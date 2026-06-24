@@ -320,7 +320,10 @@ pub fn quantize_row_q8_0_batch(x: &[f32], n_tokens: usize, dim: usize) -> Vec<bl
     for t in 0..n_tokens {
         let row = &x[t * dim..(t + 1) * dim];
         let out = &mut y[t * nb..(t + 1) * nb];
-        quantize_row_q8_0_scalar(row, out, dim);
+        // Use quantize_row_q8_0 which dispatches to AVX2 when available
+        // (quants.c lines 238-261: quantize_row_q8_0_ref with AVX2 acceleration)
+        let q = quantize_row_q8_0(row);
+        out.copy_from_slice(&q);
     }
     y
 }
