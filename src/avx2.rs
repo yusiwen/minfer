@@ -218,7 +218,7 @@ pub fn quantize_row_q8_0_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
 // ============================================================
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn bytes_from_nibbles_32(rsi: *const i8) -> __m256i {
     use core::arch::x86_64::*;
     let tmp = _mm_loadu_si128(rsi as *const __m128i);
@@ -228,14 +228,14 @@ unsafe fn bytes_from_nibbles_32(rsi: *const i8) -> __m256i {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn mm256_set_m128i(hi: __m128i, lo: __m128i) -> __m256i {
     _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     let ax = _mm256_sign_epi8(x, x);
     let sy = _mm256_sign_epi8(y, x);
@@ -245,14 +245,14 @@ unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
     _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), x))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn hsum_float_8(x: __m256) -> f32 {
     let x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
     let x128 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
