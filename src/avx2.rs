@@ -41,41 +41,35 @@ pub fn vec_dot_q4_0_q8_0(n: i32, vx: &[BlockQ4_0], vy: &[BlockQ8_0]) -> f32 {
 unsafe fn vec_dot_q4_0_q8_0_avx2(nb: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
     use core::arch::x86_64::*;
 
-    // Initialize accumulator with zeros (quants.c line 720)
-    // __m256 acc = _mm256_setzero_ps();
+    // Cast to raw byte pointers once, avoids bounds checks on struct field access.
+    // BlockQ4_0: [d: fp16(2B) | qs: u8[16]] = 18 bytes
+    // BlockQ8_0: [d: fp16(2B) | qs: i8[32]] = 34 bytes
+    let xb = x.as_ptr() as *const u8;
+    let yb = y.as_ptr() as *const u8;
+
     let mut acc = _mm256_setzero_ps();
 
-    // Main loop (quants.c lines 722-739)
     for ib in 0..nb {
-        // Compute combined scale for the block (quants.c line 725)
-        // const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
-        let x_d = block::fp16_to_f32(x[ib].d);
-        let y_d = block::fp16_to_f32(y[ib].d);
+        let xp = xb.add(ib * 18);
+        let yp = yb.add(ib * 34);
+
+        // d_x = GGML_CPU_FP16_TO_FP32(x[ib].d)
+        let x_d = half::f16::from_bits(u16::from_le_bytes([*xp, *xp.add(1)])).to_f32();
+        let y_d = half::f16::from_bits(u16::from_le_bytes([*yp, *yp.add(1)])).to_f32();
         let d = _mm256_set1_ps(x_d * y_d);
 
-        // __m256i qx = bytes_from_nibbles_32(x[ib].qs); (quants.c line 727)
-        let mut qx = bytes_from_nibbles_32(&x[ib].qs as *const u8 as *const i8);
-
-        // Now we have a vector with bytes in [ 0 .. 15 ] interval.
-        // Offset them into [ -8 .. +7 ] interval. (quants.c lines 729-731)
-        // const __m256i off = _mm256_set1_epi8( 8 );
-        // qx = _mm256_sub_epi8( qx, off );
+        // qx = bytes_from_nibbles_32(x[ib].qs)
+        let mut qx = bytes_from_nibbles_32(xp.add(2) as *const i8);
         let off = _mm256_set1_epi8(8);
         qx = _mm256_sub_epi8(qx, off);
 
-        // __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs); (quants.c line 733)
-        let qy = _mm256_loadu_si256(&y[ib].qs as *const i8 as *const __m256i);
+        // qy = _mm256_loadu_si256((const __m256i *)y[ib].qs)
+        let qy = _mm256_loadu_si256(yp.add(2) as *const __m256i);
 
-        // const __m256 q = mul_sum_i8_pairs_float(qx, qy); (quants.c line 735)
         let q = mul_sum_i8_pairs_float(qx, qy);
-
-        // Multiply q with scale and accumulate (quants.c line 738)
-        // acc = _mm256_fmadd_ps( d, q, acc );
         acc = _mm256_fmadd_ps(d, q, acc);
     }
 
-    // Horizontal sum of 8 floats (quants.c line 741)
-    // sumf = hsum_float_8(acc);
     hsum_float_8(acc)
 }
 
@@ -373,32 +367,32 @@ pub fn vec_dot_q8_0_q8_0(n: i32, vx: &[BlockQ8_0], vy: &[BlockQ8_0]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vec_dot_q8_0_q8_0_avx2(nb: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
-    use core::arch::x86_64::*;
+    // Cast to raw byte pointers once, avoids bounds checks.
+    // BlockQ8_0: [d: fp16(2B) | qs: i8[32]] = 34 bytes
+    let xb = x.as_ptr() as *const u8;
+    let yb = y.as_ptr() as *const u8;
 
-    // Initialize accumulator with zeros (quants.c line 1189)
     let mut acc = _mm256_setzero_ps();
 
     // Main loop (quants.c lines 1192-1202)
     for ib in 0..nb {
-        // Compute combined scale (quants.c line 1194)
-        // const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
-        let x_d = block::fp16_to_f32(x[ib].d);
-        let y_d = block::fp16_to_f32(y[ib].d);
+        let xp = xb.add(ib * 34);
+        let yp = yb.add(ib * 34);
+
+        // d_x = GGML_CPU_FP16_TO_FP32(x[ib].d)
+        let x_d = half::f16::from_bits(u16::from_le_bytes([*xp, *xp.add(1)])).to_f32();
+        let y_d = half::f16::from_bits(u16::from_le_bytes([*yp, *yp.add(1)])).to_f32();
         let d = _mm256_set1_ps(x_d * y_d);
 
-        // __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs); (quants.c line 1195)
-        let qx = _mm256_loadu_si256(&x[ib].qs as *const i8 as *const __m256i);
-        // __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs); (quants.c line 1196)
-        let qy = _mm256_loadu_si256(&y[ib].qs as *const i8 as *const __m256i);
+        // qx = _mm256_loadu_si256((const __m256i *)x[ib].qs)
+        let qx = _mm256_loadu_si256(xp.add(2) as *const __m256i);
+        // qy = _mm256_loadu_si256((const __m256i *)y[ib].qs)
+        let qy = _mm256_loadu_si256(yp.add(2) as *const __m256i);
 
-        // const __m256 q = mul_sum_i8_pairs_float(qx, qy); (quants.c line 1198)
         let q = mul_sum_i8_pairs_float(qx, qy);
-
-        // acc = _mm256_fmadd_ps(d, q, acc); (quants.c line 1201)
         acc = _mm256_fmadd_ps(d, q, acc);
     }
 
-    // sumf = hsum_float_8(acc); (quants.c line 1204)
     hsum_float_8(acc)
 }
 
