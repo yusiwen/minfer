@@ -1,0 +1,6 @@
+/target/
+*.gguf
+/tmp/
+*.npy
+*.f32
+.env
