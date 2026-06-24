@@ -233,30 +233,26 @@ impl Tensor {
         unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut f32, n) }
     }
 
-    /// Get the data as BlockQ4_0 slice
-    pub fn data_q4_0(&self) -> &[block::BlockQ4_0] {
-        assert!(self.ttype == TensorType::Q4_0);
-        let n = self.data.len() / std::mem::size_of::<block::BlockQ4_0>();
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const block::BlockQ4_0, n) }
+    /// Get the quantized data as raw bytes (Q4_0)
+    pub fn data_q4_0(&self) -> &[u8] {
+        assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
+        &self.data
     }
 
-    pub fn data_q4_0_mut(&mut self) -> &mut [block::BlockQ4_0] {
-        assert!(self.ttype == TensorType::Q4_0);
-        let n = self.data.len() / std::mem::size_of::<block::BlockQ4_0>();
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut block::BlockQ4_0, n) }
+    pub fn data_q4_0_mut(&mut self) -> &mut [u8] {
+        assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
+        &mut self.data
     }
 
-    /// Get the data as BlockQ8_0 slice
-    pub fn data_q8_0(&self) -> &[block::BlockQ8_0] {
-        assert!(self.ttype == TensorType::Q8_0);
-        let n = self.data.len() / std::mem::size_of::<block::BlockQ8_0>();
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const block::BlockQ8_0, n) }
+    /// Get the quantized data as raw bytes (Q8_0)
+    pub fn data_q8_0(&self) -> &[u8] {
+        assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
+        &self.data
     }
 
-    pub fn data_q8_0_mut(&mut self) -> &mut [block::BlockQ8_0] {
-        assert!(self.ttype == TensorType::Q8_0);
-        let n = self.data.len() / std::mem::size_of::<block::BlockQ8_0>();
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut block::BlockQ8_0, n) }
+    pub fn data_q8_0_mut(&mut self) -> &mut [u8] {
+        assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
+        &mut self.data
     }
 
     /// Access a single f32 value at linear index (F32 only)
