@@ -312,7 +312,27 @@ fn quantize_row_q8_0_scalar(x: &[f32], y: &mut [block::BlockQ8_0], k: usize) {
     }
 }
 
+/// Quantize multiple rows of f32 to Q8_0 blocks, writing to a pre-allocated buffer.
+/// x: [n_tokens * dim] f32, q8: [n_tokens * (dim/32)] output blocks.
+pub fn quantize_row_q8_0_buf(x: &[f32], n_tokens: usize, dim: usize, q8: &mut [block::BlockQ8_0]) {
+    let nb = dim / 32;
+    for t in 0..n_tokens {
+        let row = &x[t * dim..(t + 1) * dim];
+        let out = &mut q8[t * nb..(t + 1) * nb];
+        let k = row.len();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { quantize_row_q8_0_avx2(row, out, k) };
+                continue;
+            }
+        }
+        quantize_row_q8_0_scalar(row, out, k);
+    }
+}
+
 /// Quantize multiple rows of f32 to Q8_0 blocks [n_tokens, nb].
+/// Allocates and returns a new Vec.
 pub fn quantize_row_q8_0_batch(x: &[f32], n_tokens: usize, dim: usize) -> Vec<block::BlockQ8_0> {
     let nb = dim / 32;
     let total = n_tokens * nb;
