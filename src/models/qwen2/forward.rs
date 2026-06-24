@@ -44,13 +44,13 @@ pub fn forward(
     for il in 0..model.n_layer() {
         let l = &model.layers[il];
         let (wq, wk, wv, wo, fg, fu, fd) = (
-            as_u8(l.wq.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.wk.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.wv.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.wo.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.ffn_gate.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.ffn_up.as_ref().map(|t| t.data_q4_0()).unwrap()),
-            as_u8(l.ffn_down.as_ref().map(|t| t.data_q4_0()).unwrap()),
+            l.wq.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.wk.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.wv.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.wo.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.ffn_gate.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.ffn_up.as_ref().map(|t| t.data_q4_0()).unwrap(),
+            l.ffn_down.as_ref().map(|t| t.data_q4_0()).unwrap(),
         );
 
         // --- RMSNorm ---
@@ -114,8 +114,8 @@ pub fn forward(
         crate::avx2::quantize_row_q8_0_buf(&bn, nt, ne, q8e);
         let mut logits = vec![0.0f32; nt * nv];
         match output.ttype {
-            TensorType::Q8_0 => lq8_blk(as_u8(output.data_q8_0()), q8e, &mut logits, nv, ne, nt),
-            TensorType::Q4_0 => lq4_blk(as_u8(output.data_q4_0()), q8e, &mut logits, nv, ne, nt),
+            TensorType::Q8_0 => lq8_blk(output.data_q8_0(), q8e, &mut logits, nv, ne, nt),
+            TensorType::Q4_0 => lq4_blk(output.data_q4_0(), q8e, &mut logits, nv, ne, nt),
             _ => unreachable!(),
         }
         logits
@@ -163,10 +163,6 @@ fn apply_weight(x: &mut [f32], w: &[f32], n: usize, d: usize) {
 
 fn add_bias(x: &mut [f32], b: &[f32], n: usize, d: usize) {
     for t in 0..n { let base = t * d; for i in 0..d.min(b.len()) { x[base + i] += b[i]; } }
-}
-
-fn as_u8<T>(x: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * std::mem::size_of::<T>()) }
 }
 
 fn lq4_blk(w: &[u8], x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
