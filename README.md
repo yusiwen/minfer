@@ -44,17 +44,21 @@ Measured on a NUC12 (i7-1260P) with AVX2+FMA.
 ```
 src/
 ├── main.rs        # Entry point, CLI, inference loop
-├── gguf.rs        # GGUF format parser (v3)
+├── gguf.rs        # GGUF format parser (v3) + KV helpers
 ├── block.rs       # Quantized block types + fp16 conversions
 ├── avx2.rs        # AVX2 dot product kernels + quantization
 ├── tensor.rs      # Tensor struct + data access
 ├── vec_ops.rs     # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
-├── model.rs       # Model/HParams structs + GGUF metadata extraction
-├── forward.rs     # Transformer forward pass (24 layers, KV cache)
-├── loader.rs      # Tensor loading from GGUF into Model
+├── cache.rs       # KV cache (shared, architecture-agnostic)
 ├── sampler.rs     # Greedy / temperature / top-k / top-p sampling
 ├── tokenizer.rs   # BPE tokenizer (self-contained, GGUF-backed)
-└── template.rs    # Chat template detection + formatting
+├── template.rs    # Chat template detection + formatting
+└── models/        # Architecture-specific implementations
+    ├── mod.rs     # ModelDef trait + load_model factory dispatch
+    └── qwen2/     # Qwen2 implementation
+        ├── mod.rs     # Qwen2Model + ModelDef impl
+        ├── forward.rs # Forward pass (batch-aware)
+        └── loader.rs  # Tensor loading from GGUF
 ```
 
 ## License
