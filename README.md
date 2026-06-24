@@ -10,25 +10,43 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **AVX2-accelerated** — Q4₀×Q8₀ and Q8₀×Q8₀ dot products via AVX2+FMA
 - **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
   RMSNorm
+- **Model download** — auto-download from Hugging Face Hub or Ollama registry
 - **No external ML framework** — pure Rust, only depends on `rand`, `regex`,
-  and `half`
+  `half`, `serde`, and `serde_json`
 
 ## Usage
 
 ```bash
-cargo run --release -- <model.gguf> [prompt]
+cargo run --release -- <model> [prompt]
 ```
+
+`<model>` can be a local path or an auto-download URI:
+
+| URI format | Example |
+|------------|---------|
+| Local file | `~/models/qwen2.gguf` |
+| HF Hub | `hf:Qwen/Qwen2-0.5B-GGUF:qwen2-0.5b-q4_0.gguf` |
+| Ollama | `ollama:qwen2.5:0.5b` |
 
 If `prompt` is omitted, reads from stdin.
 
 **Examples:**
 
 ```bash
-# Base model (Qwen2)
+# Local model
 cargo run --release -- ~/models/qwen2-0.5b-q4_0.gguf "What is the capital of France?"
 
-# Instruct model (Qwen2.5) — auto-applies ChatML template from GGUF metadata
-cargo run --release -- ~/models/qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
+# Auto-download from Hugging Face + run
+cargo run --release -- hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
+
+# List available GGUF files in a HF repo (without downloading)
+cargo run --release -- download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# Pull from Ollama and create a symlink
+cargo run --release -- download ollama qwen2.5:0.5b
+
+# List locally cached models
+cargo run --release -- list
 ```
 
 ## Performance
@@ -53,6 +71,8 @@ src/
 ├── sampler.rs     # Greedy / temperature / top-k / top-p sampling
 ├── tokenizer.rs   # BPE tokenizer (self-contained, GGUF-backed)
 ├── template.rs    # Chat template detection + formatting
+├── download/      # Model download from HF Hub & Ollama
+│   └── mod.rs     # resolve() URI handler, curl-based HTTP, list_local()
 └── models/        # Architecture-specific implementations
     ├── mod.rs     # ModelDef trait + load_model factory dispatch
     └── qwen2/     # Qwen2 implementation
