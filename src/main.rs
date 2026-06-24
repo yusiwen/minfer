@@ -13,6 +13,7 @@ mod tokenizer;
 mod template;
 mod cache;
 mod models;
+mod download;
 
 use std::time::Instant;
 
@@ -34,10 +35,76 @@ impl Default for GenParams {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <model.gguf> [prompt]", args[0]);
+        eprintln!("Usage:");
+        eprintln!("  {} <model> [prompt]              — run inference", args[0]);
+        eprintln!("  {} download hf <repo> [file]      — download from Hugging Face", args[0]);
+        eprintln!("  {} download ollama <model>[:tag]   — pull from Ollama", args[0]);
+        eprintln!("  {} list                           — list cached models", args[0]);
         std::process::exit(1);
     }
+
+    // === Subcommands ===
+    match args[1].as_str() {
+        "download" => {
+            if args.len() < 4 {
+                eprintln!("Usage: {} download hf <repo> [file] | ollama <model>[:tag]", args[0]);
+                std::process::exit(1);
+            }
+            let source = &args[2];
+            let target = &args[3];
+            match source.as_str() {
+                "hf" => {
+                    let uri = if args.len() > 4 {
+                        format!("hf:{}:{}", target, args[4])
+                    } else {
+                        format!("hf:{}", target)
+                    };
+                    match download::resolve(&uri) {
+                        Ok(p) => println!("Model downloaded: {}", p.display()),
+                        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+                    }
+                }
+                "ollama" => {
+                    let uri = format!("ollama:{}", target);
+                    match download::resolve(&uri) {
+                        Ok(p) => println!("Model ready: {}", p.display()),
+                        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown download source '{}'. Use 'hf' or 'ollama'.", source);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        "list" => {
+            match download::list_local() {
+                Ok(()) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            }
+            return;
+        }
+        _ => {}  // fall through to model inference
+    }
+
     let model_path = &args[1];
+
+    // Auto-download if URI starts with hf: or ollama:
+    let model_path = if model_path.starts_with("hf:") || model_path.starts_with("ollama:") {
+        match download::resolve(model_path) {
+            Ok(p) => {
+                eprintln!("Model ready: {}", p.display());
+                p.to_string_lossy().to_string()
+            }
+            Err(e) => {
+                eprintln!("Download error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        model_path.clone()
+    };
     let prompt = if args.len() > 2 { args[2..].join(" ") } else {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap_or(0);
