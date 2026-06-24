@@ -312,6 +312,19 @@ fn quantize_row_q8_0_scalar(x: &[f32], y: &mut [block::BlockQ8_0], k: usize) {
     }
 }
 
+/// Quantize multiple rows of f32 to Q8_0 blocks [n_tokens, nb].
+pub fn quantize_row_q8_0_batch(x: &[f32], n_tokens: usize, dim: usize) -> Vec<block::BlockQ8_0> {
+    let nb = dim / 32;
+    let total = n_tokens * nb;
+    let mut y = vec![block::BlockQ8_0::default(); total];
+    for t in 0..n_tokens {
+        let row = &x[t * dim..(t + 1) * dim];
+        let out = &mut y[t * nb..(t + 1) * nb];
+        quantize_row_q8_0_scalar(row, out, dim);
+    }
+    y
+}
+
 // === ggml_vec_dot_q8_0_q8_0 (quants.c lines 1170-1236) ===
 /// Compute Q8_0 × Q8_0 dot product for one row using AVX2
 /// n: number of elements (must be multiple of 32)

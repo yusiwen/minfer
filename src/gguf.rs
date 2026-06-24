@@ -1592,3 +1592,60 @@ impl GgufContext {
         }
     }
 }
+
+// === GgufContext extension methods (moved from old model.rs) ===
+
+impl GgufContext {
+    pub fn get_key_val_str(&self, key: &str) -> Option<String> {
+        for kv in &self.kv {
+            if kv.key == key {
+                return self.get_string(kv);
+            }
+        }
+        None
+    }
+
+    pub fn get_key_val_i64(&self, key: &str) -> Option<i64> {
+        for kv in &self.kv {
+            if kv.key == key {
+                return self.get_i64(kv);
+            }
+        }
+        None
+    }
+
+    pub fn get_key_val_f32(&self, key: &str) -> Option<f32> {
+        for kv in &self.kv {
+            if kv.key == key {
+                return self.get_f32(kv);
+            }
+        }
+        None
+    }
+
+    fn get_string(&self, kv: &GgufKv) -> Option<String> {
+        if kv.type_ == GgufType::String && !kv.data_string.is_empty() {
+            Some(kv.data_string[0].clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_i64(&self, kv: &GgufKv) -> Option<i64> {
+        match kv.type_ {
+            GgufType::Int64 => Some(kv.get_val_i64(0)),
+            GgufType::Uint32 => Some(kv.get_val_u32(0) as i64),
+            GgufType::Int32 => Some(kv.get_val_i32(0) as i64),
+            GgufType::Uint64 => Some(kv.get_val_u64(0) as i64),
+            _ => None,
+        }
+    }
+
+    fn get_f32(&self, kv: &GgufKv) -> Option<f32> {
+        match kv.type_ {
+            GgufType::Float32 => Some(kv.get_val_f32(0)),
+            GgufType::Float64 => Some(kv.get_val_f64(0) as f32),
+            _ => None,
+        }
+    }
+}
