@@ -56,8 +56,7 @@ pub fn forward(
         );
 
         // --- RMSNorm ---
-        rms_norm(&hidden, hp.f_norm_rms_eps, &mut bn, nt, ne);
-        if let Some(w) = &l.attn_norm { apply_weight(&mut bn, w.data_f32(), nt, ne); }
+        rms_norm(&hidden, hp.f_norm_rms_eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
 
         // --- Quantize ONCE for QKV → raw &[u8] ---
         let (q8, rest) = qb.split_at_mut(nt * nbe * Q8B);
@@ -90,8 +89,7 @@ pub fn forward(
         for i in 0..hidden.len() { hidden[i] += bn[i]; }
 
         // --- FFN RMSNorm ---
-        rms_norm(&hidden, hp.f_norm_rms_eps, &mut bf[..nt * ne], nt, ne);
-        if let Some(w) = &l.ffn_norm { apply_weight(&mut bf[..nt * ne], w.data_f32(), nt, ne); }
+        rms_norm(&hidden, hp.f_norm_rms_eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
 
         // --- SwiGLU ---
         let (q8f, _) = qb.split_at_mut(nt * nbe * Q8B);
@@ -114,8 +112,7 @@ pub fn forward(
     }
 
     // 3. Final RMSNorm
-    rms_norm(&hidden, hp.f_norm_rms_eps, &mut bn, nt, ne);
-    if let Some(w) = &model.output_norm { apply_weight(&mut bn, w.data_f32(), nt, ne); }
+    rms_norm(&hidden, hp.f_norm_rms_eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
 
     // 4. LM head
     if let Some(output) = &model.output {
@@ -158,19 +155,18 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
     }
 }
 
-fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize) {
+fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize, w: Option<&[f32]>) {
     for t in 0..n {
         let row = &x[t * d..(t + 1) * d];
         let dst = &mut out[t * d..(t + 1) * d];
         let mut ss = 0.0f64;
         for i in 0..d { ss += (row[i] as f64) * (row[i] as f64); }
         let sc = 1.0 / ((ss / d as f64) as f32 + eps).sqrt();
-        for i in 0..d { dst[i] = row[i] * sc; }
+        match w {
+            Some(w) => { for i in 0..d { dst[i] = row[i] * sc * w[i]; } }
+            None => { for i in 0..d { dst[i] = row[i] * sc; } }
+        }
     }
-}
-
-fn apply_weight(x: &mut [f32], w: &[f32], n: usize, d: usize) {
-    for t in 0..n { let b = t * d; for i in 0..d { x[b + i] *= w[i]; } }
 }
 
 fn add_bias(x: &mut [f32], b: &[f32], n: usize, d: usize) {
