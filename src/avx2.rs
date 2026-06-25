@@ -164,19 +164,24 @@ pub fn vec_dot_q8_0_q8_0(n: i32, vx: &[BlockQ8_0], vy: &[BlockQ8_0]) -> f32 {
 // ============================================================
 // Quantize f32 → Q8_0 bytes (raw &[u8], no struct types)
 // ============================================================
+fn quantize_row_q8_0_to(x: &[f32], y: &mut [u8]) {
+    let k = x.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { quantize_avx2(x, y, k) };
+            return;
+        }
+    }
+    quantize_scalar(x, y, k);
+}
+
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
     let k = x.len();
     debug_assert!(k % 32 == 0);
     let nb = k / 32;
     let mut y = vec![0u8; nb * Q8B];
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { quantize_avx2(x, &mut y, k) };
-            return y;
-        }
-    }
-    quantize_scalar(x, &mut y, k);
+    quantize_row_q8_0_to(x, &mut y);
     y
 }
 
@@ -231,14 +236,11 @@ fn quantize_scalar(x: &[f32], y: &mut [u8], k: usize) {
     }
 }
 
-/// Quantize multiple rows, write to &mut [u8] buffer.
+/// Quantize multiple rows directly into &mut [u8] buffer (no per-row Vec allocation).
 pub fn quantize_row_q8_0_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
-    let nb = dim / 32;
-    let rowb = nb * Q8B;
+    let rowb = (dim / 32) * Q8B;
     for t in 0..nt {
-        let out = &mut buf[t * rowb..(t + 1) * rowb];
-        let q = quantize_row_q8_0(&x[t * dim..(t + 1) * dim]);
-        out.copy_from_slice(&q);
+        quantize_row_q8_0_to(&x[t * dim..(t + 1) * dim], &mut buf[t * rowb..(t + 1) * rowb]);
     }
 }
 
