@@ -146,9 +146,12 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
             if is8 {
                 for j in 0..mv { out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d; }
             } else {
-                for j in 0..mv {
-                    let nib = if j % 2 == 0 { t.data[off + 2 + j / 2] & 0x0F } else { t.data[off + 2 + j / 2] >> 4 };
-                    out[doff + b * blk + j] = (nib as i8 - 8) as f32 * d;
+                for j in (0..mv).step_by(2) {
+                    let byte = t.data[off + 2 + j / 2];
+                    let lo = (byte & 0x0F) as i8 - 8;
+                    let hi = (byte >> 4) as i8 - 8;
+                    out[doff + b * blk + j] = lo as f32 * d;
+                    if j + 1 < mv { out[doff + b * blk + j + 1] = hi as f32 * d; }
                 }
             }
         }
