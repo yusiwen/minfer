@@ -344,6 +344,45 @@ unsafe fn vec_cpy_f32_avx2(n: usize, y: &mut [f32], x: &[f32]) {
     }
 }
 
+// === vec_muladd_f32 ===
+// y[i] += scale * x[i] for i in 0..n (FMA when AVX2 available)
+#[inline]
+pub fn vec_muladd_f32(n: usize, y: &mut [f32], x: &[f32], scale: f32) {
+    debug_assert!(y.len() >= n && x.len() >= n);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { vec_muladd_f32_avx2(n, y, x, scale) };
+            return;
+        }
+    }
+
+    for i in 0..n {
+        y[i] += scale * x[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_muladd_f32_avx2(n: usize, y: &mut [f32], x: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+
+    let s = _mm256_set1_ps(scale);
+    let mut i = 0;
+    for i_step in (0..n).step_by(8) {
+        if i_step + 7 >= n { break; }
+        let vx = _mm256_loadu_ps(x.as_ptr().add(i_step));
+        let vy = _mm256_loadu_ps(y.as_ptr().add(i_step));
+        _mm256_storeu_ps(y.as_mut_ptr().add(i_step), _mm256_fmadd_ps(s, vx, vy));
+        i = i_step + 8;
+    }
+
+    for j in i..n {
+        y[j] += scale * x[j];
+    }
+}
+
 // === vec_max_f32 ===
 // Find maximum value in array
 pub fn vec_max_f32(n: usize, x: &[f32]) -> f32 {

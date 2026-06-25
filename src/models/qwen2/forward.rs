@@ -35,6 +35,8 @@ pub fn forward(
     let mut bg = vec![0.0f32; nt * maxd];
     // Q8 activation buffer: raw bytes (minfer2 pattern, no BlockQ8_0)
     let mut qb = vec![0u8; nt * maxnb * Q8B];
+    let max_seq = hp.max_seq_len as usize;
+    let mut scrs_buf = vec![0.0f32; max_seq];
 
     // 1. Embedding
     let mut hidden = vec![0.0f32; nt * ne];
@@ -79,7 +81,7 @@ pub fn forward(
 
         // --- Attention ---
         gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
-            positions, nt, nkv, nh, nk, hd, &mut ba);
+            positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv]);
 
         // --- Wo ---
         let (q8a, _) = qb.split_at_mut(nt * nbe * Q8B);
@@ -96,7 +98,14 @@ pub fn forward(
         crate::avx2::quantize_row_q8_0_buf(&bf[..nt * ne], nt, ne, q8f);
         lq4_blk(fg, q8f, &mut bg, nf, ne, nt);
         lq4_blk(fu, q8f, &mut bf, nf, ne, nt);
-        for i in 0..nt * nf { bg[i] = silu(bg[i]) * bf[i]; }
+        let len = nt * nf;
+        let bp = bg.as_mut_ptr();
+        unsafe {
+            crate::vec_ops::vec_silu_f32(len,
+                std::slice::from_raw_parts_mut(bp, len),
+                std::slice::from_raw_parts(bp as *const f32, len));
+        }
+        for i in 0..len { bg[i] *= bf[i]; }
 
         let (q8g, _) = qb.split_at_mut(nt * nbf * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bg[..nt * nf], nt, nf, q8g);
@@ -189,13 +198,14 @@ fn lq8_blk(w: &[u8], x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize)
 
 fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32) {
     let half = hd / 2;
+    let mut freqs = [0.0f32; 64]; // max half = 64 for hd <= 128
+    for i in 0..half { freqs[i] = 1.0 / fb.powf((2 * i) as f32 / hd as f32); }
     for t in 0..pos.len() {
         let p = pos[t] as f32;
         for h in 0..nh {
             let b = t * nh * hd + h * hd;
             for i in 0..half {
-                let fr = 1.0 / fb.powf((2 * i) as f32 / hd as f32);
-                let th = p * fr; let (sn, cs) = th.sin_cos();
+                let th = p * freqs[i]; let (sn, cs) = th.sin_cos();
                 let (i0, i1) = (b + i, b + i + half);
                 let (x0, x1) = (x[i0], x[i1]);
                 x[i0] = x0 * cs - x1 * sn;
@@ -206,9 +216,8 @@ fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32) {
 }
 
 fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: usize,
-    nh: usize, nk: usize, hd: usize, out: &mut [f32]) {
+    nh: usize, nk: usize, hd: usize, out: &mut [f32], scrs: &mut [f32]) {
     let gqa = nh / nk; let ne = nh * hd; let sc = 1.0 / (hd as f32).sqrt();
-    let mut scrs = vec![0.0f32; nkv];
     for h in 0..nh {
         let hk = h / gqa;
         for t in 0..nt {
@@ -217,24 +226,30 @@ fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: us
             let mut mx = f32::NEG_INFINITY;
             for kv in 0..vl {
                 let ks = kv * nk * hd + hk * hd;
-                let mut s = 0.0f32;
-                for d in 0..hd { s += q[qs + d] * ka[ks + d]; }
-                s *= sc; scrs[kv] = s; if s > mx { mx = s; }
+                let s = crate::vec_ops::vec_dot_f32(hd, &q[qs..qs + hd], &ka[ks..ks + hd]) * sc;
+                scrs[kv] = s; if s > mx { mx = s; }
             }
             for kv in vl..nkv { scrs[kv] = f32::NEG_INFINITY; }
-            let mut sm = 0.0f64;
-            for s in &mut scrs { *s = (*s - mx).exp(); sm += *s as f64; }
+            let sp = scrs.as_mut_ptr();
+            let sm = unsafe {
+                crate::vec_ops::vec_soft_max_f32(nkv,
+                    std::slice::from_raw_parts_mut(sp, nkv),
+                    std::slice::from_raw_parts(sp as *const f32, nkv),
+                    mx)
+            };
             let is = (1.0 / sm) as f32;
-            for s in &mut scrs { *s *= is; }
+            crate::vec_ops::vec_scale_f32(nkv, scrs, is);
             let os = t * ne + h * hd;
-            for d in 0..hd {
-                let mut ac = 0.0f32;
-                for kv in 0..nkv { ac += scrs[kv] * va[kv * nk * hd + hk * hd + d]; }
-                out[os + d] = ac;
+            let slice = &mut out[os..os + hd];
+            for d in 0..hd { slice[d] = 0.0; }
+            let stride = nk * hd;
+            let vs_base = hk * hd;
+            for kv in 0..nkv {
+                crate::vec_ops::vec_muladd_f32(hd, slice,
+                    &va[kv * stride + vs_base..kv * stride + vs_base + hd], scrs[kv]);
             }
         }
     }
 }
 
-#[inline]
-fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
