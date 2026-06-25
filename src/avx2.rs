@@ -7,6 +7,25 @@ pub const Q8B: usize = 34;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+/// f16→f32 conversion with correct IEEE 754 handling for all cases
+/// (zero, subnormal, normal, infinity, NaN).
+#[inline(always)]
+fn f16_to_f32_bits(bits: u16) -> f32 {
+    let i = bits as u32;
+    let sign = (i & 0x8000) << 16;
+    let exp = (i >> 10) & 0x1F;
+    let mant = i & 0x3FF;
+    if exp == 0 {
+        if mant == 0 { return f32::from_bits(sign); }
+        let pos = 31 - mant.leading_zeros();
+        return f32::from_bits(sign | ((103 + pos) << 23) | ((mant - (1 << pos)) << (23 - pos)));
+    }
+    if exp == 31 {
+        return f32::from_bits(sign | 0x7F800000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
 // ============================================================
 // Q4_0 × Q8_0 dot product (raw &[u8] interface, no n_blocks param — slice length-based)
 // ============================================================
@@ -33,13 +52,19 @@ unsafe fn dot_q4_0_q8_0_avx2(x: &[u8], y: &[u8], nb: usize) -> f32 {
     for ib in 0..nb {
         let xp = xb.add(ib * Q4B);
         let yp = yb.add(ib * Q8B);
-        let xd = half::f16::from_bits(u16::from_le_bytes([*xp, *xp.add(1)])).to_f32();
-        let yd = half::f16::from_bits(u16::from_le_bytes([*yp, *yp.add(1)])).to_f32();
+        let xd = f16_to_f32_bits(*xp.cast::<u16>());
+        let yd = f16_to_f32_bits(*yp.cast::<u16>());
         let d = _mm256_set1_ps(xd * yd);
-        let mut qx = bytes_from_nibbles_32(xp.add(2) as *const i8);
+        let tmp = _mm_loadu_si128(xp.add(2) as *const __m128i);
+        let bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
+        let mut qx = _mm256_and_si256(bytes, _mm256_set1_epi8(0xF));
         qx = _mm256_sub_epi8(qx, _mm256_set1_epi8(8));
         let qy = _mm256_loadu_si256(yp.add(2) as *const __m256i);
-        acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        let ax = _mm256_sign_epi8(qx, qx);
+        let sy = _mm256_sign_epi8(qy, qx);
+        let dot = _mm256_maddubs_epi16(ax, sy);
+        let q = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), dot));
+        acc = _mm256_fmadd_ps(d, q, acc);
     }
     hsum_float_8(acc)
 }
@@ -89,12 +114,16 @@ unsafe fn dot_q8_0_q8_0_avx2(x: &[u8], y: &[u8], nb: usize) -> f32 {
     for ib in 0..nb {
         let xp = xb.add(ib * Q8B);
         let yp = yb.add(ib * Q8B);
-        let xd = half::f16::from_bits(u16::from_le_bytes([*xp, *xp.add(1)])).to_f32();
-        let yd = half::f16::from_bits(u16::from_le_bytes([*yp, *yp.add(1)])).to_f32();
+        let xd = f16_to_f32_bits(*xp.cast::<u16>());
+        let yd = f16_to_f32_bits(*yp.cast::<u16>());
         let d = _mm256_set1_ps(xd * yd);
         let qx = _mm256_loadu_si256(xp.add(2) as *const __m256i);
         let qy = _mm256_loadu_si256(yp.add(2) as *const __m256i);
-        acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        let ax = _mm256_sign_epi8(qx, qx);
+        let sy = _mm256_sign_epi8(qy, qx);
+        let dot = _mm256_maddubs_epi16(ax, sy);
+        let q = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), dot));
+        acc = _mm256_fmadd_ps(d, q, acc);
     }
     hsum_float_8(acc)
 }
@@ -213,45 +242,8 @@ pub fn quantize_row_q8_0_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
     }
 }
 
-// ============================================================
-// Helper: bytes_from_nibbles_32
-// ============================================================
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn bytes_from_nibbles_32(rsi: *const i8) -> __m256i {
-    use core::arch::x86_64::*;
-    let tmp = _mm_loadu_si128(rsi as *const __m128i);
-    let bytes = mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
-    _mm256_and_si256(bytes, _mm256_set1_epi8(0xF))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn mm256_set_m128i(hi: __m128i, lo: __m128i) -> __m256i {
-    _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
-    let ax = _mm256_sign_epi8(x, x);
-    let sy = _mm256_sign_epi8(y, x);
-    let dot = _mm256_maddubs_epi16(ax, sy);
-    sum_i16_pairs_float(dot)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
-    _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_set1_epi16(1), x))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx")]
 #[inline]
 unsafe fn hsum_float_8(x: __m256) -> f32 {
     let x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
