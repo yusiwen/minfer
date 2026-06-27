@@ -140,9 +140,12 @@ fn main() {
     let tokenizer = tokenizer::Tokenizer::load(&ctx);
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
 
-    // === Tokenization (with optional ChatML) ===
+    // === Chat template (need tokenizer for bos_token text) ===
     let processed = if let Some(tmpl) = get_chat_template(&data) {
-        template::render_template(&tmpl, &prompt, true)
+        let bos_text = tokenizer.id_to_token.get(tokenizer.bos_token as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        template::render_template(&tmpl, &prompt, true, bos_text)
     } else {
         prompt.clone()
     };

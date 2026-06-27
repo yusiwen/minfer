@@ -12,6 +12,9 @@ pub enum TensorType {
     F32,
     F16,
     Q4_0,
+    Q4_1,
+    Q4_K,
+    Q6_K,
     Q8_0,
     I8,
     I16,
@@ -26,6 +29,9 @@ impl TensorType {
             TensorType::F32 => 4,
             TensorType::F16 => 2,
             TensorType::Q4_0 => 18,  // sizeof(block_q4_0)
+            TensorType::Q4_1 => 20,  // sizeof(block_q4_1)
+            TensorType::Q4_K => 144, // sizeof(block_q4_K)
+            TensorType::Q6_K => 210, // sizeof(block_q6_K)
             TensorType::Q8_0 => 34,  // sizeof(block_q8_0)
             TensorType::I8 => 1,
             TensorType::I16 => 2,
@@ -40,6 +46,9 @@ impl TensorType {
             TensorType::F32 => 1,
             TensorType::F16 => 1,
             TensorType::Q4_0 => 32,
+            TensorType::Q4_1 => 32,
+            TensorType::Q4_K => 256,
+            TensorType::Q6_K => 256,
             TensorType::Q8_0 => 32,
             TensorType::I8 => 1,
             TensorType::I16 => 1,
@@ -54,6 +63,9 @@ impl TensorType {
             GgmlType::F32 => TensorType::F32,
             GgmlType::F16 => TensorType::F16,
             GgmlType::Q4_0 => TensorType::Q4_0,
+            GgmlType::Q4_1 => TensorType::Q4_1,
+            GgmlType::Q4_K => TensorType::Q4_K,
+            GgmlType::Q6_K => TensorType::Q6_K,
             GgmlType::Q8_0 => TensorType::Q8_0,
             GgmlType::I8 => TensorType::I8,
             GgmlType::I16 => TensorType::I16,
@@ -67,6 +79,9 @@ impl TensorType {
             TensorType::F32 => "f32",
             TensorType::F16 => "f16",
             TensorType::Q4_0 => "q4_0",
+            TensorType::Q4_1 => "q4_1",
+            TensorType::Q4_K => "q4_K",
+            TensorType::Q6_K => "q6_K",
             TensorType::Q8_0 => "q8_0",
             TensorType::I8 => "i8",
             TensorType::I16 => "i16",
@@ -244,6 +259,17 @@ impl Tensor {
         &mut self.data
     }
 
+    /// Get the quantized data as raw bytes (Q4_1)
+    pub fn data_q4_1(&self) -> &[u8] {
+        assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
+        &self.data
+    }
+
+    pub fn data_q4_1_mut(&mut self) -> &mut [u8] {
+        assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
+        &mut self.data
+    }
+
     /// Get the quantized data as raw bytes (Q8_0)
     pub fn data_q8_0(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
@@ -252,6 +278,28 @@ impl Tensor {
 
     pub fn data_q8_0_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
+        &mut self.data
+    }
+
+    /// Get the quantized data as raw bytes (Q4_K)
+    pub fn data_q4_k(&self) -> &[u8] {
+        assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
+        &self.data
+    }
+
+    pub fn data_q4_k_mut(&mut self) -> &mut [u8] {
+        assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
+        &mut self.data
+    }
+
+    /// Get the quantized data as raw bytes (Q6_K)
+    pub fn data_q6_k(&self) -> &[u8] {
+        assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
+        &self.data
+    }
+
+    pub fn data_q6_k_mut(&mut self) -> &mut [u8] {
+        assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
         &mut self.data
     }
 
