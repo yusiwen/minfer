@@ -1,41 +1,63 @@
-// Chat template formatting for Qwen2 ChatML style
-// Reads tokenizer.chat_template from GGUF, reformats as simple ChatML
+// Chat template rendering using minijinja
+// Reads tokenizer.chat_template from GGUF, renders with message context
 
-/// Render a chat template: wraps user input with ChatML format
-/// For Qwen2: <|im_start|>system\nYou are a helpful assistant<|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n
-/// Also handles other common templates by extracting message format
-pub fn render_template(template: &str, user_input: &str, _add_generation_prompt: bool) -> String {
-    // Detect ChatML template (Qwen2, DeepSeek, etc.)
-    if template.contains("<|im_start|>") {
-        return format!(
-            "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            user_input
-        );
+use minijinja::{Environment, context};
+
+const DEFAULT_QWEN_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+const DEFAULT_SYSTEM: &str = "You are a helpful assistant.";
+
+/// Render a chat template with minijinja.
+/// Falls back to simple ChatML if the template cannot be rendered.
+pub fn render_template(
+    template: &str,
+    user_input: &str,
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> String {
+    let mut env = Environment::new();
+
+    // Register the template
+    if env.add_template("chat", template).is_err() {
+        eprintln!("Warning: invalid chat template, falling back to ChatML");
+        return fallback_chatml(user_input, add_generation_prompt);
     }
+    let tmpl = match env.get_template("chat") {
+        Ok(t) => t,
+        Err(_) => return fallback_chatml(user_input, add_generation_prompt),
+    };
 
-    // Detect Llama 3 template
-    if template.contains("<|begin_of_text|>") || template.contains("<|start_header_id|>") {
-        return format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-            user_input
-        );
+    let messages = vec![
+        serde_json::json!({
+            "role": "user",
+            "content": user_input,
+        }),
+    ];
+
+    let result = tmpl.render(context! {
+        messages => messages,
+        add_generation_prompt => add_generation_prompt,
+        bos_token => bos_token,
+        tools => minijinja::Value::UNDEFINED,
+    });
+
+    match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: chat template rendering failed ({}), falling back to ChatML", e);
+            fallback_chatml(user_input, add_generation_prompt)
+        }
     }
+}
 
-    // Detect Mistral template
-    if template.contains("[INST]") {
-        return format!("<s>[INST] {} [/INST]", user_input);
+/// Fallback: simple ChatML format
+fn fallback_chatml(user_input: &str, add_generation_prompt: bool) -> String {
+    let mut r = format!(
+        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n",
+        DEFAULT_SYSTEM,
+        user_input,
+    );
+    if add_generation_prompt {
+        r.push_str("<|im_start|>assistant\n");
     }
-
-    // Fallback: use template directly with simple {input} substitution
-    let result = template.replace("{input}", user_input)
-        .replace("{{input}}", user_input)
-        .replace("{{ message['content'] }}", user_input)
-        .replace("{content}", user_input);
-
-    if result != template {
-        return result;
-    }
-
-    // Last resort: just return the user input as-is
-    user_input.to_string()
+    r
 }

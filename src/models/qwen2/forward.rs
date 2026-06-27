@@ -1,10 +1,78 @@
 // Qwen2 forward pass — &[u8] everywhere (minfer2 pattern)
 
 use crate::cache::KVCache;
-use crate::tensor::TensorType;
+use crate::tensor::{Tensor, TensorType};
 
 const Q4B: usize = 18;
+const Q41B: usize = 20;
 const Q8B: usize = 34;
+const Q4KB: usize = 144;
+const Q6KB: usize = 210;
+
+// ============================================================
+// Dispatched quantized matmul: weight tensor × Q8_0 activation
+// ============================================================
+
+fn quant_matmul(w: &Tensor, x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
+    match w.ttype {
+        TensorType::Q4_0 => {
+            let nb = id / 32;
+            let ws = nb * Q4B;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q4_0_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
+                }
+            }
+        }
+        TensorType::Q4_1 => {
+            let nb = id / 32;
+            let ws = nb * Q41B;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q4_1_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
+                }
+            }
+        }
+        TensorType::Q4_K => {
+            let nk = id / 256;
+            let ws = nk * Q4KB;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q4_k_q8_0(wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
+                }
+            }
+        }
+        TensorType::Q6_K => {
+            let nk = id / 256;
+            let ws = nk * Q6KB;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q6_k_q8_0(wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
+                }
+            }
+        }
+        TensorType::Q8_0 => {
+            let nb = id / 32;
+            let ws = nb * Q8B;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q8_0_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
+                }
+            }
+        }
+        _ => panic!("unsupported weight type {:?} in quant_matmul", w.ttype),
+    }
+}
 
 pub fn forward(
     model: &super::Qwen2Model,
@@ -45,29 +113,20 @@ pub fn forward(
     // 2. Per-layer loop
     for il in 0..model.n_layer() {
         let l = &model.layers[il];
-        let (wq, wk, wv, wo, fg, fu, fd) = (
-            l.wq.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.wk.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.wv.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.wo.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.ffn_gate.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.ffn_up.as_ref().map(|t| t.data_q4_0()).unwrap(),
-            l.ffn_down.as_ref().map(|t| t.data_q4_0()).unwrap(),
-        );
 
         // --- RMSNorm ---
         rms_norm(&hidden, hp.f_norm_rms_eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
 
         // --- Quantize ONCE for QKV → raw &[u8] ---
-        let (q8, rest) = qb.split_at_mut(nt * nbe * Q8B);
+        let (q8, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bn, nt, ne, q8);
 
         // --- QKV ---
-        lq4_blk(wq, q8, &mut bq, nqt, ne, nt);
+        quant_matmul(l.wq.as_ref().unwrap(), q8, &mut bq, nqt, ne, nt);
         if let Some(b) = &l.bq { add_bias(&mut bq, b.data_f32(), nt, nqt); }
-        lq4_blk(wk, q8, &mut bk, nkt, ne, nt);
+        quant_matmul(l.wk.as_ref().unwrap(), q8, &mut bk, nkt, ne, nt);
         if let Some(b) = &l.bk { add_bias(&mut bk, b.data_f32(), nt, nkt); }
-        lq4_blk(wv, q8, &mut bv, nkt, ne, nt);
+        quant_matmul(l.wv.as_ref().unwrap(), q8, &mut bv, nkt, ne, nt);
         if let Some(b) = &l.bv { add_bias(&mut bv, b.data_f32(), nt, nkt); }
 
         // --- RoPE ---
@@ -83,19 +142,19 @@ pub fn forward(
             positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv]);
 
         // --- Wo ---
-        let (q8a, _) = qb.split_at_mut(nt * nbe * Q8B);
+        let (q8a, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&ba, nt, ne, q8a);
-        lq4_blk(wo, q8a, &mut bn, ne, ne, nt);
+        quant_matmul(l.wo.as_ref().unwrap(), q8a, &mut bn, ne, ne, nt);
         for i in 0..hidden.len() { hidden[i] += bn[i]; }
 
         // --- FFN RMSNorm ---
         rms_norm(&hidden, hp.f_norm_rms_eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
 
         // --- SwiGLU ---
-        let (q8f, _) = qb.split_at_mut(nt * nbe * Q8B);
+        let (q8f, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bf[..nt * ne], nt, ne, q8f);
-        lq4_blk(fg, q8f, &mut bg, nf, ne, nt);
-        lq4_blk(fu, q8f, &mut bf, nf, ne, nt);
+        quant_matmul(l.ffn_gate.as_ref().unwrap(), q8f, &mut bg, nf, ne, nt);
+        quant_matmul(l.ffn_up.as_ref().unwrap(), q8f, &mut bf, nf, ne, nt);
         let len = nt * nf;
         let bp = bg.as_mut_ptr();
         unsafe {
@@ -105,9 +164,9 @@ pub fn forward(
         }
         for i in 0..len { bg[i] *= bf[i]; }
 
-        let (q8g, _) = qb.split_at_mut(nt * nbf * Q8B);
+        let (q8g, _rest) = qb.split_at_mut(nt * nbf * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bg[..nt * nf], nt, nf, q8g);
-        lq4_blk(fd, q8g, &mut bn, ne, nf, nt);
+        quant_matmul(l.ffn_down.as_ref().unwrap(), q8g, &mut bn, ne, nf, nt);
         for i in 0..hidden.len() { hidden[i] += bn[i]; }
     }
 
@@ -116,42 +175,124 @@ pub fn forward(
 
     // 4. LM head
     if let Some(output) = &model.output {
-        let (q8e, _) = qb.split_at_mut(nt * nbe * Q8B);
+        let (q8e, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bn, nt, ne, q8e);
         let mut logits = vec![0.0f32; nt * nv];
-        match output.ttype {
-            TensorType::Q8_0 => lq8_blk(output.data_q8_0(), q8e, &mut logits, nv, ne, nt),
-            TensorType::Q4_0 => lq4_blk(output.data_q4_0(), q8e, &mut logits, nv, ne, nt),
-            _ => unreachable!(),
-        }
+        quant_matmul(output, q8e, &mut logits, nv, ne, nt);
         logits
     } else { vec![] }
 }
 
 fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usize) {
-    let blk = 32usize;
-    let nbp = (ne + blk - 1) / blk;
-    let bb = t.ttype.type_size();
-    let is8 = t.ttype == TensorType::Q8_0;
-    for (ti, &id) in ids.iter().enumerate() {
-        let idx = id as usize;
-        let doff = ti * ne;
-        for b in 0..nbp {
-            let off = (idx * nbp + b) * bb;
-            let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-            let mv = blk.min(ne - b * blk);
-            if is8 {
-                for j in 0..mv { out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d; }
-            } else {
-                for j in (0..mv).step_by(2) {
-                    let byte = t.data[off + 2 + j / 2];
-                    let lo = (byte & 0x0F) as i8 - 8;
-                    let hi = (byte >> 4) as i8 - 8;
-                    out[doff + b * blk + j] = lo as f32 * d;
-                    if j + 1 < mv { out[doff + b * blk + j + 1] = hi as f32 * d; }
+    match t.ttype {
+        TensorType::Q4_0 | TensorType::Q8_0 | TensorType::Q4_1 => {
+            let is_q4_1 = t.ttype == TensorType::Q4_1;
+            let blk = 32usize;
+            let nbp = (ne + blk - 1) / blk;
+            let bb = t.ttype.type_size();
+            let is8 = t.ttype == TensorType::Q8_0;
+            let d_off = if is_q4_1 { 2 } else { 0 };
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize;
+                let doff = ti * ne;
+                for b in 0..nbp {
+                    let off = (idx * nbp + b) * bb;
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
+                    let m = if is_q4_1 {
+                        crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]))
+                    } else { 0.0 };
+                    let mv = blk.min(ne - b * blk);
+                    if is8 {
+                        for j in 0..mv { out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d; }
+                    } else if is_q4_1 {
+                        // Q4_1: value = q * d + m (unsigned nibbles 0..15)
+                        for j in (0..mv).step_by(2) {
+                            let byte = t.data[off + 4 + j / 2];
+                            let lo = (byte & 0x0F) as f32;
+                            let hi = (byte >> 4) as f32;
+                            out[doff + b * blk + j] = lo * d + m;
+                            if j + 1 < mv { out[doff + b * blk + j + 1] = hi * d + m; }
+                        }
+                    } else {
+                        // Q4_0: value = (nibble - 8) * d
+                        for j in (0..mv).step_by(2) {
+                            let byte = t.data[off + 2 + j / 2];
+                            let lo = (byte & 0x0F) as i8 - 8;
+                            let hi = (byte >> 4) as i8 - 8;
+                            out[doff + b * blk + j] = lo as f32 * d;
+                            if j + 1 < mv { out[doff + b * blk + j + 1] = hi as f32 * d; }
+                        }
+                    }
                 }
             }
         }
+        TensorType::Q4_K => {
+            // Q4_K embedding: ne=1536 → 6 superblocks of 256 elements each
+            let n_super = (ne + 255) / 256;
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize;
+                let doff = ti * ne;
+                    for s in 0..n_super {
+                        let off = (idx * n_super + s) * Q4KB;
+                        let d    = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
+                        let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
+                        let sc_bytes = <&[u8; 12]>::try_from(&t.data[off + 4..off + 16]).unwrap();
+                        let qs       = &t.data[off + 16..off + 144];
+
+                        // Unpack 12 bytes of scales/mins → 4 × uint32_t
+                        let mut u: [u32; 4] = [0; 4];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(sc_bytes.as_ptr(), u.as_mut_ptr() as *mut u8, 12);
+                        }
+                        const KMASK1: u32 = 0x3f3f3f3f;
+                        const KMASK2: u32 = 0x0f0f0f0f;
+                        const KMASK3: u32 = 0x03030303;
+                        u[3] = ((u[2] >> 4) & KMASK2) | (((u[1] >> 6) & KMASK3) << 4);
+                        let uaux = u[1] & KMASK1;
+                        u[1] = (u[2] & KMASK2) | (((u[0] >> 6) & KMASK3) << 4);
+                        u[2] = uaux;
+                        u[0] &= KMASK1;
+
+                        for sub in 0..8 {
+                            let sc_idx = sub / 4;
+                            let sc_off = sub % 4;
+                            let sc_val = ((u[sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+                            let mm_val = ((u[2 + sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+                        let dl = d * sc_val as f32;
+                        let ml = dmin * mm_val as f32;
+
+                        let base = doff + s * 256 + sub * 32;
+                        let q4_sub = &qs[sub * 16..];
+                        for j in 0..32 {
+                            let nib = if j % 2 == 0 {
+                                q4_sub[j / 2] & 0x0F
+                            } else {
+                                q4_sub[j / 2] >> 4
+                            };
+                            let qval = nib as i8;
+                            out[base + j] = dl * qval as f32 - ml;
+                        }
+                    }
+                }
+            }
+        }
+        _ => panic!("unsupported weight type {:?} in embed_tokens", t.ttype),
+    }
+}
+
+/// 6-bit extract helper (copied from avx2.rs for embedding dequant)
+/// Little-endian packing: val0=src[0][5:0], val1=src[0][7:6]|src[1][3:0], ...
+#[inline]
+fn get6bit_embed(src: &[u8; 3], idx: usize) -> i32 {
+    let a = src[0] as i32;
+    let b = src[1] as i32;
+    let c = src[2] as i32;
+    match idx {
+        0 => a & 0x3F,
+        1 => ((b & 0x0F) << 2) | ((a >> 6) & 0x03),
+        2 => ((c & 0x03) << 4) | ((b >> 4) & 0x0F),
+        3 => (c >> 2) & 0x3F,
+        _ => unreachable!(),
     }
 }
 
@@ -171,28 +312,6 @@ fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize, w: Option<
 
 fn add_bias(x: &mut [f32], b: &[f32], n: usize, d: usize) {
     for t in 0..n { let base = t * d; for i in 0..d.min(b.len()) { x[base + i] += b[i]; } }
-}
-
-fn lq4_blk(w: &[u8], x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
-    let nb = id / 32;
-    for o in 0..od {
-        let wb = &w[o * nb * Q4B..(o + 1) * nb * Q4B];
-        for t in 0..nt {
-            let xb = &x[t * nb * Q8B..(t + 1) * nb * Q8B];
-            out[t * od + o] = crate::avx2::dot_q4_0_q8_0(wb, xb);
-        }
-    }
-}
-
-fn lq8_blk(w: &[u8], x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
-    let nb = id / 32;
-    for o in 0..od {
-        let wb = &w[o * nb * Q8B..(o + 1) * nb * Q8B];
-        for t in 0..nt {
-            let xb = &x[t * nb * Q8B..(t + 1) * nb * Q8B];
-            out[t * od + o] = crate::avx2::dot_q8_0_q8_0(wb, xb);
-        }
-    }
 }
 
 fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32) {
@@ -250,5 +369,3 @@ fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: us
         }
     }
 }
-
-

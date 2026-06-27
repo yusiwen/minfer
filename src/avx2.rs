@@ -2,7 +2,11 @@
 use crate::block::{self, BlockQ4_0, BlockQ8_0};
 
 pub const Q4B: usize = 18;
+pub const Q41B: usize = 20;
 pub const Q8B: usize = 34;
+pub const Q4KB: usize = 144; // sizeof(BlockQ4_K)
+pub const Q6KB: usize = 210; // sizeof(BlockQ6_K)
+pub const Q8KB: usize = 34;  // sizeof(BlockQ8_0), same as Q8B
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -40,6 +44,41 @@ pub fn dot_q4_0_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
         }
     }
     dot_q4_0_q8_0_scalar(q4, q8, nb)
+}
+
+// ============================================================
+// Q4_1 × Q8_0 dot product
+// Q4_1: value = q * d + m  (unsigned nibbles 0..15, no centering)
+// ============================================================
+#[inline]
+pub fn dot_q4_1_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
+    let nb = q8.len() / Q8B;
+    debug_assert!(q4.len() >= nb * Q41B);
+    dot_q4_1_q8_0_scalar(q4, q8, nb)
+}
+
+fn dot_q4_1_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
+    let mut s = 0.0f32;
+    for ib in 0..nb {
+        let xb = &x[ib * Q41B..];
+        let yb = &y[ib * Q8B..];
+        let d  = block::fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
+        let m  = block::fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        let dy = block::fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+        let mut sum_q = 0i32;
+        let mut sum_y = 0i32;
+        for j in 0..16 {
+            let lo = (xb[4 + j] & 0x0F) as i32;
+            let hi = (xb[4 + j] >> 4) as i32;
+            let y0 = yb[2 + j] as i8 as i32;
+            let y1 = yb[2 + j + 16] as i8 as i32;
+            sum_q += lo * y0 + hi * y1;
+            sum_y += y0 + y1;
+        }
+        // Formula: d * dy * Σ(q * y) + m * dy * Σ(y)
+        s += dy * (d * sum_q as f32 + m * sum_y as f32);
+    }
+    s
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -140,6 +179,175 @@ fn dot_q8_0_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
         s += si as f32 * dx * dy;
     }
     s
+}
+
+// ============================================================
+// Q4_K × Q8_0 dot product
+// Q4_K: 256 elements / superblock, 8 subblocks × 32 elements, 144 bytes
+// Q8_0: 32 elements / block, 34 bytes
+// 1 Q4_K superblock needs 8 Q8_0 blocks for the same 256 elements
+// ============================================================
+
+/// Extract a 6-bit value from 3 packed bytes (4 × 6-bit values → 3 bytes)
+/// Little-endian packing: val0=bytes[0][5:0], val1=bytes[0][7:6]|bytes[1][3:0], ...
+#[inline]
+fn get6bit(src: &[u8; 3], idx: usize) -> i32 {
+    let a = src[0] as i32;
+    let b = src[1] as i32;
+    let c = src[2] as i32;
+    match idx {
+        0 => a & 0x3F,
+        1 => ((b & 0x0F) << 2) | ((a >> 6) & 0x03),
+        2 => ((c & 0x03) << 4) | ((b >> 4) & 0x0F),
+        3 => (c >> 2) & 0x3F,
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+pub fn dot_q4_k_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
+    debug_assert!(q4.len() % Q4KB == 0);
+    dot_q4_k_q8_0_scalar(q4, q8)
+}
+
+fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
+    let n_super = q4.len() / Q4KB;
+    let mut sum = 0.0f32;
+
+    for i in 0..n_super {
+        let q4b  = &q4[i * Q4KB..];
+        let q8b  = &q8[i * 8 * Q8B..];
+
+        let d    = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
+        let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
+        let sc   = <&[u8; 12]>::try_from(&q4b[4..16]).unwrap();
+        let qs   = &q4b[16..144];
+
+        // Unpack 12 bytes of scales/mins → 4 × uint32_t
+        // Follows llama.cpp's memcpy+unpack pattern exactly
+        let mut u: [u32; 4] = [0; 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(sc.as_ptr(), u.as_mut_ptr() as *mut u8, 12);
+        }
+        const KMASK1: u32 = 0x3f3f3f3f;
+        const KMASK2: u32 = 0x0f0f0f0f;
+        const KMASK3: u32 = 0x03030303;
+        u[3] = ((u[2] >> 4) & KMASK2) | (((u[1] >> 6) & KMASK3) << 4);
+        let uaux = u[1] & KMASK1;
+        u[1] = (u[2] & KMASK2) | (((u[0] >> 6) & KMASK3) << 4);
+        u[2] = uaux;
+        u[0] &= KMASK1;
+        // u[0] = scales for subblocks 0..3
+        // u[1] = scales for subblocks 4..7
+        // u[2] = mins for subblocks 0..3
+        // u[3] = mins for subblocks 4..7
+        // Each packs 4 × 6-bit: val3<<18 | val2<<12 | val1<<6 | val0
+
+        // 8 subblocks, each 32 elements
+        for s in 0..8 {
+            let sc_idx   = s / 4;
+            let sc_off   = s % 4;
+            let sc_val   = ((u[sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+            let mm_val   = ((u[2 + sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+
+            let dl = d * sc_val as f32;
+            let ml = dmin * mm_val as f32;
+
+            // Q8_0 block for this subblock
+            let q8blk = &q8b[s * Q8B..];
+            let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+            let q8qs = &q8blk[2..];  // 32 i8 quants
+
+            // 32 nibbles from qs for this subblock
+            let q4_sub = &qs[s * 16..];
+
+            // Formula: d_q8 * (dl * Σ(q4 * q8qs[i]) - ml * Σ(q8qs[i]))
+            // Where q4 is unsigned (0-15), dl = d * sc_val, ml = dmin * mm_val
+            let mut sum_sub = 0i32;
+            let mut sum_q8  = 0i32;
+            for j in 0..32 {
+                let nib = if j % 2 == 0 {
+                    q4_sub[j / 2] & 0x0F
+                } else {
+                    q4_sub[j / 2] >> 4
+                };
+                let q8v  = q8qs[j] as i8;
+                sum_sub += (nib as i32) * q8v as i32;
+                sum_q8  += q8v as i32;
+            }
+
+            sum += d_q8 * (dl * sum_sub as f32 - ml * sum_q8 as f32);
+        }
+    }
+
+    sum
+}
+
+// ============================================================
+// Q6_K × Q8_0 dot product
+// Q6_K: 256 elements / superblock, 16 subblocks × 16 elements, 210 bytes
+//   ql[128] = low 4 bits of each value (nibbles)
+//   qh[64]  = high 2 bits of each value (packed 4 per byte)
+//   scales[16] = direct i8 values (no 6-bit unpacking)
+//   d = super-block scale
+// No dmin/min term.
+// ============================================================
+
+#[inline]
+pub fn dot_q6_k_q8_0(q6: &[u8], q8: &[u8]) -> f32 {
+    debug_assert!(q6.len() % Q6KB == 0);
+    dot_q6_k_q8_0_scalar(q6, q8)
+}
+
+fn dot_q6_k_q8_0_scalar(q6: &[u8], q8: &[u8]) -> f32 {
+    let n_super = q6.len() / Q6KB;
+    let mut sum = 0.0f32;
+
+    for i in 0..n_super {
+        let q6b = &q6[i * Q6KB..];
+        let q8b = &q8[i * 8 * Q8B..];
+
+        let d = block::fp16_to_f32(u16::from_le_bytes([q6b[208], q6b[209]])); // d at bytes 208-209
+        // BlockQ6_K { ql[128], qh[64], scales[16], d:Fp16 }
+        // ql[0..128], qh[128..192], scales[192..208], d[208..210]
+        let ql = &q6b[0..128];
+        let qh = &q6b[128..192];
+        let scales = &q6b[192..208];
+
+        // 16 subblocks, each 16 elements
+        for s in 0..16 {
+            let dl = d * scales[s] as f32;
+
+            // Q8_0 block index: each Q6_K superblock of 256 elements = 8 × Q8_0 blocks
+            // But each subblock is only 16 elements = half a Q8_0 block
+            let q8blk_idx = s / 2;  // 2 subblocks per Q8_0 block
+            let q8_offset = (s % 2) * 16;  // 0 or 16 within the Q8_0 block
+            let q8blk = &q8b[q8blk_idx * Q8B..];
+            let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+            let q8qs = &q8blk[2..];
+
+            // Extract 16 × 6-bit values for this subblock
+            let mut sum_sub = 0i32;
+            for j in 0..16 {
+                // Lower 4 bits: nibble from ql
+                let ql_byte = ql[s * 8 + j / 2];
+                let lo = if j % 2 == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+
+                // Upper 2 bits: from qh
+                let qh_byte = qh[s * 4 + j / 4];
+                let hi = (qh_byte >> (2 * (j % 4))) & 0x03;
+
+                let val = ((hi << 4) | lo) as i8;  // 6-bit value in [0..63]
+                let signed_val = val - 32;          // center at 0 → [-32..31]
+
+                sum_sub += (signed_val as i32) * (q8qs[q8_offset + j] as i8 as i32);
+            }
+
+            sum += d_q8 * dl * sum_sub as f32;
+        }
+    }
+
+    sum
 }
 
 // ============================================================
