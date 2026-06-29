@@ -300,54 +300,63 @@ pub fn dot_q6_k_q8_0(q6: &[u8], q8: &[u8]) -> f32 {
 }
 
 fn dot_q6_k_q8_0_scalar(q6: &[u8], q8: &[u8]) -> f32 {
+    // Translated from: llama.cpp/ggml/src/ggml-cpu/quants.c :: ggml_vec_dot_q6_K_q8_K_generic
+    //
+    // Step 1: dequantize Q6_K weights to a[256] (interleaved order matching dequantize_row_q6_K)
+    // Step 2: element-wise dot with Q8_0 activation, per-subblock scale applied to groups of 16
     let n_super = q6.len() / Q6KB;
-    let mut sum = 0.0f32;
+    let mut sumf = 0.0f32;
 
     for i in 0..n_super {
         let q6b = &q6[i * Q6KB..];
         let q8b = &q8[i * 8 * Q8B..];
 
-        let d = block::fp16_to_f32(u16::from_le_bytes([q6b[208], q6b[209]])); // d at bytes 208-209
-        // BlockQ6_K { ql[128], qh[64], scales[16], d:Fp16 }
-        // ql[0..128], qh[128..192], scales[192..208], d[208..210]
+        let d = block::fp16_to_f32(u16::from_le_bytes([q6b[208], q6b[209]]));
         let ql = &q6b[0..128];
         let qh = &q6b[128..192];
-        let scales = &q6b[192..208];
+        let sc = &q6b[192..208];
 
-        // 16 subblocks, each 16 elements
-        for s in 0..16 {
-            let dl = d * scales[s] as f32;
-
-            // Q8_0 block index: each Q6_K superblock of 256 elements = 8 × Q8_0 blocks
-            // But each subblock is only 16 elements = half a Q8_0 block
-            let q8blk_idx = s / 2;  // 2 subblocks per Q8_0 block
-            let q8_offset = (s % 2) * 16;  // 0 or 16 within the Q8_0 block
-            let q8blk = &q8b[q8blk_idx * Q8B..];
-            let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
-            let q8qs = &q8blk[2..];
-
-            // Extract 16 × 6-bit values for this subblock
-            let mut sum_sub = 0i32;
-            for j in 0..16 {
-                // Lower 4 bits: nibble from ql
-                let ql_byte = ql[s * 8 + j / 2];
-                let lo = if j % 2 == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
-
-                // Upper 2 bits: from qh
-                let qh_byte = qh[s * 4 + j / 4];
-                let hi = (qh_byte >> (2 * (j % 4))) & 0x03;
-
-                let val = ((hi << 4) | lo) as i8;  // 6-bit value in [0..63]
-                let signed_val = val - 32;          // center at 0 → [-32..31]
-
-                sum_sub += (signed_val as i32) * (q8qs[q8_offset + j] as i8 as i32);
+        // Dequantize 256 weight values into a[256] (interleaved)
+        let mut a = [0i8; 256];
+        {
+            let mut a_off = 0usize;
+            let mut ql_off = 0usize;
+            let mut qh_off = 0usize;
+            for _ in 0..2 {
+                for l in 0..32 {
+                    let ql0 = ql[ql_off + l] as i32;
+                    let ql1 = ql[ql_off + l + 32] as i32;
+                    let qh_b = qh[qh_off + l] as i32;
+                    a[a_off + l + 0]  = (((ql0 & 0x0F) | ((qh_b       & 3) << 4)) - 32) as i8;
+                    a[a_off + l + 32] = (((ql1 & 0x0F) | ((qh_b >> 2) & 3) << 4) - 32) as i8;
+                    a[a_off + l + 64] = (((ql0 >> 4)   | ((qh_b >> 4) & 3) << 4) - 32) as i8;
+                    a[a_off + l + 96] = (((ql1 >> 4)   | ((qh_b >> 6) & 3) << 4) - 32) as i8;
+                }
+                a_off += 128;
+                ql_off += 64;
+                qh_off += 32;
             }
+        }
 
-            sum += d_q8 * dl * sum_sub as f32;
+        // Dot with Q8_0 activation (8 blocks × 32 elements, each with its own fp16 scale)
+        // 16 groups of 16 elements each, 2 groups share one Q8_0 block
+        for g in 0..16 {
+            let scale = sc[g] as i8 as f32;
+            let blk = g / 2;           // Q8_0 block index (2 groups per block)
+            let blk_off = blk * Q8B;
+            let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8b[blk_off], q8b[blk_off + 1]]));
+            let q8q = &q8b[blk_off + 2..];
+            let mut sum_sub = 0i32;
+            for k in 0..16 {
+                let elem = g * 16 + k;
+                let off = elem % 32;
+                sum_sub += (a[elem] as i32) * (q8q[off] as i8 as i32);
+            }
+            sumf += d * scale * d_q8 * sum_sub as f32;
         }
     }
 
-    sum
+    sumf
 }
 
 // ============================================================

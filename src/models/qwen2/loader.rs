@@ -175,6 +175,14 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
 
     let mut tensor = Tensor::from_data_with_strides(ttype, &shape, &strides, data);
     tensor.set_name(&ti.name);
+
+    // Register quantized weight tensors with MPS (Apple Silicon GPU)
+    if let Some(mps) = crate::metal::MpsState::get() {
+        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q6_K | TensorType::Q8_0) {
+            mps.register_weight(&ti.name, tensor.data());
+        }
+    }
+
     tensor
 }
 

@@ -1,78 +1,13 @@
 // Qwen2 forward pass — &[u8] everywhere (minfer2 pattern)
 
 use crate::cache::KVCache;
-use crate::tensor::{Tensor, TensorType};
+use crate::tensor::TensorType;
 
-const Q4B: usize = 18;
-const Q41B: usize = 20;
+// Q8B and Q4KB are still used locally (buffer allocation, embed_tokens);
+// other block size constants moved to crate::kernel.
 const Q8B: usize = 34;
 const Q4KB: usize = 144;
 const Q6KB: usize = 210;
-
-// ============================================================
-// Dispatched quantized matmul: weight tensor × Q8_0 activation
-// ============================================================
-
-fn quant_matmul(w: &Tensor, x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
-    match w.ttype {
-        TensorType::Q4_0 => {
-            let nb = id / 32;
-            let ws = nb * Q4B;
-            let wb = w.data();
-            for o in 0..od {
-                let wrow = &wb[o * ws..(o + 1) * ws];
-                for t in 0..nt {
-                    out[t * od + o] = crate::avx2::dot_q4_0_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
-                }
-            }
-        }
-        TensorType::Q4_1 => {
-            let nb = id / 32;
-            let ws = nb * Q41B;
-            let wb = w.data();
-            for o in 0..od {
-                let wrow = &wb[o * ws..(o + 1) * ws];
-                for t in 0..nt {
-                    out[t * od + o] = crate::avx2::dot_q4_1_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
-                }
-            }
-        }
-        TensorType::Q4_K => {
-            let nk = id / 256;
-            let ws = nk * Q4KB;
-            let wb = w.data();
-            for o in 0..od {
-                let wrow = &wb[o * ws..(o + 1) * ws];
-                for t in 0..nt {
-                    out[t * od + o] = crate::avx2::dot_q4_k_q8_0(wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
-                }
-            }
-        }
-        TensorType::Q6_K => {
-            let nk = id / 256;
-            let ws = nk * Q6KB;
-            let wb = w.data();
-            for o in 0..od {
-                let wrow = &wb[o * ws..(o + 1) * ws];
-                for t in 0..nt {
-                    out[t * od + o] = crate::avx2::dot_q6_k_q8_0(wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
-                }
-            }
-        }
-        TensorType::Q8_0 => {
-            let nb = id / 32;
-            let ws = nb * Q8B;
-            let wb = w.data();
-            for o in 0..od {
-                let wrow = &wb[o * ws..(o + 1) * ws];
-                for t in 0..nt {
-                    out[t * od + o] = crate::avx2::dot_q8_0_q8_0(wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
-                }
-            }
-        }
-        _ => panic!("unsupported weight type {:?} in quant_matmul", w.ttype),
-    }
-}
 
 pub fn forward(
     model: &super::Qwen2Model,
@@ -122,11 +57,11 @@ pub fn forward(
         crate::avx2::quantize_row_q8_0_buf(&bn, nt, ne, q8);
 
         // --- QKV ---
-        quant_matmul(l.wq.as_ref().unwrap(), q8, &mut bq, nqt, ne, nt);
+        crate::kernel::quant_matmul(l.wq.as_ref().unwrap(), q8, &mut bq, nqt, ne, nt);
         if let Some(b) = &l.bq { add_bias(&mut bq, b.data_f32(), nt, nqt); }
-        quant_matmul(l.wk.as_ref().unwrap(), q8, &mut bk, nkt, ne, nt);
+        crate::kernel::quant_matmul(l.wk.as_ref().unwrap(), q8, &mut bk, nkt, ne, nt);
         if let Some(b) = &l.bk { add_bias(&mut bk, b.data_f32(), nt, nkt); }
-        quant_matmul(l.wv.as_ref().unwrap(), q8, &mut bv, nkt, ne, nt);
+        crate::kernel::quant_matmul(l.wv.as_ref().unwrap(), q8, &mut bv, nkt, ne, nt);
         if let Some(b) = &l.bv { add_bias(&mut bv, b.data_f32(), nt, nkt); }
 
         // --- RoPE ---
@@ -144,7 +79,7 @@ pub fn forward(
         // --- Wo ---
         let (q8a, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&ba, nt, ne, q8a);
-        quant_matmul(l.wo.as_ref().unwrap(), q8a, &mut bn, ne, ne, nt);
+        crate::kernel::quant_matmul(l.wo.as_ref().unwrap(), q8a, &mut bn, ne, ne, nt);
         for i in 0..hidden.len() { hidden[i] += bn[i]; }
 
         // --- FFN RMSNorm ---
@@ -153,8 +88,8 @@ pub fn forward(
         // --- SwiGLU ---
         let (q8f, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bf[..nt * ne], nt, ne, q8f);
-        quant_matmul(l.ffn_gate.as_ref().unwrap(), q8f, &mut bg, nf, ne, nt);
-        quant_matmul(l.ffn_up.as_ref().unwrap(), q8f, &mut bf, nf, ne, nt);
+        crate::kernel::quant_matmul(l.ffn_gate.as_ref().unwrap(), q8f, &mut bg, nf, ne, nt);
+        crate::kernel::quant_matmul(l.ffn_up.as_ref().unwrap(), q8f, &mut bf, nf, ne, nt);
         let len = nt * nf;
         let bp = bg.as_mut_ptr();
         unsafe {
@@ -166,7 +101,7 @@ pub fn forward(
 
         let (q8g, _rest) = qb.split_at_mut(nt * nbf * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bg[..nt * nf], nt, nf, q8g);
-        quant_matmul(l.ffn_down.as_ref().unwrap(), q8g, &mut bn, ne, nf, nt);
+        crate::kernel::quant_matmul(l.ffn_down.as_ref().unwrap(), q8g, &mut bn, ne, nf, nt);
         for i in 0..hidden.len() { hidden[i] += bn[i]; }
     }
 
@@ -178,7 +113,7 @@ pub fn forward(
         let (q8e, _rest) = qb.split_at_mut(nt * nbe * Q8B);
         crate::avx2::quantize_row_q8_0_buf(&bn, nt, ne, q8e);
         let mut logits = vec![0.0f32; nt * nv];
-        quant_matmul(output, q8e, &mut logits, nv, ne, nt);
+        crate::kernel::quant_matmul(output, q8e, &mut logits, nv, ne, nt);
         logits
     } else { vec![] }
 }
@@ -277,6 +212,49 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                             let qval = nib as i8;
                             out[base + j] = dl * qval as f32 - ml;
                         }
+                    }
+                }
+            }
+        }
+        TensorType::Q6_K => {
+            // Translated from: llama.cpp/ggml/src/ggml-quants.c :: dequantize_row_q6_K
+            // BlockQ6_K: ql[128], qh[64], scales[16](i8), d[2](f16) = 210 bytes, 256 elements
+            let n_super = (ne + 255) / 256;
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize;
+                let doff = ti * ne;
+                for s in 0..n_super {
+                    let off = (idx * n_super + s) * Q6KB;
+                    let d = crate::block::fp16_to_f32(
+                        u16::from_le_bytes([t.data[off + 208], t.data[off + 209]]));
+
+                    let mut out_pos = doff + s * 256;
+                    let mut ql_pos = off;
+                    let mut qh_pos = off + 128;
+                    let mut sc_pos = off + 192;
+
+                    for _ in 0..2 {
+                        for l in 0..32 {
+                            let is = l / 16;
+                            let ql0 = t.data[ql_pos + l];
+                            let ql1 = t.data[ql_pos + l + 32];
+                            let qh  = t.data[qh_pos + l];
+
+                            let q1 = ((ql0 & 0x0F) as i32 | (((qh as i32 >> 0) & 3) << 4)) - 32;
+                            let q2 = ((ql1 & 0x0F) as i32 | (((qh as i32 >> 2) & 3) << 4)) - 32;
+                            let q3 = ((ql0 >> 4) as i32        | (((qh as i32 >> 4) & 3) << 4)) - 32;
+                            let q4 = ((ql1 >> 4) as i32        | (((qh as i32 >> 6) & 3) << 4)) - 32;
+
+                            let sc = &t.data[sc_pos..];
+                            out[out_pos + l + 0]  = d * (sc[is + 0] as i8 as f32) * q1 as f32;
+                            out[out_pos + l + 32] = d * (sc[is + 2] as i8 as f32) * q2 as f32;
+                            out[out_pos + l + 64] = d * (sc[is + 4] as i8 as f32) * q3 as f32;
+                            out[out_pos + l + 96] = d * (sc[is + 6] as i8 as f32) * q4 as f32;
+                        }
+                        out_pos += 128;
+                        ql_pos += 64;
+                        qh_pos += 32;
+                        sc_pos += 8;
                     }
                 }
             }

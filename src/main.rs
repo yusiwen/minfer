@@ -6,6 +6,7 @@
 mod gguf;
 mod block;
 mod avx2;
+mod kernel;
 mod tensor;
 mod vec_ops;
 mod sampler;
@@ -13,6 +14,7 @@ mod tokenizer;
 mod template;
 mod cache;
 mod models;
+mod metal;
 mod download;
 
 use std::time::Instant;
@@ -132,6 +134,9 @@ fn main() {
     } else {
         println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
     }
+
+    // === Initialize MPS (Apple Silicon GPU backend) ===
+    metal::MpsState::init();
 
     // === Load model (dispatches on general.architecture) ===
     let model = models::load_model(&ctx, &data).expect("load model");
