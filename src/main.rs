@@ -33,10 +33,14 @@ impl Default for GenParams {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let meta_flag = raw_args.iter().any(|a| a == "--meta");
+    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--meta").collect();
+
     if args.len() < 2 {
         eprintln!("Usage:");
         eprintln!("  {} <model> [prompt]              — run inference", args[0]);
+        eprintln!("  {} --meta <model> [prompt]       — run with GGUF metadata dump", args[0]);
         eprintln!("  {} download hf <repo> [file]      — download from Hugging Face", args[0]);
         eprintln!("  {} download ollama <model>[:tag]   — pull from Ollama", args[0]);
         eprintln!("  {} list                           — list cached models", args[0]);
@@ -123,11 +127,19 @@ fn main() {
     println!("File: {} bytes ({:.1} MB)", data.len(), data.len() as f64 / 1_048_576.0);
 
     let ctx = gguf::GgufContext::init_from_data(&data).expect("parse GGUF");
-    println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
+    if meta_flag {
+        dump_gguf_metadata(&ctx);
+    } else {
+        println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
+    }
 
     // === Load model (dispatches on general.architecture) ===
     let model = models::load_model(&ctx, &data).expect("load model");
-    println!("Model loaded.");
+    if meta_flag {
+        dump_key_tensors(&ctx);
+    } else {
+        println!("Model loaded.");
+    }
 
     // === KV Cache ===
     let n_embd_head = model.n_embd_head();
@@ -199,6 +211,113 @@ fn main() {
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
     id == special.eos || Some(id) == special.im_end || id == 0 || id == 2
+}
+
+fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {
+    const SHOW_PREFIX: usize = 5;
+    const SHOW_SUFFIX: usize = 3;
+    if items.len() <= SHOW_PREFIX + SHOW_SUFFIX {
+        eprintln!("  {} (arr:{}) = {:?}", key, label, items);
+    } else {
+        eprint!("  {} (arr:{}) = [", key, label);
+        for i in 0..SHOW_PREFIX {
+            if i > 0 { eprint!(", "); }
+            eprint!("{:?}", items[i]);
+        }
+        eprint!(", ..., ");
+        for i in items.len() - SHOW_SUFFIX..items.len() {
+            if i > items.len() - SHOW_SUFFIX { eprint!(", "); }
+            eprint!("{:?}", items[i]);
+        }
+        eprintln!("]");
+    }
+}
+
+fn dump_gguf_metadata(ctx: &gguf::GgufContext) {
+    use gguf::GgufType;
+    eprintln!("\n=== GGUF Metadata ===");
+    for kv in &ctx.kv {
+        let key = kv.get_key();
+        if kv.is_array {
+            let ne = kv.get_ne();
+            match kv.get_type() {
+                GgufType::String => {
+                    let items: Vec<&str> = (0..ne).map(|i| kv.get_val_str(i)).collect();
+                    dump_array(key, "str", &items);
+                }
+                GgufType::Int32 => {
+                    let items: Vec<i32> = (0..ne).map(|i| kv.get_val_i32(i)).collect();
+                    dump_array(key, "i32", &items);
+                }
+                GgufType::Uint32 => {
+                    let items: Vec<u32> = (0..ne).map(|i| kv.get_val_u32(i)).collect();
+                    dump_array(key, "u32", &items);
+                }
+                GgufType::Float32 => {
+                    let items: Vec<f32> = (0..ne).map(|i| kv.get_val_f32(i)).collect();
+                    dump_array(key, "f32", &items);
+                }
+                GgufType::Int64 => {
+                    let items: Vec<i64> = (0..ne).map(|i| kv.get_val_i64(i)).collect();
+                    dump_array(key, "i64", &items);
+                }
+                GgufType::Uint64 => {
+                    let items: Vec<u64> = (0..ne).map(|i| kv.get_val_u64(i)).collect();
+                    dump_array(key, "u64", &items);
+                }
+                GgufType::Float64 => {
+                    let items: Vec<f64> = (0..ne).map(|i| kv.get_val_f64(i)).collect();
+                    dump_array(key, "f64", &items);
+                }
+                t => eprintln!("  {} (arr:{:?}) = <{} elements>", key, t, ne),
+            }
+        } else {
+            match kv.get_type() {
+                GgufType::String => eprintln!("  {} = \"{}\"", key, kv.get_val_str(0)),
+                GgufType::Bool => eprintln!("  {} = {}", key, kv.get_val_bool(0)),
+                GgufType::Int32 => eprintln!("  {} = {}", key, kv.get_val_i32(0)),
+                GgufType::Uint32 => eprintln!("  {} = {}", key, kv.get_val_u32(0)),
+                GgufType::Int64 => eprintln!("  {} = {}", key, kv.get_val_i64(0)),
+                GgufType::Uint64 => eprintln!("  {} = {}", key, kv.get_val_u64(0)),
+                GgufType::Float32 => eprintln!("  {} = {}", key, kv.get_val_f32(0)),
+                GgufType::Float64 => eprintln!("  {} = {}", key, kv.get_val_f64(0)),
+                t => eprintln!("  {} ({:?})", key, t),
+            }
+        }
+    }
+    eprintln!("=== Metadata End ===");
+}
+
+fn dump_key_tensors(ctx: &gguf::GgufContext) {
+    let key_names = [
+        "token_embd.weight",
+        "output_norm.weight",
+        "output.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_q.bias",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_k.bias",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_v.bias",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_norm.weight",
+    ];
+    eprintln!("--- Key Tensors ---");
+    for name in &key_names {
+        if let Some(ti) = ctx.info.iter().find(|t| t.name == *name) {
+            let dims: Vec<String> = {
+                let mut d: Vec<String> = ti.ne.iter().filter(|&&v| v > 0).map(|v| v.to_string()).collect();
+                if d.is_empty() { d.push("1".into()); }
+                d
+            };
+            eprintln!("  {:<50} {}  [{}]", ti.name, ti.type_.type_name(), dims.join(","));
+        }
+    }
+    eprintln!("--------");
 }
 
 fn get_chat_template(data: &[u8]) -> Option<String> {

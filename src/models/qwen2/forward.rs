@@ -191,7 +191,6 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
             let nbp = (ne + blk - 1) / blk;
             let bb = t.ttype.type_size();
             let is8 = t.ttype == TensorType::Q8_0;
-            let d_off = if is_q4_1 { 2 } else { 0 };
             for (ti, &id) in ids.iter().enumerate() {
                 let idx = id as usize;
                 let doff = ti * ne;
@@ -206,21 +205,27 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                         for j in 0..mv { out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d; }
                     } else if is_q4_1 {
                         // Q4_1: value = q * d + m (unsigned nibbles 0..15)
-                        for j in (0..mv).step_by(2) {
-                            let byte = t.data[off + 4 + j / 2];
-                            let lo = (byte & 0x0F) as f32;
-                            let hi = (byte >> 4) as f32;
-                            out[doff + b * blk + j] = lo * d + m;
-                            if j + 1 < mv { out[doff + b * blk + j + 1] = hi * d + m; }
+                        // Interleaved: qs[0]{v0, v16}, qs[1]{v1, v17}, ..., qs[15]{v15, v31}
+                        for j in 0..16 {
+                            let byte = t.data[off + 4 + j];
+                            if j < mv {
+                                out[doff + b * blk + j] = (byte & 0x0F) as f32 * d + m;
+                            }
+                            if j + 16 < mv {
+                                out[doff + b * blk + j + 16] = (byte >> 4) as f32 * d + m;
+                            }
                         }
                     } else {
                         // Q4_0: value = (nibble - 8) * d
-                        for j in (0..mv).step_by(2) {
-                            let byte = t.data[off + 2 + j / 2];
-                            let lo = (byte & 0x0F) as i8 - 8;
-                            let hi = (byte >> 4) as i8 - 8;
-                            out[doff + b * blk + j] = lo as f32 * d;
-                            if j + 1 < mv { out[doff + b * blk + j + 1] = hi as f32 * d; }
+                        // Interleaved: qs[0]{v0, v16}, qs[1]{v1, v17}, ..., qs[15]{v15, v31}
+                        for j in 0..16 {
+                            let byte = t.data[off + 2 + j];
+                            if j < mv {
+                                out[doff + b * blk + j] = ((byte & 0x0F) as i8 - 8) as f32 * d;
+                            }
+                            if j + 16 < mv {
+                                out[doff + b * blk + j + 16] = ((byte >> 4) as i8 - 8) as f32 * d;
+                            }
                         }
                     }
                 }
