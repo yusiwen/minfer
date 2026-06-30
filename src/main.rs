@@ -14,6 +14,7 @@ mod tokenizer;
 mod template;
 mod cache;
 mod models;
+#[cfg(target_os = "macos")]
 mod metal;
 mod download;
 
