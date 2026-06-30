@@ -1,6 +1,5 @@
-// Phase 1: GGUF Format Parser
+// GGUF Format Parser
 // Translated from: llama.cpp/ggml/src/gguf.cpp + ggml/include/gguf.h
-// Strict 1:1 translation — no extra code, no design changes
 
 use std::fmt;
 use std::mem;

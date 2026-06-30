@@ -176,9 +176,12 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     let mut tensor = Tensor::from_data_with_strides(ttype, &shape, &strides, data);
     tensor.set_name(&ti.name);
 
-    // Register quantized weight tensors with MPS (Apple Silicon GPU)
+    // Register weight tensors with MPS (Apple Silicon GPU).
+    // Quantized weights are used by matmul kernels; f32 norm weights are used by RMSNorm.
     if let Some(mps) = crate::metal::MpsState::get() {
         if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q6_K | TensorType::Q8_0) {
+            mps.register_weight(&ti.name, tensor.data());
+        } else if ttype == TensorType::F32 {
             mps.register_weight(&ti.name, tensor.data());
         }
     }

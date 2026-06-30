@@ -1,7 +1,6 @@
-// Phase 4: Tensor Structure + Basic Operations
+// Tensor Structure + Basic Operations
 // Translated from: llama.cpp/ggml/include/ggml.h (struct ggml_tensor, lines 667-699)
 //   + ggml/src/ggml.c (ggml_nelements, ggml_nbytes, ggml_nrows, lines 1259-1294)
-// Strict 1:1 translation — no extra code, no design changes
 
 use crate::block;
 use crate::gguf::GgmlType;

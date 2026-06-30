@@ -1,6 +1,5 @@
-// Phase 8: Sampler — greedy, temperature, top-k, top-p
+// Sampler — greedy, temperature, top-k, top-p
 // Translated from: llama.cpp/src/llama-sampling.cpp (simplified)
-// Strict 1:1 translation of sampling logic
 
 use rand::Rng;
 

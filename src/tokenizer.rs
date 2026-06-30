@@ -1,4 +1,4 @@
-// Phase 9: BPE Tokenizer (self-contained, no external deps)
+// BPE Tokenizer (self-contained, no external deps)
 // Translated from: llama.cpp/src/llama-vocab.cpp + minfer2/src/tokenizer.rs
 // Loads tokens, scores, types, and BPE merges directly from GGUF metadata
 

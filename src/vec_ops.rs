@@ -1,7 +1,6 @@
-// Phase 5: SIMD Vector Operations + Core Ops
+// SIMD Vector Operations + Core Ops
 // Translated from: llama.cpp/ggml/src/ggml-cpu/vec.cpp + vec.h
 //   + ggml/src/ggml-cpu/ops.cpp (RMSNorm, RoPE, Softmax sections)
-// Strict 1:1 translation — no extra code, no design changes
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

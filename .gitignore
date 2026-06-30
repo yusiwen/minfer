@@ -4,3 +4,4 @@
 *.npy
 *.f32
 .env
+.qoder/

@@ -4,32 +4,66 @@
 // Translated from: llama.cpp/ggml/src/ggml-metal (ops dispatch pattern)
 
 use crate::tensor::{Tensor, TensorType};
+use crate::block::{Q4B, Q41B, Q8B, Q4KB, Q6KB};
 
-// Block size constants (matching avx2.rs)
-pub const Q4B: usize = 18;
-pub const Q41B: usize = 20;
-pub const Q8B: usize = 34;
-pub const Q4KB: usize = 144;
-pub const Q6KB: usize = 210;
+/// Minimum batch size for GPU dispatch (llama.cpp uses `op_offload_min_batch_size = 32`).
+/// Below this threshold, CPU is often faster due to kernel launch overhead.
+const GPU_MIN_BATCH: usize = 1;
 
-/// Quantized matmul: dispatch to MPS (Apple Silicon) or CPU (AVX2/scalar).
-/// `w`:   weight tensor (Q4_0/Q4_1/Q4_K/Q6_K/Q8_0 quantized)
-/// `x`:   Q8_0 quantized activation buffer (nt rows × id/32*Q8B bytes each)
-/// `out`: output f32 buffer (nt rows × od)
-/// `od`:  output dimension (weight rows)
-/// `id`:  input dimension (activation columns)
-/// `nt`:  number of tokens (activation rows)
+/// Quantized matmul with f32 activation.
+/// GPU path passes f32 directly; CPU path quantizes internally.
+pub fn quant_matmul_f32(
+    w: &Tensor, x: &[f32], out: &mut [f32],
+    od: usize, id: usize, nt: usize,
+) {
+    #[cfg(target_os = "macos")]
+    if nt >= GPU_MIN_BATCH {
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if mps.has_weight(&w.name) {
+                return mps.quant_matmul_f32(w, x, out, od, id, nt);
+            }
+        }
+    }
+    cpu_quant_matmul_f32(w, x, out, od, id, nt)
+}
+
+/// Quantize `x` once and run several Q4_0 matmuls that share the same activation.
+/// This reduces per-matmul command-buffer and upload overhead.
+pub fn quant_matmul_f32_batch(
+    mats: &mut [(/*weight*/ &Tensor, /*output*/ &mut [f32], /*od*/ usize)],
+    x: &[f32], id: usize, nt: usize,
+) {
+    #[cfg(target_os = "macos")]
+    if nt >= GPU_MIN_BATCH {
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if mats.iter().all(|(w, _out, _od)| mps.has_weight(&w.name)) {
+                return mps.quant_matmul_f32_batch(mats, x, id, nt);
+            }
+        }
+    }
+    // CPU fallback: run each matmul independently.
+    for mat in mats.iter_mut() {
+        cpu_quant_matmul_f32(mat.0, x, mat.1, mat.2, id, nt);
+    }
+}
+
+/// Q8_0 activation matmul (kept for backward compat, now delegates to f32 path).
 pub fn quant_matmul(
     w: &Tensor, x: &[u8], out: &mut [f32],
     od: usize, id: usize, nt: usize,
 ) {
-    #[cfg(target_os = "macos")]
-    if let Some(mps) = crate::metal::MpsState::get() {
-        if mps.has_weight(&w.name) {
-            return mps.quant_matmul(w, x, out, od, id, nt);
-        }
-    }
     cpu_quant_matmul(w, x, out, od, id, nt)
+}
+
+/// CPU fallback for f32 activation: quantize → call existing dot product.
+pub fn cpu_quant_matmul_f32(
+    w: &Tensor, x: &[f32], out: &mut [f32],
+    od: usize, id: usize, nt: usize,
+) {
+    let nbe = id / 32;
+    let mut qb = vec![0u8; nt * nbe * Q8B];
+    crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut qb);
+    cpu_quant_matmul(w, &qb, out, od, id, nt)
 }
 
 pub fn cpu_quant_matmul(

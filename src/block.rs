@@ -1,8 +1,7 @@
-// Phase 2: Quantized Block Types + fp16 Utilities
+// Quantized Block Types + fp16 Utilities
 // Translated from: llama.cpp/ggml/src/ggml-common.h (block structs)
 //   + ggml/src/ggml-impl.h (fp16 conversion)
 //   + ggml/include/ggml.h (fp16 type)
-// Strict 1:1 translation — no extra code, no design changes
 
 // === fp16 type (ggml.h line 370) ===
 
@@ -24,10 +23,14 @@ pub fn f32_to_fp16(f: f32) -> Fp16 {
     half::f16::from_f32(f).to_bits()
 }
 
-// === Block size constants (ggml-common.h) ===
+// === Block byte-size constants (ggml-common.h) ===
 
-pub const QK_K: i64 = 256;
-pub const K_SCALE_SIZE: usize = 12;
+pub const Q4B: usize = 18;   // sizeof(block_q4_0)
+pub const Q41B: usize = 20;  // sizeof(block_q4_1)
+pub const Q8B: usize = 34;   // sizeof(block_q8_0)
+pub const Q4KB: usize = 144; // sizeof(block_q4_k)
+pub const Q6KB: usize = 210; // sizeof(block_q6_k)
+pub const Q8KB: usize = 34;  // sizeof(block_q8_0), same as Q8B
 
 // === Quantized Block Structures (ggml-common.h) ===
 

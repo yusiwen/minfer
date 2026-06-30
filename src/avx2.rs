@@ -1,12 +1,5 @@
 // AVX2 kernels — all &[u8] interface. Directly follows minfer2/src/quant.rs pattern.
-use crate::block::{self, BlockQ4_0, BlockQ8_0};
-
-pub const Q4B: usize = 18;
-pub const Q41B: usize = 20;
-pub const Q8B: usize = 34;
-pub const Q4KB: usize = 144; // sizeof(BlockQ4_K)
-pub const Q6KB: usize = 210; // sizeof(BlockQ6_K)
-pub const Q8KB: usize = 34;  // sizeof(BlockQ8_0), same as Q8B
+use crate::block::{self, BlockQ4_0, BlockQ8_0, Q4B, Q41B, Q8B, Q4KB, Q6KB, Q8KB};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -468,4 +461,236 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
     let x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
     let x128 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
     _mm_cvtss_f32(_mm_add_ss(x128, _mm_movehdup_ps(x128)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32_to_fp16(v: f32) -> u16 { half::f16::from_f32(v).to_bits() }
+
+    fn make_q4k_block(d: f32, dmin: f32, scales: &[u8; 8], mins: &[u8; 8], values: &[u8; 128]) -> Vec<u8> {
+        let mut block = vec![0u8; Q4KB];
+        let d_bits = f32_to_fp16(d).to_le_bytes();
+        let dm_bits = f32_to_fp16(dmin).to_le_bytes();
+        block[0] = d_bits[0]; block[1] = d_bits[1];
+        block[2] = dm_bits[0]; block[3] = dm_bits[1];
+        let mut raw = [0u8; 12];
+        for j in 0..4usize {
+            raw[j]   = (scales[j] & 0x3F) | (((scales[j+4] >> 4) & 0x03) << 6);
+            raw[j+4] = (mins[j] & 0x3F)   | (((mins[j+4] >> 4) & 0x03) << 6);
+            raw[j+8] = (scales[j+4] & 0x0F) | ((mins[j+4] & 0x0F) << 4);
+        }
+        block[4..16].copy_from_slice(&raw);
+        block[16..144].copy_from_slice(values);
+        block
+    }
+
+    fn make_q80_block(d: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = vec![0u8; Q8B];
+        let d_bits = f32_to_fp16(d).to_le_bytes();
+        block[0] = d_bits[0]; block[1] = d_bits[1];
+        for j in 0..32 { block[2 + j] = values[j] as u8; }
+        block
+    }
+
+    fn reference_dot(q4: &[u8], q8: &[u8]) -> f32 {
+        let n_super = q4.len() / Q4KB;
+        let mut sum = 0.0f32;
+        for i in 0..n_super {
+            let q4b = &q4[i * Q4KB..];
+            let q8b = &q8[i * 8 * Q8B..];
+            let d = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
+            let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
+            let mut u: [u32; 4] = [0; 4];
+            unsafe { std::ptr::copy_nonoverlapping(&q4b[4], u.as_mut_ptr() as *mut u8, 12); }
+            const K1: u32 = 0x3f3f3f3f; const K2: u32 = 0x0f0f0f0f; const K3: u32 = 0x03030303;
+            u[3] = ((u[2] >> 4) & K2) | (((u[1] >> 6) & K3) << 4);
+            let uaux = u[1] & K1; u[1] = (u[2] & K2) | (((u[0] >> 6) & K3) << 4); u[2] = uaux; u[0] &= K1;
+            for s in 0..8usize {
+                let si = s / 4; let so = s % 4;
+                let sv = ((u[si] >> (6 * so)) & 0x3F) as f32;
+                let mv = ((u[2 + si] >> (6 * so)) & 0x3F) as f32;
+                let dl = d * sv; let ml = dmin * mv;
+                let q8blk = &q8b[s * Q8B..];
+                let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+                let q4_sub = &q4b[16 + s * 16..];
+                for j in 0..32usize {
+                    let nib = if j % 2 == 0 { q4_sub[j/2] & 0x0F } else { q4_sub[j/2] >> 4 };
+                    let w = dl * nib as f32 - ml;
+                    let y = d_q8 * q8blk[2 + j] as i8 as f32;
+                    sum += w * y;
+                }
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn test_q4k_dot_simple() {
+        let scales = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mins = [0u8; 8];
+        let mut values = [0u8; 128];
+        for i in 0..128 { values[i] = (i % 16) as u8; }
+        let q4k = make_q4k_block(0.1, 0.0, &scales, &mins, &values);
+        let mut q8_vals = [0i8; 32];
+        for i in 0..32 { q8_vals[i] = (i as i8) - 16; }
+        let mut q8d = Vec::new();
+        for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
+        let r = reference_dot(&q4k, &q8d);
+        let t = dot_q4_k_q8_0(&q4k, &q8d);
+        eprintln!("Test 1: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    #[test]
+    fn test_q4k_dot_nonzero_mins() {
+        let scales = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mins = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut values = [0u8; 128];
+        for i in 0..128 { values[i] = (i % 16) as u8; }
+        let q4k = make_q4k_block(0.1, 0.05, &scales, &mins, &values);
+        let mut q8_vals = [0i8; 32];
+        for i in 0..32 { q8_vals[i] = (i as i8) - 16; }
+        let mut q8d = Vec::new();
+        for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
+        let r = reference_dot(&q4k, &q8d);
+        let t = dot_q4_k_q8_0(&q4k, &q8d);
+        eprintln!("Test 2: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    #[test]
+    fn test_q4k_dot_random() {
+        let mut rng: u32 = 12345;
+        let mut next = || -> u8 { rng = rng.wrapping_mul(1103515245).wrapping_add(12345); (rng >> 16) as u8 };
+        let sc: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let mn: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let vl: [u8; 128] = std::array::from_fn(|_| next());
+        let q4k = make_q4k_block(0.0123, 0.0045, &sc, &mn, &vl);
+        let mut q8d = Vec::new();
+        for _ in 0..8 {
+            let qv: [i8; 32] = std::array::from_fn(|_| next() as i8);
+            q8d.extend_from_slice(&make_q80_block(0.03, &qv));
+        }
+        let r = reference_dot(&q4k, &q8d);
+        let t = dot_q4_k_q8_0(&q4k, &q8d);
+        eprintln!("Test 3: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    #[test]
+    fn test_q4k_dot_multi_superblocks() {
+        let mut rng: u32 = 99999;
+        let mut next = || -> u8 { rng = rng.wrapping_mul(1103515245).wrapping_add(12345); (rng >> 16) as u8 };
+        let mut q4m = Vec::new();
+        let mut q8m = Vec::new();
+        for _ in 0..3 {
+            let sc: [u8; 8] = std::array::from_fn(|_| next() % 64);
+            let mn: [u8; 8] = std::array::from_fn(|_| next() % 64);
+            let vl: [u8; 128] = std::array::from_fn(|_| next());
+            q4m.extend_from_slice(&make_q4k_block(0.05, 0.02, &sc, &mn, &vl));
+            for _ in 0..8 {
+                let qv: [i8; 32] = std::array::from_fn(|_| next() as i8);
+                q8m.extend_from_slice(&make_q80_block(0.04, &qv));
+            }
+        }
+        let r = reference_dot(&q4m, &q8m);
+        let t = dot_q4_k_q8_0(&q4m, &q8m);
+        eprintln!("Test 4: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    fn make_q6k_block(d: f32, scales: &[i8; 16], ql: &[u8; 128], qh: &[u8; 64]) -> Vec<u8> {
+        let mut block = vec![0u8; Q6KB];
+        block[0..128].copy_from_slice(ql);
+        block[128..192].copy_from_slice(qh);
+        for i in 0..16 { block[192 + i] = scales[i] as u8; }
+        let d_bits = f32_to_fp16(d).to_le_bytes();
+        block[208] = d_bits[0]; block[209] = d_bits[1];
+        block
+    }
+
+    fn reference_dot_q6k(q6: &[u8], q8: &[u8]) -> f32 {
+        let n_super = q6.len() / Q6KB;
+        let mut sumf = 0.0f32;
+        for i in 0..n_super {
+            let q6b = &q6[i * Q6KB..];
+            let q8b = &q8[i * 8 * Q8B..];
+            let d = block::fp16_to_f32(u16::from_le_bytes([q6b[208], q6b[209]]));
+            let ql = &q6b[0..128];
+            let qh = &q6b[128..192];
+            let sc = &q6b[192..208];
+            let mut a = [0i8; 256];
+            {
+                let mut a_off = 0usize;
+                let mut ql_off = 0usize;
+                let mut qh_off = 0usize;
+                for _ in 0..2 {
+                    for l in 0..32 {
+                        let ql0 = ql[ql_off + l] as i32;
+                        let ql1 = ql[ql_off + l + 32] as i32;
+                        let qh_b = qh[qh_off + l] as i32;
+                        a[a_off + l + 0]  = (((ql0 & 0x0F) | ((qh_b       & 3) << 4)) - 32) as i8;
+                        a[a_off + l + 32] = (((ql1 & 0x0F) | ((qh_b >> 2) & 3) << 4) - 32) as i8;
+                        a[a_off + l + 64] = (((ql0 >> 4)   | ((qh_b >> 4) & 3) << 4) - 32) as i8;
+                        a[a_off + l + 96] = (((ql1 >> 4)   | ((qh_b >> 6) & 3) << 4) - 32) as i8;
+                    }
+                    a_off += 128; ql_off += 64; qh_off += 32;
+                }
+            }
+            for g in 0..16 {
+                let scale = sc[g] as i8 as f32;
+                let blk = g / 2;
+                let blk_off = blk * Q8B;
+                let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8b[blk_off], q8b[blk_off + 1]]));
+                let q8q = &q8b[blk_off + 2..];
+                let mut sum_sub = 0i32;
+                for k in 0..16 {
+                    let elem = g * 16 + k;
+                    let off = elem % 32;
+                    sum_sub += (a[elem] as i32) * (q8q[off] as i8 as i32);
+                }
+                sumf += d * scale * d_q8 * sum_sub as f32;
+            }
+        }
+        sumf
+    }
+
+    #[test]
+    fn test_q6k_dot_simple() {
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        for i in 0..128 { ql[i] = ((i * 7 + 3) % 16) as u8; }
+        for i in 0..64 { qh[i] = ((i * 3 + 1) % 4) as u8; }
+        let scales: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4, -5, -6, -7, -8];
+        let q6k = make_q6k_block(0.1, &scales, &ql, &qh);
+        let mut q8_vals = [0i8; 32];
+        for i in 0..32 { q8_vals[i] = (i as i8) - 16; }
+        let mut q8d = Vec::new();
+        for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
+        let r = reference_dot_q6k(&q6k, &q8d);
+        let t = dot_q6_k_q8_0(&q6k, &q8d);
+        eprintln!("Q6K Test 1: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    #[test]
+    fn test_q6k_dot_random() {
+        let mut rng: u32 = 54321;
+        let mut next = || -> u8 { rng = rng.wrapping_mul(1103515245).wrapping_add(12345); (rng >> 16) as u8 };
+        let ql: [u8; 128] = std::array::from_fn(|_| next());
+        let qh: [u8; 64] = std::array::from_fn(|_| next());
+        let sc: [i8; 16] = std::array::from_fn(|_| next() as i8);
+        let q6k = make_q6k_block(0.025, &sc, &ql, &qh);
+        let mut q8d = Vec::new();
+        for _ in 0..8 {
+            let qv: [i8; 32] = std::array::from_fn(|_| next() as i8);
+            q8d.extend_from_slice(&make_q80_block(0.03, &qv));
+        }
+        let r = reference_dot_q6k(&q6k, &q8d);
+        let t = dot_q6_k_q8_0(&q6k, &q8d);
+        eprintln!("Q6K Test 2: ref={} test={} diff={}", r, t, (r - t).abs());
+        assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
 }
