@@ -1,4 +1,4 @@
-// Phase 9: BPE Tokenizer (self-contained, no external deps)
+// BPE Tokenizer (self-contained, no external deps)
 // Loads tokens, scores, types, and BPE merges directly from GGUF metadata
 
 use std::collections::HashMap;

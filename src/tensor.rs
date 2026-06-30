@@ -1,5 +1,4 @@
-// Phase 4: Tensor Structure + Basic Operations
-// Strict 1:1 translation — no extra code, no design changes
+// Tensor Structure + Basic Operations
 
 use crate::block;
 use crate::gguf::GgmlType;

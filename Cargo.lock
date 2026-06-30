@@ -175,6 +175,7 @@ dependencies = [
 name = "minfer"
 version = "0.1.0"
 dependencies = [
+ "block",
  "half",
  "metal",
  "minijinja",

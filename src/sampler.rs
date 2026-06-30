@@ -1,5 +1,4 @@
-// Phase 8: Sampler — greedy, temperature, top-k, top-p
-// Strict 1:1 translation of sampling logic
+// Sampler — greedy, temperature, top-k, top-p
 
 use rand::Rng;
 

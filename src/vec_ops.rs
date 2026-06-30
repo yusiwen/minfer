@@ -1,5 +1,4 @@
-// Phase 5: SIMD Vector Operations + Core Ops
-// Strict 1:1 translation — no extra code, no design changes
+// SIMD Vector Operations + Core Ops
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

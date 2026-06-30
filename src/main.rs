@@ -1,4 +1,4 @@
-// Phase 9: End-to-End Inference Engine
+// End-to-End Inference Engine
 
 mod gguf;
 mod block;
@@ -132,7 +132,7 @@ fn main() {
         println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
     }
 
-    // === Initialize MPS (Apple Silicon GPU backend) ===
+    // === MPS GPU backend ===
     metal::MpsState::init();
 
     // === Load model (dispatches on general.architecture) ===

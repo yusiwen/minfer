@@ -1,5 +1,4 @@
-// Phase 1: GGUF Format Parser
-// Strict 1:1 translation — no extra code, no design changes
+// GGUF Format Parser
 
 use std::fmt;
 use std::mem;
