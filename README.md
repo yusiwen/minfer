@@ -7,7 +7,9 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **GGUF loader** — parses GGUF v3 files (metadata + quantized tensors)
 - **Self-contained BPE tokenizer** — loaded directly from GGUF metadata,
   no external dependency on tiktoken
-- **AVX2-accelerated** — Q4₀×Q8₀ and Q8₀×Q8₀ dot products via AVX2+FMA
+- **CPU: AVX2-accelerated** — Q4₀×Q8₀ and Q8₀×Q8₀ dot products via AVX2+FMA
+- **GPU: Metal backend** — Apple Silicon acceleration with flash attention
+  (online softmax), SIMD-parallel RMSNorm, float4 vectorized kernels
 - **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
   RMSNorm
 - **Model download** — auto-download from Hugging Face Hub or Ollama registry
@@ -51,11 +53,16 @@ cargo run --release -- list
 
 ## Performance
 
-| Model | Q4₀ size | Prefill | Decode |
-|-------|----------|---------|--------|
-| Qwen2-0.5B | 336 MB | ~27 tok/s | ~21 tok/s |
+**Qwen2-0.5B-Instruct (Q4_0, 336 MB):**
 
-Measured on a NUC12 (i7-1260P) with AVX2+FMA.
+| Backend | Hardware | Prefill | Decode |
+|---------|----------|---------|--------|
+| CPU (AVX2) | i7-1260P | ~27 tok/s | ~21 tok/s |
+| Metal GPU | Apple M4 Pro | ~400 tok/s | ~330 tok/s |
+
+GPU decode optimizations: flash attention (online softmax + SIMD-parallel
+dot products), SIMD-parallel RMSNorm with float4 vectorization, quantized
+matmul (Q4_0 × Q8_0) on GPU.
 
 ## Architecture
 
@@ -65,6 +72,9 @@ src/
 ├── gguf.rs        # GGUF format parser (v3) + KV helpers
 ├── block.rs       # Quantized block types + fp16 conversions
 ├── avx2.rs        # AVX2 dot product kernels + quantization
+├── metal.rs       # Metal GPU state machine + kernel dispatch
+├── metal.metal    # Metal compute shaders (attention, matmul, norm)
+├── kernel.rs      # Quantized matmul dispatch (CPU/GPU bridge)
 ├── tensor.rs      # Tensor struct + data access
 ├── vec_ops.rs     # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
 ├── cache.rs       # KV cache (shared, architecture-agnostic)
@@ -77,7 +87,7 @@ src/
     ├── mod.rs     # ModelDef trait + load_model factory dispatch
     └── qwen2/     # Qwen2 implementation
         ├── mod.rs     # Qwen2Model + ModelDef impl
-        ├── forward.rs # Forward pass (batch-aware)
+        ├── forward.rs # Forward pass (CPU + GPU paths)
         └── loader.rs  # Tensor loading from GGUF
 ```
 
