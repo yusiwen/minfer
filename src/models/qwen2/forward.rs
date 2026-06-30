@@ -33,6 +33,7 @@ pub fn forward(
     embed_tokens(token_ids, model.tok_embd.as_ref().unwrap(), &mut hidden, ne);
 
     // ─── MPS GPU path (hidden stays on GPU across layers) ────────
+    #[cfg(target_os = "macos")]
     let use_gpu = if let Some(mps) = crate::metal::MpsState::get() {
         let l0 = &model.layers[0];
         let wq = l0.wq.as_ref().unwrap();
@@ -53,7 +54,12 @@ pub fn forward(
     } else {
         false
     };
+    #[cfg(not(target_os = "macos"))]
+    let _use_gpu = false;
 
+    let mut run_cpu = true;
+
+    #[cfg(target_os = "macos")]
     if use_gpu {
         let mps = crate::metal::MpsState::get().unwrap();
         mps.upload_hidden(&hidden);
@@ -77,10 +83,12 @@ pub fn forward(
             mps.download_logits(&mut logits);
             return logits;
         }
-        // GPU output unavailable — download hidden and fall through to CPU
         mps.download_hidden(&mut hidden);
-    } else {
-        // ─── CPU fallback ────────────────────────────────────────
+        run_cpu = false;
+    }
+
+    if run_cpu {
+        // ─── CPU path ──────────────────────────────────────────────
         for il in 0..model.n_layer() {
             let l = &model.layers[il];
             rms_norm(&hidden, eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
