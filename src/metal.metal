@@ -626,6 +626,21 @@ kernel void kernel_silu_f32(
     y[tid] = v / (1.0 + exp(-v));
 }
 
+// ─── SwiGLU (fused SiLU + Mul) ───────────────────────────────
+// dst[i] = silu(gate[i]) * up[i]
+
+kernel void kernel_swiglu_f32(
+    device const float * gate [[buffer(0)]],
+    device const float * up   [[buffer(1)]],
+    device       float * dst  [[buffer(2)]],
+    constant    int    & n    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if ((int)tid >= n) return;
+    float g = gate[tid];
+    dst[tid] = (g / (1.0f + exp(-g))) * up[tid];
+}
+
 // ─── RoPE (in-place) ─────────────────────────────────────────
 // Applies rotary positional embedding to Q and K.
 // x layout: [nt][n_head][n_dims]

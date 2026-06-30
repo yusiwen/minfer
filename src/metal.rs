@@ -30,6 +30,7 @@ struct MpsStateInner {
     pl_add_bias: metal::ComputePipelineState,
     pl_mul: metal::ComputePipelineState,
     pl_silu: metal::ComputePipelineState,
+    pl_swiglu: metal::ComputePipelineState,
     pl_rope: metal::ComputePipelineState,
     pl_gqa_attn: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
@@ -249,6 +250,16 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_1d(n as u64, 256);
     }
 
+    /// SwiGLU fused: dst = silu(gate) * up  (dst may alias gate)
+    pub fn swiglu_f32(&self, gate: &metal::Buffer, up: &metal::Buffer, dst: &metal::Buffer, n: usize) {
+        self.enc.set_compute_pipeline_state(&self.state.pl_swiglu);
+        self.enc.set_buffer(0, Some(gate), 0);
+        self.enc.set_buffer(1, Some(up), 0);
+        self.enc.set_buffer(2, Some(dst), 0);
+        self.set_params(3, &(n as i32));
+        self.dispatch_1d(n as u64, 256);
+    }
+
     /// RoPE (in-place): x layout [nt][n_head][n_dims].
     pub fn rope_f32(&self, x: &metal::Buffer, n_head: usize, n_dims: usize, nt: usize,
         freq_base: f32, freq_scale: f32, positions: &metal::Buffer,
@@ -377,6 +388,7 @@ impl MpsState {
             let pl_add_bias = get_pl("kernel_add_bias_f32")?;
             let pl_mul      = get_pl("kernel_mul_f32")?;
             let pl_silu     = get_pl("kernel_silu_f32")?;
+            let pl_swiglu   = get_pl("kernel_swiglu_f32")?;
             let pl_rope     = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
@@ -396,6 +408,7 @@ impl MpsState {
                 pl_add_bias,
                 pl_mul,
                 pl_silu,
+                pl_swiglu,
                 pl_rope,
                 pl_gqa_attn,
                 pl_store_kv,
@@ -827,8 +840,7 @@ impl MpsState {
         }
         cb.matmul_on_gpu(ffn_gate, &q8_ba, &ba_buf, &bg_buf, nf, ne, nt);
         cb.matmul_on_gpu(ffn_up, &q8_ba, &ba_buf, &bf_buf, nf, ne, nt);
-        cb.silu_f32(&bg_buf, nt * nf);
-        cb.mul_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf);
+        cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf);
         if ffn_down.ttype == TensorType::Q4_0 {
             cb.quantize_q8_0(&bg_buf, &q8_ba, nf, nt);
         }
