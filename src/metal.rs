@@ -209,7 +209,7 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
-        self.dispatch_1d(n as u64, 256);
+        self.dispatch_2d(n as u64, 1, 32, 1);
     }
 
     /// Element-wise add: z = x + y
@@ -280,7 +280,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(7, &(hd as i32));
         self.set_params(8, &(scale.to_bits() as i32));
         self.set_params(9, &(nt as i32));
-        self.dispatch_2d(nt as u64, nh as u64, 1, 1);
+        self.dispatch_2d(nt as u64, nh as u64, 32, 1);
     }
 
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].

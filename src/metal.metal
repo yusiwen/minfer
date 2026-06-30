@@ -537,8 +537,8 @@ kernel void kernel_quantize_q8_0(
     }
 }
 
-// ─── RMSNorm (1 thread per row) ──────────────────────────────
-// Translated from: ggml-metal.metal :: kernel_rms_norm_fuse_impl<T,1>
+// ─── RMSNorm (1 threadgroup per row, 32 threads) ─────────────
+// Parallel sum-of-squares via simd_sum (single simdgroup, no shared memory).
 // y[t][i] = x[t][i] * rsqrt(mean(x[t]²) + eps) * w[i]
 
 kernel void kernel_rms_norm_f32(
@@ -547,13 +547,28 @@ kernel void kernel_rms_norm_f32(
     device       float * y       [[buffer(2)]],
     constant    int    & d       [[buffer(3)]],
     constant    float  & eps     [[buffer(4)]],
-    uint row [[thread_position_in_grid]]
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]],
+    uint3 ntg   [[threads_per_threadgroup]]
 ) {
-    device const float * r = x + row * d;
+    int row = tgpig.x;
+    int d4 = d / 4;
+
+    device const float4 * x4 = (device const float4 *)(x + row * d);
+
     float ss = 0.0f;
-    for (int i = 0; i < d; i++) ss += r[i] * r[i];
+    for (int i = tpitg.x; i < d4; i += 32) {
+        ss += dot(x4[i], x4[i]);
+    }
+    ss = simd_sum(ss);
+
     float scale = 1.0f / sqrt(ss / (float)d + eps);
-    for (int i = 0; i < d; i++) y[row * d + i] = r[i] * scale * w[i];
+
+    device float4 * y4 = (device float4 *)(y + row * d);
+    device const float4 * w4 = (device const float4 *)w;
+    for (int i = tpitg.x; i < d4; i += 32) {
+        y4[i] = x4[i] * scale * w4[i];
+    }
 }
 
 // ─── Add bias ────────────────────────────────────────────────
@@ -674,11 +689,13 @@ kernel void kernel_gqa_attn_f32(
     constant    int    & hd [[buffer(7)]],
     constant    float  & scale [[buffer(8)]],
     constant    int    & nt [[buffer(9)]],
-    uint2 tid [[thread_position_in_grid]]
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]]
 ) {
-    int t = tid.x;
-    int h = tid.y;
+    int t = tg_id.x;
+    int h = tg_id.y;
     if (t >= nt || h >= nh) return;
+
     int nkv = positions[t] + 1;
     int gqa = nh / nk;
     int hk = h / gqa;
@@ -690,28 +707,62 @@ kernel void kernel_gqa_attn_f32(
     device const float * vhead = v + hk * hd;
     device       float * ohead = o + t * ne_q + h * hd;
 
+    int hd4 = hd / 4;
+    device const float4 * q4 = (device const float4 *)qhead;
+
+    const int NE = 2;
+    const int C = 32 * NE;
+
     float mx = -INFINITY;
-    for (int kv = 0; kv < nkv; kv++) {
-        device const float * krow = khead + kv * stride_kv;
-        float s = 0.0f;
-        for (int i = 0; i < hd; i++) s += qhead[i] * krow[i];
-        s *= scale;
-        if (s > mx) mx = s;
+    float S = 0.0f;
+    float4 oc[16];
+    for (int i = 0; i < hd4; i++) oc[i] = (float4)0.0f;
+
+    for (int batch = 0; batch < nkv; batch += C) {
+        float s0 = -INFINITY, s1 = -INFINITY;
+        int kv0 = batch + tiisg * NE;
+        int kv1 = kv0 + 1;
+
+        if (kv0 < nkv) {
+            device const float4 * k4 = (device const float4 *)(khead + kv0 * stride_kv);
+            float d = 0.0f;
+            for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
+            s0 = d * scale;
+        }
+        if (kv1 < nkv) {
+            device const float4 * k4 = (device const float4 *)(khead + kv1 * stride_kv);
+            float d = 0.0f;
+            for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
+            s1 = d * scale;
+        }
+
+        float batch_mx = simd_max(max(s0, s1));
+        float new_mx = max(mx, batch_mx);
+        float corr = exp(mx - new_mx);
+        float e0 = exp(s0 - new_mx);
+        float e1 = exp(s1 - new_mx);
+
+        for (int i = 0; i < hd4; i++) oc[i] *= corr;
+        S *= corr;
+
+        if (kv0 < nkv) {
+            device const float4 * v4 = (device const float4 *)(vhead + kv0 * stride_kv);
+            for (int i = 0; i < hd4; i++) oc[i] += e0 * v4[i];
+        }
+        if (kv1 < nkv) {
+            device const float4 * v4 = (device const float4 *)(vhead + kv1 * stride_kv);
+            for (int i = 0; i < hd4; i++) oc[i] += e1 * v4[i];
+        }
+        S += e0;
+        S += e1;
+
+        mx = new_mx;
     }
 
-    float sum = 0.0f;
-    for (int i = 0; i < hd; i++) ohead[i] = 0.0f;
-    for (int kv = 0; kv < nkv; kv++) {
-        device const float * krow = khead + kv * stride_kv;
-        float s = 0.0f;
-        for (int i = 0; i < hd; i++) s += qhead[i] * krow[i];
-        s *= scale;
-        float e = exp(s - mx);
-        sum += e;
-        device const float * vrow = vhead + kv * stride_kv;
-        for (int i = 0; i < hd; i++) ohead[i] += e * vrow[i];
-    }
+    S = simd_sum(S);
+    for (int i = 0; i < hd4; i++) oc[i] = simd_sum(oc[i]);
 
-    float inv = 1.0 / sum;
-    for (int i = 0; i < hd; i++) ohead[i] *= inv;
+    float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
+    device float4 * o4 = (device float4 *)ohead;
+    for (int i = 0; i < hd4; i++) o4[i] = oc[i] * inv;
 }
