@@ -107,7 +107,12 @@ pub fn forward(
             gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
                 positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv]);
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
-            for i in 0..hidden.len() { hidden[i] += bn[i]; }
+            unsafe {
+                crate::vec_ops::vec_add_f32(hidden.len(),
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),
+                    std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
+                    &bn);
+            }
             rms_norm(&hidden, eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
             let ffn_in = bf[..nt * ne].to_vec();
             crate::kernel::quant_matmul_f32_batch(&mut [
@@ -119,10 +124,18 @@ pub fn forward(
                 crate::vec_ops::vec_silu_f32(len,
                     std::slice::from_raw_parts_mut(bg.as_mut_ptr(), len),
                     std::slice::from_raw_parts(bg.as_ptr(), len));
+                crate::vec_ops::vec_mul_f32(len,
+                    std::slice::from_raw_parts_mut(bg.as_mut_ptr(), len),
+                    std::slice::from_raw_parts(bg.as_ptr(), len),
+                    &bf);
             }
-            for i in 0..len { bg[i] *= bf[i]; }
             crate::kernel::quant_matmul_f32(l.ffn_down.as_ref().unwrap(), &bg[..nt * nf], &mut bn, ne, nf, nt);
-            for i in 0..hidden.len() { hidden[i] += bn[i]; }
+            unsafe {
+                crate::vec_ops::vec_add_f32(hidden.len(),
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),
+                    std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
+                    &bn);
+            }
         }
     }
     rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
@@ -228,11 +241,12 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
 
 fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize, w: Option<&[f32]>) {
     for t in 0..n {
-        let row = &x[t * d..(t + 1) * d]; let dst = &mut out[t * d..(t + 1) * d];
-        let mut ss = 0.0f64;
-        for i in 0..d { ss += (row[i] as f64) * (row[i] as f64); }
-        let sc = 1.0 / ((ss / d as f64) as f32 + eps).sqrt();
-        match w { Some(w) => { for i in 0..d { dst[i] = row[i] * sc * w[i]; } } None => { for i in 0..d { dst[i] = row[i] * sc; } } }
+        let row = &x[t * d..(t + 1) * d];
+        let dst = &mut out[t * d..(t + 1) * d];
+        match w {
+            Some(w) => crate::vec_ops::rms_norm_fused_f32(d, dst, row, w, eps),
+            None => crate::vec_ops::rms_norm_f32(d, dst, row, eps),
+        }
     }
 }
 
@@ -241,13 +255,28 @@ fn add_bias(x: &mut [f32], b: &[f32], n: usize, d: usize) {
 }
 
 fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_scale: f32) {
-    let half = hd / 2; let mut freqs = [0.0f32; 64];
+    let half = hd / 2;
+    let mut freqs = [0.0f32; 64];
     for i in 0..half { freqs[i] = freq_scale / fb.powf((2 * i) as f32 / hd as f32); }
+    let mut sin_cache = vec![0.0f32; half];
+    let mut cos_cache = vec![0.0f32; half];
     for t in 0..pos.len() {
         let p = pos[t] as f32;
+        for i in 0..half {
+            let th = p * freqs[i];
+            let (sn, cs) = th.sin_cos();
+            sin_cache[i] = sn;
+            cos_cache[i] = cs;
+        }
         for h in 0..nh {
             let b = t * nh * hd + h * hd;
-            for i in 0..half { let th = p * freqs[i]; let (sn, cs) = th.sin_cos(); let (i0, i1) = (b + i, b + i + half); let (x0, x1) = (x[i0], x[i1]); x[i0] = x0 * cs - x1 * sn; x[i1] = x0 * sn + x1 * cs; }
+            for i in 0..half {
+                let (sn, cs) = (sin_cache[i], cos_cache[i]);
+                let (i0, i1) = (b + i, b + i + half);
+                let (x0, x1) = (x[i0], x[i1]);
+                x[i0] = x0 * cs - x1 * sn;
+                x[i1] = x0 * sn + x1 * cs;
+            }
         }
     }
 }
