@@ -34,25 +34,25 @@ pub fn forward(
 
     // ─── MPS GPU path (hidden stays on GPU across layers) ────────
     #[cfg(target_os = "macos")]
-    let use_gpu = if let Some(mps) = crate::metal::MpsState::get() {
-        let l0 = &model.layers[0];
-        let wq = l0.wq.as_ref().unwrap();
-        let wk = l0.wk.as_ref().unwrap();
-        let wv = l0.wv.as_ref().unwrap();
-        let wo = l0.wo.as_ref().unwrap();
-        let fg = l0.ffn_gate.as_ref().unwrap();
-        let fu = l0.ffn_up.as_ref().unwrap();
-        let fd = l0.ffn_down.as_ref().unwrap();
-        mps.has_weight(&wq.name) && mps.has_weight(&wk.name) && mps.has_weight(&wv.name)
-            && mps.has_weight(&wo.name) && mps.has_weight(&fg.name)
-            && mps.has_weight(&fu.name) && mps.has_weight(&fd.name)
-            && l0.attn_norm.as_ref().map_or(false, |t| mps.has_weight(&t.name))
-            && l0.ffn_norm.as_ref().map_or(false, |t| mps.has_weight(&t.name))
-            && l0.bq.as_ref().map_or(true, |t| mps.has_weight(&t.name))
-            && l0.bk.as_ref().map_or(true, |t| mps.has_weight(&t.name))
-            && l0.bv.as_ref().map_or(true, |t| mps.has_weight(&t.name))
-    } else {
-        false
+    let use_gpu = {
+        crate::metal::MpsState::get().map_or(false, |mps| {
+            let l0 = &model.layers[0];
+            let wq = l0.wq.as_ref().unwrap();
+            let wk = l0.wk.as_ref().unwrap();
+            let wv = l0.wv.as_ref().unwrap();
+            let wo = l0.wo.as_ref().unwrap();
+            let fg = l0.ffn_gate.as_ref().unwrap();
+            let fu = l0.ffn_up.as_ref().unwrap();
+            let fd = l0.ffn_down.as_ref().unwrap();
+            mps.has_weight(&wq.name) && mps.has_weight(&wk.name) && mps.has_weight(&wv.name)
+                && mps.has_weight(&wo.name) && mps.has_weight(&fg.name)
+                && mps.has_weight(&fu.name) && mps.has_weight(&fd.name)
+                && l0.attn_norm.as_ref().map_or(false, |t| mps.has_weight(&t.name))
+                && l0.ffn_norm.as_ref().map_or(false, |t| mps.has_weight(&t.name))
+                && l0.bq.as_ref().map_or(true, |t| mps.has_weight(&t.name))
+                && l0.bk.as_ref().map_or(true, |t| mps.has_weight(&t.name))
+                && l0.bv.as_ref().map_or(true, |t| mps.has_weight(&t.name))
+        })
     };
     #[cfg(not(target_os = "macos"))]
     let _use_gpu = false;
@@ -191,23 +191,38 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                     let off = (idx * n_super + s) * Q4KB;
                     let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
                     let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
-                    let sc = <&[u8; 12]>::try_from(&t.data[off + 4..off + 16]).unwrap();
+                    let sc = &t.data[off + 4..off + 16];
                     let qs = &t.data[off + 16..off + 144];
-                    let mut u: [u32; 4] = [0; 4];
-                    unsafe { std::ptr::copy_nonoverlapping(sc.as_ptr(), u.as_mut_ptr() as *mut u8, 12); }
-                    const KMASK1: u32 = 0x3f3f3f3f; const KMASK2: u32 = 0x0f0f0f0f; const KMASK3: u32 = 0x03030303;
-                    u[3] = ((u[2] >> 4) & KMASK2) | (((u[1] >> 6) & KMASK3) << 4);
-                    let uaux = u[1] & KMASK1; u[1] = (u[2] & KMASK2) | (((u[0] >> 6) & KMASK3) << 4); u[2] = uaux; u[0] &= KMASK1;
+                    
+                    // Unpack interleaved scales/mins: bytes 0-2=scales[0-3], 3-5=mins[0-3], 6-8=scales[4-7], 9-11=mins[4-7]
+                    let s0 = (sc[0] & 0x3F) as i32;
+                    let s1 = (((sc[0] >> 6) & 3) | ((sc[1] & 0xF) << 2)) as i32;
+                    let s2 = (((sc[1] >> 4) & 3) | ((sc[2] & 3) << 4)) as i32;
+                    let s3 = ((sc[2] >> 2) & 0x3F) as i32;
+                    let m0 = (sc[3] & 0x3F) as i32;
+                    let m1 = (((sc[3] >> 6) & 3) | ((sc[4] & 0xF) << 2)) as i32;
+                    let m2 = (((sc[4] >> 4) & 3) | ((sc[5] & 3) << 4)) as i32;
+                    let m3 = ((sc[5] >> 2) & 0x3F) as i32;
+                    let s4 = (sc[6] & 0x3F) as i32;
+                    let s5 = (((sc[6] >> 6) & 3) | ((sc[7] & 0xF) << 2)) as i32;
+                    let s6 = (((sc[7] >> 4) & 3) | ((sc[8] & 3) << 4)) as i32;
+                    let s7 = ((sc[8] >> 2) & 0x3F) as i32;
+                    let m4 = (sc[9] & 0x3F) as i32;
+                    let m5 = (((sc[9] >> 6) & 3) | ((sc[10] & 0xF) << 2)) as i32;
+                    let m6 = (((sc[10] >> 4) & 3) | ((sc[11] & 3) << 4)) as i32;
+                    let m7 = ((sc[11] >> 2) & 0x3F) as i32;
+                    let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
+                    let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
+                    
                     for sub in 0..8 {
-                        let sc_idx = sub / 4; let sc_off = sub % 4;
-                        let sc_val = ((u[sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
-                        let mm_val = ((u[2 + sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+                        let sc_val = scales[sub];
+                        let mm_val = mins[sub];
                         let dl = d * sc_val as f32; let ml = dmin * mm_val as f32;
                         let base = doff + s * 256 + sub * 32;
                         let q4_sub = &qs[sub * 16..];
                         for j in 0..32 {
                             let nib = if j % 2 == 0 { q4_sub[j / 2] & 0x0F } else { q4_sub[j / 2] >> 4 };
-                            out[base + j] = dl * (nib as i8) as f32 - ml;
+                            out[base + j] = dl * nib as f32 - ml;
                         }
                     }
                 }
@@ -220,17 +235,15 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                 for s in 0..n_super {
                     let off = (idx * n_super + s) * Q6KB;
                     let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 208], t.data[off + 209]]));
-                    let mut out_pos = doff + s * 256; let mut ql_pos = off; let mut qh_pos = off + 128; let mut sc_pos = off + 192;
-                    for _ in 0..2 {
-                        for l in 0..32 {
-                            let g = l / 16;
-                            let ql0 = t.data[ql_pos + l] as i32; let ql1 = t.data[ql_pos + l + 32] as i32; let qh = t.data[qh_pos + l] as i32;
-                            out[out_pos + l + 0]  = d * (t.data[sc_pos + g * 8 + 0] as i8 as f32) * (((ql0 & 0x0F) | ((qh & 3) << 4)) - 32) as f32;
-                            out[out_pos + l + 32] = d * (t.data[sc_pos + g * 8 + 2] as i8 as f32) * (((ql1 & 0x0F) | ((qh >> 2) & 3) << 4) - 32) as f32;
-                            out[out_pos + l + 64] = d * (t.data[sc_pos + g * 8 + 4] as i8 as f32) * (((ql0 >> 4)   | ((qh >> 4) & 3) << 4) - 32) as f32;
-                            out[out_pos + l + 96] = d * (t.data[sc_pos + g * 8 + 6] as i8 as f32) * (((ql1 >> 4)   | ((qh >> 6) & 3) << 4) - 32) as f32;
-                        }
-                        out_pos += 128; ql_pos += 64; qh_pos += 32; sc_pos += 8;
+                    let base_out = doff + s * 256;
+                    
+                    // Dequantize 256 values following llama.cpp's dequantize_row_q6_K pattern
+                    for ei in 0..256 {
+                        let lo = (t.data[off + (ei >> 1)] >> ((ei & 1) * 4)) as i32 & 0xF;
+                        let hi = (t.data[off + 128 + (ei >> 2)] >> ((ei & 3) * 2)) as i32 & 0x3;
+                        let q = (lo | (hi << 4)) - 32;
+                        let sc_idx = ei >> 4; // ei / 16, gives 0..15
+                        out[base_out + ei] = d * (t.data[off + 192 + sc_idx] as i8 as f32) * q as f32;
                     }
                 }
             }
