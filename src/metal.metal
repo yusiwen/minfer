@@ -300,14 +300,67 @@ kernel void kernel_q4_k_f32_matmul(
         device const uchar * qs1 = blk1 + 16;
         device const float * yb = y + ib * QKK;
 
+        // Scales and mins are INTERLEAVED in 12 bytes:
+        // Bytes 0-2: scales[0-3], Bytes 3-5: mins[0-3], Bytes 6-8: scales[4-7], Bytes 9-11: mins[4-7]
+        // Each 3-byte group encodes 4 × 6-bit values
+        
+        // Unpack scales[0-3] from bytes 0-2
+        uchar sc0_s0 = sc0[0] & 0x3F;
+        uchar sc0_s1 = ((sc0[0] >> 6) & 3) | ((sc0[1] & 0xF) << 2);
+        uchar sc0_s2 = ((sc0[1] >> 4) & 3) | ((sc0[2] & 3) << 4);
+        uchar sc0_s3 = (sc0[2] >> 2) & 0x3F;
+        
+        // Unpack mins[0-3] from bytes 3-5
+        uchar sc0_m0 = sc0[3] & 0x3F;
+        uchar sc0_m1 = ((sc0[3] >> 6) & 3) | ((sc0[4] & 0xF) << 2);
+        uchar sc0_m2 = ((sc0[4] >> 4) & 3) | ((sc0[5] & 3) << 4);
+        uchar sc0_m3 = (sc0[5] >> 2) & 0x3F;
+        
+        // Unpack scales[4-7] from bytes 6-8
+        uchar sc0_s4 = sc0[6] & 0x3F;
+        uchar sc0_s5 = ((sc0[6] >> 6) & 3) | ((sc0[7] & 0xF) << 2);
+        uchar sc0_s6 = ((sc0[7] >> 4) & 3) | ((sc0[8] & 3) << 4);
+        uchar sc0_s7 = (sc0[8] >> 2) & 0x3F;
+        
+        // Unpack mins[4-7] from bytes 9-11
+        uchar sc0_m4 = sc0[9] & 0x3F;
+        uchar sc0_m5 = ((sc0[9] >> 6) & 3) | ((sc0[10] & 0xF) << 2);
+        uchar sc0_m6 = ((sc0[10] >> 4) & 3) | ((sc0[11] & 3) << 4);
+        uchar sc0_m7 = (sc0[11] >> 2) & 0x3F;
+
+        // Same for second row
+        uchar sc1_s0 = sc1[0] & 0x3F;
+        uchar sc1_s1 = ((sc1[0] >> 6) & 3) | ((sc1[1] & 0xF) << 2);
+        uchar sc1_s2 = ((sc1[1] >> 4) & 3) | ((sc1[2] & 3) << 4);
+        uchar sc1_s3 = (sc1[2] >> 2) & 0x3F;
+        
+        uchar sc1_m0 = sc1[3] & 0x3F;
+        uchar sc1_m1 = ((sc1[3] >> 6) & 3) | ((sc1[4] & 0xF) << 2);
+        uchar sc1_m2 = ((sc1[4] >> 4) & 3) | ((sc1[5] & 3) << 4);
+        uchar sc1_m3 = (sc1[5] >> 2) & 0x3F;
+        
+        uchar sc1_s4 = sc1[6] & 0x3F;
+        uchar sc1_s5 = ((sc1[6] >> 6) & 3) | ((sc1[7] & 0xF) << 2);
+        uchar sc1_s6 = ((sc1[7] >> 4) & 3) | ((sc1[8] & 3) << 4);
+        uchar sc1_s7 = (sc1[8] >> 2) & 0x3F;
+        
+        uchar sc1_m4 = sc1[9] & 0x3F;
+        uchar sc1_m5 = ((sc1[9] >> 6) & 3) | ((sc1[10] & 0xF) << 2);
+        uchar sc1_m6 = ((sc1[10] >> 4) & 3) | ((sc1[11] & 3) << 4);
+        uchar sc1_m7 = (sc1[11] >> 2) & 0x3F;
+
         for (int s = 0; s < 8; s++) {
-            int s3h = s * 3 >> 1;
-            int s3m = s * 3 & 1;
-            int sh = s3m << 2;
-            float dsc0 = bd0  * float((sc0[s3h]     >> sh) & 0x3F);
-            float dmn0 = bm0  * float((sc0[3 + s3h] >> sh) & 0x3F);
-            float dsc1 = bd1  * float((sc1[s3h]     >> sh) & 0x3F);
-            float dmn1 = bm1  * float((sc1[3 + s3h] >> sh) & 0x3F);
+            float dsc0, dmn0, dsc1, dmn1;
+            switch (s) {
+                case 0: dsc0 = bd0*sc0_s0; dmn0 = bm0*sc0_m0; dsc1 = bd1*sc1_s0; dmn1 = bm1*sc1_m0; break;
+                case 1: dsc0 = bd0*sc0_s1; dmn0 = bm0*sc0_m1; dsc1 = bd1*sc1_s1; dmn1 = bm1*sc1_m1; break;
+                case 2: dsc0 = bd0*sc0_s2; dmn0 = bm0*sc0_m2; dsc1 = bd1*sc1_s2; dmn1 = bm1*sc1_m2; break;
+                case 3: dsc0 = bd0*sc0_s3; dmn0 = bm0*sc0_m3; dsc1 = bd1*sc1_s3; dmn1 = bm1*sc1_m3; break;
+                case 4: dsc0 = bd0*sc0_s4; dmn0 = bm0*sc0_m4; dsc1 = bd1*sc1_s4; dmn1 = bm1*sc1_m4; break;
+                case 5: dsc0 = bd0*sc0_s5; dmn0 = bm0*sc0_m5; dsc1 = bd1*sc1_s5; dmn1 = bm1*sc1_m5; break;
+                case 6: dsc0 = bd0*sc0_s6; dmn0 = bm0*sc0_m6; dsc1 = bd1*sc1_s6; dmn1 = bm1*sc1_m6; break;
+                case 7: dsc0 = bd0*sc0_s7; dmn0 = bm0*sc0_m7; dsc1 = bd1*sc1_s7; dmn1 = bm1*sc1_m7; break;
+            }
 
             device const ushort * q0 = (device const ushort *)(qs0 + s * 16);
             device const ushort * q1 = (device const ushort *)(qs1 + s * 16);
@@ -730,7 +783,7 @@ kernel void kernel_gqa_attn_f32(
 
     float mx = -INFINITY;
     float S = 0.0f;
-    float4 oc[16];
+    float4 oc[32];
     for (int i = 0; i < hd4; i++) oc[i] = (float4)0.0f;
 
     for (int batch = 0; batch < nkv; batch += C) {

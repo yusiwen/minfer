@@ -213,35 +213,43 @@ fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
 
         let d    = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
         let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
-        let sc   = <&[u8; 12]>::try_from(&q4b[4..16]).unwrap();
-        let qs   = &q4b[16..144];
+        // Unpack 12 bytes of scales/mins (INTERLEAVED format):
+        // Bytes 0-2: scales[0-3], Bytes 3-5: mins[0-3], Bytes 6-8: scales[4-7], Bytes 9-11: mins[4-7]
+        let sc_bytes = <&[u8; 12]>::try_from(&q4b[4..16]).unwrap();
+        
+        // Unpack scales[0-3] from bytes 0-2
+        let s0 = (sc_bytes[0] & 0x3F) as i32;
+        let s1 = (((sc_bytes[0] >> 6) & 3) | ((sc_bytes[1] & 0xF) << 2)) as i32;
+        let s2 = (((sc_bytes[1] >> 4) & 3) | ((sc_bytes[2] & 3) << 4)) as i32;
+        let s3 = ((sc_bytes[2] >> 2) & 0x3F) as i32;
+        
+        // Unpack mins[0-3] from bytes 3-5
+        let m0 = (sc_bytes[3] & 0x3F) as i32;
+        let m1 = (((sc_bytes[3] >> 6) & 3) | ((sc_bytes[4] & 0xF) << 2)) as i32;
+        let m2 = (((sc_bytes[4] >> 4) & 3) | ((sc_bytes[5] & 3) << 4)) as i32;
+        let m3 = ((sc_bytes[5] >> 2) & 0x3F) as i32;
+        
+        // Unpack scales[4-7] from bytes 6-8
+        let s4 = (sc_bytes[6] & 0x3F) as i32;
+        let s5 = (((sc_bytes[6] >> 6) & 3) | ((sc_bytes[7] & 0xF) << 2)) as i32;
+        let s6 = (((sc_bytes[7] >> 4) & 3) | ((sc_bytes[8] & 3) << 4)) as i32;
+        let s7 = ((sc_bytes[8] >> 2) & 0x3F) as i32;
+        
+        // Unpack mins[4-7] from bytes 9-11
+        let m4 = (sc_bytes[9] & 0x3F) as i32;
+        let m5 = (((sc_bytes[9] >> 6) & 3) | ((sc_bytes[10] & 0xF) << 2)) as i32;
+        let m6 = (((sc_bytes[10] >> 4) & 3) | ((sc_bytes[11] & 3) << 4)) as i32;
+        let m7 = ((sc_bytes[11] >> 2) & 0x3F) as i32;
+        
+        let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
+        let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
 
-        // Unpack 12 bytes of scales/mins → 4 × uint32_t
-        // Follows llama.cpp's memcpy+unpack pattern exactly
-        let mut u: [u32; 4] = [0; 4];
-        unsafe {
-            std::ptr::copy_nonoverlapping(sc.as_ptr(), u.as_mut_ptr() as *mut u8, 12);
-        }
-        const KMASK1: u32 = 0x3f3f3f3f;
-        const KMASK2: u32 = 0x0f0f0f0f;
-        const KMASK3: u32 = 0x03030303;
-        u[3] = ((u[2] >> 4) & KMASK2) | (((u[1] >> 6) & KMASK3) << 4);
-        let uaux = u[1] & KMASK1;
-        u[1] = (u[2] & KMASK2) | (((u[0] >> 6) & KMASK3) << 4);
-        u[2] = uaux;
-        u[0] &= KMASK1;
-        // u[0] = scales for subblocks 0..3
-        // u[1] = scales for subblocks 4..7
-        // u[2] = mins for subblocks 0..3
-        // u[3] = mins for subblocks 4..7
-        // Each packs 4 × 6-bit: val3<<18 | val2<<12 | val1<<6 | val0
+        let qs   = &q4b[16..144];
 
         // 8 subblocks, each 32 elements
         for s in 0..8 {
-            let sc_idx   = s / 4;
-            let sc_off   = s % 4;
-            let sc_val   = ((u[sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
-            let mm_val   = ((u[2 + sc_idx] >> (6 * sc_off)) & 0x3F) as i32;
+            let sc_val = scales[s];
+            let mm_val = mins[s];
 
             let dl = d * sc_val as f32;
             let ml = dmin * mm_val as f32;
@@ -475,12 +483,30 @@ mod tests {
         let dm_bits = f32_to_fp16(dmin).to_le_bytes();
         block[0] = d_bits[0]; block[1] = d_bits[1];
         block[2] = dm_bits[0]; block[3] = dm_bits[1];
+        
+        // Pack in INTERLEAVED format: scales[0-3], mins[0-3], scales[4-7], mins[4-7]
         let mut raw = [0u8; 12];
-        for j in 0..4usize {
-            raw[j]   = (scales[j] & 0x3F) | (((scales[j+4] >> 4) & 0x03) << 6);
-            raw[j+4] = (mins[j] & 0x3F)   | (((mins[j+4] >> 4) & 0x03) << 6);
-            raw[j+8] = (scales[j+4] & 0x0F) | ((mins[j+4] & 0x0F) << 4);
-        }
+        
+        // Bytes 0-2: scales[0-3]
+        raw[0] = (scales[0] & 0x3F) | ((scales[1] & 0x03) << 6);
+        raw[1] = ((scales[1] >> 2) & 0x0F) | ((scales[2] & 0x0F) << 4) | ((scales[3] & 0x03) << 2);
+        raw[2] = ((scales[2] >> 4) & 0x03) | ((scales[3] >> 2) & 0x3F);
+        
+        // Bytes 3-5: mins[0-3]
+        raw[3] = (mins[0] & 0x3F) | ((mins[1] & 0x03) << 6);
+        raw[4] = ((mins[1] >> 2) & 0x0F) | ((mins[2] & 0x0F) << 4) | ((mins[3] & 0x03) << 2);
+        raw[5] = ((mins[2] >> 4) & 0x03) | ((mins[3] >> 2) & 0x3F);
+        
+        // Bytes 6-8: scales[4-7]
+        raw[6] = (scales[4] & 0x3F) | ((scales[5] & 0x03) << 6);
+        raw[7] = ((scales[5] >> 2) & 0x0F) | ((scales[6] & 0x0F) << 4) | ((scales[7] & 0x03) << 2);
+        raw[8] = ((scales[6] >> 4) & 0x03) | ((scales[7] >> 2) & 0x3F);
+        
+        // Bytes 9-11: mins[4-7]
+        raw[9] = (mins[4] & 0x3F) | ((mins[5] & 0x03) << 6);
+        raw[10] = ((mins[5] >> 2) & 0x0F) | ((mins[6] & 0x0F) << 4) | ((mins[7] & 0x03) << 2);
+        raw[11] = ((mins[6] >> 4) & 0x03) | ((mins[7] >> 2) & 0x3F);
+        
         block[4..16].copy_from_slice(&raw);
         block[16..144].copy_from_slice(values);
         block
@@ -502,15 +528,31 @@ mod tests {
             let q8b = &q8[i * 8 * Q8B..];
             let d = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
             let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
-            let mut u: [u32; 4] = [0; 4];
-            unsafe { std::ptr::copy_nonoverlapping(&q4b[4], u.as_mut_ptr() as *mut u8, 12); }
-            const K1: u32 = 0x3f3f3f3f; const K2: u32 = 0x0f0f0f0f; const K3: u32 = 0x03030303;
-            u[3] = ((u[2] >> 4) & K2) | (((u[1] >> 6) & K3) << 4);
-            let uaux = u[1] & K1; u[1] = (u[2] & K2) | (((u[0] >> 6) & K3) << 4); u[2] = uaux; u[0] &= K1;
+            
+            // Unpack interleaved scales/mins
+            let sc = &q4b[4..16];
+            let s0 = (sc[0] & 0x3F) as f32;
+            let s1 = (((sc[0] >> 6) & 3) | ((sc[1] & 0xF) << 2)) as f32;
+            let s2 = (((sc[1] >> 4) & 3) | ((sc[2] & 3) << 4)) as f32;
+            let s3 = ((sc[2] >> 2) & 0x3F) as f32;
+            let m0 = (sc[3] & 0x3F) as f32;
+            let m1 = (((sc[3] >> 6) & 3) | ((sc[4] & 0xF) << 2)) as f32;
+            let m2 = (((sc[4] >> 4) & 3) | ((sc[5] & 3) << 4)) as f32;
+            let m3 = ((sc[5] >> 2) & 0x3F) as f32;
+            let s4 = (sc[6] & 0x3F) as f32;
+            let s5 = (((sc[6] >> 6) & 3) | ((sc[7] & 0xF) << 2)) as f32;
+            let s6 = (((sc[7] >> 4) & 3) | ((sc[8] & 3) << 4)) as f32;
+            let s7 = ((sc[8] >> 2) & 0x3F) as f32;
+            let m4 = (sc[9] & 0x3F) as f32;
+            let m5 = (((sc[9] >> 6) & 3) | ((sc[10] & 0xF) << 2)) as f32;
+            let m6 = (((sc[10] >> 4) & 3) | ((sc[11] & 3) << 4)) as f32;
+            let m7 = ((sc[11] >> 2) & 0x3F) as f32;
+            let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
+            let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
+            
             for s in 0..8usize {
-                let si = s / 4; let so = s % 4;
-                let sv = ((u[si] >> (6 * so)) & 0x3F) as f32;
-                let mv = ((u[2 + si] >> (6 * so)) & 0x3F) as f32;
+                let sv = scales[s];
+                let mv = mins[s];
                 let dl = d * sv; let ml = dmin * mv;
                 let q8blk = &q8b[s * Q8B..];
                 let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));

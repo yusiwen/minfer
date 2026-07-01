@@ -872,7 +872,8 @@ impl MpsState {
             return false;
         }
         if output.ttype != TensorType::Q4_0 && output.ttype != TensorType::Q4_1
-            && output.ttype != TensorType::Q8_0 {
+            && output.ttype != TensorType::Q8_0
+            && output.ttype != TensorType::Q4_K && output.ttype != TensorType::Q6_K {
             return false;
         }
 
