@@ -137,6 +137,7 @@ fn main() {
     }
 
     // === MPS GPU backend ===
+    #[cfg(target_os = "macos")]
     metal::MpsState::init();
 
     // === Load model (dispatches on general.architecture) ===
