@@ -181,22 +181,6 @@ fn dot_q8_0_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
 // 1 Q4_K superblock needs 8 Q8_0 blocks for the same 256 elements
 // ============================================================
 
-/// Extract a 6-bit value from 3 packed bytes (4 × 6-bit values → 3 bytes)
-/// Little-endian packing: val0=bytes[0][5:0], val1=bytes[0][7:6]|bytes[1][3:0], ...
-#[inline]
-fn get6bit(src: &[u8; 3], idx: usize) -> i32 {
-    let a = src[0] as i32;
-    let b = src[1] as i32;
-    let c = src[2] as i32;
-    match idx {
-        0 => a & 0x3F,
-        1 => ((b & 0x0F) << 2) | ((a >> 6) & 0x03),
-        2 => ((c & 0x03) << 4) | ((b >> 4) & 0x0F),
-        3 => (c >> 2) & 0x3F,
-        _ => unreachable!(),
-    }
-}
-
 #[inline]
 pub fn dot_q4_k_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
     debug_assert!(q4.len() % Q4KB == 0);
@@ -213,36 +197,8 @@ fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
 
         let d    = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
         let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
-        // Unpack 12 bytes of scales/mins (INTERLEAVED format):
-        // Bytes 0-2: scales[0-3], Bytes 3-5: mins[0-3], Bytes 6-8: scales[4-7], Bytes 9-11: mins[4-7]
         let sc_bytes = <&[u8; 12]>::try_from(&q4b[4..16]).unwrap();
-        
-        // Unpack scales[0-3] from bytes 0-2
-        let s0 = (sc_bytes[0] & 0x3F) as i32;
-        let s1 = (((sc_bytes[0] >> 6) & 3) | ((sc_bytes[1] & 0xF) << 2)) as i32;
-        let s2 = (((sc_bytes[1] >> 4) & 3) | ((sc_bytes[2] & 3) << 4)) as i32;
-        let s3 = ((sc_bytes[2] >> 2) & 0x3F) as i32;
-        
-        // Unpack mins[0-3] from bytes 3-5
-        let m0 = (sc_bytes[3] & 0x3F) as i32;
-        let m1 = (((sc_bytes[3] >> 6) & 3) | ((sc_bytes[4] & 0xF) << 2)) as i32;
-        let m2 = (((sc_bytes[4] >> 4) & 3) | ((sc_bytes[5] & 3) << 4)) as i32;
-        let m3 = ((sc_bytes[5] >> 2) & 0x3F) as i32;
-        
-        // Unpack scales[4-7] from bytes 6-8
-        let s4 = (sc_bytes[6] & 0x3F) as i32;
-        let s5 = (((sc_bytes[6] >> 6) & 3) | ((sc_bytes[7] & 0xF) << 2)) as i32;
-        let s6 = (((sc_bytes[7] >> 4) & 3) | ((sc_bytes[8] & 3) << 4)) as i32;
-        let s7 = ((sc_bytes[8] >> 2) & 0x3F) as i32;
-        
-        // Unpack mins[4-7] from bytes 9-11
-        let m4 = (sc_bytes[9] & 0x3F) as i32;
-        let m5 = (((sc_bytes[9] >> 6) & 3) | ((sc_bytes[10] & 0xF) << 2)) as i32;
-        let m6 = (((sc_bytes[10] >> 4) & 3) | ((sc_bytes[11] & 3) << 4)) as i32;
-        let m7 = ((sc_bytes[11] >> 2) & 0x3F) as i32;
-        
-        let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
-        let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
+        let (scales, mins) = block::unpack_q4k_scales(sc_bytes);
 
         let qs   = &q4b[16..144];
 
@@ -259,22 +215,19 @@ fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
             let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
             let q8qs = &q8blk[2..];  // 32 i8 quants
 
-            // 32 nibbles from qs for this subblock
+            // 32 nibbles from qs for this subblock (16 bytes)
+            // llama.cpp format: byte i low nibble = elem i, byte i high nibble = elem i+16
             let q4_sub = &qs[s * 16..];
 
-            // Formula: d_q8 * (dl * Σ(q4 * q8qs[i]) - ml * Σ(q8qs[i]))
-            // Where q4 is unsigned (0-15), dl = d * sc_val, ml = dmin * mm_val
             let mut sum_sub = 0i32;
             let mut sum_q8  = 0i32;
-            for j in 0..32 {
-                let nib = if j % 2 == 0 {
-                    q4_sub[j / 2] & 0x0F
-                } else {
-                    q4_sub[j / 2] >> 4
-                };
-                let q8v  = q8qs[j] as i8;
-                sum_sub += (nib as i32) * q8v as i32;
-                sum_q8  += q8v as i32;
+            for j in 0..16 {
+                let lo = (q4_sub[j] & 0x0F) as i32;
+                let hi = (q4_sub[j] >> 4) as i32;
+                let q8_lo = q8qs[j] as i8 as i32;
+                let q8_hi = q8qs[j + 16] as i8 as i32;
+                sum_sub += lo * q8_lo + hi * q8_hi;
+                sum_q8  += q8_lo + q8_hi;
             }
 
             sum += d_q8 * (dl * sum_sub as f32 - ml * sum_q8 as f32);
@@ -484,28 +437,32 @@ mod tests {
         block[0] = d_bits[0]; block[1] = d_bits[1];
         block[2] = dm_bits[0]; block[3] = dm_bits[1];
         
-        // Pack in INTERLEAVED format: scales[0-3], mins[0-3], scales[4-7], mins[4-7]
+        // Pack in llama.cpp get_scale_min_k4 format:
+        // Bytes 0-3: scales[0-3] low 6 bits each
+        // Bytes 4-7: mins[0-3] low 6 bits each
+        // Bytes 8-11: high 2 bits cross-referenced
         let mut raw = [0u8; 12];
-        
-        // Bytes 0-2: scales[0-3]
-        raw[0] = (scales[0] & 0x3F) | ((scales[1] & 0x03) << 6);
-        raw[1] = ((scales[1] >> 2) & 0x0F) | ((scales[2] & 0x0F) << 4) | ((scales[3] & 0x03) << 2);
-        raw[2] = ((scales[2] >> 4) & 0x03) | ((scales[3] >> 2) & 0x3F);
-        
-        // Bytes 3-5: mins[0-3]
-        raw[3] = (mins[0] & 0x3F) | ((mins[1] & 0x03) << 6);
-        raw[4] = ((mins[1] >> 2) & 0x0F) | ((mins[2] & 0x0F) << 4) | ((mins[3] & 0x03) << 2);
-        raw[5] = ((mins[2] >> 4) & 0x03) | ((mins[3] >> 2) & 0x3F);
-        
-        // Bytes 6-8: scales[4-7]
-        raw[6] = (scales[4] & 0x3F) | ((scales[5] & 0x03) << 6);
-        raw[7] = ((scales[5] >> 2) & 0x0F) | ((scales[6] & 0x0F) << 4) | ((scales[7] & 0x03) << 2);
-        raw[8] = ((scales[6] >> 4) & 0x03) | ((scales[7] >> 2) & 0x3F);
-        
-        // Bytes 9-11: mins[4-7]
-        raw[9] = (mins[4] & 0x3F) | ((mins[5] & 0x03) << 6);
-        raw[10] = ((mins[5] >> 2) & 0x0F) | ((mins[6] & 0x0F) << 4) | ((mins[7] & 0x03) << 2);
-        raw[11] = ((mins[6] >> 4) & 0x03) | ((mins[7] >> 2) & 0x3F);
+
+        raw[0] = scales[0] & 0x3F;
+        raw[1] = scales[1] & 0x3F;
+        raw[2] = scales[2] & 0x3F;
+        raw[3] = scales[3] & 0x3F;
+        raw[4] = mins[0] & 0x3F;
+        raw[5] = mins[1] & 0x3F;
+        raw[6] = mins[2] & 0x3F;
+        raw[7] = mins[3] & 0x3F;
+        raw[8]  = ((scales[4] & 0xF) << 0) | ((mins[4] & 0xF) << 4);
+        raw[9]  = ((scales[5] & 0xF) << 0) | ((mins[5] & 0xF) << 4);
+        raw[10] = ((scales[6] & 0xF) << 0) | ((mins[6] & 0xF) << 4);
+        raw[11] = ((scales[7] & 0xF) << 0) | ((mins[7] & 0xF) << 4);
+        raw[0] |= (scales[4] & 0x30) << 2;
+        raw[1] |= (scales[5] & 0x30) << 2;
+        raw[2] |= (scales[6] & 0x30) << 2;
+        raw[3] |= (scales[7] & 0x30) << 2;
+        raw[4] |= (mins[4] & 0x30) << 2;
+        raw[5] |= (mins[5] & 0x30) << 2;
+        raw[6] |= (mins[6] & 0x30) << 2;
+        raw[7] |= (mins[7] & 0x30) << 2;
         
         block[4..16].copy_from_slice(&raw);
         block[16..144].copy_from_slice(values);
@@ -529,26 +486,10 @@ mod tests {
             let d = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
             let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
             
-            // Unpack interleaved scales/mins
-            let sc = &q4b[4..16];
-            let s0 = (sc[0] & 0x3F) as f32;
-            let s1 = (((sc[0] >> 6) & 3) | ((sc[1] & 0xF) << 2)) as f32;
-            let s2 = (((sc[1] >> 4) & 3) | ((sc[2] & 3) << 4)) as f32;
-            let s3 = ((sc[2] >> 2) & 0x3F) as f32;
-            let m0 = (sc[3] & 0x3F) as f32;
-            let m1 = (((sc[3] >> 6) & 3) | ((sc[4] & 0xF) << 2)) as f32;
-            let m2 = (((sc[4] >> 4) & 3) | ((sc[5] & 3) << 4)) as f32;
-            let m3 = ((sc[5] >> 2) & 0x3F) as f32;
-            let s4 = (sc[6] & 0x3F) as f32;
-            let s5 = (((sc[6] >> 6) & 3) | ((sc[7] & 0xF) << 2)) as f32;
-            let s6 = (((sc[7] >> 4) & 3) | ((sc[8] & 3) << 4)) as f32;
-            let s7 = ((sc[8] >> 2) & 0x3F) as f32;
-            let m4 = (sc[9] & 0x3F) as f32;
-            let m5 = (((sc[9] >> 6) & 3) | ((sc[10] & 0xF) << 2)) as f32;
-            let m6 = (((sc[10] >> 4) & 3) | ((sc[11] & 3) << 4)) as f32;
-            let m7 = ((sc[11] >> 2) & 0x3F) as f32;
-            let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
-            let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
+            let sc = <&[u8; 12]>::try_from(&q4b[4..16]).unwrap();
+            let (scales_i, mins_i) = block::unpack_q4k_scales(sc);
+            let scales: [f32; 8] = scales_i.map(|v| v as f32);
+            let mins: [f32; 8] = mins_i.map(|v| v as f32);
             
             for s in 0..8usize {
                 let sv = scales[s];
@@ -557,11 +498,14 @@ mod tests {
                 let q8blk = &q8b[s * Q8B..];
                 let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
                 let q4_sub = &q4b[16 + s * 16..];
-                for j in 0..32usize {
-                    let nib = if j % 2 == 0 { q4_sub[j/2] & 0x0F } else { q4_sub[j/2] >> 4 };
-                    let w = dl * nib as f32 - ml;
-                    let y = d_q8 * q8blk[2 + j] as i8 as f32;
-                    sum += w * y;
+                for j in 0..16usize {
+                    let lo = (q4_sub[j] & 0x0F) as f32;
+                    let hi = (q4_sub[j] >> 4) as f32;
+                    let y_lo = d_q8 * q8blk[2 + j] as i8 as f32;
+                    let y_hi = d_q8 * q8blk[2 + j + 16] as i8 as f32;
+                    let w_lo = dl * lo - ml;
+                    let w_hi = dl * hi - ml;
+                    sum += w_lo * y_lo + w_hi * y_hi;
                 }
             }
         }
@@ -581,7 +525,6 @@ mod tests {
         for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
         let r = reference_dot(&q4k, &q8d);
         let t = dot_q4_k_q8_0(&q4k, &q8d);
-        eprintln!("Test 1: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
     }
 
@@ -598,7 +541,6 @@ mod tests {
         for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
         let r = reference_dot(&q4k, &q8d);
         let t = dot_q4_k_q8_0(&q4k, &q8d);
-        eprintln!("Test 2: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
     }
 
@@ -617,7 +559,6 @@ mod tests {
         }
         let r = reference_dot(&q4k, &q8d);
         let t = dot_q4_k_q8_0(&q4k, &q8d);
-        eprintln!("Test 3: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
     }
 
@@ -639,7 +580,6 @@ mod tests {
         }
         let r = reference_dot(&q4m, &q8m);
         let t = dot_q4_k_q8_0(&q4m, &q8m);
-        eprintln!("Test 4: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
     }
 
@@ -713,8 +653,148 @@ mod tests {
         for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
         let r = reference_dot_q6k(&q6k, &q8d);
         let t = dot_q6_k_q8_0(&q6k, &q8d);
-        eprintln!("Q6K Test 1: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    // Truly independent reference: dequantize to f32, then dot
+    fn independent_dot_q4k(q4: &[u8], q8: &[u8]) -> f32 {
+        let n_super = q4.len() / Q4KB;
+        let mut sum = 0.0f32;
+        for i in 0..n_super {
+            let q4b = &q4[i * Q4KB..];
+            let q8b = &q8[i * 8 * Q8B..];
+            let d = block::fp16_to_f32(u16::from_le_bytes([q4b[0], q4b[1]]));
+            let dmin = block::fp16_to_f32(u16::from_le_bytes([q4b[2], q4b[3]]));
+            let sc = &q4b[4..16];
+            
+            // Extract scales and mins using get_scale_min_k4 format
+            let mut scales = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            for j in 0..4 {
+                scales[j] = (sc[j] & 0x3F) as f32;
+                mins[j] = (sc[j + 4] & 0x3F) as f32;
+            }
+            for j in 4..8 {
+                scales[j] = ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4)) as f32;
+                mins[j] = ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as f32;
+            }
+            
+            // Dequantize 256 weights to f32
+            let mut w = [0.0f32; 256];
+            for s in 0..8 {
+                let qs = &q4b[16 + s * 16..];
+                let base = s * 32;
+                let dl = d * scales[s];
+                let ml = dmin * mins[s];
+                for j in 0..16 {
+                    w[base + j] = dl * (qs[j] & 0x0F) as f32 - ml;
+                    w[base + j + 16] = dl * (qs[j] >> 4) as f32 - ml;
+                }
+            }
+            
+            // Dequantize 256 activations to f32
+            let mut x = [0.0f32; 256];
+            for s in 0..8 {
+                let q8blk = &q8b[s * Q8B..];
+                let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+                let base = s * 32;
+                for j in 0..32 {
+                    x[base + j] = d_q8 * q8blk[2 + j] as i8 as f32;
+                }
+            }
+            
+            // Compute dot product
+            for j in 0..256 {
+                sum += w[j] * x[j];
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn test_q4k_independent_reference() {
+        let mut rng: u32 = 12345;
+        let mut next = || -> u8 { rng = rng.wrapping_mul(1103515245).wrapping_add(12345); (rng >> 16) as u8 };
+        let sc: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let mn: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let vl: [u8; 128] = std::array::from_fn(|_| next());
+        let q4k = make_q4k_block(0.0123, 0.0045, &sc, &mn, &vl);
+        let mut q8d = Vec::new();
+        for _ in 0..8 {
+            let qv: [i8; 32] = std::array::from_fn(|_| next() as i8);
+            q8d.extend_from_slice(&make_q80_block(0.03, &qv));
+        }
+        let indep = independent_dot_q4k(&q4k, &q8d);
+        let impl_result = dot_q4_k_q8_0(&q4k, &q8d);
+        assert!((indep - impl_result).abs() < 0.01, "Q4K independent ref mismatch: diff={}", (indep - impl_result).abs());
+    }
+
+    // Truly independent reference for Q6_K: dequantize to f32, then dot
+    fn independent_dot_q6k(q6: &[u8], q8: &[u8]) -> f32 {
+        let n_super = q6.len() / Q6KB;
+        let mut sum = 0.0f32;
+        for i in 0..n_super {
+            let q6b = &q6[i * Q6KB..];
+            let q8b = &q8[i * 8 * Q8B..];
+            let d = block::fp16_to_f32(u16::from_le_bytes([q6b[208], q6b[209]]));
+            let ql = &q6b[0..128];
+            let qh = &q6b[128..192];
+            let sc = &q6b[192..208];
+            
+            // Dequantize 256 weights to f32 (matching llama.cpp dequantize_row_q6_K)
+            let mut w = [0.0f32; 256];
+            for n in 0..2 {
+                let ql_off = n * 64;
+                let qh_off = n * 32;
+                let out_off = n * 128;
+                for l in 0..32 {
+                    let is = l / 16;
+                    let si = is + n * 8;
+                    let q0 = (((ql[ql_off + l] & 0xF) as i32) | ((((qh[qh_off + l] >> 0) & 3) as i32) << 4)) - 32;
+                    let q1 = (((ql[ql_off + l + 32] & 0xF) as i32) | ((((qh[qh_off + l] >> 2) & 3) as i32) << 4)) - 32;
+                    let q2 = (((ql[ql_off + l] >> 4) as i32) | ((((qh[qh_off + l] >> 4) & 3) as i32) << 4)) - 32;
+                    let q3 = (((ql[ql_off + l + 32] >> 4) as i32) | ((((qh[qh_off + l] >> 6) & 3) as i32) << 4)) - 32;
+                    w[out_off + l] = d * (sc[si + 0] as i8 as f32) * q0 as f32;
+                    w[out_off + l + 32] = d * (sc[si + 2] as i8 as f32) * q1 as f32;
+                    w[out_off + l + 64] = d * (sc[si + 4] as i8 as f32) * q2 as f32;
+                    w[out_off + l + 96] = d * (sc[si + 6] as i8 as f32) * q3 as f32;
+                }
+            }
+            
+            // Dequantize 256 activations to f32
+            let mut x = [0.0f32; 256];
+            for s in 0..8 {
+                let q8blk = &q8b[s * Q8B..];
+                let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+                let base = s * 32;
+                for j in 0..32 {
+                    x[base + j] = d_q8 * q8blk[2 + j] as i8 as f32;
+                }
+            }
+            
+            // Compute dot product
+            for j in 0..256 {
+                sum += w[j] * x[j];
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn test_q6k_independent_reference() {
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        for i in 0..128 { ql[i] = ((i * 7 + 3) % 16) as u8; }
+        for i in 0..64 { qh[i] = ((i * 3 + 1) % 4) as u8; }
+        let scales: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4, -5, -6, -7, -8];
+        let q6k = make_q6k_block(0.1, &scales, &ql, &qh);
+        let mut q8_vals = [0i8; 32];
+        for i in 0..32 { q8_vals[i] = (i as i8) - 16; }
+        let mut q8d = Vec::new();
+        for _ in 0..8 { q8d.extend_from_slice(&make_q80_block(0.05, &q8_vals)); }
+        let indep = independent_dot_q6k(&q6k, &q8d);
+        let impl_result = dot_q6_k_q8_0(&q6k, &q8d);
+        assert!((indep - impl_result).abs() < 0.01, "Q6K independent ref mismatch: diff={}", (indep - impl_result).abs());
     }
 
     #[test]
@@ -732,7 +812,56 @@ mod tests {
         }
         let r = reference_dot_q6k(&q6k, &q8d);
         let t = dot_q6_k_q8_0(&q6k, &q8d);
-        eprintln!("Q6K Test 2: ref={} test={} diff={}", r, t, (r - t).abs());
         assert!((r - t).abs() < 0.01, "diff={}", (r - t).abs());
+    }
+
+    #[test]
+    fn test_unpack_q4k_scales_boundary() {
+        // All zeros
+        let sc = [0u8; 12];
+        let (scales, mins) = block::unpack_q4k_scales(&sc);
+        assert_eq!(scales, [0; 8]);
+        assert_eq!(mins, [0; 8]);
+
+        // All 63 (max 6-bit value) in low-6-bit slots, high-2-bit slots set to pack 63 into indices 4-7
+        let mut sc = [0u8; 12];
+        for j in 0..4 {
+            sc[j] = 63;     // scales[j] low 6 bits = 63
+            sc[j + 4] = 63; // mins[j] low 6 bits = 63
+        }
+        // For indices 4-7: high 2 bits stored in sc[0..3]>>6 and sc[4..7]>>6
+        // scales[4..7] = (sc[j+4] & 0xF) | ((sc[j-4] >> 6) << 4)
+        // To get 63 = 0x3F: low 4 bits = 0xF, high 2 bits = 0x3
+        for j in 4..8 {
+            sc[j + 4] = 0xFF; // low 4 bits = 0xF for scales, high 4 bits = 0xF for mins
+        }
+        for j in 0..4 {
+            sc[j] |= 0xC0; // high 2 bits = 0x3 for scales
+            sc[j + 4] |= 0xC0; // high 2 bits = 0x3 for mins
+        }
+        let (scales, mins) = block::unpack_q4k_scales(&sc);
+        assert_eq!(scales, [63; 8], "scales={:?}", scales);
+        assert_eq!(mins, [63; 8], "mins={:?}", mins);
+
+        // Mixed: known values
+        let mut sc = [0u8; 12];
+        sc[0] = 10; sc[1] = 20; sc[2] = 30; sc[3] = 40;
+        sc[4] = 5; sc[5] = 15; sc[6] = 25; sc[7] = 35;
+        // scales[4]=50: low4=0x2, high2=0x3 → sc[8]&0xF=2, sc[0]>>6=3 → sc[0]|=0xC0
+        // mins[4]=45: low4=0xD, high2=0x2 → sc[8]>>4=0xD, sc[4]>>6=2 → sc[4]|=0x80
+        sc[8] = 0x02 | (0x0D << 4); // scales[4] low=2, mins[4] low=0xD
+        sc[0] |= 0xC0; // scales[4] high=3
+        sc[4] |= 0x80; // mins[4] high=2
+        let (scales, mins) = block::unpack_q4k_scales(&sc);
+        assert_eq!(scales[0], 10);
+        assert_eq!(scales[1], 20);
+        assert_eq!(scales[2], 30);
+        assert_eq!(scales[3], 40);
+        assert_eq!(scales[4], 50);
+        assert_eq!(mins[0], 5);
+        assert_eq!(mins[1], 15);
+        assert_eq!(mins[2], 25);
+        assert_eq!(mins[3], 35);
+        assert_eq!(mins[4], 45);
     }
 }

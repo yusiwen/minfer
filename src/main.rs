@@ -217,7 +217,7 @@ fn main() {
 }
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
-    id == special.eos || Some(id) == special.im_end || id == 0 || id == 2
+    id == special.eos || Some(id) == special.im_end
 }
 
 fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {

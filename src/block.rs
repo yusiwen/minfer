@@ -32,6 +32,23 @@ pub const Q4KB: usize = 144; // sizeof(block_q4_k)
 pub const Q6KB: usize = 210; // sizeof(block_q6_k)
 pub const Q8KB: usize = 34;  // sizeof(block_q8_0), same as Q8B
 
+/// Unpack 8 scales and 8 mins from the 12-byte scales field of a Q4_K block.
+/// Matches llama.cpp `get_scale_min_k4`.
+#[inline]
+pub fn unpack_q4k_scales(sc: &[u8; 12]) -> ([i32; 8], [i32; 8]) {
+    let mut scales = [0i32; 8];
+    let mut mins = [0i32; 8];
+    for j in 0..4 {
+        scales[j] = (sc[j] & 0x3F) as i32;
+        mins[j]   = (sc[j + 4] & 0x3F) as i32;
+    }
+    for j in 4..8 {
+        scales[j] = ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4)) as i32;
+        mins[j]   = ((sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4)) as i32;
+    }
+    (scales, mins)
+}
+
 // === Quantized Block Structures (ggml-common.h) ===
 
 // Q4_0 — 4-bit quantization, 32 elements per block (line 184-189)

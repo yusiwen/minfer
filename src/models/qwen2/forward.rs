@@ -191,38 +191,20 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                     let off = (idx * n_super + s) * Q4KB;
                     let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
                     let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
-                    let sc = &t.data[off + 4..off + 16];
+                    let sc_arr: &[u8; 12] = t.data[off + 4..off + 16].try_into().unwrap();
+                    let (scales, mins) = crate::block::unpack_q4k_scales(sc_arr);
                     let qs = &t.data[off + 16..off + 144];
-                    
-                    // Unpack interleaved scales/mins: bytes 0-2=scales[0-3], 3-5=mins[0-3], 6-8=scales[4-7], 9-11=mins[4-7]
-                    let s0 = (sc[0] & 0x3F) as i32;
-                    let s1 = (((sc[0] >> 6) & 3) | ((sc[1] & 0xF) << 2)) as i32;
-                    let s2 = (((sc[1] >> 4) & 3) | ((sc[2] & 3) << 4)) as i32;
-                    let s3 = ((sc[2] >> 2) & 0x3F) as i32;
-                    let m0 = (sc[3] & 0x3F) as i32;
-                    let m1 = (((sc[3] >> 6) & 3) | ((sc[4] & 0xF) << 2)) as i32;
-                    let m2 = (((sc[4] >> 4) & 3) | ((sc[5] & 3) << 4)) as i32;
-                    let m3 = ((sc[5] >> 2) & 0x3F) as i32;
-                    let s4 = (sc[6] & 0x3F) as i32;
-                    let s5 = (((sc[6] >> 6) & 3) | ((sc[7] & 0xF) << 2)) as i32;
-                    let s6 = (((sc[7] >> 4) & 3) | ((sc[8] & 3) << 4)) as i32;
-                    let s7 = ((sc[8] >> 2) & 0x3F) as i32;
-                    let m4 = (sc[9] & 0x3F) as i32;
-                    let m5 = (((sc[9] >> 6) & 3) | ((sc[10] & 0xF) << 2)) as i32;
-                    let m6 = (((sc[10] >> 4) & 3) | ((sc[11] & 3) << 4)) as i32;
-                    let m7 = ((sc[11] >> 2) & 0x3F) as i32;
-                    let scales = [s0, s1, s2, s3, s4, s5, s6, s7];
-                    let mins = [m0, m1, m2, m3, m4, m5, m6, m7];
-                    
+
                     for sub in 0..8 {
                         let sc_val = scales[sub];
                         let mm_val = mins[sub];
                         let dl = d * sc_val as f32; let ml = dmin * mm_val as f32;
                         let base = doff + s * 256 + sub * 32;
                         let q4_sub = &qs[sub * 16..];
-                        for j in 0..32 {
-                            let nib = if j % 2 == 0 { q4_sub[j / 2] & 0x0F } else { q4_sub[j / 2] >> 4 };
-                            out[base + j] = dl * nib as f32 - ml;
+                        // llama.cpp format: byte j low nibble = elem j, byte j high nibble = elem j+16
+                        for j in 0..16 {
+                            out[base + j]      = dl * (q4_sub[j] & 0x0F) as f32 - ml;
+                            out[base + j + 16] = dl * (q4_sub[j] >> 4) as f32 - ml;
                         }
                     }
                 }
@@ -236,14 +218,29 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                     let off = (idx * n_super + s) * Q6KB;
                     let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 208], t.data[off + 209]]));
                     let base_out = doff + s * 256;
-                    
-                    // Dequantize 256 values following llama.cpp's dequantize_row_q6_K pattern
-                    for ei in 0..256 {
-                        let lo = (t.data[off + (ei >> 1)] >> ((ei & 1) * 4)) as i32 & 0xF;
-                        let hi = (t.data[off + 128 + (ei >> 2)] >> ((ei & 3) * 2)) as i32 & 0x3;
-                        let q = (lo | (hi << 4)) - 32;
-                        let sc_idx = ei >> 4; // ei / 16, gives 0..15
-                        out[base_out + ei] = d * (t.data[off + 192 + sc_idx] as i8 as f32) * q as f32;
+
+                    let ql = &t.data[off..off + 128];
+                    let qh = &t.data[off + 128..off + 192];
+                    let sc = &t.data[off + 192..off + 208];
+
+                    for n in 0..2 {
+                        let ql_off = n * 64;
+                        let qh_off = n * 32;
+                        let out_off = n * 128;
+                        for l in 0..32 {
+                            let is = l / 16;
+                            let si = is + n * 8;
+
+                            let q0 = (((ql[ql_off + l] & 0xF) as i32) | ((((qh[qh_off + l] >> 0) & 3) as i32) << 4)) - 32;
+                            let q1 = (((ql[ql_off + l + 32] & 0xF) as i32) | ((((qh[qh_off + l] >> 2) & 3) as i32) << 4)) - 32;
+                            let q2 = (((ql[ql_off + l] >> 4) as i32) | ((((qh[qh_off + l] >> 4) & 3) as i32) << 4)) - 32;
+                            let q3 = (((ql[ql_off + l + 32] >> 4) as i32) | ((((qh[qh_off + l] >> 6) & 3) as i32) << 4)) - 32;
+
+                            out[base_out + out_off + l]      = d * (sc[si + 0] as i8 as f32) * q0 as f32;
+                            out[base_out + out_off + l + 32] = d * (sc[si + 2] as i8 as f32) * q1 as f32;
+                            out[base_out + out_off + l + 64] = d * (sc[si + 4] as i8 as f32) * q2 as f32;
+                            out[base_out + out_off + l + 96] = d * (sc[si + 6] as i8 as f32) * q3 as f32;
+                        }
                     }
                 }
             }

@@ -250,6 +250,15 @@ kernel void kernel_q4_1_f32_matmul(
     }
 }
 
+inline void get_scale_min_k4(int j, device const uchar * q, thread uchar & d, thread uchar & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
+    } else {
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >> 4)  | ((q[j]   >> 6) << 4);
+    }
+}
+
 // ─── Q4_K × f32 matrix multiplication (simdgroup-cooperative) ──
 // Q4_K super-block: 256 elements = 8 sub-blocks × 32.
 // Block layout (144 bytes): half d, half dmin, uchar scales[12], uchar qs[128].
@@ -300,83 +309,30 @@ kernel void kernel_q4_k_f32_matmul(
         device const uchar * qs1 = blk1 + 16;
         device const float * yb = y + ib * QKK;
 
-        // Scales and mins are INTERLEAVED in 12 bytes:
-        // Bytes 0-2: scales[0-3], Bytes 3-5: mins[0-3], Bytes 6-8: scales[4-7], Bytes 9-11: mins[4-7]
-        // Each 3-byte group encodes 4 × 6-bit values
-        
-        // Unpack scales[0-3] from bytes 0-2
-        uchar sc0_s0 = sc0[0] & 0x3F;
-        uchar sc0_s1 = ((sc0[0] >> 6) & 3) | ((sc0[1] & 0xF) << 2);
-        uchar sc0_s2 = ((sc0[1] >> 4) & 3) | ((sc0[2] & 3) << 4);
-        uchar sc0_s3 = (sc0[2] >> 2) & 0x3F;
-        
-        // Unpack mins[0-3] from bytes 3-5
-        uchar sc0_m0 = sc0[3] & 0x3F;
-        uchar sc0_m1 = ((sc0[3] >> 6) & 3) | ((sc0[4] & 0xF) << 2);
-        uchar sc0_m2 = ((sc0[4] >> 4) & 3) | ((sc0[5] & 3) << 4);
-        uchar sc0_m3 = (sc0[5] >> 2) & 0x3F;
-        
-        // Unpack scales[4-7] from bytes 6-8
-        uchar sc0_s4 = sc0[6] & 0x3F;
-        uchar sc0_s5 = ((sc0[6] >> 6) & 3) | ((sc0[7] & 0xF) << 2);
-        uchar sc0_s6 = ((sc0[7] >> 4) & 3) | ((sc0[8] & 3) << 4);
-        uchar sc0_s7 = (sc0[8] >> 2) & 0x3F;
-        
-        // Unpack mins[4-7] from bytes 9-11
-        uchar sc0_m4 = sc0[9] & 0x3F;
-        uchar sc0_m5 = ((sc0[9] >> 6) & 3) | ((sc0[10] & 0xF) << 2);
-        uchar sc0_m6 = ((sc0[10] >> 4) & 3) | ((sc0[11] & 3) << 4);
-        uchar sc0_m7 = (sc0[11] >> 2) & 0x3F;
-
-        // Same for second row
-        uchar sc1_s0 = sc1[0] & 0x3F;
-        uchar sc1_s1 = ((sc1[0] >> 6) & 3) | ((sc1[1] & 0xF) << 2);
-        uchar sc1_s2 = ((sc1[1] >> 4) & 3) | ((sc1[2] & 3) << 4);
-        uchar sc1_s3 = (sc1[2] >> 2) & 0x3F;
-        
-        uchar sc1_m0 = sc1[3] & 0x3F;
-        uchar sc1_m1 = ((sc1[3] >> 6) & 3) | ((sc1[4] & 0xF) << 2);
-        uchar sc1_m2 = ((sc1[4] >> 4) & 3) | ((sc1[5] & 3) << 4);
-        uchar sc1_m3 = (sc1[5] >> 2) & 0x3F;
-        
-        uchar sc1_s4 = sc1[6] & 0x3F;
-        uchar sc1_s5 = ((sc1[6] >> 6) & 3) | ((sc1[7] & 0xF) << 2);
-        uchar sc1_s6 = ((sc1[7] >> 4) & 3) | ((sc1[8] & 3) << 4);
-        uchar sc1_s7 = (sc1[8] >> 2) & 0x3F;
-        
-        uchar sc1_m4 = sc1[9] & 0x3F;
-        uchar sc1_m5 = ((sc1[9] >> 6) & 3) | ((sc1[10] & 0xF) << 2);
-        uchar sc1_m6 = ((sc1[10] >> 4) & 3) | ((sc1[11] & 3) << 4);
-        uchar sc1_m7 = (sc1[11] >> 2) & 0x3F;
+        uchar sc0_s[8], sc0_m[8], sc1_s[8], sc1_m[8];
+        for (int j = 0; j < 8; j++) {
+            get_scale_min_k4(j, sc0, sc0_s[j], sc0_m[j]);
+            get_scale_min_k4(j, sc1, sc1_s[j], sc1_m[j]);
+        }
 
         for (int s = 0; s < 8; s++) {
-            float dsc0, dmn0, dsc1, dmn1;
-            switch (s) {
-                case 0: dsc0 = bd0*sc0_s0; dmn0 = bm0*sc0_m0; dsc1 = bd1*sc1_s0; dmn1 = bm1*sc1_m0; break;
-                case 1: dsc0 = bd0*sc0_s1; dmn0 = bm0*sc0_m1; dsc1 = bd1*sc1_s1; dmn1 = bm1*sc1_m1; break;
-                case 2: dsc0 = bd0*sc0_s2; dmn0 = bm0*sc0_m2; dsc1 = bd1*sc1_s2; dmn1 = bm1*sc1_m2; break;
-                case 3: dsc0 = bd0*sc0_s3; dmn0 = bm0*sc0_m3; dsc1 = bd1*sc1_s3; dmn1 = bm1*sc1_m3; break;
-                case 4: dsc0 = bd0*sc0_s4; dmn0 = bm0*sc0_m4; dsc1 = bd1*sc1_s4; dmn1 = bm1*sc1_m4; break;
-                case 5: dsc0 = bd0*sc0_s5; dmn0 = bm0*sc0_m5; dsc1 = bd1*sc1_s5; dmn1 = bm1*sc1_m5; break;
-                case 6: dsc0 = bd0*sc0_s6; dmn0 = bm0*sc0_m6; dsc1 = bd1*sc1_s6; dmn1 = bm1*sc1_m6; break;
-                case 7: dsc0 = bd0*sc0_s7; dmn0 = bm0*sc0_m7; dsc1 = bd1*sc1_s7; dmn1 = bm1*sc1_m7; break;
-            }
+            float dsc0 = bd0 * sc0_s[s]; float dmn0 = bm0 * sc0_m[s];
+            float dsc1 = bd1 * sc1_s[s]; float dmn1 = bm1 * sc1_m[s];
 
-            device const ushort * q0 = (device const ushort *)(qs0 + s * 16);
-            device const ushort * q1 = (device const ushort *)(qs1 + s * 16);
+            // llama.cpp Q4_K nibble format: byte j low nibble = elem j, byte j high nibble = elem j+16
+            device const uchar * qb0 = qs0 + s * 16;
+            device const uchar * qb1 = qs1 + s * 16;
             device const float  * ys = yb + s * 32;
 
             float acc0 = 0.0f, acc1 = 0.0f, sumy = 0.0f;
-            for (int j = 0; j < 8; j++) {
-                ushort v0 = q0[j];
-                ushort v1 = q1[j];
-                float y0 = ys[2*j], y1 = ys[2*j+1];
-                float y2 = ys[2*j+16], y3 = ys[2*j+17];
-                acc0 += y0 * float(v0 & 0x000F) + y1 * float((v0 >> 4) & 0x000F)
-                      + y2 * float((v0 >> 8) & 0x000F) + y3 * float((v0 >> 12) & 0x000F);
-                acc1 += y0 * float(v1 & 0x000F) + y1 * float((v1 >> 4) & 0x000F)
-                      + y2 * float((v1 >> 8) & 0x000F) + y3 * float((v1 >> 12) & 0x000F);
-                sumy += y0 + y1 + y2 + y3;
+            for (int j = 0; j < 16; j++) {
+                uchar b0 = qb0[j];
+                uchar b1 = qb1[j];
+                float y_lo = ys[j];
+                float y_hi = ys[j + 16];
+                acc0 += float(b0 & 0x0F) * y_lo + float(b0 >> 4) * y_hi;
+                acc1 += float(b1 & 0x0F) * y_lo + float(b1 >> 4) * y_hi;
+                sumy += y_lo + y_hi;
             }
             sumf0 += dsc0 * acc0 - dmn0 * sumy;
             sumf1 += dsc1 * acc1 - dmn1 * sumy;
@@ -440,27 +396,32 @@ kernel void kernel_q6_k_f32_matmul(
         device const char  * sc1 = (device const char *)(blk1 + 192);
         device const float * yb = y + ib * QKK;
 
-        for (int s = 0; s < 16; s++) {
-            float ssc0 = float(sc0[s]);
-            float ssc1 = float(sc1[s]);
-            device const float * ys = yb + s * 16;
+        for (int n = 0; n < 2; n++) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                device const float * ys = yb + n * 128 + l;
 
-            float acc0 = 0.0f, acc1 = 0.0f;
-            for (int j = 0; j < 16; j++) {
-                int ei = s * 16 + j;
-                int lo0 = int(ql0[ei >> 1] >> ((ei & 1) * 4)) & 0xF;
-                int hi0 = int(qh0[ei >> 2] >> ((ei & 3) * 2)) & 0x3;
-                int q0 = (lo0 | (hi0 << 4)) - 32;
+                int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
+                int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
+                int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
+                int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
+                int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
+                int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
+                int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
+                int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
 
-                int lo1 = int(ql1[ei >> 1] >> ((ei & 1) * 4)) & 0xF;
-                int hi1 = int(qh1[ei >> 2] >> ((ei & 3) * 2)) & 0x3;
-                int q1 = (lo1 | (hi1 << 4)) - 32;
-
-                acc0 += ys[j] * float(q0);
-                acc1 += ys[j] * float(q1);
+                int si = is + n * 8;
+                sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
+                       + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
+                       + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
+                       + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
+                sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
+                       + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
+                       + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
+                       + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
             }
-            sumf0 += bd0 * ssc0 * acc0;
-            sumf1 += bd1 * ssc1 * acc1;
+            ql0 += 64; ql1 += 64;
+            qh0 += 32; qh1 += 32;
         }
     }
 
