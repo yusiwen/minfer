@@ -732,8 +732,6 @@ kernel void kernel_gqa_attn_f32(
     int stride_kv = nk * hd;
 
     device const float * qhead = q + t * ne_q + h * hd;
-    device const float * khead = k + hk * hd;
-    device const float * vhead = v + hk * hd;
     device       float * ohead = o + t * ne_q + h * hd;
 
     int hd4 = hd / 4;
@@ -753,13 +751,13 @@ kernel void kernel_gqa_attn_f32(
         int kv1 = kv0 + 1;
 
         if (kv0 < nkv) {
-            device const float4 * k4 = (device const float4 *)(khead + kv0 * stride_kv);
+            device const float4 * k4 = (device const float4 *)(k + kv0 * stride_kv + hk * hd);
             float d = 0.0f;
             for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
             s0 = d * scale;
         }
         if (kv1 < nkv) {
-            device const float4 * k4 = (device const float4 *)(khead + kv1 * stride_kv);
+            device const float4 * k4 = (device const float4 *)(k + kv1 * stride_kv + hk * hd);
             float d = 0.0f;
             for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
             s1 = d * scale;
@@ -775,11 +773,11 @@ kernel void kernel_gqa_attn_f32(
         S *= corr;
 
         if (kv0 < nkv) {
-            device const float4 * v4 = (device const float4 *)(vhead + kv0 * stride_kv);
+            device const float4 * v4 = (device const float4 *)(v + kv0 * stride_kv + hk * hd);
             for (int i = 0; i < hd4; i++) oc[i] += e0 * v4[i];
         }
         if (kv1 < nkv) {
-            device const float4 * v4 = (device const float4 *)(vhead + kv1 * stride_kv);
+            device const float4 * v4 = (device const float4 *)(v + kv1 * stride_kv + hk * hd);
             for (int i = 0; i < hd4; i++) oc[i] += e1 * v4[i];
         }
         S += e0;
