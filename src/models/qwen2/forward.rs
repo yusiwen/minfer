@@ -32,10 +32,12 @@ pub fn forward(
 
     embed_tokens(token_ids, model.tok_embd.as_ref().unwrap(), &mut hidden, ne);
 
-    // ─── MPS GPU path (hidden stays on GPU across layers) ────────
+    let mut run_cpu = true;
+
+    // ─── MPS (Apple Silicon) GPU path ──────────────────────────
     #[cfg(target_os = "macos")]
-    let use_gpu = {
-        crate::metal::MpsState::get().map_or(false, |mps| {
+    {
+        let use_gpu = crate::metal::MpsState::get().map_or(false, |mps| {
             let l0 = &model.layers[0];
             let wq = l0.wq.as_ref().unwrap();
             let wk = l0.wk.as_ref().unwrap();
@@ -52,39 +54,88 @@ pub fn forward(
                 && l0.bq.as_ref().map_or(true, |t| mps.has_weight(&t.name))
                 && l0.bk.as_ref().map_or(true, |t| mps.has_weight(&t.name))
                 && l0.bv.as_ref().map_or(true, |t| mps.has_weight(&t.name))
-        })
-    };
-    #[cfg(not(target_os = "macos"))]
-    let _use_gpu = false;
-
-    let mut run_cpu = true;
-
-    #[cfg(target_os = "macos")]
-    if use_gpu {
-        let mps = crate::metal::MpsState::get().unwrap();
-        mps.upload_hidden(&hidden);
-        mps.upload_positions(positions);
-        let cb = mps.cmd_buffer();
-        for il in 0..model.n_layer() {
-            let l = &model.layers[il];
-            if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
-                eprintln!("layer_gpu returned false at layer {}", il);
-                return vec![];
+        });
+        if use_gpu {
+            let mps = crate::metal::MpsState::get().unwrap();
+            mps.upload_hidden(&hidden);
+            mps.upload_positions(positions);
+            let cb = mps.cmd_buffer();
+            for il in 0..model.n_layer() {
+                let l = &model.layers[il];
+                if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
+                    eprintln!("layer_gpu returned false at layer {}", il);
+                    return vec![];
+                }
             }
+            let gpu_output = mps.output_norm_gpu(
+                &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
+                model.output_b.as_ref(),
+                ne, nv, nt, eps,
+            );
+            cb.submit();
+            if gpu_output {
+                let mut logits = vec![0.0f32; nt * nv];
+                mps.download_logits(&mut logits);
+                return logits;
+            }
+            mps.download_hidden(&mut hidden);
+            run_cpu = false;
         }
-        let gpu_output = mps.output_norm_gpu(
-            &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
-            model.output_b.as_ref(),
-            ne, nv, nt, eps,
-        );
-        cb.submit();
-        if gpu_output {
-            let mut logits = vec![0.0f32; nt * nv];
-            mps.download_logits(&mut logits);
-            return logits;
+    }
+
+    // ─── CUDA (NVIDIA) GPU path ────────────────────────────────
+    #[cfg(feature = "cuda")]
+    {
+        let use_gpu = crate::cuda::CudaState::get().map_or(false, |cuda| {
+            let l0 = &model.layers[0];
+            let wq = l0.wq.as_ref().unwrap();
+            let wk = l0.wk.as_ref().unwrap();
+            let wv = l0.wv.as_ref().unwrap();
+            let wo = l0.wo.as_ref().unwrap();
+            let fg = l0.ffn_gate.as_ref().unwrap();
+            let fu = l0.ffn_up.as_ref().unwrap();
+            let fd = l0.ffn_down.as_ref().unwrap();
+            // CUDA only supports Q4_0 weights currently
+            let all_q4_0 = wq.ttype == TensorType::Q4_0 && wk.ttype == TensorType::Q4_0
+                && wv.ttype == TensorType::Q4_0 && wo.ttype == TensorType::Q4_0
+                && fg.ttype == TensorType::Q4_0 && fu.ttype == TensorType::Q4_0
+                && fd.ttype == TensorType::Q4_0;
+            all_q4_0
+                && cuda.has_weight(&wq.name) && cuda.has_weight(&wk.name) && cuda.has_weight(&wv.name)
+                && cuda.has_weight(&wo.name) && cuda.has_weight(&fg.name)
+                && cuda.has_weight(&fu.name) && cuda.has_weight(&fd.name)
+                && l0.attn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
+                && l0.ffn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
+                && l0.bq.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+                && l0.bk.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+                && l0.bv.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+        });
+        if use_gpu {
+            let cuda = crate::cuda::CudaState::get().unwrap();
+            cuda.upload_hidden(&hidden);
+            cuda.upload_positions(positions);
+            for il in 0..model.n_layer() {
+                let l = &model.layers[il];
+                if !cuda.layer_gpu(il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
+                    eprintln!("layer_gpu returned false at layer {}", il);
+                    cuda.sync();
+                    return vec![];
+                }
+            }
+            let gpu_output = cuda.output_norm_gpu(
+                model.output.as_ref().unwrap(), model.output_norm.as_ref(),
+                model.output_b.as_ref(),
+                ne, nv, nt, eps,
+            );
+            cuda.sync();
+            if gpu_output {
+                let mut logits = vec![0.0f32; nt * nv];
+                cuda.download_logits(&mut logits);
+                return logits;
+            }
+            cuda.download_hidden(&mut hidden);
+            run_cpu = false;
         }
-        mps.download_hidden(&mut hidden);
-        run_cpu = false;
     }
 
     if run_cpu {

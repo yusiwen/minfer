@@ -16,6 +16,8 @@ mod cache;
 mod models;
 #[cfg(target_os = "macos")]
 mod metal;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod download;
 
 use std::time::Instant;
@@ -136,9 +138,11 @@ fn main() {
         println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
     }
 
-    // === MPS GPU backend ===
+    // === GPU backends ===
     #[cfg(target_os = "macos")]
     metal::MpsState::init();
+    #[cfg(feature = "cuda")]
+    cuda::CudaState::init();
 
     // === Load model (dispatches on general.architecture) ===
     let model = models::load_model(&ctx, &data).expect("load model");

@@ -24,6 +24,14 @@ pub fn quant_matmul_f32(
             }
         }
     }
+    #[cfg(feature = "cuda")]
+    if nt >= GPU_MIN_BATCH {
+        if let Some(cuda) = crate::cuda::CudaState::get() {
+            if cuda.has_weight(&w.name) {
+                return cuda.quant_matmul_f32(w, x, out, od, id, nt);
+            }
+        }
+    }
     cpu_quant_matmul_f32(w, x, out, od, id, nt)
 }
 
@@ -38,6 +46,14 @@ pub fn quant_matmul_f32_batch(
         if let Some(mps) = crate::metal::MpsState::get() {
             if mats.iter().all(|(w, _out, _od)| mps.has_weight(&w.name)) {
                 return mps.quant_matmul_f32_batch(mats, x, id, nt);
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
+    if nt >= GPU_MIN_BATCH {
+        if let Some(cuda) = crate::cuda::CudaState::get() {
+            if mats.iter().all(|(w, _out, _od)| cuda.has_weight(&w.name)) {
+                return cuda.quant_matmul_f32_batch(mats, x, id, nt);
             }
         }
     }
