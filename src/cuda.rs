@@ -15,8 +15,10 @@ unsafe impl Sync for CudaPtr {}
 
 // ─── FFI declarations for CUDA runtime API ────────────────────
 
+// Sized buffer for cudaGetDeviceProperties (avoids fragile field-by-field layout).
+// Only the first 256 bytes (device name) are read; extra padding handles any CUDA version.
 #[repr(C)]
-struct cudaIpcEventHandle_t([u8; 64]);
+struct CudaDevicePropBuf([u8; 4096]);
 
 extern "C" {
     fn cudaSetDevice(device: i32) -> i32;
@@ -28,92 +30,44 @@ extern "C" {
     fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
-    fn cudaGetDeviceProperties(prop: *mut cudaDeviceProp, device: i32) -> i32;
-}
-
-#[repr(C)]
-struct cudaDeviceProp {
-    name: [i8; 256],
-    totalGlobalMem: usize,
-    sharedMemPerBlock: usize,
-    regsPerBlock: i32,
-    warpSize: i32,
-    memPitch: usize,
-    maxThreadsPerBlock: i32,
-    maxThreadsDim: [i32; 3],
-    maxGridSize: [i32; 3],
-    clockRate: i32,
-    totalConstMem: usize,
-    major: i32,
-    minor: i32,
-    textureAlignment: usize,
-    texturePitchAlignment: usize,
-    deviceOverlap: i32,
-    multiProcessorCount: i32,
-    kernelExecTimeoutEnabled: i32,
-    integrated: i32,
-    canMapHostMemory: i32,
-    computeMode: i32,
-    maxTexture1D: i32,
-    maxTexture1DLinear: i32,
-    maxTexture2D: [i32; 2],
-    maxTexture2DLinear: [i32; 3],
-    maxTexture2DGather: [i32; 2],
-    maxTexture3D: [i32; 3],
-    maxTextureCubemap: i32,
-    maxTexture1DLayered: [i32; 2],
-    maxTexture2DLayered: [i32; 3],
-    maxTextureCubemapLayered: [i32; 2],
-    maxSurface1D: i32,
-    maxSurface2D: [i32; 2],
-    maxSurface3D: [i32; 3],
-    maxSurface1DLayered: [i32; 2],
-    maxSurface2DLayered: [i32; 3],
-    maxSurfaceCubemap: i32,
-    maxSurfaceCubemapLayered: [i32; 2],
-    surfaceAlignment: usize,
-    concurrentKernels: i32,
-    ECCEnabled: i32,
-    pciBusID: i32,
-    pciDeviceID: i32,
-    pciDomainID: i32,
-    tccDriver: i32,
-    asyncEngineCount: i32,
-    unifiedAddressing: i32,
-    memoryClockRate: i32,
-    memoryBusWidth: i32,
-    l2CacheSize: i32,
-    maxThreadsPerMultiProcessor: i32,
-    streamPrioritiesSupported: i32,
-    globalL1CacheSupported: i32,
-    localL1CacheSupported: i32,
-    sharedMemPerMultiprocessor: usize,
-    regsPerMultiprocessor: i32,
-    managedMemory: i32,
-    isMultiGpuBoard: i32,
-    multiGpuBoardGroupID: i32,
-    hostNativeAtomicSupported: i32,
-    singleToDoublePrecisionPerfRatio: i32,
-    pageableMemoryAccess: i32,
-    concurrentManagedAccess: i32,
-    computePreemptionSupported: i32,
-    canUseHostPointerForRegisteredMem: i32,
-    cooperativeLaunch: i32,
-    cooperativeMultiDeviceLaunch: i32,
-    sharedMemPerBlockMultiprocessor: usize,
-    maxRegsPerMultiprocessor: i32,
-    managedMemoryPerDevice: usize,
-    accessPolicyMaxWindowSize: i32,
-    reserved: [i32; 448],
+    fn cudaGetLastError() -> i32;
+    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
+    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    fn cudaGetDeviceProperties(prop: *mut CudaDevicePropBuf, device: i32) -> i32;
+    // CUDA Graph APIs
+    fn cudaStreamBeginCapture(stream: *mut std::ffi::c_void, mode: i32) -> i32;
+    fn cudaStreamEndCapture(stream: *mut std::ffi::c_void, graph: *mut *mut std::ffi::c_void) -> i32;
+    fn cudaGraphInstantiate(exec: *mut *mut std::ffi::c_void, graph: *mut std::ffi::c_void,
+        error_node: *mut std::ffi::c_void, log_buf: *mut u8, buf_size: usize) -> i32;
+    fn cudaGraphLaunch(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
 }
 
 const cudaMemcpyHostToDevice: i32 = 1;
 const cudaMemcpyDeviceToHost: i32 = 2;
 const cudaMemcpyDeviceToDevice: i32 = 3;
 
+const CUDA_DEV_ATTR_COMPUTE_MAJOR: i32 = 75;
+const CUDA_DEV_ATTR_COMPUTE_MINOR: i32 = 76;
+const CUDA_DEV_ATTR_MULTIPROC_COUNT: i32 = 16;
+
+static CUDA_DEBUG: OnceLock<bool> = OnceLock::new();
+fn cuda_debug_enabled() -> bool {
+    *CUDA_DEBUG.get_or_init(|| std::env::var("MINFER_CUDA_DEBUG").is_ok())
+}
+
 fn cuda_check(err: i32, msg: &str) {
     if err != 0 {
         eprintln!("CUDA error ({}): {}", msg, err);
+    }
+}
+
+fn cuda_kernel_check(msg: &str) {
+    if !cuda_debug_enabled() { return; }
+    let err = unsafe { cudaGetLastError() };
+    if err != 0 {
+        eprintln!("CUDA kernel error ({}): {}", msg, err);
     }
 }
 
@@ -125,6 +79,22 @@ extern "C" {
         od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
     );
     fn launch_q4_0_f32_matmul(
+        weights: *const u8, acts: *const f32, output: *mut f32,
+        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+    );
+    fn launch_q8_0_f32_matmul(
+        weights: *const u8, acts: *const f32, output: *mut f32,
+        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+    );
+    fn launch_q4_1_f32_matmul(
+        weights: *const u8, acts: *const f32, output: *mut f32,
+        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+    );
+    fn launch_q4_k_f32_matmul(
+        weights: *const u8, acts: *const f32, output: *mut f32,
+        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+    );
+    fn launch_q6_k_f32_matmul(
         weights: *const u8, acts: *const f32, output: *mut f32,
         od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
     );
@@ -189,6 +159,8 @@ pub struct CudaState {
     kv_k: Mutex<Vec<CudaPtr>>,
     kv_v: Mutex<Vec<CudaPtr>>,
     kv_size: Mutex<Vec<usize>>,
+    // CUDA Graph for decode step (capture once, replay for each token)
+    decode_graph_exec: Mutex<CudaPtr>,
 }
 
 impl CudaState {
@@ -218,14 +190,27 @@ impl CudaState {
             return None;
         }
 
-        // Read device properties
-        let mut prop: cudaDeviceProp = unsafe { std::mem::zeroed() };
-        unsafe { cudaGetDeviceProperties(&mut prop, 0); }
-        let name = prop.name.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect::<String>();
+        // Query device properties
+        fn get_attr(attr: i32) -> i32 {
+            let mut v: i32 = 0;
+            unsafe { cudaDeviceGetAttribute(&mut v, attr, 0); }
+            v
+        }
+        let major = get_attr(CUDA_DEV_ATTR_COMPUTE_MAJOR);
+        let minor = get_attr(CUDA_DEV_ATTR_COMPUTE_MINOR);
+        let sm_count = get_attr(CUDA_DEV_ATTR_MULTIPROC_COUNT);
+        let mut free_mem: usize = 0;
+        let mut total_mem: usize = 0;
+        unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem); }
+        // Read device name (first 256 bytes of the oversized buffer)
+        let mut name_buf = CudaDevicePropBuf([0u8; 4096]);
+        unsafe { cudaGetDeviceProperties(&mut name_buf, 0); }
+        let name = name_buf.0[..256].iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect::<String>();
         eprintln!("CUDA: using {} (SM {}.{}, {} MB, {} SMs)",
-            name, prop.major, prop.minor,
-            prop.totalGlobalMem / 1048576,
-            prop.multiProcessorCount);
+            name, major, minor, total_mem / 1048576, sm_count);
 
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
         Some(CudaState {
@@ -246,6 +231,7 @@ impl CudaState {
             kv_k: Mutex::new(Vec::new()),
             kv_v: Mutex::new(Vec::new()),
             kv_size: Mutex::new(Vec::new()),
+            decode_graph_exec: Mutex::new(CudaPtr(std::ptr::null_mut())),
         })
     }
 
@@ -361,7 +347,36 @@ impl CudaState {
     }
 
     pub fn sync(&self) {
-        unsafe { cudaStreamSynchronize(self.stream()); }
+        let err = unsafe { cudaGetLastError() };
+        if err != 0 {
+            eprintln!("CUDA kernel launch error: {}", err);
+        }
+        let err = unsafe { cudaStreamSynchronize(self.stream()) };
+        if err != 0 {
+            eprintln!("CUDA stream sync error: {}", err);
+        }
+    }
+
+    /// Debug sync: print label, then sync and report error.
+    /// `il` = layer index, or negative for non-layer steps (e.g. output norm).
+    /// Only active when MINFER_CUDA_DEBUG is set.
+    pub fn debug_sync(&self, il: i32, label: &str) {
+        if !cuda_debug_enabled() { return; }
+        let err = unsafe { cudaGetLastError() };
+        if il >= 0 {
+            let tag = format!("l{il}: ");
+            if err != 0 {
+                eprintln!("CUDA DEBUG: {tag}{label} -- launch error: {err}");
+            }
+            let err = unsafe { cudaStreamSynchronize(self.stream()) };
+            if err != 0 { eprintln!("CUDA DEBUG: {tag}{label} -- sync error: {err}"); }
+            else { eprintln!("CUDA DEBUG: {tag}{label} OK"); }
+        } else {
+            if err != 0 { eprintln!("CUDA DEBUG: {label} -- launch error: {err}"); }
+            let err = unsafe { cudaStreamSynchronize(self.stream()) };
+            if err != 0 { eprintln!("CUDA DEBUG: {label} -- sync error: {err}"); }
+            else { eprintln!("CUDA DEBUG: {label} OK"); }
+        }
     }
 
     // ─── Upload/download for forward pass ─────────────────────
@@ -394,33 +409,40 @@ impl CudaState {
 
     // ─── KV cache management ─────────────────────────────────
 
-    fn kv_ensure_layer(&self, il: usize, max_nkv: usize, nkt: usize) {
-        let need = max_nkv * nkt * 4;
+    /// Pre-allocate GPU KV cache for all layers to n_ctx entries.
+    /// Must be called after model loading (when n_layer, n_ctx, nkt are known)
+    /// but before the first forward pass. Eliminates O(n²) incremental growth.
+    pub fn init_kv_cache(&self, n_layer: usize, n_ctx: usize, nkt: usize) {
+        let need = n_ctx * nkt * 4;
         let mut kvec = self.kv_k.lock().unwrap();
         let mut vvec = self.kv_v.lock().unwrap();
         let mut szvec = self.kv_size.lock().unwrap();
-        while kvec.len() <= il {
-            kvec.push(CudaPtr(std::ptr::null_mut()));
-            vvec.push(CudaPtr(std::ptr::null_mut()));
-            szvec.push(0);
+        for il in 0..n_layer {
+            let new_k = Self::cuda_malloc(need);
+            let new_v = Self::cuda_malloc(need);
+            if new_k.is_null() || new_v.is_null() {
+                eprintln!("CUDA: failed to pre-allocate KV cache for layer {}", il);
+                return;
+            }
+            kvec.push(CudaPtr(new_k));
+            vvec.push(CudaPtr(new_v));
+            szvec.push(n_ctx);
         }
-        let old_size = szvec.get(il).copied().unwrap_or(0) * nkt * 4;
-        if old_size >= need { return; }
+        let total_kb = (n_layer * need * 2) / 1024;
+        eprintln!("CUDA: pre-allocated KV cache for {} layers ({:.1} MB)", n_layer, total_kb as f64 / 1024.0);
+    }
 
-        // Allocate new
-        let new_k = Self::cuda_malloc(need);
-        let new_v = Self::cuda_malloc(need);
-        if new_k.is_null() || new_v.is_null() { return; }
-
-        // Copy old data
-        if old_size > 0 {
-            self.copy_device_to_device(kvec[il].0 as *const std::ffi::c_void, new_k, old_size);
-            self.copy_device_to_device(vvec[il].0 as *const std::ffi::c_void, new_v, old_size);
-            unsafe { cudaFree(kvec[il].0); cudaFree(vvec[il].0); }
+    /// Verify KV cache has enough room for `max_nkv` entries at layer `il`.
+    /// Returns false if capacity is exceeded (should never happen with pre-allocation).
+    fn kv_ensure_layer(&self, il: usize, max_nkv: usize) -> bool {
+        let szvec = self.kv_size.lock().unwrap();
+        let size = szvec.get(il).copied().unwrap_or(0);
+        if max_nkv > size {
+            eprintln!("CUDA: KV cache overflow at layer {}: need {} but allocated {}",
+                il, max_nkv, size);
+            return false;
         }
-
-        kvec[il] = CudaPtr(new_k);
-        vvec[il] = CudaPtr(new_v);
+        true
     }
 
     pub fn get_kv_size(&self, il: usize) -> usize {
@@ -438,6 +460,57 @@ impl CudaState {
             unsafe { std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, need) });
     }
 
+    // ─── CUDA Graph (decode step batch) ───────────────────────
+
+    pub fn graph_available(&self) -> bool {
+        !self.decode_graph_exec.lock().unwrap().0.is_null()
+    }
+
+    pub fn graph_begin_capture(&self) -> bool {
+        let stream = self.stream();
+        let err = unsafe { cudaStreamBeginCapture(stream, 0) };
+        if err != 0 {
+            eprintln!("CUDA: graph capture not supported (error {}) — using direct launch", err);
+            unsafe { cudaGetLastError(); } // consume stale error, stream not in capture mode
+            return false;
+        }
+        true
+    }
+
+    pub fn graph_end_capture(&self) {
+        let stream = self.stream();
+        let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
+        cuda_check(err, "graph end capture");
+        if graph.is_null() { return; }
+
+        let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe {
+            cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        };
+        if err != 0 || exec.is_null() {
+            eprintln!("CUDA: graph instantiate failed: {}", err);
+            unsafe { cudaGraphDestroy(graph); }
+            return;
+        }
+
+        unsafe { cudaGraphDestroy(graph); }
+        *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
+        eprintln!("CUDA: decode graph captured and instantiated");
+    }
+
+    pub fn graph_launch(&self) -> bool {
+        let exec = self.decode_graph_exec.lock().unwrap().0;
+        if exec.is_null() { return false; }
+        let stream = self.stream();
+        let err = unsafe { cudaGraphLaunch(exec, stream) };
+        if err != 0 {
+            eprintln!("CUDA: graph launch failed: {}", err);
+            return false;
+        }
+        true
+    }
+
     // ─── Kernel launch operations (called from CudaCommandBuffer) ──
 
     pub fn quant_matmul_q8(&self, w: &Tensor, x: *mut std::ffi::c_void, out: *mut std::ffi::c_void,
@@ -453,17 +526,40 @@ impl CudaState {
 
     pub fn quant_matmul_f32_on_gpu(&self, w: &Tensor, x: *mut std::ffi::c_void, out: *mut std::ffi::c_void,
         od: usize, id: usize, nt: usize) {
-        if w.ttype != TensorType::Q4_0 {
-            // Non-Q4_0 weights not yet supported in CUDA f32 matmul;
-            // caller should use quantize->Q8_0 path or CPU fallback.
-            panic!("CUDA: unsupported weight type {:?} for f32 matmul", w.ttype);
-        }
         let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
         let stream = self.stream();
-        unsafe {
-            launch_q4_0_f32_matmul(
-                wptr as *const u8, x as *const f32, out as *mut f32,
-                od as i32, id as i32, nt as i32, stream);
+        if w.ttype == TensorType::Q4_0 {
+            unsafe {
+                launch_q4_0_f32_matmul(
+                    wptr as *const u8, x as *const f32, out as *mut f32,
+                    od as i32, id as i32, nt as i32, stream);
+            }
+        } else if w.ttype == TensorType::Q8_0 {
+            unsafe {
+                launch_q8_0_f32_matmul(
+                    wptr as *const u8, x as *const f32, out as *mut f32,
+                    od as i32, id as i32, nt as i32, stream);
+            }
+        } else if w.ttype == TensorType::Q4_1 {
+            unsafe {
+                launch_q4_1_f32_matmul(
+                    wptr as *const u8, x as *const f32, out as *mut f32,
+                    od as i32, id as i32, nt as i32, stream);
+            }
+        } else if w.ttype == TensorType::Q4_K {
+            unsafe {
+                launch_q4_k_f32_matmul(
+                    wptr as *const u8, x as *const f32, out as *mut f32,
+                    od as i32, id as i32, nt as i32, stream);
+            }
+        } else if w.ttype == TensorType::Q6_K {
+            unsafe {
+                launch_q6_k_f32_matmul(
+                    wptr as *const u8, x as *const f32, out as *mut f32,
+                    od as i32, id as i32, nt as i32, stream);
+            }
+        } else {
+            panic!("CUDA: unsupported weight type {:?} for f32 matmul", w.ttype);
         }
     }
 
@@ -471,13 +567,11 @@ impl CudaState {
         out: *mut std::ffi::c_void, od: usize, id: usize, nt: usize) {
         if w.ttype == TensorType::Q4_0 {
             self.quant_matmul_q8(w, q8_x, out, od, id, nt);
+        } else if w.ttype == TensorType::Q8_0 {
+            self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
         } else if w.ttype == TensorType::Q4_1 {
-            // Fall back to CPU for Q4_1 (not yet implemented in CUDA)
-            // The caller must handle this. For now we just use the f32 matmul path
-            // which will also fall back.
             self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
         } else {
-            // For other types (Q4_K, Q6_K, Q8_0), we need the f32 matmul path
             self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
         }
     }
@@ -491,7 +585,7 @@ impl CudaState {
 
     pub fn rms_norm(&self, x: *mut std::ffi::c_void, w: Option<*mut std::ffi::c_void>, y: *mut std::ffi::c_void,
         d: usize, n: usize, eps: f32) {
-        let wptr = w.unwrap_or(y); // dummy if no weight (but weight is always present for Qwen2)
+        let wptr = w.expect("CUDA rms_norm: weight required (no-weights variant not yet implemented)");
         let stream = self.stream();
         unsafe {
             launch_rms_norm_f32(x as *const f32, wptr as *const f32, y as *mut f32,
@@ -602,27 +696,41 @@ impl CudaState {
         &self, w: &Tensor, x: &[f32], out: &mut [f32],
         od: usize, id: usize, nt: usize,
     ) {
-        if w.ttype != TensorType::Q4_0 {
-            return crate::kernel::cpu_quant_matmul_f32(w, x, out, od, id, nt);
+        if w.ttype == TensorType::Q4_0 {
+            let nb = id / 32;
+            let q8_len = nt * nb * Q8B;
+            let out_len = nt * od * 4;
+
+            let mut q8 = vec![0u8; q8_len];
+            crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut q8);
+
+            let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
+            let obuf = Self::get_or_grow(&self.buf_logits, out_len);
+
+            self.copy_to_device(&q8, xbuf);
+            self.quant_matmul_q8(w, xbuf, obuf, od, id, nt);
+            self.sync();
+            let out_bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len)
+            };
+            self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
+        } else if w.ttype == TensorType::Q8_0 {
+            let out_len = nt * od * 4;
+            let x_len = nt * id * 4;
+            let xbuf = Self::get_or_grow(&self.buf_hidden, x_len);
+            let obuf = Self::get_or_grow(&self.buf_logits, out_len);
+            self.copy_to_device(unsafe {
+                std::slice::from_raw_parts(x.as_ptr() as *const u8, x_len)
+            }, xbuf);
+            self.quant_matmul_f32_on_gpu(w, xbuf, obuf, od, id, nt);
+            self.sync();
+            let out_bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len)
+            };
+            self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
+        } else {
+            crate::kernel::cpu_quant_matmul_f32(w, x, out, od, id, nt);
         }
-
-        let nb = id / 32;
-        let q8_len = nt * nb * Q8B;
-        let out_len = nt * od * 4;
-
-        let mut q8 = vec![0u8; q8_len];
-        crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut q8);
-
-        let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
-        let obuf = Self::get_or_grow(&self.buf_logits, out_len);
-
-        self.copy_to_device(&q8, xbuf);
-        self.quant_matmul_q8(w, xbuf, obuf, od, id, nt);
-        self.sync();
-        let out_bytes = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len)
-        };
-        self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
     }
 
     // ─── Full-layer GPU pass ──────────────────────────────────
@@ -648,12 +756,22 @@ impl CudaState {
         let ffn_up   = l.ffn_up.as_ref().unwrap();
         let ffn_down = l.ffn_down.as_ref().unwrap();
 
-        // CUDA currently only supports Q4_0 weight type in layer_gpu
-        let all_q4_0 = wq.ttype == TensorType::Q4_0 && wk.ttype == TensorType::Q4_0
-            && wv.ttype == TensorType::Q4_0 && wo.ttype == TensorType::Q4_0
-            && ffn_gate.ttype == TensorType::Q4_0 && ffn_up.ttype == TensorType::Q4_0
-            && ffn_down.ttype == TensorType::Q4_0;
-        if !all_q4_0 { return false; }
+        // Accept Q4_0/Q4_1 group or Q4_K/Q6_K group (no mixing between groups)
+        fn is_q4(t: TensorType) -> bool {
+            t == TensorType::Q4_0 || t == TensorType::Q4_1
+        }
+        fn is_qk(t: TensorType) -> bool {
+            t == TensorType::Q4_K || t == TensorType::Q6_K
+        }
+        let all_q4 = is_q4(wq.ttype) && is_q4(wk.ttype)
+            && is_q4(wv.ttype) && is_q4(wo.ttype)
+            && is_q4(ffn_gate.ttype) && is_q4(ffn_up.ttype)
+            && is_q4(ffn_down.ttype);
+        let all_qk = is_qk(wq.ttype) && is_qk(wk.ttype)
+            && is_qk(wv.ttype) && is_qk(wo.ttype)
+            && is_qk(ffn_gate.ttype) && is_qk(ffn_up.ttype)
+            && is_qk(ffn_down.ttype);
+        if !all_q4 && !all_qk { return false; }
 
         if !self.has_weight(&wq.name) || !self.has_weight(&wk.name) || !self.has_weight(&wv.name)
             || !self.has_weight(&wo.name) || !self.has_weight(&ffn_gate.name)
@@ -667,7 +785,9 @@ impl CudaState {
         let bv_bias = l.bv.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
 
         let max_pos = positions.iter().copied().max().unwrap_or(0);
-        self.kv_ensure_layer(il, max_pos + 1, nkt);
+        if !self.kv_ensure_layer(il, max_pos + 1) {
+            return false;
+        }
 
         let hidden_len = nt * ne * 4;
         let bn_len = hidden_len;
@@ -696,37 +816,58 @@ impl CudaState {
 
         // Attention branch
         self.rms_norm(hidden, Some(norm_attn_w), bn, ne, nt, eps);
+        self.debug_sync(il as i32, "rms_norm(attn)");
+
         self.quantize_q8_0(bn, q8_bn, ne, nt);
+        self.debug_sync(il as i32, "quantize_q8_0(attn)");
         self.matmul_on_gpu(wq, q8_bn, bn, bq_buf, nqt, ne, nt);
-        if let Some(bb) = bq_bias { self.add_bias_f32(bq_buf, bb, nqt, nt); }
+        self.debug_sync(il as i32, "wq matmul");
+        if let Some(bb) = bq_bias { self.add_bias_f32(bq_buf, bb, nqt, nt); self.debug_sync(il as i32, "bq bias"); }
         self.matmul_on_gpu(wk, q8_bn, bn, bk_buf, nkt, ne, nt);
-        if let Some(bb) = bk_bias { self.add_bias_f32(bk_buf, bb, nkt, nt); }
+        self.debug_sync(il as i32, "wk matmul");
+        if let Some(bb) = bk_bias { self.add_bias_f32(bk_buf, bb, nkt, nt); self.debug_sync(il as i32, "bk bias"); }
         self.matmul_on_gpu(wv, q8_bn, bn, bv_buf, nkt, ne, nt);
-        if let Some(bb) = bv_bias { self.add_bias_f32(bv_buf, bb, nkt, nt); }
+        self.debug_sync(il as i32, "wv matmul");
+        if let Some(bb) = bv_bias { self.add_bias_f32(bv_buf, bb, nkt, nt); self.debug_sync(il as i32, "bv bias"); }
         self.rope_f32(bq_buf, nh, hd, nt, freq_base, freq_scale, pos_buf);
+        self.debug_sync(il as i32, "rope q");
         self.rope_f32(bk_buf, nk, hd, nt, freq_base, freq_scale, pos_buf);
+        self.debug_sync(il as i32, "rope k");
         self.store_kv_f32(bk_buf, kv_k as *mut std::ffi::c_void, nkt, nt, pos_buf);
+        self.debug_sync(il as i32, "store_kv k");
         self.store_kv_f32(bv_buf, kv_v as *mut std::ffi::c_void, nkt, nt, pos_buf);
+        self.debug_sync(il as i32, "store_kv v");
         let scale = 1.0 / (hd as f32).sqrt();
         self.gqa_attn_f32(bq_buf, kv_k as *mut std::ffi::c_void, kv_v as *mut std::ffi::c_void,
             ba_buf, pos_buf, nh, nk, hd, scale, nt);
+        self.debug_sync(il as i32, "gqa_attn");
 
         // wo projection
         self.quantize_q8_0(ba_buf, q8_ba, ne, nt);
+        self.debug_sync(il as i32, "quantize_q8_0(wo)");
         self.matmul_on_gpu(wo, q8_ba, ba_buf, bn, ne, ne, nt);
+        self.debug_sync(il as i32, "wo matmul");
         self.add_f32(hidden, bn, hidden, nt * ne);
+        self.debug_sync(il as i32, "add(residual attn)");
 
         // FFN branch
         self.rms_norm(hidden, Some(norm_ffn_w), ba_buf, ne, nt, eps);
+        self.debug_sync(il as i32, "rms_norm(ffn)");
         self.quantize_q8_0(ba_buf, q8_ba, ne, nt);
+        self.debug_sync(il as i32, "quantize_q8_0(ffn)");
         self.matmul_on_gpu(ffn_gate, q8_ba, ba_buf, bg_buf, nf, ne, nt);
+        self.debug_sync(il as i32, "ffn_gate matmul");
         self.matmul_on_gpu(ffn_up, q8_ba, ba_buf, bf_buf, nf, ne, nt);
+        self.debug_sync(il as i32, "ffn_up matmul");
         self.swiglu_f32(bg_buf, bf_buf, bg_buf, nt * nf);
+        self.debug_sync(il as i32, "swiglu");
         self.quantize_q8_0(bg_buf, q8_ba, nf, nt);
+        self.debug_sync(il as i32, "quantize_q8_0(ffn_down)");
         self.matmul_on_gpu(ffn_down, q8_ba, bg_buf, bn, ne, nf, nt);
+        self.debug_sync(il as i32, "ffn_down matmul");
         self.add_f32(hidden, bn, hidden, nt * ne);
+        self.debug_sync(il as i32, "add(residual ffn)");
 
-        self.kv_size.lock().unwrap()[il] = max_pos + 1;
         true
     }
 
@@ -746,23 +887,35 @@ impl CudaState {
             None => return false,
         };
         if !self.has_weight(&output.name) { return false; }
-        if output.ttype != TensorType::Q4_0 { return false; }
+        if output.ttype != TensorType::Q4_0 && output.ttype != TensorType::Q8_0
+            && output.ttype != TensorType::Q4_1
+            && output.ttype != TensorType::Q4_K && output.ttype != TensorType::Q6_K {
+            return false;
+        }
 
         let hidden = Self::get_or_grow(&self.buf_hidden, nt * ne * 4);
         let bn = Self::get_or_grow(&self.buf_bn, nt * ne * 4);
         let logits = Self::get_or_grow(&self.buf_logits, nt * nv * 4);
 
         self.rms_norm(hidden, Some(norm_w), bn, ne, nt, eps);
+        self.debug_sync(-1, "output: rms_norm");
 
-        // Output projection
-        let q8_len = nt * (ne / 32) * Q8B;
-        let q8_bn = Self::get_or_grow(&self.buf_q8_bn, q8_len);
-        self.quantize_q8_0(bn, q8_bn, ne, nt);
-        self.quant_matmul_q8(output, q8_bn, logits, nv, ne, nt);
+        if output.ttype == TensorType::Q4_0 {
+            let q8_len = nt * (ne / 32) * Q8B;
+            let q8_bn = Self::get_or_grow(&self.buf_q8_bn, q8_len);
+            self.quantize_q8_0(bn, q8_bn, ne, nt);
+            self.debug_sync(-1, "output: quantize_q8_0");
+            self.quant_matmul_q8(output, q8_bn, logits, nv, ne, nt);
+            self.debug_sync(-1, "output: q4_0 matmul");
+        } else {
+            self.quant_matmul_f32_on_gpu(output, bn, logits, nv, ne, nt);
+            self.debug_sync(-1, "output: f32 matmul");
+        }
 
         if let Some(ob) = output_b {
             if let Some(bias_buf) = self.get_weight_ptr(&ob.name) {
                 self.add_bias_f32(logits, bias_buf, nv, nt);
+                self.debug_sync(-1, "output: bias");
             }
         }
         true

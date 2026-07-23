@@ -179,6 +179,319 @@ __global__ void q4_0_f32_matmul(
     }
 }
 
+// ─── Q8_0 × f32 matrix multiplication ─────────────────────────
+// Each block: fp16 d + 32 × int8 qs. Dot product: d * sum(qs[i] * x[i]).
+// Thread block: 64 threads (2 warps), each warp computes 4 rows
+// Grid: x = ceil(od / 8), y = nt
+
+__global__ void q8_0_f32_matmul(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+    const int QK = 32;
+    const int QK4 = QK / 4;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+
+    if (t >= nt || r0 >= od) return;
+
+    int nb = id / QK;
+    int ws = nb * Q8B;
+    const float* y = acts + t * id;
+
+    float sumf[NR0] = {0};
+
+    for (int row = 0; row < NR0 && r0 + row < od; row++) {
+        const uint8_t* wr = weights + (r0 + row) * ws;
+        float sum = 0.0f;
+
+        for (int b = lane_id; b < nb; b += WARP) {
+            float d8 = h2f(*reinterpret_cast<const uint16_t*>(wr + b * Q8B));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(wr + b * Q8B + 2);
+            const float4* x4 = reinterpret_cast<const float4*>(y + b * QK);
+
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < QK4; i++) {
+                float4 xv = x4[i];
+                bs += float(qs[i*4 + 0]) * xv.x
+                    + float(qs[i*4 + 1]) * xv.y
+                    + float(qs[i*4 + 2]) * xv.z
+                    + float(qs[i*4 + 3]) * xv.w;
+            }
+            sum += bs * d8;
+        }
+        sumf[row] = sum;
+    }
+
+    for (int row = 0; row < NR0 && r0 + row < od; row++) {
+        sumf[row] = warp_reduce_sum(sumf[row]);
+        if (lane_id == 0) {
+            output[t * od + r0 + row] = sumf[row];
+        }
+    }
+}
+
+// ─── Q4_1 × f32 matrix multiplication ─────────────────────────
+// Q4_1 block: fp16 d (scale), fp16 m (min), 16 packed nibble bytes (32 elts).
+// val_i = nibble_i * d + m  →  dot = d * sum(nibble_i * x_i) + m * sum(x_i).
+// Thread block: 64 threads (2 warps), each warp computes 4 rows.
+// Grid: x = ceil(od / 8), y = nt.
+
+__global__ void q4_1_f32_matmul(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+    const int QK = 32;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+
+    if (t >= nt || r0 >= od) return;
+
+    int nb = id / QK;
+    int ws = nb * Q41B;
+    const float* y = acts + t * id;
+
+    float sumf[NR0] = {0};
+
+    for (int row = 0; row < NR0 && r0 + row < od; row++) {
+        const uint8_t* wr = weights + (r0 + row) * ws;
+        float sum = 0.0f;
+
+        for (int b = lane_id; b < nb; b += WARP) {
+            const uint8_t* block = wr + b * Q41B;
+            float d = h2f(*reinterpret_cast<const uint16_t*>(block));
+            float m = h2f(*reinterpret_cast<const uint16_t*>(block + 2));
+            const uint8_t* qs = block + 4;
+            const float* xb = y + b * QK;
+
+            float sumx = 0.0f;
+            float sumq = 0.0f;
+
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                uint8_t byte = qs[j];
+                float x0 = xb[j];
+                float x1 = xb[j + 16];
+                sumx += x0 + x1;
+                sumq += float(byte & 0x0F) * x0 + float(byte >> 4) * x1;
+            }
+            sum += sumq * d + sumx * m;
+        }
+        sumf[row] = sum;
+    }
+
+    for (int row = 0; row < NR0 && r0 + row < od; row++) {
+        sumf[row] = warp_reduce_sum(sumf[row]);
+        if (lane_id == 0) {
+            output[t * od + r0 + row] = sumf[row];
+        }
+    }
+}
+
+// ─── Helper: unpack Q4_K 6-bit scale and min ────────────────
+// Q4_K stores 16 × 6-bit values (8 scales + 8 mins) packed into 12 bytes.
+// This mirrors Metal's get_scale_min_k4 and Rust block.rs::unpack_q4k_scales.
+
+__device__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)  | ((q[j]   >> 6) << 4);
+    }
+}
+
+// ─── Q4_K × f32 matrix multiplication ─────────────────────────
+// Q4_K super-block: 256 elements, 8 sub-blocks × 32.
+// Block (144 bytes): fp16 d, fp16 dmin, uchar scales[12], uchar qs[128].
+// Dequant: val = d * scale[sub] * nibble - dmin * min[sub].
+// Q4_K nibble layout (llama.cpp format): byte j low nibble = elem j,
+// byte j high nibble = elem j+16 (within sub-block).
+// NR0=2 rows per warp, NSG=2 warps per block (4 rows per block).
+// Grid: x = ceil(od / 4), y = nt.
+
+__global__ void q4_k_f32_matmul(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int QKK = 256;
+    const int NR0 = 2;
+    const int NSG = 2;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+
+    if (t >= nt || r0 >= od) return;
+
+    int nbe = (id + QKK - 1) / QKK;
+    int row_stride = nbe * Q4KB;
+
+    const uint8_t* w0 = weights + (r0 + 0) * row_stride;
+    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
+    const float* y = acts + t * id;
+
+    float sumf0 = 0.0f, sumf1 = 0.0f;
+
+    for (int ib = lane_id; ib < nbe; ib += WARP) {
+        const uint8_t* blk0 = w0 + ib * Q4KB;
+        const uint8_t* blk1 = w1 + ib * Q4KB;
+
+        float bd0 = h2f(*reinterpret_cast<const uint16_t*>(blk0));
+        float bm0 = h2f(*reinterpret_cast<const uint16_t*>(blk0 + 2));
+        float bd1 = h2f(*reinterpret_cast<const uint16_t*>(blk1));
+        float bm1 = h2f(*reinterpret_cast<const uint16_t*>(blk1 + 2));
+
+        const uint8_t* sc0 = blk0 + 4;
+        const uint8_t* sc1 = blk1 + 4;
+        const uint8_t* qs0 = blk0 + 16;
+        const uint8_t* qs1 = blk1 + 16;
+        const float* yb = y + ib * QKK;
+
+        uint8_t sc0_s[8], sc0_m[8], sc1_s[8], sc1_m[8];
+        for (int j = 0; j < 8; j++) {
+            get_scale_min_k4(j, sc0, &sc0_s[j], &sc0_m[j]);
+            get_scale_min_k4(j, sc1, &sc1_s[j], &sc1_m[j]);
+        }
+
+        for (int s = 0; s < 8; s++) {
+            float dsc0 = bd0 * sc0_s[s];
+            float dmn0 = bm0 * sc0_m[s];
+            float dsc1 = bd1 * sc1_s[s];
+            float dmn1 = bm1 * sc1_m[s];
+
+            const uint8_t* qb0 = qs0 + s * 16;
+            const uint8_t* qb1 = qs1 + s * 16;
+            const float* ys = yb + s * 32;
+
+            float acc0 = 0.0f, acc1 = 0.0f, sumy = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                uint8_t b0 = qb0[j];
+                uint8_t b1 = qb1[j];
+                float y_lo = ys[j];
+                float y_hi = ys[j + 16];
+                acc0 += float(b0 & 0x0F) * y_lo + float(b0 >> 4) * y_hi;
+                acc1 += float(b1 & 0x0F) * y_lo + float(b1 >> 4) * y_hi;
+                sumy += y_lo + y_hi;
+            }
+            sumf0 += dsc0 * acc0 - dmn0 * sumy;
+            sumf1 += dsc1 * acc1 - dmn1 * sumy;
+        }
+    }
+
+    sumf0 = warp_reduce_sum(sumf0);
+    sumf1 = warp_reduce_sum(sumf1);
+    if (lane_id == 0) {
+        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+    }
+}
+
+// ─── Q6_K × f32 matrix multiplication ─────────────────────────
+// Q6_K super-block: 256 elements, 16 sub-blocks × 16.
+// Block (210 bytes): uchar ql[128], uchar qh[64], int8 scales[16], fp16 d.
+// Dequant: val = d * scales[sub] * ((low4 | (high2 << 4)) - 32).
+// NR0=2 rows per warp, NSG=2 warps per block.
+
+__global__ void q6_k_f32_matmul(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int QKK = 256;
+    const int NR0 = 2;
+    const int NSG = 2;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+
+    if (t >= nt || r0 >= od) return;
+
+    int nbe = (id + QKK - 1) / QKK;
+    int row_stride = nbe * Q6KB;
+
+    const uint8_t* w0 = weights + (r0 + 0) * row_stride;
+    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
+    const float* y = acts + t * id;
+
+    float sumf0 = 0.0f, sumf1 = 0.0f;
+
+    for (int ib = lane_id; ib < nbe; ib += WARP) {
+        const uint8_t* blk0 = w0 + ib * Q6KB;
+        const uint8_t* blk1 = w1 + ib * Q6KB;
+
+        float bd0 = h2f(*reinterpret_cast<const uint16_t*>(blk0 + 208));
+        float bd1 = h2f(*reinterpret_cast<const uint16_t*>(blk1 + 208));
+
+        const uint8_t* ql0 = blk0;
+        const uint8_t* ql1 = blk1;
+        const uint8_t* qh0 = blk0 + 128;
+        const uint8_t* qh1 = blk1 + 128;
+        const int8_t* sc0 = (const int8_t*)(blk0 + 192);
+        const int8_t* sc1 = (const int8_t*)(blk1 + 192);
+        const float* yb = y + ib * QKK;
+
+        for (int n = 0; n < 2; n++) {
+            #pragma unroll
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                const float* ys = yb + n * 128 + l;
+
+                int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
+                int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
+                int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
+                int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
+                int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
+                int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
+                int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
+                int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
+
+                int si = is + n * 8;
+                sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
+                       + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
+                       + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
+                       + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
+                sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
+                       + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
+                       + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
+                       + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
+            }
+            ql0 += 64; ql1 += 64;
+            qh0 += 32; qh1 += 32;
+        }
+    }
+
+    sumf0 = warp_reduce_sum(sumf0);
+    sumf1 = warp_reduce_sum(sumf1);
+    if (lane_id == 0) {
+        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+    }
+}
+
 // ─── Quantize f32 → Q8_0 (1 thread per 32-element block) ─────
 // Matches CPU scalar path: half delta + 32 signed int8 values
 
@@ -502,6 +815,46 @@ void launch_q4_0_f32_matmul(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q4_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q8_0_f32_matmul(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 4, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q8_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q4_1_f32_matmul(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 4, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q4_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q4_k_f32_matmul(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 2, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q4_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q6_k_f32_matmul(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 2, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q6_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
 void launch_quantize_q8_0(

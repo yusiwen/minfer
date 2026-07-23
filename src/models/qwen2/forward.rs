@@ -87,54 +87,90 @@ pub fn forward(
     #[cfg(feature = "cuda")]
     {
         let use_gpu = crate::cuda::CudaState::get().map_or(false, |cuda| {
-            let l0 = &model.layers[0];
-            let wq = l0.wq.as_ref().unwrap();
-            let wk = l0.wk.as_ref().unwrap();
-            let wv = l0.wv.as_ref().unwrap();
-            let wo = l0.wo.as_ref().unwrap();
-            let fg = l0.ffn_gate.as_ref().unwrap();
-            let fu = l0.ffn_up.as_ref().unwrap();
-            let fd = l0.ffn_down.as_ref().unwrap();
-            // CUDA only supports Q4_0 weights currently
-            let all_q4_0 = wq.ttype == TensorType::Q4_0 && wk.ttype == TensorType::Q4_0
-                && wv.ttype == TensorType::Q4_0 && wo.ttype == TensorType::Q4_0
-                && fg.ttype == TensorType::Q4_0 && fu.ttype == TensorType::Q4_0
-                && fd.ttype == TensorType::Q4_0;
-            all_q4_0
-                && cuda.has_weight(&wq.name) && cuda.has_weight(&wk.name) && cuda.has_weight(&wv.name)
-                && cuda.has_weight(&wo.name) && cuda.has_weight(&fg.name)
-                && cuda.has_weight(&fu.name) && cuda.has_weight(&fd.name)
-                && l0.attn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
-                && l0.ffn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
-                && l0.bq.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
-                && l0.bk.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
-                && l0.bv.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+            model.layers.iter().all(|l| {
+                let wq = match &l.wq { Some(t) => t, None => return false };
+                let wk = match &l.wk { Some(t) => t, None => return false };
+                let wv = match &l.wv { Some(t) => t, None => return false };
+                let wo = match &l.wo { Some(t) => t, None => return false };
+                let fg = match &l.ffn_gate { Some(t) => t, None => return false };
+                let fu = match &l.ffn_up { Some(t) => t, None => return false };
+                let fd = match &l.ffn_down { Some(t) => t, None => return false };
+                fn is_q4(t: TensorType) -> bool { t == TensorType::Q4_0 || t == TensorType::Q4_1 }
+                fn is_qk(t: TensorType) -> bool { t == TensorType::Q4_K || t == TensorType::Q6_K }
+                let all_q4 = is_q4(wq.ttype) && is_q4(wk.ttype)
+                    && is_q4(wv.ttype) && is_q4(wo.ttype)
+                    && is_q4(fg.ttype) && is_q4(fu.ttype)
+                    && is_q4(fd.ttype);
+                let all_qk = is_qk(wq.ttype) && is_qk(wk.ttype)
+                    && is_qk(wv.ttype) && is_qk(wo.ttype)
+                    && is_qk(fg.ttype) && is_qk(fu.ttype)
+                    && is_qk(fd.ttype);
+                (all_q4 || all_qk)
+                    && cuda.has_weight(&wq.name) && cuda.has_weight(&wk.name) && cuda.has_weight(&wv.name)
+                    && cuda.has_weight(&wo.name) && cuda.has_weight(&fg.name)
+                    && cuda.has_weight(&fu.name) && cuda.has_weight(&fd.name)
+                    && l.attn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
+                    && l.ffn_norm.as_ref().map_or(false, |t| cuda.has_weight(&t.name))
+                    && l.bq.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+                    && l.bk.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+                    && l.bv.as_ref().map_or(true, |t| cuda.has_weight(&t.name))
+            })
         });
         if use_gpu {
             let cuda = crate::cuda::CudaState::get().unwrap();
-            cuda.upload_hidden(&hidden);
-            cuda.upload_positions(positions);
-            for il in 0..model.n_layer() {
-                let l = &model.layers[il];
-                if !cuda.layer_gpu(il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
-                    eprintln!("layer_gpu returned false at layer {}", il);
-                    cuda.sync();
-                    return vec![];
-                }
-            }
-            let gpu_output = cuda.output_norm_gpu(
-                model.output.as_ref().unwrap(), model.output_norm.as_ref(),
-                model.output_b.as_ref(),
-                ne, nv, nt, eps,
-            );
-            cuda.sync();
-            if gpu_output {
+
+            // Fast path: replay captured decode graph (single kernel launch)
+            if nt == 1 && cuda.graph_available() {
+                cuda.upload_hidden(&hidden);
+                cuda.upload_positions(positions);
+                cuda.graph_launch();
+                cuda.sync();
                 let mut logits = vec![0.0f32; nt * nv];
                 cuda.download_logits(&mut logits);
                 return logits;
             }
-            cuda.download_hidden(&mut hidden);
-            run_cpu = false;
+
+            cuda.upload_hidden(&hidden);
+            cuda.upload_positions(positions);
+
+            let mut capture = false;
+            if capture {
+                capture = cuda.graph_begin_capture();
+            }
+
+            for il in 0..model.n_layer() {
+                let l = &model.layers[il];
+                if !cuda.layer_gpu(il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
+                    eprintln!("layer_gpu returned false at layer {} — falling back to CPU for all layers", il);
+                    cuda.sync();
+                    run_cpu = true;
+                    break;
+                }
+
+
+            }
+
+            if !run_cpu {
+                let gpu_output = cuda.output_norm_gpu(
+                    model.output.as_ref().unwrap(), model.output_norm.as_ref(),
+                    model.output_b.as_ref(),
+                    ne, nv, nt, eps,
+                );
+
+                if capture {
+                    cuda.graph_end_capture();
+                    cuda.graph_launch();
+                }
+
+                cuda.sync();
+                if gpu_output {
+                    let mut logits = vec![0.0f32; nt * nv];
+                    cuda.download_logits(&mut logits);
+                    return logits;
+                }
+                cuda.download_hidden(&mut hidden);
+                run_cpu = false;
+            }
         }
     }
 

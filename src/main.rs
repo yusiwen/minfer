@@ -159,6 +159,12 @@ fn main() {
     let n_vocab = model.n_vocab();
     let mut kv_cache = cache::KVCache::new(n_layer, n_head_kv, n_embd_head, params.n_ctx);
 
+    // Pre-allocate GPU KV cache (avoids O(n²) incremental growth during generation)
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = cuda::CudaState::get() {
+        cuda.init_kv_cache(n_layer, params.n_ctx, n_head_kv * n_embd_head);
+    }
+
     // === Tokenizer ===
     let tokenizer = tokenizer::Tokenizer::load(&ctx);
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
