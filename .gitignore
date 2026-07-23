@@ -3,5 +3,6 @@
 /tmp/
 *.npy
 *.f32
+*.log
 .env
 .qoder/
