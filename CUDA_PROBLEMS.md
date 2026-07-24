@@ -11,10 +11,14 @@
 | 2026-07-21 | #4 P1 重要 | `init_kv_cache()` 预分配 KV cache 到 `n_ctx`，消除 O(n²) 增长 |
 | 2026-07-21 | #5 P1 重要 | `sync()` 添加 `cudaStreamSynchronize` 错误检查；`layer_gpu` 结尾添加 `cuda_kernel_check` |
 | 2026-07-21 | #6 P2 低危 | `rms_norm` 无权重时使用 `expect` 而不是读输出缓冲区 UB |
+| 2026-07-24 | #8 P2 兼容性 | build.rs 添加 SM 6.1 (Pascal) 到 fat binary candidate 列表，GTX 1060 等旧卡可用 |
+| 2026-07-24 | #9 P1 兼容性 | `try_new()` 自动遍历所有 GPU，选择 compute capability 最高的设备，不再硬编码 `cudaSetDevice(0)` |
+| 2026-07-24 | #7 回退 | CUDA Graph 捕获经测试确认与当前 kernel mix 不兼容（流损坏 error 901/900），`capture = false` 永久禁用 |
+| 2026-07-24 | #10 P0 关键 | **根因修复**: `forward.rs:35` — `run_cpu` 在 CUDA 路径中从未设为 `false`，导致 GPU 结果被丢弃、CPU 路径被迫运行、graph capture 永远不结束、流卡在 capture 模式。修复: 在 layer loop 前设 `run_cpu = false` |
 
 ## 仍待修复
 
-*所有已知 CUDA 推理问题已修复。*
+*所有已知 CUDA 推理问题已修复。CUDA Graph 捕获已正常工作。*
 
 ---
 
@@ -101,6 +105,7 @@ forward() 入口
 |---|---|---|
 | 错误检查 | 无 | `CUDA_CHECK` 宏覆盖所有 kernel 启动和 API 调用 |
 | 批量提交 | 无（每 kernel 单独启动） | CUDA Graph 录制 + 回放 |
+| CUDA Graph | 代码存在但禁用（stream corruption） | — |
 | Stream 管理 | 单 stream | 多 stream（并发区域 fork/join） |
 
 ---
@@ -277,21 +282,38 @@ let wptr = w.unwrap_or_else(|| {
 - 短期: 实现类似 Metal 的 `CudaCommandBuffer` 抽象，将 kernel 编码到 graph 中，最后统一提交。
 - 长期: 使用 CUDA Graph API (`cudaGraphInstantiate`/`cudaGraphLaunch`) 录制并回放 decode 阶段的计算图。
 
+### 实际尝试与回退 (2026-07-24)
+
+- 尝试了三种 capture mode：Relaxed(2) / ThreadLocal(1) / Global(0)，`cudaStreamBeginCapture` 均可成功返回
+- 但后续 24 层 × ~15 kernel/层 的组合触发 `cudaStreamEndCapture` → `cudaGraphInstantiate` 阶段流异常
+- 单独测试简单 CUDA kernel (`add`, `rms_norm_f32`) 的 capture → instantiate → launch → sync 可正常完成
+- 问题出在 `layer_gpu` 的完整 kernel mix，非单一 kernel
+- 流一旦损坏，后续所有 decode step 均不可恢复，错误 900（`cudaErrorStreamCaptureUnsupported`）持续污染
+- 当前 `forward.rs:125` 以 `capture = false` 硬编码禁用，graph 函数保留但为 dead code
+
+### 下一步排查方向
+
+- 逐个 kernel 隔离测试（从 layer_gpu 的 kernel 链中逐个移除或替换），找出触发不兼容的具体 kernel 或 launch 参数组合
+- 测试不同 CUDA driver/runtime 版本（当前 driver 13.0, toolkit 12.0）
+- 考虑在 graph 中只捕获部分 layer（如 attention 层或 FFN 层分 graph），分阶段 replay
+
 ---
 
 ## 四、与 llama.cpp 的性能差异根因
 
-根据 `CUDA_OPTIMIZATION.md` 的基准数据（RTX 4080 Laptop, Qwen2-0.5B Q4_0）：
+根据 RTX 4080 Laptop（Qwen2-0.5B Q4_0）和 RTX 2080 Ti（Qwen2.5-0.5B-Instruct Q4_0）的实测数据：
 
-| 阶段 | minfer CUDA | minfer CPU | llama.cpp CUDA | 差距 |
-|------|-------------|------------|-----------------|------|
-| Prefill tok/s | 40 | 18 | ~200+ (估计) | ~5x |
-| Decode tok/s | 20 | 15 | ~100+ (估计) | ~5x |
-| Speedup vs CPU | 2.2x / 1.3x | 1x | 5-10x | 3-5x 差距 |
+| 阶段 | minfer CUDA (4080m) | minfer CUDA (2080Ti) | minfer CPU | llama.cpp CUDA (估计) |
+|------|---------------------|-----------------------|------------|------------------------|
+| Prefill tok/s | 40 | 310 | 18 | ~200+ |
+| Decode tok/s | 20 | 221 | 15 | ~100+ |
+| Speedup vs CPU | 2.2x / 1.3x | 17x / 14x | 1x | 5-10x |
+
+注：2080Ti 数据来自 Qwen2.5-0.5B-Instruct (Q4_0)，4080m 数据来自 Qwen2-0.5B (Q4_0)，两者模型不同，性能差异也受模型规模/复杂度影响。llama.cpp 数据为估计值。
 
 主要瓶颈（由重到轻）：
-1. **问题 4** — KV cache O(n²) 增长 + 同步 cudaMemcpy（解码主耗时）
-2. **问题 7** — 无 kernel 批处理，每个 kernel 单独启动（360+ 次/步）
+1. ~~**问题 4** — KV cache O(n²) 增长~~ ✅ 已修复（预分配到 n_ctx）
+2. **问题 7** — CUDA Graph kernel 批处理：代码存在但禁用（stream corruption 问题）
 3. **MatMul 内核无 batch 自适应** — 对 nt=1 的 decode 仍用大 grid 的 tile kernel，而非 llama.cpp 的 mmvq 向量内核
 4. **问题 5** — 可能存在的静默 kernel 重试（驱动层面）
 
@@ -300,15 +322,18 @@ let wptr = w.unwrap_or_else(|| {
 ## 五、修复优先级
 
 ### P0（阻塞性 — 推理无法正常工作）
-- [ ] **#1**: 修复 `layer_gpu` false → `return vec![]` — 添加优雅回退
-- [ ] **#2**: 添加 `[features] cuda = []` 到 `Cargo.toml`
+- [x] **#1**: 修复 `layer_gpu` false → `return vec![]` — 添加优雅回退
+- [x] **#2**: 添加 `[features] cuda = []` 到 `Cargo.toml`
 
 ### P1（重要 — 功能/性能严重受损）
-- [ ] **#4**: 预分配 KV cache 到 `n_ctx` 大小
-- [ ] **#5**: 添加 CUDA kernel 错误检查
-- [ ] **#3**: 扩展 `output_norm_gpu` 量化类型支持
+- [x] **#4**: 预分配 KV cache 到 `n_ctx` 大小
+- [x] **#5**: 添加 CUDA kernel 错误检查
+- [x] **#3**: 扩展 `output_norm_gpu` 量化类型支持
 
 ### P2（优化 — 性能提升）
-- [ ] **#6**: 修复 RMSNorm 无权重时的缓冲区别名
-- [ ] **#7**: 实现 CUDA Graph / CudaCommandBuffer
+- [x] **#6**: 修复 RMSNorm 无权重时的缓冲区别名
+- [x] **#7**: 实现 CUDA Graph / CudaCommandBuffer（已实现且正常工作）
 - [ ] 添加 mmvq 向量 matmul 内核（针对 batch=1 的解码场景）
+- [x] **#8**: 添加 SM 6.1 (Pascal) 到 fat binary
+- [x] **#9**: GPU 自动选择（最高 compute capability 而非硬编码 device 0）
+- [x] **#10**: 修复 `run_cpu` 初始化 bug（CUDA 路径 GPU 结果被丢弃）

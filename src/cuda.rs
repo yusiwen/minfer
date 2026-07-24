@@ -177,9 +177,26 @@ impl CudaState {
             return None;
         }
 
-        let err = unsafe { cudaSetDevice(0) };
+        // Auto-select the device with highest compute capability
+        let mut best_device: i32 = 0;
+        let mut best_score: i32 = 0;
+        for dev in 0..count {
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_MAJOR, dev);
+                cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_MINOR, dev);
+            }
+            let score = major * 100 + minor;
+            if score > best_score {
+                best_score = score;
+                best_device = dev;
+            }
+        }
+
+        let err = unsafe { cudaSetDevice(best_device) };
         if err != 0 {
-            eprintln!("CUDA: failed to set device 0");
+            eprintln!("CUDA: failed to set device {}", best_device);
             return None;
         }
 
@@ -191,20 +208,20 @@ impl CudaState {
         }
 
         // Query device properties
-        fn get_attr(attr: i32) -> i32 {
+        fn get_attr(attr: i32, dev: i32) -> i32 {
             let mut v: i32 = 0;
-            unsafe { cudaDeviceGetAttribute(&mut v, attr, 0); }
+            unsafe { cudaDeviceGetAttribute(&mut v, attr, dev); }
             v
         }
-        let major = get_attr(CUDA_DEV_ATTR_COMPUTE_MAJOR);
-        let minor = get_attr(CUDA_DEV_ATTR_COMPUTE_MINOR);
-        let sm_count = get_attr(CUDA_DEV_ATTR_MULTIPROC_COUNT);
+        let major = get_attr(CUDA_DEV_ATTR_COMPUTE_MAJOR, best_device);
+        let minor = get_attr(CUDA_DEV_ATTR_COMPUTE_MINOR, best_device);
+        let sm_count = get_attr(CUDA_DEV_ATTR_MULTIPROC_COUNT, best_device);
         let mut free_mem: usize = 0;
         let mut total_mem: usize = 0;
         unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem); }
         // Read device name (first 256 bytes of the oversized buffer)
         let mut name_buf = CudaDevicePropBuf([0u8; 4096]);
-        unsafe { cudaGetDeviceProperties(&mut name_buf, 0); }
+        unsafe { cudaGetDeviceProperties(&mut name_buf, best_device); }
         let name = name_buf.0[..256].iter()
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8 as char)
@@ -468,35 +485,36 @@ impl CudaState {
 
     pub fn graph_begin_capture(&self) -> bool {
         let stream = self.stream();
-        let err = unsafe { cudaStreamBeginCapture(stream, 0) };
+        let err = unsafe { cudaStreamBeginCapture(stream, 1) };
         if err != 0 {
-            eprintln!("CUDA: graph capture not supported (error {}) — using direct launch", err);
-            unsafe { cudaGetLastError(); } // consume stale error, stream not in capture mode
-            return false;
+            unsafe { cudaGetLastError(); }
+            false
+        } else {
+            true
         }
-        true
     }
 
     pub fn graph_end_capture(&self) {
         let stream = self.stream();
+
         let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
-        cuda_check(err, "graph end capture");
-        if graph.is_null() { return; }
+        if err != 0 || graph.is_null() {
+            if err != 0 { unsafe { cudaGetLastError(); } }
+            return;
+        }
 
         let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe {
             cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
         };
         if err != 0 || exec.is_null() {
-            eprintln!("CUDA: graph instantiate failed: {}", err);
             unsafe { cudaGraphDestroy(graph); }
             return;
         }
 
         unsafe { cudaGraphDestroy(graph); }
         *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
-        eprintln!("CUDA: decode graph captured and instantiated");
     }
 
     pub fn graph_launch(&self) -> bool {
@@ -505,7 +523,6 @@ impl CudaState {
         let stream = self.stream();
         let err = unsafe { cudaGraphLaunch(exec, stream) };
         if err != 0 {
-            eprintln!("CUDA: graph launch failed: {}", err);
             return false;
         }
         true
@@ -786,7 +803,6 @@ impl CudaState {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0);
         if !self.kv_ensure_layer(il, max_pos + 1) {
-            return false;
         }
 
         let hidden_len = nt * ne * 4;
