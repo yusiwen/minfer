@@ -82,7 +82,7 @@ fn find_cuda_home() -> String {
 }
 
 fn detect_archs(nvcc: &str, out_dir: &str, cuda_home: &str) -> Vec<String> {
-    let candidates = ["75", "80", "86", "89", "90"];
+    let candidates = ["61", "75", "80", "86", "89", "90"];
     let mut supported = Vec::new();
     let test_dir = format!("{}/nvcc_arch_test", out_dir);
     let _ = std::fs::create_dir_all(&test_dir);

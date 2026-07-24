@@ -119,7 +119,7 @@ pub fn forward(
         if use_gpu {
             let cuda = crate::cuda::CudaState::get().unwrap();
 
-            // Fast path: replay captured decode graph (single kernel launch)
+            // Fast path: replay captured decode graph
             if nt == 1 && cuda.graph_available() {
                 cuda.upload_hidden(&hidden);
                 cuda.upload_positions(positions);
@@ -133,10 +133,9 @@ pub fn forward(
             cuda.upload_hidden(&hidden);
             cuda.upload_positions(positions);
 
-            let mut capture = false;
-            if capture {
-                capture = cuda.graph_begin_capture();
-            }
+            let capture = nt == 1 && !cuda.graph_available() && cuda.graph_begin_capture();
+
+            run_cpu = false; // assume GPU path succeeds; reset on failure below
 
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
@@ -146,8 +145,6 @@ pub fn forward(
                     run_cpu = true;
                     break;
                 }
-
-
             }
 
             if !run_cpu {
