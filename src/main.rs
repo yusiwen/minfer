@@ -46,6 +46,7 @@ fn main() {
         eprintln!("Usage:");
         eprintln!("  {} <model> [prompt]              — run inference", args[0]);
         eprintln!("  {} --meta <model> [prompt]       — run with GGUF metadata dump", args[0]);
+        eprintln!("  {} info <model>                  — print GGUF metadata (no inference)", args[0]);
         eprintln!("  {} download hf <repo> [file]      — download from Hugging Face", args[0]);
         eprintln!("  {} download ollama <model>[:tag]   — pull from Ollama", args[0]);
         eprintln!("  {} list                           — list cached models", args[0]);
@@ -92,6 +93,27 @@ fn main() {
                 Ok(()) => {}
                 Err(e) => eprintln!("Error: {}", e),
             }
+            return;
+        }
+        "info" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} info <model>", args[0]);
+                std::process::exit(1);
+            }
+            let model_path = &args[2];
+            // Resolve auto-download URIs
+            let model_path = if model_path.starts_with("hf:") || model_path.starts_with("ollama:") {
+                match download::resolve(model_path) {
+                    Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
+                    Err(e) => { eprintln!("Download error: {}", e); std::process::exit(1); }
+                }
+            } else {
+                model_path.clone()
+            };
+            let data = std::fs::read(&model_path).expect("read GGUF file");
+            let ctx = gguf::GgufContext::init_from_data(&data).expect("parse GGUF");
+            dump_gguf_metadata(&ctx);
+            dump_key_tensors(&ctx);
             return;
         }
         _ => {}  // fall through to model inference
