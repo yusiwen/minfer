@@ -1,6 +1,7 @@
 use crate::cache::KVCache;
 use crate::tensor::TensorType;
 use crate::block::{Q4KB, Q6KB};
+use crate::vec_ops::RopeStyle;
 
 pub fn forward(
     model: &super::Qwen2Model,
@@ -57,13 +58,23 @@ pub fn forward(
         });
         if use_gpu {
             let mps = crate::metal::MpsState::get().unwrap();
-            mps.upload_hidden(&hidden);
+            // GPU embedding lookup (Q4_0): writes directly to buf_hidden on GPU
+            let gpu_embd = mps.embed_tokens_gpu(
+                model.tok_embd.as_ref().unwrap(), token_ids, nt, ne
+            );
+            if !gpu_embd {
+                // Fallback: upload CPU-computed hidden state
+                mps.upload_hidden(&hidden);
+            }
             mps.upload_positions(positions);
             let cb = mps.cmd_buffer();
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
-                if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.rope_freq_base, hp.rope_freq_scale) {
+                if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32) {
                     eprintln!("layer_gpu returned false at layer {}", il);
+                    mps.sync_kv_to_cpu(kv_cache, il);
+                    cb.submit();
+                    mps.download_hidden(&mut hidden);
                     return vec![];
                 }
             }
@@ -76,9 +87,11 @@ pub fn forward(
             if gpu_output {
                 let mut logits = vec![0.0f32; nt * nv];
                 mps.download_logits(&mut logits);
+                mps.sync_kv_to_cpu(kv_cache, model.n_layer());
                 return logits;
             }
             mps.download_hidden(&mut hidden);
+            mps.sync_kv_to_cpu(kv_cache, model.n_layer());
             run_cpu = false;
         }
     }
@@ -184,12 +197,12 @@ pub fn forward(
             if let Some(b) = &l.bq { add_bias(&mut bq, b.data_f32(), nt, nqt); }
             if let Some(b) = &l.bk { add_bias(&mut bk, b.data_f32(), nt, nkt); }
             if let Some(b) = &l.bv { add_bias(&mut bv, b.data_f32(), nt, nkt); }
-            apply_rope(&mut bq, positions, nh, hd, hp.rope_freq_base, hp.rope_freq_scale);
-            apply_rope(&mut bk, positions, nk, hd, hp.rope_freq_base, hp.rope_freq_scale);
+            apply_rope(&mut bq, positions, nh, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
+            apply_rope(&mut bk, positions, nk, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
             kv_cache.layers[il].store_multi(positions, &bk, &bv);
             let nkv = kv_cache.layers[il].size;
             gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
-                positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv]);
+                positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv], hp.attention_scale());
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
             unsafe {
                 crate::vec_ops::vec_add_f32(hidden.len(),
@@ -220,6 +233,8 @@ pub fn forward(
                     std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
                     &bn);
             }
+            #[cfg(feature = "debug_dump")]
+            crate::dump::maybe_dump(&format!("minfer_dump_layer{}_out", il), &hidden);
         }
     }
     rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
@@ -230,6 +245,8 @@ pub fn forward(
             let b = ob.data_f32();
             for t in 0..nt { let base = t * nv; for i in 0..nv.min(b.len()) { logits[base + i] += b[i]; } }
         }
+        #[cfg(feature = "debug_dump")]
+        crate::dump::maybe_dump("minfer_dump_logits", &logits);
         return logits;
     }
     vec![]
@@ -267,6 +284,29 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                 }
             }
         }
+        TensorType::Q5_0 => {
+            let blk = 32usize; let nbp = (ne + blk - 1) / blk; let bb = 22usize;
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize; let doff = ti * ne;
+                for b in 0..nbp {
+                    let off = (idx * nbp + b) * bb;
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
+                    let qh = u32::from_le_bytes([t.data[off+2], t.data[off+3], t.data[off+4], t.data[off+5]]);
+                    let qs = &t.data[off + 6..off + 22];
+                    let mv = blk.min(ne - b * blk);
+                    for j in 0..16 {
+                        let xh0 = ((qh >> j) & 1) as u32;
+                        let xh1 = ((qh >> (j + 16)) & 1) as u32;
+                        if j < mv {
+                            out[doff + b * blk + j] = (((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) - 16) as f32 * d;
+                        }
+                        if j + 16 < mv {
+                            out[doff + b * blk + j + 16] = ((((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) - 16) as f32 * d;
+                        }
+                    }
+                }
+            }
+        }
         TensorType::Q4_K => {
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
@@ -289,6 +329,36 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                         for j in 0..16 {
                             out[base + j]      = dl * (q4_sub[j] & 0x0F) as f32 - ml;
                             out[base + j + 16] = dl * (q4_sub[j] >> 4) as f32 - ml;
+                        }
+                    }
+                }
+            }
+        }
+        TensorType::Q5_K => {
+            let Q5KB: usize = 176;
+            let n_super = (ne + 255) / 256;
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize; let doff = ti * ne;
+                for s in 0..n_super {
+                    let off = (idx * n_super + s) * Q5KB;
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
+                    let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
+                    let sc_arr: &[u8; 12] = t.data[off + 4..off + 16].try_into().unwrap();
+                    let (scales, mins) = crate::block::unpack_q4k_scales(sc_arr);
+                    let qh = &t.data[off + 16..off + 48];
+                    let qs = &t.data[off + 48..off + 176];
+
+                    for sub in 0..8 {
+                        let dl = d * scales[sub] as f32;
+                        let ml = dmin * mins[sub] as f32;
+                        let base = doff + s * 256 + sub * 32;
+                        for j in 0..16 {
+                            let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
+                            let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
+                            let w0 = (qs[sub * 16 + j] & 0x0F) as f32 + 16.0 * h0 as f32;
+                            let w1 = ((qs[sub * 16 + j] >> 4) & 0x0F) as f32 + 16.0 * h1 as f32;
+                            out[base + j]      = dl * w0 - ml;
+                            out[base + j + 16] = dl * w1 - ml;
                         }
                     }
                 }
@@ -348,9 +418,9 @@ fn add_bias(x: &mut [f32], b: &[f32], n: usize, d: usize) {
     for t in 0..n { let base = t * d; for i in 0..d.min(b.len()) { x[base + i] += b[i]; } }
 }
 
-fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_scale: f32) {
+fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_scale: f32, style: RopeStyle) {
     let half = hd / 2;
-    let mut freqs = [0.0f32; 64];
+    let mut freqs = [0.0f32; 128];
     for i in 0..half { freqs[i] = freq_scale / fb.powf((2 * i) as f32 / hd as f32); }
     let mut sin_cache = vec![0.0f32; half];
     let mut cos_cache = vec![0.0f32; half];
@@ -366,7 +436,10 @@ fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_
             let b = t * nh * hd + h * hd;
             for i in 0..half {
                 let (sn, cs) = (sin_cache[i], cos_cache[i]);
-                let (i0, i1) = (b + i, b + i + half);
+                let (i0, i1) = match style {
+                    RopeStyle::NonInterleaved => (b + i, b + i + half),
+                    RopeStyle::Interleaved => (b + 2 * i, b + 2 * i + 1),
+                };
                 let (x0, x1) = (x[i0], x[i1]);
                 x[i0] = x0 * cs - x1 * sn;
                 x[i1] = x0 * sn + x1 * cs;
@@ -376,8 +449,8 @@ fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_
 }
 
 fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: usize,
-    nh: usize, nk: usize, hd: usize, out: &mut [f32], scrs: &mut [f32]) {
-    let gqa = nh / nk; let ne_q = nh * hd; let sc = 1.0 / (hd as f32).sqrt();
+    nh: usize, nk: usize, hd: usize, out: &mut [f32], scrs: &mut [f32], scale: f32) {
+    let gqa = nh / nk; let ne_q = nh * hd;
     for h in 0..nh {
         let hk = h / gqa;
         for t in 0..nt {
@@ -385,7 +458,7 @@ fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: us
             let mut mx = f32::NEG_INFINITY;
             for kv in 0..vl {
                 let ks = kv * nk * hd + hk * hd;
-                let s = crate::vec_ops::vec_dot_f32(hd, &q[qs..qs + hd], &ka[ks..ks + hd]) * sc;
+                let s = crate::vec_ops::vec_dot_f32(hd, &q[qs..qs + hd], &ka[ks..ks + hd]) * scale;
                 scrs[kv] = s; if s > mx { mx = s; }
             }
             for kv in vl..nkv { scrs[kv] = f32::NEG_INFINITY; }

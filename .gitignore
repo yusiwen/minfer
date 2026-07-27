@@ -6,3 +6,8 @@
 *.log
 .env
 .qoder/
+.venv/
+__pycache__/
+llama_ref/
+uv.lock
+.direnv/

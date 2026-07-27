@@ -76,6 +76,12 @@ pub fn cpu_quant_matmul_f32(
     w: &Tensor, x: &[f32], out: &mut [f32],
     od: usize, id: usize, nt: usize,
 ) {
+    if w.ttype == TensorType::Q5_K {
+        return cpu_q5_k_matmul_f32(w, x, out, od, id, nt);
+    }
+    if w.ttype == TensorType::Q5_0 {
+        return cpu_q5_0_matmul_f32(w, x, out, od, id, nt);
+    }
     let nbe = id / 32;
     let mut qb = vec![0u8; nt * nbe * Q8B];
     crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut qb);
@@ -148,5 +154,84 @@ pub fn cpu_quant_matmul(
             }
         }
         _ => panic!("unsupported weight type {:?} in quant_matmul", w.ttype),
+    }
+}
+
+/// Q5_K × f32 matmul: dequantize Q5_K weights on-the-fly and compute f32 dot product.
+/// Block: d(f16,2) + dmin(f16,2) + scales(u8,12) + qh(u8,32) + qs(u8,128) = 176 bytes.
+/// Each block dequantizes 256 elements using 5 bits (4 low + 1 high) per weight.
+fn cpu_q5_k_matmul_f32(
+    w: &Tensor, x: &[f32], out: &mut [f32],
+    od: usize, id: usize, nt: usize,
+) {
+    use crate::block::fp16_to_f32;
+    let n_super = id / 256;
+    let ws = n_super * 176;
+    let wb = w.data();
+    for o in 0..od {
+        let wrow = &wb[o * ws..(o + 1) * ws];
+        for t in 0..nt {
+            let a_base = t * id;
+            let mut sum = 0.0f32;
+            for s in 0..n_super {
+                let off = s * 176;
+                let d  = fp16_to_f32(u16::from_le_bytes([wrow[off],     wrow[off + 1]]));
+                let dm = fp16_to_f32(u16::from_le_bytes([wrow[off + 2], wrow[off + 3]]));
+                let sc_arr: &[u8; 12] = wrow[off + 4..off + 16].try_into().unwrap();
+                let (sc, mn) = crate::block::unpack_q4k_scales(sc_arr);
+                let qh = &wrow[off + 16..off + 48];
+                let qs = &wrow[off + 48..off + 176];
+                for sub in 0..8 {
+                    let dl = d * sc[sub] as f32;
+                    let ml = dm * mn[sub] as f32;
+                    let qs_sub = &qs[sub * 16..];
+                    for j in 0..16 {
+                        let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
+                        let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
+                        let w0 = (qs_sub[j] & 0x0F) as f32 + 16.0 * h0 as f32;
+                        let w1 = ((qs_sub[j] >> 4) & 0x0F) as f32 + 16.0 * h1 as f32;
+                        let off_a = a_base + s * 256 + sub * 32;
+                        sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
+                        sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
+                    }
+                }
+            }
+            out[t * od + o] = sum;
+        }
+    }
+}
+
+/// Q5_0 × f32 matmul: dequantize Q5_0 weights on-the-fly and compute f32 dot product.
+/// Block: d(f16,2) + qh(u8,4) + qs(u8,16) = 22 bytes per 32 elements.
+/// Dequant: val = d * ((nibble | (high_bit << 4)) - 16).
+fn cpu_q5_0_matmul_f32(
+    w: &Tensor, x: &[f32], out: &mut [f32],
+    od: usize, id: usize, nt: usize,
+) {
+    use crate::block::fp16_to_f32;
+    let nb = id / 32;
+    let ws = nb * 22;
+    let wb = w.data();
+    for o in 0..od {
+        let wrow = &wb[o * ws..(o + 1) * ws];
+        for t in 0..nt {
+            let a_base = t * id;
+            let mut sum = 0.0f32;
+            for b in 0..nb {
+                let off = b * 22;
+                let d = fp16_to_f32(u16::from_le_bytes([wrow[off], wrow[off + 1]]));
+                let qh = u32::from_le_bytes([wrow[off+2], wrow[off+3], wrow[off+4], wrow[off+5]]);
+                let qs = &wrow[off + 6..off + 22];
+                for j in 0..16 {
+                    let xh0 = ((qh >> j) & 1) as i32;
+                    let xh1 = ((qh >> (j + 16)) & 1) as i32;
+                    let w0 = (((qs[j] & 0x0F) as i32 | (xh0 << 4)) - 16) as f32 * d;
+                    let w1 = ((((qs[j] >> 4) & 0x0F) as i32 | (xh1 << 4)) - 16) as f32 * d;
+                    sum += w0 * x[a_base + b * 32 + j];
+                    sum += w1 * x[a_base + b * 32 + j + 16];
+                }
+            }
+            out[t * od + o] = sum;
+        }
     }
 }

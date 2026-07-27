@@ -5,6 +5,7 @@ pub mod qwen2;
 
 use crate::cache::KVCache;
 use crate::gguf::GgufContext;
+use crate::vec_ops::RopeStyle;
 
 /// Architecture-agnostic model interface.
 pub trait ModelDef {
@@ -15,6 +16,7 @@ pub trait ModelDef {
     fn n_head_kv(&self) -> usize;
     fn n_embd_head(&self) -> usize;
     fn n_vocab(&self) -> usize;
+    fn rope_style(&self) -> RopeStyle;
 }
 
 /// Token IDs used by the sampler to stop generation.

@@ -19,6 +19,7 @@ mod metal;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod download;
+mod dump;
 
 use std::time::Instant;
 
