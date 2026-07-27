@@ -3,6 +3,13 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RopeStyle {
+    NonInterleaved = 0,  // Qwen2: pairs [i, i+half_dim]
+    Interleaved = 1,     // LLaMA/Mistral: pairs [2*i, 2*i+1]
+}
+
 // Helper: scalar sigmoid
 #[inline]
 fn sigmoid(x: f32) -> f32 {

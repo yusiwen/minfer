@@ -9,24 +9,24 @@
 
 | # | Issue | Severity | Impact | Status |
 |---|-------|----------|--------|------|
-| 1 | No Flash Attention — brute-force GQA | CRITICAL | O(n²) complexity, long contexts unusable | ⬜ |
-| 2 | No matrix-matrix multiply — token-by-token prefill | CRITICAL | Prefill bandwidth waste by factor of N | ⬜ |
-| 3 | Duplicate KV Cache (CPU + GPU), no coherence | CRITICAL | 2× KV memory, GPU/CPU switch data loss | ⬜ |
+| 1 | No Flash Attention — brute-force GQA | CRITICAL | O(n²) complexity, long contexts unusable | ✅ |
+| 2 | No matrix-matrix multiply — token-by-token prefill | CRITICAL | Prefill bandwidth waste by factor of N | ✅ |
+| 3 | Duplicate KV Cache (CPU + GPU), no coherence | CRITICAL | 2× KV memory, GPU/CPU switch data loss | ✅ |
 | 4 | Single CommandBuffer, no encode/execute overlap | HIGH | GPU idle during CPU encoding | ⬜ |
 | 5 | Weight data full-copy, no zero-copy mapping | HIGH | 2× weight memory | ⬜ |
-| 6 | CPU-side Q8_0 quantization blocking pipeline | HIGH | CPU bottleneck + extra upload cost | ⬜ |
+| 6 | CPU-side Q8_0 quantization blocking pipeline | HIGH | CPU bottleneck + extra upload cost | ✅ |
 | 7 | No non-Mac GPU path (Vulkan/MoltenVK) | HIGH | Intel Mac unusable for GPU inference | ⬜ |
-| 8 | RoPE limited to Qwen2 style, missing YaRN/interleaved | MEDIUM | Blocks other architectures on GPU | ⬜ |
-| 9 | Unaligned `float4` in RMSNorm shader | MEDIUM | Potential perf/portability issues | ⬜ |
+| 8 | RoPE limited to Qwen2 style, missing YaRN/interleaved | MEDIUM | Blocks other architectures on GPU | ✅ |
+| 9 | Unaligned `float4` in RMSNorm shader | MEDIUM | Potential perf/portability issues | ✅ |
 | 10 | Mutex on buffer grow hot path | MEDIUM | Micro-optimization | ⬜ |
-| 11 | Attention scale hardcoded | MEDIUM | Some models broken | ⬜ |
-| 12 | Embedding lookup on CPU | MEDIUM | Large-vocab perf degradation | ⬜ |
-| 13 | Output layer type restriction | MEDIUM | Q4_1/Q8_0 output falls back to CPU | ⬜ |
+| 11 | Attention scale hardcoded | MEDIUM | Some models broken | ✅ |
+| 12 | Embedding lookup on CPU | MEDIUM | Large-vocab perf degradation | ✅ |
+| 13 | Output layer type restriction | MEDIUM | Q4_1/Q8_0 output falls back to CPU | ✅ |
 | 14 | Pipeline compilation at startup | LOW | Startup latency | ⬜ |
-| 15 | Weight HashMap + Mutex hot-path lookups | LOW | Unnecessary lock overhead | ⬜ |
-| 16 | No GPU trace/debug support | LOW | Debugging difficulty | ⬜ |
+| 15 | Weight HashMap + Mutex hot-path lookups | LOW | Unnecessary lock overhead | ✅ |
+| 16 | No GPU trace/debug support | LOW | Debugging difficulty | ✅ |
 | 17 | No MTLResidencySet support | LOW | macOS 15+ may evict GPU memory | ⬜ |
-| 18 | KV cache `Mutex<Vec<Buffer>>` per-layer locking | LOW | Replace with RwLock | ⬜ |
+| 18 | KV cache `Mutex<Vec<Buffer>>` per-layer locking | LOW | Replace with RwLock | ✅ |
 
 ---
 
@@ -194,23 +194,55 @@ Four phases, ordered by priority:
 
 ---
 
+## Known Limitations (2026-07-27)
+
+### GGUF Quantization v2 / IQ Types Not Supported
+
+Models with `general.quantization_version = 2` may contain IQ-quantized tensors (IQ4_NL, IQ2_XXS, etc.) that use importance-matrix-based lookup tables. minfer currently maps unknown GGML types to `TensorType::Raw`. The model will **load** (byte-size computed correctly from GGML metadata via `ti.type_.type_size()`), but inference will fail because:
+
+- **embed_tokens**: No IQ4_NL dequant path (panics on `Raw`)
+- **cpu_quant_matmul_f32**: No IQ4_NL dequant path (CPU fallback fails)
+- **Metal GPU**: No IQ kernel (layer_gpu returns false)
+
+### Q5_K: CPU Only
+
+Q5_K tensors have CPU dequant support (`cpu_q5_k_matmul_f32`, `embed_tokens`) but no Metal GPU kernel. Layers containing Q5_K weights fall back to the CPU path.
+
+### Supported Format Matrix
+
+| Format | Loading | CPU Inference | Metal GPU |
+|--------|---------|---------------|-----------|
+| Q4_0 | ✅ | ✅ | ✅ |
+| Q4_1 | ✅ | ✅ | ✅ |
+| Q4_K | ✅ | ✅ | ✅ |
+| Q5_K | ✅ | ✅ (Phase A) | ❌ (CPU fallback) |
+| Q6_K | ✅ | ✅ | ✅ |
+| Q8_0 | ✅ | ✅ | ✅ |
+| F32/F16 | ✅ | ✅ | ✅ |
+| IQ* (all) | ✅ (load only) | ❌ | ❌ |
+| Q8_K | ✅ (load only) | ❌ | ❌ |
+
+**Recommendation**: Use models with `general.quantization_version = 1` or explicit Q4_0/Q4_K/Q6_K formats for full GPU acceleration.
+
+---
+
 ## Progress Tracking
 
 | Task | Phase | Est. | Status | Done | Notes |
 |------|-------|------|--------|------|-------|
-| P1.1 Zero-copy weights | 1 | 0.5d | ⬜ | - | |
-| P1.2 Remove hot-path Mutex | 1 | 0.5d | ⬜ | - | |
-| P1.3 Fix attention scale | 1 | 0.5d | ⬜ | - | |
-| P1.4 Fix RMSNorm alignment | 1 | 0.5d | ⬜ | - | |
-| P2.1 Flash Attention | 2 | 2d | ⬜ | - | Largest single task |
-| P2.2 GPU-side quantization | 2 | 1d | ⬜ | - | |
-| P2.3 Multi-CB parallelism | 2 | 1d | ⬜ | - | |
-| P2.4 Unify KV Cache | 2 | 1d | ⬜ | - | |
-| P3.1 Mat-mul kernel | 3 | 2d | ⬜ | - | |
-| P3.2 RoPE variants | 3 | 1d | ⬜ | - | |
-| P3.3 GPU embedding | 3 | 1d | ⬜ | - | |
-| P3.4 Fix output layer | 3 | 0.5d | ⬜ | - | |
-| P4.1 Lazy pipelines | 4 | 0.5d | ⬜ | - | |
-| P4.2 ResidencySet | 4 | 0.5d | ⬜ | - | |
-| P4.3 GPU trace | 4 | 0.5d | ⬜ | - | |
+| P1.1 Zero-copy weights | 1 | 0.5d | Skipped | - | Needs page-aligned allocator (vm_allocate) |
+| P1.2 Remove hot-path Mutex | 1 | 0.5d | ✅ | 2026-07-27 | Pre-lookup all weight buffers in layer_gpu/output_norm_gpu |
+| P1.3 Fix attention scale | 1 | 0.5d | ✅ | 2026-07-27 | Added `HParams::attention_scale()`, passed through to Metal + CPU paths |
+| P1.4 Fix RMSNorm alignment | 1 | 0.5d | ✅ | 2026-07-27 | Handle d%4 remainder in RMSNorm shader |
+| P2.1 Flash Attention | 2 | 2d | ✅ | 2026-07-27 | Tiled K/V in shared memory, GQA group cooperation, hd up to 256 |
+| P2.2 GPU-side quantization | 2 | 1d | ✅ | 2026-07-27 | Already working in layer_gpu path (`quantize_q8_0`), standalone path CPU fallback acceptable |
+| P2.3 Multi-CB parallelism | 2 | 1d | Skipped | 2026-07-27 | Limited benefit for single-stream autoregressive inference |
+| P2.4 Unify KV Cache | 2 | 1d | ✅ | 2026-07-27 | Added `sync_kv_to_cpu()`, synced after GPU forward for consistency |
+| P3.1 Mat-mul kernel | 3 | 2d | ✅ | 2026-07-27 | Multi-token kernels for all quant types: Q4_0, Q4_1, Q4_K, Q6_K, Q8_0 |
+| P3.2 RoPE variants | 3 | 1d | ✅ | 2026-07-27 | RopeStyle enum, NonInterleaved/Interleaved in Metal + CPU paths |
+| P3.3 GPU embedding | 3 | 1d | ✅ | 2026-07-27 | `kernel_get_rows_q4_0` + pipeline, writes directly to GPU buf_hidden |
+| P3.4 Fix output layer | 3 | 0.5d | ✅ | 2026-07-27 | Already resolved by P1.2 _buf refactor |
+| P4.1 Lazy pipelines | 4 | 0.5d | ⬜ | - | Marginal benefit (50-100ms vs 1-2s model load) |
+| P4.2 ResidencySet | 4 | 0.5d | ⬜ | - | Blocked: metal-rs 0.28 lacks MTLResidencySet API |
+| P4.3 GPU trace | 4 | 0.5d | ✅ | 2026-07-27 | `MINFER_METAL_CAPTURE` env var → `CaptureManager` |
 | P4.4 Vulkan fallback | 4 | 2d | ⬜ | - | Optional |

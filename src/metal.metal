@@ -80,6 +80,74 @@ kernel void kernel_q4_0_q8_0_matmul(
     }
 }
 
+// ─── Q4_0 × Q8_0 prefill (multi-token) ──────────────────────
+// Same layout as kernel_q4_0_q8_0_matmul but loops over all
+// tokens within each threadgroup, reusing the weight rows.
+// Grid: x = ceil(od/8), y = 1. TG = 64 threads.
+
+kernel void kernel_q4_0_q8_0_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const uchar  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tid   [[thread_position_in_threadgroup]]
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+    const int NW  = 32;
+
+    const int tiisg = (int)tid.x % NW;
+    const int sgitg = (int)tid.x / NW;
+    const int r0    = ((int)tgpig.x * NSG + sgitg) * NR0;
+
+    if (r0 >= od) return;
+
+    const int nb  = id / 32;
+    const int q4s = nb * Q4B;
+    const int q8s = nb * Q8B;
+
+    for (int t = 0; t < nt; t++) {
+        device const uchar * xr = acts + t * q8s;
+        float sumf[NR0];
+        for (int row = 0; row < NR0; row++) sumf[row] = 0.0f;
+
+        for (int b = tiisg; b < nb; b += NW) {
+            device const half * xb = (device const half *)(xr + b * Q8B);
+            float d8 = float(xb[0]);
+            device const char * xq = (device const char *)(xb + 1);
+
+            for (int row = 0; row < NR0; row++) {
+                int o = r0 + row;
+                if (o >= od) break;
+
+                device const uchar * wr = weights + o * q4s;
+                device const half * wb = (device const half *)(wr + b * Q4B);
+                float d4 = float(wb[0]);
+                device const uchar * wq = (device const uchar *)(wb + 1);
+
+                int bs = 0;
+                for (int j = 0; j < 16; j++) {
+                    uchar byte = wq[j];
+                    bs += (int(byte & 0x0F) - 8) * int(xq[j])
+                        + (int(byte >> 4) - 8) * int(xq[j + 16]);
+                }
+                sumf[row] += float(bs) * d4 * d8;
+            }
+        }
+
+        for (int row = 0; row < NR0; row++) {
+            int o = r0 + row;
+            if (o < od) {
+                float total = simd_sum(sumf[row]);
+                if (tiisg == 0) output[t * od + o] = total;
+            }
+        }
+    }
+}
+
 // ─── Q4_0 × f32 matrix multiplication (simdgroup-cooperative) ──
 // Direct translation of llama.cpp mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>.
 // Threadgroup layout: NSG=2 simdgroups × NW=32 lanes = 64 threads.
@@ -168,6 +236,70 @@ kernel void kernel_q4_0_f32_matmul(
     }
 }
 
+// ─── Q4_0 × f32 prefill (multi-token) ───────────────────────
+// Same as kernel_q4_0_f32_matmul but loops over all tokens
+// within each threadgroup. Grid: x = ceil(od / (NR0*NSG)), y = 1.
+
+kernel void kernel_q4_0_f32_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const float  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 4;
+    const short NSG = 2;
+    const int nb  = id / QK;
+    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+
+    const int q4s = nb * Q4B;
+    const short ix = (short)tiisg / (NW_Q / NQ_Q);
+    const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
+
+    for (int t = 0; t < nt; t++) {
+        device const uchar * ax0 = weights + (r0 + 0) * q4s;
+        device const uchar * ax1 = weights + (r0 + 1) * q4s;
+        device const uchar * ax2 = weights + (r0 + 2) * q4s;
+        device const uchar * ax3 = weights + (r0 + 3) * q4s;
+        device const float  * y  = acts + t * id;
+
+        float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
+        float yl[16];
+        device const float * yb = y + ix * QK + il;
+
+        for (int ib = ix; ib < nb; ib += NQ_Q) {
+            float sumy0 = 0.0f, sumy1 = 0.0f;
+            for (short i = 0; i < 8; i += 2) {
+                sumy0 += yb[i + 0] + yb[i + 1];
+                yl[i + 0] = yb[i + 0];
+                yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+                sumy1 += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+                yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+            }
+            float sy = sumy0 + sumy1;
+            if (r0 + 0 < od) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
+            if (r0 + 1 < od) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
+            if (r0 + 2 < od) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
+            if (r0 + 3 < od) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
+            yb += QK * NQ_Q;
+        }
+
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
+        if (tiisg == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
+            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        }
+    }
+}
+
 // ─── Q4_1 × f32 matrix multiplication (simdgroup-cooperative) ──
 // Same structure as Q4_0 but with (d, m, qs) block layout. Dequant: val = q * d + m.
 
@@ -246,6 +378,61 @@ kernel void kernel_q4_1_f32_matmul(
         if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
         if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
         if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+    }
+}
+
+// ─── Q4_1 × f32 prefill (multi-token) ───────────────────────
+
+kernel void kernel_q4_1_f32_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const float  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 4; const short NSG = 2;
+    const int nb = id / QK;
+    const int r0 = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+    const int q41s = nb * Q41B;
+    const short ix = (short)tiisg / (NW_Q / NQ_Q);
+    const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
+
+    for (int t = 0; t < nt; t++) {
+        device const uchar * ax0 = weights + (r0 + 0) * q41s;
+        device const uchar * ax1 = weights + (r0 + 1) * q41s;
+        device const uchar * ax2 = weights + (r0 + 2) * q41s;
+        device const uchar * ax3 = weights + (r0 + 3) * q41s;
+        device const float  * y  = acts + t * id;
+        float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
+        float yl[16]; device const float * yb = y + ix * QK + il;
+        for (int ib = ix; ib < nb; ib += NQ_Q) {
+            float sumy0 = 0.0f, sumy1 = 0.0f;
+            for (short i = 0; i < 8; i += 2) {
+                sumy0 += yb[i + 0] + yb[i + 1];
+                yl[i + 0] = yb[i + 0]; yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+                sumy1 += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+                yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+            }
+            float sy = sumy0 + sumy1;
+            if (r0 + 0 < od) sumf0 += block_q4_1_dot_y(ax0 + ib * Q41B, sy, yl, il);
+            if (r0 + 1 < od) sumf1 += block_q4_1_dot_y(ax1 + ib * Q41B, sy, yl, il);
+            if (r0 + 2 < od) sumf2 += block_q4_1_dot_y(ax2 + ib * Q41B, sy, yl, il);
+            if (r0 + 3 < od) sumf3 += block_q4_1_dot_y(ax3 + ib * Q41B, sy, yl, il);
+            yb += QK * NQ_Q;
+        }
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
+        if (tiisg == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
+            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        }
     }
 }
 
@@ -346,6 +533,71 @@ kernel void kernel_q4_k_f32_matmul(
     }
 }
 
+// ─── Q4_K × f32 prefill (multi-token) ───────────────────────
+
+kernel void kernel_q4_k_f32_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const float  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int QKK = 256; const int Q4KB = 144;
+    const short NR0 = 2; const short NSG = 2; const short NW = 32;
+    const int nbe = id / QKK;
+    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+    const int row_stride = nbe * Q4KB;
+
+    for (int t = 0; t < nt; t++) {
+        device const uchar * w0 = weights + (r0 + 0) * row_stride;
+        device const uchar * w1 = weights + (r0 + 1) * row_stride;
+        device const float  * y  = acts + t * id;
+        float sumf0 = 0.0f, sumf1 = 0.0f;
+        for (int ib = (int)tiisg; ib < nbe; ib += NW) {
+            device const uchar * blk0 = w0 + ib * Q4KB;
+            device const uchar * blk1 = w1 + ib * Q4KB;
+            float bd0 = float(*(device const half *)(blk0 + 0));
+            float bm0 = float(*(device const half *)(blk0 + 2));
+            float bd1 = float(*(device const half *)(blk1 + 0));
+            float bm1 = float(*(device const half *)(blk1 + 2));
+            device const uchar * sc0 = blk0 + 4; device const uchar * sc1 = blk1 + 4;
+            device const uchar * qs0 = blk0 + 16; device const uchar * qs1 = blk1 + 16;
+            device const float * yb = y + ib * QKK;
+            uchar sc0_s[8], sc0_m[8], sc1_s[8], sc1_m[8];
+            for (int j = 0; j < 8; j++) {
+                get_scale_min_k4(j, sc0, sc0_s[j], sc0_m[j]);
+                get_scale_min_k4(j, sc1, sc1_s[j], sc1_m[j]);
+            }
+            for (int s = 0; s < 8; s++) {
+                float dsc0 = bd0 * sc0_s[s]; float dmn0 = bm0 * sc0_m[s];
+                float dsc1 = bd1 * sc1_s[s]; float dmn1 = bm1 * sc1_m[s];
+                device const uchar * qb0 = qs0 + s * 16;
+                device const uchar * qb1 = qs1 + s * 16;
+                device const float  * ys = yb + s * 32;
+                float acc0 = 0.0f, acc1 = 0.0f, sumy = 0.0f;
+                for (int j = 0; j < 16; j++) {
+                    uchar b0 = qb0[j]; uchar b1 = qb1[j];
+                    float y_lo = ys[j]; float y_hi = ys[j + 16];
+                    acc0 += float(b0 & 0x0F) * y_lo + float(b0 >> 4) * y_hi;
+                    acc1 += float(b1 & 0x0F) * y_lo + float(b1 >> 4) * y_hi;
+                    sumy += y_lo + y_hi;
+                }
+                sumf0 += dsc0 * acc0 - dmn0 * sumy;
+                sumf1 += dsc1 * acc1 - dmn1 * sumy;
+            }
+        }
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        if (tiisg == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+        }
+    }
+}
+
 // ─── Q6_K × f32 matrix multiplication (simdgroup-cooperative) ──
 // Q6_K super-block: 256 elements = 16 sub-blocks × 16.
 // Block layout (210 bytes): uchar ql[128], uchar qh[64], char scales[16], half d.
@@ -432,6 +684,74 @@ kernel void kernel_q6_k_f32_matmul(
     }
 }
 
+// ─── Q6_K × f32 prefill (multi-token) ───────────────────────
+
+kernel void kernel_q6_k_f32_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const float  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int QKK = 256; const int Q6KB = 210;
+    const short NR0 = 2; const short NSG = 2; const short NW = 32;
+    const int nbe = id / QKK;
+    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+    const int row_stride = nbe * Q6KB;
+
+    for (int t = 0; t < nt; t++) {
+        device const uchar * w0 = weights + (r0 + 0) * row_stride;
+        device const uchar * w1 = weights + (r0 + 1) * row_stride;
+        device const float  * y  = acts + t * id;
+        float sumf0 = 0.0f, sumf1 = 0.0f;
+        for (int ib = (int)tiisg; ib < nbe; ib += NW) {
+            device const uchar * blk0 = w0 + ib * Q6KB;
+            device const uchar * blk1 = w1 + ib * Q6KB;
+            float bd0 = float(*(device const half *)(blk0 + 208));
+            float bd1 = float(*(device const half *)(blk1 + 208));
+            device const uchar * ql0 = blk0; device const uchar * ql1 = blk1;
+            device const uchar * qh0 = blk0 + 128; device const uchar * qh1 = blk1 + 128;
+            device const char  * sc0 = (device const char *)(blk0 + 192);
+            device const char  * sc1 = (device const char *)(blk1 + 192);
+            device const float * yb = y + ib * QKK;
+            for (int n = 0; n < 2; n++) {
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    device const float * ys = yb + n * 128 + l;
+                    int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
+                    int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
+                    int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
+                    int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
+                    int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
+                    int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
+                    int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
+                    int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
+                    int si = is + n * 8;
+                    sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
+                           + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
+                           + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
+                           + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
+                    sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
+                           + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
+                           + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
+                           + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
+                }
+                ql0 += 64; ql1 += 64;
+                qh0 += 32; qh1 += 32;
+            }
+        }
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        if (tiisg == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+        }
+    }
+}
+
 // ─── Q8_0 × f32 matrix multiplication (simdgroup-cooperative) ──
 // Direct translation of llama.cpp kernel_mul_mv_q8_0_f32_impl.
 // NR0=2 rows per simdgroup, NSG=4 simdgroups per threadgroup => 128 threads.
@@ -515,6 +835,62 @@ kernel void kernel_q8_0_f32_matmul(
     }
 }
 
+// ─── Q8_0 × f32 prefill (multi-token) ───────────────────────
+
+kernel void kernel_q8_0_f32_matmul_multi(
+    device const uchar  * weights  [[buffer(0)]],
+    device const float  * acts     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    constant    int     & od       [[buffer(3)]],
+    constant    int     & id       [[buffer(4)]],
+    constant    int     & nt       [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup float  * shmem     [[threadgroup(0)]]
+) {
+    const short NR0 = 2; const short NSG = 4; const short NW = 32; const short NQ = 8;
+    const int nb = id / QK;
+    const int r0 = (int)tgpig.x * NR0;
+    const int q8s = nb * Q8B;
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    threadgroup float * sh0 = shmem + 0 * NW;
+    threadgroup float * sh1 = shmem + 1 * NW;
+
+    device const uchar * ax0 = weights + (r0 + 0) * q8s;
+    device const uchar * ax1 = weights + (r0 + 1) * q8s;
+
+    for (int t = 0; t < nt; t++) {
+        device const float * y = acts + t * id;
+        sh0[tiisg] = 0.0f; sh1[tiisg] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sumf0 = 0.0f, sumf1 = 0.0f;
+        device const float * yb = y + ib0 * QK + il * NQ;
+        for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+            float yl[NQ];
+            for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+            device const char * qs0 = ((device const char *)((device const half *)(ax0 + ib * Q8B) + 1)) + il * NQ;
+            device const char * qs1 = ((device const char *)((device const half *)(ax1 + ib * Q8B) + 1)) + il * NQ;
+            float sumq0 = 0.0f, sumq1 = 0.0f;
+            for (short i = 0; i < NQ; ++i) { sumq0 += qs0[i] * yl[i]; sumq1 += qs1[i] * yl[i]; }
+            sumf0 += sumq0 * float(((device const half *)(ax0 + ib * Q8B))[0]);
+            sumf1 += sumq1 * float(((device const half *)(ax1 + ib * Q8B))[0]);
+            yb += NSG * NQ * QK;
+        }
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        if (tiisg == 0) { sh0[sgitg] = sumf0; sh1[sgitg] = sumf1; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot0 = simd_sum(sh0[tiisg]);
+        float tot1 = simd_sum(sh1[tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = tot0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = tot1;
+        }
+    }
+}
+
 // ─── Quantize f32 → Q8_0 (1 thread per 32-element block) ─────
 // Matches CPU scalar path: half delta + 32 signed int8 values.
 
@@ -550,6 +926,40 @@ kernel void kernel_quantize_q8_0(
     }
 }
 
+// ─── Get rows (embedding lookup, Q4_0 → f32) ────────────────
+// Reads rows from a quantized embedding table and dequantizes to f32.
+// weights: [n_vocab][nb * Q4B], ids: [nt], dst: [nt][ne].
+
+kernel void kernel_get_rows_q4_0(
+    device const uchar  * weights [[buffer(0)]],
+    device const int    * ids     [[buffer(1)]],
+    device       float  * dst     [[buffer(2)]],
+    constant    int     & ne      [[buffer(3)]],
+    constant    int     & nt      [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    int nb = ne / 32;
+    int total = nt * nb;
+    int idx = (int)tid;
+    if (idx >= total) return;
+
+    int t = idx / nb;
+    int b = idx % nb;
+    int token_id = ids[t];
+
+    int off = (token_id * nb + b) * Q4B;
+    device const half * hptr = (device const half *)(weights + off);
+    float d4 = float(hptr[0]);
+    device const uchar * qs = weights + off + 2;
+
+    int base = t * ne + b * 32;
+    for (int j = 0; j < 16; j++) {
+        uchar byte = qs[j];
+        dst[base + j]      = float(int(byte & 0x0F) - 8) * d4;
+        dst[base + j + 16] = float(int(byte >> 4) - 8) * d4;
+    }
+}
+
 // ─── RMSNorm (1 threadgroup per row, 32 threads) ─────────────
 // Parallel sum-of-squares via simd_sum (single simdgroup, no shared memory).
 // y[t][i] = x[t][i] * rsqrt(mean(x[t]²) + eps) * w[i]
@@ -573,6 +983,11 @@ kernel void kernel_rms_norm_f32(
     for (int i = tpitg.x; i < d4; i += 32) {
         ss += dot(x4[i], x4[i]);
     }
+    int rem = d - d4 * 4;
+    if (tpitg.x == 0) {
+        device const float * x_tail = x + row * d + d4 * 4;
+        for (int i = 0; i < rem; i++) ss += x_tail[i] * x_tail[i];
+    }
     ss = simd_sum(ss);
 
     float scale = 1.0f / sqrt(ss / (float)d + eps);
@@ -581,6 +996,12 @@ kernel void kernel_rms_norm_f32(
     device const float4 * w4 = (device const float4 *)w;
     for (int i = tpitg.x; i < d4; i += 32) {
         y4[i] = x4[i] * scale * w4[i];
+    }
+    if (tpitg.x == 0) {
+        device const float * x_tail = x + row * d + d4 * 4;
+        device       float * y_tail = y + row * d + d4 * 4;
+        device const float * w_tail = w + d4 * 4;
+        for (int i = 0; i < rem; i++) y_tail[i] = x_tail[i] * scale * w_tail[i];
     }
 }
 
@@ -666,6 +1087,7 @@ kernel void kernel_rope_f32(
     constant float & freq_base [[buffer(4)]],
     constant float & freq_scale [[buffer(5)]],
     constant int * positions [[buffer(6)]],
+    constant int & rope_style [[buffer(7)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     int t = tid.x;
@@ -677,17 +1099,19 @@ kernel void kernel_rope_f32(
         float freq = freq_scale / pow(freq_base, (2.0 * i) / n_dims);
         float theta = positions[t] * freq;
         float cs = cos(theta), sn = sin(theta);
-        int j = base + i;
-        int j2 = j + half_dim;
-        float x0 = x[j], x1 = x[j2];
-        x[j]  = x0 * cs - x1 * sn;
-        x[j2] = x0 * sn + x1 * cs;
+        int i0, i1;
+        if (rope_style == 1) {
+            i0 = base + 2 * i;
+            i1 = base + 2 * i + 1;
+        } else {
+            i0 = base + i;
+            i1 = base + i + half_dim;
+        }
+        float x0 = x[i0], x1 = x[i1];
+        x[i0] = x0 * cs - x1 * sn;
+        x[i1] = x0 * sn + x1 * cs;
     }
 }
-
-// ─── GQA Attention ───────────────────────────────────────────
-// Computes grouped-query attention for one or more tokens.
-// q/k/v/o layout: [nt][nh][hd] for q/o, [nkv][nk][hd] for k/v.
 
 // ─── KV cache store ──────────────────────────────────────────
 // Scatters nt new K/V rows into the persistent KV cache at positions[].
@@ -706,89 +1130,93 @@ kernel void kernel_store_kv_f32(
     dst[positions[t] * nkt + j] = src[t * nkt + j];
 }
 
-kernel void kernel_gqa_attn_f32(
-    device const float * q [[buffer(0)]],
-    device const float * k [[buffer(1)]],
-    device const float * v [[buffer(2)]],
-    device       float * o [[buffer(3)]],
-    constant    int    * positions [[buffer(4)]],
-    constant    int    & nh [[buffer(5)]],
-    constant    int    & nk [[buffer(6)]],
-    constant    int    & hd [[buffer(7)]],
-    constant    float  & scale [[buffer(8)]],
-    constant    int    & nt [[buffer(9)]],
-    uint2 tg_id [[threadgroup_position_in_grid]],
-    uint tiisg [[thread_index_in_simdgroup]]
-) {
-    int t = tg_id.x;
-    int h = tg_id.y;
-    if (t >= nt || h >= nh) return;
+// ─── Flash Attention (GQA, online softmax, tiled K/V) ─────
+// One threadgroup per (token, KV_head). Each simdgroup processes one
+// query head. K and V tiles loaded into threadgroup-shared memory
+// and reused by all query heads in the GQA group.
+// Grid: (nt, nk), TG: (32, gqa) where gqa = nh / nk.
 
-    int nkv = positions[t] + 1;
-    int gqa = nh / nk;
-    int hk = h / gqa;
-    int ne_q = nh * hd;
+kernel void kernel_gqa_attn_f32(
+    device const float * q        [[buffer(0)]],
+    device const float * k        [[buffer(1)]],
+    device const float * v        [[buffer(2)]],
+    device       float * o        [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    const int Bc = 32;
+    int t  = (int)tgpig.x;
+    int hk = (int)tgpig.y;
+    if (t >= nt || hk >= nk) return;
+
+    int nkv  = positions[t] + 1;
+    int gqa  = nh / nk;
+    int h    = hk * gqa + (int)sgitg;
+    if (h >= nh) return;
+
+    int stride_q  = nh * hd;
     int stride_kv = nk * hd;
 
-    device const float * qhead = q + t * ne_q + h * hd;
-    device       float * ohead = o + t * ne_q + h * hd;
+    device const float * qhead = q + t * stride_q + h * hd;
+    device       float * ohead = o + t * stride_q + h * hd;
 
-    int hd4 = hd / 4;
-    device const float4 * q4 = (device const float4 *)qhead;
-
-    const int NE = 2;
-    const int C = 32 * NE;
+    threadgroup float * k_tile = shmem;
+    threadgroup float * v_tile = shmem + Bc * hd;
 
     float mx = -INFINITY;
     float S = 0.0f;
-    float4 oc[32];
-    for (int i = 0; i < hd4; i++) oc[i] = (float4)0.0f;
+    float acc[256];
+    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
 
-    for (int batch = 0; batch < nkv; batch += C) {
-        float s0 = -INFINITY, s1 = -INFINITY;
-        int kv0 = batch + tiisg * NE;
-        int kv1 = kv0 + 1;
+    int n_tiles = (nkv + Bc - 1) / Bc;
+    for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        int kv_start = tile_idx * Bc;
+        int tile_sz  = min(Bc, nkv - kv_start);
 
-        if (kv0 < nkv) {
-            device const float4 * k4 = (device const float4 *)(k + kv0 * stride_kv + hk * hd);
-            float d = 0.0f;
-            for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
-            s0 = d * scale;
+        int total = tile_sz * hd;
+        int tgsz = 32 * gqa;
+        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
+            int ki = kv_start + i / hd;
+            int di = i % hd;
+            k_tile[i] = k[ki * stride_kv + hk * hd + di];
+            v_tile[i] = v[ki * stride_kv + hk * hd + di];
         }
-        if (kv1 < nkv) {
-            device const float4 * k4 = (device const float4 *)(k + kv1 * stride_kv + hk * hd);
-            float d = 0.0f;
-            for (int i = 0; i < hd4; i++) d += dot(q4[i], k4[i]);
-            s1 = d * scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j = tiisg; j < tile_sz; j += 32) {
+            threadgroup float * kj = k_tile + j * hd;
+            float dot = 0.0f;
+            for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+            dot *= scale;
+
+            float batch_mx = simd_max(dot);
+            float new_mx = max(mx, batch_mx);
+            float corr = exp(mx - new_mx);
+            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            S *= corr;
+            float e = exp(dot - new_mx);
+            threadgroup float * vj = v_tile + j * hd;
+            for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+            S += e;
+            mx = new_mx;
         }
 
-        float batch_mx = simd_max(max(s0, s1));
-        float new_mx = max(mx, batch_mx);
-        float corr = exp(mx - new_mx);
-        float e0 = exp(s0 - new_mx);
-        float e1 = exp(s1 - new_mx);
-
-        for (int i = 0; i < hd4; i++) oc[i] *= corr;
-        S *= corr;
-
-        if (kv0 < nkv) {
-            device const float4 * v4 = (device const float4 *)(v + kv0 * stride_kv + hk * hd);
-            for (int i = 0; i < hd4; i++) oc[i] += e0 * v4[i];
-        }
-        if (kv1 < nkv) {
-            device const float4 * v4 = (device const float4 *)(v + kv1 * stride_kv + hk * hd);
-            for (int i = 0; i < hd4; i++) oc[i] += e1 * v4[i];
-        }
-        S += e0;
-        S += e1;
-
-        mx = new_mx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     S = simd_sum(S);
-    for (int i = 0; i < hd4; i++) oc[i] = simd_sum(oc[i]);
+    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
 
     float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
-    device float4 * o4 = (device float4 *)ohead;
-    for (int i = 0; i < hd4; i++) o4[i] = oc[i] * inv;
+    for (int d = tiisg; d < hd; d += 32) {
+        ohead[d] = acc[d] * inv;
+    }
 }

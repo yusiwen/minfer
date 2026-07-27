@@ -2,6 +2,7 @@
 
 use crate::gguf::GgufContext;
 use crate::tensor::{Tensor, TensorType};
+use crate::vec_ops::RopeStyle;
 
 use super::tensor_names as tn;
 
@@ -20,11 +21,16 @@ pub struct HParams {
     pub rope_freq_scale: f32,
     pub eos_token_id: u32,
     pub im_end_token_id: Option<u32>,
+    pub rope_style: RopeStyle,
 }
 
 impl HParams {
     pub fn n_embd_head(&self) -> i64 {
         self.n_embd / self.n_head
+    }
+
+    pub fn attention_scale(&self) -> f32 {
+        1.0 / (self.n_embd_head() as f32).sqrt()
     }
 }
 
@@ -131,6 +137,7 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
             .unwrap_or(1.0),
         eos_token_id: eos,
         im_end_token_id: im_end,
+        rope_style: RopeStyle::NonInterleaved,
     })
 }
 
@@ -156,8 +163,9 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     let mut shape = [1i64; 4];
     for j in 0..4 { shape[j] = ti.ne[j]; }
     let off = ctx.offset + ti.offset as usize;
-    let ts = ttype.type_size();
-    let bs = ttype.blck_size() as usize;
+    // Use GGML type for byte-size calculation — always correct regardless of TensorType mapping
+    let ts = ti.type_.type_size();
+    let bs = ti.type_.blck_size() as usize;
     let n = (shape[0] * shape[1] * shape[2] * shape[3]) as usize;
     let nbytes = (n / bs) * ts;
     let src = &raw[off..off + nbytes];
