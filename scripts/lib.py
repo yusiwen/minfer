@@ -108,7 +108,9 @@ def add_field_to_writer(writer, name, value, ftype):
 # ─── GGUF truncation ─────────────────────────────────────────
 
 def create_truncated_model(src_path, dest_path, target_layers, arch_str):
-    """Create a zero-copy truncated GGUF with target_layers."""
+    """Create a zero-copy truncated GGUF with target_layers using GGUFWriter."""
+    import numpy as _np
+    from gguf import GGMLQuantizationType
     reader = GGUFReader(src_path)
     writer = GGUFWriter(dest_path, arch=arch_str)
     writer.add_architecture()
@@ -140,9 +142,21 @@ def create_truncated_model(src_path, dest_path, target_layers, arch_str):
                 except ValueError:
                     pass
         if not skip:
-            writer.add_tensor_info(
-                tensor.name, tensor.shape, tensor.tensor_type, tensor.data_offset
-            )
+            # Map GGUF tensor type to numpy dtype + raw_dtype for quantized types
+            tt = tensor.tensor_type
+            raw = GGMLQuantizationType(tt) if tt > 1 else None
+            if raw is not None:
+                # Quantized: pass raw_dtype, use F32 as placeholder np.dtype
+                writer.add_tensor_info(
+                    tensor.name, tensor.shape, _np.float32,
+                    tensor.n_bytes, raw_dtype=raw,
+                )
+            else:
+                # F32/F16: standard path
+                writer.add_tensor_info(
+                    tensor.name, tensor.shape, _np.float32,
+                    tensor.n_bytes,
+                )
             written += 1
 
     writer.write_header_to_file()

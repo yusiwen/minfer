@@ -201,6 +201,8 @@ fn main() {
     } else {
         prompt.clone()
     };
+    #[cfg(feature = "debug_dump")]
+    crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
     let input_ids = tokenizer.encode(&processed);
     if input_ids.is_empty() { eprintln!("tokenize failed"); std::process::exit(1); }
     println!("Prompt: {} tokens", input_ids.len());
