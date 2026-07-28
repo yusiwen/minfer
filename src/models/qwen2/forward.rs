@@ -34,7 +34,7 @@ pub fn forward(
     embed_tokens(token_ids, model.tok_embd.as_ref().unwrap(), &mut hidden, ne);
 
     #[cfg(feature = "debug_dump")]
-    crate::dump::maybe_dump("minfer_dump_embed_out", &hidden);
+    if nt > 1 { crate::dump::maybe_dump("minfer_dump_embed_out", &hidden); }
 
     let mut run_cpu = true;
 
@@ -213,8 +213,8 @@ pub fn forward(
                     std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
                     &bn);
             }
-            #[cfg(feature = "debug_dump")]
-            crate::dump::maybe_dump(&format!("minfer_dump_layer{}_attn_out", il), &hidden);
+        #[cfg(feature = "debug_dump")]
+        if nt > 1 { crate::dump::maybe_dump(&format!("minfer_dump_layer{}_attn_out", il), &hidden); }
             rms_norm(&hidden, eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
             let ffn_in = bf[..nt * ne].to_vec();
             crate::kernel::quant_matmul_f32_batch(&mut [
@@ -238,13 +238,13 @@ pub fn forward(
                     std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
                     &bn);
             }
-            #[cfg(feature = "debug_dump")]
-            crate::dump::maybe_dump(&format!("minfer_dump_layer{}_out", il), &hidden);
+        #[cfg(feature = "debug_dump")]
+        if nt > 1 { crate::dump::maybe_dump(&format!("minfer_dump_layer{}_out", il), &hidden); }
         }
     }
     rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
     #[cfg(feature = "debug_dump")]
-    crate::dump::maybe_dump("minfer_dump_last_norm", &bn);
+    if nt > 1 { crate::dump::maybe_dump("minfer_dump_last_norm", &bn); }
     if let Some(output) = &model.output {
         let mut logits = vec![0.0f32; nt * nv];
         crate::kernel::quant_matmul_f32(output, &bn, &mut logits, nv, ne, nt);
@@ -253,7 +253,7 @@ pub fn forward(
             for t in 0..nt { let base = t * nv; for i in 0..nv.min(b.len()) { logits[base + i] += b[i]; } }
         }
         #[cfg(feature = "debug_dump")]
-        crate::dump::maybe_dump("minfer_dump_logits", &logits);
+        if nt > 1 { crate::dump::maybe_dump("minfer_dump_logits", &logits); }
         return logits;
     }
     vec![]
