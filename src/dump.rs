@@ -8,14 +8,21 @@
 // Output files (per layer):
 //   {MINFER_DUMP_DIR}/minfer_dump_layer{N}_out.f32  — hidden state after layer N
 //   {MINFER_DUMP_DIR}/minfer_dump_logits.f32        — final logits
+//   {MINFER_DUMP_DIR}/minfer_dump_prompt.txt         — rendered prompt text
 
 #[cfg(feature = "debug_dump")]
 static DUMP_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 #[cfg(feature = "debug_dump")]
+fn dump_dir() -> Option<&'static String> {
+    DUMP_DIR
+        .get_or_init(|| std::env::var("MINFER_DUMP_DIR").ok())
+        .as_ref()
+}
+
+#[cfg(feature = "debug_dump")]
 pub fn maybe_dump(name: &str, data: &[f32]) {
-    let dir = DUMP_DIR.get_or_init(|| std::env::var("MINFER_DUMP_DIR").ok());
-    if let Some(root) = dir {
+    if let Some(root) = dump_dir() {
         let path = format!("{}/{}.f32", root, name);
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
@@ -24,6 +31,18 @@ pub fn maybe_dump(name: &str, data: &[f32]) {
     }
 }
 
+#[cfg(feature = "debug_dump")]
+pub fn maybe_dump_text(name: &str, text: &str) {
+    if let Some(root) = dump_dir() {
+        let path = format!("{}/{}.txt", root, name);
+        std::fs::write(&path, text).ok();
+    }
+}
+
 #[cfg(not(feature = "debug_dump"))]
 #[inline(always)]
 pub fn maybe_dump(_name: &str, _data: &[f32]) {}
+
+#[cfg(not(feature = "debug_dump"))]
+#[inline(always)]
+pub fn maybe_dump_text(_name: &str, _text: &str) {}

@@ -1,39 +1,33 @@
-"""Generate llama.cpp per-layer reference hidden states for minfer comparison.
-
-Uses the "truncated model" approach: for each layer N, creates a fake GGUF
-with block_count=N (zero-copy, metadata only), loads it in llama-cpp-python,
-prefills the prompt, and extracts hidden states via llama_get_embeddings().
+"""Generate llama.cpp reference (full model, single pass) for minfer comparison.
 
 Usage:
     uv run python -m scripts.dump_llama_ref --model <gguf> --prompt "Hello"
-    uv run python -m scripts.dump_llama_ref --model <gguf> --prompt "Hello" --output ./ref
+    uv run python -m scripts.dump_llama_ref --model <gguf> --prompt "Hello" --chat
 
-Output (per layer):
-    {output_dir}/layer{N}_hidden_states.npy   last-token hidden state
-    {output_dir}/logits_prefill.npy           final logits (full model only)
-    {output_dir}/token_ids.npy                input token IDs
+Output:
+    {output_dir}/full_hidden_states.npy     last-token hidden state (after all layers)
+    {output_dir}/logits_prefill.npy         final logits
+    {output_dir}/token_ids.npy              input token IDs
+    {output_dir}/prompt.txt                 rendered prompt text
 """
 
 import argparse
 import os
-import shutil
+import struct
 import sys
-import tempfile
 import time
 import numpy as np
 from gguf import GGUFReader
 from llama_cpp import Llama, llama_cpp
 
-from .lib import create_truncated_model
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Dump llama.cpp per-layer reference data")
+    parser = argparse.ArgumentParser(description="Dump llama.cpp reference data (full model)")
     parser.add_argument("--model", required=True, help="Path to GGUF model file")
-    parser.add_argument("--prompt", default="Hello", help="Prompt text (bare, no chat template)")
+    parser.add_argument("--prompt", default="Hello", help="Prompt text")
+    parser.add_argument("--chat", action="store_true",
+                        help="Wrap with chat_template (matches minfer)")
     parser.add_argument("--output", default="./llama_ref", help="Output directory")
-    parser.add_argument("--layers", type=int, default=0,
-                        help="Number of layers (0 = auto-detect from GGUF)")
     parser.add_argument("--no-bos", action="store_true", help="Don't add BOS token")
     args = parser.parse_args()
 
@@ -44,36 +38,22 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # ── Phase 1: Read model metadata ─────────────────────────
-    print("=== Phase 1: Reading model metadata ===")
+    # ── Phase 1: Read metadata ───────────────────────────────
+    print("=== Phase 1: Model metadata ===")
     reader = GGUFReader(model_path)
-
     arch = "qwen2"
     if "general.architecture" in reader.fields:
-        raw = reader.fields["general.architecture"].parts[-1]
-        arch = raw.tobytes().decode("utf-8", errors="ignore").strip("\x00").strip()
-    print(f"  Architecture: {arch}")
+        raw_bytes = reader.fields["general.architecture"].parts[-1].tobytes()
+        arch = raw_bytes.decode("utf-8", errors="ignore").strip("\x00").strip()
 
-    # Detect total layers
-    total_layers = args.layers
-    if total_layers == 0:
-        for name in ("block_count", f"{arch}.block_count"):
-            if name in reader.fields:
-                total_layers = int(reader.fields[name].parts[-1].tobytes().decode())
-                break
-    if total_layers == 0:
-        # Fallback: count blk.N.* tensors
-        layers = set()
-        for t in reader.tensors:
-            if "blk." in t.name:
-                try:
-                    layers.add(int(t.name.split(".")[1]))
-                except (ValueError, IndexError):
-                    pass
-        total_layers = max(layers) + 1 if layers else 24
-    print(f"  Total layers: {total_layers}")
+    total_layers = 0
+    for name in ("block_count", f"{arch}.block_count"):
+        if name in reader.fields:
+            raw = reader.fields[name].parts[-1].tobytes()
+            total_layers = struct.unpack("<I", raw)[0]
+            break
+    print(f"  Architecture: {arch}, Layers: {total_layers}")
 
-    # Detect hidden_dim from token_embd
     hidden_dim = 896
     for t in reader.tensors:
         if "token_embd" in t.name:
@@ -81,78 +61,97 @@ def main():
             break
     print(f"  Hidden dim: {hidden_dim}")
 
-    # ── Phase 2: Tokenize prompt ────────────────────────────
-    print(f"\n=== Phase 2: Tokenizing prompt: {args.prompt!r} ===")
+    # ── Phase 1b: Chat template ──────────────────────────────
+    actual_prompt = args.prompt
+    if args.chat:
+        tmpl_raw = None
+        for f in reader.fields.values():
+            if f.name == "tokenizer.chat_template":
+                tmpl_raw = f.parts[-1].tobytes().decode("utf-8", errors="replace").strip("\x00")
+                break
+        if tmpl_raw:
+            from jinja2 import Environment
+            env = Environment()
+            env.add_extension("jinja2.ext.do")
+            tmpl = env.from_string(tmpl_raw)
+            messages = [{"role": "user", "content": args.prompt}]
+            actual_prompt = tmpl.render(messages=messages, add_generation_prompt=True).strip()
+            print(f"  Chat template: {len(actual_prompt)} chars")
+        else:
+            print("  [WARN] --chat set but no template found")
+
+    with open(os.path.join(args.output, "prompt.txt"), "w") as f:
+        f.write(actual_prompt)
+
+    # ── Phase 2: Tokenize + infer ────────────────────────────
+    print(f"\n=== Phase 2: Inference ===")
     full_llm = Llama(
         model_path=model_path, n_ctx=512, n_gpu_layers=0,
         embedding=True, verbose=False,
     )
+    # minfer's render_template always prepends BOS text. Match that.
+    add_bos = not args.no_bos and (not args.chat)
+    if args.chat:
+        # Read BOS token text from GGUF
+        bos_token_id = 151643
+        for f in reader.fields.values():
+            if f.name == "tokenizer.ggml.bos_token_id":
+                bos_token_id = struct.unpack("<I", f.parts[-1].tobytes())[0]
+                break
+        # Get BOS token text by tokenizing a placeholder then decoding
+        bos_text_piece = full_llm.detokenize([bos_token_id])
+        bos_text = bos_text_piece.decode("utf-8", errors="replace") if isinstance(bos_text_piece, bytes) else bos_text_piece
+        if bos_text and bos_text != "[PAD151643]":
+            actual_prompt = bos_text + actual_prompt
+            # Update prompt.txt
+            with open(os.path.join(args.output, "prompt.txt"), "w") as f:
+                f.write(actual_prompt)
     token_ids = full_llm.tokenize(
-        args.prompt.encode("utf-8"), add_bos=not args.no_bos, special=True,
+        actual_prompt.encode("utf-8"), add_bos=add_bos, special=True,
     )
     input_length = len(token_ids)
-    print(f"  Token IDs: {token_ids}")
-    print(f"  Input length: {input_length}")
+    print(f"  Prompt: {actual_prompt[:80]}...")
+    print(f"  Tokens: {input_length}")
+
+    t0 = time.time()
+    full_llm.eval(token_ids)
+    t1 = time.time()
+    print(f"  Prefill: {t1-t0:.2f}s")
+
+    # ── Phase 3: Extract hidden state ────────────────────────
+    print(f"\n=== Phase 3: Extract ===")
+    emb_ptr = llama_cpp.llama_get_embeddings(full_llm._ctx.ctx)
+    if not emb_ptr:
+        print("ERROR: llama_get_embeddings returned NULL")
+        full_llm.close()
+        sys.exit(1)
+
+    total_elems = input_length * hidden_dim
+    hidden = np.array(emb_ptr[:total_elems], dtype=np.float32).reshape(input_length, hidden_dim)
+    last_hidden = hidden[-1, :]
+
+    out_path = os.path.join(args.output, "full_hidden_states.npy")
+    np.save(out_path, last_hidden)
+    rms = float(np.sqrt(np.mean(last_hidden**2)))
+    print(f"  Hidden state: RMS={rms:.4f}")
+
+    # ── Phase 4: Extract logits ──────────────────────────────
+    logits_ptr = full_llm._ctx.get_logits()
+    logits = np.array(logits_ptr[:full_llm.n_vocab()], dtype=np.float32)
+    logits_path = os.path.join(args.output, "logits_prefill.npy")
+    np.save(logits_path, logits)
+    top = int(np.argmax(logits))
+    print(f"  Logits: top token={top}")
+
+    # Save token IDs
     np.save(os.path.join(args.output, "token_ids.npy"), np.array(token_ids, dtype=np.int64))
+
     full_llm.close()
-    del full_llm
-
-    # ── Phase 3: Per-layer dump ──────────────────────────────
-    print(f"\n=== Phase 3: Dumping layers 1..{total_layers} ===")
-    temp_dir = tempfile.mkdtemp(prefix="minfer_dump_")
-
-    for layer_target in range(1, total_layers + 1):
-        t0 = time.time()
-        fake_path = os.path.join(temp_dir, f"truncated_{layer_target}.gguf")
-
-        n_tensors = create_truncated_model(model_path, fake_path, layer_target, arch)
-        t1 = time.time()
-
-        llm = Llama(
-            model_path=fake_path, n_ctx=512, n_gpu_layers=0,
-            embedding=True, verbose=False,
-        )
-        t2 = time.time()
-
-        llm.eval(token_ids)
-        t3 = time.time()
-
-        emb_ptr = llama_cpp.llama_get_embeddings(llm._ctx.ctx)
-        if not emb_ptr:
-            print(f"  ❌ Layer {layer_target}: llama_get_embeddings returned NULL")
-            llm.close()
-            os.remove(fake_path)
-            continue
-
-        total_elems = input_length * hidden_dim
-        hidden = np.array(
-            emb_ptr[:total_elems], dtype=np.float32
-        ).reshape(input_length, hidden_dim)
-
-        last_hidden = hidden[-1, :]
-        out_path = os.path.join(args.output, f"layer{layer_target}_hidden_states.npy")
-        np.save(out_path, last_hidden)
-
-        # Save full-model logits
-        if layer_target == total_layers:
-            logits_ptr = llm._ctx.get_logits()
-            logits = np.array(logits_ptr[:llm.n_vocab()], dtype=np.float32)
-            np.save(os.path.join(args.output, "logits_prefill.npy"), logits)
-
-        llm.close()
-        os.remove(fake_path)
-
-        t4 = time.time()
-        h_rms = float(np.sqrt(np.mean(last_hidden**2)))
-        print(f"  Layer {layer_target:2d}/{total_layers} | "
-              f"total={t4-t0:.1f}s | RMS={h_rms:.4f}")
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
 
     print(f"\n=== Done ===")
     print(f"  Output: {os.path.abspath(args.output)}")
-    files = sorted(os.listdir(args.output))
-    print(f"  Files ({len(files)}): {', '.join(files[:5])}{'...' if len(files) > 5 else ''}")
+    for f in sorted(os.listdir(args.output)):
+        print(f"    {f}")
 
 
 if __name__ == "__main__":
