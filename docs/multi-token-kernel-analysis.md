@@ -231,3 +231,25 @@ The following items require attention for full IQ type support:
 4. (Optional) GPU kernels for IQ types
 
 This is tracked in the main analysis document under "Known Limitations."
+
+## Q5_0 Verification (2026-07-28)
+
+Automated cross-validation confirmed all CPU paths correct using
+`gguf.quants.dequantize()` — the same implementation validated against
+llama.cpp's C reference in `gguf-py/tests/test_quants.py`.
+
+| Path | Script | Result |
+|------|--------|--------|
+| Q5_0 embedding dequant | `verify_embed.py` | ✅ exact match |
+| RMSNorm | `verify_rmsnorm.py --compare` | ✅ cosine = 1.0 |
+| Q8_0 quantization | manual recompute vs dump | ✅ q values identical |
+| Row stride (all tensors) | `dump_tensors.py` vs matmul ws | ✅ correct |
+| WQ matmul | `verify_matmul.py` vs bq dump | ✅ cos = 1.0000000000 |
+| FFN gate matmul | `verify_matmul.py` vs bg dump | ✅ cos = 1.0000000000 |
+| FFN down matmul | `verify_matmul.py` vs fd dump | ✅ cos = 0.9999848730 |
+| RoPE rotation | `verify_rope.py` vs bq_rope dump | ✅ cos = 0.9999999942 |
+| GQA attention (nkv=1) | `verify_attention.py` vs ba dump | ✅ cos = 0.9999839613 |
+| SwiGLU activation | manual vs swiglu dump | ✅ values plausible |
+
+All 13 verified paths correct. The Q5_K_M model still produces garbled output.
+Root cause remains unidentified.

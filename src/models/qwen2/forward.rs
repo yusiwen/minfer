@@ -33,8 +33,7 @@ pub fn forward(
 
     embed_tokens(token_ids, model.tok_embd.as_ref().unwrap(), &mut hidden, ne);
 
-    #[cfg(feature = "debug_dump")]
-    if nt > 1 { crate::dump::maybe_dump("minfer_dump_embed_out", &hidden); }
+    crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_embed_out", &hidden, nt);
 
     let mut run_cpu = true;
 
@@ -192,6 +191,7 @@ pub fn forward(
         for il in 0..model.n_layer() {
             let l = &model.layers[il];
             rms_norm(&hidden, eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bn", &bn, nt, il == 0);
             crate::kernel::quant_matmul_f32_batch(&mut [
                 (l.wq.as_ref().unwrap(), &mut bq, nqt),
                 (l.wk.as_ref().unwrap(), &mut bk, nkt),
@@ -200,12 +200,15 @@ pub fn forward(
             if let Some(b) = &l.bq { add_bias(&mut bq, b.data_f32(), nt, nqt); }
             if let Some(b) = &l.bk { add_bias(&mut bk, b.data_f32(), nt, nkt); }
             if let Some(b) = &l.bv { add_bias(&mut bv, b.data_f32(), nt, nkt); }
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bq", &bq, nt, il == 0);
             apply_rope(&mut bq, positions, nh, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bq_rope", &bq, nt, il == 0);
             apply_rope(&mut bk, positions, nk, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
             kv_cache.layers[il].store_multi(positions, &bk, &bv);
             let nkv = kv_cache.layers[il].size;
             gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
                 positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv], hp.attention_scale());
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_ba", &ba, nt, il == 0);
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
             unsafe {
                 crate::vec_ops::vec_add_f32(hidden.len(),
@@ -213,14 +216,14 @@ pub fn forward(
                     std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
                     &bn);
             }
-        #[cfg(feature = "debug_dump")]
-        if nt > 1 { crate::dump::maybe_dump(&format!("minfer_dump_layer{}_attn_out", il), &hidden); }
+        crate::dump::maybe_dump_prefill_or_gen0(&format!("minfer_dump_layer{}_attn_out", il), &hidden, nt);
             rms_norm(&hidden, eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
             let ffn_in = bf[..nt * ne].to_vec();
             crate::kernel::quant_matmul_f32_batch(&mut [
                 (l.ffn_gate.as_ref().unwrap(), &mut bg, nf),
                 (l.ffn_up.as_ref().unwrap(),   &mut bf, nf),
             ], &ffn_in, ne, nt);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bg", &bg, nt, il == 0);
             let len = nt * nf;
             unsafe {
                 crate::vec_ops::vec_silu_f32(len,
@@ -231,20 +234,20 @@ pub fn forward(
                     std::slice::from_raw_parts(bg.as_ptr(), len),
                     &bf);
             }
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_swiglu", &bg, nt, il == 0);
             crate::kernel::quant_matmul_f32(l.ffn_down.as_ref().unwrap(), &bg[..nt * nf], &mut bn, ne, nf, nt);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_fd", &bn, nt, il == 0);
             unsafe {
                 crate::vec_ops::vec_add_f32(hidden.len(),
                     std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),
                     std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
                     &bn);
             }
-        #[cfg(feature = "debug_dump")]
-        if nt > 1 { crate::dump::maybe_dump(&format!("minfer_dump_layer{}_out", il), &hidden); }
+        crate::dump::maybe_dump_prefill_or_gen0(&format!("minfer_dump_layer{}_out", il), &hidden, nt);
         }
     }
     rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
-    #[cfg(feature = "debug_dump")]
-    if nt > 1 { crate::dump::maybe_dump("minfer_dump_last_norm", &bn); }
+    crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_last_norm", &bn, nt);
     if let Some(output) = &model.output {
         let mut logits = vec![0.0f32; nt * nv];
         crate::kernel::quant_matmul_f32(output, &bn, &mut logits, nv, ne, nt);
@@ -252,8 +255,7 @@ pub fn forward(
             let b = ob.data_f32();
             for t in 0..nt { let base = t * nv; for i in 0..nv.min(b.len()) { logits[base + i] += b[i]; } }
         }
-        #[cfg(feature = "debug_dump")]
-        if nt > 1 { crate::dump::maybe_dump("minfer_dump_logits", &logits); }
+        crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_logits", &logits, nt);
         return logits;
     }
     vec![]

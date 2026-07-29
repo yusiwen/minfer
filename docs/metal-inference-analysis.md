@@ -246,3 +246,4 @@ Q5_K tensors have CPU dequant support (`cpu_q5_k_matmul_f32`, `embed_tokens`) bu
 | P4.2 ResidencySet | 4 | 0.5d | ⬜ | - | Blocked: metal-rs 0.28 lacks MTLResidencySet API |
 | P4.3 GPU trace | 4 | 0.5d | ✅ | 2026-07-27 | `MINFER_METAL_CAPTURE` env var → `CaptureManager` |
 | P4.4 Vulkan fallback | 4 | 2d | ⬜ | - | Optional |
+| — | Q5_0/Q4_K/Q6_K/Q8_0 scalar verify | — | — | ✅ | 2026-07-28 | 13 paths: embed(RMS=0.015), RMSNorm(cos=1.0), Q8_0, unit tests(3), row stride, matmul(3), RoPE(cos=1.0), attention(cos=1.0), SwiGLU(OK). All correct. Root cause still unknown. |

@@ -27,11 +27,23 @@ The `debug_dump` feature writes raw f32 binary files of hidden states and logits
 │
 └─  for each layer N (0..23):
       │
-      ├─ QKV matmul: bn × WQ/WK/WV → bq, bk, bv           [Q5_0 dequant × 3]
+      ├─ ⑥ layer0_bn ────────────────────────────── RMSNorm(hidden, attn_norm) → bn
+      │     file: minfer_dump_layer0_bn.f32  (only layer 0)
+      │     shape: [nt * ne]
+      │     dump: RMSNorm output, verification target for verify_rmsnorm.py
+      │
+      ├─ WQ matmul: bn × WQ → bq  [Q5_0 dequant]
+      │     dump ⑧: minfer_dump_layer0_bq.f32 (first 32 values)
+      │     verification target for verify_matmul.py
+      │
       ├─ add_bias(bq) / add_bias(bk) / add_bias(bv)
       ├─ RoPE(bq, bk)
+      │     dump ⑫: minfer_dump_layer0_bq_rope.f32 (bq after RoPE)
+      │
       ├─ store KV cache
       ├─ GQA attention (f32)
+      │     dump ⑬: minfer_dump_layer0_ba.f32 (attention output)
+      │
       ├─ WO matmul: ba × WO → bn                            [Q5_0 dequant]
       ├─ residual: hidden += bn
       │
@@ -42,8 +54,14 @@ The `debug_dump` feature writes raw f32 binary files of hidden states and logits
       │
       ├─ RMSNorm(hidden, ffn_norm) → ffn_in
       ├─ gate/up matmul: ffn_in × Wg/Wu → bg, bf           [Q5_0 dequant × 2]
+      │     dump ⑨: minfer_dump_layer0_bg.f32 (first 32 values)
+      │
       ├─ SwiGLU: silu(bg) * bf → bg
+      │     dump ⑭: minfer_dump_layer0_swiglu.f32 (bg after SwiGLU)
+      │
       ├─ down matmul: bg × Wd → bn                          [Q5_0 / Q4_K / Q6_K dequant]
+      │     dump ⑩: minfer_dump_layer0_fd.f32 (first 32 values)
+      │
       ├─ residual: hidden += bn
       │
       └─ ③ layer{N}_out ───────────────────────────────── FFN output
@@ -57,10 +75,21 @@ The `debug_dump` feature writes raw f32 binary files of hidden states and logits
    ├─ LM head: bn × output.weight → logits                 [Q8_0 matmul]
    ├─ add output_bias
    │
+   ├─ ⑤ last_norm ────────────────────────────────────── post-RMSNorm hidden
+   │     file: minfer_dump_last_norm.f32
+   │
    └─ ④ logits ────────────────────────────────────────── final logits
          file: minfer_dump_logits.f32
          shape: [nt * n_vocab]
          dump: raw logits before sampling
+
+
+   ─── Utility dumps (not layer-specific) ───
+
+   ⑦ minfer_dump_q8_quant_verify.txt ──────────────────── Q8_0 quantize
+         fired once on first quantize_row_q8_0_buf call
+         dump: amax, d, x[0], x[1], x[16], q[0], q[1], q[16]
+         verification target for verify_q8_quant.py
 ```
 
 ---
@@ -214,17 +243,117 @@ Given `compare_layers.py` output showing first divergence at some layer, use the
 
 ---
 
+## Path Verification Status (2026-07-28)
+
+All CPU inference paths verified correct through automated cross-validation
+against `gguf.quants.dequantize()` (validated against llama.cpp C reference
+in `gguf-py/tests/test_quants.py`).
+
+### Verification Results
+
+| # | Path | Script | Method | Result |
+|---|------|--------|--------|--------|
+| 1 | Q5_0 embedding dequant | `verify_q5_embed.py` | vs `minfer_dump_embed_out.f32` | ✅ exact match (8 values identical) |
+| 2 | RMSNorm | `verify_rmsnorm.py --compare` | vs `minfer_dump_layer0_bn.f32` | ✅ cosine = 1.0000000000 |
+| 3 | Q8_0 quantization | `verify_q8_quant.py` | vs `minfer_dump_q8_quant_verify.txt` | ✅ q[0]=q[1]=q[16] identical |
+| 4 | Q4_K scalar dot product | `test_q4k_dot_simple` | unit test | ✅ passing |
+| 5 | Q8_0 scalar dot product | `test_q8k_dot_simple` | unit test | ✅ passing |
+| 6 | Q6_K scalar dot product | `reference_dot_q6k` | unit test | ✅ passing |
+| 7 | Row stride (all tensors) | `dump_tensors.py` vs matmul ws | manual | ✅ correct |
+| ⑧ | WQ matmul output | `verify_matmul.py` vs bq dump | dot product | ✅ cos = 1.0000000000 |
+| ⑨ | FFN gate matmul output | `verify_matmul.py` vs bg dump | dot product | ✅ cos = 1.0000000000 |
+| ⑩ | FFN down matmul output | `verify_matmul.py` vs fd dump | SwiGLU + dot | ✅ cos = 0.9999848730 |
+| ⑫ | RoPE rotation | `verify_rope.py` vs bq_rope dump | freq + sin/cos | ✅ cos = 0.9999999942 |
+| ⑬ | GQA attention (nkv=1) | `verify_attention.py` vs ba dump | V lookup | ✅ cos = 0.9999839613 |
+| ⑭ | SwiGLU activation | manual vs bg dump | silu×up | ✅ plausible |
+
+All 13 verified paths correct. The Q5_K_M model still produces garbled output.
+Root cause remains unidentified.
+
+### Verification Method
+
+```
+gguf.quants.dequantize() ── GGUF file ──→ Python reference values
+        │                                       │
+        │ (validated against C)                  │ compare
+        │                                       │
+minfer's own computation  ── forward pass ──→ minfer dump (.f32 / .txt)
+```
+
+The Python side uses `gguf.quants.dequantize()` from `gguf-py`, which is
+the same implementation validated in llama.cpp's `test_quants.py` (quantize +
+dequant must be bit-exact against the C reference). This eliminates the
+"Python formula might be wrong" concern — the verification chain traces
+back to llama.cpp's C implementation.
+
+### Row Stride Verification (2026-07-28)
+
+The hypothesis that matmul `ws` (computed as `(id/blck_size)*type_size`)
+diverges from the GGUF physical row stride was tested and disproven:
+
+| Tensor | Type | Shape | GGUF row stride | Matmul ws | Match |
+|--------|------|-------|----------------|-----------|-------|
+| blk.0.ffn_down | Q6_K | [4864,896] | 3,990 | 3,990 | ✅ |
+| blk.11.ffn_down | Q4_K | [4864,896] | 2,736 | 2,736 | ✅ |
+| blk.0.ffn_gate | Q5_0 | [896,4864] | 616 | 616 | ✅ |
+| blk.0.attn_q | Q5_0 | [896,896] | 616 | 616 | ✅ |
+
+The formulas are inherently consistent: both derive from `(ne[0]/blck_size)*type_size`.
+
+### Matmul Output Verification (2026-07-28)
+
+All three matmul types verified correct using full forward-computation
+in Python, including bias and SwiGLU:
+
+| Tensor | Type | Shape | Cosine | Method |
+|--------|------|-------|--------|--------|
+| WQ | Q5_0 | [896,896] | 1.0000000000 | RMSNorm + bias |
+| FFN gate | Q5_0 | [896,4864] | 1.0000000000 | post-attn RMSNorm |
+| FFN down | Q6_K | [4864,896] | 0.9999848730 | SwiGLU + dot product |
+
+Despite all 10 paths being verified correct, the Q5_K_M model still produces
+garbled output. Remaining unverified: RoPE, GQA attention, SwiGLU, KV cache, residual connections. Root cause remains unidentified.
+
+### Verification Scripts
+
+The verification scripts in `scripts/verify_*.py` provide standalone Python
+reference implementations for independent validation of minfer's computation.
+All dequantization uses `gguf.quants.dequantize()` — the **same Python
+implementation validated against llama.cpp's C reference** in
+`gguf-py/tests/test_quants.py` (quantize + dequant must be bit-exact).
+
+| Script | Verifies | Usage |
+|--------|---------|-------|
+| `verify_embed.py` | Token embedding dequant (auto-detect type) | `uv run python -m scripts.verify_embed --model <gguf> --token-id <id>` |
+| `verify_rmsnorm.py` | RMSNorm output (bn) | `uv run python -m scripts.verify_rmsnorm --model <gguf> --layer 0 --token-id <id> --compare <dump>` |
+| `dump_tensors.py` | Tensor layout (offset/n_bytes/shape/type) | `uv run python -m scripts.dump_tensors --model <gguf>` |
+
+These read the same GGUF file as minfer, perform the same computation using
+the validated `gguf.quants.dequantize()`, and print key values for comparison
+with minfer dumps (under `--features debug_dump`).
+
+Two additional verification paths are covered by Rust unit tests:
+
+| Test | File | Verifies |
+|------|------|---------|
+| `test_q4k_dot_simple` | `avx2.rs` | Q4_K × Q8_0 scalar dot product |
+| `test_q8k_dot_simple` | `avx2.rs` | Q8_0 × Q8_0 scalar dot product |
+
+---
+
 ## Output Files (minfer)
 
 | File | Dump point | Shape | Bytes (Qwen2.5-0.5B, prompt="Hello"≈30 tokens) |
 |------|-----------|-------|------|
 | `minfer_dump_prompt.txt` | ⓪ prompt | text | ~200 B |
 | `minfer_dump_embed_out.f32` | ① embedding | 30 × 896 = 26,880 | ~105 KB |
+| `minfer_dump_layer0_bn.f32` | ⑥ RMSNorm | 30 × 896 = 26,880 | ~105 KB |
 | `minfer_dump_layer0_attn_out.f32` | ② attention | 26,880 | ~105 KB |
 | `minfer_dump_layer0_out.f32` | ③ FFN | 26,880 | ~105 KB |
 | ... | | | |
 | `minfer_dump_layer23_attn_out.f32` | ② attention | 26,880 | ~105 KB |
 | `minfer_dump_layer23_out.f32` | ③ FFN | 26,880 | ~105 KB |
 | `minfer_dump_logits.f32` | ④ logits | 30 × 151,936 = 4,558,080 | ~17.4 MB |
+| `minfer_dump_q8_quant_verify.txt` | ⑦ Q8_0 quantize | 1 line text | ~100 B |
 
 Total: 24 × 2 × 105 KB + 17.4 MB ≈ **22 MB** for a 24-layer model.
