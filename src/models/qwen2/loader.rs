@@ -284,20 +284,16 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
 
     // Override n_kv_embd from layer 0 K weight's actual output dimension
     if let Some(ti) = tensor_map.get(&tn::attn_k(0)) {
-        let old = hparams.n_kv_embd;
         hparams.n_kv_embd = ti.ne[1];
-        eprintln!("n_kv_embd: {} → {} (from K weight ne[1]={}, ne={:?})", old, hparams.n_kv_embd, ti.ne[1], ti.ne);
-    } else {
-        eprintln!("n_kv_embd: {} (default)", hparams.n_kv_embd);
     }
 
-    // Warn if model contains Q5_0 weights (unsupported by MPS GPU shader)
-    let has_q5 = layers.iter().any(|l| {
-        [&l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_gate, &l.ffn_up]
-            .iter().any(|t| t.as_ref().map_or(false, |t| t.ttype == TensorType::Q5_0))
+    // Warn if model contains Q5_K weights (unsupported by MPS GPU shader)
+    let has_q5_k = layers.iter().any(|l| {
+        [&l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
+            .iter().any(|t| t.as_ref().map_or(false, |t| t.ttype == TensorType::Q5_K))
     });
-    if has_q5 {
-        eprintln!("Warning: model contains Q5_0 weights (unsupported by MPS GPU). Will use CPU.");
+    if has_q5_k {
+        eprintln!("Warning: model contains Q5_K weights (unsupported by MPS GPU). Will use CPU.");
     }
 
     println!("Loaded: {} layers", n_layer);

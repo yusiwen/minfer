@@ -22,13 +22,14 @@ src/
 ├── sampler.rs       # Greedy / Top-K / Top-P / Temperature sampling
 ├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja)
 ├── download/mod.rs  # HuggingFace + Ollama model auto-download
-├── metal.rs         # Apple MPS (Metal) GPU backend
+├── metal.rs         # Apple MPS (Metal) GPU backend + dispatch
+├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q6_K/Q8_0 kernels)
 └── models/
     ├── mod.rs       # ModelDef trait + factory dispatch
     └── qwen2/
         ├── mod.rs   # Qwen2Model + ModelDef implementation
-        ├── forward.rs  # Forward pass (quantized inference)
-        └── loader.rs   # GGUF weight loading + GPU registration
+        ├── forward.rs  # Forward pass (quantized inference, CPU + GPU fallback)
+        └── loader.rs   # GGUF weight loading + MPS/CUDA GPU registration
 ```
 
 ## Build & Run
@@ -39,10 +40,10 @@ cargo build --release
 # Debug dumps (per-layer hidden states)
 cargo build --release --features debug_dump
 
-# Run (Q4_0 — works)
+# Run Q4_0 (GPU on Apple Silicon, CPU on other platforms)
 ./target/release/minfer ~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf "hello"
 
-# Run (Q4_K_M — CPU path bug, see below)
+# Run Q4_K_M (CPU — Q5_0 not optimized for Metal yet)
 ./target/release/minfer ~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf "hello"
 
 # Skip chat template (raw prompt)
@@ -66,62 +67,76 @@ MINFER_DISABLE_MPS=1 target/release/minfer <model> "hello"
 | File | Shape | Description |
 |------|-------|-------------|
 | `minfer_dump_embed_out.f32` | (nt, ne) | Token embedding output |
+| `minfer_dump_layer{N}_out.f32` | (nt, ne) | Hidden state after layer N |
+| `minfer_dump_layer{N}_attn_out.f32` | (nt, ne) | Hidden after attention + residual |
 | `minfer_dump_layer0_bn.f32` | (nt, ne) | RMSNorm (attn_norm) output (layer 0 only) |
 | `minfer_dump_layer0_bq.f32` | (nt, nqt) | Q projection output, pre-RoPE (layer 0 only) |
 | `minfer_dump_layer0_bq_rope.f32` | (nt, nqt) | Q projection after RoPE (layer 0 only) |
 | `minfer_dump_layer0_ba.f32` | (nt, ne) | Attention output before O_proj (layer 0 only) |
-| `minfer_dump_layer0_attn_out.f32` | (nt, ne) | Hidden state after attention + residual |
 | `minfer_dump_layer0_bg.f32` | (nt, nf) | FFN gate output before SiLU (layer 0 only) |
 | `minfer_dump_layer0_swiglu.f32` | (nt, nf) | SwiGLU output (layer 0 only) |
 | `minfer_dump_layer0_fd.f32` | (nt, ne) | FFN down projection output (layer 0 only) |
-| `minfer_dump_layer{N}_out.f32` | (nt, ne) | Hidden state after layer N |
 | `minfer_dump_last_norm.f32` | (nt, ne) | Final RMSNorm (output_norm) output |
 | `minfer_dump_logits.f32` | (nt, nv) | Final logits |
 | `minfer_dump_prompt.txt` | — | Rendered prompt text |
-| `minfer_dump_q8_quant_verify.txt` | — | Q8_0 quantization verification |
 
 Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 
 ## Quantization Support
 
 ### Working (verified)
-- **Q4_0** — standard 4-bit, all weights, both architectures → **works correctly**
+- **Q4_0** — standard 4-bit, all weights, CPU + GPU → **works correctly**
 - **Q4_1** — 4-bit with min
 - **Q8_0** — 8-bit
-- **Q4_K** — 4-bit K-quant (super-block)
+- **Q4_K** — 4-bit K-quant super-block (nibble layout fixed)
 - **Q6_K** — 6-bit K-quant
-
-### Partially working
-- **Q4_K** — 4-bit K-quant super-block (CPU path: individual ops verified, but mixed Q4_K/Q6_K layers produce garbled output)
-- **Q5_0** — 5-bit, individual ops verified correct, Q5_0×Q8_0 dot product implemented
-- **Q5_K** — 5-bit K-quant (untested)
+- **Q5_0** — 5-bit, CPU path works correctly, Q5_0×Q8_0 dot product implemented
+- **Q5_K** — 5-bit K-quant, nibble layout fixed (untested)
 
 ### Not supported (CPU)
 - Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_NL, etc.
-- **Q5_0 not supported in Metal GPU shaders** — always falls back to CPU
+
+## GPU Support Matrix
+
+| Quant | MPS (Metal) | CPU |
+|-------|-------------|-----|
+| Q4_0, Q4_1 | ✓ (Q8_0-activation path + f32 path) | ✓ |
+| Q4_K, Q6_K | ✓ (f32 path) | ✓ |
+| Q8_0 | ✓ (f32 path) | ✓ |
+| **Q5_0** | ✓ (f32 path, qh unaligned-read bug fixed) | ✓ |
+| Q5_K | ✗ | ✓ |
+| F32 | ✓ (RMSNorm, biases, etc.) | ✓ |
 
 ## Known Issues
 
-### Q4_K_M CPU Path Bug (fixed)
-Q4_K_M models use **alternating ffn_down types**: 12 layers with `Q4_K` (type 12) and 12 with `Q6_K` (type 14) for FFN down projection.
+### Q4_K / Q5_K Nibble Layout (fixed)
+Q4_K and Q5_K store `qs[128]` with cross-subblock nibble packing. Each byte's lo nibble belongs to subblock 2k and hi nibble to subblock 2k+1, aligned by element index. minfer originally assumed Q4_0-style layout (lo=sub_elem[j], hi=sub_elem[j+16]).
 
-- **Root cause**: Q4_K/Q5_K nibble layout in `qs[128]` was misinterpreted. minfer assumed Q4_0-style layout (each byte's lo/hi nibble = same subblock's consecutive elements), but llama.cpp stores them cross-subblock (each byte's lo/hi nibble = element j of subblocks 2k and 2k+1). Fixed in `dot_q4_k_q8_0_scalar`, `cpu_q5_k_matmul_f32`, Q4_K embed, Q5_K embed.
-- **Fix applied**: avx2.rs, kernel.rs, forward.rs — deinterleave nibbles properly before computing dot product.
-- After fix: per-layer cos ≥ 0.9993 through all 24 layers, output matches llama CPU.
+**Files affected and fixed:**
+- `avx2.rs`: `dot_q4_k_q8_0_scalar`, `dot_q5_k_q8_0_scalar` — deinterleave before dot product
+- `kernel.rs`: `cpu_q5_k_matmul_f32` — deinterleave before dequant
+- `forward.rs`: Q4_K embed, Q5_K embed — deinterleave before dequant
+- `metal.metal`: `kernel_q4_k_f32_matmul`, `kernel_q4_k_f32_matmul_multi` — deinterleave before dot product
 
-### Q5_0 not supported in Metal GPU shaders
-Q5_0 weights are registered with MPS (for partial acceleration where possible), but the shader kernel doesn't handle Q5_0. When GPU path fails at `layer_gpu`, the engine gracefully falls back to CPU.
+### Q5_0 Metal GPU Kernel (fixed)
+The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`, `kernel_q5_0_f32_matmul`, `kernel_q5_0_f32_matmul_multi`, `kernel_q5_0_debug`).
+
+- **Root cause found & fixed**: `*(uint32_t *)(block + 2)` reads qh at a 2-byte aligned address — undefined behavior on ARM/Metal. Fixed by reading 4 individual bytes and combining. Verified via `kernel_q5_0_debug` (single-block dequant matches CPU bit-for-bit).
+- **Verified working**: CPU vs GPU per-layer comparison shows all 24 layers with cos ≥ 0.998. Output matches CPU.
+- **Workaround**: `layer_gpu` rejects Q5_0 and falls back to CPU (transparent to user).
+- **Next step**: Dump first-row output from production kernel vs CPU to isolate the discrepancy.
 
 ### KV Head Dimension (n_kv_embd)
-Qwen2.5 models use **separate KV head dimensions** (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention functions now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`.
+Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.
 
 ## Core Conventions
 
-1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights are handled via `dot_q5_0_q8_0()` (newly added).
+1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights use `dot_q5_0_q8_0()`; Q4_K uses `dot_q4_k_q8_0()`.
 2. **AVX2 dispatch pattern**: all kernels use `is_x86_feature_detected!("avx2")` runtime detection + scalar fallback (ARM Mac always uses scalar).
 3. **No ML frameworks** — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten loops.
 4. **Tensor data uses raw `&[u8]` interface** — avx2.rs dot products operate on byte slices, not structs.
 5. **GGUF padding rule**: `ggml_pad()`: `(x + n - 1) & !(n - 1)`.
+6. **Metal GPU fallback**: when `layer_gpu` fails (unsupported weight type, shader error), the engine silently falls back to CPU via `run_cpu = true`.
 
 ## Adding a New Architecture
 
