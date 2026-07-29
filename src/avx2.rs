@@ -175,6 +175,42 @@ fn dot_q8_0_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
 }
 
 // ============================================================
+// Q5_0 × Q8_0 dot product
+// Q5_0: 32 elements / block, 22 bytes = d(f16,2) + qh(u8,4) + qs(u8,16)
+// Q8_0: 32 elements / block, 34 bytes
+// ============================================================
+
+#[inline]
+pub fn dot_q5_0_q8_0(q5: &[u8], q8: &[u8]) -> f32 {
+    let nb = q8.len() / Q8B;
+    debug_assert!(q5.len() >= nb * 22);
+    dot_q5_0_q8_0_scalar(q5, q8, nb)
+}
+
+fn dot_q5_0_q8_0_scalar(q5: &[u8], q8: &[u8], nb: usize) -> f32 {
+    let mut s = 0.0f32;
+    for ib in 0..nb {
+        let q5b = &q5[ib * 22..];
+        let q8b = &q8[ib * Q8B..];
+        let d_q5 = block::fp16_to_f32(u16::from_le_bytes([q5b[0], q5b[1]]));
+        let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8b[0], q8b[1]]));
+        let d = d_q5 * d_q8;
+        let qh = u32::from_le_bytes([q5b[2], q5b[3], q5b[4], q5b[5]]);
+        let qs = &q5b[6..22];
+        let mut si = 0i32;
+        for j in 0..16 {
+            let val_lo = (((qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4) - 16);
+            let val_hi = ((((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4) - 16);
+            let q8_lo = q8b[2 + j] as i8 as i32;
+            let q8_hi = q8b[2 + j + 16] as i8 as i32;
+            si += val_lo * q8_lo + val_hi * q8_hi;
+        }
+        s += si as f32 * d;
+    }
+    s
+}
+
+// ============================================================
 // Q4_K × Q8_0 dot product
 // Q4_K: 256 elements / superblock, 8 subblocks × 32 elements, 144 bytes
 // Q8_0: 32 elements / block, 34 bytes
@@ -202,7 +238,20 @@ fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
 
         let qs   = &q4b[16..144];
 
-        // 8 subblocks, each 32 elements
+        // Step 1: Deinterleave qs into 8 subblocks × 32 elements
+        // llama.cpp Q4_K layout: 4 chunks of 32 bytes, each chunk covers 2 subblocks.
+        //   chunk[j] lo nibble → subblock 2*j element l
+        //   chunk[j] hi nibble → subblock 2*j + 1 element l
+        let mut a = [0i32; 256];
+        for chunk_idx in 0..4 {
+            let chunk = &qs[chunk_idx * 32..chunk_idx * 32 + 32];
+            for l in 0..32 {
+                a[(2 * chunk_idx) * 32 + l] = (chunk[l] & 0x0F) as i32;
+                a[(2 * chunk_idx + 1) * 32 + l] = (chunk[l] >> 4) as i32;
+            }
+        }
+
+        // Step 2: Compute dot product per subblock with correct nibble alignment
         for s in 0..8 {
             let sc_val = scales[s];
             let mm_val = mins[s];
@@ -210,24 +259,17 @@ fn dot_q4_k_q8_0_scalar(q4: &[u8], q8: &[u8]) -> f32 {
             let dl = d * sc_val as f32;
             let ml = dmin * mm_val as f32;
 
-            // Q8_0 block for this subblock
             let q8blk = &q8b[s * Q8B..];
             let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
             let q8qs = &q8blk[2..];  // 32 i8 quants
 
-            // 32 nibbles from qs for this subblock (16 bytes)
-            // llama.cpp format: byte i low nibble = elem i, byte i high nibble = elem i+16
-            let q4_sub = &qs[s * 16..];
-
             let mut sum_sub = 0i32;
             let mut sum_q8  = 0i32;
-            for j in 0..16 {
-                let lo = (q4_sub[j] & 0x0F) as i32;
-                let hi = (q4_sub[j] >> 4) as i32;
-                let q8_lo = q8qs[j] as i8 as i32;
-                let q8_hi = q8qs[j + 16] as i8 as i32;
-                sum_sub += lo * q8_lo + hi * q8_hi;
-                sum_q8  += q8_lo + q8_hi;
+            for k in 0..32 {
+                let a_val = a[s * 32 + k];
+                let q8_val = q8qs[k] as i8 as i32;
+                sum_sub += a_val * q8_val;
+                sum_q8  += q8_val;
             }
 
             sum += d_q8 * (dl * sum_sub as f32 - ml * sum_q8 as f32);

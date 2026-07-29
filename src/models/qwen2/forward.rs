@@ -17,7 +17,7 @@ pub fn forward(
     let nv = hp.n_vocab as usize;
     let nf = hp.n_ff as usize;
     let nqt = nh * hd;
-    let nkt = nk * hd;
+    let nkt = hp.n_kv_embd as usize;
     let eps = hp.f_norm_rms_eps;
 
     let mut bn = vec![0.0f32; nt * ne];
@@ -70,31 +70,35 @@ pub fn forward(
             }
             mps.upload_positions(positions);
             let cb = mps.cmd_buffer();
+            let mut gpu_failed = false;
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
                 if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32) {
-                    eprintln!("layer_gpu returned false at layer {}", il);
-                    mps.sync_kv_to_cpu(kv_cache, il);
-                    cb.submit();
-                    mps.download_hidden(&mut hidden);
-                    return vec![];
+                    gpu_failed = true;
+                    break;
                 }
             }
-            let gpu_output = mps.output_norm_gpu(
-                &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
-                model.output_b.as_ref(),
-                ne, nv, nt, eps,
-            );
-            cb.submit();
-            if gpu_output {
-                let mut logits = vec![0.0f32; nt * nv];
-                mps.download_logits(&mut logits);
+            if gpu_failed {
+                // GPU path failed — sync KV and fall back to CPU
                 mps.sync_kv_to_cpu(kv_cache, model.n_layer());
-                return logits;
+                // cb dropped without submit; hidden was not uploaded so stays CPU-valid
+            } else {
+                let gpu_output = mps.output_norm_gpu(
+                    &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
+                    model.output_b.as_ref(),
+                    ne, nv, nt, eps,
+                );
+                cb.submit();
+                if gpu_output {
+                    let mut logits = vec![0.0f32; nt * nv];
+                    mps.download_logits(&mut logits);
+                    mps.sync_kv_to_cpu(kv_cache, model.n_layer());
+                    return logits;
+                }
+                mps.download_hidden(&mut hidden);
+                mps.sync_kv_to_cpu(kv_cache, model.n_layer());
+                run_cpu = false;
             }
-            mps.download_hidden(&mut hidden);
-            mps.sync_kv_to_cpu(kv_cache, model.n_layer());
-            run_cpu = false;
         }
     }
 
@@ -206,8 +210,9 @@ pub fn forward(
             apply_rope(&mut bk, positions, nk, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
             kv_cache.layers[il].store_multi(positions, &bk, &bv);
             let nkv = kv_cache.layers[il].size;
+            let hd_kv = nkt / nk;
             gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
-                positions, nt, nkv, nh, nk, hd, &mut ba, &mut scrs_buf[..nkv], hp.attention_scale());
+                positions, nt, nkv, nh, nk, hd, hd_kv, nkt, &mut ba, &mut scrs_buf[..nkv], hp.attention_scale());
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_ba", &ba, nt, il == 0);
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
             unsafe {
@@ -328,16 +333,25 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                     let (scales, mins) = crate::block::unpack_q4k_scales(sc_arr);
                     let qs = &t.data[off + 16..off + 144];
 
+                    // Deinterleave qs: 4 chunks of 32 bytes, each covers 2 subblocks
+                    // chunk[l] lo nibble → sub 2*chunk, elem l
+                    // chunk[l] hi nibble → sub 2*chunk+1, elem l
+                    let mut nibbles = [0i32; 256];
+                    for chunk_idx in 0..4 {
+                        let chunk = &qs[chunk_idx * 32..chunk_idx * 32 + 32];
+                        for l in 0..32 {
+                            nibbles[(2 * chunk_idx) * 32 + l] = (chunk[l] & 0x0F) as i32;
+                            nibbles[(2 * chunk_idx + 1) * 32 + l] = (chunk[l] >> 4) as i32;
+                        }
+                    }
+
                     for sub in 0..8 {
                         let sc_val = scales[sub];
                         let mm_val = mins[sub];
                         let dl = d * sc_val as f32; let ml = dmin * mm_val as f32;
                         let base = doff + s * 256 + sub * 32;
-                        let q4_sub = &qs[sub * 16..];
-                        // llama.cpp format: byte j low nibble = elem j, byte j high nibble = elem j+16
-                        for j in 0..16 {
-                            out[base + j]      = dl * (q4_sub[j] & 0x0F) as f32 - ml;
-                            out[base + j + 16] = dl * (q4_sub[j] >> 4) as f32 - ml;
+                        for k in 0..32 {
+                            out[base + k] = dl * nibbles[sub * 32 + k] as f32 - ml;
                         }
                     }
                 }
@@ -357,17 +371,27 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                     let qh = &t.data[off + 16..off + 48];
                     let qs = &t.data[off + 48..off + 176];
 
+                    // Deinterleave qs nibbles: 4 chunks of 32 bytes, covering 2 subblocks each
+                    let mut nb = [0u8; 256];
+                    for ci in 0..4 {
+                        let chunk = &qs[ci * 32..ci * 32 + 32];
+                        for l in 0..32 {
+                            nb[(2 * ci) * 32 + l] = chunk[l] & 0x0F;
+                            nb[(2 * ci + 1) * 32 + l] = chunk[l] >> 4;
+                        }
+                    }
+
                     for sub in 0..8 {
                         let dl = d * scales[sub] as f32;
                         let ml = dmin * mins[sub] as f32;
                         let base = doff + s * 256 + sub * 32;
-                        for j in 0..16 {
-                            let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
-                            let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
-                            let w0 = (qs[sub * 16 + j] & 0x0F) as f32 + 16.0 * h0 as f32;
-                            let w1 = ((qs[sub * 16 + j] >> 4) & 0x0F) as f32 + 16.0 * h1 as f32;
-                            out[base + j]      = dl * w0 - ml;
-                            out[base + j + 16] = dl * w1 - ml;
+                        let h0_base = sub * 4;
+                        for j in 0..32 {
+                            let hidx = h0_base + j / 8;
+                            let shift = j % 8;
+                            let hi_bit = ((qh[hidx + if j < 16 { 0 } else { 2 }] >> shift) & 1) as u8;
+                            let w = nb[sub * 32 + j] as f32 + 16.0 * hi_bit as f32;
+                            out[base + j] = dl * w - ml;
                         }
                     }
                 }
@@ -458,16 +482,17 @@ fn apply_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize, fb: f32, freq_
 }
 
 fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: usize,
-    nh: usize, nk: usize, hd: usize, out: &mut [f32], scrs: &mut [f32], scale: f32) {
+    nh: usize, nk: usize, hd: usize, hd_kv: usize, nkt: usize, out: &mut [f32], scrs: &mut [f32], scale: f32) {
     let gqa = nh / nk; let ne_q = nh * hd;
+    assert!(hd >= hd_kv, "Q head dim ({}) must be >= KV head dim ({})", hd, hd_kv);
     for h in 0..nh {
         let hk = h / gqa;
         for t in 0..nt {
             let qs = t * ne_q + h * hd; let vl = (pos[t] + 1).min(nkv);
             let mut mx = f32::NEG_INFINITY;
             for kv in 0..vl {
-                let ks = kv * nk * hd + hk * hd;
-                let s = crate::vec_ops::vec_dot_f32(hd, &q[qs..qs + hd], &ka[ks..ks + hd]) * scale;
+                let ks = kv * nkt + hk * hd_kv;
+                let s = crate::vec_ops::vec_dot_f32(hd_kv, &q[qs..qs + hd_kv], &ka[ks..ks + hd_kv]) * scale;
                 scrs[kv] = s; if s > mx { mx = s; }
             }
             for kv in vl..nkv { scrs[kv] = f32::NEG_INFINITY; }
@@ -476,8 +501,8 @@ fn gqa_attn(q: &[f32], ka: &[f32], va: &[f32], pos: &[usize], nt: usize, nkv: us
             let is = (1.0 / sm) as f32; crate::vec_ops::vec_scale_f32(nkv, scrs, is);
             let os = t * ne_q + h * hd; let slice = &mut out[os..os + hd];
             for d in 0..hd { slice[d] = 0.0; }
-            let stride = nk * hd; let vs_base = hk * hd;
-            for kv in 0..nkv { crate::vec_ops::vec_muladd_f32(hd, slice, &va[kv * stride + vs_base..kv * stride + vs_base + hd], scrs[kv]); }
+            let vs_base = hk * hd_kv;
+            for kv in 0..nkv { crate::vec_ops::vec_muladd_f32(hd_kv, &mut slice[..hd_kv], &va[kv * nkt + vs_base..kv * nkt + vs_base + hd_kv], scrs[kv]); }
         }
     }
 }

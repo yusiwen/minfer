@@ -79,9 +79,6 @@ pub fn cpu_quant_matmul_f32(
     if w.ttype == TensorType::Q5_K {
         return cpu_q5_k_matmul_f32(w, x, out, od, id, nt);
     }
-    if w.ttype == TensorType::Q5_0 {
-        return cpu_q5_0_matmul_f32(w, x, out, od, id, nt);
-    }
     let nbe = id / 32;
     let mut qb = vec![0u8; nt * nbe * Q8B];
     crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut qb);
@@ -141,6 +138,18 @@ pub fn cpu_quant_matmul(
                 }
             }
         }
+        TensorType::Q5_0 => {
+            let nb = id / 32;
+            let ws = nb * 22;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q5_0_q8_0(
+                        wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
+                }
+            }
+        }
         TensorType::Q8_0 => {
             let nb = id / 32;
             let ws = nb * Q8B;
@@ -181,18 +190,31 @@ fn cpu_q5_k_matmul_f32(
                 let (sc, mn) = crate::block::unpack_q4k_scales(sc_arr);
                 let qh = &wrow[off + 16..off + 48];
                 let qs = &wrow[off + 48..off + 176];
+
+                // Deinterleave qs nibbles: 4 chunks of 32 bytes, covering 2 subblocks each
+                // chunk[l] lo nibble → sub 2*chunk, elem l
+                // chunk[l] hi nibble → sub 2*chunk+1, elem l
+                let mut nb = [0u8; 256];
+                for ci in 0..4 {
+                    let chunk = &qs[ci * 32..ci * 32 + 32];
+                    for l in 0..32 {
+                        nb[(2 * ci) * 32 + l] = chunk[l] & 0x0F;
+                        nb[(2 * ci + 1) * 32 + l] = chunk[l] >> 4;
+                    }
+                }
+
                 for sub in 0..8 {
                     let dl = d * sc[sub] as f32;
                     let ml = dm * mn[sub] as f32;
-                    let qs_sub = &qs[sub * 16..];
-                    for j in 0..16 {
-                        let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
-                        let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
-                        let w0 = (qs_sub[j] & 0x0F) as f32 + 16.0 * h0 as f32;
-                        let w1 = ((qs_sub[j] >> 4) & 0x0F) as f32 + 16.0 * h1 as f32;
+                    let h0_base = sub * 4;
+                    for j in 0..32 {
+                        let hidx = h0_base + j / 8;
+                        let shift = j % 8;
+                        let hi_bit = ((qh[hidx + if j < 16 { 0 } else { 2 }] >> shift) & 1) as u8;
+                        let nibble = nb[sub * 32 + j];
+                        let w = nibble as f32 + 16.0 * hi_bit as f32;
                         let off_a = a_base + s * 256 + sub * 32;
-                        sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
-                        sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
+                        sum += dl * w * x[off_a + j] - ml * x[off_a + j];
                     }
                 }
             }

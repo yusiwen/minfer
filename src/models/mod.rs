@@ -15,6 +15,7 @@ pub trait ModelDef {
     fn n_layer(&self) -> usize;
     fn n_head_kv(&self) -> usize;
     fn n_embd_head(&self) -> usize;
+    fn n_kv_embd(&self) -> usize;
     fn n_vocab(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
 }
