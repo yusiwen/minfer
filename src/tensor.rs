@@ -11,6 +11,7 @@ pub enum TensorType {
     Q4_0,
     Q4_1,
     Q5_0,
+    Q5_1,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -30,6 +31,7 @@ impl TensorType {
             TensorType::Q4_0 => 18,  // sizeof(block_q4_0)
             TensorType::Q4_1 => 20,  // sizeof(block_q4_1)
             TensorType::Q5_0 => 22,  // sizeof(block_q5_0)
+            TensorType::Q5_1 => 24,  // sizeof(block_q5_1)
             TensorType::Q4_K => 144, // sizeof(block_q4_K)
             TensorType::Q5_K => 176, // sizeof(block_q5_K)
             TensorType::Q6_K => 210, // sizeof(block_q6_K)
@@ -49,6 +51,7 @@ impl TensorType {
             TensorType::Q4_0 => 32,
             TensorType::Q4_1 => 32,
             TensorType::Q5_0 => 32,
+            TensorType::Q5_1 => 32,
             TensorType::Q4_K => 256,
             TensorType::Q5_K => 256,
             TensorType::Q6_K => 256,
@@ -68,6 +71,7 @@ impl TensorType {
             GgmlType::Q4_0 => TensorType::Q4_0,
             GgmlType::Q4_1 => TensorType::Q4_1,
             GgmlType::Q5_0 => TensorType::Q5_0,
+            GgmlType::Q5_1 => TensorType::Q5_1,
             GgmlType::Q4_K => TensorType::Q4_K,
             GgmlType::Q5_K => TensorType::Q5_K,
             GgmlType::Q6_K => TensorType::Q6_K,
@@ -86,6 +90,7 @@ impl TensorType {
             TensorType::Q4_0 => "q4_0",
             TensorType::Q4_1 => "q4_1",
             TensorType::Q5_0 => "q5_0",
+            TensorType::Q5_1 => "q5_1",
             TensorType::Q4_K => "q4_K",
             TensorType::Q5_K => "q5_K",
             TensorType::Q6_K => "q6_K",

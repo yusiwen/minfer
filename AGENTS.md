@@ -91,9 +91,10 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 - **Q4_K** — 4-bit K-quant super-block (nibble layout fixed)
 - **Q6_K** — 6-bit K-quant
 - **Q5_0** — 5-bit, CPU path works correctly, Q5_0×Q8_0 dot product implemented
-- **Q5_K** — 5-bit K-quant, nibble layout fixed (untested)
+- **Q5_K** — 5-bit K-quant, nibble layout fixed (CLI path verified, Q5_K_M model WIP)
+- **Q5_1** — 5-bit with min (Q5_K_M model), CPU path implemented, formula verified
 
-### Not supported (CPU)
+### Not supported (CLI)
 - Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_NL, etc.
 
 ## GPU Support Matrix
@@ -104,8 +105,17 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 | Q4_K, Q6_K | ✓ (f32 path) | ✓ |
 | Q8_0 | ✓ (f32 path) | ✓ |
 | **Q5_0** | ✓ (f32 path, qh unaligned-read bug fixed) | ✓ |
+| **Q5_1** | ✗ | ✓ (formula verified, Q5_K_M model WIP) |
 | Q5_K | ✗ | ✓ |
 | F32 | ✓ (RMSNorm, biases, etc.) | ✓ |
+
+## Model Support Matrix
+
+| Model | CPU | MPS GPU | Notes |
+|-------|-----|---------|-------|
+| Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (361 tok/s) | All weights Q4_0 |
+| Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ (3.2s) | ✓ (226 tok/s) | Q5_0/Q8_0/Q4_K/Q6_K mixed |
+| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✗ (乱码) | ✗ | Q5_1/Q8_0/Q5_K/Q6_K mixed, WIP |
 
 ## Known Issues
 
@@ -122,9 +132,14 @@ Q4_K and Q5_K store `qs[128]` with cross-subblock nibble packing. Each byte's lo
 The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`, `kernel_q5_0_f32_matmul`, `kernel_q5_0_f32_matmul_multi`, `kernel_q5_0_debug`).
 
 - **Root cause found & fixed**: `*(uint32_t *)(block + 2)` reads qh at a 2-byte aligned address — undefined behavior on ARM/Metal. Fixed by reading 4 individual bytes and combining. Verified via `kernel_q5_0_debug` (single-block dequant matches CPU bit-for-bit).
-- **Verified working**: CPU vs GPU per-layer comparison shows all 24 layers with cos ≥ 0.998. Output matches CPU.
-- **Workaround**: `layer_gpu` rejects Q5_0 and falls back to CPU (transparent to user).
-- **Next step**: Dump first-row output from production kernel vs CPU to isolate the discrepancy.
+- **Verified working**: CPU vs GPU per-layer comparison shows all 24 layers with cos ≥ 0.998. Output matches CPU ("Hello! How can I assist you today?").
+
+### Q5_1 (Q5_K_M model) — partially implemented
+Q5_1 format: d(f16,2) + m(f16,2) + qh(u32,4) + qs(u8,16) = 24 bytes per 32 elements. Dequant: `val = d × unsigned_5bit + m` (no -16 offset — differs from Q5_0).
+
+- **CPU path**: implemented (`TensorType::Q5_1`, `dot_q5_1_q8_0`, `embed_tokens` branch, `cpu_quant_matmul` dispatch). Unit test passes.
+- **Status**: model loads and runs, produces reasonable norms (embed=0.31, l0_out=10.0), but output garbled. Root cause TBD.
+- **MPS GPU**: not yet registered/implemented.
 
 ### KV Head Dimension (n_kv_embd)
 Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.

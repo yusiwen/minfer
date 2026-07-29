@@ -342,6 +342,30 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                 }
             }
         }
+        TensorType::Q5_1 => {
+            let blk = 32usize; let nbp = (ne + blk - 1) / blk; let bb = 24usize;
+            for (ti, &id) in ids.iter().enumerate() {
+                let idx = id as usize; let doff = ti * ne;
+                for b in 0..nbp {
+                    let off = (idx * nbp + b) * bb;
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
+                    let m = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
+                    let qh = u32::from_le_bytes([t.data[off+4], t.data[off+5], t.data[off+6], t.data[off+7]]);
+                    let qs = &t.data[off + 8..off + 24];
+                    let mv = blk.min(ne - b * blk);
+                    for j in 0..16 {
+                        let xh0 = ((qh >> j) & 1) as u32;
+                        let xh1 = ((qh >> (j + 16)) & 1) as u32;
+                        if j < mv {
+                            out[doff + b * blk + j] = ((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) as f32 * d + m;
+                        }
+                        if j + 16 < mv {
+                            out[doff + b * blk + j + 16] = (((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) as f32 * d + m;
+                        }
+                    }
+                }
+            }
+        }
         TensorType::Q4_K => {
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
@@ -411,7 +435,8 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                             let hidx = h0_base + j / 8;
                             let shift = j % 8;
                             let hi_bit = ((qh[hidx + if j < 16 { 0 } else { 2 }] >> shift) & 1) as u8;
-                            let w = nb[sub * 32 + j] as f32 + 16.0 * hi_bit as f32;
+                            // Q5_K signed: (unsigned_5bit - 16) * dl - ml
+                            let w = nb[sub * 32 + j] as f32 + 16.0 * hi_bit as f32 - 16.0;
                             out[base + j] = dl * w - ml;
                         }
                     }

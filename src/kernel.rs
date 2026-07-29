@@ -149,6 +149,18 @@ pub fn cpu_quant_matmul(
                 }
             }
         }
+        TensorType::Q5_1 => {
+            let nb = id / 32;
+            let ws = nb * 24;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q5_1_q8_0(
+                        wrow, &x[t * nb * Q8B..(t + 1) * nb * Q8B]);
+                }
+            }
+        }
         TensorType::Q8_0 => {
             let nb = id / 32;
             let ws = nb * Q8B;
@@ -205,15 +217,15 @@ fn cpu_q5_k_matmul_f32(
                 for sub in 0..8 {
                     let dl = d * sc[sub] as f32;
                     let ml = dm * mn[sub] as f32;
-                    let h0_base = sub * 4;
-                    for j in 0..32 {
-                        let hidx = h0_base + j / 8;
-                        let shift = j % 8;
-                        let hi_bit = ((qh[hidx + if j < 16 { 0 } else { 2 }] >> shift) & 1) as u8;
-                        let nibble = nb[sub * 32 + j];
-                        let w = nibble as f32 + 16.0 * hi_bit as f32;
+                    for j in 0..16 {
+                        let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
+                        let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
+                        // Q5_K signed: w = (unsigned_5bit - 16) * dl - ml
+                        let w0 = nb[sub * 32 + j] as f32 + 16.0 * h0 as f32 - 16.0;
+                        let w1 = nb[sub * 32 + j + 16] as f32 + 16.0 * h1 as f32 - 16.0;
                         let off_a = a_base + s * 256 + sub * 32;
-                        sum += dl * w * x[off_a + j] - ml * x[off_a + j];
+                        sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
+                        sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
                     }
                 }
             }
