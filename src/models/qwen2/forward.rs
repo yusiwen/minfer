@@ -69,13 +69,25 @@ pub fn forward(
                 mps.upload_hidden(&hidden);
             }
             mps.upload_positions(positions);
-            let cb = mps.cmd_buffer();
+            let mut cb = mps.cmd_buffer();
             let mut gpu_failed = false;
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
                 if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32) {
                     gpu_failed = true;
                     break;
+                }
+                #[cfg(feature = "debug_dump")]
+                {
+                    cb.submit();
+                    mps.download_hidden(&mut hidden);
+                    crate::dump::maybe_dump_prefill_or_gen0(
+                        &format!("minfer_gpu_dump_layer{}_out", il), &hidden, nt
+                    );
+                    crate::dump::maybe_dump_prefill_or_gen0(
+                        &format!("minfer_gpu_dump_layer{}_attn_out", il), &hidden, nt
+                    );
+                    cb = mps.cmd_buffer();
                 }
             }
             if gpu_failed {
@@ -93,6 +105,15 @@ pub fn forward(
                     let mut logits = vec![0.0f32; nt * nv];
                     mps.download_logits(&mut logits);
                     mps.sync_kv_to_cpu(kv_cache, model.n_layer());
+
+                    #[cfg(feature = "debug_dump")]
+                    {
+                        mps.download_hidden(&mut hidden);
+                        rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
+                        crate::dump::maybe_dump_prefill_or_gen0("minfer_gpu_dump_last_norm", &bn, nt);
+                        crate::dump::maybe_dump_prefill_or_gen0("minfer_gpu_dump_logits", &logits, nt);
+                    }
+
                     return logits;
                 }
                 mps.download_hidden(&mut hidden);

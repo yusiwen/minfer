@@ -30,6 +30,8 @@ struct MpsStateInner {
     pl_q4_k_f32_multi: metal::ComputePipelineState,
     pl_q6_k_f32: metal::ComputePipelineState,
     pl_q6_k_f32_multi: metal::ComputePipelineState,
+    pl_q5_0_f32: metal::ComputePipelineState,
+    pl_q5_0_f32_multi: metal::ComputePipelineState,
     pl_quantize_q8_0: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
@@ -41,6 +43,7 @@ struct MpsStateInner {
     pl_rope: metal::ComputePipelineState,
     pl_gqa_attn: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
+    pl_q5_0_debug: metal::ComputePipelineState,
     weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
     // Persistent scratch buffers grown on demand; avoids per-call allocation.
     q8_buf: std::sync::Mutex<metal::Buffer>,
@@ -159,6 +162,19 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q4_1 => {
                 self.enc.set_compute_pipeline_state(
                     if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
+                );
+                self.enc.set_buffer(0, Some(wb), 0);
+                self.enc.set_buffer(1, Some(x), 0);
+                self.enc.set_buffer(2, Some(out), 0);
+                self.set_params(3, &(od as i32));
+                self.set_params(4, &(id as i32));
+                self.set_params(5, &(nt as i32));
+                let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+            }
+            TensorType::Q5_0 => {
+                self.enc.set_compute_pipeline_state(
+                    if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
                 );
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
@@ -466,6 +482,8 @@ impl MpsState {
             let pl_q4_k_f32_multi = get_pl("kernel_q4_k_f32_matmul_multi")?;
             let pl_q6_k_f32 = get_pl("kernel_q6_k_f32_matmul")?;
             let pl_q6_k_f32_multi = get_pl("kernel_q6_k_f32_matmul_multi")?;
+            let pl_q5_0_f32 = get_pl("kernel_q5_0_f32_matmul")?;
+            let pl_q5_0_f32_multi = get_pl("kernel_q5_0_f32_matmul_multi")?;
             let pl_quantize_q8_0 = get_pl("kernel_quantize_q8_0")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
@@ -477,6 +495,7 @@ impl MpsState {
             let pl_rope     = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
+            let pl_q5_0_debug = get_pl("kernel_q5_0_debug")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
             let m = MpsStateInner {
                 device: device.clone(),
@@ -493,6 +512,8 @@ impl MpsState {
                 pl_q4_k_f32_multi,
                 pl_q6_k_f32,
                 pl_q6_k_f32_multi,
+                pl_q5_0_f32,
+                pl_q5_0_f32_multi,
                 pl_quantize_q8_0,
                 pl_get_rows_q4_0,
                 pl_rms_norm,
@@ -504,6 +525,7 @@ impl MpsState {
                 pl_rope,
                 pl_gqa_attn,
                 pl_store_kv,
+                pl_q5_0_debug,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_buf: std::sync::Mutex::new(dummy_buf.clone()),
@@ -876,10 +898,10 @@ impl MpsState {
         let ffn_up   = l.ffn_up.as_ref().unwrap();
         let ffn_down = l.ffn_down.as_ref().unwrap();
 
-        // Q5_0/Q5_K/Raw not supported in Metal shaders — fall back to CPU
+        // Q5_K/Raw not supported in Metal shaders — fall back to CPU
         let all_types = [wq.ttype, wk.ttype, wv.ttype, wo.ttype,
                          ffn_gate.ttype, ffn_up.ttype, ffn_down.ttype];
-        if all_types.iter().any(|t| *t == TensorType::Q5_0 || *t == TensorType::Q5_K || *t == TensorType::Raw) {
+        if all_types.iter().any(|t| *t == TensorType::Q5_K || *t == TensorType::Raw) {
             return false;
         }
 
@@ -1014,7 +1036,7 @@ impl MpsState {
         };
         let bias_buf = output_b.and_then(|ob| weights.get(&ob.name).cloned());
         drop(weights);
-        if output.ttype == TensorType::Q5_0 || output.ttype == TensorType::Q5_K || output.ttype == TensorType::Raw {
+        if output.ttype == TensorType::Q5_K || output.ttype == TensorType::Raw {
             return false;
         }
         if output.ttype != TensorType::Q4_0 && output.ttype != TensorType::Q4_1
@@ -1068,6 +1090,95 @@ impl MpsState {
                 Self::copy_from_gpu(&kv_v[il], &mut layer.v[..sz * layer.dim]);
                 layer.size = sz;
             }
+        }
+    }
+
+    /// Debug test using a real Q5_0 block from a loaded tensor.
+    pub fn test_q5_0_debug_real(&self, q5_tensor_data: &[u8]) {
+        if q5_tensor_data.len() < 22 {
+            eprintln!("[Q5_0 debug] tensor too small: {} bytes", q5_tensor_data.len());
+            return;
+        }
+        let block = &q5_tensor_data[..22];
+
+        // ---- Build activations (32 x 1.0) ----
+        let acts: Vec<f32> = (0..32).map(|_| 1.0f32).collect();
+
+        // ---- CPU reference ----
+        let mut cpu_weights = [0.0f32; 32];
+        let mut cpu_dot = 0.0f32;
+        let dh = u16::from_le_bytes([block[0], block[1]]);
+        let d = crate::block::fp16_to_f32(dh);
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for j in 0..16 {
+            let lo = ((block[6 + j] & 0x0F) as i32 | ((((qh >> j) & 1) as i32) << 4)) - 16;
+            let hi = (((block[6 + j] >> 4) & 0x0F) as i32 | ((((qh >> (j + 16)) & 1) as i32) << 4)) - 16;
+            cpu_weights[j]      = d * lo as f32;
+            cpu_weights[j + 16] = d * hi as f32;
+            cpu_dot += cpu_weights[j] + cpu_weights[j + 16];
+        }
+
+        eprintln!("[Q5_0 debug] d={:.6e} qh=0x{:08x}", d, qh);
+        eprintln!("[Q5_0 debug] CPU block bytes: d={:02x?} qh={:02x?} qs[0..4]={:02x?}",
+            &block[0..2], &block[2..6], &block[6..10]);
+        eprintln!("[Q5_0 debug] CPU dot={}, weights[0..8]={:?}", cpu_dot, &cpu_weights[..8]);
+
+        // ---- Run GPU kernel ----
+        let dev = &self.inner.device;
+        let buf_block = dev.new_buffer_with_data(
+            block.as_ptr() as *const std::ffi::c_void, 22,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let buf_acts = dev.new_buffer_with_data(
+            acts.as_ptr() as *const std::ffi::c_void, (acts.len() * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let buf_out = dev.new_buffer(
+            (56 * 4) as u64,  // 32 weights + dot + d + 22 raw block bytes + 1 pad
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        let cb = self.cmd_buffer();
+        cb.enc.set_compute_pipeline_state(&self.inner.pl_q5_0_debug);
+        cb.enc.set_buffer(0, Some(&buf_block), 0);
+        cb.enc.set_buffer(1, Some(&buf_acts), 0);
+        cb.enc.set_buffer(2, Some(&buf_out), 0);
+        let grid = metal::MTLSize { width: 1, height: 1, depth: 1 };
+        let tg   = metal::MTLSize { width: 1, height: 1, depth: 1 };
+        cb.enc.dispatch_thread_groups(grid, tg);
+        cb.submit();
+
+        // ---- Read back GPU output ----
+        let mut gpu_out = [0.0f32; 56];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf_out.contents() as *const f32,
+                gpu_out.as_mut_ptr(),
+                56,
+            );
+        }
+
+        let gpu_raw: Vec<u8> = gpu_out[34..56].iter().map(|&f| f as u8).collect();
+        eprintln!("[Q5_0 debug] GPU d={:.6e}", gpu_out[33]);
+        eprintln!("[Q5_0 debug] GPU raw bytes 0..21: {:02x?}", gpu_raw);
+        eprintln!("[Q5_0 debug] CPU raw bytes 0..21: {:02x?}", &block[0..22]);
+
+        let gpu_dot = gpu_out[32];
+        eprintln!("[Q5_0 debug] GPU dot={}, weights[0..8]={:?}", gpu_dot, &gpu_out[..8]);
+        eprintln!("[Q5_0 debug] GPU full weights: {:?}", &gpu_out[..32]);
+
+        // ---- Compare ----
+        let mut max_err = 0.0f32;
+        for j in 0..32 {
+            let err = (gpu_out[j] - cpu_weights[j]).abs();
+            if err > max_err { max_err = err; }
+        }
+        let dot_err = (gpu_dot - cpu_dot).abs();
+        eprintln!("Max weight err: {:.6e}, dot err: {:.6e}", max_err, dot_err);
+        if max_err > 1e-5 || dot_err > 1e-5 {
+            eprintln!("Q5_0 GPU DEBUG FAILED");
+        } else {
+            eprintln!("Q5_0 GPU DEBUG PASSED");
         }
     }
 }
