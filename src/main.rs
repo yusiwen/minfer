@@ -38,7 +38,8 @@ impl Default for GenParams {
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let meta_flag = raw_args.iter().any(|a| a == "--meta");
-    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--meta").collect();
+    let no_template = raw_args.iter().any(|a| a == "--no-template");
+    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--meta" && a != "--no-template").collect();
 
     if args.len() < 2 {
         eprintln!("Usage:");
@@ -173,11 +174,10 @@ fn main() {
     }
 
     // === KV Cache ===
-    let n_embd_head = model.n_embd_head();
-    let n_head_kv = model.n_head_kv();
+    let n_kv_embd = model.n_kv_embd();
     let n_layer = model.n_layer();
     let n_vocab = model.n_vocab();
-    let mut kv_cache = cache::KVCache::new(n_layer, n_head_kv, n_embd_head, params.n_ctx);
+    let mut kv_cache = cache::KVCache::new(n_layer, n_kv_embd, params.n_ctx);
 
     // Pre-allocate GPU KV cache (avoids O(n²) incremental growth during generation)
     #[cfg(feature = "cuda")]
@@ -190,7 +190,9 @@ fn main() {
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
 
     // === Chat template (need tokenizer for bos_token text) ===
-    let processed = if let Some(tmpl) = get_chat_template(&data) {
+    let processed = if no_template {
+        prompt.clone()
+    } else if let Some(tmpl) = get_chat_template(&data) {
         let bos_text = tokenizer.id_to_token.get(tokenizer.bos_token as usize)
             .map(|s| s.as_str())
             .unwrap_or("");

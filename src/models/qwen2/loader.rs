@@ -22,6 +22,10 @@ pub struct HParams {
     pub eos_token_id: u32,
     pub im_end_token_id: Option<u32>,
     pub rope_style: RopeStyle,
+    /// Actual KV embedding dimension (ne[1] of K weight).
+    /// May differ from `n_head_kv * n_embd_head()` when the model uses
+    /// separate KV head dimensions (e.g. Qwen2.5-0.5B: kv_dim=128 vs n_embd=896).
+    pub n_kv_embd: i64,
 }
 
 impl HParams {
@@ -138,6 +142,7 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
         eos_token_id: eos,
         im_end_token_id: im_end,
         rope_style: RopeStyle::NonInterleaved,
+        n_kv_embd: n_head_kv * (n_embd / n_head), // default, updated from K weight shape below
     })
 }
 
@@ -186,7 +191,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q6_K | TensorType::Q8_0) {
             mps.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             mps.register_weight(&ti.name, tensor.data());
@@ -194,7 +199,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     }
     #[cfg(feature = "cuda")]
     if let Some(cuda) = crate::cuda::CudaState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q6_K | TensorType::Q8_0) {
             cuda.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
@@ -209,7 +214,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
 // ============================================================
 
 pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
-    let hparams = hparams_from_gguf(ctx)?;
+    let mut hparams = hparams_from_gguf(ctx)?;
 
     let mut tensor_map = std::collections::HashMap::<String, &crate::gguf::GgufTensorInfo>::new();
     for ti in &ctx.info {
@@ -275,6 +280,24 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
             layer.ffn_down = Some(load_tensor(ctx, raw, ti));
         }
         layers.push(layer);
+    }
+
+    // Override n_kv_embd from layer 0 K weight's actual output dimension
+    if let Some(ti) = tensor_map.get(&tn::attn_k(0)) {
+        let old = hparams.n_kv_embd;
+        hparams.n_kv_embd = ti.ne[1];
+        eprintln!("n_kv_embd: {} → {} (from K weight ne[1]={}, ne={:?})", old, hparams.n_kv_embd, ti.ne[1], ti.ne);
+    } else {
+        eprintln!("n_kv_embd: {} (default)", hparams.n_kv_embd);
+    }
+
+    // Warn if model contains Q5_0 weights (unsupported by MPS GPU shader)
+    let has_q5 = layers.iter().any(|l| {
+        [&l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_gate, &l.ffn_up]
+            .iter().any(|t| t.as_ref().map_or(false, |t| t.ttype == TensorType::Q5_0))
+    });
+    if has_q5 {
+        eprintln!("Warning: model contains Q5_0 weights (unsupported by MPS GPU). Will use CPU.");
     }
 
     println!("Loaded: {} layers", n_layer);

@@ -44,6 +44,7 @@ impl ModelDef for Qwen2Model {
     fn n_layer(&self) -> usize { self.hparams.n_layer as usize }
     fn n_head_kv(&self) -> usize { self.hparams.n_head_kv as usize }
     fn n_embd_head(&self) -> usize { self.hparams.n_embd_head() as usize }
+    fn n_kv_embd(&self) -> usize { self.hparams.n_kv_embd as usize }
     fn n_vocab(&self) -> usize { self.hparams.n_vocab as usize }
     fn rope_style(&self) -> crate::vec_ops::RopeStyle { self.hparams.rope_style }
 }
