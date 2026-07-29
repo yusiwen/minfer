@@ -409,6 +409,24 @@ fn quantize_scalar(x: &[f32], y: &mut [u8], k: usize) {
 /// Quantize multiple rows directly into &mut [u8] buffer (no per-row Vec allocation).
 pub fn quantize_row_q8_0_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
     let rowb = (dim / 32) * Q8B;
+    #[cfg(feature = "debug_dump")]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::Relaxed) && nt > 0 && dim >= 32 {
+            let mut am = 0.0f32;
+            for j in 0..32 { am = am.max(x[j].abs()); }
+            let d = am / 127.0f32;
+            let q0 = (x[0] / d).round().clamp(-128.0, 127.0) as i8;
+            let q1 = (x[1] / d).round().clamp(-128.0, 127.0) as i8;
+            let q16 = (x[16] / d).round().clamp(-128.0, 127.0) as i8;
+            crate::dump::maybe_dump_text(
+                "minfer_dump_q8_quant_verify",
+                &format!("amax={:e} d={:e} x[0]={:e} x[1]={:e} x[16]={:e} q[0]={} q[1]={} q[16]={}",
+                    am, d, x[0], x[1], x[16], q0, q1, q16),
+            );
+        }
+    }
     for t in 0..nt {
         quantize_row_q8_0_to(&x[t * dim..(t + 1) * dim], &mut buf[t * rowb..(t + 1) * rowb]);
     }
@@ -862,5 +880,24 @@ mod tests {
         assert_eq!(mins[2], 25);
         assert_eq!(mins[3], 35);
         assert_eq!(mins[4], 45);
+    }
+
+    #[test]
+    fn test_q8k_dot_simple() {
+        let mut x = vec![0u8; Q8B];
+        let mut y = vec![0u8; Q8B];
+        let dx = 0.5f32; let dy = 2.0f32;
+        let dx_bits = f32_to_fp16(dx).to_le_bytes();
+        let dy_bits = f32_to_fp16(dy).to_le_bytes();
+        x[0] = dx_bits[0]; x[1] = dx_bits[1];
+        y[0] = dy_bits[0]; y[1] = dy_bits[1];
+        for j in 0..32 { x[2 + j] = (j as i8) as u8; y[2 + j] = (31 - j as i8) as u8; }
+        let result = dot_q8_0_q8_0(&x, &y);
+        let mut ref_sum = 0.0f32;
+        for j in 0..32 {
+            ref_sum += ((j as i8) as f32 * dx) * (((31 - j) as i8) as f32 * dy);
+        }
+        eprintln!("test_q8k_dot_simple: result={:e} ref={:e} diff={:e}", result, ref_sum, (result - ref_sum).abs());
+        assert!((result - ref_sum).abs() < 0.01);
     }
 }
