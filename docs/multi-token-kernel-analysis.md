@@ -251,5 +251,7 @@ llama.cpp's C reference in `gguf-py/tests/test_quants.py`.
 | GQA attention (nkv=1) | `verify_attention.py` vs ba dump | ✅ cos = 0.9999839613 |
 | SwiGLU activation | manual vs swiglu dump | ✅ values plausible |
 
-All 13 verified paths correct. The Q5_K_M model still produces garbled output.
-Root cause remains unidentified.
+All 14 verified paths correct. The Q5_K_M model still produces garbled output.
+Model file confirmed working with llama-cli. Root cause not in individual
+computations — likely in KV cache cross-layer integration or generation
+loop interaction.
