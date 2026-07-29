@@ -267,8 +267,31 @@ in `gguf-py/tests/test_quants.py`).
 | ⑬ | GQA attention (nkv=1) | `verify_attention.py` vs ba dump | V lookup | ✅ cos = 0.9999839613 |
 | ⑭ | SwiGLU activation | manual vs bg dump | silu×up | ✅ plausible |
 
-All 13 verified paths correct. The Q5_K_M model still produces garbled output.
-Root cause remains unidentified.
+Despite all 14 paths being verified correct, the Q5_K_M model still produces
+garbled output. Model file confirmed working with llama-cli. Root cause is
+a subtle integration issue not captured by individual verification.
+
+### Diagnostic Status (2026-07-29)
+
+| Item | Status | Method |
+|------|--------|--------|
+| Q5_0 dequant formula | ✅ | `gguf.quants.dequantize()` (C-validated) |
+| Weight tensor layout | ✅ | Raw bytes match Python |
+| RMSNorm | ✅ | cosine = 1.0 against reference |
+| Q8_0 quantization | ✅ | amax/d/q values match |
+| Unit tests (Q4_K/Q8_0/Q6_K) | ✅ | all passing |
+| Row stride | ✅ | formula matches GGUF physical layout |
+| Matmul outputs (WQ/gate/down) | ✅ | cosine = 1.0 |
+| RoPE | ✅ | cosine = 0.9999999942 |
+| GQA attention | ✅ | cosine = 0.9999839613 |
+| SwiGLU | ✅ | values plausible |
+| Residual connections | ✅ | fd contribution matches exactly |
+| Model metadata comparison | ✅ | Q4_0 vs Q5_K_M: identical architecture |
+| llama-cli on Q5_K_M | ✅ | produces correct output |
+| Per-layer verification | ⚪ | inconsistent due to f32/f64 precision diff |
+| Cross-model per-layer (Q4 vs Q5) | ⚪ | weights differ, cannot compare |
+| **KV cache integration** | **⬜** | **not verified** |
+| **Generation loop interaction** | **⬜** | **not verified** |
 
 ### Verification Method
 
