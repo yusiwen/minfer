@@ -217,6 +217,7 @@ pub fn forward(
             let l = &model.layers[il];
             rms_norm(&hidden, eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bn", &bn, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bn", &bn, nt, il == 2);
             crate::kernel::quant_matmul_f32_batch(&mut [
                 (l.wq.as_ref().unwrap(), &mut bq, nqt),
                 (l.wk.as_ref().unwrap(), &mut bk, nkt),
@@ -226,6 +227,7 @@ pub fn forward(
             if let Some(b) = &l.bk { add_bias(&mut bk, b.data_f32(), nt, nkt); }
             if let Some(b) = &l.bv { add_bias(&mut bv, b.data_f32(), nt, nkt); }
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bq", &bq, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bq", &bq, nt, il == 2);
             apply_rope(&mut bq, positions, nh, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bq_rope", &bq, nt, il == 0);
             apply_rope(&mut bk, positions, nk, hd, hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style);
@@ -235,6 +237,7 @@ pub fn forward(
             gqa_attn(&bq, &kv_cache.layers[il].k[..nkv * nkt], &kv_cache.layers[il].v[..nkv * nkt],
                 positions, nt, nkv, nh, nk, hd, hd_kv, nkt, &mut ba, &mut scrs_buf[..nkv], hp.attention_scale());
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_ba", &ba, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_ba", &ba, nt, il == 2);
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
             unsafe {
                 crate::vec_ops::vec_add_f32(hidden.len(),
@@ -250,6 +253,8 @@ pub fn forward(
                 (l.ffn_up.as_ref().unwrap(),   &mut bf, nf),
             ], &ffn_in, ne, nt);
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bg", &bg, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bg", &bg, nt, il == 2);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bf", &bf, nt, il == 2);
             let len = nt * nf;
             unsafe {
                 crate::vec_ops::vec_silu_f32(len,
@@ -261,8 +266,10 @@ pub fn forward(
                     &bf);
             }
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_swiglu", &bg, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_swiglu", &bg, nt, il == 2);
             crate::kernel::quant_matmul_f32(l.ffn_down.as_ref().unwrap(), &bg[..nt * nf], &mut bn, ne, nf, nt);
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_fd", &bn, nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_fd", &bn, nt, il == 2);
             unsafe {
                 crate::vec_ops::vec_add_f32(hidden.len(),
                     std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),

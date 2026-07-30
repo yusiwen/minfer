@@ -43,7 +43,7 @@ cargo build --release --features debug_dump
 # Run Q4_0 (GPU on Apple Silicon, CPU on other platforms)
 ./target/release/minfer ~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf "hello"
 
-# Run Q4_K_M (CPU — Q5_0 not optimized for Metal yet)
+# Run Q4_K_M (GPU on Apple Silicon when available)
 ./target/release/minfer ~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf "hello"
 
 # Skip chat template (raw prompt)
@@ -115,7 +115,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 |-------|-----|---------|-------|
 | Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (361 tok/s) | All weights Q4_0 |
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ (3.2s) | ✓ (226 tok/s) | Q5_0/Q8_0/Q4_K/Q6_K mixed |
-| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✗ (乱码) | ✗ | Q5_1/Q8_0/Q5_K/Q6_K mixed, WIP |
+| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✗ (乱码) | ✗ | Q5_1/Q8_0/Q5_K/Q6_K, Q5_1/Q5_K ops verified, composed output diverges at layer 3
 
 ## Known Issues
 
@@ -134,12 +134,25 @@ The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`
 - **Root cause found & fixed**: `*(uint32_t *)(block + 2)` reads qh at a 2-byte aligned address — undefined behavior on ARM/Metal. Fixed by reading 4 individual bytes and combining. Verified via `kernel_q5_0_debug` (single-block dequant matches CPU bit-for-bit).
 - **Verified working**: CPU vs GPU per-layer comparison shows all 24 layers with cos ≥ 0.998. Output matches CPU ("Hello! How can I assist you today?").
 
-### Q5_1 (Q5_K_M model) — partially implemented
+### Q5_1 (Q5_K_M model) — CPU path implemented, model not working
 Q5_1 format: d(f16,2) + m(f16,2) + qh(u32,4) + qs(u8,16) = 24 bytes per 32 elements. Dequant: `val = d × unsigned_5bit + m` (no -16 offset — differs from Q5_0).
 
 - **CPU path**: implemented (`TensorType::Q5_1`, `dot_q5_1_q8_0`, `embed_tokens` branch, `cpu_quant_matmul` dispatch). Unit test passes.
-- **Status**: model loads and runs, produces reasonable norms (embed=0.31, l0_out=10.0), but output garbled. Root cause TBD.
-- **MPS GPU**: not yet registered/implemented.
+- **Q5_K path**: `dot_q5_k_q8_0` implemented, deinterleave + signed formula verified correct.
+
+**Verification results** (per-layer comparison vs llama-simple CPU):
+- Layer 0-2: cos ≥ 0.9998 ✓
+- **Layer 3 (blk.2.ffn_down = Q5_K)**: cos drops to 0.665 ✗
+- **Attention path (layer 2)**: matches llama (cos=0.9998) ✓ — rule out attention/KV/Q5_1
+- **ffn_norm (RMSNorm)**: matches llama (cos≥0.999) ✓ — rule out RMSNorm
+- **ffn_out (gate+up+Swiglu+down)**: diverges — cos 0.99/0.11/0.28 for tokens 0/1/2
+- All individual ops independently verified (Python vs minfer):
+  - Q5_1 attention projection ✓, Q5_K weight bytes ✓, Q5_K deinterleave ✓
+  - Q5_K dequant weights cos=0.99999994, Q5_K full matmul ratio≈1.0, SwiGLU cos=1.0
+- **Root cause**: divergence is inside `build_ffn` (gate/up projection + SwiGLU + ffn_down). Since ffn_norm matches but ffn_out diverges, the issue is in Q5_1 gate/up projections or the subsequent SwiGLU/down chain. Q8_0 vs Q8_1 activation quantization difference between minfer and llama.cpp for Q5_1 is a likely contributor.
+- **Next step**: dump llama.cpp's gate/up/swiglu intermediate values from `build_ffn` and compare with minfer's `layer2_bg`/`layer2_bf`/`layer2_swiglu` for element-level comparison.
+
+- **MPS GPU**: Q5_1 not yet registered/implemented in Metal shader.
 
 ### KV Head Dimension (n_kv_embd)
 Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.

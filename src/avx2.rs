@@ -251,6 +251,72 @@ fn dot_q5_1_q8_0_scalar(q5: &[u8], q8: &[u8], nb: usize) -> f32 {
 }
 
 // ============================================================
+// Q5_K × Q8_0 dot product
+// Q5_K: 256 elements / superblock, 8 subblocks × 32 elements, 176 bytes
+// Q8_0: 32 elements / block, 34 bytes
+// weight = d * sc[sub] * (unsigned_5bit - 16) - dmin * mn[sub]
+// ============================================================
+
+#[inline]
+pub fn dot_q5_k_q8_0(q5: &[u8], q8: &[u8]) -> f32 {
+    debug_assert!(q5.len() % 176 == 0);
+    dot_q5_k_q8_0_scalar(q5, q8)
+}
+
+fn dot_q5_k_q8_0_scalar(q5: &[u8], q8: &[u8]) -> f32 {
+    let n_super = q5.len() / 176;
+    let mut sum = 0.0f32;
+
+    for i in 0..n_super {
+        let q5b = &q5[i * 176..];
+        let q8b = &q8[i * 8 * Q8B..];
+
+        let d    = block::fp16_to_f32(u16::from_le_bytes([q5b[0], q5b[1]]));
+        let dmin = block::fp16_to_f32(u16::from_le_bytes([q5b[2], q5b[3]]));
+        let sc_bytes = <&[u8; 12]>::try_from(&q5b[4..16]).unwrap();
+        let (scales, mins) = block::unpack_q4k_scales(sc_bytes);
+
+        let qh = &q5b[16..48];
+        let qs = &q5b[48..176];
+
+        // Deinterleave qs into 8 subblocks × 32 nibbles
+        let mut nb = [0i32; 256];
+        for ci in 0..4 {
+            let chunk = &qs[ci * 32..ci * 32 + 32];
+            for l in 0..32 {
+                nb[(2 * ci) * 32 + l] = (chunk[l] & 0x0F) as i32;
+                nb[(2 * ci + 1) * 32 + l] = (chunk[l] >> 4) as i32;
+            }
+        }
+
+        for s in 0..8 {
+            let dl = d * scales[s] as f32;
+            let ml = dmin * mins[s] as f32;
+
+            let q8blk = &q8b[s * Q8B..];
+            let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+            let q8qs = &q8blk[2..];
+
+            let mut sum_sub = 0i32;
+            let mut sum_q8  = 0i32;
+            for k in 0..32 {
+                // unsigned_5bit = nibble | (high_bit << 4)
+                let hbit = ((qh[s * 4 + k / 8] >> (k % 8)) & 1) as i32;
+                let uval = nb[s * 32 + k] | (hbit << 4);
+                let q8v = q8qs[k] as i8 as i32;
+                sum_sub += uval * q8v;
+                sum_q8  += q8v;
+            }
+            // w = dl * (uval - 16) - ml
+            // dot = d_q8 * Σ(w * q8v) = d_q8 * (dl * Σ(uval*q8v) + (-dl*16 - ml) * Σ(q8v))
+            sum += d_q8 * (dl * sum_sub as f32 + (-dl * 16.0 - ml) * sum_q8 as f32);
+        }
+    }
+
+    sum
+}
+
+// ============================================================
 // Q4_K × Q8_0 dot product
 // Q4_K: 256 elements / superblock, 8 subblocks × 32 elements, 144 bytes
 // Q8_0: 32 elements / block, 34 bytes
