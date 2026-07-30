@@ -76,9 +76,6 @@ pub fn cpu_quant_matmul_f32(
     w: &Tensor, x: &[f32], out: &mut [f32],
     od: usize, id: usize, nt: usize,
 ) {
-    if w.ttype == TensorType::Q5_K {
-        return cpu_q5_k_matmul_f32(w, x, out, od, id, nt);
-    }
     let nbe = id / 32;
     let mut qb = vec![0u8; nt * nbe * Q8B];
     crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut qb);
@@ -122,6 +119,18 @@ pub fn cpu_quant_matmul(
                 let wrow = &wb[o * ws..(o + 1) * ws];
                 for t in 0..nt {
                     out[t * od + o] = crate::avx2::dot_q4_k_q8_0(
+                        wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
+                }
+            }
+        }
+        TensorType::Q5_K => {
+            let nk = id / 256;
+            let ws = nk * 176;
+            let wb = w.data();
+            for o in 0..od {
+                let wrow = &wb[o * ws..(o + 1) * ws];
+                for t in 0..nt {
+                    out[t * od + o] = crate::avx2::dot_q5_k_q8_0(
                         wrow, &x[t * (id / 32) * Q8B..(t + 1) * (id / 32) * Q8B]);
                 }
             }
@@ -228,6 +237,42 @@ fn cpu_q5_k_matmul_f32(
                         sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
                         sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
                     }
+                }
+            }
+            out[t * od + o] = sum;
+        }
+    }
+}
+
+/// Q5_1 × f32 matmul: dequantize Q5_1 weights on-the-fly and compute f32 dot product.
+/// Block: d(f16,2) + m(f16,2) + qh(u8,4) + qs(u8,16) = 24 bytes per 32 elements.
+/// Dequant: val = d × unsigned_5bit + m.
+fn cpu_q5_1_matmul_f32(
+    w: &Tensor, x: &[f32], out: &mut [f32],
+    od: usize, id: usize, nt: usize,
+) {
+    use crate::block::fp16_to_f32;
+    let nb = id / 32;
+    let ws = nb * 24;
+    let wb = w.data();
+    for o in 0..od {
+        let wrow = &wb[o * ws..(o + 1) * ws];
+        for t in 0..nt {
+            let a_base = t * id;
+            let mut sum = 0.0f32;
+            for b in 0..nb {
+                let off = b * 24;
+                let d = fp16_to_f32(u16::from_le_bytes([wrow[off],     wrow[off + 1]]));
+                let m = fp16_to_f32(u16::from_le_bytes([wrow[off + 2], wrow[off + 3]]));
+                let qh = u32::from_le_bytes([wrow[off+4], wrow[off+5], wrow[off+6], wrow[off+7]]);
+                let qs = &wrow[off + 8..off + 24];
+                for j in 0..16 {
+                    let u_lo = (qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4;
+                    let u_hi = ((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4;
+                    let w0 = u_lo as f32 * d + m;
+                    let w1 = u_hi as f32 * d + m;
+                    sum += w0 * x[a_base + b * 32 + j]
+                        + w1 * x[a_base + b * 32 + j + 16];
                 }
             }
             out[t * od + o] = sum;

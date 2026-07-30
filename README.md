@@ -31,31 +31,31 @@ weight types work with f32 activations.
 | **Q4_0** | 4 | 18 B / 32 val | ✅ | ✅ | ✅ | ✅ |
 | **Q4_1** | 4 | 20 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q4_K** | 4 | 144 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
+| **Q5_0** | 5 | 22 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
-¹ Metal standalone `quant_matmul_f32` only handles Q4_0; Q4_1/Q4_K/Q6_K/Q8_0
+¹ Metal standalone `quant_matmul_f32` only handles Q4_0; Q4_1/Q4_K/Q5_0/Q6_K/Q8_0
 require the `layer_gpu` full-layer offload path.  
 ² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
 
 **GPU grouping restriction** (CUDA and Metal): within one transformer layer,
 all 7 weight matrices (WQ, WK, WV, WO, FFN Gate, FFN Up, FFN Down) must be
 either **all in the Q4 group** (Q4_0 / Q4_1) or **all in the QK group**
-(Q4_K / Q6_K). Mixed groups within a layer are rejected and fall back to CPU.
+(Q4_K / Q5_0 / Q6_K). Mixed groups within a layer are rejected and fall back
+to CPU.
 
 ### Not Yet Supported
 
 | Category | Types |
 |----------|-------|
-| Legacy Q5 | Q5_0, Q5_1 |
 | K-quants | Q2_K, Q3_K, Q5_K, Q8_K |
 | I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS |
-| Other | Q1_0, BF16, TQ1_0, TQ2_0, MXFP4, NVFP4 |
+| Other | Q5_1, Q1_0, BF16, TQ1_0, TQ2_0, MXFP4, NVFP4 |
 
-The GGUF parser can read metadata and compute tensor shapes for these types,
-and block layout structs are defined in `src/block.rs` for size calculations,
-but **no matmul kernel exists** — inference would fail at runtime.
+Q5_1 (Q5_K_M models) has a CPU matmul kernel and loads correctly, but inference
+produces garbled output — see AGENTS.md for details.
 
 ## Supported Model Architectures
 
@@ -140,7 +140,8 @@ cargo run --release -- list
 |---------|----------|-------|---------|--------|
 | CPU (AVX2) | i7-1260P | Qwen2-0.5B | ~27 tok/s | ~21 tok/s |
 | CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2-0.5B | ~400 tok/s | ~330 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~226 tok/s | ~207 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~361 tok/s | ~290 tok/s |
 
 GPU decode optimizations: CUDA Graph capture/replay (single `cudaGraphLaunch`
 per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
@@ -164,6 +165,7 @@ src/
 ├── tensor.rs        # Tensor struct + data access
 ├── vec_ops.rs       # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
 ├── cache.rs         # KV cache (shared, architecture-agnostic)
+├── dump.rs          # Debug dump module (gated by `--features debug_dump`)
 ├── sampler.rs       # Greedy / temperature / top-k / top-p sampling
 ├── tokenizer.rs     # BPE tokenizer (self-contained, GGUF-backed)
 ├── template.rs      # Chat template detection + formatting
