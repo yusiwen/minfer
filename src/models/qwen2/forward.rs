@@ -36,6 +36,7 @@ pub fn forward(
     crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_embed_out", &hidden, nt);
 
     let mut run_cpu = true;
+    let mut cpu_start_layer = 0; // start CPU from this layer (0 = all layers)
 
     // ─── MPS (Apple Silicon) GPU path ──────────────────────────
     #[cfg(target_os = "macos")]
@@ -75,6 +76,7 @@ pub fn forward(
                 let l = &model.layers[il];
                 if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32) {
                     gpu_failed = true;
+                    cpu_start_layer = il;
                     break;
                 }
                 #[cfg(feature = "debug_dump")]
@@ -91,9 +93,10 @@ pub fn forward(
                 }
             }
             if gpu_failed {
-                // GPU path failed — sync KV and fall back to CPU
+                // GPU path failed at cpu_start_layer — submit partial work, continue on CPU
+                cb.submit();
+                mps.download_hidden(&mut hidden);
                 mps.sync_kv_to_cpu(kv_cache, model.n_layer());
-                // cb dropped without submit; hidden was not uploaded so stays CPU-valid
             } else {
                 let gpu_output = mps.output_norm_gpu(
                     &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
@@ -119,6 +122,7 @@ pub fn forward(
                 mps.download_hidden(&mut hidden);
                 mps.sync_kv_to_cpu(kv_cache, model.n_layer());
                 run_cpu = false;
+                cpu_start_layer = model.n_layer(); // all layers done on GPU, only output_norm on CPU
             }
         }
     }
@@ -207,13 +211,14 @@ pub fn forward(
                 }
                 cuda.download_hidden(&mut hidden);
                 run_cpu = false;
+                cpu_start_layer = model.n_layer(); // all layers done on GPU, only output_norm on CPU
             }
         }
     }
 
-    if run_cpu {
+    if run_cpu || cpu_start_layer < model.n_layer() {
         // ─── CPU path ──────────────────────────────────────────────
-        for il in 0..model.n_layer() {
+        for il in cpu_start_layer..model.n_layer() {
             let l = &model.layers[il];
             rms_norm(&hidden, eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bn", &bn, nt, il == 0);
@@ -437,13 +442,11 @@ fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usi
                         let dl = d * scales[sub] as f32;
                         let ml = dmin * mins[sub] as f32;
                         let base = doff + s * 256 + sub * 32;
-                        let h0_base = sub * 4;
                         for j in 0..32 {
-                            let hidx = h0_base + j / 8;
-                            let shift = j % 8;
-                            let hi_bit = ((qh[hidx + if j < 16 { 0 } else { 2 }] >> shift) & 1) as u8;
-                            // Q5_K signed: (unsigned_5bit - 16) * dl - ml
-                            let w = nb[sub * 32 + j] as f32 + 16.0 * hi_bit as f32 - 16.0;
+                            // Q5_K qh layout: element (sub s, pos j) high bit = qh[j] bit s
+                            let hi_bit = ((qh[j] >> sub) & 1) as u8;
+                            // Q5_K unsigned (no -16, unlike Q5_0): w = unsigned_5bit * dl - ml
+                            let w = nb[sub * 32 + j] as f32 + 16.0 * hi_bit as f32;
                             out[base + j] = dl * w - ml;
                         }
                     }

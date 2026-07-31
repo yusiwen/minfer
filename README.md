@@ -32,11 +32,13 @@ weight types work with f32 activations.
 | **Q4_1** | 4 | 20 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q4_K** | 4 | 144 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q5_0** | 5 | 22 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
+| **Q5_1** | 5 | 24 B / 32 val | ✅ | ❌ | ❌ | ✅¹ |
+| **Q5_K** | 5 | 176 B / 256 val | ✅ | ❌ | ❌ | ✅¹ |
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
-¹ Metal standalone `quant_matmul_f32` only handles Q4_0; Q4_1/Q4_K/Q5_0/Q6_K/Q8_0
+¹ Metal standalone `quant_matmul_f32` only handles Q4_0; Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0
 require the `layer_gpu` full-layer offload path.  
 ² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
 
@@ -44,18 +46,19 @@ require the `layer_gpu` full-layer offload path.
 all 7 weight matrices (WQ, WK, WV, WO, FFN Gate, FFN Up, FFN Down) must be
 either **all in the Q4 group** (Q4_0 / Q4_1) or **all in the QK group**
 (Q4_K / Q5_0 / Q6_K). Mixed groups within a layer are rejected and fall back
-to CPU.
+to CPU. Q5_1 / Q5_K (Metal f32 path) are exempt from this grouping. Layers with
+any unsupported weight type (e.g. `Raw`) fall back to CPU per-layer.
 
 ### Not Yet Supported
 
 | Category | Types |
 |----------|-------|
-| K-quants | Q2_K, Q3_K, Q5_K, Q8_K |
+| K-quants | Q2_K, Q3_K, Q8_K |
 | I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS |
-| Other | Q5_1, Q1_0, BF16, TQ1_0, TQ2_0, MXFP4, NVFP4 |
+| Other | Q1_0, BF16, TQ1_0, TQ2_0, MXFP4, NVFP4 |
 
-Q5_1 (Q5_K_M models) has a CPU matmul kernel and loads correctly, but inference
-produces garbled output — see AGENTS.md for details.
+Q5_K and Q5_1 are **fully supported on CPU and Metal GPU** — Q5_K_M models run
+at full GPU speed. See `AGENTS.md` for the Q5_K formula + qh-indexing fixes.
 
 ## Supported Model Architectures
 

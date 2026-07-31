@@ -32,6 +32,10 @@ struct MpsStateInner {
     pl_q6_k_f32_multi: metal::ComputePipelineState,
     pl_q5_0_f32: metal::ComputePipelineState,
     pl_q5_0_f32_multi: metal::ComputePipelineState,
+    pl_q5_1_f32: metal::ComputePipelineState,
+    pl_q5_1_f32_multi: metal::ComputePipelineState,
+    pl_q5_k_f32: metal::ComputePipelineState,
+    pl_q5_k_f32_multi: metal::ComputePipelineState,
     pl_quantize_q8_0: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
@@ -184,6 +188,32 @@ impl MpsCommandBuffer<'_> {
                 self.set_params(5, &(nt as i32));
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+            }
+            TensorType::Q5_1 => {
+                self.enc.set_compute_pipeline_state(
+                    if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
+                );
+                self.enc.set_buffer(0, Some(wb), 0);
+                self.enc.set_buffer(1, Some(x), 0);
+                self.enc.set_buffer(2, Some(out), 0);
+                self.set_params(3, &(od as i32));
+                self.set_params(4, &(id as i32));
+                self.set_params(5, &(nt as i32));
+                let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+            }
+            TensorType::Q5_K => {
+                self.enc.set_compute_pipeline_state(
+                    if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
+                );
+                self.enc.set_buffer(0, Some(wb), 0);
+                self.enc.set_buffer(1, Some(x), 0);
+                self.enc.set_buffer(2, Some(out), 0);
+                self.set_params(3, &(od as i32));
+                self.set_params(4, &(id as i32));
+                self.set_params(5, &(nt as i32));
+                let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
             }
             _ => {
                 self.enc.set_compute_pipeline_state(
@@ -484,6 +514,10 @@ impl MpsState {
             let pl_q6_k_f32_multi = get_pl("kernel_q6_k_f32_matmul_multi")?;
             let pl_q5_0_f32 = get_pl("kernel_q5_0_f32_matmul")?;
             let pl_q5_0_f32_multi = get_pl("kernel_q5_0_f32_matmul_multi")?;
+            let pl_q5_1_f32 = get_pl("kernel_q5_1_f32_matmul")?;
+            let pl_q5_1_f32_multi = get_pl("kernel_q5_1_f32_matmul_multi")?;
+            let pl_q5_k_f32 = get_pl("kernel_q5_k_f32_matmul")?;
+            let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_quantize_q8_0 = get_pl("kernel_quantize_q8_0")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
@@ -514,6 +548,10 @@ impl MpsState {
                 pl_q6_k_f32_multi,
                 pl_q5_0_f32,
                 pl_q5_0_f32_multi,
+                pl_q5_1_f32,
+                pl_q5_1_f32_multi,
+                pl_q5_k_f32,
+                pl_q5_k_f32_multi,
                 pl_quantize_q8_0,
                 pl_get_rows_q4_0,
                 pl_rms_norm,
@@ -898,10 +936,10 @@ impl MpsState {
         let ffn_up   = l.ffn_up.as_ref().unwrap();
         let ffn_down = l.ffn_down.as_ref().unwrap();
 
-        // Q5_K/Raw not supported in Metal shaders — fall back to CPU
+        // Raw not supported in Metal shaders — fall back to CPU
         let all_types = [wq.ttype, wk.ttype, wv.ttype, wo.ttype,
                          ffn_gate.ttype, ffn_up.ttype, ffn_down.ttype];
-        if all_types.iter().any(|t| *t == TensorType::Q5_K || *t == TensorType::Raw) {
+        if all_types.iter().any(|t| *t == TensorType::Raw) {
             return false;
         }
 

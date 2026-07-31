@@ -228,11 +228,12 @@ fn cpu_q5_k_matmul_f32(
                     let dl = d * sc[sub] as f32;
                     let ml = dm * mn[sub] as f32;
                     for j in 0..16 {
-                        let h0 = ((qh[sub * 4 + j / 8] >> (j % 8)) & 1) as u8;
-                        let h1 = ((qh[sub * 4 + j / 8 + 2] >> (j % 8)) & 1) as u8;
-                        // Q5_K signed: w = (unsigned_5bit - 16) * dl - ml
-                        let w0 = nb[sub * 32 + j] as f32 + 16.0 * h0 as f32 - 16.0;
-                        let w1 = nb[sub * 32 + j + 16] as f32 + 16.0 * h1 as f32 - 16.0;
+                        // Q5_K qh layout: element (sub s, pos j) high bit = qh[j] bit s
+                        let h0 = ((qh[j] >> sub) & 1) as u8;
+                        let h1 = ((qh[j + 16] >> sub) & 1) as u8;
+                        // Q5_K unsigned (no -16, unlike Q5_0): w = unsigned_5bit * dl - ml
+                        let w0 = nb[sub * 32 + j] as f32 + 16.0 * h0 as f32;
+                        let w1 = nb[sub * 32 + j + 16] as f32 + 16.0 * h1 as f32;
                         let off_a = a_base + s * 256 + sub * 32;
                         sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
                         sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
