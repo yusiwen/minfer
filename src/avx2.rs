@@ -300,16 +300,17 @@ fn dot_q5_k_q8_0_scalar(q5: &[u8], q8: &[u8]) -> f32 {
             let mut sum_sub = 0i32;
             let mut sum_q8  = 0i32;
             for k in 0..32 {
-                // unsigned_5bit = nibble | (high_bit << 4)
-                let hbit = ((qh[s * 4 + k / 8] >> (k % 8)) & 1) as i32;
+                // Q5_K qh layout: element (sub s, pos k) high bit = qh[k] bit s
+                // (NOT qh[s*4+k/8] bit k%8 — that was a bug; see llama quantize_row_q5_K_impl)
+                let hbit = ((qh[k] >> s) & 1) as i32;
                 let uval = nb[s * 32 + k] | (hbit << 4);
                 let q8v = q8qs[k] as i8 as i32;
                 sum_sub += uval * q8v;
                 sum_q8  += q8v;
             }
-            // w = dl * (uval - 16) - ml
-            // dot = d_q8 * Σ(w * q8v) = d_q8 * (dl * Σ(uval*q8v) + (-dl*16 - ml) * Σ(q8v))
-            sum += d_q8 * (dl * sum_sub as f32 + (-dl * 16.0 - ml) * sum_q8 as f32);
+            // Q5_K is unsigned (no -16, unlike Q5_0): w = dl * uval - ml
+            // dot = d_q8 * Σ(w * q8v) = d_q8 * (dl * Σ(uval*q8v) - ml * Σ(q8v))
+            sum += d_q8 * (dl * sum_sub as f32 - ml * sum_q8 as f32);
         }
     }
 
@@ -550,7 +551,7 @@ fn quantize_scalar(x: &[f32], y: &mut [u8], k: usize) {
         let db = half::f16::from_f32(d).to_bits().to_le_bytes();
         let yo = i * Q8B;
         y[yo] = db[0]; y[yo + 1] = db[1];
-        for j in 0..32 { y[yo + 2 + j] = (x[i * 32 + j] * id).round().clamp(-128.0, 127.0) as i8 as u8; }
+        for j in 0..32 { y[yo + 2 + j] = (x[i * 32 + j] * id).round_ties_even().clamp(-128.0, 127.0) as i8 as u8; }
     }
 }
 
@@ -1084,5 +1085,107 @@ mod tests {
         // ref = 32*0.5 + 2*2*Σ(j=0..15) = 16 + 4*120 = 16 + 480 = 496
         eprintln!("test_q5_1_dot: result={:e} ref={:e} diff={:e}", result, ref_sum, (result - ref_sum).abs());
         assert!((result - ref_sum).abs() < 1.0, "result={} ref={}", result, ref_sum);
+    }
+
+    fn make_q5k_block(d: f32, dmin: f32, scales: &[u8; 8], mins: &[u8; 8], vals: &[u8; 256]) -> Vec<u8> {
+        // Build a Q5_K super-block (256 elems, 176 bytes) matching llama's quantize_row_q5_K_impl layout:
+        //   qs byte (s/2)*32 + p holds sub s even->low nibble, s odd->high nibble
+        //   qh[p] bit s = high bit of element (sub s, pos p)
+        let mut block = vec![0u8; 176];
+        let db = f32_to_fp16(d).to_le_bytes();
+        let dmb = f32_to_fp16(dmin).to_le_bytes();
+        block[0] = db[0]; block[1] = db[1];
+        block[2] = dmb[0]; block[3] = dmb[1];
+        // scales/mins in get_scale_min_k4 packing (same as Q4_K)
+        let mut raw = [0u8; 12];
+        for j in 0..4 {
+            raw[j] = scales[j] & 0x3F;
+            raw[j + 4] = mins[j] & 0x3F;
+        }
+        for j in 4..8 {
+            raw[j] = (scales[j] & 0xF) | ((mins[j] & 0xF) << 4);
+            raw[j - 4] |= (scales[j] & 0x30) << 2;
+            raw[j - 0] |= (mins[j] & 0x30) << 2;
+        }
+        block[4..16].copy_from_slice(&raw);
+        let mut qh = [0u8; 32];
+        for s in 0..8usize {
+            for p in 0..32usize {
+                let u = vals[s * 32 + p];
+                let qs_idx = (s / 2) * 32 + p;
+                let nib = u & 0x0F;
+                if s % 2 == 0 {
+                    block[48 + qs_idx] |= nib;
+                } else {
+                    block[48 + qs_idx] |= nib << 4;
+                }
+                if u & 0x10 != 0 {
+                    qh[p] |= 1 << s;
+                }
+            }
+        }
+        block[16..48].copy_from_slice(&qh);
+        block
+    }
+
+    fn independent_dot_q5k(q5: &[u8], q8: &[u8]) -> f32 {
+        // Truly independent: dequant weights (unsigned formula) then dot with dequantized q8.
+        let n_super = q5.len() / 176;
+        let mut sum = 0.0f32;
+        for i in 0..n_super {
+            let q5b = &q5[i * 176..];
+            let q8b = &q8[i * 8 * Q8B..];
+            let d = block::fp16_to_f32(u16::from_le_bytes([q5b[0], q5b[1]]));
+            let dm = block::fp16_to_f32(u16::from_le_bytes([q5b[2], q5b[3]]));
+            let sc_arr: &[u8; 12] = q5b[4..16].try_into().unwrap();
+            let (sc, mn) = crate::block::unpack_q4k_scales(sc_arr);
+            let qh = &q5b[16..48];
+            let qs = &q5b[48..176];
+            let mut nb = [0i32; 256];
+            for ci in 0..4 {
+                let chunk = &qs[ci * 32..ci * 32 + 32];
+                for l in 0..32 {
+                    nb[(2 * ci) * 32 + l] = (chunk[l] & 0x0F) as i32;
+                    nb[(2 * ci + 1) * 32 + l] = (chunk[l] >> 4) as i32;
+                }
+            }
+            let mut x = [0.0f32; 256];
+            for s in 0..8 {
+                let q8blk = &q8b[s * Q8B..];
+                let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
+                for j in 0..32 {
+                    x[s * 32 + j] = d_q8 * q8blk[2 + j] as i8 as f32;
+                }
+            }
+            for s in 0..8 {
+                let dl = d * sc[s] as f32;
+                let ml = dm * mn[s] as f32;
+                for p in 0..32 {
+                    // CORRECT qh layout: qh[pos] bit sub
+                    let hbit = ((qh[p] >> s) & 1) as i32;
+                    let u = nb[s * 32 + p] | (hbit << 4);
+                    sum += (dl * u as f32 - ml) * x[s * 32 + p];
+                }
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn test_q5k_independent_reference() {
+        let mut rng: u32 = 7777;
+        let mut next = || -> u8 { rng = rng.wrapping_mul(1103515245).wrapping_add(12345); (rng >> 16) as u8 };
+        let sc: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let mn: [u8; 8] = std::array::from_fn(|_| next() % 64);
+        let vals: [u8; 256] = std::array::from_fn(|_| next() % 32);
+        let q5k = make_q5k_block(0.0123, 0.0045, &sc, &mn, &vals);
+        let mut q8d = Vec::new();
+        for _ in 0..8 {
+            let qv: [i8; 32] = std::array::from_fn(|_| next() as i8);
+            q8d.extend_from_slice(&make_q80_block(0.03, &qv));
+        }
+        let indep = independent_dot_q5k(&q5k, &q8d);
+        let impl_result = dot_q5_k_q8_0(&q5k, &q8d);
+        assert!((indep - impl_result).abs() < 0.01, "Q5K independent ref mismatch: diff={}", (indep - impl_result).abs());
     }
 }

@@ -23,7 +23,7 @@ src/
 ├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja)
 ├── download/mod.rs  # HuggingFace + Ollama model auto-download
 ├── metal.rs         # Apple MPS (Metal) GPU backend + dispatch
-├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q6_K/Q8_0 kernels)
+├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 kernels)
 └── models/
     ├── mod.rs       # ModelDef trait + factory dispatch
     └── qwen2/
@@ -91,8 +91,8 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 - **Q4_K** — 4-bit K-quant super-block (nibble layout fixed)
 - **Q6_K** — 6-bit K-quant
 - **Q5_0** — 5-bit, CPU path works correctly, Q5_0×Q8_0 dot product implemented
-- **Q5_K** — 5-bit K-quant, nibble layout fixed (CLI path verified, Q5_K_M model WIP)
-- **Q5_1** — 5-bit with min (Q5_K_M model), CPU path implemented, formula verified
+- **Q5_K** — 5-bit K-quant, nibble + qh layout fixed, unsigned formula verified (Q5_K_M works CPU + Metal GPU)
+- **Q5_1** — 5-bit with min (Q5_K_M model), CPU + Metal GPU verified (j+16 qh indexing matches llama-ARM)
 
 ### Not supported (CLI)
 - Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_NL, etc.
@@ -105,8 +105,8 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 | Q4_K, Q6_K | ✓ (f32 path) | ✓ |
 | Q8_0 | ✓ (f32 path) | ✓ |
 | **Q5_0** | ✓ (f32 path, qh unaligned-read bug fixed) | ✓ |
-| **Q5_1** | ✗ | ✓ (formula verified, Q5_K_M model WIP) |
-| Q5_K | ✗ | ✓ |
+| **Q5_1** | ✓ (F32 path) | ✓ |
+| **Q5_K** | ✓ (f32 path, `kernel_q5_k_f32_matmul` + `_multi`) | ✓ |
 | F32 | ✓ (RMSNorm, biases, etc.) | ✓ |
 
 ## Model Support Matrix
@@ -115,7 +115,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 |-------|-----|---------|-------|
 | Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (361 tok/s) | All weights Q4_0 |
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ (3.2s) | ✓ (226 tok/s) | Q5_0/Q8_0/Q4_K/Q6_K mixed |
-| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✗ (乱码) | ✗ | Q5_1/Q8_0/Q5_K/Q6_K, Q5_1/Q5_K ops verified, composed output diverges at layer 3
+| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ (~250 tok/s) | Q5_1/Q8_0/Q5_K/Q6_K, formula + qh indexing FIXED, Q5_K Metal kernel added — full GPU |
 
 ## Known Issues
 
@@ -134,25 +134,33 @@ The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`
 - **Root cause found & fixed**: `*(uint32_t *)(block + 2)` reads qh at a 2-byte aligned address — undefined behavior on ARM/Metal. Fixed by reading 4 individual bytes and combining. Verified via `kernel_q5_0_debug` (single-block dequant matches CPU bit-for-bit).
 - **Verified working**: CPU vs GPU per-layer comparison shows all 24 layers with cos ≥ 0.998. Output matches CPU ("Hello! How can I assist you today?").
 
-### Q5_1 (Q5_K_M model) — CPU path implemented, model not working
-Q5_1 format: d(f16,2) + m(f16,2) + qh(u32,4) + qs(u8,16) = 24 bytes per 32 elements. Dequant: `val = d × unsigned_5bit + m` (no -16 offset — differs from Q5_0).
+### Q5_K formula + qh indexing bugs — FIXED (2026-07-31)
+**Q5_K_M garbled output had TWO root causes in minfer's Q5_K:**
 
-- **CPU path**: implemented (`TensorType::Q5_1`, `dot_q5_1_q8_0`, `embed_tokens` branch, `cpu_quant_matmul` dispatch). Unit test passes.
-- **Q5_K path**: `dot_q5_k_q8_0` implemented, deinterleave + signed formula verified correct.
+**Bug 1 (formula)**: minfer used the Q5_0-style **signed** formula `dl*(u-16)-ml`. llama.cpp's Q5_K (both CPU `dequantize_row_q5_K` and Metal `dequantize_q5_K`, unchanged since Oct 2023) uses **unsigned** `dl*u - ml`.
 
-**Verification results** (per-layer comparison vs llama-simple CPU):
-- Layer 0-2: cos ≥ 0.9998 ✓
-- **Layer 3 (blk.2.ffn_down = Q5_K)**: cos drops to 0.665 ✗
-- **Attention path (layer 2)**: matches llama (cos=0.9998) ✓ — rule out attention/KV/Q5_1
-- **ffn_norm (RMSNorm)**: matches llama (cos≥0.999) ✓ — rule out RMSNorm
-- **ffn_out (gate+up+Swiglu+down)**: diverges — cos 0.99/0.11/0.28 for tokens 0/1/2
-- All individual ops independently verified (Python vs minfer):
-  - Q5_1 attention projection ✓, Q5_K weight bytes ✓, Q5_K deinterleave ✓
-  - Q5_K dequant weights cos=0.99999994, Q5_K full matmul ratio≈1.0, SwiGLU cos=1.0
-- **Root cause**: divergence is inside `build_ffn` (gate/up projection + SwiGLU + ffn_down). Since ffn_norm matches but ffn_out diverges, the issue is in Q5_1 gate/up projections or the subsequent SwiGLU/down chain. Q8_0 vs Q8_1 activation quantization difference between minfer and llama.cpp for Q5_1 is a likely contributor.
-- **Next step**: dump llama.cpp's gate/up/swiglu intermediate values from `build_ffn` and compare with minfer's `layer2_bg`/`layer2_bf`/`layer2_swiglu` for element-level comparison.
+**Bug 2 (qh high-bit indexing)**: minfer read the 5th bit as `qh[sub*4 + pos/8] >> (pos%8)`. The correct layout (from `quantize_row_q5_K_impl`, llama-quants.c:1829-1844) is **`qh[pos]` bit `sub`** — qh byte index = element position within the 32-elem subblock, bit index = subblock number (0-7).
 
-- **MPS GPU**: Q5_1 not yet registered/implemented in Metal shader.
+**Evidence** (real `blk.2.ffn_down.weight` dequant):
+- unsigned formula: mean≈0, symmetric ✓ vs signed-16: mean=-0.008 ✗
+- correct qh indexing on llama's own swiglu: ffn_down cos=**0.99999902** vs llama; minfer's wrong indexing: 0.994
+
+**Fixed in 3 files × 2 bugs**:
+- `avx2.rs:dot_q5_k_q8_0_scalar` — formula + `(qh[k] >> s) & 1`
+- `forward.rs:embed_tokens` Q5_K branch — formula + `(qh[j] >> sub) & 1`
+- `kernel.rs:cpu_q5_k_matmul_f32` — formula + `(qh[j] >> sub) & 1`, `(qh[j+16] >> sub) & 1`
+
+**MPS GPU kernel** (added for full GPU support): `metal.metal` `kernel_q5_k_f32_matmul` + `_multi` (176 B/256-elem superblock, `get_scale_min_k4` scales, `qh[p] bit s` high bits, unsigned formula). Dispatch in `metal.rs` + MPS registration in `loader.rs`. Must be placed AFTER `get_scale_min_k4` in metal.metal (Metal requires declaration before use).
+
+**Why earlier verification missed it**: `scripts/verify_q5k_gate_up.py` reimplemented minfer's OWN (wrong) formula AND qh indexing, so "cos=1.0" only proved Python↔Rust self-consistency, not correctness vs llama.
+
+**Result**: Q5_K_M per-layer now matches llama (blk.2 cos=0.99999894, layers 4-21 = 0.99999971, no collapse at 22-23). CPU and MPS both produce correct output.
+
+### Q5_K_M — VERIFIED WORKING (2026-07-31)
+- CPU: "Hello! How can I assist you today?" ✓
+- **MPS GPU: full GPU support** ✓ — Q5_K Metal kernel (`kernel_q5_k_f32_matmul` + `_multi`) added, ~250 tok/s (prefill 282, gen 247). Per-layer GPU vs CPU cos ≥ 0.9999998 (layers 2-20), logits argmax matches llama.
+- Q4_0 / Q4_K_M: no regression ✓
+- llama.cpp dispatch for reference: Q5_1→Q8_1 activations (ARM `s` = fp16(d_q8·Σq8)), Q4_K/Q5_K/Q6_K→Q8_K, Q5_0/Q8_0→Q8_0. Q8_0 activations in minfer match llama to ~1e-6 (fp16-sum of Q8_1 confirmed NOT the cause).
 
 ### KV Head Dimension (n_kv_embd)
 Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.
@@ -164,7 +172,7 @@ Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=8
 3. **No ML frameworks** — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten loops.
 4. **Tensor data uses raw `&[u8]` interface** — avx2.rs dot products operate on byte slices, not structs.
 5. **GGUF padding rule**: `ggml_pad()`: `(x + n - 1) & !(n - 1)`.
-6. **Metal GPU fallback**: when `layer_gpu` fails (unsupported weight type, shader error), the engine silently falls back to CPU via `run_cpu = true`.
+6. **Metal GPU per-layer fallback**: when `layer_gpu` fails (e.g., unsupported weight type like `Raw`), the engine submits the partial GPU work, downloads the hidden state, and continues remaining layers on CPU. Q5_K is now GPU-supported.
 
 ## Adding a New Architecture
 

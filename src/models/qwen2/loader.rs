@@ -191,7 +191,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q5_1 | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_0) {
             mps.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             mps.register_weight(&ti.name, tensor.data());
@@ -199,7 +199,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     }
     #[cfg(feature = "cuda")]
     if let Some(cuda) = crate::cuda::CudaState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q5_1 | TensorType::Q6_K | TensorType::Q8_0) {
             cuda.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
@@ -285,15 +285,6 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
     // Override n_kv_embd from layer 0 K weight's actual output dimension
     if let Some(ti) = tensor_map.get(&tn::attn_k(0)) {
         hparams.n_kv_embd = ti.ne[1];
-    }
-
-    // Warn if model contains Q5_K weights (unsupported by MPS GPU shader)
-    let has_q5_k = layers.iter().any(|l| {
-        [&l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_gate, &l.ffn_up, &l.ffn_down]
-            .iter().any(|t| t.as_ref().map_or(false, |t| t.ttype == TensorType::Q5_K))
-    });
-    if has_q5_k {
-        eprintln!("Warning: model contains Q5_K weights (unsupported by MPS GPU). Will use CPU.");
     }
 
     println!("Loaded: {} layers", n_layer);
