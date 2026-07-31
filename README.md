@@ -103,24 +103,29 @@ should be relatively straightforward to port.
 ## Usage
 
 ```bash
-cargo run --release -- <model> [prompt]
+cargo run --release -- <model> [prompt] [OPTIONS]
 ```
 
-`<model>` can be a local path or an auto-download URI:
+`<model>` can be a local path, a download URI, or a cached model name:
 
-| URI format | Example |
-|------------|---------|
-| Local file | `~/models/qwen2.gguf` |
-| HF Hub | `hf:Qwen/Qwen2-0.5B-GGUF:qwen2-0.5b-q4_0.gguf` |
-| Ollama | `ollama:qwen2.5:0.5b` |
+| Format | Example |
+|--------|---------|
+| Local file | `~/models/qwen2.gguf`, `./model.gguf`, `/abs/model.gguf` |
+| Hugging Face | `hf:Qwen/Qwen2-0.5B-GGUF:qwen2-0.5b-q4_0.gguf` (auto-download) |
+| Ollama | `ollama:qwen2.5:0.5b` (pull) |
+| Cached model name | `qwen2.5-0.5b-instruct-q4_0` (resolved from `~/.cache/minfer/models`, see `list`) |
 
-If `prompt` is omitted, reads from stdin.
+If `prompt` is omitted, reads from stdin. Run `minfer --help` for full options
+(`--meta`, `--no-template`).
 
 **Examples:**
 
 ```bash
 # Local model
 cargo run --release -- ~/models/qwen2-0.5b-q4_0.gguf "What is the capital of France?"
+
+# Cached model by name (no full path needed)
+cargo run --release -- qwen2.5-0.5b-instruct-q4_0 "Hello"
 
 # Auto-download from Hugging Face + run
 cargo run --release -- hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
