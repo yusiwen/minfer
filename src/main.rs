@@ -35,20 +35,45 @@ impl Default for GenParams {
     }
 }
 
+fn print_usage(prog: &str) {
+    eprintln!("minfer — a minimal local LLM inference engine");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  {prog} <model> [prompt] [OPTIONS]");
+    eprintln!("  {prog} info <model>");
+    eprintln!("  {prog} download hf <repo> [file]");
+    eprintln!("  {prog} download ollama <model>[:tag]");
+    eprintln!("  {prog} list");
+    eprintln!();
+    eprintln!("MODEL — <model> may be any of:");
+    eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
+    eprintln!("  · a Hugging Face repo   hf:<repo>[:<file>]              (auto-download)");
+    eprintln!("  · an Ollama model       ollama:<model>[:tag]            (pull)");
+    eprintln!("  · a cached model name   <filename>   resolved from ~/.cache/minfer/models");
+    eprintln!("                         (see `{prog} list`)");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  --meta               print GGUF metadata and key tensors");
+    eprintln!("  --no-template        use the raw prompt without the chat template");
+    eprintln!("  -h, --help           show this help");
+}
+
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
+    let prog = raw_args[0].clone();
+
+    // Handle help before anything else (and before any stdin read).
+    if raw_args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage(&prog);
+        std::process::exit(0);
+    }
+
     let meta_flag = raw_args.iter().any(|a| a == "--meta");
     let no_template = raw_args.iter().any(|a| a == "--no-template");
     let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--meta" && a != "--no-template").collect();
 
     if args.len() < 2 {
-        eprintln!("Usage:");
-        eprintln!("  {} <model> [prompt]              — run inference", args[0]);
-        eprintln!("  {} --meta <model> [prompt]       — run with GGUF metadata dump", args[0]);
-        eprintln!("  {} info <model>                  — print GGUF metadata (no inference)", args[0]);
-        eprintln!("  {} download hf <repo> [file]      — download from Hugging Face", args[0]);
-        eprintln!("  {} download ollama <model>[:tag]   — pull from Ollama", args[0]);
-        eprintln!("  {} list                           — list cached models", args[0]);
+        print_usage(&prog);
         std::process::exit(1);
     }
 
@@ -56,7 +81,7 @@ fn main() {
     match args[1].as_str() {
         "download" => {
             if args.len() < 4 {
-                eprintln!("Usage: {} download hf <repo> [file] | ollama <model>[:tag]", args[0]);
+                eprintln!("Usage: {prog} download hf <repo> [file] | ollama <model>[:tag]");
                 std::process::exit(1);
             }
             let source = &args[2];
@@ -96,18 +121,13 @@ fn main() {
         }
         "info" => {
             if args.len() < 3 {
-                eprintln!("Usage: {} info <model>", args[0]);
+                eprintln!("Usage: {prog} info <model>");
                 std::process::exit(1);
             }
-            let model_path = &args[2];
-            // Resolve auto-download URIs
-            let model_path = if model_path.starts_with("hf:") || model_path.starts_with("ollama:") {
-                match download::resolve(model_path) {
-                    Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
-                    Err(e) => { eprintln!("Download error: {}", e); std::process::exit(1); }
-                }
-            } else {
-                model_path.clone()
+            // Resolve paths, hf:/ollama: URIs, and cached model names.
+            let model_path = match download::resolve(&args[2]) {
+                Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
+                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
             };
             let data = std::fs::read(&model_path).expect("read GGUF file");
             let ctx = gguf::GgufContext::init_from_data(&data).expect("parse GGUF");
@@ -120,20 +140,25 @@ fn main() {
 
     let model_path = &args[1];
 
-    // Auto-download if URI starts with hf: or ollama:
-    let model_path = if model_path.starts_with("hf:") || model_path.starts_with("ollama:") {
-        match download::resolve(model_path) {
-            Ok(p) => {
+    // Reject unknown options instead of treating them as a model path (avoids hanging on stdin).
+    if model_path.starts_with('-') {
+        eprintln!("Error: unknown option '{model_path}'");
+        print_usage(&prog);
+        std::process::exit(1);
+    }
+
+    // Resolve paths, hf:/ollama: URIs, and cached model names.
+    let is_uri = model_path.starts_with("hf:")
+        || model_path.starts_with("ollama:")
+        || (!model_path.starts_with('/') && !model_path.starts_with('.') && !model_path.starts_with('~'));
+    let model_path = match download::resolve(model_path) {
+        Ok(p) => {
+            if is_uri {
                 eprintln!("Model ready: {}", p.display());
-                p.to_string_lossy().to_string()
             }
-            Err(e) => {
-                eprintln!("Download error: {}", e);
-                std::process::exit(1);
-            }
+            p.to_string_lossy().to_string()
         }
-    } else {
-        model_path.clone()
+        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
     let prompt = if args.len() > 2 { args[2..].join(" ") } else {
         let mut input = String::new();

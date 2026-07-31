@@ -17,6 +17,7 @@ fn default_cache_dir() -> PathBuf {
 ///   - local path (starts with / or ./ or ~)
 ///   - hf:<repo>[:<file>]
 ///   - ollama:<model>[:tag]
+///   - a cached model name (resolved against ~/.cache/minfer/models)
 pub fn resolve(uri: &str) -> Result<PathBuf, String> {
     let cache_dir = default_cache_dir();
 
@@ -46,10 +47,54 @@ pub fn resolve(uri: &str) -> Result<PathBuf, String> {
     if p.exists() {
         return Ok(p);
     }
-    Err(format!(
-        "Unknown model URI: {}. Use hf:<repo>[:file] or ollama:<model>[:tag]",
-        uri
-    ))
+
+    // Bare model name → resolve against the local cache (e.g. `minfer qwen2.5-0.5b-instruct-q4_0`)
+    resolve_cached_name(uri, &cache_dir)
+}
+
+/// Search the local cache for a `.gguf` whose file name matches `name` (exact match
+/// preferred, then prefix match). Returns the path when exactly one match exists.
+fn resolve_cached_name(name: &str, cache_dir: &Path) -> Result<PathBuf, String> {
+    let mut paths = Vec::new();
+    collect_gguf_paths(cache_dir, &mut paths);
+
+    let mut exact = Vec::new();
+    let mut prefix = Vec::new();
+    for p in &paths {
+        let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if fname == name {
+            exact.push(p.clone());
+        } else if fname.starts_with(name) {
+            prefix.push(p.clone());
+        }
+    }
+    let candidates = if !exact.is_empty() { exact } else { prefix };
+
+    match candidates.len() {
+        1 => Ok(candidates[0].clone()),
+        0 => Err(format!(
+            "Model '{}' not found. Use `minfer list` to see cached models, or pass a path, hf:<repo>[:file], or ollama:<model>[:tag].",
+            name
+        )),
+        _ => Err(format!(
+            "Ambiguous model name '{}':\n  {}",
+            name,
+            candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
+        )),
+    }
+}
+
+/// Recursively collect all `*.gguf` paths under `dir`.
+fn collect_gguf_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_gguf_paths(&path, out);
+        } else if path.extension().map_or(false, |e| e == "gguf") {
+            out.push(path);
+        }
+    }
 }
 
 // ============================================================
