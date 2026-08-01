@@ -1770,21 +1770,32 @@ kernel void kernel_gqa_attn_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (int j = tiisg; j < tile_sz; j += 32) {
-            threadgroup float * kj = k_tile + j * hd;
-            float dot = 0.0f;
-            for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
-            dot *= scale;
+        for (int j0 = 0; j0 < tile_sz; j0 += 32) {
+            // All 32 lanes of the simdgroup execute the SAME iteration count so
+            // simd_max below never runs across divergent lanes (a divergent
+            // simd_max includes stale register values from exited lanes, which
+            // corrupts the online-softmax running max for partial tiles).
+            const int j = j0 + (int)tiisg;
+            const bool valid = (j < tile_sz);
+            float dot = -INFINITY;
+            if (valid) {
+                threadgroup float * kj = k_tile + j * hd;
+                dot = 0.0f;
+                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                dot *= scale;
+            }
 
             float batch_mx = simd_max(dot);
             float new_mx = max(mx, batch_mx);
             float corr = exp(mx - new_mx);
             for (int d = 0; d < hd; d++) acc[d] *= corr;
             S *= corr;
-            float e = exp(dot - new_mx);
-            threadgroup float * vj = v_tile + j * hd;
-            for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
-            S += e;
+            float e = valid ? exp(dot - new_mx) : 0.0f;
+            if (valid) {
+                threadgroup float * vj = v_tile + j * hd;
+                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                S += e;
+            }
             mx = new_mx;
         }
 

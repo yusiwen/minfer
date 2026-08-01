@@ -839,6 +839,28 @@ impl MpsState {
         Self::copy_from_gpu(&buf, hidden);
     }
 
+    /// Debug: download + dump layer-0 intermediates (mirrors the CPU path's
+    /// minfer_dump_layer0_* dumps) so GPU vs CPU divergence can be localized.
+    #[cfg(feature = "debug_dump")]
+    pub fn dump_layer0_intermediates(&self, nt: usize, ne: usize, nqt: usize, nkt: usize, nf: usize) {
+        use crate::dump;
+        macro_rules! dump_buf {
+            ($buf:expr, $name:expr, $n:expr) => {{
+                let b = $buf.lock().unwrap();
+                let mut data = vec![0.0f32; $n];
+                Self::copy_from_gpu(&b, &mut data);
+                dump::maybe_dump_prefill_or_gen0($name, &data, nt);
+            }};
+        }
+        dump_buf!(self.inner.buf_bn, "minfer_gpu_dump_layer0_bn", nt * ne);
+        dump_buf!(self.inner.buf_bq, "minfer_gpu_dump_layer0_bq", nt * nqt);
+        dump_buf!(self.inner.buf_bk, "minfer_gpu_dump_layer0_bk", nt * nkt);
+        dump_buf!(self.inner.buf_bv, "minfer_gpu_dump_layer0_bv", nt * nkt);
+        dump_buf!(self.inner.buf_ba, "minfer_gpu_dump_layer0_ba", nt * ne);
+        dump_buf!(self.inner.buf_bg, "minfer_gpu_dump_layer0_bg", nt * nf);
+        dump_buf!(self.inner.buf_bf, "minfer_gpu_dump_layer0_bf", nt * nf);
+    }
+
     /// Upload positions used by RoPE and causal attention for this forward call.
     pub fn upload_positions(&self, positions: &[usize]) {
         let need = (positions.len() * std::mem::size_of::<i32>()) as u64;

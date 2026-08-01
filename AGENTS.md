@@ -119,6 +119,28 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 
 ## Known Issues
 
+### GQA Attention `simd_max` divergence (fixed 2026-08-01)
+`kernel_gqa_attn_f32` used `for (int j = tiisg; j < tile_sz; j += 32)` — when a
+KV tile has `tile_sz < 32` (i.e. `nkv % 32 != 0`, which is nearly every prefill
+token and every decode step), the lanes with `j >= tile_sz` **exit the loop
+early**, so `simd_max(dot)` runs across divergent lanes and includes stale
+register values from the exited lanes. The online-softmax running max is then
+corrupted, producing wrong attention outputs for tokens whose KV count spans a
+partial second tile (e.g. token 36 of a 37-token prefill had cos ≈ 0.97 vs CPU;
+the whole GPU decode then diverged → repetition loops).
+
+Symptom: GPU output loops (repeats a sentence forever) while the CPU path
+(which masks invalid KV positions) generates coherent text. Q/K/V/cache and the
+matmul kernels were all verified correct — the error was isolated to attention
+via per-stage GPU/CPU dump comparisons.
+
+**Fix**: all 32 lanes execute the same iteration count (`for j0 in 0..tile_sz
+step 32`), with a `valid = j < tile_sz` mask; invalid lanes use `dot = -INFINITY`
+(so `simd_max` ignores them) and contribute `e = 0`. Verified with real model
+data: prefill last-token logits cos vs CPU went 0.83 → 0.999, gen0 0.96 → 0.999,
+and the looping prompt now generates coherent text matching llama.cpp.
+Regression test: `tests/gqa_attn_isolation.rs` (multiple nkv incl. partial tiles).
+
 ### Q4_K / Q5_K Nibble Layout (fixed)
 Q4_K and Q5_K store `qs[128]` with cross-subblock nibble packing. Each byte's lo nibble belongs to subblock 2k and hi nibble to subblock 2k+1, aligned by element index. minfer originally assumed Q4_0-style layout (lo=sub_elem[j], hi=sub_elem[j+16]).
 

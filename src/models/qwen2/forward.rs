@@ -83,7 +83,9 @@ pub fn forward(
                 {
                     cb.submit();
                     mps.download_hidden(&mut hidden);
-                    crate::dump::maybe_dump_prefill_or_gen0(
+                    if il == 0 {
+                        mps.dump_layer0_intermediates(nt, ne, nqt, nkt, nf);
+                    }                    crate::dump::maybe_dump_prefill_or_gen0(
                         &format!("minfer_gpu_dump_layer{}_out", il), &hidden, nt
                     );
                     crate::dump::maybe_dump_prefill_or_gen0(
