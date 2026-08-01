@@ -1354,41 +1354,6 @@ kernel void kernel_q8_0_f32_matmul_multi(
     }
 }
 
-// ─── Quantize f32 → Q8_0 (1 thread per 32-element block) ─────
-// Matches CPU scalar path: half delta + 32 signed int8 values.
-
-kernel void kernel_quantize_q8_0(
-    device const float * x   [[buffer(0)]],
-    device       uchar * y   [[buffer(1)]],
-    constant    int    & dim [[buffer(2)]],
-    constant    int    & nt  [[buffer(3)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    int nb = dim / 32;
-    int total = nt * nb;
-    if ((int)tid >= total) return;
-
-    int t = (int)tid / nb;
-    int b = (int)tid % nb;
-
-    device const float * src = x + t * dim + b * 32;
-    device       uchar * dst = y + (t * nb + b) * Q8B;
-
-    float am = 0.0f;
-    for (int j = 0; j < 32; j++) am = fmax(am, fabs(src[j]));
-    float d  = am / 127.0f;
-    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
-
-    device half * dptr = (device half *)dst;
-    *dptr = half(d);
-
-    for (int j = 0; j < 32; j++) {
-        int q = int(round(src[j] * id));
-        q = clamp(q, -128, 127);
-        dst[2 + j] = uchar(q);
-    }
-}
-
 // ─── Get rows (embedding lookup, Q4_0 → f32) ────────────────
 // Reads rows from a quantized embedding table and dequantizes to f32.
 // weights: [n_vocab][nb * Q4B], ids: [nt], dst: [nt][ne].

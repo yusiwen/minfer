@@ -35,7 +35,6 @@ struct MpsStateInner {
     pl_q5_1_f32_multi: metal::ComputePipelineState,
     pl_q5_k_f32: metal::ComputePipelineState,
     pl_q5_k_f32_multi: metal::ComputePipelineState,
-    pl_quantize_q8_0: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
     pl_add: metal::ComputePipelineState,
@@ -213,6 +212,19 @@ impl MpsCommandBuffer<'_> {
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
             }
+            TensorType::Q4_0 => {
+                self.enc.set_compute_pipeline_state(
+                    if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
+                );
+                self.enc.set_buffer(0, Some(wb), 0);
+                self.enc.set_buffer(1, Some(x), 0);
+                self.enc.set_buffer(2, Some(out), 0);
+                self.set_params(3, &(od as i32));
+                self.set_params(4, &(id as i32));
+                self.set_params(5, &(nt as i32));
+                let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+            }
             _ => {
                 self.enc.set_compute_pipeline_state(
                     if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
@@ -262,29 +274,14 @@ impl MpsCommandBuffer<'_> {
         }
     }
 
-    /// Quantize f32 activations to Q8_0 on the GPU.
-    /// Input layout: [nt][dim]; output layout: [nt][nb][Q8B].
-    pub fn quantize_q8_0(&self, x: &metal::Buffer, y: &metal::Buffer, dim: usize, nt: usize) {
-        self.enc.set_compute_pipeline_state(&self.state.pl_quantize_q8_0);
-        self.enc.set_buffer(0, Some(x), 0);
-        self.enc.set_buffer(1, Some(y), 0);
-        self.set_params(2, &(dim as i32));
-        self.set_params(3, &(nt as i32));
-        let nb = dim / 32;
-        self.dispatch_1d((nt * nb) as u64, 256);
-    }
-
-    /// Choose Q4_0×Q8_0 matmul when weight is Q4_0, otherwise fall back to f32-activation matmul.
+    /// Choose the f32-activation matmul for all weight types (including Q4_0,
+    /// matching llama.cpp's Metal backend which does not Q8_0-quantize activations).
     /// Pre-looked-up weight buffer and type — avoids per-matmul HashMap locking.
     fn matmul_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
-        q8_x: &metal::Buffer, f32_x: &metal::Buffer, out: &metal::Buffer,
+        _q8_x: &metal::Buffer, f32_x: &metal::Buffer, out: &metal::Buffer,
         od: usize, id: usize, nt: usize,
     ) {
-        if ttype == TensorType::Q4_0 {
-            self.quant_matmul_q8_buf(wb, q8_x, out, od, id, nt);
-        } else {
-            self.quant_matmul_f32_on_gpu_buf(wb, ttype, f32_x, out, od, id, nt);
-        }
+        self.quant_matmul_f32_on_gpu_buf(wb, ttype, f32_x, out, od, id, nt);
     }
 
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.
@@ -516,7 +513,6 @@ impl MpsState {
             let pl_q5_1_f32_multi = get_pl("kernel_q5_1_f32_matmul_multi")?;
             let pl_q5_k_f32 = get_pl("kernel_q5_k_f32_matmul")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
-            let pl_quantize_q8_0 = get_pl("kernel_quantize_q8_0")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
             let pl_add      = get_pl("kernel_add_f32")?;
@@ -549,7 +545,6 @@ impl MpsState {
                 pl_q5_1_f32_multi,
                 pl_q5_k_f32,
                 pl_q5_k_f32_multi,
-                pl_quantize_q8_0,
                 pl_get_rows_q4_0,
                 pl_rms_norm,
                 pl_add,
@@ -999,9 +994,6 @@ impl MpsState {
         }
 
         cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps);
-        if attn_all_q4 && !attn_any_q4k {
-            cb.quantize_q8_0(&bn, &q8_bn, ne, nt);
-        }
         cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, &bq_buf, nqt, ne, nt);
         if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt); }
         cb.matmul_on_gpu_buf(&buf_wk, wk.ttype, &q8_bn, &bn, &bk_buf, nkt, ne, nt);
@@ -1013,10 +1005,7 @@ impl MpsState {
         cb.store_kv_f32(&bk_buf, &kv_k[il], nkt, nt, &pos_buf);
         cb.store_kv_f32(&bv_buf, &kv_v[il], nkt, nt, &pos_buf);
         cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
-        // wo: Q4_0 needs Q8_0 quantized input; Q4_K reads f32 from ba_buf directly.
-        if wo.ttype == TensorType::Q4_0 {
-            cb.quantize_q8_0(&ba_buf, &q8_ba, ne, nt);
-        }
+        // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
         cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt);
         cb.add_f32(&hidden, &bn, &hidden, nt * ne);
 
@@ -1030,15 +1019,9 @@ impl MpsState {
         }
 
         cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps);
-        if ffn_all_q4 && !ffn_any_q4k {
-            cb.quantize_q8_0(&ba_buf, &q8_ba, ne, nt);
-        }
         cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, &bg_buf, nf, ne, nt);
         cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, &bf_buf, nf, ne, nt);
         cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf);
-        if ffn_down.ttype == TensorType::Q4_0 {
-            cb.quantize_q8_0(&bg_buf, &q8_ba, nf, nt);
-        }
         cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, &bn, ne, nf, nt);
         cb.add_f32(&hidden, &bn, &hidden, nt * ne);
 
@@ -1086,14 +1069,8 @@ impl MpsState {
 
         cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps);
 
-        if output.ttype == TensorType::Q4_0 {
-            let q8_len = (nt * (ne / 32) * Q8B) as u64;
-            let q8_bn = Self::get_or_grow(&self.inner.buf_q8_bn, q8_len, dev);
-            cb.quantize_q8_0(&bn, &q8_bn, ne, nt);
-            cb.quant_matmul_q8_buf(&buf_output, &q8_bn, &logits, nv, ne, nt);
-        } else {
-            cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt);
-        }
+        // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
+        cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt);
         if let Some(bb) = &bias_buf {
             cb.add_bias_f32(&logits, bb, nv, nt);
         }

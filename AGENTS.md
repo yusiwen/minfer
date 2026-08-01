@@ -160,14 +160,14 @@ The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`
 - CPU: "Hello! How can I assist you today?" ✓
 - **MPS GPU: full GPU support** ✓ — Q5_K Metal kernel (`kernel_q5_k_f32_matmul` + `_multi`) added, ~250 tok/s (prefill 282, gen 247). Per-layer GPU vs CPU cos ≥ 0.9999998 (layers 2-20), logits argmax matches llama.
 - Q4_0 / Q4_K_M: no regression ✓
-- llama.cpp dispatch for reference: Q5_1→Q8_1 activations (ARM `s` = fp16(d_q8·Σq8)), Q4_K/Q5_K/Q6_K→Q8_K, Q5_0/Q8_0→Q8_0. Q8_0 activations in minfer match llama to ~1e-6 (fp16-sum of Q8_1 confirmed NOT the cause).
+- llama.cpp dispatch for reference: Q5_1→Q8_1 activations (ARM `s` = fp16(d_q8·Σq8)), Q4_K/Q5_K/Q6_K→Q8_K, Q5_0/Q8_0→Q8_0. **These are the CPU backend** `vec_dot_type`s. The **Metal backend reads f32 activations directly for ALL types including Q4_0** (no Q8_0 quantization). Since P1 (2026-08-01) minfer's Metal Q4_0 also uses f32 activations, matching llama Metal. Q8_0 activations in minfer's CPU path match llama's CPU to ~1e-6.
 
 ### KV Head Dimension (n_kv_embd)
 Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.
 
 ## Core Conventions
 
-1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights use `dot_q5_0_q8_0()`; Q4_K uses `dot_q4_k_q8_0()`.
+1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights use `dot_q5_0_q8_0()`; Q4_K uses `dot_q4_k_q8_0()`. The **Metal backend reads f32 activations directly for all weight types** (Q4_0 included since P1), matching llama.cpp's Metal backend.
 2. **AVX2 dispatch pattern**: all kernels use `is_x86_feature_detected!("avx2")` runtime detection + scalar fallback (ARM Mac always uses scalar).
 3. **No ML frameworks** — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten loops.
 4. **Tensor data uses raw `&[u8]` interface** — avx2.rs dot products operate on byte slices, not structs.

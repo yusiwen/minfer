@@ -21,8 +21,9 @@ A minimal local LLM inference engine built from scratch in Rust.
 ## Supported Quantization Formats
 
 minfer supports GGUF v3 files with the following quantized weight types.
-Activation quantization uses Q8_0 (on-the-fly) for Q4_0 weights; all other
-weight types work with f32 activations.
+The CPU backend quantizes activations to Q8_0 on-the-fly; the Metal GPU
+backend reads f32 activations directly for all weight types (Q4_0 included),
+matching llama.cpp's Metal backend.
 
 ### Supported
 
