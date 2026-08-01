@@ -165,6 +165,30 @@ The Q5_0 Metal shader kernel is implemented in `metal.metal` (`block_q5_0_dot_y`
 ### KV Head Dimension (n_kv_embd)
 Qwen2.5 models may use separate KV head dimensions (e.g., Qwen2.5-0.5B: n_embd=896, n_head=14 → hd=64, n_kv_embd=128). The KV cache and attention now use `n_kv_embd` from `HParams` (read from K weight's ne[1]) instead of computing `n_head_kv * n_embd_head()`. The attention function `gqa_attn` accepts separate `hd_kv` and `nkt` parameters for correct stride calculation.
 
+### Q4_0 Prefill GEMM (`kernel_q4_0_mm_f32`) — SHIPPED 2026-08-01
+Faithful port of llama.cpp's `kernel_mul_mm_q4_0_f32` (legacy simdgroup path):
+64×32 tile, 4 simdgroups × 32 threads, Q4_0 dequant staged into `sa` (transposed
+A), f32 activations staged into `sb` via scalar stores (equivalent to llama's
+float2x4), `simdgroup_half8x8` inputs → `simdgroup_float8x8` accumulators.
+- **Q4_0 block layout**: GGUF byte j = {element j (lo), element j+16 (hi)} —
+  NOT byte j/2 = {2j, 2j+1}. llama's `dequantize_q4_0` reads `qs` as uint16.
+- **B-staging**: write to raw `(tiitg/NL1)/8` and `(tiitg/NL1)%8` sb positions
+  (unclamped, fills OOB rows with the clamped row's data); read activations
+  from the clamped `lr1` row.
+- **Store**: `transpose=false` is the ROW-major store. Direct:
+  `C + 8*(i/4)*od + 8*(i%4)`; bc_out (partial tiles): `temp_str + 8*(i%4) +
+  8*NR0*(i/4)` with `temp_str = shmem + 32*(sgitg&1) + (16*(sgitg>>1))*NR0`
+  (float, reuses sa/sb → smem 8192 B for bc_out, 6144 for full tiles).
+- **Barrier**: the FIRST multiply-loop barrier must be `mem_threadgroup`
+  (makes other simdgroups' sa/sb writes visible to `simdgroup_load`); the two
+  later ones are `mem_none`. Using `mem_none` everywhere caused a
+  non-deterministic race at od=4864 (gate/up) with nt%32 != 0.
+- **Dispatch**: GEMM for nt ≥ 16 (f32 multi wins below that due to lower fixed
+  overhead); `MINFER_GEMM=0` forces f32 multi. ~11% faster at 30 tokens,
+  ~34% at 70 tokens vs the f32 multi kernel.
+- **Isolation test**: `tests/gemm_isolation.rs` (macOS-only, needs GPU) checks
+  determinism + correctness vs a scalar CPU reference at nt = 12/30/32/33.
+
 ## Core Conventions
 
 1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights use `dot_q5_0_q8_0()`; Q4_K uses `dot_q4_k_q8_0()`. The **Metal backend reads f32 activations directly for all weight types** (Q4_0 included since P1), matching llama.cpp's Metal backend.

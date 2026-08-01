@@ -329,10 +329,17 @@ Notes on measurement:
 Measured 2026-07-31 … 2026-08-01 with the same model file and the same
 `"hello"` prompt (chat template → 30 prompt tokens, 9 generated tokens):
 
-| | llama.cpp | minfer (after P1) | Gap |
+| | llama.cpp | minfer (after P1 GEMM) | Gap |
 |---|---|---|---|
-| **Prefill** (30 tokens) | 1318 t/s (22.8 ms) | ~440 t/s (~68 ms) | **3.0×** |
+| **Prefill** (30 tokens) | 1318 t/s (22.8 ms) | ~510 t/s (~59 ms) | **2.6×** |
+| **Prefill** (70 tokens) | ~1318 t/s | ~870 t/s | ~1.5× |
 | **Decode** (9 tokens) | 345 t/s (26.1 ms) | ~340 t/s¹ (~35 ms) | ~1.0× (blended) |
+
+The prefill gap is largely a **batch-size / fixed-overhead** effect: at 70
+tokens the GEMM reaches ~870 t/s (vs ~650 for the f32 multi kernel), while
+short prompts (30 tokens) amortize the fixed per-forward overhead less well.
+The simdgroup GEMM (P1) now beats the f32 multi kernel for nt ≥ 16 — see the
+section below.
 
 ¹ minfer reports a blended rate = (30 + 9) / (prefill + decode time), which
 counts prefill overhead in the denominator. Before P1 this was 281 t/s
@@ -340,11 +347,10 @@ counts prefill overhead in the denominator. Before P1 this was 281 t/s
 (~200 t/s) because the prefill portion of the denominator inflates the
 blended number less as generation lengthens.
 
-## Prefill Gap: GEMM Kernel Architecture (3.9× → 3.0×)
+## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
-minfer's Q4_0 prefill kernel (`kernel_q4_0_q8_0_matmul_multi`) uses a
-**scalar dot-product loop** with one `int × int` multiply-accumulate per
-iteration:
+minfer's Q4_0 prefill kernel (`kernel_q4_0_f32_matmul_multi`) uses a
+**scalar dot-product loop**:
 
 ```metal
 for (int j = 0; j < 16; j++) {
@@ -353,23 +359,67 @@ for (int j = 0; j < 16; j++) {
 }
 ```
 
-Each thread can issue only one 8‑bit ALU operation per cycle, leaving
-3 of Metal's 4 SIMD ALU lanes idle on every iteration.
-
 llama.cpp's equivalent (`kernel_mul_mm_q4_0_f32`) uses
-**`simdgroup_matrix`** — the hardware matrix‑multiply engine on Apple‑Silicon
-designed specifically for GEMM problems. One instruction processes an 8×8
-block of the output matrix in parallel.
+**`simdgroup_matrix`** — the hardware matrix‑multiply engine on Apple‑Silicon.
 
-The result is a 4× difference in effective GPU throughput:
+### P0 experiment (2026-08-01): simdgroup GEMM implemented, then reverted
 
-| | GFLOPs (est.) | Utilisation |
+A full simdgroup GEMM was implemented following llama.cpp's legacy
+`kernel_mul_mm` structure (64×32 output tile, 4 simdgroups × 32 threads,
+Q4_0 dequant staged into threadgroup memory, `simdgroup_half8x8` inputs →
+`simdgroup_float8x8` accumulators, transposed store). It was verified
+**correct** (per-layer cos ≥ 0.9999 vs CPU), but **slower than the simple
+f32 multi kernel**:
+
+| Prefill batch | f32 multi | simdgroup GEMM |
 |---|---|---|
-| llama.cpp | ~940 | ~36 % of M4 Pro theoretical peak |
-| minfer | ~241 | ~9 % |
+| 30 tokens | ~440 t/s | ~422 t/s |
+| 70 tokens | ~895–1155 t/s | ~490–594 t/s |
 
-This is the **single largest remaining performance gap** and is not
-addressed anywhere in the current optimisation list.
+The GEMM was removed.
+
+### P1 (2026-08-01): faithful llama.cpp transcription — NOW SHIPPED
+
+A fresh transcription of llama.cpp's `kernel_mul_mm_q4_0_f32` (legacy
+simdgroup path) fixed **three bugs** in the P0 attempt:
+
+1. **B-staging `by`/`bly`** — llama writes to the *raw* `(tiitg/NL1)/8` and
+   `(tiitg/NL1)%8` (unclamped) sb positions, reading the activations from the
+   clamped row. P0 used the clamped index for both, leaving out-of-range N-rows
+   of the B tile uninitialized (stale/NaN threadgroup memory → garbage).
+2. **Store transpose** — `simdgroup_store` with `transpose=false` is the
+   *row-major* store (element [r][c] → dst[r*stride + c]); minfer's out is
+   `[nt][od]` = C^T of llama's `[M][N]`. The direct store must use
+   `C + 8*(i/4)*od + 8*(i%4)` with `transpose=false`, and the bc_out store
+   `temp_str + 8*(i%4) + 8*NR0*(i/4)` with `transpose=false` (the bc_out
+   copy reads back `temp_str[j*NR0 + m]` = C[N=j][M=m]).
+3. **Barrier scope** — the multiply loop's `simdgroup_barrier(mem_flags::mem_none)`
+   does not make the sa/sb writes (done by *other* simdgroups) visible to
+   `simdgroup_load`. On M4 Pro this manifested as a **non-deterministic race** at
+   od=4864 (gate/up) with nt%32 != 0. Fixed by making the **first** multiply
+   barrier `mem_flags::mem_threadgroup` (the two subsequent ones stay `mem_none`).
+
+Also: Q4_0 block layout in GGUF is **byte j = {element j (lo), element j+16
+(hi)}**, not byte j/2 = {2j, 2j+1}. The llama `dequantize_q4_0` reads `qs` as
+uint16 and the store maps `temp_a[i/4][i%4]` accordingly.
+
+**Isolation test** (`tests/gemm_isolation.rs`, macOS): runs the kernel on
+deterministic synthetic weights/acts at nt = 12/30/32/33 and asserts
+(1) run-to-run determinism and (2) agreement with a scalar CPU reference
+(≤ 2.5e-3, half-precision tolerance). All four nt values pass.
+
+**Result** (Qwen2.5-0.5B, M4 Pro, `"hello"` prompt, 30-token chat prefill):
+
+| Prefill batch | f32 multi | simdgroup GEMM | Gain |
+|---|---|---|---|
+| 12 tokens | ~150 t/s | ~88 t/s | (GEMM slower — small-batch overhead) |
+| 30 tokens | ~460 t/s | ~510 t/s | +11% |
+| 70 tokens | ~650 t/s | ~870 t/s | +34% |
+
+The GEMM is dispatched for **nt ≥ 16** (below that the f32 multi kernel's
+lower fixed overhead wins). `MINFER_GEMM=0` forces the f32 multi path for
+A/B comparison.
+
 
 ## Decode Gap: Dispatch Overhead (1.9×) + F16 KV Cache
 
@@ -444,10 +494,11 @@ Ranked by estimated impact‑to‑effort ratio for the current workload
 
 | Priority | Item | Impact | Effort | Notes |
 |:---:|------|--------|--------|-------|
-| **P0** | **GEMM kernel: simdgroup_mm** replace scalar dot (all quant types) | 3‑4× prefill | Large | Requires Metal `simdgroup_matrix` API; M1+/A14+ only; fallback to current kernel on older chips. Applies uniformly to Q4_0/Q4_K/Q5_x/Q6_K |
+| ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: implemented correctly but 2× slower than the f32 multi kernel for 0.5B-class models — reverted.** Would only pay off for 7B+ models / very long prefill batches |
 | **P2** | **KV cache: F32 → F16** | 2× attention bandwidth | Small | Change cache allocation, `store_kv`, `gqa_attn` kernel (~30 lines) |
-| P3 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
-| P4 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
-| P5 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |
-| P6 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) |
-| P7 | RoPE + store_kv fusion | 1 dispatch/layer | Small | Merge K's RoPE transform with KV cache scatter |
+| **P3** | **Improve f32 multi kernel occupancy** | up to 2× prefill | Medium | The simple f32 kernel already reaches ~1000 t/s at 70 tokens; tune grid/tile/threads to close the gap to llama.cpp's 1318 t/s |
+| P4 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
+| P5 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
+| P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |
+| P7 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) |
+| P8 | RoPE + store_kv fusion | 1 dispatch/layer | Small | Merge K's RoPE transform with KV cache scatter |

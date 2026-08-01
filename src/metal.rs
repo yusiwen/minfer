@@ -21,6 +21,7 @@ struct MpsStateInner {
     pl_q4_0_q8_multi: metal::ComputePipelineState,
     pl_q4_0_f32: metal::ComputePipelineState,
     pl_q4_0_f32_multi: metal::ComputePipelineState,
+    pl_q4_0_mm_f32: metal::ComputePipelineState,
     pl_q4_1_f32: metal::ComputePipelineState,
     pl_q4_1_f32_multi: metal::ComputePipelineState,
     pl_q8_0_f32: metal::ComputePipelineState,
@@ -213,17 +214,35 @@ impl MpsCommandBuffer<'_> {
                 self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
             }
             TensorType::Q4_0 => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                // Prefill uses the simdgroup GEMM (faithful llama.cpp port, float
+                // accumulation). MINFER_GEMM=0 disables it (f32 multi fallback) for
+                // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
+                // dominates for tiny prefills).
+                static GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let use_gemm = *GEMM.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"));
+                if nt >= 16 && use_gemm {
+                    self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_mm_f32);
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    self.set_params(3, &(od as i32));
+                    self.set_params(4, &(id as i32));
+                    self.set_params(5, &(nt as i32));
+                    self.enc.set_threadgroup_memory_length(0, 8192);
+                    self.dispatch_2d(((nt + 31) / 32) as u64, ((od + 63) / 64) as u64, 32, 4);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    self.set_params(3, &(od as i32));
+                    self.set_params(4, &(id as i32));
+                    self.set_params(5, &(nt as i32));
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                }
             }
             _ => {
                 self.enc.set_compute_pipeline_state(
@@ -499,6 +518,7 @@ impl MpsState {
             let pl_q4_0_q8_multi = get_pl("kernel_q4_0_q8_0_matmul_multi")?;
             let pl_q4_0_f32 = get_pl("kernel_q4_0_f32_matmul")?;
             let pl_q4_0_f32_multi = get_pl("kernel_q4_0_f32_matmul_multi")?;
+            let pl_q4_0_mm_f32 = get_pl("kernel_q4_0_mm_f32")?;
             let pl_q4_1_f32 = get_pl("kernel_q4_1_f32_matmul")?;
             let pl_q4_1_f32_multi = get_pl("kernel_q4_1_f32_matmul_multi")?;
             let pl_q8_0_f32 = get_pl("kernel_q8_0_f32_matmul")?;
@@ -531,6 +551,7 @@ impl MpsState {
                 pl_q4_0_q8_multi,
                 pl_q4_0_f32,
                 pl_q4_0_f32_multi,
+                pl_q4_0_mm_f32,
                 pl_q4_1_f32,
                 pl_q4_1_f32_multi,
                 pl_q8_0_f32,
