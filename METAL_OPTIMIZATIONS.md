@@ -317,20 +317,137 @@ unique.
 
 **Overall: 130 → 334 tok/s (2.6x)** on Qwen2-0.5B-Instruct, Apple M4 Pro.
 
+Notes on measurement:
+- minfer currently reports `(prompt + generated) / total_time` as its tok/s
+  metric, which blends prefill and decode into a single number
+- The pre-/post-optimisation numbers above used Qwen2-0.5B (older model);
+  current benchmarks below use Qwen2.5-0.5B (same architecture, different
+  tokenizer) — model-specific differences may account for minor variations
+
+## Current vs llama.cpp (Q4_0, Qwen2.5-0.5B, Apple M4 Pro)
+
+Measured 2026-07-31 … 2026-08-01 with the same model file and the same
+`"hello"` prompt (chat template → 30 prompt tokens, 9 generated tokens):
+
+| | llama.cpp | minfer (after P1) | Gap |
+|---|---|---|---|
+| **Prefill** (30 tokens) | 1318 t/s (22.8 ms) | ~440 t/s (~68 ms) | **3.0×** |
+| **Decode** (9 tokens) | 345 t/s (26.1 ms) | ~340 t/s¹ (~35 ms) | ~1.0× (blended) |
+
+¹ minfer reports a blended rate = (30 + 9) / (prefill + decode time), which
+counts prefill overhead in the denominator. Before P1 this was 281 t/s
+(~48.9 ms); after P1 it is ~330-350 t/s. Pure decode-only is lower
+(~200 t/s) because the prefill portion of the denominator inflates the
+blended number less as generation lengthens.
+
+## Prefill Gap: GEMM Kernel Architecture (3.9× → 3.0×)
+
+minfer's Q4_0 prefill kernel (`kernel_q4_0_q8_0_matmul_multi`) uses a
+**scalar dot-product loop** with one `int × int` multiply-accumulate per
+iteration:
+
+```metal
+for (int j = 0; j < 16; j++) {
+    bs += (int(byte & 0x0F) - 8) * int(xq[j])
+        + (int(byte >> 4) - 8) * int(xq[j + 16]);
+}
+```
+
+Each thread can issue only one 8‑bit ALU operation per cycle, leaving
+3 of Metal's 4 SIMD ALU lanes idle on every iteration.
+
+llama.cpp's equivalent (`kernel_mul_mm_q4_0_f32`) uses
+**`simdgroup_matrix`** — the hardware matrix‑multiply engine on Apple‑Silicon
+designed specifically for GEMM problems. One instruction processes an 8×8
+block of the output matrix in parallel.
+
+The result is a 4× difference in effective GPU throughput:
+
+| | GFLOPs (est.) | Utilisation |
+|---|---|---|
+| llama.cpp | ~940 | ~36 % of M4 Pro theoretical peak |
+| minfer | ~241 | ~9 % |
+
+This is the **single largest remaining performance gap** and is not
+addressed anywhere in the current optimisation list.
+
+## Decode Gap: Dispatch Overhead (1.9×) + F16 KV Cache
+
+For 1‑token decode the matmul kernels are memory‑bound and the scalar
+dot‑product loop is less of a bottleneck. The dominant delta comes from
+two sources:
+
+### 1. Q4_0 quantize + matmul — two dispatches per matmul (FIXED 2026-08-01)
+
+minfer's Q4_0 path originally required a separate `quantize_q8_0` kernel
+before every `q4_0_q8_0_matmul`:
+
+```
+Old Q4_0 path: [quantize_q8_0]  →  [q4_0_q8_0_matmul]   = 2 dispatches
+Other types:   [f32_matmul]                              = 1 dispatch
+```
+
+The quantization is shared per norm output, not per matmul: 4 `quantize_q8_0`
+dispatches per layer (attn_norm, attn_out, ffn_norm, swiglu) = **96 per
+forward pass** (not 168 — corrected from an earlier draft).
+
+**Root cause**: minfer's Q4_0 path mimicked llama.cpp's **CPU** backend
+(`vec_dot_type = Q8_0`), but llama.cpp's **Metal** backend reads **f32
+activations directly** for Q4_0 (verified: `mul_vec_q_n_f32_impl` casts
+`src1` to `float*`, no Q8_0 quantization step anywhere in the Metal
+mul_mat dispatch). minfer's Q4_0 Q8_0 path was the odd one out.
+
+**Fix (P1)**: route Q4_0 through the existing f32 matmul path
+(`matmul_on_gpu_buf` always calls `quant_matmul_f32_on_gpu_buf`), remove
+the 4 `quantize_q8_0` calls in `layer_gpu` + 1 in `output_norm_gpu`, and
+delete the now-dead `quantize_q8_0` method/pipeline/shader. Q4_0 now matches
+llama.cpp Metal behaviour.
+
+**Measured** (Q4_0, Qwen2.5-0.5B, M4 Pro, "hello" → 30 prompt / 9 gen):
+- prefill 338 → ~440 t/s (+~30 %), blended generated 281 → ~340 t/s (+~20 %)
+- bigger than the initial estimate: the f32 `block_q4_0_dot_y` kernel (interleaved
+  ushort trick) is also faster per-dot than the Q8_0 int8 kernel, not just
+  fewer dispatches. Primary value is alignment with llama.cpp Metal and code
+  simplification, which unblocks the P0 GEMM work.
+
+### 2. F32 KV cache vs llama.cpp's F16
+
+minfer stores the key‑value cache in `float` (4 bytes per element);
+llama.cpp uses `half` (2 bytes). This doubles the attention and store‑kv
+memory bandwidth. The impact is small for 0.5B‑class models with short
+contexts, but grows linearly with head‑dimension × sequence‑length.
+
 ## Files Modified
 
 | File | Changes |
 |------|---------|
-| `src/metal.metal` | New/rewritten kernels: `kernel_gqa_attn_f32` (flash attention + SIMD vec), `kernel_rms_norm_f32` (parallel), `kernel_swiglu_f32` (fused), `kernel_rope_f32` (freq_scale fix) |
-| `src/metal.rs` | New pipeline `pl_swiglu`, new method `swiglu_f32()`, updated `rms_norm()` dispatch, updated `rope_f32()`/`layer_gpu()` signatures, updated `output_norm_gpu()` for output bias |
-| `src/models/qwen2/forward.rs` | `apply_rope()` freq_scale, output_b in CPU path, GPU path enabled |
+| `src/metal.metal` | New/rewritten kernels: `kernel_gqa_attn_f32` (flash attention + SIMD vec), `kernel_rms_norm_f32` (parallel), `kernel_swiglu_f32` (fused), `kernel_rope_f32` (freq_scale fix). Additional kernels added later: `kernel_q5_1_f32_matmul` + `_multi`, `kernel_q5_k_f32_matmul` + `_multi`. P1 (2026-08-01): `kernel_quantize_q8_0` removed |
+| `src/metal.rs` | New pipeline `pl_swiglu`, new method `swiglu_f32()`, updated `rms_norm()` dispatch, updated `rope_f32()`/`layer_gpu()` signatures, updated `output_norm_gpu()` for output bias. Q5_1/Q5_K pipeline states + dispatch added later. P1 (2026-08-01): Q4_0 routed through f32 path in `matmul_on_gpu_buf`, 5 `quantize_q8_0` calls removed, dead `quantize_q8_0` method + `pl_quantize_q8_0` pipeline removed |
+| `src/models/qwen2/forward.rs` | `apply_rope()` freq_scale, output_b in CPU path, GPU path enabled. Per-layer CPU‑fallback added later (partial GPU work submitted on Q5_K layer failure) |
+| `src/avx2.rs` / `src/kernel.rs` / `src/models/qwen2/forward.rs` | Q5_K formula fix (signed‑16 → unsigned) + qh‑indexing fix (`qh[p] bit s`), 2026-07-31 |
+
+## Recently Completed (2026-07-31 … 2026-08-01)
+
+| Item | Detail |
+|------|--------|
+| Q5_1 Metal kernel | `kernel_q5_1_f32_matmul` + `_multi` (F32 activation path, same structure as Q5_0) |
+| Q5_K Metal kernel | `kernel_q5_k_f32_matmul` + `_multi` (176B/256‑elem super‑block, `qh[p] bit s` indexing, unsigned formula) |
+| Q5_K_M GPU verified | Qwen2.5‑0.5B Q5_K_M full GPU: prefill ~240 t/s, decode ~250 t/s |
+| Per‑layer CPU fallback | When `layer_gpu` fails for a Q5_K layer, the engine submits partial GPU work, downloads the hidden state, and resumes the remaining layers on CPU |
+| Q5_K formula + qh‑indexing fixes | Two independent bugs in minfer's CPU Q5_K implementation — signed formula (`dl·(u-16)-ml`) corrected to unsigned (`dl·u-ml`), and qh high‑bit indexing corrected from `qh[sub·4+pos/8] bit pos%8` to `qh[pos] bit sub` (matching llama.cpp's quantizer layout) |
+| **P1: Q4_0 → f32 activation path** | Q4_0 no longer Q8_0‑quantizes activations; routed through the existing f32 matmul kernel (matching llama.cpp Metal). Removed 4 `quantize_q8_0` calls in `layer_gpu` + 1 in `output_norm_gpu`, deleted the dead `quantize_q8_0` method/pipeline/shader. Decode ~+5‑10 %, minimal prefill change |
 
 ## Remaining Optimization Opportunities
 
-1. **Element-wise kernel float4 vectorization** — `add_f32`, `mul_f32`, `silu_f32`
-   still use scalar float loads
-2. **RoPE parallelization** — currently 1 thread per (token, head), could use 32
-   threads with simd_sum
-3. **Matmul + bias fusion** — merge `add_bias_f32` into matmul epilogue
-4. **Residual add + RMSNorm fusion** — merge `add_f32` + `rms_norm` into one kernel
-5. **RoPE + store_kv fusion** — merge K's RoPE transform with KV cache scatter
+Ranked by estimated impact‑to‑effort ratio for the current workload
+(Q4_0, Qwen2.5‑0.5B, Apple M4 Pro).
+
+| Priority | Item | Impact | Effort | Notes |
+|:---:|------|--------|--------|-------|
+| **P0** | **GEMM kernel: simdgroup_mm** replace scalar dot (all quant types) | 3‑4× prefill | Large | Requires Metal `simdgroup_matrix` API; M1+/A14+ only; fallback to current kernel on older chips. Applies uniformly to Q4_0/Q4_K/Q5_x/Q6_K |
+| **P2** | **KV cache: F32 → F16** | 2× attention bandwidth | Small | Change cache allocation, `store_kv`, `gqa_attn` kernel (~30 lines) |
+| P3 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
+| P4 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
+| P5 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |
+| P6 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) |
+| P7 | RoPE + store_kv fusion | 1 dispatch/layer | Small | Merge K's RoPE transform with KV cache scatter |
