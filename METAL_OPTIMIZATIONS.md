@@ -486,6 +486,7 @@ contexts, but grows linearly with head‑dimension × sequence‑length.
 | Per‑layer CPU fallback | When `layer_gpu` fails for a Q5_K layer, the engine submits partial GPU work, downloads the hidden state, and resumes the remaining layers on CPU |
 | Q5_K formula + qh‑indexing fixes | Two independent bugs in minfer's CPU Q5_K implementation — signed formula (`dl·(u-16)-ml`) corrected to unsigned (`dl·u-ml`), and qh high‑bit indexing corrected from `qh[sub·4+pos/8] bit pos%8` to `qh[pos] bit sub` (matching llama.cpp's quantizer layout) |
 | **P1: Q4_0 → f32 activation path** | Q4_0 no longer Q8_0‑quantizes activations; routed through the existing f32 matmul kernel (matching llama.cpp Metal). Removed 4 `quantize_q8_0` calls in `layer_gpu` + 1 in `output_norm_gpu`, deleted the dead `quantize_q8_0` method/pipeline/shader. Decode ~+5‑10 %, minimal prefill change |
+| **GQA attention `simd_max` divergence fix** | `kernel_gqa_attn_f32` looped `for (j = tiisg; j < tile_sz; j += 32)` — lanes with `j >= tile_sz` exited early, so `simd_max(dot)` ran across divergent lanes with stale registers, corrupting the online-softmax running max for partial KV tiles (`nkv % 32 != 0`). Symptoms: coherent short replies but repetition loops on longer/37-token prefills, GPU prefill logits cos ≈ 0.83 vs CPU. **Fix**: uniform iteration count + `valid = j < tile_sz` mask (`dot = -INFINITY` for invalid lanes, `e = 0`). Result: prefill logits cos 0.83 → 0.999, gen0 0.96 → 0.999, the looping prompt now generates coherent text matching llama.cpp. Regression test `tests/gqa_attn_isolation.rs` |
 
 ## Remaining Optimization Opportunities
 
@@ -494,7 +495,7 @@ Ranked by estimated impact‑to‑effort ratio for the current workload
 
 | Priority | Item | Impact | Effort | Notes |
 |:---:|------|--------|--------|-------|
-| ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: implemented correctly but 2× slower than the f32 multi kernel for 0.5B-class models — reverted.** Would only pay off for 7B+ models / very long prefill batches |
+| ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: initially 2× slower and reverted, then re-transcribed (P1) with 3 bug fixes — now SHIPPED (see "Prefill Gap" section above): ~+11 % at 30 tokens, ~+34 % at 70 tokens for nt ≥ 16** |
 | **P2** | **KV cache: F32 → F16** | 2× attention bandwidth | Small | Change cache allocation, `store_kv`, `gqa_attn` kernel (~30 lines) |
 | **P3** | **Improve f32 multi kernel occupancy** | up to 2× prefill | Medium | The simple f32 kernel already reaches ~1000 t/s at 70 tokens; tune grid/tile/threads to close the gap to llama.cpp's 1318 t/s |
 | P4 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
