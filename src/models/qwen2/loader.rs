@@ -261,6 +261,20 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
         if let Some(ti) = tensor_map.get(&tn::attn_v(i)) {
             layer.wv = Some(load_tensor(ctx, raw, ti));
         }
+
+        // Fused QKV projection (nt==1 decode): concatenate Wq/Wk/Wv along the
+        // output (row) dim into one GPU buffer so a single matmul produces
+        // q+k+v. Only registered when the three weights share a matmul
+        // (same quant type + same input dim); layer_gpu falls back to three
+        // separate matmuls otherwise.
+        #[cfg(target_os = "macos")]
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
+                if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
+                    mps.register_weight(&format!("blk.{i}.attn_qkv"), &data);
+                }
+            }
+        }
         if let Some(ti) = tensor_map.get(&tn::attn_v_bias(i)) {
             layer.bv = Some(load_tensor(ctx, raw, ti));
         }
@@ -278,6 +292,17 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
         }
         if let Some(ti) = tensor_map.get(&tn::ffn_down(i)) {
             layer.ffn_down = Some(load_tensor(ctx, raw, ti));
+        }
+
+        // Fused FFN gate+up (nt==1 decode): one matmul produces both gate and
+        // up from a concatenated weight (same pattern as attn_qkv).
+        #[cfg(target_os = "macos")]
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
+                if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
+                    mps.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                }
+            }
         }
         layers.push(layer);
     }

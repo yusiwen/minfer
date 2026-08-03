@@ -114,3 +114,38 @@ fn gemm_isolation() {
         assert!(ok_corr, "nt={nt}: GEMM wrong vs CPU (maxdiff_ref={maxdiff_ref:.1e} nan={nan1})");
     }
 }
+
+/// Row-major weight concat along the output (row) dimension must make a fused
+/// matmul equivalent to the separate matmuls — the layout assumption behind the
+/// fused QKV/FFN gate+up decode path (loader concat_rows + one matmul at od =
+/// oq+ok+ov with a shared input read). Pure CPU check, no Metal needed.
+#[test]
+fn qkv_row_concat_layout() {
+    let (id, oq, ok, ov) = (32usize, 64usize, 16usize, 16usize);
+    let synth = |od: usize| -> Vec<u8> {
+        let nblk = id / 32;
+        let mut w = vec![0u8; od * nblk * Q4B];
+        for (i, chunk) in w.chunks_mut(Q4B).enumerate() {
+            let d = 0.03 + (i % 5) as f32 * 0.01;
+            chunk[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            for b in 0..16 {
+                let lo = ((i * 3 + b * 5) % 15) as u8;
+                let hi = ((i * 7 + b * 3) % 15) as u8;
+                chunk[2 + b] = lo | (hi << 4);
+            }
+        }
+        w
+    };
+    let (wq, wk, wv) = (synth(oq), synth(ok), synth(ov));
+    let mut concat = Vec::new();
+    concat.extend_from_slice(&wq);
+    concat.extend_from_slice(&wk);
+    concat.extend_from_slice(&wv);
+    let acts: Vec<f32> = (0..id).map(|i| ((i as f32) * 0.7).sin() * 0.5).collect();
+    let fused = cpu_q4_0_mm(&concat, &acts, oq + ok + ov, id, 1);
+    let mut sep = cpu_q4_0_mm(&wq, &acts, oq, id, 1);
+    sep.extend(cpu_q4_0_mm(&wk, &acts, ok, id, 1));
+    sep.extend(cpu_q4_0_mm(&wv, &acts, ov, id, 1));
+    let maxdiff = fused.iter().zip(&sep).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(maxdiff < 1e-6, "row-major QKV concat mismatch vs separate matmuls: {maxdiff}");
+}
