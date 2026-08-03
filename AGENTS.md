@@ -123,14 +123,29 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > KV-bandwidth-bound), so F16 is opt-in for larger models / longer contexts
 > where attention bandwidth matters.
 
-> **Decode bottleneck is per-dispatch encode cost** (2026-08-01): minfer
-> dispatches ~484 kernels/forward (layer_gpu, 20/layer × 24 + 3 + embed) — nearly
-> identical to llama.cpp's ~490–530 actual Metal kernels (822 ggml graph nodes
-> minus ~300 no-op views). The ~3× decode gap is ~24µs/kernel encode overhead
-> (single command buffer, serial `set_buffer`+`set_bytes` per kernel) vs llama's
-> ~7µs (multi-command-buffer parallel encoding, packed-params `setBytes`). See
-> METAL_OPTIMIZATIONS.md "Decode Gap §0a". Next target: P3 (per-dispatch encode
-> cost + parallel command buffers).
+> **Decode bottleneck is GPU execution, not encode** (2026-08-03, A1 dead-end):
+> minfer dispatches ~484 kernels/forward, but measuring the A1 parallel-encoding
+> prototype showed the **encode is only ~1 ms/step** (4 threads × 6 layers,
+> `MINFER_TIMING`), NOT the ~24µs/kernel × 484 ≈ 11.6 ms the 2026-08-01 analysis
+> claimed. The measured decode step is ~7 ms/token and does not scale with the
+> encode split: parallel encoding into **4 command buffers REGRESSED** decode
+> (120-token gen: 1.67/1.08/1.43 s, nondeterministic, vs serial 0.93 s stable)
+> because each extra command buffer adds GPU launch overhead and the encode is
+> already hidden behind the GPU. **A1 was reverted** (2026-08-03). The decode
+> cost is dominated by GPU execution of the 24 small per-layer kernels
+> (attention reads a growing KV), not by CPU-side encoding. Next target should
+> be GPU-side: kernel fusion / fewer dispatches (e.g. fuse QKV proj into one
+> kernel, larger threadgroups per dispatch), not parallel command buffers.
+
+> **Metal cb/encoder autorelease fix** (2026-08-03, from the A1 prototype): the
+> `metal` crate returns **autoreleased** ObjC objects from `commandBuffer` /
+> `newComputeCommandEncoder` (not `new`). On a background thread, the thread's
+> autorelease pool drains at thread exit → the encoder is released without
+> `endEncoding` → Metal asserts ("Command encoder released without endEncoding")
+> and the process aborts. `cmd_buffer()` now explicitly `retain`s both objects
+> and `MpsCommandBuffer::drop` releases them, so a command buffer created on
+> any thread survives the autorelease-pool drain. Harmless for the serial path;
+> required for any future multi-command-buffer/threaded encoding.
 
 > **GPU-safety measures** (2026-08-02, after an M4 Pro GPU hang froze the
 > machine): (1) `MpsCommandBuffer::submit()` waits **bounded 10 s** and checks
