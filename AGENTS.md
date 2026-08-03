@@ -137,7 +137,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > be GPU-side: kernel fusion / fewer dispatches (e.g. fuse QKV proj into one
 > kernel, larger threadgroups per dispatch), not parallel command buffers.
 
-> **Fused QKV + FFN gate/up matmuls for decode** (2026-08-03, ~24% decode):
+> **Fused QKV + FFN gate/up matmuls for decode** (2026-08-03, ~5% decode):
 > Wq/Wk/Wv and ffn_gate/ffn_up are **row-major-concatenated at load**
 > (`concat_rows` → `blk.{i}.attn_qkv` / `blk.{i}.ffn_gu`) when the weights share
 > a quant type + input dim. For **nt==1 decode only**, layer_gpu runs ONE matmul
@@ -150,8 +150,26 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > `nt==1` + equal weight types. Verified: fused output is **byte-identical** to
 > the separate path (`MINFER_NO_FUSE_QKV=1` A/B diff), and `tests/gemm_isolation.rs`
 > `qkv_row_concat_layout` locks in the row-major layout. Median 200-token decode:
-> 2.25 s → **1.70 s** (~24 %). The FFN gate+up half is the bigger win (largest
-> matmuls, od=4864, shared input read).
+> **1.63 → 1.55 s (~5 %)** at a clean GPU state (the 2026-08-03 "~24 %" figure was
+> inflated by a GPU-state artifact during heavy crash/abort testing).
+
+> **Further dispatch fusions are dead-ends** (2026-08-03): `store_kv_both`
+> (K+V in one kernel) and `residual_rms_norm` (residual add + FFN RMSNorm in one
+> kernel) were implemented, verified correct in isolation
+> (`store_kv_both_isolation` / `residual_rms_norm_isolation`), and REVERTED —
+> they save 2 dispatches/layer but measured **no gain** (1.79 vs 1.74 s). Decode
+> for nt==1 is **weight-read-bound** (~7 ms/token ≈ 4× the ~250 MB model's
+> memory floor at 200 GB/s), NOT dispatch-launch-bound; reducing tiny-kernel
+> launches doesn't move it. The remaining lever is a more efficient nt==1
+> matmul kernel (vectorized block reads / better weight reuse), or attention
+> for very long contexts — not more fusions.
+
+> **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
+> crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
+> bad state producing intermittent wrong logits (different greedy outputs per
+> run, and a transient 8 tok/s prefill). After a clean restart everything is
+> deterministic (6-10/6-10 identical) and prefill recovers to ~500 tok/s. Not a
+> code bug — the Metal runtime/GPU needs a clean process after abort crashes.
 
 > **Metal cb/encoder autorelease fix** (2026-08-03, from the A1 prototype): the
 > `metal` crate returns **autoreleased** ObjC objects from `commandBuffer` /
