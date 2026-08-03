@@ -114,7 +114,8 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > Q5_K) use the scalar f32 multi kernel. This is why Q4_K_M/Q5_K_M prefill is
 > ~240 t/s vs Q4_0's ~554 t/s and llama.cpp's ~1750 t/s. See
 > METAL_OPTIMIZATIONS.md for the full gap analysis and the P1 (non-Q4_0 GEMM)
-> / P3 (decode dispatch) plan.
+> plan (the decode-dispatch plan was replaced by the shipped fused-matmuls +
+> split-attention work).
 
 > **KV cache type** (2026-08-01): GPU KV cache defaults to **F32**;
 > `MINFER_CACHE_TYPE=f16` switches to an F16 cache (2 bytes/elem, llama.cpp's
