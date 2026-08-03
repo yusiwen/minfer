@@ -213,6 +213,25 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > (`MINFER_NO_SPLIT_ATTN=1`) before integration. Median 200-token decode:
 > 1.56 → **1.06 s (~32 %)**.
 
+> **Attention float4 + adaptive chunks + KV geometric growth** (2026-08-03,
+> ~15 % more decode; long-context decode 10.6 → ~8 ms/token at KV≈2510):
+> (1) `kernel_gqa_attn_partial_f32` acc is now `float4 acc4[64]` (vectorized
+> dot/V-accum/corr-scale + float4 tile loads); the scalar dynamic-indexed
+> `float acc[256]` landed in per-thread local memory (a per-thread serial DRAM
+> bottleneck that parallelism didn't fix). Caught a divergent-simd_sum write bug
+> (per-lane d loop) — the reduction MUST be a uniform loop (all lanes step the
+> same d together). (2) `n_chunks` is now adaptive: `clamp((max_pos+1+15)/16,
+> 1, 32)` (more chunks for longer KV). (3) **`kv_ensure_layer` grows KV buffers
+> GEOMETRICALLY (×2)** — it previously grew by exactly `(max_pos+1)*nkt*4`,
+> reallocating a new MTLBuffer + copying the whole old KV on EVERY decode token
+> (the CPU encode cost was O(n²) in context: 0.5 ms at KV≈140 → 4.2 ms at
+> KV≈2510; now ~0.13 ms). ⚠️ During that change a typo cloned `kvec[il]` into
+> `old_v` (V cache polluted with K data → Q4_K_M garbage) — NOT caught by the
+> split-vs-classic A/B because both share the same corrupted KV; caught by
+> checking the output against a known-good reference. Verified: isolation 5
+> passed (nkv up to 4097), all models correct, short 200-token decode
+> 1.06 → **0.88 s**, long-context (KV≈2510) decode ~8 ms/token.
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per
