@@ -1950,29 +1950,37 @@ kernel void kernel_gqa_attn_partial_f32(
 
     int stride_q  = nh * hd;
     int stride_kv = nk * hd;
+    int hd4       = hd / 4;   // hd % 4 == 0 is guarded upstream (layer_gpu)
 
-    device const float * qhead = q + t * stride_q + h * hd;
+    device const float4 * qhead4 = (device const float4 *)(q + t * stride_q + h * hd);
 
-    threadgroup float * k_tile = shmem;
-    threadgroup float * v_tile = shmem + Bc * hd;
+    threadgroup float4 * k_tile4 = (threadgroup float4 *)shmem;
+    threadgroup float4 * v_tile4 = (threadgroup float4 *)(shmem + Bc * hd);
 
     float mx = -INFINITY;
     float S = 0.0f;
-    float acc[256];
-    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
+    // Vectorized float4 accumulator: hd<=256 => at most 64 float4s. Kept small
+    // (64 floats for hd=64) so the compiler can keep it in REGISTERS — the
+    // scalar dynamic-indexed float acc[256] landed in per-thread LOCAL memory,
+    // which was the long-context attention bottleneck (per-thread serial DRAM
+    // RMWs that don't improve with more parallelism).
+    float4 acc4[64];
+    for (int d4 = 0; d4 < hd4; d4++) acc4[d4] = 0.0f;
 
     int n_tiles = (kv_end - kv_start + Bc - 1) / Bc;
     for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
         int ks = kv_start + tile_idx * Bc;
         int tile_sz = min(Bc, kv_end - ks);
 
-        int total = tile_sz * hd;
+        int total4 = tile_sz * hd4;
         int tgsz = 32 * gqa;
-        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
-            int ki = ks + i / hd;
-            int di = i % hd;
-            k_tile[i] = k[ki * stride_kv + hk * hd + di];
-            v_tile[i] = v[ki * stride_kv + hk * hd + di];
+        for (int i = tiisg + (int)sgitg * 32; i < total4; i += tgsz) {
+            int ki = ks + i / hd4;
+            int di = i % hd4;
+            device const float4 * k4 = (device const float4 *)(k + ki * stride_kv + hk * hd);
+            device const float4 * v4 = (device const float4 *)(v + ki * stride_kv + hk * hd);
+            k_tile4[i] = k4[di];
+            v_tile4[i] = v4[di];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1981,21 +1989,24 @@ kernel void kernel_gqa_attn_partial_f32(
             const bool valid = (j < tile_sz);
             float dot = -INFINITY;
             if (valid) {
-                threadgroup float * kj = k_tile + j * hd;
+                threadgroup float4 * kj4 = k_tile4 + j * hd4;
                 dot = 0.0f;
-                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                for (int d4 = 0; d4 < hd4; d4++) {
+                    float4 qv = qhead4[d4] * kj4[d4];
+                    dot += qv.x + qv.y + qv.z + qv.w;
+                }
                 dot *= scale;
             }
 
             float batch_mx = simd_max(dot);
             float new_mx = max(mx, batch_mx);
             float corr = exp(mx - new_mx);
-            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            for (int d4 = 0; d4 < hd4; d4++) acc4[d4] *= corr;
             S *= corr;
             float e = valid ? exp(dot - new_mx) : 0.0f;
             if (valid) {
-                threadgroup float * vj = v_tile + j * hd;
-                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                threadgroup float4 * vj4 = v_tile4 + j * hd4;
+                for (int d4 = 0; d4 < hd4; d4++) acc4[d4] += e * vj4[d4];
                 S += e;
             }
             mx = new_mx;
@@ -2004,7 +2015,6 @@ kernel void kernel_gqa_attn_partial_f32(
     }
 
     S = simd_sum(S);
-    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
 
     // partial layout: [t][h][chunk] = {mx, S, acc[hd]}  (contiguous per chunk)
     int pbase = ((t * nh + h) * n_chunks + chunk) * (2 + hd);
@@ -2013,8 +2023,19 @@ kernel void kernel_gqa_attn_partial_f32(
             partial[pbase + 0] = mx;
             partial[pbase + 1] = S;
         }
-        for (int d = tiisg; d < hd; d += 32) {
-            partial[pbase + 2 + d] = acc[d];
+        // UNIFORM d loop (all 32 lanes step together, so simd_sum reduces the
+        // SAME component across lanes) — a per-lane divergent loop over the
+        // acc4 elements would make simd_sum reduce mismatched values.
+        for (int d = 0; d < hd; d++) {
+            float4 a4 = acc4[d / 4];
+            float val;
+            switch (d % 4) {
+                case 0: val = simd_sum(a4.x); break;
+                case 1: val = simd_sum(a4.y); break;
+                case 2: val = simd_sum(a4.z); break;
+                default: val = simd_sum(a4.w); break;
+            }
+            if (tiisg == 0) partial[pbase + 2 + d] = val;
         }
     }
 }

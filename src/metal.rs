@@ -1178,12 +1178,18 @@ impl MpsState {
                 szvec.push(0);
             }
             if kvec[il].length() < need {
+                // Grow GEOMETRICALLY (double) so the buffer isn't reallocated +
+                // fully copied on EVERY decode token as the KV grows by one row
+                // (that made the CPU encode cost O(n^2) in context length: a new
+                // MTLBuffer + full old-KV memcpy per layer per token). Doubling
+                // amortizes allocation+copy to O(log n) growth events.
+                let new_len = need.max(kvec[il].length() * 2);
                 // Preserve existing KV data when growing the buffer.
                 let old_k = kvec[il].clone();
                 let old_v = vvec[il].clone();
                 let old_len = old_k.length().min(old_v.length());
-                kvec[il] = self.inner.device.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
-                vvec[il] = self.inner.device.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
+                kvec[il] = self.inner.device.new_buffer(new_len, metal::MTLResourceOptions::StorageModeShared);
+                vvec[il] = self.inner.device.new_buffer(new_len, metal::MTLResourceOptions::StorageModeShared);
                 if old_len > 0 {
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1240,6 +1246,11 @@ impl MpsState {
         if hd > 256 {
             gpu_abort(&format!(
                 "attention head dim {hd} > 256 (kernel_gqa_attn float acc[256] would overflow)"
+            ));
+        }
+        if hd % 4 != 0 {
+            gpu_abort(&format!(
+                "attention head dim {hd} % 4 != 0 (kernel_gqa_attn_partial uses float4 vectorized acc)"
             ));
         }
         for (name, v) in [("ne", ne), ("nqt", nqt), ("nkt", nkt), ("nf", nf)] {
@@ -1354,10 +1365,12 @@ impl MpsState {
         let use_fused_qkv = nt == 1 && buf_qkv.is_some()
             && wq.ttype == wk.ttype && wk.ttype == wv.ttype
             && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
-        // KV-parallel attention chunk count (decode): MINFER_ATTN_CHUNKS overrides.
-        // 8 measured best on 0.5B (1.04 s vs 1.55 s classic for 200 tokens).
+        // KV-parallel attention chunk count (decode): adaptive to the current KV
+        // length (max_pos+1) so long contexts get more parallelism; about 16 KV
+        // rows per chunk, capped at 32. MINFER_ATTN_CHUNKS overrides for tuning.
         let split_chunks = std::env::var("MINFER_ATTN_CHUNKS").ok()
-            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 1).unwrap_or(8);
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 1)
+            .unwrap_or_else(|| ((max_pos + 1 + 15) / 16).clamp(1, 32));
         if use_fused_qkv {
             let buf_qkv = buf_qkv.as_ref().unwrap();
             // GPU safety: the concat buffer must exactly match the fused output
