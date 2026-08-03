@@ -137,6 +137,22 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > be GPU-side: kernel fusion / fewer dispatches (e.g. fuse QKV proj into one
 > kernel, larger threadgroups per dispatch), not parallel command buffers.
 
+> **Fused QKV + FFN gate/up matmuls for decode** (2026-08-03, ~24% decode):
+> Wq/Wk/Wv and ffn_gate/ffn_up are **row-major-concatenated at load**
+> (`concat_rows` → `blk.{i}.attn_qkv` / `blk.{i}.ffn_gu`) when the weights share
+> a quant type + input dim. For **nt==1 decode only**, layer_gpu runs ONE matmul
+> per group (od = nqt+2·nkt and 2·nf) into a `buf_bqkv`/`buf_bgu`; the rope/
+> store/swiglu read the q/k/v and gate/up sections via the metal crate's
+> `set_buffer` byte offsets (per-token sections are only contiguous when nt==1,
+> so prefill keeps 3 separate matmuls incl. the Q4_0 GEMM). GPU-safety guards:
+> the concat buffer byte length must exactly equal rows·row_bytes (else
+> `gpu_abort`), bqkv/bgu buffers must be large enough, and the path is gated on
+> `nt==1` + equal weight types. Verified: fused output is **byte-identical** to
+> the separate path (`MINFER_NO_FUSE_QKV=1` A/B diff), and `tests/gemm_isolation.rs`
+> `qkv_row_concat_layout` locks in the row-major layout. Median 200-token decode:
+> 2.25 s → **1.70 s** (~24 %). The FFN gate+up half is the bigger win (largest
+> matmuls, od=4864, shared input read).
+
 > **Metal cb/encoder autorelease fix** (2026-08-03, from the A1 prototype): the
 > `metal` crate returns **autoreleased** ObjC objects from `commandBuffer` /
 > `newComputeCommandEncoder` (not `new`). On a background thread, the thread's
