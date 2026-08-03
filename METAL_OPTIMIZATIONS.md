@@ -450,6 +450,20 @@ For 1‑token decode the matmul kernels are memory‑bound and the scalar
 dot‑product loop is less of a bottleneck. The dominant delta comes from
 three sources:
 
+> **SUPERSEDED (2026-08-03, A1 dead-end):** the "per-dispatch encode cost
+> ~24µs/kernel" premise below does NOT hold for the current code. Measuring the
+> A1 parallel-encoding prototype with `MINFER_TIMING` showed the encode is only
+> **~1 ms/step** (4 threads × 6 layers), and splitting the 24 layers across 4
+> command buffers **regressed** decode (120-token gen: 1.67/1.08/1.43 s,
+> nondeterministic, vs serial 0.93 s stable) — each extra command buffer adds
+> GPU launch overhead, and the encode was already hidden behind GPU execution.
+> The decode step is **GPU execution-bound** (~7 ms/token for Q4_0 on M4 Pro):
+> 24 small per-layer kernels, attention re-reading a growing KV. A1 was reverted
+> (2026-08-03); the next lever is GPU-side kernel fusion / fewer dispatches
+> (e.g. fuse QKV projection into one kernel, larger threadgroups), NOT parallel
+> command buffers. The `retain`/`release` fix for the metal crate's
+> autoreleased cb/encoder objects (required for any cross-thread cb) is kept.
+
 ### 0. KV-cache-growth degradation (2.2× at ~400 KV — the biggest long-context factor)
 
 Measured 2026-08-01 (Q4_0, pure decode):
@@ -562,7 +576,7 @@ dominates.
 | Item | Detail |
 |------|--------|
 | **GPU-hang safety fixes** | After a 2026-08-02 GPU hang (M4 Pro, AGXG16X) that froze the machine, three safety changes: (1) `submit()` now waits **bounded 10 s** (was `DISPATCH_TIME_FOREVER`), checks `MTLCommandBufferStatus`, and prints a **dispatch trace** (`MINFER_TRACE=1` records the last 16 op labels) — a GPU fault/hang now reports and exits instead of blocking forever (which previously let a single fault stall every Metal client incl. WindowServer → whole-machine freeze). (2) `kernel_gqa_attn_f32/f16` no longer `return` early for `h >= nh` before the `threadgroup_barrier` — a per-simdgroup early return deadlocks the GPU when `nh % nk != 0`; invalid heads now run the loop with a dummy index and skip the output write. (3) Runtime guards in `layer_gpu`/`output_norm_gpu`: `nh % nk == 0`, `hd <= 256` (the `acc[256]` array), `id % 32 == 0` — fall back to CPU instead of risking a GPU fault |
-| **Decode bottleneck analysis** | Measured llama.cpp's Metal dispatch count for Qwen2.5-0.5B: 822 ggml graph nodes → ~490–530 actual Metal compute kernels (minfer: ~484). The 3× decode gap is therefore **per-dispatch encode cost** (~24µs vs llama's ~7µs), not the count. Root cause: minfer uses a single command buffer with serial encoding (`set_buffer`×3+`set_bytes`×3+`set_threadgroup_memory_length`+`dispatch` per kernel) vs llama's multi-command-buffer parallel encoding (overlaps CPU encode with GPU execution) and packed-params `setBytes`. See "Decode Gap §0a". Corrects the earlier "484 dispatches is the bottleneck" claim |
+| **Decode bottleneck analysis (corrected 2026-08-03)** | The 2026-08-01 "per-dispatch encode cost ~24µs" premise was measured to be **wrong** for the current code: `MINFER_TIMING` shows the A1 parallel-encoding prototype encodes in **~1 ms/step**, and decode is **GPU-execution-bound** (~7 ms/token Q4_0). A1 (4 parallel command buffers) **regressed** decode (1.67/1.08/1.43 s vs serial 0.93 s, nondeterministic) and was reverted. The real lever is GPU-side kernel fusion / fewer dispatches, not parallel encoding |
 | **Sampling pipeline rewrite** | `sampler.rs`: fixed `apply_top_p` double-softmax bug (excluded tokens now `-INFINITY`, logits not clobbered to probabilities), added `apply_repetition_penalty` (llama `repeat_penalty` on last 64 tokens), seeded `StdRng` (`--seed`, default 42), unified `sample()` entry. Defaults now match llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`. CLI flags `--temp/--greedy/--top-k/--top-p/--repeat-penalty/-n/--seed`. **Repeat penalty alone breaks the 0.5B model's greedy repetition loops** (previously hit the n_predict cap repeating; now stops at EOS). 7 new sampler unit tests |
 | **F16 KV cache (opt-in, measured no gain)** | `MINFER_CACHE_TYPE=f16` (default f32): `kernel_store_kv_f16` + `kernel_gqa_attn_f16`, f16 allocation in `kv_ensure_layer`, f16→f32 in `sync_kv_to_cpu`. Correct (gen0 logits cos 0.9997), ~3% slower on 0.5B (dispatch-latency-bound) — kept opt-in for larger models. Attention isolation test now covers both `kernel_gqa_attn_f32` and `kernel_gqa_attn_f16` |
 | Q5_1 Metal kernel | `kernel_q5_1_f32_matmul` + `_multi` (F32 activation path, same structure as Q5_0) |
@@ -572,6 +586,7 @@ dominates.
 | Q5_K formula + qh‑indexing fixes | Two independent bugs in minfer's CPU Q5_K implementation — signed formula (`dl·(u-16)-ml`) corrected to unsigned (`dl·u-ml`), and qh high‑bit indexing corrected from `qh[sub·4+pos/8] bit pos%8` to `qh[pos] bit sub` (matching llama.cpp's quantizer layout) |
 | **P1: Q4_0 → f32 activation path** | Q4_0 no longer Q8_0‑quantizes activations; routed through the existing f32 matmul kernel (matching llama.cpp Metal). Removed 4 `quantize_q8_0` calls in `layer_gpu` + 1 in `output_norm_gpu`, deleted the dead `quantize_q8_0` method/pipeline/shader. Decode ~+5‑10 %, minimal prefill change |
 | **GQA attention `simd_max` divergence fix** | `kernel_gqa_attn_f32` looped `for (j = tiisg; j < tile_sz; j += 32)` — lanes with `j >= tile_sz` exited early, so `simd_max(dot)` ran across divergent lanes with stale registers, corrupting the online-softmax running max for partial KV tiles (`nkv % 32 != 0`). Symptoms: coherent short replies but repetition loops on longer/37-token prefills, GPU prefill logits cos ≈ 0.83 vs CPU. **Fix**: uniform iteration count + `valid = j < tile_sz` mask (`dot = -INFINITY` for invalid lanes, `e = 0`). Result: prefill logits cos 0.83 → 0.999, gen0 0.96 → 0.999, the looping prompt now generates coherent text matching llama.cpp. Regression test `tests/gqa_attn_isolation.rs` |
+| **Metal cb/encoder autorelease fix** | The `metal` crate returns **autoreleased** ObjC objects from `commandBuffer` / `newComputeCommandEncoder`. `cmd_buffer()` now explicitly `retain`s both and `MpsCommandBuffer::drop` releases them, so a cb created on any thread survives that thread's autorelease-pool drain (a background-thread cb previously got its encoder released without `endEncoding` → Metal assert + abort). Discovered while prototyping A1 parallel encoding; harmless for the serial path, required for any future threaded encoding |
 
 ## Remaining Optimization Opportunities
 
@@ -585,7 +600,7 @@ context) / 3.2× (long context).
 | ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: initially 2× slower and reverted, then re-transcribed (P1) with 3 bug fixes — now SHIPPED (see "Prefill Gap" section above): ~+11 % at 30 tokens, ~+34 % at 70 tokens for nt ≥ 16** |
 | **P1** | **GEMM kernels for non‑Q4_0 quants** | up to ~7× prefill (Q4_K_M / Q5_K_M) | Large | Extend the Q4_0 GEMM transcription pattern to `q5_0/q5_1/q8_0/q4_k/q6_k` (each needs its own dequant→sa staging). Currently non‑Q4_0 weights fall back to the scalar f32 multi kernel → Q4_K_M prefill ~240 t/s vs llama's ~1750 t/s. This also speeds up their decode |
 | **P2** | **KV cache: F32 → F16 (implemented, opt-in)** | ~0 for 0.5B; helps larger models / long context | Small | **Implemented 2026-08-01** as `MINFER_CACHE_TYPE=f16` (default f32). `kernel_store_kv_f16` + `kernel_gqa_attn_f16`. Measured F16 is ~3% **slower** on the 0.5B model — decode is dispatch-latency-bound, not KV-bandwidth-bound (attention ≈ 5% of decode work; KV read ≈ 0.5% of ~200 GB/s bandwidth). Kept opt-in for larger models where attention bandwidth dominates |
-| **P3** | **Reduce per-dispatch encode cost + parallel command buffers** | ~1.5–3× decode | Medium | llama.cpp and minfer dispatch ~490–530 kernels/forward, but llama costs ~7µs/kernel vs minfer's ~24µs. Two levers: (A2) pack `set_bytes` params into one struct + cache pipeline/buffer binds; (A1) encode node ranges on extra threads into multiple command buffers (llama `ggml_metal_graph_compute` pattern) to overlap encode with GPU execution. Also fuse K-RoPE into the KV store (-1 dispatch/layer) |
+| **P3** | ~~Reduce per-dispatch encode cost + parallel command buffers~~ (A1 dead-end 2026-08-03) | — | — | ~~A1 (parallel command buffers)~~ **tested and REVERTED 2026-08-03**: encode is ~1 ms/step (not the ~24µs/kernel claim), so 4 parallel command buffers only added GPU launch overhead (decode regressed, nondeterministic). A2 (packed `set_bytes`) is already shipped. Replaced by **GPU-side fusion**: fuse QKV projection into one kernel, larger threadgroups, fuse K-RoPE into the KV store (-1 dispatch/layer) |
 | P4 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
 | P5 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
 | P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |

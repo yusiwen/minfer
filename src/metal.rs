@@ -5,6 +5,8 @@
 use std::sync::OnceLock;
 use crate::tensor::{Tensor, TensorType};
 use crate::block::Q8B;
+#[cfg(target_os = "macos")]
+use metal::objc::{msg_send, sel, sel_impl};
 
 static MPS: OnceLock<Option<MpsState>> = OnceLock::new();
 
@@ -106,13 +108,26 @@ struct MpsStateInner {
 #[cfg(target_os = "macos")]
 pub struct MpsCommandBuffer<'a> {
     state: &'a MpsStateInner,
+    // The metal crate returns AUTORELEASED objects from `commandBuffer` /
+    // `newComputeCommandEncoder` (not `new`). cmd_buffer() retains them (and
+    // Drop releases), so the objects survive the creating thread's
+    // autorelease-pool drain — required whenever a command buffer is created on
+    // a background thread (parallel encoding) or handed across threads.
     cmd_buf: &'a metal::CommandBufferRef,
     enc: &'a metal::ComputeCommandEncoderRef,
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for MpsCommandBuffer<'_> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Release the retains taken in cmd_buffer(). This MUST happen after the
+        // encoder is ended and the command buffer committed, so Metal sees a
+        // clean lifecycle (no "encoder released without endEncoding").
+        unsafe {
+            let _: () = msg_send![self.cmd_buf, release];
+            let _: () = msg_send![self.enc, release];
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -733,9 +748,17 @@ impl MpsState {
         #[cfg(not(target_os = "macos"))] { unreachable!() }
         #[cfg(target_os = "macos")]
         {
-            let cmd_buf = self.inner.queue.new_command_buffer();
-            let enc = cmd_buf.new_compute_command_encoder();
-            MpsCommandBuffer { state: &self.inner, cmd_buf, enc }
+            let cmd_buf_ref = self.inner.queue.new_command_buffer();
+            let enc_ref = cmd_buf_ref.new_compute_command_encoder();
+            // The metal crate returns autoreleased objects (`commandBuffer`, not
+            // `newCommandBuffer`). Retain so the cb survives the creating
+            // thread's autorelease-pool drain when it crosses threads; Drop
+            // releases.
+            unsafe {
+                let _: *mut metal::objc::runtime::Object = msg_send![cmd_buf_ref, retain];
+                let _: *mut metal::objc::runtime::Object = msg_send![enc_ref, retain];
+            }
+            MpsCommandBuffer { state: &self.inner, cmd_buf: cmd_buf_ref, enc: enc_ref }
         }
     }
 
