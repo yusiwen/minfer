@@ -164,6 +164,21 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > matmul kernel (vectorized block reads / better weight reuse), or attention
 > for very long contexts — not more fusions.
 
+> **nt==1 matmul rewrite is ALSO a dead-end — kernels already hit memory
+> bandwidth** (2026-08-03): batched command-buffer benchmarking (many matmuls in
+> ONE cb, removing the per-cb launch+sync overhead that confounds single-dispatch
+> isolation timings) shows the current `kernel_q4_0_f32_matmul` reaches
+> **182–240 GB/s** (near the M4 Pro floor): fused GU 0.027 ms, vocab output
+> 0.32 ms. A custom full-block matvec kernel was ~equal (GU +15 %, vocab −30 %)
+> and the prefill GEMM is 3× SLOWER at nt==1 (its 32-token tile is wasted), so
+> none were integrated. The ~7 ms/token decode is therefore NOT the matmul
+> kernels — it is the growing-KV attention + ~120 small kernels/layer + the
+> per-token command-buffer submit/sync. Next lever: profile the attention and
+> small-kernel GPU time in the real decode (batched methodology), not more
+> matmul rewrites. Also: single-dispatch isolation timing is UNRELIABLE for
+> small kernels (a ~165 µs cb launch+sync floor dominates; always batch ≥ dozens
+> of dispatches per command buffer before trusting a per-matmul time).
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per
