@@ -21,9 +21,7 @@ kernel void kernel_q4_0_q8_0_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const uchar  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tid   [[thread_position_in_threadgroup]]
 ) {
@@ -39,9 +37,9 @@ kernel void kernel_q4_0_q8_0_matmul(
     const int t     = (int)tgpig.y;      // token index
     const int r0    = ((int)tgpig.x * NSG + sgitg) * NR0; // base output row
 
-    if (t >= nt || r0 >= od) return;
+    if (t >= p[2] || r0 >= p[0]) return;
 
-    const int nb  = id / 32;
+    const int nb  = p[1] / 32;
     const int q4s = nb * Q4B;
     const int q8s = nb * Q8B;
 
@@ -59,7 +57,7 @@ kernel void kernel_q4_0_q8_0_matmul(
 
         for (int row = 0; row < NR0; row++) {
             int o = r0 + row;
-            if (o >= od) break;
+            if (o >= p[0]) break;
 
             device const uchar * wr = weights + o * q4s;
             device const half * wb = (device const half *)(wr + b * Q4B);
@@ -79,10 +77,10 @@ kernel void kernel_q4_0_q8_0_matmul(
     // Reduce each row across the simdgroup and write.
     for (int row = 0; row < NR0; row++) {
         int o = r0 + row;
-        if (o < od) {
+        if (o < p[0]) {
             float total = simd_sum(sumf[row]);
             if (tiisg == 0) {
-                output[t * od + o] = total;
+                output[t * p[0] + o] = total;
             }
         }
     }
@@ -97,9 +95,7 @@ kernel void kernel_q4_0_q8_0_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const uchar  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tid   [[thread_position_in_threadgroup]]
 ) {
@@ -111,13 +107,13 @@ kernel void kernel_q4_0_q8_0_matmul_multi(
     const int sgitg = (int)tid.x / NW;
     const int r0    = ((int)tgpig.x * NSG + sgitg) * NR0;
 
-    if (r0 >= od) return;
+    if (r0 >= p[0]) return;
 
-    const int nb  = id / 32;
+    const int nb  = p[1] / 32;
     const int q4s = nb * Q4B;
     const int q8s = nb * Q8B;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * xr = acts + t * q8s;
         float sumf[NR0];
         for (int row = 0; row < NR0; row++) sumf[row] = 0.0f;
@@ -129,7 +125,7 @@ kernel void kernel_q4_0_q8_0_matmul_multi(
 
             for (int row = 0; row < NR0; row++) {
                 int o = r0 + row;
-                if (o >= od) break;
+                if (o >= p[0]) break;
 
                 device const uchar * wr = weights + o * q4s;
                 device const half * wb = (device const half *)(wr + b * Q4B);
@@ -148,9 +144,9 @@ kernel void kernel_q4_0_q8_0_matmul_multi(
 
         for (int row = 0; row < NR0; row++) {
             int o = r0 + row;
-            if (o < od) {
+            if (o < p[0]) {
                 float total = simd_sum(sumf[row]);
-                if (tiisg == 0) output[t * od + o] = total;
+                if (tiisg == 0) output[t * p[0] + o] = total;
             }
         }
     }
@@ -179,9 +175,7 @@ kernel void kernel_q5_0_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -189,20 +183,20 @@ kernel void kernel_q5_0_f32_matmul(
     const short NR0 = 4;
     const short NSG = 2;
     const short NW  = 32;
-    const int nb  = id / 32;
+    const int nb  = p[1] / 32;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int q5s = nb * 22;
-    device const float * y = acts + t * id;
+    device const float * y = acts + t * p[1];
 
     float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     for (int b = tiisg; b < nb; b += NW) {
         device const uchar * xb = weights + r0 * q5s + b * 22;
         for (int row = 0; row < NR0; row++) {
-            if (r0 + row >= od) break;
+            if (r0 + row >= p[0]) break;
             device const uchar * blk = xb + row * q5s;
             float d = float(*(device const half *)blk);
             uint32_t qhb = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) | ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
@@ -220,9 +214,9 @@ kernel void kernel_q5_0_f32_matmul(
     }
 
     for (int row = 0; row < NR0; row++) {
-        if (r0 + row < od) {
+        if (r0 + row < p[0]) {
             float total = simd_sum(sumf[row]);
-            if (tiisg == 0) output[t * od + r0 + row] = total;
+            if (tiisg == 0) output[t * p[0] + r0 + row] = total;
         }
     }
 }
@@ -231,9 +225,7 @@ kernel void kernel_q5_0_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -241,18 +233,18 @@ kernel void kernel_q5_0_f32_matmul_multi(
     const short NR0 = 4;
     const short NSG = 2;
     const short NW  = 32;
-    const int nb  = id / 32;
+    const int nb  = p[1] / 32;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int q5s = nb * 22;
 
-    for (int t = 0; t < nt; t++) {
-        device const float * y = acts + t * id;
+    for (int t = 0; t < p[2]; t++) {
+        device const float * y = acts + t * p[1];
         float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         for (int b = tiisg; b < nb; b += NW) {
             device const uchar * xb = weights + r0 * q5s + b * 22;
             for (int row = 0; row < NR0; row++) {
-                if (r0 + row >= od) break;
+                if (r0 + row >= p[0]) break;
                 device const uchar * blk = xb + row * q5s;
                 float d = float(*(device const half *)blk);
                 uint32_t qhb = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) | ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
@@ -270,9 +262,9 @@ kernel void kernel_q5_0_f32_matmul_multi(
         }
 
         for (int row = 0; row < NR0; row++) {
-            if (r0 + row < od) {
+            if (r0 + row < p[0]) {
                 float total = simd_sum(sumf[row]);
-                if (tiisg == 0) output[t * od + r0 + row] = total;
+                if (tiisg == 0) output[t * p[0] + r0 + row] = total;
             }
         }
     }
@@ -297,26 +289,24 @@ kernel void kernel_q4_0_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const int nb  = id / QK;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int q4s = nb * Q4B;
     device const uchar * ax0 = weights + (r0 + 0) * q4s;
     device const uchar * ax1 = weights + (r0 + 1) * q4s;
     device const uchar * ax2 = weights + (r0 + 2) * q4s;
     device const uchar * ax3 = weights + (r0 + 3) * q4s;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
@@ -336,10 +326,10 @@ kernel void kernel_q4_0_f32_matmul(
             yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
         }
         float sy = sumy0 + sumy1;
-        if (r0 + 0 < od) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
-        if (r0 + 1 < od) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
-        if (r0 + 2 < od) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
-        if (r0 + 3 < od) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
+        if (r0 + 0 < p[0]) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
+        if (r0 + 1 < p[0]) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
+        if (r0 + 2 < p[0]) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
+        if (r0 + 3 < p[0]) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
         yb += QK * NQ_Q;
     }
 
@@ -348,10 +338,10 @@ kernel void kernel_q4_0_f32_matmul(
     sumf2 = simd_sum(sumf2);
     sumf3 = simd_sum(sumf3);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-        if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-        if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+        if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+        if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
     }
 }
 
@@ -385,26 +375,24 @@ kernel void kernel_q5_1_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const int nb  = id / QK;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int q5s = nb * 24;
     device const uchar * ax0 = weights + (r0 + 0) * q5s;
     device const uchar * ax1 = weights + (r0 + 1) * q5s;
     device const uchar * ax2 = weights + (r0 + 2) * q5s;
     device const uchar * ax3 = weights + (r0 + 3) * q5s;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
@@ -424,20 +412,20 @@ kernel void kernel_q5_1_f32_matmul(
             yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
         }
         float sy = sumy0 + sumy1;
-        if (r0 + 0 < od) sumf0 += block_q5_1_dot_y(ax0 + ib * 24, sy, yl, il);
-        if (r0 + 1 < od) sumf1 += block_q5_1_dot_y(ax1 + ib * 24, sy, yl, il);
-        if (r0 + 2 < od) sumf2 += block_q5_1_dot_y(ax2 + ib * 24, sy, yl, il);
-        if (r0 + 3 < od) sumf3 += block_q5_1_dot_y(ax3 + ib * 24, sy, yl, il);
+        if (r0 + 0 < p[0]) sumf0 += block_q5_1_dot_y(ax0 + ib * 24, sy, yl, il);
+        if (r0 + 1 < p[0]) sumf1 += block_q5_1_dot_y(ax1 + ib * 24, sy, yl, il);
+        if (r0 + 2 < p[0]) sumf2 += block_q5_1_dot_y(ax2 + ib * 24, sy, yl, il);
+        if (r0 + 3 < p[0]) sumf3 += block_q5_1_dot_y(ax3 + ib * 24, sy, yl, il);
         yb += QK * NQ_Q;
     }
 
     sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
     sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-        if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-        if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+        if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+        if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
     }
 }
 
@@ -445,28 +433,26 @@ kernel void kernel_q5_1_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const int nb  = id / QK;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
 
     const int q5s = nb * 24;
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * ax0 = weights + (r0 + 0) * q5s;
         device const uchar * ax1 = weights + (r0 + 1) * q5s;
         device const uchar * ax2 = weights + (r0 + 2) * q5s;
         device const uchar * ax3 = weights + (r0 + 3) * q5s;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
 
         float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
         float yl[16];
@@ -483,20 +469,20 @@ kernel void kernel_q5_1_f32_matmul_multi(
                 yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
             }
             float sy = sumy0 + sumy1;
-            if (r0 + 0 < od) sumf0 += block_q5_1_dot_y(ax0 + ib * 24, sy, yl, il);
-            if (r0 + 1 < od) sumf1 += block_q5_1_dot_y(ax1 + ib * 24, sy, yl, il);
-            if (r0 + 2 < od) sumf2 += block_q5_1_dot_y(ax2 + ib * 24, sy, yl, il);
-            if (r0 + 3 < od) sumf3 += block_q5_1_dot_y(ax3 + ib * 24, sy, yl, il);
+            if (r0 + 0 < p[0]) sumf0 += block_q5_1_dot_y(ax0 + ib * 24, sy, yl, il);
+            if (r0 + 1 < p[0]) sumf1 += block_q5_1_dot_y(ax1 + ib * 24, sy, yl, il);
+            if (r0 + 2 < p[0]) sumf2 += block_q5_1_dot_y(ax2 + ib * 24, sy, yl, il);
+            if (r0 + 3 < p[0]) sumf3 += block_q5_1_dot_y(ax3 + ib * 24, sy, yl, il);
             yb += QK * NQ_Q;
         }
 
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+            if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+            if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
         }
     }
 }
@@ -509,28 +495,26 @@ kernel void kernel_q4_0_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const int nb  = id / QK;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
 
     const int q4s = nb * Q4B;
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * ax0 = weights + (r0 + 0) * q4s;
         device const uchar * ax1 = weights + (r0 + 1) * q4s;
         device const uchar * ax2 = weights + (r0 + 2) * q4s;
         device const uchar * ax3 = weights + (r0 + 3) * q4s;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
 
         float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
         float yl[16];
@@ -547,20 +531,20 @@ kernel void kernel_q4_0_f32_matmul_multi(
                 yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
             }
             float sy = sumy0 + sumy1;
-            if (r0 + 0 < od) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
-            if (r0 + 1 < od) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
-            if (r0 + 2 < od) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
-            if (r0 + 3 < od) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
+            if (r0 + 0 < p[0]) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
+            if (r0 + 1 < p[0]) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
+            if (r0 + 2 < p[0]) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
+            if (r0 + 3 < p[0]) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
             yb += QK * NQ_Q;
         }
 
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+            if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+            if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
         }
     }
 }
@@ -596,9 +580,7 @@ kernel void kernel_q4_0_mm_f32(
     device const uchar * weights [[buffer(0)]],
     device const float * acts    [[buffer(1)]],
     device       float * output  [[buffer(2)]],
-    constant    int    & od      [[buffer(3)]],
-    constant    int    & id      [[buffer(4)]],
-    constant    int    & nt      [[buffer(5)]],
+    constant    int    * p       [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiitg [[thread_index_in_threadgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -610,7 +592,7 @@ kernel void kernel_q4_0_mm_f32(
     constexpr int NL0 = 2;   // NK/16
     constexpr int NL1 = 4;   // NK/8
 
-    const int M = od, K = id, N = nt;
+    const int M = p[0], K = p[1], N = p[2];
     const int nblk = K / 32;
 
     const int r0 = (int)tgpig.y * NR0;
@@ -661,7 +643,7 @@ kernel void kernel_q4_0_mm_f32(
         const short by = (tiitg/NL1)/8;               // N group (raw, fills OOB rows w/ clamp data)
         const short bly = (tiitg/NL1)%8;              // N sub   (raw)
         const short bib = 4*bx + by;
-        device const float * y = acts + (r1 + lr1)*id + loop_k + iy;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -686,12 +668,12 @@ kernel void kernel_q4_0_mm_f32(
         }
     }
 
-    // === Store C (M×N) to output (N×M = [nt][od]) ===
+    // === Store C (M×N) to output (N×M = [p[2]][p[0]]) ===
     if (r0 + NR0 <= M && r1 + NR1 <= N) {
         // full tile: direct transposed store
-        device float * C = output + (r1 + 16*(sgitg >> 1))*od + (r0 + 32*(sgitg & 1));
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
         for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i/4)*od + 8*(i%4), od, 0, false);
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
         // partial tile (bc_out): per-simdgroup temp_str + float4 copy
@@ -702,7 +684,7 @@ kernel void kernel_q4_0_mm_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgitg == 0) {
             for (int j = (int)tiitg; j < nr1; j += NR1) {
-                device float  * D  = output + r0 + (r1 + j)*od;
+                device float  * D  = output + r0 + (r1 + j)*p[0];
                 device float4 * D4 = (device float4 *)D;
                 threadgroup float  * C  = temp_str + j*NR0;
                 threadgroup float4 * C4 = (threadgroup float4 *)C;
@@ -738,26 +720,24 @@ kernel void kernel_q4_1_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const int nb  = id / QK;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int q41s = nb * Q41B;
     device const uchar * ax0 = weights + (r0 + 0) * q41s;
     device const uchar * ax1 = weights + (r0 + 1) * q41s;
     device const uchar * ax2 = weights + (r0 + 2) * q41s;
     device const uchar * ax3 = weights + (r0 + 3) * q41s;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
@@ -777,10 +757,10 @@ kernel void kernel_q4_1_f32_matmul(
             yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
         }
         float sy = sumy0 + sumy1;
-        if (r0 + 0 < od) sumf0 += block_q4_1_dot_y(ax0 + ib * Q41B, sy, yl, il);
-        if (r0 + 1 < od) sumf1 += block_q4_1_dot_y(ax1 + ib * Q41B, sy, yl, il);
-        if (r0 + 2 < od) sumf2 += block_q4_1_dot_y(ax2 + ib * Q41B, sy, yl, il);
-        if (r0 + 3 < od) sumf3 += block_q4_1_dot_y(ax3 + ib * Q41B, sy, yl, il);
+        if (r0 + 0 < p[0]) sumf0 += block_q4_1_dot_y(ax0 + ib * Q41B, sy, yl, il);
+        if (r0 + 1 < p[0]) sumf1 += block_q4_1_dot_y(ax1 + ib * Q41B, sy, yl, il);
+        if (r0 + 2 < p[0]) sumf2 += block_q4_1_dot_y(ax2 + ib * Q41B, sy, yl, il);
+        if (r0 + 3 < p[0]) sumf3 += block_q4_1_dot_y(ax3 + ib * Q41B, sy, yl, il);
         yb += QK * NQ_Q;
     }
 
@@ -789,10 +769,10 @@ kernel void kernel_q4_1_f32_matmul(
     sumf2 = simd_sum(sumf2);
     sumf3 = simd_sum(sumf3);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-        if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-        if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+        if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+        if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
     }
 }
 
@@ -802,26 +782,24 @@ kernel void kernel_q4_1_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const short NR0 = 4; const short NSG = 2;
-    const int nb = id / QK;
+    const int nb = p[1] / QK;
     const int r0 = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int q41s = nb * Q41B;
     const short ix = (short)tiisg / (NW_Q / NQ_Q);
     const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * ax0 = weights + (r0 + 0) * q41s;
         device const uchar * ax1 = weights + (r0 + 1) * q41s;
         device const uchar * ax2 = weights + (r0 + 2) * q41s;
         device const uchar * ax3 = weights + (r0 + 3) * q41s;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
         float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
         float yl[16]; device const float * yb = y + ix * QK + il;
         for (int ib = ix; ib < nb; ib += NQ_Q) {
@@ -834,19 +812,19 @@ kernel void kernel_q4_1_f32_matmul_multi(
                 yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
             }
             float sy = sumy0 + sumy1;
-            if (r0 + 0 < od) sumf0 += block_q4_1_dot_y(ax0 + ib * Q41B, sy, yl, il);
-            if (r0 + 1 < od) sumf1 += block_q4_1_dot_y(ax1 + ib * Q41B, sy, yl, il);
-            if (r0 + 2 < od) sumf2 += block_q4_1_dot_y(ax2 + ib * Q41B, sy, yl, il);
-            if (r0 + 3 < od) sumf3 += block_q4_1_dot_y(ax3 + ib * Q41B, sy, yl, il);
+            if (r0 + 0 < p[0]) sumf0 += block_q4_1_dot_y(ax0 + ib * Q41B, sy, yl, il);
+            if (r0 + 1 < p[0]) sumf1 += block_q4_1_dot_y(ax1 + ib * Q41B, sy, yl, il);
+            if (r0 + 2 < p[0]) sumf2 += block_q4_1_dot_y(ax2 + ib * Q41B, sy, yl, il);
+            if (r0 + 3 < p[0]) sumf3 += block_q4_1_dot_y(ax3 + ib * Q41B, sy, yl, il);
             yb += QK * NQ_Q;
         }
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+            if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+            if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
         }
     }
 }
@@ -873,9 +851,7 @@ kernel void kernel_q5_k_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -886,15 +862,15 @@ kernel void kernel_q5_k_f32_matmul(
     const short NSG = 2;
     const short NW  = 32;
 
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int row_stride = nbe * Q5KB;
     device const uchar * w0 = weights + (r0 + 0) * row_stride;
     device const uchar * w1 = weights + (r0 + 1) * row_stride;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     float sumf0 = 0.0f, sumf1 = 0.0f;
 
@@ -957,8 +933,8 @@ kernel void kernel_q5_k_f32_matmul(
     sumf0 = simd_sum(sumf0);
     sumf1 = simd_sum(sumf1);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
     }
 }
 
@@ -968,9 +944,7 @@ kernel void kernel_q5_k_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -980,14 +954,14 @@ kernel void kernel_q5_k_f32_matmul_multi(
     const short NR0 = 2;
     const short NSG = 2;
     const short NW  = 32;
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int row_stride = nbe * Q5KB;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * w0 = weights + (r0 + 0) * row_stride;
         device const uchar * w1 = weights + (r0 + 1) * row_stride;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
         float sumf0 = 0.0f, sumf1 = 0.0f;
         for (int ib = (int)tiisg; ib < nbe; ib += NW) {
             device const uchar * blk0 = w0 + ib * Q5KB;
@@ -1035,8 +1009,8 @@ kernel void kernel_q5_k_f32_matmul_multi(
         }
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
         }
     }
 }
@@ -1052,9 +1026,7 @@ kernel void kernel_q4_k_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -1065,15 +1037,15 @@ kernel void kernel_q4_k_f32_matmul(
     const short NSG = 2;
     const short NW  = 32;
 
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int row_stride = nbe * Q4KB;
     device const uchar * w0 = weights + (r0 + 0) * row_stride;
     device const uchar * w1 = weights + (r0 + 1) * row_stride;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     float sumf0 = 0.0f, sumf1 = 0.0f;
 
@@ -1133,8 +1105,8 @@ kernel void kernel_q4_k_f32_matmul(
     sumf0 = simd_sum(sumf0);
     sumf1 = simd_sum(sumf1);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
     }
 }
 
@@ -1144,23 +1116,21 @@ kernel void kernel_q4_k_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const int QKK = 256; const int Q4KB = 144;
     const short NR0 = 2; const short NSG = 2; const short NW = 32;
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int row_stride = nbe * Q4KB;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * w0 = weights + (r0 + 0) * row_stride;
         device const uchar * w1 = weights + (r0 + 1) * row_stride;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
         float sumf0 = 0.0f, sumf1 = 0.0f;
         for (int ib = (int)tiisg; ib < nbe; ib += NW) {
             device const uchar * blk0 = w0 + ib * Q4KB;
@@ -1206,8 +1176,8 @@ kernel void kernel_q4_k_f32_matmul_multi(
         }
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
         }
     }
 }
@@ -1222,9 +1192,7 @@ kernel void kernel_q6_k_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
@@ -1235,15 +1203,15 @@ kernel void kernel_q6_k_f32_matmul(
     const short NSG = 2;
     const short NW  = 32;
 
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
-    if (t >= nt) return;
+    if (t >= p[2]) return;
 
     const int row_stride = nbe * Q6KB;
     device const uchar * w0 = weights + (r0 + 0) * row_stride;
     device const uchar * w1 = weights + (r0 + 1) * row_stride;
-    device const float  * y  = acts + t * id;
+    device const float  * y  = acts + t * p[1];
 
     float sumf0 = 0.0f, sumf1 = 0.0f;
 
@@ -1293,8 +1261,8 @@ kernel void kernel_q6_k_f32_matmul(
     sumf0 = simd_sum(sumf0);
     sumf1 = simd_sum(sumf1);
     if (tiisg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
     }
 }
 
@@ -1304,23 +1272,21 @@ kernel void kernel_q6_k_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const int QKK = 256; const int Q6KB = 210;
     const short NR0 = 2; const short NSG = 2; const short NW = 32;
-    const int nbe = id / QKK;
+    const int nbe = p[1] / QKK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int row_stride = nbe * Q6KB;
 
-    for (int t = 0; t < nt; t++) {
+    for (int t = 0; t < p[2]; t++) {
         device const uchar * w0 = weights + (r0 + 0) * row_stride;
         device const uchar * w1 = weights + (r0 + 1) * row_stride;
-        device const float  * y  = acts + t * id;
+        device const float  * y  = acts + t * p[1];
         float sumf0 = 0.0f, sumf1 = 0.0f;
         for (int ib = (int)tiisg; ib < nbe; ib += NW) {
             device const uchar * blk0 = w0 + ib * Q6KB;
@@ -1360,8 +1326,8 @@ kernel void kernel_q6_k_f32_matmul_multi(
         }
         sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
         if (tiisg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
         }
     }
 }
@@ -1376,9 +1342,7 @@ kernel void kernel_q8_0_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -1389,13 +1353,13 @@ kernel void kernel_q8_0_f32_matmul(
     const short NW  = 32;
     const short NQ  = 8;
 
-    const int nb = id / QK;
+    const int nb = p[1] / QK;
     const int r0 = (int)tgpig.x * NR0;
     const int t  = (int)tgpig.y;
-    if (t >= nt || r0 >= od) return;
+    if (t >= p[2] || r0 >= p[0]) return;
 
     const int q8s = nb * Q8B;
-    device const float * y = acts + t * id;
+    device const float * y = acts + t * p[1];
 
     device const uchar * ax0 = weights + (r0 + 0) * q8s;
     device const uchar * ax1 = weights + (r0 + 1) * q8s;
@@ -1444,8 +1408,8 @@ kernel void kernel_q8_0_f32_matmul(
     float tot0 = simd_sum(sh0[tiisg]);
     float tot1 = simd_sum(sh1[tiisg]);
     if (tiisg == 0 && sgitg == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = tot0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = tot1;
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = tot0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = tot1;
     }
 }
 
@@ -1455,16 +1419,14 @@ kernel void kernel_q8_0_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
-    constant    int     & od       [[buffer(3)]],
-    constant    int     & id       [[buffer(4)]],
-    constant    int     & nt       [[buffer(5)]],
+    constant    int     * p        [[buffer(3)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     threadgroup float  * shmem     [[threadgroup(0)]]
 ) {
     const short NR0 = 2; const short NSG = 4; const short NW = 32; const short NQ = 8;
-    const int nb = id / QK;
+    const int nb = p[1] / QK;
     const int r0 = (int)tgpig.x * NR0;
     const int q8s = nb * Q8B;
     const short ix = tiisg / (NW / NQ);
@@ -1476,8 +1438,8 @@ kernel void kernel_q8_0_f32_matmul_multi(
     device const uchar * ax0 = weights + (r0 + 0) * q8s;
     device const uchar * ax1 = weights + (r0 + 1) * q8s;
 
-    for (int t = 0; t < nt; t++) {
-        device const float * y = acts + t * id;
+    for (int t = 0; t < p[2]; t++) {
+        device const float * y = acts + t * p[1];
         sh0[tiisg] = 0.0f; sh1[tiisg] = 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float sumf0 = 0.0f, sumf1 = 0.0f;
@@ -1499,8 +1461,8 @@ kernel void kernel_q8_0_f32_matmul_multi(
         float tot0 = simd_sum(sh0[tiisg]);
         float tot1 = simd_sum(sh1[tiisg]);
         if (tiisg == 0 && sgitg == 0) {
-            if (r0 + 0 < od) output[t * od + r0 + 0] = tot0;
-            if (r0 + 1 < od) output[t * od + r0 + 1] = tot1;
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = tot0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = tot1;
         }
     }
 }
@@ -1695,7 +1657,7 @@ kernel void kernel_rope_f32(
 // ─── KV cache store ──────────────────────────────────────────
 // Scatters nt new K/V rows into the persistent KV cache at positions[].
 
-kernel void kernel_store_kv_f32(
+ kernel void kernel_store_kv_f32(
     device const float * src [[buffer(0)]],
     device       float * dst [[buffer(1)]],
     constant    int    & nkt [[buffer(2)]],
@@ -1707,6 +1669,22 @@ kernel void kernel_store_kv_f32(
     int j = tid.y;
     if (t >= nt || j >= nkt) return;
     dst[positions[t] * nkt + j] = src[t * nkt + j];
+}
+
+// F16 KV cache variant: stores f32 K/V rows into a half cache (2 bytes/elem),
+// halving attention memory bandwidth (matches llama.cpp's F16 cache).
+kernel void kernel_store_kv_f16(
+    device const float * src [[buffer(0)]],
+    device       half  * dst [[buffer(1)]],
+    constant    int    & nkt [[buffer(2)]],
+    constant    int    & nt  [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int t = tid.x;
+    int j = tid.y;
+    if (t >= nt || j >= nkt) return;
+    dst[positions[t] * nkt + j] = half(src[t * nkt + j]);
 }
 
 // ─── Flash Attention (GQA, online softmax, tiled K/V) ─────
@@ -1738,8 +1716,13 @@ kernel void kernel_gqa_attn_f32(
 
     int nkv  = positions[t] + 1;
     int gqa  = nh / nk;
-    int h    = hk * gqa + (int)sgitg;
-    if (h >= nh) return;
+    // Do NOT return early for heads beyond nh: all simdgroups in the
+    // threadgroup must reach every threadgroup_barrier below, or the GPU
+    // deadlocks when nh % nk != 0. Invalid heads run the loop with a dummy
+    // head index but skip the output write.
+    int  h0         = hk * gqa + (int)sgitg;
+    bool valid_head = (h0 < nh);
+    int  h          = valid_head ? h0 : 0;
 
     int stride_q  = nh * hd;
     int stride_kv = nk * hd;
@@ -1806,7 +1789,111 @@ kernel void kernel_gqa_attn_f32(
     for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
 
     float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
-    for (int d = tiisg; d < hd; d += 32) {
-        ohead[d] = acc[d] * inv;
+    if (valid_head) {
+        for (int d = tiisg; d < hd; d += 32) {
+            ohead[d] = acc[d] * inv;
+        }
+    }
+}
+
+// F16 KV cache variant of kernel_gqa_attn_f32: K/V are read from a half cache
+// (2 bytes/elem, matching llama.cpp) and converted to f32 when staged into
+// threadgroup tiles. Enabled via MINFER_CACHE_TYPE=f16 (default is f32).
+kernel void kernel_gqa_attn_f16(
+    device const float * q        [[buffer(0)]],
+    device const half  * k        [[buffer(1)]],
+    device const half  * v        [[buffer(2)]],
+    device       float * o        [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    const int Bc = 32;
+    int t  = (int)tgpig.x;
+    int hk = (int)tgpig.y;
+    if (t >= nt || hk >= nk) return;
+
+    int nkv  = positions[t] + 1;
+    int gqa  = nh / nk;
+    // Do NOT return early for heads beyond nh: all simdgroups in the
+    // threadgroup must reach every threadgroup_barrier below, or the GPU
+    // deadlocks when nh % nk != 0. Invalid heads run the loop with a dummy
+    // head index but skip the output write.
+    int  h0         = hk * gqa + (int)sgitg;
+    bool valid_head = (h0 < nh);
+    int  h          = valid_head ? h0 : 0;
+
+    int stride_q  = nh * hd;
+    int stride_kv = nk * hd;
+
+    device const float * qhead = q + t * stride_q + h * hd;
+    device       float * ohead = o + t * stride_q + h * hd;
+
+    threadgroup float * k_tile = shmem;
+    threadgroup float * v_tile = shmem + Bc * hd;
+
+    float mx = -INFINITY;
+    float S = 0.0f;
+    float acc[256];
+    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
+
+    int n_tiles = (nkv + Bc - 1) / Bc;
+    for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        int kv_start = tile_idx * Bc;
+        int tile_sz  = min(Bc, nkv - kv_start);
+
+        int total = tile_sz * hd;
+        int tgsz = 32 * gqa;
+        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
+            int ki = kv_start + i / hd;
+            int di = i % hd;
+            k_tile[i] = float(k[ki * stride_kv + hk * hd + di]);
+            v_tile[i] = float(v[ki * stride_kv + hk * hd + di]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j0 = 0; j0 < tile_sz; j0 += 32) {
+            const int j = j0 + (int)tiisg;
+            const bool valid = (j < tile_sz);
+            float dot = -INFINITY;
+            if (valid) {
+                threadgroup float * kj = k_tile + j * hd;
+                dot = 0.0f;
+                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                dot *= scale;
+            }
+
+            float batch_mx = simd_max(dot);
+            float new_mx = max(mx, batch_mx);
+            float corr = exp(mx - new_mx);
+            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            S *= corr;
+            float e = valid ? exp(dot - new_mx) : 0.0f;
+            if (valid) {
+                threadgroup float * vj = v_tile + j * hd;
+                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                S += e;
+            }
+            mx = new_mx;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    S = simd_sum(S);
+    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
+
+    float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
+    if (valid_head) {
+        for (int d = tiisg; d < hd; d += 32) {
+            ohead[d] = acc[d] * inv;
+        }
     }
 }

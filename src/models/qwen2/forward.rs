@@ -81,7 +81,10 @@ pub fn forward(
                 }
                 #[cfg(feature = "debug_dump")]
                 {
-                    cb.submit();
+                    if let Err(e) = cb.submit() {
+                        eprintln!("MPS: GPU submit error: {e}");
+                        std::process::exit(1);
+                    }
                     mps.download_hidden(&mut hidden);
                     if il == 0 {
                         mps.dump_layer0_intermediates(nt, ne, nqt, nkt, nf);
@@ -96,7 +99,10 @@ pub fn forward(
             }
             if gpu_failed {
                 // GPU path failed at cpu_start_layer — submit partial work, continue on CPU
-                cb.submit();
+                if let Err(e) = cb.submit() {
+                    eprintln!("MPS: GPU submit error: {e}");
+                    std::process::exit(1);
+                }
                 mps.download_hidden(&mut hidden);
                 mps.sync_kv_to_cpu(kv_cache, model.n_layer());
             } else {
@@ -105,7 +111,10 @@ pub fn forward(
                     model.output_b.as_ref(),
                     ne, nv, nt, eps,
                 );
-                cb.submit();
+                if let Err(e) = cb.submit() {
+                    eprintln!("MPS: GPU submit error: {e}");
+                    std::process::exit(1);
+                }
                 if gpu_output {
                     let mut logits = vec![0.0f32; nt * nv];
                     mps.download_logits(&mut logits);

@@ -22,19 +22,29 @@ mod download;
 mod dump;
 
 use std::time::Instant;
+use rand::SeedableRng;
 
 struct GenParams {
     n_predict: usize,
     temp: f32,
     top_k: usize,
     top_p: f32,
+    repeat_penalty: f32,
     seed: u64,
     n_ctx: usize,
 }
 
 impl Default for GenParams {
     fn default() -> Self {
-        Self { n_predict: 512, temp: 0.0, top_k: 40, top_p: 0.9, seed: 42, n_ctx: 4096 }
+        Self {
+            n_predict: 512,
+            temp: 0.8,          // llama.cpp default (sampling, not greedy)
+            top_k: 40,
+            top_p: 0.95,        // llama.cpp default
+            repeat_penalty: 1.1, // 1.0 = disabled; mild penalty reduces repetition
+            seed: 42,
+            n_ctx: 4096,
+        }
     }
 }
 
@@ -58,6 +68,13 @@ fn print_usage(prog: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  --meta               print GGUF metadata and key tensors");
     eprintln!("  --no-template        use the raw prompt without the chat template");
+    eprintln!("  --temp <T>           sampling temperature (default 0.8; 0 = greedy)");
+    eprintln!("  --greedy             greedy decoding (--temp 0)");
+    eprintln!("  --top-k <K>          top-K sampling (default 40)");
+    eprintln!("  --top-p <P>          top-P nucleus sampling (default 0.95)");
+    eprintln!("  --repeat-penalty <N> penalize repeated tokens (default 1.1; 1.0 = off)");
+    eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
+    eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  -h, --help           show this help");
 }
 
@@ -65,34 +82,103 @@ fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
 
-    // Handle help before anything else (and before any stdin read).
-    if raw_args.iter().any(|a| a == "--help" || a == "-h") {
+    // Parse flags + positional args. Sampling flags map to GenParams.
+    let mut params = GenParams::default();
+    let mut meta_flag = false;
+    let mut no_template = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1;
+    let mut parse_err: Option<String> = None;
+    while i < raw_args.len() {
+        let a = raw_args[i].as_str();
+        let mut next_val = |name: &str| -> Option<String> {
+            if i + 1 < raw_args.len() {
+                Some(raw_args[i + 1].clone())
+            } else {
+                parse_err = Some(format!("missing value for {name}"));
+                None
+            }
+        };
+        match a {
+            "-h" | "--help" => {
+                print_usage(&prog);
+                std::process::exit(0);
+            }
+            "--meta" => { meta_flag = true; i += 1; }
+            "--no-template" => { no_template = true; i += 1; }
+            "--greedy" => { params.temp = 0.0; i += 1; }
+            "--temp" | "-t" => {
+                if let Some(v) = next_val(a) {
+                    params.temp = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --temp '{v}'")); 0.0 });
+                }
+                i += 2;
+            }
+            "--top-k" => {
+                if let Some(v) = next_val(a) {
+                    params.top_k = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --top-k '{v}'")); 0 });
+                }
+                i += 2;
+            }
+            "--top-p" => {
+                if let Some(v) = next_val(a) {
+                    params.top_p = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --top-p '{v}'")); 0.0 });
+                }
+                i += 2;
+            }
+            "--repeat-penalty" => {
+                if let Some(v) = next_val(a) {
+                    params.repeat_penalty = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --repeat-penalty '{v}'")); 1.0 });
+                }
+                i += 2;
+            }
+            "-n" | "--n-predict" => {
+                if let Some(v) = next_val(a) {
+                    params.n_predict = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid -n '{v}'")); 0 });
+                }
+                i += 2;
+            }
+            "--seed" => {
+                if let Some(v) = next_val(a) {
+                    params.seed = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --seed '{v}'")); 0 });
+                }
+                i += 2;
+            }
+            _ => {
+                if a.starts_with('-') && a.len() > 1 {
+                    // Unknown option — reject instead of treating as model path.
+                    print_usage(&prog);
+                    eprintln!("Error: unknown option '{a}'");
+                    std::process::exit(1);
+                }
+                positional.push(raw_args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if let Some(e) = parse_err {
+        eprintln!("Error: {e}");
         print_usage(&prog);
-        std::process::exit(0);
+        std::process::exit(1);
     }
 
-    let meta_flag = raw_args.iter().any(|a| a == "--meta");
-    let no_template = raw_args.iter().any(|a| a == "--no-template");
-    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--meta" && a != "--no-template").collect();
-
-    if args.len() < 2 {
+    if positional.is_empty() {
         print_usage(&prog);
         std::process::exit(1);
     }
 
     // === Subcommands ===
-    match args[1].as_str() {
+    match positional[0].as_str() {
         "download" => {
-            if args.len() < 4 {
+            if positional.len() < 3 {
                 eprintln!("Usage: {prog} download hf <repo> [file] | ollama <model>[:tag]");
                 std::process::exit(1);
             }
-            let source = &args[2];
-            let target = &args[3];
+            let source = &positional[1];
+            let target = &positional[2];
             match source.as_str() {
                 "hf" => {
-                    let uri = if args.len() > 4 {
-                        format!("hf:{}:{}", target, args[4])
+                    let uri = if positional.len() > 3 {
+                        format!("hf:{}:{}", target, positional[3])
                     } else {
                         format!("hf:{}", target)
                     };
@@ -123,12 +209,12 @@ fn main() {
             return;
         }
         "info" => {
-            if args.len() < 3 {
+            if positional.len() < 2 {
                 eprintln!("Usage: {prog} info <model>");
                 std::process::exit(1);
             }
             // Resolve paths, hf:/ollama: URIs, and cached model names.
-            let model_path = match download::resolve(&args[2]) {
+            let model_path = match download::resolve(&positional[1]) {
                 Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
                 Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
             };
@@ -141,14 +227,7 @@ fn main() {
         _ => {}  // fall through to model inference
     }
 
-    let model_path = &args[1];
-
-    // Reject unknown options instead of treating them as a model path (avoids hanging on stdin).
-    if model_path.starts_with('-') {
-        eprintln!("Error: unknown option '{model_path}'");
-        print_usage(&prog);
-        std::process::exit(1);
-    }
+    let model_path = &positional[0];
 
     // Resolve paths, hf:/ollama: URIs, and cached model names.
     let is_uri = model_path.starts_with("hf:")
@@ -163,12 +242,11 @@ fn main() {
         }
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
-    let prompt = if args.len() > 2 { args[2..].join(" ") } else {
+    let prompt = if positional.len() > 1 { positional[1..].join(" ") } else {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap_or(0);
         input.trim().to_string()
     };
-    let params = GenParams::default();
 
     // === Load GGUF ===
     println!("Loading model: {} ...", model_path);
@@ -251,17 +329,25 @@ fn main() {
     let special = model.special_tokens();
     let mut current_pos = input_ids.len();
 
+    // Seeded RNG for reproducible sampling; recent-token window for the
+    // repetition penalty (llama.cpp repeat_last_n default = 64).
+    let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
+    const REPEAT_LAST_N: usize = 64;
+    let mut prev_tokens: Vec<u32> = input_ids.iter().copied().rev().take(REPEAT_LAST_N).collect();
+    prev_tokens.reverse();
+
     while generated.len() < params.n_predict {
-        let sampled = if params.temp < 1e-6 {
-            sampler::sample_greedy(&logits)
-        } else {
-            sampler::apply_top_k(&mut logits, params.top_k);
-            sampler::apply_top_p(&mut logits, params.top_p);
-            sampler::sample_temperature(&mut logits, params.temp)
-        };
+        let sampled = sampler::sample(
+            &mut logits, params.temp, params.top_k, params.top_p,
+            params.repeat_penalty, &prev_tokens, &mut rng,
+        );
 
         if is_stop_token(sampled.token_id, &special) { break; }
         generated.push(sampled.token_id);
+        prev_tokens.push(sampled.token_id);
+        if prev_tokens.len() > REPEAT_LAST_N {
+            prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
+        }
         print!("{}", tokenizer.decode(&[sampled.token_id]));
         std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
 

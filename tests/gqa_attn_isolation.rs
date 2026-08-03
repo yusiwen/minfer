@@ -42,8 +42,6 @@ fn gqa_attn_isolation() {
     let src = include_str!("../src/metal.metal");
     let opts = metal::CompileOptions::new();
     let lib = device.new_library_with_source(src, &opts).unwrap_or_else(|e| panic!("shader compile: {e}"));
-    let f = lib.get_function("kernel_gqa_attn_f32", None).unwrap();
-    let pl = device.new_compute_pipeline_state_with_function(&f).unwrap();
 
     // Qwen2.5-0.5B attention dims: nh=14, nk=2, hd=64
     let (nh, nk, hd) = (14usize, 2usize, 64usize);
@@ -63,49 +61,63 @@ fn gqa_attn_isolation() {
         let positions: Vec<i32> = (0..nt as i32).collect(); // causal: token t attends to 0..=t
 
         let qb = device.new_buffer_with_data(q.as_ptr() as *const _, (q.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        // f32 KV buffers (kernel_gqa_attn_f32)
         let kb = device.new_buffer_with_data(k.as_ptr() as *const _, (k.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
         let vb = device.new_buffer_with_data(v.as_ptr() as *const _, (v.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        // f16 KV buffers (kernel_gqa_attn_f16)
+        let k16: Vec<u16> = k.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let v16: Vec<u16> = v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let k16b = device.new_buffer_with_data(k16.as_ptr() as *const _, (k16.len() * 2) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let v16b = device.new_buffer_with_data(v16.as_ptr() as *const _, (v16.len() * 2) as u64, metal::MTLResourceOptions::StorageModeShared);
         let pb = device.new_buffer_with_data(positions.as_ptr() as *const _, (positions.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
 
         let mut ref_out = vec![0.0f32; nt * ne_q];
         cpu_attn(&q, &k, &v, nh, nk, hd, nt, nkv, scale, &mut ref_out);
 
-        let run = |cmdq: &metal::CommandQueue| -> Vec<f32> {
-            let ob = device.new_buffer((nt * ne_q * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-            let cb = cmdq.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pl);
-            enc.set_buffer(0, Some(&qb), 0);
-            enc.set_buffer(1, Some(&kb), 0);
-            enc.set_buffer(2, Some(&vb), 0);
-            enc.set_buffer(3, Some(&ob), 0);
-            enc.set_buffer(4, Some(&pb), 0);
-            for (i, val) in [nh as i32, nk as i32, hd as i32, scale.to_bits() as i32, nt as i32].iter().enumerate() {
-                enc.set_bytes(5 + i as u64, 4, val as *const i32 as *const _);
-            }
-            let shmem = (32 * hd * 2 * 4) as u64;
-            enc.set_threadgroup_memory_length(0, shmem);
-            enc.dispatch_thread_groups(
-                metal::MTLSize { width: nt as u64, height: nk as u64, depth: 1 },
-                metal::MTLSize { width: 32, height: gqa as u64, depth: 1 },
-            );
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-            let ptr = ob.contents() as *const f32;
-            unsafe { std::slice::from_raw_parts(ptr, nt * ne_q) }.to_vec()
-        };
+        // Test both the f32-KV and f16-KV attention kernels.
+        for (kernel_name, kb_ref, vb_ref) in [
+            ("kernel_gqa_attn_f32", &kb, &vb),
+            ("kernel_gqa_attn_f16", &k16b, &v16b),
+        ] {
+            let f = lib.get_function(kernel_name, None).unwrap();
+            let pl = device.new_compute_pipeline_state_with_function(&f).unwrap();
+            let run = |cmdq: &metal::CommandQueue| -> Vec<f32> {
+                let ob = device.new_buffer((nt * ne_q * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+                let cb = cmdq.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pl);
+                enc.set_buffer(0, Some(&qb), 0);
+                enc.set_buffer(1, Some(kb_ref), 0);
+                enc.set_buffer(2, Some(vb_ref), 0);
+                enc.set_buffer(3, Some(&ob), 0);
+                enc.set_buffer(4, Some(&pb), 0);
+                for (i, val) in [nh as i32, nk as i32, hd as i32, scale.to_bits() as i32, nt as i32].iter().enumerate() {
+                    enc.set_bytes(5 + i as u64, 4, val as *const i32 as *const _);
+                }
+                let shmem = (32 * hd * 2 * 4) as u64;
+                enc.set_threadgroup_memory_length(0, shmem);
+                enc.dispatch_thread_groups(
+                    metal::MTLSize { width: nt as u64, height: nk as u64, depth: 1 },
+                    metal::MTLSize { width: 32, height: gqa as u64, depth: 1 },
+                );
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let ptr = ob.contents() as *const f32;
+                unsafe { std::slice::from_raw_parts(ptr, nt * ne_q) }.to_vec()
+            };
 
-        let r1 = run(&cmdq);
-        let r2 = run(&cmdq);
-        let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let maxdiff_ref = r1.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let dot: f64 = r1.iter().zip(&ref_out).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
-        let n1: f64 = r1.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        let n2: f64 = ref_out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        let cos = dot / (n1 * n2);
-        println!("nt={nt} nkv={nkv}: deterministic={} maxdiff_ref={maxdiff_ref:.2e} cos={cos:.6}", maxdiff_gg == 0.0);
-        assert!(maxdiff_gg == 0.0, "nt={nt} nkv={nkv}: attention non-deterministic");
-        assert!(cos > 0.999, "nt={nt} nkv={nkv}: attention wrong vs CPU (cos={cos:.6})");
+            let r1 = run(&cmdq);
+            let r2 = run(&cmdq);
+            let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let maxdiff_ref = r1.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let dot: f64 = r1.iter().zip(&ref_out).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let n1: f64 = r1.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            let n2: f64 = ref_out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (n1 * n2);
+            println!("{kernel_name} nt={nt} nkv={nkv}: deterministic={} maxdiff_ref={maxdiff_ref:.2e} cos={cos:.6}", maxdiff_gg == 0.0);
+            assert!(maxdiff_gg == 0.0, "{kernel_name} nt={nt} nkv={nkv}: attention non-deterministic");
+            assert!(cos > 0.999, "{kernel_name} nt={nt} nkv={nkv}: attention wrong vs CPU (cos={cos:.6})");
+        }
     }
 }
