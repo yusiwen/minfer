@@ -112,6 +112,28 @@ The `metal` crate exposes `DeviceRef::max_threadgroup_memory_length()` and
 magic number should be re-examined: prefer a query, and document the queried
 value when a hard limit (like a kernel's fixed array size) genuinely exists.
 
+## 4a. Split-attention and float4 kernel guards (2026-08-03)
+
+- **`kernel_gqa_attn_partial_f32`** (KV-parallel split, pass 1) preserves the
+  classic kernel's barrier discipline: every simdgroup reaches every
+  `threadgroup_barrier` (empty KV chunks produce `mx=-INF/S=0/acc=0` — they skip
+  the tile loop *together*, so no barrier divergence). The **final acc reduction
+  MUST be a uniform `d` loop** (all 32 lanes step the same `d` together) — a
+  per-lane loop makes `simd_sum` reduce mismatched acc components (divergent
+  reduction bug caught by the isolation test).
+- **`kernel_gqa_attn_combine_f32`** (pass 2) is pure elementwise: no shared
+  memory, no barriers. Guards: `t<nt`, `h<nh`, and `m==-INFINITY → write zeros`
+  (avoids `exp(-INF - -INF) = NaN`).
+- New `layer_gpu` guard: `hd % 4 == 0` (gpu_abort) — the float4 vectorized acc
+  requires it. Existing `hd <= 256` guard covers the `acc4[64]` array (64
+  float4s = 256 floats).
+- **Shared-mutable-state change lesson (KV growth)**: a typo that cloned the K
+  buffer into `old_v` during KV-cache growth polluted the V cache (Q4_K_M
+  garbage). The split-vs-classic A/B did **NOT** catch it — both paths share the
+  same corrupted KV. **Any change to shared mutable GPU state (KV cache, buffer
+  growth) must be checked against a known-good reference output, not just an
+  A/B of two code paths over the same state.**
+
 ## 5. Recurrence playbook
 
 1. On a GPU fault/hang, `submit()` now reports the dispatch trace

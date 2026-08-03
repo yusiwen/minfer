@@ -10,8 +10,10 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **CPU: AVX2-accelerated** — Q4₀×Q8₀ and Q8₀×Q8₀ dot products via AVX2+FMA
 - **GPU: CUDA backend** — NVIDIA GPU acceleration with CUDA Graph capture/replay
   for decode, full-layer GPU offload (zero-copy), automatic best-GPU selection
-- **GPU: Metal backend** — Apple Silicon acceleration with flash attention
-  (online softmax), SIMD-parallel RMSNorm, float4 vectorized kernels
+ - **GPU: Metal backend** — Apple Silicon acceleration with flash attention
+   (online softmax), a **KV-parallel split attention** for decode (partial +
+   combine passes, ~2× decode over the single-pass kernel), SIMD-parallel
+   RMSNorm, float4 vectorized kernels
 - **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
   RMSNorm
 - **Model download** — auto-download from Hugging Face Hub or Ollama registry

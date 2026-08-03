@@ -486,8 +486,11 @@ did **not** recover the degradation for the 0.5B model — decode stayed
 of the M4 Pro's ~200 GB/s bandwidth, so halving it saves ~0.5%, while the
 f16→f32 conversion in the attention kernel adds per-element overhead). F16 is
 kept **opt-in** (matches llama.cpp's default) for larger models / very long
-contexts where attention bandwidth actually dominates. The dominant long-context
-decode cost is per-step dispatch/sync (see P3), not KV bandwidth.
+contexts where attention bandwidth actually dominates. **Note (2026-08-03)**: the
+KV-parallel split attention (P0.75) is f32-KV only — the f16 cache still falls
+back to the classic single-pass kernel, so a f16 split variant is the remaining
+attention lever. The dominant long-context decode cost was the per-token KV
+buffer reallocation (fixed 2026-08-03 via geometric growth), not KV bandwidth.
 
 ### 0a. Per-dispatch encoding overhead — the REAL decode bottleneck (2026-08-01)
 
@@ -603,9 +606,9 @@ context) / 3.2× (long context).
 | ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: initially 2× slower and reverted, then re-transcribed (P1) with 3 bug fixes — now SHIPPED (see "Prefill Gap" section above): ~+11 % at 30 tokens, ~+34 % at 70 tokens for nt ≥ 16** |
 | **P1** | **GEMM kernels for non‑Q4_0 quants** | up to ~7× prefill (Q4_K_M / Q5_K_M) | Large | Extend the Q4_0 GEMM transcription pattern to `q5_0/q5_1/q8_0/q4_k/q6_k` (each needs its own dequant→sa staging). Currently non‑Q4_0 weights fall back to the scalar f32 multi kernel → Q4_K_M prefill ~240 t/s vs llama's ~1750 t/s. This also speeds up their decode |
 | **P2** | **KV cache: F32 → F16 (implemented, opt-in)** | ~0 for 0.5B; helps larger models / long context | Small | **Implemented 2026-08-01** as `MINFER_CACHE_TYPE=f16` (default f32). `kernel_store_kv_f16` + `kernel_gqa_attn_f16`. Measured F16 is ~3% **slower** on the 0.5B model — decode is dispatch-latency-bound, not KV-bandwidth-bound (attention ≈ 5% of decode work; KV read ≈ 0.5% of ~200 GB/s bandwidth). Kept opt-in for larger models where attention bandwidth dominates |
-| **P3** | ~~Reduce per-dispatch encode cost + parallel command buffers~~ (A1 dead-end 2026-08-03) | — | — | ~~A1 (parallel command buffers)~~ **tested and REVERTED 2026-08-03**: encode is ~1 ms/step (not the ~24µs/kernel claim), so 4 parallel command buffers only added GPU launch overhead (decode regressed, nondeterministic). A2 (packed `set_bytes`) is already shipped. Replaced by **GPU-side fusion**: fuse QKV projection into one kernel, larger threadgroups, fuse K-RoPE into the KV store (-1 dispatch/layer) |
-| P4 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
-| P5 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
+| **P3** | ~~Reduce per-dispatch encode cost + parallel command buffers~~ (A1 dead-end 2026-08-03) | — | — | ~~A1 (parallel command buffers)~~ **tested and REVERTED 2026-08-03**: encode is ~1 ms/step (not the ~24µs/kernel claim), so 4 parallel command buffers only added GPU launch overhead. A2 (packed `set_bytes`) shipped. The GPU-side fusions that replaced it are SHIPPED: fused QKV + FFN gate/up matmuls (P0.5, ~5% decode) and KV-parallel split attention (P0.75, ~32% decode). Remaining attention lever: the split kernel's F16-KV variant (f16 currently falls back to the classic kernel) |
+| ~~P4~~ | ~~Matmul + bias fusion~~ | — | — | Dead-end 2026-08-03: Qwen models have no attention biases, and dispatch-count reductions don't move decode (see P5) |
+| ~~P5~~ | ~~Residual add + RMSNorm fusion~~ | — | — | **Dead-end 2026-08-03**: `residual_rms_norm` was implemented, verified correct, and REVERTED — no measured gain (1.79 vs 1.74 s). Dispatch-count reductions don't move decode |
 | P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |
 | P7 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) |
-| P8 | RoPE + store_kv fusion | 1 dispatch/layer | Small | Merge K's RoPE transform with KV cache scatter |
+| ~~P8~~ | ~~RoPE + store_kv fusion~~ | — | — | Dead-end 2026-08-03: same dispatch-reduction class as store_kv_both (reverted, no gain) |
