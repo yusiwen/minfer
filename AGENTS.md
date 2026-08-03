@@ -179,6 +179,24 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > small kernels (a ~165 µs cb launch+sync floor dominates; always batch ≥ dozens
 > of dispatches per command buffer before trusting a per-matmul time).
 
+> **Decode profile: attention is the #1 bottleneck (~48 % and grows with KV)**
+> (2026-08-03): subtractive measurement on the REAL decode (temporary
+> `MINFER_SKIP_ATTN` / `MINFER_SKIP_MATMULS` / `MINFER_SKIP_SMALL` env gates
+> that skip kernel groups for nt==1 only — gated on nt==1 so prefill fills the
+> buffers with finite values first, else the downstream exp/sqrt hit the slow
+> denormal path and skew the timing) gives, per token at avg KV≈140: **attention
+> ~4.2 ms (48 %)**, matmuls ~2.75 ms (32 %), small kernels ~0.95 ms (11 %), base
+> encode+sync ~0.75 ms (9 %). Attention scales with KV: 2.0 ms/token at KV≈70 →
+> 5.2 ms/token at KV≈240. Root cause: for nt==1 the `kernel_gqa_attn_f32` grid is
+> only (1, nk)=2 threadgroups (each 32×gqa=224 threads) that loop the KV tiles
+> SEQUENTIALLY with threadgroup barriers — massive GPU underutilization, KV-read
+> latency-bound. Next target: parallelize the attention KV loop across more
+> threadgroups for nt==1 (split/flash attention with a combine pass), the classic
+> flash-attention KV-parallel structure. GPU-safety: this is the riskiest rewrite
+> yet (online-softmax + threadgroup barriers + cross-TG combine); must be built
+> incrementally with isolation tests (deterministic vs a scalar reference at
+> several nkv, incl. partial tiles) before touching the decode path.
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per
