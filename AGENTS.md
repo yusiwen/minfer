@@ -19,7 +19,7 @@ src/
 ├── cache.rs         # KV Cache
 ├── dump.rs          # Debug dump module (gated by `--features debug_dump`)
 ├── tokenizer.rs     # BPE tokenizer (self-contained, loaded from GGUF metadata)
-├── sampler.rs       # Greedy / Top-K / Top-P / Temperature sampling
+├── sampler.rs       # Repeat-penalty / Top-K / Top-P / Temperature (seeded) sampling
 ├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download + cached-name resolution
 ├── metal.rs         # Apple MPS (Metal) GPU backend + dispatch
@@ -108,6 +108,65 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 | **Q5_1** | ✓ (F32 path) | ✓ |
 | **Q5_K** | ✓ (f32 path, `kernel_q5_k_f32_matmul` + `_multi`) | ✓ |
 | F32 | ✓ (RMSNorm, biases, etc.) | ✓ |
+
+> **Prefill GEMM is Q4_0-only** (2026-08-01): `kernel_q4_0_mm_f32` uses the
+> simdgroup GEMM for nt ≥ 16; all other quants (Q4_K, Q5_0, Q5_1, Q8_0, Q6_K,
+> Q5_K) use the scalar f32 multi kernel. This is why Q4_K_M/Q5_K_M prefill is
+> ~240 t/s vs Q4_0's ~554 t/s and llama.cpp's ~1750 t/s. See
+> METAL_OPTIMIZATIONS.md for the full gap analysis and the P1 (non-Q4_0 GEMM)
+> / P3 (decode dispatch) plan.
+
+> **KV cache type** (2026-08-01): GPU KV cache defaults to **F32**;
+> `MINFER_CACHE_TYPE=f16` switches to an F16 cache (2 bytes/elem, llama.cpp's
+> default, with `kernel_store_kv_f16` + `kernel_gqa_attn_f16`). Measured F16 is
+> ~3% slower than F32 on the 0.5B model (decode is dispatch-latency-bound, not
+> KV-bandwidth-bound), so F16 is opt-in for larger models / longer contexts
+> where attention bandwidth matters.
+
+> **Decode bottleneck is per-dispatch encode cost** (2026-08-01): minfer
+> dispatches ~484 kernels/forward (layer_gpu, 20/layer × 24 + 3 + embed) — nearly
+> identical to llama.cpp's ~490–530 actual Metal kernels (822 ggml graph nodes
+> minus ~300 no-op views). The ~3× decode gap is ~24µs/kernel encode overhead
+> (single command buffer, serial `set_buffer`+`set_bytes` per kernel) vs llama's
+> ~7µs (multi-command-buffer parallel encoding, packed-params `setBytes`). See
+> METAL_OPTIMIZATIONS.md "Decode Gap §0a". Next target: P3 (per-dispatch encode
+> cost + parallel command buffers).
+
+> **GPU-safety measures** (2026-08-02, after an M4 Pro GPU hang froze the
+> machine): (1) `MpsCommandBuffer::submit()` waits **bounded 10 s** and checks
+> `MTLCommandBufferStatus`; a GPU fault/hang reports the dispatch trace
+> (`MINFER_TRACE=1`, last 16 op labels) and exits instead of blocking forever.
+> (2) `kernel_gqa_attn_f32/f16` never return early for `h >= nh` before the
+> threadgroup barrier (would deadlock the GPU when `nh % nk != 0`). (3)
+> `layer_gpu`/`output_norm_gpu` assert `nh % nk == 0`, `hd ≤ 256`, `id % 32 == 0`
+> and fall back to CPU otherwise. Full details + audit status in
+> **[`GPU_SAFETY.md`](GPU_SAFETY.md)**.
+
+## GPU Safety Conventions
+
+1. **Device thresholds MUST be queried at runtime, never guessed** (2026-08-02,
+   after the GPU-hang review): device-specific limits such as
+   `max_threadgroup_memory_length()` and `max_threads_per_threadgroup()` are
+   queried via the `metal` crate's `MTLDevice` properties and cached at MpsState
+   init. Do NOT hardcode guessed limits (e.g. a remembered "32 KB threadgroup
+   memory") — verify via runtime query. See `GPU_SAFETY.md` §4.
+2. **All GPU safety guards error-exit (报错退出)** — never silently fall back to
+   CPU. A guard that detects an unsafe/unsupported configuration (dimension
+   misalignment, head-dispatch mismatch, threadgroup memory/threads exceeding the
+   queried device limit, kernel-array overflow) prints a clear message with the
+   actual values via `gpu_abort` and exits, so the user knows the GPU path can't
+   run the model instead of silently running slow on CPU. Only genuine support
+   limitations (Raw weights, unregistered weights, mixed-quant attention/FFN)
+   fall back to CPU.
+3. **Never return before a `threadgroup_barrier`** in a kernel: a per-simdgroup
+   early return can leave other simdgroups waiting on the barrier → GPU
+   permanent deadlock (machine freeze). Skip computation with a mask/flag
+   instead, keeping all simdgroups alive through every barrier.
+4. **Fixed-size kernel arrays must be guarded by a dimension check that
+   error-exits** (e.g. `float acc[256]` needs `hd ≤ 256`).
+5. **All GPU kernel dimension assumptions are asserted in `layer_gpu` /
+   `output_norm_gpu`** (`nh % nk == 0`, `id % 32 == 0`, quant-alignment) — on
+   violation, error-exit rather than risk a GPU fault or silently run on CPU.
 
 ## Model Support Matrix
 
@@ -228,6 +287,21 @@ float2x4), `simdgroup_half8x8` inputs → `simdgroup_float8x8` accumulators.
 4. Implement forward pass in `forward.rs`
 5. Implement `ModelDef` trait in `mod.rs`
 6. Add template format support in `template.rs` if needed
+
+## Sampling (2026-08-01)
+
+`sampler.rs` implements a llama.cpp-style pipeline: repetition penalty →
+top-k → top-p → temperature, with a seeded `StdRng` for reproducibility.
+Defaults align with llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`
+(1.0 = off). CLI flags override: `--temp`, `--greedy` (temp=0), `--top-k`,
+`--top-p`, `--repeat-penalty`, `-n/--n-predict`, `--seed`.
+
+The repetition penalty (`apply_repetition_penalty`) applies to the last 64
+tokens (llama `repeat_last_n` default): positive logits divided by the penalty,
+negative multiplied. It alone breaks the 0.5B model's greedy repetition loops
+(e.g. "Tell me about Transformer architecture." previously hit the 512-token
+cap repeating; with `repeat_penalty=1.1` it stops at EOS naturally even with
+`--greedy`).
 
 ## Dependencies
 

@@ -324,28 +324,51 @@ Notes on measurement:
   current benchmarks below use Qwen2.5-0.5B (same architecture, different
   tokenizer) — model-specific differences may account for minor variations
 
-## Current vs llama.cpp (Q4_0, Qwen2.5-0.5B, Apple M4 Pro)
+## Current vs llama.cpp (Qwen2.5-0.5B, Apple M4 Pro)
 
-Measured 2026-07-31 … 2026-08-01 with the same model file and the same
-`"hello"` prompt (chat template → 30 prompt tokens, 9 generated tokens):
+Measured 2026-08-01 with the `"Tell me about Transformer architecture."` prompt
+(chat template → 35 prompt tokens) and the `"hello"` prompt (→ 30 tokens).
 
-| | llama.cpp | minfer (after P1 GEMM) | Gap |
+> **Metric warning**: llama.cpp's `Generation:` is **pure** decode (only
+> generation time in the denominator). minfer's `Generated:` is a **blended**
+> rate = `(prompt + generated) / total_time`, which counts prefill in the
+> denominator — the two are **not** directly comparable. All rates below are
+> pure decode / pure prefill.
+
+### Prefill (Q4_0 vs Q4_K_M / Q5_K_M)
+
+| | llama.cpp | minfer Q4_0 | minfer Q4_K_M / Q5_K_M | Gap |
+|---|---|---|---|---|
+| **Prefill** (35 tokens) | ~1750 t/s | ~554 t/s | ~240 t/s | Q4_0 3.2×; K_M **7.3×** |
+| **Prefill** (70 tokens) | ~2600 t/s | ~780 t/s | — | ~3.3× |
+
+**Why Q4_K_M/Q5_K_M prefill is ~7× slower**: minfer's simdgroup GEMM
+(`kernel_q4_0_mm_f32`) supports **Q4_0 only**. Q4_K_M's weights are
+`q5_0 / q8_0 / q4_k / q5_1 / q6_k` — none use the GEMM, so they fall back to the
+scalar f32 multi kernel (no `simdgroup_matrix`). llama.cpp ships a `kernel_mul_mm`
+GEMM for **every** quant type. Even Q4_0 prefill (554 vs 1750) has a 3× gap
+because the GEMM only dispatches for nt ≥ 16 and the f32 multi covers the rest.
+
+### Decode (pure, single-token)
+
+| Context (KV length) | minfer Q4_0 | llama.cpp Q4_0 | Gap |
 |---|---|---|---|
-| **Prefill** (30 tokens) | 1318 t/s (22.8 ms) | ~510 t/s (~59 ms) | **2.6×** |
-| **Prefill** (70 tokens) | ~1318 t/s | ~870 t/s | ~1.5× |
-| **Decode** (9 tokens) | 345 t/s (26.1 ms) | ~340 t/s¹ (~35 ms) | ~1.0× (blended) |
+| Short (~40) | ~187 t/s | ~375 t/s | **2.0×** |
+| Long (~400) | ~86 t/s | ~279 t/s | **3.2×** |
+| KV-growth degradation | 187 → 86 (**2.2×**) | 375 → 279 (1.34×) | — |
 
-The prefill gap is largely a **batch-size / fixed-overhead** effect: at 70
-tokens the GEMM reaches ~870 t/s (vs ~650 for the f32 multi kernel), while
-short prompts (30 tokens) amortize the fixed per-forward overhead less well.
-The simdgroup GEMM (P1) now beats the f32 multi kernel for nt ≥ 16 — see the
-section below.
+**Why decode slows 2.2× as context grows (vs llama's 1.34×)**: minfer's
+attention re-reads the **entire KV cache** every decode step. The default cache
+is **F32 (4 bytes/elem)** vs llama.cpp's **F16 (2 bytes)**, but an F16 cache
+(`MINFER_CACHE_TYPE=f16`) was measured to *not* recover the degradation for the
+0.5B model (decode is dispatch-latency-bound, not KV-bandwidth-bound — see the
+Decode Gap section). The base ~3× decode gap is per-dispatch **encoding**
+overhead (~24µs/kernel vs llama's ~7µs via multi-command-buffer parallel
+encoding), not the dispatch count itself — see Decode Gap §0a.
 
-¹ minfer reports a blended rate = (30 + 9) / (prefill + decode time), which
-counts prefill overhead in the denominator. Before P1 this was 281 t/s
-(~48.9 ms); after P1 it is ~330-350 t/s. Pure decode-only is lower
-(~200 t/s) because the prefill portion of the denominator inflates the
-blended number less as generation lengthens.
+¹ Blended-rate note: a short 9-token generation (30 prompt + 9 gen) reports
+~340 t/s blended because the fast prefill dominates the denominator; long
+generations converge to the pure decode rate (~86 t/s at ~400 KV).
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
@@ -421,11 +444,64 @@ lower fixed overhead wins). `MINFER_GEMM=0` forces the f32 multi path for
 A/B comparison.
 
 
-## Decode Gap: Dispatch Overhead (1.9×) + F16 KV Cache
+## Decode Gap: Per-Dispatch Encode Cost (~24µs vs llama ~7µs) + KV Growth (2.2×) + F16 KV Cache
 
 For 1‑token decode the matmul kernels are memory‑bound and the scalar
 dot‑product loop is less of a bottleneck. The dominant delta comes from
-two sources:
+three sources:
+
+### 0. KV-cache-growth degradation (2.2× at ~400 KV — the biggest long-context factor)
+
+Measured 2026-08-01 (Q4_0, pure decode):
+
+| Context (KV length) | minfer | llama.cpp |
+|---|---|---|
+| Short (~40) | ~187 t/s | ~375 t/s |
+| Long (~400) | ~86 t/s | ~279 t/s |
+| Degradation | **2.2×** | 1.34× |
+
+minfer's `kernel_gqa_attn_f32` re-reads the **entire KV cache** every decode
+step. The default cache is **F32 (4 bytes/elem)** vs llama.cpp's **F16 (2 bytes)**.
+llama.cpp degrades far less (its F16 cache + tighter attention inner loop).
+This is why short "hello"-style generations look fast (~340 t/s blended) while
+long generations collapse to ~86 t/s.
+
+**Measured 2026-08-01**: switching to an F16 KV cache (`MINFER_CACHE_TYPE=f16`)
+did **not** recover the degradation for the 0.5B model — decode stayed
+~dispatch-latency-bound (attention ≈ 5% of decode work; the KV read is ≈ 0.5%
+of the M4 Pro's ~200 GB/s bandwidth, so halving it saves ~0.5%, while the
+f16→f32 conversion in the attention kernel adds per-element overhead). F16 is
+kept **opt-in** (matches llama.cpp's default) for larger models / very long
+contexts where attention bandwidth actually dominates. The dominant long-context
+decode cost is per-step dispatch/sync (see P3), not KV bandwidth.
+
+### 0a. Per-dispatch encoding overhead — the REAL decode bottleneck (2026-08-01)
+
+Measured dispatch counts for the same model (Qwen2.5-0.5B, flash_attn on):
+
+| | llama.cpp | minfer |
+|---|---|---|
+| ggml graph nodes | **822** (runtime log) | — |
+| actual Metal compute dispatches | **~490–530** (822 minus ~300 no-op view/permute/reshape nodes; K-RoPE fused into the KV store) | **~484** (`layer_gpu`: 20/layer × 24 + output 3 + embed 1) |
+| decode time / step | ~3.6 ms | ~11.6 ms |
+| **per-dispatch cost** | **~7 µs** | **~24 µs** |
+
+**The dispatch COUNT is nearly identical — the gap is the per-dispatch cost.**
+
+llama.cpp keeps per-dispatch overhead ~3× lower via:
+1. **Multi-command-buffer parallel encoding** (`ggml-metal-context.m`): `n` extra
+   threads encode disjoint node ranges into `n+1` command buffers concurrently,
+   overlapping CPU encoding with GPU execution. minfer uses ONE command buffer,
+   so all ~484 encodes are on the critical path and the semaphore wait blocks
+   each decode step.
+2. **Optimized encoding**: op params packed into a struct and set with a single
+   `setBytes`; pipeline/buffer state reused across nodes. minfer issues
+   `set_buffer`×3 + `set_bytes`×3 + `set_threadgroup_memory_length` +
+   `dispatch_thread_groups` per kernel.
+3. **K-RoPE fused into the KV cache store** (1 fewer dispatch/layer).
+
+This corrects the earlier conclusion that "484 dispatches is the bottleneck" —
+the count is not the problem; the per-dispatch encode cost is.
 
 ### 1. Q4_0 quantize + matmul — two dispatches per matmul (FIXED 2026-08-01)
 
@@ -460,12 +536,17 @@ llama.cpp Metal behaviour.
   fewer dispatches. Primary value is alignment with llama.cpp Metal and code
   simplification, which unblocks the P0 GEMM work.
 
-### 2. F32 KV cache vs llama.cpp's F16
+### 2. F32 KV cache vs llama.cpp's F16 — implemented as opt-in, measured no gain
 
-minfer stores the key‑value cache in `float` (4 bytes per element);
-llama.cpp uses `half` (2 bytes). This doubles the attention and store‑kv
-memory bandwidth. The impact is small for 0.5B‑class models with short
-contexts, but grows linearly with head‑dimension × sequence‑length.
+minfer's default KV cache is `float` (4 bytes per element); llama.cpp uses
+`half` (2 bytes). An F16 cache (`kernel_store_kv_f16` + `kernel_gqa_attn_f16`,
+enabled via `MINFER_CACHE_TYPE=f16`) was implemented to halve attention/store‑kv
+memory bandwidth. **Measured 2026-08-01**: ~3% **slower** than F32 on the 0.5B
+model — decode is dispatch‑latency‑bound (attention ≈ 5% of decode work; the KV
+read is ≈ 0.5% of ~200 GB/s bandwidth), so the bandwidth saving is negligible
+and the f16→f32 conversion in the tile load adds per‑element overhead. F16
+remains opt‑in for larger models / very long contexts where attention bandwidth
+dominates.
 
 ## Files Modified
 
@@ -480,6 +561,10 @@ contexts, but grows linearly with head‑dimension × sequence‑length.
 
 | Item | Detail |
 |------|--------|
+| **GPU-hang safety fixes** | After a 2026-08-02 GPU hang (M4 Pro, AGXG16X) that froze the machine, three safety changes: (1) `submit()` now waits **bounded 10 s** (was `DISPATCH_TIME_FOREVER`), checks `MTLCommandBufferStatus`, and prints a **dispatch trace** (`MINFER_TRACE=1` records the last 16 op labels) — a GPU fault/hang now reports and exits instead of blocking forever (which previously let a single fault stall every Metal client incl. WindowServer → whole-machine freeze). (2) `kernel_gqa_attn_f32/f16` no longer `return` early for `h >= nh` before the `threadgroup_barrier` — a per-simdgroup early return deadlocks the GPU when `nh % nk != 0`; invalid heads now run the loop with a dummy index and skip the output write. (3) Runtime guards in `layer_gpu`/`output_norm_gpu`: `nh % nk == 0`, `hd <= 256` (the `acc[256]` array), `id % 32 == 0` — fall back to CPU instead of risking a GPU fault |
+| **Decode bottleneck analysis** | Measured llama.cpp's Metal dispatch count for Qwen2.5-0.5B: 822 ggml graph nodes → ~490–530 actual Metal compute kernels (minfer: ~484). The 3× decode gap is therefore **per-dispatch encode cost** (~24µs vs llama's ~7µs), not the count. Root cause: minfer uses a single command buffer with serial encoding (`set_buffer`×3+`set_bytes`×3+`set_threadgroup_memory_length`+`dispatch` per kernel) vs llama's multi-command-buffer parallel encoding (overlaps CPU encode with GPU execution) and packed-params `setBytes`. See "Decode Gap §0a". Corrects the earlier "484 dispatches is the bottleneck" claim |
+| **Sampling pipeline rewrite** | `sampler.rs`: fixed `apply_top_p` double-softmax bug (excluded tokens now `-INFINITY`, logits not clobbered to probabilities), added `apply_repetition_penalty` (llama `repeat_penalty` on last 64 tokens), seeded `StdRng` (`--seed`, default 42), unified `sample()` entry. Defaults now match llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`. CLI flags `--temp/--greedy/--top-k/--top-p/--repeat-penalty/-n/--seed`. **Repeat penalty alone breaks the 0.5B model's greedy repetition loops** (previously hit the n_predict cap repeating; now stops at EOS). 7 new sampler unit tests |
+| **F16 KV cache (opt-in, measured no gain)** | `MINFER_CACHE_TYPE=f16` (default f32): `kernel_store_kv_f16` + `kernel_gqa_attn_f16`, f16 allocation in `kv_ensure_layer`, f16→f32 in `sync_kv_to_cpu`. Correct (gen0 logits cos 0.9997), ~3% slower on 0.5B (dispatch-latency-bound) — kept opt-in for larger models. Attention isolation test now covers both `kernel_gqa_attn_f32` and `kernel_gqa_attn_f16` |
 | Q5_1 Metal kernel | `kernel_q5_1_f32_matmul` + `_multi` (F32 activation path, same structure as Q5_0) |
 | Q5_K Metal kernel | `kernel_q5_k_f32_matmul` + `_multi` (176B/256‑elem super‑block, `qh[p] bit s` indexing, unsigned formula) |
 | Q5_K_M GPU verified | Qwen2.5‑0.5B Q5_K_M full GPU: prefill ~240 t/s, decode ~250 t/s |
@@ -491,13 +576,16 @@ contexts, but grows linearly with head‑dimension × sequence‑length.
 ## Remaining Optimization Opportunities
 
 Ranked by estimated impact‑to‑effort ratio for the current workload
-(Q4_0, Qwen2.5‑0.5B, Apple M4 Pro).
+(Qwen2.5‑0.5B, Apple M4 Pro). **2026-08-01 update**: measured gaps are
+prefill 3× (Q4_0) / 7× (Q4_K_M, Q5_K_M) vs llama.cpp and pure-decode 2× (short
+context) / 3.2× (long context).
 
 | Priority | Item | Impact | Effort | Notes |
 |:---:|------|--------|--------|-------|
 | ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: initially 2× slower and reverted, then re-transcribed (P1) with 3 bug fixes — now SHIPPED (see "Prefill Gap" section above): ~+11 % at 30 tokens, ~+34 % at 70 tokens for nt ≥ 16** |
-| **P2** | **KV cache: F32 → F16** | 2× attention bandwidth | Small | Change cache allocation, `store_kv`, `gqa_attn` kernel (~30 lines) |
-| **P3** | **Improve f32 multi kernel occupancy** | up to 2× prefill | Medium | The simple f32 kernel already reaches ~1000 t/s at 70 tokens; tune grid/tile/threads to close the gap to llama.cpp's 1318 t/s |
+| **P1** | **GEMM kernels for non‑Q4_0 quants** | up to ~7× prefill (Q4_K_M / Q5_K_M) | Large | Extend the Q4_0 GEMM transcription pattern to `q5_0/q5_1/q8_0/q4_k/q6_k` (each needs its own dequant→sa staging). Currently non‑Q4_0 weights fall back to the scalar f32 multi kernel → Q4_K_M prefill ~240 t/s vs llama's ~1750 t/s. This also speeds up their decode |
+| **P2** | **KV cache: F32 → F16 (implemented, opt-in)** | ~0 for 0.5B; helps larger models / long context | Small | **Implemented 2026-08-01** as `MINFER_CACHE_TYPE=f16` (default f32). `kernel_store_kv_f16` + `kernel_gqa_attn_f16`. Measured F16 is ~3% **slower** on the 0.5B model — decode is dispatch-latency-bound, not KV-bandwidth-bound (attention ≈ 5% of decode work; KV read ≈ 0.5% of ~200 GB/s bandwidth). Kept opt-in for larger models where attention bandwidth dominates |
+| **P3** | **Reduce per-dispatch encode cost + parallel command buffers** | ~1.5–3× decode | Medium | llama.cpp and minfer dispatch ~490–530 kernels/forward, but llama costs ~7µs/kernel vs minfer's ~24µs. Two levers: (A2) pack `set_bytes` params into one struct + cache pipeline/buffer binds; (A1) encode node ranges on extra threads into multiple command buffers (llama `ggml_metal_graph_compute` pattern) to overlap encode with GPU execution. Also fuse K-RoPE into the KV store (-1 dispatch/layer) |
 | P4 | Matmul + bias fusion | 1 dispatch/matmul | Medium | Merge `add_bias_f32` into matmul epilogue |
 | P5 | Residual add + RMSNorm fusion | 2 dispatches/layer | Medium | Merge `add_f32` + `rms_norm` into one kernel |
 | P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |

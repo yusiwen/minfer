@@ -8,6 +8,27 @@ use crate::block::Q8B;
 
 static MPS: OnceLock<Option<MpsState>> = OnceLock::new();
 
+/// Print a clear error for an unsafe/unsupported GPU configuration and exit.
+/// All GPU safety guards (dimension misalignment, device-limit overruns,
+/// kernel-array overflow) abort here so the user knows the GPU path cannot run
+/// the model — never silently fall back to CPU (which would mask the problem).
+fn gpu_abort(msg: &str) -> ! {
+    eprintln!("MPS: unsupported GPU configuration — refusing to risk a GPU fault:");
+    eprintln!("  {msg}");
+    eprintln!("  (force CPU with MINFER_DISABLE_MPS=1)");
+    std::process::exit(1);
+}
+
+/// KV cache element type for the GPU path. Defaults to f32; `MINFER_CACHE_TYPE=f16`
+/// switches to a half cache (llama.cpp's default). f16 halves attention memory
+/// bandwidth but showed a ~15% decode regression on the 0.5B model (decode is
+/// dispatch-latency-bound, not KV-bandwidth-bound), so it is opt-in.
+pub fn kv_cache_is_f16() -> bool {
+    static F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F16.get_or_init(|| std::env::var("MINFER_CACHE_TYPE").map_or(false, |v| v == "f16"))
+}
+
+
 pub struct MpsState {
     #[cfg(target_os = "macos")]
     inner: MpsStateInner,
@@ -16,6 +37,10 @@ pub struct MpsState {
 #[cfg(target_os = "macos")]
 struct MpsStateInner {
     device: metal::Device,
+    // Cached device capabilities (queried once at init, aligned with llama.cpp's
+    // ggml-metal-device props). All dispatch-time guards compare against these.
+    max_threadgroup_memory: u64,
+    max_threads_per_threadgroup: u32,
     queue: metal::CommandQueue,
     pl_q4_0_q8: metal::ComputePipelineState,
     pl_q4_0_q8_multi: metal::ComputePipelineState,
@@ -45,7 +70,9 @@ struct MpsStateInner {
     pl_swiglu: metal::ComputePipelineState,
     pl_rope: metal::ComputePipelineState,
     pl_gqa_attn: metal::ComputePipelineState,
+    pl_gqa_attn_f16: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
+    pl_store_kv_f16: metal::ComputePipelineState,
     weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
     // Persistent scratch buffers grown on demand; avoids per-call allocation.
     q8_buf: std::sync::Mutex<metal::Buffer>,
@@ -70,6 +97,8 @@ struct MpsStateInner {
     kv_k: std::sync::RwLock<Vec<metal::Buffer>>,
     kv_v: std::sync::RwLock<Vec<metal::Buffer>>,
     kv_size: std::sync::RwLock<Vec<usize>>,
+    // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
+    dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
 // ─── MpsCommandBuffer: batch multiple ops in one GPU submission ──────
@@ -88,6 +117,21 @@ impl Drop for MpsCommandBuffer<'_> {
 
 #[cfg(target_os = "macos")]
 impl MpsCommandBuffer<'_> {
+    /// Record the current dispatch op label (only when MINFER_TRACE=1, so normal
+    /// encode speed is unaffected). Used to print the faulting kernel on a
+    /// Metal command-buffer error / timeout.
+    fn trace_op(&self, op: &str) {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*TRACE.get_or_init(|| std::env::var("MINFER_TRACE").is_ok()) {
+            return;
+        }
+        let mut t = self.state.dispatch_trace.lock().unwrap();
+        t.push_back(op.to_string());
+        if t.len() > 16 {
+            t.pop_front();
+        }
+    }
+
     fn set_params(&self, idx: u64, val: &i32) {
         self.enc.set_bytes(
             idx,
@@ -126,6 +170,7 @@ impl MpsCommandBuffer<'_> {
     pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
         x: &metal::Buffer, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
+        self.trace_op("matmul");
         match ttype {
             TensorType::Q8_0 => {
                 self.enc.set_compute_pipeline_state(
@@ -134,9 +179,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 const NW: u64 = 32;
                 const NSG: u64 = 4;
                 const NR0: u64 = 2;
@@ -155,9 +199,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
             }
@@ -168,9 +211,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
@@ -181,9 +223,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
@@ -194,9 +235,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
@@ -207,9 +247,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
             }
@@ -221,13 +260,19 @@ impl MpsCommandBuffer<'_> {
                 static GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let use_gemm = *GEMM.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"));
                 if nt >= 16 && use_gemm {
+                    // A3: the GEMM kernel requires 8192 B threadgroup memory.
+                    if 8192 > self.state.max_threadgroup_memory {
+                        gpu_abort(&format!(
+                            "Q4_0 GEMM needs 8192 B threadgroup memory, device max is {} B",
+                            self.state.max_threadgroup_memory
+                        ));
+                    }
                     self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_mm_f32);
                     self.enc.set_buffer(0, Some(wb), 0);
                     self.enc.set_buffer(1, Some(x), 0);
                     self.enc.set_buffer(2, Some(out), 0);
-                    self.set_params(3, &(od as i32));
-                    self.set_params(4, &(id as i32));
-                    self.set_params(5, &(nt as i32));
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                     self.enc.set_threadgroup_memory_length(0, 8192);
                     self.dispatch_2d(((nt + 31) / 32) as u64, ((od + 63) / 64) as u64, 32, 4);
                 } else {
@@ -237,9 +282,8 @@ impl MpsCommandBuffer<'_> {
                     self.enc.set_buffer(0, Some(wb), 0);
                     self.enc.set_buffer(1, Some(x), 0);
                     self.enc.set_buffer(2, Some(out), 0);
-                    self.set_params(3, &(od as i32));
-                    self.set_params(4, &(id as i32));
-                    self.set_params(5, &(nt as i32));
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
@@ -251,9 +295,8 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_buffer(0, Some(wb), 0);
                 self.enc.set_buffer(1, Some(x), 0);
                 self.enc.set_buffer(2, Some(out), 0);
-                self.set_params(3, &(od as i32));
-                self.set_params(4, &(id as i32));
-                self.set_params(5, &(nt as i32));
+                let mm_p = [od as i32, id as i32, nt as i32];
+                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
@@ -277,18 +320,16 @@ impl MpsCommandBuffer<'_> {
             self.enc.set_buffer(0, Some(wb), 0);
             self.enc.set_buffer(1, Some(x), 0);
             self.enc.set_buffer(2, Some(out), 0);
-            self.set_params(3, &(od as i32));
-            self.set_params(4, &(id as i32));
-            self.set_params(5, &(nt as i32));
+            let mm_p = [od as i32, id as i32, nt as i32];
+            self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
             self.dispatch_2d((od as u64 + 7) / 8, 1, 64, 1);
         } else {
             self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_q8);
             self.enc.set_buffer(0, Some(wb), 0);
             self.enc.set_buffer(1, Some(x), 0);
             self.enc.set_buffer(2, Some(out), 0);
-            self.set_params(3, &(od as i32));
-            self.set_params(4, &(id as i32));
-            self.set_params(5, &(nt as i32));
+            let mm_p = [od as i32, id as i32, nt as i32];
+            self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
             self.dispatch_2d((od as u64 + 7) / 8, nt as u64, 64, 1);
         }
     }
@@ -308,6 +349,7 @@ impl MpsCommandBuffer<'_> {
     pub fn embed_tokens_gpu(&self, wb: &metal::Buffer, ids: &metal::Buffer,
         dst: &metal::Buffer, ne: usize, nt: usize,
     ) {
+        self.trace_op("embed");
         self.enc.set_compute_pipeline_state(&self.state.pl_get_rows_q4_0);
         self.enc.set_buffer(0, Some(wb), 0);
         self.enc.set_buffer(1, Some(ids), 0);
@@ -322,6 +364,7 @@ impl MpsCommandBuffer<'_> {
     pub fn rms_norm(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
         d: usize, n: usize, eps: f32,
     ) {
+        self.trace_op("rms_norm");
         self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm);
         self.enc.set_buffer(0, Some(x), 0);
         self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0); // dummy if no weight
@@ -333,6 +376,7 @@ impl MpsCommandBuffer<'_> {
 
     /// Element-wise add: z = x + y
     pub fn add_f32(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer, n: usize) {
+        self.trace_op("add");
         self.enc.set_compute_pipeline_state(&self.state.pl_add);
         self.enc.set_buffer(0, Some(x), 0);
         self.enc.set_buffer(1, Some(y), 0);
@@ -343,6 +387,7 @@ impl MpsCommandBuffer<'_> {
 
     /// Add 1-D bias to rows: y[t][i] += b[i]
     pub fn add_bias_f32(&self, y: &metal::Buffer, b: &metal::Buffer, d: usize, n: usize) {
+        self.trace_op("bias");
         self.enc.set_compute_pipeline_state(&self.state.pl_add_bias);
         self.enc.set_buffer(0, Some(y), 0);
         self.enc.set_buffer(1, Some(b), 0);
@@ -370,6 +415,7 @@ impl MpsCommandBuffer<'_> {
 
     /// SwiGLU fused: dst = silu(gate) * up  (dst may alias gate)
     pub fn swiglu_f32(&self, gate: &metal::Buffer, up: &metal::Buffer, dst: &metal::Buffer, n: usize) {
+        self.trace_op("swiglu");
         self.enc.set_compute_pipeline_state(&self.state.pl_swiglu);
         self.enc.set_buffer(0, Some(gate), 0);
         self.enc.set_buffer(1, Some(up), 0);
@@ -384,6 +430,7 @@ impl MpsCommandBuffer<'_> {
         freq_base: f32, freq_scale: f32, positions: &metal::Buffer,
         rope_style: i32,
     ) {
+        self.trace_op("rope");
         self.enc.set_compute_pipeline_state(&self.state.pl_rope);
         self.enc.set_buffer(0, Some(x), 0);
         self.set_params(1, &(n_head as i32));
@@ -403,8 +450,11 @@ impl MpsCommandBuffer<'_> {
     pub fn gqa_attn_f32(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
         o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
     ) {
+        self.trace_op("gqa_attn");
         let gqa = nh / nk;
-        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn);
+        self.enc.set_compute_pipeline_state(
+            if kv_cache_is_f16() { &self.state.pl_gqa_attn_f16 } else { &self.state.pl_gqa_attn }
+        );
         self.enc.set_buffer(0, Some(q), 0);
         self.enc.set_buffer(1, Some(k), 0);
         self.enc.set_buffer(2, Some(v), 0);
@@ -422,10 +472,14 @@ impl MpsCommandBuffer<'_> {
     }
 
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].
-    pub fn store_kv_f32(&self, src: &metal::Buffer, dst: &metal::Buffer, nkt: usize, nt: usize,
+    /// Writes f32 (default) or f16 (MINFER_CACHE_TYPE=f16) into the KV cache.
+    pub fn store_kv(&self, src: &metal::Buffer, dst: &metal::Buffer, nkt: usize, nt: usize,
         positions: &metal::Buffer,
     ) {
-        self.enc.set_compute_pipeline_state(&self.state.pl_store_kv);
+        self.trace_op("store_kv");
+        self.enc.set_compute_pipeline_state(
+            if kv_cache_is_f16() { &self.state.pl_store_kv_f16 } else { &self.state.pl_store_kv }
+        );
         self.enc.set_buffer(0, Some(src), 0);
         self.enc.set_buffer(1, Some(dst), 0);
         self.set_params(2, &(nkt as i32));
@@ -436,29 +490,49 @@ impl MpsCommandBuffer<'_> {
 
     /// Commit GPU work and wait for completion using a semaphore completion handler.
     /// This avoids the ~20ms Metal scheduler wakeup overhead of wait_until_completed.
-    pub fn submit(self) {
+    pub fn submit(self) -> Result<(), String> {
         self.enc.end_encoding();
 
         // dispatch_semaphore_t is already a reference-counted opaque pointer.
-        // We create one with value 0, signal from the completion handler, and wait here.
         let sem = unsafe { dispatch_semaphore_create(0) };
-
-        // We need to pass `sem` into the block. Capture it as a usize to satisfy
-        // the block crate's Sync requirement.
         let sem_val = sem as usize;
 
         use block::ConcreteBlock;
         let blk = ConcreteBlock::new(move |_buf: &metal::CommandBufferRef| {
-            // SAFETY: dispatch_semaphore_signal is thread-safe.
             unsafe { dispatch_semaphore_signal(sem_val as *mut std::ffi::c_void); }
         });
         let blk = blk.copy();
         self.cmd_buf.add_completed_handler(&blk);
         self.cmd_buf.commit();
 
-        // DISPATCH_TIME_FOREVER = ~0u64 — wait indefinitely for GPU completion.
-        unsafe { dispatch_semaphore_wait(sem, !0u64); }
+        // Bounded wait (10 s). If the GPU hangs (hardware fault), the completion
+        // handler never fires and we bail out instead of blocking forever.
+        let timeout = unsafe { dispatch_time(0, 10_000_000_000i64) }; // 10 s from now
+        let rc = unsafe { dispatch_semaphore_wait(sem, timeout) };
         unsafe { dispatch_release(sem); }
+
+        if rc == 0 {
+            // Command buffer finished (possibly with an error status).
+            match self.cmd_buf.status() {
+                metal::MTLCommandBufferStatus::Completed => Ok(()),
+                st => Err(format!(
+                    "Metal command buffer status={st:?}. recent dispatches: {}",
+                    self.recent_trace()
+                )),
+            }
+        } else {
+            // Timed out: the GPU did not complete the work.
+            Err(format!(
+                "Metal command buffer timed out after 10s (GPU hang). recent dispatches: {}",
+                self.recent_trace()
+            ))
+        }
+    }
+
+    /// Join the recent dispatch trace into a printable string.
+    fn recent_trace(&self) -> String {
+        let t = self.state.dispatch_trace.lock().unwrap();
+        t.iter().cloned().collect::<Vec<_>>().join(" -> ")
     }
 }
 
@@ -467,6 +541,7 @@ extern "C" {
     fn dispatch_semaphore_create(value: isize) -> *mut std::ffi::c_void;
     fn dispatch_semaphore_signal(sem: *mut std::ffi::c_void) -> isize;
     fn dispatch_semaphore_wait(sem: *mut std::ffi::c_void, timeout: u64) -> isize;
+    fn dispatch_time(when: u64, delta: i64) -> u64;
     fn dispatch_release(obj: *mut std::ffi::c_void);
 }
 
@@ -542,10 +617,17 @@ impl MpsState {
             let pl_swiglu   = get_pl("kernel_swiglu_f32")?;
             let pl_rope     = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
+            let pl_gqa_attn_f16 = get_pl("kernel_gqa_attn_f16")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
+            let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
             let m = MpsStateInner {
                 device: device.clone(),
+                max_threadgroup_memory: device.max_threadgroup_memory_length(),
+                max_threads_per_threadgroup: {
+                    let t = device.max_threads_per_threadgroup();
+                    (t.width * t.height * t.depth) as u32
+                },
                 queue: device.new_command_queue(),
                 pl_q4_0_q8,
                 pl_q4_0_q8_multi,
@@ -575,7 +657,9 @@ impl MpsState {
                 pl_swiglu,
                 pl_rope,
                 pl_gqa_attn,
+                pl_gqa_attn_f16,
                 pl_store_kv,
+                pl_store_kv_f16,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_buf: std::sync::Mutex::new(dummy_buf.clone()),
@@ -596,6 +680,7 @@ impl MpsState {
                 kv_k: std::sync::RwLock::new(Vec::new()),
                 kv_v: std::sync::RwLock::new(Vec::new()),
                 kv_size: std::sync::RwLock::new(Vec::new()),
+                dispatch_trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             eprintln!("MPS: using Metal on {} (unified: {})",
                 device.name(), if device.has_unified_memory() { "yes" } else { "no" });
@@ -712,6 +797,16 @@ impl MpsState {
         }
     }
 
+    /// Copy `count` f16 elements from a GPU buffer, converting to f32.
+    /// Used to read back the F16 KV cache for CPU fallback.
+    pub fn copy_from_gpu_half_to_f32(src: &metal::Buffer, dst: &mut [f32], count: usize) {
+        let p = src.contents() as *const u16;
+        for i in 0..count {
+            // SAFETY: the buffer holds at least `count` f16 values.
+            dst[i] = f32::from(half::f16::from_bits(unsafe { *p.add(i) }));
+        }
+    }
+
     /// Create a temporary GPU buffer from CPU data (for norm weights, biases, etc.)
     pub fn temp_buffer(&self, data: &[f32]) -> metal::Buffer {
         #[cfg(not(target_os = "macos"))] { unreachable!() }
@@ -784,7 +879,10 @@ impl MpsState {
                 cb.quant_matmul_q8(mat.0, &xbuf, &pool[i], mat.2, id, nt);
             }
         }
-        cb.submit();
+        cb.submit().unwrap_or_else(|e| {
+            eprintln!("MPS: GPU submit error: {e}");
+            std::process::exit(1);
+        });
 
         {
             let pool = self.inner.out_pool.lock().unwrap();
@@ -820,7 +918,10 @@ impl MpsState {
 
         let cb = self.cmd_buffer();
         cb.quant_matmul_q8(w, &xbuf, &obuf, od, id, nt);
-        cb.submit();
+        cb.submit().unwrap_or_else(|e| {
+            eprintln!("MPS: GPU submit error: {e}");
+            std::process::exit(1);
+        });
         Self::copy_from_gpu(&obuf, out);
     }
 
@@ -904,13 +1005,16 @@ impl MpsState {
         let ids_buf = self.inner.buf_token_ids.lock().unwrap().clone();
         let cb = self.cmd_buffer();
         cb.embed_tokens_gpu(&wb, &ids_buf, &hidden, ne, nt);
-        cb.submit();
+        if cb.submit().is_err() {
+            return false;
+        }
         true
     }
 
     /// Ensure the GPU KV cache for layer `il` can hold at least `max_nkv` rows.
     fn kv_ensure_layer(&self, il: usize, max_nkv: usize, nkt: usize) {
-        let need = (max_nkv * nkt * 4) as u64;
+        let elem = if kv_cache_is_f16() { 2u64 } else { 4u64 }; // F16 or F32 KV cache
+        let need = (max_nkv * nkt) as u64 * elem;
         {
             let mut kvec = self.inner.kv_k.write().unwrap();
             let mut vvec = self.inner.kv_v.write().unwrap();
@@ -969,6 +1073,47 @@ impl MpsState {
         let ffn_gate = l.ffn_gate.as_ref().unwrap();
         let ffn_up   = l.ffn_up.as_ref().unwrap();
         let ffn_down = l.ffn_down.as_ref().unwrap();
+
+        // Runtime guards: the Metal kernels assume these constraints. On any
+        // violation we error-exit (never silently fall back to CPU — that would
+        // mask an unsupported GPU configuration). nh%nk==0 and hd<=256 are
+        // required by the attention kernel (barrier participation + acc[256]);
+        // id%32==0 by the quantized matmuls.
+        if nh % nk != 0 {
+            gpu_abort(&format!(
+                "attention head mismatch: nh={nh}, nk={nk}, nh%nk != 0 (kernel_gqa_attn would deadlock the GPU)"
+            ));
+        }
+        if hd > 256 {
+            gpu_abort(&format!(
+                "attention head dim {hd} > 256 (kernel_gqa_attn float acc[256] would overflow)"
+            ));
+        }
+        for (name, v) in [("ne", ne), ("nqt", nqt), ("nkt", nkt), ("nf", nf)] {
+            if v % 32 != 0 {
+                gpu_abort(&format!(
+                    "{name}={v} is not 32-aligned (quantized matmul kernels would read out of bounds)"
+                ));
+            }
+        }
+        // Device-limit guards (queried values, not guessed): the attention
+        // kernel's threadgroup needs 2*32*hd f32s and 32*gqa threads.
+        let attn_smem = 2 * 32 * hd * 4;
+        if attn_smem as u64 > self.inner.max_threadgroup_memory {
+            gpu_abort(&format!(
+                "attention needs {attn_smem} B threadgroup memory, device max is {} B",
+                self.inner.max_threadgroup_memory
+            ));
+        }
+        let gqa = nh / nk;
+        if 32 * gqa as u32 > self.inner.max_threads_per_threadgroup {
+            gpu_abort(&format!(
+                "attention threadgroup needs {} threads (32 * gqa={}), device max is {}",
+                32 * gqa,
+                32 * gqa,
+                self.inner.max_threads_per_threadgroup
+            ));
+        }
 
         // Raw not supported in Metal shaders — fall back to CPU
         let all_types = [wq.ttype, wk.ttype, wv.ttype, wo.ttype,
@@ -1045,8 +1190,8 @@ impl MpsState {
         if let Some(bb) = &bv_bias { cb.add_bias_f32(&bv_buf, bb, nkt, nt); }
         cb.rope_f32(&bq_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style);
         cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style);
-        cb.store_kv_f32(&bk_buf, &kv_k[il], nkt, nt, &pos_buf);
-        cb.store_kv_f32(&bv_buf, &kv_v[il], nkt, nt, &pos_buf);
+        cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf);
+        cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf);
         cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
         // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
         cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt);
@@ -1082,6 +1227,12 @@ impl MpsState {
         output_b: Option<&Tensor>,
         ne: usize, nv: usize, nt: usize, eps: f32,
     ) -> bool {
+        // The output matmul quantized kernels require id (ne) % 32 == 0.
+        if ne % 32 != 0 {
+            gpu_abort(&format!(
+                "output matmul input dim ne={ne} is not 32-aligned (quantized matmul would read out of bounds)"
+            ));
+        }
         let weights = self.inner.weights.lock().unwrap();
         let norm_w = match output_norm {
             Some(t) => match weights.get(&t.name) {
@@ -1128,20 +1279,28 @@ impl MpsState {
 
     /// Sync GPU KV cache to CPU KVCache for up to `num_layers` layers.
     /// Ensures CPU fallback has consistent KV state after GPU forward passes.
+    /// The GPU cache is F16 (opt-in) or F32; the CPU cache is F32.
     pub fn sync_kv_to_cpu(&self, kv_cache: &mut crate::cache::KVCache, num_layers: usize) {
         let kv_k = self.inner.kv_k.read().unwrap();
         let kv_v = self.inner.kv_v.read().unwrap();
         let kv_size = self.inner.kv_size.read().unwrap();
+        let f16 = kv_cache_is_f16();
         for il in 0..num_layers.min(kv_k.len()) {
             let sz = kv_size[il];
             if sz == 0 || il >= kv_cache.layers.len() {
                 continue;
             }
             let layer = &mut kv_cache.layers[il];
-            let needed = (sz * layer.dim * 4) as u64;
-            if kv_k[il].length() >= needed && (layer.k.len() * 4) as u64 >= needed {
-                Self::copy_from_gpu(&kv_k[il], &mut layer.k[..sz * layer.dim]);
-                Self::copy_from_gpu(&kv_v[il], &mut layer.v[..sz * layer.dim]);
+            let n = sz * layer.dim;
+            let elem = if f16 { 2u64 } else { 4u64 };
+            if kv_k[il].length() >= (n as u64) * elem && layer.k.len() >= n {
+                if f16 {
+                    Self::copy_from_gpu_half_to_f32(&kv_k[il], &mut layer.k[..n], n);
+                    Self::copy_from_gpu_half_to_f32(&kv_v[il], &mut layer.v[..n], n);
+                } else {
+                    Self::copy_from_gpu(&kv_k[il], &mut layer.k[..n]);
+                    Self::copy_from_gpu(&kv_v[il], &mut layer.v[..n]);
+                }
                 layer.size = sz;
             }
         }

@@ -83,9 +83,8 @@ fn gemm_isolation() {
         enc.set_buffer(0, Some(&wb), 0);
         enc.set_buffer(1, Some(&xb), 0);
         enc.set_buffer(2, Some(&out), 0);
-        for (i, v) in [od as i32, id as i32, nt as i32].iter().enumerate() {
-            enc.set_bytes(3 + i as u64, 4, v as *const i32 as *const _);
-        }
+        let mm_p = [od as i32, id as i32, nt as i32];
+        enc.set_bytes(3, 12, mm_p.as_ptr() as *const _);
         enc.set_threadgroup_memory_length(0, 8192);
         enc.dispatch_thread_groups(
             metal::MTLSize { width: ((nt + 31) / 32) as u64, height: ((od + 63) / 64) as u64, depth: 1 },
