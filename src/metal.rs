@@ -102,14 +102,18 @@ struct MpsStateInner {
     pl_q4_1_f32_multi: metal::ComputePipelineState,
     pl_q8_0_f32: metal::ComputePipelineState,
     pl_q8_0_f32_multi: metal::ComputePipelineState,
+    pl_q8_0_mm_f32: metal::ComputePipelineState,
     pl_q4_k_f32: metal::ComputePipelineState,
     pl_q4_k_f32_multi: metal::ComputePipelineState,
     pl_q6_k_f32: metal::ComputePipelineState,
     pl_q6_k_f32_multi: metal::ComputePipelineState,
+    pl_q6_k_mm_f32: metal::ComputePipelineState,
     pl_q5_0_f32: metal::ComputePipelineState,
     pl_q5_0_f32_multi: metal::ComputePipelineState,
+    pl_q5_0_mm_f32: metal::ComputePipelineState,
     pl_q5_1_f32: metal::ComputePipelineState,
     pl_q5_1_f32_multi: metal::ComputePipelineState,
+    pl_q5_1_mm_f32: metal::ComputePipelineState,
     pl_q5_k_f32: metal::ComputePipelineState,
     pl_q5_k_f32_multi: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
@@ -223,6 +227,34 @@ impl MpsCommandBuffer<'_> {
         );
     }
 
+    /// GEMM kernels (prefill nt>=16) are enabled unless MINFER_GEMM=0.
+    fn gemm_enabled() -> bool {
+        static GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *GEMM.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"))
+    }
+
+    /// Dispatch a 64×32-tile simdgroup GEMM (NT≥16 prefill). GPU safety: the
+    /// kernels stage 8 KB of threadgroup memory (sa 4 KB + sb 2 KB + bc_out
+    /// 8 KB reusing sa/sb) — verified against the queried device limit.
+    fn gemm_dispatch(&self, pl: &metal::ComputePipelineState, wb: &metal::Buffer,
+        x: &metal::Buffer, out: &metal::Buffer, od: usize, id: usize, nt: usize,
+    ) {
+        if 8192 > self.state.max_threadgroup_memory {
+            gpu_abort(&format!(
+                "GEMM needs 8192 B threadgroup memory, device max is {} B",
+                self.state.max_threadgroup_memory
+            ));
+        }
+        self.enc.set_compute_pipeline_state(pl);
+        self.enc.set_buffer(0, Some(wb), 0);
+        self.enc.set_buffer(1, Some(x), 0);
+        self.enc.set_buffer(2, Some(out), 0);
+        let mm_p = [od as i32, id as i32, nt as i32];
+        self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+        self.enc.set_threadgroup_memory_length(0, 8192);
+        self.dispatch_2d(((nt + 31) / 32) as u64, ((od + 63) / 64) as u64, 32, 4);
+    }
+
     fn dispatch_1d(&self, n: u64, tg: u64) {
         self.enc.dispatch_thread_groups(
             metal::MTLSize { width: (n + tg - 1) / tg, height: 1, depth: 1 },
@@ -249,36 +281,46 @@ impl MpsCommandBuffer<'_> {
         self.trace_op("matmul");
         match ttype {
             TensorType::Q8_0 => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                const NW: u64 = 32;
-                const NSG: u64 = 4;
-                const NR0: u64 = 2;
-                const TG_MEM: u64 = NW * NR0 * std::mem::size_of::<f32>() as u64; // 256 bytes
-                self.enc.set_threadgroup_memory_length(0, TG_MEM);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 1) / 2) as u64, grid_y, NW, NSG);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, x, out, od, id, nt);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    const NW: u64 = 32;
+                    const NSG: u64 = 4;
+                    const NR0: u64 = 2;
+                    const TG_MEM: u64 = NW * NR0 * std::mem::size_of::<f32>() as u64; // 256 bytes
+                    self.enc.set_threadgroup_memory_length(0, TG_MEM);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 1) / 2) as u64, grid_y, NW, NSG);
+                }
             }
             TensorType::Q4_K | TensorType::Q6_K => {
-                let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
-                    if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
+                // Q6_K has a simdgroup GEMM (super-block); Q4_K still falls back
+                // to the scalar f32 multi (no Q4_K in the shipped 0.5B K_M models).
+                if ttype == TensorType::Q6_K && nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q6_k_mm_f32, wb, x, out, od, id, nt);
                 } else {
-                    if nt > 1 { &self.state.pl_q6_k_f32_multi } else { &self.state.pl_q6_k_f32 }
-                };
-                self.enc.set_compute_pipeline_state(pl);
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                    let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
+                        if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
+                    } else {
+                        if nt > 1 { &self.state.pl_q6_k_f32_multi } else { &self.state.pl_q6_k_f32 }
+                    };
+                    self.enc.set_compute_pipeline_state(pl);
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                }
             }
             TensorType::Q4_1 => {
                 self.enc.set_compute_pipeline_state(
@@ -293,28 +335,36 @@ impl MpsCommandBuffer<'_> {
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
             TensorType::Q5_0 => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, x, out, od, id, nt);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                }
             }
             TensorType::Q5_1 => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, x, out, od, id, nt);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                }
             }
             TensorType::Q5_K => {
                 self.enc.set_compute_pipeline_state(
@@ -333,24 +383,8 @@ impl MpsCommandBuffer<'_> {
                 // accumulation). MINFER_GEMM=0 disables it (f32 multi fallback) for
                 // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
                 // dominates for tiny prefills).
-                static GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_gemm = *GEMM.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"));
-                if nt >= 16 && use_gemm {
-                    // A3: the GEMM kernel requires 8192 B threadgroup memory.
-                    if 8192 > self.state.max_threadgroup_memory {
-                        gpu_abort(&format!(
-                            "Q4_0 GEMM needs 8192 B threadgroup memory, device max is {} B",
-                            self.state.max_threadgroup_memory
-                        ));
-                    }
-                    self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_mm_f32);
-                    self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
-                    self.enc.set_buffer(2, Some(out), 0);
-                    let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                    self.enc.set_threadgroup_memory_length(0, 8192);
-                    self.dispatch_2d(((nt + 31) / 32) as u64, ((od + 63) / 64) as u64, 32, 4);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, x, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
@@ -734,14 +768,18 @@ impl MpsState {
             let pl_q4_1_f32 = get_pl("kernel_q4_1_f32_matmul")?;
             let pl_q4_1_f32_multi = get_pl("kernel_q4_1_f32_matmul_multi")?;
             let pl_q8_0_f32 = get_pl("kernel_q8_0_f32_matmul")?;
+            let pl_q8_0_mm_f32 = get_pl("kernel_q8_0_mm_f32")?;
             let pl_q8_0_f32_multi = get_pl("kernel_q8_0_f32_matmul_multi")?;
             let pl_q4_k_f32 = get_pl("kernel_q4_k_f32_matmul")?;
             let pl_q4_k_f32_multi = get_pl("kernel_q4_k_f32_matmul_multi")?;
             let pl_q6_k_f32 = get_pl("kernel_q6_k_f32_matmul")?;
+            let pl_q6_k_mm_f32 = get_pl("kernel_q6_k_mm_f32")?;
             let pl_q6_k_f32_multi = get_pl("kernel_q6_k_f32_matmul_multi")?;
             let pl_q5_0_f32 = get_pl("kernel_q5_0_f32_matmul")?;
+            let pl_q5_0_mm_f32 = get_pl("kernel_q5_0_mm_f32")?;
             let pl_q5_0_f32_multi = get_pl("kernel_q5_0_f32_matmul_multi")?;
             let pl_q5_1_f32 = get_pl("kernel_q5_1_f32_matmul")?;
+            let pl_q5_1_mm_f32 = get_pl("kernel_q5_1_mm_f32")?;
             let pl_q5_1_f32_multi = get_pl("kernel_q5_1_f32_matmul_multi")?;
             let pl_q5_k_f32 = get_pl("kernel_q5_k_f32_matmul")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
@@ -776,15 +814,19 @@ impl MpsState {
                 pl_q4_1_f32,
                 pl_q4_1_f32_multi,
                 pl_q8_0_f32,
+                pl_q8_0_mm_f32,
                 pl_q8_0_f32_multi,
                 pl_q4_k_f32,
                 pl_q4_k_f32_multi,
                 pl_q6_k_f32,
                 pl_q6_k_f32_multi,
+                pl_q6_k_mm_f32,
                 pl_q5_0_f32,
                 pl_q5_0_f32_multi,
+                pl_q5_0_mm_f32,
                 pl_q5_1_f32,
                 pl_q5_1_f32_multi,
+                pl_q5_1_mm_f32,
                 pl_q5_k_f32,
                 pl_q5_k_f32_multi,
                 pl_get_rows_q4_0,

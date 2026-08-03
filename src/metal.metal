@@ -575,6 +575,107 @@ inline void dequant_q4_0_16(device const uchar * blkp, short il, thread float4x4
     reg = reg_f;
 }
 
+// ─── Dequant helpers for the non-Q4_0 GEMM kernels (faithful llama.cpp ports) ─
+// Each produces a float4x4 of 16 f32 for one 32-element block half (il=0/1),
+// except Q6_K which produces a 32-element sub-block of a 256-element super-block
+// (il=0..7). Layout matches llama's block_* structs / GGUF tensor bytes.
+
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
+// Q5_0: d(half,2) + qh(u32,4) + qs(u16*8,16) = 22 B / 32 elems. Signed (val - 16).
+inline void dequant_q5_0_16(device const uchar * blkp, short il, thread float4x4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(blkp + 6);
+    const float d  = float(*(device const half *)blkp);
+    const float md = -16.0f * d;
+    const ushort mask = il ? 0x00F0 : 0x000F;
+    const uint32_t qh = (uint32_t)blkp[2] | ((uint32_t)blkp[3] << 8) | ((uint32_t)blkp[4] << 16) | ((uint32_t)blkp[5] << 24);
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ? 0 : 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i)) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i+1)) << gh_bk) & 0x10;
+        const int32_t x0 = ((((qs[i]) & mask) >> x_mv) | xh_0);
+        const int32_t x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg_f[i/2][2*(i%2) + 0] = d * (float)x0 + md;
+        reg_f[i/2][2*(i%2) + 1] = d * (float)x1 + md;
+    }
+    reg = reg_f;
+}
+
+// Q5_1: d(half,2) + m(half,2) + qh(u32,4) + qs(u16*8,16) = 24 B / 32 elems. Unsigned + m.
+inline void dequant_q5_1_16(device const uchar * blkp, short il, thread float4x4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(blkp + 8);
+    const float d = float(*(device const half *)blkp);
+    const float m = float(*(device const half *)(blkp + 2));
+    const ushort mask = il ? 0x00F0 : 0x000F;
+    const uint32_t qh = (uint32_t)blkp[4] | ((uint32_t)blkp[5] << 8) | ((uint32_t)blkp[6] << 16) | ((uint32_t)blkp[7] << 24);
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ? 0 : 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i)) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i+1)) << gh_bk) & 0x10;
+        const int32_t x0 = ((((qs[i]) & mask) >> x_mv) | xh_0);
+        const int32_t x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg_f[i/2][2*(i%2) + 0] = d * (float)x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d * (float)x1 + m;
+    }
+    reg = reg_f;
+}
+
+// Q8_0: d(half,2) + qs(int8*32,32) = 34 B / 32 elems.
+inline void dequant_q8_0_16(device const uchar * blkp, short il, thread float4x4 & reg) {
+    device const int8_t * qs = (device const int8_t *)(blkp + 2);
+    const float d = float(*(device const half *)blkp);
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = (float)qs[i + 16*il] * d;
+    }
+    reg = reg_f;
+}
+
+// Q6_K: d(half,2) LAST + ql(u8,128) + qh(u8,64) + scales(i8,16) = 210 B / 256 elems.
+// il = 0..7 = which 32-element sub-block of the super-block.
+inline void dequant_q6_k_16(device const uchar * blkp, short il, thread float4x4 & reg) {
+    const float d_all = float(*(device const half *)(blkp + 208));
+    device const uint16_t * ql = (device const uint16_t *)blkp;
+    device const uint16_t * qh = (device const uint16_t *)(blkp + 128);
+    device const int8_t * scales = (device const int8_t *)(blkp + 192);
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = (float)scales[(il%2) + 2*((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg_f[i][0] = dl0 * ((float)(q & 0xFF))       - ml;
+        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+    reg = reg_f;
+}
+
 kernel void kernel_q4_0_mm_f32(
     device const uchar * weights [[buffer(0)]],
     device const float * acts    [[buffer(1)]],
@@ -676,6 +777,466 @@ kernel void kernel_q4_0_mm_f32(
         }
     } else {
         // partial tile (bc_out): per-simdgroup temp_str + float4 copy
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = (int)tiitg; j < nr1; j += NR1) {
+                device float  * D  = output + r0 + (r1 + j)*p[0];
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) *(D4 + i) = *(C4 + i);
+                i *= 4;
+                for (; i < nr0; i++) *(D + i) = *(C + i);
+            }
+        }
+    }
+}
+
+// ─── Q8_0 × f32 GEMM (simdgroup-cooperative, prefill nt>=16) ──
+// Same structure as kernel_q4_0_mm_f32; Q8_0: d(half,2) + qs(int8*32,32) = 34 B.
+kernel void kernel_q8_0_mm_f32(
+    device const uchar * weights [[buffer(0)]],
+    device const float * acts    [[buffer(1)]],
+    device       float * output  [[buffer(2)]],
+    constant    int    * p       [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup char * shmem [[threadgroup(0)]]
+) {
+    constexpr int Q8B = 34;
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int M = p[0], K = p[1], N = p[2];
+    const int nblk = K / 32;
+
+    const int r0 = (int)tgpig.y * NR0;
+    const int r1 = (int)tgpig.x * NR1;
+
+    const short nr0 = (M - r0 < NR0) ? (M - r0) : NR0;
+    const short nr1 = (N - r1 < NR1) ? (N - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    threadgroup half * sa = (threadgroup half *)shmem;             // 64×32 f16 = 4096 B
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);    // 32×32 f16 = 2048 B
+
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short i = tiitg; i < 32*32; i += 128) sb[i] = 0.0f;
+    for (short i = tiitg; i < 64*32; i += 128) sa[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        thread float4x4 temp_a;
+        dequant_q8_0_16(weights + (r0 + lr0) * nblk * Q8B + (loop_k/32) * Q8B, il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = lr0/8;
+            const short lx = lr0%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            sa[64*ib + 8*ly + lx] = half(temp_a[i/4][i%4]);
+        }
+
+        const short iy = 8*(tiitg % NL1);
+        const short bx = tiitg % NL1;
+        const short by = (tiitg/NL1)/8;
+        const short bly = (tiitg/NL1)%8;
+        const short bib = 4*bx + by;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        for (short i = 0; i < 8; i++) {
+            sb[64*bib + 8*bly + i] = half(y[i]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= M && r1 + NR1 <= N) {
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
+        }
+    } else {
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = (int)tiitg; j < nr1; j += NR1) {
+                device float  * D  = output + r0 + (r1 + j)*p[0];
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) *(D4 + i) = *(C4 + i);
+                i *= 4;
+                for (; i < nr0; i++) *(D + i) = *(C + i);
+            }
+        }
+    }
+}
+
+// ─── Q5_0 × f32 GEMM (simdgroup-cooperative, prefill nt>=16) ──
+// Same structure; Q5_0: d(2) + qh(4) + qs(16) = 22 B. Signed (val - 16).
+kernel void kernel_q5_0_mm_f32(
+    device const uchar * weights [[buffer(0)]],
+    device const float * acts    [[buffer(1)]],
+    device       float * output  [[buffer(2)]],
+    constant    int    * p       [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup char * shmem [[threadgroup(0)]]
+) {
+    constexpr int Q5B = 22;
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int M = p[0], K = p[1], N = p[2];
+    const int nblk = K / 32;
+
+    const int r0 = (int)tgpig.y * NR0;
+    const int r1 = (int)tgpig.x * NR1;
+
+    const short nr0 = (M - r0 < NR0) ? (M - r0) : NR0;
+    const short nr1 = (N - r1 < NR1) ? (N - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    threadgroup half * sa = (threadgroup half *)shmem;             // 64×32 f16 = 4096 B
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);    // 32×32 f16 = 2048 B
+
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short i = tiitg; i < 32*32; i += 128) sb[i] = 0.0f;
+    for (short i = tiitg; i < 64*32; i += 128) sa[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        thread float4x4 temp_a;
+        dequant_q5_0_16(weights + (r0 + lr0) * nblk * Q5B + (loop_k/32) * Q5B, il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = lr0/8;
+            const short lx = lr0%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            sa[64*ib + 8*ly + lx] = half(temp_a[i/4][i%4]);
+        }
+
+        const short iy = 8*(tiitg % NL1);
+        const short bx = tiitg % NL1;
+        const short by = (tiitg/NL1)/8;
+        const short bly = (tiitg/NL1)%8;
+        const short bib = 4*bx + by;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        for (short i = 0; i < 8; i++) {
+            sb[64*bib + 8*bly + i] = half(y[i]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= M && r1 + NR1 <= N) {
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
+        }
+    } else {
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = (int)tiitg; j < nr1; j += NR1) {
+                device float  * D  = output + r0 + (r1 + j)*p[0];
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) *(D4 + i) = *(C4 + i);
+                i *= 4;
+                for (; i < nr0; i++) *(D + i) = *(C + i);
+            }
+        }
+    }
+}
+
+// ─── Q5_1 × f32 GEMM (simdgroup-cooperative, prefill nt>=16) ──
+// Same structure; Q5_1: d(2) + m(2) + qh(4) + qs(16) = 24 B. Unsigned + m.
+kernel void kernel_q5_1_mm_f32(
+    device const uchar * weights [[buffer(0)]],
+    device const float * acts    [[buffer(1)]],
+    device       float * output  [[buffer(2)]],
+    constant    int    * p       [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup char * shmem [[threadgroup(0)]]
+) {
+    constexpr int Q51B = 24;
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int M = p[0], K = p[1], N = p[2];
+    const int nblk = K / 32;
+
+    const int r0 = (int)tgpig.y * NR0;
+    const int r1 = (int)tgpig.x * NR1;
+
+    const short nr0 = (M - r0 < NR0) ? (M - r0) : NR0;
+    const short nr1 = (N - r1 < NR1) ? (N - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    threadgroup half * sa = (threadgroup half *)shmem;             // 64×32 f16 = 4096 B
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);    // 32×32 f16 = 2048 B
+
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short i = tiitg; i < 32*32; i += 128) sb[i] = 0.0f;
+    for (short i = tiitg; i < 64*32; i += 128) sa[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        thread float4x4 temp_a;
+        dequant_q5_1_16(weights + (r0 + lr0) * nblk * Q51B + (loop_k/32) * Q51B, il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = lr0/8;
+            const short lx = lr0%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            sa[64*ib + 8*ly + lx] = half(temp_a[i/4][i%4]);
+        }
+
+        const short iy = 8*(tiitg % NL1);
+        const short bx = tiitg % NL1;
+        const short by = (tiitg/NL1)/8;
+        const short bly = (tiitg/NL1)%8;
+        const short bib = 4*bx + by;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        for (short i = 0; i < 8; i++) {
+            sb[64*bib + 8*bly + i] = half(y[i]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= M && r1 + NR1 <= N) {
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
+        }
+    } else {
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = (int)tiitg; j < nr1; j += NR1) {
+                device float  * D  = output + r0 + (r1 + j)*p[0];
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) *(D4 + i) = *(C4 + i);
+                i *= 4;
+                for (; i < nr0; i++) *(D + i) = *(C + i);
+            }
+        }
+    }
+}
+
+// ─── Q6_K × f32 GEMM (simdgroup-cooperative, prefill nt>=16) ──
+// Same 64×32-tile structure as Q4_0, but the weights are 256-element super-blocks
+// (Q6KB=210). Each 32-elem K step spans 2 "il halves" of the super-block (il =
+// (loop_k%256)/16 + il0, il0 = 0/1), dequantized by dequant_q6_k_16.
+kernel void kernel_q6_k_mm_f32(
+    device const uchar * weights [[buffer(0)]],
+    device const float * acts    [[buffer(1)]],
+    device       float * output  [[buffer(2)]],
+    constant    int    * p       [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup char * shmem [[threadgroup(0)]]
+) {
+    constexpr int Q6KB = 210;
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int M = p[0], K = p[1], N = p[2];
+    const int nblk = K / 256;   // super-blocks per row
+
+    const int r0 = (int)tgpig.y * NR0;
+    const int r1 = (int)tgpig.x * NR1;
+
+    const short nr0 = (M - r0 < NR0) ? (M - r0) : NR0;
+    const short nr1 = (N - r1 < NR1) ? (N - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    threadgroup half * sa = (threadgroup half *)shmem;             // 64×32 f16 = 4096 B
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);    // 32×32 f16 = 2048 B
+
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short i = tiitg; i < 32*32; i += 128) sb[i] = 0.0f;
+    for (short i = tiitg; i < 64*32; i += 128) sa[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        thread float4x4 temp_a;
+        // super-block at loop_k/256; the 32-elem step spans 2 il-halves
+        dequant_q6_k_16(weights + (r0 + lr0) * nblk * Q6KB + (loop_k/256) * Q6KB,
+                        ((loop_k % 256) / 16) + il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = lr0/8;
+            const short lx = lr0%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            sa[64*ib + 8*ly + lx] = half(temp_a[i/4][i%4]);
+        }
+
+        const short iy = 8*(tiitg % NL1);
+        const short bx = tiitg % NL1;
+        const short by = (tiitg/NL1)/8;
+        const short bly = (tiitg/NL1)%8;
+        const short bib = 4*bx + by;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        for (short i = 0; i < 8; i++) {
+            sb[64*bib + 8*bly + i] = half(y[i]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= M && r1 + NR1 <= N) {
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
+        }
+    } else {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
