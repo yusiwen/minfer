@@ -1896,3 +1896,172 @@ kernel void kernel_gqa_attn_f16(
         }
     }
 }
+
+// ─── KV-parallel split attention (nt==1 decode) ──────────────
+// The decode bottleneck (measured ~48% of per-token time, grows with KV): for
+// nt==1 the classic kernel uses a grid of only (1, nk) threadgroups that loop
+// the KV tiles SEQUENTIALLY (latency-bound, GPU underutilized). This two-pass
+// split parallelizes the KV dimension:
+//   pass 1  kernel_gqa_attn_partial_f32: grid (nt, nk, n_chunks) — each TG
+//           computes an online-softmax PARTIAL (mx, S, acc[hd]) for its KV
+//           chunk [c*cs, min(nkv,(c+1)*cs)). Same tile/barrier structure as the
+//           classic kernel, but each TG loops only its chunk.
+//   pass 2  kernel_gqa_attn_combine_f32: grid (nt, nh) — reads the n_chunks
+//           partials, merges with the standard max/exp/l-sum, writes output.
+// GPU safety: pass 1 preserves the uniform-loop + valid-head + no-early-return
+// patterns; pass 2 is a pure elementwise kernel (no shared memory, no barriers).
+
+kernel void kernel_gqa_attn_partial_f32(
+    device const float * q        [[buffer(0)]],
+    device const float * k        [[buffer(1)]],
+    device const float * v        [[buffer(2)]],
+    device       float * partial  [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    constant    int    & n_chunks  [[buffer(10)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    const int Bc = 32;
+    int t     = (int)tgpig.x;
+    int hk    = (int)tgpig.y;
+    int chunk = (int)tgpig.z;
+    if (t >= nt || hk >= nk) return;
+
+    int nkv = positions[t] + 1;
+    int gqa = nh / nk;
+    int h0  = hk * gqa + (int)sgitg;
+    bool valid_head = (h0 < nh);
+    int  h  = valid_head ? h0 : 0;
+
+    // chunk bounds: chunk c covers [c*cs, min(nkv,(c+1)*cs)), cs = ceil(nkv/P).
+    // Empty chunks (kv_start >= nkv) produce an empty partial (mx=-INF, S=0,
+    // acc=0) that the combine ignores via exp(-INF - m) == 0.
+    int cs = (nkv + n_chunks - 1) / n_chunks;
+    int kv_start = chunk * cs;
+    int kv_end   = min(nkv, kv_start + cs);
+
+    int stride_q  = nh * hd;
+    int stride_kv = nk * hd;
+
+    device const float * qhead = q + t * stride_q + h * hd;
+
+    threadgroup float * k_tile = shmem;
+    threadgroup float * v_tile = shmem + Bc * hd;
+
+    float mx = -INFINITY;
+    float S = 0.0f;
+    float acc[256];
+    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
+
+    int n_tiles = (kv_end - kv_start + Bc - 1) / Bc;
+    for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        int ks = kv_start + tile_idx * Bc;
+        int tile_sz = min(Bc, kv_end - ks);
+
+        int total = tile_sz * hd;
+        int tgsz = 32 * gqa;
+        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
+            int ki = ks + i / hd;
+            int di = i % hd;
+            k_tile[i] = k[ki * stride_kv + hk * hd + di];
+            v_tile[i] = v[ki * stride_kv + hk * hd + di];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j0 = 0; j0 < tile_sz; j0 += 32) {
+            const int j = j0 + (int)tiisg;
+            const bool valid = (j < tile_sz);
+            float dot = -INFINITY;
+            if (valid) {
+                threadgroup float * kj = k_tile + j * hd;
+                dot = 0.0f;
+                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                dot *= scale;
+            }
+
+            float batch_mx = simd_max(dot);
+            float new_mx = max(mx, batch_mx);
+            float corr = exp(mx - new_mx);
+            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            S *= corr;
+            float e = valid ? exp(dot - new_mx) : 0.0f;
+            if (valid) {
+                threadgroup float * vj = v_tile + j * hd;
+                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                S += e;
+            }
+            mx = new_mx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    S = simd_sum(S);
+    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
+
+    // partial layout: [t][h][chunk] = {mx, S, acc[hd]}  (contiguous per chunk)
+    int pbase = ((t * nh + h) * n_chunks + chunk) * (2 + hd);
+    if (valid_head) {
+        if (tiisg == 0) {
+            partial[pbase + 0] = mx;
+            partial[pbase + 1] = S;
+        }
+        for (int d = tiisg; d < hd; d += 32) {
+            partial[pbase + 2 + d] = acc[d];
+        }
+    }
+}
+
+kernel void kernel_gqa_attn_combine_f32(
+    device const float * partial [[buffer(0)]],
+    device       float * o       [[buffer(1)]],
+    constant    int    & nh       [[buffer(2)]],
+    constant    int    & hd       [[buffer(3)]],
+    constant    int    & nt       [[buffer(4)]],
+    constant    int    & n_chunks [[buffer(5)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]]
+) {
+    int t = (int)tgpig.x;
+    int h = (int)tgpig.y;
+    if (t >= nt || h >= nh) return;
+
+    int pbase = (t * nh + h) * n_chunks * (2 + hd);
+
+    // merged running max over the partials
+    float m = -INFINITY;
+    for (int c = 0; c < n_chunks; c++) {
+        m = max(m, partial[pbase + c * (2 + hd) + 0]);
+    }
+    if (m == -INFINITY) {
+        // no partial had data (nkv==0) — not reachable for real heads, but
+        // write zeros rather than NaN (exp(-INF - -INF)) for GPU safety.
+        device float * ohead = o + t * (nh * hd) + h * hd;
+        for (int d = tiisg; d < hd; d += 32) ohead[d] = 0.0f;
+        return;
+    }
+
+    float l = 0.0f;
+    float acc[256];
+    for (int d = 0; d < hd; d++) acc[d] = 0.0f;
+    for (int c = 0; c < n_chunks; c++) {
+        int cbase = pbase + c * (2 + hd);
+        float e = exp(partial[cbase + 0] - m);
+        l += partial[cbase + 1] * e;
+        for (int d = tiisg; d < hd; d += 32) {
+            acc[d] += partial[cbase + 2 + d] * e;
+        }
+    }
+
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float * ohead = o + t * (nh * hd) + h * hd;
+    for (int d = tiisg; d < hd; d += 32) {
+        ohead[d] = acc[d] * inv;
+    }
+}

@@ -197,6 +197,22 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > incrementally with isolation tests (deterministic vs a scalar reference at
 > several nkv, incl. partial tiles) before touching the decode path.
 
+> **KV-parallel split attention SHIPPED (~32 % decode)** (2026-08-03):
+> `kernel_gqa_attn_partial_f32` + `kernel_gqa_attn_combine_f32`. Pass 1 grids
+> (nt, nk, n_chunks) — each TG computes an online-softmax PARTIAL (mx, S, acc)
+> for its KV chunk [c·cs, min(nkv,(c+1)·cs)) with the SAME tile/barrier/valid-head
+> structure as the classic kernel (each TG loops only its chunk; empty chunks
+> produce mx=-INF/S=0/acc=0). Pass 2 (grid (nt, nh)) merges the partials via the
+> standard max/exp/l-sum (a pure elementwise kernel — no shared memory, no
+> barriers; guarded m==-INF→zeros). Used for nt==1 decode with the f32 KV cache
+> (f16 falls back to the classic kernel); n_chunks default 8 (`MINFER_ATTN_CHUNKS`
+> overrides), measured best (1 vs 2 vs 4 vs 8 vs 16). GPU-safety: built first in
+> `tests/gqa_attn_isolation.rs::gqa_attn_split_isolation` (deterministic + cos 1.0
+> vs the scalar reference at nkv=1/30/33/65/100/240, n_chunks=1/2/4/8, empty
+> chunks, nt=1/2), then A/B-verified byte-identical to the classic path
+> (`MINFER_NO_SPLIT_ATTN=1`) before integration. Median 200-token decode:
+> 1.56 → **1.06 s (~32 %)**.
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per

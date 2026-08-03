@@ -122,6 +122,8 @@ struct MpsStateInner {
     pl_rope: metal::ComputePipelineState,
     pl_gqa_attn: metal::ComputePipelineState,
     pl_gqa_attn_f16: metal::ComputePipelineState,
+    pl_gqa_attn_partial: metal::ComputePipelineState,
+    pl_gqa_attn_combine: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
     weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
@@ -138,6 +140,7 @@ struct MpsStateInner {
     buf_bv: std::sync::Mutex<metal::Buffer>,
     buf_bqkv: std::sync::Mutex<metal::Buffer>,
     buf_ba: std::sync::Mutex<metal::Buffer>,
+    buf_attn_partial: std::sync::Mutex<metal::Buffer>,
     buf_bf: std::sync::Mutex<metal::Buffer>,
     buf_bg: std::sync::Mutex<metal::Buffer>,
     buf_bgu: std::sync::Mutex<metal::Buffer>,
@@ -210,6 +213,13 @@ impl MpsCommandBuffer<'_> {
         self.enc.dispatch_thread_groups(
             metal::MTLSize { width: w, height: h, depth: 1 },
             metal::MTLSize { width: tw, height: th, depth: 1 },
+        );
+    }
+
+    fn dispatch_3d(&self, w: u64, h: u64, d: u64, tw: u64, th: u64, td: u64) {
+        self.enc.dispatch_thread_groups(
+            metal::MTLSize { width: w, height: h, depth: d },
+            metal::MTLSize { width: tw, height: th, depth: td },
         );
     }
 
@@ -555,6 +565,49 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
     }
 
+    /// KV-parallel split attention for nt==1 decode (the classic kernel's grid
+    /// is only (1, nk) threadgroups that loop the KV sequentially — the measured
+    /// #1 decode bottleneck). Two passes: partial per KV chunk (grid (nt,nk,P)),
+    /// then combine (grid (nt,nh)). Requires the partials buffer (`buf_attn_partial`)
+    /// sized for nt*nh*P*(2+hd) floats, grown on demand here.
+    pub fn gqa_attn_split_f32(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
+        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize,
+        scale: f32, nt: usize, n_chunks: usize,
+    ) {
+        self.trace_op("gqa_attn_split");
+        let gqa = nh / nk;
+        let need = (nt * nh * n_chunks * (2 + hd) * 4) as u64;
+        let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
+
+        // pass 1: partials per (token, KV_head, chunk)
+        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_partial);
+        self.enc.set_buffer(0, Some(q), 0);
+        self.enc.set_buffer(1, Some(k), 0);
+        self.enc.set_buffer(2, Some(v), 0);
+        self.enc.set_buffer(3, Some(&partial), 0);
+        self.enc.set_buffer(4, Some(positions), 0);
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(n_chunks as i32));
+        const Bc: u64 = 32;
+        let shmem = Bc * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
+        self.enc.set_threadgroup_memory_length(0, shmem);
+        self.dispatch_3d(nt as u64, nk as u64, n_chunks as u64, 32, gqa as u64, 1);
+
+        // pass 2: combine
+        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_combine);
+        self.enc.set_buffer(0, Some(&partial), 0);
+        self.enc.set_buffer(1, Some(o), 0);
+        self.set_params(2, &(nh as i32));
+        self.set_params(3, &(hd as i32));
+        self.set_params(4, &(nt as i32));
+        self.set_params(5, &(n_chunks as i32));
+        self.dispatch_2d(nt as u64, nh as u64, 32, 1);
+    }
+
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].
     /// Writes f32 (default) or f16 (MINFER_CACHE_TYPE=f16) into the KV cache.
     pub fn store_kv(&self, src: &metal::Buffer, dst: &metal::Buffer, nkt: usize, nt: usize,
@@ -702,6 +755,8 @@ impl MpsState {
             let pl_rope     = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_gqa_attn_f16 = get_pl("kernel_gqa_attn_f16")?;
+            let pl_gqa_attn_partial = get_pl("kernel_gqa_attn_partial_f32")?;
+            let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
@@ -742,6 +797,8 @@ impl MpsState {
                 pl_rope,
                 pl_gqa_attn,
                 pl_gqa_attn_f16,
+                pl_gqa_attn_partial,
+                pl_gqa_attn_combine,
                 pl_store_kv,
                 pl_store_kv_f16,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -755,6 +812,7 @@ impl MpsState {
                 buf_bv: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_bqkv: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_ba: std::sync::Mutex::new(dummy_buf.clone()),
+                buf_attn_partial: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_bf: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_bg: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_bgu: std::sync::Mutex::new(dummy_buf.clone()),
@@ -1295,6 +1353,10 @@ impl MpsState {
         let use_fused_qkv = nt == 1 && buf_qkv.is_some()
             && wq.ttype == wk.ttype && wk.ttype == wv.ttype
             && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        // KV-parallel attention chunk count (decode): MINFER_ATTN_CHUNKS overrides.
+        // 8 measured best on 0.5B (1.04 s vs 1.55 s classic for 200 tokens).
+        let split_chunks = std::env::var("MINFER_ATTN_CHUNKS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 1).unwrap_or(8);
         if use_fused_qkv {
             let buf_qkv = buf_qkv.as_ref().unwrap();
             // GPU safety: the concat buffer must exactly match the fused output
@@ -1323,7 +1385,12 @@ impl MpsState {
             cb.rope_f32(&bqkv_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, nqt);
             cb.store_kv(&bqkv_buf, &kv_k[il], nkt, nt, &pos_buf, nqt);
             cb.store_kv(&bqkv_buf, &kv_v[il], nkt, nt, &pos_buf, nqt + nkt);
-            cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            if nt == 1 && !crate::metal::kv_cache_is_f16()
+                && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+            } else {
+                cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            }
         } else {
             cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, &bq_buf, nqt, ne, nt);
             if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt, 0); }
@@ -1335,7 +1402,12 @@ impl MpsState {
             cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
             cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf, 0);
             cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf, 0);
-            cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            if nt == 1 && !crate::metal::kv_cache_is_f16()
+                && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+            } else {
+                cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            }
         }
         // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
         cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt);
