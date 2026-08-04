@@ -134,6 +134,8 @@ fn gqa_attn_split_isolation() {
     let lib = device.new_library_with_source(src, &opts).unwrap_or_else(|e| panic!("shader compile: {e}"));
     let f_p = lib.get_function("kernel_gqa_attn_partial_f32", None).unwrap();
     let pl_p = device.new_compute_pipeline_state_with_function(&f_p).unwrap();
+    let f_p16 = lib.get_function("kernel_gqa_attn_partial_f16", None).unwrap();
+    let pl_p16 = device.new_compute_pipeline_state_with_function(&f_p16).unwrap();
     let f_c = lib.get_function("kernel_gqa_attn_combine_f32", None).unwrap();
     let pl_c = device.new_compute_pipeline_state_with_function(&f_c).unwrap();
 
@@ -171,9 +173,14 @@ fn gqa_attn_split_isolation() {
         let qb = device.new_buffer_with_data(q.as_ptr() as *const _, (q.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
         let kb = device.new_buffer_with_data(k.as_ptr() as *const _, (k.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
         let vb = device.new_buffer_with_data(v.as_ptr() as *const _, (v.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let k16: Vec<u16> = k.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let v16: Vec<u16> = v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let k16b = device.new_buffer_with_data(k16.as_ptr() as *const _, (k16.len() * 2) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let v16b = device.new_buffer_with_data(v16.as_ptr() as *const _, (v16.len() * 2) as u64, metal::MTLResourceOptions::StorageModeShared);
         let pb = device.new_buffer_with_data(positions.as_ptr() as *const _, (positions.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
 
-        let run = |cmdq: &metal::CommandQueue| -> Vec<f32> {
+        let run = |cmdq: &metal::CommandQueue, partial_pl: &metal::ComputePipelineState,
+                   kb_ref: &metal::Buffer, vb_ref: &metal::Buffer| -> Vec<f32> {
             let partial = device.new_buffer((nt * nh * n_chunks * (2 + hd) * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
             let ob = device.new_buffer((nt * ne_q * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
 
@@ -181,10 +188,10 @@ fn gqa_attn_split_isolation() {
             {
                 let cb = cmdq.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pl_p);
+                enc.set_compute_pipeline_state(partial_pl);
                 enc.set_buffer(0, Some(&qb), 0);
-                enc.set_buffer(1, Some(&kb), 0);
-                enc.set_buffer(2, Some(&vb), 0);
+                enc.set_buffer(1, Some(kb_ref), 0);
+                enc.set_buffer(2, Some(vb_ref), 0);
                 enc.set_buffer(3, Some(&partial), 0);
                 enc.set_buffer(4, Some(&pb), 0);
                 for (i, val) in [nh as i32, nk as i32, hd as i32, scale.to_bits() as i32, nt as i32, n_chunks as i32].iter().enumerate() {
@@ -200,7 +207,7 @@ fn gqa_attn_split_isolation() {
                 cb.commit();
                 cb.wait_until_completed();
             }
-            // pass 2: combine
+            // pass 2: combine (f32, shared between f32 and f16 caches)
             {
                 let cb = cmdq.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
@@ -222,17 +229,22 @@ fn gqa_attn_split_isolation() {
             unsafe { std::slice::from_raw_parts(ptr, nt * ne_q) }.to_vec()
         };
 
-        let r1 = run(&cmdq);
-        let r2 = run(&cmdq);
-        let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let dot: f64 = r1.iter().zip(&ref_out).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
-        let n1: f64 = r1.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        let n2: f64 = ref_out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        let cos = dot / (n1 * n2);
-        let maxdiff_ref = r1.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        println!("split nt={nt} nkv={nkv} n_chunks={n_chunks}: deterministic={} maxdiff_ref={maxdiff_ref:.2e} cos={cos:.6}", maxdiff_gg == 0.0);
-        assert!(maxdiff_gg == 0.0, "split nt={nt} nkv={nkv} nc={n_chunks}: non-deterministic");
-        assert!(cos > 0.999, "split nt={nt} nkv={nkv} nc={n_chunks}: wrong vs CPU (cos={cos:.6})");
+        for (label, pl, kb_ref, vb_ref) in [
+            ("f32", &pl_p, &kb, &vb),
+            ("f16", &pl_p16, &k16b, &v16b),
+        ] {
+            let r1 = run(&cmdq, pl, kb_ref, vb_ref);
+            let r2 = run(&cmdq, pl, kb_ref, vb_ref);
+            let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let dot: f64 = r1.iter().zip(&ref_out).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let n1: f64 = r1.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            let n2: f64 = ref_out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (n1 * n2);
+            let maxdiff_ref = r1.iter().zip(&ref_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("split[{label}] nt={nt} nkv={nkv} n_chunks={n_chunks}: deterministic={} maxdiff_ref={maxdiff_ref:.2e} cos={cos:.6}", maxdiff_gg == 0.0);
+            assert!(maxdiff_gg == 0.0, "split[{label}] nt={nt} nkv={nkv} nc={n_chunks}: non-deterministic");
+            assert!(cos > 0.999, "split[{label}] nt={nt} nkv={nkv} nc={n_chunks}: wrong vs CPU (cos={cos:.6})");
+        }
     }
 }
 

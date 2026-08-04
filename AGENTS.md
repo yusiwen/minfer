@@ -222,14 +222,23 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > structure as the classic kernel (each TG loops only its chunk; empty chunks
 > produce mx=-INF/S=0/acc=0). Pass 2 (grid (nt, nh)) merges the partials via the
 > standard max/exp/l-sum (a pure elementwise kernel — no shared memory, no
-> barriers; guarded m==-INF→zeros). Used for nt==1 decode with the f32 KV cache
-> (f16 falls back to the classic kernel); n_chunks default 8 (`MINFER_ATTN_CHUNKS`
-> overrides), measured best (1 vs 2 vs 4 vs 8 vs 16). GPU-safety: built first in
+> barriers; guarded m==-INF→zeros). Used for nt==1 decode; n_chunks default
+> adaptive `clamp((max_pos+1+15)/16, 1, 32)` (`MINFER_ATTN_CHUNKS` overrides),
+> measured best (1 vs 2 vs 4 vs 8 vs 16). GPU-safety: built first in
 > `tests/gqa_attn_isolation.rs::gqa_attn_split_isolation` (deterministic + cos 1.0
 > vs the scalar reference at nkv=1/30/33/65/100/240, n_chunks=1/2/4/8, empty
 > chunks, nt=1/2), then A/B-verified byte-identical to the classic path
 > (`MINFER_NO_SPLIT_ATTN=1`) before integration. Median 200-token decode:
 > 1.56 → **1.06 s (~32 %)**.
+
+> **F16 split attention SHIPPED** (2026-08-03): `kernel_gqa_attn_partial_f16`
+> reads the half K/V cache and converts to f32 float4 when staging the
+> threadgroup tiles; the combine pass is shared (partials are f32). The split is
+> now used for BOTH cache types at nt==1 (`MINFER_CACHE_TYPE=f16` no longer falls
+> back to the classic single-pass kernel). Verified in
+> `gqa_attn_split_isolation` (f32 AND f16 variants, cos>0.999) + end-to-end A/B
+> vs the f16 classic path. f16 200-token decode: 1.60 → **0.95 s** (f32 split
+> 0.89 s) — closes the f16-vs-f32 gap for larger models / long context.
 
 > **Attention float4 + adaptive chunks + KV geometric growth** (2026-08-03,
 > ~15 % more decode; long-context decode 10.6 → ~8 ms/token at KV≈2510):
