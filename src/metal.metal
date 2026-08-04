@@ -585,6 +585,23 @@ static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
+// Q4_1: d(half,2) + m(half,2) + qs(u16*8,16) = 20 B / 32 elems. Unsigned + m.
+inline void dequant_q4_1_16(device const uchar * blkp, short il, thread float4x4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(blkp + 4);
+    const float d  = float(*(device const half *)blkp);
+    const float m  = float(*(device const half *)(blkp + 2));
+    const float d1 = il ? (d / 16.0f) : d;
+    const float d2 = d1 / 256.0f;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = ushort(mask0 << 8);
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        reg_f[i/2][2*(i%2) + 0] = (float(qs[i] & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = (float(qs[i] & mask1) * d2) + m;
+    }
+    reg = reg_f;
+}
+
 // Q5_0: d(half,2) + qh(u32,4) + qs(u16*8,16) = 22 B / 32 elems. Signed (val - 16).
 inline void dequant_q5_0_16(device const uchar * blkp, short il, thread float4x4 & reg) {
     device const uint16_t * qs = (device const uint16_t *)(blkp + 6);
@@ -821,6 +838,120 @@ kernel void kernel_q4_0_mm_f32(
         }
     } else {
         // partial tile (bc_out): per-simdgroup temp_str + float4 copy
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = (int)tiitg; j < nr1; j += NR1) {
+                device float  * D  = output + r0 + (r1 + j)*p[0];
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + j*NR0;
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) *(D4 + i) = *(C4 + i);
+                i *= 4;
+                for (; i < nr0; i++) *(D + i) = *(C + i);
+            }
+        }
+    }
+}
+
+// ─── Q4_1 × f32 GEMM (simdgroup-cooperative, prefill nt>=16) ──
+// Same structure as kernel_q4_0_mm_f32; Q4_1: d(2) + m(2) + qs(16) = 20 B.
+kernel void kernel_q4_1_mm_f32(
+    device const uchar * weights [[buffer(0)]],
+    device const float * acts    [[buffer(1)]],
+    device       float * output  [[buffer(2)]],
+    constant    int    * p       [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    threadgroup char * shmem [[threadgroup(0)]]
+) {
+    constexpr int Q41B = 20;
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int M = p[0], K = p[1], N = p[2];
+    const int nblk = K / 32;
+
+    const int r0 = (int)tgpig.y * NR0;
+    const int r1 = (int)tgpig.x * NR1;
+
+    const short nr0 = (M - r0 < NR0) ? (M - r0) : NR0;
+    const short nr1 = (N - r1 < NR1) ? (N - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    threadgroup half * sa = (threadgroup half *)shmem;
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short i = tiitg; i < 32*32; i += 128) sb[i] = 0.0f;
+    for (short i = tiitg; i < 64*32; i += 128) sa[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        thread float4x4 temp_a;
+        dequant_q4_1_16(weights + (r0 + lr0) * nblk * Q41B + (loop_k/32) * Q41B, il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = lr0/8;
+            const short lx = lr0%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            sa[64*ib + 8*ly + lx] = half(temp_a[i/4][i%4]);
+        }
+
+        const short iy = 8*(tiitg % NL1);
+        const short bx = tiitg % NL1;
+        const short by = (tiitg/NL1)/8;
+        const short bly = (tiitg/NL1)%8;
+        const short bib = 4*bx + by;
+        device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        for (short i = 0; i < 8; i++) {
+            sb[64*bib + 8*bly + i] = half(y[i]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= M && r1 + NR1 <= N) {
+        device float * C = output + (r1 + 16*(sgitg >> 1))*p[0] + (r0 + 32*(sgitg & 1));
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
+        }
+    } else {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
