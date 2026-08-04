@@ -153,7 +153,7 @@ cargo run --release -- list
 | CPU (AVX2) | i7-1260P | Qwen2-0.5B | ~27 tok/s | ~21 tok/s |
 | CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
 | Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~650–1000 tok/s | ~230 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~966 tok/s | ~300 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~966 tok/s | ~315 tok/s |
 | Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~442 tok/s | — |
 
 Prefill uses simdgroup GEMMs for every quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
