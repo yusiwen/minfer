@@ -129,6 +129,7 @@ struct MpsStateInner {
     pl_gqa_attn: metal::ComputePipelineState,
     pl_gqa_attn_f16: metal::ComputePipelineState,
     pl_gqa_attn_partial: metal::ComputePipelineState,
+    pl_gqa_attn_partial_f16: metal::ComputePipelineState,
     pl_gqa_attn_combine: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
@@ -629,8 +630,11 @@ impl MpsCommandBuffer<'_> {
         let need = (nt * nh * n_chunks * (2 + hd) * 4) as u64;
         let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
 
-        // pass 1: partials per (token, KV_head, chunk)
-        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_partial);
+        // pass 1: partials per (token, KV_head, chunk) — f16 cache picks the
+        // f16 partial kernel (K/V read as half, staged to f32 float4 tiles).
+        self.enc.set_compute_pipeline_state(
+            if kv_cache_is_f16() { &self.state.pl_gqa_attn_partial_f16 } else { &self.state.pl_gqa_attn_partial }
+        );
         self.enc.set_buffer(0, Some(q), 0);
         self.enc.set_buffer(1, Some(k), 0);
         self.enc.set_buffer(2, Some(v), 0);
@@ -812,6 +816,7 @@ impl MpsState {
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_gqa_attn_f16 = get_pl("kernel_gqa_attn_f16")?;
             let pl_gqa_attn_partial = get_pl("kernel_gqa_attn_partial_f32")?;
+            let pl_gqa_attn_partial_f16 = get_pl("kernel_gqa_attn_partial_f16")?;
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
@@ -860,6 +865,7 @@ impl MpsState {
                 pl_gqa_attn,
                 pl_gqa_attn_f16,
                 pl_gqa_attn_partial,
+                pl_gqa_attn_partial_f16,
                 pl_gqa_attn_combine,
                 pl_store_kv,
                 pl_store_kv_f16,
@@ -1479,7 +1485,7 @@ impl MpsState {
             cb.rope_f32(&bqkv_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, nqt);
             cb.store_kv(&bqkv_buf, &kv_k[il], nkt, nt, &pos_buf, nqt);
             cb.store_kv(&bqkv_buf, &kv_v[il], nkt, nt, &pos_buf, nqt + nkt);
-            if nt == 1 && !crate::metal::kv_cache_is_f16()
+            if nt == 1
                 && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
                 cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
             } else {
@@ -1496,7 +1502,7 @@ impl MpsState {
             cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
             cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf, 0);
             cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf, 0);
-            if nt == 1 && !crate::metal::kv_cache_is_f16()
+            if nt == 1
                 && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
                 cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
             } else {
