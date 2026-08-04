@@ -75,9 +75,9 @@ OOB, fixed arrays, dimension assumptions, infinite waits).
 
 | ID | Finding | Risk | Status |
 |----|---------|------|--------|
-| H1 | Attention assumes `hd == hd_kv` — kernel uses `stride_kv = nk*hd` but the KV cache row is `nkt = nk*hd_kv`; OOB reads if they differ (other Qwen2.5 models may have `hd_kv != hd`). | High (fault) | **OPEN** — add `nkt != nk*hd` guard in `layer_gpu` → CPU fallback |
+| H1 | Attention assumes `hd == hd_kv` — kernel uses `stride_kv = nk*hd` but the KV cache row is `nkt = nk*hd_kv`; OOB reads if they differ (other Qwen2.5 models may have `hd_kv != hd`). | High (fault) | **GUARDED 2026-08-03** — `layer_gpu` aborts (`nkt != nk*hd` → `gpu_abort`) instead of risking misaligned KV reads. Qwen2.5 0.5B/1.5B have `hd == hd_kv`, so this never fires on supported models |
 | H2 | Attention threadgroup smem `2*32*hd*4` may exceed the device limit for large `hd`. | High (dispatch failure) | **OPEN** — must be a runtime query, see §4 |
-| M1 | Q4_K/Q5_K/Q6_K kernels assume `K % 256 == 0` (`nbe = K/256` floor); guard only checks `% 32`. Non-aligned K (e.g. 896) → missed elements (wrong) or OOB if rows unpadded. | Medium | **OPEN** — add per-weight-type `id % 256 == 0` guard |
+| M1 | Q4_K/Q5_K/Q6_K kernels assume `K % 256 == 0` (`nbe = K/256` floor); non-aligned K (e.g. 896) → missed elements (wrong). | Medium | **GUARDED 2026-08-03** — `quant_matmul_f32_on_gpu_buf` aborts when `id % 256 != 0` for Q4_K/Q5_K/Q6_K (GEMM and scalar paths both use K/256) |
 | M2 | `kernel_get_rows_q4_0` (embed) computes `(token_id*nb+b)*Q4B` with no `token_id < vocab` check. Sampler guarantees valid ids (low risk), but no defense. | Medium | **OPEN** — host-side token_id range check → CPU fallback |
 | L1 | Matmul kernels compute `ax` pointers past the buffer for OOB rows; reads guarded by `if (r0+N < p[0])` — pointer arithmetic only, no fault. | Low | Accept |
 | L2 | `store_kv` has no in-kernel position bound; host `kv_ensure_layer` keeps positions < capacity. | Low | Accept |

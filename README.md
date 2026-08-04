@@ -41,8 +41,9 @@ matching llama.cpp's Metal backend.
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
-¹ Metal standalone `quant_matmul_f32` only handles Q4_0; Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0
-require the `layer_gpu` full-layer offload path.  
+¹ Metal prefill uses a simdgroup GEMM for every quant type (nt≥16); the scalar
+f32 multi kernels handle decode (nt==1) and small prefills. Q4_0/Q4_1/Q4_K/
+Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 all run through `layer_gpu` (full-layer offload).
 ² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
 
 **GPU grouping restriction** (CUDA and Metal): within one transformer layer,
@@ -151,8 +152,13 @@ cargo run --release -- list
 |---------|----------|-------|---------|--------|
 | CPU (AVX2) | i7-1260P | Qwen2-0.5B | ~27 tok/s | ~21 tok/s |
 | CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~226 tok/s | ~207 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~361 tok/s | ~290 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~650–1000 tok/s | ~230 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~966 tok/s | ~300 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~442 tok/s | — |
+
+Prefill uses simdgroup GEMMs for every quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
+Q4_K/Q5_K/Q6_K); decode uses fused QKV/FFN matmuls + a KV-parallel split
+attention. See `METAL_OPTIMIZATIONS.md`.
 
 GPU decode optimizations: CUDA Graph capture/replay (single `cudaGraphLaunch`
 per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
