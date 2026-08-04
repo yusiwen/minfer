@@ -610,6 +610,18 @@ context) / 3.2× (long context).
 | **P3** | ~~Reduce per-dispatch encode cost + parallel command buffers~~ (A1 dead-end 2026-08-03) | — | — | ~~A1 (parallel command buffers)~~ **tested and REVERTED 2026-08-03**: encode is ~1 ms/step (not the ~24µs/kernel claim), so 4 parallel command buffers only added GPU launch overhead. A2 (packed `set_bytes`) shipped. The GPU-side fusions that replaced it are SHIPPED: fused QKV + FFN gate/up matmuls (P0.5, ~5% decode) and KV-parallel split attention (P0.75, ~32% decode, incl. the f16 partial variant) |
 | ~~P4~~ | ~~Matmul + bias fusion~~ | — | — | Dead-end 2026-08-03: Qwen models have no attention biases, and dispatch-count reductions don't move decode (see P5) |
 | ~~P5~~ | ~~Residual add + RMSNorm fusion~~ | — | — | **Dead-end 2026-08-03**: `residual_rms_norm` was implemented, verified correct, and REVERTED — no measured gain (1.79 vs 1.74 s). Dispatch-count reductions don't move decode |
-| P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads |
-| P7 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) |
+| P6 | Element‑wise float4 vectorisation | 1‑2% | Small | `add_f32`, `mul_f32`, `silu_f32` still use scalar loads — planned 2026-08-03 (see Follow-up Work) |
+| P7 | RoPE parallelisation | ~1% | Small | Currently 1 thread per (token, head) — planned 2026-08-03 (see Follow-up Work) |
 | ~~P8~~ | ~~RoPE + store_kv fusion~~ | — | — | Dead-end 2026-08-03: same dispatch-reduction class as store_kv_both (reverted, no gain) |
+
+## Follow-up Work (2026-08-03)
+
+Current state: decode 0.87 s / 200 tokens (~230 t/s, Q4_0), prefill uses simdgroup
+GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
+
+| Priority | Item | Type | Notes |
+|---|---|---|---|
+| 1 | **Qwen2.5-7B Q4_K_M verification** | verification | Validate all shipped optimizations (split attention, KV geometric growth, per-quant GEMMs, f16 split) at scale + long context. Download via `minfer download` (~4 GB); not currently cached |
+| 2 | **Decode micro-opt: P6 + P7** | perf | P6 element-wise float4 (`add_f32`/`mul_f32`/`silu_f32` scalar loads), P7 RoPE parallelisation — ~2-3 % decode total, low risk, small effort |
+| 3 | **Q4_K AVX2 CPU dot-product fix** | correctness (x86) | 5 failing `test_q4k_dot_*` bin tests (diff 39-167) — the AVX2 Q4_K dequant/dot is wrong; dormant on ARM (scalar path used), affects x86-64 CPU users. Cannot reproduce/verify on ARM — needs static analysis vs the `kernel.rs`/`avx2.rs` scalar reference, then cross-check the portable path |
+| 4 | **Q4_1 GEMM** | completeness | Drop-in (the Q4_0 GEMM + `dequant_q4_1_16`); Qwen models don't use Q4_1, but community GGUF files may |
