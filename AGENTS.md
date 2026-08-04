@@ -259,6 +259,15 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > passed (nkv up to 4097), all models correct, short 200-token decode
 > 1.06 → **0.88 s**, long-context (KV≈2510) decode ~8 ms/token.
 
+> **Decode micro-opt P6/P7** (2026-08-03, ~10%): the element-wise kernels
+> (`add_f32`/`mul_f32`/`silu_f32`/`swiglu_f32`/`add_bias_f32`) were vectorized to
+> process 4 elements/thread (float4) with a scalar tail, and `kernel_rope_f32`
+> parallelized to one thread per (dim, head, token) — the Q rope was previously
+> 14 threads doing 32 dims serially (recomputes pow/cos/sin per dim but the
+> parallelism hides transcendental latency). 200-token decode ~0.88 → **~0.80 s**
+> at a clean GPU state (measurements are bimodal: fast ~0.80 s vs throttled
+> ~1.15 s — GPU-state artifact, not code). All models + isolation 6 passed.
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per
