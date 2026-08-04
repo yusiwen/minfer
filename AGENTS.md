@@ -414,6 +414,15 @@ float2x4), `simdgroup_half8x8` inputs → `simdgroup_float8x8` accumulators.
 - **Isolation test**: `tests/gemm_isolation.rs` (macOS-only, needs GPU) checks
   determinism + correctness vs a scalar CPU reference at nt = 12/30/32/33.
 
+### Q4_K AVX2 dot product broken (x86 only — dormant on ARM)
+`avx2.rs`'s Q4_K dot has a bug: `cargo test --bin minfer` shows 5 failing
+`test_q4k_dot_*` tests (diff 39–167 vs the reference). ARM has no AVX2, so the
+CPU Q4_K path uses the scalar fallback and "works" (the shipped models are
+verified on this M4 Pro); **x86-64 CPU users would get wrong Q4_K results**.
+Cannot reproduce/verify on ARM — fix needs static analysis of the AVX2 Q4_K
+dequant/dot vs the `kernel.rs` scalar reference, then cross-check the portable
+path. Tracked in METAL_OPTIMIZATIONS.md "Follow-up Work" (#3).
+
 ## Core Conventions
 
 1. **Activations quantized to Q8_0 on-the-fly** — all CPU matmuls use `Q8_0` quantized activations. Q5_0 weights use `dot_q5_0_q8_0()`; Q4_K uses `dot_q4_k_q8_0()`. The **Metal backend reads f32 activations directly for all weight types** (Q4_0 included since P1), matching llama.cpp's Metal backend.
