@@ -150,6 +150,15 @@ fn qkv_row_concat_layout() {
     assert!(maxdiff < 1e-6, "row-major QKV concat mismatch vs separate matmuls: {maxdiff}");
 }
 
+/// CPU dequant for Q4_1: d(2) + m(2) + qs(u8,16), unsigned + m.
+fn dq_q4_1(blk: &[u8], k: usize) -> f32 {
+    let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+    let m = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+    let b = blk[4 + k % 16];
+    let q = if k < 16 { (b & 0x0F) as i32 } else { ((b >> 4) & 0x0F) as i32 };
+    d * (q as f32) + m
+}
+
 /// CPU dequant for Q8_0: d(half) + qs(int8[32]).
 fn dq_q8_0(blk: &[u8], k: usize) -> f32 {
     let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
@@ -267,8 +276,9 @@ fn non_q4_0_gemm_isolation() {
     let acts: Vec<f32> = (0..nt * 1024).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
 
     // (kernel name, block bytes, block elems, dequant fn)
-    let quants: [(&str, usize, usize, fn(&[u8], usize) -> f32); 7] = [
+    let quants: [(&str, usize, usize, fn(&[u8], usize) -> f32); 8] = [
         ("kernel_q4_0_mm_f32", 18, 32, dq),
+        ("kernel_q4_1_mm_f32", 20, 32, dq_q4_1),
         ("kernel_q8_0_mm_f32", 34, 32, dq_q8_0),
         ("kernel_q5_0_mm_f32", 22, 32, dq_q5_0),
         ("kernel_q5_1_mm_f32", 24, 32, dq_q5_1),
@@ -284,7 +294,7 @@ fn non_q4_0_gemm_isolation() {
         for (i, chunk) in weights.chunks_mut(bbytes).enumerate() {
             let d = 0.05 + (i % 7) as f32 * 0.01;
             chunk[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
-            if kname == "kernel_q5_1_mm_f32" {
+            if kname == "kernel_q5_1_mm_f32" || kname == "kernel_q4_1_mm_f32" {
                 chunk[2..4].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
             }
             // Per-quant fill: header fields get valid small values, payload gets PRNG.
@@ -306,6 +316,7 @@ fn non_q4_0_gemm_isolation() {
                 "kernel_q5_1_mm_f32" => (16, 8usize),
                 "kernel_q5_0_mm_f32" => (16, 6usize),
                 "kernel_q4_0_mm_f32" => (16, 2usize),
+                "kernel_q4_1_mm_f32" => (16, 4usize),
                 _ => (32, 2usize),
             };
             let mut seed = i as u64 * 131 + 7;

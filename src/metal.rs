@@ -101,6 +101,7 @@ struct MpsStateInner {
     pl_q4_0_mm_f32: metal::ComputePipelineState,
     pl_q4_1_f32: metal::ComputePipelineState,
     pl_q4_1_f32_multi: metal::ComputePipelineState,
+    pl_q4_1_mm_f32: metal::ComputePipelineState,
     pl_q8_0_f32: metal::ComputePipelineState,
     pl_q8_0_f32_multi: metal::ComputePipelineState,
     pl_q8_0_mm_f32: metal::ComputePipelineState,
@@ -337,16 +338,20 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_1 => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, x, out, od, id, nt);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                }
             }
             TensorType::Q5_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
@@ -790,6 +795,7 @@ impl MpsState {
             let pl_q4_0_f32_multi = get_pl("kernel_q4_0_f32_matmul_multi")?;
             let pl_q4_0_mm_f32 = get_pl("kernel_q4_0_mm_f32")?;
             let pl_q4_1_f32 = get_pl("kernel_q4_1_f32_matmul")?;
+            let pl_q4_1_mm_f32 = get_pl("kernel_q4_1_mm_f32")?;
             let pl_q4_1_f32_multi = get_pl("kernel_q4_1_f32_matmul_multi")?;
             let pl_q8_0_f32 = get_pl("kernel_q8_0_f32_matmul")?;
             let pl_q8_0_mm_f32 = get_pl("kernel_q8_0_mm_f32")?;
@@ -840,6 +846,7 @@ impl MpsState {
                 pl_q4_0_mm_f32,
                 pl_q4_1_f32,
                 pl_q4_1_f32_multi,
+                pl_q4_1_mm_f32,
                 pl_q8_0_f32,
                 pl_q8_0_mm_f32,
                 pl_q8_0_f32_multi,
