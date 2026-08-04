@@ -1206,6 +1206,15 @@ impl MpsState {
     /// GPU embedding lookup: dequantize embedding rows and write to buf_hidden.
     /// Returns false if the embedding weight is not on GPU or not Q4_0.
     pub fn embed_tokens_gpu(&self, embd_weight: &Tensor, token_ids: &[u32], nt: usize, ne: usize) -> bool {
+        // GPU safety (M2): kernel_get_rows_q4_0 indexes rows by token_id with no
+        // in-kernel bound. A token_id >= vocab would read out of bounds — check
+        // host-side and error-exit (the tokenizer normally guarantees valid ids).
+        let vocab = embd_weight.shape[1] as usize;
+        if let Some(&bad) = token_ids.iter().find(|&&id| id as usize >= vocab) {
+            gpu_abort(&format!(
+                "embedding token id {bad} >= vocab {vocab} (kernel_get_rows_q4_0 would read out of bounds)"
+            ));
+        }
         if embd_weight.ttype != TensorType::Q4_0 {
             return false;
         }
