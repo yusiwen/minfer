@@ -179,29 +179,78 @@ fn dq_q5_1(blk: &[u8], k: usize) -> f32 {
 }
 
 /// CPU dequant for Q6_K super-block (d at offset 208): ql(128) + qh(64) + sc(16),
-/// element value = d * sc[e/16] * (q - 32).
+/// element value = d * sc[e/16] * (q - 32). q indexing matches avx2.rs dequant.
 fn dq_q6_k(blk: &[u8], e: usize) -> f32 {
     let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[208], blk[209]])));
     let sc = blk[192 + e / 16] as i8 as f32;
-    // element e within the 256-super-block, interleaved ql/qh layout
-    let g = e / 128;         // 0 or 1 (two 128-element halves)
-    let l = e % 128;
-    let g_sub = l / 64;      // 0 or 1
-    let l_sub = l % 64;      // 0..63
-    let ql_off = g * 64 + g_sub * 32 + (l_sub % 32);
-    let qh_off = g * 32 + (l_sub % 32);
-    let qh_b = blk[128 + qh_off] as i32;
-    let (q, bit_shift) = match (g_sub, l_sub / 32) {
-        (0, 0) => ((blk[ql_off] & 0x0F) as i32, 0),
-        (0, 1) => (((blk[ql_off] >> 4) & 0x0F) as i32, 4),
-        (1, 0) => ((blk[ql_off] & 0x0F) as i32, 2),
-        _ => (((blk[ql_off] >> 4) & 0x0F) as i32, 6),
+    let half = e / 128;   // 0 or 1 (two 128-element halves)
+    let o = e % 128;
+    let ql_idx = half * 64 + if o < 64 { o } else { o - 64 };
+    let ql_b = blk[ql_idx] as i32;
+    let qh_b = blk[128 + half * 32 + (o % 32)] as i32;
+    let (q, shift) = match o {
+        0..32 => (ql_b & 0x0F, 0),
+        32..64 => (ql_b & 0x0F, 2),
+        64..96 => ((ql_b >> 4) & 0x0F, 4),
+        _ => ((ql_b >> 4) & 0x0F, 6),
     };
-    let q_val = q | (((qh_b >> bit_shift) & 3) << 4);
+    let q_val = q | (((qh_b >> shift) & 3) << 4);
     d * sc * ((q_val - 32) as f32)
 }
 
-/// Isolation test for the non-Q4_0 simdgroup GEMMs (Q8_0/Q5_0/Q5_1/Q6_K):
+/// get_scale_min_k4_just2 (llama port): scale/min pair from the 12-byte scales array.
+fn scale_min_k4_just2(j: usize, k: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j + 0 + k] & 63, q[j + 4 + k] & 63)
+    } else {
+        ((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2), (q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))
+    }
+}
+
+/// CPU dequant for Q4_K (d+dmin+scales(12)+qs(128)=144B): element e = dl*(qs nibble)-ml.
+fn dq_q4_k(blk: &[u8], e: usize) -> f32 {
+    let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+    let dmin = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+    let scales = &blk[4..16];
+    let qs = &blk[16..144];
+    let il = e / 16;
+    let i = e % 16;
+    let is = (il / 4) * 2;
+    let q_off = (il / 4) * 32 + 16 * (il & 1);
+    let il2 = il & 3;
+    let (s, m) = scale_min_k4_just2(is, il2 / 2, scales);
+    let dsc = if il2 < 2 { d } else { d / 16.0 };
+    let dl = dsc * s as f32;
+    let ml = dmin * m as f32;
+    let mask = if il2 < 2 { 0x0F } else { 0xF0 };
+    dl * ((qs[q_off + i] & mask) as f32) - ml
+}
+
+/// CPU dequant for Q5_K (d+dmin+scales(12)+qh(32)+qs(128)=176B): + qh high bit.
+fn dq_q5_k(blk: &[u8], e: usize) -> f32 {
+    let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+    let dmin = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+    let scales = &blk[4..16];
+    let qh = &blk[16..48];
+    let qs = &blk[48..176];
+    let il = e / 16;
+    let i = e % 16;
+    let is = (il / 4) * 2;
+    let q_off = (il / 4) * 32 + 16 * (il & 1);
+    let qh_off = 16 * (il & 1);
+    let ul = 1u8 << (il / 2);
+    let il2 = il & 3;
+    let (s, m) = scale_min_k4_just2(is, il2 / 2, scales);
+    let dsc = if il2 < 2 { d } else { d / 16.0 };
+    let dl = dsc * s as f32;
+    let ml = dmin * m as f32;
+    let mask = if il2 < 2 { 0x0F } else { 0xF0 };
+    let qh_val = if il2 < 2 { 16.0 } else { 256.0 };
+    let hi = if qh[qh_off + i] & ul != 0 { qh_val } else { 0.0 };
+    dl * ((qs[q_off + i] & mask) as f32 + hi) - ml
+}
+
+/// Isolation test for the non-Q4_0 simdgroup GEMMs (Q8_0/Q5_0/Q5_1/Q6_K/Q4_K/Q5_K):
 /// deterministic + correct vs a scalar CPU reference at prefill dims (nt>=16).
 #[test]
 fn non_q4_0_gemm_isolation() {
@@ -218,11 +267,13 @@ fn non_q4_0_gemm_isolation() {
     let acts: Vec<f32> = (0..nt * 1024).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
 
     // (kernel name, block bytes, block elems, dequant fn)
-    let quants: [(&str, usize, usize, fn(&[u8], usize) -> f32); 5] = [
+    let quants: [(&str, usize, usize, fn(&[u8], usize) -> f32); 7] = [
         ("kernel_q4_0_mm_f32", 18, 32, dq),
         ("kernel_q8_0_mm_f32", 34, 32, dq_q8_0),
         ("kernel_q5_0_mm_f32", 22, 32, dq_q5_0),
         ("kernel_q5_1_mm_f32", 24, 32, dq_q5_1),
+        ("kernel_q4_k_mm_f32", 144, 256, dq_q4_k),
+        ("kernel_q5_k_mm_f32", 176, 256, dq_q5_k),
         ("kernel_q6_k_mm_f32", 210, 256, dq_q6_k),
     ];
 
@@ -236,9 +287,22 @@ fn non_q4_0_gemm_isolation() {
             if kname == "kernel_q5_1_mm_f32" {
                 chunk[2..4].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
             }
-            // fill only the quantized payload (never the d / m / qh header bytes)
+            // Per-quant fill: header fields get valid small values, payload gets PRNG.
+            match kname {
+                "kernel_q4_k_mm_f32" | "kernel_q5_k_mm_f32" => {
+                    chunk[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes()); // dmin
+                    for b in 4..16 { chunk[b] = 0x11; }  // scales[12]: scale=1, min=1 (6-bit)
+                }
+                "kernel_q6_k_mm_f32" => {
+                    for b in 192..208 { chunk[b] = 0x11; } // int8 scales
+                    chunk[208..210].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes()); // d at END
+                }
+                _ => {}
+            }
             let (nq, qoff) = match kname {
-                "kernel_q6_k_mm_f32" => (bbytes - 2, 0usize),
+                "kernel_q4_k_mm_f32" => (128, 16usize),   // qs only
+                "kernel_q5_k_mm_f32" => (160, 16usize),   // qh(32) + qs(128)
+                "kernel_q6_k_mm_f32" => (192, 0usize),    // ql(128) + qh(64)
                 "kernel_q5_1_mm_f32" => (16, 8usize),
                 "kernel_q5_0_mm_f32" => (16, 6usize),
                 "kernel_q4_0_mm_f32" => (16, 2usize),

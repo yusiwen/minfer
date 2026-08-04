@@ -105,6 +105,7 @@ struct MpsStateInner {
     pl_q8_0_mm_f32: metal::ComputePipelineState,
     pl_q4_k_f32: metal::ComputePipelineState,
     pl_q4_k_f32_multi: metal::ComputePipelineState,
+    pl_q4_k_mm_f32: metal::ComputePipelineState,
     pl_q6_k_f32: metal::ComputePipelineState,
     pl_q6_k_f32_multi: metal::ComputePipelineState,
     pl_q6_k_mm_f32: metal::ComputePipelineState,
@@ -116,6 +117,7 @@ struct MpsStateInner {
     pl_q5_1_mm_f32: metal::ComputePipelineState,
     pl_q5_k_f32: metal::ComputePipelineState,
     pl_q5_k_f32_multi: metal::ComputePipelineState,
+    pl_q5_k_mm_f32: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
     pl_add: metal::ComputePipelineState,
@@ -304,8 +306,10 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q4_K | TensorType::Q6_K => {
                 // Q6_K has a simdgroup GEMM (super-block); Q4_K still falls back
                 // to the scalar f32 multi (no Q4_K in the shipped 0.5B K_M models).
-                if ttype == TensorType::Q6_K && nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q6_k_mm_f32, wb, x, out, od, id, nt);
+                if nt >= 16 && Self::gemm_enabled() {
+                    // both Q4_K and Q6_K have simdgroup GEMMs
+                    let pl = if ttype == TensorType::Q6_K { &self.state.pl_q6_k_mm_f32 } else { &self.state.pl_q4_k_mm_f32 };
+                    self.gemm_dispatch(pl, wb, x, out, od, id, nt);
                 } else {
                     let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
                         if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
@@ -367,16 +371,20 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_K => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
-                self.enc.set_buffer(2, Some(out), 0);
-                let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                if nt >= 16 && Self::gemm_enabled() {
+                    self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, x, out, od, id, nt);
+                } else {
+                    self.enc.set_compute_pipeline_state(
+                        if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
+                    );
+                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(2, Some(out), 0);
+                    let mm_p = [od as i32, id as i32, nt as i32];
+                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                }
             }
             TensorType::Q4_0 => {
                 // Prefill uses the simdgroup GEMM (faithful llama.cpp port, float
@@ -771,6 +779,7 @@ impl MpsState {
             let pl_q8_0_mm_f32 = get_pl("kernel_q8_0_mm_f32")?;
             let pl_q8_0_f32_multi = get_pl("kernel_q8_0_f32_matmul_multi")?;
             let pl_q4_k_f32 = get_pl("kernel_q4_k_f32_matmul")?;
+            let pl_q4_k_mm_f32 = get_pl("kernel_q4_k_mm_f32")?;
             let pl_q4_k_f32_multi = get_pl("kernel_q4_k_f32_matmul_multi")?;
             let pl_q6_k_f32 = get_pl("kernel_q6_k_f32_matmul")?;
             let pl_q6_k_mm_f32 = get_pl("kernel_q6_k_mm_f32")?;
@@ -782,6 +791,7 @@ impl MpsState {
             let pl_q5_1_mm_f32 = get_pl("kernel_q5_1_mm_f32")?;
             let pl_q5_1_f32_multi = get_pl("kernel_q5_1_f32_matmul_multi")?;
             let pl_q5_k_f32 = get_pl("kernel_q5_k_f32_matmul")?;
+            let pl_q5_k_mm_f32 = get_pl("kernel_q5_k_mm_f32")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
@@ -818,6 +828,7 @@ impl MpsState {
                 pl_q8_0_f32_multi,
                 pl_q4_k_f32,
                 pl_q4_k_f32_multi,
+                pl_q4_k_mm_f32,
                 pl_q6_k_f32,
                 pl_q6_k_f32_multi,
                 pl_q6_k_mm_f32,
@@ -829,6 +840,7 @@ impl MpsState {
                 pl_q5_1_mm_f32,
                 pl_q5_k_f32,
                 pl_q5_k_f32_multi,
+                pl_q5_k_mm_f32,
                 pl_get_rows_q4_0,
                 pl_rms_norm,
                 pl_add,

@@ -119,17 +119,20 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 
 > **P1 SHIPPED: non-Q4_0 simdgroup GEMMs** (2026-08-03): `kernel_q8_0_mm_f32`,
 > `kernel_q5_0_mm_f32`, `kernel_q5_1_mm_f32` (32-elem blocks — drop-in copies of
-> the Q4_0 GEMM with a per-quant `dequant_*_16` into the f16 sa tile), and
-> `kernel_q6_k_mm_f32` (256-elem super-block; the dequant il = (loop_k%256)/16 +
-> il0 spans the 2 il-halves per 32-elem K step). All dispatched for nt ≥ 16
-> (MINFER_GEMM=0 disables) with the 8 KB threadgroup-memory guard. Faithful
-> llama.cpp transcriptions (block layouts verified: llama block_q6_K stores d at
-> the END, matching minfer's Q6K layout). Verified: `tests/gemm_isolation.rs`
-> `non_q4_0_gemm_isolation` (deterministic + relative error <5e-3 vs CPU refs for
-> all 4 + Q4_0), end-to-end A/B byte-identical vs MINFER_GEMM=0, all models
-> correct. Q4_K_M prefill ~300 → **~650 t/s**, Q5_K_M ~330 → **~610 t/s**; decode
-> unchanged (GEMM is prefill-only). Q4_K/Q5_K still fall back to the scalar f32
-> multi (not present in the shipped 0.5B K_M models).
+> the Q4_0 GEMM with a per-quant `dequant_*_16` into the f16 sa tile), and the
+> 256-elem super-block GEMMs `kernel_q4_k_mm_f32`, `kernel_q5_k_mm_f32`,
+> `kernel_q6_k_mm_f32` (dequant il = (loop_k%256)/16 + il0 spans the 2 il-halves
+> per 32-elem K step). All dispatched for nt ≥ 16 (MINFER_GEMM=0 disables) with
+> the 8 KB threadgroup-memory guard. Faithful llama.cpp transcriptions (llama
+> block_q6_K stores d at the END; block_q5_K = qh BEFORE qs — both match
+> minfer). Verified: `tests/gemm_isolation.rs` `non_q4_0_gemm_isolation`
+> (deterministic + relative error <5e-3 vs CPU refs for all 6 + Q4_0; the Q6_K
+> CPU ref initially only passed trivially with d=0 — fixed to match avx2.rs
+> indexing), end-to-end A/B byte-identical vs MINFER_GEMM=0, all models correct.
+> Q4_K_M prefill ~300 → **~650-1000 t/s**, Q5_K_M ~330 → **~610-680 t/s**;
+> **Qwen2.5-1.5B Q4_K_M prefill 48 → 442 t/s (~9×)** (its weights are Q4_K/Q6_K,
+> so it exercises the Q4_K GEMM end-to-end). Decode unchanged (GEMM is
+> prefill-only).
 
 > **KV cache type** (2026-08-01): GPU KV cache defaults to **F32**;
 > `MINFER_CACHE_TYPE=f16` switches to an F16 cache (2 bytes/elem, llama.cpp's
