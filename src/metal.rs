@@ -509,7 +509,8 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(1, Some(y), 0);
         self.enc.set_buffer(2, Some(z), 0);
         self.set_params(3, &(n as i32));
-        self.dispatch_1d(n as u64, 256);
+        // float4 kernel: 4 elements/thread (ceil for the scalar tail)
+        self.dispatch_1d(((n as u64) + 3) / 4, 256);
     }
 
     /// Add 1-D bias to rows: y[t][i] += b[i]. `off` = element offset into `y`
@@ -522,7 +523,8 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(0, Some(y), (off * 4) as u64);
         self.enc.set_buffer(1, Some(b), 0);
         self.set_params(2, &(d as i32));
-        self.dispatch_2d(n as u64, d as u64, 1, 64);
+        // float4 kernel: 4 dims/thread
+        self.dispatch_2d(n as u64, ((d as u64) + 3) / 4, 1, 64);
     }
 
     /// Element-wise multiply: z = x * y
@@ -551,7 +553,7 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(1, Some(up), 0);
         self.enc.set_buffer(2, Some(dst), 0);
         self.set_params(3, &(n as i32));
-        self.dispatch_1d(n as u64, 256);
+        self.dispatch_1d(((n as u64) + 3) / 4, 256);
     }
 
     /// SwiGLU over a fused gate+up buffer: gate at offset 0, up at `up_off`
@@ -565,7 +567,7 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(1, Some(up), (up_off * 4) as u64);
         self.enc.set_buffer(2, Some(dst), 0);
         self.set_params(3, &(n as i32));
-        self.dispatch_1d(n as u64, 256);
+        self.dispatch_1d(((n as u64) + 3) / 4, 256);
     }
 
     /// RoPE (in-place): x layout [nt][n_head][n_dims]. `off` = element offset
@@ -585,7 +587,8 @@ impl MpsCommandBuffer<'_> {
         self.set_params(5, &(freq_scale.to_bits() as i32));
         self.enc.set_buffer(6, Some(positions), 0);
         self.set_params(7, &rope_style);
-        self.dispatch_2d(nt as u64, n_head as u64, 1, 1);
+        // P7: one thread per (dim, head, token) instead of one per (token, head)
+        self.dispatch_3d((n_dims / 2) as u64, n_head as u64, nt as u64, 1, 1, 1);
     }
 
     /// Flash Attention: one threadgroup per (token, KV_head), tiled K/V
