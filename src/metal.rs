@@ -281,6 +281,14 @@ impl MpsCommandBuffer<'_> {
         x: &metal::Buffer, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         self.trace_op("matmul");
+        // GPU safety (M1): the K-quant (super-block) kernels index weights by
+        // K/256 super-blocks (floor). A non-256-aligned id silently drops the
+        // remainder (wrong results, not a fault) — refuse rather than risk it.
+        if matches!(ttype, TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K) && id % 256 != 0 {
+            gpu_abort(&format!(
+                "matmul input dim id={id} is not 256-aligned for {ttype:?} (K-quant kernels use K/256 super-block floor)"
+            ));
+        }
         match ttype {
             TensorType::Q8_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
@@ -1326,9 +1334,19 @@ impl MpsState {
         if 32 * gqa as u32 > self.inner.max_threads_per_threadgroup {
             gpu_abort(&format!(
                 "attention threadgroup needs {} threads (32 * gqa={}), device max is {}",
-                32 * gqa,
-                32 * gqa,
+                 32 * gqa,
+                 32 * gqa,
                 self.inner.max_threads_per_threadgroup
+            ));
+        }
+        // GPU safety (H1): the attention kernel strides the KV cache with
+        // nk*hd, so it requires the KV head dim to equal the query head dim
+        // (nkt == nk*hd). Models with a separate KV head dim would silently
+        // read misaligned KV rows — refuse rather than risk wrong results.
+        if nkt != nk * hd {
+            gpu_abort(&format!(
+                "attention KV head dim nkt={nkt} != nk*hd={} (kernel_gqa_attn strides KV by nk*hd; separate-KV-head models unsupported)",
+                nk * hd
             ));
         }
 
