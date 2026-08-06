@@ -76,11 +76,27 @@ fn resolve_cached_name(name: &str, cache_dir: &Path) -> Result<PathBuf, String> 
             "Model '{}' not found. Use `minfer list` to see cached models, or pass a path, hf:<repo>[:file], or ollama:<model>[:tag].",
             name
         )),
-        _ => Err(format!(
-            "Ambiguous model name '{}':\n  {}",
-            name,
-            candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
-        )),
+        _ => {
+            // If every candidate is a part of ONE split model, resolve to part 0
+            // (its split.count drives the loader, which finds the rest).
+            let prefixes: std::collections::HashSet<String> = candidates.iter()
+                .filter_map(|p| crate::gguf::split_file_info(&p.file_name().unwrap_or_default().to_string_lossy()))
+                .map(|(p, _, _)| p)
+                .collect();
+            if prefixes.len() == 1 {
+                if let Some(p0) = candidates.iter().find(|p| {
+                    crate::gguf::split_file_info(&p.file_name().unwrap_or_default().to_string_lossy())
+                        .map_or(false, |(_, idx, _)| idx == 0)
+                }) {
+                    return Ok(p0.clone());
+                }
+            }
+            Err(format!(
+                "Ambiguous model name '{}':\n  {}",
+                name,
+                candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
+            ))
+        }
     }
 }
 
@@ -197,7 +213,13 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
 
     for name in &parts {
         let file_path = hf_dir.join(name);
-        if file_path.exists() {
+        let size = gguf_files.iter().find(|s| &s.rfilename == name).and_then(|s| s.size);
+        // Skip only when the file exists AND (if we know the size) matches it —
+        // a partial/interrupted download must be resumed, not skipped.
+        let complete = file_path.exists() && size.map_or(false, |s| {
+            file_path.metadata().map(|m| m.len() == s).unwrap_or(false)
+        });
+        if complete {
             eprintln!("Already cached: {}", file_path.display());
             continue;
         }
@@ -205,7 +227,6 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
             "https://huggingface.co/{}/resolve/main/{}",
             repo, name
         );
-        let size = gguf_files.iter().find(|s| &s.rfilename == name).and_then(|s| s.size);
         http_download(&download_url, &file_path, size)?;
     }
 

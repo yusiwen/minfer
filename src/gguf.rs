@@ -1635,6 +1635,11 @@ impl GgufContext {
             GgufType::Uint32 => Some(kv.get_val_u32(0) as i64),
             GgufType::Int32 => Some(kv.get_val_i32(0) as i64),
             GgufType::Uint64 => Some(kv.get_val_u64(0) as i64),
+            GgufType::Uint16 => Some(kv.get_val_u16(0) as i64),
+            GgufType::Int16 => Some(kv.get_val_i16(0) as i64),
+            GgufType::Uint8 => Some(kv.get_val_u8(0) as i64),
+            GgufType::Int8 => Some(kv.get_val_i8(0) as i64),
+            GgufType::Bool => Some(if kv.get_val_bool(0) { 1 } else { 0 }),
             _ => None,
         }
     }
