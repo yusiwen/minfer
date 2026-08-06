@@ -58,9 +58,25 @@ MINFER_DISABLE_MPS=1 target/release/minfer <model> "hello"
 # Info (list tensor names/types/shapes)
 ./target/release/minfer info <model>
 
-# Auto-download
-./target/release/minfer download hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_0.gguf
+# Auto-download (single file or multi-part split; split fetches ALL parts)
+./target/release/minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF q4_0.gguf
+./target/release/minfer download hf Qwen/Qwen2.5-7B-Instruct-GGUF q4_k_m   # → both -00001/-00002-of-00002 parts
+./target/release/minfer download ollama qwen2.5:0.5b
 ```
+
+> **Multi-part (split) GGUF support** (2026-08-03, aligned with llama.cpp): a
+> split model is `name-0000X-of-0000Y.gguf` (Y parts). Part 0 holds the model
+> metadata (architecture/hparams) + its own tensors; each part is a standalone
+> GGUF that lists the tensors it holds (offsets relative to its own data
+> section). `GgufContext`-level `GgufModel`/`load_gguf_model` (gguf.rs) parse
+> every part and validate `split.no == 0` (must load the first split); the qwen2
+> loader builds a **merged tensor index** across parts and reads each tensor from
+> its own part's data. The model entry is part 0 (`minfer
+> qwen2.5-7b-instruct-q4_k_m 'hi'` — cached-name resolution dedupes split parts
+> to part 0). `get_i64` handles Uint16/Int16/Uint8/Int8/Bool (llama's
+> `split.count`/`split.no` are Uint16). Download resume is size-checked (a
+> partial part is resumed via curl `-C -`, never skipped). Verified: 7B Q4_K_M
+> loads as 2 parts (4466 MB) with correct GPU output.
 
 ## Debug Dump Files (`MINFER_DUMP_DIR`)
 
