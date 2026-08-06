@@ -41,12 +41,18 @@ pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty
 }
 
 /// Top-K filtering: keep only top K logits, set the rest to -INFINITY.
+///
+/// O(n) threshold extraction via `select_nth_unstable_by` instead of a
+/// full-vocab sort — llama.cpp uses an equivalent partial selection
+/// (`std::partial_sort`) here. The selection runs on a copy because the
+/// in-place variant reorders the array, which would corrupt the
+/// index→token mapping; the original `logits` is only masked, never moved.
 pub fn apply_top_k(logits: &mut [f32], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
     }
     let mut sorted = logits.to_vec();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Less));
+    sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
     let threshold = sorted[k - 1];
     for v in logits.iter_mut() {
         if *v < threshold {
@@ -59,12 +65,66 @@ pub fn apply_top_k(logits: &mut [f32], k: usize) {
 /// softmax probability >= p. Sets excluded tokens' raw logits to -INFINITY
 /// (does NOT overwrite logits with probabilities, so the final temperature
 /// softmax stays correct).
+///
+/// Only the finite survivors of a prior top_k pass matter (≤ k entries); masked
+/// logits contribute exp(-INF - max) = 0 to the softmax, so working on the
+/// survivors alone is bit-identical to the full-array computation. Falls back
+/// to the full-array path when too many candidates survive (i.e. top_k
+/// disabled) so this never degenerates into a full-vocab sort.
 pub fn apply_top_p(logits: &mut [f32], p: f32) {
     if p <= 0.0 || p >= 1.0 {
         return;
     }
+    let survivors: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v > f32::NEG_INFINITY)
+        .map(|(i, &v)| (i, v))
+        .collect();
+    if survivors.is_empty() {
+        return;
+    }
+    if survivors.len() > 1024 {
+        apply_top_p_full(logits, p);
+        return;
+    }
+
+    // Softmax over the survivors (identical to the old full-array softmax since
+    // the masked entries contribute exp(-INF)=0 and 0.0 doesn't change the f64
+    // running sum).
+    let max_val = survivors.iter().fold(f32::NEG_INFINITY, |a, &(_, v)| a.max(v));
+    let sum: f64 = survivors
+        .iter()
+        .map(|&(_, v)| ((v - max_val) as f64).exp())
+        .sum();
+    let mut cand: Vec<(usize, f32)> = survivors
+        .iter()
+        .map(|&(i, v)| (i, (v - max_val).exp() / sum as f32))
+        .collect();
+
+    // Stable descending sort by probability (ties keep index order, matching
+    // the full-array sort the survivor set was derived from).
+    cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut cumulative = 0.0f32;
+    let mut keep = cand.len();
+    for (i, &(_, prob)) in cand.iter().enumerate() {
+        cumulative += prob;
+        if cumulative > p {
+            keep = i + 1;
+            break;
+        }
+    }
+    for &(idx, _) in &cand[keep..] {
+        logits[idx] = f32::NEG_INFINITY;
+    }
+}
+
+/// Full-array top-p fallback (only when top_k is disabled and > 1024
+/// candidates survive). Retains the original softmax-over-everything +
+/// full sort behavior for that rare path.
+fn apply_top_p_full(logits: &mut [f32], p: f32) {
     let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    // Softmax into a temp array (logits stay raw).
     let sum: f64 = logits.iter().map(|&v| ((v - max_val) as f64).exp()).sum();
     let mut indexed: Vec<(usize, f32)> = logits
         .iter()
@@ -96,11 +156,18 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
         *v *= inv_temp;
     }
 
-    // Softmax
+    // Softmax. Masked (-INF) logits map to exp(-INF)=0 and contribute nothing
+    // to the running max or sum; skipping the exp() call for them avoids
+    // ~n_vocab transcendental evaluations per token while staying bit-identical
+    // (exp(-INF) == +0.0 exactly).
     let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let mut sum = 0.0f64;
     for v in logits.iter_mut() {
-        *v = (*v - max_val).exp();
+        if *v > f32::NEG_INFINITY {
+            *v = (*v - max_val).exp();
+        } else {
+            *v = 0.0;
+        }
         sum += *v as f64;
     }
     let inv_sum = (1.0 / sum) as f32;
@@ -108,10 +175,14 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
         *v *= inv_sum;
     }
 
-    // Sample from the distribution
+    // Sample from the distribution (skipping zero-probability tokens — after
+    // top_k/top_p only ≤k entries are finite, so this scan is near-empty).
     let r: f32 = rng.gen();
     let mut cumulative = 0.0f32;
     for (i, &v) in logits.iter().enumerate() {
+        if v <= 0.0 {
+            continue;
+        }
         cumulative += v;
         if r <= cumulative {
             return SampledToken { token_id: i as u32, logit: v };

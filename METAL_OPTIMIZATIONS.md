@@ -370,6 +370,102 @@ encoding), not the dispatch count itself — see Decode Gap §0a.
 ~340 t/s blended because the fast prefill dominates the denominator; long
 generations converge to the pure decode rate (~86 t/s at ~400 KV).
 
+## Decode bottleneck is the CPU sampler, not the GPU (2026-08-06)
+
+A side-by-side benchmark of the **same** Qwen2.5-0.5B-Instruct Q4_K_M GGUF
+(`"Tell me about Transformer architecture."`, chat template → 35 prompt tokens)
+on the M4 Pro showed the reported decode gap vs llama.cpp is mostly **CPU-side
+sampling**, not GPU:
+
+| Source | Config | Generated | Total time | Pure decode |
+|---|---|---|---|---|
+| llama.cpp (`Generation:`) | default sampling | ~330 (EOS) | — | **247.2 tok/s** |
+| minfer | default sampling (top_k=40/top_p=0.95/temp=0.8) | 512 | 6.64-7.31 s | ~77-93 tok/s |
+| minfer | `--greedy` (temp=0, GPU only) | 512 | 3.02 s | **~172 tok/s** |
+
+minfer's blended rate `(prompt+gen)/total` under-reports, but isolating the GPU
+decode with `--greedy` (same 512 tokens) shows the GPU is only **~5.0-5.8
+ms/token** (~180-208 tok/s) — the default sampler adds **~7.6 ms/token** on top.
+
+### Per-token breakdown (identical `-n 128`, avg KV≈100)
+
+| Sampler config | ms/token | delta vs greedy |
+|---|---|---|
+| greedy (temp=0) | 5.1 | — |
+| + temperature (no top_k/top_p) | 5.9 | +0.8 |
+| + top_k=40 | 12.6 | **+6.7** |
+| + top_p=0.95 | 14.8 | **+2.2** |
+
+The greedy-vs-sampled gap is reproducible across repeated runs (greedy
+1.33-2.40 s vs sampled 6.79-7.31 s for 512 tokens) — **not** a GPU-state
+artifact (unlike the earlier bimodal 0.80/1.15 s decode variance).
+
+### Root cause
+
+`sampler.rs` runs a full-vocab O(n·log n) sort **per token** on the critical
+path. The decode loop is strictly serial (sample → print → forward), so the CPU
+sampling time does not overlap with the GPU forward:
+
+- `apply_top_k` (`sampler.rs:45-57`): `logits.to_vec()` (607 KB copy) +
+  `sort_by` over **all 151,936** logits every token.
+- `apply_top_p` (`sampler.rs:63-87`): full softmax + sort of **151,936**
+  `(usize, f32)` tuples (2.4 MB allocation per token) even though top_k already
+  reduced the candidates to ≤40.
+
+llama.cpp's sampler is a **candidate-list chain** (verified in llama.cpp
+`src/llama-sampler.cpp` @ 88b47a755): `top_k` (`llama_sampler_top_k_impl`,
+:321) does a `std::partial_sort` — **O(n·log k), NOT a full sort** — then
+shrinks the candidate array to k (`cur_p->size = k`), and every later sampler
+(`top_p` :1355, temperature, dist) operates on the ≤k survivors. Its only
+full-vocab work per token is a sequential fill of the candidate array from the
+logits plus that one partial sort, ~0.5-1 ms. (Note: llama-cli runs this CPU
+chain via `common_sampler_sample`; the newer GPU backend samplers
+`llama_set_sampler`/`backend_apply` in this version are used by llama-server /
+speculative, not llama-cli.) This is why llama.cpp sustains 247 tok/s with
+default sampling while minfer's GPU-only rate is already close (~200 tok/s
+greedy).
+
+### Implications
+
+1. The 3.3× "decode gap" users see with default settings is mostly sampler CPU
+   time, NOT GPU. With `--greedy`, minfer reaches ~180-208 tok/s vs llama's
+   ~247 — a genuine GPU gap of ~1.2-1.4× (dispatch count + f32 activations,
+   tracked separately in this document).
+2. GPU decode is **flat at ~5-6 ms/token up to KV≈550** (greedy -n 64/128/256/512:
+   5.2/5.1/6.0/5.8 ms/token) — the split attention hides KV growth at these
+   lengths, confirming the earlier attention work paid off.
+
+### Fix — SHIPPED 2026-08-06 (`sampler.rs`)
+
+- `apply_top_k`: full-vocab `sort_by` (O(n·log n)) + 607 KB copy replaced with
+  `select_nth_unstable_by` on a copy to extract the k-th largest threshold in
+  O(n), then a value mask pass. (Runs on a copy because the in-place variant
+  reorders the array, which would corrupt the index→token mapping; the original
+  `logits` is only masked, never moved.)
+- `apply_top_p`: collects the finite top_k survivors (≤40) and does softmax +
+  stable descending sort on just those (O(k·log k)); falls back to the old
+  full-array path only when > 1024 candidates survive (top_k disabled).
+- `sample_temperature`: skips the exp() call for masked (-INF) logits (still
+  yields exp(-INF)=0 exactly) and skips zero-probability tokens in the final
+  cumulative scan.
+- `main.rs`: decode loop now moves the single-token `forward()` logits Vec in
+  place instead of `logits_all[..n_vocab].to_vec()` (607 KB copy/token).
+
+**Measured** (Qwen2.5-0.5B Q4_K_M, M4 Pro, default sampling top_k=40/top_p=0.95):
+
+| Length | Before | After | |
+|---|---|---|---|
+| -n 128 (seed 42) | 1.46 s | **0.72 s** | 2.0× |
+| -n 256 | ~3.35 s | ~1.7 s | ~2.0× |
+| -n 512 | 6.64-7.31 s | **3.49-3.55 s** | ~2.0× |
+
+Per-token default-sampling decode: ~12.6-14.8 ms → **~5.5-6.5 ms** (~150-200
+tok/s), now close to the greedy GPU-only rate (~5 ms/token). The fixed-seed
+output is **byte-identical** to the old sampler (all 7 `sampler.rs` tests pass;
+the 5 failing `avx2::test_q4k_dot_*` are the unrelated pre-existing x86 bug).
+Residual sampled-vs-greedy gap (~0.5-1.5 ms/token, noisy under GPU-state
+variance) is the remaining ~0.5-1 ms CPU sampling serialized in the loop.
+
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
 minfer's Q4_0 prefill kernel (`kernel_q4_0_f32_matmul_multi`) uses a
@@ -625,3 +721,4 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 2 | ~~Decode micro-opt: P6 + P7~~ | ~~perf~~ | **SHIPPED 2026-08-03**: float4 element-wise kernels + parallel RoPE (~2-3 % decode; 200-token ~0.88 → ~0.80 s) |
 | 3 | **Q4_K AVX2 CPU dot-product fix** | correctness (x86) | 5 failing `test_q4k_dot_*` bin tests (diff 39-167) — the AVX2 Q4_K dequant/dot is wrong; dormant on ARM (scalar path used), affects x86-64 CPU users. Cannot reproduce/verify on ARM — needs static analysis vs the `kernel.rs`/`avx2.rs` scalar reference, then cross-check the portable path |
 | ~~4~~ | ~~Q4_1 GEMM~~ | ~~completeness~~ | **SHIPPED 2026-08-03**: `kernel_q4_1_mm_f32` (20 B/32-elem, `dequant_q4_1_16` d*q+m) — every quant type now has a simdgroup GEMM; verified in `non_q4_0_gemm_isolation` (8 GEMMs) |
+| 5 | ~~**CPU sampler: top_k/top_p full-vocab sort**~~ | ~~perf (CPU)~~ | **SHIPPED 2026-08-06**: default sampling was 2.5x slower than `--greedy` (+7.6 ms/token; GPU decode is only ~5 ms/token — the llama.cpp 247 vs minfer 80 tok/s gap was mostly sampler CPU time, see "Decode bottleneck is the CPU sampler, not the GPU" 2026-08-06). Fix: top_k → `select_nth_unstable_by` (O(n)); top_p → softmax+sort only the ≤k survivors; temp → skip masked logits; main.rs drops the 607 KB logits copy. Byte-identical fixed-seed output; default decode ~12.6-14.8 → ~5.5-6.5 ms/token (~2×, 512 tokens 6.9 → 3.5 s) |

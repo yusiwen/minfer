@@ -346,8 +346,9 @@ fn main() {
         print!("{}", tokenizer.decode(&[sampled.token_id]));
         std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
 
-        let logits_all = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache);
-        logits = logits_all[..n_vocab].to_vec();
+        // forward() returns nt*nv logits; for single-token decode that's exactly
+        // n_vocab, so move the Vec in place instead of copying 607 KB/token.
+        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache);
         current_pos += 1;
     }
 
