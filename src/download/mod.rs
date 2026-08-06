@@ -140,45 +140,76 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let target = if let Some(f) = &file {
-        let found = gguf_files.iter().find(|s| s.rfilename == *f);
-        match found {
-            Some(s) => s,
-            None => {
+    // Select the target model group (all parts of a split, or a single file).
+    // Returns the list of part files to download + the path to return (part 0).
+    let select = |requested: Option<&str>| -> Result<Vec<String>, String> {
+        if let Some(f) = requested {
+            let exact = gguf_files.iter().find(|s| s.rfilename == *f);
+            if let Some(s) = exact {
+                return Ok(vec![s.rfilename.clone()]);
+            }
+            // prefix match: a split like "q4_k_m" → all "-0000X-of-0000Y" parts.
+            // Accept the exact split prefix ("qwen2.5-7b-instruct-q4_k_m") or a
+            // shorter tail ("q4_k_m") for convenience.
+            let split_prefix_matches = |p: &str| -> bool { p == f || p.ends_with(&format!("-{f}")) };
+            let parts: Vec<String> = gguf_files.iter()
+                .filter(|s| crate::gguf::split_file_info(&s.rfilename)
+                    .map_or(false, |(p, _, _)| split_prefix_matches(&p)))
+                .map(|s| s.rfilename.clone())
+                .collect();
+            if parts.is_empty() {
                 let list: Vec<&str> = gguf_files.iter().map(|s| s.rfilename.as_str()).collect();
                 return Err(format!(
-                    "File '{}' not found in '{}'. Available GGUF files:\n{}",
-                    f,
-                    repo,
+                    "File '{f}' not found in '{repo}'. Available GGUF files:\n{}",
+                    list.join("\n")
+                ));
+            }
+            Ok(parts)
+        } else if gguf_files.len() == 1 {
+            Ok(vec![gguf_files[0].rfilename.clone()])
+        } else {
+            // multiple .gguf: accept if they are all parts of ONE split model
+            let prefixes: std::collections::HashSet<String> = gguf_files.iter()
+                .filter_map(|s| crate::gguf::split_file_info(&s.rfilename))
+                .map(|(p, _, _)| p)
+                .collect();
+            if prefixes.len() == 1 {
+                Ok(gguf_files.iter().map(|s| s.rfilename.clone()).collect())
+            } else {
+                let list: Vec<&str> = gguf_files.iter().map(|s| s.rfilename.as_str()).collect();
+                return Err(format!(
+                    "Multiple GGUF files found. Specify one:\n{}",
                     list.join("\n")
                 ));
             }
         }
-    } else if gguf_files.len() == 1 {
-        gguf_files[0]
-    } else {
-        let list: Vec<&str> = gguf_files.iter().map(|s| s.rfilename.as_str()).collect();
-        return Err(format!(
-            "Multiple GGUF files found. Specify one:\n{}",
-            list.join("\n")
-        ));
     };
 
-    let file_path = hf_dir.join(&target.rfilename);
-    if file_path.exists() {
-        eprintln!("Already cached: {}", file_path.display());
-        return Ok(file_path);
+    let parts = select(file.as_deref())?;
+    let return_name = {
+        // part 0 is the model entry (its split.count drives the loader)
+        let first = &parts[0];
+        match crate::gguf::split_file_info(first) {
+            Some((prefix, _, count)) => format!("{}-00001-of-{:05}.gguf", prefix, count),
+            None => first.clone(),
+        }
+    };
+
+    for name in &parts {
+        let file_path = hf_dir.join(name);
+        if file_path.exists() {
+            eprintln!("Already cached: {}", file_path.display());
+            continue;
+        }
+        let download_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            repo, name
+        );
+        let size = gguf_files.iter().find(|s| &s.rfilename == name).and_then(|s| s.size);
+        http_download(&download_url, &file_path, size)?;
     }
 
-    // Download
-    let download_url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        repo, target.rfilename
-    );
-    let file_size = target.size;
-    http_download(&download_url, &file_path, file_size)?;
-
-    Ok(file_path)
+    Ok(hf_dir.join(&return_name))
 }
 
 #[derive(serde::Deserialize)]

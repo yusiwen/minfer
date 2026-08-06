@@ -4,7 +4,7 @@
 pub mod qwen2;
 
 use crate::cache::KVCache;
-use crate::gguf::GgufContext;
+use crate::gguf::{GgufContext, GgufModel};
 use crate::vec_ops::RopeStyle;
 
 /// Architecture-agnostic model interface.
@@ -26,13 +26,15 @@ pub struct SpecialTokens {
     pub im_end: Option<u32>,
 }
 
-/// Load a model from GGUF data, dispatching on `general.architecture`.
-pub fn load_model(ctx: &GgufContext, raw: &[u8]) -> Option<Box<dyn ModelDef>> {
+/// Load a model from GGUF (single file or multi-part split), dispatching on
+/// `general.architecture` from part 0.
+pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
+    let ctx = &model.parts[0].ctx;
     let arch = ctx.get_key_val_str("general.architecture")?;
     match arch.as_str() {
         "qwen2" => {
-            let model = qwen2::loader::load(ctx, raw)?;
-            Some(Box::new(model))
+            let m = qwen2::loader::load(model)?;
+            Some(Box::new(m))
         }
         other => {
             eprintln!("Unsupported architecture: '{}'", other);
