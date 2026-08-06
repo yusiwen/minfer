@@ -51,13 +51,16 @@ fn print_usage(prog: &str) {
     eprintln!("USAGE:");
     eprintln!("  {prog} <model> [prompt] [OPTIONS]");
     eprintln!("  {prog} info <model>");
-    eprintln!("  {prog} download hf <repo> [file]");
+    eprintln!("  {prog} download hf <repo> [quant]");
     eprintln!("  {prog} download ollama <model>[:tag]");
+    eprintln!("  {prog} download <hf|ollama>:<name>[:variant]");
     eprintln!("  {prog} list");
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
-    eprintln!("  · a Hugging Face repo   hf:<repo>[:<file>]              (auto-download)");
+    eprintln!("  · a Hugging Face repo   hf:<repo>[:<quant>]              (auto-download)");
+    eprintln!("                         <quant> e.g. Q4_0, q4_k_m (case-insensitive;");
+    eprintln!("                         single file or split auto-detected)");
     eprintln!("  · an Ollama model       ollama:<model>[:tag]            (pull)");
     eprintln!("  · a cached model name   <filename>   resolved from ~/.cache/minfer/models");
     eprintln!("                         (see `{prog} list`)");
@@ -166,35 +169,33 @@ fn main() {
     // === Subcommands ===
     match positional[0].as_str() {
         "download" => {
-            if positional.len() < 3 {
-                eprintln!("Usage: {prog} download hf <repo> [file] | ollama <model>[:tag]");
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} download hf <repo> [quant] | ollama <model>[:tag]");
+                eprintln!("       {prog} download hf:<repo>[:quant] | ollama:<model>[:tag]");
                 std::process::exit(1);
             }
-            let source = &positional[1];
-            let target = &positional[2];
-            match source.as_str() {
-                "hf" => {
-                    let uri = if positional.len() > 3 {
-                        format!("hf:{}:{}", target, positional[3])
-                    } else {
-                        format!("hf:{}", target)
-                    };
-                    match download::resolve(&uri) {
-                        Ok(p) => println!("Model downloaded: {}", p.display()),
-                        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
-                    }
-                }
-                "ollama" => {
-                    let uri = format!("ollama:{}", target);
-                    match download::resolve(&uri) {
-                        Ok(p) => println!("Model ready: {}", p.display()),
-                        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
-                    }
-                }
-                _ => {
-                    eprintln!("Unknown download source '{}'. Use 'hf' or 'ollama'.", source);
+            let arg = &positional[1];
+            let uri = if arg == "hf" || arg == "ollama" {
+                // space form: download hf <repo> [quant]  /  download ollama <model>[:tag]
+                if positional.len() < 3 {
+                    eprintln!("Usage: {prog} download {} <repo-or-model> [variant]", arg);
                     std::process::exit(1);
                 }
+                format!("{}:{}", arg, positional[2..].join(":"))
+            } else if arg.starts_with("hf:") || arg.starts_with("ollama:") {
+                // URI form: download hf:<repo>[:quant]  /  download ollama:<model>[:tag]
+                if positional.len() != 2 {
+                    eprintln!("Usage: {prog} download <hf|ollama>:<name>[:variant]");
+                    std::process::exit(1);
+                }
+                arg.clone()
+            } else {
+                eprintln!("Unknown download source '{}'. Use 'hf' or 'ollama'.", arg);
+                std::process::exit(1);
+            };
+            match download::resolve(&uri) {
+                Ok(p) => println!("Model downloaded: {}", p.display()),
+                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
             }
             return;
         }

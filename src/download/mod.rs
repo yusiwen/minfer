@@ -117,9 +117,81 @@ fn collect_gguf_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 // Hugging Face
 // ============================================================
 
+/// Match a requested quant type (or exact filename) against the repo's `.gguf`
+/// file list, grouping split parts into one model. Returns the ordered list of
+/// part filenames to download (all parts of a split, or the single file).
+///
+/// Matching (quant is case-insensitive, single-file or split):
+///   1. exact filename (as-is) — if it is a split part, expands to the whole group
+///   2. base-name match: base == q or base ends with "-{q}" (q = quant lowercased),
+///      where base = split prefix, or the single filename minus `.gguf`
+///   3. exactly one group must match, else an error lists the available models.
+/// No requested quant: the repo must contain exactly one model group.
+fn match_model(filenames: &[String], requested: Option<&str>) -> Result<Vec<String>, String> {
+    struct Group {
+        base: String,
+        files: Vec<String>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for f in filenames {
+        let base = match crate::gguf::split_file_info(f) {
+            Some((prefix, _, _)) => prefix,
+            None => f.strip_suffix(".gguf").unwrap_or(f).to_string(),
+        };
+        match groups.iter_mut().find(|g| g.base == base) {
+            Some(g) => g.files.push(f.clone()),
+            None => groups.push(Group { base, files: vec![f.clone()] }),
+        }
+    }
+    let list = |g: &[&Group]| -> String {
+        g.iter().map(|g| format!("  {}", g.base)).collect::<Vec<_>>().join("\n")
+    };
+
+    if let Some(req) = requested {
+        if let Some(f) = filenames.iter().find(|f| f.as_str() == req) {
+            let base = match crate::gguf::split_file_info(f) {
+                Some((prefix, _, _)) => prefix,
+                None => f.strip_suffix(".gguf").unwrap_or(f).to_string(),
+            };
+            let group = groups.iter().find(|g| g.base == base).expect("group exists");
+            return Ok(group.files.clone());
+        }
+        let q = req.to_lowercase();
+        let matched: Vec<&Group> = groups
+            .iter()
+            .filter(|g| {
+                let b = g.base.to_lowercase();
+                b == q || b.ends_with(&format!("-{q}"))
+            })
+            .collect();
+        return match matched.len() {
+            0 => Err(format!(
+                "Quant '{}' not found in repo. Available models:\n{}",
+                req,
+                list(&groups.iter().collect::<Vec<_>>())
+            )),
+            1 => Ok(matched[0].files.clone()),
+            _ => Err(format!(
+                "Quant '{}' is ambiguous — matches multiple models:\n{}",
+                req,
+                list(&matched)
+            )),
+        };
+    }
+
+    match groups.len() {
+        0 => Err("No .gguf files found in repo.".to_string()),
+        1 => Ok(groups[0].files.clone()),
+        _ => Err(format!(
+            "Multiple models in repo. Specify a quant type:\n{}",
+            list(&groups.iter().collect::<Vec<_>>())
+        )),
+    }
+}
+
 /// Parse hf:<repo>[:<file>] and download.
 /// repo: e.g. "Qwen/Qwen2-0.5B-GGUF"
-/// file: optional filename, defaults to listing all GGUF files
+/// file: optional quant type or filename, defaults to listing all GGUF files
 fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
     let (repo, file) = if let Some(pos) = repo.find(':') {
         (repo[..pos].to_string(), Some(repo[pos + 1..].to_string()))
@@ -157,51 +229,9 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
     }
 
     // Select the target model group (all parts of a split, or a single file).
-    // Returns the list of part files to download + the path to return (part 0).
-    let select = |requested: Option<&str>| -> Result<Vec<String>, String> {
-        if let Some(f) = requested {
-            let exact = gguf_files.iter().find(|s| s.rfilename == *f);
-            if let Some(s) = exact {
-                return Ok(vec![s.rfilename.clone()]);
-            }
-            // prefix match: a split like "q4_k_m" → all "-0000X-of-0000Y" parts.
-            // Accept the exact split prefix ("qwen2.5-7b-instruct-q4_k_m") or a
-            // shorter tail ("q4_k_m") for convenience.
-            let split_prefix_matches = |p: &str| -> bool { p == f || p.ends_with(&format!("-{f}")) };
-            let parts: Vec<String> = gguf_files.iter()
-                .filter(|s| crate::gguf::split_file_info(&s.rfilename)
-                    .map_or(false, |(p, _, _)| split_prefix_matches(&p)))
-                .map(|s| s.rfilename.clone())
-                .collect();
-            if parts.is_empty() {
-                let list: Vec<&str> = gguf_files.iter().map(|s| s.rfilename.as_str()).collect();
-                return Err(format!(
-                    "File '{f}' not found in '{repo}'. Available GGUF files:\n{}",
-                    list.join("\n")
-                ));
-            }
-            Ok(parts)
-        } else if gguf_files.len() == 1 {
-            Ok(vec![gguf_files[0].rfilename.clone()])
-        } else {
-            // multiple .gguf: accept if they are all parts of ONE split model
-            let prefixes: std::collections::HashSet<String> = gguf_files.iter()
-                .filter_map(|s| crate::gguf::split_file_info(&s.rfilename))
-                .map(|(p, _, _)| p)
-                .collect();
-            if prefixes.len() == 1 {
-                Ok(gguf_files.iter().map(|s| s.rfilename.clone()).collect())
-            } else {
-                let list: Vec<&str> = gguf_files.iter().map(|s| s.rfilename.as_str()).collect();
-                return Err(format!(
-                    "Multiple GGUF files found. Specify one:\n{}",
-                    list.join("\n")
-                ));
-            }
-        }
-    };
-
-    let parts = select(file.as_deref())?;
+    // Returns the list of part files to download.
+    let filenames: Vec<String> = gguf_files.iter().map(|s| s.rfilename.clone()).collect();
+    let parts = match_model(&filenames, file.as_deref())?;
     let return_name = {
         // part 0 is the model entry (its split.count drives the loader)
         let first = &parts[0];
@@ -213,8 +243,19 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
 
     for name in &parts {
         let file_path = hf_dir.join(name);
-        let size = gguf_files.iter().find(|s| &s.rfilename == name).and_then(|s| s.size);
-        // Skip only when the file exists AND (if we know the size) matches it —
+        let download_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            repo, name
+        );
+        // Expected size: prefer the HF API `size`; fall back to a HEAD request
+        // (many repos omit `size`), so a complete cached file is skipped, not
+        // re-fetched.
+        let size = gguf_files
+            .iter()
+            .find(|s| &s.rfilename == name)
+            .and_then(|s| s.size)
+            .or_else(|| head_content_length(&download_url));
+        // Skip only when the file exists AND its size matches the remote one —
         // a partial/interrupted download must be resumed, not skipped.
         let complete = file_path.exists() && size.map_or(false, |s| {
             file_path.metadata().map(|m| m.len() == s).unwrap_or(false)
@@ -223,10 +264,6 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
             eprintln!("Already cached: {}", file_path.display());
             continue;
         }
-        let download_url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            repo, name
-        );
         http_download(&download_url, &file_path, size)?;
     }
 
@@ -359,6 +396,26 @@ fn http_get(url: &str) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("UTF-8 error: {}", e))
 }
 
+/// Query the remote Content-Length (HEAD), for repos whose API omits `size`.
+fn head_content_length(url: &str) -> Option<u64> {
+    let output = std::process::Command::new("curl")
+        .args(["-sIL", url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().rev().find_map(|l| {
+        let t = l.trim();
+        let head = t.get(..15)?;
+        if !head.eq_ignore_ascii_case("content-length:") {
+            return None;
+        }
+        t.get(15..).and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// Download a file via curl with resume support and progress.
 fn http_download(url: &str, path: &Path, _expected_size: Option<u64>) -> Result<(), String> {
     let path_str = path.to_string_lossy().to_string();
@@ -451,4 +508,77 @@ fn walk_dir(dir: &Path, depth: usize) -> Result<Vec<String>, String> {
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::match_model;
+
+    fn single(name: &str) -> Vec<String> {
+        vec![name.to_string()]
+    }
+
+    fn split(prefix: &str, count: usize) -> Vec<String> {
+        (1..=count)
+            .map(|i| format!("{}-{:05}-of-{:05}.gguf", prefix, i, count))
+            .collect()
+    }
+
+    #[test]
+    fn match_single_file_quant() {
+        let files = single("qwen2.5-0.5b-instruct-q4_0.gguf");
+        assert_eq!(match_model(&files, Some("q4_0")).unwrap(), files);
+    }
+
+    #[test]
+    fn match_single_file_quant_case_insensitive() {
+        let files = single("qwen2.5-0.5b-instruct-q4_0.gguf");
+        assert_eq!(match_model(&files, Some("Q4_0")).unwrap(), files);
+        assert_eq!(match_model(&files, Some("Q4_K_M")).unwrap_err().contains("not found"), true);
+    }
+
+    #[test]
+    fn match_split_quant() {
+        let files = split("qwen2.5-7b-instruct-q4_k_m", 2);
+        let got = match_model(&files, Some("q4_k_m")).unwrap();
+        assert_eq!(got, files);
+        assert_eq!(match_model(&files, Some("Q4_K_M")).unwrap(), files);
+        assert_eq!(match_model(&files, Some("qwen2.5-7b-instruct-q4_k_m")).unwrap(), files);
+    }
+
+    #[test]
+    fn match_exact_filename_expands_split() {
+        let files = split("foo", 3);
+        let part0 = &files[0];
+        let got = match_model(&files, Some(part0)).unwrap();
+        assert_eq!(got, files); // whole group
+    }
+
+    #[test]
+    fn match_mixed_repo_ambiguous() {
+        let mut files = Vec::new();
+        files.extend(single("m1-q4_k_m.gguf"));
+        files.extend(split("m2-q4_k_m", 2));
+        files.extend(split("m2-q5_k_m", 2));
+        // two different base names share the same quant tail → ambiguous
+        let err = match_model(&files, Some("q4_k_m")).unwrap_err();
+        assert!(err.contains("ambiguous"), "err: {err}");
+        assert!(err.contains("m1-q4_k_m") && err.contains("m2-q4_k_m"), "err: {err}");
+        // unique
+        assert_eq!(match_model(&files, Some("q5_k_m")).unwrap(), split("m2-q5_k_m", 2));
+        // not found
+        assert!(match_model(&files, Some("q4_0")).unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn match_no_requested() {
+        // one model group (split) → all parts
+        let files = split("m-q4_k_m", 2);
+        assert_eq!(match_model(&files, None).unwrap(), files);
+        // multiple models → error
+        let mut files2 = Vec::new();
+        files2.extend(single("m1-q4_0.gguf"));
+        files2.extend(single("m2-q4_k_m.gguf"));
+        assert!(match_model(&files2, None).unwrap_err().contains("Multiple models"));
+    }
 }

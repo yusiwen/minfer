@@ -58,10 +58,12 @@ MINFER_DISABLE_MPS=1 target/release/minfer <model> "hello"
 # Info (list tensor names/types/shapes)
 ./target/release/minfer info <model>
 
-# Auto-download (single file or multi-part split; split fetches ALL parts)
-./target/release/minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF q4_0.gguf
-./target/release/minfer download hf Qwen/Qwen2.5-7B-Instruct-GGUF q4_k_m   # → both -00001/-00002-of-00002 parts
-./target/release/minfer download ollama qwen2.5:0.5b
+# Auto-download — quant auto-matches single file or split (case-insensitive)
+./target/release/minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF Q4_0        # single file
+./target/release/minfer download hf Qwen/Qwen2.5-7B-Instruct-GGUF q4_k_m        # → both -00001/-00002-of-00002 parts
+./target/release/minfer download hf:Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M        # URI form (case-insensitive)
+./target/release/minfer download ollama qwen2.5:0.5b                            # ollama (tag = variant)
+./target/release/minfer download ollama:qwen2.5:0.5b                            # ollama URI form
 ```
 
 > **Multi-part (split) GGUF support** (2026-08-03, aligned with llama.cpp): a
@@ -74,9 +76,11 @@ MINFER_DISABLE_MPS=1 target/release/minfer <model> "hello"
 > its own part's data. The model entry is part 0 (`minfer
 > qwen2.5-7b-instruct-q4_k_m 'hi'` — cached-name resolution dedupes split parts
 > to part 0). `get_i64` handles Uint16/Int16/Uint8/Int8/Bool (llama's
-> `split.count`/`split.no` are Uint16). Download resume is size-checked (a
-> partial part is resumed via curl `-C -`, never skipped). Verified: 7B Q4_K_M
-> loads as 2 parts (4466 MB) with correct GPU output.
+> `split.count`/`split.no` are Uint16). Download resume is size-checked
+> (expected size from the HF API, or a HEAD Content-Length fallback for repos
+> that omit `size`; a partial part is resumed via curl `-C -`, never skipped).
+> Quant matching is case-insensitive and auto-detects single vs split.
+> Verified: 7B Q4_K_M loads as 2 parts (4466 MB) with correct GPU output.
 
 ## Debug Dump Files (`MINFER_DUMP_DIR`)
 
