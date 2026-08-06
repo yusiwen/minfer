@@ -214,16 +214,27 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
 // Architecture loader
 // ============================================================
 
-pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
+pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
+    let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
 
-    let mut tensor_map = std::collections::HashMap::<String, &crate::gguf::GgufTensorInfo>::new();
-    for ti in &ctx.info {
-        tensor_map.insert(ti.name.clone(), ti);
+    // Merged tensor index across all split parts (llama.cpp weights_map): each
+    // tensor lives in the part that lists it, read from that part's own data.
+    let mut tensor_map = std::collections::HashMap::<String, (usize, &crate::gguf::GgufTensorInfo)>::new();
+    for (pi, part) in model.parts.iter().enumerate() {
+        for ti in &part.ctx.info {
+            tensor_map.insert(ti.name.clone(), (pi, ti));
+        }
     }
-
     let load_one = |n: &str| -> Option<Tensor> {
-        tensor_map.get(n).map(|ti| load_tensor(ctx, raw, ti))
+        tensor_map.get(n).map(|(pi, ti)| {
+            let part = &model.parts[*pi];
+            load_tensor(&part.ctx, &part.data, ti)
+        })
+    };
+    let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
+        let part = &model.parts[*pi];
+        load_tensor(&part.ctx, &part.data, ti)
     };
 
     // Token embedding
@@ -245,22 +256,22 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
         let mut layer = crate::models::qwen2::loader::LayerWeights::new();
 
         if let Some(ti) = tensor_map.get(&tn::attn_norm(i)) {
-            layer.attn_norm = Some(load_tensor(ctx, raw, ti));
+            layer.attn_norm = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_q(i)) {
-            layer.wq = Some(load_tensor(ctx, raw, ti));
+            layer.wq = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_q_bias(i)) {
-            layer.bq = Some(load_tensor(ctx, raw, ti));
+            layer.bq = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_k(i)) {
-            layer.wk = Some(load_tensor(ctx, raw, ti));
+            layer.wk = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_k_bias(i)) {
-            layer.bk = Some(load_tensor(ctx, raw, ti));
+            layer.bk = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_v(i)) {
-            layer.wv = Some(load_tensor(ctx, raw, ti));
+            layer.wv = Some(load_ti(ti));
         }
 
         // Fused QKV projection (nt==1 decode): concatenate Wq/Wk/Wv along the
@@ -277,22 +288,22 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
             }
         }
         if let Some(ti) = tensor_map.get(&tn::attn_v_bias(i)) {
-            layer.bv = Some(load_tensor(ctx, raw, ti));
+            layer.bv = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::attn_out(i)) {
-            layer.wo = Some(load_tensor(ctx, raw, ti));
+            layer.wo = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::ffn_norm(i)) {
-            layer.ffn_norm = Some(load_tensor(ctx, raw, ti));
+            layer.ffn_norm = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::ffn_gate(i)) {
-            layer.ffn_gate = Some(load_tensor(ctx, raw, ti));
+            layer.ffn_gate = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::ffn_up(i)) {
-            layer.ffn_up = Some(load_tensor(ctx, raw, ti));
+            layer.ffn_up = Some(load_ti(ti));
         }
         if let Some(ti) = tensor_map.get(&tn::ffn_down(i)) {
-            layer.ffn_down = Some(load_tensor(ctx, raw, ti));
+            layer.ffn_down = Some(load_ti(ti));
         }
 
         // Fused FFN gate+up (nt==1 decode): one matmul produces both gate and
@@ -309,7 +320,7 @@ pub fn load(ctx: &GgufContext, raw: &[u8]) -> Option<super::Qwen2Model> {
     }
 
     // Override n_kv_embd from layer 0 K weight's actual output dimension
-    if let Some(ti) = tensor_map.get(&tn::attn_k(0)) {
+    if let Some((_, ti)) = tensor_map.get(&tn::attn_k(0)) {
         hparams.n_kv_embd = ti.ne[1];
     }
 

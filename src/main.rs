@@ -218,10 +218,10 @@ fn main() {
                 Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
                 Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
             };
-            let data = std::fs::read(&model_path).expect("read GGUF file");
-            let ctx = gguf::GgufContext::init_from_data(&data).expect("parse GGUF");
-            dump_gguf_metadata(&ctx);
-            dump_key_tensors(&ctx);
+            let gguf_model = gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
+            let ctx = &gguf_model.parts[0].ctx;
+            dump_gguf_metadata(ctx);
+            dump_key_tensors(ctx);
             return;
         }
         _ => {}  // fall through to model inference
@@ -248,19 +248,16 @@ fn main() {
         input.trim().to_string()
     };
 
-    // === Load GGUF ===
+    // === Load GGUF (single file or multi-part split) ===
     println!("Loading model: {} ...", model_path);
-    let data = {
-        let mut f = std::fs::File::open(model_path).expect("open model");
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut f, &mut buf).expect("read model");
-        buf
-    };
-    println!("File: {} bytes ({:.1} MB)", data.len(), data.len() as f64 / 1_048_576.0);
+    let gguf_model = gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
+    let n_parts = gguf_model.parts.len();
+    let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data.len()).sum();
+    println!("File: {} bytes ({:.1} MB) in {n_parts} part(s)", total_bytes, total_bytes as f64 / 1_048_576.0);
 
-    let ctx = gguf::GgufContext::init_from_data(&data).expect("parse GGUF");
+    let ctx = &gguf_model.parts[0].ctx;
     if meta_flag {
-        dump_gguf_metadata(&ctx);
+        dump_gguf_metadata(ctx);
     } else {
         println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
     }
@@ -272,9 +269,9 @@ fn main() {
     cuda::CudaState::init();
 
     // === Load model (dispatches on general.architecture) ===
-    let model = models::load_model(&ctx, &data).expect("load model");
+    let model = models::load_model(&gguf_model).expect("load model");
     if meta_flag {
-        dump_key_tensors(&ctx);
+        dump_key_tensors(ctx);
     } else {
         println!("Model loaded.");
     }
@@ -298,7 +295,7 @@ fn main() {
     // === Chat template (need tokenizer for bos_token text) ===
     let processed = if no_template {
         prompt.clone()
-    } else if let Some(tmpl) = get_chat_template(&data) {
+    } else if let Some(tmpl) = get_chat_template(&gguf_model.parts[0].data) {
         let bos_text = tokenizer.id_to_token.get(tokenizer.bos_token as usize)
             .map(|s| s.as_str())
             .unwrap_or("");

@@ -1648,3 +1648,131 @@ impl GgufContext {
         }
     }
 }
+
+// === Multi-part (split) GGUF support — aligned with llama.cpp ===
+// A split model is `name-0000X-of-0000Y.gguf` (Y parts). Part 0 holds the model
+// metadata (architecture, hparams) and the tensors whose data it contains;
+// parts 1+ are standalone GGUFs that each list the tensors they hold (offsets
+// relative to that part's own data section). This mirrors llama.cpp's
+// `llama_model_loader` (each part is parsed separately; a tensor is read from
+// its own part's data).
+
+/// One GGUF part: its parsed context + the raw file bytes (data section).
+pub struct GgufPart {
+    pub ctx: GgufContext,
+    pub data: Vec<u8>,
+}
+
+/// A model loaded from one GGUF file, or from the N parts of a split.
+pub struct GgufModel {
+    pub parts: Vec<GgufPart>,
+}
+
+/// Parse a split filename `name-0000X-of-0000Y.gguf` → (prefix, zero-based idx, count).
+/// Returns None when the name isn't a split file.
+pub fn split_file_info(name: &str) -> Option<(String, usize, usize)> {
+    let stem = name.strip_suffix(".gguf")?;
+    let dash = stem.rfind("-of-")?;
+    let idx_part = &stem[..dash];
+    let count_str = &stem[dash + 4..];
+    let idx_dash = idx_part.rfind('-')?;
+    let prefix = &idx_part[..idx_dash];
+    let idx_num = &idx_part[idx_dash + 1..];
+    if idx_num.len() != 5 || count_str.len() != 5 { return None; }
+    let idx: usize = idx_num.parse().ok()?;
+    let count: usize = count_str.parse().ok()?;
+    if idx == 0 || count == 0 || idx > count { return None; }
+    Some((prefix.to_string(), idx - 1, count))
+}
+
+/// Given a part path, resolve the full ordered list of all N part paths.
+/// Returns None when the path isn't a valid split file or isn't the first part.
+pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let name = path.file_name()?.to_str()?;
+    let (prefix, idx, count) = split_file_info(name)?;
+    if idx != 0 { return None; }
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let fname = format!("{}-{:05}-of-{:05}.gguf", prefix, i + 1, count);
+        out.push(dir.join(fname));
+    }
+    Some(out)
+}
+
+/// Load a GGUF model from `path` (a single file or the FIRST part of a split),
+/// assembling all parts. Aligned with llama.cpp: part 0 must be loaded first.
+pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
+    let data0 = std::fs::read(path).ok()?;
+    let ctx0 = GgufContext::init_from_data(&data0)?;
+    let split_count = ctx0.get_key_val_i64("split.count").map(|v| v as usize).unwrap_or(1);
+
+    if split_count <= 1 {
+        return Some(GgufModel { parts: vec![GgufPart { ctx: ctx0, data: data0 }] });
+    }
+
+    let split_no = ctx0.get_key_val_i64("split.no").map(|v| v as usize).unwrap_or(0);
+    if split_no != 0 {
+        eprintln!("GGUF: split.no = {split_no} — must load the first split (00001-of-{split_count})");
+        return None;
+    }
+
+    let part_paths = resolve_splits(path)?;
+    if part_paths.len() != split_count {
+        eprintln!(
+            "GGUF: split count mismatch: filename implies {} parts, split.count = {split_count}",
+            part_paths.len()
+        );
+        return None;
+    }
+
+    let mut parts = Vec::with_capacity(split_count);
+    for (i, p) in part_paths.iter().enumerate() {
+        let data = std::fs::read(p).ok()?;
+        let ctx = GgufContext::init_from_data(&data)?;
+        let no = ctx.get_key_val_i64("split.no").map(|v| v as usize).unwrap_or(0);
+        if no != i {
+            eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
+            return None;
+        }
+        parts.push(GgufPart { ctx, data });
+    }
+    Some(GgufModel { parts })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_file_info_parses_pattern() {
+        let (prefix, idx, count) =
+            split_file_info("qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf").unwrap();
+        assert_eq!(prefix, "qwen2.5-7b-instruct-q4_k_m");
+        assert_eq!(idx, 0);
+        assert_eq!(count, 2);
+
+        let (_, idx2, count2) =
+            split_file_info("qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf").unwrap();
+        assert_eq!(idx2, 1);
+        assert_eq!(count2, 2);
+
+        // not a split file
+        assert!(split_file_info("qwen2.5-0.5b-instruct-q4_k_m.gguf").is_none());
+        // invalid idx > count
+        assert!(split_file_info("foo-00099-of-00002.gguf").is_none());
+    }
+
+    #[test]
+    fn resolve_splits_builds_all_parts() {
+        let parts = resolve_splits(std::path::Path::new(
+            "/m/foo-00001-of-00003.gguf")).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].file_name().unwrap().to_str().unwrap(), "foo-00001-of-00003.gguf");
+        assert_eq!(parts[1].file_name().unwrap().to_str().unwrap(), "foo-00002-of-00003.gguf");
+        assert_eq!(parts[2].file_name().unwrap().to_str().unwrap(), "foo-00003-of-00003.gguf");
+        // non-first part rejected
+        assert!(resolve_splits(std::path::Path::new(
+            "/m/foo-00002-of-00003.gguf")).is_none());
+    }
+}

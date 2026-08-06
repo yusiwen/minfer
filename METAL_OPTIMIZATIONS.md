@@ -621,7 +621,7 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 
 | Priority | Item | Type | Notes |
 |---|---|---|---|
-| 1 | **Qwen2.5-7B Q4_K_M verification** | verification | Validate all shipped optimizations (split attention, KV geometric growth, per-quant GEMMs, f16 split) at scale + long context. Download via `minfer download` (~4 GB); not currently cached |
+| 1 | **Qwen2.5-7B Q4_K_M verification** | verification | Validate all shipped optimizations at scale + long context. **Split-GGUF support (multi-part `-0000X-of-0000Y.gguf`) is SHIPPED 2026-08-03** (aligned with llama.cpp): `GgufModel`/`load_gguf_model` parse every part (each lists its own tensors), the loader builds a merged tensor index reading each tensor from its own part; `download hf:repo:q4_k_m` fetches all parts. Unit tests cover the split pattern + part resolution; end-to-end 7B verification pending |
 | 2 | ~~Decode micro-opt: P6 + P7~~ | ~~perf~~ | **SHIPPED 2026-08-03**: float4 element-wise kernels + parallel RoPE (~2-3 % decode; 200-token ~0.88 → ~0.80 s) |
 | 3 | **Q4_K AVX2 CPU dot-product fix** | correctness (x86) | 5 failing `test_q4k_dot_*` bin tests (diff 39-167) — the AVX2 Q4_K dequant/dot is wrong; dormant on ARM (scalar path used), affects x86-64 CPU users. Cannot reproduce/verify on ARM — needs static analysis vs the `kernel.rs`/`avx2.rs` scalar reference, then cross-check the portable path |
 | ~~4~~ | ~~Q4_1 GEMM~~ | ~~completeness~~ | **SHIPPED 2026-08-03**: `kernel_q4_1_mm_f32` (20 B/32-elem, `dequant_q4_1_16` d*q+m) — every quant type now has a simdgroup GEMM; verified in `non_q4_0_gemm_isolation` (8 GEMMs) |
