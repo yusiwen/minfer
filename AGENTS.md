@@ -288,6 +288,24 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > at a clean GPU state (measurements are bimodal: fast ~0.80 s vs throttled
 > ~1.15 s — GPU-state artifact, not code). All models + isolation 6 passed.
 
+> **Decode bottleneck is the CPU sampler, not the GPU** (2026-08-06, llama.cpp
+> A/B): same Qwen2.5-0.5B Q4_K_M model — llama.cpp `Generation:` **247.2 tok/s**
+> vs minfer default-sampling ~80-93 tok/s. Isolating GPU decode with `--greedy`
+> gives ~180-208 tok/s (**5.0-5.8 ms/token**) — the default sampler adds
+> **~7.6 ms/token**. Root cause: `sampler.rs apply_top_k` does a full-vocab
+> (151,936) sort + 607 KB copy and `apply_top_p` a full softmax + sort of
+> 151,936 `(usize,f32)` (2.4 MB/token), serialized in the decode loop; llama.cpp's
+> candidate-list chain (top_k `std::partial_sort` O(n·log k) → top_p over the ≤k
+> survivors, verified in src/llama-sampler.cpp @ 88b47a755) is near-free.
+> **FIX SHIPPED 2026-08-06**: top_k → `select_nth_unstable_by` (O(n), on a copy
+> to preserve index→token mapping); top_p → softmax+sort only the ≤k survivors;
+> temp skips masked logits; main.rs moves the logits Vec instead of a 607 KB
+> copy. Default decode ~12.6-14.8 → **~5.5-6.5 ms/token** (~2×: 512 tokens
+> 6.9 → ~3.5 s, ~150-200 tok/s); fixed-seed output **byte-identical** (7 sampler
+> tests pass; the 5 avx2::test_q4k_dot_* failures are the pre-existing x86 bug).
+> Full measurements in METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU
+> sampler" (2026-08-06).
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per
