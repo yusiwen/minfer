@@ -61,10 +61,13 @@ pub fn forward(
         });
         if use_gpu {
             let mps = crate::metal::MpsState::get().unwrap();
-            // GPU embedding lookup (Q4_0): writes directly to buf_hidden on GPU
-            let gpu_embd = mps.embed_tokens_gpu(
-                model.tok_embd.as_ref().unwrap(), token_ids, nt, ne
-            );
+            // GPU embedding lookup (Q4_0): writes directly to buf_hidden on GPU.
+            // Skips the dispatch under the decode profiling gate (like layer_gpu).
+            let gpu_embd = if crate::metal::DecodeSkips::active(nt).matmul { false } else {
+                mps.embed_tokens_gpu(
+                    model.tok_embd.as_ref().unwrap(), token_ids, nt, ne
+                )
+            };
             if !gpu_embd {
                 // Fallback: upload CPU-computed hidden state
                 mps.upload_hidden(&hidden);
