@@ -306,6 +306,26 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > Full measurements in METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU
 > sampler" (2026-08-06).
 
+> **Decode bottleneck is the matmul dequant inner loop, NOT launch overhead**
+> (2026-08-06, Phase 1 corrected the model): greedy decode 5.4 ms/token =
+> matmuls **~3.1 ms (~90 GB/s)** + attention 0.7 ms (flat — split attention
+> works) + small element-wise ~0.5 ms + base infra ~0.7 ms. The 278 MB matmul
+> sweep has a ~1.2-1.4 ms floor, so the Q4_K_M f32-multi kernels are
+> **dequant-compute-bound at ~90 GB/s** (scalar int→float in the inner loop);
+> Q4_0 decodes ~1.4× faster because its kernel is the vectorized
+> interleaved-ushort one. **Phase 1 SHIPPED**: fused bias+RoPE+KV-store
+> (7→1, `kernel_attn_bias_rope_store`) saved 144 kernels but only **~0.27
+> ms/token (~5 %, byte-identical f32+f16)** → tiny kernels cost ~2-3 µs each;
+> the "~10-15 µs/kernel launch overhead / aggressive fusion" model was wrong
+> (the 2026-08-03 "fusion dead-end" conclusion was right after all). **Next**:
+> optimize the Q4_K_M matmul dequant paths (Q5_0/Q6_K/Q4_K/Q5_K/Q8_0/Q5_1) to
+> be bandwidth-bound → ~1.7 ms → ~3.5 ms/token ≈ llama. Profiling gates kept
+> as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
+> `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
+> dispatch gated in its exact original position — the FFN down-matmul must stay
+> AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md "Decode Gap (revised
+> 2026-08-06)".
+
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
 > bad state producing intermittent wrong logits (different greedy outputs per

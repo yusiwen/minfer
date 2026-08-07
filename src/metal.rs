@@ -134,6 +134,7 @@ struct MpsStateInner {
     pl_gqa_attn_combine: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
+    pl_attn_bsr: metal::ComputePipelineState,
     weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
     // Persistent scratch buffers grown on demand; avoids per-call allocation.
     q8_buf: std::sync::Mutex<metal::Buffer>,
@@ -163,6 +164,35 @@ struct MpsStateInner {
     kv_size: std::sync::RwLock<Vec<usize>>,
     // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
     dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+/// Decode profiling gates (subtractive per-token timing). Each flag skips one
+/// kernel group during decode (nt==1) when `MINFER_SKIP_{ATTN,MATMULS,SMALL}=1`.
+/// The env is read once per process into a OnceLock (mirroring the MINFER_TRACE
+/// pattern), so normal decode has ~zero overhead. Usage in the dispatch code is
+/// constrained to gate each kernel IN ITS EXACT ORIGINAL POSITION — never move a
+/// dispatch relative to its neighbors (a grouped gate moved the FFN down-matmul
+/// before swiglu on 2026-08-06 and corrupted output).
+#[derive(Clone, Copy, Default)]
+pub struct DecodeSkips {
+    pub attn: bool,
+    pub matmul: bool,
+    pub small: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DecodeSkips {
+    pub fn active(nt: usize) -> Self {
+        if nt != 1 {
+            return DecodeSkips::default();
+        }
+        static CACHE: std::sync::OnceLock<DecodeSkips> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| DecodeSkips {
+            attn: std::env::var("MINFER_SKIP_ATTN").map_or(false, |v| v == "1"),
+            matmul: std::env::var("MINFER_SKIP_MATMULS").map_or(false, |v| v == "1"),
+            small: std::env::var("MINFER_SKIP_SMALL").map_or(false, |v| v == "1"),
+        })
+    }
 }
 
 // ─── MpsCommandBuffer: batch multiple ops in one GPU submission ──────
@@ -687,6 +717,38 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nkt as u64, 1, 1);
     }
 
+    /// Fused bias-add + RoPE + KV-store for nt==1 decode: ONE kernel replaces
+    /// add_bias×3 + rope×2 + store_kv×2 (7 dispatches). `bqkv` layout is
+    /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw
+    /// per-section buffers. `pos` = the single token position. The KV store
+    /// writes f32 or f16 (per kv_cache_is_f16) into kv_k/kv_v.
+    pub fn attn_bias_rope_store(&self,
+        bqkv: &metal::Buffer,
+        bias_q: &metal::Buffer, bias_k: &metal::Buffer, bias_v: &metal::Buffer,
+        kv_k: &metal::Buffer, kv_v: &metal::Buffer,
+        nqt: usize, nkt: usize, hd: usize,
+        freq_base: f32, freq_scale: f32, pos: i32, rope_style: i32,
+    ) {
+        self.trace_op("attn_bias_rope_store");
+        self.enc.set_compute_pipeline_state(&self.state.pl_attn_bsr);
+        self.enc.set_buffer(0, Some(bqkv), 0);
+        self.enc.set_buffer(1, Some(bias_q), 0);
+        self.enc.set_buffer(2, Some(bias_k), 0);
+        self.enc.set_buffer(3, Some(bias_v), 0);
+        self.enc.set_buffer(4, Some(kv_k), 0);
+        self.enc.set_buffer(5, Some(kv_v), 0);
+        self.set_params(6, &(nqt as i32));
+        self.set_params(7, &(nkt as i32));
+        self.set_params(8, &(hd as i32));
+        self.set_params(9, &(freq_base.to_bits() as i32));
+        self.set_params(10, &(freq_scale.to_bits() as i32));
+        self.set_params(11, &pos);
+        self.set_params(12, &rope_style);
+        self.set_params(13, &(if kv_cache_is_f16() { 1 } else { 0 }));
+        let grid = nqt / 2 + nkt / 2 + nkt;
+        self.dispatch_1d(grid as u64, 256);
+    }
+
     /// Commit GPU work and wait for completion using a semaphore completion handler.
     /// This avoids the ~20ms Metal scheduler wakeup overhead of wait_until_completed.
     pub fn submit(self) -> Result<(), String> {
@@ -829,6 +891,7 @@ impl MpsState {
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
+            let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
             let m = MpsStateInner {
                 device: device.clone(),
@@ -879,6 +942,7 @@ impl MpsState {
                 pl_gqa_attn_combine,
                 pl_store_kv,
                 pl_store_kv_f16,
+                pl_attn_bsr,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_buf: std::sync::Mutex::new(dummy_buf.clone()),
@@ -1450,7 +1514,12 @@ impl MpsState {
                 { return false; }
         }
 
-        cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps);
+        // ── decode profiling gates (subtractive per-token timing) ──────────
+        // Flags are OnceLock-cached (see DecodeSkips). Each gated dispatch below
+        // stays in its EXACT original position — never reorder across gates.
+        let sk = DecodeSkips::active(nt);
+
+        if !sk.small { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
 
         // Fused QKV projection (nt==1 decode): one matmul on the concatenated
         // Wq/Wk/Wv produces q+k+v in one buffer; the rope/store read the q/k/v
@@ -1487,41 +1556,62 @@ impl MpsState {
                     bqkv_buf.length(), (od_total * 4) as u64
                 ));
             }
-            cb.matmul_on_gpu_buf(&buf_qkv, wq.ttype, &q8_bn, &bn, &bqkv_buf, od_total, ne, nt);
-            if let Some(bb) = &bq_bias { cb.add_bias_f32(&bqkv_buf, bb, nqt, nt, 0); }
-            if let Some(bb) = &bk_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt); }
-            if let Some(bb) = &bv_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt + nkt); }
-            cb.rope_f32(&bqkv_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
-            cb.rope_f32(&bqkv_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, nqt);
-            cb.store_kv(&bqkv_buf, &kv_k[il], nkt, nt, &pos_buf, nqt);
-            cb.store_kv(&bqkv_buf, &kv_v[il], nkt, nt, &pos_buf, nqt + nkt);
-            if nt == 1
-                && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
-                cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
-            } else {
-                cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            if !sk.matmul { cb.matmul_on_gpu_buf(&buf_qkv, wq.ttype, &q8_bn, &bn, &bqkv_buf, od_total, ne, nt); }
+            // Fused bias+RoPE+KV-store (nt==1 only): replaces the 7 separate
+            // bias/rope/store dispatches below. Requires all three biases + even
+            // hd (rope pair mapping); MINFER_NO_FUSE_BSR=1 disables it for A/B.
+            let use_fused_bsr = nt == 1 && hd % 2 == 0
+                && bq_bias.is_some() && bk_bias.is_some() && bv_bias.is_some()
+                && !std::env::var("MINFER_NO_FUSE_BSR").map_or(false, |v| v == "1");
+            if !sk.small {
+                if use_fused_bsr {
+                    cb.attn_bias_rope_store(&bqkv_buf,
+                        bq_bias.as_ref().unwrap(), bk_bias.as_ref().unwrap(), bv_bias.as_ref().unwrap(),
+                        &kv_k[il], &kv_v[il],
+                        nqt, nkt, hd, freq_base, freq_scale, positions[0] as i32, rope_style);
+                } else {
+                    if let Some(bb) = &bq_bias { cb.add_bias_f32(&bqkv_buf, bb, nqt, nt, 0); }
+                    if let Some(bb) = &bk_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt); }
+                    if let Some(bb) = &bv_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt + nkt); }
+                    cb.rope_f32(&bqkv_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
+                    cb.rope_f32(&bqkv_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, nqt);
+                    cb.store_kv(&bqkv_buf, &kv_k[il], nkt, nt, &pos_buf, nqt);
+                    cb.store_kv(&bqkv_buf, &kv_v[il], nkt, nt, &pos_buf, nqt + nkt);
+                }
+            }
+            if !sk.attn {
+                if nt == 1
+                    && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                    cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                } else {
+                    cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+                }
             }
         } else {
             cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, &bq_buf, nqt, ne, nt);
-            if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt, 0); }
             cb.matmul_on_gpu_buf(&buf_wk, wk.ttype, &q8_bn, &bn, &bk_buf, nkt, ne, nt);
-            if let Some(bb) = &bk_bias { cb.add_bias_f32(&bk_buf, bb, nkt, nt, 0); }
             cb.matmul_on_gpu_buf(&buf_wv, wv.ttype, &q8_bn, &bn, &bv_buf, nkt, ne, nt);
-            if let Some(bb) = &bv_bias { cb.add_bias_f32(&bv_buf, bb, nkt, nt, 0); }
-            cb.rope_f32(&bq_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
-            cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
-            cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf, 0);
-            cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf, 0);
-            if nt == 1
-                && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
-                cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
-            } else {
-                cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+            if !sk.small {
+                if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt, 0); }
+                if let Some(bb) = &bk_bias { cb.add_bias_f32(&bk_buf, bb, nkt, nt, 0); }
+                if let Some(bb) = &bv_bias { cb.add_bias_f32(&bv_buf, bb, nkt, nt, 0); }
+                cb.rope_f32(&bq_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
+                cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
+                cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf, 0);
+                cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf, 0);
+            }
+            if !sk.attn {
+                if nt == 1
+                    && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                    cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                } else {
+                    cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+                }
             }
         }
         // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt);
-        cb.add_f32(&hidden, &bn, &hidden, nt * ne);
+        if !sk.matmul { cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt); }
+        if !sk.small { cb.add_f32(&hidden, &bn, &hidden, nt * ne); }
 
         // FFN branch
         let ffn_all_q4 = ffn_gate.ttype == TensorType::Q4_0 && ffn_up.ttype == TensorType::Q4_0;
@@ -1532,7 +1622,7 @@ impl MpsState {
                 { return false; }
         }
 
-        cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps);
+        if !sk.small { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
         // Fused FFN gate+up (nt==1 decode): one matmul on the concatenated
         // gate+up weight → bgu; swiglu reads gate at offset 0 and up at nf.
         // Same nt==1 gate + exact-buffer-length guard as the QKV fusion.
@@ -1556,16 +1646,24 @@ impl MpsState {
                     bgu_buf.length(), (od_total * 4) as u64
                 ));
             }
-            cb.matmul_on_gpu_buf(&buf_gu, ffn_gate.ttype, &q8_ba, &ba_buf, &bgu_buf, od_total, ne, nt);
-            cb.swiglu_f32_off(&bgu_buf, &bgu_buf, &bgu_buf, nt * nf, nt * nf);
-            cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bgu_buf, &bn, ne, nf, nt);
+            if !sk.matmul {
+                cb.matmul_on_gpu_buf(&buf_gu, ffn_gate.ttype, &q8_ba, &ba_buf, &bgu_buf, od_total, ne, nt);
+            }
+            if !sk.small { cb.swiglu_f32_off(&bgu_buf, &bgu_buf, &bgu_buf, nt * nf, nt * nf); }
+            if !sk.matmul {
+                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bgu_buf, &bn, ne, nf, nt);
+            }
         } else {
-            cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, &bg_buf, nf, ne, nt);
-            cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, &bf_buf, nf, ne, nt);
-            cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf);
-            cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, &bn, ne, nf, nt);
+            if !sk.matmul {
+                cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, &bg_buf, nf, ne, nt);
+                cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, &bf_buf, nf, ne, nt);
+            }
+            if !sk.small { cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf); }
+            if !sk.matmul {
+                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, &bn, ne, nf, nt);
+            }
         }
-        cb.add_f32(&hidden, &bn, &hidden, nt * ne);
+        if !sk.small { cb.add_f32(&hidden, &bn, &hidden, nt * ne); }
 
         self.inner.kv_size.write().unwrap()[il] = max_pos + 1;
         true
@@ -1615,12 +1713,16 @@ impl MpsState {
         let bn = Self::get_or_grow(&self.inner.buf_bn, (nt * ne * 4) as u64, dev);
         let logits = Self::get_or_grow(&self.inner.buf_logits, (nt * nv * 4) as u64, dev);
 
-        cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps);
+        let sk = DecodeSkips::active(nt);
+
+        if !sk.small { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
 
         // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt);
-        if let Some(bb) = &bias_buf {
-            cb.add_bias_f32(&logits, bb, nv, nt, 0);
+        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt); }
+        if !sk.small {
+            if let Some(bb) = &bias_buf {
+                cb.add_bias_f32(&logits, bb, nv, nt, 0);
+            }
         }
         true
     }
