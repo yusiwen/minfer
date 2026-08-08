@@ -306,25 +306,39 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > Full measurements in METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU
 > sampler" (2026-08-06).
 
-> **Decode bottleneck is the matmul dequant inner loop, NOT launch overhead**
-> (2026-08-06, Phase 1 corrected the model): greedy decode 5.4 ms/token =
-> matmuls **~3.1 ms (~90 GB/s)** + attention 0.7 ms (flat — split attention
-> works) + small element-wise ~0.5 ms + base infra ~0.7 ms. The 278 MB matmul
-> sweep has a ~1.2-1.4 ms floor, so the Q4_K_M f32-multi kernels are
-> **dequant-compute-bound at ~90 GB/s** (scalar int→float in the inner loop);
-> Q4_0 decodes ~1.4× faster because its kernel is the vectorized
-> interleaved-ushort one. **Phase 1 SHIPPED**: fused bias+RoPE+KV-store
-> (7→1, `kernel_attn_bias_rope_store`) saved 144 kernels but only **~0.27
-> ms/token (~5 %, byte-identical f32+f16)** → tiny kernels cost ~2-3 µs each;
-> the "~10-15 µs/kernel launch overhead / aggressive fusion" model was wrong
-> (the 2026-08-03 "fusion dead-end" conclusion was right after all). **Next**:
-> optimize the Q4_K_M matmul dequant paths (Q5_0/Q6_K/Q4_K/Q5_K/Q8_0/Q5_1) to
-> be bandwidth-bound → ~1.7 ms → ~3.5 ms/token ≈ llama. Profiling gates kept
+> **Decode gap: matmuls at ~130 GB/s (structural for nt==1), NOT launch
+> overhead, NOT dequant-compute-bound** (2026-08-06, final model): greedy decode
+> 5.4 ms/token = matmuls **~3.0 ms (~130 GB/s)** + attention 0.7 ms (flat —
+> split attention works) + small element-wise ~0.5 ms + base infra ~0.7 ms. The
+> real matmul sweep is **~392 MB/token** (Q5_0 173 + Q8_0 146 + Q6_K 43 + Q4_K
+> 29 MB, parsed from GGUF) → ~1.96 ms floor; matmuls run at 63 % of bandwidth.
+> **Phase 1 SHIPPED**: fused bias+RoPE+KV-store (7→1) saved 144 kernels but only
+> ~0.27 ms/token (~5 %, byte-identical f32+f16) → tiny kernels cost ~2-3 µs
+> each; the "launch-overhead / aggressive fusion" model was wrong. **Q5_0
+> vectorized dot SHIPPED**: the Q5_0 matmul was the last scalar kernel; using
+> the existing `block_q5_0_dot_y` gained only ~0.08 ms (~2.6 % matmul) → matmuls
+> are NOT dequant-compute-bound; the ~1 ms to the bandwidth floor is structural
+> (nt==1 small-grid launch/latency + occupancy), and dequant vectorization has
+> diminishing returns. Remaining low-value opts (Q6_K/Q4_K vectorization, encode
+> opt, small fusions) → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05.
+> Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
 > dispatch gated in its exact original position — the FFN down-matmul must stay
 > AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md "Decode Gap (revised
 > 2026-08-06)".
+
+> **Performance-verification methodology** (2026-08-06, after the Q5_0
+> shader-compile-bug was misread as a GPU throttle): (1) `metal.rs::tests::metal_pipelines_compile`
+> compiles every Metal pipeline at `cargo test` — `cargo build` does NOT compile
+> shaders, so a duplicate/missing kernel only fails at model load (MPS falls back
+> to CPU silently; the ~7 tok/s CPU time reads like "GPU throttling"). (2)
+> `scripts/bench.sh <args>` runs minfer and refuses (non-zero exit) unless `MPS:
+> GPU acceleration enabled` is in the output; `scripts/bench.sh --health <model>`
+> additionally requires prefill ≥ 200 tok/s (healthy ~500+, CPU fallback ~7).
+> Benchmark decode only after a passing `--health`. Beware: sustained GPU
+> benchmarking thermally throttles the M4 Pro (extreme case: everything ~1.3 s
+> regardless of config) — interleave configs, take min/median, use few runs.
 
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a

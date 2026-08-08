@@ -483,28 +483,23 @@ in its exact original position). Kept in `layer_gpu`/`output_norm_gpu`/
 | base infra (cb submit + sync + 607 KB logits download + encode) | 0.86 | 16% | all three skips |
 | **full** | **5.4** | | |
 
-**Root cause (revised again 2026-08-06 — Phase 1 measured the fusion plan):
-the Q4_K_M matmul kernels are the bottleneck, dequant-compute-bound at ~90
-GB/s — NOT launch overhead.** The matmul weight sweep is **278 MB/token**
-(358M layer params + 136M output, mixed Q4_K/Q5_0/Q5_1/Q6_K/Q8_0) → memory
-floor ~1.2-1.4 ms at 200-240 GB/s. Measured **matmul-only time is ~3.1
-ms/token ≈ 90 GB/s** (isolated via `MINFER_SKIP_ATTN + MINFER_SKIP_SMALL`,
-base subtracted) — the f32 multi kernels for the Q4_K_M quants dequantize
-scalarly in the inner loop and are compute-bound. The 436-kernel launch
-overhead model was WRONG: a controlled fusion (below) showed tiny kernels cost
-only ~2-3 µs each. Correct per-kernel costs: small ~2-3 µs, attention ~15 µs,
-matmul ~33 µs (≈12 µs bandwidth + ~20 µs dequant compute). The Q4_0 model
-decodes ~1.4× faster than Q4_K_M (0.98 s vs 1.36 s / 256 tokens) because its
-Q4_0 kernel is the fast interleaved-ushort one.
+**Root cause (final 2026-08-06): matmuls are the bottleneck at ~130 GB/s —
+structural for nt==1, NOT fixable by dequant vectorization.** The matmul weight
+sweep is **~392 MB/token** (Q5_0 173 + Q8_0 146 + Q6_K 43 + Q4_K 29 MB, parsed
+from GGUF) → memory floor ~1.96 ms at ~200 GB/s. Measured **matmul-only time is
+~3.0 ms/token ≈ 130 GB/s** (isolated via `MINFER_SKIP_ATTN + MINFER_SKIP_SMALL`,
+base subtracted). The 436-kernel launch-overhead model was WRONG (a controlled
+fusion showed tiny kernels cost ~2-3 µs each). The Q4_0 model decodes ~1.4×
+faster than Q4_K_M (0.98 s vs 1.36 s / 256 tokens) — but that's mostly the
+smaller Q4_0 weight sweep (~250 MB vs 392 MB), not a kernel-speed difference.
 
-This **revises** the earlier conclusions:
-1. "Decode is weight-read-bound, NOT dispatch-launch-bound" (2026-08-03) — the
-   batched-cb benchmark's 182-240 GB/s ceiling was Q4_0-specific; the Q4_K_M
-   quants achieve only ~90 GB/s.
-2. "Per-kernel launch overhead ~10-15 µs is THE lever" (2026-08-06, earlier this
-   session) — Phase 1 (bias+RoPE+store 7→1, 144 kernels) measured **~0.27
-   ms/token (~2 µs/kernel)**, i.e. the fusion program has only ~0.4 ms total
-   upside. The dominant reducible factor is the matmul dequant inner loop.
+This **revises** the session's earlier conclusions:
+1. "Matmul dequant inner loop is THE lever (~1.7 ms potential)" (2026-08-06,
+   earlier) — vectorizing the Q5_0 kernel (the last scalar one) gained only
+   **~0.08 ms (~2.6 % matmul)**, so the matmuls are NOT dequant-compute-bound;
+   the ~130 GB/s is nt==1 small-grid launch/latency + ALU + occupancy.
+2. "Per-kernel launch overhead ~10-15 µs is THE lever" (2026-08-06, earlier) —
+   Phase 1 (bias+RoPE+store 7→1, 144 kernels) measured ~0.27 ms (~2 µs/kernel).
 
 ### Phase 1 — SHIPPED 2026-08-06: fused bias+RoPE+KV-store (7 → 1 kernel)
 
@@ -515,28 +510,42 @@ biases present + even hd; `MINFER_NO_FUSE_BSR=1` falls back to the 7 kernels.
 Verified **byte-identical** (f32 AND f16 caches, fixed seed). Measured: 1.420 →
 **1.350 s median** (-n 256, greedy) = **~0.27 ms/token (~5 %)**.
 
-### Plan (next): optimize the Q4_K_M matmul dequant inner loop (~1.7 ms potential)
+### Q5_0 vectorized dot — SHIPPED 2026-08-06, small gain (the last scalar kernel)
 
-The ~97 nt==1 matmul kernels run at ~90 GB/s (dequant-compute-bound). Target
-bandwidth-bound (~200 GB/s → matmuls ~1.4 ms, saving ~1.7 ms → decode ~3.5 ms
-≈ llama.cpp). Focus on the Q4_K_M quant paths: `kernel_q5_0_f32_matmul`,
-`kernel_q6_k_f32_matmul`, `kernel_q4_k_f32_matmul`, `kernel_q5_k_f32_matmul`,
-`kernel_q8_0_f32_matmul`, `kernel_q5_1_f32_matmul` (+ `_multi`). Directions:
-vectorized dequant (float4/uint4 block loads like the Q4_0 interleaved-ushort
-kernel), reduce per-element int→float work, better weight reuse across the od
-grid. The remaining small-kernel fusions (residual+norm 2→1, swiglu into GU
-epilogue) are now low priority (~0.07-0.25 ms each — Phase 1 showed ~2-3
-µs/kernel). Per-kernel encode optimization (pack setBytes) still worth ~0.1-0.2
-ms (CPU-side) and is orthogonal.
+The Q5_0 matmul was the **only** scalar dequant kernel left (all others — Q8_0 is
+a llama `kernel_mul_mv_q8_0_f32_impl` translation, Q4_0/Q5_1 use the
+interleaved-ushort dot). `kernel_q5_0_f32_matmul`/`_multi` now use the existing
+`block_q5_0_dot_y` (ushort nibble + qh-bit trick, llama `block_q_n_dot_y` port),
+matching the Q5_1 kernel structure. **Measured (MPS-asserted, corrected
+methodology)**: matmul-only 3.09 → **3.05 ms/token (~1-2 %)** — a negligible
+gain, no decode-level difference beyond noise. **Conclusion: the matmuls are NOT
+primarily dequant-compute-bound** — the vectorization (the entire ALU-difference
+between scalar and vectorized dequant) bought only ~0.04-0.08 ms, so the ~130
+GB/s is a mix of nt==1 small-grid launch latency + ALU + occupancy, not fixable
+by more dequant micro-opts.
+> **Verification lesson (2026-08-06)**: this kernel initially LOOKED like a GPU
+> throttle (~7 tok/s) — the duplicate `block_q5_0_dot_y` definition failed the
+> Metal shader compile, MPS fell back to CPU silently, and the CPU time was
+> misread as a hot GPU. Guard now: `tests` → `metal.rs::tests::metal_pipelines_compile`
+> compiles every pipeline at `cargo test` (catches shader errors), and
+> `scripts/bench.sh` asserts `MPS: GPU acceleration enabled` (and prefill ≥ 200
+> tok/s in `--health`) before trusting any timing — the CPU-fallback signature is
+> ~7 tok/s vs the healthy ~500+ tok/s prefill.
 
-Per-change verification:
-1. New/optimized kernel isolation test — deterministic vs the scalar CPU
-   reference (follow `tests/gemm_isolation.rs`).
-2. GPU-safety conventions — no early return before `threadgroup_barrier`,
-   runtime-queried device limits, dimension asserts.
-3. A/B — fixed-seed output byte-identical (gate via `MINFER_NO_FUSE_*` /
-   `DecodeSkips`, or a quant-path env switch).
-4. Re-profile with `DecodeSkips` to confirm the GB/s improvement.
+### Corrected matmul GB/s and the residual plan
+
+The actual matmul weight sweep is **~392 MB/token** (Q5_0 173 + Q8_0 146 + Q6_K
+43 + Q4_K 29 MB, parsed from GGUF) — the earlier "278 MB / ~90 GB/s" was wrong.
+Matmul-only is **3.05 ms/token ≈ 129 GB/s** (63 % of the ~200 GB/s floor;
+bandwidth-bound would be ~1.96 ms). The ~1 ms to the floor is structural:
+nt==1 single-token matmuls with small grids can't fully saturate DRAM bandwidth,
+and the dequant ALU adds ~7 ops/byte even vectorized. **Dequant vectorization
+has diminishing returns** (Q5_0: +2.6 % for a full kernel rewrite). Remaining
+low-value options: Q6_K/Q4_K vectorization (~0.1-0.2 ms combined, same class as
+Q5_0), per-kernel encode optimization (pack setBytes, ~0.1-0.2 ms CPU-side),
+small-kernel fusions (residual+norm, swiglu epilogue — ~0.07-0.25 ms each).
+Realistic decode ceiling with all of them: ~4.8-5.0 ms/token vs llama's ~4.05.
+
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
@@ -803,5 +812,5 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 3 | **Q4_K AVX2 CPU dot-product fix** | correctness (x86) | 5 failing `test_q4k_dot_*` bin tests (diff 39-167) — the AVX2 Q4_K dequant/dot is wrong; dormant on ARM (scalar path used), affects x86-64 CPU users. Cannot reproduce/verify on ARM — needs static analysis vs the `kernel.rs`/`avx2.rs` scalar reference, then cross-check the portable path |
 | ~~4~~ | ~~Q4_1 GEMM~~ | ~~completeness~~ | **SHIPPED 2026-08-03**: `kernel_q4_1_mm_f32` (20 B/32-elem, `dequant_q4_1_16` d*q+m) — every quant type now has a simdgroup GEMM; verified in `non_q4_0_gemm_isolation` (8 GEMMs) |
 | 5 | ~~**CPU sampler: top_k/top_p full-vocab sort**~~ | ~~perf (CPU)~~ | **SHIPPED 2026-08-06**: default sampling was 2.5x slower than `--greedy` (+7.6 ms/token; GPU decode is only ~5 ms/token — the llama.cpp 247 vs minfer 80 tok/s gap was mostly sampler CPU time, see "Decode bottleneck is the CPU sampler, not the GPU" 2026-08-06). Fix: top_k → `select_nth_unstable_by` (O(n)); top_p → softmax+sort only the ≤k survivors; temp → skip masked logits; main.rs drops the 607 KB logits copy. Byte-identical fixed-seed output; default decode ~12.6-14.8 → ~5.5-6.5 ms/token (~2×, 512 tokens 6.9 → 3.5 s) |
-| 6 | **Q4_K_M matmul dequant inner loop (~90 GB/s → bandwidth-bound)** | perf (GPU) | Corrected model (2026-08-06): full 5.4 ms = matmuls ~3.1 ms (dequant-compute-bound at ~90 GB/s; the 278 MB sweep floor is ~1.2-1.4 ms) + attn 0.7 + small ~0.5 + base ~0.7. Phase 1 (fused bias+RoPE+store 7→1) SHIPPED — only ~0.27 ms (~2-3 µs/kernel), so the "launch-overhead / aggressive fusion" plan was wrong. Next: vectorize the Q5_0/Q6_K/Q4_K/Q5_K/Q8_0/Q5_1 f32-multi dequant (like the Q4_0 interleaved-ushort kernel) → ~1.7 ms → ~3.5 ms/token ≈ llama. See "Decode Gap (revised 2026-08-06)" |
+| 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Dequant vectorization has diminishing returns (~1 ms to the floor is structural nt==1 launch/latency). ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
 | 7 | ~~**Fused bias+RoPE+KV-store (7 → 1 kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06** (Phase 1): `kernel_attn_bias_rope_store` replaces add_bias×3 + rope×2 + store_kv×2 for nt==1 decode; f32+f16 KV caches; gated on biases+even-hd; `MINFER_NO_FUSE_BSR=1` fallback. Byte-identical A/B (both caches). ~0.27 ms/token (~5 %) — proved tiny kernels cost ~2-3 µs, i.e. the launch-overhead model was wrong and the real bottleneck is the matmul dequant inner loop (row 6) |

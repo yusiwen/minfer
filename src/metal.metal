@@ -170,6 +170,9 @@ inline float block_q5_0_dot_y(device const uchar * block, float sumy, thread flo
     return d * (sumy * -16.0f + acc0 + acc1 + acc2 + acc3);
 }
 
+// Q5_0 × f32 matrix multiplication — vectorized dot (ushort nibble + qh bits),
+// mirroring kernel_q5_1_f32_matmul using block_q5_0_dot_y (defined above).
+
 kernel void kernel_q5_0_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
@@ -181,42 +184,50 @@ kernel void kernel_q5_0_f32_matmul(
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const short NW  = 32;
-    const int nb  = p[1] / 32;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
     const int t   = (int)tgpig.y;
     if (t >= p[2]) return;
 
-    const int q5s = nb * 22;
-    device const float * y = acts + t * p[1];
+    const int q5s = nb * Q5B;
+    device const uchar * ax0 = weights + (r0 + 0) * q5s;
+    device const uchar * ax1 = weights + (r0 + 1) * q5s;
+    device const uchar * ax2 = weights + (r0 + 2) * q5s;
+    device const uchar * ax3 = weights + (r0 + 3) * q5s;
+    device const float  * y  = acts + t * p[1];
 
-    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const short ix = (short)tiisg / (NW_Q / NQ_Q);
+    const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
 
-    for (int b = tiisg; b < nb; b += NW) {
-        device const uchar * xb = weights + r0 * q5s + b * 22;
-        for (int row = 0; row < NR0; row++) {
-            if (r0 + row >= p[0]) break;
-            device const uchar * blk = xb + row * q5s;
-            float d = float(*(device const half *)blk);
-            uint32_t qhb = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) | ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
-            device const uchar * qs = blk + 6;
+    float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
+    float yl[16];
+    device const float * yb = y + ix * QK + il;
 
-            float dot = 0.0f;
-            for (int j = 0; j < 16; j++) {
-                int x0 = ((qs[j] & 0x0F) | (int)(((qhb >> j) & 1) << 4)) - 16;
-                int x1 = (((qs[j] >> 4) & 0x0F) | (int)(((qhb >> (j + 16)) & 1) << 4)) - 16;
-                dot += d * (float)x0 * y[b * 32 + j]
-                    + d * (float)x1 * y[b * 32 + j + 16];
-            }
-            sumf[row] += dot;
+    for (int ib = ix; ib < nb; ib += NQ_Q) {
+        float sumy0 = 0.0f, sumy1 = 0.0f;
+        for (short i = 0; i < 8; i += 2) {
+            sumy0 += yb[i + 0] + yb[i + 1];
+            yl[i + 0] = yb[i + 0];
+            yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+            sumy1 += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
         }
+        float sy = sumy0 + sumy1;
+        if (r0 + 0 < p[0]) sumf0 += block_q5_0_dot_y(ax0 + ib * Q5B, sy, yl, il);
+        if (r0 + 1 < p[0]) sumf1 += block_q5_0_dot_y(ax1 + ib * Q5B, sy, yl, il);
+        if (r0 + 2 < p[0]) sumf2 += block_q5_0_dot_y(ax2 + ib * Q5B, sy, yl, il);
+        if (r0 + 3 < p[0]) sumf3 += block_q5_0_dot_y(ax3 + ib * Q5B, sy, yl, il);
+        yb += QK * NQ_Q;
     }
 
-    for (int row = 0; row < NR0; row++) {
-        if (r0 + row < p[0]) {
-            float total = simd_sum(sumf[row]);
-            if (tiisg == 0) output[t * p[0] + r0 + row] = total;
-        }
+    sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+    sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
+    if (tiisg == 0) {
+        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+        if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+        if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
     }
 }
 
@@ -231,40 +242,49 @@ kernel void kernel_q5_0_f32_matmul_multi(
 ) {
     const short NR0 = 4;
     const short NSG = 2;
-    const short NW  = 32;
-    const int nb  = p[1] / 32;
+    const int nb  = p[1] / QK;
     const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
-    const int q5s = nb * 22;
+
+    const int q5s = nb * Q5B;
+    const short ix = (short)tiisg / (NW_Q / NQ_Q);
+    const short il = ((short)tiisg % (NW_Q / NQ_Q)) * 8;
 
     for (int t = 0; t < p[2]; t++) {
-        device const float * y = acts + t * p[1];
-        float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        device const uchar * ax0 = weights + (r0 + 0) * q5s;
+        device const uchar * ax1 = weights + (r0 + 1) * q5s;
+        device const uchar * ax2 = weights + (r0 + 2) * q5s;
+        device const uchar * ax3 = weights + (r0 + 3) * q5s;
+        device const float  * y  = acts + t * p[1];
 
-        for (int b = tiisg; b < nb; b += NW) {
-            device const uchar * xb = weights + r0 * q5s + b * 22;
-            for (int row = 0; row < NR0; row++) {
-                if (r0 + row >= p[0]) break;
-                device const uchar * blk = xb + row * q5s;
-                float d = float(*(device const half *)blk);
-                uint32_t qhb = (uint32_t)blk[2] | ((uint32_t)blk[3] << 8) | ((uint32_t)blk[4] << 16) | ((uint32_t)blk[5] << 24);
-                device const uchar * qq = blk + 6;
+        float sumf0 = 0.0f, sumf1 = 0.0f, sumf2 = 0.0f, sumf3 = 0.0f;
+        float yl[16];
+        device const float * yb = y + ix * QK + il;
 
-                float dot = 0.0f;
-                for (int j = 0; j < 16; j++) {
-                    int x0 = ((qq[j] & 0x0F) | (int)(((qhb >> j) & 1) << 4)) - 16;
-                    int x1 = (((qq[j] >> 4) & 0x0F) | (int)(((qhb >> (j + 16)) & 1) << 4)) - 16;
-                    dot += d * (float)x0 * y[b * 32 + j]
-                        + d * (float)x1 * y[b * 32 + j + 16];
-                }
-                sumf[row] += dot;
+        for (int ib = ix; ib < nb; ib += NQ_Q) {
+            float sumy0 = 0.0f, sumy1 = 0.0f;
+            for (short i = 0; i < 8; i += 2) {
+                sumy0 += yb[i + 0] + yb[i + 1];
+                yl[i + 0] = yb[i + 0];
+                yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+                sumy1 += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+                yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
             }
+            float sy = sumy0 + sumy1;
+            if (r0 + 0 < p[0]) sumf0 += block_q5_0_dot_y(ax0 + ib * Q5B, sy, yl, il);
+            if (r0 + 1 < p[0]) sumf1 += block_q5_0_dot_y(ax1 + ib * Q5B, sy, yl, il);
+            if (r0 + 2 < p[0]) sumf2 += block_q5_0_dot_y(ax2 + ib * Q5B, sy, yl, il);
+            if (r0 + 3 < p[0]) sumf3 += block_q5_0_dot_y(ax3 + ib * Q5B, sy, yl, il);
+            yb += QK * NQ_Q;
         }
 
-        for (int row = 0; row < NR0; row++) {
-            if (r0 + row < p[0]) {
-                float total = simd_sum(sumf[row]);
-                if (tiisg == 0) output[t * p[0] + r0 + row] = total;
-            }
+        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
+        sumf2 = simd_sum(sumf2); sumf3 = simd_sum(sumf3);
+        if (tiisg == 0) {
+            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
+            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+            if (r0 + 2 < p[0]) output[t * p[0] + r0 + 2] = sumf2;
+            if (r0 + 3 < p[0]) output[t * p[0] + r0 + 3] = sumf3;
         }
     }
 }
