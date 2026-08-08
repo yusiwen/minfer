@@ -1764,3 +1764,24 @@ impl MpsState {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: the Metal shader program (metal.metal) is compiled at
+    /// RUNTIME by `try_new` — `cargo build` does NOT catch shader errors. A
+    /// duplicate/missing kernel or a Metal compile error makes `MpsState::init`
+    /// fall back to CPU silently, which looks like a "GPU throttling" slowdown
+    /// (2026-08-06: the Q5_0 `block_q5_0_dot_y` redefine bug did exactly this).
+    /// This test compiles every pipeline and fails if MPS is unavailable.
+    #[test]
+    fn metal_pipelines_compile() {
+        MpsState::init();
+        assert!(
+            MpsState::get().is_some(),
+            "MPS unavailable — Metal shader compilation failed (check src/metal.metal for \
+             duplicate/missing kernel definitions); the model would run on CPU"
+        );
+    }
+}
