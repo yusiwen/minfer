@@ -77,6 +77,12 @@ pub fn forward(
             // MINFER_TIMING=1: split forward() into encode (cb creation → submit)
             // vs GPU-exec+download (submit → after download). Debug tool only.
             let fwd_timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");
+            // MINFER_SPLIT_CB=N (decode only): submit every ceil(24/N) layers into a
+            // separate command buffer (llama-style multi-cb). Debug/tuning only — the
+            // A1 test regressed; re-verified 2026-08-06 with the corrected methodology.
+            let split_cb = std::env::var("MINFER_SPLIT_CB").ok()
+                .and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 2);
+            let layers_per_cb = split_cb.map(|n| (model.n_layer() + n - 1) / n);
             let enc_t0 = std::time::Instant::now();
             let mut gpu_failed = false;
             for il in 0..model.n_layer() {
@@ -85,6 +91,12 @@ pub fn forward(
                     gpu_failed = true;
                     cpu_start_layer = il;
                     break;
+                }
+                if let Some(lpc) = layers_per_cb {
+                    if (il + 1) % lpc == 0 && il + 1 < model.n_layer() {
+                        cb.submit().expect("MPS: split-cb submit error");
+                        cb = mps.cmd_buffer();
+                    }
                 }
                 #[cfg(feature = "debug_dump")]
                 {

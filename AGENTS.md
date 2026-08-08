@@ -330,8 +330,18 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > into CPU-encode 0.13 ms + **GPU 4.3-4.6 ms** + download 0.08 ms + sampling 0.43 ms —
 > the gap is 100 % GPU execution (per-dispatch 10.3 µs vs llama 6.2 µs), and the
 > CPU-side "pack setBytes / parallel encode" ideas are ~worthless (encode is only
-> 0.13 ms). No hidden matmul lever exists; the remaining GPU gap is structural
-> per-dispatch efficiency + llama's fused flash attention.
+> 0.13 ms). No hidden matmul kernel lever exists. **#5 (2026-08-06)**: "structural"
+> is an INFERENCE, not a proven architecture gap — VERIFIED: matmul kernel source
+> is line-for-line identical, dispatch count comparable (~436 vs ~490-530),
+> per-dispatch GPU time differs. **#6 (2026-08-06) — hypotheses CLOSED**:
+> (1) dispatch params DISPROVEN — llama's N_R0/N_SG (Q5_0=4/2, Q8_0=2/4,
+> Q6_K=2/2, Q4_K=2/2 + the Q8_0 special grid) match minfer exactly; (2) attention
+> NOT the main lever — llama `-fa on` vs off = 3.64 vs 3.88 ms (~0.25 ms);
+> (3) multi-cb NOT a lever — llama's multi-cb hides CPU encode (minfer encode is
+> 0.13 ms), `MINFER_SPLIT_CB=N` re-test regresses linearly (0.67 → 0.93/1.23/1.62 s).
+> Conclusion: the ~1 ms GPU gap is the per-kernel execution of ~436 serial kernels
+> in one cb (small ops f32 vs llama f16 + MPS serialization) — genuine structural
+> difference, not micro-optimizable.
 > Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each

@@ -598,9 +598,47 @@ per-token wall-clock:
 per-dispatch 10.3 µs vs 6.2 µs, with identical matmul kernels + comparable
 dispatch count). The CPU-side hypotheses are DEAD: the per-dispatch encode is
 ~0.3 µs (0.13 ms total — "pack setBytes / parallel encode" is ~worthless), and
-the sampler fix already cut sampling to 0.43 ms. The remaining GPU gap is
-structural per-dispatch efficiency + llama's fused flash attention, with no
-single fixable kernel difference.
+the sampler fix already cut sampling to 0.43 ms.
+
+### What "structural" means — verified vs inferred (2026-08-06 #5)
+
+"Structural" is an **inference, not a proven architectural inferiority**. What is
+strictly VERIFIED:
+
+1. The matmul kernel **source** is line-for-line identical (nt==1
+   `mul_vec_q_n_f32_impl` / `block_q*_dot_y` translations).
+2. Dispatch **count** is comparable (~436 vs ~490-530).
+3. Per-dispatch GPU time differs (10.3 µs vs 6.2 µs).
+
+Hypotheses tested and CLOSED (2026-08-06 #6, follow-up executed):
+
+1. **Dispatch parameters — DISPROVEN.** llama's `mul_mv` (nt==1) pipeline config
+   (`ggml-metal-impl.h` N_R0/N_SG) for Q5_0 = 4/2, Q8_0 = 2/4, Q6_K = 2/2,
+   Q4_K = 2/2, plus the Q8_0 special grid (ne01/nr0, simdgroups cooperate) — ALL
+   match minfer's `quant_matmul_f32_on_gpu_buf` exactly. Same kernel source +
+   same dispatch config ⇒ the matmuls execute identically.
+2. **Attention is NOT the main lever.** llama `-fa on` vs `-fa off`: 3.64 vs
+   3.88 ms/token → flash attention saves llama only ~0.25 ms, and even with
+   flash OFF llama (3.88 ms) is far faster than minfer (5.16 ms). Fusing
+   minfer's split-attention combine is worth at most ~0.2-0.4 ms.
+3. **Multi-command-buffer — NOT a lever.** llama's multi-cb
+   (`ggml_metal_graph_compute`: n_main + n_cb threads) exists to HIDE CPU
+   encoding under GPU execution — irrelevant to minfer (encode is 0.13 ms), and
+   there is no cross-cb GPU overlap (same queue). `MINFER_SPLIT_CB=N` re-test
+   (corrected methodology, MPS-asserted) REGRESSES linearly: single 0.67 s /
+   split2 0.93 / split4 1.23 / split8 1.62 s (-n 128 greedy) — each extra cb
+   adds ~0.13-0.25 s of submit+sync.
+
+### Where the GPU gap actually is (conclusion)
+
+With kernel source AND dispatch params matching llama, and multi-cb/attention
+ruled out as the main cause, the ~1 ms GPU gap is in the per-kernel GPU
+execution efficiency of the ~436 serial kernels in ONE command buffer. The
+remaining candidate is the small elementwise/norm kernels (minfer is f32
+everywhere; llama may process intermediates as f16, halving their traffic) and
+the fundamental MPS serialization of a single large cb — a genuine structural
+difference, not a micro-optimizable one. `MINFER_SPLIT_CB` is kept as an
+env-gated debug tool (default off).
 
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
@@ -870,3 +908,4 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 5 | ~~**CPU sampler: top_k/top_p full-vocab sort**~~ | ~~perf (CPU)~~ | **SHIPPED 2026-08-06**: default sampling was 2.5x slower than `--greedy` (+7.6 ms/token; GPU decode is only ~5 ms/token — the llama.cpp 247 vs minfer 80 tok/s gap was mostly sampler CPU time, see "Decode bottleneck is the CPU sampler, not the GPU" 2026-08-06). Fix: top_k → `select_nth_unstable_by` (O(n)); top_p → softmax+sort only the ≤k survivors; temp → skip masked logits; main.rs drops the 607 KB logits copy. Byte-identical fixed-seed output; default decode ~12.6-14.8 → ~5.5-6.5 ms/token (~2×, 512 tokens 6.9 → 3.5 s) |
 | 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Bandwidth decomposition (2026-08-06 #1): output ~220 GB/s (bandwidth-bound), small-od matmuls ~60-116 (structural small-grid, no fixable lever); the earlier "Q5_0 is 5× slower" was a cold-start artifact. ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
 | 7 | ~~**Fused bias+RoPE+KV-store (7 → 1 kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06** (Phase 1): `kernel_attn_bias_rope_store` replaces add_bias×3 + rope×2 + store_kv×2 for nt==1 decode; f32+f16 KV caches; gated on biases+even-hd; `MINFER_NO_FUSE_BSR=1` fallback. Byte-identical A/B (both caches). ~0.27 ms/token (~5 %) — proved tiny kernels cost ~2-3 µs, i.e. the launch-overhead model was wrong and the real bottleneck is the matmul dequant inner loop (row 6) |
+| 8 | ~~**Truly locate the GPU gap**~~ | ~~perf (GPU)~~ | **CLOSED 2026-08-06 #6**: fair A/B (#4): llama 3.51 vs minfer 5.16 ms/token (1.47×); MINFER_TIMING: gap is 100 % GPU. Follow-up executed — (1) dispatch params DISPROVEN (llama N_R0/N_SG for Q5_0/Q8_0/Q6_K/Q4_K all match minfer), (2) attention ~0.25 ms only (llama `-fa on` 3.64 vs off 3.88 ms; even non-flash llama beats minfer), (3) multi-cb regresses (`MINFER_SPLIT_CB=N`: 0.67 → 0.93/1.23/1.62 s; llama's multi-cb is CPU-encode hiding). Conclusion: the ~1 ms GPU gap is per-kernel execution of ~436 serial kernels in one cb (small ops f32 vs llama f16 + MPS serialization) — genuine structural difference, not micro-optimizable. See "Decode Gap (revised 2026-08-06)" #6 |
