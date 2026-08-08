@@ -640,6 +640,63 @@ the fundamental MPS serialization of a single large cb — a genuine structural
 difference, not a micro-optimizable one. `MINFER_SPLIT_CB` is kept as an
 env-gated debug tool (default off).
 
+### Architecture-level optimization plan (2026-08-06 #7)
+
+Since matmul kernel source AND dispatch params match llama exactly, the matmul
+portion (~3 ms) is at llama's level; the ~1 ms gap is concentrated in the
+**non-matmul kernels** (attention ~0.7 ms + small elementwise ~0.5 ms +
+overhead). The per-dispatch "10.3 µs" is only an average — the real per-kernel
+GPU distribution is unknown. The plan is measurement-driven (per this session's
+lessons — every inference so far has been wrong without a real measurement):
+
+**Step 0 (required): real per-kernel GPU timeline via `xctrace`.**
+`xctrace record --template 'Metal System Trace' --launch ./target/release/minfer …`
+for BOTH minfer and llama (same workload), then `xctrace export` to parse each
+kernel's actual GPU time. This decides which lever matters (attention-dominated?
+small-op-dominated? uniform launch overhead?). It also settles whether minfer's
+subtractive "matmul-only 3.05 ms" overestimates the real matmul cost.
+
+**Step 1 — candidate architecture-level changes (pick per the trace):**
+
+| Lever | If the trace shows… | Change | Trade-off / risk |
+|---|---|---|---|
+| **1. Fused single-kernel flash attention** | attention partial/combine dominate non-matmul time | Port llama's `kernel_flash_attn_ext_blk` (ONE kernel/layer with KV-parallel tiles, f16 KV, simdgroup-optimized) replacing minfer's partial+combine (2→1 kernel/层, −24 kernels) | Keeps the KV-parallel structure the split was built for (no long-context regression). Moderate-high risk (new kernel + isolation). ~0.2-0.4 ms |
+| **2. Faithful non-blocking multi-cb** | uniform per-kernel launch/serialization overhead | Split decode into N cbs, commit ALL without waiting (llama's pattern), wait once. The 2026-08-06 `MINFER_SPLIT_CB` test was BLOCKING (each submit waits) — NOT a faithful test | Low risk to test. Uncertain (sequential dependency → GPU still runs cbs in order) |
+| **3. f16 intermediate activations** | small-op traffic dominates | Halve elementwise/attention tile traffic (f16 buffers + kernels) | Weak prior: llama's graph activations are ALSO f32 (only K/V → f16). Huge rewrite |
+| **4. Accept the architecture floor** | uniform MPS serialization, no dominant component | Document ~68 % (1.47×) as minfer's Metal decode level | — |
+
+**Step 2: implement + verify** per the established methodology (byte-identical
+A/B, `scripts/bench.sh` MPS assertion, isolation tests).
+
+**Honest expectation:** uncertain 0.2-1.0 ms; Step 0's trace converts the
+"structural" inference into per-kernel fact before committing to a rewrite.
+
+### Step 0 result (2026-08-06) — per-category GPU decomposition
+
+**Reliable per-category GPU times** (`MINFER_TIMING` gpu(submit-wait) +
+`DecodeSkips`, greedy, min of runs, -n 64):
+
+| Category | ms/token | % |
+|---|---|---|
+| matmuls | **2.99** | 72 % |
+| attention | 0.54 | 13 % |
+| small elementwise | 0.52 | 12 % |
+| **full GPU** | **4.18** | |
+
+**matmuls (2.99 ms, 72 %) are identical to llama** (kernel source + dispatch
+params verified) — the ~1 ms gap vs llama is in the **non-matmul kernels**
+(attention 0.54 + small 0.52 = 1.06 ms vs llama's ~0.5 ms) plus kernel
+serialization. This REFINES the target: attention fusion and small-op
+efficiency, not the matmuls.
+
+**xctrace limitation (recorded honestly):** the `Metal System Trace` template's
+CLI export does NOT expose full per-kernel durations — `metal-gpu-execution-points`
+underestimates kernel time (~0.28 ms/token vs the real 4.18 ms) and the shader
+profiler intervals were not captured. The aggregate GPU-work for the same
+workload was comparable (minfer 24.1 ms vs llama 24.0 ms total), consistent with
+"same GPU work, gap is launch/idle/serialization", but per-kernel precision is
+not obtainable from the CLI alone (needs the Xcode GUI on the .trace).
+
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
@@ -909,3 +966,4 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Bandwidth decomposition (2026-08-06 #1): output ~220 GB/s (bandwidth-bound), small-od matmuls ~60-116 (structural small-grid, no fixable lever); the earlier "Q5_0 is 5× slower" was a cold-start artifact. ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
 | 7 | ~~**Fused bias+RoPE+KV-store (7 → 1 kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06** (Phase 1): `kernel_attn_bias_rope_store` replaces add_bias×3 + rope×2 + store_kv×2 for nt==1 decode; f32+f16 KV caches; gated on biases+even-hd; `MINFER_NO_FUSE_BSR=1` fallback. Byte-identical A/B (both caches). ~0.27 ms/token (~5 %) — proved tiny kernels cost ~2-3 µs, i.e. the launch-overhead model was wrong and the real bottleneck is the matmul dequant inner loop (row 6) |
 | 8 | ~~**Truly locate the GPU gap**~~ | ~~perf (GPU)~~ | **CLOSED 2026-08-06 #6**: fair A/B (#4): llama 3.51 vs minfer 5.16 ms/token (1.47×); MINFER_TIMING: gap is 100 % GPU. Follow-up executed — (1) dispatch params DISPROVEN (llama N_R0/N_SG for Q5_0/Q8_0/Q6_K/Q4_K all match minfer), (2) attention ~0.25 ms only (llama `-fa on` 3.64 vs off 3.88 ms; even non-flash llama beats minfer), (3) multi-cb regresses (`MINFER_SPLIT_CB=N`: 0.67 → 0.93/1.23/1.62 s; llama's multi-cb is CPU-encode hiding). Conclusion: the ~1 ms GPU gap is per-kernel execution of ~436 serial kernels in one cb (small ops f32 vs llama f16 + MPS serialization) — genuine structural difference, not micro-optimizable. See "Decode Gap (revised 2026-08-06)" #6 |
+| 9 | **Architecture-level GPU gap plan (xctrace → fused flash / multi-cb / f16)** | perf (GPU) | Plan #7 (2026-08-06): matmul source+params match llama ⇒ gap is non-matmul kernels (attention 0.7 + small 0.5 + overhead). Step 0: `xctrace` per-kernel GPU timeline for minfer AND llama (decides the lever). Step 1 candidates: (1) port llama `kernel_flash_attn_ext_blk` (single fused flash, KV-parallel, −24 kernels, ~0.2-0.4 ms), (2) faithful non-blocking multi-cb (previous test was blocking), (3) f16 intermediates (weak prior), (4) accept. Step 2: implement+verify. See "Decode Gap (revised 2026-08-06)" #7 |

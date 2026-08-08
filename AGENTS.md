@@ -341,7 +341,18 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > 0.13 ms), `MINFER_SPLIT_CB=N` re-test regresses linearly (0.67 → 0.93/1.23/1.62 s).
 > Conclusion: the ~1 ms GPU gap is the per-kernel execution of ~436 serial kernels
 > in one cb (small ops f32 vs llama f16 + MPS serialization) — genuine structural
-> difference, not micro-optimizable.
+> difference, not micro-optimizable. **#7 (2026-08-06) architecture plan**: matmul
+> source+params match llama ⇒ gap is non-matmul kernels. Step 0 (done): clean
+> per-category GPU decomposition (`MINFER_TIMING`+DecodeSkips, greedy) = matmul
+> **2.99 ms (72 %)** + attention 0.54 + small 0.52 = 4.18 ms GPU/token — matmuls
+> identical to llama, so the lever is attention fusion + small-op efficiency.
+> xctrace limitation: the Metal System Trace CLI export doesn't give per-kernel
+> durations (execution-points underestimate; shader profiler not captured) —
+> aggregate GPU-work comparable (24.1 vs 24.0 ms), per-kernel needs the Xcode GUI.
+> Step 1 candidates: port llama `kernel_flash_attn_ext_blk` (single fused flash,
+> KV-parallel, −24 kernels), faithful non-blocking multi-cb (the MINFER_SPLIT_CB
+> test was BLOCKING submits — not a faithful llama test), f16 intermediates (weak
+> prior), or accept. See METAL_OPTIMIZATIONS.md "Decode Gap (revised 2026-08-06)" #7.
 > Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
