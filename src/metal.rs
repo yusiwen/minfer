@@ -1783,4 +1783,92 @@ mod tests {
              duplicate/missing kernel definitions); the model would run on CPU"
         );
     }
+
+    /// Batched-cb bandwidth profile of each nt==1 matmul kernel (decode path).
+    /// Dispatches the SAME matmul N times in one command buffer (per the
+    /// 2026-08-03 methodology: a single dispatch is dominated by the ~165 µs
+    /// cb launch+sync floor — batch dozens before trusting a per-matmul time),
+    /// then reports GB/s of weight reads. Goal (2026-08-06 #1): find whether any
+    /// specific matmul (output/QKV/O/GU/down) is far below the ~200 GB/s floor.
+    #[test]
+    fn matmul_bandwidth_profile() {
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active for the bandwidth profile");
+        let dev = &mps.inner.device;
+
+        // (label, ttype, od, id, batches) — Qwen2.5-0.5B Q4_K_M decode dims.
+        let cases: &[(&str, TensorType, usize, usize, usize)] = &[
+            ("QKV  q5_0 (od=1152,id=896)",  TensorType::Q5_0, 1152,   896, 400),
+            ("O    q5_0 (od=896, id=896)",  TensorType::Q5_0,  896,   896, 400),
+            ("GU   q5_0 (od=9728,id=896)",  TensorType::Q5_0, 9728,   896, 100),
+            ("down q6_K (od=896, id=4864)", TensorType::Q6_K,  896,  4864, 200),
+            ("out  q8_0 (od=151936,id=896)", TensorType::Q8_0, 151936, 896, 6),
+            // Q4_0 kernel (the "fast interleaved-ushort" one) at the SAME small
+            // dims — isolates whether the low GB/s is the kernel or the small-od structure.
+            ("QKV  q4_0 (od=1152,id=896)",  TensorType::Q4_0, 1152,   896, 400),
+            ("GU   q4_0 (od=9728,id=896)",  TensorType::Q4_0, 9728,   896, 100),
+            ("out  q4_0 (od=151936,id=896)", TensorType::Q4_0, 151936, 896, 6),
+            // Q5_1 shares Q5_0's qh (variable-shift) handling + an m term.
+            ("QKV  q5_1 (od=1152,id=896)",  TensorType::Q5_1, 1152,   896, 400),
+        ];
+
+        println!("\n=== nt==1 matmul bandwidth profile (batched cb, M4 Pro) ===");
+        // Warm up the first pipeline (Q4_0) so the first measured case isn't a cold start.
+        {
+            let wb = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
+            let acts = dev.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+            let out = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
+            let cb = mps.cmd_buffer();
+            for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, TensorType::Q4_0, &acts, &acts, &out, 2048, 128, 1); }
+            cb.submit().expect("warmup");
+        }
+        for &(label, ttype, od, id, n) in cases {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let nblocks = (id + bq - 1) / bq;
+            let wbytes = nblocks * bb * od;
+            let wb = dev.new_buffer(wbytes as u64, metal::MTLResourceOptions::StorageModeShared);
+            // Deterministic fill: d bytes 0x3333 (finite half), data nibbles 3.
+            unsafe { std::slice::from_raw_parts_mut(wb.contents() as *mut u8, wbytes).fill(0x33); }
+            let acts = dev.new_buffer((id * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = acts.contents() as *mut f32;
+                for i in 0..id { *p.add(i) = 0.5; }
+            }
+            let out = dev.new_buffer((od * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+
+            // Warm this kernel with a discard batch (GPU clock/pipeline ramp-up —
+            // the first measurement of a kernel is up to ~4x slow otherwise).
+            {
+                let cb = mps.cmd_buffer();
+                for _ in 0..(n / 2).max(16) { cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, &out, od, id, 1); }
+                cb.submit().expect("warmup");
+            }
+
+            // Measure TWICE; report the second (warm) value — even after the
+            // warmup batch the very first timed cb can still be slow.
+            let mut warm_gbs = 0.0f64;
+            for rep in 0..2 {
+                let cb = mps.cmd_buffer();
+                for _ in 0..n {
+                    cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, &out, od, id, 1);
+                }
+                let t0 = std::time::Instant::now();
+                cb.submit().expect("submit");
+                let dt = t0.elapsed().as_secs_f64();
+                warm_gbs = wbytes as f64 * n as f64 / dt / 1e9;
+                if rep == 0 {
+                    println!(
+                        "  {label:<26} (cold run {rep}: {:>5.0} GB/s) — warming…",
+                        warm_gbs
+                    );
+                }
+            }
+            println!(
+                "  {label:<26} {:>7.1} MB  x{n:>3} = {:>6.0} MB  {:>5.0} GB/s  (warm)",
+                wbytes as f64 / 1e6, wbytes as f64 * n as f64 / 1e6, warm_gbs
+            );
+        }
+        println!("=== end profile ===");
+    }
 }

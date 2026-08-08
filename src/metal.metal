@@ -170,9 +170,6 @@ inline float block_q5_0_dot_y(device const uchar * block, float sumy, thread flo
     return d * (sumy * -16.0f + acc0 + acc1 + acc2 + acc3);
 }
 
-// Q5_0 × f32 matrix multiplication — vectorized dot (ushort nibble + qh bits),
-// mirroring kernel_q5_1_f32_matmul using block_q5_0_dot_y (defined above).
-
 kernel void kernel_q5_0_f32_matmul(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],

@@ -74,6 +74,10 @@ pub fn forward(
             }
             mps.upload_positions(positions);
             let mut cb = mps.cmd_buffer();
+            // MINFER_TIMING=1: split forward() into encode (cb creation → submit)
+            // vs GPU-exec+download (submit → after download). Debug tool only.
+            let fwd_timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");
+            let enc_t0 = std::time::Instant::now();
             let mut gpu_failed = false;
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
@@ -114,14 +118,22 @@ pub fn forward(
                     model.output_b.as_ref(),
                     ne, nv, nt, eps,
                 );
+                let enc_submit_t0 = std::time::Instant::now();
                 if let Err(e) = cb.submit() {
                     eprintln!("MPS: GPU submit error: {e}");
                     std::process::exit(1);
                 }
+                let submit_dur = if fwd_timing { Some(enc_submit_t0.elapsed().as_secs_f64()) } else { None };
+                let enc_dur = if fwd_timing { Some(enc_submit_t0.duration_since(enc_t0).as_secs_f64()) } else { None };
                 if gpu_output {
                     let mut logits = vec![0.0f32; nt * nv];
                     mps.download_logits(&mut logits);
                     mps.sync_kv_to_cpu(kv_cache, model.n_layer());
+
+                    if let (Some(e), Some(s)) = (enc_dur, submit_dur) {
+                        eprintln!("[MINFER_TIMING]  forward: encode {:>5.2} ms | gpu(submit-wait) {:>5.2} ms | download {:>5.2} ms",
+                            e * 1e3, s * 1e3, (enc_t0.elapsed().as_secs_f64() - e - s) * 1e3);
+                    }
 
                     #[cfg(feature = "debug_dump")]
                     {

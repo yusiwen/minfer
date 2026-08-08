@@ -466,7 +466,7 @@ the 5 failing `avx2::test_q4k_dot_*` are the unrelated pre-existing x86 bug).
 Residual sampled-vs-greedy gap (~0.5-1.5 ms/token, noisy under GPU-state
 variance) is the remaining ~0.5-1 ms CPU sampling serialized in the loop.
 
-## Decode Gap (revised 2026-08-06): matmul dequant inner loop, NOT launch overhead
+## Decode Gap (revised 2026-08-06): matmuls at ~130 GB/s — structural for nt==1
 
 **Precise gap location** (Q4_K_M 0.5B, greedy decode, avg KV≈160, M4 Pro).
 Subtractive profile via `MINFER_SKIP_ATTN/MATMULS/SMALL=1` env gates
@@ -532,6 +532,22 @@ by more dequant micro-opts.
 > tok/s in `--health`) before trusting any timing — the CPU-fallback signature is
 > ~7 tok/s vs the healthy ~500+ tok/s prefill.
 
+### Matmul bandwidth decomposition (2026-08-06 #1) — no per-matmul lever found
+
+`metal.rs::tests::matmul_bandwidth_profile` batches the SAME nt==1 matmul dozens
+of times in one command buffer and reports GB/s. **Warm results** (Qwen2.5-0.5B
+dims): output q8_0 **~200-230 GB/s (bandwidth-bound ✓)**, GU ~170-250, QKV/O/down
+~60-116. Small-od matmuls are ~2× below the floor — structural (small grids
+can't saturate DRAM), NOT a fixable single kernel. Q5_0 is only ~1.3× slower
+than Q4_0/Q5_1 at equal dims (the 5-bit format costs more ALU), so there is no
+"slow quant" to optimize.
+> **Measurement trap (2026-08-06)**: the FIRST timed run of each kernel was
+> initially read as "Q5_0 is 5× slower than Q4_0" — a **cold-start/GPU-clock-ramp
+> artifact** (the same kernel measured later: 23 → 107 GB/s). The test now warms
+> each kernel and measures twice, reporting the warm value. Batched-cb numbers
+> still vary ~2× run-to-run (60 vs 107 GB/s for the same kernel) — treat them as
+> relative, never absolute.
+
 ### Corrected matmul GB/s and the residual plan
 
 The actual matmul weight sweep is **~392 MB/token** (Q5_0 173 + Q8_0 146 + Q6_K
@@ -545,6 +561,46 @@ low-value options: Q6_K/Q4_K vectorization (~0.1-0.2 ms combined, same class as
 Q5_0), per-kernel encode optimization (pack setBytes, ~0.1-0.2 ms CPU-side),
 small-kernel fusions (residual+norm, swiglu epilogue — ~0.07-0.25 ms each).
 Realistic decode ceiling with all of them: ~4.8-5.0 ms/token vs llama's ~4.05.
+
+### llama.cpp per-op comparison (2026-08-06 #3) — no hidden matmul lever
+
+This llama.cpp version (88b47a755) removed the old `ggml_perf` per-op table;
+`--perf`/`-v` only exposes the aggregate graph stats. What IS verifiable:
+- llama's Qwen2 decode graph = **822 nodes** (≈490-530 actual Metal dispatches after
+  ~300 view/permute no-ops) — comparable to minfer's ~436.
+- **Flash Attention is enabled** — llama runs ONE fused flash-attn kernel per
+  layer; minfer's split attention is 2 kernels (partial + combine).
+- llama eval ≈ 3.66 ms/token on this run.
+- The common-quant matmul kernels (`kernel_q5_0_*`, `kernel_q8_0_*`, the
+  `block_q*_dot_y` functions) are **line-for-line llama translations** — there is
+  no faster llama matmul kernel to copy. (The newer `kernel_mul_mv_ext_*` kernels
+  are selected only for nt=2-8 small batches, NOT single-token decode.)
+
+### Fair A/B + wall-clock decomposition (2026-08-06 #4) — the gap is 100 % GPU
+
+Same-session interleaved A/B (llama `-v --single-turn --perf` `predicted_per_token_ms`
+vs minfer generation-only, -n 128, default sampling, 6 rounds, medians):
+**llama 3.51 ms/token vs minfer 5.16 ms/token = 1.47× (minfer ~68 %)**. The earlier
+"80-85 %" was a flawed cross-session comparison (minfer greedy GPU-only vs llama
+full-sampling); the user's cross-session 1.9× included GPU-state noise.
+
+`MINFER_TIMING=1` (added to main.rs/forward.rs, env-gated) decomposes minfer's
+per-token wall-clock:
+
+| Component | ms/token |
+|---|---|
+| CPU encode (all ~436 dispatches) | **0.13** |
+| **GPU execution (submit-wait)** | **~4.3-4.6** |
+| logits download (607 KB) | 0.08 |
+| CPU sampling (default) | 0.43 |
+
+**The entire gap vs llama is GPU execution** (minfer ~4.5 ms vs llama ~3.1 ms =
+per-dispatch 10.3 µs vs 6.2 µs, with identical matmul kernels + comparable
+dispatch count). The CPU-side hypotheses are DEAD: the per-dispatch encode is
+~0.3 µs (0.13 ms total — "pack setBytes / parallel encode" is ~worthless), and
+the sampler fix already cut sampling to 0.43 ms. The remaining GPU gap is
+structural per-dispatch efficiency + llama's fused flash attention, with no
+single fixable kernel difference.
 
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
@@ -812,5 +868,5 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 3 | **Q4_K AVX2 CPU dot-product fix** | correctness (x86) | 5 failing `test_q4k_dot_*` bin tests (diff 39-167) — the AVX2 Q4_K dequant/dot is wrong; dormant on ARM (scalar path used), affects x86-64 CPU users. Cannot reproduce/verify on ARM — needs static analysis vs the `kernel.rs`/`avx2.rs` scalar reference, then cross-check the portable path |
 | ~~4~~ | ~~Q4_1 GEMM~~ | ~~completeness~~ | **SHIPPED 2026-08-03**: `kernel_q4_1_mm_f32` (20 B/32-elem, `dequant_q4_1_16` d*q+m) — every quant type now has a simdgroup GEMM; verified in `non_q4_0_gemm_isolation` (8 GEMMs) |
 | 5 | ~~**CPU sampler: top_k/top_p full-vocab sort**~~ | ~~perf (CPU)~~ | **SHIPPED 2026-08-06**: default sampling was 2.5x slower than `--greedy` (+7.6 ms/token; GPU decode is only ~5 ms/token — the llama.cpp 247 vs minfer 80 tok/s gap was mostly sampler CPU time, see "Decode bottleneck is the CPU sampler, not the GPU" 2026-08-06). Fix: top_k → `select_nth_unstable_by` (O(n)); top_p → softmax+sort only the ≤k survivors; temp → skip masked logits; main.rs drops the 607 KB logits copy. Byte-identical fixed-seed output; default decode ~12.6-14.8 → ~5.5-6.5 ms/token (~2×, 512 tokens 6.9 → 3.5 s) |
-| 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Dequant vectorization has diminishing returns (~1 ms to the floor is structural nt==1 launch/latency). ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
+| 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Bandwidth decomposition (2026-08-06 #1): output ~220 GB/s (bandwidth-bound), small-od matmuls ~60-116 (structural small-grid, no fixable lever); the earlier "Q5_0 is 5× slower" was a cold-start artifact. ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
 | 7 | ~~**Fused bias+RoPE+KV-store (7 → 1 kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06** (Phase 1): `kernel_attn_bias_rope_store` replaces add_bias×3 + rope×2 + store_kv×2 for nt==1 decode; f32+f16 KV caches; gated on biases+even-hd; `MINFER_NO_FUSE_BSR=1` fallback. Byte-identical A/B (both caches). ~0.27 ms/token (~5 %) — proved tiny kernels cost ~2-3 µs, i.e. the launch-overhead model was wrong and the real bottleneck is the matmul dequant inner loop (row 6) |

@@ -331,11 +331,19 @@ fn main() {
     let mut prev_tokens: Vec<u32> = input_ids.iter().copied().rev().take(REPEAT_LAST_N).collect();
     prev_tokens.reverse();
 
+    // MINFER_TIMING=1: decompose the per-token wall-clock into CPU sampling vs
+    // forward() (CPU encode + GPU exec + logits download). Debug tool only.
+    let timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");
+    let (mut t_samp, mut t_fwd, mut n_tok) = (0.0f64, 0.0f64, 0usize);
+    let (mut t0, mut t1) = (std::time::Instant::now(), std::time::Instant::now());
+
     while generated.len() < params.n_predict {
+        t0 = std::time::Instant::now();
         let sampled = sampler::sample(
             &mut logits, params.temp, params.top_k, params.top_p,
             params.repeat_penalty, &prev_tokens, &mut rng,
         );
+        if timing { t_samp += t0.elapsed().as_secs_f64(); }
 
         if is_stop_token(sampled.token_id, &special) { break; }
         generated.push(sampled.token_id);
@@ -348,8 +356,16 @@ fn main() {
 
         // forward() returns nt*nv logits; for single-token decode that's exactly
         // n_vocab, so move the Vec in place instead of copying 607 KB/token.
+        t1 = std::time::Instant::now();
         logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache);
+        if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
+    }
+
+    if timing {
+        eprintln!("\n[MINFER_TIMING] over {n_tok} tokens: sample {:>6.2} ms/tok ({:>4.1}%), forward {:>6.2} ms/tok ({:>4.1}%)",
+            t_samp / n_tok as f64 * 1e3, 100.0 * t_samp / (t_samp + t_fwd),
+            t_fwd / n_tok as f64 * 1e3, 100.0 * t_fwd / (t_samp + t_fwd));
     }
 
     println!();

@@ -321,6 +321,17 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > (nt==1 small-grid launch/latency + occupancy), and dequant vectorization has
 > diminishing returns. Remaining low-value opts (Q6_K/Q4_K vectorization, encode
 > opt, small fusions) → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05.
+> **llama per-op comparison (2026-08-06 #3)**: this llama version has no per-op
+> timing (ggml_perf removed); graph = 822 nodes (~490-530 dispatches, comparable
+> to minfer's ~436), Flash Attention fused, and the matmul kernels are line-for-
+> line llama translations — so llama's advantage is NOT faster matmuls. **Fair
+> A/B + decomposition (2026-08-06 #4)**: same-session interleaved → llama 3.51 vs
+> minfer 5.16 ms/token (1.47×, ~68 %); `MINFER_TIMING=1` splits minfer's wall-clock
+> into CPU-encode 0.13 ms + **GPU 4.3-4.6 ms** + download 0.08 ms + sampling 0.43 ms —
+> the gap is 100 % GPU execution (per-dispatch 10.3 µs vs llama 6.2 µs), and the
+> CPU-side "pack setBytes / parallel encode" ideas are ~worthless (encode is only
+> 0.13 ms). No hidden matmul lever exists; the remaining GPU gap is structural
+> per-dispatch efficiency + llama's fused flash attention.
 > Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
@@ -339,6 +350,11 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > Benchmark decode only after a passing `--health`. Beware: sustained GPU
 > benchmarking thermally throttles the M4 Pro (extreme case: everything ~1.3 s
 > regardless of config) — interleave configs, take min/median, use few runs.
+> Also: **batched-cb per-kernel timing has a cold-start/GPU-clock-ramp artifact**
+> (the first timed kernel measured ~4× slow; same kernel later: 23 → 107 GB/s) —
+> always warm each kernel and measure twice, and treat isolated kernel GB/s as
+> relative, never absolute (`metal.rs::tests::matmul_bandwidth_profile` does
+> this).
 
 > **GPU nondeterminism was a state artifact** (2026-08-03): during heavy
 > crash/abort testing (Metal encoder asserts, timeout kills) the GPU entered a
