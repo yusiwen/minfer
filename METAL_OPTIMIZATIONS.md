@@ -697,6 +697,90 @@ workload was comparable (minfer 24.1 ms vs llama 24.0 ms total), consistent with
 "same GPU work, gap is launch/idle/serialization", but per-kernel precision is
 not obtainable from the CLI alone (needs the Xcode GUI on the .trace).
 
+### Step 1 result (2026-08-06) — naive fused attention confirmed SLOWER
+
+Before committing to the llama `kernel_flash_attn_ext_impl` port, the naive
+"1 kernel/层" alternative was measured (minfer already has the classic
+single-pass `kernel_gqa_attn_f32` via `MINFER_NO_SPLIT_ATTN=1`):
+
+| Attention design | GPU/token (min, short KV) |
+|---|---|
+| split (partial+combine, 2 kernels/层) | **4.15 ms** |
+| classic single-pass (1 kernel/层) | 4.80 ms (+0.65 ms) |
+
+**Conclusion: the split-attention design (2026-08-03) is correct — a naive
+1-kernel fusion is SLOWER.** llama's fused flash attention is fast because of its
+`simdgroup_matrix` design and function constants, NOT because it is one kernel.
+The only way to get a fast 1-kernel attention is a faithful port of
+`kernel_flash_attn_ext_impl` (~600 lines, simdgroup matrices, per-shape function
+constants) — a multi-day, high-risk effort for an expected ~0.3 ms (out of the
+~1.4 ms gap). **Net assessment: no low-risk path remains to close the GPU gap in
+this architecture; the remaining candidates (full flash port, f16 small ops) are
+high-effort with modest/uncertain return.**
+
+### Step 1 — Phase A validation gate result (2026-08-06): flash port is a dead-end
+
+The full llama `kernel_flash_attn_ext_vec` port was gated on a Phase A experiment
+(per the session's measure-first discipline). Verified:
+1. **f16 KV does NOT help attention** — `MINFER_CACHE_TYPE=f16` attention GPU
+   0.54 ms vs f32 0.52 ms (the existing `kernel_gqa_attn_partial_f16`; the f16
+   cache is the core of llama's flash advantage, but minfer's 0.5B attention is
+   not KV-read-bound — consistent with the 2026-08-03 f16 wall-clock finding).
+2. **Chunk tuning is already optimal** — adaptive (`nkv/16`) gives 0.51 ms;
+   chunks=8 is 0.52 ms, over-parallelizing regresses badly (chunks=32 → 1.1 ms,
+   chunks=64 → 1.9 ms).
+3. **Attention scales sub-linearly with KV** (0.51 → 0.56 ms for KV 163 → 291) —
+   not KV-bandwidth-bound, so halving KV bytes (f16) and even the float4/stride
+   structure have little headroom.
+4. minfer's split attention already uses float4 acc + adaptive chunks +
+   KV-parallel two-pass (structurally what llama's vec kernel does).
+
+**Phase A verdict: STOP the flash port.** llama's decode flash is faster because
+of its overall Metal backend maturity (f16 KV as the DEFAULT, simdgroup-heavy
+prefill, multi-cb scheduling), not because the decode attention kernel alone is
+transformative for this model. minfer's split attention is at its design limit
+(~0.5 ms, 13 % of the 4.2 ms GPU).
+
+### Final gap report (2026-08-06) — where the GPU gap actually is
+
+**Verified chain:**
+1. Same-session interleaved A/B (-n 128, default sampling, 6 rounds, medians):
+   llama wall **3.78 ms** vs minfer wall **5.23 ms** (1.38×).
+2. minfer's pure GPU (`MINFER_TIMING` submit-wait) is **4.19 ms — LARGER than
+   llama's TOTAL per-token wall** (3.78 ms). Even with zero CPU overhead llama's
+   GPU must be < 3.78 ms < minfer's 4.19 ms → **the gap is 100 % GPU-side**, and
+   it is confirmed stronger than the "CPU+GPU" framing (minfer's GPU alone beats
+   llama's entire decode).
+3. minfer GPU is FLAT across KV (4.13-4.19 ms at -n 32/64/128/256); llama wall is
+   also flat (~3.3-3.9 ms) — neither is attention-bound at these lengths.
+
+**matmuls are NOT the gap:** kernel source + dispatch params identical, both
+~130 GB/s over the 392 MB sweep (~3.0 ms). With llama's matmuls also ~3.0 ms,
+its non-matmul GPU budget is ≤0.78 ms (consistent with flash attention ~0.25 +
+~0.5 small/serialization).
+
+**Gap decomposition (minfer GPU 4.19 vs llama GPU ≈ 3.4-3.5 inferred):**
+
+| Component | minfer | llama | gap |
+|---|---|---|---|
+| matmuls | 2.99 | ~3.0 (identical) | ~0 |
+| attention | 0.54 | ~0.25 (`-fa` measured) | **~0.3 ms** |
+| small elementwise | 0.52 | ~0.2-0.3 (est.) | **~0.25 ms** |
+| per-kernel serialization / measurement variance | — | — | **~0.2 ms** |
+
+**Honest uncertainty:** llama's GPU is inferred (wall 3.78 − est. sampling ~0.3),
+not directly measured (this llama version removed `ggml_perf`; the Metal System
+Trace CLI export cannot give per-kernel durations). minfer's subtractive
+matmul-only (2.99) may overestimate slightly. The small-op llama side is an
+estimate.
+
+**Bottom line:** the ~0.7-0.8 ms gap is 100 % GPU, NOT in the matmuls (identical),
+and distributed across attention (~0.3 ms, split vs fused flash), small
+elementwise (~0.25 ms, minfer's f32 structure), and per-kernel serialization
+(~0.2 ms). This reconciles the session's 7 closed hypotheses: no single fixable
+component exists — minfer's Metal decode is at this architecture's practical
+limit.
+
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 

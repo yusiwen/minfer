@@ -349,10 +349,25 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > xctrace limitation: the Metal System Trace CLI export doesn't give per-kernel
 > durations (execution-points underestimate; shader profiler not captured) —
 > aggregate GPU-work comparable (24.1 vs 24.0 ms), per-kernel needs the Xcode GUI.
-> Step 1 candidates: port llama `kernel_flash_attn_ext_blk` (single fused flash,
-> KV-parallel, −24 kernels), faithful non-blocking multi-cb (the MINFER_SPLIT_CB
-> test was BLOCKING submits — not a faithful llama test), f16 intermediates (weak
-> prior), or accept. See METAL_OPTIMIZATIONS.md "Decode Gap (revised 2026-08-06)" #7.
+> **Step 1 result (2026-08-06)**: naive 1-kernel/层 attention (classic
+> `kernel_gqa_attn_f32`, `MINFER_NO_SPLIT_ATTN=1`) is SLOWER than split — 4.80 vs
+> 4.15 ms GPU/token — confirming the split design is right; llama's flash is fast
+> because of simdgroup_matrix, not "one kernel". Only a faithful
+> `kernel_flash_attn_ext_impl` port (~600 lines, function constants) could give a
+> fast 1-kernel attention, at multi-day/high-risk cost for ~0.3 ms. Net: no
+> low-risk path remains to close the GPU gap in this architecture.
+> **Phase A gate (2026-08-06) — flash port STOPPED**: f16 KV attention 0.54 vs
+> 0.52 ms (f16 is the core of llama's flash advantage but minfer 0.5B attention
+> isn't KV-read-bound), chunk tuning already optimal (adaptive 0.51 ms), attention
+> scales sub-linearly with KV. minfer's split attention is at its design limit
+> (~0.5 ms, 13 % of the 4.2 ms GPU); the llama flash port is a dead-end for this
+> model. **Final gap report (2026-08-06)**: minfer pure GPU **4.19 ms > llama's
+> TOTAL wall 3.78 ms** (same-session A/B) → the gap is 100 % GPU (even stronger
+> than the CPU+GPU framing). matmuls identical (both ~3.0 ms @ 130 GB/s) → NOT
+> the gap. The ~0.7-0.8 ms gap = attention ~0.3 (split 0.54 vs flash 0.25) +
+> small ~0.25 (minfer f32 vs llama est.) + per-kernel serialization ~0.2. llama
+> GPU is inferred (no per-op timing); no single fixable component — minfer's
+> Metal decode is at this architecture's practical limit.
 > Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
