@@ -663,15 +663,17 @@ mod tests {
                 let dl = d * sv; let ml = dmin * mv;
                 let q8blk = &q8b[s * Q8B..];
                 let d_q8 = block::fp16_to_f32(u16::from_le_bytes([q8blk[0], q8blk[1]]));
-                let q4_sub = &q4b[16 + s * 16..];
-                for j in 0..16usize {
-                    let lo = (q4_sub[j] & 0x0F) as f32;
-                    let hi = (q4_sub[j] >> 4) as f32;
-                    let y_lo = d_q8 * q8blk[2 + j] as i8 as f32;
-                    let y_hi = d_q8 * q8blk[2 + j + 16] as i8 as f32;
-                    let w_lo = dl * lo - ml;
-                    let w_hi = dl * hi - ml;
-                    sum += w_lo * y_lo + w_hi * y_hi;
+                // Correct llama Q4_K layout: qs is 4 chunks of 32 bytes; chunk c
+                // covers subblocks 2c and 2c+1 — byte l → sub 2c elem l (lo nibble),
+                // sub 2c+1 elem l (hi nibble). (The old 16-bytes-per-subblock
+                // layout was WRONG and made this reference diverge from the
+                // implementation, which already deinterleaves correctly.)
+                let chunk = &q4b[16 + (s / 2) * 32..16 + (s / 2) * 32 + 32];
+                for j in 0..32usize {
+                    let a_val = if s % 2 == 0 { (chunk[j] & 0x0F) as f32 } else { (chunk[j] >> 4) as f32 };
+                    let y = d_q8 * q8blk[2 + j] as i8 as f32;
+                    let w = dl * a_val - ml;
+                    sum += w * y;
                 }
             }
         }
@@ -848,13 +850,14 @@ mod tests {
             // Dequantize 256 weights to f32
             let mut w = [0.0f32; 256];
             for s in 0..8 {
-                let qs = &q4b[16 + s * 16..];
+                // Correct llama Q4_K layout: chunk s/2 (32 bytes), lo→sub 2c, hi→sub 2c+1
+                let chunk = &q4b[16 + (s / 2) * 32..16 + (s / 2) * 32 + 32];
                 let base = s * 32;
                 let dl = d * scales[s];
                 let ml = dmin * mins[s];
-                for j in 0..16 {
-                    w[base + j] = dl * (qs[j] & 0x0F) as f32 - ml;
-                    w[base + j + 16] = dl * (qs[j] >> 4) as f32 - ml;
+                for j in 0..32 {
+                    let nib = if s % 2 == 0 { chunk[j] & 0x0F } else { chunk[j] >> 4 };
+                    w[base + j] = dl * nib as f32 - ml;
                 }
             }
             

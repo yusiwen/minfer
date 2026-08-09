@@ -547,14 +547,16 @@ float2x4), `simdgroup_half8x8` inputs → `simdgroup_float8x8` accumulators.
 - **Isolation test**: `tests/gemm_isolation.rs` (macOS-only, needs GPU) checks
   determinism + correctness vs a scalar CPU reference at nt = 12/30/32/33.
 
-### Q4_K AVX2 dot product broken (x86 only — dormant on ARM)
-`avx2.rs`'s Q4_K dot has a bug: `cargo test --bin minfer` shows 5 failing
-`test_q4k_dot_*` tests (diff 39–167 vs the reference). ARM has no AVX2, so the
-CPU Q4_K path uses the scalar fallback and "works" (the shipped models are
-verified on this M4 Pro); **x86-64 CPU users would get wrong Q4_K results**.
-Cannot reproduce/verify on ARM — fix needs static analysis of the AVX2 Q4_K
-dequant/dot vs the `kernel.rs` scalar reference, then cross-check the portable
-path. Tracked in METAL_OPTIMIZATIONS.md "Follow-up Work" (#3).
+### Q4_K AVX2 dot product — RESOLVED 2026-08-06 (was a stale test reference, not a bug)
+`cargo test --bin minfer` previously showed 5 failing `test_q4k_dot_*` tests
+(diff 39–167). **Root cause: the TESTS' reference implementations used the OLD
+16-bytes-per-subblock Q4_K layout** (`reference_dot`, `independent_dot_q4k`),
+not the real llama layout. The `dot_q4_k_q8_0` implementation itself was correct
+(4-chunk deinterleave — chunk c covers subblocks 2c/2c+1, byte l → sub 2c elem l
+lo / sub 2c+1 elem l hi, verified line-for-line vs llama `dequantize_row_q4_K`),
+and there is NO AVX2 Q4_K path (scalar only). Both test references were fixed to
+the correct layout → **all 29 bin tests pass (0 failures)**. x86 CPU users were
+never affected. Full detail in the 2026-08-06 fix.
 
 ## Core Conventions
 
