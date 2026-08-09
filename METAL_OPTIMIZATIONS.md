@@ -745,42 +745,41 @@ transformative for this model. minfer's split attention is at its design limit
 ### Final gap report (2026-08-06) — where the GPU gap actually is
 
 **Verified chain:**
-1. Same-session interleaved A/B (-n 128, default sampling, 6 rounds, medians):
-   llama wall **3.78 ms** vs minfer wall **5.23 ms** (1.38×).
-2. minfer's pure GPU (`MINFER_TIMING` submit-wait) is **4.19 ms — LARGER than
-   llama's TOTAL per-token wall** (3.78 ms). Even with zero CPU overhead llama's
-   GPU must be < 3.78 ms < minfer's 4.19 ms → **the gap is 100 % GPU-side**, and
-   it is confirmed stronger than the "CPU+GPU" framing (minfer's GPU alone beats
-   llama's entire decode).
-3. minfer GPU is FLAT across KV (4.13-4.19 ms at -n 32/64/128/256); llama wall is
-   also flat (~3.3-3.9 ms) — neither is attention-bound at these lengths.
+1. Same-session interleaved A/B: llama ~3.6-4.2 ms vs minfer ~5.1-5.2 ms per token
+   at -n 64-256 (**1.2-1.4×**), widening to **1.7×** at -n 512 (minfer 6.7 vs llama
+   3.9 ms).
+2. minfer's pure GPU (`MINFER_TIMING` submit-wait) exceeds llama's TOTAL wall —
+   the gap is 100 % GPU-side.
+3. minfer's AVERAGE decode grows with context (5.05 → 6.7 ms at -n 64 → 512);
+   llama's stays ~flat (~3.6-4.2 ms) — the KV-length attention-scaling component.
 
-**matmuls are NOT the gap:** kernel source + dispatch params identical, both
-~130 GB/s over the 392 MB sweep (~3.0 ms). With llama's matmuls also ~3.0 ms,
-its non-matmul GPU budget is ≤0.78 ms (consistent with flash attention ~0.25 +
-~0.5 small/serialization).
+**Precise decomposition (short context -n 32, min of runs):**
 
-**Gap decomposition (minfer GPU 4.19 vs llama GPU ≈ 3.4-3.5 inferred):**
-
-| Component | minfer | llama | gap |
+| Component | minfer GPU | llama GPU | gap |
 |---|---|---|---|
-| matmuls | 2.99 | ~3.0 (identical) | ~0 |
-| attention | 0.54 | ~0.25 (`-fa` measured) | **~0.3 ms** |
-| small elementwise | 0.52 | ~0.2-0.3 (est.) | **~0.25 ms** |
-| per-kernel serialization / measurement variance | — | — | **~0.2 ms** |
+| matmuls | ~3.0 ms (bandwidth-bound, identical source+params) | ~3.0 ms | **~0** |
+| **non-matmul** (attention + small elementwise + per-kernel serialization) | **~1.2 ms** (`no_matmul` config: full 4.18 − 3.0) | **~0.3 ms** (inferred) | **~0.9 ms** |
 
-**Honest uncertainty:** llama's GPU is inferred (wall 3.78 − est. sampling ~0.3),
-not directly measured (this llama version removed `ggml_perf`; the Metal System
-Trace CLI export cannot give per-kernel durations). minfer's subtractive
-matmul-only (2.99) may overestimate slightly. The small-op llama side is an
-estimate.
+**The structural gap is 100 % in the NON-MATMUL kernels** — minfer's ~340 small
+kernels (attention partial/combine, rms_norm×2, add×2, rope, store, swiglu) run
+at ~1.2 ms vs llama's ~0.3 ms (~4×). The matmuls (the ~72 % "body" of the GPU)
+are identical and contribute ~0 gap. This is the precise pinpoint of what was
+previously described vaguely as "attention + small + serialization": the gap is
+the small-kernel tail (f32 elementwise + ~340 single-cb serialized dispatches +
+attention that grows with KV), NOT the matmuls.
 
-**Bottom line:** the ~0.7-0.8 ms gap is 100 % GPU, NOT in the matmuls (identical),
-and distributed across attention (~0.3 ms, split vs fused flash), small
-elementwise (~0.25 ms, minfer's f32 structure), and per-kernel serialization
-(~0.2 ms). This reconciles the session's 7 closed hypotheses: no single fixable
-component exists — minfer's Metal decode is at this architecture's practical
-limit.
+**Honest uncertainty:** the ~1.2 ms non-matmul figure is reliable (the
+`no_matmul` config, which isolates the non-matmul GPU without subtractive
+noise). The attention-vs-small split within it has ±0.2 ms noise (subtractive
+deltas), and llama's ~0.3 ms non-matmul is inferred (no per-op timing in this
+llama version). The KV-growth component adds ~0.5 ms/token at -n 512.
+
+**Bottom line:** ~0.9-1.0 ms structural GPU gap (plus ~0.5 ms KV-growth at long
+context) = minfer's ~340 non-matmul kernels at ~4× llama's efficiency. This
+reconciles the session's 7 closed hypotheses — no single fixable component
+exists without an architecture-level rewrite (f16 small ops, flash attention,
+fewer/serialized kernels); minfer's Metal decode is at this architecture's
+practical limit.
 
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)

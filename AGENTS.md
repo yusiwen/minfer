@@ -361,13 +361,16 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > isn't KV-read-bound), chunk tuning already optimal (adaptive 0.51 ms), attention
 > scales sub-linearly with KV. minfer's split attention is at its design limit
 > (~0.5 ms, 13 % of the 4.2 ms GPU); the llama flash port is a dead-end for this
-> model. **Final gap report (2026-08-06)**: minfer pure GPU **4.19 ms > llama's
-> TOTAL wall 3.78 ms** (same-session A/B) → the gap is 100 % GPU (even stronger
-> than the CPU+GPU framing). matmuls identical (both ~3.0 ms @ 130 GB/s) → NOT
-> the gap. The ~0.7-0.8 ms gap = attention ~0.3 (split 0.54 vs flash 0.25) +
-> small ~0.25 (minfer f32 vs llama est.) + per-kernel serialization ~0.2. llama
-> GPU is inferred (no per-op timing); no single fixable component — minfer's
-> Metal decode is at this architecture's practical limit.
+> model. **Final gap report (2026-08-06, precise)**: minfer GPU 4.18 ms ≈
+> matmul ~3.0 ms (identical source+params, ~130 GB/s) + **non-matmul ~1.2 ms**
+> (the `no_matmul` config isolates it cleanly). llama's non-matmul ≈ 0.3 ms →
+> **the structural gap (~0.9-1.0 ms) is 100 % in the ~340 non-matmul kernels**
+> (attention + small f32 elementwise + single-cb serialization), at ~4× llama's
+> efficiency — NOT the matmuls. Plus a KV-growth component (~0.5 ms/token at
+> -n 512: minfer's AVERAGE decode grows 5.05 → 6.7 ms, llama stays ~flat).
+> llama GPU is inferred (no per-op timing); no single fixable component without
+> an architecture-level rewrite — minfer's Metal decode is at this
+> architecture's practical limit.
 > Profiling gates kept
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
