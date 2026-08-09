@@ -184,6 +184,13 @@ pub struct DecodeSkips {
 impl DecodeSkips {
     pub fn active(nt: usize) -> Self {
         if nt != 1 {
+            // Prefill: only MINFER_SKIP_ATTN applies (used to isolate the
+            // attention cost during prompt processing — the classic prefill
+            // attention kernel is O(nt²) and the measured prefill gap vs llama
+            // grows with prompt length). matmul/small stay decode-only.
+            if std::env::var("MINFER_SKIP_ATTN").map_or(false, |v| v == "1") {
+                return DecodeSkips { attn: true, matmul: false, small: false };
+            }
             return DecodeSkips::default();
         }
         static CACHE: std::sync::OnceLock<DecodeSkips> = std::sync::OnceLock::new();
