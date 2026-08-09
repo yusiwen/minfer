@@ -320,6 +320,7 @@ fn main() {
 
     // === Generate ===
     let mut logits = last_logits;
+    let gen_start = Instant::now();   // pure-decode start (llama "Generation" caliber)
     let mut generated: Vec<u32> = Vec::new();
     let special = model.special_tokens();
     let mut current_pos = input_ids.len();
@@ -369,10 +370,17 @@ fn main() {
     }
 
     println!();
+    let gen_time = gen_start.elapsed();
     let total_time = infer_start.elapsed();
     println!("\n---");
+    // Pure-decode rate (generated tokens / decode time) — matches llama.cpp's
+    // "Generation:" caliber. The "Total:" line below keeps the previous blended
+    // caliber (prompt+generated / prefill+decode) for comparison.
     println!("Generated: {} tokens in {:.2}s ({:.1} tok/s)",
-        generated.len(), total_time.as_secs_f64(),
+        generated.len(), gen_time.as_secs_f64(),
+        generated.len() as f64 / gen_time.as_secs_f64());
+    println!("Total:     {} tokens in {:.2}s ({:.1} tok/s)",
+        input_ids.len() + generated.len(), total_time.as_secs_f64(),
         (input_ids.len() + generated.len()) as f64 / total_time.as_secs_f64());
 }
 

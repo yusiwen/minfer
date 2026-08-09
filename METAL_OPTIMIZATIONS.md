@@ -329,11 +329,12 @@ Notes on measurement:
 Measured 2026-08-01 with the `"Tell me about Transformer architecture."` prompt
 (chat template → 35 prompt tokens) and the `"hello"` prompt (→ 30 tokens).
 
-> **Metric warning**: llama.cpp's `Generation:` is **pure** decode (only
-> generation time in the denominator). minfer's `Generated:` is a **blended**
-> rate = `(prompt + generated) / total_time`, which counts prefill in the
-> denominator — the two are **not** directly comparable. All rates below are
-> pure decode / pure prefill.
+> **Metric warning (updated 2026-08-06)**: llama.cpp's `Generation:` is **pure**
+> decode (only generation time in the denominator). minfer's `Generated:` is now
+> ALSO pure decode (`generated / gen_time`) — aligned with llama.cpp; minfer's
+> `Total:` line keeps the previous **blended** rate
+> `(prompt + generated) / total_time` for comparison. All rates below are pure
+> decode / pure prefill.
 
 ### Prefill (Q4_0 vs Q4_K_M / Q5_K_M)
 
@@ -383,9 +384,9 @@ sampling**, not GPU:
 | minfer | default sampling (top_k=40/top_p=0.95/temp=0.8) | 512 | 6.64-7.31 s | ~77-93 tok/s |
 | minfer | `--greedy` (temp=0, GPU only) | 512 | 3.02 s | **~172 tok/s** |
 
-minfer's blended rate `(prompt+gen)/total` under-reports, but isolating the GPU
-decode with `--greedy` (same 512 tokens) shows the GPU is only **~5.0-5.8
-ms/token** (~180-208 tok/s) — the default sampler adds **~7.6 ms/token** on top.
+The minfer rates above are the OLD **blended** caliber (`(prompt+gen)/total`,
+pre-fix 2026-08-06); the pure-decode rate is higher — e.g. ~5.0-5.8 ms/token
+(~180-208 tok/s greedy), and the default sampler adds ~7.6 ms/token on top.
 
 ### Per-token breakdown (identical `-n 128`, avg KV≈100)
 

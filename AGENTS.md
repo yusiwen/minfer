@@ -301,10 +301,10 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > to preserve index→token mapping); top_p → softmax+sort only the ≤k survivors;
 > temp skips masked logits; main.rs moves the logits Vec instead of a 607 KB
 > copy. Default decode ~12.6-14.8 → **~5.5-6.5 ms/token** (~2×: 512 tokens
-> 6.9 → ~3.5 s, ~150-200 tok/s); fixed-seed output **byte-identical** (7 sampler
-> tests pass; the 5 avx2::test_q4k_dot_* failures are the pre-existing x86 bug).
-> Full measurements in METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU
-> sampler" (2026-08-06).
+> 6.9 → ~3.5 s; the ~150-200 tok/s figure was the OLD blended caliber — since
+> 2026-08-06 "Generated:" is pure decode like llama's "Generation:"); fixed-seed
+> output **byte-identical** (7 sampler tests pass). Full measurements in
+> METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU sampler" (2026-08-06).
 
 > **Decode gap: matmuls at ~130 GB/s (structural for nt==1), NOT launch
 > overhead, NOT dequant-compute-bound** (2026-08-06, final model): greedy decode
@@ -376,7 +376,11 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > 2026-08-06)".
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
-> shader-compile-bug was misread as a GPU throttle): (1) `metal.rs::tests::metal_pipelines_compile`
+> shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since
+> 2026-08-06 minfer's `Generated:` is **pure decode** (`generated / gen_time`,
+> aligned with llama.cpp's `Generation:`); `Total:` keeps the blended rate
+> (`prompt+gen / total_time`). Historical `Generated:` numbers (pre-fix) were
+> blended. (1) `metal.rs::tests::metal_pipelines_compile`
 > compiles every Metal pipeline at `cargo test` — `cargo build` does NOT compile
 > shaders, so a duplicate/missing kernel only fails at model load (MPS falls back
 > to CPU silently; the ~7 tok/s CPU time reads like "GPU throttling"). (2)

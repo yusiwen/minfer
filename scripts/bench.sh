@@ -35,6 +35,14 @@ trap 'rm -f "$tmp"' EXIT
 "$MINFER_BIN" "$@" >"$tmp" 2>&1
 cat "$tmp"
 
+# Dual-caliber decode summary: pure decode (llama "Generation" style) vs the
+# previous blended rate (prompt+generated / prefill+decode).
+gen=$(grep -o 'Generated: .* ([0-9.]* tok/s)' "$tmp" | grep -oE '[0-9.]+ tok/s' | head -1)
+tot=$(grep -o 'Total:     .* ([0-9.]* tok/s)' "$tmp" | grep -oE '[0-9.]+ tok/s' | head -1)
+if [ -n "$gen" ] || [ -n "$tot" ]; then
+    echo "[ Generation (llama-style): ${gen:-n/a} | Total (blended): ${tot:-n/a} ]"
+fi
+
 if [ "${MINFER_DISABLE_MPS:-}" = "1" ]; then
     exit 0
 fi
