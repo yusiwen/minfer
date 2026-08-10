@@ -772,7 +772,8 @@ attention that grows with KV), NOT the matmuls.
 `no_matmul` config, which isolates the non-matmul GPU without subtractive
 noise). The attention-vs-small split within it has ±0.2 ms noise (subtractive
 deltas), and llama's ~0.3 ms non-matmul is inferred (no per-op timing in this
-llama version). The KV-growth component adds ~0.5 ms/token at -n 512.
+llama version). The KV-growth component was partially fixed 2026-08-10 (chunk
+cap 32→16 + sync removal, ~0.2-0.25 ms/token at -n 512; see the note below).
 
 **Bottom line:** ~0.9-1.0 ms structural GPU gap (plus ~0.5 ms KV-growth at long
 context) = minfer's ~340 non-matmul kernels at ~4× llama's efficiency. This
@@ -781,6 +782,215 @@ exists without an architecture-level rewrite (f16 small ops, flash attention,
 fewer/serialized kernels); minfer's Metal decode is at this architecture's
 practical limit.
 
+### KV-growth component — partially FIXED (2026-08-10): chunk cap + sync removal
+
+The KV-growth component of the gap (minfer's avg decode grows with context,
+llama's stays flat) was found to have **two concrete, addressable causes** that
+the session's earlier analysis missed:
+
+1. **Attention chunk cap was too high.** The adaptive formula
+   `clamp((max_pos+1+15)/16, 1, 32)` drives `n_chunks` to 32 at KV≥512 — but the
+   split-attention kernel **over-parallelizes at 32 chunks** (the 2026-08-06
+   Phase A gate had already measured "chunks=32 → 1.1 ms"; the adaptive formula
+   walked every layer straight into that regime at long context). Retuned to
+   `clamp((max_pos+1+31)/32, 1, 16)`:
+   - **Decode (KV≈430, interleaved gpu submit-wait, greedy -n 512):** chunks=32
+     → ~5.0-5.7 ms/token vs chunks=6-12 → ~4.5-4.6 ms. NEW formula = 14-16 chunks.
+   - **Batched-cb isolation** (`gqa_attn_split_timing`, now covers 8/16/32):
+     nkv=2510 → 0.081 ms/layer (8/16) vs 0.108 (32); nkv=4000 → **0.089 (16)**
+     vs 0.127 (8) / 0.112 (32). So the optimum grows sub-linearly and the cap is 16.
+   - Byte-identical output at any chunk count (correctness invariant).
+2. **Per-token `sync_kv_to_cpu` on the pure-GPU success path** (`forward.rs`).
+   Every decode token copied the **entire GPU KV cache** (24 layers × nkv × nkt)
+   back to the CPU `KVCache` — O(nkv)/token, growing linearly with context.
+   The CPU KV is only read by the CPU fallback layer loop, and GPU-layer failure
+   is deterministic (weight types), so only the `gpu_failed` branch needs the
+   sync. Removed from both full-GPU-success paths. `download` component measured
+   OLD ~0.11-0.14 ms → NEW flat 0.02-0.03 ms.
+
+**Interleaved A/B at -n 512 greedy (gpu submit-wait, 3 rounds):** OLD
+4.65-4.76 ms/token → NEW 4.50-4.55 ms/token (**~0.2-0.25 ms/token**).
+Byte-identical f32 + f16, all tests pass (29 bin + 3 gemm + 3 gqa_attn).
+Remaining KV-growth beyond this is the sub-linear attention KV-read that llama's
+f16 cache + flash handle natively — see the structural-gap note above.
+
+
+## minfer vs llama.cpp: Full Metal Inference Path Comparison (2026-08-10)
+
+### Bottom line
+
+minfer and llama.cpp use **structurally almost identical** Metal inference
+paths: both are a "CPU encodes dispatches + GPU executes a single serial
+command buffer" stream with 17-20 kernels per layer, and the matmul kernel
+source + dispatch params are line-for-line identical. The per-token decode
+gap (measured minfer GPU ~4.35-4.55 ms vs llama 3.51 ms wall / GPU ~3.1-3.3 ms)
+is NOT in the path structure but in:
+
+1. **llama's higher per-kernel GPU execution efficiency** — f16 KV cache
+   (2 B/elem vs f32), a single-kernel fused flash-attn (with simdgroup
+   matrices), and ~4× faster non-matmul small kernels.
+2. **minfer's former O(nkv)/token CPU overhead, now fixed** (2026-08-10):
+   chunk cap 32→16 + removal of `sync_kv_to_cpu` on the pure-GPU success
+   paths → ~0.2-0.25 ms/token at long context.
+3. matmuls (~3.0 ms, 72 % of GPU) have **zero gap** on both sides.
+
+llama per-op timings are marked "inferred": this llama.cpp version
+(88b47a755) removed the `ggml_perf` per-op timing table and `--perf` only
+exposes graph aggregates. llama's matmul time follows from "kernel source +
+dispatch params identical to minfer"; non-matmul from "llama total wall −
+minfer's identical matmul". minfer numbers are measured (`MINFER_TIMING` +
+`MINFER_SKIP_*` subtractive + batched-cb isolation).
+
+### Whole-pipeline stage comparison (per decode token, nt==1)
+
+| Stage | minfer | llama.cpp | CPU/GPU |
+|---|---|---|---|
+| Sampling | `sampler.rs` top_k/top_p/temp/repeat-penalty (O(n) + candidate list) | `llama-sampler.cpp` candidate-list chain (partial_sort) | **CPU** |
+| Dispatch encode | `MpsCommandBuffer` set_buffer/set_params/dispatch_threadgroups ×N, single-threaded | `ggml-metal-ops.cpp` same; multi-cb threads hide encode | **CPU** |
+| GPU execution | single cb serial ~483 dispatches (Q4_K_M) | single/multi cb, ~490-530 dispatches | **GPU** |
+| Embedding | Q4_0: `kernel_get_rows_q4_0`; other types: CPU `embed_tokens` + `upload_hidden` | `ggml_get_rows` → Metal `kernel_get_rows_*` | GPU (or CPU upload) |
+| KV store | `kernel_store_kv_f32`/`_f16` (2 dispatches, fusable into BSR) | `kernel_cpy_f32_f16` ×2 (K,V) | GPU |
+| Attention | **2 kernels/layer** (`kernel_gqa_attn_partial_f32` + `_combine_f32`) | **1 kernel/layer** (`kernel_flash_attn_ext_vec`, nt<20; +1 pad if has_kvpad) | GPU |
+| Logits readback | `copy_from_gpu` 607 KB | Metal buffer read | GPU→CPU |
+
+### Per-layer kernel sequence (Q4_K_M 0.5B, nt==1)
+
+**minfer — 20/layer** (fused QKV OFF: wq=Q5_0, wk=Q5_0, wv=Q8_0 have mixed types):
+
+| # | op | Metal kernel | CPU/GPU |
+|---|---|---|---|
+| 1 | RMSNorm (attn_norm) | `kernel_rms_norm_f32` | GPU |
+| 2-4 | Wq/Wk/Wv 3×matmul | `kernel_q5_0_f32_matmul_multi` ×2 + `kernel_q8_0_f32_matmul_multi` | GPU |
+| 5-7 | 3×add_bias | `kernel_add_bias_f32` | GPU |
+| 8-9 | 2×RoPE (Q,K) | `kernel_rope_f32` | GPU |
+| 10-11 | 2×KV store | `kernel_store_kv_f32` (or f16) | GPU |
+| 12-13 | attention split: partial + combine | `kernel_gqa_attn_partial_f32` + `kernel_gqa_attn_combine_f32` | GPU |
+| 14 | Wo matmul | `kernel_q5_0_f32_matmul_multi` | GPU |
+| 15 | residual add | `kernel_add_f32` | GPU |
+| 16 | RMSNorm (ffn_norm) | `kernel_rms_norm_f32` | GPU |
+| 17 | fused gate+up matmul | `kernel_q5_0_f32_matmul_multi` (od=2·nf) | GPU |
+| 18 | SwiGLU | `kernel_swiglu_f32` (fused silu+mul) | GPU |
+| 19 | Ffn_down matmul | `kernel_q6_k_f32_matmul_multi` | GPU |
+| 20 | residual add | `kernel_add_f32` | GPU |
+
+×24 = 480 + output_norm (rms+matmul+bias = 3) = **483** (embed is a CPU upload,
+0 dispatches). **Q4_0 model** (all weights Q4_0): fused QKV + fused
+bias+RoPE+store (BSR) are active → **12/layer**, ×24 + output 3 + GPU embed 1
+= **292**.
+
+**llama.cpp — 17/layer** (flash_attn on):
+
+| # | op | Metal kernel | CPU/GPU |
+|---|---|---|---|
+| 1 | RMSNorm (attn_norm) | `kernel_rms_norm_fuse` | GPU |
+| 2-4 | Wq/Wk/Wv 3×matmul | `kernel_mul_mv_q5_0_f32` ×2 + `kernel_mul_mv_q8_0_f32` | GPU |
+| 5-6 | 2×RoPE (Q,K) | `kernel_rope_neox` | GPU |
+| 7-8 | 2×KV store (f32→f16) | `kernel_cpy_f32_f16` | GPU |
+| 9 | **flash attention (vec, 1 dispatch)** | `kernel_flash_attn_ext_vec` | GPU |
+| 10 | Wo matmul | `kernel_mul_mv_q5_0_f32` | GPU |
+| 11 | residual add | `kernel_add` | GPU |
+| 12 | RMSNorm (ffn_norm) | `kernel_rms_norm_fuse` | GPU |
+| 13-14 | gate + up matmul | `kernel_mul_mv_q5_0_f32` ×2 | GPU |
+| 15 | SwiGLU | `kernel_swiglu_f32` (fused) | GPU |
+| 16 | Ffn_down matmul | `kernel_mul_mv_q6_k_f32` | GPU |
+| 17 | residual add | `kernel_add` | GPU |
+
+×24 = 408 + output_norm (rms+matmul+bias=3) + embed (get_rows=1) ≈ 412 base;
+measured graph has 822 nodes → **~490-530 dispatches** (the delta comes from
+f16 cast/cont/reshape and other non-no-op nodes).
+
+### Per-step timing (Q4_K_M 0.5B, M4 Pro, decode nt==1)
+
+| Category | minfer GPU | llama GPU | Evidence |
+|---|---|---|---|
+| matmul (QKV/O/GU/down/output, ~97) | **~3.0 ms** (~130 GB/s) | ~3.0 ms (same source+params) | minfer measured / llama inferred |
+| attention | **0.54 ms** (split 2 kernel, float4 acc) | ~0.15-0.2 ms (flash vec 1 kernel) | minfer measured (skip-ATTN) / llama inferred |
+| small elementwise (norm/bias/rope/store/add/swiglu, ~300) | **~0.5 ms** | ~0.1-0.3 ms | minfer measured / llama inferred |
+| base infra (encode+submit+download) | encode 0.13 + download 0.02-0.03 | ~0.3-0.5 (incl. multi-cb encode) | minfer measured / llama inferred |
+| **Total** | **~4.35-4.55 ms/token GPU** | **~3.1-3.3 ms GPU / 3.51 wall** | interleaved A/B |
+
+### Where the structural gap is (consistent with the 2026-08-06 final report)
+
+- **Matmul: zero gap** — kernel source + dispatch params line-for-line
+  identical (see "Decode Gap" #6).
+- **Non-matmul ~1.2 ms = ~4× llama**: ~340 non-matmul kernels serialized in a
+  single cb, f32 elementwise, attention as 2 kernels; llama's flash-attn
+  1 kernel + f16 KV + simdgroup are more efficient.
+- **KV-growth partially fixed** (2026-08-10): ~0.2-0.25 ms/token at long
+  context; the remainder is sub-linear attention KV-read, which llama amortizes
+  natively via its f16 cache + flash.
+
+### Kernel inventory comparison
+
+| Category | minfer (metal.metal) | llama.cpp (ggml-metal.metal) |
+|---|---|---|
+| matmul (per-quant × multi) | `kernel_q4_0/q4_1/q5_0/q5_1/q8_0_f32_matmul(_multi)`, `_q4_k/q5_k/q6_k_*` | `kernel_mul_mv_qN_f32` (per quant) |
+| prefill GEMM (nt≥16) | `kernel_q4_0/q4_1/q8_0/q5_0/q5_1/q4_k/q5_k/q6_k_mm_f32` | `kernel_mul_mm_qN_f32` (simdgroup) |
+| embed | `kernel_get_rows_q4_0` | `kernel_get_rows_*` |
+| norm | `kernel_rms_norm_f32` | `kernel_rms_norm_fuse_impl` |
+| elementwise | `kernel_add_f32`/`_mul_f32`/`_silu_f32`/`_swiglu_f32`/`_add_bias_f32` | `kernel_add`/`kernel_mul`/`kernel_swiglu_f32` |
+| rope | `kernel_rope_f32` | `kernel_rope_neox` |
+| KV store | `kernel_store_kv_f32`/`_f16` | `kernel_cpy_f32_f16` |
+| attention | `kernel_gqa_attn_partial_f32`/`_f16` + `_combine_f32` (2 kernels) | `kernel_flash_attn_ext_vec` (1 kernel) |
+
+
+## Per-Kernel Non-Matmul Profile + 256-Thread RMSNorm (P0/P1, 2026-08-10)
+
+The 2026-08-06 final gap report left one measurement open: "the real per-kernel
+GPU distribution is unknown". **P0 completed it** with a batched-cb per-kernel
+profile test (`metal.rs::tests::non_matmul_bandwidth_profile`, median of 3,
+following the established batched methodology — a single dispatch is dominated
+by the ~165 µs cb launch+sync floor; batch dozens and take medians).
+
+### Per-kernel GPU time (Qwen2.5-0.5B decode dims, M4 Pro, batched, median)
+
+| Kernel | us/dispatch | Notes |
+|---|---|---|
+| **rms_norm 32t** (1 simdgroup) | **13.8** | 7× the elementwise kernels — latency-bound |
+| rms_norm 256t (8 simdgroups, P1) | **3.7** | ~3.7× faster, bit-identical |
+| add_f32 / add_bias / swiglu / rope / store_kv | ~1.6-2.3 | the 256-thread elementwise baseline |
+| attn_bias_rope_store (BSR) | 3.1 | |
+| **attention split pair** (partial+combine, nkv=430) | **44.3** | the dominant non-matmul kernel |
+| attention classic (single-pass, nkv=430) | **352** | 8× worse than split — confirms the split design |
+
+### P1: 256-thread RMSNorm SHIPPED
+
+**Finding:** the 32-thread `kernel_rms_norm_f32` (single simdgroup) costs
+~13.8 µs/dispatch — **7× the 256-thread elementwise kernels doing the same
+traffic**. A single simdgroup cannot hide DRAM latency for one 896-element row
+(896 floats = 3.5 KB read + 3.5 KB write ≈ 70 ns of bandwidth, so 13.8 µs is
+pure latency, not bandwidth). The Phase 4 "32 threads already saturate it"
+note (2026-08-06) compared a *different* kernel; it did not hold for decode.
+
+**Fix:** `kernel_rms_norm_f32_256` — faithful llama.cpp transcription of
+`kernel_rms_norm_fuse_impl`: 256-thread threadgroup (8 simdgroups), per-simdgroup
+partial sums reduced through a threadgroup buffer with two
+`threadgroup_barrier(mem_threadgroup)` calls. Dispatch: `dispatch_2d(n, 1, 32, 8)`
+(one threadgroup per row). Metal safety: the threadgroup buffer is 8 floats
+(8 simdgroups) — the kernel uses the `tiisg`/`sgitg` attribute pattern that the
+attention kernels already use successfully.
+
+**Verified** (`rms_norm_256_correctness`): maxdiff vs scalar CPU = 7.2e-7,
+32t vs 256t **maxdiff = 0.0 (bit-identical)**. End-to-end byte-identical on
+f32 AND f16 caches, Q4_K_M AND Q4_0 models.
+
+**Measured** (interleaved, -n 128/256 greedy):
+- gpu submit-wait: 32t 4.40-4.49 → 256t **4.25-4.32 ms/token** (~0.1-0.2 ms,
+  ~3-4 %)
+- wall-clock: 32t 203-207 → 256t **206-212 t/s**
+- gated by `MINFER_NO_RMS_256=1` for A/B (default = 256t).
+
+### P0 conclusion for the remaining gap
+
+- **Attention (split pair ~44 µs/layer at nkv=430) is the dominant non-matmul
+  kernel** — and the classic single-pass is 8× worse, reconfirming the split
+  design (2026-08-03) and that only a faithful flash-attn port (~600 lines,
+  simdgroup matrices) could cut it — still multi-day/high-risk for ~0.3 ms.
+- **The small elementwise tail (~300 kernels at ~2-3 µs each) is structurally
+  cheap** — it is per-dispatch latency on tiny kernels, not a fixable kernel.
+  rms_norm was the one exception (latency-bound at 32 threads) and is now fixed.
+- Remaining gap vs llama (~3.1-3.3 ms GPU) after P1: ~4.1-4.3 ms → mostly the
+  attention pair + base infra. No further low-risk lever identified.
 
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
@@ -1023,8 +1233,8 @@ context) / 3.2× (long context).
 | Priority | Item | Impact | Effort | Notes |
 |:---:|------|--------|--------|-------|
 | **P0.5** | **Fused QKV + FFN gate/up matmuls (decode)** | **~5% decode (shipped 2026-08-03)** | Medium | Wq/Wk/Wv and ffn_gate/ffn_up are row-major-concatenated at load (`concat_rows` → `blk.{i}.attn_qkv`/`ffn_gu`) when types + input dim match. nt==1 decode runs ONE matmul/group (od=nqt+2·nkt, 2·nf) into `buf_bqkv`/`buf_bgu`; rope/store/swiglu read sections via `set_buffer` byte offsets. nt==1-only + exact-length `gpu_abort` guards. Byte-identical to separate path (`MINFER_NO_FUSE_QKV=1` A/B); layout locked in `gemm_isolation.rs::qkv_row_concat_layout`. Median 200-token decode 1.63→1.55 s (~5%) at a clean GPU state (the "~24%" figure was inflated by a GPU-state artifact). **Dispatch fusions are dead-ends** (store_kv_both + residual_rms_norm verified correct but no gain) |
-| **P0.75** | **KV-parallel split attention (decode)** | **~32% decode (shipped 2026-08-03)** | High | attention was measured as the #1 decode bottleneck (~48%, grows with KV): for nt==1 `kernel_gqa_attn_f32` grids only (1, nk)=2 TGs looping the KV sequentially. New `kernel_gqa_attn_partial_f32` + `_f16` (grid (nt,nk,P), per-chunk online-softmax partials; f16 reads half K/V, converts to f32 float4 tiles) + shared `kernel_gqa_attn_combine_f32` (grid (nt,nh), merge pass, no shared mem/barriers). nt==1, both cache types. P adaptive `clamp(nkv/16,1,32)` (`MINFER_ATTN_CHUNKS`). Built in `gqa_attn_split_isolation` first (deterministic + cos 1.0 vs scalar at nkv up to 4097, f32 AND f16 variants), then A/B byte-identical to classic. Median 200-token decode 1.56→1.06 s (f32); f16 1.60→0.95 s |
-| **P0.8** | **Attention float4 acc + adaptive chunks + KV geometric growth** | **~15% more decode + long-context (shipped 2026-08-03)** | Medium | float4-vectorized acc/dot/tile-loads in the partial kernel (scalar dynamic `acc[256]` was per-thread local memory); adaptive `n_chunks=clamp(nkv/16,1,32)`; `kv_ensure_layer` grows KV buffers ×2 instead of +1 row every decode token (was O(n²) CPU encode: 0.5ms@KV140 → 4.2ms@KV2510 → now 0.13ms). ⚠️ old_v clone typo polluted the V cache (Q4_K_M garbage) — A/B didn't catch it (both paths share the corrupted KV); caught against a known-good reference. Short 200-token decode 1.06→0.88 s; long-context (KV≈2510) 10.6→8 ms/token |
+| **P0.75** | **KV-parallel split attention (decode)** | **~32% decode (shipped 2026-08-03)** | High | attention was measured as the #1 decode bottleneck (~48%, grows with KV): for nt==1 `kernel_gqa_attn_f32` grids only (1, nk)=2 TGs looping the KV sequentially. New `kernel_gqa_attn_partial_f32` + `_f16` (grid (nt,nk,P), per-chunk online-softmax partials; f16 reads half K/V, converts to f32 float4 tiles) + shared `kernel_gqa_attn_combine_f32` (grid (nt,nh), merge pass, no shared mem/barriers). nt==1, both cache types. P adaptive `clamp(nkv/32,1,16)` (`MINFER_ATTN_CHUNKS`). Built in `gqa_attn_split_isolation` first (deterministic + cos 1.0 vs scalar at nkv up to 4097, f32 AND f16 variants), then A/B byte-identical to classic. Median 200-token decode 1.56→1.06 s (f32); f16 1.60→0.95 s. **2026-08-10**: P formula retuned `/16..32` → `/32..16` (the 32-chunk cap over-parallelized long contexts — see the Decode Gap note); `sync_kv_to_cpu` dropped from the GPU-success paths (CPU KV only read on the deterministic GPU-failure fallback). Interleaved -n 512: 4.65-4.76 → 4.50-4.55 ms/token (~0.2-0.25 ms) |
+| **P0.8** | **Attention float4 acc + adaptive chunks + KV geometric growth** | **~15% more decode + long-context (shipped 2026-08-03)** | Medium | float4-vectorized acc/dot/tile-loads in the partial kernel (scalar dynamic `acc[256]` was per-thread local memory); adaptive `n_chunks=clamp(nkv/32,1,16)` (**2026-08-10: `/32..16` — the `/16..32` cap over-parallelized long context, see Decode Gap note**); `kv_ensure_layer` grows KV buffers ×2 instead of +1 row every decode token (was O(n²) CPU encode: 0.5ms@KV140 → 4.2ms@KV2510 → now 0.13ms). ⚠️ old_v clone typo polluted the V cache (Q4_K_M garbage) — A/B didn't catch it (both paths share the corrupted KV); caught against a known-good reference. Short 200-token decode 1.06→0.88 s; long-context (KV≈2510) 10.6→8 ms/token |
 | ~~P0~~ | ~~GEMM kernel: simdgroup_mm~~ | — | — | **Investigated 2026-08-01: initially 2× slower and reverted, then re-transcribed (P1) with 3 bug fixes — now SHIPPED (see "Prefill Gap" section above): ~+11 % at 30 tokens, ~+34 % at 70 tokens for nt ≥ 16** |
 | **P1** | **GEMM kernels for non‑Q4_0 quants** | **Q4_K_M ~300→~650, Q5_K_M ~330→~610, 1.5B Q4_K_M 48→442 t/s prefill (shipped 2026-08-03)** | Large | `kernel_q8_0_mm_f32`/`kernel_q5_0_mm_f32`/`kernel_q5_1_mm_f32` (32-elem blocks, drop-in Q4_0 GEMM + per-quant `dequant_*_16`) + `kernel_q4_k_mm_f32`/`kernel_q5_k_mm_f32`/`kernel_q6_k_mm_f32` (256-elem super-blocks, dequant il = (loop_k%256)/16 + il0). nt≥16 dispatch + 8 KB tg-memory guard. Faithful llama transcriptions (block_q6_K d at END; block_q5_K qh BEFORE qs). Isolation `non_q4_0_gemm_isolation` (deterministic, relerr<5e-3 vs CPU for all 6 + Q4_0) + A/B byte-identical vs MINFER_GEMM=0. 1.5B Q4_K_M (Q4_K/Q6_K weights) verified end-to-end ~9× prefill |
 | **P2** | **KV cache: F32 → F16 (implemented, opt-in)** | ~0 for 0.5B; helps larger models / long context | Small | **Implemented 2026-08-01** as `MINFER_CACHE_TYPE=f16` (default f32). `kernel_store_kv_f16` + `kernel_gqa_attn_f16`. Measured F16 is ~3% **slower** on the 0.5B model — decode is dispatch-latency-bound, not KV-bandwidth-bound (attention ≈ 5% of decode work; KV read ≈ 0.5% of ~200 GB/s bandwidth). Kept opt-in for larger models where attention bandwidth dominates |

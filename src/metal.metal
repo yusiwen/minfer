@@ -2301,6 +2301,69 @@ kernel void kernel_rms_norm_f32(
 // ─── Add bias ────────────────────────────────────────────────
 // y[t][i] += b[i]
 
+// ─── RMSNorm, multi-simdgroup (256-thread) variant ───────────
+// Faithful llama.cpp transcription (kernel_rms_norm_fuse_impl): the threadgroup
+// is 256 threads (8 simdgroups). Per-simdgroup partial sums are reduced through
+// a small threadgroup buffer with TWO threadgroup barriers. The 32-thread
+// single-simdgroup kernel above was measured at ~7x the per-dispatch cost of
+// the 256-thread elementwise kernels (P0 profile 2026-08-10) — a single simdgroup
+// cannot hide DRAM latency for one 896-element row. Dispatch nt = min(d/4, 256).
+kernel void kernel_rms_norm_f32_256(
+    device const float * x       [[buffer(0)]],
+    device const float * w       [[buffer(1)]],
+    device       float * y       [[buffer(2)]],
+    constant    int    & d       [[buffer(3)]],
+    constant    float  & eps     [[buffer(4)]],
+    threadgroup float * shmem [[threadgroup(0)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]]
+) {
+    if (sgitg == 0) {
+        shmem[tiisg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ntg = 256; // dispatched threads per threadgroup (8 simdgroups)
+    int row = tgpig.x;
+    int d4 = d / 4;
+    device const float4 * x4 = (device const float4 *)(x + row * d);
+    float ss = 0.0f;
+    for (int i = 32 * sgitg + tiisg; i < d4; i += ntg) {
+        ss += dot(x4[i], x4[i]);
+    }
+    int rem = d - d4 * 4;
+    if (tiisg == 0 && sgitg == 0) {
+        device const float * x_tail = x + row * d + d4 * 4;
+        for (int i = 0; i < rem; i++) ss += x_tail[i] * x_tail[i];
+    }
+    ss = simd_sum(ss);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ss = shmem[tiisg];
+    ss = simd_sum(ss);
+
+    float scale = 1.0f / sqrt(ss / (float)d + eps);
+
+    device float4 * y4 = (device float4 *)(y + row * d);
+    device const float4 * w4 = (device const float4 *)w;
+    for (int i = 32 * sgitg + tiisg; i < d4; i += ntg) {
+        y4[i] = x4[i] * scale * w4[i];
+    }
+    if (tiisg == 0 && sgitg == 0) {
+        device const float * x_tail = x + row * d + d4 * 4;
+        device       float * y_tail = y + row * d + d4 * 4;
+        device const float * w_tail = w + d4 * 4;
+        for (int i = 0; i < rem; i++) y_tail[i] = x_tail[i] * scale * w_tail[i];
+    }
+}
+
+
  kernel void kernel_add_bias_f32(
      device       float * y [[buffer(0)]],
      device const float * b [[buffer(1)]],

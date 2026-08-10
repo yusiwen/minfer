@@ -140,7 +140,14 @@ pub fn forward(
                 if gpu_output {
                     let mut logits = vec![0.0f32; nt * nv];
                     mps.download_logits(&mut logits);
-                    mps.sync_kv_to_cpu(kv_cache, model.n_layer());
+                    // No sync_kv_to_cpu here: the CPU KVCache is only read by the
+                    // CPU fallback layer loop below, and GPU-layer failure is
+                    // deterministic (weight types) — if all layers succeeded on
+                    // GPU, they always succeed, so the gpu_failed branch's sync
+                    // is the only one that ever needs fresh CPU KV. Skipping this
+                    // per-token copy removes an O(nkv)/token GPU→CPU drain that
+                    // grows linearly with context (the "KV-growth" decode cost
+                    // llama.cpp does not pay).
 
                     if let (Some(e), Some(s)) = (enc_dur, submit_dur) {
                         eprintln!("[MINFER_TIMING]  forward: encode {:>5.2} ms | gpu(submit-wait) {:>5.2} ms | download {:>5.2} ms",
@@ -158,7 +165,6 @@ pub fn forward(
                     return logits;
                 }
                 mps.download_hidden(&mut hidden);
-                mps.sync_kv_to_cpu(kv_cache, model.n_layer());
                 run_cpu = false;
                 cpu_start_layer = model.n_layer(); // all layers done on GPU, only output_norm on CPU
             }

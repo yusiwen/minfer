@@ -79,6 +79,13 @@ pub fn kv_cache_is_f16() -> bool {
     *F16.get_or_init(|| std::env::var("MINFER_CACHE_TYPE").map_or(false, |v| v == "f16"))
 }
 
+/// Use the 256-thread multi-simdgroup rms_norm in the decode path (P1 2026-08-10
+/// A/B gate; ON by default after it measured ~2x faster than the 32-thread kernel).
+pub fn rms_norm_256_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_NO_RMS_256").map_or(true, |v| v != "1"))
+}
+
 
 pub struct MpsState {
     #[cfg(target_os = "macos")]
@@ -121,6 +128,7 @@ struct MpsStateInner {
     pl_q5_k_mm_f32: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
+    pl_rms_norm_256: metal::ComputePipelineState,
     pl_add: metal::ComputePipelineState,
     pl_add_bias: metal::ComputePipelineState,
     pl_mul: metal::ComputePipelineState,
@@ -543,6 +551,26 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(n as u64, 1, 32, 1);
     }
 
+    /// RMSNorm with a 256-thread multi-simdgroup kernel (P1 2026-08-10, llama
+    /// transcription). Same math as rms_norm but the threadgroup is 256 threads
+    /// so a single 896-element row isn't DRAM-latency-bound (the 32-thread
+    /// kernel measured ~7x the per-dispatch cost of 256-thread elementwise ops).
+    /// Requires a threadgroup buffer of n_simdgroups floats (8 for 256 threads).
+    pub fn rms_norm_256(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
+        d: usize, n: usize, eps: f32,
+    ) {
+        self.trace_op("rms_norm");
+        self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm_256);
+        self.enc.set_buffer(0, Some(x), 0);
+        self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0);
+        self.enc.set_buffer(2, Some(y), 0);
+        self.set_params(3, &(d as i32));
+        self.set_params(4, &(eps.to_bits() as i32));
+        self.enc.set_threadgroup_memory_length(0, 8 * 4);
+        // 256 threads = 8 simdgroups; one threadgroup per row.
+        self.dispatch_2d(n as u64, 1, 32, 8);
+    }
+
     /// Element-wise add: z = x + y
     pub fn add_f32(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer, n: usize) {
         self.trace_op("add");
@@ -885,6 +913,7 @@ impl MpsState {
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
+            let pl_rms_norm_256 = get_pl("kernel_rms_norm_f32_256")?;
             let pl_add      = get_pl("kernel_add_f32")?;
             let pl_add_bias = get_pl("kernel_add_bias_f32")?;
             let pl_mul      = get_pl("kernel_mul_f32")?;
@@ -936,6 +965,7 @@ impl MpsState {
                 pl_q5_k_mm_f32,
                 pl_get_rows_q4_0,
                 pl_rms_norm,
+                pl_rms_norm_256,
                 pl_add,
                 pl_add_bias,
                 pl_mul,
@@ -1526,7 +1556,10 @@ impl MpsState {
         // stays in its EXACT original position — never reorder across gates.
         let sk = DecodeSkips::active(nt);
 
-        if !sk.small { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
+        if !sk.small {
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
+            else { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
+        }
 
         // Fused QKV projection (nt==1 decode): one matmul on the concatenated
         // Wq/Wk/Wv produces q+k+v in one buffer; the rope/store read the q/k/v
@@ -1538,11 +1571,15 @@ impl MpsState {
             && wq.ttype == wk.ttype && wk.ttype == wv.ttype
             && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
         // KV-parallel attention chunk count (decode): adaptive to the current KV
-        // length (max_pos+1) so long contexts get more parallelism; about 16 KV
-        // rows per chunk, capped at 32. MINFER_ATTN_CHUNKS overrides for tuning.
+        // length (max_pos+1) so long contexts get more parallelism. One chunk per
+        // 32 KV rows, capped at 16. (2026-08-10: the previous /16..32 formula
+        // over-parallelized — measured chunks=32 → ~5.0-5.7 ms/token at KV≈430
+        // and 0.108 ms/layer at nkv=2510 vs 0.081 for chunks=8/16, and nkv=4000
+        // is best at chunks=16 (0.089 vs 0.127@8, 0.112@32).) MINFER_ATTN_CHUNKS
+        // overrides for tuning.
         let split_chunks = std::env::var("MINFER_ATTN_CHUNKS").ok()
             .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 1)
-            .unwrap_or_else(|| ((max_pos + 1 + 15) / 16).clamp(1, 32));
+            .unwrap_or_else(|| ((max_pos + 1 + 31) / 32).clamp(1, 16));
         if use_fused_qkv {
             let buf_qkv = buf_qkv.as_ref().unwrap();
             // GPU safety: the concat buffer must exactly match the fused output
@@ -1629,7 +1666,10 @@ impl MpsState {
                 { return false; }
         }
 
-        if !sk.small { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
+        if !sk.small {
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
+            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
+        }
         // Fused FFN gate+up (nt==1 decode): one matmul on the concatenated
         // gate+up weight → bgu; swiglu reads gate at offset 0 and up at nf.
         // Same nt==1 gate + exact-buffer-length guard as the QKV fusion.
@@ -1722,7 +1762,10 @@ impl MpsState {
 
         let sk = DecodeSkips::active(nt);
 
-        if !sk.small { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
+        if !sk.small {
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
+            else { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
+        }
 
         // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
         if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt); }
@@ -1877,5 +1920,187 @@ mod tests {
             );
         }
         println!("=== end profile ===");
+    }
+
+    /// Batched-cb per-kernel GPU time profile of the NON-MATMUL decode kernels
+    /// (rms_norm, add, add_bias, swiglu, rope, store_kv, BSR, attn partial +
+    /// combine). P0 of the "per-kernel GPU distribution" plan (2026-08-10):
+    /// the final gap report says the ~1.2 ms non-matmul tail is "~340 kernels at
+    /// ~4x llama" but the per-kernel distribution was UNKNOWN (xctrace CLI can't
+    /// give per-kernel durations). This batches each kernel dozens-hundreds of
+    /// times in ONE command buffer (the 2026-08-03 methodology: single-dispatch
+    /// timing has a ~165 us cb launch+sync floor; batch to amortize), warms each
+    /// kernel, measures twice, and reports per-kernel GPU time in us.
+    #[test]
+    fn non_matmul_bandwidth_profile() {
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active");
+        let dev = &mps.inner.device;
+
+        // Qwen2.5-0.5B decode dims.
+        let (ne, nqt, nkt, nf) = (896usize, 896usize, 128usize, 4864usize);
+        let (nh, nk, hd) = (14usize, 2usize, 64usize);
+        let nkv = 430usize; // long-ish context (matches the -n 512 avg)
+
+        // Shared activation buffers (f32).
+        let x  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let y  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let bqkv = dev.new_buffer(((nqt + 2 * nkt) * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let w  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let g  = dev.new_buffer((nf * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let u  = dev.new_buffer((nf * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let bq = dev.new_buffer((nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let bk = dev.new_buffer((nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let bv = dev.new_buffer((nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let kv  = dev.new_buffer((nkv * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let pos = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        let o   = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        // finite fill (0.5) so no denormal/NaN paths skew timing
+        for b in [&x, &y, &bqkv, &w, &g, &u, &bq, &bk, &bv, &kv, &o] {
+            unsafe { std::slice::from_raw_parts_mut(b.contents() as *mut f32, (b.length() / 4) as usize).fill(0.5); }
+        }
+        unsafe { std::slice::from_raw_parts_mut(pos.contents() as *mut i32, 1)[0] = (nkv - 1) as i32; }
+
+        // (label, dispatch closure, batches) — each closure dispatches ONE kernel.
+        let cases: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
+            ("rms_norm 32t  (d=896, 1 row)",  Box::new(|cb| cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6)), 400),
+            ("rms_norm 256t (d=896, 1 row)",  Box::new(|cb| cb.rms_norm_256(&x, Some(&w), &y, ne, 1, 1e-6)), 400),
+            ("add_f32 (n=896, 256t)",        Box::new(|cb| cb.add_f32(&x, &y, &x, ne)), 400),
+            ("add_bias_f32 (d=896, 64t)",    Box::new(|cb| cb.add_bias_f32(&x, &w, ne, 1, 0)), 400),
+            ("swiglu_f32 (n=4864, 256t)",    Box::new(|cb| cb.swiglu_f32(&g, &u, &g, nf)), 400),
+            ("rope_f32 (q: 14h x 64d)",      Box::new(|cb| cb.rope_f32(&bqkv, nh, hd, 1, 1e6, 1.0, &pos, 0, 0)), 400),
+            ("store_kv (nkt=128, 1t)",       Box::new(|cb| cb.store_kv(&bk, &kv, nkt, 1, &pos, 0)), 400),
+            ("attn_bsr (q+k+v, 256t)",       Box::new(|cb| cb.attn_bias_rope_store(&bqkv, &bq, &bk, &bv, &kv, &kv, nqt, nkt, hd, 1e6, 1.0, (nkv - 1) as i32, 0)), 400),
+            // split = partial + combine as a PAIR (2 dispatches/layer, decode path)
+            ("attn split p+c (c=16)",        Box::new(|cb| cb.gqa_attn_split_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1, 16)), 100),
+        ];
+
+        println!("\n=== nt==1 non-matmul GPU profile (batched cb, M4 Pro) ===");
+        // warm the whole pipeline once
+        {
+            let cb = mps.cmd_buffer();
+            for _ in 0..50 { cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6); }
+            cb.submit().expect("warmup");
+        }
+
+        for (i, (label, dispatch, n)) in cases.iter().enumerate() {
+            // warm this kernel (pipeline/clock ramp)
+            {
+                let cb = mps.cmd_buffer();
+                for _ in 0..(n / 2).max(16) { dispatch(&cb); }
+                cb.submit().expect("warmup");
+            }
+            // median of 3 warm runs (the docs' methodology: batched-cb per-kernel
+            // numbers vary ~2x run-to-run due to GPU clock — take the median).
+            let mut us: Vec<f64> = Vec::new();
+            for _ in 0..3 {
+                let cb = mps.cmd_buffer();
+                for _ in 0..*n { dispatch(&cb); }
+                let t0 = std::time::Instant::now();
+                cb.submit().expect("submit");
+                let dt = t0.elapsed().as_secs_f64();
+                us.push(dt * 1e6 / *n as f64);
+            }
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = us[1];
+            println!("  [{i}] {label:<26} {:>7.2} us/kernel  (median, n={}, [{:.2},{:.2},{:.2}])",
+                med, n, us[0], us[1], us[2]);
+        }
+
+        // Classic single-pass attention (baseline for the split pair):
+        let cases2: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
+            ("attn classic (nkv=430)", Box::new(|cb| cb.gqa_attn_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1)), 100),
+        ];
+        for (i, (label, dispatch, n)) in cases2.iter().enumerate() {
+            {
+                let cb = mps.cmd_buffer();
+                for _ in 0..(n / 2).max(16) { dispatch(&cb); }
+                cb.submit().expect("warmup");
+            }
+            let mut us: Vec<f64> = Vec::new();
+            for _ in 0..3 {
+                let cb = mps.cmd_buffer();
+                for _ in 0..*n { dispatch(&cb); }
+                let t0 = std::time::Instant::now();
+                cb.submit().expect("submit");
+                let dt = t0.elapsed().as_secs_f64();
+                us.push(dt * 1e6 / *n as f64);
+            }
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("  [{i}] {label:<26} {:>7.2} us/kernel  (median, n={}, [{:.2},{:.2},{:.2}])",
+                us[1], n, us[0], us[1], us[2]);
+        }
+        println!("=== end non-matmul profile ===");
+    }
+
+    /// Correctness of the 256-thread multi-simdgroup rms_norm vs a scalar CPU
+    /// reference (and vs the 32-thread kernel). P1 (2026-08-10): the multi-
+    /// simdgroup reduction (shmem + 2 barriers) is the riskiest new piece —
+    /// must be byte-deterministic before it touches the decode path.
+    #[test]
+    fn rms_norm_256_correctness() {
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active");
+        let dev = &mps.inner.device;
+        let d = 896usize;
+
+        let x = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let w = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let y32 = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let y256 = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        // Deterministic input: x = sin(i), w = cos(i/7) — exercises varied magnitudes.
+        unsafe {
+            let xp = x.contents() as *mut f32;
+            let wp = w.contents() as *mut f32;
+            for i in 0..d {
+                *xp.add(i) = (i as f32 * 0.37).sin() * 3.0;
+                *wp.add(i) = (i as f32 / 7.0).cos() + 1.0;
+            }
+        }
+
+        for (label, buf, method) in [
+            ("32t", &y32, 0),
+            ("256t", &y256, 1),
+        ] {
+            let cb = mps.cmd_buffer();
+            if method == 0 { cb.rms_norm(&x, Some(&w), buf, d, 1, 1e-6); }
+            else { cb.rms_norm_256(&x, Some(&w), buf, d, 1, 1e-6); }
+            cb.submit().expect("submit");
+        }
+
+        // CPU scalar reference: scale = 1/sqrt(mean(x^2)+eps); y = x*scale*w.
+        let xs: Vec<f32> = (0..d).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let ws: Vec<f32> = (0..d).map(|i| (i as f32 / 7.0).cos() + 1.0).collect();
+        let mean: f32 = xs.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let scale = 1.0f32 / (mean + 1e-6f32).sqrt();
+        let mut ref_y = vec![0.0f32; d];
+        for i in 0..d { ref_y[i] = xs[i] * scale * ws[i]; }
+
+        for (label, buf) in [("32t", &y32), ("256t", &y256)] {
+            let mut got = vec![0.0f32; d];
+            unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, got.as_mut_ptr(), d); }
+            let mut maxd = 0.0f32;
+            let mut dot = 0.0f32;
+            let mut na = 0.0f32;
+            for i in 0..d {
+                maxd = maxd.max((got[i] - ref_y[i]).abs());
+                dot += got[i] * ref_y[i];
+                na += got[i] * got[i];
+            }
+            let cos = dot / (na.sqrt() * ref_y.iter().map(|v| v * v).sum::<f32>().sqrt());
+            println!("  rms_norm {label}: maxdiff={maxd:.3e} cos={cos:.9}");
+            assert!(cos > 0.9999, "rms_norm {label} wrong vs CPU (cos={cos})");
+            assert!(maxd < 1e-3, "rms_norm {label} maxdiff {maxd} > 1e-3");
+        }
+        // 32t vs 256t should be bit-close (same math, different reduction order).
+        let mut y32v = vec![0.0f32; d];
+        let mut y256v = vec![0.0f32; d];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y32.contents() as *const f32, y32v.as_mut_ptr(), d);
+            std::ptr::copy_nonoverlapping(y256.contents() as *const f32, y256v.as_mut_ptr(), d);
+        }
+        let maxdd: f32 = (0..d).map(|i| (y32v[i] - y256v[i]).abs()).fold(0.0, f32::max);
+        println!("  rms_norm 32t vs 256t maxdiff={maxdd:.3e}");
+        assert!(maxdd < 1e-3, "32t vs 256t diverge (maxdiff {maxdd})");
     }
 }

@@ -243,8 +243,19 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > produce mx=-INF/S=0/acc=0). Pass 2 (grid (nt, nh)) merges the partials via the
 > standard max/exp/l-sum (a pure elementwise kernel — no shared memory, no
 > barriers; guarded m==-INF→zeros). Used for nt==1 decode; n_chunks default
-> adaptive `clamp((max_pos+1+15)/16, 1, 32)` (`MINFER_ATTN_CHUNKS` overrides),
-> measured best (1 vs 2 vs 4 vs 8 vs 16). GPU-safety: built first in
+> adaptive `clamp((max_pos+1+31)/32, 1, 16)` (`MINFER_ATTN_CHUNKS` overrides).
+> **2026-08-10**: the original `/16..32` formula over-parallelized at long
+> context (decode chunks=32 → ~5.0-5.7 ms/token at KV≈430; batched isolation
+> 0.108 ms/layer at nkv=2510 vs 0.081@8/16, and nkv=4000 is best at chunks=16:
+> 0.089 vs 0.127@8 / 0.112@32). The `/32..16` formula also matches short context
+> (KV=35-128 → 2-4 chunks, flat) and is byte-identical. Also (2026-08-10)
+> `sync_kv_to_cpu` removed from the two full-GPU-success paths in `forward.rs`
+> (kept only in the `gpu_failed` branch): the CPU KVCache is only read by the CPU
+> fallback loop and GPU-layer failure is deterministic (weight types), so the
+> per-token O(nkv)/token GPU→CPU KV copy was pure drain — the "KV-growth" decode
+> cost llama does not pay. Interleaved -n 512 greedy (gpu submit-wait): OLD
+> 4.65-4.76 → NEW 4.50-4.55 ms/token (~0.2-0.25 ms, byte-identical f32+f16).
+> GPU-safety: built first in
 > `tests/gqa_attn_isolation.rs::gqa_attn_split_isolation` (deterministic + cos 1.0
 > vs the scalar reference at nkv=1/30/33/65/100/240, n_chunks=1/2/4/8, empty
 > chunks, nt=1/2), then A/B-verified byte-identical to the classic path
@@ -268,7 +279,9 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > bottleneck that parallelism didn't fix). Caught a divergent-simd_sum write bug
 > (per-lane d loop) — the reduction MUST be a uniform loop (all lanes step the
 > same d together). (2) `n_chunks` is now adaptive: `clamp((max_pos+1+15)/16,
-> 1, 32)` (more chunks for longer KV). (3) **`kv_ensure_layer` grows KV buffers
+> 1, 32)` (more chunks for longer KV) — **updated 2026-08-10 to
+> `clamp((max_pos+1+31)/32, 1, 16)`** (the 32-chunk cap over-parallelized long
+> contexts; see the split-attention note above). (3) **`kv_ensure_layer` grows KV buffers
 > GEOMETRICALLY (×2)** — it previously grew by exactly `(max_pos+1)*nkt*4`,
 > reallocating a new MTLBuffer + copying the whole old KV on EVERY decode token
 > (the CPU encode cost was O(n²) in context: 0.5 ms at KV≈140 → 4.2 ms at
@@ -377,6 +390,31 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > dispatch gated in its exact original position — the FFN down-matmul must stay
 > AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md "Decode Gap (revised
 > 2026-08-06)".
+> **minfer vs llama.cpp: full Metal inference path comparison (2026-08-10)**: the
+> comparison section in METAL_OPTIMIZATIONS.md gives both sides' per-layer decode
+> kernel sequences (minfer 20/layer Q4_K_M / 12/layer Q4_0 vs llama 17/layer
+> flash), per-category timings (matmul ~3.0 ms zero gap; non-matmul minfer
+> ~1.2 ms vs llama ~0.3 ms = 4×), and a kernel inventory table. llama per-op
+> timings are inferred (that version has no ggml_perf per-op timing); minfer
+> numbers are measured via MINFER_TIMING + skip-gate subtraction.
+
+> **Per-kernel non-matmul profile + 256-thread RMSNorm (2026-08-10, P0/P1)**:
+> `metal.rs::tests::non_matmul_bandwidth_profile` (batched-cb per-kernel timing,
+> median of 3) showed the 32-thread `kernel_rms_norm_f32` costs ~13.8 µs/dispatch
+> vs ~2.2 µs for the 256-thread elementwise kernels (add/swiglu/rope) doing the
+> same traffic — a single simdgroup cannot hide DRAM latency for one 896-element
+> row (the Phase 4 "32 threads already saturate" claim was a different-kernel
+> comparison). New `kernel_rms_norm_f32_256` (llama transcription: 256-thread
+> threadgroup, per-simdgroup partial sums reduced through a threadgroup buffer
+> with 2 barriers) is **bit-identical** (maxdiff 0.0, `rms_norm_256_correctness`
+> test) and ~3.7× faster isolated (3.7 vs 13.8 µs); integrated into the decode
+> path (all 3 rms_norm sites) gated by `MINFER_NO_RMS_256=1` for A/B. Interleaved
+> decode: gpu submit-wait ~4.25-4.32 → ~4.40-4.49 ms/token (~0.1-0.2 ms, ~3-4 %),
+> wall-clock 203-207 → 206-212 t/s. Byte-identical f32+f16, Q4_K_M+Q4_0. The same
+> profile shows the **attention split pair (partial+combine) is the dominant
+> non-matmul kernel** (~44 µs/layer at nkv=430, and the classic single-pass is
+> ~352 µs — 8× worse), confirming the split design and that flash-port remains
+> the only attention lever.
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since

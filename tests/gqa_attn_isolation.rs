@@ -269,7 +269,11 @@ fn gqa_attn_split_timing() {
     let ne_q = nh * hd;
     let cmdq = device.new_command_queue();
 
-    for &(nkv, n_chunks) in &[(140usize, 8usize), (2510usize, 32usize), (4000usize, 32usize)] {
+    for &(nkv, n_chunks) in &[
+        (140usize, 8usize),
+        (2510usize, 8usize), (2510usize, 16usize), (2510usize, 32usize),
+        (4000usize, 8usize), (4000usize, 16usize), (4000usize, 32usize),
+    ] {
         let q: Vec<f32> = (0..ne_q).map(|i| ((i as f32) * 1.7).sin() * 3.0).collect();
         let k: Vec<f32> = (0..nkv * nk * hd).map(|i| ((i as f32) * 0.9).cos() * 2.0).collect();
         let v: Vec<f32> = (0..nkv * nk * hd).map(|i| ((i as f32) * 0.4).sin() * 1.5).collect();
