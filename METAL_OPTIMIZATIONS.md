@@ -672,6 +672,46 @@ A/B, `scripts/bench.sh` MPS assertion, isolation tests).
 **Honest expectation:** uncertain 0.2-1.0 ms; Step 0's trace converts the
 "structural" inference into per-kernel fact before committing to a rewrite.
 
+### Plan update (2026-08-12) — reconcile with prefill A1/A2/C findings
+
+The 2026-08-11/12 prefill investigation (A1/A2/C, see "Parallel Prefill
+Attention" → follow-up) changed the status of the candidates above:
+
+| Original candidate | 2026-08-12 status | Reason |
+|---|---|---|
+| **Step 0 `xctrace` per-kernel** | ⚠️ **CLI method DISPROVEN** — must use the Xcode GUI | A2: `xctrace record` Metal System Trace CLI export is empty ("Shader Timeline: Disabled"); `GGML_METAL_CAPTURE_COMPUTE` needs Xcode/Instruments. Per-kernel llama durations require the Xcode GUI on the .trace — cannot be scripted from the CLI |
+| **1. Fused flash attention (decode)** | Unchanged — still the only real attention lever | The split partial+combine pair is the dominant non-matmul kernel (~44 µs/layer at nkv=430); classic single-pass is 8× worse. ~0.2-0.4 ms potential, moderate-high risk, still deferred |
+| **2. Non-blocking multi-cb** | Unchanged — weak | Decode is GPU-execution-bound (encode is only 0.13 ms/step); prior test (blocking) regressed linearly. Only a faithful non-blocking commit-all test could change the verdict — low expected value |
+| **3. f16 intermediate activations** | Weak prior — unchanged | Core convention #1: llama's Metal backend reads **f32 activations for ALL weight types** (only K/V cache → f16). Halving elementwise traffic has no llama counterpart to copy; huge rewrite for uncertain gain |
+| **4. Accept the architecture floor** | **Now the active recommendation for both decode AND prefill** | Decode is 72-88 % of llama (per-kernel structural gap, no fixable component). Prefill: attention fixed (100→30 ms / 169→57 ms), GEMM measured at ~5.4 TFLOPs/s ceiling vs llama ~7 — the ~30 % is per-kernel execution efficiency, not a kernel bug |
+
+**New candidate added from A1 (not in the 2026-08-06 list):**
+
+- **Grid-shape scheduling probe (prefill GEMM, low effort):**
+  `prefill_gemm_throughput_profile` shows the same kernel varies
+  **3.5 → 5.4 TFLOPs/s purely by grid shape** (nt=416→3.5, 448→5.1, 480→5.3,
+  512→5.2). Untested hypothesis: padding/reshaping the GEMM grid (e.g. aligning
+  the nt row-tiles) could recover part of the ~30 % prefill GEMM gap without a
+  kernel rewrite. **Counter-evidence to check first**: llama dispatches the same
+  grid (N_R0/N_SG verified identical), so if llama hits ~7 TFLOPs/s on the same
+  grid, shape alone cannot explain the gap — the difference is per-kernel
+  execution (MPS serialization), not scheduling. Cheap to probe; low expectation
+  but no downside.
+- ~~2D `simdgroup_matrix` GEMM port~~ — **dropped**: PARAMETER_AUDIT A already
+  established llama **disables the mpp/tensor (Metal 3 2D-simdgroup) GEMM on
+  M4 Pro** (pre-M5, "M4 no significant difference"), using the same 64×32
+  simdgroup kernel as minfer. Porting it cannot close a gap llama itself doesn't
+  have on this hardware.
+- ~~bf16 activation staging in the GEMM~~ — **dropped**: same Core convention #1
+  counter — llama reads f32 activations, no bf16 `sb` staging to copy.
+
+**Verdict:** no new architecture-level lever survived reconciliation. The
+post-A1 state is: attention fixed at 0.5B/7B, GEMMs at the documented ~5.4
+TFLOPs/s ceiling, decode at the per-kernel structural floor. Remaining actionable
+items are (a) the grid-shape probe above (low expectation), and (b) an Xcode GUI
+per-kernel trace if a manual profiling session is ever worthwhile. The docs'
+"architecture-level rewrite" candidates remain the only path to further gains.
+
 ### Step 0 result (2026-08-06) — per-category GPU decomposition
 
 **Reliable per-category GPU times** (`MINFER_TIMING` gpu(submit-wait) +
@@ -1392,4 +1432,4 @@ GEMMs for every quant type, GPU-safety audit fully closed (H1/H2/M1/M2 guarded).
 | 6 | ~~**Q5_0 vectorized matmul dot (last scalar kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06**: `kernel_q5_0_f32_matmul`/`_multi` now use the existing `block_q5_0_dot_y` (ushort nibble + qh-bit, llama `block_q_n_dot_y` port), matching Q5_1/Q4_0. Correct (deterministic greedy output matches known-good; f32+f16). **Measured (MPS-asserted) matmul-only 3.09 → 3.05 ms/token (~1-2 %) — the matmuls are NOT dequant-compute-bound**; real sweep is ~392 MB/token ≈ 129 GB/s (63 % of floor). Bandwidth decomposition (2026-08-06 #1): output ~220 GB/s (bandwidth-bound), small-od matmuls ~60-116 (structural small-grid, no fixable lever); the earlier "Q5_0 is 5× slower" was a cold-start artifact. ⚠️ This kernel's shader-compile failure (duplicate `block_q5_0_dot_y`) initially read as a GPU throttle — now guarded by `metal_pipelines_compile` test + `scripts/bench.sh` MPS assertion. Remaining low-value: Q6_K/Q4_K vectorization, encode opt, small fusions → realistic ceiling ~4.8-5.0 ms/token vs llama ~4.05. See "Decode Gap (revised 2026-08-06)" |
 | 7 | ~~**Fused bias+RoPE+KV-store (7 → 1 kernel)**~~ | ~~perf (GPU)~~ | **SHIPPED 2026-08-06** (Phase 1): `kernel_attn_bias_rope_store` replaces add_bias×3 + rope×2 + store_kv×2 for nt==1 decode; f32+f16 KV caches; gated on biases+even-hd; `MINFER_NO_FUSE_BSR=1` fallback. Byte-identical A/B (both caches). ~0.27 ms/token (~5 %) — proved tiny kernels cost ~2-3 µs, i.e. the launch-overhead model was wrong and the real bottleneck is the matmul dequant inner loop (row 6) |
 | 8 | ~~**Truly locate the GPU gap**~~ | ~~perf (GPU)~~ | **CLOSED 2026-08-06 #6**: fair A/B (#4): llama 3.51 vs minfer 5.16 ms/token (1.47×); MINFER_TIMING: gap is 100 % GPU. Follow-up executed — (1) dispatch params DISPROVEN (llama N_R0/N_SG for Q5_0/Q8_0/Q6_K/Q4_K all match minfer), (2) attention ~0.25 ms only (llama `-fa on` 3.64 vs off 3.88 ms; even non-flash llama beats minfer), (3) multi-cb regresses (`MINFER_SPLIT_CB=N`: 0.67 → 0.93/1.23/1.62 s; llama's multi-cb is CPU-encode hiding). Conclusion: the ~1 ms GPU gap is per-kernel execution of ~436 serial kernels in one cb (small ops f32 vs llama f16 + MPS serialization) — genuine structural difference, not micro-optimizable. See "Decode Gap (revised 2026-08-06)" #6 |
-| 9 | **Architecture-level GPU gap plan (xctrace → fused flash / multi-cb / f16)** | perf (GPU) | Plan #7 (2026-08-06): matmul source+params match llama ⇒ gap is non-matmul kernels (attention 0.7 + small 0.5 + overhead). Step 0: `xctrace` per-kernel GPU timeline for minfer AND llama (decides the lever). Step 1 candidates: (1) port llama `kernel_flash_attn_ext_blk` (single fused flash, KV-parallel, −24 kernels, ~0.2-0.4 ms), (2) faithful non-blocking multi-cb (previous test was blocking), (3) f16 intermediates (weak prior), (4) accept. Step 2: implement+verify. See "Decode Gap (revised 2026-08-06)" #7 |
+| 9 | ~~**Architecture-level GPU gap plan (xctrace → fused flash / multi-cb / f16)**~~ | ~~perf (GPU)~~ | Plan #7 (2026-08-06): matmul source+params match llama ⇒ gap is non-matmul kernels (attention 0.7 + small 0.5 + overhead). Step 0: `xctrace` per-kernel GPU timeline for minfer AND llama (decides the lever). Step 1 candidates: (1) port llama `kernel_flash_attn_ext_blk` (single fused flash, KV-parallel, −24 kernels, ~0.2-0.4 ms), (2) faithful non-blocking multi-cb (previous test was blocking), (3) f16 intermediates (weak prior), (4) accept. Step 2: implement+verify. **REVISED 2026-08-12**: Step 0's CLI method disproven (A2 — xctrace export empty, needs Xcode GUI); candidate 1 unchanged but deferred; candidates 2/3 weak; **"accept the architecture floor" is the active recommendation**; 2D-simdgroup GEMM + bf16 staging dropped (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A, reads f32 activations per Core convention #1); only remaining lever is a low-expectation grid-shape probe (see "Architecture-level optimization plan" → Plan update). See "Decode Gap (revised 2026-08-06)" #7 |

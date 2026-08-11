@@ -462,6 +462,16 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; xctrace export
 > is empty — "Shader Timeline disabled"), confirming the docs' Xcode-GUI-only
 > limitation. See METAL_OPTIMIZATIONS.md "Parallel Prefill Attention" → follow-up.
+> **Optimization-plan status (2026-08-12)**: the architecture-level plan in
+> METAL_OPTIMIZATIONS.md ("Architecture-level optimization plan" → "Plan update")
+> was reconciled — Step 0's CLI xctrace method disproven (needs Xcode GUI);
+> 2D-simdgroup GEMM + bf16 staging dropped (llama disables tensor GEMM on M4 Pro
+> per PARAMETER_AUDIT A, reads f32 activations per Core convention #1); flash
+> port unchanged but deferred; **"accept the architecture floor" is the active
+> recommendation** for both decode and prefill. Only remaining lever: a
+> low-expectation grid-shape probe (`prefill_gemm_throughput_profile`, 3.5-5.4
+> TFLOPs/s variance by nt) — counter-evidence (llama same grid, same ~7) likely
+> explains it as per-kernel execution, not scheduling.
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since
