@@ -933,6 +933,42 @@ f16 cast/cont/reshape and other non-no-op nodes).
 | KV store | `kernel_store_kv_f32`/`_f16` | `kernel_cpy_f32_f16` |
 | attention | `kernel_gqa_attn_partial_f32`/`_f16` + `_combine_f32` (2 kernels) | `kernel_flash_attn_ext_vec` (1 kernel) |
 
+### Same-model, same-parameter A/B (2026-08-11)
+
+Measured on the Apple M4 Pro with the SAME GGUF files and both backends on
+Metal/MPS. minfer: `--greedy` (pure decode, llama "Generation" caliber).
+llama.cpp: `llama-bench -b 512 -t 8` (pure eval). Both use
+`Qwen2.5-0.5B-Instruct`.
+
+**Q4_K_M** (`qwen2.5-0.5b-instruct-q4_k_m.gguf`):
+
+| Test | llama.cpp | minfer | Gap |
+|---|---|---|---|
+| prefill 30 tok | 2720 t/s | ~748 t/s | **3.6×** |
+| prefill 430 tok | 6909 t/s | ~2466 t/s | **2.8×** |
+| decode 128 tok (pure GPU) | 293-299 t/s | ~218 t/s (4.47 ms/tok steady) | **1.3-1.4×** |
+| decode, default sampling | 247 t/s | ~197 t/s | **1.25×** |
+
+**Q4_0** (`qwen2.5-0.5b-instruct-q4_0.gguf`):
+
+| Test | llama.cpp | minfer | Gap |
+|---|---|---|---|
+| prefill 30 tok | 2610 t/s | ~812 t/s | **3.2×** |
+| prefill 430 tok | 7449 t/s | ~2596 t/s | **2.9×** |
+| decode 128 tok | 314-339 t/s | ~279 t/s (3.90 ms/tok steady) | **1.1-1.2×** |
+
+**Reading:**
+- **Decode is now 72-88 % of llama** (1.1-1.4× pure GPU, 1.25× with default
+  sampling) — improved from the pre-2026-08-10 ~1.47× by rms_norm_256, the
+  chunk-cap/sync fixes, and the per-kernel non-matmul profile work.
+- **Prefill remains the main gap (2.8-3.6×).** After the 2026-08-11 parallel
+  attention (pp430 attention 100 → 30 ms), the remaining gap is the matmuls +
+  small kernels — at the documented architecture limit (matmul ~130 GB/s,
+  non-matmul ~4× llama efficiency). The only larger lever left is a faithful
+  ~600-line llama flash-attn simdgroup port, low priority for a one-time prefill.
+- Both engines show the same prefill-vs-decode pattern (long prompts are
+  GEMM-efficient in both).
+
 
 ## Per-Kernel Non-Matmul Profile + 256-Thread RMSNorm (P0/P1, 2026-08-10)
 

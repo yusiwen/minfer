@@ -397,6 +397,11 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > ~1.2 ms vs llama ~0.3 ms = 4×), and a kernel inventory table. llama per-op
 > timings are inferred (that version has no ggml_perf per-op timing); minfer
 > numbers are measured via MINFER_TIMING + skip-gate subtraction.
+> **Same-model, same-parameter A/B (2026-08-11)**: decode is now 72-88 % of
+> llama (Q4_K_M 218 vs 293-299 t/s, Q4_0 279 vs 314-339 t/s pure GPU; default
+> sampling 197 vs 247 t/s). Prefill remains 2.8-3.6× (llama 6909 vs minfer 2466
+> t/s at pp430) — now mostly matmuls + small kernels at the architecture limit,
+> not attention (see METAL_OPTIMIZATIONS.md "Same-model, same-parameter A/B").
 
 > **Per-kernel non-matmul profile + 256-thread RMSNorm (2026-08-10, P0/P1)**:
 > `metal.rs::tests::non_matmul_bandwidth_profile` (batched-cb per-kernel timing,
