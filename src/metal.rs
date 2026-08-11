@@ -86,6 +86,15 @@ pub fn rms_norm_256_enabled() -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_RMS_256").map_or(true, |v| v != "1"))
 }
 
+/// Use matmul-based prefill attention (P1 2026-08-11): broadcast+quantize the
+/// KV to Q8_0 and compute kq/kqv via the fast Q8_0 GEMM, replacing the
+/// latency-bound classic kernel for nt>1. ON by default; MINFER_NO_MATMUL_ATTN=1
+/// falls back to the classic kernel for A/B.
+pub fn matmul_attn_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_NO_MATMUL_ATTN").map_or(true, |v| v != "1"))
+}
+
 
 pub struct MpsState {
     #[cfg(target_os = "macos")]
@@ -143,6 +152,9 @@ struct MpsStateInner {
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
     pl_attn_bsr: metal::ComputePipelineState,
+    pl_attn_scores: metal::ComputePipelineState,
+    pl_attn_output: metal::ComputePipelineState,
+    pl_softmax_attn: metal::ComputePipelineState,
     weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
     // Persistent scratch buffers grown on demand; avoids per-call allocation.
     q8_buf: std::sync::Mutex<metal::Buffer>,
@@ -170,6 +182,8 @@ struct MpsStateInner {
     kv_k: std::sync::RwLock<Vec<metal::Buffer>>,
     kv_v: std::sync::RwLock<Vec<metal::Buffer>>,
     kv_size: std::sync::RwLock<Vec<usize>>,
+    // Prefill parallel-attention scratch (P1 2026-08-11): scores [nt][nh][nkv].
+    buf_attn_scores: std::sync::Mutex<metal::Buffer>,
     // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
     dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
@@ -566,7 +580,7 @@ impl MpsCommandBuffer<'_> {
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
-        self.enc.set_threadgroup_memory_length(0, 8 * 4);
+        self.enc.set_threadgroup_memory_length(0, 32 * 4);
         // 256 threads = 8 simdgroups; one threadgroup per row.
         self.dispatch_2d(n as u64, 1, 32, 8);
     }
@@ -752,6 +766,64 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nkt as u64, 1, 1);
     }
 
+    /// Prefill parallel attention (P1 2026-08-11): replaces the classic
+    /// latency-bound attention kernel for nt>1 (grid (nt,nk), sequential KV loop
+    /// with ~24K barriers at nt=430 → ~100ms, 48% of prefill, ~25x llama's).
+    /// This 3-pass replacement is fully parallel (no threadgroup barriers):
+    ///   1. scores[t][h][kv] = dot(q[t][h][0..hd], k[kv][hk*hd..]) * scale
+    ///   2. masked softmax over kv per (t,h) row
+    ///   3. out[t][h][0..hd] = Σ_kv softmax[t][h][kv] * v[kv][hk*hd..]
+    /// q: [nt][nqt], kv_k/kv_v: [nkv][nkt], out: [nt][nqt]. nkv = real KV length
+    /// (max_pos+1); the scores buffer is [nt][nh][nkv] (no padding needed — all
+    /// three kernels handle arbitrary nkv).
+    pub fn attn_parallel_prefill(&self, q: &metal::Buffer, kv_k: &metal::Buffer, kv_v: &metal::Buffer,
+        out: &metal::Buffer, positions: &metal::Buffer,
+        nkv: usize, nkt: usize, _nqt: usize, nt: usize, nh: usize,
+        hd: usize, gqa: usize, scale: f32,
+    ) {
+        self.trace_op("attn_parallel");
+        let dev = &self.state.device;
+        let scores = MpsState::get_or_grow(&self.state.buf_attn_scores,
+            (nt * nh * nkv * 4) as u64, dev);
+
+        // pass 1: scores [nt*nh][nkv] — one 256-thread TG per (t,h) row
+        self.enc.set_compute_pipeline_state(&self.state.pl_attn_scores);
+        self.enc.set_buffer(0, Some(q), 0);
+        self.enc.set_buffer(1, Some(kv_k), 0);
+        self.enc.set_buffer(2, Some(&scores), 0);
+        self.set_params(3, &(nh as i32));
+        self.set_params(4, &(hd as i32));
+        self.set_params(5, &(nkv as i32));
+        self.set_params(6, &(nt as i32));
+        self.set_params(7, &(gqa as i32));
+        self.set_params(8, &(nkt as i32));
+        self.set_params(9, &(scale.to_bits() as i32));
+        self.dispatch_2d((nt * nh) as u64, 1, 256, 1);
+
+        // pass 2: masked softmax over kv per (t,h) row
+        self.enc.set_compute_pipeline_state(&self.state.pl_softmax_attn);
+        self.enc.set_buffer(0, Some(&scores), 0);
+        self.enc.set_buffer(1, Some(positions), 0);
+        self.set_params(2, &(nkv as i32));
+        self.set_params(3, &(nt as i32));
+        self.set_params(4, &(nh as i32));
+        self.enc.set_threadgroup_memory_length(0, 32 * 4);
+        self.dispatch_2d((nt * nh) as u64, 1, 32, 8);
+
+        // pass 3: out = softmax · V — one 256-thread TG per (t,h) row
+        self.enc.set_compute_pipeline_state(&self.state.pl_attn_output);
+        self.enc.set_buffer(0, Some(&scores), 0);
+        self.enc.set_buffer(1, Some(kv_v), 0);
+        self.enc.set_buffer(2, Some(out), 0);
+        self.set_params(3, &(nh as i32));
+        self.set_params(4, &(hd as i32));
+        self.set_params(5, &(nkv as i32));
+        self.set_params(6, &(nt as i32));
+        self.set_params(7, &(gqa as i32));
+        self.set_params(8, &(nkt as i32));
+        self.dispatch_2d((nt * nh) as u64, 1, 256, 1);
+    }
+
     /// Fused bias-add + RoPE + KV-store for nt==1 decode: ONE kernel replaces
     /// add_bias×3 + rope×2 + store_kv×2 (7 dispatches). `bqkv` layout is
     /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw
@@ -928,6 +1000,9 @@ impl MpsState {
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
+            let pl_attn_scores = get_pl("kernel_attn_scores")?;
+            let pl_attn_output = get_pl("kernel_attn_output")?;
+            let pl_softmax_attn = get_pl("kernel_softmax_attn")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
             let m = MpsStateInner {
                 device: device.clone(),
@@ -980,6 +1055,9 @@ impl MpsState {
                 pl_store_kv,
                 pl_store_kv_f16,
                 pl_attn_bsr,
+                pl_attn_scores,
+                pl_attn_output,
+                pl_softmax_attn,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_buf: std::sync::Mutex::new(dummy_buf.clone()),
@@ -1003,6 +1081,7 @@ impl MpsState {
                 kv_k: std::sync::RwLock::new(Vec::new()),
                 kv_v: std::sync::RwLock::new(Vec::new()),
                 kv_size: std::sync::RwLock::new(Vec::new()),
+                buf_attn_scores: std::sync::Mutex::new(dummy_buf.clone()),
                 dispatch_trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             eprintln!("MPS: using Metal on {} (unified: {})",
@@ -1624,9 +1703,16 @@ impl MpsState {
                 }
             }
             if !sk.attn {
-                if nt == 1
-                    && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
-                    cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                if nt == 1 {
+                    if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                        cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                    } else {
+                        cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+                    }
+                } else if matmul_attn_enabled() {
+                    let nkv = max_pos + 1;
+                    cb.attn_parallel_prefill(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf,
+                        nkv, nkt, nqt, nt, nh, hd, nh / nk, attn_scale);
                 } else {
                     cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
                 }
@@ -1645,9 +1731,16 @@ impl MpsState {
                 cb.store_kv(&bv_buf, &kv_v[il], nkt, nt, &pos_buf, 0);
             }
             if !sk.attn {
-                if nt == 1
-                    && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
-                    cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                if nt == 1 {
+                    if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                        cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                    } else {
+                        cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
+                    }
+                } else if matmul_attn_enabled() {
+                    let nkv = max_pos + 1;
+                    cb.attn_parallel_prefill(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf,
+                        nkv, nkt, nqt, nt, nh, hd, nh / nk, attn_scale);
                 } else {
                     cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
                 }
@@ -2102,5 +2195,215 @@ mod tests {
         let maxdd: f32 = (0..d).map(|i| (y32v[i] - y256v[i]).abs()).fold(0.0, f32::max);
         println!("  rms_norm 32t vs 256t maxdiff={maxdd:.3e}");
         assert!(maxdd < 1e-3, "32t vs 256t diverge (maxdiff {maxdd})");
+    }
+
+
+    /// Correctness of the 3-pass parallel prefill attention vs a CPU reference
+    /// using REAL dumped layer-0 activations (q, k, v). P1.
+    #[test]
+    fn attn_parallel_realdata_correctness() {
+        use std::io::Read;
+        let dir = std::env::var("MINFER_TEST_DUMP").unwrap_or_else(|_| "/tmp/dp3".into());
+        let mut bq = Vec::new();
+        std::fs::File::open(format!("{dir}/minfer_gpu_dump_layer0_bq.f32")).unwrap().read_to_end(&mut bq).unwrap();
+        let bq: Vec<f32> = bq.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let mut bk = Vec::new();
+        std::fs::File::open(format!("{dir}/minfer_gpu_dump_layer0_bk.f32")).unwrap().read_to_end(&mut bk).unwrap();
+        let bk: Vec<f32> = bk.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let mut bv = Vec::new();
+        std::fs::File::open(format!("{dir}/minfer_gpu_dump_layer0_bv.f32")).unwrap().read_to_end(&mut bv).unwrap();
+        let bv: Vec<f32> = bv.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let (nh, nk, hd, nkt, nqt) = (14usize, 2usize, 64usize, 128usize, 896usize);
+        let nt = bq.len() / nqt;
+        let nkv = bk.len() / nkt;
+        let gqa = nh / nk;
+        let scale = 1.0 / (hd as f32).sqrt();
+        assert_eq!(nt, 35);
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS");
+        let dev = &mps.inner.device;
+        let qb = dev.new_buffer_with_data(bq.as_ptr() as *const _, (bq.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let kb = dev.new_buffer_with_data(bk.as_ptr() as *const _, (bk.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let vb = dev.new_buffer_with_data(bv.as_ptr() as *const _, (bv.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let ob = dev.new_buffer((nt*nqt*4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let pb = dev.new_buffer((nt*4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        unsafe { for t in 0..nt { (pb.contents() as *mut i32).add(t).write(t as i32); } }
+        let cb = mps.cmd_buffer();
+        cb.attn_parallel_prefill(&qb, &kb, &vb, &ob, &pb, nkv, nkt, nqt, nt, nh, hd, gqa, scale);
+        cb.submit().expect("submit");
+        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, nt*nqt) }.to_vec();
+        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, nt*nqt) }.to_vec();
+        let nan = got.iter().filter(|v| !v.is_finite()).count();
+        println!("  realdata parallel: nan={nan} of {}", nt * nqt);
+        assert!(nan == 0, "realdata parallel produced NaN");
+        // CPU reference
+        let mut ref_out = vec![0.0f32; nt*nqt];
+        let mut scrs = vec![0.0f32; nkv];
+        for h in 0..nh {
+            let hk = h / gqa;
+            for t in 0..nt {
+                let qq = t*nqt + h*hd;
+                let vl = (t+1).min(nkv);
+                let mut mx = f32::NEG_INFINITY;
+                for kv in 0..vl {
+                    let ks_ = kv*nkt + hk*hd;
+                    let s = (0..hd).map(|d| bq[qq+d]*bk[ks_+d]).sum::<f32>()*scale;
+                    scrs[kv] = s; if s > mx { mx = s; }
+                }
+                for kv in vl..nkv { scrs[kv] = f32::NEG_INFINITY; }
+                let mut sum = 0.0f32;
+                for kv in 0..nkv { scrs[kv] = if scrs[kv]==f32::NEG_INFINITY {0.0} else {(scrs[kv]-mx).exp()}; sum += scrs[kv]; }
+                for kv in 0..nkv { scrs[kv] /= sum; }
+                let oo = t*nqt + h*hd;
+                for d in 0..hd { ref_out[oo+d]=0.0; }
+                for kv in 0..nkv { for d in 0..hd { ref_out[oo+d] += scrs[kv]*bv[kv*nkt+hk*hd+d]; } }
+            }
+        }
+        let maxerr = (0..nt*nqt).map(|i| (got[i]-ref_out[i]).abs()).fold(0.0f32, f32::max);
+        println!("  realdata parallel maxerr vs CPU: {maxerr:.5}");
+        assert!(maxerr < 0.1, "realdata wrong (maxerr {maxerr})");
+    }
+
+    /// End-to-end correctness of the 3-pass parallel prefill attention vs a CPU
+    /// scalar reference (the exact algorithm in forward.rs::gqa_attn). P1.
+    #[test]
+    fn attn_parallel_prefill_correctness() {
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active");
+        let dev = &mps.inner.device;
+        let (nh, nk, hd, nkt, nqt) = (14usize, 2usize, 64usize, 128usize, 896usize);
+        let (nt, nkv_real) = (35usize, 35usize);
+        let nkv_p = ((nkv_real + 31) / 32) * 32;
+        let gqa = nh / nk;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // deterministic q [nt][nqt], kv [nkv][nkt]
+        let q = dev.new_buffer((nt * nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let k = dev.new_buffer((nkv_real * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let v = dev.new_buffer((nkv_real * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let out = dev.new_buffer((nt * nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let pos = dev.new_buffer((nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let qp = q.contents() as *mut f32;
+            for i in 0..(nt * nqt) { *qp.add(i) = ((i as f32) * 0.37).sin() * 1.5; }
+            let kp = k.contents() as *mut f32;
+            for i in 0..(nkv_real * nkt) { *kp.add(i) = ((i as f32) * 0.11).cos() * 1.2; }
+            let vp = v.contents() as *mut f32;
+            for i in 0..(nkv_real * nkt) { *vp.add(i) = ((i as f32) * 0.23).sin() * 0.9; }
+            let pp = pos.contents() as *mut i32;
+            for t in 0..nt { *pp.add(t) = t as i32; }
+        }
+
+        let cb = mps.cmd_buffer();
+        cb.attn_parallel_prefill(&q, &k, &v, &out, &pos,
+            nkv_real, nkt, nqt, nt, nh, hd, gqa, scale);
+        cb.submit().expect("submit");
+
+        // CPU reference (mirror of forward.rs::gqa_attn)
+        let qs: Vec<f32> = (0..nt * nqt).map(|i| ((i as f32) * 0.37).sin() * 1.5).collect();
+        let ks: Vec<f32> = (0..nkv_real * nkt).map(|i| ((i as f32) * 0.11).cos() * 1.2).collect();
+        let vs: Vec<f32> = (0..nkv_real * nkt).map(|i| ((i as f32) * 0.23).sin() * 0.9).collect();
+        let mut ref_out = vec![0.0f32; nt * nqt];
+        let mut scrs = vec![0.0f32; nkv_real];
+        for h in 0..nh {
+            let hk = h / gqa;
+            for t in 0..nt {
+                let qq = t * nqt + h * hd;
+                let vl = (t + 1).min(nkv_real);
+                let mut mx = f32::NEG_INFINITY;
+                for kv in 0..vl {
+                    let ks_ = kv * nkt + hk * hd;
+                    let s = (0..hd).map(|d| qs[qq + d] * ks[ks_ + d]).sum::<f32>() * scale;
+                    scrs[kv] = s; if s > mx { mx = s; }
+                }
+                for kv in vl..nkv_real { scrs[kv] = f32::NEG_INFINITY; }
+                let mut sum = 0.0f32;
+                for kv in 0..nkv_real { scrs[kv] = if scrs[kv] == f32::NEG_INFINITY { 0.0 } else { (scrs[kv] - mx).exp() }; sum += scrs[kv]; }
+                for kv in 0..nkv_real { scrs[kv] /= sum; }
+                let oo = t * nqt + h * hd;
+                for d in 0..hd { ref_out[oo + d] = 0.0; }
+                for kv in 0..nkv_real {
+                    let vbase = kv * nkt + hk * hd;
+                    for d in 0..hd { ref_out[oo + d] += scrs[kv] * vs[vbase + d]; }
+                }
+            }
+        }
+
+        let mut got = vec![0.0f32; nt * nqt];
+        unsafe { std::ptr::copy_nonoverlapping(out.contents() as *const f32, got.as_mut_ptr(), nt * nqt); }
+        let mut maxerr = 0.0f32;
+        for i in 0..nt * nqt {
+            maxerr = maxerr.max((got[i] - ref_out[i]).abs());
+        }
+        println!("  attn_parallel_prefill: maxerr vs CPU {maxerr:.5}");
+        assert!(maxerr < 0.1, "matmul attention wrong vs CPU (maxerr {maxerr})");
+    }
+
+    /// Prefill GEMM (nt=430) throughput — P1 prefill-gap investigation (2026-08-11):
+    /// minfer pp430 ~1860 t/s vs llama-Metal ~6940 t/s (3.7x). GEMM params match
+    /// (64x32 tile, 4 sg, both legacy-simdgroup on M4). This measures the GEMM
+    /// kernel's achieved GB/s at the REAL Q4_K prefill dims to see if it's
+    /// bandwidth-bound or latency/occupancy-bound vs llama.
+    #[test]
+    fn prefill_gemm_throughput_profile() {
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active");
+        let dev = &mps.inner.device;
+        // Qwen2.5-0.5B Q4_K_M prefill dims: attn_q=Q5_0 (od=896,id=896),
+        // ffn_up=Q5_0 (od=18944,id=896), ffn_down=Q6_K (od=896,id=4864).
+        // Use the 64x32-tile GEMM (nt>=16) which is what prefill uses.
+        let cases: &[(&str, TensorType, usize, usize)] = &[
+            ("attn_q Q5_0 od=896  id=896  nt=430", TensorType::Q5_0, 896, 896),
+            ("attn_q Q4_0 od=896  id=896  nt=430", TensorType::Q4_0, 896, 896),
+            ("ffn_up Q5_0 od=18944 id=896  nt=430", TensorType::Q5_0, 18944, 896),
+            ("ffn_up Q4_0 od=18944 id=896  nt=430", TensorType::Q4_0, 18944, 896),
+            ("down  Q6_K od=896  id=4864 nt=430", TensorType::Q6_K, 896, 4864),
+        ];
+        let nt = 430usize;
+        println!("\n=== prefill GEMM throughput (nt=430, batched cb) ===");
+        for &(label, ttype, od, id) in cases {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let nblocks = (id + bq - 1) / bq;
+            let wbytes = nblocks * bb * od;
+            let wb = dev.new_buffer(wbytes as u64, metal::MTLResourceOptions::StorageModeShared);
+            // Fill with valid finite weights: each block's d (first 2 bytes, fp16)
+            // = 1.0 (0x00 0x3C LE), remaining bytes 0x33 (finite nibbles). Avoids
+            // the denormal-fp16 slow path that skews GEMM timing.
+            unsafe { std::slice::from_raw_parts_mut(wb.contents() as *mut u8, wbytes).fill(0x33); }
+            {
+                let p = wb.contents() as *mut u8;
+                let row = nblocks * bb;
+                for r in 0..od {
+                    for b in 0..nblocks {
+                        let off = (r * row + b * bb) as isize;
+                        unsafe { *p.offset(off) = 0x00; *p.offset(off + 1) = 0x3C; }
+                    }
+                }
+            }
+            let acts = dev.new_buffer((id * nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            unsafe { std::slice::from_raw_parts_mut(acts.contents() as *mut f32, id * nt).fill(0.5); }
+            let out = dev.new_buffer((od * nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            // warm
+            {
+                let cb = mps.cmd_buffer();
+                for _ in 0..20 { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, &out, od, id, nt); }
+                cb.submit().expect("warmup");
+            }
+            let n = 50;
+            let mut us: Vec<f64> = Vec::new();
+            for _ in 0..3 {
+                let cb = mps.cmd_buffer();
+                for _ in 0..n { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, &out, od, id, nt); }
+                let t0 = std::time::Instant::now();
+                cb.submit().expect("submit");
+                let dt = t0.elapsed().as_secs_f64();
+                us.push(dt * 1e6 / n as f64);
+            }
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let per_us = us[1]; // median
+            let gbs = wbytes as f64 / (per_us * 1e-6) / 1e9;
+            println!("  {label:<30} {:.1} MB {per_us:>7.1} us => {:>5.0} GB/s (warm)", wbytes as f64/1e6, gbs);
+        }
     }
 }

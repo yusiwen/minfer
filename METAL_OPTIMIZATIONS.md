@@ -992,6 +992,61 @@ f32 AND f16 caches, Q4_K_M AND Q4_0 models.
 - Remaining gap vs llama (~3.1-3.3 ms GPU) after P1: ~4.1-4.3 ms → mostly the
   attention pair + base infra. No further low-risk lever identified.
 
+## Parallel Prefill Attention (P1, 2026-08-11) — pp430 ~32 % faster
+
+With llama-Metal rebuilt (`GGML_METAL=ON`), the real prefill gap was localized
+with clean numbers:
+
+| Test | llama-Metal | minfer (classic) | minfer (parallel, this P1) | Gap |
+|---|---|---|---|---|
+| pp30 (35 tok) | 2370 t/s | ~44 ms | **~40 ms** | 3.0× |
+| pp430 | 6939 t/s | ~212 ms | **~144 ms** | 2.3× |
+
+**Root cause:** the classic `kernel_gqa_attn_f32` at prefill is latency-bound.
+Grid `(nt, nk)` = 860 TGs at nt=430, each looping the KV sequentially with 2
+`threadgroup_barrier` per 32-row tile (~24K barriers), 32-lane dot over hd.
+Measured **~100 ms (48 % of prefill, ~25× llama's attention)** — the classic
+kernel was the prefill bottleneck, not the matmuls.
+
+**Fix — 3-pass parallel attention (all barrier-free):**
+1. `kernel_attn_scores`: one 256-thread threadgroup per `(t,h)` row; each
+   thread computes one score `= dot(q[t][h][0..hd], k[kv][hk*hd..]) * scale`.
+2. `kernel_softmax_attn`: masked softmax over the kv axis per `(t,h)` row
+   (256-thread TG with per-simdgroup partial reduction — the same pattern as
+   rms_norm_256).
+3. `kernel_attn_output`: one 256-thread TG per `(t,h)`; each thread sums
+   `softmax[kv] * v[kv][hk*hd+d]` over kv for one output dim.
+
+GQA is handled by per-head `hk = h/gqa` indexing (the broadcast-GEMM idea was
+tried and abandoned — a 2D GEMM produces `Σ_h` over all heads, but attention
+needs the per-head 3D scores tensor `[nt][nh][nkv]`, which only dedicated
+kernels can express). Scores buffer: `[nt][nh][nkv]` (no padding needed).
+
+⚠️ **Threadgroup-memory bug found during bring-up:** the 256-thread softmax's
+`if (sgitg == 0) { shmem[tiisg] = ... }` writes 32 floats (tiisg 0..31) but only
+8 were allocated (`8*4 = 32 B`). The OOB write corrupted adjacent threadgroup
+memory → NaN in the max/sum reductions for rows with `vl < 256` (negative-score
+rows), producing garbage output. Fixed by allocating `32*4 = 128 B`. **The same
+latent bug was fixed in rms_norm_256** (it happened to work because its shmem
+was init to 0, so the OOB region read as 0).
+
+**Verified:**
+- `attn_parallel_prefill_correctness` (deterministic sin/cos data, maxerr 0.0
+  vs the exact CPU gqa_attn algorithm).
+- `attn_parallel_realdata_correctness` (real dumped layer-0 activations,
+  maxerr 0.0, NaN 0).
+- End-to-end **byte-identical** output vs classic (f32 + f16 caches, greedy +
+  sampled, Q4_K_M + Q4_0).
+- 34 bin + 6 isolation tests pass.
+
+**Measured (prefill GPU, min of 3, Q4_K_M 0.5B):**
+- pp430: classic 212 → **144 ms (~32 %)**, attention 100 → **30 ms** (3.4×).
+- pp30: classic 44 → **40 ms (~9 %)**.
+
+Gated by `MINFER_NO_MATMUL_ATTN=1` (default = parallel). The remaining pp430
+gap to llama (62 ms) is now the matmuls + small kernels — at their documented
+architecture limit (see the Decode Gap sections), not attention.
+
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
 minfer's Q4_0 prefill kernel (`kernel_q4_0_f32_matmul_multi`) uses a

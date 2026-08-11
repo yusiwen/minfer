@@ -427,6 +427,27 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > **MINFER_TIMING steady-state gpu submit-wait** (tok 5+), never the `Generated:`
 > line of pre-caliber-fix builds.
 
+> **Parallel prefill attention (P1, 2026-08-11) — pp430 ~32 % faster**:
+> with llama-Metal rebuilt (GGML_METAL=ON), the real prefill gap was localized:
+> minfer pp430 ~1812 t/s vs llama ~6939 (3.8×), and the classic `kernel_gqa_attn_f32`
+> (grid (nt,nk), sequential KV loop with ~24K barriers at nt=430) was ~100 ms
+> (48 % of prefill, ~25× llama's attention). Replaced with a 3-pass parallel
+> attention for nt>1 (all barrier-free): `kernel_attn_scores` (one 256-thread TG
+> per (t,h) row) → `kernel_softmax_attn` (masked softmax over kv per row) →
+> `kernel_attn_output` (softmax·V). GQA via per-head hk=h/gqa indexing (the
+> broadcast-GEMM idea was abandoned — a 2D GEMM can't produce the per-head
+> 3D scores tensor). ⚠️ threadgroup-memory bug: the 256-thread softmax's
+> `shmem[tiisg]` init writes 32 floats but only 8 were allocated (8·4=32 B) —
+> OOB into adjacent threadgroup memory corrupted the max/sum reductions → NaN
+> rows; fixed by allocating 32·4=128 B (same latent bug fixed in rms_norm_256).
+> Verified: `attn_parallel_prefill_correctness` (maxerr 0.0 vs CPU),
+> `attn_parallel_realdata_correctness` (real layer-0 activations, maxerr 0.0),
+> end-to-end byte-identical (f32+f16, greedy+sampled), 34 bin + 6 isolation tests.
+> Measured (prefill GPU): pp430 classic 212 → **144 ms (~32 %)**, attention
+> 100 → **30 ms**; pp30 44 → 40 ms (~9 %). Gated by `MINFER_NO_MATMUL_ATTN=1`
+> (default = parallel). Remaining pp430 gap to llama (62 ms) is matmuls + small
+> kernels (at their documented architecture limit), not attention.
+
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since
 > 2026-08-06 minfer's `Generated:` is **pure decode** (`generated / gen_time`,
