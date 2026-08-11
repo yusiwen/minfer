@@ -1083,6 +1083,47 @@ Gated by `MINFER_NO_MATMUL_ATTN=1` (default = parallel). The remaining pp430
 gap to llama (62 ms) is now the matmuls + small kernels — at their documented
 architecture limit (see the Decode Gap sections), not attention.
 
+### Prefill GEMM throughput + 7B verification (2026-08-11, follow-up)
+
+**A1 — prefill GEMM ceiling.** `prefill_gemm_throughput_profile` (batched-cb,
+single-dispatch verified) measures the real prefill GEMM throughput at nt=430:
+
+| matmul (nt=430) | MB | per-dispatch | GB/s |
+|---|---|---|---|
+| attn_q Q5_0 od=896 id=896 | 0.6 | 150-185 µs | ~4 |
+| ffn_up Q5_0 od=18944 id=896 | 11.7 | 2.75-2.9 ms | ~4 |
+| ffn_up Q4_0 od=18944 id=896 | 9.5 | 2.46 ms | ~4 |
+| down Q6_K od=896 id=4864 | 3.6 | 0.77 ms | ~5 |
+
+Single-dispatch and batched-cb agree (the earlier ~4 GB/s is real, not a test
+artifact; it reconciles exactly with the real pp430 = 141-157 ms ≈ 24 layers ×
+~6.7 ms). The GEMM is **compute-bound** (Q5_0 dequant), ~2.7-5.4 TFLOPs/s
+depending on the grid shape (nt=416→3.5, nt=448→5.1, nt=480→5.3, nt=512→5.2
+TFLOPs/s — grid-row scheduling variance, not a bc_out bug). llama achieves ~7
+TFLOPs/s effective prefill, i.e. a **~30 % GEMM execution-efficiency gap** that
+is the same "structural" class the 2026-08-06 session found for decode (kernel
+source + dispatch params identical; the difference is per-kernel execution).
+
+**A2 — llama per-op timing is not obtainable via CLI.** `GGML_METAL_CAPTURE_COMPUTE`
+fails with "Capture layer is not inserted" (needs Xcode/Instruments GPU capture).
+`xctrace record --template 'Metal System Trace'` captures a .trace but the CLI
+export is empty — the template's "Shader Timeline: Disabled" means per-kernel GPU
+durations require the Xcode GUI. Confirms the 2026-08-06 "needs the Xcode GUI"
+limitation for llama too.
+
+**C — 7B verification (Qwen2.5-7B Q4_K_M):** the parallel prefill attention +
+rms_norm_256 are correct at scale (output "The capital of France is Paris.",
+byte-identical vs classic+rms_32; 34 bin + 6 isolation tests pass). At 7B pp230
+prefill GPU: parallel 832 ms vs classic 944 ms (~12 % faster); parallel attention
+57 ms vs classic 169 ms (**~3× faster**). 7B decode unchanged (~66 ms/tok
+steady, both paths). So the parallel prefill attention holds at 7B scale.
+
+**Conclusion:** the remaining prefill gap (~2.8× vs llama) is the GEMM execution
+efficiency (~30 %+, structural per the 2026-08-06 finding), not attention or a
+single fixable kernel bug. The 2026-08-11 parallel attention fixed the prefill
+attention kernel (100 → 30 ms at 0.5B, 169 → 57 ms at 7B); the matmuls are at
+minfer's ~5.4 TFLOPs/s ceiling vs llama's ~7.
+
 ## Prefill Gap: simdgroup GEMM — implemented, fixed, and SHIPPED (P1)
 
 minfer's Q4_0 prefill kernel (`kernel_q4_0_f32_matmul_multi`) uses a

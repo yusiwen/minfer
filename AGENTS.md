@@ -452,6 +452,16 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > 100 → **30 ms**; pp30 44 → 40 ms (~9 %). Gated by `MINFER_NO_MATMUL_ATTN=1`
 > (default = parallel). Remaining pp430 gap to llama (62 ms) is matmuls + small
 > kernels (at their documented architecture limit), not attention.
+> **7B verified + prefill GEMM ceiling (2026-08-11 follow-up)**: parallel prefill
+> attn + rms_256 are correct at 7B (byte-identical, 34 bin + 6 isolation pass);
+> 7B pp230 prefill 944 → **832 ms (~12 %)**, parallel attention 169 → **57 ms
+> (~3×)**. `prefill_gemm_throughput_profile` measures minfer's prefill GEMM
+> ceiling at ~**5.4 TFLOPs/s** (Q5_0 dequant-bound, grid-shape variance 3.5-5.4)
+> vs llama's ~7 TFLOPs/s effective — a ~30 % GEMM execution-efficiency gap, the
+> same "structural" class as the decode finding. llama per-op timing is NOT
+> obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; xctrace export
+> is empty — "Shader Timeline disabled"), confirming the docs' Xcode-GUI-only
+> limitation. See METAL_OPTIMIZATIONS.md "Parallel Prefill Attention" → follow-up.
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since

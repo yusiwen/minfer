@@ -2403,7 +2403,7 @@ mod tests {
             us.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let per_us = us[1]; // median
             let gbs = wbytes as f64 / (per_us * 1e-6) / 1e9;
-            println!("  {label:<30} {:.1} MB {per_us:>7.1} us => {:>5.0} GB/s (warm)", wbytes as f64/1e6, gbs);
+            println!("  {label:<30} {:.1} MB {per_us:>7.1} us => {:>5.0} GB/s (warm, n=50)", wbytes as f64/1e6, gbs);
         }
     }
 }
