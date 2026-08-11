@@ -415,6 +415,17 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > non-matmul kernel** (~44 µs/layer at nkv=430, and the classic single-pass is
 > ~352 µs — 8× worse), confirming the split design and that flash-port remains
 > the only attention lever.
+> **7B decode "28-31 t/s" was a blended-caliber artifact, NOT a regression**
+> (2026-08-11, P0): a suspicious 7B slowdown (12 vs 45 t/s) bisected cleanly back
+> to... nothing — the old binaries label the BLENDED rate as `Generated:` (pre-
+> `dc66d0d` caliber change), and 7B hits EOS after ~9 tokens so short generations
+> make the difference huge. Same-caliber A/B (parent dfd7866 vs current a7f21e4):
+> steady-state gpu submit-wait 56.2 vs 54.4 ms/token, wall 10.8-14.1 vs
+> 14.2-14.5 t/s — current is marginally FASTER. The real 7B pure-decode rate is
+> ~14-15 t/s (~55 ms/token GPU); docs' historical "28-31 t/s" was blended.
+> Lesson: when A/B'ing binaries across the `dc66d0d` caliber boundary, compare
+> **MINFER_TIMING steady-state gpu submit-wait** (tok 5+), never the `Generated:`
+> line of pre-caliber-fix builds.
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since
