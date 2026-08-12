@@ -465,11 +465,13 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > architecture floor" verdict is **REVOKED** — the goal is to match llama.cpp
 > performance. METAL_OPTIMIZATIONS.md §0 progress table is the single tracking
 > source; §4 is the only action path: (1) Xcode GUI per-kernel trace (CLI xctrace
-> disproven), (2) flash-attention port for the decode non-matmul 4× gap, (3)
-> prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape probe first,
-> counter-evidence noted). Dropped: 2D-simdgroup GEMM (llama disables tensor GEMM
-> on M4 Pro per PARAMETER_AUDIT A) + bf16 staging (llama reads f32 activations per
-> Core convention #1).
+> disproven; fallback = existing MINFER_TIMING + skip-gate decomposition), (2)
+> decode non-matmul efficiency = flash-attention port (attention half) + small
+> elementwise investigation (other half), (3) prefill GEMM execution efficiency
+> toward ~7 TFLOPs/s (grid-shape probe first, counter-evidence noted), (4) 7B
+> same-model A/B + per-step regression check. Dropped: 2D-simdgroup GEMM (llama
+> disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A) + bf16 staging (llama
+> reads f32 activations per Core convention #1).
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since

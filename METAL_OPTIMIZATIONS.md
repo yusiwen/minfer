@@ -49,10 +49,15 @@
 
 | # | Item | Goal | Status |
 |---|---|---|---|
-| 1 | **Xcode GUI per-kernel GPU trace** (minfer + llama, same workload, decode + prefill) | pinpoint the non-matmul 4× and GEMM ~30 % gap | not started. CLI method proven impossible (§4.1) |
-| 2 | **flash attention port** (or an equivalent 1-kernel decode attention) | decode non-matmul 1.2→0.3 ms | gated on trace #1. Former "dead-end" verdict revoked (§4.2) |
-| 3 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3) |
-| 4 | remaining items per trace #1 results | — | TBD |
+| 1 | **Xcode GUI per-kernel GPU trace** (minfer + llama, same workload, decode + prefill) | pinpoint the non-matmul 4× and GEMM ~30 % gap | not started. CLI method proven impossible; fallback exists (§4.1) |
+| 2 | **flash attention port** (or an equivalent 1-kernel decode attention) | decode **attention** 0.54→~0.15 ms | gated on trace #1. Former "dead-end" verdict revoked (§4.2) |
+| 3 | **decode small-elementwise efficiency** (why llama's f32 small kernels are ~4× faster than minfer's) | decode **small elementwise** ~0.5→~0.1-0.3 ms | gated on trace #1. Part of the non-matmul 4× gap (§4.2) |
+| 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3) |
+| 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
+| 6 | remaining items per trace #1 results | — | TBD |
+
+> Note: §0 #2 + #3 together close the decode non-matmul 4× gap (1.2→0.3 ms).
+> Flash alone only covers the attention half; small elementwise is the other half.
 
 ### ❌ Decided not to change (has measured or llama-source evidence)
 
@@ -391,12 +396,25 @@ decides the priority of §4.2/§4.3 (attention-dominated? small-op-dominated?
 uniform launch overhead?) and validates whether §1.2's subtractive minfer
 decomposition overestimates matmul.
 
-### 4.2 flash attention port (the decode non-matmul 4× gap)
+**Fallback (if Xcode GUI stays unavailable)**: minfer already has a solid
+subtractive stack — `MINFER_TIMING` (gpu submit-wait) + `MINFER_SKIP_ATTN/MATMULS/
+SMALL=1` (DecodeSkips) + batched-cb per-kernel profiles (§2.3). The trace would
+refine the llama side (currently inferred, §1.2); without it, proceed with the
+existing measured decomposition as the best available basis, keeping the trace as
+a later cross-check. The trace is the preferred step 0, not a hard blocker.
+
+### 4.2 decode non-matmul efficiency: flash attention + small elementwise
+
+The decode non-matmul gap (1.2 vs 0.3 ms, ~4×) has **two halves of comparable
+size** (§1.2/§2.3): attention (~0.54 ms vs ~0.15-0.2) and the small elementwise
+tail (~0.5 ms vs ~0.1-0.3). Both are required to close the 1.2→0.3 ms gap.
+
+#### 4.2.1 flash attention port (the attention half)
 
 **Former "dead-end" verdict revoked** (2026-08-12): the 2026-08-06 downgrade to
 "dead-end" (~0.3 ms gain, multi-day risk) was made under the accept-floor premise.
-Since the goal is to reach llama's level (non-matmul 1.2→0.3 ms is the only body of
-the structural gap, §2.4), this is a **required path**, not an option.
+Since the goal is to reach llama's level (attention ~0.35 ms of the structural
+gap), this is a **required path**, not an option.
 
 Current state: minfer's split attention (2 kernels/layer, ~0.54 ms) is structurally
 the best non-flash design (classic single-pass is 8× worse). llama's flash is fast
@@ -407,6 +425,32 @@ because it is "1 kernel" (a naive 1-kernel fusion measured 4.80 vs 4.15 ms, slow
 simdgroup matrices, f16 KV, KV-parallel tiles) replacing partial+combine (−24
 kernels). Risk: new kernel + isolation tests (follow the established methodology:
 isolation test first against a scalar reference, then byte-identical A/B).
+
+**Prefill flash explicitly deferred**: llama also uses a prefill flash
+(`kernel_flash_attn_ext_blk`), but minfer's 3-pass parallel prefill attention
+already cut prefill attention to 30 ms (was 100 ms) — a prefill flash port would
+recover only ~25 ms for the same ~600-line cost, so it is **out of scope unless
+the prefill GEMM (§4.3) lands and attention becomes the residual prefill
+bottleneck again**.
+
+#### 4.2.2 small elementwise efficiency (the other half)
+
+The ~300 small elementwise kernels (rms_norm/add/rope/store/swiglu) run at
+~0.5 ms vs llama's ~0.1-0.3 ms. §2.3 attributes this to "structurally cheap
+per-dispatch latency" (each is 2-3 µs; rms_norm was the one exception, fixed via
+the 256-thread rewrite). But llama runs the SAME f32 kernels ~4× faster, so the
+gap is real and unexplained — it is exactly what the trace (§4.1) must localize.
+Candidate directions, to be chosen per the trace:
+- **per-kernel latency**: if the trace shows uniform ~2-3 µs dispatch latency,
+  investigate fusing the ~20 kernels/layer down toward llama's 17 (fewer
+  dispatches; note §0-❌-5 says naive fusions measured no gain — needs a trace to
+  tell whether dispatch count or per-dispatch latency dominates).
+- **kernel efficiency**: if the trace shows individual small kernels at ~4×
+  llama's time, port llama's specific kernel bodies (e.g. `kernel_rms_norm_fuse`
+  was already a win; `kernel_add`/`kernel_swiglu_f32` equivalents).
+- **workload structure**: if llama simply does less small-op work per layer
+  (fused flash removes add_bias/rope/store from its path), the win comes from
+  the flash port (§4.2.1), not the small kernels themselves.
 
 ### 4.3 prefill GEMM execution efficiency (~5.4 vs ~7 TFLOPs/s)
 
@@ -426,7 +470,22 @@ pursue a higher-efficiency GEMM structure. 2D `simdgroup_matrix` (mpp tensor)
 **already excluded** (llama disables it on M4 Pro, PARAMETER_AUDIT A); bf16 staging
 **already excluded** (llama reads f32 activations).
 
-### 4.4 Backfill after each item
+### 4.4 7B verification and A/B (user-facing model)
+
+All §1 A/B numbers are on the 0.5B research model. The 7B Q4_K_M is the
+user-facing model (steady decode ~66 ms/token GPU, prefill pp230 832 ms with the
+parallel attention). Add a **7B same-model A/B vs llama** (llama-bench on the
+same `qwen2.5-7b-instruct-q4_k_m` split GGUF) to:
+- quantify the real 7B gap per the same categories as §1.2 (matmul / attention /
+  small / base);
+- catch regressions from §4.2/§4.3 that 0.5B A/Bs would miss (7B has different
+  dims: nh=28, gqa=7, hd=128, larger FFN — GEMM grid and attention chunk behavior
+  differ).
+Every completed step must pass: correctness byte-identical on 7B + 0.5B, no 7B
+decode/prefill regression vs the pre-change baseline (same-caliber
+`MINFER_TIMING` steady-state gpu submit-wait, tok 5+).
+
+### 4.5 Backfill after each item
 
 After each item completes: update the §0 progress table (check, fill in the commit,
 update measured effect) → record the implementation + verification in the relevant
