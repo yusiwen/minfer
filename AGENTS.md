@@ -317,7 +317,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > 6.9 → ~3.5 s; the ~150-200 tok/s figure was the OLD blended caliber — since
 > 2026-08-06 "Generated:" is pure decode like llama's "Generation:"); fixed-seed
 > output **byte-identical** (7 sampler tests pass). Full measurements in
-> METAL_OPTIMIZATIONS.md "Decode bottleneck is the CPU sampler" (2026-08-06).
+> METAL_OPTIMIZATIONS.md §3.2.
 
 > **Decode gap: matmuls at ~130 GB/s (structural for nt==1), NOT launch
 > overhead, NOT dequant-compute-bound** (2026-08-06, final model): greedy decode
@@ -388,10 +388,9 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
 > dispatch gated in its exact original position — the FFN down-matmul must stay
-> AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md "Decode Gap (revised
-> 2026-08-06)".
+> AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md §2.3/§4.
 > **minfer vs llama.cpp: full Metal inference path comparison (2026-08-10)**: the
-> comparison section in METAL_OPTIMIZATIONS.md gives both sides' per-layer decode
+> comparison section in METAL_OPTIMIZATIONS.md (§1.3/§1.4) gives both sides'
 > kernel sequences (minfer 20/layer Q4_K_M / 12/layer Q4_0 vs llama 17/layer
 > flash), per-category timings (matmul ~3.0 ms zero gap; non-matmul minfer
 > ~1.2 ms vs llama ~0.3 ms = 4×), and a kernel inventory table. llama per-op
@@ -401,7 +400,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > llama (Q4_K_M 218 vs 293-299 t/s, Q4_0 279 vs 314-339 t/s pure GPU; default
 > sampling 197 vs 247 t/s). Prefill remains 2.8-3.6× (llama 6909 vs minfer 2466
 > t/s at pp430) — now mostly matmuls + small kernels at the architecture limit,
-> not attention (see METAL_OPTIMIZATIONS.md "Same-model, same-parameter A/B").
+> not attention (see METAL_OPTIMIZATIONS.md §1.1).
 
 > **Per-kernel non-matmul profile + 256-thread RMSNorm (2026-08-10, P0/P1)**:
 > `metal.rs::tests::non_matmul_bandwidth_profile` (batched-cb per-kernel timing,
@@ -461,17 +460,16 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > same "structural" class as the decode finding. llama per-op timing is NOT
 > obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; xctrace export
 > is empty — "Shader Timeline disabled"), confirming the docs' Xcode-GUI-only
-> limitation. See METAL_OPTIMIZATIONS.md "Parallel Prefill Attention" → follow-up.
-> **Optimization-plan status (2026-08-12)**: the architecture-level plan in
-> METAL_OPTIMIZATIONS.md ("Architecture-level optimization plan" → "Plan update")
-> was reconciled — Step 0's CLI xctrace method disproven (needs Xcode GUI);
-> 2D-simdgroup GEMM + bf16 staging dropped (llama disables tensor GEMM on M4 Pro
-> per PARAMETER_AUDIT A, reads f32 activations per Core convention #1); flash
-> port unchanged but deferred; **"accept the architecture floor" is the active
-> recommendation** for both decode and prefill. Only remaining lever: a
-> low-expectation grid-shape probe (`prefill_gemm_throughput_profile`, 3.5-5.4
-> TFLOPs/s variance by nt) — counter-evidence (llama same grid, same ~7) likely
-> explains it as per-kernel execution, not scheduling.
+> limitation. See METAL_OPTIMIZATIONS.md §3.4/§4.
+> **Optimization-plan status (2026-08-12)**: the 2026-08-06 "accept the
+> architecture floor" verdict is **REVOKED** — the goal is to match llama.cpp
+> performance. METAL_OPTIMIZATIONS.md §0 progress table is the single tracking
+> source; §4 is the only action path: (1) Xcode GUI per-kernel trace (CLI xctrace
+> disproven), (2) flash-attention port for the decode non-matmul 4× gap, (3)
+> prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape probe first,
+> counter-evidence noted). Dropped: 2D-simdgroup GEMM (llama disables tensor GEMM
+> on M4 Pro per PARAMETER_AUDIT A) + bf16 staging (llama reads f32 activations per
+> Core convention #1).
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since
