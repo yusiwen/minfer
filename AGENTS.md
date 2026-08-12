@@ -362,7 +362,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > xctrace limitation: the Metal System Trace CLI export doesn't give per-kernel
 > durations (execution-points underestimate; shader profiler not captured) —
 > aggregate GPU-work comparable (24.1 vs 24.0 ms), per-kernel needs the Xcode GUI.
-> **Step 1 result (2026-08-06)**: naive 1-kernel/层 attention (classic
+> **Step 1 result (2026-08-06)**: naive 1-kernel/layer attention (classic
 > `kernel_gqa_attn_f32`, `MINFER_NO_SPLIT_ATTN=1`) is SLOWER than split — 4.80 vs
 > 4.15 ms GPU/token — confirming the split design is right; llama's flash is fast
 > because of simdgroup_matrix, not "one kernel". Only a faithful
@@ -527,7 +527,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
    queried via the `metal` crate's `MTLDevice` properties and cached at MpsState
    init. Do NOT hardcode guessed limits (e.g. a remembered "32 KB threadgroup
    memory") — verify via runtime query. See `GPU_SAFETY.md` §4.
-2. **All GPU safety guards error-exit (报错退出)** — never silently fall back to
+2. **All GPU safety guards error-exit** — never silently fall back to
    CPU. A guard that detects an unsafe/unsupported configuration (dimension
    misalignment, head-dispatch mismatch, threadgroup memory/threads exceeding the
    queried device limit, kernel-array overflow) prints a clear message with the
