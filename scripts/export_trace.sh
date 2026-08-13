@@ -21,10 +21,12 @@
 # Env:
 #   XCT          xctrace binary (default: the one inside Xcode)
 #   TRACE_OUT    output dir   (default: /tmp/minfer_trace_export)
+#   TRACE_PROC   process name to filter per-forward intervals (default: minfer)
 set -u
 
 XCT="${XCT:-/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace}"
 OUT="${TRACE_OUT:-/tmp/minfer_trace_export}"
+PROC="${TRACE_PROC:-minfer}"
 mkdir -p "$OUT"
 
 toc() { "$XCT" export --input "$1" --toc 2>/dev/null; }
@@ -64,6 +66,7 @@ dump() { "$XCT" export --input "$trace" \
 dump gpu-counter-info               counter_info
 dump metal-gpu-intervals            gpu_intervals
 dump metal-shader-profiler-shader-list shader_list
+dump metal-shader-profiler-intervals shader_intervals
 if [ ! -f "$OUT/counter_value.xml" ]; then
     "$XCT" export --input "$trace" \
         --xpath "/trace-toc/run[@number=\"$run\"]/data/table[@schema=\"gpu-counter-value\"]" \
@@ -71,9 +74,10 @@ if [ ! -f "$OUT/counter_value.xml" ]; then
 fi
 
 # Python summary: counter map + per-phase bottleneck profile + per-forward times.
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" "$PROC" <<'PY'
 import os, re, statistics, sys
 out = sys.argv[1]
+PROC = sys.argv[2]
 
 def text(s):  # inner text of an element
     m = re.search(r'>(.*?)</', s)
@@ -183,12 +187,12 @@ for cid in sorted(agg):
         continue
     print(f"  {name:<45} mean={m:7.1f}%  max={max(vals):7.1f}%  n={len(vals)}")
 
-# ---- per-forward GPU intervals (minfer), ordered by start time ----
+# ---- per-forward GPU intervals (PROC), ordered by start time ----
 iv = open(f"{out}/gpu_intervals.xml").read()
 irows = re.findall(r'<row>(.*?)</row>', iv, re.S)
 forwards = []  # (start_ns, duration_us)
 for r in irows:
-    if 'minfer' not in r:
+    if PROC not in r:
         continue
     ms = re.search(r'<start-time id="\d+" fmt="[^"]*">(\d+)</start-time>', r)
     md = re.search(r'<duration id="\d+" fmt="[^"]*">(\d+)</duration>', r)
@@ -196,12 +200,51 @@ for r in irows:
         forwards.append((int(ms.group(1)), int(md.group(1))/1e3))
 forwards.sort()
 if forwards:
-    print(f"\n=== minfer forward GPU intervals: n={len(forwards)} ===")
+    print(f"\n=== {PROC} forward GPU intervals: n={len(forwards)} ===")
     print(f"  prefill (first forward): {forwards[0][1]:.1f} us")
     dec = [d for _, d in forwards[1:]]
     if dec:
         print(f"  decode ({len(dec)} forwards): mean={statistics.mean(dec):.1f} us  median={statistics.median(dec):.1f} us  min={min(dec):.1f}  max={max(dec):.1f}")
     prefill_us = forwards[0][1]
+
+# ---- per-kernel shader durations (metal-shader-profiler-intervals) ----
+# Same id/ref dedup as the counter table: first occurrence of a duration /
+# kernel-name / start-time defines an element id with a value; later rows
+# reference it (<duration ref/> / <metal-object-label ref/> / <start-time ref/>).
+# Single-target table (only the launched process appears), so no PROC filter.
+si_path = f"{out}/shader_intervals.xml"
+kernels = {}
+if os.path.exists(si_path):
+    si = open(si_path).read()
+    dur_by_id = {}
+    name_by_id = {}
+    start_by_id = {}
+    for r in re.findall(r'<row>(.*?)</row>', si, re.S):
+        for m in re.finditer(r'<duration id="(\d+)"[^>]*>(\d+)</duration>', r):
+            dur_by_id[m.group(1)] = int(m.group(2))
+        for m in re.finditer(r'<metal-object-label id="(\d+)"[^>]*fmt="([^"]*)"', r):
+            name_by_id[m.group(1)] = m.group(2)
+        for m in re.finditer(r'<start-time id="(\d+)"[^>]*>(\d+)</start-time>', r):
+            start_by_id[m.group(1)] = int(m.group(2))
+        # resolve this row: name + duration + start
+        mni = re.search(r'<metal-object-label[^>]*fmt="([^"]*)"', r)
+        mnr = re.search(r'<metal-object-label ref="(\d+)"/>', r)
+        mn = mni.group(1) if mni else (name_by_id.get(mnr.group(1)) if mnr else None)
+        mdi = re.search(r'<duration[^>]*>(\d+)</duration>', r)
+        mdr = re.search(r'<duration ref="(\d+)"/>', r)
+        md = int(mdi.group(1)) if mdi else (dur_by_id.get(mdr.group(1)) if mdr else None)
+        mp = re.search(r'<percent[^>]*>([0-9.]+)</percent>', r)
+        if mn and md and 'kernel_' in mn:
+            pct = float(mp.group(1)) if mp else 0.0
+            kernels.setdefault(mn, {'n':0, 'us':0.0, 'pct':0.0})
+            kernels[mn]['n'] += 1
+            kernels[mn]['us'] += md/1e3
+            kernels[mn]['pct'] += pct
+if kernels:
+    print(f"\n=== {PROC} per-kernel shader durations ({len(kernels)} kernels, {sum(k['n'] for k in kernels.values())} intervals) ===")
+    print(f"  {'kernel':<48} {'n':>6} {'total_us':>10} {'avg_us':>8} {'%GPU':>6}")
+    for name, k in sorted(kernels.items(), key=lambda kv: -kv[1]['us']):
+        print(f"  {name:<48} {k['n']:>6} {k['us']:>10.1f} {k['us']/k['n']:>8.2f} {k['pct']:>6.1f}")
 
 # ---- phase-split bottleneck profile ----
 # Counter tick ts and forward start ts share the trace-relative ns timeline.

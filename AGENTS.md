@@ -462,19 +462,22 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > intervals are not recorded by the Metal System Trace on this setup — see
 > METAL_OPTIMIZATIONS.md §4.1, which replaces the old "Xcode-GUI-only" claim with
 > the correct xctrace path + Performance Limiters workflow). See §3.4/§4.
-> **Optimization-plan status (2026-08-12, trace step DONE 2026-08-13)**: the
+> **Optimization-plan status (2026-08-12, trace DONE 2026-08-13)**: the
 > 2026-08-06 "accept the architecture floor" verdict is **REVOKED** — the goal is
 > to match llama.cpp performance. METAL_OPTIMIZATIONS.md §0 progress table is the
 > single tracking source; §4 is the only action path: (1) GPU trace DONE —
-> `scripts/export_trace.sh` + Performance Limiters counter set; minfer prefill =
-> no HW limit (GPU under-occupied, scheduling not compute), decode =
-> cache/memory-bound (LLC/MMU); llama-side trace pending, (2) decode non-matmul
-> efficiency = flash-attention port (attention half) + small elementwise
-> investigation (other half), (3) prefill GEMM execution efficiency toward ~7
-> TFLOPs/s (grid-shape probe first, counter-evidence noted), (4) 7B
-> same-model A/B + per-step regression check. Dropped: 2D-simdgroup GEMM (llama
-> disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A) + bf16 staging (llama
-> reads f32 activations per Core convention #1).
+> `scripts/export_trace.sh` + Performance Limiters counter set gives BOTH
+> per-kernel durations (metal-shader-profiler-intervals) and limiter profile;
+> per-kernel comparison (METAL §4.1.1): matmuls 1.6-3.9× slower per call
+> (q8_0 580 vs 353 µs — the NEW primary decode lever), attention 3.4× (19.5 vs
+> 5.8 µs), small elementwise at parity (the old 4× claim refuted); limiter:
+> prefill = under-occupied (no HW limit), decode = cache/memory-bound on BOTH
+> sides, (2) decode matmul per-call execution (dispatch granularity /
+> mul_mv_ext port / threadgroup re-verify), (3) flash-attention port (attention
+> 3.4×), (4) prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape
+> probe first), (5) 7B same-model A/B + per-step regression check. Dropped:
+> 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
+> + bf16 staging (llama reads f32 activations per Core convention #1).
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
 > shader-compile-bug was misread as a GPU throttle): (0) **tok/s caliber**: since

@@ -49,15 +49,15 @@
 
 | # | Item | Goal | Status |
 |---|---|---|---|
-| 1 | **GPU trace (minfer): Performance Limiters bottleneck profile** | per-phase bottleneck type (done); llama-side comparison pending | **minfer DONE 2026-08-13** (§4.1): prefill = under-occupied (no HW limit), decode = cache/memory-bound. llama trace pending |
-| 2 | **flash attention port** (or an equivalent 1-kernel decode attention) | decode **attention** 0.54→~0.15 ms | gated on trace. Former "dead-end" verdict revoked (§4.2) |
-| 3 | **decode small-elementwise efficiency** (why llama's f32 small kernels are ~4× faster than minfer's) | decode **small elementwise** ~0.5→~0.1-0.3 ms | gated on trace. Part of the non-matmul 4× gap (§4.2) |
+| 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel comparison obtained — matmul 1.6-3.9×, attention 3.4×, small-op parity |
+| 2 | **decode matmul per-call execution inefficiency** (NEW primary lever from trace) | q8_0 580→353 µs, q5_0 32→8 µs per call | test dispatch granularity (mul_mv_ext port), threadgroup config, output-matmul grid (§4.2.1) |
+| 3 | **flash attention port** | decode **attention** 19.5→~5.8 µs/call | gated on trace. Former "dead-end" verdict revoked (§4.2.2) |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
-| 6 | remaining items per trace results | — | TBD |
+| 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 
-> Note: §0 #2 + #3 together close the decode non-matmul 4× gap (1.2→0.3 ms).
-> Flash alone only covers the attention half; small elementwise is the other half.
+> Note: §4.1.1's per-kernel data refutes the 2026-08-06 "non-matmul 4×" model —
+> the decode gap is matmul per-call + attention, NOT small elementwise.
 
 ### ❌ Decided not to change (has measured or llama-source evidence)
 
@@ -115,6 +115,12 @@ minfer `--greedy` (pure decode, llama "Generation" caliber); llama.cpp
 | base infra (encode+submit+download) | encode 0.13 + download 0.02-0.03 | ~0.3-0.5 (incl. multi-cb encode) | minfer measured / llama inferred |
 | **Total** | **~4.35-4.55 ms/token GPU** | **~3.1-3.3 ms GPU / 3.51 wall** | interleaved A/B |
 
+> **SUPERSEDED 2026-08-13 by the per-kernel trace (§4.1.1)**: the llama-side
+> numbers here were *inferred* (no per-op timing existed). The trace shows the
+> real picture differs: matmuls are NOT "zero gap" (minfer 1.6-3.9× slower per
+> call), and small elementwise is NOT "4× slower" (parity). The Total is right;
+> the category split was not.
+
 ### 1.3 Whole-pipeline comparison (decode token, nt==1)
 
 | Stage | minfer | llama.cpp | CPU/GPU |
@@ -165,9 +171,9 @@ dispatches** (f16 cast/cont/reshape are non-no-op nodes).
 
 > **Core finding (2026-08-06 #5, verbatim)**: "Structural" is an **inference, not a
 > proven architectural inferiority**. §2.1 is what is strictly VERIFIED; §2.2 is
-> the inference after elimination. The decisive per-kernel measurement (Xcode GUI)
-> was **never completed** (§4.1), so any "architecture floor" conclusion is
-> provisional — and this project rejects it (see §4).
+> the inference after elimination. The decisive per-kernel measurement was
+> **completed 2026-08-13** (§4.1.1) — see its per-kernel table, which refuted
+> several of the §2.2-§2.4 inferences.
 
 ### 2.1 Strictly verified
 
@@ -215,7 +221,7 @@ and take the median:
 (~300 kernels × 2-3 µs) is structurally cheap per-dispatch latency; rms_norm was
 the one exception and is now fixed.
 
-### 2.4 Final gap report (2026-08-06, precise decomposition)
+### 2.4 Final gap report (2026-08-06, precise decomposition) — SUPERSEDED
 
 | Component | minfer GPU | llama GPU | gap |
 |---|---|---|---|
@@ -225,6 +231,11 @@ the one exception and is now fixed.
 **The structural gap is 100 % in non-matmul** — minfer's ~340 small kernels run at
 ~4× llama's efficiency. (Honest uncertainty: minfer's 1.2 ms is reliable; the
 attention-vs-small split has ±0.2 ms noise; llama's 0.3 ms is inferred.)
+
+> **SUPERSEDED 2026-08-13 by §4.1.1's per-kernel trace.** The "~0 gap matmuls"
+> and "small ~4×" were subtraction artifacts. Real per-kernel data: matmuls
+> ARE the gap (1.6-3.9× per call) and small-op is at parity. This section is
+> kept as the historical pinpoint that motivated the trace.
 
 ### 2.5 KV-growth component (partially fixed 2026-08-10)
 
@@ -380,65 +391,118 @@ isolation tests pass, end-to-end byte-identical.
 
 ### 4.1 Step 0: GPU trace analysis (DONE 2026-08-13)
 
-**Result in one line**: per-kernel shader DURATIONS are not obtainable from the
-Metal System Trace on this setup (M4 Pro / Xcode 26.6) — but GPU performance
-LIMITERS are, via the Performance Limiters counter set, and they reveal the
-bottleneck TYPE per phase (memory/cache-bound, not ALU-bound).
+**Result in one line**: with Counter Set = Performance Limiters, the Metal
+System Trace DOES record per-kernel shader durations (`metal-shader-profiler-intervals`),
+giving the first real minfer-vs-llama per-op GPU comparison. The 2026-08-13
+early claim "per-kernel durations unavailable" was WRONG — it came from an
+`--xpath`/parsing bug (id/ref dedup), now fixed in `scripts/export_trace.sh`.
 
-**Correct xctrace path** (the old docs' "CLI impossible" was a wrong-tool bug):
-`/usr/bin/xctrace` is a broken stub ("tool not found"); the real binary is
-`/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`. Use it for
-`--toc` (verify the recording config) and `--xpath` table exports.
-
-**Why per-kernel durations are unavailable**: the Metal System Trace records
-per-forward GPU intervals (one row per command buffer = one minfer forward),
-NOT per-kernel times. The `metal-shader-profiler-intervals` table stayed empty
-even with "Enable Shader Timeline" ON — because the **GPU Counter Set** drives
-shader sampling, and this setup only offers `null` or `Performance Limiters`
-(counter sampling is OFF with `null`). So a trace gives:
-- `metal-gpu-intervals`: per-forward total GPU duration (cross-checks §1.2)
-- `metal-shader-profiler-shader-list`: the compiled kernel inventory
-- `gpu-counter-value` (+`gpu-counter-info`): full counter time-series when the
-  Counter Set is `Performance Limiters`
+**Correct xctrace path**: `/usr/bin/xctrace` is a broken stub ("tool not
+found"); the real binary is
+`/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`.
 
 **Workflow** (see `scripts/export_trace.sh`, written 2026-08-13):
 1. Record in Instruments: template Metal System Trace, **Counter Set →
-   Performance Limiters**, Enable Shader Timeline on (harmless), Deferred.
-2. `scripts/export_trace.sh <trace> [run]` exports and summarizes: counter map,
-   whole-run + per-phase bottleneck profile, per-forward durations.
-   `--list` shows runs + config; `--raw` dumps one table.
-3. Interpretation (percentage-type counters; bandwidth counters like
-   L1/LLC Read Bandwidth are cumulative and not %, ignore their magnitude):
+   Performance Limiters**, Enable Shader Timeline on, Deferred.
+2. `scripts/export_trace.sh <trace> [run]` exports + summarizes:
+   - `metal-shader-profiler-intervals` → **per-kernel durations** (kernel,
+     count, total/avg µs, % GPU work) — the key table
+   - `gpu-counter-value` → whole-run + per-phase limiter profile (bottleneck type)
+   - `metal-gpu-intervals` → per-forward durations
+   - `TRACE_PROC=<proc>` filters per-forward intervals (default `minfer`).
+3. Interpretation: percentage-type counters (Limiter/Utilization/Occupancy);
+   bandwidth counters (L1/LLC Read Bandwidth) are cumulative — ignore magnitude.
 
-**Measured bottleneck profile — minfer Q4_K_M 0.5B, -n 128 greedy (run2):**
+### 4.1.1 Per-kernel comparison — minfer vs llama (decode, M4 Pro, Q4_K_M 0.5B)
 
-| Phase | Occupancy Target | LLC Limiter | MMU Limiter | InstrThr Limiter | ALU Util | Read |
-|---|---|---|---|---|---|---|
-| prefill (35 tok, 20.99 ms) | **97.8 %** | 9.5 % | 3.7 % | 4.8 % | 3.3 % | **no hardware limit — GPU under-occupied** |
-| decode (avg 3.96 ms/token) | 76.6 % | **64.0 %** | 48.7 % | 42.4 % | ~10 % | **cache/memory-bound** |
+Both sides recorded with the identical Metal System Trace + Performance
+Limiters config. minfer: `-n 128 --greedy` (run2); llama-cli: `-n 128 --temp 0`
+(run1). **avg µs per kernel invocation** (the fair metric; step counts differ):
 
-- **Prefill has NO hardware bottleneck**: occupancy target 97.8 % but actual
-  Total Occupancy only 2.7 % — the GPU *wants* to be busy but is not filled.
-  The prefill GEMM gap (§4.3) is therefore an execution/scheduling inefficiency
-  (kernels too short / occupancy not reached), NOT an ALU or cache limit. This
-  is direct evidence for the "per-kernel execution, not kernel compute" verdict.
-- **Decode is memory/cache-bound** (LLC 64 %, MMU 49 %), consistent with the
-  ~130 GB/s weight-read model (§2.4). No ALU limit (~10 %) — the small-op and
-  matmul kernels are NOT compute-starved; the gap is bandwidth + per-kernel
-  latency.
+| kernel (minfer) | avg µs | kernel (llama) | avg µs | ratio |
+|---|---|---|---|---|
+| **q8_0 matmul** | **580.2** | mul_mv_q8_0_f32 | **353.2** | **1.6×** |
+| **q6_k matmul** | 37.8 | mul_mv_q6_K_f32 | 15.5 | **2.4×** |
+| **q5_0 matmul** | 32.0 | mul_mv_q5_0_f32 | 8.2 | **3.9×** |
+| **q4_k matmul** | 31.4 | mul_mv_q4_K_f32 | 9.7 | **3.2×** |
+| **attention partial+combine** | 15.2+4.3=19.5 | flash_attn_ext_vec | 5.8 | **3.4×** |
+| add_bias | 2.0 | bin_fuse | 1.6 | 1.3× |
+| rope | 1.4 | rope_neox | 1.3 | 1.1× |
+| rms_norm_256 | 1.3 | rms_norm_mul | 1.9 | **0.7× (minfer faster)** |
+| swiglu | 1.2 | swiglu | 1.6 | 0.8× |
+| store_kv | 1.3 | set_rows | 1.4 | 0.9× |
 
-**Next**: capture the same trace for llama-bench (same Performance Limiters
-config) and run the same script → llama's per-phase limiter profile, for a
-direct minfer-vs-llama bottleneck comparison. This replaces the (unobtainable)
-per-kernel duration comparison with an equally diagnostic limiter comparison.
+**This repoints §4.2/§4.3 priorities — three surprises vs the 2026-08-06 model:**
 
-### 4.2 decode non-matmul efficiency: flash attention + small elementwise
+1. **The decode gap is matmul-dominated, NOT attention/small-op.** minfer's
+   nt==1 matmul kernels run 1.6-3.9× slower than llama's on the SAME dims and
+   SAME source lineage (§2.1). q8_0 at 580 µs dominates decode GPU time. This
+   contradicts the old "matmuls are identical / zero gap" claim (§1.2/§2.4) —
+   the kernel source is the same but minfer's EXECUTION is slower per call.
+2. **Attention is 3.4×** (19.5 vs 5.8 µs) — confirms the flash port value (§4.2.1),
+   but it is now the SECOND lever, not the first.
+3. **The small-op 4× gap is REVERSED**: minfer's small kernels are now equal
+   or FASTER than llama's (rms_norm 1.3 vs 1.9, swiglu 1.2 vs 1.6). The
+   2026-08-06 "small elementwise ~4× slower" (§2.4) is refuted by direct
+   measurement — §4.2.2 is downgraded.
 
-The decode non-matmul gap (1.2 vs 0.3 ms, ~4×) has **two halves of comparable
-size** (§1.2/§2.3): attention (~0.54 ms vs ~0.15-0.2) and the small elementwise
-tail (~0.5 ms vs ~0.1-0.3). Both are required to close the 1.2→0.3 ms gap.
+**Why matmuls are slower per-call despite identical source**: the limiter
+profile shows decode is memory/cache-bound (LLC 64 %, MMU 49 % for BOTH sides;
+llama decode LLC 62 %, MMU 49 %). Both engines read the same ~392 MB/token at
+~130 GB/s — but llama reads it in **fewer, larger calls** (llama q8_0 = 199
+calls for the whole run vs minfer 120; llama's mul_mv_ext/batch handling reads
+more per dispatch). The per-call latency gap is the nt==1 grid/launch pattern:
+minfer's single-od kernels are dispatched one matmul per call, llama batches
+some (mul_mv_ext, R1×2) — see §4.3.
 
-#### 4.2.1 flash attention port (the attention half)
+**Bottleneck profile (limiter, from the same traces):**
+
+| Phase | Occupancy Target | LLC Limiter | MMU Limiter | ALU Util |
+|---|---|---|---|---|
+| minfer prefill | 97.8 % | 9.5 % | 3.7 % | 3.3 % |
+| minfer decode | 76.6 % | **64.0 %** | 48.7 % | ~10 % |
+| llama prefill | 99.6 % | 4.2 % | 2.3 % | 0.5 % |
+| llama decode | 69.4 % | **62.1 %** | 49.3 % | ~10 % |
+
+Both sides: prefill has NO hardware limit (GPU under-occupied — scheduling,
+not compute); decode is cache/memory-bound with nearly identical LLC/MMU
+pressure. The minfer-vs-llama decode gap is NOT a different bottleneck — it is
+minfer's per-call matmul inefficiency under the same memory-bound regime.
+
+**Open question (recorded, low priority)**: whether per-kernel intervals are
+recorded for minfer was initially doubted; the export/parse bug made it look
+empty. Now confirmed present. No further investigation needed.
+
+### 4.2 decode gap: per-kernel comparison (REVISED 2026-08-13)
+
+**The 2026-08-06 "non-matmul 1.2 ms ≈ 4×" model is REFUTED by the trace.**
+§4.1.1's per-kernel measurements show:
+- **matmuls are the main decode gap** (1.6-3.9× per-call, q8_0 dominates at
+  580 vs 353 µs) — the old §1.2/§2.4 "matmuls identical, zero gap" is wrong;
+- **attention is 3.4×** (19.5 vs 5.8 µs) — the flash port stays a real lever;
+- **small elementwise is now equal-or-faster than llama** (rms_norm 1.3 vs 1.9,
+  swiglu 1.2 vs 1.6) — the 4× small-op claim is refuted (§4.2.2 downgraded).
+
+So the decode work splits into: (A) per-call matmul execution inefficiency
+(§4.2.1) and (B) attention 3.4× (§4.2.2). Small-op fusion is closed.
+
+#### 4.2.1 matmul per-call execution (the NEW primary lever)
+
+The nt==1 matmul kernels have the SAME source lineage as llama's (§2.1) but
+minfer executes them 1.6-3.9× slower per call (q8_0 580 vs 353 µs, q5_0 32 vs
+8.2 µs) under identical memory-bound limiter pressure (both sides LLC ~62-64 %).
+Hypotheses to test, in order:
+1. **dispatch granularity**: llama uses `kernel_mul_mv_ext_*` (R1×2, batch
+   reads) for small n — minfer always dispatches one `_f32_matmul_multi` per
+   matmul. Port the ext/batched dispatch path to read more weights per launch.
+2. **threadgroup config**: llama's mul_mv threadgroup params (N_R0/N_SG,
+   §PARAMETER_AUDIT B) — the audit claimed they match, but the trace shows
+   different per-call times; re-verify with a real workload (not batched-cb).
+3. **grid shape**: the q8_0 kernel at od=151936 (output vocab) is huge; check
+   whether llama's special grid for the output matmul (noted in §2.2) is the
+   differentiator.
+
+#### 4.2.2 attention 3.4× → flash attention port
 
 **Former "dead-end" verdict revoked** (2026-08-12): the 2026-08-06 downgrade to
 "dead-end" (~0.3 ms gain, multi-day risk) was made under the accept-floor premise.
@@ -462,24 +526,15 @@ recover only ~25 ms for the same ~600-line cost, so it is **out of scope unless
 the prefill GEMM (§4.3) lands and attention becomes the residual prefill
 bottleneck again**.
 
-#### 4.2.2 small elementwise efficiency (the other half)
+#### 4.2.3 small elementwise — CLOSED by the trace (was the "other half")
 
-The ~300 small elementwise kernels (rms_norm/add/rope/store/swiglu) run at
-~0.5 ms vs llama's ~0.1-0.3 ms. §2.3 attributes this to "structurally cheap
-per-dispatch latency" (each is 2-3 µs; rms_norm was the one exception, fixed via
-the 256-thread rewrite). But llama runs the SAME f32 kernels ~4× faster, so the
-gap is real and unexplained — it is exactly what the trace (§4.1) must localize.
-Candidate directions, to be chosen per the trace:
-- **per-kernel latency**: if the trace shows uniform ~2-3 µs dispatch latency,
-  investigate fusing the ~20 kernels/layer down toward llama's 17 (fewer
-  dispatches; note §0-❌-5 says naive fusions measured no gain — needs a trace to
-  tell whether dispatch count or per-dispatch latency dominates).
-- **kernel efficiency**: if the trace shows individual small kernels at ~4×
-  llama's time, port llama's specific kernel bodies (e.g. `kernel_rms_norm_fuse`
-  was already a win; `kernel_add`/`kernel_swiglu_f32` equivalents).
-- **workload structure**: if llama simply does less small-op work per layer
-  (fused flash removes add_bias/rope/store from its path), the win comes from
-  the flash port (§4.2.1), not the small kernels themselves.
+**Refuted 2026-08-13**: §4.1.1 measured minfer's small elementwise kernels at
+1.2-2.0 µs vs llama's 1.3-1.9 µs — **equal or faster, not 4× slower**. The
+2026-08-06 "small-op ~4×" claim (§2.4) came from subtractive decomposition
+noise, not real per-kernel data. The 256-thread rms_norm, float4 elementwise
+(P6/P7), and BSR fusion already brought small ops to parity. No further work
+here. The small-op tail in §1.2's 0.5 ms is dispatch latency on tiny kernels
+(2-3 µs each), now confirmed present on both sides equally.
 
 ### 4.3 prefill GEMM execution efficiency (~5.4 vs ~7 TFLOPs/s)
 
