@@ -517,6 +517,8 @@ loops. llama's `kernel_mul_mv_q6_K_f32_impl` uses a stride-2 thread layout
 (stride-2 + float4, TG(32, nsg=2) dispatch). Result:
 - q6_K isolation: 72 → **209 GB/s** (llama 217)
 - decode steady gpu: **4.27 → 3.72 ms/token (~13 %)**
+- **full decode A/B (Generated: pure-decode, -n 256 ×5): old cf2705c median
+  ~203 t/s → new 525efe1 median ~220 t/s (~+8 %)**
 - byte-identical output (git-stash A/B), all tests green.
 
 q5_0 and q8_0 were already at parity — no work there. q4_K is not present in
