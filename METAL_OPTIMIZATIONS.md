@@ -49,15 +49,16 @@
 
 | # | Item | Goal | Status |
 |---|---|---|---|
-| 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel comparison obtained — matmul 1.6-3.9×, attention 3.4×, small-op parity |
-| 2 | **decode matmul per-call execution inefficiency** (NEW primary lever from trace) | q8_0 580→353 µs, q5_0 32→8 µs per call | test dispatch granularity (mul_mv_ext port), threadgroup config, output-matmul grid (§4.2.1) |
+| 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
+| 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 19.5→~5.8 µs/call | gated on trace. Former "dead-end" verdict revoked (§4.2.2) |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 
-> Note: §4.1.1's per-kernel data refutes the 2026-08-06 "non-matmul 4×" model —
-> the decode gap is matmul per-call + attention, NOT small elementwise.
+> Note: §4.1.1's per-kernel table is superseded by the clean isolation A/B
+> (§4.2.1): the trace mixed fused-vs-separate and different od per kernel name.
+> The reliable decode gap = q6_K ffn_down kernel saturation (now fixed).
 
 ### ❌ Decided not to change (has measured or llama-source evidence)
 
@@ -415,6 +416,12 @@ found"); the real binary is
 
 ### 4.1.1 Per-kernel comparison — minfer vs llama (decode, M4 Pro, Q4_K_M 0.5B)
 
+> **SUPERSEDED 2026-08-13 by the clean isolation A/B in §4.2.1.** The per-kernel
+> numbers below mix fused-vs-separate matmuls and different od per kernel name
+> (trace per-step aggregate semantics), so the ratios are NOT reliable. The
+> isolation A/B (same od/id/nt, both engines) is authoritative: q5_0/q8_0 at
+> parity, q6_K ffn_down 3× slower (fixed). Kept below as the raw trace record.
+
 Both sides recorded with the identical Metal System Trace + Performance
 Limiters config. minfer: `-n 128 --greedy` (run2); llama-cli: `-n 128 --temp 0`
 (run1). **avg µs per kernel invocation** (the fair metric; step counts differ):
@@ -488,19 +495,33 @@ So the decode work splits into: (A) per-call matmul execution inefficiency
 
 #### 4.2.1 matmul per-call execution (the NEW primary lever)
 
-The nt==1 matmul kernels have the SAME source lineage as llama's (§2.1) but
-minfer executes them 1.6-3.9× slower per call (q8_0 580 vs 353 µs, q5_0 32 vs
-8.2 µs) under identical memory-bound limiter pressure (both sides LLC ~62-64 %).
-Hypotheses to test, in order:
-1. **dispatch granularity**: llama uses `kernel_mul_mv_ext_*` (R1×2, batch
-   reads) for small n — minfer always dispatches one `_f32_matmul_multi` per
-   matmul. Port the ext/batched dispatch path to read more weights per launch.
-2. **threadgroup config**: llama's mul_mv threadgroup params (N_R0/N_SG,
-   §PARAMETER_AUDIT B) — the audit claimed they match, but the trace shows
-   different per-call times; re-verify with a real workload (not batched-cb).
-3. **grid shape**: the q8_0 kernel at od=151936 (output vocab) is huge; check
-   whether llama's special grid for the output matmul (noted in §2.2) is the
-   differentiator.
+**Clean isolation A/B (2026-08-13)**: the trace per-kernel table (§4.1.1) was
+unreliable (fused-vs-separate, mixed od per kernel name). Replaced by a clean
+apples-to-apples isolation harness: minfer `matmul_bandwidth_profile` (batched
+cb) vs llama `test-backend-ops perf -b MTL0 -o MUL_MAT` at the SAME od/id/nt:
+
+| matmul | od/id | minfer GB/s | llama GB/s | gap |
+|---|---|---|---|---|
+| q5_0 | 896/896 | 91 | 97 | ~parity |
+| q5_0 (fused GU) | 37888/896 | 155-166 | 211 | moderate |
+| **q6_K (ffn_down)** | **896/4864** | **72** | **217** | **3.0×** |
+| q8_0 (output) | 151936/896 | 220-251 | 252 | ~parity |
+
+**Root cause (q6_K, the real gap)**: minfer's `kernel_q6_k_f32_matmul` used a
+stride-64 super-block loop — for id=4864 (nb=19 super-blocks) only 19 of 64 TG
+threads did work (**~30 % utilization**) with scalar (non-vectorized) inner
+loops. llama's `kernel_mul_mv_q6_K_f32_impl` uses a stride-2 thread layout
+(16 groups × float4 sums) → ~100 % utilization.
+
+**Fix (SHIPPED 2026-08-13)**: ported llama's q6_K kernel layout into minfer
+(stride-2 + float4, TG(32, nsg=2) dispatch). Result:
+- q6_K isolation: 72 → **209 GB/s** (llama 217)
+- decode steady gpu: **4.27 → 3.72 ms/token (~13 %)**
+- byte-identical output (git-stash A/B), all tests green.
+
+q5_0 and q8_0 were already at parity — no work there. q4_K is not present in
+the 0.5B K_M model weights (Q5_0/Q8_0/Q6_K/Q4_K mixed); if a model uses q4_K
+decode it should get the same layout treatment.
 
 #### 4.2.2 attention 3.4× → flash attention port
 

@@ -1949,72 +1949,85 @@ kernel void kernel_q6_k_f32_matmul(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    const int QKK = 256;
-    const int Q6KB = 210;
-    const short NR0 = 2;
-    const short NSG = 2;
-    const short NW  = 32;
+    // Faithful port of llama's kernel_mul_mv_q6_K_f32_impl (stride-2 thread
+    // layout, float4 sums). Dispatch: TG(32, nsg=2), grid_x = od/(nr0*nsg).
+    constexpr short NR0 = 2;
+    constexpr short NSG = 2;
 
-    const int nbe = p[1] / QKK;
-    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
-    const int t   = (int)tgpig.y;
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = p[1] / 256;                       // super-blocks per row
+    const int r0 = (int)tgpig.x;                     // grid tile (not row!)
+    const int t  = (int)tgpig.y;
     if (t >= p[2]) return;
 
-    const int row_stride = nbe * Q6KB;
-    device const uchar * w0 = weights + (r0 + 0) * row_stride;
-    device const uchar * w1 = weights + (r0 + 1) * row_stride;
-    device const float  * y  = acts + t * p[1];
+    const int first_row = (r0 * NSG + (int)sgitg) * NR0;
 
-    float sumf0 = 0.0f, sumf1 = 0.0f;
+    const int row_stride = nb * 210;                 // Q6_K block bytes
+    device const uchar * x0 = weights + first_row * row_stride;
+    device const float * yy = acts + t * p[1];
 
-    for (int ib = (int)tiisg; ib < nbe; ib += NW) {
-        device const uchar * blk0 = w0 + ib * Q6KB;
-        device const uchar * blk1 = w1 + ib * Q6KB;
+    float sumf[NR0] = { 0.0f, 0.0f };
 
-        float bd0 = float(*(device const half *)(blk0 + 208));
-        float bd1 = float(*(device const half *)(blk1 + 208));
-        device const uchar * ql0 = blk0;
-        device const uchar * ql1 = blk1;
-        device const uchar * qh0 = blk0 + 128;
-        device const uchar * qh1 = blk1 + 128;
-        device const char  * sc0 = (device const char *)(blk0 + 192);
-        device const char  * sc1 = (device const char *)(blk1 + 192);
-        device const float * yb = y + ib * QKK;
+    float yl[16];
 
-        for (int n = 0; n < 2; n++) {
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                device const float * ys = yb + n * 128 + l;
+    const short tid = tiisg / 2;
+    const short ix  = tiisg % 2;
+    const short ip  = tid / 8;                       // 0 or 1
+    const short il  = tid % 8;
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
 
-                int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
-                int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
-                int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
-                int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
-                int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
-                int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
-                int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
-                int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
+    const short y_offset   = 128 * ip + l0;
+    const short q_offset_l =  64 * ip + l0;
+    const short q_offset_h =  32 * ip + l0;
 
-                int si = is + n * 8;
-                sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
-                       + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
-                       + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
-                       + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
-                sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
-                       + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
-                       + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
-                       + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
+    for (int i = ix; i < nb; i += 2) {
+        device const uchar * blk = x0 + i * 210;
+        device const uchar * q1 = blk + q_offset_l;
+        device const uchar * q2 = q1 + 32;
+        device const uchar * qh = blk + 128 + q_offset_h;
+        device const int8_t  * sc = (device const int8_t *)(blk + 192) + is;
+        device const half   * dh = (device const half *)(blk + 208);
+
+        device const float * y = yy + i * 256 + y_offset;
+
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            float4 sums = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
             }
-            ql0 += 64; ql1 += 64;
-            qh0 += 32; qh1 += 32;
+
+            sumf[row] += float(dh[0]) * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                                       + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+
+            q1 += row_stride;
+            q2 += row_stride;
+            qh += row_stride;
+            sc += row_stride;
+            dh += row_stride / 2;
         }
     }
 
-    sumf0 = simd_sum(sumf0);
-    sumf1 = simd_sum(sumf1);
-    if (tiisg == 0) {
-        if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
-        if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+    for (int row = 0; row < NR0 && first_row + row < p[0]; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            output[t * p[0] + first_row + row] = sum_all;
+        }
     }
 }
 

@@ -392,7 +392,14 @@ impl MpsCommandBuffer<'_> {
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                    self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                    // Q6_K: llama's kernel_mul_mv_q6_K_f32_impl uses TG(32, nsg=2);
+                    // the stride-2 thread layout keeps all threads busy for small
+                    // id (nb super-blocks), unlike the old stride-64 scalar loop.
+                    if ttype == TensorType::Q6_K {
+                        self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
+                    } else {
+                        self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
+                    }
                 }
             }
             TensorType::Q4_1 => {

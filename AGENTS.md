@@ -462,18 +462,21 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > intervals are not recorded by the Metal System Trace on this setup — see
 > METAL_OPTIMIZATIONS.md §4.1, which replaces the old "Xcode-GUI-only" claim with
 > the correct xctrace path + Performance Limiters workflow). See §3.4/§4.
-> **Optimization-plan status (2026-08-12, trace DONE 2026-08-13)**: the
+> **Optimization-plan status (2026-08-12, trace DONE 2026-08-13, q6_K FIXED)**: the
 > 2026-08-06 "accept the architecture floor" verdict is **REVOKED** — the goal is
 > to match llama.cpp performance. METAL_OPTIMIZATIONS.md §0 progress table is the
 > single tracking source; §4 is the only action path: (1) GPU trace DONE —
 > `scripts/export_trace.sh` + Performance Limiters counter set gives BOTH
 > per-kernel durations (metal-shader-profiler-intervals) and limiter profile;
-> per-kernel comparison (METAL §4.1.1): matmuls 1.6-3.9× slower per call
-> (q8_0 580 vs 353 µs — the NEW primary decode lever), attention 3.4× (19.5 vs
-> 5.8 µs), small elementwise at parity (the old 4× claim refuted); limiter:
-> prefill = under-occupied (no HW limit), decode = cache/memory-bound on BOTH
-> sides, (2) decode matmul per-call execution (dispatch granularity /
-> mul_mv_ext port / threadgroup re-verify), (3) flash-attention port (attention
+> the trace per-kernel table was later SUPERSEDED by a clean isolation A/B
+> (llama test-backend-ops perf vs minfer matmul_bandwidth_profile) — the early
+> "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed
+> od); limiter: prefill = under-occupied (no HW limit), decode =
+> cache/memory-bound on BOTH sides. (2) decode matmul per-call: the real gap
+> was **q6_K ffn_down** (72 vs 217 GB/s, stride-64 loop ~30% TG utilization) —
+> **FIXED 2026-08-13** (ported llama's stride-2/float4 layout): q6_K 209 GB/s,
+> decode 4.27→3.72 ms/tok (~13%), byte-identical, tests green. q5_0/q8_0 at
+> parity; q4_K only if a model uses it, (3) flash-attention port (attention
 > 3.4×), (4) prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape
 > probe first), (5) 7B same-model A/B + per-step regression check. Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
