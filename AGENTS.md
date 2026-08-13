@@ -477,7 +477,11 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > **FIXED 2026-08-13** (ported llama's stride-2/float4 layout): q6_K 209 GB/s,
 > decode 4.27→3.72 ms/tok (~13%), byte-identical, tests green. q5_0/q8_0 at
 > parity; q4_K only if a model uses it, (3) flash-attention port (attention
-> 3.4×), (4) prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape
+> ~7-10× isolation-confirmed 2026-08-13: minfer split 42.8 µs/layer vs llama
+> flash ~4-6 µs/layer at nkv=430; structural cause = simd_shuffle_down vs
+> threadgroup barriers; port decision pending KV-layout pre-check — see METAL
+> §4.2.2; llama build env has a pre-existing ObjC/SDK issue recorded there),
+> (4) prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape
 > probe first), (5) 7B same-model A/B + per-step regression check. Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).

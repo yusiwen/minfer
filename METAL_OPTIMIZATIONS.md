@@ -51,7 +51,7 @@
 |---|---|---|---|
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
-| 3 | **flash attention port** | decode **attention** 19.5→~5.8 µs/call | gated on trace. Former "dead-end" verdict revoked (§4.2.2) |
+| 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | gap isolation-confirmed 2026-08-13 (§4.2.2). Port decision pending KV-layout pre-check (minfer `[nkv,nk,hd]` vs llama `[hd,nk,nkv]`). Recommended option C (hybrid float4+simd reduction, no function constants) |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
@@ -525,22 +525,60 @@ q5_0 and q8_0 were already at parity — no work there. q4_K is not present in
 the 0.5B K_M model weights (Q5_0/Q8_0/Q6_K/Q4_K mixed); if a model uses q4_K
 decode it should get the same layout treatment.
 
-#### 4.2.2 attention 3.4× → flash attention port
+#### 4.2.2 attention gap confirmed — flash attention port
 
 **Former "dead-end" verdict revoked** (2026-08-12): the 2026-08-06 downgrade to
 "dead-end" (~0.3 ms gain, multi-day risk) was made under the accept-floor premise.
-Since the goal is to reach llama's level (attention ~0.35 ms of the structural
-gap), this is a **required path**, not an option.
+Since the goal is to reach llama's level (attention ~0.9 ms of the decode gap),
+this is a **required path**, not an option.
 
-Current state: minfer's split attention (2 kernels/layer, ~0.54 ms) is structurally
-the best non-flash design (classic single-pass is 8× worse). llama's flash is fast
-because of its `simdgroup_matrix` design + per-shape function constants, NOT
-because it is "1 kernel" (a naive 1-kernel fusion measured 4.80 vs 4.15 ms, slower).
+**Gap confirmed by isolation (2026-08-13, NOT a trace artifact):**
 
-**Candidate**: faithful port of llama `kernel_flash_attn_ext_vec` (~600 lines,
-simdgroup matrices, f16 KV, KV-parallel tiles) replacing partial+combine (−24
-kernels). Risk: new kernel + isolation tests (follow the established methodology:
-isolation test first against a scalar reference, then byte-identical A/B).
+| metric | minfer | llama | ratio |
+|---|---|---|---|
+| attention per layer, nkv=430 (isolation) | **42.8 µs** (partial+combine) | **~4-6 µs** (flash vec) | **~7-10×** |
+
+llama flash isolation (`test-backend-ops perf`, f16 KV, nb=1 vec kernel):
+kv=4096 → 23.7 µs, kv=8192 → 55.3 µs (≈linear scaling) → extrapolated to
+nkv=430 ≈ 2.5-6 µs/layer, matching the trace's 5.8 µs. Attention is **~0.9 ms
+of the 3.72 ms decode step (~24 %)** — the largest remaining decode lever after
+the q6_K fix.
+
+**Structural root cause** (correcting the earlier "simdgroup_matrix design"
+claim): llama's flash does NOT use the hardware matrix engine here — it uses
+**`dot(float4,float4)` + `simd_shuffle_down` reductions** for QK^T and PV, which
+need **NO threadgroup barrier within a KV tile**. minfer's partial uses scalar
+float4-sum accumulation and **2 threadgroup_barrier per 32-row tile**
+(28/layer at nkv=430). That barrier + reduction structure is the gap, not the
+dot instruction.
+
+**Note — `dot()` builtin experiment failed and was reverted (2026-08-13)**:
+replacing minfer's hand-written `qv.x+qv.y+qv.z+qv.w` with Metal's `dot()`
+builtin errors: `dot` is a reserved Metal function name and the classic
+attention kernel (`kernel_gqa_attn_f32/f16`) already uses a **local variable
+named `dot`** in the same translation unit. Fully reverted (git diff clean,
+tests green); the hand-sum is what the compiler emits for `dot()` anyway, so
+the gain would be noise. The real lever is the barrier/reduction structure.
+
+**Note — llama.cpp build environment (out of scope but recorded)**: the llama
+repo has a pre-existing ObjC/SDK build issue — `MTL4CommandQueue` needs
+macOS 26, but recompiling ggml-metal ObjC with deployment target 26.0 trips
+CoreFoundation `-Welaborated-enum-base`. The existing `test-backend-ops` binary
+works and has the perf cases used above; **adding NEW llama test cases requires
+a build fix that is out of this task's scope**.
+
+**Port decision (options, in order of preference):**
+
+| Option | Description | Gain | Risk |
+|---|---|---|---|
+| **C. Hybrid (recommended)** | Port llama's float4 QK^T/PV + simd_shuffle_down reduction structure into a single minfer decode-attention kernel, WITHOUT the full function-constant / nwg/nsg specialization system (fixed config for Qwen2 dims) | up to ~7× (42.8 → ~6 µs) | Moderate: new kernel + isolation tests |
+| **A. Full port** | Faithful `kernel_flash_attn_ext_vec` (~600 lines, function constants, per-shape pipelines) replacing partial+combine | same as C | High: requires minfer to support function-constant pipeline compilation (runtime selection differs) |
+| **B. Optimize partial only** | Fewer barriers / float4 QK^T in the existing split kernel | bounded 1.5-2× | Low |
+
+**Pre-port check required**: minfer's KV cache layout vs llama flash's expected
+layout. llama flash reads K/V as `[hd, nk, nkv]` contiguous per head; minfer
+stores per `[nkv, nk, hd]`. Must confirm/rework the KV cache (or a view) to
+match before porting — otherwise the kernel reads garbage.
 
 **Prefill flash explicitly deferred**: llama also uses a prefill flash
 (`kernel_flash_attn_ext_blk`), but minfer's 3-pass parallel prefill attention
