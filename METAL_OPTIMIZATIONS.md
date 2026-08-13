@@ -49,12 +49,12 @@
 
 | # | Item | Goal | Status |
 |---|---|---|---|
-| 1 | **Xcode GUI per-kernel GPU trace** (minfer + llama, same workload, decode + prefill) | pinpoint the non-matmul 4× and GEMM ~30 % gap | not started. CLI method proven impossible; fallback exists (§4.1) |
-| 2 | **flash attention port** (or an equivalent 1-kernel decode attention) | decode **attention** 0.54→~0.15 ms | gated on trace #1. Former "dead-end" verdict revoked (§4.2) |
-| 3 | **decode small-elementwise efficiency** (why llama's f32 small kernels are ~4× faster than minfer's) | decode **small elementwise** ~0.5→~0.1-0.3 ms | gated on trace #1. Part of the non-matmul 4× gap (§4.2) |
-| 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3) |
+| 1 | **GPU trace (minfer): Performance Limiters bottleneck profile** | per-phase bottleneck type (done); llama-side comparison pending | **minfer DONE 2026-08-13** (§4.1): prefill = under-occupied (no HW limit), decode = cache/memory-bound. llama trace pending |
+| 2 | **flash attention port** (or an equivalent 1-kernel decode attention) | decode **attention** 0.54→~0.15 ms | gated on trace. Former "dead-end" verdict revoked (§4.2) |
+| 3 | **decode small-elementwise efficiency** (why llama's f32 small kernels are ~4× faster than minfer's) | decode **small elementwise** ~0.5→~0.1-0.3 ms | gated on trace. Part of the non-matmul 4× gap (§4.2) |
+| 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
-| 6 | remaining items per trace #1 results | — | TBD |
+| 6 | remaining items per trace results | — | TBD |
 
 > Note: §0 #2 + #3 together close the decode non-matmul 4× gap (1.2→0.3 ms).
 > Flash alone only covers the attention half; small elementwise is the other half.
@@ -378,30 +378,59 @@ isolation tests pass, end-to-end byte-identical.
 > goal. The following is the evidence-based action path, in order; update the §0
 > progress table after each step.
 
-### 4.1 Step 0 (required): Xcode GUI per-kernel GPU trace
+### 4.1 Step 0: GPU trace analysis (DONE 2026-08-13)
 
-**Why it is required**: every "structural / no low-risk lever" conclusion is based
-on elimination + source identity, **never on per-kernel GPU timing** (§2.1 only
-verifies down to "per-dispatch GPU time differs"). The CLI method is proven
-impossible (2026-08-11 A2):
-- `GGML_METAL_CAPTURE_COMPUTE=1` errors with "Capture layer is not inserted"
-  (needs Xcode/Instruments GPU capture).
-- `xctrace record --template 'Metal System Trace'` captures a .trace, but the CLI
-  export is empty — the template has "Shader Timeline: Disabled"; per-kernel
-  durations are only visible in the Xcode GUI.
+**Result in one line**: per-kernel shader DURATIONS are not obtainable from the
+Metal System Trace on this setup (M4 Pro / Xcode 26.6) — but GPU performance
+LIMITERS are, via the Performance Limiters counter set, and they reveal the
+bottleneck TYPE per phase (memory/cache-bound, not ALU-bound).
 
-**Action**: capture one decode and one prefill .trace each for minfer and
-llama.cpp (same workload) in Xcode/Instruments; compare per-kernel GPU time. This
-decides the priority of §4.2/§4.3 (attention-dominated? small-op-dominated?
-uniform launch overhead?) and validates whether §1.2's subtractive minfer
-decomposition overestimates matmul.
+**Correct xctrace path** (the old docs' "CLI impossible" was a wrong-tool bug):
+`/usr/bin/xctrace` is a broken stub ("tool not found"); the real binary is
+`/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`. Use it for
+`--toc` (verify the recording config) and `--xpath` table exports.
 
-**Fallback (if Xcode GUI stays unavailable)**: minfer already has a solid
-subtractive stack — `MINFER_TIMING` (gpu submit-wait) + `MINFER_SKIP_ATTN/MATMULS/
-SMALL=1` (DecodeSkips) + batched-cb per-kernel profiles (§2.3). The trace would
-refine the llama side (currently inferred, §1.2); without it, proceed with the
-existing measured decomposition as the best available basis, keeping the trace as
-a later cross-check. The trace is the preferred step 0, not a hard blocker.
+**Why per-kernel durations are unavailable**: the Metal System Trace records
+per-forward GPU intervals (one row per command buffer = one minfer forward),
+NOT per-kernel times. The `metal-shader-profiler-intervals` table stayed empty
+even with "Enable Shader Timeline" ON — because the **GPU Counter Set** drives
+shader sampling, and this setup only offers `null` or `Performance Limiters`
+(counter sampling is OFF with `null`). So a trace gives:
+- `metal-gpu-intervals`: per-forward total GPU duration (cross-checks §1.2)
+- `metal-shader-profiler-shader-list`: the compiled kernel inventory
+- `gpu-counter-value` (+`gpu-counter-info`): full counter time-series when the
+  Counter Set is `Performance Limiters`
+
+**Workflow** (see `scripts/export_trace.sh`, written 2026-08-13):
+1. Record in Instruments: template Metal System Trace, **Counter Set →
+   Performance Limiters**, Enable Shader Timeline on (harmless), Deferred.
+2. `scripts/export_trace.sh <trace> [run]` exports and summarizes: counter map,
+   whole-run + per-phase bottleneck profile, per-forward durations.
+   `--list` shows runs + config; `--raw` dumps one table.
+3. Interpretation (percentage-type counters; bandwidth counters like
+   L1/LLC Read Bandwidth are cumulative and not %, ignore their magnitude):
+
+**Measured bottleneck profile — minfer Q4_K_M 0.5B, -n 128 greedy (run2):**
+
+| Phase | Occupancy Target | LLC Limiter | MMU Limiter | InstrThr Limiter | ALU Util | Read |
+|---|---|---|---|---|---|---|
+| prefill (35 tok, 20.99 ms) | **97.8 %** | 9.5 % | 3.7 % | 4.8 % | 3.3 % | **no hardware limit — GPU under-occupied** |
+| decode (avg 3.96 ms/token) | 76.6 % | **64.0 %** | 48.7 % | 42.4 % | ~10 % | **cache/memory-bound** |
+
+- **Prefill has NO hardware bottleneck**: occupancy target 97.8 % but actual
+  Total Occupancy only 2.7 % — the GPU *wants* to be busy but is not filled.
+  The prefill GEMM gap (§4.3) is therefore an execution/scheduling inefficiency
+  (kernels too short / occupancy not reached), NOT an ALU or cache limit. This
+  is direct evidence for the "per-kernel execution, not kernel compute" verdict.
+- **Decode is memory/cache-bound** (LLC 64 %, MMU 49 %), consistent with the
+  ~130 GB/s weight-read model (§2.4). No ALU limit (~10 %) — the small-op and
+  matmul kernels are NOT compute-starved; the gap is bandwidth + per-kernel
+  latency.
+
+**Next**: capture the same trace for llama-bench (same Performance Limiters
+config) and run the same script → llama's per-phase limiter profile, for a
+direct minfer-vs-llama bottleneck comparison. This replaces the (unobtainable)
+per-kernel duration comparison with an equally diagnostic limiter comparison.
 
 ### 4.2 decode non-matmul efficiency: flash attention + small elementwise
 

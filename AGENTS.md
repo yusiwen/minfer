@@ -458,17 +458,20 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > ceiling at ~**5.4 TFLOPs/s** (Q5_0 dequant-bound, grid-shape variance 3.5-5.4)
 > vs llama's ~7 TFLOPs/s effective — a ~30 % GEMM execution-efficiency gap, the
 > same "structural" class as the decode finding. llama per-op timing is NOT
-> obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; xctrace export
-> is empty — "Shader Timeline disabled"), confirming the docs' Xcode-GUI-only
-> limitation. See METAL_OPTIMIZATIONS.md §3.4/§4.
-> **Optimization-plan status (2026-08-12)**: the 2026-08-06 "accept the
-> architecture floor" verdict is **REVOKED** — the goal is to match llama.cpp
-> performance. METAL_OPTIMIZATIONS.md §0 progress table is the single tracking
-> source; §4 is the only action path: (1) Xcode GUI per-kernel trace (CLI xctrace
-> disproven; fallback = existing MINFER_TIMING + skip-gate decomposition), (2)
-> decode non-matmul efficiency = flash-attention port (attention half) + small
-> elementwise investigation (other half), (3) prefill GEMM execution efficiency
-> toward ~7 TFLOPs/s (grid-shape probe first, counter-evidence noted), (4) 7B
+> obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; per-kernel shader
+> intervals are not recorded by the Metal System Trace on this setup — see
+> METAL_OPTIMIZATIONS.md §4.1, which replaces the old "Xcode-GUI-only" claim with
+> the correct xctrace path + Performance Limiters workflow). See §3.4/§4.
+> **Optimization-plan status (2026-08-12, trace step DONE 2026-08-13)**: the
+> 2026-08-06 "accept the architecture floor" verdict is **REVOKED** — the goal is
+> to match llama.cpp performance. METAL_OPTIMIZATIONS.md §0 progress table is the
+> single tracking source; §4 is the only action path: (1) GPU trace DONE —
+> `scripts/export_trace.sh` + Performance Limiters counter set; minfer prefill =
+> no HW limit (GPU under-occupied, scheduling not compute), decode =
+> cache/memory-bound (LLC/MMU); llama-side trace pending, (2) decode non-matmul
+> efficiency = flash-attention port (attention half) + small elementwise
+> investigation (other half), (3) prefill GEMM execution efficiency toward ~7
+> TFLOPs/s (grid-shape probe first, counter-evidence noted), (4) 7B
 > same-model A/B + per-step regression check. Dropped: 2D-simdgroup GEMM (llama
 > disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A) + bf16 staging (llama
 > reads f32 activations per Core convention #1).
