@@ -1,8 +1,9 @@
 # Metal Backend Optimizations
 
 > **Goal**: match llama.cpp (commit `88b47a755`, Apple M4 Pro) performance.
-> **Current gap (2026-08-11 same-model, same-parameter A/B)**: decode is 72-88 % of
-> llama (pure GPU 1.1-1.4×), prefill 2.8-3.6×. See [§1 Current state](#1-current-state).
+> **Current gap (2026-08-14 same-model, same-parameter A/B)**: decode is 72-88 % of
+> llama (pure GPU 1.1-1.4×), long prefill ~2.6-2.7× (down from 2.8-3.6× via the
+> prefill flash port, `5974eb1`). See [§1 Current state](#1-current-state).
 >
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
@@ -80,17 +81,19 @@
 
 ## 1. Current state
 
-### 1.1 Same-model, same-parameter A/B (2026-08-11, M4 Pro, identical GGUF)
+### 1.1 Same-model, same-parameter A/B (2026-08-14, M4 Pro, identical GGUF)
 
 minfer `--greedy` (pure decode, llama "Generation" caliber); llama.cpp
-`llama-bench -b 512 -t 8` (pure eval). Model Qwen2.5-0.5B-Instruct.
+`llama-bench -b 512 -t 8` (pure eval). Model Qwen2.5-0.5B-Instruct. Prefill
+numbers updated after the prefill flash port (`5974eb1`): minfer pp430-435 uses
+the `kernel_flash_attn_blk_f32` path (hd==64).
 
 **Q4_K_M** (`qwen2.5-0.5b-instruct-q4_k_m.gguf`):
 
 | Test | llama.cpp | minfer | Gap |
 |---|---|---|---|
-| prefill 30 tok | 2720 t/s | ~748 t/s | **3.6×** |
-| prefill 430 tok | 6909 t/s | ~2466 t/s | **2.8×** |
+| prefill 30 tok | 2720 t/s | ~580 t/s (pp35, flash; short-prompt fixed overhead dominates) | — |
+| prefill 430 tok | 6909 t/s | ~2530-2620 t/s (pp435, flash) | **2.6-2.7×** |
 | decode 128 tok (pure GPU) | 293-299 t/s | ~218 t/s (4.47 ms/tok steady) | **1.3-1.4×** |
 | decode, default sampling | 247 t/s | ~197 t/s | **1.25×** |
 
@@ -98,16 +101,21 @@ minfer `--greedy` (pure decode, llama "Generation" caliber); llama.cpp
 
 | Test | llama.cpp | minfer | Gap |
 |---|---|---|---|
-| prefill 30 tok | 2610 t/s | ~812 t/s | **3.2×** |
-| prefill 430 tok | 7449 t/s | ~2596 t/s | **2.9×** |
+| prefill 30 tok | 2610 t/s | ~680 t/s (pp35, flash) | — |
+| prefill 430 tok | 7449 t/s | ~2770 t/s (pp435, flash) | **2.7×** |
 | decode 128 tok | 314-339 t/s | ~279 t/s (3.90 ms/tok steady) | **1.1-1.2×** |
 
 **Reading**:
 - **Decode is now 72-88 % of llama** (pure GPU 1.1-1.4×, default sampling 1.25×) —
   driven by rms_norm_256, the chunk-cap/sync fixes, and the per-kernel non-matmul
   profile (was 1.47× before 2026-08-10).
-- **Prefill remains the main gap (2.8-3.6×)** — after the parallel attention fix
-  (100→30 ms), the remainder is matmuls + small kernels (§4.3).
+- **Prefill (long) improved from 2.8-3.6× to ~2.6-2.7×** after the prefill flash
+  port (§4.3.2): GPU ~164 → ~144 ms at pp435 (~12 %; pp294 ~16 %). The residual
+  gap is the non-attention 89 → ~44 ms structural difference (GEMMs + small
+  kernels under-occupied, §4.3.1), NOT attention (now ~3-4 ms, llama-like).
+- **Short prefill (pp30) is dominated by per-dispatch fixed overhead** (~580-680
+  t/s regardless of attention path — flash/3-pass/classic all equal), so pp30 is
+  no longer a meaningful attention lever; llama's pp30 is similarly launch-bound.
 
 ### 1.2 Per-token GPU decomposition (decode, nt==1, Q4_K_M 0.5B)
 
