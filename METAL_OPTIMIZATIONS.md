@@ -43,7 +43,8 @@
 | 21 | Same-model, same-parameter A/B benchmark doc | gap baseline established | `09d27ae` |
 | 22 | **Flash attention port** (llama `kernel_flash_attn_ext_vec`, NSG=1 fixed DK=DV=64) | decode GPU 0.25-1.0 ms/token faster; wall ~10 % (0.5B, byte-identical) | `2e0c8b3` |
 | 23 | **Prefill gap root-cause** (2026-08-14): GEMM is NOT the prefill lever | see to-do #4 status | — |
-| 24 | **Prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy simdgroup-matrix, NSG=4 fixed DK=DV=64) | prefill GPU ~110→~93 ms (~16 %); f32+f16 byte-identical to classic | this work |
+| 24 | **Prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy simdgroup-matrix, NSG=4 fixed DK=DV=64) | prefill GPU ~110→~93 ms (~16 %); f32+f16 byte-identical to classic | `5974eb1` |
+| 25 | **hd=128 (7B) prefill flash feasibility analysis** (2026-08-15) | verdict: feasible; shmem 10240 B < 32 KB; ~9.5 % total prefill gain + fixes 7B f16-cache bug | see §4.3.3 |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -759,6 +760,66 @@ output byte-identically.
 flash path requires hd==64 (fixed DK=DV), else 3-pass. Host side:
 `attn_flash_prefill` (metal.rs) grows the pad buffer, runs `kernel_kv_tail_pad`
 when nkv % 64 != 0, then the blk kernel.
+
+#### 4.3.3 hd=128 (7B) prefill flash feasibility analysis (2026-08-15)
+
+The §4.3.2 port is fixed-shape DK=DV=64 (0.5B/1.5B). The user-facing 7B
+(hd=128, nh=28, nk=4, nkt=512) still runs the 3-pass prefill attention. This
+section answers whether a hd=128 blk variant is feasible and worth doing.
+
+**llama.cpp reference (verified in source)**:
+- 7B prefill uses `kernel_flash_attn_ext_blk` (the `use_vec` gate is
+  `ne01 < 20`, i.e. decode-only; ggml-metal-ops.cpp:2526-2533). NSG = 4
+  (`ne00 >= 512 ? 8 : 4`, line 2835 — 7B hd=128 → 4, same as 0.5B).
+- NQPSG=8 / NCPSG=64 (metal-impl.h:109-110), grid `(ceil(nt/8), nh)`,
+  threads `(32, NSG)`.
+- shmem formula `FATTN_SMEM` (ops.cpp:2817): hd=128 →
+  `8*(128 + 2*128 + 2*2*64) halfs = 10240 B`. hd=64 → 7168 B (matches minfer).
+
+**shmem layout scales cleanly** — the key insight: the `ss` softmax scratch is
+`Q*SH` floats (SH=2*C=128, C fixed), NOT `C*hd`, so it does NOT grow with the
+head size. minfer hd=128 layout: `sq[Q·DK halfs]=2048 B | so[Q·PV floats]=4096 B
+| ss[Q·SH floats]=4096 B` = **10240 B total**, well under the M4 Pro
+`max_threadgroup_memory_length = 32768 B` (runtime-queried via the probe in
+`examples/`). ✓
+
+**Constant deltas for a hd=128 variant** (vs the hd=64 kernels at
+metal.metal:3534/3717): `DK=DV=128`, `DK4=DV4=32`, `DK8=16`, `PV=128` (`PAD2(128,64)`),
+`PV4=32`, `PV8=16`, `NO=PV8/NSG=4` (was 2 → two extra `lo[]` accumulators +
+the O-store loop), shmem offsets `so@512`, `ss@1536` (float units), total 2560
+floats. Everything else (QK^T loop over DK8/2=8 iters, O+=P·V loop, online
+softmax, causal+pad masks, `kernel_kv_tail_pad`, f16 variant, host dispatch)
+is unchanged. KV layout + stride already match llama (`[nkv][nk*hd]`, NS10=nkt=512).
+
+**Measured 7B prefill decomposition (pp332, Q4_K_M, MINFER_TIMING GPU
+submit-wait, min of 3) vs llama**:
+
+| path | minfer GPU | llama | minfer/llama |
+|---|---|---|---|
+| 3-pass attention (baseline) | **~1137 ms** | **734 ms** (452 t/s) | **1.55×** |
+| no-attention (`MINFER_SKIP_ATTN=1`) | **~1019 ms** | ~730 ms (attn ~4-6 ms) | ~1.40× |
+| attention cost (by subtraction) | **~118 ms (10.4 %)** | — | — |
+
+**Verdict — feasible, but LOW leverage at 7B**:
+- Attention is only **~10 %** of 7B prefill (vs **~34 %** at 0.5B pp325): the 7B
+  GEMMs/FFN dominate and are weight-bound, so a perfect flash port
+  (attention ~118 → ~6 ms) yields only **~9.5 % total prefill gain**
+  (1137 → ~1029 ms), closing the llama gap from 1.55× to ~1.40×. The remaining
+  1.40× is the non-attention structural gap (§4.3.1) — GEMMs + small kernels.
+- **BUT the port also fixes a correctness bug**: 7B with `MINFER_CACHE_TYPE=f16`
+  currently generates **garbage ("!!!!!!")** — the same f16-cache 3-pass bug as
+  0.5B (§4.3.2 bonus), since 7B falls back to 3-pass (hd=128). A hd=128 flash
+  f16 variant would make f16 cache correct on the user-facing model. Verified:
+  `MINFER_CACHE_TYPE=f16 ./minfer 7B "The capital of France is" -n 12 --greedy`
+  → `!!!!!!!!!!!!`.
+- Work estimate: moderate (two kernel copies or template params + host gate
+  change from `hd == 64` to `hd == 128` + shmem 10240 + isolation test extension
+  to hd=128 dims). Low GPU-safety risk (same structure, only wider head dims).
+
+**Decision**: pending prioritization. ~9.5 % prefill gain + f16-cache
+correctness fix on the user-facing model; the bigger 7B prefill lever is the
+non-attention 89→~44 ms gap (to-do #4 remainder), which the flash port does NOT
+touch.
 
 ### 4.4 7B verification and A/B (user-facing model)
 

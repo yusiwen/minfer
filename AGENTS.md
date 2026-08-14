@@ -524,6 +524,16 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > scores/output kernels read the f16 KV as `float*` → garbage). Gate:
 > `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. The non-attention 89 ms vs
 > llama's ~44 ms is a secondary structural gap. (5) 7B same-model A/B + per-step regression check.
+> **hd=128 (7B) feasibility ANALYSIS DONE 2026-08-15 (§4.3.3)**: the 7B prefill
+> uses the same blk kernel in llama (nsg=4, NQPSG=8/NCPSG=64, `use_vec` is
+> decode-only `ne01<20`); shmem scales to **10240 B** (`ss` is `Q*SH`, NOT
+> `C*hd` — does NOT grow with head) < M4 Pro 32768 B limit → **feasible**.
+> Measured 7B pp332 decomposition: attention only **~118 ms (10.4 %)** of 1137 ms
+> vs llama 734 ms (1.55×) → a flash port gains only **~9.5 % total prefill** and
+> does NOT touch the 1.40× non-attention gap. **Stronger reason to do it**: 7B
+> with `MINFER_CACHE_TYPE=f16` also produces **garbage ("!!!!!!")** via the
+> hd=128 3-pass fallback — a hd=128 f16 flash variant fixes 7B's f16 prefill
+> correctness. Decision pending prioritization (low leverage, moderate work).
 > Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).
