@@ -510,10 +510,20 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > `kernel_flash_attn_ext_blk` = a single fused **legacy `simdgroup_matrix`**
 > kernel (`has_simdgroup_mm` on M4 Pro, NOT the M5 tensor API); the prefill
 > GEMM kernels are at parity (§4.3.1 — grid probe + barrier/store experiments
-> ruled them out, ~2-3 % max). ⇒ the #1 prefill lever is now the **blk flash
-> port** (fixed-shape NSG=1 float8x8, same primitives as minfer's GEMMs;
-> expected 135 → ~90 ms); the non-attention 89 ms vs llama's ~44 ms is a
-> secondary structural gap. (5) 7B same-model A/B + per-step regression check.
+> ruled them out, ~2-3 % max). ⇒ the #1 prefill lever is the **blk flash
+> port** (fixed-shape **NSG=4** float8x8 — llama picks nsg=4 for hd<512 — same
+> primitives as minfer's GEMMs). **PREFILL FLASH PORT DONE 2026-08-14 (§4.3.2)**:
+> `kernel_flash_attn_blk_f32/_f16` (NSG=4/Q=8/C=64/DK=DV=64, 7168 B shmem,
+> inline causal mask, `kernel_kv_tail_pad` for the partial last KV block),
+> replacing the 3-pass attention for hd==64 (0.5B/1.5B). Verified: isolation
+> test (`tests/flash_attn_blk_isolation.rs`, cos vs CPU >0.999 across 16 configs,
+> f32+f16), A/B **byte-identical to the classic `gqa_attn_f32`** (both cache
+> types, all layers + logits maxabs 0.0), prefill GPU ~110 → **~93 ms (~16 %)**
+> at pp294 (the 135→~90 ms target is met); 7B (hd=128) falls back to 3-pass.
+> **Bonus: fixes the pre-existing f16-cache 3-pass prefill bug** (the 3-pass
+> scores/output kernels read the f16 KV as `float*` → garbage). Gate:
+> `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. The non-attention 89 ms vs
+> llama's ~44 ms is a secondary structural gap. (5) 7B same-model A/B + per-step regression check.
 > Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).

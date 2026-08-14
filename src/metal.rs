@@ -104,6 +104,16 @@ pub fn flash_attn_enabled(hd: usize) -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_FLASH").map_or(true, |v| v != "1")) && hd == 64
 }
 
+/// Use the llama kernel_flash_attn_ext_blk port (kernel_flash_attn_blk_f32/_f16,
+/// legacy simdgroup_matrix) for prefill attention when nt>1. Fixed-shape
+/// (DK=DV=64) kernel → requires hd==64; anything else falls back to the 3-pass
+/// parallel attention. ON by default; MINFER_NO_PREFILL_FLASH=1 reverts to the
+/// 3-pass path for A/B.
+pub fn prefill_flash_enabled(hd: usize) -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_NO_PREFILL_FLASH").map_or(true, |v| v != "1")) && hd == 64
+}
+
 
 pub struct MpsState {
     #[cfg(target_os = "macos")]
@@ -160,6 +170,9 @@ struct MpsStateInner {
     pl_gqa_attn_combine: metal::ComputePipelineState,
     pl_flash_attn: metal::ComputePipelineState,
     pl_flash_attn_f16: metal::ComputePipelineState,
+    pl_flash_attn_blk: metal::ComputePipelineState,
+    pl_flash_attn_blk_f16: metal::ComputePipelineState,
+    pl_kv_tail_pad: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
     pl_attn_bsr: metal::ComputePipelineState,
@@ -195,6 +208,8 @@ struct MpsStateInner {
     kv_size: std::sync::RwLock<Vec<usize>>,
     // Prefill parallel-attention scratch (P1 2026-08-11): scores [nt][nh][nkv].
     buf_attn_scores: std::sync::Mutex<metal::Buffer>,
+    // Flash-prefill tail pad (2026-08-14): [2][64][nkt] f32/f16 K-tail + V-tail.
+    buf_attn_pad: std::sync::Mutex<metal::Buffer>,
     // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
     dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
@@ -890,6 +905,59 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d((nt * nh) as u64, 1, 256, 1);
     }
 
+    /// Prefill flash attention (2026-08-14, llama kernel_flash_attn_ext_blk port):
+    /// ONE kernel replaces the 3-pass parallel attention for nt>1 (measured 46 ms
+    /// of 135 ms prefill GPU vs llama's ~3 ms). Fixed-shape NSG=4/Q=8/C=64/
+    /// DK=DV=64: grid (ceil(nt/8), nh) of 128-thread threadgroups (32 lanes × 4
+    /// simdgroups), each computing Q=8 query tokens × ALL KV for head h via
+    /// simdgroup_matrix QK^T + online softmax + PV with an inline causal mask.
+    /// GQA head hk = h/gqa is baked into the K/V base inside the kernel.
+    /// The host copies the last partial KV block (nkv % 64 != 0) into a
+    /// [2][64][nkt] tail-pad buffer first (kernel_kv_tail_pad); padded rows are
+    /// zero + masked, so a pad buffer is always bound but only populated then.
+    pub fn attn_flash_prefill(&self, q: &metal::Buffer, kv_k: &metal::Buffer, kv_v: &metal::Buffer,
+        out: &metal::Buffer, positions: &metal::Buffer,
+        nkv: usize, nkt: usize, nt: usize, nh: usize,
+        nk: usize, hd: usize, scale: f32,
+    ) {
+        self.trace_op("attn_flash_blk");
+        let dev = &self.state.device;
+        let f16 = kv_cache_is_f16();
+        let elem = if f16 { 2u64 } else { 4u64 };
+        let pad = MpsState::get_or_grow(&self.state.buf_attn_pad,
+            (2 * 64 * nkt as u64) * elem, dev);
+
+        if nkv % 64 != 0 {
+            self.enc.set_compute_pipeline_state(&self.state.pl_kv_tail_pad);
+            self.enc.set_buffer(0, Some(kv_k), 0);
+            self.enc.set_buffer(1, Some(kv_v), 0);
+            self.enc.set_buffer(2, Some(&pad), 0);
+            self.set_params(3, &(nkv as i32));
+            self.set_params(4, &(nkt as i32));
+            self.set_params(5, &(if f16 { 1 } else { 0 }));
+            self.dispatch_2d(nkt as u64, 64, 1, 1);
+        }
+
+        self.enc.set_compute_pipeline_state(
+            if f16 { &self.state.pl_flash_attn_blk_f16 } else { &self.state.pl_flash_attn_blk }
+        );
+        self.enc.set_buffer(0, Some(q), 0);
+        self.enc.set_buffer(1, Some(kv_k), 0);
+        self.enc.set_buffer(2, Some(kv_v), 0);
+        self.enc.set_buffer(3, Some(&pad), 0);
+        self.enc.set_buffer(4, Some(out), 0);
+        self.enc.set_buffer(5, Some(positions), 0);
+        self.set_params(6, &(nh as i32));
+        self.set_params(7, &(nk as i32));
+        self.set_params(8, &(hd as i32));
+        self.set_params(9, &(scale.to_bits() as i32));
+        self.set_params(10, &(nt as i32));
+        self.set_params(11, &(nkv as i32));
+        // shmem: sq (512 half = 1024 B) | so (512 f32 = 2048 B) | ss (1024 f32 = 4096 B)
+        self.enc.set_threadgroup_memory_length(0, 7168);
+        self.dispatch_2d(((nt + 7) / 8) as u64, nh as u64, 32, 4);
+    }
+
     /// Fused bias-add + RoPE + KV-store for nt==1 decode: ONE kernel replaces
     /// add_bias×3 + rope×2 + store_kv×2 (7 dispatches). `bqkv` layout is
     /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw
@@ -1065,6 +1133,9 @@ impl MpsState {
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
             let pl_flash_attn = get_pl("kernel_flash_attn_ext_f32")?;
             let pl_flash_attn_f16 = get_pl("kernel_flash_attn_ext_f16")?;
+            let pl_flash_attn_blk = get_pl("kernel_flash_attn_blk_f32")?;
+            let pl_flash_attn_blk_f16 = get_pl("kernel_flash_attn_blk_f16")?;
+            let pl_kv_tail_pad = get_pl("kernel_kv_tail_pad")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
@@ -1122,6 +1193,9 @@ impl MpsState {
                 pl_gqa_attn_combine,
                 pl_flash_attn,
                 pl_flash_attn_f16,
+                pl_flash_attn_blk,
+                pl_flash_attn_blk_f16,
+                pl_kv_tail_pad,
                 pl_store_kv,
                 pl_store_kv_f16,
                 pl_attn_bsr,
@@ -1152,6 +1226,7 @@ impl MpsState {
                 kv_v: std::sync::RwLock::new(Vec::new()),
                 kv_size: std::sync::RwLock::new(Vec::new()),
                 buf_attn_scores: std::sync::Mutex::new(dummy_buf.clone()),
+                buf_attn_pad: std::sync::Mutex::new(dummy_buf.clone()),
                 dispatch_trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             eprintln!("MPS: using Metal on {} (unified: {})",
@@ -1811,6 +1886,10 @@ impl MpsState {
                     } else {
                         cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
                     }
+                } else if prefill_flash_enabled(hd) {
+                    let nkv = max_pos + 1;
+                    cb.attn_flash_prefill(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf,
+                        nkv, nkt, nt, nh, nk, hd, attn_scale);
                 } else if matmul_attn_enabled() {
                     let nkv = max_pos + 1;
                     cb.attn_parallel_prefill(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf,

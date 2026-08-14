@@ -42,6 +42,7 @@
 | 21 | Same-model, same-parameter A/B benchmark doc | gap baseline established | `09d27ae` |
 | 22 | **Flash attention port** (llama `kernel_flash_attn_ext_vec`, NSG=1 fixed DK=DV=64) | decode GPU 0.25-1.0 ms/token faster; wall ~10 % (0.5B, byte-identical) | `2e0c8b3` |
 | 23 | **Prefill gap root-cause** (2026-08-14): GEMM is NOT the prefill lever | see to-do #4 status | — |
+| 24 | **Prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy simdgroup-matrix, NSG=4 fixed DK=DV=64) | prefill GPU ~110→~93 ms (~16 %); f32+f16 byte-identical to classic | this work |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -54,7 +55,7 @@
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | **DONE 2026-08-14** (§4.2.2): ported `kernel_flash_attn_ext_vec` (NSG=1, DK=DV=64/NE=2/C=32) as `kernel_flash_attn_ext_f32/_f16`; KV-layout check PASSED (minfer `[nkv][nk*hd]` == llama physical layout — no cache rework). Isolation-verified (`tests/flash_attn_isolation.rs`: cos vs CPU >0.999 for nkv 1..4097 incl. partial/empty chunks; flash-vs-split cos=1.0 through the shared combine), A/B byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B Q4_K_M), decode GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING), wall ~10 %; no long-context regression. Gate: `MINFER_NO_FLASH=1` reverts to split |
-| 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. ⇒ **NEXT: prefill flash port** (fixed-shape NSG=1 float8x8; expected 135 → ~90 ms); non-attention 89 vs ~44 ms is a secondary structural gap |
+| 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. **PORT DONE 2026-08-14 (§4.3.2)**: `kernel_flash_attn_blk_f32/_f16` (fixed-shape NSG=4, Q=8, C=64, DK=DV=64, 7168 B shmem, inline causal mask, `kernel_kv_tail_pad` for the partial last block) + host `attn_flash_prefill`. Isolation-verified (`tests/flash_attn_blk_isolation.rs`: cos vs CPU >0.999 across 16 nt/nkv configs incl. partial blocks + GQA, f32+f16, deterministic), A/B **byte-identical to the classic `gqa_attn_f32`** at every layer (f32 AND f16 cache — maxabs 0.0), interleaved MINFER_TIMING prefill GPU **~110→~93 ms (~16 %)**, all 34 bin + 9 isolation tests pass. **Bonus: FIXES the f16-cache prefill 3-pass bug** (the 3-pass `kernel_attn_scores`/`kernel_attn_output` read the f16 KV cache as `float*` → garbage "!!!!!!"; the f16 blk kernel reads half K/V correctly). Default for hd==64 (0.5B/1.5B); 7B hd=128 falls back to 3-pass. Gate: `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. Non-attention 89 vs ~44 ms remains a secondary structural gap |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 
@@ -706,6 +707,50 @@ under-occupied, no HW limiter per §4.1).
 pursue a higher-efficiency GEMM structure. 2D `simdgroup_matrix` (mpp tensor)
 **already excluded** (llama disables it on M4 Pro, PARAMETER_AUDIT A); bf16 staging
 **already excluded** (llama reads f32 activations).
+
+#### 4.3.2 PREFILL FLASH PORT DONE (2026-08-14) — `kernel_flash_attn_blk_f32/_f16`
+
+Faithful fixed-shape transcription of llama's `kernel_flash_attn_ext_blk`
+(legacy `simdgroup_matrix`). NSG=4 (llama picks `nsg = ne00 >= 512 ? 8 : 4`; hd=64
+→ 4), Q=8 (`OP_FLASH_ATTN_EXT_NQPSG`), C=64 (`OP_FLASH_ATTN_EXT_NCPSG`),
+DK=DV=64, 128 threads (32 lanes × 4 simdgroups), shmem 7168 B (sq[512 half] |
+so[512 f32] | ss[1024 f32]). Grid `(ceil(nt/8), nh)`; each threadgroup computes
+Q=8 query tokens × ALL KV for head h (GQA hk = h/gqa baked into the K/V base).
+**Two deliberate GPU-safety deviations from llama**: (1) the causal mask is
+computed inline (no mask/block-pad pre-pass kernels); (2) the partial last KV
+block (nkv % 64 != 0) is read from a `[2][64][nkt]` tail-pad buffer
+(`kernel_kv_tail_pad` copies the last 64 virtual rows from the real cache; padded
+rows are zero + masked to -MINF, so they never contribute). Q is **always f32**
+(llama reads Q as `float4` regardless of KV type — `llama-graph.cpp:2457-2463`
+casts only K/V to f16); the f16 variant switches only the K/V/pad operands to
+`half` + `simdgroup_half8x8` K/V tiles.
+
+**Verification**:
+- `tests/flash_attn_blk_isolation.rs` (macOS): cos vs a scalar CPU reference
+  >0.999 across 16 nt/nkv configs (nkv 1..300 incl. partial blocks, nkv < C,
+  multi-threadgroup nt up to 200, GQA=7), f32+f16, run-to-run deterministic.
+- A/B vs the long-verified classic `gqa_attn_f32` kernel: **byte-identical**
+  (maxabs 0.0) at every layer AND the final logits, for BOTH cache types
+  (f32: MINFER_NO_PREFILL_FLASH=1 → 3-pass, MINFER_NO_MATMUL_ATTN=1 → classic;
+  f16: classic A/B). 0.5B Q4_K_M, pp140 + 4 decode tokens.
+- 34 bin tests + 9 isolation tests pass (includes `metal_pipelines_compile`).
+
+**Performance** (0.5B Q4_K_M, interleaved MINFER_TIMING, pp294): prefill GPU
+submit-wait **~110 → ~93 ms (~16 %)**, matching the earlier pp257 wall-clock
+trend (2390-2514 vs 1906-2272 t/s). The 135→~90 ms target from §4.3.1 is met.
+7B (hd=128) correctly falls back to the 3-pass path (identical output).
+
+**Bonus — fixes a pre-existing f16-cache prefill bug**: the 3-pass
+`kernel_attn_scores`/`kernel_attn_output` read the KV buffers as `device const
+float *` but with `MINFER_CACHE_TYPE=f16` the cache holds half data → garbage
+generation ("!!!!!!"). The f16 blk kernel reads half K/V correctly; the flash
+path is now the f16 prefill default for hd==64 and matches the classic f16
+output byte-identically.
+
+**Dispatch**: `MINFER_NO_PREFILL_FLASH=1` reverts to the 3-pass for A/B; the
+flash path requires hd==64 (fixed DK=DV), else 3-pass. Host side:
+`attn_flash_prefill` (metal.rs) grows the pad buffer, runs `kernel_kv_tail_pad`
+when nkv % 64 != 0, then the blk kernel.
 
 ### 4.4 7B verification and A/B (user-facing model)
 
