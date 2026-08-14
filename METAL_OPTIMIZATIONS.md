@@ -51,7 +51,7 @@
 |---|---|---|---|
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
-| 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | gap isolation-confirmed 2026-08-13 (§4.2.2). Port decision pending KV-layout pre-check (minfer `[nkv,nk,hd]` vs llama `[hd,nk,nkv]`). Recommended option C (hybrid float4+simd reduction, no function constants) |
+| 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | gap isolation-confirmed 2026-08-13 (§4.2.2); **KV-layout check PASSED 2026-08-14** (minfer `[nkv][nk*hd]` == llama's physical layout; stride args `nb11=nk*hd*elem, nb12=hd*elem, ns10=nk*hd` — no cache rework). Recommended option C (hybrid float4+simd reduction, no function constants) — port next |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
@@ -580,9 +580,16 @@ a build fix that is out of this task's scope**.
 | **B. Optimize partial only** | Fewer barriers / float4 QK^T in the existing split kernel | bounded 1.5-2× | Low |
 
 **Pre-port check required**: minfer's KV cache layout vs llama flash's expected
-layout. llama flash reads K/V as `[hd, nk, nkv]` contiguous per head; minfer
-stores per `[nkv, nk, hd]`. Must confirm/rework the KV cache (or a view) to
-match before porting — otherwise the kernel reads garbage.
+layout. **CHECKED 2026-08-14 — PASS, no rework needed.** llama's KV cache is
+`ggml_new_tensor_3d(type, n_embd_k_gqa, kv_size, n_stream)` with
+`n_embd_k_gqa = nk*hd` packed into dim0 — physical layout `[nkv][nk*hd]`,
+token stride `nk*hd*elem`. `get_k` (llama-kv-cache.cpp:1368) + `permute(0,2,1,3)`
+(llama-graph.cpp:2443) hand the flash kernel `nb11 = nk*hd*elem` (token stride),
+`nb12 = hd*elem` (KV-head stride), `ns10 = nb11/nb10 = nk*hd` — exactly
+minfer's `k + ki*stride_kv + hk*hd` with `stride_kv = nk*hd`. The flash kernel
+can consume minfer's existing KV buffer unchanged; the host passes the stride
+args mirroring minfer (`nb10 = elem, nb11 = nk*hd*elem, nb12 = hd*elem,
+ns10 = nk*hd`). Full chain in §5.5 D-1 + flash-investigation log Step 6.
 
 **Prefill flash explicitly deferred**: llama also uses a prefill flash
 (`kernel_flash_attn_ext_blk`), but minfer's 3-pass parallel prefill attention
@@ -792,12 +799,14 @@ the memory pipeline unbroken.
 
 For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
 
-1. **KV-layout check (prerequisite)**: llama's K/V are `[head, nkv, hd]`
-   (`nb11` = token stride, `ns10 = nb11/nb10` = hd elems/head/token), read as
-   `pk4 += ty*NS10/4 + tx`. minfer is `[nkv, nk, hd]` (`stride_kv = nk*hd`).
-   Simulate llama's strides via `nb10/nb11` args without moving the cache:
-   treat K as head-major (head stride = hd, token stride = nk*hd →
-   `nb10 = 4, nb11 = nk*hd*4, ns10 = nk*hd`). This decides all kernel indexing.
+1. **KV-layout check (prerequisite) — DONE 2026-08-14, PASS**: llama's K/V
+   physical layout IS `[nkv][nk*hd]` (all KV heads packed in dim0 of the cache
+   tensor, token stride `nk*hd`), and the flash kernel reads it with
+   `nb11 = nk*hd*elem` (token), `nb12 = hd*elem` (head), `ns10 = nk*hd` — the
+   same indexing minfer already uses (`k + ki*stride_kv + hk*hd`,
+   `stride_kv = nk*hd`). **No cache rework needed**; the host passes the
+   stride args mirroring minfer's layout (`nb10 = elem, nb11 = nk*hd*elem,
+   nb12 = hd*elem, ns10 = nk*hd`). Evidence chain in §4.2.2.
 2. **Single-kernel rewrite**: fix `DK=DV=64, NE=2, C=32, NSG=1, NWG=32`
    (0.5B shapes), dropping llama's function-constant system (no FC branches;
    hardcoded constants). Build the shmem layout `sq4 + ss + sm + so4`, QK^T/PV
@@ -809,8 +818,8 @@ For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
 5. **prefill untouched**: nt>1 keeps the current 3-pass parallel attention.
 
 **Risk points**:
-- KV layout mismatch is the most likely failure — do the 10-min layout check
-  first.
+- KV layout mismatch was the most likely failure — **CLEARED** (2026-08-14,
+  see D-1 above); the layout is compatible as-is.
 - Function constants → hardcoded constants is NOT a line-by-line translation;
   shmem offsets must be re-derived (`sgitg*SH` terms are all 0 for NSG=1,
   which simplifies).
