@@ -292,6 +292,28 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > passed (nkv up to 4097), all models correct, short 200-token decode
 > 1.06 → **0.88 s**, long-context (KV≈2510) decode ~8 ms/token.
 
+> **Flash attention port SHIPPED (decode, 2026-08-14)** (§4.2.2, the last
+> prefill/decode attention lever): `kernel_flash_attn_ext_f32`/`_f16` in
+> metal.metal — a faithful NSG=1 fixed-shape (DK=DV=64, NE=2, C=32) transcription
+> of llama's `kernel_flash_attn_ext_vec` (f16_dk64_dv64-equivalent). Replaces the
+> split pair for nt==1 when hd==64: the QK^T/PV reduce uses
+> `simd_shuffle_down(8,4,2,1)` + `simd_shuffle(·,NL*ty)` broadcast instead of the
+> split's 2 threadgroup_barrier/32-row-tile (llama's structural advantage).
+> Partials {M,S,O[hd]} are in the SAME layout as `kernel_gqa_attn_partial_f32`,
+> so the shared combine kernel merges them unchanged (strided C=32-block
+> chunking vs the split's contiguous ranges — interchangeable from the combine's
+> view). GPU-safety deviations from llama: the partial-chunk mask is computed
+> inline per lane (llama's `sm[]` write→read is an unbarriered cross-lane race),
+> control flow is break-only, reads clamp to nkv-1 (no pad buffer). Gated by
+> `MINFER_NO_FLASH=1` (A/B), falls back to split for hd≠64. Verified:
+> `tests/flash_attn_isolation.rs` (cos vs CPU >0.999 nkv 1..4097 incl. partial/
+> empty chunks, nt 1-2, f32+f16; flash-vs-split cos=1.0 through the shared
+> combine), end-to-end byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B), decode
+> GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING, no long-KV regression
+> despite the per-head GQA KV re-read), wall ~10 % (0.5B f32 184-196 vs 168-182
+> t/s, f16 257-262 vs 230-237); 7B parity (weight-read-bound). Prefill nt>1
+> untouched (3-pass parallel attention).
+
 > **Decode micro-opt P6/P7** (2026-08-03, ~10%): the element-wise kernels
 > (`add_f32`/`mul_f32`/`silu_f32`/`swiglu_f32`/`add_bias_f32`) were vectorized to
 > process 4 elements/thread (float4) with a scalar tail, and `kernel_rope_f32`

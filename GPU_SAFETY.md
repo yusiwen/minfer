@@ -134,6 +134,35 @@ value when a hard limit (like a kernel's fixed array size) genuinely exists.
   growth) must be checked against a known-good reference output, not just an
   A/B of two code paths over the same state.**
 
+## 4b. Flash-attention kernels (`kernel_flash_attn_ext_f32/_f16`, 2026-08-14)
+
+The llama-port decode attention kernel (NSG=1, one 32-lane simdgroup per
+(t, h, chunk) threadgroup). Deadlock/race discipline:
+
+- **Mask is computed inline per lane** (`(ic+NE*tx+ty < nkv) ? 0 : -MINF_MAXHALF`),
+  never via a shared `sm[]` array. llama's `sm[tiisg]` write → `sm[NE*tx+ty]`
+  read is a cross-lane threadgroup access with NO barrier (works only by NSG=1
+  lockstep) — a race this kernel removes on purpose.
+- **All control flow is `break`-only**: `if (ic >= nkv) break` depends on
+  lane-independent values, so all 32 lanes exit together. No `continue`, no
+  per-lane early returns. Every lane reaches both `threadgroup_barrier`s per
+  chunk. Out-of-range KV reads are clamped to `nkv-1` (in-bounds, value masked
+  to ~0 via `exp(-MINF_MAXHALF)`).
+- **Shuffle reductions are intra-simdgroup** (`simd_shuffle_down(8,4,2,1)` +
+  `simd_shuffle(·, NL*ty)` broadcast) — no threadgroup barrier inside the reduce.
+  The route-to-lane-0/16 pattern keeps the DK4=16-lane reduction pure within
+  each NE group.
+- **Fixed-shape guard on the host**: `flash_attn_enabled(hd)` gates dispatch on
+  `hd == 64` (DK/DV are hardcoded); `layer_gpu` falls back to the split path
+  for any other hd (a support limitation, not a silent safety degradation).
+- **shared `ss[]` handoffs** (QK^T → softmax → PV) are the only cross-lane
+  threadgroup accesses and are protected by the two `threadgroup_barrier`s per
+  chunk.
+- Partials {M, S, O[hd]} reuse the combine kernel's format; the combine's
+  `m==-INFINITY → zeros` guard also covers empty flash chunks (iwg with
+  `iwg*C >= nkv`, which break on the first iteration and write an empty
+  partial).
+
 ## 5. Recurrence playbook
 
 1. On a GPU fault/hang, `submit()` now reports the dispatch trace

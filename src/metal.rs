@@ -95,6 +95,15 @@ pub fn matmul_attn_enabled() -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_MATMUL_ATTN").map_or(true, |v| v != "1"))
 }
 
+/// Use the llama flash-attention port (kernel_flash_attn_ext_f32/_f16) for
+/// nt==1 decode. Fixed-shape (DK=DV=64) kernel → requires hd==64; anything else
+/// falls back to the split-attention path. ON by default; MINFER_NO_FLASH=1
+/// reverts to the split path for A/B.
+pub fn flash_attn_enabled(hd: usize) -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_NO_FLASH").map_or(true, |v| v != "1")) && hd == 64
+}
+
 
 pub struct MpsState {
     #[cfg(target_os = "macos")]
@@ -149,6 +158,8 @@ struct MpsStateInner {
     pl_gqa_attn_partial: metal::ComputePipelineState,
     pl_gqa_attn_partial_f16: metal::ComputePipelineState,
     pl_gqa_attn_combine: metal::ComputePipelineState,
+    pl_flash_attn: metal::ComputePipelineState,
+    pl_flash_attn_f16: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
     pl_attn_bsr: metal::ComputePipelineState,
@@ -756,6 +767,54 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nh as u64, 32, 1);
     }
 
+    /// Flash-attention port (llama kernel_flash_attn_ext_vec, NSG=1 fixed
+    /// DK=DV=64/NE=2/C=32 shape) for nt==1 decode. Replaces the split pair with
+    /// a single-simdgroup-per-(t,h,iwg) kernel whose Q*K^T reduce is
+    /// shuffle-based (simd_shuffle_down 8,4,2,1 + broadcast) instead of
+    /// threadgroup barriers — llama's structural advantage over the split
+    /// attention (~7-10x isolated at nkv=430). Output partials are {M,S,O[hd]}
+    /// in the SAME layout as kernel_gqa_attn_partial_f32, so the shared combine
+    /// kernel merges them unchanged. Grid (nt, nh, n_chunks), 32 threads.
+    /// Host guard: layer_gpu only dispatches this when hd==64 (fixed DK/DV);
+    /// otherwise the split path is used.
+    pub fn gqa_attn_flash(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
+        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize,
+        scale: f32, nt: usize, n_chunks: usize,
+    ) {
+        self.trace_op("gqa_attn_flash");
+        let need = (nt * nh * n_chunks * (2 + hd) * 4) as u64;
+        let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
+
+        // pass 1: flash partials — f16 cache reads the half K/V directly.
+        self.enc.set_compute_pipeline_state(
+            if kv_cache_is_f16() { &self.state.pl_flash_attn_f16 } else { &self.state.pl_flash_attn }
+        );
+        self.enc.set_buffer(0, Some(q), 0);
+        self.enc.set_buffer(1, Some(k), 0);
+        self.enc.set_buffer(2, Some(v), 0);
+        self.enc.set_buffer(3, Some(&partial), 0);
+        self.enc.set_buffer(4, Some(positions), 0);
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(n_chunks as i32));
+        // shmem: sq4 (16 float4 = 256 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B)
+        self.enc.set_threadgroup_memory_length(0, 1024);
+        self.dispatch_3d(nt as u64, nh as u64, n_chunks as u64, 32, 1, 1);
+
+        // pass 2: combine (shared with the split path)
+        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_combine);
+        self.enc.set_buffer(0, Some(&partial), 0);
+        self.enc.set_buffer(1, Some(o), 0);
+        self.set_params(2, &(nh as i32));
+        self.set_params(3, &(hd as i32));
+        self.set_params(4, &(nt as i32));
+        self.set_params(5, &(n_chunks as i32));
+        self.dispatch_2d(nt as u64, nh as u64, 32, 1);
+    }
+
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].
     /// Writes f32 (default) or f16 (MINFER_CACHE_TYPE=f16) into the KV cache.
     pub fn store_kv(&self, src: &metal::Buffer, dst: &metal::Buffer, nkt: usize, nt: usize,
@@ -1004,6 +1063,8 @@ impl MpsState {
             let pl_gqa_attn_partial = get_pl("kernel_gqa_attn_partial_f32")?;
             let pl_gqa_attn_partial_f16 = get_pl("kernel_gqa_attn_partial_f16")?;
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
+            let pl_flash_attn = get_pl("kernel_flash_attn_ext_f32")?;
+            let pl_flash_attn_f16 = get_pl("kernel_flash_attn_ext_f16")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
@@ -1059,6 +1120,8 @@ impl MpsState {
                 pl_gqa_attn_partial,
                 pl_gqa_attn_partial_f16,
                 pl_gqa_attn_combine,
+                pl_flash_attn,
+                pl_flash_attn_f16,
                 pl_store_kv,
                 pl_store_kv_f16,
                 pl_attn_bsr,
@@ -1711,7 +1774,9 @@ impl MpsState {
             }
             if !sk.attn {
                 if nt == 1 {
-                    if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                    if flash_attn_enabled(hd) {
+                        cb.gqa_attn_flash(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                    } else if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
                         cb.gqa_attn_split_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
                     } else {
                         cb.gqa_attn_f32(&bqkv_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);
@@ -1739,7 +1804,9 @@ impl MpsState {
             }
             if !sk.attn {
                 if nt == 1 {
-                    if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
+                    if flash_attn_enabled(hd) {
+                        cb.gqa_attn_flash(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
+                    } else if !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1") {
                         cb.gqa_attn_split_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt, split_chunks);
                     } else {
                         cb.gqa_attn_f32(&bq_buf, &kv_k[il], &kv_v[il], &ba_buf, &pos_buf, nh, nk, hd, attn_scale, nt);

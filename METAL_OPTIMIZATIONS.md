@@ -40,6 +40,7 @@
 | 19 | Q4_K AVX2 test-reference fix (implementation was already correct) | 29 bin tests green | `266ffb7` |
 | 20 | Split-GGUF (7B multi-part) support | 7B loads and runs | `cbba68c` / `34eaf10` |
 | 21 | Same-model, same-parameter A/B benchmark doc | gap baseline established | `09d27ae` |
+| 22 | **Flash attention port** (llama `kernel_flash_attn_ext_vec`, NSG=1 fixed DK=DV=64) | decode GPU 0.25-1.0 ms/token faster; wall ~10 % (0.5B, byte-identical) | ⏳ uncommitted |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -51,7 +52,7 @@
 |---|---|---|---|
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
-| 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | gap isolation-confirmed 2026-08-13 (§4.2.2); **KV-layout check PASSED 2026-08-14** (minfer `[nkv][nk*hd]` == llama's physical layout; stride args `nb11=nk*hd*elem, nb12=hd*elem, ns10=nk*hd` — no cache rework). Recommended option C (hybrid float4+simd reduction, no function constants) — port next |
+| 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | **DONE 2026-08-14** (§4.2.2): ported `kernel_flash_attn_ext_vec` (NSG=1, DK=DV=64/NE=2/C=32) as `kernel_flash_attn_ext_f32/_f16`; KV-layout check PASSED (minfer `[nkv][nk*hd]` == llama physical layout — no cache rework). Isolation-verified (`tests/flash_attn_isolation.rs`: cos vs CPU >0.999 for nkv 1..4097 incl. partial/empty chunks; flash-vs-split cos=1.0 through the shared combine), A/B byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B Q4_K_M), decode GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING), wall ~10 %; no long-context regression. Gate: `MINFER_NO_FLASH=1` reverts to split |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
@@ -598,6 +599,40 @@ recover only ~25 ms for the same ~600-line cost, so it is **out of scope unless
 the prefill GEMM (§4.3) lands and attention becomes the residual prefill
 bottleneck again**.
 
+**Port SHIPPED 2026-08-14 (option C, decode only)**:
+`kernel_flash_attn_ext_f32` / `_f16` in metal.metal — a faithful NSG=1
+fixed-shape (DK=DV=64, NE=2, C=32, NL=16) transcription of llama's
+`kernel_flash_attn_ext_vec` for the Qwen2 decode dims, chosen to match the
+f16_dk64_dv64 instance (function-constant system not needed — the shape is
+fixed and guarded on the host). It writes **the same {M, S, O[hd]} partials as
+`kernel_gqa_attn_partial_f32`**, so the shared combine kernel merges them
+unchanged (the flash kernel's strided C=32-block chunking and the split's
+contiguous chunking are interchangeable from the combine's perspective).
+
+- **Dispatch** (`metal.rs::gqa_attn_flash`): grid `(nt, nh, n_chunks)`, 32
+  threads, 1024 B shmem (sq4 | ss | so4); f16-cache variant reads the half KV
+  directly. Selected in layer_gpu for `nt==1` when `hd==64` (fixed DK/DV);
+  `MINFER_NO_FLASH=1` reverts to the split path for A/B.
+- **GPU-safety deviations from llama** (documented in the kernel comment): the
+  partial-chunk mask is computed **inline per lane** (llama's `sm[]` write→read
+  is a cross-lane threadgroup access without a barrier — a race the codebase
+  convention forbids); all control flow is `break`-only (no `continue`, no
+  early returns) so all 32 lanes reach both `threadgroup_barrier`s; reads clamp
+  to `nkv-1` with `-MINF_MAXHALF` masking instead of llama's pad buffer.
+- **Verification**: `tests/flash_attn_isolation.rs` — `flash_attn_ext_isolation`
+  (cos vs CPU >0.999 for nkv 1..4097 incl. partial tiles, empty chunks,
+  n_chunks 1..32, nt 1..2, f32+f16; run-to-run deterministic) +
+  `flash_attn_matches_split` (cos=1.0 vs the split path through the shared
+  combine). End-to-end A/B (`MINFER_NO_FLASH=1`): **byte-identical** output on
+  0.5B Q4_K_M (f32 cache) + Q4_0 (f16 cache) + 7B Q4_K_M.
+- **Measured**: interleaved MINFER_TIMING steady-state decode GPU — flash
+  **3.55/4.35/4.33** vs split **4.59/4.99/4.51** ms/token at KV≈64 (~0.3-1.0 ms
+  faster); KV≈250: 3.65-4.18 vs 3.96-4.40 (still faster, no long-KV
+  regression despite the per-head KV re-read for GQA). Wall clock ~10 %
+  (0.5B 184-196 vs 168-182 t/s f32; 257-262 vs 230-237 f16). 7B parity
+  (weight-read-bound, ~0.2 ms of a 55 ms step). Full detail + llama re-bench in
+  the flash-investigation log Step 7.
+
 #### 4.2.3 small elementwise — CLOSED by the trace (was the "other half")
 
 **Refuted 2026-08-13**: §4.1.1 measured minfer's small elementwise kernels at
@@ -807,15 +842,20 @@ For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
    `stride_kv = nk*hd`). **No cache rework needed**; the host passes the
    stride args mirroring minfer's layout (`nb10 = elem, nb11 = nk*hd*elem,
    nb12 = hd*elem, ns10 = nk*hd`). Evidence chain in §4.2.2.
-2. **Single-kernel rewrite**: fix `DK=DV=64, NE=2, C=32, NSG=1, NWG=32`
-   (0.5B shapes), dropping llama's function-constant system (no FC branches;
-   hardcoded constants). Build the shmem layout `sq4 + ss + sm + so4`, QK^T/PV
-   via `dot(float4)` + `simd_shuffle_down`.
-3. **Cross-TG reduce**: nwg=32 partials → reuse minfer's existing combine
-   kernel (align the partial format) or a new nwg reduce pass.
-4. **isolation tests**: scalar reference first (multi-nkv, partial tiles, empty
-   tiles), then byte-identical A/B.
-5. **prefill untouched**: nt>1 keeps the current 3-pass parallel attention.
+ 2. **Single-kernel rewrite — DONE 2026-08-14**: fixed `DK=DV=64, NE=2, C=32,
+    NSG=1` (0.5B/7B decode dims), dropping llama's function-constant system
+    (hardcoded constants; `n_chunks` is the host-tunable grid depth instead of
+    llama's fixed NWG). Shmem `sq4 + ss + so4` (no `sm[]` — mask inlined),
+    QK^T/PV via float4 + `simd_shuffle_down(8,4,2,1)` + `simd_shuffle(·, NL*ty)`
+    broadcast (the reduce routes the full-head sum to lanes 0/16).
+ 3. **Cross-TG reduce — DONE**: reuse minfer's existing combine kernel — the
+    flash kernel writes the same `{M, S, O[hd]}` partials (strided C=32-block
+    chunking, interchangeable with the split's contiguous chunking).
+ 4. **isolation tests — DONE**: `tests/flash_attn_isolation.rs` (scalar CPU ref,
+    multi-nkv incl. partial/empty chunks, nt 1-2, f32+f16; flash-vs-split A/B
+    through the shared combine) + end-to-end byte-identical A/B
+    (`MINFER_NO_FLASH=1`).
+ 5. **prefill untouched**: nt>1 keeps the current 3-pass parallel attention.
 
 **Risk points**:
 - KV layout mismatch was the most likely failure — **CLEARED** (2026-08-14,
