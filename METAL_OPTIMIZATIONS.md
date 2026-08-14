@@ -552,6 +552,10 @@ float4-sum accumulation and **2 threadgroup_barrier per 32-row tile**
 (28/layer at nkv=430). That barrier + reduction structure is the gap, not the
 dot instruction.
 
+> Full line-by-line kernel comparison (design tables, register-vs-shmem
+> accumulation, tile geometry, KV-layout indexing, port change surface): **§5.5**.
+> Glossary of the variables/functions used throughout this document: **§5.6**.
+
 **Note — `dot()` builtin experiment failed and was reverted (2026-08-13)**:
 replacing minfer's hand-written `qv.x+qv.y+qv.z+qv.w` with Metal's `dot()`
 builtin errors: `dot` is a reserved Metal function name and the classic
@@ -684,3 +688,198 @@ only**:
   existed; now filled in.
 - "decode short ~187 / long ~86 t/s" (KV-growth table) — before split attention.
 - "pure decode 2.0× / 3.2×" early gap — now 1.1-1.4× (§1.1).
+
+### 5.5 flash attention: llama.cpp vs minfer — detailed kernel comparison (reference for §4.2.2)
+
+> Line-by-line structural comparison behind the §4.2.2 ~7-10× attention gap
+> (minfer split attention 42.8 µs/layer vs llama flash ~4-6 µs/layer at
+> nkv=430). Source: llama `kernel_flash_attn_ext_vec` (ggml-metal.metal:7218),
+> llama dispatch (ggml-metal-ops.cpp:2959), minfer `kernel_gqa_attn_partial_f32`
+> (metal.metal:2995), `_f16` (:3127), `kernel_gqa_attn_combine_f32` (:3243).
+
+#### A. Overall design
+
+| | llama `kernel_flash_attn_ext_vec` | minfer `partial + combine` |
+|---|---|---|
+| kernels/layer | **1** (nwg cross-TG reduce built in) | **2** (partial + combine) |
+| per-TG scope | 1 query × 1 head, whole KV loop inside the kernel | 1 query × 1 KV-head × 1 chunk |
+| KV parallelism | **32 workgroups each sweep a KV slice** (stride `NWG*NSG*C`), online-softmax partials → temp buffer + a 2nd reduce kernel | `n_chunks` chunks, partials → combine kernel |
+| threads/layer (0.5B decode) | grid (1, 14, 32), 32 threads/TG → **14×32 = 448** | grid (1, 2, n_chunks), 32×gqa=224 threads/TG → 448×n_chunks |
+| KV read | `half4`/`float4` direct from global (f16 cache), no explicit shmem staging | explicit KV-tile stage into threadgroup shmem per 32-row tile |
+
+> Key: the **cross-TG reduction idea is identical** on both sides (online
+> softmax partials + a combine pass). All the difference is **inside a single
+> threadgroup**.
+
+#### B. Inside one threadgroup — the core gap
+
+**llama** (dk64 template: `NE=2, NL=16, C=32`, 32 threads = 2 rows × 16 cols):
+
+```
+QK^T:  for cc in 0..C/NE:                 // 16 cache columns per simdgroup
+         for ii in 0..DK4/NL:             // 16 float4 dots
+           mqk[cc] += dot(pk4[..], pq4[..])
+         reduce = simd_shuffle_down ×5 + simd_shuffle   // ← NO threadgroup barrier
+```
+
+- QK^T accumulates in registers `mqk[]`; the reduction is `simd_shuffle_down`
+  (16 lanes of ONE simdgroup merge via pairwise shuffles — **no
+  threadgroup barrier needed**).
+- softmax update: `M = simd_max`, `S = S*ms + simd_sum(vs)` (same simd reduces).
+- PV: `lo[ii] += float4(pv4)*float4(sst)` register accumulate +
+  `simd_shuffle_down` reduce.
+- **only 2 `simdgroup_barrier` per tile** (QK→softmax, softmax→PV), and
+  simdgroup-level (much cheaper than threadgroup-level).
+- KV read straight as `half4` from global; relies on HW cache + barrier-free
+  pipelining.
+
+**minfer** (partial kernel, 224 threads/TG = 7 simdgroups × 32):
+
+```
+per 32-row tile:
+  1. all threads stage the KV tile into threadgroup shmem (k_tile4/v_tile4)
+  2. threadgroup_barrier                          // ① make data visible
+  3. each lane does one row's QK^T:
+       dot = 0; for d4: qv = qhead4[d4]*kj4[d4]; dot += qv.x+qv.y+qv.z+qv.w
+       batch_mx = simd_max(dot); online-softmax (corr, acc4 *= corr)
+  4. threadgroup_barrier                          // ② before reusing shmem
+```
+
+Gap sources:
+- **After every QK^T reduce and before every PV accumulate llama only needs
+  simd-level shuffles; minfer must `threadgroup_barrier`** — its 32 rows are
+  processed serially by the same simdgroup's lanes (`for j0` loop, tile_sz=32)
+  while different lanes of the 224-thread TG handle different heads (gqa=7).
+  Result: **2 global barriers per tile, 28/layer at nkv=430**; each barrier
+  stalls the whole TG to the slowest lane.
+- llama's 16-column reduce stays inside one simdgroup (32 threads) — **zero
+  cross-simdgroup sync**.
+- minfer's `acc4` is register-accumulated but serialized by the barrier
+  sequence; llama's `mqk/lo` register accumulation pipelines through the
+  shuffle chain.
+
+#### C. Why the gap is ~7-10× and not smaller
+
+Of minfer's 42.8 µs/layer (nkv=430), the **28 threadgroup barriers + per-tile
+shmem stage-in/out** dominate: a barrier makes all 224 threads wait, while each
+32×64 tile does only ~2048 MACs — swamped by sync overhead. llama's simd
+reductions drop sync to near zero, and `half4` reads with no shmem staging keep
+the memory pipeline unbroken.
+
+#### D. Port (option C) — actual change surface
+
+For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
+
+1. **KV-layout check (prerequisite)**: llama's K/V are `[head, nkv, hd]`
+   (`nb11` = token stride, `ns10 = nb11/nb10` = hd elems/head/token), read as
+   `pk4 += ty*NS10/4 + tx`. minfer is `[nkv, nk, hd]` (`stride_kv = nk*hd`).
+   Simulate llama's strides via `nb10/nb11` args without moving the cache:
+   treat K as head-major (head stride = hd, token stride = nk*hd →
+   `nb10 = 4, nb11 = nk*hd*4, ns10 = nk*hd`). This decides all kernel indexing.
+2. **Single-kernel rewrite**: fix `DK=DV=64, NE=2, C=32, NSG=1, NWG=32`
+   (0.5B shapes), dropping llama's function-constant system (no FC branches;
+   hardcoded constants). Build the shmem layout `sq4 + ss + sm + so4`, QK^T/PV
+   via `dot(float4)` + `simd_shuffle_down`.
+3. **Cross-TG reduce**: nwg=32 partials → reuse minfer's existing combine
+   kernel (align the partial format) or a new nwg reduce pass.
+4. **isolation tests**: scalar reference first (multi-nkv, partial tiles, empty
+   tiles), then byte-identical A/B.
+5. **prefill untouched**: nt>1 keeps the current 3-pass parallel attention.
+
+**Risk points**:
+- KV layout mismatch is the most likely failure — do the 10-min layout check
+  first.
+- Function constants → hardcoded constants is NOT a line-by-line translation;
+  shmem offsets must be re-derived (`sgitg*SH` terms are all 0 for NSG=1,
+  which simplifies).
+- `simd_shuffle_down` lane participation (NE=2 uses only the `NE>1`/`NE>2`
+  branches; `simd_shuffle_down(mqk[cc], 16)` folds 16 cols onto lane 0) needs
+  careful index alignment.
+
+### 5.6 Glossary — variables and functions used in this document
+
+> Common (both kernels, GGUF/model dims):
+
+| Symbol | Meaning |
+|---|---|
+| `n_embd` / `ne` | model hidden size (embedding dim), e.g. 896 (0.5B), 3584 (7B) |
+| `n_head` / `nh` | number of query heads, e.g. 14 (0.5B), 28 (7B) |
+| `n_kv_embd` | KV cache head dim (`hd_kv`), e.g. 128 (0.5B); may differ from `n_embd` |
+| `hd` / `hd_kv` | attention head dim: `n_embd/n_head` (64 for 0.5B) and KV head dim |
+| `gqa` | group size = `nh/nk` (e.g. 7 for 0.5B) — GQA heads share a KV head |
+| `nk` | number of KV heads (`n_head_kv`), e.g. 2 (0.5B) |
+| `nkv` | number of KV cache positions (context length so far) |
+| `nkt` | total KV cache capacity (max positions) |
+| `nt` | number of tokens in the batch (prefill nt>1, decode nt==1) |
+| `nqt` | number of query tokens (prefill) |
+| `od` | output dim of a matmul (rows of the weight) |
+| `id` | input dim of a matmul (cols of the weight) |
+| `nf` | FFN intermediate dim (gate/up/down) |
+| `positions` | per-token KV position array; `nkv = positions[t] + 1` |
+| `max_pos` | largest position used so far |
+| `n_chunks` | split-attention chunk count (`MINFER_ATTN_CHUNKS`, adaptive) |
+| `Bc` | KV tile size in rows (32) used by the minfer attention kernels |
+| `n_layers` / `n_layer` | transformer layer count (24 for 0.5B, 28 for 7B) |
+| `Q4_0`/`Q4_K`/`Q5_0`/`Q5_K`/`Q6_K`/`Q8_0` | GGUF weight quant types (see §Quantization in AGENTS.md) |
+
+> llama `ggml` tensor/strided-layout args (used in flash/matmul kernels):
+
+| Symbol | Meaning |
+|---|---|
+| `ne00..ne33` | tensor dimensions: `ne0x`=dim0(dims of x-th src), `ne1x`=dim1, `ne2x`=dim2, `ne3x`=dim3 |
+| `nb10..nb33` | byte stride of each dim for src1 (`nb10`=elem stride in bytes, `nb11`=row/token stride, etc.) |
+| `ns10` / `ns20` | `nb11/nb10` and `nb21/nb20` — element count per head/row/token (used as the flash KV inner-loop stride) |
+| `ne11` | KV cache length dim (`nkv`) in flash-attn args |
+| `ne12`/`ne13` | KV head dim2/dim3 (GQA heads, batch) |
+| `nwg` | number of workgroups (32 for flash vec, each sweeps a KV slice) |
+| `nsg` | simdgroups per threadgroup (flash vec: 1; blk: 4-8) |
+| `NWG`/`NSG` | function-constant copies of `nwg`/`nsg` inside the kernel |
+| `NE` | columns per simdgroup in a flash tile (dk64: 2) |
+| `NL` | lanes per column = `NW/NE` (dk64: 16), `NW` = 32 (simd width) |
+| `C` | flash tile columns (32), `SH = 4*C` shared memory per simdgroup |
+| `DK`/`DV` | flash key/value head dims (dk64/dv64 templates; Qwen2.5-0.5B: 64/64) |
+| `DK4`/`DV4` | `DK/4`, `DV/4` (float4 element count) |
+| `PK`/`PV` | `PAD2(DK,128)`/`PAD2(DV,128)` — padded head dim for shmem |
+| `NL`/`NE` | see above (flash vec tile geometry) |
+
+> Metal thread variables:
+
+| Symbol | Meaning |
+|---|---|
+| `tgpig` | threadgroup position in grid (`.x/.y/.z` = the 3 grid dims) |
+| `tiisg` | thread index in simdgroup (0..31) |
+| `sgitg` | simdgroup index in threadgroup (0..nsg-1) |
+| `simd_max`/`simd_sum` | SIMD (warp) reduction builtins |
+| `simd_shuffle_down` | SIMD shuffle reduce (lanes exchange values pairwise) |
+| `threadgroup_barrier` | TG-wide memory + execution barrier (all simdgroups) |
+| `simdgroup_barrier` | simdgroup-wide barrier (cheaper, single warp) |
+| `float4`/`half4` | 4-wide vector types (128-bit / 64-bit) used for SIMD loads |
+
+> minfer kernels (src/metal.metal unless noted):
+
+| Function | Meaning |
+|---|---|
+| `kernel_gqa_attn_f32/f16` | classic single-pass attention (grid (nt,nk), sequential KV loop) — prefill-past, superseded |
+| `kernel_gqa_attn_partial_f32/_f16` | split attention pass 1: online-softmax partials (grid (nt, nk, n_chunks)) |
+| `kernel_gqa_attn_combine_f32` | split attention pass 2: merge partials (grid (nt, nh)) |
+| `kernel_attn_scores` / `kernel_softmax_attn` / `kernel_attn_output` | 3-pass parallel prefill attention (nt>1, barrier-free) |
+| `kernel_store_kv_f32/f16` | KV cache store (f32 or f16 cache) |
+| `kernel_q4_0_mm_f32` | Q4_0 prefill GEMM (simdgroup, nt≥16) |
+| `kernel_q6_k_f32_matmul` | q6_K matmul (stride-2/float4 layout, decode; was the 3× gap, fixed §4.2.1) |
+| `kernel_mul_mv_q6_K_f32_impl` | llama's q6_K kernel whose layout was ported |
+| `kernel_rms_norm_fuse_impl` | llama's fused rms_norm kernel pattern (256-thread port `kernel_rms_norm_f32_256`) |
+| `kernel_flash_attn_ext_vec` / `_blk` | llama flash kernels: vec = decode (nb<20, simd-shuffle), blk = prefill (simdgroup_matrix) |
+| `kernel_cpy_f32_f16` | copy f32→f16 (used for f16 KV cache) |
+| `kernel_get_rows_q4_0` | Q4_0 embedding gather |
+
+> minfer env vars:
+
+| Var | Meaning |
+|---|---|
+| `MINFER_ATTN_CHUNKS` | override split-attention chunk count |
+| `MINFER_CACHE_TYPE` | `f16` = f16 KV cache (2 B/elem), default f32 |
+| `MINFER_GEMM` | `0` = disable the Q4_0/non-Q4_0 prefill simdgroup GEMMs |
+| `MINFER_NO_FUSE_QKV` | `1` = disable fused QKV/FFN-gu decode matmuls |
+| `MINFER_SPLIT_CB` | `N` = split the decode into N command buffers |
+| `MINFER_TIMING` | `1` = per-category decode GPU timing split |
+| `MINFER_TRACE` | `1` = record per-dispatch labels (GPU hang debug) |
