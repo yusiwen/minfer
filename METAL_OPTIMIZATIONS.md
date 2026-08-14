@@ -53,7 +53,7 @@
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | gap isolation-confirmed 2026-08-13 (§4.2.2). Port decision pending KV-layout pre-check (minfer `[nkv,nk,hd]` vs llama `[hd,nk,nkv]`). Recommended option C (hybrid float4+simd reduction, no function constants) |
 | 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
-| 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | not started (§4.4) |
+| 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 
 > Note: §4.1.1's per-kernel table is superseded by the clean isolation A/B
@@ -622,7 +622,7 @@ pursue a higher-efficiency GEMM structure. 2D `simdgroup_matrix` (mpp tensor)
 ### 4.4 7B verification and A/B (user-facing model)
 
 All §1 A/B numbers are on the 0.5B research model. The 7B Q4_K_M is the
-user-facing model (steady decode ~66 ms/token GPU, prefill pp230 832 ms with the
+user-facing model (steady decode ~50 ms/token GPU, prefill pp252 ~240 t/s with the
 parallel attention). Add a **7B same-model A/B vs llama** (llama-bench on the
 same `qwen2.5-7b-instruct-q4_k_m` split GGUF) to:
 - quantify the real 7B gap per the same categories as §1.2 (matmul / attention /
@@ -633,6 +633,28 @@ same `qwen2.5-7b-instruct-q4_k_m` split GGUF) to:
 Every completed step must pass: correctness byte-identical on 7B + 0.5B, no 7B
 decode/prefill regression vs the pre-change baseline (same-caliber
 `MINFER_TIMING` steady-state gpu submit-wait, tok 5+).
+
+#### 4.4.1 7B baseline (2026-08-14) — the pre-change reference
+
+Same model `qwen2.5-7b-instruct-q4_k_m` (2-part split GGUF, 4.36 GiB), same
+pp252 prompt, M4 Pro. minfer = `--greedy --no-template`, decode steady = the
+MINFER_TIMING `gpu(submit-wait)` tok 5+ segment; llama = llama-bench `-p 252 -n 32 -r 3`.
+
+| metric | minfer | llama | minfer/llama |
+|---|---|---|---|
+| **prefill pp252** | 205-286 t/s (median ~240) | **460.7 ± 1.1 t/s** | **~52 %** |
+| **decode tg32** | 14.5-19.0 t/s (median ~18.8; steady GPU 50.1-51.3 ms/token) | **50.5 ± 0.2 t/s** | **~37 %** |
+
+0.5B sanity on the same commit (no regression): pp252 2009.7 vs llama 6138 t/s
+(33 %), tg32 242.8 vs 291.8 t/s (83 %) — matches the §1.1 72-88 % decode band.
+
+> **Key finding: 7B decode gap (~37 % of llama) is much larger than 0.5B
+> (~83 %).** 7B has hd=128, nh=28, bigger KV — attention and small-kernel
+> overhead dominate more at 7B, so the §4.2.2 flash-attention port is expected
+> to help 7B the most. This baseline is the reference for every future
+> step's regression check (same-caliber MINFER_TIMING steady-state, tok 5+).
+> Note: 7B short-prompt "hi" prefill reads ~41 t/s (health check's 200 t/s
+> threshold is 0.5B-calibrated and does NOT apply to 7B short prompts).
 
 ### 4.5 Backfill after each item
 
