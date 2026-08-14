@@ -502,9 +502,19 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > ~7-10× isolation-confirmed 2026-08-13: minfer split 42.8 µs/layer vs llama
 > flash ~4-6 µs/layer at nkv=430; structural cause = simd_shuffle_down vs
 > threadgroup barriers; port decision pending KV-layout pre-check — see METAL
-> §4.2.2; llama build env has a pre-existing ObjC/SDK issue recorded there),
-> (4) prefill GEMM execution efficiency toward ~7 TFLOPs/s (grid-shape
-> probe first), (5) 7B same-model A/B + per-step regression check. Dropped:
+> §4.2.2; llama build env has a pre-existing ObjC/SDK issue recorded there).
+> **DECODE PORT DONE 2026-08-14** (`kernel_flash_attn_ext_f32/_f16`, §4.2.2,
+> `2e0c8b3`). **PREFILL RE-SCOPED 2026-08-14**: pp325 decomposition shows
+> **attention = 46/135 ms (34 %)**, llama pp320 = 47.7 ms total with attention
+> only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is
+> `kernel_flash_attn_ext_blk` = a single fused **legacy `simdgroup_matrix`**
+> kernel (`has_simdgroup_mm` on M4 Pro, NOT the M5 tensor API); the prefill
+> GEMM kernels are at parity (§4.3.1 — grid probe + barrier/store experiments
+> ruled them out, ~2-3 % max). ⇒ the #1 prefill lever is now the **blk flash
+> port** (fixed-shape NSG=1 float8x8, same primitives as minfer's GEMMs;
+> expected 135 → ~90 ms); the non-attention 89 ms vs llama's ~44 ms is a
+> secondary structural gap. (5) 7B same-model A/B + per-step regression check.
+> Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).
 

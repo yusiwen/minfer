@@ -40,7 +40,8 @@
 | 19 | Q4_K AVX2 test-reference fix (implementation was already correct) | 29 bin tests green | `266ffb7` |
 | 20 | Split-GGUF (7B multi-part) support | 7B loads and runs | `cbba68c` / `34eaf10` |
 | 21 | Same-model, same-parameter A/B benchmark doc | gap baseline established | `09d27ae` |
-| 22 | **Flash attention port** (llama `kernel_flash_attn_ext_vec`, NSG=1 fixed DK=DV=64) | decode GPU 0.25-1.0 ms/token faster; wall ~10 % (0.5B, byte-identical) | ⏳ uncommitted |
+| 22 | **Flash attention port** (llama `kernel_flash_attn_ext_vec`, NSG=1 fixed DK=DV=64) | decode GPU 0.25-1.0 ms/token faster; wall ~10 % (0.5B, byte-identical) | `2e0c8b3` |
+| 23 | **Prefill gap root-cause** (2026-08-14): GEMM is NOT the prefill lever | see to-do #4 status | — |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -53,7 +54,7 @@
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | **DONE 2026-08-14** (§4.2.2): ported `kernel_flash_attn_ext_vec` (NSG=1, DK=DV=64/NE=2/C=32) as `kernel_flash_attn_ext_f32/_f16`; KV-layout check PASSED (minfer `[nkv][nk*hd]` == llama physical layout — no cache rework). Isolation-verified (`tests/flash_attn_isolation.rs`: cos vs CPU >0.999 for nkv 1..4097 incl. partial/empty chunks; flash-vs-split cos=1.0 through the shared combine), A/B byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B Q4_K_M), decode GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING), wall ~10 %; no long-context regression. Gate: `MINFER_NO_FLASH=1` reverts to split |
-| 4 | **prefill GEMM execution efficiency → ~7 TFLOPs/s** (llama level) | prefill 2.3-2.8× → 1× | grid-shape probe first (3.5-5.4 variance, §4.3). Trace shows no HW limit — scheduling/occupancy, not kernel compute |
+| 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. ⇒ **NEXT: prefill flash port** (fixed-shape NSG=1 float8x8; expected 135 → ~90 ms); non-attention 89 vs ~44 ms is a secondary structural gap |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 
@@ -592,12 +593,17 @@ can consume minfer's existing KV buffer unchanged; the host passes the stride
 args mirroring minfer (`nb10 = elem, nb11 = nk*hd*elem, nb12 = hd*elem,
 ns10 = nk*hd`). Full chain in §5.5 D-1 + flash-investigation log Step 6.
 
-**Prefill flash explicitly deferred**: llama also uses a prefill flash
-(`kernel_flash_attn_ext_blk`), but minfer's 3-pass parallel prefill attention
-already cut prefill attention to 30 ms (was 100 ms) — a prefill flash port would
-recover only ~25 ms for the same ~600-line cost, so it is **out of scope unless
-the prefill GEMM (§4.3) lands and attention becomes the residual prefill
-bottleneck again**.
+**Prefill flash RE-SCOPED 2026-08-14 (was "explicitly deferred")**: the §4.3
+re-investigation measured prefill attention at **46 ms of the 135 ms pp325
+(34 %)** vs llama's ~3 ms (`kernel_flash_attn_ext_blk`, a SINGLE fused
+`simdgroup_matrix` kernel — `has_simdgroup_mm`, NOT the M5 tensor API), so the
+earlier "recover only ~25 ms" estimate was wrong (it was based on the stale
+30 ms post-parallel-fix attention). This is now the **#1 prefill lever**, ahead
+of the GEMM (§4.3.1). Feasibility is high: minfer already ports the vec flash
+variant, the KV-layout check passed, and the blk kernel uses the same
+`simdgroup_float8x8` primitives as the prefill GEMMs; the per-shape
+function-constant system is the main port surface (fixed Qwen2 dims = NSG=1,
+DK=DV=64, ncpsg/nqptg constant like the decode port's fixed-shape approach).
 
 **Port SHIPPED 2026-08-14 (option C, decode only)**:
 `kernel_flash_attn_ext_f32` / `_f16` in metal.metal — a faithful NSG=1
@@ -655,6 +661,46 @@ real pp430 141-157 ms).
 TFLOPs/s — if true, shape alone cannot explain the gap; the difference is
 per-kernel execution (MPS serialization). **So the grid-shape probe has low
 expectation**, but it is zero-cost — do it first to rule it out (10-minute scale).
+
+#### 4.3.1 INVESTIGATION RESULT (2026-08-14) — GEMM kernels are NOT the prefill lever
+
+The grid probe + two per-kernel experiments rule out the GEMM kernels:
+
+1. **Grid shape**: not the lever (see above) — llama dispatches the identical
+   grid (64×32 tile, (32,4) threads, N_MM defines identical, mm-vs-mv at
+   ne11_mm_min=8). Shape alone cannot explain a 1.3× execution gap.
+2. **Threadgroup barrier** (minfer's only structural deviation: 6
+   `mem_threadgroup` barriers per 2-block ik-loop vs llama's 2 `mem_none`):
+   `mem_none` + scalar sb-store measured only **~2-3 %** faster (ffn_up Q5_0
+   2757→2705 µs, ffn_up Q4_0 2454→2381 µs) AND **RACES in minfer**
+   (nondeterministic garbage output, verified on Q4_K_M). minfer's
+   `mem_threadgroup` is a genuine correctness requirement — do not revert.
+3. **Vectorized `half2x4` sb store** (llama's float2x4): **RACY in minfer** even
+   with `mem_threadgroup` (1/5 runs corrupted). Scalar store stays.
+
+**Real pp325 decomposition** (0.5B Q4_K_M, `MINFER_SKIP_ATTN=1` subtractive,
+MINFER_TIMING gpu submit-wait): total **135 ms = attention 46 ms (34 %) +
+everything-else 89 ms**. llama pp320 = **47.7 ms total** with attention only
+~3 ms (`-fa on` 6803 vs `-fa off` 6373 t/s). **So minfer's attention is ~46 ms
+vs llama's ~3 ms (~15×) — the dominant single component.**
+
+**Root cause — llama's prefill attention is a single fused tensor kernel**:
+for ne01 ≥ 20 (prefill) llama dispatches `kernel_flash_attn_ext_blk`
+(ggml-metal-ops.cpp `ggml_metal_op_flash_attn_ext_use_vec`: `ne01 < 20` → vec,
+else blk) which does QK^T + PV via **legacy `simdgroup_matrix` (`float8x8`,
+`has_simdgroup_mm` = true on M4 Pro — NOT the M5-gated "tensor API"**, which
+llama disables pre-M5 for MUL_MAT only). One dispatch/layer replaces minfer's 3
+barrier-free passes (scores + softmax + output).
+
+**Re-scope (to-do #4 revised)**: the prefill lever is a **prefill flash port**
+(`kernel_flash_attn_ext_blk`, function-constant nqptg/ncpsg), not GEMM
+execution efficiency. Feasibility is high — minfer already ports the decode
+vec-variant (to-do #3) and uses the same simdgroup primitives in the prefill
+GEMMs; the remaining unknown is the blk KV-tile/pad layout (single-pass needs
+the partial-row combine like the decode flash). Expected prefill: 135 → ~90 ms
+(~1.5×), still ~2× llama's 48 ms because the **non-attention 89 ms vs llama's
+~44 ms** is a secondary structural gap (GEMMs + small kernels, both
+under-occupied, no HW limiter per §4.1).
 
 **Follow-up**: after §4.1's trace locates the GEMM gap (if inside the matmul),
 pursue a higher-efficiency GEMM structure. 2D `simdgroup_matrix` (mpp tensor)
