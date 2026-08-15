@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--prompt", default="Hello", help="Prompt text")
     parser.add_argument("--chat", action="store_true",
                         help="Wrap with chat_template (matches minfer)")
-    parser.add_argument("--output", default="./llama_ref", help="Output directory")
+    parser.add_argument("--output", default="/tmp/llama_ref", help="Output directory")
     parser.add_argument("--no-bos", action="store_true", help="Don't add BOS token")
     args = parser.parse_args()
 

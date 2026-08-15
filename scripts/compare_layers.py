@@ -17,7 +17,7 @@ from .lib import load_f32, cosine_sim
 
 def main():
     parser = argparse.ArgumentParser(description="Compare minfer vs llama.cpp output")
-    parser.add_argument("--llama-dir", default="./llama_ref",
+    parser.add_argument("--llama-dir", default="/tmp/llama_ref",
                         help="Directory with llama reference .npy files")
     parser.add_argument("--minfer-dir", default="/tmp",
                         help="Directory with minfer dump .f32 files")
