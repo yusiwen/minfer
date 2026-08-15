@@ -1,4 +1,4 @@
-// examples/cuda_graph_diag.rs
+// test/cuda_graph_rust/cuda_graph_diag.rs
 // Minimal Rust → FFI → CUDA graph capture diagnostic.
 // Tests graph capture from Rust FFI with and without stream reuse.
 //
@@ -17,7 +17,6 @@ extern "C" {
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut c_void) -> i32;
     fn cudaMemset(ptr: *mut c_void, value: i32, count: usize) -> i32;
-    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
     fn cudaGetLastError() -> i32;
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
@@ -29,9 +28,6 @@ extern "C" {
     fn cudaGraphDestroy(graph: *mut c_void) -> i32;
     fn cudaGraphExecDestroy(exec: *mut c_void) -> i32;
 }
-
-const cudaMemcpyHostToDevice: i32 = 1;
-const cudaMemcpyDeviceToHost: i32 = 2;
 
 // ─── Kernel Launch FFI (from cuda_kernels.cu) ───────────────────
 extern "C" {

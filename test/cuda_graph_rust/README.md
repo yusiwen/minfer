@@ -7,7 +7,7 @@ while equivalent C++ standalone tests pass.
 
 | # | File | Purpose | Run |
 |---|------|---------|-----|
-| 06 | `examples/cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA graph capture (no model) | `cargo run --example cuda_graph_diag` |
+| 06 | `cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA graph capture (no model) | `cargo run --example cuda_graph_diag --features cuda` |
 | 07 | (planned) | Stream state verification after prefill | — |
 | 08 | (planned) | Buffer growth (`get_or_grow`) during capture | — |
 
@@ -15,13 +15,13 @@ while equivalent C++ standalone tests pass.
 
 ```bash
 # Build and run the diagnostic tool
-cargo run --example cuda_graph_diag
+cargo run --example cuda_graph_diag --features cuda
 
 # With debug output
-MINFER_CUDA_DEBUG=1 cargo run --example cuda_graph_diag
+MINFER_CUDA_DEBUG=1 cargo run --example cuda_graph_diag --features cuda
 
 # Run only on specific GPU
-CUDA_VISIBLE_DEVICES=1 cargo run --example cuda_graph_diag
+CUDA_VISIBLE_DEVICES=1 cargo run --example cuda_graph_diag --features cuda
 ```
 
 ## Linking

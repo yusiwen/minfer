@@ -93,7 +93,7 @@ for il in 0..model.n_layer() {
 
 | # | Test | Result |
 |---|------|:------:|
-| 06 | `examples/cuda_graph_diag.rs` — minimal Rust → FFI → CUDA graph | ✅ PASS |
+| 06 | `test/cuda_graph_rust/cuda_graph_diag.rs` — minimal Rust → FFI → CUDA graph | ✅ PASS |
 | 07 | Stream state check | 🔜 covered by fix |
 | 08 | Buffer growth check | 🔜 covered by fix |
 
@@ -130,4 +130,4 @@ for il in 0..model.n_layer() {
 | `build.rs` | CUDA kernel compilation + linking |
 | `test/cuda_graph/` | C++ standalone tests (Phase 1) |
 | `test/cuda_graph_rust/` | Rust integration tests (Phase 2) |
-| `examples/cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA test |
+| `test/cuda_graph_rust/cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA test (gated example, `--features cuda`) |

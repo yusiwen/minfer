@@ -15,6 +15,11 @@ minijinja = { version = "2", default-features = false, features = ["builtins"] }
 cuda = []
 debug_dump = []
 
+[[example]]
+name = "cuda_graph_diag"
+path = "test/cuda_graph_rust/cuda_graph_diag.rs"
+required-features = ["cuda"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.28"
 block = "0.1.6"

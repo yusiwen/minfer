@@ -780,8 +780,8 @@ section answers whether a hd=128 blk variant is feasible and worth doing.
 `Q*SH` floats (SH=2*C=128, C fixed), NOT `C*hd`, so it does NOT grow with the
 head size. minfer hd=128 layout: `sq[Q·DK halfs]=2048 B | so[Q·PV floats]=4096 B
 | ss[Q·SH floats]=4096 B` = **10240 B total**, well under the M4 Pro
-`max_threadgroup_memory_length = 32768 B` (runtime-queried via the probe in
-`examples/`). ✓
+`max_threadgroup_memory_length = 32768 B` (runtime-queried via a one-off
+`probe_device.rs`). ✓
 
 **Constant deltas for a hd=128 variant** (vs the hd=64 kernels at
 metal.metal:3534/3717): `DK=DV=128`, `DK4=DV4=32`, `DK8=16`, `PV=128` (`PAD2(128,64)`),

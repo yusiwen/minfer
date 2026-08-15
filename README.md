@@ -188,8 +188,6 @@ src/
 ├── template.rs      # Chat template detection + formatting
 ├── download/        # Model download from HF Hub & Ollama
 │   └── mod.rs       # resolve() URI handler, curl-based HTTP, list_local()
-├── examples/
-│   └── cuda_graph_diag.rs  # CUDA graph capture diagnostic tool
 └── models/          # Architecture-specific implementations
     ├── mod.rs       # ModelDef trait + load_model factory dispatch
     └── qwen2/       # Qwen2 implementation
