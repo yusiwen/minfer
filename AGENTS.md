@@ -133,7 +133,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > simdgroup GEMM for nt ≥ 16; all other quants (Q4_K, Q5_0, Q5_1, Q8_0, Q6_K,
 > Q5_K) use the scalar f32 multi kernel. This is why Q4_K_M/Q5_K_M prefill is
 > ~240 t/s vs Q4_0's ~554 t/s and llama.cpp's ~1750 t/s. See
-> METAL_OPTIMIZATIONS.md for the full gap analysis and the P1 (non-Q4_0 GEMM)
+> docs/METAL_OPTIMIZATIONS.md for the full gap analysis and the P1 (non-Q4_0 GEMM)
 > plan (the decode-dispatch plan was replaced by the shipped fused-matmuls +
 > split-attention work).
 
@@ -339,7 +339,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > 6.9 → ~3.5 s; the ~150-200 tok/s figure was the OLD blended caliber — since
 > 2026-08-06 "Generated:" is pure decode like llama's "Generation:"); fixed-seed
 > output **byte-identical** (7 sampler tests pass). Full measurements in
-> METAL_OPTIMIZATIONS.md §3.2.
+> docs/METAL_OPTIMIZATIONS.md §3.2.
 
 > **Decode gap: matmuls at ~130 GB/s (structural for nt==1), NOT launch
 > overhead, NOT dequant-compute-bound** (2026-08-06, final model): greedy decode
@@ -410,9 +410,9 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > as `MINFER_SKIP_ATTN/MATMULS/SMALL=1` (decode-only), centralized in
 > `metal.rs::DecodeSkips` (OnceLock-cached env read like MINFER_TRACE; each
 > dispatch gated in its exact original position — the FFN down-matmul must stay
-> AFTER swiglu). Full detail in METAL_OPTIMIZATIONS.md §2.3/§4.
+> AFTER swiglu). Full detail in docs/METAL_OPTIMIZATIONS.md §2.3/§4.
 > **minfer vs llama.cpp: full Metal inference path comparison (2026-08-10)**: the
-> comparison section in METAL_OPTIMIZATIONS.md (§1.3/§1.4) gives both sides'
+> comparison section in docs/METAL_OPTIMIZATIONS.md (§1.3/§1.4) gives both sides'
 > kernel sequences (minfer 20/layer Q4_K_M / 12/layer Q4_0 vs llama 17/layer
 > flash), per-category timings (matmul ~3.0 ms zero gap; non-matmul minfer
 > ~1.2 ms vs llama ~0.3 ms = 4×), and a kernel inventory table. llama per-op
@@ -422,7 +422,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > llama (Q4_K_M 218 vs 293-299 t/s, Q4_0 279 vs 314-339 t/s pure GPU; default
 > sampling 197 vs 247 t/s). Prefill remains 2.8-3.6× (llama 6909 vs minfer 2466
 > t/s at pp430) — now mostly matmuls + small kernels at the architecture limit,
-> not attention (see METAL_OPTIMIZATIONS.md §1.1).
+> not attention (see docs/METAL_OPTIMIZATIONS.md §1.1).
 
 > **Per-kernel non-matmul profile + 256-thread RMSNorm (2026-08-10, P0/P1)**:
 > `metal.rs::tests::non_matmul_bandwidth_profile` (batched-cb per-kernel timing,
@@ -482,11 +482,11 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > same "structural" class as the decode finding. llama per-op timing is NOT
 > obtainable via CLI (`GGML_METAL_CAPTURE_COMPUTE` needs Xcode; per-kernel shader
 > intervals are not recorded by the Metal System Trace on this setup — see
-> METAL_OPTIMIZATIONS.md §4.1, which replaces the old "Xcode-GUI-only" claim with
+> docs/METAL_OPTIMIZATIONS.md §4.1, which replaces the old "Xcode-GUI-only" claim with
 > the correct xctrace path + Performance Limiters workflow). See §3.4/§4.
 > **Optimization-plan status (2026-08-12, trace DONE 2026-08-13, q6_K FIXED)**: the
 > 2026-08-06 "accept the architecture floor" verdict is **REVOKED** — the goal is
-> to match llama.cpp performance. METAL_OPTIMIZATIONS.md §0 progress table is the
+> to match llama.cpp performance. docs/METAL_OPTIMIZATIONS.md §0 progress table is the
 > single tracking source; §4 is the only action path: (1) GPU trace DONE —
 > `scripts/export_trace.sh` + Performance Limiters counter set gives BOTH
 > per-kernel durations (metal-shader-profiler-intervals) and limiter profile;
@@ -535,7 +535,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > hd=128 3-pass fallback — a hd=128 f16 flash variant fixes 7B's f16 prefill
 > correctness. Decision pending prioritization (low leverage, moderate work).
 > Dropped:
-> 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per PARAMETER_AUDIT A)
+> 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per docs/PARAMETER_AUDIT.md §A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).
 
 > **Performance-verification methodology** (2026-08-06, after the Q5_0
@@ -584,7 +584,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > threadgroup barrier (would deadlock the GPU when `nh % nk != 0`). (3)
 > `layer_gpu`/`output_norm_gpu` assert `nh % nk == 0`, `hd ≤ 256`, `id % 32 == 0`
 > and fall back to CPU otherwise. Full details + audit status in
-> **[`GPU_SAFETY.md`](GPU_SAFETY.md)**.
+> **[`docs/GPU_SAFETY.md`](docs/GPU_SAFETY.md)**.
 
 ## GPU Safety Conventions
 
@@ -593,7 +593,7 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
    `max_threadgroup_memory_length()` and `max_threads_per_threadgroup()` are
    queried via the `metal` crate's `MTLDevice` properties and cached at MpsState
    init. Do NOT hardcode guessed limits (e.g. a remembered "32 KB threadgroup
-   memory") — verify via runtime query. See `GPU_SAFETY.md` §4.
+   memory") — verify via runtime query. See `docs/GPU_SAFETY.md` §4.
 2. **All GPU safety guards error-exit** — never silently fall back to
    CPU. A guard that detects an unsafe/unsupported configuration (dimension
    misalignment, head-dispatch mismatch, threadgroup memory/threads exceeding the
@@ -761,3 +761,21 @@ cap repeating; with `repeat_penalty=1.1` it stops at EOS naturally even with
 ## Dependencies
 
 Only 5 external crates: `rand` (sampling), `regex` (BPE pre-tokenization), `half` (fp16), `serde+serde_json` (download API), `minijinja` (template rendering).
+
+## Documentation Locations
+
+All non-root documentation lives in **`docs/`** (the project root only keeps
+`AGENTS.md` and `README.md`). Index (2026-08-15):
+
+| Topic | Location |
+|---|---|
+| Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
+| GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
+| CPU backend optimizations | `docs/CPU_OPTIMIZATIONS.md` |
+| CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
+| Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
+| KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
+| Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |
+| Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
+| Debug dump format reference | `docs/debug-dump.md` |
+| Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |

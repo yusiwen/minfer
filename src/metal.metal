@@ -3520,7 +3520,7 @@ kernel void kernel_flash_attn_ext_f16(
 }
 
 // ─── Flash attention for prefill (nt > 1) — port of llama kernel_flash_attn_ext_blk
-// (the legacy simdgroup_matrix flash, METAL_OPTIMIZATIONS.md §4.3.1). Fixed-shape:
+// (the legacy simdgroup_matrix flash, docs/METAL_OPTIMIZATIONS.md §4.3.1). Fixed-shape:
 // NSG=4, Q=8, C=64, DK=DV=64. Grid (ceil(nt/8), nh), 128 threads (32 lanes x 4
 // simdgroups). Each threadgroup computes Q=8 query tokens x ALL KV for head h
 // (GQA head hk = h/gqa is baked into the K/V base). Faithful llama transcription
