@@ -106,12 +106,13 @@ pub fn flash_attn_enabled(hd: usize) -> bool {
 
 /// Use the llama kernel_flash_attn_ext_blk port (kernel_flash_attn_blk_f32/_f16,
 /// legacy simdgroup_matrix) for prefill attention when nt>1. Fixed-shape
-/// (DK=DV=64) kernel → requires hd==64; anything else falls back to the 3-pass
-/// parallel attention. ON by default; MINFER_NO_PREFILL_FLASH=1 reverts to the
-/// 3-pass path for A/B.
+/// (DK=DV=64 or DK=DV=128) kernel → requires hd==64 or hd==128; anything else
+/// falls back to the 3-pass parallel attention. ON by default;
+/// MINFER_NO_PREFILL_FLASH=1 reverts to the 3-pass path for A/B.
 pub fn prefill_flash_enabled(hd: usize) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_PREFILL_FLASH").map_or(true, |v| v != "1")) && hd == 64
+    *V.get_or_init(|| std::env::var("MINFER_NO_PREFILL_FLASH").map_or(true, |v| v != "1"))
+        && (hd == 64 || hd == 128)
 }
 
 
@@ -172,6 +173,8 @@ struct MpsStateInner {
     pl_flash_attn_f16: metal::ComputePipelineState,
     pl_flash_attn_blk: metal::ComputePipelineState,
     pl_flash_attn_blk_f16: metal::ComputePipelineState,
+    pl_flash_attn_blk_hd128: metal::ComputePipelineState,
+    pl_flash_attn_blk_hd128_f16: metal::ComputePipelineState,
     pl_kv_tail_pad: metal::ComputePipelineState,
     pl_store_kv: metal::ComputePipelineState,
     pl_store_kv_f16: metal::ComputePipelineState,
@@ -939,7 +942,11 @@ impl MpsCommandBuffer<'_> {
         }
 
         self.enc.set_compute_pipeline_state(
-            if f16 { &self.state.pl_flash_attn_blk_f16 } else { &self.state.pl_flash_attn_blk }
+            if f16 {
+                if hd == 128 { &self.state.pl_flash_attn_blk_hd128_f16 } else { &self.state.pl_flash_attn_blk_f16 }
+            } else {
+                if hd == 128 { &self.state.pl_flash_attn_blk_hd128 } else { &self.state.pl_flash_attn_blk }
+            }
         );
         self.enc.set_buffer(0, Some(q), 0);
         self.enc.set_buffer(1, Some(kv_k), 0);
@@ -953,8 +960,10 @@ impl MpsCommandBuffer<'_> {
         self.set_params(9, &(scale.to_bits() as i32));
         self.set_params(10, &(nt as i32));
         self.set_params(11, &(nkv as i32));
-        // shmem: sq (512 half = 1024 B) | so (512 f32 = 2048 B) | ss (1024 f32 = 4096 B)
-        self.enc.set_threadgroup_memory_length(0, 7168);
+        // shmem: hd=64: sq (512 half = 1024 B) | so (512 f32 = 2048 B) | ss (1024 f32 = 4096 B);
+        //        hd=128: sq (1024 half = 2048 B) | so (1024 f32 = 4096 B) | ss (1024 f32 = 4096 B)
+        let shmem = if hd == 128 { 10240u64 } else { 7168u64 };
+        self.enc.set_threadgroup_memory_length(0, shmem);
         self.dispatch_2d(((nt + 7) / 8) as u64, nh as u64, 32, 4);
     }
 
@@ -1135,6 +1144,8 @@ impl MpsState {
             let pl_flash_attn_f16 = get_pl("kernel_flash_attn_ext_f16")?;
             let pl_flash_attn_blk = get_pl("kernel_flash_attn_blk_f32")?;
             let pl_flash_attn_blk_f16 = get_pl("kernel_flash_attn_blk_f16")?;
+            let pl_flash_attn_blk_hd128 = get_pl("kernel_flash_attn_blk_hd128_f32")?;
+            let pl_flash_attn_blk_hd128_f16 = get_pl("kernel_flash_attn_blk_hd128_f16")?;
             let pl_kv_tail_pad = get_pl("kernel_kv_tail_pad")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
@@ -1195,6 +1206,8 @@ impl MpsState {
                 pl_flash_attn_f16,
                 pl_flash_attn_blk,
                 pl_flash_attn_blk_f16,
+                pl_flash_attn_blk_hd128,
+                pl_flash_attn_blk_hd128_f16,
                 pl_kv_tail_pad,
                 pl_store_kv,
                 pl_store_kv_f16,

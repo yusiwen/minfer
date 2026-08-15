@@ -533,7 +533,19 @@ Gen0 suffix (`_gen0.f32`) = first autoregressive generation step (single token).
 > does NOT touch the 1.40× non-attention gap. **Stronger reason to do it**: 7B
 > with `MINFER_CACHE_TYPE=f16` also produces **garbage ("!!!!!!")** via the
 > hd=128 3-pass fallback — a hd=128 f16 flash variant fixes 7B's f16 prefill
-> correctness. Decision pending prioritization (low leverage, moderate work).
+> correctness. **HD=128 PREFILL FLASH PORT SHIPPED 2026-08-15 (§4.3.3 done)**:
+> `kernel_flash_attn_blk_hd128_f32/_f16` (same structure, DK=DV=128, DK8=16,
+> PV=128/PV4=32/PV8=16, **NO=4** mv[]/lo[] accumulators — the llama DV>64 O+=P·V
+> split re-blocked, 10240 B shmem so@512/ss@1536 float units). Host: new
+> pipelines + `attn_flash_prefill` selects pipeline/shmem by hd; `prefill_flash_enabled`
+> now allows hd==64||hd==128 (7B). Verified: isolation test extended to
+> NH=28/NK=4/HD=128 (cos vs CPU >0.999 + deterministic across all 16 nt/nkv
+> configs, f32+f16), end-to-end 7B A/B **blk hd128 ≡ 3-pass ≡ f16 byte-identical**
+> output, **fixes 7B's f16-cache garbage** (3-pass f16 revert still produces
+> garbage), no 0.5B regression, 7B decode steady ~50 ms/token unchanged.
+> Performance: 7B pp310 prefill GPU **blk hd128 ~949 ms vs 3-pass ~1042 ms
+> (~9 % faster, matching the ~9.5 % §4.3.3 prediction)**, f16 ~952 ms. All 34
+> bin + 10 isolation tests pass.
 > Dropped:
 > 2D-simdgroup GEMM (llama disables tensor GEMM on M4 Pro per docs/PARAMETER_AUDIT.md §A)
 > + bf16 staging (llama reads f32 activations per Core convention #1).

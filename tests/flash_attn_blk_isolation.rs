@@ -1,20 +1,16 @@
 // Isolation tests for the prefill flash-attention port
-// (kernel_flash_attn_blk_f32 / kernel_flash_attn_blk_f16, NSG=4 fixed-shape):
-// verify correctness vs a scalar CPU reference (online-softmax flash math with
-// a causal mask), including the partial last KV block (nkv % 64 != 0) via the
-// [2][64][nkt] tail-pad buffer (kernel_kv_tail_pad), nkv < C (whole KV in one
-// block), multiple query tokens (nt up to 200 → multiple 8-token threadgroups),
-// GQA heads, and both f32 and f16 KV caches. Also A/B the blk path against the
+// (kernel_flash_attn_blk_f32/_f16 for hd=64 and the hd=128 variants
+// kernel_flash_attn_blk_hd128_f32/_f16, NSG=4 fixed-shape): verify correctness
+// vs a scalar CPU reference (online-softmax flash math with a causal mask),
+// including the partial last KV block (nkv % 64 != 0) via the [2][64][nkt]
+// tail-pad buffer (kernel_kv_tail_pad), nkv < C (whole KV in one block),
+// multiple query tokens (nt up to 200 → multiple 8-token threadgroups), GQA
+// heads, and both f32 and f16 KV caches. Also A/B the blk path against the
 // classic gqa_attn_f32 kernel (the long-verified reference). macOS only.
 #![cfg(target_os = "macos")]
 
 use metal::{MTLResourceOptions, MTLSize};
 
-const NH: usize = 14;
-const NK: usize = 2;
-const HD: usize = 64;
-const NE_Q: usize = NH * HD; // 896
-const SCALE: f32 = 0.125; // 1/sqrt(64)
 const C: usize = 64;
 
 fn cpu_attn(q: &[f32], k: &[f32], v: &[f32], nh: usize, nk: usize, hd: usize,
@@ -132,19 +128,21 @@ impl Ctx {
         Ctx { device, lib, cmdq }
     }
 
-    /// kernel_flash_attn_blk_f32/_f16 with the tail-pad copy. Replicates the
-    /// host dispatch: if nkv % 64 != 0, first kernel_kv_tail_pad fills pad
+    /// kernel_flash_attn_blk{,_hd128}_f32/_f16 with the tail-pad copy. Replicates
+    /// the host dispatch: if nkv % 64 != 0, first kernel_kv_tail_pad fills pad
     /// [2][64][nkt] from the last 64 virtual rows, then the blk kernel runs
-    /// with grid (ceil(nt/8), nh) x (32,4) threads and 7168 B shmem.
-    fn blk_attn(&self, q: &[f32], k: &[f32], v: &[f32], nt: usize, nkv: usize,
-        f16: bool) -> Vec<f32> {
-        let nkt = NK * HD;
+    /// with grid (ceil(nt/8), nh) x (32,4) threads and shmem 7168 (hd=64) or
+    /// 10240 (hd=128) B. Kernel + shmem selected by `hd`.
+    fn blk_attn(&self, q: &[f32], k: &[f32], v: &[f32], nh: usize, nk: usize, hd: usize,
+        scale: f32, nt: usize, nkv: usize, f16: bool) -> Vec<f32> {
+        let ne_q = nh * hd;
+        let nkt = nk * hd;
         let (qb, kb, vb) = self.buffers(q, k, v, f16);
         let positions: Vec<i32> = (0..nt as i32).collect();
         let pb = self.device.new_buffer_with_data(positions.as_ptr() as *const _, (positions.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
         let elem = if f16 { 2u64 } else { 4u64 };
         let pad = self.device.new_buffer((2 * C as u64 * nkt as u64) * elem, MTLResourceOptions::StorageModeShared);
-        let ob = self.device.new_buffer((nt * NE_Q * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let ob = self.device.new_buffer((nt * ne_q * 4) as u64, MTLResourceOptions::StorageModeShared);
 
         let cb = self.cmdq.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -165,7 +163,11 @@ impl Ctx {
             );
         }
 
-        let kname = if f16 { "kernel_flash_attn_blk_f16" } else { "kernel_flash_attn_blk_f32" };
+        let (kname, shmem) = if hd == 128 {
+            (if f16 { "kernel_flash_attn_blk_hd128_f16" } else { "kernel_flash_attn_blk_hd128_f32" }, 10240u64)
+        } else {
+            (if f16 { "kernel_flash_attn_blk_f16" } else { "kernel_flash_attn_blk_f32" }, 7168u64)
+        };
         let f = self.lib.get_function(kname, None).unwrap();
         let pl = self.device.new_compute_pipeline_state_with_function(&f).unwrap();
         enc.set_compute_pipeline_state(&pl);
@@ -175,20 +177,20 @@ impl Ctx {
         enc.set_buffer(3, Some(&pad), 0);
         enc.set_buffer(4, Some(&ob), 0);
         enc.set_buffer(5, Some(&pb), 0);
-        for (i, val) in [NH as i32, NK as i32, HD as i32,
-            SCALE.to_bits() as i32, nt as i32, nkv as i32].iter().enumerate() {
+        for (i, val) in [nh as i32, nk as i32, hd as i32,
+            scale.to_bits() as i32, nt as i32, nkv as i32].iter().enumerate() {
             enc.set_bytes(6 + i as u64, 4, val as *const i32 as *const _);
         }
-        enc.set_threadgroup_memory_length(0, 7168);
+        enc.set_threadgroup_memory_length(0, shmem);
         enc.dispatch_thread_groups(
-            MTLSize { width: (nt.div_ceil(8)) as u64, height: NH as u64, depth: 1 },
+            MTLSize { width: (nt.div_ceil(8)) as u64, height: nh as u64, depth: 1 },
             MTLSize { width: 32, height: 4, depth: 1 },
         );
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
         let ptr = ob.contents() as *const f32;
-        unsafe { std::slice::from_raw_parts(ptr, nt * NE_Q) }.to_vec()
+        unsafe { std::slice::from_raw_parts(ptr, nt * ne_q) }.to_vec()
     }
 
     fn buffers(&self, q: &[f32], k: &[f32], v: &[f32],
@@ -208,47 +210,53 @@ impl Ctx {
 #[test]
 fn flash_attn_blk_isolation() {
     let ctx = Ctx::new();
-    // nt spans 1..(multi-threadgroup); nkv spans <C, exact multiple of C,
-    // and partial last block. gqa = 14/2 = 7 always (fixed NH/NK).
-    for &(nt, nkv) in &[
-        (1usize, 1usize),
-        (1, 5),
-        (1, 63),
-        (1, 64),
-        (1, 65),
-        (1, 100),
-        (1, 127),
-        (1, 128),
-        (1, 129),
-        (8, 64),        // exactly one threadgroup, full block
-        (8, 63),        // one threadgroup, partial block
-        (8, 100),       // 2 blocks
-        (9, 100),       // 2 threadgroups
-        (16, 140),      // 2 threadgroups + partial (real prefill case)
-        (32, 251),      // multi-block + partial
-        (200, 300),     // many threadgroups
-    ] {
-        let q: Vec<f32> = (0..nt * NE_Q).map(|i| ((i as f32) * 1.7).sin() * 3.0).collect();
-        let k: Vec<f32> = (0..nkv * NK * HD).map(|i| ((i as f32) * 0.9).cos() * 2.0).collect();
-        let v: Vec<f32> = (0..nkv * NK * HD).map(|i| ((i as f32) * 0.4).sin() * 1.5).collect();
+    // hd=64 (0.5B/1.5B: NH=14, NK=2, gqa=7) and hd=128 (7B: NH=28, NK=4, gqa=7).
+    for &(nh, nk, hd) in &[(14usize, 2usize, 64usize), (28, 4, 128)] {
+        let scale = 1.0 / (hd as f32).sqrt();
+        let ne_q = nh * hd;
+        let nkt = nk * hd;
+        // nt spans 1..(multi-threadgroup); nkv spans <C, exact multiple of C,
+        // and partial last block. gqa = nh/nk = 7 for both configs.
+        for &(nt, nkv) in &[
+            (1usize, 1usize),
+            (1, 5),
+            (1, 63),
+            (1, 64),
+            (1, 65),
+            (1, 100),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (8, 64),        // exactly one threadgroup, full block
+            (8, 63),        // one threadgroup, partial block
+            (8, 100),       // 2 blocks
+            (9, 100),       // 2 threadgroups
+            (16, 140),      // 2 threadgroups + partial (real prefill case)
+            (32, 251),      // multi-block + partial
+            (200, 300),     // many threadgroups
+        ] {
+            let q: Vec<f32> = (0..nt * ne_q).map(|i| ((i as f32) * 1.7).sin() * 3.0).collect();
+            let k: Vec<f32> = (0..nkv * nkt).map(|i| ((i as f32) * 0.9).cos() * 2.0).collect();
+            let v: Vec<f32> = (0..nkv * nkt).map(|i| ((i as f32) * 0.4).sin() * 1.5).collect();
 
-        // CPU reference (masked, unpadded) — the plain causal attention.
-        let mut ref_out = vec![0.0f32; nt * NE_Q];
-        cpu_attn(&q, &k, &v, NH, NK, HD, nt, nkv, SCALE, &mut ref_out);
-        // padded reference (exact kernel semantics for partial blocks).
-        let mut ref_pad = vec![0.0f32; nt * NE_Q];
-        cpu_attn_padded(&q, &k, &v, NH, NK, HD, nt, nkv, SCALE, &mut ref_pad);
-        // The two references agree exactly (masking is identical).
-        let (_, cos_ref, _) = stats(&format!("cpu-pad-vs-cpu nt={nt} nkv={nkv}"), &ref_pad, &ref_out);
-        assert!(cos_ref > 0.99999, "cpu references disagree at nt={nt} nkv={nkv} (cos={cos_ref:.6})");
+            // CPU reference (masked, unpadded) — the plain causal attention.
+            let mut ref_out = vec![0.0f32; nt * ne_q];
+            cpu_attn(&q, &k, &v, nh, nk, hd, nt, nkv, scale, &mut ref_out);
+            // padded reference (exact kernel semantics for partial blocks).
+            let mut ref_pad = vec![0.0f32; nt * ne_q];
+            cpu_attn_padded(&q, &k, &v, nh, nk, hd, nt, nkv, scale, &mut ref_pad);
+            // The two references agree exactly (masking is identical).
+            let (_, cos_ref, _) = stats(&format!("cpu-pad-vs-cpu hd={hd} nt={nt} nkv={nkv}"), &ref_pad, &ref_out);
+            assert!(cos_ref > 0.99999, "cpu references disagree at hd={hd} nt={nt} nkv={nkv} (cos={cos_ref:.6})");
 
-        for (label, f16) in [("f32", false), ("f16", true)] {
-            let r1 = ctx.blk_attn(&q, &k, &v, nt, nkv, f16);
-            let r2 = ctx.blk_attn(&q, &k, &v, nt, nkv, f16);
-            let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            let (maxdiff, cos, _) = stats(&format!("blk[{label}] nt={nt} nkv={nkv}"), &r1, &ref_pad);
-            assert!(maxdiff_gg == 0.0, "blk[{label}] nt={nt} nkv={nkv}: run-to-run differs ({maxdiff_gg:.2e})");
-            assert!(cos > 0.999, "blk[{label}] nt={nt} nkv={nkv}: wrong vs CPU (cos={cos:.6} maxdiff={maxdiff:.2e})");
+            for (label, f16) in [("f32", false), ("f16", true)] {
+                let r1 = ctx.blk_attn(&q, &k, &v, nh, nk, hd, scale, nt, nkv, f16);
+                let r2 = ctx.blk_attn(&q, &k, &v, nh, nk, hd, scale, nt, nkv, f16);
+                let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let (maxdiff, cos, _) = stats(&format!("blk[{label}] hd={hd} nt={nt} nkv={nkv}"), &r1, &ref_pad);
+                assert!(maxdiff_gg == 0.0, "blk[{label}] hd={hd} nt={nt} nkv={nkv}: run-to-run differs ({maxdiff_gg:.2e})");
+                assert!(cos > 0.999, "blk[{label}] hd={hd} nt={nt} nkv={nkv}: wrong vs CPU (cos={cos:.6} maxdiff={maxdiff:.2e})");
+            }
         }
     }
 }
