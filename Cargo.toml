@@ -17,7 +17,7 @@ debug_dump = []
 
 [[example]]
 name = "cuda_graph_diag"
-path = "test/cuda_graph_rust/cuda_graph_diag.rs"
+path = "experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs"
 required-features = ["cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies]

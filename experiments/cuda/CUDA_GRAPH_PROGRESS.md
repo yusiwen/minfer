@@ -79,7 +79,7 @@ for il in 0..model.n_layer() {
 
 ## Test Results — Full Matrix
 
-### Phase 1: C++ Standalone (`test/cuda_graph/`)
+### Phase 1: C++ Standalone (`./test_*.cu`)
 
 | # | Test | Scope | Global (0) | ThreadLocal (1) | Relaxed (2) |
 |---|------|-------|:----------:|:---------------:|:-----------:|
@@ -89,11 +89,11 @@ for il in 0..model.n_layer() {
 | 04 | `test_04_multi_layer` | N×24 kernels (N=24) | ✅ | ✅ | ✅ |
 | 05 | `test_05_with_output_projection` | 579 kernels + 73 MB output | — | — | ✅ |
 
-### Phase 2: Rust Integration (`test/cuda_graph_rust/`)
+### Phase 2: Rust Integration (`./cuda_graph_rust/`)
 
 | # | Test | Result |
 |---|------|:------:|
-| 06 | `test/cuda_graph_rust/cuda_graph_diag.rs` — minimal Rust → FFI → CUDA graph | ✅ PASS |
+| 06 | `./cuda_graph_rust/cuda_graph_diag.rs` — minimal Rust → FFI → CUDA graph | ✅ PASS |
 | 07 | Stream state check | 🔜 covered by fix |
 | 08 | Buffer growth check | 🔜 covered by fix |
 
@@ -128,6 +128,6 @@ for il in 0..model.n_layer() {
 | `src/cuda_kernels.cu` | All CUDA kernels + launch wrappers |
 | `src/models/qwen2/forward.rs` | Layer loop + capture logic |
 | `build.rs` | CUDA kernel compilation + linking |
-| `test/cuda_graph/` | C++ standalone tests (Phase 1) |
-| `test/cuda_graph_rust/` | Rust integration tests (Phase 2) |
-| `test/cuda_graph_rust/cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA test (gated example, `--features cuda`) |
+| `./test_*.cu` | C++ standalone tests (Phase 1) |
+| `./cuda_graph_rust/` | Rust integration tests (Phase 2) |
+| `./cuda_graph_rust/cuda_graph_diag.rs` | Minimal Rust → FFI → CUDA test (gated example, `--features cuda`) |

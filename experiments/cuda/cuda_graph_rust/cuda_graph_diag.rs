@@ -1,4 +1,4 @@
-// test/cuda_graph_rust/cuda_graph_diag.rs
+// experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs
 // Minimal Rust → FFI → CUDA graph capture diagnostic.
 // Tests graph capture from Rust FFI with and without stream reuse.
 //
