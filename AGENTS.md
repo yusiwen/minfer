@@ -83,11 +83,6 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ (~250 tok/s) | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
 | Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~18 t/s) | hd=128, split GGUF, flash attention f32/f16 |
 
-Flash attention decode: hd=64 (0.5B/1.5B) and hd=128 (7B) both on the flash
-kernel (`kernel_flash_attn_ext_*` / `_hd128_*`), selected by
-`match (kv_cache_is_f16(), hd)`. Gate: `MINFER_NO_FLASH=1` reverts to split.
-Prefill flash (`kernel_flash_attn_blk_*`) covers hd=64 + hd=128.
-
 ## GPU Safety
 
 Read `docs/GPU_SAFETY.md` before touching Metal code. Hard rules: `submit()` waits bounded (10 s) + checks status, reports the dispatch trace (`MINFER_TRACE=1`) and exits — never blocks forever; no early return past a `threadgroup_barrier` in a kernel (GPU deadlock/freeze); device limits (threadgroup memory/threads) queried at runtime, never hardcoded; all guard failures `gpu_abort` with actual values — no silent CPU fallback.
