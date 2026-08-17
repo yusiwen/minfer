@@ -95,13 +95,15 @@ pub fn matmul_attn_enabled() -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_MATMUL_ATTN").map_or(true, |v| v != "1"))
 }
 
-/// Use the llama flash-attention port (kernel_flash_attn_ext_f32/_f16) for
-/// nt==1 decode. Fixed-shape (DK=DV=64) kernel → requires hd==64; anything else
-/// falls back to the split-attention path. ON by default; MINFER_NO_FLASH=1
-/// reverts to the split path for A/B.
+/// Use the llama flash-attention port (kernel_flash_attn_ext_f32/_f16 and the
+/// hd=128 variants) for nt==1 decode. Fixed-shape kernels → requires hd==64
+/// (DK=DV=64) or hd==128 (DK=DV=128); anything else falls back to the
+/// split-attention path. ON by default; MINFER_NO_FLASH=1 reverts to the split
+/// path for A/B.
 pub fn flash_attn_enabled(hd: usize) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_FLASH").map_or(true, |v| v != "1")) && hd == 64
+    *V.get_or_init(|| std::env::var("MINFER_NO_FLASH").map_or(true, |v| v != "1"))
+        && (hd == 64 || hd == 128)
 }
 
 /// Use the llama kernel_flash_attn_ext_blk port (kernel_flash_attn_blk_f32/_f16,
@@ -171,6 +173,8 @@ struct MpsStateInner {
     pl_gqa_attn_combine: metal::ComputePipelineState,
     pl_flash_attn: metal::ComputePipelineState,
     pl_flash_attn_f16: metal::ComputePipelineState,
+    pl_flash_attn_hd128: metal::ComputePipelineState,
+    pl_flash_attn_hd128_f16: metal::ComputePipelineState,
     pl_flash_attn_blk: metal::ComputePipelineState,
     pl_flash_attn_blk_f16: metal::ComputePipelineState,
     pl_flash_attn_blk_hd128: metal::ComputePipelineState,
@@ -804,9 +808,12 @@ impl MpsCommandBuffer<'_> {
         let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
 
         // pass 1: flash partials — f16 cache reads the half K/V directly.
-        self.enc.set_compute_pipeline_state(
-            if kv_cache_is_f16() { &self.state.pl_flash_attn_f16 } else { &self.state.pl_flash_attn }
-        );
+        self.enc.set_compute_pipeline_state(match (kv_cache_is_f16(), hd) {
+            (false, 128) => &self.state.pl_flash_attn_hd128,
+            (true, 128) => &self.state.pl_flash_attn_hd128_f16,
+            (false, _) => &self.state.pl_flash_attn,
+            (true, _) => &self.state.pl_flash_attn_f16,
+        });
         self.enc.set_buffer(0, Some(q), 0);
         self.enc.set_buffer(1, Some(k), 0);
         self.enc.set_buffer(2, Some(v), 0);
@@ -818,8 +825,10 @@ impl MpsCommandBuffer<'_> {
         self.set_params(8, &(scale.to_bits() as i32));
         self.set_params(9, &(nt as i32));
         self.set_params(10, &(n_chunks as i32));
-        // shmem: sq4 (16 float4 = 256 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B)
-        self.enc.set_threadgroup_memory_length(0, 1024);
+        // shmem (hd=64): sq4 (16 float4 = 256 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B) = 896 → 1024
+        // shmem (hd=128): sq4 (32 float4 = 512 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B) = 1152
+        let shmem = if hd == 128 { 1152 } else { 1024 };
+        self.enc.set_threadgroup_memory_length(0, shmem);
         self.dispatch_3d(nt as u64, nh as u64, n_chunks as u64, 32, 1, 1);
 
         // pass 2: combine (shared with the split path)
@@ -1142,6 +1151,8 @@ impl MpsState {
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
             let pl_flash_attn = get_pl("kernel_flash_attn_ext_f32")?;
             let pl_flash_attn_f16 = get_pl("kernel_flash_attn_ext_f16")?;
+            let pl_flash_attn_hd128 = get_pl("kernel_flash_attn_ext_hd128_f32")?;
+            let pl_flash_attn_hd128_f16 = get_pl("kernel_flash_attn_ext_hd128_f16")?;
             let pl_flash_attn_blk = get_pl("kernel_flash_attn_blk_f32")?;
             let pl_flash_attn_blk_f16 = get_pl("kernel_flash_attn_blk_f16")?;
             let pl_flash_attn_blk_hd128 = get_pl("kernel_flash_attn_blk_hd128_f32")?;
@@ -1204,6 +1215,8 @@ impl MpsState {
                 pl_gqa_attn_combine,
                 pl_flash_attn,
                 pl_flash_attn_f16,
+                pl_flash_attn_hd128,
+                pl_flash_attn_hd128_f16,
                 pl_flash_attn_blk,
                 pl_flash_attn_blk_f16,
                 pl_flash_attn_blk_hd128,

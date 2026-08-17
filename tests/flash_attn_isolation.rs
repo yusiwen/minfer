@@ -66,12 +66,19 @@ struct Ctx {
 
 impl Ctx {
     fn new() -> Self {
+        Self::with_hd(14, 2, 64)
+    }
+
+    fn new_hd128() -> Self {
+        Self::with_hd(28, 4, 128)
+    }
+
+    fn with_hd(nh: usize, nk: usize, hd: usize) -> Self {
         let device = metal::Device::system_default().expect("no metal device");
         let src = include_str!("../src/metal.metal");
         let opts = metal::CompileOptions::new();
         let lib = device.new_library_with_source(src, &opts).unwrap_or_else(|e| panic!("shader compile: {e}"));
         let cmdq = device.new_command_queue();
-        let (nh, nk, hd) = (14usize, 2usize, 64usize);
         let scale = 1.0 / (hd as f32).sqrt();
         Ctx { device, lib, cmdq, nh, nk, hd, scale, ne_q: nh * hd }
     }
@@ -86,7 +93,12 @@ impl Ctx {
         let partial = self.device.new_buffer((nt * self.nh * n_chunks * (2 + self.hd) * 4) as u64, MTLResourceOptions::StorageModeShared);
         let ob = self.device.new_buffer((nt * self.ne_q * 4) as u64, MTLResourceOptions::StorageModeShared);
 
-        let kname = if f16 { "kernel_flash_attn_ext_f16" } else { "kernel_flash_attn_ext_f32" };
+        let kname = match (f16, self.hd) {
+            (false, 128) => "kernel_flash_attn_ext_hd128_f32",
+            (true, 128) => "kernel_flash_attn_ext_hd128_f16",
+            (false, _) => "kernel_flash_attn_ext_f32",
+            (true, _) => "kernel_flash_attn_ext_f16",
+        };
         let f = self.lib.get_function(kname, None).unwrap();
         let pl = self.device.new_compute_pipeline_state_with_function(&f).unwrap();
         let f_c = self.lib.get_function("kernel_gqa_attn_combine_f32", None).unwrap();
@@ -104,7 +116,10 @@ impl Ctx {
             self.scale.to_bits() as i32, nt as i32, n_chunks as i32].iter().enumerate() {
             enc.set_bytes(5 + i as u64, 4, val as *const i32 as *const _);
         }
-        enc.set_threadgroup_memory_length(0, 1024);
+        // shmem (hd=64): sq4 256 | ss 128 | so4 512 = 1024
+        // shmem (hd=128): sq4 512 | ss 128 | so4 512 = 1152
+        let shmem = if self.hd == 128 { 1152 } else { 1024 };
+        enc.set_threadgroup_memory_length(0, shmem);
         enc.dispatch_thread_groups(
             MTLSize { width: nt as u64, height: self.nh as u64, depth: n_chunks as u64 },
             MTLSize { width: 32, height: 1, depth: 1 },
@@ -197,7 +212,12 @@ impl Ctx {
 
 #[test]
 fn flash_attn_ext_isolation() {
-    let ctx = Ctx::new();
+    for ctx in [Ctx::new(), Ctx::new_hd128()] {
+        run_isolation(&ctx);
+    }
+}
+
+fn run_isolation(ctx: &Ctx) {
     // n_chunks covers: 1 (whole KV in one TG), small, and > ceil(nkv/C)
     // (empty chunks) cases; nkv spans 1..N tokens incl. partial chunks.
     for &(nt, nkv, n_chunks) in &[
@@ -227,9 +247,9 @@ fn flash_attn_ext_isolation() {
             let r1 = ctx.flash_attn(&q, &k, &v, nt, nkv, n_chunks, f16);
             let r2 = ctx.flash_attn(&q, &k, &v, nt, nkv, n_chunks, f16);
             let maxdiff_gg = r1.iter().zip(&r2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            let (maxdiff, cos, _) = stats(&format!("flash[{label}] nt={nt} nkv={nkv} nc={n_chunks}"), &r1, &ref_out);
-            assert!(maxdiff_gg == 0.0, "flash[{label}] nt={nt} nkv={nkv} nc={n_chunks}: run-to-run differs ({maxdiff_gg:.2e})");
-            assert!(cos > 0.999, "flash[{label}] nt={nt} nkv={nkv} nc={n_chunks}: wrong vs CPU (cos={cos:.6} maxdiff={maxdiff:.2e})");
+            let (maxdiff, cos, _) = stats(&format!("flash[{label}] hd={} nt={nt} nkv={nkv} nc={n_chunks}", ctx.hd), &r1, &ref_out);
+            assert!(maxdiff_gg == 0.0, "flash[{label}] hd={} nt={nt} nkv={nkv} nc={n_chunks}: run-to-run differs ({maxdiff_gg:.2e})", ctx.hd);
+            assert!(cos > 0.999, "flash[{label}] hd={} nt={nt} nkv={nkv} nc={n_chunks}: wrong vs CPU (cos={cos:.6} maxdiff={maxdiff:.2e})", ctx.hd);
         }
     }
 }
@@ -240,7 +260,12 @@ fn flash_attn_ext_isolation() {
 /// partials and merge identically.
 #[test]
 fn flash_attn_matches_split() {
-    let ctx = Ctx::new();
+    for ctx in [Ctx::new(), Ctx::new_hd128()] {
+        run_matches_split(&ctx);
+    }
+}
+
+fn run_matches_split(ctx: &Ctx) {
     for &(nt, nkv, n_chunks) in &[
         (1usize, 1usize, 4usize),
         (1, 30, 4),
@@ -259,8 +284,8 @@ fn flash_attn_matches_split() {
         for (label, f16) in [("f32", false), ("f16", true)] {
             let flash = ctx.flash_attn(&q, &k, &v, nt, nkv, n_chunks, f16);
             let split = ctx.split_attn(&q, &k, &v, nt, nkv, n_chunks, f16);
-            let (maxdiff, cos, _) = stats(&format!("flash-vs-split[{label}] nt={nt} nkv={nkv} nc={n_chunks}"), &flash, &split);
-            assert!(cos > 0.9999, "flash[{label}] nt={nt} nkv={nkv} nc={n_chunks}: disagrees with split (cos={cos:.6} maxdiff={maxdiff:.2e})");
+            let (maxdiff, cos, _) = stats(&format!("flash-vs-split[{label}] hd={} nt={nt} nkv={nkv} nc={n_chunks}", ctx.hd), &flash, &split);
+            assert!(cos > 0.9999, "flash[{label}] hd={} nt={nt} nkv={nkv} nc={n_chunks}: disagrees with split (cos={cos:.6} maxdiff={maxdiff:.2e})", ctx.hd);
         }
     }
 }

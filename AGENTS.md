@@ -81,6 +81,12 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (361 tok/s) | All weights Q4_0 |
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ | ✓ (226 tok/s) | Q5_0/Q8_0/Q4_K/Q6_K mixed |
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ (~250 tok/s) | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
+| Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~18 t/s) | hd=128, split GGUF, flash attention f32/f16 |
+
+Flash attention decode: hd=64 (0.5B/1.5B) and hd=128 (7B) both on the flash
+kernel (`kernel_flash_attn_ext_*` / `_hd128_*`), selected by
+`match (kv_cache_is_f16(), hd)`. Gate: `MINFER_NO_FLASH=1` reverts to split.
+Prefill flash (`kernel_flash_attn_blk_*`) covers hd=64 + hd=128.
 
 ## GPU Safety
 

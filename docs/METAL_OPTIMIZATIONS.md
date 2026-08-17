@@ -45,6 +45,7 @@
 | 23 | **Prefill gap root-cause** (2026-08-14): GEMM is NOT the prefill lever | see to-do #4 status | — |
 | 24 | **Prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy simdgroup-matrix, NSG=4 fixed DK=DV=64) | prefill GPU ~110→~93 ms (~16 %); f32+f16 byte-identical to classic | `5974eb1` |
 | 25 | **hd=128 (7B) prefill flash port** (2026-08-15, §4.3.3 done) | 7B pp310 prefill GPU 1042→**~949 ms (~9 %)**, f32/f16 byte-identical, fixes 7B f16-cache garbage | §4.3.3 |
+| 26 | **hd=128 (7B) decode flash port** (2026-08-17, §4.2.2 extend) | 7B decode steady GPU ~51.1 ms vs split ~51.6 ms (pp205), f32+f16+split byte-identical | §4.2.2 |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -649,6 +650,26 @@ contiguous chunking are interchangeable from the combine's perspective).
   (weight-read-bound, ~0.2 ms of a 55 ms step). Full detail + llama re-bench in
   the flash-investigation log Step 7.
 
+**hd=128 decode flash PORT 2026-08-17 (7B, to-do #26)**: 7B decode was the last
+path still on the split (partial+combine) attention — llama uses a separate
+`f16_dk128_dv128` vec instance (`128,128,1`, NE=1, C=32, DK4=DV4=32). Ported as
+`kernel_flash_attn_ext_hd128_f32/_f16` (metal.metal, immediately after the
+hd=64 kernels): **NE=1** (one float4/lane, no ii loop, DK4=DV4=32, so4 size
+NL·DV4=512 B → shmem 1152 B), 32 cc-iterations each with a full
+`simd_sum(mqk)` (llama's vec NE==1 branch) instead of the NE=2 shuffle-down
+tree, mask computed inline per-lane with `(ic+tx<nkv)?0:-MINF_MAXHALF` (llama's
+cross-lane `sm[]` write is the codebase's forbidden race), partial write covers
+all 128 dims per lane (`tx*4`). Host (`metal.rs::gqa_attn_flash`): pipeline
+selected by `match (kv_cache_is_f16(), hd)` — 4 pipelines
+(f32/f16 × hd64/hd128), `flash_attn_enabled` now `hd == 64 || hd == 128`.
+Isolation: `tests/flash_attn_isolation.rs` parameterized `Ctx::with_hd`
+(nh,nk,hd) — both test fns run hd=64 (14,2,64) AND hd=128 (28,4,128). Verified:
+43 tests green; 7B e2e byte-identical for **flash/split × f32/f16** all four
+combinations (pp41 + pp205); 0.5B unchanged. Measured pp205 steady decode GPU:
+**flash ~51.1 vs split ~51.6 ms/token** (3×interleaved) — the NE=1/32-iter
+simd_sum risk point did NOT materialize; parity with slight flash edge (the
+split path reads K then V in two kernels + combine; flash reads each once).
+
 #### 4.2.3 small elementwise — CLOSED by the trace (was the "other half")
 
 **Refuted 2026-08-13**: §4.1.1 measured minfer's small elementwise kernels at
@@ -873,6 +894,13 @@ MINFER_TIMING `gpu(submit-wait)` tok 5+ segment; llama = llama-bench `-p 252 -n 
 > step's regression check (same-caliber MINFER_TIMING steady-state, tok 5+).
 > Note: 7B short-prompt "hi" prefill reads ~41 t/s (health check's 200 t/s
 > threshold is 0.5B-calibrated and does NOT apply to 7B short prompts).
+
+> **Post-hoc (2026-08-17)**: the decode flash hd=128 port (§4.2.2) confirmed the
+> §4.2.2 "7B parity" prediction — steady decode GPU stays ~51 ms/token (flash
+> ~51.1 vs split ~51.6 at pp205, byte-identical), i.e. 7B decode is
+> weight-read-bound and the flash port is a correctness/dedup win, not a speed
+> win at this step. The 37 % vs llama gap must come from the q8_0 FFN matmul
+> kernels (weight-read-bound limit), not attention.
 
 ### 4.5 Backfill after each item
 
