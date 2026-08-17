@@ -425,10 +425,11 @@ impl MpsCommandBuffer<'_> {
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                    // Q6_K: llama's kernel_mul_mv_q6_K_f32_impl uses TG(32, nsg=2);
-                    // the stride-2 thread layout keeps all threads busy for small
-                    // id (nb super-blocks), unlike the old stride-64 scalar loop.
-                    if ttype == TensorType::Q6_K {
+                    // Q6_K/Q4_K: llama's kernel_mul_mv_q6_K/q4_K_f32_impl use
+                    // TG(32, nsg=2); the stride-2 (q6_K) / stride-4 (q4_K) thread
+                    // layout keeps all threads busy for small id (nb super-blocks),
+                    // unlike the old stride-64 scalar loop.
+                    if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
                     } else {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
@@ -2118,7 +2119,7 @@ mod tests {
         let mps = MpsState::get().expect("MPS must be active for the bandwidth profile");
         let dev = &mps.inner.device;
 
-        // (label, ttype, od, id, batches) — Qwen2.5-0.5B Q4_K_M decode dims.
+        // (label, ttype, od, id, batches) — Qwen2.5-0.5B Q4_K_M + 7B Q4_K decode dims.
         let cases: &[(&str, TensorType, usize, usize, usize)] = &[
             ("QKV  q5_0 (od=1152,id=896)",  TensorType::Q5_0, 1152,   896, 400),
             ("O    q5_0 (od=896, id=896)",  TensorType::Q5_0,  896,   896, 400),
@@ -2132,6 +2133,11 @@ mod tests {
             ("out  q4_0 (od=151936,id=896)", TensorType::Q4_0, 151936, 896, 6),
             // Q5_1 shares Q5_0's qh (variable-shift) handling + an m term.
             ("QKV  q5_1 (od=1152,id=896)",  TensorType::Q5_1, 1152,   896, 400),
+            // Qwen2.5-7B Q4_K decode dims (to-do #7 pre-port baseline):
+            // attn_q/attn_output (3584/3584), attn_k (3584/512), ffn_gate/up (18944/3584).
+            ("7B attn_q q4_K (3584/3584)",   TensorType::Q4_K, 3584,  3584, 400),
+            ("7B attn_k q4_K (3584/512)",    TensorType::Q4_K, 3584,   512, 400),
+            ("7B ffn_g/u q4_K (18944/3584)", TensorType::Q4_K, 18944, 3584, 100),
         ];
 
         println!("\n=== nt==1 matmul bandwidth profile (batched cb, M4 Pro) ===");

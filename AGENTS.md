@@ -91,7 +91,7 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (361 tok/s) | All weights Q4_0 |
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ | ✓ (226 tok/s) | Q5_0/Q8_0/Q4_K/Q6_K mixed |
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ (~250 tok/s) | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
-| Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~18 t/s) | hd=128, split GGUF, flash attention f32/f16 |
+| Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~45-49 t/s) | hd=128, split GGUF, flash attention f32/f16, q4_K decode matmul port |
 
 ## GPU Safety
 
