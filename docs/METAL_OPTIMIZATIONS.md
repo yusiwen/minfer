@@ -61,6 +61,7 @@
 | 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. **PORT DONE 2026-08-14 (§4.3.2)**: `kernel_flash_attn_blk_f32/_f16` (fixed-shape NSG=4, Q=8, C=64, DK=DV=64, 7168 B shmem, inline causal mask, `kernel_kv_tail_pad` for the partial last block) + host `attn_flash_prefill`. Isolation-verified (`tests/flash_attn_blk_isolation.rs`: cos vs CPU >0.999 across 16 nt/nkv configs incl. partial blocks + GQA, f32+f16, deterministic), A/B **byte-identical to the classic `gqa_attn_f32`** at every layer (f32 AND f16 cache — maxabs 0.0), interleaved MINFER_TIMING prefill GPU **~110→~93 ms (~16 %)**, all 34 bin + 9 isolation tests pass. **Bonus: FIXES the f16-cache prefill 3-pass bug** (the 3-pass `kernel_attn_scores`/`kernel_attn_output` read the f16 KV cache as `float*` → garbage "!!!!!!"; the f16 blk kernel reads half K/V correctly). Default for hd==64 (0.5B/1.5B) and — since the 2026-08-15 hd=128 port — for hd==128 (7B) too. Gate: `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. Non-attention 89 vs ~44 ms remains a secondary structural gap |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
+| 7 | **q4_K decode matmul layout port (7B)** — the next decode lever | 7B decode 37 % → closer to llama (steady GPU ~50 → target ~30 ms/token) | **PLANNED 2026-08-17** (§4.2.1): 7B K_M decode matmuls are **Q4_K-dominated** (attn_q/k/output + ffn_gate/up all Q4_K; Q6_K only output/ffn_down/attn_v). minfer's `kernel_q4_k_f32_matmul` still uses the old scalar + deinterleave structure (§4.2.1 note "q4_K next if a K_M model uses it"). Port llama's `kernel_mul_mv_q4_K_f32_impl` stride-2/float4 layout (llama metal.metal:8300, `sc16[4]` kmask unpack — watch the scale/min high/low nibble interleave, riskier than q6_K). Steps: ① isolation bandwidth probe at 7B dims (od=18944/id=3584, od=3584/3584, output od=152064) ② kernel port ③ 7B steady-decode A/B + byte-identical ④ 0.5B regression + docs |
 
 > Note: §4.1.1's per-kernel table is superseded by the clean isolation A/B
 > (§4.2.1): the trace mixed fused-vs-separate and different od per kernel name.
@@ -535,8 +536,11 @@ loops. llama's `kernel_mul_mv_q6_K_f32_impl` uses a stride-2 thread layout
 - byte-identical output (git-stash A/B), all tests green.
 
 q5_0 and q8_0 were already at parity — no work there. q4_K is not present in
-the 0.5B K_M model weights (Q5_0/Q8_0/Q6_K/Q4_K mixed); if a model uses q4_K
-decode it should get the same layout treatment.
+the 0.5B K_M model weights (Q5_0/Q8_0/Q6_K/Q4_K mixed), so it was not measured
+here — but **7B K_M DOES use q4_K as its dominant decode type** (attn_q/k/output
++ ffn_gate/up all q4_K, see §4.4.2), and minfer's `kernel_q4_k_f32_matmul`
+(still the old scalar + 256B deinterleave structure) likely carries the same
+gap q6_K had. **→ the next decode lever is a q4_K layout port (to-do #7).**
 
 #### 4.2.2 attention gap confirmed — flash attention port
 
@@ -899,8 +903,22 @@ MINFER_TIMING `gpu(submit-wait)` tok 5+ segment; llama = llama-bench `-p 252 -n 
 > §4.2.2 "7B parity" prediction — steady decode GPU stays ~51 ms/token (flash
 > ~51.1 vs split ~51.6 at pp205, byte-identical), i.e. 7B decode is
 > weight-read-bound and the flash port is a correctness/dedup win, not a speed
-> win at this step. The 37 % vs llama gap must come from the q8_0 FFN matmul
-> kernels (weight-read-bound limit), not attention.
+> win at this step. The 37 % vs llama gap must come from the matmul kernels
+> (weight-read-bound limit), not attention — and 7B's decode matmuls are
+> **Q4_K-dominated** (not q8_0, which was already at parity): see §4.4.2 /
+> to-do #7.
+
+#### 4.4.2 7B decode weight-type breakdown (2026-08-17)
+
+`minfer info` on `qwen2.5-7b-instruct-q4_k_m` (2-part): the decode matmuls are
+**q4_K-dominated** — `attn_q`/`attn_k`/`attn_output` and `ffn_gate`/`ffn_up`
+are all `q4_K`; only `output`/`ffn_down`/`attn_v` are `q6_K` (already fixed in
+§4.2.1). So at 7B the decode weight-read profile is the inverse of 0.5B's
+(q6_K-heavy): the q6_K fix that shipped 2026-08-13 helps 7B less than it helped
+0.5B, and q4_K is the untested, unoptimized decode type. This explains why the
+flash decode hd=128 port (§4.2.2) moved 7B steady decode so little (~51.1 vs
+~51.6 ms/token — attention was not the 7B decode bottleneck). To-do #7 targets
+this directly.
 
 ### 4.5 Backfill after each item
 
