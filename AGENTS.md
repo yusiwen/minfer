@@ -5,6 +5,16 @@ Supports **Qwen2/Qwen2.5 architecture**, **CPU + Apple MPS (Metal) GPU** inferen
 
 This file is the always-loaded project index. Deep dives, performance analysis, and historical fixes live in `docs/` (index at the bottom) — don't re-litigate them here.
 
+## Code Search (ccc)
+
+minfer is a llama.cpp-inspired engine; both codebases are indexed with [ccc](https://cocoindex.io/cocoindex-code/). When the question is "where / how is X implemented", prefer ccc semantic search over whole-repo grep/rg.
+
+- **minfer's own code** -> use the `ccc` MCP `search` tool, or CLI: `ccc search "<query>"` from this directory (index: `.cocoindex_code/`, 1255 chunks).
+- **llama.cpp reference source** (`$HOME/git/reading/llama.cpp`, C++ upstream: ggml, quantization kernels, sampler, tokenizer, llama_server, etc.) -> use the `ccc-llamacpp` MCP `search` tool, or CLI: `cd $HOME/git/reading/llama.cpp && ccc search "<query>"` (index: 47326 chunks).
+- **Structural search**: `ccc grep '<pattern>'` -- e.g. `ccc grep 'fn \NAME(\(A*\))' src/` for Rust functions, or `ccc grep '\NAME(\(A*\))'` inside llama.cpp for call sites.
+- **Filters**: `--lang rust|cpp|...`, `--path 'src/**'` to narrow results.
+- Both MCP servers auto-refresh their indexes (`refresh_index=true` default); stale results -> pass `refresh_index=true` explicitly or run `ccc index` / `ccc search --refresh`.
+
 ## Architecture at a Glance
 
 ```
@@ -134,13 +144,3 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
-
-## Code Search (ccc)
-
-minfer is a llama.cpp-inspired engine; both codebases are indexed with [ccc](https://cocoindex.io/cocoindex-code/). When the question is "where / how is X implemented", prefer ccc semantic search over whole-repo grep/rg.
-
-- **minfer's own code** -> use the `ccc` MCP `search` tool, or CLI: `ccc search "<query>"` from this directory (index: `.cocoindex_code/`, 1255 chunks).
-- **llama.cpp reference source** (`$HOME/git/reading/llama.cpp`, C++ upstream: ggml, quantization kernels, sampler, tokenizer, llama_server, etc.) -> use the `ccc-llamacpp` MCP `search` tool, or CLI: `cd $HOME/git/reading/llama.cpp && ccc search "<query>"` (index: 47326 chunks).
-- **Structural search**: `ccc grep '<pattern>'` -- e.g. `ccc grep 'fn \NAME(\(A*\))' src/` for Rust functions, or `ccc grep '\NAME(\(A*\))'` inside llama.cpp for call sites.
-- **Filters**: `--lang rust|cpp|...`, `--path 'src/**'` to narrow results.
-- Both MCP servers auto-refresh their indexes (`refresh_index=true` default); stale results -> pass `refresh_index=true` explicitly or run `ccc index` / `ccc search --refresh`.
