@@ -11,3 +11,5 @@ __pycache__/
 llama_ref/
 uv.lock
 .direnv/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
