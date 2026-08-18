@@ -206,35 +206,58 @@ per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
 activation quantization (f32 → Q8_0). Metal: flash attention (online softmax),
 SIMD-parallel RMSNorm with float4 vectorization, Q4_0 × Q8_0 matmul.
 
-## Architecture
+## Project Structure
 
 ```
-src/
-├── main.rs          # Entry point, CLI, inference loop
-├── gguf.rs          # GGUF format parser (v3) + KV helpers
-├── block.rs         # Quantized block types + fp16 conversions
-├── avx2.rs          # AVX2 dot product kernels + quantization
-├── cuda.rs          # CUDA GPU state, FFI bindings, graph capture
-├── cuda_kernels.cu  # CUDA kernels (matmul, attention, element-wise ops)
-├── metal.rs         # Metal GPU state machine + kernel dispatch
-├── metal.metal      # Metal compute shaders (attention, matmul, norm)
-├── build.rs         # CUDA kernel compilation + arch detection
-├── kernel.rs        # Quantized matmul dispatch (CPU/GPU bridge)
-├── tensor.rs        # Tensor struct + data access
-├── vec_ops.rs       # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
-├── cache.rs         # KV cache (shared, architecture-agnostic)
-├── dump.rs          # Debug dump module (gated by `--features debug_dump`)
-├── sampler.rs       # Greedy / temperature / top-k / top-p sampling
-├── tokenizer.rs     # BPE tokenizer (self-contained, GGUF-backed)
-├── template.rs      # Chat template detection + formatting
-├── download/        # Model download from HF Hub & Ollama
-│   └── mod.rs       # resolve() URI handler, curl-based HTTP, list_local()
-└── models/          # Architecture-specific implementations
-    ├── mod.rs       # ModelDef trait + load_model factory dispatch
-    └── qwen2/       # Qwen2 implementation
-        ├── mod.rs       # Qwen2Model + ModelDef impl
-        ├── forward.rs   # Forward pass (CPU + GPU paths)
-        └── loader.rs    # Tensor loading from GGUF
+minfer/
+├── Cargo.toml             # crate manifest (deps, [features] cuda / debug_dump)
+├── Cargo.lock
+├── build.rs               # CUDA kernel compilation + arch detection
+├── flake.nix / flake.lock # Nix dev shell
+├── pyproject.toml         # Python tooling for the verification scripts
+├── AGENTS.md              # AI-agent project index (architecture, conventions)
+├── LICENSE
+├── README.md
+├── src/
+│   ├── main.rs            # Entry point, CLI, inference loop
+│   ├── gguf.rs            # GGUF format parser (v3) + KV helpers
+│   ├── block.rs           # Quantized block types + fp16 conversions
+│   ├── avx2.rs            # AVX2 dot product kernels + quantization
+│   ├── cuda.rs            # CUDA GPU state, FFI bindings, graph capture
+│   ├── cuda_kernels.cu    # CUDA kernels (matmul, attention, element-wise ops)
+│   ├── metal.rs           # Metal GPU state machine + kernel dispatch
+│   ├── metal.metal        # Metal compute shaders (attention, matmul, norm)
+│   ├── kernel.rs          # Quantized matmul dispatch (CPU/GPU bridge)
+│   ├── tensor.rs          # Tensor struct + data access
+│   ├── vec_ops.rs         # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
+│   ├── cache.rs           # KV cache (shared, architecture-agnostic)
+│   ├── dump.rs            # Debug dump module (gated by `--features debug_dump`)
+│   ├── sampler.rs         # Greedy / temperature / top-k / top-p sampling
+│   ├── tokenizer.rs       # BPE tokenizer (self-contained, GGUF-backed)
+│   ├── template.rs        # Chat template detection + formatting
+│   ├── download/          # Model download from HF Hub & Ollama
+│   │   └── mod.rs         # resolve() URI handler, curl-based HTTP, list_local()
+│   └── models/            # Architecture-specific implementations
+│       ├── mod.rs         # ModelDef trait + load_model factory dispatch
+│       └── qwen2/         # Qwen2 implementation
+│           ├── mod.rs     # Qwen2Model + ModelDef impl
+│           ├── forward.rs # Forward pass (CPU + GPU paths)
+│           └── loader.rs  # Tensor loading from GGUF
+├── tests/                 # Kernel isolation tests (vs CPU reference)
+│   ├── flash_attn_blk_isolation.rs
+│   ├── flash_attn_isolation.rs
+│   ├── gemm_isolation.rs
+│   └── gqa_attn_isolation.rs
+├── scripts/               # Benchmark + verification tooling
+│   ├── bench.sh           # GPU benchmark wrapper (asserts MPS active)
+│   ├── compare_layers.py  # Layer-by-layer comparison vs llama.cpp dumps
+│   ├── dump_llama_ref.py  # llama.cpp reference dump generator
+│   ├── dump_tensors.py
+│   ├── export_trace.sh
+│   ├── lib.py
+│   └── verify_*.py        # Per-op verifiers (rmsnorm, rope, attention, ...)
+└── experiments/           # Throwaway experiments
+    └── cuda/              # CUDA graph capture prototypes
 ```
 
 ## License
