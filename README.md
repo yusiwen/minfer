@@ -154,7 +154,8 @@ cargo run --release -- list
 | CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
 | Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~650–1000 tok/s | ~230 tok/s |
 | Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~966 tok/s | ~315 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~442 tok/s | — |
+| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~650–770 tok/s | ~155–160 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-7B Q4_K_M | ~120–130 tok/s | ~42–45 tok/s |
 
 Prefill uses simdgroup GEMMs for every quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
 Q4_K/Q5_K/Q6_K); decode uses fused QKV/FFN matmuls + a KV-parallel split
