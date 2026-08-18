@@ -199,7 +199,7 @@ cargo run --release -- list
 
 Prefill uses simdgroup GEMMs for every quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
 Q4_K/Q5_K/Q6_K); decode uses fused QKV/FFN matmuls + a KV-parallel split
-attention. See `docs/METAL_OPTIMIZATIONS.md`.
+attention. See **[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
 
 GPU decode optimizations: CUDA Graph capture/replay (single `cudaGraphLaunch`
 per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
