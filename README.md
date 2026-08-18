@@ -104,6 +104,41 @@ See `AGENTS.md` for a step-by-step guide. In brief:
 Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral, Phi)
 should be relatively straightforward to port.
 
+## Architecture
+
+minfer is a pure-Rust LLM inference engine with no ML framework dependency.
+The full design (module map, inference pipeline, backend layering & fallback,
+quantization layout, KV cache, adding a new architecture) is documented in
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+
+At a glance: a GGUF v3 model is loaded and dispatched on `general.architecture`
+to an implementation of the `ModelDef` trait; every forward call is an
+imperative per-layer loop that tries the GPU first (Metal on Apple Silicon,
+CUDA on NVIDIA) and falls back to the CPU per-layer:
+
+```mermaid
+flowchart LR
+    A[CLI] --> B[load GGUF<br/>metadata + quantized weights]
+    B --> C[tokenize prompt<br/>BPE + chat template]
+    C --> D[PREFILL<br/>forward all tokens at once]
+    D --> E[DECODE loop<br/>forward 1 token at a time]
+    E --> F[sample<br/>penalty → top-k → top-p → temp]
+    F --> E
+    E --> G[text out]
+    D --> H{GPU layer?}
+    H -->|yes| I[Metal / CUDA<br/>flash attention + GEMM/matmul]
+    H -->|no| J[CPU<br/>AVX2 dot products + Q8_0 activations]
+    I --> D
+    J --> D
+```
+
+Key modules: `gguf.rs` (parser), `models/qwen2/` (forward pass + loader),
+`kernel.rs`/`avx2.rs` (quantized matmul), `metal.rs`+`metal.metal` and
+`cuda.rs`+`cuda_kernels.cu` (GPU backends), `cache.rs` (KV cache),
+`sampler.rs`/`tokenizer.rs`/`template.rs` (sampling + tokenization + chat
+templates). Supported quants: Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K
+(CPU + Metal), F32/F16 norms & biases.
+
 ## Usage
 
 ```bash

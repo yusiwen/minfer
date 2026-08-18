@@ -134,6 +134,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 
 | Topic | Location |
 |---|---|
+| Overall architecture design (module map, pipeline, backend layering, quant layout, adding an arch) | `docs/ARCHITECTURE.md` |
 | Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations | `docs/CPU_OPTIMIZATIONS.md` |
