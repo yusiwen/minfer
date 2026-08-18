@@ -118,18 +118,23 @@ CUDA on NVIDIA) and falls back to the CPU per-layer:
 
 ```mermaid
 flowchart LR
-    A[CLI] --> B[load GGUF<br/>metadata + quantized weights]
-    B --> C[tokenize prompt<br/>BPE + chat template]
-    C --> D[PREFILL<br/>forward all tokens at once]
-    D --> E[DECODE loop<br/>forward 1 token at a time]
-    E --> F[sample<br/>penalty → top-k → top-p → temp]
-    F --> E
-    E --> G[text out]
-    D --> H{GPU layer?}
-    H -->|yes| I[Metal / CUDA<br/>flash attention + GEMM/matmul]
-    H -->|no| J[CPU<br/>AVX2 dot products + Q8_0 activations]
-    I --> D
-    J --> D
+    subgraph FWD["forward(): per-layer GPU-first, CPU fallback"]
+        J{"GPU layer?"} -->|yes| K["Metal / CUDA<br/>flash attention + GEMM/matmul"]
+        J -->|no| L["CPU<br/>AVX2 dot products + Q8_0 activations"]
+    end
+
+    A["CLI"] --> B["load GGUF<br/>metadata + quantized weights"]
+    B --> C["tokenize prompt<br/>BPE + chat template"]
+    C --> D["PREFILL<br/>forward all prompt tokens"]
+    D --> E["last-token logits"]
+    E --> F{"DECODE loop"}
+    F -->|sample| G["sample next token<br/>penalty → top-k → top-p → temp"]
+    G -->|stop| H["text out"]
+    G -->|continue| I["forward 1 token<br/>update KV cache"]
+    I --> F
+
+    D -.->|per layer| FWD
+    I -.->|per layer| FWD
 ```
 
 Key modules: `gguf.rs` (parser), `models/qwen2/` (forward pass + loader),
