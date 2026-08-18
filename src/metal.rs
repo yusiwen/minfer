@@ -2536,13 +2536,23 @@ mod tests {
         let dev = &mps.inner.device;
         // Qwen2.5-0.5B Q4_K_M prefill dims: attn_q=Q5_0 (od=896,id=896),
         // ffn_up=Q5_0 (od=18944,id=896), ffn_down=Q6_K (od=896,id=4864).
+        // 7B Q4_K_M prefill GEMMs (od=ne[1], id=ne[0] from `minfer info`):
+        //   q4_K: attn_q/attn_output (3584/3584), attn_k (512/3584), ffn_gate/up (18944/3584)
+        //   q6_K: attn_v (512/3584), ffn_down (3584/18944), output (152064/3584)
         // Use the 64x32-tile GEMM (nt>=16) which is what prefill uses.
         let cases: &[(&str, TensorType, usize, usize)] = &[
-            ("attn_q Q5_0 od=896  id=896  nt=430", TensorType::Q5_0, 896, 896),
-            ("attn_q Q4_0 od=896  id=896  nt=430", TensorType::Q4_0, 896, 896),
-            ("ffn_up Q5_0 od=18944 id=896  nt=430", TensorType::Q5_0, 18944, 896),
-            ("ffn_up Q4_0 od=18944 id=896  nt=430", TensorType::Q4_0, 18944, 896),
-            ("down  Q6_K od=896  id=4864 nt=430", TensorType::Q6_K, 896, 4864),
+            ("attn_q Q5_0  od=896    id=896   nt=430", TensorType::Q5_0, 896, 896),
+            ("attn_q Q4_0  od=896    id=896   nt=430", TensorType::Q4_0, 896, 896),
+            ("ffn_up Q5_0  od=18944  id=896   nt=430", TensorType::Q5_0, 18944, 896),
+            ("ffn_up Q4_0  od=18944  id=896   nt=430", TensorType::Q4_0, 18944, 896),
+            ("down  Q6_K   od=896    id=4864  nt=430", TensorType::Q6_K, 896, 4864),
+            // 7B prefill GEMMs (2026-08-18, llama test-backend-ops A/B)
+            ("7B attn_q Q4_K od=3584   id=3584  nt=430", TensorType::Q4_K, 3584, 3584),
+            ("7B attn_k Q4_K od=512    id=3584  nt=430", TensorType::Q4_K, 512, 3584),
+            ("7B ffn_gu Q4_K od=18944  id=3584  nt=430", TensorType::Q4_K, 18944, 3584),
+            ("7B attn_v Q6_K od=512    id=3584  nt=430", TensorType::Q6_K, 512, 3584),
+            ("7B ffn_down Q6_K od=3584 id=18944 nt=430", TensorType::Q6_K, 3584, 18944),
+            ("7B output Q6_K od=152064 id=3584  nt=430", TensorType::Q6_K, 152064, 3584),
         ];
         let nt = 430usize;
         println!("\n=== prefill GEMM throughput (nt=430, batched cb) ===");
@@ -2588,7 +2598,8 @@ mod tests {
             us.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let per_us = us[1]; // median
             let gbs = wbytes as f64 / (per_us * 1e-6) / 1e9;
-            println!("  {label:<30} {:.1} MB {per_us:>7.1} us => {:>5.0} GB/s (warm, n=50)", wbytes as f64/1e6, gbs);
+            let tflops = 2.0 * od as f64 * id as f64 * nt as f64 / (per_us * 1e-6) / 1e12;
+            println!("  {label:<32} {:.1} MB {per_us:>8.1} us => {:>5.0} GB/s  {:>5.2} TFLOPS (warm, n=50)", wbytes as f64/1e6, gbs, tflops);
         }
     }
 }
