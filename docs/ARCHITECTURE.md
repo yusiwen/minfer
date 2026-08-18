@@ -59,28 +59,28 @@ prefill** followed by an **autoregressive decode loop**.
 
 ```mermaid
 flowchart TD
-    A[CLI args: model, prompt, flags] --> B{resolve model}
-    B -->|local path| C[load GGUF v3<br/>single or split parts]
-    B -->|hf:… / ollama:…| D[auto-download]
+    A["CLI args: model, prompt, flags"] --> B{"resolve model"}
+    B -->|local path| C["load GGUF v3<br/>single or split parts"]
+    B -->|"hf:… / ollama:…"| D["auto-download"]
     B -->|cached name| C
-    C --> E[parse metadata KV + tensor table]
-    E --> F[init GPU backend<br/>MPS / CUDA]
-    E --> G[load model<br/>dispatch on general.architecture]
-    G --> H[build KV cache<br/>n_layer × n_ctx × n_kv_embd]
-    H --> I[load BPE tokenizer from GGUF]
-    I --> J{no-template?}
-    J -->|no| K[render chat template<br/>tokenizer.chat_template via minijinja]
-    J -->|yes| L[raw prompt]
-    K --> M[tokenize prompt]
+    C --> E["parse metadata KV + tensor table"]
+    E --> F["init GPU backend<br/>MPS / CUDA"]
+    E --> G["load model<br/>dispatch on general.architecture"]
+    G --> H["build KV cache<br/>n_layer × n_ctx × n_kv_embd"]
+    H --> I["load BPE tokenizer from GGUF"]
+    I --> J{"no-template?"}
+    J -->|no| K["render chat template<br/>tokenizer.chat_template via minijinja"]
+    J -->|yes| L["raw prompt"]
+    K --> M["tokenize prompt"]
     L --> M
-    M --> N[PREFILL<br/>forward all prompt tokens at once]
-    N --> O[last-token logits]
-    O --> P{DECODE loop<br/>while generated < n_predict}
-    P --> Q[sample next token<br/>repeat-penalty → top-k → top-p → temp]
-    Q --> R[stop token?]
-    R -->|yes| S[done]
-    R -->|no| T[append token, decode+print]
-    T --> U[forward single token<br/>update KV cache]
+    M --> N["PREFILL<br/>forward all prompt tokens at once"]
+    N --> O["last-token logits"]
+    O --> P{"DECODE loop<br/>while generated < n_predict"}
+    P --> Q["sample next token<br/>repeat-penalty → top-k → top-p → temp"]
+    Q --> R["stop token?"]
+    R -->|yes| S["done"]
+    R -->|no| T["append token, decode+print"]
+    T --> U["forward single token<br/>update KV cache"]
     U --> P
 ```
 
@@ -104,20 +104,20 @@ in `models/qwen2/forward.rs`.
 
 ```mermaid
 flowchart LR
-    A[token_embd lookup] --> B[hidden]
-    B --> C[RMSNorm attn_norm]
-    C --> D[WQ / WK / WV matmuls + bias]
-    D --> E[RoPE on Q and K]
-    E --> F[store K/V into KV cache]
-    F --> G[GQA attention<br/>Q·K^T → softmax → ·V]
-    G --> H[WO matmul + bias]
-    H --> I[+ residual → hidden]
-    I --> J[RMSNorm ffn_norm]
-    J --> K[FFN gate + up matmuls]
-    K --> L[SiLU(gate) × up]
-    L --> M[FFN down matmul]
-    M --> N[+ residual → hidden]
-    N --> O[next layer / output_norm]
+    A["token_embd lookup"] --> B["hidden"]
+    B --> C["RMSNorm attn_norm"]
+    C --> D["WQ / WK / WV matmuls + bias"]
+    D --> E["RoPE on Q and K"]
+    E --> F["store K/V into KV cache"]
+    F --> G["GQA attention<br/>Q·K^T → softmax → ·V"]
+    G --> H["WO matmul + bias"]
+    H --> I["+ residual → hidden"]
+    I --> J["RMSNorm ffn_norm"]
+    J --> K["FFN gate + up matmuls"]
+    K --> L["SiLU(gate) × up"]
+    L --> M["FFN down matmul"]
+    M --> N["+ residual → hidden"]
+    N --> O["next layer / output_norm"]
 ```
 
 GQA: each query head `h` maps to KV head `hk = h / gqa`. The KV head dimension
@@ -144,19 +144,19 @@ design decision of the engine:
 
 ```mermaid
 flowchart TD
-    A[forward nt tokens] --> B{embedding on GPU?}
-    B -->|yes| C[GPU embed lookup → buf_hidden]
-    B -->|no| D[CPU embed → upload hidden]
-    D --> E[upload positions]
+    A["forward nt tokens"] --> B{"embedding on GPU?"}
+    B -->|yes| C["GPU embed lookup → buf_hidden"]
+    B -->|no| D["CPU embed → upload hidden"]
+    D --> E["upload positions"]
     C --> E
-    E --> F{per-layer: layer_gpu ok?}
-    F -->|yes, all layers| G[output_norm_gpu<br/>on GPU]
-    F -->|no at layer i| H[submit partial GPU work<br/>download hidden, sync KV to CPU]
-    H --> I[CPU loop from layer i]
-    G -->|output on GPU| J[download logits → return]
-    G -->|output fell back| I
-    I --> K[output_norm + output matmul on CPU]
-    K --> L[return logits]
+    E --> F{"per-layer: layer_gpu ok?"}
+    F -->|"yes, all layers"| G["output_norm_gpu<br/>on GPU"]
+    F -->|"no at layer i"| H["submit partial GPU work<br/>download hidden, sync KV to CPU"]
+    H --> I["CPU loop from layer i"]
+    G -->|"output on GPU"| J["download logits → return"]
+    G -->|"output fell back"| I
+    I --> K["output_norm + output matmul on CPU"]
+    K --> L["return logits"]
 ```
 
 ### 5.1 Selection rules
@@ -192,13 +192,13 @@ failures `gpu_abort` with actual values. See `docs/GPU_SAFETY.md`.
 
 ```mermaid
 flowchart LR
-    A[GGUF file] --> B[metadata KV<br/>hparams + tokenizer + template]
-    A --> C[tensor table<br/>name / type / shape / offset]
-    C --> D[quantized data blob]
-    D --> E[Tensor{type, shape, strides, Vec<u8>}]
-    B --> F[HParams]
-    B --> G[Tokenizer]
-    B --> H[Chat template]
+    A["GGUF file"] --> B["metadata KV<br/>hparams + tokenizer + template"]
+    A --> C["tensor table<br/>name / type / shape / offset"]
+    C --> D["quantized data blob"]
+    D --> E["Tensor: type, shape, strides, Vec&lt;u8&gt;"]
+    B --> F["HParams"]
+    B --> G["Tokenizer"]
+    B --> H["Chat template"]
 ```
 
 ---
