@@ -805,6 +805,7 @@ kernel void kernel_q4_0_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -822,6 +823,7 @@ kernel void kernel_q4_0_mm_f32(
         const short bly = (tiitg/NL1)%8;              // N sub   (raw)
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -832,12 +834,16 @@ kernel void kernel_q4_0_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -927,6 +933,7 @@ kernel void kernel_q4_1_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -942,6 +949,7 @@ kernel void kernel_q4_1_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -951,12 +959,16 @@ kernel void kernel_q4_1_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -1043,6 +1055,7 @@ kernel void kernel_q8_0_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -1058,6 +1071,7 @@ kernel void kernel_q8_0_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -1067,12 +1081,16 @@ kernel void kernel_q8_0_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -1159,6 +1177,7 @@ kernel void kernel_q5_0_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -1174,6 +1193,7 @@ kernel void kernel_q5_0_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -1183,12 +1203,16 @@ kernel void kernel_q5_0_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -1275,6 +1299,7 @@ kernel void kernel_q5_1_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -1290,6 +1315,7 @@ kernel void kernel_q5_1_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -1299,12 +1325,16 @@ kernel void kernel_q5_1_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -1395,6 +1425,7 @@ kernel void kernel_q6_k_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -1410,6 +1441,7 @@ kernel void kernel_q6_k_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -1419,12 +1451,16 @@ kernel void kernel_q6_k_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -4671,6 +4707,7 @@ kernel void kernel_q4_k_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -4686,6 +4723,7 @@ kernel void kernel_q4_k_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -4695,12 +4733,16 @@ kernel void kernel_q4_k_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
@@ -4788,6 +4830,7 @@ kernel void kernel_q5_k_mm_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll
         for (short i = 0; i < 16; i++) {
             const short sx = 2*il0 + i/8;
             const short sy = lr0/8;
@@ -4803,6 +4846,7 @@ kernel void kernel_q5_k_mm_f32(
         const short bly = (tiitg/NL1)%8;
         const short bib = 4*bx + by;
         device const float * y = acts + (r1 + lr1)*p[1] + loop_k + iy;
+        #pragma unroll
         for (short i = 0; i < 8; i++) {
             sb[64*bib + 8*bly + i] = half(y[i]);
         }
@@ -4812,12 +4856,16 @@ kernel void kernel_q5_k_mm_f32(
         threadgroup const half * lsma = sa + 4*64*(sgitg%2);
         threadgroup const half * lsmb = sb + 2*64*(sgitg/2);
 
+        #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }

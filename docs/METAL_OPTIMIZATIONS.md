@@ -49,6 +49,7 @@
 | 26 | **hd=128 (7B) decode flash port** (2026-08-17, §4.2.2 extend) | 7B decode steady GPU ~51.1 ms vs split ~51.6 ms (pp205), f32+f16+split byte-identical | §4.2.2 |
 | 27 | **q4_K decode matmul layout port (7B)** (2026-08-17, to-do #7, §4.2.1) | 7B q4_K dims 70→265 GB/s (attn_q), 18→146 (attn_k), 74→243 GB/s (ffn_g/u); **7B decode steady GPU ~51 → ~19.3 ms/token (~2.6×, now ≈ llama's 50.5 t/s)**; 7B/0.5B byte-identical | to-do #7 |
 | 28 | **GEMM partial-tile race + missing Metal `memoryBarrier`** (2026-08-19, §4.3.6): (a) all 8 simdgroup mm kernels lacked the `threadgroup_barrier` BEFORE the partial-tile `temp_str` stores — `temp_str` overlaps sa/sb, so a fast simdgroup overwrites sa/sb while a slow one still reads them → intermittently corrupted last-2-token logits (partial x-tile only); (b) the single prefill encoder had NO `memoryBarrier` between dispatches → RMSNorm write raced QKV read of the reused `bn` buffer (last-2 token slots, huge stale values) | 1.5B/7B first-token nondeterminism (~10-30 % wrong tokens, dump-localized) → **24/24 deterministic, output matches CPU byte-for-byte** | uncommitted |
+| 29 | **mm-kernel hot-loop `#pragma unroll`** (2026-08-19, §4.3.9): llama `FOR_UNROLL`s the staging/ik/load/mac loops; minfer's 8 mm kernels had none → added the 6 unroll points (llama-parity set) | 7B pp495 **1438.8 → 1355.6 ms (~5.8 %)**, 0.5B ~6.9 %, 1.5B ~2.4 %; byte-identical + 24/24 determinism | uncommitted |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -1155,6 +1156,33 @@ Only MSL-compiler register-scheduling / execution-environment differences remain
 at parity (~50 t/s). Future work on prefill would require the tensor-API GEMM
 (`mpp::tensor_ops`, llama only uses it for MoE `kernel_mul_mm_id`) as a
 beat-llama research direction, not a parity fix.
+
+> **2026-08-19 SUPERSEDED (partially) by §4.3.9**: the compiler-level gap is NOT
+> fully source-inaccessible — missing `#pragma unroll` on the mm-kernel hot loops
+> recovered ~6 % (7B pp495 1438.8 → 1355.6 ms). The tensor-API note above still
+> stands (disabled on M4 by llama's own default; M2 Ultra ~5 % slower).
+
+#### 4.3.9 mm-kernel hot-loop unrolling (2026-08-19) — first measurable compiler-level win
+
+llama's legacy `kernel_mul_mm` forces unrolling with `FOR_UNROLL` (86 uses) on the
+staging/ik/load/mac loops; minfer's 8 mm kernels had ZERO `#pragma unroll` and
+relied on the MSL optimizer's auto-unroller. Added `#pragma unroll` to the 5 hot
+loops of all 8 mm kernels (`kernel_q4_0/q4_1/q8_0/q5_0/q5_1/q6_k/q4_k/q5_k_mm_f32`):
+sa-staging (16), sb-staging (8), ik-loop (NK/8=4), ma-load (4), mb-load (2), mac (8)
+— matching llama's `FOR_UNROLL` set exactly (llama has no sb-loop; its sb is one
+vectorized `S1_2x4` store).
+
+**Verified** (thermal-controlled stash A/B, min of 3, pp495):
+- 7B: **1438.8 → 1355.6 ms (~5.8 %)**; 1.5B: 350.9 → 342.6 ms (~2.4 %);
+  0.5B: 126.3 → 117.6 ms (~6.9 %).
+- Byte-identical on 0.5B/1.5B/7B (sampled tokens + `-n 8` output unchanged);
+  1.5B ×24 first-token determinism 24/24.
+
+Reduces the per-GEMM gap from ~1.33× to ~1.25×. The remaining per-GEMM gap is
+still not explained at source level (§4.3.6 list); with unrolling done, the next
+cheap lever would be eliminating minfer's extra ik-loop `threadgroup_barrier`s
+(§4.3.6 suspect, measured ~2-3 %), which the docs previously found non-removable
+(deterministic corruption) — the root cause of that asymmetry is still open.
 
 
 
