@@ -1202,6 +1202,26 @@ cheap lever would be eliminating minfer's extra ik-loop `threadgroup_barrier`s
 > suffices. Applied to all 8 mm kernels: the last structural difference vs llama
 > is gone.
 
+> **2026-08-19 — structural-equivalence audit COMPLETE (post unroll+barrier)**.
+> minfer's mm GEMM is now verified identical to llama's legacy `kernel_mul_mm` at
+> EVERY measurable level, yet the ~1.25× real-chain gap persists:
+> - **Source**: ik-loop/load/mac/staging line-identical; dequant identical.
+> - **IR**: `.air` disassembly (same standalone toolchain) — kernel bodies
+>   `kernel_q4_k_mm_f32` (19 KB) vs `kernel_mul_mm_q4_K_f32` (25 KB); same op mix
+>   (1 mac site, 2× 8×8 load, 2× store); only barrier-site counts differ (6 vs 4
+>   wg, 2 vs 3 sg).
+> - **smem**: 8192 B both (bc_out path).
+> - **Dispatch**: llama `(ne11/32, ne01/64, 32×4)` (ops.cpp:2222) == minfer
+>   `(nt/32, od/64, 32×4)` (metal.rs:368).
+> - **Runtime compile**: both `newLibraryWithSource` with default options
+>   (llama adds only preprocessorMacros, irrelevant to the legacy q4_K path).
+> - **Wall-clock**: minfer CPU-encode overhead is small (~28 ms, wall 1380 vs GPU
+>   1352 ms); llama wall 1069 ms (463 t/s pp495) → **true gap ≥1.25× in the GPU
+>   GEMM itself**, not host-side.
+> The residual gap is below IR/static visibility (backend machine-code
+> scheduling or GPU execution-environment), consistent with §4.3.6. Combined
+> unroll (§4.3.9) + barrier (§#30) recover ~6.5 % of the ~1.33×.
+
 
 
 ### 4.4 7B verification and A/B (user-facing model)
