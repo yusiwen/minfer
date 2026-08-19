@@ -836,7 +836,12 @@ kernel void kernel_q4_0_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -961,7 +966,12 @@ kernel void kernel_q4_1_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -1083,7 +1093,12 @@ kernel void kernel_q8_0_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -1205,7 +1220,12 @@ kernel void kernel_q5_0_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -1327,7 +1347,12 @@ kernel void kernel_q5_1_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -1453,7 +1478,12 @@ kernel void kernel_q6_k_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -4735,7 +4765,12 @@ kernel void kernel_q4_k_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);
@@ -4858,7 +4893,12 @@ kernel void kernel_q5_k_mm_f32(
 
         #pragma unroll
         for (short ik = 0; ik < NK/8; ik++) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // llama.cpp parity (ggml-metal.metal:10239): the ik-loop only READS
+            // sa/sb (staging writes are visible after the barrier above). With the
+            // unrolled loop a within-simdgroup barrier suffices — the pre-unroll
+            // deterministic corruption (docs §4.3.6) was a rolled-loop compiler
+            // artifact, not a memory-visibility need.
+            simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll
             for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
             simdgroup_barrier(mem_flags::mem_none);

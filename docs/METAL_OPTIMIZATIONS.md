@@ -50,6 +50,7 @@
 | 27 | **q4_K decode matmul layout port (7B)** (2026-08-17, to-do #7, §4.2.1) | 7B q4_K dims 70→265 GB/s (attn_q), 18→146 (attn_k), 74→243 GB/s (ffn_g/u); **7B decode steady GPU ~51 → ~19.3 ms/token (~2.6×, now ≈ llama's 50.5 t/s)**; 7B/0.5B byte-identical | to-do #7 |
 | 28 | **GEMM partial-tile race + missing Metal `memoryBarrier`** (2026-08-19, §4.3.6): (a) all 8 simdgroup mm kernels lacked the `threadgroup_barrier` BEFORE the partial-tile `temp_str` stores — `temp_str` overlaps sa/sb, so a fast simdgroup overwrites sa/sb while a slow one still reads them → intermittently corrupted last-2-token logits (partial x-tile only); (b) the single prefill encoder had NO `memoryBarrier` between dispatches → RMSNorm write raced QKV read of the reused `bn` buffer (last-2 token slots, huge stale values) | 1.5B/7B first-token nondeterminism (~10-30 % wrong tokens, dump-localized) → **24/24 deterministic, output matches CPU byte-for-byte** | uncommitted |
 | 29 | **mm-kernel hot-loop `#pragma unroll`** (2026-08-19, §4.3.9): llama `FOR_UNROLL`s the staging/ik/load/mac loops; minfer's 8 mm kernels had none → added the 6 unroll points (llama-parity set) | 7B pp495 **1438.8 → 1355.6 ms (~5.8 %)**, 0.5B ~6.9 %, 1.5B ~2.4 %; byte-identical + 24/24 determinism | uncommitted |
+| 30 | **ik-loop `threadgroup_barrier` → `simdgroup_barrier(mem_none)`** (2026-08-19, §4.3.9 follow-up): .air diff showed the pre-unroll corruption was a rolled-loop compiler artifact, not a memory need; with the unroll in place llama's exact barrier form is now safe | 7B pp495 min **1387.4 → 1370.6 ms (~1.2 %)**; byte-identical (1.5B×24 / 7B×8 / 0.5B×3); removes the last structural mm-kernel difference vs llama | uncommitted |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -1183,6 +1184,23 @@ still not explained at source level (§4.3.6 list); with unrolling done, the nex
 cheap lever would be eliminating minfer's extra ik-loop `threadgroup_barrier`s
 (§4.3.6 suspect, measured ~2-3 %), which the docs previously found non-removable
 (deterministic corruption) — the root cause of that asymmetry is still open.
+
+> **2026-08-19 follow-up — ik-loop barrier root cause FOUND via .air diff, and
+> the extra barriers REMOVED.** The §4.3.6 corruption verdict was measured on the
+> PRE-unroll kernel; it was a **rolled-loop compiler artifact**, not a
+> memory-visibility need. Evidence: (a) `.air` disassembly (metal toolchain
+> 32023.883) shows the ik-loop `threadgroup_barrier(mem_threadgroup)` →
+> `simdgroup_barrier(mem_none)` swap changes ONLY the barrier instruction —
+> zero IR scheduling difference; the runtime corruption is below the AIR level.
+> (b) `threadgroup_barrier(mem_none)` (threadgroup-wide exec sync, no flush) is
+> safe but no faster → the requirement is execution-order, not memory. (c) with
+> the `#pragma unroll` from §4.3.9 in place, **`simdgroup_barrier(mem_none)`
+> (llama's exact form) is now CORRECT** — 1.5B ×24 + 7B ×8 + 0.5B ×3
+> byte-identical/deterministic, 33/34 tests green — and ~1 % faster (7B pp495
+> min 1370.6 vs 1387.4 ms). The unrolled straight-line ik-loop schedules each
+> simdgroup's 4 iterations contiguously, so the within-simdgroup barrier
+> suffices. Applied to all 8 mm kernels: the last structural difference vs llama
+> is gone.
 
 
 
