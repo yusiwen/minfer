@@ -86,6 +86,22 @@ Verified clean: simple elementwise kernels (add/mul/silu/bias/swiglu/rope all
 have `tid < n` guards), Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 matmuls (K reads bounded),
 GEMM smem/bc_out (within 8192 B), Q5_K qh/qs reads (within the 176 B block).
 
+**Post-audit finding (2026-08-19, fixed) — cross-kernel and within-kernel write
+visibility (not a deadlock, but a correctness race)**:
+- **No `memoryBarrier` between dispatches in the single prefill compute encoder**:
+  dispatches are ordered but write-visibility across them is NOT guaranteed by
+  Metal. `bn` reused as RMSNorm output / QKV input / WO output / ffn_down output
+  raced → last-2-token garbage. Fixed with `memoryBarrierWithScope` after every
+  `dispatch_*` (`src/metal.rs`), matching llama.cpp. Rule for future code: any
+  buffer written by one dispatch and read by the next in the same encoder needs
+  the barrier; do not rely on "it's serialized".
+- **GEMM partial-tile `temp_str` overlaps `sa`/`sb`**: after the K-loop, a fast
+  simdgroup could overwrite `sa`/`sb` while a slow simdgroup still read them —
+  `threadgroup_barrier` is required BEFORE the `temp_str` stores (all 8 mm
+  kernels). Audit rule: when a threadgroup-memory buffer is REUSED for a different
+  purpose at a different loop stage, there must be a `threadgroup_barrier`
+  between the last read and the first write of the reuse.
+
 ## 4. Device metrics: query at runtime, never guess (2026-08-02 rule)
 
 **Rule**: device-specific thresholds (threadgroup memory, max threads per

@@ -855,6 +855,8 @@ kernel void kernel_q4_0_mm_f32(
         }
     } else {
         // partial tile (bc_out): per-simdgroup temp_str + float4 copy
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -969,6 +971,8 @@ kernel void kernel_q4_1_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -1083,6 +1087,8 @@ kernel void kernel_q8_0_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -1197,6 +1203,8 @@ kernel void kernel_q5_0_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -1311,6 +1319,8 @@ kernel void kernel_q5_1_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -1429,6 +1439,8 @@ kernel void kernel_q6_k_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -4703,6 +4715,8 @@ kernel void kernel_q4_k_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
@@ -4818,6 +4832,8 @@ kernel void kernel_q5_k_mm_f32(
             simdgroup_store(mc[i], C + 8*(i/4)*p[0] + 8*(i%4), p[0], 0, false);
         }
     } else {
+        // ensure every simdgroup finished reading sa/sb before temp_str overwrites it (llama.cpp parity)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);

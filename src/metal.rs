@@ -239,14 +239,15 @@ pub struct DecodeSkips {
 impl DecodeSkips {
     pub fn active(nt: usize) -> Self {
         if nt != 1 {
-            // Prefill: only MINFER_SKIP_ATTN applies (used to isolate the
-            // attention cost during prompt processing — the classic prefill
-            // attention kernel is O(nt²) and the measured prefill gap vs llama
-            // grows with prompt length). matmul/small stay decode-only.
-            if std::env::var("MINFER_SKIP_ATTN").map_or(false, |v| v == "1") {
-                return DecodeSkips { attn: true, matmul: false, small: false };
-            }
-            return DecodeSkips::default();
+            // Prefill: MINFER_SKIP_ATTN isolates the attention cost (classic
+            // prefill attention is O(nt²)). MINFER_SKIP_MATMULS / _SMALL were
+            // added 2026-08-18 for the Phase-0 prefill decomposition (subtractive
+            // timing of the GEMM vs small-kernel+dispatch split, METAL_OPT §4.3.4).
+            // Gates stay in their exact original positions (never reorder).
+            let attn = std::env::var("MINFER_SKIP_ATTN").map_or(false, |v| v == "1");
+            let matmul = std::env::var("MINFER_SKIP_MATMULS").map_or(false, |v| v == "1");
+            let small = std::env::var("MINFER_SKIP_SMALL").map_or(false, |v| v == "1");
+            return DecodeSkips { attn, matmul, small };
         }
         static CACHE: std::sync::OnceLock<DecodeSkips> = std::sync::OnceLock::new();
         *CACHE.get_or_init(|| DecodeSkips {
@@ -309,11 +310,25 @@ impl MpsCommandBuffer<'_> {
         );
     }
 
+    /// GPU memory barrier (2026-08-19 fix). Metal does NOT guarantee
+    /// write visibility between dispatches in a single compute command encoder;
+    /// without an explicit barrier, a kernel that reads a buffer written by a
+    /// preceding dispatch can race with that dispatch's last threadgroups,
+    /// intermittently corrupting the tail rows (observed: last-2 token slots of
+    /// layer0 bn on 1.5B/7B prefill). llama.cpp's Metal backend inserts the same
+    /// barrier after every op. MTLBarrierScopeBuffers = 1 << 0.
+    fn barrier(&self) {
+        unsafe {
+            let _: () = msg_send![self.enc, memoryBarrierWithScope: 1u64];
+        }
+    }
+
     fn dispatch_2d(&self, w: u64, h: u64, tw: u64, th: u64) {
         self.enc.dispatch_thread_groups(
             metal::MTLSize { width: w, height: h, depth: 1 },
             metal::MTLSize { width: tw, height: th, depth: 1 },
         );
+        self.barrier();
     }
 
     fn dispatch_3d(&self, w: u64, h: u64, d: u64, tw: u64, th: u64, td: u64) {
@@ -321,6 +336,7 @@ impl MpsCommandBuffer<'_> {
             metal::MTLSize { width: w, height: h, depth: d },
             metal::MTLSize { width: tw, height: th, depth: td },
         );
+        self.barrier();
     }
 
     /// GEMM kernels (prefill nt>=16) are enabled unless MINFER_GEMM=0.
@@ -356,6 +372,7 @@ impl MpsCommandBuffer<'_> {
             metal::MTLSize { width: (n + tg - 1) / tg, height: 1, depth: 1 },
             metal::MTLSize { width: tg, height: 1, depth: 1 },
         );
+        self.barrier();
     }
 
     /// Dispatch Q4_0/Q4_1/Q4_K/Q8_0 × f32 matmul (activations are f32).

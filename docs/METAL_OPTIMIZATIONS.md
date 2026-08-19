@@ -48,6 +48,7 @@
 | 25 | **hd=128 (7B) prefill flash port** (2026-08-15, §4.3.3 done) | 7B pp310 prefill GPU 1042→**~949 ms (~9 %)**, f32/f16 byte-identical, fixes 7B f16-cache garbage | §4.3.3 |
 | 26 | **hd=128 (7B) decode flash port** (2026-08-17, §4.2.2 extend) | 7B decode steady GPU ~51.1 ms vs split ~51.6 ms (pp205), f32+f16+split byte-identical | §4.2.2 |
 | 27 | **q4_K decode matmul layout port (7B)** (2026-08-17, to-do #7, §4.2.1) | 7B q4_K dims 70→265 GB/s (attn_q), 18→146 (attn_k), 74→243 GB/s (ffn_g/u); **7B decode steady GPU ~51 → ~19.3 ms/token (~2.6×, now ≈ llama's 50.5 t/s)**; 7B/0.5B byte-identical | to-do #7 |
+| 28 | **GEMM partial-tile race + missing Metal `memoryBarrier`** (2026-08-19, §4.3.6): (a) all 8 simdgroup mm kernels lacked the `threadgroup_barrier` BEFORE the partial-tile `temp_str` stores — `temp_str` overlaps sa/sb, so a fast simdgroup overwrites sa/sb while a slow one still reads them → intermittently corrupted last-2-token logits (partial x-tile only); (b) the single prefill encoder had NO `memoryBarrier` between dispatches → RMSNorm write raced QKV read of the reused `bn` buffer (last-2 token slots, huge stale values) | 1.5B/7B first-token nondeterminism (~10-30 % wrong tokens, dump-localized) → **24/24 deterministic, output matches CPU byte-for-byte** | uncommitted |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -60,7 +61,7 @@
 | 1 | **GPU trace (minfer + llama): Performance Limiters + per-kernel** | per-phase bottleneck + per-op durations for both sides | **DONE 2026-08-13** (§4.1/§4.1.1): per-kernel + limiter comparison. Early "1.6-3.9×" numbers were trace-semantics artifacts (fused-vs-separate, mixed od); the clean isolation A/B (llama test-backend-ops perf) shows q5_0/q8_0 at parity and **q6_K ffn_down 3× slower** — fixed (this row) |
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§4.2.1): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | **DONE 2026-08-14** (§4.2.2): ported `kernel_flash_attn_ext_vec` (NSG=1, DK=DV=64/NE=2/C=32) as `kernel_flash_attn_ext_f32/_f16`; KV-layout check PASSED (minfer `[nkv][nk*hd]` == llama physical layout — no cache rework). Isolation-verified (`tests/flash_attn_isolation.rs`: cos vs CPU >0.999 for nkv 1..4097 incl. partial/empty chunks; flash-vs-split cos=1.0 through the shared combine), A/B byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B Q4_K_M), decode GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING), wall ~10 %; no long-context regression. Gate: `MINFER_NO_FLASH=1` reverts to split |
-| 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. **PORT DONE 2026-08-14 (§4.3.2)**: `kernel_flash_attn_blk_f32/_f16` (fixed-shape NSG=4, Q=8, C=64, DK=DV=64, 7168 B shmem, inline causal mask, `kernel_kv_tail_pad` for the partial last block) + host `attn_flash_prefill`. Isolation-verified (`tests/flash_attn_blk_isolation.rs`: cos vs CPU >0.999 across 16 nt/nkv configs incl. partial blocks + GQA, f32+f16, deterministic), A/B **byte-identical to the classic `gqa_attn_f32`** at every layer (f32 AND f16 cache — maxabs 0.0), interleaved MINFER_TIMING prefill GPU **~110→~93 ms (~16 %)**, all 34 bin + 9 isolation tests pass. **Bonus: FIXES the f16-cache prefill 3-pass bug** (the 3-pass `kernel_attn_scores`/`kernel_attn_output` read the f16 KV cache as `float*` → garbage "!!!!!!"; the f16 blk kernel reads half K/V correctly). Default for hd==64 (0.5B/1.5B) and — since the 2026-08-15 hd=128 port — for hd==128 (7B) too. Gate: `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. Non-attention 89 vs ~44 ms remains a secondary structural gap — **7B direct per-kernel GEMM A/B 2026-08-18 (§4.3.4): minfer GEMMs at 87-94 % of llama (parity), so the residual gap is dispatch serialization + small kernels, not GEMM compute** |
+| 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§4.3.1)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. **PORT DONE 2026-08-14 (§4.3.2)**: `kernel_flash_attn_blk_f32/_f16` (fixed-shape NSG=4, Q=8, C=64, DK=DV=64, 7168 B shmem, inline causal mask, `kernel_kv_tail_pad` for the partial last block) + host `attn_flash_prefill`. Isolation-verified (`tests/flash_attn_blk_isolation.rs`: cos vs CPU >0.999 across 16 nt/nkv configs incl. partial blocks + GQA, f32+f16, deterministic), A/B **byte-identical to the classic `gqa_attn_f32`** at every layer (f32 AND f16 cache — maxabs 0.0), interleaved MINFER_TIMING prefill GPU **~110→~93 ms (~16 %)**, all 34 bin + 9 isolation tests pass. **Bonus: FIXES the f16-cache prefill 3-pass bug** (the 3-pass `kernel_attn_scores`/`kernel_attn_output` read the f16 KV cache as `float*` → garbage "!!!!!!"; the f16 blk kernel reads half K/V correctly). Default for hd==64 (0.5B/1.5B) and — since the 2026-08-15 hd=128 port — for hd==128 (7B) too. Gate: `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. Non-attention 89 vs ~44 ms remains a secondary structural gap — **7B direct per-kernel GEMM A/B 2026-08-18 (§4.3.4): minfer GEMMs at 87-94 % of llama (parity). Phase 0 prefill decomposition 2026-08-18 (§4.3.5): GEMMs are 76 % (0.5B) / 88 % (7B) of prefill; small kernels only 10 % / 4 % → #1 fusion ceiling low. **Phase X 2026-08-18 (§4.3.6): §4.3.4's parity was a test-backend-ops measurement artifact — llama real prefill GEMMs ≈ 6.9 TFLOPS (467 t/s pp466) vs minfer ≈ 5.2 (≈1.33×). Concurrency, fusion, small kernels, dequant type, ik-loop barrier, sb-staging vectorization, and geometry ALL measured/verified — none explains the 1.33×; the gap is not addressable from minfer source (compiler-level only).** |
 | 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§4.4): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. Baseline recorded for per-step checks |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§4.2.3) |
 | 7 | **q4_K decode matmul layout port (7B)** — the next decode lever | 7B decode 37 % → closer to llama (steady GPU ~50 → target ~30 ms/token) | **DONE 2026-08-17** (§4.2.1): 7B K_M decode matmuls are **Q4_K-dominated** (attn_q/k/output + ffn_gate/up all Q4_K; Q6_K only output/ffn_down/attn_v). Ported llama's `kernel_mul_mv_q4_K_f32_impl` stride-4/float4 layout into `kernel_q4_k_f32_matmul` (TG(32, nsg=2) dispatch, `sc16`/kmask nibble unpack — the scale/min high/low nibble interleave reproduces llama's `get_scale_min_k4` exactly, verified against llama's dequantizer). Steps: ① isolation probe at 7B dims — old kernel 70/18/74 GB/s (attn_q 3584/3584, attn_k 3584/512, ffn_g/u 18944/3584) → new **265/146/243 GB/s** ② kernel port ③ 7B steady-decode A/B: **~49.7 → ~19.3 ms/token GPU (~2.6×), 17-19 → 45-49 t/s (≈ llama's 50.5)**, git-stash A/B byte-identical ④ 0.5B (no q4_K weights — trivially identical) + 1.5B (q4_K decode + multi path) regression green; all 34 bin tests pass |
@@ -933,6 +934,206 @@ scheduling-bound). The smallest matmuls (attn_k/v, od=512) show the largest
 relative gap (87-93 %), consistent with dispatch-latency-bound small GEMMs. No
 new GEMM-kernel work is warranted; the §4.3.1 "secondary structural gap"
 conclusion now has direct 7B evidence.
+
+> ⚠️ **2026-08-18 SUPERSEDED by §4.3.6**: this isolation A/B compared
+> llama-under-measured isolation (test-backend-ops per-iteration submit/sync
+> overhead) against minfer-clean isolation (batched cb). With llama's REAL
+> prefill GEMMs at ~6.9 TFLOPS (llama-cli/bench pp466 = 467 t/s) vs minfer's
+> ~5.2, the true per-GEMM gap is ~1.33× — the GEMM kernels ARE the lever. The
+> isolation "parity" was a measurement artifact.
+
+#### 4.3.5 Phase 0: prefill subtractive decomposition (2026-08-18) — #1 fusion ceiling is low
+
+To size the "small-kernel fusion / dispatch-reduction" lever (proposed §4.3.4
+follow-up), the prefill skip gates were extended to nt>1 (`DecodeSkips::active`,
+`MINFER_SKIP_MATMULS` / `MINFER_SKIP_SMALL` now honored during prefill — gates
+kept in their exact original positions). Subtractive decomposition via
+`MINFER_TIMING gpu(submit-wait)`, min of 3 interleaved, pp466 (fixed prompt),
+both models Q4_K_M:
+
+| category (derived) | 0.5B pp466 | 7B pp466 |
+|---|---|---|
+| **total prefill GPU** | **125.7 ms** | **1613.5 ms** |
+| attention (flash blk) | 7.2 ms (5.7 %) | 17.5 ms (1.1 %) |
+| **layer GEMMs** | **95.2 ms (75.7 %)** | **1424 ms (88.3 %)** |
+| **small kernels + their dispatch** | **12.9 ms (10.3 %)** | **65.1 ms (4.0 %)** |
+| output GEMM + empty-cb infra | 10.4 ms (8.3 %) | 106.7 ms (6.6 %) |
+
+> Derivation: `attention = base − skip_attn`; `GEMMs = skip_attn − skip_attn+matmul`;
+> `small+dispatch = skip_attn+matmul − all-skip`; remainder = output lm_head GEMM
+> (not gateable) + the empty-submission floor. The 7B "all-skip" 106.7 ms is
+> dominated by the output GEMM (~90 ms at isolation); true empty-cb infra is ~16 ms.
+
+**Reading**:
+- **GEMMs dominate prefill at BOTH sizes (76 % / 88 %)**; the flash port cut
+  attention to single-digit percentages. The 1.40× gap vs llama cannot come from
+  the 4-10 % small-kernel tail.
+- **#1 small-kernel fusion ceiling: ≤10 % (0.5B) / ≤4 % (7B)** — and that is the
+  upper bound (fusing ALL 12 small kernels/layer); realistic fusion (bias+RoPE,
+  residual+RMSNorm, store_kv K+V) recovers at most ~half of it. The 0.5B number
+  is just over the 5 % decision gate, but the user-facing 7B is below it.
+- **Decision: #1 is NOT the prefill lever — pivot to Phase X.** The gap is the
+  real-chain GEMM execution: minfer's real prefill ≈ its own isolation-GEMM sum
+  (no loss, but no gain), while llama's real prefill runs *faster* than its
+  isolation sum (~8 %) — llama interleaves/pipelines back-to-back GEMMs where
+  minfer serializes them. Candidates: prefill concurrency (llama init shows
+  `use concurrency = true`; the decode multi-cb regression is a decode-only
+  result — prefill is compute/occupancy-bound), a 7B prefill xctrace per-kernel
+  comparison (§4.1 method), and per-GEMM occupancy tuning.
+
+> ⚠️ **2026-08-18 CORRECTION (thermal)**: the §4.3.5 table above was taken with a
+> *sequential per-config* methodology (3 runs of each config in a row) under GPU
+> thermal drift — the M4 Pro throttles to ~1.3-1.4 s floor under sustained load
+> (§3.3 measurement trap). The 0.5B numbers in particular are unreliable (the
+> "23 ms skip-attn+matmul" vs "120 ms" later). The **authoritative numbers are the
+> interleaved re-measure in §4.3.6** (configs cycled per pass, min of 4).
+
+#### 4.3.6 Phase X part 1 (2026-08-18): real-chain GEMM efficiency — the mechanism
+
+**Thermal-corrected interleaved decomposition** (7B Q4_K_M pp466, `MINFER_TIMING`
+gpu submit-wait, configs cycled per pass, min of 4, 60 s cooldown first):
+
+| category | 7B pp466 |
+|---|---|
+| total prefill GPU | **1373.6 ms** |
+| attention (flash blk) | 21.7 ms (1.6 %) |
+| **layer GEMMs** | **1175.0 ms (85.5 %)** |
+| small kernels | 72.9 ms (5.3 %) |
+| output GEMM + empty infra | 104.0 ms (7.6 %) |
+
+**The "GEMM↔small transition loss" hypothesis is DISPROVEN**: layer GEMM time is
+identical with small kernels interleaved (**1175 ms**) vs back-to-back
+(`MINFER_SKIP_SMALL=1`, **1179 ms**). The earlier apparent 256 ms transition
+loss was pure thermal drift. **#1 fusion ceiling is finally confirmed LOW**
+(small kernels = 5.3 %; even fusing all of them recovers ≤5 %, and the transitions
+cost ~0).
+
+**llama concurrency DISPROVEN**: llama's `MTLDispatchTypeConcurrent` (+
+dependency-aware `memoryBarrier`, `ggml-metal-device.m:469`/ops.cpp `mem_ranges`)
+has **zero effect on llama prefill** — `GGML_METAL_CONCURRENCY_DISABLE=1` vs
+default = 465.82 vs 467.17 t/s (0.3 %, noise) at pp466.
+
+**The real gap is in the GEMM kernels themselves — and §4.3.4's isolation A/B was
+methodology-flawed**:
+- llama real 7B prefill pp466 = **466.9 t/s** (llama-cli AND llama-bench agree,
+  ~0.998 s). Total FLOPs 6.59 TFLOP → **llama real ≈ 6.9 TFLOPS effective** —
+  *faster* than its own test-backend-ops isolation (5.9-6.1) because that harness
+  has a per-iteration submit/sync overhead that systematically under-measures.
+- minfer real 7B prefill layer GEMMs = 1175 ms / 6.08 TFLOP = **5.17 TFLOPS** —
+  matching minfer's own isolation (batched cb, clean).
+- **True per-GEMM gap ≈ 1.33× (6.9 vs 5.2)**, back to the original §4.3.1
+  "~5.4 vs ~7" finding. §4.3.4's "parity (87-94 %)" was an artifact of comparing
+  llama-under-measured isolation against minfer-clean isolation.
+- minfer's `kernel_mul_mm` q4_K (metal.metal:4614) vs llama's legacy
+  `kernel_mul_mm` (ggml-metal.metal:10095): SAME 64×32 tile / 128 threads /
+  simdgroup_matrix structure. The only structural difference: minfer has **6
+  `mem_threadgroup` barriers per 32×64 tile (4 extra inside the ik-loop)** vs
+  llama's 2 + cheap `simdgroup_barrier(mem_none)`. But §4.3.1 measured barrier
+  removal = only 2-3 % AND races — so barriers are NOT the 1.33× either.
+
+**Open question (the actual remaining lever)**: the ~1.33× per-GEMM execution gap
+with structurally-identical kernels. Not concurrency, not fusion, not barriers, not
+small kernels, not attention. Remaining suspects to investigate (kernel-level,
+GPU-safety-sensitive):
+1. **Dequant instruction sequence** — minfer `dequant_q4_k_16` vs llama
+   `dequantize_row_q4_K` (different from the mv-kernel's dequantizer; the mm kernel
+   dequant may be slower).
+2. **sb staging** — minfer scalar `half()` stores vs llama vectorized `S1_2x4`
+   (`half2x4`) stores (measured RACY in minfer §4.3.1 — root cause unknown, not
+   re-litigated).
+3. **Register pressure / residency** — different `temp_a`/sa/sb layout may drop
+   resident threadgroups (occupancy), which the batched isolation would partially
+   hide but the real chain exposes. Needs a `threads_limited`/occupancy probe.
+4. **Grid ordering** — minfer `dispatch((nt+31)/32, (od+63)/64)` vs llama
+   `(ne11/nr1, ne01/nr0)` (same shape, both y=od-major).
+
+> **Phase X part 2 (2026-08-18) — suspects 1 & 2 measured and CLOSED, barrier
+> confirmed required, geometry confirmed identical**: every source-level element
+> of minfer's mm kernels now matches llama. Full record of the experiments:
+>
+> 1. **Dequant instructions: IDENTICAL.** `dequant_q4_k_16` (metal.metal:716) vs
+>    `dequantize_q4_K` (ggml-metal.metal:737) are line-for-line the same
+>    (`dl*(q[i]&mask)-ml`, identical q/il/sc/d indexing; only the temp type differs).
+> 2. **temp_a float4x4→half4x4** (match llama's `S0_4x4`, suspected register
+>    pressure): **no speedup** (7B pp466 ~1374 vs baseline ~1373) and 7B run3
+>    output nondeterminism → REVERTED. Register-pressure hypothesis not supported
+>    (the MSL compiler apparently allocates the same registers either way).
+> 3. **ik-loop barrier → `simdgroup_barrier(mem_none)`** (llama's exact form,
+>    4× fewer cross-simdgroup syncs/tile): **CORRUPTS output deterministically**
+>    (garbage "!!!!!!!", all runs). The docs' "mem_threadgroup is a genuine
+>    correctness requirement" is EMPIRICALLY CONFIRMED. The barrier is the one
+>    structural difference from llama but is NOT removable in minfer (root cause
+>    of the asymmetry vs llama unestablished; likely a compiler/scheduling
+>    interaction with minfer's staging, not a memory-visibility issue per the
+>    simdgroup-slice analysis).
+> 4. **sb staging scalar→vectorized `half2x4`** (llama's `S1_2x4`, the literal
+>    suspect #2): **byte-identical on 7B AND 0.5B** (5/5 runs each, this session;
+>    the earlier §4.3.1 "RACY 1/5" claim likely mis-attributed a deterministic
+>    output difference to a race — the earlier test compared against the wrong
+>    reference) but **ZERO speedup** (interleaved A/B: 1353.4 vs 1352.3 ms) →
+>    REVERTED. The staging is not the lever.
+> 5. **Geometry: IDENTICAL.** llama's legacy mm pipeline (ggml-metal-device.cpp:704)
+>    sets `nr0=64, nr1=32, nsg=4, smem=6144/8192` → dispatch `(nt/32, od/64)` with
+>    128 threads = minfer's `gemm_dispatch` exactly (metal.rs:353). Grid order also
+>    identical (both y=od-major).
+>
+> **Net conclusion**: the ~1.33× gap has NO source-level explanation. The only
+> remaining lever candidates are MSL-compiler-level (shader machine code / register
+> scheduling, comparing the compiled `.air` of both metal.metal files) or a subtle
+> execution-environment effect. Not addressable from minfer source. Recommend:
+> (a) accept the gap and record it, or (b) if pursued, disassemble both compiled
+> shaders and diff the machine code (deep, low-value given the parity of every
+> structural element).
+
+#### 4.3.7 GEMM PARTIAL-TILE RACE FIXED + missing Metal `memoryBarrier` (2026-08-19) — the prefill nondeterminism root cause
+
+**Symptom**: 1.5B/7B prefill intermittently produced a wrong first generated token
+(~10-30 % of runs; 0.5B was stable). Debug dumps (`debug_dump` build, `-n 1`)
+localized the corruption to **exactly the last 2 prefill token slots** of the reused
+per-layer `bn` buffer (layer0, huge stale values, rms 18.9 vs clean 0.32), and then
+— once that was fixed — to **rows 464/465 of the prefill output logits** (od
+141152..141183, i.e. sgitg 3's sub-tile of the LAST partial x-tile).
+
+**Two independent races**:
+
+1. **No `memoryBarrier` between dispatches in the single prefill encoder** (Rust
+   `src/metal.rs`). Dispatches in one Metal compute command encoder are ordered but
+   write-visibility is NOT guaranteed without an explicit barrier. `bn` is written by
+   RMSNorm, read by QKV, rewritten by WO and ffn_down — a reader's last tiles raced
+   the writer's first tiles → last-2-token garbage. llama.cpp inserts
+   `memoryBarrierWithScope` after every op. **Fix**: `barrier()` (MTLBarrierScopeBuffers)
+   at the end of `dispatch_1d/2d/3d`.
+2. **Missing `threadgroup_barrier` before the GEMM partial-tile `temp_str` stores**
+   (Metal kernels). All 8 simdgroup mm kernels
+   (`kernel_q4_0/q4_1/q8_0/q5_0/q5_1/q6_k/q4_k/q5_k_mm_f32`) store the partial tile
+   via `temp_str` — a 2048-float region that **overlaps the `sa`/`sb` staging
+   buffers** — then copy it out. After the K-loop ends there was NO barrier before
+   the `simdgroup_store`s, so a fast simdgroup could overwrite `sa`/`sb` while a slow
+   simdgroup still read them for its final MAC → intermittently wrong `mc`
+   accumulation → corrupted logits for the partial (last) x-tile. The full-tile path
+   stores straight to the output (no `sa`/`sb` reuse) → immune, which is why only the
+   last partial tile corrupts. llama.cpp's `mul_mm_t` template has this exact barrier
+   (`ggml-metal.metal:10273`) — the ports missed it. **Fix**: added
+   `threadgroup_barrier(mem_flags::mem_threadgroup)` before the `temp_str` stores in
+   all 8 kernels.
+
+**The "clean" majority output was itself wrong**: pre-fix GPU printed `" Quant"` as
+the first token 22/24 times (small corruption flipping argmax to the runner-up) and
+garbage (`" an"`, `"라면"`, …) the rest. CPU ground truth is `"The"` — the fix makes
+GPU match CPU exactly.
+
+**Verification**:
+- 1.5B Q4_K_M: 24/24 first token `"The"` (GPU) == CPU; `-n 8` byte-identical
+  ("The transformer language model performs inference steps by").
+- 7B Q4_K_M (split GGUF): 24/24 first token `"Your"` (GPU) == CPU.
+- 0.5B (Q4_0/Q8_0 mm kernels also patched): unchanged, matches CPU.
+- Prefill logits argmax: last rows (488-494) CPU == GPU (row 494 = sampled first
+  token); mid-prompt argmax flips (11/495) are expected Q8_0-quantized-activations
+  (CPU) vs f32 (GPU) numerical divergence, generation-affecting last row identical.
+- `MINFER_GEMM=0` (forces f32-multi output GEMM) + barriers was 24/24 — the
+  isolation proof that the residual race lived in the mm GEMM partial-tile path.
+- Prefill time unchanged (barrier cost ~0).
+
 
 
 ### 4.4 7B verification and A/B (user-facing model)
