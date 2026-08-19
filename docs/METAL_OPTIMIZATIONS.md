@@ -1134,6 +1134,28 @@ GPU match CPU exactly.
   isolation proof that the residual race lived in the mm GEMM partial-tile path.
 - Prefill time unchanged (barrier cost ~0).
 
+#### 4.3.8 Post-fix prefill re-baseline + last cheap levers measured (2026-08-19) — gap accepted
+
+Closes the §4.3.6 "open question" with the last untested cheap levers. All
+measurements 7B Q4_K_M pp495 (fixed 495-token prompt), interleaved, min of 4,
+60 s cooldown first (same thermal-corrected method as §4.3.6).
+
+| experiment | result | verdict |
+|---|---|---|
+| **Post-fix baseline** (2026-08-19 barrier fix + kernel barriers): `MINFER_TIMING gpu(submit-wait)` | minfer **1461.8 ms (338.6 t/s)**; llama-cli min **457.5 t/s** (≈1.076 s) → **73.6 %** | no regression from the 08-19 fix (§4.3.6 pp466 ≈ 73 %); gap unchanged ~1.33× per-GEMM |
+| **MSL compile options** — llama compiles with `-O3` (CMakeLists.txt:86); minfer runtime default → set `setOptimizationLevel: MTLLibraryOptimizationLevelFast` (msg_send) | byte-identical, but min **1478.0 ms vs 1461.8** (~1.1 % SLOWER) | no benefit; reverted |
+| **MTLDispatchTypeConcurrent** (llama's encoder dispatch type; `compute_command_encoder_with_dispatch_type`) | byte-identical + deterministic, but min **1443.6 ms vs 1451.4** (~0.5 %) | noise (matches §4.3.6's llama 0.3 %); reverted |
+| **Resource-scoped memoryBarrier** (llama's dependency-aware `memoryBarrierWithResources`) | **not pursued** — the encoder reuses essentially every activation/scratch buffer (buf_hidden/bn/ba/bf/bg/q8/kv/attn_scores) across adjacent dispatches, so dependency-aware ≈ barrier-always; per-dispatch resource tracking adds correctness risk for ~0 expected gain | n/a |
+
+**Net conclusion (final)**: the ~1.33× per-GEMM prefill gap is NOT source-addressable.
+Structurally-identical kernels, identical geometry/dequant/staging, compile
+optimization level, dispatch type, and barrier regime all measured — none closes it.
+Only MSL-compiler register-scheduling / execution-environment differences remain
+(§4.3.6). **Gap accepted and recorded**: 7B prefill ~73 % of llama (pp495), decode
+at parity (~50 t/s). Future work on prefill would require the tensor-API GEMM
+(`mpp::tensor_ops`, llama only uses it for MoE `kernel_mul_mm_id`) as a
+beat-llama research direction, not a parity fix.
+
 
 
 ### 4.4 7B verification and A/B (user-facing model)
