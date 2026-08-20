@@ -277,7 +277,6 @@ fn main() {
     // === KV Cache ===
     let n_kv_embd = model.n_kv_embd();
     let n_layer = model.n_layer();
-    let n_vocab = model.n_vocab();
     let mut kv_cache = cache::KVCache::new(n_layer, n_kv_embd, params.n_ctx);
 
     // Pre-allocate GPU KV cache (avoids O(n²) incremental growth during generation)
@@ -310,8 +309,12 @@ fn main() {
     // === Prefill ===
     let infer_start = Instant::now();
     let positions: Vec<usize> = (0..input_ids.len()).collect();
-    let logits = model.forward(&input_ids, &positions, &mut kv_cache);
-    let last_logits: Vec<f32> = logits[(input_ids.len() - 1) * n_vocab..].to_vec();
+    // forward() computes logits for only the LAST n_out tokens (n_out=1 here:
+    // single sequence, only the final token is sampled). llama.cpp does the same
+    // via ggml_get_rows(inp_out_ids) at the last layer, shrinking the lm_head
+    // to n_outputs rows — saves the full-nt output GEMM + logits download.
+    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1);
+    let last_logits: Vec<f32> = logits;
 
     let prefill_time = infer_start.elapsed();
     println!("Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
@@ -355,10 +358,10 @@ fn main() {
         print!("{}", tokenizer.decode(&[sampled.token_id]));
         std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
 
-        // forward() returns nt*nv logits; for single-token decode that's exactly
-        // n_vocab, so move the Vec in place instead of copying 607 KB/token.
+        // forward() returns n_out*nv logits (n_out=1 for single-token decode,
+        // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
         t1 = std::time::Instant::now();
-        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache);
+        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1);
         if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
     }

@@ -611,11 +611,11 @@ impl MpsCommandBuffer<'_> {
 
     /// RMSNorm: y = x * rsqrt(mean(x²)+eps) * w
     pub fn rms_norm(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
-        d: usize, n: usize, eps: f32,
+        d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm);
-        self.enc.set_buffer(0, Some(x), 0);
+        self.enc.set_buffer(0, Some(x), off);
         self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0); // dummy if no weight
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
@@ -629,11 +629,11 @@ impl MpsCommandBuffer<'_> {
     /// kernel measured ~7x the per-dispatch cost of 256-thread elementwise ops).
     /// Requires a threadgroup buffer of n_simdgroups floats (8 for 256 threads).
     pub fn rms_norm_256(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
-        d: usize, n: usize, eps: f32,
+        d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm_256);
-        self.enc.set_buffer(0, Some(x), 0);
+        self.enc.set_buffer(0, Some(x), off);
         self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0);
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
@@ -1825,8 +1825,8 @@ impl MpsState {
         let sk = DecodeSkips::active(nt);
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
-            else { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps, 0); }
+            else { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps, 0); }
         }
 
         // Fused QKV projection (nt==1 decode): one matmul on the concatenated
@@ -1957,8 +1957,8 @@ impl MpsState {
         }
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
-            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps, 0); }
+            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps, 0); }
         }
         // Fused FFN gate+up (nt==1 decode): one matmul on the concatenated
         // gate+up weight → bgu; swiglu reads gate at offset 0 and up at nf.
@@ -2014,7 +2014,7 @@ impl MpsState {
         output: &Tensor,
         output_norm: Option<&Tensor>,
         output_b: Option<&Tensor>,
-        ne: usize, nv: usize, nt: usize, eps: f32,
+        ne: usize, nv: usize, nt: usize, n_out: usize, eps: f32,
     ) -> bool {
         // The output matmul quantized kernels require id (ne) % 32 == 0.
         if ne % 32 != 0 {
@@ -2022,6 +2022,7 @@ impl MpsState {
                 "output matmul input dim ne={ne} is not 32-aligned (quantized matmul would read out of bounds)"
             ));
         }
+        debug_assert!(n_out <= nt, "n_out={n_out} > nt={nt}");
         let weights = self.inner.weights.lock().unwrap();
         let norm_w = match output_norm {
             Some(t) => match weights.get(&t.name) {
@@ -2045,23 +2046,32 @@ impl MpsState {
             return false;
         }
 
+        // The output rows are the LAST n_out tokens of the batch (single-sequence
+        // layout: hidden is [nt][ne] row-major, output row = last token per seq).
+        // llama.cpp does the equivalent via ggml_get_rows(cur, inp_out_ids) at the
+        // last layer (llama-graph.cpp), which shrinks the final norm + lm_head to
+        // n_outputs rows. minfer runs the layer loop over all nt tokens but only
+        // computes the final norm + output GEMM on the tail n_out rows, saving the
+        // full-nt lm_head GEMM (7B prefill: [152064x495] vs [152064x1]).
+        let hid_off = ((nt - n_out) * ne * 4) as u64;
+
         let dev = &self.inner.device;
         let hidden = Self::get_or_grow(&self.inner.buf_hidden, (nt * ne * 4) as u64, dev);
-        let bn = Self::get_or_grow(&self.inner.buf_bn, (nt * ne * 4) as u64, dev);
-        let logits = Self::get_or_grow(&self.inner.buf_logits, (nt * nv * 4) as u64, dev);
+        let bn = Self::get_or_grow(&self.inner.buf_bn, (n_out * ne * 4) as u64, dev);
+        let logits = Self::get_or_grow(&self.inner.buf_logits, (n_out * nv * 4) as u64, dev);
 
         let sk = DecodeSkips::active(nt);
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
-            else { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, nt, eps); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_w), &bn, ne, n_out, eps, hid_off); }
+            else { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, n_out, eps, hid_off); }
         }
 
         // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, nt); }
+        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, n_out); }
         if !sk.small {
             if let Some(bb) = &bias_buf {
-                cb.add_bias_f32(&logits, bb, nv, nt, 0);
+                cb.add_bias_f32(&logits, bb, nv, n_out, 0);
             }
         }
         true
@@ -2258,8 +2268,8 @@ mod tests {
 
         // (label, dispatch closure, batches) — each closure dispatches ONE kernel.
         let cases: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
-            ("rms_norm 32t  (d=896, 1 row)",  Box::new(|cb| cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6)), 400),
-            ("rms_norm 256t (d=896, 1 row)",  Box::new(|cb| cb.rms_norm_256(&x, Some(&w), &y, ne, 1, 1e-6)), 400),
+            ("rms_norm 32t  (d=896, 1 row)",  Box::new(|cb| cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6, 0)), 400),
+            ("rms_norm 256t (d=896, 1 row)",  Box::new(|cb| cb.rms_norm_256(&x, Some(&w), &y, ne, 1, 1e-6, 0)), 400),
             ("add_f32 (n=896, 256t)",        Box::new(|cb| cb.add_f32(&x, &y, &x, ne)), 400),
             ("add_bias_f32 (d=896, 64t)",    Box::new(|cb| cb.add_bias_f32(&x, &w, ne, 1, 0)), 400),
             ("swiglu_f32 (n=4864, 256t)",    Box::new(|cb| cb.swiglu_f32(&g, &u, &g, nf)), 400),
@@ -2274,7 +2284,7 @@ mod tests {
         // warm the whole pipeline once
         {
             let cb = mps.cmd_buffer();
-            for _ in 0..50 { cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6); }
+            for _ in 0..50 { cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6, 0); }
             cb.submit().expect("warmup");
         }
 
@@ -2358,8 +2368,8 @@ mod tests {
             ("256t", &y256, 1),
         ] {
             let cb = mps.cmd_buffer();
-            if method == 0 { cb.rms_norm(&x, Some(&w), buf, d, 1, 1e-6); }
-            else { cb.rms_norm_256(&x, Some(&w), buf, d, 1, 1e-6); }
+            if method == 0 { cb.rms_norm(&x, Some(&w), buf, d, 1, 1e-6, 0); }
+            else { cb.rms_norm_256(&x, Some(&w), buf, d, 1, 1e-6, 0); }
             cb.submit().expect("submit");
         }
 

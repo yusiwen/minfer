@@ -27,8 +27,8 @@ impl Qwen2Model {
 }
 
 impl ModelDef for Qwen2Model {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache) -> Vec<f32> {
-        forward::forward(self, tokens, positions, kv)
+    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
+        forward::forward(self, tokens, positions, kv, n_out)
     }
 
     fn format_chat(&self, messages: &[(String, String)]) -> String {

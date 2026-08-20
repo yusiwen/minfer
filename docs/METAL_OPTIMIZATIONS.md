@@ -52,6 +52,7 @@
 | 29 | **mm-kernel hot-loop `#pragma unroll`** (2026-08-19, §3.4): llama `FOR_UNROLL`s the staging/ik/load/mac loops; minfer's 8 mm kernels had none → added the 6 unroll points (llama-parity set) | 7B pp495 **1438.8 → 1355.6 ms (~5.8 %)**, 0.5B ~6.9 %, 1.5B ~2.4 %; byte-identical + 24/24 determinism | `f3a499d` |
 | 30 | **ik-loop `threadgroup_barrier` → `simdgroup_barrier(mem_none)`** (2026-08-19, §3.4 follow-up): .air diff showed the pre-unroll corruption was a rolled-loop compiler artifact, not a memory need; with the unroll in place llama's exact barrier form is now safe | 7B pp495 min **1387.4 → 1370.6 ms (~1.2 %)**; byte-identical (1.5B×24 / 7B×8 / 0.5B×3); removes the last structural mm-kernel difference vs llama | `0e756f3` |
 | 31 | **Phase-0 7B prefill decomposition (2026-08-20, §3.6)**: exact 7B MUL_MAT graph mapped (197 GEMMs, 7.000 TFLOP, wk/down/output = q6_K on the q4_k_m; CORRECTS the earlier "all q4_K except ffn_down=q6_K" assumption); llama GPU-busy measured by host timestamps (CB1 83 ms + CB0 964 ms ≈ 1043 ms @ pp495 = 6.71 TF clean window); every remaining factor refuted via an exact-shape replay harness (kernels A/B in-batch 6.21 vs 6.26 TF, grid/smem/buffer-mode/pooling/barriers free, interleave + 2-CB split hurt, weight data no effect, concurrent dispatch no benefit with the per-dispatch barrier) | exact-shape replay (minfer kernel, real 7B shapes, one CB) = **~1126 ms = 6.20 TF**, converging with llama under comparable system load; engine GEMM-only ~1240 ms (residual ~90-115 ms engine-vs-replay, unattributable); gap vs llama stays ~1.25× (consistent with §3.4) | `bd89eab` |
+| 32 | **lm_head / final-norm output-rows-only (2026-08-21, §3.7)**: llama computes the final norm + last-layer FFN + lm_head on **n_outputs rows only** (`ggml_get_rows(cur, inp_out_ids)` at qwen2.cpp:106-108; graph dump shows output GEMM `out=[152064 1]` and last-layer gate/down `[.. 1]`); minfer computed `[152064×495]`. **§3.6's "7.000 TFLOP" was WRONG** (assumed output N=495; correct llama total ≈ 6.26 TFLOP — the kernel-level "gap" was mostly this over-count). Fix: `forward()`/`output_norm_gpu`/CUDA all take `n_out`; final rms_norm + lm_head run on the tail n_out rows (n_out=1), logits buffer/download shrink 301 MB → 608 KB | 7B pp495 GPU **~1354 → ~1255 ms** (stable; pre-change noisy 1354-2754), **download ~150 ms → ~0.1 ms** (wall −~150 ms); 0.5B GPU output byte-identical pre/post; 1.5B/7B greedy generation correct | uncommitted |
 
 **Completed optimizations in detail** (every done / decided-not item):
 [§3.1 Correctness fixes](#31-correctness-fixes-metal-backend-foundation) ·
@@ -73,7 +74,7 @@
 | 2 | **decode matmul per-call execution** | **q6_K 72→209 GB/s (llama 217); decode 4.27→3.72 ms/tok (~13%)** | **q6_K DONE 2026-08-13** (§3.3): ported llama's stride-2/float4 kernel layout; byte-identical + tests green. q5_0/q8_0 already at parity. q4_K next if a K_M model uses it |
 | 3 | **flash attention port** | decode **attention** 42.8→~4-6 µs/layer (~7-10×) | **DONE 2026-08-14** (§3.3): ported `kernel_flash_attn_ext_vec` (NSG=1, DK=DV=64/NE=2/C=32) as `kernel_flash_attn_ext_f32/_f16`; KV-layout check PASSED (minfer `[nkv][nk*hd]` == llama physical layout — no cache rework). Isolation-verified (`tests/flash_attn_isolation.rs`: cos vs CPU >0.999 for nkv 1..4097 incl. partial/empty chunks; flash-vs-split cos=1.0 through the shared combine), A/B byte-identical (0.5B Q4_K_M f32 + Q4_0 f16 + 7B Q4_K_M), decode GPU 0.25-1.0 ms/token faster (interleaved MINFER_TIMING), wall ~10 %; no long-context regression. Gate: `MINFER_NO_FLASH=1` reverts to split |
 | 4 | **prefill flash attention port** (llama `kernel_flash_attn_ext_blk`, legacy `simdgroup_matrix`) + prefill GEMM/small efficiency | prefill 2.3-2.8× → ~1.5× (135 → ~90 ms); GEMM/small 89→~44 ms secondary | **GEMMs RULED OUT 2026-08-14 (§3.6)**. Grid-shape probe (3.5-5.4 variance) + barrier/store experiments rule out the GEMM kernels (mem_none ≈ mem_threadgroup ~2-3 % and RACES in minfer). Real pp325 decomposition (0.5B Q4_K_M, MINFER_SKIP_ATTN): **attention 46 ms (34 %)**, everything-else 89 ms. llama pp320 = 47.7 ms total with attention only ~3 ms (6803 vs 6373 t/s `-fa on/off`). llama's prefill attention is `kernel_flash_attn_ext_blk` = **legacy simdgroup-matrix (has_simdgroup_mm, NOT the M5 tensor API)** — single fused kernel vs minfer's 3-pass. **PORT DONE 2026-08-14 (§3.4)**: `kernel_flash_attn_blk_f32/_f16` (fixed-shape NSG=4, Q=8, C=64, DK=DV=64, 7168 B shmem, inline causal mask, `kernel_kv_tail_pad` for the partial last block) + host `attn_flash_prefill`. Isolation-verified (`tests/flash_attn_blk_isolation.rs`: cos vs CPU >0.999 across 16 nt/nkv configs incl. partial blocks + GQA, f32+f16, deterministic), A/B **byte-identical to the classic `gqa_attn_f32`** at every layer (f32 AND f16 cache — maxabs 0.0), interleaved MINFER_TIMING prefill GPU **~110→~93 ms (~16 %)**, all 34 bin + 9 isolation tests pass. **Bonus: FIXES the f16-cache prefill 3-pass bug** (the 3-pass `kernel_attn_scores`/`kernel_attn_output` read the f16 KV cache as `float*` → garbage "!!!!!!"; the f16 blk kernel reads half K/V correctly). Default for hd==64 (0.5B/1.5B) and — since the 2026-08-15 hd=128 port — for hd==128 (7B) too. Gate: `MINFER_NO_PREFILL_FLASH=1` reverts to 3-pass. Non-attention 89 vs ~44 ms remains a secondary structural gap — **7B direct per-kernel GEMM A/B 2026-08-18 (§3.6): minfer GEMMs at 87-94 % of llama (parity). Phase 0 prefill decomposition 2026-08-18 (§3.6): GEMMs are 76 % (0.5B) / 88 % (7B) of prefill; small kernels only 10 % / 4 % → #1 fusion ceiling low. **Phase X 2026-08-18 (§3.6): §4.3.4's parity was a test-backend-ops measurement artifact — llama real prefill GEMMs ≈ 6.9 TFLOPS (467 t/s pp466) vs minfer ≈ 5.2 (≈1.33×). Concurrency, fusion, small kernels, dequant type, ik-loop barrier, sb-staging vectorization, and geometry ALL measured/verified — none explains the 1.33×; the gap is not addressable from minfer source (compiler-level only).** **FINAL 2026-08-20 (§3.6)**: exact 7B MUL_MAT graph mapped (197 GEMMs, 7.000 TFLOP; wk/down/output = q6_K — CORRECTS the earlier assumption), llama GPU-busy by host timestamps ≈ 1043 ms @ pp495 (6.71 TF, clean window), exact-shape replay (real 7B shapes, minfer kernels, one CB) ≈ **1126 ms = 6.20 TF**. Isolated AND in-batch kernel A/B equal (6.21 vs 6.26 TF); grid/smem/buffer-mode/pooling/weight-data/barriers all free; GEMM interleave + 2-CB split hurt; concurrent dispatch no benefit with the engine's required per-dispatch barrier. Residual engine-vs-replay ~90-115 ms unattributable (GPU-side scheduling, below static visibility). Under comparable system load (avg 3-4) llama-bench pp495 degrades to 1250-1760 ms and **converges with the replay**. **CLOSED**: attention port DONE, GEMM/small gap confirmed NOT source-addressable at every tested level — only the tensor-API GEMM (`mpp::tensor_ops`, llama disables on M4) remains as a beat-llama research direction, not a parity fix.** |
-| 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§1.6): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. **CURRENT 2026-08-20**: decode at parity (≈50 t/s, #27 q4_K port), prefill **pp495 ~1324-1336 ms vs llama ~1043-1064 ms (~73 %, §3.6)** — gap confirmed kernel-level not source-addressable (#31). Regression checks run per step; all green |
+| 5 | **7B same-model A/B + per-step regression check** (0.5B is the research model; 7B is the user-facing one) | 7B decode/prefill gap vs llama quantified; no 7B regression from each step | **BASELINE 2026-08-14** (§1.6): 7B Q4_K_M pp252: prefill **~240 t/s (52 % of llama 461)**, decode **~18.8 t/s (37 % of llama 50.5)**, steady GPU 50.1-51.3 ms/token. 0.5B sanity: pp252 2010 t/s (33 %), tg32 243 t/s (83 %) — no regression. **CURRENT 2026-08-21**: decode at parity (≈50 t/s, #27); prefill **pp495 ~1255 ms vs llama ~1043-1064 ms (~82 %, §3.6/§3.7)** after the lm_head output-rows-only fix (#32: GPU −~100 ms + download −~150 ms). Regression checks run per step; all green |
 | 6 | ~~decode small-elementwise efficiency~~ | — | **CLOSED 2026-08-13**: trace shows small-op parity (1.2-2.0 vs 1.3-1.9 µs) — the old 4× claim was subtractive noise (§3.3) |
 | 7 | **q4_K decode matmul layout port (7B)** — the next decode lever | 7B decode 37 % → closer to llama (steady GPU ~50 → target ~30 ms/token) | **DONE 2026-08-17** (§3.3): 7B K_M decode matmuls are **Q4_K-dominated** (attn_q/k/output + ffn_gate/up all Q4_K; Q6_K only output/ffn_down/attn_v). Ported llama's `kernel_mul_mv_q4_K_f32_impl` stride-4/float4 layout into `kernel_q4_k_f32_matmul` (TG(32, nsg=2) dispatch, `sc16`/kmask nibble unpack — the scale/min high/low nibble interleave reproduces llama's `get_scale_min_k4` exactly, verified against llama's dequantizer). Steps: ① isolation probe at 7B dims — old kernel 70/18/74 GB/s (attn_q 3584/3584, attn_k 3584/512, ffn_g/u 18944/3584) → new **265/146/243 GB/s** ② kernel port ③ 7B steady-decode A/B: **~49.7 → ~19.3 ms/token GPU (~2.6×), 17-19 → 45-49 t/s (≈ llama's 50.5)**, git-stash A/B byte-identical ④ 0.5B (no q4_K weights — trivially identical) + 1.5B (q4_K decode + multi path) regression green; all 34 bin tests pass |
 
@@ -203,29 +204,31 @@ dispatches** (f16 cast/cont/reshape are non-no-op nodes).
 
 (Early numbers used the blended caliber; since 2026-08-06 `Generated:` is pure decode.)
 
-### 1.6 Current 7B state (user-facing model, Q4_K_M, 2026-08-20)
+### 1.6 Current 7B state (user-facing model, Q4_K_M, 2026-08-21)
 
 The 7B (`qwen2.5-7b-instruct-q4_k_m`, split GGUF) is the user-facing model; this
 is the current standing after the decode q4_K port (#27), the correctness/unroll/
-barrier work (#28-30), and the Phase-0 prefill decomposition (#31, §3.6).
+barrier work (#28-30), the Phase-0 prefill decomposition (#31, §3.6), and the
+lm_head output-rows-only fix (#32, §3.7).
 
 | Metric | minfer | llama.cpp | Gap |
 |---|---|---|---|
 | **decode** (steady GPU) | ~19.3 ms/token (45-49 t/s) | ~50.5 t/s (19.8 ms/tok) | **≈95 % (parity)** |
-| **prefill pp495 GPU** | ~1324-1336 ms (≈5.24-5.29 TF) | ~1043-1064 ms (6.71 TF, clean) | **~73 % (~1.25-1.3×)** |
+| **prefill pp495 GPU** | ~1255 ms (≈5.15 TF @ 6.46 TFLOP) | ~1043-1064 ms (≈6.0 TF @ 6.26 TFLOP) | **~82 % (~1.2×)** |
+| **prefill pp495 logits download** | **~0.1 ms** (608 KB, was ~150 ms/301 MB) | blit, 608 KB | parity |
 | exact-shape replay (pure GEMM, one CB) | ~1126 ms (6.20 TF) | — | converges with llama under comparable load |
 
 - **Decode is at parity** (essentially closed by #27's q4_K decode matmul port).
-- **Prefill gap is kernel-level NOT source-addressable**: minfer's mm kernels are
-  proven identical to llama's legacy `kernel_mul_mm` at every measurable level
-  (source/IR/smem/dispatch/runtime-compile, §3.4) and A/B-equal in isolation
-  and in-batch (§3.6); all graph-level factors (interleave, 2-CB split,
-  dispatch type, barriers, data, pooling) are refuted.
-- The residual ~1.25× prefill gap is below static visibility (GPU backend
-  machine-code scheduling / execution environment) and is **accepted** (§3.6/
-  §3.6). The only remaining research direction is the tensor-API GEMM
+- **Prefill**: the big lm_head over-count (minfer computed `[152064×495]` logits,
+  llama computes `[152064×1]` after `get_rows(inp_out_ids)`) is FIXED (#32) —
+  GPU ~1354 → ~1255 ms, download ~150 → ~0.1 ms. The corrected FLOP accounting
+  (llama ≈ 6.26 TFLOP, NOT 7.0) shows llama ≈ 6.0 TF ≈ the replay's 6.2 TF.
+- The residual ~1.2× prefill gap is kernel/graph-level, below static visibility
+  (GPU backend machine-code scheduling / execution environment) and **accepted**
+  (§3.6). The only remaining research direction is the tensor-API GEMM
   (`mpp::tensor_ops`) — llama disables it on M4 by default, so it is a
-  beat-llama option, not a parity fix.
+  beat-llama option, not a parity fix. A ~40 ms follow-up (last-layer FFN on
+  output rows only, §3.7) is documented but not yet implemented.
 
 ---
 
@@ -551,6 +554,53 @@ llama's). Record of the investigation (was §4.3.1-§4.3.10):
 degrades to 1250-1760 ms at load avg 3-4). The only remaining research
 direction is the **tensor-API GEMM** (`mpp::tensor_ops`) — llama disables it on
 M4 by default, so it is a beat-llama option, not a parity fix (decided-not, §0).
+
+> **⚠️ 2026-08-21 CORRECTION — the §3.6 FLOP accounting was WRONG.** The
+> "7.000 TFLOP" total assumed the output (lm_head) GEMM runs on all N=495
+> tokens. The graph dump actually shows `out=[152064 1 1 1]` for the output and
+> the last layer's gate/up/down on N=1 — llama's `ggml_get_rows(cur,
+> inp_out_ids)` (qwen2.cpp:106-108) reduces to **n_outputs rows after the last
+> attention**, so the last layer's FFN + final norm + lm_head all run on N=1.
+> Correct llama total ≈ **6.26 TFLOP** → llama efficiency ≈ 6.0 TF (NOT 6.71),
+> essentially equal to the replay's 6.2 TF. **minfer was computing the full-nt
+> output GEMM `[152064×495]` (≈539 GFLOP waste) + final norm on all rows + a
+> 301 MB logits download — a large fraction of the measured "gap" was this
+> over-count, not the kernels.** Fixed 2026-08-21 (§3.7 / changelog #32).
+
+### 3.7 lm_head / final-norm output-rows-only (2026-08-21, changelog #32)
+
+**Discovery** (from the `LLAMA_METAL_E2E.md` reference): llama's graph reduces
+the hidden state to `n_outputs` rows right after the last layer's attention
+(`ggml_get_rows(cur, inp_out_ids)` + `get_rows(inpSA, inp_out_ids)`,
+`src/models/qwen2.cpp:106-108`), so the last layer's FFN, the final norm and the
+lm_head all run on **1 row** for a single-sequence prefill (graph dump: output
+GEMM `out=[152064 1 1 1]`, last-layer gate/down `[.. 1 ..]`). minfer computed
+the output projection over **all nt tokens** (`[nv×nt]`) and downloaded all of
+it.
+
+**Fix**: `forward()` / `output_norm_gpu` (Metal + CUDA) now take `n_out`
+(number of output rows = the LAST n_out tokens, single-sequence row-major
+`[nt][ne]` hidden). The final `rms_norm` + output GEMM + bias + logits buffer +
+download all operate on `n_out` rows (n_out=1 for the minfer CLI). Host:
+`src/models/qwen2/forward.rs` (GPU `output_norm_gpu(…, n_out, …)`, CUDA path,
+CPU fallback slices `hidden[(nt-n_out)*ne..]`), `src/metal.rs:2012` +
+`rms_norm(.., off)` byte-offset, `src/main.rs` passes `n_out=1`.
+
+**Measured** (7B Q4_K_M pp495, interleaved A/B same window):
+- GPU submit-wait: pre ~1354 (noisy 1354-2754) → post **1253-1271 ms** (stable)
+- logits download: ~150 ms (301 MB) → **~0.1 ms** (608 KB)
+- 0.5B GPU generation **byte-identical** pre/post (same seed, same text); 1.5B /
+  7B greedy generation correct.
+- Corrected efficiency: llama ≈ 6.0 TF @ 6.26 TFLOP; minfer post-fix ≈
+  6.46 TFLOP @ ~1.255 s ≈ 5.15 TF — the remaining ~1.2× is the §3.6
+  kernel/graph residual, plus minfer still computing the **last layer's FFN on
+  all nt** (llama reduces before it) ≈ ~40 ms follow-up potential.
+
+**Follow-up (documented, not yet implemented)**: match llama's full reduction by
+also running the LAST layer's FFN on the output rows only (after the last
+attention, reduce hidden → run layer-27 FFN on n_out). Worth ≈ 40 ms GPU (the
+layer-27 gate/up/down GEMMs on N=495→1). Requires special-casing the last layer
+in `layer_gpu`.
 
 
 ---

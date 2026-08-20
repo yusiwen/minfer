@@ -891,7 +891,7 @@ impl CudaState {
         output: &Tensor,
         output_norm: Option<&Tensor>,
         output_b: Option<&Tensor>,
-        ne: usize, nv: usize, nt: usize, eps: f32,
+        ne: usize, nv: usize, nt: usize, n_out: usize, eps: f32,
     ) -> bool {
         let norm_w = match output_norm {
             Some(t) => match self.get_weight_ptr(&t.name) {
@@ -906,29 +906,34 @@ impl CudaState {
             && output.ttype != TensorType::Q4_K && output.ttype != TensorType::Q6_K {
             return false;
         }
+        debug_assert!(n_out <= nt, "n_out={n_out} > nt={nt}");
+
+        // Output rows = last n_out tokens (single-sequence [nt][ne] row-major).
+        let hid_off = (nt - n_out) * ne * 4;
 
         let hidden = Self::get_or_grow(&self.buf_hidden, nt * ne * 4);
-        let bn = Self::get_or_grow(&self.buf_bn, nt * ne * 4);
-        let logits = Self::get_or_grow(&self.buf_logits, nt * nv * 4);
+        let bn = Self::get_or_grow(&self.buf_bn, n_out * ne * 4);
+        let logits = Self::get_or_grow(&self.buf_logits, n_out * nv * 4);
 
-        self.rms_norm(hidden, Some(norm_w), bn, ne, nt, eps);
+        let hidden_off = (hidden as *mut u8).add(hid_off) as *mut std::ffi::c_void;
+        self.rms_norm(hidden_off, Some(norm_w), bn, ne, n_out, eps);
         self.debug_sync(-1, "output: rms_norm");
 
         if output.ttype == TensorType::Q4_0 {
-            let q8_len = nt * (ne / 32) * Q8B;
+            let q8_len = n_out * (ne / 32) * Q8B;
             let q8_bn = Self::get_or_grow(&self.buf_q8_bn, q8_len);
-            self.quantize_q8_0(bn, q8_bn, ne, nt);
+            self.quantize_q8_0(bn, q8_bn, ne, n_out);
             self.debug_sync(-1, "output: quantize_q8_0");
-            self.quant_matmul_q8(output, q8_bn, logits, nv, ne, nt);
+            self.quant_matmul_q8(output, q8_bn, logits, nv, ne, n_out);
             self.debug_sync(-1, "output: q4_0 matmul");
         } else {
-            self.quant_matmul_f32_on_gpu(output, bn, logits, nv, ne, nt);
+            self.quant_matmul_f32_on_gpu(output, bn, logits, nv, ne, n_out);
             self.debug_sync(-1, "output: f32 matmul");
         }
 
         if let Some(ob) = output_b {
             if let Some(bias_buf) = self.get_weight_ptr(&ob.name) {
-                self.add_bias_f32(logits, bias_buf, nv, nt);
+                self.add_bias_f32(logits, bias_buf, nv, n_out);
                 self.debug_sync(-1, "output: bias");
             }
         }

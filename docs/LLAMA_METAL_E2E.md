@@ -109,7 +109,7 @@
 | 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal.rs:692` (swiglu) + `:392` (down matmul) |
 | 3.13 | Per layer: residual | `ggml_add` | `src/models/qwen2.cpp:127` | `add_f32` |
 | 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal.rs:2072` (rms_norm inside output_norm_gpu) |
-| 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal.rs:2078` (output GEMM) |
+| 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal.rs:2078` (output GEMM) — **2026-08-21: now output-rows-only (`n_out`), matching llama** |
 | 3.16 | Node ordering | `ggml_build_forward_expand` → `ggml_build_forward_impl` → `ggml_visit_parents_graph` (DFS, parents before children) | `ggml.c:7188,7120` | "N/A" (minfer encodes imperatively in layer order) |
 
 ### P4 Scheduler split & allocation
@@ -303,6 +303,11 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §4.3.10`).
    nodes → scheduler → backend); minfer = imperative (`forward.rs` encodes
    layer-by-layer directly into a single MPS command buffer). No
    scheduler/allocator layer; `src/cache.rs` holds KV directly.
+1b. **Output-rows reduction (2026-08-21)**: llama shrinks the graph to
+   `n_outputs` rows after the last attention (`get_rows(inp_out_ids)`,
+   `qwen2.cpp:106-108`) → last-layer FFN + final norm + lm_head run on 1 row.
+   minfer now mirrors this for the final norm + lm_head (`n_out` param); the
+   last-layer FFN still runs on all nt (≈40 ms follow-up, minfer §3.7).
 2. **Level-for-level equivalence proven** (minfer `docs/METAL_OPTIMIZATIONS.md`
    §4.3.9/§4.3.10): the prefill GEMM kernels (`kernel_mul_mm` vs
    `kernel_q*_mm_f32`) match at source/IR/smem/dispatch/runtime-compile level;

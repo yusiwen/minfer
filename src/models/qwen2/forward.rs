@@ -7,9 +7,11 @@ pub fn forward(
     model: &super::Qwen2Model,
     token_ids: &[u32], positions: &[usize],
     kv_cache: &mut KVCache,
+    n_out: usize,
 ) -> Vec<f32> {
     let hp = &model.hparams;
     let nt = token_ids.len();
+    assert!(n_out <= nt, "n_out={n_out} > nt={nt}");
     let ne = hp.n_embd as usize;
     let nh = hp.n_head as usize;
     let nk = hp.n_head_kv as usize;
@@ -128,7 +130,7 @@ pub fn forward(
                 let gpu_output = mps.output_norm_gpu(
                     &cb, model.output.as_ref().unwrap(), model.output_norm.as_ref(),
                     model.output_b.as_ref(),
-                    ne, nv, nt, eps,
+                    ne, nv, nt, n_out, eps,
                 );
                 let enc_submit_t0 = std::time::Instant::now();
                 if let Err(e) = cb.submit() {
@@ -138,7 +140,7 @@ pub fn forward(
                 let submit_dur = if fwd_timing { Some(enc_submit_t0.elapsed().as_secs_f64()) } else { None };
                 let enc_dur = if fwd_timing { Some(enc_submit_t0.duration_since(enc_t0).as_secs_f64()) } else { None };
                 if gpu_output {
-                    let mut logits = vec![0.0f32; nt * nv];
+                    let mut logits = vec![0.0f32; n_out * nv];
                     mps.download_logits(&mut logits);
                     // No sync_kv_to_cpu here: the CPU KVCache is only read by the
                     // CPU fallback layer loop below, and GPU-layer failure is
@@ -213,7 +215,7 @@ pub fn forward(
                 cuda.upload_positions(positions);
                 cuda.graph_launch();
                 cuda.sync();
-                let mut logits = vec![0.0f32; nt * nv];
+                let mut logits = vec![0.0f32; n_out * nv];
                 cuda.download_logits(&mut logits);
                 return logits;
             }
@@ -239,7 +241,7 @@ pub fn forward(
                 let gpu_output = cuda.output_norm_gpu(
                     model.output.as_ref().unwrap(), model.output_norm.as_ref(),
                     model.output_b.as_ref(),
-                    ne, nv, nt, eps,
+                    ne, nv, nt, n_out, eps,
                 );
 
                 if capture {
@@ -249,7 +251,7 @@ pub fn forward(
 
                 cuda.sync();
                 if gpu_output {
-                    let mut logits = vec![0.0f32; nt * nv];
+                    let mut logits = vec![0.0f32; n_out * nv];
                     cuda.download_logits(&mut logits);
                     return logits;
                 }
@@ -328,16 +330,17 @@ pub fn forward(
         crate::dump::maybe_dump_prefill_or_gen0(&format!("minfer_dump_layer{}_out", il), &hidden, nt);
         }
     }
-    rms_norm(&hidden, eps, &mut bn, nt, ne, model.output_norm.as_ref().map(|t| t.data_f32()));
-    crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_last_norm", &bn, nt);
+    rms_norm(&hidden[(nt - n_out) * ne..], eps, &mut bn[..n_out * ne], n_out, ne,
+        model.output_norm.as_ref().map(|t| t.data_f32()));
+    crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_last_norm", &bn, n_out);
     if let Some(output) = &model.output {
-        let mut logits = vec![0.0f32; nt * nv];
-        crate::kernel::quant_matmul_f32(output, &bn, &mut logits, nv, ne, nt);
+        let mut logits = vec![0.0f32; n_out * nv];
+        crate::kernel::quant_matmul_f32(output, &bn[..n_out * ne], &mut logits, nv, ne, n_out);
         if let Some(ob) = &model.output_b {
             let b = ob.data_f32();
-            for t in 0..nt { let base = t * nv; for i in 0..nv.min(b.len()) { logits[base + i] += b[i]; } }
+            for t in 0..n_out { let base = t * nv; for i in 0..nv.min(b.len()) { logits[base + i] += b[i]; } }
         }
-        crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_logits", &logits, nt);
+        crate::dump::maybe_dump_prefill_or_gen0("minfer_dump_logits", &logits, n_out);
         return logits;
     }
     vec![]

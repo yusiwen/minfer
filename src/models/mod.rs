@@ -9,7 +9,7 @@ use crate::vec_ops::RopeStyle;
 
 /// Architecture-agnostic model interface.
 pub trait ModelDef {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache) -> Vec<f32>;
+    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
     fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;
