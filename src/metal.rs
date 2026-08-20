@@ -158,6 +158,7 @@ struct MpsStateInner {
     pl_q5_k_f32_multi: metal::ComputePipelineState,
     pl_q5_k_mm_f32: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
+    pl_get_rows_q4_k: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
     pl_rms_norm_256: metal::ComputePipelineState,
     pl_add: metal::ComputePipelineState,
@@ -596,16 +597,20 @@ impl MpsCommandBuffer<'_> {
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.
     /// Writes f32 hidden state [nt][ne] to dst (buf_hidden).
     pub fn embed_tokens_gpu(&self, wb: &metal::Buffer, ids: &metal::Buffer,
-        dst: &metal::Buffer, ne: usize, nt: usize,
+        dst: &metal::Buffer, ne: usize, nt: usize, ttype: TensorType,
     ) {
         self.trace_op("embed");
-        self.enc.set_compute_pipeline_state(&self.state.pl_get_rows_q4_0);
+        let (pl, nb) = match ttype {
+            TensorType::Q4_0 => (&self.state.pl_get_rows_q4_0, ne / 32),
+            TensorType::Q4_K => (&self.state.pl_get_rows_q4_k, (ne / 256) * 16),
+            _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
+        };
+        self.enc.set_compute_pipeline_state(pl);
         self.enc.set_buffer(0, Some(wb), 0);
         self.enc.set_buffer(1, Some(ids), 0);
         self.enc.set_buffer(2, Some(dst), 0);
         self.set_params(3, &(ne as i32));
         self.set_params(4, &(nt as i32));
-        let nb = ne / 32;
         self.dispatch_1d((nt * nb) as u64, 256);
     }
 
@@ -1154,6 +1159,7 @@ impl MpsState {
             let pl_q5_k_mm_f32 = get_pl("kernel_q5_k_mm_f32")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
+            let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
             let pl_rms_norm_256 = get_pl("kernel_rms_norm_f32_256")?;
             let pl_add      = get_pl("kernel_add_f32")?;
@@ -1218,6 +1224,7 @@ impl MpsState {
                 pl_q5_k_f32_multi,
                 pl_q5_k_mm_f32,
                 pl_get_rows_q4_0,
+                pl_get_rows_q4_k,
                 pl_rms_norm,
                 pl_rms_norm_256,
                 pl_add,
@@ -1589,19 +1596,28 @@ impl MpsState {
     }
 
     /// GPU embedding lookup: dequantize embedding rows and write to buf_hidden.
-    /// Returns false if the embedding weight is not on GPU or not Q4_0.
+    /// Returns false if the embedding weight is not on GPU or not a supported
+    /// quant type (Q4_0 / Q4_K).
     pub fn embed_tokens_gpu(&self, embd_weight: &Tensor, token_ids: &[u32], nt: usize, ne: usize) -> bool {
-        // GPU safety (M2): kernel_get_rows_q4_0 indexes rows by token_id with no
+        // GPU safety (M2): the get_rows kernels index rows by token_id with no
         // in-kernel bound. A token_id >= vocab would read out of bounds — check
         // host-side and error-exit (the tokenizer normally guarantees valid ids).
         let vocab = embd_weight.shape[1] as usize;
         if let Some(&bad) = token_ids.iter().find(|&&id| id as usize >= vocab) {
             gpu_abort(&format!(
-                "embedding token id {bad} >= vocab {vocab} (kernel_get_rows_q4_0 would read out of bounds)"
+                "embedding token id {bad} >= vocab {vocab} (get_rows would read out of bounds)"
             ));
         }
-        if embd_weight.ttype != TensorType::Q4_0 {
-            return false;
+        let ttype = embd_weight.ttype;
+        match ttype {
+            TensorType::Q4_0 => {}
+            TensorType::Q4_K => {
+                // kernel_get_rows_q4_k uses ne/256 super-blocks (exact division).
+                if ne % 256 != 0 {
+                    return false; // non-256-aligned ne: fall back to CPU embed
+                }
+            }
+            _ => return false,
         }
         let wb = match self.get_weight(&embd_weight.name) {
             Some(b) => b,
@@ -1612,7 +1628,7 @@ impl MpsState {
         let hidden = Self::get_or_grow(&self.inner.buf_hidden, (nt * ne * 4) as u64, dev);
         let ids_buf = self.inner.buf_token_ids.lock().unwrap().clone();
         let cb = self.cmd_buffer();
-        cb.embed_tokens_gpu(&wb, &ids_buf, &hidden, ne, nt);
+        cb.embed_tokens_gpu(&wb, &ids_buf, &hidden, ne, nt, ttype);
         if cb.submit().is_err() {
             return false;
         }

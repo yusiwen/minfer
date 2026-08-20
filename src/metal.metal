@@ -2363,6 +2363,45 @@ kernel void kernel_get_rows_q4_0(
     }
 }
 
+// ─── GET_ROWS Q4_K: embedding lookup for Q4_K tables (256-elem super-blocks).
+// One thread per (token, 16-element group); reuses dequant_q4_k_16 (the same
+// helper the Q4_K GEMM kernels use, validated byte-identical to llama's
+// dequantize_row_q4_K). Matches llama's kernel_get_rows_q<block_q4_K, ...>.
+// Host guards ne % 256 == 0 (super-block alignment).
+kernel void kernel_get_rows_q4_k(
+    device const uchar  * weights [[buffer(0)]],
+    device const int    * ids     [[buffer(1)]],
+    device       float  * dst     [[buffer(2)]],
+    constant    int     & ne      [[buffer(3)]],
+    constant    int     & nt      [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    constexpr int Q4KB = 144;
+    int nsb = (ne / 256) * 16;   // 16-element groups per token row
+    int total = nt * nsb;
+    int idx = (int)tid;
+    if (idx >= total) return;
+
+    int t = idx / nsb;
+    int g = idx % nsb;
+    int token_id = ids[t];
+
+    int super = g / 16;
+    int il = g % 16;
+    int off = (token_id * (ne / 256) + super) * Q4KB;
+
+    float4x4 reg;
+    dequant_q4_k_16(weights + off, il, reg);
+
+    int base = t * ne + g * 16;
+    for (int j = 0; j < 4; j++) {
+        dst[base + j*4 + 0] = reg[j][0];
+        dst[base + j*4 + 1] = reg[j][1];
+        dst[base + j*4 + 2] = reg[j][2];
+        dst[base + j*4 + 3] = reg[j][3];
+    }
+}
+
 // ─── RMSNorm (1 threadgroup per row, 32 threads) ─────────────
 // Parallel sum-of-squares via simd_sum (single simdgroup, no shared memory).
 // y[t][i] = x[t][i] * rsqrt(mean(x[t]²) + eps) * w[i]

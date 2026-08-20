@@ -96,7 +96,7 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/forward.rs:6` (forward) |
-| 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal.rs:1594` (embed_tokens_gpu, get_rows) |
+| 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal.rs:1594` (embed_tokens_gpu, get_rows) — **2026-08-21: Q4_0 + Q4_K on GPU (was Q4_0-only; 7B/1.5B Q4_K embd fell back to CPU)** |
 | 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal.rs:1565` (upload_positions) |
 | 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal.rs` (store_kv uses pos_buf) |
 | 3.5 | Per layer: attn_norm | `build_norm` (RMSNorm + Mul + optional Add) | `llama-graph.cpp:1556` | `src/metal.rs:614` (rms_norm) + `:648` (add) |

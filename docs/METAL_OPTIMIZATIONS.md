@@ -53,6 +53,7 @@
 | 30 | **ik-loop `threadgroup_barrier` → `simdgroup_barrier(mem_none)`** (2026-08-19, §3.4 follow-up): .air diff showed the pre-unroll corruption was a rolled-loop compiler artifact, not a memory need; with the unroll in place llama's exact barrier form is now safe | 7B pp495 min **1387.4 → 1370.6 ms (~1.2 %)**; byte-identical (1.5B×24 / 7B×8 / 0.5B×3); removes the last structural mm-kernel difference vs llama | `0e756f3` |
 | 31 | **Phase-0 7B prefill decomposition (2026-08-20, §3.6)**: exact 7B MUL_MAT graph mapped (197 GEMMs, 7.000 TFLOP, wk/down/output = q6_K on the q4_k_m; CORRECTS the earlier "all q4_K except ffn_down=q6_K" assumption); llama GPU-busy measured by host timestamps (CB1 83 ms + CB0 964 ms ≈ 1043 ms @ pp495 = 6.71 TF clean window); every remaining factor refuted via an exact-shape replay harness (kernels A/B in-batch 6.21 vs 6.26 TF, grid/smem/buffer-mode/pooling/barriers free, interleave + 2-CB split hurt, weight data no effect, concurrent dispatch no benefit with the per-dispatch barrier) | exact-shape replay (minfer kernel, real 7B shapes, one CB) = **~1126 ms = 6.20 TF**, converging with llama under comparable system load; engine GEMM-only ~1240 ms (residual ~90-115 ms engine-vs-replay, unattributable); gap vs llama stays ~1.25× (consistent with §3.4) | `bd89eab` |
 | 32 | **lm_head / final-norm output-rows-only (2026-08-21, §3.7)**: llama computes the final norm + last-layer FFN + lm_head on **n_outputs rows only** (`ggml_get_rows(cur, inp_out_ids)` at qwen2.cpp:106-108; graph dump shows output GEMM `out=[152064 1]` and last-layer gate/down `[.. 1]`); minfer computed `[152064×495]`. **§3.6's "7.000 TFLOP" was WRONG** (assumed output N=495; correct llama total ≈ 6.26 TFLOP — the kernel-level "gap" was mostly this over-count). Fix: `forward()`/`output_norm_gpu`/CUDA all take `n_out`; final rms_norm + lm_head run on the tail n_out rows (n_out=1), logits buffer/download shrink 301 MB → 608 KB | 7B pp495 GPU **~1354 → ~1255 ms** (stable; pre-change noisy 1354-2754), **download ~150 ms → ~0.1 ms** (wall −~150 ms); 0.5B GPU output byte-identical pre/post; 1.5B/7B greedy generation correct | `43989da` |
+| 33 | **GPU Q4_K embedding (get_rows) (2026-08-21)**: minfer's `kernel_get_rows_q4_0` was Q4_0-only, so the 7B/1.5B (Q4_K `token_embd.weight`) fell back to CPU scalar dequant + 7 MB `upload_hidden` per prefill (O(nt) wall: ~5-15 ms @ 495 tok, ~100-200 ms @ 8K). Added `kernel_get_rows_q4_k` (reuses the validated `dequant_q4_k_16`, llama `kernel_get_rows_q`-equivalent) + pipeline + type routing in `embed_tokens_gpu` | 7B/1.5B embedding now on GPU; greedy output **byte-identical** pre/post (same seed); `get_rows_q4_k_isolation` test bit-exact vs CPU; no prefill GPU regression | uncommitted |
 
 **Completed optimizations in detail** (every done / decided-not item):
 [§3.1 Correctness fixes](#31-correctness-fixes-metal-backend-foundation) ·
@@ -210,8 +211,8 @@ dispatches** (f16 cast/cont/reshape are non-no-op nodes).
 
 The 7B (`qwen2.5-7b-instruct-q4_k_m`, split GGUF) is the user-facing model; this
 is the current standing after the decode q4_K port (#27), the correctness/unroll/
-barrier work (#28-30), the Phase-0 prefill decomposition (#31, §3.6), and the
-lm_head output-rows-only fix (#32, §3.7).
+barrier work (#28-30), the Phase-0 prefill decomposition (#31, §3.6), the
+lm_head output-rows-only fix (#32, §3.7), and the GPU Q4_K embedding port (#33).
 
 | Metric | minfer | llama.cpp | Gap |
 |---|---|---|---|
