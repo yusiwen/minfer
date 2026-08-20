@@ -619,8 +619,9 @@ in `layer_gpu`.
 > source evidence). The detailed records live in §3 ("Completed optimizations
 > in detail", incl. the §3.6 investigation record) — see the §3 links in §0's
 > Progress Overview; decided-not items are in §0's "Decided not to change"
-> table. This chapter holds only the remaining research + operational
-> reference.
+> table. This chapter holds the remaining research + operational reference,
+> plus the **cold-start to-dos added 2026-08-21 (§4.2)** (a separate axis from
+> the steady-state gap — not part of the §0 "match llama.cpp" table).
 
 ### 4.1 Remaining research (not a parity fix)
 
@@ -635,7 +636,34 @@ shrinks the graph before layer-27's FFN), closing the remaining minfer-vs-llama
 prefill work difference (6.46 vs 6.26 TFLOP). Requires special-casing the last
 layer in `layer_gpu`.
 
-### 4.2 Reference: GPU profiling tooling (done, operational)
+### 4.2 Cold-start optimization to-dos (2026-08-21)
+
+**Observed**: 7B run twice in a row → the second run ≈ 2× faster (Total
+1.46 s → 0.77 s). Note the CLI's `Total` timing starts AFTER model load
+(`main.rs:313 infer_start`), so the 2× is in the **inference phases**
+(prefill + decode), not the load. Root causes:
+
+| Factor | Effect | Evidence |
+|---|---|---|
+| **GPU weight-buffer cold state (run 1)** | the 5.2 GB weights are freshly CPU-memcpy'd into Shared buffers at load; the GPU's first read hits cold MMU/TLB + page residency → slower prefill + decode on run 1 | decode 32.6 t/s (~84 GB/s) run 1 vs 46.4 t/s (~119 GB/s) run 2 |
+| **GPU clock ramp** | first GPU burst after idle starts below max clock | secondary |
+| **Model-load wall (not in `Total`, but real wall time)** | 4.4 GB `std::fs::read` (gguf.rs:1711,1736) + Metal shader source compile (`newLibraryWithSource`, metal.rs:1120) — run 2 mitigated by the OS page cache + the Metal driver's on-disk shader cache | run 1 load visibly slow, run 2 ~free |
+
+Warm steady-state = run 2's numbers (pp30 ~0.17 s, decode ~46 t/s). Not a bug.
+
+| # | Item | Current | Approach (llama parity) | Expected | Blocker / Risk |
+|---|---|---|---|---|---|
+| 1 | **Precompiled metallib** | every process compiles `metal.metal` from source via `newLibraryWithSource` | build-time `metal` compiler → embed a `.metallib` → load with `newLibraryWithData` | remove the per-invocation shader compile (~0.3-1 s), also the first-ever run (not just after the driver cache warms) | the standalone Metal toolchain is not installed (`xcodebuild -downloadComponent MetalToolchain`), then a build step (Makefile / cargo build) |
+| 2 | **GGUF mmap + zero-copy weight buffers** | `std::fs::read` the whole file into a Vec, then copy each weight into a Shared GPU buffer (2 passes) | mmap the GGUF; `newBufferWithBytesNoCopy` over the mapped data (llama `ggml-metal-device.m:1668`) | remove the 4.4 GB copy pass + the 4.4 GB intermediate Vec; the GPU reads the mapped file pages directly | GGUF tensor data must be page-aligned and its layout must match what the GPU kernels expect (llama does this for offloaded layers, so feasible) |
+| 3 | **Persistent / server mode** (note) | one-shot CLI: every invocation re-loads the model | keep the process alive and reuse the loaded model (llama-server pattern) | removes reload for repeated calls — the definitive fix for the observed run-1/run-2 gap | out of the current CLI scope |
+
+> Item 1 removes a genuinely avoidable per-invocation cost; item 2 is mostly a
+> memory + one-copy-pass win (the 4.4 GB disk read is unavoidable either way).
+> Item 3 is the only way to make *every* invocation fast, at the cost of a
+> daemon. Together they target the cold-start axis only — steady-state
+> inference is unaffected (already at the §1.6 numbers).
+
+### 4.3 Reference: GPU profiling tooling (done, operational)
 
 - `xctrace`: `/usr/bin/xctrace` is a broken stub ("tool not found"); the real
   binary is `/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`.
@@ -649,7 +677,7 @@ layer in `layer_gpu`.
   ratios; bandwidth counters (L1/LLC Read Bandwidth) are cumulative — ignore
   magnitude.
 
-### 4.3 Process (was §4.5 backfill)
+### 4.4 Process (was §4.5 backfill)
 
 After each item completes: update the §0 progress table (check, fill in the
 commit, update measured effect) → record the implementation + verification in
