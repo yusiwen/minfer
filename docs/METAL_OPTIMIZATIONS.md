@@ -51,6 +51,7 @@
 | 28 | **GEMM partial-tile race + missing Metal `memoryBarrier`** (2026-08-19, §4.3.6): (a) all 8 simdgroup mm kernels lacked the `threadgroup_barrier` BEFORE the partial-tile `temp_str` stores — `temp_str` overlaps sa/sb, so a fast simdgroup overwrites sa/sb while a slow one still reads them → intermittently corrupted last-2-token logits (partial x-tile only); (b) the single prefill encoder had NO `memoryBarrier` between dispatches → RMSNorm write raced QKV read of the reused `bn` buffer (last-2 token slots, huge stale values) | 1.5B/7B first-token nondeterminism (~10-30 % wrong tokens, dump-localized) → **24/24 deterministic, output matches CPU byte-for-byte** | uncommitted |
 | 29 | **mm-kernel hot-loop `#pragma unroll`** (2026-08-19, §4.3.9): llama `FOR_UNROLL`s the staging/ik/load/mac loops; minfer's 8 mm kernels had none → added the 6 unroll points (llama-parity set) | 7B pp495 **1438.8 → 1355.6 ms (~5.8 %)**, 0.5B ~6.9 %, 1.5B ~2.4 %; byte-identical + 24/24 determinism | uncommitted |
 | 30 | **ik-loop `threadgroup_barrier` → `simdgroup_barrier(mem_none)`** (2026-08-19, §4.3.9 follow-up): .air diff showed the pre-unroll corruption was a rolled-loop compiler artifact, not a memory need; with the unroll in place llama's exact barrier form is now safe | 7B pp495 min **1387.4 → 1370.6 ms (~1.2 %)**; byte-identical (1.5B×24 / 7B×8 / 0.5B×3); removes the last structural mm-kernel difference vs llama | uncommitted |
+| 31 | **Phase-0 7B prefill decomposition (2026-08-20, §4.3.10)**: exact 7B MUL_MAT graph mapped (197 GEMMs, 7.000 TFLOP, wk/down/output = q6_K on the q4_k_m; CORRECTS the earlier "all q4_K except ffn_down=q6_K" assumption); llama GPU-busy measured by host timestamps (CB1 83 ms + CB0 964 ms ≈ 1043 ms @ pp495 = 6.71 TF clean window); every remaining factor refuted via an exact-shape replay harness (kernels A/B in-batch 6.21 vs 6.26 TF, grid/smem/buffer-mode/pooling/barriers free, interleave + 2-CB split hurt, weight data no effect, concurrent dispatch no benefit with the per-dispatch barrier) | exact-shape replay (minfer kernel, real 7B shapes, one CB) = **~1126 ms = 6.20 TF**, converging with llama under comparable system load; engine GEMM-only ~1240 ms (residual ~90-115 ms engine-vs-replay, unattributable); gap vs llama stays ~1.25× (consistent with §4.3.9) | — |
 
 ### 🔜 To-do (required path to match llama.cpp)
 
@@ -1221,6 +1222,56 @@ cheap lever would be eliminating minfer's extra ik-loop `threadgroup_barrier`s
 > The residual gap is below IR/static visibility (backend machine-code
 > scheduling or GPU execution-environment), consistent with §4.3.6. Combined
 > unroll (§4.3.9) + barrier (§#30) recover ~6.5 % of the ~1.33×.
+
+#### 4.3.10 Phase-0 7B prefill decomposition (2026-08-20) — exhaustive refutation + exact-shape replay
+
+Closes the §4.3.9 "residual gap" question with a full 7B Q4_K_M pp495 (fixed
+495-token prompt) decomposition at the GRAPH level. Every factor was tested
+with an exact-shape replay harness (real 7B shapes, minfer kernels, one command
+buffer, `-O` Swift — note: Swift `-Onone` fills a 447 MB buffer in ~40 s, which
+looked like a GPU hang; always compile the harnesses with `-O`).
+
+**Weight-type map CORRECTED** (from llama's `GGML_METAL_PRINT_GRAPH` dump of all
+197 MUL_MAT): 14 layers have `wk` = **q6_K** and `down` = **q6_K** (layers
+0,1,2,5,9,11,14,17,20,23,24,25,26,27 / 0,1,2,5,12,14,17,20,23,24,25,26,27), and
+**output projection = q6_K [152064×3584]** — NOT "all q4_K except ffn_down=q6_K"
+as previously assumed. `wq/wo/wv/gate/up` always q4_K. Total MUL_MAT FLOP =
+**7.000 TFLOP** (per-node sum from the graph dump).
+
+**llama GPU-busy (host timestamps, clean window)**: CB1 (main, first 64 nodes)
+83 ms + CB0 (worker, remaining 392 nodes) 964 ms ≈ **1043 ms @ pp495 = 6.71 TF**.
+This is the target. Under comparable system load (load avg ~3-4) llama-bench
+pp495 degrades to 1250-1760 ms and CONVERGES with the replay — the earlier
+"llama 1043 vs replay 1126" gap was different load windows.
+
+**Results** (all factors tested):
+
+| experiment | result | verdict |
+|---|---|---|
+| isolated kernel A/B (single GEMM, fresh CB) | q4K 6.18 vs llama 6.24 TF; q6K equal or minfer-faster (down 5.75 vs 5.98; output **5.93 vs 5.45 — minfer faster**) | kernels equal |
+| in-batch kernel A/B (28×6 q4K + output, one CB, distinct weights) | minfer 841 vs llama 833 ms (~1 %) | kernels equal |
+| grid / threads / smem | llama `(ne11/32, ne01/64, 32×4)` == minfer `(nt/32, od/64, 32×4)`, 8192 B both | identical |
+| buffer storage mode | both StorageModeShared (`newBufferWithBytesNoCopy` llama / `new_buffer` minfer) | identical |
+| pooled vs separate weight buffers | 1174 vs 1175 ms | no effect |
+| weight DATA (real GGUF vs pseudo-random) | real ~1226 vs random ~1209 ms GEMM-only | no effect |
+| barrier per dispatch (replay: `memoryBarrier(scope:.buffers)`) | 1143.2 vs 1143.7 ms | free |
+| interleave dummy attn/norm dispatches between GEMMs | 845 vs 840 ms | **hurts** |
+| 2-CB split (llama-style parallel encode) | split=14 → 1195 ms, split=27 → 1210 vs 1-CB 1126 ms | **hurts** |
+| concurrent vs serial encoder (replay, no barrier) | 1126 vs 1143 ms (and immune to cold-start) | helps only WITHOUT the per-dispatch barrier; with barrier (engine) no benefit |
+
+**Exact-shape replay** (real 7B shapes, all kernels, one CB): **~1126-1143 ms =
+6.12-6.20 TF** — the best achievable with these kernels. The engine's own
+GEMM-only (`MINFER_SKIP_ATTN=1 MINFER_SKIP_SMALL=1`, ~1240 ms today) is
+**~90-115 ms slower than the replay** despite identical kernels/dispatch/barriers
+— an engine-vs-harness residual not attributable to any tested factor (encode is
+only ~1 ms, so it is GPU-side scheduling, below static visibility, consistent
+with §4.3.6/§4.3.9).
+
+**Final standing**: 7B pp495 minfer FULL ~1324-1336 ms vs llama ~1043-1064 ms
+(clean), converging under load; the ~1.25× per-GEMM gap is confirmed NOT
+source-addressable at any tested level. The concurrent-dispatch-type experiment
+was reverted (no benefit with the engine's required per-dispatch barrier).
+
 
 
 
