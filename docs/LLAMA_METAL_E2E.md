@@ -56,7 +56,7 @@
 | P8 | Per-op kernel dispatch | Per op type: set pipeline + args + threadgroups | `ggml-metal-ops.cpp:265-497` | `src/metal.rs:392` (quant_matmul_f32_on_gpu_buf) et al. |
 | P9 | GPU kernel execution | Metal shader compute | `ggml-metal.metal` | `src/metal.metal` |
 | P10 | KV cache | In-graph write (set_rows) & read (flash/matmul direct) | `llama-kv-cache.cpp:1301` `llama-graph.cpp:2800` | `src/metal.rs:866` (store_kv) + `src/cache.rs` |
-| P11 | logits/embd readback | GPU→host copy | `ggml-metal-context.m:351` `llama-context.cpp:1854` | `src/metal.rs:2012` (output_norm_gpu then download_logits) |
+| P11 | logits/embd readback | GPU→host copy | `ggml-metal-context.m:351` `llama-context.cpp:1854` | `src/metal.rs:2012` (output_norm_gpu then download_logits, now `n_out` rows / 608 KB) |
 
 ## 2. Detailed step table (end-to-end execution order)
 
@@ -108,7 +108,7 @@
 | 3.11 | Per layer: ffn_norm | `build_norm` | `src/models/qwen2.cpp:114` | `rms_norm` |
 | 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal.rs:692` (swiglu) + `:392` (down matmul) |
 | 3.13 | Per layer: residual | `ggml_add` | `src/models/qwen2.cpp:127` | `add_f32` |
-| 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal.rs:2072` (rms_norm inside output_norm_gpu) |
+| 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal.rs:2072` (rms_norm inside output_norm_gpu) — **2026-08-21: also output-rows-only (`n_out`), matching llama** |
 | 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal.rs:2078` (output GEMM) — **2026-08-21: now output-rows-only (`n_out`), matching llama** |
 | 3.16 | Node ordering | `ggml_build_forward_expand` → `ggml_build_forward_impl` → `ggml_visit_parents_graph` (DFS, parents before children) | `ggml.c:7188,7120` | "N/A" (minfer encodes imperatively in layer order) |
 
@@ -207,7 +207,7 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 11.1 | Locate backend | `ggml_backend_sched_get_tensor_backend(t_logits)` | `llama-context.cpp:1948` | — |
-| 11.2 | Async readback | `ggml_backend_tensor_get_async` → `ggml_metal_get_tensor_async`: `newBufferWithBytesNoCopy` wraps host memory + **blit encoder** GPU→host, queued into `cmd_bufs_ext` | `llama-context.cpp:1854` `ggml-metal-context.m:351-391` | `src/metal.rs` (`copy_from_gpu`: Shared buffer direct memcpy, no blit) |
+| 11.2 | Async readback | `ggml_backend_tensor_get_async` → `ggml_metal_get_tensor_async`: `newBufferWithBytesNoCopy` wraps host memory + **blit encoder** GPU→host, queued into `cmd_bufs_ext` | `llama-context.cpp:1854` `ggml-metal-context.m:351-391` | `src/metal.rs` (`copy_from_gpu`: Shared buffer direct memcpy, no blit) — **2026-08-21: now `n_out×nv` (608 KB for single output; was 301 MB)** |
 | 11.3 | Synchronize | before the next decode, `ggml_backend_sched_synchronize` waits for the blit | `ggml-backend.cpp` | `submit()` blocks + `download_logits` |
 
 ## 3. Supplementary mapping tables
@@ -245,7 +245,7 @@ Complete forward-path mapping (non-forward ops omitted):
 **On M4, llama disables the tensor API** (§0.4) and actually uses branch ②'s
 legacy `simdgroup_matrix` path — which is **level-for-level equivalent** to
 minfer's `kernel_q4_k_mm_f32` (`src/metal.metal:4692`, 64×32 tile, 32×4
-threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §4.3.10`).
+threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
 
 ### 3.3 `FLASH_ATTN_EXT` variant selection (`ggml-metal-ops.cpp:2990-3492`)
 
@@ -309,7 +309,7 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §4.3.10`).
    minfer now mirrors this for the final norm + lm_head (`n_out` param); the
    last-layer FFN still runs on all nt (≈40 ms follow-up, minfer §3.7).
 2. **Level-for-level equivalence proven** (minfer `docs/METAL_OPTIMIZATIONS.md`
-   §4.3.9/§4.3.10): the prefill GEMM kernels (`kernel_mul_mm` vs
+   §3.4/§3.6): the prefill GEMM kernels (`kernel_mul_mm` vs
    `kernel_q*_mm_f32`) match at source/IR/smem/dispatch/runtime-compile level;
    this table's P8/P9 rows are the comparison anchors.
 3. **Fusion gap**: llama's RMSNorm+Mul+Add, ADD×N, single-kernel flash fusion vs
@@ -319,7 +319,7 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §4.3.10`).
    `kv_f16` dequant pass); minfer defaults f32, `MINFER_CACHE_TYPE=f16` optional,
    no quantized KV.
 5. **Multi-CB**: llama 2-CB concurrent encode; minfer single CB all layers.
-   Measured (minfer §4.3.10): llama's 2-CB split is **slower** in a pure-GEMM
+   Measured (minfer §3.6): llama's 2-CB split is **slower** in a pure-GEMM
    replay — not a speed source.
 6. **Barrier**: llama dependency-aware; minfer barriers after every dispatch.
-   Measured free (§4.3.10) — not a gap source.
+   Measured free (§3.6) — not a gap source.
