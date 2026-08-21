@@ -180,8 +180,9 @@ impl Backend for CpuBackend {
                     .weights
                     .get(&meta.weight_name)
                     .ok_or_else(|| format!("weight '{}' not registered", meta.weight_name))?;
-                let od = w.shape[0] as usize;
-                let id = w.shape[1] as usize;
+                // llama.cpp/GGUF convention: metadata [in, out], memory [out][in]
+                let od = w.shape[1] as usize; // output dim
+                let id = w.shape[0] as usize; // input dim
                 let nt = node.out_shape[1];
                 if w.ttype == crate::tensor::TensorType::F32 {
                     // plain f32 matmul: out[t*od+o] = dot(w[o], x[t])
@@ -215,16 +216,22 @@ impl Backend for CpuBackend {
                     .get(&meta.weight_name)
                     .ok_or_else(|| format!("embedding '{}' not registered", meta.weight_name))?;
                 let n_embd = node.out_shape[0];
-                let wf = w.data_f32();
-                let vocab = w.shape[1] as usize;
                 let nt = node.out_shape[1];
-                for t in 0..nt {
-                    let id = ins[0][t].to_bits() as usize; // I32 bit pattern
-                    if id >= vocab {
-                        return Err(format!("embedding id {id} >= vocab {vocab}"));
+                let ids: Vec<u32> = (0..nt).map(|t| ins[0][t].to_bits()).collect();
+                if w.ttype == crate::tensor::TensorType::F32 {
+                    let wf = w.data_f32();
+                    let vocab = w.shape[1] as usize;
+                    for (t, &id) in ids.iter().enumerate() {
+                        if (id as usize) >= vocab {
+                            return Err(format!("embedding id {id} >= vocab {vocab}"));
+                        }
+                        let src = &wf[id as usize * n_embd..(id as usize + 1) * n_embd];
+                        out[t * n_embd..(t + 1) * n_embd].copy_from_slice(src);
                     }
-                    let src = &wf[id * n_embd..(id + 1) * n_embd];
-                    out[t * n_embd..(t + 1) * n_embd].copy_from_slice(src);
+                } else {
+                    // quantized embedding: shared dequantization (forward.rs
+                    // embed_tokens — the canonical row getter)
+                    crate::models::qwen2::forward::embed_tokens(&ids, w, out, n_embd);
                 }
                 Ok(())
             }
@@ -483,9 +490,10 @@ mod tests {
     fn matmul_add_silu_scale() {
         // x [4,1] * W [3,4] + b [3] -> [3,1]; silu; *2
         let mut h = Harness::new();
+        // weight metadata [in=4, out=3]; memory = 3 rows of 4 (out-major)
         h.reg(tensor_f32(
             "W",
-            [3, 4, 1, 1],
+            [4, 3, 1, 1],
             vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
         ));
         h.reg(tensor_f32("b", [3, 1, 1, 1], vec![0.5, -1.0, 0.25]));

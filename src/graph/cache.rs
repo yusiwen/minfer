@@ -1,10 +1,15 @@
-//! Graph reuse cache (Phase 4): params-only deterministic reuse.
+//! Graph reuse cache (Phase 4→6): params-only deterministic reuse.
 //!
 //! Mirrors llama.cpp's `llm_graph_params::allow_reuse` + `llm_graph_result`
 //! reuse path. Key invariant: **graph topology is a deterministic function of
-//! `GraphParams`** — equal params ⇒ identical topology ⇒ the graph and its
-//! buffer allocation are reused as-is, only input data is refreshed. `n_past`
-//! never appears here (it is execution data).
+//! `GraphParams`** — equal params ⇒ identical topology ⇒ the graph is reused
+//! as-is, only input data is refreshed. `n_past` never appears here (it is
+//! execution data).
+//!
+//! The allocator lives inside the cache and **survives graph rebuilds**: the
+//! persistent KV regions are exactly the KV cache, so a prefill→decode
+//! transition (different `n_tokens`/`gtype` ⇒ rebuild) must not lose them.
+//! Only the node/buffer mapping is recomputed on rebuild.
 
 use super::alloc::GraphAllocator;
 use super::params::GraphParams;
@@ -12,26 +17,26 @@ use super::{ComputeGraph, NodeId};
 
 pub struct GraphCache {
     graph: Option<ComputeGraph>,
-    alloc: Option<GraphAllocator>,
+    alloc: GraphAllocator,
     prev_params: Option<GraphParams>,
 }
 
 impl Default for GraphCache {
     fn default() -> Self {
-        Self { graph: None, alloc: None, prev_params: None }
+        Self::new()
     }
 }
 
 impl GraphCache {
     pub fn new() -> Self {
-        Self::default()
+        Self { graph: None, alloc: GraphAllocator::new(), prev_params: None }
     }
 
-    /// Params-only reuse check. On success the previously stored graph + alloc
-    /// are reused without rebuilding (caller then refreshes input data).
+    /// Params-only reuse check. On success the previously stored graph is
+    /// reused without rebuilding (caller then refreshes input data).
     pub fn try_reuse(&mut self, params: &GraphParams) -> bool {
-        match (&self.prev_params, &self.graph, &self.alloc) {
-            (Some(prev), Some(_), Some(_)) if Self::params_match(prev, params) => {
+        match (&self.prev_params, &self.graph) {
+            (Some(prev), Some(_)) if Self::params_match(prev, params) => {
                 self.prev_params = Some(params.clone());
                 true
             }
@@ -47,18 +52,23 @@ impl GraphCache {
             && a.weights_version == b.weights_version
     }
 
-    /// Store a freshly built graph + allocation.
-    pub fn store(&mut self, graph: ComputeGraph, alloc: GraphAllocator, params: GraphParams) {
+    /// Store a freshly built graph. The allocator is kept (KV regions persist);
+    /// its liveness mapping is recomputed by the caller via `alloc_graph`.
+    pub fn replace_graph(&mut self, graph: ComputeGraph, params: GraphParams) {
         self.graph = Some(graph);
-        self.alloc = Some(alloc);
         self.prev_params = Some(params);
+    }
+
+    /// The allocator (weight registration before first `alloc_graph`).
+    pub fn alloc(&mut self) -> &mut GraphAllocator {
+        &mut self.alloc
     }
 
     /// Take the current graph + allocator for execution.
     pub fn current(&mut self) -> Option<(&ComputeGraph, &mut GraphAllocator)> {
-        match (&self.graph, &mut self.alloc) {
-            (Some(g), Some(a)) => Some((g, a)),
-            _ => None,
+        match &self.graph {
+            Some(g) => Some((g, &mut self.alloc)),
+            None => None,
         }
     }
 
@@ -73,20 +83,6 @@ impl GraphCache {
         prev.nodes.iter().zip(graph.nodes.iter()).all(|(a, b)| {
             a.op == b.op && a.out_shape == b.out_shape && a.src == b.src
         })
-    }
-
-    /// Debug-only: if params match but the new build differs structurally, the
-    /// builder is not deterministic — panic loudly.
-    #[cfg(debug_assertions)]
-    pub fn assert_consistent_rebuild(&self, params: &GraphParams, graph: &ComputeGraph) {
-        if let Some(prev) = &self.prev_params {
-            if Self::params_match(prev, params) && !self.verify_structural(graph) {
-                panic!(
-                    "graph rebuild with identical params produced a different topology \
-                     (builder is not deterministic)"
-                );
-            }
-        }
     }
 
     /// Node ids of the stored graph's outputs (convenience for the caller).
@@ -127,8 +123,7 @@ mod tests {
 
         let g = tiny_graph();
         let outputs_expected = g.outputs.clone();
-        let alloc = GraphAllocator::new();
-        cache.store(g, alloc, params(1, 1));
+        cache.replace_graph(g, params(1, 1));
 
         // same params -> reuse
         assert!(cache.try_reuse(&params(1, 1)));
@@ -136,7 +131,7 @@ mod tests {
         assert!(!cache.try_reuse(&params(4, 1)));
         // weights version changed (LoRA switch) -> rebuild
         assert!(!cache.try_reuse(&params(1, 2)));
-        // gtype differs (n_tokens 4 => prefill vs decode) -> rebuild
+        // gtype differs -> rebuild
         let p = GraphParams {
             n_tokens: 1,
             n_seqs: 1,
@@ -152,13 +147,18 @@ mod tests {
     }
 
     #[test]
-    fn n_past_is_not_part_of_reuse() {
-        // n_past never appears in GraphParams — the graph is reused regardless
-        // of KV position. Here we simply assert params without n_past compare
-        // equal: two identical builds reuse.
+    fn allocator_survives_rebuild() {
         let mut cache = GraphCache::new();
-        cache.store(tiny_graph(), GraphAllocator::new(), params(1, 1));
-        assert!(cache.try_reuse(&params(1, 1)));
+        cache.replace_graph(tiny_graph(), params(1, 1));
+        // rebuild with different params: allocator object identity persists
+        // (a KV persistent region registered before must still be there)
+        cache.alloc().alloc_persistent("kv.test", 16);
+        assert!(cache.alloc().get_persistent("kv.test").is_some());
+        cache.replace_graph(tiny_graph(), params(4, 1));
+        assert!(
+            cache.alloc().get_persistent("kv.test").is_some(),
+            "persistent regions must survive graph rebuilds"
+        );
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
         #[cfg(debug_assertions)]
         {
             let mut cache = GraphCache::new();
-            cache.store(tiny_graph(), GraphAllocator::new(), params(1, 1));
+            cache.replace_graph(tiny_graph(), params(1, 1));
             // a different topology with the same params must fail verification
             let mut b = GraphBuilder::new();
             let x = b.input("x", [4, 1, 1, 1], DType::F32);

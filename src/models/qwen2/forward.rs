@@ -357,7 +357,7 @@ pub fn forward(
 
 // ─── CPU helpers ────────────────────────────────────────────────────
 
-fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usize) {
+pub(crate) fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usize) {
     match t.ttype {
         TensorType::Q4_0 | TensorType::Q8_0 | TensorType::Q4_1 => {
             let is_q4_1 = t.ttype == TensorType::Q4_1;

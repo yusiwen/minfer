@@ -110,11 +110,18 @@ impl BackendScheduler {
     /// Execute the graph split by split. With a single backend there is one
     /// split and copies are no-ops; the loop structure matches llama.cpp's
     /// `compute_splits` for when cross-backend transfers arrive (Phase 3).
+    ///
+    /// Nodes execute in **build order** (the builder appends sources before
+    /// consumers, so this is a valid topological order — matching ggml, which
+    /// executes `nodes[0..n_nodes]` in order). This guarantees e.g. that a KV
+    /// store node executes before the attention that reads the KV view.
     pub fn execute(
         &self,
         graph: &ComputeGraph,
         alloc: &mut GraphAllocator,
     ) -> Result<(), String> {
+        #[cfg(debug_assertions)]
+        debug_assert!(graph.topo_order().is_ok(), "graph is not a valid DAG");
         let splits = self.split_graph(graph);
         let mut prev_backend: Option<BackendTag> = None;
         for split in &splits {
@@ -129,18 +136,21 @@ impl BackendScheduler {
             for id in split.node_range.0..split.node_range.1 {
                 let node = graph.node(id);
                 if node.is_input() {
-                    continue;
+                    continue; // data pre-filled by the allocator
                 }
+                // dead nodes (no consumers, not outputs) get no buffer — the
+                // fusion pass can orphan them (e.g. silu folded into SwiGLU);
+                // they are skipped, not executed
+                let Some(br) = alloc.node_buffer(id) else { continue };
+                // NOTE: execution follows node id order (build order), which is
+                // the graph's topological order by construction.
                 let mut in_bufs = Vec::with_capacity(node.src.len());
                 for &s in &node.src {
-                    let br = alloc
+                    let sbr = alloc
                         .node_buffer(s)
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
-                    in_bufs.push(br.id);
+                    in_bufs.push(sbr.id);
                 }
-                let br = alloc
-                    .node_buffer(id)
-                    .ok_or_else(|| format!("node {id} has no allocated buffer"))?;
                 match split.backend {
                     BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br.id)?,
                     other => {

@@ -10,6 +10,18 @@ use crate::vec_ops::RopeStyle;
 /// Architecture-agnostic model interface.
 pub trait ModelDef {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
+
+    /// Build the declarative compute graph for one forward step (Phase 5).
+    /// Topology is a deterministic function of `params` (reuse invariant).
+    fn build_graph(&self, _params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {
+        unimplemented!("build_graph not implemented for this architecture")
+    }
+
+    /// Graph-based forward (Phase 6); defaults to the imperative path.
+    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
+        self.forward(tokens, positions, kv, n_out)
+    }
+
     fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;

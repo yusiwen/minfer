@@ -1,6 +1,7 @@
 // Qwen2 model definition + ModelDef impl
 
 pub mod forward;
+pub mod graph;
 pub mod loader;
 
 use crate::cache::KVCache;
@@ -29,6 +30,14 @@ impl Qwen2Model {
 impl ModelDef for Qwen2Model {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
         forward::forward(self, tokens, positions, kv, n_out)
+    }
+
+    fn build_graph(&self, params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {
+        graph::Qwen2Graph::build(self, params)
+    }
+
+    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
+        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out)
     }
 
     fn format_chat(&self, messages: &[(String, String)]) -> String {

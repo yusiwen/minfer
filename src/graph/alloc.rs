@@ -69,9 +69,19 @@ impl GraphAllocator {
     }
 
     /// Liveness analysis + allocation for every node buffer.
+    ///
+    /// Runs on every graph (re)build: previous liveness buffers are released
+    /// back to the pool, while **persistent regions (KV cache) survive** — they
+    /// are the KV cache and must persist across prefill→decode rebuilds.
     pub fn alloc_graph(&mut self, graph: &ComputeGraph) -> Result<(), String> {
-        self.node_to_buf.clear();
+        // release previous liveness buffers (persistent/KV regions are not in
+        // buf_alive and stay untouched)
+        let prev: Vec<usize> = self.buf_alive.keys().copied().collect();
+        for id in prev {
+            self.cpu.free_buffer(id);
+        }
         self.buf_alive.clear();
+        self.node_to_buf.clear();
         let order = graph.topo_order()?;
         let n = graph.n_nodes();
 

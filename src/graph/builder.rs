@@ -89,11 +89,14 @@ impl GraphBuilder {
         )
     }
 
-    /// Matrix multiply `w @ x` (+ optional bias). Weight shape `[out, in]`.
-    /// Activations are `[n_embd, nt, 1, 1]` (features × tokens), so the
-    /// output is `[out, nt, 1, 1]`.
+    /// Matrix multiply `w @ x` (+ optional bias).
+    ///
+    /// Weight convention (llama.cpp/GGUF): the tensor metadata is `[in, out]`
+    /// (ne[0] = input dim, fastest) while memory is `[out][in]` row-major —
+    /// i.e. the output dim is `shape[1]`. Activations are `[n_embd, nt, 1, 1]`
+    /// (features × tokens), so the output is `[shape[1], nt, 1, 1]`.
     pub fn matmul(&mut self, x: NodeId, w: &Tensor, bias: Option<&Tensor>) -> NodeId {
-        let out = w.shape[0] as usize;
+        let out = w.shape[1] as usize;
         let nt = self.graph.nodes[x].out_shape[1];
         let name = format!("matmul_{}", w.name);
         self.node(
