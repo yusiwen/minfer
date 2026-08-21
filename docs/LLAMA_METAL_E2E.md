@@ -192,7 +192,7 @@
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| 10.1 | KV tensor creation | `ggml_new_tensor_3d(ctx, type_k/v, n_embd_k_gqa, kv_size, n_stream)`, default **F16** | `llama-kv-cache.cpp:231-232` | `src/cache.rs` (KV in f32, optional f16) |
+| 10.1 | KV tensor creation | `ggml_new_tensor_3d(ctx, type_k/v, n_embd_k_gqa, kv_size, n_stream)`, default **F16** | `llama-kv-cache.cpp:231-232` | `src/cache.rs` (GPU KV f16 auto for 7B class / f32 for small, `MINFER_CACHE_TYPE` overrides) |
 | 10.2 | Per-layer device allocation | per-layer backend buft, allocate + clear | `llama-kv-cache.cpp:299,307` | `src/metal.rs` (KV buffer allocation) |
 | 10.3 | Slot lookup | `find_slot`: ring-buffer cell range + k/v idx tensors | `llama-kv-cache.cpp:894` | `src/metal.rs: store_kv` writes by `pos_buf` |
 | 10.4 | In-graph write | `cpy_k`/`cpy_v` → `ggml_set_rows` (K always cache-row indexed; V per FA/non-FA layout) | `llama-kv-cache.cpp:1301-1389` | `src/metal.rs:866` (store_kv, `nkt`/`nt` strides) |
@@ -318,8 +318,8 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
    minfer's mostly-separate dispatches (§3.4) — the source of the
    per-layer dispatch-count difference in decode/prefill.
 4. **KV format**: llama defaults f16 + optional quantized KV (since #27390, a
-   `kv_f16` dequant pass); minfer defaults f32, `MINFER_CACHE_TYPE=f16` optional,
-   no quantized KV.
+   `kv_f16` dequant pass); minfer auto-selects f16 for the 7B class / f32 for small models (#37,
+   `MINFER_CACHE_TYPE=f16/f32` overrides), no quantized KV.
 5. **Multi-CB**: llama 2-CB concurrent encode; minfer single CB all layers.
    Measured (minfer §3.6): llama's 2-CB split is **slower** in a pure-GEMM
    replay — not a speed source.

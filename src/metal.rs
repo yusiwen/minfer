@@ -70,13 +70,27 @@ pub fn concat_rows(tensors: &[&Tensor]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// KV cache element type for the GPU path. Defaults to f32; `MINFER_CACHE_TYPE=f16`
-/// switches to a half cache (llama.cpp's default). f16 halves attention memory
-/// bandwidth but showed a ~15% decode regression on the 0.5B model (decode is
-/// dispatch-latency-bound, not KV-bandwidth-bound), so it is opt-in.
+/// KV cache element type for the GPU path. `MINFER_CACHE_TYPE=f16` forces a
+/// half cache (llama.cpp's default); `MINFER_CACHE_TYPE=f32` forces f32. When
+/// unset, `set_kv_cache_type` (called at model load with the model dims)
+/// auto-selects: f16 for the 7B class (n_layers×n_kv_embd ≥ 8192 — KV
+/// bandwidth-bound decode; measured 7B @2K ctx f16 ≈ −1 ms/token vs f32),
+/// f32 for small models (0.5B measured f16 ~3% SLOWER — dispatch-latency-bound,
+/// see §0 decided-not #8 / §2.5).
+static KV_F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 pub fn kv_cache_is_f16() -> bool {
-    static F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F16.get_or_init(|| std::env::var("MINFER_CACHE_TYPE").map_or(false, |v| v == "f16"))
+    *KV_F16.get_or_init(|| false)
+}
+
+/// Called once at model load with the model dims, BEFORE the first forward:
+/// sets the GPU KV cache element type (auto-select or MINFER_CACHE_TYPE).
+pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
+    let f16 = std::env::var("MINFER_CACHE_TYPE").map_or(
+        n_layers * n_kv_embd >= 8192, // auto: 7B class → f16
+        |v| v == "f16",
+    );
+    let _ = KV_F16.set(f16);
 }
 
 /// Use the 256-thread multi-simdgroup rms_norm in the decode path (P1 2026-08-10
