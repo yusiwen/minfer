@@ -172,6 +172,7 @@ struct MpsStateInner {
     pl_q5_k_f32_multi: metal::ComputePipelineState,
     pl_q5_k_mm_f32: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
+    pl_get_rows_f32: metal::ComputePipelineState,
     pl_get_rows_q4_k: metal::ComputePipelineState,
     pl_get_rows_q4_1: metal::ComputePipelineState,
     pl_get_rows_q5_0: metal::ComputePipelineState,
@@ -649,6 +650,19 @@ impl MpsCommandBuffer<'_> {
         self.set_params(3, &(ne as i32));
         self.set_params(4, &(nt as i32));
         self.dispatch_1d((nt * nb) as u64, 256);
+    }
+
+    /// Generic f32 row selection: out[t] = x[ids[t]] (graph n_out tail rows).
+    pub fn get_rows_f32(&self, x: &metal::Buffer, ids: &metal::Buffer,
+        out: &metal::Buffer, ne: usize, nt: usize,
+    ) {
+        self.trace_op("get_rows_f32");
+        self.enc.set_compute_pipeline_state(&self.state.pl_get_rows_f32);
+        self.enc.set_buffer(0, Some(x), 0);
+        self.enc.set_buffer(1, Some(ids), 0);
+        self.enc.set_buffer(2, Some(out), 0);
+        self.set_params(3, &(ne as i32));
+        self.dispatch_2d(nt as u64, ne as u64, 1, 1);
     }
 
     /// RMSNorm: y = x * rsqrt(mean(x²)+eps) * w
@@ -1256,6 +1270,7 @@ impl MpsState {
             let pl_q5_k_mm_f32 = get_pl("kernel_q5_k_mm_f32")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
+            let pl_get_rows_f32 = get_pl("kernel_get_rows_f32")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
             let pl_get_rows_q4_1 = get_pl("kernel_get_rows_q4_1")?;
             let pl_get_rows_q5_0 = get_pl("kernel_get_rows_q5_0")?;
@@ -1329,6 +1344,7 @@ impl MpsState {
                 pl_q5_k_f32_multi,
                 pl_q5_k_mm_f32,
                 pl_get_rows_q4_0,
+                pl_get_rows_f32,
                 pl_get_rows_q4_k,
                 pl_get_rows_q4_1,
                 pl_get_rows_q5_0,

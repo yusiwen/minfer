@@ -245,8 +245,23 @@ impl Backend for CpuBackend {
             }
             Op::GetRows => {
                 let meta = match &node.meta {
-                    NodeMeta::Embed(m) => m,
-                    other => return Err(format!("get_rows node missing EmbedMeta: {other:?}")),
+                    NodeMeta::Embed(m) => Some(m),
+                    NodeMeta::None => None, // generic row selection: x[ids]
+                    other => return Err(format!("get_rows node with unexpected meta: {other:?}")),
+                };
+                let Some(meta) = meta else {
+                    // generic gather: out[t*n+i] = x[ids[t]*n+i]
+                    let n_embd = node.out_shape[0];
+                    let nt = node.out_shape[1];
+                    for t in 0..nt {
+                        let id = ins[1][t].to_bits() as usize; // ids (I32)
+                        if (id + 1) * n_embd > ins[0].len() {
+                            return Err(format!("get_rows index {id} out of range"));
+                        }
+                        out[t * n_embd..(t + 1) * n_embd]
+                            .copy_from_slice(&ins[0][id * n_embd..(id + 1) * n_embd]);
+                    }
+                    return Ok(());
                 };
                 let w = self
                     .weights
@@ -661,5 +676,32 @@ mod tests {
         assert!((got[1] - 0.5).abs() < 1e-5, "got[1]={}", got[1]);
         assert!((got[2] - 0.25).abs() < 1e-5, "got[2]={}", got[2]);
         assert!((got[3] - 0.75).abs() < 1e-5, "got[3]={}", got[3]);
+    }
+
+    /// Generic get_rows (n_out tail selection): out[t] = x[ids[t]].
+    #[test]
+    fn cpu_generic_get_rows() {
+        let mut gb = GraphBuilder::new();
+        let x = gb.input("x", [4, 3, 1, 1], DType::F32);
+        let ids = gb.input("ids", [1, 1, 1, 1], DType::I32);
+        let r = gb.get_rows(x, ids, [4, 1, 1, 1]);
+        gb.output(r);
+        let g = gb.build();
+
+        let mut sched = BackendScheduler::new();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        // rows: r0=[1,2,3,4] r1=[10,20,30,40] r2=[100,200,300,400]
+        alloc.fill_input(&g, "x", &[1.0,2.0,3.0,4.0, 10.0,20.0,30.0,40.0, 100.0,200.0,300.0,400.0]).unwrap();
+        alloc.fill_input_i32(&g, "ids", &[2]).unwrap();
+        sched.execute(&g, &mut alloc).unwrap();
+        let got = alloc.get_buffer(&g, r).unwrap();
+        assert_eq!(got, &[100.0, 200.0, 300.0, 400.0], "get_rows should select row 2");
+
+        // ids = [0]
+        alloc.fill_input_i32(&g, "ids", &[0]).unwrap();
+        sched.execute(&g, &mut alloc).unwrap();
+        let got = alloc.get_buffer(&g, r).unwrap();
+        assert_eq!(got, &[1.0, 2.0, 3.0, 4.0], "get_rows should select row 0");
     }
 }

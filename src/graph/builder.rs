@@ -116,6 +116,12 @@ impl GraphBuilder {
         )
     }
 
+    /// Generic row selection: `out[t] = x[ids[t]]` (llama `ggml_get_rows`;
+    /// also used for the n_out tail-row reduction). `ids` is an I32 input.
+    pub fn get_rows(&mut self, x: NodeId, ids: NodeId, out_shape: [usize; 4]) -> NodeId {
+        self.node("get_rows", Op::GetRows, &[x, ids], out_shape, DType::F32, NodeMeta::None)
+    }
+
     /// RoPE. `pos` is an input node carrying per-token positions (data).
     pub fn rope(&mut self, x: NodeId, pos: NodeId, style: RopeStyle, meta: RoPEMeta) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;

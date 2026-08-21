@@ -236,18 +236,26 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::GetRows => {
-                let meta = match &node.meta {
-                    NodeMeta::Embed(m) => m,
-                    other => return Err(format!("get_rows node missing EmbedMeta: {other:?}")),
-                };
-                let (wb, w_off) = self
-                    .state
-                    .weight_buf(&meta.weight_name)
-                    .ok_or_else(|| format!("embedding '{}' not on GPU", meta.weight_name))?;
-                let ne = node.out_shape[0];
-                let nt = node.out_shape[1];
-                cb.embed_tokens_gpu(&wb, w_off, self.buf(in_bufs[0]), self.buf(out_buf), ne, nt, meta.weight_ttype);
-                Ok(())
+                match &node.meta {
+                    NodeMeta::Embed(m) => {
+                        let (wb, w_off) = self
+                            .state
+                            .weight_buf(&m.weight_name)
+                            .ok_or_else(|| format!("embedding '{}' not on GPU", m.weight_name))?;
+                        let ne = node.out_shape[0];
+                        let nt = node.out_shape[1];
+                        cb.embed_tokens_gpu(&wb, w_off, self.buf(in_bufs[0]), self.buf(out_buf), ne, nt, m.weight_ttype);
+                        Ok(())
+                    }
+                    NodeMeta::None => {
+                        // generic row selection: out[t] = x[ids[t]] (n_out tail)
+                        let ne = node.out_shape[0];
+                        let nt = node.out_shape[1];
+                        cb.get_rows_f32(self.buf(in_bufs[0]), self.buf(in_bufs[1]), self.buf(out_buf), ne, nt);
+                        Ok(())
+                    }
+                    other => Err(format!("get_rows node with unexpected meta: {other:?}")),
+                }
             }
             Op::RoPE { style } => {
                 let meta = match &node.meta {

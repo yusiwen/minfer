@@ -89,7 +89,19 @@ impl Qwen2Graph {
 
             // output projection + residual
             let wo = b.matmul(attn_out, l.wo.as_ref().unwrap(), None);
-            h = b.add(residual, wo);
+            let is_last = il == model.layers.len() - 1;
+            if is_last && params.n_out < nt {
+                // G3: reduce to the tail n_out rows BEFORE the last layer's FFN
+                // (llama `ggml_get_rows(cur/inpSA, inp_out_ids)` at
+                // qwen2.cpp:106-108) — ffn_norm, gate/up/down, swiglu, both
+                // residuals and lm_head all run on n_out rows only.
+                let tail_ids = b.input("tail_ids", [params.n_out, 1, 1, 1], crate::graph::DType::I32);
+                let cur_tail = b.get_rows(wo, tail_ids, [ne, params.n_out, 1, 1]);
+                let res_tail = b.get_rows(residual, tail_ids, [ne, params.n_out, 1, 1]);
+                h = b.add(res_tail, cur_tail);
+            } else {
+                h = b.add(residual, wo);
+            }
 
             // FFN (SwiGLU); built as silu+mul so the fusion pass folds it
             let residual = h;
@@ -155,6 +167,7 @@ impl Qwen2Graph {
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
+            n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams {
                 n_ctx: model.hparams.max_seq_len as usize,
@@ -206,6 +219,12 @@ impl Qwen2Graph {
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         let pos: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
+        // G3: the last-layer tail-row reduction reads `tail_ids` (filled when
+        // the graph was built with n_out < nt, i.e. prefill)
+        if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
+            let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
+            alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
+        }
         if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
             if let Some(idsbuf) = graph.inputs.iter().find(|&&i| graph.node(i).name == "token_ids").copied() {
                 let v = alloc.copy_to_cpu(idsbuf).unwrap_or_default();
@@ -246,12 +265,13 @@ impl Qwen2Graph {
             eprintln!("[graph dump] wrote {dir}/logits_{tag}.f32 ({} elems)", logits.len());
         }
 
-        // extract the last n_out rows of logits ([nv, nt] → [n_out * nv]);
-        // the logits may live on any backend — host copy always works
+        // extract the tail n_out rows of logits. With G3 the graph already
+        // reduced the last layer + lm_head to n_out rows (buffer = n_out*nv);
+        // without it (decode, n_out == nt) the buffer is nv*nt == n_out*nv.
+        // Either way the first n_out*nv elements are the answer.
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
-        let off = (nt - n_out) * nv;
-        logits[off..off + n_out * nv].to_vec()
+        logits[..n_out * nv].to_vec()
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.
@@ -377,6 +397,7 @@ mod tests {
             let params = GraphParams {
                 n_tokens: nt,
                 n_seqs: 1,
+                n_out: 1,
                 gtype: GraphType::Prefill,
                 cparams: CParams { n_ctx, n_batch: nt, flash_attn: false, gpu: false },
                 weights_version: 1,
@@ -404,6 +425,7 @@ mod tests {
             let dparams = GraphParams {
                 n_tokens: 1,
                 n_seqs: 1,
+                n_out: 1,
                 gtype: GraphType::Decode,
                 cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: false },
                 weights_version: 1,
@@ -663,5 +685,186 @@ mod tests {
             eprintln!("[real wk matmul] vs manual Q4_0xf32: max diff {m2:.3e}");
             assert!(m2 < 5e-3, "real wk Metal diverges from Q4_0xf32 reference: {m2:.3e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use crate::models::ModelDef;
+
+    fn model_path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
+        if p.exists() { Some(p) } else { None }
+    }
+
+    /// G3 correctness: the n_out=1 (reduced) graph must produce the same last
+    /// token logits as the full-nt (n_out=nt) graph, node by node through the
+    /// tail block (wo → get_rows → tail add → ffn → output). This also guards
+    /// the allocator's build-order liveness (scheduler executes in build
+    /// order; a topo-order liveness pass would free still-alive inputs).
+    #[test]
+    fn tail_reduction_matches_full_nt() {
+        use crate::graph::alloc::GraphAllocator;
+        use crate::graph::scheduler::BackendScheduler;
+        use crate::graph::params::{CParams, GraphParams, GraphType};
+        use crate::graph::ops::Op;
+        let Some(path) = model_path() else {
+            eprintln!("not cached; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let nt = ids.len();
+        let nv = model.n_vocab();
+
+        /// Identify the semantic nodes of the final block by src-chain. Works
+        /// for both the full graph (n_out=nt) and the reduced graph (n_out=1,
+        /// tail get_rows inserted after wo).
+        fn semantic_nodes(g: &crate::graph::ComputeGraph) -> Vec<(usize, &'static str)> {
+            let q_matmul = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_q.weight").unwrap();
+            let q_rope = g.nodes.iter().position(|n| matches!(n.op, Op::RoPE { .. }) && n.src[0] == q_matmul).unwrap();
+            let attn = g.nodes.iter().position(|n| matches!(n.op, Op::Attn { .. }) && n.src[0] == q_rope).unwrap();
+            let wo = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_output.weight").unwrap();
+            // post-attn add: full -> add(src wo); reduced -> add(get_rows(wo), get_rows(h))
+            let add_after_wo = g.nodes.iter().position(|n| {
+                matches!(n.op, Op::Add)
+                    && n.src.iter().any(|&s| {
+                        s == wo || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wo
+                    })
+            }).unwrap();
+            let ffn_norm = g.nodes.iter().position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == add_after_wo).unwrap();
+            let gate = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_gate.weight").unwrap();
+            let up = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_up.weight").unwrap();
+            // FusionPass merges silu+mul into a single SwiGLU node
+            let swiglu = g.nodes.iter().position(|n| matches!(n.op, Op::SwiGLU) && n.src.contains(&gate)).unwrap();
+            let down = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_down.weight").unwrap();
+            let post_ffn = g.nodes.iter().position(|n| matches!(n.op, Op::Add) && n.src.contains(&down)).unwrap();
+            let out_norm = g.nodes.iter().position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == post_ffn).unwrap();
+            let lm = g.nodes.iter().position(|n| n.name == "matmul_output.weight").unwrap();
+            vec![
+                (q_matmul, "q_matmul"), (q_rope, "q_rope"), (attn, "attn"),
+                (wo, "wo"), (add_after_wo, "post_attn_add"), (ffn_norm, "ffn_norm"),
+                (gate, "gate"), (up, "up"), (swiglu, "swiglu"),
+                (down, "down"), (post_ffn, "post_ffn_add"), (out_norm, "output_norm"),
+                (lm, "lm_head"),
+            ]
+        }
+
+        /// Build + execute a graph for n_out, keeping the given node ids alive
+        /// as graph outputs (so post-exec dumps are not clobbered by liveness
+        /// reuse). Returns (graph, allocator).
+        fn run_keep(
+            q2: &Qwen2Model, ids: &[u32], n_out: usize,
+            keep: &[usize],
+        ) -> (crate::graph::ComputeGraph, crate::graph::alloc::GraphAllocator) {
+            use crate::graph::params::{CParams, GraphParams, GraphType};
+            let model: &dyn ModelDef = q2;
+            let nt = ids.len();
+            let params = GraphParams {
+                n_tokens: nt, n_seqs: 1, n_out,
+                gtype: GraphType::Prefill,
+                cparams: CParams { n_ctx: 4096, n_batch: nt, flash_attn: false, gpu: false },
+                weights_version: 1,
+            };
+            let mut graph = model.build_graph(&params);
+            for &i in keep {
+                if !graph.outputs.contains(&i) { graph.outputs.push(i); }
+            }
+            let sched = BackendScheduler::new();
+            let mut alloc = GraphAllocator::new();
+            Qwen2Graph::register_graph_weights(q2, &mut alloc);
+            sched.assign_backends(&mut graph, &alloc);
+            let backends: [&dyn Backend; 1] = [alloc.cpu()];
+            FusionPass::new().run(&mut graph, &backends, &|_, _| Some(0));
+            alloc.alloc_graph(&graph).unwrap();
+            let ids32: Vec<u32> = ids.iter().copied().collect();
+            let pos32: Vec<u32> = (0..nt as u32).collect();
+            alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
+            alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
+            if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
+                let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
+                alloc.fill_input_i32(&graph, "tail_ids", &tail).unwrap();
+            }
+            sched.execute(&graph, &mut alloc).unwrap();
+            (graph, alloc)
+        }
+
+        // Discover semantic nodes on throwaway graphs, then re-run with those
+        // nodes (plus their get_rows inputs) kept alive.
+        let (fg0, _) = run_keep(q2, &ids, nt, &[]);
+        let (rg0, _) = run_keep(q2, &ids, 1, &[]);
+        let fsem = semantic_nodes(&fg0);
+        let rsem = semantic_nodes(&rg0);
+        let mut fkeep: Vec<usize> = fsem.iter().map(|&(i, _)| i).collect();
+        let mut rkeep: Vec<usize> = rsem.iter().map(|&(i, _)| i).collect();
+        for g in [&fg0, &rg0] {
+            let wo_id = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_output.weight");
+            if let Some(wi) = wo_id {
+                if let Some(addi) = g.nodes.iter().position(|n| {
+                    matches!(n.op, Op::Add)
+                        && n.src.iter().any(|&s| {
+                            s == wi || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wi
+                        })
+                }) {
+                    let target = if std::ptr::eq(g, &fg0) { &mut fkeep } else { &mut rkeep };
+                    for &s in &g.nodes[addi].src {
+                        if !target.contains(&s) { target.push(s); }
+                        // in the reduced graph the src is a get_rows: also keep
+                        // the h / wo buffer it reads
+                        if matches!(g.nodes[s].op, Op::GetRows) {
+                            for &s2 in &g.nodes[s].src {
+                                if !target.contains(&s2) { target.push(s2); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        drop(fg0); drop(rg0);
+
+        let (fg, mut fa) = run_keep(q2, &ids, nt, &fkeep);
+        let (rg, mut ra) = run_keep(q2, &ids, 1, &rkeep);
+
+        // KV load at layer 23 must be identical (attention path preserved)
+        let fkv = fg.nodes.iter().position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
+        let rkv = rg.nodes.iter().position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
+        if let (Some(fk), Some(rk)) = (fkv, rkv) {
+            let a = fa.copy_to_cpu(fk).unwrap();
+            let b = ra.copy_to_cpu(rk).unwrap();
+            let kvd = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0f32, f32::max);
+            assert!(kvd < 1e-5, "kv.23 diverges: {kvd:.3e}");
+        }
+
+        // Full graph: every node holds nt rows. Reduced graph: same nt rows
+        // before wo, 1 row after the tail get_rows. Compare the LAST row of
+        // each (they describe the same token nt-1).
+        for (fl, rl) in fsem.iter().zip(rsem.iter()) {
+            let (fi, flab) = *fl;
+            let (ri, _) = *rl;
+            let a = fa.copy_to_cpu(fi).unwrap();
+            let b = ra.copy_to_cpu(ri).unwrap();
+            let al = a.len();
+            let full_row = al / nt; // row width in the full graph (row count == nt)
+            let row_f: Vec<f32> = a[al - full_row..].to_vec();
+            let row_b: Vec<f32> = if b.len() >= full_row { b[b.len() - full_row..].to_vec() } else { b.clone() };
+            let d = (0..row_f.len().min(row_b.len()))
+                .map(|i| (row_f[i] - row_b[i]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(d < 1e-5, "{flab} diverges: {d:.3e}");
+        }
+
+        let full_last: Vec<f32> = fa.copy_to_cpu(fg.outputs[0]).unwrap();
+        let reduced_last: Vec<f32> = ra.copy_to_cpu(rg.outputs[0]).unwrap();
+        let mut maxd = 0.0f32;
+        for i in 0..nv {
+            maxd = maxd.max((full_last[nv * (nt - 1) + i] - reduced_last[i]).abs());
+        }
+        assert!(maxd < 1e-5, "tail reduction diverges: {maxd:.3e}");
     }
 }

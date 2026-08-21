@@ -38,6 +38,10 @@ impl Default for CParams {
 pub struct GraphParams {
     pub n_tokens: usize,
     pub n_seqs: usize,
+    /// Number of output (tail) rows: the last layer's FFN + lm_head run on the
+    /// last `n_out` rows only (llama `inp_out_ids`). Part of the topology —
+    /// a change forces a rebuild.
+    pub n_out: usize,
     pub gtype: GraphType,
     pub cparams: CParams,
     /// Bumped by the model whenever weights change (LoRA switch, reload).

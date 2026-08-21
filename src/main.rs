@@ -341,6 +341,7 @@ fn main() {
         let gparams = GraphParams {
             n_tokens: input_ids.len(),
             n_seqs: 1,
+            n_out: 1,
             gtype: if input_ids.len() == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams { n_ctx: params.n_ctx, n_batch: input_ids.len(), flash_attn: false, gpu: false },
             weights_version: 1,

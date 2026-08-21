@@ -2482,6 +2482,22 @@ template [[host_name("kernel_get_rows_q8_0")]] kernel get_rows_q32_t kernel_get_
 template [[host_name("kernel_get_rows_q6_k")]] kernel get_rows_q256_t kernel_get_rows_q256<210, dequant_q6_k_16>;
 template [[host_name("kernel_get_rows_q5_k")]] kernel get_rows_q256_t kernel_get_rows_q256<176, dequant_q5_k_16>;
 
+// Generic f32 row selection (llama ggml_get_rows for f32 data): the graph's
+// n_out tail-row reduction. One thread per (row, element):
+//   out[t*ne + i] = x[ids[t]*ne + i]
+kernel void kernel_get_rows_f32(
+    device const float  * x    [[buffer(0)]],
+    device const int    * ids  [[buffer(1)]],
+    device       float  * out  [[buffer(2)]],
+    constant    int     & ne   [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int t = tid.x;
+    int i = tid.y;
+    int id = ids[t];
+    out[t * ne + i] = x[id * ne + i];
+}
+
 // ─── GPU warm-up read (2026-08-21, METAL_OPTIMIZATIONS #39) ─────
 // Dummy full-buffer read at model load: the FIRST GPU access to file-backed
 // (mmap) pages costs ~44 ms of one-time page/TLB setup per process; running a

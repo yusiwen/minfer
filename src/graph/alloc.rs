@@ -114,7 +114,14 @@ impl GraphAllocator {
         self.buf_alive.clear();
         self.node_to_buf.clear();
 
-        let order = graph.topo_order()?;
+        // The scheduler executes nodes in BUILD order (node id order — the
+        // builder appends sources before consumers), so liveness must use the
+        // same order: topo_order() can reorder srcless nodes (kv_load) ahead,
+        // which would let a later consumer's buffer reuse clobber an input the
+        // scheduler has not yet read (G3 tail get_rows regression). Validate
+        // acyclicity, but keep build order.
+        graph.topo_order()?;
+        let order: Vec<NodeId> = (0..graph.n_nodes()).collect();
         let n = graph.n_nodes();
 
         let mut exec = vec![0usize; n];
@@ -131,6 +138,13 @@ impl GraphAllocator {
         }
         for &o in &graph.outputs {
             last_use[o] = order.len();
+        }
+        // Inputs are filled on the host BEFORE execution starts, so every
+        // input buffer is live at fill time; liveness (which tracks execution
+        // order) must never reuse an input's buffer for another input — the
+        // later fill would clobber the earlier one. Treat inputs like outputs.
+        for &i in &graph.inputs {
+            last_use[i] = order.len();
         }
 
         // consumer counts (for in-place alias safety: an input may only be

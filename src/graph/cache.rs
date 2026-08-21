@@ -47,6 +47,7 @@ impl GraphCache {
     fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
         a.n_tokens == b.n_tokens
             && a.n_seqs == b.n_seqs
+            && a.n_out == b.n_out
             && a.gtype == b.gtype
             && a.cparams == b.cparams
             && a.weights_version == b.weights_version
@@ -102,6 +103,7 @@ mod tests {
         GraphParams {
             n_tokens,
             n_seqs: 1,
+            n_out: 1,
             gtype: if n_tokens == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: Default::default(),
             weights_version,
@@ -135,6 +137,7 @@ mod tests {
         let p = GraphParams {
             n_tokens: 1,
             n_seqs: 1,
+            n_out: 1,
             gtype: GraphType::Prefill,
             cparams: Default::default(),
             weights_version: 1,

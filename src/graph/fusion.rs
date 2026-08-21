@@ -148,6 +148,7 @@ mod tests {
         GraphParams {
             n_tokens: 4,
             n_seqs: 1,
+            n_out: 1,
             gtype: GraphType::Prefill,
             cparams: Default::default(),
             weights_version: 1,
