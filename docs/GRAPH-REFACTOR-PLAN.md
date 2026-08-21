@@ -924,6 +924,7 @@ Phase 8: Verification
 | Phase 6 | Wiring + Cleanup：**forward.rs 已删除**（`6af12a4`）；`ModelDef::forward` 路由到图路径（默认）；`embed_tokens` 移至 kernel.rs；`--graph` 保留为兼容空操作 | ✅ | `2acfe83` + `6af12a4` | 删除后全套 78 通过；CLI 默认路径输出与旧实现一致 |
 | Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | 本机无 nvcc（构建警告 CUDA 禁用），无法编译/验证；待有 CUDA 环境后按 §9 包装（supports_op 按现有能力矩阵、保留 CUDA Graph 以 uid 为键） |
 | Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | ✅ | `6af12a4` | ✅ 0.5B Q4_0 新旧 logits **逐位一致**（max diff 0.0，prefill+decode）；✅ **7B Q4_K_M GPU 图路径**：输出流畅（"Hello! How can I assist you today"，42.3 tok/s）；✅ `--dump-graph` 导出（437 节点）；✅ `--graph` 为默认路径 |
+| Phase 9 (G1-G3) | MetalBackend 接线优化：attention 分发（G1）+ `rms_norm_256`（G2）+ `n_out` 尾部行收缩（G3，llama `inp_out_ids` 同款）；附带修复两个 allocator liveness bug | ✅ | `32b0d03` + `8febf4c` | 全套 80 通过（1 个既有环境失败不变）；0.5B decode KV206 2.1×、prefill pp440 +~55 % vs 旧路径；7B decode ≈ 旧路径；0.5B/7B greedy 输出与 G1 前一致；`tail_reduction_matches_full_nt` 逐节点对比通过（wo→get_rows→tail add→ffn→logits 全 0.000） |
 
 ### 实施中偏离计划文档的记录
 
@@ -942,9 +943,13 @@ Phase 8: Verification
 13. **matmul 权重采用 llama.cpp/GGUF 布局**：元数据 `[in, out]`（ne[0]=in 最快）、内存 `[out][in]` 行主序 → `od = shape[1]`、`id = shape[0]`（Phase 2 测试初版误用 `[out, in]`，已修正）。
 14. **KV 持久区跨图重建存活**：`GraphCache` 持有 allocator，重建只换图、不清 KV 区（prefill→decode 触发重建时 KV 不丢）——对应 llama.cpp KV 在 memory context 而非 graph buffer。
 15. **调度器按构建序执行**（ggml 同款 `nodes[0..n]`），保证 KV store 先于读它的 attention；融合产生的孤儿节点（无消费者）跳过不执行。
-16. **n_out 尾部行优化（GetRows）推迟**：现图路径按全 nt 计算、仅提取尾部 logits 行——采样行数值与旧路径逐位一致（logits max diff = 0.0 已验证）；优化属纯省算不改数值。
+16. **n_out 尾部行优化（GetRows）已实现（G3，`8febf4c`）**：原计划"全 nt 计算、仅提取尾部行"已替换为 llama.cpp 同款方案——末层 `wo` 之后插 `GetRows(wo/residual, tail_ids)`（`tail_ids` 为 I32 输入，prefill 填 `[(nt-n_out)..nt)`；decode nt==1 时 n_out==nt 不建节点），末层 FFN + output_norm + lm_head 全部只在尾部 `n_out` 行上运行；`GraphParams.n_out` 参与复用判定（`cache::params_match`）。0.5B prefill pp440 ~3900-4000 t/s（+~55 % vs 旧路径；G1/G2 后 ~2600）。
 17. **Phase 6 已删 forward.rs**（`6af12a4`）：logits 逐位一致验证通过后删除；`embed_tokens` 移入 `kernel.rs`；`--graph` 保留为兼容空操作（图路径已是默认）。
 18. **in-place 算子缓冲别名**（Phase 3 关键修复）：`Silu`/`RoPE` 的输出缓冲与输入缓冲**别名**（同后端且输入唯一消费者时）——避免 host 侧拷贝在批处理（单 command buffer）下读取 GPU 未写数据（此 bug 曾致 KV 区全 0、输出乱码；修复后 437 节点单 cb 正确）。跨后端输入仍分配独立缓冲（生产者已完成的拷贝是安全的）。
 19. **后端配置进入复用判定**：`CParams.gpu` 标志——backend 分配是构图的一部分，MPS 初始化变化（如测试间）必须触发重建。
 20. **每层 KV = 两个独立持久区（k、v）**（Phase 3 定型，替代 Phase 1 的 [K|V] 连续布局）：CPU/Metal 对称，attention 经 `kv_pair(layer)` 取兄弟区。
+21. **MetalBackend 接线优化 G1/G2（`32b0d03`）**：`Attn` 按 nt/hd 分发 flash/split/parallel/classic（门控与旧路径一致：`flash_attn_enabled(hd)`、`prefill_flash_enabled(hd)`、`matmul_attn_enabled()`、`MINFER_NO_*`、`MINFER_ATTN_CHUNKS`）；`RmsNorm` 用 `rms_norm_256`（`rms_norm_256_enabled()` 时）。纯接线，内核早已隔离测试。
+22. **allocator liveness 必须与调度器执行序一致（G3 修复，`8febf4c`）**：scheduler 按构建序（node id 序）执行，而 allocator 原先用 `topo_order()`（Kahn）算 liveness——Kahn 会把无 src 的 `kv_load` 等排前，导致 liveness 认为某输入已死、其缓冲被后续节点复用，但调度器实际还没读到它（G3 尾部收缩图：attn 复用了 residual h 的缓冲，`get_rows(h)` 读到的却是 attn 输出，logits 差 21.79）。修复：allocator 改用构建序做 liveness（`topo_order` 仅做环校验）。
+23. **input 缓冲永不释放（G3 修复，`8febf4c`）**：所有输入在 execute 前由 host 填充，若两个 input 的缓冲被 liveness 复用为同一块，后填的会覆盖先填的（`embedding_and_rope` 回归：token_ids 被 positions 覆盖）。修复：input 与 output 同等待遇（`last_use = order.len()`）。
+24. **G1-G3 实测（M4 Pro，`--temp 0` greedy）**：0.5B decode KV206 ~122 → **~256 t/s**（2.1×，≈旧路径）；0.5B prefill pp440 **~3900-4000 t/s**（+~55 % vs 旧路径 2530-2620）；7B decode KV206 ~32.5 → **~49 t/s**（≈旧路径 ~48）；7B prefill pp206 ~217 t/s（≈旧路径 ~240，−10 %，attention 非瓶颈）。greedy 输出与 G1 前逐 token 一致（flash/split/parallel 与 classic 数值一致；tail 收缩图与全 nt 图 logits 逐位一致）。
 5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
