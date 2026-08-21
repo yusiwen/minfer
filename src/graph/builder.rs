@@ -66,7 +66,10 @@ impl GraphBuilder {
             &[ids],
             out_shape,
             DType::F32,
-            NodeMeta::Embed(EmbedMeta { vocab_size: weight.shape[1] as usize }),
+            NodeMeta::Embed(EmbedMeta {
+                vocab_size: weight.shape[1] as usize,
+                weight_name: weight.name.clone(),
+            }),
         )
     }
 
@@ -132,11 +135,26 @@ impl GraphBuilder {
         self.node("softmax", Op::Softmax { dim }, &[x], shape, DType::F32, NodeMeta::None)
     }
 
-    /// Attention over a KV region produced by `kvcache_load`.
-    /// Output shape = q shape.
-    pub fn attn(&mut self, q: NodeId, kv: NodeId, mode: AttnMode, meta: AttnMeta) -> NodeId {
+    /// Attention over a KV region produced by `kvcache_load`. `pos` carries the
+    /// per-token write positions (I32 input), needed for causal masking
+    /// (`vl = pos[t]+1`). Output shape = q shape.
+    pub fn attn(
+        &mut self,
+        q: NodeId,
+        kv: NodeId,
+        pos: NodeId,
+        mode: AttnMode,
+        meta: AttnMeta,
+    ) -> NodeId {
         let shape = self.graph.nodes[q].out_shape;
-        self.node("attn", Op::Attn { mode }, &[q, kv], shape, DType::F32, NodeMeta::Attn(meta))
+        self.node(
+            "attn",
+            Op::Attn { mode },
+            &[q, kv, pos],
+            shape,
+            DType::F32,
+            NodeMeta::Attn(meta),
+        )
     }
 
     /// Fused SwiGLU (fusion-pass target; backends without a fused kernel

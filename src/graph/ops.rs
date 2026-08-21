@@ -103,18 +103,25 @@ pub struct NormMeta {
     pub bias_name: Option<String>,
 }
 
+/// RoPE params. `n_head`/`hd` are needed by the kernel (the rope applies per
+/// head over `hd` dims), so they ride in the metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoPEMeta {
     pub freq_base: f32,
     pub freq_scale: f32,
+    pub n_head: usize,
+    pub hd: usize,
 }
 
+/// Attention params. `nkt` = KV row stride (n_embd), `scale` = QK scale.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttnMeta {
     pub n_head: usize,
     pub n_head_kv: usize,
     pub hd: usize,
     pub hd_kv: usize,
+    pub nkt: usize,
+    pub scale: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,4 +133,5 @@ pub struct KvcacheMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbedMeta {
     pub vocab_size: usize,
+    pub weight_name: String,
 }

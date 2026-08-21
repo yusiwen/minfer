@@ -6,8 +6,11 @@
 //! backend scheduler (Phase 4).
 
 pub mod alloc;
+pub mod backend;
 pub mod builder;
+pub mod cpu_backend;
 pub mod ops;
+pub mod scheduler;
 
 use ops::{NodeMeta, Op};
 

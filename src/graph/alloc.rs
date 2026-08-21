@@ -1,29 +1,27 @@
-//! Liveness-based per-backend buffer allocator (Phase 1: CPU pool).
+//! Liveness-based per-backend buffer allocator (Phase 1→2).
 //!
 //! Mirrors llama.cpp's `ggml_gallocr`: buffers are shared between nodes whose
 //! live ranges do not overlap, and persistent regions (KV cache) are allocated
 //! once and never freed. KV positions (`n_past`) never influence allocation —
 //! the KV region is sized by `n_ctx` at build time.
+//!
+//! Since Phase 2 the storage lives in the backends' own pools (`CpuBackend`);
+//! the allocator only tracks liveness and the node → buffer mapping.
 
 use std::collections::HashMap;
 
+use super::backend::Backend as BackendTrait;
+use super::cpu_backend::CpuBackend;
 use super::ops::Op;
 use super::{Backend, BufRef, ComputeGraph, NodeId, PersistentBuf};
 
-/// A CPU pool buffer.
-struct CpuBuf {
-    data: Vec<f32>,
-    /// Last node-exec index (in topo order) at which this buffer is still live.
-    alive_until: usize,
-    in_use: bool,
-}
-
 /// Per-backend liveness allocator.
 pub struct GraphAllocator {
-    cpu_buffers: Vec<CpuBuf>,
+    cpu: CpuBackend,
     node_to_buf: HashMap<NodeId, BufRef>,
-    /// KV persistent region per layer (sized n_embd * n_ctx; the V region is a
-    /// Phase 5 executor concern and lives adjacent to K in the same region).
+    /// cpu pool id → last exec index it stays alive until
+    buf_alive: HashMap<usize, usize>,
+    /// KV persistent region per layer (layout `[K | V]`, each n_embd*n_ctx)
     kv: HashMap<usize, BufRef>,
     /// All persistent regions (never freed).
     pub persistent: Vec<PersistentBuf>,
@@ -32,8 +30,9 @@ pub struct GraphAllocator {
 impl Default for GraphAllocator {
     fn default() -> Self {
         Self {
-            cpu_buffers: Vec::new(),
+            cpu: CpuBackend::new(),
             node_to_buf: HashMap::new(),
+            buf_alive: HashMap::new(),
             kv: HashMap::new(),
             persistent: Vec::new(),
         }
@@ -45,9 +44,25 @@ impl GraphAllocator {
         Self::default()
     }
 
+    /// The CPU backend (register weights here / host access).
+    pub fn cpu(&self) -> &CpuBackend {
+        &self.cpu
+    }
+
+    /// Mutable CPU backend (weight registration, execution).
+    pub fn cpu_mut(&mut self) -> &mut CpuBackend {
+        &mut self.cpu
+    }
+
+    /// Register a weight tensor by name (delegates to the CPU backend).
+    pub fn register_weight(&mut self, name: &str, t: crate::tensor::Tensor) {
+        self.cpu.register_weight(name, t);
+    }
+
     /// Liveness analysis + allocation for every node buffer.
     pub fn alloc_graph(&mut self, graph: &ComputeGraph) -> Result<(), String> {
         self.node_to_buf.clear();
+        self.buf_alive.clear();
         let order = graph.topo_order()?;
         let n = graph.n_nodes();
 
@@ -57,12 +72,10 @@ impl GraphAllocator {
             exec[id] = i;
         }
 
-        // last use = max exec index over consumers (own index if none);
-        // outputs stay live until the end
+        // last use = max exec index over consumers; outputs stay live to the end
         let mut last_use = exec.clone();
         for (i, &id) in order.iter().enumerate() {
-            let node = graph.node(id);
-            for &s in &node.src {
+            for &s in &graph.node(id).src {
                 if last_use[s] < i {
                     last_use[s] = i;
                 }
@@ -75,19 +88,19 @@ impl GraphAllocator {
         for (i, &id) in order.iter().enumerate() {
             // free buffers whose liveness ended before this node
             self.sweep(i);
-            let node = graph.node(id);
-            match node.op {
+            match graph.node(id).op {
                 Op::KvcacheStore { layer } | Op::KvcacheLoad { layer } => {
                     // persistent view — no liveness allocation
-                    let br = self.ensure_kv(layer, node.n_elements());
+                    let br = self.ensure_kv(layer, graph.node(id).n_elements());
                     self.node_to_buf.insert(id, br);
                 }
                 _ => {
                     if last_use[id] > i {
                         // produce a live value: allocate (or reuse a freed one)
-                        let size = node.n_elements();
-                        let br = self.alloc_cpu(size, last_use[id]);
-                        self.node_to_buf.insert(id, br);
+                        let size = graph.node(id).n_elements();
+                        let pid = self.cpu.alloc_buffer(size);
+                        self.buf_alive.insert(pid, last_use[id]);
+                        self.node_to_buf.insert(id, BufRef { backend: Backend::CPU, id: pid });
                     }
                 }
             }
@@ -101,64 +114,76 @@ impl GraphAllocator {
     }
 
     /// KV persistent region for a layer; created on first use.
+    /// Layout: `[K (n_embd*n_ctx) | V (n_embd*n_ctx)]` — contiguous so the
+    /// attention kernel can view K and V from one buffer.
     fn ensure_kv(&mut self, layer: usize, size: usize) -> BufRef {
         if let Some(&br) = self.kv.get(&layer) {
             return br;
         }
-        let br = self.alloc_persistent(&format!("kv.{layer}"), size);
+        let pid = self.cpu.alloc_buffer(2 * size);
+        self.persistent.push(PersistentBuf {
+            name: format!("kv.{layer}"),
+            backend: Backend::CPU,
+            id: pid,
+        });
+        let br = BufRef { backend: Backend::CPU, id: pid };
         self.kv.insert(layer, br);
         br
     }
 
     /// Allocate a persistent (never-freed) CPU region.
     pub fn alloc_persistent(&mut self, name: &str, size: usize) -> BufRef {
-        let id = self.cpu_buffers.len();
-        self.cpu_buffers.push(CpuBuf {
-            data: vec![0.0f32; size],
-            alive_until: usize::MAX,
-            in_use: true,
-        });
+        let pid = self.cpu.alloc_buffer(size);
         self.persistent.push(PersistentBuf {
             name: name.to_string(),
             backend: Backend::CPU,
-            id,
+            id: pid,
         });
-        BufRef { backend: Backend::CPU, id }
-    }
-
-    /// Allocate a liveness-tracked CPU buffer of exactly `size` elements,
-    /// reusing a freed buffer when one matches.
-    fn alloc_cpu(&mut self, size: usize, alive_until: usize) -> BufRef {
-        if let Some(id) = self
-            .cpu_buffers
-            .iter()
-            .position(|b| !b.in_use && b.data.len() == size)
-        {
-            let b = &mut self.cpu_buffers[id];
-            b.in_use = true;
-            b.alive_until = alive_until;
-            return BufRef { backend: Backend::CPU, id };
-        }
-        let id = self.cpu_buffers.len();
-        self.cpu_buffers.push(CpuBuf {
-            data: vec![0.0f32; size],
-            alive_until,
-            in_use: true,
-        });
-        BufRef { backend: Backend::CPU, id }
+        BufRef { backend: Backend::CPU, id: pid }
     }
 
     /// Mark buffers whose liveness ended before exec index `i` as reusable.
     fn sweep(&mut self, i: usize) {
-        for b in &mut self.cpu_buffers {
-            if b.in_use && b.alive_until < i {
-                b.in_use = false;
-            }
+        let expired: Vec<usize> = self
+            .buf_alive
+            .iter()
+            .filter(|(_, &al)| al < i)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            self.buf_alive.remove(&id);
+            self.cpu.free_buffer(id);
         }
     }
 
     /// Fill an input node's buffer from host data (CPU path).
-    pub fn fill_input(&mut self, graph: &ComputeGraph, name: &str, data: &[f32]) -> Result<(), String> {
+    pub fn fill_input(
+        &mut self,
+        graph: &ComputeGraph,
+        name: &str,
+        data: &[f32],
+    ) -> Result<(), String> {
+        self.fill_input_impl(graph, name, data)
+    }
+
+    /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
+    /// patterns — exact for |v| < 2^24.
+    pub fn fill_input_i32(
+        &mut self,
+        graph: &ComputeGraph,
+        name: &str,
+        data: &[u32],
+    ) -> Result<(), String> {
+        let bits: Vec<f32> = data.iter().map(|&v| f32::from_bits(v)).collect();
+        self.fill_input_impl(graph, name, &bits)
+    }
+
+    fn fill_input_impl(
+        &mut self,
+        graph: &ComputeGraph,
+        name: &str,
+        data: &[f32],
+    ) -> Result<(), String> {
         let id = graph
             .inputs
             .iter()
@@ -171,16 +196,7 @@ impl GraphAllocator {
         if br.backend != Backend::CPU {
             return Err(format!("input '{name}' is on {:?}, not CPU", br.backend));
         }
-        let buf = &mut self.cpu_buffers[br.id].data;
-        let want = buf.len();
-        if data.len() != want {
-            return Err(format!(
-                "input '{name}': expected {want} elements, got {}",
-                data.len()
-            ));
-        }
-        buf.copy_from_slice(data);
-        Ok(())
+        self.cpu.write_host(br.id, data)
     }
 
     /// Host view of a CPU node's buffer.
@@ -189,7 +205,7 @@ impl GraphAllocator {
         if br.backend != Backend::CPU {
             return None;
         }
-        Some(&self.cpu_buffers[br.id].data)
+        self.cpu.read_host(br.id)
     }
 
     /// Host view of a persistent region by name.
@@ -197,12 +213,12 @@ impl GraphAllocator {
         self.persistent
             .iter()
             .find(|p| p.name == name)
-            .map(|p| self.cpu_buffers[p.id].data.as_slice())
+            .and_then(|p| self.cpu.read_host(p.id))
     }
 
     /// Number of distinct CPU buffers currently allocated (for tests).
     pub fn n_cpu_buffers(&self) -> usize {
-        self.cpu_buffers.len()
+        self.cpu.pool_len()
     }
 
     /// Number of distinct buffers actually mapped to nodes (for tests).
@@ -239,10 +255,12 @@ mod tests {
         let g = chain(6);
         let mut alloc = GraphAllocator::new();
         alloc.alloc_graph(&g).unwrap();
-        // 6 ops + 1 input = 7 nodes; liveness reuse must keep distinct
-        // buffers well below the node count
-        assert!(alloc.n_mapped_buffers() < g.n_nodes(), "expected reuse, got {} buffers for {} nodes", alloc.n_mapped_buffers(), g.n_nodes());
-        // every live node got a buffer
+        assert!(
+            alloc.n_mapped_buffers() < g.n_nodes(),
+            "expected reuse, got {} buffers for {} nodes",
+            alloc.n_mapped_buffers(),
+            g.n_nodes()
+        );
         for id in 0..g.n_nodes() {
             assert!(alloc.node_buffer(id).is_some(), "node {id} missing buffer");
         }
@@ -250,7 +268,6 @@ mod tests {
 
     #[test]
     fn parallel_chains_do_not_share() {
-        // two independent chains: more buffers than a single chain
         let mut b = GraphBuilder::new();
         let a0 = b.input("a0", [4, 1, 1, 1], crate::graph::DType::F32);
         let b0 = b.input("b0", [4, 1, 1, 1], crate::graph::DType::F32);
@@ -285,9 +302,7 @@ mod tests {
         alloc.alloc_graph(&g).unwrap();
         alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
         assert_eq!(alloc.get_buffer(&g, x).unwrap(), &[1.0, 2.0, 3.0, 4.0]);
-        // wrong size rejected
         assert!(alloc.fill_input(&g, "x", &[1.0, 2.0]).is_err());
-        // unknown input rejected
         assert!(alloc.fill_input(&g, "nope", &[]).is_err());
     }
 
@@ -308,7 +323,8 @@ mod tests {
         assert_eq!(alloc.node_buffer(3), alloc.node_buffer(4));
         assert_eq!(alloc.persistent.len(), 1);
         assert_eq!(alloc.persistent[0].name, "kv.0");
-        assert_eq!(alloc.get_persistent("kv.0").unwrap().len(), 16 * 1024);
+        // [K | V] contiguous: 2 * n_embd * n_ctx
+        assert_eq!(alloc.get_persistent("kv.0").unwrap().len(), 2 * 16 * 1024);
         // mapped buffers: positions/k/v (3 liveness) + kv region (shared) = 4
         assert_eq!(alloc.n_mapped_buffers(), 4);
     }
