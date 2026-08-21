@@ -207,6 +207,7 @@ struct MpsStateInner {
     pl_attn_scores: metal::ComputePipelineState,
     pl_attn_output: metal::ComputePipelineState,
     pl_softmax_attn: metal::ComputePipelineState,
+    pl_warmup: metal::ComputePipelineState,
     // (buffer, byte-offset): weights live either in a per-weight copied buffer
     // (offset 0) or — since the 2026-08-21 mmap loader — as offsets into a
     // page-aligned NoCopy buffer over the mmap'd GGUF part (llama-style,
@@ -1281,6 +1282,8 @@ impl MpsState {
             let pl_attn_scores = get_pl("kernel_attn_scores")?;
             let pl_attn_output = get_pl("kernel_attn_output")?;
             let pl_softmax_attn = get_pl("kernel_softmax_attn")?;
+            let pl_warmup = get_pl("kernel_warmup_read")?;
+            let pl_warmup = get_pl("kernel_warmup_read")?;
             let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
             let m = MpsStateInner {
                 device: device.clone(),
@@ -1352,6 +1355,7 @@ impl MpsState {
                 pl_attn_scores,
                 pl_attn_output,
                 pl_softmax_attn,
+                pl_warmup,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 mmap_parts: std::sync::Mutex::new(Vec::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
@@ -1424,7 +1428,22 @@ impl MpsState {
                 metal::MTLResourceOptions::StorageModeShared,
                 None,
             );
-            self.inner.mmap_parts.lock().unwrap().push((base, data.len(), buf));
+            self.inner.mmap_parts.lock().unwrap().push((base, data.len(), buf.clone()));
+            // GPU-side warm-up (METAL_OPTIMIZATIONS #39): the FIRST GPU access to
+            // file-backed (mmap) pages costs ~44 ms of one-time page/TLB setup.
+            // Doing a dummy full-buffer read HERE (at model load, outside the
+            // CLI's Total timing) moves that cost out of the first prefill —
+            // llama-bench's numbers are equally warm. ~5 ms bandwidth + the
+            // setup, amortized into load.
+            let cb = self.cmd_buffer();
+            cb.trace_op("part_warmup");
+            cb.enc.set_compute_pipeline_state(&self.inner.pl_warmup);
+            cb.enc.set_buffer(0, Some(&buf), 0);
+            let tiny = self.inner.buf_positions.lock().unwrap().clone();
+            cb.enc.set_buffer(1, Some(&tiny), 0);
+            let n = (buf.length() / 4) as u64;
+            cb.dispatch_1d((n + 255) / 256, 256);
+            let _ = cb.submit();
         }
     }
 
@@ -1737,9 +1756,14 @@ impl MpsState {
     }
 
     /// GPU embedding lookup: dequantize embedding rows and write to buf_hidden.
-    /// Returns false if the embedding weight is not on GPU or not a supported
-    /// quant type (Q4_0 / Q4_K).
-    pub fn embed_tokens_gpu(&self, embd_weight: &Tensor, token_ids: &[u32], nt: usize, ne: usize) -> bool {
+    /// Dispatches into the caller's command buffer (llama puts ggml_get_rows in
+    /// the main graph — one submit for embed + layers; a separate embed submit
+    /// cost ~44 ms of one-time per-process GPU TLB/page setup on the mmap
+    /// loader, METAL_OPTIMIZATIONS #39). Returns false if the embedding weight
+    /// is not on GPU or not a supported quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
+    /// Q4_K/Q6_K/Q5_K).
+    pub fn embed_tokens_gpu(&self, cb: &MpsCommandBuffer,
+        embd_weight: &Tensor, token_ids: &[u32], nt: usize, ne: usize) -> bool {
         // GPU safety (M2): the get_rows kernels index rows by token_id with no
         // in-kernel bound. A token_id >= vocab would read out of bounds — check
         // host-side and error-exit (the tokenizer normally guarantees valid ids).
@@ -1773,11 +1797,7 @@ impl MpsState {
         let dev = &self.inner.device;
         let hidden = Self::get_or_grow(&self.inner.buf_hidden, (nt * ne * 4) as u64, dev);
         let ids_buf = self.inner.buf_token_ids.lock().unwrap().clone();
-        let cb = self.cmd_buffer();
         cb.embed_tokens_gpu(&wb, w_off, &ids_buf, &hidden, ne, nt, ttype);
-        if cb.submit().is_err() {
-            return false;
-        }
         true
     }
 

@@ -2482,6 +2482,21 @@ template [[host_name("kernel_get_rows_q8_0")]] kernel get_rows_q32_t kernel_get_
 template [[host_name("kernel_get_rows_q6_k")]] kernel get_rows_q256_t kernel_get_rows_q256<210, dequant_q6_k_16>;
 template [[host_name("kernel_get_rows_q5_k")]] kernel get_rows_q256_t kernel_get_rows_q256<176, dequant_q5_k_16>;
 
+// ─── GPU warm-up read (2026-08-21, METAL_OPTIMIZATIONS #39) ─────
+// Dummy full-buffer read at model load: the FIRST GPU access to file-backed
+// (mmap) pages costs ~44 ms of one-time page/TLB setup per process; running a
+// read of every page HERE moves that cost out of the first prefill (llama-bench
+// numbers are equally warm). Each thread reads one uchar4 (faults its page);
+// only thread 0 writes a single byte to the small output buffer.
+kernel void kernel_warmup_read(
+    device const uchar * src [[buffer(0)]],
+    device       uchar * out [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    device const uchar4 * p = (device const uchar4 *)src + tid;
+    if (tid == 0) out[0] = p->x;
+}
+
 // ─── RMSNorm (1 threadgroup per row, 32 threads) ─────────────
 // Parallel sum-of-squares via simd_sum (single simdgroup, no shared memory).
 // y[t][i] = x[t][i] * rsqrt(mean(x[t]²) + eps) * w[i]

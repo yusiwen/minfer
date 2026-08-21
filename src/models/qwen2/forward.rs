@@ -63,11 +63,16 @@ pub fn forward(
         });
         if use_gpu {
             let mps = crate::metal::MpsState::get().unwrap();
-            // GPU embedding lookup (Q4_0): writes directly to buf_hidden on GPU.
+            // One command buffer for embed + all layers + output (llama builds
+            // ggml_get_rows into the main graph; a separate embed submit cost
+            // ~44 ms of one-time GPU TLB/page setup per process on the mmap
+            // loader — METAL_OPTIMIZATIONS #39).
+            let mut cb = mps.cmd_buffer();
+            // GPU embedding lookup: writes directly to buf_hidden on GPU.
             // Skips the dispatch under the decode profiling gate (like layer_gpu).
             let gpu_embd = if crate::metal::DecodeSkips::active(nt).matmul { false } else {
                 mps.embed_tokens_gpu(
-                    model.tok_embd.as_ref().unwrap(), token_ids, nt, ne
+                    &cb, model.tok_embd.as_ref().unwrap(), token_ids, nt, ne
                 )
             };
             if !gpu_embd {
@@ -75,7 +80,6 @@ pub fn forward(
                 mps.upload_hidden(&hidden);
             }
             mps.upload_positions(positions);
-            let mut cb = mps.cmd_buffer();
             // MINFER_TIMING=1: split forward() into encode (cb creation → submit)
             // vs GPU-exec+download (submit → after download). Debug tool only.
             let fwd_timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");

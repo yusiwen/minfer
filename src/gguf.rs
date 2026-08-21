@@ -1701,6 +1701,10 @@ impl MmapFile {
             if ptr as isize == -1 {
                 return None;
             }
+            // (The GPU-side warm-up read happens in metal.rs register_part —
+            // the first GPU access to file-backed pages costs ~44 ms of one-time
+            // page/TLB setup per process, METAL_OPTIMIZATIONS #39. A CPU-side
+            // madvise/touch does NOT fix it — the cost is the GPU's own access.)
             Some(MmapFile { ptr: ptr as *mut u8, len, _file: file })
         }
     }
