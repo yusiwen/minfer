@@ -7,7 +7,7 @@ use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
 use super::ops::{
-    AttnMeta, AttnMode, EmbedMeta, KvcacheMeta, MatMulMeta, NodeMeta, NormMeta, Op, RoPEMeta,
+    AttnMeta, AttnMode, EmbedMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta, NormMeta, Op, RoPEMeta,
 };
 use super::{CNode, ComputeGraph, DType, NodeId};
 
@@ -123,6 +123,23 @@ impl GraphBuilder {
     }
 
     /// RoPE. `pos` is an input node carrying per-token positions (data).
+    /// decode (nt==1) fused QKV: one concat matmul (wq|wk|wv) whose output
+    /// buffer carries q (rows 0..nqt), k (nqt..nqt+nkt), v (nqt+nkt..) after
+    /// bias+rope; the backend also stores K/V into the layer's persistent
+    /// regions (kv_pair). Output shape = [nqt+nkt+nkt, nt].
+    pub fn fused_qkv(&mut self, x: NodeId, pos: NodeId, layer: usize, meta: FusedQkvMeta) -> NodeId {
+        let nt = self.graph.nodes[x].out_shape[1];
+        let od_total = meta.nqt + 2 * meta.nkt;
+        self.node(
+            "fused_qkv",
+            Op::FusedQKV { layer },
+            &[x, pos],
+            [od_total, nt, 1, 1],
+            DType::F32,
+            NodeMeta::FusedQkv(meta),
+        )
+    }
+
     pub fn rope(&mut self, x: NodeId, pos: NodeId, style: RopeStyle, meta: RoPEMeta) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
         self.node("rope", Op::RoPE { style }, &[x, pos], shape, DType::F32, NodeMeta::Rope(meta))
@@ -159,12 +176,15 @@ impl GraphBuilder {
         mode: AttnMode,
         meta: AttnMeta,
     ) -> NodeId {
-        let shape = self.graph.nodes[q].out_shape;
+        // Attention output is one row per query head: [n_head*hd, nt]. The q
+        // input may be a larger fused concat buffer (G4 FusedQKV carries
+        // q|k|v), so the output shape comes from the meta, not from q.
+        let nt = self.graph.nodes[q].out_shape[1];
         self.node(
             "attn",
             Op::Attn { mode },
             &[q, kv, pos],
-            shape,
+            [meta.n_head * meta.hd, nt, 1, 1],
             DType::F32,
             NodeMeta::Attn(meta),
         )

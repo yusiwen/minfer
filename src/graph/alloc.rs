@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use super::backend::Backend as BackendTrait;
 use super::backend::KvProvider;
 use super::cpu_backend::CpuBackend;
-use super::ops::Op;
+use super::ops::{NodeMeta, Op};
 use super::{Backend, BufRef, ComputeGraph, NodeId, PersistentBuf};
 
 /// Per-backend liveness allocator.
@@ -165,6 +165,22 @@ impl GraphAllocator {
                     let pair = self.ensure_kv(layer, backend, node.n_elements());
                     // the node's buffer = the K region
                     self.node_to_buf.insert(id, pair[0]);
+                }
+                Op::FusedQKV { layer } => {
+                    // fused decode QKV: also needs the layer's persistent KV
+                    // regions (the kernel stores K/V), but its output is a
+                    // normal concat buffer (q|k|v), not the K region.
+                    let kv_elems = match &node.meta {
+                        NodeMeta::FusedQkv(m) => m.kv_elems,
+                        _ => node.n_elements(),
+                    };
+                    self.ensure_kv(layer, backend, kv_elems);
+                    if last_use[id] > i {
+                        let size = node.n_elements();
+                        let pid = self.alloc_in_pool(backend, size);
+                        self.buf_alive.insert((backend, pid), last_use[id]);
+                        self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                    }
                 }
                 Op::Silu | Op::RoPE { .. } => {
                     // In-place elementwise transforms: alias the input buffer

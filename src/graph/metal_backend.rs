@@ -137,14 +137,16 @@ impl Backend for MetalBackend {
             }
             Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
+            Op::FusedQKV { .. } => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
         }
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // swiglu_f32 kernel exists; bias+rope stays a layer_gpu-level fusion
-        matches!(fused, FusedOp::SwiGLU)
+        // swiglu_f32 and attn_bias_rope_store kernels exist (the latter is the
+        // fused decode QKV store path, nt==1 only)
+        matches!(fused, FusedOp::SwiGLU | FusedOp::QKVBiasRopeStore)
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
@@ -348,6 +350,53 @@ impl Backend for MetalBackend {
                 if in_bufs[0] != out_buf {
                     self.copy_in(out_buf, in_bufs[0]);
                 }
+                Ok(())
+            }
+            Op::FusedQKV { layer } => {
+                let meta = match &node.meta {
+                    NodeMeta::FusedQkv(m) => m,
+                    other => return Err(format!("fused_qkv node missing FusedQkvMeta: {other:?}")),
+                };
+                let (wb, w_off) = self
+                    .state
+                    .weight_buf(&meta.qkv_weight)
+                    .ok_or_else(|| format!("qkv weight '{}' not on GPU", meta.qkv_weight))?;
+                let nt = node.out_shape[1];
+                debug_assert!(nt == 1, "FusedQKV is decode (nt==1) only, got nt={nt}");
+                let od_total = meta.nqt + 2 * meta.nkt;
+                // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
+                cb.quant_matmul_f32_on_gpu_buf(
+                    &wb, w_off, meta.weight_ttype, self.buf(in_bufs[0]), 0, self.buf(out_buf),
+                    od_total, meta.in_dim, nt,
+                );
+                // 2) fused bias + rope + KV store in one kernel pass
+                let (k_id, v_id) = kv_pair
+                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let bias_off = |name: &Option<String>| -> Result<(metal::Buffer, u64), String> {
+                    match name {
+                        Some(n) => self.state.weight_buf(n).ok_or_else(|| format!("bias '{n}' not on GPU")),
+                        None => Err("fused QKV bias missing".into()),
+                    }
+                };
+                let bq = bias_off(&meta.bias_q)?;
+                let bk = bias_off(&meta.bias_k)?;
+                let bv = bias_off(&meta.bias_v)?;
+                let (bq_b, bq_o) = bq;
+                let (bk_b, bk_o) = bk;
+                let (bv_b, bv_o) = bv;
+                let pos = {
+                    let n = (self.buf(in_bufs[1]).length() as usize) / 4;
+                    let p = unsafe { std::slice::from_raw_parts(self.buf(in_bufs[1]).contents() as *const u32, n) };
+                    p[0] as i32
+                };
+
+                cb.attn_bias_rope_store(
+                    self.buf(out_buf),
+                    &bq_b, bq_o, &bk_b, bk_o, &bv_b, bv_o,
+                    self.buf(k_id), self.buf(v_id),
+                    meta.nqt, meta.nkt, meta.hd,
+                    meta.freq_base, meta.freq_scale, pos, meta.rope_style as i32,
+                );
                 Ok(())
             }
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => {

@@ -20,7 +20,7 @@ use crate::graph::alloc::GraphAllocator;
 use crate::graph::cache::GraphCache;
 use crate::graph::backend::Backend;
 use crate::graph::fusion::FusionPass;
-use crate::graph::ops::{AttnMeta, AttnMode, RoPEMeta};
+use crate::graph::ops::{AttnMeta, AttnMode, FusedQkvMeta, RoPEMeta};
 use crate::graph::params::{CParams, GraphParams, GraphType};
 use crate::graph::scheduler::BackendScheduler;
 use crate::graph::ComputeGraph;
@@ -62,24 +62,58 @@ impl Qwen2Graph {
             // pre-norm
             let normed = b.rms_norm(h, l.attn_norm.as_ref(), eps);
 
-            // Q/K/V projections (+ biases)
-            let q = b.matmul(normed, l.wq.as_ref().unwrap(), l.bq.as_ref());
-            let k = b.matmul(normed, l.wk.as_ref().unwrap(), l.bk.as_ref());
-            let v = b.matmul(normed, l.wv.as_ref().unwrap(), l.bv.as_ref());
+            // Q/K/V projections (+ biases). decode (nt==1) with GPU QKV concat
+            // uses the fused path (G4): one concat matmul + one fused
+            // bias+rope+store kernel, replacing 3 matmul + 3 bias + 2 rope +
+            // 2 store dispatches.
+            let fuse_qkv = nt == 1
+                && params.cparams.gpu
+                && params.cparams.fuse_qkv
+                && l.bq.is_some() && l.bk.is_some() && l.bv.is_some()
+                && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);
+            let (q, kv) = if fuse_qkv {
+                let qkv = b.fused_qkv(
+                    normed, inp_pos, il,
+                    FusedQkvMeta {
+                        qkv_weight: format!("blk.{il}.attn_qkv"),
+                        bias_q: l.bq.as_ref().map(|t| t.name.clone()),
+                        bias_k: l.bk.as_ref().map(|t| t.name.clone()),
+                        bias_v: l.bv.as_ref().map(|t| t.name.clone()),
+                        weight_ttype: l.wq.as_ref().unwrap().ttype,
+                        in_dim: hp.n_embd as usize,
+                        nqt: nh * hd,
+                        nkt,
+                        hd,
+                        nh,
+                        nk,
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        rope_style: hp.rope_style,
+                        kv_elems: nkt * n_ctx,
+                    },
+                );
+                // q lives at concat offset 0 (rows 0..nqt); K/V went into the
+                // persistent regions via the fused store — read them back.
+                let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                (qkv, kv)
+            } else {
+                let q = b.matmul(normed, l.wq.as_ref().unwrap(), l.bq.as_ref());
+                let k = b.matmul(normed, l.wk.as_ref().unwrap(), l.bk.as_ref());
+                let v = b.matmul(normed, l.wv.as_ref().unwrap(), l.bv.as_ref());
 
-            // RoPE (Q: nh heads, K: nk heads, both hd dims)
-            let q = b.rope(
-                q, inp_pos, hp.rope_style,
-                RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nh, hd },
-            );
-            let k = b.rope(
-                k, inp_pos, hp.rope_style,
-                RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nk, hd },
-            );
+                let q = b.rope(
+                    q, inp_pos, hp.rope_style,
+                    RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nh, hd },
+                );
+                let k = b.rope(
+                    k, inp_pos, hp.rope_style,
+                    RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nk, hd },
+                );
 
-            // KV cache (persistent region; positions are data)
-            b.kvcache_store(il, k, v, inp_pos, n_ctx);
-            let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                b.kvcache_store(il, k, v, inp_pos, n_ctx);
+                let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                (q, kv)
+            };
 
             // attention
             let attn_out = b.attn(
@@ -120,6 +154,25 @@ impl Qwen2Graph {
         b.output(logits);
 
         b.build()
+    }
+
+    /// Whether wq/wk/wv can share one concat matmul (loader registered
+    /// `blk.{i}.attn_qkv`): same quant type, same input dim, block-aligned.
+    fn qkv_concat_available(
+        wq: &Option<crate::tensor::Tensor>,
+        wk: &Option<crate::tensor::Tensor>,
+        wv: &Option<crate::tensor::Tensor>,
+    ) -> bool {
+        let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else { return false };
+        #[cfg(target_os = "macos")]
+        {
+            crate::metal::concat_rows(&[wq, wk, wv]).is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (wq, wk, wv);
+            false
+        }
     }
 
     /// Register every weight the graph references on the allocator's backend.
@@ -174,6 +227,11 @@ impl Qwen2Graph {
                 n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on,
+                // G4: decode QKV fusion is part of the topology — the env
+                // toggle forces a rebuild so it can be A/B'd reliably.
+                fuse_qkv: nt == 1
+                    && metal_on
+                    && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
             },
             weights_version: 1,
         };
@@ -399,7 +457,7 @@ mod tests {
                 n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Prefill,
-                cparams: CParams { n_ctx, n_batch: nt, flash_attn: false, gpu: false },
+                cparams: CParams { n_ctx, n_batch: nt, flash_attn: false, gpu: false, fuse_qkv: false },
                 weights_version: 1,
             };
             let sched = BackendScheduler::new();
@@ -427,7 +485,7 @@ mod tests {
                 n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Decode,
-                cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: false },
+                cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: false, fuse_qkv: false },
                 weights_version: 1,
             };
             let mut dgraph: ComputeGraph = model.build_graph(&dparams);
@@ -769,7 +827,7 @@ mod tail_tests {
             let params = GraphParams {
                 n_tokens: nt, n_seqs: 1, n_out,
                 gtype: GraphType::Prefill,
-                cparams: CParams { n_ctx: 4096, n_batch: nt, flash_attn: false, gpu: false },
+                cparams: CParams { n_ctx: 4096, n_batch: nt, flash_attn: false, gpu: false, fuse_qkv: false },
                 weights_version: 1,
             };
             let mut graph = model.build_graph(&params);
@@ -866,5 +924,105 @@ mod tail_tests {
             maxd = maxd.max((full_last[nv * (nt - 1) + i] - reduced_last[i]).abs());
         }
         assert!(maxd < 1e-5, "tail reduction diverges: {maxd:.3e}");
+    }
+
+    /// G4: decode (nt==1) QKV fusion must be numerically identical to the
+    /// unfused path. The fused graph replaces 3 matmul + 3 bias + 2 rope +
+    /// 2 store with one concat matmul (blk.{i}.attn_qkv) + one fused
+    /// bias+rope+store kernel; both execute the same Metal math, so logits
+    /// must match exactly.
+    #[test]
+    fn fused_qkv_matches_unfused_decode() {
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("not macOS; skipping");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::graph::alloc::GraphAllocator;
+            use crate::graph::scheduler::BackendScheduler;
+            use crate::graph::params::{CParams, GraphParams, GraphType};
+            use crate::graph::ops::Op;
+            let Some(path) = model_path() else {
+                eprintln!("not cached; skipping");
+                return;
+            };
+            crate::metal::MpsState::init();
+            let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+            let model = crate::models::load_model(&gguf).expect("load model");
+            let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
+            let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+            let ids = tok.encode("The capital of France is");
+            let nt = ids.len();
+            let nv = model.n_vocab();
+            let model: &dyn ModelDef = q2;
+
+            // also run against the 7B K_M model when cached (Q4_K concat path)
+            let seven_b_path = {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                home.map(|mut p| {
+                    p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf");
+                    p
+                }).filter(|p| p.exists())
+            };
+            if let Some(p7) = seven_b_path {
+                let gguf7 = crate::gguf::load_gguf_model(&p7).expect("parse 7B GGUF");
+                let model7 = crate::models::load_model(&gguf7).expect("load 7B model");
+                let q7: &Qwen2Model = model7.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
+                let m7: &dyn ModelDef = q7;
+                let tok7 = crate::tokenizer::Tokenizer::load(&gguf7.parts[0].ctx);
+                let ids7 = tok7.encode("Hello!");
+                let nv7 = model7.n_vocab();
+                let l7f = run_decode(q7, m7, &ids7, 4096, nv7, true, true);
+                let l7u = run_decode(q7, m7, &ids7, 4096, nv7, false, false);
+                let mut d7 = 0.0f32;
+                for i in 0..l7f.len().min(l7u.len()) {
+                    d7 = d7.max((l7f[i] - l7u[i]).abs());
+                }
+                eprintln!("[fused-qkv] 7B decode fused-vs-unfused max diff: {d7:.3e}");
+                assert!(d7 < 1e-5, "7B fused QKV decode diverges: {d7:.3e}");
+            }
+
+            fn run_decode(
+                q2: &Qwen2Model, model: &dyn ModelDef, tok_ids: &[u32], n_ctx: usize, nv: usize,
+                fuse: bool, expect_fused_node: bool,
+            ) -> Vec<f32> {
+                use crate::graph::params::{CParams, GraphParams, GraphType};
+                let params = GraphParams {
+                    n_tokens: 1, n_seqs: 1, n_out: 1,
+                    gtype: GraphType::Decode,
+                    cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: true, fuse_qkv: fuse },
+                    weights_version: 1,
+                };
+                let mut graph = model.build_graph(&params);
+                let sched = BackendScheduler::new();
+                let mut alloc = GraphAllocator::new();
+                Qwen2Graph::register_graph_weights(q2, &mut alloc);
+                assert!(alloc.enable_metal(), "Metal backend unavailable");
+                sched.assign_backends(&mut graph, &alloc);
+                // verify the fusion actually happened / was skipped
+                let has_fused = graph.nodes.iter().any(|n| matches!(n.op, Op::FusedQKV { .. }));
+                assert_eq!(has_fused, expect_fused_node, "FusedQKV node presence");
+                alloc.alloc_graph(&graph).unwrap();
+                alloc.fill_input_i32(&graph, "token_ids", &[tok_ids[0]]).unwrap();
+                alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
+                sched.execute(&graph, &mut alloc).unwrap();
+                alloc.copy_to_cpu(graph.outputs[0]).unwrap()
+            }
+
+            // decode step with a fresh single-token prompt (pos 0): fused vs
+            // unfused must agree exactly (same Metal kernels, same math).
+            let fused_l = run_decode(q2, model, &[ids[0]], 4096, nv, true, true);
+            let unfused_l = run_decode(q2, model, &[ids[0]], 4096, nv, false, false);
+            assert_eq!(fused_l.len(), unfused_l.len());
+            let mut maxd = 0.0f32;
+            for i in 0..fused_l.len() {
+                maxd = maxd.max((fused_l[i] - unfused_l[i]).abs());
+            }
+            eprintln!("[fused-qkv] decode logits fused-vs-unfused max diff: {maxd:.3e}");
+            assert!(maxd < 1e-5, "fused QKV decode diverges: {maxd:.3e}");
+            let _ = nt;
+        }
     }
 }

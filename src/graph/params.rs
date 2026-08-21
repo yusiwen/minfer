@@ -25,11 +25,14 @@ pub struct CParams {
     pub n_batch: usize,
     pub flash_attn: bool,
     pub gpu: bool,
+    /// G4 decode QKV fusion enabled (part of the topology: toggling
+    /// `MINFER_NO_FUSE_QKV` must force a rebuild).
+    pub fuse_qkv: bool,
 }
 
 impl Default for CParams {
     fn default() -> Self {
-        Self { n_ctx: 4096, n_batch: 128, flash_attn: false, gpu: false }
+        Self { n_ctx: 4096, n_batch: 128, flash_attn: false, gpu: false, fuse_qkv: false }
     }
 }
 

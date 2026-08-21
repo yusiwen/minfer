@@ -367,7 +367,7 @@ impl Backend for CpuBackend {
                 )?;
                 Ok(())
             }
-            Op::FusedBiasRope | Op::BatchMatMul => {
+            Op::FusedBiasRope | Op::BatchMatMul | Op::FusedQKV { .. } => {
                 Err(format!("op {:?} unsupported on CPU (fusion not enabled for it)", node.op))
             }
         }

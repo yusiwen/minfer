@@ -170,6 +170,7 @@ impl BackendScheduler {
                 // borrow (the backend needs it for KV store / attention)
                 let kv_pair = match &node.op {
                     Op::KvcacheStore { layer } => alloc.kv_pair(*layer),
+                    Op::FusedQKV { layer } => alloc.kv_pair(*layer),
                     Op::Attn { .. } => match &node.meta {
                         NodeMeta::Attn(m) => alloc.kv_pair(m.layer),
                         _ => None,

@@ -23,6 +23,7 @@ pub enum FusedOp {
     SwiGLU,     // silu(gate) * up
     BiasRope,   // add_bias + rope (+ kv store on GPU: attn_bias_rope_store)
     BatchMatMul, // multiple matmuls sharing one quantized activation
+    QKVBiasRopeStore, // decode QKV: concat matmul + bias+rope+store (nt==1)
 }
 
 /// Operator type. Implements full `PartialEq` (payloads included) so debug
@@ -71,6 +72,10 @@ pub enum Op {
     SwiGLU,
     FusedBiasRope,
     BatchMatMul,
+    /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store
+    /// in one kernel pass (llama `attn_bias_rope_store`). Carries the layer so
+    /// the scheduler can resolve the persistent K/V regions (kv_pair).
+    FusedQKV { layer: usize },
 }
 
 /// Per-node metadata.
@@ -87,6 +92,7 @@ pub enum NodeMeta {
     Attn(AttnMeta),
     Kvcache(KvcacheMeta),
     Embed(EmbedMeta),
+    FusedQkv(FusedQkvMeta),
 }
 
 /// Matmul target weight (+ optional bias) — resolved to a backend buffer by
@@ -138,6 +144,31 @@ pub struct AttnMeta {
 pub struct KvcacheMeta {
     pub n_embd: usize,
     pub n_head_kv: usize,
+}
+
+/// decode QKV fusion metadata: concat weight (wq|wk|wv rows), the three
+/// biases, and the rope/store parameters. `qkv_weight` is the loader-registered
+/// concat tensor (`blk.{i}.attn_qkv`); `od_total = nqt + 2*nkt`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedQkvMeta {
+    pub qkv_weight: String,
+    pub bias_q: Option<String>,
+    pub bias_k: Option<String>,
+    pub bias_v: Option<String>,
+    pub weight_ttype: TensorType,
+    /// Weight dims (GGUF convention): `in_dim = shape[0]`, concat `out_dim =
+    /// shape[1]` sum = nqt + nkt + nkt.
+    pub in_dim: usize,
+    pub nqt: usize,
+    pub nkt: usize,
+    pub hd: usize,
+    pub nh: usize,
+    pub nk: usize,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub rope_style: RopeStyle,
+    /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
+    pub kv_elems: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
