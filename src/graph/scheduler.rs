@@ -1,19 +1,22 @@
-//! Backend scheduler (Phase 4: assign → split → execute; fusion is separate).
+//! Backend scheduler (Phase 3→4: assign → split → execute).
 //!
-//! Mirrors llama.cpp's `ggml_backend_sched_split_graph` + `compute_splits`
-//! (simplified: single backend today, cross-backend transfers land with the
-//! Metal backend in Phase 3):
-//! - `assign_backends`: per-op capability-driven assignment (all-CPU for now)
-//! - `split_graph`: partition the node sequence into contiguous same-backend
-//!   splits, recording cross-split inputs/outputs
-//! - `execute`: run splits in order, copying inputs at boundaries (no-op when
-//!   everything is on one backend)
+//! Mirrors llama.cpp's `ggml_backend_sched_split_graph` + `compute_splits`:
+//! - `assign_backends`: per-op capability-driven assignment
+//! - `split_graph`: partition into contiguous same-backend splits, deriving
+//!   cross-split inputs/outputs
+//! - `execute`: per split — sync the previous backend, copy split inputs
+//!   across backends, run the nodes (each backend batches its ops into one
+//!   command buffer, flushed at the boundary via `synchronize`), then a final
+//!   sync.
 //!
-//! The buffer pools live in `GraphAllocator` (single source of truth — the
-//! allocator is also the capability registry); the scheduler orchestrates.
+//! Nodes execute in **build order** (the builder appends sources before
+//! consumers, so this is a valid topological order — matching ggml, which
+//! executes `nodes[0..n_nodes]` in order). This guarantees e.g. that a KV
+//! store node executes before the attention that reads the KV view.
 
 use super::alloc::GraphAllocator;
-use super::backend::Backend;
+use super::backend::{Backend, KvProvider};
+use super::ops::{NodeMeta, Op};
 use super::{Backend as BackendTag, ComputeGraph, NodeId};
 
 /// A contiguous subgraph executed on one backend.
@@ -48,7 +51,7 @@ impl BackendScheduler {
     }
 
     /// Assign every node to the best backend that supports it (capability
-    /// driven via the allocator's backend registry; all-CPU for now).
+    /// driven via the allocator's backend registry).
     pub fn assign_backends(&self, graph: &mut ComputeGraph, alloc: &GraphAllocator) {
         for node in &mut graph.nodes {
             if node.backend.is_some() {
@@ -107,14 +110,7 @@ impl BackendScheduler {
         splits
     }
 
-    /// Execute the graph split by split. With a single backend there is one
-    /// split and copies are no-ops; the loop structure matches llama.cpp's
-    /// `compute_splits` for when cross-backend transfers arrive (Phase 3).
-    ///
-    /// Nodes execute in **build order** (the builder appends sources before
-    /// consumers, so this is a valid topological order — matching ggml, which
-    /// executes `nodes[0..n_nodes]` in order). This guarantees e.g. that a KV
-    /// store node executes before the attention that reads the KV view.
+    /// Execute the graph split by split (llama.cpp `compute_splits` shape).
     pub fn execute(
         &self,
         graph: &ComputeGraph,
@@ -123,14 +119,29 @@ impl BackendScheduler {
         #[cfg(debug_assertions)]
         debug_assert!(graph.topo_order().is_ok(), "graph is not a valid DAG");
         let splits = self.split_graph(graph);
+        if std::env::var("MINFER_GRAPH_TRACE").is_ok() {
+            for (si, s) in splits.iter().enumerate() {
+                eprintln!("[graph] split {si}: {:?} nodes {}-{}", s.backend, s.node_range.0, s.node_range.1);
+            }
+            let mut by = std::collections::BTreeMap::new();
+            for n in &graph.nodes {
+                *by.entry((format!("{:?}", n.op).split('{').next().unwrap().to_string(), n.backend.map(|b| format!("{b:?}")).unwrap_or_default()))
+                    .or_insert(0usize) += 1;
+            }
+            for (k, v) in by {
+                eprintln!("[graph] op {:<12} backend {:<7} x{v}", k.0, k.1);
+            }
+        }
         let mut prev_backend: Option<BackendTag> = None;
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
-                    return Err(format!(
-                        "cross-backend split ({pb:?} -> {:?}) needs Phase 3 transfer support",
-                        split.backend
-                    ));
+                    // 1. flush the previous backend's async work
+                    alloc.sync_backend(pb);
+                    // 2. copy this split's inputs across backends
+                    for &inp in &split.inputs {
+                        alloc.copy_across(inp, split.backend)?;
+                    }
                 }
             }
             for id in split.node_range.0..split.node_range.1 {
@@ -142,8 +153,12 @@ impl BackendScheduler {
                 // fusion pass can orphan them (e.g. silu folded into SwiGLU);
                 // they are skipped, not executed
                 let Some(br) = alloc.node_buffer(id) else { continue };
-                // NOTE: execution follows node id order (build order), which is
-                // the graph's topological order by construction.
+                if br.backend != split.backend {
+                    return Err(format!(
+                        "node {id} buffer on {:?} but executing split is {:?} (assignment/alloc mismatch)",
+                        br.backend, split.backend
+                    ));
+                }
                 let mut in_bufs = Vec::with_capacity(node.src.len());
                 for &s in &node.src {
                     let sbr = alloc
@@ -151,16 +166,36 @@ impl BackendScheduler {
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr.id);
                 }
+                // resolve the layer's KV region pair BEFORE the mutable backend
+                // borrow (the backend needs it for KV store / attention)
+                let kv_pair = match &node.op {
+                    Op::KvcacheStore { layer } => alloc.kv_pair(*layer),
+                    Op::Attn { .. } => match &node.meta {
+                        NodeMeta::Attn(m) => alloc.kv_pair(m.layer),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // NOTE: execution follows node id order (build order), which is
+                // the graph's topological order by construction.
                 match split.backend {
-                    BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br.id)?,
-                    other => {
-                        return Err(format!(
-                            "backend {other:?} execution needs Phase 3 (metal_backend)"
-                        ))
+                    BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br.id, kv_pair)?,
+                    #[cfg(target_os = "macos")]
+                    BackendTag::Metal => {
+                        let m = alloc
+                            .metal_mut()
+                            .ok_or("Metal backend not enabled")?;
+                        m.execute_node(node, &in_bufs, br.id, kv_pair)?;
                     }
+                    #[cfg(not(target_os = "macos"))]
+                    BackendTag::Metal => return Err("Metal unavailable".into()),
+                    BackendTag::Cuda => return Err("CUDA backend not implemented".into()),
                 }
             }
             prev_backend = Some(split.backend);
+        }
+        if let Some(pb) = prev_backend {
+            alloc.sync_backend(pb);
         }
         Ok(())
     }
@@ -197,7 +232,6 @@ mod tests {
 
     #[test]
     fn split_on_backend_change() {
-        // hand-assign: x(input) CPU, silu Metal, add CPU -> 3 splits
         let mut g = small_graph();
         g.nodes[0].backend = Some(BackendTag::CPU);
         g.nodes[1].backend = Some(BackendTag::Metal);
@@ -208,12 +242,9 @@ mod tests {
         assert_eq!(splits[0].backend, BackendTag::CPU);
         assert_eq!(splits[1].backend, BackendTag::Metal);
         assert_eq!(splits[2].backend, BackendTag::CPU);
-        // cross-split edges: x (0) feeds the Metal silu; silu out (1) feeds the
-        // CPU add
         assert_eq!(splits[0].outputs, vec![0]);
         assert_eq!(splits[1].inputs, vec![0]);
         assert_eq!(splits[1].outputs, vec![1]);
-        // add(silu(x), x): consumes both the silu output (1) and x (0)
         assert_eq!(splits[2].inputs, vec![1, 0]);
     }
 
@@ -230,16 +261,5 @@ mod tests {
         for i in 0..4 {
             assert!((got[i] - (silu((i + 1) as f32) + (i + 1) as f32)).abs() < 1e-5);
         }
-    }
-
-    #[test]
-    fn cross_backend_execute_rejected_for_now() {
-        let mut g = small_graph();
-        g.nodes[1].backend = Some(BackendTag::Metal); // would need Phase 3 transfer
-        let sched = BackendScheduler::new();
-        let mut alloc = GraphAllocator::new();
-        alloc.alloc_graph(&g).unwrap();
-        alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
-        assert!(sched.execute(&g, &mut alloc).is_err());
     }
 }

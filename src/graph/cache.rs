@@ -152,7 +152,7 @@ mod tests {
         cache.replace_graph(tiny_graph(), params(1, 1));
         // rebuild with different params: allocator object identity persists
         // (a KV persistent region registered before must still be there)
-        cache.alloc().alloc_persistent("kv.test", 16);
+        cache.alloc().alloc_persistent("kv.test", crate::graph::Backend::CPU, 16);
         assert!(cache.alloc().get_persistent("kv.test").is_some());
         cache.replace_graph(tiny_graph(), params(4, 1));
         assert!(

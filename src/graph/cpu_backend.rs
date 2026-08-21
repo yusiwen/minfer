@@ -107,7 +107,44 @@ impl Backend for CpuBackend {
         node: &CNode,
         in_bufs: &[usize],
         out_buf: usize,
+        kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
+        // KV store needs mutable access to both K and V persistent regions
+        // (the V region is a sibling buffer, not an input) — handle it before
+        // the aliasing split below, which borrows the pool immutably.
+        if let Op::KvcacheStore { layer } = &node.op {
+            let (k_id, v_id) = kv_pair
+                .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+            if k_id != out_buf {
+                return Err("KV store out buffer must be the K region".into());
+            }
+            let nkt = node.out_shape[0];
+            let n_ctx = node.out_shape[1];
+            let nt = self.buffers[in_bufs[0]].len() / nkt;
+            let pos: Vec<usize> = self.buffers[in_bufs[2]].iter().map(|b| b.to_bits() as usize).collect();
+            let k_src = self.buffers[in_bufs[0]].clone();
+            let v_src = self.buffers[in_bufs[1]].clone();
+            // k region = out_buf, v region = sibling; both in this pool.
+            // Disjoint mutable access via split_at_mut.
+            let (k_dst, v_dst): (&mut [f32], &mut [f32]) = if v_id < k_id {
+                let (before, after) = self.buffers.split_at_mut(k_id);
+                (&mut after[0], &mut before[v_id])
+            } else {
+                let (before, after) = self.buffers.split_at_mut(v_id);
+                (&mut before[k_id], &mut after[0])
+            };
+            for t in 0..nt {
+                let p = pos[t];
+                if p >= n_ctx {
+                    return Err(format!("KV store position {p} >= n_ctx {n_ctx}"));
+                }
+                let ks = p * nkt;
+                k_dst[ks..ks + nkt].copy_from_slice(&k_src[t * nkt..(t + 1) * nkt]);
+                v_dst[ks..ks + nkt].copy_from_slice(&v_src[t * nkt..(t + 1) * nkt]);
+            }
+            return Ok(());
+        }
+
         // Aliasing safety: liveness reuse may map an input and the output to
         // the same physical buffer. Snapshot aliased inputs, then carve the
         // output region out of the pool with split_at_mut so the remaining
@@ -273,23 +310,9 @@ impl Backend for CpuBackend {
                 crate::vec_ops::vec_mul_f32(out.len(), out, &g, ins[1]);
                 Ok(())
             }
-            Op::KvcacheStore { .. } => {
-                let n_embd = node.out_shape[0];
-                let n_ctx = node.out_shape[1];
-                let nt = ins[0].len() / n_embd;
-                for t in 0..nt {
-                    let p = ins[2][t].to_bits() as usize; // position (I32)
-                    if p >= n_ctx {
-                        return Err(format!("KV store position {p} >= n_ctx {n_ctx}"));
-                    }
-                    let ks = p * n_embd;
-                    out[ks..ks + n_embd].copy_from_slice(&ins[0][t * n_embd..(t + 1) * n_embd]);
-                    out[n_ctx * n_embd + ks..n_ctx * n_embd + ks + n_embd]
-                        .copy_from_slice(&ins[1][t * n_embd..(t + 1) * n_embd]);
-                }
-                Ok(())
-            }
-            Op::KvcacheLoad { .. } => Ok(()), // view of the persistent region
+            Op::KvcacheStore { .. } => unreachable!("KV store handled in the dedicated path"),
+            Op::KvcacheLoad { .. } => Ok(()), // view of the K region
+
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
                 // Phase 2: identity (shape/layout metadata; data unchanged)
                 out.copy_from_slice(ins[0]);
@@ -302,10 +325,20 @@ impl Backend for CpuBackend {
                 };
                 let nt = node.out_shape[1];
                 let nkt = meta.nkt;
-                // KV region: [K (n_embd*n_ctx) | V]
-                let n_ctx = (ins[1].len() / 2) / nkt;
-                let ka = &ins[1][..n_ctx * nkt];
-                let va = &ins[1][n_ctx * nkt..];
+                // K and V are separate persistent regions per layer
+                let (k_id, v_id) = kv_pair
+                    .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
+                let k_slice: &[f32] = if k_id < out_buf {
+                    &before[k_id]
+                } else {
+                    &after[k_id - out_buf - 1]
+                };
+                let v_slice: &[f32] = if v_id < out_buf {
+                    &before[v_id]
+                } else {
+                    &after[v_id - out_buf - 1]
+                };
+                let n_ctx = k_slice.len() / nkt;
                 // current KV size = max position + 1
                 let nkv = (0..nt)
                     .map(|t| ins[2][t].to_bits() as usize + 1)
@@ -315,7 +348,7 @@ impl Backend for CpuBackend {
                 let pos: Vec<usize> = (0..nt).map(|t| ins[2][t].to_bits() as usize).collect();
                 let mut scrs = vec![0.0f32; nkv.max(1)];
                 cpu_gqa_attn(
-                    ins[0], ka, va, &pos, nt, nkv, meta.n_head, meta.n_head_kv, meta.hd,
+                    ins[0], k_slice, v_slice, &pos, nt, nkv, meta.n_head, meta.n_head_kv, meta.hd,
                     meta.hd_kv, nkt, out, &mut scrs, meta.scale,
                 )?;
                 Ok(())
@@ -346,7 +379,7 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn synchronize(&self) {}
+    fn synchronize(&mut self) {}
 }
 
 /// RoPE per-head (same math as forward.rs's apply_rope).
@@ -603,6 +636,7 @@ mod tests {
             pos,
             crate::graph::ops::AttnMode::Gqa,
             super::super::ops::AttnMeta {
+                layer: 0,
                 n_head: 2,
                 n_head_kv: 2,
                 hd: 2,

@@ -15,16 +15,21 @@ pub enum GraphType {
 }
 
 /// Runtime parameters that affect graph construction.
+///
+/// `gpu` records whether the GPU backend participates — the backend assignment
+/// is part of the built graph, so a change (e.g. MPS init between runs) must
+/// force a rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CParams {
     pub n_ctx: usize,
     pub n_batch: usize,
     pub flash_attn: bool,
+    pub gpu: bool,
 }
 
 impl Default for CParams {
     fn default() -> Self {
-        Self { n_ctx: 4096, n_batch: 128, flash_attn: false }
+        Self { n_ctx: 4096, n_batch: 128, flash_attn: false, gpu: false }
     }
 }
 

@@ -790,14 +790,23 @@ impl MpsCommandBuffer<'_> {
     pub fn gqa_attn_f32(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
         o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
     ) {
+        self.gqa_attn_f32_off(q, 0, k, 0, v, 0, o, positions, nh, nk, hd, scale, nt);
+    }
+
+    /// Offset variant of `gqa_attn_f32` — K/V may live at byte offsets inside a
+    /// shared buffer (the graph backend's `[K | V]` contiguous KV region).
+    pub fn gqa_attn_f32_off(&self, q: &metal::Buffer, q_off: u64,
+        k: &metal::Buffer, k_off: u64, v: &metal::Buffer, v_off: u64,
+        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
+    ) {
         self.trace_op("gqa_attn");
         let gqa = nh / nk;
         self.enc.set_compute_pipeline_state(
             if kv_cache_is_f16() { &self.state.pl_gqa_attn_f16 } else { &self.state.pl_gqa_attn }
         );
-        self.enc.set_buffer(0, Some(q), 0);
-        self.enc.set_buffer(1, Some(k), 0);
-        self.enc.set_buffer(2, Some(v), 0);
+        self.enc.set_buffer(0, Some(q), q_off);
+        self.enc.set_buffer(1, Some(k), k_off);
+        self.enc.set_buffer(2, Some(v), v_off);
         self.enc.set_buffer(3, Some(o), 0);
         self.enc.set_buffer(4, Some(positions), 0);
         self.set_params(5, &(nh as i32));
@@ -1407,6 +1416,34 @@ impl MpsState {
         #[cfg(not(target_os = "macos"))] { false }
         #[cfg(target_os = "macos")]
         { self.inner.weights.lock().unwrap().contains_key(name) }
+    }
+
+    /// Look up a registered weight's (buffer, byte offset) — used by the graph
+    /// Metal backend to dispatch per-op kernels without holding the Tensor.
+    pub fn weight_buf(&self, name: &str) -> Option<(metal::Buffer, u64)> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = name;
+            None
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.weights.lock().unwrap().get(name).cloned()
+        }
+    }
+
+    /// Allocate a shared-memory f32 buffer (visible to both CPU and GPU) for
+    /// the graph backend's buffer pool.
+    pub fn new_f32_buffer(&self, n_elements: usize) -> metal::Buffer {
+        #[cfg(not(target_os = "macos"))]
+        {
+            unreachable!()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let bytes = (n_elements * 4) as u64;
+            self.inner.device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared)
+        }
     }
 
     /// Register an mmap'd GGUF part for zero-copy weight wrapping. The part

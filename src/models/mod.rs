@@ -11,6 +11,9 @@ use crate::vec_ops::RopeStyle;
 pub trait ModelDef {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
 
+    /// Downcast helper for the graph path's weight registration.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Build the declarative compute graph for one forward step (Phase 5).
     /// Topology is a deterministic function of `params` (reuse invariant).
     fn build_graph(&self, _params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {

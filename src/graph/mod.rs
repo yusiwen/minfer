@@ -12,6 +12,8 @@ pub mod cache;
 pub mod cpu_backend;
 pub mod dot;
 pub mod fusion;
+#[cfg(target_os = "macos")]
+pub mod metal_backend;
 pub mod ops;
 pub mod params;
 pub mod scheduler;
@@ -45,7 +47,7 @@ impl DType {
 }
 
 /// Execution backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Backend {
     CPU,
     Metal,

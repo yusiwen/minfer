@@ -32,6 +32,10 @@ impl ModelDef for Qwen2Model {
         forward::forward(self, tokens, positions, kv, n_out)
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn build_graph(&self, params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {
         graph::Qwen2Graph::build(self, params)
     }

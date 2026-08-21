@@ -69,6 +69,7 @@ impl GraphBuilder {
             NodeMeta::Embed(EmbedMeta {
                 vocab_size: weight.shape[1] as usize,
                 weight_name: weight.name.clone(),
+                weight_ttype: weight.ttype,
             }),
         )
     }
@@ -108,6 +109,9 @@ impl GraphBuilder {
             NodeMeta::MatMul(MatMulMeta {
                 weight_name: w.name.clone(),
                 bias_name: bias.map(|b| b.name.clone()),
+                weight_ttype: w.ttype,
+                in_dim: w.shape[0] as usize,
+                out_dim: w.shape[1] as usize,
             }),
         )
     }

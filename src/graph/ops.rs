@@ -5,6 +5,7 @@
 //! carry only the layer index; the write position is injected via an input node
 //! (`positions`), so the graph topology never depends on `n_past`.
 
+use crate::tensor::TensorType;
 use crate::vec_ops::RopeStyle;
 
 /// Attention mode.
@@ -89,11 +90,17 @@ pub enum NodeMeta {
 }
 
 /// Matmul target weight (+ optional bias) — resolved to a backend buffer by
-/// name at execution time.
+/// name at execution time; `weight_ttype` lets GPU backends pick the kernel
+/// without holding the whole Tensor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatMulMeta {
     pub weight_name: String,
     pub bias_name: Option<String>,
+    pub weight_ttype: TensorType,
+    /// Weight dims under the GGUF convention: memory `[out][in]` row-major,
+    /// metadata `[in, out]` — so `in_dim = shape[0]`, `out_dim = shape[1]`.
+    pub in_dim: usize,
+    pub out_dim: usize,
 }
 
 /// Normalization weight/bias names.
@@ -113,9 +120,12 @@ pub struct RoPEMeta {
     pub hd: usize,
 }
 
-/// Attention params. `nkt` = KV row stride (n_embd), `scale` = QK scale.
+/// Attention params. `layer` lets the backend resolve the layer's K/V regions
+/// (each layer has two persistent regions: K and V). `nkt` = KV row stride
+/// (n_embd), `scale` = QK scale.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttnMeta {
+    pub layer: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
     pub hd: usize,
@@ -134,4 +144,5 @@ pub struct KvcacheMeta {
 pub struct EmbedMeta {
     pub vocab_size: usize,
     pub weight_name: String,
+    pub weight_ttype: TensorType,
 }
