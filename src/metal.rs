@@ -350,7 +350,7 @@ impl MpsCommandBuffer<'_> {
     /// kernels stage 8 KB of threadgroup memory (sa 4 KB + sb 2 KB + bc_out
     /// 8 KB reusing sa/sb) — verified against the queried device limit.
     fn gemm_dispatch(&self, pl: &metal::ComputePipelineState, wb: &metal::Buffer,
-        x: &metal::Buffer, out: &metal::Buffer, od: usize, id: usize, nt: usize,
+        x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         if 8192 > self.state.max_threadgroup_memory {
             gpu_abort(&format!(
@@ -360,7 +360,7 @@ impl MpsCommandBuffer<'_> {
         }
         self.enc.set_compute_pipeline_state(pl);
         self.enc.set_buffer(0, Some(wb), 0);
-        self.enc.set_buffer(1, Some(x), 0);
+        self.enc.set_buffer(1, Some(x), x_off);
         self.enc.set_buffer(2, Some(out), 0);
         let mm_p = [od as i32, id as i32, nt as i32];
         self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -386,11 +386,11 @@ impl MpsCommandBuffer<'_> {
     ) {
         let weights = self.state.weights.lock().unwrap();
         let wb = weights.get(&w.name).expect("weight not on GPU");
-        self.quant_matmul_f32_on_gpu_buf(wb, w.ttype, x, out, od, id, nt);
+        self.quant_matmul_f32_on_gpu_buf(wb, w.ttype, x, 0, out, od, id, nt);
     }
 
     pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
-        x: &metal::Buffer, out: &metal::Buffer, od: usize, id: usize, nt: usize,
+        x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         self.trace_op("matmul");
         // GPU safety (M1): the K-quant (super-block) kernels index weights by
@@ -404,13 +404,13 @@ impl MpsCommandBuffer<'_> {
         match ttype {
             TensorType::Q8_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -429,7 +429,7 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 16 && Self::gemm_enabled() {
                     // both Q4_K and Q6_K have simdgroup GEMMs
                     let pl = if ttype == TensorType::Q6_K { &self.state.pl_q6_k_mm_f32 } else { &self.state.pl_q4_k_mm_f32 };
-                    self.gemm_dispatch(pl, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(pl, wb, x, x_off, out, od, id, nt);
                 } else {
                     let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
                         if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
@@ -438,7 +438,7 @@ impl MpsCommandBuffer<'_> {
                     };
                     self.enc.set_compute_pipeline_state(pl);
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -456,13 +456,13 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q4_1 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -472,13 +472,13 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -488,13 +488,13 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_1 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -504,13 +504,13 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_K => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -524,13 +524,13 @@ impl MpsCommandBuffer<'_> {
                 // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
                 // dominates for tiny prefills).
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, x, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
                     );
                     self.enc.set_buffer(0, Some(wb), 0);
-                    self.enc.set_buffer(1, Some(x), 0);
+                    self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
                     self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -543,7 +543,7 @@ impl MpsCommandBuffer<'_> {
                     if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
                 );
                 self.enc.set_buffer(0, Some(wb), 0);
-                self.enc.set_buffer(1, Some(x), 0);
+                self.enc.set_buffer(1, Some(x), x_off);
                 self.enc.set_buffer(2, Some(out), 0);
                 let mm_p = [od as i32, id as i32, nt as i32];
                 self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
@@ -588,10 +588,10 @@ impl MpsCommandBuffer<'_> {
     /// matching llama.cpp's Metal backend which does not Q8_0-quantize activations).
     /// Pre-looked-up weight buffer and type — avoids per-matmul HashMap locking.
     fn matmul_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
-        _q8_x: &metal::Buffer, f32_x: &metal::Buffer, out: &metal::Buffer,
-        od: usize, id: usize, nt: usize,
+        _q8_x: &metal::Buffer, f32_x: &metal::Buffer, x_off: u64,
+        out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
-        self.quant_matmul_f32_on_gpu_buf(wb, ttype, f32_x, out, od, id, nt);
+        self.quant_matmul_f32_on_gpu_buf(wb, ttype, f32_x, x_off, out, od, id, nt);
     }
 
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.
@@ -650,11 +650,19 @@ impl MpsCommandBuffer<'_> {
 
     /// Element-wise add: z = x + y
     pub fn add_f32(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer, n: usize) {
+        self.add_f32_off(x, y, z, n, 0, 0, 0);
+    }
+
+    /// Element-wise add with per-buffer byte offsets (last-layer output-rows
+    /// reduction: x/z read/write the tail n_out rows of `hidden`, y starts at 0).
+    pub fn add_f32_off(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer,
+        n: usize, x_off: u64, y_off: u64, z_off: u64,
+    ) {
         self.trace_op("add");
         self.enc.set_compute_pipeline_state(&self.state.pl_add);
-        self.enc.set_buffer(0, Some(x), 0);
-        self.enc.set_buffer(1, Some(y), 0);
-        self.enc.set_buffer(2, Some(z), 0);
+        self.enc.set_buffer(0, Some(x), x_off);
+        self.enc.set_buffer(1, Some(y), y_off);
+        self.enc.set_buffer(2, Some(z), z_off);
         self.set_params(3, &(n as i32));
         // float4 kernel: 4 elements/thread (ceil for the scalar tail)
         self.dispatch_1d(((n as u64) + 3) / 4, 256);
@@ -1693,6 +1701,7 @@ impl MpsState {
         nh: usize, nk: usize, hd: usize,
         eps: f32, attn_scale: f32, freq_base: f32, freq_scale: f32,
         rope_style: i32,
+        n_out: usize, is_last: bool,
     ) -> bool {
         let attn_norm = match &l.attn_norm { Some(t) => t, None => return false };
         let ffn_norm  = match &l.ffn_norm  { Some(t) => t, None => return false };
@@ -1884,7 +1893,7 @@ impl MpsState {
                     bqkv_buf.length(), (od_total * 4) as u64
                 ));
             }
-            if !sk.matmul { cb.matmul_on_gpu_buf(&buf_qkv, wq.ttype, &q8_bn, &bn, &bqkv_buf, od_total, ne, nt); }
+            if !sk.matmul { cb.matmul_on_gpu_buf(&buf_qkv, wq.ttype, &q8_bn, &bn, 0, &bqkv_buf, od_total, ne, nt); }
             // Fused bias+RoPE+KV-store (nt==1 only): replaces the 7 separate
             // bias/rope/store dispatches below. Requires all three biases + even
             // hd (rope pair mapping); MINFER_NO_FUSE_BSR=1 disables it for A/B.
@@ -1925,9 +1934,9 @@ impl MpsState {
                 }
             }
         } else {
-            cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, &bq_buf, nqt, ne, nt);
-            cb.matmul_on_gpu_buf(&buf_wk, wk.ttype, &q8_bn, &bn, &bk_buf, nkt, ne, nt);
-            cb.matmul_on_gpu_buf(&buf_wv, wv.ttype, &q8_bn, &bn, &bv_buf, nkt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, 0, &bq_buf, nqt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wk, wk.ttype, &q8_bn, &bn, 0, &bk_buf, nkt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wv, wv.ttype, &q8_bn, &bn, 0, &bv_buf, nkt, ne, nt);
             if !sk.small {
                 if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt, 0); }
                 if let Some(bb) = &bk_bias { cb.add_bias_f32(&bk_buf, bb, nkt, nt, 0); }
@@ -1960,8 +1969,19 @@ impl MpsState {
             }
         }
         // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        if !sk.matmul { cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, &bn, ne, ne, nt); }
-        if !sk.small { cb.add_f32(&hidden, &bn, &hidden, nt * ne); }
+        if !sk.matmul { cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, 0, &bn, ne, ne, nt); }
+        // FFN input rows for the LAST layer are reduced to n_out (llama
+        // ggml_get_rows(inp_out_ids) at qwen2.cpp:106-108); everything after the
+        // attention — both residuals, ffn_norm, gate/up/down, swiglu — runs on the
+        // tail n_out rows only. Non-last layers keep the full nt.
+        let (ffn_nt, ffn_off) = if is_last { (n_out, nt - n_out) } else { (nt, 0) };
+        if !sk.small {
+            if ffn_nt == nt {
+                cb.add_f32(&hidden, &bn, &hidden, nt * ne);
+            } else {
+                cb.add_f32_off(&hidden, &bn, &hidden, ffn_nt * ne, (ffn_off * ne * 4) as u64, (ffn_off * ne * 4) as u64, (ffn_off * ne * 4) as u64);
+            }
+        }
 
         // FFN branch
         let ffn_all_q4 = ffn_gate.ttype == TensorType::Q4_0 && ffn_up.ttype == TensorType::Q4_0;
@@ -1973,8 +1993,9 @@ impl MpsState {
         }
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps, 0); }
-            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, nt, eps, 0); }
+            let ffn_off_bytes = (ffn_off * ne * 4) as u64;
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
+            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
         }
         // Fused FFN gate+up (nt==1 decode): one matmul on the concatenated
         // gate+up weight → bgu; swiglu reads gate at offset 0 and up at nf.
@@ -2000,23 +2021,30 @@ impl MpsState {
                 ));
             }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_gu, ffn_gate.ttype, &q8_ba, &ba_buf, &bgu_buf, od_total, ne, nt);
+                cb.matmul_on_gpu_buf(&buf_gu, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bgu_buf, od_total, ne, nt);
             }
             if !sk.small { cb.swiglu_f32_off(&bgu_buf, &bgu_buf, &bgu_buf, nt * nf, nt * nf); }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bgu_buf, &bn, ne, nf, nt);
+                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bgu_buf, 0, &bn, ne, nf, nt);
             }
         } else {
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, &bg_buf, nf, ne, nt);
-                cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, &bf_buf, nf, ne, nt);
+                cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bg_buf, nf, ne, ffn_nt);
+                cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, 0, &bf_buf, nf, ne, ffn_nt);
             }
-            if !sk.small { cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, nt * nf); }
+            if !sk.small { cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, ffn_nt * nf); }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, &bn, ne, nf, nt);
+                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, 0, &bn, ne, nf, ffn_nt);
             }
         }
-        if !sk.small { cb.add_f32(&hidden, &bn, &hidden, nt * ne); }
+        if !sk.small {
+            if ffn_nt == nt {
+                cb.add_f32(&hidden, &bn, &hidden, nt * ne);
+            } else {
+                cb.add_f32_off(&hidden, &bn, &hidden, ffn_nt * ne,
+                    (ffn_off * ne * 4) as u64, 0, (ffn_off * ne * 4) as u64);
+            }
+        }
 
         self.inner.kv_size.write().unwrap()[il] = max_pos + 1;
         true
@@ -2084,7 +2112,7 @@ impl MpsState {
         }
 
         // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, &logits, nv, ne, n_out); }
+        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, 0, &logits, nv, ne, n_out); }
         if !sk.small {
             if let Some(bb) = &bias_buf {
                 cb.add_bias_f32(&logits, bb, nv, n_out, 0);
@@ -2190,7 +2218,7 @@ mod tests {
             let acts = dev.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
             let out = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
             let cb = mps.cmd_buffer();
-            for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, TensorType::Q4_0, &acts, &acts, &out, 2048, 128, 1); }
+            for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, TensorType::Q4_0, &acts, &acts, 0, &out, 2048, 128, 1); }
             cb.submit().expect("warmup");
         }
         for &(label, ttype, od, id, n) in cases {
@@ -2212,7 +2240,7 @@ mod tests {
             // the first measurement of a kernel is up to ~4x slow otherwise).
             {
                 let cb = mps.cmd_buffer();
-                for _ in 0..(n / 2).max(16) { cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, &out, od, id, 1); }
+                for _ in 0..(n / 2).max(16) { cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, 0, &out, od, id, 1); }
                 cb.submit().expect("warmup");
             }
 
@@ -2222,7 +2250,7 @@ mod tests {
             for rep in 0..2 {
                 let cb = mps.cmd_buffer();
                 for _ in 0..n {
-                    cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, &out, od, id, 1);
+                    cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, 0, &out, od, id, 1);
                 }
                 let t0 = std::time::Instant::now();
                 cb.submit().expect("submit");
@@ -2625,14 +2653,14 @@ mod tests {
             // warm
             {
                 let cb = mps.cmd_buffer();
-                for _ in 0..20 { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, &out, od, id, nt); }
+                for _ in 0..20 { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, 0, &out, od, id, nt); }
                 cb.submit().expect("warmup");
             }
             let n = 50;
             let mut us: Vec<f64> = Vec::new();
             for _ in 0..3 {
                 let cb = mps.cmd_buffer();
-                for _ in 0..n { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, &out, od, id, nt); }
+                for _ in 0..n { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, 0, &out, od, id, nt); }
                 let t0 = std::time::Instant::now();
                 cb.submit().expect("submit");
                 let dt = t0.elapsed().as_secs_f64();

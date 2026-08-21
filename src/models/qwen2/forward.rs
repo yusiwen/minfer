@@ -89,7 +89,7 @@ pub fn forward(
             let mut gpu_failed = false;
             for il in 0..model.n_layer() {
                 let l = &model.layers[il];
-                if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32) {
+                if !mps.layer_gpu(&cb, il, l, positions, ne, nqt, nkt, nf, nt, nh, nk, hd, eps, hp.attention_scale(), hp.rope_freq_base, hp.rope_freq_scale, hp.rope_style as i32, n_out, il == model.n_layer() - 1) {
                     gpu_failed = true;
                     cpu_start_layer = il;
                     break;
@@ -266,6 +266,11 @@ pub fn forward(
         // ─── CPU path ──────────────────────────────────────────────
         for il in cpu_start_layer..model.n_layer() {
             let l = &model.layers[il];
+            // Last layer: everything after the attention runs on the tail n_out
+            // rows only (llama ggml_get_rows(inp_out_ids) at qwen2.cpp:106-108).
+            let is_last = il == model.n_layer() - 1;
+            let ffn_nt = if is_last { n_out } else { nt };
+            let ffn_off = nt - ffn_nt; // row offset into hidden for the tail n_out rows
             rms_norm(&hidden, eps, &mut bn, nt, ne, l.attn_norm.as_ref().map(|t| t.data_f32()));
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bn", &bn, nt, il == 0);
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bn", &bn, nt, il == 2);
@@ -291,22 +296,22 @@ pub fn forward(
             crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_ba", &ba, nt, il == 2);
             crate::kernel::quant_matmul_f32(l.wo.as_ref().unwrap(), &ba, &mut bn, ne, ne, nt);
             unsafe {
-                crate::vec_ops::vec_add_f32(hidden.len(),
-                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),
-                    std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
-                    &bn);
+                crate::vec_ops::vec_add_f32(ffn_nt * ne,
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr().add(ffn_off * ne), ffn_nt * ne),
+                    std::slice::from_raw_parts(hidden.as_ptr().add(ffn_off * ne), ffn_nt * ne),
+                    &bn[ffn_off * ne..ffn_off * ne + ffn_nt * ne]);
             }
         crate::dump::maybe_dump_prefill_or_gen0(&format!("minfer_dump_layer{}_attn_out", il), &hidden, nt);
-            rms_norm(&hidden, eps, &mut bf[..nt * ne], nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
-            let ffn_in = bf[..nt * ne].to_vec();
+            rms_norm(&hidden[ffn_off * ne..], eps, &mut bf[..ffn_nt * ne], ffn_nt, ne, l.ffn_norm.as_ref().map(|t| t.data_f32()));
+            let ffn_in = bf[..ffn_nt * ne].to_vec();
             crate::kernel::quant_matmul_f32_batch(&mut [
                 (l.ffn_gate.as_ref().unwrap(), &mut bg, nf),
                 (l.ffn_up.as_ref().unwrap(),   &mut bf, nf),
-            ], &ffn_in, ne, nt);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bg", &bg, nt, il == 0);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bg", &bg, nt, il == 2);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bf", &bf, nt, il == 2);
-            let len = nt * nf;
+            ], &ffn_in, ne, ffn_nt);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_bg", &bg, ffn_nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bg", &bg, ffn_nt, il == 2);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_bf", &bf, ffn_nt, il == 2);
+            let len = ffn_nt * nf;
             unsafe {
                 crate::vec_ops::vec_silu_f32(len,
                     std::slice::from_raw_parts_mut(bg.as_mut_ptr(), len),
@@ -316,16 +321,16 @@ pub fn forward(
                     std::slice::from_raw_parts(bg.as_ptr(), len),
                     &bf);
             }
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_swiglu", &bg, nt, il == 0);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_swiglu", &bg, nt, il == 2);
-            crate::kernel::quant_matmul_f32(l.ffn_down.as_ref().unwrap(), &bg[..nt * nf], &mut bn, ne, nf, nt);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_fd", &bn, nt, il == 0);
-            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_fd", &bn, nt, il == 2);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_swiglu", &bg, ffn_nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_swiglu", &bg, ffn_nt, il == 2);
+            crate::kernel::quant_matmul_f32(l.ffn_down.as_ref().unwrap(), &bg[..ffn_nt * nf], &mut bn, ne, nf, ffn_nt);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer0_fd", &bn, ffn_nt, il == 0);
+            crate::dump::maybe_dump_prefill_or_gen0_if("minfer_dump_layer2_fd", &bn, ffn_nt, il == 2);
             unsafe {
-                crate::vec_ops::vec_add_f32(hidden.len(),
-                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr(), hidden.len()),
-                    std::slice::from_raw_parts(hidden.as_ptr(), hidden.len()),
-                    &bn);
+                crate::vec_ops::vec_add_f32(ffn_nt * ne,
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr().add(ffn_off * ne), ffn_nt * ne),
+                    std::slice::from_raw_parts(hidden.as_ptr().add(ffn_off * ne), ffn_nt * ne),
+                    &bn[..ffn_nt * ne]);
             }
         crate::dump::maybe_dump_prefill_or_gen0(&format!("minfer_dump_layer{}_out", il), &hidden, nt);
         }

@@ -106,8 +106,8 @@
 | 3.9 | Per layer: attention | `build_attn` → `build_attn_mha`: flash path `ggml_flash_attn_ext`; non-flash `mul_mat(k,q)`+`soft_max_ext`+`mul_mat(v,kq)` | `llama-graph.cpp:2517,2557` | `src/metal.rs:949` (attn_flash_prefill) / `:741` (gqa_attn_f32) |
 | 3.10 | Per layer: wo + residual | `build_attn` inner `build_lora_mm(wo)` + `ggml_add` | `llama-graph.cpp:2677` `src/models/qwen2.cpp:110` | `src/metal.rs:392` (wo matmul) + `:648` (add) |
 | 3.11 | Per layer: ffn_norm | `build_norm` | `src/models/qwen2.cpp:114` | `rms_norm` |
-| 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal.rs:692` (swiglu) + `:392` (down matmul) |
-| 3.13 | Per layer: residual | `ggml_add` | `src/models/qwen2.cpp:127` | `add_f32` |
+| 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal.rs:692` (swiglu) + `:392` (down matmul) — **2026-08-21: last layer runs on `n_out` rows only (llama's `get_rows` reduction, #34)** |
+| 3.13 | Per layer: residual | `ggml_add` | `src/models/qwen2.cpp:127` | `add_f32` — **2026-08-21: last layer's both residuals on the tail `n_out` rows (`add_f32_off`, #34)** |
 | 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal.rs:2072` (rms_norm inside output_norm_gpu) — **2026-08-21: also output-rows-only (`n_out`), matching llama** |
 | 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal.rs:2078` (output GEMM) — **2026-08-21: now output-rows-only (`n_out`), matching llama** |
 | 3.16 | Node ordering | `ggml_build_forward_expand` → `ggml_build_forward_impl` → `ggml_visit_parents_graph` (DFS, parents before children) | `ggml.c:7188,7120` | "N/A" (minfer encodes imperatively in layer order) |
@@ -304,10 +304,12 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
    layer-by-layer directly into a single MPS command buffer). No
    scheduler/allocator layer; `src/cache.rs` holds KV directly.
 1b. **Output-rows reduction (2026-08-21)**: llama shrinks the graph to
-   `n_outputs` rows after the last attention (`get_rows(inp_out_ids)`,
-   `qwen2.cpp:106-108`) → last-layer FFN + final norm + lm_head run on 1 row.
-   minfer now mirrors this for the final norm + lm_head (`n_out` param); the
-   last-layer FFN still runs on all nt (≈40 ms follow-up, minfer §3.7).
+   `n_outputs` rows after the last attention (`get_rows(cur, inp_out_ids)` +
+   `get_rows(inpSA, inp_out_ids)`, `qwen2.cpp:106-108`) → the last layer's
+   FFN + both residuals + final norm + lm_head all run on 1 row. minfer mirrors
+   the FULL reduction: final norm + lm_head via `n_out` (#32), and the last
+   layer's FFN + residuals via `layer_gpu(n_out, is_last)` (#34) — minfer's
+   total graph work (≈6.26 TFLOP) now exactly equals llama's.
 2. **Level-for-level equivalence proven** (minfer `docs/METAL_OPTIMIZATIONS.md`
    §3.4/§3.6): the prefill GEMM kernels (`kernel_mul_mm` vs
    `kernel_q*_mm_f32`) match at source/IR/smem/dispatch/runtime-compile level;
