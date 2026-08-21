@@ -658,6 +658,15 @@ requirement. No other prefill path remains open (§3.6 / §0 decided #1).
 the minfer-vs-llama prefill work difference 6.46 vs 6.26 TFLOP) is now **DONE
 (#34)** — no prefill work difference remains; minfer's total equals llama's.
 
+**2026-08-21 (#41, DEFERRED)**: **quantized KV cache** (llama #27390/#27438 —
+Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 KV: prefill dequantizes to f16 scratch via
+`kernel_flash_attn_ext_kv_f16` when `ne01≥32`; decode reads quantized blocks
+directly in the flash vec kernel). Analyzed against llama source (ops.cpp:2805-
+2831, metal.metal:6328-6366/7864-7885) and **deferred**: the shipped models cap
+at `max_seq=32768` — f16 KV (#37) needs only 1.9 GB at 32K (within the 8.7 GB
+mmap-era RSS), so Q8_0 KV (0.96 GB) has no validation target on the current
+models. Revisit when a >32K-context model is the user-facing one.
+
 ### 4.2 Cold-start optimization to-dos (2026-08-21)
 
 **Observed**: 7B run twice in a row → the second run ≈ 2× faster (Total
