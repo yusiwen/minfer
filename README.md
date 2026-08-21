@@ -210,11 +210,14 @@ cargo run --release -- list
 ## Performance
 
 > The table below was measured on the **legacy `layer_gpu` path** (pre-compute-
-> graph). Since Phase 6 the compute-graph path is the default: **0.5B decode is
-> at parity (~217 tok/s)**, **7B decode is ~42 tok/s** (~10 % below the legacy
-> ~48 — the graph path still uses the classic attention kernel; wiring the
-> isolated-tested flash/split attention kernels is pending, see
-> [`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md) §0.1/§4.3).
+> graph). Since Phase 6 the compute-graph path is the default. Its measured
+> state (M4 Pro, 2026-08-21): **CPU is exact parity**; **short-context decode is
+> near parity** (0.5B ~202 t/s vs ~218, 7B ~41 vs ~48); but **prefill and
+> long-context decode regress** — the graph path still uses the classic
+> attention kernel (no flash/split), so decode slows with KV growth (7B ~32 t/s
+> at KV 200+) and prefill is −35…−48 %. Wiring the isolated-tested flash/split
+> attention kernels is pending — see
+> [`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md) §0.1/§4.3.
 
 **Qwen2 / Qwen2.5 on Apple M4 Pro / RTX 2080 Ti (2026-08-21):**
 

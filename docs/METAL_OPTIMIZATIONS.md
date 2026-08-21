@@ -42,13 +42,29 @@ already transfer:
 | Fused decode QKV / bias+rope+store (`attn_bias_rope_store`) | — (layer_gpu-only fused kernels) | ⬜ graph builds separate ops — more dispatches, no fused decode path |
 | `n_out` tail-row optimization (#32/#34) | — | ⬜ not ported — the graph computes full `nt` and extracts the tail logits rows (numerically identical, plan §17.16) |
 
-**Graph-path measured numbers** (same models, `--temp 0` greedy):
+**Graph-path measured numbers** (M4 Pro, `--temp 0` greedy, 2026-08-21; old-path
+figures from §1/§1.6 — same models):
 
-| Scenario | Old path (layer_gpu) | Graph path | Note |
+| Scenario | Old path (layer_gpu) | Graph path | Δ |
 |---|---|---|---|
-| 0.5B Q4_0 decode | ~218 t/s | **~217 t/s** | parity — matmul/embed kernels dominate; classic attention not the decode bottleneck at 0.5B |
-| 7B Q4_K_M decode | ~45-49 t/s | **~42.3 t/s** | ~10 % below old — classic `gqa_attn_f32` decode attention |
-| 7B Q4_K_M prefill | ~1234 ms @ pp499 | (not yet A/B'd) | graph runs the classic prefill attention + full-nt FFN — expect the old-path gap + attention gap |
+| 0.5B Q4_K_M decode, short KV (30→62) | ~218 t/s (§1.1, steady) | ~202 t/s | ≈ −7 % (near parity) |
+| 0.5B Q4_K_M decode, KV ~200+ | ~218 t/s steady | **~122 t/s** | **−44 % (KV-growth)** |
+| 0.5B Q4_0 decode (n=20…128) | ~279 t/s (§1.1, 128 tok) | ~170–217 t/s | −20…−40 % |
+| 0.5B Q4_K_M prefill pp390 | ~2530–2620 t/s (§1.1 pp430) | ~1663 t/s | **−35 %** |
+| 7B Q4_K_M decode, short KV | ~45–49 t/s | ~41–42 t/s | ≈ −12 % |
+| 7B Q4_K_M decode, KV ~200+ | ~48 t/s steady | **~32.5 t/s** | **−32 % (KV-growth)** |
+| 7B Q4_K_M prefill pp206 | ~240 t/s (§1.6 pp252) | ~124 t/s | **−48 %** |
+| 0.5B CPU decode | ~5.9 t/s | ~5.9 t/s | 0 % (exact parity) |
+
+**Reading**: the CPU path is exact parity (same kernels, bit-identical logits).
+Short-KV decode is near parity (~5-12 % slower — matmul/embed kernels dominate
+and transfer fully). The **significant regressions are attention-driven**: the
+classic `gqa_attn_f32` is O(nkv) per token with no KV-parallelism, so (a) decode
+slows as KV grows (0.5B −44 % at KV 200+, 7B −32 %) where the old split/flash
+attention held steady, and (b) prefill is −35…−48 % (the old parallel/flash
+prefill attention). The `n_out` tail-row optimization (not ported) adds full-nt
+FFN/lm_head work on top. All three are **wiring gaps** (G1–G4 below) — the
+isolated-tested fast kernels are unused by `MetalBackend`.
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① `Attn` → `gqa_attn_flash`/`gqa_attn_split_f32` (decode) + `attn_flash_prefill`/`attn_parallel_prefill` (prefill), gated like the old path (`flash_attn_enabled(hd)` etc.); ② `RmsNorm` → `rms_norm_256` when `rms_norm_256_enabled()`; ③ `n_out` tail-row `GetRows` (plan §5.5). These are pure wiring — the kernels are already isolated-tested.
 
