@@ -918,12 +918,12 @@ Phase 8: Verification
 |-------|------|------|-----------|------|
 | Phase 1 | IR 基础设施：`graph/mod.rs` + `ops.rs` + `builder.rs` + `alloc.rs` | ✅ | `33adfd1` | 12 个单元测试通过（topo 排序/环检测、Op 负载相等性、链式 liveness 缓冲复用、并行链隔离、输入填充、持久 KV 共享）；全套 46 通过（1 个既有环境失败：`attn_parallel_realdata_correctness` 需 /tmp/dp3 dump） |
 | Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs`（+ 最小执行器 `scheduler.rs`） | ✅ | `960d54b` | 16 个 graph 测试通过（matmul+bias+silu+scale 对照手工计算、rms_norm 对照 vec_ops、embedding+rope 对照参考、KV store/load + GQA attention 往返、liveness/IR）；全套 50 通过（1 个既有环境失败不变） |
-| Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜ | — | — |
+| Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜（下轮） | — | 现有 per-op kernel 已齐（rms_norm/matmul/rope/silu/swiglu/gqa_attn/store_kv/embed），需缓冲池 + command buffer 管理 + 跨后端拷贝 |
 | Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs`(assign/split/execute) + `fusion.rs` + `dot.rs` + `cache.rs` + `params.rs` | ✅ | `88fe6ef` | 11 个新测试（融合应用/门控、DOT 格式、缓存复用语义、切分边界/跨 split 边）；全套 61 通过（1 个既有环境失败不变） |
 | Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs`（`Qwen2Graph::build`） | ✅ | `2acfe83` | 真实模型 Qwen2.5-0.5B Q4_0：graph vs forward logits **max diff = 0.000e0**（prefill + decode，KV 跨步） |
 | Phase 6 | Wiring + Cleanup：ModelDef + build_graph/forward_graph、main.rs `--graph` 标志；**forward.rs 暂不删除**（作 logits 对比基线，Phase 8 验证通过后再删） | ✅ | `2acfe83` | CLI `--graph` 推理与旧路径输出一致（greedy 同 token）；CPU decode 速度持平（5.9 tok/s） |
-| Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | — |
-| Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | ⬜ | — | — |
+| Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | 本机无 nvcc（构建警告 CUDA 禁用），实现后无法编译验证，待有 CUDA 环境后实施 |
+| Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | 🔶 部分完成 | `b0f2f69` | ✅ 0.5B Q4_0 新旧 logits 逐位一致（max diff 0.0，prefill+decode）；✅ `--dump-graph` 导出可用（437 节点）；⬜ 7B GPU 路径待 Phase 3（Metal）完成 |
 
 ### 实施中偏离计划文档的记录
 
