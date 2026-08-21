@@ -6,6 +6,7 @@ mod avx2;
 mod kernel;
 mod tensor;
 mod vec_ops;
+mod graph;
 mod sampler;
 mod tokenizer;
 mod template;
