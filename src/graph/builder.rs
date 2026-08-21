@@ -7,7 +7,8 @@ use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
 use super::ops::{
-    AttnMeta, AttnMode, EmbedMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta, NormMeta, Op, RoPEMeta,
+    AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta, NormMeta,
+    Op, RoPEMeta,
 };
 use super::{CNode, ComputeGraph, DType, NodeId};
 
@@ -116,6 +117,29 @@ impl GraphBuilder {
         )
     }
 
+    /// Matmul against a GPU-registered weight by name (probes/tests only):
+    /// builds a MatMul node whose meta references `weight_name` directly.
+    pub fn matmul_by_name(
+        &mut self, x: NodeId, weight_name: &str, ttype: crate::tensor::TensorType,
+        out_dim: usize, in_dim: usize,
+    ) -> NodeId {
+        let nt = self.graph.nodes[x].out_shape[1];
+        self.node(
+            "matmul_named",
+            Op::MatMul { transpose_b: false },
+            &[x],
+            [out_dim, nt, 1, 1],
+            DType::F32,
+            NodeMeta::MatMul(MatMulMeta {
+                weight_name: weight_name.to_string(),
+                bias_name: None,
+                weight_ttype: ttype,
+                in_dim,
+                out_dim,
+            }),
+        )
+    }
+
     /// Generic row selection: `out[t] = x[ids[t]]` (llama `ggml_get_rows`;
     /// also used for the n_out tail-row reduction). `ids` is an I32 input.
     pub fn get_rows(&mut self, x: NodeId, ids: NodeId, out_shape: [usize; 4]) -> NodeId {
@@ -137,6 +161,22 @@ impl GraphBuilder {
             [od_total, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedQkv(meta),
+        )
+    }
+
+    /// decode (nt==1) fused FFN gate+up: one concat matmul (`ffn_gu`) whose
+    /// output buffer carries gate (rows 0..nf) and up (nf..2*nf); a single
+    /// in-place swiglu pass folds silu(gate)*up into the gate rows. The next
+    /// down matmul reads rows 0..nf (od = nf). Output shape = [2*nf, nt].
+    pub fn fused_ffn(&mut self, x: NodeId, meta: FusedFfnMeta) -> NodeId {
+        let nt = self.graph.nodes[x].out_shape[1];
+        self.node(
+            "fused_ffn",
+            Op::FusedFFN,
+            &[x],
+            [2 * meta.nf, nt, 1, 1],
+            DType::F32,
+            NodeMeta::FusedFfn(meta),
         )
     }
 

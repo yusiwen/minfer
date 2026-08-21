@@ -137,7 +137,7 @@ impl Backend for MetalBackend {
             }
             Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
-            Op::FusedQKV { .. } => dtype == DType::F32,
+            Op::FusedQKV { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
         }
@@ -219,6 +219,7 @@ impl Backend for MetalBackend {
                     NodeMeta::MatMul(m) => m,
                     other => return Err(format!("matmul node missing MatMulMeta: {other:?}")),
                 };
+
                 let (wb, w_off) = self
                     .state
                     .weight_buf(&meta.weight_name)
@@ -349,6 +350,38 @@ impl Backend for MetalBackend {
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
                 if in_bufs[0] != out_buf {
                     self.copy_in(out_buf, in_bufs[0]);
+                }
+                Ok(())
+            }
+            Op::FusedFFN => {
+                let meta = match &node.meta {
+                    NodeMeta::FusedFfn(m) => m,
+                    other => return Err(format!("fused_ffn node missing FusedFfnMeta: {other:?}")),
+                };
+                let (wb, w_off) = self
+                    .state
+                    .weight_buf(&meta.gu_weight)
+                    .ok_or_else(|| format!("gate+up weight '{}' not on GPU", meta.gu_weight))?;
+                let nt = node.out_shape[1];
+                debug_assert!(nt == 1, "FusedFFN is decode (nt==1) only, got nt={nt}");
+                let od_total = 2 * meta.nf;
+                // 1) concat matmul: x × [ffn_gate|ffn_up] → gate|up concat buffer
+                cb.quant_matmul_f32_on_gpu_buf(
+                    &wb, w_off, meta.weight_ttype, self.buf(in_bufs[0]), 0, self.buf(out_buf),
+                    od_total, meta.in_dim, nt,
+                );
+                // 2) swiglu in place: silu(gate rows 0..nf) * up rows nf..2*nf
+                //    (llama ggml_swiglu_split); result written back to gate rows
+                let n = nt * meta.nf;
+                cb.swiglu_f32_off(
+                    self.buf(out_buf), self.buf(out_buf), self.buf(out_buf), n, n,
+                );
+                if std::env::var("MINFER_FFNDEBUG").is_ok() {
+                    self.submit_pending();
+                    let nb = (self.pool[out_buf].length() as usize) / 4;
+                    let ob = unsafe { std::slice::from_raw_parts(self.buf(out_buf).contents() as *const f32, nb) };
+                    eprintln!("[ffn-out] FusedFFN out_buf={out_buf} len={nb} first4={:?} last4={:?}",
+                        &ob[..4], &ob[nb-4..]);
                 }
                 Ok(())
             }

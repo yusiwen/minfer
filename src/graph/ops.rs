@@ -76,6 +76,12 @@ pub enum Op {
     /// in one kernel pass (llama `attn_bias_rope_store`). Carries the layer so
     /// the scheduler can resolve the persistent K/V regions (kv_pair).
     FusedQKV { layer: usize },
+    /// decode (nt==1) fused FFN gate+up: one concat matmul (ffn_gate|ffn_up,
+    /// loader-registered `blk.{i}.ffn_gu`) whose output buffer carries gate
+    /// (rows 0..nf) and up (nf..2*nf); a single swiglu pass (silu(gate)*up,
+    /// llama `ggml_swiglu_split`) runs in place. The following down matmul
+    /// reads rows 0..nf (od = nf; nt==1 makes the concat layout safe).
+    FusedFFN,
 }
 
 /// Per-node metadata.
@@ -93,6 +99,7 @@ pub enum NodeMeta {
     Kvcache(KvcacheMeta),
     Embed(EmbedMeta),
     FusedQkv(FusedQkvMeta),
+    FusedFfn(FusedFfnMeta),
 }
 
 /// Matmul target weight (+ optional bias) — resolved to a backend buffer by
@@ -169,6 +176,19 @@ pub struct FusedQkvMeta {
     pub rope_style: RopeStyle,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
+}
+
+/// decode FFN gate+up fusion metadata: the loader-registered concat weight
+/// `blk.{i}.ffn_gu` (ffn_gate|ffn_up rows), the shared input dim, and the FFN
+/// output dim nf (gate rows 0..nf, up rows nf..2*nf in the output buffer).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedFfnMeta {
+    pub gu_weight: String,
+    pub weight_ttype: TensorType,
+    /// Weight dims (GGUF convention): `in_dim = shape[0]` (== n_embd), the
+    /// concat output has `2*nf` rows (`nf = shape[1]` of either weight).
+    pub in_dim: usize,
+    pub nf: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
