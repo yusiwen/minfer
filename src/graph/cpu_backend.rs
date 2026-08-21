@@ -266,9 +266,8 @@ impl Backend for CpuBackend {
                         out[t * n_embd..(t + 1) * n_embd].copy_from_slice(src);
                     }
                 } else {
-                    // quantized embedding: shared dequantization (forward.rs
-                    // embed_tokens — the canonical row getter)
-                    crate::models::qwen2::forward::embed_tokens(&ids, w, out, n_embd);
+                    // quantized embedding: shared dequantization
+                    crate::kernel::embed_tokens(&ids, w, out, n_embd);
                 }
                 Ok(())
             }

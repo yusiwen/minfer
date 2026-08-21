@@ -1,6 +1,5 @@
 // Qwen2 model definition + ModelDef impl
 
-pub mod forward;
 pub mod graph;
 pub mod loader;
 
@@ -29,7 +28,7 @@ impl Qwen2Model {
 
 impl ModelDef for Qwen2Model {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
-        forward::forward(self, tokens, positions, kv, n_out)
+        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -87,7 +87,9 @@ fn main() {
     let mut params = GenParams::default();
     let mut meta_flag = false;
     let mut no_template = false;
-    let mut graph_mode = false;
+    // `--graph` is accepted for compatibility; the graph path is now the
+    // default forward (Phase 6).
+    let _graph_mode = false;
     let mut dump_graph: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
@@ -141,8 +143,7 @@ fn main() {
                 i += 2;
             }
             "--graph" => {
-                graph_mode = true;
-                i += 1;
+                i += 1; // accepted for compat; graph path is the default
             }
             "--dump-graph" => {
                 if let Some(v) = next_val("--dump-graph") {
@@ -326,11 +327,7 @@ fn main() {
     // single sequence, only the final token is sampled). llama.cpp does the same
     // via ggml_get_rows(inp_out_ids) at the last layer, shrinking the lm_head
     // to n_outputs rows — saves the full-nt output GEMM + logits download.
-    let logits = if graph_mode {
-        model.forward_graph(&input_ids, &positions, &mut kv_cache, 1)
-    } else {
-        model.forward(&input_ids, &positions, &mut kv_cache, 1)
-    };
+    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1);
     let last_logits: Vec<f32> = logits;
 
     let prefill_time = infer_start.elapsed();
@@ -395,11 +392,7 @@ fn main() {
         // forward() returns n_out*nv logits (n_out=1 for single-token decode,
         // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
         t1 = std::time::Instant::now();
-        logits = if graph_mode {
-            model.forward_graph(&[sampled.token_id], &[current_pos], &mut kv_cache, 1)
-        } else {
-            model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1)
-        };
+        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1);
         if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
     }
