@@ -8,8 +8,12 @@
 pub mod alloc;
 pub mod backend;
 pub mod builder;
+pub mod cache;
 pub mod cpu_backend;
+pub mod dot;
+pub mod fusion;
 pub mod ops;
+pub mod params;
 pub mod scheduler;
 
 use ops::{NodeMeta, Op};

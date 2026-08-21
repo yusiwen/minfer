@@ -59,6 +59,15 @@ impl GraphAllocator {
         self.cpu.register_weight(name, t);
     }
 
+    /// Which backend supports this op/dtype (highest priority first).
+    /// With only the CPU backend registered this always yields CPU or None.
+    pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
+        if self.cpu.supports_op(op, dtype) {
+            return Some(Backend::CPU);
+        }
+        None
+    }
+
     /// Liveness analysis + allocation for every node buffer.
     pub fn alloc_graph(&mut self, graph: &ComputeGraph) -> Result<(), String> {
         self.node_to_buf.clear();
