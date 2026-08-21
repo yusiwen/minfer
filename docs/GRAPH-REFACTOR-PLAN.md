@@ -918,12 +918,12 @@ Phase 8: Verification
 |-------|------|------|-----------|------|
 | Phase 1 | IR 基础设施：`graph/mod.rs` + `ops.rs` + `builder.rs` + `alloc.rs` | ✅ | `33adfd1` | 12 个单元测试通过（topo 排序/环检测、Op 负载相等性、链式 liveness 缓冲复用、并行链隔离、输入填充、持久 KV 共享）；全套 46 通过（1 个既有环境失败：`attn_parallel_realdata_correctness` 需 /tmp/dp3 dump） |
 | Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs`（+ 最小执行器 `scheduler.rs`） | ✅ | `960d54b` | 16 个 graph 测试通过（matmul+bias+silu+scale 对照手工计算、rms_norm 对照 vec_ops、embedding+rope 对照参考、KV store/load + GQA attention 往返、liveness/IR）；全套 50 通过（1 个既有环境失败不变） |
-| Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜（下轮） | — | 现有 per-op kernel 已齐（rms_norm/matmul/rope/silu/swiglu/gqa_attn/store_kv/embed），需缓冲池 + command buffer 管理 + 跨后端拷贝 |
+| Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（per-op 接线）+ 跨后端调度 | ✅ | `2d53921` | 15 个新测试（元素级/rms_norm/matmul Q8_0+Q4_0 对照手工参考、跨后端拷贝、多 split 交替、KV store+attention 真实尺度+decode、layer-0 全 Metal 与 CPU 逐位一致、真实权重 matmul）；CLI `--graph` GPU 输出流畅（"Hello! How can I assist you today..."，217 tok/s vs CPU 5.9） |
 | Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs`(assign/split/execute) + `fusion.rs` + `dot.rs` + `cache.rs` + `params.rs` | ✅ | `88fe6ef` | 11 个新测试（融合应用/门控、DOT 格式、缓存复用语义、切分边界/跨 split 边）；全套 61 通过（1 个既有环境失败不变） |
 | Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs`（`Qwen2Graph::build`） | ✅ | `2acfe83` | 真实模型 Qwen2.5-0.5B Q4_0：graph vs forward logits **max diff = 0.000e0**（prefill + decode，KV 跨步） |
 | Phase 6 | Wiring + Cleanup：ModelDef + build_graph/forward_graph、main.rs `--graph` 标志；**forward.rs 暂不删除**（作 logits 对比基线，Phase 8 验证通过后再删） | ✅ | `2acfe83` | CLI `--graph` 推理与旧路径输出一致（greedy 同 token）；CPU decode 速度持平（5.9 tok/s） |
 | Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | 本机无 nvcc（构建警告 CUDA 禁用），实现后无法编译验证，待有 CUDA 环境后实施 |
-| Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | 🔶 部分完成 | `b0f2f69` | ✅ 0.5B Q4_0 新旧 logits 逐位一致（max diff 0.0，prefill+decode）；✅ `--dump-graph` 导出可用（437 节点）；⬜ 7B GPU 路径待 Phase 3（Metal）完成 |
+| Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | 🔶 部分完成 | `2d53921` | ✅ 0.5B Q4_0 新旧 logits 逐位一致（max diff 0.0，prefill+decode）；✅ `--dump-graph` 导出可用（437 节点）；✅ **7B GPU 路径验证中**：0.5B GPU 图路径输出流畅（217 tok/s）；⬜ 7B 模型实测（下轮） |
 
 ### 实施中偏离计划文档的记录
 
@@ -944,4 +944,7 @@ Phase 8: Verification
 15. **调度器按构建序执行**（ggml 同款 `nodes[0..n]`），保证 KV store 先于读它的 attention；融合产生的孤儿节点（无消费者）跳过不执行。
 16. **n_out 尾部行优化（GetRows）推迟**：现图路径按全 nt 计算、仅提取尾部 logits 行——采样行数值与旧路径逐位一致（logits max diff = 0.0 已验证）；优化属纯省算不改数值。
 17. **Phase 6 未删 forward.rs**：保留作 logits 对比基线（测试依赖），Phase 8 全部验证通过后删除。
+18. **in-place 算子缓冲别名**（Phase 3 关键修复）：`Silu`/`RoPE` 的输出缓冲与输入缓冲**别名**（同后端且输入唯一消费者时）——避免 host 侧拷贝在批处理（单 command buffer）下读取 GPU 未写数据（此 bug 曾致 KV 区全 0、输出乱码；修复后 437 节点单 cb 正确）。跨后端输入仍分配独立缓冲（生产者已完成的拷贝是安全的）。
+19. **后端配置进入复用判定**：`CParams.gpu` 标志——backend 分配是构图的一部分，MPS 初始化变化（如测试间）必须触发重建。
+20. **每层 KV = 两个独立持久区（k、v）**（Phase 3 定型，替代 Phase 1 的 [K|V] 连续布局）：CPU/Metal 对称，attention 经 `kv_pair(layer)` 取兄弟区。
 5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
