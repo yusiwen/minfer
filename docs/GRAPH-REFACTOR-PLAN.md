@@ -909,3 +909,26 @@ Phase 8: Verification
 | minfer matmul dispatch | `src/kernel.rs:15/40` | `quant_matmul_f32` / `quant_matmul_f32_batch` |
 | minfer CUDA | `src/cuda.rs:482/757` | CUDA Graph 捕获 + `layer_gpu`（包装而非 stub） |
 | minfer GPU 安全 | `docs/GPU_SAFETY.md` | guard → abort / 支持性限制 → 回退 的区分 |
+
+---
+
+## 17. Implementation Progress
+
+| Phase | 内容 | 状态 | 提交 hash | 验证 |
+|-------|------|------|-----------|------|
+| Phase 1 | IR 基础设施：`graph/mod.rs` + `ops.rs` + `builder.rs` + `alloc.rs` | ✅ | `33adfd1` | 12 个单元测试通过（topo 排序/环检测、Op 负载相等性、链式 liveness 缓冲复用、并行链隔离、输入填充、持久 KV 共享）；全套 46 通过（1 个既有环境失败：`attn_parallel_realdata_correctness` 需 /tmp/dp3 dump） |
+| Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs` | ⬜ | — | — |
+| Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜ | — | — |
+| Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs` + `fusion.rs` + `dot.rs` + `cache.rs` | ⬜ | — | — |
+| Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs` | ⬜ | — | — |
+| Phase 6 | Wiring + Cleanup：ModelDef/build_graph、删 forward.rs、main.rs | ⬜ | — | — |
+| Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | — |
+| Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | ⬜ | — | — |
+
+### 实施中偏离计划文档的记录
+
+1. **`NodeMeta` 用具体 enum 代替 `Box<dyn Any + Send + Sync>`**（`src/graph/ops.rs`）：可 `PartialEq`（供 debug 复用校验）、无 downcast panic、`CNode` 可 `Clone`。代价：新增元数据类型需改 enum（已含 MatMul/Norm/Rope/Attn/Kvcache/Embed）。
+2. **`Op::Input` 叶子节点**：输入节点用独立 op 标记（对应 llama.cpp `GGML_OP_NONE` 叶），`ComputeGraph::inputs` 记录其 id。
+3. **`rope()` 增加 `style: RopeStyle` 参数**（计划示例签名未含，但 minfer `ModelDef::rope_style()` 需要它）；**`kvcache_store/load` 显式携带 `n_ctx`** 用于持久区定长（load 形状 `[n_embd, n_ctx]`，执行期只读已写前缀）。
+4. **Phase 1 KV 持久区每层一块**（K 区；V 区与 KV 写入细节属 Phase 5 执行器职责，`alloc.rs` 已注明）。
+5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
