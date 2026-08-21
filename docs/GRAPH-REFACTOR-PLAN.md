@@ -920,8 +920,8 @@ Phase 8: Verification
 | Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs`（+ 最小执行器 `scheduler.rs`） | ✅ | `960d54b` | 16 个 graph 测试通过（matmul+bias+silu+scale 对照手工计算、rms_norm 对照 vec_ops、embedding+rope 对照参考、KV store/load + GQA attention 往返、liveness/IR）；全套 50 通过（1 个既有环境失败不变） |
 | Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜ | — | — |
 | Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs`(assign/split/execute) + `fusion.rs` + `dot.rs` + `cache.rs` + `params.rs` | ✅ | `88fe6ef` | 11 个新测试（融合应用/门控、DOT 格式、缓存复用语义、切分边界/跨 split 边）；全套 61 通过（1 个既有环境失败不变） |
-| Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs` | ⬜ | — | — |
-| Phase 6 | Wiring + Cleanup：ModelDef/build_graph、删 forward.rs、main.rs | ⬜ | — | — |
+| Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs`（`Qwen2Graph::build`） | ✅ | `2acfe83` | 真实模型 Qwen2.5-0.5B Q4_0：graph vs forward logits **max diff = 0.000e0**（prefill + decode，KV 跨步） |
+| Phase 6 | Wiring + Cleanup：ModelDef + build_graph/forward_graph、main.rs `--graph` 标志；**forward.rs 暂不删除**（作 logits 对比基线，Phase 8 验证通过后再删） | ✅ | `2acfe83` | CLI `--graph` 推理与旧路径输出一致（greedy 同 token）；CPU decode 速度持平（5.9 tok/s） |
 | Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | — |
 | Phase 8 | Verification：新旧 logits 对比、7B GPU、--dump-graph | ⬜ | — | — |
 
@@ -939,4 +939,9 @@ Phase 8: Verification
 10. **BatchMatMul 融合推迟**：单输出 IR（`CNode` 一个 out buffer）无法表达多输出融合节点；待 Phase 5 评估 IR 扩展（concat+view 或 多输出节点）。SwiGLU/BiasRope 融合已实现并按 backend `supports_fused` 门控。
 11. **缓冲池单一持有者 = `GraphAllocator`**（Phase 2 偏差的最终形态）：scheduler 是纯编排器（`assign_backends(graph, alloc)` 经 allocator 能力查询），执行经 `alloc.cpu_mut()`。Phase 3 加 Metal 池时在 allocator 内并列持有。
 12. **`GraphParams`（`graph/params.rs`）即复用判定的全部依据**：n_tokens/n_seqs/gtype/cparams/weights_version；`n_past` 明确缺席（执行期数据）。`weights_version` 用全局原子计数器，Phase 6 由模型接线。
+13. **matmul 权重采用 llama.cpp/GGUF 布局**：元数据 `[in, out]`（ne[0]=in 最快）、内存 `[out][in]` 行主序 → `od = shape[1]`、`id = shape[0]`（Phase 2 测试初版误用 `[out, in]`，已修正）。
+14. **KV 持久区跨图重建存活**：`GraphCache` 持有 allocator，重建只换图、不清 KV 区（prefill→decode 触发重建时 KV 不丢）——对应 llama.cpp KV 在 memory context 而非 graph buffer。
+15. **调度器按构建序执行**（ggml 同款 `nodes[0..n]`），保证 KV store 先于读它的 attention；融合产生的孤儿节点（无消费者）跳过不执行。
+16. **n_out 尾部行优化（GetRows）推迟**：现图路径按全 nt 计算、仅提取尾部 logits 行——采样行数值与旧路径逐位一致（logits max diff = 0.0 已验证）；优化属纯省算不改数值。
+17. **Phase 6 未删 forward.rs**：保留作 logits 对比基线（测试依赖），Phase 8 全部验证通过后删除。
 5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
