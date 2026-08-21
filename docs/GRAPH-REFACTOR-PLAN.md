@@ -919,7 +919,7 @@ Phase 8: Verification
 | Phase 1 | IR 基础设施：`graph/mod.rs` + `ops.rs` + `builder.rs` + `alloc.rs` | ✅ | `33adfd1` | 12 个单元测试通过（topo 排序/环检测、Op 负载相等性、链式 liveness 缓冲复用、并行链隔离、输入填充、持久 KV 共享）；全套 46 通过（1 个既有环境失败：`attn_parallel_realdata_correctness` 需 /tmp/dp3 dump） |
 | Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs`（+ 最小执行器 `scheduler.rs`） | ✅ | `960d54b` | 16 个 graph 测试通过（matmul+bias+silu+scale 对照手工计算、rms_norm 对照 vec_ops、embedding+rope 对照参考、KV store/load + GQA attention 往返、liveness/IR）；全套 50 通过（1 个既有环境失败不变） |
 | Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜ | — | — |
-| Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs` + `fusion.rs` + `dot.rs` + `cache.rs` | ⬜ | — | — |
+| Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs`(assign/split/execute) + `fusion.rs` + `dot.rs` + `cache.rs` + `params.rs` | ✅ | `88fe6ef` | 11 个新测试（融合应用/门控、DOT 格式、缓存复用语义、切分边界/跨 split 边）；全套 61 通过（1 个既有环境失败不变） |
 | Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs` | ⬜ | — | — |
 | Phase 6 | Wiring + Cleanup：ModelDef/build_graph、删 forward.rs、main.rs | ⬜ | — | — |
 | Phase 7 | CUDA Backend：包装现有 `cuda.rs`（保留 CUDA Graph） | ⬜ | — | — |
@@ -936,4 +936,7 @@ Phase 8: Verification
 7. **`Backend::execute_node` 用 `&mut self`**（CPU 池需可变访问；GPU 后端命令缓冲同理）；**缓冲池单一持有者 = `GraphAllocator`**（scheduler 经 allocator 执行，避免双池）。
 8. **I32 输入（token ids/positions）以 `f32::from_bits` 位模式存储**（|v| < 2^24 精确），allocator 提供 `fill_input_i32`。
 9. **F32 权重 matmul 在 CPU backend 支持**（现有 `cpu_quant_matmul_f32` 对 F32 panic，graph 路径经 `vec_ops::mat_mul_f32` 兜底）。
+10. **BatchMatMul 融合推迟**：单输出 IR（`CNode` 一个 out buffer）无法表达多输出融合节点；待 Phase 5 评估 IR 扩展（concat+view 或 多输出节点）。SwiGLU/BiasRope 融合已实现并按 backend `supports_fused` 门控。
+11. **缓冲池单一持有者 = `GraphAllocator`**（Phase 2 偏差的最终形态）：scheduler 是纯编排器（`assign_backends(graph, alloc)` 经 allocator 能力查询），执行经 `alloc.cpu_mut()`。Phase 3 加 Metal 池时在 allocator 内并列持有。
+12. **`GraphParams`（`graph/params.rs`）即复用判定的全部依据**：n_tokens/n_seqs/gtype/cparams/weights_version；`n_past` 明确缺席（执行期数据）。`weights_version` 用全局原子计数器，Phase 6 由模型接线。
 5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
