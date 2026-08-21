@@ -211,16 +211,18 @@ cargo run --release -- list
 
 > The table below was measured on the **legacy `layer_gpu` path** (pre-compute-
 > graph). Since Phase 6 the compute-graph path is the default, and since
-> G1–G4 (2026-08-21) its `MetalBackend` wires the same fast kernels (flash/
+> G1–G5 (2026-08-21) its `MetalBackend` wires the same fast kernels (flash/
 > split/parallel attention dispatch + `rms_norm_256` + the `n_out` tail-row
-> reduction + **fused decode QKV**), so graph-path numbers now **match or
-> exceed the legacy path**: 0.5B Q4_0 decode ~299 t/s at KV440 (**+~11 % over
-> legacy** — G4 fuses the QKV chain into one concat matmul + one
-> bias+rope+store pass), 0.5B prefill ~3900–4000 t/s at pp440 (**+~55 % over
-> legacy** — the G3 tail reduction drops the full-nt last-layer FFN + lm_head),
-> 7B decode ~49 t/s (≈ legacy). Remaining gap: 7B prefill ~−10 % (GEMM-bound;
-> attention is not the bottleneck there). Greedy outputs are byte-identical
-> across all graph paths (`MINFER_NO_FUSE_QKV=1` reverts the decode fusion).
+> reduction + **fused decode QKV + FFN gate/up**), so graph-path numbers now
+> **match or exceed the legacy path**: 0.5B Q4_0 decode ~300-330 t/s at KV440
+> (**+~15 % over legacy** — G4 fuses the QKV chain into one concat matmul +
+> one bias+rope+store pass, G5 fuses the FFN gate/up the same way), 0.5B
+> prefill ~3900–4000 t/s at pp440 (**+~55 % over legacy** — the G3 tail
+> reduction drops the full-nt last-layer FFN + lm_head), 7B decode ~46-49 t/s
+> (≈ legacy; FFN fusion gated off there — Q4_K concat matmul slower).
+> Remaining gap: 7B prefill ~−10 % (GEMM-bound; attention is not the
+> bottleneck there). Greedy outputs are byte-identical across all graph paths
+> (`MINFER_NO_FUSE_QKV` / `MINFER_NO_FUSE_FFN` revert the decode fusions).
 > See [`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md) §0.1/§4.3.
 
 **Qwen2 / Qwen2.5 on Apple M4 Pro / RTX 2080 Ti (2026-08-21):**
