@@ -11,9 +11,11 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **GPU: CUDA backend** — NVIDIA GPU acceleration with CUDA Graph capture/replay
   for decode, full-layer GPU offload (zero-copy), automatic best-GPU selection
  - **GPU: Metal backend** — Apple Silicon acceleration with flash attention
-   (online softmax), a **KV-parallel split attention** for decode (partial +
-   combine passes, ~2× decode over the single-pass kernel), SIMD-parallel
-   RMSNorm, float4 vectorized kernels
+   (single fused kernel for decode + prefill, llama.cpp ports), simdgroup GEMM
+   prefill for every quant type, SIMD-parallel RMSNorm, float4 vectorized
+   kernels, **mmap'd GGUF weights shared zero-copy with the GPU**, a
+   build-time precompiled `.metallib` (no per-run shader compile), and
+   auto-selected f16 KV cache for 7B-class models
 - **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
   RMSNorm
 - **Model download** — auto-download from Hugging Face Hub or Ollama registry
@@ -41,9 +43,10 @@ matching llama.cpp's Metal backend.
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
-¹ Metal prefill uses a simdgroup GEMM for every quant type (nt≥16); the scalar
-f32 multi kernels handle decode (nt==1) and small prefills. Q4_0/Q4_1/Q4_K/
-Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 all run through `layer_gpu` (full-layer offload).
+¹ Metal prefill uses a simdgroup GEMM for every quant type (dispatched when
+`nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)`); the scalar f32 multi kernels handle decode
+(nt==1) and tiny small-od batches. Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0
+all run through `layer_gpu` (full-layer offload).
 ² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
 
 **GPU grouping restriction** (CUDA and Metal): within one transformer layer,
@@ -186,25 +189,27 @@ cargo run --release -- list
 
 ## Performance
 
-**Qwen2 / Qwen2.5 — 0.5B class (Q4_0, ~400 MB):**
+**Qwen2 / Qwen2.5 on Apple M4 Pro / RTX 2080 Ti (2026-08-21):**
 
-| Backend | Hardware | Model | Prefill | Decode |
+| Backend | Hardware | Model | Prefill (pp499) | Decode (greedy) |
 |---------|----------|-------|---------|--------|
 | CPU (AVX2) | i7-1260P | Qwen2-0.5B | ~27 tok/s | ~21 tok/s |
 | CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~650–1000 tok/s | ~230 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~966 tok/s | ~315 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~650–770 tok/s | ~155–160 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-7B Q4_K_M | ~120–130 tok/s | ~42–45 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~4460 tok/s | ~268 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~4775 tok/s | ~321 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~1750 tok/s | ~153 tok/s |
+| Metal GPU | Apple M4 Pro | Qwen2.5-7B Q4_K_M | ~430 tok/s (pp31 ~250) | ~48 tok/s |
 
-Prefill uses simdgroup GEMMs for every quant type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
-Q4_K/Q5_K/Q6_K); decode uses fused QKV/FFN matmuls + a KV-parallel split
-attention. See **[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
+Prefill uses simdgroup GEMMs for every quant type (dispatched for
+`nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)`); decode uses fused QKV/FFN matmuls + a
+KV-parallel split attention. See
+**[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
 
 GPU decode optimizations: CUDA Graph capture/replay (single `cudaGraphLaunch`
 per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
-activation quantization (f32 → Q8_0). Metal: flash attention (online softmax),
-SIMD-parallel RMSNorm with float4 vectorization, Q4_0 × Q8_0 matmul.
+activation quantization (f32 → Q8_0). Metal: flash attention (online softmax,
+fused decode + prefill kernels), SIMD-parallel RMSNorm with float4
+vectorization, fused QKV/FFN decode matmuls, f16 KV for 7B-class models.
 
 ## Project Structure
 
@@ -212,7 +217,7 @@ SIMD-parallel RMSNorm with float4 vectorization, Q4_0 × Q8_0 matmul.
 minfer/
 ├── Cargo.toml             # crate manifest (deps, [features] cuda / debug_dump)
 ├── Cargo.lock
-├── build.rs               # CUDA kernel compilation + arch detection
+├── build.rs               # CUDA kernels + Metal metallib (precompiled shaders)
 ├── flake.nix / flake.lock # Nix dev shell
 ├── pyproject.toml         # Python tooling for the verification scripts
 ├── AGENTS.md              # AI-agent project index (architecture, conventions)
@@ -220,12 +225,12 @@ minfer/
 ├── README.md
 ├── src/
 │   ├── main.rs            # Entry point, CLI, inference loop
-│   ├── gguf.rs            # GGUF format parser (v3) + KV helpers
+│   ├── gguf.rs            # GGUF parser (v3) + mmap'd zero-copy loader
 │   ├── block.rs           # Quantized block types + fp16 conversions
 │   ├── avx2.rs            # AVX2 dot product kernels + quantization
 │   ├── cuda.rs            # CUDA GPU state, FFI bindings, graph capture
 │   ├── cuda_kernels.cu    # CUDA kernels (matmul, attention, element-wise ops)
-│   ├── metal.rs           # Metal GPU state machine + kernel dispatch
+│   ├── metal.rs           # Metal GPU state machine + kernel dispatch (metallib, mmap weights)
 │   ├── metal.metal        # Metal compute shaders (attention, matmul, norm)
 │   ├── kernel.rs          # Quantized matmul dispatch (CPU/GPU bridge)
 │   ├── tensor.rs          # Tensor struct + data access
