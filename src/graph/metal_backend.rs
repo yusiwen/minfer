@@ -74,6 +74,27 @@ impl MetalBackend {
         }
     }
 
+    /// KV-parallel attention chunk count (decode), mirroring layer_gpu's
+    /// adaptive rule: one chunk per 32 KV rows, capped at 16, with a
+    /// MINFER_ATTN_CHUNKS override.
+    fn attention_chunks(&self, positions: &metal::Buffer) -> usize {
+        let max_pos = Self::positions_max(positions);
+        std::env::var("MINFER_ATTN_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c >= 1)
+            .unwrap_or_else(|| ((max_pos + 1 + 31) / 32).clamp(1, 16))
+    }
+
+    /// max(positions) + host-side read of the (host-written) I32 positions
+    /// buffer — the positions are input data, never GPU-computed, so a host
+    /// read is safe here.
+    fn positions_max(positions: &metal::Buffer) -> usize {
+        let n = (positions.length() as usize) / 4;
+        let p = unsafe { std::slice::from_raw_parts(positions.contents() as *const u32, n) };
+        p.iter().map(|&x| x as usize).max().unwrap_or(0)
+    }
+
     fn copy_in(&self, dst: usize, src: usize) {
         // in-place-ish ops (silu/rope) may alias; snapshot to dst first
         let src_buf = self.buf(src);
@@ -178,8 +199,15 @@ impl Backend for MetalBackend {
                 };
                 let d = node.out_shape[0];
                 let n = node.out_shape[1];
+                // G2: 256-thread kernel when enabled (METAL_OPTIMIZATIONS #16)
                 match w {
-                    Some((wb, w_off)) => cb.rms_norm(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0),
+                    Some((wb, w_off)) => {
+                        if crate::metal::rms_norm_256_enabled() {
+                            cb.rms_norm_256(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                        } else {
+                            cb.rms_norm(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                        }
+                    }
                     None => cb.rms_norm(self.buf(in_bufs[0]), None, 0, self.buf(out_buf), d, n, *eps, 0),
                 }
                 Ok(())
@@ -272,10 +300,40 @@ impl Backend for MetalBackend {
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
                 let nt = node.out_shape[1];
-                cb.gqa_attn_f32(
-                    self.buf(in_bufs[0]), self.buf(k_id), self.buf(v_id), self.buf(out_buf),
-                    self.buf(in_bufs[2]), meta.n_head, meta.n_head_kv, meta.hd, meta.scale, nt,
-                );
+                // G1: dispatch the fast attention kernels (flash / split /
+                // parallel) exactly like the legacy layer_gpu path. The fast
+                // paths are gated to the isolation-tested shapes (hd 64/128);
+                // anything else falls back to the classic kernel.
+                let k = self.buf(k_id);
+                let v = self.buf(v_id);
+                let q = self.buf(in_bufs[0]);
+                let o = self.buf(out_buf);
+                let positions = self.buf(in_bufs[2]);
+                if nt == 1 {
+                    if crate::metal::flash_attn_enabled(meta.hd) {
+                        let chunks = self.attention_chunks(positions);
+                        cb.gqa_attn_flash(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1, chunks);
+                    } else if (meta.hd == 64 || meta.hd == 128)
+                        && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1")
+                    {
+                        let chunks = self.attention_chunks(positions);
+                        cb.gqa_attn_split_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1, chunks);
+                    } else {
+                        cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1);
+                    }
+                } else if meta.hd == 64 || meta.hd == 128 {
+                    let max_pos = Self::positions_max(positions);
+                    let nkv = max_pos + 1;
+                    if crate::metal::prefill_flash_enabled(meta.hd) {
+                        cb.attn_flash_prefill(q, k, v, o, positions, nkv, meta.nkt, nt, meta.n_head, meta.n_head_kv, meta.hd, meta.scale);
+                    } else if crate::metal::matmul_attn_enabled() {
+                        cb.attn_parallel_prefill(q, k, v, o, positions, nkv, meta.nkt, meta.n_head * meta.hd, nt, meta.n_head, meta.hd, meta.n_head / meta.n_head_kv, meta.scale);
+                    } else {
+                        cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, nt);
+                    }
+                } else {
+                    cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, nt);
+                }
                 Ok(())
             }
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
