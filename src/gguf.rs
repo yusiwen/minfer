@@ -1661,10 +1661,67 @@ impl GgufContext {
 // `llama_model_loader` (each part is parsed separately; a tensor is read from
 // its own part's data).
 
+/// Read-only mmap of a GGUF file part (zero-dependency: raw mmap/munmap via
+/// the system libc, which Rust links by default). The file pages are shared
+/// with the CPU and (via newBufferWithBytesNoCopy) the GPU instead of being
+/// copied — llama's `llama_mmap` / `newBufferWithBytesNoCopy` equivalent
+/// (ggml-metal-device.m:1668). MAP_PRIVATE (no writes happen), PROT_READ.
+pub struct MmapFile {
+    ptr: *mut u8,
+    len: usize,
+    #[allow(dead_code)]
+    _file: std::fs::File, // keeps the fd alive for the mapping's lifetime
+}
+
+#[cfg(target_os = "macos")]
+const PROT_READ: i32 = 0x1;
+#[cfg(target_os = "macos")]
+const MAP_PRIVATE: i32 = 0x0002;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32,
+            fd: i32, offset: i64) -> *mut std::ffi::c_void;
+    fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+}
+
+impl MmapFile {
+    pub fn map(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        #[cfg(not(target_os = "macos"))]
+        { let _ = path; return None; }
+        #[cfg(target_os = "macos")]
+        {
+            let file = std::fs::File::open(path).ok()?;
+            let len = file.metadata().ok()?.len() as usize;
+            let ptr = unsafe {
+                mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
+            };
+            // MAP_FAILED = (void*)-1
+            if ptr as isize == -1 {
+                return None;
+            }
+            Some(MmapFile { ptr: ptr as *mut u8, len, _file: file })
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for MmapFile {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe { munmap(self.ptr as *mut std::ffi::c_void, self.len); }
+    }
+}
+
 /// One GGUF part: its parsed context + the raw file bytes (data section).
 pub struct GgufPart {
     pub ctx: GgufContext,
-    pub data: Vec<u8>,
+    /// `'static` slice of the (leaked, process-lifetime) mmap of the part file.
+    pub data: &'static [u8],
 }
 
 /// A model loaded from one GGUF file, or from the N parts of a split.
@@ -1706,9 +1763,12 @@ pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>>
 
 /// Load a GGUF model from `path` (a single file or the FIRST part of a split),
 /// assembling all parts. Aligned with llama.cpp: part 0 must be loaded first.
+/// Each part file is mmap'd (zero-copy; the Mmap is leaked for the process
+/// lifetime so weight tensors can hold `&'static` slices into it).
 pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
-    let data0 = std::fs::read(path).ok()?;
-    let ctx0 = GgufContext::init_from_data(&data0)?;
+    let mmap0 = Box::leak(Box::new(MmapFile::map(path)?));
+    let data0: &'static [u8] = mmap0.as_slice();
+    let ctx0 = GgufContext::init_from_data(data0)?;
     let split_count = ctx0.get_key_val_i64("split.count").map(|v| v as usize).unwrap_or(1);
 
     if split_count <= 1 {
@@ -1732,8 +1792,9 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
 
     let mut parts = Vec::with_capacity(split_count);
     for (i, p) in part_paths.iter().enumerate() {
-        let data = std::fs::read(p).ok()?;
-        let ctx = GgufContext::init_from_data(&data)?;
+        let mmap = Box::leak(Box::new(MmapFile::map(p)?));
+        let data: &'static [u8] = mmap.as_slice();
+        let ctx = GgufContext::init_from_data(data)?;
         let no = ctx.get_key_val_i64("split.no").map(|v| v as usize).unwrap_or(0);
         if no != i {
             eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");

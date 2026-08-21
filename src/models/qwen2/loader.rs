@@ -163,7 +163,7 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 // Tensor loading
 // ============================================================
 
-fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) -> Tensor {
+fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTensorInfo) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
     let mut shape = [1i64; 4];
     for j in 0..4 { shape[j] = ti.ne[j]; }
@@ -173,10 +173,9 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
     let bs = ti.type_.blck_size() as usize;
     let n = (shape[0] * shape[1] * shape[2] * shape[3]) as usize;
     let nbytes = (n / bs) * ts;
+    // Borrow the tensor bytes straight from the mmap'd part file (zero-copy —
+    // the file pages are shared with the CPU and GPU instead of a per-tensor copy).
     let src = &raw[off..off + nbytes];
-
-    let mut data = Vec::with_capacity(src.len());
-    data.extend_from_slice(src);
 
     let mut strides = [0usize; 4];
     strides[0] = ts;
@@ -185,7 +184,7 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
         strides[j] = strides[j - 1] * shape[j - 1] as usize;
     }
 
-    let mut tensor = Tensor::from_data_with_strides(ttype, &shape, &strides, data);
+    let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
     tensor.set_name(&ti.name);
 
     // Register weight tensors with GPU backends.
@@ -216,6 +215,16 @@ fn load_tensor(ctx: &GgufContext, raw: &[u8], ti: &crate::gguf::GgufTensorInfo) 
 pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
     let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
+
+    // Zero-copy weight registration: tell the Metal backend about each mmap'd
+    // part (page-aligned base) BEFORE any weight is registered, so weights are
+    // wrapped as (buffer, offset) into the part buffer instead of being copied.
+    #[cfg(target_os = "macos")]
+    if let Some(mps) = crate::metal::MpsState::get() {
+        for part in &model.parts {
+            mps.register_part(part.data);
+        }
+    }
 
     // Merged tensor index across all split parts (llama.cpp weights_map): each
     // tensor lives in the part that lists it, read from that part's own data.

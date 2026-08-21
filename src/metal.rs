@@ -187,7 +187,15 @@ struct MpsStateInner {
     pl_attn_scores: metal::ComputePipelineState,
     pl_attn_output: metal::ComputePipelineState,
     pl_softmax_attn: metal::ComputePipelineState,
-    weights: std::sync::Mutex<std::collections::HashMap<String, metal::Buffer>>,
+    // (buffer, byte-offset): weights live either in a per-weight copied buffer
+    // (offset 0) or — since the 2026-08-21 mmap loader — as offsets into a
+    // page-aligned NoCopy buffer over the mmap'd GGUF part (llama-style,
+    // ggml-metal-device.m:1668; newBufferWithBytesNoCopy requires a page-aligned
+    // base, so per-tensor offsets are passed via setBuffer:offset:).
+    weights: std::sync::Mutex<std::collections::HashMap<String, (metal::Buffer, u64)>>,
+    // Registered mmap'd GGUF parts: (base_ptr, len, Metal buffer). register_weight
+    // resolves a weight slice to (buffer, offset) by pointer-range containment.
+    mmap_parts: std::sync::Mutex<Vec<(usize, usize, metal::Buffer)>>,
     // Persistent scratch buffers grown on demand; avoids per-call allocation.
     q8_buf: std::sync::Mutex<metal::Buffer>,
     out_buf: std::sync::Mutex<metal::Buffer>,
@@ -349,7 +357,7 @@ impl MpsCommandBuffer<'_> {
     /// Dispatch a 64×32-tile simdgroup GEMM (NT≥16 prefill). GPU safety: the
     /// kernels stage 8 KB of threadgroup memory (sa 4 KB + sb 2 KB + bc_out
     /// 8 KB reusing sa/sb) — verified against the queried device limit.
-    fn gemm_dispatch(&self, pl: &metal::ComputePipelineState, wb: &metal::Buffer,
+    fn gemm_dispatch(&self, pl: &metal::ComputePipelineState, wb: &metal::Buffer, w_off: u64,
         x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         if 8192 > self.state.max_threadgroup_memory {
@@ -359,7 +367,7 @@ impl MpsCommandBuffer<'_> {
             ));
         }
         self.enc.set_compute_pipeline_state(pl);
-        self.enc.set_buffer(0, Some(wb), 0);
+        self.enc.set_buffer(0, Some(wb), w_off);
         self.enc.set_buffer(1, Some(x), x_off);
         self.enc.set_buffer(2, Some(out), 0);
         let mm_p = [od as i32, id as i32, nt as i32];
@@ -385,11 +393,12 @@ impl MpsCommandBuffer<'_> {
         od: usize, id: usize, nt: usize,
     ) {
         let weights = self.state.weights.lock().unwrap();
-        let wb = weights.get(&w.name).expect("weight not on GPU");
-        self.quant_matmul_f32_on_gpu_buf(wb, w.ttype, x, 0, out, od, id, nt);
+        let (wb, w_off) = weights.get(&w.name).expect("weight not on GPU").clone();
+        drop(weights);
+        self.quant_matmul_f32_on_gpu_buf(&wb, w_off, w.ttype, x, 0, out, od, id, nt);
     }
 
-    pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
+    pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &metal::Buffer, w_off: u64, ttype: TensorType,
         x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         self.trace_op("matmul");
@@ -404,12 +413,12 @@ impl MpsCommandBuffer<'_> {
         match ttype {
             TensorType::Q8_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -429,7 +438,7 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 16 && Self::gemm_enabled() {
                     // both Q4_K and Q6_K have simdgroup GEMMs
                     let pl = if ttype == TensorType::Q6_K { &self.state.pl_q6_k_mm_f32 } else { &self.state.pl_q4_k_mm_f32 };
-                    self.gemm_dispatch(pl, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(pl, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
                         if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
@@ -437,7 +446,7 @@ impl MpsCommandBuffer<'_> {
                         if nt > 1 { &self.state.pl_q6_k_f32_multi } else { &self.state.pl_q6_k_f32 }
                     };
                     self.enc.set_compute_pipeline_state(pl);
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -456,12 +465,12 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q4_1 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -472,12 +481,12 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_0 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -488,12 +497,12 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_1 => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -504,12 +513,12 @@ impl MpsCommandBuffer<'_> {
             }
             TensorType::Q5_K => {
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -524,12 +533,12 @@ impl MpsCommandBuffer<'_> {
                 // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
                 // dominates for tiny prefills).
                 if nt >= 16 && Self::gemm_enabled() {
-                    self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, x, x_off, out, od, id, nt);
+                    self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
                         if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
                     );
-                    self.enc.set_buffer(0, Some(wb), 0);
+                    self.enc.set_buffer(0, Some(wb), w_off);
                     self.enc.set_buffer(1, Some(x), x_off);
                     self.enc.set_buffer(2, Some(out), 0);
                     let mm_p = [od as i32, id as i32, nt as i32];
@@ -542,7 +551,7 @@ impl MpsCommandBuffer<'_> {
                 self.enc.set_compute_pipeline_state(
                     if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
                 );
-                self.enc.set_buffer(0, Some(wb), 0);
+                self.enc.set_buffer(0, Some(wb), w_off);
                 self.enc.set_buffer(1, Some(x), x_off);
                 self.enc.set_buffer(2, Some(out), 0);
                 let mm_p = [od as i32, id as i32, nt as i32];
@@ -558,16 +567,17 @@ impl MpsCommandBuffer<'_> {
         od: usize, id: usize, nt: usize,
     ) {
         let weights = self.state.weights.lock().unwrap();
-        let wb = weights.get(&w.name).expect("weight not on GPU");
-        self.quant_matmul_q8_buf(wb, x, out, od, id, nt);
+        let (wb, w_off) = weights.get(&w.name).expect("weight not on GPU").clone();
+        drop(weights);
+        self.quant_matmul_q8_buf(&wb, w_off, x, out, od, id, nt);
     }
 
-    pub fn quant_matmul_q8_buf(&self, wb: &metal::Buffer, x: &metal::Buffer,
+    pub fn quant_matmul_q8_buf(&self, wb: &metal::Buffer, w_off: u64, x: &metal::Buffer,
         out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
         if nt > 1 {
             self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_q8_multi);
-            self.enc.set_buffer(0, Some(wb), 0);
+            self.enc.set_buffer(0, Some(wb), w_off);
             self.enc.set_buffer(1, Some(x), 0);
             self.enc.set_buffer(2, Some(out), 0);
             let mm_p = [od as i32, id as i32, nt as i32];
@@ -575,7 +585,7 @@ impl MpsCommandBuffer<'_> {
             self.dispatch_2d((od as u64 + 7) / 8, 1, 64, 1);
         } else {
             self.enc.set_compute_pipeline_state(&self.state.pl_q4_0_q8);
-            self.enc.set_buffer(0, Some(wb), 0);
+            self.enc.set_buffer(0, Some(wb), w_off);
             self.enc.set_buffer(1, Some(x), 0);
             self.enc.set_buffer(2, Some(out), 0);
             let mm_p = [od as i32, id as i32, nt as i32];
@@ -587,16 +597,16 @@ impl MpsCommandBuffer<'_> {
     /// Choose the f32-activation matmul for all weight types (including Q4_0,
     /// matching llama.cpp's Metal backend which does not Q8_0-quantize activations).
     /// Pre-looked-up weight buffer and type — avoids per-matmul HashMap locking.
-    fn matmul_on_gpu_buf(&self, wb: &metal::Buffer, ttype: TensorType,
+    fn matmul_on_gpu_buf(&self, wb: &metal::Buffer, w_off: u64, ttype: TensorType,
         _q8_x: &metal::Buffer, f32_x: &metal::Buffer, x_off: u64,
         out: &metal::Buffer, od: usize, id: usize, nt: usize,
     ) {
-        self.quant_matmul_f32_on_gpu_buf(wb, ttype, f32_x, x_off, out, od, id, nt);
+        self.quant_matmul_f32_on_gpu_buf(wb, w_off, ttype, f32_x, x_off, out, od, id, nt);
     }
 
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.
     /// Writes f32 hidden state [nt][ne] to dst (buf_hidden).
-    pub fn embed_tokens_gpu(&self, wb: &metal::Buffer, ids: &metal::Buffer,
+    pub fn embed_tokens_gpu(&self, wb: &metal::Buffer, w_off: u64, ids: &metal::Buffer,
         dst: &metal::Buffer, ne: usize, nt: usize, ttype: TensorType,
     ) {
         self.trace_op("embed");
@@ -606,7 +616,7 @@ impl MpsCommandBuffer<'_> {
             _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
         };
         self.enc.set_compute_pipeline_state(pl);
-        self.enc.set_buffer(0, Some(wb), 0);
+        self.enc.set_buffer(0, Some(wb), w_off);
         self.enc.set_buffer(1, Some(ids), 0);
         self.enc.set_buffer(2, Some(dst), 0);
         self.set_params(3, &(ne as i32));
@@ -615,13 +625,13 @@ impl MpsCommandBuffer<'_> {
     }
 
     /// RMSNorm: y = x * rsqrt(mean(x²)+eps) * w
-    pub fn rms_norm(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
-        d: usize, n: usize, eps: f32, off: u64,
+    pub fn rms_norm(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, w_off: u64,
+        y: &metal::Buffer, d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm);
         self.enc.set_buffer(0, Some(x), off);
-        self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0); // dummy if no weight
+        self.enc.set_buffer(1, Some(w.unwrap_or(y)), w_off); // dummy if no weight
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
@@ -633,13 +643,13 @@ impl MpsCommandBuffer<'_> {
     /// so a single 896-element row isn't DRAM-latency-bound (the 32-thread
     /// kernel measured ~7x the per-dispatch cost of 256-thread elementwise ops).
     /// Requires a threadgroup buffer of n_simdgroups floats (8 for 256 threads).
-    pub fn rms_norm_256(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, y: &metal::Buffer,
-        d: usize, n: usize, eps: f32, off: u64,
+    pub fn rms_norm_256(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, w_off: u64,
+        y: &metal::Buffer, d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm_256);
         self.enc.set_buffer(0, Some(x), off);
-        self.enc.set_buffer(1, Some(w.unwrap_or(y)), 0);
+        self.enc.set_buffer(1, Some(w.unwrap_or(y)), w_off);
         self.enc.set_buffer(2, Some(y), 0);
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
@@ -670,13 +680,13 @@ impl MpsCommandBuffer<'_> {
 
     /// Add 1-D bias to rows: y[t][i] += b[i]. `off` = element offset into `y`
     /// (used by the fused QKV path to bias the q/k/v sections of one buffer).
-    pub fn add_bias_f32(&self, y: &metal::Buffer, b: &metal::Buffer, d: usize, n: usize,
-        off: usize,
+    pub fn add_bias_f32(&self, y: &metal::Buffer, b: &metal::Buffer, b_off: u64,
+        d: usize, n: usize, off: usize,
     ) {
         self.trace_op("bias");
         self.enc.set_compute_pipeline_state(&self.state.pl_add_bias);
         self.enc.set_buffer(0, Some(y), (off * 4) as u64);
-        self.enc.set_buffer(1, Some(b), 0);
+        self.enc.set_buffer(1, Some(b), b_off);
         self.set_params(2, &(d as i32));
         // float4 kernel: 4 dims/thread
         self.dispatch_2d(n as u64, ((d as u64) + 3) / 4, 1, 64);
@@ -1014,7 +1024,9 @@ impl MpsCommandBuffer<'_> {
     /// writes f32 or f16 (per kv_cache_is_f16) into kv_k/kv_v.
     pub fn attn_bias_rope_store(&self,
         bqkv: &metal::Buffer,
-        bias_q: &metal::Buffer, bias_k: &metal::Buffer, bias_v: &metal::Buffer,
+        bias_q: &metal::Buffer, bq_off: u64,
+        bias_k: &metal::Buffer, bk_off: u64,
+        bias_v: &metal::Buffer, bv_off: u64,
         kv_k: &metal::Buffer, kv_v: &metal::Buffer,
         nqt: usize, nkt: usize, hd: usize,
         freq_base: f32, freq_scale: f32, pos: i32, rope_style: i32,
@@ -1022,9 +1034,9 @@ impl MpsCommandBuffer<'_> {
         self.trace_op("attn_bias_rope_store");
         self.enc.set_compute_pipeline_state(&self.state.pl_attn_bsr);
         self.enc.set_buffer(0, Some(bqkv), 0);
-        self.enc.set_buffer(1, Some(bias_q), 0);
-        self.enc.set_buffer(2, Some(bias_k), 0);
-        self.enc.set_buffer(3, Some(bias_v), 0);
+        self.enc.set_buffer(1, Some(bias_q), bq_off);
+        self.enc.set_buffer(2, Some(bias_k), bk_off);
+        self.enc.set_buffer(3, Some(bias_v), bv_off);
         self.enc.set_buffer(4, Some(kv_k), 0);
         self.enc.set_buffer(5, Some(kv_v), 0);
         self.set_params(6, &(nqt as i32));
@@ -1303,6 +1315,7 @@ impl MpsState {
                 pl_attn_output,
                 pl_softmax_attn,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
+                mmap_parts: std::sync::Mutex::new(Vec::new()),
                 q8_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_buf: std::sync::Mutex::new(dummy_buf.clone()),
                 out_pool: std::sync::Mutex::new(Vec::new()),
@@ -1354,24 +1367,65 @@ impl MpsState {
         { self.inner.weights.lock().unwrap().contains_key(name) }
     }
 
+    /// Register an mmap'd GGUF part for zero-copy weight wrapping. The part
+    /// data pointer must be page-aligned (mmap returns page-aligned addresses):
+    /// newBufferWithBytesNoCopy requires a page-aligned base (llama
+    /// ggml_metal_buffer_map, ggml-metal-device.m:1701). Weights from this part
+    /// are then registered as (buffer, offset) into this one buffer.
+    pub fn register_part(&self, data: &'static [u8]) {
+        #[cfg(not(target_os = "macos"))] { let _ = data; }
+        #[cfg(target_os = "macos")]
+        {
+            if data.is_empty() { return; }
+            let page = 16384; // macOS page size on Apple Silicon
+            let base = data.as_ptr() as usize;
+            debug_assert!(base % page == 0, "mmap'd GGUF part not page-aligned");
+            let buf = self.inner.device.new_buffer_with_bytes_no_copy(
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            self.inner.mmap_parts.lock().unwrap().push((base, data.len(), buf));
+        }
+    }
+
     pub fn register_weight(&self, name: &str, data: &[u8]) {
         #[cfg(not(target_os = "macos"))] {}
         #[cfg(target_os = "macos")]
         {
             if data.is_empty() { return; }
-            // Allocate a fresh GPU buffer and copy; the source Tensor Vec<u8> is untouched.
-            let buf = self.inner.device.new_buffer(
-                data.len() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    buf.contents() as *mut u8,
-                    data.len(),
-                );
-            }
-            self.inner.weights.lock().unwrap().insert(name.to_string(), buf);
+            let ptr = data.as_ptr() as usize;
+            let force_copy = std::env::var("MINFER_WEIGHT_COPY").map_or(false, |v| v == "1");
+            // Zero-copy path: the weight is a slice of a registered mmap'd part
+            // → (part buffer, offset). The GPU reads the mapped file pages
+            // directly (llama's shared mmap buffer, ggml-metal-device.m:1668) —
+            // no CPU→GPU memcpy, no GPU-side allocation.
+            let entry = if !force_copy {
+                let parts = self.inner.mmap_parts.lock().unwrap();
+                parts.iter().find(|(base, len, _)| {
+                    ptr >= *base && ptr + data.len() <= base + len
+                }).map(|(base, _, buf)| (buf.clone(), (ptr - base) as u64))
+            } else { None };
+            let (buf, off) = match entry {
+                Some(e) => e,
+                None => {
+                    // Fallback: copy into a fresh per-weight buffer (offset 0).
+                    let b = self.inner.device.new_buffer(
+                        data.len() as u64,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    );
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            b.contents() as *mut u8,
+                            data.len(),
+                        );
+                    }
+                    (b, 0u64)
+                }
+            };
+            self.inner.weights.lock().unwrap().insert(name.to_string(), (buf, off));
         }
     }
 
@@ -1434,7 +1488,7 @@ impl MpsState {
         }
     }
 
-    pub fn get_weight(&self, name: &str) -> Option<metal::Buffer> {
+    pub fn get_weight(&self, name: &str) -> Option<(metal::Buffer, u64)> {
         #[cfg(not(target_os = "macos"))] { None }
         #[cfg(target_os = "macos")]
         {
@@ -1668,7 +1722,7 @@ impl MpsState {
             }
             _ => return false,
         }
-        let wb = match self.get_weight(&embd_weight.name) {
+        let (wb, w_off) = match self.get_weight(&embd_weight.name) {
             Some(b) => b,
             None => return false,
         };
@@ -1677,7 +1731,7 @@ impl MpsState {
         let hidden = Self::get_or_grow(&self.inner.buf_hidden, (nt * ne * 4) as u64, dev);
         let ids_buf = self.inner.buf_token_ids.lock().unwrap().clone();
         let cb = self.cmd_buffer();
-        cb.embed_tokens_gpu(&wb, &ids_buf, &hidden, ne, nt, ttype);
+        cb.embed_tokens_gpu(&wb, w_off, &ids_buf, &hidden, ne, nt, ttype);
         if cb.submit().is_err() {
             return false;
         }
@@ -1818,6 +1872,9 @@ impl MpsState {
         }
 
         // Pre-lookup all weight buffers once to avoid per-matmul HashMap locking.
+        // Each entry is (buffer, byte offset) — weights live as offsets into the
+        // mmap'd part buffer (2026-08-21 zero-copy loader) or at offset 0 in a
+        // per-weight copied buffer.
         let weights = self.inner.weights.lock().unwrap();
         let buf_wq = match weights.get(&wq.name) { Some(b) => b.clone(), None => return false };
         let buf_wk = match weights.get(&wk.name) { Some(b) => b.clone(), None => return false };
@@ -1891,8 +1948,8 @@ impl MpsState {
         let sk = DecodeSkips::active(nt);
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps, 0); }
-            else { cb.rms_norm(&hidden, Some(&norm_attn_w), &bn, ne, nt, eps, 0); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_attn_w.0), norm_attn_w.1, &bn, ne, nt, eps, 0); }
+            else { cb.rms_norm(&hidden, Some(&norm_attn_w.0), norm_attn_w.1, &bn, ne, nt, eps, 0); }
         }
 
         // Fused QKV projection (nt==1 decode): one matmul on the concatenated
@@ -1915,7 +1972,7 @@ impl MpsState {
             .and_then(|v| v.parse::<usize>().ok()).filter(|&c| c >= 1)
             .unwrap_or_else(|| ((max_pos + 1 + 31) / 32).clamp(1, 16));
         if use_fused_qkv {
-            let buf_qkv = buf_qkv.as_ref().unwrap();
+            let (buf_qkv, _qkv_off) = buf_qkv.as_ref().unwrap();
             // GPU safety: the concat buffer must exactly match the fused output
             // rows, else the matmul reads out of bounds. Verify the byte length
             // against the expected row layout and error-exit (never fall back).
@@ -1934,7 +1991,7 @@ impl MpsState {
                     bqkv_buf.length(), (od_total * 4) as u64
                 ));
             }
-            if !sk.matmul { cb.matmul_on_gpu_buf(&buf_qkv, wq.ttype, &q8_bn, &bn, 0, &bqkv_buf, od_total, ne, nt); }
+            if !sk.matmul { cb.matmul_on_gpu_buf(&buf_qkv, 0, wq.ttype, &q8_bn, &bn, 0, &bqkv_buf, od_total, ne, nt); }
             // Fused bias+RoPE+KV-store (nt==1 only): replaces the 7 separate
             // bias/rope/store dispatches below. Requires all three biases + even
             // hd (rope pair mapping); MINFER_NO_FUSE_BSR=1 disables it for A/B.
@@ -1943,14 +2000,17 @@ impl MpsState {
                 && !std::env::var("MINFER_NO_FUSE_BSR").map_or(false, |v| v == "1");
             if !sk.small {
                 if use_fused_bsr {
+                    let (bq_b, bq_o) = bq_bias.as_ref().unwrap();
+                    let (bk_b, bk_o) = bk_bias.as_ref().unwrap();
+                    let (bv_b, bv_o) = bv_bias.as_ref().unwrap();
                     cb.attn_bias_rope_store(&bqkv_buf,
-                        bq_bias.as_ref().unwrap(), bk_bias.as_ref().unwrap(), bv_bias.as_ref().unwrap(),
+                        bq_b, *bq_o, bk_b, *bk_o, bv_b, *bv_o,
                         &kv_k[il], &kv_v[il],
                         nqt, nkt, hd, freq_base, freq_scale, positions[0] as i32, rope_style);
                 } else {
-                    if let Some(bb) = &bq_bias { cb.add_bias_f32(&bqkv_buf, bb, nqt, nt, 0); }
-                    if let Some(bb) = &bk_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt); }
-                    if let Some(bb) = &bv_bias { cb.add_bias_f32(&bqkv_buf, bb, nkt, nt, nqt + nkt); }
+                    if let Some(bb) = &bq_bias { cb.add_bias_f32(&bqkv_buf, &bb.0, bb.1, nqt, nt, 0); }
+                    if let Some(bb) = &bk_bias { cb.add_bias_f32(&bqkv_buf, &bb.0, bb.1, nkt, nt, nqt); }
+                    if let Some(bb) = &bv_bias { cb.add_bias_f32(&bqkv_buf, &bb.0, bb.1, nkt, nt, nqt + nkt); }
                     cb.rope_f32(&bqkv_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
                     cb.rope_f32(&bqkv_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, nqt);
                     cb.store_kv(&bqkv_buf, &kv_k[il], nkt, nt, &pos_buf, nqt);
@@ -1975,13 +2035,13 @@ impl MpsState {
                 }
             }
         } else {
-            cb.matmul_on_gpu_buf(&buf_wq, wq.ttype, &q8_bn, &bn, 0, &bq_buf, nqt, ne, nt);
-            cb.matmul_on_gpu_buf(&buf_wk, wk.ttype, &q8_bn, &bn, 0, &bk_buf, nkt, ne, nt);
-            cb.matmul_on_gpu_buf(&buf_wv, wv.ttype, &q8_bn, &bn, 0, &bv_buf, nkt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wq.0, buf_wq.1, wq.ttype, &q8_bn, &bn, 0, &bq_buf, nqt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wk.0, buf_wk.1, wk.ttype, &q8_bn, &bn, 0, &bk_buf, nkt, ne, nt);
+            cb.matmul_on_gpu_buf(&buf_wv.0, buf_wv.1, wv.ttype, &q8_bn, &bn, 0, &bv_buf, nkt, ne, nt);
             if !sk.small {
-                if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, bb, nqt, nt, 0); }
-                if let Some(bb) = &bk_bias { cb.add_bias_f32(&bk_buf, bb, nkt, nt, 0); }
-                if let Some(bb) = &bv_bias { cb.add_bias_f32(&bv_buf, bb, nkt, nt, 0); }
+                if let Some(bb) = &bq_bias { cb.add_bias_f32(&bq_buf, &bb.0, bb.1, nqt, nt, 0); }
+                if let Some(bb) = &bk_bias { cb.add_bias_f32(&bk_buf, &bb.0, bb.1, nkt, nt, 0); }
+                if let Some(bb) = &bv_bias { cb.add_bias_f32(&bv_buf, &bb.0, bb.1, nkt, nt, 0); }
                 cb.rope_f32(&bq_buf, nh, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
                 cb.rope_f32(&bk_buf, nk, hd, nt, freq_base, freq_scale, &pos_buf, rope_style, 0);
                 cb.store_kv(&bk_buf, &kv_k[il], nkt, nt, &pos_buf, 0);
@@ -2010,7 +2070,7 @@ impl MpsState {
             }
         }
         // all weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        if !sk.matmul { cb.matmul_on_gpu_buf(&buf_wo, wo.ttype, &q8_ba, &ba_buf, 0, &bn, ne, ne, nt); }
+        if !sk.matmul { cb.matmul_on_gpu_buf(&buf_wo.0, buf_wo.1, wo.ttype, &q8_ba, &ba_buf, 0, &bn, ne, ne, nt); }
         // FFN input rows for the LAST layer are reduced to n_out (llama
         // ggml_get_rows(inp_out_ids) at qwen2.cpp:106-108); everything after the
         // attention — both residuals, ffn_norm, gate/up/down, swiglu — runs on the
@@ -2035,8 +2095,8 @@ impl MpsState {
 
         if !sk.small {
             let ffn_off_bytes = (ffn_off * ne * 4) as u64;
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w), &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
-            else { cb.rms_norm(&hidden, Some(&norm_ffn_w), &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_ffn_w.0), norm_ffn_w.1, &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
+            else { cb.rms_norm(&hidden, Some(&norm_ffn_w.0), norm_ffn_w.1, &ba_buf, ne, ffn_nt, eps, ffn_off_bytes); }
         }
         // Fused FFN gate+up (nt==1 decode): one matmul on the concatenated
         // gate+up weight → bgu; swiglu reads gate at offset 0 and up at nf.
@@ -2045,7 +2105,7 @@ impl MpsState {
             && ffn_gate.ttype == ffn_up.ttype
             && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
         if use_fused_gu {
-            let buf_gu = buf_gu.as_ref().unwrap();
+            let (buf_gu, _gu_off) = buf_gu.as_ref().unwrap();
             let od_total = nf + nf;
             let row = (ne / quant_block_q(ffn_gate.ttype)) * quant_block_bytes(ffn_gate.ttype);
             let expect = (od_total * row) as u64;
@@ -2062,20 +2122,20 @@ impl MpsState {
                 ));
             }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_gu, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bgu_buf, od_total, ne, nt);
+                cb.matmul_on_gpu_buf(&buf_gu, 0, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bgu_buf, od_total, ne, nt);
             }
             if !sk.small { cb.swiglu_f32_off(&bgu_buf, &bgu_buf, &bgu_buf, nt * nf, nt * nf); }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bgu_buf, 0, &bn, ne, nf, nt);
+                cb.matmul_on_gpu_buf(&buf_fd.0, buf_fd.1, ffn_down.ttype, &q8_ba, &bgu_buf, 0, &bn, ne, nf, nt);
             }
         } else {
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fg, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bg_buf, nf, ne, ffn_nt);
-                cb.matmul_on_gpu_buf(&buf_fu, ffn_up.ttype, &q8_ba, &ba_buf, 0, &bf_buf, nf, ne, ffn_nt);
+                cb.matmul_on_gpu_buf(&buf_fg.0, buf_fg.1, ffn_gate.ttype, &q8_ba, &ba_buf, 0, &bg_buf, nf, ne, ffn_nt);
+                cb.matmul_on_gpu_buf(&buf_fu.0, buf_fu.1, ffn_up.ttype, &q8_ba, &ba_buf, 0, &bf_buf, nf, ne, ffn_nt);
             }
             if !sk.small { cb.swiglu_f32(&bg_buf, &bf_buf, &bg_buf, ffn_nt * nf); }
             if !sk.matmul {
-                cb.matmul_on_gpu_buf(&buf_fd, ffn_down.ttype, &q8_ba, &bg_buf, 0, &bn, ne, nf, ffn_nt);
+                cb.matmul_on_gpu_buf(&buf_fd.0, buf_fd.1, ffn_down.ttype, &q8_ba, &bg_buf, 0, &bn, ne, nf, ffn_nt);
             }
         }
         if !sk.small {
@@ -2148,15 +2208,15 @@ impl MpsState {
         let sk = DecodeSkips::active(nt);
 
         if !sk.small {
-            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_w), &bn, ne, n_out, eps, hid_off); }
-            else { cb.rms_norm(&hidden, Some(&norm_w), &bn, ne, n_out, eps, hid_off); }
+            if rms_norm_256_enabled() { cb.rms_norm_256(&hidden, Some(&norm_w.0), norm_w.1, &bn, ne, n_out, eps, hid_off); }
+            else { cb.rms_norm(&hidden, Some(&norm_w.0), norm_w.1, &bn, ne, n_out, eps, hid_off); }
         }
 
         // all output weight types read f32 activations (Q4_0 included); no Q8_0 quantize pass.
-        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output, output.ttype, &bn, 0, &logits, nv, ne, n_out); }
+        if !sk.matmul { cb.quant_matmul_f32_on_gpu_buf(&buf_output.0, buf_output.1, output.ttype, &bn, 0, &logits, nv, ne, n_out); }
         if !sk.small {
             if let Some(bb) = &bias_buf {
-                cb.add_bias_f32(&logits, bb, nv, n_out, 0);
+                cb.add_bias_f32(&logits, &bb.0, bb.1, nv, n_out, 0);
             }
         }
         true
@@ -2259,7 +2319,7 @@ mod tests {
             let acts = dev.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
             let out = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
             let cb = mps.cmd_buffer();
-            for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, TensorType::Q4_0, &acts, &acts, 0, &out, 2048, 128, 1); }
+            for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, 0, TensorType::Q4_0, &acts, &acts, 0, &out, 2048, 128, 1); }
             cb.submit().expect("warmup");
         }
         for &(label, ttype, od, id, n) in cases {
@@ -2281,7 +2341,7 @@ mod tests {
             // the first measurement of a kernel is up to ~4x slow otherwise).
             {
                 let cb = mps.cmd_buffer();
-                for _ in 0..(n / 2).max(16) { cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, 0, &out, od, id, 1); }
+                for _ in 0..(n / 2).max(16) { cb.matmul_on_gpu_buf(&wb, 0, ttype, &acts, &acts, 0, &out, od, id, 1); }
                 cb.submit().expect("warmup");
             }
 
@@ -2291,7 +2351,7 @@ mod tests {
             for rep in 0..2 {
                 let cb = mps.cmd_buffer();
                 for _ in 0..n {
-                    cb.matmul_on_gpu_buf(&wb, ttype, &acts, &acts, 0, &out, od, id, 1);
+                    cb.matmul_on_gpu_buf(&wb, 0, ttype, &acts, &acts, 0, &out, od, id, 1);
                 }
                 let t0 = std::time::Instant::now();
                 cb.submit().expect("submit");
@@ -2353,14 +2413,14 @@ mod tests {
 
         // (label, dispatch closure, batches) — each closure dispatches ONE kernel.
         let cases: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
-            ("rms_norm 32t  (d=896, 1 row)",  Box::new(|cb| cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6, 0)), 400),
-            ("rms_norm 256t (d=896, 1 row)",  Box::new(|cb| cb.rms_norm_256(&x, Some(&w), &y, ne, 1, 1e-6, 0)), 400),
+            ("rms_norm 32t  (d=896, 1 row)",  Box::new(|cb| cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0)), 400),
+            ("rms_norm 256t (d=896, 1 row)",  Box::new(|cb| cb.rms_norm_256(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0)), 400),
             ("add_f32 (n=896, 256t)",        Box::new(|cb| cb.add_f32(&x, &y, &x, ne)), 400),
-            ("add_bias_f32 (d=896, 64t)",    Box::new(|cb| cb.add_bias_f32(&x, &w, ne, 1, 0)), 400),
+            ("add_bias_f32 (d=896, 64t)",    Box::new(|cb| cb.add_bias_f32(&x, &w, 0, ne, 1, 0)), 400),
             ("swiglu_f32 (n=4864, 256t)",    Box::new(|cb| cb.swiglu_f32(&g, &u, &g, nf)), 400),
             ("rope_f32 (q: 14h x 64d)",      Box::new(|cb| cb.rope_f32(&bqkv, nh, hd, 1, 1e6, 1.0, &pos, 0, 0)), 400),
             ("store_kv (nkt=128, 1t)",       Box::new(|cb| cb.store_kv(&bk, &kv, nkt, 1, &pos, 0)), 400),
-            ("attn_bsr (q+k+v, 256t)",       Box::new(|cb| cb.attn_bias_rope_store(&bqkv, &bq, &bk, &bv, &kv, &kv, nqt, nkt, hd, 1e6, 1.0, (nkv - 1) as i32, 0)), 400),
+            ("attn_bsr (q+k+v, 256t)",       Box::new(|cb| cb.attn_bias_rope_store(&bqkv, &bq, 0, &bk, 0, &bv, 0, &kv, &kv, nqt, nkt, hd, 1e6, 1.0, (nkv - 1) as i32, 0)), 400),
             // split = partial + combine as a PAIR (2 dispatches/layer, decode path)
             ("attn split p+c (c=16)",        Box::new(|cb| cb.gqa_attn_split_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1, 16)), 100),
         ];
@@ -2369,7 +2429,7 @@ mod tests {
         // warm the whole pipeline once
         {
             let cb = mps.cmd_buffer();
-            for _ in 0..50 { cb.rms_norm(&x, Some(&w), &y, ne, 1, 1e-6, 0); }
+            for _ in 0..50 { cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0); }
             cb.submit().expect("warmup");
         }
 
@@ -2453,8 +2513,8 @@ mod tests {
             ("256t", &y256, 1),
         ] {
             let cb = mps.cmd_buffer();
-            if method == 0 { cb.rms_norm(&x, Some(&w), buf, d, 1, 1e-6, 0); }
-            else { cb.rms_norm_256(&x, Some(&w), buf, d, 1, 1e-6, 0); }
+            if method == 0 { cb.rms_norm(&x, Some(&w), 0, buf, d, 1, 1e-6, 0); }
+            else { cb.rms_norm_256(&x, Some(&w), 0, buf, d, 1, 1e-6, 0); }
             cb.submit().expect("submit");
         }
 
@@ -2694,14 +2754,14 @@ mod tests {
             // warm
             {
                 let cb = mps.cmd_buffer();
-                for _ in 0..20 { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, 0, &out, od, id, nt); }
+                for _ in 0..20 { cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt); }
                 cb.submit().expect("warmup");
             }
             let n = 50;
             let mut us: Vec<f64> = Vec::new();
             for _ in 0..3 {
                 let cb = mps.cmd_buffer();
-                for _ in 0..n { cb.quant_matmul_f32_on_gpu_buf(&wb, ttype, &acts, 0, &out, od, id, nt); }
+                for _ in 0..n { cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt); }
                 let t0 = std::time::Instant::now();
                 cb.submit().expect("submit");
                 let dt = t0.elapsed().as_secs_f64();
@@ -2712,6 +2772,81 @@ mod tests {
             let gbs = wbytes as f64 / (per_us * 1e-6) / 1e9;
             let tflops = 2.0 * od as f64 * id as f64 * nt as f64 / (per_us * 1e-6) / 1e12;
             println!("  {label:<32} {:.1} MB {per_us:>8.1} us => {:>5.0} GB/s  {:>5.2} TFLOPS (warm, n=50)", wbytes as f64/1e6, gbs, tflops);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mmap_align_test {
+    #[test]
+    fn nocopy_alignment_probe() {
+        let dev = metal::Device::system_default().unwrap();
+        // A 16-aligned Vec base + 32 → 32-aligned, NOT 256-aligned
+        let mut backing = vec![0u8; 8192 + 64];
+        let base = backing.as_mut_ptr() as usize;
+        let aligned = (base + 63) & !31usize; // 32-aligned pointer
+        assert!(aligned % 32 == 0 && aligned % 256 != 0, "need a non-256-aligned 32-aligned ptr");
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(aligned as *mut u8, 4096) };
+        for i in 0..4096 { buf_slice[i] = (i & 0xFF) as u8; }
+        let b = dev.new_buffer_with_bytes_no_copy(
+            aligned as *const std::ffi::c_void, 4096,
+            metal::MTLResourceOptions::StorageModeShared, None);
+        let contents = unsafe { std::slice::from_raw_parts(b.contents() as *const u8, 4096) };
+        let mut ok = contents.len() == 4096;
+        for i in 0..4096 { if contents[i] != (i & 0xFF) as u8 { ok = false; break; } }
+        println!("CPU readback: ok={ok}");
+        // GPU readback: dispatch a trivial copy kernel reading the buffer
+        let lib = dev.new_library_with_source(
+            "kernel void k(const device uchar *in [[buffer(0)]], device uchar *out [[buffer(1)]]) { out[0] = in[3]; }",
+            &metal::CompileOptions::new()).unwrap();
+        let pl = dev.new_compute_pipeline_state_with_function(&lib.get_function("k", None).unwrap()).unwrap();
+        let out = dev.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
+        let q = dev.new_command_queue();
+        let cb = q.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pl);
+        enc.set_buffer(0, Some(&b), 0);
+        enc.set_buffer(1, Some(&out), 0);
+        enc.dispatch_thread_groups(metal::MTLSize::new(1,1,1), metal::MTLSize::new(1,1,1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let got = unsafe { *(out.contents() as *const u8) };
+        println!("GPU readback (expect 3): got={got} -> {}", if got == 3 { "OK" } else { "WRONG" });
+        assert!(got == 3, "GPU readback at 32-aligned nocopy base is WRONG");
+        // Same probe over an mmap'd FILE region (the actual weights path)
+        {
+            let path = std::env::temp_dir().join("minfer_mmap_probe.bin");
+            let mut f = std::fs::File::create(&path).unwrap();
+            use std::io::Write;
+            let mut blob = vec![0u8; 8192 + 64];
+            for i in 0..blob.len() { blob[i] = (i & 0xFF) as u8; }
+            f.write_all(&blob).unwrap();
+            drop(f);
+            use std::os::unix::io::AsRawFd;
+            extern "C" { fn mmap(a: *mut std::ffi::c_void, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut std::ffi::c_void; }
+            let file = std::fs::File::open(&path).unwrap();
+            let m = unsafe { mmap(std::ptr::null_mut(), 8192, 0x1, 0x0002, file.as_raw_fd(), 0) };
+            assert!(m as isize != -1);
+            let mbase = m as usize;
+            let mptr = (mbase + 63) & !31usize; // 32-aligned, not page-aligned
+            assert!(mptr % 256 != 0, "need non-256-aligned");
+            let bm = dev.new_buffer_with_bytes_no_copy(
+                mptr as *const std::ffi::c_void, 4096,
+                metal::MTLResourceOptions::StorageModeShared, None);
+            let out2 = dev.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+            let cb2 = q.new_command_buffer();
+            let enc2 = cb2.new_compute_command_encoder();
+            enc2.set_compute_pipeline_state(&pl);
+            enc2.set_buffer(0, Some(&bm), 0);
+            enc2.set_buffer(1, Some(&out2), 0);
+            enc2.dispatch_thread_groups(metal::MTLSize::new(1,1,1), metal::MTLSize::new(1,1,1));
+            enc2.end_encoding();
+            cb2.commit();
+            cb2.wait_until_completed();
+            let got2 = unsafe { *(out2.contents() as *const u8) };
+            println!("mmap GPU readback (expect 3): got={got2} -> {}", if got2 == 3 { "OK" } else { "WRONG" });
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

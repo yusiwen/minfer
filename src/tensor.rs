@@ -110,14 +110,15 @@ impl TensorType {
 ///   type  → ttype
 ///   ne[]  → shape (number of elements per dimension)
 ///   nb[]  → strides (stride in bytes per dimension)
-///   data  → stored as Vec<u8>
+///   data  → Owned Vec (scratch tensors) or a Borrowed slice of the mmap'd
+///           GGUF file (weight tensors — zero-copy load, 2026-08-21)
 ///   name  → name
 #[derive(Clone)]
 pub struct Tensor {
     pub ttype: TensorType,
     pub shape: [i64; 4],    // ne[0..3]: number of elements per dimension
     pub strides: [usize; 4], // nb[0..3]: stride in bytes per dimension
-    pub data: Vec<u8>,
+    pub data: std::borrow::Cow<'static, [u8]>,
     pub name: String,
 }
 
@@ -129,7 +130,7 @@ impl Tensor {
             ttype,
             shape: *shape,
             strides: [0; 4],
-            data: Vec::new(),
+            data: std::borrow::Cow::Owned(Vec::new()),
             name: String::new(),
         };
 
@@ -144,18 +145,18 @@ impl Tensor {
 
         // Allocate data
         let nbytes = tensor.nbytes();
-        tensor.data = vec![0u8; nbytes];
+        tensor.data = std::borrow::Cow::Owned(vec![0u8; nbytes]);
 
         tensor
     }
 
-    /// Create a tensor from an existing data buffer (zero-copy, takes ownership)
+    /// Create a tensor from an existing data buffer (takes ownership)
     pub fn from_data(ttype: TensorType, shape: &[i64; 4], data: Vec<u8>) -> Self {
         let mut tensor = Tensor {
             ttype,
             shape: *shape,
             strides: [0; 4],
-            data,
+            data: std::borrow::Cow::Owned(data),
             name: String::new(),
         };
 
@@ -183,7 +184,26 @@ impl Tensor {
             ttype,
             shape: *shape,
             strides: *strides,
-            data,
+            data: std::borrow::Cow::Owned(data),
+            name: String::new(),
+        }
+    }
+
+    /// Create a weight tensor as a Borrowed slice of the mmap'd GGUF file
+    /// (zero-copy load — the file pages are shared with the CPU/GPU instead of
+    /// being copied per tensor). The slice must be 'static: the gguf loader
+    /// leaks the Mmap for the process lifetime.
+    pub fn from_data_borrowed_with_strides(
+        ttype: TensorType,
+        shape: &[i64; 4],
+        strides: &[usize; 4],
+        data: &'static [u8],
+    ) -> Self {
+        Tensor {
+            ttype,
+            shape: *shape,
+            strides: *strides,
+            data: std::borrow::Cow::Borrowed(data),
             name: String::new(),
         }
     }
@@ -240,11 +260,11 @@ impl Tensor {
 
     /// Get the raw data pointer (slice into data Vec)
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Get the data as f32 slice (panics if type is not F32)
@@ -257,62 +277,62 @@ impl Tensor {
     pub fn data_f32_mut(&mut self) -> &mut [f32] {
         assert!(self.ttype == TensorType::F32);
         let n = self.data.len() / 4;
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut f32, n) }
+        unsafe { std::slice::from_raw_parts_mut(self.data.to_mut().as_mut_ptr() as *mut f32, n) }
     }
 
     /// Get the quantized data as raw bytes (Q4_0)
     pub fn data_q4_0(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_q4_0_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Get the quantized data as raw bytes (Q4_1)
     pub fn data_q4_1(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_q4_1_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Get the quantized data as raw bytes (Q8_0)
     pub fn data_q8_0(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_q8_0_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Get the quantized data as raw bytes (Q4_K)
     pub fn data_q4_k(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_q4_k_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Get the quantized data as raw bytes (Q6_K)
     pub fn data_q6_k(&self) -> &[u8] {
         assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
-        &self.data
+        self.data.as_ref()
     }
 
     pub fn data_q6_k_mut(&mut self) -> &mut [u8] {
         assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
-        &mut self.data
+        self.data.to_mut()
     }
 
     /// Access a single f32 value at linear index (F32 only)
@@ -327,7 +347,7 @@ impl Tensor {
     /// Copy data from another tensor (for views/slices)
     pub fn copy_from(&mut self, src: &Tensor) {
         assert!(self.nbytes() == src.nbytes());
-        self.data.copy_from_slice(&src.data);
+        self.data.to_mut().copy_from_slice(src.data.as_ref());
     }
 
     // === Reshape ===

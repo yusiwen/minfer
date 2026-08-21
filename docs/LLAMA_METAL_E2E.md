@@ -77,10 +77,10 @@
 |---|---|---|---|---|
 | 1.1 | Load architecture tensors | Qwen2's `load_arch_tensors` creates all weight tensors | `src/models/qwen2.cpp:19-47` | `src/models/qwen2/loader.rs` |
 | 1.2 | Per-layer device split | Layers 0..i_gpu_start-1 stay on CPU; the rest split to GPU devices by free memory | `llama-model.cpp:1314-1323` | "N/A" (all-on-GPU or MINFER_DISABLE_MPS all-CPU) |
-| 1.3 | Allocate Metal buffers | `ggml_backend_alloc_ctx_tensors_from_buft` → `ggml_metal_buffer_init`; mmap path `ggml_metal_buffer_map` | `llama-model.cpp:1637` `ggml-metal-device.m:1631,1701` | `src/metal.rs:1302` (register_weight: `new_buffer` + memcpy) |
-| 1.4 | Buffer storage mode | shared = `newBufferWithBytesNoCopy` (mmap/weights); private = `newBufferWithLength` | `ggml-metal-device.m:1668,1673` | `src/metal.rs` (always `StorageModeShared`) |
+| 1.3 | Allocate Metal buffers | `ggml_backend_alloc_ctx_tensors_from_buft` → `ggml_metal_buffer_init`; mmap path `ggml_metal_buffer_map` | `llama-model.cpp:1637` `ggml-metal-device.m:1631,1701` | `src/metal.rs` (register_part: ONE page-aligned `newBufferWithBytesNoCopy` per mmap'd part) — **2026-08-21: weights are (buffer, byte-offset) into the part buffer, llama's exact design** |
+| 1.4 | Buffer storage mode | shared = `newBufferWithBytesNoCopy` (mmap/weights); private = `newBufferWithLength` | `ggml-metal-device.m:1668,1673` | `src/metal.rs` (mmap parts `StorageModeShared` NoCopy; scratch/KV buffers `StorageModeShared` copies) |
 | 1.5 | Mark weight buffers | `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` | `llama-model.cpp:1657` | — |
-| 1.6 | Upload weight data | mmap direct reference; non-mmap uses blit `set_tensor_async` | `llama-model-loader.cpp:1548,1558` `ggml-metal-context.m:307` | register_weight memcpy (CPU→Shared buffer, no blit) |
+| 1.6 | Upload weight data | mmap direct reference; non-mmap uses blit `set_tensor_async` | `llama-model-loader.cpp:1548,1558` `ggml-metal-context.m:307` | **2026-08-21: zero-copy — weights are Borrowed slices of the mmap'd GGUF (`Tensor.data: Cow<'static,[u8]>`) wrapped by `newBufferWithBytesNoCopy` at the part level; no memcpy anywhere** |
 
 ### P2 Batch preparation & microbatching (per decode)
 
