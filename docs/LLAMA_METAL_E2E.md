@@ -167,7 +167,7 @@
 | `RMS_NORM` | `ggml_metal_op_norm` (fuses Mul+Add) | `kernel_rms_norm_fuse_impl` | `ops.cpp:3887-4006` `metal.metal:3181` | `src/metal.rs:614` (rms_norm) + separate `:648` (add) |
 | `ROPE` | `ggml_metal_op_rope` | `kernel_rope_norm/neox/multi/vision` | `ops.cpp:4025-4126` `metal.metal:4664-4868` | `src/metal.rs:719` (rope_f32) |
 | `ADD/SUB/MUL/DIV` | `ggml_metal_op_bin` (ADD fusion ×8) | `kernel_add` / `kernel_mul` (n_fuse specialization) | `ops.cpp:3578` | `src/metal.rs:648` (add_f32 single op) |
-| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `metal.metal:10061` | `src/metal.rs:599` (embed_tokens_gpu → get_rows_q4_0) |
+| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `metal.metal:10061` | `src/metal.rs:599` (embed_tokens_gpu → **2026-08-21: all minfer-supported quants — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (32-elem) + Q4_K/Q6_K/Q5_K (256-elem)**, matching llama's template coverage) |
 | `SET_ROWS` | `ggml_metal_op_set_rows` | `kernel_set_rows_*` | `ops.cpp:1210` `metal.metal:10156` | `src/metal.rs:866` (store_kv dedicated kernel) |
 | `CPY/DUP/CONT` | `ggml_metal_op_cpy` | `kernel_cpy_t_t/_f32_q/_q_f32` | `ops.cpp:2078` `metal.metal:8023-8122` | "N/A" (f16 KV converted directly by store_kv) |
 
@@ -186,7 +186,7 @@
 | `kernel_rms_norm_fuse_impl` | RMSNorm + Mul + Add fusion | `metal.metal:3181` | `rms_norm_256` + separate add |
 | `kernel_soft_max*` | non-flash path softmax | `metal.metal:2011,2117` | "N/A" (inlined in flash; or a dedicated `softmax` kernel) |
 | `kernel_rope_*` | RoPE | `metal.metal:4664-4868` | `src/metal.metal: kernel_rope_f32` |
-| `kernel_get_rows_*` | embedding lookup | `metal.metal:10061,10092` | `src/metal.metal: kernel_get_rows_q4_0` |
+| `kernel_get_rows_*` | embedding lookup | `metal.metal:10061,10092` | `src/metal.metal: kernel_get_rows_q4_0/q4_1/q5_0/q5_1/q8_0/q4_k/q6_k/q5_k` (templates `kernel_get_rows_q32`/`_q256`) |
 
 ### P10 KV cache
 

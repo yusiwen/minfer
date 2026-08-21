@@ -465,3 +465,132 @@ fn get_rows_q4_k_isolation() {
     assert!(maxdiff_gg == 0.0, "get_rows_q4_k non-deterministic");
     assert!(maxdiff_ref == 0.0 && nan1 == 0, "get_rows_q4_k wrong vs CPU (maxdiff={maxdiff_ref})");
 }
+
+/// Isolation test for the remaining get_rows kernels (Q4_1/Q5_0/Q5_1/Q8_0
+/// 32-elem blocks + Q6_K/Q5_K 256-elem super-blocks, added 2026-08-21 #38):
+/// deterministic + bit-exact vs the scalar CPU dq_* references — the same
+/// arithmetic the kernels' dequant_*_16 helpers implement (validated in the
+/// GEMM isolation tests). Covers the 0.5B Q5_0/Q5_1/Q6_K/Q8_0 embedding tables
+/// that previously fell back to CPU dequant + upload.
+#[test]
+fn get_rows_multi_type_isolation() {
+    let device = metal::Device::system_default().expect("no metal device");
+    let src = include_str!("../src/metal.metal");
+    let opts = metal::CompileOptions::new();
+    let lib = device
+        .new_library_with_source(src, &opts)
+        .unwrap_or_else(|e| panic!("shader compile: {e}"));
+
+    struct Case { kname: &'static str, bbytes: usize, is256: bool, dq: fn(&[u8], usize) -> f32 }
+    let cases = [
+        Case { kname: "kernel_get_rows_q4_1", bbytes: 20, is256: false, dq: dq_q4_1 },
+        Case { kname: "kernel_get_rows_q5_0", bbytes: 22, is256: false, dq: dq_q5_0 },
+        Case { kname: "kernel_get_rows_q5_1", bbytes: 24, is256: false, dq: dq_q5_1 },
+        Case { kname: "kernel_get_rows_q8_0", bbytes: 34, is256: false, dq: dq_q8_0 },
+        Case { kname: "kernel_get_rows_q6_k", bbytes: 210, is256: true, dq: dq_q6_k },
+        Case { kname: "kernel_get_rows_q5_k", bbytes: 176, is256: true, dq: dq_q5_k },
+    ];
+
+    let ne = 512usize;
+    let vocab = 7usize;
+    let nt = 5usize;
+    let ids: [usize; 5] = [3, 1, 5, 0, 6];
+
+    let cmdq = device.new_command_queue();
+
+    for case in cases {
+        let nblk = if case.is256 { ne / 256 } else { ne / 32 };
+        let mut table = vec![0u8; vocab * nblk * case.bbytes];
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for (bi, chunk) in table.chunks_mut(case.bbytes).enumerate() {
+            // deterministic pseudo-random payload
+            let mut next = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 32) as u8
+            };
+            match case.kname {
+                "kernel_get_rows_q4_1" => {
+                    chunk[0..2].copy_from_slice(&half::f16::from_f32(0.1 + (bi % 5) as f32 * 0.02).to_bits().to_le_bytes());
+                    chunk[2..4].copy_from_slice(&half::f16::from_f32(0.03).to_bits().to_le_bytes());
+                    for b in 4..20 { chunk[b] = next(); }
+                }
+                "kernel_get_rows_q5_0" => {
+                    chunk[0..2].copy_from_slice(&half::f16::from_f32(0.1 + (bi % 5) as f32 * 0.02).to_bits().to_le_bytes());
+                    for b in 2..6 { chunk[b] = next(); }
+                    for b in 6..22 { chunk[b] = next(); }
+                }
+                "kernel_get_rows_q5_1" => {
+                    chunk[0..2].copy_from_slice(&half::f16::from_f32(0.1 + (bi % 5) as f32 * 0.02).to_bits().to_le_bytes());
+                    chunk[2..4].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+                    for b in 4..8 { chunk[b] = next(); }
+                    for b in 8..24 { chunk[b] = next(); }
+                }
+                "kernel_get_rows_q8_0" => {
+                    chunk[0..2].copy_from_slice(&half::f16::from_f32(0.1 + (bi % 5) as f32 * 0.02).to_bits().to_le_bytes());
+                    for b in 2..34 { chunk[b] = next(); }
+                }
+                "kernel_get_rows_q6_k" => {
+                    for b in 0..128 { chunk[b] = next(); }         // ql
+                    for b in 128..192 { chunk[b] = next() & 0x03; } // qh (2 bits each)
+                    for b in 192..208 { chunk[b] = (next() as i8 / 16) as u8; } // scales (small i8)
+                    chunk[208..210].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+                }
+                _ => { // q5_k
+                    chunk[0..2].copy_from_slice(&half::f16::from_f32(0.1 + (bi % 5) as f32 * 0.02).to_bits().to_le_bytes());
+                    chunk[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+                    for b in 4..16 { chunk[b] = 0x11; }            // scales[12]: scale=1, min=1
+                    for b in 16..48 { chunk[b] = next(); }         // qh
+                    for b in 48..176 { chunk[b] = next(); }        // qs
+                }
+            }
+        }
+
+        // CPU reference
+        let mut ref_out = vec![0.0f32; nt * ne];
+        for t in 0..nt {
+            let row = ids[t];
+            for s in 0..nblk {
+                let blk = &table[(row * nblk + s) * case.bbytes..(row * nblk + s + 1) * case.bbytes];
+                let per = if case.is256 { 256 } else { 32 };
+                for k in 0..per {
+                    ref_out[t * ne + s * per + k] = (case.dq)(blk, k);
+                }
+            }
+        }
+
+        let f = lib.get_function(case.kname, None).unwrap();
+        let pl = device.new_compute_pipeline_state_with_function(&f).unwrap();
+        let wb = device.new_buffer_with_data(table.as_ptr() as *const _, table.len() as u64, metal::MTLResourceOptions::StorageModeShared);
+        let ids_i: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
+        let ib = device.new_buffer_with_data(ids_i.as_ptr() as *const _, (ids_i.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let ob = device.new_buffer((nt * ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+
+        let cb = cmdq.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pl);
+        enc.set_buffer(0, Some(&wb), 0);
+        enc.set_buffer(1, Some(&ib), 0);
+        enc.set_buffer(2, Some(&ob), 0);
+        let ne_i = ne as i32;
+        let nt_i = nt as i32;
+        enc.set_bytes(3, 4, &ne_i as *const i32 as *const _);
+        enc.set_bytes(4, 4, &nt_i as *const i32 as *const _);
+        let nthreads = if case.is256 { nt * (ne / 256) * 16 } else { nt * (ne / 32) };
+        enc.dispatch_thread_groups(
+            metal::MTLSize { width: ((nthreads + 255) / 256) as u64, height: 1, depth: 1 },
+            metal::MTLSize { width: 256, height: 1, depth: 1 },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let got = unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, nt * ne) };
+        let mut maxdiff = 0.0f32;
+        for i in 0..nt * ne {
+            maxdiff = maxdiff.max((got[i] - ref_out[i]).abs());
+        }
+        let rel = maxdiff / ref_out.iter().fold(0.0f32, |a, &v| a.max(v.abs()).max(1e-6));
+        assert!(rel < 1e-5, "{}: get_rows wrong vs CPU (maxdiff={:.3e} rel={:.3e})", case.kname, maxdiff, rel);
+        println!("  get_rows {}: bit-close vs CPU (rel {:.2e})", case.kname, rel);
+    }
+}

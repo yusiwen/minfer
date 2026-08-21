@@ -173,6 +173,12 @@ struct MpsStateInner {
     pl_q5_k_mm_f32: metal::ComputePipelineState,
     pl_get_rows_q4_0: metal::ComputePipelineState,
     pl_get_rows_q4_k: metal::ComputePipelineState,
+    pl_get_rows_q4_1: metal::ComputePipelineState,
+    pl_get_rows_q5_0: metal::ComputePipelineState,
+    pl_get_rows_q5_1: metal::ComputePipelineState,
+    pl_get_rows_q8_0: metal::ComputePipelineState,
+    pl_get_rows_q6_k: metal::ComputePipelineState,
+    pl_get_rows_q5_k: metal::ComputePipelineState,
     pl_rms_norm: metal::ComputePipelineState,
     pl_rms_norm_256: metal::ComputePipelineState,
     pl_add: metal::ComputePipelineState,
@@ -626,7 +632,13 @@ impl MpsCommandBuffer<'_> {
         self.trace_op("embed");
         let (pl, nb) = match ttype {
             TensorType::Q4_0 => (&self.state.pl_get_rows_q4_0, ne / 32),
+            TensorType::Q4_1 => (&self.state.pl_get_rows_q4_1, ne / 32),
+            TensorType::Q5_0 => (&self.state.pl_get_rows_q5_0, ne / 32),
+            TensorType::Q5_1 => (&self.state.pl_get_rows_q5_1, ne / 32),
+            TensorType::Q8_0 => (&self.state.pl_get_rows_q8_0, ne / 32),
             TensorType::Q4_K => (&self.state.pl_get_rows_q4_k, (ne / 256) * 16),
+            TensorType::Q6_K => (&self.state.pl_get_rows_q6_k, (ne / 256) * 16),
+            TensorType::Q5_K => (&self.state.pl_get_rows_q5_k, (ne / 256) * 16),
             _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
         };
         self.enc.set_compute_pipeline_state(pl);
@@ -1235,6 +1247,12 @@ impl MpsState {
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
+            let pl_get_rows_q4_1 = get_pl("kernel_get_rows_q4_1")?;
+            let pl_get_rows_q5_0 = get_pl("kernel_get_rows_q5_0")?;
+            let pl_get_rows_q5_1 = get_pl("kernel_get_rows_q5_1")?;
+            let pl_get_rows_q8_0 = get_pl("kernel_get_rows_q8_0")?;
+            let pl_get_rows_q6_k = get_pl("kernel_get_rows_q6_k")?;
+            let pl_get_rows_q5_k = get_pl("kernel_get_rows_q5_k")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
             let pl_rms_norm_256 = get_pl("kernel_rms_norm_f32_256")?;
             let pl_add      = get_pl("kernel_add_f32")?;
@@ -1300,6 +1318,12 @@ impl MpsState {
                 pl_q5_k_mm_f32,
                 pl_get_rows_q4_0,
                 pl_get_rows_q4_k,
+                pl_get_rows_q4_1,
+                pl_get_rows_q5_0,
+                pl_get_rows_q5_1,
+                pl_get_rows_q8_0,
+                pl_get_rows_q6_k,
+                pl_get_rows_q5_k,
                 pl_rms_norm,
                 pl_rms_norm_256,
                 pl_add,
@@ -1727,9 +1751,14 @@ impl MpsState {
         }
         let ttype = embd_weight.ttype;
         match ttype {
-            TensorType::Q4_0 => {}
-            TensorType::Q4_K => {
-                // kernel_get_rows_q4_k uses ne/256 super-blocks (exact division).
+            TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q5_0 | TensorType::Q5_1 | TensorType::Q8_0 => {
+                // 32-elem block kernels: exact division required.
+                if ne % 32 != 0 {
+                    return false; // non-32-aligned ne: fall back to CPU embed
+                }
+            }
+            TensorType::Q4_K | TensorType::Q6_K | TensorType::Q5_K => {
+                // 256-elem super-block kernels: exact division required.
                 if ne % 256 != 0 {
                     return false; // non-256-aligned ne: fall back to CPU embed
                 }
