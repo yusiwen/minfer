@@ -88,6 +88,7 @@ fn main() {
     let mut meta_flag = false;
     let mut no_template = false;
     let mut graph_mode = false;
+    let mut dump_graph: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -142,6 +143,12 @@ fn main() {
             "--graph" => {
                 graph_mode = true;
                 i += 1;
+            }
+            "--dump-graph" => {
+                if let Some(v) = next_val("--dump-graph") {
+                    dump_graph = Some(v);
+                }
+                i += 2;
             }
             "--seed" => {
                 if let Some(v) = next_val(a) {
@@ -330,6 +337,23 @@ fn main() {
     println!("Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
         input_ids.len(), prefill_time.as_secs_f64(),
         input_ids.len() as f64 / prefill_time.as_secs_f64());
+
+    // === Graph DOT export (--dump-graph <path>) ===
+    if let Some(path) = &dump_graph {
+        use crate::graph::params::{CParams, GraphParams, GraphType};
+        let gparams = GraphParams {
+            n_tokens: input_ids.len(),
+            n_seqs: 1,
+            gtype: if input_ids.len() == 1 { GraphType::Decode } else { GraphType::Prefill },
+            cparams: CParams { n_ctx: params.n_ctx, n_batch: input_ids.len(), flash_attn: false },
+            weights_version: 1,
+        };
+        let g = model.build_graph(&gparams);
+        let mut f = std::fs::File::create(path).expect("create dot file");
+        g.dump_dot(&mut f).expect("write dot");
+        println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
+        std::process::exit(0);
+    }
 
     // === Generate ===
     let mut logits = last_logits;
