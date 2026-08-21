@@ -917,7 +917,7 @@ Phase 8: Verification
 | Phase | 内容 | 状态 | 提交 hash | 验证 |
 |-------|------|------|-----------|------|
 | Phase 1 | IR 基础设施：`graph/mod.rs` + `ops.rs` + `builder.rs` + `alloc.rs` | ✅ | `33adfd1` | 12 个单元测试通过（topo 排序/环检测、Op 负载相等性、链式 liveness 缓冲复用、并行链隔离、输入填充、持久 KV 共享）；全套 46 通过（1 个既有环境失败：`attn_parallel_realdata_correctness` 需 /tmp/dp3 dump） |
-| Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs` | ⬜ | — | — |
+| Phase 2 | CPU Backend：`backend.rs` + `cpu_backend.rs`（+ 最小执行器 `scheduler.rs`） | ✅ | `960d54b` | 16 个 graph 测试通过（matmul+bias+silu+scale 对照手工计算、rms_norm 对照 vec_ops、embedding+rope 对照参考、KV store/load + GQA attention 往返、liveness/IR）；全套 50 通过（1 个既有环境失败不变） |
 | Phase 3 | Metal Fine-Grained Graph Backend：`metal_backend.rs`（接线现有 per-op 方法） | ⬜ | — | — |
 | Phase 4 | Scheduling + Fusion + Debugging：`scheduler.rs` + `fusion.rs` + `dot.rs` + `cache.rs` | ⬜ | — | — |
 | Phase 5 | Qwen2 Graph Construction：`models/qwen2/graph.rs` | ⬜ | — | — |
@@ -930,5 +930,10 @@ Phase 8: Verification
 1. **`NodeMeta` 用具体 enum 代替 `Box<dyn Any + Send + Sync>`**（`src/graph/ops.rs`）：可 `PartialEq`（供 debug 复用校验）、无 downcast panic、`CNode` 可 `Clone`。代价：新增元数据类型需改 enum（已含 MatMul/Norm/Rope/Attn/Kvcache/Embed）。
 2. **`Op::Input` 叶子节点**：输入节点用独立 op 标记（对应 llama.cpp `GGML_OP_NONE` 叶），`ComputeGraph::inputs` 记录其 id。
 3. **`rope()` 增加 `style: RopeStyle` 参数**（计划示例签名未含，但 minfer `ModelDef::rope_style()` 需要它）；**`kvcache_store/load` 显式携带 `n_ctx`** 用于持久区定长（load 形状 `[n_embd, n_ctx]`，执行期只读已写前缀）。
-4. **Phase 1 KV 持久区每层一块**（K 区；V 区与 KV 写入细节属 Phase 5 执行器职责，`alloc.rs` 已注明）。
+4. **KV 持久区布局 `[K | V]` 连续**（每层一块，长度 `2*n_embd*n_ctx`；Phase 2 起由 allocator 保证，attention kernel 从一个 buffer 取 K 与 V）。
+5. **`attn()` 增加 `pos` 输入**（计划签名 `attn(q, kv_layer, meta)` 无位置——但因果 mask 需要 `pos[t]+1`；llama.cpp 的 mask 同样依赖 idx 输入）。
+6. **meta 结构扩展**：`EmbedMeta.weight_name`、`RoPEMeta.n_head/hd`、`AttnMeta.nkt/scale`（kernel 必需，计划 §3.1 未列）。
+7. **`Backend::execute_node` 用 `&mut self`**（CPU 池需可变访问；GPU 后端命令缓冲同理）；**缓冲池单一持有者 = `GraphAllocator`**（scheduler 经 allocator 执行，避免双池）。
+8. **I32 输入（token ids/positions）以 `f32::from_bits` 位模式存储**（|v| < 2^24 精确），allocator 提供 `fill_input_i32`。
+9. **F32 权重 matmul 在 CPU backend 支持**（现有 `cpu_quant_matmul_f32` 对 F32 panic，graph 路径经 `vec_ops::mat_mul_f32` 兜底）。
 5. 全量测试基线：`cargo test --release` = 46 通过 / 1 失败（`attn_parallel_realdata_correctness` 需要 `/tmp/dp3` 下的 `minfer_gpu_dump_layer0_b{q,k,v}.f32` 真实 dump，属环境依赖的既有失败）。
