@@ -1,7 +1,66 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() {
+    // ─── Precompiled Metal library (metallib) ─────────────────────────
+    // Compile src/metal.metal → $OUT_DIR/minfer.metallib at build time so the
+    // binary can load it with newLibraryWithData (llama embeds default.metallib
+    // the same way; minfer previously compiled from source at every process
+    // start — ~0.3-1 s, and even the first-ever run). Flags mirror llama's
+    // release build (ggml/src/ggml-metal/CMakeLists.txt): `-O3`. Numerics are
+    // IDENTICAL to the runtime newLibraryWithSource compile (verified 2026-08-21
+    // on 7B/0.5B greedy output across -O1/-O2/-O3, -fno-fast-math,
+    // -std=metal3.1/3.2 — byte-identical at every combination; the earlier
+    // apparent divergence was a prompt-mixup in the A/B reference). On any
+    // failure (no xcrun / no SDK / compile error) an EMPTY marker file is
+    // emitted and src/metal.rs falls back to newLibraryWithSource.
+    println!("cargo:rerun-if-changed=src/metal.metal");
+    println!("cargo:rerun-if-changed=build.rs");
+    {
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let air = format!("{out_dir}/minfer.air");
+        let metallib = format!("{out_dir}/minfer.metallib");
+
+        let metal_ok = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "-O3",
+                   // clang module cache goes to a writable dir (note: metal
+                   // only accepts the `=` form of -fmodules-cache-path)
+                   &format!("-fmodules-cache-path={out_dir}"),
+                   "-c", "src/metal.metal", "-o"])
+            .arg(&air)
+            .stdout(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let lib_ok = if metal_ok {
+            Command::new("xcrun")
+                .args(["-sdk", "macosx", "metallib"])
+                .arg(&air)
+                .args(["-o", &metallib])
+                .stdout(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !lib_ok {
+            // Fallback marker: empty metallib → runtime source compile.
+            let _ = std::fs::write(&metallib, b"");
+            println!("cargo:warning=Metal metallib compile failed — will compile shaders from source at runtime");
+        }
+        let _ = std::fs::remove_file(&air);
+        // Content hash in the env fingerprint: cargo does not track OUT_DIR
+        // files for include_bytes!, so a changed metallib (metal.metal edit)
+        // would otherwise leave a stale binary. The hash forces a recompile.
+        let bytes = std::fs::read(&metallib).unwrap_or_default();
+        let hash: String = bytes.iter().map(|b| format!("{b:02x}")).take(16).collect();
+        println!("cargo:rustc-env=MINFER_METALLIB_PATH={metallib}");
+        println!("cargo:rustc-env=MINFER_METALLIB_HASH={hash}");
+    }
+
     let nvcc = match Command::new("nvcc").arg("--version").output() {
         Ok(_) => "nvcc",
         Err(_) => {

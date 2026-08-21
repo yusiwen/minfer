@@ -1098,6 +1098,31 @@ extern "C" {
 
 // ─── MpsState (global singleton) ─────────────────────────────────────
 
+/// Compile metal.metal from source at runtime (fallback when the build-time
+/// metallib is unavailable — see try_new). ~0.3-1 s per process start.
+#[cfg(target_os = "macos")]
+fn compile_metal_source(device: &metal::Device) -> Option<metal::Library> {
+    let src = include_str!("metal.metal");
+    let opts = metal::CompileOptions::new();
+    match device.new_library_with_source(src, &opts) {
+        Ok(l) => Some(l),
+        Err(e) => { eprintln!("MPS: shader compilation failed: {}", e); None }
+    }
+}
+
+/// Load the embedded precompiled metallib, falling back to a runtime source
+/// compile when it is empty or fails to load.
+#[cfg(target_os = "macos")]
+fn load_embedded_or_source(device: &metal::Device, metallib: &[u8]) -> Option<metal::Library> {
+    if !metallib.is_empty() {
+        match device.new_library_with_data(metallib) {
+            Ok(l) => return Some(l),
+            Err(e) => eprintln!("MPS: precompiled metallib load failed ({e}) — falling back to source compile"),
+        }
+    }
+    compile_metal_source(device)
+}
+
 impl MpsState {
     pub fn try_new() -> Option<Self> {
         if std::env::var("MINFER_DISABLE_MPS").is_ok() {
@@ -1122,11 +1147,27 @@ impl MpsState {
                 eprintln!("MPS: GPU capture started");
             }
 
-            let src = include_str!("metal.metal");
-            let opts = metal::CompileOptions::new();
-            let lib = match device.new_library_with_source(src, &opts) {
-                Ok(l) => l,
-                Err(e) => { eprintln!("MPS: shader compilation failed: {}", e); return None; }
+            // Prefer the build-time precompiled metallib (build.rs compiles
+            // src/metal.metal → minfer.metallib, llama-style: embedded
+            // default.metallib, ggml-metal-device.m:128-234). The embedded
+            // file is EMPTY when the Metal toolchain was unavailable at build
+            // time → fall back to newLibraryWithSource (per-process compile,
+            // ~0.3-1 s). Flags must match the runtime source-compile numerics
+            // exactly — see build.rs for the chosen -O level.
+            // MINFER_METALLIB_FILE overrides the embedded library at runtime
+            // (debug/tuning hook to A/B different -O levels without rebuilds).
+            static METALLIB: &[u8] = include_bytes!(env!("MINFER_METALLIB_PATH"));
+            let override_file = std::env::var("MINFER_METALLIB_FILE").ok().filter(|p| !p.is_empty());
+            let lib = if let Some(path) = override_file {
+                match std::fs::read(&path).ok().and_then(|b| device.new_library_with_data(&b).ok()) {
+                    Some(l) => l,
+                    None => {
+                        eprintln!("MPS: metallib override {path} unreadable — falling back to embedded/source");
+                        load_embedded_or_source(&device, METALLIB)?
+                    }
+                }
+            } else {
+                load_embedded_or_source(&device, METALLIB)?
             };
 
             let get_pl = |name: &str| {

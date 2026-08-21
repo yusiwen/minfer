@@ -65,7 +65,7 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 0.1 | Register Metal backend | Construct backend per device, call `ggml_metal_init` | `ggml-metal.cpp:689` | — |
-| 0.2 | Create `struct ggml_metal` context | MTLDevice + shared MTLCommandQueue, load kernel library, create concurrent dispatch queue, fusion/concurrency flags | `ggml-metal-context.m:84-175` | `src/metal.rs:1090-1200` (MpsState singleton) |
+| 0.2 | Create `struct ggml_metal` context | MTLDevice + shared MTLCommandQueue, load kernel library, create concurrent dispatch queue, fusion/concurrency flags | `ggml-metal-context.m:84-175` | `src/metal.rs:1090-1200` (MpsState singleton) — **2026-08-21: kernel library is now a build-time precompiled `.metallib` embedded in the binary (`build.rs`, llama's `-O3` flags, `newLibraryWithData`), with a runtime `newLibraryWithSource` fallback when the toolchain is absent** |
 | 0.3 | Init low-level device | `MTLCreateSystemDefaultDevice` + `newCommandQueue`, probe capabilities (simdgroup_mm / unified_memory / bfloat / tensor) | `ggml-metal-device.m:714-760` | `src/metal.rs` (`new_device` capability probe) |
 | 0.4 | **tensor-API gate** | `has_tensor` defaults to OFF for pre-M5/M6/A19/A20 (disabled on M4) | `ggml-metal-device.m:753-760` | "N/A" (llama itself doesn't use the tensor API on M4) |
 | 0.5 | Create scheduler | `ggml_backend_sched_new` (backend array + gallocr + events) | `ggml-backend.cpp:1792` | "N/A" |
