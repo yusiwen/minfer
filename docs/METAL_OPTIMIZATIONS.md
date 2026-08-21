@@ -8,6 +8,14 @@
 >
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
+>
+> 📌 **Compute-graph era note (2026-08-21+, Phase 6)**: inference now runs through
+> the declarative compute graph (`src/graph/`, `MetalBackend`), which dispatches
+> these kernels **per op** instead of the old whole-layer `layer_gpu`. **Every
+> kernel/optimization below remains valid** — the gap is in *wiring*, not kernels:
+> see [§0.1 Graph-path (MetalBackend) integration status](#01-graph-path-metalbackend-integration-status-2026-08-21).
+> The old-path measurements in §1 are pre-graph references; graph-path numbers
+> live in §0.1.
 
 ---
 
@@ -16,6 +24,33 @@
 > Legend: `[x]` done (with commit) · `[ ]` to-do · `[—]` decided not to change.
 > Commits are from `git log`; a few early items are marked "TODO-trace" (long
 > history, to be filled in later).
+
+### §0.1 Graph-path (MetalBackend) integration status (2026-08-21)
+
+The graph's `MetalBackend` (`src/graph/metal_backend.rs`) dispatches one op per
+call into a split-scoped `MpsCommandBuffer`. Which of the optimizations below
+already transfer:
+
+| Graph op | Kernel used by MetalBackend | Status |
+|---|---|---|
+| `MatMul` | `quant_matmul_f32_on_gpu_buf` → per-type GEMM / `_multi` / ported q4_K kernel | ✅ **full transfer** (#11/#12/#27/#29/#30/#40 apply) |
+| `GetRows` (embed) | `embed_tokens_gpu` → `get_rows` kernels | ✅ full transfer (#33/#38 apply) |
+| `KvcacheStore` | `store_kv` | ✅ |
+| `RoPE` / `Silu` / `Add` / `Mul` / `SwiGLU` | `rope_f32` / `silu_f32` / `add_f32` / `mul_f32` / `swiglu_f32` | ✅ |
+| `RmsNorm` | `rms_norm` (**32-thread** kernel) | ⬜ **#16 not applied** — graph uses the 32-thread kernel, not `rms_norm_256` (~2× faster decode dispatch cost) |
+| `Attn` (prefill + decode) | `gqa_attn_f32` (**classic** kernel) | ⬜ **flash attention not wired** — #22/#24/#25/#26 kernels exist but the graph path calls the classic kernel for BOTH prefill and decode; split attention (#9/#10/#13) and `attn_parallel_prefill` (#17) also unused |
+| Fused decode QKV / bias+rope+store (`attn_bias_rope_store`) | — (layer_gpu-only fused kernels) | ⬜ graph builds separate ops — more dispatches, no fused decode path |
+| `n_out` tail-row optimization (#32/#34) | — | ⬜ not ported — the graph computes full `nt` and extracts the tail logits rows (numerically identical, plan §17.16) |
+
+**Graph-path measured numbers** (same models, `--temp 0` greedy):
+
+| Scenario | Old path (layer_gpu) | Graph path | Note |
+|---|---|---|---|
+| 0.5B Q4_0 decode | ~218 t/s | **~217 t/s** | parity — matmul/embed kernels dominate; classic attention not the decode bottleneck at 0.5B |
+| 7B Q4_K_M decode | ~45-49 t/s | **~42.3 t/s** | ~10 % below old — classic `gqa_attn_f32` decode attention |
+| 7B Q4_K_M prefill | ~1234 ms @ pp499 | (not yet A/B'd) | graph runs the classic prefill attention + full-nt FFN — expect the old-path gap + attention gap |
+
+**Graph-path TODO (wire into `MetalBackend`)**: ① `Attn` → `gqa_attn_flash`/`gqa_attn_split_f32` (decode) + `attn_flash_prefill`/`attn_parallel_prefill` (prefill), gated like the old path (`flash_attn_enabled(hd)` etc.); ② `RmsNorm` → `rms_norm_256` when `rms_norm_256_enabled()`; ③ `n_out` tail-row `GetRows` (plan §5.5). These are pure wiring — the kernels are already isolated-tested.
 
 ### ✅ Done
 
@@ -694,7 +729,20 @@ Warm steady-state = run 2's numbers (pp30 ~0.17 s, decode ~46 t/s). Not a bug.
 > daemon. Together they target the cold-start axis only — steady-state
 > inference is unaffected (already at the §1.6 numbers).
 
-### 4.3 Reference: GPU profiling tooling (done, operational)
+### 4.3 Graph-path (MetalBackend) integration to-dos (2026-08-21+, compute-graph era)
+
+The compute graph is now the inference path (Phase 6). Kernel-level parity work
+is complete (§0); the remaining gap is **wiring already-tested kernels into
+`MetalBackend`** — see §0.1 for the status table and measured numbers.
+
+| # | Item | Current | Approach | Expected |
+|---|---|---|---|---|
+| G1 | **Attention: wire the fast kernels** | `MetalBackend` calls the classic `gqa_attn_f32` for BOTH prefill and decode — flash (#22/#24/#25/#26), split (#9/#10/#13) and `attn_parallel_prefill` (#17) kernels are isolated-tested but unused | per-op `Attn` dispatch: `gqa_attn_flash`/`gqa_attn_split_f32` for decode, `attn_flash_prefill`/`attn_parallel_prefill` for prefill, gated like the old path (`flash_attn_enabled(hd)`, `MINFER_NO_FLASH`, …) | 7B decode ~42 → ~45-49 t/s (old-path parity); 7B prefill recovers the flash attention win |
+| G2 | **RMSNorm: 256-thread kernel** | graph uses the 32-thread `rms_norm` | `rms_norm_256` when `rms_norm_256_enabled()` (#16) | decode small-op dispatch cost ~2× lower |
+| G3 | **n_out tail-row optimization** | graph computes full `nt` (FFN + lm_head), extracts the tail logits | `GetRows(hidden, tail_ids)` before the last layer's FFN + lm_head (plan §5.5, llama `inp_out_ids`) | 7B prefill full-nt FFN/lm_head work eliminated (≈ old-path #32/#34) |
+| G4 | **Fused decode QKV / bias+rope+store** | graph emits separate matmul/bias/rope/store ops per layer | op-level fusion (BatchMatMul IR, `FusedBiasRope`) or a MetalBackend decode fast path | fewer dispatches per decode token (old fused-decode path #8) |
+
+### 4.4 Reference: GPU profiling tooling (done, operational)
 
 - `xctrace`: `/usr/bin/xctrace` is a broken stub ("tool not found"); the real
   binary is `/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`.
@@ -708,7 +756,7 @@ Warm steady-state = run 2's numbers (pp30 ~0.17 s, decode ~46 t/s). Not a bug.
   ratios; bandwidth counters (L1/LLC Read Bandwidth) are cumulative — ignore
   magnitude.
 
-### 4.4 Process (was §4.5 backfill)
+### 4.5 Process (was §4.5 backfill)
 
 After each item completes: update the §0 progress table (check, fill in the
 commit, update measured effect) → record the implementation + verification in
