@@ -40,6 +40,7 @@ already transfer:
 | `RoPE` / `Silu` / `Add` / `Mul` / `SwiGLU` | `rope_f32` / `silu_f32` / `add_f32` / `mul_f32` / `swiglu_f32` | ✅ |
 | `RmsNorm` | `rms_norm_256` (G2) | ✅ **G2** — `rms_norm_256_enabled()` (#16, ~2× faster decode dispatch cost) |
 | `Attn` (prefill + decode) | flash / split / parallel / classic, gated like the old path (G1) | ✅ **G1** — nt==1 → `flash_attn_enabled(hd)` → `gqa_attn_flash` (chunked) else `gqa_attn_split_f32` else classic; nt>1 → hd 64/128 + `prefill_flash_enabled(hd)` → `attn_flash_prefill` else `matmul_attn_enabled()` → `attn_parallel_prefill` else classic (#9/#10/#13/#17/#22/#24/#25/#26) |
+| `FusedQKV` (decode QKV, G4) | concat matmul (`blk.{i}.attn_qkv`) + `attn_bias_rope_store` | ✅ **G4** — nt==1 builds one fused node replacing 3 matmul + 3 bias + 2 rope + 2 store (10 dispatches → 2); q at concat offset 0 feeds attention; `MINFER_NO_FUSE_QKV=1` reverts |
 | Fused decode QKV / bias+rope+store (`attn_bias_rope_store`) | — (layer_gpu-only fused kernels) | ⬜ graph builds separate ops — more dispatches, no fused decode path |
 | `n_out` tail-row optimization (#32/#34) | tail `GetRows` + reduced last layer (G3) | ✅ **G3** — full-nt FFN/lm_head work dropped (prefill ↑~1.5× on 0.5B) |
 
@@ -48,7 +49,7 @@ from §1/§1.6 — same models; graph-path numbers current as of **G1+G2+G3**):
 
 | Scenario | Old path (layer_gpu) | Graph path | Δ |
 |---|---|---|
-| 0.5B Q4_0 decode, KV ~200+ | ~279 t/s (§1.1, 128 tok) | **~256 t/s** (KV206) | ≈ parity (**2.1× vs pre-G1 ~122**) |
+| 0.5B Q4_0 decode, KV ~200+ | ~279 t/s (§1.1, 128 tok) | **~256 t/s** (KV206, pre-G4) / **~299 t/s** (KV440, G4) | ≈ parity→**+~11 % over old** (2.1× vs pre-G1 ~122) |
 | 0.5B Q4_0 prefill pp390–440 | ~2530–2620 t/s (§1.1 pp430) | **~3900–4000 t/s** (pp440) | **+~55 % over old** (G3 tail reduction; was ~1663 pre-G1, ~2600 post-G1/G2) |
 | 7B Q4_K_M decode, KV ~200+ | ~48 t/s steady | **~49 t/s** (KV206) | ≈ parity (was ~32.5 pre-G1) |
 | 7B Q4_K_M prefill pp206 | ~240 t/s (§1.6 pp252) | ~217 t/s (pp206) | ≈ −10 % (unchanged by G1–G3) |
@@ -63,11 +64,12 @@ GEMM dominates and transfers fully). Greedy outputs are byte-identical to the
 pre-G1 graph path (flash/split/parallel and tail-reduced paths all verified).
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① ✅ G1 attention dispatch;
-② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ **G4** fused decode
-QKV + bias+rope+store (or BatchMatMul IR), plan §4.3 below. G1–G3 were pure
-wiring (kernels already isolated-tested); G3 additionally fixed two allocator
-liveness bugs (liveness used topo_order while the scheduler executes in build
-order; input buffers were freed and reused before host fills finished).
+② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ ✅ G4 fused decode
+QKV + bias+rope+store. G1–G4 are wiring (kernels already isolated-tested);
+G3 additionally fixed two allocator liveness bugs (liveness used topo_order
+while the scheduler executes in build order; input buffers were freed and
+reused before host fills finished). Remaining decode lever: fused FFN
+gate/up (BatchMatMul IR, `blk.{i}.ffn_gu` already loader-registered).
 
 ### ✅ Done
 
@@ -757,7 +759,7 @@ is complete (§0); the remaining gap is **wiring already-tested kernels into
 | G1 | **Attention: wire the fast kernels** | ✅ **done** | per-op `Attn` dispatch: nt==1 → `flash_attn_enabled(hd)` → `gqa_attn_flash` (chunked `MINFER_ATTN_CHUNKS`) else `gqa_attn_split_f32` else classic; nt>1 → hd 64/128 + `prefill_flash_enabled(hd)` → `attn_flash_prefill` else `matmul_attn_enabled()` → `attn_parallel_prefill` else classic. Gated like the old path (`MINFER_NO_FLASH`/`MINFER_NO_SPLIT_ATTN`/`MINFER_NO_PREFILL_FLASH`/`MINFER_NO_MATMUL_ATTN`). Decode KV-growth closed: 0.5B KV206 ~122 → **~256 t/s (2.1×)**, 7B ~32.5 → **~49 t/s**; greedy byte-identical | `32b0d03` |
 | G2 | **RMSNorm: 256-thread kernel** | ✅ **done** | `RmsNorm` dispatches `rms_norm_256` when `rms_norm_256_enabled()` (#16), falls back to the 32-thread kernel | `32b0d03` |
 | G3 | **n_out tail-row optimization** | ✅ **done** | `GetRows(wo/residual, tail_ids)` after the last layer's `wo`; the last FFN + output_norm + lm_head run on `n_out` rows (llama `inp_out_ids`, plan §5.5). `GraphParams.n_out` joins the reuse identity; decode (nt==1) builds no reduction. 0.5B prefill pp440 **~3900–4000 t/s (+~55 % over the old path)**; full-nt vs reduced graphs bit-identical through the whole tail block. **Also fixed two allocator liveness bugs surfaced by the reduced graph**: (a) liveness used `topo_order()` while the scheduler executes in build order — a later consumer's buffer reuse could clobber a still-alive input (attn reused the residual h before `get_rows(h)` read it); (b) input buffers were freed and reused before the host-side fills finished (two inputs sharing a buffer clobbered each other). | `8febf4c` |
-| G4 | **Fused decode QKV / bias+rope+store** | ⬜ TODO | op-level fusion (BatchMatMul IR, `FusedBiasRope`) or a MetalBackend decode fast path | fewer dispatches per decode token (old fused-decode path #8) |
+| G4 | **Fused decode QKV / bias+rope+store** | ✅ **done** | decode (nt==1) builds one `Op::FusedQKV` node: a single concat matmul (`blk.{i}.attn_qkv`, loader-registered `wq|wk|wv`) into a q\|k\|v concat buffer + one `attn_bias_rope_store` pass (3 bias + q/k rope + K/V store); attention reads q from concat offset 0. 10 dispatches → 2 per layer. `CParams.fuse_qkv` is part of the reuse identity; `MINFER_NO_FUSE_QKV=1` reverts (A/B). 0.5B decode **~269 → ~299 t/s (+~11 %)**, KV550 265 → 295; 7B unchanged (Q4_K GEMM-bound); fused-vs-unfused decode logits **max diff 0.0** (0.5B + 7B) | `a2c83bc` |
 
 ### 4.4 Reference: GPU profiling tooling (done, operational)
 
