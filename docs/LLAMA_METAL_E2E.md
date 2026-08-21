@@ -236,7 +236,7 @@ Complete forward-path mapping (non-forward ops omitted):
 | Branch | Trigger condition | kernel / pipeline | threadgroups | llama.cpp location |
 |---|---|---|---|---|
 | ① mat-mv ext | src1=f32, `ne00%128==0`, src0 type in supported set, **ne11∈[2,8]** (K-quants need ne11∈[4,8]) | `kernel_mul_mv_ext_*` (nsg=2, nxpsg per ne00: 16/8/4) | (ne01/r0ptg, ne11/r1ptg, ne12·ne13), 32×nsg | `ops.cpp:2340-2439` `device.cpp:706` |
-| ② simdgroup MM | non-transposed, `has_simdgroup_mm`, `ne00>=64`, `ne11>8` | `kernel_mul_mm_<t0>_<t1>` (function-constants `bc_inp/bc_out/ne12/ne13/r2/r3`) | (ne11/nr1, ne01/nr0, ne12·ne13), 32×nsg; **M4: nr0=64, nr1=32, nsg=4, smem 8192** (bc_out) | `ops.cpp:2440-2490` `device.cpp:739-799` |
+| ② simdgroup MM | non-transposed, `has_simdgroup_mm`, `ne00>=64`, `ne11>8` — **minfer #40: GEMM now dispatches for `nt≥2 && (od≥2048 || nt≥9)` (was nt≥16), closing the nt∈[9,15] gap (7B pp12 16.6→124 t/s ≈ llama)** | `kernel_mul_mm_<t0>_<t1>` (function-constants `bc_inp/bc_out/ne12/ne13/r2/r3`) | (ne11/nr1, ne01/nr0, ne12·ne13), 32×nsg; **M4: nr0=64, nr1=32, nsg=4, smem 8192** (bc_out) | `ops.cpp:2440-2490` `device.cpp:739-799` |
 | ③ mat-vec | otherwise | `kernel_mul_mv_*` (per quant type) | nsg/nr0 per type | `ops.cpp:2491-2538` `device.cpp:801+` |
 
 **Function-constant offsets** (`ggml-metal-impl.h:99-100`): `FC_MUL_MV=600`,

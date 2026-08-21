@@ -433,7 +433,7 @@ impl MpsCommandBuffer<'_> {
         }
         match ttype {
             TensorType::Q8_0 => {
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
@@ -456,7 +456,7 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q4_K | TensorType::Q6_K => {
                 // Q6_K has a simdgroup GEMM (super-block); Q4_K still falls back
                 // to the scalar f32 multi (no Q4_K in the shipped 0.5B K_M models).
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     // both Q4_K and Q6_K have simdgroup GEMMs
                     let pl = if ttype == TensorType::Q6_K { &self.state.pl_q6_k_mm_f32 } else { &self.state.pl_q4_k_mm_f32 };
                     self.gemm_dispatch(pl, wb, w_off, x, x_off, out, od, id, nt);
@@ -485,7 +485,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_1 => {
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
@@ -501,7 +501,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_0 => {
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
@@ -517,7 +517,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_1 => {
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
@@ -533,7 +533,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_K => {
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
@@ -553,7 +553,7 @@ impl MpsCommandBuffer<'_> {
                 // accumulation). MINFER_GEMM=0 disables it (f32 multi fallback) for
                 // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
                 // dominates for tiny prefills).
-                if nt >= 16 && Self::gemm_enabled() {
+                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
                     self.enc.set_compute_pipeline_state(
