@@ -10,6 +10,8 @@ mod graph;
 mod sampler;
 mod tokenizer;
 mod template;
+#[allow(dead_code)] // conversation 模块在 Phase 2（--cnv CLI 接线）被 main 使用
+mod conversation;
 mod cache;
 mod models;
 #[cfg(target_os = "macos")]

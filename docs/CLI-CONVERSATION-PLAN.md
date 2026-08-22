@@ -8,6 +8,20 @@
 > 落地（§5.3），6 个单测全绿：差分正确性（assistant 内容不重复喂回）、尾部换行补偿、
 > 无换行不补偿、空前缀、前缀失败兜底（reverse 模板）、无模板 ChatML fallback、null-content
 > 历史。token 级一致性断言延后到 L1.5 KV 等价测试（需真实 tokenizer/模型，§8.4）。
+>
+> **Revision 2 (2026-08-22) — Phase 1 implemented.** `src/conversation.rs` 落地：`Engine`/
+> `TokenCodec` 抽象 + `GraphEngine`（持有模型引用 + 会话私有 `GraphCache` + `n_ctx`）+
+> `Conversation`（纯逻辑状态）+ `start`/`user_turn`/`regen_turn`/`clear` + EOG/EOT 处理。
+> 13 个 mock 单测全绿 + 1 个 `#[ignore]` 真实模型 2 回合冒烟（`conversation_real_model_smoke`）。
+> 实现中发现并落实的设计细化（相对 §5 原文）：
+> 1. **cache 所有权**：`Conversation` **不含** `GraphCache`——cache 归 `GraphEngine`。避免
+>    `&mut self` 与 `&mut cache` 借用冲突，且让 Engine 可被 mock 替换（§5.2 数据结构的修订）。
+> 2. **EOG 写入 KV**：模型自停的 EOG token 必须解码进 KV（canonical 渲染在 assistant 消息后
+>    带 EOG 标记），llama.cpp 同样先解码 EOG 再停——否则 §5.4 不变量被破坏。
+> 3. **stop 串 token 不写 KV**（与 llama.cpp 保留在 KV 不同）：stop 串不属于 canonical 文本，
+>    不入 stream_tokens/采样窗口，不变量严格成立。
+> 4. **惩罚窗口在 delta 追加后重灌**（llama.cpp 把 prompt token 喂进采样器窗口，等价语义）。
+> 5. `Engine` 增加 `reset_cache()`（全量重灌/`/clear` 用）。
 
 ---
 
@@ -187,12 +201,11 @@ if add_ass && fmt_past 以 '\n' 结尾: delta = "\n" + delta   // 尾部换行�
 ### 5.2 数据结构（新模块 `src/conversation.rs`）
 
 ```rust
-/// 一次多轮对话会话。整个会话的 token 流累积在 KV 区域中。
+/// 一次多轮对话会话（纯逻辑状态；推理状态在 `Engine` 中——rev 2 修订：
+/// cache 归 `GraphEngine`，避免借用冲突并支持 mock，见 Revision 2 注 1）。
 pub struct Conversation {
     /// 已记录消息（role, content）。与 server 的 ChatMessage 同构；null content 支持。
     pub messages: Vec<(String, Option<String>)>,
-    /// 会话私有 cache：KV 区域 + 图分配器（n_ctx = params.n_ctx，不是 max_seq_len）。
-    pub cache: GraphCache,
     /// KV 中完整的 token 流（prefill delta + 生成 + 手动插入的 EOT）。
     /// 用于：惩罚窗口 seeding、/regen 回滚、一致性校验（debug）。
     pub stream_tokens: Vec<u32>,
@@ -201,19 +214,18 @@ pub struct Conversation {
     /// 当前 assistant 回合的起始位置（/regen 回滚点 = 本回合 delta 第一个 token 的位置）。
     pub turn_pos: usize,
     pub rng: StdRng,
-    /// 惩罚窗口；每回合开始时从 stream_tokens 尾部取 64（llama.cpp repeat_last_n）。
+    /// 惩罚窗口；每回合在 delta 追加后从 stream_tokens 尾部取 64（llama.cpp repeat_last_n）。
     pub prev_tokens: Vec<u32>,
-    /// stop 串匹配用完整生成字节流（server rev-5 语义：全流后缀匹配）。
-    pub pending_bytes: Vec<u8>,
-    /// 跨 token 的半截 UTF-8 字符（避免 U+FFFD）。
-    pub incomplete_utf8: Vec<u8>,
-    /// 模板 EOG：im_end，缺省用 eos（与 is_stop_token 一致）。
+    /// EOG 集合（eos + im_end）。
+    pub eog: Vec<u32>,
+    /// 模板 EOG（im_end，缺省用 eos）；未达 EOG 结束时插入。
     pub eot_token: u32,
     /// 上回合未以 EOG 结束 → 下回合输入前先写 EOT。
     pub need_insert_eot: bool,
     /// tokenizer.chat_template；None → ChatML fallback 渲染。
     pub template: Option<String>,
     pub bos_text: String,
+    pub n_ctx: usize,
 }
 ```
 
@@ -418,15 +430,20 @@ add_generation_prompt, bos_token) -> FormattedDelta{text, prefix_matched}`；`te
 
 ### Phase 1：会话核心（新模块 `src/conversation.rs`）
 
-- `Conversation` 结构（§5.2）+ 回合循环（§5.5）。
-- **回合循环必须面向 `Engine` 抽象实现**（`trait Engine { fn forward(&mut self, tokens, positions, n_out) -> Vec<f32> }`，真实实现包 `forward_cached`）——这是 L1 mock 测试的前提（§8.2）。
-- EOG / EOT 处理、`need_insert_eot` 统一插入。
-- `prev_tokens` 每回合重灌；`stream_tokens` 全程维护。
+**Status: implemented (rev 2).** `conversation::Engine`/`TokenCodec`/`GraphEngine`/`Conversation`
+（`start`/`user_turn`/`regen_turn`/`clear`）+ 13 mock 单测 + `#[ignore]` 真实模型冒烟
+（`cargo test --bin minfer conversation_real_model_smoke -- --ignored`，0.5B 2 回合，标量 CPU
+~9 分钟，Metal 更快）。设计细化见 Revision 2（cache 归 GraphEngine、EOG 入 KV、stop 串不入 KV、
+惩罚窗口 delta 后重灌）。
+
+- `Conversation` 结构（§5.2，**cache 修订为归 `GraphEngine`**）+ 回合循环（§5.5）。
+- **回合循环必须面向 `Engine` 抽象实现**（`trait Engine { fn forward(...); fn reset_cache(); }`，真实实现包 `forward_graph_cached`）——这是 L1 mock 测试的前提（§8.2）。
+- EOG / EOT 处理、`need_insert_eot` 统一插入（EOG 解码入 KV；stop 串 token 不入 KV）。
+- `prev_tokens` 每回合在 delta 追加后重灌；`stream_tokens` 全程维护。
 - 测试：
   - 状态机单测（mock 无模型）：EOT 插入时机、messages 累积、turn_pos 记录；
-  - 一致性单测：构造 token 流模拟，验证 §5.4 不变量；
-  - 真实模型集成冒烟：stdin 管道喂 2–3 回合（Qwen2.5-0.5B），验证无 U+FFFD、
-    stop 串截断、EOG 结束、位置单调不越界。
+  - 一致性单测：构造 token 流模拟，验证 §5.4 不变量（special-token 感知的 FakeCodec）；
+  - 真实模型集成冒烟：`#[ignore]`，Qwen2.5-0.5B 2 回合（无 U+FFFD、增量性、位置不越界）。
 
 ### Phase 2：CLI 接线与 UX（`src/main.rs`）
 

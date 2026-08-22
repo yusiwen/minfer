@@ -153,7 +153,7 @@ pub fn render_template(
 /// Fallback: simple ChatML format over ALL messages (server path). Every
 /// message keeps its role/content; null content (assistant tool-call turn)
 /// emits the role marker only.
-fn fallback_chatml_messages(
+pub(crate) fn fallback_chatml_messages(
     messages: &[(String, Option<String>)],
     add_generation_prompt: bool,
 ) -> String {
