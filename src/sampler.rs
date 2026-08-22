@@ -1,6 +1,7 @@
-// Sampler — repetition penalty, top-k, top-p, temperature (seeded)
+// Sampler — repetition/frequency/presence penalties, top-k, top-p, temperature (seeded)
 
 use rand::Rng;
+use std::collections::HashMap;
 
 /// Sampling result
 #[derive(Debug)]
@@ -22,22 +23,91 @@ pub fn sample_greedy(logits: &[f32]) -> SampledToken {
     SampledToken { token_id: best_id, logit: best_val }
 }
 
-/// Repetition penalty: penalize tokens that already appeared in `prev_tokens`.
-/// `penalty == 1.0` disables. Positive logits are divided by the penalty
-/// (reduced), negative logits are multiplied (pushed further down). This is
-/// llama.cpp's `repeat_penalty` applied to the last `repeat_last_n` tokens.
-pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
-    if (penalty - 1.0).abs() < 1e-6 || penalty < 1.0 {
+/// Combined penalty pass over the tokens in `prev_tokens` (the caller keeps the
+/// window; llama.cpp `repeat_last_n` default = 64). Matches llama.cpp's
+/// `llama_sampler_init_penalties` semantics:
+///
+/// ```text
+/// for each distinct token t in prev_tokens, with count(t) occurrences:
+///     logits[t] -= count(t) * frequency_penalty           # if frequency_penalty != 0
+///     logits[t] -= presence_penalty                       # once, if count(t) > 0
+///     logits[t] = logits[t] <= 0 ? logits[t] * repeat     # if repeat != 1.0 and repeat >= 1.0
+///                               : logits[t] / repeat
+/// ```
+///
+/// All three penalties are applied in one pass over the window (distinct tokens
+/// counted once with a HashMap) — same cost class as llama.cpp's penalties
+/// sampler. `repeat == 1.0` disables the repeat term; `repeat < 1.0` is also
+/// ignored (existing minfer behavior, matching `apply_repetition_penalty`).
+pub fn apply_penalties(
+    logits: &mut [f32],
+    prev_tokens: &[u32],
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+) {
+    if (repeat - 1.0).abs() < 1e-6 && frequency.abs() < 1e-6 && presence.abs() < 1e-6 {
         return;
     }
+    let mut counts: HashMap<u32, u32> = HashMap::new();
     for &t in prev_tokens {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+    for (&t, &c) in &counts {
         let idx = t as usize;
         if idx >= logits.len() {
             continue;
         }
         let v = logits[idx];
-        logits[idx] = if v <= 0.0 { v * penalty } else { v / penalty };
+        let mut nv = v;
+        if frequency.abs() >= 1e-6 || presence.abs() >= 1e-6 {
+            nv -= c as f32 * frequency;
+            if c > 0 {
+                nv -= presence;
+            }
+        }
+        if (repeat - 1.0).abs() >= 1e-6 && repeat >= 1.0 {
+            nv = if nv <= 0.0 { nv * repeat } else { nv / repeat };
+        }
+        logits[idx] = nv;
     }
+}
+
+/// Repetition penalty: penalize tokens that already appeared in `prev_tokens`.
+/// `penalty == 1.0` disables. Positive logits are divided by the penalty
+/// (reduced), negative logits are multiplied (pushed further down). This is
+/// llama.cpp's `repeat_penalty` applied to the last `repeat_last_n` tokens.
+pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
+    apply_penalties(logits, prev_tokens, penalty, 0.0, 0.0);
+}
+
+/// Last `last_n` tokens of `tokens` — the recent-token window for the penalty
+/// pass (llama.cpp `repeat_last_n` default = 64). Returns the whole slice when
+/// shorter; empty when `tokens` is empty.
+pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
+    let start = tokens.len().saturating_sub(last_n);
+    tokens[start..].to_vec()
+}
+
+/// Byte-wise suffix match of `buf` against any stop string in `stops`.
+///
+/// Returns the byte index where the matched stop string starts — the
+/// truncation point for the generated text (text up to that index is kept).
+/// When several stop strings match, the earliest start wins (the longest stop
+/// truncates the most). Empty stop strings are ignored. Multi-byte stop
+/// strings split across tokens match because the comparison is byte-wise.
+pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for s in stops {
+        if s.is_empty() || s.len() > buf.len() {
+            continue;
+        }
+        if &buf[buf.len() - s.len()..] == *s {
+            let start = buf.len() - s.len();
+            best = Some(best.map_or(start, |b| b.min(start)));
+        }
+    }
+    best
 }
 
 /// Top-K filtering: keep only top K logits, set the rest to -INFINITY.
@@ -191,19 +261,41 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
     SampledToken { token_id: (logits.len() - 1) as u32, logit: logits[logits.len() - 1] }
 }
 
-/// Complete sampling pipeline: repetition penalty → top-k → top-p →
-/// temperature. `temp < 1e-6` (greedy) skips the stochastic steps but still
-/// applies the repetition penalty.
-pub fn sample<R: Rng>(logits: &mut [f32], temp: f32, top_k: usize, top_p: f32,
-    repeat_penalty: f32, prev_tokens: &[u32], rng: &mut R,
+/// Complete sampling pipeline: penalties → top-k → top-p → temperature.
+/// `temp < 1e-6` (greedy) skips the stochastic steps but still applies the
+/// penalties.
+pub fn sample_with_penalties<R: Rng>(
+    logits: &mut [f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    prev_tokens: &[u32],
+    rng: &mut R,
 ) -> SampledToken {
-    apply_repetition_penalty(logits, prev_tokens, repeat_penalty);
+    apply_penalties(logits, prev_tokens, repeat_penalty, frequency_penalty, presence_penalty);
     if temp < 1e-6 {
         return sample_greedy(logits);
     }
     apply_top_k(logits, top_k);
     apply_top_p(logits, top_p);
     sample_temperature(logits, temp, rng)
+}
+
+/// Complete sampling pipeline with only the repeat penalty (frequency and
+/// presence disabled) — kept for callers that don't use the OAI penalties.
+pub fn sample<R: Rng>(
+    logits: &mut [f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    prev_tokens: &[u32],
+    rng: &mut R,
+) -> SampledToken {
+    sample_with_penalties(logits, temp, top_k, top_p, repeat_penalty, 0.0, 0.0, prev_tokens, rng)
 }
 
 #[cfg(test)]
@@ -282,5 +374,119 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let s = sample(&mut logits, 0.0, 40, 0.95, 2.0, &[3], &mut rng);
         assert_eq!(s.token_id, 2, "greedy + penalty should avoid the penalized token");
+    }
+
+    // === Phase 1 (OPENAI-CHAT-API-PLAN.md): frequency/presence penalties ===
+
+    #[test]
+    fn test_frequency_penalty_scales_with_count() {
+        // token 3 appears twice in the window: logit -= 2 * 0.5 = 1.0
+        let mut logits = [1.0f32, 2.0, 3.0, 4.0];
+        apply_penalties(&mut logits, &[3, 3], 1.0, 0.5, 0.0);
+        assert!((logits[3] - 3.0).abs() < 1e-6, "2x0.5 subtracted: {}", logits[3]);
+        // others untouched when repeat == 1.0
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], 3.0);
+    }
+
+    #[test]
+    fn test_presence_penalty_applied_once() {
+        // token 3 present (once or twice) => logit -= 0.8, no count scaling
+        let mut a = [1.0f32, 2.0, 3.0, 4.0];
+        apply_penalties(&mut a, &[3], 1.0, 0.0, 0.8);
+        assert!((a[3] - 3.2).abs() < 1e-6, "presence once: {}", a[3]);
+        let mut b = [1.0f32, 2.0, 3.0, 4.0];
+        apply_penalties(&mut b, &[3, 3], 1.0, 0.0, 0.8);
+        assert!((b[3] - 3.2).abs() < 1e-6, "presence is per-token, not per-occurrence: {}", b[3]);
+    }
+
+    #[test]
+    fn test_freq_presence_then_repeat_penalty() {
+        // llama.cpp order: subtract freq/presence, then apply repeat (÷ or ×)
+        let mut logits = [4.0f32, -4.0, 0.0, 0.0];
+        // token 0: 4.0 - 1*1.0(freq) - 1.0(presence) = 2.0, repeat 2.0 => 1.0
+        apply_penalties(&mut logits, &[0], 2.0, 1.0, 1.0);
+        assert!((logits[0] - 1.0).abs() < 1e-6, "4 - 2 then /2: {}", logits[0]);
+        // tokens not in the window are untouched
+        assert_eq!(logits[1], -4.0);
+        assert_eq!(logits[2], 0.0);
+
+        // negative logit in the window: repeat multiplies (no freq/presence)
+        let mut logits = [4.0f32, -4.0, 0.0, 0.0];
+        apply_penalties(&mut logits, &[1], 2.0, 0.0, 0.0);
+        assert!((logits[1] - -8.0).abs() < 1e-6, "negative * repeat: {}", logits[1]);
+        assert_eq!(logits[0], 4.0);
+        assert_eq!(logits[2], 0.0);
+    }
+
+    #[test]
+    fn test_penalties_disabled_at_defaults() {
+        let mut logits = [1.0f32, 2.0, 3.0, 4.0];
+        let before = logits.clone();
+        apply_penalties(&mut logits, &[1, 2, 3], 1.0, 0.0, 0.0);
+        assert_eq!(logits, before, "repeat=1, freq=0, presence=0 is a no-op");
+    }
+
+    #[test]
+    fn test_penalties_identity_with_old_repeat_only() {
+        // freq=presence=0 must reproduce apply_repetition_penalty exactly
+        let mut a = [1.0f32, 2.0, 3.0, 4.0, -2.0, -5.0];
+        let mut b = a.clone();
+        apply_repetition_penalty(&mut a, &[3, 4], 2.0);
+        apply_penalties(&mut b, &[3, 4], 2.0, 0.0, 0.0);
+        assert_eq!(a, b, "combined pass must be identical to repeat-only");
+    }
+
+    #[test]
+    fn test_penalty_out_of_range_token_skipped() {
+        let mut logits = [1.0f32, 2.0];
+        apply_penalties(&mut logits, &[99, 99], 2.0, 1.0, 1.0);
+        assert_eq!(logits, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_recent_window_tail() {
+        let tokens = [0u32, 1, 2, 3, 4, 5];
+        assert_eq!(recent_window(&tokens, 3), vec![3, 4, 5]);
+        assert_eq!(recent_window(&tokens, 64), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(recent_window(&tokens, 0), Vec::<u32>::new());
+        assert_eq!(recent_window(&[], 64), Vec::<u32>::new());
+    }
+
+    // === Phase 1: stop strings (byte-wise suffix matching) ===
+
+    #[test]
+    fn test_stop_suffix_basic() {
+        let buf = b"hello world";
+        assert_eq!(match_stop_suffix(buf, &[b"world"]), Some(6));
+        assert_eq!(match_stop_suffix(buf, &[b"hello"]), None, "not a suffix");
+        assert_eq!(match_stop_suffix(buf, &[b"d"]), Some(10));
+        assert_eq!(match_stop_suffix(buf, &[b"x"]), None);
+        assert_eq!(match_stop_suffix(buf, &[]), None);
+    }
+
+    #[test]
+    fn test_stop_suffix_empty_and_too_long_ignored() {
+        let buf = b"abc";
+        assert_eq!(match_stop_suffix(buf, &[b"", b"abc", b"abcd"]), Some(0));
+        assert_eq!(match_stop_suffix(buf, &[b"", b"zzz"]), None);
+    }
+
+    #[test]
+    fn test_stop_suffix_longest_wins() {
+        // both "ab" and "b" are suffixes of "xab"; earliest start (longest) wins
+        let buf = b"xab";
+        assert_eq!(match_stop_suffix(buf, &[b"b", b"ab"]), Some(1));
+        assert_eq!(match_stop_suffix(buf, &[b"ab", b"b"]), Some(1));
+    }
+
+    #[test]
+    fn test_stop_suffix_multibyte_split_across_tokens() {
+        // "中" = E4 B8 AD; first two bytes arrive in one token, last byte next
+        let partial = [0xE4u8, 0xB8];
+        assert_eq!(match_stop_suffix(&partial, &[&[0xE4, 0xB8, 0xAD]]), None, "stop longer than buf");
+        let complete = [0xE4u8, 0xB8, 0xAD, 0xE4, 0xB8, 0xAD];
+        assert_eq!(match_stop_suffix(&complete, &[&[0xE4, 0xB8, 0xAD]]), Some(3));
     }
 }

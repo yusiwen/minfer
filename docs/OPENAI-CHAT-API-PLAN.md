@@ -32,6 +32,21 @@
 >   `ModelDef::forward_graph_cached` trait method (Qwen2 implements it).
 > - Test `forward_cached_isolates_kv_between_caches`: two caches interleaved stay bit-identical,
 >   smaller `n_ctx` gives identical prefill logits, out-of-range positions are rejected.
+>
+> **Revision 4 (2026-08-22) — Phase 1 implemented (sampler + CLI).** Full penalty/stop support with
+> unit tests and real-model CLI smoke tests:
+> - `sampler::apply_penalties(logits, prev_tokens, repeat, freq, presence)` — one merged pass with
+>   llama.cpp `llama_sampler_init_penalties` semantics (freq/presence subtracted, then repeat ÷/×);
+>   identical to the old repeat-only pass when freq/presence are 0 (tested).
+> - `sampler::sample_with_penalties` (chain: penalties → top-k → top-p → temperature); `sample` kept
+>   as a repeat-only wrapper.
+> - `sampler::recent_window(tokens, 64)` — penalty-window helper (prompt-tail seeding).
+> - `sampler::match_stop_suffix(buf, stops) -> Option<usize>` — byte-wise suffix match, longest stop
+>   wins, empty stops ignored, multi-byte stops split across tokens handled (tested).
+> - CLI (`src/main.rs`): `--frequency-penalty`, `--presence-penalty`, repeatable `--stop <STR>`;
+>   generation output is byte-level (`decode_bytes`), so split multi-byte chars no longer produce
+>   U+FFFD (smoke-tested with Chinese text); stop strings truncate the emitted text (smoke-tested:
+>   `--stop " is"` stops and removes the stop string).
 
 ---
 
@@ -91,7 +106,7 @@ Add an OpenAI-compatible HTTP server to minfer, enabling integration with existi
 | Chat template rendering | `src/template.rs` | Single-turn only, needs extension |
 | ChatML formatting | `src/models/qwen2/mod.rs:66` | Ready (multi-message) |
 | Model inference | `src/models/qwen2/graph.rs` | Ready; `forward_cached` (per-slot cache + explicit n_ctx) implemented (rev 3) |
-| Sampler | `src/sampler.rs` | Repeat-penalty / top-k / top-p / temperature; **needs frequency/presence penalty + stop strings** (Phase 1) |
+| Sampler | `src/sampler.rs` | `apply_penalties` (freq/presence/repeat), `sample_with_penalties`, `recent_window`, `match_stop_suffix` — **done (rev 4)**; server wiring pending |
 | Tokenizer | `src/tokenizer.rs` | `decode_bytes` + `complete_utf8_prefix_len` implemented (rev 3); `decode()` kept for compat |
 | KV Cache | Graph allocator persistent regions (`src/graph/alloc.rs`, `kv_pair(layer)`); **`src/cache.rs` is the legacy type and is ignored by the graph path** | Ready for one slot; per-slot possible via `forward_cached` (rev 3) |
 
@@ -105,9 +120,9 @@ Add an OpenAI-compatible HTTP server to minfer, enabling integration with existi
 | Slot-scoped graph cache | `forward_cached` (Phase 0) | — | **done (rev 3)** |
 | Configurable n_ctx | `forward_cached` n_ctx param + bounds assert (Phase 0) | — | **done (rev 3)** |
 | Byte-level tokenizer API | `decode_bytes` + `complete_utf8_prefix_len` (Phase 0) | — | **done (rev 3)** |
-| Frequency/presence penalty | Per-vocab penalty pass in `sampler.rs` (shared window with repeat penalty) | Medium | pending (Phase 1) |
-| Stop-string matcher | Text-level stop detection + truncation in the generation loop | Medium | pending (Phase 1) |
-| UTF-8 incremental decoder | Hold back incomplete multi-byte sequences (Phase 0 helper done; loop wiring pending) | Low-Medium | partial |
+| Frequency/presence penalty | `apply_penalties` + `sample_with_penalties` (Phase 1) | — | **done (rev 4)** |
+| Stop-string matcher | `match_stop_suffix` + CLI `--stop` wiring (Phase 1) | — | **done (rev 4)**; server streaming wiring pending |
+| UTF-8 incremental decoder | `decode_bytes` + `complete_utf8_prefix_len` (Phase 0) + CLI byte-level output (Phase 1) | — | **done (rev 4)** for CLI; SSE holdback pending |
 | Session manager | Multi-slot state | Medium | pending |
 | Streaming support | SSE responses | Medium | pending (Phase 4) |
 | Error handler | Standard error format | Low | pending |
@@ -827,6 +842,9 @@ Test: `forward_cached_isolates_kv_between_caches` — two caches interleaved sta
 smaller `n_ctx` gives identical prefill logits, out-of-range positions are rejected.
 
 ### Phase 1: Sampler Extensions (`src/sampler.rs` + generation loop)
+
+**Status: implemented (rev 4).** All items are done with unit tests; CLI smoke-tested against the
+cached Qwen2.5-0.5B model (stop truncation, penalties, Chinese output without U+FFFD).
 
 1. Merge frequency/presence into the penalty pass: extend `apply_repetition_penalty` →
    `apply_penalties(logits, prev_tokens, repeat, freq, presence)` per the formula in
