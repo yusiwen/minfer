@@ -1,9 +1,10 @@
 // Tensor Structure + Basic Operations
 
-use crate::block;
 use crate::gguf::GgmlType;
 
 /// Tensor type: represents which memory representation is used for the tensor data
+// Variant names follow GGUF conventions (Q4_K, Q5_K, Q6_K) — allow non-camel-case.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorType {
     F32,
@@ -122,6 +123,10 @@ pub struct Tensor {
     pub name: String,
 }
 
+// ggml-parity Tensor API: the graph path exercises a subset of these helpers
+// (borrowed weights, nbytes, data, …); the rest are kept as the complete
+// ggml_tensor interface (used by tests / debug tooling).
+#[allow(dead_code)]
 impl Tensor {
     /// Create a new tensor with given type and shape.
     /// Allocates data buffer with proper alignment.

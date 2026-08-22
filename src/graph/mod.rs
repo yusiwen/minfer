@@ -24,7 +24,10 @@ use ops::{NodeMeta, Op};
 pub type NodeId = usize;
 
 /// Activation dtype carried by node outputs (weight tensors keep their own
-/// `TensorType`; IR activations are F32 except where noted).
+/// `TensorType`; IR activations are F32 except where noted). F16 / Q8_0 are
+/// part of the full IR dtype vocabulary (ggml parity) but no supported op
+/// constructs them today.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
@@ -33,6 +36,7 @@ pub enum DType {
     Q8_0,
 }
 
+#[allow(dead_code)]
 impl DType {
     /// Bytes per element (Q8_0 = 1 byte per quantized element block member;
     /// actual block layout is a backend concern).
@@ -51,6 +55,8 @@ impl DType {
 pub enum Backend {
     CPU,
     Metal,
+    /// CUDA backend (Phase 7, feature-gated) — planned, not yet wired.
+    #[allow(dead_code)]
     Cuda,
 }
 
@@ -99,6 +105,7 @@ pub struct ComputeGraph {
     pub inputs: Vec<NodeId>,
     pub outputs: Vec<NodeId>,
     /// Graph identifier for reuse detection (CUDA Graph caching etc.).
+    #[allow(dead_code)]
     pub uid: u64,
 }
 
@@ -106,12 +113,16 @@ impl ComputeGraph {
     pub fn node(&self, id: NodeId) -> &CNode {
         &self.nodes[id]
     }
+    /// Mutable node access (fusion pass / debug tooling).
+    #[allow(dead_code)]
     pub fn node_mut(&mut self, id: NodeId) -> &mut CNode {
         &mut self.nodes[id]
     }
     pub fn n_nodes(&self) -> usize {
         self.nodes.len()
     }
+    /// Element count of a node output (assertion / debug helper).
+    #[allow(dead_code)]
     pub fn n_elements(&self, id: NodeId) -> usize {
         self.nodes[id].n_elements()
     }

@@ -119,6 +119,7 @@ impl GraphBuilder {
 
     /// Matmul against a GPU-registered weight by name (probes/tests only):
     /// builds a MatMul node whose meta references `weight_name` directly.
+    #[allow(dead_code)]
     pub fn matmul_by_name(
         &mut self, x: NodeId, weight_name: &str, ttype: crate::tensor::TensorType,
         out_dim: usize, in_dim: usize,
@@ -200,6 +201,9 @@ impl GraphBuilder {
         self.node("mul", Op::Mul, &[a, b], shape, DType::F32, NodeMeta::None)
     }
 
+    /// Softmax builder (op vocabulary; the fused attention kernels softmax
+    /// internally, so no live graph emits a standalone softmax node today).
+    #[allow(dead_code)]
     pub fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
         self.node("softmax", Op::Softmax { dim }, &[x], shape, DType::F32, NodeMeta::None)
@@ -231,7 +235,9 @@ impl GraphBuilder {
     }
 
     /// Fused SwiGLU (fusion-pass target; backends without a fused kernel
-    /// decompose to silu+mul at execution).
+    /// decompose to silu+mul at execution). Used by tests; the Qwen2 graph
+    /// builder emits gate/up separately and lets the fusion pass combine them.
+    #[allow(dead_code)]
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let shape = self.graph.nodes[gate].out_shape;
         self.node("swiglu", Op::SwiGLU, &[gate, up], shape, DType::F32, NodeMeta::None)

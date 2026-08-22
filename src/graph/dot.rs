@@ -6,7 +6,6 @@
 
 use std::io::Write;
 
-use super::ops::Op;
 use super::{Backend, ComputeGraph};
 
 impl ComputeGraph {
@@ -53,19 +52,6 @@ impl ComputeGraph {
         }
 
         writeln!(w, "}}")
-    }
-}
-
-/// One-line op tag for DOT labels (op payloads are large).
-pub fn op_tag(op: &Op) -> String {
-    match op {
-        Op::MatMul { .. } => "matmul".into(),
-        Op::RmsNorm { .. } => "rms_norm".into(),
-        Op::RoPE { .. } => "rope".into(),
-        Op::Attn { .. } => "attn".into(),
-        Op::KvcacheStore { .. } => "kv_store".into(),
-        Op::KvcacheLoad { .. } => "kv_load".into(),
-        other => format!("{other:?}").to_lowercase(),
     }
 }
 

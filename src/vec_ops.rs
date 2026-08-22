@@ -7,13 +7,10 @@ use std::arch::x86_64::*;
 #[repr(i32)]
 pub enum RopeStyle {
     NonInterleaved = 0,  // Qwen2: pairs [i, i+half_dim]
+    /// LLaMA/Mistral: pairs [2*i, 2*i+1] — kept for llama.cpp parity; no
+    /// supported architecture uses it yet.
+    #[allow(dead_code)]
     Interleaved = 1,     // LLaMA/Mistral: pairs [2*i, 2*i+1]
-}
-
-// Helper: scalar sigmoid
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 // === vec_dot_f32 (vec.cpp lines 11-137) ===
@@ -426,19 +423,6 @@ unsafe fn vec_muladd_f32_avx2(n: usize, y: &mut [f32], x: &[f32], scale: f32) {
     }
 }
 
-// === vec_max_f32 ===
-// Find maximum value in array
-pub fn vec_max_f32(n: usize, x: &[f32]) -> f32 {
-    debug_assert!(x.len() >= n && n > 0);
-    let mut max_val = x[0];
-    for i in 1..n {
-        if x[i] > max_val {
-            max_val = x[i];
-        }
-    }
-    max_val
-}
-
 // === rms_norm_f32 (ops.cpp lines 3757-3817) ===
 // y[i] = x[i] * rsqrt(mean(x²) + eps)
 // where mean(x²) = sum(x[i]²) / n
@@ -593,59 +577,6 @@ unsafe fn rms_norm_fused_f32_avx2(n: usize, y: &mut [f32], x: &[f32], w: &[f32],
 
 // === rope_f32 — strict 1:1 translation of ops.cpp lines 5707-5811 ===
 // Applies rotary position embeddings in NEOX style (Qwen2, GPT-NeoX)
-// C++ order of operations:
-//   1. ggml_rope_cache_init: pre-compute cos/sin into cache (lines 5707-5721)
-//   2. rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst) with NEOX mode (lines 5794-5811)
-// NEOX pairs: (x[0], x[n_dims/2]), (x[1], x[n_dims/2+1]), ..., (x[n_dims/2-1], x[n_dims-1])
-// NOT adjacent pairs! This matches ops.cpp NEOX mode exactly.
-pub fn rope_f32(
-    n_dims: usize,
-    y: &mut [f32],
-    x: &[f32],
-    pos: i32,
-    freq_base: f32,
-    freq_scale: f32,
-) {
-    debug_assert!(y.len() >= n_dims && x.len() >= n_dims);
-    debug_assert!(n_dims % 2 == 0);
-
-    // Step 1: ggml_rope_cache_init (ops.cpp lines 5707-5721)
-    // Pre-compute cos/sin values into a local cache
-    // For Qwen2 (no YaRN, no freq_factors, sin_sign=1.0):
-    //   theta = pos * freq_scale
-    //   for i0 in 0..n_dims step 2:
-    //     cache[i0+0] = cos(theta)
-    //     cache[i0+1] = sin(theta)
-    //     theta *= powf(freq_base, -2.0/n_dims)
-    let theta_scale = (freq_base as f64).powf(-2.0 / n_dims as f64) as f32;
-    let mut cache = vec![0.0f32; n_dims];
-    let mut theta = pos as f32 * freq_scale;
-
-    for i0 in (0..n_dims).step_by(2) {
-        cache[i0 + 0] = theta.cos();
-        cache[i0 + 1] = theta.sin();
-        theta *= theta_scale;
-    }
-
-    // Step 2: rotate_pairs<float> with NEOX mode (ops.cpp lines 5794-5811)
-    // NEOX mode: scale=2, n_offset=n_dims/2
-    //   ic = i0/2  (because scale=2)
-    //   cos_theta = cache[i0], sin_theta = cache[i0+1]
-    //   x0 = src[ic], x1 = src[ic + n_dims/2]
-    //   dst[ic]           = x0*cos - x1*sin
-    //   dst[ic + n_dims/2] = x0*sin + x1*cos
-    let n_offset = n_dims / 2;
-    for i0 in (0..n_dims).step_by(2) {
-        let ic = i0 / 2;
-        let cos_theta = cache[i0 + 0];
-        let sin_theta = cache[i0 + 1];
-        let x0 = x[ic];
-        let x1 = x[ic + n_offset];
-        y[ic]           = x0 * cos_theta - x1 * sin_theta;
-        y[ic + n_offset] = x0 * sin_theta + x1 * cos_theta;
-    }
-}
-
 // === mat_mul_f32 ===
 // Simple f32 matrix multiply: C[m][n] = A[m][k] * B[k][n]
 // Uses vec_dot_f32 for each row-column pair
@@ -667,35 +598,6 @@ pub fn mat_mul_f32(
         for col in 0..n {
             let b_col = &b[col * k..(col + 1) * k];
             c[row * n + col] = vec_dot_f32(k, a_row, b_col);
-        }
-    }
-}
-
-// === mat_mul_q4_0_q8_0 ===
-// Quantized matrix multiply using AVX2 Q4_0 × Q8_0 dot product
-// C is f32 [m][n], A is Q4_0 [m][k], B is Q8_0 [k][n]
-// B is stored column-major
-pub fn mat_mul_q4_0_q8_0(
-    m: usize, n: usize, k: usize,
-    c: &mut [f32],
-    a_blocks: &[crate::block::BlockQ4_0],  // [m, k/32]
-    b_blocks: &[crate::block::BlockQ8_0],  // [k/32, n] column-major
-) {
-    use crate::avx2;
-
-    let qk = 32; // QK4_0
-    let nb = (k / qk) as i32;
-
-    debug_assert!(k % qk == 0);
-    debug_assert!(c.len() >= m * n);
-    debug_assert!(a_blocks.len() >= m * nb as usize);
-    debug_assert!(b_blocks.len() >= nb as usize * n);
-
-    for row in 0..m {
-        let a_row = &a_blocks[row * nb as usize..(row + 1) * nb as usize];
-        for col in 0..n {
-            let b_col = &b_blocks[col * nb as usize..(col + 1) * nb as usize];
-            c[row * n + col] = crate::avx2::vec_dot_q4_0_q8_0(k as i32, a_row, b_col);
         }
     }
 }

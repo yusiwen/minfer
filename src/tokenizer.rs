@@ -39,13 +39,18 @@ fn byte_encode(text: &str, byte_to_unicode: &HashMap<u8, char>) -> String {
 #[derive(Clone)]
 pub struct Tokenizer {
     pub id_to_token: Vec<String>,
+    /// Score / type / special-token maps are loaded from GGUF metadata for
+    /// llama.cpp parity; the engine reads `id_to_token` + `vocab` + `merges`.
+    #[allow(dead_code)]
     pub id_to_score: Vec<f32>,
+    #[allow(dead_code)]
     pub id_to_type: Vec<i32>,
     pub vocab: HashMap<String, u32>,
     pub merges: HashMap<(String, String), usize>,
     byte_to_unicode: HashMap<u8, char>,
     /// Reverse mapping for decode
     unicode_to_byte: HashMap<char, u8>,
+    #[allow(dead_code)]
     pub special_tokens: HashMap<String, u32>,
     pub bos_token: u32,
     pub eos_token: u32,
@@ -300,7 +305,9 @@ impl Tokenizer {
     ///
     /// Lossy: an incomplete multi-byte sequence at the end becomes U+FFFD.
     /// Streaming paths should use [`Tokenizer::decode_bytes`] plus
-    /// [`complete_utf8_prefix_len`] holdback instead.
+    /// [`complete_utf8_prefix_len`] holdback instead. (Tests use this wrapper;
+    /// the CLI streams via `decode_bytes`.)
+    #[allow(dead_code)]
     pub fn decode(&self, ids: &[u32]) -> String {
         String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }

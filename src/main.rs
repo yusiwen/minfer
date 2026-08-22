@@ -553,7 +553,8 @@ fn main() {
     // forward() (CPU encode + GPU exec + logits download). Debug tool only.
     let timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");
     let (mut t_samp, mut t_fwd, mut n_tok) = (0.0f64, 0.0f64, 0usize);
-    let (mut t0, mut t1) = (std::time::Instant::now(), std::time::Instant::now());
+    // t0/t1 are (re)assigned at the top of each loop iteration before use.
+    let (mut t0, mut t1);
 
     while generated.len() < params.n_predict {
         t0 = std::time::Instant::now();

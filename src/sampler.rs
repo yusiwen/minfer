@@ -7,6 +7,8 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct SampledToken {
     pub token_id: u32,
+    /// Logit of the sampled token (result metadata; callers read `token_id`).
+    #[allow(dead_code)]
     pub logit: f32,
 }
 
@@ -77,6 +79,9 @@ pub fn apply_penalties(
 /// `penalty == 1.0` disables. Positive logits are divided by the penalty
 /// (reduced), negative logits are multiplied (pushed further down). This is
 /// llama.cpp's `repeat_penalty` applied to the last `repeat_last_n` tokens.
+/// (Kept as the standalone penalty API — the CLI path uses
+/// `sample_with_penalties` directly; tests exercise this wrapper.)
+#[allow(dead_code)]
 pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
     apply_penalties(logits, prev_tokens, penalty, 0.0, 0.0);
 }
@@ -286,6 +291,7 @@ pub fn sample_with_penalties<R: Rng>(
 
 /// Complete sampling pipeline with only the repeat penalty (frequency and
 /// presence disabled) — kept for callers that don't use the OAI penalties.
+#[allow(dead_code)]
 pub fn sample<R: Rng>(
     logits: &mut [f32],
     temp: f32,

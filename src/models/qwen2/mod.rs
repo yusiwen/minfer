@@ -21,6 +21,9 @@ pub struct Qwen2Model {
 }
 
 impl Qwen2Model {
+    /// Inherent accessor — callers use the trait's `n_layer()` (the graph tests
+    /// go through `Box<dyn ModelDef>`), so this stays as a concrete-type helper.
+    #[allow(dead_code)]
     pub fn n_layer(&self) -> usize {
         self.layers.len()
     }
@@ -73,6 +76,9 @@ impl ModelDef for Qwen2Model {
 }
 
 /// Simple ChatML formatting.
+// Only reached through the trait's format_chat (which no live caller uses —
+// template.rs renders chat templates); kept as the fallback implementation.
+#[allow(dead_code)]
 fn format_chatml(messages: &[(String, String)]) -> String {
     let mut prompt = String::new();
     for (role, content) in messages {

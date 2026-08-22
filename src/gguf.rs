@@ -38,8 +38,6 @@ pub enum GgufType {
     Float64 = 12,
 }
 
-const GGUF_TYPE_COUNT: i32 = 13;
-
 impl GgufType {
     fn from_i32(v: i32) -> Self {
         match v {
@@ -78,6 +76,9 @@ impl GgufType {
         }
     }
 
+    /// Human-readable name for a GgufType. Part of the raw KV accessor API
+    /// (only exercised by tests/debug tooling today).
+    #[allow(dead_code)]
     pub fn type_name(&self) -> &'static str {
         match self {
             GgufType::Uint8 => "u8",
@@ -101,6 +102,10 @@ impl GgufType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+/// GGML quant type enum. Variant names follow the GGUF/ggml-common.h naming
+/// convention verbatim (Q4_K, IQ2_XXS, …) so discriminator values and on-disk
+/// names match upstream — hence the non-camel-case allow.
+#[allow(non_camel_case_types)]
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -237,8 +242,6 @@ impl GgmlType {
             GgmlType::MXFP4 => 72,
             GgmlType::NVFP4 => 80,
             // deprecated types 4, 5 have type_size=0 but aren't enum variants
-            // they're not reachable via the GgmlType enum
-            _ => panic!("ggml_type_size: unknown type {:?}", self),
         }
     }
 
@@ -276,8 +279,6 @@ impl GgmlType {
             GgmlType::MXFP4 => 32,
             GgmlType::NVFP4 => 32,
             // deprecated types 4, 5 have blck_size=0 but aren't enum variants
-            // they're not reachable via the GgmlType enum
-            _ => panic!("ggml_blck_size: unknown type {:?}", self),
         }
     }
 
@@ -317,7 +318,6 @@ impl GgmlType {
             GgmlType::MXFP4 => "mxfp4",
             GgmlType::NVFP4 => "nvfp4",
             GgmlType::Q1_0 => "q1_0",
-            _ => "DEPRECATED",
         }
     }
 }
@@ -520,12 +520,6 @@ impl GgufKv {
         ne
     }
 
-    fn cast(&mut self, new_type: GgufType) {
-        let new_type_size = new_type.type_size();
-        assert!(self.data.len() % new_type_size == 0);
-        self.type_ = new_type;
-    }
-
     pub fn get_val_u8(&self, i: usize) -> u8 {
         assert!(self.type_ == GgufType::Uint8);
         self.data[i]
@@ -628,6 +622,10 @@ pub struct GgufContext {
     // This is handled by the caller (loader.rs), not stored here
 }
 
+// Raw key/value + tensor accessors (from gguf.cpp lines 1004-1193); the loader
+// reads through its own typed helpers (get_key_val_*), so this impl stays as
+// the public raw API surface (tests / debug tooling).
+#[allow(dead_code)]
 impl GgufContext {
     // === Accessor functions (from gguf.cpp lines 1004-1193) ===
 
@@ -1124,7 +1122,7 @@ impl GgufContext {
                     break;
                 }
 
-                let mut type_: GgufType = GgufType::Uint8;
+                let mut type_: GgufType;
                 let mut is_array: bool = false;
                 let mut n: u64 = 1;
 
@@ -1534,6 +1532,7 @@ impl GgufContext {
     }
 
     /// Debug dump of all KV metadata
+    #[allow(dead_code)]
     pub fn dump_metadata(&self) {
         println!("GGUF Context:");
         println!("  version: {}", self.version);

@@ -32,11 +32,14 @@ impl CpuBackend {
         self.weights.insert(name.to_string(), t);
     }
 
+    /// Look up a registered weight tensor (test / debug helper).
+    #[allow(dead_code)]
     pub fn weight(&self, name: &str) -> Option<&Tensor> {
         self.weights.get(name)
     }
 
     /// Pool size (for tests).
+    #[allow(dead_code)]
     pub fn pool_len(&self) -> usize {
         self.buffers.len()
     }

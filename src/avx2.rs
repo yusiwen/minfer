@@ -1,11 +1,13 @@
 // AVX2 kernels — all &[u8] interface. Directly follows minfer2/src/quant.rs pattern.
-use crate::block::{self, BlockQ4_0, BlockQ8_0, Q4B, Q41B, Q8B, Q4KB, Q6KB, Q8KB};
+use crate::block::{self, Q4B, Q41B, Q8B, Q4KB, Q6KB};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// f16→f32 conversion with correct IEEE 754 handling for all cases
-/// (zero, subnormal, normal, infinity, NaN).
+/// (zero, subnormal, normal, infinity, NaN). Only used by the x86_64 AVX2
+/// kernels (the scalar paths use `block::fp16_to_f32`).
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn f16_to_f32_bits(bits: u16) -> f32 {
     let i = bits as u32;
@@ -199,8 +201,8 @@ fn dot_q5_0_q8_0_scalar(q5: &[u8], q8: &[u8], nb: usize) -> f32 {
         let qs = &q5b[6..22];
         let mut si = 0i32;
         for j in 0..16 {
-            let val_lo = (((qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4) - 16);
-            let val_hi = ((((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4) - 16);
+            let val_lo = ((qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4) - 16;
+            let val_hi = (((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4) - 16;
             let q8_lo = q8b[2 + j] as i8 as i32;
             let q8_hi = q8b[2 + j + 16] as i8 as i32;
             si += val_lo * q8_lo + val_hi * q8_hi;
@@ -462,25 +464,6 @@ fn dot_q6_k_q8_0_scalar(q6: &[u8], q8: &[u8]) -> f32 {
 }
 
 // ============================================================
-// Legacy struct-based wrappers (for backward compat in vec_ops.rs)
-// ============================================================
-#[inline]
-pub fn vec_dot_q4_0_q8_0(n: i32, vx: &[BlockQ4_0], vy: &[BlockQ8_0]) -> f32 {
-    let nb = (n / 32) as usize;
-    let vx_b: &[u8] = unsafe { std::mem::transmute(vx) };
-    let vy_b: &[u8] = unsafe { std::mem::transmute(vy) };
-    dot_q4_0_q8_0(&vx_b[..nb * Q4B], &vy_b[..nb * Q8B])
-}
-
-#[inline]
-pub fn vec_dot_q8_0_q8_0(n: i32, vx: &[BlockQ8_0], vy: &[BlockQ8_0]) -> f32 {
-    let nb = (n / 32) as usize;
-    let vx_b: &[u8] = unsafe { std::mem::transmute(vx) };
-    let vy_b: &[u8] = unsafe { std::mem::transmute(vy) };
-    dot_q8_0_q8_0(&vx_b[..nb * Q8B], &vy_b[..nb * Q8B])
-}
-
-// ============================================================
 // Quantize f32 → Q8_0 bytes (raw &[u8], no struct types)
 // ============================================================
 fn quantize_row_q8_0_to(x: &[f32], y: &mut [u8]) {
@@ -495,6 +478,9 @@ fn quantize_row_q8_0_to(x: &[f32], y: &mut [u8]) {
     quantize_scalar(x, y, k);
 }
 
+/// Test helper: quantize a full row and return the Q8_0 bytes (the graph path
+/// quantizes into caller-owned buffers via `quantize_row_q8_0_buf` instead).
+#[cfg(test)]
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
     let k = x.len();
     debug_assert!(k % 32 == 0);

@@ -16,7 +16,6 @@
 //! constraints are checked up front (nkt == nk*hd for attention).
 
 use crate::metal::MpsState;
-use crate::tensor::TensorType;
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};

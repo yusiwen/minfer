@@ -13,12 +13,6 @@ pub fn fp16_to_f32(h: Fp16) -> f32 {
     half::f16::from_bits(h).to_f32()
 }
 
-/// Convert f32 to fp16 using half crate (matches minfer2's f16::from_f32)
-#[inline]
-pub fn f32_to_fp16(f: f32) -> Fp16 {
-    half::f16::from_f32(f).to_bits()
-}
-
 // === Block byte-size constants (ggml-common.h) ===
 
 pub const Q4B: usize = 18;   // sizeof(block_q4_0)
@@ -26,7 +20,6 @@ pub const Q41B: usize = 20;  // sizeof(block_q4_1)
 pub const Q8B: usize = 34;   // sizeof(block_q8_0)
 pub const Q4KB: usize = 144; // sizeof(block_q4_k)
 pub const Q6KB: usize = 210; // sizeof(block_q6_k)
-pub const Q8KB: usize = 34;  // sizeof(block_q8_0), same as Q8B
 
 /// Unpack 8 scales and 8 mins from the 12-byte scales field of a Q4_K block.
 /// Matches llama.cpp `get_scale_min_k4`.
@@ -181,131 +174,6 @@ pub struct BlockQ8_K {
 pub struct BlockQ1_0 {
     pub d: Fp16,           // delta
     pub qs: [u8; 16],      // bits / quants (128/8 = 16 bytes)
-}
-
-// TQ1_0 — Ternary 1-bit, 256 elements (line 266-271)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockTq1_0 {
-    pub qs: [u8; 48],      // quants (QK_K - 4 * QK_K / 64) / 5 = 48
-    pub qh: [u8; 4],       // QK_K/64 = 256/64 = 4
-    pub d: Fp16,
-}
-
-// TQ2_0 — Ternary 2-bit, 256 elements (line 274-278)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockTq2_0 {
-    pub qs: [u8; 64],      // QK_K/4 = 64
-    pub d: Fp16,
-}
-
-// IQ2_XXS — "True" 2-bit, 256 elements (line 371-375)
-// 2.0625 bpw
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq2Xxs {
-    pub d: Fp16,
-    pub qs: [u16; 32],     // QK_K/8 * sizeof(uint16_t)
-}
-
-// IQ2_XS — 2.3125 bpw (line 378-383)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq2Xs {
-    pub d: Fp16,
-    pub qs: [u16; 32],     // QK_K/8
-    pub scales: [u8; 8],   // QK_K/32 = 8
-}
-
-// IQ2_S — 2.5625 bpw (line 386-392)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq2S {
-    pub d: Fp16,
-    pub qs: [u8; 64],      // QK_K/4
-    pub qh: [u8; 8],       // QK_K/32 = 8
-    pub scales: [u8; 8],   // QK_K/32 = 8
-}
-
-// IQ3_XXS — "True" 3-bit, 256 elements (line 397-401)
-// 3.0625 bpw
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq3Xxs {
-    pub d: Fp16,
-    pub qs: [u8; 96],      // 3*QK_K/8 = 96
-}
-
-// IQ3_S — 3.4375 bpw (line 405-412)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq3S {
-    pub d: Fp16,
-    pub qs: [u8; 64],      // QK_K/4
-    pub qh: [u8; 8],       // QK_K/32 = 8
-    pub signs: [u8; 32],   // QK_K/8 = 32
-    pub scales: [u8; 4],   // IQ3S_N_SCALE = QK_K/64 = 4
-}
-
-// IQ1_S — 1.5625 bpw (line 415-420)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq1S {
-    pub d: Fp16,
-    pub qs: [u8; 32],      // QK_K/8 = 32
-    pub qh: [u16; 8],      // QK_K/32 = 8
-}
-
-// IQ1_M — 1.75 bpw (line 423-428)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq1M {
-    pub qs: [u8; 32],      // QK_K/8 = 32
-    pub qh: [u8; 16],      // QK_K/16 = 16
-    pub scales: [u8; 8],   // QK_K/32 = 8
-}
-
-// IQ1_M scale type (line 431-434)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub union Iq1mScale {
-    pub f16: Fp16,
-    pub u16: u16,
-}
-
-// IQ4_NL — Non-linear 4-bit, 32 elements (line 437-442)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq4Nl {
-    pub d: Fp16,
-    pub qs: [u8; 16],      // QK4_NL/2 = 16
-}
-
-// IQ4_XS — 4-bit with scales, 256 elements (line 444-450)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockIq4Xs {
-    pub d: Fp16,
-    pub scales_h: u16,
-    pub scales_l: [u8; 4], // QK_K/64 = 4
-    pub qs: [u8; 128],     // QK_K/2 = 128
-}
-
-// MXFP4 — MXFP4 4-bit, 32 elements (line 204-209)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockMxfp4 {
-    pub e: u8,             // E8M0
-    pub qs: [u8; 16],      // QK_MXFP4/2
-}
-
-// NVFP4 — NVFP4 4-bit, 64 elements (line 211-217)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct BlockNvfp4 {
-    pub d: [u8; 4],        // UE4M3 scales (64/16 = 4)
-    pub qs: [u8; 32],      // packed 4-bit E2M1 values (64/2 = 32)
 }
 
 // === Static assertions equivalent ===

@@ -5,71 +5,6 @@
 use crate::tensor::{Tensor, TensorType};
 use crate::block::{Q4B, Q41B, Q8B, Q4KB, Q6KB};
 
-/// Minimum batch size for GPU dispatch (llama.cpp uses `op_offload_min_batch_size = 32`).
-/// Below this threshold, CPU is often faster due to kernel launch overhead.
-const GPU_MIN_BATCH: usize = 1;
-
-/// Quantized matmul with f32 activation.
-/// GPU path passes f32 directly; CPU path quantizes internally.
-pub fn quant_matmul_f32(
-    w: &Tensor, x: &[f32], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
-    #[cfg(target_os = "macos")]
-    if nt >= GPU_MIN_BATCH {
-        if let Some(mps) = crate::metal::MpsState::get() {
-            if mps.has_weight(&w.name) {
-                return mps.quant_matmul_f32(w, x, out, od, id, nt);
-            }
-        }
-    }
-    #[cfg(feature = "cuda")]
-    if nt >= GPU_MIN_BATCH {
-        if let Some(cuda) = crate::cuda::CudaState::get() {
-            if cuda.has_weight(&w.name) {
-                return cuda.quant_matmul_f32(w, x, out, od, id, nt);
-            }
-        }
-    }
-    cpu_quant_matmul_f32(w, x, out, od, id, nt)
-}
-
-/// Quantize `x` once and run several Q4_0 matmuls that share the same activation.
-/// This reduces per-matmul command-buffer and upload overhead.
-pub fn quant_matmul_f32_batch(
-    mats: &mut [(/*weight*/ &Tensor, /*output*/ &mut [f32], /*od*/ usize)],
-    x: &[f32], id: usize, nt: usize,
-) {
-    #[cfg(target_os = "macos")]
-    if nt >= GPU_MIN_BATCH {
-        if let Some(mps) = crate::metal::MpsState::get() {
-            if mats.iter().all(|(w, _out, _od)| mps.has_weight(&w.name)) {
-                return mps.quant_matmul_f32_batch(mats, x, id, nt);
-            }
-        }
-    }
-    #[cfg(feature = "cuda")]
-    if nt >= GPU_MIN_BATCH {
-        if let Some(cuda) = crate::cuda::CudaState::get() {
-            if mats.iter().all(|(w, _out, _od)| cuda.has_weight(&w.name)) {
-                return cuda.quant_matmul_f32_batch(mats, x, id, nt);
-            }
-        }
-    }
-    // CPU fallback: run each matmul independently.
-    for mat in mats.iter_mut() {
-        cpu_quant_matmul_f32(mat.0, x, mat.1, mat.2, id, nt);
-    }
-}
-
-/// Q8_0 activation matmul (kept for backward compat, now delegates to f32 path).
-pub fn quant_matmul(
-    w: &Tensor, x: &[u8], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
-    cpu_quant_matmul(w, x, out, od, id, nt)
-}
-
 /// CPU fallback for f32 activation: quantize → call existing dot product.
 pub fn cpu_quant_matmul_f32(
     w: &Tensor, x: &[f32], out: &mut [f32],
@@ -183,135 +118,6 @@ pub fn cpu_quant_matmul(
             }
         }
         _ => panic!("unsupported weight type {:?} in quant_matmul", w.ttype),
-    }
-}
-
-/// Q5_K × f32 matmul: dequantize Q5_K weights on-the-fly and compute f32 dot product.
-/// Block: d(f16,2) + dmin(f16,2) + scales(u8,12) + qh(u8,32) + qs(u8,128) = 176 bytes.
-/// Each block dequantizes 256 elements using 5 bits (4 low + 1 high) per weight.
-fn cpu_q5_k_matmul_f32(
-    w: &Tensor, x: &[f32], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
-    use crate::block::fp16_to_f32;
-    let n_super = id / 256;
-    let ws = n_super * 176;
-    let wb = w.data();
-    for o in 0..od {
-        let wrow = &wb[o * ws..(o + 1) * ws];
-        for t in 0..nt {
-            let a_base = t * id;
-            let mut sum = 0.0f32;
-            for s in 0..n_super {
-                let off = s * 176;
-                let d  = fp16_to_f32(u16::from_le_bytes([wrow[off],     wrow[off + 1]]));
-                let dm = fp16_to_f32(u16::from_le_bytes([wrow[off + 2], wrow[off + 3]]));
-                let sc_arr: &[u8; 12] = wrow[off + 4..off + 16].try_into().unwrap();
-                let (sc, mn) = crate::block::unpack_q4k_scales(sc_arr);
-                let qh = &wrow[off + 16..off + 48];
-                let qs = &wrow[off + 48..off + 176];
-
-                // Deinterleave qs nibbles: 4 chunks of 32 bytes, covering 2 subblocks each
-                // chunk[l] lo nibble → sub 2*chunk, elem l
-                // chunk[l] hi nibble → sub 2*chunk+1, elem l
-                let mut nb = [0u8; 256];
-                for ci in 0..4 {
-                    let chunk = &qs[ci * 32..ci * 32 + 32];
-                    for l in 0..32 {
-                        nb[(2 * ci) * 32 + l] = chunk[l] & 0x0F;
-                        nb[(2 * ci + 1) * 32 + l] = chunk[l] >> 4;
-                    }
-                }
-
-                for sub in 0..8 {
-                    let dl = d * sc[sub] as f32;
-                    let ml = dm * mn[sub] as f32;
-                    for j in 0..16 {
-                        // Q5_K qh layout: element (sub s, pos j) high bit = qh[j] bit s
-                        let h0 = ((qh[j] >> sub) & 1) as u8;
-                        let h1 = ((qh[j + 16] >> sub) & 1) as u8;
-                        // Q5_K unsigned (no -16, unlike Q5_0): w = unsigned_5bit * dl - ml
-                        let w0 = nb[sub * 32 + j] as f32 + 16.0 * h0 as f32;
-                        let w1 = nb[sub * 32 + j + 16] as f32 + 16.0 * h1 as f32;
-                        let off_a = a_base + s * 256 + sub * 32;
-                        sum += dl * w0 * x[off_a + j] - ml * x[off_a + j];
-                        sum += dl * w1 * x[off_a + j + 16] - ml * x[off_a + j + 16];
-                    }
-                }
-            }
-            out[t * od + o] = sum;
-        }
-    }
-}
-
-/// Q5_1 × f32 matmul: dequantize Q5_1 weights on-the-fly and compute f32 dot product.
-/// Block: d(f16,2) + m(f16,2) + qh(u8,4) + qs(u8,16) = 24 bytes per 32 elements.
-/// Dequant: val = d × unsigned_5bit + m.
-fn cpu_q5_1_matmul_f32(
-    w: &Tensor, x: &[f32], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
-    use crate::block::fp16_to_f32;
-    let nb = id / 32;
-    let ws = nb * 24;
-    let wb = w.data();
-    for o in 0..od {
-        let wrow = &wb[o * ws..(o + 1) * ws];
-        for t in 0..nt {
-            let a_base = t * id;
-            let mut sum = 0.0f32;
-            for b in 0..nb {
-                let off = b * 24;
-                let d = fp16_to_f32(u16::from_le_bytes([wrow[off],     wrow[off + 1]]));
-                let m = fp16_to_f32(u16::from_le_bytes([wrow[off + 2], wrow[off + 3]]));
-                let qh = u32::from_le_bytes([wrow[off+4], wrow[off+5], wrow[off+6], wrow[off+7]]);
-                let qs = &wrow[off + 8..off + 24];
-                for j in 0..16 {
-                    let u_lo = (qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4;
-                    let u_hi = ((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4;
-                    let w0 = u_lo as f32 * d + m;
-                    let w1 = u_hi as f32 * d + m;
-                    sum += w0 * x[a_base + b * 32 + j]
-                        + w1 * x[a_base + b * 32 + j + 16];
-                }
-            }
-            out[t * od + o] = sum;
-        }
-    }
-}
-
-/// Q5_0 × f32 matmul: dequantize Q5_0 weights on-the-fly and compute f32 dot product.
-/// Block: d(f16,2) + qh(u8,4) + qs(u8,16) = 22 bytes per 32 elements.
-/// Dequant: val = d * ((nibble | (high_bit << 4)) - 16).
-fn cpu_q5_0_matmul_f32(
-    w: &Tensor, x: &[f32], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
-    use crate::block::fp16_to_f32;
-    let nb = id / 32;
-    let ws = nb * 22;
-    let wb = w.data();
-    for o in 0..od {
-        let wrow = &wb[o * ws..(o + 1) * ws];
-        for t in 0..nt {
-            let a_base = t * id;
-            let mut sum = 0.0f32;
-            for b in 0..nb {
-                let off = b * 22;
-                let d = fp16_to_f32(u16::from_le_bytes([wrow[off], wrow[off + 1]]));
-                let qh = u32::from_le_bytes([wrow[off+2], wrow[off+3], wrow[off+4], wrow[off+5]]);
-                let qs = &wrow[off + 6..off + 22];
-                for j in 0..16 {
-                    let xh0 = ((qh >> j) & 1) as i32;
-                    let xh1 = ((qh >> (j + 16)) & 1) as i32;
-                    let w0 = (((qs[j] & 0x0F) as i32 | (xh0 << 4)) - 16) as f32 * d;
-                    let w1 = ((((qs[j] >> 4) & 0x0F) as i32 | (xh1 << 4)) - 16) as f32 * d;
-                    sum += w0 * x[a_base + b * 32 + j];
-                    sum += w1 * x[a_base + b * 32 + j + 16];
-                }
-            }
-            out[t * od + o] = sum;
-        }
     }
 }
 
@@ -431,12 +237,12 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
             }
         }
         TensorType::Q5_K => {
-            let Q5KB: usize = 176;
+            let q5_kb: usize = 176;
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
                 let idx = id as usize; let doff = ti * ne;
                 for s in 0..n_super {
-                    let off = (idx * n_super + s) * Q5KB;
+                    let off = (idx * n_super + s) * q5_kb;
                     let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
                     let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
                     let sc_arr: &[u8; 12] = t.data[off + 4..off + 16].try_into().unwrap();

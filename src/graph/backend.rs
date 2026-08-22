@@ -19,6 +19,9 @@ pub trait KvProvider {
 }
 
 pub trait Backend: Send + Sync {
+    /// Human-readable backend name (diagnostics). Not called by the scheduler
+    /// today, but part of the Backend API surface.
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// Op support by (op, dtype). `supports_fused` gates the fusion pass

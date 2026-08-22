@@ -98,7 +98,7 @@ pub fn generate(
     let mut stopped_by_string = false;
 
     // Emit `full[emitted..end]` as one Text event (complete UTF-8 by caller).
-    let mut emit = |full: &[u8], emitted: usize, end: usize, tx: &mpsc::Sender<StreamEvent>| -> Result<(), ApiError> {
+    let emit = |full: &[u8], emitted: usize, end: usize, tx: &mpsc::Sender<StreamEvent>| -> Result<(), ApiError> {
         if end > emitted {
             let chunk = String::from_utf8_lossy(&full[emitted..end]).into_owned();
             if tx.blocking_send(StreamEvent::Text(chunk)).is_err() {

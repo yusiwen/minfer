@@ -36,7 +36,7 @@ src/
 ├── conversation.rs  # Multi-turn conversation session (append-only KV + Engine abstraction)
 ├── server/          # OpenAI-compatible HTTP server (axum; types/slot/chat)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download + cached-name resolution
-├── metal.rs         # MPS kernels + per-op GPU methods + retained layer_gpu (tests only)
+├── metal.rs         # MPS kernels + per-op GPU methods (graph backend entry points)
 ├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 kernels)
 ├── cuda.rs          # CUDA backend (feature-gated; graph integration pending — Phase 7)
 └── models/

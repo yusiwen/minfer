@@ -55,10 +55,13 @@ Fix (`src/metal.metal`, both kernels): no early return. Invalid heads
 in-bounds) so **all** simdgroups reach every barrier, then **skip the output
 write** via a `valid_head` flag.
 
-### 2.3 Runtime guards — fall back to CPU instead of risking a fault
+### 2.3 Runtime guards — fall back instead of risking a fault
 
-`layer_gpu` / `output_norm_gpu` now return `false` (CPU fallback) when the
-kernels' assumptions do not hold:
+The legacy whole-layer `layer_gpu` / `output_norm_gpu` entry points (deleted
+with the imperative forward, Phase 6) returned `false` (CPU fallback) when the
+kernels' assumptions did not hold; the graph path reports the same invariants
+as `Err` from `MetalBackend::execute_node` (never a silent CPU fallback). The
+checked assumptions:
 
 - `nh % nk != 0` — attention barrier participation (see 2.2).
 - `hd > 256` — the `float acc[256]` private array would overflow. **Note**: the
@@ -66,7 +69,7 @@ kernels' assumptions do not hold:
   see §4. This hardcoded `256` is the array size, which is a fixed kernel
   declaration; the threadgroup-smem check belongs in the dispatch (§4).
 - `ne/nqt/nkt/nf % 32 != 0` — quantized-matmul block alignment.
-- `ne % 32 != 0` in `output_norm_gpu`.
+- `ne % 32 != 0` in the output matmul.
 
 ## 3. Audit findings (2026-08-02) — status
 

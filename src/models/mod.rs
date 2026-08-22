@@ -4,7 +4,7 @@
 pub mod qwen2;
 
 use crate::cache::KVCache;
-use crate::gguf::{GgufContext, GgufModel};
+use crate::gguf::GgufModel;
 use crate::graph::cache::GraphCache;
 use crate::vec_ops::RopeStyle;
 
@@ -13,6 +13,11 @@ use crate::vec_ops::RopeStyle;
 /// `Send + Sync` so a model can be shared across threads (the HTTP server's
 /// worker thread owns the only inference path; `Arc<dyn ModelDef>` is used by
 /// the OpenAI-compatible server, OPENAI-CHAT-API-PLAN.md).
+// NOTE: several required methods (as_any, forward_graph, format_chat,
+// n_head_kv, n_embd_head, n_kv_embd, n_vocab, rope_style) are only reached
+// through `Box<dyn ModelDef>` calls or planned paths; rustc's dead-code lint
+// flags them anyway, so the trait is allow'd as the model API surface.
+#[allow(dead_code)]
 pub trait ModelDef: Send + Sync {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
 

@@ -13,6 +13,9 @@ pub enum SlotState {
 /// One inference slot. Only ever touched by the serial worker thread, so no
 /// locking is needed; the queue provides concurrency between requests.
 pub struct Slot {
+    /// Slot index (0-based). Carried for diagnostics / future routing; the
+    /// worker currently addresses slots positionally.
+    #[allow(dead_code)]
     pub id: usize,
     pub state: SlotState,
     pub cache: GraphCache,

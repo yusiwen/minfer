@@ -372,7 +372,6 @@ impl Qwen2Graph {
         // debug dump: MINFER_GRAPH_DUMP=/tmp/x writes the logits and layer-0 KV
         // so GPU vs CPU graph runs can be compared (Phase 3 debugging)
         if let Ok(dir) = std::env::var("MINFER_GRAPH_DUMP") {
-            let nv = model.hparams.n_vocab as usize;
             let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
             let tag = if nt == 1 { "decode" } else { "prefill" };
             let _ = std::fs::write(format!("{dir}/logits_{tag}.f32"), {

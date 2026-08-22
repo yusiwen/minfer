@@ -3,7 +3,6 @@
 
 use minijinja::{Environment, context};
 
-const DEFAULT_QWEN_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 const DEFAULT_SYSTEM: &str = "You are a helpful assistant.";
 
 /// Render a chat template with a full message list (server path,

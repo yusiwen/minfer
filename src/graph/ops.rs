@@ -9,8 +9,11 @@ use crate::tensor::TensorType;
 use crate::vec_ops::RopeStyle;
 
 /// Attention mode.
+// Mha is part of the full attention-mode vocabulary (ggml parity); only Gqa /
+// Flash are constructed by the supported architectures today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttnMode {
+    #[allow(dead_code)]
     Mha,
     Gqa,
     Flash,
@@ -18,11 +21,15 @@ pub enum AttnMode {
 
 /// Fused-op capability tag: drives the fusion pass (Phase 4) — a fusion is only
 /// applied when the target backend reports `supports_fused(FusedOp)`.
+// BatchMatMul / QKVBiasRopeStore are the planned fused variants (the decode
+// path uses FusedQKV today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusedOp {
     SwiGLU,     // silu(gate) * up
     BiasRope,   // add_bias + rope (+ kv store on GPU: attn_bias_rope_store)
+    #[allow(dead_code)]
     BatchMatMul, // multiple matmuls sharing one quantized activation
+    #[allow(dead_code)]
     QKVBiasRopeStore, // decode QKV: concat matmul + bias+rope+store (nt==1)
 }
 
@@ -38,10 +45,16 @@ pub enum Op {
     // ---- element-wise ----
     Add,
     Mul,
+    /// Part of the full op vocabulary (ggml parity); no supported architecture
+    /// emits a scale node yet.
+    #[allow(dead_code)]
     Scale(f32),
     Silu,
 
     // ---- reduction ----
+    /// Softmax is part of the op vocabulary; the attention kernels fuse the
+    /// softmax internally, so no standalone softmax node is emitted today.
+    #[allow(dead_code)]
     Softmax { dim: usize },
 
     // ---- normalization ----
@@ -64,13 +77,19 @@ pub enum Op {
     KvcacheLoad { layer: usize },
 
     // ---- view / reshape ----
+    /// View / Reshape / Permute / BatchMatMul are part of the full ggml op
+    /// vocabulary; the Qwen2 graph builder doesn't emit them (yet).
+    #[allow(dead_code)]
     View { offset: usize, shape: [usize; 4] },
+    #[allow(dead_code)]
     Reshape { shape: [usize; 4] },
+    #[allow(dead_code)]
     Permute { dims: [usize; 4] },
 
     // ---- fused ops (fusion pass output, gated by backend supports_fused) ----
     SwiGLU,
     FusedBiasRope,
+    #[allow(dead_code)]
     BatchMatMul,
     /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store
     /// in one kernel pass (llama `attn_bias_rope_store`). Carries the layer so

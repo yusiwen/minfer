@@ -13,7 +13,7 @@
 
 use super::alloc::GraphAllocator;
 use super::params::GraphParams;
-use super::{ComputeGraph, NodeId};
+use super::ComputeGraph;
 
 pub struct GraphCache {
     graph: Option<ComputeGraph>,
@@ -84,11 +84,6 @@ impl GraphCache {
         prev.nodes.iter().zip(graph.nodes.iter()).all(|(a, b)| {
             a.op == b.op && a.out_shape == b.out_shape && a.src == b.src
         })
-    }
-
-    /// Node ids of the stored graph's outputs (convenience for the caller).
-    pub fn outputs(&self) -> Vec<NodeId> {
-        self.graph.as_ref().map(|g| g.outputs.clone()).unwrap_or_default()
     }
 }
 

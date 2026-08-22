@@ -298,6 +298,8 @@ impl GraphAllocator {
     }
 
     /// Fill an input node's buffer from host data (routes to the node's pool).
+    /// (Test / debug helper — the generation loop fills I32 inputs.)
+    #[allow(dead_code)]
     pub fn fill_input(
         &mut self,
         graph: &ComputeGraph,
@@ -349,7 +351,9 @@ impl GraphAllocator {
     }
 
     /// Host view of a CPU node's buffer (Metal nodes: use copy_to_cpu).
-    pub fn get_buffer(&self, graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
+    /// (Test helper.)
+    #[allow(dead_code)]
+    pub fn get_buffer(&self, _graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
         let br = self.node_buffer(id)?;
         match br.backend {
             Backend::CPU => self.cpu.read_host(br.id),
@@ -371,6 +375,8 @@ impl GraphAllocator {
     }
 
     /// Host view of a persistent region by name (CPU pool).
+    /// (Test helper.)
+    #[allow(dead_code)]
     pub fn get_persistent(&self, name: &str) -> Option<&[f32]> {
         self.persistent
             .iter()
@@ -379,11 +385,13 @@ impl GraphAllocator {
     }
 
     /// Number of distinct buffers currently allocated (for tests).
+    #[allow(dead_code)]
     pub fn n_cpu_buffers(&self) -> usize {
         self.cpu.pool_len()
     }
 
     /// Number of distinct buffers actually mapped to nodes (for tests).
+    #[allow(dead_code)]
     pub fn n_mapped_buffers(&self) -> usize {
         let mut s: std::collections::BTreeSet<(Backend, usize)> = std::collections::BTreeSet::new();
         for br in self.node_to_buf.values() {

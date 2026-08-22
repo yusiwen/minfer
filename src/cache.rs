@@ -1,4 +1,10 @@
-// KV Cache — shared by all transformer architectures
+// KV Cache — shared by all transformer architectures.
+//
+// LEGACY: the graph path owns KV in persistent per-layer regions (alloc.rs),
+// so this type survives only as the `ModelDef::forward` signature's vestigial
+// `&mut KVCache` parameter (main.rs / tests still construct it, nothing reads
+// it). Kept until the trait signature is refactored away.
+#![allow(dead_code)]
 
 /// KV cache for a single transformer layer.
 #[derive(Clone)]

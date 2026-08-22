@@ -103,11 +103,15 @@ pub struct TurnParams {
 }
 
 /// 一回合生成结果。
+// text / stopped_by_* 由流式 emit 路径输出，字段保留为结构化结果（测试用）。
 #[derive(Debug)]
 pub struct TurnOutcome {
     /// assistant 生成文本（stop 串截断后；不含 EOG）。
+    #[allow(dead_code)]
     pub text: String,
+    #[allow(dead_code)]
     pub stopped_by_eog: bool,
+    #[allow(dead_code)]
     pub stopped_by_string: bool,
     /// n_predict 耗尽或上下文填满。
     pub hit_n_predict: bool,
@@ -217,6 +221,8 @@ impl Conversation {
     }
 
     /// 启动会话：`Some(首条输入)` → 全量渲染 + prefill + 生成；None → 等待输入。
+    /// (入口保留为完整 API；CLI 用 `user_turn` 走统一路径，`start` 由测试覆盖。)
+    #[allow(dead_code)]
     pub fn start(
         &mut self,
         first_input: Option<&str>,
