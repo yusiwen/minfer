@@ -2,6 +2,17 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn main() {
+    // ─── Build version (minfer --version) ─────────────────────────────
+    // The release workflow passes MINFER_VERSION as "vX.Y.Z(shortsha)",
+    // e.g. "v0.0.1(1234abc)" — the most recent "v"-prefixed release tag
+    // plus the build commit hash. Local/dev builds fall back to the Cargo
+    // package version (with a "v" prefix to match the tag convention).
+    println!("cargo:rerun-if-env-changed=MINFER_VERSION");
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let minfer_version = std::env::var("MINFER_VERSION")
+        .unwrap_or_else(|_| format!("v{pkg_version}"));
+    println!("cargo:rustc-env=MINFER_VERSION={minfer_version}");
+
     // ─── Precompiled Metal library (metallib) ─────────────────────────
     // Compile src/metal.metal → $OUT_DIR/minfer.metallib at build time so the
     // binary can load it with newLibraryWithData (llama embeds default.metallib

@@ -114,6 +114,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --n-ctx <N>          server total context (default 4096; divided among slots)");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
     eprintln!("  -h, --help           show this help");
+    eprintln!("  -V, --version        print version and exit");
 }
 
 fn main() {
@@ -156,6 +157,12 @@ fn main() {
         match a {
             "-h" | "--help" => {
                 print_usage(&prog);
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                // Value injected at build time (build.rs): "v<tag>(<short sha>)"
+                // for release builds, "v<Cargo pkg version>" otherwise.
+                println!("minfer {}", env!("MINFER_VERSION"));
                 std::process::exit(0);
             }
             "--server" => { server_mode = true; i += 1; }
