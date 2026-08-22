@@ -9,7 +9,11 @@ use crate::graph::cache::GraphCache;
 use crate::vec_ops::RopeStyle;
 
 /// Architecture-agnostic model interface.
-pub trait ModelDef {
+///
+/// `Send + Sync` so a model can be shared across threads (the HTTP server's
+/// worker thread owns the only inference path; `Arc<dyn ModelDef>` is used by
+/// the OpenAI-compatible server, OPENAI-CHAT-API-PLAN.md).
+pub trait ModelDef: Send + Sync {
     fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
 
     /// Downcast helper for the graph path's weight registration.

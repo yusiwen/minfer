@@ -308,6 +308,14 @@ impl Tokenizer {
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
     }
+
+    /// Text of the BOS token ("" when unknown) — chat templates render it.
+    pub fn bos_text(&self) -> String {
+        self.id_to_token
+            .get(self.bos_token as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// Length of the longest prefix of `bytes` that ends on a complete UTF-8

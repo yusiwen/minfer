@@ -13,3 +13,4 @@ uv.lock
 .direnv/
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+/.cargo-home/
