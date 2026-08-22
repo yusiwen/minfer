@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 fn main() {
     // ─── Build version (minfer --version) ─────────────────────────────
@@ -32,27 +32,65 @@ fn main() {
         let air = format!("{out_dir}/minfer.air");
         let metallib = format!("{out_dir}/minfer.metallib");
 
-        let metal_ok = Command::new("xcrun")
+        // Capture stderr so a failed compile prints the REAL compiler error —
+        // previously the failure was swallowed and only a bare "compile
+        // failed" was shown (typical cause: an older Xcode/SDK rejecting a
+        // Metal language feature; the runtime newLibraryWithSource fallback
+        // then compiles the same source against the OS's Metal compiler).
+        //
+        // DEVELOPER_DIR/SDKROOT are stripped and /usr/bin/xcrun is used
+        // explicitly so the REAL Apple toolchain is always selected:
+        //   - nix devShells (this repo's flake.nix via direnv) export
+        //     DEVELOPER_DIR/SDKROOT pointing at nixpkgs' open-source apple-sdk,
+        //     where the nix xcbuild `xcrun` (first on PATH) has no `metal`
+        //     tool ("tool 'metal' not found" → metallib fallback).
+        //   - the nix xcrun also cannot resolve the macosx SDK without those
+        //     vars, so stripping them only works together with the /usr/bin
+        //     path. The system xcrun falls back to `xcode-select -p`.
+        // Unsetting the vars only affects these two child processes — rustc
+        // linking in the same shell still uses the nix SDK/clang.
+        let mut metal_err = String::new();
+        let metal_ok = match Command::new("/usr/bin/xcrun")
+            .env_remove("DEVELOPER_DIR")
+            .env_remove("SDKROOT")
             .args(["-sdk", "macosx", "metal", "-O3",
                    // clang module cache goes to a writable dir (note: metal
                    // only accepts the `=` form of -fmodules-cache-path)
                    &format!("-fmodules-cache-path={out_dir}"),
                    "-c", "src/metal.metal", "-o"])
             .arg(&air)
-            .stdout(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                metal_err.push_str(&String::from_utf8_lossy(&o.stderr));
+                false
+            }
+            Err(e) => {
+                metal_err.push_str(&format!("failed to spawn /usr/bin/xcrun: {e}"));
+                false
+            }
+        };
 
         let lib_ok = if metal_ok {
-            Command::new("xcrun")
+            match Command::new("/usr/bin/xcrun")
+                .env_remove("DEVELOPER_DIR")
+                .env_remove("SDKROOT")
                 .args(["-sdk", "macosx", "metallib"])
                 .arg(&air)
                 .args(["-o", &metallib])
-                .stdout(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .output()
+            {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    metal_err.push_str(&String::from_utf8_lossy(&o.stderr));
+                    false
+                }
+                Err(e) => {
+                    metal_err.push_str(&format!("failed to spawn /usr/bin/xcrun: {e}"));
+                    false
+                }
+            }
         } else {
             false
         };
@@ -60,7 +98,12 @@ fn main() {
         if !lib_ok {
             // Fallback marker: empty metallib → runtime source compile.
             let _ = std::fs::write(&metallib, b"");
-            println!("cargo:warning=Metal metallib compile failed — will compile shaders from source at runtime");
+            let err = metal_err.trim();
+            if err.is_empty() {
+                println!("cargo:warning=Metal metallib compile failed (no compiler output) — will compile shaders from source at runtime");
+            } else {
+                println!("cargo:warning=Metal metallib compile failed — will compile shaders from source at runtime. Compiler output:\n{err}");
+            }
         }
         let _ = std::fs::remove_file(&air);
         // Content hash in the env fingerprint: cargo does not track OUT_DIR

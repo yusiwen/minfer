@@ -3524,13 +3524,11 @@ kernel void kernel_flash_attn_ext_f32(
     threadgroup float * shmem [[threadgroup(0)]]
 ) {
     constexpr int DK  = 64;
-    constexpr int DV  = 64;
     constexpr int NE  = 2;
     constexpr int C   = 32;
     constexpr int NW  = 32;
     constexpr int NL  = NW / NE;   // 16
     constexpr int DK4 = DK / 4;    // 16
-    constexpr int DV4 = DV / 4;    // 16
     constexpr float MINF_MAXHALF = 65504.0f; // half max; -MINF_MAXHALF ~= -INF mask
 
     const int t   = (int)tgpig.x;
@@ -3542,7 +3540,6 @@ kernel void kernel_flash_attn_ext_f32(
     const int gqa = nh / nk;
     const int hk  = h / gqa;
     const int stride_kv  = nk * hd;         // f32 elements per token row
-    const int stride_kv4 = stride_kv / 4;   // float4 per token row
     const int hk4        = hk * hd / 4;     // head offset in float4
 
     const int tx = (int)tiisg % NL;   // 0..NL-1 (DK4 dim)
@@ -3663,13 +3660,11 @@ kernel void kernel_flash_attn_ext_f16(
     threadgroup float * shmem [[threadgroup(0)]]
 ) {
     constexpr int DK  = 64;
-    constexpr int DV  = 64;
     constexpr int NE  = 2;
     constexpr int C   = 32;
     constexpr int NW  = 32;
     constexpr int NL  = NW / NE;
     constexpr int DK4 = DK / 4;
-    constexpr int DV4 = DV / 4;
     constexpr float MINF_MAXHALF = 65504.0f;
 
     const int t   = (int)tgpig.x;
@@ -3681,7 +3676,6 @@ kernel void kernel_flash_attn_ext_f16(
     const int gqa = nh / nk;
     const int hk  = h / gqa;
     const int stride_kv  = nk * hd;         // half elements per token row
-    const int stride_kv4 = stride_kv / 4;   // half4 per token row
     const int hk4        = hk * hd / 4;
 
     const int tx = (int)tiisg % NL;
@@ -3797,13 +3791,11 @@ kernel void kernel_flash_attn_ext_hd128_f32(
     threadgroup float * shmem [[threadgroup(0)]]
 ) {
     constexpr int DK  = 128;
-    constexpr int DV  = 128;
     constexpr int NE  = 1;
     constexpr int C   = 32;
     constexpr int NW  = 32;
     constexpr int NL  = NW / NE;   // 32
     constexpr int DK4 = DK / 4;    // 32
-    constexpr int DV4 = DV / 4;    // 32
     constexpr float MINF_MAXHALF = 65504.0f;
 
     const int t   = (int)tgpig.x;
@@ -3815,11 +3807,9 @@ kernel void kernel_flash_attn_ext_hd128_f32(
     const int gqa = nh / nk;
     const int hk  = h / gqa;
     const int stride_kv  = nk * hd;         // f32 elements per token row
-    const int stride_kv4 = stride_kv / 4;   // float4 per token row
     const int hk4        = hk * hd / 4;     // head offset in float4
 
     const int tx = (int)tiisg % NL;   // 0..NL-1 (DK4 dim) == tiisg (NE=1)
-    const int ty = (int)tiisg / NL;   // always 0
 
     // shmem layout (f32): sq4[DK4 float4] | ss[C] | so4[NW float4]
     threadgroup float4 * sq4 = (threadgroup float4 *)shmem;
@@ -3920,13 +3910,11 @@ kernel void kernel_flash_attn_ext_hd128_f16(
     threadgroup float * shmem [[threadgroup(0)]]
 ) {
     constexpr int DK  = 128;
-    constexpr int DV  = 128;
     constexpr int NE  = 1;
     constexpr int C   = 32;
     constexpr int NW  = 32;
     constexpr int NL  = NW / NE;   // 32
     constexpr int DK4 = DK / 4;    // 32
-    constexpr int DV4 = DV / 4;    // 32
     constexpr float MINF_MAXHALF = 65504.0f;
 
     const int t   = (int)tgpig.x;
@@ -3938,11 +3926,9 @@ kernel void kernel_flash_attn_ext_hd128_f16(
     const int gqa = nh / nk;
     const int hk  = h / gqa;
     const int stride_kv  = nk * hd;         // half elements per token row
-    const int stride_kv4 = stride_kv / 4;   // half4 per token row
     const int hk4        = hk * hd / 4;
 
     const int tx = (int)tiisg % NL;   // 0..NL-1 (DK4 dim) == tiisg (NE=1)
-    const int ty = (int)tiisg / NL;   // always 0
 
     threadgroup float4 * sq4 = (threadgroup float4 *)shmem;
     threadgroup float  * ss  = shmem + DK4 * 4;
@@ -4049,12 +4035,10 @@ kernel void kernel_flash_attn_blk_f32(
     constexpr int C   = 64;
     constexpr int NSG = 4;
     constexpr int DK  = 64;
-    constexpr int DV  = 64;
     constexpr int NW  = 32;
     constexpr int NQ  = Q / NSG;      // 2
     constexpr int SH  = 2 * C;        // 128
     constexpr int DK4 = DK / 4;       // 16
-    constexpr int DV4 = DV / 4;       // 16
     constexpr int DK8 = DK / 8;       // 8
     constexpr int PV  = 64;           // PAD2(DV, 64)
     constexpr int PV4 = PV / 4;       // 16
@@ -4232,12 +4216,10 @@ kernel void kernel_flash_attn_blk_f16(
     constexpr int C   = 64;
     constexpr int NSG = 4;
     constexpr int DK  = 64;
-    constexpr int DV  = 64;
     constexpr int NW  = 32;
     constexpr int NQ  = Q / NSG;
     constexpr int SH  = 2 * C;
     constexpr int DK4 = DK / 4;
-    constexpr int DV4 = DV / 4;
     constexpr int DK8 = DK / 8;
     constexpr int PV  = 64;
     constexpr int PV4 = PV / 4;
@@ -4412,12 +4394,10 @@ kernel void kernel_flash_attn_blk_hd128_f32(
     constexpr int C   = 64;
     constexpr int NSG = 4;
     constexpr int DK  = 128;
-    constexpr int DV  = 128;
     constexpr int NW  = 32;
     constexpr int NQ  = Q / NSG;      // 2
     constexpr int SH  = 2 * C;        // 128
     constexpr int DK4 = DK / 4;       // 32
-    constexpr int DV4 = DV / 4;       // 32
     constexpr int DK8 = DK / 8;       // 16
     constexpr int PV  = 128;          // PAD2(DV, 64)
     constexpr int PV4 = PV / 4;       // 32
@@ -4597,12 +4577,10 @@ kernel void kernel_flash_attn_blk_hd128_f16(
     constexpr int C   = 64;
     constexpr int NSG = 4;
     constexpr int DK  = 128;
-    constexpr int DV  = 128;
     constexpr int NW  = 32;
     constexpr int NQ  = Q / NSG;
     constexpr int SH  = 2 * C;
     constexpr int DK4 = DK / 4;
-    constexpr int DV4 = DV / 4;
     constexpr int DK8 = DK / 8;
     constexpr int PV  = 128;
     constexpr int PV4 = PV / 4;
