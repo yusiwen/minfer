@@ -121,7 +121,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     let stream = req.stream.unwrap_or(false);
     let params: SamplingParams = req.resolve(rand::random::<u64>());
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let created = state.created;
+    let created = now_unix(); // per-request timestamp (OpenAI semantics)
     let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
 
     // Render the chat template + tokenize (cheap, do it on the handler side so

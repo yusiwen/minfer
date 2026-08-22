@@ -68,8 +68,10 @@ pub fn generate(
     let positions: Vec<usize> = (0..nt).collect();
     let special = model.special_tokens();
 
-    // Prefill (n_out=1: only the last token's logits are returned).
-    let last_logits = guarded_forward(model, input_ids, &positions, nt, n_ctx_slot, cache)?;
+    // Prefill (n_out=1: only the LAST token's logits are returned and used for
+    // the first sample — passing nt here would hand the sampler all nt rows and
+    // corrupt the first sampled token).
+    let last_logits = guarded_forward(model, input_ids, &positions, 1, n_ctx_slot, cache)?;
     let mut logits = last_logits;
     let mut current_pos = nt;
 
