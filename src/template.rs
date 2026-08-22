@@ -55,6 +55,58 @@ pub fn render_messages(
     }
 }
 
+/// 差分渲染结果（`common_chat_format_single` 的 minfer 版）。
+pub struct FormattedDelta {
+    /// 追加文本：`fmt_new` 去掉 `fmt_past` 前缀后的部分（含尾部换行补偿）。
+    pub text: String,
+    /// `fmt_new` 是否以 `fmt_past` 为前缀。false 表示模板非确定性（如依赖
+    /// 外部状态），调用方必须放弃增量、走全量重灌兜底（§5.4）。
+    pub prefix_matched: bool,
+}
+
+/// 增量渲染：给定已记录历史与新消息，返回"只需追加进 KV"的文本增量。
+///
+/// 对应 llama.cpp `common_chat_format_single`（common/chat.cpp:653）：
+/// 两次渲染（有/无新消息）取差分，避免把已生成的历史重复喂给模型；
+/// 若 `fmt_past` 以 `\n` 结尾则前补 `\n`——该换行属于前缀尾部，被 diff 吃掉，
+/// 但模型生成的 EOG 之后不会自带它，而 canonical 文本需要它（§3.2/§5.4）。
+///
+/// `template` 为 None 时用 ChatML fallback 渲染（`fallback_chatml_messages`）。
+pub fn format_single(
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    new_msg: (String, Option<String>),
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> FormattedDelta {
+    let render = |msgs: &[(String, Option<String>)], add_gen: bool| match template {
+        Some(t) => render_messages(t, msgs, add_gen, bos_token),
+        None => fallback_chatml_messages(msgs, add_gen),
+    };
+    let fmt_past = if messages.is_empty() {
+        String::new()
+    } else {
+        render(messages, false)
+    };
+    let mut all = messages.to_vec();
+    all.push(new_msg);
+    let fmt_new = render(&all, add_generation_prompt);
+
+    let mut out = String::new();
+    // 尾部换行补偿：fmt_past 以 '\n' 结尾时，该换行属于前缀尾部，diff 会丢掉它，
+    // 但 canonical 文本（模型 EOG 之后、下一条消息之前）需要它。
+    if add_generation_prompt && !fmt_past.is_empty() && fmt_past.ends_with('\n') {
+        out.push('\n');
+    }
+    if fmt_new.starts_with(&fmt_past) {
+        out.push_str(&fmt_new[fmt_past.len()..]);
+        FormattedDelta { text: out, prefix_matched: true }
+    } else {
+        // 前缀失败：模板非确定性 → 返回全量，调用方走全量重灌兜底。
+        FormattedDelta { text: fmt_new, prefix_matched: false }
+    }
+}
+
 /// Render a chat template with minijinja (single user message, CLI path).
 /// Falls back to simple ChatML if the template cannot be rendered.
 pub fn render_template(
@@ -193,5 +245,97 @@ mod tests {
         let tmpl = "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}assistant:";
         let out = render_template(tmpl, "hello", true, "");
         assert_eq!(out, "user: hello\nassistant:");
+    }
+
+    // === format_single（增量差分渲染，CLI-CONVERSATION-PLAN.md §5.3）===
+
+    /// Qwen2.5 风格 ChatML 模板（每条消息后跟一个换行，结尾有 assistant 头）。
+    const QWEN_CHATML: &str = "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+    fn m(role: &str, content: &str) -> (String, Option<String>) {
+        (role.to_string(), Some(content.to_string()))
+    }
+
+    #[test]
+    fn format_single_diffs_only_new_user_message() {
+        // 历史 [system, user, assistant] + 新 user → delta 只含新消息与 assistant 头，
+        // 不得重复包含已生成的 assistant 内容。
+        let past = vec![
+            m("system", "You are helpful."),
+            m("user", "hi"),
+            m("assistant", "Hello!"),
+        ];
+        let d = format_single(Some(QWEN_CHATML), &past, m("user", "what is 2+2?"), true, "");
+        assert!(d.prefix_matched, "prefix must match for a deterministic template");
+        assert_eq!(
+            d.text,
+            "\n<|im_start|>user\nwhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // 不变量：KV 前缀 + delta == fmt_new（canonical 全量渲染）。
+        // KV 前缀 = fmt_past 去掉模板在最后一条消息后输出的换行——模型生成 EOG 后
+        // 不会自带该换行，补偿逻辑正是把它加回 delta 开头。
+        let fmt_past = render_messages(QWEN_CHATML, &past, false, "");
+        let kv_prefix = fmt_past.strip_suffix('\n').unwrap_or(&fmt_past);
+        let mut all = past.clone();
+        all.push(m("user", "what is 2+2?"));
+        let fmt_new = render_messages(QWEN_CHATML, &all, true, "");
+        assert_eq!(format!("{kv_prefix}{}", d.text), fmt_new);
+    }
+
+    #[test]
+    fn format_single_no_trailing_newline_no_compensation() {
+        // 模板不产生尾部 '\n' → 不做补偿。
+        let tmpl = "{% for mm in messages %}[{{ mm['role'] }}:{{ mm['content'] }}]{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
+        let past = vec![m("user", "hi"), m("assistant", "Hello!")];
+        let d = format_single(Some(tmpl), &past, m("user", "Q"), true, "");
+        assert!(d.prefix_matched);
+        assert_eq!(d.text, "[user:Q]<assistant>");
+    }
+
+    #[test]
+    fn format_single_empty_history_returns_full_new() {
+        let d = format_single(Some(QWEN_CHATML), &[], m("user", "first"), true, "");
+        assert!(d.prefix_matched);
+        let expect = render_messages(QWEN_CHATML, &[m("user", "first")], true, "");
+        assert_eq!(d.text, expect);
+    }
+
+    #[test]
+    fn format_single_prefix_mismatch_falls_back_to_full() {
+        // 非确定性模板（reverse）→ fmt_new 不以 fmt_past 为前缀 → 全量 + 标记。
+        let tmpl = "{% for mm in messages|reverse %}[{{ mm['role'] }}]{% endfor %}";
+        let past = vec![m("user", "hi"), m("assistant", "Hello!")];
+        let d = format_single(Some(tmpl), &past, m("user", "Q"), false, "");
+        assert!(!d.prefix_matched);
+        let mut all = past.clone();
+        all.push(m("user", "Q"));
+        let expect = render_messages(tmpl, &all, false, "");
+        assert_eq!(d.text, expect, "mismatch must return the full re-render");
+    }
+
+    #[test]
+    fn format_single_fallback_without_template() {
+        // template=None → ChatML fallback 渲染，同样满足前缀/补偿语义。
+        let past = vec![m("user", "hi"), m("assistant", "Hello!")];
+        let d = format_single(None, &past, m("user", "Q"), true, "");
+        assert!(d.prefix_matched);
+        assert_eq!(
+            d.text,
+            "\n<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn format_single_null_content_history() {
+        // assistant 消息 content=None（tool-call 回合）不破坏差分。
+        let tmpl = "{% for mm in messages %}[{{ mm['role'] }}]{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
+        let past = vec![
+            m("user", "hi"),
+            ("assistant".to_string(), None),
+            m("user", "again"),
+        ];
+        let d = format_single(Some(tmpl), &past, m("assistant", "ok"), false, "");
+        assert!(d.prefix_matched);
+        assert_eq!(d.text, "[assistant]");
     }
 }

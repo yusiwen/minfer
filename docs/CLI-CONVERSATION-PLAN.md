@@ -1,8 +1,13 @@
 # CLI 多轮对话改造方案 (CLI Multi-Turn Conversation Plan)
 
-**Status:** Design Document
+**Status:** Design Document + implementation record
 **Date:** 2026-08-22
 **参考代码:** llama.cpp `tools/cli/cli-context.cpp`（现行 client-server CLI）、legacy `examples/main/main.cpp`（独立进程交互循环，commit `1d36b3670` 前）、`common/chat.h` / `common/chat.cpp`（模板机制）
+
+> **Revision 1 (2026-08-22) — Phase 0 implemented.** `template::format_single` + `FormattedDelta`
+> 落地（§5.3），6 个单测全绿：差分正确性（assistant 内容不重复喂回）、尾部换行补偿、
+> 无换行不补偿、空前缀、前缀失败兜底（reverse 模板）、无模板 ChatML fallback、null-content
+> 历史。token 级一致性断言延后到 L1.5 KV 等价测试（需真实 tokenizer/模型，§8.4）。
 
 ---
 
@@ -399,13 +404,17 @@ minfer 中位置是数据、KV 区域是每层连续 f32 数组 → 平移 = 每
 
 ### Phase 0：模板差分渲染（`src/template.rs`）
 
+**Status: implemented (rev 1).** `format_single(template: Option<&str>, messages, new_msg,
+add_generation_prompt, bos_token) -> FormattedDelta{text, prefix_matched}`；`template=None`
+走 ChatML fallback。测试见 §8.8（6 个单测，`cargo test format_single`）。
+
 - 新增 `format_single`（§5.3）：差分 + 尾部 `\n` 补偿 + 前缀失败通知。
 - （可选清理）单发路径切 `forward_cached(..., params.n_ctx, ...)`。
 - 测试：
   - ChatML / Llama3 风格模板：`format_single(past, ("user", x))` 的 diff 正确；
   - 补偿逻辑：past 以 `\n` 结尾 vs 不以；
   - 前缀失败兜底：非确定性模板返回全量 + 标记；
-  - token 级断言：`tokenize(fmt_past) + tokenize(delta) == tokenize(fmt_new)`（对标准模板）。
+  - token 级断言：`tokenize(fmt_past) + tokenize(delta) == tokenize(fmt_new)`（对标准模板）→ **延后到 L1.5 KV 等价测试**。
 
 ### Phase 1：会话核心（新模块 `src/conversation.rs`）
 
