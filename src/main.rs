@@ -111,7 +111,9 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --server             run as an OpenAI-compatible HTTP server");
     eprintln!("  --port <N>           server port (default 8080)");
-    eprintln!("  --n-ctx <N>          server total context (default 4096; divided among slots)");
+    eprintln!("  --n-ctx <N>          context size (default 4096; server: total, divided among slots)");
+    eprintln!("                       single-shot / --cnv: sizes the KV cache, clamped to the model's");
+    eprintln!("                       max context (e.g. Qwen3-4B 40960); server: total context");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
     eprintln!("  -h, --help           show this help");
     eprintln!("  -V, --version        print version and exit");
@@ -499,7 +501,13 @@ fn main() {
     // single sequence, only the final token is sampled). llama.cpp does the same
     // via ggml_get_rows(inp_out_ids) at the last layer, shrinking the lm_head
     // to n_outputs rows — saves the full-nt output GEMM + logits download.
-    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1);
+    // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
+    // model's max_seq_len, which would allocate 12 GB+ and pay a first-submit
+    // Metal tax (docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). It never shrinks below
+    // the prompt length, and the model's forward clamps it to max_seq_len.
+    // Computed ONCE so prefill and decode size the same KV regions.
+    let ctx = params.n_ctx.max(input_ids.len());
+    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx);
     let last_logits: Vec<f32> = logits;
 
     let prefill_time = infer_start.elapsed();
@@ -603,7 +611,7 @@ fn main() {
         // forward() returns n_out*nv logits (n_out=1 for single-token decode,
         // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
         t1 = std::time::Instant::now();
-        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1);
+        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
         if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
     }

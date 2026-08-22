@@ -30,8 +30,8 @@ impl Qwen2Model {
 }
 
 impl ModelDef for Qwen2Model {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
-        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out)
+    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -42,8 +42,8 @@ impl ModelDef for Qwen2Model {
         graph::Qwen2Graph::build(self, params)
     }
 
-    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
-        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out)
+    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
     }
 
     fn forward_graph_cached(

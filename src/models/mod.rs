@@ -20,7 +20,10 @@ use crate::vec_ops::RopeStyle;
 // flags them anyway, so the trait is allow'd as the model API surface.
 #[allow(dead_code)]
 pub trait ModelDef: Send + Sync {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32>;
+    /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
+    /// (the graph path; the legacy `kv` arg is ignored there). Callers must
+    /// guarantee `positions[i] < n_ctx` for every position.
+    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32>;
 
     /// Downcast helper for the graph path's weight registration.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -32,8 +35,8 @@ pub trait ModelDef: Send + Sync {
     }
 
     /// Graph-based forward (Phase 6); defaults to the imperative path.
-    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
-        self.forward(tokens, positions, kv, n_out)
+    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+        self.forward(tokens, positions, kv, n_out, n_ctx)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context

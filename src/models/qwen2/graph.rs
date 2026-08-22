@@ -250,20 +250,26 @@ impl Qwen2Graph {
     /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
     /// `kv` is ignored (the graph owns its KV in persistent regions).
     ///
-    /// CLI convenience wrapper: uses the process-global `graph_cache()` and the
-    /// model's full `max_seq_len` context. Server / multi-slot code must call
-    /// [`Qwen2Graph::forward_cached`] with a slot-scoped cache instead.
+    /// CLI convenience wrapper: uses the process-global `graph_cache()`. The
+    /// KV regions are sized by `n_ctx`, clamped to the model's `max_seq_len`
+    /// (llama.cpp clamps `n_ctx` the same way); single-shot previously used the
+    /// full `max_seq_len` unconditionally, which over-allocated and paid a
+    /// first-submit Metal tax proportional to the KV bytes (see
+    /// docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). Server / multi-slot code must
+    /// call [`Qwen2Graph::forward_cached`] with a slot-scoped cache instead.
     pub fn forward(
         model: &Qwen2Model,
         tokens: &[u32],
         positions: &[usize],
         _kv: &mut KVCache,
         n_out: usize,
+        n_ctx: usize,
     ) -> Vec<f32> {
+        let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);
         let mut guard = graph_cache().lock().unwrap();
         Self::forward_cached(
             model, tokens, positions, n_out,
-            model.hparams.max_seq_len as usize, &mut guard,
+            n_ctx, &mut guard,
         )
     }
 
@@ -580,9 +586,9 @@ mod tests {
         // the prefill -> decode transition (like the real loop).
         let n_ctx = q2.hparams.max_seq_len as usize;
         let mut kv_f = KVCache::new(model.n_layer(), model.n_kv_embd(), n_ctx);
-        let lf = model.forward(&ids, &positions, &mut kv_f, 1);
+        let lf = model.forward(&ids, &positions, &mut kv_f, 1, n_ctx);
         let next = argmax(&lf);
-        let lf2 = model.forward(&[next], &[ids.len()], &mut kv_f, 1);
+        let lf2 = model.forward(&[next], &[ids.len()], &mut kv_f, 1, n_ctx);
         let (lg, lg2) = run_prefill_decode(q2, &ids, next, n_ctx);
         compare("prefill", &lf, &lg);
         compare("decode", &lf2, &lg2);
@@ -614,11 +620,11 @@ mod tests {
 
             // CPU reference (forward, not forward_graph — separate KV state)
             let mut kv = KVCache::new(model.n_layer(), model.n_kv_embd(), 4096);
-            let ref_l = model.forward(&ids, &positions, &mut kv, 1);
+            let ref_l = model.forward(&ids, &positions, &mut kv, 1, 4096);
 
             // GPU graph (forward_graph picks Metal when MPS + weights on GPU)
             let mut kv2 = KVCache::new(model.n_layer(), model.n_kv_embd(), 4096);
-            let gpu_l = model.forward_graph(&ids, &positions, &mut kv2, 1);
+            let gpu_l = model.forward_graph(&ids, &positions, &mut kv2, 1, 4096);
 
             let mut maxd = 0.0f32;
             for i in 0..ref_l.len() {

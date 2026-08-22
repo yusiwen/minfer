@@ -23,9 +23,13 @@ same GGUF file, and *why* — measured on the M4 Pro dev machine, 2026-08.
 |---|---|---|---|
 | **Metal decode** (tg, tok/s) | **75.4–75.9** | **78.6–79.7** | **~95 %** |
 | **Metal prefill, steady-state** (marginal, tok/s) | ~800–1000 | ~900 | ≈ parity |
-| Metal prefill, first request in a fresh process, 241 tok | 552 ms (incl. ~275 ms KV-commit) | 313 ms | 1.76× wall |
+| Metal prefill, first request, 241 tok | 552 ms pre-fix → **~370 ms post-fix** (default n_ctx 4096) | 313 ms | 1.76× → ~1.2× wall |
 | **CPU decode** (tok/s) | **1.1** | **61–68** (8–10 threads) | **~60×** |
 | **CPU prefill** (tok/s) | ~1.1 | ~211 | **~190×** |
+
+Post-fix note: the first-request gap was a KV-sizing policy issue (§2), now
+fixed — the 241-token first request drops from 552 ms to ~370 ms
+(241×1.15 + ~106 ms instead of + ~289 ms).
 
 Bottom line: **on the GPU there is no meaningful gap** — decode is ~95 % of
 llama and prefill is at parity in steady state; the visible first-request
@@ -58,14 +62,14 @@ Per-token decomposition of minfer's `forward()` (13.09 ms/token wall):
   full prefill + 8 decode submits, MatMul encode totals 0.585 ms, every other op
   sub-ms; the decode GPU time is stable at 12.3–13.0 ms/submit.
 
-## 2. Metal prefill: parity in steady state; the first request pays a KV-commit tax
+## 2. Metal prefill: parity in steady state; the first request pays a KV-size tax
 
 Both engines use **simdgroup GEMMs** for prefill matmuls: minfer's 64×32-tile
 `kernel_q4_k_mm_f32` (f32 activations) vs llama's 64×64 `kernel_mul_mm_q4_K_f32`
 (f16 activations). Both land at ~75–80 % of the GPU's fp32 peak — measured
 marginal throughput:
 
-| Prompt | minfer first-submit GPU | llama (llama-bench) |
+| Prompt | minfer first-submit GPU (pre-fix) | llama (llama-bench) |
 |---|---|---|
 | pp16 / 5 tok | ~283 ms (5 tok) | 238 tok/s (67 ms) |
 | pp120 / 121 tok | 390 ms | — |
@@ -75,18 +79,20 @@ marginal throughput:
 
 → steady-state prefill ≈ **800–1000 tok/s (minfer) vs ~900 tok/s (llama)**.
 
-### The first-request tax (the 425-vs-771 wall-clock gap)
+### The first-request tax (the 425-vs-771 wall-clock gap) — FIXED
 
-minfer's single-shot CLI sizes the **KV regions at `max_seq_len = 40960`**
-(`Qwen3Graph::forward` passes `model.hparams.max_seq_len` straight through, and
-`GraphParams.cparams.n_ctx` sizes the persistent per-layer KV regions):
+minfer's single-shot CLI used to size the **KV regions at `max_seq_len =
+40960`** (`Qwen3Graph::forward` passed `model.hparams.max_seq_len` straight
+through, and `GraphParams.cparams.n_ctx` sizes the persistent per-layer KV
+regions):
 
 ```
 36 layers × 2 regions × 40960 × 1024 × 4 B (f32) = 12.1 GB of Metal shared buffers
 ```
 
-The **first** GPU command buffer then pays ~275 ms committing those pages
-(measured first-submit GPU time vs n_ctx — same process, `--cnv`):
+The **first** GPU command buffer then paid ~275 ms — a one-time Metal
+driver cost that scales with the total KV buffer bytes (measured first-submit
+GPU time vs n_ctx — same process, `--cnv`):
 
 | n_ctx | first-submit GPU time |
 |---|---|
@@ -96,17 +102,28 @@ The **first** GPU command buffer then pays ~275 ms committing those pages
 
 After the first submit the cost never recurs (decode submits are 12.3–13.0 ms
 each; a second, larger prefill in the same process — conv turn 2 — shows no
-fixed cost either). So it is a **one-time page-commit on first GPU touch**, not
-a per-prefill or per-token cost.
+fixed cost either). Note the cost is **not** memory commitment: peak RSS is
+identical (~2.1 GB) at n_ctx 4096 and 40960 — it is the Metal driver's
+first-use setup (buffer VA/registration) for the oversized regions, so it is
+strictly a one-time latency + address-space tax, never a resident-memory one.
 
 llama.cpp avoids showing it because (a) its KV cache is sized by `n_ctx`
 (default 4096 → ~1 GB) and (b) it runs a **warmup pass at model load** that
 absorbs the one-time cost before the first real request.
 
-Secondary consequence: the single-shot process holds **12.1 GB** of f32 KV
-buffers it never uses (a 10-token prompt), while `--cnv` / `--n-ctx` correctly
-use the CLI value (conv turn-1 at n_ctx 4096: 106 ms; at 40960: 289 ms — the
-difference is entirely this sizing).
+Secondary consequence (pre-fix): the single-shot process held **12.1 GB** of f32
+KV buffers it never used (a 10-token prompt), while `--cnv` / `--n-ctx`
+correctly used the CLI value (conv turn-1 at n_ctx 4096: 106 ms; at 40960:
+289 ms — the difference was entirely this sizing).
+
+**Fix (this commit)**: `ModelDef::forward` now takes `n_ctx`; the single-shot
+CLI passes `--n-ctx` (default 4096) and both `Qwen2Graph::forward` /
+`Qwen3Graph::forward` clamp it to the model's `max_seq_len` (llama.cpp clamps
+the same way). Result: default first-submit 289 ms → **~106–109 ms**, the
+12.1 GB address-space allocation disappears, and the 5-token prefill wall
+drops from 0.31 s to 0.11 s. Greedy output is byte-identical (KV *content*
+is unchanged — only buffer sizes). `--n-ctx` now also documents as applying to
+single-shot / `--cnv`, not just the server.
 
 ## 3. CPU: the real gap — ~60× decode, ~190× prefill
 
@@ -141,22 +158,21 @@ Decode attention re-reads the whole KV: 36 × 4 kv-heads × 128 hd × 2 (K+V) ×
 | 4096 | +3.2 ms/tok | +1.6 ms/tok | ~13 % |
 | 8192 | +6.3 ms/tok | +3.2 ms/tok | ~24 % |
 
-Also halves the KV commit cost from §2. (llama.cpp's default `kv_cache_type` is
-f16; minfer stores f32.)
+Also halves the KV read traffic and the §2 first-submit tax. (llama.cpp's
+default `kv_cache_type` is f16; minfer stores f32.)
 
 ## 5. Recommendations (ordered by measured impact)
 
-1. **Fix single-shot KV sizing** (largest first-request win, zero kernel work):
-   thread the CLI `n_ctx` through the graph forward (or clamp `max_seq_len`)
-   so single-shot sizes KV like `--cnv` does. Removes ~275 ms of first-request
-   latency and a 12.1 GB allocation on a 10-token prompt. Measured: n_ctx 4096
-   first-submit = 106 ms vs 289 ms at 40960.
+1. ~~Fix single-shot KV sizing~~ **DONE (this commit)** — `ModelDef::forward`
+   takes `n_ctx`; single-shot passes `--n-ctx` (default 4096), clamped to the
+   model's `max_seq_len`. First-request latency 289 → ~106 ms, 12.1 GB
+   address-space allocation gone; greedy output byte-identical.
 2. **CPU backend: NEON dot products + threading** (the only big gap): aarch64
    SIMD kernels (q4_K/q8_1 style) + a small thread pool would take CPU decode
    from 1.1 toward 10–60 tok/s. Per-core scalar→NEON is worth ~5.7×, threading
    another ~10× (diminishing; E-core awareness needed, see §3).
-3. **KV cache f16/bf16**: halves KV traffic and the §2 commit cost; worth ~6–24 %
-   on long-context decode.
+3. **KV cache f16/bf16**: halves KV traffic and the §2 first-submit tax; worth
+   ~6–24 % on long-context decode.
 4. **Prefill marginal (optional)**: f16-activation GEMM or a 64×64 tile to close
    the last ~10 %; at current parity this is low priority.
 
@@ -169,9 +185,10 @@ f16; minfer stores f32.)
 - llama-bench's backend column lists *available* devices ("MTL,BLAS") even for
   `-ngl 0` — the `-ngl` value is the authoritative offload control.
 - llama-cli perf lines: "Prompt: … t/s" = prefill, "Generation: … t/s" = decode.
-- minfer's first prefill in a fresh process includes the KV page-commit (§2);
-  `--cnv` (n_ctx 4096) is the clean way to measure steady-state prefill, or
-  subtract the measured commit from the single-shot total.
+- minfer's first prefill in a fresh process includes the KV-size first-submit
+  tax (§2; post-fix ~106 ms at default n_ctx 4096); `--cnv` (n_ctx 4096) is the
+  clean way to measure steady-state prefill, or subtract the measured tax from
+  the single-shot total.
 - Raw instrumentation: `MINFER_OP_PROFILE=1` (op-encode table + per-submit GPU
   time), `MINFER_TIMING=1` (sample vs forward per token).
 
@@ -188,6 +205,10 @@ f16; minfer stores f32.)
 | llama-cli CPU Generation (t=8 / 10 / 14) | 68.4 / 60.8 / 15.9 tok/s |
 | llama-bench Metal pp16/240/480 | 238 / 771 / 821 tok/s |
 | llama-bench CPU pp240 | 211 tok/s |
-| minfer prefill GPU (first submit) | 5 tok: 283 ms · 121: 390 ms · 241: 552 ms · 481: 851 ms |
-| minfer prefill GPU vs n_ctx (10 tok) | 2048: 87 ms · 4096: 106 ms · 40960: 289 ms |
-| minfer conv turn-2 delta prefill (n_ctx 4096) | 16 tok in 12.3 ms (no commit cost) |
+| minfer prefill GPU (first submit, pre-fix) | 5 tok: 283 ms · 121: 390 ms · 241: 552 ms · 481: 851 ms |
+| minfer prefill GPU vs n_ctx (10 tok, pre-fix) | 2048: 87 ms · 4096: 106 ms · 40960: 289 ms |
+| minfer first-submit, post-fix (n_ctx 4096 / 2048 / 8192 / 65536→clamped) | 109 / 99 / 127 / 308 ms |
+| minfer first-submit RSS (n_ctx 4096 vs 40960) | 2.14 vs 2.12 GB — tax is not resident memory |
+| minfer conv turn-2 delta prefill (n_ctx 4096) | 16 tok in 12.3 ms (no tax) |
+| minfer 5-token prefill wall (pre → post fix) | 0.31 s → 0.11 s |
+| greedy 64-token output, pre vs post fix | byte-identical |

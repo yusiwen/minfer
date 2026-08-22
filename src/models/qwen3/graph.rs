@@ -192,17 +192,27 @@ impl Qwen3Graph {
 
     /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
     /// `kv` is ignored (the graph owns its KV in persistent regions).
+    ///
+    /// CLI convenience wrapper: uses the process-global `graph_cache()`. The
+    /// KV regions are sized by `n_ctx`, clamped to the model's `max_seq_len`
+    /// (llama.cpp clamps `n_ctx` the same way); single-shot previously used the
+    /// full `max_seq_len` unconditionally (40960 on Qwen3-4B → 12.1 GB of f32
+    /// KV buffers + a ~275 ms first-submit Metal tax, see
+    /// docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). Server / multi-slot code must
+    /// call [`Qwen3Graph::forward_cached`] with a slot-scoped cache instead.
     pub fn forward(
         model: &Qwen3Model,
         tokens: &[u32],
         positions: &[usize],
         _kv: &mut KVCache,
         n_out: usize,
+        n_ctx: usize,
     ) -> Vec<f32> {
+        let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);
         let mut guard = graph_cache().lock().unwrap();
         Self::forward_cached(
             model, tokens, positions, n_out,
-            model.hparams.max_seq_len as usize, &mut guard,
+            n_ctx, &mut guard,
         )
     }
 
