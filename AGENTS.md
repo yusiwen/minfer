@@ -188,3 +188,4 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
 | **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |
+| **CLI multi-turn conversation plan (append-only KV + incremental template diff)** | `docs/CLI-CONVERSATION-PLAN.md` |
