@@ -594,6 +594,7 @@ mod tests {
     /// so a loose tolerance + greedy-token equality is the criterion).
     #[test]
     fn graph_metal_matches_cpu_logits() {
+        let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("not macOS; skipping");
@@ -637,6 +638,7 @@ mod tests {
     /// Phase 3: full layer-0 path on Metal vs CPU (embed/rms/matmul/rope/kv/attn).
     #[test]
     fn graph_metal_layer0_isolation() {
+        let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("not macOS; skipping");
@@ -746,6 +748,7 @@ mod tests {
     /// Real model layer-0 K matmul: Metal vs CPU (isolates weight offset/data).
     #[test]
     fn graph_metal_real_wk_matmul() {
+        let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("not macOS; skipping");

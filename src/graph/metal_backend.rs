@@ -489,6 +489,7 @@ mod tests {
     /// GPU graph (silu + add) must match the CPU graph bit-for-bit.
     #[test]
     fn metal_elementwise_matches_cpu() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(backend) = MetalBackend::new() else {
             eprintln!("MPS unavailable; skipping");
@@ -536,6 +537,7 @@ mod tests {
     /// rms_norm on Metal must match CPU within float tolerance.
     #[test]
     fn metal_rmsnorm_matches_cpu() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         // register a norm weight on MPS (name must resolve in weight_buf)
@@ -580,6 +582,7 @@ mod tests {
     /// Cross-backend copies: silu on Metal, input/add on CPU.
     #[test]
     fn metal_cross_backend_copy() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let mut gb = GraphBuilder::new();
@@ -621,6 +624,7 @@ mod tests {
     /// Real-scale matmul (Q8_0 weight, 896×128 like wk): Metal vs CPU.
     #[test]
     fn metal_matmul_q8_matches_cpu() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let od = 128usize; // output dim
@@ -680,14 +684,33 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(m).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
-        eprintln!("[matmul q8] Metal vs manual-Q8x f32 max diff {maxd:.3e}");
-        assert!(maxd < 1e-3, "matmul Metal diverges from Q8_0xf32 reference: {maxd:.3e}");
+        let mut worst = 0usize;
+        let mut nonzero = 0usize;
+        for i in 0..got.len() {
+            let d = (got[i] - expect[i]).abs();
+            if got[i] != 0.0 {
+                nonzero += 1;
+            }
+            if d > maxd {
+                maxd = d;
+                worst = i;
+            }
+        }
+        eprintln!("[matmul q8] Metal vs manual-Q8x f32 max diff {maxd:.3e} (nonzero {nonzero}/{})", got.len());
+        assert!(
+            maxd < 1e-3,
+            "matmul Metal diverges from Q8_0xf32 reference: {maxd:.3e} (worst idx {worst} (t={}, o={}): got {} expect {})",
+            worst / od,
+            worst % od,
+            got[worst],
+            expect[worst]
+        );
     }
 
     /// rms_norm at REAL scale (d=896, nt=8, like attn_norm) Metal vs CPU.
     #[test]
     fn metal_rmsnorm_real_scale() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let d = 896usize;
@@ -730,6 +753,7 @@ mod tests {
     /// Cross-backend copy at scale: silu of [896, 8] on Metal.
     #[test]
     fn metal_cross_backend_copy_large() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let d = 896usize;
@@ -769,6 +793,7 @@ mod tests {
     /// cross-backend copy of the embed output in between.
     #[test]
     fn metal_embed_then_rmsnorm_cross_backend() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let ne = 32usize;
@@ -832,6 +857,7 @@ mod tests {
     /// Multiple Metal nodes alternating with CPU nodes (multi-split sync/copy).
     #[test]
     fn metal_multi_split_alternation() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let d = 64usize;
@@ -887,6 +913,7 @@ mod tests {
     /// Metal KV store + GQA attention vs CPU (F32 inputs, bit-exact check).
     #[test]
     fn metal_attn_kv_matches_cpu() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let mut gb = GraphBuilder::new();
@@ -938,6 +965,7 @@ mod tests {
     /// Real Q4_0 matmul (layer-0 wq: [896, 896]) Metal vs manual reference.
     #[test]
     fn metal_matmul_q4_matches_reference() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let od = 896usize;
@@ -1017,6 +1045,7 @@ mod tests {
     /// nkt=128, nt=30) vs CPU.
     #[test]
     fn metal_attn_kv_real_scale() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);
@@ -1072,6 +1101,7 @@ mod tests {
     /// Metal decode-step attention: nt=1 with 30 already-stored KV rows.
     #[test]
     fn metal_attn_decode_step() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);
@@ -1132,6 +1162,7 @@ mod tests {
     /// KV store whose K input is a GPU-computed op (silu) — not host-filled.
     #[test]
     fn metal_store_after_gpu_op() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let mut gb = GraphBuilder::new();
@@ -1181,6 +1212,7 @@ mod tests {
     /// KV store+attn at REAL dims (nkt=128, n_ctx=32768, nt=30) hand-filled.
     #[test]
     fn metal_store_real_dims() {
+        let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
         let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);

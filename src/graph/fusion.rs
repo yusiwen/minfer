@@ -198,6 +198,7 @@ mod tests {
 
     #[test]
     fn bias_rope_fusion_gated_by_metal_only() {
+        let _g = crate::metal::metal_test_lock();
         // pattern: rope(add(x, bias), pos)
         let mut b = GraphBuilder::new();
         let x = b.input("x", [8, 4, 1, 1], DType::F32);

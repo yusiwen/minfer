@@ -10,6 +10,25 @@ use metal::objc::{msg_send, sel, sel_impl};
 
 static MPS: OnceLock<Option<MpsState>> = OnceLock::new();
 
+/// Serialize Metal-touching tests.
+///
+/// Parallel test threads submitting to the same MTLCommandQueue can make the
+/// GPU intermittently drop kernel writes — observed on Apple M4 Pro as
+/// `kernel_q8_0_f32_matmul_multi` losing whole threadgroup rows (two adjacent
+/// output rows stay 0) while the command buffer still reports Completed, when
+/// the heavy `prefill_gemm_throughput_profile` test (50-kernel batches, up to
+/// ~700 MB of buffers per case) is running concurrently. Product code is
+/// single-worker serial and never submits concurrently, so this is a
+/// test-only guard: every test that touches MPS takes the lock.
+#[cfg(test)]
+pub(crate) fn metal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // Tolerate poisoning: the guard only serializes GPU access (no shared data),
+    // and a panicking test (e.g. the pre-existing q4 overflow) would otherwise
+    // poison the lock for every later test.
+    LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Print a clear error for an unsafe/unsupported GPU configuration and exit.
 /// All GPU safety guards (dimension misalignment, device-limit overruns,
 /// kernel-array overflow) abort here so the user knows the GPU path cannot run
@@ -2387,6 +2406,7 @@ mod tests {
     /// This test compiles every pipeline and fails if MPS is unavailable.
     #[test]
     fn metal_pipelines_compile() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         assert!(
             MpsState::get().is_some(),
@@ -2403,6 +2423,7 @@ mod tests {
     /// specific matmul (output/QKV/O/GU/down) is far below the ~200 GB/s floor.
     #[test]
     fn matmul_bandwidth_profile() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         let mps = MpsState::get().expect("MPS must be active for the bandwidth profile");
         let dev = &mps.inner.device;
@@ -2499,6 +2520,7 @@ mod tests {
     /// kernel, measures twice, and reports per-kernel GPU time in us.
     #[test]
     fn non_matmul_bandwidth_profile() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         let mps = MpsState::get().expect("MPS must be active");
         let dev = &mps.inner.device;
@@ -2605,6 +2627,7 @@ mod tests {
     /// must be byte-deterministic before it touches the decode path.
     #[test]
     fn rms_norm_256_correctness() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         let mps = MpsState::get().expect("MPS must be active");
         let dev = &mps.inner.device;
@@ -2675,6 +2698,7 @@ mod tests {
     /// using REAL dumped layer-0 activations (q, k, v). P1.
     #[test]
     fn attn_parallel_realdata_correctness() {
+        let _g = crate::metal::metal_test_lock();
         use std::io::Read;
         let dir = std::env::var("MINFER_TEST_DUMP").unwrap_or_else(|_| "/tmp/dp3".into());
         let mut bq = Vec::new();
@@ -2741,6 +2765,7 @@ mod tests {
     /// scalar reference (the exact algorithm in forward.rs::gqa_attn). P1.
     #[test]
     fn attn_parallel_prefill_correctness() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         let mps = MpsState::get().expect("MPS must be active");
         let dev = &mps.inner.device;
@@ -2819,6 +2844,7 @@ mod tests {
     /// bandwidth-bound or latency/occupancy-bound vs llama.
     #[test]
     fn prefill_gemm_throughput_profile() {
+        let _g = crate::metal::metal_test_lock();
         MpsState::init();
         let mps = MpsState::get().expect("MPS must be active");
         let dev = &mps.inner.device;
@@ -2896,6 +2922,7 @@ mod tests {
 mod mmap_align_test {
     #[test]
     fn nocopy_alignment_probe() {
+        let _g = crate::metal::metal_test_lock();
         let dev = metal::Device::system_default().unwrap();
         // A 16-aligned Vec base + 32 → 32-aligned, NOT 256-aligned
         let mut backing = vec![0u8; 8192 + 64];

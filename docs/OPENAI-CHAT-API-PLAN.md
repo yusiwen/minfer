@@ -65,6 +65,21 @@
 >   truncation, concurrent requests (serialized by the worker), context overflow → 400
 >   `exceed_context_size_error`, unknown role → 400 `invalid_request_error`.
 > - `cargo test`: 117 passed; 2 pre-existing Metal/env failures unrelated.
+>
+> **Revision 6 (2026-08-22) — Metal test concurrency fix.** The intermittently failing
+> `metal_matmul_q8_matches_cpu` test was chased to a GPU-level race:
+> - **Root cause:** parallel test threads submitting to the same `MTLCommandQueue` can make the GPU
+>   intermittently drop kernel writes — `kernel_q8_0_f32_matmul_multi` lost whole threadgroup rows
+>   (two adjacent output rows stayed 0; max diff ~40, not float noise) while the command buffer still
+>   reported `Completed`. The trigger was the heavy `prefill_gemm_throughput_profile` test (50-kernel
+>   batches, up to ~700 MB of buffers per case) running concurrently. Reproduced deterministically as
+>   q8 + prefill_gemm; bisected to that pair; GEMM-disabled still flaky (1/3); a delayed re-read of the
+>   buffer returned identical values (not a CPU read-cache issue).
+> - **Fix (test-only):** `crate::metal::metal_test_lock()` — a global poison-tolerant Mutex guard that
+>   every Metal-touching test takes, serializing GPU submission across tests. Product code is
+>   single-worker serial and never submits concurrently, so it is unaffected.
+> - **Verification:** metal group 3/3 green (was 1/3), full suite 117 passed twice, integration tests
+>   (`tests/*.rs`, which build their own device/queue) unaffected.
 
 ---
 
