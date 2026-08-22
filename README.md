@@ -216,7 +216,9 @@ In-conversation commands: `/exit` `/quit`, `/clear`, `/regen` (regenerate the
 last reply), `/help`; EOF (Ctrl+D) exits. Flags: `-st/--single-turn`,
 `--system <STR>`, `-mli/--multiline-input`, `--color on|off|auto`,
 `--session <FILE>` (save/load the conversation history as JSON; on overflow the
-oldest turns are dropped automatically and generation continues).
+oldest turns are dropped automatically and generation continues). Qwen3-style
+`<think>…</think>` reasoning blocks are gray-highlighted (single-shot mode too,
+when stdout is a terminal or `MINFER_COLOR=1`).
 
 **OpenAI-compatible HTTP server** (`--server`):
 

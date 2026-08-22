@@ -556,6 +556,19 @@ fn main() {
     // t0/t1 are (re)assigned at the top of each loop iteration before use.
     let (mut t0, mut t1);
 
+    // Gray-highlight the Qwen3 `<think>…</think>` reasoning block so it reads
+    // apart from the answer. Only when stdout is a terminal (no ANSI in pipes);
+    // MINFER_COLOR=1 forces it on (e.g. piping to less -R or a file).
+    let mut hi = ThinkHighlighter::new(
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            || std::env::var("MINFER_COLOR").map_or(false, |v| v == "1"),
+        b"\x1b[0m", // exit think → back to the default answer color
+        |b| {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        },
+    );
+
     while generated.len() < params.n_predict {
         t0 = std::time::Instant::now();
         let sampled = sampler::sample_with_penalties(
@@ -577,15 +590,13 @@ fn main() {
         if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
             full.truncate(cut);
             if cut > emitted {
-                std::io::Write::write_all(&mut std::io::stdout(), &full[emitted..]).unwrap_or(());
-                std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
+                hi.feed(&full[emitted..]);
                 emitted = full.len();
             }
             break;
         }
         if emitted < full.len() {
-            std::io::Write::write_all(&mut std::io::stdout(), &full[emitted..]).unwrap_or(());
-            std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
+            hi.feed(&full[emitted..]);
             emitted = full.len();
         }
 
@@ -596,11 +607,13 @@ fn main() {
         if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
     }
-    // Final flush of any bytes not yet written.
+    // Final flush of any bytes not yet written (incl. a dangling partial
+    // <think> marker, emitted raw).
     if emitted < full.len() {
-        std::io::Write::write_all(&mut std::io::stdout(), &full[emitted..]).unwrap_or(());
-        std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
+        hi.feed(&full[emitted..]);
+        emitted = full.len();
     }
+    hi.finish();
 
     if timing {
         eprintln!("\n[MINFER_TIMING] over {n_tok} tokens: sample {:>6.2} ms/tok ({:>4.1}%), forward {:>6.2} ms/tok ({:>4.1}%)",
@@ -625,6 +638,89 @@ fn main() {
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
     id == special.eos || Some(id) == special.im_end
+}
+
+/// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning
+/// stands apart from the normal answer. Streaming-safe: the markers may be
+/// split across arbitrary token/chunk boundaries. `exit_code` restores the
+/// color that follows the think block (conversation mode: the green answer
+/// wrap `\x1b[32m`; plain mode: reset `\x1b[0m`). With color disabled the
+/// sink sees the raw bytes unchanged.
+struct ThinkHighlighter<F: FnMut(&[u8])> {
+    sink: F,
+    color: bool,
+    exit_code: &'static [u8],
+    pending: Vec<u8>,
+    in_think: bool,
+}
+
+impl<F: FnMut(&[u8])> ThinkHighlighter<F> {
+    const OPEN: &'static [u8] = b"<think>";
+    const CLOSE: &'static [u8] = b"</think>";
+    const GRAY: &'static [u8] = b"\x1b[90m";
+
+    fn new(color: bool, exit_code: &'static [u8], sink: F) -> Self {
+        Self { sink, color, exit_code, pending: Vec::new(), in_think: false }
+    }
+
+    fn feed(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+        self.drain_pending();
+    }
+
+    /// Flush any remaining bytes (call once at the end of a turn). Also
+    /// restores the exit color if the stream ended inside a `<think>` block
+    /// (e.g. n_predict cut the reasoning mid-way) so no color state leaks.
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            let bytes = std::mem::take(&mut self.pending);
+            self.emit(&bytes);
+        }
+        if self.color && self.in_think {
+            self.emit(self.exit_code);
+            self.in_think = false;
+        }
+    }
+
+    fn drain_pending(&mut self) {
+        loop {
+            let marker = if self.in_think { Self::CLOSE } else { Self::OPEN };
+            let Some(pos) = find_subslice(&self.pending, marker) else {
+                // No marker yet: emit everything except the tail that could be
+                // a marker prefix (e.g. "<thin"), keep that for the next chunk.
+                let keep = marker.len().saturating_sub(1);
+                let cut = self.pending.len().saturating_sub(keep);
+                if cut > 0 {
+                    let body = self.pending[..cut].to_vec();
+                    self.pending.drain(..cut);
+                    self.emit(&body);
+                }
+                return;
+            };
+            if pos > 0 {
+                let body = self.pending[..pos].to_vec();
+                self.emit(&body);
+            }
+            // switch color, emit the marker itself in the new color
+            if self.color {
+                self.emit(if self.in_think { self.exit_code } else { Self::GRAY });
+            }
+            self.emit(marker);
+            self.pending.drain(..pos + marker.len());
+            self.in_think = !self.in_think;
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) {
+        (self.sink)(bytes);
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // === Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md Phase 2) ===
@@ -784,10 +880,12 @@ fn run_conversation(
                         std::io::stdout().flush().unwrap_or(());
                     }
                     let t0 = Instant::now();
-                    let r = conv.regen_turn(&*tokenizer, &tp, &mut engine, &mut |b| {
+                    let mut hi = ThinkHighlighter::new(color_on, b"\x1b[32m", |b| {
                         let _ = std::io::stdout().write_all(b);
                         let _ = std::io::stdout().flush();
                     });
+                    let r = conv.regen_turn(&*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+                    hi.finish();
                     if color_on {
                         print!("\x1b[0m");
                         std::io::stdout().flush().unwrap_or(());
@@ -819,10 +917,12 @@ fn run_conversation(
             std::io::stdout().flush().unwrap_or(());
         }
         let t0 = Instant::now();
-        let result = conv.user_turn(&input, &*tokenizer, &tp, &mut engine, &mut |b| {
+        let mut hi = ThinkHighlighter::new(color_on, b"\x1b[32m", |b| {
             let _ = std::io::stdout().write_all(b);
             let _ = std::io::stdout().flush();
         });
+        let result = conv.user_turn(&input, &*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+        hi.finish();
         if color_on {
             print!("\x1b[0m");
             std::io::stdout().flush().unwrap_or(());
@@ -968,4 +1068,72 @@ fn get_chat_template(data: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod think_highlighter_tests {
+    use super::*;
+
+    fn run(color: bool, exit: &'static [u8], chunks: &[&[u8]]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut hi = ThinkHighlighter::new(color, exit, |b| out.extend_from_slice(b));
+        for c in chunks {
+            hi.feed(c);
+        }
+        hi.finish();
+        out
+    }
+
+    #[test]
+    fn colors_think_block_gray() {
+        let out = run(true, b"\x1b[32m", &[b"<think>abc</think>def"]);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[90m<think>abc\x1b[32m</think>def");
+    }
+
+    #[test]
+    fn markers_split_across_chunks() {
+        // <think> split 3 ways, </think> split 2 ways, trailing answer split.
+        let out = run(
+            true, b"\x1b[0m",
+            &[b"<thi", b"nk>one two</th", b"ink>answer ", b"tail"],
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[90m<think>one two\x1b[0m</think>answer tail");
+    }
+
+    #[test]
+    fn multiple_think_blocks() {
+        let out = run(true, b"\x1b[0m", &[b"<think>a</think><think>b</think>c"]);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[90m<think>a\x1b[0m</think>\x1b[90m<think>b\x1b[0m</think>c");
+    }
+
+    #[test]
+    fn no_marker_passthrough() {
+        let out = run(true, b"\x1b[0m", &[b"plain text", b" more"]);
+        assert_eq!(out, b"plain text more");
+    }
+
+    #[test]
+    fn color_off_passthrough() {
+        let chunks: Vec<&[u8]> = vec![b"<think>", b"secret</think>", b"visible"];
+        let out = run(false, b"\x1b[0m", &chunks);
+        assert_eq!(out, b"<think>secret</think>visible");
+    }
+
+    #[test]
+    fn unclosed_think_flushed_raw() {
+        let out = run(true, b"\x1b[0m", &[b"<think>never closed"]);
+        let s = String::from_utf8(out).unwrap();
+        // gray switched on, content emitted, and finish() restores the exit
+        // color so no gray leaks into the trailing stats lines
+        assert_eq!(s, "\x1b[90m<think>never closed\x1b[0m");
+    }
+
+    #[test]
+    fn unclosed_think_color_off_passthrough() {
+        let out = run(false, b"\x1b[0m", &[b"<think>never closed"]);
+        assert_eq!(out, b"<think>never closed");
+    }
 }

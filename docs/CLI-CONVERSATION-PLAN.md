@@ -358,6 +358,9 @@ UX（对齐 llama.cpp）：
 
 - 提示符 `> `（assistant 回合结束打印 `\n> `）；
 - 颜色：assistant 输出 / 用户输入 / 提示符三色，`--color auto`（tty 检测）；
+- Qwen3 `<think>…</think>` 推理块灰色高亮（`ThinkHighlighter`，流式安全：标记可跨
+  token 切分）：进入 `\x1b[90m` 灰、退出恢复 assistant 色（conv 模式绿色；普通模式
+  默认色，tty 或 `MINFER_COLOR=1` 时启用，管道输出零 ANSI）；
 - Ctrl+C：生成中第一次 → 打断（`need_insert_eot = true`）；空闲时 → 退出（exit 130）；
 - `-mli/--multiline-input`：多行输入（MVP 可简化为空行提交；`\` 续行属细化项）。
 
