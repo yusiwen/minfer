@@ -115,6 +115,7 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
 | Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~42 tok/s) | hd=128, split GGUF, graph path verified end-to-end |
 | Q8_0 (qwen3-0.6b-instruct-q8_0) | ✓ | ✓ (~215 tok/s) | Dense Qwen3: decoupled head dim (128) + per-head Q/K RMSNorm (`Op::QkNorm`); greedy 60-token sequence identical to llama.cpp (same GGUF, temp 0, no penalties); hd=128, kv dim 1024 |
+| Q4_K_M (qwen3-4b-instruct-q4_k_m) | ✓ | ✓ (~78 tok/s) | Q4_K/Q6_K mixed, 36 layers, hd=128 (decoupled from 2560/32=80), kv dim 1024; greedy 40-token sequence identical to llama.cpp on CPU and Metal |
 
 ## GPU Safety
 
