@@ -183,6 +183,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | **Compute graph design + rewrite plan + implementation record (per-phase commits)** | `docs/GRAPH-REFACTOR-PLAN.md` |
 | llama.cpp compute-graph design analysis (ggml_cgraph / scheduler / reuse) | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
+| objc 0.2 vs objc2 ecosystem — why block is vendored, nix devShell xcrun fix, migration path | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations | `docs/CPU_OPTIMIZATIONS.md` |
 | CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
