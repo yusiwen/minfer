@@ -983,8 +983,12 @@ mod tests {
                 let d = if amax == 0.0 { 0.0f32 } else { amax / 127.0 };
                 wbytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
                 for j in 0..16 {
-                    let q0 = ((blk[j] / d).round() as i8 + 8).clamp(0, 15) as u8;
-                    let q1 = ((blk[j + 16] / d).round() as i8 + 8).clamp(0, 15) as u8;
+                    // Q4_0 quantize: q = round(v/d) + 8 in [0,15]. Use i32 for
+                    // the +8 offset — v/d can reach ±127 when the row's amax is
+                    // near 1 (d = amax/127), so an i8 intermediate overflows
+                    // (127+8 > i8::MAX) and panics in debug builds.
+                    let q0 = ((blk[j] / d).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((blk[j + 16] / d).round() as i32 + 8).clamp(0, 15) as u8;
                     wbytes.push(q0 | (q1 << 4));
                 }
             }

@@ -23,7 +23,7 @@
 >   queue; the rev-1 error table contradicted its own lifecycle section.
 >
 > **Revision 3 (2026-08-22) — Phase 0 implemented.** Architecture prerequisites are done, each with
-> tests (`cargo test` green apart from two pre-existing Metal/environment failures):
+> tests (green; the two failures noted in later revisions were fixed in rev 7):
 > - `Tokenizer::decode_bytes(&[u32]) -> Vec<u8>` + `complete_utf8_prefix_len` (no lossy conversion;
 >   unit tests incl. a CJK char split across tokens).
 > - `Qwen2Graph::forward_cached(model, tokens, positions, n_out, n_ctx, &mut GraphCache)` — the
@@ -64,7 +64,8 @@
 > - Smoke-tested with curl: non-streaming JSON shape, SSE role→content→finish→`[DONE]`, stop-string
 >   truncation, concurrent requests (serialized by the worker), context overflow → 400
 >   `exceed_context_size_error`, unknown role → 400 `invalid_request_error`.
-> - `cargo test`: 117 passed; 2 pre-existing Metal/env failures unrelated.
+> - `cargo test`: 117 passed at the time; the 2 remaining failures were later root-caused and fixed
+>   (rev 7) — the suite is fully green.
 >
 > **Revision 6 (2026-08-22) — Metal test concurrency fix.** The intermittently failing
 > `metal_matmul_q8_matches_cpu` test was chased to a GPU-level race:
@@ -80,6 +81,16 @@
 >   single-worker serial and never submits concurrently, so it is unaffected.
 > - **Verification:** metal group 3/3 green (was 1/3), full suite 117 passed twice, integration tests
 >   (`tests/*.rs`, which build their own device/queue) unaffected.
+>
+> **Revision 7 (2026-08-22) — the two "pre-existing" failures are fixed; the suite is fully green.**
+> - `metal_matmul_q4_matches_reference` was a **real test-code bug**, not an environment issue: the
+>   Q4_0 quantizer used an `i8` intermediate (`(v/d).round() as i8 + 8`), which overflows (127+8 >
+>   i8::MAX) whenever a weight row's amax approaches 1 (d = amax/127) — debug builds panicked, release
+>   builds silently wrapped to garbage-but-self-consistent weights. Fixed with an `i32` intermediate;
+>   the Metal-vs-reference comparison now actually runs and passes.
+> - `attn_parallel_realdata_correctness` panicked on missing fixture files (`/tmp/dp3` layer-0 dumps
+>   from a debug_dump run); it now skips cleanly when absent, like the other fixture-dependent tests.
+> - `cargo test`: **119 passed, 0 failed** (twice), plus 11 integration tests — no skips needed.
 
 ---
 
