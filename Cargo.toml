@@ -9,7 +9,7 @@ regex = "1"
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-minijinja = { version = "2", default-features = false, features = ["builtins"] }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 
 # OpenAI-compatible HTTP server (OPENAI-CHAT-API-PLAN.md, Phase 2+)
 axum = "0.7"
@@ -31,3 +31,16 @@ required-features = ["cuda"]
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.28"
 block = "0.1.6"
+
+# objc 0.2.7 (pulled in by metal) expands `#[cfg_attr(feature = "cargo-clippy", …)]`
+# inside its `sel_impl` macro, which rustc flags as an unexpected `feature` cfg in
+# this crate's context (the macro's cfg is evaluated against the destination crate).
+# objc 0.2.7 is the latest published version, so allow that one value explicitly.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+# Vendored one-line fix for `block` 0.1.6 (rust-lang/rust#74840: static of
+# uninhabited type — a hard error in future rustc; upstream unmaintained).
+# See vendor/block/README.md. metal 0.28 and minfer both resolve to this copy.
+[patch.crates-io]
+block = { path = "vendor/block" }
