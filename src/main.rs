@@ -10,7 +10,6 @@ mod graph;
 mod sampler;
 mod tokenizer;
 mod template;
-#[allow(dead_code)] // conversation 模块在 Phase 2（--cnv CLI 接线）被 main 使用
 mod conversation;
 mod cache;
 mod models;
@@ -24,6 +23,21 @@ mod server;
 
 use std::time::Instant;
 use rand::SeedableRng;
+
+/// Conversation-mode color behavior (CLI-CONVERSATION-PLAN.md §5.6).
+#[derive(Clone, Copy, PartialEq)]
+enum ColorMode { On, Off, Auto }
+
+impl ColorMode {
+    fn enabled(self) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            ColorMode::On => true,
+            ColorMode::Off => false,
+            ColorMode::Auto => std::io::stdout().is_terminal() && std::io::stderr().is_terminal(),
+        }
+    }
+}
 
 struct GenParams {
     n_predict: usize,
@@ -79,6 +93,11 @@ fn print_usage(prog: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  --meta               print GGUF metadata and key tensors");
     eprintln!("  --no-template        use the raw prompt without the chat template");
+    eprintln!("  --cnv, --conversation   multi-turn conversation mode (interactive REPL)");
+    eprintln!("  -st, --single-turn   conversation: run one turn, then exit");
+    eprintln!("  --system <STR>       conversation: system prompt");
+    eprintln!("  -mli, --multiline-input   conversation: submit input on an empty line");
+    eprintln!("  --color [on|off|auto]     conversation: color output (default auto = tty)");
     eprintln!("  --temp <T>           sampling temperature (default 0.8; 0 = greedy)");
     eprintln!("  --greedy             greedy decoding (--temp 0)");
     eprintln!("  --top-k <K>          top-K sampling (default 40)");
@@ -104,6 +123,12 @@ fn main() {
     let mut params = GenParams::default();
     let mut meta_flag = false;
     let mut no_template = false;
+    // Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md, Phase 2).
+    let mut conv_mode = false;
+    let mut single_turn = false;
+    let mut system_prompt: Option<String> = None;
+    let mut multiline_input = false;
+    let mut color_mode = ColorMode::Auto;
     // `--graph` is accepted for compatibility; the graph path is now the
     // default forward (Phase 6).
     let _graph_mode = false;
@@ -153,6 +178,26 @@ fn main() {
             }
             "--meta" => { meta_flag = true; i += 1; }
             "--no-template" => { no_template = true; i += 1; }
+            "--cnv" | "--conversation" => { conv_mode = true; i += 1; }
+            "-st" | "--single-turn" => { single_turn = true; i += 1; }
+            "--system" => {
+                if let Some(v) = next_val(a) {
+                    system_prompt = Some(v);
+                }
+                i += 2;
+            }
+            "-mli" | "--multiline-input" => { multiline_input = true; i += 1; }
+            "--color" => {
+                if let Some(v) = next_val(a) {
+                    color_mode = match v.as_str() {
+                        "on" => ColorMode::On,
+                        "off" => ColorMode::Off,
+                        "auto" => ColorMode::Auto,
+                        _ => { parse_err = Some(format!("invalid --color '{v}' (on|off|auto)")); ColorMode::Auto }
+                    };
+                }
+                i += 2;
+            }
             "--greedy" => { params.temp = 0.0; i += 1; }
             "--temp" | "-t" => {
                 if let Some(v) = next_val(a) {
@@ -301,6 +346,14 @@ fn main() {
 
     let model_path = &positional[0];
 
+    // Conversation mode needs the chat template (ChatML fallback included);
+    // --no-template would leave the history unformatted.
+    if conv_mode && no_template {
+        eprintln!("Error: --cnv conflicts with --no-template (conversation needs the chat template)");
+        print_usage(&prog);
+        std::process::exit(1);
+    }
+
     // Resolve paths, hf:/ollama: URIs, and cached model names.
     let is_uri = model_path.starts_with("hf:")
         || model_path.starts_with("ollama:")
@@ -314,7 +367,18 @@ fn main() {
         }
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
-    let prompt = if positional.len() > 1 { positional[1..].join(" ") } else {
+    // Conversation mode: the positional prompt is the FIRST user turn; stdin
+    // is read interactively by the loop (never consume it here).
+    let first_prompt = if conv_mode && positional.len() > 1 {
+        Some(positional[1..].join(" "))
+    } else {
+        None
+    };
+    let prompt = if positional.len() > 1 {
+        positional[1..].join(" ")
+    } else if conv_mode {
+        String::new()
+    } else {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap_or(0);
         input.trim().to_string()
@@ -377,6 +441,22 @@ fn main() {
             model_path, server_n_ctx, server_n_slots);
         server::run(model, tokenizer, &gguf_model, server_port, server_n_ctx, server_n_slots);
         return;
+    }
+
+    // === Multi-turn conversation mode (--cnv) ===
+    if conv_mode {
+        let code = run_conversation(
+            model,
+            &tokenizer,
+            &gguf_model.parts[0].data,
+            &params,
+            system_prompt,
+            single_turn,
+            multiline_input,
+            color_mode,
+            first_prompt,
+        );
+        std::process::exit(code);
     }
 
     // === Chat template (need tokenizer for bos_token text) ===
@@ -528,6 +608,198 @@ fn main() {
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
     id == special.eos || Some(id) == special.im_end
+}
+
+// === Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md Phase 2) ===
+
+/// 读一行用户输入。多行模式（-mli）下累积直到空行提交；EOF 时提交已输入内容或返回 None。
+fn read_user_input(multiline: bool) -> Option<String> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).ok()? == 0 {
+            // EOF（Ctrl+D）
+            return if buf.is_empty() { None } else { Some(buf) };
+        }
+        let line = line.trim_end_matches(['\n', '\r']).to_string();
+        if !multiline {
+            return Some(line);
+        }
+        if line.is_empty() {
+            return Some(buf); // 空行提交
+        }
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&line);
+    }
+}
+
+/// 交互式多轮对话循环（--cnv）。
+/// 追加式 KV + 增量模板渲染：`Conversation` 状态机 + `GraphEngine` 推理引擎。
+fn run_conversation(
+    model: Box<dyn models::ModelDef>,
+    tokenizer: &tokenizer::Tokenizer,
+    gguf_data: &[u8],
+    params: &GenParams,
+    system_prompt: Option<String>,
+    single_turn: bool,
+    multiline: bool,
+    color_mode: ColorMode,
+    first_prompt: Option<String>,
+) -> i32 {
+    use std::io::Write;
+    use crate::conversation::Engine as _; // reset_cache / forward trait methods
+
+    let template = get_chat_template(gguf_data);
+    let special = model.special_tokens();
+    let bos_text = tokenizer
+        .id_to_token
+        .get(tokenizer.bos_token as usize)
+        .cloned()
+        .unwrap_or_default();
+    let eog = {
+        let mut v = vec![special.eos];
+        if let Some(im) = special.im_end {
+            v.push(im);
+        }
+        v
+    };
+    let eot = special.im_end.unwrap_or(special.eos);
+
+    let spec = conversation::ConversationSpec {
+        template,
+        bos_text,
+        eog,
+        eot,
+        seed: params.seed,
+        n_ctx: params.n_ctx,
+        system_prompt,
+    };
+    let mut conv = conversation::Conversation::new(spec);
+    let mut engine = conversation::GraphEngine::new(&*model, params.n_ctx);
+    let tp = conversation::TurnParams {
+        n_predict: params.n_predict,
+        temp: params.temp,
+        top_k: params.top_k,
+        top_p: params.top_p,
+        repeat_penalty: params.repeat_penalty,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+        stop_strings: params.stop_strings.clone(),
+    };
+    let color_on = color_mode.enabled();
+    let mut turn = 0usize;
+
+    let mut pending = first_prompt;
+    loop {
+        if pending.is_none() {
+            // 提示符 + flush（管道化测试的前置条件，见文档 §8.3）。
+            if color_on {
+                print!("\x1b[1;36m");
+            }
+            print!("> ");
+            if color_on {
+                print!("\x1b[0m");
+            }
+            std::io::stdout().flush().unwrap_or(());
+            let Some(input) = read_user_input(multiline) else { break };
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                continue;
+            }
+            pending = Some(input);
+        }
+        let input = pending.take().unwrap();
+
+        // Slash 命令。
+        if input.starts_with('/') {
+            let cmd = input.split_whitespace().next().unwrap_or("");
+            match cmd {
+                "/exit" | "/quit" => break,
+                "/help" => {
+                    println!("\ncommands:");
+                    println!("  /exit, /quit   exit (Ctrl+D / EOF also exits)");
+                    println!("  /clear         clear the chat history");
+                    println!("  /regen         regenerate the last assistant reply");
+                    println!("  /help          this help");
+                    continue;
+                }
+                "/clear" => {
+                    conv.clear();
+                    engine.reset_cache();
+                    println!("\n[history cleared]");
+                    continue;
+                }
+                "/regen" => {
+                    if color_on {
+                        print!("\x1b[32m");
+                        std::io::stdout().flush().unwrap_or(());
+                    }
+                    let t0 = Instant::now();
+                    let r = conv.regen_turn(&*tokenizer, &tp, &mut engine, &mut |b| {
+                        let _ = std::io::stdout().write_all(b);
+                        let _ = std::io::stdout().flush();
+                    });
+                    if color_on {
+                        print!("\x1b[0m");
+                        std::io::stdout().flush().unwrap_or(());
+                    }
+                    match r {
+                        Ok(out) => {
+                            turn += 1;
+                            println!();
+                            eprintln!("[turn {turn}] regen: prefill {} tokens, generated {} tokens in {:.2}s",
+                                out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                        }
+                        Err(e) => eprintln!("\n[regen failed: {e}]"),
+                    }
+                    if single_turn {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {
+                    eprintln!("unknown command '{cmd}' — try /help");
+                    continue;
+                }
+            }
+        }
+
+        // 普通用户回合。
+        if color_on {
+            print!("\x1b[32m");
+            std::io::stdout().flush().unwrap_or(());
+        }
+        let t0 = Instant::now();
+        let result = conv.user_turn(&input, &*tokenizer, &tp, &mut engine, &mut |b| {
+            let _ = std::io::stdout().write_all(b);
+            let _ = std::io::stdout().flush();
+        });
+        if color_on {
+            print!("\x1b[0m");
+            std::io::stdout().flush().unwrap_or(());
+        }
+        match result {
+            Ok(out) => {
+                turn += 1;
+                println!();
+                eprintln!("[turn {turn}] prefill {} tokens, generated {} tokens in {:.2}s",
+                    out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                if out.hit_n_predict {
+                    eprintln!("[turn {turn}] stopped by n_predict / context limit");
+                }
+            }
+            Err(e) => eprintln!("\n[error] {e}"),
+        }
+        if single_turn {
+            break;
+        }
+    }
+    eprintln!("\n---\nconversation ended after {turn} turn(s)");
+    0
 }
 
 fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {

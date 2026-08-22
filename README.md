@@ -185,6 +185,19 @@ If `prompt` is omitted, reads from stdin. Run `minfer --help` for full options
 (`--meta`, `--no-template`, `--dump-graph <path>` to export the prefill compute
 graph as Graphviz DOT).
 
+**Multi-turn conversation** (`--cnv`, docs/CLI-CONVERSATION-PLAN.md): append-only
+KV + incremental template rendering — each turn only prefills the new message
+delta, the whole conversation accumulates in the KV cache:
+
+```bash
+cargo run --release -- --cnv qwen2.5-0.5b-instruct-q4_0           # interactive REPL
+cargo run --release -- --cnv -st qwen2.5-0.5b-instruct-q4_0 "hi"  # single turn
+```
+
+In-conversation commands: `/exit` `/quit`, `/clear`, `/regen` (regenerate the
+last reply), `/help`; EOF (Ctrl+D) exits. Flags: `-st/--single-turn`,
+`--system <STR>`, `-mli/--multiline-input`, `--color on|off|auto`.
+
 **Examples:**
 
 ```bash

@@ -22,6 +22,14 @@
 >    不入 stream_tokens/采样窗口，不变量严格成立。
 > 4. **惩罚窗口在 delta 追加后重灌**（llama.cpp 把 prompt token 喂进采样器窗口，等价语义）。
 > 5. `Engine` 增加 `reset_cache()`（全量重灌/`/clear` 用）。
+>
+> **Revision 3 (2026-08-22) — Phase 2 implemented.** CLI 接线（`src/main.rs`）：`--cnv`/`-st`/
+> `--system`/`-mli`/`--color [on|off|auto]`；`--cnv` 与 `--no-template` 互斥报错（模型加载前）；
+> slash 命令 `/exit` `/quit` `/clear` `/regen` `/help`；`> ` 提示符 + flush 纪律；每回合
+> stderr 报告 `[turn N] prefill X tokens, generated Y tokens`（增量性断言用）。README 增补
+> 会话用法。测试：3 个快路径进程级测试（参数校验，默认跑）+ 4 个 `#[ignore]` 真实模型会话测试
+> （`tests/conversation_cli.rs`，stdin 管道脚本化会话；标量 CPU 上 ~10 分钟）。决策点 3 落地：
+> **MVP 不做 Ctrl+C 打断**（EOF 退出；Ctrl+C 走默认终止），信号语义留待后续。
 
 ---
 
@@ -446,6 +454,10 @@ add_generation_prompt, bos_token) -> FormattedDelta{text, prefix_matched}`；`te
   - 真实模型集成冒烟：`#[ignore]`，Qwen2.5-0.5B 2 回合（无 U+FFFD、增量性、位置不越界）。
 
 ### Phase 2：CLI 接线与 UX（`src/main.rs`）
+
+**Status: implemented (rev 3).** 参数/命令/提示符/flush 全部落地（见 Revision 3）；
+进程级测试 `tests/conversation_cli.rs`（3 快 + 4 忽略真实模型）。Ctrl+C 打断按决策点 3
+推迟（EOF 退出）。
 
 - 参数：`--cnv` `-st` `--system` `-mli` `--color`；`--cnv` 与 `--no-template` 互斥校验。
 - slash 命令：`/exit` `/clear` `/regen` `/help`。
