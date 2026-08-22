@@ -24,7 +24,7 @@ src/
 ├── graph/           # ★ declarative compute graph — the inference core (see below)
 ├── gguf.rs          # GGUF v3 parser (~1650 lines, largest file)
 ├── block.rs         # 20+ quantized block types (repr(C), matching ggml-common.h)
-├── avx2.rs          # AVX2 dot product kernels + f32→Q8_0 quantization
+├── avx2.rs          # AVX2 + aarch64 NEON/SDOT dot kernels + Q8_0/Q8_K quantization
 ├── kernel.rs        # Quantized matmul dispatch + CPU scalar fallbacks (+ embed_tokens row getter)
 ├── vec_ops.rs       # SIMD vector ops (RMSNorm, RoPE, Softmax, SiLU)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
@@ -89,7 +89,7 @@ Split (multi-part) GGUF is supported: entry is part 0; `load_gguf_model` parses 
 
 ## Quantization Support
 
-Working: **Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K** (CPU + Metal GPU, see matrix below).
+Working: **Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K** (CPU + Metal GPU, see matrix below). CPU activations: Q8_0 for the simple weight types, **Q8_K for K-quant weights** (llama.cpp's format: 256-element blocks with precomputed bsums).
 Not supported (CLI): Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_NL, etc.
 
 ## GPU Support Matrix
@@ -114,8 +114,8 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ | ✓ | Q5_0/Q8_0/Q4_K/Q6_K mixed |
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
 | Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~42 tok/s) | hd=128, split GGUF, graph path verified end-to-end |
-| Q8_0 (qwen3-0.6b-instruct-q8_0) | ✓ | ✓ (~215 tok/s) | Dense Qwen3: decoupled head dim (128) + per-head Q/K RMSNorm (`Op::QkNorm`); greedy 60-token sequence identical to llama.cpp (same GGUF, temp 0, no penalties); hd=128, kv dim 1024 |
-| Q4_K_M (qwen3-4b-instruct-q4_k_m) | ✓ | ✓ (~78 tok/s) | Q4_K/Q6_K mixed, 36 layers, hd=128 (decoupled from 2560/32=80), kv dim 1024; greedy 40-token sequence identical to llama.cpp on CPU and Metal; KV sized by `--n-ctx` (default 4096, clamped to model context — 40960 would allocate 12.1 GB + ~275 ms first-submit Metal tax, see `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) |
+| Q8_0 (qwen3-0.6b-instruct-q8_0) | ✓ (~160 tok/s) | ✓ (~215 tok/s) | Dense Qwen3: decoupled head dim (128) + per-head Q/K RMSNorm (`Op::QkNorm`); greedy 60-token sequence identical to llama.cpp (same GGUF, temp 0, no penalties); hd=128, kv dim 1024 |
+| Q4_K_M (qwen3-4b-instruct-q4_k_m) | ✓ (~52–58 tok/s, -t 8) | ✓ (~78 tok/s) | Q4_K/Q6_K mixed, 36 layers, hd=128 (decoupled from 2560/32=80), kv dim 1024; greedy 40-token sequence identical to llama.cpp on CPU and Metal; KV sized by `--n-ctx` (default 4096, clamped to model context — 40960 would allocate 12.1 GB + ~275 ms first-submit Metal tax, see `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) |
 
 ## GPU Safety
 
@@ -138,7 +138,7 @@ Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backend
 ## Core Conventions
 
 1. Activations quantized to Q8_0 on-the-fly — all CPU matmuls use Q8_0 quantized activations (Q5_0 → `dot_q5_0_q8_0()`, Q4_K → `dot_q4_k_q8_0()`). Metal reads f32 activations directly for all weight types (Q4_0 included since P1), matching llama.cpp's Metal backend.
-2. AVX2 dispatch: `is_x86_feature_detected!("avx2")` + scalar fallback (ARM Mac always scalar).
+2. AVX2 (x86) / NEON+SDOT (aarch64) dispatch with scalar fallbacks; `MINFER_NO_NEON=1` forces scalar on ARM. SDOT is emitted via inline asm (`vdotq_s32` is unstable in std::arch).
 3. No ML frameworks — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten.
 4. Tensor data uses raw `&[u8]` — avx2.rs dot products operate on byte slices, not structs.
 5. GGUF padding: `ggml_pad()`: `(x + n - 1) & !(n - 1)`.
@@ -167,7 +167,7 @@ Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backend
 
 ## Sampling
 
-`sampler.rs`: repetition penalty → top-k → top-p → temperature, seeded `StdRng`. Defaults match llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`. CLI: `--temp`, `--greedy` (temp=0), `--top-k`, `--top-p`, `--repeat-penalty`, `-n/--n-predict`, `--seed`. Repetition penalty applies to the last 64 tokens (llama `repeat_last_n`): positive logits ÷ penalty, negative ×; alone fixes the 0.5B greedy repetition loops.
+`sampler.rs`: repetition penalty → top-k → top-p → temperature, seeded `StdRng`. Defaults match llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`. CLI: `--temp`, `--greedy` (temp=0), `--top-k`, `--top-p`, `--repeat-penalty`, `-n/--n-predict`, `--seed`, `-t/--threads` (CPU workers, default macOS P-cores; E-cores hurt). Repetition penalty applies to the last 64 tokens (llama `repeat_last_n`): positive logits ÷ penalty, negative ×; alone fixes the 0.5B greedy repetition loops.
 
 ## Dependencies
 
@@ -188,7 +188,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
 | objc 0.2 vs objc2 ecosystem — why block is vendored, nix devShell xcrun fix, migration path | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
-| CPU backend optimizations | `docs/CPU_OPTIMIZATIONS.md` |
+| CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
 | CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
 | Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
 | KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |

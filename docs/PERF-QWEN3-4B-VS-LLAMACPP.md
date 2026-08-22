@@ -24,18 +24,19 @@ same GGUF file, and *why* — measured on the M4 Pro dev machine, 2026-08.
 | **Metal decode** (tg, tok/s) | **75.4–75.9** | **78.6–79.7** | **~95 %** |
 | **Metal prefill, steady-state** (marginal, tok/s) | ~800–1000 | ~900 | ≈ parity |
 | Metal prefill, first request, 241 tok | 552 ms pre-fix → **~370 ms post-fix** (default n_ctx 4096) | 313 ms | 1.76× → ~1.2× wall |
-| **CPU decode** (tok/s) | **1.1** | **61–68** (8–10 threads) | **~60×** |
-| **CPU prefill** (tok/s) | ~1.1 | ~211 | **~190×** |
+| **CPU decode** (tok/s, -t 8) | **1.1 → ~52–58** | 63–68 | **~60× → ~80–90 %** |
+| **CPU prefill** (tok/s) | ~1.1 → **~75** | ~211 | ~190× → ~2.8× |
 
-Post-fix note: the first-request gap was a KV-sizing policy issue (§2), now
+Post-fix notes: the first-request gap was a KV-sizing policy issue (§2), now
 fixed — the 241-token first request drops from 552 ms to ~370 ms
-(241×1.15 + ~106 ms instead of + ~289 ms).
+(241×1.15 + ~106 ms instead of + ~289 ms). The CPU gap (§3) was
+NEON/threading — now ~50× faster, near llama parity.
 
 Bottom line: **on the GPU there is no meaningful gap** — decode is ~95 % of
-llama and prefill is at parity in steady state; the visible first-request
-difference is a KV-size/initialization policy issue, not a kernel issue. The
-**real gap is CPU-only**: minfer is single-threaded and uses scalar (non-NEON)
-dot products. Details below.
+llama and prefill is at parity in steady state; the first-request difference
+was a KV-size policy issue, now fixed. The **CPU gap was closed from ~60× to
+~80–90 % of llama** via NEON/SDOT kernels + a persistent row-parallel pool
+(§3). Remaining items: CPU prefill (~2.9×) and f16 KV cache. Details below.
 
 ## 1. Metal decode: no gap (75.9 vs 79.7 tok/s)
 
@@ -125,27 +126,68 @@ drops from 0.31 s to 0.11 s. Greedy output is byte-identical (KV *content*
 is unchanged — only buffer sizes). `--n-ctx` now also documents as applying to
 single-shot / `--cnv`, not just the server.
 
-## 3. CPU: the real gap — ~60× decode, ~190× prefill
+## 3. CPU: the real gap — ~60× decode, ~190× prefill — FIXED
 
-minfer CPU decode: **1.1 tok/s** (936 ms/token, 99.4 % in `forward()`).
-llama.cpp CPU decode: **61–68 tok/s** (best at `-t 8`; `-t 10` → 60.8;
-`-t 14` *including the 4 E-cores* collapses to 15.9 tok/s — E-cores hurt).
+**Before (baseline)**: minfer CPU decode **1.1 tok/s** (936 ms/token, 99.4 %
+in `forward()`); llama.cpp CPU decode **61–68 tok/s** (best at `-t 8`; `-t 10`
+→ 60.8; `-t 14` *including the 4 E-cores* collapses to 15.9 tok/s — E-cores
+hurt).
 
-The gap decomposes into two compounding causes, both structural:
+The gap decomposed into two compounding causes, both structural:
 
-1. **Single-threaded (×~10)**: minfer's CPU backend has no threading
-   (no rayon, no thread pool — only the HTTP server spawns a worker).
+1. **Single-threaded (×~10)**: minfer's CPU backend had no threading.
    llama.cpp uses 8–10 P-core threads.
 2. **Scalar dot products on ARM (×~5.7 per core)**: minfer's quantized dot
-   kernels are AVX2 (x86) with a **scalar fallback** — on aarch64 there is no
-   SIMD path at all. llama.cpp uses NEON dot kernels (q4_K × q8_1 with
-   int16 accumulate + vectorized activation quantization).
+   kernels were AVX2 (x86) with a **scalar fallback** — no SIMD on aarch64.
 
-Per-core effective bandwidth: llama 166 GB/s ÷ 10 threads ≈ 16.6 GB/s/core vs
-minfer 2.66 GB/s/core → 5.7× per core. 10 × 5.7 ≈ 57× ≈ the measured ~60×.
+**After (this commit)**: CPU decode **1.1 → ~52–58 tok/s** at `-t 8`
+(**~50×**, ~80–90 % of llama's 63–68), prefill **~1.1 → ~75 tok/s**
+(241-token). What was done:
 
-CPU prefill has the same per-token cost as decode (no cross-token reuse in the
-matmul kernels), so minfer ~1.1 tok/s vs llama 211 tok/s (pp240) — ~190×.
+1. **NEON + SDOT dot kernels** (`src/avx2.rs`): all eight quantized
+   dot products got aarch64 fast paths using the ARMv8.2 `sdot`
+   instruction (16 MACs/instr, emitted via inline asm — `vdotq_s32` is
+   unstable in std::arch). **Bit-exact with the scalar kernels** (int32
+   accumulation is exact; per-block float ops kept in identical order —
+   verified by unit tests on random data).
+2. **Q8_K activations for K-quant matmuls** (`src/block.rs`,
+   `src/avx2.rs`, `src/kernel.rs`): llama.cpp's activation format for
+   Q4_K/Q5_K/Q6_K weights — 256-element blocks with precomputed int16
+   per-subblock sums (`bsums`), so the dots never re-reduce the
+   activation and apply one scale per 256 elements instead of 8. The
+   kernels were restructured to llama's shape (SDOT accumulation with
+   scales applied via `vmlaq_n_s32` *before* the horizontal reduce: one
+   `vaddvq` per superblock instead of 8). Also a NEON q8_K quantizer
+   (bit-exact with the scalar one).
+3. **Persistent CPU thread pool + row-parallel matmuls**
+   (`src/kernel.rs`): per-call `thread::scope` spawning costs ~170 µs
+   (measured) — too slow for ~250 matmuls/token — so a persistent pool
+   (atomic generation handoff + spin/yield workers, main thread
+   participates as the last worker) dispatches each matmul's rows in
+   ~1–3 µs. Output is **bit-identical** to single-threaded (each row is
+   computed by exactly one worker with the identical code path). A
+   generic `par_for` extends the same pool to other ops (the attention
+   is parallelized over heads).
+4. **NEON vector ops** (`src/vec_ops.rs`): `vec_dot_f32`,
+   `vec_muladd_f32`, `vec_scale_f32`, `vec_add_f32`, and an in-place
+   softmax (fast polynomial exp) — the CPU attention/norm path was fully
+   scalar before.
+5. **CLI `-t/--threads <N>`** (default: macOS P-core count via
+   `hw.perflevel0.logicalcpu`, 10 on M4 Pro; measured best is 8 for the
+   4B — E-cores hurt, matching llama). `MINFER_NO_NEON=1` forces the
+   scalar kernels for A/B.
+
+Correctness: NEON vs scalar, threaded vs single-threaded, and the whole
+NEON+threads pipeline vs the scalar single-thread baseline are all
+**byte-identical** on the greedy output; new unit tests cover the NEON
+kernels against the scalar references on random data. The CPU activation
+quantization change (q8_0 → q8_K for K-quants) shifts logits slightly, so
+CPU-vs-Metal greedy text can now flip at near-tie boundaries (both are
+coherent); Metal output is unchanged.
+
+CPU prefill (241 tok): **~75 tok/s** vs llama 211 — the remaining prefill
+gap is the serial activation quantization (NEON now) plus no token-level
+parallelism; the GPU path remains the fast prefill route (~800+ tok/s).
 
 ## 4. Secondary: KV cache f32 vs f16 (long-context decode)
 
@@ -163,18 +205,18 @@ default `kv_cache_type` is f16; minfer stores f32.)
 
 ## 5. Recommendations (ordered by measured impact)
 
-1. ~~Fix single-shot KV sizing~~ **DONE (this commit)** — `ModelDef::forward`
+1. ~~Fix single-shot KV sizing~~ **DONE (commit d5b8023)** — `ModelDef::forward`
    takes `n_ctx`; single-shot passes `--n-ctx` (default 4096), clamped to the
    model's `max_seq_len`. First-request latency 289 → ~106 ms, 12.1 GB
    address-space allocation gone; greedy output byte-identical.
-2. **CPU backend: NEON dot products + threading** (the only big gap): aarch64
-   SIMD kernels (q4_K/q8_1 style) + a small thread pool would take CPU decode
-   from 1.1 toward 10–60 tok/s. Per-core scalar→NEON is worth ~5.7×, threading
-   another ~10× (diminishing; E-core awareness needed, see §3).
+2. ~~CPU backend: NEON dot products + threading~~ **DONE (this commit)** — SDOT
+   kernels + Q8_K activations + persistent row-parallel pool + NEON vec ops +
+   `-t/--threads`: CPU decode 1.1 → ~52–58 tok/s (~50×, ~80–90 % of llama),
+   CPU prefill ~1.1 → ~75 tok/s. Details in §3.
 3. **KV cache f16/bf16**: halves KV traffic and the §2 first-submit tax; worth
    ~6–24 % on long-context decode.
-4. **Prefill marginal (optional)**: f16-activation GEMM or a 64×64 tile to close
-   the last ~10 %; at current parity this is low priority.
+4. **CPU prefill (optional)**: token-level parallelism or a GEMM path to close
+   the 75-vs-211 gap; the GPU path already handles prefill at ~800+ tok/s.
 
 ## 6. Methodology notes / pitfalls seen
 
@@ -202,7 +244,10 @@ default `kv_cache_type` is f16; minfer stores f32.)
 | llama-bench Metal tg64 | 79.73 ± 0.14 tok/s |
 | llama-cli Metal Generation, n=48 | 78.6 tok/s |
 | llama-bench CPU tg32/64 (t=10) | 60.74 ± 6.4 / 66.71 ± 3.2 tok/s |
-| llama-cli CPU Generation (t=8 / 10 / 14) | 68.4 / 60.8 / 15.9 tok/s |
+| llama-cli CPU Generation (t=8 / 10 / 14) | 63–69 / 60.8 / 15.9 tok/s |
+| minfer CPU decode post-fix (-t 1 / 8 / 10) | 10.4 / 48–58 / 50.9 tok/s |
+| minfer CPU prefill 241 tok post-fix (-t 8) | ~70–75 tok/s |
+| llama-bench CPU pp240 (t=8) | 202.7 ± 1.3 tok/s |
 | llama-bench Metal pp16/240/480 | 238 / 771 / 821 tok/s |
 | llama-bench CPU pp240 | 211 tok/s |
 | minfer prefill GPU (first submit, pre-fix) | 5 tok: 283 ms · 121: 390 ms · 241: 552 ms · 481: 851 ms |

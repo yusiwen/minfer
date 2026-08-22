@@ -13,7 +13,9 @@ A minimal local LLM inference engine built from scratch in Rust.
   multi-part support, **mmap'd weights shared zero-copy with the GPU**
 - **Self-contained BPE tokenizer** — loaded directly from GGUF metadata,
   no external dependency on tiktoken
-- **CPU: AVX2-accelerated** — Q4₀×Q8₀ and Q8₀×Q8₀ dot products via AVX2+FMA
+- **CPU: AVX2 (x86) / NEON+SDOT (Apple Silicon) SIMD** — all 8 quantized
+  dot products, plus a persistent row-parallel thread pool (`-t/--threads`;
+  Qwen3-4B CPU decode ~52–58 tok/s on M4 Pro vs 1.1 before)
 - **GPU: Metal backend** — Apple Silicon acceleration with flash attention
   (single fused kernel for decode + prefill, llama.cpp ports), simdgroup GEMM
   prefill for every quant type, SIMD-parallel RMSNorm, float4 vectorized
@@ -41,9 +43,11 @@ A minimal local LLM inference engine built from scratch in Rust.
 ## Supported Quantization Formats
 
 minfer supports GGUF v3 files with the following quantized weight types.
-The CPU backend quantizes activations to Q8_0 on-the-fly; the Metal GPU
-backend reads f32 activations directly for all weight types (Q4_0 included),
-matching llama.cpp's Metal backend.
+The CPU backend quantizes activations on-the-fly (Q8_0 for the simple
+weight types, **Q8_K** — llama.cpp's format with precomputed per-subblock
+sums — for Q4_K/Q5_K/Q6_K); the Metal GPU backend reads f32 activations
+directly for all weight types (Q4_0 included), matching llama.cpp's Metal
+backend.
 
 ### Supported
 
@@ -319,7 +323,7 @@ minfer/
 │   │   └── dot.rs         # Graphviz DOT export (--dump-graph)
 │   ├── gguf.rs            # GGUF parser (v3) + mmap'd zero-copy loader
 │   ├── block.rs           # Quantized block types + fp16 conversions
-│   ├── avx2.rs            # AVX2 dot product kernels + quantization
+│   ├── avx2.rs            # AVX2 + NEON/SDOT dot kernels + Q8_0/Q8_K quantization
 │   ├── cuda.rs            # CUDA GPU state, FFI bindings, graph capture
 │   ├── cuda_kernels.cu    # CUDA kernels (matmul, attention, element-wise ops)
 │   ├── metal.rs           # Metal kernels + per-op dispatch (metallib, mmap weights)

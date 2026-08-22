@@ -20,6 +20,11 @@ pub const Q41B: usize = 20;  // sizeof(block_q4_1)
 pub const Q8B: usize = 34;   // sizeof(block_q8_0)
 pub const Q4KB: usize = 144; // sizeof(block_q4_k)
 pub const Q6KB: usize = 210; // sizeof(block_q6_k)
+/// sizeof(block_q8_k) — 256-element activation block: d(f16,2) + qs(256 i8)
+/// + scales(16 i8) + bsums(16 i16). Used as the CPU activation format for
+/// K-quant matmuls (llama.cpp's choice: precomputed per-subblock sums avoid
+/// re-reducing the activation in every dot).
+pub const Q8KB: usize = 2 + 256 + 16 + 32; // 306
 
 /// Unpack 8 scales and 8 mins from the 12-byte scales field of a Q4_K block.
 /// Matches llama.cpp `get_scale_min_k4`.

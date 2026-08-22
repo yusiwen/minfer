@@ -668,3 +668,51 @@ Future optimizations should focus on:
 The code is production-ready for small models and single-threaded use cases.
 Further optimizations require significant engineering effort and are only
 justified for larger models or multi-core servers.
+
+---
+
+## NEON + Threading Overhaul (2026-08, Qwen3-4B Q4_K_M on M4 Pro)
+
+The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
+~52–58 tok/s** at `-t 8` (~80–90 % of llama.cpp's 63–69), and prefill from
+~1.1 to ~70–75 tok/s. Full analysis: `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3.
+
+### What was added
+
+1. **aarch64 NEON/SDOT dot kernels** (`src/avx2.rs`) — all 8 quantized dot
+   products (Q4_0/Q4_1/Q8_0/Q5_0/Q5_1/Q5_K/Q4_K/Q6_K) use the ARMv8.2 `sdot`
+   instruction (16 MACs/instr) via stable inline asm (`vdotq_s32` is unstable
+   in std::arch). **Bit-exact with the scalar kernels** (exact int32
+   accumulation, per-block float ops in identical order); `MINFER_NO_NEON=1`
+   reverts.
+2. **Q8_K activations for K-quant matmuls** (`src/block.rs` Q8KB,
+   `src/avx2.rs` quantize + dots, `src/kernel.rs` dispatch) — llama.cpp's
+   activation format: 256-element blocks with precomputed int16 per-subblock
+   sums, so dots never re-reduce the activation and use one scale per 256
+   elements. Kernels restructured to llama's shape (scales applied to the SDOT
+   vectors via `vmlaq_n_s32` *before* the single horizontal reduce).
+3. **Persistent CPU thread pool + row-parallel matmuls** (`src/kernel.rs`) —
+   per-call `thread::scope` spawns cost ~170 µs (measured), so a persistent
+   pool (atomic generation handoff, spin-then-yield workers, main thread
+   participates as the last worker) dispatches each matmul in ~1–3 µs.
+   Output is bit-identical to single-threaded (each row computed by one
+   worker). Generic `par_for` extends it to other ops (attention over heads).
+4. **NEON vector ops** (`src/vec_ops.rs`) — vec_dot/muladd/scale/add and an
+   in-place softmax (polynomial exp); the attention/norm path was fully
+   scalar on ARM before.
+5. **CLI `-t/--threads <N>`** (default = macOS P-core count via
+   `hw.perflevel0.logicalcpu`; measured best 8 for the 4B; E-cores hurt,
+   matching llama).
+
+### Pitfalls hit
+
+- `vld1q_s16` loads **8 lanes only** — loading 16 bsums needs two loads;
+  `vpaddq_s16(a, b)` yields 8 lanes (a's 4 pairs then b's 4 pairs), and
+  `vget_high_s16` on an 8-lane array read undefined stack bytes. Both caused
+  silent garbage; caught by NEON-vs-scalar unit tests on random data.
+- int16 `vmlal_s8` accumulation overflows for Q8_0 (127×127×4); SDOT's int32
+  accumulation avoids the whole class.
+- Workers spinning between matmuls show up as ~50 % idle in profilers — that
+  is the main thread's serial work (quantize, dispatch, attention), not a
+  kernel problem; the attention-parallelization and NEON quantize closed most
+  of it.

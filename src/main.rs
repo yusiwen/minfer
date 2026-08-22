@@ -114,6 +114,8 @@ fn print_usage(prog: &str) {
     eprintln!("  --n-ctx <N>          context size (default 4096; server: total, divided among slots)");
     eprintln!("                       single-shot / --cnv: sizes the KV cache, clamped to the model's");
     eprintln!("                       max context (e.g. Qwen3-4B 40960); server: total context");
+    eprintln!("  -t, --threads <N>    CPU worker threads (default: performance cores, e.g. 10 on M4 Pro;");
+    eprintln!("                       1 = single-threaded; affects the CPU-only path)");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
     eprintln!("  -h, --help           show this help");
     eprintln!("  -V, --version        print version and exit");
@@ -181,6 +183,13 @@ fn main() {
                 }
                 i += 2;
             }
+            "-t" | "--threads" => {
+                if let Some(v) = next_val(a) {
+                    let n = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --threads '{v}'")); 0 });
+                    crate::kernel::set_cpu_threads(n);
+                }
+                i += 2;
+            }
             "--n-slots" => {
                 if let Some(v) = next_val(a) {
                     server_n_slots = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --n-slots '{v}'")); 1 });
@@ -216,7 +225,7 @@ fn main() {
                 i += 2;
             }
             "--greedy" => { params.temp = 0.0; i += 1; }
-            "--temp" | "-t" => {
+            "--temp" => {
                 if let Some(v) = next_val(a) {
                     params.temp = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --temp '{v}'")); 0.0 });
                 }

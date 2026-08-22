@@ -387,10 +387,9 @@ impl Backend for CpuBackend {
                     .unwrap_or(0)
                     .min(n_ctx);
                 let pos: Vec<usize> = (0..nt).map(|t| ins[2][t].to_bits() as usize).collect();
-                let mut scrs = vec![0.0f32; nkv.max(1)];
                 cpu_gqa_attn(
                     ins[0], k_slice, v_slice, &pos, nt, nkv, meta.n_head, meta.n_head_kv, meta.hd,
-                    meta.hd_kv, nkt, out, &mut scrs, meta.scale,
+                    meta.hd_kv, nkt, out, meta.scale,
                 )?;
                 Ok(())
             }
@@ -471,50 +470,106 @@ pub(crate) fn cpu_gqa_attn(
     hd_kv: usize,
     nkt: usize,
     out: &mut [f32],
-    scrs: &mut [f32],
     scale: f32,
 ) -> Result<(), String> {
     if hd < hd_kv {
         return Err(format!("Q head dim ({hd}) must be >= KV head dim ({hd_kv})"));
     }
-    let gqa = nh / nk;
-    let ne_q = nh * hd;
-    for h in 0..nh {
+
+    // Heads are independent: parallelize over head ranges on the CPU pool.
+    // Each worker computes its own head range with a private scores buffer,
+    // so the output is bit-identical to the single-threaded order (no
+    // cross-head reduction).
+    let ctx = AttnCtx {
+        q: q.as_ptr(),
+        ka: ka.as_ptr(),
+        va: va.as_ptr(),
+        pos: pos.as_ptr(),
+        nt,
+        nkv,
+        nh,
+        hk: nk,
+        hd,
+        hd_kv,
+        nkt,
+        out: out.as_mut_ptr(),
+        scale,
+    };
+    if crate::kernel::cpu_threads() <= 1 || nh < 2 {
+        unsafe { attn_heads(&ctx as *const _ as *const (), 0, nh) };
+        return Ok(());
+    }
+    crate::kernel::par_for(nh, &ctx as *const _ as *const (), attn_heads);
+    Ok(())
+}
+
+/// Raw context for the pooled attention worker (valid for the par_for call).
+struct AttnCtx {
+    q: *const f32,
+    ka: *const f32,
+    va: *const f32,
+    pos: *const usize,
+    nt: usize,
+    nkv: usize,
+    nh: usize,
+    hk: usize,
+    hd: usize,
+    hd_kv: usize,
+    nkt: usize,
+    out: *mut f32,
+    scale: f32,
+}
+
+/// Compute attention for heads [h0, h1). SAFETY: `ctx` points to a live
+/// `AttnCtx` for the duration; each head h writes the disjoint output range
+/// out[t*ne_q + h*hd .. +hd], so concurrent calls over disjoint head ranges
+/// cannot race.
+unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
+    let c = &*(ctx as *const AttnCtx);
+    let gqa = c.nh / c.hk;
+    let ne_q = c.nh * c.hd;
+    let mut scrs = vec![0.0f32; c.nkv.max(1)];
+    for h in h0..h1 {
         let hk = h / gqa;
-        for t in 0..nt {
-            let qs = t * ne_q + h * hd;
-            let vl = (pos[t] + 1).min(nkv);
+        for t in 0..c.nt {
+            let qs = t * ne_q + h * c.hd;
+            let vl = (*c.pos.add(t) + 1).min(c.nkv);
             let mut mx = f32::NEG_INFINITY;
             for kv in 0..vl {
-                let ks = kv * nkt + hk * hd_kv;
-                let s = crate::vec_ops::vec_dot_f32(hd_kv, &q[qs..qs + hd_kv], &ka[ks..ks + hd_kv])
-                    * scale;
+                let ks = kv * c.nkt + hk * c.hd_kv;
+                let s = crate::vec_ops::vec_dot_f32(
+                    c.hd_kv,
+                    std::slice::from_raw_parts(c.q.add(qs), c.hd_kv),
+                    std::slice::from_raw_parts(c.ka.add(ks), c.hd_kv),
+                ) * c.scale;
                 scrs[kv] = s;
                 if s > mx {
                     mx = s;
                 }
             }
-            for kv in vl..nkv {
+            for kv in vl..c.nkv {
                 scrs[kv] = f32::NEG_INFINITY;
             }
-            let s_in = scrs[..nkv].to_vec();
-            let sm = crate::vec_ops::vec_soft_max_f32(nkv, scrs, &s_in, mx);
+            let sm = crate::vec_ops::vec_soft_max_inplace_f32(c.nkv, &mut scrs, mx);
             let is = (1.0 / sm) as f32;
-            crate::vec_ops::vec_scale_f32(nkv, scrs, is);
-            let os = t * ne_q + h * hd;
-            out[os..os + hd].fill(0.0);
-            let vs_base = hk * hd_kv;
-            for kv in 0..nkv {
+            crate::vec_ops::vec_scale_f32(c.nkv, &mut scrs, is);
+            let os = t * ne_q + h * c.hd;
+            let out_slice = std::slice::from_raw_parts_mut(c.out.add(os), c.hd);
+            out_slice.fill(0.0);
+            let vs_base = hk * c.hd_kv;
+            for kv in 0..c.nkv {
                 crate::vec_ops::vec_muladd_f32(
-                    hd_kv,
-                    &mut out[os..os + hd_kv],
-                    &va[kv * nkt + vs_base..kv * nkt + vs_base + hd_kv],
+                    c.hd_kv,
+                    std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
+                    std::slice::from_raw_parts(
+                        c.va.add(kv * c.nkt + vs_base),
+                        c.hd_kv,
+                    ),
                     scrs[kv],
                 );
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
