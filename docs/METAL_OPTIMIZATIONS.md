@@ -55,6 +55,9 @@ from §1/§1.6 — same models; graph-path numbers current as of **G1+G2+G3**):
 | 7B Q4_K_M decode, KV ~200+ | ~48 t/s steady | **~49 t/s** (KV206) | ≈ parity (was ~32.5 pre-G1) |
 | 7B Q4_K_M prefill pp206 | ~240 t/s (§1.6 pp252) | ~217 t/s (pp206) | ≈ −10 % (unchanged by G1–G3) |
 | 0.5B CPU decode | ~5.9 t/s | ~5.9 t/s | 0 % (exact parity) |
+| Qwen3-4B Q4_K_M decode | — | **~75.9 t/s** (KV64) | llama-Metal 79.7 → **≈ parity** (full A/B: `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) |
+| Qwen3-4B Q4_K_M prefill steady-state | — | ~800–1000 t/s marginal | llama ~900 → ≈ parity |
+| Qwen3-4B first-request prefill (241 tok) | — | 552 ms (incl. ~275 ms KV page-commit) | llama 313 ms — the gap is **KV sizing**, not kernels |
 
 **Reading**: G1 (attention dispatch: flash/split/parallel) closed the decode
 KV-growth regression (−44 %/−32 % → parity; 0.5B 2.1×, 7B ~1.5×); G3 (n_out

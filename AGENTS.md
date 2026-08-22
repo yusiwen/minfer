@@ -197,5 +197,6 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | **Qwen3 dense support plan + implementation record** | `docs/QWEN3-SUPPORT-PLAN.md` |
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
+| **Qwen3-4B perf vs llama.cpp (decode parity, CPU gap, KV-commit finding)** | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |
 | **CLI multi-turn conversation plan (append-only KV + incremental template diff)** | `docs/CLI-CONVERSATION-PLAN.md` |

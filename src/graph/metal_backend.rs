@@ -21,6 +21,35 @@ use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
 use super::{CNode, DType};
 
+// ─── op profiler (MINFER_OP_PROFILE=1, debug aid) ────────────────────
+// Host-side encode time per op label (accumulated across the process) plus
+// per-submit GPU wait time. The first submit prints the full per-op table
+// (prefill); later submits print one line each (decode = one submit per token).
+// Zero overhead when the env var is unset.
+use std::collections::BTreeMap;
+static OP_ENC: std::sync::Mutex<BTreeMap<String, (u64, f64)>> = std::sync::Mutex::new(BTreeMap::new());
+static GPU_MS: std::sync::Mutex<(u64, f64)> = std::sync::Mutex::new((0, 0.0));
+
+fn op_profile_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_OP_PROFILE").map_or(false, |v| v == "1"))
+}
+
+/// Records host-side encode time per op label on drop (works with early returns).
+struct EncTimer {
+    key: String,
+    t0: std::time::Instant,
+}
+impl Drop for EncTimer {
+    fn drop(&mut self) {
+        let ms = self.t0.elapsed().as_secs_f64() * 1e3;
+        let mut m = OP_ENC.lock().unwrap();
+        let e = m.entry(std::mem::take(&mut self.key)).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += ms;
+    }
+}
+
 pub struct MetalBackend {
     state: &'static MpsState,
     /// f32-element pool: id → shared MTLBuffer (size * 4 bytes)
@@ -66,10 +95,26 @@ impl MetalBackend {
     /// Submit the pending command buffer (if any) and clear it.
     fn submit_pending(&mut self) {
         if !self.cb_ptr.is_null() {
+            let t0 = std::time::Instant::now();
             // SAFETY: exclusive &mut self — take the box back and submit.
             let cb = unsafe { Box::from_raw(self.cb_ptr) };
             self.cb_ptr = std::ptr::null_mut();
             cb.submit().expect("MPS: graph backend command-buffer submit error");
+            if op_profile_enabled() {
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let n = {
+                    let mut g = GPU_MS.lock().unwrap();
+                    g.0 += 1;
+                    g.1 += ms;
+                    g.0
+                };
+                if n == 1 {
+                    Self::print_profile();
+                } else {
+                    eprintln!("[MINFER_OP_PROFILE] submit #{n}: GPU {ms:.2} ms (total {:.1} ms)",
+                        GPU_MS.lock().unwrap().1);
+                }
+            }
         }
     }
 
@@ -108,6 +153,21 @@ impl MetalBackend {
         }
     }
 
+    fn print_profile() {
+        let enc = OP_ENC.lock().unwrap();
+        let gpu = GPU_MS.lock().unwrap();
+        let mut rows: Vec<_> = enc.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        eprintln!("\n[MINFER_OP_PROFILE] host-encode per op (cumulative), GPU submits={}:", gpu.0);
+        let mut enc_total = 0.0;
+        for (k, (n, ms)) in rows.iter().take(20) {
+            enc_total += ms;
+            eprintln!("  {ms:9.3} ms  x{n:4}  {k}");
+        }
+        eprintln!("  host encode (top20): {enc_total:.3} ms; GPU wait: {:.3} ms over {} submits",
+            gpu.1, gpu.0);
+    }
+
 }
 
 impl Drop for MetalBackend {
@@ -118,6 +178,9 @@ impl Drop for MetalBackend {
             let cb = unsafe { Box::from_raw(self.cb_ptr) };
             self.cb_ptr = std::ptr::null_mut();
             let _ = cb.submit();
+        }
+        if op_profile_enabled() {
+            Self::print_profile();
         }
     }
 }
@@ -172,6 +235,11 @@ impl Backend for MetalBackend {
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
         let cb = self.cb();
+        let _t = if op_profile_enabled() {
+            Some(EncTimer { key: format!("{:?}", node.op), t0: std::time::Instant::now() })
+        } else {
+            None
+        };
         match &node.op {
             Op::Input => Ok(()),
             Op::Silu => {
