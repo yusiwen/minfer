@@ -647,15 +647,17 @@ let mut child = Command::new(env!("CARGO_BIN_EXE_minfer"))
 
 ## 9. 开放问题与决策点
 
+> **实现状态（rev 4）：** 下列决策点已在 Phase 0–3 落地，标注 ✅；未落地项保留为后续。
+
 1. **`--cnv` 显式开启 vs 有模板自动开启**（llama.cpp 默认 auto）。
-   推荐：显式开启（MVP），文档注明未来可加 auto。破坏性小、与现有用法不冲突。
-2. **溢出策略**：截断 + 重灌（推荐，MVP）vs KV 平移 vs 直接报错。
-   推荐截断 + 重灌：实现简单、行为可预期；平移留给 Phase 4。
-3. **Ctrl+C 打断**是否入 MVP：需要信号处理（项目当前 5 个 crate 无 ctrlc/libc；
-   新增依赖或 `#[cfg(unix)]` unsafe signal handler）。
-   推荐：MVP 先不做打断（EOF 退出即可），打断语义 Phase 2 末尾补。
-4. **解码循环是否与 server 共享**（抽 `src/generate.rs`）：MVP 复制现循环骨架（低风险），
-   统一重构放 Phase 4。
-5. **会话持久化是否入范围**：推荐 Phase 3 可选（只存 messages JSON，不存 KV）。
-6. **无模板时 `--cnv` 的行为**：ChatML fallback 渲染（推荐，恒可用）vs 报错。
-7. **EOT 插入策略**：统一"未达 EOG 即插"（推荐，保证不变量）vs 仅 Ctrl+C（llama.cpp 原样）。
+   ✅ 已定：显式开启（MVP），保持单发用法兼容；auto 未来可加。
+2. **溢出策略**：截断 + 重灌（✅ 已实现，Phase 3）vs KV 平移（Phase 4 可选）vs 直接报错。
+3. **Ctrl+C 打断**：⚠️ 未实现（MVP 决策：EOF 退出；Ctrl+C 走默认终止）。需要信号处理
+   （`#[cfg(unix)]` unsafe handler 或 `libc`）；打断语义列为后续。
+4. **解码循环是否与 server 共享**（抽 `src/generate.rs`）：⚠️ 未做——MVP 复制循环骨架
+   （低风险），统一重构放 Phase 4。
+5. **会话持久化**：✅ 已实现（Phase 3，`--session`：仅 messages JSON + 全量重灌，不存 KV）。
+6. **无模板时 `--cnv` 的行为**：✅ 已定：ChatML fallback 渲染（`template=None` 走
+   `fallback_chatml_messages`，恒可用）；`--cnv --no-template` 显式报错。
+7. **EOT 插入策略**：✅ 已定：统一"未达 EOG 即插"（保证 §5.4 不变量）；EOG token 解码入 KV、
+   stop 串 token 不入 KV（见 Revision 2 注 2/3）。
