@@ -187,3 +187,64 @@ fn stop_string_truncates_output() {
     assert_eq!(code, 0);
     assert!(!out.contains('\u{FFFD}'));
 }
+
+#[test]
+#[ignore = "requires cached 0.5B model; slow on scalar CPU (~minutes)"]
+fn context_overflow_truncates_and_continues() {
+    let Some(model) = model_path() else {
+        eprintln!("0.5B q4_0 not cached; skipping");
+        return;
+    };
+    // 小 n_ctx + 多回合累积：每回合至少 ~9 token（渲染 + EOG/EOT），8 回合必然
+    // 越过 n_ctx → 触发"丢弃最旧回合 + 全量重灌"（§5.7），会话不中断、不报错。
+    // 对模型实际回复长度鲁棒（-n 4 封顶生成）。
+    let input = "hi\n".repeat(8) + "/exit\n";
+    let (_, err, code) = run_cli(
+        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "40",
+          "-n", "4", &model],
+        &input,
+        1800,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(err.contains("dropped oldest"), "overflow truncation expected: {err}");
+    assert!(!err.contains("[error]"), "no hard error: {err}");
+    let stats = turn_stats(&err);
+    assert_eq!(stats.len(), 8, "all 8 turns complete: {err}");
+}
+
+#[test]
+#[ignore = "requires cached 0.5B model; slow on scalar CPU (~minutes)"]
+fn session_save_load_round_trip() {
+    let Some(model) = model_path() else {
+        eprintln!("0.5B q4_0 not cached; skipping");
+        return;
+    };
+    let session = std::env::temp_dir().join(format!("minfer-session-test-{}.json", std::process::id()));
+    let session = session.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&session);
+
+    // run 1：两回合后 /exit → 落盘
+    let (_, err1, code1) = run_cli(
+        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512",
+          "--session", &session, &model],
+        "hi\nQ\n/exit\n",
+        1800,
+    );
+    assert_eq!(code1, 0, "stderr: {err1}");
+    assert!(err1.contains("[session] saved"), "stderr: {err1}");
+    assert!(std::path::Path::new(&session).exists(), "session file written");
+
+    // run 2：载入历史 → 继续 1 回合 → 退出（再次落盘）
+    let (_, err2, code2) = run_cli(
+        &["--cnv", "--greedy", "--seed", "43", "--color", "off", "--n-ctx", "512",
+          "--session", &session, &model],
+        "third\n/exit\n",
+        1800,
+    );
+    assert_eq!(code2, 0, "stderr: {err2}");
+    assert!(err2.contains("[session] loaded"), "stderr: {err2}");
+    let stats = turn_stats(&err2);
+    assert_eq!(stats.len(), 1, "run 2 continues with one more turn: {err2}");
+
+    let _ = std::fs::remove_file(&session);
+}

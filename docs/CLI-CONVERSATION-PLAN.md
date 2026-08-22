@@ -30,6 +30,18 @@
 > 会话用法。测试：3 个快路径进程级测试（参数校验，默认跑）+ 4 个 `#[ignore]` 真实模型会话测试
 > （`tests/conversation_cli.rs`，stdin 管道脚本化会话；标量 CPU 上 ~10 分钟）。决策点 3 落地：
 > **MVP 不做 Ctrl+C 打断**（EOF 退出；Ctrl+C 走默认终止），信号语义留待后续。
+>
+> **Revision 4 (2026-08-22) — Phase 3 implemented.** 溢出截断 + 重灌（§5.7）与 `--session`
+> 持久化（§5.8）落地：
+> - `user_turn` 溢出路径：丢弃最旧非 system 回合（`drop_oldest_turns_until_fits`，user+
+>   assistant 对）→ 全量重灌 → 继续回合；`TurnOutcome.dropped_turns` 上报（CLI 打
+>   `<<context full: dropped oldest N turn(s)>>` 警告）。单条消息超长仍报
+>   `ConvError::ContextFull`（状态回滚：弹出 user 消息 + 复位 EOT 标记）。
+> - `--session <FILE>`：`messages_to_json`/`messages_from_json`（OpenAI 风格
+>   `[{"role","content"}]`，与 server ChatMessage 同构）+ `load_history`（载入后全量重灌，
+>   不序列化 KV state）；退出时落盘。
+> - 测试：+4 单测（溢出截断/单条超长/session JSON 往返/load_history 重灌）；+2 `#[ignore]`
+>   真实模型进程测试（溢出续聊、session save→load→续聊往返）。全量 142 passed。
 
 ---
 
@@ -467,6 +479,10 @@ add_generation_prompt, bos_token) -> FormattedDelta{text, prefix_matched}`；`te
   `/regen` 后回答变化（seed 不同）且不崩；`/clear` 后位置归零。
 
 ### Phase 3：上下文溢出 + 会话持久化
+
+**Status: implemented (rev 4).** 截断 + 重灌（`drop_oldest_turns_until_fits` + 全量重灌 +
+`TurnOutcome.dropped_turns` 警告）与 `--session`（JSON 存取 + `load_history` 重灌）均已落地，
+见 Revision 4。测试：4 单测 + 2 `#[ignore]` 真实模型进程测试（溢出续聊 / session 往返）。
 
 - 截断 + 重灌（§5.7）；`--session` 存取（§5.8）。
 - 测试：

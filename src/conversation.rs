@@ -114,6 +114,8 @@ pub struct TurnOutcome {
     /// 本回合 prefill 的 token 数（增量性断言用；fallback 路径为全量长度）。
     pub prefill_tokens: usize,
     pub tokens_generated: usize,
+    /// 上下文溢出时丢弃的旧回合数（0 = 未截断，§5.7）。
+    pub dropped_turns: usize,
 }
 
 #[derive(Debug)]
@@ -283,12 +285,29 @@ impl Conversation {
             return Ok(out);
         }
 
-        // 4. 上下文溢出检查（Phase 3 改为截断 + 重灌；此处报错）。
+        // 4. 上下文溢出：丢弃最旧的非 system 回合 + 全量重灌（§5.7）。
         if self.current_pos + delta_toks.len() > self.n_ctx {
-            return Err(ConvError::ContextFull {
-                needed: self.current_pos + delta_toks.len(),
-                available: self.n_ctx,
-            });
+            self.messages.push(("user".to_string(), Some(input.to_string())));
+            let dropped = self.drop_oldest_turns_until_fits(decoder);
+            if dropped == 0 {
+                // 只剩 [system?, 最后一条 user] 仍放不下：单条消息超长，报错。
+                // 回滚：弹出刚推入的 user 消息，并复位 EOT 标记（若本回合已写 EOT，
+                // 它已正确关闭上一回合，不应在下一回合重复插入）。
+                self.messages.pop();
+                self.need_insert_eot = false;
+                return Err(ConvError::ContextFull {
+                    needed: self.current_pos + delta_toks.len(),
+                    available: self.n_ctx,
+                });
+            }
+            let full = self.render_full(true);
+            let toks = decoder.encode(&full);
+            let logits = self.rehydrate_full(engine, &toks);
+            self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
+            let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+            out.prefill_tokens = toks.len();
+            out.dropped_turns = dropped;
+            return Ok(out);
         }
 
         // 5. 记录 user 消息、设置回滚点、prefill delta。
@@ -374,6 +393,73 @@ impl Conversation {
         self.turn_pos = 0;
         self.prev_tokens.clear();
         self.need_insert_eot = false;
+    }
+
+    /// 上下文溢出：丢弃最旧的非 system 回合（user + 其 assistant 对），直到
+    /// `render(messages, true)` 的 token 数 ≤ n_ctx。返回丢弃的回合数；
+    /// 只剩 [system?, 最后一条 user] 仍放不下时返回 0（调用方报错）。
+    fn drop_oldest_turns_until_fits(&mut self, decoder: &dyn TokenCodec) -> usize {
+        let mut dropped = 0;
+        loop {
+            let full = self.render_full(true);
+            if decoder.encode(&full).len() <= self.n_ctx {
+                return dropped;
+            }
+            let Some(idx) = self.oldest_droppable_turn_start() else {
+                return dropped;
+            };
+            self.messages.remove(idx);
+            if idx < self.messages.len() && self.messages[idx].0 == "assistant" {
+                self.messages.remove(idx);
+            }
+            dropped += 1;
+        }
+    }
+
+    /// 最旧可丢弃回合的起点：最后一条 user 消息之前第一个 user 消息的位置。
+    fn oldest_droppable_turn_start(&self) -> Option<usize> {
+        let last_user = self.messages.iter().rposition(|m| m.0 == "user")?;
+        (0..last_user).find(|&i| self.messages[i].0 == "user")
+    }
+
+    /// `--session`：messages 序列化为 OpenAI 风格 JSON 数组
+    /// （与 server 的 ChatMessage 同构：`[{"role","content"},...]`，§5.8）。
+    pub fn messages_to_json(&self) -> String {
+        let arr: Vec<serde_json::Value> = self
+            .messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect();
+        serde_json::to_string_pretty(&arr).unwrap_or_default()
+    }
+
+    /// 从 JSON 数组解析 messages（`--session` 加载；非法输入返回 None）。
+    pub fn messages_from_json(json: &str) -> Option<Vec<(String, Option<String>)>> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let arr = v.as_array()?;
+        arr.iter()
+            .map(|m| {
+                let role = m.get("role")?.as_str()?.to_string();
+                let content = m.get("content").and_then(|c| c.as_str()).map(str::to_string);
+                Some((role, content))
+            })
+            .collect()
+    }
+
+    /// 载入历史并**全量重灌** KV（§5.8：不序列化 KV state——因 §5.4 不变量，
+    /// 重灌结果与继续会话一致，只是多一次 prefill）。
+    pub fn load_history(
+        &mut self,
+        messages: Vec<(String, Option<String>)>,
+        decoder: &dyn TokenCodec,
+        engine: &mut dyn Engine,
+    ) {
+        self.messages = messages;
+        self.need_insert_eot = false;
+        self.turn_pos = 0;
+        let full = self.render_full(false);
+        let toks = decoder.encode(&full);
+        let _ = self.rehydrate_full(engine, &toks);
     }
 
     /// 解码循环：从 `logits`（prefill 最后 token）开始逐 token 采样/解码，
@@ -475,6 +561,7 @@ impl Conversation {
             hit_n_predict,
             prefill_tokens: 0, // 调用方填写
             tokens_generated: n_gen,
+            dropped_turns: 0,
         })
     }
 }
@@ -812,6 +899,109 @@ mod tests {
         let mut eng2 = MockEngine::new(vec![999, IM_END]);
         c.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
         assert_eq!(eng2.calls[0].0, vec![IM_END]);
+    }
+
+    // === Phase 3：溢出截断 + 会话持久化 ===
+
+    #[test]
+    fn overflow_truncates_oldest_turns_and_rehydrates() {
+        // n_ctx=50：turn1(22) + turn2(44) 都放得下；turn3 的 delta 会让
+        // current_pos + delta > 50 → 丢弃最旧的 user+assistant 对并全量重灌。
+        let mut c = conv(50);
+        let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        assert_eq!(c.stream_tokens.len(), 22, "t1: 21-token render + EOG");
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        assert_eq!(c.stream_tokens.len(), 44, "t2: +21 delta + EOG");
+
+        // t3 触发溢出：重灌（engine.reset）+ 丢 1 回合 + 全量渲染
+        let mut eng3 = MockEngine::new(vec![IM_END, EOS]);
+        let out = c.user_turn("X", &FakeCodec, &cfg(), &mut eng3, &mut noop_emit()).unwrap();
+        assert_eq!(out.dropped_turns, 1, "oldest turn must be dropped");
+        assert_eq!(eng3.resets, 1, "rehydrate must reset the engine cache");
+        // 消息：最旧 [user hi, assistant] 对已被丢弃
+        assert_eq!(
+            c.messages,
+            vec![
+                ("user".into(), Some("Q".into())),
+                ("assistant".into(), Some("".into())),
+                ("user".into(), Some("X".into())),
+                ("assistant".into(), Some("".into())),
+            ]
+        );
+        // KV = 重灌后的全量渲染（turn_pos 归零）+ EOG
+        let canon = FakeCodec.encode(&template::fallback_chatml_messages(
+            &[("user".into(), Some("Q".into())), ("assistant".into(), Some("".into()))],
+            false,
+        ));
+        assert_eq!(c.turn_pos, 0);
+        let full = FakeCodec.encode(&template::fallback_chatml_messages(
+            &[
+                ("user".into(), Some("Q".into())),
+                ("assistant".into(), Some("".into())),
+                ("user".into(), Some("X".into())),
+            ],
+            true,
+        ));
+        assert_eq!(c.stream_tokens, [&full[..], &[IM_END]].concat());
+        assert_eq!(c.stream_tokens.len(), canon.len() + full.len() - canon.len() + 1);
+    }
+
+    #[test]
+    fn overflow_single_message_still_errors() {
+        let mut c = conv(20); // 小于单条消息的渲染长度
+        let mut eng = MockEngine::new(vec![]);
+        let err = c
+            .user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap_err();
+        assert!(matches!(err, ConvError::ContextFull { .. }));
+    }
+
+    #[test]
+    fn session_json_round_trip() {
+        let mut c = conv(512);
+        let mut eng = MockEngine::new(vec![IM_END, EOS]);
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        let json = c.messages_to_json();
+        let parsed = Conversation::messages_from_json(&json).expect("parse");
+        assert_eq!(parsed, c.messages);
+        // null content 保留（OpenAI 风格对象格式）
+        let with_null = vec![("user".into(), Some("hi".into())), ("assistant".into(), None)];
+        let with_null_json = serde_json::json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": null },
+        ])
+        .to_string();
+        let j2 = Conversation::messages_from_json(&with_null_json).unwrap();
+        assert_eq!(j2, with_null);
+        // 非法输入 → None
+        assert!(Conversation::messages_from_json("not json").is_none());
+    }
+
+    #[test]
+    fn load_history_rehydrates_full_render() {
+        let mut c = conv(512);
+        let mut eng = MockEngine::new(vec![IM_END, EOS]);
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        let saved = c.messages_to_json();
+
+        // 新会话载入历史 → 全量重灌（render(messages, false)）
+        let mut c2 = conv(512);
+        let mut eng2 = MockEngine::new(vec![IM_END, EOS]);
+        let msgs = Conversation::messages_from_json(&saved).unwrap();
+        c2.load_history(msgs, &FakeCodec, &mut eng2);
+        assert_eq!(c2.messages, c.messages);
+        assert_eq!(c2.current_pos, c2.stream_tokens.len());
+        let canon = canonical(&c.messages);
+        assert_eq!(c2.stream_tokens, canon, "KV = canonical render of loaded history");
+        assert_eq!(c2.turn_pos, 0);
+
+        // 载入后继续对话（增量 delta 从重灌后的 KV 续写）
+        let out = c2.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        assert!(out.stopped_by_eog);
+        assert_eq!(c2.messages.len(), 4);
+        assert!(c2.current_pos > c2.stream_tokens.len().saturating_sub(1));
+        assert_eq!(c2.current_pos, c2.stream_tokens.len());
     }
 
     /// 真实模型 2 回合冒烟（L2 的一部分；默认 ignore，与现有 realdata 测试一致）：

@@ -98,6 +98,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --system <STR>       conversation: system prompt");
     eprintln!("  -mli, --multiline-input   conversation: submit input on an empty line");
     eprintln!("  --color [on|off|auto]     conversation: color output (default auto = tty)");
+    eprintln!("  --session <FILE>          conversation: save/load conversation history (JSON)");
     eprintln!("  --temp <T>           sampling temperature (default 0.8; 0 = greedy)");
     eprintln!("  --greedy             greedy decoding (--temp 0)");
     eprintln!("  --top-k <K>          top-K sampling (default 40)");
@@ -129,6 +130,7 @@ fn main() {
     let mut system_prompt: Option<String> = None;
     let mut multiline_input = false;
     let mut color_mode = ColorMode::Auto;
+    let mut session_file: Option<String> = None;
     // `--graph` is accepted for compatibility; the graph path is now the
     // default forward (Phase 6).
     let _graph_mode = false;
@@ -187,6 +189,12 @@ fn main() {
                 i += 2;
             }
             "-mli" | "--multiline-input" => { multiline_input = true; i += 1; }
+            "--session" => {
+                if let Some(v) = next_val(a) {
+                    session_file = Some(v);
+                }
+                i += 2;
+            }
             "--color" => {
                 if let Some(v) = next_val(a) {
                     color_mode = match v.as_str() {
@@ -454,6 +462,7 @@ fn main() {
             single_turn,
             multiline_input,
             color_mode,
+            session_file,
             first_prompt,
         );
         std::process::exit(code);
@@ -648,6 +657,7 @@ fn run_conversation(
     single_turn: bool,
     multiline: bool,
     color_mode: ColorMode,
+    session_file: Option<String>,
     first_prompt: Option<String>,
 ) -> i32 {
     use std::io::Write;
@@ -680,6 +690,31 @@ fn run_conversation(
     };
     let mut conv = conversation::Conversation::new(spec);
     let mut engine = conversation::GraphEngine::new(&*model, params.n_ctx);
+
+    // --session 加载：历史 JSON → 全量重灌 KV（§5.8）。
+    if let Some(path) = &session_file {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            match conversation::Conversation::messages_from_json(&text) {
+                Some(msgs) => {
+                    conv.load_history(msgs, &*tokenizer, &mut engine);
+                    eprintln!("[session] loaded {} message(s) from {path}", conv.messages.len());
+                }
+                None => eprintln!("[session] ignoring unreadable session file {path}"),
+            }
+        }
+    }
+
+    // --session 保存（退出时）。
+    let save_session = |conv: &conversation::Conversation| {
+        if let Some(path) = &session_file {
+            let json = conv.messages_to_json();
+            if std::fs::write(path, json).is_ok() {
+                eprintln!("[session] saved {} message(s) to {path}", conv.messages.len());
+            } else {
+                eprintln!("[session] failed to save session to {path}");
+            }
+        }
+    };
     let tp = conversation::TurnParams {
         n_predict: params.n_predict,
         temp: params.temp,
@@ -791,6 +826,10 @@ fn run_conversation(
                 if out.hit_n_predict {
                     eprintln!("[turn {turn}] stopped by n_predict / context limit");
                 }
+                if out.dropped_turns > 0 {
+                    eprintln!("[turn {turn}] <<context full: dropped oldest {n} turn(s)>>",
+                        n = out.dropped_turns);
+                }
             }
             Err(e) => eprintln!("\n[error] {e}"),
         }
@@ -798,6 +837,7 @@ fn run_conversation(
             break;
         }
     }
+    save_session(&conv);
     eprintln!("\n---\nconversation ended after {turn} turn(s)");
     0
 }

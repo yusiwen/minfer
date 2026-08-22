@@ -196,7 +196,9 @@ cargo run --release -- --cnv -st qwen2.5-0.5b-instruct-q4_0 "hi"  # single turn
 
 In-conversation commands: `/exit` `/quit`, `/clear`, `/regen` (regenerate the
 last reply), `/help`; EOF (Ctrl+D) exits. Flags: `-st/--single-turn`,
-`--system <STR>`, `-mli/--multiline-input`, `--color on|off|auto`.
+`--system <STR>`, `-mli/--multiline-input`, `--color on|off|auto`,
+`--session <FILE>` (save/load the conversation history as JSON; on overflow the
+oldest turns are dropped automatically and generation continues).
 
 **Examples:**
 
