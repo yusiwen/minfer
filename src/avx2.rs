@@ -405,7 +405,6 @@ pub fn dot_q6_k_q8_0(q6: &[u8], q8: &[u8]) -> f32 {
 }
 
 fn dot_q6_k_q8_0_scalar(q6: &[u8], q8: &[u8]) -> f32 {
-    //
     // Step 1: dequantize Q6_K weights to a[256] (interleaved order matching dequantize_row_q6_K)
     // Step 2: element-wise dot with Q8_0 activation, per-subblock scale applied to groups of 16
     let n_super = q6.len() / Q6KB;
