@@ -91,6 +91,18 @@
 > - `attn_parallel_realdata_correctness` panicked on missing fixture files (`/tmp/dp3` layer-0 dumps
 >   from a debug_dump run); it now skips cleanly when absent, like the other fixture-dependent tests.
 > - `cargo test`: **119 passed, 0 failed** (twice), plus 11 integration tests — no skips needed.
+>
+> **Revision 8 (2026-08-22) — realdata attention fixtures restored.** The `attn_parallel_realdata_correctness`
+> test was previously skipping because its layer-0 q/k/v dump files came from the **deleted** layer_gpu
+> dump path (removed in the Phase 6 graph refactor, commit `6af12a4`). Restored with a one-time
+> generator instead of the old path:
+> - `#[test] #[ignore] gen_layer0_realdata_dump` in `src/metal.rs` runs a real 35-token prefill on the
+>   cached Qwen2.5-0.5B q4_0 through the current **graph** path (embedding → rms_norm → q/k/v matmul,
+>   pre-RoPE, token-major) and writes
+>   `$MINFER_TEST_DUMP` (default `/tmp/dp3`) `/minfer_gpu_dump_layer0_b{q,k,v}.f32`.
+>   Run once: `cargo test --bin minfer gen_layer0_realdata_dump -- --ignored`.
+> - With the fixtures present, `attn_parallel_realdata_correctness` now **really runs** (GPU kernel vs
+>   CPU reference, `maxerr < 0.1`) instead of skipping. Suite stays 119 passed / 0 failed / 1 ignored.
 
 ---
 

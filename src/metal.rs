@@ -3006,4 +3006,103 @@ mod mmap_align_test {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    // ─── Fixture generator for attn_parallel_realdata_correctness ───────────
+    // The realdata test consumes layer-0 q/k/v dumps that the (now deleted)
+    // layer_gpu dump path used to write. This generator rebuilds them with the
+    // current graph path: a real 35-token prefill on the cached 0.5B q4_0,
+    // dumping the layer-0 q/k/v matmul outputs (pre-RoPE, token-major) as f32
+    // files. Run once with:
+    //   cargo test --bin minfer gen_layer0_realdata_dump -- --ignored
+    // (writes to $MINFER_TEST_DUMP or /tmp/dp3, matching the test's default).
+    fn cached_qwen05_q4_0() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
+        if p.exists() { Some(p) } else { None }
+    }
+
+    fn write_f32(path: &str, data: &[f32]) {
+        let mut b = Vec::with_capacity(data.len() * 4);
+        for x in data {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(path, b).expect("write dump");
+    }
+
+    #[test]
+    #[ignore = "one-time fixture generator (writes /tmp/dp3 files)"]
+    fn gen_layer0_realdata_dump() {
+        use crate::graph::alloc::GraphAllocator;
+        use crate::graph::builder::GraphBuilder;
+        use crate::graph::scheduler::BackendScheduler;
+        use crate::graph::DType;
+        use crate::models::qwen2::graph::Qwen2Graph;
+        use crate::models::qwen2::Qwen2Model;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_qwen05_q4_0() else {
+            eprintln!("0.5B q4_0 not cached; skipping fixture generator");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        const NT: usize = 35; // the realdata test asserts nt == 35
+        let mut ids = tok.encode(
+            "The capital of France is Paris and the capital of Germany is Berlin. \
+             The capital of Italy is Rome and the capital of Spain is Madrid and \
+             the capital of the United Kingdom is London and the capital of Japan is Tokyo.",
+        );
+        assert!(ids.len() >= NT, "prompt tokenizes to {} < {NT} tokens", ids.len());
+        ids.truncate(NT);
+
+        let hp = &q2.hparams;
+        let nh = hp.n_head as usize;
+        let nk = hp.n_head_kv as usize;
+        let hd = hp.n_embd_head() as usize;
+        let nqt = nh * hd;
+        let nkt = nk * hd;
+        let l0 = &q2.layers[0];
+
+        // embedding -> rms_norm -> q/k/v matmul. No RoPE on purpose: the
+        // fixtures are pre-RoPE projections (the attention kernel and the CPU
+        // reference in the realdata test don't apply RoPE).
+        let mut b = GraphBuilder::new();
+        let ids_n = b.input("token_ids", [NT, 1, 1, 1], DType::I32);
+        let h = b.embedding(ids_n, q2.tok_embd.as_ref().unwrap());
+        let normed = b.rms_norm(h, l0.attn_norm.as_ref(), hp.f_norm_rms_eps);
+        let qn = b.matmul(normed, l0.wq.as_ref().unwrap(), l0.bq.as_ref());
+        let kn = b.matmul(normed, l0.wk.as_ref().unwrap(), l0.bk.as_ref());
+        let vn = b.matmul(normed, l0.wv.as_ref().unwrap(), l0.bv.as_ref());
+        b.output(qn);
+        b.output(kn);
+        b.output(vn);
+        let mut graph = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        Qwen2Graph::register_graph_weights(q2, &mut alloc);
+        let sched = BackendScheduler::new();
+        sched.assign_backends(&mut graph, &mut alloc);
+        alloc.alloc_graph(&graph).unwrap();
+        alloc.fill_input_i32(&graph, "token_ids", &ids).unwrap();
+        sched.execute(&graph, &mut alloc).unwrap();
+
+        let q = alloc.copy_to_cpu(qn).expect("q buffer");
+        let k = alloc.copy_to_cpu(kn).expect("k buffer");
+        let v = alloc.copy_to_cpu(vn).expect("v buffer");
+        assert_eq!(q.len(), NT * nqt, "q dims");
+        assert_eq!(k.len(), NT * nkt, "k dims");
+        assert_eq!(v.len(), NT * nkt, "v dims");
+        eprintln!("[gen dump] layer0 q/k/v: {NT}x{nqt} / {NT}x{nkt} / {NT}x{nkt} (q[0]={})", q[0]);
+
+        let dir = std::env::var("MINFER_TEST_DUMP").unwrap_or_else(|_| "/tmp/dp3".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_f32(&format!("{dir}/minfer_gpu_dump_layer0_bq.f32"), &q);
+        write_f32(&format!("{dir}/minfer_gpu_dump_layer0_bk.f32"), &k);
+        write_f32(&format!("{dir}/minfer_gpu_dump_layer0_bv.f32"), &v);
+        eprintln!("[gen dump] wrote {dir}/minfer_gpu_dump_layer0_b{{q,k,v}}.f32");
+    }
 }
