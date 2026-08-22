@@ -5,6 +5,7 @@ pub mod qwen2;
 
 use crate::cache::KVCache;
 use crate::gguf::{GgufContext, GgufModel};
+use crate::graph::cache::GraphCache;
 use crate::vec_ops::RopeStyle;
 
 /// Architecture-agnostic model interface.
@@ -23,6 +24,24 @@ pub trait ModelDef {
     /// Graph-based forward (Phase 6); defaults to the imperative path.
     fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize) -> Vec<f32> {
         self.forward(tokens, positions, kv, n_out)
+    }
+
+    /// Graph-based forward with a caller-provided cache and explicit context
+    /// size (server / multi-slot path, OPENAI-CHAT-API-PLAN.md Phase 0).
+    ///
+    /// `cache` owns the persistent KV regions and survives graph rebuilds;
+    /// `n_ctx` sizes those regions. Callers must guarantee
+    /// `positions[i] < n_ctx` for all `i`.
+    fn forward_graph_cached(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        n_out: usize,
+        n_ctx: usize,
+        cache: &mut GraphCache,
+    ) -> Vec<f32> {
+        let _ = (tokens, positions, n_out, n_ctx, cache);
+        unimplemented!("forward_graph_cached not implemented for this architecture")
     }
 
     fn format_chat(&self, messages: &[(String, String)]) -> String;

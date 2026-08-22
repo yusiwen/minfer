@@ -249,6 +249,10 @@ impl Qwen2Graph {
 
     /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
     /// `kv` is ignored (the graph owns its KV in persistent regions).
+    ///
+    /// CLI convenience wrapper: uses the process-global `graph_cache()` and the
+    /// model's full `max_seq_len` context. Server / multi-slot code must call
+    /// [`Qwen2Graph::forward_cached`] with a slot-scoped cache instead.
     pub fn forward(
         model: &Qwen2Model,
         tokens: &[u32],
@@ -256,8 +260,37 @@ impl Qwen2Graph {
         _kv: &mut KVCache,
         n_out: usize,
     ) -> Vec<f32> {
+        let mut guard = graph_cache().lock().unwrap();
+        Self::forward_cached(
+            model, tokens, positions, n_out,
+            model.hparams.max_seq_len as usize, &mut guard,
+        )
+    }
+
+    /// Graph-based forward with a caller-provided cache and explicit context
+    /// size (server / multi-slot path).
+    ///
+    /// `cache` owns the KV regions (persistent per-layer regions inside its
+    /// allocator) and survives rebuilds; `n_ctx` sizes those regions and must
+    /// satisfy `positions[i] < n_ctx` for every position (asserted below).
+    pub fn forward_cached(
+        model: &Qwen2Model,
+        tokens: &[u32],
+        positions: &[usize],
+        n_out: usize,
+        n_ctx: usize,
+        cache: &mut GraphCache,
+    ) -> Vec<f32> {
         let nt = tokens.len();
         debug_assert!(n_out <= nt);
+        // Out-of-range positions would write past the KV regions (which are
+        // sized n_kv_embd * n_ctx): fail loudly instead of corrupting memory.
+        if let Some(&maxp) = positions.iter().max() {
+            assert!(
+                maxp < n_ctx,
+                "position {maxp} exceeds n_ctx {n_ctx} (KV region overflow)"
+            );
+        }
         // GPU availability is part of the reuse identity (backend assignment
         // lives in the built graph, not in the params' other fields)
         let metal_on = cfg!(target_os = "macos")
@@ -269,7 +302,7 @@ impl Qwen2Graph {
             n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams {
-                n_ctx: model.hparams.max_seq_len as usize,
+                n_ctx,
                 n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on,
@@ -281,9 +314,6 @@ impl Qwen2Graph {
             },
             weights_version: 1,
         };
-
-        let mut guard = graph_cache().lock().unwrap();
-        let cache = &mut *guard;
 
         if !cache.try_reuse(&params) {
             let mut graph = Self::build(model, &params);
@@ -789,6 +819,75 @@ mod tests {
             eprintln!("[real wk matmul] vs manual Q4_0xf32: max diff {m2:.3e}");
             assert!(m2 < 5e-3, "real wk Metal diverges from Q4_0xf32 reference: {m2:.3e}");
         }
+    }
+
+    /// Phase 0 (OPENAI-CHAT-API-PLAN.md): `forward_cached` with two independent
+    /// `GraphCache` instances must isolate KV — interleaving prefill/decode
+    /// across caches must not change either cache's logits, and a cache scoped
+    /// to a smaller `n_ctx` must still work (CPU-only, real model when cached).
+    #[test]
+    fn forward_cached_isolates_kv_between_caches() {
+        use crate::graph::cache::GraphCache;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping forward_cached test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2 model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is Paris and");
+        let nt = ids.len();
+        assert!(nt > 2, "prompt too short");
+        let positions: Vec<usize> = (0..nt).collect();
+        let next_pos = nt; // first decode position
+        let n_ctx = 32768usize;
+
+        // Same input on two fresh caches => identical logits (deterministic).
+        let mut cache_a = GraphCache::new();
+        let mut cache_b = GraphCache::new();
+        let pa = Qwen2Graph::forward_cached(q2, &ids, &positions, 1, n_ctx, &mut cache_a);
+        let pb = Qwen2Graph::forward_cached(q2, &ids, &positions, 1, n_ctx, &mut cache_b);
+        assert_eq!(pa.len(), pb.len());
+        let mut d = 0.0f32;
+        for i in 0..pa.len() {
+            d = d.max((pa[i] - pb[i]).abs());
+        }
+        assert_eq!(d, 0.0, "identical inputs on fresh caches must give identical logits");
+
+        // Interleave: A prefill -> B prefill -> A decode -> B decode.
+        // Each cache's KV must stay isolated from the other's.
+        let da = Qwen2Graph::forward_cached(
+            q2, &[argmax(&pa)], &[next_pos], 1, n_ctx, &mut cache_a,
+        );
+        let db = Qwen2Graph::forward_cached(
+            q2, &[argmax(&pb)], &[next_pos], 1, n_ctx, &mut cache_b,
+        );
+        let mut d2 = 0.0f32;
+        for i in 0..da.len().min(db.len()) {
+            d2 = d2.max((da[i] - db[i]).abs());
+        }
+        assert_eq!(d2, 0.0, "interleaved caches must not cross-contaminate KV");
+
+        // n_ctx bounds: positions must stay below n_ctx (asserted), and a
+        // smaller n_ctx must produce the same prefill logits (KV capacity does
+        // not change the math while positions fit).
+        let small_ctx = nt + 4;
+        let mut cache_s = GraphCache::new();
+        let ps = Qwen2Graph::forward_cached(q2, &ids, &positions, 1, small_ctx, &mut cache_s);
+        let mut d3 = 0.0f32;
+        for i in 0..pa.len() {
+            d3 = d3.max((pa[i] - ps[i]).abs());
+        }
+        assert_eq!(d3, 0.0, "smaller n_ctx must not change prefill logits");
+        // And an out-of-range position must panic (guarded), not corrupt memory.
+        let oob = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Qwen2Graph::forward_cached(
+                q2, &[argmax(&pa)], &[small_ctx], 1, small_ctx, &mut cache_s,
+            );
+        }));
+        assert!(oob.is_err(), "position >= n_ctx must be rejected");
     }
 }
 

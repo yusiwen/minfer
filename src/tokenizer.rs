@@ -265,8 +265,13 @@ impl Tokenizer {
         result
     }
 
-    /// Decode token IDs to text (reverse byte encoding).
-    pub fn decode(&self, ids: &[u32]) -> String {
+    /// Decode token IDs to raw bytes (reverse byte-level encoding).
+    ///
+    /// Unlike `decode`, this never performs lossy UTF-8 conversion: a token that
+    /// is an incomplete multi-byte sequence keeps its raw bytes. Callers that
+    /// render text incrementally (streaming) must buffer incomplete sequences —
+    /// see [`complete_utf8_prefix_len`].
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut encoded = String::new();
         for &id in ids {
             if (id as usize) < self.id_to_token.len() {
@@ -288,10 +293,116 @@ impl Tokenizer {
             }
         }
 
-        String::from_utf8_lossy(&result).into_owned()
+        result
+    }
+
+    /// Decode token IDs to text.
+    ///
+    /// Lossy: an incomplete multi-byte sequence at the end becomes U+FFFD.
+    /// Streaming paths should use [`Tokenizer::decode_bytes`] plus
+    /// [`complete_utf8_prefix_len`] holdback instead.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
+    }
+}
+
+/// Length of the longest prefix of `bytes` that ends on a complete UTF-8
+/// character boundary.
+///
+/// Mirrors llama.cpp's `format_incomplete_utf8` holdback: when a multi-byte
+/// character is split across two tokens, the trailing bytes are kept until the
+/// character completes, so streamed output never contains U+FFFD.
+pub fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut end = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let len = if b < 0x80 {
+            1
+        } else if b & 0xE0 == 0xC0 {
+            2
+        } else if b & 0xF0 == 0xE0 {
+            3
+        } else if b & 0xF8 == 0xF0 {
+            4
+        } else {
+            1 // stray continuation byte: consume it as one unit
+        };
+        if i + len > bytes.len() {
+            break; // incomplete trailing character
+        }
+        i += len;
+        end = i;
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal tokenizer for decode tests: id 2 is the byte-level encoding of
+    /// 中 (U+4E2D = E4 B8 AD in UTF-8, i.e. bytes 0xE4 0xB8 0xAD).
+    fn test_tokenizer() -> Tokenizer {
+        let byte_to_unicode = build_byte_to_unicode();
+        let unicode_to_byte = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
+        Tokenizer {
+            id_to_token: vec!["hello".into(), " world".into(), "ä¸Ń".into()],
+            id_to_score: vec![0.0; 3],
+            id_to_type: vec![1; 3],
+            vocab: HashMap::new(),
+            merges: HashMap::new(),
+            byte_to_unicode,
+            unicode_to_byte,
+            special_tokens: HashMap::new(),
+            bos_token: 0,
+            eos_token: 0,
+            im_start: 0,
+            im_end: 0,
+        }
+    }
+
+    #[test]
+    fn decode_bytes_reverses_byte_encoding() {
+        let t = test_tokenizer();
+        assert_eq!(t.decode_bytes(&[0]), b"hello");
+        assert_eq!(t.decode_bytes(&[0, 1]), b"hello world");
+        assert_eq!(t.decode(&[0, 1]), "hello world");
+    }
+
+    #[test]
+    fn decode_bytes_keeps_multibyte_bytes() {
+        let t = test_tokenizer();
+        let bytes = t.decode_bytes(&[2]);
+        assert_eq!(bytes, vec![0xE4, 0xB8, 0xAD]); // 中
+        assert_eq!(t.decode(&[2]), "中");
+        assert!(!t.decode(&[2]).contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decode_out_of_range_id_is_skipped() {
+        let t = test_tokenizer();
+        assert_eq!(t.decode_bytes(&[99]), Vec::<u8>::new());
+        assert_eq!(t.decode(&[0, 99, 1]), "hello world");
+    }
+
+    #[test]
+    fn complete_utf8_prefix_len_holds_incomplete_trailing() {
+        // 中 = E4 B8 AD
+        let full = [0xE4u8, 0xB8, 0xAD];
+        assert_eq!(complete_utf8_prefix_len(&full[..1]), 0, "1 of 3 bytes: incomplete");
+        assert_eq!(complete_utf8_prefix_len(&full[..2]), 0, "2 of 3 bytes: incomplete");
+        assert_eq!(complete_utf8_prefix_len(&full[..3]), 3, "all 3 bytes: complete");
+
+        let mixed = [b'a', 0xE4, 0xB8, 0xAD, b'b'];
+        assert_eq!(complete_utf8_prefix_len(&mixed[..3]), 1, "a complete, 中 incomplete");
+        assert_eq!(complete_utf8_prefix_len(&mixed[..4]), 4, "a + 中 complete");
+        assert_eq!(complete_utf8_prefix_len(&mixed[..5]), 5);
+        assert_eq!(complete_utf8_prefix_len(b"abc"), 3, "pure ASCII");
+        assert_eq!(complete_utf8_prefix_len(&[]), 0);
     }
 }

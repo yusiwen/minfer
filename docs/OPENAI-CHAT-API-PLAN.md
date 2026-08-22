@@ -1,0 +1,922 @@
+# OpenAI-Compatible Chat API Plan
+
+**Status:** Design Document  
+**Date:** 2025-08-20  
+**Architecture:** Plan B — Multi-slot + Serial Execution  
+
+> **Revision 2 (sampling + architecture alignment, 2026-08-22).** This revision corrects stale assumptions
+> against minfer's current graph architecture and expands the MVP sampling scope:
+>
+> - **KV cache lives in the graph allocator, not `src/cache.rs`.** The graph path (`Qwen2Graph::forward`)
+>   ignores the legacy `KVCache` argument entirely — KV is a pair of persistent f32 regions per layer inside
+>   a **process-global `Mutex<GraphCache>`** (`src/models/qwen2/graph.rs`, `graph_cache()`). Multi-slot
+>   therefore requires refactoring `forward()` to take a **slot-scoped `&mut GraphCache`** plus an explicit
+>   `n_ctx` (currently hardcoded to `hparams.max_seq_len`). "Each slot owns an independent `KVCache`" is
+>   wrong as written.
+> - **Sampling is expanded to full MVP parity with llama.cpp**: `frequency_penalty` / `presence_penalty`
+>   (per-vocab penalty pass, shared with the existing repeat penalty), `stop` strings (text-level matching
+>   with UTF-8-safe incremental decoding), and `top_k` / `repeat_penalty` passthrough. These were listed as
+>   request fields but had no implementation path in rev 1.
+> - **Defaults now match llama.cpp** (`max_tokens` = no limit, `temperature` 0.8, `top_p` 0.95, `top_k` 40,
+>   `repeat_penalty` 1.1, random seed default) instead of rev 1's `max_tokens: 16` / `temperature: 1.0`.
+> - **Busy slots are queued (deferred), never rejected with 503** — matching llama.cpp's unbounded task
+>   queue; the rev-1 error table contradicted its own lifecycle section.
+>
+> **Revision 3 (2026-08-22) — Phase 0 implemented.** Architecture prerequisites are done, each with
+> tests (`cargo test` green apart from two pre-existing Metal/environment failures):
+> - `Tokenizer::decode_bytes(&[u32]) -> Vec<u8>` + `complete_utf8_prefix_len` (no lossy conversion;
+>   unit tests incl. a CJK char split across tokens).
+> - `Qwen2Graph::forward_cached(model, tokens, positions, n_out, n_ctx, &mut GraphCache)` — the
+>   process-global `graph_cache()` is now only a thin CLI wrapper; `forward()` delegates to it.
+>   Positions are bounds-checked against `n_ctx` (panic instead of KV-region overflow). New
+>   `ModelDef::forward_graph_cached` trait method (Qwen2 implements it).
+> - Test `forward_cached_isolates_kv_between_caches`: two caches interleaved stay bit-identical,
+>   smaller `n_ctx` gives identical prefill logits, out-of-range positions are rejected.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Current State](#current-state)
+3. [Target Architecture](#target-architecture)
+4. [Alignment with llama.cpp](#alignment-with-llamacpp)
+5. [Data Structures](#data-structures)
+6. [API Endpoints](#api-endpoints)
+7. [Chat Template Handling](#chat-template-handling)
+8. [Streaming (SSE)](#streaming-sse)
+9. [Slot Management](#slot-management)
+10. [Error Handling](#error-handling)
+11. [Implementation Plan](#implementation-plan)
+12. [Testing Strategy](#testing-strategy)
+
+---
+
+## Overview
+
+### Goal
+
+Add an OpenAI-compatible HTTP server to minfer, enabling integration with existing tools and applications that use the OpenAI API format.
+
+### Scope (MVP)
+
+- `POST /v1/chat/completions` — Chat completions endpoint
+- `GET /v1/models` — List available models
+- `GET /health` — Health check
+- Multi-slot support with serial execution (Plan B)
+- Streaming and non-streaming responses
+- **Full sampling parameter support**: `temperature`, `top_k`, `top_p`, `repeat_penalty`,
+  `frequency_penalty`, `presence_penalty`, `seed` (see [Sampling Parameters](#sampling-parameters))
+- **Stop-string termination**: `stop` (string or array of strings) with text-level matching and
+  UTF-8-safe incremental decoding
+
+### Non-Goals (MVP)
+
+- Tool/function calling
+- JSON schema constrained output
+- Embeddings endpoint
+- Multi-model routing
+- Batch processing
+- Multimodal message content (content arrays); such requests are rejected with a clear 400 instead
+  of a serde parse error
+
+---
+
+## Current State
+
+### Existing Components (Reusable)
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| Chat template rendering | `src/template.rs` | Single-turn only, needs extension |
+| ChatML formatting | `src/models/qwen2/mod.rs:66` | Ready (multi-message) |
+| Model inference | `src/models/qwen2/graph.rs` | Ready; `forward_cached` (per-slot cache + explicit n_ctx) implemented (rev 3) |
+| Sampler | `src/sampler.rs` | Repeat-penalty / top-k / top-p / temperature; **needs frequency/presence penalty + stop strings** (Phase 1) |
+| Tokenizer | `src/tokenizer.rs` | `decode_bytes` + `complete_utf8_prefix_len` implemented (rev 3); `decode()` kept for compat |
+| KV Cache | Graph allocator persistent regions (`src/graph/alloc.rs`, `kv_pair(layer)`); **`src/cache.rs` is the legacy type and is ignored by the graph path** | Ready for one slot; per-slot possible via `forward_cached` (rev 3) |
+
+### Missing Components
+
+| Component | Purpose | Complexity | Status |
+|-----------|---------|------------|--------|
+| HTTP server | Accept connections | Medium | pending (Phase 2) |
+| Request parser | Parse OpenAI format | Low | pending |
+| Response formatter | Generate OpenAI format | Low | pending |
+| Slot-scoped graph cache | `forward_cached` (Phase 0) | — | **done (rev 3)** |
+| Configurable n_ctx | `forward_cached` n_ctx param + bounds assert (Phase 0) | — | **done (rev 3)** |
+| Byte-level tokenizer API | `decode_bytes` + `complete_utf8_prefix_len` (Phase 0) | — | **done (rev 3)** |
+| Frequency/presence penalty | Per-vocab penalty pass in `sampler.rs` (shared window with repeat penalty) | Medium | pending (Phase 1) |
+| Stop-string matcher | Text-level stop detection + truncation in the generation loop | Medium | pending (Phase 1) |
+| UTF-8 incremental decoder | Hold back incomplete multi-byte sequences (Phase 0 helper done; loop wiring pending) | Low-Medium | partial |
+| Session manager | Multi-slot state | Medium | pending |
+| Streaming support | SSE responses | Medium | pending (Phase 4) |
+| Error handler | Standard error format | Low | pending |
+
+---
+
+## Target Architecture
+
+```
++-------------------------------------------------------------+
+|                        HTTP Layer                           |
+|                  (axum + tokio runtime)                     |
++-------------------------------------------------------------+
+|  POST /v1/chat/completions  |  GET /v1/models  |  /health  |
++-------------------------------------------------------------+
+|                     Request Parser                          |
+|         (JSON -> ChatCompletionRequest struct)              |
++-------------------------------------------------------------+
+|                   Chat Template Engine                      |
+|        (messages array -> formatted prompt string)          |
++-------------------------------------------------------------+
+|                     Session Manager                         |
+|              (Slot pool + request routing)                  |
++-----------------+-----------------+------------------------+
+|    Slot 0       |    Slot 1       |         Slot N         |
+|   GraphCache    |   GraphCache    |        GraphCache      |
+|   (graph + KV   |   (graph + KV   |    (graph + KV regions,|
+|    regions,     |    regions,     |     n_ctx_slot each)   |
+|    n_ctx_slot)  |    n_ctx_slot)  |                        |
+|   state=Idle    |   state=Busy    |        state=Idle      |
++-----------------+-----------------+------------------------+
+|                   Shared Model Layer                        |
+|        (weight tensors — Arc/Cow-shared, tokenizer)         |
++-------------------------------------------------------------+
+```
+
+Key correction vs. rev 1: **each slot owns a `GraphCache`** (one graph + one allocator + its own
+persistent KV regions). The compute graph is *not* shared: `GraphParams` includes `n_tokens`/`gtype`,
+so a prefill for a different prompt length rebuilds the graph anyway, and the KV regions live inside
+the allocator, which is per-cache. What is shared across slots is the **weight data** (`Tensor.data` is
+`Cow<'static, [u8]>` borrowing the GGUF blob, and Metal weights live in the global `MpsState` registry),
+plus the tokenizer and the chat template.
+
+---
+
+## Alignment with llama.cpp
+
+### Request/Response Format
+
+llama.cpp's `oaicompat_chat_params_parse` (in `tools/server/server-common.cpp`, function name, not line
+numbers — the file was restructured) defines the request format. Our parser must accept:
+
+**Required fields:**
+- `messages` (array of objects with `role` and `content`)
+
+**Optional fields (MVP):**
+- `model` (string, ignored if single model)
+- `stream` (boolean, default: false)
+- `max_tokens` (integer, default: **-1 = no limit**; generate until EOS, a stop string, or the slot's
+  context fills — matches llama.cpp `n_predict` default `-1` in `common/common.h`)
+- `temperature` (float, default: **0.8** — llama.cpp / minfer CLI default, *not* the OpenAI 1.0)
+- `top_k` (integer, default: **40**)
+- `top_p` (float, default: **0.95** — llama.cpp / minfer CLI default)
+- `repeat_penalty` (float, default: **1.1**; 1.0 disables)
+- `frequency_penalty` (float, default: 0.0)
+- `presence_penalty` (float, default: 0.0)
+- `stop` (string or array of strings; also accepts `stop_sequences`, Anthropic alias)
+- `seed` (integer; **default: random** — `LLAMA_DEFAULT_SEED` semantics, *not* the CLI's `42`)
+
+> The service-side defaults deliberately match llama.cpp / the minfer CLI (`0.8` / `0.95`) rather than
+> the OpenAI spec (`1.0` / `1.0`) so server and CLI behavior are consistent. This is a documented
+> divergence from OpenAI; clients that care should pass explicit values.
+
+**Non-goals (MVP):**
+- `tools` / `tool_choice`
+- `response_format` (json_schema mode)
+- `logprobs` / `top_logprobs`
+- `reasoning_effort`
+- `n` (multiple choices), `logit_bias`, `user`
+- multimodal `content` arrays (reject with 400)
+
+**Unknown fields** are ignored silently, but the fields above must be parsed — llama.cpp passes through
+extra sampling keys (e.g. `min_p`), and a silent drop of a known field (e.g. `top_k`) would diverge from
+llama.cpp behavior without any warning.
+
+### Sampling Parameters
+
+llama.cpp implements all penalties in one sampler (`llama_sampler_init_penalties`, applied before
+top-k). minfer's `sampler.rs` today only has the repeat-penalty half; the MVP must extend
+`apply_repetition_penalty` into a combined penalties pass over the same recent-token window
+(`repeat_last_n = 64`, matching llama.cpp and the minfer CLI):
+
+```
+for each distinct token t in the last 64 tokens, with count(t) occurrences:
+    logits[t] -= count(t) * frequency_penalty                      # if frequency_penalty != 0
+    logits[t] -= presence_penalty                                  # once, if count(t) > 0 and presence_penalty != 0
+    logits[t] = logits[t] <= 0 ? logits[t] * repeat_penalty        # repeat penalty (existing behavior)
+                             : logits[t] / repeat_penalty          # if repeat_penalty != 1.0
+```
+
+Sampler chain order stays: penalties → top-k → top-p → temperature (llama.cpp order). A single merged
+penalty pass avoids two scans of the 64-token window. Cost is bounded by the window: count distinct
+tokens in the last 64 once (HashMap, O(64)), then apply per distinct token — the same cost class as
+llama.cpp's penalties sampler (no full-vocab scan needed).
+
+### Stop Strings
+
+`stop` is **not** implemented anywhere in minfer today (the CLI only stops on EOS / `<|im_end|>`,
+`src/main.rs:is_stop_token`). llama.cpp converts `stop` into `antiprompt` entries checked at the
+**text level** after each token (`tools/server/server-task.cpp`), truncating the emitted text at the
+stop string and reporting `stopping_word` in the response. Our generation loop must add:
+
+1. A per-slot **byte buffer** of generated text (post byte-level detokenization).
+2. After each sampled token, append its bytes and check whether the buffer ends with any stop string
+   (byte-wise suffix match, so multi-byte stop strings split across tokens still match).
+3. On match: truncate the buffer at the stop string, set `finish_reason = "stop"`, stop generating.
+   In streaming mode the truncation must happen **before** emitting the chunk — see
+   [Streaming (SSE)](#streaming-sse) for the incomplete-UTF-8 buffering that makes this safe.
+
+### Response Format
+
+Non-streaming response (llama.cpp: `server-task.cpp`, oaicompat response builder):
+
+```json
+{
+  "id": "chatcmpl-<random>",
+  "object": "chat.completion",
+  "created": <unix_timestamp>,
+  "model": "<model_name>",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<generated_text>"
+      },
+      "finish_reason": "stop" | "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": <n>,
+    "completion_tokens": <n>,
+    "total_tokens": <n>
+  }
+}
+```
+
+Streaming response (llama.cpp: `server-stream.cpp`, chunk builder):
+
+```json
+{
+  "id": "chatcmpl-<random>",
+  "object": "chat.completion.chunk",
+  "created": <unix_timestamp>,
+  "model": "<model_name>",
+  "choices": [
+    {
+      "index": 0,
+      "delta": {
+        "role": "assistant" | null,
+        "content": "<text_chunk>" | null
+      },
+      "finish_reason": null | "stop" | "length"
+    }
+  ]
+}
+```
+
+### Chat Template Handling
+
+llama.cpp applies templates via `common_chat_templates_apply` (`common/chat.h`). Our implementation:
+
+1. Parse messages from request
+2. Load Jinja template from GGUF metadata (`tokenizer.chat_template`)
+3. Render template with messages array
+4. Tokenize rendered prompt
+
+**Required change:** `template.rs` only accepts a single `user_input: &str` today, and its ChatML
+fallback (`fallback_chatml`) drops system/assistant messages entirely (it takes only the user input and
+injects a hardcoded system prompt). Both must be extended to a `Vec<ChatMessage>`; see
+[Chat Template Handling](#chat-template-handling) below.
+
+### SSE Format
+
+llama.cpp's SSE formatting (`tools/server/server-common.cpp`, `format_server_sse`-style helpers):
+
+```
+data: {"id":"chatcmpl-xxx",...}\n\n
+data: {"id":"chatcmpl-xxx",...}\n\n
+data: [DONE]\n\n
+```
+
+Key points:
+- Each JSON object prefixed with `data: `
+- Each message ends with `\n\n`
+- Final terminator: `data: [DONE]\n\n`
+- llama.cpp buffers **incomplete UTF-8 sequences** across tokens (`format_incomplete_utf8`) so a
+  multi-byte character split across two tokens never produces `U+FFFD` replacement chars. minfer's
+  `tokenizer::decode` currently uses `String::from_utf8_lossy` (same bug in the CLI) — the server needs
+  a byte-level decode API plus the incomplete-sequence buffer (see [Streaming (SSE)](#streaming-sse)).
+
+### Slot Management
+
+llama.cpp's slot system (`tools/server/server-context.cpp`, `llama_server_context::launch_slot_with_task`):
+- Single `llama_context` shared across all slots; KV cache partitioned by sequence id (`seq_id`)
+- Tasks are **deferred in an unbounded queue** while all slots are busy — never rejected with 503
+- Context overflow triggers **KV context shift** (retain `n_keep`, roll the cache) by default; erroring
+  only when shift is disabled or impossible
+- Serial execution (one decode call per update cycle)
+
+Our implementation:
+- Single model instance with shared weight data and tokenizer
+- **Each slot owns a `GraphCache`** (graph + allocator + persistent KV regions) — the current
+  process-global `graph_cache()` static must be refactored into a per-slot cache passed into
+  `Qwen2Graph::forward` (rev 1's "each slot has an independent `KVCache`" referred to the unused legacy
+  type in `src/cache.rs`)
+- Explicit `n_ctx` parameter: `forward()` currently hardcodes `cparams.n_ctx = hparams.max_seq_len`,
+  which must become configurable (see [Slot Management](#slot-management)) — otherwise "n_ctx divided
+  among slots" cannot be realized
+- Serial execution (no batching in MVP)
+
+---
+
+## Data Structures
+
+### Rust Types
+
+```rust
+// === Request Types ===
+
+#[derive(Deserialize)]
+struct ChatCompletionRequest {
+    messages: Vec<ChatMessage>,
+    model: Option<String>,
+    stream: Option<bool>,
+    max_tokens: Option<i64>,        // default -1 = no limit (llama.cpp n_predict)
+    temperature: Option<f32>,       // default 0.8 (llama.cpp / minfer CLI)
+    top_k: Option<u32>,             // default 40
+    top_p: Option<f32>,             // default 0.95
+    repeat_penalty: Option<f32>,    // default 1.1
+    frequency_penalty: Option<f32>, // default 0.0
+    presence_penalty: Option<f32>,  // default 0.0
+    stop: Option<StopCondition>,    // string | array; also accept "stop_sequences" alias
+    seed: Option<u64>,              // default: random (NOT the CLI's 42)
+}
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    role: String,            // validate: "system" | "user" | "assistant" | "tool" | "developer" -> else 400
+    content: Option<String>, // null allowed (assistant prefill / tool-call turn)
+    // NOTE: OpenAI also permits `content` as an array of parts (multimodal).
+    // MVP: reject arrays with a clear 400 (see Non-Goals) instead of a serde error.
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StopCondition {
+    String(String),
+    Array(Vec<String>),
+}
+
+// === Sampling Parameters (resolved once per request, applied per token) ===
+
+struct SamplingParams {
+    temp: f32,               // 0.8 default; < 1e-6 => greedy
+    top_k: usize,            // 40
+    top_p: f32,              // 0.95
+    repeat_penalty: f32,     // 1.1
+    frequency_penalty: f32,  // 0.0
+    presence_penalty: f32,   // 0.0
+    seed: u64,               // random by default; per-slot StdRng
+    stop_strings: Vec<String>, // from `stop` / `stop_sequences`
+    max_tokens: i64,         // -1 = no limit
+}
+```
+
+> **Defaults note:** `SamplingParams` carries the *resolved* defaults from the table above, not `Option`s.
+> `max_tokens = -1` means "generate until EOS, a stop string, or the slot context fills" — never a small
+> magic default like 16, which would truncate every client that omits the field.
+
+```rust
+// === Response Types ===
+
+#[derive(Serialize)]
+struct ChatCompletionResponse {
+    id: String,
+    object: String,         // "chat.completion"
+    created: i64,
+    model: String,
+    choices: Vec<Choice>,
+    usage: Usage,
+}
+
+#[derive(Serialize)]
+struct Choice {
+    index: u32,
+    message: ResponseMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResponseMessage {
+    role: String,
+    content: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+// === Streaming Types ===
+
+#[derive(Serialize)]
+struct ChatCompletionChunk {
+    id: String,
+    object: String,         // "chat.completion.chunk"
+    created: i64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Serialize)]
+struct ChunkChoice {
+    index: u32,
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Delta {
+    role: Option<String>,
+    content: Option<String>,
+}
+
+// === Slot Types ===
+
+struct Slot {
+    id: usize,
+    state: SlotState,
+    cache: GraphCache,          // per-slot graph + allocator + KV regions (NOT src/cache.rs)
+    n_ctx_slot: usize,          // per-slot context (n_ctx / n_slots); passed into forward()
+    current_pos: usize,         // == n tokens stored in KV since the last reset
+    generated_tokens: Vec<u32>,
+    rng: StdRng,                // seeded from `seed`; random (time/entropy) when the request omits it
+    prev_tokens: Vec<u32>,      // repetition-penalty window; MUST be seeded with the prompt tail
+                                // (last 64 prompt tokens) at prefill — the CLI does this in main.rs
+    n_predict_max: i64,         // -1 = until EOS / stop string / context full
+    stop_strings: Vec<Vec<u8>>, // byte-encoded stop strings for suffix matching
+    pending_bytes: Vec<u8>,     // generated bytes not yet emitted (stop detection + UTF-8 buffering)
+    incomplete_utf8: Vec<u8>,   // trailing bytes of a split multi-byte char, held until completion
+}
+
+#[derive(PartialEq)]
+enum SlotState {
+    Idle,
+    Processing,
+}
+
+// === Error Types ===
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: ErrorDetail,
+}
+
+#[derive(Serialize)]
+struct ErrorDetail {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: String,
+    code: u16, // numeric HTTP status — matches llama.cpp's format_error_response.
+               // NOTE: OpenAI's spec uses a *string* code (e.g. "context_length_exceeded");
+               // we deliberately follow llama.cpp. Revisit only if a client depends on it.
+}
+```
+
+---
+
+## API Endpoints
+
+### POST /v1/chat/completions
+
+**Request:**
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ],
+  "model": "qwen2.5-0.5b",
+  "temperature": 0.7,
+  "top_k": 40,
+  "top_p": 0.9,
+  "repeat_penalty": 1.1,
+  "frequency_penalty": 0.3,
+  "presence_penalty": 0.2,
+  "stop": ["\n\n", "User:"],
+  "max_tokens": 100
+}
+```
+
+**Non-streaming Response:**
+```json
+{
+  "id": "chatcmpl-a1b2c3d4",
+  "object": "chat.completion",
+  "created": 1724150000,
+  "model": "qwen2.5-0.5b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help you today?"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 8,
+    "total_tokens": 18
+  }
+}
+```
+
+**Streaming Response:**
+```
+data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":1724150000,"model":"qwen2.5-0.5b","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":1724150000,"model":"qwen2.5-0.5b","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":1724150000,"model":"qwen2.5-0.5b","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":1724150000,"model":"qwen2.5-0.5b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+### GET /v1/models
+
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen2.5-0.5b",
+      "object": "model",
+      "created": 1724150000,
+      "owned_by": "minfer"
+    }
+  ]
+}
+```
+
+### GET /health
+
+**Response:**
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
+## Chat Template Handling
+
+### Current Implementation
+
+`src/template.rs` renders a template with a single user message.
+
+Current signature:
+- `render_template(template, user_input, add_generation_prompt, bos_token) -> String`
+
+Current limitations (both must be fixed for the server):
+1. Only a single `user_input` is rendered as one `{"role": "user"}` message.
+2. The ChatML fallback `fallback_chatml(user_input, ...)` takes **only the user input**, drops
+   system/assistant messages from a multi-turn conversation, and injects a hardcoded system prompt.
+
+### Required Changes
+
+Extend to accept the full message array. New signature:
+- `render_messages(template, messages: &[ChatMessage], add_generation_prompt, bos_token) -> String`
+
+Input validation before rendering (returns 400 `invalid_request_error` on failure):
+- `role` must be one of `system | user | assistant | tool | developer`; unknown roles would otherwise
+  flow into the template/ChatML fallback and produce garbage.
+- `content` must be a string or null; reject array (multimodal) content with a clear 400.
+
+### Template Rendering Flow
+
+1. Parse request into Vec of ChatMessage (validated)
+2. Load template from GGUF metadata (`tokenizer.chat_template`)
+3. Create context with messages array
+4. Render via minijinja (`tools` is passed as UNDEFINED — already handled in `template.rs`, matching
+   llama.cpp's behavior of skipping the tools block when none are supplied)
+5. Fallback to ChatML if template fails
+
+Minor: the template is recompiled per request today (`Environment::new()` per call); fine for MVP, but
+the server may cache one compiled `Environment` per model to skip recompilation.
+
+### ChatML Fallback
+
+The fallback function must iterate over **all** messages (not just the user message) and format each as:
+
+```
+<im_start>{role}
+{content}<im_end>
+```
+
+Then append `<im_start>assistant\n` if add_generation_prompt is true.
+
+> This is a rewrite of the current `fallback_chatml`, which only accepts `user_input` and hardcodes the
+> system message — the rev-1 doc's spec was correct, but the existing code does not implement it.
+
+---
+
+## Streaming (SSE)
+
+### SSE Format Specification
+
+Each streaming chunk follows this format:
+
+```
+data: {json_object}\n\n
+```
+
+The final message is:
+
+```
+data: [DONE]\n\n
+```
+
+### First Chunk
+
+The first chunk must include `"delta": {"role": "assistant"}` with null content.
+
+### Content Chunks
+
+Subsequent chunks include `"delta": {"content": "<text>"}` with no role.
+
+### Final Chunk
+
+The final chunk has `"finish_reason": "stop"` (EOS or stop string) or `"length"` (max_tokens or
+context full) and empty delta.
+
+### Implementation Notes
+
+- Use axum's SSE response type or manual streaming
+- Each chunk is a ChatCompletionChunk serialized to JSON
+- Prefix each with "data: " and suffix with "\n\n"
+- Send "data: [DONE]\n\n" at stream end
+- **Threading:** inference is synchronous and serial; run it on a dedicated worker thread (one per
+  server, matching Plan B) and push tokens into a per-request `mpsc` channel that the axum handler
+  streams from. Do not run inference inline in async handlers; a single worker keeps MPS command-buffer
+  submission on one consistent thread and gives natural backpressure. The slot-scoped `GraphCache` lock
+  must be held for the **entire** prefill + decode sequence of a request — never released between
+  steps, or an interleaved request clobbers the KV regions.
+
+### UTF-8-Safe Incremental Decoding
+
+minfer's `tokenizer::decode()` uses `String::from_utf8_lossy`, which turns an incomplete multi-byte
+sequence (a token carrying the first 1–2 bytes of a CJK character) into `U+FFFD`. llama.cpp avoids this
+with `format_incomplete_utf8` (holds trailing bytes until the character completes). Server requirements:
+
+1. Add `Tokenizer::decode_bytes(&[u32]) -> Vec<u8>` (byte-level, no lossy conversion).
+2. Per slot, keep `incomplete_utf8: Vec<u8>`; each emitted chunk = the complete-UTF-8 prefix of
+   (held bytes + new token bytes); trailing incomplete bytes are held back.
+3. Flush any remaining incomplete bytes only at the end of the stream (before `[DONE]`).
+
+### Stop-String Truncation in Streaming
+
+Because chunks already sent cannot be retracted, stop detection must run **before** a chunk is emitted:
+
+- Maintain `slot.pending_bytes` (generated bytes not yet emitted).
+- After each token: append bytes → byte-wise suffix match against every `stop_strings` entry.
+- If matched: truncate `pending_bytes` at the stop string, stop generation, emit the truncated text as
+  the final content chunk, then `{"delta": {}, "finish_reason": "stop"}` and `[DONE]`.
+- If not matched: emit only the complete-UTF-8 prefix of `pending_bytes` (the stop string may span the
+  next token, so the full pending buffer is never emitted until the check passes).
+
+---
+
+## Slot Management
+
+### Slot Structure
+
+Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)):
+- id: unique slot identifier
+- state: Idle or Processing
+- cache: a **`GraphCache`** (graph + allocator + persistent KV regions) — *not* the legacy `KVCache`
+  from `src/cache.rs`, which the graph path ignores
+- n_ctx_slot: per-slot context budget
+- current_pos: current generation position (number of tokens stored in KV since the last reset)
+- generated_tokens: list of generated token IDs
+- rng: independent StdRng, seeded from the request's `seed` (random when omitted)
+- prev_tokens: repetition-penalty window, **seeded with the last 64 prompt tokens at prefill** (the CLI
+  does this in `src/main.rs`; without it the first 64 generated tokens escape the penalty)
+- n_predict_max: max tokens to generate (-1 = no limit)
+- stop_strings / pending_bytes / incomplete_utf8: stop matching + UTF-8 buffering state
+  (see [Streaming (SSE)](#streaming-sse))
+
+### Slot Lifecycle
+
+1. Request arrives -> find idle slot
+2. If no idle slot -> **defer the task in the request queue** (never reject with 503; matches
+   llama.cpp's unbounded task queue)
+3. Assign task to slot -> state becomes Processing; seed `prev_tokens` from the prompt tail
+4. Run prefill on the slot's KV regions (positions 0..nt); if prompt length exceeds the slot's
+   remaining context, see [Context Overflow Handling](#context-overflow-handling)
+5. Autoregressive generation loop (penalties → top-k → top-p → temperature; stop-string / EOS /
+   max_tokens / context-full termination)
+6. On completion -> state becomes Idle, KV regions and sampling state are reset for the next request
+7. Return response -> slot available for next request
+
+### Model Sharing
+
+The **weight data** (GGUF-backed tensors, `Cow<'static, [u8]>` — plus Metal weights in the global
+`MpsState`), the **tokenizer**, and the **chat template** are shared across all slots. The **compute
+graph and its allocator are per-slot** (rev 1 said "compute graph shared" — wrong: the KV regions live
+inside the allocator, and `GraphParams` includes `n_tokens`/`gtype`, so a per-request prefill rebuilds
+the graph anyway).
+
+### Context Size Allocation
+
+Total context (n_ctx) is divided equally among slots:
+- n_ctx_slot = n_ctx / n_slots
+- Each slot's `GraphCache` builds its KV regions sized for **n_ctx_slot** (KV element count =
+  `n_kv_embd * n_ctx_slot` per layer)
+
+Prerequisite: `Qwen2Graph::forward` currently hardcodes `cparams.n_ctx = hparams.max_seq_len`
+(`src/models/qwen2/graph.rs`) — this must accept the per-slot `n_ctx` as a parameter, otherwise KV is
+always sized for the model's full max_seq_len (32768 for Qwen2.5-7B) and the division is a no-op.
+
+Memory note: minfer stores KV as **f32** (the allocator pools are `Vec<f32>`); llama.cpp defaults to
+f16. For Qwen2.5-7B at n_ctx 4096 the f32 KV is ~460 MB/slot (vs ~230 MB f16). Sizing n_ctx_slot is
+the only lever the MVP has until an f16 KV store lands — budget it explicitly.
+
+### Concurrency Model
+
+- Requests can arrive concurrently
+- Task queue + slot assignment is serialized via a Mutex; busy slots defer tasks (see lifecycle)
+- Inference is serial (one slot at a time) on a dedicated worker thread
+- This matches llama.cpp's `--parallel N` behavior (minus batching, which is a non-goal)
+
+---
+
+## Error Handling
+
+### Error Response Format
+
+All errors follow OpenAI's error format:
+
+```json
+{
+  "error": {
+    "message": "Error description",
+    "type": "error_type",
+    "code": 400
+  }
+}
+```
+
+### Error Types
+
+| Scenario | HTTP Status | Error Type |
+|----------|-------------|------------|
+| Missing messages field | 400 | invalid_request_error |
+| Invalid message format (role, content array) | 400 | invalid_request_error |
+| Context length exceeded | 400 | exceed_context_size_error (llama.cpp's dedicated type; OpenAI uses the string code `context_length_exceeded`) |
+| Model not loaded | 503 | unavailable_error |
+| Internal server error | 500 | server_error |
+
+**Note:** there is **no "all slots busy" error** — busy slots defer their tasks in the request queue
+(matching llama.cpp's unbounded task queue). Rejecting with 503 would break streaming clients that
+rely on long-running generations.
+
+### Context Overflow Handling
+
+Before running inference, check if the prompt tokens exceed the slot's remaining context:
+- remaining = n_ctx_slot - current_pos
+- If prompt_tokens > remaining, return 400 with an overflow error.
+
+This deliberately diverges from llama.cpp, whose default behavior is **KV context shift** (retain the
+first `n_keep` tokens, roll the cache forward, continue) with an error only when shifting is disabled
+or impossible. Shift is a post-MVP enhancement; until then, the 400 response is the documented behavior.
+Note also that the slot's positions must stay below `n_ctx_slot` on every decode step — the overflow
+check alone is not enough, because a long generation that never hits `max_tokens` will fill the slot
+(KV store writes at `positions`; out-of-range positions would corrupt memory). Track `current_pos` and
+stop with `finish_reason: "length"` when it reaches `n_ctx_slot`.
+
+---
+
+## Implementation Plan
+
+### Phase 0: Architecture Prerequisites (no HTTP yet)
+
+**Status: implemented (rev 3).** All three items are done with tests.
+
+These refactors are required before any slot can exist; each is independently testable via `cargo test`.
+
+1. **Per-slot `GraphCache`**: `Qwen2Graph::forward_cached` takes a `&mut GraphCache`; the
+   process-global `graph_cache()` static is now only the CLI's thin wrapper (`forward()` delegates to
+   `forward_cached` with `max_seq_len`). `ModelDef::forward_graph_cached` added for the server path.
+2. **Configurable `n_ctx`**: `forward_cached` sizes KV regions from its `n_ctx` argument and asserts
+   `positions < n_ctx` before execution (panic instead of KV-region overflow).
+3. **Byte-level tokenizer API**: `Tokenizer::decode_bytes(&[u32]) -> Vec<u8>` +
+   `complete_utf8_prefix_len` in `src/tokenizer.rs` (no `from_utf8_lossy`).
+
+Test: `forward_cached_isolates_kv_between_caches` — two caches interleaved stay bit-identical,
+smaller `n_ctx` gives identical prefill logits, out-of-range positions are rejected.
+
+### Phase 1: Sampler Extensions (`src/sampler.rs` + generation loop)
+
+1. Merge frequency/presence into the penalty pass: extend `apply_repetition_penalty` →
+   `apply_penalties(logits, prev_tokens, repeat, freq, presence)` per the formula in
+   [Sampling Parameters](#sampling-parameters); keep behavior identical when freq/presence are 0.
+2. `prev_tokens` seeding: extract the CLI's prompt-tail seeding (`src/main.rs`) into a helper the
+   server's slot prefill also calls.
+3. Stop-string matcher: implement byte-wise suffix matching over `pending_bytes`; unit-test with
+   multi-byte stop strings split across tokens.
+4. Keep the existing sampler chain order (penalties → top-k → top-p → temperature).
+
+### Phase 2: Core Infrastructure
+
+**Files to create:**
+- `src/server/mod.rs` - Server module root
+- `src/server/types.rs` - Request/response types
+- `src/server/chat.rs` - Chat completions handler
+- `src/server/slot.rs` - Slot management
+
+**Dependencies to add:**
+- `axum` - HTTP framework
+- `tokio` - Async runtime
+- `tower-http` - CORS middleware
+- `uuid` - Request ID generation
+
+### Phase 3: Chat Endpoint
+
+1. Implement request parsing with serde (all fields from
+   [Request/Response Format](#requestresponse-format), including `top_k`/`repeat_penalty`/`stop`/penalties)
+2. Implement response formatting (incl. `usage` counted on the **rendered** prompt tokens)
+3. Implement non-streaming chat completions on a single slot (worker thread + channel)
+4. Test with curl
+
+### Phase 4: Streaming
+
+1. Implement SSE response formatting
+2. Wire UTF-8-safe incremental decoding (`decode_bytes` + `incomplete_utf8` holdback)
+3. Implement stop-string truncation before emission (see
+   [Stop-String Truncation in Streaming](#stop-string-truncation-in-streaming))
+4. Test with streaming clients
+
+### Phase 5: Multi-Slot
+
+1. Implement `Slot` struct (per-slot `GraphCache`, `n_ctx_slot`, sampling/stop/UTF-8 state)
+2. Implement SlotPool + task queue with Mutex (defer when all busy — no 503)
+3. Integrate with the worker thread and the per-request channels
+4. Test concurrent requests
+
+### Phase 6: Polish
+
+1. Add /v1/models endpoint
+2. Add /health endpoint
+3. Add error handling (`code` numeric, matching llama.cpp's `format_error_response`)
+4. Add CLI flag `--server [--port] [--n-ctx] [--n-slots]`
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+
+- Request parsing (valid and invalid inputs; missing `messages`, unknown `role`, array `content` → 400)
+- Response formatting
+- Chat template rendering with multiple messages (incl. ChatML fallback preserving all roles)
+- Slot allocation and release
+- **Sampler:** frequency/presence penalty formula (incl. zero-frequency identity with the old repeat
+  penalty); penalty window seeding from the prompt tail
+- **Stop strings:** suffix matching, multi-byte stop strings split across token boundaries, truncation
+  content correctness
+- **UTF-8:** `decode_bytes` round-trip; incomplete-sequence holdback across tokens (no `U+FFFD` in
+  streamed output)
+
+### Integration Tests
+
+- Non-streaming chat completions
+- Streaming chat completions
+- Concurrent requests (queueing behavior — no 503 under load)
+- Context overflow handling (400 + `exceed_context_size_error`; `finish_reason: "length"` at
+  `n_ctx_slot` without overflow)
+- Stop-string termination in both modes
+
+### Compatibility Tests
+
+- Test with OpenAI Python client
+- Test with curl
+- Test with existing chat UI tools
+- Compare sampler behavior vs the minfer CLI for identical params (temp/top_k/top_p/repeat) and vs
+  llama.cpp server for identical prompts + penalties
+
+### Performance Tests
+
+- Measure tokens/second for single slot
+- Measure latency under concurrent load
+- Compare with llama.cpp server
