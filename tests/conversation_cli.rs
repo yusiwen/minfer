@@ -24,7 +24,7 @@ fn model_path() -> Option<String> {
 fn run_cli(args: &[&str], stdin_input: &str, timeout_secs: u64) -> (String, String, i32) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_minfer"))
         .args(args)
-        // 固定 CPU 后端：golden/断言与后端解耦（Metal logits 与 CPU 有 ~1e1 差异）
+        // Pin the CPU backend: golden/assertions decoupled from the backend (Metal logits differ from CPU by ~1e1)
         .env("MINFER_DISABLE_MPS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -74,7 +74,7 @@ fn turn_stats(err: &str) -> Vec<(usize, usize, usize)> {
 
 #[test]
 fn cnv_with_no_template_errors_before_model_load() {
-    // 互斥校验发生在模型解析之前 → 任意路径即可，快。
+    // The mutual-exclusion check runs before model parsing → any path works, fast.
     let (_, err, code) = run_cli(&["--cnv", "--no-template", "no-such-model.gguf"], "", 30);
     assert_ne!(code, 0, "must exit non-zero");
     assert!(
@@ -118,14 +118,14 @@ fn two_turn_session_via_stdin_pipe() {
     assert!(!out.contains('\u{FFFD}'), "no U+FFFD in stdout");
     let stats = turn_stats(&err);
     assert_eq!(stats.len(), 2, "two turns: {err}");
-    // 增量性（L8）：turn 2 的 delta prefill 必须小于 turn 1 的全量渲染
+    // Incrementality (L8): turn 2's delta prefill must be less than turn 1's full rendering
     assert!(
         stats[1].1 < stats[0].1,
         "turn 2 prefill ({}) must be < turn 1 prefill ({}): {err}",
         stats[1].1,
         stats[0].1
     );
-    // 两回合都有输出（assistant 文本经 emit 进 stdout）
+    // Both turns produce output (assistant text emitted to stdout)
     assert!(out.trim().len() > 0, "assistant output expected: {out:?}");
 }
 
@@ -161,7 +161,7 @@ fn clear_and_regen_commands() {
         1800,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    // /clear 的确认走 stdout（println!），错误走 stderr
+    // /clear confirmation goes to stdout (println!), errors to stderr
     assert!(out.contains("[history cleared]"), "stdout: {out}");
     assert!(!err.contains("[regen failed"), "regen must succeed: {err}");
     assert!(!err.contains("[error]"), "no errors: {err}");
@@ -176,7 +176,7 @@ fn stop_string_truncates_output() {
         eprintln!("0.5B q4_0 not cached; skipping");
         return;
     };
-    // 常见英文单词 stop 串；模型输出被截断到 stop 之前
+    // A common English stop string; model output is truncated before the stop
     let input = "hi\n/exit\n";
     let (out, _, code) = run_cli(
         &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512",
@@ -195,9 +195,9 @@ fn context_overflow_truncates_and_continues() {
         eprintln!("0.5B q4_0 not cached; skipping");
         return;
     };
-    // 小 n_ctx + 多回合累积：每回合至少 ~9 token（渲染 + EOG/EOT），8 回合必然
-    // 越过 n_ctx → 触发"丢弃最旧回合 + 全量重灌"（§5.7），会话不中断、不报错。
-    // 对模型实际回复长度鲁棒（-n 4 封顶生成）。
+    // Small n_ctx + accumulated turns: each turn costs at least ~9 tokens (render +
+    // EOG/EOT), so 8 turns inevitably exceed n_ctx → "drop oldest turn + full re-render"
+    // (§5.7) triggers; session continues without error. Robust to reply length (-n 4 caps generation).
     let input = "hi\n".repeat(8) + "/exit\n";
     let (_, err, code) = run_cli(
         &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "40",
@@ -223,7 +223,7 @@ fn session_save_load_round_trip() {
     let session = session.to_string_lossy().to_string();
     let _ = std::fs::remove_file(&session);
 
-    // run 1：两回合后 /exit → 落盘
+    // run 1: /exit after two turns → saved to disk
     let (_, err1, code1) = run_cli(
         &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512",
           "--session", &session, &model],
@@ -234,7 +234,7 @@ fn session_save_load_round_trip() {
     assert!(err1.contains("[session] saved"), "stderr: {err1}");
     assert!(std::path::Path::new(&session).exists(), "session file written");
 
-    // run 2：载入历史 → 继续 1 回合 → 退出（再次落盘）
+    // run 2: load history → continue one turn → exit (saved again)
     let (_, err2, code2) = run_cli(
         &["--cnv", "--greedy", "--seed", "43", "--color", "off", "--n-ctx", "512",
           "--session", &session, &model],

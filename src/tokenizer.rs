@@ -361,7 +361,7 @@ mod tests {
     use super::*;
 
     /// Minimal tokenizer for decode tests: id 2 is the byte-level encoding of
-    /// 中 (U+4E2D = E4 B8 AD in UTF-8, i.e. bytes 0xE4 0xB8 0xAD).
+    /// the CJK char U+4E2D (E4 B8 AD in UTF-8, i.e. bytes 0xE4 0xB8 0xAD).
     fn test_tokenizer() -> Tokenizer {
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
@@ -393,7 +393,7 @@ mod tests {
     fn decode_bytes_keeps_multibyte_bytes() {
         let t = test_tokenizer();
         let bytes = t.decode_bytes(&[2]);
-        assert_eq!(bytes, vec![0xE4, 0xB8, 0xAD]); // 中
+        assert_eq!(bytes, vec![0xE4, 0xB8, 0xAD]); // bytes of U+4E2D
         assert_eq!(t.decode(&[2]), "中");
         assert!(!t.decode(&[2]).contains('\u{FFFD}'));
     }
@@ -407,15 +407,15 @@ mod tests {
 
     #[test]
     fn complete_utf8_prefix_len_holds_incomplete_trailing() {
-        // 中 = E4 B8 AD
+        // U+4E2D = E4 B8 AD
         let full = [0xE4u8, 0xB8, 0xAD];
         assert_eq!(complete_utf8_prefix_len(&full[..1]), 0, "1 of 3 bytes: incomplete");
         assert_eq!(complete_utf8_prefix_len(&full[..2]), 0, "2 of 3 bytes: incomplete");
         assert_eq!(complete_utf8_prefix_len(&full[..3]), 3, "all 3 bytes: complete");
 
         let mixed = [b'a', 0xE4, 0xB8, 0xAD, b'b'];
-        assert_eq!(complete_utf8_prefix_len(&mixed[..3]), 1, "a complete, 中 incomplete");
-        assert_eq!(complete_utf8_prefix_len(&mixed[..4]), 4, "a + 中 complete");
+        assert_eq!(complete_utf8_prefix_len(&mixed[..3]), 1, "a complete, U+4E2D incomplete");
+        assert_eq!(complete_utf8_prefix_len(&mixed[..4]), 4, "a + U+4E2D complete");
         assert_eq!(complete_utf8_prefix_len(&mixed[..5]), 5);
         assert_eq!(complete_utf8_prefix_len(b"abc"), 3, "pure ASCII");
         assert_eq!(complete_utf8_prefix_len(&[]), 0);

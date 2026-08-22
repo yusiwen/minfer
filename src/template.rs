@@ -54,23 +54,23 @@ pub fn render_messages(
     }
 }
 
-/// 差分渲染结果（`common_chat_format_single` 的 minfer 版）。
+/// Diff rendering result (the minfer version of `common_chat_format_single`).
 pub struct FormattedDelta {
-    /// 追加文本：`fmt_new` 去掉 `fmt_past` 前缀后的部分（含尾部换行补偿）。
+    /// Appended text: the part of `fmt_new` after stripping the `fmt_past` prefix (including trailing-newline compensation).
     pub text: String,
-    /// `fmt_new` 是否以 `fmt_past` 为前缀。false 表示模板非确定性（如依赖
-    /// 外部状态），调用方必须放弃增量、走全量重灌兜底（§5.4）。
+    /// Whether `fmt_new` starts with the `fmt_past` prefix; false means the template is
+    /// non-deterministic (e.g. depends on external state) → caller must fall back to a full re-render (§5.4).
     pub prefix_matched: bool,
 }
 
-/// 增量渲染：给定已记录历史与新消息，返回"只需追加进 KV"的文本增量。
+/// Incremental rendering: given the recorded history and the new message, return the text delta that only needs to be appended to KV.
 ///
-/// 对应 llama.cpp `common_chat_format_single`（common/chat.cpp:653）：
-/// 两次渲染（有/无新消息）取差分，避免把已生成的历史重复喂给模型；
-/// 若 `fmt_past` 以 `\n` 结尾则前补 `\n`——该换行属于前缀尾部，被 diff 吃掉，
-/// 但模型生成的 EOG 之后不会自带它，而 canonical 文本需要它（§3.2/§5.4）。
+/// Mirrors llama.cpp `common_chat_format_single` (common/chat.cpp:653): renders
+/// twice (with/without the new message) and diffs, avoiding re-feeding generated
+/// history to the model. If `fmt_past` ends with `\n`, prepend `\n` — that newline
+/// is the prefix tail, eaten by the diff, but not emitted after the model's EOG; canonical text needs it (§3.2/§5.4).
 ///
-/// `template` 为 None 时用 ChatML fallback 渲染（`fallback_chatml_messages`）。
+/// When `template` is None, render with the ChatML fallback (`fallback_chatml_messages`).
 pub fn format_single(
     template: Option<&str>,
     messages: &[(String, Option<String>)],
@@ -92,8 +92,8 @@ pub fn format_single(
     let fmt_new = render(&all, add_generation_prompt);
 
     let mut out = String::new();
-    // 尾部换行补偿：fmt_past 以 '\n' 结尾时，该换行属于前缀尾部，diff 会丢掉它，
-    // 但 canonical 文本（模型 EOG 之后、下一条消息之前）需要它。
+    // Trailing-newline compensation: when fmt_past ends with '\n', the newline is
+    // the prefix tail, eaten by the diff, but required by canonical text (after EOG, before next message).
     if add_generation_prompt && !fmt_past.is_empty() && fmt_past.ends_with('\n') {
         out.push('\n');
     }
@@ -101,7 +101,7 @@ pub fn format_single(
         out.push_str(&fmt_new[fmt_past.len()..]);
         FormattedDelta { text: out, prefix_matched: true }
     } else {
-        // 前缀失败：模板非确定性 → 返回全量，调用方走全量重灌兜底。
+        // Prefix mismatch: non-deterministic template → return the full text; the caller falls back to a full re-render.
         FormattedDelta { text: fmt_new, prefix_matched: false }
     }
 }
@@ -246,9 +246,9 @@ mod tests {
         assert_eq!(out, "user: hello\nassistant:");
     }
 
-    // === format_single（增量差分渲染，CLI-CONVERSATION-PLAN.md §5.3）===
+    // === format_single (incremental diff rendering, CLI-CONVERSATION-PLAN.md §5.3) ===
 
-    /// Qwen2.5 风格 ChatML 模板（每条消息后跟一个换行，结尾有 assistant 头）。
+    /// Qwen2.5-style ChatML template (a newline after each message, ending with an assistant header).
     const QWEN_CHATML: &str = "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
     fn m(role: &str, content: &str) -> (String, Option<String>) {
@@ -257,8 +257,8 @@ mod tests {
 
     #[test]
     fn format_single_diffs_only_new_user_message() {
-        // 历史 [system, user, assistant] + 新 user → delta 只含新消息与 assistant 头，
-        // 不得重复包含已生成的 assistant 内容。
+        // History [system, user, assistant] + new user → delta contains only the new message
+        // and the assistant header; it must not repeat the already-generated assistant content.
         let past = vec![
             m("system", "You are helpful."),
             m("user", "hi"),
@@ -270,9 +270,9 @@ mod tests {
             d.text,
             "\n<|im_start|>user\nwhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
         );
-        // 不变量：KV 前缀 + delta == fmt_new（canonical 全量渲染）。
-        // KV 前缀 = fmt_past 去掉模板在最后一条消息后输出的换行——模型生成 EOG 后
-        // 不会自带该换行，补偿逻辑正是把它加回 delta 开头。
+        // Invariant: KV prefix + delta == fmt_new (canonical full rendering).
+        // KV prefix = fmt_past minus the newline the template emits after the last message;
+        // the model doesn't emit that newline after EOG, so compensation prepends it to delta.
         let fmt_past = render_messages(QWEN_CHATML, &past, false, "");
         let kv_prefix = fmt_past.strip_suffix('\n').unwrap_or(&fmt_past);
         let mut all = past.clone();
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn format_single_no_trailing_newline_no_compensation() {
-        // 模板不产生尾部 '\n' → 不做补偿。
+        // Template produces no trailing '\n' → no compensation.
         let tmpl = "{% for mm in messages %}[{{ mm['role'] }}:{{ mm['content'] }}]{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
         let past = vec![m("user", "hi"), m("assistant", "Hello!")];
         let d = format_single(Some(tmpl), &past, m("user", "Q"), true, "");
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn format_single_prefix_mismatch_falls_back_to_full() {
-        // 非确定性模板（reverse）→ fmt_new 不以 fmt_past 为前缀 → 全量 + 标记。
+        // Non-deterministic template (reverse) → fmt_new doesn't start with fmt_past → full text + flag.
         let tmpl = "{% for mm in messages|reverse %}[{{ mm['role'] }}]{% endfor %}";
         let past = vec![m("user", "hi"), m("assistant", "Hello!")];
         let d = format_single(Some(tmpl), &past, m("user", "Q"), false, "");
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn format_single_fallback_without_template() {
-        // template=None → ChatML fallback 渲染，同样满足前缀/补偿语义。
+        // template=None → rendered via the ChatML fallback; same prefix/compensation semantics.
         let past = vec![m("user", "hi"), m("assistant", "Hello!")];
         let d = format_single(None, &past, m("user", "Q"), true, "");
         assert!(d.prefix_matched);
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn format_single_null_content_history() {
-        // assistant 消息 content=None（tool-call 回合）不破坏差分。
+        // An assistant message with content=None (tool-call turn) must not break the diff.
         let tmpl = "{% for mm in messages %}[{{ mm['role'] }}]{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
         let past = vec![
             m("user", "hi"),

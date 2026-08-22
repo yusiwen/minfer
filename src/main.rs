@@ -629,7 +629,8 @@ fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
 
 // === Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md Phase 2) ===
 
-/// 读一行用户输入。多行模式（-mli）下累积直到空行提交；EOF 时提交已输入内容或返回 None。
+/// Read one line of user input. In multiline mode (-mli), accumulate until an
+/// empty line submits; on EOF, submit buffered input or return None.
 fn read_user_input(multiline: bool) -> Option<String> {
     use std::io::BufRead;
     let stdin = std::io::stdin();
@@ -637,7 +638,7 @@ fn read_user_input(multiline: bool) -> Option<String> {
     loop {
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).ok()? == 0 {
-            // EOF（Ctrl+D）
+            // EOF (Ctrl+D)
             return if buf.is_empty() { None } else { Some(buf) };
         }
         let line = line.trim_end_matches(['\n', '\r']).to_string();
@@ -645,7 +646,7 @@ fn read_user_input(multiline: bool) -> Option<String> {
             return Some(line);
         }
         if line.is_empty() {
-            return Some(buf); // 空行提交
+            return Some(buf); // empty line submits
         }
         if !buf.is_empty() {
             buf.push('\n');
@@ -654,8 +655,9 @@ fn read_user_input(multiline: bool) -> Option<String> {
     }
 }
 
-/// 交互式多轮对话循环（--cnv）。
-/// 追加式 KV + 增量模板渲染：`Conversation` 状态机 + `GraphEngine` 推理引擎。
+/// Interactive multi-turn conversation loop (--cnv).
+/// Append-only KV + incremental template rendering: a `Conversation` state
+/// machine driving a `GraphEngine` inference engine.
 fn run_conversation(
     model: Box<dyn models::ModelDef>,
     tokenizer: &tokenizer::Tokenizer,
@@ -699,7 +701,7 @@ fn run_conversation(
     let mut conv = conversation::Conversation::new(spec);
     let mut engine = conversation::GraphEngine::new(&*model, params.n_ctx);
 
-    // --session 加载：历史 JSON → 全量重灌 KV（§5.8）。
+    // --session load: history JSON → full KV re-seed (§5.8).
     if let Some(path) = &session_file {
         if let Ok(text) = std::fs::read_to_string(path) {
             match conversation::Conversation::messages_from_json(&text) {
@@ -712,7 +714,7 @@ fn run_conversation(
         }
     }
 
-    // --session 保存（退出时）。
+    // --session save (on exit).
     let save_session = |conv: &conversation::Conversation| {
         if let Some(path) = &session_file {
             let json = conv.messages_to_json();
@@ -739,7 +741,7 @@ fn run_conversation(
     let mut pending = first_prompt;
     loop {
         if pending.is_none() {
-            // 提示符 + flush（管道化测试的前置条件，见文档 §8.3）。
+            // Prompt + flush (precondition for piped tests, see docs §8.3).
             if color_on {
                 print!("\x1b[1;36m");
             }
@@ -757,7 +759,7 @@ fn run_conversation(
         }
         let input = pending.take().unwrap();
 
-        // Slash 命令。
+        // Slash commands.
         if input.starts_with('/') {
             let cmd = input.split_whitespace().next().unwrap_or("");
             match cmd {
@@ -811,7 +813,7 @@ fn run_conversation(
             }
         }
 
-        // 普通用户回合。
+        // Ordinary user turn.
         if color_on {
             print!("\x1b[32m");
             std::io::stdout().flush().unwrap_or(());

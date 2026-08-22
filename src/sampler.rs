@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_stop_suffix_multibyte_split_across_tokens() {
-        // "中" = E4 B8 AD; first two bytes arrive in one token, last byte next
+        // U+4E2D = E4 B8 AD; first two bytes arrive in one token, last byte next
         let partial = [0xE4u8, 0xB8];
         assert_eq!(match_stop_suffix(&partial, &[&[0xE4, 0xB8, 0xAD]]), None, "stop longer than buf");
         let complete = [0xE4u8, 0xB8, 0xAD, 0xE4, 0xB8, 0xAD];
