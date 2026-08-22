@@ -2326,6 +2326,14 @@ kernel void kernel_q8_0_f32_matmul_multi(
             if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = tot0;
             if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = tot1;
         }
+        // RACE FIX (Qwen3 GPU nondeterminism): without a trailing barrier the
+        // next iteration's `sh0[tiisg] = 0.0f` zeroing (top of the loop) can
+        // overtake a slow thread still reading `sh0[tiisg]` in the simd_sum
+        // above — it then reduces over zeros and writes a wrong (often 0)
+        // output element. All threads must finish their shmem reads before
+        // anyone re-zeroes the buffer. Only this kernel cooperates across
+        // simdgroups via shmem inside a t-loop, so only it needs the barrier.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

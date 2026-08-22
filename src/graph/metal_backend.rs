@@ -130,7 +130,7 @@ impl Backend for MetalBackend {
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         match op {
             Op::Input => true,
-            Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::SwiGLU => dtype == DType::F32,
+            Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::QkNorm { .. } | Op::SwiGLU => dtype == DType::F32,
             Op::MatMul { .. } => {
                 matches!(dtype, DType::F32) // activations are f32; weight type in meta
             }
@@ -201,6 +201,31 @@ impl Backend for MetalBackend {
                 let d = node.out_shape[0];
                 let n = node.out_shape[1];
                 // G2: 256-thread kernel when enabled (METAL_OPTIMIZATIONS #16)
+                match w {
+                    Some((wb, w_off)) => {
+                        if crate::metal::rms_norm_256_enabled() {
+                            cb.rms_norm_256(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                        } else {
+                            cb.rms_norm(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                        }
+                    }
+                    None => cb.rms_norm(self.buf(in_bufs[0]), None, 0, self.buf(out_buf), d, n, *eps, 0),
+                }
+                Ok(())
+            }
+            Op::QkNorm { hd, nh, eps } => {
+                // Per-head norm: contiguous [nt*nh, hd] rows — same kernel as
+                // RmsNorm with d = hd and n = nt*nh (weight length hd).
+                let w = match &node.meta {
+                    NodeMeta::Norm(m) => m
+                        .weight_name
+                        .as_ref()
+                        .and_then(|n| self.state.weight_buf(n)),
+                    _ => None,
+                };
+                let d = *hd;
+                let n = (self.pool[out_buf].length() as usize / 4) / d;
+                let _ = nh;
                 match w {
                     Some((wb, w_off)) => {
                         if crate::metal::rms_norm_256_enabled() {

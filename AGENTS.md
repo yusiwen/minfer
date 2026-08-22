@@ -60,6 +60,7 @@ src/
 | `metal_backend.rs` | Metal execution (per-op MPS kernels; `cfg(target_os = "macos")`) |
 | `scheduler.rs` | assign → split → execute (+ cross-backend copies at split boundaries) |
 | `fusion.rs` | Pattern-matching fusion (SwiGLU/BiasRope), gated by backend `supports_fused` |
+| `models/qwen3/` | Qwen3 dense (mod/loader/graph) — Qwen2 + decoupled head dim + `Op::QkNorm` per-head Q/K RMSNorm |
 | `cache.rs` | `GraphCache` — params-only deterministic graph reuse |
 | `params.rs` | `GraphParams`/`CParams`/`GraphType` — the reuse identity |
 | `dot.rs` | Graphviz DOT export (`--dump-graph`) |
@@ -113,6 +114,7 @@ Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 mult
 | Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ | ✓ | Q5_0/Q8_0/Q4_K/Q6_K mixed |
 | Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
 | Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~42 tok/s) | hd=128, split GGUF, graph path verified end-to-end |
+| Q8_0 (qwen3-0.6b-instruct-q8_0) | ✓ | ✓ (~215 tok/s) | Dense Qwen3: decoupled head dim (128) + per-head Q/K RMSNorm (`Op::QkNorm`); greedy 60-token sequence identical to llama.cpp (same GGUF, temp 0, no penalties); hd=128, kv dim 1024 |
 
 ## GPU Safety
 
@@ -191,6 +193,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
 | Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |
 | Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
+| **Qwen3 dense support plan + implementation record** | `docs/QWEN3-SUPPORT-PLAN.md` |
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
 | **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |

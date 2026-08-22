@@ -22,8 +22,9 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **GPU: CUDA backend** (feature-gated `--features cuda`) — NVIDIA GPU
   acceleration with CUDA Graph capture/replay; **graph integration pending
   (Phase 7)** — the legacy `layer_gpu` path remains until then
-- **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
-  RMSNorm
+- **Qwen2 / Qwen3 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
+  RMSNorm; Qwen3 adds the decoupled head dim + per-head Q/K RMSNorm
+  (`attn_q_norm`/`attn_k_norm`, `Op::QkNorm`)
 - **Model download** — auto-download from Hugging Face Hub or Ollama registry
 - **Multi-turn conversation CLI** (`--cnv`) — append-only KV + incremental
   chat-template rendering: each turn only prefills the new message delta, the
@@ -85,17 +86,24 @@ at full GPU speed. See `AGENTS.md` for the Q5_K formula + qh-indexing fixes.
 
 ## Supported Model Architectures
 
-minfer currently supports **one** model architecture.
+minfer currently supports **two** model architectures.
 
 | Architecture | Variants | Status | Detection Key |
 |-------------|----------|:------:|---------------|
 | **Qwen2** | Qwen2, Qwen2.5 | ✅ Fully supported | `general.architecture = "qwen2"` |
+| **Qwen3** | Qwen3 (dense: 0.6B–32B) | ✅ Fully supported (CPU + Metal GPU) | `general.architecture = "qwen3"` |
+
+Qwen3 support: dense architecture only (no MoE / hybrid-SWA / VL variants yet).
+The dense models reuse the Qwen2 graph with two deltas — the head dim is read
+from `qwen3.attention.key_length` (decoupled from `n_embd / n_head`) and Q/K go
+through a per-head RMSNorm (`blk.{i}.attn_q_norm` / `attn_k_norm`) before RoPE.
+See `docs/QWEN3-SUPPORT-PLAN.md` for the design + verification record.
 
 ### How Architecture Detection Works
 
 minfer reads the `general.architecture` string from the GGUF metadata header.
-Only the exact value `"qwen2"` (case-sensitive) is accepted. Any other value
-produces a clear error:
+Only the exact values `"qwen2"` and `"qwen3"` (case-sensitive) are accepted. Any
+other value produces a clear error:
 
 ```
 Unsupported architecture: 'llama'

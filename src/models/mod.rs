@@ -2,6 +2,7 @@
 // Reference: minfer2/src/models/mod.rs
 
 pub mod qwen2;
+pub mod qwen3;
 
 use crate::cache::KVCache;
 use crate::gguf::GgufModel;
@@ -77,6 +78,10 @@ pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
     match arch.as_str() {
         "qwen2" => {
             let m = qwen2::loader::load(model)?;
+            Some(Box::new(m))
+        }
+        "qwen3" => {
+            let m = qwen3::loader::load(model)?;
             Some(Box::new(m))
         }
         other => {

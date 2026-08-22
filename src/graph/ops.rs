@@ -59,6 +59,12 @@ pub enum Op {
 
     // ---- normalization ----
     RmsNorm { eps: f32 },
+    /// Per-head RMSNorm (Qwen3 `attn_q_norm`/`attn_k_norm`): the input is a
+    /// flat token-major buffer `[nt * nh * hd]`; each contiguous `hd`-wide row
+    /// (`t*nh + h`) is RMS-normalized with a weight of length `hd`. The buffer
+    /// layout makes this a contiguous `[nt*nh, hd]` matrix, so execution reuses
+    /// the RMSNorm kernels with `d = hd`, `n = nt*nh`.
+    QkNorm { hd: usize, nh: usize, eps: f32 },
 
     // ---- linear algebra ----
     MatMul { transpose_b: bool },

@@ -69,6 +69,7 @@ impl Backend for CpuBackend {
                 | Op::Silu
                 | Op::Softmax { .. }
                 | Op::RmsNorm { .. }
+                | Op::QkNorm { .. }
                 | Op::MatMul { .. }
                 | Op::GetRows
                 | Op::RoPE { .. }
@@ -198,6 +199,29 @@ impl Backend for CpuBackend {
                     _ => None,
                 };
                 let d = node.out_shape[0];
+                let n = out.len() / d;
+                for t in 0..n {
+                    let row = &ins[0][t * d..(t + 1) * d];
+                    let dst = &mut out[t * d..(t + 1) * d];
+                    match w {
+                        Some(w) => {
+                            crate::vec_ops::rms_norm_fused_f32(d, dst, row, w.data_f32(), *eps)
+                        }
+                        None => crate::vec_ops::rms_norm_f32(d, dst, row, *eps),
+                    }
+                }
+                Ok(())
+            }
+            Op::QkNorm { hd, nh, eps } => {
+                // Per-head norm: the flat [nt*nh*hd] buffer viewed as a
+                // contiguous [nt*nh, hd] matrix (t*(nh*hd) + h*hd == (t*nh+h)*hd),
+                // so this is the same RMSNorm row loop with d = hd, n = nt*nh.
+                let w = match &node.meta {
+                    NodeMeta::Norm(m) => m.weight_name.as_ref().and_then(|n| self.weights.get(n)),
+                    _ => None,
+                };
+                let _ = nh; // row count is derived from the buffer length
+                let d = *hd;
                 let n = out.len() / d;
                 for t in 0..n {
                     let row = &ins[0][t * d..(t + 1) * d];

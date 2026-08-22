@@ -91,6 +91,24 @@ impl GraphBuilder {
         )
     }
 
+    /// Per-head RMSNorm (Qwen3 Q/K norms): normalizes each contiguous `hd`-wide
+    /// head row of the flat `[nt*nh*hd]` buffer with a weight of length `hd`.
+    /// Output shape = input shape.
+    pub fn qk_norm(&mut self, x: NodeId, weight: Option<&Tensor>, hd: usize, nh: usize, eps: f32) -> NodeId {
+        let shape = self.graph.nodes[x].out_shape;
+        self.node(
+            "qk_norm",
+            Op::QkNorm { hd, nh, eps },
+            &[x],
+            shape,
+            DType::F32,
+            NodeMeta::Norm(NormMeta {
+                weight_name: weight.map(|t| t.name.clone()),
+                bias_name: None,
+            }),
+        )
+    }
+
     /// Matrix multiply `w @ x` (+ optional bias).
     ///
     /// Weight convention (llama.cpp/GGUF): the tensor metadata is `[in, out]`
