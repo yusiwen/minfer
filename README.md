@@ -25,8 +25,17 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **Qwen2 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
   RMSNorm
 - **Model download** — auto-download from Hugging Face Hub or Ollama registry
-- **No external ML framework** — pure Rust, only depends on `rand`, `regex`,
-  `half`, `serde`, and `serde_json`
+- **Multi-turn conversation CLI** (`--cnv`) — append-only KV + incremental
+  chat-template rendering: each turn only prefills the new message delta, the
+  whole conversation accumulates in the KV cache; in-session commands
+  (`/clear`, `/regen`, …), automatic overflow truncation, `--session`
+  persistence (see [docs/CLI-CONVERSATION-PLAN.md](docs/CLI-CONVERSATION-PLAN.md))
+- **OpenAI-compatible HTTP server** (`--server`) — `/v1/chat/completions`
+  (streaming + non-streaming), `/v1/models`, `/health`; multi-slot with queued
+  serial execution (see [docs/OPENAI-CHAT-API-PLAN.md](docs/OPENAI-CHAT-API-PLAN.md))
+- **No external ML framework** — pure Rust; runtime deps are minimal (`rand`,
+  `regex`, `half`, `serde`, `serde_json`, `minijinja`; `axum`/`tokio` only for
+  the HTTP server)
 
 ## Supported Quantization Formats
 
@@ -162,7 +171,8 @@ Key modules: `src/graph/` (IR / builder / scheduler / backends / reuse cache),
 `gguf.rs` (parser + mmap'd zero-copy loader), `models/qwen2/` (build_graph +
 loader), `kernel.rs`/`avx2.rs` (quantized matmul), `metal.rs`+`metal.metal` and
 `cuda.rs`+`cuda_kernels.cu` (GPU kernels), `sampler.rs`/`tokenizer.rs`/
-`template.rs` (sampling + tokenization + chat templates). Supported quants:
+`template.rs` (sampling + tokenization + chat templates), `conversation.rs`
+(multi-turn sessions), `server/` (HTTP). Supported quants:
 Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K (CPU + Metal), F32/F16 norms &
 biases.
 
@@ -199,6 +209,14 @@ last reply), `/help`; EOF (Ctrl+D) exits. Flags: `-st/--single-turn`,
 `--system <STR>`, `-mli/--multiline-input`, `--color on|off|auto`,
 `--session <FILE>` (save/load the conversation history as JSON; on overflow the
 oldest turns are dropped automatically and generation continues).
+
+**OpenAI-compatible HTTP server** (`--server`):
+
+```bash
+cargo run --release -- --server --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
+# POST /v1/chat/completions  (stream + non-stream)
+# GET  /v1/models, GET /health
+```
 
 **Examples:**
 
@@ -275,7 +293,7 @@ minfer/
 ├── LICENSE
 ├── README.md
 ├── src/
-│   ├── main.rs            # Entry point, CLI, inference loop
+│   ├── main.rs            # Entry point, CLI (single-shot + --cnv conversation), inference loop
 │   ├── graph/             # ★ Declarative compute graph (the inference core)
 │   │   ├── mod.rs         # ComputeGraph, CNode, DType, Backend, BufRef
 │   │   ├── ops.rs         # Op enum + node metadata
@@ -304,6 +322,12 @@ minfer/
 │   ├── sampler.rs         # Greedy / temperature / top-k / top-p sampling
 │   ├── tokenizer.rs       # BPE tokenizer (self-contained, GGUF-backed)
 │   ├── template.rs        # Chat template detection + formatting
+│   ├── conversation.rs    # Multi-turn conversation session (append-only KV + Engine abstraction)
+│   ├── server/            # OpenAI-compatible HTTP server
+│   │   ├── mod.rs         # axum router + handlers (chat completions, models, health)
+│   │   ├── types.rs       # Request/response types + ApiError
+│   │   ├── slot.rs        # Per-slot GraphCache + context budget
+│   │   └── chat.rs        # Serial worker generation loop + SSE events
 │   ├── download/          # Model download from HF Hub & Ollama
 │   │   └── mod.rs         # resolve() URI handler, curl-based HTTP, list_local()
 │   └── models/            # Architecture-specific implementations
@@ -316,7 +340,8 @@ minfer/
 │   ├── flash_attn_blk_isolation.rs
 │   ├── flash_attn_isolation.rs
 │   ├── gemm_isolation.rs
-│   └── gqa_attn_isolation.rs
+│   ├── gqa_attn_isolation.rs
+│   └── conversation_cli.rs # --cnv process-level tests (arg validation + ignored real-model sessions)
 ├── scripts/               # Benchmark + verification tooling
 │   ├── bench.sh           # GPU benchmark wrapper (asserts MPS active)
 │   ├── compare_layers.py  # Layer-by-layer comparison vs llama.cpp dumps
