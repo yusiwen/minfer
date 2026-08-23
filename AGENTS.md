@@ -196,6 +196,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |
 | Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
 | **Qwen3 dense support plan + implementation record** | `docs/QWEN3-SUPPORT-PLAN.md` |
+| **Architecture roadmap (which model families to support next, tiered by reuse)** | `docs/ARCHITECTURE-ROADMAP.md` |
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
 | **Qwen3-4B perf vs llama.cpp (decode parity, CPU gap, KV-commit finding)** | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
