@@ -24,7 +24,7 @@ src/
 ├── graph/           # ★ declarative compute graph — the inference core (see below)
 ├── gguf.rs          # GGUF v3 parser (~1650 lines, largest file)
 ├── block.rs         # 20+ quantized block types (repr(C), matching ggml-common.h)
-├── avx2.rs          # AVX2 + aarch64 NEON/SDOT dot kernels + Q8_0/Q8_K quantization
+├── quants.rs          # AVX2 + aarch64 NEON/SDOT dot kernels + Q8_0/Q8_K quantization
 ├── kernel.rs        # Quantized matmul dispatch + CPU scalar fallbacks (+ embed_tokens row getter)
 ├── vec_ops.rs       # SIMD vector ops (RMSNorm, RoPE, Softmax, SiLU)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
@@ -140,7 +140,7 @@ Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backend
 1. Activations quantized to Q8_0 on-the-fly — all CPU matmuls use Q8_0 quantized activations (Q5_0 → `dot_q5_0_q8_0()`, Q4_K → `dot_q4_k_q8_0()`). Metal reads f32 activations directly for all weight types (Q4_0 included since P1), matching llama.cpp's Metal backend.
 2. AVX2 (x86) / NEON+SDOT (aarch64) dispatch with scalar fallbacks; `MINFER_NO_NEON=1` forces scalar on ARM. SDOT is emitted via inline asm (`vdotq_s32` is unstable in std::arch).
 3. No ML frameworks — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten.
-4. Tensor data uses raw `&[u8]` — avx2.rs dot products operate on byte slices, not structs.
+4. Tensor data uses raw `&[u8]` — quants.rs dot products operate on byte slices, not structs.
 5. GGUF padding: `ggml_pad()`: `(x + n - 1) & !(n - 1)`.
 6. Cross-backend execution: splits sync and copy at boundaries; per-op backend assignment is decided at graph build time by `supports_op` (weights registered on the backend decide feasibility); guard failures abort (see GPU Safety) — never silent mid-execution fallback.
 

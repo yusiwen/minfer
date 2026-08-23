@@ -196,7 +196,7 @@ The 256 elements are organized as 2 halves × 128 elements. Each half has 8 scal
 
 ### Correct Scale Mapping
 
-Reference: `dot_q6_k_q8_0_scalar` in `avx2.rs` implements dequantization **correctly**.
+Reference: `dot_q6_k_q8_0_scalar` in `quants.rs` implements dequantization **correctly**.
 
 The dequantized `a[256]` is linearly arranged, with scale `sc[g]` applied to `a[g*16 .. g*16+15]`:
 
@@ -278,7 +278,7 @@ The correct stride should be 1 (i.e., `g * 1` or simply `g`):
 - 128 of 256 elements affected total (50%)
 - Embedding lookup produces incorrect values, degrading output quality
 
-Note: `dot_q6_k_q8_0_scalar` in `avx2.rs` (used for CPU-path matmul) is **not affected by this bug** — its dequantization and scale application are separated. The dequantize loop does not use scales; scales are applied correctly in the subsequent dot product loop as `sc[g]` (g=0..15 sequential).
+Note: `dot_q6_k_q8_0_scalar` in `quants.rs` (used for CPU-path matmul) is **not affected by this bug** — its dequantization and scale application are separated. The dequantize loop does not use scales; scales are applied correctly in the subsequent dot product loop as `sc[g]` (g=0..15 sequential).
 
 ### Fix
 
@@ -372,7 +372,7 @@ float dmn0 = bm0 * float((sc0[3 + s3h] >> sh) & 0x3F);   // min
 
 ### 根因
 
-Metal kernel 的 `s * 3 >> 1` 公式假设 scale 和 min 交错排列，但 GGUF Q4_K 格式将 8 个 scale 和 8 个 min **分别**打包在前 6 字节和后 6 字节中。CPU 路径（`avx2.rs` 的 `memcpy + KMASK` 解包）正确实现了此格式，但 Metal kernel 没有。
+Metal kernel 的 `s * 3 >> 1` 公式假设 scale 和 min 交错排列，但 GGUF Q4_K 格式将 8 个 scale 和 8 个 min **分别**打包在前 6 字节和后 6 字节中。CPU 路径（`quants.rs` 的 `memcpy + KMASK` 解包）正确实现了此格式，但 Metal kernel 没有。
 
 ### 影响
 
@@ -457,7 +457,7 @@ This code has multiple issues:
 
 The code appears to be attempting to replicate llama.cpp's `dequantize_row_q6_K` internal logic, which dequantizes into a temporary array `a[256]` using an interleaved pattern. However, when writing directly to output, this pattern doesn't translate correctly without proper index mapping.
 
-Reference implementation from `avx2.rs` shows the correct approach:
+Reference implementation from `quants.rs` shows the correct approach:
 - Dequantize all 256 values sequentially
 - Access scales sequentially: `sc[g]` where g goes from 0 to 15
 - Each scale covers 16 consecutive elements

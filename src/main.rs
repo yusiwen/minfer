@@ -2,7 +2,7 @@
 
 mod gguf;
 mod block;
-mod avx2;
+mod quants;
 mod kernel;
 mod tensor;
 mod vec_ops;

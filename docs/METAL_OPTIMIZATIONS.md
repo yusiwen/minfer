@@ -400,7 +400,7 @@ amortizes natively via its f16 cache + flash.
 - Formula: Q5_0-style signed `dl*(u-16)-ml` was wrong → llama's **unsigned**
   `dl*u-ml`.
 - qh high-bit index: `qh[sub*4+pos/8] bit pos%8` was wrong → **`qh[pos] bit sub`**.
-- Fixed in `avx2.rs` / `kernel.rs` / `forward.rs` (embed).
+- Fixed in `quants.rs` / `kernel.rs` / `forward.rs` (embed).
 
 **GQA attention `simd_max` divergence fix** (2026-08-01, `28d4ba2`): in a partial
 KV tile (`nkv % 32 != 0`), out-of-range lanes exited the loop early → `simd_max(dot)`

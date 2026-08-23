@@ -181,7 +181,7 @@ alias their input buffer; matmuls follow the GGUF weight layout
 
 Key modules: `src/graph/` (IR / builder / scheduler / backends / reuse cache),
 `gguf.rs` (parser + mmap'd zero-copy loader), `models/qwen2/` (build_graph +
-loader), `kernel.rs`/`avx2.rs` (quantized matmul), `metal.rs`+`metal.metal` and
+loader), `kernel.rs`/`quants.rs` (quantized matmul), `metal.rs`+`metal.metal` and
 `cuda.rs`+`cuda_kernels.cu` (GPU kernels), `sampler.rs`/`tokenizer.rs`/
 `template.rs` (sampling + tokenization + chat templates), `conversation.rs`
 (multi-turn sessions), `server/` (HTTP). Supported quants:
@@ -323,7 +323,7 @@ minfer/
 │   │   └── dot.rs         # Graphviz DOT export (--dump-graph)
 │   ├── gguf.rs            # GGUF parser (v3) + mmap'd zero-copy loader
 │   ├── block.rs           # Quantized block types + fp16 conversions
-│   ├── avx2.rs            # AVX2 + NEON/SDOT dot kernels + Q8_0/Q8_K quantization
+│   ├── quants.rs            # AVX2 + NEON/SDOT dot kernels + Q8_0/Q8_K quantization
 │   ├── cuda.rs            # CUDA GPU state, FFI bindings, graph capture
 │   ├── cuda_kernels.cu    # CUDA kernels (matmul, attention, element-wise ops)
 │   ├── metal.rs           # Metal kernels + per-op dispatch (metallib, mmap weights)

@@ -726,7 +726,7 @@ mod tests {
         let mut wbytes = Vec::new();
         for r in 0..od {
             let row = &wf[r * inn..(r + 1) * inn];
-            wbytes.extend_from_slice(&crate::avx2::quantize_row_q8_0(row));
+            wbytes.extend_from_slice(&crate::quants::quantize_row_q8_0(row));
         }
         let mut wt = crate::tensor::Tensor::from_data(
             crate::tensor::TensorType::Q8_0, &[inn as i64, od as i64, 1, 1], wbytes);
@@ -896,7 +896,7 @@ mod tests {
         let mut ebytes = Vec::new();
         for r in 0..vocab {
             let row = &ef[r * ne..(r + 1) * ne];
-            ebytes.extend_from_slice(&crate::avx2::quantize_row_q8_0(row));
+            ebytes.extend_from_slice(&crate::quants::quantize_row_q8_0(row));
         }
         let mut emb = crate::tensor::Tensor::from_data(
             crate::tensor::TensorType::Q8_0, &[ne as i64, vocab as i64, 1, 1], ebytes);

@@ -1,4 +1,8 @@
-// AVX2 kernels — all &[u8] interface. Directly follows minfer2/src/quant.rs pattern.
+// Quantized dot-product kernels + activation quantization — all &[u8]
+// interface. Fast paths: AVX2+FMA on x86_64, NEON+SDOT on aarch64, with
+// scalar fallbacks (minfer2/src/quant.rs heritage; the file was historically
+// named avx2.rs). Activation formats: Q8_0 (simple weight types) and Q8_K
+// (K-quant weights — 256-element blocks with precomputed bsums).
 use crate::block::{self, Q4B, Q41B, Q8B, Q4KB, Q6KB};
 
 #[cfg(target_arch = "x86_64")]

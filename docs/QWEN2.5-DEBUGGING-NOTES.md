@@ -17,7 +17,7 @@ After fixing multiple documented bugs (Bug 1, 3, 4, 5), Qwen2.5-1.5B still produ
 - Fix: Complete rewrite with sequential scale access (sc_idx = ei >> 4)
 
 ### Bug 4: Q4_K Scale/Min Interleaved Format ✓
-- Files: `src/metal.metal`, `src/avx2.rs`, `src/models/qwen2/forward.rs`
+- Files: `src/metal.metal`, `src/quants.rs`, `src/models/qwen2/forward.rs`
 - Issue: Assumed separate format (bytes 0-5=scales, 6-11=mins)
 - Fix: Changed to interleaved format matching llama.cpp
   - Bytes 0-2: scales[0-3]
@@ -131,7 +131,7 @@ Find or create a minimal Q4_K/Q6_K model to test with fewer layers and smaller d
 ## Files Modified
 
 - `src/metal.metal` - Q4_K kernel, attention kernel
-- `src/avx2.rs` - Q4_K dot product, Q6_K dot product, test helpers
+- `src/quants.rs` - Q4_K dot product, Q6_K dot product, test helpers
 - `src/models/qwen2/forward.rs` - Q4_K & Q6_K embedding dequantization, GPU detection
 - `src/metal.rs` - Minor cleanup
 - `QWEN2.5-1.5B-BUGS.md` - Documentation

@@ -359,8 +359,8 @@ Two additional verification paths are covered by Rust unit tests:
 
 | Test | File | Verifies |
 |------|------|---------|
-| `test_q4k_dot_simple` | `avx2.rs` | Q4_K × Q8_0 scalar dot product |
-| `test_q8k_dot_simple` | `avx2.rs` | Q8_0 × Q8_0 scalar dot product |
+| `test_q4k_dot_simple` | `quants.rs` | Q4_K × Q8_0 scalar dot product |
+| `test_q8k_dot_simple` | `quants.rs` | Q8_0 × Q8_0 scalar dot product |
 
 ---
 

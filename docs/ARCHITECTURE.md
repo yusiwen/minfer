@@ -43,7 +43,7 @@
 | `graph/` | **Compute graph core** — IR, builder, scheduler, backends, reuse cache (see §4 table) |
 | `gguf.rs` | GGUF v3 parser (metadata KV + tensor table + data blob), multi-part (split) support, `ggml_pad` alignment |
 | `block.rs` | 20+ quantized block types as `repr(C)` structs + fp16 conversions, matching `ggml-common.h` |
-| `avx2.rs` | AVX2+FMA dot-product kernels (Q4_0×Q8_0, Q8_0×Q8_0) + f32→Q8_0 quantization, scalar fallback |
+| `quants.rs` | AVX2+FMA dot-product kernels (Q4_0×Q8_0, Q8_0×Q8_0) + f32→Q8_0 quantization, scalar fallback |
 | `kernel.rs` | Quantized matmul dispatch (Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/Q8_0) over activations, CPU scalar fallback, shared `embed_tokens` row getter |
 | `vec_ops.rs` | SIMD vector ops: RMSNorm, RoPE (Qwen2/Llama styles), softmax, SiLU, add/scale/mul |
 | `tensor.rs` | 4D `Tensor` (type/shape/strides/`Vec<u8>` data), ggml-compatible strides & byte sizing |
@@ -299,7 +299,7 @@ CPU backend. See `docs/GPU_SAFETY.md`.
   super-blocks. Supported: Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K
   (CPU + Metal), F32/F16 norms & biases.
 - **Activation quantization**: CPU matmuls quantize f32 activations to Q8_0
-  on-the-fly (`avx2.rs`); Metal reads f32 directly.
+  on-the-fly (`quants.rs`); Metal reads f32 directly.
 - **GGUF parsing** (`gguf.rs`): `ggml_pad(x, n) = (x + n - 1) & !(n - 1)`
   alignment; tensor strides computed from type block size exactly like
   ggml; split multi-part models are merged into one tensor index.

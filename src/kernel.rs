@@ -17,13 +17,13 @@ pub fn cpu_quant_matmul_f32(
         TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K => {
             let n_super = id / 256;
             let mut qb = vec![0u8; nt * n_super * Q8KB];
-            crate::avx2::quantize_row_q8_k_buf(x, nt, id, &mut qb);
+            crate::quants::quantize_row_q8_k_buf(x, nt, id, &mut qb);
             cpu_quant_matmul(w, &qb, out, od, id, nt)
         }
         _ => {
             let nbe = id / 32;
             let mut qb = vec![0u8; nt * nbe * Q8B];
-            crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut qb);
+            crate::quants::quantize_row_q8_0_buf(x, nt, id, &mut qb);
             cpu_quant_matmul(w, &qb, out, od, id, nt)
         }
     }
@@ -136,7 +136,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q4_0_q8_0(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q4_0_q8_0(wrow, xrow);
                 }
             }
         }
@@ -148,7 +148,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q4_1_q8_0(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q4_1_q8_0(wrow, xrow);
                 }
             }
         }
@@ -160,7 +160,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q4_k_q8_k(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q4_k_q8_k(wrow, xrow);
                 }
             }
         }
@@ -172,7 +172,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q5_k_q8_k(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q5_k_q8_k(wrow, xrow);
                 }
             }
         }
@@ -184,7 +184,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q6_k_q8_k(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q6_k_q8_k(wrow, xrow);
                 }
             }
         }
@@ -196,7 +196,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q5_0_q8_0(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q5_0_q8_0(wrow, xrow);
                 }
             }
         }
@@ -208,7 +208,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q5_1_q8_0(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q5_1_q8_0(wrow, xrow);
                 }
             }
         }
@@ -220,7 +220,7 @@ unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
                 let wrow = std::slice::from_raw_parts(job.w.add(o * ws), ws);
                 for t in 0..nt {
                     let xrow = std::slice::from_raw_parts(job.x.add(t * rowb), rowb);
-                    *job.out.add(t * od + o) = crate::avx2::dot_q8_0_q8_0(wrow, xrow);
+                    *job.out.add(t * od + o) = crate::quants::dot_q8_0_q8_0(wrow, xrow);
                 }
             }
         }

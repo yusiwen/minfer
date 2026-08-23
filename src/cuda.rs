@@ -689,7 +689,7 @@ impl CudaState {
         let nb = id / 32;
         let q8_len = nt * nb * Q8B;
         let mut q8 = vec![0u8; q8_len];
-        crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut q8);
+        crate::quants::quantize_row_q8_0_buf(x, nt, id, &mut q8);
 
         let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
         self.copy_to_device(&q8, xbuf);
@@ -717,7 +717,7 @@ impl CudaState {
             let out_len = nt * od * 4;
 
             let mut q8 = vec![0u8; q8_len];
-            crate::avx2::quantize_row_q8_0_buf(x, nt, id, &mut q8);
+            crate::quants::quantize_row_q8_0_buf(x, nt, id, &mut q8);
 
             let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
             let obuf = Self::get_or_grow(&self.buf_logits, out_len);

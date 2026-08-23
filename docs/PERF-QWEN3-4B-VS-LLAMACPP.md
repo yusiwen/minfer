@@ -144,14 +144,14 @@ The gap decomposed into two compounding causes, both structural:
 (**~50×**, ~80–90 % of llama's 63–68), prefill **~1.1 → ~75 tok/s**
 (241-token). What was done:
 
-1. **NEON + SDOT dot kernels** (`src/avx2.rs`): all eight quantized
+1. **NEON + SDOT dot kernels** (`src/quants.rs`): all eight quantized
    dot products got aarch64 fast paths using the ARMv8.2 `sdot`
    instruction (16 MACs/instr, emitted via inline asm — `vdotq_s32` is
    unstable in std::arch). **Bit-exact with the scalar kernels** (int32
    accumulation is exact; per-block float ops kept in identical order —
    verified by unit tests on random data).
 2. **Q8_K activations for K-quant matmuls** (`src/block.rs`,
-   `src/avx2.rs`, `src/kernel.rs`): llama.cpp's activation format for
+   `src/quants.rs`, `src/kernel.rs`): llama.cpp's activation format for
    Q4_K/Q5_K/Q6_K weights — 256-element blocks with precomputed int16
    per-subblock sums (`bsums`), so the dots never re-reduce the
    activation and apply one scale per 256 elements instead of 8. The

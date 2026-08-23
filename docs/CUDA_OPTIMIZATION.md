@@ -35,7 +35,7 @@ The Qwen2-0.5B model has **mixed quantization types**: most weights are Q4_0, bu
 
 ### P1: GPU-Side Activation Quantization
 
-Currently, `f32 → Q8_0` quantization runs on CPU (`avx2::quantize_row_q8_0_buf`). The CUDA `quantize_q8_0` kernel already exists but is unused in `layer_gpu()`.
+Currently, `f32 → Q8_0` quantization runs on CPU (`quants::quantize_row_q8_0_buf`). The CUDA `quantize_q8_0` kernel already exists but is unused in `layer_gpu()`.
 
 **Required**: Remove CPU quantize call in `layer_gpu()`; the GPU kernel runs on the f32 buffer directly.
 **Estimated speedup**: 1.2x

@@ -348,7 +348,7 @@ minfer and llama.cpp is due to:
 **Impact:** Huge for Q4_K models (all matmul operations).
 **Difficulty:** High (requires SIMD bit manipulation).
 
-**Current state:** `src/avx2.rs:201` uses scalar `dot_q4_k_q8_0_scalar`.
+**Current state:** `src/quants.rs:201` uses scalar `dot_q4_k_q8_0_scalar`.
 
 **llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c:1900-2076`
 implements AVX2 with `denibble()` trick for fast nibble unpacking.
@@ -567,7 +567,7 @@ parallelization if needed.
    - Further optimization: marginal gains only
 
 4. **Quantization (5% of time):** f32→Q8_0 conversion.
-   - Already optimized in `avx2.rs`
+   - Already optimized in `quants.rs`
    - Further optimization: activation reuse (but this caused regressions)
 
 ---
@@ -679,14 +679,14 @@ The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
 
 ### What was added
 
-1. **aarch64 NEON/SDOT dot kernels** (`src/avx2.rs`) — all 8 quantized dot
+1. **aarch64 NEON/SDOT dot kernels** (`src/quants.rs`) — all 8 quantized dot
    products (Q4_0/Q4_1/Q8_0/Q5_0/Q5_1/Q5_K/Q4_K/Q6_K) use the ARMv8.2 `sdot`
    instruction (16 MACs/instr) via stable inline asm (`vdotq_s32` is unstable
    in std::arch). **Bit-exact with the scalar kernels** (exact int32
    accumulation, per-block float ops in identical order); `MINFER_NO_NEON=1`
    reverts.
 2. **Q8_K activations for K-quant matmuls** (`src/block.rs` Q8KB,
-   `src/avx2.rs` quantize + dots, `src/kernel.rs` dispatch) — llama.cpp's
+   `src/quants.rs` quantize + dots, `src/kernel.rs` dispatch) — llama.cpp's
    activation format: 256-element blocks with precomputed int16 per-subblock
    sums, so dots never re-reduce the activation and use one scale per 256
    elements. Kernels restructured to llama's shape (scales applied to the SDOT
