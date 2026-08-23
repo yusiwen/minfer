@@ -52,6 +52,11 @@ pub struct Tokenizer {
     unicode_to_byte: HashMap<char, u8>,
     #[allow(dead_code)]
     pub special_tokens: HashMap<String, u32>,
+    /// Special tokens grouped by first char, longest-first within a group.
+    /// Built from `special_tokens` (GGUF type 3/4) plus the hardcoded
+    /// `<|im_start|>` / `<|im_end|>` / EOS fallbacks, so models whose
+    /// converters mark special tokens as type 1 still match.
+    special_by_first: HashMap<char, Vec<(String, u32)>>,
     pub bos_token: u32,
     pub eos_token: u32,
     pub im_start: u32,
@@ -132,6 +137,32 @@ impl Tokenizer {
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte: HashMap<char, u8> = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
 
+        // Merge GGUF special tokens (type 3/4) with hardcoded fallbacks, then
+        // group by first char with longest-first ordering inside each group
+        // (an earliest-position, longest-match scan needs both).
+        let mut merged: HashMap<String, u32> = special_tokens.clone();
+        if !merged.contains_key("<|im_start|>") {
+            merged.insert("<|im_start|>".to_string(), im_start);
+        }
+        if !merged.contains_key("<|im_end|>") {
+            merged.insert("<|im_end|>".to_string(), im_end);
+        }
+        if eos_token != 0 {
+            if let Some(eos_text) = id_to_token.get(eos_token as usize) {
+                if eos_text.starts_with('<') && !merged.contains_key(eos_text) {
+                    merged.insert(eos_text.clone(), eos_token);
+                }
+            }
+        }
+        let mut special_by_first: HashMap<char, Vec<(String, u32)>> = HashMap::new();
+        for (pat, id) in merged {
+            let first = pat.chars().next().unwrap_or('\0');
+            special_by_first.entry(first).or_default().push((pat, id));
+        }
+        for group in special_by_first.values_mut() {
+            group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        }
+
         Tokenizer {
             id_to_token,
             id_to_score,
@@ -141,6 +172,7 @@ impl Tokenizer {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens,
+            special_by_first,
             bos_token,
             eos_token,
             im_start,
@@ -224,42 +256,38 @@ impl Tokenizer {
     }
 
     /// Tokenize text into token IDs.
+    ///
+    /// Special tokens (from the GGUF `tokenizer.ggml.token_type` 3/4 table,
+    /// plus `<|im_start|>` / `<|im_end|>` / EOS fallbacks) are matched as
+    /// single tokens *before* BPE — earliest position wins, longest text wins
+    /// at the same position. This is what makes special-token templates work
+    /// (e.g. DeepSeek-R1's `<｜User｜>` / `<think>`), matching llama.cpp.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut result = Vec::new();
         let mut remaining = text;
 
-        // Special token patterns (must match early)
-        let mut special_patterns: Vec<(&str, u32)> =
-            vec![("<|im_start|>", self.im_start), ("<|im_end|>", self.im_end)];
-        // Also add EOS if it's a known special token
-        if self.eos_token != 0 {
-            // Only add EOS as special if its text is known
-            if let Some(eos_text) = self.id_to_token.get(self.eos_token as usize) {
-                if eos_text.starts_with('<') {
-                    special_patterns.push((eos_text.as_str(), self.eos_token));
-                }
-            }
-        }
-
         loop {
-            // Find the earliest special token
-            let mut earliest: Option<(usize, &str, u32)> = None;
-            for &(pat, id) in &special_patterns {
-                if let Some(pos) = remaining.find(pat) {
-                    if earliest.is_none() || pos < earliest.unwrap().0 {
-                        earliest = Some((pos, pat, id));
+            // Find the earliest position where any special token starts.
+            let mut earliest: Option<(usize, u32, usize)> = None; // (byte_pos, id, byte_len)
+            'scan: for (ci, ch) in remaining.char_indices() {
+                if let Some(group) = self.special_by_first.get(&ch) {
+                    let rest = &remaining[ci..];
+                    for (pat, id) in group {
+                        if rest.starts_with(pat.as_str()) {
+                            earliest = Some((ci, *id, pat.len()));
+                            break 'scan; // group is longest-first; earliest char wins
+                        }
                     }
                 }
             }
 
-            if let Some((pos, pat, id)) = earliest {
+            if let Some((pos, id, len)) = earliest {
                 // Encode text before the special token
                 if pos > 0 {
-                    let before = &remaining[..pos];
-                    result.extend(self.encode_bpe(before));
+                    result.extend(self.encode_bpe(&remaining[..pos]));
                 }
                 result.push(id);
-                remaining = &remaining[pos + pat.len()..];
+                remaining = &remaining[pos + len..];
             } else {
                 // No more special tokens, encode the rest
                 result.extend(self.encode_bpe(remaining));
@@ -360,12 +388,31 @@ pub fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    /// Rebuilds `special_by_first` the way `load()` does: GGUF special tokens
+    /// plus the hardcoded `<|im_start|>` / `<|im_end|>` fallbacks.
+    fn rebuild_special_index(t: &mut Tokenizer) {
+        let mut merged: HashMap<String, u32> = t.special_tokens.clone();
+        if !merged.contains_key("<|im_start|>") {
+            merged.insert("<|im_start|>".into(), t.im_start);
+        }
+        if !merged.contains_key("<|im_end|>") {
+            merged.insert("<|im_end|>".into(), t.im_end);
+        }
+        for (pat, id) in merged {
+            let first = pat.chars().next().unwrap_or('\0');
+            t.special_by_first.entry(first).or_default().push((pat, id));
+        }
+        for group in t.special_by_first.values_mut() {
+            group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        }
+    }
+
     /// Minimal tokenizer for decode tests: id 2 is the byte-level encoding of
     /// the CJK char U+4E2D (E4 B8 AD in UTF-8, i.e. bytes 0xE4 0xB8 0xAD).
     fn test_tokenizer() -> Tokenizer {
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
-        Tokenizer {
+        let mut t = Tokenizer {
             id_to_token: vec!["hello".into(), " world".into(), "ä¸Ń".into()],
             id_to_score: vec![0.0; 3],
             id_to_type: vec![1; 3],
@@ -374,11 +421,14 @@ mod tests {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens: HashMap::new(),
+            special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
             im_start: 0,
             im_end: 0,
-        }
+        };
+        rebuild_special_index(&mut t);
+        t
     }
 
     #[test]
@@ -419,5 +469,78 @@ mod tests {
         assert_eq!(complete_utf8_prefix_len(&mixed[..5]), 5);
         assert_eq!(complete_utf8_prefix_len(b"abc"), 3, "pure ASCII");
         assert_eq!(complete_utf8_prefix_len(&[]), 0);
+    }
+
+    /// Builds a tokenizer whose special-token table mimics a DeepSeek-R1 style
+    /// model: fullwidth-bar tokens that the GPT-2 pre-tokenizer regex would
+    /// otherwise split apart (regression for the R1 template, see README).
+    fn r1_style_tokenizer() -> Tokenizer {
+        let mut t = test_tokenizer();
+        t.special_tokens.insert("<｜User｜>".into(), 151644);
+        t.special_tokens.insert("<｜Assistant｜>".into(), 151645);
+        t.special_tokens.insert("<think>".into(), 151648);
+        t.special_tokens.insert("<｜end▁of▁sentence｜>".into(), 151643);
+        rebuild_special_index(&mut t);
+        // Populate the vocab so BPE finds "What" and " is" etc. as whole tokens
+        // (the pieces the regex would produce must NOT reassemble the specials).
+        // Keys must be byte-encoded like bpe_encode expects ("Ġ" = space, "Ċ" = \n).
+        t.vocab.insert("What".into(), 3838);
+        t.vocab.insert(byte_encode(" is", &t.byte_to_unicode), 374);
+        t.vocab.insert(byte_encode(" ", &t.byte_to_unicode), 220);
+        t.vocab.insert(byte_encode("2", &t.byte_to_unicode), 17);
+        t.vocab.insert(byte_encode("+", &t.byte_to_unicode), 10);
+        t.vocab.insert(byte_encode("?", &t.byte_to_unicode), 30);
+        t.vocab.insert(byte_encode("\n", &t.byte_to_unicode), 198);
+        t
+    }
+
+    #[test]
+    fn special_tokens_match_as_single_ids_before_bpe() {
+        let t = r1_style_tokenizer();
+        let ids = t.encode("<｜User｜>What is 2+2?<｜Assistant｜><think>\n");
+        // llama.cpp reference for the same string (llama-tokenize): 151644 3838 374 220 17 10 17 30 151645 151648 198
+        assert_eq!(
+            ids,
+            vec![151644, 3838, 374, 220, 17, 10, 17, 30, 151645, 151648, 198],
+            "special tokens must survive as single IDs, never split by BPE"
+        );
+    }
+
+    #[test]
+    fn special_token_earliest_position_wins() {
+        let t = r1_style_tokenizer();
+        // text before a special token is BPE-encoded; specials in the middle match
+        let ids = t.encode("abc<think>def<｜User｜>ghi");
+        let abc: Vec<u32> = t.encode_bpe("abc");
+        let def: Vec<u32> = t.encode_bpe("def");
+        let ghi: Vec<u32> = t.encode_bpe("ghi");
+        let mut expect = abc.clone();
+        expect.push(151648);
+        expect.extend(def);
+        expect.push(151644);
+        expect.extend(ghi);
+        assert_eq!(ids, expect);
+    }
+
+    #[test]
+    fn longest_special_token_wins_at_same_position() {
+        let mut t = r1_style_tokenizer();
+        // Both <think> and <think▁begin｜> start at the same position; the longer
+        // one must win even though <think> was inserted first.
+        t.special_tokens.insert("<think▁begin｜>".into(), 151649);
+        rebuild_special_index(&mut t);
+        let ids = t.encode("<think▁begin｜>");
+        assert_eq!(ids, vec![151649]);
+    }
+
+    #[test]
+    fn chatml_specials_still_match_via_fallback() {
+        // Even without GGUF type 3/4 info (special_tokens empty), the hardcoded
+        // <|im_start|>/<|im_end|> fallback must keep working.
+        let mut t = test_tokenizer();
+        t.vocab.insert("hi".into(), 42);
+        let ids = t.encode("<|im_start|>hi<|im_end|>");
+        // im_start/im_end fall back to 0 (unknown) in this synthetic tokenizer
+        assert_eq!(ids, vec![0, 42, 0]);
     }
 }

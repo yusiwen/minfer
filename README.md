@@ -12,7 +12,10 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **GGUF loader** — parses GGUF v3 files (metadata + quantized tensors), split
   multi-part support, **mmap'd weights shared zero-copy with the GPU**
 - **Self-contained BPE tokenizer** — loaded directly from GGUF metadata,
-  no external dependency on tiktoken
+  no external dependency on tiktoken; special tokens (GGUF type 3/4 table plus
+  `<|im_start|>`/EOS fallbacks) match as single IDs before BPE, so
+  special-token templates (DeepSeek-R1's `<｜User｜>`/`<think>`, etc.) tokenize
+  exactly like llama.cpp
 - **CPU: AVX2 (x86) / NEON+SDOT (Apple Silicon) SIMD** — all 8 quantized
   dot products, plus a persistent row-parallel thread pool (`-t/--threads`;
   Qwen3-4B CPU decode ~52–58 tok/s on M4 Pro vs 1.1 before)
@@ -94,7 +97,7 @@ minfer currently supports **two** model architectures.
 
 | Architecture | Variants | Status | Detection Key |
 |-------------|----------|:------:|---------------|
-| **Qwen2** | Qwen2, Qwen2.5 | ✅ Fully supported | `general.architecture = "qwen2"` |
+| **Qwen2** | Qwen2, Qwen2.5, DeepSeek-R1-Distill-Qwen | ✅ Fully supported | `general.architecture = "qwen2"` |
 | **Qwen3** | Qwen3 (dense: 0.6B–32B) | ✅ Fully supported (CPU + Metal GPU) | `general.architecture = "qwen3"` |
 
 Qwen3 support: dense architecture only (no MoE / hybrid-SWA / VL variants yet).
