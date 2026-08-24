@@ -2,6 +2,9 @@
 name = "minfer"
 version = "0.0.3"
 edition = "2021"
+description = "A minimal local LLM inference engine built from scratch in Rust"
+license = "MIT"
+repository = "https://github.com/yusiwen/minfer"
 
 [dependencies]
 rand = "0.8"
