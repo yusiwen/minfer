@@ -348,8 +348,9 @@ minfer/
 │   │   ├── scheduler.rs   # assign → split → execute (+ cross-backend copies)
 │   │   ├── fusion.rs      # Pattern fusion (gated by supports_fused)
 │   │   ├── cache.rs       # GraphCache — params-only graph reuse
-│   │   ├── params.rs      # GraphParams (the reuse identity)
-│   │   └── dot.rs         # Graphviz DOT export (--dump-graph)
+│   │   ├── params.rs      # GraphParams, CParams, GraphType (the reuse identity)
+│   │   ├── dot.rs         # Graphviz DOT export (--dump-graph)
+│   │   └── json.rs        # JSON graph export (interactive viz)
 │   ├── gguf.rs            # GGUF parser (v3) + mmap'd zero-copy loader
 │   ├── block.rs           # Quantized block types + fp16 conversions
 │   ├── quants.rs            # AVX2 + NEON/SDOT dot kernels + Q8_0/Q8_K quantization
@@ -366,18 +367,25 @@ minfer/
 │   ├── tokenizer.rs       # BPE tokenizer (self-contained, GGUF-backed)
 │   ├── template.rs        # Chat template detection + formatting
 │   ├── conversation.rs    # Multi-turn conversation session (append-only KV + Engine abstraction)
+│   ├── live.rs            # P3 live event broadcast (SSE for --viz)
+│   ├── trace.rs           # P2 per-node trace data (MINFER_TRACE)
 │   ├── server/            # OpenAI-compatible HTTP server
 │   │   ├── mod.rs         # axum router + handlers (chat completions, models, health)
 │   │   ├── types.rs       # Request/response types + ApiError
 │   │   ├── slot.rs        # Per-slot GraphCache + context budget
-│   │   └── chat.rs        # Serial worker generation loop + SSE events
+│   │   ├── chat.rs        # Serial worker generation loop + SSE events
+│   │   └── viz.rs         # --viz interactive visualization server
 │   ├── download/          # Model download from HF Hub & Ollama
 │   │   └── mod.rs         # resolve() URI handler, curl-based HTTP, list_local()
 │   └── models/            # Architecture-specific implementations
 │       ├── mod.rs         # ModelDef trait + load_model factory dispatch
-│       └── qwen2/         # Qwen2 implementation
-│           ├── mod.rs     # Qwen2Model + ModelDef impl
-│           ├── graph.rs   # build_graph + graph forward (Qwen2Graph)
+│       ├── qwen2/         # Qwen2 implementation
+│       │   ├── mod.rs     # Qwen2Model + ModelDef impl
+│       │   ├── graph.rs   # build_graph + graph forward (Qwen2Graph)
+│       │   └── loader.rs  # Tensor loading from GGUF
+│       └── qwen3/         # Qwen3 dense (decoupled head dim, per-head Q/K RMSNorm)
+│           ├── mod.rs     # Qwen3Model + ModelDef impl
+│           ├── graph.rs   # build_graph (Op::QkNorm per-head Q/K RMSNorm)
 │           └── loader.rs  # Tensor loading from GGUF
 ├── tests/                 # Kernel isolation tests (vs CPU reference)
 │   ├── flash_attn_blk_isolation.rs
