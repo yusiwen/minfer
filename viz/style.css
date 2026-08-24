@@ -71,6 +71,15 @@ select:hover, button:hover { border-color: var(--accent); }
 button.primary { background: #0c4a6e; border-color: #0ea5e9; }
 button.primary:hover { background: #0e7490; }
 
+/* live mode disables the playback controls — gray them out so it's obvious */
+select:disabled, button:disabled, input[type="range"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  color: var(--fg-faint);
+  border-color: var(--border);
+  background: var(--bg-3);
+}
+
 .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
 
 input[type="range"] { width: 110px; accent-color: var(--accent); }
@@ -208,12 +217,13 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 /* ---------- live panel（P3） ---------- */
 #btn-live.live-on { background: #064e3b; border-color: #10b981; color: #a7f3d0; }
 #live-panel {
-  position: absolute; top: 12px; right: 344px; z-index: 15;
-  width: 600px; background: var(--bg-2); border: 1px solid var(--border);
+  position: fixed; top: 12px; right: 344px; z-index: 15;
+  width: 600px; max-width: calc(100vw - 16px); background: var(--bg-2);
+  border: 1px solid var(--border);
   border-radius: 8px; padding: 10px 12px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
 }
 #live-panel[hidden] { display: none; }
-.live-head { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; margin-bottom: 8px; }
+.live-head { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; margin-bottom: 8px; cursor: move; user-select: none; }
 .live-head button { margin-left: auto; border: none; background: none; color: var(--fg-dim); font-size: 15px; cursor: pointer; }
 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); }
 .live-dot.on { background: #10b981; box-shadow: 0 0 6px #10b981; }

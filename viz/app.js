@@ -1167,6 +1167,31 @@ function init() {
     if (e.key === "Enter") runLive();
   });
 
+  // Live panel is draggable, clamped to the viewport.
+  {
+    const panel = document.getElementById("live-panel");
+    const head = panel.querySelector(".live-head");
+    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+    head.addEventListener("mousedown", e => {
+      if (e.target.closest("button")) return; // don't drag via the × close button
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY; sl = rect.left; st = rect.top;
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", e => {
+      if (!dragging) return;
+      const x = sl + (e.clientX - sx);
+      const y = st + (e.clientY - sy);
+      const left = Math.max(0, Math.min(x, window.innerWidth - panel.offsetWidth));
+      const top = Math.max(0, Math.min(y, window.innerHeight - panel.offsetHeight));
+      panel.style.left = left + "px";
+      panel.style.top = top + "px";
+      panel.style.right = "auto";
+    });
+    window.addEventListener("mouseup", () => { dragging = false; });
+  }
+
   loadManifest();
 
   // 若本页由 minfer --viz 伺服（同源 /viz/graph 可达），自动填充直播地址并连接
