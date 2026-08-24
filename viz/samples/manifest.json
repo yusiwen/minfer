@@ -1,0 +1,28 @@
+{
+  "samples": [
+    {
+      "label": "★ Qwen2.5-0.5B · trace：prefill + 3 步 decode（真实数据）",
+      "file": "qwen2.5-0.5b-trace.json"
+    },
+    {
+      "label": "Qwen2.5-0.5B · prefill · Metal (440 节点)",
+      "file": "qwen2.5-0.5b-prefill-metal.json"
+    },
+    {
+      "label": "Qwen2.5-0.5B · prefill · CPU (440 节点)",
+      "file": "qwen2.5-0.5b-prefill-cpu.json"
+    },
+    {
+      "label": "Qwen2.5-0.5B · decode · Metal 融合 (305 节点)",
+      "file": "qwen2.5-0.5b-decode-metal.json"
+    },
+    {
+      "label": "Qwen3-0.6B · prefill · Metal (568 节点)",
+      "file": "qwen3-0.6b-prefill-metal.json"
+    },
+    {
+      "label": "Qwen2.5-7B · prefill · Metal (512 节点)",
+      "file": "qwen2.5-7b-prefill-metal.json"
+    }
+  ]
+}

@@ -58,8 +58,13 @@ pub struct Tokenizer {
     /// converters mark special tokens as type 1 still match.
     special_by_first: HashMap<char, Vec<(String, u32)>>,
     pub bos_token: u32,
+    // Reserved special-token ids (special-token handling flows through
+    // `special_tokens()` / SpecialTokens; these are kept for API completeness).
+    #[allow(dead_code)]
     pub eos_token: u32,
+    #[allow(dead_code)]
     pub im_start: u32,
+    #[allow(dead_code)]
     pub im_end: u32,
 }
 

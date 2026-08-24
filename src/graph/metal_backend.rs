@@ -55,6 +55,10 @@ pub struct MetalBackend {
     /// f32-element pool: id → shared MTLBuffer (size * 4 bytes)
     pool: Vec<metal::Buffer>,
     free: Vec<usize>,
+    /// P2/P3 capture staging: host-readable buffers written by per-split blits.
+    /// Only allocated while a trace/live capture is armed.
+    staging: Vec<metal::Buffer>,
+    free_staging: Vec<usize>,
     /// Pending command buffer for the current split. Stored as a leaked box
     /// pointer (null = none) because MpsCommandBuffer is !Send/!Sync; all
     /// access happens sequentially through &self/&mut self methods on the
@@ -69,10 +73,66 @@ unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 
 impl MetalBackend {
+    /// P2/P3 capture: encode blits copying `src_ids` (pool buffers) into
+    /// staging buffers, at the END of this split's command buffer (after all
+    /// kernels, so the data is this step's output). Returns the staging ids —
+    /// their contents are valid only after the next `synchronize`.
+    pub fn capture_split(&mut self, src_ids: &[usize]) -> Result<Vec<usize>, String> {
+        let mut dst_ids = Vec::with_capacity(src_ids.len());
+        for &sid in src_ids {
+            let len = self.buf(sid).length() as usize;
+            dst_ids.push(self.staging_alloc(len)?);
+        }
+        let pairs: Vec<(usize, usize)> = src_ids
+            .iter()
+            .copied()
+            .zip(dst_ids.iter().copied())
+            .collect();
+        self.cb().encode_captures(&pairs, &self.pool, &self.staging)?;
+        Ok(dst_ids)
+    }
+
+    fn staging_alloc(&mut self, len_bytes: usize) -> Result<usize, String> {
+        if let Some(pos) = self
+            .free_staging
+            .iter()
+            .position(|&id| self.staging[id].length() as usize == len_bytes)
+        {
+            return Ok(self.free_staging.swap_remove(pos));
+        }
+        if len_bytes % 4 != 0 {
+            return Err(format!("capture staging size {len_bytes} not 4-aligned"));
+        }
+        let buf = self.state.new_f32_buffer(len_bytes / 4);
+        self.staging.push(buf);
+        Ok(self.staging.len() - 1)
+    }
+
+    /// Read a staging buffer (valid after the split's command buffer was
+    /// submitted by `synchronize`).
+    pub fn read_staging(&self, id: usize) -> Option<&[f32]> {
+        let buf = self.staging.get(id)?;
+        let len = (buf.length() as usize) / 4;
+        Some(unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len) })
+    }
+
+    /// Return all staging buffers to the free list (call after the readback of
+    /// one split's captures; they may be reused by the next split).
+    pub fn release_staging_all(&mut self) {
+        self.free_staging = (0..self.staging.len()).collect();
+    }
+
     /// None when MPS is unavailable or not initialized (MpsState::init()).
     pub fn new() -> Option<Self> {
         let state = MpsState::get()?;
-        Some(Self { state, pool: Vec::new(), free: Vec::new(), cb_ptr: std::ptr::null_mut() })
+        Some(Self {
+            state,
+            pool: Vec::new(),
+            free: Vec::new(),
+            staging: Vec::new(),
+            free_staging: Vec::new(),
+            cb_ptr: std::ptr::null_mut(),
+        })
     }
 
     fn buf(&self, id: usize) -> &metal::Buffer {
@@ -82,14 +142,14 @@ impl MetalBackend {
     /// The current split's command buffer (created on first op of a split).
     /// The box is leaked, so the returned reference is 'static and does not
     /// borrow `self` — callers can freely touch the pool afterwards.
-    fn cb(&mut self) -> &'static crate::metal::MpsCommandBuffer<'static> {
+    fn cb(&mut self) -> &'static mut crate::metal::MpsCommandBuffer<'static> {
         if self.cb_ptr.is_null() {
             let cb = Box::new(self.state.cmd_buffer());
             self.cb_ptr = Box::into_raw(cb);
         }
         // SAFETY: cb_ptr is null or points to a live box created here; all
         // callers hold &mut self, so no concurrent mutation.
-        unsafe { &*self.cb_ptr }
+        unsafe { &mut *self.cb_ptr }
     }
 
     /// Submit the pending command buffer (if any) and clear it.

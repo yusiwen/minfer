@@ -68,10 +68,19 @@ pub fn generate(
     let positions: Vec<usize> = (0..nt).collect();
     let special = model.special_tokens();
 
+    // P3 live (server): phase/token/logits events for the web visualizer.
+    let live_on = crate::live::enabled();
+
     // Prefill (n_out=1: only the LAST token's logits are returned and used for
     // the first sample — passing nt here would hand the sampler all nt rows and
     // corrupt the first sampled token).
+    if live_on {
+        crate::live::begin_phase("prefill");
+    }
     let last_logits = guarded_forward(model, input_ids, &positions, 1, n_ctx_slot, cache)?;
+    if live_on {
+        crate::live::attach_step(&last_logits);
+    }
     let mut logits = last_logits;
     let mut current_pos = nt;
 
@@ -96,6 +105,10 @@ pub fn generate(
     let mut completion_tokens = 0usize;
     let mut finish_reason = "stop";
     let mut stopped_by_string = false;
+
+    if live_on {
+        crate::live::begin_phase("decode");
+    }
 
     // Emit `full[emitted..end]` as one Text event (complete UTF-8 by caller).
     let emit = |full: &[u8], emitted: usize, end: usize, tx: &mpsc::Sender<StreamEvent>| -> Result<(), ApiError> {
@@ -163,6 +176,11 @@ pub fn generate(
         }
 
         // Decode step.
+        if live_on {
+            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
+                .into_owned();
+            crate::live::set_token(sampled.token_id, &text);
+        }
         logits = guarded_forward(
             model,
             &[sampled.token_id],
@@ -171,6 +189,9 @@ pub fn generate(
             n_ctx_slot,
             cache,
         )?;
+        if live_on {
+            crate::live::attach_step(&logits);
+        }
         current_pos += 1;
     }
 
@@ -193,6 +214,9 @@ pub fn generate(
     }
     let _ = tx
         .blocking_send(StreamEvent::Finish { reason: finish_reason.to_string(), tokens: completion_tokens });
+    if live_on {
+        crate::live::finish(finish_reason, completion_tokens, &String::from_utf8_lossy(&full));
+    }
 
     Ok(())
 }

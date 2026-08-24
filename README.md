@@ -8,7 +8,14 @@ A minimal local LLM inference engine built from scratch in Rust.
   then assigns backends, fuses ops, allocates and executes via a scheduler,
   modeled on llama.cpp's `ggml_cgraph` + backend scheduler; params-only graph
   reuse (decode steps skip reconstruction), per-op backend assignment,
-  Graphviz DOT export (`--dump-graph`)
+  Graphviz DOT export (`--dump-graph`) and **interactive web visualization**
+  (`viz/` — `--dump-graph-json` + zero-dependency flowchart page)
+- **Interactive graph visualization (`viz/`)** — a zero-dependency browser page
+  for the compute graph. `minfer --viz <model>` serves the page, live SSE
+  inference, per-node tensor stats/heatmaps and logits top-5 in one process;
+  `--dump-graph-json` / `MINFER_TRACE` export graphs and real traces. See the
+  [visualization showcase](#interactive-web-visualization-viz) and
+  [viz/README.md](viz/README.md) for the full user guide.
 - **GGUF loader** — parses GGUF v3 files (metadata + quantized tensors), split
   multi-part support, **mmap'd weights shared zero-copy with the GPU**
 - **Self-contained BPE tokenizer** — loaded directly from GGUF metadata,
@@ -42,6 +49,22 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **No external ML framework** — pure Rust; runtime deps are minimal (`rand`,
   `regex`, `half`, `serde`, `serde_json`, `minijinja`; `axum`/`tokio` only for
   the HTTP server)
+
+## Interactive Web Visualization (viz/)
+
+The inference compute graph can be viewed interactively in the browser — nodes
+colored by backend + data magnitude, per-node tensor stats and heatmaps, logits
+top-5, and live inference over SSE:
+
+![minfer inference graph visualization](docs/viz-demo.png)
+
+- **Live streaming**: `minfer --viz <model.gguf>` (default port 8081) serves the
+  page + live SSE from a single process.
+- **Export a graph**: `minfer --dump-graph-json graph.json <model> "Hello"`; or
+  pick a canned sample via the page's "Select a sample model" dropdown.
+
+See **[viz/README.md](viz/README.md)** for the full user guide, the JSON format,
+and all page features.
 
 ## Supported Quantization Formats
 
@@ -208,7 +231,8 @@ cargo run --release -- <model> [prompt] [OPTIONS]
 
 If `prompt` is omitted, reads from stdin. Run `minfer --help` for full options
 (`--meta`, `--no-template`, `--dump-graph <path>` to export the prefill compute
-graph as Graphviz DOT).
+graph as Graphviz DOT, `--dump-graph-json <path>` for the interactive web
+visualizer — see `viz/README.md`).
 
 **Multi-turn conversation** (`--cnv`, docs/CLI-CONVERSATION-PLAN.md): append-only
 KV + incremental template rendering — each turn only prefills the new message

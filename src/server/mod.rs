@@ -7,6 +7,7 @@
 pub mod chat;
 pub mod slot;
 pub mod types;
+pub mod viz;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -39,7 +40,8 @@ pub struct AppState {
     pub created: i64,
 }
 
-/// Build the axum router.
+/// Build the axum router (pure OpenAI API; the viz live endpoints live under
+/// `minfer --viz`, see `server::viz`).
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -63,6 +65,7 @@ pub fn run(
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
+
     let worker_tokenizer = tokenizer.clone();
     let worker = std::thread::spawn(move || {
         chat::worker_loop(model, worker_tokenizer, slots, job_rx)
@@ -97,7 +100,7 @@ pub fn run(
     });
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -105,7 +108,7 @@ fn now_unix() -> i64 {
 }
 
 /// Read `tokenizer.chat_template` from GGUF metadata (same lookup the CLI uses).
-fn chat_template_from_gguf(data: &[u8]) -> Option<String> {
+pub(crate) fn chat_template_from_gguf(data: &[u8]) -> Option<String> {
     let ctx = crate::gguf::GgufContext::init_from_data(data)?;
     ctx.kv.iter().find(|kv| kv.key == "tokenizer.chat_template")
         .map(|kv| kv.get_val_str(0).to_string())

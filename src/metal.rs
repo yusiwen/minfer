@@ -256,6 +256,10 @@ pub struct MpsCommandBuffer<'a> {
     // a background thread (parallel encoding) or handed across threads.
     cmd_buf: &'a metal::CommandBufferRef,
     enc: &'a metal::ComputeCommandEncoderRef,
+    /// Whether the compute encoder is still open. `encode_captures` (P2/P3
+    /// staging blits) ends it and encodes a blit pass; `submit` must then skip
+    /// the (now illegal) second `end_encoding`.
+    enc_open: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -307,6 +311,48 @@ impl MpsCommandBuffer<'_> {
         unsafe {
             let _: () = msg_send![self.enc, memoryBarrierWithScope: 1u64];
         }
+    }
+
+    /// End the compute pass. Call before encoding blits from the same command
+    /// buffer (Metal allows only one active encoder at a time); `submit` then
+    /// skips its own `end_encoding`.
+    pub fn end_compute(&mut self) {
+        if self.enc_open {
+            self.enc.end_encoding();
+            self.enc_open = false;
+        }
+    }
+
+    /// Encode GPU→host staging copies (P2/P3 live/trace capture) into this
+    /// command buffer, AFTER all kernels of the split. The destinations' data
+    /// is valid once the command buffer is submitted (`synchronize`).
+    pub fn encode_captures(
+        &mut self,
+        pairs: &[(usize, usize)],
+        buffers: &[metal::Buffer],
+        staging: &[metal::Buffer],
+    ) -> Result<(), String> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        self.end_compute();
+        let blit_ref = self.cmd_buf.new_blit_command_encoder();
+        // Autoreleased (selector `blitCommandEncoder`) — retain like the
+        // compute encoder so it survives the autorelease-pool drain.
+        unsafe {
+            let _: *mut metal::objc::runtime::Object = msg_send![blit_ref, retain];
+        }
+        for &(src, dst) in pairs {
+            let src_buf = buffers.get(src).ok_or_else(|| format!("capture: no buffer {src}"))?;
+            let dst_buf = staging.get(dst).ok_or_else(|| format!("capture: no staging {dst}"))?;
+            let len = src_buf.length();
+            blit_ref.copy_from_buffer(src_buf, 0, dst_buf, 0, len);
+        }
+        blit_ref.end_encoding();
+        unsafe {
+            let _: () = msg_send![blit_ref, release];
+        }
+        Ok(())
     }
 
     fn dispatch_2d(&self, w: u64, h: u64, tw: u64, th: u64) {
@@ -1016,7 +1062,9 @@ impl MpsCommandBuffer<'_> {
     /// Commit GPU work and wait for completion using a semaphore completion handler.
     /// This avoids the ~20ms Metal scheduler wakeup overhead of wait_until_completed.
     pub fn submit(self) -> Result<(), String> {
-        self.enc.end_encoding();
+        if self.enc_open {
+            self.enc.end_encoding();
+        }
 
         // dispatch_semaphore_t is already a reference-counted opaque pointer.
         let sem = unsafe { dispatch_semaphore_create(0) };
@@ -1440,7 +1488,7 @@ impl MpsState {
                 let _: *mut metal::objc::runtime::Object = msg_send![cmd_buf_ref, retain];
                 let _: *mut metal::objc::runtime::Object = msg_send![enc_ref, retain];
             }
-            MpsCommandBuffer { state: &self.inner, cmd_buf: cmd_buf_ref, enc: enc_ref }
+            MpsCommandBuffer { state: &self.inner, cmd_buf: cmd_buf_ref, enc: enc_ref, enc_open: true }
         }
     }
 

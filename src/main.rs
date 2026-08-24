@@ -18,6 +18,8 @@ mod metal;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod download;
+mod trace;
+mod live;
 mod dump;
 mod server;
 
@@ -111,12 +113,15 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --server             run as an OpenAI-compatible HTTP server");
     eprintln!("  --port <N>           server port (default 8080)");
+    eprintln!("  --viz [PORT]         self-contained viz server (web page + live SSE, default port 8081)");
     eprintln!("  --n-ctx <N>          context size (default 4096; server: total, divided among slots)");
     eprintln!("                       single-shot / --cnv: sizes the KV cache, clamped to the model's");
     eprintln!("                       max context (e.g. Qwen3-4B 40960); server: total context");
     eprintln!("  -t, --threads <N>    CPU worker threads (default: performance cores, e.g. 10 on M4 Pro;");
     eprintln!("                       1 = single-threaded; affects the CPU-only path)");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
+    eprintln!("  --dump-graph <PATH>       export the compute graph as Graphviz DOT and exit");
+    eprintln!("  --dump-graph-json <PATH>  export the compute graph as JSON (web visualizer, viz/) and exit");
     eprintln!("  -h, --help           show this help");
     eprintln!("  -V, --version        print version and exit");
 }
@@ -140,11 +145,15 @@ fn main() {
     // default forward (Phase 6).
     let _graph_mode = false;
     let mut dump_graph: Option<String> = None;
+    let mut dump_graph_json: Option<String> = None;
     // OpenAI-compatible HTTP server mode (OPENAI-CHAT-API-PLAN.md).
     let mut server_mode = false;
     let mut server_port: u16 = 8080;
     let mut server_n_ctx: usize = params.n_ctx;
     let mut server_n_slots: usize = 1;
+    // Self-contained viz server (P3 live demo): `--viz [port]`.
+    let mut viz_mode = false;
+    let mut viz_port: u16 = 8081;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -170,6 +179,20 @@ fn main() {
                 std::process::exit(0);
             }
             "--server" => { server_mode = true; i += 1; }
+            "--viz" => {
+                // Optional port value: `--viz 8081` (bare `--viz` → 8081).
+                viz_mode = true;
+                if let Some(v) = raw_args.get(i + 1) {
+                    if let Ok(p) = v.parse::<u16>() {
+                        viz_port = p;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
             "--port" => {
                 if let Some(v) = next_val(a) {
                     server_port = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --port '{v}'")); 8080 });
@@ -279,6 +302,12 @@ fn main() {
             "--dump-graph" => {
                 if let Some(v) = next_val("--dump-graph") {
                     dump_graph = Some(v);
+                }
+                i += 2;
+            }
+            "--dump-graph-json" => {
+                if let Some(v) = next_val("--dump-graph-json") {
+                    dump_graph_json = Some(v);
                 }
                 i += 2;
             }
@@ -402,7 +431,11 @@ fn main() {
     };
     let prompt = if positional.len() > 1 {
         positional[1..].join(" ")
-    } else if conv_mode {
+    } else if conv_mode || server_mode || viz_mode {
+        // --server / --viz / --cnv take no positional prompt and never consume
+        // stdin for it. (Bare `minfer --viz model.gguf` would otherwise hang on
+        // read_line until you press Enter — the model+grep host already shows
+        // startup, so don't block on a prompt these modes don't use.)
         String::new()
     } else {
         let mut input = String::new();
@@ -412,7 +445,43 @@ fn main() {
 
     // === Load GGUF (single file or multi-part split) ===
     println!("Loading model: {} ...", model_path);
-    let gguf_model = gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
+    let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+        Some(m) => m,
+        None => {
+            let p = std::path::Path::new(&model_path);
+            if p.is_dir() {
+                // A directory is almost always a cache dir with several .gguf
+                // candidates — list them instead of a bare "parse GGUF" panic.
+                let mut found: Vec<String> = std::fs::read_dir(p)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter_map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                n.ends_with(".gguf").then_some(n)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                found.sort();
+                eprintln!("Error: {model_path} is a directory — minfer needs a .gguf file path");
+                if found.is_empty() {
+                    eprintln!("       no .gguf files found in that directory");
+                } else {
+                    eprintln!("       candidates:");
+                    for f in &found {
+                        eprintln!("         minfer --viz {}/{}", model_path.trim_end_matches('/'), f);
+                    }
+                    eprintln!("       or run `minfer list` for cached models");
+                }
+            } else if !p.exists() {
+                eprintln!("Error: file not found: {model_path}");
+                eprintln!("       run `minfer list` to see cached models");
+            } else {
+                eprintln!("Error: failed to parse GGUF: {model_path} (not a valid GGUF or corrupt)");
+            }
+            std::process::exit(1);
+        }
+    };
     let n_parts = gguf_model.parts.len();
     let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data.len()).sum();
     println!("File: {} bytes ({:.1} MB) in {n_parts} part(s)", total_bytes, total_bytes as f64 / 1_048_576.0);
@@ -469,6 +538,14 @@ fn main() {
         return;
     }
 
+    // === Self-contained viz server (--viz [port]) ===
+    if viz_mode {
+        eprintln!("Starting viz server (model={}, n_ctx={}, slots={})",
+            model_path, params.n_ctx, 1);
+        server::viz::run_viz(model, tokenizer, &gguf_model, viz_port, params.n_ctx, 1);
+        return;
+    }
+
     // === Multi-turn conversation mode (--cnv) ===
     if conv_mode {
         let code = run_conversation(
@@ -516,34 +593,72 @@ fn main() {
     // the prompt length, and the model's forward clamps it to max_seq_len.
     // Computed ONCE so prefill and decode size the same KV regions.
     let ctx = params.n_ctx.max(input_ids.len());
+    // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; the
+    // CLI marks phase boundaries and attaches tokens/logits for the page.
+    // `trace_on` is hoisted out of the decode loop (one env read per run).
+    let trace_on = crate::trace::enabled();
+    if trace_on {
+        crate::trace::begin_phase("prefill");
+    }
     let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx);
     let last_logits: Vec<f32> = logits;
+    if trace_on {
+        crate::trace::attach_step(&last_logits);
+    }
 
     let prefill_time = infer_start.elapsed();
     println!("Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
         input_ids.len(), prefill_time.as_secs_f64(),
         input_ids.len() as f64 / prefill_time.as_secs_f64());
 
-    // === Graph DOT export (--dump-graph <path>) ===
-    if let Some(path) = &dump_graph {
-        use crate::graph::params::{CParams, GraphParams, GraphType};
-        let gparams = GraphParams {
-            n_tokens: input_ids.len(),
-            n_seqs: 1,
-            n_out: 1,
-            gtype: if input_ids.len() == 1 { GraphType::Decode } else { GraphType::Prefill },
-            cparams: CParams { n_ctx: params.n_ctx, n_batch: input_ids.len(), flash_attn: false, gpu: false, fuse_qkv: false },
-            weights_version: 1,
-        };
-        let g = model.build_graph(&gparams);
-        let mut f = std::fs::File::create(path).expect("create dot file");
-        g.dump_dot(&mut f).expect("write dot");
-        println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
+    // === Graph export (--dump-graph <dot> / --dump-graph-json <json>) ===
+    // Rebuilds the graph the runtime just ran (shared helper: build → assign →
+    // FusionPass), with real backend assignment (CPU/Metal colors) and the same
+    // fusion env toggles as the live path.
+    if dump_graph.is_some() || dump_graph_json.is_some() {
+        use crate::graph::json::{export_graph_json, runtime_gparams};
+        #[cfg(target_os = "macos")]
+        let metal_on = crate::graph::metal_backend::metal_available()
+            && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
+        #[cfg(not(target_os = "macos"))]
+        let metal_on = false;
+        let fuse_qkv = input_ids.len() == 1
+            && metal_on
+            && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        let model_name = std::path::Path::new(&model_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model_path.clone());
+
+        let doc = export_graph_json(
+            &*model, &model_name, input_ids.len(), params.n_ctx, metal_on, fuse_qkv,
+        );
+        let kind = if input_ids.len() == 1 { "decode" } else { "prefill" };
+        if let Some(path) = &dump_graph {
+            // DOT export needs the graph itself (fused, assigned — same as the
+            // runtime), so rebuild it via the shared helper.
+            let gparams = runtime_gparams(input_ids.len(), params.n_ctx, metal_on, fuse_qkv);
+            let g = crate::graph::json::build_runtime_graph(&*model, &gparams);
+            let mut f = std::fs::File::create(path).expect("create dot file");
+            g.dump_dot(&mut f).expect("write dot");
+            println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
+        }
+        if let Some(path) = &dump_graph_json {
+            let s = serde_json::to_string_pretty(&doc).expect("serialize graph json");
+            std::fs::write(path, s).expect("write graph json");
+            println!(
+                "Graph JSON exported to {path} ({} nodes, {kind})",
+                doc["nodes"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
+        }
         std::process::exit(0);
     }
 
     // === Generate ===
     let mut logits = last_logits;
+    if trace_on {
+        crate::trace::begin_phase("decode");
+    }
     let gen_start = Instant::now();   // pure-decode start (llama "Generation" caliber)
     let mut generated: Vec<u32> = Vec::new();
     let special = model.special_tokens();
@@ -619,8 +734,16 @@ fn main() {
 
         // forward() returns n_out*nv logits (n_out=1 for single-token decode,
         // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
+        if trace_on {
+            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
+                .into_owned();
+            crate::trace::set_token(sampled.token_id, &text);
+        }
         t1 = std::time::Instant::now();
         logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
+        if trace_on {
+            crate::trace::attach_step(&logits);
+        }
         if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
         current_pos += 1;
     }
@@ -628,7 +751,6 @@ fn main() {
     // <think> marker, emitted raw).
     if emitted < full.len() {
         hi.feed(&full[emitted..]);
-        emitted = full.len();
     }
     hi.finish();
 
@@ -636,6 +758,31 @@ fn main() {
         eprintln!("\n[MINFER_TIMING] over {n_tok} tokens: sample {:>6.2} ms/tok ({:>4.1}%), forward {:>6.2} ms/tok ({:>4.1}%)",
             t_samp / n_tok as f64 * 1e3, 100.0 * t_samp / (t_samp + t_fwd),
             t_fwd / n_tok as f64 * 1e3, 100.0 * t_fwd / (t_samp + t_fwd));
+    }
+
+    // === P2 trace finish (MINFER_TRACE=<path>) ===
+    // Attach the exported prefill/decode graphs (same params the runtime used,
+    // mirrored by the dump block) and serialize the whole trace.
+    if let Some(tpath) = crate::trace::path() {
+        let model_name = std::path::Path::new(&model_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model_path.clone());
+        use crate::graph::json::export_graph_json;
+        #[cfg(target_os = "macos")]
+        let metal_on = crate::graph::metal_backend::metal_available()
+            && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
+        #[cfg(not(target_os = "macos"))]
+        let metal_on = false;
+        let fuse_qkv = metal_on
+            && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        let prefill_graph = export_graph_json(
+            &*model, &model_name, input_ids.len(), params.n_ctx, metal_on, false,
+        );
+        let decode_graph = export_graph_json(
+            &*model, &model_name, 1, params.n_ctx, metal_on, fuse_qkv,
+        );
+        crate::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
     }
 
     println!();

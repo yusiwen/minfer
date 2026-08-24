@@ -17,7 +17,7 @@
 use super::alloc::GraphAllocator;
 use super::backend::{Backend, KvProvider};
 use super::ops::{NodeMeta, Op};
-use super::{Backend as BackendTag, ComputeGraph, NodeId};
+use super::{Backend as BackendTag, ComputeGraph, CNode, NodeId};
 
 /// A contiguous subgraph executed on one backend.
 #[derive(Debug, Clone)]
@@ -133,11 +133,35 @@ impl BackendScheduler {
             }
         }
         let mut prev_backend: Option<BackendTag> = None;
+        // P2 trace (MINFER_TRACE) + P3 live (--viz): read back every node's
+        // output (stats + downsampled sample). Checked once per execute() call;
+        // one step per execute() (prefill = 1 step, each decode forward = 1).
+        // Capture happens AFTER each node executes (this step's data):
+        //   CPU → read immediately; Metal → blit into staging at split end,
+        //   read after the split's command buffer is submitted (one submit per
+        //   split — no per-node GPU flush). KV regions are skipped on Metal
+        //   (staging would be huge; captured in full on CPU). Inputs are
+        //   host-filled by the allocator → read directly.
+        let trace_on = crate::trace::enabled();
+        let live_on = crate::live::enabled();
+        let capture = trace_on || live_on;
+        if trace_on {
+            crate::trace::begin_step();
+        }
+        if live_on {
+            crate::live::begin_step();
+        }
+        // (node_id, src_buf_id) for the current Metal split, then (node_id,
+        // staging_id) awaiting readback after that split's sync.
+        let mut metal_srcs: Vec<(usize, usize)> = Vec::new();
+        let mut staged: Vec<(usize, usize)> = Vec::new();
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
                     // 1. flush the previous backend's async work
                     alloc.sync_backend(pb);
+                    // 1b. staged Metal captures are valid now — read them back
+                    flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
                     // 2. copy this split's inputs across backends
                     for &inp in &split.inputs {
                         alloc.copy_across(inp, split.backend)?;
@@ -146,6 +170,15 @@ impl BackendScheduler {
             }
             for id in split.node_range.0..split.node_range.1 {
                 let node = graph.node(id);
+                if capture && node.is_input() {
+                    // inputs are host-filled before execute — no pending GPU
+                    // work, so reading them here is always current
+                    if let Some(br) = alloc.node_buffer(id) {
+                        if let Some(d) = read_host_buffer(alloc, br.backend, br.id) {
+                            record_node_data(node, d, trace_on, live_on);
+                        }
+                    }
+                }
                 if node.is_input() {
                     continue; // data pre-filled by the allocator
                 }
@@ -192,13 +225,106 @@ impl BackendScheduler {
                     BackendTag::Metal => return Err("Metal unavailable".into()),
                     BackendTag::Cuda => return Err("CUDA backend not implemented".into()),
                 }
+                // CAPTURE AFTER EXECUTION — this step's output
+                if capture {
+                    // KV regions are huge (n_embd × n_ctx per layer) — skipped
+                    // on both backends (page shows "no data for this node in this
+                    // step"); everything else is captured.
+                    let is_kv = matches!(
+                        node.op,
+                        Op::KvcacheStore { .. } | Op::KvcacheLoad { .. }
+                    );
+                    if !is_kv {
+                        match br.backend {
+                            BackendTag::CPU => {
+                                if let Some(d) = alloc.cpu().read_host(br.id) {
+                                    record_node_data(node, d, trace_on, live_on);
+                                }
+                            }
+                            #[cfg(target_os = "macos")]
+                            BackendTag::Metal => {
+                                metal_srcs.push((id, br.id));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // encode this split's Metal captures as one blit pass (after all of
+            // its kernels, so the staging holds this step's output)
+            if !metal_srcs.is_empty() {
+                let src_ids: Vec<usize> = metal_srcs.iter().map(|&(_, b)| b).collect();
+                let dsts = alloc
+                    .metal_mut()
+                    .ok_or("Metal backend not enabled")?
+                    .capture_split(&src_ids)?;
+                for ((nid, _), st) in metal_srcs.iter().zip(dsts.into_iter()) {
+                    staged.push((*nid, st));
+                }
+                metal_srcs.clear();
             }
             prev_backend = Some(split.backend);
         }
         if let Some(pb) = prev_backend {
             alloc.sync_backend(pb);
+            flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
         }
         Ok(())
+    }
+}
+
+/// Read a buffer's host data. CPU: direct. Metal: only safe for host-filled
+/// inputs (no pending GPU work); staged Metal outputs go through
+/// `flush_metal_captures` instead.
+fn read_host_buffer(alloc: &GraphAllocator, backend: BackendTag, id: usize) -> Option<&[f32]> {
+    match backend {
+        BackendTag::CPU => alloc.cpu().read_host(id),
+        #[cfg(target_os = "macos")]
+        BackendTag::Metal => alloc.metal().and_then(|m| m.read_host(id)),
+        _ => None,
+    }
+}
+
+/// Analyze + record one node's output (shared by the immediate and the staged
+/// Metal paths).
+fn record_node_data(node: &CNode, data: &[f32], trace_on: bool, live_on: bool) {
+    let dn = crate::graph::json::dtype_name(node.out_dtype);
+    let (stats, values, stride, n_total) = crate::trace::analyze(dn, data);
+    if trace_on {
+        crate::trace::record_node(node.id, dn, stats, values.clone(), stride, n_total);
+    }
+    if live_on {
+        crate::live::record_node(
+            node.id,
+            &node.name,
+            crate::graph::json::op_name(&node.op),
+            dn,
+            stats,
+            &values,
+            stride,
+            n_total,
+        );
+    }
+}
+
+/// Read back staged Metal captures (valid after their split's command buffer
+/// was submitted by `sync_backend`), then return the staging buffers to the
+/// free list.
+fn flush_metal_captures(
+    graph: &ComputeGraph,
+    alloc: &mut GraphAllocator,
+    staged: &mut Vec<(usize, usize)>,
+    trace_on: bool,
+    live_on: bool,
+) {
+    for (id, st) in staged.drain(..) {
+        let node = graph.node(id);
+        if let Some(d) = alloc.metal().and_then(|m| m.read_staging(st)) {
+            record_node_data(node, d, trace_on, live_on);
+        }
+    }
+    if let Some(m) = alloc.metal_mut() {
+        m.release_staging_all();
     }
 }
 

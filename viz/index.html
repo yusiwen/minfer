@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minfer · Inference Graph Demo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="toolbar">
+  <div class="brand">
+    <span class="logo">▣</span>
+    <span class="title">minfer Inference Graph</span>
+    <span class="subtitle" id="doc-title">not loaded</span>
+  </div>
+
+  <div class="controls">
+    <select id="model-select" title="Choose a pre-generated sample graph (needs an http server; or use “Open File” below)">
+      <option value="">— Select a sample model —</option>
+    </select>
+    <button id="btn-open" title="Load a graph JSON from any path (works under file://)">Open File…</button>
+    <input type="file" id="file-input" accept=".json" hidden>
+
+    <span class="sep"></span>
+
+    <button id="btn-step-back" title="Previous step">⏮</button>
+    <button id="btn-play" class="primary" title="Play / Pause">▶</button>
+    <button id="btn-step-fwd" title="Next step">⏭</button>
+    <input type="range" id="speed" min="1" max="200" value="60" title="Playback speed (ms/step)">
+    <span class="speed-label" id="speed-label">60ms</span>
+    <span class="step-info" id="step-info">—</span>
+  </div>
+
+  <div class="filters">
+    <label title="Show KV cache read/write edges"><input type="checkbox" id="f-kv" checked> KV edges</label>
+    <label title="Show input/output nodes"><input type="checkbox" id="f-io" checked> Input/Output</label>
+    <label title="Only show nodes on the attention path"><input type="checkbox" id="f-attn"> Attention path</label>
+    <label title="Only show nodes on the FFN path"><input type="checkbox" id="f-ffn"> FFN path</label>
+    <button id="btn-fit" title="Fit to window">Fit</button>
+    <button id="btn-live" class="live-btn" title="Connect to a minfer server to watch live inference">Live</button>
+  </div>
+</header>
+
+<div id="live-panel" hidden>
+  <div class="live-head">
+    <span class="live-dot" id="live-dot"></span>
+    <span>Live (P3)</span>
+    <button id="live-close" title="Close">×</button>
+  </div>
+  <div class="live-row">
+    <input id="live-url" value="http://127.0.0.1:8081" placeholder="http://127.0.0.1:8081" title="minfer --viz address">
+    <button id="live-connect">Connect</button>
+    <input id="live-prompt" value="Hello! Introduce yourself in one sentence" placeholder="prompt…" title="Prompt to send to the model">
+    <input id="live-max" type="number" value="8" min="1" max="64" title="max_tokens">
+    <button id="live-run" class="primary" disabled>Run</button>
+  </div>
+  <div class="live-status" id="live-status">Not connected</div>
+</div>
+
+<main>
+  <div id="tracebar" hidden>
+    <div class="phase-tabs" id="phase-tabs"></div>
+    <div class="step-ctl">
+      <span class="step-ctl-label">step</span>
+      <input type="range" id="step-slider" min="0" max="0" value="0" title="Select this step">
+      <span class="step-ctl-label" id="step-label">0/0</span>
+    </div>
+    <div class="token-strip" id="token-strip"></div>
+  </div>
+  <div id="graph-body">
+    <div id="canvas-wrap">
+      <svg id="canvas" width="100%" height="100%">
+        <g id="viewport">
+          <g id="edges"></g>
+          <g id="nodes"></g>
+        </g>
+      </svg>
+      <div id="empty-hint">
+        Load an inference graph (JSON) to start the demo:<br>
+        <code>minfer --dump-graph-json graph.json model.gguf "Hello"</code><br>
+        Or click “Open File…” above to load an exported graph.<br><br>
+        <b>Watch live inference</b>: if you've started <code>minfer --viz model.gguf</code>,
+        click “Live” in the toolbar to connect, enter a prompt, then click “Run”.
+      </div>
+    </div>
+
+    <aside id="panel">
+      <div id="panel-body"><div class="placeholder">Click any node to view that step's data</div></div>
+    </aside>
+  </div>
+</main>
+
+<footer id="statusbar">
+  <span id="status-model">—</span>
+  <span class="flex-spacer"></span>
+  <span id="status-counts">—</span>
+</footer>
+
+<div id="legend-pop">
+  <div class="legend-title">Operator legend <button id="legend-close">×</button></div>
+  <table id="legend-table"></table>
+</div>
+<button id="btn-legend" title="Operator legend">Legend</button>
+
+<script src="app.js"></script>
+</body>
+</html>

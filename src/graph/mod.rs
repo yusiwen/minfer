@@ -12,6 +12,7 @@ pub mod cache;
 pub mod cpu_backend;
 pub mod dot;
 pub mod fusion;
+pub mod json;
 #[cfg(target_os = "macos")]
 pub mod metal_backend;
 pub mod ops;

@@ -79,6 +79,8 @@ cargo build --release --features debug_dump    # + per-layer debug dumps
 MINFER_DISABLE_MPS=1 ./target/release/minfer <model> "hello"      # force CPU
 MINFER_DUMP_DIR=/tmp/dump ./target/release/minfer <model> "hello" # debug dump (debug_dump build)
 MINFER_GRAPH_DUMP=/tmp/d ./target/release/minfer --graph <model> "hello"  # dump graph logits/KV (any build)
+MINFER_TRACE=/tmp/t.json ./target/release/minfer <model> "hello" -n 5      # per-node real-data trace for viz/ (P2)
+MINFER_DISABLE_MPS=1 ./target/release/minfer --viz <model>                  # self-contained viz server (page + live SSE + /viz/run), lazy capture
 ```
 
 Split (multi-part) GGUF is supported: entry is part 0; `load_gguf_model` parses every part and builds a merged tensor index; download resume is size-checked (curl `-C -`).
@@ -202,3 +204,4 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | **Qwen3-4B perf vs llama.cpp (decode parity, CPU gap, KV-commit finding)** | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |
 | **CLI multi-turn conversation plan (append-only KV + incremental template diff)** | `docs/CLI-CONVERSATION-PLAN.md` |
+| **Interactive inference-graph web visualization** (`--dump-graph-json` + zero-dep flowchart page + `MINFER_TRACE` real-data trace: per-node stats/values, decode tokens & logits top-5) | `viz/README.md` |
