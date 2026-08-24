@@ -441,7 +441,6 @@ function renderPanel(id) {
       step = liveSteps.length ? liveSteps[liveSteps.length - 1] : null;
     }
   }
-  if (step) h += stepSummaryHtml(step);
 
   h += `<div class="node-header"><h3>${htmlEscape(n.name)}</h3>`;
   h += `<span class="badge op">${htmlEscape(n.op)}</span>`;
@@ -481,6 +480,10 @@ function renderPanel(id) {
   h += `<div class="explain">${OP_EXPLAIN[n.op] || "(no description yet)"}</div>`;
 
   h += renderExtraData(n);
+  // Step overview (input token + logits top-5) goes below the node details so
+  // clicking a node shows its details first instead of hiding them under the
+  // (scrolling) step summary.
+  if (step) h += stepSummaryHtml(step);
   body.innerHTML = h;
   body.querySelectorAll(".link-node").forEach(s => {
     s.addEventListener("click", () => selectNode(parseInt(s.dataset.id, 10)));
@@ -524,20 +527,26 @@ function renderExtraData(n) {
 function renderHeatmap(containerId, values, shape, stride) {
   const wrap = document.getElementById(containerId);
   if (!wrap) return;
-  const cols = Math.min((shape && shape[1]) || 1, 16);
+  // The natural layout mirrors the tensor's [d, nt] grid. But for a 1D/decode
+  // tensor (nt == 1) the grid collapses to a single vertical column (a thin
+  // strip), which reads poorly. Fall back to a roughly-square grid so the
+  // downsampled samples form a readable heatmap.
+  let cols = Math.min((shape && shape[1]) || 1, 16);
+  if (cols < 2) cols = Math.max(2, Math.min(16, Math.ceil(Math.sqrt(values.length))));
   const rows = Math.ceil(values.length / cols);
+  const CELL = Math.max(6, Math.min(12, Math.floor(200 / cols)));
   let min = Infinity, max = -Infinity;
   for (const v of values) { if (v < min) min = v; if (v > max) max = v; }
   const span = (max - min) || 1;
-  const W = cols * 5, H = Math.max(rows * 5, 10);
+  const W = cols * CELL, H = rows * CELL;
   let cells = "";
   for (let i = 0; i < values.length; i++) {
     const t = (values[i] - min) / span;
     const hue = 240 - t * 240; // 蓝 → 红
-    const x = (i % cols) * 5, y = Math.floor(i / cols) * 5;
-    cells += `<rect x="${x}" y="${y}" width="5" height="5" fill="hsl(${hue},75%,55%)"/>`;
+    const x = (i % cols) * CELL, y = Math.floor(i / cols) * CELL;
+    cells += `<rect x="${x}" y="${y}" width="${CELL}" height="${CELL}" fill="hsl(${hue},75%,55%)"/>`;
   }
-  wrap.innerHTML = `<svg width="${W}" height="${H}" xmlns="${SVG_NS}">${cells}</svg>`;
+  wrap.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="${SVG_NS}" preserveAspectRatio="none">${cells}</svg>`;
 }
 
 /* ---------------- 过滤 ---------------- */
@@ -600,6 +609,10 @@ function fit() {
 function initPanZoom() {
   let dragging = false, sx = 0, sy = 0, vx = 0, vy = 0;
   canvas.addEventListener("pointerdown", e => {
+    // Let node clicks through: setPointerCapture here would retarget the pointer
+    // (and the resulting click) to the canvas, so the node's click handler never
+    // fires and selecting a node by a real mouse click silently fails.
+    if (e.target.closest(".node-group")) return;
     dragging = true; sx = e.clientX; sy = e.clientY; vx = state.view.x; vy = state.view.y;
     canvas.classList.add("panning");
     canvas.setPointerCapture(e.pointerId);

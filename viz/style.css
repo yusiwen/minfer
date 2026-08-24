@@ -211,7 +211,7 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .link-node:hover { text-decoration: underline; }
 
 .hm-wrap { margin-top: 8px; }
-.hm-wrap svg { width: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0b1220; }
+.hm-wrap svg { display: block; max-width: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0b1220; }
 .hm-caption { font-size: 10px; color: var(--fg-faint); margin-top: 4px; }
 
 /* ---------- live panel（P3） ---------- */
@@ -247,10 +247,14 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .flex-spacer { flex: 1; }
 
 /* ---------- legend ---------- */
-#btn-legend {
+.corner-tools {
   position: fixed; right: 348px; bottom: 34px; z-index: 20;
-  background: var(--bg-3); font-size: 12px;
+  display: flex; align-items: center; gap: 8px;
 }
+.corner-tools button { background: var(--bg-3); font-size: 12px; display: inline-flex; align-items: center; }
+#btn-legend { background: var(--bg-3); font-size: 12px; }
+#btn-fit { width: 30px; height: 30px; justify-content: center; padding: 0; }
+#btn-fit svg { vertical-align: middle; }
 #legend-pop {
   display: none; position: fixed; right: 348px; bottom: 66px; z-index: 20;
   width: 420px; max-height: 70vh; overflow-y: auto;
