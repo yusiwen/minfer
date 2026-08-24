@@ -2,6 +2,8 @@
 
 A minimal local LLM inference engine built from scratch in Rust.
 
+![minfer CLI conversation (Qwen3-0.6B, Qwen3-0.6B-Q8_0)](docs/cli-conversation.png)
+
 ## Features
 
 - **Declarative compute graph** — inference builds a `ComputeGraph` (pure IR)

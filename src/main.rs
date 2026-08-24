@@ -865,11 +865,23 @@ impl<F: FnMut(&[u8])> ThinkHighlighter<F> {
                 let body = self.pending[..pos].to_vec();
                 self.emit(&body);
             }
-            // switch color, emit the marker itself in the new color
+            // The think block (both tags + reasoning) is gray; the answer color
+            // takes over only AFTER the closing tag — otherwise `</think>` turns
+            // the answer color (e.g. green) and looks like part of the reasoning.
             if self.color {
-                self.emit(if self.in_think { self.exit_code } else { Self::GRAY });
+                if self.in_think {
+                    // closing </think>: keep it gray, then switch to the answer color
+                    self.emit(Self::GRAY);
+                    self.emit(marker);
+                    self.emit(self.exit_code);
+                } else {
+                    // opening <think>: switch to gray for the reasoning
+                    self.emit(Self::GRAY);
+                    self.emit(marker);
+                }
+            } else {
+                self.emit(marker);
             }
-            self.emit(marker);
             self.pending.drain(..pos + marker.len());
             self.in_think = !self.in_think;
         }
@@ -1252,7 +1264,8 @@ mod think_highlighter_tests {
     fn colors_think_block_gray() {
         let out = run(true, b"\x1b[32m", &[b"<think>abc</think>def"]);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b[90m<think>abc\x1b[32m</think>def");
+        // whole think block (tags + content) stays gray; answer turns green after
+        assert_eq!(s, "\x1b[90m<think>abc\x1b[90m</think>\x1b[32mdef");
     }
 
     #[test]
@@ -1263,14 +1276,14 @@ mod think_highlighter_tests {
             &[b"<thi", b"nk>one two</th", b"ink>answer ", b"tail"],
         );
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b[90m<think>one two\x1b[0m</think>answer tail");
+        assert_eq!(s, "\x1b[90m<think>one two\x1b[90m</think>\x1b[0manswer tail");
     }
 
     #[test]
     fn multiple_think_blocks() {
         let out = run(true, b"\x1b[0m", &[b"<think>a</think><think>b</think>c"]);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b[90m<think>a\x1b[0m</think>\x1b[90m<think>b\x1b[0m</think>c");
+        assert_eq!(s, "\x1b[90m<think>a\x1b[90m</think>\x1b[0m\x1b[90m<think>b\x1b[90m</think>\x1b[0mc");
     }
 
     #[test]
