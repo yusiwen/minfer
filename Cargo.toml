@@ -1,6 +1,6 @@
 [package]
 name = "minfer"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "A minimal local LLM inference engine built from scratch in Rust"
 license = "MIT"
