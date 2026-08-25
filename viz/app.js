@@ -929,7 +929,11 @@ function resetLiveRun() {
 }
 
 function disablePlayback(on) {
-  for (const id of ["btn-play", "btn-step-back", "btn-step-fwd", "speed", "step-slider"]) {
+  // Live mode owns the view (nodes light up in real time), so the manual
+  // playback controls AND the "load a different graph" controls (sample
+  // dropdown, Open File) are all disabled — loading a static graph would
+  // clobber the live view. Re-enabled on disconnect.
+  for (const id of ["btn-play", "btn-step-back", "btn-step-fwd", "speed", "step-slider", "model-select", "btn-open"]) {
     document.getElementById(id).disabled = on;
   }
 }
