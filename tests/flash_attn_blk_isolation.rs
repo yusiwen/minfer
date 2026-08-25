@@ -9,7 +9,37 @@
 // classic gqa_attn_f32 kernel (the long-verified reference). macOS only.
 #![cfg(target_os = "macos")]
 
-use metal::{MTLResourceOptions, MTLSize};
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
+use objc2_metal::{
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSString;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
+type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
+#[cfg(target_os = "macos")]
+type MetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+#[cfg(target_os = "macos")]
+type MetalCommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+#[cfg(target_os = "macos")]
+type MetalComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+#[cfg(target_os = "macos")]
+type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
+#[cfg(target_os = "macos")]
+type MetalComputeCommandEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
+
+
 
 const C: usize = 64;
 
@@ -113,18 +143,17 @@ fn stats(name: &str, got: &[f32], want: &[f32]) -> (f32, f64, bool) {
 }
 
 struct Ctx {
-    device: metal::Device,
-    lib: metal::Library,
-    cmdq: metal::CommandQueue,
+    device: MetalDevice,
+    lib: MetalLibrary,
+    cmdq: MetalCommandQueue,
 }
 
 impl Ctx {
     fn new() -> Self {
-        let device = metal::Device::system_default().expect("no metal device");
+        let device = MTLCreateSystemDefaultDevice().expect("no metal device");
         let src = include_str!("../src/metal.metal");
-        let opts = metal::CompileOptions::new();
-        let lib = device.new_library_with_source(src, &opts).unwrap_or_else(|e| panic!("shader compile: {e}"));
-        let cmdq = device.new_command_queue();
+        let lib = device.newLibraryWithSource_options_error(&*NSString::from_str(src), None).unwrap_or_else(|e| panic!("shader compile: {e}"));
+        let cmdq = device.newCommandQueue().unwrap();
         Ctx { device, lib, cmdq }
     }
 
@@ -139,28 +168,25 @@ impl Ctx {
         let nkt = nk * hd;
         let (qb, kb, vb) = self.buffers(q, k, v, f16);
         let positions: Vec<i32> = (0..nt as i32).collect();
-        let pb = self.device.new_buffer_with_data(positions.as_ptr() as *const _, (positions.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let pb = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(positions.as_ptr() as *const _ as *mut c_void).unwrap(), ((positions.len() * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
         let elem = if f16 { 2u64 } else { 4u64 };
-        let pad = self.device.new_buffer((2 * C as u64 * nkt as u64) * elem, MTLResourceOptions::StorageModeShared);
-        let ob = self.device.new_buffer((nt * ne_q * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let pad = self.device.newBufferWithLength_options(((2 * C as u64 * nkt as u64) * elem) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let ob = self.device.newBufferWithLength_options(((nt * ne_q * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
 
-        let cb = self.cmdq.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
+        let cb = self.cmdq.commandBuffer().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
 
         if nkv % C != 0 {
-            let f = self.lib.get_function("kernel_kv_tail_pad", None).unwrap();
-            let pl = self.device.new_compute_pipeline_state_with_function(&f).unwrap();
-            enc.set_compute_pipeline_state(&pl);
-            enc.set_buffer(0, Some(&kb), 0);
-            enc.set_buffer(1, Some(&vb), 0);
-            enc.set_buffer(2, Some(&pad), 0);
+            let f = self.lib.newFunctionWithName(&*NSString::from_str("kernel_kv_tail_pad")).unwrap();
+            let pl = self.device.newComputePipelineStateWithFunction_error(&f).unwrap();
+            enc.setComputePipelineState(&*pl);
+            unsafe { enc.setBuffer_offset_atIndex(Some(&*kb), (0) as usize, (0) as usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&*vb), (0) as usize, (1) as usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (2) as usize) };
             for (i, val) in [nkv as i32, nkt as i32, if f16 { 1 } else { 0 }].iter().enumerate() {
-                enc.set_bytes(3 + i as u64, 4, val as *const i32 as *const _);
+                unsafe { enc.setBytes_length_atIndex(NonNull::new(val as *const i32 as *const _ as *mut c_void).unwrap(), (4) as usize, (3 + i as u64) as usize) };
             }
-            enc.dispatch_thread_groups(
-                MTLSize { width: nkt as u64, height: C as u64, depth: 1 },
-                MTLSize { width: 1, height: 1, depth: 1 },
-            );
+            enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (nkt as u64) as usize, height: (C as u64) as usize, depth: (1) as usize }, MTLSize { width: (1) as usize, height: (1) as usize, depth: (1) as usize });
         }
 
         let (kname, shmem) = if hd == 128 {
@@ -168,41 +194,38 @@ impl Ctx {
         } else {
             (if f16 { "kernel_flash_attn_blk_f16" } else { "kernel_flash_attn_blk_f32" }, 7168u64)
         };
-        let f = self.lib.get_function(kname, None).unwrap();
-        let pl = self.device.new_compute_pipeline_state_with_function(&f).unwrap();
-        enc.set_compute_pipeline_state(&pl);
-        enc.set_buffer(0, Some(&qb), 0);
-        enc.set_buffer(1, Some(&kb), 0);
-        enc.set_buffer(2, Some(&vb), 0);
-        enc.set_buffer(3, Some(&pad), 0);
-        enc.set_buffer(4, Some(&ob), 0);
-        enc.set_buffer(5, Some(&pb), 0);
+        let f = self.lib.newFunctionWithName(&*NSString::from_str(kname)).unwrap();
+        let pl = self.device.newComputePipelineStateWithFunction_error(&f).unwrap();
+        enc.setComputePipelineState(&*pl);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*qb), (0) as usize, (0) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*kb), (0) as usize, (1) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*vb), (0) as usize, (2) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (3) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*ob), (0) as usize, (4) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*pb), (0) as usize, (5) as usize) };
         for (i, val) in [nh as i32, nk as i32, hd as i32,
             scale.to_bits() as i32, nt as i32, nkv as i32].iter().enumerate() {
-            enc.set_bytes(6 + i as u64, 4, val as *const i32 as *const _);
+            unsafe { enc.setBytes_length_atIndex(NonNull::new(val as *const i32 as *const _ as *mut c_void).unwrap(), (4) as usize, (6 + i as u64) as usize) };
         }
-        enc.set_threadgroup_memory_length(0, shmem);
-        enc.dispatch_thread_groups(
-            MTLSize { width: (nt.div_ceil(8)) as u64, height: nh as u64, depth: 1 },
-            MTLSize { width: 32, height: 4, depth: 1 },
-        );
-        enc.end_encoding();
+        unsafe { enc.setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: ((nt.div_ceil(8)) as u64) as usize, height: (nh as u64) as usize, depth: (1) as usize }, MTLSize { width: (32) as usize, height: (4) as usize, depth: (1) as usize });
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
-        let ptr = ob.contents() as *const f32;
+        cb.waitUntilCompleted();
+        let ptr = ob.contents().as_ptr() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, nt * ne_q) }.to_vec()
     }
 
     fn buffers(&self, q: &[f32], k: &[f32], v: &[f32],
-        f16: bool) -> (metal::Buffer, metal::Buffer, metal::Buffer) {
-        let qb = self.device.new_buffer_with_data(q.as_ptr() as *const _, (q.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let kb = self.device.new_buffer_with_data(k.as_ptr() as *const _, (k.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let vb = self.device.new_buffer_with_data(v.as_ptr() as *const _, (v.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        f16: bool) -> (MetalBuffer, MetalBuffer, MetalBuffer) {
+        let qb = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(q.as_ptr() as *const _ as *mut c_void).unwrap(), ((q.len() * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let kb = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(k.as_ptr() as *const _ as *mut c_void).unwrap(), ((k.len() * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let vb = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(v.as_ptr() as *const _ as *mut c_void).unwrap(), ((v.len() * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
         if !f16 { return (qb, kb, vb); }
         let k16: Vec<u16> = k.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
         let v16: Vec<u16> = v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
-        let k16b = self.device.new_buffer_with_data(k16.as_ptr() as *const _, (k16.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let v16b = self.device.new_buffer_with_data(v16.as_ptr() as *const _, (v16.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let k16b = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(k16.as_ptr() as *const _ as *mut c_void).unwrap(), ((k16.len() * 2) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let v16b = unsafe { self.device.newBufferWithBytes_length_options(NonNull::new(v16.as_ptr() as *const _ as *mut c_void).unwrap(), ((v16.len() * 2) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
         (qb, k16b, v16b)
     }
 }

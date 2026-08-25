@@ -32,22 +32,8 @@ path = "experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs"
 required-features = ["cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.28"
-block = "0.1.6"
 objc2-metal = "0.3"
 block2 = "0.6"
 objc2-foundation = "0.3"
 objc2 = "0.6"
-
-# objc 0.2.7 (pulled in by metal) expands `#[cfg_attr(feature = "cargo-clippy", …)]`
-# inside its `sel_impl` macro, which rustc flags as an unexpected `feature` cfg in
-# this crate's context (the macro's cfg is evaluated against the destination crate).
-# objc 0.2.7 is the latest published version, so allow that one value explicitly.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
-
-# Vendored one-line fix for `block` 0.1.6 (rust-lang/rust#74840: static of
-# uninhabited type — a hard error in future rustc; upstream unmaintained).
-# See vendor/block/README.md. metal 0.28 and minfer both resolve to this copy.
-[patch.crates-io]
-block = { path = "vendor/block" }
+dispatch2 = "0.3"

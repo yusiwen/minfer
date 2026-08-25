@@ -16,6 +16,8 @@
 //! constraints are checked up front (nkt == nk*hd for attention).
 
 use crate::metal::MpsState;
+#[cfg(target_os = "macos")]
+use objc2_metal::MTLBuffer;
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
@@ -53,11 +55,11 @@ impl Drop for EncTimer {
 pub struct MetalBackend {
     state: &'static MpsState,
     /// f32-element pool: id → shared MTLBuffer (size * 4 bytes)
-    pool: Vec<metal::Buffer>,
+    pool: Vec<crate::metal::MetalBuffer>,
     free: Vec<usize>,
     /// P2/P3 capture staging: host-readable buffers written by per-split blits.
     /// Only allocated while a trace/live capture is armed.
-    staging: Vec<metal::Buffer>,
+    staging: Vec<crate::metal::MetalBuffer>,
     free_staging: Vec<usize>,
     /// Pending command buffer for the current split. Stored as a leaked box
     /// pointer (null = none) because MpsCommandBuffer is !Send/!Sync; all
@@ -113,7 +115,7 @@ impl MetalBackend {
     pub fn read_staging(&self, id: usize) -> Option<&[f32]> {
         let buf = self.staging.get(id)?;
         let len = (buf.length() as usize) / 4;
-        Some(unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len) })
+        Some(unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, len) })
     }
 
     /// Return all staging buffers to the free list (call after the readback of
@@ -135,7 +137,7 @@ impl MetalBackend {
         })
     }
 
-    fn buf(&self, id: usize) -> &metal::Buffer {
+    fn buf(&self, id: usize) -> &crate::metal::MetalBuffer {
         &self.pool[id]
     }
 
@@ -181,7 +183,7 @@ impl MetalBackend {
     /// KV-parallel attention chunk count (decode), mirroring layer_gpu's
     /// adaptive rule: one chunk per 32 KV rows, capped at 16, with a
     /// MINFER_ATTN_CHUNKS override.
-    fn attention_chunks(&self, positions: &metal::Buffer) -> usize {
+    fn attention_chunks(&self, positions: &crate::metal::MetalBuffer) -> usize {
         let max_pos = Self::positions_max(positions);
         std::env::var("MINFER_ATTN_CHUNKS")
             .ok()
@@ -193,9 +195,9 @@ impl MetalBackend {
     /// max(positions) + host-side read of the (host-written) I32 positions
     /// buffer — the positions are input data, never GPU-computed, so a host
     /// read is safe here.
-    fn positions_max(positions: &metal::Buffer) -> usize {
+    fn positions_max(positions: &crate::metal::MetalBuffer) -> usize {
         let n = (positions.length() as usize) / 4;
-        let p = unsafe { std::slice::from_raw_parts(positions.contents() as *const u32, n) };
+        let p = unsafe { std::slice::from_raw_parts(positions.contents().as_ptr() as *const u32, n) };
         p.iter().map(|&x| x as usize).max().unwrap_or(0)
     }
 
@@ -206,8 +208,8 @@ impl MetalBackend {
         let n = (src_buf.length().min(dst_buf.length()) / 4) as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                src_buf.contents() as *const f32,
-                dst_buf.contents() as *mut f32,
+                src_buf.contents().as_ptr() as *const f32,
+                dst_buf.contents().as_ptr() as *mut f32,
                 n,
             );
         }
@@ -531,7 +533,7 @@ impl Backend for MetalBackend {
                 if std::env::var("MINFER_FFNDEBUG").is_ok() {
                     self.submit_pending();
                     let nb = (self.pool[out_buf].length() as usize) / 4;
-                    let ob = unsafe { std::slice::from_raw_parts(self.buf(out_buf).contents() as *const f32, nb) };
+                    let ob = unsafe { std::slice::from_raw_parts(self.buf(out_buf).contents().as_ptr() as *const f32, nb) };
                     eprintln!("[ffn-out] FusedFFN out_buf={out_buf} len={nb} first4={:?} last4={:?}",
                         &ob[..4], &ob[nb-4..]);
                 }
@@ -557,7 +559,7 @@ impl Backend for MetalBackend {
                 // 2) fused bias + rope + KV store in one kernel pass
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
-                let bias_off = |name: &Option<String>| -> Result<(metal::Buffer, u64), String> {
+                let bias_off = |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
                     match name {
                         Some(n) => self.state.weight_buf(n).ok_or_else(|| format!("bias '{n}' not on GPU")),
                         None => Err("fused QKV bias missing".into()),
@@ -571,7 +573,7 @@ impl Backend for MetalBackend {
                 let (bv_b, bv_o) = bv;
                 let pos = {
                     let n = (self.buf(in_bufs[1]).length() as usize) / 4;
-                    let p = unsafe { std::slice::from_raw_parts(self.buf(in_bufs[1]).contents() as *const u32, n) };
+                    let p = unsafe { std::slice::from_raw_parts(self.buf(in_bufs[1]).contents().as_ptr() as *const u32, n) };
                     p[0] as i32
                 };
 
@@ -593,7 +595,7 @@ impl Backend for MetalBackend {
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
-        Some(unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len) })
+        Some(unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, len) })
     }
 
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String> {
@@ -603,7 +605,7 @@ impl Backend for MetalBackend {
             return Err(format!("buffer {id}: expected {len} elements, got {}", data.len()));
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents().as_ptr() as *mut f32, data.len());
         }
         Ok(())
     }

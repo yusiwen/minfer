@@ -5,9 +5,38 @@
 use std::sync::OnceLock;
 use crate::tensor::{Tensor, TensorType};
 #[cfg(target_os = "macos")]
-use metal::objc::{msg_send, sel, sel_impl};
+use objc2_metal::{
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCaptureDescriptor,
+    MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
+};
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSString;
+use block2::RcBlock;
+use dispatch2::DispatchData;
+use std::ffi::c_void;
+use std::ptr::NonNull;
 
 static MPS: OnceLock<Option<MpsState>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+pub type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
+#[cfg(target_os = "macos")]
+pub type MetalCommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+#[cfg(target_os = "macos")]
+pub type MetalCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+#[cfg(target_os = "macos")]
+pub type MetalComputeCommandEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
+#[cfg(target_os = "macos")]
+pub type MetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+#[cfg(target_os = "macos")]
+pub type MetalComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+#[cfg(target_os = "macos")]
+pub type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
+#[cfg(target_os = "macos")]
+
 
 /// Serialize Metal-touching tests.
 ///
@@ -154,92 +183,98 @@ pub struct MpsState {
     #[cfg(target_os = "macos")]
     inner: MpsStateInner,
 }
+// Metal objects (objc2) are not auto Send/Sync, but minfer touches MpsState only
+// through the single scheduler thread (or metal_test_lock in tests), and Metal
+// objects are thread-safe in reality — so assert it.
+unsafe impl Send for MpsState {}
+unsafe impl Sync for MpsState {}
+
 
 #[cfg(target_os = "macos")]
 struct MpsStateInner {
-    device: metal::Device,
+    device: MetalDevice,
     // Cached device capabilities (queried once at init, aligned with llama.cpp's
     // ggml-metal-device props). All dispatch-time guards compare against these.
     max_threadgroup_memory: u64,
-    queue: metal::CommandQueue,
-    pl_q4_0_f32: metal::ComputePipelineState,
-    pl_q4_0_f32_multi: metal::ComputePipelineState,
-    pl_q4_0_mm_f32: metal::ComputePipelineState,
-    pl_q4_1_f32: metal::ComputePipelineState,
-    pl_q4_1_f32_multi: metal::ComputePipelineState,
-    pl_q4_1_mm_f32: metal::ComputePipelineState,
-    pl_q8_0_f32: metal::ComputePipelineState,
-    pl_q8_0_f32_multi: metal::ComputePipelineState,
-    pl_q8_0_mm_f32: metal::ComputePipelineState,
-    pl_q4_k_f32: metal::ComputePipelineState,
-    pl_q4_k_f32_multi: metal::ComputePipelineState,
-    pl_q4_k_mm_f32: metal::ComputePipelineState,
-    pl_q6_k_f32: metal::ComputePipelineState,
-    pl_q6_k_f32_multi: metal::ComputePipelineState,
-    pl_q6_k_mm_f32: metal::ComputePipelineState,
-    pl_q5_0_f32: metal::ComputePipelineState,
-    pl_q5_0_f32_multi: metal::ComputePipelineState,
-    pl_q5_0_mm_f32: metal::ComputePipelineState,
-    pl_q5_1_f32: metal::ComputePipelineState,
-    pl_q5_1_f32_multi: metal::ComputePipelineState,
-    pl_q5_1_mm_f32: metal::ComputePipelineState,
-    pl_q5_k_f32: metal::ComputePipelineState,
-    pl_q5_k_f32_multi: metal::ComputePipelineState,
-    pl_q5_k_mm_f32: metal::ComputePipelineState,
-    pl_get_rows_q4_0: metal::ComputePipelineState,
-    pl_get_rows_f32: metal::ComputePipelineState,
-    pl_get_rows_q4_k: metal::ComputePipelineState,
-    pl_get_rows_q4_1: metal::ComputePipelineState,
-    pl_get_rows_q5_0: metal::ComputePipelineState,
-    pl_get_rows_q5_1: metal::ComputePipelineState,
-    pl_get_rows_q8_0: metal::ComputePipelineState,
-    pl_get_rows_q6_k: metal::ComputePipelineState,
-    pl_get_rows_q5_k: metal::ComputePipelineState,
-    pl_rms_norm: metal::ComputePipelineState,
-    pl_rms_norm_256: metal::ComputePipelineState,
-    pl_add: metal::ComputePipelineState,
-    pl_add_bias: metal::ComputePipelineState,
-    pl_mul: metal::ComputePipelineState,
-    pl_silu: metal::ComputePipelineState,
-    pl_swiglu: metal::ComputePipelineState,
-    pl_rope: metal::ComputePipelineState,
-    pl_gqa_attn: metal::ComputePipelineState,
-    pl_gqa_attn_f16: metal::ComputePipelineState,
-    pl_gqa_attn_partial: metal::ComputePipelineState,
-    pl_gqa_attn_partial_f16: metal::ComputePipelineState,
-    pl_gqa_attn_combine: metal::ComputePipelineState,
-    pl_flash_attn: metal::ComputePipelineState,
-    pl_flash_attn_f16: metal::ComputePipelineState,
-    pl_flash_attn_hd128: metal::ComputePipelineState,
-    pl_flash_attn_hd128_f16: metal::ComputePipelineState,
-    pl_flash_attn_blk: metal::ComputePipelineState,
-    pl_flash_attn_blk_f16: metal::ComputePipelineState,
-    pl_flash_attn_blk_hd128: metal::ComputePipelineState,
-    pl_flash_attn_blk_hd128_f16: metal::ComputePipelineState,
-    pl_kv_tail_pad: metal::ComputePipelineState,
-    pl_store_kv: metal::ComputePipelineState,
-    pl_store_kv_f16: metal::ComputePipelineState,
-    pl_attn_bsr: metal::ComputePipelineState,
-    pl_attn_scores: metal::ComputePipelineState,
-    pl_attn_output: metal::ComputePipelineState,
-    pl_softmax_attn: metal::ComputePipelineState,
-    pl_warmup: metal::ComputePipelineState,
+    queue: MetalCommandQueue,
+    pl_q4_0_f32: MetalComputePipelineState,
+    pl_q4_0_f32_multi: MetalComputePipelineState,
+    pl_q4_0_mm_f32: MetalComputePipelineState,
+    pl_q4_1_f32: MetalComputePipelineState,
+    pl_q4_1_f32_multi: MetalComputePipelineState,
+    pl_q4_1_mm_f32: MetalComputePipelineState,
+    pl_q8_0_f32: MetalComputePipelineState,
+    pl_q8_0_f32_multi: MetalComputePipelineState,
+    pl_q8_0_mm_f32: MetalComputePipelineState,
+    pl_q4_k_f32: MetalComputePipelineState,
+    pl_q4_k_f32_multi: MetalComputePipelineState,
+    pl_q4_k_mm_f32: MetalComputePipelineState,
+    pl_q6_k_f32: MetalComputePipelineState,
+    pl_q6_k_f32_multi: MetalComputePipelineState,
+    pl_q6_k_mm_f32: MetalComputePipelineState,
+    pl_q5_0_f32: MetalComputePipelineState,
+    pl_q5_0_f32_multi: MetalComputePipelineState,
+    pl_q5_0_mm_f32: MetalComputePipelineState,
+    pl_q5_1_f32: MetalComputePipelineState,
+    pl_q5_1_f32_multi: MetalComputePipelineState,
+    pl_q5_1_mm_f32: MetalComputePipelineState,
+    pl_q5_k_f32: MetalComputePipelineState,
+    pl_q5_k_f32_multi: MetalComputePipelineState,
+    pl_q5_k_mm_f32: MetalComputePipelineState,
+    pl_get_rows_q4_0: MetalComputePipelineState,
+    pl_get_rows_f32: MetalComputePipelineState,
+    pl_get_rows_q4_k: MetalComputePipelineState,
+    pl_get_rows_q4_1: MetalComputePipelineState,
+    pl_get_rows_q5_0: MetalComputePipelineState,
+    pl_get_rows_q5_1: MetalComputePipelineState,
+    pl_get_rows_q8_0: MetalComputePipelineState,
+    pl_get_rows_q6_k: MetalComputePipelineState,
+    pl_get_rows_q5_k: MetalComputePipelineState,
+    pl_rms_norm: MetalComputePipelineState,
+    pl_rms_norm_256: MetalComputePipelineState,
+    pl_add: MetalComputePipelineState,
+    pl_add_bias: MetalComputePipelineState,
+    pl_mul: MetalComputePipelineState,
+    pl_silu: MetalComputePipelineState,
+    pl_swiglu: MetalComputePipelineState,
+    pl_rope: MetalComputePipelineState,
+    pl_gqa_attn: MetalComputePipelineState,
+    pl_gqa_attn_f16: MetalComputePipelineState,
+    pl_gqa_attn_partial: MetalComputePipelineState,
+    pl_gqa_attn_partial_f16: MetalComputePipelineState,
+    pl_gqa_attn_combine: MetalComputePipelineState,
+    pl_flash_attn: MetalComputePipelineState,
+    pl_flash_attn_f16: MetalComputePipelineState,
+    pl_flash_attn_hd128: MetalComputePipelineState,
+    pl_flash_attn_hd128_f16: MetalComputePipelineState,
+    pl_flash_attn_blk: MetalComputePipelineState,
+    pl_flash_attn_blk_f16: MetalComputePipelineState,
+    pl_flash_attn_blk_hd128: MetalComputePipelineState,
+    pl_flash_attn_blk_hd128_f16: MetalComputePipelineState,
+    pl_kv_tail_pad: MetalComputePipelineState,
+    pl_store_kv: MetalComputePipelineState,
+    pl_store_kv_f16: MetalComputePipelineState,
+    pl_attn_bsr: MetalComputePipelineState,
+    pl_attn_scores: MetalComputePipelineState,
+    pl_attn_output: MetalComputePipelineState,
+    pl_softmax_attn: MetalComputePipelineState,
+    pl_warmup: MetalComputePipelineState,
     // (buffer, byte-offset): weights live either in a per-weight copied buffer
     // (offset 0) or — since the 2026-08-21 mmap loader — as offsets into a
     // page-aligned NoCopy buffer over the mmap'd GGUF part (llama-style,
     // ggml-metal-device.m:1668; newBufferWithBytesNoCopy requires a page-aligned
     // base, so per-tensor offsets are passed via setBuffer:offset:).
-    weights: std::sync::Mutex<std::collections::HashMap<String, (metal::Buffer, u64)>>,
+    weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64)>>,
     // Registered mmap'd GGUF parts: (base_ptr, len, Metal buffer). register_weight
     // resolves a weight slice to (buffer, offset) by pointer-range containment.
-    mmap_parts: std::sync::Mutex<Vec<(usize, usize, metal::Buffer)>>,
+    mmap_parts: std::sync::Mutex<Vec<(usize, usize, MetalBuffer)>>,
     // Scratch for the mmap-part warmup dispatch (register_part).
-    buf_positions: std::sync::Mutex<metal::Buffer>,
-    buf_attn_partial: std::sync::Mutex<metal::Buffer>,
+    buf_positions: std::sync::Mutex<MetalBuffer>,
+    buf_attn_partial: std::sync::Mutex<MetalBuffer>,
     // Prefill parallel-attention scratch (P1 2026-08-11): scores [nt][nh][nkv].
-    buf_attn_scores: std::sync::Mutex<metal::Buffer>,
+    buf_attn_scores: std::sync::Mutex<MetalBuffer>,
     // Flash-prefill tail pad (2026-08-14): [2][64][nkt] f32/f16 K-tail + V-tail.
-    buf_attn_pad: std::sync::Mutex<metal::Buffer>,
+    buf_attn_pad: std::sync::Mutex<MetalBuffer>,
     // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
     dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
@@ -254,8 +289,8 @@ pub struct MpsCommandBuffer<'a> {
     // Drop releases), so the objects survive the creating thread's
     // autorelease-pool drain — required whenever a command buffer is created on
     // a background thread (parallel encoding) or handed across threads.
-    cmd_buf: &'a metal::CommandBufferRef,
-    enc: &'a metal::ComputeCommandEncoderRef,
+    cmd_buf: MetalCommandBuffer,
+    enc: MetalComputeCommandEncoder,
     /// Whether the compute encoder is still open. `encode_captures` (P2/P3
     /// staging blits) ends it and encodes a blit pass; `submit` must then skip
     /// the (now illegal) second `end_encoding`.
@@ -263,18 +298,6 @@ pub struct MpsCommandBuffer<'a> {
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for MpsCommandBuffer<'_> {
-    fn drop(&mut self) {
-        // Release the retains taken in cmd_buffer(). This MUST happen after the
-        // encoder is ended and the command buffer committed, so Metal sees a
-        // clean lifecycle (no "encoder released without endEncoding").
-        unsafe {
-            let _: () = msg_send![self.cmd_buf, release];
-            let _: () = msg_send![self.enc, release];
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 impl MpsCommandBuffer<'_> {
     /// Record the current dispatch op label (only when MINFER_TRACE=1, so normal
@@ -293,11 +316,7 @@ impl MpsCommandBuffer<'_> {
     }
 
     fn set_params(&self, idx: u64, val: &i32) {
-        self.enc.set_bytes(
-            idx,
-            std::mem::size_of::<i32>() as u64,
-            val as *const i32 as *const std::ffi::c_void,
-        );
+        unsafe { self.enc.setBytes_length_atIndex(NonNull::new(val as *const i32 as *const std::ffi::c_void as *mut c_void).unwrap(), (std::mem::size_of::<i32>() as u64) as usize, (idx) as usize) };
     }
 
     /// GPU memory barrier (2026-08-19 fix). Metal does NOT guarantee
@@ -308,9 +327,7 @@ impl MpsCommandBuffer<'_> {
     /// layer0 bn on 1.5B/7B prefill). llama.cpp's Metal backend inserts the same
     /// barrier after every op. MTLBarrierScopeBuffers = 1 << 0.
     fn barrier(&self) {
-        unsafe {
-            let _: () = msg_send![self.enc, memoryBarrierWithScope: 1u64];
-        }
+        self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 
     /// End the compute pass. Call before encoding blits from the same command
@@ -318,7 +335,7 @@ impl MpsCommandBuffer<'_> {
     /// skips its own `end_encoding`.
     pub fn end_compute(&mut self) {
         if self.enc_open {
-            self.enc.end_encoding();
+            self.enc.endEncoding();
             self.enc_open = false;
         }
     }
@@ -329,45 +346,35 @@ impl MpsCommandBuffer<'_> {
     pub fn encode_captures(
         &mut self,
         pairs: &[(usize, usize)],
-        buffers: &[metal::Buffer],
-        staging: &[metal::Buffer],
+        buffers: &[MetalBuffer],
+        staging: &[MetalBuffer],
     ) -> Result<(), String> {
         if pairs.is_empty() {
             return Ok(());
         }
         self.end_compute();
-        let blit_ref = self.cmd_buf.new_blit_command_encoder();
-        // Autoreleased (selector `blitCommandEncoder`) — retain like the
-        // compute encoder so it survives the autorelease-pool drain.
-        unsafe {
-            let _: *mut metal::objc::runtime::Object = msg_send![blit_ref, retain];
-        }
+        let blit_ref = self.cmd_buf.blitCommandEncoder().expect("blit encoder");
         for &(src, dst) in pairs {
             let src_buf = buffers.get(src).ok_or_else(|| format!("capture: no buffer {src}"))?;
             let dst_buf = staging.get(dst).ok_or_else(|| format!("capture: no staging {dst}"))?;
             let len = src_buf.length();
-            blit_ref.copy_from_buffer(src_buf, 0, dst_buf, 0, len);
+            unsafe {
+                blit_ref.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &**src_buf, 0, &**dst_buf, 0, len,
+                );
+            }
         }
-        blit_ref.end_encoding();
-        unsafe {
-            let _: () = msg_send![blit_ref, release];
-        }
+        blit_ref.endEncoding();
         Ok(())
     }
 
     fn dispatch_2d(&self, w: u64, h: u64, tw: u64, th: u64) {
-        self.enc.dispatch_thread_groups(
-            metal::MTLSize { width: w, height: h, depth: 1 },
-            metal::MTLSize { width: tw, height: th, depth: 1 },
-        );
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (w) as usize, height: (h) as usize, depth: (1) as usize }, MTLSize { width: (tw) as usize, height: (th) as usize, depth: (1) as usize });
         self.barrier();
     }
 
     fn dispatch_3d(&self, w: u64, h: u64, d: u64, tw: u64, th: u64, td: u64) {
-        self.enc.dispatch_thread_groups(
-            metal::MTLSize { width: w, height: h, depth: d },
-            metal::MTLSize { width: tw, height: th, depth: td },
-        );
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (w) as usize, height: (h) as usize, depth: (d) as usize }, MTLSize { width: (tw) as usize, height: (th) as usize, depth: (td) as usize });
         self.barrier();
     }
 
@@ -380,8 +387,8 @@ impl MpsCommandBuffer<'_> {
     /// Dispatch a 64×32-tile simdgroup GEMM (NT≥16 prefill). GPU safety: the
     /// kernels stage 8 KB of threadgroup memory (sa 4 KB + sb 2 KB + bc_out
     /// 8 KB reusing sa/sb) — verified against the queried device limit.
-    fn gemm_dispatch(&self, pl: &metal::ComputePipelineState, wb: &metal::Buffer, w_off: u64,
-        x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
+    fn gemm_dispatch(&self, pl: &MetalComputePipelineState, wb: &MetalBuffer, w_off: u64,
+        x: &MetalBuffer, x_off: u64, out: &MetalBuffer, od: usize, id: usize, nt: usize,
     ) {
         if 8192 > self.state.max_threadgroup_memory {
             gpu_abort(&format!(
@@ -389,26 +396,23 @@ impl MpsCommandBuffer<'_> {
                 self.state.max_threadgroup_memory
             ));
         }
-        self.enc.set_compute_pipeline_state(pl);
-        self.enc.set_buffer(0, Some(wb), w_off);
-        self.enc.set_buffer(1, Some(x), x_off);
-        self.enc.set_buffer(2, Some(out), 0);
+        self.enc.setComputePipelineState(&**(pl));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
         let mm_p = [od as i32, id as i32, nt as i32];
-        self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
-        self.enc.set_threadgroup_memory_length(0, 8192);
+        unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((8192) as usize, (0) as usize) };
         self.dispatch_2d(((nt + 31) / 32) as u64, ((od + 63) / 64) as u64, 32, 4);
     }
 
     fn dispatch_1d(&self, n: u64, tg: u64) {
-        self.enc.dispatch_thread_groups(
-            metal::MTLSize { width: (n + tg - 1) / tg, height: 1, depth: 1 },
-            metal::MTLSize { width: tg, height: 1, depth: 1 },
-        );
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: ((n + tg - 1) / tg) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (tg) as usize, height: (1) as usize, depth: (1) as usize });
         self.barrier();
     }
 
-    pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &metal::Buffer, w_off: u64, ttype: TensorType,
-        x: &metal::Buffer, x_off: u64, out: &metal::Buffer, od: usize, id: usize, nt: usize,
+    pub fn quant_matmul_f32_on_gpu_buf(&self, wb: &MetalBuffer, w_off: u64, ttype: TensorType,
+        x: &MetalBuffer, x_off: u64, out: &MetalBuffer, od: usize, id: usize, nt: usize,
     ) {
         self.trace_op("matmul");
         // GPU safety (M1): the K-quant (super-block) kernels index weights by
@@ -424,19 +428,17 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q8_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q8_0_f32_multi } else { &self.state.pl_q8_0_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     const NW: u64 = 32;
                     const NSG: u64 = 4;
                     const NR0: u64 = 2;
                     const TG_MEM: u64 = NW * NR0 * std::mem::size_of::<f32>() as u64; // 256 bytes
-                    self.enc.set_threadgroup_memory_length(0, TG_MEM);
+                    unsafe { self.enc.setThreadgroupMemoryLength_atIndex((TG_MEM) as usize, (0) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 1) / 2) as u64, grid_y, NW, NSG);
                 }
@@ -449,17 +451,17 @@ impl MpsCommandBuffer<'_> {
                     let pl = if ttype == TensorType::Q6_K { &self.state.pl_q6_k_mm_f32 } else { &self.state.pl_q4_k_mm_f32 };
                     self.gemm_dispatch(pl, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    let pl: &metal::ComputePipelineState = if ttype == TensorType::Q4_K {
+                    let pl: &MetalComputePipelineState = if ttype == TensorType::Q4_K {
                         if nt > 1 { &self.state.pl_q4_k_f32_multi } else { &self.state.pl_q4_k_f32 }
                     } else {
                         if nt > 1 { &self.state.pl_q6_k_f32_multi } else { &self.state.pl_q6_k_f32 }
                     };
-                    self.enc.set_compute_pipeline_state(pl);
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(pl));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     // Q6_K/Q4_K: llama's kernel_mul_mv_q6_K/q4_K_f32_impl use
                     // TG(32, nsg=2); the stride-2 (q6_K) / stride-4 (q4_K) thread
@@ -476,14 +478,12 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q4_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q4_1_f32_multi } else { &self.state.pl_q4_1_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
@@ -492,14 +492,12 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q5_0_f32_multi } else { &self.state.pl_q5_0_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
@@ -508,14 +506,12 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_1_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q5_1_f32_multi } else { &self.state.pl_q5_1_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
@@ -524,14 +520,12 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q5_k_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q5_k_f32_multi } else { &self.state.pl_q5_k_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
                 }
@@ -544,27 +538,23 @@ impl MpsCommandBuffer<'_> {
                 if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
                     self.gemm_dispatch(&self.state.pl_q4_0_mm_f32, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
-                    self.enc.set_compute_pipeline_state(
-                        if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
-                    );
-                    self.enc.set_buffer(0, Some(wb), w_off);
-                    self.enc.set_buffer(1, Some(x), x_off);
-                    self.enc.set_buffer(2, Some(out), 0);
+                    self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }));
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                     let mm_p = [od as i32, id as i32, nt as i32];
-                    self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                    unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                     let grid_y = if nt > 1 { 1 } else { nt as u64 };
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
             }
             _ => {
-                self.enc.set_compute_pipeline_state(
-                    if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }
-                );
-                self.enc.set_buffer(0, Some(wb), w_off);
-                self.enc.set_buffer(1, Some(x), x_off);
-                self.enc.set_buffer(2, Some(out), 0);
+                self.enc.setComputePipelineState(&**(if nt > 1 { &self.state.pl_q4_0_f32_multi } else { &self.state.pl_q4_0_f32 }));
+                unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+                unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize) };
+                unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
                 let mm_p = [od as i32, id as i32, nt as i32];
-                self.enc.set_bytes(3, 12, mm_p.as_ptr() as *const std::ffi::c_void);
+                unsafe { self.enc.setBytes_length_atIndex(NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (12) as usize, (3) as usize) };
                 let grid_y = if nt > 1 { 1 } else { nt as u64 };
                 self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
             }
@@ -577,17 +567,17 @@ impl MpsCommandBuffer<'_> {
     /// (Only exercised by the `matmul_bandwidth_profile` test; the graph backend
     /// calls `quant_matmul_f32_on_gpu_buf` directly.)
     #[allow(dead_code)]
-    fn matmul_on_gpu_buf(&self, wb: &metal::Buffer, w_off: u64, ttype: TensorType,
-        _q8_x: &metal::Buffer, f32_x: &metal::Buffer, x_off: u64,
-        out: &metal::Buffer, od: usize, id: usize, nt: usize,
+    fn matmul_on_gpu_buf(&self, wb: &MetalBuffer, w_off: u64, ttype: TensorType,
+        _q8_x: &MetalBuffer, f32_x: &MetalBuffer, x_off: u64,
+        out: &MetalBuffer, od: usize, id: usize, nt: usize,
     ) {
         self.quant_matmul_f32_on_gpu_buf(wb, w_off, ttype, f32_x, x_off, out, od, id, nt);
     }
 
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.
     /// Writes f32 hidden state [nt][ne] to dst (buf_hidden).
-    pub fn embed_tokens_gpu(&self, wb: &metal::Buffer, w_off: u64, ids: &metal::Buffer,
-        dst: &metal::Buffer, ne: usize, nt: usize, ttype: TensorType,
+    pub fn embed_tokens_gpu(&self, wb: &MetalBuffer, w_off: u64, ids: &MetalBuffer,
+        dst: &MetalBuffer, ne: usize, nt: usize, ttype: TensorType,
     ) {
         self.trace_op("embed");
         let (pl, nb) = match ttype {
@@ -601,37 +591,37 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q5_K => (&self.state.pl_get_rows_q5_k, (ne / 256) * 16),
             _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
         };
-        self.enc.set_compute_pipeline_state(pl);
-        self.enc.set_buffer(0, Some(wb), w_off);
-        self.enc.set_buffer(1, Some(ids), 0);
-        self.enc.set_buffer(2, Some(dst), 0);
+        self.enc.setComputePipelineState(&**(pl));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(ids)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(dst)), (0) as usize, (2) as usize) };
         self.set_params(3, &(ne as i32));
         self.set_params(4, &(nt as i32));
         self.dispatch_1d((nt * nb) as u64, 256);
     }
 
     /// Generic f32 row selection: out[t] = x[ids[t]] (graph n_out tail rows).
-    pub fn get_rows_f32(&self, x: &metal::Buffer, ids: &metal::Buffer,
-        out: &metal::Buffer, ne: usize, nt: usize,
+    pub fn get_rows_f32(&self, x: &MetalBuffer, ids: &MetalBuffer,
+        out: &MetalBuffer, ne: usize, nt: usize,
     ) {
         self.trace_op("get_rows_f32");
-        self.enc.set_compute_pipeline_state(&self.state.pl_get_rows_f32);
-        self.enc.set_buffer(0, Some(x), 0);
-        self.enc.set_buffer(1, Some(ids), 0);
-        self.enc.set_buffer(2, Some(out), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_get_rows_f32);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(ids)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
         self.set_params(3, &(ne as i32));
         self.dispatch_2d(nt as u64, ne as u64, 1, 1);
     }
 
     /// RMSNorm: y = x * rsqrt(mean(x²)+eps) * w
-    pub fn rms_norm(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, w_off: u64,
-        y: &metal::Buffer, d: usize, n: usize, eps: f32, off: u64,
+    pub fn rms_norm(&self, x: &MetalBuffer, w: Option<&MetalBuffer>, w_off: u64,
+        y: &MetalBuffer, d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
-        self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm);
-        self.enc.set_buffer(0, Some(x), off);
-        self.enc.set_buffer(1, Some(w.unwrap_or(y)), w_off); // dummy if no weight
-        self.enc.set_buffer(2, Some(y), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_rms_norm);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(w.unwrap_or(y))), (w_off) as usize, (1) as usize) }; // dummy if no weight
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (2) as usize) };
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
         self.dispatch_2d(n as u64, 1, 32, 1);
@@ -642,36 +632,36 @@ impl MpsCommandBuffer<'_> {
     /// so a single 896-element row isn't DRAM-latency-bound (the 32-thread
     /// kernel measured ~7x the per-dispatch cost of 256-thread elementwise ops).
     /// Requires a threadgroup buffer of n_simdgroups floats (8 for 256 threads).
-    pub fn rms_norm_256(&self, x: &metal::Buffer, w: Option<&metal::Buffer>, w_off: u64,
-        y: &metal::Buffer, d: usize, n: usize, eps: f32, off: u64,
+    pub fn rms_norm_256(&self, x: &MetalBuffer, w: Option<&MetalBuffer>, w_off: u64,
+        y: &MetalBuffer, d: usize, n: usize, eps: f32, off: u64,
     ) {
         self.trace_op("rms_norm");
-        self.enc.set_compute_pipeline_state(&self.state.pl_rms_norm_256);
-        self.enc.set_buffer(0, Some(x), off);
-        self.enc.set_buffer(1, Some(w.unwrap_or(y)), w_off);
-        self.enc.set_buffer(2, Some(y), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_rms_norm_256);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(w.unwrap_or(y))), (w_off) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (2) as usize) };
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
-        self.enc.set_threadgroup_memory_length(0, 32 * 4);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((32 * 4) as usize, (0) as usize) };
         // 256 threads = 8 simdgroups; one threadgroup per row.
         self.dispatch_2d(n as u64, 1, 32, 8);
     }
 
     /// Element-wise add: z = x + y
-    pub fn add_f32(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer, n: usize) {
+    pub fn add_f32(&self, x: &MetalBuffer, y: &MetalBuffer, z: &MetalBuffer, n: usize) {
         self.add_f32_off(x, y, z, n, 0, 0, 0);
     }
 
     /// Element-wise add with per-buffer byte offsets (last-layer output-rows
     /// reduction: x/z read/write the tail n_out rows of `hidden`, y starts at 0).
-    pub fn add_f32_off(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer,
+    pub fn add_f32_off(&self, x: &MetalBuffer, y: &MetalBuffer, z: &MetalBuffer,
         n: usize, x_off: u64, y_off: u64, z_off: u64,
     ) {
         self.trace_op("add");
-        self.enc.set_compute_pipeline_state(&self.state.pl_add);
-        self.enc.set_buffer(0, Some(x), x_off);
-        self.enc.set_buffer(1, Some(y), y_off);
-        self.enc.set_buffer(2, Some(z), z_off);
+        self.enc.setComputePipelineState(&*self.state.pl_add);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), (y_off) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(z)), (z_off) as usize, (2) as usize) };
         self.set_params(3, &(n as i32));
         // float4 kernel: 4 elements/thread (ceil for the scalar tail)
         self.dispatch_1d(((n as u64) + 3) / 4, 256);
@@ -679,57 +669,57 @@ impl MpsCommandBuffer<'_> {
 
     /// Add 1-D bias to rows: y[t][i] += b[i]. `off` = element offset into `y`
     /// (used by the fused QKV path to bias the q/k/v sections of one buffer).
-    pub fn add_bias_f32(&self, y: &metal::Buffer, b: &metal::Buffer, b_off: u64,
+    pub fn add_bias_f32(&self, y: &MetalBuffer, b: &MetalBuffer, b_off: u64,
         d: usize, n: usize, off: usize,
     ) {
         self.trace_op("bias");
-        self.enc.set_compute_pipeline_state(&self.state.pl_add_bias);
-        self.enc.set_buffer(0, Some(y), (off * 4) as u64);
-        self.enc.set_buffer(1, Some(b), b_off);
+        self.enc.setComputePipelineState(&*self.state.pl_add_bias);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), ((off * 4) as u64) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(b)), (b_off) as usize, (1) as usize) };
         self.set_params(2, &(d as i32));
         // float4 kernel: 4 dims/thread
         self.dispatch_2d(n as u64, ((d as u64) + 3) / 4, 1, 64);
     }
 
     /// Element-wise multiply: z = x * y
-    pub fn mul_f32(&self, x: &metal::Buffer, y: &metal::Buffer, z: &metal::Buffer, n: usize) {
-        self.enc.set_compute_pipeline_state(&self.state.pl_mul);
-        self.enc.set_buffer(0, Some(x), 0);
-        self.enc.set_buffer(1, Some(y), 0);
-        self.enc.set_buffer(2, Some(z), 0);
+    pub fn mul_f32(&self, x: &MetalBuffer, y: &MetalBuffer, z: &MetalBuffer, n: usize) {
+        self.enc.setComputePipelineState(&*self.state.pl_mul);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(z)), (0) as usize, (2) as usize) };
         self.set_params(3, &(n as i32));
         self.dispatch_1d(n as u64, 256);
     }
 
     /// SiLU in-place: y = y / (1 + exp(-y))
-    pub fn silu_f32(&self, y: &metal::Buffer, n: usize) {
-        self.enc.set_compute_pipeline_state(&self.state.pl_silu);
-        self.enc.set_buffer(0, Some(y), 0);
+    pub fn silu_f32(&self, y: &MetalBuffer, n: usize) {
+        self.enc.setComputePipelineState(&*self.state.pl_silu);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (0) as usize) };
         self.set_params(1, &(n as i32));
         self.dispatch_1d(n as u64, 256);
     }
 
     /// SwiGLU fused: dst = silu(gate) * up  (dst may alias gate)
-    pub fn swiglu_f32(&self, gate: &metal::Buffer, up: &metal::Buffer, dst: &metal::Buffer, n: usize) {
+    pub fn swiglu_f32(&self, gate: &MetalBuffer, up: &MetalBuffer, dst: &MetalBuffer, n: usize) {
         self.trace_op("swiglu");
-        self.enc.set_compute_pipeline_state(&self.state.pl_swiglu);
-        self.enc.set_buffer(0, Some(gate), 0);
-        self.enc.set_buffer(1, Some(up), 0);
-        self.enc.set_buffer(2, Some(dst), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_swiglu);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(gate)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(up)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(dst)), (0) as usize, (2) as usize) };
         self.set_params(3, &(n as i32));
         self.dispatch_1d(((n as u64) + 3) / 4, 256);
     }
 
     /// SwiGLU over a fused gate+up buffer: gate at offset 0, up at `up_off`
     /// elements (fused FFN gate+up path). Writes silu(gate)*up back to gate.
-    pub fn swiglu_f32_off(&self, gate: &metal::Buffer, up: &metal::Buffer, dst: &metal::Buffer,
+    pub fn swiglu_f32_off(&self, gate: &MetalBuffer, up: &MetalBuffer, dst: &MetalBuffer,
         n: usize, up_off: usize,
     ) {
         self.trace_op("swiglu");
-        self.enc.set_compute_pipeline_state(&self.state.pl_swiglu);
-        self.enc.set_buffer(0, Some(gate), 0);
-        self.enc.set_buffer(1, Some(up), (up_off * 4) as u64);
-        self.enc.set_buffer(2, Some(dst), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_swiglu);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(gate)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(up)), ((up_off * 4) as u64) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(dst)), (0) as usize, (2) as usize) };
         self.set_params(3, &(n as i32));
         self.dispatch_1d(((n as u64) + 3) / 4, 256);
     }
@@ -737,19 +727,19 @@ impl MpsCommandBuffer<'_> {
     /// RoPE (in-place): x layout [nt][n_head][n_dims]. `off` = element offset
     /// into `x` (fused QKV: K section lives mid-buffer).
     /// rope_style: 0 = non-interleaved (Qwen2), 1 = interleaved (LLaMA).
-    pub fn rope_f32(&self, x: &metal::Buffer, n_head: usize, n_dims: usize, nt: usize,
-        freq_base: f32, freq_scale: f32, positions: &metal::Buffer,
+    pub fn rope_f32(&self, x: &MetalBuffer, n_head: usize, n_dims: usize, nt: usize,
+        freq_base: f32, freq_scale: f32, positions: &MetalBuffer,
         rope_style: i32, off: usize,
     ) {
         self.trace_op("rope");
-        self.enc.set_compute_pipeline_state(&self.state.pl_rope);
-        self.enc.set_buffer(0, Some(x), (off * 4) as u64);
+        self.enc.setComputePipelineState(&*self.state.pl_rope);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(x)), ((off * 4) as u64) as usize, (0) as usize) };
         self.set_params(1, &(n_head as i32));
         self.set_params(2, &(n_dims as i32));
         self.set_params(3, &(nt as i32));
         self.set_params(4, &(freq_base.to_bits() as i32));
         self.set_params(5, &(freq_scale.to_bits() as i32));
-        self.enc.set_buffer(6, Some(positions), 0);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (6) as usize) };
         self.set_params(7, &rope_style);
         // P7: one thread per (dim, head, token) instead of one per (token, head)
         self.dispatch_3d((n_dims / 2) as u64, n_head as u64, nt as u64, 1, 1, 1);
@@ -759,28 +749,26 @@ impl MpsCommandBuffer<'_> {
     /// with online softmax. Each simdgroup processes one query head.
     /// K/V tiles loaded into threadgroup-shared memory, reused by all
     /// query heads in the GQA group.
-    pub fn gqa_attn_f32(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
-        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
+    pub fn gqa_attn_f32(&self, q: &MetalBuffer, k: &MetalBuffer, v: &MetalBuffer,
+        o: &MetalBuffer, positions: &MetalBuffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
     ) {
         self.gqa_attn_f32_off(q, 0, k, 0, v, 0, o, positions, nh, nk, hd, scale, nt);
     }
 
     /// Offset variant of `gqa_attn_f32` — K/V may live at byte offsets inside a
     /// shared buffer (the graph backend's `[K | V]` contiguous KV region).
-    pub fn gqa_attn_f32_off(&self, q: &metal::Buffer, q_off: u64,
-        k: &metal::Buffer, k_off: u64, v: &metal::Buffer, v_off: u64,
-        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
+    pub fn gqa_attn_f32_off(&self, q: &MetalBuffer, q_off: u64,
+        k: &MetalBuffer, k_off: u64, v: &MetalBuffer, v_off: u64,
+        o: &MetalBuffer, positions: &MetalBuffer, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize,
     ) {
         self.trace_op("gqa_attn");
         let gqa = nh / nk;
-        self.enc.set_compute_pipeline_state(
-            if kv_cache_is_f16() { &self.state.pl_gqa_attn_f16 } else { &self.state.pl_gqa_attn }
-        );
-        self.enc.set_buffer(0, Some(q), q_off);
-        self.enc.set_buffer(1, Some(k), k_off);
-        self.enc.set_buffer(2, Some(v), v_off);
-        self.enc.set_buffer(3, Some(o), 0);
-        self.enc.set_buffer(4, Some(positions), 0);
+        self.enc.setComputePipelineState(&**(if kv_cache_is_f16() { &self.state.pl_gqa_attn_f16 } else { &self.state.pl_gqa_attn }));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(q)), (q_off) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(k)), (k_off) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(v)), (v_off) as usize, (2) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (3) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize) };
         self.set_params(5, &(nh as i32));
         self.set_params(6, &(nk as i32));
         self.set_params(7, &(hd as i32));
@@ -788,7 +776,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(9, &(nt as i32));
         const BC: u64 = 32;
         let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
-        self.enc.set_threadgroup_memory_length(0, shmem);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize) };
         self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
     }
 
@@ -797,8 +785,8 @@ impl MpsCommandBuffer<'_> {
     /// #1 decode bottleneck). Two passes: partial per KV chunk (grid (nt,nk,P)),
     /// then combine (grid (nt,nh)). Requires the partials buffer (`buf_attn_partial`)
     /// sized for nt*nh*P*(2+hd) floats, grown on demand here.
-    pub fn gqa_attn_split_f32(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
-        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize,
+    pub fn gqa_attn_split_f32(&self, q: &MetalBuffer, k: &MetalBuffer, v: &MetalBuffer,
+        o: &MetalBuffer, positions: &MetalBuffer, nh: usize, nk: usize, hd: usize,
         scale: f32, nt: usize, n_chunks: usize,
     ) {
         self.trace_op("gqa_attn_split");
@@ -808,14 +796,12 @@ impl MpsCommandBuffer<'_> {
 
         // pass 1: partials per (token, KV_head, chunk) — f16 cache picks the
         // f16 partial kernel (K/V read as half, staged to f32 float4 tiles).
-        self.enc.set_compute_pipeline_state(
-            if kv_cache_is_f16() { &self.state.pl_gqa_attn_partial_f16 } else { &self.state.pl_gqa_attn_partial }
-        );
-        self.enc.set_buffer(0, Some(q), 0);
-        self.enc.set_buffer(1, Some(k), 0);
-        self.enc.set_buffer(2, Some(v), 0);
-        self.enc.set_buffer(3, Some(&partial), 0);
-        self.enc.set_buffer(4, Some(positions), 0);
+        self.enc.setComputePipelineState(&**(if kv_cache_is_f16() { &self.state.pl_gqa_attn_partial_f16 } else { &self.state.pl_gqa_attn_partial }));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (3) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize) };
         self.set_params(5, &(nh as i32));
         self.set_params(6, &(nk as i32));
         self.set_params(7, &(hd as i32));
@@ -824,13 +810,13 @@ impl MpsCommandBuffer<'_> {
         self.set_params(10, &(n_chunks as i32));
         const BC: u64 = 32;
         let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
-        self.enc.set_threadgroup_memory_length(0, shmem);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize) };
         self.dispatch_3d(nt as u64, nk as u64, n_chunks as u64, 32, gqa as u64, 1);
 
         // pass 2: combine
-        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_combine);
-        self.enc.set_buffer(0, Some(&partial), 0);
-        self.enc.set_buffer(1, Some(o), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_gqa_attn_combine);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (1) as usize) };
         self.set_params(2, &(nh as i32));
         self.set_params(3, &(hd as i32));
         self.set_params(4, &(nt as i32));
@@ -848,8 +834,8 @@ impl MpsCommandBuffer<'_> {
     /// kernel merges them unchanged. Grid (nt, nh, n_chunks), 32 threads.
     /// Host guard: layer_gpu only dispatches this when hd==64 (fixed DK/DV);
     /// otherwise the split path is used.
-    pub fn gqa_attn_flash(&self, q: &metal::Buffer, k: &metal::Buffer, v: &metal::Buffer,
-        o: &metal::Buffer, positions: &metal::Buffer, nh: usize, nk: usize, hd: usize,
+    pub fn gqa_attn_flash(&self, q: &MetalBuffer, k: &MetalBuffer, v: &MetalBuffer,
+        o: &MetalBuffer, positions: &MetalBuffer, nh: usize, nk: usize, hd: usize,
         scale: f32, nt: usize, n_chunks: usize,
     ) {
         self.trace_op("gqa_attn_flash");
@@ -857,17 +843,17 @@ impl MpsCommandBuffer<'_> {
         let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
 
         // pass 1: flash partials — f16 cache reads the half K/V directly.
-        self.enc.set_compute_pipeline_state(match (kv_cache_is_f16(), hd) {
+        self.enc.setComputePipelineState(&**(match (kv_cache_is_f16(), hd) {
             (false, 128) => &self.state.pl_flash_attn_hd128,
             (true, 128) => &self.state.pl_flash_attn_hd128_f16,
             (false, _) => &self.state.pl_flash_attn,
             (true, _) => &self.state.pl_flash_attn_f16,
-        });
-        self.enc.set_buffer(0, Some(q), 0);
-        self.enc.set_buffer(1, Some(k), 0);
-        self.enc.set_buffer(2, Some(v), 0);
-        self.enc.set_buffer(3, Some(&partial), 0);
-        self.enc.set_buffer(4, Some(positions), 0);
+        }));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (3) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize) };
         self.set_params(5, &(nh as i32));
         self.set_params(6, &(nk as i32));
         self.set_params(7, &(hd as i32));
@@ -877,13 +863,13 @@ impl MpsCommandBuffer<'_> {
         // shmem (hd=64): sq4 (16 float4 = 256 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B) = 896 → 1024
         // shmem (hd=128): sq4 (32 float4 = 512 B) | ss (32 f32 = 128 B) | so4 (32 float4 = 512 B) = 1152
         let shmem = if hd == 128 { 1152 } else { 1024 };
-        self.enc.set_threadgroup_memory_length(0, shmem);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize) };
         self.dispatch_3d(nt as u64, nh as u64, n_chunks as u64, 32, 1, 1);
 
         // pass 2: combine (shared with the split path)
-        self.enc.set_compute_pipeline_state(&self.state.pl_gqa_attn_combine);
-        self.enc.set_buffer(0, Some(&partial), 0);
-        self.enc.set_buffer(1, Some(o), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_gqa_attn_combine);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (1) as usize) };
         self.set_params(2, &(nh as i32));
         self.set_params(3, &(hd as i32));
         self.set_params(4, &(nt as i32));
@@ -893,18 +879,16 @@ impl MpsCommandBuffer<'_> {
 
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].
     /// Writes f32 (default) or f16 (MINFER_CACHE_TYPE=f16) into the KV cache.
-    pub fn store_kv(&self, src: &metal::Buffer, dst: &metal::Buffer, nkt: usize, nt: usize,
-        positions: &metal::Buffer, off: usize,
+    pub fn store_kv(&self, src: &MetalBuffer, dst: &MetalBuffer, nkt: usize, nt: usize,
+        positions: &MetalBuffer, off: usize,
     ) {
         self.trace_op("store_kv");
-        self.enc.set_compute_pipeline_state(
-            if kv_cache_is_f16() { &self.state.pl_store_kv_f16 } else { &self.state.pl_store_kv }
-        );
-        self.enc.set_buffer(0, Some(src), (off * 4) as u64);
-        self.enc.set_buffer(1, Some(dst), 0);
+        self.enc.setComputePipelineState(&**(if kv_cache_is_f16() { &self.state.pl_store_kv_f16 } else { &self.state.pl_store_kv }));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(src)), ((off * 4) as u64) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(dst)), (0) as usize, (1) as usize) };
         self.set_params(2, &(nkt as i32));
         self.set_params(3, &(nt as i32));
-        self.enc.set_buffer(4, Some(positions), 0);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize) };
         self.dispatch_2d(nt as u64, nkt as u64, 1, 1);
     }
 
@@ -918,8 +902,8 @@ impl MpsCommandBuffer<'_> {
     /// q: [nt][nqt], kv_k/kv_v: [nkv][nkt], out: [nt][nqt]. nkv = real KV length
     /// (max_pos+1); the scores buffer is [nt][nh][nkv] (no padding needed — all
     /// three kernels handle arbitrary nkv).
-    pub fn attn_parallel_prefill(&self, q: &metal::Buffer, kv_k: &metal::Buffer, kv_v: &metal::Buffer,
-        out: &metal::Buffer, positions: &metal::Buffer,
+    pub fn attn_parallel_prefill(&self, q: &MetalBuffer, kv_k: &MetalBuffer, kv_v: &MetalBuffer,
+        out: &MetalBuffer, positions: &MetalBuffer,
         nkv: usize, nkt: usize, _nqt: usize, nt: usize, nh: usize,
         hd: usize, gqa: usize, scale: f32,
     ) {
@@ -929,10 +913,10 @@ impl MpsCommandBuffer<'_> {
             (nt * nh * nkv * 4) as u64, dev);
 
         // pass 1: scores [nt*nh][nkv] — one 256-thread TG per (t,h) row
-        self.enc.set_compute_pipeline_state(&self.state.pl_attn_scores);
-        self.enc.set_buffer(0, Some(q), 0);
-        self.enc.set_buffer(1, Some(kv_k), 0);
-        self.enc.set_buffer(2, Some(&scores), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_attn_scores);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*scores), (0) as usize, (2) as usize) };
         self.set_params(3, &(nh as i32));
         self.set_params(4, &(hd as i32));
         self.set_params(5, &(nkv as i32));
@@ -943,20 +927,20 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d((nt * nh) as u64, 1, 256, 1);
 
         // pass 2: masked softmax over kv per (t,h) row
-        self.enc.set_compute_pipeline_state(&self.state.pl_softmax_attn);
-        self.enc.set_buffer(0, Some(&scores), 0);
-        self.enc.set_buffer(1, Some(positions), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_softmax_attn);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*scores), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (1) as usize) };
         self.set_params(2, &(nkv as i32));
         self.set_params(3, &(nt as i32));
         self.set_params(4, &(nh as i32));
-        self.enc.set_threadgroup_memory_length(0, 32 * 4);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((32 * 4) as usize, (0) as usize) };
         self.dispatch_2d((nt * nh) as u64, 1, 32, 8);
 
         // pass 3: out = softmax · V — one 256-thread TG per (t,h) row
-        self.enc.set_compute_pipeline_state(&self.state.pl_attn_output);
-        self.enc.set_buffer(0, Some(&scores), 0);
-        self.enc.set_buffer(1, Some(kv_v), 0);
-        self.enc.set_buffer(2, Some(out), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_attn_output);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*scores), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize) };
         self.set_params(3, &(nh as i32));
         self.set_params(4, &(hd as i32));
         self.set_params(5, &(nkv as i32));
@@ -976,8 +960,8 @@ impl MpsCommandBuffer<'_> {
     /// The host copies the last partial KV block (nkv % 64 != 0) into a
     /// [2][64][nkt] tail-pad buffer first (kernel_kv_tail_pad); padded rows are
     /// zero + masked, so a pad buffer is always bound but only populated then.
-    pub fn attn_flash_prefill(&self, q: &metal::Buffer, kv_k: &metal::Buffer, kv_v: &metal::Buffer,
-        out: &metal::Buffer, positions: &metal::Buffer,
+    pub fn attn_flash_prefill(&self, q: &MetalBuffer, kv_k: &MetalBuffer, kv_v: &MetalBuffer,
+        out: &MetalBuffer, positions: &MetalBuffer,
         nkv: usize, nkt: usize, nt: usize, nh: usize,
         nk: usize, hd: usize, scale: f32,
     ) {
@@ -989,29 +973,27 @@ impl MpsCommandBuffer<'_> {
             (2 * 64 * nkt as u64) * elem, dev);
 
         if nkv % 64 != 0 {
-            self.enc.set_compute_pipeline_state(&self.state.pl_kv_tail_pad);
-            self.enc.set_buffer(0, Some(kv_k), 0);
-            self.enc.set_buffer(1, Some(kv_v), 0);
-            self.enc.set_buffer(2, Some(&pad), 0);
+            self.enc.setComputePipelineState(&*self.state.pl_kv_tail_pad);
+            unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (0) as usize) };
+            unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (1) as usize) };
+            unsafe { self.enc.setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (2) as usize) };
             self.set_params(3, &(nkv as i32));
             self.set_params(4, &(nkt as i32));
             self.set_params(5, &(if f16 { 1 } else { 0 }));
             self.dispatch_2d(nkt as u64, 64, 1, 1);
         }
 
-        self.enc.set_compute_pipeline_state(
-            if f16 {
+        self.enc.setComputePipelineState(&**(if f16 {
                 if hd == 128 { &self.state.pl_flash_attn_blk_hd128_f16 } else { &self.state.pl_flash_attn_blk_f16 }
             } else {
                 if hd == 128 { &self.state.pl_flash_attn_blk_hd128 } else { &self.state.pl_flash_attn_blk }
-            }
-        );
-        self.enc.set_buffer(0, Some(q), 0);
-        self.enc.set_buffer(1, Some(kv_k), 0);
-        self.enc.set_buffer(2, Some(kv_v), 0);
-        self.enc.set_buffer(3, Some(&pad), 0);
-        self.enc.set_buffer(4, Some(out), 0);
-        self.enc.set_buffer(5, Some(positions), 0);
+            }));
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (2) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (3) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (4) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (5) as usize) };
         self.set_params(6, &(nh as i32));
         self.set_params(7, &(nk as i32));
         self.set_params(8, &(hd as i32));
@@ -1021,7 +1003,7 @@ impl MpsCommandBuffer<'_> {
         // shmem: hd=64: sq (512 half = 1024 B) | so (512 f32 = 2048 B) | ss (1024 f32 = 4096 B);
         //        hd=128: sq (1024 half = 2048 B) | so (1024 f32 = 4096 B) | ss (1024 f32 = 4096 B)
         let shmem = if hd == 128 { 10240u64 } else { 7168u64 };
-        self.enc.set_threadgroup_memory_length(0, shmem);
+        unsafe { self.enc.setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize) };
         self.dispatch_2d(((nt + 7) / 8) as u64, nh as u64, 32, 4);
     }
 
@@ -1031,22 +1013,22 @@ impl MpsCommandBuffer<'_> {
     /// per-section buffers. `pos` = the single token position. The KV store
     /// writes f32 or f16 (per kv_cache_is_f16) into kv_k/kv_v.
     pub fn attn_bias_rope_store(&self,
-        bqkv: &metal::Buffer,
-        bias_q: &metal::Buffer, bq_off: u64,
-        bias_k: &metal::Buffer, bk_off: u64,
-        bias_v: &metal::Buffer, bv_off: u64,
-        kv_k: &metal::Buffer, kv_v: &metal::Buffer,
+        bqkv: &MetalBuffer,
+        bias_q: &MetalBuffer, bq_off: u64,
+        bias_k: &MetalBuffer, bk_off: u64,
+        bias_v: &MetalBuffer, bv_off: u64,
+        kv_k: &MetalBuffer, kv_v: &MetalBuffer,
         nqt: usize, nkt: usize, hd: usize,
         freq_base: f32, freq_scale: f32, pos: i32, rope_style: i32,
     ) {
         self.trace_op("attn_bias_rope_store");
-        self.enc.set_compute_pipeline_state(&self.state.pl_attn_bsr);
-        self.enc.set_buffer(0, Some(bqkv), 0);
-        self.enc.set_buffer(1, Some(bias_q), bq_off);
-        self.enc.set_buffer(2, Some(bias_k), bk_off);
-        self.enc.set_buffer(3, Some(bias_v), bv_off);
-        self.enc.set_buffer(4, Some(kv_k), 0);
-        self.enc.set_buffer(5, Some(kv_v), 0);
+        self.enc.setComputePipelineState(&*self.state.pl_attn_bsr);
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(bqkv)), (0) as usize, (0) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(bias_q)), (bq_off) as usize, (1) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(bias_k)), (bk_off) as usize, (2) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(bias_v)), (bv_off) as usize, (3) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (4) as usize) };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (5) as usize) };
         self.set_params(6, &(nqt as i32));
         self.set_params(7, &(nkt as i32));
         self.set_params(8, &(hd as i32));
@@ -1063,19 +1045,17 @@ impl MpsCommandBuffer<'_> {
     /// This avoids the ~20ms Metal scheduler wakeup overhead of wait_until_completed.
     pub fn submit(self) -> Result<(), String> {
         if self.enc_open {
-            self.enc.end_encoding();
+            self.enc.endEncoding();
         }
 
         // dispatch_semaphore_t is already a reference-counted opaque pointer.
         let sem = unsafe { dispatch_semaphore_create(0) };
         let sem_val = sem as usize;
 
-        use block::ConcreteBlock;
-        let blk = ConcreteBlock::new(move |_buf: &metal::CommandBufferRef| {
-            unsafe { dispatch_semaphore_signal(sem_val as *mut std::ffi::c_void); }
+        let blk = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            unsafe { dispatch_semaphore_signal(sem_val as *mut c_void); }
         });
-        let blk = blk.copy();
-        self.cmd_buf.add_completed_handler(&blk);
+        unsafe { self.cmd_buf.addCompletedHandler(RcBlock::into_raw(blk)); }
         self.cmd_buf.commit();
 
         // Bounded wait (10 s). If the GPU hangs (hardware fault), the completion
@@ -1087,7 +1067,7 @@ impl MpsCommandBuffer<'_> {
         if rc == 0 {
             // Command buffer finished (possibly with an error status).
             match self.cmd_buf.status() {
-                metal::MTLCommandBufferStatus::Completed => Ok(()),
+                MTLCommandBufferStatus::Completed => Ok(()),
                 st => Err(format!(
                     "Metal command buffer status={st:?}. recent dispatches: {}",
                     self.recent_trace()
@@ -1123,10 +1103,9 @@ extern "C" {
 /// Compile metal.metal from source at runtime (fallback when the build-time
 /// metallib is unavailable — see try_new). ~0.3-1 s per process start.
 #[cfg(target_os = "macos")]
-fn compile_metal_source(device: &metal::Device) -> Option<metal::Library> {
+fn compile_metal_source(device: &MetalDevice) -> Option<MetalLibrary> {
     let src = include_str!("metal.metal");
-    let opts = metal::CompileOptions::new();
-    match device.new_library_with_source(src, &opts) {
+    match device.newLibraryWithSource_options_error(&*NSString::from_str(src), None) {
         Ok(l) => Some(l),
         Err(e) => { eprintln!("MPS: shader compilation failed: {}", e); None }
     }
@@ -1135,9 +1114,9 @@ fn compile_metal_source(device: &metal::Device) -> Option<metal::Library> {
 /// Load the embedded precompiled metallib, falling back to a runtime source
 /// compile when it is empty or fails to load.
 #[cfg(target_os = "macos")]
-fn load_embedded_or_source(device: &metal::Device, metallib: &[u8]) -> Option<metal::Library> {
+fn load_embedded_or_source(device: &MetalDevice, metallib: &[u8]) -> Option<MetalLibrary> {
     if !metallib.is_empty() {
-        match device.new_library_with_data(metallib) {
+        match device.newLibraryWithData_error(&*DispatchData::from_bytes(metallib)) {
             Ok(l) => return Some(l),
             Err(e) => eprintln!("MPS: precompiled metallib load failed ({e}) — falling back to source compile"),
         }
@@ -1160,15 +1139,15 @@ impl MpsState {
 
         #[cfg(target_os = "macos")]
         {
-            let device = metal::Device::system_default()?;
+            let device = MTLCreateSystemDefaultDevice()?;
 
             // GPU trace capture: set MINFER_METAL_CAPTURE=1
             if std::env::var("MINFER_METAL_CAPTURE").is_ok() {
-                let capture = metal::CaptureManager::shared();
-                let desc = metal::CaptureDescriptor::new();
-                desc.set_capture_device(&device);
-                desc.set_destination(metal::MTLCaptureDestination::DeveloperTools);
-                capture.start_capture(&desc).ok();
+                let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+                let desc = MTLCaptureDescriptor::new();
+                desc.set_capture_device(&*device);
+                desc.setDestination(MTLCaptureDestination::DeveloperTools);
+                let _ = capture.startCaptureWithDescriptor_error(&*desc);
                 eprintln!("MPS: GPU capture started");
             }
 
@@ -1184,7 +1163,7 @@ impl MpsState {
             static METALLIB: &[u8] = include_bytes!(env!("MINFER_METALLIB_PATH"));
             let override_file = std::env::var("MINFER_METALLIB_FILE").ok().filter(|p| !p.is_empty());
             let lib = if let Some(path) = override_file {
-                match std::fs::read(&path).ok().and_then(|b| device.new_library_with_data(&b).ok()) {
+                match std::fs::read(&path).ok().and_then(|b| device.newLibraryWithData_error(&*DispatchData::from_bytes(&b)).ok()) {
                     Some(l) => l,
                     None => {
                         eprintln!("MPS: metallib override {path} unreadable — falling back to embedded/source");
@@ -1196,11 +1175,11 @@ impl MpsState {
             };
 
             let get_pl = |name: &str| {
-                let f = match lib.get_function(name, None) {
-                    Ok(f) => f,
-                    Err(e) => { eprintln!("MPS: no function '{}': {}", name, e); return None; }
+                let f = match lib.newFunctionWithName(&*NSString::from_str(name)) {
+                    Some(f) => f,
+                    None => { eprintln!("MPS: no function '{}'", name); return None; }
                 };
-                match device.new_compute_pipeline_state_with_function(&f) {
+                match device.newComputePipelineStateWithFunction_error(&*f) {
                     Ok(p) => Some(p),
                     Err(e) => { eprintln!("MPS: pipeline '{}': {}", name, e); None }
                 }
@@ -1268,11 +1247,11 @@ impl MpsState {
             let pl_attn_output = get_pl("kernel_attn_output")?;
             let pl_softmax_attn = get_pl("kernel_softmax_attn")?;
             let pl_warmup = get_pl("kernel_warmup_read")?;
-            let dummy_buf = device.new_buffer(1, metal::MTLResourceOptions::StorageModeShared);
+            let dummy_buf = device.newBufferWithLength_options((1) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             let m = MpsStateInner {
                 device: device.clone(),
-                max_threadgroup_memory: device.max_threadgroup_memory_length(),
-                queue: device.new_command_queue(),
+                max_threadgroup_memory: device.maxThreadgroupMemoryLength() as u64,
+                queue: device.newCommandQueue().unwrap(),
                 pl_q4_0_f32,
                 pl_q4_0_f32_multi,
                 pl_q4_0_mm_f32,
@@ -1344,7 +1323,7 @@ impl MpsState {
                 dispatch_trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             eprintln!("MPS: using Metal on {} (unified: {})",
-                device.name(), if device.has_unified_memory() { "yes" } else { "no" });
+                device.name().to_string(), if device.hasUnifiedMemory() { "yes" } else { "no" });
             Some(MpsState { inner: m })
         }
     }
@@ -1370,7 +1349,7 @@ impl MpsState {
 
     /// Look up a registered weight's (buffer, byte offset) — used by the graph
     /// Metal backend to dispatch per-op kernels without holding the Tensor.
-    pub fn weight_buf(&self, name: &str) -> Option<(metal::Buffer, u64)> {
+    pub fn weight_buf(&self, name: &str) -> Option<(MetalBuffer, u64)> {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = name;
@@ -1384,7 +1363,7 @@ impl MpsState {
 
     /// Allocate a shared-memory f32 buffer (visible to both CPU and GPU) for
     /// the graph backend's buffer pool.
-    pub fn new_f32_buffer(&self, n_elements: usize) -> metal::Buffer {
+    pub fn new_f32_buffer(&self, n_elements: usize) -> MetalBuffer {
         #[cfg(not(target_os = "macos"))]
         {
             unreachable!()
@@ -1392,7 +1371,7 @@ impl MpsState {
         #[cfg(target_os = "macos")]
         {
             let bytes = (n_elements * 4) as u64;
-            self.inner.device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared)
+            self.inner.device.newBufferWithLength_options((bytes) as usize, MTLResourceOptions::StorageModeShared).unwrap()
         }
     }
 
@@ -1409,12 +1388,7 @@ impl MpsState {
             let page = 16384; // macOS page size on Apple Silicon
             let base = data.as_ptr() as usize;
             debug_assert!(base % page == 0, "mmap'd GGUF part not page-aligned");
-            let buf = self.inner.device.new_buffer_with_bytes_no_copy(
-                data.as_ptr() as *const std::ffi::c_void,
-                data.len() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-                None,
-            );
+            let buf = unsafe { self.inner.device.newBufferWithBytesNoCopy_length_options_deallocator(NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(), (data.len() as u64) as usize, MTLResourceOptions::StorageModeShared, None).unwrap() };
             self.inner.mmap_parts.lock().unwrap().push((base, data.len(), buf.clone()));
             // GPU-side warm-up (METAL_OPTIMIZATIONS #39): the FIRST GPU access to
             // file-backed (mmap) pages costs ~44 ms of one-time page/TLB setup.
@@ -1424,10 +1398,10 @@ impl MpsState {
             // setup, amortized into load.
             let cb = self.cmd_buffer();
             cb.trace_op("part_warmup");
-            cb.enc.set_compute_pipeline_state(&self.inner.pl_warmup);
-            cb.enc.set_buffer(0, Some(&buf), 0);
+            cb.enc.setComputePipelineState(&*self.inner.pl_warmup);
+            unsafe { cb.enc.setBuffer_offset_atIndex(Some(&*buf), (0) as usize, (0) as usize) };
             let tiny = self.inner.buf_positions.lock().unwrap().clone();
-            cb.enc.set_buffer(1, Some(&tiny), 0);
+            unsafe { cb.enc.setBuffer_offset_atIndex(Some(&*tiny), (0) as usize, (1) as usize) };
             let n = (buf.length() / 4) as u64;
             cb.dispatch_1d((n + 255) / 256, 256);
             let _ = cb.submit();
@@ -1455,14 +1429,11 @@ impl MpsState {
                 Some(e) => e,
                 None => {
                     // Fallback: copy into a fresh per-weight buffer (offset 0).
-                    let b = self.inner.device.new_buffer(
-                        data.len() as u64,
-                        metal::MTLResourceOptions::StorageModeShared,
-                    );
+                    let b = self.inner.device.newBufferWithLength_options((data.len() as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             data.as_ptr(),
-                            b.contents() as *mut u8,
+                            b.contents().as_ptr() as *mut u8,
                             data.len(),
                         );
                     }
@@ -1478,16 +1449,9 @@ impl MpsState {
         #[cfg(not(target_os = "macos"))] { unreachable!() }
         #[cfg(target_os = "macos")]
         {
-            let cmd_buf_ref = self.inner.queue.new_command_buffer();
-            let enc_ref = cmd_buf_ref.new_compute_command_encoder();
-            // The metal crate returns autoreleased objects (`commandBuffer`, not
-            // `newCommandBuffer`). Retain so the cb survives the creating
-            // thread's autorelease-pool drain when it crosses threads; Drop
-            // releases.
-            unsafe {
-                let _: *mut metal::objc::runtime::Object = msg_send![cmd_buf_ref, retain];
-                let _: *mut metal::objc::runtime::Object = msg_send![enc_ref, retain];
-            }
+            let cmd_buf_ref = self.inner.queue.commandBuffer().unwrap();
+            let enc_ref = cmd_buf_ref.computeCommandEncoder().unwrap();
+            // objc2-metal returns owned Retained values — no manual retain/release.
             MpsCommandBuffer { state: &self.inner, cmd_buf: cmd_buf_ref, enc: enc_ref, enc_open: true }
         }
     }
@@ -1495,17 +1459,17 @@ impl MpsState {
     /// Return a buffer with at least `need` bytes, growing the persistent pool
     /// if necessary. The underlying allocation is reused across calls.
     fn get_or_grow(
-        slot: &std::sync::Mutex<metal::Buffer>,
+        slot: &std::sync::Mutex<MetalBuffer>,
         need: u64,
-        dev: &metal::Device,
-    ) -> metal::Buffer {
+        dev: &MetalDevice,
+    ) -> MetalBuffer {
         {
             let b = slot.lock().unwrap();
-            if b.length() >= need {
+            if b.length() >= need as usize {
                 return b.clone();
             }
         }
-        let new = dev.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
+        let new = dev.newBufferWithLength_options((need) as usize, MTLResourceOptions::StorageModeShared).unwrap();
         *slot.lock().unwrap() = new.clone();
         new
     }
@@ -1515,6 +1479,11 @@ impl MpsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
+    use objc2_foundation::NSString;
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
 
     /// Regression guard: the Metal shader program (metal.metal) is compiled at
     /// RUNTIME by `try_new` — `cargo build` does NOT catch shader errors. A
@@ -1570,9 +1539,9 @@ mod tests {
         println!("\n=== nt==1 matmul bandwidth profile (batched cb, M4 Pro) ===");
         // Warm up the first pipeline (Q4_0) so the first measured case isn't a cold start.
         {
-            let wb = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
-            let acts = dev.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
-            let out = dev.new_buffer(65536, metal::MTLResourceOptions::StorageModeShared);
+            let wb = dev.newBufferWithLength_options((65536) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+            let acts = dev.newBufferWithLength_options((4096) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+            let out = dev.newBufferWithLength_options((65536) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             let cb = mps.cmd_buffer();
             for _ in 0..50 { cb.matmul_on_gpu_buf(&wb, 0, TensorType::Q4_0, &acts, &acts, 0, &out, 2048, 128, 1); }
             cb.submit().expect("warmup");
@@ -1582,15 +1551,15 @@ mod tests {
             let bb = quant_block_bytes(ttype);
             let nblocks = (id + bq - 1) / bq;
             let wbytes = nblocks * bb * od;
-            let wb = dev.new_buffer(wbytes as u64, metal::MTLResourceOptions::StorageModeShared);
+            let wb = dev.newBufferWithLength_options((wbytes as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             // Deterministic fill: d bytes 0x3333 (finite half), data nibbles 3.
-            unsafe { std::slice::from_raw_parts_mut(wb.contents() as *mut u8, wbytes).fill(0x33); }
-            let acts = dev.new_buffer((id * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            unsafe { std::slice::from_raw_parts_mut(wb.contents().as_ptr() as *mut u8, wbytes).fill(0x33); }
+            let acts = dev.newBufferWithLength_options(((id * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             unsafe {
-                let p = acts.contents() as *mut f32;
+                let p = acts.contents().as_ptr() as *mut f32;
                 for i in 0..id { *p.add(i) = 0.5; }
             }
-            let out = dev.new_buffer((od * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            let out = dev.newBufferWithLength_options(((od * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
 
             // Warm this kernel with a discard batch (GPU clock/pipeline ramp-up —
             // the first measurement of a kernel is up to ~4x slow otherwise).
@@ -1649,23 +1618,23 @@ mod tests {
         let nkv = 430usize; // long-ish context (matches the -n 512 avg)
 
         // Shared activation buffers (f32).
-        let x  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let y  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let bqkv = dev.new_buffer(((nqt + 2 * nkt) * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let w  = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let g  = dev.new_buffer((nf * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let u  = dev.new_buffer((nf * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let bq = dev.new_buffer((nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let bk = dev.new_buffer((nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let bv = dev.new_buffer((nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let kv  = dev.new_buffer((nkv * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let pos = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
-        let o   = dev.new_buffer((ne * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let x  = dev.newBufferWithLength_options(((ne * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let y  = dev.newBufferWithLength_options(((ne * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let bqkv = dev.newBufferWithLength_options((((nqt + 2 * nkt) * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let w  = dev.newBufferWithLength_options(((ne * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let g  = dev.newBufferWithLength_options(((nf * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let u  = dev.newBufferWithLength_options(((nf * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let bq = dev.newBufferWithLength_options(((nqt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let bk = dev.newBufferWithLength_options(((nkt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let bv = dev.newBufferWithLength_options(((nkt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let kv  = dev.newBufferWithLength_options(((nkv * nkt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let pos = dev.newBufferWithLength_options((4) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let o   = dev.newBufferWithLength_options(((ne * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
         // finite fill (0.5) so no denormal/NaN paths skew timing
         for b in [&x, &y, &bqkv, &w, &g, &u, &bq, &bk, &bv, &kv, &o] {
-            unsafe { std::slice::from_raw_parts_mut(b.contents() as *mut f32, (b.length() / 4) as usize).fill(0.5); }
+            unsafe { std::slice::from_raw_parts_mut(b.contents().as_ptr() as *mut f32, (b.length() / 4) as usize).fill(0.5); }
         }
-        unsafe { std::slice::from_raw_parts_mut(pos.contents() as *mut i32, 1)[0] = (nkv - 1) as i32; }
+        unsafe { std::slice::from_raw_parts_mut(pos.contents().as_ptr() as *mut i32, 1)[0] = (nkv - 1) as i32; }
 
         // (label, dispatch closure, batches) — each closure dispatches ONE kernel.
         let cases: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
@@ -1751,14 +1720,14 @@ mod tests {
         let dev = &mps.inner.device;
         let d = 896usize;
 
-        let x = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let w = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let y32 = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let y256 = dev.new_buffer((d * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let x = dev.newBufferWithLength_options(((d * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let w = dev.newBufferWithLength_options(((d * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let y32 = dev.newBufferWithLength_options(((d * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let y256 = dev.newBufferWithLength_options(((d * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
         // Deterministic input: x = sin(i), w = cos(i/7) — exercises varied magnitudes.
         unsafe {
-            let xp = x.contents() as *mut f32;
-            let wp = w.contents() as *mut f32;
+            let xp = x.contents().as_ptr() as *mut f32;
+            let wp = w.contents().as_ptr() as *mut f32;
             for i in 0..d {
                 *xp.add(i) = (i as f32 * 0.37).sin() * 3.0;
                 *wp.add(i) = (i as f32 / 7.0).cos() + 1.0;
@@ -1785,7 +1754,7 @@ mod tests {
 
         for (label, buf) in [("32t", &y32), ("256t", &y256)] {
             let mut got = vec![0.0f32; d];
-            unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, got.as_mut_ptr(), d); }
+            unsafe { std::ptr::copy_nonoverlapping(buf.contents().as_ptr() as *const f32, got.as_mut_ptr(), d); }
             let mut maxd = 0.0f32;
             let mut dot = 0.0f32;
             let mut na = 0.0f32;
@@ -1803,8 +1772,8 @@ mod tests {
         let mut y32v = vec![0.0f32; d];
         let mut y256v = vec![0.0f32; d];
         unsafe {
-            std::ptr::copy_nonoverlapping(y32.contents() as *const f32, y32v.as_mut_ptr(), d);
-            std::ptr::copy_nonoverlapping(y256.contents() as *const f32, y256v.as_mut_ptr(), d);
+            std::ptr::copy_nonoverlapping(y32.contents().as_ptr() as *const f32, y32v.as_mut_ptr(), d);
+            std::ptr::copy_nonoverlapping(y256.contents().as_ptr() as *const f32, y256v.as_mut_ptr(), d);
         }
         let maxdd: f32 = (0..d).map(|i| (y32v[i] - y256v[i]).abs()).fold(0.0, f32::max);
         println!("  rms_norm 32t vs 256t maxdiff={maxdd:.3e}");
@@ -1851,17 +1820,17 @@ mod tests {
         MpsState::init();
         let mps = MpsState::get().expect("MPS");
         let dev = &mps.inner.device;
-        let qb = dev.new_buffer_with_data(bq.as_ptr() as *const _, (bq.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let kb = dev.new_buffer_with_data(bk.as_ptr() as *const _, (bk.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let vb = dev.new_buffer_with_data(bv.as_ptr() as *const _, (bv.len()*4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let ob = dev.new_buffer((nt*nqt*4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let pb = dev.new_buffer((nt*4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        unsafe { for t in 0..nt { (pb.contents() as *mut i32).add(t).write(t as i32); } }
+        let qb = unsafe { dev.newBufferWithBytes_length_options(NonNull::new(bq.as_ptr() as *const _ as *mut c_void).unwrap(), ((bq.len()*4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let kb = unsafe { dev.newBufferWithBytes_length_options(NonNull::new(bk.as_ptr() as *const _ as *mut c_void).unwrap(), ((bk.len()*4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let vb = unsafe { dev.newBufferWithBytes_length_options(NonNull::new(bv.as_ptr() as *const _ as *mut c_void).unwrap(), ((bv.len()*4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let ob = dev.newBufferWithLength_options(((nt*nqt*4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let pb = dev.newBufferWithLength_options(((nt*4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        unsafe { for t in 0..nt { (pb.contents().as_ptr() as *mut i32).add(t).write(t as i32); } }
         let cb = mps.cmd_buffer();
         cb.attn_parallel_prefill(&qb, &kb, &vb, &ob, &pb, nkv, nkt, nqt, nt, nh, hd, gqa, scale);
         cb.submit().expect("submit");
-        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, nt*nqt) }.to_vec();
-        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, nt*nqt) }.to_vec();
+        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents().as_ptr() as *const f32, nt*nqt) }.to_vec();
+        let got: Vec<f32> = unsafe { std::slice::from_raw_parts(ob.contents().as_ptr() as *const f32, nt*nqt) }.to_vec();
         let nan = got.iter().filter(|v| !v.is_finite()).count();
         println!("  realdata parallel: nan={nan} of {}", nt * nqt);
         assert!(nan == 0, "realdata parallel produced NaN");
@@ -1908,19 +1877,19 @@ mod tests {
         let scale = 1.0 / (hd as f32).sqrt();
 
         // deterministic q [nt][nqt], kv [nkv][nkt]
-        let q = dev.new_buffer((nt * nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let k = dev.new_buffer((nkv_real * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let v = dev.new_buffer((nkv_real * nkt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let out = dev.new_buffer((nt * nqt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let pos = dev.new_buffer((nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let q = dev.newBufferWithLength_options(((nt * nqt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let k = dev.newBufferWithLength_options(((nkv_real * nkt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let v = dev.newBufferWithLength_options(((nkv_real * nkt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let out = dev.newBufferWithLength_options(((nt * nqt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let pos = dev.newBufferWithLength_options(((nt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
         unsafe {
-            let qp = q.contents() as *mut f32;
+            let qp = q.contents().as_ptr() as *mut f32;
             for i in 0..(nt * nqt) { *qp.add(i) = ((i as f32) * 0.37).sin() * 1.5; }
-            let kp = k.contents() as *mut f32;
+            let kp = k.contents().as_ptr() as *mut f32;
             for i in 0..(nkv_real * nkt) { *kp.add(i) = ((i as f32) * 0.11).cos() * 1.2; }
-            let vp = v.contents() as *mut f32;
+            let vp = v.contents().as_ptr() as *mut f32;
             for i in 0..(nkv_real * nkt) { *vp.add(i) = ((i as f32) * 0.23).sin() * 0.9; }
-            let pp = pos.contents() as *mut i32;
+            let pp = pos.contents().as_ptr() as *mut i32;
             for t in 0..nt { *pp.add(t) = t as i32; }
         }
 
@@ -1960,7 +1929,7 @@ mod tests {
         }
 
         let mut got = vec![0.0f32; nt * nqt];
-        unsafe { std::ptr::copy_nonoverlapping(out.contents() as *const f32, got.as_mut_ptr(), nt * nqt); }
+        unsafe { std::ptr::copy_nonoverlapping(out.contents().as_ptr() as *const f32, got.as_mut_ptr(), nt * nqt); }
         let mut maxerr = 0.0f32;
         for i in 0..nt * nqt {
             maxerr = maxerr.max((got[i] - ref_out[i]).abs());
@@ -2007,13 +1976,13 @@ mod tests {
             let bb = quant_block_bytes(ttype);
             let nblocks = (id + bq - 1) / bq;
             let wbytes = nblocks * bb * od;
-            let wb = dev.new_buffer(wbytes as u64, metal::MTLResourceOptions::StorageModeShared);
+            let wb = dev.newBufferWithLength_options((wbytes as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             // Fill with valid finite weights: each block's d (first 2 bytes, fp16)
             // = 1.0 (0x00 0x3C LE), remaining bytes 0x33 (finite nibbles). Avoids
             // the denormal-fp16 slow path that skews GEMM timing.
-            unsafe { std::slice::from_raw_parts_mut(wb.contents() as *mut u8, wbytes).fill(0x33); }
+            unsafe { std::slice::from_raw_parts_mut(wb.contents().as_ptr() as *mut u8, wbytes).fill(0x33); }
             {
-                let p = wb.contents() as *mut u8;
+                let p = wb.contents().as_ptr() as *mut u8;
                 let row = nblocks * bb;
                 for r in 0..od {
                     for b in 0..nblocks {
@@ -2022,9 +1991,9 @@ mod tests {
                     }
                 }
             }
-            let acts = dev.new_buffer((id * nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-            unsafe { std::slice::from_raw_parts_mut(acts.contents() as *mut f32, id * nt).fill(0.5); }
-            let out = dev.new_buffer((od * nt * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            let acts = dev.newBufferWithLength_options(((id * nt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+            unsafe { std::slice::from_raw_parts_mut(acts.contents().as_ptr() as *mut f32, id * nt).fill(0.5); }
+            let out = dev.newBufferWithLength_options(((od * nt * 4) as u64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
             // warm
             {
                 let cb = mps.cmd_buffer();
@@ -2052,10 +2021,15 @@ mod tests {
 
 #[cfg(test)]
 mod mmap_align_test {
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
     #[test]
     fn nocopy_alignment_probe() {
         let _g = crate::metal::metal_test_lock();
-        let dev = metal::Device::system_default().unwrap();
+        let dev = MTLCreateSystemDefaultDevice().unwrap();
         // A 16-aligned Vec base + 32 → 32-aligned, NOT 256-aligned
         let mut backing = vec![0u8; 8192 + 64];
         let base = backing.as_mut_ptr() as usize;
@@ -2063,30 +2037,26 @@ mod mmap_align_test {
         assert!(aligned % 32 == 0 && aligned % 256 != 0, "need a non-256-aligned 32-aligned ptr");
         let buf_slice = unsafe { std::slice::from_raw_parts_mut(aligned as *mut u8, 4096) };
         for i in 0..4096 { buf_slice[i] = (i & 0xFF) as u8; }
-        let b = dev.new_buffer_with_bytes_no_copy(
-            aligned as *const std::ffi::c_void, 4096,
-            metal::MTLResourceOptions::StorageModeShared, None);
-        let contents = unsafe { std::slice::from_raw_parts(b.contents() as *const u8, 4096) };
+        let b = unsafe { dev.newBufferWithBytesNoCopy_length_options_deallocator(NonNull::new(aligned as *const std::ffi::c_void as *mut c_void).unwrap(), (4096) as usize, MTLResourceOptions::StorageModeShared, None).unwrap() };
+        let contents = unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, 4096) };
         let mut ok = contents.len() == 4096;
         for i in 0..4096 { if contents[i] != (i & 0xFF) as u8 { ok = false; break; } }
         println!("CPU readback: ok={ok}");
         // GPU readback: dispatch a trivial copy kernel reading the buffer
-        let lib = dev.new_library_with_source(
-            "kernel void k(const device uchar *in [[buffer(0)]], device uchar *out [[buffer(1)]]) { out[0] = in[3]; }",
-            &metal::CompileOptions::new()).unwrap();
-        let pl = dev.new_compute_pipeline_state_with_function(&lib.get_function("k", None).unwrap()).unwrap();
-        let out = dev.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
-        let q = dev.new_command_queue();
-        let cb = q.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pl);
-        enc.set_buffer(0, Some(&b), 0);
-        enc.set_buffer(1, Some(&out), 0);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1,1,1), metal::MTLSize::new(1,1,1));
-        enc.end_encoding();
+        let lib = dev.newLibraryWithSource_options_error(&*NSString::from_str("kernel void k(const device uchar *in [[buffer(0)]], device uchar *out [[buffer(1)]]) { out[0] = in[3]; }"), None).unwrap();
+        let pl = dev.newComputePipelineStateWithFunction_error(&lib.newFunctionWithName(&*NSString::from_str("k")).unwrap()).unwrap();
+        let out = dev.newBufferWithLength_options((16) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+        let q = dev.newCommandQueue().unwrap();
+        let cb = q.commandBuffer().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&*pl);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*b), (0) as usize, (0) as usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*out), (0) as usize, (1) as usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (1) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (1) as usize, height: (1) as usize, depth: (1) as usize });
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
-        let got = unsafe { *(out.contents() as *const u8) };
+        cb.waitUntilCompleted();
+        let got = unsafe { *(out.contents().as_ptr() as *const u8) };
         println!("GPU readback (expect 3): got={got} -> {}", if got == 3 { "OK" } else { "WRONG" });
         assert!(got == 3, "GPU readback at 32-aligned nocopy base is WRONG");
         // Same probe over an mmap'd FILE region (the actual weights path)
@@ -2106,20 +2076,18 @@ mod mmap_align_test {
             let mbase = m as usize;
             let mptr = (mbase + 63) & !31usize; // 32-aligned, not page-aligned
             assert!(mptr % 256 != 0, "need non-256-aligned");
-            let bm = dev.new_buffer_with_bytes_no_copy(
-                mptr as *const std::ffi::c_void, 4096,
-                metal::MTLResourceOptions::StorageModeShared, None);
-            let out2 = dev.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
-            let cb2 = q.new_command_buffer();
-            let enc2 = cb2.new_compute_command_encoder();
-            enc2.set_compute_pipeline_state(&pl);
-            enc2.set_buffer(0, Some(&bm), 0);
-            enc2.set_buffer(1, Some(&out2), 0);
-            enc2.dispatch_thread_groups(metal::MTLSize::new(1,1,1), metal::MTLSize::new(1,1,1));
-            enc2.end_encoding();
+            let bm = unsafe { dev.newBufferWithBytesNoCopy_length_options_deallocator(NonNull::new(mptr as *const std::ffi::c_void as *mut c_void).unwrap(), (4096) as usize, MTLResourceOptions::StorageModeShared, None).unwrap() };
+            let out2 = dev.newBufferWithLength_options((64) as usize, MTLResourceOptions::StorageModeShared).unwrap();
+            let cb2 = q.commandBuffer().unwrap();
+            let enc2 = cb2.computeCommandEncoder().unwrap();
+            enc2.setComputePipelineState(&*pl);
+            unsafe { enc2.setBuffer_offset_atIndex(Some(&*bm), (0) as usize, (0) as usize) };
+            unsafe { enc2.setBuffer_offset_atIndex(Some(&*out2), (0) as usize, (1) as usize) };
+            enc2.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (1) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (1) as usize, height: (1) as usize, depth: (1) as usize });
+            enc2.endEncoding();
             cb2.commit();
-            cb2.wait_until_completed();
-            let got2 = unsafe { *(out2.contents() as *const u8) };
+            cb2.waitUntilCompleted();
+            let got2 = unsafe { *(out2.contents().as_ptr() as *const u8) };
             println!("mmap GPU readback (expect 3): got={got2} -> {}", if got2 == 3 { "OK" } else { "WRONG" });
             let _ = std::fs::remove_file(&path);
         }
