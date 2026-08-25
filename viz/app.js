@@ -673,6 +673,7 @@ async function loadDoc(doc) {
   applyFilters();
   fit();
   updateStepInfo();
+  updatePlaybackEnabled();
   deselect();
 }
 
@@ -704,6 +705,7 @@ function loadPhase(pi) {
   fit();
   loadStep(0);
   if (state.live) applyLivePhaseState();
+  updatePlaybackEnabled();
 }
 
 function loadStep(si) {
@@ -928,14 +930,25 @@ function resetLiveRun() {
   liveState.curKind = null;
 }
 
-function disablePlayback(on) {
-  // Live mode owns the view (nodes light up in real time), so the manual
-  // playback controls AND the "load a different graph" controls (sample
-  // dropdown, Open File) are all disabled — loading a static graph would
-  // clobber the live view. Re-enabled on disconnect.
-  for (const id of ["btn-play", "btn-step-back", "btn-step-fwd", "speed", "step-slider", "model-select", "btn-open"]) {
-    document.getElementById(id).disabled = on;
-  }
+// Two groups of view-changing controls with different enable rules:
+//  - playback controls require a loaded graph; in live mode they are disabled
+//    because the view is driven by the SSE stream.
+//  - load controls (sample dropdown + Open File) must stay usable whenever
+//    there is no graph (that's how you load one) and are disabled only while
+//    connected to live, where loading a static graph would clobber the view.
+const PLAYBACK_CTRL_IDS = ["btn-play", "btn-step-back", "btn-step-fwd", "speed", "step-slider"];
+const LOAD_CTRL_IDS = ["model-select", "btn-open"];
+
+function setControlsDisabled(ids, on) {
+  for (const id of ids) document.getElementById(id).disabled = on;
+}
+
+// Enable playback controls only when there is a graph to play AND we are not
+// in live mode; disable the load controls only while live. Call whenever the
+// "has a graph" / "live" state changes.
+function updatePlaybackEnabled() {
+  setControlsDisabled(PLAYBACK_CTRL_IDS, state.live || !state.nodes?.length);
+  setControlsDisabled(LOAD_CTRL_IDS, state.live);
 }
 
 async function connectLive() {
@@ -957,7 +970,7 @@ async function connectLive() {
     liveState.es.onmessage = ev => { try { handleLiveEvent(JSON.parse(ev.data)); } catch (e) { console.error("live event:", e); } };
     liveState.es.onerror = () => { if (liveState.connected) setLiveStatus("Event stream disconnected"); };
     liveState.connected = true;
-    disablePlayback(true);
+    updatePlaybackEnabled();
     document.getElementById("btn-live").classList.add("live-on");
     document.getElementById("live-connect").textContent = "Disconnect";
     document.getElementById("live-run").disabled = false;
@@ -971,7 +984,7 @@ function disconnectLive() {
   if (liveState.es) { liveState.es.close(); liveState.es = null; }
   liveState.connected = false;
   state.live = false;
-  disablePlayback(false);
+  updatePlaybackEnabled();
   document.getElementById("btn-live").classList.remove("live-on");
   document.getElementById("live-connect").textContent = "Connect";
   document.getElementById("live-run").disabled = true;
@@ -1224,6 +1237,10 @@ function init() {
   const params = new URLSearchParams(location.search);
   const file = params.get("file");
   if (file) fetch(file).then(r => r.json()).then(loadDoc).catch(e => console.error("loadDoc:", e));
+
+  // With no graph loaded yet, nothing is playable — gray out the playback and
+  // load-graph controls until a graph/trace is actually loaded (or live connects).
+  updatePlaybackEnabled();
 }
 
 function resetPlayback() {
