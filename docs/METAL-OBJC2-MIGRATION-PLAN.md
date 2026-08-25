@@ -1,6 +1,6 @@
 # Metal Backend: objc 0.2 → objc2 Migration Plan
 
-**Status:** Draft — reviewed & corrected against the current source and verified against `objc2-metal` 0.3.2 / `block2` 0.6.2 / `objc2-foundation` 0.3 / `objc2` 0.6 source. API names, method signatures, return types and version pins below are confirmed, not assumed.  
+**Status:** ✅ Implemented (2026-08-25). The plan was executed and committed: `metal`/`block`+`vendor/block` removed, `src/metal.rs` + `src/graph/metal_backend.rs` + the `tests/*_isolation.rs` migrated to objc2-metal/block2. All `cargo test` targets pass (164 tests incl. Metal-vs-CPU + kernel isolation) and end-to-end Metal inference produces correct output. This doc is kept as the record of what changed and the pitfalls found (keep the `commandBuffer()` vs Metal-4 `newCommandBuffer` distinction, `NSUInteger=usize`, `NonNull` contents, `unsafe` wrapping, `MTLBarrierScope`).  
 **Estimated effort:** 4–6 working days (senior Rust + Metal dev)  
 **Scope:** `src/metal.rs` (2226 LOC), `src/graph/metal_backend.rs` (1420 LOC), `build.rs`, `Cargo.toml`, tests
 
@@ -401,7 +401,7 @@ No changes needed. `xcrun metal` compilation is independent of the Rust bindings
 
 All test modules in both `src/metal.rs` and `src/graph/metal_backend.rs` use the public API surface (`MpsState::init()`, `MpsState::get()`, `MpsCommandBuffer` methods, `MetalBackend::new()`). Since these are already abstracted, most tests require **no code changes** — only type-level compatibility.
 
-The test `metal_pipelines_compile()` will need to handle the new error type from `newComputePipelineStateWithFunction_error`.
+The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error type from `newComputePipelineStateWithFunction_error`.
 
 ---
 

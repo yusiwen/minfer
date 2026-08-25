@@ -110,15 +110,12 @@ same relationship.
 - **Do not "fix" the nix/devShell SDK issue in `flake.nix`**: overriding
   `DEVELOPER_DIR`/`SDKROOT` there would also redirect rustc's linker
   environment; the `build.rs` scoped fix is the correct place.
-- **Future modernization path**: migrating the Metal layer to the `objc2`
-  ecosystem (`objc2-metal` + `block2`) would be a **rewrite of `src/metal.rs`
-  (~2800 lines)** from the `metal` crate API to the objc2 style — a
-  project-sized effort, not a dependency swap. It is the correct long-term
-  direction (and would let us delete `vendor/block`), but it is not worth
-  doing to chase a warning.
-- **When can `vendor/block` be dropped?** If upstream ever publishes a fixed
-  `block` (or `metal` moves to `block2`), delete `vendor/` and the
-  `[patch.crates-io]` entry — the code itself is unaffected either way.
+- **✅ DONE (2026-08-25)**: the Metal layer was migrated to the `objc2`
+  ecosystem (`objc2-metal` + `block2` + `objc2-foundation`), dropping the
+  `metal` crate, `block` crate, `vendor/block` and the `[patch.crates-io]`
+  entry (see `docs/METAL-OBJC2-MIGRATION-PLAN.md`). `src/metal.rs`,
+  `src/graph/metal_backend.rs` and `tests/*_isolation.rs` now use objc2-metal;
+  `metal`/`block` are no longer dependencies.
 
 ---
 
