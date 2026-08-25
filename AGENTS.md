@@ -177,7 +177,7 @@ Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backend
 Core inference deps are minimal: `rand` (sampling), `regex` (BPE pre-tokenization), `half` (fp16),
 `serde+serde_json` (download API + `--session` history), `minijinja` (template rendering).
 The OpenAI-compatible server adds `axum`/`tokio`/`tokio-stream`/`tower-http`/`uuid`/`futures-util`;
-macOS adds `metal`/`block`.
+macOS adds `objc2-metal`/`block2`/`objc2-foundation`/`objc2`/`dispatch2` (the old `metal`/`block`/`vendor` were removed in the 2026-08-25 objc2 migration).
 
 ## Documentation Locations
 
@@ -189,7 +189,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | **Compute graph design + rewrite plan + implementation record (per-phase commits)** | `docs/GRAPH-REFACTOR-PLAN.md` |
 | llama.cpp compute-graph design analysis (ggml_cgraph / scheduler / reuse) | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
-| objc 0.2 vs objc2 ecosystem — why block is vendored, nix devShell xcrun fix, migration path | `docs/METAL_OBJC-ECOSYSTEM.md` |
+| objc 0.2 vs objc2 ecosystem — why block was vendored, nix devShell xcrun fix, and the objc2 migration (done 2026-08-25) | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
 | CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |

@@ -1,12 +1,15 @@
 # Metal Backend and the Objective-C Crate Ecosystem (objc 0.2 vs objc2)
 
-**Context.** minfer's Metal backend (`src/metal.rs`, `src/metal.metal`) is built
-on the [`metal`](https://crates.io/crates/metal) crate, which is locked into the
-**legacy `objc` 0.2 ecosystem**. This document records what that means, why it
-matters for building/running minfer, what the modern alternative (`objc2`)
-offers, and what a future migration would involve. It exists so the various
-"why is this vendored / why does the build do this" decisions have a single
-reference.
+**Context (ℹ️ superseded).** minfer's Metal backend (`src/metal.rs`,
+`src/metal.metal`) was built on the
+[`metal`](https://crates.io/crates/metal) crate, which was locked into the
+**legacy `objc` 0.2 ecosystem**. This document records what that meant, why it
+mattered for building/running minfer, and what the modern alternative (`objc2`)
+offered. The migration described here **landed on 2026-08-25** (see
+`docs/METAL-OBJC2-MIGRATION-PLAN.md`): the backend now uses `objc2-metal` +
+`block2` + `objc2-foundation`, and `metal`/`block`/`vendor/block`/
+`[patch.crates-io]` were removed. The rest of this document is kept as
+historical context for why the old setup looked the way it did.
 
 ---
 
@@ -39,17 +42,20 @@ Objective-C. The `metal` crate is a Metal-framework binding built on top of
   foundation breaks, every crate above it breaks together. Two concrete
   instances of this in minfer:
 
-  **a) `block` 0.1.6 uninhabited static (rust-lang/rust#74840).**
-  `block` declares `enum Class {}` + `extern { static _NSConcreteStackBlock: Class }`
-  — a *static of uninhabited type*, which rustc is phasing out: a
-  future-incompat warning today, a **hard error in a future rustc** (breaking
-  every macOS build, since `metal` pulls `block` unconditionally). Upstream is
-  unmaintained (master has the same code; crates.io has no newer release).
-  **Fix:** a vendored one-line fix under `vendor/block/`, wired via
-  `[patch.crates-io] block = { path = "vendor/block" }` (see
-  `vendor/block/README.md`). The fix turns `Class` into an opaque
+  **a) `block` 0.1.6 uninhabited static (rust-lang/rust#74840).** — *historical,
+  resolved by the 2026-08-25 objc2 migration: `metal`, `block` and `vendor/block`
+  no longer exist in the dependency tree, so this issue is gone.*
+  Historically, `block` declared `enum Class {}` +
+  `extern { static _NSConcreteStackBlock: Class }`
+  — a *static of uninhabited type*, which rustc was phasing out: a
+  future-incompat warning at the time, a **hard error in a future rustc**
+  (breaking every macOS build, since `metal` pulled `block` unconditionally).
+  Upstream was unmaintained (master had the same code; crates.io had no newer
+  release). The **fix** was a vendored one-line fix under `vendor/block/`, wired
+  via `[patch.crates-io] block = { path = "vendor/block" }` (see
+  `vendor/block/README.md`): it turned `Class` into an opaque
   `#[repr(C)]` ZST (same `isa`-pointer semantics, now inhabited and FFI-safe)
-  and adds explicit `extern "C"` ABIs.
+  and added explicit `extern "C"` ABIs.
 
   **b) nix devShells shadow the real Apple toolchain.**
   `flake.nix` (loaded via direnv) uses nixpkgs' darwin stdenv, which exports
@@ -101,12 +107,13 @@ same relationship.
 
 ## 5. What this means for minfer (decisions and roadmap)
 
-- **Keep the vendored `block`** (`vendor/block` + `[patch.crates-io]`): as long
-  as the `metal` crate is used, `block` 0.1.6 is compiled unconditionally
-  (metal's public API signatures reference `block::ConcreteBlock`), so there is
-  no way to drop it without forking `metal`. The vendor is the cheapest,
-  offline-reproducible, verified fix (all tests pass; future-incompat report
-  clean).
+- **(Historical — no longer applies.)** While the `metal` crate was used,
+  `block` 0.1.6 was compiled unconditionally (metal's public API references
+  `block::ConcreteBlock`), so it could not be dropped without forking `metal`;
+  the vendor (`vendor/block` + `[patch.crates-io]`) was the cheapest
+  offline-reproducible fix. This is **moot since the 2026-08-25 objc2 migration**
+  (see the DONE bullet below): `metal`/`block`/`vendor/block`/`[patch.crates-io]`
+  are all gone.
 - **Do not "fix" the nix/devShell SDK issue in `flake.nix`**: overriding
   `DEVELOPER_DIR`/`SDKROOT` there would also redirect rustc's linker
   environment; the `build.rs` scoped fix is the correct place.
@@ -119,5 +126,7 @@ same relationship.
 
 ---
 
-*Last updated: 2026-08-22. Facts (versions/downloads) verified against
-crates.io at that date.*
+*Last updated: 2026-08-25 — migration to objc2-metal landed (see
+`METAL-OBJC2-MIGRATION-PLAN.md`); the sections above are kept as historical
+context. Facts (versions/downloads) were verified against crates.io at the
+original date.*
