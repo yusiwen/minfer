@@ -527,12 +527,12 @@ function renderExtraData(n) {
 function renderHeatmap(containerId, values, shape, stride) {
   const wrap = document.getElementById(containerId);
   if (!wrap) return;
-  // The natural layout mirrors the tensor's [d, nt] grid. But for a 1D/decode
-  // tensor (nt == 1) the grid collapses to a single vertical column (a thin
-  // strip), which reads poorly. Fall back to a roughly-square grid so the
-  // downsampled samples form a readable heatmap.
-  let cols = Math.min((shape && shape[1]) || 1, 16);
-  if (cols < 2) cols = Math.max(2, Math.min(16, Math.ceil(Math.sqrt(values.length))));
+  // The samples are a flat, strided downsample of the whole tensor, so they
+  // carry no reliable 2D layout (the server's per-phase `shape[1]` is a
+  // canonical nt, not the real token count of this run). Layout them on a
+  // near-square grid so a small nt (1 or 2) can't collapse the heatmap into a
+  // thin strip — one cell per sample, roughly square.
+  const cols = Math.max(2, Math.min(16, Math.ceil(Math.sqrt(values.length))));
   const rows = Math.ceil(values.length / cols);
   const CELL = Math.max(6, Math.min(12, Math.floor(200 / cols)));
   let min = Infinity, max = -Infinity;
