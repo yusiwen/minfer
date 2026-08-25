@@ -33,7 +33,7 @@ See [`docs/METAL_OBJC-ECOSYSTEM.md`](../METAL_OBJC-ECOSYSTEM.md) for the full ec
 
 | objc 0.2 | objc2-metal | Notes |
 |---|---|---|
-| `queue.new_command_buffer() → &CommandBufferRef` (autoreleased) | `queue.newCommandBuffer() → Option<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>` | ⚠️ camelCase; returns **`Option`** (not `Result`); objc2-metal 0.3.2 returns `MTL4CommandBuffer` |
+| `queue.new_command_buffer() → &CommandBufferRef` (autoreleased) | `queue.commandBuffer() → Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>` | ⚠️ camelCase `commandBuffer()`; returns **`Option`** (not `Result`). `newCommandBuffer` on the device is a separate **Metal-4 API** returning `MTL4CommandBuffer` — not the queue path |
 | `cmd_buf.new_compute_command_encoder() → &ComputeCommandEncoderRef` | `cmd_buf.computeCommandEncoder() → Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>` | ⚠️ camelCase; **`Option`** — not an owned struct, and `unsafe` is **not** required here |
 | `cmd_buf.new_blit_command_encoder() → &BlitCommandEncoderRef` | `cmd_buf.blitCommandEncoder() → Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>>` | ⚠️ camelCase; **`Option`** |
 | `enc.set_compute_pipeline_state(&pl)` | `encoder.setComputePipelineState(&state)` | camelCase; takes `&ProtocolObject<dyn MTLComputePipelineState>` |
@@ -188,7 +188,7 @@ type MetalCompileOptions = Retained<MTLCompileOptions>;
 
 > ⚠️ `MetalBuffer` uses `dyn MTLBuffer`, **not** `dyn MTLResource`. `MTLResource` does not expose `.length()`/`.contents()` (those live on the `MTLBuffer` sub-protocol), and minfer calls them at `metal.rs:348/431` and `metal_backend.rs:83/115/197/206/208`. Aliasing to `MTLResource` will not compile.
 >
-> ⚠️ **objc2-metal 0.3.2 introduced `MTL4*` types.** `MTLDevice::newCommandBuffer()` returns `Option<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>`, while the completion-handler block arg is `NonNull<ProtocolObject<dyn MTLCommandBuffer>>`. Confirm which concrete command-buffer type the crate exposes for your target and alias `MetalCommandBuffer`/`MetalComputeCommandEncoder` accordingly (the `computeCommandEncoder()` may be a protocol or a concrete wrapper — let the compiler tell you).
+> ⚠️ **objc2-metal 0.3.2 introduced `MTL4*` types.** The queue's command-buffer method is **`commandBuffer() → Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>`** (the one minfer uses); `MTLDevice::newCommandBuffer()` is the separate **Metal-4** API returning `MTL4CommandBuffer` and is **not** used here. The completion-handler block arg is `NonNull<ProtocolObject<dyn MTLCommandBuffer>>`. Alias `MetalCommandBuffer` to the queue's returned type.
 
 #### 3.2.3 `MpsState::try_new()` — Initialization Rewrite
 
@@ -249,7 +249,7 @@ type MetalCompileOptions = Retained<MTLCompileOptions>;
 
 #### 3.2.4 `MpsCommandBuffer` — Manual Retain/Release → ARC
 
-The current code uses `unsafe { msg_send![obj, retain] }` and the `Drop` impl with `msg_send![obj, release]` because the `metal` 0.28 crate returns autoreleased objects. With objc2-metal, `newCommandBuffer()` returns a `Retained<...>` directly — no manual retain/release needed.
+The current code uses `unsafe { msg_send![obj, retain] }` and the `Drop` impl with `msg_send![obj, release]` because the `metal` 0.28 crate returns autoreleased objects. With objc2-metal, `commandBuffer()` returns a `Retained<...>` directly — no manual retain/release needed.
 
 ```diff
  pub struct MpsCommandBuffer<'a> {
@@ -282,12 +282,12 @@ The current code uses `unsafe { msg_send![obj, retain] }` and the `Drop` impl wi
 -    unsafe { msg_send![cmd_buf_ref, retain]; }
 -    unsafe { msg_send![enc_ref, retain]; }
 -    MpsCommandBuffer { state: &self.inner, cmd_buf: cmd_buf_ref, enc: enc_ref, enc_open: true }
-+    let cmd_buf = self.inner.queue.newCommandBuffer()?;   // Option<Retained<...>>
++    let cmd_buf = self.inner.queue.commandBuffer()?;     // Option<Retained<...>>
 +    let enc = cmd_buf.computeCommandEncoder()?;           // Option<Retained<...>>
 +    Ok(MpsCommandBuffer { state: &self.inner, cmd_buf, enc, enc_open: true })
  }
 ```
-> ⚠️ `newCommandBuffer()` / `computeCommandEncoder()` return **`Option`**, so `cmd_buffer()` must change its return type to `Option<MpsCommandBuffer<'_>>` (or `.expect()`/`.ok_or`). This ripples to `metal_backend.rs` `cb()` — see §3.3 item 5. Also `newCommandBuffer()` returns an `MTL4CommandBuffer` in objc2-metal 0.3.2 — make the `MetalCommandBuffer` alias match whatever the crate actually returns (see §3.2.2 note).
+> ⚠️ `commandBuffer()` / `computeCommandEncoder()` return **`Option`**, so `cmd_buffer()` must change its return type to `Option<MpsCommandBuffer<'_>>` (or `.expect()`/`.ok_or`). This ripples to `metal_backend.rs` `cb()` — see §3.3 item 5. `commandBuffer()` returns an `MTLCommandBuffer`.
 
 #### 3.2.6 `MpsCommandBuffer::barrier()` — msg_send! → Direct Method
 
@@ -496,7 +496,7 @@ The test `metal_pipelines_compile()` will need to handle the new error type from
 
 5. **MTLResourceOptions enum:** `StorageModeShared` still exists in objc2-metal (it's a bit-flag struct, so use `MTLResourceOptions::StorageModeShared`). The `CPUCacheModeDefaultCache` naming in the original draft was a red herring — just confirm each variant you use is present, and don't assume a raw-integer cast (use the typed constants or `from_bits`).
 
-6. **Method names are camelCase (Objective-C selectors preserved).** objc2-metal 0.3.2 exposes methods under their selector-derived camelCase names — `newCommandBuffer`, `computeCommandEncoder`, `blitCommandEncoder`, `setComputePipelineState`, `setBuffer_offset_atIndex`, `setBytes_length_atIndex`, `dispatchThreadgroups_threadsPerThreadgroup`, `endEncoding`, `memoryBarrierWithScope`, `addCompletedHandler`, `newFunctionWithName`, `newLibraryWithSource_options_error`, `copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size`, `hasUnifiedMemory`, `waitUntilCompleted` — **not** the snake_case names shown in early drafts or the old `metal` crate. Several are `unsafe fn` (e.g. `setBytes_length_atIndex`, `setBuffer_offset_atIndex`, `addCompletedHandler`, `copyFromBuffer_...`, `newBufferWithBytesNoCopy_length_options_deallocator`).
+6. **Method names are camelCase (Objective-C selectors preserved).** objc2-metal 0.3.2 exposes methods under their selector-derived camelCase names — `commandBuffer`, `computeCommandEncoder`, `blitCommandEncoder`, `setComputePipelineState`, `setBuffer_offset_atIndex`, `setBytes_length_atIndex`, `dispatchThreadgroups_threadsPerThreadgroup`, `endEncoding`, `memoryBarrierWithScope`, `addCompletedHandler`, `newFunctionWithName`, `newLibraryWithSource_options_error`, `copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size`, `hasUnifiedMemory`, `waitUntilCompleted` — **not** the snake_case names shown in early drafts or the old `metal` crate. Several are `unsafe fn` (e.g. `setBytes_length_atIndex`, `setBuffer_offset_atIndex`, `addCompletedHandler`, `copyFromBuffer_...`, `newBufferWithBytesNoCopy_length_options_deallocator`).
 
 7. **`contents()` returns `NonNull<c_void>` (not `*mut c_void`).** All `buf.contents()` call sites (`metal.rs:1465`, `metal_backend.rs:116/198/208`) need `.as_ptr()`/`.cast::<T>()` (e.g. `b.contents().as_ptr() as *mut u8`).
 
@@ -512,7 +512,7 @@ The `metal-rs` crate at <https://github.com/madsmtm/metal-rs> is the **official 
 ```rust
 let device = MTLCreateSystemDefaultDevice().expect("No device found");      // no Device::system_default() in objc2-metal
 let command_queue = device.newCommandQueue().expect("no queue");            // Option
-let command_buffer = command_queue.newCommandBuffer().expect("no buffer");  // Option, MTL4CommandBuffer
+let command_buffer = command_queue.commandBuffer().expect("no buffer");    // Option
 let encoder = command_buffer.computeCommandEncoder().expect("no encoder");  // Option
 encoder.setComputePipelineState(&pipeline_state);
 encoder.setBuffer_offset_atIndex(Some(&buffer), 0, 0);                      // (buffer, offset, index), unsafe
