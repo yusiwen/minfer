@@ -25,8 +25,8 @@ pub enum AttnMode {
 // path uses FusedQKV today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusedOp {
-    SwiGLU,     // silu(gate) * up
-    BiasRope,   // add_bias + rope (+ kv store on GPU: attn_bias_rope_store)
+    SwiGLU,   // silu(gate) * up
+    BiasRope, // add_bias + rope (+ kv store on GPU: attn_bias_rope_store)
     #[allow(dead_code)]
     BatchMatMul, // multiple matmuls sharing one quantized activation
     #[allow(dead_code)]
@@ -55,42 +55,67 @@ pub enum Op {
     /// Softmax is part of the op vocabulary; the attention kernels fuse the
     /// softmax internally, so no standalone softmax node is emitted today.
     #[allow(dead_code)]
-    Softmax { dim: usize },
+    Softmax {
+        dim: usize,
+    },
 
     // ---- normalization ----
-    RmsNorm { eps: f32 },
+    RmsNorm {
+        eps: f32,
+    },
     /// Per-head RMSNorm (Qwen3 `attn_q_norm`/`attn_k_norm`): the input is a
     /// flat token-major buffer `[nt * nh * hd]`; each contiguous `hd`-wide row
     /// (`t*nh + h`) is RMS-normalized with a weight of length `hd`. The buffer
     /// layout makes this a contiguous `[nt*nh, hd]` matrix, so execution reuses
     /// the RMSNorm kernels with `d = hd`, `n = nt*nh`.
-    QkNorm { hd: usize, nh: usize, eps: f32 },
+    QkNorm {
+        hd: usize,
+        nh: usize,
+        eps: f32,
+    },
 
     // ---- linear algebra ----
-    MatMul { transpose_b: bool },
+    MatMul {
+        transpose_b: bool,
+    },
 
     // ---- indexing ----
     GetRows,
 
     // ---- positional encoding ----
-    RoPE { style: RopeStyle },
+    RoPE {
+        style: RopeStyle,
+    },
 
     // ---- attention ----
-    Attn { mode: AttnMode },
+    Attn {
+        mode: AttnMode,
+    },
 
     // ---- KV cache (persistent external buffer; positions are data) ----
-    KvcacheStore { layer: usize },
-    KvcacheLoad { layer: usize },
+    KvcacheStore {
+        layer: usize,
+    },
+    KvcacheLoad {
+        layer: usize,
+    },
 
     // ---- view / reshape ----
     /// View / Reshape / Permute / BatchMatMul are part of the full ggml op
     /// vocabulary; the Qwen2 graph builder doesn't emit them (yet).
     #[allow(dead_code)]
-    View { offset: usize, shape: [usize; 4] },
+    View {
+        offset: usize,
+        shape: [usize; 4],
+    },
     #[allow(dead_code)]
-    Reshape { shape: [usize; 4] },
+    Reshape {
+        shape: [usize; 4],
+    },
     #[allow(dead_code)]
-    Permute { dims: [usize; 4] },
+    Permute {
+        dims: [usize; 4],
+    },
 
     // ---- fused ops (fusion pass output, gated by backend supports_fused) ----
     SwiGLU,
@@ -100,7 +125,9 @@ pub enum Op {
     /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store
     /// in one kernel pass (llama `attn_bias_rope_store`). Carries the layer so
     /// the scheduler can resolve the persistent K/V regions (kv_pair).
-    FusedQKV { layer: usize },
+    FusedQKV {
+        layer: usize,
+    },
     /// decode (nt==1) fused FFN gate+up: one concat matmul (ffn_gate|ffn_up,
     /// loader-registered `blk.{i}.ffn_gu`) whose output buffer carries gate
     /// (rows 0..nf) and up (nf..2*nf); a single swiglu pass (silu(gate)*up,

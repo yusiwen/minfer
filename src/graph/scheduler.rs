@@ -17,7 +17,7 @@
 use super::alloc::GraphAllocator;
 use super::backend::{Backend, KvProvider};
 use super::ops::{NodeMeta, Op};
-use super::{Backend as BackendTag, ComputeGraph, CNode, NodeId};
+use super::{Backend as BackendTag, CNode, ComputeGraph, NodeId};
 
 /// A contiguous subgraph executed on one backend.
 #[derive(Debug, Clone)]
@@ -33,7 +33,12 @@ pub struct Split {
 
 impl Split {
     fn new(backend: BackendTag, start: usize) -> Self {
-        Self { backend, node_range: (start, start), inputs: Vec::new(), outputs: Vec::new() }
+        Self {
+            backend,
+            node_range: (start, start),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
     }
 }
 
@@ -57,7 +62,9 @@ impl BackendScheduler {
             if node.backend.is_some() {
                 continue; // keep explicit assignments
             }
-            node.backend = alloc.supports(&node.op, node.out_dtype).or(Some(BackendTag::CPU));
+            node.backend = alloc
+                .supports(&node.op, node.out_dtype)
+                .or(Some(BackendTag::CPU));
         }
     }
 
@@ -70,7 +77,9 @@ impl BackendScheduler {
         let mut split = Split::new(BackendTag::CPU, 0);
         for id in 0..n {
             let node = graph.node(id);
-            let b = node.backend.unwrap_or_else(|| cur.unwrap_or(BackendTag::CPU));
+            let b = node
+                .backend
+                .unwrap_or_else(|| cur.unwrap_or(BackendTag::CPU));
             if let Some(c) = cur {
                 if b != c {
                     split.node_range.1 = id;
@@ -111,22 +120,24 @@ impl BackendScheduler {
     }
 
     /// Execute the graph split by split (llama.cpp `compute_splits` shape).
-    pub fn execute(
-        &self,
-        graph: &ComputeGraph,
-        alloc: &mut GraphAllocator,
-    ) -> Result<(), String> {
+    pub fn execute(&self, graph: &ComputeGraph, alloc: &mut GraphAllocator) -> Result<(), String> {
         #[cfg(debug_assertions)]
         debug_assert!(graph.topo_order().is_ok(), "graph is not a valid DAG");
         let splits = self.split_graph(graph);
         if std::env::var("MINFER_GRAPH_TRACE").is_ok() {
             for (si, s) in splits.iter().enumerate() {
-                eprintln!("[graph] split {si}: {:?} nodes {}-{}", s.backend, s.node_range.0, s.node_range.1);
+                eprintln!(
+                    "[graph] split {si}: {:?} nodes {}-{}",
+                    s.backend, s.node_range.0, s.node_range.1
+                );
             }
             let mut by = std::collections::BTreeMap::new();
             for n in &graph.nodes {
-                *by.entry((format!("{:?}", n.op).split('{').next().unwrap().to_string(), n.backend.map(|b| format!("{b:?}")).unwrap_or_default()))
-                    .or_insert(0usize) += 1;
+                *by.entry((
+                    format!("{:?}", n.op).split('{').next().unwrap().to_string(),
+                    n.backend.map(|b| format!("{b:?}")).unwrap_or_default(),
+                ))
+                .or_insert(0usize) += 1;
             }
             for (k, v) in by {
                 eprintln!("[graph] op {:<12} backend {:<7} x{v}", k.0, k.1);
@@ -186,7 +197,9 @@ impl BackendScheduler {
                 // dead nodes (no consumers, not outputs) get no buffer — the
                 // fusion pass can orphan them (e.g. silu folded into SwiGLU);
                 // they are skipped, not executed
-                let Some(br) = alloc.node_buffer(id) else { continue };
+                let Some(br) = alloc.node_buffer(id) else {
+                    continue;
+                };
                 if br.backend != split.backend {
                     return Err(format!(
                         "node {id} buffer on {:?} but executing split is {:?} (assignment/alloc mismatch)",
@@ -214,12 +227,12 @@ impl BackendScheduler {
                 // NOTE: execution follows node id order (build order), which is
                 // the graph's topological order by construction.
                 match split.backend {
-                    BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br.id, kv_pair)?,
+                    BackendTag::CPU => alloc
+                        .cpu_mut()
+                        .execute_node(node, &in_bufs, br.id, kv_pair)?,
                     #[cfg(target_os = "macos")]
                     BackendTag::Metal => {
-                        let m = alloc
-                            .metal_mut()
-                            .ok_or("Metal backend not enabled")?;
+                        let m = alloc.metal_mut().ok_or("Metal backend not enabled")?;
                         m.execute_node(node, &in_bufs, br.id, kv_pair)?;
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -231,10 +244,7 @@ impl BackendScheduler {
                     // KV regions are huge (n_embd × n_ctx per layer) — skipped
                     // on both backends (page shows "no data for this node in this
                     // step"); everything else is captured.
-                    let is_kv = matches!(
-                        node.op,
-                        Op::KvcacheStore { .. } | Op::KvcacheLoad { .. }
-                    );
+                    let is_kv = matches!(node.op, Op::KvcacheStore { .. } | Op::KvcacheLoad { .. });
                     if !is_kv {
                         match br.backend {
                             BackendTag::CPU => {

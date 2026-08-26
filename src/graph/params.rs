@@ -32,7 +32,13 @@ pub struct CParams {
 
 impl Default for CParams {
     fn default() -> Self {
-        Self { n_ctx: 4096, n_batch: 128, flash_attn: false, gpu: false, fuse_qkv: false }
+        Self {
+            n_ctx: 4096,
+            n_batch: 128,
+            flash_attn: false,
+            gpu: false,
+            fuse_qkv: false,
+        }
     }
 }
 

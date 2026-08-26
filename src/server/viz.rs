@@ -97,9 +97,7 @@ pub fn run_viz(
     }));
 
     let worker_tokenizer = tokenizer.clone();
-    std::thread::spawn(move || {
-        super::chat::worker_loop(model, worker_tokenizer, slots, job_rx)
-    });
+    std::thread::spawn(move || super::chat::worker_loop(model, worker_tokenizer, slots, job_rx));
 
     let template = super::chat_template_from_gguf(&gguf.parts[0].data);
     let app = Arc::new(AppState {
@@ -119,12 +117,16 @@ pub fn run_viz(
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async move {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
-            eprintln!("Error: failed to bind {addr}: {e}");
-            std::process::exit(1);
-        });
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to bind {addr}: {e}");
+                std::process::exit(1);
+            });
         eprintln!("minfer viz server on http://{addr}  (open in a browser to interact)");
-        axum::serve(listener, viz_router(state)).await.expect("server");
+        axum::serve(listener, viz_router(state))
+            .await
+            .expect("server");
     });
 }
 
@@ -151,7 +153,11 @@ async fn style_asset() -> Response {
     ([(axum::http::header::CONTENT_TYPE, "text/css")], STYLE_CSS).into_response()
 }
 async fn app_asset() -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "application/javascript")], APP_JS).into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+        APP_JS,
+    )
+        .into_response()
 }
 /// Tiny inline SVG favicon (kills the browser's /favicon.ico 404 noise).
 async fn favicon() -> Response {
@@ -163,7 +169,11 @@ async fn favicon() -> Response {
 }
 
 fn html(body: String) -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 /// Serve samples/ from disk (`MINFER_VIZ_DIR` or `viz` relative to CWD).
@@ -216,7 +226,9 @@ async fn viz_events(State(state): State<Arc<VizState>>) -> Response {
         ),
         LiveGuard,
     );
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// POST /viz/run {prompt, max_tokens?, temperature?} — dedicated inference trigger endpoint.
@@ -261,7 +273,11 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
     if state
         .app
         .job_tx
-        .send(Job { input_ids, params, tx })
+        .send(Job {
+            input_ids,
+            params,
+            tx,
+        })
         .await
         .is_err()
     {
@@ -274,7 +290,10 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Finish { reason: r, tokens: n } => {
+            StreamEvent::Finish {
+                reason: r,
+                tokens: n,
+            } => {
                 reason = r;
                 tokens = n;
             }

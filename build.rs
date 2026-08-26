@@ -9,8 +9,8 @@ fn main() {
     // package version (with a "v" prefix to match the tag convention).
     println!("cargo:rerun-if-env-changed=MINFER_VERSION");
     let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
-    let minfer_version = std::env::var("MINFER_VERSION")
-        .unwrap_or_else(|_| format!("v{pkg_version}"));
+    let minfer_version =
+        std::env::var("MINFER_VERSION").unwrap_or_else(|_| format!("v{pkg_version}"));
     println!("cargo:rustc-env=MINFER_VERSION={minfer_version}");
 
     // ─── Precompiled Metal library (metallib) ─────────────────────────
@@ -58,11 +58,18 @@ fn main() {
         let metal_ok = match Command::new("/usr/bin/xcrun")
             .env_remove("DEVELOPER_DIR")
             .env_remove("SDKROOT")
-            .args(["-sdk", "macosx", "metal", "-O3",
-                   // clang module cache goes to a writable dir (note: metal
-                   // only accepts the `=` form of -fmodules-cache-path)
-                   &format!("-fmodules-cache-path={out_dir}"),
-                   "-c", "src/metal.metal", "-o"])
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-O3",
+                // clang module cache goes to a writable dir (note: metal
+                // only accepts the `=` form of -fmodules-cache-path)
+                &format!("-fmodules-cache-path={out_dir}"),
+                "-c",
+                "src/metal.metal",
+                "-o",
+            ])
             .arg(&air)
             .output()
         {
@@ -138,12 +145,16 @@ fn main() {
     let include_flag = format!("-I{cuda_home}/include");
 
     let mut args: Vec<String> = Vec::new();
-    args.push("-o".into()); args.push(obj_file.clone());
-    args.push("-c".into()); args.push(cu_file.into());
+    args.push("-o".into());
+    args.push(obj_file.clone());
+    args.push("-c".into());
+    args.push(cu_file.into());
     args.push(include_flag.clone());
     args.push("-O3".into());
-    args.push("--compiler-options".into()); args.push("-fPIC".into());
-    args.push("-Xcompiler".into()); args.push("-Wno-unused-function".into());
+    args.push("--compiler-options".into());
+    args.push("-fPIC".into());
+    args.push("-Xcompiler".into());
+    args.push("-Wno-unused-function".into());
 
     for arch in &archs {
         args.push("-gencode".into());
@@ -154,7 +165,9 @@ fn main() {
         args.push(format!("arch=compute_{highest},code=compute_{highest}"));
     }
 
-    let status = Command::new(nvcc).args(&args).status()
+    let status = Command::new(nvcc)
+        .args(&args)
+        .status()
         .expect("failed to compile CUDA kernels");
 
     if !status.success() {
@@ -188,10 +201,14 @@ fn main() {
 
 fn find_cuda_home() -> String {
     if let Ok(home) = std::env::var("CUDA_HOME") {
-        if !home.is_empty() { return home; }
+        if !home.is_empty() {
+            return home;
+        }
     }
     if let Ok(home) = std::env::var("CUDA_PATH") {
-        if !home.is_empty() { return home; }
+        if !home.is_empty() {
+            return home;
+        }
     }
     if Path::new("/usr/local/cuda").exists() {
         return "/usr/local/cuda".to_string();

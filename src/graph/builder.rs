@@ -7,8 +7,8 @@ use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
 use super::ops::{
-    AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta, NormMeta,
-    Op, RoPEMeta,
+    AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta,
+    NormMeta, Op, RoPEMeta,
 };
 use super::{CNode, ComputeGraph, DType, NodeId};
 
@@ -18,7 +18,9 @@ pub struct GraphBuilder {
 
 impl GraphBuilder {
     pub fn new() -> Self {
-        Self { graph: ComputeGraph::default() }
+        Self {
+            graph: ComputeGraph::default(),
+        }
     }
 
     /// Create an operator node; returns its id.
@@ -94,7 +96,14 @@ impl GraphBuilder {
     /// Per-head RMSNorm (Qwen3 Q/K norms): normalizes each contiguous `hd`-wide
     /// head row of the flat `[nt*nh*hd]` buffer with a weight of length `hd`.
     /// Output shape = input shape.
-    pub fn qk_norm(&mut self, x: NodeId, weight: Option<&Tensor>, hd: usize, nh: usize, eps: f32) -> NodeId {
+    pub fn qk_norm(
+        &mut self,
+        x: NodeId,
+        weight: Option<&Tensor>,
+        hd: usize,
+        nh: usize,
+        eps: f32,
+    ) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
         self.node(
             "qk_norm",
@@ -139,8 +148,12 @@ impl GraphBuilder {
     /// builds a MatMul node whose meta references `weight_name` directly.
     #[allow(dead_code)]
     pub fn matmul_by_name(
-        &mut self, x: NodeId, weight_name: &str, ttype: crate::tensor::TensorType,
-        out_dim: usize, in_dim: usize,
+        &mut self,
+        x: NodeId,
+        weight_name: &str,
+        ttype: crate::tensor::TensorType,
+        out_dim: usize,
+        in_dim: usize,
     ) -> NodeId {
         let nt = self.graph.nodes[x].out_shape[1];
         self.node(
@@ -162,7 +175,14 @@ impl GraphBuilder {
     /// Generic row selection: `out[t] = x[ids[t]]` (llama `ggml_get_rows`;
     /// also used for the n_out tail-row reduction). `ids` is an I32 input.
     pub fn get_rows(&mut self, x: NodeId, ids: NodeId, out_shape: [usize; 4]) -> NodeId {
-        self.node("get_rows", Op::GetRows, &[x, ids], out_shape, DType::F32, NodeMeta::None)
+        self.node(
+            "get_rows",
+            Op::GetRows,
+            &[x, ids],
+            out_shape,
+            DType::F32,
+            NodeMeta::None,
+        )
     }
 
     /// RoPE. `pos` is an input node carrying per-token positions (data).
@@ -170,7 +190,13 @@ impl GraphBuilder {
     /// buffer carries q (rows 0..nqt), k (nqt..nqt+nkt), v (nqt+nkt..) after
     /// bias+rope; the backend also stores K/V into the layer's persistent
     /// regions (kv_pair). Output shape = [nqt+nkt+nkt, nt].
-    pub fn fused_qkv(&mut self, x: NodeId, pos: NodeId, layer: usize, meta: FusedQkvMeta) -> NodeId {
+    pub fn fused_qkv(
+        &mut self,
+        x: NodeId,
+        pos: NodeId,
+        layer: usize,
+        meta: FusedQkvMeta,
+    ) -> NodeId {
         let nt = self.graph.nodes[x].out_shape[1];
         let od_total = meta.nqt + 2 * meta.nkt;
         self.node(
@@ -201,7 +227,14 @@ impl GraphBuilder {
 
     pub fn rope(&mut self, x: NodeId, pos: NodeId, style: RopeStyle, meta: RoPEMeta) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
-        self.node("rope", Op::RoPE { style }, &[x, pos], shape, DType::F32, NodeMeta::Rope(meta))
+        self.node(
+            "rope",
+            Op::RoPE { style },
+            &[x, pos],
+            shape,
+            DType::F32,
+            NodeMeta::Rope(meta),
+        )
     }
 
     pub fn silu(&mut self, x: NodeId) -> NodeId {
@@ -224,7 +257,14 @@ impl GraphBuilder {
     #[allow(dead_code)]
     pub fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
-        self.node("softmax", Op::Softmax { dim }, &[x], shape, DType::F32, NodeMeta::None)
+        self.node(
+            "softmax",
+            Op::Softmax { dim },
+            &[x],
+            shape,
+            DType::F32,
+            NodeMeta::None,
+        )
     }
 
     /// Attention over a KV region produced by `kvcache_load`. `pos` carries the
@@ -258,7 +298,14 @@ impl GraphBuilder {
     #[allow(dead_code)]
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let shape = self.graph.nodes[gate].out_shape;
-        self.node("swiglu", Op::SwiGLU, &[gate, up], shape, DType::F32, NodeMeta::None)
+        self.node(
+            "swiglu",
+            Op::SwiGLU,
+            &[gate, up],
+            shape,
+            DType::F32,
+            NodeMeta::None,
+        )
     }
 
     /// Write this step's K/V into the layer's persistent KV region at the
@@ -279,7 +326,10 @@ impl GraphBuilder {
             &[k, v, pos],
             [n_embd, n_ctx, 1, 1],
             DType::F32,
-            NodeMeta::Kvcache(KvcacheMeta { n_embd, n_head_kv: 0 }),
+            NodeMeta::Kvcache(KvcacheMeta {
+                n_embd,
+                n_head_kv: 0,
+            }),
         )
     }
 

@@ -117,7 +117,7 @@ impl TensorType {
 #[derive(Clone)]
 pub struct Tensor {
     pub ttype: TensorType,
-    pub shape: [i64; 4],    // ne[0..3]: number of elements per dimension
+    pub shape: [i64; 4],     // ne[0..3]: number of elements per dimension
     pub strides: [usize; 4], // nb[0..3]: stride in bytes per dimension
     pub data: std::borrow::Cow<'static, [u8]>,
     pub name: String,
@@ -362,7 +362,12 @@ impl Tensor {
     pub fn reshape(&mut self, new_shape: &[i64; 4]) {
         let old_ne = self.nelements();
         let new_ne = new_shape[0] * new_shape[1] * new_shape[2] * new_shape[3];
-        assert!(old_ne == new_ne, "reshape: element count mismatch ({} vs {})", old_ne, new_ne);
+        assert!(
+            old_ne == new_ne,
+            "reshape: element count mismatch ({} vs {})",
+            old_ne,
+            new_ne
+        );
 
         self.shape = *new_shape;
 
@@ -382,7 +387,9 @@ impl Tensor {
         let mut first = true;
         for d in 0..4 {
             if self.shape[d] != 1 || d == 0 {
-                if !first { s.push_str(","); }
+                if !first {
+                    s.push_str(",");
+                }
                 s.push_str(&self.shape[d].to_string());
                 first = false;
             }

@@ -29,7 +29,8 @@ use super::{CNode, DType};
 // (prefill); later submits print one line each (decode = one submit per token).
 // Zero overhead when the env var is unset.
 use std::collections::BTreeMap;
-static OP_ENC: std::sync::Mutex<BTreeMap<String, (u64, f64)>> = std::sync::Mutex::new(BTreeMap::new());
+static OP_ENC: std::sync::Mutex<BTreeMap<String, (u64, f64)>> =
+    std::sync::Mutex::new(BTreeMap::new());
 static GPU_MS: std::sync::Mutex<(u64, f64)> = std::sync::Mutex::new((0, 0.0));
 
 fn op_profile_enabled() -> bool {
@@ -90,7 +91,8 @@ impl MetalBackend {
             .copied()
             .zip(dst_ids.iter().copied())
             .collect();
-        self.cb().encode_captures(&pairs, &self.pool, &self.staging)?;
+        self.cb()
+            .encode_captures(&pairs, &self.pool, &self.staging)?;
         Ok(dst_ids)
     }
 
@@ -161,7 +163,8 @@ impl MetalBackend {
             // SAFETY: exclusive &mut self — take the box back and submit.
             let cb = unsafe { Box::from_raw(self.cb_ptr) };
             self.cb_ptr = std::ptr::null_mut();
-            cb.submit().expect("MPS: graph backend command-buffer submit error");
+            cb.submit()
+                .expect("MPS: graph backend command-buffer submit error");
             if op_profile_enabled() {
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 let n = {
@@ -173,8 +176,10 @@ impl MetalBackend {
                 if n == 1 {
                     Self::print_profile();
                 } else {
-                    eprintln!("[MINFER_OP_PROFILE] submit #{n}: GPU {ms:.2} ms (total {:.1} ms)",
-                        GPU_MS.lock().unwrap().1);
+                    eprintln!(
+                        "[MINFER_OP_PROFILE] submit #{n}: GPU {ms:.2} ms (total {:.1} ms)",
+                        GPU_MS.lock().unwrap().1
+                    );
                 }
             }
         }
@@ -197,7 +202,8 @@ impl MetalBackend {
     /// read is safe here.
     fn positions_max(positions: &crate::metal::MetalBuffer) -> usize {
         let n = (positions.length() as usize) / 4;
-        let p = unsafe { std::slice::from_raw_parts(positions.contents().as_ptr() as *const u32, n) };
+        let p =
+            unsafe { std::slice::from_raw_parts(positions.contents().as_ptr() as *const u32, n) };
         p.iter().map(|&x| x as usize).max().unwrap_or(0)
     }
 
@@ -220,16 +226,20 @@ impl MetalBackend {
         let gpu = GPU_MS.lock().unwrap();
         let mut rows: Vec<_> = enc.iter().collect();
         rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
-        eprintln!("\n[MINFER_OP_PROFILE] host-encode per op (cumulative), GPU submits={}:", gpu.0);
+        eprintln!(
+            "\n[MINFER_OP_PROFILE] host-encode per op (cumulative), GPU submits={}:",
+            gpu.0
+        );
         let mut enc_total = 0.0;
         for (k, (n, ms)) in rows.iter().take(20) {
             enc_total += ms;
             eprintln!("  {ms:9.3} ms  x{n:4}  {k}");
         }
-        eprintln!("  host encode (top20): {enc_total:.3} ms; GPU wait: {:.3} ms over {} submits",
-            gpu.1, gpu.0);
+        eprintln!(
+            "  host encode (top20): {enc_total:.3} ms; GPU wait: {:.3} ms over {} submits",
+            gpu.1, gpu.0
+        );
     }
-
 }
 
 impl Drop for MetalBackend {
@@ -255,7 +265,9 @@ impl Backend for MetalBackend {
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         match op {
             Op::Input => true,
-            Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::QkNorm { .. } | Op::SwiGLU => dtype == DType::F32,
+            Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::QkNorm { .. } | Op::SwiGLU => {
+                dtype == DType::F32
+            }
             Op::MatMul { .. } => {
                 matches!(dtype, DType::F32) // activations are f32; weight type in meta
             }
@@ -274,9 +286,11 @@ impl Backend for MetalBackend {
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
-        if let Some(idx) = self.free.iter().position(|&id| {
-            self.pool[id].length() as usize == size * 4
-        }) {
+        if let Some(idx) = self
+            .free
+            .iter()
+            .position(|&id| self.pool[id].length() as usize == size * 4)
+        {
             return self.free.swap_remove(idx);
         }
         self.pool.push(self.state.new_f32_buffer(size));
@@ -298,7 +312,10 @@ impl Backend for MetalBackend {
     ) -> Result<(), String> {
         let cb = self.cb();
         let _t = if op_profile_enabled() {
-            Some(EncTimer { key: format!("{:?}", node.op), t0: std::time::Instant::now() })
+            Some(EncTimer {
+                key: format!("{:?}", node.op),
+                t0: std::time::Instant::now(),
+            })
         } else {
             None
         };
@@ -313,11 +330,21 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::Add => {
-                cb.add_f32(self.buf(in_bufs[0]), self.buf(in_bufs[1]), self.buf(out_buf), self.pool[out_buf].length() as usize / 4);
+                cb.add_f32(
+                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[1]),
+                    self.buf(out_buf),
+                    self.pool[out_buf].length() as usize / 4,
+                );
                 Ok(())
             }
             Op::Mul => {
-                cb.mul_f32(self.buf(in_bufs[0]), self.buf(in_bufs[1]), self.buf(out_buf), self.pool[out_buf].length() as usize / 4);
+                cb.mul_f32(
+                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[1]),
+                    self.buf(out_buf),
+                    self.pool[out_buf].length() as usize / 4,
+                );
                 Ok(())
             }
             Op::RmsNorm { eps } => {
@@ -334,12 +361,39 @@ impl Backend for MetalBackend {
                 match w {
                     Some((wb, w_off)) => {
                         if crate::metal::rms_norm_256_enabled() {
-                            cb.rms_norm_256(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                            cb.rms_norm_256(
+                                self.buf(in_bufs[0]),
+                                Some(&wb),
+                                w_off,
+                                self.buf(out_buf),
+                                d,
+                                n,
+                                *eps,
+                                0,
+                            );
                         } else {
-                            cb.rms_norm(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                            cb.rms_norm(
+                                self.buf(in_bufs[0]),
+                                Some(&wb),
+                                w_off,
+                                self.buf(out_buf),
+                                d,
+                                n,
+                                *eps,
+                                0,
+                            );
                         }
                     }
-                    None => cb.rms_norm(self.buf(in_bufs[0]), None, 0, self.buf(out_buf), d, n, *eps, 0),
+                    None => cb.rms_norm(
+                        self.buf(in_bufs[0]),
+                        None,
+                        0,
+                        self.buf(out_buf),
+                        d,
+                        n,
+                        *eps,
+                        0,
+                    ),
                 }
                 Ok(())
             }
@@ -359,12 +413,39 @@ impl Backend for MetalBackend {
                 match w {
                     Some((wb, w_off)) => {
                         if crate::metal::rms_norm_256_enabled() {
-                            cb.rms_norm_256(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                            cb.rms_norm_256(
+                                self.buf(in_bufs[0]),
+                                Some(&wb),
+                                w_off,
+                                self.buf(out_buf),
+                                d,
+                                n,
+                                *eps,
+                                0,
+                            );
                         } else {
-                            cb.rms_norm(self.buf(in_bufs[0]), Some(&wb), w_off, self.buf(out_buf), d, n, *eps, 0);
+                            cb.rms_norm(
+                                self.buf(in_bufs[0]),
+                                Some(&wb),
+                                w_off,
+                                self.buf(out_buf),
+                                d,
+                                n,
+                                *eps,
+                                0,
+                            );
                         }
                     }
-                    None => cb.rms_norm(self.buf(in_bufs[0]), None, 0, self.buf(out_buf), d, n, *eps, 0),
+                    None => cb.rms_norm(
+                        self.buf(in_bufs[0]),
+                        None,
+                        0,
+                        self.buf(out_buf),
+                        d,
+                        n,
+                        *eps,
+                        0,
+                    ),
                 }
                 Ok(())
             }
@@ -380,8 +461,15 @@ impl Backend for MetalBackend {
                     .ok_or_else(|| format!("weight '{}' not on GPU", meta.weight_name))?;
                 let nt = node.out_shape[1];
                 cb.quant_matmul_f32_on_gpu_buf(
-                    &wb, w_off, meta.weight_ttype, self.buf(in_bufs[0]), 0, self.buf(out_buf),
-                    meta.out_dim, meta.in_dim, nt,
+                    &wb,
+                    w_off,
+                    meta.weight_ttype,
+                    self.buf(in_bufs[0]),
+                    0,
+                    self.buf(out_buf),
+                    meta.out_dim,
+                    meta.in_dim,
+                    nt,
                 );
                 if let Some(bname) = &meta.bias_name {
                     let (bb, b_off) = self
@@ -401,14 +489,28 @@ impl Backend for MetalBackend {
                             .ok_or_else(|| format!("embedding '{}' not on GPU", m.weight_name))?;
                         let ne = node.out_shape[0];
                         let nt = node.out_shape[1];
-                        cb.embed_tokens_gpu(&wb, w_off, self.buf(in_bufs[0]), self.buf(out_buf), ne, nt, m.weight_ttype);
+                        cb.embed_tokens_gpu(
+                            &wb,
+                            w_off,
+                            self.buf(in_bufs[0]),
+                            self.buf(out_buf),
+                            ne,
+                            nt,
+                            m.weight_ttype,
+                        );
                         Ok(())
                     }
                     NodeMeta::None => {
                         // generic row selection: out[t] = x[ids[t]] (n_out tail)
                         let ne = node.out_shape[0];
                         let nt = node.out_shape[1];
-                        cb.get_rows_f32(self.buf(in_bufs[0]), self.buf(in_bufs[1]), self.buf(out_buf), ne, nt);
+                        cb.get_rows_f32(
+                            self.buf(in_bufs[0]),
+                            self.buf(in_bufs[1]),
+                            self.buf(out_buf),
+                            ne,
+                            nt,
+                        );
                         Ok(())
                     }
                     other => Err(format!("get_rows node with unexpected meta: {other:?}")),
@@ -424,23 +526,49 @@ impl Backend for MetalBackend {
                 }
                 let nt = node.out_shape[1];
                 cb.rope_f32(
-                    self.buf(out_buf), meta.n_head, meta.hd, nt,
-                    meta.freq_base, meta.freq_scale, self.buf(in_bufs[1]), *style as i32, 0,
+                    self.buf(out_buf),
+                    meta.n_head,
+                    meta.hd,
+                    nt,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    self.buf(in_bufs[1]),
+                    *style as i32,
+                    0,
                 );
                 Ok(())
             }
             Op::SwiGLU => {
                 let n = self.pool[out_buf].length() as usize / 4;
-                cb.swiglu_f32(self.buf(in_bufs[0]), self.buf(in_bufs[1]), self.buf(out_buf), n);
+                cb.swiglu_f32(
+                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[1]),
+                    self.buf(out_buf),
+                    n,
+                );
                 Ok(())
             }
             Op::KvcacheStore { layer } => {
-                let (k_id, v_id) = kv_pair
-                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 let nkt = node.out_shape[0];
                 let nt = (self.pool[in_bufs[0]].length() as usize / 4) / nkt;
-                cb.store_kv(self.buf(in_bufs[0]), self.buf(k_id), nkt, nt, self.buf(in_bufs[2]), 0);
-                cb.store_kv(self.buf(in_bufs[1]), self.buf(v_id), nkt, nt, self.buf(in_bufs[2]), 0);
+                cb.store_kv(
+                    self.buf(in_bufs[0]),
+                    self.buf(k_id),
+                    nkt,
+                    nt,
+                    self.buf(in_bufs[2]),
+                    0,
+                );
+                cb.store_kv(
+                    self.buf(in_bufs[1]),
+                    self.buf(v_id),
+                    nkt,
+                    nt,
+                    self.buf(in_bufs[2]),
+                    0,
+                );
                 Ok(())
             }
             Op::KvcacheLoad { .. } => Ok(()), // view of the K region
@@ -477,27 +605,111 @@ impl Backend for MetalBackend {
                 if nt == 1 {
                     if crate::metal::flash_attn_enabled(meta.hd) {
                         let chunks = self.attention_chunks(positions);
-                        cb.gqa_attn_flash(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1, chunks);
+                        cb.gqa_attn_flash(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            1,
+                            chunks,
+                        );
                     } else if (meta.hd == 64 || meta.hd == 128)
                         && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1")
                     {
                         let chunks = self.attention_chunks(positions);
-                        cb.gqa_attn_split_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1, chunks);
+                        cb.gqa_attn_split_f32(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            1,
+                            chunks,
+                        );
                     } else {
-                        cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, 1);
+                        cb.gqa_attn_f32(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            1,
+                        );
                     }
                 } else if meta.hd == 64 || meta.hd == 128 {
                     let max_pos = Self::positions_max(positions);
                     let nkv = max_pos + 1;
                     if crate::metal::prefill_flash_enabled(meta.hd) {
-                        cb.attn_flash_prefill(q, k, v, o, positions, nkv, meta.nkt, nt, meta.n_head, meta.n_head_kv, meta.hd, meta.scale);
+                        cb.attn_flash_prefill(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            nkv,
+                            meta.nkt,
+                            nt,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                        );
                     } else if crate::metal::matmul_attn_enabled() {
-                        cb.attn_parallel_prefill(q, k, v, o, positions, nkv, meta.nkt, meta.n_head * meta.hd, nt, meta.n_head, meta.hd, meta.n_head / meta.n_head_kv, meta.scale);
+                        cb.attn_parallel_prefill(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            nkv,
+                            meta.nkt,
+                            meta.n_head * meta.hd,
+                            nt,
+                            meta.n_head,
+                            meta.hd,
+                            meta.n_head / meta.n_head_kv,
+                            meta.scale,
+                        );
                     } else {
-                        cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, nt);
+                        cb.gqa_attn_f32(
+                            q,
+                            k,
+                            v,
+                            o,
+                            positions,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            nt,
+                        );
                     }
                 } else {
-                    cb.gqa_attn_f32(q, k, v, o, positions, meta.n_head, meta.n_head_kv, meta.hd, meta.scale, nt);
+                    cb.gqa_attn_f32(
+                        q,
+                        k,
+                        v,
+                        o,
+                        positions,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        nt,
+                    );
                 }
                 Ok(())
             }
@@ -521,21 +733,40 @@ impl Backend for MetalBackend {
                 let od_total = 2 * meta.nf;
                 // 1) concat matmul: x × [ffn_gate|ffn_up] → gate|up concat buffer
                 cb.quant_matmul_f32_on_gpu_buf(
-                    &wb, w_off, meta.weight_ttype, self.buf(in_bufs[0]), 0, self.buf(out_buf),
-                    od_total, meta.in_dim, nt,
+                    &wb,
+                    w_off,
+                    meta.weight_ttype,
+                    self.buf(in_bufs[0]),
+                    0,
+                    self.buf(out_buf),
+                    od_total,
+                    meta.in_dim,
+                    nt,
                 );
                 // 2) swiglu in place: silu(gate rows 0..nf) * up rows nf..2*nf
                 //    (llama ggml_swiglu_split); result written back to gate rows
                 let n = nt * meta.nf;
                 cb.swiglu_f32_off(
-                    self.buf(out_buf), self.buf(out_buf), self.buf(out_buf), n, n,
+                    self.buf(out_buf),
+                    self.buf(out_buf),
+                    self.buf(out_buf),
+                    n,
+                    n,
                 );
                 if std::env::var("MINFER_FFNDEBUG").is_ok() {
                     self.submit_pending();
                     let nb = (self.pool[out_buf].length() as usize) / 4;
-                    let ob = unsafe { std::slice::from_raw_parts(self.buf(out_buf).contents().as_ptr() as *const f32, nb) };
-                    eprintln!("[ffn-out] FusedFFN out_buf={out_buf} len={nb} first4={:?} last4={:?}",
-                        &ob[..4], &ob[nb-4..]);
+                    let ob = unsafe {
+                        std::slice::from_raw_parts(
+                            self.buf(out_buf).contents().as_ptr() as *const f32,
+                            nb,
+                        )
+                    };
+                    eprintln!(
+                        "[ffn-out] FusedFFN out_buf={out_buf} len={nb} first4={:?} last4={:?}",
+                        &ob[..4],
+                        &ob[nb - 4..]
+                    );
                 }
                 Ok(())
             }
@@ -553,18 +784,29 @@ impl Backend for MetalBackend {
                 let od_total = meta.nqt + 2 * meta.nkt;
                 // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
                 cb.quant_matmul_f32_on_gpu_buf(
-                    &wb, w_off, meta.weight_ttype, self.buf(in_bufs[0]), 0, self.buf(out_buf),
-                    od_total, meta.in_dim, nt,
+                    &wb,
+                    w_off,
+                    meta.weight_ttype,
+                    self.buf(in_bufs[0]),
+                    0,
+                    self.buf(out_buf),
+                    od_total,
+                    meta.in_dim,
+                    nt,
                 );
                 // 2) fused bias + rope + KV store in one kernel pass
-                let (k_id, v_id) = kv_pair
-                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
-                let bias_off = |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
-                    match name {
-                        Some(n) => self.state.weight_buf(n).ok_or_else(|| format!("bias '{n}' not on GPU")),
-                        None => Err("fused QKV bias missing".into()),
-                    }
-                };
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let bias_off =
+                    |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
+                        match name {
+                            Some(n) => self
+                                .state
+                                .weight_buf(n)
+                                .ok_or_else(|| format!("bias '{n}' not on GPU")),
+                            None => Err("fused QKV bias missing".into()),
+                        }
+                    };
                 let bq = bias_off(&meta.bias_q)?;
                 let bk = bias_off(&meta.bias_k)?;
                 let bv = bias_off(&meta.bias_v)?;
@@ -573,16 +815,32 @@ impl Backend for MetalBackend {
                 let (bv_b, bv_o) = bv;
                 let pos = {
                     let n = (self.buf(in_bufs[1]).length() as usize) / 4;
-                    let p = unsafe { std::slice::from_raw_parts(self.buf(in_bufs[1]).contents().as_ptr() as *const u32, n) };
+                    let p = unsafe {
+                        std::slice::from_raw_parts(
+                            self.buf(in_bufs[1]).contents().as_ptr() as *const u32,
+                            n,
+                        )
+                    };
                     p[0] as i32
                 };
 
                 cb.attn_bias_rope_store(
                     self.buf(out_buf),
-                    &bq_b, bq_o, &bk_b, bk_o, &bv_b, bv_o,
-                    self.buf(k_id), self.buf(v_id),
-                    meta.nqt, meta.nkt, meta.hd,
-                    meta.freq_base, meta.freq_scale, pos, meta.rope_style as i32,
+                    &bq_b,
+                    bq_o,
+                    &bk_b,
+                    bk_o,
+                    &bv_b,
+                    bv_o,
+                    self.buf(k_id),
+                    self.buf(v_id),
+                    meta.nqt,
+                    meta.nkt,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    pos,
+                    meta.rope_style as i32,
                 );
                 Ok(())
             }
@@ -602,10 +860,17 @@ impl Backend for MetalBackend {
         let buf = self.pool.get(id).ok_or_else(|| format!("no buffer {id}"))?;
         let len = (buf.length() as usize) / 4;
         if len != data.len() {
-            return Err(format!("buffer {id}: expected {len} elements, got {}", data.len()));
+            return Err(format!(
+                "buffer {id}: expected {len} elements, got {}",
+                data.len()
+            ));
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents().as_ptr() as *mut f32, data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buf.contents().as_ptr() as *mut f32,
+                data.len(),
+            );
         }
         Ok(())
     }
@@ -676,14 +941,28 @@ mod tests {
         alloc.fill_input(&g2, "x", &[0.5, 1.0, 2.0, -1.0]).unwrap();
         let splits = sched.split_graph(&g2);
         for (si, sp) in splits.iter().enumerate() {
-            eprintln!("[dbg] split {si}: {:?} range {:?} inputs {:?}", sp.backend, sp.node_range, sp.inputs);
+            eprintln!(
+                "[dbg] split {si}: {:?} range {:?} inputs {:?}",
+                sp.backend, sp.node_range, sp.inputs
+            );
         }
         sched.execute(&g2, &mut alloc).unwrap();
-        eprintln!("[dbg] silu out (node 1) = {:?}", alloc.copy_to_cpu(1).unwrap());
-        eprintln!("[dbg] add out (node 2) = {:?}", alloc.copy_to_cpu(2).unwrap());
+        eprintln!(
+            "[dbg] silu out (node 1) = {:?}",
+            alloc.copy_to_cpu(1).unwrap()
+        );
+        eprintln!(
+            "[dbg] add out (node 2) = {:?}",
+            alloc.copy_to_cpu(2).unwrap()
+        );
         let got = alloc.copy_to_cpu(o).unwrap();
         for i in 0..4 {
-            assert!((got[i] - expect[i]).abs() < 1e-6, "out[{i}] {} vs {}", got[i], expect[i]);
+            assert!(
+                (got[i] - expect[i]).abs() < 1e-6,
+                "out[{i}] {} vs {}",
+                got[i],
+                expect[i]
+            );
         }
         let _ = backend;
     }
@@ -693,12 +972,19 @@ mod tests {
     fn metal_rmsnorm_matches_cpu() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         // register a norm weight on MPS (name must resolve in weight_buf)
         let wdata: Vec<f32> = (0..8).map(|i| 0.5 + i as f32 * 0.1).collect();
         let mut bytes = Vec::new();
-        for x in &wdata { bytes.extend_from_slice(&x.to_le_bytes()); }
-        crate::metal::MpsState::get().unwrap().register_weight("nw", &bytes);
+        for x in &wdata {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("nw", &bytes);
 
         let nw = f32t("nw", [8, 1, 1, 1], wdata);
         let mut gb = GraphBuilder::new();
@@ -720,7 +1006,9 @@ mod tests {
         // Metal
         let mut sched = BackendScheduler::new();
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -728,7 +1016,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(r).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[rms_norm] max diff {maxd:.3e}");
         assert!(maxd < 1e-4, "rms_norm Metal diverges: {maxd:.3e}");
     }
@@ -738,7 +1028,10 @@ mod tests {
     fn metal_cross_backend_copy() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let mut gb = GraphBuilder::new();
         let x = gb.input("x", [4, 1, 1, 1], DType::F32);
         let s = gb.silu(x);
@@ -764,14 +1057,28 @@ mod tests {
         alloc.fill_input(&g2, "x", &[0.5, 1.0, 2.0, -1.0]).unwrap();
         let splits = sched.split_graph(&g2);
         for (si, sp) in splits.iter().enumerate() {
-            eprintln!("[dbg] split {si}: {:?} range {:?} inputs {:?}", sp.backend, sp.node_range, sp.inputs);
+            eprintln!(
+                "[dbg] split {si}: {:?} range {:?} inputs {:?}",
+                sp.backend, sp.node_range, sp.inputs
+            );
         }
         sched.execute(&g2, &mut alloc).unwrap();
-        eprintln!("[dbg] silu out (node 1) = {:?}", alloc.copy_to_cpu(1).unwrap());
-        eprintln!("[dbg] add out (node 2) = {:?}", alloc.copy_to_cpu(2).unwrap());
+        eprintln!(
+            "[dbg] silu out (node 1) = {:?}",
+            alloc.copy_to_cpu(1).unwrap()
+        );
+        eprintln!(
+            "[dbg] add out (node 2) = {:?}",
+            alloc.copy_to_cpu(2).unwrap()
+        );
         let got = alloc.copy_to_cpu(o).unwrap();
         for i in 0..4 {
-            assert!((got[i] - expect[i]).abs() < 1e-6, "cross-backend out[{i}] {} vs {}", got[i], expect[i]);
+            assert!(
+                (got[i] - expect[i]).abs() < 1e-6,
+                "cross-backend out[{i}] {} vs {}",
+                got[i],
+                expect[i]
+            );
         }
     }
 
@@ -780,23 +1087,35 @@ mod tests {
     fn metal_matmul_q8_matches_cpu() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let od = 128usize; // output dim
         let inn = 896usize; // input dim // id
-        // random-ish weight [out][in] row-major -> quantize each row to Q8_0
-        let wf: Vec<f32> = (0..od * inn).map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0).collect();
+                            // random-ish weight [out][in] row-major -> quantize each row to Q8_0
+        let wf: Vec<f32> = (0..od * inn)
+            .map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
         let mut wbytes = Vec::new();
         for r in 0..od {
             let row = &wf[r * inn..(r + 1) * inn];
             wbytes.extend_from_slice(&crate::quants::quantize_row_q8_0(row));
         }
         let mut wt = crate::tensor::Tensor::from_data(
-            crate::tensor::TensorType::Q8_0, &[inn as i64, od as i64, 1, 1], wbytes);
+            crate::tensor::TensorType::Q8_0,
+            &[inn as i64, od as i64, 1, 1],
+            wbytes,
+        );
         wt.name = "wq8".to_string();
-        crate::metal::MpsState::get().unwrap().register_weight("wq8", wt.data());
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("wq8", wt.data());
 
         let nt = 8usize;
-        let xd: Vec<f32> = (0..inn * nt).map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0).collect();
+        let xd: Vec<f32> = (0..inn * nt)
+            .map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0)
+            .collect();
 
         let mut gb = GraphBuilder::new();
         let x = gb.input("x", [inn, nt, 1, 1], DType::F32);
@@ -815,7 +1134,10 @@ mod tests {
                     let mut acc = 0.0f32;
                     for b in 0..inn / 32 {
                         let boff = b * bsz;
-                        let d = crate::block::fp16_to_f32(u16::from_le_bytes([wrow[boff], wrow[boff + 1]]));
+                        let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                            wrow[boff],
+                            wrow[boff + 1],
+                        ]));
                         let qs = &wrow[boff + 2..boff + 34];
                         for j in 0..32 {
                             let q = (qs[j] as i8) as f32;
@@ -830,7 +1152,9 @@ mod tests {
         // Metal
         let mut sched = BackendScheduler::new();
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -850,7 +1174,10 @@ mod tests {
                 worst = i;
             }
         }
-        eprintln!("[matmul q8] Metal vs manual-Q8x f32 max diff {maxd:.3e} (nonzero {nonzero}/{})", got.len());
+        eprintln!(
+            "[matmul q8] Metal vs manual-Q8x f32 max diff {maxd:.3e} (nonzero {nonzero}/{})",
+            got.len()
+        );
         assert!(
             maxd < 1e-3,
             "matmul Metal diverges from Q8_0xf32 reference: {maxd:.3e} (worst idx {worst} (t={}, o={}): got {} expect {})",
@@ -866,15 +1193,24 @@ mod tests {
     fn metal_rmsnorm_real_scale() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let d = 896usize;
         let nt = 8usize;
         let wdata: Vec<f32> = (0..d).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
         let mut bytes = Vec::new();
-        for x in &wdata { bytes.extend_from_slice(&x.to_le_bytes()); }
-        crate::metal::MpsState::get().unwrap().register_weight("nw896", &bytes);
+        for x in &wdata {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("nw896", &bytes);
         let nw = f32t("nw896", [d as i64, 1, 1, 1], wdata);
-        let xd: Vec<f32> = (0..d * nt).map(|i| ((i * 97) % 200) as f32 / 100.0 - 1.0).collect();
+        let xd: Vec<f32> = (0..d * nt)
+            .map(|i| ((i * 97) % 200) as f32 / 100.0 - 1.0)
+            .collect();
 
         let mut gb = GraphBuilder::new();
         let x = gb.input("x", [d, nt, 1, 1], DType::F32);
@@ -891,7 +1227,9 @@ mod tests {
         let expect = ca.get_buffer(&g, r).unwrap().to_vec();
 
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -899,7 +1237,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(r).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[rms_norm 896] max diff {maxd:.3e}");
         assert!(maxd < 1e-4, "rms_norm(896) Metal diverges: {maxd:.3e}");
     }
@@ -909,10 +1249,15 @@ mod tests {
     fn metal_cross_backend_copy_large() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let d = 896usize;
         let nt = 8usize;
-        let xd: Vec<f32> = (0..d * nt).map(|i| ((i * 97) % 200) as f32 / 100.0 - 1.0).collect();
+        let xd: Vec<f32> = (0..d * nt)
+            .map(|i| ((i * 97) % 200) as f32 / 100.0 - 1.0)
+            .collect();
         let mut gb = GraphBuilder::new();
         let x = gb.input("x", [d, nt, 1, 1], DType::F32);
         let s = gb.silu(x);
@@ -938,7 +1283,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(o).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[cross large] max diff {maxd:.3e}");
         assert!(maxd < 1e-6, "cross-backend large diverges: {maxd:.3e}");
     }
@@ -949,25 +1296,39 @@ mod tests {
     fn metal_embed_then_rmsnorm_cross_backend() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let ne = 32usize;
         let vocab = 8usize;
         let nt = 4usize;
         // Q8_0 embedding [ne, vocab]
-        let ef: Vec<f32> = (0..ne * vocab).map(|i| ((i * 31) % 97) as f32 / 50.0 - 1.0).collect();
+        let ef: Vec<f32> = (0..ne * vocab)
+            .map(|i| ((i * 31) % 97) as f32 / 50.0 - 1.0)
+            .collect();
         let mut ebytes = Vec::new();
         for r in 0..vocab {
             let row = &ef[r * ne..(r + 1) * ne];
             ebytes.extend_from_slice(&crate::quants::quantize_row_q8_0(row));
         }
         let mut emb = crate::tensor::Tensor::from_data(
-            crate::tensor::TensorType::Q8_0, &[ne as i64, vocab as i64, 1, 1], ebytes);
+            crate::tensor::TensorType::Q8_0,
+            &[ne as i64, vocab as i64, 1, 1],
+            ebytes,
+        );
         emb.name = "embq8".to_string();
-        crate::metal::MpsState::get().unwrap().register_weight("embq8", emb.data());
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("embq8", emb.data());
         let wdata: Vec<f32> = (0..ne).map(|i| 0.5 + (i % 3) as f32 * 0.2).collect();
         let mut wbytes = Vec::new();
-        for x in &wdata { wbytes.extend_from_slice(&x.to_le_bytes()); }
-        crate::metal::MpsState::get().unwrap().register_weight("nwE", &wbytes);
+        for x in &wdata {
+            wbytes.extend_from_slice(&x.to_le_bytes());
+        }
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("nwE", &wbytes);
         let nw = f32t("nwE", [ne as i64, 1, 1, 1], wdata);
         let nw2 = nw.clone();
         let ids: Vec<u32> = vec![1, 3, 5, 2];
@@ -1003,7 +1364,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(r).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[embed+rms] max diff {maxd:.3e}");
         assert!(maxd < 1e-3, "embed->rms cross-backend diverges: {maxd:.3e}");
     }
@@ -1013,16 +1376,25 @@ mod tests {
     fn metal_multi_split_alternation() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let d = 64usize;
         let nt = 4usize;
         let wdata: Vec<f32> = (0..d).map(|i| 0.5 + (i % 3) as f32 * 0.2).collect();
         let mut wbytes = Vec::new();
-        for x in &wdata { wbytes.extend_from_slice(&x.to_le_bytes()); }
-        crate::metal::MpsState::get().unwrap().register_weight("nwM", &wbytes);
+        for x in &wdata {
+            wbytes.extend_from_slice(&x.to_le_bytes());
+        }
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("nwM", &wbytes);
         let nw = f32t("nwM", [d as i64, 1, 1, 1], wdata);
         let nw2 = nw.clone();
-        let xd: Vec<f32> = (0..d * nt).map(|i| ((i * 41) % 199) as f32 / 100.0 - 1.0).collect();
+        let xd: Vec<f32> = (0..d * nt)
+            .map(|i| ((i * 41) % 199) as f32 / 100.0 - 1.0)
+            .collect();
 
         // x(CPU) -> rms(Metal) -> silu(CPU) -> rms(Metal) -> add(CPU) -> rms(Metal)
         let mut gb = GraphBuilder::new();
@@ -1059,7 +1431,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(f).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[multi-split] max diff {maxd:.3e}");
         assert!(maxd < 1e-3, "multi-split alternation diverges: {maxd:.3e}");
     }
@@ -1069,7 +1443,10 @@ mod tests {
     fn metal_attn_kv_matches_cpu() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let mut gb = GraphBuilder::new();
         let pos = gb.input("positions", [2, 1, 1, 1], DType::I32);
         let q = gb.input("q", [8, 2, 1, 1], DType::F32);
@@ -1077,17 +1454,33 @@ mod tests {
         let v = gb.input("v", [8, 2, 1, 1], DType::F32);
         gb.kvcache_store(0, k, v, pos, 16);
         let kv = gb.kvcache_load(0, 8, 16, 2);
-        let o = gb.attn(q, kv, pos, crate::graph::ops::AttnMode::Gqa,
+        let o = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
             crate::graph::ops::AttnMeta {
-                layer: 0, n_head: 2, n_head_kv: 2, hd: 4, hd_kv: 4, nkt: 8,
+                layer: 0,
+                n_head: 2,
+                n_head_kv: 2,
+                hd: 4,
+                hd_kv: 4,
+                nkt: 8,
                 scale: 0.5,
-            });
+            },
+        );
         gb.output(o);
         let g = gb.build();
 
-        let qd: Vec<f32> = (0..16).map(|i| ((i * 13) % 29) as f32 / 10.0 - 1.4).collect();
-        let kd: Vec<f32> = (0..16).map(|i| ((i * 17) % 31) as f32 / 10.0 - 1.5).collect();
-        let vd: Vec<f32> = (0..16).map(|i| ((i * 19) % 37) as f32 / 10.0 - 1.8).collect();
+        let qd: Vec<f32> = (0..16)
+            .map(|i| ((i * 13) % 29) as f32 / 10.0 - 1.4)
+            .collect();
+        let kd: Vec<f32> = (0..16)
+            .map(|i| ((i * 17) % 31) as f32 / 10.0 - 1.5)
+            .collect();
+        let vd: Vec<f32> = (0..16)
+            .map(|i| ((i * 19) % 37) as f32 / 10.0 - 1.8)
+            .collect();
 
         let mut sched = BackendScheduler::new();
         let mut ca = GraphAllocator::new();
@@ -1100,7 +1493,9 @@ mod tests {
         let expect = ca.get_buffer(&g, o).unwrap().to_vec();
 
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1111,7 +1506,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(o).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[attn kv] max diff {maxd:.3e}");
         assert!(maxd < 1e-4, "Metal attention diverges: {maxd:.3e}");
     }
@@ -1121,11 +1518,16 @@ mod tests {
     fn metal_matmul_q4_matches_reference() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let od = 896usize;
         let inn = 896usize;
         let nt = 8usize;
-        let wf: Vec<f32> = (0..od * inn).map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0).collect();
+        let wf: Vec<f32> = (0..od * inn)
+            .map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
         // quantize to Q4_0: 18 bytes per 32 values (d f16 + 16 nibbles)
         let mut wbytes = Vec::new();
         for r in 0..od {
@@ -1133,7 +1535,9 @@ mod tests {
             for b in 0..inn / 32 {
                 let blk = &row[b * 32..b * 32 + 32];
                 let mut amax = 0.0f32;
-                for &v in blk { amax = amax.max(v.abs()); }
+                for &v in blk {
+                    amax = amax.max(v.abs());
+                }
                 let d = if amax == 0.0 { 0.0f32 } else { amax / 127.0 };
                 wbytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
                 for j in 0..16 {
@@ -1148,11 +1552,18 @@ mod tests {
             }
         }
         let mut wt = crate::tensor::Tensor::from_data(
-            crate::tensor::TensorType::Q4_0, &[inn as i64, od as i64, 1, 1], wbytes);
+            crate::tensor::TensorType::Q4_0,
+            &[inn as i64, od as i64, 1, 1],
+            wbytes,
+        );
         wt.name = "wq4".to_string();
-        crate::metal::MpsState::get().unwrap().register_weight("wq4", wt.data());
+        crate::metal::MpsState::get()
+            .unwrap()
+            .register_weight("wq4", wt.data());
 
-        let xd: Vec<f32> = (0..inn * nt).map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0).collect();
+        let xd: Vec<f32> = (0..inn * nt)
+            .map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0)
+            .collect();
 
         // manual Q4_0 x f32 reference
         let mut expect = vec![0.0f32; od * nt];
@@ -1164,7 +1575,10 @@ mod tests {
                     let mut acc = 0.0f32;
                     for b in 0..inn / 32 {
                         let boff = b * 18;
-                        let d = crate::block::fp16_to_f32(u16::from_le_bytes([wrow[boff], wrow[boff + 1]]));
+                        let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                            wrow[boff],
+                            wrow[boff + 1],
+                        ]));
                         for j in 0..16 {
                             let byte = wrow[boff + 2 + j];
                             let q0 = ((byte & 0x0F) as i8 - 8) as f32;
@@ -1186,7 +1600,9 @@ mod tests {
 
         let mut sched = BackendScheduler::new();
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1194,7 +1610,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(m).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[matmul q4] Metal vs manual Q4_0xf32 max diff {maxd:.3e}");
         assert!(maxd < 1e-3, "Q4_0 matmul Metal diverges: {maxd:.3e}");
     }
@@ -1205,7 +1623,10 @@ mod tests {
     fn metal_attn_kv_real_scale() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);
         let nt = 30usize;
         let nqt = nh * hd;
@@ -1216,17 +1637,33 @@ mod tests {
         let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
         gb.kvcache_store(0, k, v, pos, 4096);
         let kv = gb.kvcache_load(0, nkt, 4096, nk);
-        let o = gb.attn(q, kv, pos, crate::graph::ops::AttnMode::Gqa,
+        let o = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
             crate::graph::ops::AttnMeta {
-                layer: 0, n_head: nh, n_head_kv: nk, hd, hd_kv: nkt / nk, nkt,
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: nkt / nk,
+                nkt,
                 scale: 1.0 / (hd as f32).sqrt(),
-            });
+            },
+        );
         gb.output(o);
         let g = gb.build();
 
-        let qd: Vec<f32> = (0..nqt * nt).map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2).collect();
-        let kd: Vec<f32> = (0..nkt * nt).map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3).collect();
-        let vd: Vec<f32> = (0..nkt * nt).map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1).collect();
+        let qd: Vec<f32> = (0..nqt * nt)
+            .map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2)
+            .collect();
+        let kd: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3)
+            .collect();
+        let vd: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1)
+            .collect();
         let posd: Vec<u32> = (0..nt as u32).collect();
 
         let mut sched = BackendScheduler::new();
@@ -1240,7 +1677,9 @@ mod tests {
         let expect = ca.get_buffer(&g, o).unwrap().to_vec();
 
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1251,9 +1690,14 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(o).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[attn kv real] max diff {maxd:.3e}");
-        assert!(maxd < 1e-3, "Metal attention at real scale diverges: {maxd:.3e}");
+        assert!(
+            maxd < 1e-3,
+            "Metal attention at real scale diverges: {maxd:.3e}"
+        );
     }
 
     /// Metal decode-step attention: nt=1 with 30 already-stored KV rows.
@@ -1261,7 +1705,10 @@ mod tests {
     fn metal_attn_decode_step() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);
         let nqt = nh * hd;
         let nkv_prev = 30usize; // KV already filled by the prefill
@@ -1275,17 +1722,33 @@ mod tests {
         let v = gb.input("v", [nkt, nkv_prev + 1, 1, 1], DType::F32);
         gb.kvcache_store(0, k, v, pos, 4096);
         let kv = gb.kvcache_load(0, nkt, 4096, nk);
-        let o = gb.attn(q, kv, pos, crate::graph::ops::AttnMode::Gqa,
+        let o = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
             crate::graph::ops::AttnMeta {
-                layer: 0, n_head: nh, n_head_kv: nk, hd, hd_kv: nkt / nk, nkt,
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: nkt / nk,
+                nkt,
                 scale: 1.0 / (hd as f32).sqrt(),
-            });
+            },
+        );
         gb.output(o);
         let g = gb.build();
 
-        let qd: Vec<f32> = (0..nqt * (nkv_prev + 1)).map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2).collect();
-        let kd: Vec<f32> = (0..nkt * (nkv_prev + 1)).map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3).collect();
-        let vd: Vec<f32> = (0..nkt * (nkv_prev + 1)).map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1).collect();
+        let qd: Vec<f32> = (0..nqt * (nkv_prev + 1))
+            .map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2)
+            .collect();
+        let kd: Vec<f32> = (0..nkt * (nkv_prev + 1))
+            .map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3)
+            .collect();
+        let vd: Vec<f32> = (0..nkt * (nkv_prev + 1))
+            .map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1)
+            .collect();
         let posd: Vec<u32> = (0..=nkv_prev as u32).collect();
 
         let mut sched = BackendScheduler::new();
@@ -1299,7 +1762,9 @@ mod tests {
         let expect = ca.get_buffer(&g, o).unwrap().to_vec();
 
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1312,7 +1777,9 @@ mod tests {
         // compare ONLY the decode row (last token)
         let off = nkv_prev * nqt;
         let mut maxd = 0.0f32;
-        for i in off..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in off..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[attn decode] decode-row max diff {maxd:.3e}");
         assert!(maxd < 1e-3, "Metal decode attention diverges: {maxd:.3e}");
     }
@@ -1322,7 +1789,10 @@ mod tests {
     fn metal_store_after_gpu_op() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let mut gb = GraphBuilder::new();
         let pos = gb.input("positions", [2, 1, 1, 1], DType::I32);
         let q = gb.input("q", [8, 2, 1, 1], DType::F32);
@@ -1331,16 +1801,32 @@ mod tests {
         let ks = gb.silu(k); // GPU-computed K input
         gb.kvcache_store(0, ks, v, pos, 16);
         let kv = gb.kvcache_load(0, 8, 16, 2);
-        let o = gb.attn(q, kv, pos, crate::graph::ops::AttnMode::Gqa,
+        let o = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
             crate::graph::ops::AttnMeta {
-                layer: 0, n_head: 2, n_head_kv: 2, hd: 4, hd_kv: 4, nkt: 8,
+                layer: 0,
+                n_head: 2,
+                n_head_kv: 2,
+                hd: 4,
+                hd_kv: 4,
+                nkt: 8,
                 scale: 0.5,
-            });
+            },
+        );
         gb.output(o);
         let g = gb.build();
-        let qd: Vec<f32> = (0..16).map(|i| ((i * 13) % 29) as f32 / 10.0 - 1.4).collect();
-        let kd: Vec<f32> = (0..16).map(|i| ((i * 17) % 31) as f32 / 10.0 - 1.5).collect();
-        let vd: Vec<f32> = (0..16).map(|i| ((i * 19) % 37) as f32 / 10.0 - 1.8).collect();
+        let qd: Vec<f32> = (0..16)
+            .map(|i| ((i * 13) % 29) as f32 / 10.0 - 1.4)
+            .collect();
+        let kd: Vec<f32> = (0..16)
+            .map(|i| ((i * 17) % 31) as f32 / 10.0 - 1.5)
+            .collect();
+        let vd: Vec<f32> = (0..16)
+            .map(|i| ((i * 19) % 37) as f32 / 10.0 - 1.8)
+            .collect();
         let mut sched = BackendScheduler::new();
         let mut ca = GraphAllocator::new();
         ca.alloc_graph(&g).unwrap();
@@ -1351,7 +1837,9 @@ mod tests {
         sched.execute(&g, &mut ca).unwrap();
         let expect = ca.get_buffer(&g, o).unwrap().to_vec();
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1362,7 +1850,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(o).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[store after gpu op] max diff {maxd:.3e}");
         assert!(maxd < 1e-4, "store-after-gpu-op diverges: {maxd:.3e}");
     }
@@ -1372,7 +1862,10 @@ mod tests {
     fn metal_store_real_dims() {
         let _g = crate::metal::metal_test_lock();
         crate::metal::MpsState::init();
-        let Some(_b) = MetalBackend::new() else { eprintln!("MPS unavailable; skipping"); return; };
+        let Some(_b) = MetalBackend::new() else {
+            eprintln!("MPS unavailable; skipping");
+            return;
+        };
         let (nh, nk, hd, nkt) = (14usize, 2usize, 64usize, 128usize);
         let nt = 30usize;
         let nqt = nh * hd;
@@ -1383,16 +1876,32 @@ mod tests {
         let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
         gb.kvcache_store(0, k, v, pos, 32768);
         let kv = gb.kvcache_load(0, nkt, 32768, nk);
-        let o = gb.attn(q, kv, pos, crate::graph::ops::AttnMode::Gqa,
+        let o = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
             crate::graph::ops::AttnMeta {
-                layer: 0, n_head: nh, n_head_kv: nk, hd, hd_kv: nkt / nk, nkt,
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: nkt / nk,
+                nkt,
                 scale: 1.0 / (hd as f32).sqrt(),
-            });
+            },
+        );
         gb.output(o);
         let g = gb.build();
-        let qd: Vec<f32> = (0..nqt * nt).map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2).collect();
-        let kd: Vec<f32> = (0..nkt * nt).map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3).collect();
-        let vd: Vec<f32> = (0..nkt * nt).map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1).collect();
+        let qd: Vec<f32> = (0..nqt * nt)
+            .map(|i| ((i * 13) % 997) as f32 / 400.0 - 1.2)
+            .collect();
+        let kd: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 17) % 991) as f32 / 400.0 - 1.3)
+            .collect();
+        let vd: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 19) % 983) as f32 / 400.0 - 1.1)
+            .collect();
         let posd: Vec<u32> = (0..nt as u32).collect();
         let mut sched = BackendScheduler::new();
         let mut ca = GraphAllocator::new();
@@ -1404,7 +1913,9 @@ mod tests {
         sched.execute(&g, &mut ca).unwrap();
         let expect = ca.get_buffer(&g, o).unwrap().to_vec();
         let mut g2 = g.clone();
-        for n in &mut g2.nodes { n.backend = Some(Tag::Metal); }
+        for n in &mut g2.nodes {
+            n.backend = Some(Tag::Metal);
+        }
         let mut alloc = GraphAllocator::new();
         alloc.enable_metal();
         alloc.alloc_graph(&g2).unwrap();
@@ -1415,7 +1926,9 @@ mod tests {
         sched.execute(&g2, &mut alloc).unwrap();
         let got = alloc.copy_to_cpu(o).unwrap();
         let mut maxd = 0.0f32;
-        for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+        for i in 0..got.len() {
+            maxd = maxd.max((got[i] - expect[i]).abs());
+        }
         eprintln!("[store real dims] max diff {maxd:.3e}");
         assert!(maxd < 1e-3, "store at real dims diverges: {maxd:.3e}");
     }

@@ -27,7 +27,12 @@ pub struct Slot {
 pub fn new_slots(n_slots: usize, n_ctx_total: usize) -> Vec<Slot> {
     let per = n_ctx_total / n_slots.max(1);
     (0..n_slots)
-        .map(|id| Slot { id, state: SlotState::Idle, cache: GraphCache::new(), n_ctx_slot: per })
+        .map(|id| Slot {
+            id,
+            state: SlotState::Idle,
+            cache: GraphCache::new(),
+            n_ctx_slot: per,
+        })
         .collect()
 }
 

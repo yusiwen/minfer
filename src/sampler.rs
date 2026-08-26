@@ -22,7 +22,10 @@ pub fn sample_greedy(logits: &[f32]) -> SampledToken {
             best_id = i as u32;
         }
     }
-    SampledToken { token_id: best_id, logit: best_val }
+    SampledToken {
+        token_id: best_id,
+        logit: best_val,
+    }
 }
 
 /// Combined penalty pass over the tokens in `prev_tokens` (the caller keeps the
@@ -167,7 +170,9 @@ pub fn apply_top_p(logits: &mut [f32], p: f32) {
     // Softmax over the survivors (identical to the old full-array softmax since
     // the masked entries contribute exp(-INF)=0 and 0.0 doesn't change the f64
     // running sum).
-    let max_val = survivors.iter().fold(f32::NEG_INFINITY, |a, &(_, v)| a.max(v));
+    let max_val = survivors
+        .iter()
+        .fold(f32::NEG_INFINITY, |a, &(_, v)| a.max(v));
     let sum: f64 = survivors
         .iter()
         .map(|&(_, v)| ((v - max_val) as f64).exp())
@@ -260,10 +265,16 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
         }
         cumulative += v;
         if r <= cumulative {
-            return SampledToken { token_id: i as u32, logit: v };
+            return SampledToken {
+                token_id: i as u32,
+                logit: v,
+            };
         }
     }
-    SampledToken { token_id: (logits.len() - 1) as u32, logit: logits[logits.len() - 1] }
+    SampledToken {
+        token_id: (logits.len() - 1) as u32,
+        logit: logits[logits.len() - 1],
+    }
 }
 
 /// Complete sampling pipeline: penalties → top-k → top-p → temperature.
@@ -280,7 +291,13 @@ pub fn sample_with_penalties<R: Rng>(
     prev_tokens: &[u32],
     rng: &mut R,
 ) -> SampledToken {
-    apply_penalties(logits, prev_tokens, repeat_penalty, frequency_penalty, presence_penalty);
+    apply_penalties(
+        logits,
+        prev_tokens,
+        repeat_penalty,
+        frequency_penalty,
+        presence_penalty,
+    );
     if temp < 1e-6 {
         return sample_greedy(logits);
     }
@@ -301,7 +318,17 @@ pub fn sample<R: Rng>(
     prev_tokens: &[u32],
     rng: &mut R,
 ) -> SampledToken {
-    sample_with_penalties(logits, temp, top_k, top_p, repeat_penalty, 0.0, 0.0, prev_tokens, rng)
+    sample_with_penalties(
+        logits,
+        temp,
+        top_k,
+        top_p,
+        repeat_penalty,
+        0.0,
+        0.0,
+        prev_tokens,
+        rng,
+    )
 }
 
 #[cfg(test)]
@@ -321,7 +348,11 @@ mod tests {
         // token 3 appears in prev; with penalty 2.0 its positive logit halves
         let mut logits = [1.0f32, 2.0, 3.0, 4.0];
         apply_repetition_penalty(&mut logits, &[3], 2.0);
-        assert!((logits[3] - 2.0).abs() < 1e-6, "positive logit should halve: {}", logits[3]);
+        assert!(
+            (logits[3] - 2.0).abs() < 1e-6,
+            "positive logit should halve: {}",
+            logits[3]
+        );
         // greedy now picks token 2 (3.0) instead of 3
         let s = sample_greedy(&logits);
         assert_eq!(s.token_id, 2);
@@ -329,7 +360,11 @@ mod tests {
         // negative logit gets multiplied (more negative)
         let mut logits = [-4.0f32, -2.0, -1.0, -3.0];
         apply_repetition_penalty(&mut logits, &[3], 2.0);
-        assert!((logits[3] - -6.0).abs() < 1e-6, "negative logit should double: {}", logits[3]);
+        assert!(
+            (logits[3] - -6.0).abs() < 1e-6,
+            "negative logit should double: {}",
+            logits[3]
+        );
     }
 
     #[test]
@@ -355,17 +390,31 @@ mod tests {
         let mut logits = [1.0f32, 2.0, 3.0, 4.0];
         apply_top_p(&mut logits, 0.5);
         // only the top token (index 3) should remain non-masked
-        let kept: Vec<usize> = logits.iter().enumerate()
-            .filter(|(_, &v)| !v.is_infinite() || v > 0.0).map(|(i, _)| i).collect();
-        assert_eq!(kept, vec![3], "only the most probable token should survive p=0.5");
+        let kept: Vec<usize> = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| !v.is_infinite() || v > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![3],
+            "only the most probable token should survive p=0.5"
+        );
         // logits must NOT be overwritten with probabilities
-        assert!((logits[3] - 4.0).abs() < 1e-6, "raw logit preserved: {}", logits[3]);
+        assert!(
+            (logits[3] - 4.0).abs() < 1e-6,
+            "raw logit preserved: {}",
+            logits[3]
+        );
     }
 
     #[test]
     fn test_seeded_sampling_reproducible() {
         let mut logits1 = vec![0.0f32; 100];
-        for (i, v) in logits1.iter_mut().enumerate() { *v = (i as f32) * 0.1; }
+        for (i, v) in logits1.iter_mut().enumerate() {
+            *v = (i as f32) * 0.1;
+        }
         let mut logits2 = logits1.clone();
         let mut rng1 = rand::rngs::StdRng::seed_from_u64(42);
         let mut rng2 = rand::rngs::StdRng::seed_from_u64(42);
@@ -379,7 +428,10 @@ mod tests {
         let mut logits = [1.0f32, 2.0, 3.0, 4.0];
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let s = sample(&mut logits, 0.0, 40, 0.95, 2.0, &[3], &mut rng);
-        assert_eq!(s.token_id, 2, "greedy + penalty should avoid the penalized token");
+        assert_eq!(
+            s.token_id, 2,
+            "greedy + penalty should avoid the penalized token"
+        );
     }
 
     // === Phase 1 (OPENAI-CHAT-API-PLAN.md): frequency/presence penalties ===
@@ -389,7 +441,11 @@ mod tests {
         // token 3 appears twice in the window: logit -= 2 * 0.5 = 1.0
         let mut logits = [1.0f32, 2.0, 3.0, 4.0];
         apply_penalties(&mut logits, &[3, 3], 1.0, 0.5, 0.0);
-        assert!((logits[3] - 3.0).abs() < 1e-6, "2x0.5 subtracted: {}", logits[3]);
+        assert!(
+            (logits[3] - 3.0).abs() < 1e-6,
+            "2x0.5 subtracted: {}",
+            logits[3]
+        );
         // others untouched when repeat == 1.0
         assert_eq!(logits[0], 1.0);
         assert_eq!(logits[1], 2.0);
@@ -404,7 +460,11 @@ mod tests {
         assert!((a[3] - 3.2).abs() < 1e-6, "presence once: {}", a[3]);
         let mut b = [1.0f32, 2.0, 3.0, 4.0];
         apply_penalties(&mut b, &[3, 3], 1.0, 0.0, 0.8);
-        assert!((b[3] - 3.2).abs() < 1e-6, "presence is per-token, not per-occurrence: {}", b[3]);
+        assert!(
+            (b[3] - 3.2).abs() < 1e-6,
+            "presence is per-token, not per-occurrence: {}",
+            b[3]
+        );
     }
 
     #[test]
@@ -413,7 +473,11 @@ mod tests {
         let mut logits = [4.0f32, -4.0, 0.0, 0.0];
         // token 0: 4.0 - 1*1.0(freq) - 1.0(presence) = 2.0, repeat 2.0 => 1.0
         apply_penalties(&mut logits, &[0], 2.0, 1.0, 1.0);
-        assert!((logits[0] - 1.0).abs() < 1e-6, "4 - 2 then /2: {}", logits[0]);
+        assert!(
+            (logits[0] - 1.0).abs() < 1e-6,
+            "4 - 2 then /2: {}",
+            logits[0]
+        );
         // tokens not in the window are untouched
         assert_eq!(logits[1], -4.0);
         assert_eq!(logits[2], 0.0);
@@ -421,7 +485,11 @@ mod tests {
         // negative logit in the window: repeat multiplies (no freq/presence)
         let mut logits = [4.0f32, -4.0, 0.0, 0.0];
         apply_penalties(&mut logits, &[1], 2.0, 0.0, 0.0);
-        assert!((logits[1] - -8.0).abs() < 1e-6, "negative * repeat: {}", logits[1]);
+        assert!(
+            (logits[1] - -8.0).abs() < 1e-6,
+            "negative * repeat: {}",
+            logits[1]
+        );
         assert_eq!(logits[0], 4.0);
         assert_eq!(logits[2], 0.0);
     }
@@ -491,8 +559,15 @@ mod tests {
     fn test_stop_suffix_multibyte_split_across_tokens() {
         // U+4E2D = E4 B8 AD; first two bytes arrive in one token, last byte next
         let partial = [0xE4u8, 0xB8];
-        assert_eq!(match_stop_suffix(&partial, &[&[0xE4, 0xB8, 0xAD]]), None, "stop longer than buf");
+        assert_eq!(
+            match_stop_suffix(&partial, &[&[0xE4, 0xB8, 0xAD]]),
+            None,
+            "stop longer than buf"
+        );
         let complete = [0xE4u8, 0xB8, 0xAD, 0xE4, 0xB8, 0xAD];
-        assert_eq!(match_stop_suffix(&complete, &[&[0xE4, 0xB8, 0xAD]]), Some(3));
+        assert_eq!(
+            match_stop_suffix(&complete, &[&[0xE4, 0xB8, 0xAD]]),
+            Some(3)
+        );
     }
 }

@@ -2,16 +2,20 @@
 //   CPU (AVX2/NEON/scalar) is always available as fallback.
 //   MPS (Apple Silicon GPU) is enabled at runtime when Metal is available.
 
+use crate::block::{Q41B, Q4B, Q4KB, Q6KB, Q8B, Q8KB};
 use crate::tensor::{Tensor, TensorType};
-use crate::block::{Q4B, Q41B, Q8B, Q4KB, Q6KB, Q8KB};
 
 /// CPU fallback for f32 activation: quantize → call existing dot product.
 /// K-quant weights (Q4_K/Q5_K/Q6_K) quantize activations to Q8_K (256-element
 /// blocks with precomputed bsums — llama.cpp's format, so the dots never
 /// re-reduce the activation); the simple types keep Q8_0.
 pub fn cpu_quant_matmul_f32(
-    w: &Tensor, x: &[f32], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
+    w: &Tensor,
+    x: &[f32],
+    out: &mut [f32],
+    od: usize,
+    id: usize,
+    nt: usize,
 ) {
     match w.ttype {
         TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K => {
@@ -65,7 +69,8 @@ pub fn cpu_threads() -> usize {
         {
             // hw.perflevel0.logicalcpu = performance-core count (10 on M4 Pro).
             if let Ok(out) = std::process::Command::new("sysctl")
-                .args(["-n", "hw.perflevel0.logicalcpu"]).output()
+                .args(["-n", "hw.perflevel0.logicalcpu"])
+                .output()
             {
                 if let Ok(s) = String::from_utf8(out.stdout) {
                     if let Ok(n) = s.trim().parse::<usize>() {
@@ -76,7 +81,9 @@ pub fn cpu_threads() -> usize {
                 }
             }
         }
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     })
 }
 
@@ -300,10 +307,7 @@ fn get_pool(n_workers: usize) -> Arc<Pool> {
 /// Threaded row-parallel matmul. Each row is computed by exactly one worker
 /// with the identical code path as the single-threaded loop, so the output is
 /// bit-identical regardless of thread count. Small matmuls run inline.
-pub fn cpu_quant_matmul(
-    w: &Tensor, x: &[u8], out: &mut [f32],
-    od: usize, id: usize, nt: usize,
-) {
+pub fn cpu_quant_matmul(w: &Tensor, x: &[u8], out: &mut [f32], od: usize, id: usize, nt: usize) {
     // SAFETY: w.data()/x/out are borrowed by the caller for the whole call;
     // mm_rows only touches row o of out from the owner of chunk containing o.
     let job = MmJob {
@@ -374,74 +378,128 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
     match t.ttype {
         TensorType::Q4_0 | TensorType::Q8_0 | TensorType::Q4_1 => {
             let is_q4_1 = t.ttype == TensorType::Q4_1;
-            let blk = 32usize; let nbp = (ne + blk - 1) / blk; let bb = t.ttype.type_size();
+            let blk = 32usize;
+            let nbp = (ne + blk - 1) / blk;
+            let bb = t.ttype.type_size();
             let is8 = t.ttype == TensorType::Q8_0;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for b in 0..nbp {
                     let off = (idx * nbp + b) * bb;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-                    let m = if is_q4_1 { crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]])) } else { 0.0 };
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off],
+                        t.data[off + 1],
+                    ]));
+                    let m = if is_q4_1 {
+                        crate::block::fp16_to_f32(u16::from_le_bytes([
+                            t.data[off + 2],
+                            t.data[off + 3],
+                        ]))
+                    } else {
+                        0.0
+                    };
                     let mv = blk.min(ne - b * blk);
-                    if is8 { for j in 0..mv { out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d; } }
-                    else if is_q4_1 {
+                    if is8 {
+                        for j in 0..mv {
+                            out[doff + b * blk + j] = (t.data[off + 2 + j] as i8) as f32 * d;
+                        }
+                    } else if is_q4_1 {
                         for j in 0..16 {
                             let byte = t.data[off + 4 + j];
-                            if j < mv { out[doff + b * blk + j] = (byte & 0x0F) as f32 * d + m; }
-                            if j + 16 < mv { out[doff + b * blk + j + 16] = (byte >> 4) as f32 * d + m; }
+                            if j < mv {
+                                out[doff + b * blk + j] = (byte & 0x0F) as f32 * d + m;
+                            }
+                            if j + 16 < mv {
+                                out[doff + b * blk + j + 16] = (byte >> 4) as f32 * d + m;
+                            }
                         }
                     } else {
                         for j in 0..16 {
                             let byte = t.data[off + 2 + j];
-                            if j < mv { out[doff + b * blk + j] = ((byte & 0x0F) as i8 - 8) as f32 * d; }
-                            if j + 16 < mv { out[doff + b * blk + j + 16] = ((byte >> 4) as i8 - 8) as f32 * d; }
+                            if j < mv {
+                                out[doff + b * blk + j] = ((byte & 0x0F) as i8 - 8) as f32 * d;
+                            }
+                            if j + 16 < mv {
+                                out[doff + b * blk + j + 16] = ((byte >> 4) as i8 - 8) as f32 * d;
+                            }
                         }
                     }
                 }
             }
         }
         TensorType::Q5_0 => {
-            let blk = 32usize; let nbp = (ne + blk - 1) / blk; let bb = 22usize;
+            let blk = 32usize;
+            let nbp = (ne + blk - 1) / blk;
+            let bb = 22usize;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for b in 0..nbp {
                     let off = (idx * nbp + b) * bb;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-                    let qh = u32::from_le_bytes([t.data[off+2], t.data[off+3], t.data[off+4], t.data[off+5]]);
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off],
+                        t.data[off + 1],
+                    ]));
+                    let qh = u32::from_le_bytes([
+                        t.data[off + 2],
+                        t.data[off + 3],
+                        t.data[off + 4],
+                        t.data[off + 5],
+                    ]);
                     let qs = &t.data[off + 6..off + 22];
                     let mv = blk.min(ne - b * blk);
                     for j in 0..16 {
                         let xh0 = ((qh >> j) & 1) as u32;
                         let xh1 = ((qh >> (j + 16)) & 1) as u32;
                         if j < mv {
-                            out[doff + b * blk + j] = (((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) - 16) as f32 * d;
+                            out[doff + b * blk + j] =
+                                (((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) - 16) as f32 * d;
                         }
                         if j + 16 < mv {
-                            out[doff + b * blk + j + 16] = ((((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) - 16) as f32 * d;
+                            out[doff + b * blk + j + 16] =
+                                ((((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) - 16) as f32
+                                    * d;
                         }
                     }
                 }
             }
         }
         TensorType::Q5_1 => {
-            let blk = 32usize; let nbp = (ne + blk - 1) / blk; let bb = 24usize;
+            let blk = 32usize;
+            let nbp = (ne + blk - 1) / blk;
+            let bb = 24usize;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for b in 0..nbp {
                     let off = (idx * nbp + b) * bb;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-                    let m = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
-                    let qh = u32::from_le_bytes([t.data[off+4], t.data[off+5], t.data[off+6], t.data[off+7]]);
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off],
+                        t.data[off + 1],
+                    ]));
+                    let m = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off + 2],
+                        t.data[off + 3],
+                    ]));
+                    let qh = u32::from_le_bytes([
+                        t.data[off + 4],
+                        t.data[off + 5],
+                        t.data[off + 6],
+                        t.data[off + 7],
+                    ]);
                     let qs = &t.data[off + 8..off + 24];
                     let mv = blk.min(ne - b * blk);
                     for j in 0..16 {
                         let xh0 = ((qh >> j) & 1) as u32;
                         let xh1 = ((qh >> (j + 16)) & 1) as u32;
                         if j < mv {
-                            out[doff + b * blk + j] = ((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) as f32 * d + m;
+                            out[doff + b * blk + j] =
+                                ((qs[j] & 0x0F) as i32 | ((xh0 << 4) as i32)) as f32 * d + m;
                         }
                         if j + 16 < mv {
-                            out[doff + b * blk + j + 16] = (((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) as f32 * d + m;
+                            out[doff + b * blk + j + 16] =
+                                (((qs[j] >> 4) & 0x0F) as i32 | ((xh1 << 4) as i32)) as f32 * d + m;
                         }
                     }
                 }
@@ -450,11 +508,18 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
         TensorType::Q4_K => {
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for s in 0..n_super {
                     let off = (idx * n_super + s) * Q4KB;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-                    let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off],
+                        t.data[off + 1],
+                    ]));
+                    let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off + 2],
+                        t.data[off + 3],
+                    ]));
                     let sc_arr: &[u8; 12] = t.data[off + 4..off + 16].try_into().unwrap();
                     let (scales, mins) = crate::block::unpack_q4k_scales(sc_arr);
                     let qs = &t.data[off + 16..off + 144];
@@ -474,7 +539,8 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
                     for sub in 0..8 {
                         let sc_val = scales[sub];
                         let mm_val = mins[sub];
-                        let dl = d * sc_val as f32; let ml = dmin * mm_val as f32;
+                        let dl = d * sc_val as f32;
+                        let ml = dmin * mm_val as f32;
                         let base = doff + s * 256 + sub * 32;
                         for k in 0..32 {
                             out[base + k] = dl * nibbles[sub * 32 + k] as f32 - ml;
@@ -487,11 +553,18 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
             let q5_kb: usize = 176;
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for s in 0..n_super {
                     let off = (idx * n_super + s) * q5_kb;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off], t.data[off + 1]]));
-                    let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 2], t.data[off + 3]]));
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off],
+                        t.data[off + 1],
+                    ]));
+                    let dmin = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off + 2],
+                        t.data[off + 3],
+                    ]));
                     let sc_arr: &[u8; 12] = t.data[off + 4..off + 16].try_into().unwrap();
                     let (scales, mins) = crate::block::unpack_q4k_scales(sc_arr);
                     let qh = &t.data[off + 16..off + 48];
@@ -525,10 +598,14 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
         TensorType::Q6_K => {
             let n_super = (ne + 255) / 256;
             for (ti, &id) in ids.iter().enumerate() {
-                let idx = id as usize; let doff = ti * ne;
+                let idx = id as usize;
+                let doff = ti * ne;
                 for s in 0..n_super {
                     let off = (idx * n_super + s) * Q6KB;
-                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([t.data[off + 208], t.data[off + 209]]));
+                    let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                        t.data[off + 208],
+                        t.data[off + 209],
+                    ]));
                     let base_out = doff + s * 256;
 
                     let ql = &t.data[off..off + 128];
@@ -543,15 +620,26 @@ pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne:
                             let is = l / 16;
                             let si = is + n * 8;
 
-                            let q0 = (((ql[ql_off + l] & 0xF) as i32) | ((((qh[qh_off + l] >> 0) & 3) as i32) << 4)) - 32;
-                            let q1 = (((ql[ql_off + l + 32] & 0xF) as i32) | ((((qh[qh_off + l] >> 2) & 3) as i32) << 4)) - 32;
-                            let q2 = (((ql[ql_off + l] >> 4) as i32) | ((((qh[qh_off + l] >> 4) & 3) as i32) << 4)) - 32;
-                            let q3 = (((ql[ql_off + l + 32] >> 4) as i32) | ((((qh[qh_off + l] >> 6) & 3) as i32) << 4)) - 32;
+                            let q0 = (((ql[ql_off + l] & 0xF) as i32)
+                                | ((((qh[qh_off + l] >> 0) & 3) as i32) << 4))
+                                - 32;
+                            let q1 = (((ql[ql_off + l + 32] & 0xF) as i32)
+                                | ((((qh[qh_off + l] >> 2) & 3) as i32) << 4))
+                                - 32;
+                            let q2 = (((ql[ql_off + l] >> 4) as i32)
+                                | ((((qh[qh_off + l] >> 4) & 3) as i32) << 4))
+                                - 32;
+                            let q3 = (((ql[ql_off + l + 32] >> 4) as i32)
+                                | ((((qh[qh_off + l] >> 6) & 3) as i32) << 4))
+                                - 32;
 
-                            out[base_out + out_off + l]      = d * (sc[si + 0] as i8 as f32) * q0 as f32;
-                            out[base_out + out_off + l + 32] = d * (sc[si + 2] as i8 as f32) * q1 as f32;
-                            out[base_out + out_off + l + 64] = d * (sc[si + 4] as i8 as f32) * q2 as f32;
-                            out[base_out + out_off + l + 96] = d * (sc[si + 6] as i8 as f32) * q3 as f32;
+                            out[base_out + out_off + l] = d * (sc[si + 0] as i8 as f32) * q0 as f32;
+                            out[base_out + out_off + l + 32] =
+                                d * (sc[si + 2] as i8 as f32) * q1 as f32;
+                            out[base_out + out_off + l + 64] =
+                                d * (sc[si + 4] as i8 as f32) * q2 as f32;
+                            out[base_out + out_off + l + 96] =
+                                d * (sc[si + 6] as i8 as f32) * q3 as f32;
                         }
                     }
                 }

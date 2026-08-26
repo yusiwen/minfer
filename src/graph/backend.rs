@@ -52,6 +52,8 @@ pub trait Backend: Send + Sync {
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;
 
     /// Wait for async work to complete (CPU: no-op; Metal: submit the pending
-    /// command buffer). Called between splits and after the last split.
+    /// command buffer). Called between splits and after the last split; only the
+    /// Metal path invokes it today, so a CPU-only build never calls it.
+    #[allow(dead_code)]
     fn synchronize(&mut self);
 }

@@ -21,8 +21,11 @@ extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
     fn cudaGraphInstantiate(
-        exec: *mut *mut c_void, graph: *mut c_void,
-        err_node: *mut c_void, log_buf: *mut c_void, buf_size: usize,
+        exec: *mut *mut c_void,
+        graph: *mut c_void,
+        err_node: *mut c_void,
+        log_buf: *mut c_void,
+        buf_size: usize,
     ) -> i32;
     fn cudaGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
     fn cudaGraphDestroy(graph: *mut c_void) -> i32;
@@ -32,15 +35,16 @@ extern "C" {
 // ─── Kernel Launch FFI (from cuda_kernels.cu) ───────────────────
 extern "C" {
     fn launch_rms_norm_f32(
-        x: *const f32, w: *const f32, y: *mut f32,
-        d: i32, eps: f32, n: i32, stream: *mut c_void,
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        d: i32,
+        eps: f32,
+        n: i32,
+        stream: *mut c_void,
     );
-    fn launch_add_f32(
-        x: *const f32, y: *const f32, z: *mut f32, n: i32, stream: *mut c_void,
-    );
-    fn launch_quantize_q8_0(
-        x: *const f32, y: *mut u8, dim: i32, nt: i32, stream: *mut c_void,
-    );
+    fn launch_add_f32(x: *const f32, y: *const f32, z: *mut f32, n: i32, stream: *mut c_void);
+    fn launch_quantize_q8_0(x: *const f32, y: *mut u8, dim: i32, nt: i32, stream: *mut c_void);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -73,13 +77,20 @@ fn test_simple_kernel(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32)
 
         let err = unsafe { cudaStreamBeginCapture(stream, mode) };
         println!("    begin capture: {err}");
-        if err != 0 { continue; }
+        if err != 0 {
+            continue;
+        }
 
         // Launch rms_norm via FFI (same call path as cuda.rs)
         unsafe {
             launch_rms_norm_f32(
-                dummy_a as *const f32, dummy_b as *const f32, dummy_a,
-                896, 1e-5, 1, stream,
+                dummy_a as *const f32,
+                dummy_b as *const f32,
+                dummy_a,
+                896,
+                1e-5,
+                1,
+                stream,
             );
         }
         check("rms_norm kernel");
@@ -88,17 +99,27 @@ fn test_simple_kernel(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32)
         let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
         println!("    end capture: {err}  graph={graph:p}");
         if err != 0 || graph.is_null() {
-            unsafe { cudaGetLastError(); }
+            unsafe {
+                cudaGetLastError();
+            }
             continue;
         }
 
         let mut exec: *mut c_void = std::ptr::null_mut();
         let err = unsafe {
-            cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+            cudaGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         println!("    instantiate: {err}");
         if err != 0 {
-            unsafe { cudaGraphDestroy(graph); }
+            unsafe {
+                cudaGraphDestroy(graph);
+            }
             continue;
         }
 
@@ -123,12 +144,20 @@ fn test_stream_reuse(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
     println!("  -- simulated prefill --");
     unsafe {
         launch_rms_norm_f32(
-            dummy_a as *const f32, dummy_b as *const f32, dummy_a,
-            896, 1e-5, 1, stream,
+            dummy_a as *const f32,
+            dummy_b as *const f32,
+            dummy_a,
+            896,
+            1e-5,
+            1,
+            stream,
         );
         launch_add_f32(
-            dummy_a as *const f32, dummy_b as *const f32, dummy_a,
-            896, stream,
+            dummy_a as *const f32,
+            dummy_b as *const f32,
+            dummy_a,
+            896,
+            stream,
         );
     }
     // Sync prefill
@@ -148,8 +177,13 @@ fn test_stream_reuse(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
 
     unsafe {
         launch_rms_norm_f32(
-            dummy_a as *const f32, dummy_b as *const f32, dummy_a,
-            896, 1e-5, 1, stream,
+            dummy_a as *const f32,
+            dummy_b as *const f32,
+            dummy_a,
+            896,
+            1e-5,
+            1,
+            stream,
         );
     }
     check("kernel during capture");
@@ -165,17 +199,31 @@ fn test_stream_reuse(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
 
     let mut exec: *mut c_void = std::ptr::null_mut();
     let err = unsafe {
-        cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        cudaGraphInstantiate(
+            &mut exec,
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
     };
     println!("    instantiate: {err}");
-    if err != 0 { unsafe { cudaGraphDestroy(graph); }; return; }
+    if err != 0 {
+        unsafe {
+            cudaGraphDestroy(graph);
+        };
+        return;
+    }
 
     let err = unsafe { cudaGraphLaunch(exec, stream) };
     println!("    launch: {err}");
     let err = unsafe { cudaStreamSynchronize(stream) };
     println!("    sync: {err}");
 
-    unsafe { cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); }
+    unsafe {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+    }
 }
 
 // ─── Test: multi-kernel capture (like layer_gpu) via FFI ────────
@@ -189,13 +237,20 @@ fn test_multi_kernel(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
 
     let err = unsafe { cudaStreamBeginCapture(stream, 2) }; // Relaxed
     println!("    begin capture: {err}");
-    if err != 0 { return; }
+    if err != 0 {
+        return;
+    }
 
     // Kernel 1: rms_norm
     unsafe {
         launch_rms_norm_f32(
-            dummy_a as *const f32, dummy_b as *const f32, dummy_a,
-            ne as i32, 1e-5, nt as i32, stream,
+            dummy_a as *const f32,
+            dummy_b as *const f32,
+            dummy_a,
+            ne as i32,
+            1e-5,
+            nt as i32,
+            stream,
         );
     }
     check("  [1/3] rms_norm");
@@ -203,17 +258,18 @@ fn test_multi_kernel(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
     // Kernel 2: add
     unsafe {
         launch_add_f32(
-            dummy_a as *const f32, dummy_b as *const f32, dummy_b,
-            ne as i32, stream,
+            dummy_a as *const f32,
+            dummy_b as *const f32,
+            dummy_b,
+            ne as i32,
+            stream,
         );
     }
     check("  [2/3] add");
 
     // Kernel 3: quantize_q8_0
     unsafe {
-        launch_quantize_q8_0(
-            dummy_a as *const f32, q8_buf, ne as i32, nt as i32, stream,
-        );
+        launch_quantize_q8_0(dummy_a as *const f32, q8_buf, ne as i32, nt as i32, stream);
     }
     check("  [3/3] quantize_q8_0");
 
@@ -223,17 +279,27 @@ fn test_multi_kernel(stream: *mut c_void, dummy_a: *mut f32, dummy_b: *mut f32) 
     if err != 0 || graph.is_null() {
         let le = unsafe { cudaGetLastError() };
         println!("    cudaGetLastError after end: {le}");
-        unsafe { cudaFree(q8_buf as *mut c_void); }
+        unsafe {
+            cudaFree(q8_buf as *mut c_void);
+        }
         return;
     }
 
     let mut exec: *mut c_void = std::ptr::null_mut();
     let err = unsafe {
-        cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        cudaGraphInstantiate(
+            &mut exec,
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
     };
     println!("    instantiate: {err}");
     if err != 0 {
-        unsafe { cudaGraphDestroy(graph); }
+        unsafe {
+            cudaGraphDestroy(graph);
+        }
         return;
     }
 
@@ -256,13 +322,20 @@ fn test_malloc_during_capture(stream: *mut c_void, dummy_a: *mut f32) {
 
     let err = unsafe { cudaStreamBeginCapture(stream, 2) };
     println!("    begin capture: {err}");
-    if err != 0 { return; }
+    if err != 0 {
+        return;
+    }
 
     // Kernel launch
     unsafe {
         launch_rms_norm_f32(
-            dummy_a as *const f32, dummy_a as *const f32, dummy_a,
-            896, 1e-5, 1, stream,
+            dummy_a as *const f32,
+            dummy_a as *const f32,
+            dummy_a,
+            896,
+            1e-5,
+            1,
+            stream,
         );
     }
     check("  kernel launch");
@@ -273,14 +346,18 @@ fn test_malloc_during_capture(stream: *mut c_void, dummy_a: *mut f32) {
     println!("    cudaMalloc during capture: {alloc_err}");
 
     if !test_ptr.is_null() {
-        unsafe { cudaFree(test_ptr); }
+        unsafe {
+            cudaFree(test_ptr);
+        }
     }
 
     let mut graph: *mut c_void = std::ptr::null_mut();
     let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
     println!("    end capture: {err}");
     if err == 0 && !graph.is_null() {
-        unsafe { cudaGraphDestroy(graph); }
+        unsafe {
+            cudaGraphDestroy(graph);
+        }
     }
     let le = unsafe { cudaGetLastError() };
     println!("    cudaGetLastError after cleanup: {le}");
@@ -316,7 +393,9 @@ fn main() {
         }
     }
     println!("Selected device {best_dev}\n");
-    unsafe { cudaSetDevice(best_dev); }
+    unsafe {
+        cudaSetDevice(best_dev);
+    }
 
     // ── Create stream ──
     let mut stream: *mut c_void = std::ptr::null_mut();

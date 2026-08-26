@@ -1,34 +1,38 @@
 // End-to-End Inference Engine
 
-mod gguf;
 mod block;
-mod quants;
-mod kernel;
-mod tensor;
-mod vec_ops;
-mod graph;
-mod sampler;
-mod tokenizer;
-mod template;
-mod conversation;
 mod cache;
-mod models;
-#[cfg(target_os = "macos")]
-mod metal;
+mod conversation;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod download;
-mod trace;
-mod live;
 mod dump;
+mod gguf;
+mod graph;
+mod kernel;
+mod live;
+#[cfg(target_os = "macos")]
+mod metal;
+mod models;
+mod quants;
+mod sampler;
 mod server;
+mod template;
+mod tensor;
+mod tokenizer;
+mod trace;
+mod vec_ops;
 
-use std::time::Instant;
 use rand::SeedableRng;
+use std::time::Instant;
 
 /// Conversation-mode color behavior (CLI-CONVERSATION-PLAN.md §5.6).
 #[derive(Clone, Copy, PartialEq)]
-enum ColorMode { On, Off, Auto }
+enum ColorMode {
+    On,
+    Off,
+    Auto,
+}
 
 impl ColorMode {
     fn enabled(self) -> bool {
@@ -58,10 +62,10 @@ impl Default for GenParams {
     fn default() -> Self {
         Self {
             n_predict: 512,
-            temp: 0.8,          // llama.cpp default (sampling, not greedy)
+            temp: 0.8, // llama.cpp default (sampling, not greedy)
             top_k: 40,
-            top_p: 0.95,        // llama.cpp default
-            repeat_penalty: 1.1, // 1.0 = disabled; mild penalty reduces repetition
+            top_p: 0.95,            // llama.cpp default
+            repeat_penalty: 1.1,    // 1.0 = disabled; mild penalty reduces repetition
             frequency_penalty: 0.0, // llama.cpp default (0.0 = disabled)
             presence_penalty: 0.0,  // llama.cpp default (0.0 = disabled)
             seed: 42,
@@ -113,11 +117,19 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --server             run as an OpenAI-compatible HTTP server");
     eprintln!("  --port <N>           server port (default 8080)");
-    eprintln!("  --viz [PORT]         self-contained viz server (web page + live SSE, default port 8081)");
-    eprintln!("  --n-ctx <N>          context size (default 4096; server: total, divided among slots)");
-    eprintln!("                       single-shot / --cnv: sizes the KV cache, clamped to the model's");
+    eprintln!(
+        "  --viz [PORT]         self-contained viz server (web page + live SSE, default port 8081)"
+    );
+    eprintln!(
+        "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
+    );
+    eprintln!(
+        "                       single-shot / --cnv: sizes the KV cache, clamped to the model's"
+    );
     eprintln!("                       max context (e.g. Qwen3-4B 40960); server: total context");
-    eprintln!("  -t, --threads <N>    CPU worker threads (default: performance cores, e.g. 10 on M4 Pro;");
+    eprintln!(
+        "  -t, --threads <N>    CPU worker threads (default: performance cores, e.g. 10 on M4 Pro;"
+    );
     eprintln!("                       1 = single-threaded; affects the CPU-only path)");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
     eprintln!("  --dump-graph <PATH>       export the compute graph as Graphviz DOT and exit");
@@ -178,7 +190,10 @@ fn main() {
                 println!("minfer {}", env!("MINFER_VERSION"));
                 std::process::exit(0);
             }
-            "--server" => { server_mode = true; i += 1; }
+            "--server" => {
+                server_mode = true;
+                i += 1;
+            }
             "--viz" => {
                 // Optional port value: `--viz 8081` (bare `--viz` → 8081).
                 viz_mode = true;
@@ -195,41 +210,68 @@ fn main() {
             }
             "--port" => {
                 if let Some(v) = next_val(a) {
-                    server_port = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --port '{v}'")); 8080 });
+                    server_port = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --port '{v}'"));
+                        8080
+                    });
                 }
                 i += 2;
             }
             "--n-ctx" => {
                 if let Some(v) = next_val(a) {
-                    server_n_ctx = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --n-ctx '{v}'")); 4096 });
+                    server_n_ctx = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --n-ctx '{v}'"));
+                        4096
+                    });
                     params.n_ctx = server_n_ctx;
                 }
                 i += 2;
             }
             "-t" | "--threads" => {
                 if let Some(v) = next_val(a) {
-                    let n = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --threads '{v}'")); 0 });
+                    let n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --threads '{v}'"));
+                        0
+                    });
                     crate::kernel::set_cpu_threads(n);
                 }
                 i += 2;
             }
             "--n-slots" => {
                 if let Some(v) = next_val(a) {
-                    server_n_slots = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --n-slots '{v}'")); 1 });
+                    server_n_slots = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --n-slots '{v}'"));
+                        1
+                    });
                 }
                 i += 2;
             }
-            "--meta" => { meta_flag = true; i += 1; }
-            "--no-template" => { no_template = true; i += 1; }
-            "--cnv" | "--conversation" => { conv_mode = true; i += 1; }
-            "-st" | "--single-turn" => { single_turn = true; i += 1; }
+            "--meta" => {
+                meta_flag = true;
+                i += 1;
+            }
+            "--no-template" => {
+                no_template = true;
+                i += 1;
+            }
+            "--cnv" | "--conversation" => {
+                conv_mode = true;
+                i += 1;
+            }
+            "-st" | "--single-turn" => {
+                single_turn = true;
+                i += 1;
+            }
             "--system" => {
                 if let Some(v) = next_val(a) {
                     system_prompt = Some(v);
                 }
                 i += 2;
             }
-            "-mli" | "--multiline-input" => { multiline_input = true; i += 1; }
+            "-mli" | "--multiline-input" => {
+                multiline_input = true;
+                i += 1;
+            }
             "--session" => {
                 if let Some(v) = next_val(a) {
                     session_file = Some(v);
@@ -242,45 +284,69 @@ fn main() {
                         "on" => ColorMode::On,
                         "off" => ColorMode::Off,
                         "auto" => ColorMode::Auto,
-                        _ => { parse_err = Some(format!("invalid --color '{v}' (on|off|auto)")); ColorMode::Auto }
+                        _ => {
+                            parse_err = Some(format!("invalid --color '{v}' (on|off|auto)"));
+                            ColorMode::Auto
+                        }
                     };
                 }
                 i += 2;
             }
-            "--greedy" => { params.temp = 0.0; i += 1; }
+            "--greedy" => {
+                params.temp = 0.0;
+                i += 1;
+            }
             "--temp" => {
                 if let Some(v) = next_val(a) {
-                    params.temp = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --temp '{v}'")); 0.0 });
+                    params.temp = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --temp '{v}'"));
+                        0.0
+                    });
                 }
                 i += 2;
             }
             "--top-k" => {
                 if let Some(v) = next_val(a) {
-                    params.top_k = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --top-k '{v}'")); 0 });
+                    params.top_k = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --top-k '{v}'"));
+                        0
+                    });
                 }
                 i += 2;
             }
             "--top-p" => {
                 if let Some(v) = next_val(a) {
-                    params.top_p = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --top-p '{v}'")); 0.0 });
+                    params.top_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --top-p '{v}'"));
+                        0.0
+                    });
                 }
                 i += 2;
             }
             "--repeat-penalty" => {
                 if let Some(v) = next_val(a) {
-                    params.repeat_penalty = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --repeat-penalty '{v}'")); 1.0 });
+                    params.repeat_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --repeat-penalty '{v}'"));
+                        1.0
+                    });
                 }
                 i += 2;
             }
             "--frequency-penalty" => {
                 if let Some(v) = next_val(a) {
-                    params.frequency_penalty = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --frequency-penalty '{v}'")); 0.0 });
+                    params.frequency_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --frequency-penalty '{v}'"));
+                        0.0
+                    });
                 }
                 i += 2;
             }
             "--presence-penalty" => {
                 if let Some(v) = next_val(a) {
-                    params.presence_penalty = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --presence-penalty '{v}'")); 0.0 });
+                    params.presence_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --presence-penalty '{v}'"));
+                        0.0
+                    });
                 }
                 i += 2;
             }
@@ -292,7 +358,10 @@ fn main() {
             }
             "-n" | "--n-predict" => {
                 if let Some(v) = next_val(a) {
-                    params.n_predict = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid -n '{v}'")); 0 });
+                    params.n_predict = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid -n '{v}'"));
+                        0
+                    });
                 }
                 i += 2;
             }
@@ -313,7 +382,10 @@ fn main() {
             }
             "--seed" => {
                 if let Some(v) = next_val(a) {
-                    params.seed = v.parse().unwrap_or_else(|_| { parse_err = Some(format!("invalid --seed '{v}'")); 0 });
+                    params.seed = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --seed '{v}'"));
+                        0
+                    });
                 }
                 i += 2;
             }
@@ -369,7 +441,10 @@ fn main() {
             };
             match download::resolve(&uri) {
                 Ok(p) => println!("Model downloaded: {}", p.display()),
-                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
             return;
         }
@@ -387,16 +462,23 @@ fn main() {
             }
             // Resolve paths, hf:/ollama: URIs, and cached model names.
             let model_path = match download::resolve(&positional[1]) {
-                Ok(p) => { eprintln!("Model ready: {}", p.display()); p.to_string_lossy().to_string() }
-                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+                Ok(p) => {
+                    eprintln!("Model ready: {}", p.display());
+                    p.to_string_lossy().to_string()
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             };
-            let gguf_model = gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
+            let gguf_model =
+                gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
             let ctx = &gguf_model.parts[0].ctx;
             dump_gguf_metadata(ctx);
             dump_key_tensors(ctx);
             return;
         }
-        _ => {}  // fall through to model inference
+        _ => {} // fall through to model inference
     }
 
     let model_path = &positional[0];
@@ -404,7 +486,9 @@ fn main() {
     // Conversation mode needs the chat template (ChatML fallback included);
     // --no-template would leave the history unformatted.
     if conv_mode && no_template {
-        eprintln!("Error: --cnv conflicts with --no-template (conversation needs the chat template)");
+        eprintln!(
+            "Error: --cnv conflicts with --no-template (conversation needs the chat template)"
+        );
         print_usage(&prog);
         std::process::exit(1);
     }
@@ -412,7 +496,9 @@ fn main() {
     // Resolve paths, hf:/ollama: URIs, and cached model names.
     let is_uri = model_path.starts_with("hf:")
         || model_path.starts_with("ollama:")
-        || (!model_path.starts_with('/') && !model_path.starts_with('.') && !model_path.starts_with('~'));
+        || (!model_path.starts_with('/')
+            && !model_path.starts_with('.')
+            && !model_path.starts_with('~'));
     let model_path = match download::resolve(model_path) {
         Ok(p) => {
             if is_uri {
@@ -420,7 +506,10 @@ fn main() {
             }
             p.to_string_lossy().to_string()
         }
-        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     };
     // Conversation mode: the positional prompt is the FIRST user turn; stdin
     // is read interactively by the loop (never consume it here).
@@ -469,7 +558,11 @@ fn main() {
                 } else {
                     eprintln!("       candidates:");
                     for f in &found {
-                        eprintln!("         minfer --viz {}/{}", model_path.trim_end_matches('/'), f);
+                        eprintln!(
+                            "         minfer --viz {}/{}",
+                            model_path.trim_end_matches('/'),
+                            f
+                        );
                     }
                     eprintln!("       or run `minfer list` for cached models");
                 }
@@ -477,14 +570,20 @@ fn main() {
                 eprintln!("Error: file not found: {model_path}");
                 eprintln!("       run `minfer list` to see cached models");
             } else {
-                eprintln!("Error: failed to parse GGUF: {model_path} (not a valid GGUF or corrupt)");
+                eprintln!(
+                    "Error: failed to parse GGUF: {model_path} (not a valid GGUF or corrupt)"
+                );
             }
             std::process::exit(1);
         }
     };
     let n_parts = gguf_model.parts.len();
     let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data.len()).sum();
-    println!("File: {} bytes ({:.1} MB) in {n_parts} part(s)", total_bytes, total_bytes as f64 / 1_048_576.0);
+    println!(
+        "File: {} bytes ({:.1} MB) in {n_parts} part(s)",
+        total_bytes,
+        total_bytes as f64 / 1_048_576.0
+    );
 
     let ctx = &gguf_model.parts[0].ctx;
     if meta_flag {
@@ -532,16 +631,27 @@ fn main() {
             eprintln!("Error: --n-ctx must be >= 1");
             std::process::exit(1);
         }
-        eprintln!("Starting OpenAI-compatible server (model={}, n_ctx={}, n_slots={})",
-            model_path, server_n_ctx, server_n_slots);
-        server::run(model, tokenizer, &gguf_model, server_port, server_n_ctx, server_n_slots);
+        eprintln!(
+            "Starting OpenAI-compatible server (model={}, n_ctx={}, n_slots={})",
+            model_path, server_n_ctx, server_n_slots
+        );
+        server::run(
+            model,
+            tokenizer,
+            &gguf_model,
+            server_port,
+            server_n_ctx,
+            server_n_slots,
+        );
         return;
     }
 
     // === Self-contained viz server (--viz [port]) ===
     if viz_mode {
-        eprintln!("Starting viz server (model={}, n_ctx={}, slots={})",
-            model_path, params.n_ctx, 1);
+        eprintln!(
+            "Starting viz server (model={}, n_ctx={}, slots={})",
+            model_path, params.n_ctx, 1
+        );
         server::viz::run_viz(model, tokenizer, &gguf_model, viz_port, params.n_ctx, 1);
         return;
     }
@@ -567,7 +677,9 @@ fn main() {
     let processed = if no_template {
         prompt.clone()
     } else if let Some(tmpl) = get_chat_template(&gguf_model.parts[0].data) {
-        let bos_text = tokenizer.id_to_token.get(tokenizer.bos_token as usize)
+        let bos_text = tokenizer
+            .id_to_token
+            .get(tokenizer.bos_token as usize)
             .map(|s| s.as_str())
             .unwrap_or("");
         template::render_template(&tmpl, &prompt, true, bos_text)
@@ -577,7 +689,10 @@ fn main() {
     #[cfg(feature = "debug_dump")]
     crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
     let input_ids = tokenizer.encode(&processed);
-    if input_ids.is_empty() { eprintln!("tokenize failed"); std::process::exit(1); }
+    if input_ids.is_empty() {
+        eprintln!("tokenize failed");
+        std::process::exit(1);
+    }
     println!("Prompt: {} tokens", input_ids.len());
 
     // === Prefill ===
@@ -607,9 +722,12 @@ fn main() {
     }
 
     let prefill_time = infer_start.elapsed();
-    println!("Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
-        input_ids.len(), prefill_time.as_secs_f64(),
-        input_ids.len() as f64 / prefill_time.as_secs_f64());
+    println!(
+        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
+        input_ids.len(),
+        prefill_time.as_secs_f64(),
+        input_ids.len() as f64 / prefill_time.as_secs_f64()
+    );
 
     // === Graph export (--dump-graph <dot> / --dump-graph-json <json>) ===
     // Rebuilds the graph the runtime just ran (shared helper: build → assign →
@@ -631,9 +749,18 @@ fn main() {
             .unwrap_or_else(|| model_path.clone());
 
         let doc = export_graph_json(
-            &*model, &model_name, input_ids.len(), params.n_ctx, metal_on, fuse_qkv,
+            &*model,
+            &model_name,
+            input_ids.len(),
+            params.n_ctx,
+            metal_on,
+            fuse_qkv,
         );
-        let kind = if input_ids.len() == 1 { "decode" } else { "prefill" };
+        let kind = if input_ids.len() == 1 {
+            "decode"
+        } else {
+            "prefill"
+        };
         if let Some(path) = &dump_graph {
             // DOT export needs the graph itself (fused, assigned — same as the
             // runtime), so rebuild it via the shared helper.
@@ -659,7 +786,7 @@ fn main() {
     if trace_on {
         crate::trace::begin_phase("decode");
     }
-    let gen_start = Instant::now();   // pure-decode start (llama "Generation" caliber)
+    let gen_start = Instant::now(); // pure-decode start (llama "Generation" caliber)
     let mut generated: Vec<u32> = Vec::new();
     let special = model.special_tokens();
     let mut current_pos = input_ids.len();
@@ -676,7 +803,11 @@ fn main() {
     // string split across tokens is caught even if its earlier tokens were
     // already flushed (they stay in the terminal, like llama.cpp). Output is
     // byte-wise (never lossy), so split multi-byte chars pass through intact.
-    let stop_bytes: Vec<Vec<u8>> = params.stop_strings.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let stop_bytes: Vec<Vec<u8>> = params
+        .stop_strings
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
     let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
     let mut full: Vec<u8> = Vec::new();
     let mut emitted: usize = 0;
@@ -704,13 +835,23 @@ fn main() {
     while generated.len() < params.n_predict {
         t0 = std::time::Instant::now();
         let sampled = sampler::sample_with_penalties(
-            &mut logits, params.temp, params.top_k, params.top_p,
-            params.repeat_penalty, params.frequency_penalty, params.presence_penalty,
-            &prev_tokens, &mut rng,
+            &mut logits,
+            params.temp,
+            params.top_k,
+            params.top_p,
+            params.repeat_penalty,
+            params.frequency_penalty,
+            params.presence_penalty,
+            &prev_tokens,
+            &mut rng,
         );
-        if timing { t_samp += t0.elapsed().as_secs_f64(); }
+        if timing {
+            t_samp += t0.elapsed().as_secs_f64();
+        }
 
-        if is_stop_token(sampled.token_id, &special) { break; }
+        if is_stop_token(sampled.token_id, &special) {
+            break;
+        }
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -735,8 +876,8 @@ fn main() {
         // forward() returns n_out*nv logits (n_out=1 for single-token decode,
         // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
         if trace_on {
-            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
-                .into_owned();
+            let text =
+                String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id])).into_owned();
             crate::trace::set_token(sampled.token_id, &text);
         }
         t1 = std::time::Instant::now();
@@ -744,7 +885,10 @@ fn main() {
         if trace_on {
             crate::trace::attach_step(&logits);
         }
-        if timing { t_fwd += t1.elapsed().as_secs_f64(); n_tok += 1; }
+        if timing {
+            t_fwd += t1.elapsed().as_secs_f64();
+            n_tok += 1;
+        }
         current_pos += 1;
     }
     // Final flush of any bytes not yet written (incl. a dangling partial
@@ -774,14 +918,17 @@ fn main() {
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
-        let fuse_qkv = metal_on
-            && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        let fuse_qkv = metal_on && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
         let prefill_graph = export_graph_json(
-            &*model, &model_name, input_ids.len(), params.n_ctx, metal_on, false,
+            &*model,
+            &model_name,
+            input_ids.len(),
+            params.n_ctx,
+            metal_on,
+            false,
         );
-        let decode_graph = export_graph_json(
-            &*model, &model_name, 1, params.n_ctx, metal_on, fuse_qkv,
-        );
+        let decode_graph =
+            export_graph_json(&*model, &model_name, 1, params.n_ctx, metal_on, fuse_qkv);
         crate::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
     }
 
@@ -792,12 +939,18 @@ fn main() {
     // Pure-decode rate (generated tokens / decode time) — matches llama.cpp's
     // "Generation:" caliber. The "Total:" line below keeps the previous blended
     // caliber (prompt+generated / prefill+decode) for comparison.
-    println!("Generated: {} tokens in {:.2}s ({:.1} tok/s)",
-        generated.len(), gen_time.as_secs_f64(),
-        generated.len() as f64 / gen_time.as_secs_f64());
-    println!("Total:     {} tokens in {:.2}s ({:.1} tok/s)",
-        input_ids.len() + generated.len(), total_time.as_secs_f64(),
-        (input_ids.len() + generated.len()) as f64 / total_time.as_secs_f64());
+    println!(
+        "Generated: {} tokens in {:.2}s ({:.1} tok/s)",
+        generated.len(),
+        gen_time.as_secs_f64(),
+        generated.len() as f64 / gen_time.as_secs_f64()
+    );
+    println!(
+        "Total:     {} tokens in {:.2}s ({:.1} tok/s)",
+        input_ids.len() + generated.len(),
+        total_time.as_secs_f64(),
+        (input_ids.len() + generated.len()) as f64 / total_time.as_secs_f64()
+    );
 }
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -824,7 +977,13 @@ impl<F: FnMut(&[u8])> ThinkHighlighter<F> {
     const GRAY: &'static [u8] = b"\x1b[90m";
 
     fn new(color: bool, exit_code: &'static [u8], sink: F) -> Self {
-        Self { sink, color, exit_code, pending: Vec::new(), in_think: false }
+        Self {
+            sink,
+            color,
+            exit_code,
+            pending: Vec::new(),
+            in_think: false,
+        }
     }
 
     fn feed(&mut self, data: &[u8]) {
@@ -848,7 +1007,11 @@ impl<F: FnMut(&[u8])> ThinkHighlighter<F> {
 
     fn drain_pending(&mut self) {
         loop {
-            let marker = if self.in_think { Self::CLOSE } else { Self::OPEN };
+            let marker = if self.in_think {
+                Self::CLOSE
+            } else {
+                Self::OPEN
+            };
             let Some(pos) = find_subslice(&self.pending, marker) else {
                 // No marker yet: emit everything except the tail that could be
                 // a marker prefix (e.g. "<thin"), keep that for the next chunk.
@@ -942,8 +1105,8 @@ fn run_conversation(
     session_file: Option<String>,
     first_prompt: Option<String>,
 ) -> i32 {
-    use std::io::Write;
-    use crate::conversation::Engine as _; // reset_cache / forward trait methods
+    use crate::conversation::Engine as _;
+    use std::io::Write; // reset_cache / forward trait methods
 
     let template = get_chat_template(gguf_data);
     let special = model.special_tokens();
@@ -979,7 +1142,10 @@ fn run_conversation(
             match conversation::Conversation::messages_from_json(&text) {
                 Some(msgs) => {
                     conv.load_history(msgs, &*tokenizer, &mut engine);
-                    eprintln!("[session] loaded {} message(s) from {path}", conv.messages.len());
+                    eprintln!(
+                        "[session] loaded {} message(s) from {path}",
+                        conv.messages.len()
+                    );
                 }
                 None => eprintln!("[session] ignoring unreadable session file {path}"),
             }
@@ -991,7 +1157,10 @@ fn run_conversation(
         if let Some(path) = &session_file {
             let json = conv.messages_to_json();
             if std::fs::write(path, json).is_ok() {
-                eprintln!("[session] saved {} message(s) to {path}", conv.messages.len());
+                eprintln!(
+                    "[session] saved {} message(s) to {path}",
+                    conv.messages.len()
+                );
             } else {
                 eprintln!("[session] failed to save session to {path}");
             }
@@ -1022,7 +1191,9 @@ fn run_conversation(
                 print!("\x1b[0m");
             }
             std::io::stdout().flush().unwrap_or(());
-            let Some(input) = read_user_input(multiline) else { break };
+            let Some(input) = read_user_input(multiline) else {
+                break;
+            };
             let input = input.trim().to_string();
             if input.is_empty() {
                 continue;
@@ -1107,14 +1278,20 @@ fn run_conversation(
             Ok(out) => {
                 turn += 1;
                 println!();
-                eprintln!("[turn {turn}] prefill {} tokens, generated {} tokens in {:.2}s",
-                    out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "[turn {turn}] prefill {} tokens, generated {} tokens in {:.2}s",
+                    out.prefill_tokens,
+                    out.tokens_generated,
+                    t0.elapsed().as_secs_f64()
+                );
                 if out.hit_n_predict {
                     eprintln!("[turn {turn}] stopped by n_predict / context limit");
                 }
                 if out.dropped_turns > 0 {
-                    eprintln!("[turn {turn}] <<context full: dropped oldest {n} turn(s)>>",
-                        n = out.dropped_turns);
+                    eprintln!(
+                        "[turn {turn}] <<context full: dropped oldest {n} turn(s)>>",
+                        n = out.dropped_turns
+                    );
                 }
             }
             Err(e) => eprintln!("\n[error] {e}"),
@@ -1136,12 +1313,16 @@ fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {
     } else {
         eprint!("  {} (arr:{}) = [", key, label);
         for i in 0..SHOW_PREFIX {
-            if i > 0 { eprint!(", "); }
+            if i > 0 {
+                eprint!(", ");
+            }
             eprint!("{:?}", items[i]);
         }
         eprint!(", ..., ");
         for i in items.len() - SHOW_SUFFIX..items.len() {
-            if i > items.len() - SHOW_SUFFIX { eprint!(", "); }
+            if i > items.len() - SHOW_SUFFIX {
+                eprint!(", ");
+            }
             eprint!("{:?}", items[i]);
         }
         eprintln!("]");
@@ -1225,11 +1406,23 @@ fn dump_key_tensors(ctx: &gguf::GgufContext) {
     for name in &key_names {
         if let Some(ti) = ctx.info.iter().find(|t| t.name == *name) {
             let dims: Vec<String> = {
-                let mut d: Vec<String> = ti.ne.iter().filter(|&&v| v > 0).map(|v| v.to_string()).collect();
-                if d.is_empty() { d.push("1".into()); }
+                let mut d: Vec<String> = ti
+                    .ne
+                    .iter()
+                    .filter(|&&v| v > 0)
+                    .map(|v| v.to_string())
+                    .collect();
+                if d.is_empty() {
+                    d.push("1".into());
+                }
                 d
             };
-            eprintln!("  {:<50} {}  [{}]", ti.name, ti.type_.type_name(), dims.join(","));
+            eprintln!(
+                "  {:<50} {}  [{}]",
+                ti.name,
+                ti.type_.type_name(),
+                dims.join(",")
+            );
         }
     }
     eprintln!("--------");
@@ -1272,18 +1465,25 @@ mod think_highlighter_tests {
     fn markers_split_across_chunks() {
         // <think> split 3 ways, </think> split 2 ways, trailing answer split.
         let out = run(
-            true, b"\x1b[0m",
+            true,
+            b"\x1b[0m",
             &[b"<thi", b"nk>one two</th", b"ink>answer ", b"tail"],
         );
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b[90m<think>one two\x1b[90m</think>\x1b[0manswer tail");
+        assert_eq!(
+            s,
+            "\x1b[90m<think>one two\x1b[90m</think>\x1b[0manswer tail"
+        );
     }
 
     #[test]
     fn multiple_think_blocks() {
         let out = run(true, b"\x1b[0m", &[b"<think>a</think><think>b</think>c"]);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b[90m<think>a\x1b[90m</think>\x1b[0m\x1b[90m<think>b\x1b[90m</think>\x1b[0mc");
+        assert_eq!(
+            s,
+            "\x1b[90m<think>a\x1b[90m</think>\x1b[0m\x1b[90m<think>b\x1b[90m</think>\x1b[0mc"
+        );
     }
 
     #[test]

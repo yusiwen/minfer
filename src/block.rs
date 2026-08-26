@@ -15,9 +15,9 @@ pub fn fp16_to_f32(h: Fp16) -> f32 {
 
 // === Block byte-size constants (ggml-common.h) ===
 
-pub const Q4B: usize = 18;   // sizeof(block_q4_0)
-pub const Q41B: usize = 20;  // sizeof(block_q4_1)
-pub const Q8B: usize = 34;   // sizeof(block_q8_0)
+pub const Q4B: usize = 18; // sizeof(block_q4_0)
+pub const Q41B: usize = 20; // sizeof(block_q4_1)
+pub const Q8B: usize = 34; // sizeof(block_q8_0)
 pub const Q4KB: usize = 144; // sizeof(block_q4_k)
 pub const Q6KB: usize = 210; // sizeof(block_q6_k)
 /// sizeof(block_q8_k) — 256-element activation block: d(f16,2) + qs(256 i8)
@@ -34,11 +34,11 @@ pub fn unpack_q4k_scales(sc: &[u8; 12]) -> ([i32; 8], [i32; 8]) {
     let mut mins = [0i32; 8];
     for j in 0..4 {
         scales[j] = (sc[j] & 0x3F) as i32;
-        mins[j]   = (sc[j + 4] & 0x3F) as i32;
+        mins[j] = (sc[j + 4] & 0x3F) as i32;
     }
     for j in 4..8 {
         scales[j] = ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4)) as i32;
-        mins[j]   = ((sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4)) as i32;
+        mins[j] = ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as i32;
     }
     (scales, mins)
 }
@@ -51,49 +51,52 @@ pub fn unpack_q4k_scales(sc: &[u8; 12]) -> ([i32; 8], [i32; 8]) {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ4_0 {
-    pub d: Fp16,           // delta (scale)
-    pub qs: [u8; 16],      // nibbles / quants (32 × 4-bit = 16 bytes)
+    pub d: Fp16,      // delta (scale)
+    pub qs: [u8; 16], // nibbles / quants (32 × 4-bit = 16 bytes)
 }
 
 // Q4_1 — 4-bit quantization with min, 32 elements per block (line 191-202)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ4_1 {
-    pub d: Fp16,           // delta (scale)
-    pub m: Fp16,           // min
-    pub qs: [u8; 16],      // nibbles / quants
+    pub d: Fp16,      // delta (scale)
+    pub m: Fp16,      // min
+    pub qs: [u8; 16], // nibbles / quants
 }
 
 // Q5_0 — 5-bit quantization, 32 elements per block (line 219-225)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ5_0 {
-    pub d: Fp16,           // delta
-    pub qh: [u8; 4],       // 5-th bit of quants (32 bits = 4 bytes)
-    pub qs: [u8; 16],      // nibbles / quants (low 4 bits)
+    pub d: Fp16,      // delta
+    pub qh: [u8; 4],  // 5-th bit of quants (32 bits = 4 bytes)
+    pub qs: [u8; 16], // nibbles / quants (low 4 bits)
 }
 
 // Q5_1 — 5-bit quantization with min, 32 elements per block (line 227-239)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ5_1 {
-    pub d: Fp16,           // delta
-    pub m: Fp16,           // min
-    pub qh: [u8; 4],       // 5-th bit of quants
-    pub qs: [u8; 16],      // nibbles / quants (low 4 bits)
+    pub d: Fp16,      // delta
+    pub m: Fp16,      // min
+    pub qh: [u8; 4],  // 5-th bit of quants
+    pub qs: [u8; 16], // nibbles / quants (low 4 bits)
 }
 
 // Q8_0 — 8-bit quantization, 32 elements per block (line 241-246)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ8_0 {
-    pub d: Fp16,           // delta
-    pub qs: [i8; 32],      // quants
+    pub d: Fp16,      // delta
+    pub qs: [i8; 32], // quants
 }
 
 impl Default for BlockQ8_0 {
     fn default() -> Self {
-        Self { d: 0, qs: [0i8; 32] }
+        Self {
+            d: 0,
+            qs: [0i8; 32],
+        }
     }
 }
 
@@ -101,9 +104,9 @@ impl Default for BlockQ8_0 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ8_1 {
-    pub d: Fp16,           // delta
-    pub s: Fp16,           // d * sum(qs[i])
-    pub qs: [i8; 32],      // quants
+    pub d: Fp16,      // delta
+    pub s: Fp16,      // d * sum(qs[i])
+    pub qs: [i8; 32], // quants
 }
 
 // Q2_K — 2-bit super-block quantization, 256 elements (line 288-299)
@@ -112,10 +115,10 @@ pub struct BlockQ8_1 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ2_K {
-    pub scales: [u8; 16],  // scales and mins, quantized with 4 bits (QK_K/16)
-    pub qs: [u8; 64],      // quants (QK_K/4)
-    pub d: Fp16,           // super-block scale for quantized scales
-    pub dmin: Fp16,        // super-block scale for quantized mins
+    pub scales: [u8; 16], // scales and mins, quantized with 4 bits (QK_K/16)
+    pub qs: [u8; 64],     // quants (QK_K/4)
+    pub d: Fp16,          // super-block scale for quantized scales
+    pub dmin: Fp16,       // super-block scale for quantized mins
 }
 
 // Q3_K — 3-bit super-block quantization, 256 elements (line 305-311)
@@ -123,10 +126,10 @@ pub struct BlockQ2_K {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ3_K {
-    pub hmask: [u8; 32],   // quants - high bit (QK_K/8)
-    pub qs: [u8; 64],      // quants - low 2 bits (QK_K/4)
-    pub scales: [u8; 12],  // scales, quantized with 6 bits
-    pub d: Fp16,           // super-block scale
+    pub hmask: [u8; 32],  // quants - high bit (QK_K/8)
+    pub qs: [u8; 64],     // quants - low 2 bits (QK_K/4)
+    pub scales: [u8; 12], // scales, quantized with 6 bits
+    pub d: Fp16,          // super-block scale
 }
 
 // Q4_K — 4-bit super-block quantization, 256 elements (line 317-328)
@@ -134,10 +137,10 @@ pub struct BlockQ3_K {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ4_K {
-    pub d: Fp16,           // super-block scale for quantized scales
-    pub dmin: Fp16,        // super-block scale for quantized mins
-    pub scales: [u8; 12],  // scales and mins, quantized with 6 bits (K_SCALE_SIZE)
-    pub qs: [u8; 128],     // 4-bit quants (QK_K/2)
+    pub d: Fp16,          // super-block scale for quantized scales
+    pub dmin: Fp16,       // super-block scale for quantized mins
+    pub scales: [u8; 12], // scales and mins, quantized with 6 bits (K_SCALE_SIZE)
+    pub qs: [u8; 128],    // 4-bit quants (QK_K/2)
 }
 
 // Q5_K — 5-bit super-block quantization, 256 elements (line 334-346)
@@ -145,11 +148,11 @@ pub struct BlockQ4_K {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ5_K {
-    pub d: Fp16,           // super-block scale for quantized scales
-    pub dmin: Fp16,        // super-block scale for quantized mins
-    pub scales: [u8; 12],  // scales and mins, quantized with 6 bits (K_SCALE_SIZE)
-    pub qh: [u8; 32],      // quants, high bit (QK_K/8)
-    pub qs: [u8; 128],     // quants, low 4 bits (QK_K/2)
+    pub d: Fp16,          // super-block scale for quantized scales
+    pub dmin: Fp16,       // super-block scale for quantized mins
+    pub scales: [u8; 12], // scales and mins, quantized with 6 bits (K_SCALE_SIZE)
+    pub qh: [u8; 32],     // quants, high bit (QK_K/8)
+    pub qs: [u8; 128],    // quants, low 4 bits (QK_K/2)
 }
 
 // Q6_K — 6-bit super-block quantization, 256 elements (line 352-358)
@@ -157,10 +160,10 @@ pub struct BlockQ5_K {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ6_K {
-    pub ql: [u8; 128],     // quants, lower 4 bits (QK_K/2)
-    pub qh: [u8; 64],      // quants, upper 2 bits (QK_K/4)
-    pub scales: [i8; 16],  // scales, quantized with 8 bits (QK_K/16)
-    pub d: Fp16,           // super-block scale
+    pub ql: [u8; 128],    // quants, lower 4 bits (QK_K/2)
+    pub qh: [u8; 64],     // quants, upper 2 bits (QK_K/4)
+    pub scales: [i8; 16], // scales, quantized with 8 bits (QK_K/16)
+    pub d: Fp16,          // super-block scale
 }
 
 // Q8_K — 8-bit intermediate quantization, 256 elements (line 361-366)
@@ -168,17 +171,17 @@ pub struct BlockQ6_K {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ8_K {
-    pub d: f32,            // delta
-    pub qs: [i8; 256],     // quants (QK_K)
-    pub bsums: [i16; 16],  // sum of quants in groups of 16 (QK_K/16)
+    pub d: f32,           // delta
+    pub qs: [i8; 256],    // quants (QK_K)
+    pub bsums: [i16; 16], // sum of quants in groups of 16 (QK_K/16)
 }
 
 // Q1_0 — 1-bit quantization, 128 elements per block (line 177-182)
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BlockQ1_0 {
-    pub d: Fp16,           // delta
-    pub qs: [u8; 16],      // bits / quants (128/8 = 16 bytes)
+    pub d: Fp16,      // delta
+    pub qs: [u8; 16], // bits / quants (128/8 = 16 bytes)
 }
 
 // === Static assertions equivalent ===

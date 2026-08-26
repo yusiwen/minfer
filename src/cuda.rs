@@ -1,9 +1,9 @@
 // CUDA (NVIDIA GPU) backend for x86-64 Linux/Windows.
 
+use crate::block::Q8B;
+use crate::tensor::{Tensor, TensorType};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use crate::tensor::{Tensor, TensorType};
-use crate::block::Q8B;
 
 /// Wrapper to make `*mut c_void` Send+Sync for use in Mutex.
 #[derive(Clone, Copy)]
@@ -22,8 +22,19 @@ extern "C" {
     fn cudaSetDevice(device: i32) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
-    fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
-    fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaMemcpy(
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: i32,
+    ) -> i32;
+    fn cudaMemcpyAsync(
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     fn cudaStreamCreate(stream: *mut *mut std::ffi::c_void) -> i32;
     fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
@@ -34,9 +45,17 @@ extern "C" {
     fn cudaGetDeviceProperties(prop: *mut CudaDevicePropBuf, device: i32) -> i32;
     // CUDA Graph APIs
     fn cudaStreamBeginCapture(stream: *mut std::ffi::c_void, mode: i32) -> i32;
-    fn cudaStreamEndCapture(stream: *mut std::ffi::c_void, graph: *mut *mut std::ffi::c_void) -> i32;
-    fn cudaGraphInstantiate(exec: *mut *mut std::ffi::c_void, graph: *mut std::ffi::c_void,
-        error_node: *mut std::ffi::c_void, log_buf: *mut u8, buf_size: usize) -> i32;
+    fn cudaStreamEndCapture(
+        stream: *mut std::ffi::c_void,
+        graph: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn cudaGraphInstantiate(
+        exec: *mut *mut std::ffi::c_void,
+        graph: *mut std::ffi::c_void,
+        error_node: *mut std::ffi::c_void,
+        log_buf: *mut u8,
+        buf_size: usize,
+    ) -> i32;
     fn cudaGraphLaunch(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
     fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
     fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
@@ -62,7 +81,9 @@ fn cuda_check(err: i32, msg: &str) {
 }
 
 fn cuda_kernel_check(msg: &str) {
-    if !cuda_debug_enabled() { return; }
+    if !cuda_debug_enabled() {
+        return;
+    }
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
         eprintln!("CUDA kernel error ({}): {}", msg, err);
@@ -73,63 +94,134 @@ fn cuda_kernel_check(msg: &str) {
 
 extern "C" {
     fn launch_q4_0_q8_0_matmul(
-        weights: *const u8, acts: *const u8, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_q4_0_f32_matmul(
-        weights: *const u8, acts: *const f32, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_q8_0_f32_matmul(
-        weights: *const u8, acts: *const f32, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_q4_1_f32_matmul(
-        weights: *const u8, acts: *const f32, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_q4_k_f32_matmul(
-        weights: *const u8, acts: *const f32, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_q6_k_f32_matmul(
-        weights: *const u8, acts: *const f32, output: *mut f32,
-        od: i32, id: i32, nt: i32, stream: *mut std::ffi::c_void
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_quantize_q8_0(
-        x: *const f32, y: *mut u8, dim: i32, nt: i32, stream: *mut std::ffi::c_void
+        x: *const f32,
+        y: *mut u8,
+        dim: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_rms_norm_f32(
-        x: *const f32, w: *const f32, y: *mut f32,
-        d: i32, eps: f32, n: i32, stream: *mut std::ffi::c_void
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        d: i32,
+        eps: f32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_add_bias_f32(
-        y: *mut f32, b: *const f32, d: i32, n: i32, stream: *mut std::ffi::c_void
+        y: *mut f32,
+        b: *const f32,
+        d: i32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_add_f32(
-        x: *const f32, y: *const f32, z: *mut f32, n: i32, stream: *mut std::ffi::c_void
+        x: *const f32,
+        y: *const f32,
+        z: *mut f32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_mul_f32(
-        x: *const f32, y: *const f32, z: *mut f32, n: i32, stream: *mut std::ffi::c_void
+        x: *const f32,
+        y: *const f32,
+        z: *mut f32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
     );
-    fn launch_silu_f32(
-        y: *mut f32, n: i32, stream: *mut std::ffi::c_void
-    );
+    fn launch_silu_f32(y: *mut f32, n: i32, stream: *mut std::ffi::c_void);
     fn launch_swiglu_f32(
-        gate: *const f32, up: *const f32, dst: *mut f32, n: i32, stream: *mut std::ffi::c_void
+        gate: *const f32,
+        up: *const f32,
+        dst: *mut f32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_rope_f32(
-        x: *mut f32, n_head: i32, n_dims: i32, nt: i32,
-        freq_base: f32, freq_scale: f32, positions: *const i32, stream: *mut std::ffi::c_void
+        x: *mut f32,
+        n_head: i32,
+        n_dims: i32,
+        nt: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *const i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_store_kv_f32(
-        src: *const f32, dst: *mut f32, nkt: i32, nt: i32,
-        positions: *const i32, stream: *mut std::ffi::c_void
+        src: *const f32,
+        dst: *mut f32,
+        nkt: i32,
+        nt: i32,
+        positions: *const i32,
+        stream: *mut std::ffi::c_void,
     );
     fn launch_gqa_attn_f32(
-        q: *const f32, k: *const f32, v: *const f32, o: *mut f32,
-        positions: *const i32, nh: i32, nk: i32, hd: i32,
-        scale: f32, nt: i32, stream: *mut std::ffi::c_void
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        o: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
     );
 }
 
@@ -208,7 +300,9 @@ impl CudaState {
         // Query device properties
         fn get_attr(attr: i32, dev: i32) -> i32 {
             let mut v: i32 = 0;
-            unsafe { cudaDeviceGetAttribute(&mut v, attr, dev); }
+            unsafe {
+                cudaDeviceGetAttribute(&mut v, attr, dev);
+            }
             v
         }
         let major = get_attr(CUDA_DEV_ATTR_COMPUTE_MAJOR, best_device);
@@ -216,16 +310,27 @@ impl CudaState {
         let sm_count = get_attr(CUDA_DEV_ATTR_MULTIPROC_COUNT, best_device);
         let mut free_mem: usize = 0;
         let mut total_mem: usize = 0;
-        unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem); }
+        unsafe {
+            cudaMemGetInfo(&mut free_mem, &mut total_mem);
+        }
         // Read device name (first 256 bytes of the oversized buffer)
         let mut name_buf = CudaDevicePropBuf([0u8; 4096]);
-        unsafe { cudaGetDeviceProperties(&mut name_buf, best_device); }
-        let name = name_buf.0[..256].iter()
+        unsafe {
+            cudaGetDeviceProperties(&mut name_buf, best_device);
+        }
+        let name = name_buf.0[..256]
+            .iter()
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8 as char)
             .collect::<String>();
-        eprintln!("CUDA: using {} (SM {}.{}, {} MB, {} SMs)",
-            name, major, minor, total_mem / 1048576, sm_count);
+        eprintln!(
+            "CUDA: using {} (SM {}.{}, {} MB, {} SMs)",
+            name,
+            major,
+            minor,
+            total_mem / 1048576,
+            sm_count
+        );
 
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
         Some(CudaState {
@@ -257,8 +362,11 @@ impl CudaState {
     pub fn init() {
         CUDA.get_or_init(|| {
             let s = Self::try_new();
-            if s.is_some() { eprintln!("CUDA: GPU acceleration enabled"); }
-            else { eprintln!("CUDA: not available, using CPU fallback"); }
+            if s.is_some() {
+                eprintln!("CUDA: GPU acceleration enabled");
+            } else {
+                eprintln!("CUDA: not available, using CPU fallback");
+            }
             s
         });
     }
@@ -268,22 +376,38 @@ impl CudaState {
     }
 
     pub fn register_weight(&self, name: &str, data: &[u8]) {
-        if data.is_empty() { return; }
+        if data.is_empty() {
+            return;
+        }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
         if err != 0 || ptr.is_null() {
-            eprintln!("CUDA: failed to allocate {} bytes for '{}'", data.len(), name);
+            eprintln!(
+                "CUDA: failed to allocate {} bytes for '{}'",
+                data.len(),
+                name
+            );
             return;
         }
         let err = unsafe {
-            cudaMemcpy(ptr, data.as_ptr() as *const std::ffi::c_void, data.len(), cudaMemcpyHostToDevice)
+            cudaMemcpy(
+                ptr,
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len(),
+                cudaMemcpyHostToDevice,
+            )
         };
         if err != 0 {
             eprintln!("CUDA: failed to copy '{}' to device", name);
-            unsafe { cudaFree(ptr); }
+            unsafe {
+                cudaFree(ptr);
+            }
             return;
         }
-        self.weights.lock().unwrap().insert(name.to_string(), CudaPtr(ptr));
+        self.weights
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), CudaPtr(ptr));
     }
 
     pub fn get_weight_ptr(&self, name: &str) -> Option<*mut std::ffi::c_void> {
@@ -301,7 +425,9 @@ impl CudaState {
         let (ptr, size) = &mut *guard;
         if ptr.0.is_null() || *size < need {
             if !ptr.0.is_null() {
-                unsafe { cudaFree(ptr.0); }
+                unsafe {
+                    cudaFree(ptr.0);
+                }
             }
             let mut new_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let err = unsafe { cudaMalloc(&mut new_ptr, need) };
@@ -333,31 +459,63 @@ impl CudaState {
 
     pub fn copy_to_device(&self, src: &[u8], dst: *mut std::ffi::c_void) {
         unsafe {
-            cudaMemcpy(dst, src.as_ptr() as *const std::ffi::c_void, src.len(), cudaMemcpyHostToDevice);
+            cudaMemcpy(
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                cudaMemcpyHostToDevice,
+            );
         }
     }
 
     pub fn copy_to_device_async(&self, src: &[u8], dst: *mut std::ffi::c_void) {
         unsafe {
-            cudaMemcpyAsync(dst, src.as_ptr() as *const std::ffi::c_void, src.len(), cudaMemcpyHostToDevice, self.stream());
+            cudaMemcpyAsync(
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                cudaMemcpyHostToDevice,
+                self.stream(),
+            );
         }
     }
 
     pub fn copy_from_device(&self, src: *const std::ffi::c_void, dst: &mut [u8]) {
         unsafe {
-            cudaMemcpy(dst.as_mut_ptr() as *mut std::ffi::c_void, src, dst.len(), cudaMemcpyDeviceToHost);
+            cudaMemcpy(
+                dst.as_mut_ptr() as *mut std::ffi::c_void,
+                src,
+                dst.len(),
+                cudaMemcpyDeviceToHost,
+            );
         }
     }
 
     pub fn copy_from_device_async(&self, src: *const std::ffi::c_void, dst: &mut [u8]) {
         unsafe {
-            cudaMemcpyAsync(dst.as_mut_ptr() as *mut std::ffi::c_void, src, dst.len(), cudaMemcpyDeviceToHost, self.stream());
+            cudaMemcpyAsync(
+                dst.as_mut_ptr() as *mut std::ffi::c_void,
+                src,
+                dst.len(),
+                cudaMemcpyDeviceToHost,
+                self.stream(),
+            );
         }
     }
 
-    pub fn copy_device_to_device(&self, src: *const std::ffi::c_void, dst: *mut std::ffi::c_void, size: usize) {
+    pub fn copy_device_to_device(
+        &self,
+        src: *const std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        size: usize,
+    ) {
         unsafe {
-            cudaMemcpy(dst as *mut std::ffi::c_void, src, size, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(
+                dst as *mut std::ffi::c_void,
+                src,
+                size,
+                cudaMemcpyDeviceToDevice,
+            );
         }
     }
 
@@ -376,7 +534,9 @@ impl CudaState {
     /// `il` = layer index, or negative for non-layer steps (e.g. output norm).
     /// Only active when MINFER_CUDA_DEBUG is set.
     pub fn debug_sync(&self, il: i32, label: &str) {
-        if !cuda_debug_enabled() { return; }
+        if !cuda_debug_enabled() {
+            return;
+        }
         let err = unsafe { cudaGetLastError() };
         if il >= 0 {
             let tag = format!("l{il}: ");
@@ -384,13 +544,21 @@ impl CudaState {
                 eprintln!("CUDA DEBUG: {tag}{label} -- launch error: {err}");
             }
             let err = unsafe { cudaStreamSynchronize(self.stream()) };
-            if err != 0 { eprintln!("CUDA DEBUG: {tag}{label} -- sync error: {err}"); }
-            else { eprintln!("CUDA DEBUG: {tag}{label} OK"); }
+            if err != 0 {
+                eprintln!("CUDA DEBUG: {tag}{label} -- sync error: {err}");
+            } else {
+                eprintln!("CUDA DEBUG: {tag}{label} OK");
+            }
         } else {
-            if err != 0 { eprintln!("CUDA DEBUG: {label} -- launch error: {err}"); }
+            if err != 0 {
+                eprintln!("CUDA DEBUG: {label} -- launch error: {err}");
+            }
             let err = unsafe { cudaStreamSynchronize(self.stream()) };
-            if err != 0 { eprintln!("CUDA DEBUG: {label} -- sync error: {err}"); }
-            else { eprintln!("CUDA DEBUG: {label} OK"); }
+            if err != 0 {
+                eprintln!("CUDA DEBUG: {label} -- sync error: {err}");
+            } else {
+                eprintln!("CUDA DEBUG: {label} OK");
+            }
         }
     }
 
@@ -399,27 +567,36 @@ impl CudaState {
     pub fn upload_hidden(&self, hidden: &[f32]) {
         let need = hidden.len() * 4;
         let ptr = Self::get_or_grow(&self.buf_hidden, need);
-        self.copy_to_device(unsafe { std::slice::from_raw_parts(hidden.as_ptr() as *const u8, need) }, ptr);
+        self.copy_to_device(
+            unsafe { std::slice::from_raw_parts(hidden.as_ptr() as *const u8, need) },
+            ptr,
+        );
     }
 
     pub fn download_hidden(&self, hidden: &mut [f32]) {
         let need = hidden.len() * 4;
         let guard = self.buf_hidden.lock().unwrap();
-        let ptr = guard.0.0;
-        if ptr.is_null() { return; }
-        self.copy_from_device(ptr as *const std::ffi::c_void,
-            unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, need) });
+        let ptr = guard.0 .0;
+        if ptr.is_null() {
+            return;
+        }
+        self.copy_from_device(ptr as *const std::ffi::c_void, unsafe {
+            std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, need)
+        });
     }
 
     pub fn upload_positions(&self, positions: &[usize]) {
         let ints: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
         let need = ints.len() * 4;
         let ptr = Self::get_or_grow(&self.buf_positions, need);
-        self.copy_to_device(unsafe { std::slice::from_raw_parts(ints.as_ptr() as *const u8, need) }, ptr);
+        self.copy_to_device(
+            unsafe { std::slice::from_raw_parts(ints.as_ptr() as *const u8, need) },
+            ptr,
+        );
     }
 
     pub fn get_positions_buf(&self) -> *mut std::ffi::c_void {
-        self.buf_positions.lock().unwrap().0.0
+        self.buf_positions.lock().unwrap().0 .0
     }
 
     // ─── KV cache management ─────────────────────────────────
@@ -444,7 +621,11 @@ impl CudaState {
             szvec.push(n_ctx);
         }
         let total_kb = (n_layer * need * 2) / 1024;
-        eprintln!("CUDA: pre-allocated KV cache for {} layers ({:.1} MB)", n_layer, total_kb as f64 / 1024.0);
+        eprintln!(
+            "CUDA: pre-allocated KV cache for {} layers ({:.1} MB)",
+            n_layer,
+            total_kb as f64 / 1024.0
+        );
     }
 
     /// Verify KV cache has enough room for `max_nkv` entries at layer `il`.
@@ -453,8 +634,10 @@ impl CudaState {
         let szvec = self.kv_size.lock().unwrap();
         let size = szvec.get(il).copied().unwrap_or(0);
         if max_nkv > size {
-            eprintln!("CUDA: KV cache overflow at layer {}: need {} but allocated {}",
-                il, max_nkv, size);
+            eprintln!(
+                "CUDA: KV cache overflow at layer {}: need {} but allocated {}",
+                il, max_nkv, size
+            );
             return false;
         }
         true
@@ -469,10 +652,13 @@ impl CudaState {
     pub fn download_logits(&self, logits: &mut [f32]) {
         let need = logits.len() * 4;
         let guard = self.buf_logits.lock().unwrap();
-        let ptr = guard.0.0;
-        if ptr.is_null() { return; }
-        self.copy_from_device(ptr as *const std::ffi::c_void,
-            unsafe { std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, need) });
+        let ptr = guard.0 .0;
+        if ptr.is_null() {
+            return;
+        }
+        self.copy_from_device(ptr as *const std::ffi::c_void, unsafe {
+            std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, need)
+        });
     }
 
     // ─── CUDA Graph (decode step batch) ───────────────────────
@@ -485,7 +671,9 @@ impl CudaState {
         let stream = self.stream();
         let err = unsafe { cudaStreamBeginCapture(stream, 1) };
         if err != 0 {
-            unsafe { cudaGetLastError(); }
+            unsafe {
+                cudaGetLastError();
+            }
             false
         } else {
             true
@@ -498,26 +686,42 @@ impl CudaState {
         let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
         if err != 0 || graph.is_null() {
-            if err != 0 { unsafe { cudaGetLastError(); } }
+            if err != 0 {
+                unsafe {
+                    cudaGetLastError();
+                }
+            }
             return;
         }
 
         let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe {
-            cudaGraphInstantiate(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+            cudaGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if err != 0 || exec.is_null() {
-            unsafe { cudaGraphDestroy(graph); }
+            unsafe {
+                cudaGraphDestroy(graph);
+            }
             return;
         }
 
-        unsafe { cudaGraphDestroy(graph); }
+        unsafe {
+            cudaGraphDestroy(graph);
+        }
         *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
     }
 
     pub fn graph_launch(&self) -> bool {
         let exec = self.decode_graph_exec.lock().unwrap().0;
-        if exec.is_null() { return false; }
+        if exec.is_null() {
+            return false;
+        }
         let stream = self.stream();
         let err = unsafe { cudaGraphLaunch(exec, stream) };
         if err != 0 {
@@ -528,58 +732,116 @@ impl CudaState {
 
     // ─── Kernel launch operations (called from CudaCommandBuffer) ──
 
-    pub fn quant_matmul_q8(&self, w: &Tensor, x: *mut std::ffi::c_void, out: *mut std::ffi::c_void,
-        od: usize, id: usize, nt: usize) {
+    pub fn quant_matmul_q8(
+        &self,
+        w: &Tensor,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
         let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
         let stream = self.stream();
         unsafe {
             launch_q4_0_q8_0_matmul(
-                wptr as *const u8, x as *const u8, out as *mut f32,
-                od as i32, id as i32, nt as i32, stream);
+                wptr as *const u8,
+                x as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
         }
     }
 
-    pub fn quant_matmul_f32_on_gpu(&self, w: &Tensor, x: *mut std::ffi::c_void, out: *mut std::ffi::c_void,
-        od: usize, id: usize, nt: usize) {
+    pub fn quant_matmul_f32_on_gpu(
+        &self,
+        w: &Tensor,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
         let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
         let stream = self.stream();
         if w.ttype == TensorType::Q4_0 {
             unsafe {
                 launch_q4_0_f32_matmul(
-                    wptr as *const u8, x as *const f32, out as *mut f32,
-                    od as i32, id as i32, nt as i32, stream);
+                    wptr as *const u8,
+                    x as *const f32,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
             }
         } else if w.ttype == TensorType::Q8_0 {
             unsafe {
                 launch_q8_0_f32_matmul(
-                    wptr as *const u8, x as *const f32, out as *mut f32,
-                    od as i32, id as i32, nt as i32, stream);
+                    wptr as *const u8,
+                    x as *const f32,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
             }
         } else if w.ttype == TensorType::Q4_1 {
             unsafe {
                 launch_q4_1_f32_matmul(
-                    wptr as *const u8, x as *const f32, out as *mut f32,
-                    od as i32, id as i32, nt as i32, stream);
+                    wptr as *const u8,
+                    x as *const f32,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
             }
         } else if w.ttype == TensorType::Q4_K {
             unsafe {
                 launch_q4_k_f32_matmul(
-                    wptr as *const u8, x as *const f32, out as *mut f32,
-                    od as i32, id as i32, nt as i32, stream);
+                    wptr as *const u8,
+                    x as *const f32,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
             }
         } else if w.ttype == TensorType::Q6_K {
             unsafe {
                 launch_q6_k_f32_matmul(
-                    wptr as *const u8, x as *const f32, out as *mut f32,
-                    od as i32, id as i32, nt as i32, stream);
+                    wptr as *const u8,
+                    x as *const f32,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
             }
         } else {
             panic!("CUDA: unsupported weight type {:?} for f32 matmul", w.ttype);
         }
     }
 
-    pub fn matmul_on_gpu(&self, w: &Tensor, q8_x: *mut std::ffi::c_void, f32_x: *mut std::ffi::c_void,
-        out: *mut std::ffi::c_void, od: usize, id: usize, nt: usize) {
+    pub fn matmul_on_gpu(
+        &self,
+        w: &Tensor,
+        q8_x: *mut std::ffi::c_void,
+        f32_x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
         if w.ttype == TensorType::Q4_0 {
             self.quant_matmul_q8(w, q8_x, out, od, id, nt);
         } else if w.ttype == TensorType::Q8_0 {
@@ -591,41 +853,92 @@ impl CudaState {
         }
     }
 
-    pub fn quantize_q8_0(&self, x: *mut std::ffi::c_void, y: *mut std::ffi::c_void, dim: usize, nt: usize) {
+    pub fn quantize_q8_0(
+        &self,
+        x: *mut std::ffi::c_void,
+        y: *mut std::ffi::c_void,
+        dim: usize,
+        nt: usize,
+    ) {
         let stream = self.stream();
         unsafe {
             launch_quantize_q8_0(x as *const f32, y as *mut u8, dim as i32, nt as i32, stream);
         }
     }
 
-    pub fn rms_norm(&self, x: *mut std::ffi::c_void, w: Option<*mut std::ffi::c_void>, y: *mut std::ffi::c_void,
-        d: usize, n: usize, eps: f32) {
-        let wptr = w.expect("CUDA rms_norm: weight required (no-weights variant not yet implemented)");
+    pub fn rms_norm(
+        &self,
+        x: *mut std::ffi::c_void,
+        w: Option<*mut std::ffi::c_void>,
+        y: *mut std::ffi::c_void,
+        d: usize,
+        n: usize,
+        eps: f32,
+    ) {
+        let wptr =
+            w.expect("CUDA rms_norm: weight required (no-weights variant not yet implemented)");
         let stream = self.stream();
         unsafe {
-            launch_rms_norm_f32(x as *const f32, wptr as *const f32, y as *mut f32,
-                d as i32, eps, n as i32, stream);
+            launch_rms_norm_f32(
+                x as *const f32,
+                wptr as *const f32,
+                y as *mut f32,
+                d as i32,
+                eps,
+                n as i32,
+                stream,
+            );
         }
     }
 
-    pub fn add_f32(&self, x: *mut std::ffi::c_void, y: *mut std::ffi::c_void, z: *mut std::ffi::c_void, n: usize) {
+    pub fn add_f32(
+        &self,
+        x: *mut std::ffi::c_void,
+        y: *mut std::ffi::c_void,
+        z: *mut std::ffi::c_void,
+        n: usize,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_add_f32(x as *const f32, y as *const f32, z as *mut f32, n as i32, stream);
+            launch_add_f32(
+                x as *const f32,
+                y as *const f32,
+                z as *mut f32,
+                n as i32,
+                stream,
+            );
         }
     }
 
-    pub fn add_bias_f32(&self, y: *mut std::ffi::c_void, b: *mut std::ffi::c_void, d: usize, n: usize) {
+    pub fn add_bias_f32(
+        &self,
+        y: *mut std::ffi::c_void,
+        b: *mut std::ffi::c_void,
+        d: usize,
+        n: usize,
+    ) {
         let stream = self.stream();
         unsafe {
             launch_add_bias_f32(y as *mut f32, b as *const f32, d as i32, n as i32, stream);
         }
     }
 
-    pub fn mul_f32(&self, x: *mut std::ffi::c_void, y: *mut std::ffi::c_void, z: *mut std::ffi::c_void, n: usize) {
+    pub fn mul_f32(
+        &self,
+        x: *mut std::ffi::c_void,
+        y: *mut std::ffi::c_void,
+        z: *mut std::ffi::c_void,
+        n: usize,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_mul_f32(x as *const f32, y as *const f32, z as *mut f32, n as i32, stream);
+            launch_mul_f32(
+                x as *const f32,
+                y as *const f32,
+                z as *mut f32,
+                n as i32,
+                stream,
+            );
         }
     }
 
@@ -636,37 +949,99 @@ impl CudaState {
         }
     }
 
-    pub fn swiglu_f32(&self, gate: *mut std::ffi::c_void, up: *mut std::ffi::c_void, dst: *mut std::ffi::c_void, n: usize) {
+    pub fn swiglu_f32(
+        &self,
+        gate: *mut std::ffi::c_void,
+        up: *mut std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        n: usize,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_swiglu_f32(gate as *const f32, up as *const f32, dst as *mut f32, n as i32, stream);
+            launch_swiglu_f32(
+                gate as *const f32,
+                up as *const f32,
+                dst as *mut f32,
+                n as i32,
+                stream,
+            );
         }
     }
 
-    pub fn rope_f32(&self, x: *mut std::ffi::c_void, n_head: usize, n_dims: usize, nt: usize,
-        freq_base: f32, freq_scale: f32, positions: *mut std::ffi::c_void) {
+    pub fn rope_f32(
+        &self,
+        x: *mut std::ffi::c_void,
+        n_head: usize,
+        n_dims: usize,
+        nt: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *mut std::ffi::c_void,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_rope_f32(x as *mut f32, n_head as i32, n_dims as i32, nt as i32,
-                freq_base, freq_scale, positions as *const i32, stream);
+            launch_rope_f32(
+                x as *mut f32,
+                n_head as i32,
+                n_dims as i32,
+                nt as i32,
+                freq_base,
+                freq_scale,
+                positions as *const i32,
+                stream,
+            );
         }
     }
 
-    pub fn gqa_attn_f32(&self, q: *mut std::ffi::c_void, k: *mut std::ffi::c_void, v: *mut std::ffi::c_void,
-        o: *mut std::ffi::c_void, positions: *mut std::ffi::c_void, nh: usize, nk: usize, hd: usize, scale: f32, nt: usize) {
+    pub fn gqa_attn_f32(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_gqa_attn_f32(q as *const f32, k as *const f32, v as *const f32, o as *mut f32,
-                positions as *const i32, nh as i32, nk as i32, hd as i32, scale, nt as i32, stream);
+            launch_gqa_attn_f32(
+                q as *const f32,
+                k as *const f32,
+                v as *const f32,
+                o as *mut f32,
+                positions as *const i32,
+                nh as i32,
+                nk as i32,
+                hd as i32,
+                scale,
+                nt as i32,
+                stream,
+            );
         }
     }
 
-    pub fn store_kv_f32(&self, src: *mut std::ffi::c_void, dst: *mut std::ffi::c_void, nkt: usize, nt: usize,
-        positions: *mut std::ffi::c_void) {
+    pub fn store_kv_f32(
+        &self,
+        src: *mut std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        nkt: usize,
+        nt: usize,
+        positions: *mut std::ffi::c_void,
+    ) {
         let stream = self.stream();
         unsafe {
-            launch_store_kv_f32(src as *const f32, dst as *mut f32, nkt as i32, nt as i32,
-                positions as *const i32, stream);
+            launch_store_kv_f32(
+                src as *const f32,
+                dst as *mut f32,
+                nkt as i32,
+                nt as i32,
+                positions as *const i32,
+                stream,
+            );
         }
     }
 
@@ -674,8 +1049,14 @@ impl CudaState {
 
     pub fn quant_matmul_f32_batch(
         &self,
-        mats: &mut [(/*weight*/ &Tensor, /*output*/ &mut [f32], /*od*/ usize)],
-        x: &[f32], id: usize, nt: usize,
+        mats: &mut [(
+            /*weight*/ &Tensor,
+            /*output*/ &mut [f32],
+            /*od*/ usize,
+        )],
+        x: &[f32],
+        id: usize,
+        nt: usize,
     ) {
         // For batch Q4_0 matmuls: quantize activations once, then launch each matmul
         if mats.iter().any(|m| m.0.ttype != TensorType::Q4_0) {
@@ -700,16 +1081,20 @@ impl CudaState {
             let obuf = Self::get_or_grow(&self.buf_bq, out_len);
             self.quant_matmul_q8(mat.0, xbuf, obuf, mat.2, id, nt);
             self.sync();
-            let out_bytes = unsafe {
-                std::slice::from_raw_parts_mut(mat.1.as_mut_ptr() as *mut u8, out_len)
-            };
+            let out_bytes =
+                unsafe { std::slice::from_raw_parts_mut(mat.1.as_mut_ptr() as *mut u8, out_len) };
             self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
         }
     }
 
     pub fn quant_matmul_f32(
-        &self, w: &Tensor, x: &[f32], out: &mut [f32],
-        od: usize, id: usize, nt: usize,
+        &self,
+        w: &Tensor,
+        x: &[f32],
+        out: &mut [f32],
+        od: usize,
+        id: usize,
+        nt: usize,
     ) {
         if w.ttype == TensorType::Q4_0 {
             let nb = id / 32;
@@ -725,23 +1110,22 @@ impl CudaState {
             self.copy_to_device(&q8, xbuf);
             self.quant_matmul_q8(w, xbuf, obuf, od, id, nt);
             self.sync();
-            let out_bytes = unsafe {
-                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len)
-            };
+            let out_bytes =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len) };
             self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
         } else if w.ttype == TensorType::Q8_0 {
             let out_len = nt * od * 4;
             let x_len = nt * id * 4;
             let xbuf = Self::get_or_grow(&self.buf_hidden, x_len);
             let obuf = Self::get_or_grow(&self.buf_logits, out_len);
-            self.copy_to_device(unsafe {
-                std::slice::from_raw_parts(x.as_ptr() as *const u8, x_len)
-            }, xbuf);
+            self.copy_to_device(
+                unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x_len) },
+                xbuf,
+            );
             self.quant_matmul_f32_on_gpu(w, xbuf, obuf, od, id, nt);
             self.sync();
-            let out_bytes = unsafe {
-                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len)
-            };
+            let out_bytes =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len) };
             self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
         } else {
             crate::kernel::cpu_quant_matmul_f32(w, x, out, od, id, nt);
@@ -757,18 +1141,32 @@ impl CudaState {
         il: usize,
         l: &crate::models::qwen2::loader::LayerWeights,
         positions: &[usize],
-        ne: usize, nqt: usize, nkt: usize, nf: usize, nt: usize,
-        nh: usize, nk: usize, hd: usize,
-        eps: f32, freq_base: f32, freq_scale: f32,
+        ne: usize,
+        nqt: usize,
+        nkt: usize,
+        nf: usize,
+        nt: usize,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        eps: f32,
+        freq_base: f32,
+        freq_scale: f32,
     ) -> bool {
-        let attn_norm = match &l.attn_norm { Some(t) => t, None => return false };
-        let ffn_norm  = match &l.ffn_norm  { Some(t) => t, None => return false };
+        let attn_norm = match &l.attn_norm {
+            Some(t) => t,
+            None => return false,
+        };
+        let ffn_norm = match &l.ffn_norm {
+            Some(t) => t,
+            None => return false,
+        };
         let wq = l.wq.as_ref().unwrap();
         let wk = l.wk.as_ref().unwrap();
         let wv = l.wv.as_ref().unwrap();
         let wo = l.wo.as_ref().unwrap();
         let ffn_gate = l.ffn_gate.as_ref().unwrap();
-        let ffn_up   = l.ffn_up.as_ref().unwrap();
+        let ffn_up = l.ffn_up.as_ref().unwrap();
         let ffn_down = l.ffn_down.as_ref().unwrap();
 
         // Accept Q4_0/Q4_1 group or Q4_K/Q6_K group (no mixing between groups)
@@ -778,30 +1176,48 @@ impl CudaState {
         fn is_qk(t: TensorType) -> bool {
             t == TensorType::Q4_K || t == TensorType::Q6_K
         }
-        let all_q4 = is_q4(wq.ttype) && is_q4(wk.ttype)
-            && is_q4(wv.ttype) && is_q4(wo.ttype)
-            && is_q4(ffn_gate.ttype) && is_q4(ffn_up.ttype)
+        let all_q4 = is_q4(wq.ttype)
+            && is_q4(wk.ttype)
+            && is_q4(wv.ttype)
+            && is_q4(wo.ttype)
+            && is_q4(ffn_gate.ttype)
+            && is_q4(ffn_up.ttype)
             && is_q4(ffn_down.ttype);
-        let all_qk = is_qk(wq.ttype) && is_qk(wk.ttype)
-            && is_qk(wv.ttype) && is_qk(wo.ttype)
-            && is_qk(ffn_gate.ttype) && is_qk(ffn_up.ttype)
+        let all_qk = is_qk(wq.ttype)
+            && is_qk(wk.ttype)
+            && is_qk(wv.ttype)
+            && is_qk(wo.ttype)
+            && is_qk(ffn_gate.ttype)
+            && is_qk(ffn_up.ttype)
             && is_qk(ffn_down.ttype);
-        if !all_q4 && !all_qk { return false; }
-
-        if !self.has_weight(&wq.name) || !self.has_weight(&wk.name) || !self.has_weight(&wv.name)
-            || !self.has_weight(&wo.name) || !self.has_weight(&ffn_gate.name)
-            || !self.has_weight(&ffn_up.name) || !self.has_weight(&ffn_down.name) {
+        if !all_q4 && !all_qk {
             return false;
         }
-        let norm_attn_w = match self.get_weight_ptr(&attn_norm.name) { Some(p) => p, None => return false };
-        let norm_ffn_w  = match self.get_weight_ptr(&ffn_norm.name)  { Some(p) => p, None => return false };
+
+        if !self.has_weight(&wq.name)
+            || !self.has_weight(&wk.name)
+            || !self.has_weight(&wv.name)
+            || !self.has_weight(&wo.name)
+            || !self.has_weight(&ffn_gate.name)
+            || !self.has_weight(&ffn_up.name)
+            || !self.has_weight(&ffn_down.name)
+        {
+            return false;
+        }
+        let norm_attn_w = match self.get_weight_ptr(&attn_norm.name) {
+            Some(p) => p,
+            None => return false,
+        };
+        let norm_ffn_w = match self.get_weight_ptr(&ffn_norm.name) {
+            Some(p) => p,
+            None => return false,
+        };
         let bq_bias = l.bq.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
         let bk_bias = l.bk.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
         let bv_bias = l.bv.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
 
         let max_pos = positions.iter().copied().max().unwrap_or(0);
-        if !self.kv_ensure_layer(il, max_pos + 1) {
-        }
+        if !self.kv_ensure_layer(il, max_pos + 1) {}
 
         let hidden_len = nt * ne * 4;
         let bn_len = hidden_len;
@@ -836,13 +1252,22 @@ impl CudaState {
         self.debug_sync(il as i32, "quantize_q8_0(attn)");
         self.matmul_on_gpu(wq, q8_bn, bn, bq_buf, nqt, ne, nt);
         self.debug_sync(il as i32, "wq matmul");
-        if let Some(bb) = bq_bias { self.add_bias_f32(bq_buf, bb, nqt, nt); self.debug_sync(il as i32, "bq bias"); }
+        if let Some(bb) = bq_bias {
+            self.add_bias_f32(bq_buf, bb, nqt, nt);
+            self.debug_sync(il as i32, "bq bias");
+        }
         self.matmul_on_gpu(wk, q8_bn, bn, bk_buf, nkt, ne, nt);
         self.debug_sync(il as i32, "wk matmul");
-        if let Some(bb) = bk_bias { self.add_bias_f32(bk_buf, bb, nkt, nt); self.debug_sync(il as i32, "bk bias"); }
+        if let Some(bb) = bk_bias {
+            self.add_bias_f32(bk_buf, bb, nkt, nt);
+            self.debug_sync(il as i32, "bk bias");
+        }
         self.matmul_on_gpu(wv, q8_bn, bn, bv_buf, nkt, ne, nt);
         self.debug_sync(il as i32, "wv matmul");
-        if let Some(bb) = bv_bias { self.add_bias_f32(bv_buf, bb, nkt, nt); self.debug_sync(il as i32, "bv bias"); }
+        if let Some(bb) = bv_bias {
+            self.add_bias_f32(bv_buf, bb, nkt, nt);
+            self.debug_sync(il as i32, "bv bias");
+        }
         self.rope_f32(bq_buf, nh, hd, nt, freq_base, freq_scale, pos_buf);
         self.debug_sync(il as i32, "rope q");
         self.rope_f32(bk_buf, nk, hd, nt, freq_base, freq_scale, pos_buf);
@@ -852,8 +1277,18 @@ impl CudaState {
         self.store_kv_f32(bv_buf, kv_v as *mut std::ffi::c_void, nkt, nt, pos_buf);
         self.debug_sync(il as i32, "store_kv v");
         let scale = 1.0 / (hd as f32).sqrt();
-        self.gqa_attn_f32(bq_buf, kv_k as *mut std::ffi::c_void, kv_v as *mut std::ffi::c_void,
-            ba_buf, pos_buf, nh, nk, hd, scale, nt);
+        self.gqa_attn_f32(
+            bq_buf,
+            kv_k as *mut std::ffi::c_void,
+            kv_v as *mut std::ffi::c_void,
+            ba_buf,
+            pos_buf,
+            nh,
+            nk,
+            hd,
+            scale,
+            nt,
+        );
         self.debug_sync(il as i32, "gqa_attn");
 
         // wo projection
@@ -891,7 +1326,11 @@ impl CudaState {
         output: &Tensor,
         output_norm: Option<&Tensor>,
         output_b: Option<&Tensor>,
-        ne: usize, nv: usize, nt: usize, n_out: usize, eps: f32,
+        ne: usize,
+        nv: usize,
+        nt: usize,
+        n_out: usize,
+        eps: f32,
     ) -> bool {
         let norm_w = match output_norm {
             Some(t) => match self.get_weight_ptr(&t.name) {
@@ -900,10 +1339,15 @@ impl CudaState {
             },
             None => return false,
         };
-        if !self.has_weight(&output.name) { return false; }
-        if output.ttype != TensorType::Q4_0 && output.ttype != TensorType::Q8_0
+        if !self.has_weight(&output.name) {
+            return false;
+        }
+        if output.ttype != TensorType::Q4_0
+            && output.ttype != TensorType::Q8_0
             && output.ttype != TensorType::Q4_1
-            && output.ttype != TensorType::Q4_K && output.ttype != TensorType::Q6_K {
+            && output.ttype != TensorType::Q4_K
+            && output.ttype != TensorType::Q6_K
+        {
             return false;
         }
         debug_assert!(n_out <= nt, "n_out={n_out} > nt={nt}");
@@ -939,5 +1383,4 @@ impl CudaState {
         }
         true
     }
-
 }

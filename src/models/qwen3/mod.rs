@@ -40,7 +40,14 @@ impl Qwen3Model {
 }
 
 impl ModelDef for Qwen3Model {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+    fn forward(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        kv: &mut KVCache,
+        n_out: usize,
+        n_ctx: usize,
+    ) -> Vec<f32> {
         graph::Qwen3Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
     }
 
@@ -48,11 +55,21 @@ impl ModelDef for Qwen3Model {
         self
     }
 
-    fn build_graph(&self, params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {
+    fn build_graph(
+        &self,
+        params: &crate::graph::params::GraphParams,
+    ) -> crate::graph::ComputeGraph {
         graph::Qwen3Graph::build(self, params)
     }
 
-    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+    fn forward_graph(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        kv: &mut KVCache,
+        n_out: usize,
+        n_ctx: usize,
+    ) -> Vec<f32> {
         graph::Qwen3Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
     }
 
@@ -77,12 +94,24 @@ impl ModelDef for Qwen3Model {
         SpecialTokens { eos, im_end }
     }
 
-    fn n_layer(&self) -> usize { self.hparams.n_layer as usize }
-    fn n_head_kv(&self) -> usize { self.hparams.n_head_kv as usize }
-    fn n_embd_head(&self) -> usize { self.hparams.n_embd_head() as usize }
-    fn n_kv_embd(&self) -> usize { self.hparams.n_kv_embd as usize }
-    fn n_vocab(&self) -> usize { self.hparams.n_vocab as usize }
-    fn rope_style(&self) -> crate::vec_ops::RopeStyle { self.hparams.rope_style }
+    fn n_layer(&self) -> usize {
+        self.hparams.n_layer as usize
+    }
+    fn n_head_kv(&self) -> usize {
+        self.hparams.n_head_kv as usize
+    }
+    fn n_embd_head(&self) -> usize {
+        self.hparams.n_embd_head() as usize
+    }
+    fn n_kv_embd(&self) -> usize {
+        self.hparams.n_kv_embd as usize
+    }
+    fn n_vocab(&self) -> usize {
+        self.hparams.n_vocab as usize
+    }
+    fn rope_style(&self) -> crate::vec_ops::RopeStyle {
+        self.hparams.rope_style
+    }
 }
 
 /// Simple ChatML formatting (fallback; template.rs renders the model's own
@@ -91,9 +120,7 @@ impl ModelDef for Qwen3Model {
 fn format_chatml(messages: &[(String, String)]) -> String {
     let mut prompt = String::new();
     for (role, content) in messages {
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n", role, content
-        ));
+        prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
     }
     prompt.push_str("<|im_start|>assistant\n");
     prompt
@@ -109,17 +136,39 @@ pub mod tensor_names {
     pub const OUTPUT: &str = "output.weight";
     pub const OUTPUT_BIAS: &str = "output.bias";
 
-    pub fn attn_norm(i: usize) -> String { format!("blk.{}.attn_norm.weight", i) }
-    pub fn attn_q(i: usize) -> String { format!("blk.{}.attn_q.weight", i) }
-    pub fn attn_k(i: usize) -> String { format!("blk.{}.attn_k.weight", i) }
-    pub fn attn_v(i: usize) -> String { format!("blk.{}.attn_v.weight", i) }
-    pub fn attn_out(i: usize) -> String { format!("blk.{}.attn_output.weight", i) }
+    pub fn attn_norm(i: usize) -> String {
+        format!("blk.{}.attn_norm.weight", i)
+    }
+    pub fn attn_q(i: usize) -> String {
+        format!("blk.{}.attn_q.weight", i)
+    }
+    pub fn attn_k(i: usize) -> String {
+        format!("blk.{}.attn_k.weight", i)
+    }
+    pub fn attn_v(i: usize) -> String {
+        format!("blk.{}.attn_v.weight", i)
+    }
+    pub fn attn_out(i: usize) -> String {
+        format!("blk.{}.attn_output.weight", i)
+    }
     /// Per-head Q RMSNorm weight (Qwen3): shape [n_embd_head].
-    pub fn attn_q_norm(i: usize) -> String { format!("blk.{}.attn_q_norm.weight", i) }
+    pub fn attn_q_norm(i: usize) -> String {
+        format!("blk.{}.attn_q_norm.weight", i)
+    }
     /// Per-head K RMSNorm weight (Qwen3): shape [n_embd_head].
-    pub fn attn_k_norm(i: usize) -> String { format!("blk.{}.attn_k_norm.weight", i) }
-    pub fn ffn_norm(i: usize) -> String { format!("blk.{}.ffn_norm.weight", i) }
-    pub fn ffn_gate(i: usize) -> String { format!("blk.{}.ffn_gate.weight", i) }
-    pub fn ffn_up(i: usize) -> String { format!("blk.{}.ffn_up.weight", i) }
-    pub fn ffn_down(i: usize) -> String { format!("blk.{}.ffn_down.weight", i) }
+    pub fn attn_k_norm(i: usize) -> String {
+        format!("blk.{}.attn_k_norm.weight", i)
+    }
+    pub fn ffn_norm(i: usize) -> String {
+        format!("blk.{}.ffn_norm.weight", i)
+    }
+    pub fn ffn_gate(i: usize) -> String {
+        format!("blk.{}.ffn_gate.weight", i)
+    }
+    pub fn ffn_up(i: usize) -> String {
+        format!("blk.{}.ffn_up.weight", i)
+    }
+    pub fn ffn_down(i: usize) -> String {
+        format!("blk.{}.ffn_down.weight", i)
+    }
 }

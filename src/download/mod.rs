@@ -61,7 +61,11 @@ fn resolve_cached_name(name: &str, cache_dir: &Path) -> Result<PathBuf, String> 
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
     for p in &paths {
-        let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if fname == name {
             exact.push(p.clone());
         } else if fname.starts_with(name) {
@@ -102,7 +106,9 @@ fn resolve_cached_name(name: &str, cache_dir: &Path) -> Result<PathBuf, String> 
 
 /// Recursively collect all `*.gguf` paths under `dir`.
 fn collect_gguf_paths(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -140,11 +146,17 @@ fn match_model(filenames: &[String], requested: Option<&str>) -> Result<Vec<Stri
         };
         match groups.iter_mut().find(|g| g.base == base) {
             Some(g) => g.files.push(f.clone()),
-            None => groups.push(Group { base, files: vec![f.clone()] }),
+            None => groups.push(Group {
+                base,
+                files: vec![f.clone()],
+            }),
         }
     }
     let list = |g: &[&Group]| -> String {
-        g.iter().map(|g| format!("  {}", g.base)).collect::<Vec<_>>().join("\n")
+        g.iter()
+            .map(|g| format!("  {}", g.base))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     if let Some(req) = requested {
@@ -153,7 +165,10 @@ fn match_model(filenames: &[String], requested: Option<&str>) -> Result<Vec<Stri
                 Some((prefix, _, _)) => prefix,
                 None => f.strip_suffix(".gguf").unwrap_or(f).to_string(),
             };
-            let group = groups.iter().find(|g| g.base == base).expect("group exists");
+            let group = groups
+                .iter()
+                .find(|g| g.base == base)
+                .expect("group exists");
             return Ok(group.files.clone());
         }
         let q = req.to_lowercase();
@@ -207,8 +222,13 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
     let json = http_get(&api_url)?;
 
     // Parse siblings from the HF API response object
-    let api_resp: HfApiResponse = serde_json::from_str(&json)
-        .map_err(|e| format!("JSON parse error: {}. API response: {}..", e, &json[..json.len().min(100)]))?;
+    let api_resp: HfApiResponse = serde_json::from_str(&json).map_err(|e| {
+        format!(
+            "JSON parse error: {}. API response: {}..",
+            e,
+            &json[..json.len().min(100)]
+        )
+    })?;
 
     let gguf_files: Vec<&HfSibling> = api_resp
         .siblings
@@ -220,7 +240,8 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
         return Err(format!(
             "No .gguf files found in '{}'. Available files:\n{}",
             repo,
-            api_resp.siblings
+            api_resp
+                .siblings
                 .iter()
                 .map(|s| format!("  {}", s.rfilename))
                 .collect::<Vec<_>>()
@@ -243,10 +264,7 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
 
     for name in &parts {
         let file_path = hf_dir.join(name);
-        let download_url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            repo, name
-        );
+        let download_url = format!("https://huggingface.co/{}/resolve/main/{}", repo, name);
         // Expected size: prefer the HF API `size`; fall back to a HEAD request
         // (many repos omit `size`), so a complete cached file is skipped, not
         // re-fetched.
@@ -257,9 +275,10 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
             .or_else(|| head_content_length(&download_url));
         // Skip only when the file exists AND its size matches the remote one —
         // a partial/interrupted download must be resumed, not skipped.
-        let complete = file_path.exists() && size.map_or(false, |s| {
-            file_path.metadata().map(|m| m.len() == s).unwrap_or(false)
-        });
+        let complete = file_path.exists()
+            && size.map_or(false, |s| {
+                file_path.metadata().map(|m| m.len() == s).unwrap_or(false)
+            });
         if complete {
             eprintln!("Already cached: {}", file_path.display());
             continue;
@@ -322,13 +341,21 @@ fn download_ollama(model: &str, cache_dir: &Path) -> Result<PathBuf, String> {
     let ollama_blobs = PathBuf::from(&ollama_home).join(".ollama/models/blobs");
 
     // Get manifest to find the GGUF digest
-    let manifest_path = PathBuf::from(&ollama_home)
-        .join(format!(".ollama/models/manifests/registry.ollama.ai/library/{}/{}", model_name, tag));
-    let manifest_json = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("Cannot read Ollama manifest: {}. Try 'ollama pull {}' first. Error: {}", manifest_path.display(), full_name, e))?;
+    let manifest_path = PathBuf::from(&ollama_home).join(format!(
+        ".ollama/models/manifests/registry.ollama.ai/library/{}/{}",
+        model_name, tag
+    ));
+    let manifest_json = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        format!(
+            "Cannot read Ollama manifest: {}. Try 'ollama pull {}' first. Error: {}",
+            manifest_path.display(),
+            full_name,
+            e
+        )
+    })?;
 
-    let manifest: OllamaManifest = serde_json::from_str(&manifest_json)
-        .map_err(|e| format!("Parse manifest: {}", e))?;
+    let manifest: OllamaManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| format!("Parse manifest: {}", e))?;
 
     // Find the largest blob (the GGUF model file)
     let largest = manifest
@@ -338,7 +365,10 @@ fn download_ollama(model: &str, cache_dir: &Path) -> Result<PathBuf, String> {
         .max_by_key(|l| l.size)
         .ok_or("No layers in manifest")?;
 
-    let digest = largest.digest.strip_prefix("sha256:").unwrap_or(&largest.digest);
+    let digest = largest
+        .digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&largest.digest);
     let blob_path = ollama_blobs.join(format!("sha256-{}", digest));
 
     if !blob_path.exists() {
@@ -357,8 +387,7 @@ fn download_ollama(model: &str, cache_dir: &Path) -> Result<PathBuf, String> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::copy(&blob_path, &gguf_path)
-            .map_err(|e| format!("copy: {}", e))?;
+        std::fs::copy(&blob_path, &gguf_path).map_err(|e| format!("copy: {}", e))?;
     }
 
     eprintln!("Linked: {} ← {}", gguf_path.display(), blob_path.display());
@@ -426,8 +455,10 @@ fn http_download(url: &str, path: &Path, _expected_size: Option<u64>) -> Result<
     let status = std::process::Command::new("curl")
         .args([
             "-L",
-            "-C", "-",          // resume if possible
-            "-o", &path_str,
+            "-C",
+            "-", // resume if possible
+            "-o",
+            &path_str,
             "--progress-bar",
             url,
         ])
@@ -534,7 +565,12 @@ mod tests {
     fn match_single_file_quant_case_insensitive() {
         let files = single("qwen2.5-0.5b-instruct-q4_0.gguf");
         assert_eq!(match_model(&files, Some("Q4_0")).unwrap(), files);
-        assert_eq!(match_model(&files, Some("Q4_K_M")).unwrap_err().contains("not found"), true);
+        assert_eq!(
+            match_model(&files, Some("Q4_K_M"))
+                .unwrap_err()
+                .contains("not found"),
+            true
+        );
     }
 
     #[test]
@@ -543,7 +579,10 @@ mod tests {
         let got = match_model(&files, Some("q4_k_m")).unwrap();
         assert_eq!(got, files);
         assert_eq!(match_model(&files, Some("Q4_K_M")).unwrap(), files);
-        assert_eq!(match_model(&files, Some("qwen2.5-7b-instruct-q4_k_m")).unwrap(), files);
+        assert_eq!(
+            match_model(&files, Some("qwen2.5-7b-instruct-q4_k_m")).unwrap(),
+            files
+        );
     }
 
     #[test]
@@ -563,11 +602,19 @@ mod tests {
         // two different base names share the same quant tail → ambiguous
         let err = match_model(&files, Some("q4_k_m")).unwrap_err();
         assert!(err.contains("ambiguous"), "err: {err}");
-        assert!(err.contains("m1-q4_k_m") && err.contains("m2-q4_k_m"), "err: {err}");
+        assert!(
+            err.contains("m1-q4_k_m") && err.contains("m2-q4_k_m"),
+            "err: {err}"
+        );
         // unique
-        assert_eq!(match_model(&files, Some("q5_k_m")).unwrap(), split("m2-q5_k_m", 2));
+        assert_eq!(
+            match_model(&files, Some("q5_k_m")).unwrap(),
+            split("m2-q5_k_m", 2)
+        );
         // not found
-        assert!(match_model(&files, Some("q4_0")).unwrap_err().contains("not found"));
+        assert!(match_model(&files, Some("q4_0"))
+            .unwrap_err()
+            .contains("not found"));
     }
 
     #[test]
@@ -579,6 +626,8 @@ mod tests {
         let mut files2 = Vec::new();
         files2.extend(single("m1-q4_0.gguf"));
         files2.extend(single("m2-q4_k_m.gguf"));
-        assert!(match_model(&files2, None).unwrap_err().contains("Multiple models"));
+        assert!(match_model(&files2, None)
+            .unwrap_err()
+            .contains("Multiple models"));
     }
 }

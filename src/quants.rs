@@ -2,7 +2,7 @@
 // interface. Fast paths: AVX2+FMA on x86_64, NEON+SDOT on aarch64, with
 // scalar fallbacks. Activation formats: Q8_0 (simple weight types) and Q8_K
 // (K-quant weights — 256-element blocks with precomputed bsums).
-use crate::block::{self, Q4B, Q41B, Q8B, Q4KB, Q6KB};
+use crate::block::{self, Q41B, Q4B, Q4KB, Q6KB, Q8B};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -18,7 +18,9 @@ fn f16_to_f32_bits(bits: u16) -> f32 {
     let exp = (i >> 10) & 0x1F;
     let mant = i & 0x3FF;
     if exp == 0 {
-        if mant == 0 { return f32::from_bits(sign); }
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
         let pos = 31 - mant.leading_zeros();
         return f32::from_bits(sign | ((103 + pos) << 23) | ((mant - (1 << pos)) << (23 - pos)));
     }
@@ -72,8 +74,8 @@ fn dot_q4_1_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
     for ib in 0..nb {
         let xb = &x[ib * Q41B..];
         let yb = &y[ib * Q8B..];
-        let d  = block::fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
-        let m  = block::fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        let d = block::fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
+        let m = block::fp16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
         let dy = block::fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
         let mut sum_q = 0i32;
         let mut sum_y = 0i32;
@@ -191,7 +193,9 @@ fn dot_q8_0_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
         let dx = block::fp16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
         let dy = block::fp16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
         let mut si = 0i32;
-        for j in 0..32 { si += (xb[2 + j] as i8 as i32) * (yb[2 + j] as i8 as i32); }
+        for j in 0..32 {
+            si += (xb[2 + j] as i8 as i32) * (yb[2 + j] as i8 as i32);
+        }
         s += si as f32 * dx * dy;
     }
     s
@@ -269,14 +273,14 @@ fn dot_q5_1_q8_0_scalar(q5: &[u8], q8: &[u8], nb: usize) -> f32 {
         let qh = u32::from_le_bytes([q5b[4], q5b[5], q5b[6], q5b[7]]);
         let qs = &q5b[8..24];
         let mut sum_sub = 0i32;
-        let mut sum_q8  = 0i32;
+        let mut sum_q8 = 0i32;
         for j in 0..16 {
             let u_lo = (qs[j] & 0x0F) as i32 | (((qh >> j) & 1) as i32) << 4;
             let u_hi = ((qs[j] >> 4) & 0x0F) as i32 | (((qh >> (j + 16)) & 1) as i32) << 4;
             let q8_lo = q8b[2 + j] as i8 as i32;
             let q8_hi = q8b[2 + j + 16] as i8 as i32;
             sum_sub += u_lo * q8_lo + u_hi * q8_hi;
-            sum_q8  += q8_lo + q8_hi;
+            sum_q8 += q8_lo + q8_hi;
         }
         // Q5_1 dequant: val = d_q5 * unsigned_5bit + m_q5 (no -16 offset!)
         // dot = d_q8 * d_q5 * Σ(u×q) + d_q8 * m_q5 * Σ(q)
@@ -334,13 +338,26 @@ unsafe fn quantize_avx2(x: &[f32], y: &mut [u8], k: usize) {
         let d = ms / 127.0f32;
         let db = half::f16::from_f32(d).to_bits().to_le_bytes();
         let yo = i * Q8B;
-        y[yo] = db[0]; y[yo + 1] = db[1];
+        y[yo] = db[0];
+        y[yo + 1] = db[1];
         let id = if ms != 0.0 { 127.0f32 / ms } else { 0.0f32 };
         let mul = _mm256_set1_ps(id);
-        let i0 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v0, mul), _MM_ROUND_NEAREST as i32));
-        let i1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v1, mul), _MM_ROUND_NEAREST as i32));
-        let i2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v2, mul), _MM_ROUND_NEAREST as i32));
-        let i3 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v3, mul), _MM_ROUND_NEAREST as i32));
+        let i0 = _mm256_cvtps_epi32(_mm256_round_ps(
+            _mm256_mul_ps(v0, mul),
+            _MM_ROUND_NEAREST as i32,
+        ));
+        let i1 = _mm256_cvtps_epi32(_mm256_round_ps(
+            _mm256_mul_ps(v1, mul),
+            _MM_ROUND_NEAREST as i32,
+        ));
+        let i2 = _mm256_cvtps_epi32(_mm256_round_ps(
+            _mm256_mul_ps(v2, mul),
+            _MM_ROUND_NEAREST as i32,
+        ));
+        let i3 = _mm256_cvtps_epi32(_mm256_round_ps(
+            _mm256_mul_ps(v3, mul),
+            _MM_ROUND_NEAREST as i32,
+        ));
         let i0 = _mm256_packs_epi32(i0, i1);
         let i2 = _mm256_packs_epi32(i2, i3);
         let i0 = _mm256_packs_epi16(i0, i2);
@@ -353,13 +370,18 @@ fn quantize_scalar(x: &[f32], y: &mut [u8], k: usize) {
     let nb = k / 32;
     for i in 0..nb {
         let mut am = 0.0f32;
-        for j in 0..32 { am = am.max(x[i * 32 + j].abs()); }
+        for j in 0..32 {
+            am = am.max(x[i * 32 + j].abs());
+        }
         let d = am / 127.0f32;
         let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
         let db = half::f16::from_f32(d).to_bits().to_le_bytes();
         let yo = i * Q8B;
-        y[yo] = db[0]; y[yo + 1] = db[1];
-        for j in 0..32 { y[yo + 2 + j] = (x[i * 32 + j] * id).round_ties_even().clamp(-128.0, 127.0) as i8 as u8; }
+        y[yo] = db[0];
+        y[yo + 1] = db[1];
+        for j in 0..32 {
+            y[yo + 2 + j] = (x[i * 32 + j] * id).round_ties_even().clamp(-128.0, 127.0) as i8 as u8;
+        }
     }
 }
 
@@ -372,20 +394,27 @@ pub fn quantize_row_q8_0_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
         static DUMPED: AtomicBool = AtomicBool::new(false);
         if !DUMPED.swap(true, Ordering::Relaxed) && nt > 0 && dim >= 32 {
             let mut am = 0.0f32;
-            for j in 0..32 { am = am.max(x[j].abs()); }
+            for j in 0..32 {
+                am = am.max(x[j].abs());
+            }
             let d = am / 127.0f32;
             let q0 = (x[0] / d).round().clamp(-128.0, 127.0) as i8;
             let q1 = (x[1] / d).round().clamp(-128.0, 127.0) as i8;
             let q16 = (x[16] / d).round().clamp(-128.0, 127.0) as i8;
             crate::dump::maybe_dump_text(
                 "minfer_dump_q8_quant_verify",
-                &format!("amax={:e} d={:e} x[0]={:e} x[1]={:e} x[16]={:e} q[0]={} q[1]={} q[16]={}",
-                    am, d, x[0], x[1], x[16], q0, q1, q16),
+                &format!(
+                    "amax={:e} d={:e} x[0]={:e} x[1]={:e} x[16]={:e} q[0]={} q[1]={} q[16]={}",
+                    am, d, x[0], x[1], x[16], q0, q1, q16
+                ),
             );
         }
     }
     for t in 0..nt {
-        quantize_row_q8_0_to(&x[t * dim..(t + 1) * dim], &mut buf[t * rowb..(t + 1) * rowb]);
+        quantize_row_q8_0_to(
+            &x[t * dim..(t + 1) * dim],
+            &mut buf[t * rowb..(t + 1) * rowb],
+        );
     }
 }
 
@@ -402,7 +431,9 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
 mod tests {
     use super::*;
 
-    fn f32_to_fp16(v: f32) -> u16 { half::f16::from_f32(v).to_bits() }
+    fn f32_to_fp16(v: f32) -> u16 {
+        half::f16::from_f32(v).to_bits()
+    }
 
     #[test]
     fn test_unpack_q4k_scales_boundary() {
@@ -415,7 +446,7 @@ mod tests {
         // All 63 (max 6-bit value) in low-6-bit slots, high-2-bit slots set to pack 63 into indices 4-7
         let mut sc = [0u8; 12];
         for j in 0..4 {
-            sc[j] = 63;     // scales[j] low 6 bits = 63
+            sc[j] = 63; // scales[j] low 6 bits = 63
             sc[j + 4] = 63; // mins[j] low 6 bits = 63
         }
         // For indices 4-7: high 2 bits stored in sc[0..3]>>6 and sc[4..7]>>6
@@ -434,8 +465,14 @@ mod tests {
 
         // Mixed: known values
         let mut sc = [0u8; 12];
-        sc[0] = 10; sc[1] = 20; sc[2] = 30; sc[3] = 40;
-        sc[4] = 5; sc[5] = 15; sc[6] = 25; sc[7] = 35;
+        sc[0] = 10;
+        sc[1] = 20;
+        sc[2] = 30;
+        sc[3] = 40;
+        sc[4] = 5;
+        sc[5] = 15;
+        sc[6] = 25;
+        sc[7] = 35;
         // scales[4]=50: low4=0x2, high2=0x3 → sc[8]&0xF=2, sc[0]>>6=3 → sc[0]|=0xC0
         // mins[4]=45: low4=0xD, high2=0x2 → sc[8]>>4=0xD, sc[4]>>6=2 → sc[4]|=0x80
         sc[8] = 0x02 | (0x0D << 4); // scales[4] low=2, mins[4] low=0xD
@@ -458,18 +495,29 @@ mod tests {
     fn test_q8k_dot_simple() {
         let mut x = vec![0u8; Q8B];
         let mut y = vec![0u8; Q8B];
-        let dx = 0.5f32; let dy = 2.0f32;
+        let dx = 0.5f32;
+        let dy = 2.0f32;
         let dx_bits = f32_to_fp16(dx).to_le_bytes();
         let dy_bits = f32_to_fp16(dy).to_le_bytes();
-        x[0] = dx_bits[0]; x[1] = dx_bits[1];
-        y[0] = dy_bits[0]; y[1] = dy_bits[1];
-        for j in 0..32 { x[2 + j] = (j as i8) as u8; y[2 + j] = (31 - j as i8) as u8; }
+        x[0] = dx_bits[0];
+        x[1] = dx_bits[1];
+        y[0] = dy_bits[0];
+        y[1] = dy_bits[1];
+        for j in 0..32 {
+            x[2 + j] = (j as i8) as u8;
+            y[2 + j] = (31 - j as i8) as u8;
+        }
         let result = dot_q8_0_q8_0(&x, &y);
         let mut ref_sum = 0.0f32;
         for j in 0..32 {
             ref_sum += ((j as i8) as f32 * dx) * (((31 - j) as i8) as f32 * dy);
         }
-        eprintln!("test_q8k_dot_simple: result={:e} ref={:e} diff={:e}", result, ref_sum, (result - ref_sum).abs());
+        eprintln!(
+            "test_q8k_dot_simple: result={:e} ref={:e} diff={:e}",
+            result,
+            ref_sum,
+            (result - ref_sum).abs()
+        );
         assert!((result - ref_sum).abs() < 0.01);
     }
 
@@ -480,9 +528,11 @@ mod tests {
         // weight = d * unsigned_5bit + m
         let mut q5 = vec![0u8; 24];
         // d = 2.0 (fp16: 0x4000)
-        q5[0] = 0x00; q5[1] = 0x40;
+        q5[0] = 0x00;
+        q5[1] = 0x40;
         // m = 0.5 (fp16: 0x3800)
-        q5[2] = 0x00; q5[3] = 0x38;
+        q5[2] = 0x00;
+        q5[3] = 0x38;
         // qh = 0 (no high bits)
         // qs nibbles: 0,1,2,...,15 for both lo and hi
         for j in 0..16u8 {
@@ -491,10 +541,14 @@ mod tests {
 
         // Build Q8_0 activation: all 1.0 -> d_q8 = 1.0/127 ≈ 0.007874, quants = 127
         let mut q8 = vec![0u8; 34];
-        q8[0] = 0x00; q8[1] = 0x20; // fp16 1.0/128? Let's use d_q8=1.0, actually use known values
-        // Actually, let's use d_q8 = 1.0 (fp16 0x3C00) and all quants = 1
-        q8[0] = 0x00; q8[1] = 0x3C; // d_q8 = 1.0
-        for j in 0..32 { q8[2 + j] = 1u8; } // quants = 1
+        q8[0] = 0x00;
+        q8[1] = 0x20; // fp16 1.0/128? Let's use d_q8=1.0, actually use known values
+                      // Actually, let's use d_q8 = 1.0 (fp16 0x3C00) and all quants = 1
+        q8[0] = 0x00;
+        q8[1] = 0x3C; // d_q8 = 1.0
+        for j in 0..32 {
+            q8[2 + j] = 1u8;
+        } // quants = 1
 
         let result = dot_q5_1_q8_0(&q5, &q8);
 
@@ -506,10 +560,19 @@ mod tests {
             ref_sum += 2.0 * j as f32 + 0.5 + 2.0 * j as f32 + 0.5;
         }
         // ref = 32*0.5 + 2*2*Σ(j=0..15) = 16 + 4*120 = 16 + 480 = 496
-        eprintln!("test_q5_1_dot: result={:e} ref={:e} diff={:e}", result, ref_sum, (result - ref_sum).abs());
-        assert!((result - ref_sum).abs() < 1.0, "result={} ref={}", result, ref_sum);
+        eprintln!(
+            "test_q5_1_dot: result={:e} ref={:e} diff={:e}",
+            result,
+            ref_sum,
+            (result - ref_sum).abs()
+        );
+        assert!(
+            (result - ref_sum).abs() < 1.0,
+            "result={} ref={}",
+            result,
+            ref_sum
+        );
     }
-
 }
 
 // ============================================================
@@ -648,14 +711,20 @@ mod neon_kernels {
                 hb[j + 16] = ((qh >> (j + 16)) & 1) as i8;
             }
             let bytes = vld1q_u8(qs.as_ptr());
-            let lo = vsubq_s8(vorrq_s8(
-                vreinterpretq_s8_u8(vandq_u8(bytes, m4b)),
-                vshlq_n_s8::<4>(vld1q_s8(hb.as_ptr())),
-            ), s16);
-            let hi = vsubq_s8(vorrq_s8(
-                vreinterpretq_s8_u8(vshrq_n_u8::<4>(bytes)),
-                vshlq_n_s8::<4>(vld1q_s8(hb.as_ptr().add(16))),
-            ), s16);
+            let lo = vsubq_s8(
+                vorrq_s8(
+                    vreinterpretq_s8_u8(vandq_u8(bytes, m4b)),
+                    vshlq_n_s8::<4>(vld1q_s8(hb.as_ptr())),
+                ),
+                s16,
+            );
+            let hi = vsubq_s8(
+                vorrq_s8(
+                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(bytes)),
+                    vshlq_n_s8::<4>(vld1q_s8(hb.as_ptr().add(16))),
+                ),
+                s16,
+            );
             let y0 = vld1q_s8(q8b.as_ptr().add(2) as *const i8);
             let y1 = vld1q_s8(q8b.as_ptr().add(18) as *const i8);
             let si = dot16(lo, y0) + dot16(hi, y1);
@@ -698,7 +767,6 @@ mod neon_kernels {
         }
         s
     }
-
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -735,8 +803,10 @@ pub fn quantize_row_q8_k_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
         if neon_enabled() {
             for t in 0..nt {
                 unsafe {
-                    quantize_row_q8_k_buf_neon(&x[t * dim..(t + 1) * dim],
-                                               &mut buf[t * rowb..(t + 1) * rowb]);
+                    quantize_row_q8_k_buf_neon(
+                        &x[t * dim..(t + 1) * dim],
+                        &mut buf[t * rowb..(t + 1) * rowb],
+                    );
                 }
             }
             return;
@@ -767,8 +837,7 @@ pub fn quantize_row_q8_k_buf(x: &[f32], nt: usize, dim: usize, buf: &mut [u8]) {
             // own per-subblock scales); stored zeroed for format completeness.
             for j in 0..16 {
                 out[o + 258 + j] = 0;
-                out[o + 274 + 2 * j..o + 274 + 2 * j + 2]
-                    .copy_from_slice(&bsums[j].to_le_bytes());
+                out[o + 274 + 2 * j..o + 274 + 2 * j + 2].copy_from_slice(&bsums[j].to_le_bytes());
             }
         }
     }
@@ -845,8 +914,11 @@ fn dot_q4_k_q8_k_scalar(q4: &[u8], q8k: &[u8]) -> f32 {
         // mins term: Σ mins[s] * (bsums[2s] + bsums[2s+1]) — llama subtracts first.
         let mut mterm = 0i32;
         for s in 0..8 {
-            let b0 = i16::from_le_bytes([q8b[274 + 2 * (2 * s)], q8b[274 + 2 * (2 * s) + 1]]) as i32;
-            let b1 = i16::from_le_bytes([q8b[274 + 2 * (2 * s + 1)], q8b[274 + 2 * (2 * s + 1) + 1]]) as i32;
+            let b0 =
+                i16::from_le_bytes([q8b[274 + 2 * (2 * s)], q8b[274 + 2 * (2 * s) + 1]]) as i32;
+            let b1 =
+                i16::from_le_bytes([q8b[274 + 2 * (2 * s + 1)], q8b[274 + 2 * (2 * s + 1) + 1]])
+                    as i32;
             mterm += mins[s] as i32 * (b0 + b1);
         }
         sumf -= dmin * mterm as f32;
@@ -955,8 +1027,11 @@ fn dot_q5_k_q8_k_scalar(q5: &[u8], q8k: &[u8]) -> f32 {
         let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q5b[4..16]).unwrap());
         let mut mterm = 0i32;
         for s in 0..8 {
-            let b0 = i16::from_le_bytes([q8b[274 + 2 * (2 * s)], q8b[274 + 2 * (2 * s) + 1]]) as i32;
-            let b1 = i16::from_le_bytes([q8b[274 + 2 * (2 * s + 1)], q8b[274 + 2 * (2 * s + 1) + 1]]) as i32;
+            let b0 =
+                i16::from_le_bytes([q8b[274 + 2 * (2 * s)], q8b[274 + 2 * (2 * s) + 1]]) as i32;
+            let b1 =
+                i16::from_le_bytes([q8b[274 + 2 * (2 * s + 1)], q8b[274 + 2 * (2 * s + 1) + 1]])
+                    as i32;
             mterm += mins[s] as i32 * (b0 + b1);
         }
         sumf -= dmin * mterm as f32;
@@ -1012,9 +1087,12 @@ mod neon_q8k {
         for i in 0..n_super {
             let q4b = &q4[i * Q4KB..];
             let q8b = &q8k[i * Q8KB..];
-            let d = super::neon_kernels::fp16(q4b[0], q4b[1]) * super::neon_kernels::fp16(q8b[0], q8b[1]);
-            let dmin = super::neon_kernels::fp16(q4b[2], q4b[3]) * super::neon_kernels::fp16(q8b[0], q8b[1]);
-            let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q4b[4..16]).unwrap());
+            let d = super::neon_kernels::fp16(q4b[0], q4b[1])
+                * super::neon_kernels::fp16(q8b[0], q8b[1]);
+            let dmin = super::neon_kernels::fp16(q4b[2], q4b[3])
+                * super::neon_kernels::fp16(q8b[0], q8b[1]);
+            let (scales, mins) =
+                block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q4b[4..16]).unwrap());
             // mins term: (bsums[2s]+bsums[2s+1]) per 32-element subblock
             let bsums0 = vld1q_s16(q8b.as_ptr().add(274) as *const i16);
             let bsums1 = vld1q_s16(q8b.as_ptr().add(274 + 16) as *const i16);
@@ -1076,7 +1154,8 @@ mod neon_q8k {
         for i in 0..n_super {
             let q6b = &q6[i * Q6KB..];
             let q8b = &q8k[i * Q8KB..];
-            let d = super::neon_kernels::fp16(q6b[208], q6b[209]) * super::neon_kernels::fp16(q8b[0], q8b[1]);
+            let d = super::neon_kernels::fp16(q6b[208], q6b[209])
+                * super::neon_kernels::fp16(q8b[0], q8b[1]);
             for n in 0..2 {
                 let qlp = q6b.as_ptr().add(n * 64);
                 let qhp = q6b.as_ptr().add(128 + n * 32);
@@ -1086,14 +1165,62 @@ mod neon_q8k {
                 let ql3 = vld1q_u8(qlp.add(48));
                 let qh0 = vld1q_u8(qhp);
                 let qh1 = vld1q_u8(qhp.add(16));
-                let q0a = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0, m4b), vshlq_n_u8::<4>(vandq_u8(qh0, m3)))), s32);
-                let q0b = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1, m4b), vshlq_n_u8::<4>(vandq_u8(qh1, m3)))), s32);
-                let q1a = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql2, m4b), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh0), m3)))), s32);
-                let q1b = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql3, m4b), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh1), m3)))), s32);
-                let q2a = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql0), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh0), m3)))), s32);
-                let q2b = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql1), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh1), m3)))), s32);
-                let q3a = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql2), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<6>(qh0), m3)))), s32);
-                let q3b = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql3), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<6>(qh1), m3)))), s32);
+                let q0a = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql0, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(qh0, m3)),
+                    )),
+                    s32,
+                );
+                let q0b = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql1, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(qh1, m3)),
+                    )),
+                    s32,
+                );
+                let q1a = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql2, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh0), m3)),
+                    )),
+                    s32,
+                );
+                let q1b = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(ql3, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh1), m3)),
+                    )),
+                    s32,
+                );
+                let q2a = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(ql0),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh0), m3)),
+                    )),
+                    s32,
+                );
+                let q2b = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(ql1),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh1), m3)),
+                    )),
+                    s32,
+                );
+                let q3a = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(ql2),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<6>(qh0), m3)),
+                    )),
+                    s32,
+                );
+                let q3b = vsubq_s8(
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(ql3),
+                        vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<6>(qh1), m3)),
+                    )),
+                    s32,
+                );
                 let qv = [q0a, q0b, q1a, q1b, q2a, q2b, q3a, q3b];
                 let mut acc = zero;
                 for g in 0..8 {
@@ -1119,9 +1246,12 @@ mod neon_q8k {
         for i in 0..n_super {
             let q5b = &q5[i * 176..];
             let q8b = &q8k[i * Q8KB..];
-            let d = super::neon_kernels::fp16(q5b[0], q5b[1]) * super::neon_kernels::fp16(q8b[0], q8b[1]);
-            let dmin = super::neon_kernels::fp16(q5b[2], q5b[3]) * super::neon_kernels::fp16(q8b[0], q8b[1]);
-            let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q5b[4..16]).unwrap());
+            let d = super::neon_kernels::fp16(q5b[0], q5b[1])
+                * super::neon_kernels::fp16(q8b[0], q8b[1]);
+            let dmin = super::neon_kernels::fp16(q5b[2], q5b[3])
+                * super::neon_kernels::fp16(q8b[0], q8b[1]);
+            let (scales, mins) =
+                block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q5b[4..16]).unwrap());
             let mut mterm = 0i32;
             for s in 0..8 {
                 let b0 = i16::from_le_bytes([q8b[274 + 4 * s], q8b[274 + 4 * s + 1]]) as i32;
@@ -1178,29 +1308,44 @@ use neon_q8k::{
 mod neon_correctness {
     use super::*;
 
-    fn rng_state() -> u64 { 0x9E3779B97F4A7C15 }
+    fn rng_state() -> u64 {
+        0x9E3779B97F4A7C15
+    }
     fn next(st: &mut u64) -> u64 {
-        *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *st
     }
 
     fn q4k_block(st: &mut u64) -> Vec<u8> {
         let mut b = vec![0u8; Q4KB];
-        for v in b.iter_mut() { *v = (next(st) >> 8) as u8; }
+        for v in b.iter_mut() {
+            *v = (next(st) >> 8) as u8;
+        }
         // valid d/dmin (finite fp16), scales/mins as u8
-        b[0] = 0x00; b[1] = 0x3C; b[2] = 0x00; b[3] = 0x3C;
+        b[0] = 0x00;
+        b[1] = 0x3C;
+        b[2] = 0x00;
+        b[3] = 0x3C;
         b
     }
     fn q6k_block(st: &mut u64) -> Vec<u8> {
         let mut b = vec![0u8; Q6KB];
-        for v in b.iter_mut() { *v = (next(st) >> 8) as u8; }
-        b[208] = 0x00; b[209] = 0x3C;
+        for v in b.iter_mut() {
+            *v = (next(st) >> 8) as u8;
+        }
+        b[208] = 0x00;
+        b[209] = 0x3C;
         b
     }
     fn q8k_block(st: &mut u64) -> Vec<u8> {
         let mut b = vec![0u8; crate::block::Q8KB];
-        for v in b.iter_mut() { *v = (next(st) >> 8) as u8; }
-        b[0] = 0x00; b[1] = 0x3C;
+        for v in b.iter_mut() {
+            *v = (next(st) >> 8) as u8;
+        }
+        b[0] = 0x00;
+        b[1] = 0x3C;
         b
     }
 
@@ -1226,24 +1371,35 @@ mod neon_correctness {
                 for v in b.iter_mut() {
                     *v = ((next(&mut st) >> 8) % 8) as u8;
                 }
-                b[0] = 0x00; b[1] = 0x3C; b[2] = 0x00; b[3] = 0x3C; // d = dmin = 1
-                b[4] = 8; b[5] = 8; b[6] = 8; b[7] = 8;             // scales[0..4] = 8
+                b[0] = 0x00;
+                b[1] = 0x3C;
+                b[2] = 0x00;
+                b[3] = 0x3C; // d = dmin = 1
+                b[4] = 8;
+                b[5] = 8;
+                b[6] = 8;
+                b[7] = 8; // scales[0..4] = 8
                 q4.extend_from_slice(&b);
                 let mut b6 = vec![0u8; Q6KB];
                 for v in b6.iter_mut() {
                     *v = ((next(&mut st) >> 8) % 8) as u8;
                 }
-                b6[208] = 0x00; b6[209] = 0x3C; // d = 1
+                b6[208] = 0x00;
+                b6[209] = 0x3C; // d = 1
                 q6.extend_from_slice(&b6);
             }
             let a = dot_q4_k_q8_k(&q4, &q8k);
             let b = dot_q4_k_q8_k_scalar(&q4, &q8k);
-            assert!((a - b).abs() <= (a.abs() + b.abs()).max(1e-6) * 1e-5,
-                "q4_K q8_K NEON {a} != scalar {b}");
+            assert!(
+                (a - b).abs() <= (a.abs() + b.abs()).max(1e-6) * 1e-5,
+                "q4_K q8_K NEON {a} != scalar {b}"
+            );
             let a = dot_q6_k_q8_k(&q6, &q8k);
             let b = dot_q6_k_q8_k_scalar(&q6, &q8k);
-            assert!((a - b).abs() <= (a.abs() + b.abs()).max(1e-6) * 1e-5,
-                "q6_K q8_K NEON {a} != scalar {b}");
+            assert!(
+                (a - b).abs() <= (a.abs() + b.abs()).max(1e-6) * 1e-5,
+                "q6_K q8_K NEON {a} != scalar {b}"
+            );
         }
     }
 
@@ -1252,7 +1408,9 @@ mod neon_correctness {
         let mut st = rng_state();
         for _ in 0..10 {
             let dim = 256 * (1 + (next(&mut st) % 4) as usize);
-            let x: Vec<f32> = (0..dim).map(|i| ((next(&mut st) >> 40) as f32) * 1e-3 - 0.5).collect();
+            let x: Vec<f32> = (0..dim)
+                .map(|i| ((next(&mut st) >> 40) as f32) * 1e-3 - 0.5)
+                .collect();
             let mut ba = vec![0u8; (dim / 256) * crate::block::Q8KB];
             let mut bb = vec![0u8; (dim / 256) * crate::block::Q8KB];
             quantize_row_q8_k_buf(&x, 1, dim, &mut ba);
@@ -1263,11 +1421,14 @@ mod neon_correctness {
                 let blk = &x[s * 256..(s + 1) * 256];
                 let o = s * crate::block::Q8KB;
                 let mut amax = 0.0f32;
-                for &v in blk { amax = amax.max(v.abs()); }
+                for &v in blk {
+                    amax = amax.max(v.abs());
+                }
                 let d = amax / 127.0f32;
                 let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
                 let db = half::f16::from_f32(d).to_bits().to_le_bytes();
-                bb[o] = db[0]; bb[o + 1] = db[1];
+                bb[o] = db[0];
+                bb[o + 1] = db[1];
                 let mut bsums = [0i16; 16];
                 for j in 0..256 {
                     let q = (blk[j] * id).round_ties_even().clamp(-128.0, 127.0) as i8;
@@ -1276,7 +1437,8 @@ mod neon_correctness {
                 }
                 for j in 0..16 {
                     bb[o + 258 + j] = 0;
-                    bb[o + 274 + 2 * j..o + 274 + 2 * j + 2].copy_from_slice(&bsums[j].to_le_bytes());
+                    bb[o + 274 + 2 * j..o + 274 + 2 * j + 2]
+                        .copy_from_slice(&bsums[j].to_le_bytes());
                 }
             }
             assert_eq!(ba, bb, "q8_K quantize NEON != scalar at dim {dim}");

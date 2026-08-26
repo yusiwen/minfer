@@ -191,11 +191,10 @@ impl GraphAllocator {
                     // a fresh buffer: the producer completed before the split
                     // boundary, so the backend's host copy is safe there.
                     if last_use[id] > i {
-                        let in_ref = self
-                            .node_to_buf
-                            .get(&node.src[0])
-                            .copied()
-                            .ok_or_else(|| format!("in-place op src buffer missing (node {id})"))?;
+                        let in_ref =
+                            self.node_to_buf.get(&node.src[0]).copied().ok_or_else(|| {
+                                format!("in-place op src buffer missing (node {id})")
+                            })?;
                         // alias only when the input's sole consumer is this op
                         // (in-place overwrites the input) AND it is on the same
                         // backend
@@ -367,7 +366,11 @@ impl GraphAllocator {
         match br.backend {
             Backend::CPU => self.cpu.read_host(br.id).map(|s| s.to_vec()),
             #[cfg(target_os = "macos")]
-            Backend::Metal => self.metal.as_mut().and_then(|m| m.read_host(br.id)).map(|s| s.to_vec()),
+            Backend::Metal => self
+                .metal
+                .as_mut()
+                .and_then(|m| m.read_host(br.id))
+                .map(|s| s.to_vec()),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => None,
             Backend::Cuda => None,
@@ -419,11 +422,7 @@ impl GraphAllocator {
     /// Cross-backend copy of a node's buffer into `dst_backend`'s pool:
     /// host round trip through read_host/write_host (shared-memory GPU
     /// buffers make this a plain memcpy both ways).
-    pub fn copy_across(
-        &mut self,
-        node_id: NodeId,
-        dst_backend: Backend,
-    ) -> Result<(), String> {
+    pub fn copy_across(&mut self, node_id: NodeId, dst_backend: Backend) -> Result<(), String> {
         let br = self
             .node_buffer(node_id)
             .ok_or_else(|| format!("node {node_id} has no buffer"))?;
@@ -444,7 +443,13 @@ impl GraphAllocator {
             Backend::Cuda => return Err("CUDA unavailable".into()),
         }
         // remap the node to the destination buffer
-        self.node_to_buf.insert(node_id, BufRef { backend: dst_backend, id: new_id });
+        self.node_to_buf.insert(
+            node_id,
+            BufRef {
+                backend: dst_backend,
+                id: new_id,
+            },
+        );
         // release the old buffer
         self.buf_alive.remove(&(br.backend, br.id));
         self.free_in_pool(br.backend, br.id);
@@ -511,7 +516,10 @@ mod tests {
             al.alloc_graph(&g2).unwrap();
             al.n_mapped_buffers()
         };
-        assert!(alloc.n_mapped_buffers() > n_chain6, "parallel chains should not share");
+        assert!(
+            alloc.n_mapped_buffers() > n_chain6,
+            "parallel chains should not share"
+        );
     }
 
     #[test]
@@ -559,14 +567,24 @@ mod tests {
     fn cycle_graph_allocation_fails() {
         let mut g = ComputeGraph::default();
         g.nodes.push(super::super::CNode {
-            id: 0, name: "a".into(), op: Op::Add, src: vec![1],
-            out_shape: [1, 1, 1, 1], out_dtype: super::super::DType::F32,
-            backend: None, meta: super::super::ops::NodeMeta::None,
+            id: 0,
+            name: "a".into(),
+            op: Op::Add,
+            src: vec![1],
+            out_shape: [1, 1, 1, 1],
+            out_dtype: super::super::DType::F32,
+            backend: None,
+            meta: super::super::ops::NodeMeta::None,
         });
         g.nodes.push(super::super::CNode {
-            id: 1, name: "b".into(), op: Op::Add, src: vec![0],
-            out_shape: [1, 1, 1, 1], out_dtype: super::super::DType::F32,
-            backend: None, meta: super::super::ops::NodeMeta::None,
+            id: 1,
+            name: "b".into(),
+            op: Op::Add,
+            src: vec![0],
+            out_shape: [1, 1, 1, 1],
+            out_dtype: super::super::DType::F32,
+            backend: None,
+            meta: super::super::ops::NodeMeta::None,
         });
         let mut alloc = GraphAllocator::new();
         assert!(alloc.alloc_graph(&g).is_err());

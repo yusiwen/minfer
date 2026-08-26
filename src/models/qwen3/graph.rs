@@ -17,8 +17,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::cache::KVCache;
 use crate::graph::alloc::GraphAllocator;
-use crate::graph::cache::GraphCache;
 use crate::graph::backend::Backend;
+use crate::graph::cache::GraphCache;
 use crate::graph::fusion::FusionPass;
 use crate::graph::ops::{AttnMeta, AttnMode, RoPEMeta};
 use crate::graph::params::{CParams, GraphParams, GraphType};
@@ -40,8 +40,8 @@ impl Qwen3Graph {
         let nh = hp.n_head as usize;
         let nk = hp.n_head_kv as usize;
         let hd = hp.n_embd_head() as usize; // 128 (decoupled; NOT ne/nh = 64)
-        let nkt = hp.n_kv_embd as usize;    // 1024
-        let hd_kv = nkt / nk;               // 128
+        let nkt = hp.n_kv_embd as usize; // 1024
+        let hd_kv = nkt / nk; // 128
         let nf = hp.n_ff as usize;
         let eps = hp.f_norm_rms_eps;
         let n_ctx = params.cparams.n_ctx;
@@ -53,7 +53,11 @@ impl Qwen3Graph {
 
         let mut h = b.embedding(inp_ids, model.tok_embd.as_ref().unwrap());
 
-        let mode = if params.cparams.flash_attn { AttnMode::Flash } else { AttnMode::Gqa };
+        let mode = if params.cparams.flash_attn {
+            AttnMode::Flash
+        } else {
+            AttnMode::Gqa
+        };
         let attn_scale = hp.attention_scale(); // 1/sqrt(128)
 
         for (il, l) in model.layers.iter().enumerate() {
@@ -76,12 +80,26 @@ impl Qwen3Graph {
             let k = b.qk_norm(k, l.k_norm.as_ref(), hd, nk, eps);
 
             let q = b.rope(
-                q, inp_pos, hp.rope_style,
-                RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nh, hd },
+                q,
+                inp_pos,
+                hp.rope_style,
+                RoPEMeta {
+                    freq_base: hp.rope_freq_base,
+                    freq_scale: hp.rope_freq_scale,
+                    n_head: nh,
+                    hd,
+                },
             );
             let k = b.rope(
-                k, inp_pos, hp.rope_style,
-                RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nk, hd },
+                k,
+                inp_pos,
+                hp.rope_style,
+                RoPEMeta {
+                    freq_base: hp.rope_freq_base,
+                    freq_scale: hp.rope_freq_scale,
+                    n_head: nk,
+                    hd,
+                },
             );
 
             b.kvcache_store(il, k, v, inp_pos, n_ctx);
@@ -89,8 +107,19 @@ impl Qwen3Graph {
 
             // attention
             let attn_out = b.attn(
-                q, kv, inp_pos, mode,
-                AttnMeta { layer: il, n_head: nh, n_head_kv: nk, hd, hd_kv, nkt, scale: attn_scale },
+                q,
+                kv,
+                inp_pos,
+                mode,
+                AttnMeta {
+                    layer: il,
+                    n_head: nh,
+                    n_head_kv: nk,
+                    hd,
+                    hd_kv,
+                    nkt,
+                    scale: attn_scale,
+                },
             );
 
             // output projection + residual
@@ -98,7 +127,11 @@ impl Qwen3Graph {
             let is_last = il == model.layers.len() - 1;
             if is_last && params.n_out < nt {
                 // G3: reduce to the tail n_out rows BEFORE the last layer's FFN
-                let tail_ids = b.input("tail_ids", [params.n_out, 1, 1, 1], crate::graph::DType::I32);
+                let tail_ids = b.input(
+                    "tail_ids",
+                    [params.n_out, 1, 1, 1],
+                    crate::graph::DType::I32,
+                );
                 let cur_tail = b.get_rows(wo, tail_ids, [ne, params.n_out, 1, 1]);
                 let res_tail = b.get_rows(residual, tail_ids, [ne, params.n_out, 1, 1]);
                 h = b.add(res_tail, cur_tail);
@@ -139,7 +172,11 @@ impl Qwen3Graph {
 
         // output: norm + lm_head
         let normed = b.rms_norm(h, model.output_norm.as_ref(), eps);
-        let logits = b.matmul(normed, model.output.as_ref().unwrap(), model.output_b.as_ref());
+        let logits = b.matmul(
+            normed,
+            model.output.as_ref().unwrap(),
+            model.output_b.as_ref(),
+        );
         b.output(logits);
 
         b.build()
@@ -151,7 +188,9 @@ impl Qwen3Graph {
         fg: &Option<crate::tensor::Tensor>,
         fu: &Option<crate::tensor::Tensor>,
     ) -> bool {
-        let (Some(fg), Some(fu)) = (fg, fu) else { return false };
+        let (Some(fg), Some(fu)) = (fg, fu) else {
+            return false;
+        };
         #[cfg(target_os = "macos")]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
@@ -178,9 +217,17 @@ impl Qwen3Graph {
         }
         for l in &model.layers {
             for t in [
-                &l.attn_norm, &l.wq, &l.wk, &l.wv, &l.wo,
-                &l.q_norm, &l.k_norm,
-                &l.ffn_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down,
+                &l.attn_norm,
+                &l.wq,
+                &l.wk,
+                &l.wv,
+                &l.wo,
+                &l.q_norm,
+                &l.k_norm,
+                &l.ffn_norm,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
             ] {
                 if let Some(t) = t {
                     let name = t.name.clone();
@@ -210,10 +257,7 @@ impl Qwen3Graph {
     ) -> Vec<f32> {
         let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);
         let mut guard = graph_cache().lock().unwrap();
-        Self::forward_cached(
-            model, tokens, positions, n_out,
-            n_ctx, &mut guard,
-        )
+        Self::forward_cached(model, tokens, positions, n_out, n_ctx, &mut guard)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context
@@ -235,15 +279,19 @@ impl Qwen3Graph {
             );
         }
         #[cfg(target_os = "macos")]
-        let metal_on = crate::graph::metal_backend::metal_available()
-            && Self::weights_on_gpu(model);
+        let metal_on =
+            crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model);
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
             n_out,
-            gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
+            gtype: if nt == 1 {
+                GraphType::Decode
+            } else {
+                GraphType::Prefill
+            },
             cparams: CParams {
                 n_ctx,
                 n_batch: nt,
@@ -295,12 +343,21 @@ impl Qwen3Graph {
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         let pos: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
-        if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
+        if graph
+            .inputs
+            .iter()
+            .any(|&i| graph.node(i).name == "tail_ids")
+        {
             let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
             alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
         }
         if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
-            if let Some(idsbuf) = graph.inputs.iter().find(|&&i| graph.node(i).name == "token_ids").copied() {
+            if let Some(idsbuf) = graph
+                .inputs
+                .iter()
+                .find(|&&i| graph.node(i).name == "token_ids")
+                .copied()
+            {
                 let v = alloc.copy_to_cpu(idsbuf).unwrap_or_default();
                 eprintln!("[graph dump] ids after fill: {:?}", &v[..v.len().min(8)]);
             }
@@ -322,13 +379,21 @@ impl Qwen3Graph {
             };
             let _ = std::fs::write(format!("{dir}/logits_{tag}.f32"), {
                 let mut b = Vec::with_capacity(logits.len() * 4);
-                for x in &logits { b.extend_from_slice(&x.to_le_bytes()); }
+                for x in &logits {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
                 b
             });
-            if let Some(kv0) = graph.nodes.iter().position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 })) {
+            if let Some(kv0) = graph
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 }))
+            {
                 if let Some(kv) = alloc.copy_to_cpu(kv0) {
                     let mut b = Vec::with_capacity(kv.len() * 4);
-                    for x in &kv { b.extend_from_slice(&x.to_le_bytes()); }
+                    for x in &kv {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
                     let _ = std::fs::write(format!("{dir}/kv0_{tag}.f32"), b);
                 }
             }
@@ -338,12 +403,17 @@ impl Qwen3Graph {
                 if nid < graph.n_nodes() {
                     if let Some(buf) = alloc.copy_to_cpu(nid) {
                         let mut b = Vec::with_capacity(buf.len() * 4);
-                        for x in &buf { b.extend_from_slice(&x.to_le_bytes()); }
+                        for x in &buf {
+                            b.extend_from_slice(&x.to_le_bytes());
+                        }
                         let _ = std::fs::write(format!("{dir}/node{nid}_{tag}.f32"), b);
                     }
                 }
             }
-            eprintln!("[graph dump] wrote {dir}/logits_{tag}.f32 ({} elems)", logits.len());
+            eprintln!(
+                "[graph dump] wrote {dir}/logits_{tag}.f32 ({} elems)",
+                logits.len()
+            );
         }
 
         let nv = model.hparams.n_vocab as usize;
@@ -356,16 +426,29 @@ impl Qwen3Graph {
     fn weights_on_gpu(model: &Qwen3Model) -> bool {
         let names: Vec<String> = {
             let mut v = Vec::new();
-            for t in [&model.tok_embd, &model.output_norm, &model.output, &model.output_b] {
+            for t in [
+                &model.tok_embd,
+                &model.output_norm,
+                &model.output,
+                &model.output_b,
+            ] {
                 if let Some(t) = t {
                     v.push(t.name.clone());
                 }
             }
             for l in &model.layers {
                 for t in [
-                    &l.attn_norm, &l.wq, &l.wk, &l.wv, &l.wo,
-                    &l.q_norm, &l.k_norm,
-                    &l.ffn_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down,
+                    &l.attn_norm,
+                    &l.wq,
+                    &l.wk,
+                    &l.wv,
+                    &l.wo,
+                    &l.q_norm,
+                    &l.k_norm,
+                    &l.ffn_norm,
+                    &l.ffn_gate,
+                    &l.ffn_up,
+                    &l.ffn_down,
                 ] {
                     if let Some(t) = t {
                         v.push(t.name.clone());
@@ -376,7 +459,9 @@ impl Qwen3Graph {
         };
         #[cfg(target_os = "macos")]
         {
-            let Some(mps) = crate::metal::MpsState::get() else { return false };
+            let Some(mps) = crate::metal::MpsState::get() else {
+                return false;
+            };
             names.iter().all(|n| mps.has_weight(n))
         }
         #[cfg(not(target_os = "macos"))]
@@ -404,14 +489,21 @@ mod tests {
         let home = std::env::var_os("HOME")?;
         let mut p = std::path::PathBuf::from(home);
         p.push(".cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     fn load_qwen3() -> Option<(crate::gguf::GgufModel, Qwen3Model, Vec<u32>, Vec<usize>)> {
         let path = cached_model_path()?;
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let q3: &Qwen3Model = model.as_any().downcast_ref::<Qwen3Model>().expect("qwen3 model");
+        let q3: &Qwen3Model = model
+            .as_any()
+            .downcast_ref::<Qwen3Model>()
+            .expect("qwen3 model");
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
         let ids = tok.encode("The capital of France is");
         assert!(!ids.is_empty());
@@ -436,7 +528,10 @@ mod tests {
             maxd = maxd.max((a[i] - b[i]).abs());
         }
         eprintln!("[{tag}] logits max abs diff: {maxd:.3e}");
-        assert!(maxd < 1e-3, "[{tag}] graph logits diverge (max diff {maxd:.3e})");
+        assert!(
+            maxd < 1e-3,
+            "[{tag}] graph logits diverge (max diff {maxd:.3e})"
+        );
     }
 
     /// Qwen3 hermetic CPU verification (the model's forward IS the graph path,
@@ -511,9 +606,7 @@ mod tests {
         compare("smaller n_ctx prefill", &pa, &ps);
 
         let oob = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Qwen3Graph::forward_cached(
-                &q3, &[na], &[small_ctx], 1, small_ctx, &mut cache_s,
-            );
+            Qwen3Graph::forward_cached(&q3, &[na], &[small_ctx], 1, small_ctx, &mut cache_s);
         }));
         assert!(oob.is_err(), "position >= n_ctx must be rejected");
     }
@@ -560,7 +653,11 @@ mod tests {
                     toks.push(argmax(&l));
                 }
                 eprintln!("[qwen3 metal {tag}] greedy={toks:?}");
-                assert_eq!(toks, reference.to_vec(), "Metal greedy diverges from the llama.cpp-verified reference (cache {tag})");
+                assert_eq!(
+                    toks,
+                    reference.to_vec(),
+                    "Metal greedy diverges from the llama.cpp-verified reference (cache {tag})"
+                );
             }
         }
     }
@@ -589,8 +686,17 @@ mod tests {
             };
             let nt = ids.len();
             let params = GraphParams {
-                n_tokens: nt, n_seqs: 1, n_out: 1, gtype: GraphType::Prefill,
-                cparams: CParams { n_ctx: 512, n_batch: nt, flash_attn: false, gpu: true, fuse_qkv: false },
+                n_tokens: nt,
+                n_seqs: 1,
+                n_out: 1,
+                gtype: GraphType::Prefill,
+                cparams: CParams {
+                    n_ctx: 512,
+                    n_batch: nt,
+                    flash_attn: false,
+                    gpu: true,
+                    fuse_qkv: false,
+                },
                 weights_version: 1,
             };
             // layer-0: embed, attn rms, q/k/v matmul, qk_norm q/k, rope q/k
@@ -599,7 +705,9 @@ mod tests {
             for _ in 0..2 {
                 let mut graph = Qwen3Graph::build(&q3, &params);
                 for &nid in &keep {
-                    if !graph.outputs.contains(&nid) { graph.outputs.push(nid); }
+                    if !graph.outputs.contains(&nid) {
+                        graph.outputs.push(nid);
+                    }
                 }
                 let sched = BackendScheduler::new();
                 let mut alloc = GraphAllocator::new();
@@ -622,7 +730,10 @@ mod tests {
                 let (a, b) = (&dumps[0][i], &dumps[1][i]);
                 let neq = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
                 eprintln!("[determinism] node{nid}: neq={neq}");
-                assert_eq!(neq, 0, "Metal prefill node {nid} is not deterministic across runs");
+                assert_eq!(
+                    neq, 0,
+                    "Metal prefill node {nid} is not deterministic across runs"
+                );
             }
         }
     }

@@ -72,10 +72,16 @@ impl LayerWeights {
     pub fn new() -> Self {
         Self {
             attn_norm: None,
-            wq: None, wk: None, wv: None, wo: None,
-            q_norm: None, k_norm: None,
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            q_norm: None,
+            k_norm: None,
             ffn_norm: None,
-            ffn_gate: None, ffn_up: None, ffn_down: None,
+            ffn_gate: None,
+            ffn_up: None,
+            ffn_down: None,
         }
     }
 }
@@ -127,8 +133,8 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
     let n_head_kv = get_i64(ctx, "qwen3.attention.head_count_kv")
         .or_else(|| get_i64(ctx, "llama.attention.head_count_kv"))
         .unwrap_or(n_head);
-    let n_layer = get_i64(ctx, "qwen3.block_count")
-        .or_else(|| get_i64(ctx, "llama.block_count"))?;
+    let n_layer =
+        get_i64(ctx, "qwen3.block_count").or_else(|| get_i64(ctx, "llama.block_count"))?;
     let n_ff = get_i64(ctx, "qwen3.feed_forward_length")
         .or_else(|| get_i64(ctx, "llama.feed_forward_length"))?;
 
@@ -143,7 +149,12 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
     let im_end = find_token_id(ctx, "<|im_end|>").or(Some(eos));
 
     Some(HParams {
-        n_embd, n_head, n_head_kv, n_layer, n_ff, n_vocab,
+        n_embd,
+        n_head,
+        n_head_kv,
+        n_layer,
+        n_ff,
+        n_vocab,
         max_seq_len: get_i64(ctx, "qwen3.context_length")
             .or_else(|| get_i64(ctx, "llama.context_length"))
             .unwrap_or(32768),
@@ -184,7 +195,9 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTensorInfo) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
     let mut shape = [1i64; 4];
-    for j in 0..4 { shape[j] = ti.ne[j]; }
+    for j in 0..4 {
+        shape[j] = ti.ne[j];
+    }
     let off = ctx.offset + ti.offset as usize;
     // Use GGML type for byte-size calculation — always correct regardless of TensorType mapping
     let ts = ti.type_.type_size();
@@ -208,7 +221,17 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q5_1 | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(
+            ttype,
+            TensorType::Q4_0
+                | TensorType::Q4_1
+                | TensorType::Q4_K
+                | TensorType::Q5_0
+                | TensorType::Q5_1
+                | TensorType::Q5_K
+                | TensorType::Q6_K
+                | TensorType::Q8_0
+        ) {
             mps.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             mps.register_weight(&ti.name, tensor.data());
@@ -216,7 +239,16 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
     }
     #[cfg(feature = "cuda")]
     if let Some(cuda) = crate::cuda::CudaState::get() {
-        if matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1 | TensorType::Q4_K | TensorType::Q5_0 | TensorType::Q5_1 | TensorType::Q6_K | TensorType::Q8_0) {
+        if matches!(
+            ttype,
+            TensorType::Q4_0
+                | TensorType::Q4_1
+                | TensorType::Q4_K
+                | TensorType::Q5_0
+                | TensorType::Q5_1
+                | TensorType::Q6_K
+                | TensorType::Q8_0
+        ) {
             cuda.register_weight(&ti.name, tensor.data());
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
@@ -236,7 +268,8 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
 
     // Merged tensor index across all split parts (llama.cpp weights_map): each
     // tensor lives in the part that lists it, read from that part's own data.
-    let mut tensor_map = std::collections::HashMap::<String, (usize, &crate::gguf::GgufTensorInfo)>::new();
+    let mut tensor_map =
+        std::collections::HashMap::<String, (usize, &crate::gguf::GgufTensorInfo)>::new();
     for (pi, part) in model.parts.iter().enumerate() {
         for ti in &part.ctx.info {
             tensor_map.insert(ti.name.clone(), (pi, ti));
@@ -251,9 +284,12 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         // sanity: kv dim must equal n_head_kv * n_embd_head (catches a wrong
         // key_length fallback before it silently corrupts attention)
         assert_eq!(
-            hparams.n_kv_embd, hparams.n_head_kv * hparams.n_embd_head,
+            hparams.n_kv_embd,
+            hparams.n_head_kv * hparams.n_embd_head,
             "Qwen3 KV dim {} != n_head_kv {} * n_embd_head {}",
-            hparams.n_kv_embd, hparams.n_head_kv, hparams.n_embd_head,
+            hparams.n_kv_embd,
+            hparams.n_head_kv,
+            hparams.n_embd_head,
         );
     }
     #[cfg(target_os = "macos")]

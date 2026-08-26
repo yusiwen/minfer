@@ -31,14 +31,16 @@ struct Live {
 static LIVE: OnceLock<Mutex<Live>> = OnceLock::new();
 
 fn live() -> &'static Mutex<Live> {
-    LIVE.get_or_init(|| Mutex::new(Live {
-        tx: None,
-        clients: 0,
-        phase: String::new(),
-        step: 0,
-        pending_token: None,
-        pending_text: String::new(),
-    }))
+    LIVE.get_or_init(|| {
+        Mutex::new(Live {
+            tx: None,
+            clients: 0,
+            phase: String::new(),
+            step: 0,
+            pending_token: None,
+            pending_text: String::new(),
+        })
+    })
 }
 
 /// Server startup (`--viz`): arm the broadcaster.
@@ -79,7 +81,10 @@ pub fn begin_phase(kind: &str) {
     let mut l = live().lock().unwrap();
     l.phase = kind.into();
     l.step = 0;
-    emit(&l, &serde_json::json!({ "type": "phase", "kind": kind, "index": 0 }));
+    emit(
+        &l,
+        &serde_json::json!({ "type": "phase", "kind": kind, "index": 0 }),
+    );
 }
 
 /// Scheduler: one `execute()` = one step. Emits nothing (node events carry the
@@ -90,21 +95,33 @@ pub fn begin_step() {
 }
 
 /// Scheduler: one node's output. `values` is the strided sample (P2 analyze).
-pub fn record_node(id: usize, name: &str, op: &str, dtype: &str, stats: [f64; 4], values: &[f32], stride: usize, n_total: usize) {
+pub fn record_node(
+    id: usize,
+    name: &str,
+    op: &str,
+    dtype: &str,
+    stats: [f64; 4],
+    values: &[f32],
+    stride: usize,
+    n_total: usize,
+) {
     let l = live().lock().unwrap();
     let step = l.step;
-    emit(&l, &serde_json::json!({
-        "type": "node",
-        "step": step,
-        "id": id,
-        "name": name,
-        "op": op,
-        "dtype": dtype,
-        "stats": { "min": stats[0], "max": stats[1], "mean": stats[2], "absmean": stats[3] },
-        "values": values,
-        "stride": stride,
-        "n": n_total,
-    }));
+    emit(
+        &l,
+        &serde_json::json!({
+            "type": "node",
+            "step": step,
+            "id": id,
+            "name": name,
+            "op": op,
+            "dtype": dtype,
+            "stats": { "min": stats[0], "max": stats[1], "mean": stats[2], "absmean": stats[3] },
+            "values": values,
+            "stride": stride,
+            "n": n_total,
+        }),
+    );
 }
 
 /// Server (decode): remember the token about to become the next step's input.
@@ -124,25 +141,31 @@ pub fn attach_step(logits: &[f32]) {
     l.pending_token = None;
     l.pending_text.clear();
     let top = crate::trace::topk(logits, 5);
-    emit(&l, &serde_json::json!({
-        "type": "step",
-        "phase": l.phase,
-        "step": step,
-        "token": tok,
-        "text": txt,
-        "logits_top": top,
-    }));
+    emit(
+        &l,
+        &serde_json::json!({
+            "type": "step",
+            "phase": l.phase,
+            "step": step,
+            "token": tok,
+            "text": txt,
+            "logits_top": top,
+        }),
+    );
 }
 
 /// Server: generation finished.
 pub fn finish(reason: &str, tokens: usize, text: &str) {
     let l = live().lock().unwrap();
-    emit(&l, &serde_json::json!({
-        "type": "finish",
-        "reason": reason,
-        "tokens": tokens,
-        "text": text,
-    }));
+    emit(
+        &l,
+        &serde_json::json!({
+            "type": "finish",
+            "reason": reason,
+            "tokens": tokens,
+            "text": text,
+        }),
+    );
 }
 
 /// SSE connect greeting.

@@ -14,7 +14,9 @@ use std::process::{Command, Stdio};
 fn model_path() -> Option<String> {
     let home = std::env::var_os("HOME")?;
     let mut p = std::path::PathBuf::from(home);
-    p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
+    p.push(
+        ".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf",
+    );
     p.exists().then(|| p.to_string_lossy().to_string())
 }
 
@@ -50,15 +52,27 @@ fn run_cli(args: &[&str], stdin_input: &str, timeout_secs: u64) -> (String, Stri
     let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
     let mut out = String::new();
     let mut err = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
-    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
     (out, err, code)
 }
 
 /// Parse per-turn stats lines like `[turn 2] prefill 51 tokens, generated 0 tokens in 0.12s`.
 fn turn_stats(err: &str) -> Vec<(usize, usize, usize)> {
-    let re = regex::Regex::new(r"\[turn (\d+)\] (?:regen: )?prefill (\d+) tokens, generated (\d+) tokens")
-        .unwrap();
+    let re = regex::Regex::new(
+        r"\[turn (\d+)\] (?:regen: )?prefill (\d+) tokens, generated (\d+) tokens",
+    )
+    .unwrap();
     re.captures_iter(err)
         .map(|c| {
             (
@@ -94,7 +108,13 @@ fn invalid_color_value_errors() {
 fn help_lists_conversation_flags() {
     let (_, err, code) = run_cli(&["--help"], "", 30);
     assert_eq!(code, 0);
-    for flag in ["--cnv", "--single-turn", "--system", "--multiline-input", "--color"] {
+    for flag in [
+        "--cnv",
+        "--single-turn",
+        "--system",
+        "--multiline-input",
+        "--color",
+    ] {
         assert!(err.contains(flag), "help must mention {flag}: {err}");
     }
 }
@@ -110,7 +130,9 @@ fn two_turn_session_via_stdin_pipe() {
     };
     let input = "hi\nwhat is 2+2?\n/exit\n";
     let (out, err, code) = run_cli(
-        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model],
+        &[
+            "--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model,
+        ],
         input,
         1800,
     );
@@ -138,7 +160,9 @@ fn single_turn_exits_after_one_turn() {
     };
     let input = "hi\nthis second line must not become a turn\n";
     let (_, err, code) = run_cli(
-        &["--cnv", "-st", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model],
+        &[
+            "--cnv", "-st", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model,
+        ],
         input,
         1800,
     );
@@ -156,7 +180,9 @@ fn clear_and_regen_commands() {
     };
     let input = "hi\n/clear\nQ\n/regen\n/exit\n";
     let (out, err, code) = run_cli(
-        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model],
+        &[
+            "--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", &model,
+        ],
         input,
         1800,
     );
@@ -179,8 +205,10 @@ fn stop_string_truncates_output() {
     // A common English stop string; model output is truncated before the stop
     let input = "hi\n/exit\n";
     let (out, _, code) = run_cli(
-        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512",
-          "--stop", "is", &model],
+        &[
+            "--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512", "--stop",
+            "is", &model,
+        ],
         input,
         1800,
     );
@@ -200,13 +228,18 @@ fn context_overflow_truncates_and_continues() {
     // (§5.7) triggers; session continues without error. Robust to reply length (-n 4 caps generation).
     let input = "hi\n".repeat(8) + "/exit\n";
     let (_, err, code) = run_cli(
-        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "40",
-          "-n", "4", &model],
+        &[
+            "--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "40", "-n", "4",
+            &model,
+        ],
         &input,
         1800,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(err.contains("dropped oldest"), "overflow truncation expected: {err}");
+    assert!(
+        err.contains("dropped oldest"),
+        "overflow truncation expected: {err}"
+    );
     assert!(!err.contains("[error]"), "no hard error: {err}");
     let stats = turn_stats(&err);
     assert_eq!(stats.len(), 8, "all 8 turns complete: {err}");
@@ -219,25 +252,51 @@ fn session_save_load_round_trip() {
         eprintln!("0.5B q4_0 not cached; skipping");
         return;
     };
-    let session = std::env::temp_dir().join(format!("minfer-session-test-{}.json", std::process::id()));
+    let session =
+        std::env::temp_dir().join(format!("minfer-session-test-{}.json", std::process::id()));
     let session = session.to_string_lossy().to_string();
     let _ = std::fs::remove_file(&session);
 
     // run 1: /exit after two turns → saved to disk
     let (_, err1, code1) = run_cli(
-        &["--cnv", "--greedy", "--seed", "42", "--color", "off", "--n-ctx", "512",
-          "--session", &session, &model],
+        &[
+            "--cnv",
+            "--greedy",
+            "--seed",
+            "42",
+            "--color",
+            "off",
+            "--n-ctx",
+            "512",
+            "--session",
+            &session,
+            &model,
+        ],
         "hi\nQ\n/exit\n",
         1800,
     );
     assert_eq!(code1, 0, "stderr: {err1}");
     assert!(err1.contains("[session] saved"), "stderr: {err1}");
-    assert!(std::path::Path::new(&session).exists(), "session file written");
+    assert!(
+        std::path::Path::new(&session).exists(),
+        "session file written"
+    );
 
     // run 2: load history → continue one turn → exit (saved again)
     let (_, err2, code2) = run_cli(
-        &["--cnv", "--greedy", "--seed", "43", "--color", "off", "--n-ctx", "512",
-          "--session", &session, &model],
+        &[
+            "--cnv",
+            "--greedy",
+            "--seed",
+            "43",
+            "--color",
+            "off",
+            "--n-ctx",
+            "512",
+            "--session",
+            &session,
+            &model,
+        ],
         "third\n/exit\n",
         1800,
     );

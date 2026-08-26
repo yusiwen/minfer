@@ -23,19 +23,36 @@ pub trait ModelDef: Send + Sync {
     /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
     /// (the graph path; the legacy `kv` arg is ignored there). Callers must
     /// guarantee `positions[i] < n_ctx` for every position.
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32>;
+    fn forward(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        kv: &mut KVCache,
+        n_out: usize,
+        n_ctx: usize,
+    ) -> Vec<f32>;
 
     /// Downcast helper for the graph path's weight registration.
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Build the declarative compute graph for one forward step (Phase 5).
     /// Topology is a deterministic function of `params` (reuse invariant).
-    fn build_graph(&self, _params: &crate::graph::params::GraphParams) -> crate::graph::ComputeGraph {
+    fn build_graph(
+        &self,
+        _params: &crate::graph::params::GraphParams,
+    ) -> crate::graph::ComputeGraph {
         unimplemented!("build_graph not implemented for this architecture")
     }
 
     /// Graph-based forward (Phase 6); defaults to the imperative path.
-    fn forward_graph(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32> {
+    fn forward_graph(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        kv: &mut KVCache,
+        n_out: usize,
+        n_ctx: usize,
+    ) -> Vec<f32> {
         self.forward(tokens, positions, kv, n_out, n_ctx)
     }
 

@@ -29,7 +29,11 @@ impl Default for GraphCache {
 
 impl GraphCache {
     pub fn new() -> Self {
-        Self { graph: None, alloc: GraphAllocator::new(), prev_params: None }
+        Self {
+            graph: None,
+            alloc: GraphAllocator::new(),
+            prev_params: None,
+        }
     }
 
     /// Params-only reuse check. On success the previously stored graph is
@@ -74,16 +78,19 @@ impl GraphCache {
     }
 
     /// Debug-only structural check: two graphs built from equal params must be
-    /// identical (op sequence with full payloads, shapes, dependencies).
-    #[cfg(debug_assertions)]
+    /// identical (op sequence with full payloads, shapes, dependencies). Used
+    /// only from `mod tests` in debug builds, so it is gated off a normal
+    /// (non-test) binary build.
+    #[cfg(all(test, debug_assertions))]
     pub fn verify_structural(&self, graph: &ComputeGraph) -> bool {
         let Some(prev) = &self.graph else { return true };
         if prev.nodes.len() != graph.nodes.len() {
             return false;
         }
-        prev.nodes.iter().zip(graph.nodes.iter()).all(|(a, b)| {
-            a.op == b.op && a.out_shape == b.out_shape && a.src == b.src
-        })
+        prev.nodes
+            .iter()
+            .zip(graph.nodes.iter())
+            .all(|(a, b)| a.op == b.op && a.out_shape == b.out_shape && a.src == b.src)
     }
 }
 
@@ -99,7 +106,11 @@ mod tests {
             n_tokens,
             n_seqs: 1,
             n_out: 1,
-            gtype: if n_tokens == 1 { GraphType::Decode } else { GraphType::Prefill },
+            gtype: if n_tokens == 1 {
+                GraphType::Decode
+            } else {
+                GraphType::Prefill
+            },
             cparams: Default::default(),
             weights_version,
         }
@@ -150,7 +161,9 @@ mod tests {
         cache.replace_graph(tiny_graph(), params(1, 1));
         // rebuild with different params: allocator object identity persists
         // (a KV persistent region registered before must still be there)
-        cache.alloc().alloc_persistent("kv.test", crate::graph::Backend::CPU, 16);
+        cache
+            .alloc()
+            .alloc_persistent("kv.test", crate::graph::Backend::CPU, 16);
         assert!(cache.alloc().get_persistent("kv.test").is_some());
         cache.replace_graph(tiny_graph(), params(4, 1));
         assert!(

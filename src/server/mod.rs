@@ -67,9 +67,8 @@ pub fn run(
     let n_ctx_slot = n_ctx / n_slots.max(1);
 
     let worker_tokenizer = tokenizer.clone();
-    let worker = std::thread::spawn(move || {
-        chat::worker_loop(model, worker_tokenizer, slots, job_rx)
-    });
+    let worker =
+        std::thread::spawn(move || chat::worker_loop(model, worker_tokenizer, slots, job_rx));
     let _ = worker;
 
     let template = chat_template_from_gguf(&gguf.parts[0].data);
@@ -91,10 +90,12 @@ pub fn run(
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async move {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
-            eprintln!("Error: failed to bind {addr}: {e}");
-            std::process::exit(1);
-        });
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to bind {addr}: {e}");
+                std::process::exit(1);
+            });
         eprintln!("minfer server listening on http://{addr}");
         axum::serve(listener, router(state)).await.expect("server");
     });
@@ -110,7 +111,9 @@ pub(crate) fn now_unix() -> i64 {
 /// Read `tokenizer.chat_template` from GGUF metadata (same lookup the CLI uses).
 pub(crate) fn chat_template_from_gguf(data: &[u8]) -> Option<String> {
     let ctx = crate::gguf::GgufContext::init_from_data(data)?;
-    ctx.kv.iter().find(|kv| kv.key == "tokenizer.chat_template")
+    ctx.kv
+        .iter()
+        .find(|kv| kv.key == "tokenizer.chat_template")
         .map(|kv| kv.get_val_str(0).to_string())
 }
 
@@ -125,7 +128,10 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     let params: SamplingParams = req.resolve(rand::random::<u64>());
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = now_unix(); // per-request timestamp (OpenAI semantics)
-    let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
+    let model_name = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_name.clone());
 
     // Render the chat template + tokenize (cheap, do it on the handler side so
     // context-overflow is rejected before the job occupies the worker queue).
@@ -156,7 +162,11 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     }
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(64);
-    let job = Job { input_ids, params, tx };
+    let job = Job {
+        input_ids,
+        params,
+        tx,
+    };
     if state.job_tx.send(job).await.is_err() {
         return error_response(&ApiError::unavailable("server shutting down"));
     }
@@ -219,7 +229,9 @@ fn stream_response(
                 .map(move |ev| to_event(&id_owned, &model_owned, created, ev)),
         )
         .chain(futures_util::stream::iter(vec![done]));
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn to_event(id: &str, model: &str, created: i64, ev: StreamEvent) -> Result<Event, Infallible> {

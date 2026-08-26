@@ -24,7 +24,11 @@ pub fn runtime_gparams(n_tokens: usize, n_ctx: usize, gpu: bool, fuse_qkv: bool)
         n_tokens,
         n_seqs: 1,
         n_out: 1,
-        gtype: if n_tokens == 1 { GraphType::Decode } else { GraphType::Prefill },
+        gtype: if n_tokens == 1 {
+            GraphType::Decode
+        } else {
+            GraphType::Prefill
+        },
         cparams: CParams {
             n_ctx,
             n_batch: n_tokens,
@@ -171,8 +175,15 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
 /// Op payload as a flat JSON object (page shows it under "detail").
 fn op_detail(op: &Op) -> Value {
     match op {
-        Op::Input | Op::Add | Op::Mul | Op::Silu | Op::GetRows | Op::SwiGLU
-        | Op::FusedBiasRope | Op::FusedFFN | Op::BatchMatMul => json!({}),
+        Op::Input
+        | Op::Add
+        | Op::Mul
+        | Op::Silu
+        | Op::GetRows
+        | Op::SwiGLU
+        | Op::FusedBiasRope
+        | Op::FusedFFN
+        | Op::BatchMatMul => json!({}),
         Op::Scale(s) => json!({ "scale": s }),
         Op::Softmax { dim } => json!({ "dim": dim }),
         Op::RmsNorm { eps } => json!({ "eps": eps }),

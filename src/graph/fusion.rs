@@ -180,7 +180,11 @@ mod tests {
         assert_eq!(n, 1, "expected one SwiGLU fusion");
         assert!(g.nodes.iter().any(|nd| matches!(nd.op, Op::SwiGLU)));
         // the fused node's src = [gate, up]
-        let fused = g.nodes.iter().find(|nd| matches!(nd.op, Op::SwiGLU)).unwrap();
+        let fused = g
+            .nodes
+            .iter()
+            .find(|nd| matches!(nd.op, Op::SwiGLU))
+            .unwrap();
         assert_eq!(fused.src.len(), 2);
     }
 

@@ -111,7 +111,11 @@ pub fn generate(
     }
 
     // Emit `full[emitted..end]` as one Text event (complete UTF-8 by caller).
-    let emit = |full: &[u8], emitted: usize, end: usize, tx: &mpsc::Sender<StreamEvent>| -> Result<(), ApiError> {
+    let emit = |full: &[u8],
+                emitted: usize,
+                end: usize,
+                tx: &mpsc::Sender<StreamEvent>|
+     -> Result<(), ApiError> {
         if end > emitted {
             let chunk = String::from_utf8_lossy(&full[emitted..end]).into_owned();
             if tx.blocking_send(StreamEvent::Text(chunk)).is_err() {
@@ -177,8 +181,8 @@ pub fn generate(
 
         // Decode step.
         if live_on {
-            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
-                .into_owned();
+            let text =
+                String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id])).into_owned();
             crate::live::set_token(sampled.token_id, &text);
         }
         logits = guarded_forward(
@@ -212,10 +216,16 @@ pub fn generate(
     } else if emitted < full.len() {
         emit(&full, emitted, full.len(), tx)?;
     }
-    let _ = tx
-        .blocking_send(StreamEvent::Finish { reason: finish_reason.to_string(), tokens: completion_tokens });
+    let _ = tx.blocking_send(StreamEvent::Finish {
+        reason: finish_reason.to_string(),
+        tokens: completion_tokens,
+    });
     if live_on {
-        crate::live::finish(finish_reason, completion_tokens, &String::from_utf8_lossy(&full));
+        crate::live::finish(
+            finish_reason,
+            completion_tokens,
+            &String::from_utf8_lossy(&full),
+        );
     }
 
     Ok(())
@@ -282,7 +292,10 @@ mod tests {
 
     #[test]
     fn stop_token_matches_eos_and_im_end() {
-        let special = SpecialTokens { eos: 2, im_end: Some(7) };
+        let special = SpecialTokens {
+            eos: 2,
+            im_end: Some(7),
+        };
         assert!(is_stop_token(2, &special));
         assert!(is_stop_token(7, &special));
         assert!(!is_stop_token(3, &special));

@@ -24,7 +24,11 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self { buffers: Vec::new(), free: Vec::new(), weights: HashMap::new() }
+        Self {
+            buffers: Vec::new(),
+            free: Vec::new(),
+            weights: HashMap::new(),
+        }
     }
 
     /// Register a weight tensor by name (Phase 6 wires this from the model).
@@ -91,7 +95,11 @@ impl Backend for CpuBackend {
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
-        if let Some(idx) = self.free.iter().position(|&id| self.buffers[id].len() == size) {
+        if let Some(idx) = self
+            .free
+            .iter()
+            .position(|&id| self.buffers[id].len() == size)
+        {
             let id = self.free.swap_remove(idx);
             self.buffers[id].fill(0.0);
             return id;
@@ -117,15 +125,18 @@ impl Backend for CpuBackend {
         // (the V region is a sibling buffer, not an input) — handle it before
         // the aliasing split below, which borrows the pool immutably.
         if let Op::KvcacheStore { layer } = &node.op {
-            let (k_id, v_id) = kv_pair
-                .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+            let (k_id, v_id) =
+                kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
             if k_id != out_buf {
                 return Err("KV store out buffer must be the K region".into());
             }
             let nkt = node.out_shape[0];
             let n_ctx = node.out_shape[1];
             let nt = self.buffers[in_bufs[0]].len() / nkt;
-            let pos: Vec<usize> = self.buffers[in_bufs[2]].iter().map(|b| b.to_bits() as usize).collect();
+            let pos: Vec<usize> = self.buffers[in_bufs[2]]
+                .iter()
+                .map(|b| b.to_bits() as usize)
+                .collect();
             let k_src = self.buffers[in_bufs[0]].clone();
             let v_src = self.buffers[in_bufs[1]].clone();
             // k region = out_buf, v region = sibling; both in this pool.
@@ -322,8 +333,7 @@ impl Backend for CpuBackend {
                 let hd = meta.hd;
                 let nt = node.out_shape[1];
                 // positions are I32 bit patterns in ins[1]
-                let pos: Vec<usize> =
-                    (0..nt).map(|t| ins[1][t].to_bits() as usize).collect();
+                let pos: Vec<usize> = (0..nt).map(|t| ins[1][t].to_bits() as usize).collect();
                 out.copy_from_slice(ins[0]);
                 cpu_rope(out, &pos, nh, hd, meta.freq_base, meta.freq_scale, *style);
                 Ok(())
@@ -388,13 +398,27 @@ impl Backend for CpuBackend {
                     .min(n_ctx);
                 let pos: Vec<usize> = (0..nt).map(|t| ins[2][t].to_bits() as usize).collect();
                 cpu_gqa_attn(
-                    ins[0], k_slice, v_slice, &pos, nt, nkv, meta.n_head, meta.n_head_kv, meta.hd,
-                    meta.hd_kv, nkt, out, meta.scale,
+                    ins[0],
+                    k_slice,
+                    v_slice,
+                    &pos,
+                    nt,
+                    nkv,
+                    meta.n_head,
+                    meta.n_head_kv,
+                    meta.hd,
+                    meta.hd_kv,
+                    nkt,
+                    out,
+                    meta.scale,
                 )?;
                 Ok(())
             }
             Op::FusedBiasRope | Op::BatchMatMul | Op::FusedQKV { .. } | Op::FusedFFN => {
-                Err(format!("op {:?} unsupported on CPU (fusion not enabled for it)", node.op))
+                Err(format!(
+                    "op {:?} unsupported on CPU (fusion not enabled for it)",
+                    node.op
+                ))
             }
         }
     }
@@ -473,7 +497,9 @@ pub(crate) fn cpu_gqa_attn(
     scale: f32,
 ) -> Result<(), String> {
     if hd < hd_kv {
-        return Err(format!("Q head dim ({hd}) must be >= KV head dim ({hd_kv})"));
+        return Err(format!(
+            "Q head dim ({hd}) must be >= KV head dim ({hd_kv})"
+        ));
     }
 
     // Heads are independent: parallelize over head ranges on the CPU pool.
@@ -561,10 +587,7 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
                 crate::vec_ops::vec_muladd_f32(
                     c.hd_kv,
                     std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
-                    std::slice::from_raw_parts(
-                        c.va.add(kv * c.nkt + vs_base),
-                        c.hd_kv,
-                    ),
+                    std::slice::from_raw_parts(c.va.add(kv * c.nkt + vs_base), c.hd_kv),
                     scrs[kv],
                 );
             }
@@ -597,7 +620,10 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            Self { sched: BackendScheduler::new(), alloc: GraphAllocator::new() }
+            Self {
+                sched: BackendScheduler::new(),
+                alloc: GraphAllocator::new(),
+            }
         }
         fn reg(&mut self, t: Tensor) {
             let name = t.name.clone();
@@ -629,9 +655,20 @@ mod tests {
 
         let mut gb = GraphBuilder::new();
         let x = gb.input("x", [4, 1, 1, 1], DType::F32);
-        let m = gb.matmul(x, h.alloc.cpu().weight("W").unwrap(), Some(h.alloc.cpu().weight("b").unwrap()));
+        let m = gb.matmul(
+            x,
+            h.alloc.cpu().weight("W").unwrap(),
+            Some(h.alloc.cpu().weight("b").unwrap()),
+        );
         let s = gb.silu(m);
-        let o = gb.node("scale2", Op::Scale(2.0), &[s], [3, 1, 1, 1], DType::F32, NodeMeta::None);
+        let o = gb.node(
+            "scale2",
+            Op::Scale(2.0),
+            &[s],
+            [3, 1, 1, 1],
+            DType::F32,
+            NodeMeta::None,
+        );
         gb.output(o);
         let g = gb.build();
 
@@ -640,7 +677,12 @@ mod tests {
         let expect = [silu(1.5) * 2.0, silu(3.0) * 2.0, silu(9.25) * 2.0];
         let got = h.out(&g, o);
         for i in 0..3 {
-            assert!((got[i] - expect[i]).abs() < 1e-4, "out[{i}]={} expect {}", got[i], expect[i]);
+            assert!(
+                (got[i] - expect[i]).abs() < 1e-4,
+                "out[{i}]={} expect {}",
+                got[i],
+                expect[i]
+            );
         }
     }
 
@@ -668,7 +710,12 @@ mod tests {
             );
         }
         for i in 0..8 {
-            assert!((got[i] - ref_out[i]).abs() < 1e-6, "norm[{i}] {} vs {}", got[i], ref_out[i]);
+            assert!(
+                (got[i] - ref_out[i]).abs() < 1e-6,
+                "norm[{i}] {} vs {}",
+                got[i],
+                ref_out[i]
+            );
         }
     }
 
@@ -679,7 +726,9 @@ mod tests {
         h.reg(tensor_f32(
             "tok_embd",
             [4, 4, 1, 1],
-            vec![0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4, 3.1, 3.2, 3.3, 3.4],
+            vec![
+                0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4, 3.1, 3.2, 3.3, 3.4,
+            ],
         ));
         let mut gb = GraphBuilder::new();
         let ids = gb.input("token_ids", [2, 1, 1, 1], DType::I32);
@@ -709,9 +758,22 @@ mod tests {
             0.1, 0.2, 0.3, 0.4, // id 0
             2.1, 2.2, 2.3, 2.4, // id 2
         ];
-        cpu_rope(&mut ref_x, &[0, 1], 2, 2, 10000.0, 1.0, RopeStyle::NonInterleaved);
+        cpu_rope(
+            &mut ref_x,
+            &[0, 1],
+            2,
+            2,
+            10000.0,
+            1.0,
+            RopeStyle::NonInterleaved,
+        );
         for i in 0..8 {
-            assert!((got[i] - ref_x[i]).abs() < 1e-5, "rope[{i}] {} vs {}", got[i], ref_x[i]);
+            assert!(
+                (got[i] - ref_x[i]).abs() < 1e-5,
+                "rope[{i}] {} vs {}",
+                got[i],
+                ref_x[i]
+            );
         }
     }
 
@@ -749,7 +811,9 @@ mod tests {
         h.alloc.fill_input_i32(&g, "positions", &[0]).unwrap();
         h.alloc.fill_input(&g, "q", &[1.0, 0.0, 0.0, 1.0]).unwrap();
         h.alloc.fill_input(&g, "k", &[1.0, 0.0, 0.0, 1.0]).unwrap();
-        h.alloc.fill_input(&g, "v", &[0.5, 0.5, 0.25, 0.75]).unwrap();
+        h.alloc
+            .fill_input(&g, "v", &[0.5, 0.5, 0.25, 0.75])
+            .unwrap();
         h.sched.execute(&g, &mut h.alloc).unwrap();
         let got = h.out(&g, out);
         // scores: h0: dot([1,0],[1,0])*0.5 = 0.5; h1: dot([0,1],[0,1])*0.5 = 0.5
@@ -774,11 +838,23 @@ mod tests {
         let mut alloc = GraphAllocator::new();
         alloc.alloc_graph(&g).unwrap();
         // rows: r0=[1,2,3,4] r1=[10,20,30,40] r2=[100,200,300,400]
-        alloc.fill_input(&g, "x", &[1.0,2.0,3.0,4.0, 10.0,20.0,30.0,40.0, 100.0,200.0,300.0,400.0]).unwrap();
+        alloc
+            .fill_input(
+                &g,
+                "x",
+                &[
+                    1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0,
+                ],
+            )
+            .unwrap();
         alloc.fill_input_i32(&g, "ids", &[2]).unwrap();
         sched.execute(&g, &mut alloc).unwrap();
         let got = alloc.get_buffer(&g, r).unwrap();
-        assert_eq!(got, &[100.0, 200.0, 300.0, 400.0], "get_rows should select row 2");
+        assert_eq!(
+            got,
+            &[100.0, 200.0, 300.0, 400.0],
+            "get_rows should select row 2"
+        );
 
         // ids = [0]
         alloc.fill_input_i32(&g, "ids", &[0]).unwrap();

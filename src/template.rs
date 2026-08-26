@@ -1,7 +1,7 @@
 // Chat template rendering using minijinja
 // Reads tokenizer.chat_template from GGUF, renders with message context
 
-use minijinja::{Environment, context};
+use minijinja::{context, Environment};
 
 const DEFAULT_SYSTEM: &str = "You are a helpful assistant.";
 
@@ -48,7 +48,10 @@ pub fn render_messages(
     match result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: chat template rendering failed ({}), falling back to ChatML", e);
+            eprintln!(
+                "Warning: chat template rendering failed ({}), falling back to ChatML",
+                e
+            );
             fallback_chatml_messages(messages, add_generation_prompt)
         }
     }
@@ -99,10 +102,16 @@ pub fn format_single(
     }
     if fmt_new.starts_with(&fmt_past) {
         out.push_str(&fmt_new[fmt_past.len()..]);
-        FormattedDelta { text: out, prefix_matched: true }
+        FormattedDelta {
+            text: out,
+            prefix_matched: true,
+        }
     } else {
         // Prefix mismatch: non-deterministic template → return the full text; the caller falls back to a full re-render.
-        FormattedDelta { text: fmt_new, prefix_matched: false }
+        FormattedDelta {
+            text: fmt_new,
+            prefix_matched: false,
+        }
     }
 }
 
@@ -126,12 +135,10 @@ pub fn render_template(
         Err(_) => return fallback_chatml(user_input, add_generation_prompt),
     };
 
-    let messages = vec![
-        serde_json::json!({
-            "role": "user",
-            "content": user_input,
-        }),
-    ];
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": user_input,
+    })];
 
     let result = tmpl.render(context! {
         messages => messages,
@@ -143,7 +150,10 @@ pub fn render_template(
     match result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: chat template rendering failed ({}), falling back to ChatML", e);
+            eprintln!(
+                "Warning: chat template rendering failed ({}), falling back to ChatML",
+                e
+            );
             fallback_chatml(user_input, add_generation_prompt)
         }
     }
@@ -173,8 +183,7 @@ pub(crate) fn fallback_chatml_messages(
 fn fallback_chatml(user_input: &str, add_generation_prompt: bool) -> String {
     let mut r = format!(
         "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n",
-        DEFAULT_SYSTEM,
-        user_input,
+        DEFAULT_SYSTEM, user_input,
     );
     if add_generation_prompt {
         r.push_str("<|im_start|>assistant\n");
@@ -216,7 +225,10 @@ mod tests {
         assert!(out.starts_with("[system:You are helpful.]"), "got: {out}");
         assert!(out.contains("[user:Hi]"), "got: {out}");
         assert!(out.contains("[assistant:Hello!]"), "got: {out}");
-        assert!(out.contains("[assistant:"), "null-content role marker present: {out}");
+        assert!(
+            out.contains("[assistant:"),
+            "null-content role marker present: {out}"
+        );
     }
 
     #[test]
@@ -234,14 +246,18 @@ mod tests {
         let mut m = msgs();
         m.push(("assistant".into(), None));
         let out = render_messages("{{ bad", &m, false, "");
-        assert!(out.contains("<|im_start|>assistant\n<|im_end|>"), "null content role marker");
+        assert!(
+            out.contains("<|im_start|>assistant\n<|im_end|>"),
+            "null content role marker"
+        );
         assert!(!out.contains("None"), "null must not be stringified");
     }
 
     #[test]
     fn render_template_single_user_unchanged() {
         // CLI path still renders a single user message via the template
-        let tmpl = "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}assistant:";
+        let tmpl =
+            "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}assistant:";
         let out = render_template(tmpl, "hello", true, "");
         assert_eq!(out, "user: hello\nassistant:");
     }
@@ -264,8 +280,17 @@ mod tests {
             m("user", "hi"),
             m("assistant", "Hello!"),
         ];
-        let d = format_single(Some(QWEN_CHATML), &past, m("user", "what is 2+2?"), true, "");
-        assert!(d.prefix_matched, "prefix must match for a deterministic template");
+        let d = format_single(
+            Some(QWEN_CHATML),
+            &past,
+            m("user", "what is 2+2?"),
+            true,
+            "",
+        );
+        assert!(
+            d.prefix_matched,
+            "prefix must match for a deterministic template"
+        );
         assert_eq!(
             d.text,
             "\n<|im_start|>user\nwhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"

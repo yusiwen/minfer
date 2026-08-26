@@ -1,18 +1,24 @@
 // BPE Tokenizer (self-contained, no external deps)
 // Loads tokens, scores, types, and BPE merges directly from GGUF metadata
 
-use std::collections::HashMap;
 use crate::gguf::{GgufContext, GgufType};
+use std::collections::HashMap;
 
 /// Build byte-to-unicode mapping (GPT-2 style).
 fn build_byte_to_unicode() -> HashMap<u8, char> {
     let mut bs: Vec<u32> = Vec::new();
     // Printable ASCII: ! to ~
-    for b in 0x21..=0x7e { bs.push(b); }
+    for b in 0x21..=0x7e {
+        bs.push(b);
+    }
     // Latin-1 supplement: ¡ to ¬
-    for b in 0xa1..=0xac { bs.push(b); }
+    for b in 0xa1..=0xac {
+        bs.push(b);
+    }
     // Latin-1 supplement: ® to ÿ
-    for b in 0xae..=0xff { bs.push(b); }
+    for b in 0xae..=0xff {
+        bs.push(b);
+    }
 
     let mut cs = bs.clone();
     let mut n = 0u32;
@@ -24,7 +30,10 @@ fn build_byte_to_unicode() -> HashMap<u8, char> {
         }
     }
 
-    bs.iter().zip(cs.iter()).map(|(&b, &c)| (b as u8, char::from_u32(c).unwrap())).collect()
+    bs.iter()
+        .zip(cs.iter())
+        .map(|(&b, &c)| (b as u8, char::from_u32(c).unwrap()))
+        .collect()
 }
 
 /// Byte-encode text using GPT-2 unicode mapping.
@@ -140,7 +149,8 @@ impl Tokenizer {
         let im_end = vocab.get("<|im_end|>").copied().unwrap_or(eos_token);
 
         let byte_to_unicode = build_byte_to_unicode();
-        let unicode_to_byte: HashMap<char, u8> = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
+        let unicode_to_byte: HashMap<char, u8> =
+            byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
 
         // Merge GGUF special tokens (type 3/4) with hardcoded fallbacks, then
         // group by first char with longest-first ordering inside each group
@@ -464,13 +474,33 @@ mod tests {
     fn complete_utf8_prefix_len_holds_incomplete_trailing() {
         // U+4E2D = E4 B8 AD
         let full = [0xE4u8, 0xB8, 0xAD];
-        assert_eq!(complete_utf8_prefix_len(&full[..1]), 0, "1 of 3 bytes: incomplete");
-        assert_eq!(complete_utf8_prefix_len(&full[..2]), 0, "2 of 3 bytes: incomplete");
-        assert_eq!(complete_utf8_prefix_len(&full[..3]), 3, "all 3 bytes: complete");
+        assert_eq!(
+            complete_utf8_prefix_len(&full[..1]),
+            0,
+            "1 of 3 bytes: incomplete"
+        );
+        assert_eq!(
+            complete_utf8_prefix_len(&full[..2]),
+            0,
+            "2 of 3 bytes: incomplete"
+        );
+        assert_eq!(
+            complete_utf8_prefix_len(&full[..3]),
+            3,
+            "all 3 bytes: complete"
+        );
 
         let mixed = [b'a', 0xE4, 0xB8, 0xAD, b'b'];
-        assert_eq!(complete_utf8_prefix_len(&mixed[..3]), 1, "a complete, U+4E2D incomplete");
-        assert_eq!(complete_utf8_prefix_len(&mixed[..4]), 4, "a + U+4E2D complete");
+        assert_eq!(
+            complete_utf8_prefix_len(&mixed[..3]),
+            1,
+            "a complete, U+4E2D incomplete"
+        );
+        assert_eq!(
+            complete_utf8_prefix_len(&mixed[..4]),
+            4,
+            "a + U+4E2D complete"
+        );
         assert_eq!(complete_utf8_prefix_len(&mixed[..5]), 5);
         assert_eq!(complete_utf8_prefix_len(b"abc"), 3, "pure ASCII");
         assert_eq!(complete_utf8_prefix_len(&[]), 0);
@@ -484,7 +514,8 @@ mod tests {
         t.special_tokens.insert("<｜User｜>".into(), 151644);
         t.special_tokens.insert("<｜Assistant｜>".into(), 151645);
         t.special_tokens.insert("<think>".into(), 151648);
-        t.special_tokens.insert("<｜end▁of▁sentence｜>".into(), 151643);
+        t.special_tokens
+            .insert("<｜end▁of▁sentence｜>".into(), 151643);
         rebuild_special_index(&mut t);
         // Populate the vocab so BPE finds "What" and " is" etc. as whole tokens
         // (the pieces the regex would produce must NOT reassemble the specials).

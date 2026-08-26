@@ -17,8 +17,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::cache::KVCache;
 use crate::graph::alloc::GraphAllocator;
-use crate::graph::cache::GraphCache;
 use crate::graph::backend::Backend;
+use crate::graph::cache::GraphCache;
 use crate::graph::fusion::FusionPass;
 use crate::graph::ops::{AttnMeta, AttnMode, FusedFfnMeta, FusedQkvMeta, RoPEMeta};
 use crate::graph::params::{CParams, GraphParams, GraphType};
@@ -53,7 +53,11 @@ impl Qwen2Graph {
 
         let mut h = b.embedding(inp_ids, model.tok_embd.as_ref().unwrap());
 
-        let mode = if params.cparams.flash_attn { AttnMode::Flash } else { AttnMode::Gqa };
+        let mode = if params.cparams.flash_attn {
+            AttnMode::Flash
+        } else {
+            AttnMode::Gqa
+        };
         let attn_scale = hp.attention_scale();
 
         for (il, l) in model.layers.iter().enumerate() {
@@ -69,11 +73,15 @@ impl Qwen2Graph {
             let fuse_qkv = nt == 1
                 && params.cparams.gpu
                 && params.cparams.fuse_qkv
-                && l.bq.is_some() && l.bk.is_some() && l.bv.is_some()
+                && l.bq.is_some()
+                && l.bk.is_some()
+                && l.bv.is_some()
                 && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);
             let (q, kv) = if fuse_qkv {
                 let qkv = b.fused_qkv(
-                    normed, inp_pos, il,
+                    normed,
+                    inp_pos,
+                    il,
                     FusedQkvMeta {
                         qkv_weight: format!("blk.{il}.attn_qkv"),
                         bias_q: l.bq.as_ref().map(|t| t.name.clone()),
@@ -102,12 +110,26 @@ impl Qwen2Graph {
                 let v = b.matmul(normed, l.wv.as_ref().unwrap(), l.bv.as_ref());
 
                 let q = b.rope(
-                    q, inp_pos, hp.rope_style,
-                    RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nh, hd },
+                    q,
+                    inp_pos,
+                    hp.rope_style,
+                    RoPEMeta {
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        n_head: nh,
+                        hd,
+                    },
                 );
                 let k = b.rope(
-                    k, inp_pos, hp.rope_style,
-                    RoPEMeta { freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale, n_head: nk, hd },
+                    k,
+                    inp_pos,
+                    hp.rope_style,
+                    RoPEMeta {
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        n_head: nk,
+                        hd,
+                    },
                 );
 
                 b.kvcache_store(il, k, v, inp_pos, n_ctx);
@@ -117,8 +139,19 @@ impl Qwen2Graph {
 
             // attention
             let attn_out = b.attn(
-                q, kv, inp_pos, mode,
-                AttnMeta { layer: il, n_head: nh, n_head_kv: nk, hd, hd_kv, nkt, scale: attn_scale },
+                q,
+                kv,
+                inp_pos,
+                mode,
+                AttnMeta {
+                    layer: il,
+                    n_head: nh,
+                    n_head_kv: nk,
+                    hd,
+                    hd_kv,
+                    nkt,
+                    scale: attn_scale,
+                },
             );
 
             // output projection + residual
@@ -129,7 +162,11 @@ impl Qwen2Graph {
                 // (llama `ggml_get_rows(cur/inpSA, inp_out_ids)` at
                 // qwen2.cpp:106-108) — ffn_norm, gate/up/down, swiglu, both
                 // residuals and lm_head all run on n_out rows only.
-                let tail_ids = b.input("tail_ids", [params.n_out, 1, 1, 1], crate::graph::DType::I32);
+                let tail_ids = b.input(
+                    "tail_ids",
+                    [params.n_out, 1, 1, 1],
+                    crate::graph::DType::I32,
+                );
                 let cur_tail = b.get_rows(wo, tail_ids, [ne, params.n_out, 1, 1]);
                 let res_tail = b.get_rows(residual, tail_ids, [ne, params.n_out, 1, 1]);
                 h = b.add(res_tail, cur_tail);
@@ -178,7 +215,11 @@ impl Qwen2Graph {
 
         // output: norm + lm_head
         let normed = b.rms_norm(h, model.output_norm.as_ref(), eps);
-        let logits = b.matmul(normed, model.output.as_ref().unwrap(), model.output_b.as_ref());
+        let logits = b.matmul(
+            normed,
+            model.output.as_ref().unwrap(),
+            model.output_b.as_ref(),
+        );
         b.output(logits);
 
         b.build()
@@ -191,7 +232,9 @@ impl Qwen2Graph {
         wk: &Option<crate::tensor::Tensor>,
         wv: &Option<crate::tensor::Tensor>,
     ) -> bool {
-        let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else { return false };
+        let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else {
+            return false;
+        };
         #[cfg(target_os = "macos")]
         {
             crate::metal::concat_rows(&[wq, wk, wv]).is_some()
@@ -209,7 +252,9 @@ impl Qwen2Graph {
         fg: &Option<crate::tensor::Tensor>,
         fu: &Option<crate::tensor::Tensor>,
     ) -> bool {
-        let (Some(fg), Some(fu)) = (fg, fu) else { return false };
+        let (Some(fg), Some(fu)) = (fg, fu) else {
+            return false;
+        };
         #[cfg(target_os = "macos")]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
@@ -236,8 +281,18 @@ impl Qwen2Graph {
         }
         for l in &model.layers {
             for t in [
-                &l.attn_norm, &l.wq, &l.bq, &l.wk, &l.bk, &l.wv, &l.bv, &l.wo,
-                &l.ffn_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down,
+                &l.attn_norm,
+                &l.wq,
+                &l.bq,
+                &l.wk,
+                &l.bk,
+                &l.wv,
+                &l.bv,
+                &l.wo,
+                &l.ffn_norm,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
             ] {
                 if let Some(t) = t {
                     let name = t.name.clone();
@@ -267,10 +322,7 @@ impl Qwen2Graph {
     ) -> Vec<f32> {
         let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);
         let mut guard = graph_cache().lock().unwrap();
-        Self::forward_cached(
-            model, tokens, positions, n_out,
-            n_ctx, &mut guard,
-        )
+        Self::forward_cached(model, tokens, positions, n_out, n_ctx, &mut guard)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context
@@ -302,15 +354,19 @@ impl Qwen2Graph {
         // attributes rather than `cfg!()` so the `metal_backend` path is not
         // resolved on non-macOS builds (the module does not exist there).
         #[cfg(target_os = "macos")]
-        let metal_on = crate::graph::metal_backend::metal_available()
-            && Self::weights_on_gpu(model);
+        let metal_on =
+            crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model);
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
             n_out,
-            gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
+            gtype: if nt == 1 {
+                GraphType::Decode
+            } else {
+                GraphType::Prefill
+            },
             cparams: CParams {
                 n_ctx,
                 n_batch: nt,
@@ -367,12 +423,21 @@ impl Qwen2Graph {
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
         // G3: the last-layer tail-row reduction reads `tail_ids` (filled when
         // the graph was built with n_out < nt, i.e. prefill)
-        if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
+        if graph
+            .inputs
+            .iter()
+            .any(|&i| graph.node(i).name == "tail_ids")
+        {
             let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
             alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
         }
         if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
-            if let Some(idsbuf) = graph.inputs.iter().find(|&&i| graph.node(i).name == "token_ids").copied() {
+            if let Some(idsbuf) = graph
+                .inputs
+                .iter()
+                .find(|&&i| graph.node(i).name == "token_ids")
+                .copied()
+            {
                 let v = alloc.copy_to_cpu(idsbuf).unwrap_or_default();
                 eprintln!("[graph dump] ids after fill: {:?}", &v[..v.len().min(8)]);
             }
@@ -388,26 +453,39 @@ impl Qwen2Graph {
             let tag = if nt == 1 { "decode" } else { "prefill" };
             let _ = std::fs::write(format!("{dir}/logits_{tag}.f32"), {
                 let mut b = Vec::with_capacity(logits.len() * 4);
-                for x in &logits { b.extend_from_slice(&x.to_le_bytes()); }
+                for x in &logits {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
                 b
             });
             for nid in [0usize, 1, 2, 3, 5, 8, 10, 11] {
                 if nid < graph.n_nodes() {
                     if let Some(buf) = alloc.copy_to_cpu(nid) {
                         let mut b = Vec::with_capacity(buf.len() * 4);
-                        for x in &buf { b.extend_from_slice(&x.to_le_bytes()); }
+                        for x in &buf {
+                            b.extend_from_slice(&x.to_le_bytes());
+                        }
                         let _ = std::fs::write(format!("{dir}/node{nid}_{tag}.f32"), b);
                     }
                 }
             }
-            if let Some(kv0) = graph.nodes.iter().position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 })) {
+            if let Some(kv0) = graph
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 }))
+            {
                 if let Some(kv) = alloc.copy_to_cpu(kv0) {
                     let mut b = Vec::with_capacity(kv.len() * 4);
-                    for x in &kv { b.extend_from_slice(&x.to_le_bytes()); }
+                    for x in &kv {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
                     let _ = std::fs::write(format!("{dir}/kv0_{tag}.f32"), b);
                 }
             }
-            eprintln!("[graph dump] wrote {dir}/logits_{tag}.f32 ({} elems)", logits.len());
+            eprintln!(
+                "[graph dump] wrote {dir}/logits_{tag}.f32 ({} elems)",
+                logits.len()
+            );
         }
 
         // extract the tail n_out rows of logits. With G3 the graph already
@@ -424,15 +502,30 @@ impl Qwen2Graph {
     fn weights_on_gpu(model: &Qwen2Model) -> bool {
         let names: Vec<String> = {
             let mut v = Vec::new();
-            for t in [&model.tok_embd, &model.output_norm, &model.output, &model.output_b] {
+            for t in [
+                &model.tok_embd,
+                &model.output_norm,
+                &model.output,
+                &model.output_b,
+            ] {
                 if let Some(t) = t {
                     v.push(t.name.clone());
                 }
             }
             for l in &model.layers {
                 for t in [
-                    &l.attn_norm, &l.wq, &l.bq, &l.wk, &l.bk, &l.wv, &l.bv, &l.wo,
-                    &l.ffn_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down,
+                    &l.attn_norm,
+                    &l.wq,
+                    &l.bq,
+                    &l.wk,
+                    &l.bk,
+                    &l.wv,
+                    &l.bv,
+                    &l.wo,
+                    &l.ffn_norm,
+                    &l.ffn_gate,
+                    &l.ffn_up,
+                    &l.ffn_down,
                 ] {
                     if let Some(t) = t {
                         v.push(t.name.clone());
@@ -443,7 +536,9 @@ impl Qwen2Graph {
         };
         #[cfg(target_os = "macos")]
         {
-            let Some(mps) = crate::metal::MpsState::get() else { return false };
+            let Some(mps) = crate::metal::MpsState::get() else {
+                return false;
+            };
             names.iter().all(|n| mps.has_weight(n))
         }
         #[cfg(not(target_os = "macos"))]
@@ -471,7 +566,11 @@ mod tests {
         let home = std::env::var_os("HOME")?;
         let mut p = std::path::PathBuf::from(home);
         p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     fn argmax(x: &[f32]) -> u32 {
@@ -492,7 +591,10 @@ mod tests {
             maxd = maxd.max((a[i] - b[i]).abs());
         }
         eprintln!("[{tag}] logits max abs diff: {maxd:.3e}");
-        assert!(maxd < 1e-3, "[{tag}] graph vs forward logits diverge (max diff {maxd:.3e})");
+        assert!(
+            maxd < 1e-3,
+            "[{tag}] graph vs forward logits diverge (max diff {maxd:.3e})"
+        );
     }
 
     /// Phase 6 verification (hermetic, CPU-only): the graph path must reproduce
@@ -502,13 +604,13 @@ mod tests {
     #[test]
     fn graph_logits_match_forward_real_model() {
         use crate::graph::alloc::GraphAllocator;
-        use crate::models::ModelDef;
         use crate::graph::backend::Backend;
         use crate::graph::builder::GraphBuilder;
         use crate::graph::fusion::FusionPass;
         use crate::graph::params::{CParams, GraphParams, GraphType};
         use crate::graph::scheduler::BackendScheduler;
         use crate::graph::ComputeGraph;
+        use crate::models::ModelDef;
 
         let Some(path) = cached_model_path() else {
             eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping graph-logits test");
@@ -526,7 +628,10 @@ mod tests {
         }
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2 model");
+        let q2: &Qwen2Model = model
+            .as_any()
+            .downcast_ref::<Qwen2Model>()
+            .expect("qwen2 model");
         let ctx = &gguf.parts[0].ctx;
         let tok = crate::tokenizer::Tokenizer::load(ctx);
         let ids = tok.encode("The capital of France is");
@@ -545,7 +650,13 @@ mod tests {
                 n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Prefill,
-                cparams: CParams { n_ctx, n_batch: nt, flash_attn: false, gpu: false, fuse_qkv: false },
+                cparams: CParams {
+                    n_ctx,
+                    n_batch: nt,
+                    flash_attn: false,
+                    gpu: false,
+                    fuse_qkv: false,
+                },
                 weights_version: 1,
             };
             let sched = BackendScheduler::new();
@@ -573,7 +684,13 @@ mod tests {
                 n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Decode,
-                cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: false, fuse_qkv: false },
+                cparams: CParams {
+                    n_ctx,
+                    n_batch: 1,
+                    flash_attn: false,
+                    gpu: false,
+                    fuse_qkv: false,
+                },
                 weights_version: 1,
             };
             let mut dgraph: ComputeGraph = model.build_graph(&dparams);
@@ -582,7 +699,9 @@ mod tests {
             FusionPass::new().run(&mut dgraph, &backends, &|_, _| Some(0));
             alloc.alloc_graph(&dgraph).unwrap();
             alloc.fill_input_i32(&dgraph, "token_ids", &[next]).unwrap();
-            alloc.fill_input_i32(&dgraph, "positions", &[nt as u32]).unwrap();
+            alloc
+                .fill_input_i32(&dgraph, "positions", &[nt as u32])
+                .unwrap();
             sched.execute(&dgraph, &mut alloc).unwrap();
             let dlogits = alloc.copy_to_cpu(dgraph.outputs[0]).unwrap();
             (prefill_l, dlogits.to_vec())
@@ -660,7 +779,10 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            let Some(path) = cached_model_path() else { eprintln!("not cached; skipping"); return; };
+            let Some(path) = cached_model_path() else {
+                eprintln!("not cached; skipping");
+                return;
+            };
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
@@ -683,18 +805,30 @@ mod tests {
             let hd = hp.n_embd_head() as usize;
             let nkt = hp.n_kv_embd as usize;
             let rm = |hd_, nh_| crate::graph::ops::RoPEMeta {
-                freq_base: hp.rope_freq_base, freq_scale: hp.rope_freq_scale,
-                n_head: nh_, hd: hd_,
+                freq_base: hp.rope_freq_base,
+                freq_scale: hp.rope_freq_scale,
+                n_head: nh_,
+                hd: hd_,
             };
             let qr = gb.rope(q, pos, hp.rope_style, rm(hd, nh));
             let kr = gb.rope(k, pos, hp.rope_style, rm(hd, nk));
             gb.kvcache_store(0, kr, v, pos, 32768);
             let kv = gb.kvcache_load(0, nkt, 32768, nk);
-            let ao = gb.attn(qr, kv, pos, crate::graph::ops::AttnMode::Gqa,
+            let ao = gb.attn(
+                qr,
+                kv,
+                pos,
+                crate::graph::ops::AttnMode::Gqa,
                 crate::graph::ops::AttnMeta {
-                    layer: 0, n_head: nh, n_head_kv: nk, hd, hd_kv: nkt / nk,
-                    nkt, scale: hp.attention_scale(),
-                });
+                    layer: 0,
+                    n_head: nh,
+                    n_head_kv: nk,
+                    hd,
+                    hd_kv: nkt / nk,
+                    nkt,
+                    scale: hp.attention_scale(),
+                },
+            );
             gb.output(ao);
             let g = gb.build();
 
@@ -731,7 +865,9 @@ mod tests {
                 sched.execute(&g2, &mut alloc).unwrap();
                 let got = alloc.copy_to_cpu(g2.outputs[0]).unwrap();
                 let mut maxd = 0.0f32;
-                for i in 0..got.len().min(expect.len()) { maxd = maxd.max((got[i] - expect[i]).abs()); }
+                for i in 0..got.len().min(expect.len()) {
+                    maxd = maxd.max((got[i] - expect[i]).abs());
+                }
                 let kv_got = g2
                     .nodes
                     .iter()
@@ -739,23 +875,42 @@ mod tests {
                     .and_then(|nid| alloc.copy_to_cpu(nid))
                     .unwrap_or_default();
                 let mut kvd = 0.0f32;
-                for i in 0..kv_ref.len().min(kv_got.len()) { kvd = kvd.max((kv_ref[i] - kv_got[i]).abs()); }
-                eprintln!("[embed iso] kv0[0..4] gpu={:?} cpu={:?}", &kv_got[..kv_got.len().min(4)], &kv_ref[..kv_ref.len().min(4)]);
-                let kvn = g2.nodes.iter().position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 })).unwrap();
+                for i in 0..kv_ref.len().min(kv_got.len()) {
+                    kvd = kvd.max((kv_ref[i] - kv_got[i]).abs());
+                }
+                eprintln!(
+                    "[embed iso] kv0[0..4] gpu={:?} cpu={:?}",
+                    &kv_got[..kv_got.len().min(4)],
+                    &kv_ref[..kv_ref.len().min(4)]
+                );
+                let kvn = g2
+                    .nodes
+                    .iter()
+                    .position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: 0 }))
+                    .unwrap();
                 eprintln!("[embed iso] kv_load bufref={:?}", alloc.node_buffer(kvn));
                 use crate::graph::backend::KvProvider as _;
                 let kp = alloc.kv_pair(0);
                 eprintln!("[embed iso] kv_pair(0)={:?}", kp);
                 if let Some((ki, _)) = kp {
-                    if let Some(kv2) = alloc.metal().and_then(|m| m.read_host(ki).map(|s| s.to_vec())) {
-                        eprintln!("[embed iso] kv_pair(0) direct metal read[0..4]={:?}", &kv2[..4]);
+                    if let Some(kv2) = alloc
+                        .metal()
+                        .and_then(|m| m.read_host(ki).map(|s| s.to_vec()))
+                    {
+                        eprintln!(
+                            "[embed iso] kv_pair(0) direct metal read[0..4]={:?}",
+                            &kv2[..4]
+                        );
                     }
                 }
                 eprintln!("[embed iso] run max diff {maxd:.3e} kvK diff {kvd:.3e} got0={:?} expect0={:?} got29={:?} expect29={:?}",
                     &got[0..4], &expect[0..4], &got[29 * 896..29 * 896 + 4], &expect[29 * 896..29 * 896 + 4]);
                 worst = worst.max(maxd);
             }
-            assert!(worst < 1e-3, "embed isolation nondeterministic: worst {worst:.3e}");
+            assert!(
+                worst < 1e-3,
+                "embed isolation nondeterministic: worst {worst:.3e}"
+            );
         }
     }
 
@@ -771,7 +926,10 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            let Some(path) = cached_model_path() else { eprintln!("not cached; skipping"); return; };
+            let Some(path) = cached_model_path() else {
+                eprintln!("not cached; skipping");
+                return;
+            };
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
@@ -781,7 +939,9 @@ mod tests {
             let ne = q2.hparams.n_embd as usize;
             let nkt = q2.hparams.n_kv_embd as usize;
             let nt = 30usize; // GEMM path (nt >= 9)
-            let xd: Vec<f32> = (0..ne * nt).map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0).collect();
+            let xd: Vec<f32> = (0..ne * nt)
+                .map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0)
+                .collect();
 
             let mut gb = crate::graph::builder::GraphBuilder::new();
             let x = gb.input("x", [ne, nt, 1, 1], crate::graph::DType::F32);
@@ -801,7 +961,9 @@ mod tests {
 
             // Metal
             let mut g2 = g.clone();
-            for n in &mut g2.nodes { n.backend = Some(crate::graph::Backend::Metal); }
+            for n in &mut g2.nodes {
+                n.backend = Some(crate::graph::Backend::Metal);
+            }
             let mut alloc = crate::graph::alloc::GraphAllocator::new();
             alloc.enable_metal();
             alloc.alloc_graph(&g2).unwrap();
@@ -809,7 +971,9 @@ mod tests {
             sched.execute(&g2, &mut alloc).unwrap();
             let got = alloc.copy_to_cpu(m).unwrap();
             let mut maxd = 0.0f32;
-            for i in 0..got.len() { maxd = maxd.max((got[i] - expect[i]).abs()); }
+            for i in 0..got.len() {
+                maxd = maxd.max((got[i] - expect[i]).abs());
+            }
             eprintln!("[real wk matmul] vs CPU: max diff {maxd:.3e} (nt={nt}, od={nkt}, id={ne})");
             // manual Q4_0 x f32 reference from the real weight bytes
             let mut ref2 = vec![0.0f32; nkt * nt];
@@ -821,11 +985,17 @@ mod tests {
                         let mut acc = 0.0f32;
                         for b in 0..ne / 32 {
                             let boff = b * 18;
-                            let d = crate::block::fp16_to_f32(u16::from_le_bytes([wrow[boff], wrow[boff + 1]]));
+                            let d = crate::block::fp16_to_f32(u16::from_le_bytes([
+                                wrow[boff],
+                                wrow[boff + 1],
+                            ]));
                             for j in 0..16 {
                                 let byte = wrow[boff + 2 + j];
-                                acc += ((byte & 0x0F) as i8 - 8) as f32 * d * xd[t * ne + b * 32 + j];
-                                acc += ((byte >> 4) as i8 - 8) as f32 * d * xd[t * ne + b * 32 + j + 16];
+                                acc +=
+                                    ((byte & 0x0F) as i8 - 8) as f32 * d * xd[t * ne + b * 32 + j];
+                                acc += ((byte >> 4) as i8 - 8) as f32
+                                    * d
+                                    * xd[t * ne + b * 32 + j + 16];
                             }
                         }
                         ref2[t * nkt + o] = acc;
@@ -833,9 +1003,14 @@ mod tests {
                 }
             }
             let mut m2 = 0.0f32;
-            for i in 0..got.len() { m2 = m2.max((got[i] - ref2[i]).abs()); }
+            for i in 0..got.len() {
+                m2 = m2.max((got[i] - ref2[i]).abs());
+            }
             eprintln!("[real wk matmul] vs manual Q4_0xf32: max diff {m2:.3e}");
-            assert!(m2 < 5e-3, "real wk Metal diverges from Q4_0xf32 reference: {m2:.3e}");
+            assert!(
+                m2 < 5e-3,
+                "real wk Metal diverges from Q4_0xf32 reference: {m2:.3e}"
+            );
         }
     }
 
@@ -853,7 +1028,10 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2 model");
+        let q2: &Qwen2Model = model
+            .as_any()
+            .downcast_ref::<Qwen2Model>()
+            .expect("qwen2 model");
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
         let ids = tok.encode("The capital of France is Paris and");
         let nt = ids.len();
@@ -872,16 +1050,17 @@ mod tests {
         for i in 0..pa.len() {
             d = d.max((pa[i] - pb[i]).abs());
         }
-        assert_eq!(d, 0.0, "identical inputs on fresh caches must give identical logits");
+        assert_eq!(
+            d, 0.0,
+            "identical inputs on fresh caches must give identical logits"
+        );
 
         // Interleave: A prefill -> B prefill -> A decode -> B decode.
         // Each cache's KV must stay isolated from the other's.
-        let da = Qwen2Graph::forward_cached(
-            q2, &[argmax(&pa)], &[next_pos], 1, n_ctx, &mut cache_a,
-        );
-        let db = Qwen2Graph::forward_cached(
-            q2, &[argmax(&pb)], &[next_pos], 1, n_ctx, &mut cache_b,
-        );
+        let da =
+            Qwen2Graph::forward_cached(q2, &[argmax(&pa)], &[next_pos], 1, n_ctx, &mut cache_a);
+        let db =
+            Qwen2Graph::forward_cached(q2, &[argmax(&pb)], &[next_pos], 1, n_ctx, &mut cache_b);
         let mut d2 = 0.0f32;
         for i in 0..da.len().min(db.len()) {
             d2 = d2.max((da[i] - db[i]).abs());
@@ -902,7 +1081,12 @@ mod tests {
         // And an out-of-range position must panic (guarded), not corrupt memory.
         let oob = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Qwen2Graph::forward_cached(
-                q2, &[argmax(&pa)], &[small_ctx], 1, small_ctx, &mut cache_s,
+                q2,
+                &[argmax(&pa)],
+                &[small_ctx],
+                1,
+                small_ctx,
+                &mut cache_s,
             );
         }));
         assert!(oob.is_err(), "position >= n_ctx must be rejected");
@@ -918,7 +1102,11 @@ mod tail_tests {
         let home = std::env::var_os("HOME")?;
         let mut p = std::path::PathBuf::from(home);
         p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     /// G3 correctness: the n_out=1 (reduced) graph must produce the same last
@@ -929,9 +1117,9 @@ mod tail_tests {
     #[test]
     fn tail_reduction_matches_full_nt() {
         use crate::graph::alloc::GraphAllocator;
-        use crate::graph::scheduler::BackendScheduler;
-        use crate::graph::params::{CParams, GraphParams, GraphType};
         use crate::graph::ops::Op;
+        use crate::graph::params::{CParams, GraphParams, GraphType};
+        use crate::graph::scheduler::BackendScheduler;
         let Some(path) = model_path() else {
             eprintln!("not cached; skipping");
             return;
@@ -948,31 +1136,92 @@ mod tail_tests {
         /// for both the full graph (n_out=nt) and the reduced graph (n_out=1,
         /// tail get_rows inserted after wo).
         fn semantic_nodes(g: &crate::graph::ComputeGraph) -> Vec<(usize, &'static str)> {
-            let q_matmul = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_q.weight").unwrap();
-            let q_rope = g.nodes.iter().position(|n| matches!(n.op, Op::RoPE { .. }) && n.src[0] == q_matmul).unwrap();
-            let attn = g.nodes.iter().position(|n| matches!(n.op, Op::Attn { .. }) && n.src[0] == q_rope).unwrap();
-            let wo = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_output.weight").unwrap();
+            let q_matmul = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.attn_q.weight")
+                .unwrap();
+            let q_rope = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::RoPE { .. }) && n.src[0] == q_matmul)
+                .unwrap();
+            let attn = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Attn { .. }) && n.src[0] == q_rope)
+                .unwrap();
+            let wo = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.attn_output.weight")
+                .unwrap();
             // post-attn add: full -> add(src wo); reduced -> add(get_rows(wo), get_rows(h))
-            let add_after_wo = g.nodes.iter().position(|n| {
-                matches!(n.op, Op::Add)
-                    && n.src.iter().any(|&s| {
-                        s == wo || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wo
-                    })
-            }).unwrap();
-            let ffn_norm = g.nodes.iter().position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == add_after_wo).unwrap();
-            let gate = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_gate.weight").unwrap();
-            let up = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_up.weight").unwrap();
+            let add_after_wo = g
+                .nodes
+                .iter()
+                .position(|n| {
+                    matches!(n.op, Op::Add)
+                        && n.src.iter().any(|&s| {
+                            s == wo
+                                || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wo
+                        })
+                })
+                .unwrap();
+            let ffn_norm = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == add_after_wo)
+                .unwrap();
+            let gate = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.ffn_gate.weight")
+                .unwrap();
+            let up = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.ffn_up.weight")
+                .unwrap();
             // FusionPass merges silu+mul into a single SwiGLU node
-            let swiglu = g.nodes.iter().position(|n| matches!(n.op, Op::SwiGLU) && n.src.contains(&gate)).unwrap();
-            let down = g.nodes.iter().position(|n| n.name == "matmul_blk.23.ffn_down.weight").unwrap();
-            let post_ffn = g.nodes.iter().position(|n| matches!(n.op, Op::Add) && n.src.contains(&down)).unwrap();
-            let out_norm = g.nodes.iter().position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == post_ffn).unwrap();
-            let lm = g.nodes.iter().position(|n| n.name == "matmul_output.weight").unwrap();
+            let swiglu = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::SwiGLU) && n.src.contains(&gate))
+                .unwrap();
+            let down = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.ffn_down.weight")
+                .unwrap();
+            let post_ffn = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Add) && n.src.contains(&down))
+                .unwrap();
+            let out_norm = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::RmsNorm { .. }) && n.src[0] == post_ffn)
+                .unwrap();
+            let lm = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_output.weight")
+                .unwrap();
             vec![
-                (q_matmul, "q_matmul"), (q_rope, "q_rope"), (attn, "attn"),
-                (wo, "wo"), (add_after_wo, "post_attn_add"), (ffn_norm, "ffn_norm"),
-                (gate, "gate"), (up, "up"), (swiglu, "swiglu"),
-                (down, "down"), (post_ffn, "post_ffn_add"), (out_norm, "output_norm"),
+                (q_matmul, "q_matmul"),
+                (q_rope, "q_rope"),
+                (attn, "attn"),
+                (wo, "wo"),
+                (add_after_wo, "post_attn_add"),
+                (ffn_norm, "ffn_norm"),
+                (gate, "gate"),
+                (up, "up"),
+                (swiglu, "swiglu"),
+                (down, "down"),
+                (post_ffn, "post_ffn_add"),
+                (out_norm, "output_norm"),
                 (lm, "lm_head"),
             ]
         }
@@ -981,21 +1230,36 @@ mod tail_tests {
         /// as graph outputs (so post-exec dumps are not clobbered by liveness
         /// reuse). Returns (graph, allocator).
         fn run_keep(
-            q2: &Qwen2Model, ids: &[u32], n_out: usize,
+            q2: &Qwen2Model,
+            ids: &[u32],
+            n_out: usize,
             keep: &[usize],
-        ) -> (crate::graph::ComputeGraph, crate::graph::alloc::GraphAllocator) {
+        ) -> (
+            crate::graph::ComputeGraph,
+            crate::graph::alloc::GraphAllocator,
+        ) {
             use crate::graph::params::{CParams, GraphParams, GraphType};
             let model: &dyn ModelDef = q2;
             let nt = ids.len();
             let params = GraphParams {
-                n_tokens: nt, n_seqs: 1, n_out,
+                n_tokens: nt,
+                n_seqs: 1,
+                n_out,
                 gtype: GraphType::Prefill,
-                cparams: CParams { n_ctx: 4096, n_batch: nt, flash_attn: false, gpu: false, fuse_qkv: false },
+                cparams: CParams {
+                    n_ctx: 4096,
+                    n_batch: nt,
+                    flash_attn: false,
+                    gpu: false,
+                    fuse_qkv: false,
+                },
                 weights_version: 1,
             };
             let mut graph = model.build_graph(&params);
             for &i in keep {
-                if !graph.outputs.contains(&i) { graph.outputs.push(i); }
+                if !graph.outputs.contains(&i) {
+                    graph.outputs.push(i);
+                }
             }
             let sched = BackendScheduler::new();
             let mut alloc = GraphAllocator::new();
@@ -1008,7 +1272,11 @@ mod tail_tests {
             let pos32: Vec<u32> = (0..nt as u32).collect();
             alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
             alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
-            if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
+            if graph
+                .inputs
+                .iter()
+                .any(|&i| graph.node(i).name == "tail_ids")
+            {
                 let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
                 alloc.fill_input_i32(&graph, "tail_ids", &tail).unwrap();
             }
@@ -1025,40 +1293,61 @@ mod tail_tests {
         let mut fkeep: Vec<usize> = fsem.iter().map(|&(i, _)| i).collect();
         let mut rkeep: Vec<usize> = rsem.iter().map(|&(i, _)| i).collect();
         for g in [&fg0, &rg0] {
-            let wo_id = g.nodes.iter().position(|n| n.name == "matmul_blk.23.attn_output.weight");
+            let wo_id = g
+                .nodes
+                .iter()
+                .position(|n| n.name == "matmul_blk.23.attn_output.weight");
             if let Some(wi) = wo_id {
                 if let Some(addi) = g.nodes.iter().position(|n| {
                     matches!(n.op, Op::Add)
                         && n.src.iter().any(|&s| {
-                            s == wi || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wi
+                            s == wi
+                                || matches!(g.nodes[s].op, Op::GetRows) && g.nodes[s].src[0] == wi
                         })
                 }) {
-                    let target = if std::ptr::eq(g, &fg0) { &mut fkeep } else { &mut rkeep };
+                    let target = if std::ptr::eq(g, &fg0) {
+                        &mut fkeep
+                    } else {
+                        &mut rkeep
+                    };
                     for &s in &g.nodes[addi].src {
-                        if !target.contains(&s) { target.push(s); }
+                        if !target.contains(&s) {
+                            target.push(s);
+                        }
                         // in the reduced graph the src is a get_rows: also keep
                         // the h / wo buffer it reads
                         if matches!(g.nodes[s].op, Op::GetRows) {
                             for &s2 in &g.nodes[s].src {
-                                if !target.contains(&s2) { target.push(s2); }
+                                if !target.contains(&s2) {
+                                    target.push(s2);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        drop(fg0); drop(rg0);
+        drop(fg0);
+        drop(rg0);
 
         let (fg, mut fa) = run_keep(q2, &ids, nt, &fkeep);
         let (rg, mut ra) = run_keep(q2, &ids, 1, &rkeep);
 
         // KV load at layer 23 must be identical (attention path preserved)
-        let fkv = fg.nodes.iter().position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
-        let rkv = rg.nodes.iter().position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
+        let fkv = fg
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
+        let rkv = rg
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::KvcacheLoad { layer: 23 }));
         if let (Some(fk), Some(rk)) = (fkv, rkv) {
             let a = fa.copy_to_cpu(fk).unwrap();
             let b = ra.copy_to_cpu(rk).unwrap();
-            let kvd = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0f32, f32::max);
+            let kvd = (0..a.len())
+                .map(|i| (a[i] - b[i]).abs())
+                .fold(0.0f32, f32::max);
             assert!(kvd < 1e-5, "kv.23 diverges: {kvd:.3e}");
         }
 
@@ -1073,7 +1362,11 @@ mod tail_tests {
             let al = a.len();
             let full_row = al / nt; // row width in the full graph (row count == nt)
             let row_f: Vec<f32> = a[al - full_row..].to_vec();
-            let row_b: Vec<f32> = if b.len() >= full_row { b[b.len() - full_row..].to_vec() } else { b.clone() };
+            let row_b: Vec<f32> = if b.len() >= full_row {
+                b[b.len() - full_row..].to_vec()
+            } else {
+                b.clone()
+            };
             let d = (0..row_f.len().min(row_b.len()))
                 .map(|i| (row_f[i] - row_b[i]).abs())
                 .fold(0.0f32, f32::max);
@@ -1105,19 +1398,32 @@ mod tail_tests {
         #[cfg(target_os = "macos")]
         {
             use crate::graph::alloc::GraphAllocator;
-            use crate::graph::scheduler::BackendScheduler;
-            use crate::graph::params::{CParams, GraphParams, GraphType};
-            use crate::graph::ops::Op;
             use crate::graph::builder::GraphBuilder;
+            use crate::graph::ops::Op;
+            use crate::graph::params::{CParams, GraphParams, GraphType};
+            use crate::graph::scheduler::BackendScheduler;
 
             fn run_decode(
-                q2: &Qwen2Model, model: &dyn ModelDef, tok_ids: &[u32], n_ctx: usize, nv: usize,
-                fuse: bool, expect_fused_node: bool,
+                q2: &Qwen2Model,
+                model: &dyn ModelDef,
+                tok_ids: &[u32],
+                n_ctx: usize,
+                nv: usize,
+                fuse: bool,
+                expect_fused_node: bool,
             ) -> Vec<f32> {
                 let params = GraphParams {
-                    n_tokens: 1, n_seqs: 1, n_out: 1,
+                    n_tokens: 1,
+                    n_seqs: 1,
+                    n_out: 1,
                     gtype: GraphType::Decode,
-                    cparams: CParams { n_ctx, n_batch: 1, flash_attn: false, gpu: true, fuse_qkv: fuse },
+                    cparams: CParams {
+                        n_ctx,
+                        n_batch: 1,
+                        flash_attn: false,
+                        gpu: true,
+                        fuse_qkv: fuse,
+                    },
                     weights_version: 1,
                 };
                 let mut graph = model.build_graph(&params);
@@ -1128,13 +1434,20 @@ mod tail_tests {
                 sched.assign_backends(&mut graph, &alloc);
                 {
                     let backends: Vec<&dyn Backend> = vec![alloc.cpu(), alloc.metal().unwrap()];
-                    FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-                        Some(crate::graph::Backend::CPU) => Some(0),
-                        Some(crate::graph::Backend::Metal) => Some(1),
-                        _ => None,
-                    });
+                    FusionPass::new().run(
+                        &mut graph,
+                        &backends,
+                        &|g, id| match g.node(id).backend {
+                            Some(crate::graph::Backend::CPU) => Some(0),
+                            Some(crate::graph::Backend::Metal) => Some(1),
+                            _ => None,
+                        },
+                    );
                 }
-                let has_fused = graph.nodes.iter().any(|n| matches!(n.op, Op::FusedQKV { .. }));
+                let has_fused = graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, Op::FusedQKV { .. }));
                 assert_eq!(has_fused, expect_fused_node, "FusedQKV node presence");
                 let ffn_off = std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
                 let has_fused_ffn = graph.nodes.iter().any(|n| matches!(n.op, Op::FusedFFN));
@@ -1143,10 +1456,15 @@ mod tail_tests {
                     let nf = q2.hparams.n_ff as usize;
                     nf <= 16384
                 };
-                assert_eq!(has_fused_ffn, expect_fused_node && !ffn_off && ffn_small,
-                    "FusedFFN node presence");
+                assert_eq!(
+                    has_fused_ffn,
+                    expect_fused_node && !ffn_off && ffn_small,
+                    "FusedFFN node presence"
+                );
                 alloc.alloc_graph(&graph).unwrap();
-                alloc.fill_input_i32(&graph, "token_ids", &[tok_ids[0]]).unwrap();
+                alloc
+                    .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
+                    .unwrap();
                 alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
                 sched.execute(&graph, &mut alloc).unwrap();
                 alloc.copy_to_cpu(graph.outputs[0]).unwrap()
@@ -1155,13 +1473,30 @@ mod tail_tests {
             /// Build + execute a decode graph, marking every post-FFN Add
             /// (residual + ffn_down) as an output so we can compare layer by layer.
             fn run_decode_layers(
-                q2: &Qwen2Model, model: &dyn ModelDef, tok_ids: &[u32],
+                q2: &Qwen2Model,
+                model: &dyn ModelDef,
+                tok_ids: &[u32],
                 fuse: bool,
-            ) -> (Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            ) -> (
+                Vec<f32>,
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+            ) {
                 let params = GraphParams {
-                    n_tokens: 1, n_seqs: 1, n_out: 1,
+                    n_tokens: 1,
+                    n_seqs: 1,
+                    n_out: 1,
                     gtype: GraphType::Decode,
-                    cparams: CParams { n_ctx: 4096, n_batch: 1, flash_attn: false, gpu: true, fuse_qkv: fuse },
+                    cparams: CParams {
+                        n_ctx: 4096,
+                        n_batch: 1,
+                        flash_attn: false,
+                        gpu: true,
+                        fuse_qkv: fuse,
+                    },
                     weights_version: 1,
                 };
                 let mut graph = model.build_graph(&params);
@@ -1172,7 +1507,8 @@ mod tail_tests {
                 let mut fused_outs: Vec<usize> = Vec::new();
                 let mut swiglu_ids: Vec<usize> = Vec::new();
                 for (i, n) in graph.nodes.iter().enumerate() {
-                    if matches!(n.op, Op::Add) && n.src.len() == 2
+                    if matches!(n.op, Op::Add)
+                        && n.src.len() == 2
                         && graph.nodes[n.src[1]].name.contains("ffn_down")
                     {
                         ffn_adds.push(i);
@@ -1191,8 +1527,12 @@ mod tail_tests {
                         graph.outputs.push(i);
                     }
                     if matches!(n.op, Op::RmsNorm { .. }) {
-                        let fed = graph.nodes.iter().any(|m| m.src.contains(&i)
-                            && (matches!(m.op, Op::FusedFFN) || m.name.contains("ffn_gate") || m.name.contains("ffn_up")));
+                        let fed = graph.nodes.iter().any(|m| {
+                            m.src.contains(&i)
+                                && (matches!(m.op, Op::FusedFFN)
+                                    || m.name.contains("ffn_gate")
+                                    || m.name.contains("ffn_up"))
+                        });
                         if fed {
                             norm_adds.push(i);
                             graph.outputs.push(i);
@@ -1206,14 +1546,20 @@ mod tail_tests {
                 sched.assign_backends(&mut graph, &alloc);
                 {
                     let backends: Vec<&dyn Backend> = vec![alloc.cpu(), alloc.metal().unwrap()];
-                    FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-                        Some(crate::graph::Backend::CPU) => Some(0),
-                        Some(crate::graph::Backend::Metal) => Some(1),
-                        _ => None,
-                    });
+                    FusionPass::new().run(
+                        &mut graph,
+                        &backends,
+                        &|g, id| match g.node(id).backend {
+                            Some(crate::graph::Backend::CPU) => Some(0),
+                            Some(crate::graph::Backend::Metal) => Some(1),
+                            _ => None,
+                        },
+                    );
                 }
                 alloc.alloc_graph(&graph).unwrap();
-                alloc.fill_input_i32(&graph, "token_ids", &[tok_ids[0]]).unwrap();
+                alloc
+                    .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
+                    .unwrap();
                 alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
                 sched.execute(&graph, &mut alloc).unwrap();
                 let logits = alloc.copy_to_cpu(graph.outputs[0]).unwrap();

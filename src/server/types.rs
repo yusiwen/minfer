@@ -66,9 +66,8 @@ impl ChatCompletionRequest {
     /// on malformed JSON, missing/empty messages, unknown roles, or non-string
     /// content (multimodal arrays are rejected per the plan's Non-Goals).
     pub fn parse(body: &[u8]) -> Result<Self, ApiError> {
-        let req: ChatCompletionRequest = serde_json::from_slice(body).map_err(|e| {
-            ApiError::invalid_request(format!("invalid request body: {e}"))
-        })?;
+        let req: ChatCompletionRequest = serde_json::from_slice(body)
+            .map_err(|e| ApiError::invalid_request(format!("invalid request body: {e}")))?;
         if req.messages.is_empty() {
             return Err(ApiError::invalid_request(
                 "messages must not be empty".to_string(),
@@ -158,7 +157,10 @@ pub fn build_response(
         model: model.to_string(),
         choices: vec![Choice {
             index: 0,
-            message: ResponseMessage { role: "assistant", content: text },
+            message: ResponseMessage {
+                role: "assistant",
+                content: text,
+            },
             finish_reason: finish_reason.to_string(),
         }],
         usage: Usage {
@@ -220,16 +222,32 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn invalid_request(msg: impl Into<String>) -> Self {
-        Self { status: 400, message: msg.into(), error_type: "invalid_request_error" }
+        Self {
+            status: 400,
+            message: msg.into(),
+            error_type: "invalid_request_error",
+        }
     }
     pub fn exceed_context(msg: impl Into<String>) -> Self {
-        Self { status: 400, message: msg.into(), error_type: "exceed_context_size_error" }
+        Self {
+            status: 400,
+            message: msg.into(),
+            error_type: "exceed_context_size_error",
+        }
     }
     pub fn unavailable(msg: impl Into<String>) -> Self {
-        Self { status: 503, message: msg.into(), error_type: "unavailable_error" }
+        Self {
+            status: 503,
+            message: msg.into(),
+            error_type: "unavailable_error",
+        }
     }
     pub fn server(msg: impl Into<String>) -> Self {
-        Self { status: 500, message: msg.into(), error_type: "server_error" }
+        Self {
+            status: 500,
+            message: msg.into(),
+            error_type: "server_error",
+        }
     }
     pub fn json(&self) -> String {
         serde_json::json!({
@@ -286,10 +304,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_unknown_role() {
-        let err = ChatCompletionRequest::parse(
-            br#"{"messages":[{"role":"pirate","content":"yo"}]}"#,
-        )
-        .unwrap_err();
+        let err =
+            ChatCompletionRequest::parse(br#"{"messages":[{"role":"pirate","content":"yo"}]}"#)
+                .unwrap_err();
         assert_eq!(err.status, 400);
         assert!(err.message.contains("pirate"));
     }
@@ -316,7 +333,10 @@ mod tests {
         assert_eq!(p.frequency_penalty, 0.0);
         assert_eq!(p.presence_penalty, 0.0);
         assert_eq!(p.max_tokens, MAX_TOKENS_UNLIMITED);
-        assert_eq!(p.seed, 1234, "request seed missing -> caller-provided random default");
+        assert_eq!(
+            p.seed, 1234,
+            "request seed missing -> caller-provided random default"
+        );
         assert!(p.stop_strings.is_empty());
     }
 

@@ -61,7 +61,11 @@ pub struct GraphEngine<'a> {
 
 impl<'a> GraphEngine<'a> {
     pub fn new(model: &'a dyn ModelDef, n_ctx: usize) -> Self {
-        Self { model, cache: GraphCache::new(), n_ctx }
+        Self {
+            model,
+            cache: GraphCache::new(),
+            n_ctx,
+        }
     }
 }
 
@@ -198,7 +202,9 @@ impl Conversation {
     /// Fully renders the current messages (with/without the generation prompt).
     fn render_full(&self, add_generation_prompt: bool) -> String {
         match &self.template {
-            Some(t) => template::render_messages(t, &self.messages, add_generation_prompt, &self.bos_text),
+            Some(t) => {
+                template::render_messages(t, &self.messages, add_generation_prompt, &self.bos_text)
+            }
             None => template::fallback_chatml_messages(&self.messages, add_generation_prompt),
         }
     }
@@ -234,7 +240,8 @@ impl Conversation {
         let Some(input) = first_input else {
             return Ok(None);
         };
-        self.messages.push(("user".to_string(), Some(input.to_string())));
+        self.messages
+            .push(("user".to_string(), Some(input.to_string())));
         let full = self.render_full(true);
         let toks = decoder.encode(&full);
         if toks.is_empty() {
@@ -278,7 +285,8 @@ impl Conversation {
 
         // 3. Prefix mismatch (non-deterministic template) → full re-render fallback (§5.4).
         if !delta.prefix_matched {
-            self.messages.push(("user".to_string(), Some(input.to_string())));
+            self.messages
+                .push(("user".to_string(), Some(input.to_string())));
             let full = self.render_full(true);
             let toks = decoder.encode(&full);
             if toks.is_empty() {
@@ -286,14 +294,16 @@ impl Conversation {
             }
             let logits = self.rehydrate_full(engine, &toks);
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
-            let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+            let mut out =
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
             out.prefill_tokens = toks.len();
             return Ok(out);
         }
 
         // 4. Context overflow: drop the oldest non-system turn + full re-render (§5.7).
         if self.current_pos + delta_toks.len() > self.n_ctx {
-            self.messages.push(("user".to_string(), Some(input.to_string())));
+            self.messages
+                .push(("user".to_string(), Some(input.to_string())));
             let dropped = self.drop_oldest_turns_until_fits(decoder);
             if dropped == 0 {
                 // Only [system?, last user] left and it still does not fit: a single message is too long, error out.
@@ -310,16 +320,19 @@ impl Conversation {
             let toks = decoder.encode(&full);
             let logits = self.rehydrate_full(engine, &toks);
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
-            let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+            let mut out =
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
             out.prefill_tokens = toks.len();
             out.dropped_turns = dropped;
             return Ok(out);
         }
 
         // 5. Record the user message, set the rollback point, prefill the delta.
-        self.messages.push(("user".to_string(), Some(input.to_string())));
+        self.messages
+            .push(("user".to_string(), Some(input.to_string())));
         self.turn_pos = self.current_pos;
-        let positions: Vec<usize> = (self.current_pos..self.current_pos + delta_toks.len()).collect();
+        let positions: Vec<usize> =
+            (self.current_pos..self.current_pos + delta_toks.len()).collect();
         let logits = engine.forward(&delta_toks, &positions, 1);
         self.stream_tokens.extend_from_slice(&delta_toks);
         self.current_pos += delta_toks.len();
@@ -446,7 +459,10 @@ impl Conversation {
         arr.iter()
             .map(|m| {
                 let role = m.get("role")?.as_str()?.to_string();
-                let content = m.get("content").and_then(|c| c.as_str()).map(str::to_string);
+                let content = m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
                 Some((role, content))
             })
             .collect()
@@ -519,7 +535,8 @@ impl Conversation {
                 stopped_by_eog = true;
                 self.prev_tokens.push(sampled.token_id);
                 if self.prev_tokens.len() > REPEAT_LAST_N {
-                    self.prev_tokens.drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
+                    self.prev_tokens
+                        .drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
                 }
                 self.stream_tokens.push(sampled.token_id);
                 let _ = engine.forward(&[sampled.token_id], &[self.current_pos], 1);
@@ -538,7 +555,8 @@ impl Conversation {
             }
             self.prev_tokens.push(sampled.token_id);
             if self.prev_tokens.len() > REPEAT_LAST_N {
-                self.prev_tokens.drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
+                self.prev_tokens
+                    .drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
             }
             self.stream_tokens.push(sampled.token_id);
             // Emit only complete UTF-8 prefixes (holdback of half-characters across tokens, avoiding U+FFFD).
@@ -556,7 +574,8 @@ impl Conversation {
 
         let text = String::from_utf8(full.clone())
             .unwrap_or_else(|_| String::from_utf8_lossy(&full).into_owned());
-        self.messages.push(("assistant".to_string(), Some(text.clone())));
+        self.messages
+            .push(("assistant".to_string(), Some(text.clone())));
         // Did not reach EOG → insert EOT before the next turn's input (§5.4).
         self.need_insert_eot = !stopped_by_eog;
 
@@ -592,7 +611,12 @@ mod tests {
 
     impl MockEngine {
         fn new(program: Vec<u32>) -> Self {
-            Self { program: program.into(), calls: Vec::new(), resets: 0, vocab: 4096 }
+            Self {
+                program: program.into(),
+                calls: Vec::new(),
+                resets: 0,
+                vocab: 4096,
+            }
         }
         fn call_tokens(&self) -> Vec<u32> {
             self.calls.iter().flat_map(|c| c.0.clone()).collect()
@@ -601,7 +625,8 @@ mod tests {
 
     impl Engine for MockEngine {
         fn forward(&mut self, tokens: &[u32], positions: &[usize], n_out: usize) -> Vec<f32> {
-            self.calls.push((tokens.to_vec(), positions.to_vec(), n_out));
+            self.calls
+                .push((tokens.to_vec(), positions.to_vec(), n_out));
             let id = self.program.pop_front().unwrap_or(EOS);
             let mut logits = vec![0.0f32; self.vocab];
             logits[id as usize] = 100.0;
@@ -700,7 +725,9 @@ mod tests {
     fn start_no_input_waits() {
         let mut c = conv(512);
         let mut eng = MockEngine::new(vec![]);
-        let out = c.start(None, &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        let out = c
+            .start(None, &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert!(out.is_none());
         assert!(c.messages.is_empty());
         assert_eq!(c.current_pos, 0);
@@ -713,7 +740,9 @@ mod tests {
         let mut eng = MockEngine::new(vec![72, 105, IM_END, EOS]);
         let mut emitted: Vec<u8> = Vec::new();
         let out = c
-            .start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut |b| emitted.extend_from_slice(b))
+            .start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut |b| {
+                emitted.extend_from_slice(b)
+            })
             .unwrap()
             .unwrap();
         assert!(out.stopped_by_eog);
@@ -722,10 +751,13 @@ mod tests {
         let full = fallback_full(&[("user".into(), Some("hi".into()))]);
         assert_eq!(out.prefill_tokens, full.len());
         assert_eq!(c.stream_tokens, [&full[..], &[72, 105, IM_END]].concat());
-        assert_eq!(c.messages, vec![
-            ("user".into(), Some("hi".into())),
-            ("assistant".into(), Some("Hi".into())),
-        ]);
+        assert_eq!(
+            c.messages,
+            vec![
+                ("user".into(), Some("hi".into())),
+                ("assistant".into(), Some("Hi".into())),
+            ]
+        );
         assert!(!c.need_insert_eot);
         assert_eq!(emitted, b"Hi");
     }
@@ -735,16 +767,22 @@ mod tests {
         let mut c = conv(512);
         // t1: EOG, EOG-decode placeholder; t2: EOG, EOG-decode placeholder
         let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
-        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         let len_after_t1 = c.stream_tokens.len();
-        let t2 = c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        let t2 = c
+            .user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert!(t2.stopped_by_eog);
         // delta = "\n<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n" (with newline compensation)
         let delta = FakeCodec.encode("\n<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n");
         assert_eq!(t2.prefill_tokens, delta.len());
         // Incrementality: only the delta + this turn's EOG are appended (hit immediately, no generated tokens)
         assert_eq!(c.stream_tokens.len(), len_after_t1 + delta.len() + 1);
-        assert_eq!(&c.stream_tokens[len_after_t1..len_after_t1 + delta.len()], &delta[..]);
+        assert_eq!(
+            &c.stream_tokens[len_after_t1..len_after_t1 + delta.len()],
+            &delta[..]
+        );
         assert_eq!(c.stream_tokens.last(), Some(&IM_END));
         // turn_pos points to the start of t2's delta (= the position after t1)
         assert_eq!(c.turn_pos, len_after_t1);
@@ -758,17 +796,27 @@ mod tests {
         let mut eng = MockEngine::new(vec![72, 105, 33]); // 'H','i','!'
         let mut tp = cfg();
         tp.stop_strings = vec!["!".to_string()];
-        let out = c.user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit()).unwrap();
+        let out = c
+            .user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit())
+            .unwrap();
         assert!(out.stopped_by_string);
         assert!(!out.stopped_by_eog);
         assert_eq!(out.text, "Hi");
-        assert!(c.need_insert_eot, "stop-string termination → EOT needed before the next turn");
+        assert!(
+            c.need_insert_eot,
+            "stop-string termination → EOT needed before the next turn"
+        );
 
         // The next turn inserts EOT first (the engine receives the [eot] call), then runs the delta.
         let mut eng2 = MockEngine::new(vec![999, IM_END]); // 999 = dummy for the EOT insertion
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
         assert_eq!(eng2.calls[0].0, vec![IM_END], "first call must insert EOT");
-        assert_eq!(eng2.calls[0].1, vec![c.turn_pos - 1], "EOT written at the position before the delta");
+        assert_eq!(
+            eng2.calls[0].1,
+            vec![c.turn_pos - 1],
+            "EOT written at the position before the delta"
+        );
         // After EOT, before delta: the stream prefix == the canonical prefix (missing the trailing template newline)
         let canon = canonical(&[
             ("user".into(), Some("hi".into())),
@@ -783,7 +831,9 @@ mod tests {
         let mut eng = MockEngine::new(vec![72, 105, 33, 34]);
         let mut tp = cfg();
         tp.n_predict = 2;
-        let out = c.user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit()).unwrap();
+        let out = c
+            .user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit())
+            .unwrap();
         assert!(out.hit_n_predict);
         assert_eq!(out.text, "Hi");
         assert_eq!(out.tokens_generated, 2);
@@ -795,14 +845,18 @@ mod tests {
         let mut c = conv(512);
         // t1: EOG, placeholder; t2: 'P', EOG, placeholder; regen: 'W', EOG, placeholder
         let mut eng = MockEngine::new(vec![IM_END, EOS, 80, IM_END, EOS, 87, IM_END, EOS]);
-        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert_eq!(c.messages.last().unwrap().0, "assistant");
         let turn2_start = c.turn_pos;
 
         // regen t2: roll back to turn2_start, replay t2's delta, generate 'W'
         let mut eng2 = MockEngine::new(vec![87, IM_END, EOS]); // 'W', EOG, placeholder
-        let out = c.regen_turn(&FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        let out = c
+            .regen_turn(&FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
         assert_eq!(out.text, "W");
         assert!(out.stopped_by_eog);
         // messages: user hi, assistant "", user Q, assistant W
@@ -817,22 +871,30 @@ mod tests {
     fn regen_first_turn_uses_full_render() {
         let mut c = conv(512);
         let mut eng = MockEngine::new(vec![IM_END, EOS]);
-        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert_eq!(c.turn_pos, 0);
 
         // regen t1: turn_pos == 0 → full render (the engine's first call must be the full render, not a suffix)
         let mut eng2 = MockEngine::new(vec![88, IM_END, EOS]); // 'X', EOG, placeholder
-        let out = c.regen_turn(&FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        let out = c
+            .regen_turn(&FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
         assert_eq!(out.text, "X");
         let full = fallback_full(&[("user".into(), Some("hi".into()))]);
-        assert_eq!(eng2.calls[0].0, full, "first call must be the full first-turn render");
+        assert_eq!(
+            eng2.calls[0].0, full,
+            "first call must be the full first-turn render"
+        );
     }
 
     #[test]
     fn regen_without_assistant_errors() {
         let mut c = conv(512);
         let mut eng = MockEngine::new(vec![]);
-        let err = c.regen_turn(&FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap_err();
+        let err = c
+            .regen_turn(&FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap_err();
         assert!(matches!(err, ConvError::NothingToRegen));
     }
 
@@ -842,8 +904,10 @@ mod tests {
         s.system_prompt = Some("Be nice.".into());
         let mut c = Conversation::new(s);
         let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
-        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         c.clear();
         assert_eq!(c.messages, vec![("system".into(), Some("Be nice.".into()))]);
         assert!(c.stream_tokens.is_empty());
@@ -874,8 +938,13 @@ mod tests {
         let mut eng = MockEngine::new(vec![72, 105, 33, 34, 35, 36, 37, 38, 39, 40, IM_END]);
         let mut tp = cfg();
         tp.n_predict = 100;
-        let out = c.user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit()).unwrap();
-        assert!(out.hit_n_predict, "context full should stop as cleanly as n_predict exhaustion");
+        let out = c
+            .user_turn("hi", &FakeCodec, &tp, &mut eng, &mut noop_emit())
+            .unwrap();
+        assert!(
+            out.hit_n_predict,
+            "context full should stop as cleanly as n_predict exhaustion"
+        );
         assert!(c.current_pos <= 30);
         assert!(c.need_insert_eot);
     }
@@ -885,11 +954,19 @@ mod tests {
         let mut c = conv(512);
         // t1: 'H','i', EOG, placeholder; t2: EOG, placeholder
         let mut eng = MockEngine::new(vec![72, 105, IM_END, EOS, IM_END, EOS]);
-        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         // After t1, prev_tokens = the last 64 stream tokens (including delta + generated + EOG)
-        assert_eq!(c.prev_tokens.len(), c.stream_tokens.len().min(REPEAT_LAST_N));
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
-        assert_eq!(c.prev_tokens.len(), c.stream_tokens.len().min(REPEAT_LAST_N));
+        assert_eq!(
+            c.prev_tokens.len(),
+            c.stream_tokens.len().min(REPEAT_LAST_N)
+        );
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        assert_eq!(
+            c.prev_tokens.len(),
+            c.stream_tokens.len().min(REPEAT_LAST_N)
+        );
     }
 
     #[test]
@@ -899,11 +976,13 @@ mod tests {
         let mut eng = MockEngine::new(vec![72, 105, 33]); // 'H','i','!'
         let mut tp = cfg();
         tp.stop_strings = vec!["!".to_string()];
-        c.start(Some("hi"), &FakeCodec, &tp, &mut eng, &mut noop_emit()).unwrap();
+        c.start(Some("hi"), &FakeCodec, &tp, &mut eng, &mut noop_emit())
+            .unwrap();
         assert!(c.need_insert_eot);
 
         let mut eng2 = MockEngine::new(vec![999, IM_END]);
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
         assert_eq!(eng2.calls[0].0, vec![IM_END]);
     }
 
@@ -915,14 +994,18 @@ mod tests {
         // current_pos + delta > 50 → drop the oldest user+assistant pair and fully re-render.
         let mut c = conv(50);
         let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
-        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert_eq!(c.stream_tokens.len(), 22, "t1: 21-token render + EOG");
-        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         assert_eq!(c.stream_tokens.len(), 44, "t2: +21 delta + EOG");
 
         // t3 triggers overflow: re-render (engine.reset) + drop 1 turn + full render
         let mut eng3 = MockEngine::new(vec![IM_END, EOS]);
-        let out = c.user_turn("X", &FakeCodec, &cfg(), &mut eng3, &mut noop_emit()).unwrap();
+        let out = c
+            .user_turn("X", &FakeCodec, &cfg(), &mut eng3, &mut noop_emit())
+            .unwrap();
         assert_eq!(out.dropped_turns, 1, "oldest turn must be dropped");
         assert_eq!(eng3.resets, 1, "rehydrate must reset the engine cache");
         // Messages: the oldest [user hi, assistant] pair has been dropped
@@ -937,7 +1020,10 @@ mod tests {
         );
         // KV = the full render after re-render (turn_pos reset to zero) + EOG
         let canon = FakeCodec.encode(&template::fallback_chatml_messages(
-            &[("user".into(), Some("Q".into())), ("assistant".into(), Some("".into()))],
+            &[
+                ("user".into(), Some("Q".into())),
+                ("assistant".into(), Some("".into())),
+            ],
             false,
         ));
         assert_eq!(c.turn_pos, 0);
@@ -950,7 +1036,10 @@ mod tests {
             true,
         ));
         assert_eq!(c.stream_tokens, [&full[..], &[IM_END]].concat());
-        assert_eq!(c.stream_tokens.len(), canon.len() + full.len() - canon.len() + 1);
+        assert_eq!(
+            c.stream_tokens.len(),
+            canon.len() + full.len() - canon.len() + 1
+        );
     }
 
     #[test]
@@ -967,12 +1056,16 @@ mod tests {
     fn session_json_round_trip() {
         let mut c = conv(512);
         let mut eng = MockEngine::new(vec![IM_END, EOS]);
-        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         let json = c.messages_to_json();
         let parsed = Conversation::messages_from_json(&json).expect("parse");
         assert_eq!(parsed, c.messages);
         // null content is preserved (OpenAI-style object format)
-        let with_null = vec![("user".into(), Some("hi".into())), ("assistant".into(), None)];
+        let with_null = vec![
+            ("user".into(), Some("hi".into())),
+            ("assistant".into(), None),
+        ];
         let with_null_json = serde_json::json!([
             { "role": "user", "content": "hi" },
             { "role": "assistant", "content": null },
@@ -988,7 +1081,8 @@ mod tests {
     fn load_history_rehydrates_full_render() {
         let mut c = conv(512);
         let mut eng = MockEngine::new(vec![IM_END, EOS]);
-        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit()).unwrap();
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
         let saved = c.messages_to_json();
 
         // A new session loads the history → full re-render (render(messages, false))
@@ -999,11 +1093,16 @@ mod tests {
         assert_eq!(c2.messages, c.messages);
         assert_eq!(c2.current_pos, c2.stream_tokens.len());
         let canon = canonical(&c.messages);
-        assert_eq!(c2.stream_tokens, canon, "KV = canonical render of loaded history");
+        assert_eq!(
+            c2.stream_tokens, canon,
+            "KV = canonical render of loaded history"
+        );
         assert_eq!(c2.turn_pos, 0);
 
         // Continue the conversation after loading (the incremental delta continues from the re-rendered KV)
-        let out = c2.user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit()).unwrap();
+        let out = c2
+            .user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
         assert!(out.stopped_by_eog);
         assert_eq!(c2.messages.len(), 4);
         assert!(c2.current_pos > c2.stream_tokens.len().saturating_sub(1));
@@ -1071,17 +1170,24 @@ mod tests {
         };
         let mut emitted: Vec<u8> = Vec::new();
         let t1 = conv
-            .start(Some("hi"), &tok, &tp, &mut engine, &mut |b| emitted.extend_from_slice(b))
+            .start(Some("hi"), &tok, &tp, &mut engine, &mut |b| {
+                emitted.extend_from_slice(b)
+            })
             .unwrap()
             .expect("first turn ran");
         let t2 = conv
-            .user_turn("what is 2+2?", &tok, &tp, &mut engine, &mut |b| emitted.extend_from_slice(b))
+            .user_turn("what is 2+2?", &tok, &tp, &mut engine, &mut |b| {
+                emitted.extend_from_slice(b)
+            })
             .unwrap();
         eprintln!("t1 text: {:?}", t1.text);
         eprintln!("t2 text: {:?}", t2.text);
         assert!(!t1.text.is_empty(), "turn 1 must answer");
         assert!(!t2.text.is_empty(), "turn 2 must answer");
-        assert!(!t1.text.contains('\u{FFFD}') && !t2.text.contains('\u{FFFD}'), "no U+FFFD");
+        assert!(
+            !t1.text.contains('\u{FFFD}') && !t2.text.contains('\u{FFFD}'),
+            "no U+FFFD"
+        );
         // Incrementality: t2's delta prefill must be much smaller than t1's full prefill
         assert!(
             t2.prefill_tokens < t1.prefill_tokens,
@@ -1093,6 +1199,9 @@ mod tests {
         assert_eq!(conv.current_pos, conv.stream_tokens.len());
         assert_eq!(conv.messages.len(), 4, "user, assistant, user, assistant");
         // No EOT needed after EOG (the model stops on its own)
-        assert!(!conv.need_insert_eot, "greedy 0.5B usually EOGs; if this trips, inspect output");
+        assert!(
+            !conv.need_insert_eot,
+            "greedy 0.5B usually EOGs; if this trips, inspect output"
+        );
     }
 }

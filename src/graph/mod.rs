@@ -163,7 +163,11 @@ impl ComputeGraph {
             }
         }
         if order.len() != n {
-            return Err(format!("cycle detected: {}/{} nodes ordered", order.len(), n));
+            return Err(format!(
+                "cycle detected: {}/{} nodes ordered",
+                order.len(),
+                n
+            ));
         }
         Ok(order)
     }
@@ -206,14 +210,24 @@ mod tests {
         // hand-built cycle: a -> b -> a
         let mut g = ComputeGraph::default();
         g.nodes.push(CNode {
-            id: 0, name: "a".into(), op: Op::Add, src: vec![1],
-            out_shape: [1, 1, 1, 1], out_dtype: DType::F32,
-            backend: None, meta: NodeMeta::None,
+            id: 0,
+            name: "a".into(),
+            op: Op::Add,
+            src: vec![1],
+            out_shape: [1, 1, 1, 1],
+            out_dtype: DType::F32,
+            backend: None,
+            meta: NodeMeta::None,
         });
         g.nodes.push(CNode {
-            id: 1, name: "b".into(), op: Op::Add, src: vec![0],
-            out_shape: [1, 1, 1, 1], out_dtype: DType::F32,
-            backend: None, meta: NodeMeta::None,
+            id: 1,
+            name: "b".into(),
+            op: Op::Add,
+            src: vec![0],
+            out_shape: [1, 1, 1, 1],
+            out_dtype: DType::F32,
+            backend: None,
+            meta: NodeMeta::None,
         });
         assert!(g.topo_order().is_err());
     }
