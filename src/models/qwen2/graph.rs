@@ -298,10 +298,14 @@ impl Qwen2Graph {
             );
         }
         // GPU availability is part of the reuse identity (backend assignment
-        // lives in the built graph, not in the params' other fields)
-        let metal_on = cfg!(target_os = "macos")
-            && crate::graph::metal_backend::metal_available()
+        // lives in the built graph, not in the params' other fields). Uses
+        // attributes rather than `cfg!()` so the `metal_backend` path is not
+        // resolved on non-macOS builds (the module does not exist there).
+        #[cfg(target_os = "macos")]
+        let metal_on = crate::graph::metal_backend::metal_available()
             && Self::weights_on_gpu(model);
+        #[cfg(not(target_os = "macos"))]
+        let metal_on = false;
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
@@ -327,12 +331,14 @@ impl Qwen2Graph {
             {
                 let alloc = cache.alloc();
                 Self::register_graph_weights(model, alloc);
+                #[cfg(target_os = "macos")]
                 if metal_on {
                     alloc.enable_metal();
                 }
                 sched.assign_backends(&mut graph, alloc);
                 // fusion pass gated per node's assigned backend
                 let backends: Vec<&dyn Backend> = {
+                    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                     let mut v: Vec<&dyn Backend> = vec![alloc.cpu()];
                     #[cfg(target_os = "macos")]
                     if metal_on {
@@ -414,6 +420,7 @@ impl Qwen2Graph {
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.
+    #[cfg(target_os = "macos")]
     fn weights_on_gpu(model: &Qwen2Model) -> bool {
         let names: Vec<String> = {
             let mut v = Vec::new();
@@ -599,6 +606,7 @@ mod tests {
     /// so a loose tolerance + greedy-token equality is the criterion).
     #[test]
     fn graph_metal_matches_cpu_logits() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
@@ -643,6 +651,7 @@ mod tests {
     /// Phase 3: full layer-0 path on Metal vs CPU (embed/rms/matmul/rope/kv/attn).
     #[test]
     fn graph_metal_layer0_isolation() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
@@ -753,6 +762,7 @@ mod tests {
     /// Real model layer-0 K matmul: Metal vs CPU (isolates weight offset/data).
     #[test]
     fn graph_metal_real_wk_matmul() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {

@@ -55,6 +55,7 @@ impl DType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Backend {
     CPU,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Metal,
     /// CUDA backend (Phase 7, feature-gated) — planned, not yet wired.
     #[allow(dead_code)]

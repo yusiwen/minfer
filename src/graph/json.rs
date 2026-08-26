@@ -42,6 +42,7 @@ pub fn runtime_gparams(n_tokens: usize, n_ctx: usize, gpu: bool, fuse_qkv: bool)
 /// live server.
 pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> ComputeGraph {
     let mut g = model.build_graph(gparams);
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut alloc = GraphAllocator::new();
     #[cfg(target_os = "macos")]
     if gparams.cparams.gpu {
@@ -54,6 +55,7 @@ pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> Compu
         use crate::graph::backend::Backend as BackendTrait;
         use crate::graph::fusion::FusionPass;
         let backends: Vec<&dyn BackendTrait> = {
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut v: Vec<&dyn BackendTrait> = vec![alloc.cpu()];
             #[cfg(target_os = "macos")]
             if gparams.cparams.gpu {

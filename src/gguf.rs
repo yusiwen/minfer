@@ -1686,11 +1686,11 @@ extern "C" {
 
 impl MmapFile {
     pub fn map(path: &std::path::Path) -> Option<Self> {
-        use std::os::unix::io::AsRawFd;
         #[cfg(not(target_os = "macos"))]
         { let _ = path; return None; }
         #[cfg(target_os = "macos")]
         {
+            use std::os::unix::io::AsRawFd;
             let file = std::fs::File::open(path).ok()?;
             let len = file.metadata().ok()?.len() as usize;
             let ptr = unsafe {

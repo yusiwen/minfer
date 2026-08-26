@@ -14,6 +14,11 @@ fn main() {
     println!("cargo:rustc-env=MINFER_VERSION={minfer_version}");
 
     // ─── Precompiled Metal library (metallib) ─────────────────────────
+    // Only run on the macOS target (CARGO_CFG_TARGET_OS, not the host — a
+    // cross-compile to Linux from macOS must not spawn xcrun either). On any
+    // other target no metallib is built and the env vars are left unset; the
+    // Metal module itself is cfg-gated out there, so nothing reads them.
+    //
     // Compile src/metal.metal → $OUT_DIR/minfer.metallib at build time so the
     // binary can load it with newLibraryWithData (llama embeds default.metallib
     // the same way; minfer previously compiled from source at every process
@@ -27,7 +32,7 @@ fn main() {
     // emitted and src/metal.rs falls back to newLibraryWithSource.
     println!("cargo:rerun-if-changed=src/metal.metal");
     println!("cargo:rerun-if-changed=build.rs");
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let air = format!("{out_dir}/minfer.air");
         let metallib = format!("{out_dir}/minfer.metallib");

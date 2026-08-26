@@ -234,9 +234,11 @@ impl Qwen3Graph {
                 "position {maxp} exceeds n_ctx {n_ctx} (KV region overflow)"
             );
         }
-        let metal_on = cfg!(target_os = "macos")
-            && crate::graph::metal_backend::metal_available()
+        #[cfg(target_os = "macos")]
+        let metal_on = crate::graph::metal_backend::metal_available()
             && Self::weights_on_gpu(model);
+        #[cfg(not(target_os = "macos"))]
+        let metal_on = false;
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
@@ -261,11 +263,13 @@ impl Qwen3Graph {
             {
                 let alloc = cache.alloc();
                 Self::register_graph_weights(model, alloc);
+                #[cfg(target_os = "macos")]
                 if metal_on {
                     alloc.enable_metal();
                 }
                 sched.assign_backends(&mut graph, alloc);
                 let backends: Vec<&dyn Backend> = {
+                    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                     let mut v: Vec<&dyn Backend> = vec![alloc.cpu()];
                     #[cfg(target_os = "macos")]
                     if metal_on {
@@ -348,6 +352,7 @@ impl Qwen3Graph {
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.
+    #[cfg(target_os = "macos")]
     fn weights_on_gpu(model: &Qwen3Model) -> bool {
         let names: Vec<String> = {
             let mut v = Vec::new();
@@ -443,6 +448,7 @@ mod tests {
     /// run would exercise the Metal path instead — covered by the Metal tests).
     #[test]
     fn graph_cpu_self_consistency_real_model() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(target_os = "macos")]
         if crate::metal::MpsState::get().is_some() {
@@ -473,6 +479,7 @@ mod tests {
     /// not change prefill logits while positions fit. CPU-only (see above).
     #[test]
     fn forward_cached_isolates_kv_between_caches() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(target_os = "macos")]
         if crate::metal::MpsState::get().is_some() {
@@ -518,6 +525,7 @@ mod tests {
     /// two independent caches must produce the identical sequence.
     #[test]
     fn graph_metal_matches_llama_reference() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {
@@ -565,6 +573,7 @@ mod tests {
     /// independent executions element by element.
     #[test]
     fn metal_prefill_determinism() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         #[cfg(not(target_os = "macos"))]
         {

@@ -198,6 +198,7 @@ mod tests {
 
     #[test]
     fn bias_rope_fusion_gated_by_metal_only() {
+        #[cfg(target_os = "macos")]
         let _g = crate::metal::metal_test_lock();
         // pattern: rope(add(x, bias), pos)
         let mut b = GraphBuilder::new();

@@ -219,6 +219,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
     // KV cache element type (GPU path): auto-select f16 for the 7B class (KV
     // bandwidth-bound decode) unless MINFER_CACHE_TYPE overrides. Must run
     // before the first forward (kv_cache_is_f16 reads the OnceLock).
+    #[cfg(target_os = "macos")]
     crate::metal::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
 
     // Zero-copy weight registration: tell the Metal backend about each mmap'd
