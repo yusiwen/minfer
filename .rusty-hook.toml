@@ -1,0 +1,5 @@
+# rusty-hook configuration (committed so every clone gets the same hooks).
+# The hook scripts are installed automatically into .git/hooks on the first
+# build of dev-dependencies (e.g. `cargo test`).
+[hooks]
+pre-commit = "sh scripts/fmt_hook.sh"

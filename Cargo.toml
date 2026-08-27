@@ -26,6 +26,13 @@ futures-util = "0.3"
 cuda = []
 debug_dump = []
 
+[dev-dependencies]
+# Git hook manager: on the first build of dev-dependencies (`cargo test` /
+# `cargo build --tests`) it installs the `.rusty-hook.toml` hooks (here a
+# pre-commit that runs `cargo fmt`) into `.git/hooks`, so a fresh clone gets
+# the formatting hook automatically without a manual `git config`.
+rusty-hook = "^0.11.2"
+
 [[example]]
 name = "cuda_graph_diag"
 path = "experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs"
