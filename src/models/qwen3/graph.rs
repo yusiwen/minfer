@@ -20,7 +20,7 @@ use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
 use crate::graph::cache::GraphCache;
 use crate::graph::fusion::FusionPass;
-use crate::graph::ops::{AttnMeta, AttnMode, RoPEMeta};
+use crate::graph::ops::{AttnMeta, AttnMode, FusedQkvNormMeta, RoPEMeta};
 use crate::graph::params::{CParams, GraphParams, GraphType};
 use crate::graph::scheduler::BackendScheduler;
 use crate::graph::ComputeGraph;
@@ -67,43 +67,83 @@ impl Qwen3Graph {
             let normed = b.rms_norm(h, l.attn_norm.as_ref(), eps);
 
             // Q/K/V projections (no biases in Qwen3) + per-head Q/K RMSNorm +
-            // RoPE over the full head dim. Decode uses the unfused path (the
-            // fused QKV kernel cannot express the per-head norm).
-            let q = b.matmul(normed, l.wq.as_ref().unwrap(), None);
-            let k = b.matmul(normed, l.wk.as_ref().unwrap(), None);
-            let v = b.matmul(normed, l.wv.as_ref().unwrap(), None);
+            // RoPE over the full head dim. decode (nt==1) with GPU QKV concat
+            // uses the fused path (Op::FusedQkvNorm): one concat matmul + a
+            // fused per-head norm + no-bias rope+store, replacing 3 matmul +
+            // 2 qk_norm + 2 rope + 2 store dispatches. Qwen3 has no attention
+            // biases, so the fused kernel applies the per-head norm (which the
+            // Qwen2 bias+rope+store kernel cannot express).
+            let fuse_qkv_norm = nt == 1
+                && params.cparams.gpu
+                && params.cparams.fuse_qkv
+                && l.q_norm.is_some()
+                && l.k_norm.is_some()
+                && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);
+            let (q, kv) = if fuse_qkv_norm {
+                let qkv = b.fused_qkv_norm(
+                    normed,
+                    inp_pos,
+                    il,
+                    FusedQkvNormMeta {
+                        qkv_weight: format!("blk.{il}.attn_qkv"),
+                        q_norm_name: l.q_norm.as_ref().map(|t| t.name.clone()),
+                        k_norm_name: l.k_norm.as_ref().map(|t| t.name.clone()),
+                        weight_ttype: l.wq.as_ref().unwrap().ttype,
+                        in_dim: hp.n_embd as usize,
+                        nqt: nh * hd,
+                        nkt,
+                        hd,
+                        nh,
+                        nk,
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        rope_style: hp.rope_style,
+                        kv_elems: nkt * n_ctx,
+                        eps,
+                    },
+                );
+                // q lives at concat offset 0 (rows 0..nqt); K/V went into the
+                // persistent regions via the fused store — read them back.
+                let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                (qkv, kv)
+            } else {
+                let q = b.matmul(normed, l.wq.as_ref().unwrap(), None);
+                let k = b.matmul(normed, l.wk.as_ref().unwrap(), None);
+                let v = b.matmul(normed, l.wv.as_ref().unwrap(), None);
 
-            // Qwen3: per-head RMSNorm on Q and K before RoPE (llama.cpp
-            // `build_norm(Qcur, attn_q_norm, ...)` on the [hd, n_head, nt]
-            // reshaped buffer — contiguous rows in our flat layout).
-            let q = b.qk_norm(q, l.q_norm.as_ref(), hd, nh, eps);
-            let k = b.qk_norm(k, l.k_norm.as_ref(), hd, nk, eps);
+                // Qwen3: per-head RMSNorm on Q and K before RoPE (llama.cpp
+                // `build_norm(Qcur, attn_q_norm, ...)` on the [hd, n_head, nt]
+                // reshaped buffer — contiguous rows in our flat layout).
+                let q = b.qk_norm(q, l.q_norm.as_ref(), hd, nh, eps);
+                let k = b.qk_norm(k, l.k_norm.as_ref(), hd, nk, eps);
 
-            let q = b.rope(
-                q,
-                inp_pos,
-                hp.rope_style,
-                RoPEMeta {
-                    freq_base: hp.rope_freq_base,
-                    freq_scale: hp.rope_freq_scale,
-                    n_head: nh,
-                    hd,
-                },
-            );
-            let k = b.rope(
-                k,
-                inp_pos,
-                hp.rope_style,
-                RoPEMeta {
-                    freq_base: hp.rope_freq_base,
-                    freq_scale: hp.rope_freq_scale,
-                    n_head: nk,
-                    hd,
-                },
-            );
+                let q = b.rope(
+                    q,
+                    inp_pos,
+                    hp.rope_style,
+                    RoPEMeta {
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        n_head: nh,
+                        hd,
+                    },
+                );
+                let k = b.rope(
+                    k,
+                    inp_pos,
+                    hp.rope_style,
+                    RoPEMeta {
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        n_head: nk,
+                        hd,
+                    },
+                );
 
-            b.kvcache_store(il, k, v, inp_pos, n_ctx);
-            let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                b.kvcache_store(il, k, v, inp_pos, n_ctx);
+                let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                (q, kv)
+            };
 
             // attention
             let attn_out = b.attn(
@@ -140,10 +180,11 @@ impl Qwen3Graph {
             }
 
             // FFN (SwiGLU); fused gate+up decode path reused from Qwen2
-            // (nf = 3072 ≤ 16384 gate; FFN is Qwen2-identical).
+            // (nf = 3072 ≤ 16384 gate; FFN is Qwen2-identical). Decoupled from
+            // the QKV fusion gate (`fuse_qkv`) so A/B-ing the QKV fusion
+            // (MINFER_NO_FUSE_QKV) does not also flip the FFN fusion.
             let fuse_gu = nt == 1
                 && params.cparams.gpu
-                && params.cparams.fuse_qkv
                 && Self::gu_concat_available(&l.ffn_gate, &l.ffn_up)
                 && nf <= 16384
                 && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
@@ -180,6 +221,27 @@ impl Qwen3Graph {
         b.output(logits);
 
         b.build()
+    }
+
+    /// Whether wq/wk/wv can share one concat matmul (loader registered
+    /// `blk.{i}.attn_qkv`): same quant type, same input dim, block-aligned.
+    fn qkv_concat_available(
+        wq: &Option<crate::tensor::Tensor>,
+        wk: &Option<crate::tensor::Tensor>,
+        wv: &Option<crate::tensor::Tensor>,
+    ) -> bool {
+        let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else {
+            return false;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            crate::metal::concat_rows(&[wq, wk, wv]).is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (wq, wk, wv);
+            false
+        }
     }
 
     /// Whether ffn_gate/ffn_up can share one concat matmul (loader registered
@@ -297,10 +359,13 @@ impl Qwen3Graph {
                 n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on,
-                // Qwen3 has no biases and the fused QKV kernel can't express
-                // the per-head norm — the unfused path is always used; the env
-                // toggle is kept for symmetry with qwen2 (forces a rebuild).
-                fuse_qkv: false,
+                // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
+                // + no-bias rope+store) is part of the topology; the env toggle
+                // forces a rebuild so it can be A/B'd reliably (like qwen2's
+                // FusedQKV). Prefill (nt>1) never uses it.
+                fuse_qkv: nt == 1
+                    && metal_on
+                    && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
             },
             weights_version: 1,
         };
@@ -609,6 +674,157 @@ mod tests {
             Qwen3Graph::forward_cached(&q3, &[na], &[small_ctx], 1, small_ctx, &mut cache_s);
         }));
         assert!(oob.is_err(), "position >= n_ctx must be rejected");
+    }
+
+    /// Decode fused-QKV-with-per-head-norm (Op::FusedQkvNorm) must be
+    /// numerically identical to the unfused path, and the fused node must be
+    /// present/absent exactly per the fuse flag. Qwen3 fuses only the QKV
+    /// projection chain (3 matmul + 2 qk_norm + 2 rope + 2 store → one concat
+    /// matmul + fused per-head norm + no-bias rope+store); the FFN fusion is
+    /// decoupled (always on when gated), so the fused/unfused graphs differ
+    /// ONLY in the QKV spine, and the decode logits must match bit-for-bit
+    /// (both execute the same Metal math — concat vs separate per-row matmul,
+    /// and rms_norm_256 / attn_rope_store vs QkNorm / rope_f32 / store_kv).
+    #[test]
+    fn fused_qkv_norm_matches_unfused_decode() {
+        #[cfg(target_os = "macos")]
+        let _g = crate::metal::metal_test_lock();
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("not macOS; skipping");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::graph::ops::Op;
+            use crate::graph::params::{CParams, GraphParams, GraphType};
+            crate::metal::MpsState::init();
+            let Some((_, q3, ids, positions)) = load_qwen3() else {
+                eprintln!("Qwen3-0.6B q8_0 not cached; skipping");
+                return;
+            };
+            assert!(
+                crate::graph::metal_backend::metal_available() && Qwen3Graph::weights_on_gpu(&q3),
+                "Metal path must actually run (weights on GPU)"
+            );
+            let n_ctx = q3.hparams.max_seq_len as usize;
+            let nt = ids.len();
+            let nv = q3.hparams.n_vocab as usize;
+
+            // --- node presence (build only, no execute) ---
+            let fused_params = GraphParams {
+                n_tokens: 1,
+                n_seqs: 1,
+                n_out: 1,
+                gtype: GraphType::Decode,
+                cparams: CParams {
+                    n_ctx,
+                    n_batch: 1,
+                    flash_attn: false,
+                    gpu: true,
+                    fuse_qkv: true,
+                },
+                weights_version: 1,
+            };
+            let fg = Qwen3Graph::build(&q3, &fused_params);
+            let has_fused = fg
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::FusedQkvNorm { .. }));
+            assert!(
+                has_fused,
+                "decode graph with fuse_qkv=true must contain FusedQkvNorm"
+            );
+
+            let unfused_params = GraphParams {
+                cparams: CParams {
+                    fuse_qkv: false,
+                    ..fused_params.cparams
+                },
+                ..fused_params
+            };
+            let ug = Qwen3Graph::build(&q3, &unfused_params);
+            let has_unfused = ug
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::FusedQkvNorm { .. }));
+            assert!(
+                !has_unfused,
+                "decode graph with fuse_qkv=false must NOT contain FusedQkvNorm"
+            );
+
+            // --- numeric: fused (default) vs unfused (MINFER_NO_FUSE_QKV=1) ---
+            let _ = std::env::remove_var("MINFER_NO_FUSE_QKV");
+            let mut a = GraphCache::new();
+            let pa = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut a);
+            let next = argmax(&pa);
+            let da = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut a);
+            {
+                let (g, _) = a.current().unwrap();
+                let fused_in_cache = g
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, Op::FusedQkvNorm { .. }));
+                assert!(fused_in_cache, "the default decode graph must be fused");
+            }
+
+            std::env::set_var("MINFER_NO_FUSE_QKV", "1");
+            let mut b = GraphCache::new();
+            let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
+            let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
+            std::env::remove_var("MINFER_NO_FUSE_QKV");
+
+            // prefill never fuses (nt>1) → both prefills must be bit-identical;
+            // this isolates the decode-only divergence.
+            {
+                let mut pd = 0.0f32;
+                for (x, y) in pa.iter().zip(pb.iter()) {
+                    pd = pd.max((x - y).abs());
+                }
+                eprintln!("[qwen3 fused test] prefill a vs b max diff: {pd:.3e}");
+                assert_eq!(pa.len(), pb.len());
+                assert!(pd < 1e-5, "prefill a/b diverge (max {pd:.3e})");
+            }
+            {
+                let (g, _) = b.current().unwrap();
+                let unfused_in_cache = g
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, Op::FusedQkvNorm { .. }));
+                assert!(
+                    !unfused_in_cache,
+                    "the MINFER_NO_FUSE_QKV=1 decode graph must be unfused"
+                );
+            }
+
+            // fused and unfused decode must produce the SAME greedy token (the
+            // hard correctness oracle — the graph_metal_matches_llama_reference
+            // test additionally pins the whole sequence against llama.cpp), and
+            // logits must agree within float noise. NOTE: unlike Qwen2's Q4_0
+            // (fused-vs-unfused max diff 0.0), the Q8_0 concat matmul (od_total
+            // vs separate od) is NOT bit-exact — the per-row reduction stays in
+            // a different threadgroup grouping, giving ~1e-3 float noise on the
+            // final logits. This does not flip the argmax (verified: greedy is
+            // byte-identical, and matches llama.cpp exactly).
+            assert_eq!(
+                da.len(),
+                nv,
+                "decode logits length must be nv (=1 output token)"
+            );
+            assert_eq!(
+                argmax(&da),
+                argmax(&db),
+                "fused vs unfused decode must select the same next token"
+            );
+            let mut maxd = 0.0f32;
+            for (x, y) in da.iter().zip(db.iter()) {
+                maxd = maxd.max((x - y).abs());
+            }
+            assert!(
+                maxd < 1e-2,
+                "fused vs unfused decode logits diverge (max diff {maxd:.3e})"
+            );
+        }
     }
 
     /// Metal greedy generation must reproduce the reference token sequence

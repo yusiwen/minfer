@@ -168,6 +168,7 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
         Op::FusedBiasRope => "fused_bias_rope",
         Op::BatchMatMul => "batch_matmul",
         Op::FusedQKV { .. } => "fused_qkv",
+        Op::FusedQkvNorm { .. } => "fused_qkv_norm",
         Op::FusedFFN => "fused_ffn",
     }
 }
@@ -183,7 +184,8 @@ fn op_detail(op: &Op) -> Value {
         | Op::SwiGLU
         | Op::FusedBiasRope
         | Op::FusedFFN
-        | Op::BatchMatMul => json!({}),
+        | Op::BatchMatMul
+        | Op::FusedQkvNorm { .. } => json!({}),
         Op::Scale(s) => json!({ "scale": s }),
         Op::Softmax { dim } => json!({ "dim": dim }),
         Op::RmsNorm { eps } => json!({ "eps": eps }),
@@ -260,6 +262,22 @@ fn meta_json(meta: &NodeMeta) -> Value {
             "wtype": f.weight_ttype.name(),
             "in_dim": f.in_dim,
             "nf": f.nf,
+        }),
+        NodeMeta::FusedQkvNorm(f) => json!({
+            "weight": f.qkv_weight,
+            "q_norm": f.q_norm_name,
+            "k_norm": f.k_norm_name,
+            "wtype": f.weight_ttype.name(),
+            "in_dim": f.in_dim,
+            "nqt": f.nqt,
+            "nkt": f.nkt,
+            "hd": f.hd,
+            "nh": f.nh,
+            "nk": f.nk,
+            "freq_base": f.freq_base,
+            "freq_scale": f.freq_scale,
+            "kv_elems": f.kv_elems,
+            "eps": f.eps,
         }),
     }
 }

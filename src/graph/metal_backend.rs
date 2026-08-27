@@ -273,7 +273,7 @@ impl Backend for MetalBackend {
             }
             Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
-            Op::FusedQKV { .. } | Op::FusedFFN => dtype == DType::F32,
+            Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
         }
@@ -370,6 +370,7 @@ impl Backend for MetalBackend {
                                 n,
                                 *eps,
                                 0,
+                                0,
                             );
                         } else {
                             cb.rms_norm(
@@ -380,6 +381,7 @@ impl Backend for MetalBackend {
                                 d,
                                 n,
                                 *eps,
+                                0,
                                 0,
                             );
                         }
@@ -392,6 +394,7 @@ impl Backend for MetalBackend {
                         d,
                         n,
                         *eps,
+                        0,
                         0,
                     ),
                 }
@@ -422,6 +425,7 @@ impl Backend for MetalBackend {
                                 n,
                                 *eps,
                                 0,
+                                0,
                             );
                         } else {
                             cb.rms_norm(
@@ -432,6 +436,7 @@ impl Backend for MetalBackend {
                                 d,
                                 n,
                                 *eps,
+                                0,
                                 0,
                             );
                         }
@@ -444,6 +449,7 @@ impl Backend for MetalBackend {
                         d,
                         n,
                         *eps,
+                        0,
                         0,
                     ),
                 }
@@ -832,6 +838,129 @@ impl Backend for MetalBackend {
                     bk_o,
                     &bv_b,
                     bv_o,
+                    self.buf(k_id),
+                    self.buf(v_id),
+                    meta.nqt,
+                    meta.nkt,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    pos,
+                    meta.rope_style as i32,
+                );
+                Ok(())
+            }
+            Op::FusedQkvNorm { layer } => {
+                let meta = match &node.meta {
+                    NodeMeta::FusedQkvNorm(m) => m,
+                    other => {
+                        return Err(format!(
+                            "fused_qkv_norm node missing FusedQkvNormMeta: {other:?}"
+                        ))
+                    }
+                };
+                let (wb, w_off) = self
+                    .state
+                    .weight_buf(&meta.qkv_weight)
+                    .ok_or_else(|| format!("qkv weight '{}' not on GPU", meta.qkv_weight))?;
+                // per-head Q/K RMSNorm weights (llama attn_q_norm / attn_k_norm)
+                let norm_off =
+                    |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
+                        match name {
+                            Some(n) => self
+                                .state
+                                .weight_buf(n)
+                                .ok_or_else(|| format!("norm '{n}' not on GPU")),
+                            None => Err("fused QKV norm weight missing".into()),
+                        }
+                    };
+                let (qn_b, qn_o) = norm_off(&meta.q_norm_name)?;
+                let (kn_b, kn_o) = norm_off(&meta.k_norm_name)?;
+                let nt = node.out_shape[1];
+                debug_assert!(nt == 1, "FusedQkvNorm is decode (nt==1) only, got nt={nt}");
+                let od_total = meta.nqt + 2 * meta.nkt;
+                // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
+                cb.quant_matmul_f32_on_gpu_buf(
+                    &wb,
+                    w_off,
+                    meta.weight_ttype,
+                    self.buf(in_bufs[0]),
+                    0,
+                    self.buf(out_buf),
+                    od_total,
+                    meta.in_dim,
+                    nt,
+                );
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                // 2) per-head RMSNorm on q/k IN PLACE on the concat buffer
+                //    (llama build_norm(Qcur/Kcur, attn_q_norm/attn_k_norm) before
+                //    ggml_rope_ext). q section is at byte offset 0; k section at
+                //    byte offset nqt*4. Reuse the rms_norm_256 kernel (d=hd rows).
+                let off_q = 0u64;
+                let off_k = (meta.nqt * 4) as u64;
+                let n_q = meta.nh;
+                let n_k = meta.nk;
+                if crate::metal::rms_norm_256_enabled() {
+                    cb.rms_norm_256(
+                        self.buf(out_buf),
+                        Some(&qn_b),
+                        qn_o,
+                        self.buf(out_buf),
+                        meta.hd,
+                        n_q,
+                        meta.eps,
+                        off_q,
+                        off_q,
+                    );
+                    cb.rms_norm_256(
+                        self.buf(out_buf),
+                        Some(&kn_b),
+                        kn_o,
+                        self.buf(out_buf),
+                        meta.hd,
+                        n_k,
+                        meta.eps,
+                        off_k,
+                        off_k,
+                    );
+                } else {
+                    cb.rms_norm(
+                        self.buf(out_buf),
+                        Some(&qn_b),
+                        qn_o,
+                        self.buf(out_buf),
+                        meta.hd,
+                        n_q,
+                        meta.eps,
+                        off_q,
+                        off_q,
+                    );
+                    cb.rms_norm(
+                        self.buf(out_buf),
+                        Some(&kn_b),
+                        kn_o,
+                        self.buf(out_buf),
+                        meta.hd,
+                        n_k,
+                        meta.eps,
+                        off_k,
+                        off_k,
+                    );
+                }
+                // 3) no-bias rope + KV store (q in place, k rope+store, v store)
+                let pos = {
+                    let n = (self.buf(in_bufs[1]).length() as usize) / 4;
+                    let p = unsafe {
+                        std::slice::from_raw_parts(
+                            self.buf(in_bufs[1]).contents().as_ptr() as *const u32,
+                            n,
+                        )
+                    };
+                    p[0] as i32
+                };
+                cb.attn_rope_store(
+                    self.buf(out_buf),
                     self.buf(k_id),
                     self.buf(v_id),
                     meta.nqt,

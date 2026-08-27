@@ -376,8 +376,12 @@ layer-0 K path across two Metal executions).
 
 ### 6.4 Known follow-ups (unchanged from §3 Phase E)
 
-- Fused QKV decode with qk-norm (new Metal kernel) — decode currently pays
-  3 matmuls + separate norm/rope/store.
+- **Fused QKV decode with qk-norm** — **DONE 2026-08-27** (`Op::FusedQkvNorm` + the
+  no-bias `kernel_attn_rope_store`). We added a new fused decode op that
+  concatenates Wq/Wk/Wv into one matmul and applies the per-head Q/K RMSNorm +
+  no-bias RoPE + KV store in place on the concat buffer (a single op replacing
+  3 matmul + 2 qk_norm + 2 rope + 2 store). The Qwen2 `attn_bias_rope_store`
+  path (biases, no per-head norm) is untouched.
 - Qwen3 MoE / hybrid-SWA / VL / reranker variants (`LLM_ARCH_QWEN3MOE`,
   `QWEN3NEXT`, `QWEN3VL*`) — separate architectures, out of scope here.
 - Optional `<think>`-block stripping at the CLI layer.

@@ -265,6 +265,7 @@ struct MpsStateInner {
     pl_store_kv: MetalComputePipelineState,
     pl_store_kv_f16: MetalComputePipelineState,
     pl_attn_bsr: MetalComputePipelineState,
+    pl_attn_rope_store: MetalComputePipelineState,
     pl_attn_scores: MetalComputePipelineState,
     pl_attn_output: MetalComputePipelineState,
     pl_softmax_attn: MetalComputePipelineState,
@@ -1065,6 +1066,7 @@ impl MpsCommandBuffer<'_> {
         n: usize,
         eps: f32,
         off: u64,
+        y_off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc.setComputePipelineState(&*self.state.pl_rms_norm);
@@ -1081,7 +1083,7 @@ impl MpsCommandBuffer<'_> {
         }; // dummy if no weight
         unsafe {
             self.enc
-                .setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (2) as usize)
+                .setBuffer_offset_atIndex(Some(&**(y)), (y_off) as usize, (2) as usize)
         };
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
@@ -1103,6 +1105,7 @@ impl MpsCommandBuffer<'_> {
         n: usize,
         eps: f32,
         off: u64,
+        y_off: u64,
     ) {
         self.trace_op("rms_norm");
         self.enc
@@ -1120,7 +1123,7 @@ impl MpsCommandBuffer<'_> {
         };
         unsafe {
             self.enc
-                .setBuffer_offset_atIndex(Some(&**(y)), (0) as usize, (2) as usize)
+                .setBuffer_offset_atIndex(Some(&**(y)), (y_off) as usize, (2) as usize)
         };
         self.set_params(3, &(d as i32));
         self.set_params(4, &(eps.to_bits() as i32));
@@ -1880,6 +1883,53 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_1d(grid as u64, 256);
     }
 
+    /// Fused decode QKV rope+store WITHOUT attention biases (Qwen3): the concat
+    /// buffer `bqkv` holds q|k|v (q = rows 0..nqt, k = nqt..nqt+nkt,
+    /// v = nqt+nkt..), and the per-head Q/K RMSNorm was already applied in place
+    /// by the preceding rms_norm_256 dispatches. This kernel only RoPEs q in
+    /// place, RoPEs + stores K, and stores V into the persistent KV regions.
+    /// Grid: nqt/2 + nkt/2 + nkt, 256 threads. Buffer indices: 0=bqkv, 1=kv_k,
+    /// 2=kv_v; params 3..=10.
+    pub fn attn_rope_store(
+        &self,
+        bqkv: &MetalBuffer,
+        kv_k: &MetalBuffer,
+        kv_v: &MetalBuffer,
+        nqt: usize,
+        nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        pos: i32,
+        rope_style: i32,
+    ) {
+        self.trace_op("attn_rope_store");
+        self.enc
+            .setComputePipelineState(&*self.state.pl_attn_rope_store);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(bqkv)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (2) as usize)
+        };
+        self.set_params(3, &(nqt as i32));
+        self.set_params(4, &(nkt as i32));
+        self.set_params(5, &(hd as i32));
+        self.set_params(6, &(freq_base.to_bits() as i32));
+        self.set_params(7, &(freq_scale.to_bits() as i32));
+        self.set_params(8, &pos);
+        self.set_params(9, &rope_style);
+        self.set_params(10, &(if kv_cache_is_f16() { 1 } else { 0 }));
+        let grid = nqt / 2 + nkt / 2 + nkt;
+        self.dispatch_1d(grid as u64, 256);
+    }
+
     /// Commit GPU work and wait for completion using a semaphore completion handler.
     /// This avoids the ~20ms Metal scheduler wakeup overhead of wait_until_completed.
     pub fn submit(self) -> Result<(), String> {
@@ -2105,6 +2155,7 @@ impl MpsState {
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
+            let pl_attn_rope_store = get_pl("kernel_attn_rope_store")?;
             let pl_attn_scores = get_pl("kernel_attn_scores")?;
             let pl_attn_output = get_pl("kernel_attn_output")?;
             let pl_softmax_attn = get_pl("kernel_softmax_attn")?;
@@ -2174,6 +2225,7 @@ impl MpsState {
                 pl_store_kv,
                 pl_store_kv_f16,
                 pl_attn_bsr,
+                pl_attn_rope_store,
                 pl_attn_scores,
                 pl_attn_output,
                 pl_softmax_attn,
@@ -2764,12 +2816,12 @@ mod tests {
         let cases: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![
             (
                 "rms_norm 32t  (d=896, 1 row)",
-                Box::new(|cb| cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0)),
+                Box::new(|cb| cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0, 0)),
                 400,
             ),
             (
                 "rms_norm 256t (d=896, 1 row)",
-                Box::new(|cb| cb.rms_norm_256(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0)),
+                Box::new(|cb| cb.rms_norm_256(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0, 0)),
                 400,
             ),
             (
@@ -2836,7 +2888,7 @@ mod tests {
         {
             let cb = mps.cmd_buffer();
             for _ in 0..50 {
-                cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0);
+                cb.rms_norm(&x, Some(&w), 0, &y, ne, 1, 1e-6, 0, 0);
             }
             cb.submit().expect("warmup");
         }
@@ -2954,9 +3006,9 @@ mod tests {
         for (label, buf, method) in [("32t", &y32, 0), ("256t", &y256, 1)] {
             let cb = mps.cmd_buffer();
             if method == 0 {
-                cb.rms_norm(&x, Some(&w), 0, buf, d, 1, 1e-6, 0);
+                cb.rms_norm(&x, Some(&w), 0, buf, d, 1, 1e-6, 0, 0);
             } else {
-                cb.rms_norm_256(&x, Some(&w), 0, buf, d, 1, 1e-6, 0);
+                cb.rms_norm_256(&x, Some(&w), 0, buf, d, 1, 1e-6, 0, 0);
             }
             cb.submit().expect("submit");
         }
@@ -3740,5 +3792,152 @@ mod mmap_align_test {
         write_f32(&format!("{dir}/minfer_gpu_dump_layer0_bk.f32"), &k);
         write_f32(&format!("{dir}/minfer_gpu_dump_layer0_bv.f32"), &v);
         eprintln!("[gen dump] wrote {dir}/minfer_gpu_dump_layer0_b{{q,k,v}}.f32");
+    }
+
+    /// Isolation test for `kernel_attn_rope_store` (the Qwen3 fused decode
+    /// QKV rope+store pass, no attention biases) against a scalar CPU
+    /// reference. Exercises the q-rope (in place), k-rope+store and v-store
+    /// sections of the concat q|k|v buffer, for both the f32 and f16 KV cache
+    /// paths (the store type comes from `kv_cache_is_f16()`).
+    #[test]
+    fn attn_rope_store_isolated() {
+        let _g = crate::metal::metal_test_lock();
+        MpsState::init();
+        let mps = MpsState::get().expect("MPS must be active");
+        let dev = &mps.inner.device;
+        let nqt = 16usize; // nh*hd = 2*8
+        let nkt = 8usize; // nk*hd = 1*8
+        let hd = 8usize;
+        let nh = 2usize;
+        let nk = 1usize;
+        let pos = 5i32;
+        let freq_base = 10000.0f32;
+        let freq_scale = 1.0f32;
+        let rope_style = 0i32; // NonInterleaved (Qwen3)
+        let kv_f16 = crate::metal::kv_cache_is_f16();
+        let total = nqt + 2 * nkt;
+
+        let bqkv = dev
+            .newBufferWithLength_options(
+                (total * 4) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let kv_k = dev
+            .newBufferWithLength_options(
+                ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let kv_v = dev
+            .newBufferWithLength_options(
+                ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        // deterministic q|k|v: sin over index with a per-section offset. Keep a
+        // host copy (`orig`) to compute the CPU reference against the PRE-kernel
+        // values (the kernel applies the rope in place on the concat buffer).
+        let mut orig = vec![0.0f32; total];
+        unsafe {
+            let p = bqkv.contents().as_ptr() as *mut f32;
+            for i in 0..total {
+                let v = ((i as f32) * 0.37).sin() + (i as f32) * 0.001;
+                *p.add(i) = v;
+                orig[i] = v;
+            }
+        }
+
+        let cb = mps.cmd_buffer();
+        cb.attn_rope_store(
+            &bqkv, &kv_k, &kv_v, nqt, nkt, hd, freq_base, freq_scale, pos, rope_style,
+        );
+        cb.submit().expect("submit");
+
+        // CPU reference: rope q in place, rope + store k, store v — applied to a
+        // copy of `orig` (the pre-kernel q|k|v).
+        let read_f32 = |buf: &MetalBuffer, n: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; n];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.contents().as_ptr() as *const f32,
+                    v.as_mut_ptr(),
+                    n,
+                )
+            };
+            v
+        };
+        let mut ref_buf = orig.clone();
+        let half_dim = hd / 2;
+        let rope_pair = |buf: &mut [f32], off: usize, h: usize, d: usize| {
+            let base = h * hd;
+            let i0 = off + base + d;
+            let i1 = off + base + d + half_dim;
+            let freq = freq_scale / freq_base.powf((2.0 * d as f32) / hd as f32);
+            let theta = pos as f32 * freq;
+            let (cs, sn) = (theta.cos(), theta.sin());
+            let (x0, x1) = (buf[i0], buf[i1]);
+            buf[i0] = x0 * cs - x1 * sn;
+            buf[i1] = x0 * sn + x1 * cs;
+        };
+        // q section 0..nqt
+        for h in 0..nh {
+            for d in 0..half_dim {
+                rope_pair(&mut ref_buf, 0, h, d);
+            }
+        }
+        // k section nqt..nqt+nkt (rope + store)
+        for h in 0..nk {
+            for d in 0..half_dim {
+                rope_pair(&mut ref_buf, nqt, h, d);
+            }
+        }
+        // v section unchanged
+
+        let got_buf = read_f32(&bqkv, total);
+        let mut maxd = 0.0f32;
+        for (x, y) in got_buf.iter().zip(ref_buf.iter()) {
+            maxd = maxd.max((x - y).abs());
+        }
+        assert!(
+            maxd < 1e-6,
+            "attn_rope_store concat buffer diverges (max {maxd:.3e})"
+        );
+
+        // KV store: k = roped k, v = raw v, at the position offset `pos*nkt`.
+        // NOTE: the kernel's `pow`/`cos`/`sin` (Metal libm) differ from Rust's
+        // `powf`/`cos`/`sin` by ~1e-6, so compare with a tolerance, not ==.
+        let kv_off = pos as usize * nkt;
+        let mut kd = 0.0f32;
+        let mut vd = 0.0f32;
+        if kv_f16 {
+            let kk = read_f16(&kv_k, (pos as usize + 1) * nkt);
+            let vv = read_f16(&kv_v, (pos as usize + 1) * nkt);
+            for j in 0..nkt {
+                kd = kd.max((kk[kv_off + j].to_f32() - ref_buf[nqt + j]).abs());
+                vd = vd.max((vv[kv_off + j].to_f32() - ref_buf[nqt + nkt + j]).abs());
+            }
+        } else {
+            let kk = read_f32(&kv_k, (pos as usize + 1) * nkt);
+            let vv = read_f32(&kv_v, (pos as usize + 1) * nkt);
+            for j in 0..nkt {
+                kd = kd.max((kk[kv_off + j] - ref_buf[nqt + j]).abs());
+                vd = vd.max((vv[kv_off + j] - ref_buf[nqt + nkt + j]).abs());
+            }
+        }
+        assert!(kd < 1e-5, "kv_k store diverges (max {kd:.3e})");
+        assert!(vd < 1e-5, "kv_v store diverges (max {vd:.3e})");
+    }
+
+    fn read_f16(buf: &MetalBuffer, n: usize) -> Vec<half::f16> {
+        let mut v = vec![half::f16::from_bits(0); n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.contents().as_ptr() as *const half::f16,
+                v.as_mut_ptr(),
+                n,
+            )
+        };
+        v
     }
 }

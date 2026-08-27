@@ -43,6 +43,7 @@ already transfer:
 | `FusedQKV` (decode QKV, G4) | concat matmul (`blk.{i}.attn_qkv`) + `attn_bias_rope_store` | ✅ **G4** — nt==1 builds one fused node replacing 3 matmul + 3 bias + 2 rope + 2 store (10 dispatches → 2); q at concat offset 0 feeds attention; `MINFER_NO_FUSE_QKV=1` reverts |
 | `FusedFFN` (decode gate+up, G5) | concat matmul (`blk.{i}.ffn_gu`) + in-place `swiglu_f32_off` | ✅ **G5** — nt==1 builds one fused node replacing 2 matmul + silu + mul (4 → 2 dispatches); down reads rows 0..nf; gated `nf ≤ 16384` (7B Q4_K concat matmul slower); `MINFER_NO_FUSE_FFN=1` reverts |
 | Fused decode QKV / bias+rope+store (`attn_bias_rope_store`) | — (layer_gpu-only fused kernels) | ⬜ graph builds separate ops — more dispatches, no fused decode path |
+| `FusedQkvNorm` (Qwen3 decode, per-head Q/K RMSNorm) | concat matmul (`blk.{i}.attn_qkv`) + `rms_norm_256` (q/k in place) + `attn_rope_store` | ✅ **Qwen3 `Op::FusedQkvNorm`** (2026-08-27) — decode fuses 3 matmul + 2 qk_norm + 2 rope + 2 store → 1 concat matmul + 2 per-head norm + 1 no-bias rope+store; Qwen2's `attn_bias_rope_store` path untouched |
 | `n_out` tail-row optimization (#32/#34) | tail `GetRows` + reduced last layer (G3) | ✅ **G3** — full-nt FFN/lm_head work dropped (prefill ↑~1.5× on 0.5B) |
 
 **Graph-path measured numbers** (M4 Pro, `--temp 0` greedy; old-path figures
@@ -69,8 +70,11 @@ pre-G1 graph path (flash/split/parallel and tail-reduced paths all verified).
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① ✅ G1 attention dispatch;
 ② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ ✅ G4 fused decode
-QKV + bias+rope+store; ⑤ ✅ fused decode FFN gate+up (`Op::FusedFFN`).
-G1–G5 are wiring (kernels already isolated-tested); G3 additionally fixed
+QKV + bias+rope+store; ⑤ ✅ fused decode FFN gate+up (`Op::FusedFFN`);
+⑥ ✅ G6 Qwen3 fused decode QKV with per-head Q/K RMSNorm (`Op::FusedQkvNorm`,
+2026-08-27) — decode 3 matmul + 2 qk_norm + 2 rope + 2 store → 1 concat matmul
++ 2 per-head norm + 1 no-bias rope+store.
+G1–G6 are wiring (kernels already isolated-tested); G3 additionally fixed
 two allocator liveness bugs (liveness used topo_order while the scheduler
 executes in build order; input buffers were freed and reused before host
 fills finished). The FFN fusion is **gated on nf ≤ 16384** — the Q4_K

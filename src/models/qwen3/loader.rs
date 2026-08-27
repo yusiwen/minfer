@@ -346,6 +346,22 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         if let Some(ti) = tensor_map.get(&tn::attn_v(i)) {
             layer.wv = Some(load_ti(ti));
         }
+
+        // Fused QKV projection (nt==1 decode, Qwen3): concatenate Wq/Wk/Wv along
+        // the output (row) dim into one GPU buffer so a single matmul produces
+        // q+k+v, then the per-head Q/K RMSNorm + no-bias rope+store are applied
+        // in one fused pass (Op::FusedQkvNorm). Only registered when the three
+        // weights share a matmul (same quant type + same input dim); decode
+        // falls back to three separate matmuls otherwise. Requires the per-head
+        // Q/K norm weights to be present (Qwen3 always has them).
+        #[cfg(target_os = "macos")]
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
+                if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
+                    mps.register_weight(&format!("blk.{i}.attn_qkv"), &data);
+                }
+            }
+        }
         if let Some(ti) = tensor_map.get(&tn::attn_out(i)) {
             layer.wo = Some(load_ti(ti));
         }

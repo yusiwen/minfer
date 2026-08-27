@@ -414,12 +414,14 @@ impl Backend for CpuBackend {
                 )?;
                 Ok(())
             }
-            Op::FusedBiasRope | Op::BatchMatMul | Op::FusedQKV { .. } | Op::FusedFFN => {
-                Err(format!(
-                    "op {:?} unsupported on CPU (fusion not enabled for it)",
-                    node.op
-                ))
-            }
+            Op::FusedBiasRope
+            | Op::BatchMatMul
+            | Op::FusedQKV { .. }
+            | Op::FusedQkvNorm { .. }
+            | Op::FusedFFN => Err(format!(
+                "op {:?} unsupported on CPU (fusion not enabled for it)",
+                node.op
+            )),
         }
     }
 

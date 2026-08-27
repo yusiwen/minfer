@@ -134,6 +134,16 @@ pub enum Op {
     /// llama `ggml_swiglu_split`) runs in place. The following down matmul
     /// reads rows 0..nf (od = nf; nt==1 makes the concat layout safe).
     FusedFFN,
+    /// decode (nt==1) fused QKV with per-head Q/K RMSNorm (Qwen3): one concat
+    /// matmul (wq|wk|wv) + per-head qk_norm (q/k) + a no-bias rope+store pass
+    /// (llama `build_norm(Qcur, attn_q_norm)` before `ggml_rope_ext`). Qwen3
+    /// has no attention biases and the existing `attn_bias_rope_store` kernel
+    /// cannot express the per-head norm, so this is a separate op (the Qwen2
+    /// `FusedQKV` path is untouched). Carries the layer so the scheduler can
+    /// resolve the persistent K/V regions (kv_pair).
+    FusedQkvNorm {
+        layer: usize,
+    },
 }
 
 /// Per-node metadata.
@@ -152,6 +162,7 @@ pub enum NodeMeta {
     Embed(EmbedMeta),
     FusedQkv(FusedQkvMeta),
     FusedFfn(FusedFfnMeta),
+    FusedQkvNorm(FusedQkvNormMeta),
 }
 
 /// Matmul target weight (+ optional bias) — resolved to a backend buffer by
@@ -241,6 +252,36 @@ pub struct FusedFfnMeta {
     /// concat output has `2*nf` rows (`nf = shape[1]` of either weight).
     pub in_dim: usize,
     pub nf: usize,
+}
+
+/// decode QKV fusion metadata with per-head Q/K RMSNorm (Qwen3): the concat
+/// weight (wq|wk|wv rows), the two per-head norm weights, and the rope/store
+/// parameters. `qkv_weight` is the loader-registered concat tensor
+/// (`blk.{i}.attn_qkv`); `od_total = nqt + 2*nkt`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedQkvNormMeta {
+    pub qkv_weight: String,
+    /// Per-head Q RMSNorm weight (llama `attn_q_norm`, f32 [hd]) — optional in
+    /// the general case but present for Qwen3 (the gate requires both).
+    pub q_norm_name: Option<String>,
+    /// Per-head K RMSNorm weight (llama `attn_k_norm`, f32 [hd]).
+    pub k_norm_name: Option<String>,
+    pub weight_ttype: TensorType,
+    /// Weight dims (GGUF convention): `in_dim = shape[0]`, concat `out_dim =
+    /// shape[1]` sum = nqt + nkt + nkt.
+    pub in_dim: usize,
+    pub nqt: usize,
+    pub nkt: usize,
+    pub hd: usize,
+    pub nh: usize,
+    pub nk: usize,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub rope_style: RopeStyle,
+    /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
+    pub kv_elems: usize,
+    /// Per-head RMSNorm epsilon (llama `f_norm_rms_eps`).
+    pub eps: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

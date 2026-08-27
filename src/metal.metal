@@ -3021,11 +3021,83 @@ kernel void kernel_attn_bias_rope_store(
     }
 }
 
-// ─── Flash Attention (GQA, online softmax, tiled K/V) ─────
-// One threadgroup per (token, KV_head). Each simdgroup processes one
-// query head. K and V tiles loaded into threadgroup-shared memory
-// and reused by all query heads in the GQA group.
-// Grid: (nt, nk), TG: (32, gqa) where gqa = nh / nk.
+// ─── Fused decode QKV with per-head Q/K RMSNorm (Qwen3, no bias) ───
+// Analogue of kernel_attn_bias_rope_store but WITHOUT the attention biases
+// (Qwen3 has none). The per-head RMSNorm is applied by the separate
+// rms_norm_256 dispatches BEFORE this kernel is launched (the concat buffer's
+// q/k sections are normed in place); this kernel only does RoPE on q/k and
+// stores K/V into the persistent KV regions. Same section layout as the
+// bias+rope+store kernel: q = bqkv[0..nqt], k = bqkv[nqt..nqt+nkt],
+// v = bqkv[nqt+nkt..]. Grid: nqt/2 + nkt/2 + nkt, 256 threads.
+kernel void kernel_attn_rope_store(
+    device       float * bqkv [[buffer(0)]],
+    device        void * kv_k [[buffer(1)]],
+    device        void * kv_v [[buffer(2)]],
+    constant        int & nqt [[buffer(3)]],
+    constant        int & nkt [[buffer(4)]],
+    constant        int & hd  [[buffer(5)]],
+    constant      float & freq_base [[buffer(6)]],
+    constant      float & freq_scale [[buffer(7)]],
+    constant        int & pos [[buffer(8)]],
+    constant        int & rope_style [[buffer(9)]],
+    constant        int & kv_is_f16 [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const int half_dim = hd / 2;
+    const int qpairs = nqt / 2;
+    const int kpairs = nkt / 2;
+    const int total = qpairs + kpairs + nkt;
+    const int u = (int)tid;
+    if (u >= total) return;
+
+    if (u < qpairs) {
+        const int head = u / half_dim;
+        const int d    = u % half_dim;
+        const int base = head * hd;
+        const int i0 = (rope_style == 1) ? (base + 2 * d)     : (base + d);
+        const int i1 = (rope_style == 1) ? (base + 2 * d + 1) : (base + d + half_dim);
+        float x0 = bqkv[i0];
+        float x1 = bqkv[i1];
+        const float freq = freq_scale / pow(freq_base, (2.0 * d) / hd);
+        const float theta = pos * freq;
+        const float cs = cos(theta), sn = sin(theta);
+        bqkv[i0] = x0 * cs - x1 * sn;
+        bqkv[i1] = x0 * sn + x1 * cs;
+    } else if (u < qpairs + kpairs) {
+        const int u2   = u - qpairs;
+        const int head = u2 / half_dim;
+        const int d    = u2 % half_dim;
+        const int base = head * hd;
+        const int j0 = (rope_style == 1) ? (base + 2 * d)     : (base + d);
+        const int j1 = (rope_style == 1) ? (base + 2 * d + 1) : (base + d + half_dim);
+        const int k0 = nqt + j0, k1 = nqt + j1;
+        float x0 = bqkv[k0];
+        float x1 = bqkv[k1];
+        const float freq = freq_scale / pow(freq_base, (2.0 * d) / hd);
+        const float theta = pos * freq;
+        const float cs = cos(theta), sn = sin(theta);
+        float r0 = x0 * cs - x1 * sn;
+        float r1 = x0 * sn + x1 * cs;
+        bqkv[k0] = r0; bqkv[k1] = r1;
+        if (kv_is_f16) {
+            ((device half *)kv_k)[pos * nkt + j0] = half(r0);
+            ((device half *)kv_k)[pos * nkt + j1] = half(r1);
+        } else {
+            ((device float *)kv_k)[pos * nkt + j0] = r0;
+            ((device float *)kv_k)[pos * nkt + j1] = r1;
+        }
+    } else {
+        const int j  = u - qpairs - kpairs;
+        const int vi = nqt + nkt + j;
+        float v = bqkv[vi];
+        bqkv[vi] = v;
+        if (kv_is_f16) {
+            ((device half *)kv_v)[pos * nkt + j] = half(v);
+        } else {
+            ((device float *)kv_v)[pos * nkt + j] = v;
+        }
+    }
+}
 
 kernel void kernel_gqa_attn_f32(
     device const float * q        [[buffer(0)]],

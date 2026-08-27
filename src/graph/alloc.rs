@@ -182,6 +182,22 @@ impl GraphAllocator {
                         self.node_to_buf.insert(id, BufRef { backend, id: pid });
                     }
                 }
+                Op::FusedQkvNorm { layer } => {
+                    // fused decode QKV with per-head Q/K RMSNorm (Qwen3): same
+                    // layout as FusedQKV — persistent KV regions + a normal
+                    // concat (q|k|v) output buffer for the attention q input.
+                    let kv_elems = match &node.meta {
+                        NodeMeta::FusedQkvNorm(m) => m.kv_elems,
+                        _ => node.n_elements(),
+                    };
+                    self.ensure_kv(layer, backend, kv_elems);
+                    if last_use[id] > i {
+                        let size = node.n_elements();
+                        let pid = self.alloc_in_pool(backend, size);
+                        self.buf_alive.insert((backend, pid), last_use[id]);
+                        self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                    }
+                }
                 Op::Silu | Op::RoPE { .. } => {
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend

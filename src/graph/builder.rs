@@ -7,8 +7,8 @@ use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
 use super::ops::{
-    AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, KvcacheMeta, MatMulMeta, NodeMeta,
-    NormMeta, Op, RoPEMeta,
+    AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, FusedQkvNormMeta, KvcacheMeta,
+    MatMulMeta, NodeMeta, NormMeta, Op, RoPEMeta,
 };
 use super::{CNode, ComputeGraph, DType, NodeId};
 
@@ -222,6 +222,31 @@ impl GraphBuilder {
             [2 * meta.nf, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedFfn(meta),
+        )
+    }
+
+    /// decode (nt==1) fused QKV with per-head Q/K RMSNorm (Qwen3): one concat
+    /// matmul (wq|wk|wv) whose output buffer carries q (rows 0..nqt), k
+    /// (nqt..nqt+nkt), v (nqt+nkt..) after per-head norm + rope + store. The
+    /// backend normalizes q/k per head (llama `attn_q_norm`/`attn_k_norm`),
+    /// then ropes q in place, ropes + stores K, and stores V into the layer's
+    /// persistent regions (kv_pair). Output shape = [nqt+nkt+nkt, nt].
+    pub fn fused_qkv_norm(
+        &mut self,
+        x: NodeId,
+        pos: NodeId,
+        layer: usize,
+        meta: FusedQkvNormMeta,
+    ) -> NodeId {
+        let nt = self.graph.nodes[x].out_shape[1];
+        let od_total = meta.nqt + 2 * meta.nkt;
+        self.node(
+            "fused_qkv_norm",
+            Op::FusedQkvNorm { layer },
+            &[x, pos],
+            [od_total, nt, 1, 1],
+            DType::F32,
+            NodeMeta::FusedQkvNorm(meta),
         )
     }
 

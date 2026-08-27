@@ -218,6 +218,7 @@ impl BackendScheduler {
                 let kv_pair = match &node.op {
                     Op::KvcacheStore { layer } => alloc.kv_pair(*layer),
                     Op::FusedQKV { layer } => alloc.kv_pair(*layer),
+                    Op::FusedQkvNorm { layer } => alloc.kv_pair(*layer),
                     Op::Attn { .. } => match &node.meta {
                         NodeMeta::Attn(m) => alloc.kv_pair(m.layer),
                         _ => None,
