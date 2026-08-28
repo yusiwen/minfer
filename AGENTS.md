@@ -32,7 +32,7 @@ src/
 ├── dump.rs          # Debug dump module (gated by `--features debug_dump`)
 ├── tokenizer.rs     # BPE tokenizer (self-contained, loaded from GGUF metadata)
 ├── sampler.rs       # Repeat-penalty / Top-K / Top-P / Temperature (seeded) sampling
-├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja)
+├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja) — ⚠ minijinja 2.21.0 has no `str` methods; Qwen3's Python-style template fails → falls back to ChatML (see docs/QWEN3-SUPPORT-PLAN §5#9)
 ├── conversation.rs  # Multi-turn conversation session (append-only KV + Engine abstraction)
 ├── server/          # OpenAI-compatible HTTP server (axum; types/slot/chat)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download + cached-name resolution
@@ -198,6 +198,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |
 | Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
 | **Qwen3 dense support plan + implementation record** | `docs/QWEN3-SUPPORT-PLAN.md` |
+| **Qwen3 chat-template / minijinja incompatibility (falls back to ChatML)** | `docs/QWEN3-SUPPORT-PLAN.md` §5 gotcha #9 |
 | **Architecture roadmap (which model families to support next, tiered by reuse)** | `docs/ARCHITECTURE-ROADMAP.md` |
 | Debug dump format reference | `docs/debug-dump.md` |
 | Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |

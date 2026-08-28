@@ -33,7 +33,7 @@ file_type 7, quantization_version 2).
 | context_length | 40960 | `max_seq_len` / `n_ctx` |
 | tokenizer | gpt2 model, `pre = "qwen2"` | minfer's BPE tokenizer works unchanged |
 | eos / bos / pad | 151645 (`<|im_end|>`) / 151643 / 151643, `add_bos = false` | `SpecialTokens` fine |
-| chat_template | Qwen3 ChatML + `<think>` tags | rendered via minijinja from GGUF — works today |
+| chat_template | Qwen3 ChatML + `<think>` tags | **does NOT render via minijinja** — uses Python str-method syntax (`.split()/.lstrip()`) that minijinja 2.21.0 lacks → falls back to ChatML (see §5 gotcha) |
 | vocab | 151936 (÷32 ✓ for Q8_0 blocks) | — |
 | weights | all Q8_0 (q/k/v/wo/gate/up/down) + f32 norms | Q8_0 fully supported (CPU + Metal) |
 
@@ -302,13 +302,36 @@ let attn = b.attn(q, kv, inp_pos, Gqa, AttnMeta { n_head: nh, n_head_kv: nk, hd,
    NeoX/NonInterleaved — minfer's `cpu_rope`/Metal `rope_f32` already rotate
    the full head dim given `hd`, so only the `hd` value changes.
 5. **KV f16 auto-pick** uses `n_layer × n_kv_embd`; pass the real 1024.
-6. **ChatML template** renders fine, but generation includes `<think>` blocks
-   (thinking mode) — expected behavior, handle at the CLI layer if undesired.
+6. **ChatML template** — expected to render, but it does NOT: the Qwen3
+   `chat_template` uses Python string-method syntax that minijinja 2.21.0
+   cannot run, so it always falls back to ChatML. The fallback emits
+   `<|im_start|>` correctly (Qwen3-compatible), so plain chat works and the
+   model still emits `<think>` blocks (thinking mode). But the template's
+   think-block extraction, tool-call formatting and `enable_thinking` handling
+   are lost — see gotcha #9 below.
 7. **No biases anywhere** in Qwen3 — `bq/bk/bv/output_b` stay `None`; the
    loader's optional-bias paths already handle that.
 8. **Context 40960**: `n_ctx` defaults from `qwen3.context_length`; KV region
    sizing is `n_kv_embd × n_ctx` = 1024 × 40960 ≈ 40 MB/layer → ~1.1 GB f16 —
    fine, but keep the f16 KV path (auto-selected).
+9. **Qwen3 chat_template is NOT rendered by minijinja** (2026-08-27) — the
+   engine log shows
+   `chat template rendering failed (unknown method: string has no method named split), falling back to ChatML`.
+   Root cause: the template (`tokenizer.chat_template` from the GGUF) is written
+   with **Python string-method syntax** (`message.content.split('</think>')`,
+   `.lstrip('\n')`, `.rstrip('\n')` at template lines 35-36). minijinja 2.21.0
+   strings are Rust strings and expose **no** `str` methods; string operations
+   must be Jinja **filters** (`|split`, `|replace`). It also lacks the
+   `lstrip`/`rstrip`/`strip`/`contains` filters. So the template always fails at
+   line 35 and `template.rs::render_messages` falls back to `fallback_chatml_messages`
+   (`src/template.rs:50-56`). Consequence: the template's think-block extraction
+   (`<think>…</think>` split into `reasoning_content` vs `content`), tool-call
+   formatting (`<tool_call>`/`<tool_response>`), multi-step-tool collapse, and
+   `enable_thinking` are LOST; the fallback keeps `<think>` inline and feeds it
+   back verbatim on the next turn. Plain chat still works (the ChatML fallback
+   uses the Qwen3-compatible `<|im_start|>` markers). Fix direction and the
+   engine-level limitation are recorded in
+   `docs/OPENAI-CHAT-API-PLAN.md` §Chat Template Handling.
 
 ---
 
@@ -384,4 +407,7 @@ layer-0 K path across two Metal executions).
   path (biases, no per-head norm) is untouched.
 - Qwen3 MoE / hybrid-SWA / VL / reranker variants (`LLM_ARCH_QWEN3MOE`,
   `QWEN3NEXT`, `QWEN3VL*`) — separate architectures, out of scope here.
-- Optional `<think>`-block stripping at the CLI layer.
+- Optional `<think>`-block stripping at the CLI layer — note: since the Qwen3
+  template isn't rendered (gotcha #9), the `<think>` block stays inline and is
+  fed back verbatim; fixing the template render (see `docs/OPENAI-CHAT-API-PLAN.md`
+  §Chat Template Handling) is the real fix, CLI-side stripping is a stopgap.
