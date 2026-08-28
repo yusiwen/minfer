@@ -624,6 +624,22 @@ __global__ void swiglu_f32(
     dst[tid] = (g / (1.0f + expf(-g))) * up[tid];
 }
 
+// ─── I32 input decode: positions/token ids arrive as f32::from_bits(v)
+// bit patterns (graph convention, alloc.rs fill_input_i32) while the rope /
+// store / attention kernels read raw int32. One elementwise pass
+// reinterprets the bits into a scratch buffer — fully device-side, so the
+// per-layer path needs no host sync (and stays CUDA-Graph-replayable).
+
+__global__ void f32_bits_to_i32(
+    const float* __restrict__ src,
+    int* __restrict__ dst,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = __float_as_int(src[tid]);
+}
+
 // ─── RoPE (NEOX-style, in-place) ─────────────────────────────
 // x layout: [nt][n_head][n_dims] — pairs (x[i], x[i+half])
 // NEOX-style: pairs (x[i], x[i+hd/2]) for each head
@@ -915,6 +931,15 @@ void launch_swiglu_f32(
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
     swiglu_f32<<<grid, block, 0, stream>>>(gate, up, dst, n);
+}
+
+void launch_f32_bits_to_i32(
+    const float* src, int* dst, int n, cudaStream_t stream
+) {
+    int block_sz = 256;
+    dim3 block(block_sz, 1, 1);
+    dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
+    f32_bits_to_i32<<<grid, block, 0, stream>>>(src, dst, n);
 }
 
 void launch_rope_f32(

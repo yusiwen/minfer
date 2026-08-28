@@ -202,6 +202,12 @@ extern "C" {
         n: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_f32_bits_to_i32(
+        src: *const f32,
+        dst: *mut i32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_rope_f32(
         x: *mut f32,
         n_head: i32,
@@ -808,6 +814,49 @@ impl CudaState {
         }
     }
 
+    /// f32-activation matmul dispatch by raw weight pointer + tensor type.
+    /// The graph backend (graph/cuda_backend.rs) resolves weights by name and
+    /// holds no Tensor, so dispatch takes (ptr, ttype) directly; the legacy
+    /// Tensor-taking entry point below delegates here.
+    pub fn matmul_f32_ptr(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        ttype: TensorType,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) -> Result<(), String> {
+        let stream = self.stream();
+        macro_rules! launch {
+            ($f:ident) => {{
+                unsafe {
+                    $f(
+                        wptr as *const u8,
+                        x as *const f32,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        stream,
+                    );
+                }
+                Ok(())
+            }};
+        }
+        match ttype {
+            TensorType::Q4_0 => launch!(launch_q4_0_f32_matmul),
+            TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
+            TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
+            TensorType::Q4_K => launch!(launch_q4_k_f32_matmul),
+            TensorType::Q6_K => launch!(launch_q6_k_f32_matmul),
+            other => Err(format!(
+                "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"
+            )),
+        }
+    }
+
     pub fn quant_matmul_f32_on_gpu(
         &self,
         w: &Tensor,
@@ -818,70 +867,8 @@ impl CudaState {
         nt: usize,
     ) {
         let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
-        let stream = self.stream();
-        if w.ttype == TensorType::Q4_0 {
-            unsafe {
-                launch_q4_0_f32_matmul(
-                    wptr as *const u8,
-                    x as *const f32,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-            }
-        } else if w.ttype == TensorType::Q8_0 {
-            unsafe {
-                launch_q8_0_f32_matmul(
-                    wptr as *const u8,
-                    x as *const f32,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-            }
-        } else if w.ttype == TensorType::Q4_1 {
-            unsafe {
-                launch_q4_1_f32_matmul(
-                    wptr as *const u8,
-                    x as *const f32,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-            }
-        } else if w.ttype == TensorType::Q4_K {
-            unsafe {
-                launch_q4_k_f32_matmul(
-                    wptr as *const u8,
-                    x as *const f32,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-            }
-        } else if w.ttype == TensorType::Q6_K {
-            unsafe {
-                launch_q6_k_f32_matmul(
-                    wptr as *const u8,
-                    x as *const f32,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-            }
-        } else {
-            panic!("CUDA: unsupported weight type {:?} for f32 matmul", w.ttype);
-        }
+        self.matmul_f32_ptr(wptr, w.ttype, x, out, od, id, nt)
+            .unwrap_or_else(|e| panic!("CUDA: {e}"));
     }
 
     pub fn matmul_on_gpu(
@@ -962,16 +949,25 @@ impl CudaState {
         }
     }
 
+    /// Add a per-row bias to a token-major `[rows][d]` buffer: `y[t][i] += b[i]`.
+    /// `rows` is the ROW COUNT (token count) — the kernel grid maps one block
+    /// row per token, so passing the total element count writes out of bounds.
     pub fn add_bias_f32(
         &self,
         y: *mut std::ffi::c_void,
         b: *mut std::ffi::c_void,
         d: usize,
-        n: usize,
+        rows: usize,
     ) {
         let stream = self.stream();
         unsafe {
-            launch_add_bias_f32(y as *mut f32, b as *const f32, d as i32, n as i32, stream);
+            launch_add_bias_f32(
+                y as *mut f32,
+                b as *const f32,
+                d as i32,
+                rows as i32,
+                stream,
+            );
         }
     }
 
@@ -1073,6 +1069,16 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
+        }
+    }
+
+    /// Decode I32 graph inputs (f32::from_bits bit patterns, alloc.rs
+    /// fill_input_i32) into raw int32 for the rope/store/attention kernels.
+    /// Fully device-side: no host sync, capture-safe (Phase 7d).
+    pub fn bits_to_i32(&self, src: *mut std::ffi::c_void, dst: *mut std::ffi::c_void, n: usize) {
+        let stream = self.stream();
+        unsafe {
+            launch_f32_bits_to_i32(src as *const f32, dst as *mut i32, n as i32, stream);
         }
     }
 
