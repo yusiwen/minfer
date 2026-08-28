@@ -10,6 +10,8 @@ pub mod backend;
 pub mod builder;
 pub mod cache;
 pub mod cpu_backend;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
 pub mod dot;
 pub mod fusion;
 pub mod json;
@@ -57,7 +59,7 @@ pub enum Backend {
     CPU,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Metal,
-    /// CUDA backend (Phase 7, feature-gated) — planned, not yet wired.
+    /// CUDA backend (Phase 7, `--features cuda`).
     #[allow(dead_code)]
     Cuda,
 }

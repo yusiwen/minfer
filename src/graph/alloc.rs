@@ -22,6 +22,8 @@ pub struct GraphAllocator {
     cpu: CpuBackend,
     #[cfg(target_os = "macos")]
     metal: Option<super::metal_backend::MetalBackend>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda_backend::CudaBackend>,
     node_to_buf: HashMap<NodeId, BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
@@ -37,6 +39,8 @@ impl Default for GraphAllocator {
             cpu: CpuBackend::new(),
             #[cfg(target_os = "macos")]
             metal: None,
+            #[cfg(feature = "cuda")]
+            cuda: None,
             node_to_buf: HashMap::new(),
             buf_alive: HashMap::new(),
             kv: HashMap::new(),
@@ -82,6 +86,31 @@ impl GraphAllocator {
         self.metal.as_ref()
     }
 
+    /// Enable the CUDA backend (device presence + `MINFER_DISABLE_CUDA` are
+    /// checked by `CudaBackend::new` via the CudaState singleton).
+    /// (Model-side wiring lands in Phase 7c; tests use it meanwhile.)
+    #[allow(dead_code)]
+    #[cfg(feature = "cuda")]
+    pub fn enable_cuda(&mut self) -> bool {
+        if self.cuda.is_none() {
+            self.cuda = super::cuda_backend::CudaBackend::new();
+        }
+        self.cuda.is_some()
+    }
+
+    /// Mutable CUDA backend (None when unavailable / feature off).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_mut(&mut self) -> Option<&mut super::cuda_backend::CudaBackend> {
+        self.cuda.as_mut()
+    }
+
+    /// Immutable CUDA backend. (Phase 7c: used by the model-side gate.)
+    #[allow(dead_code)]
+    #[cfg(feature = "cuda")]
+    pub fn cuda(&self) -> Option<&super::cuda_backend::CudaBackend> {
+        self.cuda.as_ref()
+    }
+
     /// Register a weight tensor by name (delegates to the CPU backend).
     pub fn register_weight(&mut self, name: &str, t: crate::tensor::Tensor) {
         self.cpu.register_weight(name, t);
@@ -93,6 +122,12 @@ impl GraphAllocator {
         if let Some(m) = &self.metal {
             if m.supports_op(op, dtype) {
                 return Some(Backend::Metal);
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(c) = &self.cuda {
+            if c.supports_op(op, dtype) {
+                return Some(Backend::Cuda);
             }
         }
         if self.cpu.supports_op(op, dtype) {
@@ -251,6 +286,13 @@ impl GraphAllocator {
                 .alloc_buffer(size),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => unreachable!(),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self
+                .cuda
+                .as_mut()
+                .expect("CUDA pool not enabled")
+                .alloc_buffer(size),
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => unreachable!("CUDA pool not implemented"),
         }
     }
@@ -266,6 +308,13 @@ impl GraphAllocator {
             }
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => {}
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                if let Some(c) = &mut self.cuda {
+                    c.free_buffer(id);
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => {}
         }
     }
@@ -361,6 +410,13 @@ impl GraphAllocator {
                 .write_host(br.id, data),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => Err("Metal unavailable".into()),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self
+                .cuda
+                .as_mut()
+                .expect("CUDA pool not enabled")
+                .write_host(br.id, data),
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => Err("CUDA unavailable".into()),
         }
     }
@@ -389,6 +445,9 @@ impl GraphAllocator {
                 .map(|s| s.to_vec()),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => None,
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self.cuda.as_ref().and_then(|c| c.copy_to_host(br.id)),
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => None,
         }
     }
@@ -431,6 +490,13 @@ impl GraphAllocator {
             }
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => {}
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                if let Some(c) = &mut self.cuda {
+                    c.synchronize();
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => {}
         }
     }
@@ -456,6 +522,13 @@ impl GraphAllocator {
             Backend::Metal => self.metal.as_mut().unwrap().write_host(new_id, &data)?,
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => return Err("Metal unavailable".into()),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self
+                .cuda
+                .as_mut()
+                .expect("CUDA pool not enabled")
+                .write_host(new_id, &data)?,
+            #[cfg(not(feature = "cuda"))]
             Backend::Cuda => return Err("CUDA unavailable".into()),
         }
         // remap the node to the destination buffer

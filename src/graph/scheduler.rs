@@ -238,6 +238,12 @@ impl BackendScheduler {
                     }
                     #[cfg(not(target_os = "macos"))]
                     BackendTag::Metal => return Err("Metal unavailable".into()),
+                    #[cfg(feature = "cuda")]
+                    BackendTag::Cuda => {
+                        let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
+                        c.execute_node(node, &in_bufs, br.id, kv_pair)?;
+                    }
+                    #[cfg(not(feature = "cuda"))]
                     BackendTag::Cuda => return Err("CUDA backend not implemented".into()),
                 }
                 // CAPTURE AFTER EXECUTION — this step's output

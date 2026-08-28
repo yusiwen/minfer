@@ -27,6 +27,7 @@ unsafe impl Sync for CudaPtr {}
 struct CudaDevicePropBuf([u8; 4096]);
 
 extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
     fn cudaSetDevice(device: i32) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
@@ -263,7 +264,39 @@ pub struct CudaState {
 }
 
 impl CudaState {
+    /// Preload the NVIDIA driver library.
+    ///
+    /// libcudart resolves `libcuda.so.1` through the loader's default search,
+    /// which misses distribution-specific driver paths — and nix shells do not
+    /// consult `/etc/ld.so.cache` at all (the binary then fails with
+    /// cudaGetDeviceCount err 35, CUDA_ERROR_LIBRARY_NOT_FOUND). Loading it up
+    /// front from the well-known locations makes cudart's own dlopen re-use
+    /// the resident object (SONAME match). Harmless no-op when the driver is
+    /// already loadable; libcuda's glibc-stub dependencies resolve via the
+    /// binary's DT_RPATH (nix glibc dir) or the system default paths.
+    fn preload_driver() {
+        const RTLD_NOW: std::ffi::c_int = 2;
+        const RTLD_GLOBAL: std::ffi::c_int = 0x100;
+        const CANDIDATES: &[&str] = &[
+            "libcuda.so.1",
+            "/usr/lib/aarch64-linux-gnu/libcuda.so.1",
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/lib64/libcuda.so.1",
+            "/usr/lib/libcuda.so.1",
+        ];
+        for c in CANDIDATES {
+            let Ok(cstr) = std::ffi::CString::new(*c) else {
+                continue;
+            };
+            let handle = unsafe { dlopen(cstr.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+            if !handle.is_null() {
+                return;
+            }
+        }
+    }
+
     fn try_new() -> Option<Self> {
+        Self::preload_driver();
         if std::env::var("MINFER_DISABLE_CUDA").is_ok() {
             eprintln!("CUDA: disabled by MINFER_DISABLE_CUDA");
             return None;
@@ -272,7 +305,7 @@ impl CudaState {
         let mut count: i32 = 0;
         let err = unsafe { cudaGetDeviceCount(&mut count) };
         if err != 0 || count == 0 {
-            eprintln!("CUDA: no CUDA devices found");
+            eprintln!("CUDA: no CUDA devices found (cudaGetDeviceCount err {err}, count {count})");
             return None;
         }
 
@@ -454,7 +487,8 @@ impl CudaState {
         }
     }
 
-    fn cuda_malloc(size: usize) -> *mut std::ffi::c_void {
+    /// Allocate device memory (graph-backend pool helper). Null on failure.
+    pub fn cuda_malloc(size: usize) -> *mut std::ffi::c_void {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaMalloc(&mut ptr, size) };
         if err != 0 || ptr.is_null() {
@@ -462,6 +496,15 @@ impl CudaState {
             return std::ptr::null_mut();
         }
         ptr
+    }
+
+    /// Free device memory allocated via [`Self::cuda_malloc`] (no-op on null).
+    pub fn cuda_free(ptr: *mut std::ffi::c_void) {
+        if !ptr.is_null() {
+            unsafe {
+                cudaFree(ptr);
+            }
+        }
     }
 
     // ─── Copy helpers ─────────────────────────────────────────
