@@ -127,64 +127,126 @@ fn main() {
         println!("cargo:rustc-env=MINFER_METALLIB_HASH={hash}");
     }
 
-    let nvcc = match Command::new("nvcc").arg("--version").output() {
-        Ok(_) => "nvcc",
-        Err(_) => {
-            println!("cargo:warning=nvcc not found, CUDA support will be disabled");
-            return;
-        }
+    // ─── CUDA kernels (opt-in: `--features cuda`) ─────────────────────
+    // Everything below only runs when the `cuda` cargo feature is enabled.
+    // Plain builds never touch nvcc: previously ANY build attempted the CUDA
+    // compile whenever an nvcc happened to be on PATH, and a host-compiler
+    // mismatch (nix devShells put GCC 15 first on PATH; CUDA 13 only accepts
+    // <= 13) degraded the whole build to a "CUDA support disabled" warning.
+    //
+    // With the feature requested CUDA is REQUIRED: src/cuda.rs declares the
+    // `launch_*` symbols that only libcuda_kernels.a provides, so every
+    // failure below aborts the build with an actionable message instead of
+    // leaving a binary that cannot link.
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=MINFER_CUDA_CCBIN");
+    println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        return;
+    }
+
+    let nvcc = match find_nvcc() {
+        Some(n) => n,
+        None => panic!(
+            "CUDA feature requested but nvcc was not found — install the CUDA \
+             toolkit or point CUDA_HOME at its root (e.g. /usr/local/cuda)"
+        ),
     };
 
-    let cuda_home = find_cuda_home();
+    let cuda_home = find_cuda_home(&nvcc);
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let cu_file = "src/cuda_kernels.cu";
-    let obj_file = format!("{}/cuda_kernels.o", out_dir);
-
-    let archs = detect_archs(nvcc, &out_dir, &cuda_home);
-
     let include_flag = format!("-I{cuda_home}/include");
 
-    let mut args: Vec<String> = Vec::new();
-    args.push("-o".into());
-    args.push(obj_file.clone());
-    args.push("-c".into());
-    args.push(cu_file.into());
-    args.push(include_flag.clone());
-    args.push("-O3".into());
-    args.push("--compiler-options".into());
-    args.push("-fPIC".into());
-    args.push("-Xcompiler".into());
-    args.push("-Wno-unused-function".into());
+    // nvcc inherits the first cc/g++ on PATH as its host compiler and
+    // hard-fails when that is newer than the toolkit supports. Keep nvcc's
+    // own default whenever it works (machines with a compatible default are
+    // untouched); only pin -ccbin when the default is rejected.
+    // `ccbin: None` means nvcc's own default host compiler works — pass no
+    // -ccbin at all, keeping the behavior of machines whose PATH already has
+    // a compatible compiler.
+    let (ccbin, ccbin_label) = match std::env::var("MINFER_CUDA_CCBIN") {
+        Ok(v) if !v.is_empty() => {
+            let label = format!("MINFER_CUDA_CCBIN={v}");
+            (Some(v), label)
+        }
+        _ => match detect_host_compiler(&nvcc, &out_dir, &include_flag) {
+            Some(HostCompiler::Default) => (None, "nvcc default".to_string()),
+            Some(HostCompiler::Pinned(c)) => {
+                println!(
+                    "cargo:warning=CUDA: nvcc default host compiler rejected, pinning -ccbin {c}"
+                );
+                (Some(c.clone()), format!("-ccbin {c}"))
+            }
+            None => panic!(
+                "CUDA feature requested but no host compiler accepted by nvcc was \
+                 found — install a GCC within the CUDA-supported range, or force \
+                 one with MINFER_CUDA_CCBIN=/path/to/g++"
+            ),
+        },
+    };
 
+    let archs = detect_archs(&nvcc, &out_dir, &include_flag, ccbin.as_deref());
+    if archs.is_empty() {
+        panic!(
+            "CUDA feature requested but nvcc accepted none of the candidate \
+             architectures (sm_61…sm_121) — extend detect_archs() in build.rs \
+             if this toolkit is newer than the list"
+        );
+    }
+    let highest = archs.last().unwrap();
+    println!(
+        "cargo:warning=CUDA: host compiler {ccbin_label}; targets {}; PTX compute_{highest}",
+        archs
+            .iter()
+            .map(|a| format!("sm_{a}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let obj_file = format!("{out_dir}/cuda_kernels.o");
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        obj_file.clone(),
+        "-c".into(),
+        cu_file.into(),
+        include_flag,
+        "-O3".into(),
+        "--compiler-options".into(),
+        "-fPIC".into(),
+        "-Xcompiler".into(),
+        "-Wno-unused-function".into(),
+    ];
+    if let Some(c) = &ccbin {
+        args.push("-ccbin".into());
+        args.push(c.clone());
+    }
     for arch in &archs {
         args.push("-gencode".into());
         args.push(format!("arch=compute_{arch},code=sm_{arch}"));
     }
-    if let Some(highest) = archs.last() {
-        args.push("-gencode".into());
-        args.push(format!("arch=compute_{highest},code=compute_{highest}"));
-    }
+    args.push("-gencode".into());
+    args.push(format!("arch=compute_{highest},code=compute_{highest}"));
 
-    let status = Command::new(nvcc)
+    let status = Command::new(&nvcc)
         .args(&args)
         .status()
-        .expect("failed to compile CUDA kernels");
-
+        .unwrap_or_else(|e| panic!("CUDA: failed to spawn {nvcc}: {e}"));
     if !status.success() {
-        println!("cargo:warning=CUDA kernel compilation failed, CUDA support disabled");
-        return;
+        panic!("CUDA kernel compilation failed — see the nvcc errors above");
     }
 
+    let lib_file = format!("{out_dir}/libcuda_kernels.a");
     let ar_status = Command::new("ar")
-        .args(["rcs", &format!("{}/libcuda_kernels.a", out_dir), &obj_file])
+        .args(["rcs", &lib_file, &obj_file])
         .status()
-        .expect("failed to create static library");
+        .unwrap_or_else(|e| panic!("CUDA: failed to spawn ar: {e}"));
     if !ar_status.success() {
-        println!("cargo:warning=Failed to create static library, CUDA support disabled");
-        return;
+        panic!("CUDA: ar failed to create {lib_file}");
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir);
+    println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=cuda_kernels");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
@@ -192,59 +254,143 @@ fn main() {
     let lib_dir = format!("{cuda_home}/lib64");
     if Path::new(&lib_dir).exists() {
         println!("cargo:rustc-link-search={}", lib_dir);
+        // Bake an rpath so the binary finds libcudart without relying on
+        // LD_LIBRARY_PATH (host-driven model: run on the machine that built).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+        // libcudart needs libstdc++ transitively; DT_RUNPATH is not consulted
+        // for transitive deps (and nix's loader ignores /etc/ld.so.cache), so
+        // emit old-style DT_RPATH, which is.
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
-
-    println!("cargo:rustc-cfg=feature=\"cuda\"");
-    println!("cargo:rerun-if-changed={}", cu_file);
-    println!("cargo:rerun-if-changed=build.rs");
 }
 
-fn find_cuda_home() -> String {
-    if let Ok(home) = std::env::var("CUDA_HOME") {
-        if !home.is_empty() {
-            return home;
+// ─── CUDA toolchain discovery ────────────────────────────────────────────────
+
+/// Locate nvcc, preferring the toolkit CUDA_HOME/CUDA_PATH points at so the
+/// headers passed with -I and the compiler that is run always come from the
+/// same toolkit. Falls back to PATH (previous behavior).
+fn find_nvcc() -> Option<String> {
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(home) = std::env::var(var) {
+            if !home.is_empty() {
+                let candidate = format!("{home}/bin/nvcc");
+                if Path::new(&candidate).exists() {
+                    return Some(candidate);
+                }
+            }
         }
     }
-    if let Ok(home) = std::env::var("CUDA_PATH") {
-        if !home.is_empty() {
-            return home;
+    if Command::new("nvcc").arg("--version").output().is_ok() {
+        return Some("nvcc".to_string());
+    }
+    None
+}
+
+fn find_cuda_home(nvcc: &str) -> String {
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(home) = std::env::var(var) {
+            if !home.is_empty() {
+                return home;
+            }
         }
     }
     if Path::new("/usr/local/cuda").exists() {
         return "/usr/local/cuda".to_string();
     }
+    // Derive the toolkit root from the nvcc path (…/bin/nvcc) so custom
+    // install locations still get their headers passed with -I.
+    if let Some(root) = nvcc.strip_suffix("/bin/nvcc") {
+        if Path::new(&format!("{root}/include/cuda_runtime.h")).exists() {
+            return root.to_string();
+        }
+    }
     "/usr".to_string()
 }
 
-fn detect_archs(nvcc: &str, out_dir: &str, cuda_home: &str) -> Vec<String> {
-    let candidates = ["61", "75", "80", "86", "89", "90"];
-    let mut supported = Vec::new();
-    let test_dir = format!("{}/nvcc_arch_test", out_dir);
+/// Outcome of probing nvcc's host compiler for the C++ side of the kernels.
+enum HostCompiler {
+    /// nvcc's own default (first cc/g++ on PATH) compiles — pass no -ccbin.
+    Default,
+    /// The default was rejected; pin this compiler with -ccbin.
+    Pinned(String),
+}
+
+/// Probe the host compiler nvcc should use. nvcc hard-fails on host GCCs
+/// newer than the toolkit supports (CUDA 13 rejects GCC 15, which nix
+/// devShells put first on PATH), and the glibc `noexcept` mismatch then
+/// surfaces as errors inside <cmath> instead of a version diagnostic. Returns
+/// `None` when neither the default nor any known candidate compiles.
+fn detect_host_compiler(nvcc: &str, out_dir: &str, include_flag: &str) -> Option<HostCompiler> {
+    let src = format!("{out_dir}/host_probe.cu");
+    let obj = format!("{out_dir}/host_probe.o");
+    let _ = std::fs::write(&src, "__global__ void host_probe() {}\n");
+    let probe = |ccbin: Option<&str>| -> bool {
+        let mut args: Vec<String> = vec![
+            "-o".into(),
+            obj.clone(),
+            "-c".into(),
+            src.clone(),
+            include_flag.to_string(),
+        ];
+        if let Some(c) = ccbin {
+            args.push("-ccbin".into());
+            args.push(c.to_string());
+        }
+        Command::new(nvcc)
+            .args(&args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    // Newest first; nvcc performs the version check itself, so this adapts to
+    // whatever CUDA is installed (older toolkits reject newer GCCs here).
+    let candidates = [
+        "g++-15", "g++-14", "g++-13", "g++-12", "g++-11", "g++", "c++", "clang++",
+    ];
+    let picked = if probe(None) {
+        Some(HostCompiler::Default)
+    } else {
+        candidates
+            .iter()
+            .find(|c| probe(Some(*c)))
+            .map(|c| HostCompiler::Pinned(c.to_string()))
+    };
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&obj);
+    picked
+}
+
+/// Probe which SASS targets this nvcc accepts (cross-compilation needs no GPU
+/// present). Candidates newer than the toolkit — Blackwell sm_100/103/110/120/
+/// 121 require CUDA 12.8+ — simply fail the probe and are skipped, so one list
+/// works on every CUDA version and every GPU gets its native SASS when
+/// available.
+fn detect_archs(nvcc: &str, out_dir: &str, include_flag: &str, ccbin: Option<&str>) -> Vec<String> {
+    let candidates = [
+        "61", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
+    ];
+    let test_dir = format!("{out_dir}/nvcc_arch_test");
     let _ = std::fs::create_dir_all(&test_dir);
-    let test_cu = format!("{}/dummy.cu", test_dir);
+    let test_cu = format!("{test_dir}/dummy.cu");
     let _ = std::fs::write(&test_cu, "__global__ void dummy() {}\n");
-    let include_flag = format!("-I{cuda_home}/include");
+    let mut supported = Vec::new();
     for arch in &candidates {
-        let out = format!("{}/dummy_{arch}.o", test_dir);
-        let ok = Command::new(nvcc)
-            .args(["-o", &out, "-c", &test_cu])
+        let out = format!("{test_dir}/dummy_{arch}.o");
+        let mut cmd = Command::new(nvcc);
+        cmd.args(["-o", &out, "-c", &test_cu])
             .arg(format!("-arch=sm_{arch}"))
-            .args([&include_flag, "--compiler-options", "-fPIC"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .args(["--compiler-options", "-fPIC"])
+            .arg(include_flag);
+        if let Some(c) = ccbin {
+            cmd.args(["-ccbin", c]);
+        }
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
         if ok {
-            eprintln!("cargo:warning=CUDA: targeting sm_{arch}");
             supported.push(arch.to_string());
             let _ = std::fs::remove_file(&out);
-        } else {
-            eprintln!("cargo:warning=CUDA: sm_{arch} not supported by nvcc, skipping");
         }
     }
     let _ = std::fs::remove_dir_all(&test_dir);
-    if supported.is_empty() {
-        eprintln!("cargo:warning=CUDA: no architectures detected, defaulting to sm_75");
-        supported.push("75".to_string());
-    }
     supported
 }

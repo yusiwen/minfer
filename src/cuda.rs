@@ -1,4 +1,12 @@
 // CUDA (NVIDIA GPU) backend for x86-64 Linux/Windows.
+//
+// NOTE: this backend is a staged draft (Phase 7 in docs/GRAPH-REFACTOR-PLAN.md).
+// The full CudaState API (buffers, streams, CUDA Graph capture, per-op kernels)
+// is written ahead of the graph-scheduler integration, so most of it is not yet
+// reachable from main() (which only uses init/get/init_kv_cache). Dead-code
+// warnings are expected until Phase 7 lands, hence the module-level allow below.
+// Remove it once the backend is wired into the scheduler.
+#![allow(dead_code)]
 
 use crate::block::Q8B;
 use crate::tensor::{Tensor, TensorType};
@@ -61,9 +69,10 @@ extern "C" {
     fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
 }
 
-const cudaMemcpyHostToDevice: i32 = 1;
-const cudaMemcpyDeviceToHost: i32 = 2;
-const cudaMemcpyDeviceToDevice: i32 = 3;
+// cudaMemcpyKind values (https://docs.nvidia.com/cuda/runtime-api/group__CUDART__TYPES.html)
+const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 const CUDA_DEV_ATTR_COMPUTE_MAJOR: i32 = 75;
 const CUDA_DEV_ATTR_COMPUTE_MINOR: i32 = 76;
@@ -394,7 +403,7 @@ impl CudaState {
                 ptr,
                 data.as_ptr() as *const std::ffi::c_void,
                 data.len(),
-                cudaMemcpyHostToDevice,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         };
         if err != 0 {
@@ -463,7 +472,7 @@ impl CudaState {
                 dst,
                 src.as_ptr() as *const std::ffi::c_void,
                 src.len(),
-                cudaMemcpyHostToDevice,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
             );
         }
     }
@@ -474,7 +483,7 @@ impl CudaState {
                 dst,
                 src.as_ptr() as *const std::ffi::c_void,
                 src.len(),
-                cudaMemcpyHostToDevice,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
                 self.stream(),
             );
         }
@@ -486,7 +495,7 @@ impl CudaState {
                 dst.as_mut_ptr() as *mut std::ffi::c_void,
                 src,
                 dst.len(),
-                cudaMemcpyDeviceToHost,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
             );
         }
     }
@@ -497,7 +506,7 @@ impl CudaState {
                 dst.as_mut_ptr() as *mut std::ffi::c_void,
                 src,
                 dst.len(),
-                cudaMemcpyDeviceToHost,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
                 self.stream(),
             );
         }
@@ -514,7 +523,7 @@ impl CudaState {
                 dst as *mut std::ffi::c_void,
                 src,
                 size,
-                cudaMemcpyDeviceToDevice,
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
             );
         }
     }
@@ -1076,7 +1085,7 @@ impl CudaState {
         self.copy_to_device(&q8, xbuf);
 
         // Launch each matmul and read back results
-        for (i, mat) in mats.iter_mut().enumerate() {
+        for (_i, mat) in mats.iter_mut().enumerate() {
             let out_len = nt * mat.2 * 4;
             let obuf = Self::get_or_grow(&self.buf_bq, out_len);
             self.quant_matmul_q8(mat.0, xbuf, obuf, mat.2, id, nt);
@@ -1359,7 +1368,7 @@ impl CudaState {
         let bn = Self::get_or_grow(&self.buf_bn, n_out * ne * 4);
         let logits = Self::get_or_grow(&self.buf_logits, n_out * nv * 4);
 
-        let hidden_off = (hidden as *mut u8).add(hid_off) as *mut std::ffi::c_void;
+        let hidden_off = unsafe { (hidden as *mut u8).add(hid_off) } as *mut std::ffi::c_void;
         self.rms_norm(hidden_off, Some(norm_w), bn, ne, n_out, eps);
         self.debug_sync(-1, "output: rms_norm");
 

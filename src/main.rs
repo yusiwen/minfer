@@ -614,7 +614,7 @@ fn main() {
     // Pre-allocate GPU KV cache (avoids O(n²) incremental growth during generation)
     #[cfg(feature = "cuda")]
     if let Some(cuda) = cuda::CudaState::get() {
-        cuda.init_kv_cache(n_layer, params.n_ctx, n_head_kv * n_embd_head);
+        cuda.init_kv_cache(n_layer, params.n_ctx, n_kv_embd as usize);
     }
 
     // === Tokenizer ===

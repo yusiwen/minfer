@@ -70,6 +70,13 @@ src/
 ```bash
 cargo build --release
 cargo build --release --features debug_dump    # + per-layer debug dumps
+cargo build --release --features cuda          # + CUDA backend (opt-in; requires nvcc + CUDA toolkit)
+
+# CUDA build notes (build.rs): the host nvcc and a compatible host compiler are
+# auto-detected — when the default cc/g++ on PATH is newer than the toolkit
+# supports (e.g. nix devShells' GCC 15 vs CUDA 13), build.rs pins the first
+# working -ccbin (gcc-13/-12/…). MINFER_CUDA_CCBIN=/path/to/g++ forces one.
+# Without --features cuda, builds never touch nvcc at all.
 
 ./target/release/minfer <model.gguf> "hello"                      # run (compute-graph forward)
 ./target/release/minfer --graph <model> "hello"                   # accepted for compat (graph path is default)
