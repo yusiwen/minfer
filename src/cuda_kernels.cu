@@ -1209,6 +1209,162 @@ __global__ void gqa_attn_f32_f16kv(
     }
 }
 
+// ─── 8d: split-K decode attention (flash-decoding) ───────────
+// The single-warp-per-(token,head) online-softmax kernel leaves the GPU idle
+// at nt == 1 (28 warps total at 7B) — nsys showed 48% of the 7B decode step
+// at 2K ctx. Pass 1 scans SPLITS KV chunks in parallel (fixed grid, device-
+// side range split so CUDA Graph capture stays valid); pass 2 merges the
+// partial (mx, S, oc) results. Partial layout: [SPLITS][nh][pstr] floats,
+// pstr = (4+hd+3)&~3 — oc starts at float offset 4 so the float4 writes are
+// 16-byte aligned. Scratch is a fixed-size state buffer (nh/hd are graph
+// constants), grown during warmup — never inside a capture window.
+
+template <typename KV>
+__device__ __forceinline__ float2 kv_ld2(const KV* p);
+
+template <>
+__device__ __forceinline__ float2 kv_ld2<float>(const float* p) {
+    return make_float2(p[0], p[1]);
+}
+
+template <>
+__device__ __forceinline__ float2 kv_ld2<__half>(const __half* p) {
+    return __half22float2(*reinterpret_cast<const __half2*>(p));
+}
+
+template <typename KV>
+__global__ void gqa_attn_split_partial(
+    const float* __restrict__ q,
+    const KV* __restrict__ k,
+    const KV* __restrict__ v,
+    float* __restrict__ partial,
+    const int* positions,
+    int nh, int nk, int hd, float scale, int pstr
+) {
+    const int SPLITS = 8;
+    int sp = blockIdx.x;
+    int h = blockIdx.y;
+    int nkv = positions[0] + 1;
+    int chunk = (nkv + SPLITS - 1) / SPLITS;
+    int lo = sp * chunk;
+    int hi = min(nkv, lo + chunk);
+
+    int lane_id = threadIdx.x;
+    int gqa = nh / nk;
+    int hk = h / gqa;
+    int stride_kv = nk * hd;
+    const float4* q4 = reinterpret_cast<const float4*>(q + h * hd);
+    int hd4 = hd / 4;
+
+    float mx = -INFINITY, S = 0.0f;
+    float4 oc[32];
+    #pragma unroll
+    for (int i = 0; i < hd4; i++) oc[i] = make_float4(0, 0, 0, 0);
+
+    for (int base = lo; base < hi; base += 64) {
+        float s0 = -INFINITY, s1 = -INFINITY;
+        int kv0 = base + lane_id * 2;
+        int kv1 = kv0 + 1;
+        if (kv0 < hi) {
+            const KV* krow = k + (size_t)kv0 * stride_kv + hk * hd;
+            float d = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 qv = q4[i];
+                float2 a = kv_ld2<KV>(krow + i * 4);
+                float2 b = kv_ld2<KV>(krow + i * 4 + 2);
+                d += qv.x * a.x + qv.y * a.y + qv.z * b.x + qv.w * b.y;
+            }
+            s0 = d * scale;
+        }
+        if (kv1 < hi) {
+            const KV* krow = k + (size_t)kv1 * stride_kv + hk * hd;
+            float d = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 qv = q4[i];
+                float2 a = kv_ld2<KV>(krow + i * 4);
+                float2 b = kv_ld2<KV>(krow + i * 4 + 2);
+                d += qv.x * a.x + qv.y * a.y + qv.z * b.x + qv.w * b.y;
+            }
+            s1 = d * scale;
+        }
+        float bmx = fmaxf(s0, s1);
+        for (int off = 16; off > 0; off >>= 1)
+            bmx = fmaxf(bmx, __shfl_xor_sync(0xFFFFFFFF, bmx, off));
+        float nmx = fmaxf(mx, bmx);
+        float corr = expf(mx - nmx);
+        float e0 = (kv0 < hi) ? expf(s0 - nmx) : 0.0f;
+        float e1 = (kv1 < hi) ? expf(s1 - nmx) : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < hd4; i++) {
+            oc[i].x *= corr; oc[i].y *= corr; oc[i].z *= corr; oc[i].w *= corr;
+        }
+        S *= corr;
+        if (kv0 < hi) {
+            const KV* vrow = v + (size_t)kv0 * stride_kv + hk * hd;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float2 a = kv_ld2<KV>(vrow + i * 4);
+                float2 b = kv_ld2<KV>(vrow + i * 4 + 2);
+                oc[i].x += e0 * a.x; oc[i].y += e0 * a.y;
+                oc[i].z += e0 * b.x; oc[i].w += e0 * b.y;
+            }
+        }
+        if (kv1 < hi) {
+            const KV* vrow = v + (size_t)kv1 * stride_kv + hk * hd;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float2 a = kv_ld2<KV>(vrow + i * 4);
+                float2 b = kv_ld2<KV>(vrow + i * 4 + 2);
+                oc[i].x += e1 * a.x; oc[i].y += e1 * a.y;
+                oc[i].z += e1 * b.x; oc[i].w += e1 * b.y;
+            }
+        }
+        S += e0 + e1;
+        mx = nmx;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < hd4; i++) {
+        oc[i].x = warp_reduce_sum(oc[i].x);
+        oc[i].y = warp_reduce_sum(oc[i].y);
+        oc[i].z = warp_reduce_sum(oc[i].z);
+        oc[i].w = warp_reduce_sum(oc[i].w);
+    }
+    S = warp_reduce_sum(S);
+
+    if (lane_id == 0) {
+        float* dst = partial + ((size_t)sp * nh + h) * pstr;
+        dst[0] = mx;
+        dst[1] = S;
+        float4* o4 = reinterpret_cast<float4*>(dst + 4); // 16B-aligned by pstr
+        #pragma unroll
+        for (int i = 0; i < hd4; i++) o4[i] = oc[i];
+    }
+}
+
+__global__ void gqa_attn_split_combine(
+    const float* __restrict__ partial,
+    float* __restrict__ o,
+    int nh, int hd, int pstr
+) {
+    int h = blockIdx.y;
+    int i = threadIdx.x; // hd threads
+    if (i >= hd) return;
+    float gmx = -INFINITY;
+    for (int sp = 0; sp < 8; sp++)
+        gmx = fmaxf(gmx, partial[((size_t)sp * nh + h) * pstr]);
+    float S = 0.0f, acc = 0.0f;
+    for (int sp = 0; sp < 8; sp++) {
+        const float* p = partial + ((size_t)sp * nh + h) * pstr;
+        float w = expf(p[0] - gmx);
+        S += p[1] * w;
+        acc += p[4 + i] * w;
+    }
+    o[h * hd + i] = (S > 0.0f) ? acc / S : 0.0f;
+}
+
 __global__ void gqa_attn_f32(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -1572,6 +1728,36 @@ void launch_gqa_attn_f32_f16kv(
     gqa_attn_f32_f16kv<<<grid, block, 0, stream>>>(
         q, (__half*)k, (__half*)v, o, positions,
         n_head, n_head_kv, hd, scale, nt
+    );
+}
+
+void launch_gqa_attn_split_f16kv(
+    const float* q, const void* k, const void* v, float* o,
+    float* partial, const int* positions,
+    int n_head, int n_head_kv, int hd,
+    float scale, int pstr, cudaStream_t stream
+) {
+    gqa_attn_split_partial<__half><<<dim3(8, n_head), 32, 0, stream>>>(
+        q, (const __half*)k, (const __half*)v, partial, positions,
+        n_head, n_head_kv, hd, scale, pstr
+    );
+    gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
+        partial, o, n_head, hd, pstr
+    );
+}
+
+void launch_gqa_attn_split_f32kv(
+    const float* q, const void* k, const void* v, float* o,
+    float* partial, const int* positions,
+    int n_head, int n_head_kv, int hd,
+    float scale, int pstr, cudaStream_t stream
+) {
+    gqa_attn_split_partial<float><<<dim3(8, n_head), 32, 0, stream>>>(
+        q, (const float*)k, (const float*)v, partial, positions,
+        n_head, n_head_kv, hd, scale, pstr
+    );
+    gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
+        partial, o, n_head, hd, pstr
     );
 }
 

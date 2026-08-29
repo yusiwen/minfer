@@ -705,6 +705,28 @@ impl CudaBackend {
                 // The causal bound (positions[t]+1) is derived from the device
                 // positions inside the kernel — no host scalar crosses here
                 // (precondition for CUDA Graph replay, Phase 7d).
+                // 8d: decode (nt == 1) uses split-K flash-decoding — the
+                // single-warp kernel leaves the GPU idle at nt == 1 (nsys:
+                // 48% of the 7B decode step at 2K ctx). Fixed grid +
+                // device-side range split keeps CUDA Graph capture valid;
+                // the partials scratch is size-stable (nh/hd constants).
+                if nt == 1 {
+                    self.state.gqa_attn_split(
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        self.ptr_of(out_buf)?,
+                        pos,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        self.kv_f16,
+                    );
+                    return Ok(());
+                }
+                // nt > 1 (prefill): single-warp-per-(token, head) kernel —
+                // the grid already covers nt × nh blocks.
                 // 8b: f16-KV variant reads half K/V (q/o stay f32)
                 if self.kv_f16 {
                     self.state.gqa_attn_f16kv(
@@ -1348,11 +1370,8 @@ mod tests {
                     (0..id_)
                         .map(|i| {
                             let b = i / 32;
-                            let d8 = half::f16::from_le_bytes([
-                                q8[b * 34],
-                                q8[b * 34 + 1],
-                            ])
-                            .to_f32();
+                            let d8 =
+                                half::f16::from_le_bytes([q8[b * 34], q8[b * 34 + 1]]).to_f32();
                             d8 * q8[b * 34 + 2 + (i % 32)] as i8 as f32
                         })
                         .collect()
@@ -2467,6 +2486,127 @@ mod tests {
                 got1[r],
                 got1[r] - want
             );
+        }
+    }
+
+    // 8d: split-K decode attention parity (nt == 1 routes to the split path).
+    // nkv = 3 exercises EMPTY splits (positions[0] = 2 → splits 3..7 have no
+    // rows); nkv = 37 exercises a partial last split with SPLITS = 8. Both KV
+    // layouts checked. Reference: cpu_gqa_attn over the same KV (zero rows +
+    // one stored row).
+    #[test]
+    fn cuda_attn_split_decode_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (nh, nk_h, hd) = (4usize, 2usize, 8usize);
+        let nkt = nk_h * hd;
+        let n_ctx = 64usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        for kv_f16 in [false, true] {
+            for pos0 in [2usize, 36usize] {
+                let nkv = pos0 + 1;
+                cb.set_kv_f16_for_test(kv_f16);
+                let mut b = GraphBuilder::new();
+                let q = b.input("q", [nh * hd, 1, 1, 1], DType::F32);
+                let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
+                let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
+                let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
+                let store = b.kvcache_store(0, k, v, pp, n_ctx);
+                let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+                let at = b.attn(
+                    q,
+                    load,
+                    pp,
+                    AttnMode::Gqa,
+                    AttnMeta {
+                        layer: 0,
+                        n_head: nh,
+                        n_head_kv: nk_h,
+                        hd,
+                        hd_kv: hd,
+                        nkt,
+                        scale,
+                    },
+                );
+                b.output(at);
+                let g = b.build();
+
+                let (xb_q, xb_k, xb_v) = (
+                    cb.alloc_buffer(nh * hd),
+                    cb.alloc_buffer(nkt),
+                    cb.alloc_buffer(nkt),
+                );
+                let xb_p = cb.alloc_buffer(1);
+                let ob_at = cb.alloc_buffer(nh * hd);
+                let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
+
+                let qs: Vec<f32> = (0..nh * hd)
+                    .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+                    .collect();
+                let ks: Vec<f32> = (0..nkt)
+                    .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+                    .collect();
+                let vs: Vec<f32> = (0..nkt)
+                    .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                    .collect();
+                let pb = vec![f32::from_bits(pos0 as u32)];
+                let to_half = |x: &[f32]| -> Vec<f32> {
+                    x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+                };
+                let (ks_r, vs_r) = if kv_f16 {
+                    (to_half(&ks), to_half(&vs))
+                } else {
+                    (ks.clone(), vs.clone())
+                };
+                cb.write_host(xb_q, &qs).unwrap();
+                cb.write_host(xb_k, &ks).unwrap();
+                cb.write_host(xb_v, &vs).unwrap();
+                cb.write_host(xb_p, &pb).unwrap();
+                cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
+                cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
+
+                cb.execute_node(
+                    &g.nodes[store],
+                    &[xb_k, xb_v, xb_p],
+                    kreg,
+                    Some((kreg, vreg)),
+                )
+                .unwrap();
+                cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+                    .unwrap();
+
+                let mut kfull = vec![0f32; nkt * n_ctx];
+                let mut vfull = vec![0f32; nkt * n_ctx];
+                kfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&ks_r);
+                vfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&vs_r);
+                let mut aref = vec![0f32; nh * hd];
+                crate::graph::cpu_backend::cpu_gqa_attn(
+                    &qs,
+                    &kfull,
+                    &vfull,
+                    &[pos0],
+                    1,
+                    nkv,
+                    nh,
+                    nk_h,
+                    hd,
+                    hd,
+                    nkt,
+                    &mut aref,
+                    scale,
+                )
+                .unwrap();
+                let agot = cb.copy_to_host(ob_at).unwrap();
+                assert_close(
+                    &format!("attn_split(f16kv={kv_f16}, nkv={nkv})"),
+                    &agot,
+                    &aref,
+                    1e-4,
+                );
+            }
         }
     }
 

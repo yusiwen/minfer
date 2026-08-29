@@ -285,6 +285,34 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_gqa_attn_split_f16kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        partial: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        pstr: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_gqa_attn_split_f32kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        partial: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        pstr: i32,
+        stream: *mut std::ffi::c_void,
+    );
 }
 
 // ─── CudaState singleton ───────────────────────────────────────
@@ -407,6 +435,10 @@ pub struct CudaState {
     /// 8c: prefill Q8_0-activation scratch (quantized activations for the
     /// Q4_0×Q8_0 GEMM, nt > 1). Grown on demand like the layer-path buffers.
     buf_q8_prefill: Mutex<(CudaPtr, usize)>,
+    /// 8d: split-K attention partials ([8][nh][pstr] floats, nh/hd are graph
+    /// constants so the size is stable — grown during warmup, never inside a
+    /// capture window).
+    buf_attn_partial: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_ba: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
@@ -634,6 +666,7 @@ impl CudaState {
             buf_bg: Mutex::new(dummy),
             buf_q8_bn: Mutex::new(dummy),
             buf_q8_prefill: Mutex::new(dummy),
+            buf_attn_partial: Mutex::new(dummy),
             buf_q8_ba: Mutex::new(dummy),
             buf_positions: Mutex::new(dummy),
             buf_logits: Mutex::new(dummy),
@@ -1720,6 +1753,61 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
+        }
+    }
+
+    /// 8d: split-K decode attention (nt == 1). `pstr` = (4 + hd + 3) & !3 —
+    /// the partials' row stride keeps the oc section 16-byte aligned. The
+    /// scratch must be at least 8 * nh * pstr floats (see buf_attn_partial).
+    pub fn gqa_attn_split(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        f16_kv: bool,
+    ) {
+        let pstr = ((4 + hd + 3) & !3) as i32;
+        let need = 8 * nh * (pstr as usize) * 4;
+        let partial = Self::get_or_grow(&self.buf_attn_partial, need);
+        let stream = self.stream();
+        unsafe {
+            if f16_kv {
+                launch_gqa_attn_split_f16kv(
+                    q as *const f32,
+                    k,
+                    v,
+                    o as *mut f32,
+                    partial as *mut f32,
+                    positions as *const i32,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    pstr,
+                    stream,
+                );
+            } else {
+                launch_gqa_attn_split_f32kv(
+                    q as *const f32,
+                    k,
+                    v,
+                    o as *mut f32,
+                    partial as *mut f32,
+                    positions as *const i32,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    pstr,
+                    stream,
+                );
+            }
         }
     }
 
