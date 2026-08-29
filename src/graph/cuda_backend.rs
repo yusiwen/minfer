@@ -1673,6 +1673,217 @@ mod tests {
     /// The reference dequantizes with the same independent in-test block
     /// layouts as `cuda_kquant_matmul_parity`.
     #[test]
+    fn cuda_q4k_decode_mmvq_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // 8e-reversal: decode (nt == 1) Q4_K dispatches to the MMVQ structure
+        // kernel (q8 activations + dp4a, one 256-thread block per row) when
+        // id >= 2048 && id % 32 == 0. Reference: independent dequant of the
+        // same bytes + the SAME q8 activation quantization the kernel applies
+        // (round-trip error ~2/127 per element), so the tolerance stays tight.
+        let (od, id_, nt) = (5120usize, 3584usize, 1usize); // 7B fused-qkv shape
+                                                            // activations with real-model spread (RMSNorm outputs reach ±4, and
+                                                            // some 32-blocks are near-zero: exercises the f16 d8 denormal range)
+        let mut rng_state = 12345u64;
+        let xs: Vec<f32> = (0..id_ * nt)
+            .map(|_| {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = ((rng_state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0; // [-1, 1)
+                let mag = if (rng_state >> 60) & 7 == 0 {
+                    1e-5
+                } else {
+                    3.0
+                };
+                (u as f32) * mag
+            })
+            .collect();
+
+        fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
+            if j < 4 {
+                (q[j] & 63, q[j + 4] & 63)
+            } else {
+                (
+                    (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                    (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+                )
+            }
+        }
+
+        let mut w4b = Vec::new();
+        let mut w4dq = vec![0f32; od * id_];
+        for r in 0..od {
+            for ib in 0..id_ / 256 {
+                let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
+                let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
+                w4b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                w4b.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                let mut scb = [0u8; 12];
+                for j in 0..12 {
+                    scb[j] = ((r * 31 + j * 17 + ib * 5) % 63) as u8;
+                }
+                w4b.extend_from_slice(&scb);
+                let mut qs = [0u8; 128];
+                for j in 0..128 {
+                    let lo = ((r * 13 + j * 7 + ib * 3) % 15) as u8;
+                    let hi = ((r * 5 + j * 11 + ib * 2) % 15) as u8;
+                    qs[j] = lo | (hi << 4);
+                }
+                w4b.extend_from_slice(&qs);
+                for j in 0..4 {
+                    let (s_lo, m_lo) = k4_scale(&scb, 2 * j);
+                    let (s_hi, m_hi) = k4_scale(&scb, 2 * j + 1);
+                    for l in 0..32 {
+                        let b = qs[j * 32 + l];
+                        let base = r * id_ + ib * 256 + j * 64;
+                        w4dq[base + l] = (b & 0x0F) as f32 * d * s_lo as f32 - dmin * m_lo as f32;
+                        w4dq[base + 32 + l] =
+                            (b >> 4) as f32 * d * s_hi as f32 - dmin * m_hi as f32;
+                    }
+                }
+            }
+        }
+
+        // mirror quantize_q8_0_pad40: per 32-element block, d = amax/127,
+        // payload at byte offset 4 (padded 40B blocks)
+        let mut x8 = vec![0u8; (id_ / 32) * 40];
+        for b in 0..id_ / 32 {
+            let mut am = 0f32;
+            for j in 0..32 {
+                am = am.max(xs[b * 32 + j].abs());
+            }
+            let dd = am / 127.0;
+            let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+            x8[b * 40..b * 40 + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+            for j in 0..32 {
+                let q = (xs[b * 32 + j] * di).round().clamp(-128.0, 127.0) as i8;
+                x8[b * 40 + 4 + j] = q as u8;
+            }
+        }
+        let dq8 = |i: usize| -> f32 {
+            half::f16::from_le_bytes([x8[(i / 32) * 40], x8[(i / 32) * 40 + 1]]).to_f32()
+                * (x8[(i / 32) * 40 + 4 + (i % 32)] as i8) as f32
+        };
+
+        let mut w4t = Tensor::from_data(
+            TensorType::Q4_K,
+            &[id_ as i64, od as i64, 1, 1],
+            w4b.clone(),
+        );
+        w4t.name = "mmw4k".to_string();
+        cb.state.register_weight("mmw4k", &w4b);
+
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+        let m = b.matmul(x, &w4t, None);
+        b.output(m);
+        let g = b.build();
+
+        let xb = cb.alloc_buffer(id_ * nt);
+        cb.write_host(xb, &xs).unwrap();
+        let ob = cb.alloc_buffer(od * nt);
+        cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+        let got = cb.copy_to_host(ob).unwrap();
+
+        let mut want = vec![0f32; od * nt];
+        for t in 0..nt {
+            for r in 0..od {
+                let mut acc = 0f32;
+                for i in 0..id_ {
+                    acc += w4dq[r * id_ + i] * dq8(t * id_ + i);
+                }
+                want[t * od + r] = acc;
+            }
+        }
+        let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+        // q8 activation quantization noise (<= 2/127 per element, random
+        // signs over 2048 elements) lands well under 1e-2 of the row scale.
+        assert_close("q4_k decode mmvq", &got, &want, scale * 1e-2);
+
+        // ── real 7B weights (Q4_K tensors of the decode path) ──
+        // dumped via the ignored `dump_real_q4k_tensor` helper; skipped when
+        // the file is absent so the suite stays hermetic.
+        let real_shapes = [
+            ("real_blk_0_attn_q_weight.bin", 3584usize, 3584usize),
+            ("real_blk_0_attn_k_weight.bin", 3584usize, 512usize),
+            ("real_blk_0_ffn_gate_weight.bin", 3584usize, 18944usize),
+        ];
+        for (file, id2, od2) in real_shapes {
+            let Ok(wb) = std::fs::read(format!("/tmp/minfer_phase7/{file}")) else {
+                break;
+            };
+            assert_eq!(wb.len(), od2 * (id2 / 256) * 144);
+            let mut w2t = Tensor::from_data(
+                TensorType::Q4_K,
+                &[id2 as i64, od2 as i64, 1, 1],
+                wb.clone(),
+            );
+            w2t.name = "realq4k".to_string();
+            cb.state.register_weight("realq4k", &wb);
+            let mut b2 = GraphBuilder::new();
+            let x2 = b2.input("x2", [id2, 1, 1, 1], DType::F32);
+            let m2 = b2.matmul(x2, &w2t, None);
+            b2.output(m2);
+            let g2 = b2.build();
+            let xb2 = cb.alloc_buffer(id2);
+            cb.write_host(xb2, &xs).unwrap();
+            let ob2 = cb.alloc_buffer(od2);
+            cb.execute_node(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
+            let got2 = cb.copy_to_host(ob2).unwrap();
+
+            // CPU reference over the real bytes: dequant (same map as the
+            // parity reference above) + q8-quantized activations
+            let mut want2 = vec![0f32; od2];
+            for r in 0..od2 {
+                let mut acc = 0f32;
+                for ib in 0..id2 / 256 {
+                    let blk = &wb[(r * (id2 / 256) + ib) * 144..];
+                    let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                    let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+                    let mut scb = [0u8; 12];
+                    scb.copy_from_slice(&blk[4..16]);
+                    for j in 0..4 {
+                        let (s_lo, m_lo) = k4_scale(&scb, 2 * j);
+                        let (s_hi, m_hi) = k4_scale(&scb, 2 * j + 1);
+                        for l in 0..32 {
+                            let b8 = blk[16 + j * 32 + l];
+                            let base = ib * 256 + j * 64;
+                            let v_lo = (b8 & 0x0F) as f32 * d * s_lo as f32 - dmin * m_lo as f32;
+                            let v_hi = (b8 >> 4) as f32 * d * s_hi as f32 - dmin * m_hi as f32;
+                            acc += v_lo * dq8(base + l);
+                            acc += v_hi * dq8(base + 32 + l);
+                        }
+                    }
+                }
+                want2[r] = acc;
+            }
+            // activations here only cover id2=3584 — regenerate quantization
+            // for the real id (xs has id_=3584 entries from the scaled-up test)
+            let scale2 = want2.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            let mut worst = (0f32, 0usize);
+            for r in 0..od2 {
+                let e = (got2[r] - want2[r]).abs();
+                if e > worst.0 {
+                    worst = (e, r);
+                }
+            }
+            println!(
+                "real q4_k [{file}]: max err {:.4} at row {} (got {:.4} want {:.4}, scale {scale2:.3})",
+                worst.0, worst.1, got2[worst.1], want2[worst.1]
+            );
+            assert!(
+                worst.0 <= scale2 * 1e-2,
+                "real q4_k mmvq err {} > {}",
+                worst.0,
+                scale2 * 1e-2
+            );
+        }
+    }
+
+    #[test]
     fn cuda_fused_ffn_parity() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");

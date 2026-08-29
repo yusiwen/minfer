@@ -299,6 +299,22 @@ extern "C" {
         pstr: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_quantize_q8_0_pad40(
+        x: *const f32,
+        y: *mut u8,
+        dim: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q4_k_q8_mmvq(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_1_f32_matmul(
         weights: *const u8,
         acts: *const f32,
@@ -457,6 +473,9 @@ pub struct CudaState {
     /// constants so the size is stable — grown during warmup, never inside a
     /// capture window).
     buf_attn_partial: Mutex<(CudaPtr, usize)>,
+    /// 8e-reversal: decode MMVQ q8 activation scratch (nt=1, so id/32 * 40B
+    /// per token — size-stable per graph, grown during warmup runs).
+    buf_q8_decode: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_ba: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
@@ -685,6 +704,7 @@ impl CudaState {
             buf_q8_bn: Mutex::new(dummy),
             buf_q8_prefill: Mutex::new(dummy),
             buf_attn_partial: Mutex::new(dummy),
+            buf_q8_decode: Mutex::new(dummy),
             buf_q8_ba: Mutex::new(dummy),
             buf_positions: Mutex::new(dummy),
             buf_logits: Mutex::new(dummy),
@@ -1418,7 +1438,19 @@ impl CudaState {
             }
             TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
             TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
-            TensorType::Q4_K => launch!(launch_q4_k_f32_matmul),
+            TensorType::Q4_K => {
+                // 8e-reversal: decode (nt == 1) runs the MMVQ structure
+                // (dp4a over q8 activations, one row per 256-thread block) —
+                // +74–77% at 7B shapes (bench8e2); id >= 2048 gate (below
+                // that it is launch-latency noise), id % 32 == 0 for the
+                // sub-block tail granularity. Prefill keeps the f32 kernel.
+                if nt == 1 && id >= 2048 && id % 32 == 0 {
+                    self.q4_k_decode_mmvq(wptr, x, out, od, id, nt);
+                    Ok(())
+                } else {
+                    launch!(launch_q4_k_f32_matmul)
+                }
+            }
             TensorType::Q5_1 => launch!(launch_q5_1_f32_matmul),
             TensorType::Q5_K => {
                 // 8f: partial tail super-blocks are masked at 32-element
@@ -1839,6 +1871,44 @@ impl CudaState {
                     stream,
                 );
             }
+        }
+    }
+
+    /// 8e-reversal: decode (nt == 1) q4_K matmul via the llama.cpp MMVQ
+    /// structure — quantize the activation row to padded 40B q8 blocks in
+    /// `buf_q8_decode`, then run the dp4a one-row-per-block kernel. The
+    /// caller gates on id % 32 == 0 (sub-block granularity) and id >= 2048
+    /// (below that the structure win is launch-latency noise).
+    pub fn q4_k_decode_mmvq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let nb = id / 32;
+        let need = nt * nb * 40;
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        let stream = self.stream();
+        unsafe {
+            launch_quantize_q8_0_pad40(
+                x as *const f32,
+                q8 as *mut u8,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+            launch_q4_k_q8_mmvq(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
         }
     }
 

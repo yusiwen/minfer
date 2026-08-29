@@ -553,6 +553,107 @@ __global__ void q4_k_f32_matmul(
     }
 }
 
+// ─── 8e-reversal: llama.cpp MMVQ structure for DECODE (nt == 1) ───────────
+// The original 8e verdict ("116 GB/s = the platform's streaming limit") was
+// wrong: a plain read-only kernel does 252.7 GB/s on GB10 (93% of the 273
+// GB/s theoretical). The f32-activation kernel achieved only ~46% because it
+// runs 2 warps x 4 rows with each lane serially processing whole 144B blocks
+// (~28K threads in flight at 7B ffn_down) — not enough parallelism to hide
+// LPDDR latency. llama.cpp's mul_mat_vec_q uses ONE output row per block
+// with the row's (block, 32-element sub-block) units spread round-robin over
+// 256 threads (8 warps), int dp4a dots over q8-quantized activations, and a
+// block-wide reduction — ~917K threads in flight at the same shape.
+// Measured (bench8e2, L2-defeated, 7B shapes): 194–207 GB/s vs 112–117,
+// i.e. +74–77% per matmul; at id < 2048 the win collapses to noise
+// (launch-latency bound), so dispatch gates on id >= 2048.
+//
+// Activation layout: padded 40-byte q8_0 blocks — [f16 d][2B pad][32B int8]
+// — so the int8 payload is 4-byte aligned for the uint32/dp4a reads. The
+// scratch (buf_q8_decode) is size-stable per graph (id fixed), grown during
+// the warmup runs, never inside a capture window.
+#define Q8PB 40
+
+__global__ void quantize_q8_0_pad40(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ y,
+    int dim, int nt
+) {
+    int nb = dim / 32;
+    int total = nt * nb;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    int t = tid / nb;
+    int b = tid % nb;
+    const float* src = x + (size_t)t * dim + b * 32;
+    uint8_t* dst = y + ((size_t)t * nb + b) * Q8PB;
+    float am = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) am = fmaxf(am, fabsf(src[j]));
+    float d = am / 127.0f;
+    float di = (d != 0.0f) ? 1.0f / d : 0.0f;
+    *reinterpret_cast<__half*>(dst) = __float2half(d);
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        int q = int(rintf(src[j] * di));
+        q = max(-128, min(127, q));
+        dst[4 + j] = uint8_t(int8_t(q));
+    }
+}
+
+__global__ void __launch_bounds__(256) q4_k_q8_mmvq(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = (id + 255) / 256;
+    const int row_stride = nbe * Q4KB;
+    const int nsub = (id + 31) / 32; // ceil — partial tail super-blocks excluded
+    const uint8_t* x8row = acts8 + (size_t)t * nsub * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 3, sub = u & 7;
+        const uint8_t* blk = weights + (size_t)row * row_stride + blk_i * Q4KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        uint8_t s8, m8;
+        get_scale_min_k4(sub, blk + 4, &s8, &m8);
+        // sub-block nibbles: chunk (sub>>1) of 32B, lo nibbles for even sub,
+        // hi for odd; element l of the sub-block ↔ byte l.
+        const uint32_t* qw = reinterpret_cast<const uint32_t*>(blk + 16 + (sub >> 1) * 32);
+        const bool lo = (sub & 1) == 0;
+        const uint8_t* x8 = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+        int dot = 0, sx = 0;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            const uint32_t w = qw[v];
+            const int n = lo ? (int)(w & 0x0F0F0F0F) : (int)((w >> 4) & 0x0F0F0F0F);
+            const int xa = (int)xw[v]; // q8 block covers exactly this sub-block
+            dot = __dp4a(n, xa, dot);
+            sx  = __dp4a(0x01010101, xa, sx);
+        }
+        // value = d*s*nib − dm*m (dm is the block's own dmin, not d)
+        acc += d8 * ((float)s8 * (float)d * (float)dot - (float)m8 * (float)dm * (float)sx);
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFF, acc, off);
+    __shared__ float warp_sums[8];
+    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) v += warp_sums[k];
+        output[(size_t)t * od + row] = v;
+    }
+}
+
 __global__ void q6_k_f32_matmul(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ acts,
@@ -1821,6 +1922,25 @@ void launch_q4_k_f32_matmul(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q4_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_quantize_q8_0_pad40(
+    const float* x, uint8_t* y, int dim, int nt, cudaStream_t stream
+) {
+    int nb = dim / 32;
+    long long total = (long long)nt * nb;
+    int block = 256;
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    quantize_q8_0_pad40<<<(int)grid, block, 0, stream>>>(x, y, dim, nt);
+}
+
+void launch_q4_k_q8_mmvq(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q4_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
 }
 
 void launch_q5_1_f32_matmul(

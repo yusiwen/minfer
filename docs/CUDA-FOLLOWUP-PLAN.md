@@ -116,29 +116,70 @@ parity vs cpu_gqa_attn 1e-4 (empty + partial splits, both KV layouts); 7B
 E2E @2K decode 10.1 → 13.7 tok/s (+36%), greedy text identical; @440
 neutral (3 pairs within noise). cuda 154/0.
 
-## 8e. MMQ shared-memory tiling for K-quants — **NEGATIVE RESULT 2026-08-29**
+## 8e. MMQ / MMVQ for decode K-quants — **VERDICT REVERSED → DONE 2026-08-29 (re-examined per llama.cpp)**
 
-The premise did not survive measurement. Standalone A/B (`/tmp/minfer_phase7/
-bench8e.cu`, 7e② methodology, L2 DEFEATED by cycling 8× 76 MB weight buffers
-≈ 600 MB working set — without this the bench numbers are L2-inflated):
+**The 2026-08-29 negative result was wrong on both of its load-bearing claims.**
+Re-examination (user request: "8e MMQ tiling 的问题检查一下,参考 llama.cpp 的代码,修复"):
 
-- Current streaming kernel at the 7B FFN shapes: **116 GB/s true streaming**
-  (the 7e② "163 GB/s" figure was L2-resident). Cross-check: 7B decode 26.4
-  tok/s × 4.4 GB/token = 114 GB/s — decode is ALREADY at the achieved
-  streaming bandwidth.
-- Variant A (dp4a over q8_0-quantized activations, aligned 40 B block
-  layout): ≤ +3% at ffn_gu, −12% at ffn_down (quantize pass not amortized at
-  nt=1) — failed the ≥10% gate.
-- Variant B (wide blocks: 128 threads, 8 rows/warp, 32 rows/block for more
-  loads in flight): −6% — occupancy is not the limiter; the DRAM access
-  pattern is.
+1. **"116 GB/s = the platform's streaming limit" was false.** A pure read-only
+   probe (`bwprobe.cu`: grid-stride `__ldcs` uint4 sum over 6×256 MB buffers,
+   5 sweeps) measures the GB10 at **252.7 GB/s** read-only (93% of the 273
+   GB/s theoretical); D2D memcpy 234.9 GB/s (read+write). The old kernel's
+   116 GB/s was its ACHIEVED rate (~46%), not a ceiling — there was ~2.2×
+   headroom. (The final bench8e.cu also never actually timed its dp4a
+   candidate — the table column was "-" while the "failed the gate" claim was
+   already written.)
+2. **The structure, not the access pattern, was the limiter.** The in-tree
+   kernel runs 2 warps × 4 rows per block (~64 threads), each lane serially
+   decoding whole 144 B blocks — only ~28K threads in flight at 7B ffn_down,
+   not enough to hide LPDDR latency. llama.cpp's `mul_mat_vec_q` has an
+   explicit **GB10 parameter table** (`MMVQ_PARAMETERS_GB10`,
+   `GGML_CUDA_CC_DGX_SPARK`): for decode (ncols_dst == 1) it uses ONE output
+   row per block with 8 warps (256 threads, `2× generic` when `halve_iters`),
+   the row's (block, 32-element sub-block) units spread round-robin over the
+   threads, `__dp4a` int dots over q8-quantized activations, and a block-wide
+   reduction — ~917K threads in flight at the same shape.
 
-Conclusion: do NOT wire. The remaining gap to the 273 GB/s marketing number
-is the LPDDR5X streaming ceiling (llama.cpp-class access patterns or
-cp.async.bulk/TMA would be needed to verify); kernel-side tiling does not
-move it. Decode-side bandwidth work is closed unless a fundamentally
-different weight layout (e.g. interleaved tiles) is measured to stream
-faster.
+**Fix (ported in-tree, q4_K first):**
+- `quantize_q8_0_pad40` — per-token activation quantization into padded 40 B
+  blocks ([f16 d][2B pad][32B int8]) so the int8 payload is 4-byte aligned
+  for the dp4a reads (the 8e lesson: the unpadded 34 B layout misaligns).
+  Scratch: `buf_q8_decode` (nt=1, size-stable per graph, grown during the
+  eager warmup runs — capture-safe like `buf_attn_partial`).
+- `q4_k_q8_mmvq` — one row per block, 256 threads, units `u = (blk, sub)`,
+  per-unit 8×`__dp4a` (dot + Σx for the m-term), value =
+  `d8·(s8·d·dot − m8·dm·sx)` (note dm, not d — first draft folded the m-term
+  under `d`; caught by the parity test). Sub-block nibble map matches the
+  in-tree/llama.cpp q4_K packing: chunk (sub>>1), lo nibbles for even sub,
+  hi for odd, element l ↔ byte l. Partial last super-blocks are excluded by
+  `nsub = ceil(id/32)` units (same granularity as the q5_K kernel).
+- Dispatch: `matmul_f32_ptr_layout`, Q4_K arm — `nt == 1 && id >= 2048 &&
+  id % 32 == 0` → mmvq (below id 2048 the win collapses to launch-latency
+  noise: 0.5B attn shape measured +2.3%); everything else keeps the f32
+  kernel. Prefill (nt > 1) unchanged.
+
+**Measured (bench8e2.cu, L2-defeated 8-buffer cycling, 7B shapes):**
+
+| shape | old kernel | mmvq | Δ |
+|---|---|---|---|
+| ffn_gu (od 37888 × id 3584) | 0.660 ms = 116 GB/s | 0.373 ms = 205 GB/s | **+77%** |
+| ffn_down (od 3584 × id 18944) | 0.338 ms = 113 GB/s | 0.193 ms = 198 GB/s | **+75%** |
+| 0.5B attn (896²) | 0.0062 ms | 0.0061 ms | +2.3% (gate excludes) |
+
+**Gates:** parity test `cuda_q4k_decode_mmvq_parity` (od 5120 / id 3584 with
+real-magnitude activations incl. near-zero blocks; plus REAL 7B q4_K_M
+weights — blk.0 attn_q [3584²], attn_k [3584×512], ffn_gate [3584×18944] —
+all bit-exact vs the independent dequant+q8 reference); 7B q4_k_m E2E @2K
+greedy text identical to HEAD-base, decode **23.4 → 32.0 tok/s (+37%)**,
+200-token × 3 runs each side; 0.5B q5_k_m / Qwen3-0.6B Q8_0 / 7B @440
+regressions clean; cuda suite 156/0.
+
+Follow-up candidate (not started): the same structure for **q6_K and q5_K**
+decode (llama.cpp's GB10 table covers both; in-tree 8d attention is decode-
+only already). The 8e "decode-side bandwidth work is closed" sentence above
+is withdrawn — the correct statement is: the f32-activation streaming kernel
+structure was the bottleneck; q8+dp4a MMVQ reaches ~200 GB/s of the 252.7
+GB/s probe ceiling at the 7B shapes.
 
 ## 8f. Q5_K kernels — **DONE 2026-08-29 (`b959ec9`, Q5_K + Q5_1)**
 
@@ -224,5 +265,6 @@ The 8g① decode-only capture gate ships together with 8a.
 
 Rationale: 8a is correctness debt from Phase 7 itself; 8b is the largest
 decode lever with a proven Metal precedent; 8c is a promise to close with a
-measure-first gate; 8d/8e chase the remaining 40% bandwidth/overhead headroom
-on 7B; 8f widens model coverage; 8g/8h are polish.
+measure-first gate; 8d/8e chased the bandwidth/overhead headroom on 7B (8e
+re-examined 2026-08-29 and reversed into the MMVQ decode win, see above); 8f
+widens model coverage; 8g/8h are polish.

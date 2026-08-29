@@ -1922,6 +1922,64 @@ mod tail_tests {
     /// Device-level: on a CUDA build the engine routes through the CUDA
     /// backend (model-load guard keeps the gate stable).
     #[test]
+    #[ignore] // run explicitly: cargo test --release --features cuda dump_real_q4k_tensor -- --ignored --nocapture
+    fn dump_real_q4k_tensor() {
+        // 7B q4_k_m (Q4_K weights at 7B dims) — debug helper, ignored by default
+        let path = std::path::PathBuf::from(
+            "~/.cache/minfer/models/hf/Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+        );
+        let path = shellexpand_tilde(&path);
+        let gguf = crate::gguf::load_gguf_model(&path).unwrap();
+        let names = [
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.1.ffn_down.weight",
+            "lm_head.weight",
+        ];
+        let mut spec = String::new();
+        for name in names {
+            // find the tensor info across parts, then slice the part's mmap
+            let mut found = None;
+            for part in &gguf.parts {
+                if let Some(info) = part.ctx.info.iter().find(|i| i.name == name) {
+                    let start = part.ctx.offset + info.offset as usize;
+                    let n = info.ne.iter().product::<i64>();
+                    let bytes =
+                        info.type_.type_size() * n as usize / info.type_.blck_size() as usize;
+                    found = Some((info.type_, info.ne, &part.data[start..start + bytes]));
+                    break;
+                }
+            }
+            match found {
+                Some((ty, ne, data)) => {
+                    let out = format!("/tmp/minfer_phase7/real_{}.bin", name.replace('.', "_"));
+                    std::fs::write(&out, data).unwrap();
+                    spec.push_str(&format!(
+                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {out}\n",
+                        data.len()
+                    ));
+                }
+                None => spec.push_str(&format!("{name}: MISSING\n")),
+            }
+        }
+        println!("{}", spec);
+    }
+
+    fn shellexpand_tilde(p: &std::path::Path) -> std::path::PathBuf {
+        let s = p.to_str().unwrap();
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return std::path::PathBuf::from(home).join(rest);
+            }
+        }
+        p.to_path_buf()
+    }
+
+    #[test]
     fn cuda_conversation_multiturn_reuse() {
         #[cfg(feature = "cuda")]
         {
