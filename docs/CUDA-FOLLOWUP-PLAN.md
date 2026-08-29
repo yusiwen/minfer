@@ -47,6 +47,22 @@ f16 for the 7B class — that asymmetry is 8b below.
 
 Gate: all existing suites stay green; new gates pass.
 
+**Batch-1 outcome (2026-08-29, commits `789e64b`→`b849601`):**
+- 8a③ DONE — `fuse_flags_are_part_of_the_reuse_identity` asserts both flip
+  directions through `GraphCache::try_reuse`.
+- 8g① DONE — `ComputeGraph::capture_nt_hint()` + decode-only capture gate
+  in `graph_replay_step`; `cuda_prefill_shaped_graph_never_captures` runs a
+  prefill-shaped (nt=8) graph 4× and asserts zero captures.
+- 8a② DONE — and it caught a real CPU bug: `vec_ops::mat_mul_f32` wrote
+  token-TRANSPOSED output for nt > 1 (decode nt==1 was accidentally
+  correct, hiding it forever; no F32-weight model existed). Verified with a
+  byte-exact GGUF→F32 converter (numpy): qwen2.5-0.5B-F32 produced garbage
+  on CPU while the same weights kept as Q4_0 ran fine; after the fix, both
+  F32 models (0.5B + qwen3-0.6B) produce the identical greedy text on CPU
+  and CUDA. Regression test: `f32_matmul_nt2_token_major`.
+- 8a① BLOCKED on hardware — no macOS machine in this environment; the
+  loader gate + fuse_ffn decoupling remain pending a Mac regression run.
+
 ## 8b. KV f16 on CUDA (decode lever, long-context)
 
 CUDA KV is f32-only. Metal's policy (`set_kv_cache_type`): f16 when
