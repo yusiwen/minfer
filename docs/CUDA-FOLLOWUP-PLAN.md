@@ -118,12 +118,21 @@ cheap after Q5_K.
 Gate: standalone A/B + parity test mirroring `cuda_kquant_matmul_parity`;
 `qwen2.5-0.5b-instruct-q5_k_m` E2E (the negative-test model from 7c).
 
-## 8g. CUDA Graphs for prefill
+## 8g. Prefill capture: gate the accidental path, then productize
 
-Decode splits are captured (7d, +18% 0.5B); prefill still launches ~437
-nodes directly. Capture win is smaller (launch overhead amortized over big
-kernels) but the graph is static per (n_tokens, params). Do after 8c/8d —
-allocator churn at prefill sizes makes capture windows more fragile.
+Two findings from the Phase 8 completeness audit (2026-08-29):
+
+1. **Immediate hygiene (ships with 8a):** `graph_replay_step` has NO nt
+   gate — the scheduler runs the 3-run capture protocol for EVERY CUDA
+   split, so a repeated identical-nt prefill (server/slot scenario) would
+   silently start capturing a ~437-node graph. Correctness is plausible
+   (positions are out-of-window input fills, prefill is single-split since
+   7e③, pool churn forces recapture) but untested and benefit-free. Add an
+   explicit decode-only capture gate, or a test that turns prefill capture
+   into a deliberate feature.
+2. **Productization:** capture prefill splits deliberately — after 8c/8d
+   (allocator churn at prefill sizes makes capture windows more fragile;
+   the launch-overhead win is smaller since big kernels amortize it).
 
 Gate: replay bit-parity harness like 7d's, at pp16 + pp300.
 
@@ -132,14 +141,38 @@ Gate: replay bit-parity harness like 7d's, at pp16 + pp300.
 1. **Stale docs**: `CUDA_OPTIMIZATION.md` / `CUDA_PROBLEMS.md` describe the
    pre-Phase-7 imperative path (`layer_gpu`, deleted `forward.rs`) — mark
    superseded with a pointer to CUDA-BACKEND-PLAN (their surviving ideas are
-   absorbed here: cuBLAS → 8i, MMQ tiling → 8e, GPU quantize → 8c).
+   absorbed here: cuBLAS → 8k, MMQ tiling → 8e, GPU quantize → 8c).
 2. **Optional CUDA CI runner** — device-gated tests skip gracefully today;
    a self-hosted GB10 runner would keep the 144-test suite honest on every
    commit.
 3. **Temp files**: the Phase-7 ledger (`/tmp/minfer_phase7/TEMPS.md`) is
    closed; cleanup still awaits the user's decision (no auto-delete).
 
-## 8i. Explicitly not planned (revisit only with a concrete need)
+## 8i. Graph integration test debts (CUDA)
+
+Coverage gaps found in the Phase 8 completeness audit (2026-08-29):
+
+1. **Multi-split capture** — per-split capture is supported but the
+   bit-parity tests only cover single-split graphs (7e③ made every current
+   decode graph single-split; no live exposure today).
+2. **Multi-turn conversation on CUDA** — decode graphs are
+   n_past-independent, so cross-turn reuse should work structurally, but
+   the conversation path (new prefill graph per turn + reused decode graph)
+   has no device-level test.
+3. **OpenAI server slot loop on CUDA** — the slot's prefill→decode switches
+   hit the same GraphCache; no device-level coverage.
+
+Gate: each as a `#[cfg(test)]` device test mirroring the 7d parity harness,
+skipping gracefully without a device.
+
+## 8j. cudaGraphExecUpdate (optional)
+
+Parametric exec update instead of full recapture on pool_gen change. Not
+worth it today: capture is ms-scale, recapture is rare (pool_gen is stable
+across decode steps), and llama.cpp does not use it either. Revisit only if
+recapture shows up in a profile.
+
+## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,
 multi-GPU + peer copies, `graph_optimize`-style node reordering, Windows,
@@ -147,7 +180,8 @@ IQ/Q2/Q3 quant families.
 
 ## Priority order
 
-**8a → 8b → 8c → 8d → 8e → 8f → 8g → 8h** (8i stays closed).
+**8a → 8b → 8c → 8d → 8e → 8f → 8i → 8g → 8h → 8j** (8k stays closed).
+The 8g① decode-only capture gate ships together with 8a.
 
 Rationale: 8a is correctness debt from Phase 7 itself; 8b is the largest
 decode lever with a proven Metal precedent; 8c is a promise to close with a
