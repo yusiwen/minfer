@@ -95,20 +95,26 @@ Negative result recorded for the record: the unshaped wire the 7e⑥ bullet
 imagined would have REGRESSED 7B-class Q4_0 ffn_down by ~60%. The shape
 gate is load-bearing.
 
-## 8d. Attention kernel (remaining decode overhead)
+## 8d. Attention kernel — **DONE 2026-08-29 (`a5af60f`, split-K flash-decoding)**
 
-Attention on CUDA is a hand-rolled f32 path (GQA, kv f32). At short ctx the
-weight reads dominate, but attention grows O(ctx) per token while the
-quant-matmul kernels now run at ~163 GB/s on FFN shapes.
+nsys capture now works (the 7e② "no kernel data" issue was the report
+workflow, not the config): `nsys profile --trace=cuda` + `nsys stats` /
+sqlite over `CUPTI_ACTIVITY_KIND_KERNEL`, decode step isolated by gap
+segmentation. Result at 7B @2K decode: gqa_attn 48.3% of the step,
+q4_k matmul 36.4%, q6_k 13.9% — the single-warp-per-(token, head) kernel
+ran 28 warps total (GPU idle) and streamed 2K KV rows serially at
+~3 GB/s effective.
 
-- Profile first with nsys (the 7e② profiles captured no kernel data — fix
-  the capture config or use CUPTI) to get the per-kernel decode split.
-- Candidates: fused GQA attention (one kernel for scores+softmax+AV) and/or
-  flash-style prefill attention; pair with 8b (f16 KV reads).
-- The old `gqa_attn_f32` kernel (pre-Phase-7) may be a starting point.
+Fix: split-K flash-decoding — pass 1 scans SPLITS=8 KV chunks in parallel
+(FIXED grid × nh blocks, ranges derived from device-side positions → CUDA
+Graph capture stays valid), pass 2 merges (mx, S, oc) partials. Size-stable
+state scratch, grown during warmup only. Template over the KV element type
+(f16 + f32 layouts). Dispatch nt == 1 only.
 
-Gate: node-level parity vs the current path (tolerance class per GPU_SAFETY);
-7B decode A/B at ctx 440 and 2K.
+Gates: standalone A/B nkv 440 +49% / 2000 +64% / 8000 +80% (maxdiff 1e-8);
+parity vs cpu_gqa_attn 1e-4 (empty + partial splits, both KV layouts); 7B
+E2E @2K decode 10.1 → 13.7 tok/s (+36%), greedy text identical; @440
+neutral (3 pairs within noise). cuda 154/0.
 
 ## 8e. MMQ shared-memory tiling for K-quants — **NEGATIVE RESULT 2026-08-29**
 
