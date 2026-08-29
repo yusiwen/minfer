@@ -200,7 +200,8 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
 | **CUDA graph backend plan + implementation record (Phase 7a–7e complete: per-op dispatch, capture/replay, K-quant vectorization, F32 matmul, FusedFFN, pinned staging)** | `docs/CUDA-BACKEND-PLAN.md` |
-| CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
+| **CUDA follow-up plan (Phase 8: correctness debts, KV f16, prefill Q8_0 GEMM, attention, MMQ tiling, Q5_K, prefill graphs)** | `docs/CUDA-FOLLOWUP-PLAN.md` |
+| CUDA backend (draft) / problems — **superseded by the two plans above (pre-Phase-7 imperative path)** | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
 | Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
 | KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
 | Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |

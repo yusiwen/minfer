@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-08-29)**: this doc describes the pre-Phase-7 imperative
+> CUDA path (`layer_gpu`, the deleted `forward.rs`). The current record is
+> `docs/CUDA-BACKEND-PLAN.md` (Phase 7a–7e, complete) and forward work lives
+> in `docs/CUDA-FOLLOWUP-PLAN.md` (Phase 8). Kept for history.
+>
 # CUDA 推理路径问题分析
 
 ## 修复日志
