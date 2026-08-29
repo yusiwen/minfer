@@ -579,14 +579,14 @@ impl Qwen3Graph {
                             | TensorType::Q4_1
                             | TensorType::Q4_K
                             | TensorType::Q6_K
-                    ) && cuda.has_weight(&t.name)
+                    ) && cuda.has_weight_of_size(&t.name, t.data().len())
                 }
                 None => true,
             }
         }
         fn registered(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
-                Some(t) => cuda.has_weight(&t.name),
+                Some(t) => cuda.has_weight_of_size(&t.name, t.data().len()),
                 None => true,
             }
         }
@@ -695,6 +695,9 @@ mod tests {
             eprintln!("Qwen3-0.6B q8_0 not cached; skipping");
             return;
         };
+        // Keep the weight registry stable for this whole test (see qwen2 tests).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let n_ctx = q3.hparams.max_seq_len as usize;
         let nt = ids.len();
 
@@ -726,6 +729,9 @@ mod tests {
             eprintln!("Qwen3-0.6B q8_0 not cached; skipping");
             return;
         };
+        // Keep the weight registry stable for this whole test (see qwen2 tests).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let nt = ids.len();
         let n_ctx = q3.hparams.max_seq_len as usize;
 

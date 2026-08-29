@@ -11,7 +11,8 @@
 use crate::block::Q8B;
 use crate::tensor::{Tensor, TensorType};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Wrapper to make `*mut c_void` Send+Sync for use in Mutex.
 #[derive(Clone, Copy)]
@@ -245,9 +246,68 @@ extern "C" {
 
 static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
 
+/// A small per-thread reentrant lock guarding model weight registration.
+///
+/// std's `Mutex` is not reentrant, but the natural usage nests: a test holds
+/// the lock across several forwards while `load_model` (called inside) takes
+/// it again to register weights. This guard tracks the owning thread plus a
+/// depth counter — recursive acquisition on the same thread is free; other
+/// threads block until the outermost guard drops.
+pub struct ModelLoadGuard {
+    _inner: Option<MutexGuard<'static, ()>>,
+}
+
+static MODEL_LOAD_MUTEX: Mutex<()> = Mutex::new(());
+static MODEL_LOAD_OWNER: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static MODEL_LOAD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl ModelLoadGuard {
+    fn acquire() -> Self {
+        let tid = std::thread::current().id();
+        // ThreadId is opaque; use its Debug value as a stable discriminator
+        // for the owner slot (collision-free within a process).
+        let tid_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            tid.hash(&mut h);
+            h.finish()
+        };
+        let depth = MODEL_LOAD_DEPTH.with(|d| d.get());
+        if depth > 0 && MODEL_LOAD_OWNER.load(Ordering::Acquire) == tid_hash {
+            MODEL_LOAD_DEPTH.with(|d| d.set(depth + 1));
+            return ModelLoadGuard { _inner: None };
+        }
+        // Poison-immune: a panicking holder (test assertion) must not wedge
+        // every later loader — the registry has no inconsistent state to
+        // recover from (entries are atomically replaced).
+        let inner = MODEL_LOAD_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        MODEL_LOAD_OWNER.store(tid_hash, Ordering::Release);
+        MODEL_LOAD_DEPTH.with(|d| d.set(1));
+        ModelLoadGuard {
+            _inner: Some(inner),
+        }
+    }
+}
+
+impl Drop for ModelLoadGuard {
+    fn drop(&mut self) {
+        let depth = MODEL_LOAD_DEPTH.with(|d| d.get());
+        if depth > 1 {
+            MODEL_LOAD_DEPTH.with(|d| d.set(depth - 1));
+            return;
+        }
+        if depth == 1 {
+            MODEL_LOAD_OWNER.store(0, Ordering::Release);
+            MODEL_LOAD_DEPTH.with(|d| d.set(0));
+        }
+    }
+}
+
 pub struct CudaState {
     stream: Mutex<CudaPtr>,
-    weights: Mutex<HashMap<String, CudaPtr>>,
+    weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
     // Persistent activation buffers (grown on demand) with size tracking
     buf_hidden: Mutex<(CudaPtr, usize)>,
     buf_bn: Mutex<(CudaPtr, usize)>,
@@ -267,6 +327,13 @@ pub struct CudaState {
     kv_size: Mutex<Vec<usize>>,
     // CUDA Graph for decode step (capture once, replay for each token)
     decode_graph_exec: Mutex<CudaPtr>,
+    /// Process-wide stream serialization for the graph-path backend (Phase
+    /// 7d): stream capture is per-stream, so while one backend holds an open
+    /// capture window, every OTHER backend's stream work (fills, copies,
+    /// launches, allocs) must block instead of being recorded into that
+    /// graph. The capturing backend holds this lock across its window; its
+    /// own enqueues skip re-locking (they are the recorded work).
+    stream_lock: Mutex<()>,
 }
 
 impl CudaState {
@@ -400,6 +467,7 @@ impl CudaState {
             kv_v: Mutex::new(Vec::new()),
             kv_size: Mutex::new(Vec::new()),
             decode_graph_exec: Mutex::new(CudaPtr(std::ptr::null_mut())),
+            stream_lock: Mutex::new(()),
         })
     }
 
@@ -426,6 +494,23 @@ impl CudaState {
     pub fn register_weight(&self, name: &str, data: &[u8]) {
         if data.is_empty() {
             return;
+        }
+        {
+            let mut w = self.weights.lock().unwrap();
+            if let Some((_, size)) = w.get(name) {
+                if *size == data.len() {
+                    // Device weights are immutable: same name + size ⇒ the
+                    // same GGUF tensor (single-model-per-process today, and
+                    // unit tests reload the same file). Reuse the existing
+                    // device copy instead of leaking one buffer per load.
+                    return;
+                }
+                // Different size (a different architecture registered the
+                // same tensor name): replace the entry. The stale buffer is
+                // deliberately NOT freed — a live captured graph may still
+                // reference it; the leak is bounded by the number of
+                // distinct (arch, tensor) shapes ever loaded.
+            }
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
@@ -455,11 +540,32 @@ impl CudaState {
         self.weights
             .lock()
             .unwrap()
-            .insert(name.to_string(), CudaPtr(ptr));
+            .insert(name.to_string(), (CudaPtr(ptr), data.len()));
     }
 
     pub fn get_weight_ptr(&self, name: &str) -> Option<*mut std::ffi::c_void> {
-        self.weights.lock().unwrap().get(name).map(|cp| cp.0)
+        self.weights.lock().unwrap().get(name).map(|(cp, _)| cp.0)
+    }
+
+    /// Process-wide model-load serialization: loaders hold this while
+    /// registering weights, so two models with same-named tensors (qwen2 0.5B
+    /// vs qwen3 0.6B in parallel tests) cannot interleave their registrations.
+    /// The graph-path tests that span multiple forwards hold it for their body
+    /// to keep the weight registry stable underneath them. REENTRANT per
+    /// thread: `load_model` takes it inside callers that already hold it.
+    pub fn model_load_guard() -> ModelLoadGuard {
+        ModelLoadGuard::acquire()
+    }
+
+    /// Size-aware registry check for the graph-path gate: a same-name entry
+    /// with a DIFFERENT byte size belongs to another architecture's model and
+    /// must read as "not registered" so that model cleanly falls back to CPU.
+    pub fn has_weight_of_size(&self, name: &str, bytes: usize) -> bool {
+        self.weights
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|(_, size)| *size == bytes)
     }
 
     pub fn stream(&self) -> *mut std::ffi::c_void {
@@ -568,13 +674,24 @@ impl CudaState {
         size: usize,
     ) {
         unsafe {
-            cudaMemcpy(
+            // Stream-ordered (not the legacy-sync cudaMemcpy): capturable
+            // inside a CUDA Graph capture window and race-free with replay.
+            cudaMemcpyAsync(
                 dst as *mut std::ffi::c_void,
                 src,
                 size,
                 CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                self.stream(),
             );
         }
+    }
+
+    /// Process-wide stream serialization handle (see the field docs). The
+    /// returned reference is `&'static` at every call site because `CudaState`
+    /// itself is only ever built as `&'static` (Box::leak in `get`), so the
+    /// elided lifetime there is `'static` — guards may be stored.
+    pub fn stream_lock(&self) -> &Mutex<()> {
+        &self.stream_lock
     }
 
     pub fn sync(&self) {
@@ -773,6 +890,70 @@ impl CudaState {
             cudaGraphDestroy(graph);
         }
         *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
+    }
+
+    /// Close a capture window and return the instantiated exec handle (null
+    /// on failure, after clearing the CUDA error state). Used by the
+    /// graph-path backend, which owns per-(uid, range) exec storage; the
+    /// legacy `graph_end_capture` single-slot flow is unchanged.
+    pub fn graph_end_capture_to_exec(&self) -> *mut std::ffi::c_void {
+        let stream = self.stream();
+
+        let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
+        if err != 0 || graph.is_null() {
+            if err != 0 {
+                unsafe {
+                    cudaGetLastError();
+                }
+            }
+            eprintln!("CUDA: stream capture end failed (err {err})");
+            return std::ptr::null_mut();
+        }
+
+        let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe {
+            cudaGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        unsafe {
+            cudaGraphDestroy(graph);
+        }
+        if err != 0 || exec.is_null() {
+            eprintln!("CUDA: graph instantiate failed (err {err})");
+            return std::ptr::null_mut();
+        }
+        exec
+    }
+
+    /// Free an instantiated graph exec (Phase 7d cache invalidation).
+    pub fn graph_destroy(&self, exec: *mut std::ffi::c_void) {
+        if !exec.is_null() {
+            unsafe {
+                cudaGraphDestroy(exec);
+            }
+        }
+    }
+
+    /// Launch an arbitrary instantiated graph exec on the backend stream.
+    pub fn graph_launch_exec(&self, exec: *mut std::ffi::c_void) -> bool {
+        if exec.is_null() {
+            return false;
+        }
+        let stream = self.stream();
+        let err = unsafe { cudaGraphLaunch(exec, stream) };
+        if err != 0 {
+            unsafe {
+                cudaGetLastError();
+            }
+            return false;
+        }
+        true
     }
 
     pub fn graph_launch(&self) -> bool {

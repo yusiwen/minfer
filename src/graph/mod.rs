@@ -109,7 +109,8 @@ pub struct ComputeGraph {
     pub inputs: Vec<NodeId>,
     pub outputs: Vec<NodeId>,
     /// Graph identifier for reuse detection (CUDA Graph caching etc.).
-    #[allow(dead_code)]
+    /// Populated by `GraphCache::replace_graph` (monotonic per process);
+    /// a reused graph keeps its uid.
     pub uid: u64,
 }
 

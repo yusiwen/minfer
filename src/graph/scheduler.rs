@@ -180,6 +180,30 @@ impl BackendScheduler {
                     }
                 }
             }
+            // CUDA Graph replay (Phase 7d): a captured split replays its whole
+            // node loop as one launch. Disabled under MINFER_TRACE/--viz
+            // capture (per-node host readbacks inside a capture window are
+            // illegal — they would corrupt the recorded graph).
+            #[cfg(feature = "cuda")]
+            let replayed = if capture {
+                false
+            } else {
+                match split.backend {
+                    BackendTag::Cuda => {
+                        let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
+                        c.graph_replay(graph.uid, split.node_range)
+                    }
+                    _ => false,
+                }
+            };
+            #[cfg(not(feature = "cuda"))]
+            let replayed = false;
+            if replayed {
+                // the captured launch covers every node of this split (the
+                // boundary sync of the NEXT split still closes it out)
+                prev_backend = Some(split.backend);
+                continue;
+            }
             for id in split.node_range.0..split.node_range.1 {
                 let node = graph.node(id);
                 if capture && node.is_input() {

@@ -206,46 +206,81 @@ builder never emits fused decode nodes for CUDA (`qwen2/graph.rs:230-267`).
    sync or read back — `debug_sync` (`cuda.rs:545`) and the Attn readback get a
    `capturing` guard; all launch args must be device-resident data.
 
-### 4.8 CUDA Graph capture / replay (phase 7d)
+### 4.8 CUDA Graph capture / replay (phase 7d — IMPLEMENTED, commit 7d)
 
-llama.cpp's state machine, adapted:
+llama.cpp's state machine, adapted (✅ = as designed; ⚠ = implementation note):
 
-- **Key**: `(graph.uid, node_range, pool_gen)` per captured CUDA split.
-  `ComputeGraph.uid` (`graph/mod.rs:109-111`) gets populated in `GraphCache`:
-  monotonic counter assigned when a *new* graph is built; reuse keeps it (same
-  semantics as llama.cpp's `ggml_graph_next_uid`, `ggml.c:56-68`).
-  `pool_gen` plays the role of llama.cpp's node-props memcmp: if any pool
-  (re)allocation happened since capture, pointers may differ → re-capture.
-  (llama.cpp compares full src-pointer snapshots; minfer's allocator gives the
-  same guarantee more cheaply because buffers are never freed between steps.)
-- **Warmup ×2**: first two executions of a `(uid, range)` run direct launches;
-  capture arms only after two consecutive unchanged executions (llama.cpp
-  `ggml-cuda.cu:4267-4286`). This naturally skips one-shot prefill graphs.
-- **Capture**: `cudaStreamBeginCapture(mode ThreadLocal)` around the split's
-  node loop (`graph_begin_capture`, `cuda.rs:679`), `EndCapture` +
-  `cudaGraphInstantiate` (`graph_end_capture`, `cuda.rs:692`).
-- **Replay**: subsequent executions with the same key call
-  `cudaGraphLaunch` (`graph_launch`, `cuda.rs:729`) instead of the node loop;
-  input buffers were H2D-filled *before* the split at the same stable
-  addresses, so replay reads fresh data — the exact invariant llama.cpp relies
-  on (`ggml-cuda.cu:2618-2621`).
-- **Trait hooks** (additive, default no-op — CPU/Metal untouched):
-  `fn graph_replay(&mut self, uid: u64, range: (usize, usize)) -> bool { false }`
-  — scheduler calls it before the node loop of a CUDA split and skips the loop
-  on `true`; capture begin/end stay internal to the backend (driven by
-  uid+range+pool_gen bookkeeping in `execute_node`/`synchronize`).
-- **Prerequisite kernel change**: `gqa_attn_f32` takes `nk` as a *host* scalar
-  (`cuda.rs:1005`) — a baked scalar makes replay compute a stale attention
-  window as KV grows. Change the kernel to derive the per-row KV bound from the
-  device-side `positions` buffer (`bound = pos[row]+1`), drop the host `nk`
-  arg, and the v1 positions readback disappears with it. RoPE/store_kv already
-  read positions on device — no other host scalars are baked. Verified against
-  non-replayed execution bit-for-bit.
-- **Failure policy** (deliberate deviation from llama.cpp's `CUDA_CHECK`
-  abort, `common.cuh:183-191`): capture/instantiate failure logs a warning and
-  disables graphs for the session (`graphs_disabled`), inference continues with
-  direct launches. Env `MINFER_NO_CUDA_GRAPH=1` forces off. Semantics are
-  identical either way — only speed differs — so fallback is safe.
+- ✅ **Key**: `(graph.uid, node_range, pool_gen)` per captured CUDA split.
+  `ComputeGraph.uid` is populated in `GraphCache::replace_graph` (monotonic
+  counter starting at 1; reuse keeps it — llama.cpp `ggml_graph_next_uid`
+  semantics, `ggml.c:56-68`).
+  `pool_gen` plays the role of llama.cpp's node-props memcmp: any pool
+  (re)allocation invalidates the stored exec (checked lazily at replay time,
+  before a stale exec could ever launch; pointers never move, so this is
+  conservative).
+- ✅ **Warmup ×2**: executions 1-2 of a `(uid, range)` run direct launches;
+  the 3rd opens the capture window (llama.cpp `ggml-cuda.cu:4267-4286`).
+  One-shot prefill graphs never reach capture — zero overhead there.
+- ✅ **Capture**: `cudaStreamBeginCapture(ThreadLocal)` around the split's
+  node loop; `EndCapture` + `cudaGraphInstantiate` at the split's
+  `synchronize` (the window must close before the next split's host I/O).
+  The captured launches do not execute during capture, so the backend
+  **launches the instantiated graph once at close** — the capture run itself
+  produces its outputs.
+- ✅ **Replay**: subsequent executions with the same key call
+  `cudaGraphLaunch` instead of the node loop; input staging buffers were
+  H2D-filled before the split at stable addresses (`copy_across` rewrites
+  them per step), so replay reads fresh data (`ggml-cuda.cu:2618-2621`).
+- ✅ **Trait hook** (additive, default no-op — CPU/Metal untouched):
+  `fn graph_replay(&mut self, uid: u64, range: (usize, usize)) -> bool`;
+  the scheduler skips the CUDA split's node loop on `true`. ⚠ Replay is
+  force-disabled while `MINFER_TRACE`/`--viz` capture is active (per-node
+  host readbacks inside a capture window are illegal — they would corrupt
+  the recorded graph).
+- ✅ **Prerequisite kernel change: already in place.** `gqa_attn_f32` derives
+  the per-token KV bound from the device-side `positions` buffer
+  (`nkv = positions[t] + 1`); its `nk` parameter is the KV-head count (a
+  stride), not the window — no host scalar is baked, and the v1 positions
+  readback never existed in the graph path.
+- ✅/⚠ **Failure policy**: `MINFER_NO_CUDA_GRAPH=1` forces off at backend
+  construction; a begin-capture or replay-launch failure logs a warning and
+  disables graphs for the session (inference continues with direct
+  launches). ⚠ Deviation for end/instantiate failure: the recorded launches
+  never executed, so that step's split cannot produce output — the backend
+  logs loudly, disables graphs, and the step's outputs are undefined
+  (effectively unreachable: the window contains only kernels + async D2D;
+  host syncs and readbacks are outside it). Accepted rather than inventing
+  a silent re-execution path.
+
+Implementation notes (what the parallel test suite forced into existence):
+
+- **Process-wide stream lock** (`CudaState::stream_lock`): stream capture is
+  **per-stream, not per-thread** — while one backend holds an open window,
+  any other thread's enqueues to the shared stream (fills, copies, launches,
+  even another test's `execute`) would be recorded into that graph. The
+  capturing backend holds the lock across its whole window (stored
+  `MutexGuard`); its own enqueues skip re-locking; every other stream-touch
+  (`execute_node`, `write_host`, `copy_to_host`, allocs/frees, plain sync)
+  takes it per call. Production runs one engine thread — uncontended.
+- **Weight-registry hardening** (`register_weight`): same name + size ⇒
+  reuse the existing device copy (unit tests reload the same GGUF and were
+  leaking a full device model per load — 100+ OOM aborts when the parallel
+  suite finally exercised registration everywhere); different size ⇒ replace
+  but never free (a live captured graph may still reference it; the leak is
+  bounded by distinct shapes). The gate (`weights_on_cuda`) is size-aware, so
+  a foreign-architecture entry reads as "not registered" and that model
+  cleanly stays on CPU.
+- **`ModelLoadGuard`** (reentrant, process-wide): loaders hold it while
+  registering; real-model graph tests hold it across their forwards. Without
+  it, a parallel load of another architecture lands mid-test and flips the
+  CUDA gate between forwards — mixing CPU-allocated persistent KV regions
+  with CUDA assignment (`node buffer on CPU but executing split is Cuda`).
+  Pre-7d the parallel suite was green only because the init race made most
+  test loads skip device registration entirely.
+- **Capture-safe D2D**: `copy_device_to_device` switched from legacy-sync
+  `cudaMemcpy` (illegal inside a window) to `cudaMemcpyAsync` — a landmine
+  no current graph hits (View/Reshape/Permute + aliased in-place ops), but
+  one code path away.
 
 ### 4.9 GPU safety (CUDA edition)
 
@@ -334,7 +369,7 @@ flag).
 | 7a | alloc/copy roundtrip + copy_across tests pass (feature build); plain build untouched, zero nvcc |
 | 7b | all per-op parity tests; 0.5B Q4_0 full-model: CUDA greedy text == CPU greedy text |
 | 7c | 3-model E2E table (0.5B/0.6B/7B) with tok/s; disable-env negatives; graph reuse across decode steps (params-only, no rebuild) |
-| 7d | replay bit-parity; re-capture on rebuild; 200-token generation; graph-off A/B identical text |
+| 7d | ✅ replay bit-parity (`cuda_graph_replay_bit_parity`); re-capture on pool_gen change (`cuda_graph_recaptures_on_pool_gen_change`); 200-token generation, replay vs direct-launch bitwise parity (`cuda_graph_generation_replay_parity_real_model`); graphs-off A/B identical greedy text on 0.5B + 7B (CLI). Measured: 0.5B decode 200 → 236 tok/s (+18%), 7B decode 8.1 → 8.6 tok/s (+6% — launch overhead was the smaller share; kernel bandwidth is the 7e lever) |
 | 7e | per-item A/B numbers appended to `docs/CUDA-BACKEND-PLAN.md` or `CUDA_OPTIMIZATION.md` |
 
 ---

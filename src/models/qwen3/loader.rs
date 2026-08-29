@@ -263,6 +263,15 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
 // ============================================================
 
 pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
+    #[cfg(feature = "cuda")]
+    // Same rationale as qwen2/loader.rs: block until CUDA init completes so
+    // per-tensor registration is all-or-nothing (no partial gate flips).
+    crate::cuda::CudaState::init();
+    // Serialize weight registration against other threads' loads (same-named
+    // tensors across architectures) and against graph tests that hold this
+    // lock across several forwards.
+    #[cfg(feature = "cuda")]
+    let _model_load_guard = crate::cuda::CudaState::model_load_guard();
     let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
 

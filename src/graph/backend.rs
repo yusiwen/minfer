@@ -62,6 +62,25 @@ pub trait Backend: Send + Sync {
     /// Wait for async work to complete (CPU: no-op; Metal: submit the pending
     /// command buffer). Called between splits and after the last split; only the
     /// Metal path invokes it today, so a CPU-only build never calls it.
+    ///
+    /// A backend that captured a CUDA Graph window for the current split must
+    /// close it here (instantiate + launch the captured work once), because
+    /// capture records launches without executing them.
     #[allow(dead_code)]
     fn synchronize(&mut self);
+
+    /// Try to replay a previously captured graph for `(uid, range)` on this
+    /// backend (Phase 7d, CUDA only). Returns `true` when the replay replaced
+    /// the node loop — the scheduler then skips executing this split's nodes.
+    ///
+    /// Returning `false` may have armed or ENTERED capture mode for a future
+    /// replay as a side effect (warmup bookkeeping internal to the backend);
+    /// the window stays open until this split's `synchronize`. Implementations
+    /// must keep captured pointers stable (pool ids never move memory) and
+    /// re-capture when pool generation changed.
+    ///
+    /// Default: no capture support (CPU/Metal are no-ops).
+    fn graph_replay(&mut self, _uid: u64, _range: (usize, usize)) -> bool {
+        false
+    }
 }

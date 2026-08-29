@@ -106,6 +106,18 @@ impl GraphAllocator {
         self.cuda.is_some()
     }
 
+    /// Test hook: ensure the CUDA backend exists and force its CUDA Graph
+    /// capture/replay off (the direct-launch reference in A/B tests).
+    #[cfg(all(feature = "cuda", test))]
+    pub fn disable_graphs_for_test(&mut self) {
+        if !self.enable_cuda() {
+            panic!("disable_graphs_for_test: no CUDA device");
+        }
+        if let Some(c) = self.cuda.as_mut() {
+            c.set_graphs_enabled_for_test(false);
+        }
+    }
+
     /// Mutable CUDA backend (None when unavailable / feature off).
     #[cfg(feature = "cuda")]
     pub fn cuda_mut(&mut self) -> Option<&mut super::cuda_backend::CudaBackend> {

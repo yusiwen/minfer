@@ -14,6 +14,12 @@
 use super::alloc::GraphAllocator;
 use super::params::GraphParams;
 use super::ComputeGraph;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic graph identity for CUDA Graph caching (llama.cpp
+/// `ggml_graph_next_uid` analog): assigned when a NEW graph is stored in the
+/// cache; a reused graph keeps its uid. Starts at 1 (0 = "no uid").
+static NEXT_GRAPH_UID: AtomicU64 = AtomicU64::new(1);
 
 pub struct GraphCache {
     graph: Option<ComputeGraph>,
@@ -59,7 +65,9 @@ impl GraphCache {
 
     /// Store a freshly built graph. The allocator is kept (KV regions persist);
     /// its liveness mapping is recomputed by the caller via `alloc_graph`.
-    pub fn replace_graph(&mut self, graph: ComputeGraph, params: GraphParams) {
+    /// The graph gets a fresh monotonic uid (CUDA Graph cache key part).
+    pub fn replace_graph(&mut self, mut graph: ComputeGraph, params: GraphParams) {
+        graph.uid = NEXT_GRAPH_UID.fetch_add(1, Ordering::Relaxed);
         self.graph = Some(graph);
         self.prev_params = Some(params);
     }

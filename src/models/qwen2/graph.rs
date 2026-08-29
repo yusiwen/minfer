@@ -610,14 +610,14 @@ impl Qwen2Graph {
                             | TensorType::Q4_1
                             | TensorType::Q4_K
                             | TensorType::Q6_K
-                    ) && cuda.has_weight(&t.name)
+                    ) && cuda.has_weight_of_size(&t.name, t.data().len())
                 }
                 None => true,
             }
         }
         fn registered(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
-                Some(t) => cuda.has_weight(&t.name),
+                Some(t) => cuda.has_weight_of_size(&t.name, t.data().len()),
                 None => true,
             }
         }
@@ -662,7 +662,7 @@ impl Qwen2Graph {
                     ]
                 }))
                 .find(|t| match t {
-                    Some(t) => !cuda.has_weight(&t.name),
+                    Some(t) => !cuda.has_weight_of_size(&t.name, t.data().len()),
                     None => false,
                 });
             if let Some(Some(t)) = fail {
@@ -757,6 +757,12 @@ mod tests {
         }
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
+        // Keep the weight registry stable for this whole test: a parallel
+        // test loading a different architecture swaps same-named entries,
+        // which would flip the CUDA gate mid-test (persistent KV regions
+        // were allocated under the earlier decision).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let q2: &Qwen2Model = model
             .as_any()
             .downcast_ref::<Qwen2Model>()
@@ -884,6 +890,12 @@ mod tests {
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
+            // Keep the weight registry stable for this whole test: a parallel
+            // test loading a different architecture swaps same-named entries,
+            // which would flip the CUDA gate mid-test (persistent KV regions
+            // were allocated under the earlier decision).
+            #[cfg(feature = "cuda")]
+            let _model_load_guard = crate::cuda::CudaState::model_load_guard();
             let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
             let ids = tok.encode("The capital of France is");
             let positions: Vec<usize> = (0..ids.len()).collect();
@@ -929,6 +941,12 @@ mod tests {
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
+            // Keep the weight registry stable for this whole test: a parallel
+            // test loading a different architecture swaps same-named entries,
+            // which would flip the CUDA gate mid-test (persistent KV regions
+            // were allocated under the earlier decision).
+            #[cfg(feature = "cuda")]
+            let _model_load_guard = crate::cuda::CudaState::model_load_guard();
             let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
             let nt = 30usize;
             let ids: Vec<u32> = (100..100 + nt as u32).collect();
@@ -1076,6 +1094,12 @@ mod tests {
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
+            // Keep the weight registry stable for this whole test: a parallel
+            // test loading a different architecture swaps same-named entries,
+            // which would flip the CUDA gate mid-test (persistent KV regions
+            // were allocated under the earlier decision).
+            #[cfg(feature = "cuda")]
+            let _model_load_guard = crate::cuda::CudaState::model_load_guard();
             let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
             let l0 = &q2.layers[0];
             let wk = l0.wk.as_ref().unwrap();
@@ -1171,6 +1195,12 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
+        // Keep the weight registry stable for this whole test: a parallel
+        // test loading a different architecture swaps same-named entries,
+        // which would flip the CUDA gate mid-test (persistent KV regions
+        // were allocated under the earlier decision).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let q2: &Qwen2Model = model
             .as_any()
             .downcast_ref::<Qwen2Model>()
@@ -1269,6 +1299,12 @@ mod tail_tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
+        // Keep the weight registry stable for this whole test: a parallel
+        // test loading a different architecture swaps same-named entries,
+        // which would flip the CUDA gate mid-test (persistent KV regions
+        // were allocated under the earlier decision).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
         let ids = tok.encode("The capital of France is");
@@ -1743,6 +1779,12 @@ mod tail_tests {
             crate::metal::MpsState::init();
             let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
             let model = crate::models::load_model(&gguf).expect("load model");
+            // Keep the weight registry stable for this whole test: a parallel
+            // test loading a different architecture swaps same-named entries,
+            // which would flip the CUDA gate mid-test (persistent KV regions
+            // were allocated under the earlier decision).
+            #[cfg(feature = "cuda")]
+            let _model_load_guard = crate::cuda::CudaState::model_load_guard();
             let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
             let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
             let ids = tok.encode("The capital of France is");

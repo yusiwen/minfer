@@ -29,6 +29,38 @@ pub struct CudaBackend {
     /// I32 input buffers (grown on demand; freed in Drop alongside the pool).
     pos_scratch: *mut std::ffi::c_void,
     pos_scratch_bytes: usize,
+    /// Captured CUDA Graphs (Phase 7d), keyed by (graph uid, split node
+    /// range) and valid only for the pool_gen captured at. Few entries: one
+    /// per executed split of each reused graph (decode captures; a one-shot
+    /// prefill never passes warmup).
+    graph_execs: Vec<CapturedGraph>,
+    /// Direct-launch warmup counter per (uid, range): the 3rd consecutive
+    /// execution enters capture (llama.cpp warms up twice).
+    graph_runs: std::collections::HashMap<(u64, (usize, usize)), u32>,
+    /// Open capture window (armed by `graph_replay`, closed by `synchronize`).
+    capturing: Option<(u64, (usize, usize))>,
+    /// Held process-wide stream lock while `capturing` is open (released when
+    /// the window closes; see `CudaState::stream_lock`).
+    stream_guard: Option<std::sync::MutexGuard<'static, ()>>,
+    /// `MINFER_NO_CUDA_GRAPH=1` (at construction) or a capture failure
+    /// (session-wide) force the plain direct-launch path.
+    graphs_mode: GraphMode,
+}
+
+/// An instantiated CUDA Graph exec with its capture identity.
+struct CapturedGraph {
+    exec: *mut std::ffi::c_void,
+    uid: u64,
+    range: (usize, usize),
+    pool_gen: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphMode {
+    /// Capture/replay allowed.
+    Enabled,
+    /// Forced off (`MINFER_NO_CUDA_GRAPH=1`) or disabled after a failure.
+    Disabled,
 }
 
 // SAFETY: CudaBuf holds raw device pointers that are only dereferenced by the
@@ -45,6 +77,11 @@ impl CudaBackend {
     #[allow(dead_code)]
     pub fn new() -> Option<Self> {
         let state = crate::cuda::CudaState::get()?;
+        let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
+            GraphMode::Disabled
+        } else {
+            GraphMode::Enabled
+        };
         Some(Self {
             state,
             pool: Vec::new(),
@@ -52,6 +89,11 @@ impl CudaBackend {
             pool_gen: 0,
             pos_scratch: std::ptr::null_mut(),
             pos_scratch_bytes: 0,
+            graph_execs: Vec::new(),
+            graph_runs: std::collections::HashMap::new(),
+            capturing: None,
+            stream_guard: None,
+            graphs_mode,
         })
     }
 
@@ -59,6 +101,136 @@ impl CudaBackend {
     #[allow(dead_code)]
     pub fn pool_gen(&self) -> u64 {
         self.pool_gen
+    }
+
+    /// Number of captured graphs currently held (test introspection).
+    #[cfg(test)]
+    fn captured_count(&self) -> usize {
+        self.graph_execs.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_graphs_enabled_for_test(&mut self, enabled: bool) {
+        self.graphs_mode = if enabled {
+            GraphMode::Enabled
+        } else {
+            GraphMode::Disabled
+        };
+        self.graph_execs.clear();
+        self.graph_runs.clear();
+    }
+
+    /// Phase 7d (CUDA Graph capture/replay), llama.cpp's state machine:
+    ///
+    /// - executions 1 and 2 of a `(uid, range)` split run direct launches
+    ///   (warmup — one-shot graphs like prefill never reach capture);
+    /// - the 3rd execution opens a stream-capture window around the node loop
+    ///   (this call returns `false`; the window is closed by `synchronize`,
+    ///   which instantiates, launches once so the step still produces output,
+    ///   and caches the exec);
+    /// - subsequent executions launch the captured graph and return `true`
+    ///   (the caller skips the node loop). Input staging buffers were
+    ///   H2D-filled before the split at stable addresses, so replay reads
+    ///   fresh data — the invariant llama.cpp relies on.
+    ///
+    /// A pool_gen change invalidates the stored exec (pointers may differ).
+    /// `MINFER_NO_CUDA_GRAPH=1` or any failure disables graphs for the
+    /// backend's lifetime and everything falls back to direct launches.
+    fn graph_replay_step(&mut self, uid: u64, range: (usize, usize)) -> bool {
+        if self.graphs_mode != GraphMode::Enabled {
+            return false;
+        }
+        let key = (uid, range);
+        if let Some(pos) = self
+            .graph_execs
+            .iter()
+            .position(|g| g.uid == uid && g.range == range)
+        {
+            if self.graph_execs[pos].pool_gen != self.pool_gen {
+                // pool churned since capture — pointers may differ, re-capture
+                let g = self.graph_execs.remove(pos);
+                self.graph_runs.remove(&key);
+                self.state.graph_destroy(g.exec);
+            } else {
+                let exec = self.graph_execs[pos].exec;
+                // a plain stream launch — serialized like any other stream op
+                let _sg = self.stream_guard();
+                if self.state.graph_launch_exec(exec) {
+                    return true;
+                }
+                eprintln!("CUDA: graph replay launch failed; graphs disabled for this session");
+                self.graphs_mode = GraphMode::Disabled;
+                return false;
+            }
+        }
+        let runs = self.graph_runs.entry(key).or_insert(0);
+        *runs += 1;
+        if *runs >= 3 && self.capturing.is_none() {
+            // Hold the process-wide stream lock across the capture window:
+            // any other backend's stream work would otherwise be recorded
+            // into this graph (capture is per-stream, not per-thread).
+            let guard = self.state.stream_lock().lock().unwrap();
+            if self.state.graph_begin_capture() {
+                self.capturing = Some(key);
+                self.stream_guard = Some(guard);
+            } else {
+                drop(guard);
+                eprintln!("CUDA: stream capture unavailable; graphs disabled for this session");
+                self.graphs_mode = GraphMode::Disabled;
+            }
+        }
+        false
+    }
+
+    /// Stream-work serialization for backend methods: `None` while THIS
+    /// backend holds an open capture window (its own enqueues are the
+    /// recorded work); otherwise a held process-wide lock that blocks while
+    /// any other backend is capturing.
+    fn stream_guard(&self) -> Option<std::sync::MutexGuard<'static, ()>> {
+        if self.capturing.is_some() {
+            None
+        } else {
+            Some(self.state.stream_lock().lock().unwrap())
+        }
+    }
+
+    /// Close an open capture window (instantiate + launch once + cache), or
+    /// fall back to a plain synchronize. Called at split boundaries and after
+    /// the last split — never inside a capture window.
+    fn close_capture_or_sync(&mut self) {
+        if let Some(key) = self.capturing.take() {
+            // the stream lock stays held (self.stream_guard) until the window
+            // is fully closed and the capture launch has been enqueued
+            let exec = self.state.graph_end_capture_to_exec();
+            let ok = !exec.is_null() && self.state.graph_launch_exec(exec);
+            self.stream_guard = None; // release after the last stream op
+            if ok {
+                self.graph_execs.push(CapturedGraph {
+                    exec,
+                    uid: key.0,
+                    range: key.1,
+                    pool_gen: self.pool_gen,
+                });
+                self.state.sync();
+            } else {
+                self.state.graph_destroy(exec);
+                // The recorded launches never executed — this step's
+                // outputs are undefined. End-of-capture failure is
+                // effectively unreachable for our graphs (no host syncs,
+                // no readbacks, async D2D only inside the window), so log
+                // loudly, disable, and surface the broken state to the
+                // next caller via a poisoned error on the next replay.
+                eprintln!(
+                    "CUDA: graph capture end/instantiate/launch failed; \
+                     graphs disabled for this session (this step's split did not execute — \
+                     rerun with MINFER_NO_CUDA_GRAPH=1)"
+                );
+                self.graphs_mode = GraphMode::Disabled;
+                self.state.sync();
+            }
+            return;
+        }
+        self.state.sync();
     }
 
     fn ptr_of(&self, id: usize) -> Result<*mut std::ffi::c_void, String> {
@@ -78,6 +250,7 @@ impl CudaBackend {
         if b.ptr.is_null() || b.bytes == 0 {
             return None;
         }
+        let _sg = self.stream_guard();
         let mut out = vec![0f32; b.bytes / 4];
         self.state.sync();
         let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b.bytes) };
@@ -88,6 +261,8 @@ impl CudaBackend {
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
+        // cudaFree implicitly syncs — serialize against open capture windows.
+        let _sg = self.stream_guard();
         // Pools live as long as the backend (inside GraphCache); only real
         // teardown frees device memory. free_buffer() only recycles.
         for b in &self.pool {
@@ -100,6 +275,11 @@ impl Drop for CudaBackend {
             self.pos_scratch = std::ptr::null_mut();
             self.pos_scratch_bytes = 0;
         }
+        for g in &self.graph_execs {
+            self.state.graph_destroy(g.exec);
+        }
+        self.graph_execs.clear();
+        self.capturing = None;
     }
 }
 
@@ -218,6 +398,7 @@ impl Backend for CudaBackend {
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
+        let _sg = self.stream_guard(); // cudaMalloc syncs the device
         let bytes = size * 4;
         if let Some(pos) = self
             .free
@@ -228,6 +409,10 @@ impl Backend for CudaBackend {
             self.pool_gen += 1;
             return id;
         }
+        // On OOM, cuda_malloc logs and returns null; the null buffer fails
+        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
+        // backend may be holding the process-wide stream lock, and panicking
+        // under a mutex poisons it for every other user.
         let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
         self.pool.push(CudaBuf { ptr, bytes });
         self.pool_gen += 1;
@@ -235,6 +420,7 @@ impl Backend for CudaBackend {
     }
 
     fn free_buffer(&mut self, id: usize) {
+        let _sg = self.stream_guard();
         // Recycle, never cudaFree here: persistent KV regions survive rebuilds
         // and the pool keeps freed device memory for reuse (CPU/Metal alike).
         if !self.free.contains(&id) {
@@ -246,7 +432,12 @@ impl Backend for CudaBackend {
         // bypass the free list entirely (see Backend::alloc_fresh): the ids in
         // it are still referenced by node_to_buf and physically live during
         // the execute that follows
+        let _sg = self.stream_guard(); // cudaMalloc syncs the device
         let bytes = size * 4;
+        // On OOM, cuda_malloc logs and returns null; the null buffer fails
+        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
+        // backend may be holding the process-wide stream lock, and panicking
+        // under a mutex poisons it for every other user.
         let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
         self.pool.push(CudaBuf { ptr, bytes });
         self.pool_gen += 1;
@@ -260,6 +451,9 @@ impl Backend for CudaBackend {
         out_buf: usize,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
+        // one lock acquisition per node; None while this backend itself is
+        // capturing (its own enqueues are the recorded work)
+        let _sg = self.stream_guard();
         match &node.op {
             // Inputs are host-filled by the allocator; KvcacheLoad is a view
             // of the persistent K region (out_buf IS the region — no kernel).
@@ -556,6 +750,7 @@ impl Backend for CudaBackend {
     }
 
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String> {
+        let _sg = self.stream_guard();
         let bytes = data.len() * 4;
         let dst = self.ptr_of(id)?;
         if self.pool[id].bytes < bytes {
@@ -570,7 +765,14 @@ impl Backend for CudaBackend {
     }
 
     fn synchronize(&mut self) {
-        self.state.sync();
+        if self.capturing.is_none() {
+            let _sg = self.stream_guard();
+        }
+        self.close_capture_or_sync();
+    }
+
+    fn graph_replay(&mut self, uid: u64, range: (usize, usize)) -> bool {
+        self.graph_replay_step(uid, range)
     }
 }
 
@@ -578,7 +780,11 @@ impl Backend for CudaBackend {
 mod tests {
     use super::*;
     use crate::graph::alloc::GraphAllocator;
-    use crate::graph::backend::KvProvider;
+    use crate::graph::backend::{Backend as _, KvProvider};
+    use crate::graph::builder::GraphBuilder;
+    use crate::graph::cache::GraphCache;
+    use crate::graph::scheduler::BackendScheduler;
+    use crate::graph::DType;
 
     /// Init the CUDA singleton; silent-skip the test when no device answers
     /// (e.g. CI without a GPU). Run with --nocapture to see skips.
@@ -696,7 +902,6 @@ mod tests {
 
     // ─── Phase 7b: per-op dispatch parity ───────────────────────
 
-    use crate::graph::builder::GraphBuilder;
     use crate::graph::ops::{AttnMeta, AttnMode, RoPEMeta};
     use crate::tensor::{Tensor, TensorType};
 
@@ -1166,5 +1371,217 @@ mod tests {
         let got = alloc.copy_to_cpu(s).unwrap();
         let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
         assert_close("scheduler chain", &got, &want, scale * 1e-3);
+    }
+
+    // ─── Phase 7d: CUDA Graph capture/replay ─────────────────────
+
+    /// x, y → silu(x) + y: a weightless all-CUDA graph exercising the
+    /// capture/replay bookkeeping without model weights.
+    fn replay_graph() -> crate::graph::ComputeGraph {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], DType::F32);
+        let y = b.input("y", [8, 1, 1, 1], DType::F32);
+        let s = b.silu(x);
+        let o = b.add(s, y);
+        b.output(o);
+        b.build()
+    }
+
+    fn replay_alloc(graphs_enabled: bool) -> GraphAllocator {
+        let mut alloc = GraphAllocator::new();
+        assert!(alloc.enable_cuda(), "cuda device required");
+        if !graphs_enabled {
+            alloc.cuda_mut().unwrap().set_graphs_enabled_for_test(false);
+        }
+        alloc
+    }
+
+    fn replay_step(
+        sched: &BackendScheduler,
+        graph: &crate::graph::ComputeGraph,
+        alloc: &mut GraphAllocator,
+        seed: f32,
+    ) -> Vec<f32> {
+        let xs: Vec<f32> = (0..8).map(|i| seed + i as f32).collect();
+        let ys: Vec<f32> = (0..8).map(|i| (seed * 0.5) - i as f32).collect();
+        alloc.fill_input(graph, "x", &xs).unwrap();
+        alloc.fill_input(graph, "y", &ys).unwrap();
+        sched.execute(graph, alloc).unwrap();
+        alloc.copy_to_cpu(graph.outputs[0]).unwrap()
+    }
+
+    /// Warmup → capture → replay must be bit-identical to pure direct
+    /// launches for every step (llama.cpp's core replay guarantee).
+    #[test]
+    fn cuda_graph_replay_bit_parity() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let sched = BackendScheduler;
+        let mut g_cap = replay_graph();
+        let mut g_ref = replay_graph();
+        let mut cap = replay_alloc(true);
+        let mut refr = replay_alloc(false);
+        sched.assign_backends(&mut g_cap, &cap);
+        sched.assign_backends(&mut g_ref, &refr);
+        cap.alloc_graph(&g_cap).unwrap();
+        refr.alloc_graph(&g_ref).unwrap();
+
+        for step in 0..5u32 {
+            let seed = 10.0 + 10.0 * step as f32;
+            let got = replay_step(&sched, &g_cap, &mut cap, seed);
+            let want = replay_step(&sched, &g_ref, &mut refr, seed);
+            assert_eq!(
+                got, want,
+                "step {step}: replay path diverged from direct launches"
+            );
+        }
+        // steps 1-2 direct, step 3 captured, steps 4-5 replayed
+        assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
+    }
+
+    /// A pool generation change after capture must invalidate the stored exec
+    /// (conservative: pointers may differ) and re-capture on a later run.
+    #[test]
+    fn cuda_graph_recaptures_on_pool_gen_change() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let sched = BackendScheduler;
+        let mut g = replay_graph();
+        let mut cap = replay_alloc(true);
+        let mut refr = replay_alloc(false);
+        sched.assign_backends(&mut g, &cap);
+        cap.alloc_graph(&g).unwrap();
+        refr.alloc_graph(&g).unwrap();
+
+        for step in 0..3u32 {
+            let seed = 1.0 + step as f32;
+            let got = replay_step(&sched, &g, &mut cap, seed);
+            let want = replay_step(&sched, &g, &mut refr, seed);
+            assert_eq!(got, want, "warmup step {step}");
+        }
+        assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
+
+        // bump pool_gen behind the backend's back (as a new staging alloc
+        // would). Invalidation is lazy: the stale exec is dropped at the next
+        // graph_replay call, before it could ever be launched.
+        let c = cap.cuda_mut().unwrap();
+        let _fresh = Backend::alloc_fresh(c, 64);
+
+        // run 4: graph_replay sees the pool_gen change → drops the exec and
+        // runs direct (warmup restarts). Parity holds throughout.
+        let got = replay_step(&sched, &g, &mut cap, 4.0);
+        let want = replay_step(&sched, &g, &mut refr, 4.0);
+        assert_eq!(got, want, "post-invalidation step 4");
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_count(),
+            0,
+            "stale exec must be dropped after pool churn"
+        );
+
+        // run 5 direct (warmup 2), run 6 re-captures — parity holds
+        for step in 5..7u32 {
+            let seed = step as f32;
+            let got = replay_step(&sched, &g, &mut cap, seed);
+            let want = replay_step(&sched, &g, &mut refr, seed);
+            assert_eq!(got, want, "post-invalidation step {step}");
+        }
+        assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
+    }
+
+    /// Real-model generation: two full generations (independent caches) must
+    /// produce identical greedy tokens — the first loop mixes direct/capture/
+    /// replay executions, the second replays everything, and a third loop
+    /// with graphs force-disabled is the direct-launch reference.
+    #[test]
+    fn cuda_graph_generation_replay_parity_real_model() {
+        use crate::models::qwen2::graph::Qwen2Graph;
+        use crate::models::qwen2::Qwen2Model;
+
+        crate::cuda::CudaState::init();
+        if crate::cuda::CudaState::get().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
+        if !p.exists() {
+            eprintln!("skipping: qwen2.5-0.5b q4_0 not cached");
+            return;
+        }
+        // Hold the model-load lock from BEFORE the load through the whole
+        // comparison: a parallel test loading a different architecture
+        // registers same-named tensors of a different size, which would swap
+        // the weight registry underneath these loops and corrupt one of them.
+        // (The guard is reentrant — load_model takes it again internally.)
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let gguf = crate::gguf::load_gguf_model(&p).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().unwrap();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let nt = ids.len();
+        // Full model context (32k) would size f32 KV regions at ~800 MB per
+        // cache — x3 caches here. 4096 comfortably covers a 200-token decode
+        // and keeps the parallel suite's device-memory footprint small.
+        let n_ctx = 4096;
+
+        fn generate(
+            q2: &Qwen2Model,
+            ids: &[u32],
+            nt: usize,
+            n_ctx: usize,
+            steps: usize,
+        ) -> (Vec<u32>, Vec<f32>) {
+            let mut cache = GraphCache::new();
+            let positions: Vec<usize> = (0..nt).collect();
+            let mut logits = Qwen2Graph::forward_cached(q2, ids, &positions, 1, n_ctx, &mut cache);
+            let mut toks = Vec::with_capacity(steps);
+            for step in 0..steps {
+                let next = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
+                toks.push(next);
+                logits =
+                    Qwen2Graph::forward_cached(q2, &[next], &[nt + step], 1, n_ctx, &mut cache);
+            }
+            (toks, logits)
+        }
+
+        // loop 1: warmup → capture → replay across the steps (200 tokens)
+        let (toks1, last1) = generate(q2, &ids, nt, n_ctx, 200);
+        // loop 2: everything replays (fresh cache, fresh backend bookkeeping)
+        let (toks2, last2) = generate(q2, &ids, nt, n_ctx, 200);
+        assert_eq!(toks1, toks2, "replay generation diverged from mixed-mode");
+        assert_eq!(last1, last2, "final-step logits diverged bitwise");
+
+        // loop 3: graphs force-disabled — the direct-launch reference. The
+        // allocator must get its CUDA backend (and the disabled flag) before
+        // the first forward_cached call, which would otherwise create it.
+        let mut cache3 = GraphCache::new();
+        cache3.alloc().disable_graphs_for_test();
+        let positions: Vec<usize> = (0..nt).collect();
+        let mut logits3 = Qwen2Graph::forward_cached(q2, &ids, &positions, 1, n_ctx, &mut cache3);
+        let mut toks3 = Vec::with_capacity(200);
+        for step in 0..200 {
+            let next = logits3
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
+            toks3.push(next);
+            logits3 = Qwen2Graph::forward_cached(q2, &[next], &[nt + step], 1, n_ctx, &mut cache3);
+        }
+        assert_eq!(
+            toks1, toks3,
+            "graph-captured generation diverged from direct launches"
+        );
     }
 }
