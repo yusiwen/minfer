@@ -140,15 +140,22 @@ move it. Decode-side bandwidth work is closed unless a fundamentally
 different weight layout (e.g. interleaved tiles) is measured to stream
 faster.
 
-## 8f. Q5_K kernels (lift the all-or-nothing gate)
+## 8f. Q5_K kernels — **DONE 2026-08-29 (`b959ec9`, Q5_K + Q5_1)**
 
-`q5_k_m` models fall back to CPU wholesale (the weights gate requires every
-matmul weight to have a CUDA kernel; Q5_K lacks one). Kernel pattern follows
-the q4_K unit mapping (176-byte super-blocks). Also covers Q5_0/Q5_1 if
-cheap after Q5_K.
+The all-or-nothing gate needs a kernel for EVERY matmul weight type; the
+0.5B q5_k_m file (ftype Q5_K_M) actually contains **Q5_1** for attn q/k/o,
+ffn gate/up and tok_embd, plus Q6_K (ffn_down) and Q8_0 (attn_v, output) —
+so Q5_1 was required alongside Q5_K. Both f32-activation matmuls mirror the
+Q4_0/Q4_K structures; Q5_K decodes the transposed qh (bit s of byte l) and
+deinterleaved qs chunks, with sub-level tail masking for partial last
+super-blocks (0.5B id = 896 = 3.5×256; dispatch requires id % 32 == 0).
+embed_rows_q5_1/_q5_k cover the q5_1 token embedding. Gates updated in both
+qwen2 and qwen3 `weights_on_cuda`.
 
-Gate: standalone A/B + parity test mirroring `cuda_kquant_matmul_parity`;
-`qwen2.5-0.5b-instruct-q5_k_m` E2E (the negative-test model from 7c).
+Gate results: parity test (q5_1 id 64; q5_K id 896 tail, decode-formula
+weights over real unpack_q4k_scales, 5e-3); 0.5B q5_k_m E2E — CUDA now
+admits the model (was CPU wholesale), greedy output identical to CPU;
+cuda 155/0. Q5_0 deferred (no model needs it; add when one does).
 
 ## 8g. Prefill capture: gate the accidental path, then productize
 
