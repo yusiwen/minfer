@@ -184,10 +184,9 @@ impl Qwen2Graph {
             // the decode (nt==1) scalar kernel. Gate on FFN size.
             let fuse_gu = nt == 1
                 && params.cparams.gpu
-                && params.cparams.fuse_qkv
+                && params.cparams.fuse_ffn
                 && Self::gu_concat_available(&l.ffn_gate, &l.ffn_up)
-                && nf <= 16384
-                && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                && nf <= 16384;
             let residual = h;
             let normed = b.rms_norm(h, l.ffn_norm.as_ref(), eps);
             let ffn_out = if fuse_gu {
@@ -255,11 +254,20 @@ impl Qwen2Graph {
         let (Some(fg), Some(fu)) = (fg, fu) else {
             return false;
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(feature = "cuda")))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(target_os = "macos", feature = "cuda"))]
+        {
+            crate::metal::concat_rows(&[fg, fu]).is_some()
+                || crate::cuda::concat_rows(&[fg, fu]).is_some()
+        }
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            crate::cuda::concat_rows(&[fg, fu]).is_some()
+        }
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         {
             let _ = (fg, fu);
             false
@@ -380,11 +388,17 @@ impl Qwen2Graph {
                 n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on || cuda_on,
-                // G4: decode QKV fusion is part of the topology — the env
-                // toggle forces a rebuild so it can be A/B'd reliably.
+                // G4/G5: decode fusions are part of the topology — the env
+                // toggles force a rebuild so they can be A/B'd reliably.
+                // G5 (FFN gate+up) is decoupled from the QKV fusion gate
+                // (mirrors Qwen3) so A/B-ing one fusion does not flip the
+                // other; 7e⑤ extends it to the CUDA backend.
                 fuse_qkv: nt == 1
                     && metal_on
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
+                fuse_ffn: nt == 1
+                    && (metal_on || cuda_on)
+                    && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
             },
             weights_version: 1,
         };
@@ -827,6 +841,7 @@ mod tests {
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
+                    fuse_ffn: false,
                 },
                 weights_version: 1,
             };
@@ -875,6 +890,7 @@ mod tests {
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
+                    fuse_ffn: false,
                 },
                 weights_version: 1,
             };
@@ -1467,6 +1483,7 @@ mod tail_tests {
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
+                    fuse_ffn: false,
                 },
                 weights_version: 1,
             };
@@ -1645,6 +1662,7 @@ mod tail_tests {
                         flash_attn: false,
                         gpu: true,
                         fuse_qkv: fuse,
+                        fuse_ffn: fuse,
                     },
                     weights_version: 1,
                 };
@@ -1718,6 +1736,7 @@ mod tail_tests {
                         flash_attn: false,
                         gpu: true,
                         fuse_qkv: fuse,
+                        fuse_ffn: fuse,
                     },
                     weights_version: 1,
                 };

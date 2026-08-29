@@ -19,7 +19,13 @@ use serde_json::{json, Value};
 
 /// The GraphParams the runtime uses for a forward with `n_tokens` (mirrors the
 /// model cache's construction; `gpu`/`fuse_qkv` follow the env toggles).
-pub fn runtime_gparams(n_tokens: usize, n_ctx: usize, gpu: bool, fuse_qkv: bool) -> GraphParams {
+pub fn runtime_gparams(
+    n_tokens: usize,
+    n_ctx: usize,
+    gpu: bool,
+    fuse_qkv: bool,
+    fuse_ffn: bool,
+) -> GraphParams {
     GraphParams {
         n_tokens,
         n_seqs: 1,
@@ -35,6 +41,7 @@ pub fn runtime_gparams(n_tokens: usize, n_ctx: usize, gpu: bool, fuse_qkv: bool)
             flash_attn: false,
             gpu,
             fuse_qkv,
+            fuse_ffn,
         },
         weights_version: 1,
     }
@@ -100,8 +107,9 @@ pub fn export_graph_json(
     n_ctx: usize,
     gpu: bool,
     fuse_qkv: bool,
+    fuse_ffn: bool,
 ) -> Value {
-    let gparams = runtime_gparams(n_tokens, n_ctx, gpu, fuse_qkv);
+    let gparams = runtime_gparams(n_tokens, n_ctx, gpu, fuse_qkv, fuse_ffn);
     let g = build_runtime_graph(model, &gparams);
     let kind = if n_tokens == 1 { "decode" } else { "prefill" };
     g.export_json(model_name, kind)

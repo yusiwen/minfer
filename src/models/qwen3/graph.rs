@@ -183,11 +183,13 @@ impl Qwen3Graph {
             // (nf = 3072 ≤ 16384 gate; FFN is Qwen2-identical). Decoupled from
             // the QKV fusion gate (`fuse_qkv`) so A/B-ing the QKV fusion
             // (MINFER_NO_FUSE_QKV) does not also flip the FFN fusion.
+            // fuse_ffn lives in CParams (the reuse identity) so the
+            // MINFER_NO_FUSE_FFN toggle reliably forces a rebuild.
             let fuse_gu = nt == 1
                 && params.cparams.gpu
+                && params.cparams.fuse_ffn
                 && Self::gu_concat_available(&l.ffn_gate, &l.ffn_up)
-                && nf <= 16384
-                && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                && nf <= 16384;
             let residual = h;
             let normed = b.rms_norm(h, l.ffn_norm.as_ref(), eps);
             let ffn_out = if fuse_gu {
@@ -253,11 +255,20 @@ impl Qwen3Graph {
         let (Some(fg), Some(fu)) = (fg, fu) else {
             return false;
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(feature = "cuda")))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(target_os = "macos", feature = "cuda"))]
+        {
+            crate::metal::concat_rows(&[fg, fu]).is_some()
+                || crate::cuda::concat_rows(&[fg, fu]).is_some()
+        }
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            crate::cuda::concat_rows(&[fg, fu]).is_some()
+        }
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         {
             let _ = (fg, fu);
             false
@@ -374,6 +385,9 @@ impl Qwen3Graph {
                 fuse_qkv: nt == 1
                     && metal_on
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
+                fuse_ffn: nt == 1
+                    && (metal_on || cuda_on)
+                    && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
             },
             weights_version: 1,
         };
@@ -823,6 +837,7 @@ mod tests {
                     flash_attn: false,
                     gpu: true,
                     fuse_qkv: true,
+                    fuse_ffn: false,
                 },
                 weights_version: 1,
             };
@@ -839,6 +854,7 @@ mod tests {
             let unfused_params = GraphParams {
                 cparams: CParams {
                     fuse_qkv: false,
+                    fuse_ffn: false,
                     ..fused_params.cparams
                 },
                 ..fused_params
@@ -1012,6 +1028,7 @@ mod tests {
                     flash_attn: false,
                     gpu: true,
                     fuse_qkv: false,
+                    fuse_ffn: false,
                 },
                 weights_version: 1,
             };

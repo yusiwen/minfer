@@ -420,6 +420,27 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
                 }
             }
         }
+        // 7e⑤: Fused FFN gate+up (nt==1 decode) — CUDA registration. The
+        // concat rows go through register_weight (block-quant types) or the
+        // padded repack (Q6_K: 210→224-byte slots for aligned uint4 loads),
+        // matching what matmul_f32_ptr_layout dispatches on.
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = crate::cuda::CudaState::get() {
+            if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
+                if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
+                    if fg.ttype == crate::tensor::TensorType::Q6_K {
+                        cuda.register_weight_q6k_padded(
+                            &format!("blk.{i}.ffn_gu"),
+                            &data,
+                            (fg.shape[1] + fu.shape[1]) as usize,
+                            fg.shape[0] as usize,
+                        );
+                    } else {
+                        cuda.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                    }
+                }
+            }
+        }
         layers.push(layer);
     }
 

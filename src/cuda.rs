@@ -183,6 +183,7 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_swiglu_f32_off(buf: *mut f32, n: i32, off: i32, stream: *mut std::ffi::c_void);
     fn launch_gather_rows_f32(
         src: *const f32,
         ids: *const f32,
@@ -375,6 +376,67 @@ pub struct CudaState {
     /// graph. The capturing backend holds this lock across its window; its
     /// own enqueues skip re-locking (they are the recorded work).
     stream_lock: Mutex<()>,
+}
+
+/// Quant block element count (ggml block_q): 256 for K-quants, 32 otherwise.
+fn quant_block_q(t: TensorType) -> usize {
+    match t {
+        TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K => 256,
+        _ => 32,
+    }
+}
+
+/// Quant block byte size — matches ggml type_size (Q4_0=18, Q4_1=20, Q5_0=22,
+/// Q5_1=24, Q8_0=34, Q4_K=144, Q5_K=176, Q6_K=210).
+fn quant_block_bytes(t: TensorType) -> usize {
+    match t {
+        TensorType::Q4_0 => 18,
+        TensorType::Q4_1 => 20,
+        TensorType::Q5_0 => 22,
+        TensorType::Q5_1 => 24,
+        TensorType::Q8_0 => 34,
+        TensorType::Q4_K => 144,
+        TensorType::Q5_K => 176,
+        TensorType::Q6_K => 210,
+        _ => 0,
+    }
+}
+
+/// Concatenate raw quantized weights along the output (row) dimension into one
+/// weight buffer for a fused matmul (nt==1 decode): the matmul kernel lays
+/// weights out as [out rows][blocks][block bytes], so a row-major concat is
+/// contiguous. Returns None when the weights can't share a single matmul
+/// (different types, different input dims, or an unsized type).
+pub fn concat_rows(tensors: &[&Tensor]) -> Option<Vec<u8>> {
+    if tensors.len() < 2 {
+        return None;
+    }
+    let tt = tensors[0].ttype;
+    if tensors.iter().any(|t| t.ttype != tt) {
+        return None;
+    }
+    let bq = quant_block_q(tt);
+    let bb = quant_block_bytes(tt);
+    if bb == 0 {
+        return None;
+    }
+    let ne0 = tensors[0].shape[0] as usize;
+    if tensors.iter().any(|t| t.shape[0] != ne0 as i64) {
+        return None;
+    }
+    if ne0 % bq != 0 {
+        return None;
+    }
+    let row = (ne0 / bq) * bb;
+    let rows: usize = tensors.iter().map(|t| t.shape[1] as usize).sum();
+    let mut out = Vec::with_capacity(rows * row);
+    for t in tensors {
+        out.extend_from_slice(t.data());
+    }
+    if out.len() != rows * row {
+        return None;
+    }
+    Some(out)
 }
 
 impl CudaState {
@@ -1204,6 +1266,17 @@ impl CudaState {
         let stream = self.stream();
         unsafe {
             launch_quantize_q8_0(x as *const f32, y as *mut u8, dim as i32, nt as i32, stream);
+        }
+    }
+
+    /// 7e⑤: in-place split swiglu over one buffer (llama
+    /// `ggml_swiglu_split`): buf[i] = silu(buf[i]) * buf[off + i] for
+    /// i in 0..n. Used by the fused FFN decode path where the concat
+    /// matmul output carries gate rows 0..nf and up rows nf..2*nf.
+    pub fn swiglu_f32_off_on_gpu(&self, buf: *mut std::ffi::c_void, n: usize, off: usize) {
+        let stream = self.stream();
+        unsafe {
+            launch_swiglu_f32_off(buf as *mut f32, n as i32, off as i32, stream);
         }
     }
 

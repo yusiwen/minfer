@@ -28,6 +28,10 @@ pub struct CParams {
     /// G4 decode QKV fusion enabled (part of the topology: toggling
     /// `MINFER_NO_FUSE_QKV` must force a rebuild).
     pub fuse_qkv: bool,
+    /// G5 decode FFN gate+up fusion enabled (part of the topology: toggling
+    /// `MINFER_NO_FUSE_FFN` must force a rebuild). Decoupled from `fuse_qkv`
+    /// so A/B-ing one fusion does not flip the other.
+    pub fuse_ffn: bool,
 }
 
 impl Default for CParams {
@@ -38,6 +42,7 @@ impl Default for CParams {
             flash_attn: false,
             gpu: false,
             fuse_qkv: false,
+            fuse_ffn: false,
         }
     }
 }

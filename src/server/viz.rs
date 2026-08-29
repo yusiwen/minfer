@@ -88,10 +88,10 @@ pub fn run_viz(
         "model": model_name,
         "phases": [
             { "kind": "prefill",
-              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 16, n_ctx_slot, gpu, false),
+              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 16, n_ctx_slot, gpu, false, false),
               "steps": [] },
             { "kind": "decode",
-              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 1, n_ctx_slot, gpu, fuse_qkv),
+              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 1, n_ctx_slot, gpu, fuse_qkv, fuse_qkv),
               "steps": [] },
         ],
     }));

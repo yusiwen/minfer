@@ -391,7 +391,11 @@ impl Backend for CudaBackend {
             // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
             // generic f32 tail gather (no meta). Removes the CPU round trips
             // around the prefill's embed and G3 tail reduction.
-            | Op::GetRows => true,
+            // 7e⑤: decode FFN gate+up fusion — concat matmul + in-place
+            // offset swiglu (the gu_concat_available / CParams.fuse_ffn
+            // gates decide when the node is built).
+            | Op::GetRows
+            | Op::FusedFFN => true,
             // MatMul ttype gating happens at the model level (weights must all
             // be registered on CUDA — same all-or-nothing rule as Metal).
             Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
@@ -605,6 +609,48 @@ impl Backend for CudaBackend {
                 Ok(())
             }
 
+            // 7e⑤: decode FFN gate+up fusion (decode nt==1 only): one concat
+            // matmul (ffn_gate|ffn_up rows → gate|up in the output buffer),
+            // then an in-place offset swiglu folding silu(gate)*up into the
+            // gate rows. The following down matmul reads rows 0..nf.
+            Op::FusedFFN => {
+                let meta = match &node.meta {
+                    NodeMeta::FusedFfn(m) => m,
+                    other => {
+                        return Err(format!("fused_ffn node missing FusedFfnMeta: {other:?}"));
+                    }
+                };
+                let wptr = self.state.get_weight_ptr(&meta.gu_weight).ok_or_else(|| {
+                    format!(
+                        "cuda: gu weight '{}' not registered ({})",
+                        meta.gu_weight, node.name
+                    )
+                })?;
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "cuda: {}: FusedFFN is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
+                let od_total = 2 * meta.nf;
+                // 1) concat matmul: x × [ffn_gate|ffn_up]
+                self.state.matmul_f32_ptr_layout(
+                    wptr,
+                    meta.weight_ttype,
+                    self.ptr_of(in_bufs[0])?,
+                    self.ptr_of(out_buf)?,
+                    od_total,
+                    meta.in_dim,
+                    nt,
+                    self.state.is_weight_padded(&meta.gu_weight),
+                )?;
+                // 2) in-place swiglu: silu(rows 0..nf) × (rows nf..2*nf)
+                let n = nt * meta.nf;
+                self.state
+                    .swiglu_f32_off_on_gpu(self.ptr_of(out_buf)?, n, n);
+                Ok(())
+            }
             Op::MatMul { transpose_b } => {
                 if *transpose_b {
                     return Err(format!(
@@ -1451,6 +1497,190 @@ mod tests {
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
             assert_close("f32 matmul odd id", &got, &want, scale * 2e-3);
+        }
+    }
+
+    /// 7e⑤: fused FFN gate+up parity — the concat matmul + in-place offset
+    /// swiglu must equal silu(gate·x)·(up·x) computed on the host, for a
+    /// plain-registered q4_K concat and a padded-repacked q6_K concat.
+    /// The reference dequantizes with the same independent in-test block
+    /// layouts as `cuda_kquant_matmul_parity`.
+    #[test]
+    fn cuda_fused_ffn_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (nf, id_) = (8usize, 512usize); // concat od = 16, decode nt = 1
+        let xs: Vec<f32> = (0..id_)
+            .map(|i| (((i as u64) * 1103515245 % 997) as f32) / 500.0 - 1.0)
+            .collect();
+
+        // ── q4_K gate/up weights (144-byte super-blocks, llama layout) ──
+        // get_scale_min_k4 (llama.cpp Q4_K scale packing): the second half
+        // of the 8 scale/min pairs is spliced across the 12 scale bytes.
+        fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
+            if j < 4 {
+                (q[j] & 63, q[j + 4] & 63)
+            } else {
+                (
+                    (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                    (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+                )
+            }
+        }
+        fn build_q4k(seed: u64, rows: usize, id: usize, bytes: &mut Vec<u8>, dq: &mut Vec<f32>) {
+            for r in 0..rows {
+                for ib in 0..id / 256 {
+                    let d = 0.031f32 + 0.005 * ((seed + (r * 7 + ib * 3) as u64) % 5) as f32;
+                    let dmin = 0.002f32 + 0.001 * ((seed + (r * 3 + ib) as u64) % 4) as f32;
+                    bytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    bytes.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                    let mut scb = [0u8; 12];
+                    for j in 0..12 {
+                        scb[j] = ((seed as usize + r * 31 + j * 17 + ib * 5) % 63) as u8;
+                    }
+                    bytes.extend_from_slice(&scb);
+                    let mut qs = [0u8; 128];
+                    for j in 0..128 {
+                        let lo = ((seed as usize + r * 13 + j * 7 + ib * 3) % 15) as u8;
+                        let hi = ((seed as usize + r * 5 + j * 11 + ib * 2) % 15) as u8;
+                        qs[j] = lo | (hi << 4);
+                    }
+                    bytes.extend_from_slice(&qs);
+                    for j in 0..4 {
+                        let (s_lo, m_lo) = k4_scale(&scb, 2 * j);
+                        let (s_hi, m_hi) = k4_scale(&scb, 2 * j + 1);
+                        for l in 0..32 {
+                            let b = qs[j * 32 + l];
+                            let base = r * id + ib * 256 + j * 64;
+                            dq[base + l] = (b & 0x0F) as f32 * d * s_lo as f32 - dmin * m_lo as f32;
+                            dq[base + 32 + l] =
+                                (b >> 4) as f32 * d * s_hi as f32 - dmin * m_hi as f32;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── q6_K gate/up weights (210-byte super-blocks, llama layout) ──
+        fn build_q6k(seed: u64, rows: usize, id: usize, bytes: &mut Vec<u8>, dq: &mut Vec<f32>) {
+            for r in 0..rows {
+                for ib in 0..id / 256 {
+                    let d = 0.027f32 + 0.004 * ((seed + (r * 11 + ib * 7) as u64) % 6) as f32;
+                    let mut ql = [0u8; 128];
+                    let mut qh = [0u8; 64];
+                    let mut sc = [0i8; 16];
+                    for i in 0..128 {
+                        ql[i] = ((seed as usize + r * 29 + i * 7 + ib * 3) % 255) as u8;
+                    }
+                    for i in 0..64 {
+                        qh[i] = ((seed as usize + r * 17 + i * 13 + ib * 11) % 255) as u8;
+                    }
+                    for i in 0..16 {
+                        sc[i] = (((seed as usize + r * 5 + i * 3 + ib) % 15) as i8) - 7;
+                    }
+                    bytes.extend_from_slice(&ql);
+                    bytes.extend_from_slice(&qh);
+                    bytes.extend(sc.iter().map(|&x| x as u8));
+                    bytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    // reference dequant (llama.cpp Q6_K layout, same as
+                    // the kquant test): four interleaved 32-element groups
+                    // per 128-element half.
+                    for n in 0..2usize {
+                        let qlh = &ql[n * 64..n * 64 + 64];
+                        let qhh = &qh[n * 32..n * 32 + 32];
+                        for l in 0..32usize {
+                            let is = l / 16;
+                            let q1 =
+                                ((qlh[l] & 0xF) as i32 | (((qhh[l] >> 0) as i32 & 3) << 4)) - 32;
+                            let q2 = ((qlh[l + 32] & 0xF) as i32
+                                | (((qhh[l] >> 2) as i32 & 3) << 4))
+                                - 32;
+                            let q3 =
+                                ((qlh[l] >> 4) as i32 | (((qhh[l] >> 4) as i32 & 3) << 4)) - 32;
+                            let q4 = ((qlh[l + 32] >> 4) as i32
+                                | (((qhh[l] >> 6) as i32 & 3) << 4))
+                                - 32;
+                            let base = r * id + ib * 256 + n * 128;
+                            dq[base + l] = d * sc[n * 8 + is] as f32 * q1 as f32;
+                            dq[base + l + 32] = d * sc[n * 8 + is + 2] as f32 * q2 as f32;
+                            dq[base + l + 64] = d * sc[n * 8 + is + 4] as f32 * q3 as f32;
+                            dq[base + l + 96] = d * sc[n * 8 + is + 6] as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut g4b = Vec::new();
+        let mut g4dq = vec![0f32; nf * id_];
+        build_q4k(1, nf, id_, &mut g4b, &mut g4dq);
+        let mut u4b = Vec::new();
+        let mut u4dq = vec![0f32; nf * id_];
+        build_q4k(101, nf, id_, &mut u4b, &mut u4dq);
+        let mut g6b = Vec::new();
+        let mut g6dq = vec![0f32; nf * id_];
+        build_q6k(7, nf, id_, &mut g6b, &mut g6dq);
+        let mut u6b = Vec::new();
+        let mut u6dq = vec![0f32; nf * id_];
+        build_q6k(207, nf, id_, &mut u6b, &mut u6dq);
+
+        // concat rows: gate rows then up rows (concat_rows semantics)
+        let gu4: Vec<u8> = g4b.iter().chain(u4b.iter()).copied().collect();
+        let gu6: Vec<u8> = g6b.iter().chain(u6b.iter()).copied().collect();
+        cb.state.register_weight("mgu4", &gu4);
+        // q6_K concat goes through the padded repack (7e② layout)
+        cb.state
+            .register_weight_q6k_padded("mgu6", &gu6, 2 * nf, id_);
+        assert!(cb.state.is_weight_padded("mgu6"));
+
+        let (xb, ogu4, ogu6) = (
+            cb.alloc_buffer(id_),
+            cb.alloc_buffer(2 * nf),
+            cb.alloc_buffer(2 * nf),
+        );
+        cb.write_host(xb, &xs).unwrap();
+
+        for (ttype, wname, ogu, gdq, udq) in [
+            (crate::tensor::TensorType::Q4_K, "mgu4", ogu4, &g4dq, &u4dq),
+            (crate::tensor::TensorType::Q6_K, "mgu6", ogu6, &g6dq, &u6dq),
+        ] {
+            let mut b = crate::graph::builder::GraphBuilder::new();
+            let x = b.input("x", [id_, 1, 1, 1], crate::graph::DType::F32);
+            let gu = b.fused_ffn(
+                x,
+                crate::graph::ops::FusedFfnMeta {
+                    gu_weight: wname.to_string(),
+                    weight_ttype: ttype,
+                    in_dim: id_,
+                    nf,
+                },
+            );
+            b.output(gu);
+            let g = b.build();
+            cb.execute_node(&g.nodes[gu], &[xb], ogu, None).unwrap();
+
+            // host reference: silu(gate·x) × (up·x)
+            let got = cb.copy_to_host(ogu).unwrap();
+            let mut want = vec![0f32; nf];
+            for r in 0..nf {
+                let mut ag = 0f32;
+                let mut au = 0f32;
+                for i in 0..id_ {
+                    ag += gdq[r * id_ + i] * xs[i];
+                    au += udq[r * id_ + i] * xs[i];
+                }
+                let s = ag / (1.0f32 + (-ag).exp());
+                want[r] = s * au;
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close(
+                &format!("{ttype:?} fused ffn"),
+                &got[..nf],
+                &want,
+                scale * 1e-3,
+            );
         }
     }
 

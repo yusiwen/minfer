@@ -975,6 +975,16 @@ __global__ void silu_f32(float* y, int n) {
 
 // ─── SwiGLU fused: dst = silu(gate) * up ─────────────────────
 
+// 7e⑤: in-place split swiglu over one buffer — buf[i] = silu(buf[i]) *
+// buf[off + i] (the fused FFN concat matmul output: gate rows 0..nf, up
+// rows nf..2*nf; results written back into the gate rows).
+__global__ void swiglu_f32_off(float* __restrict__ buf, int n, int off) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    float g = buf[tid];
+    buf[tid] = (g / (1.0f + expf(-g))) * buf[off + tid];
+}
+
 __global__ void swiglu_f32(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -1222,6 +1232,14 @@ void launch_q6_k_f32_matmul_padded(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q6_k_f32_matmul_padded<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_swiglu_f32_off(
+    float* buf, int n, int off, cudaStream_t stream
+) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    swiglu_f32_off<<<grid, block, 0, stream>>>(buf, n, off);
 }
 
 void launch_gather_rows_f32(

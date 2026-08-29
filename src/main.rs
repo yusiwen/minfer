@@ -734,9 +734,16 @@ fn main() {
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
+        #[cfg(feature = "cuda")]
+        let cuda_on = crate::cuda::CudaState::get().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let cuda_on = false;
         let fuse_qkv = input_ids.len() == 1
             && metal_on
             && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        let fuse_ffn = input_ids.len() == 1
+            && (metal_on || cuda_on)
+            && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
         let model_name = std::path::Path::new(&model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -749,6 +756,7 @@ fn main() {
             params.n_ctx,
             metal_on,
             fuse_qkv,
+            fuse_ffn,
         );
         let kind = if input_ids.len() == 1 {
             "decode"
@@ -758,7 +766,8 @@ fn main() {
         if let Some(path) = &dump_graph {
             // DOT export needs the graph itself (fused, assigned — same as the
             // runtime), so rebuild it via the shared helper.
-            let gparams = runtime_gparams(input_ids.len(), params.n_ctx, metal_on, fuse_qkv);
+            let gparams =
+                runtime_gparams(input_ids.len(), params.n_ctx, metal_on, fuse_qkv, fuse_ffn);
             let g = crate::graph::json::build_runtime_graph(&*model, &gparams);
             let mut f = std::fs::File::create(path).expect("create dot file");
             g.dump_dot(&mut f).expect("write dot");
@@ -913,6 +922,8 @@ fn main() {
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
         let fuse_qkv = metal_on && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+        let fuse_ffn = (metal_on || cfg!(feature = "cuda"))
+            && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
         let prefill_graph = export_graph_json(
             &*model,
             &model_name,
@@ -920,9 +931,17 @@ fn main() {
             params.n_ctx,
             metal_on,
             false,
+            fuse_ffn,
         );
-        let decode_graph =
-            export_graph_json(&*model, &model_name, 1, params.n_ctx, metal_on, fuse_qkv);
+        let decode_graph = export_graph_json(
+            &*model,
+            &model_name,
+            1,
+            params.n_ctx,
+            metal_on,
+            fuse_qkv,
+            fuse_ffn,
+        );
         crate::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
     }
 

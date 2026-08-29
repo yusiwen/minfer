@@ -379,7 +379,25 @@ flag).
   8×512×3) and the extended `cuda_kquant_matmul_parity` (aligned + odd-id
   cases). No cached F32-weight GGUF — E2E F32-model validation pending
   the first such model.
-- FusedFFN for CUDA: host-side concat-weight registration (`ffn_gu` analog of `metal::concat_rows`) + existing concat-matmul kernel + `swiglu` via pointer offsets into the concat buffer; gated by `nf ≤ 16384` like Metal.
+- ✅ **FusedFFN for CUDA (7e⑤, 2026-08-29)**: `cuda::concat_rows` (the
+  `metal::concat_rows` analog — raw row-major concat of same-type,
+  same-in-dim weights); loaders register `blk.{i}.ffn_gu` on CUDA (Q6_K
+  concats go through the padded repack). New `swiglu_f32_off` kernel:
+  in-place `buf[i] = silu(buf[i]) * buf[off+i]` over the concat matmul
+  output (gate rows 0..nf, up rows nf..2nf); `Op::FusedFFN` supported and
+  executed (concat matmul → offset swiglu; down reads rows 0..nf).
+  Topology: `CParams.fuse_ffn` decouples the FFN fusion from the QKV
+  fusion gate in BOTH models (mirrors Qwen3's existing intent) — the
+  `MINFER_NO_FUSE_FFN` toggle is now part of the reuse identity, so it
+  reliably forces a rebuild (Qwen2 previously keyed FFN fusion off
+  `fuse_qkv`, a Metal-only gate that silently disabled fusion on CUDA).
+  Qwen2/Qwen3 `gu_concat_available` gains the CUDA branch, enabling FFN
+  fusion on CUDA for the first time. Parity: `cuda_fused_ffn_parity`
+  (q4_K plain concat + q6_K padded concat vs host silu(gate·x)·(up·x),
+  independent in-test dequant). E2E: 0.5B q4_0 226.7 → 249.6 tok/s
+  (+10%), Qwen3-0.6B q8_0 182.4 → 190.0 tok/s (+4%); 7B unchanged
+  (nf = 18944 > 16384 gate, unfused). Suites 144/0 (cuda parallel +
+  single), plain 130/0.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
 - Async H2D input fill + pinned staging; prefill Q8_0-activation path (`launch_quantize_q8_0` + `launch_q4_0_q8_0_matmul` exist).
 - Docs: `GRAPH-REFACTOR-PLAN.md` §17 Phase 7 row → ✅ (replace the stale "本机无 nvcc" blocker note); `GPU_SAFETY.md` CUDA section; prune `#![allow(dead_code)]` in `cuda.rs` to the still-legacy surface.
