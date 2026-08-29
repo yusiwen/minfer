@@ -201,15 +201,21 @@ impl BackendScheduler {
                     continue;
                 };
                 if br.backend != split.backend {
+                    let op_full = format!("{:?}", node.op);
+                    let op = op_full.split(['(', '{']).next().unwrap_or("?");
                     return Err(format!(
-                        "node {id} buffer on {:?} but executing split is {:?} (assignment/alloc mismatch)",
+                        "node {id} ({op}) buffer on {:?} but executing split is {:?} (assignment/alloc mismatch)",
                         br.backend, split.backend
                     ));
                 }
                 let mut in_bufs = Vec::with_capacity(node.src.len());
                 for &s in &node.src {
+                    // a cross-backend staging copy (split boundary) takes
+                    // precedence: the producing split's canonical buffer stays
+                    // on its own backend
                     let sbr = alloc
-                        .node_buffer(s)
+                        .cross_buffer(s)
+                        .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr.id);
                 }
@@ -262,6 +268,17 @@ impl BackendScheduler {
                             #[cfg(target_os = "macos")]
                             BackendTag::Metal => {
                                 metal_srcs.push((id, br.id));
+                            }
+                            // CUDA: staged D2H needs an owned buffer (borrowed
+                            // read_host can't survive the sync) — copy_to_host
+                            // synchronizes, which is fine for capture mode
+                            #[cfg(feature = "cuda")]
+                            BackendTag::Cuda => {
+                                if let Some(c) = alloc.cuda() {
+                                    if let Some(v) = c.copy_to_host(br.id) {
+                                        record_node_data(node, &v, trace_on, live_on);
+                                    }
+                                }
                             }
                             _ => {}
                         }

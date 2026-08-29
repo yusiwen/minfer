@@ -371,29 +371,39 @@ __global__ void q4_k_f32_matmul(
             get_scale_min_k4(j, sc1, &sc1_s[j], &sc1_m[j]);
         }
 
-        for (int s = 0; s < 8; s++) {
-            float dsc0 = bd0 * sc0_s[s];
-            float dmn0 = bm0 * sc0_m[s];
-            float dsc1 = bd1 * sc1_s[s];
-            float dmn1 = bm1 * sc1_m[s];
+        // Q4_K nibble layout (llama.cpp / quants.rs::dot_q4_k_q8_k_scalar):
+        // 64-element chunks — LOW nibbles of bytes [32j..32j+31] cover
+        // elements [64j..64j+31] (scale sc[2j], min m[2j]); HIGH nibbles of
+        // the same bytes cover elements [64j+32..64j+63] (scale sc[2j+1],
+        // min m[2j+1]). The previous version assumed "sub-block s = bytes
+        // s*16, low group then high group", which misreads every odd
+        // sub-block (half the elements of each super-block).
+        for (int j = 0; j < 4; j++) {
+            const uint8_t* qb0 = qs0 + j * 32;
+            const uint8_t* qb1 = qs1 + j * 32;
+            const float* yl = yb + j * 64;
 
-            const uint8_t* qb0 = qs0 + s * 16;
-            const uint8_t* qb1 = qs1 + s * 16;
-            const float* ys = yb + s * 32;
-
-            float acc0 = 0.0f, acc1 = 0.0f, sumy = 0.0f;
+            float slo0 = 0.0f, shi0 = 0.0f, syl0 = 0.0f, syh0 = 0.0f;
+            float slo1 = 0.0f, shi1 = 0.0f, syl1 = 0.0f, syh1 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t b0 = qb0[j];
-                uint8_t b1 = qb1[j];
-                float y_lo = ys[j];
-                float y_hi = ys[j + 16];
-                acc0 += float(b0 & 0x0F) * y_lo + float(b0 >> 4) * y_hi;
-                acc1 += float(b1 & 0x0F) * y_lo + float(b1 >> 4) * y_hi;
-                sumy += y_lo + y_hi;
+            for (int l = 0; l < 32; l++) {
+                uint8_t b0 = qb0[l];
+                uint8_t b1 = qb1[l];
+                float y_a = yl[l];      // element 64j + l      (LOW nibble)
+                float y_b = yl[l + 32]; // element 64j + 32 + l (HIGH nibble)
+                slo0 += float(b0 & 0x0F) * y_a;
+                shi0 += float(b0 >> 4) * y_b;
+                slo1 += float(b1 & 0x0F) * y_a;
+                shi1 += float(b1 >> 4) * y_b;
+                syl0 += y_a;
+                syh0 += y_b;
+                syl1 += y_a;
+                syh1 += y_b;
             }
-            sumf0 += dsc0 * acc0 - dmn0 * sumy;
-            sumf1 += dsc1 * acc1 - dmn1 * sumy;
+            sumf0 += bd0 * (float(sc0_s[2 * j]) * slo0 + float(sc0_s[2 * j + 1]) * shi0)
+                   - bm0 * (float(sc0_m[2 * j]) * syl0 + float(sc0_m[2 * j + 1]) * syh0);
+            sumf1 += bd1 * (float(sc1_s[2 * j]) * slo1 + float(sc1_s[2 * j + 1]) * shi1)
+                   - bm1 * (float(sc1_m[2 * j]) * syl1 + float(sc1_m[2 * j + 1]) * syh1);
         }
     }
 

@@ -114,6 +114,12 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn alloc_fresh(&mut self, size: usize) -> usize {
+        // never recycled from the free list (see Backend::alloc_fresh)
+        self.buffers.push(vec![0.0f32; size]);
+        self.buffers.len() - 1
+    }
+
     fn execute_node(
         &mut self,
         node: &CNode,

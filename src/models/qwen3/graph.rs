@@ -345,6 +345,14 @@ impl Qwen3Graph {
             crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model);
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
+        // CUDA participation (Phase 7): requires a usable device AND every
+        // matmul weight registered on the CUDA registry in a kernel-supported
+        // type (all-or-nothing; tok_embd excluded — the embedding gather has
+        // no CUDA kernel and stays on the CPU backend).
+        #[cfg(feature = "cuda")]
+        let cuda_on = crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model);
+        #[cfg(not(feature = "cuda"))]
+        let cuda_on = false;
         let params = GraphParams {
             n_tokens: nt,
             n_seqs: 1,
@@ -358,7 +366,7 @@ impl Qwen3Graph {
                 n_ctx,
                 n_batch: nt,
                 flash_attn: false,
-                gpu: metal_on,
+                gpu: metal_on || cuda_on,
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
                 // + no-bias rope+store) is part of the topology; the env toggle
                 // forces a rebuild so it can be A/B'd reliably (like qwen2's
@@ -380,9 +388,13 @@ impl Qwen3Graph {
                 if metal_on {
                     alloc.enable_metal();
                 }
+                #[cfg(feature = "cuda")]
+                if cuda_on {
+                    alloc.enable_cuda();
+                }
                 sched.assign_backends(&mut graph, alloc);
                 let backends: Vec<&dyn Backend> = {
-                    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+                    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
                     let mut v: Vec<&dyn Backend> = vec![alloc.cpu()];
                     #[cfg(target_os = "macos")]
                     if metal_on {
@@ -390,11 +402,22 @@ impl Qwen3Graph {
                             v.push(m);
                         }
                     }
+                    #[cfg(feature = "cuda")]
+                    if cuda_on {
+                        if let Some(c) = alloc.cuda() {
+                            v.push(c);
+                        }
+                    }
                     v
                 };
+                // The closure maps a node's backend to its index in `backends`
+                // (the fusion pass probes supports_fused through it), so the
+                // CUDA index is derived from the actual vector layout.
+                let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
                 FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
                     Some(crate::graph::Backend::CPU) => Some(0),
                     Some(crate::graph::Backend::Metal) => Some(1),
+                    Some(crate::graph::Backend::Cuda) => cuda_idx,
                     _ => None,
                 });
                 alloc.alloc_graph(&graph).unwrap();
@@ -534,6 +557,59 @@ impl Qwen3Graph {
             let _ = names;
             false
         }
+    }
+
+    /// CUDA participation gate (Phase 7c): all-or-nothing over the weights
+    /// the graph executes, EXCLUDING `tok_embd` (the embedding gather has no
+    /// CUDA kernel and stays on the CPU backend). Matmul weights additionally
+    /// require a type with an f32-activation kernel (Q5_0/Q5_1/Q5_K/F32 have
+    /// none — the loader registers them for the legacy path, so the type
+    /// check is required here). Norm/bias weights are f32 and only need
+    /// registration; q_norm/k_norm feed Op::QkNorm on CUDA.
+    #[cfg(feature = "cuda")]
+    fn weights_on_cuda(model: &Qwen3Model) -> bool {
+        use crate::tensor::TensorType;
+        fn matmul_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
+            match t {
+                Some(t) => {
+                    matches!(
+                        t.ttype,
+                        TensorType::Q4_0
+                            | TensorType::Q8_0
+                            | TensorType::Q4_1
+                            | TensorType::Q4_K
+                            | TensorType::Q6_K
+                    ) && cuda.has_weight(&t.name)
+                }
+                None => true,
+            }
+        }
+        fn registered(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
+            match t {
+                Some(t) => cuda.has_weight(&t.name),
+                None => true,
+            }
+        }
+        let Some(cuda) = crate::cuda::CudaState::get() else {
+            return false;
+        };
+        let mut ok = matmul_ok(&model.output, &cuda)
+            && registered(&model.output_norm, &cuda)
+            && registered(&model.output_b, &cuda);
+        for l in &model.layers {
+            ok &= registered(&l.attn_norm, &cuda)
+                && matmul_ok(&l.wq, &cuda)
+                && matmul_ok(&l.wk, &cuda)
+                && matmul_ok(&l.wv, &cuda)
+                && matmul_ok(&l.wo, &cuda)
+                && registered(&l.q_norm, &cuda)
+                && registered(&l.k_norm, &cuda)
+                && registered(&l.ffn_norm, &cuda)
+                && matmul_ok(&l.ffn_gate, &cuda)
+                && matmul_ok(&l.ffn_up, &cuda)
+                && matmul_ok(&l.ffn_down, &cuda);
+        }
+        ok
     }
 }
 

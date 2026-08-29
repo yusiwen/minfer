@@ -303,6 +303,12 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn alloc_fresh(&mut self, size: usize) -> usize {
+        // never recycled from the free list (see Backend::alloc_fresh)
+        self.pool.push(self.state.new_f32_buffer(size));
+        self.pool.len() - 1
+    }
+
     fn execute_node(
         &mut self,
         node: &CNode,

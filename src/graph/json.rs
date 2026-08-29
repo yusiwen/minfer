@@ -46,11 +46,15 @@ pub fn runtime_gparams(n_tokens: usize, n_ctx: usize, gpu: bool, fuse_qkv: bool)
 /// live server.
 pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> ComputeGraph {
     let mut g = model.build_graph(gparams);
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
     let mut alloc = GraphAllocator::new();
     #[cfg(target_os = "macos")]
     if gparams.cparams.gpu {
         alloc.enable_metal();
+    }
+    #[cfg(feature = "cuda")]
+    if gparams.cparams.gpu {
+        alloc.enable_cuda();
     }
     BackendScheduler::new().assign_backends(&mut g, &alloc);
     // FusionPass so the exported graph matches the executed graph (the cache
@@ -59,7 +63,7 @@ pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> Compu
         use crate::graph::backend::Backend as BackendTrait;
         use crate::graph::fusion::FusionPass;
         let backends: Vec<&dyn BackendTrait> = {
-            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
             let mut v: Vec<&dyn BackendTrait> = vec![alloc.cpu()];
             #[cfg(target_os = "macos")]
             if gparams.cparams.gpu {
@@ -67,11 +71,20 @@ pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> Compu
                     v.push(m);
                 }
             }
+            #[cfg(feature = "cuda")]
+            if gparams.cparams.gpu {
+                if let Some(c) = alloc.cuda() {
+                    v.push(c);
+                }
+            }
             v
         };
+        // Index into `backends` for the fusion pass's supports_fused probe.
+        let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
         FusionPass::new().run(&mut g, &backends, &|g, id| match g.node(id).backend {
             Some(Backend::CPU) => Some(0),
             Some(Backend::Metal) => Some(1),
+            Some(Backend::Cuda) => cuda_idx,
             _ => None,
         });
     }

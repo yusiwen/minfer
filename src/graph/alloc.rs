@@ -25,6 +25,13 @@ pub struct GraphAllocator {
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda_backend::CudaBackend>,
     node_to_buf: HashMap<NodeId, BufRef>,
+    /// Cross-backend copies for the CURRENT graph (split-boundary staging):
+    /// node → buffer on the consuming split's backend. NOT part of the node's
+    /// canonical assignment — node_to_buf must stay re-executable (a remap
+    /// would break the next execute of a reused graph, whose producing split
+    /// would find its buffer on another backend). The same staging buffer is
+    /// rewritten on every execute (no per-step allocation).
+    cross: HashMap<NodeId, BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
     /// per-layer KV persistent regions: [k, v]
@@ -42,6 +49,7 @@ impl Default for GraphAllocator {
             #[cfg(feature = "cuda")]
             cuda: None,
             node_to_buf: HashMap::new(),
+            cross: HashMap::new(),
             buf_alive: HashMap::new(),
             kv: HashMap::new(),
             persistent: Vec::new(),
@@ -148,6 +156,13 @@ impl GraphAllocator {
         }
         self.buf_alive.clear();
         self.node_to_buf.clear();
+        // cross-backend staging buffers belong to the previous graph (their
+        // sizes follow that graph's shapes) — free and re-materialize on the
+        // first execute of the new graph
+        let prev_cross: Vec<(NodeId, BufRef)> = self.cross.drain().collect();
+        for (_, cb) in prev_cross {
+            self.free_in_pool(cb.backend, cb.id);
+        }
 
         // The scheduler executes nodes in BUILD order (node id order — the
         // builder appends sources before consumers), so liveness must use the
@@ -292,6 +307,30 @@ impl GraphAllocator {
                 .as_mut()
                 .expect("CUDA pool not enabled")
                 .alloc_buffer(size),
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => unreachable!("CUDA pool not implemented"),
+        }
+    }
+
+    /// Fresh (never recycled) buffer on a backend's pool — split-boundary
+    /// staging only. See Backend::alloc_fresh.
+    fn alloc_fresh_in(&mut self, backend: Backend, size: usize) -> usize {
+        match backend {
+            Backend::CPU => self.cpu.alloc_fresh(size),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => self
+                .metal
+                .as_mut()
+                .expect("Metal pool not enabled")
+                .alloc_fresh(size),
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => unreachable!(),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self
+                .cuda
+                .as_mut()
+                .expect("CUDA pool not enabled")
+                .alloc_fresh(size),
             #[cfg(not(feature = "cuda"))]
             Backend::Cuda => unreachable!("CUDA pool not implemented"),
         }
@@ -504,6 +543,14 @@ impl GraphAllocator {
     /// Cross-backend copy of a node's buffer into `dst_backend`'s pool:
     /// host round trip through read_host/write_host (shared-memory GPU
     /// buffers make this a plain memcpy both ways).
+    ///
+    /// The node's canonical buffer (node_to_buf) is left untouched — the copy
+    /// lands in the `cross` staging map, which the scheduler consults when a
+    /// CONSUMER on `dst_backend` resolves its inputs. Consumers on the node's
+    /// own backend keep reading the original buffer. This keeps a reused graph
+    /// re-executable: the producing split always finds its buffer where the
+    /// allocator put it, and the staging buffer (allocated once per graph
+    /// rebuild) is simply rewritten on each execute.
     pub fn copy_across(&mut self, node_id: NodeId, dst_backend: Backend) -> Result<(), String> {
         let br = self
             .node_buffer(node_id)
@@ -511,10 +558,36 @@ impl GraphAllocator {
         if br.backend == dst_backend {
             return Ok(());
         }
+        // one staging buffer per (node, dst backend) per graph: reuse it when
+        // this execute (or a previous one) already made the copy
+        let staged = self.cross.get(&node_id).map(|cb| (cb.backend, cb.id));
+        if let Some((cb_backend, cb_id)) = staged {
+            if cb_backend == dst_backend {
+                let data = self
+                    .copy_to_cpu(node_id)
+                    .ok_or_else(|| format!("node {node_id} host read failed"))?;
+                match dst_backend {
+                    Backend::CPU => self.cpu.write_host(cb_id, &data)?,
+                    #[cfg(target_os = "macos")]
+                    Backend::Metal => self.metal.as_mut().unwrap().write_host(cb_id, &data)?,
+                    #[cfg(not(target_os = "macos"))]
+                    Backend::Metal => return Err("Metal unavailable".into()),
+                    #[cfg(feature = "cuda")]
+                    Backend::Cuda => self
+                        .cuda
+                        .as_mut()
+                        .expect("CUDA pool not enabled")
+                        .write_host(cb_id, &data)?,
+                    #[cfg(not(feature = "cuda"))]
+                    Backend::Cuda => return Err("CUDA unavailable".into()),
+                }
+                return Ok(());
+            }
+        }
         let data = self
             .copy_to_cpu(node_id)
             .ok_or_else(|| format!("node {node_id} host read failed"))?;
-        let new_id = self.alloc_in_pool(dst_backend, data.len());
+        let new_id = self.alloc_fresh_in(dst_backend, data.len());
         // write into the destination backend pool
         match dst_backend {
             Backend::CPU => self.cpu.write_host(new_id, &data)?,
@@ -531,18 +604,21 @@ impl GraphAllocator {
             #[cfg(not(feature = "cuda"))]
             Backend::Cuda => return Err("CUDA unavailable".into()),
         }
-        // remap the node to the destination buffer
-        self.node_to_buf.insert(
+        self.cross.insert(
             node_id,
             BufRef {
                 backend: dst_backend,
                 id: new_id,
             },
         );
-        // release the old buffer
-        self.buf_alive.remove(&(br.backend, br.id));
-        self.free_in_pool(br.backend, br.id);
         Ok(())
+    }
+
+    /// The node's cross-backend staging buffer, if a split boundary copied it
+    /// for the current graph. Consumers on another backend read this instead
+    /// of the node's canonical buffer.
+    pub fn cross_buffer(&self, node_id: NodeId) -> Option<BufRef> {
+        self.cross.get(&node_id).copied()
     }
 }
 

@@ -1,11 +1,11 @@
 // CUDA (NVIDIA GPU) backend for x86-64 Linux/Windows.
 //
-// NOTE: this backend is a staged draft (Phase 7 in docs/GRAPH-REFACTOR-PLAN.md).
-// The full CudaState API (buffers, streams, CUDA Graph capture, per-op kernels)
-// is written ahead of the graph-scheduler integration, so most of it is not yet
-// reachable from main() (which only uses init/get/init_kv_cache). Dead-code
-// warnings are expected until Phase 7 lands, hence the module-level allow below.
-// Remove it once the backend is wired into the scheduler.
+// The graph backend lives in graph/cuda_backend.rs (Phase 7a-7d); this module
+// hosts the CudaState singleton it wraps: device probes, the weight registry,
+// streams, per-op kernel entry points and the CUDA Graph capture API. The
+// legacy layer_gpu/`init_kv_cache` pre-alloc path is no longer driven by
+// main() (the graph allocator owns KV regions since Phase 7c) and stays for
+// direct CudaState consumers, hence the module-level allow below.
 #![allow(dead_code)]
 
 use crate::block::Q8B;

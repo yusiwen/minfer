@@ -1870,12 +1870,13 @@ pub struct MmapFile {
     _file: std::fs::File, // keeps the fd alive for the mapping's lifetime
 }
 
-#[cfg(target_os = "macos")]
+// Generic POSIX mmap (Linux + macOS; the syscall ABI is identical on both).
+#[cfg(unix)]
 const PROT_READ: i32 = 0x1;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const MAP_PRIVATE: i32 = 0x0002;
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 extern "C" {
     fn mmap(
         addr: *mut std::ffi::c_void,
@@ -1890,12 +1891,12 @@ extern "C" {
 
 impl MmapFile {
     pub fn map(path: &std::path::Path) -> Option<Self> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(unix))]
         {
             let _ = path;
             return None;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             let file = std::fs::File::open(path).ok()?;
@@ -1933,7 +1934,7 @@ impl MmapFile {
 
 impl Drop for MmapFile {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         unsafe {
             munmap(self.ptr as *mut std::ffi::c_void, self.len);
         }

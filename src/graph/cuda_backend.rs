@@ -242,6 +242,17 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn alloc_fresh(&mut self, size: usize) -> usize {
+        // bypass the free list entirely (see Backend::alloc_fresh): the ids in
+        // it are still referenced by node_to_buf and physically live during
+        // the execute that follows
+        let bytes = size * 4;
+        let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
+        self.pool.push(CudaBuf { ptr, bytes });
+        self.pool_gen += 1;
+        self.pool.len() - 1
+    }
+
     fn execute_node(
         &mut self,
         node: &CNode,
@@ -617,12 +628,29 @@ mod tests {
         let data = [1.0f32, -2.0, 3.0, 4.0];
         alloc.fill_input(&g, "x", &data).unwrap();
 
-        // CPU → CUDA → host readback
+        let canon = alloc.node_buffer(x).unwrap();
+        // CPU → CUDA staging copy: canonical buffer untouched, cross map holds
+        // the device copy (Phase 7c: the old remap-into-node_to_buf semantics
+        // broke re-execution of reused graphs — the producing split found its
+        // buffer remapped to another backend on the next execute)
         alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
+        let cross = alloc.cross_buffer(x).expect("cross staging buffer");
+        assert_eq!(cross.backend, crate::graph::Backend::Cuda);
+        assert_eq!(
+            alloc.node_buffer(x).unwrap(),
+            canon,
+            "canonical buffer must not be remapped"
+        );
         assert_eq!(alloc.copy_to_cpu(x).unwrap(), data.to_vec());
-        // CUDA → CPU → host readback
+        // re-copy (same dst) reuses the same staging buffer id
+        alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
+        assert_eq!(alloc.cross_buffer(x).unwrap().id, cross.id);
+        // same-backend copy is a no-op
         alloc.copy_across(x, crate::graph::Backend::CPU).unwrap();
-        assert_eq!(alloc.copy_to_cpu(x).unwrap(), data.to_vec());
+        assert!(alloc.cross_buffer(x).unwrap().backend == crate::graph::Backend::Cuda);
+        // rebuild clears staging (buffers freed, map empty)
+        alloc.alloc_graph(&g).unwrap();
+        assert!(alloc.cross_buffer(x).is_none());
     }
 
     #[test]

@@ -33,6 +33,14 @@ pub trait Backend: Send + Sync {
     fn alloc_buffer(&mut self, size: usize) -> usize;
     fn free_buffer(&mut self, id: usize);
 
+    /// Allocate a buffer that bypasses the recycle free list. Split-boundary
+    /// staging needs this: at execute time the free list holds ids whose
+    /// physical contents are still referenced by node_to_buf and get
+    /// read/written later in the same execute — recycling one would clobber
+    /// in-flight data. Fresh buffers enter the normal free list on
+    /// free_buffer (at graph rebuild), where liveness recycling is safe.
+    fn alloc_fresh(&mut self, size: usize) -> usize;
+
     /// Execute one node: inputs and output are ids in this backend's pool.
     /// `kv_pair` is the layer's (k, v) region buffer ids for KV ops
     /// (None for non-KV ops or when the layer has no regions). The output
