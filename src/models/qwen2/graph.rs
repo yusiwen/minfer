@@ -641,6 +641,39 @@ impl Qwen2Graph {
                 && matmul_ok(&l.ffn_up, &cuda)
                 && matmul_ok(&l.ffn_down, &cuda);
         }
+        if !ok {
+            // TEMP DIAGNOSTIC: identify the first weight that fails the gate
+            let fail = [&model.output]
+                .into_iter()
+                .chain(model.layers.iter().flat_map(|l| {
+                    [
+                        &l.attn_norm,
+                        &l.wq,
+                        &l.bq,
+                        &l.wk,
+                        &l.bk,
+                        &l.wv,
+                        &l.bv,
+                        &l.wo,
+                        &l.ffn_norm,
+                        &l.ffn_gate,
+                        &l.ffn_up,
+                        &l.ffn_down,
+                    ]
+                }))
+                .find(|t| match t {
+                    Some(t) => !cuda.has_weight(&t.name),
+                    None => false,
+                });
+            if let Some(Some(t)) = fail {
+                eprintln!(
+                    "CUDA GATE: weight '{}' (type {:?}) not registered on CUDA",
+                    t.name, t.ttype
+                );
+            } else {
+                eprintln!("CUDA GATE: a matmul weight has an unsupported type");
+            }
+        }
         ok
     }
 }
