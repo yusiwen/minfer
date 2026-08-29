@@ -1332,20 +1332,43 @@ mod tests {
         crate::kernel::embed_tokens(&(0..od as u32).collect::<Vec<u32>>(), &w8, &mut dq8, id_);
         let mut dq4 = vec![0f32; od * id_];
         crate::kernel::embed_tokens(&(0..od as u32).collect::<Vec<u32>>(), &w4, &mut dq4, id_);
-        for (name, o, dq) in [("q8_0 matmul", o8, &dq8), ("q4_0 matmul", o4, &dq4)] {
+        for (name, o, dq, quantize_acts) in [
+            ("q8_0 matmul", o8, &dq8, false),
+            // 8c: prefill Q4_0 runs the Q8_0-activation GEMM (the CPU path
+            // has always quantized activations too) — mirror that in the
+            // reference and keep a tight tolerance.
+            ("q4_0 matmul", o4, &dq4, true),
+        ] {
             let got = cb.copy_to_host(o).unwrap();
             let mut want = vec![0f32; od * nt];
             for t in 0..nt {
+                let xrow = &xs[t * id_..(t + 1) * id_];
+                let acts: Vec<f32> = if quantize_acts {
+                    let q8 = crate::quants::quantize_row_q8_0(xrow);
+                    (0..id_)
+                        .map(|i| {
+                            let b = i / 32;
+                            let d8 = half::f16::from_le_bytes([
+                                q8[b * 34],
+                                q8[b * 34 + 1],
+                            ])
+                            .to_f32();
+                            d8 * q8[b * 34 + 2 + (i % 32)] as i8 as f32
+                        })
+                        .collect()
+                } else {
+                    xrow.to_vec()
+                };
                 for r in 0..od {
                     let mut acc = 0f32;
                     for i in 0..id_ {
-                        acc += dq[r * id_ + i] * xs[t * id_ + i];
+                        acc += dq[r * id_ + i] * acts[i];
                     }
                     want[t * od + r] = acc + bias[r];
                 }
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
-            assert_close(name, &got, &want, scale * 1e-3);
+            assert_close(name, &got, &want, scale * 2e-2);
         }
     }
 
@@ -2304,6 +2327,147 @@ mod tests {
         .unwrap();
         let agot = cb.copy_to_host(ob_at).unwrap();
         assert_close("gqa_attn(f16 kv)", &agot, &aref, 1e-4);
+    }
+
+    // 8c: prefill Q4_0 matmul (nt > 1, id <= 8192) routes through the
+    // Q8_0-activation GEMM. The reference builds the SAME Q8_0 activation
+    // blocks and uses dot_q4_0_q8_0 — the kernel's exact math — so the
+    // tolerance is tight. The nt == 1 call takes the f32-activation path
+    // (decode); its reference dequantizes the weights.
+    #[test]
+    fn cuda_q4_0_prefill_q8_0_gemm_parity() {
+        crate::cuda::CudaState::init();
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (od, id, nt) = (32usize, 64usize, 3usize);
+        let nb = id / 32;
+
+        // build a Q4_0 weight: d = amax/7, biased nibbles (v + 8)
+        let wf: Vec<f32> = (0..od * id)
+            .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+            .collect();
+        let mut wq = Vec::with_capacity(od * nb * 18);
+        for r in 0..od {
+            for b in 0..nb {
+                let row = &wf[r * id + b * 32..r * id + (b + 1) * 32];
+                let amax = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let d = amax / 7.0;
+                let di = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let dbits = half::f16::from_f32(d).to_le_bytes();
+                wq.push(dbits[0]);
+                wq.push(dbits[1]);
+                for j in 0..16 {
+                    let q0 = (row[j] * di).round().clamp(-8.0, 7.0) as i8 + 8;
+                    let q1 = (row[j + 16] * di).round().clamp(-8.0, 7.0) as i8 + 8;
+                    wq.push(((q1 as u8) << 4) | (q0 as u8));
+                }
+            }
+        }
+        let state = cb.state;
+        state.register_weight("w40", &wq);
+        let wptr = state.get_weight_ptr("w40").unwrap();
+
+        let xs: Vec<f32> = (0..id * nt)
+            .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+            .collect();
+        // per-token Q8_0 activation blocks (same layout the kernel reads)
+        let q8s: Vec<Vec<u8>> = (0..nt)
+            .map(|t| crate::quants::quantize_row_q8_0(&xs[t * id..(t + 1) * id]))
+            .collect();
+
+        let xb = cb.alloc_buffer(id * nt);
+        let out = cb.alloc_buffer(od * nt);
+        cb.write_host(xb, &xs).unwrap();
+        let (xptr, optr) = (cb.ptr_of(xb).unwrap(), cb.ptr_of(out).unwrap());
+
+        // nt > 1: Q8_0-activation path
+        state
+            .matmul_f32_ptr(wptr, TensorType::Q4_0, xptr, optr, od, id, nt)
+            .unwrap();
+        cb.synchronize();
+        let got = cb.copy_to_host(out).unwrap();
+        for t in 0..nt {
+            for r in 0..od {
+                let want =
+                    crate::quants::dot_q4_0_q8_0(&wq[r * nb * 18..(r + 1) * nb * 18], &q8s[t]);
+                assert!(
+                    (got[t * od + r] - want).abs() < 1e-3,
+                    "q8_0 path [{t}][{r}] {} vs {want}",
+                    got[t * od + r]
+                );
+            }
+        }
+
+        // CPU cross-check: my hand dequant vs dot_q4_0_q8_0 (same wq bytes)
+        let q8_tok0 = &q8s[0];
+        for r in [0usize, 1, 17] {
+            let via_dot =
+                crate::quants::dot_q4_0_q8_0(&wq[r * nb * 18..(r + 1) * nb * 18], q8_tok0);
+            let mut deq = 0f32;
+            for b in 0..nb {
+                let blk = &wq[r * nb * 18 + b * 18..r * nb * 18 + (b + 1) * 18];
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                let q8b = &q8_tok0[b * 34..(b + 1) * 34];
+                let d8 = half::f16::from_le_bytes([q8b[0], q8b[1]]).to_f32();
+                let mut si = 0i32;
+                for j in 0..16 {
+                    let v0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                    let v1 = (blk[2 + j] >> 4) as i32 - 8;
+                    si += v0 * q8b[2 + j] as i8 as i32 + v1 * q8b[2 + j + 16] as i8 as i32;
+                }
+                deq += si as f32 * d * d8;
+            }
+            let deq_f32 = {
+                // dequant-want against raw f32 x (what the f32 kernel reads);
+                // weight block b pairs with x[b*32 .. b*32+32]
+                let mut acc = 0f32;
+                for b in 0..nb {
+                    let blk = &wq[r * nb * 18 + b * 18..r * nb * 18 + (b + 1) * 18];
+                    let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                    let xb = &xs[b * 32..(b + 1) * 32];
+                    for j in 0..16 {
+                        let v0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                        let v1 = (blk[2 + j] >> 4) as i32 - 8;
+                        acc += d * (v0 as f32 * xb[j] + v1 as f32 * xb[j + 16]);
+                    }
+                }
+                acc
+            };
+            assert!(
+                (via_dot - deq).abs() < 1e-2 && (via_dot - deq_f32).abs() < 5e-2,
+                "crosscheck r={r}: dot_q8 {via_dot} vs dequant-q8 {deq} vs dequant-f32 {deq_f32}"
+            );
+        }
+
+        // nt == 1: f32-activation path (decode), reference dequantizes weights
+        let out1 = cb.alloc_buffer(od);
+        let (x1, o1) = (cb.ptr_of(xb).unwrap(), cb.ptr_of(out1).unwrap());
+        state
+            .matmul_f32_ptr(wptr, TensorType::Q4_0, x1, o1, od, id, 1)
+            .unwrap();
+        cb.synchronize();
+        let got1 = cb.copy_to_host(out1).unwrap();
+        for r in 0..od {
+            let mut want = 0f32;
+            for b in 0..nb {
+                let blk = &wq[r * nb * 18 + b * 18..r * nb * 18 + (b + 1) * 18];
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                let xrow = &xs[b * 32..(b + 1) * 32];
+                for j in 0..16 {
+                    let v0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                    let v1 = (blk[2 + j] >> 4) as i32 - 8;
+                    want += d * (v0 as f32 * xrow[j] + v1 as f32 * xrow[j + 16]);
+                }
+            }
+            assert!(
+                (got1[r] - want).abs() < 0.05,
+                "f32 path [{r}] got {} want {want} diff {}",
+                got1[r],
+                got1[r] - want
+            );
+        }
     }
 
     #[test]

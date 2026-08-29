@@ -404,6 +404,9 @@ pub struct CudaState {
     buf_bg: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_bn: Mutex<(CudaPtr, usize)>,
+    /// 8c: prefill Q8_0-activation scratch (quantized activations for the
+    /// Q4_0×Q8_0 GEMM, nt > 1). Grown on demand like the layer-path buffers.
+    buf_q8_prefill: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_ba: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
@@ -630,6 +633,7 @@ impl CudaState {
             buf_bf: Mutex::new(dummy),
             buf_bg: Mutex::new(dummy),
             buf_q8_bn: Mutex::new(dummy),
+            buf_q8_prefill: Mutex::new(dummy),
             buf_q8_ba: Mutex::new(dummy),
             buf_positions: Mutex::new(dummy),
             buf_logits: Mutex::new(dummy),
@@ -1329,7 +1333,38 @@ impl CudaState {
             }};
         }
         match ttype {
-            TensorType::Q4_0 => launch!(launch_q4_0_f32_matmul),
+            TensorType::Q4_0 => {
+                // 8c: prefill Q8_0-activation GEMM — quantize activations once
+                // and run the int8-dot kernel. Standalone A/B (7e② method,
+                // bench8c): +38–44% at id ≤ 8192 (activation-heavy shapes:
+                // 0.5B all, 7B attn/qkv/o, 7B ffn_gu +4.7%); −63% at
+                // 7B ffn_down (id=18944, weight-stream-bound — the q8_0
+                // kernel streams weight bytes slower), so the shape gate
+                // excludes it. Decode (nt == 1) keeps the f32 kernel.
+                // Prefill never enters a CUDA Graph capture window (8g①
+                // decode-only gate), so the on-demand scratch grow is safe.
+                if nt > 1 && id <= 8192 {
+                    let q8 = Self::get_or_grow(
+                        &self.buf_q8_prefill,
+                        nt * (id / 32) * Q8B,
+                    );
+                    self.quantize_q8_0(x, q8, id, nt);
+                    unsafe {
+                        launch_q4_0_q8_0_matmul(
+                            wptr as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            od as i32,
+                            id as i32,
+                            nt as i32,
+                            stream,
+                        );
+                    }
+                    Ok(())
+                } else {
+                    launch!(launch_q4_0_f32_matmul)
+                }
+            }
             TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
             TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
             TensorType::Q4_K => launch!(launch_q4_k_f32_matmul),
