@@ -58,6 +58,13 @@ MPS) it fails with `18.99` on macOS, exactly like GB10 — which is the
 interpretation-matrix row "machine-independent logic bug; macOS records stale".
 The fix makes the test pass bit-identically regardless.
 
+**Residual (open, scheduled as Phase 7e item):** on aarch64-Linux (GB10) the
+test still fails after the `tail_ids` fix, with max diff **0.449** (down from
+18.99; macOS 0.0). Deterministic, single-threaded, both paths share the
+now-gated worker pool — a genuine numeric-order difference between the graph
+execute path and the legacy adapter path on this machine. Tracked in
+`docs/CUDA-BACKEND-PLAN.md` §7e (first item); not blocking any CUDA phase.
+
 ## Issue 2 — Parallel test runs trip the `attn_heads` UB check (passes single-threaded) — **RESOLVED**
 
 **Location:** `src/graph/cpu_backend.rs:598` in `attn_heads`, dispatched via the

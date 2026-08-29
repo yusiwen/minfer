@@ -301,6 +301,7 @@ flag).
 
 ### 7e — Polish + optional perf (each item A/B measured, independently landable)
 
+- CPU-path residual: `graph_logits_match_forward_real_model` diverges by max diff **0.449** on aarch64-Linux (graph vs legacy-forward; macOS is bit-identical 0.0 after the `tail_ids` test fix in `2ed3eb1`, which collapsed the 18.99 "wrong-row" diff to this residual). Deterministic, single-threaded, both paths share the (now-gated) worker pool. Hypothesis: different reduction-order/dispatch split between the graph execute path and the legacy adapter path on Linux NEON (par_for range split, or Q8_K activation handling). Approach: per-layer dump bisect between the two paths → first diverging node → compare its dispatch (worker split vs scalar). CPU-path code — coordinate before fixing; not blocking any CUDA phase (graph-vs-graph tests pass, E2E verified).
 - `launch_get_rows_*` for quantized rows → Embed + tail-GetRows on CUDA, removes the 2 host round trips (also unlocks `weights_on_cuda` without the tok_embd exclusion).
 - F32×F32 matmul kernel (F32-weight `output` / F32 models).
 - FusedFFN for CUDA: host-side concat-weight registration (`ffn_gu` analog of `metal::concat_rows`) + existing concat-matmul kernel + `swiglu` via pointer offsets into the concat buffer; gated by `nf ≤ 16384` like Metal.
