@@ -174,6 +174,24 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_gather_rows_f32(
+        src: *const f32,
+        ids: *const f32,
+        out: *mut f32,
+        n: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_embed_rows(
+        w: *const u8,
+        ids: *const f32,
+        out: *mut f32,
+        n_embd: i32,
+        nt: i32,
+        type_id: i32,
+        block_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_rms_norm_f32(
         x: *const f32,
         w: *const f32,
@@ -1164,6 +1182,74 @@ impl CudaState {
         unsafe {
             launch_quantize_q8_0(x as *const f32, y as *mut u8, dim as i32, nt as i32, stream);
         }
+    }
+
+    /// 7e③: generic f32 row gather on device (`get_rows`: out[t*n+i] =
+    /// src[ids[t]*n+i]; ids are I32-as-f32 bit patterns on device).
+    pub fn gather_rows_f32_on_gpu(
+        &self,
+        src: *mut std::ffi::c_void,
+        ids: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        n: usize,
+        nt: usize,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_gather_rows_f32(
+                src as *const f32,
+                ids as *const f32,
+                out as *mut f32,
+                n as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// 7e③: embedding gather + dequantize on device. `padded_q6k` selects the
+    /// padded (224-byte) block stride for Q6_K weights registered via
+    /// `register_weight_q6k_padded`.
+    pub fn embed_rows_on_gpu(
+        &self,
+        ttype: TensorType,
+        wptr: *mut std::ffi::c_void,
+        ids: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        n_embd: usize,
+        nt: usize,
+        padded_q6k: bool,
+    ) -> Result<(), String> {
+        let stream = self.stream();
+        let (type_id, block_stride) = match ttype {
+            TensorType::Q8_0 => (0i32, 34i32),
+            TensorType::Q4_0 => (1, 18),
+            TensorType::Q4_K => (2, 144),
+            TensorType::Q6_K => (3, if padded_q6k { 224 } else { 210 }),
+            TensorType::F32 => {
+                // f32 tok_embd is a plain gather of weight rows
+                self.gather_rows_f32_on_gpu(wptr, ids, out, n_embd, nt);
+                return Ok(());
+            }
+            other => {
+                return Err(format!(
+                    "cuda: no embed_rows kernel for weight type {other:?}"
+                ));
+            }
+        };
+        unsafe {
+            launch_embed_rows(
+                wptr as *const u8,
+                ids as *const f32,
+                out as *mut f32,
+                n_embd as i32,
+                nt as i32,
+                type_id,
+                block_stride,
+                stream,
+            );
+        }
+        Ok(())
     }
 
     pub fn rms_norm(

@@ -650,6 +650,140 @@ __global__ void q6_k_f32_matmul_padded(
     }
 }
 
+// ─── Row gather / embedding (7e③) ─────────────────────────────
+// Embedding = gather + dequantize weight rows on device (removes the CPU
+// round trips around the prefill's embed and G3 tail get_rows). ids are
+// I32-as-f32 bit patterns (exact for |v| < 2^24), read via __float2int_rn.
+// The generic f32 gather (get_rows: out[t*n+i] = x[ids[t]*n+i]) shares the
+// f32 kernel.
+
+__global__ void gather_rows_f32(
+    const float* __restrict__ src,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n, int nt
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)nt * n;
+    if (idx >= total) return;
+    int t = (int)(idx / n);
+    int i = (int)(idx % n);
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    out[idx] = src[(long long)id * n + i];
+}
+
+__global__ void embed_rows_q8_0(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    const int BS = 34; // f16 d + 32 int8
+    int nb = n_embd / 32;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nb) return;
+    int t = tid / nb, b = tid % nb;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    const uint8_t* blk = w + ((long long)id * nb + b) * BS;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    const int8_t* q = (const int8_t*)(blk + 2);
+    float* o = out + (long long)t * n_embd + b * 32;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) o[i] = d * float(q[i]);
+}
+
+__global__ void embed_rows_q4_0(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    const int BS = 18; // f16 d + 16 nibble bytes
+    int nb = n_embd / 32;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nb) return;
+    int t = tid / nb, b = tid % nb;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    const uint8_t* blk = w + ((long long)id * nb + b) * BS;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    const uint8_t* q = blk + 2;
+    float* o = out + (long long)t * n_embd + b * 32;
+    // element j = LOW nibble of byte j; element j+16 = HIGH nibble.
+    // minfer Q4_0 stores round(v/d) + 8 (same -8 offset as the matmuls and
+    // the CPU embed path).
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        o[i] = d * (float(q[i] & 0x0F) - 8.0f);
+        o[i + 16] = d * (float(q[i] >> 4) - 8.0f);
+    }
+}
+
+__global__ void embed_rows_q4_k(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    int nsp = n_embd / 256; // super-blocks per row
+    int nsub = nsp * 8;     // 32-element sub-blocks per row
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nsub) return;
+    int t = tid / nsub, s = tid % nsub;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    int sp = s / 8, sub = s % 8;
+    const uint8_t* blk = w + ((long long)id * nsp + sp) * Q4KB;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float dmin = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    uint8_t scb, mb;
+    get_scale_min_k4(sub, blk + 4, &scb, &mb);
+    // sub-block s covers elements [32s..32s+31]: chunk j = s/2, LOW nibbles
+    // for even s, HIGH for odd (scale index s).
+    int j = sub / 2, half = sub % 2;
+    const uint8_t* q = blk + 16 + j * 32;
+    float* o = out + (long long)t * n_embd + s * 32;
+    float ds = d * float(scb), dmm = dmin * float(mb);
+    #pragma unroll
+    for (int l = 0; l < 32; l++) {
+        float nib = half ? float(q[l] >> 4) : float(q[l] & 0x0F);
+        o[l] = ds * nib - dmm;
+    }
+}
+
+// Q6_K: one thread per 16-element sub-block (16 per 256 super-block).
+// block_stride = 210 (raw GGUF) or 224 (padded registration).
+__global__ void embed_rows_q6_k(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt, int block_stride
+) {
+    int nsp = n_embd / 256;
+    int nsub = nsp * 16;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nsub) return;
+    int t = tid / nsub, s = tid % nsub;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    int sp = s / 16, sub = s % 16;
+    const uint8_t* blk = w + ((long long)id * nsp + sp) * block_stride;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+    const uint8_t* ql = blk;
+    const uint8_t* qh = blk + 128;
+    const int8_t* sc = (const int8_t*)(blk + 192);
+    // sub s = n*8 + tt*2 + g: element base n*128 + tt*32 + g*16
+    int n = sub / 8, rem = sub % 8, tt = rem / 2, g = rem % 2;
+    int ql_off = n * 64 + (tt % 2) * 32 + g * 16;
+    int qh_off = n * 32 + g * 16;
+    int sc_idx = n * 8 + tt * 2 + g;
+    float* o = out + (long long)t * n_embd + sp * 256 + n * 128 + tt * 32 + g * 16;
+    float dsc = d * float(sc[sc_idx]);
+    #pragma unroll
+    for (int r = 0; r < 16; r++) {
+        int nib = (tt < 2) ? (ql[ql_off + r] & 0x0F) : (ql[ql_off + r] >> 4);
+        int q2 = (qh[qh_off + r] >> (tt * 2)) & 3;
+        o[r] = dsc * float((nib | (q2 << 4)) - 32);
+    }
+}
+
 // ─── Quantize f32 → Q8_0 (1 thread per 32-element block) ─────
 // Matches CPU scalar path: half delta + 32 signed int8 values
 
@@ -1019,6 +1153,40 @@ void launch_q6_k_f32_matmul_padded(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q6_k_f32_matmul_padded<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_gather_rows_f32(
+    const float* src, const float* ids, float* out,
+    int n, int nt, cudaStream_t stream
+) {
+    long long total = (long long)nt * n;
+    int block = 256;
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    gather_rows_f32<<<(int)grid, block, 0, stream>>>(src, ids, out, n, nt);
+}
+
+void launch_embed_rows(
+    const uint8_t* w, const float* ids, float* out,
+    int n_embd, int nt, int type_id, int block_stride, cudaStream_t stream
+) {
+    int block = 256;
+    long long total = 0;
+    if (type_id == 0 || type_id == 1) { // q8_0 / q4_0: one thread per 32-group
+        total = (long long)nt * (n_embd / 32);
+    } else if (type_id == 2) {          // q4_K: one per 32-element sub-block
+        total = (long long)nt * (n_embd / 256) * 8;
+    } else {                            // q6_K: one per 16-element sub-block
+        total = (long long)nt * (n_embd / 256) * 16;
+    }
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    switch (type_id) {
+        case 0: embed_rows_q8_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
+        case 1: embed_rows_q4_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
+        case 2: embed_rows_q4_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
+        default: embed_rows_q6_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt, block_stride); break;
+    }
 }
 
 void launch_q4_k_f32_matmul(

@@ -338,7 +338,32 @@ flag).
 
 - ✅ **CPU-path residual (7e①, RESOLVED — not a bug)**: `graph_logits_match_forward_real_model` diff **0.449** (prefill) / **0.525** (decode) diagnosed as a *path-identity artifact*: since Phase 6 `model.forward` routes through the graph path, the test's "reference" is itself a graph — on CUDA builds it takes the CUDA graph (the manual side is CPU-only), so the diff is cross-backend f32 reduction-order noise (AGENTS §9 class), not a CPU-path defect. macOS's 0.0 was just "no CUDA feature → both sides CPU". Hypotheses (NEON split, Q8_K handling, worker pool) all disproved: the diff survived `MINFER_NO_NEON=1` and `set_cpu_threads(1)` unchanged. Greedy tokens agree on both steps (12095 / 11). Fix: `compare` mirrors the Metal precedent — strict `1e-3` on CPU-only builds, greedy-token equality when the engine side runs CUDA. Recorded in `docs/KNOWN-CPU-ISSUES-2026-08-29.md`.
 - ✅ **Vectorized q4_K/q6_K kernels (7e②, 2026-08-29)**: 7B decode **8.4 → 26.4 tok/s (3.1×)**, 0.5B 241 tok/s (unchanged, q4_0 untouched). Three combined changes, each validated by a standalone nvcc A/B against the original kernel plus a new `cuda_kquant_matmul_parity` test (independent in-test dequant reference; q6_K previously had NO parity coverage — the gap that let a broken intermediate variant pass the suite): (1) **Q6_K padded registration** — `register_weight_q6k_padded` copies each 210-byte block into a 224-byte slot (224 = 14×16) so the weight stream can use 16-byte-aligned uint4 loads (the raw 210-byte stride forced 1-byte-per-instruction reads); dispatch via `matmul_f32_ptr_layout(.., padded_q6k)`; `has_weight_of_size` matches padded entries by their ORIGINAL raw length so the weights gate stays correct. (2) **Unit lane mapping for q4_K** — lanes own (row, super-block) pairs (NR0=4, 56 units/warp) instead of one block per lane: the 7B FFN shapes have nbe=14 blocks/row, which idled 18/32 lanes in the lane-per-block layout; measured 42 → 163 GB/s on the ffn_gu shape. (3) **float4 activation loads** in both kernels. Debugging lessons recorded: a temporary sync inside the matmul dispatch silently corrupted graph capture windows (garbage output whenever graphs were enabled) — never sync inside `execute_node`; and "faster but wrong" (the v-selector bug read ¼ of the y values) is a red flag for load-count changes, not a perf win.
-- `launch_get_rows_*` for quantized rows → Embed + tail-GetRows on CUDA, removes the 2 host round trips (also unlocks `weights_on_cuda` without the tok_embd exclusion).
+- ✅ **Embed + GetRows on device (7e③, 2026-08-29)**: the embedding gather
+  (Op::GetRows with Embed meta — `builder.embedding()` emits GetRows, there
+  is no separate Op::Embed) and the generic f32 tail gather (G3, no meta)
+  run as CUDA kernels, removing the prefill/decode CPU round trips around
+  them — prefill and decode graphs are now a SINGLE CUDA split (no
+  cross-backend copies at all). One thread per output sub-block per weight
+  type (F32/Q8_0/Q4_0: 32-elem groups; Q4_K: 32-elem sub-blocks of the
+  super-block, scale = sub-block index; Q6_K: 16-elem sub-blocks, with a
+  `block_stride` parameter covering both the raw 210-byte and padded
+  224-byte registrations). ids are I32-as-f32 BIT patterns read with
+  `__float_as_int` (graph rule §4) — `__float2int_rn` would read the
+  denormal float value and always yield 0. minfer Q4_0 stores
+  `round(v/d) + 8` — the embed kernel needs the same `-8` offset as the
+  matmuls and the CPU embed path (a plain `d*nibble` version passed the
+  suite's q4_0-free coverage and produced garbage only on q4_0 models —
+  re-run E2E per quant after touching a shared kernel; unit tests with a
+  single quant do not cover the convention). `weights_on_cuda` now gates
+  tok_embd like every other weight (embed-kernel types F32/Q4_0/Q8_0/
+  Q4_K/Q6_K; Q4_1-embd models are unaffected — their Q5_K matmul weights
+  already keep them CPU-only). Measured: prefill 300-token 7B prompt
+  9.42→9.18 s (≈1.5% — matmul-dominated; the structural win is the
+  single-split graph), decode unchanged (26.2 tok/s 7B, 248 tok/s 0.5B).
+  Parity: `cuda_embed_getrows_parity` covers all 6 embed types incl. the
+  padded Q6_K layout against `kernel::embed_tokens`, plus a model-shape
+  q4_0 case (n_embd=896, ids up to 9625) and the generic gather.
+- Remaining prefill perf work: FusedFFN (7e⑤) and F32×F32 matmul (7e④).
 - F32×F32 matmul kernel (F32-weight `output` / F32 models).
 - FusedFFN for CUDA: host-side concat-weight registration (`ffn_gu` analog of `metal::concat_rows`) + existing concat-matmul kernel + `swiglu` via pointer offsets into the concat buffer; gated by `nf ≤ 16384` like Metal.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.

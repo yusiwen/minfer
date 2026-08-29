@@ -385,7 +385,13 @@ impl Backend for CudaBackend {
             | Op::KvcacheLoad { .. }
             | Op::View { .. }
             | Op::Reshape { .. }
-            | Op::Permute { .. } => true,
+            | Op::Permute { .. }
+            // 7e③: row gather — the embedding (Embed meta, weight dequant by
+            // type; weight-type support is enforced by the model-level gate,
+            // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
+            // generic f32 tail gather (no meta). Removes the CPU round trips
+            // around the prefill's embed and G3 tail reduction.
+            | Op::GetRows => true,
             // MatMul ttype gating happens at the model level (weights must all
             // be registered on CUDA — same all-or-nothing rule as Metal).
             Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
@@ -466,6 +472,44 @@ impl Backend for CudaBackend {
                     .ok_or_else(|| format!("cuda: {} without source buffer", node.name))?;
                 self.copy_d2d(src, out_buf)
             }
+            // 7e③: row gather. Embed meta = weight gather + dequantize (the
+            // embedding, type dispatched on device); no meta = generic f32
+            // gather (the G3 tail reduction). ids are I32-as-f32 bits.
+            Op::GetRows => match &node.meta {
+                NodeMeta::Embed(m) => {
+                    let wptr = self.state.get_weight_ptr(&m.weight_name).ok_or_else(|| {
+                        format!(
+                            "cuda: {} weight '{}' not registered",
+                            node.name, m.weight_name
+                        )
+                    })?;
+                    let n_embd = node.out_shape[0];
+                    let nt = node.out_shape[1];
+                    self.state.embed_rows_on_gpu(
+                        m.weight_ttype,
+                        wptr,
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(out_buf)?,
+                        n_embd,
+                        nt,
+                        self.state.is_weight_padded(&m.weight_name),
+                    )?;
+                    Ok(())
+                }
+                NodeMeta::None => {
+                    let n_embd = node.out_shape[0];
+                    let nt = node.out_shape[1];
+                    self.state.gather_rows_f32_on_gpu(
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(in_bufs[1])?,
+                        self.ptr_of(out_buf)?,
+                        n_embd,
+                        nt,
+                    );
+                    Ok(())
+                }
+                other => Err(format!("get_rows node with unexpected meta: {other:?}")),
+            },
 
             Op::Add => {
                 let n = self.elems(out_buf);
@@ -1331,6 +1375,242 @@ mod tests {
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
             assert_close(name, &got, &want, scale * 2e-3);
+        }
+    }
+
+    /// 7e③: embedding / row-gather parity. Device embed kernels (one per
+    /// supported weight type, incl. the padded Q6_K layout) must match
+    /// `kernel::embed_tokens` — the CPU path these nodes used before 7e③ —
+    /// and the generic f32 gather (G3 tail get_rows) must match a manual
+    /// row copy.
+    #[test]
+    fn cuda_embed_getrows_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (vocab, n_embd, nt) = (6usize, 512usize, 3usize); // 2 super-blocks/row
+        let ids: Vec<u32> = vec![0, 5, 2];
+        let ids_f32: Vec<f32> = ids.iter().map(|&i| f32::from_bits(i)).collect();
+
+        // ── build one tensor per supported type (rows = vocab) ──
+        // f32
+        let wf: Vec<f32> = (0..vocab * n_embd)
+            .map(|i| (((i as u64) * 2654435761 % 1009) as f32) / 504.0 - 1.0)
+            .collect();
+        let wf_bytes: Vec<u8> = wf.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut tf = Tensor::from_data(
+            TensorType::F32,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            wf_bytes.clone(),
+        );
+        tf.name = "ewf32".to_string();
+
+        // q8_0 (34B blocks: f16 d + 32 i8)
+        let mut w8 = Vec::new();
+        for r in 0..vocab {
+            for ib in 0..n_embd / 32 {
+                let d = 0.02f32 + 0.003 * ((r * 5 + ib) % 7) as f32;
+                w8.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for i in 0..32 {
+                    w8.push((((r * 37 + ib * 17 + i * 3) % 255) as i8 as u8).wrapping_add(0));
+                }
+            }
+        }
+        let mut t8 = Tensor::from_data(
+            TensorType::Q8_0,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w8.clone(),
+        );
+        t8.name = "ewq8".to_string();
+
+        // q4_0 (18B blocks: f16 d + 16 nibble bytes; elem j = LOW of byte j)
+        let mut w40 = Vec::new();
+        for r in 0..vocab {
+            for ib in 0..n_embd / 32 {
+                let d = 0.03f32 + 0.004 * ((r * 3 + ib * 2) % 5) as f32;
+                w40.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for i in 0..16 {
+                    let lo = ((r * 11 + ib * 7 + i * 3) % 15) as u8;
+                    let hi = ((r * 7 + ib * 5 + i) % 15) as u8;
+                    w40.push(lo | (hi << 4));
+                }
+            }
+        }
+        let mut t40 = Tensor::from_data(
+            TensorType::Q4_0,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w40.clone(),
+        );
+        t40.name = "ewq40".to_string();
+
+        // q4_k (144B super-blocks) — same generator scheme as the matmul test
+        let mut w4k = Vec::new();
+        for r in 0..vocab {
+            for ib in 0..n_embd / 256 {
+                let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
+                let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
+                w4k.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                w4k.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                for j in 0..12 {
+                    w4k.push(((r * 31 + j * 17 + ib * 5) % 63) as u8);
+                }
+                for j in 0..128 {
+                    let lo = ((r * 13 + j * 7 + ib * 3) % 15) as u8;
+                    let hi = ((r * 5 + j * 11 + ib * 2) % 15) as u8;
+                    w4k.push(lo | (hi << 4));
+                }
+            }
+        }
+        let mut t4k = Tensor::from_data(
+            TensorType::Q4_K,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w4k.clone(),
+        );
+        t4k.name = "ewq4k".to_string();
+
+        // q6_k (210B raw; also registered padded)
+        let mut w6k = Vec::new();
+        for r in 0..vocab {
+            for ib in 0..n_embd / 256 {
+                let d = 0.027f32 + 0.004 * ((r * 11 + ib * 7) % 6) as f32;
+                for i in 0..128 {
+                    w6k.push(((r * 29 + i * 7 + ib * 3) % 255) as u8);
+                }
+                for i in 0..64 {
+                    w6k.push(((r * 17 + i * 13 + ib * 11) % 255) as u8);
+                }
+                for i in 0..16 {
+                    w6k.push(((((r * 5 + i * 3 + ib) % 15) as i8) - 7) as u8);
+                }
+                w6k.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+            }
+        }
+        let mut t6k = Tensor::from_data(
+            TensorType::Q6_K,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w6k.clone(),
+        );
+        t6k.name = "ewq6k".to_string();
+        let mut t6kp = Tensor::from_data(
+            TensorType::Q6_K,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w6k.clone(),
+        );
+        t6kp.name = "ewq6kp".to_string();
+
+        // ── register + build one graph with an embed node per type ──
+        cb.state.register_weight("ewf32", &wf_bytes);
+        cb.state.register_weight("ewq8", &w8);
+        cb.state.register_weight("ewq40", &w40);
+        cb.state.register_weight("ewq4k", &w4k);
+        cb.state.register_weight("ewq6k", &w6k);
+        cb.state
+            .register_weight_q6k_padded("ewq6kp", &w6k, vocab, n_embd);
+        assert!(cb.state.is_weight_padded("ewq6kp"));
+
+        let mut b = GraphBuilder::new();
+        let ids_in = b.input("ids", [nt, 1, 1, 1], DType::F32);
+        let e_f32 = b.embedding(ids_in, &tf);
+        let e_q8 = b.embedding(ids_in, &t8);
+        let e_q40 = b.embedding(ids_in, &t40);
+        let e_q4k = b.embedding(ids_in, &t4k);
+        let e_q6k = b.embedding(ids_in, &t6k);
+        let e_q6kp = b.embedding(ids_in, &t6kp);
+        // ── 7e③ model-shape q4_0 case (0.5B): n_embd=896 (nb=28 blocks),
+        // large ids — the exact shape that E2E first exercised ──
+        let (mv, me) = (10000usize, 896usize);
+        let mids: Vec<u32> = vec![785, 6722, 315, 9625, 374];
+        let mut mw = Vec::new();
+        for r in 0..mv {
+            for ib in 0..me / 32 {
+                let d = 0.03f32 + 0.004 * ((r * 3 + ib * 2) % 5) as f32;
+                mw.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for i in 0..16 {
+                    let lo = ((r * 11 + ib * 7 + i * 3) % 15) as u8;
+                    let hi = ((r * 7 + ib * 5 + i) % 15) as u8;
+                    mw.push(lo | (hi << 4));
+                }
+            }
+        }
+        let mut mt = Tensor::from_data(TensorType::Q4_0, &[me as i64, mv as i64, 1, 1], mw.clone());
+        mt.name = "ewq40m".to_string();
+        cb.state.register_weight("ewq40m", &mw);
+        let mids_f32: Vec<f32> = mids.iter().map(|&i| f32::from_bits(i)).collect();
+        let midb = cb.alloc_buffer(mids.len());
+        cb.write_host(midb, &mids_f32).unwrap();
+        let mout = cb.alloc_buffer(me * mids.len());
+        let mut mb = GraphBuilder::new();
+        let mi = mb.input("mids", [mids.len(), 1, 1, 1], DType::F32);
+        let me_node = mb.embedding(mi, &mt);
+        mb.output(me_node);
+        let mg = mb.build();
+        cb.execute_node(&mg.nodes[me_node], &[midb], mout, None)
+            .unwrap();
+        {
+            let got = cb.copy_to_host(mout).unwrap();
+            let mut want = vec![0f32; me * mids.len()];
+            crate::kernel::embed_tokens(&mids, &mt, &mut want, me);
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close("embed q4_0 model-shape", &got, &want, scale * 2e-3);
+        }
+
+        // generic gather (G3 tail): x[ids[t]] — the source has vocab rows so
+        // every id is in range
+        let xin = b.input("x", [n_embd, vocab, 1, 1], DType::F32);
+        let gr = b.get_rows(xin, ids_in, [n_embd, nt, 1, 1]);
+        for n in [e_f32, e_q8, e_q40, e_q4k, e_q6k, e_q6kp, gr] {
+            b.output(n);
+        }
+        let g = b.build();
+
+        let idsb = cb.alloc_buffer(nt);
+        cb.write_host(idsb, &ids_f32).unwrap();
+        let xvals: Vec<f32> = (0..n_embd * vocab)
+            .map(|i| (((i as u64) * 1103515245 % 997) as f32) / 500.0 - 1.0)
+            .collect();
+        let xb = cb.alloc_buffer(n_embd * vocab);
+        cb.write_host(xb, &xvals).unwrap();
+
+        let mut outs = Vec::new();
+        for node in [e_f32, e_q8, e_q40, e_q4k, e_q6k, e_q6kp] {
+            let out = cb.alloc_buffer(n_embd * nt);
+            cb.execute_node(&g.nodes[node], &[idsb], out, None).unwrap();
+            outs.push(out);
+        }
+        let grb = cb.alloc_buffer(n_embd * nt);
+        cb.execute_node(&g.nodes[gr], &[xb, idsb], grb, None)
+            .unwrap();
+
+        // ── references ──
+        let names = ["f32", "q8_0", "q4_0", "q4_k", "q6_k", "q6_k padded"];
+        let tensors = [&tf, &t8, &t40, &t4k, &t6k, &t6kp];
+        for ((name, t), &ob) in names.iter().zip(tensors).zip(outs.iter()) {
+            let got = cb.copy_to_host(ob).unwrap();
+            let mut want = vec![0f32; n_embd * nt];
+            if t.ttype == TensorType::F32 {
+                // embed_tokens handles the quantized types; f32 is a row copy
+                for (ti, &id) in ids.iter().enumerate() {
+                    let src = (id as usize) * n_embd;
+                    want[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(&wf[src..src + n_embd]);
+                }
+            } else {
+                crate::kernel::embed_tokens(&ids, t, &mut want, n_embd);
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close(&format!("embed {name}"), &got, &want, scale * 2e-3);
+        }
+        let got = cb.copy_to_host(grb).unwrap();
+        for t in 0..nt {
+            let id = ids[t] as usize;
+            for i in 0..n_embd {
+                let want = xvals[id * n_embd + i];
+                assert!(
+                    (got[t * n_embd + i] - want).abs() <= 1e-6 * (1.0 + want.abs()),
+                    "gather [{t},{i}]: got {} want {want}",
+                    got[t * n_embd + i]
+                );
+            }
         }
     }
 

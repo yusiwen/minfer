@@ -347,8 +347,8 @@ impl Qwen3Graph {
         let metal_on = false;
         // CUDA participation (Phase 7): requires a usable device AND every
         // matmul weight registered on the CUDA registry in a kernel-supported
-        // type (all-or-nothing; tok_embd excluded — the embedding gather has
-        // no CUDA kernel and stays on the CPU backend).
+        // type (all-or-nothing; 7e③ moved the embedding gather on device, so
+        // tok_embd is gated like every other weight).
         #[cfg(feature = "cuda")]
         let cuda_on = crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model);
         #[cfg(not(feature = "cuda"))]
@@ -559,12 +559,13 @@ impl Qwen3Graph {
         }
     }
 
-    /// CUDA participation gate (Phase 7c): all-or-nothing over the weights
-    /// the graph executes, EXCLUDING `tok_embd` (the embedding gather has no
-    /// CUDA kernel and stays on the CPU backend). Matmul weights additionally
+    /// CUDA participation gate (Phase 7c, extended 7e③): all-or-nothing over
+    /// the weights the graph executes, now INCLUDING `tok_embd` (7e③ gave the
+    /// embedding a device gather+dequant kernel). Matmul weights additionally
     /// require a type with an f32-activation kernel (Q5_0/Q5_1/Q5_K/F32 have
     /// none — the loader registers them for the legacy path, so the type
-    /// check is required here). Norm/bias weights are f32 and only need
+    /// check is required here); tok_embd requires an embed-kernel type
+    /// (F32/Q4_0/Q8_0/Q4_K/Q6_K). Norm/bias weights are f32 and only need
     /// registration; q_norm/k_norm feed Op::QkNorm on CUDA.
     #[cfg(feature = "cuda")]
     fn weights_on_cuda(model: &Qwen3Model) -> bool {
@@ -584,6 +585,21 @@ impl Qwen3Graph {
                 None => true,
             }
         }
+        fn embed_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
+            match t {
+                Some(t) => {
+                    matches!(
+                        t.ttype,
+                        TensorType::F32
+                            | TensorType::Q4_0
+                            | TensorType::Q8_0
+                            | TensorType::Q4_K
+                            | TensorType::Q6_K
+                    ) && cuda.has_weight_of_size(&t.name, t.data().len())
+                }
+                None => true,
+            }
+        }
         fn registered(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
                 Some(t) => cuda.has_weight_of_size(&t.name, t.data().len()),
@@ -593,7 +609,8 @@ impl Qwen3Graph {
         let Some(cuda) = crate::cuda::CudaState::get() else {
             return false;
         };
-        let mut ok = matmul_ok(&model.output, &cuda)
+        let mut ok = embed_ok(&model.tok_embd, &cuda)
+            && matmul_ok(&model.output, &cuda)
             && registered(&model.output_norm, &cuda)
             && registered(&model.output_b, &cuda);
         for l in &model.layers {
