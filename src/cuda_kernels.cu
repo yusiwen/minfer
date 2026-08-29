@@ -784,6 +784,75 @@ __global__ void embed_rows_q6_k(
     }
 }
 
+// ─── F32 × F32 matmul (7e④) ───────────────────────────────────
+// Same unit lane mapping as the q4_K kernel: lanes own (row, 256-elem
+// chunk) pairs, float4 loads on both operands. Requires id % 8 == 0 for
+// the aligned float4 loads; the scalar kernel covers the general case.
+__global__ void f32_f32_matmul_vec(
+    const float* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+    const int CHK = 256;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+    if (t >= nt || r0 >= od) return;
+
+    int nch = (id + CHK - 1) / CHK;
+    const float* y = acts + (size_t)t * id;
+
+    float acc[NR0];
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+
+    for (int u = lane_id; u < nch * NR0; u += WARP) {
+        int ic = u % nch, rr = u / nch;
+        const float* wr = weights + (size_t)(r0 + rr) * id + ic * CHK;
+        const float* yc = y + ic * CHK;
+        int len = min(CHK, id - ic * CHK);
+        float p = 0.0f;
+        // the unit's lane streams the WHOLE chunk (8 floats per pass)
+        for (int i = 0; i < len; i += 8) {
+            float4 a0 = *reinterpret_cast<const float4*>(wr + i);
+            float4 a1 = *reinterpret_cast<const float4*>(wr + i + 4);
+            float4 b0 = *reinterpret_cast<const float4*>(yc + i);
+            float4 b1 = *reinterpret_cast<const float4*>(yc + i + 4);
+            p += a0.x * b0.x + a0.y * b0.y + a0.z * b0.z + a0.w * b0.w
+               + a1.x * b1.x + a1.y * b1.y + a1.z * b1.z + a1.w * b1.w;
+        }
+        acc[rr] += p;
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) {
+        float v = warp_reduce_sum(acc[rr]);
+        if (lane_id == 0 && r0 + rr < od) output[(size_t)t * od + r0 + rr] = v;
+    }
+}
+
+// General-case fallback: one thread per (token, output) pair, scalar dot.
+__global__ void f32_f32_matmul_scalar(
+    const float* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)nt * od) return;
+    int t = (int)(idx / od), r = (int)(idx % od);
+    const float* wr = weights + (size_t)r * id;
+    const float* y = acts + (size_t)t * id;
+    float acc = 0.0f;
+    for (int i = 0; i < id; i++) acc += wr[i] * y[i];
+    output[idx] = acc;
+}
+
 // ─── Quantize f32 → Q8_0 (1 thread per 32-element block) ─────
 // Matches CPU scalar path: half delta + 32 signed int8 values
 
@@ -1186,6 +1255,22 @@ void launch_embed_rows(
         case 1: embed_rows_q4_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 2: embed_rows_q4_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         default: embed_rows_q6_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt, block_stride); break;
+    }
+}
+
+void launch_f32_f32_matmul(
+    const float* w, const float* x, float* out,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    if (id % 8 == 0) {
+        dim3 grid((od + 7) / 8, nt), block(64);
+        f32_f32_matmul_vec<<<grid, block, 0, stream>>>(w, x, out, od, id, nt);
+    } else {
+        long long total = (long long)nt * od;
+        int block = 256;
+        long long grid = (total + block - 1) / block;
+        if (grid > 2147483647LL) grid = 2147483647LL;
+        f32_f32_matmul_scalar<<<(int)grid, block, 0, stream>>>(w, x, out, od, id, nt);
     }
 }
 

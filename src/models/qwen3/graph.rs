@@ -580,6 +580,7 @@ impl Qwen3Graph {
                             | TensorType::Q4_1
                             | TensorType::Q4_K
                             | TensorType::Q6_K
+                            | TensorType::F32
                     ) && cuda.has_weight_of_size(&t.name, t.data().len())
                 }
                 None => true,

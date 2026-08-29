@@ -364,7 +364,21 @@ flag).
   padded Q6_K layout against `kernel::embed_tokens`, plus a model-shape
   q4_0 case (n_embd=896, ids up to 9625) and the generic gather.
 - Remaining prefill perf work: FusedFFN (7e⑤) and F32×F32 matmul (7e④).
-- F32×F32 matmul kernel (F32-weight `output` / F32 models).
+- ✅ **F32×F32 matmul kernel (7e④, 2026-08-29)**: `f32_f32_matmul_vec`
+  (same unit lane mapping as the q4_K kernel — lanes own (row, 256-elem
+  chunk) pairs, float4 loads; requires `id % 8 == 0`) plus
+  `f32_f32_matmul_scalar` (thread per output element) for general dims.
+  Dispatch: `TensorType::F32` arm in `matmul_f32_ptr_layout`; the 32-byte
+  quant-block guard now exempts F32 weights; `matmul_ok` gates admit F32
+  matmul weights, so unquantized / F32-head models participate in CUDA.
+  Kernel lesson (2nd of the phase): in the unit mapping the unit's lane
+  must stream its WHOLE chunk — a leftover `i = lane_id * 8` inside the
+  unit silently computed only 1/64 of each dot (the same-lane-count
+  structure from the quant kernels does not transfer). Validated by
+  standalone nvcc A/B (bit-exact vs CPU double-accumulation at
+  8×512×3) and the extended `cuda_kquant_matmul_parity` (aligned + odd-id
+  cases). No cached F32-weight GGUF — E2E F32-model validation pending
+  the first such model.
 - FusedFFN for CUDA: host-side concat-weight registration (`ffn_gu` analog of `metal::concat_rows`) + existing concat-matmul kernel + `swiglu` via pointer offsets into the concat buffer; gated by `nf ≤ 16384` like Metal.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
 - Async H2D input fill + pinned staging; prefill Q8_0-activation path (`launch_quantize_q8_0` + `launch_q4_0_q8_0_matmul` exist).

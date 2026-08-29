@@ -174,6 +174,15 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_f32_f32_matmul(
+        w: *const f32,
+        x: *const f32,
+        out: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_gather_rows_f32(
         src: *const f32,
         ids: *const f32,
@@ -1129,6 +1138,20 @@ impl CudaState {
                 } else {
                     launch!(launch_q6_k_f32_matmul)
                 }
+            }
+            TensorType::F32 => {
+                unsafe {
+                    launch_f32_f32_matmul(
+                        wptr as *const f32,
+                        x as *const f32,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        stream,
+                    );
+                }
+                Ok(())
             }
             other => Err(format!(
                 "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"

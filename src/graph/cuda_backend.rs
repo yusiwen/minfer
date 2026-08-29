@@ -629,7 +629,10 @@ impl Backend for CudaBackend {
                     })?;
                 let (od, id) = (meta.out_dim, meta.in_dim);
                 let nt = node.out_shape[1];
-                if id % 32 != 0 {
+                // quant kernels address whole 32-element blocks; the F32×F32
+                // kernel has no such constraint (vec path needs id % 8 == 0
+                // and falls back to a scalar kernel otherwise)
+                if meta.weight_ttype != crate::tensor::TensorType::F32 && id % 32 != 0 {
                     return Err(format!(
                         "cuda: {}: matmul input dim {id} is not a multiple of the 32-element quant block",
                         node.name
@@ -1336,14 +1339,47 @@ mod tests {
         );
         w6pt.name = "mw6kp".to_string();
 
+        // ── F32 weight (7e④): aligned id (512) and odd id (513, scalar path)
+        let wfb: Vec<u8> = w4dq.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut wft =
+            Tensor::from_data(TensorType::F32, &[id_ as i64, od as i64, 1, 1], wfb.clone());
+        wft.name = "mwf32".to_string();
+        cb.state.register_weight("mwf32", &wfb);
+        // odd id: 513-wide rows (first 512 = w4dq, element 512 synthetic)
+        let (od_o, id_o) = (8usize, 513usize);
+        let mut wfo_vals = Vec::with_capacity(od_o * id_o);
+        for r in 0..od_o {
+            for i in 0..id_o {
+                wfo_vals.push(if i < id_ {
+                    w4dq[r * id_ + i]
+                } else {
+                    (r + 1) as f32 * 0.25
+                });
+            }
+        }
+        let wfo: Vec<u8> = wfo_vals.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut wfot = Tensor::from_data(
+            TensorType::F32,
+            &[id_o as i64, od_o as i64, 1, 1],
+            wfo.clone(),
+        );
+        wfot.name = "mwf32o".to_string();
+        cb.state.register_weight("mwf32o", &wfo);
+
         let mut b = GraphBuilder::new();
         let x = b.input("x", [id_, nt, 1, 1], DType::F32);
         let m4 = b.matmul(x, &w4t, None);
         let m6 = b.matmul(x, &w6t, None);
         let m6p = b.matmul(x, &w6pt, None);
+        let mf = b.matmul(x, &wft, None);
         b.output(m4);
         b.output(m6);
         b.output(m6p);
+        b.output(mf);
+        // odd-id graph: x sliced to id_ = 513
+        let xo = b.input("xo", [id_o, nt, 1, 1], DType::F32);
+        let mfo = b.matmul(xo, &wfot, None);
+        b.output(mfo);
         let g = b.build();
 
         let xb = cb.alloc_buffer(id_ * nt);
@@ -1353,9 +1389,17 @@ mod tests {
             cb.alloc_buffer(od * nt),
             cb.alloc_buffer(od * nt),
         );
+        let of = cb.alloc_buffer(od * nt);
         cb.execute_node(&g.nodes[m4], &[xb], o4, None).unwrap();
         cb.execute_node(&g.nodes[m6], &[xb], o6, None).unwrap();
         cb.execute_node(&g.nodes[m6p], &[xb], o6p, None).unwrap();
+        cb.execute_node(&g.nodes[mf], &[xb], of, None).unwrap();
+        let mut xso = xs.clone();
+        xso.resize(id_o * nt, 0.25f32); // extend for the odd-id input
+        let xob = cb.alloc_buffer(id_o * nt);
+        cb.write_host(xob, &xso).unwrap();
+        let ofo = cb.alloc_buffer(od_o * nt);
+        cb.execute_node(&g.nodes[mfo], &[xob], ofo, None).unwrap();
 
         for (name, o, dq) in [
             ("q4_k matmul", o4, &w4dq),
@@ -1375,6 +1419,38 @@ mod tests {
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
             assert_close(name, &got, &want, scale * 2e-3);
+        }
+
+        // F32 matmul (aligned + odd-id scalar path) vs the same reference rows
+        {
+            let got = cb.copy_to_host(of).unwrap();
+            let mut want = vec![0f32; od * nt];
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut acc = 0f32;
+                    for i in 0..id_ {
+                        acc += w4dq[r * id_ + i] * xs[t * id_ + i];
+                    }
+                    want[t * od + r] = acc;
+                }
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close("f32 matmul", &got, &want, scale * 2e-3);
+        }
+        {
+            let got = cb.copy_to_host(ofo).unwrap();
+            let mut want = vec![0f32; od_o * nt];
+            for t in 0..nt {
+                for r in 0..od_o {
+                    let mut acc = 0f32;
+                    for i in 0..id_o {
+                        acc += wfo_vals[r * id_o + i] * xso[t * id_o + i];
+                    }
+                    want[t * od_o + r] = acc;
+                }
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close("f32 matmul odd id", &got, &want, scale * 2e-3);
         }
     }
 
