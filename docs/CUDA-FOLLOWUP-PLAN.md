@@ -177,32 +177,29 @@ Gate: replay bit-parity harness like 7d's, at pp16 + pp300.
 
 ## 8h. Infra / process
 
-1. **Stale docs**: `CUDA_OPTIMIZATION.md` / `CUDA_PROBLEMS.md` describe the
-   pre-Phase-7 imperative path (`layer_gpu`, deleted `forward.rs`) — mark
-   superseded with a pointer to CUDA-BACKEND-PLAN (their surviving ideas are
-   absorbed here: cuBLAS → 8k, MMQ tiling → 8e, GPU quantize → 8c).
+1. **Stale docs**: `CUDA_OPTIMIZATION.md` / `CUDA_PROBLEMS.md` — **DONE
+   2026-08-29 (`60e9cc1`)**: marked SUPERSEDED with pointers to the current
+   plans (absorbed ideas named: cuBLAS → 8k, MMQ tiling → 8e, GPU quantize → 8c).
 2. **Optional CUDA CI runner** — device-gated tests skip gracefully today;
    a self-hosted GB10 runner would keep the 144-test suite honest on every
    commit.
 3. **Temp files**: the Phase-7 ledger (`/tmp/minfer_phase7/TEMPS.md`) is
    closed; cleanup still awaits the user's decision (no auto-delete).
 
-## 8i. Graph integration test debts (CUDA)
+## 8i. Graph integration test debts — **DONE 2026-08-29 (`60e9cc1`)**
 
-Coverage gaps found in the Phase 8 completeness audit (2026-08-29):
-
-1. **Multi-split capture** — per-split capture is supported but the
-   bit-parity tests only cover single-split graphs (7e③ made every current
-   decode graph single-split; no live exposure today).
-2. **Multi-turn conversation on CUDA** — decode graphs are
-   n_past-independent, so cross-turn reuse should work structurally, but
-   the conversation path (new prefill graph per turn + reused decode graph)
-   has no device-level test.
-3. **OpenAI server slot loop on CUDA** — the slot's prefill→decode switches
-   hit the same GraphCache; no device-level coverage.
-
-Gate: each as a `#[cfg(test)]` device test mirroring the 7d parity harness,
-skipping gracefully without a device.
+1. **Multi-split capture** — `cuda_multisplit_capture_bit_parity`: CUDA →
+   CPU (Softmax) → CUDA graph yields two CUDA splits; both capture
+   (captured_count == 2) and replay bit-identical to direct launches.
+2. **Multi-turn conversation** — `cuda_conversation_multiturn_reuse`
+   (q4_0 0.5B, device): turn-2 incremental (append-only KV + reused decode
+   graph) vs turn-2 rehydrated from history (fresh graphs + full re-prefill)
+   produce IDENTICAL greedy text. ConversationSpec now derives Clone; note
+   that device tests must call `CudaState::init()` themselves (`get()` only
+   reads the singleton).
+3. **Slot loop** — covered by the same test: both paths run the GraphCache
+   prefill→decode alternation the OpenAI server slot uses; a dedicated
+   axum-level test remains out of scope (needs a live HTTP harness).
 
 ## 8j. cudaGraphExecUpdate (optional)
 
