@@ -921,8 +921,14 @@ fn main() {
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
+        #[cfg(feature = "cuda")]
+        let cuda_on = crate::cuda::CudaState::get().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let cuda_on = false;
         let fuse_qkv = metal_on && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
-        let fuse_ffn = (metal_on || cfg!(feature = "cuda"))
+        // device-presence gate (matches the engine's CParams construction,
+        // Phase 8 review: cfg!(feature) claims CUDA without a device)
+        let fuse_ffn = (metal_on || cuda_on)
             && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
         let prefill_graph = export_graph_json(
             &*model,

@@ -140,6 +140,12 @@ impl CudaBackend {
         if self.graphs_mode != GraphMode::Enabled {
             return false;
         }
+        // a replay launch into OUR OWN open capture window would be
+        // CUDA-invalid — defer to direct execution (Phase 8 review;
+        // unreachable today: 7e③ made graphs single-split)
+        if self.capturing.is_some() {
+            return false;
+        }
         let key = (uid, range);
         if let Some(pos) = self
             .graph_execs
@@ -227,6 +233,10 @@ impl CudaBackend {
                 );
                 self.graphs_mode = GraphMode::Disabled;
                 self.state.sync();
+                // NOTE: there is no poisoned-error mechanism — later steps
+                // run direct-launch with graphs disabled; this step's outputs
+                // were undefined and are consumed as-is. (Phase 8 review:
+                // the old comment claimed otherwise.)
             }
             return;
         }
@@ -284,177 +294,26 @@ impl Drop for CudaBackend {
 }
 
 impl CudaBackend {
-    fn state_free(ptr: *mut std::ffi::c_void) {
-        <crate::cuda::CudaState>::cuda_free(ptr);
-    }
-
-    fn elems(&self, id: usize) -> usize {
-        self.pool[id].bytes / 4
-    }
-
-    fn copy_d2d(&self, src: usize, dst: usize) -> Result<(), String> {
-        let (s, d) = (self.ptr_of(src)?, self.ptr_of(dst)?);
-        let (sb, db) = (self.pool[src].bytes, self.pool[dst].bytes);
-        if sb != db {
-            return Err(format!(
-                "cuda: device copy size mismatch src {sb} vs dst {db} bytes"
-            ));
-        }
-        self.state.copy_device_to_device(s, d, db);
-        Ok(())
-    }
-
-    /// Decode an I32 input buffer (f32::from_bits bit patterns, alloc.rs
-    /// fill_input_i32) into raw int32 on the device. The rope/store/attention
-    /// kernels read `const int* positions`; one tiny elementwise pass keeps
-    /// the whole path on-device — no host sync, and the pointer stays stable
-    /// across steps (a precondition for CUDA Graph replay in Phase 7d).
-    fn positions_i32(&mut self, id: usize) -> Result<*mut std::ffi::c_void, String> {
-        let src = self.ptr_of(id)?;
-        let bytes = self.pool[id].bytes;
-        if self.pos_scratch_bytes < bytes {
-            if !self.pos_scratch.is_null() {
-                Self::state_free(self.pos_scratch);
+    /// End an open capture window WITHOUT launching it (error path, Phase 8
+    /// review): the recorded launches never executed, so the split's outputs
+    /// are invalid. Disables graph capture for the session.
+    fn abort_capture(&mut self, cause: &str) {
+        if let Some(key) = self.capturing.take() {
+            let exec = self.state.graph_end_capture_to_exec();
+            if !exec.is_null() {
+                self.state.graph_destroy(exec);
             }
-            let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
-            if ptr.is_null() {
-                self.pos_scratch_bytes = 0;
-                return Err("cuda: positions scratch allocation failed".to_string());
-            }
-            self.pos_scratch = ptr;
-            self.pos_scratch_bytes = bytes;
-        }
-        self.state.bits_to_i32(src, self.pos_scratch, bytes / 4);
-        Ok(self.pos_scratch)
-    }
-
-    /// Resolve a NormMeta weight by name on the CUDA registry. Unlike Metal
-    /// (which silently degrades to a weightless norm when the weight is not on
-    /// the backend), a declared-but-missing weight is an invariant violation
-    /// here and returns Err (docs/GPU_SAFETY.md).
-    fn norm_weight(&self, node: &CNode) -> Result<*mut std::ffi::c_void, String> {
-        let name = match &node.meta {
-            NodeMeta::Norm(m) => m.weight_name.as_deref(),
-            other => {
-                return Err(format!(
-                    "cuda: {} node missing NormMeta: {other:?}",
-                    node.name
-                ))
-            }
-        };
-        let Some(name) = name else {
-            return Err(format!(
-                "cuda: {} has no norm weight (the CUDA rms_norm kernel requires one)",
-                node.name
-            ));
-        };
-        self.state.get_weight_ptr(name).ok_or_else(|| {
-            format!(
-                "cuda: weight '{name}' not registered on CUDA ({})",
-                node.name
-            )
-        })
-    }
-}
-
-impl Backend for CudaBackend {
-    fn name(&self) -> &str {
-        "cuda"
-    }
-
-    /// v1 capability matrix (docs/CUDA-BACKEND-PLAN.md §4.3): the full
-    /// per-layer chain runs on CUDA; Embed/GetRows, Scale, Softmax and the
-    /// fused decode ops have no kernels and stay on the CPU backend. RoPE is
-    /// gated to the neox (non-interleaved) layout — the only style the
-    /// supported architectures emit.
-    fn supports_op(&self, op: &Op, dtype: DType) -> bool {
-        if dtype != DType::F32 {
-            return false;
-        }
-        match op {
-            Op::Input
-            | Op::Add
-            | Op::Mul
-            | Op::Silu
-            | Op::SwiGLU
-            | Op::RmsNorm { .. }
-            | Op::QkNorm { .. }
-            | Op::MatMul { .. }
-            | Op::Attn { .. }
-            | Op::KvcacheStore { .. }
-            | Op::KvcacheLoad { .. }
-            | Op::View { .. }
-            | Op::Reshape { .. }
-            | Op::Permute { .. }
-            // 7e③: row gather — the embedding (Embed meta, weight dequant by
-            // type; weight-type support is enforced by the model-level gate,
-            // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
-            // generic f32 tail gather (no meta). Removes the CPU round trips
-            // around the prefill's embed and G3 tail reduction.
-            // 7e⑤: decode FFN gate+up fusion — concat matmul + in-place
-            // offset swiglu (the gu_concat_available / CParams.fuse_ffn
-            // gates decide when the node is built).
-            | Op::GetRows
-            | Op::FusedFFN => true,
-            // MatMul ttype gating happens at the model level (weights must all
-            // be registered on CUDA — same all-or-nothing rule as Metal).
-            Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
-            _ => false,
+            self.stream_guard = None;
+            self.graphs_mode = GraphMode::Disabled;
+            eprintln!(
+                "CUDA: node error inside capture window (split {key:?}); capture aborted, \
+                 graphs disabled for this session: {cause}"
+            );
+            self.state.sync();
         }
     }
 
-    fn supports_fused(&self, fused: &FusedOp) -> bool {
-        matches!(fused, FusedOp::SwiGLU)
-    }
-
-    fn alloc_buffer(&mut self, size: usize) -> usize {
-        let _sg = self.stream_guard(); // cudaMalloc syncs the device
-        let bytes = size * 4;
-        if let Some(pos) = self
-            .free
-            .iter()
-            .position(|&id| self.pool[id].bytes == bytes)
-        {
-            let id = self.free.remove(pos);
-            self.pool_gen += 1;
-            return id;
-        }
-        // On OOM, cuda_malloc logs and returns null; the null buffer fails
-        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
-        // backend may be holding the process-wide stream lock, and panicking
-        // under a mutex poisons it for every other user.
-        let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
-        self.pool.push(CudaBuf { ptr, bytes });
-        self.pool_gen += 1;
-        self.pool.len() - 1
-    }
-
-    fn free_buffer(&mut self, id: usize) {
-        let _sg = self.stream_guard();
-        // Recycle, never cudaFree here: persistent KV regions survive rebuilds
-        // and the pool keeps freed device memory for reuse (CPU/Metal alike).
-        if !self.free.contains(&id) {
-            self.free.push(id);
-        }
-    }
-
-    fn alloc_fresh(&mut self, size: usize) -> usize {
-        // bypass the free list entirely (see Backend::alloc_fresh): the ids in
-        // it are still referenced by node_to_buf and physically live during
-        // the execute that follows
-        let _sg = self.stream_guard(); // cudaMalloc syncs the device
-        let bytes = size * 4;
-        // On OOM, cuda_malloc logs and returns null; the null buffer fails
-        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
-        // backend may be holding the process-wide stream lock, and panicking
-        // under a mutex poisons it for every other user.
-        let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
-        self.pool.push(CudaBuf { ptr, bytes });
-        self.pool_gen += 1;
-        self.pool.len() - 1
-    }
-
-    fn execute_node(
+    fn execute_node_inner(
         &mut self,
         node: &CNode,
         in_bufs: &[usize],
@@ -833,6 +692,204 @@ impl Backend for CudaBackend {
             op => Err(format!(
                 "cuda: op {op:?} has no kernel (stays on the CPU backend per supports_op)"
             )),
+        }
+    }
+
+    fn state_free(ptr: *mut std::ffi::c_void) {
+        <crate::cuda::CudaState>::cuda_free(ptr);
+    }
+
+    fn elems(&self, id: usize) -> usize {
+        self.pool[id].bytes / 4
+    }
+
+    fn copy_d2d(&self, src: usize, dst: usize) -> Result<(), String> {
+        let (s, d) = (self.ptr_of(src)?, self.ptr_of(dst)?);
+        let (sb, db) = (self.pool[src].bytes, self.pool[dst].bytes);
+        if sb != db {
+            return Err(format!(
+                "cuda: device copy size mismatch src {sb} vs dst {db} bytes"
+            ));
+        }
+        self.state.copy_device_to_device(s, d, db);
+        Ok(())
+    }
+
+    /// Decode an I32 input buffer (f32::from_bits bit patterns, alloc.rs
+    /// fill_input_i32) into raw int32 on the device. The rope/store/attention
+    /// kernels read `const int* positions`; one tiny elementwise pass keeps
+    /// the whole path on-device — no host sync, and the pointer stays stable
+    /// across steps (a precondition for CUDA Graph replay in Phase 7d).
+    fn positions_i32(&mut self, id: usize) -> Result<*mut std::ffi::c_void, String> {
+        let src = self.ptr_of(id)?;
+        let bytes = self.pool[id].bytes;
+        if self.pos_scratch_bytes < bytes {
+            if !self.pos_scratch.is_null() {
+                Self::state_free(self.pos_scratch);
+            }
+            let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
+            if ptr.is_null() {
+                self.pos_scratch_bytes = 0;
+                return Err("cuda: positions scratch allocation failed".to_string());
+            }
+            self.pos_scratch = ptr;
+            self.pos_scratch_bytes = bytes;
+            // the freed scratch pointer may be embedded in captured graph
+            // execs — invalidate them so they re-capture against the new
+            // address (Phase 8 review; currently masked because growth only
+            // happens on a larger prefill whose allocs churn pool_gen anyway)
+            self.pool_gen += 1;
+        }
+        self.state.bits_to_i32(src, self.pos_scratch, bytes / 4);
+        Ok(self.pos_scratch)
+    }
+
+    /// Resolve a NormMeta weight by name on the CUDA registry. Unlike Metal
+    /// (which silently degrades to a weightless norm when the weight is not on
+    /// the backend), a declared-but-missing weight is an invariant violation
+    /// here and returns Err (docs/GPU_SAFETY.md).
+    fn norm_weight(&self, node: &CNode) -> Result<*mut std::ffi::c_void, String> {
+        let name = match &node.meta {
+            NodeMeta::Norm(m) => m.weight_name.as_deref(),
+            other => {
+                return Err(format!(
+                    "cuda: {} node missing NormMeta: {other:?}",
+                    node.name
+                ))
+            }
+        };
+        let Some(name) = name else {
+            return Err(format!(
+                "cuda: {} has no norm weight (the CUDA rms_norm kernel requires one)",
+                node.name
+            ));
+        };
+        self.state.get_weight_ptr(name).ok_or_else(|| {
+            format!(
+                "cuda: weight '{name}' not registered on CUDA ({})",
+                node.name
+            )
+        })
+    }
+}
+
+impl Backend for CudaBackend {
+    fn name(&self) -> &str {
+        "cuda"
+    }
+
+    /// v1 capability matrix (docs/CUDA-BACKEND-PLAN.md §4.3): the full
+    /// per-layer chain runs on CUDA; Embed/GetRows, Scale, Softmax and the
+    /// fused decode ops have no kernels and stay on the CPU backend. RoPE is
+    /// gated to the neox (non-interleaved) layout — the only style the
+    /// supported architectures emit.
+    fn supports_op(&self, op: &Op, dtype: DType) -> bool {
+        if dtype != DType::F32 {
+            return false;
+        }
+        match op {
+            Op::Input
+            | Op::Add
+            | Op::Mul
+            | Op::Silu
+            | Op::SwiGLU
+            | Op::RmsNorm { .. }
+            | Op::QkNorm { .. }
+            | Op::MatMul { .. }
+            | Op::Attn { .. }
+            | Op::KvcacheStore { .. }
+            | Op::KvcacheLoad { .. }
+            | Op::View { .. }
+            | Op::Reshape { .. }
+            | Op::Permute { .. }
+            // 7e③: row gather — the embedding (Embed meta, weight dequant by
+            // type; weight-type support is enforced by the model-level gate,
+            // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
+            // generic f32 tail gather (no meta). Removes the CPU round trips
+            // around the prefill's embed and G3 tail reduction.
+            // 7e⑤: decode FFN gate+up fusion — concat matmul + in-place
+            // offset swiglu (the gu_concat_available / CParams.fuse_ffn
+            // gates decide when the node is built).
+            | Op::GetRows
+            | Op::FusedFFN => true,
+            // MatMul ttype gating happens at the model level (weights must all
+            // be registered on CUDA — same all-or-nothing rule as Metal).
+            Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
+            _ => false,
+        }
+    }
+
+    fn supports_fused(&self, fused: &FusedOp) -> bool {
+        matches!(fused, FusedOp::SwiGLU)
+    }
+
+    fn alloc_buffer(&mut self, size: usize) -> usize {
+        let _sg = self.stream_guard(); // cudaMalloc syncs the device
+        let bytes = size * 4;
+        if let Some(pos) = self
+            .free
+            .iter()
+            .position(|&id| self.pool[id].bytes == bytes)
+        {
+            let id = self.free.remove(pos);
+            self.pool_gen += 1;
+            return id;
+        }
+        // On OOM, cuda_malloc logs and returns null; the null buffer fails
+        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
+        // backend may be holding the process-wide stream lock, and panicking
+        // under a mutex poisons it for every other user.
+        let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
+        self.pool.push(CudaBuf { ptr, bytes });
+        self.pool_gen += 1;
+        self.pool.len() - 1
+    }
+
+    fn free_buffer(&mut self, id: usize) {
+        let _sg = self.stream_guard();
+        // Recycle, never cudaFree here: persistent KV regions survive rebuilds
+        // and the pool keeps freed device memory for reuse (CPU/Metal alike).
+        if !self.free.contains(&id) {
+            self.free.push(id);
+        }
+    }
+
+    fn alloc_fresh(&mut self, size: usize) -> usize {
+        // bypass the free list entirely (see Backend::alloc_fresh): the ids in
+        // it are still referenced by node_to_buf and physically live during
+        // the execute that follows
+        let _sg = self.stream_guard(); // cudaMalloc syncs the device
+        let bytes = size * 4;
+        // On OOM, cuda_malloc logs and returns null; the null buffer fails
+        // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
+        // backend may be holding the process-wide stream lock, and panicking
+        // under a mutex poisons it for every other user.
+        let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
+        self.pool.push(CudaBuf { ptr, bytes });
+        self.pool_gen += 1;
+        self.pool.len() - 1
+    }
+
+    fn execute_node(
+        &mut self,
+        node: &CNode,
+        in_bufs: &[usize],
+        out_buf: usize,
+        kv_pair: Option<(usize, usize)>,
+    ) -> Result<(), String> {
+        match self.execute_node_inner(node, in_bufs, out_buf, kv_pair) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A node error during an open capture window dooms the window:
+                // the scheduler propagates before the boundary sync, so nothing
+                // would close it — later input fills would be RECORDED into the
+                // window and the eventual close would cache a multi-step graph
+                // (double KV commit on every replay). Abort the window loudly.
+                if self.capturing.is_some() {
+                    self.abort_capture(&e);
+                }
+                Err(e)
+            }
         }
     }
 

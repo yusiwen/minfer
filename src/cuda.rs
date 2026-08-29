@@ -670,6 +670,11 @@ impl CudaState {
             }
             return;
         }
+        // a plain (unpadded) registration must clear any stale padded flag
+        // for the same name: a second model reusing the tensor name with a
+        // non-Q6_K type would otherwise dispatch the padded-224 kernel on a
+        // raw-210 buffer (Phase 8 review finding)
+        self.padded_weights.lock().unwrap().remove(name);
         self.weights
             .lock()
             .unwrap()
@@ -822,12 +827,24 @@ impl CudaState {
         let mut guard = self.staging.lock().unwrap();
         if guard.is_none() {
             let mut ptrs = Vec::new();
+            let mut alloc_err = 0i32;
             for _ in 0..STAGING_SLOTS {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-                if unsafe { cudaHostAlloc(&mut p, STAGING_SLOT_BYTES, 0) } != 0 {
+                alloc_err = unsafe { cudaHostAlloc(&mut p, STAGING_SLOT_BYTES, 0) };
+                if alloc_err != 0 {
                     break;
                 }
                 ptrs.push(p as *mut u8);
+            }
+            // a shrunken ring silently degrades to a stream sync every
+            // `ptrs.len()` fills — surface it (Phase 8 review)
+            if ptrs.len() != STAGING_SLOTS {
+                eprintln!(
+                    "CUDA: pinned staging ring shrunk to {}/{} slots (cudaHostAlloc err {});                      fills beyond the ring fall back to sync copies",
+                    ptrs.len(),
+                    STAGING_SLOTS,
+                    alloc_err
+                );
             }
             if !ptrs.is_empty() {
                 *guard = Some(PinnedPool {
@@ -845,16 +862,19 @@ impl CudaState {
                 return;
             }
         };
-        // ring wrap: retire all in-flight copies before reusing slot 0
+        // ring wrap: retire all in-flight copies before reusing slot 0. The
+        // reset is re-checked under the re-lock so two threads that both
+        // observed the full ring cannot both take slot 0 (Phase 8 review).
         if pool.next == pool.ptrs.len() {
             drop(guard);
             self.sync();
             guard = self.staging.lock().unwrap();
-            let pool = guard.as_mut().unwrap();
-            pool.next = 0;
         }
         let slot = {
             let pool = guard.as_mut().unwrap();
+            if pool.next >= pool.ptrs.len() {
+                pool.next = 0;
+            }
             let p = pool.ptrs[pool.next];
             pool.next += 1;
             p

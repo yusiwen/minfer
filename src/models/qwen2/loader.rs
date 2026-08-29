@@ -379,11 +379,18 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
 
         // Fused FFN gate+up (nt==1 decode): one matmul produces both gate and
         // up from a concatenated weight (same pattern as attn_qkv).
+        // Gated like the build-side fusion decision (nf ≤ 16384): the 7B's
+        // nf = 18944 concat would otherwise hold ~2.0 GiB of weights no node
+        // ever reads (Phase 8 review). Memory-footprint-only change.
         #[cfg(target_os = "macos")]
         if let Some(mps) = crate::metal::MpsState::get() {
             if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
-                if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
-                    mps.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                let fuse = fg.shape[1] <= 16384
+                    && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                if fuse {
+                    if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
+                        mps.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                    }
                 }
             }
         }

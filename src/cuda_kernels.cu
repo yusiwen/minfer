@@ -426,7 +426,10 @@ __global__ void q6_k_f32_matmul(
     int row_stride = nbe * Q6KB;
 
     const uint8_t* w0 = weights + (r0 + 0) * row_stride;
-    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
+    // NR0 = 2 with odd od: the last group's row 1 does not exist — alias it
+    // to row 0 (in-bounds); the write guard discards the sum (7e review)
+    const bool row1_ok = (r0 + 1) < od;
+    const uint8_t* w1 = row1_ok ? weights + (r0 + 1) * row_stride : w0;
     const float* y = acts + t * id;
 
     float sumf0 = 0.0f, sumf1 = 0.0f;
@@ -553,7 +556,10 @@ __global__ void q6_k_f32_matmul_padded(
     int row_stride = nbe * Q6KPB;
 
     const uint8_t* w0 = weights + (r0 + 0) * row_stride;
-    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
+    // NR0 = 2 with odd od: the last group's row 1 does not exist — alias it
+    // to row 0 (in-bounds); the write guard discards the sum (7e review)
+    const bool row1_ok = (r0 + 1) < od;
+    const uint8_t* w1 = row1_ok ? weights + (r0 + 1) * row_stride : w0;
     const float* y = acts + t * id;
 
     float sumf0 = 0.0f, sumf1 = 0.0f;

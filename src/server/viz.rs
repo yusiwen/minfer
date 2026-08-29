@@ -77,6 +77,14 @@ pub fn run_viz(
     #[cfg(not(target_os = "macos"))]
     let gpu = false;
     let fuse_qkv = gpu && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+    // match the engine's CParams construction: FFN fusion also runs on CUDA
+    // (device-presence gate, Phase 8 review — was hardcoded false)
+    #[cfg(feature = "cuda")]
+    let cuda_on = crate::cuda::CudaState::get().is_some();
+    #[cfg(not(feature = "cuda"))]
+    let cuda_on = false;
+    let fuse_ffn =
+        (gpu || cuda_on) && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
     let model_name = gguf
         .parts
         .first()
@@ -91,7 +99,7 @@ pub fn run_viz(
               "graph": crate::graph::json::export_graph_json(&*model, &model_name, 16, n_ctx_slot, gpu, false, false),
               "steps": [] },
             { "kind": "decode",
-              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 1, n_ctx_slot, gpu, fuse_qkv, fuse_qkv),
+              "graph": crate::graph::json::export_graph_json(&*model, &model_name, 1, n_ctx_slot, gpu, fuse_qkv, fuse_ffn),
               "steps": [] },
         ],
     }));

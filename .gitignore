@@ -15,3 +15,6 @@ uv.lock
 /.cocoindex_code/
 /.cargo-home/
 /.ccc_config/
+
+# stray MINFER_TRACE dump accidentally committed twice (Phase 8 review)
+/1
