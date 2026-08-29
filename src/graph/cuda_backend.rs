@@ -2610,6 +2610,229 @@ mod tests {
         }
     }
 
+    // 8f: Q5_1 / Q5_K f32-activation matmul parity (incl. the Q5_K partial
+    // tail super-block at id = 896 = 3.5 × 256). The weight blocks are
+    // quantized in-test against scales unpacked with the REAL
+    // block::unpack_q4k_scales, so kernel and reference share the exact
+    // decode math and the tolerance stays tight.
+    #[test]
+    fn cuda_q5_matmul_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let nt = 3usize;
+
+        // ── Q5_1: od 8, id 64 (2 blocks / row) ──
+        {
+            let (od, id) = (8usize, 64usize);
+            let nb = id / 32;
+            let wf: Vec<f32> = (0..od * id)
+                .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+                .collect();
+            let mut wq = Vec::new();
+            for r in 0..od {
+                for b in 0..nb {
+                    let row = &wf[r * id + b * 32..r * id + (b + 1) * 32];
+                    let amax = row.iter().fold(0f32, |m, &v| m.max(v));
+                    let amin = row.iter().fold(0f32, |m, &v| m.min(v));
+                    let d = (amax - amin) / 31.0;
+                    let di = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    wq.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    wq.extend_from_slice(&half::f16::from_f32(amin).to_le_bytes());
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let u_lo = ((row[j] - amin) * di).round().clamp(0.0, 31.0) as u32;
+                        let u_hi = ((row[j + 16] - amin) * di).round().clamp(0.0, 31.0) as u32;
+                        qs[j] = ((u_lo & 0xF) | ((u_hi & 0xF) << 4)) as u8;
+                        qh |= ((u_lo >> 4) & 1) << j;
+                        qh |= ((u_hi >> 4) & 1) << (j + 16);
+                    }
+                    wq.extend_from_slice(&qh.to_le_bytes());
+                    wq.extend_from_slice(&qs);
+                }
+            }
+            let state = cb.state;
+            state.register_weight("w51", &wq);
+            let wptr = state.get_weight_ptr("w51").unwrap();
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                .collect();
+            let xb = cb.alloc_buffer(id * nt);
+            let out = cb.alloc_buffer(od * nt);
+            cb.write_host(xb, &xs).unwrap();
+            state
+                .matmul_f32_ptr(
+                    wptr,
+                    TensorType::Q5_1,
+                    cb.ptr_of(xb).unwrap(),
+                    cb.ptr_of(out).unwrap(),
+                    od,
+                    id,
+                    nt,
+                )
+                .unwrap();
+            cb.synchronize();
+            let got = cb.copy_to_host(out).unwrap();
+            // independent dequant reference
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut want = 0f32;
+                    for b in 0..nb {
+                        let blk = &wq[(r * nb + b) * 24..(r * nb + b) * 24 + 24];
+                        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                        let m = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+                        let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+                        let xrow = &xs[t * id + b * 32..t * id + (b + 1) * 32];
+                        for j in 0..16 {
+                            let u_lo = ((blk[8 + j] & 0xF) as f32) + 16.0 * ((qh >> j) & 1) as f32;
+                            let u_hi =
+                                ((blk[8 + j] >> 4) as f32) + 16.0 * ((qh >> (j + 16)) & 1) as f32;
+                            want += d * (u_lo * xrow[j] + u_hi * xrow[j + 16])
+                                + m * (xrow[j] + xrow[j + 16]);
+                        }
+                    }
+                    assert!(
+                        (got[t * od + r] - want).abs() < 5e-3,
+                        "q5_1 [{t}][{r}] {} vs {want}",
+                        got[t * od + r]
+                    );
+                }
+            }
+        }
+
+        // ── Q5_K: od 8, id 896 (PARTIAL tail super-block: 3.5 × 256) ──
+        // Weight values are GENERATED from the decode formula with random
+        // per-sub w (0..31) against scales unpacked from random sc bytes —
+        // the test targets the kernel's decode/indexing/tail-masking
+        // correctness, not a quantizer.
+        {
+            let (od, id) = (8usize, 896usize);
+            let nsp = (id + 255) / 256; // 4 — last one is partial (4 valid subs)
+            let mut wf: Vec<f32> = (0..od * id)
+                .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+                .collect();
+            let mut wq = vec![0u8; od * nsp * 176];
+            for r in 0..od {
+                for sp in 0..nsp {
+                    let blk_off = (r * nsp + sp) * 176;
+                    let sc: [u8; 12] = core::array::from_fn(|i| ((i * 7 + 3) % 63 + 1) as u8);
+                    let (scales, mins) = crate::block::unpack_q4k_scales(&sc);
+                    wq[blk_off..blk_off + 4].copy_from_slice(&{
+                        // d = 0.25, dmin = 0.25 (exact in f16)
+                        let b = half::f16::from_f32(0.25).to_le_bytes();
+                        [b[0], b[1], b[0], b[1]]
+                    });
+                    wq[blk_off + 4..blk_off + 16].copy_from_slice(&sc);
+                    // qh/qs stay zero for invalid tail subs (masked out)
+                    let valid = ((id - sp * 256).min(256) + 31) / 32;
+                    for sub in 0..valid {
+                        let base = sp * 256 + sub * 32;
+                        let row = &wf[r * id + base..r * id + base + 32];
+                        // invert the decode: v = d·s8·w − dmin·m8 →
+                        // w = (v + dmin·m8) / (d·s8); needs w ∈ 0..31 —
+                        // instead regenerate v FROM w so it is exact:
+                        for l in 0..32 {
+                            let seed = (r * 91 + base + l) % 32;
+                            let v =
+                                0.25 * scales[sub] as f32 * seed as f32 - 0.25 * mins[sub] as f32;
+                            // overwrite wf so the reference dot uses exact values
+                            wf[r * id + base + l] = v;
+                            let wv = seed as u8;
+                            let ci = sub >> 1;
+                            if sub & 1 == 1 {
+                                qs_byte(&mut wq[blk_off + 48..], ci, l, wv, true);
+                            } else {
+                                qs_byte(&mut wq[blk_off + 48..], ci, l, wv, false);
+                            }
+                            qh_byte(&mut wq[blk_off + 16..], l, sub, wv);
+                        }
+                    }
+                }
+            }
+            let state = cb.state;
+            state.register_weight("w5k", &wq);
+            let wptr = state.get_weight_ptr("w5k").unwrap();
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                .collect();
+            let xb = cb.alloc_buffer(id * nt);
+            let out = cb.alloc_buffer(od * nt);
+            cb.write_host(xb, &xs).unwrap();
+            state
+                .matmul_f32_ptr(
+                    wptr,
+                    TensorType::Q5_K,
+                    cb.ptr_of(xb).unwrap(),
+                    cb.ptr_of(out).unwrap(),
+                    od,
+                    id,
+                    nt,
+                )
+                .unwrap();
+            cb.synchronize();
+            let got = cb.copy_to_host(out).unwrap();
+            // independent dequant reference (mirrors the kernel decode)
+            let deq = |r: usize| -> Vec<f32> {
+                let mut outv = vec![0f32; id];
+                for sp in 0..nsp {
+                    let blk_off = (r * nsp + sp) * 176;
+                    let d = half::f16::from_le_bytes([wq[blk_off], wq[blk_off + 1]]).to_f32();
+                    let dmin =
+                        half::f16::from_le_bytes([wq[blk_off + 2], wq[blk_off + 3]]).to_f32();
+                    let sc: [u8; 12] = wq[blk_off + 4..blk_off + 16].try_into().unwrap();
+                    let (scales, mins) = crate::block::unpack_q4k_scales(&sc);
+                    let valid = ((id - sp * 256).min(256) + 31) / 32;
+                    for sub in 0..valid {
+                        let ci = sub >> 1;
+                        for l in 0..32 {
+                            let qbyte = wq[blk_off + 48 + ci * 32 + l];
+                            let nib = if sub & 1 == 1 {
+                                qbyte >> 4
+                            } else {
+                                qbyte & 0xF
+                            };
+                            let w =
+                                nib as f32 + 16.0 * (((wq[blk_off + 16 + l] >> sub) & 1) as f32);
+                            outv[sp * 256 + sub * 32 + l] =
+                                d * scales[sub] as f32 * w - dmin * mins[sub] as f32;
+                        }
+                    }
+                }
+                outv
+            };
+            for t in 0..nt {
+                for r in 0..od {
+                    let dq = deq(r);
+                    let mut want = 0f32;
+                    for i in 0..id {
+                        want += dq[i] * xs[t * id + i];
+                    }
+                    assert!(
+                        (got[t * od + r] - want).abs() < 5e-3,
+                        "q5_K [{t}][{r}] {} vs {want}",
+                        got[t * od + r]
+                    );
+                }
+            }
+        }
+    }
+
+    // q5_K qs nibble packing: 4 chunks of 32 bytes; chunk ci, byte l:
+    // low nibble = element l of sub 2ci, high = element l of sub 2ci+1
+    fn qs_byte(qs: &mut [u8], ci: usize, l: usize, w: u8, hi: bool) {
+        if hi {
+            qs[ci * 32 + l] |= w << 4;
+        } else {
+            qs[ci * 32 + l] |= w & 0xF;
+        }
+    }
+    // q5_K qh layout: byte l, bit sub = the >16 bit of element (sub, l)
+    fn qh_byte(qh: &mut [u8], l: usize, sub: usize, w: u8) {
+        qh[l] |= ((w >> 4) & 1) << sub;
+    }
+
     #[test]
     fn cuda_scheduler_chain() {
         crate::cuda::CudaState::init();

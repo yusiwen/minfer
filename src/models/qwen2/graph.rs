@@ -619,15 +619,14 @@ impl Qwen2Graph {
         fn matmul_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
                 Some(t) => {
-                    matches!(
-                        t.ttype,
-                        TensorType::Q4_0
-                            | TensorType::Q8_0
-                            | TensorType::Q4_1
-                            | TensorType::Q4_K
-                            | TensorType::Q6_K
-                            | TensorType::F32
-                    ) && cuda.has_weight_of_size(&t.name, t.data().len())
+                    matches!(t.ttype, |TensorType::Q4_0| TensorType::Q8_0
+                        | TensorType::Q4_1
+                        | TensorType::Q4_K
+                        | TensorType::Q6_K
+                        | TensorType::F32
+                        | TensorType::Q5_1
+                        | TensorType::Q5_K)
+                        && cuda.has_weight_of_size(&t.name, t.data().len())
                 }
                 None => true,
             }
@@ -635,14 +634,13 @@ impl Qwen2Graph {
         fn embed_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
                 Some(t) => {
-                    matches!(
-                        t.ttype,
-                        TensorType::F32
-                            | TensorType::Q4_0
-                            | TensorType::Q8_0
-                            | TensorType::Q4_K
-                            | TensorType::Q6_K
-                    ) && cuda.has_weight_of_size(&t.name, t.data().len())
+                    matches!(t.ttype, |TensorType::F32| TensorType::Q4_0
+                        | TensorType::Q8_0
+                        | TensorType::Q4_K
+                        | TensorType::Q6_K
+                        | TensorType::Q5_1
+                        | TensorType::Q5_K)
+                        && cuda.has_weight_of_size(&t.name, t.data().len())
                 }
                 None => true,
             }

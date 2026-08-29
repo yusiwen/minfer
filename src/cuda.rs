@@ -299,6 +299,24 @@ extern "C" {
         pstr: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_q5_1_f32_matmul(
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q5_k_f32_matmul(
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_gqa_attn_split_f32kv(
         q: *const f32,
         k: *const std::ffi::c_void,
@@ -1401,6 +1419,17 @@ impl CudaState {
             TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
             TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
             TensorType::Q4_K => launch!(launch_q4_k_f32_matmul),
+            TensorType::Q5_1 => launch!(launch_q5_1_f32_matmul),
+            TensorType::Q5_K => {
+                // 8f: partial tail super-blocks are masked at 32-element
+                // granularity inside the kernel — finer tails unsupported.
+                if id % 32 != 0 {
+                    return Err(format!(
+                        "cuda: Q5_K id {id} not a multiple of 32 (tail masking granularity)"
+                    ));
+                }
+                launch!(launch_q5_k_f32_matmul)
+            }
             TensorType::Q6_K => {
                 if padded_q6k {
                     launch!(launch_q6_k_f32_matmul_padded)
@@ -1528,6 +1557,8 @@ impl CudaState {
             TensorType::Q8_0 => (0i32, 34i32),
             TensorType::Q4_0 => (1, 18),
             TensorType::Q4_K => (2, 144),
+            TensorType::Q5_1 => (4, 24),
+            TensorType::Q5_K => (5, 176),
             TensorType::Q6_K => (3, if padded_q6k { 224 } else { 210 }),
             TensorType::F32 => {
                 // f32 tok_embd is a plain gather of weight rows
