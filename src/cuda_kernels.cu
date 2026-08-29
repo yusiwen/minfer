@@ -1062,8 +1062,152 @@ __global__ void store_kv_f32(
     dst[positions[t] * nkt + j] = src[t * nkt + j];
 }
 
+// 8b: f16 KV variant — stores f32 rows as half into the same persistent
+// region viewed as half (2 bytes/elem); halves attention read bandwidth.
+__global__ void store_kv_f16(
+    const float* __restrict__ src,
+    __half* __restrict__ dst,
+    int nkt, int nt,
+    const int* positions
+) {
+    int t = blockIdx.x;
+    int j = blockIdx.y;
+    if (t >= nt || j >= nkt) return;
+    dst[positions[t] * nkt + j] = __float2half(src[t * nkt + j]);
+}
+
+// helper: convert a half4 (hd is a multiple of 4) to float4
+__device__ __forceinline__ float4 h4_to_f4(const __half* p) {
+    float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
+    float2 b = __half22float2(*reinterpret_cast<const __half2*>(p + 2));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
 // ─── GQA Attention (online softmax, 32 threads/head/token) ───
 // q/k/v/o layout: [nt][nh][hd]; k/v stored as [nkv][nk][hd]
+
+// 8b: GQA attention over an f16 KV cache — exact structural mirror of
+// gqa_attn_f32 (same online softmax, same reductions); the ONLY difference
+// is the K/V load mechanics: half4 → float4 conversions, f32 accumulation
+// everywhere (Metal pl_gqa_attn_f16 precision class).
+__global__ void gqa_attn_f32_f16kv(
+    const float* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    float* __restrict__ o,
+    const int* positions,
+    int nh, int nk, int hd,
+    float scale, int nt
+) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= nt || h >= nh) return;
+
+    int nkv = positions[t] + 1;
+    int gqa = nh / nk;
+    int hk = h / gqa;
+    int ne_q = nh * hd;
+    int stride_kv = nk * hd;
+
+    const float* qhead = q + t * ne_q + h * hd;
+    float* ohead = o + t * ne_q + h * hd;
+
+    int tid = threadIdx.x;
+    int hd4 = hd / 4;
+    const float4* q4 = reinterpret_cast<const float4*>(qhead);
+
+    // Online softmax with persistent accumulators
+    const int NE = 2;
+    const int C = WARP * NE;
+
+    float mx = -INFINITY;
+    float S = 0.0f;
+    float4 oc[32];
+    #pragma unroll
+    for (int i = 0; i < hd4; i++) oc[i] = make_float4(0, 0, 0, 0);
+
+    for (int batch = 0; batch < nkv; batch += C) {
+        float s0 = -INFINITY, s1 = -INFINITY;
+        int kv0 = batch + tid * NE;
+        int kv1 = kv0 + 1;
+
+        if (kv0 < nkv) {
+            const __half* krow = k + (size_t)kv0 * stride_kv + hk * hd;
+            float d = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 qv = q4[i], kvv = h4_to_f4(krow + i * 4);
+                d += qv.x * kvv.x + qv.y * kvv.y + qv.z * kvv.z + qv.w * kvv.w;
+            }
+            s0 = d * scale;
+        }
+        if (kv1 < nkv) {
+            const __half* krow = k + (size_t)kv1 * stride_kv + hk * hd;
+            float d = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 qv = q4[i], kvv = h4_to_f4(krow + i * 4);
+                d += qv.x * kvv.x + qv.y * kvv.y + qv.z * kvv.z + qv.w * kvv.w;
+            }
+            s1 = d * scale;
+        }
+
+        float batch_mx = fmaxf(s0, s1);
+        // Warp-level max reduction
+        for (int off = 16; off > 0; off >>= 1)
+            batch_mx = fmaxf(batch_mx, __shfl_xor_sync(0xFFFFFFFF, batch_mx, off));
+        float new_mx = fmaxf(mx, batch_mx);
+        float corr = expf(mx - new_mx);
+
+        float e0 = expf(s0 - new_mx);
+        float e1 = expf(s1 - new_mx);
+
+        #pragma unroll
+        for (int i = 0; i < hd4; i++) oc[i].x *= corr, oc[i].y *= corr, oc[i].z *= corr, oc[i].w *= corr;
+        S *= corr;
+
+        if (kv0 < nkv) {
+            const __half* vrow = v + (size_t)kv0 * stride_kv + hk * hd;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 vv = h4_to_f4(vrow + i * 4);
+                oc[i].x += e0 * vv.x; oc[i].y += e0 * vv.y;
+                oc[i].z += e0 * vv.z; oc[i].w += e0 * vv.w;
+            }
+        }
+        if (kv1 < nkv) {
+            const __half* vrow = v + (size_t)kv1 * stride_kv + hk * hd;
+            #pragma unroll
+            for (int i = 0; i < hd4; i++) {
+                float4 vv = h4_to_f4(vrow + i * 4);
+                oc[i].x += e1 * vv.x; oc[i].y += e1 * vv.y;
+                oc[i].z += e1 * vv.z; oc[i].w += e1 * vv.w;
+            }
+        }
+        S += e0 + e1;
+        mx = new_mx;
+    }
+
+    // Warp-level reduction of S and oc
+    S = warp_reduce_sum(S);
+    #pragma unroll
+    for (int i = 0; i < hd4; i++) {
+        oc[i].x = warp_reduce_sum(oc[i].x);
+        oc[i].y = warp_reduce_sum(oc[i].y);
+        oc[i].z = warp_reduce_sum(oc[i].z);
+        oc[i].w = warp_reduce_sum(oc[i].w);
+    }
+
+    float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
+    float4* o4 = reinterpret_cast<float4*>(ohead);
+    #pragma unroll
+    for (int i = 0; i < hd4; i++) {
+        o4[i].x = oc[i].x * inv;
+        o4[i].y = oc[i].y * inv;
+        o4[i].z = oc[i].z * inv;
+        o4[i].w = oc[i].w * inv;
+    }
+}
 
 __global__ void gqa_attn_f32(
     const float* __restrict__ q,
@@ -1406,6 +1550,29 @@ void launch_store_kv_f32(
 ) {
     dim3 grid(nt, nkt, 1);
     store_kv_f32<<<grid, dim3(1, 1, 1), 0, stream>>>(src, dst, nkt, nt, positions);
+}
+
+void launch_store_kv_f16(
+    const float* src, void* dst, int nkt, int nt,
+    const int* positions, cudaStream_t stream
+) {
+    dim3 grid(nt, nkt, 1);
+    store_kv_f16<<<grid, dim3(1, 1, 1), 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
+}
+
+void launch_gqa_attn_f32_f16kv(
+    const float* q, const void* k, const void* v, float* o,
+    const int* positions,
+    int n_head, int n_head_kv, int hd,
+    float scale, int nt, cudaStream_t stream
+) {
+    int block_sz = 32; // one warp per (token, head)
+    dim3 block(block_sz, 1, 1);
+    dim3 grid(nt, n_head, 1);
+    gqa_attn_f32_f16kv<<<grid, block, 0, stream>>>(
+        q, (__half*)k, (__half*)v, o, positions,
+        n_head, n_head_kv, hd, scale, nt
+    );
 }
 
 void launch_gqa_attn_f32(

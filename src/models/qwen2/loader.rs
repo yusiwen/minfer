@@ -277,6 +277,9 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
     // before the first forward (kv_cache_is_f16 reads the OnceLock).
     #[cfg(target_os = "macos")]
     crate::metal::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
+    // 8b: CUDA side shares the same policy and MINFER_CACHE_TYPE override.
+    #[cfg(feature = "cuda")]
+    crate::cuda::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
 
     // Zero-copy weight registration: tell the Metal backend about each mmap'd
     // part (page-aligned base) BEFORE any weight is registered, so weights are

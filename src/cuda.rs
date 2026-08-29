@@ -264,6 +264,27 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_store_kv_f16(
+        src: *const f32,
+        dst: *mut std::ffi::c_void,
+        nkt: i32,
+        nt: i32,
+        positions: *const i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_gqa_attn_f32_f16kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
 }
 
 // ─── CudaState singleton ───────────────────────────────────────
@@ -464,6 +485,23 @@ pub fn concat_rows(tensors: &[&Tensor]) -> Option<Vec<u8>> {
         return None;
     }
     Some(out)
+}
+
+/// 8b: GPU KV cache element type (CUDA side, mirrors `metal::kv_cache_is_f16`).
+/// `MINFER_CACHE_TYPE=f16|f32` forces one; unset auto-selects f16 for the
+/// 7B class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for
+/// small models. Read once per CudaBackend at construction.
+static KV_F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn kv_cache_is_f16() -> bool {
+    *KV_F16.get_or_init(|| false)
+}
+
+/// Called at model load with the model dims, BEFORE the first forward.
+pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
+    let f16 =
+        std::env::var("MINFER_CACHE_TYPE").map_or(n_layers * n_kv_embd >= 8192, |v| v == "f16");
+    let _ = KV_F16.set(f16);
 }
 
 impl CudaState {
@@ -1616,6 +1654,40 @@ impl CudaState {
         }
     }
 
+    /// 8b: GQA attention over an f16 KV cache (K/V read as half and
+    /// converted to f32 in registers; q/o stay f32). Matches Metal's
+    /// pl_gqa_attn_f16 precision class (f16 storage, f32 accumulate).
+    pub fn gqa_attn_f16kv(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_gqa_attn_f32_f16kv(
+                q as *const f32,
+                k as *const std::ffi::c_void,
+                v as *const std::ffi::c_void,
+                o as *mut f32,
+                positions as *const i32,
+                nh as i32,
+                nk as i32,
+                hd as i32,
+                scale,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
     /// Decode I32 graph inputs (f32::from_bits bit patterns, alloc.rs
     /// fill_input_i32) into raw int32 for the rope/store/attention kernels.
     /// Fully device-side: no host sync, capture-safe (Phase 7d).
@@ -1623,6 +1695,30 @@ impl CudaState {
         let stream = self.stream();
         unsafe {
             launch_f32_bits_to_i32(src as *const f32, dst as *mut i32, n as i32, stream);
+        }
+    }
+
+    /// 8b: f16 KV cache — see `kv_cache_is_f16`. Same trade-off as Metal:
+    /// halves attention KV read bandwidth; the region stays f32-sized (the
+    /// f16 view uses the first half of the bytes).
+    pub fn store_kv_f16(
+        &self,
+        src: *mut std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        nkt: usize,
+        nt: usize,
+        positions: *mut std::ffi::c_void,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_store_kv_f16(
+                src as *const f32,
+                dst as *mut std::ffi::c_void,
+                nkt as i32,
+                nt as i32,
+                positions as *const i32,
+                stream,
+            );
         }
     }
 

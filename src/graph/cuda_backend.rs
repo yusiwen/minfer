@@ -19,6 +19,11 @@ struct CudaBuf {
 
 pub struct CudaBackend {
     state: &'static crate::cuda::CudaState,
+    /// 8b: KV cache element type — f16 (bandwidth-halving, Metal-aligned
+    /// auto-select policy) or f32. Set at construction from the process-wide
+    /// flag; a `#[cfg(test)]` setter flips it per instance so device tests
+    /// can exercise both layouts in one process.
+    kv_f16: bool,
     pool: Vec<CudaBuf>,
     free: Vec<usize>,
     /// Bumped on every pool allocation (fresh or free-list reuse). A captured
@@ -77,6 +82,7 @@ impl CudaBackend {
     #[allow(dead_code)]
     pub fn new() -> Option<Self> {
         let state = crate::cuda::CudaState::get()?;
+        let kv_f16 = crate::cuda::kv_cache_is_f16();
         let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
             GraphMode::Disabled
         } else {
@@ -94,6 +100,7 @@ impl CudaBackend {
             capturing: None,
             stream_guard: None,
             graphs_mode,
+            kv_f16,
         })
     }
 
@@ -110,6 +117,13 @@ impl CudaBackend {
     }
 
     #[cfg(test)]
+    /// 8b: flip the per-instance KV element type (device tests exercise both
+    /// layouts in one process; production backends take the global policy
+    /// set by the loader at construction).
+    pub(crate) fn set_kv_f16_for_test(&mut self, f16: bool) {
+        self.kv_f16 = f16;
+    }
+
     pub(crate) fn set_graphs_enabled_for_test(&mut self, enabled: bool) {
         self.graphs_mode = if enabled {
             GraphMode::Enabled
@@ -636,10 +650,18 @@ impl CudaBackend {
                 // Note: positions >= n_ctx are not validated here (device-side
                 // data); the CPU backend checks them, the GPU backends trust
                 // session-level clamping like Metal's store_kv dispatch.
-                self.state
-                    .store_kv_f32(self.ptr_of(in_bufs[0])?, self.ptr_of(k_id)?, nkt, nt, pos);
-                self.state
-                    .store_kv_f32(self.ptr_of(in_bufs[1])?, self.ptr_of(v_id)?, nkt, nt, pos);
+                // 8b: f16 KV stores into the same persistent region viewed as
+                // half (2 bytes/elem) — halves attention read bandwidth, same
+                // trade-off as Metal's store_kv dispatch.
+                let (sk, sv) = (self.ptr_of(in_bufs[0])?, self.ptr_of(in_bufs[1])?);
+                let (dk, dv) = (self.ptr_of(k_id)?, self.ptr_of(v_id)?);
+                if self.kv_f16 {
+                    self.state.store_kv_f16(sk, dk, nkt, nt, pos);
+                    self.state.store_kv_f16(sv, dv, nkt, nt, pos);
+                } else {
+                    self.state.store_kv_f32(sk, dk, nkt, nt, pos);
+                    self.state.store_kv_f32(sv, dv, nkt, nt, pos);
+                }
                 Ok(())
             }
 
@@ -683,18 +705,34 @@ impl CudaBackend {
                 // The causal bound (positions[t]+1) is derived from the device
                 // positions inside the kernel — no host scalar crosses here
                 // (precondition for CUDA Graph replay, Phase 7d).
-                self.state.gqa_attn_f32(
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(k_id)?,
-                    self.ptr_of(v_id)?,
-                    self.ptr_of(out_buf)?,
-                    pos,
-                    meta.n_head,
-                    meta.n_head_kv,
-                    meta.hd,
-                    meta.scale,
-                    nt,
-                );
+                // 8b: f16-KV variant reads half K/V (q/o stay f32)
+                if self.kv_f16 {
+                    self.state.gqa_attn_f16kv(
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        self.ptr_of(out_buf)?,
+                        pos,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        nt,
+                    );
+                } else {
+                    self.state.gqa_attn_f32(
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        self.ptr_of(out_buf)?,
+                        pos,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        nt,
+                    );
+                }
                 Ok(())
             }
 
@@ -2120,6 +2158,152 @@ mod tests {
         .unwrap();
         let agot = cb.copy_to_host(ob_at).unwrap();
         assert_close("gqa_attn", &agot, &aref, 1e-4);
+    }
+
+    // 8b: f16 KV cache — the store rounds K/V to half and the attention
+    // kernel reads half4. The reference builds its KV from the SAME
+    // half-rounded values so the comparison isolates the kernel from the
+    // f16 quantization noise (tolerance stays tight).
+    #[test]
+    fn cuda_kv_f16_roundtrip_attn() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        cb.set_kv_f16_for_test(true);
+        let (nh, nk_h, hd) = (4usize, 2usize, 8usize);
+        let nkt = nk_h * hd;
+        let (nt, n_ctx) = (3usize, 32usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let pos: Vec<usize> = vec![1, 4, 9];
+
+        let mut b = GraphBuilder::new();
+        let q = b.input("q", [nh * hd, nt, 1, 1], DType::F32);
+        let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
+        let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
+        let store = b.kvcache_store(0, k, v, pp, n_ctx);
+        let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+        let qr = b.rope(
+            q,
+            pp,
+            RopeStyle::NonInterleaved,
+            RoPEMeta {
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                n_head: nh,
+                hd,
+            },
+        );
+        let at = b.attn(
+            qr,
+            load,
+            pp,
+            AttnMode::Gqa,
+            AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk_h,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale,
+            },
+        );
+        b.output(at);
+        let g = b.build();
+
+        let (xb_q, xb_k, xb_v) = (
+            cb.alloc_buffer(nh * hd * nt),
+            cb.alloc_buffer(nkt * nt),
+            cb.alloc_buffer(nkt * nt),
+        );
+        let xb_p = cb.alloc_buffer(nt);
+        let (ob_qr, ob_at) = (cb.alloc_buffer(nh * hd * nt), cb.alloc_buffer(nh * hd * nt));
+        let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
+
+        let qs: Vec<f32> = (0..nh * hd * nt)
+            .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+            .collect();
+        let ks: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+            .collect();
+        let vs: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+            .collect();
+        let pb: Vec<f32> = pos.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        // the reference KV: what the f16 store actually persists (f32→f16→f32)
+        let to_half = |x: &[f32]| -> Vec<f32> {
+            x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+        };
+        let ks_h = to_half(&ks);
+        let vs_h = to_half(&vs);
+        cb.write_host(xb_q, &qs).unwrap();
+        cb.write_host(xb_k, &ks).unwrap();
+        cb.write_host(xb_v, &vs).unwrap();
+        cb.write_host(xb_p, &pb).unwrap();
+        // zero the regions (unwritten rows read as f16 zeros)
+        cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
+        cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
+
+        cb.execute_node(
+            &g.nodes[store],
+            &[xb_k, xb_v, xb_p],
+            kreg,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+        cb.execute_node(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
+            .unwrap();
+        cb.execute_node(
+            &g.nodes[at],
+            &[ob_qr, kreg, xb_p],
+            ob_at,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+
+        // a) stored K rows equal the half-rounded values at the scatter positions
+        let kback_f32 = cb.copy_to_host(kreg).unwrap();
+        // reinterpret the region as f16 pairs (store wrote 2 bytes/elem)
+        let kbytes: Vec<u8> = kback_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        for (t, &p) in pos.iter().enumerate() {
+            for j in 0..nkt {
+                let byte_off = (p * nkt + j) * 2;
+                let got = half::f16::from_le_bytes([kbytes[byte_off], kbytes[byte_off + 1]]);
+                assert!(
+                    (got.to_f32() - ks_h[t * nkt + j]).abs() < 1e-6,
+                    "f16 K row {p}[{j}]"
+                );
+            }
+        }
+        // b) attention vs cpu_gqa_attn over the half-rounded KV
+        let qgot = cb.copy_to_host(ob_qr).unwrap();
+        let mut qref = qs.clone();
+        crate::graph::cpu_backend::cpu_rope(
+            &mut qref,
+            &pos,
+            nh,
+            hd,
+            10000.0,
+            1.0,
+            RopeStyle::NonInterleaved,
+        );
+        assert_close("rope(f16 kv)", &qgot, &qref, 1e-4);
+        let mut kfull = vec![0f32; nkt * n_ctx];
+        let mut vfull = vec![0f32; nkt * n_ctx];
+        for (t, &p) in pos.iter().enumerate() {
+            kfull[p * nkt..(p + 1) * nkt].copy_from_slice(&ks_h[t * nkt..(t + 1) * nkt]);
+            vfull[p * nkt..(p + 1) * nkt].copy_from_slice(&vs_h[t * nkt..(t + 1) * nkt]);
+        }
+        let nkv = pos.iter().copied().max().unwrap() + 1;
+        let mut aref = vec![0f32; nh * hd * nt];
+        crate::graph::cpu_backend::cpu_gqa_attn(
+            &qref, &kfull, &vfull, &pos, nt, nkv, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+        )
+        .unwrap();
+        let agot = cb.copy_to_host(ob_at).unwrap();
+        assert_close("gqa_attn(f16 kv)", &agot, &aref, 1e-4);
     }
 
     #[test]
