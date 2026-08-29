@@ -769,6 +769,18 @@ mod tests {
             let pos32: Vec<u32> = (0..nt as u32).collect();
             alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
             alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
+            // G3 tail-reduction input: forward_cached fills it (see
+            // forward_cached); the manual graph must do the same, otherwise the
+            // reduce picks row 0 instead of the last row → logits of a different
+            // token (the ~1.9e1 divergence, issue 1).
+            if graph
+                .inputs
+                .iter()
+                .any(|&i| graph.node(i).name == "tail_ids")
+            {
+                let tail: Vec<u32> = ((nt - params.n_out)..nt).map(|x| x as u32).collect();
+                alloc.fill_input_i32(&graph, "tail_ids", &tail).unwrap();
+            }
             sched.execute(&graph, &mut alloc).unwrap();
             let nv = model.n_vocab();
             let logits = alloc.copy_to_cpu(graph.outputs[0]).unwrap();
@@ -1500,6 +1512,13 @@ mod tail_tests {
             use crate::graph::ops::Op;
             use crate::graph::params::{CParams, GraphParams, GraphType};
             use crate::graph::scheduler::BackendScheduler;
+
+            // Serialize with the other Metal tests + ensure MPS is initialized:
+            // without the lock this test races concurrent MPS access under
+            // parallel `cargo test`, which makes the fused/unfused greedy token
+            // flip (GPU nondeterminism under contention).
+            let _g = crate::metal::metal_test_lock();
+            crate::metal::MpsState::init();
 
             fn run_decode(
                 q2: &Qwen2Model,

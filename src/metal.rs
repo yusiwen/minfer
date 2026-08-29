@@ -3378,6 +3378,7 @@ mod tests {
     /// kernel's achieved GB/s at the REAL Q4_K prefill dims to see if it's
     /// bandwidth-bound or latency/occupancy-bound vs llama.
     #[test]
+    #[ignore = "heavy Metal throughput profile (~450 MB, ~20 s); timing-sensitive under parallel load — run opt-in: cargo test -- --ignored prefill_gemm_throughput_profile"]
     fn prefill_gemm_throughput_profile() {
         let _g = crate::metal::metal_test_lock();
         MpsState::init();

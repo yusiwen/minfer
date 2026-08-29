@@ -211,10 +211,16 @@ impl BackendScheduler {
                 let mut in_bufs = Vec::with_capacity(node.src.len());
                 for &s in &node.src {
                     // a cross-backend staging copy (split boundary) takes
-                    // precedence: the producing split's canonical buffer stays
-                    // on its own backend
+                    // precedence only when it was made FOR this split's backend:
+                    // a node feeding two different backends leaves one stale
+                    // cross-buffer (e.g. x goes to a Metal silu split and a CPU
+                    // add split — cross_buffer(x) ends up Metal), which must not
+                    // be read by the CPU consumer. Otherwise fall back to the
+                    // node's canonical buffer (already on the split's backend if
+                    // no copy was needed for it).
                     let sbr = alloc
                         .cross_buffer(s)
+                        .filter(|cb| cb.backend == split.backend)
                         .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr.id);
