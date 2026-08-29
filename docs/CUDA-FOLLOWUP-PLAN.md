@@ -63,21 +63,19 @@ Gate: all existing suites stay green; new gates pass.
 - 8a① BLOCKED on hardware — no macOS machine in this environment; the
   loader gate + fuse_ffn decoupling remain pending a Mac regression run.
 
-## 8b. KV f16 on CUDA (decode lever, long-context)
+## 8b. KV f16 on CUDA — **DONE 2026-08-29 (`f7b0036`)**
 
-CUDA KV is f32-only. Metal's policy (`set_kv_cache_type`): f16 when
-`n_layers × n_kv_embd ≥ 8192` (7B class), else f32 — measured −1 ms/token at
-2K ctx on Metal.
+`store_kv_f16` + `gqa_attn_f32_f16kv` (exact structural mirror of the f32
+attention: same online softmax, warp reductions, guards; the only delta is
+half4 → float4 K/V loads with f32 accumulation). Policy mirrors Metal:
+`MINFER_CACHE_TYPE=f16|f32` override, auto f16 when n_layers×n_kv_embd ≥ 8192
+(7B class), set at model load and cached per CudaBackend instance.
 
-- Add `store_kv_f16` + f16-reading attention path (dequant-on-read), or an
-  f16 template parameter on the attention kernel.
-- Reuse Metal's auto-select policy and `MINFER_CACHE_TYPE=f16|f32` override
-  so both backends behave identically.
-- Halves KV read traffic per decode token; benefit grows with context
-  (7B @2K ≈ 50 MB/step f32 → 25 MB; becomes dominant past ~8K ctx).
-
-Gate: `cuda_kv_roundtrip` f16 variant bit-parity vs a host reference;
-7B long-gen greedy text unchanged; ctx-2K decode timing A/B.
+Gates passed: f16 roundtrip parity vs a half-rounded-KV reference (1e-4,
+kernel isolated from quantization noise); 7B 96-token greedy text identical
+f16 vs f32; 7B @2K-ctx decode +~11% (swap-order pairs: 10.3/10.2 vs
+9.4/9.0 tok/s — the win grows with context). Caveat: `MINFER_GRAPH_DUMP`
+reads KV regions as f32 — incompatible with f16 KV (debug dump path only).
 
 ## 8c. Prefill Q8_0-activation GEMM (the 7e⑥ leftover)
 
