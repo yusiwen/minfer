@@ -22,13 +22,22 @@ f16 for the 7B class — that asymmetry is 8b below.
 
 ## 8a. Correctness debts (do first, small)
 
+> **Phase 8 review (2026-08-29, independent subagent review of 4fcd0d8..5cbb4ca):
+> 11 findings, all fixed in `961f696`** — capture-window abort on execute_node
+> errors, replay-vs-open-window guard, kernel weight-READ row guards
+> (q4_k/q6_k raw+padded/f32_vec), pos_scratch pool_gen bump, ring-wrap reset
+> race, stale padded_weights flag, pinned-ring alloc logging, Metal ffn_gu
+> gate (~1.99 GiB on 7B, memory-only), stray 7 MB trace file removed,
+> dump/trace/viz fuse_ffn gating aligned with the engine. Suites re-verified
+> (cuda 147/0, plain 133/0, fmt clean; 7B/0.5B E2E greedy coherent).
+
 1. **macOS regression run** — the qwen2 FFN-fusion gate was decoupled from
    `fuse_qkv` to `CParams.fuse_ffn` in 7e⑤ (mirroring Qwen3's existing
-   intent). Metal behavior change: `MINFER_NO_FUSE_QKV=1` no longer also
-   disables FFN fusion (use `MINFER_NO_FUSE_FFN=1`). Linux cannot verify
-   Metal — on a Mac: run 0.5B + 7B, greedy text must match the pre-change
-   record, and A/B `MINFER_NO_FUSE_FFN` (fused vs unfused with FusionPass
-   per the AGENTS.md test rule).
+   intent), and `961f696` additionally gated the Metal `ffn_gu` loader
+   registration on the same condition. Metal checks on a Mac: 0.5B + 7B
+   greedy text must match the pre-change record; A/B
+   `MINFER_NO_FUSE_FFN` (fused vs unfused with FusionPass per the AGENTS.md
+   test rule); confirm 0.5B still fuses on Metal (nf=2944 → gate open).
 2. **F32-weight GGUF E2E** — 7e④'s F32×F32 kernels have parity coverage but
    no end-to-end model (none cached). Download/quantize one F32-weight model
    and run the standard greedy-coherence + CPU A/B gate.
