@@ -132,6 +132,42 @@ mod tests {
         b.build()
     }
 
+    /// 8a③: the fusion toggles MUST participate in the reuse identity —
+    /// flipping `fuse_qkv`/`fuse_ffn` (what `MINFER_NO_FUSE_QKV`/
+    /// `MINFER_NO_FUSE_FFN` do at build time) changes the topology, so a
+    /// cached graph must NOT be reused. Guards against someone dropping the
+    /// fields from CParams/PartialEq and silently breaking the A/B envs.
+    #[test]
+    fn fuse_flags_are_part_of_the_reuse_identity() {
+        let mut base = params(1, 1);
+        base.cparams.fuse_qkv = true;
+        base.cparams.fuse_ffn = true;
+        let mut cache = GraphCache::new();
+        let g = tiny_graph();
+        cache.replace_graph(g, base.clone());
+        assert!(cache.try_reuse(&base), "identical params reuse");
+
+        for flip in ["fuse_qkv", "fuse_ffn"] {
+            let mut other = base.clone();
+            match flip {
+                "fuse_qkv" => other.cparams.fuse_qkv = false,
+                "fuse_ffn" => other.cparams.fuse_ffn = false,
+                _ => unreachable!(),
+            }
+            assert!(
+                !cache.try_reuse(&other),
+                "{flip}=false must force a rebuild (8a③)"
+            );
+            // and the reverse direction: stored off, requested on
+            let mut off = base.clone();
+            off.cparams.fuse_qkv = false;
+            off.cparams.fuse_ffn = false;
+            let mut cache2 = GraphCache::new();
+            cache2.replace_graph(tiny_graph(), off);
+            assert!(!cache2.try_reuse(&base));
+        }
+    }
+
     #[test]
     fn reuse_requires_equal_params() {
         let mut cache = GraphCache::new();
