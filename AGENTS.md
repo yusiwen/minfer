@@ -38,7 +38,7 @@ src/
 ├── download/mod.rs  # HuggingFace + Ollama auto-download + cached-name resolution
 ├── metal.rs         # MPS kernels + per-op GPU methods (graph backend entry points)
 ├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 kernels)
-├── cuda.rs          # CUDA backend (feature-gated; graph integration pending — Phase 7)
+├── cuda.rs          # CUDA device layer (feature-gated; CudaState singleton, weight registry, kernels, pinned staging; graph backend in graph/cuda_backend.rs — Phase 7 complete: 7a–7e)
 └── models/
     ├── mod.rs       # ModelDef trait + factory dispatch
     └── qwen2/
@@ -199,6 +199,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | objc 0.2 vs objc2 ecosystem — why block was vendored, nix devShell xcrun fix, and the objc2 migration (done 2026-08-25) | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
+| **CUDA graph backend plan + implementation record (Phase 7a–7e complete: per-op dispatch, capture/replay, K-quant vectorization, F32 matmul, FusedFFN, pinned staging)** | `docs/CUDA-BACKEND-PLAN.md` |
 | CUDA backend (draft) / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
 | Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
 | KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
