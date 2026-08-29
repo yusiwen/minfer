@@ -324,6 +324,12 @@ __device__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m
 // NR0=2 rows per warp, NSG=2 warps per block (4 rows per block).
 // Grid: x = ceil(od / 4), y = nt.
 
+// ─── Q4_K × f32 matrix multiplication (7e②: vectorized + unit mapping) ──
+// Each lane owns (row, super-block) pairs — all 32 lanes stay busy even
+// when nbe < 32 (the 7B FFN shapes have nbe = 14, which idled 18/32 lanes
+// in the lane-per-block layout). Weight loads are uint4 (Q4KB = 144 is
+// 16-byte aligned), activations float4; measured 3× the pair-layout
+// kernel on the 7B shapes (~163 GB/s vs ~42 GB/s).
 __global__ void q4_k_f32_matmul(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ acts,
@@ -331,7 +337,7 @@ __global__ void q4_k_f32_matmul(
     int od, int id, int nt
 ) {
     const int QKK = 256;
-    const int NR0 = 2;
+    const int NR0 = 4;
     const int NSG = 2;
 
     int warp_id = threadIdx.x / WARP;
@@ -343,83 +349,61 @@ __global__ void q4_k_f32_matmul(
 
     int nbe = (id + QKK - 1) / QKK;
     int row_stride = nbe * Q4KB;
-
-    const uint8_t* w0 = weights + (r0 + 0) * row_stride;
-    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
     const float* y = acts + t * id;
 
-    float sumf0 = 0.0f, sumf1 = 0.0f;
+    float acc[NR0];
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
 
-    for (int ib = lane_id; ib < nbe; ib += WARP) {
-        const uint8_t* blk0 = w0 + ib * Q4KB;
-        const uint8_t* blk1 = w1 + ib * Q4KB;
+    for (int u = lane_id; u < nbe * NR0; u += WARP) {
+        int ib = u % nbe;
+        int rr = u / nbe;
+        const uint8_t* blk = weights + (r0 + rr) * row_stride + ib * Q4KB;
 
-        float bd0 = h2f(*reinterpret_cast<const uint16_t*>(blk0));
-        float bm0 = h2f(*reinterpret_cast<const uint16_t*>(blk0 + 2));
-        float bd1 = h2f(*reinterpret_cast<const uint16_t*>(blk1));
-        float bm1 = h2f(*reinterpret_cast<const uint16_t*>(blk1 + 2));
-
-        const uint8_t* sc0 = blk0 + 4;
-        const uint8_t* sc1 = blk1 + 4;
-        const uint8_t* qs0 = blk0 + 16;
-        const uint8_t* qs1 = blk1 + 16;
+        float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        const uint8_t* sc = blk + 4;
+        const uint8_t* qs = blk + 16;
         const float* yb = y + ib * QKK;
 
-        uint8_t sc0_s[8], sc0_m[8], sc1_s[8], sc1_m[8];
-        for (int j = 0; j < 8; j++) {
-            get_scale_min_k4(j, sc0, &sc0_s[j], &sc0_m[j]);
-            get_scale_min_k4(j, sc1, &sc1_s[j], &sc1_m[j]);
-        }
+        uint8_t sc_s[8], sc_m[8];
+        for (int j = 0; j < 8; j++) get_scale_min_k4(j, sc, &sc_s[j], &sc_m[j]);
 
-        // Q4_K nibble layout (llama.cpp / quants.rs::dot_q4_k_q8_k_scalar):
-        // 64-element chunks — LOW nibbles of bytes [32j..32j+31] cover
-        // elements [64j..64j+31] (scale sc[2j], min m[2j]); HIGH nibbles of
-        // the same bytes cover elements [64j+32..64j+63] (scale sc[2j+1],
-        // min m[2j+1]). The previous version assumed "sub-block s = bytes
-        // s*16, low group then high group", which misreads every odd
-        // sub-block (half the elements of each super-block).
+        float partial = 0.0f;
+        #pragma unroll
         for (int j = 0; j < 4; j++) {
-            const uint8_t* qb0 = qs0 + j * 32;
-            const uint8_t* qb1 = qs1 + j * 32;
             const float* yl = yb + j * 64;
-
-            float slo0 = 0.0f, shi0 = 0.0f, syl0 = 0.0f, syh0 = 0.0f;
-            float slo1 = 0.0f, shi1 = 0.0f, syl1 = 0.0f, syh1 = 0.0f;
+            float slo = 0.0f, shi = 0.0f, syl = 0.0f, syh = 0.0f;
             #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                uint8_t b0 = qb0[l];
-                uint8_t b1 = qb1[l];
-                float y_a = yl[l];      // element 64j + l      (LOW nibble)
-                float y_b = yl[l + 32]; // element 64j + 32 + l (HIGH nibble)
-                slo0 += float(b0 & 0x0F) * y_a;
-                shi0 += float(b0 >> 4) * y_b;
-                slo1 += float(b1 & 0x0F) * y_a;
-                shi1 += float(b1 >> 4) * y_b;
-                syl0 += y_a;
-                syh0 += y_b;
-                syl1 += y_a;
-                syh1 += y_b;
+            for (int u2 = 0; u2 < 2; u2++) {
+                uint4 q = *reinterpret_cast<const uint4*>(qs + j * 32 + u2 * 16);
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&q);
+                const float* ylo = yl + u2 * 16;
+                const float* yhi = yl + 32 + u2 * 16;
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    float4 ya = *reinterpret_cast<const float4*>(ylo + v * 4);
+                    float4 yb4 = *reinterpret_cast<const float4*>(yhi + v * 4);
+                    slo += float(b[v*4+0] & 0x0F) * ya.x + float(b[v*4+1] & 0x0F) * ya.y
+                         + float(b[v*4+2] & 0x0F) * ya.z + float(b[v*4+3] & 0x0F) * ya.w;
+                    shi += float(b[v*4+0] >> 4) * yb4.x + float(b[v*4+1] >> 4) * yb4.y
+                         + float(b[v*4+2] >> 4) * yb4.z + float(b[v*4+3] >> 4) * yb4.w;
+                    syl += ya.x + ya.y + ya.z + ya.w;
+                    syh += yb4.x + yb4.y + yb4.z + yb4.w;
+                }
             }
-            sumf0 += bd0 * (float(sc0_s[2 * j]) * slo0 + float(sc0_s[2 * j + 1]) * shi0)
-                   - bm0 * (float(sc0_m[2 * j]) * syl0 + float(sc0_m[2 * j + 1]) * syh0);
-            sumf1 += bd1 * (float(sc1_s[2 * j]) * slo1 + float(sc1_s[2 * j + 1]) * shi1)
-                   - bm1 * (float(sc1_m[2 * j]) * syl1 + float(sc1_m[2 * j + 1]) * syh1);
+            partial += d * (float(sc_s[2 * j]) * slo + float(sc_s[2 * j + 1]) * shi)
+                     - dm * (float(sc_m[2 * j]) * syl + float(sc_m[2 * j + 1]) * syh);
         }
+        acc[rr] += partial;
     }
 
-    sumf0 = warp_reduce_sum(sumf0);
-    sumf1 = warp_reduce_sum(sumf1);
-    if (lane_id == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) {
+        float v = warp_reduce_sum(acc[rr]);
+        if (lane_id == 0 && r0 + rr < od) output[t * od + r0 + rr] = v;
     }
 }
-
-// ─── Q6_K × f32 matrix multiplication ─────────────────────────
-// Q6_K super-block: 256 elements, 16 sub-blocks × 16.
-// Block (210 bytes): uchar ql[128], uchar qh[64], int8 scales[16], fp16 d.
-// Dequant: val = d * scales[sub] * ((low4 | (high2 << 4)) - 32).
-// NR0=2 rows per warp, NSG=2 warps per block.
 
 __global__ void q6_k_f32_matmul(
     const uint8_t* __restrict__ weights,
@@ -462,33 +446,199 @@ __global__ void q6_k_f32_matmul(
         const int8_t* sc1 = (const int8_t*)(blk1 + 192);
         const float* yb = y + ib * QKK;
 
+        // 7e②: the y side (the hot cache-resident stream) loads float4
+        // groups instead of 32-float-strided scalars; ql/qh stay per-byte —
+        // Q6KB = 210 is not 16-byte aligned, so vector weight loads would
+        // need a repacked layout (possible follow-up).
         for (int n = 0; n < 2; n++) {
             #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                const float* ys = yb + n * 128 + l;
+            for (int g = 0; g < 2; g++) {
+                // l stays in [0,32): two 16-element groups per half; the four
+                // terms ys[0/32/64/96] use scales sc[n*8 + g + {0, 2, 4, 6}]
+                // (si = l/16 + n*8 in the scalar formulation, is = g).
+                const float* yb_n = yb + n * 128 + g * 16;
 
-                int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
-                int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
-                int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
-                int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
-                int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
-                int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
-                int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
-                int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
+                float p00 = 0.0f, p01 = 0.0f, p02 = 0.0f, p03 = 0.0f;
+                float p10 = 0.0f, p11 = 0.0f, p12 = 0.0f, p13 = 0.0f;
 
-                int si = is + n * 8;
-                sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
-                       + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
-                       + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
-                       + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
-                sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
-                       + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
-                       + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
-                       + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const int l = g * 16 + v * 4;
+                    float4 ys0 = *reinterpret_cast<const float4*>(yb_n + 0);
+                    float4 ys1 = *reinterpret_cast<const float4*>(yb_n + 32);
+                    float4 ys2 = *reinterpret_cast<const float4*>(yb_n + 64);
+                    float4 ys3 = *reinterpret_cast<const float4*>(yb_n + 96);
+
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const int b = l + r;
+                        int qh0_b = qh0[b];
+                        int qh1_b = qh1[b];
+                        int q0_0 = ((int)(ql0[b] & 0xF) | ((qh0_b & 3) << 4)) - 32;
+                        int q1_0 = ((int)(ql1[b] & 0xF) | ((qh1_b & 3) << 4)) - 32;
+                        int q0_1 = ((int)(ql0[b + 32] & 0xF) | (((qh0_b >> 2) & 3) << 4)) - 32;
+                        int q1_1 = ((int)(ql1[b + 32] & 0xF) | (((qh1_b >> 2) & 3) << 4)) - 32;
+                        int q0_2 = ((int)(ql0[b] >> 4) | (((qh0_b >> 4) & 3) << 4)) - 32;
+                        int q1_2 = ((int)(ql1[b] >> 4) | (((qh1_b >> 4) & 3) << 4)) - 32;
+                        int q0_3 = ((int)(ql0[b + 32] >> 4) | (((qh0_b >> 6) & 3) << 4)) - 32;
+                        int q1_3 = ((int)(ql1[b + 32] >> 4) | (((qh1_b >> 6) & 3) << 4)) - 32;
+
+                        // component index is r (the element within the
+                        // float4), not v — the v selector was the 7e② bug
+                        // (3/4 of the y values were never read).
+                        const float* c0 = reinterpret_cast<const float*>(&ys0);
+                        const float* c1 = reinterpret_cast<const float*>(&ys1);
+                        const float* c2 = reinterpret_cast<const float*>(&ys2);
+                        const float* c3 = reinterpret_cast<const float*>(&ys3);
+                        const float y0 = c0[r];
+                        const float y1 = c1[r];
+                        const float y2 = c2[r];
+                        const float y3 = c3[r];
+                        p00 += float(q0_0) * y0;
+                        p01 += float(q0_1) * y1;
+                        p02 += float(q0_2) * y2;
+                        p03 += float(q0_3) * y3;
+                        p10 += float(q1_0) * y0;
+                        p11 += float(q1_1) * y1;
+                        p12 += float(q1_2) * y2;
+                        p13 += float(q1_3) * y3;
+                    }
+                    yb_n += 4;
+                }
+                int si = n * 8 + g;
+                sumf0 += bd0 * (float(sc0[si + 0]) * p00 + float(sc0[si + 2]) * p01
+                              + float(sc0[si + 4]) * p02 + float(sc0[si + 6]) * p03);
+                sumf1 += bd1 * (float(sc1[si + 0]) * p10 + float(sc1[si + 2]) * p11
+                              + float(sc1[si + 4]) * p12 + float(sc1[si + 6]) * p13);
             }
             ql0 += 64; ql1 += 64;
             qh0 += 32; qh1 += 32;
+        }
+    }
+
+    sumf0 = warp_reduce_sum(sumf0);
+    sumf1 = warp_reduce_sum(sumf1);
+    if (lane_id == 0) {
+        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+    }
+}
+
+// ─── Q6_K × f32 matmul, PADDED weight layout (7e②) ────────────
+// Registered via register_weight_q6k_padded: each 210-byte block lives in a
+// 224-byte slot (224 = 14×16), so every block — and the ql/qh/scales fields
+// inside it — is 16-byte aligned and the weight stream uses uint4 loads.
+// This is the 7B decode bottleneck fix: Q6_K (ffn_down + output.weight) is
+// ~45% of the q4_K_M weight traffic and the 210-byte stride previously
+// forced 1-byte-per-instruction reads.
+__global__ void q6_k_f32_matmul_padded(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int QKK = 256;
+    const int NR0 = 2;
+    const int NSG = 2;
+    const int Q6KPB = 224;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+
+    if (t >= nt || r0 >= od) return;
+
+    int nbe = (id + QKK - 1) / QKK;
+    int row_stride = nbe * Q6KPB;
+
+    const uint8_t* w0 = weights + (r0 + 0) * row_stride;
+    const uint8_t* w1 = weights + (r0 + 1) * row_stride;
+    const float* y = acts + t * id;
+
+    float sumf0 = 0.0f, sumf1 = 0.0f;
+
+    for (int ib = lane_id; ib < nbe; ib += WARP) {
+        const uint8_t* blk0 = w0 + ib * Q6KPB;
+        const uint8_t* blk1 = w1 + ib * Q6KPB;
+
+        float bd0 = h2f(*reinterpret_cast<const uint16_t*>(blk0 + 208));
+        float bd1 = h2f(*reinterpret_cast<const uint16_t*>(blk1 + 208));
+
+        const uint8_t* ql0 = blk0;
+        const uint8_t* ql1 = blk1;
+        const uint8_t* qh0 = blk0 + 128;
+        const uint8_t* qh1 = blk1 + 128;
+        const int8_t* sc0 = (const int8_t*)(blk0 + 192);
+        const int8_t* sc1 = (const int8_t*)(blk1 + 192);
+        const float* yb = y + ib * QKK;
+
+        for (int n = 0; n < 2; n++) {
+            #pragma unroll
+            for (int g = 0; g < 2; g++) {
+                // 16 elements per group (l = g*16 .. g*16+15); the four terms
+                // ys[0/32/64/96] use scales sc[n*8 + g + {0, 2, 4, 6}].
+                const float* yb_n = yb + n * 128 + g * 16;
+
+                float p00 = 0.0f, p01 = 0.0f, p02 = 0.0f, p03 = 0.0f;
+                float p10 = 0.0f, p11 = 0.0f, p12 = 0.0f, p13 = 0.0f;
+
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    // 16 weight bytes per group per source = one uint4 each
+                    uint4 ql0a = *reinterpret_cast<const uint4*>(ql0 + n * 64 + g * 16);
+                    uint4 ql0b = *reinterpret_cast<const uint4*>(ql0 + n * 64 + 32 + g * 16);
+                    uint4 ql1a = *reinterpret_cast<const uint4*>(ql1 + n * 64 + g * 16);
+                    uint4 ql1b = *reinterpret_cast<const uint4*>(ql1 + n * 64 + 32 + g * 16);
+                    uint4 qh0a = *reinterpret_cast<const uint4*>(qh0 + n * 32 + g * 16);
+                    uint4 qh1a = *reinterpret_cast<const uint4*>(qh1 + n * 32 + g * 16);
+                    const uint8_t* a0 = reinterpret_cast<const uint8_t*>(&ql0a);
+                    const uint8_t* b0 = reinterpret_cast<const uint8_t*>(&ql0b);
+                    const uint8_t* a1 = reinterpret_cast<const uint8_t*>(&ql1a);
+                    const uint8_t* b1 = reinterpret_cast<const uint8_t*>(&ql1b);
+                    const uint8_t* h0 = reinterpret_cast<const uint8_t*>(&qh0a);
+                    const uint8_t* h1 = reinterpret_cast<const uint8_t*>(&qh1a);
+
+                    float4 ys0 = *reinterpret_cast<const float4*>(yb_n + 0);
+                    float4 ys1 = *reinterpret_cast<const float4*>(yb_n + 32);
+                    float4 ys2 = *reinterpret_cast<const float4*>(yb_n + 64);
+                    float4 ys3 = *reinterpret_cast<const float4*>(yb_n + 96);
+                    const float* c0 = reinterpret_cast<const float*>(&ys0);
+                    const float* c1 = reinterpret_cast<const float*>(&ys1);
+                    const float* c2 = reinterpret_cast<const float*>(&ys2);
+                    const float* c3 = reinterpret_cast<const float*>(&ys3);
+
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const int j = v * 4 + r;
+                        int h0b = h0[j];
+                        int h1b = h1[j];
+                        int q0_0 = ((int)(a0[j] & 0xF) | ((h0b & 3) << 4)) - 32;
+                        int q1_0 = ((int)(a1[j] & 0xF) | ((h1b & 3) << 4)) - 32;
+                        int q0_1 = ((int)(b0[j] & 0xF) | (((h0b >> 2) & 3) << 4)) - 32;
+                        int q1_1 = ((int)(b1[j] & 0xF) | (((h1b >> 2) & 3) << 4)) - 32;
+                        int q0_2 = ((int)(a0[j] >> 4) | (((h0b >> 4) & 3) << 4)) - 32;
+                        int q1_2 = ((int)(a1[j] >> 4) | (((h1b >> 4) & 3) << 4)) - 32;
+                        int q0_3 = ((int)(b0[j] >> 4) | (((h0b >> 6) & 3) << 4)) - 32;
+                        int q1_3 = ((int)(b1[j] >> 4) | (((h1b >> 6) & 3) << 4)) - 32;
+
+                        p00 += float(q0_0) * c0[r];
+                        p01 += float(q0_1) * c1[r];
+                        p02 += float(q0_2) * c2[r];
+                        p03 += float(q0_3) * c3[r];
+                        p10 += float(q1_0) * c0[r];
+                        p11 += float(q1_1) * c1[r];
+                        p12 += float(q1_2) * c2[r];
+                        p13 += float(q1_3) * c3[r];
+                    }
+                    yb_n += 4;
+                }
+                int si = n * 8 + g;
+                sumf0 += bd0 * (float(sc0[si + 0]) * p00 + float(sc0[si + 2]) * p01
+                              + float(sc0[si + 4]) * p02 + float(sc0[si + 6]) * p03);
+                sumf1 += bd1 * (float(sc1[si + 0]) * p10 + float(sc1[si + 2]) * p11
+                              + float(sc1[si + 4]) * p12 + float(sc1[si + 6]) * p13);
+            }
         }
     }
 
@@ -859,6 +1009,16 @@ void launch_q4_1_f32_matmul(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q4_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q6_k_f32_matmul_padded(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 2, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q6_k_f32_matmul_padded<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
 void launch_q4_k_f32_matmul(

@@ -230,7 +230,20 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 | TensorType::Q6_K
                 | TensorType::Q8_0
         ) {
-            cuda.register_weight(&ti.name, tensor.data());
+            if ttype == TensorType::Q6_K {
+                // 7e②: register Q6_K in the padded 224-byte block layout so
+                // the matmul kernel can use aligned uint4 weight loads
+                // (the raw 210-byte stride forces 1-byte-per-instruction
+                // reads and caps 7B decode near ~38 GB/s).
+                cuda.register_weight_q6k_padded(
+                    &ti.name,
+                    tensor.data(),
+                    tensor.shape[1] as usize,
+                    tensor.shape[0] as usize,
+                );
+            } else {
+                cuda.register_weight(&ti.name, tensor.data());
+            }
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
         }

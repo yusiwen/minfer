@@ -597,7 +597,7 @@ impl Backend for CudaBackend {
                         node.name
                     ));
                 }
-                self.state.matmul_f32_ptr(
+                self.state.matmul_f32_ptr_layout(
                     wptr,
                     meta.weight_ttype,
                     self.ptr_of(in_bufs[0])?,
@@ -605,6 +605,7 @@ impl Backend for CudaBackend {
                     od,
                     id,
                     nt,
+                    self.state.is_weight_padded(&meta.weight_name),
                 )?;
                 if let Some(bname) = &meta.bias_name {
                     let bptr = self.state.get_weight_ptr(bname).ok_or_else(|| {
@@ -1145,6 +1146,191 @@ mod tests {
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
             assert_close(name, &got, &want, scale * 1e-3);
+        }
+    }
+
+    /// 7e②: K-quant matmul parity (Q4_K + Q6_K). The reference dequantizes
+    /// each row with an independent in-test implementation of the
+    /// llama.cpp block layout and dots it with the f32 activations. The
+    /// original scalar CUDA kernels and the 7e② vectorized ones must both
+    /// agree with it (coverage gap found in 7e②: q6_K previously had NO
+    /// parity test, which let a broken vectorized variant pass the suite).
+    #[test]
+    fn cuda_kquant_matmul_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // id_ = 512 = 2 super-blocks of 256; od = 8 rows (NR0 = 2 → 4 row
+        // pairs across 2 warps per block).
+        let (od, id_, nt) = (8usize, 512usize, 3usize);
+        let xs: Vec<f32> = (0..id_ * nt)
+            .map(|i| (((i as u64) * 1103515245 % 997) as f32) / 500.0 - 1.0)
+            .collect();
+
+        // get_scale_min_k4 (llama.cpp Q4_K scale packing, reimplemented
+        // here independently of the kernel under test).
+        fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
+            if j < 4 {
+                (q[j] & 63, q[j + 4] & 63)
+            } else {
+                (
+                    (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                    (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+                )
+            }
+        }
+
+        // ── Q4_K tensor: 144 bytes per 256-element super-block ──
+        // layout: f16 d, f16 dmin, u8 scales[12], nibble bytes qs[128]
+        let mut w4b = Vec::new();
+        let mut w4dq = vec![0f32; od * id_];
+        for r in 0..od {
+            for ib in 0..id_ / 256 {
+                let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
+                let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
+                w4b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                w4b.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                let mut scb = [0u8; 12];
+                for j in 0..12 {
+                    scb[j] = ((r * 31 + j * 17 + ib * 5) % 63) as u8;
+                }
+                w4b.extend_from_slice(&scb);
+                let mut qs = [0u8; 128];
+                for j in 0..128 {
+                    let lo = ((r * 13 + j * 7 + ib * 3) % 15) as u8;
+                    let hi = ((r * 5 + j * 11 + ib * 2) % 15) as u8;
+                    qs[j] = lo | (hi << 4);
+                }
+                w4b.extend_from_slice(&qs);
+                // reference dequant: LOW nibbles of bytes[32j..32j+31] are
+                // elements [64j..64j+31] (scale 2j), HIGH nibbles are
+                // elements [64j+32..64j+63] (scale 2j+1);
+                // value = d*sc*nibble - dmin*m
+                for j in 0..4 {
+                    let (s_lo, m_lo) = k4_scale(&scb, 2 * j);
+                    let (s_hi, m_hi) = k4_scale(&scb, 2 * j + 1);
+                    for l in 0..32 {
+                        let b = qs[j * 32 + l];
+                        let base = r * id_ + ib * 256 + j * 64;
+                        w4dq[base + l] = (b & 0x0F) as f32 * d * s_lo as f32 - dmin * m_lo as f32;
+                        w4dq[base + 32 + l] =
+                            (b >> 4) as f32 * d * s_hi as f32 - dmin * m_hi as f32;
+                    }
+                }
+            }
+        }
+
+        // ── Q6_K tensor: 210 bytes per 256-element super-block ──
+        // layout: ql[128], qh[64], i8 scales[16], f16 d
+        let mut w6b = Vec::new();
+        let mut w6dq = vec![0f32; od * id_];
+        for r in 0..od {
+            for ib in 0..id_ / 256 {
+                let d = 0.027f32 + 0.004 * ((r * 11 + ib * 7) % 6) as f32;
+                let mut ql = [0u8; 128];
+                let mut qh = [0u8; 64];
+                let mut sc = [0i8; 16];
+                for i in 0..128 {
+                    ql[i] = ((r * 29 + i * 7 + ib * 3) % 255) as u8;
+                }
+                for i in 0..64 {
+                    qh[i] = ((r * 17 + i * 13 + ib * 11) % 255) as u8;
+                }
+                for i in 0..16 {
+                    sc[i] = (((r * 5 + i * 3 + ib) % 15) as i8) - 7;
+                }
+                w6b.extend_from_slice(&ql);
+                w6b.extend_from_slice(&qh);
+                w6b.extend(sc.iter().map(|&x| x as u8));
+                w6b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                // reference dequant (llama.cpp Q6_K layout):
+                // value = d * sc[n*8 + l/16 + t*2] * (nibble|2bits<<4 - 32)
+                for n in 0..2usize {
+                    let qlh = &ql[n * 64..n * 64 + 64];
+                    let qhh = &qh[n * 32..n * 32 + 32];
+                    for l in 0..32usize {
+                        let is = l / 16;
+                        let q1 = ((qlh[l] & 0xF) as i32 | (((qhh[l] >> 0) as i32 & 3) << 4)) - 32;
+                        let q2 =
+                            ((qlh[l + 32] & 0xF) as i32 | (((qhh[l] >> 2) as i32 & 3) << 4)) - 32;
+                        let q3 = ((qlh[l] >> 4) as i32 | (((qhh[l] >> 4) as i32 & 3) << 4)) - 32;
+                        let q4 =
+                            ((qlh[l + 32] >> 4) as i32 | (((qhh[l] >> 6) as i32 & 3) << 4)) - 32;
+                        let base = r * id_ + ib * 256 + n * 128;
+                        w6dq[base + l] = d * sc[n * 8 + is] as f32 * q1 as f32;
+                        w6dq[base + l + 32] = d * sc[n * 8 + is + 2] as f32 * q2 as f32;
+                        w6dq[base + l + 64] = d * sc[n * 8 + is + 4] as f32 * q3 as f32;
+                        w6dq[base + l + 96] = d * sc[n * 8 + is + 6] as f32 * q4 as f32;
+                    }
+                }
+            }
+        }
+
+        let mut w4t = Tensor::from_data(
+            TensorType::Q4_K,
+            &[id_ as i64, od as i64, 1, 1],
+            w4b.clone(),
+        );
+        w4t.name = "mw4k".to_string();
+        cb.state.register_weight("mw4k", &w4b);
+        let mut w6t = Tensor::from_data(
+            TensorType::Q6_K,
+            &[id_ as i64, od as i64, 1, 1],
+            w6b.clone(),
+        );
+        w6t.name = "mw6k".to_string();
+        cb.state.register_weight("mw6k", &w6b);
+        // 7e② padded layout path (register_weight_q6k_padded)
+        cb.state.register_weight_q6k_padded("mw6kp", &w6b, od, id_);
+        assert!(cb.state.is_weight_padded("mw6kp"));
+
+        let mut w6pt = Tensor::from_data(
+            TensorType::Q6_K,
+            &[id_ as i64, od as i64, 1, 1],
+            w6b.clone(),
+        );
+        w6pt.name = "mw6kp".to_string();
+
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+        let m4 = b.matmul(x, &w4t, None);
+        let m6 = b.matmul(x, &w6t, None);
+        let m6p = b.matmul(x, &w6pt, None);
+        b.output(m4);
+        b.output(m6);
+        b.output(m6p);
+        let g = b.build();
+
+        let xb = cb.alloc_buffer(id_ * nt);
+        cb.write_host(xb, &xs).unwrap();
+        let (o4, o6, o6p) = (
+            cb.alloc_buffer(od * nt),
+            cb.alloc_buffer(od * nt),
+            cb.alloc_buffer(od * nt),
+        );
+        cb.execute_node(&g.nodes[m4], &[xb], o4, None).unwrap();
+        cb.execute_node(&g.nodes[m6], &[xb], o6, None).unwrap();
+        cb.execute_node(&g.nodes[m6p], &[xb], o6p, None).unwrap();
+
+        for (name, o, dq) in [
+            ("q4_k matmul", o4, &w4dq),
+            ("q6_k matmul", o6, &w6dq),
+            ("q6_k padded matmul", o6p, &w6dq),
+        ] {
+            let got = cb.copy_to_host(o).unwrap();
+            let mut want = vec![0f32; od * nt];
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut acc = 0f32;
+                    for i in 0..id_ {
+                        acc += dq[r * id_ + i] * xs[t * id_ + i];
+                    }
+                    want[t * od + r] = acc;
+                }
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_close(name, &got, &want, scale * 2e-3);
         }
     }
 

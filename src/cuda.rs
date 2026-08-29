@@ -158,6 +158,15 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_q6_k_f32_matmul_padded(
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_quantize_q8_0(
         x: *const f32,
         y: *mut u8,
@@ -308,6 +317,11 @@ impl Drop for ModelLoadGuard {
 pub struct CudaState {
     stream: Mutex<CudaPtr>,
     weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
+    /// Names registered through `register_weight_q6k_padded` (device layout
+    /// is 224-byte-padded Q6_K, not the raw GGUF byte stream) → the
+    /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
+    /// tensors by their raw GGUF size.
+    padded_weights: Mutex<HashMap<String, usize>>,
     // Persistent activation buffers (grown on demand) with size tracking
     buf_hidden: Mutex<(CudaPtr, usize)>,
     buf_bn: Mutex<(CudaPtr, usize)>,
@@ -451,6 +465,7 @@ impl CudaState {
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
             weights: Mutex::new(HashMap::new()),
+            padded_weights: Mutex::new(HashMap::new()),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
             buf_bq: Mutex::new(dummy),
@@ -543,6 +558,43 @@ impl CudaState {
             .insert(name.to_string(), (CudaPtr(ptr), data.len()));
     }
 
+    /// 7e②: register a Q6_K tensor in the PADDED device layout (each
+    /// 210-byte block in a 224-byte slot) so the matmul kernel can use
+    /// 16-byte-aligned uint4 weight loads. `od`/`id` are the matmul output/
+    /// input dims (GGUF shape [in, out] → id = shape[0], od = shape[1]).
+    pub fn register_weight_q6k_padded(&self, name: &str, data: &[u8], od: usize, id: usize) {
+        const Q6KB: usize = 210;
+        const Q6KPB: usize = 224;
+        let nbe = id.div_ceil(256);
+        let row_len = nbe * Q6KB;
+        if od == 0 || id == 0 || data.len() < od * row_len {
+            eprintln!(
+                "CUDA: q6_k padded registration skipped for '{}' ({} bytes, od={od} id={id})",
+                name,
+                data.len()
+            );
+            return;
+        }
+        let mut padded = vec![0u8; od * nbe * Q6KPB];
+        for r in 0..od {
+            for ib in 0..nbe {
+                let src = r * row_len + ib * Q6KB;
+                let dst = r * nbe * Q6KPB + ib * Q6KPB;
+                padded[dst..dst + Q6KB].copy_from_slice(&data[src..src + Q6KB]);
+            }
+        }
+        self.register_weight(name, &padded);
+        self.padded_weights
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), data.len());
+    }
+
+    /// Whether `name` was registered in the padded Q6_K layout.
+    pub fn is_weight_padded(&self, name: &str) -> bool {
+        self.padded_weights.lock().unwrap().contains_key(name)
+    }
+
     pub fn get_weight_ptr(&self, name: &str) -> Option<*mut std::ffi::c_void> {
         self.weights.lock().unwrap().get(name).map(|(cp, _)| cp.0)
     }
@@ -561,6 +613,12 @@ impl CudaState {
     /// with a DIFFERENT byte size belongs to another architecture's model and
     /// must read as "not registered" so that model cleanly falls back to CPU.
     pub fn has_weight_of_size(&self, name: &str, bytes: usize) -> bool {
+        // Padded Q6_K entries live on the device with a larger (224-byte
+        // stride) footprint; match them by their ORIGINAL raw length so the
+        // weights gate sees them as registered.
+        if let Some(&raw) = self.padded_weights.lock().unwrap().get(name) {
+            return raw == bytes;
+        }
         self.weights
             .lock()
             .unwrap()
@@ -1009,6 +1067,22 @@ impl CudaState {
         id: usize,
         nt: usize,
     ) -> Result<(), String> {
+        self.matmul_f32_ptr_layout(wptr, ttype, x, out, od, id, nt, false)
+    }
+
+    /// `padded_q6k`: the weight buffer was registered via
+    /// `register_weight_q6k_padded` (224-byte block stride).
+    pub fn matmul_f32_ptr_layout(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        ttype: TensorType,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        padded_q6k: bool,
+    ) -> Result<(), String> {
         let stream = self.stream();
         macro_rules! launch {
             ($f:ident) => {{
@@ -1031,7 +1105,13 @@ impl CudaState {
             TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
             TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
             TensorType::Q4_K => launch!(launch_q4_k_f32_matmul),
-            TensorType::Q6_K => launch!(launch_q6_k_f32_matmul),
+            TensorType::Q6_K => {
+                if padded_q6k {
+                    launch!(launch_q6_k_f32_matmul_padded)
+                } else {
+                    launch!(launch_q6_k_f32_matmul)
+                }
+            }
             other => Err(format!(
                 "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"
             )),
