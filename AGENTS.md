@@ -213,3 +213,4 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |
 | **CLI multi-turn conversation plan (append-only KV + incremental template diff)** | `docs/CLI-CONVERSATION-PLAN.md` |
 | **Interactive inference-graph web visualization** (`--dump-graph-json` + zero-dep flowchart page + `MINFER_TRACE` real-data trace: per-node stats/values, decode tokens & logits top-5) | `viz/README.md` |
+| **Known CPU-path issues on aarch64-Linux (legacy-forward divergence, parallel attn_heads UB), macOS verification steps** | `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |
