@@ -2273,6 +2273,55 @@ mod tests {
         assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
     }
 
+    /// Phase 8 review: an execute_node error during an open capture window
+    /// must ABORT the window (the scheduler propagates before the boundary
+    /// sync, so nothing else would close it). Driven directly here because
+    /// no supported model can fail a node mid-capture today.
+    #[test]
+    fn cuda_capture_abort_on_error() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let sched = BackendScheduler;
+        let mut g_cap = replay_graph();
+        let mut g_ref = replay_graph();
+        let mut cap = replay_alloc(true);
+        let mut refr = replay_alloc(false);
+        sched.assign_backends(&mut g_cap, &cap);
+        sched.assign_backends(&mut g_ref, &refr);
+        cap.alloc_graph(&g_cap).unwrap();
+        refr.alloc_graph(&g_ref).unwrap();
+
+        // open the window via the 3-run protocol WITHOUT executing nodes
+        let cb = cap.cuda_mut().unwrap();
+        for _ in 0..3 {
+            cb.graph_replay_step(7, (0, 1));
+        }
+        assert!(cb.capturing.is_some(), "3rd run must open a capture window");
+        assert!(cb.stream_guard.is_some(), "window holds the stream lock");
+
+        // the error path: abort, not close
+        cb.abort_capture("unit test");
+        assert!(cb.capturing.is_none(), "window must be closed");
+        assert!(cb.stream_guard.is_none(), "stream lock released");
+        assert_eq!(
+            cb.graphs_mode,
+            GraphMode::Disabled,
+            "graphs disabled after an aborted window"
+        );
+        assert_eq!(cb.captured_count(), 0, "aborted window must not be cached");
+        assert!(
+            !cb.graph_replay_step(7, (0, 1)),
+            "no replay after graphs are disabled"
+        );
+
+        // direct execution keeps working after the abort
+        let got = replay_step(&sched, &g_cap, &mut cap, 99.0);
+        let want = replay_step(&sched, &g_ref, &mut refr, 99.0);
+        assert_eq!(got, want, "post-abort direct execution diverged");
+    }
+
     /// A pool generation change after capture must invalidate the stored exec
     /// (conservative: pointers may differ) and re-capture on a later run.
     #[test]
