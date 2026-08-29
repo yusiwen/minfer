@@ -157,23 +157,23 @@ weights over real unpack_q4k_scales, 5e-3); 0.5B q5_k_m E2E — CUDA now
 admits the model (was CPU wholesale), greedy output identical to CPU;
 cuda 155/0. Q5_0 deferred (no model needs it; add when one does).
 
-## 8g. Prefill capture: gate the accidental path, then productize
+## 8g. Prefill capture — **8g① DONE (8a batch); 8g② DONE 2026-08-29 (`eb24054`)**
 
 Two findings from the Phase 8 completeness audit (2026-08-29):
 
-1. **Immediate hygiene (ships with 8a):** `graph_replay_step` has NO nt
+1. **Immediate hygiene (shipped with 8a):** `graph_replay_step` has NO nt
    gate — the scheduler runs the 3-run capture protocol for EVERY CUDA
    split, so a repeated identical-nt prefill (server/slot scenario) would
-   silently start capturing a ~437-node graph. Correctness is plausible
-   (positions are out-of-window input fills, prefill is single-split since
-   7e③, pool churn forces recapture) but untested and benefit-free. Add an
-   explicit decode-only capture gate, or a test that turns prefill capture
-   into a deliberate feature.
-2. **Productization:** capture prefill splits deliberately — after 8c/8d
-   (allocator churn at prefill sizes makes capture windows more fragile;
-   the launch-overhead win is smaller since big kernels amortize it).
-
-Gate: replay bit-parity harness like 7d's, at pp16 + pp300.
+   silently start capturing a ~437-node graph. → Fixed: decode-only
+   capture gate (`ComputeGraph::capture_nt_hint()`, ships with 8a).
+2. **Productization — DONE (`eb24054`):** prefill capture is now a
+   DELIBERATE opt-in (`MINFER_CAPTURE_PREFILL=1` /
+   `set_prefill_capture_for_test`) rather than accidental: a repeated
+   identical-nt prefill split captures after the same 3-run protocol.
+   Gate: `cuda_prefill_capture_bit_parity_pp16_pp300` — captured prefill
+   replays bit-identical to direct launches at pp16 AND pp300
+   (captured_count == 1 each); real-model smoke unchanged output.
+   Default OFF (the 8g① no-capture assertion still holds).
 
 ## 8h. Infra / process
 
