@@ -110,19 +110,29 @@ quant-matmul kernels now run at ~163 GB/s on FFN shapes.
 Gate: node-level parity vs the current path (tolerance class per GPU_SAFETY);
 7B decode A/B at ctx 440 and 2K.
 
-## 8e. MMQ shared-memory tiling for K-quants (kernel bandwidth)
+## 8e. MMQ shared-memory tiling for K-quants — **NEGATIVE RESULT 2026-08-29**
 
-The 7e② unit-mapping kernels are streaming; llama.cpp's MMQ uses shared-
-memory tiling + better occupancy. 62% of peak BW leaves ~40% on the table —
-if tiling pushes the FFN shapes from ~163 to ~200 GB/s, 7B decode goes from
-~26 to ~32 tok/s without touching anything else.
+The premise did not survive measurement. Standalone A/B (`/tmp/minfer_phase7/
+bench8e.cu`, 7e② methodology, L2 DEFEATED by cycling 8× 76 MB weight buffers
+≈ 600 MB working set — without this the bench numbers are L2-inflated):
 
-- Apply to q4_K/q6_K first (the 7B-critical types), reusing the 7e②
-  standalone-A/B + `cuda_kquant_matmul_parity` harness.
-- Keep the unit-mapping kernel as fallback (dispatch by shape if tiling wins
-  only on large od).
+- Current streaming kernel at the 7B FFN shapes: **116 GB/s true streaming**
+  (the 7e② "163 GB/s" figure was L2-resident). Cross-check: 7B decode 26.4
+  tok/s × 4.4 GB/token = 114 GB/s — decode is ALREADY at the achieved
+  streaming bandwidth.
+- Variant A (dp4a over q8_0-quantized activations, aligned 40 B block
+  layout): ≤ +3% at ffn_gu, −12% at ffn_down (quantize pass not amortized at
+  nt=1) — failed the ≥10% gate.
+- Variant B (wide blocks: 128 threads, 8 rows/warp, 32 rows/block for more
+  loads in flight): −6% — occupancy is not the limiter; the DRAM access
+  pattern is.
 
-Gate: bit-parity unchanged (same block math), standalone A/B, 7B E2E.
+Conclusion: do NOT wire. The remaining gap to the 273 GB/s marketing number
+is the LPDDR5X streaming ceiling (llama.cpp-class access patterns or
+cp.async.bulk/TMA would be needed to verify); kernel-side tiling does not
+move it. Decode-side bandwidth work is closed unless a fundamentally
+different weight layout (e.g. interleaved tiles) is measured to stream
+faster.
 
 ## 8f. Q5_K kernels (lift the all-or-nothing gate)
 
