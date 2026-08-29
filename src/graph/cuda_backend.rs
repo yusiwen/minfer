@@ -50,6 +50,10 @@ pub struct CudaBackend {
     /// `MINFER_NO_CUDA_GRAPH=1` (at construction) or a capture failure
     /// (session-wide) force the plain direct-launch path.
     graphs_mode: GraphMode,
+    /// 8g②: deliberate prefill-capture opt-in (default off). Repeated
+    /// identical-nt prefills (server/slot scenario) may then capture after
+    /// the usual 3-run protocol; MINFER_CAPTURE_PREFILL=1 enables it.
+    prefill_capture: bool,
 }
 
 /// An instantiated CUDA Graph exec with its capture identity.
@@ -88,6 +92,7 @@ impl CudaBackend {
         } else {
             GraphMode::Enabled
         };
+        let prefill_capture = std::env::var("MINFER_CAPTURE_PREFILL").as_deref() == Ok("1");
         Some(Self {
             state,
             pool: Vec::new(),
@@ -100,6 +105,7 @@ impl CudaBackend {
             capturing: None,
             stream_guard: None,
             graphs_mode,
+            prefill_capture,
             kv_f16,
         })
     }
@@ -122,6 +128,12 @@ impl CudaBackend {
     /// set by the loader at construction).
     pub(crate) fn set_kv_f16_for_test(&mut self, f16: bool) {
         self.kv_f16 = f16;
+    }
+
+    /// 8g②: turn on deliberate prefill capture for tests (the pp16/pp300
+    /// bit-parity harness is the validation gate).
+    pub(crate) fn set_prefill_capture_for_test(&mut self, enabled: bool) {
+        self.prefill_capture = enabled;
     }
 
     pub(crate) fn set_graphs_enabled_for_test(&mut self, enabled: bool) {
@@ -193,8 +205,14 @@ impl CudaBackend {
         // 8g①: capture decode-shaped graphs only (nt_hint None = no matmul
         // in the graph, synthetic tests). A repeated identical-nt prefill
         // (server/slot scenario) must not silently start capturing a
-        // ~437-node graph that was never validated for capture.
-        if *runs >= 3 && self.capturing.is_none() && nt_hint.map_or(true, |nt| nt == 1) {
+        // ~437-node graph that was never validated for capture. 8g② turns
+        // prefill capture into a DELIBERATE opt-in (test setter or
+        // MINFER_CAPTURE_PREFILL=1) — gated by the pp16/pp300 bit-parity
+        // harness.
+        if *runs >= 3
+            && self.capturing.is_none()
+            && nt_hint.map_or(true, |nt| nt == 1 || self.prefill_capture)
+        {
             // Hold the process-wide stream lock across the capture window:
             // any other backend's stream work would otherwise be recorded
             // into this graph (capture is per-stream, not per-thread).
@@ -3100,6 +3118,74 @@ mod tests {
             2,
             "both CUDA splits must be captured"
         );
+    }
+
+    /// 8g②: deliberate prefill capture — with the opt-in ON, a repeated
+    /// identical-nt prefill-shaped graph captures after the 3-run protocol
+    /// and replays BIT-IDENTICAL to direct launches, at both pp16 and pp300
+    /// (the ~437-node real-prefill scale). Default remains OFF (8g① test).
+    #[test]
+    fn cuda_prefill_capture_bit_parity_pp16_pp300() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let build = |nt: usize| -> crate::graph::ComputeGraph {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [8, nt, 1, 1], DType::F32);
+            let y = b.input("y", [8, nt, 1, 1], DType::F32);
+            let s = b.silu(x);
+            let a = b.add(s, y);
+            let wb: Vec<u8> = (0..32)
+                .flat_map(|i| ((i as f32 - 16.0) / 32.0).to_le_bytes())
+                .collect();
+            let mut w = Tensor::from_data(crate::tensor::TensorType::F32, &[8, 4, 1, 1], wb);
+            w.name = "w".to_string();
+            let o = b.matmul(a, &w, None);
+            b.output(o);
+            b.build()
+        };
+
+        let sched = BackendScheduler;
+        for nt in [16usize, 300usize] {
+            let mut g_cap = build(nt);
+            let mut g_ref = build(nt);
+            let mut cap = replay_alloc(true);
+            let mut refr = replay_alloc(false);
+            cap.cuda_mut().unwrap().set_prefill_capture_for_test(true);
+            let wb: Vec<u8> = (0..32)
+                .flat_map(|i| ((i as f32 - 16.0) / 32.0).to_le_bytes())
+                .collect();
+            cap.cuda_mut().unwrap().state.register_weight("w", &wb);
+            refr.cuda_mut().unwrap().state.register_weight("w", &wb);
+            sched.assign_backends(&mut g_cap, &cap);
+            sched.assign_backends(&mut g_ref, &refr);
+            cap.alloc_graph(&g_cap).unwrap();
+            refr.alloc_graph(&g_ref).unwrap();
+
+            for step in 0..5u32 {
+                let seed = 1.0 + 2.0 * step as f32;
+                let xs: Vec<f32> = (0..8 * nt).map(|i| seed + (i % 9) as f32).collect();
+                let ys: Vec<f32> = (0..8 * nt).map(|i| seed * 0.5 - (i % 7) as f32).collect();
+                cap.fill_input(&g_cap, "x", &xs).unwrap();
+                cap.fill_input(&g_cap, "y", &ys).unwrap();
+                refr.fill_input(&g_ref, "x", &xs).unwrap();
+                refr.fill_input(&g_ref, "y", &ys).unwrap();
+                sched.execute(&g_cap, &mut cap).unwrap();
+                sched.execute(&g_ref, &mut refr).unwrap();
+                let got = cap.copy_to_cpu(g_cap.outputs[0]).unwrap();
+                let want = refr.copy_to_cpu(g_ref.outputs[0]).unwrap();
+                assert_eq!(
+                    got, want,
+                    "pp{nt} step {step}: prefill replay diverged from direct launches"
+                );
+            }
+            assert_eq!(
+                cap.cuda_mut().unwrap().captured_count(),
+                1,
+                "pp{nt}: the prefill split must be captured exactly once"
+            );
+        }
     }
 
     /// Phase 8 review: an execute_node error during an open capture window
