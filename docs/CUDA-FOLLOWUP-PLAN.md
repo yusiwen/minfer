@@ -77,21 +77,23 @@ f16 vs f32; 7B @2K-ctx decode +~11% (swap-order pairs: 10.3/10.2 vs
 9.4/9.0 tok/s — the win grows with context). Caveat: `MINFER_GRAPH_DUMP`
 reads KV regions as f32 — incompatible with f16 KV (debug dump path only).
 
-## 8c. Prefill Q8_0-activation GEMM (the 7e⑥ leftover)
+## 8c. Prefill Q8_0-activation GEMM — **DONE 2026-08-29 (`69a27c5`, shaped)**
 
-The original 7e⑥ bullet bundled two items; only the async-H2D staging half
-landed. The unwired half: quantize activations once per prefill
-(`launch_quantize_q8_0` exists) and run Q4_0×Q8_0-style GEMMs
-(`launch_q4_0_q8_0_matmul` exists) instead of the f32-activation kernels.
+Measure-first verdict (standalone nvcc A/B, quantize included): +38–44% at
+id ≤ 8192 (0.5B shapes, 7B attn/qkv/o; activation-heavy), +4.7% at 7B
+ffn_gu (weight-bound), **−63% at 7B ffn_down (id=18944)** — the q8_0 kernel
+streams weight bytes SLOWER than the f32 kernel when id/od is high, so a
+blind wire would have been a large regression. Wired only the winning
+region: `nt > 1 && id ≤ 8192` routes Q4_0 prefill through quantize_q8_0 +
+q4_0_q8_0_matmul (grow-on-demand scratch; capture-safe because prefill
+never captures since 8g①). E2E: 0.5B prefill @3.6K tokens 1005 → 1246 tok/s
+(+24%), greedy text unchanged. Parity: `cuda_q4_0_prefill_q8_0_gemm_parity`
+(nt>1 vs the kernel's exact math, nt=1 f32 path vs hand dequant);
+`cuda_matmul_parity`'s q4_0 arm mirrors activation quantization.
 
-- Measure FIRST at 7B prefill shapes (standalone nvcc A/B, the 7e②
-  methodology): the f32 kernels already reach decent bandwidth at large nt,
-  so the win is unproven — do not wire on faith.
-- Wire behind a gate only if the A/B shows a real win; otherwise record the
-  negative result in CUDA-BACKEND-PLAN and delete the externs.
-
-Gate: standalone A/B ≥ 10% on the [od, id, nt] shapes that dominate prefill
-before any in-tree wiring.
+Negative result recorded for the record: the unshaped wire the 7e⑥ bullet
+imagined would have REGRESSED 7B-class Q4_0 ffn_down by ~60%. The shape
+gate is load-bearing.
 
 ## 8d. Attention kernel (remaining decode overhead)
 
