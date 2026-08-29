@@ -4,9 +4,9 @@
 // hosts the CudaState singleton it wraps: device probes, the weight registry,
 // streams, per-op kernel entry points and the CUDA Graph capture API. The
 // legacy layer_gpu/`init_kv_cache` pre-alloc path is no longer driven by
-// main() (the graph allocator owns KV regions since Phase 7c) and stays for
-// direct CudaState consumers, hence the module-level allow below.
-#![allow(dead_code)]
+// main() (the graph allocator owns KV regions since Phase 7c); the legacy
+// surface carries targeted #![allow]s at its use sites instead of a
+// module-wide opt-out (7e⑦).
 
 use crate::block::Q8B;
 use crate::tensor::{Tensor, TensorType};
@@ -48,7 +48,6 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
     fn cudaStreamCreate(stream: *mut *mut std::ffi::c_void) -> i32;
-    fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaGetLastError() -> i32;
@@ -69,7 +68,6 @@ extern "C" {
         buf_size: usize,
     ) -> i32;
     fn cudaGraphLaunch(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
-    fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
     fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
 }
 
@@ -82,25 +80,12 @@ const CUDA_DEV_ATTR_COMPUTE_MAJOR: i32 = 75;
 const CUDA_DEV_ATTR_COMPUTE_MINOR: i32 = 76;
 const CUDA_DEV_ATTR_MULTIPROC_COUNT: i32 = 16;
 
+// Legacy layer_gpu debug tracing (7e⑦): the graph path syncs via
+// `CudaState::sync()`; MINFER_CUDA_DEBUG tracing stays for the legacy
+// surface only (debug_sync in the impl below).
 static CUDA_DEBUG: OnceLock<bool> = OnceLock::new();
 fn cuda_debug_enabled() -> bool {
     *CUDA_DEBUG.get_or_init(|| std::env::var("MINFER_CUDA_DEBUG").is_ok())
-}
-
-fn cuda_check(err: i32, msg: &str) {
-    if err != 0 {
-        eprintln!("CUDA error ({}): {}", msg, err);
-    }
-}
-
-fn cuda_kernel_check(msg: &str) {
-    if !cuda_debug_enabled() {
-        return;
-    }
-    let err = unsafe { cudaGetLastError() };
-    if err != 0 {
-        eprintln!("CUDA kernel error ({}): {}", msg, err);
-    }
 }
 
 // ─── FFI declarations for kernel launch wrappers ───────────
@@ -380,23 +365,36 @@ pub struct CudaState {
     /// tensors by their raw GGUF size.
     padded_weights: Mutex<HashMap<String, usize>>,
     // Persistent activation buffers (grown on demand) with size tracking
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_hidden: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bn: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bq: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bk: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bv: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_ba: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bf: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_bg: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_bn: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_ba: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_positions: Mutex<(CudaPtr, usize)>,
+    #[allow(dead_code)] // legacy surface (7e⑦)
     buf_logits: Mutex<(CudaPtr, usize)>,
     // Persistent per-layer GPU KV cache (k, v) and current size
     kv_k: Mutex<Vec<CudaPtr>>,
     kv_v: Mutex<Vec<CudaPtr>>,
     kv_size: Mutex<Vec<usize>>,
     // CUDA Graph for decode step (capture once, replay for each token)
+    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
     decode_graph_exec: Mutex<CudaPtr>,
     /// Process-wide stream serialization for the graph-path backend (Phase
     /// 7d): stream capture is per-stream, so while one backend holds an open
@@ -621,6 +619,7 @@ impl CudaState {
         });
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦): used by layer_gpu
     pub fn has_weight(&self, name: &str) -> bool {
         self.weights.lock().unwrap().contains_key(name)
     }
@@ -630,7 +629,7 @@ impl CudaState {
             return;
         }
         {
-            let mut w = self.weights.lock().unwrap();
+            let w = self.weights.lock().unwrap();
             if let Some((_, size)) = w.get(name) {
                 if *size == data.len() {
                     // Device weights are immutable: same name + size ⇒ the
@@ -751,6 +750,7 @@ impl CudaState {
 
     // ─── Persistent buffer management ─────────────────────────
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     fn get_or_grow(slot: &Mutex<(CudaPtr, usize)>, need: usize) -> *mut std::ffi::c_void {
         let mut guard = slot.lock().unwrap();
         let (ptr, size) = &mut *guard;
@@ -805,18 +805,6 @@ impl CudaState {
                 src.as_ptr() as *const std::ffi::c_void,
                 src.len(),
                 CUDA_MEMCPY_HOST_TO_DEVICE,
-            );
-        }
-    }
-
-    pub fn copy_to_device_async(&self, src: &[u8], dst: *mut std::ffi::c_void) {
-        unsafe {
-            cudaMemcpyAsync(
-                dst,
-                src.as_ptr() as *const std::ffi::c_void,
-                src.len(),
-                CUDA_MEMCPY_HOST_TO_DEVICE,
-                self.stream(),
             );
         }
     }
@@ -894,18 +882,6 @@ impl CudaState {
         }
     }
 
-    pub fn copy_from_device_async(&self, src: *const std::ffi::c_void, dst: &mut [u8]) {
-        unsafe {
-            cudaMemcpyAsync(
-                dst.as_mut_ptr() as *mut std::ffi::c_void,
-                src,
-                dst.len(),
-                CUDA_MEMCPY_DEVICE_TO_HOST,
-                self.stream(),
-            );
-        }
-    }
-
     pub fn copy_device_to_device(
         &self,
         src: *const std::ffi::c_void,
@@ -947,6 +923,7 @@ impl CudaState {
     /// Debug sync: print label, then sync and report error.
     /// `il` = layer index, or negative for non-layer steps (e.g. output norm).
     /// Only active when MINFER_CUDA_DEBUG is set.
+    #[allow(dead_code)]
     pub fn debug_sync(&self, il: i32, label: &str) {
         if !cuda_debug_enabled() {
             return;
@@ -978,6 +955,7 @@ impl CudaState {
 
     // ─── Upload/download for forward pass ─────────────────────
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn upload_hidden(&self, hidden: &[f32]) {
         let need = hidden.len() * 4;
         let ptr = Self::get_or_grow(&self.buf_hidden, need);
@@ -987,6 +965,7 @@ impl CudaState {
         );
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn download_hidden(&self, hidden: &mut [f32]) {
         let need = hidden.len() * 4;
         let guard = self.buf_hidden.lock().unwrap();
@@ -999,6 +978,7 @@ impl CudaState {
         });
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn upload_positions(&self, positions: &[usize]) {
         let ints: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
         let need = ints.len() * 4;
@@ -1009,6 +989,7 @@ impl CudaState {
         );
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn get_positions_buf(&self) -> *mut std::ffi::c_void {
         self.buf_positions.lock().unwrap().0 .0
     }
@@ -1018,6 +999,7 @@ impl CudaState {
     /// Pre-allocate GPU KV cache for all layers to n_ctx entries.
     /// Must be called after model loading (when n_layer, n_ctx, nkt are known)
     /// but before the first forward pass. Eliminates O(n²) incremental growth.
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn init_kv_cache(&self, n_layer: usize, n_ctx: usize, nkt: usize) {
         let need = n_ctx * nkt * 4;
         let mut kvec = self.kv_k.lock().unwrap();
@@ -1044,6 +1026,7 @@ impl CudaState {
 
     /// Verify KV cache has enough room for `max_nkv` entries at layer `il`.
     /// Returns false if capacity is exceeded (should never happen with pre-allocation).
+    #[allow(dead_code)] // legacy surface (7e⑦)
     fn kv_ensure_layer(&self, il: usize, max_nkv: usize) -> bool {
         let szvec = self.kv_size.lock().unwrap();
         let size = szvec.get(il).copied().unwrap_or(0);
@@ -1057,12 +1040,14 @@ impl CudaState {
         true
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn get_kv_size(&self, il: usize) -> usize {
         let szvec = self.kv_size.lock().unwrap();
         szvec.get(il).copied().unwrap_or(0)
     }
 
     /// Download logits from GPU after layer loop.
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn download_logits(&self, logits: &mut [f32]) {
         let need = logits.len() * 4;
         let guard = self.buf_logits.lock().unwrap();
@@ -1077,6 +1062,7 @@ impl CudaState {
 
     // ─── CUDA Graph (decode step batch) ───────────────────────
 
+    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
     pub fn graph_available(&self) -> bool {
         !self.decode_graph_exec.lock().unwrap().0.is_null()
     }
@@ -1094,6 +1080,7 @@ impl CudaState {
         }
     }
 
+    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
     pub fn graph_end_capture(&self) {
         let stream = self.stream();
 
@@ -1195,6 +1182,7 @@ impl CudaState {
         true
     }
 
+    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
     pub fn graph_launch(&self) -> bool {
         let exec = self.decode_graph_exec.lock().unwrap().0;
         if exec.is_null() {
@@ -1210,6 +1198,7 @@ impl CudaState {
 
     // ─── Kernel launch operations (called from CudaCommandBuffer) ──
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn quant_matmul_q8(
         &self,
         w: &Tensor,
@@ -1640,6 +1629,7 @@ impl CudaState {
 
     // ─── Batch quant_matmul (for Q/K/V projection) ────────────
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn quant_matmul_f32_batch(
         &self,
         mats: &mut [(
@@ -1680,6 +1670,7 @@ impl CudaState {
         }
     }
 
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn quant_matmul_f32(
         &self,
         w: &Tensor,
@@ -1729,6 +1720,7 @@ impl CudaState {
 
     /// Encode one transformer layer onto the CUDA stream.
     /// Returns false if any weight is missing from GPU.
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn layer_gpu(
         &self,
         il: usize,
@@ -1914,6 +1906,7 @@ impl CudaState {
     }
 
     /// Final RMSNorm + output matmul on GPU.
+    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn output_norm_gpu(
         &self,
         output: &Tensor,

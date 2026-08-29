@@ -194,3 +194,16 @@ The llama-port decode attention kernel (NSG=1, one 32-lane simdgroup per
    `/Library/Logs/DiagnosticReports/` for new spin/ips artifacts.
 4. Only after 2+ recurrences in 1–2 weeks: run Apple Diagnostics (hold D at
    boot) and file a GPU hang report via Feedback Assistant.
+
+
+## CUDA (Phase 7, aarch64 GB10)
+
+Hard rules (mirror the Metal section; enforced in `graph/cuda_backend.rs` + `cuda.rs`):
+
+1. **Kernel-invariant violations return `Err` from `execute_node`** — never a silent CPU fallback. Backend assignment at build time (`supports_op` + registered-weight gates) decides placement; a mid-execution guard failure aborts the run with the blocking node's name.
+2. **No sync inside an active capture window.** The 7d CUDA Graph capture wraps decode splits; any `cudaStreamSynchronize` (e.g. a debug print that reads device data) inside the window corrupts the capture — the 7e② "faster but wrong" incident was exactly this (a temp wrapper's internal sync produced garbage only with graphs ON). Debug reads must go through `close_capture_or_sync` paths.
+3. **Device memory is not host-readable via plain memcpy on GB10** — host probes that `copy_from_slice` a device pointer SIGSEGV (`__memcpy_sve`). All D2H goes through `cudaMemcpy` staging (`copy_to_host`).
+4. **Launch errors are checked at sync points, not per launch**: `CudaState::sync()` polls `cudaGetLastError` + `cudaStreamSynchronize` and reports both. Kernels launch on the shared stream; the stream guard mutex serializes cross-backend stream use.
+5. **Same-stream ordering is the correctness contract for async fills**: the 7e⑥ pinned-staging `write_input_async` queues `cudaMemcpyAsync` on the stream and returns before the copy lands — safe because every consumer kernel runs later on the same stream. The staging ring syncs once when it wraps (>8 fills without a sync); never hand a slot back before that.
+6. **Weight registry ownership**: `register_weight` is name-keyed (same name+size reuses the device copy; different size replaces and deliberately leaks the stale buffer — bounded, a live captured graph may still reference it). Padded Q6_K repacks register through `register_weight_q6k_padded` and dispatch on `is_weight_padded`.
+7. **Device limits are queried at runtime** (SM count, compute capability, `cudaMemGetInfo`); no hardcoded SM/arch assumptions beyond the compiled targets list.

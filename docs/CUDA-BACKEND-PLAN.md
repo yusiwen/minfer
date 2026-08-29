@@ -413,7 +413,21 @@ flag).
   Qwen3-0.6B ~188 tok/s — H2D per step is KB-scale so the win is the
   removed CPU stall, µs; 7B n=128 21.7–23.6 tok/s, no regression).
   Suites 144/0 (cuda parallel + single), plain 130/0.
-- Docs: `GRAPH-REFACTOR-PLAN.md` §17 Phase 7 row → ✅ (replace the stale "本机无 nvcc" blocker note); `GPU_SAFETY.md` CUDA section; prune `#![allow(dead_code)]` in `cuda.rs` to the still-legacy surface.
+- ✅ **Docs + cleanup (7e⑦, 2026-08-29)**: `GRAPH-REFACTOR-PLAN.md` §17
+  Phase 7 row → ✅ (stale "本机无 nvcc" blocker replaced with the
+  dfa3516→082095c record); `GPU_SAFETY.md` gains a CUDA section (capture
+  windows vs syncs, GB10 non-host-readable device memory, async-fill
+  same-stream contract, weight-registry ownership, launch-error policy).
+  `#![allow(dead_code)]` in `cuda.rs` removed: deleted the callerless
+  debug scaffolding (`cuda_check`/`cuda_kernel_check`) and the unused
+  `cudaStreamDestroy`/`cudaGraphExecDestroy` externs plus the
+  `copy_to_device_async`/`copy_from_device_async` wrappers superseded by
+  7e⑥ staging; the remaining legacy surface (the pre-7c persistent-slot
+  pool `buf_*` + `get_or_grow`/`upload_*`/`init_kv_cache`/`layer_gpu`/
+  `quant_matmul_*`, the old single-slot capture API, and the unwired
+  prefill Q8_0-activation externs) carries per-item scoped
+  `#[allow(dead_code)]` with reasons. Release build: zero rustc warnings.
+  Suites 144/0 (cuda parallel + single), plain 130/0; fmt clean.
 
 ---
 
