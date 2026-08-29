@@ -115,6 +115,17 @@ pub struct ComputeGraph {
 }
 
 impl ComputeGraph {
+    /// 8g①: token-count hint for the CUDA capture gate — the first MatMul
+    /// node's output row count (activations are [d, nt]). `None` when the
+    /// graph has no matmul (synthetic test graphs), which leaves the capture
+    /// decision untouched.
+    pub fn capture_nt_hint(&self) -> Option<usize> {
+        self.nodes.iter().find_map(|n| match &n.meta {
+            crate::graph::ops::NodeMeta::MatMul(_) => Some(n.out_shape[1]),
+            _ => None,
+        })
+    }
+
     pub fn node(&self, id: NodeId) -> &CNode {
         &self.nodes[id]
     }

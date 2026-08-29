@@ -136,7 +136,12 @@ impl CudaBackend {
     /// A pool_gen change invalidates the stored exec (pointers may differ).
     /// `MINFER_NO_CUDA_GRAPH=1` or any failure disables graphs for the
     /// backend's lifetime and everything falls back to direct launches.
-    fn graph_replay_step(&mut self, uid: u64, range: (usize, usize)) -> bool {
+    fn graph_replay_step(
+        &mut self,
+        uid: u64,
+        range: (usize, usize),
+        nt_hint: Option<usize>,
+    ) -> bool {
         if self.graphs_mode != GraphMode::Enabled {
             return false;
         }
@@ -171,7 +176,11 @@ impl CudaBackend {
         }
         let runs = self.graph_runs.entry(key).or_insert(0);
         *runs += 1;
-        if *runs >= 3 && self.capturing.is_none() {
+        // 8g①: capture decode-shaped graphs only (nt_hint None = no matmul
+        // in the graph, synthetic tests). A repeated identical-nt prefill
+        // (server/slot scenario) must not silently start capturing a
+        // ~437-node graph that was never validated for capture.
+        if *runs >= 3 && self.capturing.is_none() && nt_hint.map_or(true, |nt| nt == 1) {
             // Hold the process-wide stream lock across the capture window:
             // any other backend's stream work would otherwise be recorded
             // into this graph (capture is per-stream, not per-thread).
@@ -925,8 +934,8 @@ impl Backend for CudaBackend {
         self.close_capture_or_sync();
     }
 
-    fn graph_replay(&mut self, uid: u64, range: (usize, usize)) -> bool {
-        self.graph_replay_step(uid, range)
+    fn graph_replay(&mut self, uid: u64, range: (usize, usize), nt_hint: Option<usize>) -> bool {
+        self.graph_replay_step(uid, range, nt_hint)
     }
 }
 
@@ -2273,6 +2282,61 @@ mod tests {
         assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
     }
 
+    /// 8g①: a prefill-shaped graph (any matmul with nt > 1) must NEVER open
+    /// a capture window, even after 3+ executions of the same (uid, range) —
+    /// a repeated identical-nt prefill (server scenario) would otherwise be
+    /// captured without validation.
+    #[test]
+    fn cuda_prefill_shaped_graph_never_captures() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let mut g = {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [8, 8, 1, 1], DType::F32);
+            let y = b.input("y", [8, 8, 1, 1], DType::F32);
+            let s = b.silu(x);
+            let a = b.add(s, y);
+            let wb: Vec<u8> = (0..32)
+                .flat_map(|i| ((i as f32 - 16.0) / 32.0).to_le_bytes())
+                .collect();
+            let mut w = Tensor::from_data(crate::tensor::TensorType::F32, &[8, 4, 1, 1], wb);
+            w.name = "w".to_string();
+            let o = b.matmul(a, &w, None);
+            b.output(o);
+            b.build()
+        };
+        assert_eq!(g.capture_nt_hint(), Some(8), "prefill-shaped hint");
+
+        let sched = BackendScheduler;
+        let mut cap = replay_alloc(true);
+        sched.assign_backends(&mut g, &mut cap);
+        cap.cuda_mut().unwrap().state.register_weight(
+            "w",
+            &(0..32)
+                .flat_map(|i| ((i as f32 - 16.0) / 32.0).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        cap.alloc_graph(&g).unwrap();
+
+        for step in 0..4u32 {
+            let seed = 3.0 + 7.0 * step as f32;
+            let xs: Vec<f32> = (0..64).map(|i| seed + i as f32).collect();
+            let ys: Vec<f32> = (0..64).map(|i| seed * 0.25 - i as f32).collect();
+            cap.fill_input(&g, "x", &xs).unwrap();
+            cap.fill_input(&g, "y", &ys).unwrap();
+            sched.execute(&g, &mut cap).unwrap();
+        }
+        let cb = cap.cuda_mut().unwrap();
+        assert_eq!(
+            cb.captured_count(),
+            0,
+            "prefill-shaped graph must never be captured"
+        );
+        assert!(cb.capturing.is_none());
+    }
+
     /// Phase 8 review: an execute_node error during an open capture window
     /// must ABORT the window (the scheduler propagates before the boundary
     /// sync, so nothing else would close it). Driven directly here because
@@ -2296,7 +2360,7 @@ mod tests {
         // open the window via the 3-run protocol WITHOUT executing nodes
         let cb = cap.cuda_mut().unwrap();
         for _ in 0..3 {
-            cb.graph_replay_step(7, (0, 1));
+            cb.graph_replay_step(7, (0, 1), None);
         }
         assert!(cb.capturing.is_some(), "3rd run must open a capture window");
         assert!(cb.stream_guard.is_some(), "window holds the stream lock");
@@ -2312,7 +2376,7 @@ mod tests {
         );
         assert_eq!(cb.captured_count(), 0, "aborted window must not be cached");
         assert!(
-            !cb.graph_replay_step(7, (0, 1)),
+            !cb.graph_replay_step(7, (0, 1), None),
             "no replay after graphs are disabled"
         );
 

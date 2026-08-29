@@ -191,7 +191,7 @@ impl BackendScheduler {
                 match split.backend {
                     BackendTag::Cuda => {
                         let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
-                        c.graph_replay(graph.uid, split.node_range)
+                        c.graph_replay(graph.uid, split.node_range, graph.capture_nt_hint())
                     }
                     _ => false,
                 }

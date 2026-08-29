@@ -80,7 +80,10 @@ pub trait Backend: Send + Sync {
     /// re-capture when pool generation changed.
     ///
     /// Default: no capture support (CPU/Metal are no-ops).
-    fn graph_replay(&mut self, _uid: u64, _range: (usize, usize)) -> bool {
+    /// `nt_hint`: the graph's token count when it has matmul nodes
+    /// (`capture_nt_hint()`), `None` otherwise. Backends that support graph
+    /// capture (CUDA) use it to gate capture to decode-shaped graphs (8g①).
+    fn graph_replay(&mut self, _uid: u64, _range: (usize, usize), _nt_hint: Option<usize>) -> bool {
         false
     }
 }
