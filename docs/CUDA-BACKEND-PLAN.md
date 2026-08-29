@@ -399,7 +399,20 @@ flag).
   (nf = 18944 > 16384 gate, unfused). Suites 144/0 (cuda parallel +
   single), plain 130/0.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
-- Async H2D input fill + pinned staging; prefill Q8_0-activation path (`launch_quantize_q8_0` + `launch_q4_0_q8_0_matmul` exist).
+- ✅ **Async H2D input fill + pinned staging (7e⑥, 2026-08-29)**:
+  `CudaState::write_input_async` — a lazy ring of 8 × 2 MiB
+  `cudaHostAlloc` slots (`cudaFreeHost` on drop); `write_host` now copies
+  the Rust slice into a pinned slot and queues `cudaMemcpyAsync` on the
+  stream (returns before the copy lands; same-stream ordering guarantees
+  the fill completes before the kernels that read it). Pageable
+  `cudaMemcpy` had blocked the CPU until completion and forced the driver
+  through its own bounce buffer. Ring wrap (>8 fills without a sync)
+  triggers one stream sync before slot reuse — never hit in practice
+  (per-step input fills are KB-scale). Sync fallback for >2 MiB fills or
+  if pinned allocation fails. E2E unchanged-or-better (0.5B ~248,
+  Qwen3-0.6B ~188 tok/s — H2D per step is KB-scale so the win is the
+  removed CPU stall, µs; 7B n=128 21.7–23.6 tok/s, no regression).
+  Suites 144/0 (cuda parallel + single), plain 130/0.
 - Docs: `GRAPH-REFACTOR-PLAN.md` §17 Phase 7 row → ✅ (replace the stale "本机无 nvcc" blocker note); `GPU_SAFETY.md` CUDA section; prune `#![allow(dead_code)]` in `cuda.rs` to the still-legacy surface.
 
 ---

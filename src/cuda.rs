@@ -38,6 +38,8 @@ extern "C" {
         count: usize,
         kind: i32,
     ) -> i32;
+    fn cudaHostAlloc(ptr: *mut *mut std::ffi::c_void, size: usize, flags: i32) -> i32;
+    fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpyAsync(
         dst: *mut std::ffi::c_void,
         src: *const std::ffi::c_void,
@@ -342,8 +344,35 @@ impl Drop for ModelLoadGuard {
     }
 }
 
+/// Pinned-host staging slots for async H2D input fills (7e⑥). Pageable
+/// `cudaMemcpy` forces the driver to bounce through an internal pinned
+/// buffer AND blocks until the copy lands; copying into our own pinned
+/// slot + `cudaMemcpyAsync` returns immediately and lets the copy overlap
+/// the subsequent kernel launches on the stream. Slots form a ring: when
+/// the ring wraps, one stream sync retires every in-flight copy before a
+/// slot is reused (in practice input fills are KB-scale and the ring
+/// never wraps within a step).
+struct PinnedPool {
+    ptrs: Vec<*mut u8>,
+    slot_bytes: usize,
+    next: usize,
+}
+impl Drop for PinnedPool {
+    fn drop(&mut self) {
+        for p in self.ptrs.drain(..) {
+            unsafe { cudaFreeHost(p as *mut std::ffi::c_void) };
+        }
+    }
+}
+
+unsafe impl Send for PinnedPool {}
+unsafe impl Sync for PinnedPool {}
+
 pub struct CudaState {
     stream: Mutex<CudaPtr>,
+    /// Lazy pinned staging ring (7e⑥); None until the first async fill,
+    /// and stays None if cudaHostAlloc fails (sync fallback).
+    staging: Mutex<Option<PinnedPool>>,
     weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
     /// Names registered through `register_weight_q6k_padded` (device layout
     /// is 224-byte-padded Q6_K, not the raw GGUF byte stream) → the
@@ -553,6 +582,7 @@ impl CudaState {
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
+            staging: Mutex::new(None),
             weights: Mutex::new(HashMap::new()),
             padded_weights: Mutex::new(HashMap::new()),
             buf_hidden: Mutex::new(dummy),
@@ -785,6 +815,68 @@ impl CudaState {
                 dst,
                 src.as_ptr() as *const std::ffi::c_void,
                 src.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.stream(),
+            );
+        }
+    }
+
+    /// 7e⑥: async H2D input fill through a pinned staging slot. The data
+    /// is copied into pinned host memory (cheap, CPU-side), then
+    /// `cudaMemcpyAsync` queues the transfer on the stream — the call
+    /// returns before the copy lands; same-stream ordering guarantees the
+    /// fill completes before the kernels that read the buffer. Falls back
+    /// to a synchronous pageable copy for oversized inputs or if pinned
+    /// allocation failed.
+    pub fn write_input_async(&self, data: &[u8], dst: *mut std::ffi::c_void) {
+        const STAGING_SLOTS: usize = 8;
+        const STAGING_SLOT_BYTES: usize = 2 * 1024 * 1024;
+        let mut guard = self.staging.lock().unwrap();
+        if guard.is_none() {
+            let mut ptrs = Vec::new();
+            for _ in 0..STAGING_SLOTS {
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                if unsafe { cudaHostAlloc(&mut p, STAGING_SLOT_BYTES, 0) } != 0 {
+                    break;
+                }
+                ptrs.push(p as *mut u8);
+            }
+            if !ptrs.is_empty() {
+                *guard = Some(PinnedPool {
+                    ptrs,
+                    slot_bytes: STAGING_SLOT_BYTES,
+                    next: 0,
+                });
+            }
+        }
+        let pool = match guard.as_mut() {
+            Some(p) if data.len() <= p.slot_bytes => p,
+            _ => {
+                drop(guard);
+                self.copy_to_device(data, dst);
+                return;
+            }
+        };
+        // ring wrap: retire all in-flight copies before reusing slot 0
+        if pool.next == pool.ptrs.len() {
+            drop(guard);
+            self.sync();
+            guard = self.staging.lock().unwrap();
+            let pool = guard.as_mut().unwrap();
+            pool.next = 0;
+        }
+        let slot = {
+            let pool = guard.as_mut().unwrap();
+            let p = pool.ptrs[pool.next];
+            pool.next += 1;
+            p
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), slot, data.len());
+            cudaMemcpyAsync(
+                dst,
+                slot as *const std::ffi::c_void,
+                data.len(),
                 CUDA_MEMCPY_HOST_TO_DEVICE,
                 self.stream(),
             );

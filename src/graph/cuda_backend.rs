@@ -853,8 +853,11 @@ impl Backend for CudaBackend {
                 self.pool[id].bytes
             ));
         }
+        // 7e⑥: pinned-staged async fill (same-stream ordering makes this
+        // race-free with the kernels that read the input; the ring syncs
+        // only if more than STAGING_SLOTS fills queue up without a sync).
         let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
-        self.state.copy_to_device(src, dst);
+        self.state.write_input_async(src, dst);
         Ok(())
     }
 
