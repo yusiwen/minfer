@@ -181,8 +181,11 @@ Two findings from the Phase 8 completeness audit (2026-08-29):
    2026-08-29 (`60e9cc1`)**: marked SUPERSEDED with pointers to the current
    plans (absorbed ideas named: cuBLAS → 8k, MMQ tiling → 8e, GPU quantize → 8c).
 2. **Optional CUDA CI runner** — device-gated tests skip gracefully today;
-   a self-hosted GB10 runner would keep the 144-test suite honest on every
-   commit.
+   a self-hosted GB10 runner would keep the test suite honest on every
+   commit. **DEFERRED (2026-08-29):** requires standing self-hosted runner
+   infrastructure (a wired-up machine + runner registration) — not
+   achievable from a dev session; the 158-test device suite runs green
+   locally (cuda 158/0).
 3. **Temp files**: the Phase-7 ledger (`/tmp/minfer_phase7/TEMPS.md`) is
    closed; cleanup still awaits the user's decision (no auto-delete).
 
