@@ -399,7 +399,7 @@ flag).
   (nf = 18944 > 16384 gate, unfused). Suites 144/0 (cuda parallel +
   single), plain 130/0.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
-- ⬜ **OPEN (was the second half of the 7e⑥ bullet): prefill Q8_0-activation GEMM path** — quantize activations once per prefill (`launch_quantize_q8_0` exists) and run Q4_0×Q8_0-style GEMMs (`launch_q4_0_q8_0_matmul` exists, unwired) instead of the f32-activation kernels. The externs are kept behind scoped `allow(dead_code)`; measure against the f32 path before wiring (prefill is matmul-dominated; the f32 kernels already reach decent bandwidth at large nt, so the win is unproven).
+- ✅ **8c (2026-08-29, `69a27c5`): prefill Q4_0 GEMM via Q8_0 activations, SHAPED** — standalone A/B: +38–44% at id ≤ 8192, +4.7% at 7B ffn_gu, **−63% at 7B ffn_down (id=18944)** → wired only `nt>1 && id≤8192`; 0.5B prefill +24% E2E. Full record in CUDA-FOLLOWUP-PLAN §8c.
 - ✅ **Async H2D input fill + pinned staging (7e⑥, 2026-08-29)** — first half
   of the original bullet (the Q8_0 prefill GEMM half above stays open):
   `CudaState::write_input_async` — a lazy ring of 8 × 2 MiB
