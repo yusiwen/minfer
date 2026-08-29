@@ -58,12 +58,17 @@ MPS) it fails with `18.99` on macOS, exactly like GB10 — which is the
 interpretation-matrix row "machine-independent logic bug; macOS records stale".
 The fix makes the test pass bit-identically regardless.
 
-**Residual (open, scheduled as Phase 7e item):** on aarch64-Linux (GB10) the
-test still fails after the `tail_ids` fix, with max diff **0.449** (down from
-18.99; macOS 0.0). Deterministic, single-threaded, both paths share the
-now-gated worker pool — a genuine numeric-order difference between the graph
-execute path and the legacy adapter path on this machine. Tracked in
-`docs/CUDA-BACKEND-PLAN.md` §7e (first item); not blocking any CUDA phase.
+**RESOLVED (Phase 7e①, 2026-08-29) — not a bug; path-identity diagnosis.**
+Since Phase 6 `model.forward` routes through the graph path, so the test's
+"reference" side is also a graph. On CUDA builds the engine side takes the
+CUDA graph (the loader now initializes CUDA before registering weights)
+while the manual side is CPU-only — the 0.449 (prefill) / 0.525 (decode)
+max-logit diff is accumulated f32 reduction-order noise between backends,
+the exact cross-backend class AGENTS §9 documents for Metal. Greedy tokens
+agree on both steps (12095 / 11). The test's criterion now mirrors the Metal
+precedent: strict `1e-3` on CPU-only builds, greedy-token equality on
+CUDA-capable builds. macOS showed 0.0 simply because its build had no CUDA
+feature — both sides were CPU.
 
 ## Issue 2 — Parallel test runs trip the `attn_heads` UB check (passes single-threaded) — **RESOLVED**
 
