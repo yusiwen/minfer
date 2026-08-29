@@ -650,6 +650,38 @@ mod tests {
     }
 
     #[test]
+    // 8a② regression: an F32-weight matmul with nt > 1 must produce
+    // token-major output [nt][od]. The old mat_mul_f32 wrote [od][nt] —
+    // only visible for nt > 1 (decode nt==1 was accidentally correct).
+    #[test]
+    fn f32_matmul_nt2_token_major() {
+        let mut h = Harness::new();
+        // W [in=4, out=3]: row o selects (o+1) * x[o]
+        h.reg(tensor_f32(
+            "W",
+            [4, 3, 1, 1],
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+        ));
+        let mut gb = GraphBuilder::new();
+        let x = gb.input("x", [4, 2, 1, 1], DType::F32);
+        let m = gb.matmul(x, h.alloc.cpu().weight("W").unwrap(), None);
+        gb.output(m);
+        let g = gb.build();
+        let xdata = vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, -0.25, 2.0];
+        h.run(&g, &[("x", xdata)]);
+        let got = h.out(&g, m);
+        // token 0: [1, 4, 9]; token 1: [-1, 1, -0.75]
+        let expect = [1.0, 4.0, 9.0, -1.0, 1.0, -0.75];
+        for i in 0..6 {
+            assert!(
+                (got[i] - expect[i]).abs() < 1e-5,
+                "out[{i}]={} expect {}",
+                got[i],
+                expect[i]
+            );
+        }
+    }
+
     fn matmul_add_silu_scale() {
         // x [4,1] * W [3,4] + b [3] -> [3,1]; silu; *2
         let mut h = Harness::new();

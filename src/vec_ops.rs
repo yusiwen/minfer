@@ -667,28 +667,30 @@ unsafe fn rms_norm_fused_f32_avx2(n: usize, y: &mut [f32], x: &[f32], w: &[f32],
 // === rope_f32 — strict 1:1 translation of ops.cpp lines 5707-5811 ===
 // Applies rotary position embeddings in NEOX style (Qwen2, GPT-NeoX)
 // === mat_mul_f32 ===
-// Simple f32 matrix multiply: C[m][n] = A[m][k] * B[k][n]
-// Uses vec_dot_f32 for each row-column pair
+// Simple f32 matrix multiply: C[n][m] = B[n][k] * A[m][k]^T
+// (token-major output, matching minfer's [nt][d] activation convention)
+// Uses vec_dot_f32 for each token-output pair
 pub fn mat_mul_f32(
     m: usize,
     n: usize,
     k: usize,
     c: &mut [f32],
-    a: &[f32], // [m, k]
-    b: &[f32], // [k, n]  — NOTE: B is stored column-major for efficient dot
+    a: &[f32], // [m, k] — weight rows ([out][in])
+    b: &[f32], // [n, k] token-major activations ([nt][d])
 ) {
     debug_assert!(c.len() >= m * n);
     debug_assert!(a.len() >= m * k);
     debug_assert!(b.len() >= k * n);
 
-    // B is stored column-major: b[row + col * k] = B[row][col]
-    // For each output element C[row][col]:
-    //   C[row][col] = dot(A[row][:], B[:][col])
-    for row in 0..m {
-        let a_row = &a[row * k..(row + 1) * k];
-        for col in 0..n {
-            let b_col = &b[col * k..(col + 1) * k];
-            c[row * n + col] = vec_dot_f32(k, a_row, b_col);
+    // 8a②: this used to write C[row*n + col] = [m, n] — the output was
+    // transposed for every nt > 1. Decode (nt == 1) was accidentally correct,
+    // which is why no decode-only test ever caught it.
+    for col in 0..n {
+        let b_row = &b[col * k..(col + 1) * k];
+        let c_row = &mut c[col * m..(col + 1) * m];
+        for row in 0..m {
+            let a_row = &a[row * k..(row + 1) * k];
+            c_row[row] = vec_dot_f32(k, a_row, b_row);
         }
     }
 }
