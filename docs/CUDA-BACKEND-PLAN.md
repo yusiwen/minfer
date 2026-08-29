@@ -363,7 +363,7 @@ flag).
   Parity: `cuda_embed_getrows_parity` covers all 6 embed types incl. the
   padded Q6_K layout against `kernel::embed_tokens`, plus a model-shape
   q4_0 case (n_embd=896, ids up to 9625) and the generic gather.
-- Remaining prefill perf work: FusedFFN (7e⑤) and F32×F32 matmul (7e④).
+- ✅ Remaining prefill perf work resolved: FusedFFN (7e⑤) and F32×F32 matmul (7e④) both landed; the larger prefill lever that remains open is the **Q8_0-activation GEMM path** (see the open item below).
 - ✅ **F32×F32 matmul kernel (7e④, 2026-08-29)**: `f32_f32_matmul_vec`
   (same unit lane mapping as the q4_K kernel — lanes own (row, 256-elem
   chunk) pairs, float4 loads; requires `id % 8 == 0`) plus
@@ -399,7 +399,9 @@ flag).
   (nf = 18944 > 16384 gate, unfused). Suites 144/0 (cuda parallel +
   single), plain 130/0.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
-- ✅ **Async H2D input fill + pinned staging (7e⑥, 2026-08-29)**:
+- ⬜ **OPEN (was the second half of the 7e⑥ bullet): prefill Q8_0-activation GEMM path** — quantize activations once per prefill (`launch_quantize_q8_0` exists) and run Q4_0×Q8_0-style GEMMs (`launch_q4_0_q8_0_matmul` exists, unwired) instead of the f32-activation kernels. The externs are kept behind scoped `allow(dead_code)`; measure against the f32 path before wiring (prefill is matmul-dominated; the f32 kernels already reach decent bandwidth at large nt, so the win is unproven).
+- ✅ **Async H2D input fill + pinned staging (7e⑥, 2026-08-29)** — first half
+  of the original bullet (the Q8_0 prefill GEMM half above stays open):
   `CudaState::write_input_async` — a lazy ring of 8 × 2 MiB
   `cudaHostAlloc` slots (`cudaFreeHost` on drop); `write_host` now copies
   the Rust slice into a pinned slot and queues `cudaMemcpyAsync` on the
@@ -462,5 +464,6 @@ flag).
 ## 8. Out of Scope / Future
 
 Multi-GPU + peer copies (llama.cpp §6), FP16 activations + cuBLAS, FlashAttention
-kernel, VMM pool, pinned-host buffers, CUDA graphs for prefill, Q5/IQ kernel
-family, `graph_optimize`-style node reordering, CUDA CI runners, Windows.
+kernel, VMM pool, CUDA graphs for prefill, Q5/IQ kernel family,
+`graph_optimize`-style node reordering, CUDA CI runners, Windows.
+(pinned-host buffers left this list in 7e⑥ — implemented as the staging ring.)

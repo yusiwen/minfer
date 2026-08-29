@@ -424,19 +424,27 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         // concat rows go through register_weight (block-quant types) or the
         // padded repack (Q6_K: 210→224-byte slots for aligned uint4 loads),
         // matching what matmul_f32_ptr_layout dispatches on.
+        // Gated like the build-side fusion decision (nf ≤ 16384; the 7B's
+        // nf = 18944 concat would otherwise waste ~2 GiB of VRAM on weights
+        // no graph node ever reads — 7e⑤ review finding).
         #[cfg(feature = "cuda")]
         if let Some(cuda) = crate::cuda::CudaState::get() {
             if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
-                if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
-                    if fg.ttype == crate::tensor::TensorType::Q6_K {
-                        cuda.register_weight_q6k_padded(
-                            &format!("blk.{i}.ffn_gu"),
-                            &data,
-                            (fg.shape[1] + fu.shape[1]) as usize,
-                            fg.shape[0] as usize,
-                        );
-                    } else {
-                        cuda.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                let nf = fg.shape[1] as usize;
+                let fuse_ffn =
+                    nf <= 16384 && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                if fuse_ffn {
+                    if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
+                        if fg.ttype == crate::tensor::TensorType::Q6_K {
+                            cuda.register_weight_q6k_padded(
+                                &format!("blk.{i}.ffn_gu"),
+                                &data,
+                                (fg.shape[1] + fu.shape[1]) as usize,
+                                fg.shape[0] as usize,
+                            );
+                        } else {
+                            cuda.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                        }
                     }
                 }
             }
