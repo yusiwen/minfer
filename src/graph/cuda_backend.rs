@@ -3048,6 +3048,60 @@ mod tests {
         assert!(cb.capturing.is_none());
     }
 
+    /// 8i-1: MULTI-SPLIT capture. A CUDA op → CPU op → CUDA op graph yields
+    /// two CUDA splits; each must capture and replay independently with
+    /// bit-identical results vs pure direct launches (per-split capture is
+    /// supported but 7d's parity only covered single-split graphs).
+    #[test]
+    fn cuda_multisplit_capture_bit_parity() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // Softmax has no CUDA kernel (stays on CPU) → forces a split between
+        // two CUDA segments.
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], DType::F32);
+        let y = b.input("y", [8, 1, 1, 1], DType::F32);
+        let s = b.silu(x);
+        let sm = b.softmax(s, 0);
+        let o = b.add(sm, y);
+        b.output(o);
+        let mut g_cap = b.build();
+
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], DType::F32);
+        let y = b.input("y", [8, 1, 1, 1], DType::F32);
+        let s = b.silu(x);
+        let sm = b.softmax(s, 0);
+        let o = b.add(sm, y);
+        b.output(o);
+        let mut g_ref = b.build();
+
+        let sched = BackendScheduler;
+        let mut cap = replay_alloc(true);
+        let mut refr = replay_alloc(false);
+        sched.assign_backends(&mut g_cap, &cap);
+        sched.assign_backends(&mut g_ref, &refr);
+        cap.alloc_graph(&g_cap).unwrap();
+        refr.alloc_graph(&g_ref).unwrap();
+
+        for step in 0..5u32 {
+            let seed = 5.0 + 3.0 * step as f32;
+            let got = replay_step(&sched, &g_cap, &mut cap, seed);
+            let want = replay_step(&sched, &g_ref, &mut refr, seed);
+            assert_eq!(
+                got, want,
+                "step {step}: multi-split replay diverged from direct launches"
+            );
+        }
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_count(),
+            2,
+            "both CUDA splits must be captured"
+        );
+    }
+
     /// Phase 8 review: an execute_node error during an open capture window
     /// must ABORT the window (the scheduler propagates before the boundary
     /// sync, so nothing else would close it). Driven directly here because

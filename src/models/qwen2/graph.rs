@@ -1913,4 +1913,142 @@ mod tail_tests {
             }
         }
     }
+
+    /// 8i-2/8i-3: multi-turn conversation on CUDA — the incremental path
+    /// (append-only KV + REUSED decode graph across turns) vs the full
+    /// rehydrate path (fresh graphs + full prefill from history) must
+    /// produce identical greedy continuations. Both paths exercise the
+    /// GraphCache prefill→decode alternation the server slot loop uses.
+    /// Device-level: on a CUDA build the engine routes through the CUDA
+    /// backend (model-load guard keeps the gate stable).
+    #[test]
+    fn cuda_conversation_multiturn_reuse() {
+        #[cfg(feature = "cuda")]
+        {
+            // get() only READS the singleton — init() first (main.rs's job in
+            // the binary; tests must do it themselves).
+            crate::cuda::CudaState::init();
+            if crate::cuda::CudaState::get().is_none() {
+                eprintln!("skipping: no CUDA device");
+                return;
+            }
+        }
+        let Some(path) = model_path() else {
+            eprintln!("skipping: q4_0 model not cached");
+            return;
+        };
+        #[cfg(feature = "cuda")]
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let ctx = &gguf.parts[0].ctx;
+        let tok = crate::tokenizer::Tokenizer::load(ctx);
+        let spec = crate::conversation::ConversationSpec {
+            template: None, // ChatML fallback (Qwen2's native style)
+            bos_text: String::new(),
+            eog: vec![model.special_tokens().eos],
+            eot: model
+                .special_tokens()
+                .im_end
+                .unwrap_or(model.special_tokens().eos),
+            seed: 42,
+            n_ctx: 1024,
+            system_prompt: None,
+        };
+        let greedy = crate::conversation::TurnParams {
+            n_predict: 16,
+            temp: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            stop_strings: Vec::new(),
+        };
+        use crate::conversation::Engine as _;
+
+        // Path A: incremental — turn 1 prefill+decode, turn 2 appends onto
+        // the same KV with a REUSED decode graph.
+        let spec_a = crate::conversation::ConversationSpec {
+            template: None,
+            bos_text: String::new(),
+            eog: vec![model.special_tokens().eos],
+            eot: model
+                .special_tokens()
+                .im_end
+                .unwrap_or(model.special_tokens().eos),
+            seed: 42,
+            n_ctx: 1024,
+            system_prompt: None,
+        };
+        let mut conv_a = crate::conversation::Conversation::new(spec_a);
+        let mut engine_a = crate::conversation::GraphEngine::new(model.as_ref(), 1024);
+        let mut out1 = Vec::new();
+        let mut emit1 = |b: &[u8]| out1.extend_from_slice(b);
+        let r1 = conv_a
+            .start(
+                Some("The capital of France is Paris. The Eiffel"),
+                &tok,
+                &greedy,
+                &mut engine_a,
+                &mut emit1,
+            )
+            .expect("turn 1")
+            .expect("turn 1 produced an outcome");
+        let turn1_text = String::from_utf8_lossy(&out1).to_string();
+        assert!(!turn1_text.trim().is_empty(), "turn 1 produced no text");
+        // EOG may legitimately stop before n_predict; the substance is the
+        // cross-path equality below.
+        assert!(r1.tokens_generated >= 1, "turn 1 generated nothing");
+        let mut out2 = Vec::new();
+        let mut emit2 = |b: &[u8]| out2.extend_from_slice(b);
+        let r2 = conv_a
+            .user_turn(
+                "Now continue describing it.",
+                &tok,
+                &greedy,
+                &mut engine_a,
+                &mut emit2,
+            )
+            .expect("turn 2");
+        let turn2_text = String::from_utf8_lossy(&out2).to_string();
+        assert!(!turn2_text.trim().is_empty(), "turn 2 produced no text");
+
+        // Path B: full rehydrate — same history, fresh conversation; KV is
+        // fully re-prefilled and the decode graph is rebuilt.
+        let spec_b = crate::conversation::ConversationSpec {
+            template: None,
+            bos_text: String::new(),
+            eog: vec![model.special_tokens().eos],
+            eot: model
+                .special_tokens()
+                .im_end
+                .unwrap_or(model.special_tokens().eos),
+            seed: 42,
+            n_ctx: 1024,
+            system_prompt: None,
+        };
+        let mut conv_b = crate::conversation::Conversation::new(spec_b);
+        let mut engine_b = crate::conversation::GraphEngine::new(model.as_ref(), 1024);
+        let hist = conv_a.messages_to_json();
+        let msgs =
+            crate::conversation::Conversation::messages_from_json(&hist).expect("history json");
+        conv_b.load_history(msgs, &tok, &mut engine_b);
+        let mut out3 = Vec::new();
+        let mut emit3 = |b: &[u8]| out3.extend_from_slice(b);
+        let _r3 = conv_b
+            .user_turn(
+                "Now continue describing it.",
+                &tok,
+                &greedy,
+                &mut engine_b,
+                &mut emit3,
+            )
+            .expect("turn 2 rehydrated");
+        let turn2_rehydrated = String::from_utf8_lossy(&out3).to_string();
+        assert_eq!(
+            turn2_text, turn2_rehydrated,
+            "incremental (reused decode graph) vs rehydrated (fresh graphs) divergence"
+        );
+    }
 }

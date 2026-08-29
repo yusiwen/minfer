@@ -80,6 +80,7 @@ impl Engine for GraphEngine<'_> {
 }
 
 /// Session construction parameters.
+#[derive(Clone)]
 pub struct ConversationSpec {
     /// `tokenizer.chat_template`; None → ChatML fallback rendering.
     pub template: Option<String>,

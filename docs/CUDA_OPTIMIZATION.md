@@ -1,3 +1,10 @@
+> **STATUS (2026-08-29): SUPERSEDED.** This document describes the pre-Phase-7
+> imperative CUDA path (`layer_gpu`, deleted `forward.rs`). The surviving
+> ideas were absorbed into the current plans (cuBLAS → 8k evaluation, MMQ
+> tiling → 8e negative result, GPU quantize → 8c). Read
+> `docs/CUDA-BACKEND-PLAN.md` (implementation record) and
+> `docs/CUDA-FOLLOWUP-PLAN.md` (Phase 8) instead.
+
 > **SUPERSEDED (2026-08-29)**: this doc describes the pre-Phase-7 imperative
 > CUDA path (`layer_gpu`, the deleted `forward.rs`). The current record is
 > `docs/CUDA-BACKEND-PLAN.md` (Phase 7a–7e, complete) and forward work lives
