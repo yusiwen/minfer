@@ -367,6 +367,79 @@ prefill gap; ② FA-style decode attention (single KV pass, online softmax)
 — the @2K gap and part of the small-model gap; ③ per-token CPU overhead
 audit on small models (sampler + sync path).
 
+## 8m. Prefill GEMM: tiled wmma f16 — DONE 2026-08-30 (`ba3f317`, `65b686c` follow-ups)
+
+Root cause of the ~110x prefill gap (7B @2K: 30.7 vs llama 3401 tok/s): the
+decode-shaped quant kernels used `grid.y = nt`, re-streaming the whole weight
+matrix once per token. Fix: for `nt >= 16 && id % 32 == 0` dequantize the
+weight to f16 scratch once per call and run ONE 64x64-tile wmma f16 GEMM
+(f32 accum) over all eight supported quant types.
+
+- Kernels (`src/cuda_kernels.cu`): 8 per-type `dequant_*_f16` kernels,
+  `convert_f32_f16_kernel`, double-buffered `gemm_f16_nt_kernel`
+  (grid.x = nt tile, grid.y = od tile so consecutive blocks share the B
+  panel in L2), per-type `block_stride` (Q6_K padded = 224).
+- v1 bug: only the first 16 k's of each 32-slice fed the mma (garbage
+  prefill) — fixed with fa[4]/fb[2] fragments, 4 mma per k-step.
+- 8m-2 (`65b686c`… actually `ba3f317` + the cp.async commit): `cp.async`
+  tile staging (arch >= 800; sm_75 keeps the synchronous loader) —
+  31 -> 35 TFLOPS, 7B @2K prefill 1082 -> 1204 tok/s.
+- Test `cuda_prefill_f16_gemm_parity`: all 8 types + real 7B Q4_K weight;
+  the Q6_K "failure" was a test-reference bug (qh field offset +128).
+- Env: `MINFER_NO_PREFILL_GEMM=1` reverts.
+
+| model | prefill @2K before | after | llama.cpp |
+|---|---|---|---|
+| 7B q4_k_m | 30.7 | 1201 | 3401 |
+| 0.6B q8_0 | 346 | 4585 | 23909 |
+| 0.5B q4_0 | 1721 | 2908 | 30550 |
+
+Remaining gap to llama: their MMQ path quantizes activations to int8 and
+uses int8 tensor cores (~52 TFLOPS-equiv); our f16 wmma ceiling measured
+~35 TFLOPS. Next lever: fused dequant-in-GEMM (kills the 288 ms dequant +
+54 ms convert passes and shrinks B traffic 3.4x, projected ~1600 tok/s),
+then an int8 MMQ GEMM for full parity.
+
+## 8n. FA-style tiled prefill attention — DONE 2026-08-30 (`cb66fca`)
+
+nsys on the 7B @2K prefill showed `gqa_attn_f32_f16kv` at 76% of GPU time
+(176 ms/layer): one block per (token, head) re-read K per token per head
+(~132 GB/layer) with a 128-register accumulator (spills).
+
+New `fa_prefill_f16kv` (hd == 128, nt >= 64; gated by
+`MINFER_NO_FA_PREFILL=1`): one block per (64-token q tile, head), K/V tiles
+staged in shared memory, QK^T on tensor cores (wmma), online softmax with
+probs in f16, O accumulator in per-thread REGISTERS (thread owns a
+(row, quadrant) pair — V reads become warp broadcasts; the first
+shared-memory O accumulator version hit 8-way bank conflicts, 123 ms/layer).
+
+- Subtle race found by the standalone harness: f16 probs aliasing the f32
+  score tile at a 128B row stride clobber OTHER softmax threads' unread
+  scores (probs row r lands on scores of rows 2r/2r+1). Fixed with a 256B
+  probs stride (row r's probs overlap only Sf row r, already read).
+- Result: 176 -> 8.5 ms/layer; 7B @2K prefill contributed ~4.9 s -> 0.24 s.
+- Test `cuda_fa_prefill_attention_parity` vs `cpu_gqa_attn` (max err 2.8e-4).
+
+## 8o. One-time decode-start CPU stalls — DONE 2026-08-30 (`65b686c`)
+
+A -n sweep (fixed = total - n x marginal) exposed ~650-920 ms of
+pure-CPU time at the prefill->decode graph switch, invisible to GPU
+profiling (no kernels, no CUDA API calls):
+
+1. `register_graph_weights` re-cloned every weight tensor on every graph
+   rebuild; `Tensor.data: Cow::Owned` makes `t.clone()` a deep copy —
+   4.4 GB per rebuild on 7B (~635 ms). Fix: `CpuBackend::register_weight`
+   skips already-registered names (weights are immutable after load;
+   weights_version guards future changes).
+2. The decode-graph build probed FFN concat availability via
+   `cuda::concat_rows`, which eagerly REBUILT the concatenated bytes
+   (~1.9 GB, ~920 ms) just to call `.is_some()`. Fix: metadata-only
+   `cuda::concat_rows_feasible` (the loader already builds + registers the
+   concat once at load). Metal path untouched.
+
+Result: first decode step 724 -> 35 ms; every model's decode rate unchanged
+(7B 40.6, 0.6B 195, 0.5B q4_0 257 — all within noise of baseline).
+
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,
