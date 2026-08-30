@@ -9,6 +9,7 @@
 #define Q41B 20   // sizeof(BlockQ4_1): half d + half m + uchar qs[16]
 #define Q8B  34   // sizeof(BlockQ8_0): half d + char qs[32]
 #define Q4KB 144  // sizeof(BlockQ4_K)
+#define Q5KB 176  // sizeof(BlockQ5_K)
 #define Q6KB 210  // sizeof(BlockQ6_K)
 #define WARP 32
 
@@ -652,6 +653,135 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq(
         for (int k = 0; k < 8; k++) v += warp_sums[k];
         output[(size_t)t * od + row] = v;
     }
+}
+
+// 8e follow-up: the warp+block reduction shared by the q5_K/q6_K MMVQ
+// kernels (same shape as the inline one in q4_k_q8_mmvq).
+__device__ __forceinline__ void mmvq_block_reduce(
+    float acc, float* __restrict__ output, int od, int t
+) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFF, acc, off);
+    __shared__ float warp_sums[8];
+    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) v += warp_sums[k];
+        output[(size_t)t * od + (size_t)blockIdx.x] = v;
+    }
+}
+
+// 8e follow-up: decode (nt == 1) Q6_K MMVQ — same llama.cpp GB10 structure
+// as q4_k_q8_mmvq (one row per 256-thread block, sub-block units round-robin
+// across lanes, dp4a over q8 activations). Q6_K sub-blocks are 16 elements
+// (16 signed 6-bit scales per 256-element super-block, no min term), so the
+// unit is half of a 32-element q8 activation block and the per-unit dot is
+// 4 dp4a. Element l of sub-block s (l in [0,16), s in [0,16)):
+//   chunk = s/8, group g = (s/2)%4, half is = s%2
+//   ql byte  = chunk*64 + (g%2)*32 + is*16 + l   (lo nibble for g<2, hi else)
+//   qh byte  = 128 + chunk*32 + is*16 + l        (2-bit pair g per element)
+//   scale    = (int8) blk[192 + s]; value = d * scale * (q6 - 32)
+// q6_K block strides are 210B raw / 224B padded (7e② repack) — both even but
+// not 4-aligned, so the weight side reads 2-byte halves (llama.cpp
+// get_int_b2 style); the 256B-aligned base keeps every access 2B-aligned.
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int blk_stride
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = (id + 255) >> 8;
+    const int row_stride = nbe * blk_stride;
+    const int nsub = (id + 15) >> 4; // ceil — partial tail super-blocks excluded
+    const uint8_t* x8row = acts8 + (size_t)t * (id >> 5) * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 4, s = u & 15;
+        const int chunk = s >> 3, g = (s >> 1) & 3, is = s & 1;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)blk_i * blk_stride;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+        const float sc = (float)(int8_t)blk[192 + s];
+        const uint8_t* ql = blk + chunk * 64 + (g & 1) * 32 + is * 16;
+        const uint8_t* qh = blk + 128 + chunk * 32 + is * 16;
+        const uint8_t* x8 = x8row + (size_t)(u >> 1) * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4) + (u & 1) * 4;
+        int dot = 0;
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            const uint32_t wl = (uint32_t)*reinterpret_cast<const uint16_t*>(ql + 4 * v) |
+                                ((uint32_t)*reinterpret_cast<const uint16_t*>(ql + 4 * v + 2) << 16);
+            const uint32_t wh = (uint32_t)*reinterpret_cast<const uint16_t*>(qh + 4 * v) |
+                                ((uint32_t)*reinterpret_cast<const uint16_t*>(qh + 4 * v + 2) << 16);
+            const uint32_t nib = (g < 2) ? (wl & 0x0F0F0F0F) : ((wl >> 4) & 0x0F0F0F0F);
+            const uint32_t hi = ((wh >> (2 * g)) & 0x03030303) << 4;
+            // q6 nibble+high pair is 0..63; subtract 32 per byte (in-range,
+            // never saturates) to get the signed value for dp4a
+            const int vi = __vsubss4((int)(nib | hi), 0x20202020);
+            dot = __dp4a(vi, (int)xw[v], dot);
+        }
+        acc += d8 * sc * d * (float)dot;
+    }
+
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+// 8e follow-up: decode (nt == 1) Q5_K MMVQ — the q4_k_q8_mmvq structure with
+// the q5 high-bit plane folded in. Sub-blocks are 32 elements (scales/mins
+// packed like q4_K via get_scale_min_k4). Element l of sub-block s:
+//   nibble byte = 48 + (s/2)*32 + l   (lo nibble for even s, hi for odd)
+//   high bit    = (qh[l] >> s) & 1    (qh plane at byte 16, 1 bit per element)
+//   value = d*s5*(nib | bit<<4) − dm*m5  → acc += d8*(s8*d*dot − m8*dm*sx)
+// 176B block stride is 16-byte aligned, so the weight side uses uint32 loads.
+__global__ void __launch_bounds__(256) q5_k_q8_mmvq(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = (id + 255) >> 8;
+    const int row_stride = nbe * Q5KB;
+    const int nsub = (id + 31) >> 5; // ceil — partial tail super-blocks excluded
+    const uint8_t* x8row = acts8 + (size_t)t * nsub * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 3, sub = u & 7;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)blk_i * Q5KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        uint8_t s8, m8;
+        get_scale_min_k4(sub, blk + 4, &s8, &m8);
+        const uint32_t* qw = reinterpret_cast<const uint32_t*>(blk + 48 + (sub >> 1) * 32);
+        const bool lo = (sub & 1) == 0;
+        const uint8_t* x8 = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+        int dot = 0, sx = 0;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            const uint32_t w = qw[v];
+            // qh word v holds the high bits of elements 4v..4v+3 (byte l of
+            // the qh plane, bit `sub`) — one word per nibble word
+            const uint32_t qh32 = *reinterpret_cast<const uint32_t*>(blk + 16 + 4 * v);
+            const uint32_t nib = lo ? (w & 0x0F0F0F0F) : ((w >> 4) & 0x0F0F0F0F);
+            const uint32_t hi = ((qh32 >> sub) & 0x01010101) << 4;
+            const int xa = (int)xw[v];
+            dot = __dp4a((int)(nib | hi), xa, dot);
+            sx  = __dp4a(0x01010101, xa, sx);
+        }
+        // value = d*s*(nib|bit) − dm*m (dm is the block's own dmin, not d)
+        acc += d8 * ((float)s8 * (float)d * (float)dot - (float)m8 * (float)dm * (float)sx);
+    }
+
+    mmvq_block_reduce(acc, output, od, t);
 }
 
 __global__ void q6_k_f32_matmul(
@@ -1941,6 +2071,22 @@ void launch_q4_k_q8_mmvq(
 ) {
     dim3 grid(od, nt);
     q4_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q6_k_q8_mmvq(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int blk_stride, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q6_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+}
+
+void launch_q5_k_q8_mmvq(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q5_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
 }
 
 void launch_q5_1_f32_matmul(

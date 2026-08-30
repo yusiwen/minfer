@@ -315,6 +315,25 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_q6_k_q8_mmvq(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        blk_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q5_k_q8_mmvq(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_1_f32_matmul(
         weights: *const u8,
         acts: *const f32,
@@ -1460,10 +1479,23 @@ impl CudaState {
                         "cuda: Q5_K id {id} not a multiple of 32 (tail masking granularity)"
                     ));
                 }
-                launch!(launch_q5_k_f32_matmul)
+                // 8e follow-up: decode (nt == 1) joins the MMVQ structure
+                // (dp4a over q8 activations, one row per 256-thread block).
+                if nt == 1 && id >= 2048 {
+                    self.q5_k_decode_mmvq(wptr, x, out, od, id, nt);
+                    Ok(())
+                } else {
+                    launch!(launch_q5_k_f32_matmul)
+                }
             }
             TensorType::Q6_K => {
-                if padded_q6k {
+                // 8e follow-up: decode (nt == 1) joins the MMVQ structure —
+                // 16-element units over q8 activations. blk_stride follows
+                // the weight registration (224 padded 7e② repack / 210 raw).
+                if nt == 1 && id >= 2048 && id % 32 == 0 {
+                    self.q6_k_decode_mmvq(wptr, x, out, od, id, nt, padded_q6k);
+                    Ok(())
+                } else if padded_q6k {
                     launch!(launch_q6_k_f32_matmul_padded)
                 } else {
                     launch!(launch_q6_k_f32_matmul)
@@ -1901,6 +1933,80 @@ impl CudaState {
                 stream,
             );
             launch_q4_k_q8_mmvq(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// 8e follow-up: decode (nt == 1) q6_K matmul via the same MMVQ
+    /// structure — the shared q8 activation scratch, then the 16-element
+    /// unit dp4a kernel. `blk_stride` follows the weight registration:
+    /// 224 for the padded 7e② repack, 210 for raw bytes.
+    pub fn q6_k_decode_mmvq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        blk_stride_padded: bool,
+    ) {
+        let nb = id / 32;
+        let need = nt * nb * 40;
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        let stream = self.stream();
+        unsafe {
+            launch_quantize_q8_0_pad40(
+                x as *const f32,
+                q8 as *mut u8,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+            launch_q6_k_q8_mmvq(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                if blk_stride_padded { 224 } else { 210 },
+                stream,
+            );
+        }
+    }
+
+    /// 8e follow-up: decode (nt == 1) q5_K matmul via the same MMVQ
+    /// structure (q4_K shape with the q5 high-bit plane folded in).
+    pub fn q5_k_decode_mmvq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let nb = id / 32;
+        let need = nt * nb * 40;
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        let stream = self.stream();
+        unsafe {
+            launch_quantize_q8_0_pad40(
+                x as *const f32,
+                q8 as *mut u8,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+            launch_q5_k_q8_mmvq(
                 wptr as *const u8,
                 q8 as *const u8,
                 out as *mut f32,

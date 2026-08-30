@@ -1969,6 +1969,56 @@ mod tail_tests {
         println!("{}", spec);
     }
 
+    /// 8e follow-up: dump real Q5_K tensors from the 0.5B q5_k_m model for
+    /// the `cuda_q5k_decode_mmvq_parity` real-weight section — debug helper,
+    /// ignored by default. Writes to a `real05_` prefix so it cannot collide
+    /// with the 7B q4_K dumps.
+    #[test]
+    #[ignore] // run explicitly: cargo test --release --features cuda dump_real_q5k_tensor -- --ignored --nocapture
+    fn dump_real_q5k_tensor() {
+        let path = std::path::PathBuf::from(
+            "~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q5_k_m.gguf",
+        );
+        let path = shellexpand_tilde(&path);
+        let gguf = crate::gguf::load_gguf_model(&path).unwrap();
+        let names = [
+            "token_embd.weight",
+            "output.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+        ];
+        let mut spec = String::new();
+        for name in names {
+            let mut found = None;
+            for part in &gguf.parts {
+                if let Some(info) = part.ctx.info.iter().find(|i| i.name == name) {
+                    let start = part.ctx.offset + info.offset as usize;
+                    let n = info.ne.iter().product::<i64>();
+                    let bytes =
+                        info.type_.type_size() * n as usize / info.type_.blck_size() as usize;
+                    found = Some((info.type_, info.ne, &part.data[start..start + bytes]));
+                    break;
+                }
+            }
+            match found {
+                Some((ty, ne, data)) => {
+                    let out = format!("/tmp/minfer_phase7/real05_{}.bin", name.replace('.', "_"));
+                    std::fs::write(&out, data).unwrap();
+                    spec.push_str(&format!(
+                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {out}\n",
+                        data.len()
+                    ));
+                }
+                None => spec.push_str(&format!("{name}: MISSING\n")),
+            }
+        }
+        println!("{}", spec);
+    }
+
     fn shellexpand_tilde(p: &std::path::Path) -> std::path::PathBuf {
         let s = p.to_str().unwrap();
         if let Some(rest) = s.strip_prefix("~/") {
