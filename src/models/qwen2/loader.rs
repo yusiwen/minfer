@@ -227,6 +227,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 | TensorType::Q4_K
                 | TensorType::Q5_0
                 | TensorType::Q5_1
+                | TensorType::Q5_K
                 | TensorType::Q6_K
                 | TensorType::Q8_0
         ) {
