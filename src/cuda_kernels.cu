@@ -2677,14 +2677,16 @@ __global__ void convert_f32_f16_kernel(
     if (g < n) out[g] = __float2half(x[g]);
 }
 
-__device__ __forceinline__ void gemm_load_tile(
+// 8m②: cp.async global→shared staging (sm_80+). The synchronous load
+// stalled every warp on the L2 round trip each 32-k step (~31 TFLOPS
+// measured); async copies overlap the k+32 tile fetch with the k compute.
+__device__ __forceinline__ void gemm_load_tile_sync(
     const __half* __restrict__ A, const __half* __restrict__ B,
     __half* As, __half* Bs,
     int n0, int m0, int k0, int nt, int od, int id
 ) {
-    // 256 threads: 64 rows x 4 aligned 16B chunks (8 halves each).
     int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
-    bool k_ok = k0 + c4 < id; // id % 8 == 0 gate keeps chunks inside the row
+    bool k_ok = k0 + c4 < id;
     int n = n0 + r;
     if (n < nt && k_ok) {
         *reinterpret_cast<uint4*>(As + r * 32 + c4) =
@@ -2700,6 +2702,32 @@ __device__ __forceinline__ void gemm_load_tile(
         *reinterpret_cast<uint4*>(Bs + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
     }
 }
+
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void gemm_cp16(__half* smem_dst, const __half* gsrc, bool full) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(smem_dst);
+    int sz = full ? 16 : 0; // src-size 0 => zero-fill the 16B chunk
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d),
+                 "l"(gsrc), "r"(sz));
+}
+__device__ __forceinline__ void gemm_cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void gemm_cp_wait1() { asm volatile("cp.async.wait_group 1;\n"); }
+__device__ __forceinline__ void gemm_cp_wait0() { asm volatile("cp.async.wait_group 0;\n"); }
+
+__device__ __forceinline__ void gemm_load_tile_async(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    __half* As, __half* Bs,
+    int n0, int m0, int k0, int nt, int od, int id
+) {
+    // 256 threads: 64 rows x 4 aligned 16B chunks (8 halves each).
+    int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+    bool k_ok = k0 + c4 < id; // id % 8 == 0 gate keeps chunks inside the row
+    int n = n0 + r;
+    gemm_cp16(As + r * 32 + c4, A + (long long)n * id + k0 + c4, n < nt && k_ok);
+    int m = m0 + r;
+    gemm_cp16(Bs + r * 32 + c4, B + (long long)m * id + k0 + c4, m < od && k_ok);
+}
+#endif // __CUDA_ARCH__ >= 800
 
 // C[nt, od] = A[nt, id] · B[od, id]^T. 64x64 output tiles, k-step 32,
 // double-buffered shared staging, 8 warps (each owns a 16 nt x 16 od
@@ -2730,11 +2758,30 @@ __global__ void gemm_f16_nt_kernel(
     wmma::fill_fragment(fc[1], 0.0f);
 
     int buf = 0;
-    gemm_load_tile(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
+#if __CUDA_ARCH__ >= 800
+    gemm_load_tile_async(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
+    gemm_cp_commit();
+#else
+    gemm_load_tile_sync(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
     __syncthreads();
+#endif
     for (int k = 0; k < id; k += 32, buf ^= 1) {
+#if __CUDA_ARCH__ >= 800
+        if (k + 32 < id) {
+            gemm_load_tile_async(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+            gemm_cp_commit();
+        }
+        // wait until the CURRENT tile landed (one group may stay in flight)
         if (k + 32 < id)
-            gemm_load_tile(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+            gemm_cp_wait1();
+        else
+            gemm_cp_wait0();
+        __syncthreads();
+#else
+        if (k + 32 < id)
+            gemm_load_tile_sync(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+        __syncthreads();
+#endif
         // fa: [n-block 0/1] x [k-half 0/1]; fb: [k-half 0/1] — both k halves
         // of the 32-wide slice must be accumulated (the v1 bug: only the
         // first 16 k's were multiplied).
