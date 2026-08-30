@@ -265,7 +265,9 @@ impl Qwen2Graph {
         }
         #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
         {
-            crate::cuda::concat_rows(&[fg, fu]).is_some()
+            // metadata-only probe — the concat bytes are built once by the
+            // loader; rebuilding them here cost ~920 ms per decode graph build
+            crate::cuda::concat_rows_feasible(&[fg, fu])
         }
         #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         {

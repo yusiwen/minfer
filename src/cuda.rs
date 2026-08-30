@@ -626,6 +626,40 @@ pub fn concat_rows(tensors: &[&Tensor]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Metadata-only `concat_rows` feasibility check — no byte copying. The
+/// decode-graph build probes concat availability per layer; the eager
+/// variant re-concatenated ~1.9 GB (28 ffn gate/up pairs on 7B) on every
+/// decode graph build, measured as a ~920 ms one-time stall at the
+/// prefill→decode switch. The loader performs the real concatenation once
+/// at model load and registers `blk.{i}.ffn_gu`; both paths must agree, so
+/// this mirrors concat_rows' precondition checks exactly (the per-tensor
+/// data-length check subsumes the final `out.len() != rows * row` test).
+pub fn concat_rows_feasible(tensors: &[&Tensor]) -> bool {
+    if tensors.len() < 2 {
+        return false;
+    }
+    let tt = tensors[0].ttype;
+    if tensors.iter().any(|t| t.ttype != tt) {
+        return false;
+    }
+    let bq = quant_block_q(tt);
+    let bb = quant_block_bytes(tt);
+    if bb == 0 {
+        return false;
+    }
+    let ne0 = tensors[0].shape[0] as usize;
+    if tensors.iter().any(|t| t.shape[0] != ne0 as i64) {
+        return false;
+    }
+    if ne0 % bq != 0 {
+        return false;
+    }
+    let row = (ne0 / bq) * bb;
+    tensors
+        .iter()
+        .all(|t| t.data().len() == row * (t.shape[1] as usize))
+}
+
 /// 8b: GPU KV cache element type (CUDA side, mirrors `metal::kv_cache_is_f16`).
 /// `MINFER_CACHE_TYPE=f16|f32` forces one; unset auto-selects f16 for the
 /// 7B class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for
