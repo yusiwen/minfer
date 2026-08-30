@@ -440,6 +440,43 @@ profiling (no kernels, no CUDA API calls):
 Result: first decode step 724 -> 35 ms; every model's decode rate unchanged
 (7B 40.6, 0.6B 195, 0.5B q4_0 257 — all within noise of baseline).
 
+## 8p. Prefill GEMM: persistent f16 weights + fused dequant-in-GEMM — DONE 2026-08-30 (`2992f57`)
+
+Two-pass 8m dequantized W into an f16 scratch on EVERY call (288 ms per
+7B @2K forward) and the fused-GEMM experiment that replaced it both start
+from the same observation: the weight bytes never change, so the f16 form
+should exist exactly once per weight, not once per call.
+
+- **Persistent per-weight f16 cache (default)**: `CudaState::w16_cache`
+  keyed by the registered device pointer (stable: `register_weight`
+  reuses the device copy for same name+size and never frees on replace).
+  The loader warms it at LOAD time — a lazy first-call fill put ~8.6 GB of
+  cudaMalloc inside the first, timed, prefill and measured WORSE than
+  baseline (1165 vs 1201 tok/s). Gated to models whose quantized matmul
+  weights total >= 2 GB (`W16_ENABLE_BYTES`): the CUDA test suite keeps
+  several loaded models resident on a shared OVERCOMMITTED CUDA pool
+  (cudaMemGetInfo free ~= 24 GB of a 130 GB total; reservations succeed
+  far past free), and a +1-2 GB cache per loaded fixture made later
+  models' weight uploads OOM probabilistically. `MINFER_NO_W16CACHE=1`
+  reverts. 7B q4_k_m @2K prefill: 1201 -> ~1400-1495 tok/s.
+- **Fused dequant-in-GEMM (opt-in `MINFER_FUSED_B=1`)**:
+  `gemm_qb_nt_kernel` dequantizes B tiles in-register from raw quantized
+  bytes, same 64x64 wmma tile structure, bit-identical rounding to the
+  dequant kernels. Measured SLOWER than the cp.async f16 GEMM on large nt
+  (994 vs 1201 on 7B @2K): every nt tile sweep re-dequantizes the whole B
+  panel (30 sweeps at nt=1920) and cp.async cannot convert/dequantize, so
+  the load pipeline goes synchronous. Kept as the memory-lean alternative
+  (no 2 B/element resident copy).
+- **Latent bug found by the new bitparity test**:
+  `cuda_prefill_fused_b_bitparity` (fused vs legacy bit-equality, all 8
+  types x 2 super-block configs) caught cudaErrorMisalignedAddress (716)
+  in `dequant_q5_0_f16` — a u32 qh load at blk+2 on 22-byte blocks is
+  only 2-byte aligned for odd block indices. Any Q5_0 prefill GEMM would
+  have crashed; fixed there and in the new `bqa_q5_0/q5_1` (two u16
+  loads). The old parity test never exercised Q5_0/Q5_1.
+- Remaining prefill gap to llama.cpp (3401) is the f16 tensor-core
+  ceiling (~35 TFLOPS) vs their int8 MMQ (~52) — P2, see 8m.
+
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,
