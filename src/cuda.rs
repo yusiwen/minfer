@@ -291,6 +291,21 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
     );
+    // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
+    // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
+    fn launch_fa_prefill_f16kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     fn launch_store_kv_f16(
         src: *const f32,
         dst: *mut std::ffi::c_void,
@@ -1963,6 +1978,32 @@ impl CudaState {
         nt: usize,
     ) {
         let stream = self.stream();
+        // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The
+        // legacy kernel is one block per (token, head) — K re-read per token
+        // per head (7B @2K: ~132 GB/layer) with a 128-register accumulator —
+        // and measured 176 ms/layer, 76% of the whole 2K prefill. hd % 16
+        // is hard-wired (FA_HQ = hd/4 = 32) and the shared-memory opt-in
+        // can fail on constrained devices, hence the rc fallback.
+        if nt >= 64 && hd == 128 && !Self::no_fa_prefill() {
+            let rc = unsafe {
+                launch_fa_prefill_f16kv(
+                    q as *const f32,
+                    k as *const std::ffi::c_void,
+                    v as *const std::ffi::c_void,
+                    o as *mut f32,
+                    positions as *const i32,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    nt as i32,
+                    stream,
+                )
+            };
+            if rc == 0 {
+                return;
+            }
+        }
         unsafe {
             launch_gqa_attn_f32_f16kv(
                 q as *const f32,
@@ -2044,6 +2085,11 @@ impl CudaState {
     /// 8m: force the legacy per-type prefill kernels (A/B escape hatch).
     fn no_prefill_gemm() -> bool {
         std::env::var("MINFER_NO_PREFILL_GEMM").map_or(false, |v| v == "1")
+    }
+
+    /// 8n: force the legacy per-token prefill attention kernel (A/B escape).
+    fn no_fa_prefill() -> bool {
+        std::env::var("MINFER_NO_FA_PREFILL").map_or(false, |v| v == "1")
     }
 
     /// 8e-reversal: decode (nt == 1) q4_K matmul via the llama.cpp MMVQ

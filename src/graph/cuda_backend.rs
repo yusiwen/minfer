@@ -3024,6 +3024,111 @@ mod tests {
         assert_close("gqa_attn(f16 kv)", &agot, &aref, 1e-4);
     }
 
+    // 8n: prefill attention (nt >= 64, hd == 128) routes through the
+    // FA-style tiled kernel (wmma QK^T, online softmax, per-thread register
+    // O accumulator). Reference: cpu_gqa_attn over the f16-rounded KV — the
+    // kernel reads the same f16 cache; its q and probs carry f16 rounding,
+    // measured ~1.4e-4 on the standalone harness, so 5e-3 leaves headroom.
+    #[test]
+    fn cuda_fa_prefill_attention_parity() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        cb.set_kv_f16_for_test(true);
+        let (nh, nk_h, hd) = (4usize, 2usize, 128usize);
+        let nkt = nk_h * hd;
+        let (nt, n_ctx) = (100usize, 128usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let pos: Vec<usize> = (0..nt).collect();
+
+        let mut b = GraphBuilder::new();
+        let q = b.input("q", [nh * hd, nt, 1, 1], DType::F32);
+        let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
+        let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
+        let _store = b.kvcache_store(0, k, v, pp, n_ctx);
+        let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+        let at = b.attn(
+            q,
+            load,
+            pp,
+            AttnMode::Gqa,
+            AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk_h,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale,
+            },
+        );
+        b.output(at);
+        let g = b.build();
+
+        let (xb_q, xb_k, xb_v) = (
+            cb.alloc_buffer(nh * hd * nt),
+            cb.alloc_buffer(nkt * nt),
+            cb.alloc_buffer(nkt * nt),
+        );
+        let xb_p = cb.alloc_buffer(nt);
+        let ob_at = cb.alloc_buffer(nh * hd * nt);
+        let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
+
+        let qs: Vec<f32> = (0..nh * hd * nt)
+            .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+            .collect();
+        let ks: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+            .collect();
+        let vs: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+            .collect();
+        let pb: Vec<f32> = pos.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        let to_half = |x: &[f32]| -> Vec<f32> {
+            x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+        };
+        let ks_h = to_half(&ks);
+        let vs_h = to_half(&vs);
+        cb.write_host(xb_q, &qs).unwrap();
+        cb.write_host(xb_k, &ks).unwrap();
+        cb.write_host(xb_v, &vs).unwrap();
+        cb.write_host(xb_p, &pb).unwrap();
+        cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
+        cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
+
+        cb.execute_node(
+            &g.nodes[_store],
+            &[xb_k, xb_v, xb_p],
+            kreg,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+        cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+            .unwrap();
+
+        let mut kfull = vec![0f32; nkt * n_ctx];
+        let mut vfull = vec![0f32; nkt * n_ctx];
+        for (t, &p) in pos.iter().enumerate() {
+            kfull[p * nkt..(p + 1) * nkt].copy_from_slice(&ks_h[t * nkt..(t + 1) * nkt]);
+            vfull[p * nkt..(p + 1) * nkt].copy_from_slice(&vs_h[t * nkt..(t + 1) * nkt]);
+        }
+        let nkv = pos.iter().copied().max().unwrap() + 1;
+        let mut aref = vec![0f32; nh * hd * nt];
+        crate::graph::cpu_backend::cpu_gqa_attn(
+            &qs, &kfull, &vfull, &pos, nt, nkv, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+        )
+        .unwrap();
+        let agot = cb.copy_to_host(ob_at).unwrap();
+        let mut maxe = 0f32;
+        for (a, r) in agot.iter().zip(aref.iter()) {
+            maxe = maxe.max((a - r).abs());
+        }
+        println!("fa prefill attention: max err {maxe:.6}");
+        assert_close("fa_prefill_f16kv", &agot, &aref, 5e-3);
+    }
+
     // 8c: prefill Q4_0 matmul (nt > 1, id <= 8192) routes through the
     // Q8_0-activation GEMM. The reference builds the SAME Q8_0 activation
     // blocks and uses dot_q4_0_q8_0 — the kernel's exact math — so the
