@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cstdint>
 
 // ─── Block size constants (must match src/block.rs) ───────────
@@ -2270,6 +2271,328 @@ void launch_gqa_attn_f32(
     dim3 block(WARP, 1, 1); // 32 threads per block (1 warp)
     dim3 grid(nt, nh, 1);
     gqa_attn_f32<<<grid, block, 0, stream>>>(q, k, v, o, positions, nh, nk, hd, scale, nt);
+}
+
+// ─── 8m: prefill dequant-to-f16 + wmma HGEMM ────────────────────────────
+// Prefill (nt >= 16) routes quantized matmuls through ONE tiled
+// tensor-core GEMM instead of the decode-shaped kernels whose
+// grid.y = nt re-streamed the whole weight matrix once per token
+// (7B q4_k_m @2K: 30.7 tok/s vs llama.cpp MMQ 3401). Weights are
+// dequantized to f16 once per call into a scratch buffer, activations
+// converted to f16, then C[nt, od] = A[nt, id] · B[od, id]^T via
+// 16x16x16 wmma with f32 accumulation. Gated on id % 32 == 0 (block
+// math + 16B-aligned uint4 tile loads).
+
+// type_id mapping for launch_dequant_f16 (Rust side passes it):
+// 0=q8_0 1=q4_0 2=q4_1 3=q5_0 4=q5_1 5=q4_K 6=q5_K 7=q6_K
+
+__global__ void dequant_q8_0_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nb = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nb) return;
+    int row = (int)(g / nb);
+    const uint8_t* blk = w + g * 34;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    const int8_t* q = (const int8_t*)(blk + 2);
+    __half* o = out + (long long)row * id + (int)(g % nb) * 32;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) o[i] = __float2half(d * float(q[i]));
+}
+
+__global__ void dequant_q4_0_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nb = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nb) return;
+    int row = (int)(g / nb);
+    const uint8_t* blk = w + g * 18;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    const uint8_t* q = blk + 2;
+    __half* o = out + (long long)row * id + (int)(g % nb) * 32;
+    // minfer Q4_0 stores round(v/d) + 8 (same -8 offset as the matmuls).
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        o[i] = __float2half(d * (float(q[i] & 0x0F) - 8.0f));
+        o[i + 16] = __float2half(d * (float(q[i] >> 4) - 8.0f));
+    }
+}
+
+__global__ void dequant_q4_1_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nb = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nb) return;
+    int row = (int)(g / nb);
+    const uint8_t* blk = w + g * 20;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float m = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    const uint8_t* q = blk + 4;
+    __half* o = out + (long long)row * id + (int)(g % nb) * 32;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        o[i] = __float2half(d * float(q[i] & 0x0F) + m);
+        o[i + 16] = __float2half(d * float(q[i] >> 4) + m);
+    }
+}
+
+__global__ void dequant_q5_0_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nb = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nb) return;
+    int row = (int)(g / nb);
+    const uint8_t* blk = w + g * 22;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    uint32_t qh = *reinterpret_cast<const uint32_t*>(blk + 2);
+    const uint8_t* qs = blk + 6;
+    __half* o = out + (long long)row * id + (int)(g % nb) * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        float lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1) - 16.0f;
+        float hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1) - 16.0f;
+        o[j] = __float2half(d * lo);
+        o[j + 16] = __float2half(d * hi);
+    }
+}
+
+__global__ void dequant_q5_1_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nb = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nb) return;
+    int row = (int)(g / nb);
+    const uint8_t* blk = w + g * 24;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float m = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    uint32_t qh = *reinterpret_cast<const uint32_t*>(blk + 4);
+    const uint8_t* qs = blk + 8;
+    __half* o = out + (long long)row * id + (int)(g % nb) * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        float lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1);
+        float hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1);
+        o[j] = __float2half(d * lo + m);
+        o[j + 16] = __float2half(d * hi + m);
+    }
+}
+
+__global__ void dequant_q4_k_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nsub = id / 32; // 8 sub-blocks per 256 super-block
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nsub) return;
+    int row = (int)(g / nsub), s = (int)(g % nsub);
+    int sp = s / 8, sub = s % 8;
+    const uint8_t* blk = w + ((long long)row * (id / 256) + sp) * Q4KB;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float dmin = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    uint8_t scb, mb;
+    get_scale_min_k4(sub, blk + 4, &scb, &mb);
+    int j = sub / 2, half = sub % 2;
+    const uint8_t* q = blk + 16 + j * 32;
+    __half* o = out + (long long)row * id + s * 32;
+    float ds = d * float(scb), dmm = dmin * float(mb);
+    #pragma unroll
+    for (int l = 0; l < 32; l++) {
+        float nib = half ? float(q[l] >> 4) : float(q[l] & 0x0F);
+        o[l] = __float2half(ds * nib - dmm);
+    }
+}
+
+__global__ void dequant_q5_k_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out, int od, int id
+) {
+    int nsub = id / 32;
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nsub) return;
+    int row = (int)(g / nsub), sidx = (int)(g % nsub);
+    int sp = sidx / 8, sub = sidx % 8;
+    const uint8_t* blk = w + ((long long)row * (id / 256) + sp) * Q5KB;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float dmin = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    uint8_t scb, mb;
+    get_scale_min_k4(sub, blk + 4, &scb, &mb);
+    int ci = sub >> 1, hi = sub & 1;
+    const uint8_t* q4 = blk + 48 + ci * 32;
+    const uint8_t* qh = blk + 16;
+    __half* o = out + (long long)row * id + sidx * 32;
+    float ds = d * float(scb), dmm = dmin * float(mb);
+    #pragma unroll
+    for (int l = 0; l < 32; l++) {
+        float nib = hi ? float(q4[l] >> 4) : float(q4[l] & 0x0F);
+        float wv = nib + 16.0f * float((qh[l] >> sub) & 1);
+        o[l] = __float2half(ds * wv - dmm);
+    }
+}
+
+__global__ void dequant_q6_k_f16(
+    const uint8_t* __restrict__ w, __half* __restrict__ out,
+    int od, int id, int block_stride
+) {
+    int nsub = id / 16; // 16-element units, 16 per 256 super-block
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long)od * nsub) return;
+    int row = (int)(g / nsub), s = (int)(g % nsub);
+    int sp = s / 16, sub = s % 16;
+    const uint8_t* blk = w + ((long long)row * (id / 256) + sp) * block_stride;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+    const uint8_t* ql = blk;
+    const uint8_t* qh = blk + 128;
+    const int8_t* sc = (const int8_t*)(blk + 192);
+    int n = sub / 8, rem = sub % 8, tt = rem / 2, gq = rem % 2;
+    int ql_off = n * 64 + (tt % 2) * 32 + gq * 16;
+    int qh_off = n * 32 + gq * 16;
+    int sc_idx = n * 8 + tt * 2 + gq;
+    __half* o = out + (long long)row * id + sp * 256 + n * 128 + tt * 32 + gq * 16;
+    float dsc = d * float(sc[sc_idx]);
+    #pragma unroll
+    for (int r = 0; r < 16; r++) {
+        int nib = (tt < 2) ? (ql[ql_off + r] & 0x0F) : (ql[ql_off + r] >> 4);
+        int q2 = (qh[qh_off + r] >> (tt * 2)) & 3;
+        o[r] = __float2half(dsc * float((nib | (q2 << 4)) - 32));
+    }
+}
+
+// f32 activations -> f16 (one kernel, elementwise).
+__global__ void convert_f32_f16_kernel(
+    const float* __restrict__ x, __half* __restrict__ out, long long n
+) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g < n) out[g] = __float2half(x[g]);
+}
+
+__device__ __forceinline__ void gemm_load_tile(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    __half* As, __half* Bs,
+    int n0, int m0, int k0, int nt, int od, int id
+) {
+    // 256 threads: 64 rows x 4 aligned 16B chunks (8 halves each).
+    int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+    bool k_ok = k0 + c4 < id; // id % 8 == 0 gate keeps chunks inside the row
+    int n = n0 + r;
+    if (n < nt && k_ok) {
+        *reinterpret_cast<uint4*>(As + r * 32 + c4) =
+            *reinterpret_cast<const uint4*>(A + (long long)n * id + k0 + c4);
+    } else {
+        *reinterpret_cast<uint4*>(As + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
+    }
+    int m = m0 + r;
+    if (m < od && k_ok) {
+        *reinterpret_cast<uint4*>(Bs + r * 32 + c4) =
+            *reinterpret_cast<const uint4*>(B + (long long)m * id + k0 + c4);
+    } else {
+        *reinterpret_cast<uint4*>(Bs + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
+    }
+}
+
+// C[nt, od] = A[nt, id] · B[od, id]^T. 64x64 output tiles, k-step 32,
+// double-buffered shared staging, 8 warps (each owns a 16 nt x 16 od
+// fragment pair). f32 accumulation. Tails: nt/od masked at store, k-tail
+// zero-filled (id % 8 == 0 keeps the uint4 chunk loads aligned).
+__global__ void gemm_f16_nt_kernel(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    float* __restrict__ C, int nt, int od, int id
+) {
+    using namespace nvcuda;
+    __shared__ __half As[2][64 * 32];
+    __shared__ __half Bs[2][64 * 32];
+    __shared__ float Cs[8][16 * 16]; // per-warp store staging
+
+    int warp = threadIdx.x >> 5;      // 0..7
+    int wm = warp >> 1;               // od sub-tile: 4 x 16 rows
+    int wn = warp & 1;                // nt sub-tile: 2 x 32 rows
+    // blockIdx.x = nt tile, blockIdx.y = od tile: consecutive blocks share
+    // the same od-tile's B panel (64 rows x id f16, ~0.5MB) in L2, so the
+    // f16 weight matrix streams from DRAM ~once instead of nt/64 times.
+    int m0 = blockIdx.y * 64;
+    int n0 = blockIdx.x * 64;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[4];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb[2];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[2];
+    wmma::fill_fragment(fc[0], 0.0f);
+    wmma::fill_fragment(fc[1], 0.0f);
+
+    int buf = 0;
+    gemm_load_tile(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
+    __syncthreads();
+    for (int k = 0; k < id; k += 32, buf ^= 1) {
+        if (k + 32 < id)
+            gemm_load_tile(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+        // fa: [n-block 0/1] x [k-half 0/1]; fb: [k-half 0/1] — both k halves
+        // of the 32-wide slice must be accumulated (the v1 bug: only the
+        // first 16 k's were multiplied).
+        wmma::load_matrix_sync(fa[0], &As[buf][wn * 32 * 32], 32);
+        wmma::load_matrix_sync(fa[1], &As[buf][(wn * 32 + 16) * 32], 32);
+        wmma::load_matrix_sync(fa[2], &As[buf][wn * 32 * 32 + 16], 32);
+        wmma::load_matrix_sync(fa[3], &As[buf][(wn * 32 + 16) * 32 + 16], 32);
+        wmma::load_matrix_sync(fb[0], &Bs[buf][wm * 16 * 32], 32);
+        wmma::load_matrix_sync(fb[1], &Bs[buf][wm * 16 * 32 + 16], 32);
+        wmma::mma_sync(fc[0], fa[0], fb[0], fc[0]);
+        wmma::mma_sync(fc[1], fa[1], fb[0], fc[1]);
+        wmma::mma_sync(fc[0], fa[2], fb[1], fc[0]);
+        wmma::mma_sync(fc[1], fa[3], fb[1], fc[1]);
+        __syncthreads();
+    }
+
+    int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        wmma::store_matrix_sync(Cs[warp], fc[j], 16, wmma::mem_row_major);
+        int nb = n0 + wn * 32 + j * 16, mb = m0 + wm * 16;
+        for (int e = lane; e < 256; e += 32) {
+            int n = nb + (e >> 4), m = mb + (e & 15);
+            if (n < nt && m < od)
+                C[(long long)n * od + m] = Cs[warp][(e >> 4) * 16 + (e & 15)];
+        }
+    }
+}
+
+void launch_dequant_f16(
+    int type_id, const uint8_t* w, __half* out,
+    int od, int id, int block_stride, cudaStream_t stream
+) {
+    int block = 256;
+    long long total;
+    switch (type_id) {
+        case 7: total = (long long)od * (id / 16); break;            // q6_K
+        default: total = (long long)od * (id / 32); break;           // all others
+    }
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    switch (type_id) {
+        case 0: dequant_q8_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 1: dequant_q4_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 2: dequant_q4_1_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 3: dequant_q5_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 4: dequant_q5_1_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 5: dequant_q4_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 6: dequant_q5_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        default: dequant_q6_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id, block_stride); break;
+    }
+}
+
+void launch_convert_f16(
+    const float* x, __half* out, long long n, cudaStream_t stream
+) {
+    long long grid = (n + 255) / 256;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    convert_f32_f16_kernel<<<(int)grid, 256, 0, stream>>>(x, out, n);
+}
+
+void launch_gemm_f16(
+    const __half* a, const __half* b, float* c,
+    int nt, int od, int id, cudaStream_t stream
+) {
+    dim3 grid((nt + 63) / 64, (od + 63) / 64);
+    gemm_f16_nt_kernel<<<grid, 256, 0, stream>>>(a, b, c, nt, od, id);
 }
 
 } // extern "C"

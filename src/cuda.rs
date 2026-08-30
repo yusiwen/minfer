@@ -264,6 +264,33 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // 8m: prefill dequant-to-f16 + wmma HGEMM. The f16 pointers cross the
+    // boundary as c_void (Rust has no __half); the type_id mapping is
+    // documented at launch_dequant_f16 in cuda_kernels.cu.
+    fn launch_dequant_f16(
+        type_id: i32,
+        w: *const u8,
+        out: *mut std::ffi::c_void,
+        od: i32,
+        id: i32,
+        block_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_convert_f16(
+        x: *const f32,
+        out: *mut std::ffi::c_void,
+        n: i64,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_gemm_f16(
+        a: *const std::ffi::c_void,
+        b: *const std::ffi::c_void,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_store_kv_f16(
         src: *const f32,
         dst: *mut std::ffi::c_void,
@@ -495,6 +522,12 @@ pub struct CudaState {
     /// 8e-reversal: decode MMVQ q8 activation scratch (nt=1, so id/32 * 40B
     /// per token — size-stable per graph, grown during warmup runs).
     buf_q8_decode: Mutex<(CudaPtr, usize)>,
+    /// 8m: prefill f16 GEMM scratch — dequantized weights (od*id halves) and
+    /// converted activations (nt*id halves), grown on demand. Prefill never
+    /// enters a CUDA Graph capture window (8g①), so the grow is capture-safe
+    /// (same assumption as the 8c buf_q8_prefill).
+    buf_f16_w: Mutex<(CudaPtr, usize)>,
+    buf_f16_x: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_q8_ba: Mutex<(CudaPtr, usize)>,
     #[allow(dead_code)] // legacy surface (7e⑦)
@@ -724,6 +757,8 @@ impl CudaState {
             buf_q8_prefill: Mutex::new(dummy),
             buf_attn_partial: Mutex::new(dummy),
             buf_q8_decode: Mutex::new(dummy),
+            buf_f16_w: Mutex::new(dummy),
+            buf_f16_x: Mutex::new(dummy),
             buf_q8_ba: Mutex::new(dummy),
             buf_positions: Mutex::new(dummy),
             buf_logits: Mutex::new(dummy),
@@ -1405,6 +1440,31 @@ impl CudaState {
         nt: usize,
         padded_q6k: bool,
     ) -> Result<(), String> {
+        // 8m: prefill (nt >= 16) runs ONE tiled wmma f16 GEMM for every
+        // quantized weight type — dequant weights to f16 scratch once per
+        // call, convert activations, single tensor-core GEMM. The legacy
+        // per-type kernels are decode-shaped (grid.y = nt): every token
+        // block re-streamed the whole weight matrix (7B q4_k_m @2K prefill
+        // 30.7 tok/s vs llama.cpp MMQ 3401). id % 32 == 0 covers the block
+        // math of every type and keeps the GEMM's uint4 tile loads aligned.
+        // MINFER_NO_PREFILL_GEMM=1 forces the legacy kernels (A/B escape).
+        if nt >= 16
+            && id % 32 == 0
+            && !Self::no_prefill_gemm()
+            && matches!(
+                ttype,
+                TensorType::Q4_0
+                    | TensorType::Q4_1
+                    | TensorType::Q5_0
+                    | TensorType::Q5_1
+                    | TensorType::Q8_0
+                    | TensorType::Q4_K
+                    | TensorType::Q5_K
+                    | TensorType::Q6_K
+            )
+        {
+            return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
+        }
         let stream = self.stream();
         macro_rules! launch {
             ($f:ident) => {{
@@ -1528,6 +1588,66 @@ impl CudaState {
                 "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"
             )),
         }
+    }
+
+    /// 8m: prefill GEMM — dequant the weight to f16 scratch once, convert
+    /// activations to f16, then one tensor-core GEMM (see the dispatch-gate
+    /// comment in `matmul_f32_ptr_layout`). Caller guarantees nt >= 16 and
+    /// id % 32 == 0 for the supported quant types.
+    fn prefill_gemm_f16(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        ttype: TensorType,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        padded_q6k: bool,
+    ) -> Result<(), String> {
+        let stream = self.stream();
+        let type_id = match ttype {
+            TensorType::Q8_0 => 0,
+            TensorType::Q4_0 => 1,
+            TensorType::Q4_1 => 2,
+            TensorType::Q5_0 => 3,
+            TensorType::Q5_1 => 4,
+            TensorType::Q4_K => 5,
+            TensorType::Q5_K => 6,
+            TensorType::Q6_K => 7,
+            other => return Err(format!("cuda: prefill GEMM got unsupported type {other:?}")),
+        };
+        // Q6_K reads whichever layout the weight was registered with
+        // (224-byte padded 7e② repack or raw 210); all others are raw.
+        let block_stride: i32 = if ttype == TensorType::Q6_K && padded_q6k {
+            224
+        } else {
+            210
+        };
+        let w16 = Self::get_or_grow(&self.buf_f16_w, od * id * 2);
+        let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
+        unsafe {
+            launch_dequant_f16(
+                type_id,
+                wptr as *const u8,
+                w16,
+                od as i32,
+                id as i32,
+                block_stride,
+                stream,
+            );
+            launch_convert_f16(x as *const f32, x16, (nt * id) as i64, stream);
+            launch_gemm_f16(
+                x16,
+                w16,
+                out as *mut f32,
+                nt as i32,
+                od as i32,
+                id as i32,
+                stream,
+            );
+        }
+        Ok(())
     }
 
     pub fn quant_matmul_f32_on_gpu(
@@ -1919,6 +2039,11 @@ impl CudaState {
     /// back onto the f32 kernels (A/B escape hatch, MINFER_NO_FUSE_* style).
     fn no_kq_mmvq() -> bool {
         std::env::var("MINFER_NO_KQ_MMVQ").map_or(false, |v| v == "1")
+    }
+
+    /// 8m: force the legacy per-type prefill kernels (A/B escape hatch).
+    fn no_prefill_gemm() -> bool {
+        std::env::var("MINFER_NO_PREFILL_GEMM").map_or(false, |v| v == "1")
     }
 
     /// 8e-reversal: decode (nt == 1) q4_K matmul via the llama.cpp MMVQ

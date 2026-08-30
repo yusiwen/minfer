@@ -3165,6 +3165,325 @@ mod tests {
         }
     }
 
+    /// 8m: the prefill f16 GEMM path (nt >= 16) for every supported quant
+    /// type — random VALID block bytes with small d/dmin, reference computed
+    /// in Rust by dequantizing those exact bytes (kernel-vs-reference parity;
+    /// quantization quality is irrelevant). Tails: od=70, nt=33 (id stays
+    /// %32==0 like every real tensor). Real 7B Q4_K check at the end, skipped
+    /// when the dump is absent so the suite stays hermetic.
+    #[test]
+    fn cuda_prefill_f16_gemm_parity() {
+        fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
+            if j < 4 {
+                (q[j] & 63, q[j + 4] & 63)
+            } else {
+                (
+                    (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                    (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+                )
+            }
+        }
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        crate::cuda::CudaState::init();
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (od, id, nt) = (70usize, 256usize, 33usize);
+        let state = cb.state;
+
+        // seeded pseudo-random source (deterministic across runs)
+        let mut seed = 0x2545F491u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let xs: Vec<f32> = (0..id * nt)
+            .map(|_| (rnd() % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
+        let xb = cb.alloc_buffer(id * nt);
+        let out = cb.alloc_buffer(od * nt);
+        cb.write_host(xb, &xs).unwrap();
+        let (xptr, optr) = (cb.ptr_of(xb).unwrap(), cb.ptr_of(out).unwrap());
+
+        // build [type → (wq bytes, dequant closure)]
+        // d values are small so the f16 scratch never overflows.
+        let mut mk =
+            |nbytes: usize| -> Vec<u8> { (0..nbytes).map(|_| (rnd() & 0xFF) as u8).collect() };
+
+        // Q8_0: d=0.01 + int8 q
+        let mut wq80 = mk(od * (id / 32) * 34);
+        for g in 0..od * (id / 32) {
+            let db = half::f16::from_f32(0.01).to_le_bytes();
+            wq80[g * 34] = db[0];
+            wq80[g * 34 + 1] = db[1];
+        }
+        // Q4_0: d=0.05 + biased nibbles (kernel does nib - 8)
+        let mut wq40 = mk(od * (id / 32) * 18);
+        for g in 0..od * (id / 32) {
+            let db = half::f16::from_f32(0.05).to_le_bytes();
+            wq40[g * 18] = db[0];
+            wq40[g * 18 + 1] = db[1];
+        }
+        // Q4_K: d=0.01, dmin=0.005, raw scales/nibbles
+        let nsp = id / 256;
+        let mut wq4k = mk(od * nsp * 144);
+        for r in 0..od {
+            for sp in 0..nsp {
+                let blk = &mut wq4k[(r * nsp + sp) * 144..(r * nsp + sp) * 144 + 144];
+                let db = half::f16::from_f32(0.01).to_le_bytes();
+                blk[0] = db[0];
+                blk[1] = db[1];
+                let mb_ = half::f16::from_f32(0.005).to_le_bytes();
+                blk[2] = mb_[0];
+                blk[3] = mb_[1];
+            }
+        }
+        // Q5_K: d=0.01, dmin=0.005 (176B blocks)
+        let mut wq5k = mk(od * nsp * 176);
+        for r in 0..od {
+            for sp in 0..nsp {
+                let blk = &mut wq5k[(r * nsp + sp) * 176..(r * nsp + sp) * 176 + 176];
+                let db = half::f16::from_f32(0.01).to_le_bytes();
+                blk[0] = db[0];
+                blk[1] = db[1];
+                let mb_ = half::f16::from_f32(0.005).to_le_bytes();
+                blk[2] = mb_[0];
+                blk[3] = mb_[1];
+            }
+        }
+        // Q6_K: raw 210B blocks, d = 0.01 at offset 208 (LAST field)
+        let mut wq6k = mk(od * nsp * 210);
+        for r in 0..od {
+            for sp in 0..nsp {
+                let blk = &mut wq6k[(r * nsp + sp) * 210..(r * nsp + sp) * 210 + 210];
+                let db = half::f16::from_f32(0.01).to_le_bytes();
+                blk[208] = db[0];
+                blk[209] = db[1];
+            }
+        }
+
+        state.register_weight("gemm_w80", &wq80);
+        state.register_weight("gemm_w40", &wq40);
+        state.register_weight("gemm_w4k", &wq4k);
+        state.register_weight("gemm_w5k", &wq5k);
+        state.register_weight_q6k_padded("gemm_w6k", &wq6k, od, id);
+
+        // ── run the GEMM path per type (nt=33 ≥ 16 hits the gate) ──
+        let cases: [(TensorType, &str, bool); 5] = [
+            (TensorType::Q8_0, "gemm_w80", false),
+            (TensorType::Q4_0, "gemm_w40", false),
+            (TensorType::Q4_K, "gemm_w4k", false),
+            (TensorType::Q5_K, "gemm_w5k", false),
+            (TensorType::Q6_K, "gemm_w6k", true),
+        ];
+        for (ttype, name, padded) in cases {
+            let wptr = state.get_weight_ptr(name).unwrap();
+            state
+                .matmul_f32_ptr_layout(wptr, ttype, xptr, optr, od, id, nt, padded)
+                .unwrap();
+            cb.synchronize();
+            let got = cb.copy_to_host(out).unwrap();
+
+            // reference: dequant the same bytes, plain f32 dot with raw xs
+            let mut want = vec![0f32; od * nt];
+            for r in 0..od {
+                for t in 0..nt {
+                    let mut acc = 0f32;
+                    match ttype {
+                        TensorType::Q8_0 => {
+                            for g in 0..id / 32 {
+                                let blk = &wq80[(r * (id / 32) + g) * 34..][..34];
+                                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                                for i in 0..32 {
+                                    acc += d * (blk[2 + i] as i8 as f32) * xs[t * id + g * 32 + i];
+                                }
+                            }
+                        }
+                        TensorType::Q4_0 => {
+                            for g in 0..id / 32 {
+                                let blk = &wq40[(r * (id / 32) + g) * 18..][..18];
+                                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                                for j in 0..16 {
+                                    let v0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                                    let v1 = (blk[2 + j] >> 4) as i32 - 8;
+                                    acc += d
+                                        * (v0 as f32 * xs[t * id + g * 32 + j]
+                                            + v1 as f32 * xs[t * id + g * 32 + j + 16]);
+                                }
+                            }
+                        }
+                        TensorType::Q4_K => {
+                            for ib in 0..nsp {
+                                let blk = &wq4k[(r * nsp + ib) * 144..][..144];
+                                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                                let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+                                let mut scb = [0u8; 12];
+                                scb.copy_from_slice(&blk[4..16]);
+                                for j in 0..4 {
+                                    let (s0, m0) = k4_scale(&scb, 2 * j);
+                                    let (s1, m1) = k4_scale(&scb, 2 * j + 1);
+                                    for l in 0..32 {
+                                        let b8 = blk[16 + j * 32 + l];
+                                        let base = ib * 256 + j * 64;
+                                        let v0 =
+                                            (b8 & 0x0F) as f32 * d * s0 as f32 - dmin * m0 as f32;
+                                        let v1 =
+                                            (b8 >> 4) as f32 * d * s1 as f32 - dmin * m1 as f32;
+                                        acc += v0 * xs[t * id + base + l];
+                                        acc += v1 * xs[t * id + base + 32 + l];
+                                    }
+                                }
+                            }
+                        }
+                        TensorType::Q5_K => {
+                            for ib in 0..nsp {
+                                let blk = &wq5k[(r * nsp + ib) * 176..][..176];
+                                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                                let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+                                let mut scb = [0u8; 12];
+                                scb.copy_from_slice(&blk[4..16]);
+                                for sub in 0..8 {
+                                    let (scb_s, mb) = k4_scale(&scb, sub);
+                                    let ci = sub >> 1;
+                                    let hi = sub & 1;
+                                    let q4 = &blk[48 + ci * 32..48 + ci * 32 + 32];
+                                    let qh = &blk[16..48]; // 256 high bits = 32 bytes
+                                    for l in 0..32 {
+                                        let nib = if hi != 0 { q4[l] >> 4 } else { q4[l] & 0x0F };
+                                        let wv = nib as f32 + 16.0 * ((qh[l] >> sub) & 1) as f32;
+                                        let v = d * scb_s as f32 * wv - dmin * mb as f32;
+                                        acc += v * xs[t * id + ib * 256 + sub * 32 + l];
+                                    }
+                                }
+                            }
+                        }
+                        TensorType::Q6_K => {
+                            for ib in 0..nsp {
+                                let blk = &wq6k[(r * nsp + ib) * 210..][..210];
+                                let d = half::f16::from_le_bytes([blk[208], blk[209]]).to_f32();
+                                for sub in 0..16 {
+                                    let n = sub / 8;
+                                    let rem = sub % 8;
+                                    let tt = rem / 2;
+                                    let gq = rem % 2;
+                                    let ql_off = n * 64 + (tt % 2) * 32 + gq * 16;
+                                    // qh field lives at blk[128..192] (64 bytes,
+                                    // 2 bits per element); qh_off is relative to it.
+                                    let qh_off = 128 + n * 32 + gq * 16;
+                                    let dsc = d * (blk[192 + n * 8 + tt * 2 + gq] as i8 as f32);
+                                    for rr in 0..16 {
+                                        let nib = if tt < 2 {
+                                            (blk[ql_off + rr] & 0x0F) as i32
+                                        } else {
+                                            (blk[ql_off + rr] >> 4) as i32
+                                        };
+                                        let q2 = ((blk[qh_off + rr] >> (tt * 2)) & 3) as i32;
+                                        let v = dsc * (((nib | (q2 << 4)) - 32) as f32);
+                                        acc += v * xs
+                                            [t * id + ib * 256 + n * 128 + tt * 32 + gq * 16 + rr];
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    want[t * od + r] = acc;
+                }
+            }
+
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            let mut worst = (0f32, 0usize);
+            for i in 0..got.len() {
+                let e = (got[i] - want[i]).abs();
+                if e > worst.0 {
+                    worst = (e, i);
+                }
+            }
+            println!(
+                "prefill f16 gemm [{name:?}]: max err {:.5} at {} (got {:.4} want {:.4}, scale {scale:.3})",
+                worst.0,
+                worst.1,
+                got[worst.1],
+                want[worst.1]
+            );
+            // f16 weight/activation rounding (~2^-11 rel per element) over a
+            // 256-length dot: well under 2% of the row scale.
+            assert!(
+                worst.0 <= scale * 2e-2,
+                "prefill gemm {name:?}: err {} > {} at {}",
+                worst.0,
+                scale * 2e-2,
+                worst.1
+            );
+        }
+
+        // ── real 7B Q4_K weight (attn_q 3584×3584) through the GEMM path ──
+        let Ok(wb) = std::fs::read("/tmp/minfer_phase7/real_blk_0_attn_q_weight.bin") else {
+            eprintln!("real q4_k dump absent — skipping the real-weight GEMM check");
+            return;
+        };
+        let (rod, rid) = (3584usize, 3584usize);
+        assert_eq!(wb.len(), rod * (rid / 256) * 144);
+        state.register_weight("gemm_realq4k", &wb);
+        let wptr = state.get_weight_ptr("gemm_realq4k").unwrap();
+        let rnt = 17usize;
+        let rxs: Vec<f32> = (0..rid * rnt)
+            .map(|i| ((i * 73) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+        let rxb = cb.alloc_buffer(rid * rnt);
+        let rout = cb.alloc_buffer(rod * rnt);
+        cb.write_host(rxb, &rxs).unwrap();
+        let (rxp, rop) = (cb.ptr_of(rxb).unwrap(), cb.ptr_of(rout).unwrap());
+        state
+            .matmul_f32_ptr_layout(wptr, TensorType::Q4_K, rxp, rop, rod, rid, rnt, false)
+            .unwrap();
+        cb.synchronize();
+        let got = cb.copy_to_host(rout).unwrap();
+        let mut worst = (0f32, 0usize);
+        let mut scale = 1e-9f32;
+        for t in 0..rnt {
+            for r in 0..rod {
+                let mut acc = 0f32;
+                for ib in 0..rid / 256 {
+                    let blk = &wb[(r * (rid / 256) + ib) * 144..][..144];
+                    let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                    let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+                    let mut scb = [0u8; 12];
+                    scb.copy_from_slice(&blk[4..16]);
+                    for j in 0..4 {
+                        let (s0, m0) = k4_scale(&scb, 2 * j);
+                        let (s1, m1) = k4_scale(&scb, 2 * j + 1);
+                        for l in 0..32 {
+                            let b8 = blk[16 + j * 32 + l];
+                            let base = ib * 256 + j * 64;
+                            let v0 = (b8 & 0x0F) as f32 * d * s0 as f32 - dmin * m0 as f32;
+                            let v1 = (b8 >> 4) as f32 * d * s1 as f32 - dmin * m1 as f32;
+                            acc += v0 * rxs[t * rid + base + l];
+                            acc += v1 * rxs[t * rid + base + 32 + l];
+                        }
+                    }
+                }
+                scale = scale.max(acc.abs());
+                let e = (got[t * rod + r] - acc).abs();
+                if e > worst.0 {
+                    worst = (e, t * rod + r);
+                }
+            }
+        }
+        println!(
+            "real 7B q4_k f16 gemm: max err {:.4} at {} (scale {scale:.3})",
+            worst.0, worst.1
+        );
+        assert!(
+            worst.0 <= scale * 2e-2,
+            "real q4_k f16 gemm err {}",
+            worst.0
+        );
+    }
+
     // 8d: split-K decode attention parity (nt == 1 routes to the split path).
     // nkv = 3 exercises EMPTY splits (positions[0] = 2 → splits 3..7 have no
     // rows); nkv = 37 exercises a partial last split with SPLITS = 8. Both KV
@@ -3642,6 +3961,9 @@ mod tests {
     /// launches for every step (llama.cpp's core replay guarantee).
     #[test]
     fn cuda_graph_replay_bit_parity() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -3675,6 +3997,9 @@ mod tests {
     /// captured without validation.
     #[test]
     fn cuda_prefill_shaped_graph_never_captures() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -3730,6 +4055,9 @@ mod tests {
     /// supported but 7d's parity only covered single-split graphs).
     #[test]
     fn cuda_multisplit_capture_bit_parity() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -3784,6 +4112,9 @@ mod tests {
     /// (the ~437-node real-prefill scale). Default remains OFF (8g① test).
     #[test]
     fn cuda_prefill_capture_bit_parity_pp16_pp300() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -3852,6 +4183,9 @@ mod tests {
     /// no supported model can fail a node mid-capture today.
     #[test]
     fn cuda_capture_abort_on_error() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -3899,6 +4233,9 @@ mod tests {
     /// (conservative: pointers may differ) and re-capture on a later run.
     #[test]
     fn cuda_graph_recaptures_on_pool_gen_change() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         if device().is_none() {
             eprintln!("skipping: no CUDA device");
             return;
