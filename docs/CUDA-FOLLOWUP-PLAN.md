@@ -320,6 +320,53 @@ worth it today: capture is ms-scale, recapture is rare (pool_gen is stable
 across decode steps), and llama.cpp does not use it either. Revisit only if
 recapture shows up in a profile.
 
+## 8l. llama.cpp CUDA parity benchmark — DONE 2026-08-30 (`acca28f`)
+
+Cross-benchmark vs llama.cpp `ca3d5a3e1 (10665)`, same GGUF files, GB10,
+`-ngl 99 -t 8`, llama-bench `-r 3` (FA 0/1 matrix) + llama-cli cross-check;
+minfer side 3 reps `--greedy`. Raw logs: `/tmp/minfer_llamacpp_cmp/`.
+
+**Found + fixed the Q5_K registration gap first**: the CUDA whitelist in
+`models/qwen2/loader.rs` (added 7c) was missing `TensorType::Q5_K` (Metal's
+list had it). Every Q5_K matmul silently ran on CPU with per-token
+GPU↔CPU copies — 0.5B q5_k_m decoded at 51.6 tok/s with the
+`CUDA GATE: ... not registered on CUDA` spam, and the 8e② q5_K decode MMVQ
+was unreachable on real models. One-line fix → 246.3 tok/s (4.8×).
+
+Decode (tok/s, llama-bench tg128 / minfer -n 256; short context):
+
+| model | llama fa0 | llama fa1 | minfer | gap (fa1) |
+|---|---:|---:|---:|---:|
+| 0.5B q4_0   | 417.6 | 453.5 | 258.0 | 1.76× |
+| 0.5B q5_k_m | 311.0 | 394.6 | 246.3 | 1.60× |
+| 0.6B q8_0   | 273.8 | 290.3 | 197.8 | 1.47× |
+| 7B q4_k_m   | 46.4  | 47.1  | 41.2  | 1.15× |
+
+7B @2K context: llama.cpp 44.9 (llama-cli) / ~45.1 (bench `-pg 2048,128`
+derived) vs minfer 31.3 → 1.43×. Depth penalty llama −5% vs minfer −24% —
+the attention/KV path loses ~3 ms/token at 2K.
+
+Prefill (tok/s): llama.cpp pp (MMQ / dequant-GEMM, weights streamed once)
+vs minfer **110× (7B q4_k_m: 3401 vs 30.7)**, 69× (0.6B q8_0), ~18–30×
+(0.5B). Root cause: minfer's quantized prefill reuses the decode-shaped
+kernels with `grid.y = nt` — every token block re-streams the full weight
+matrix (7B: ≈4.4 GB × 1920 tok ÷ 62 s ≈ 135 GB/s effective, pure redundant
+traffic). The 8c Q8_0-activation GEMM only covers q4_0/q8_0 shapes ≤ 8192
+and is itself far from MMQ.
+
+Attribution of the decode gap: at 7B both engines are bandwidth-limited
+(llama ≈221 GB/s ≈ 81% of the 273 GB/s peak, minfer ≈193 GB/s ≈ 71%); the
+residual 15% + the small-model 1.5–1.8× are per-token overhead (graph
+replay is worth +24% on 0.5B: 208 → 258 with `MINFER_NO_CUDA_GRAPH=1`,
+launch/sync/sampler CPU time) plus llama.cpp's FA-style single-pass decode
+attention vs minfer's multi-pass scores kernel.
+
+Follow-up candidates (ranked by measured impact): ① prefill MMQ-style
+tiled int8 GEMM (or dequant→f16 tensor-core GEMM) — closes the 18–110×
+prefill gap; ② FA-style decode attention (single KV pass, online softmax)
+— the @2K gap and part of the small-model gap; ③ per-token CPU overhead
+audit on small models (sampler + sync path).
+
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,
