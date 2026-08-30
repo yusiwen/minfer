@@ -181,6 +181,74 @@ is withdrawn — the correct statement is: the f32-activation streaming kernel
 structure was the bottleneck; q8+dp4a MMVQ reaches ~200 GB/s of the 252.7
 GB/s probe ceiling at the 7B shapes.
 
+## 8e②. q6_K / q5_K decode MMVQ — **DONE 2026-08-30 (`1298cb2`, `1d28235`)**
+
+The 8e follow-up candidate, ported to both remaining K-quant types with the
+same llama.cpp GB10 structure (one row per 256-thread block, sub-block units
+round-robin, `__dp4a` over `quantize_q8_0_pad40` activations, 8-warp block
+reduce via the shared `mmvq_block_reduce` helper — the q4_K kernel keeps its
+inlined copy):
+
+- `q6_k_q8_mmvq` — 16-element units (16 **signed** scales per super-block,
+  no min term), `vi = __vsubss4(nib|hi2, 32)` for the −32 bias; weight side
+  reads 2-byte halves because the 210 B raw / 224 B padded strides are not
+  4-aligned (llama.cpp `get_int_b2` approach); `blk_stride` follows the
+  weight registration (loader weights are padded-224, runtime truth).
+- `q5_k_q8_mmvq` — q4_K shape plus the q5 high-bit plane: **one qh word per
+  nibble word** (`blk + 16 + 4*v`, bit = sub-block index); 176 B stride is
+  16-byte aligned so uint32 loads work.
+- Dispatch: decode (nt == 1) arms in `matmul_f32_ptr_layout`, shape-gated
+  (see below). Prefill and sub-gate shapes keep the f32 kernels.
+
+**Bugs found by the one-hot probe debugger (`dbg56.cu`: x = e_k ⇒ out must
+equal w[k], since a one-hot quantizes to exactly 1.0):**
+1. q5_K first draft hoisted `qh32` out of the nibble-word loop — elements
+   ≥ 4 read qh bytes 16..19 regardless of v (k=40 decoded hibit from
+   qh[16] instead of qh[24]; 109/256 one-hot mismatches, and repeated got
+   values across different k). Fixed: per-word qh load.
+2. q6_K kernel was CORRECT — the failing q6 parity test had its generator
+   writing `d` at block offset 0 instead of 208 (`block_q6_K` field order
+   is ql[128], qh[64], scales[16], d). The one-hot probe passed on random
+   bytes because ref and kernel read the same garbage; the structured test
+   (meaningful d) exploded. Fixed the test, not the kernel.
+
+**Shape gate (`1d28235`) — the dispatch crossover is work-size dependent.**
+A CUDA-events micro-bench (padded f32 kernel vs MMVQ, 200 reps/shape) shows
+the 2-byte weight loads only win once latency is hidden:
+
+| shape | f32 padded | mmvq | ratio |
+|---|---|---|---|
+| 7B attn_v (od 512 × id 3584) | 8.2 µs | 37.7 µs | **4.6× slower** |
+| 0.5B ffn_down (896 × 4864) | 13.0 µs | 38.8 µs | **3.0× slower** |
+| od 2048 × id 4864 | 26.8 µs | 44.5 µs | 1.66× slower |
+| od 3584 × id 8192 | 95.1 µs | 87.7 µs | 0.92× |
+| 7B ffn_down (3584 × 18944) | 507 µs | 333 µs | **0.65× (1.5× faster)** |
+| 7B lm_head (152064 × 3584) | 3124 µs | 2200 µs | **0.70× (1.4× faster)** |
+
+Gate: `nt == 1 && od*id >= 24_000_000` (+ `id % 32 == 0` for q6_K); below it
+the f32 kernels keep their coalesced-loop win (the earlier `id >= 2048`-only
+gate put 7B attn_v and 0.5B ffn_down on the losing side). `MINFER_NO_KQ_MMVQ=1`
+forces f32 for A/B. A debugging detour worth recording: 0.5B wall-clock A/B
+under a co-resident sglang server (96% GPU util) swung 15–52 tok/s for the
+SAME binary — only the per-kernel event timing and the 7B interleaved A/B
+were trustworthy.
+
+**Gates:** synthetic parity (full 6-bit / full 0..255 scale-byte coverage,
+partial tail super-block id=2176; q5 exercises `get_scale_min_k4` splicing)
+via direct decode calls — small shapes intentionally bypass the gate; REAL
+weights bit-exact 0.0000 — 7B ffn_down full shape (3584×18944) **through the
+graph dispatch** (gate wiring), 7B attn_v + 0.5B ffn_down by direct calls;
+7B q4_k_m E2E @2K greedy text identical to base, decode 28.8 → 31.1 tok/s
+median (interleaved A/B ×3; on top of 8e's 23.4 → 32.0); Qwen3-0.6B Q8_0 and
+0.5B q4_0 bit-identical perf (199.7 / 260.1 tok/s both binaries); cuda suite
+158/0. No local model carries Q5_K tensors (the "q5_k_m"-branded 0.5B GGUF
+stores Q5_1/Q8_0/Q6_K — confirmed by dump), so q5_K parity rests on the
+synthetic plus the shared kernel structure.
+
+Follow-up candidate (not started): llama.cpp's shape-dependent `halve_iters`
+(idle-tail rule: double warps when `idle*8 <= iters_wide*2`) — the in-tree
+kernels use the fixed 256-thread/1-row layout only.
+
 ## 8f. Q5_K kernels — **DONE 2026-08-29 (`b959ec9`, Q5_K + Q5_1)**
 
 The all-or-nothing gate needs a kernel for EVERY matmul weight type; the
