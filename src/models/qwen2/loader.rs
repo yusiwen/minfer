@@ -437,12 +437,58 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
 
     println!("Loaded: {} layers", n_layer);
 
-    Some(super::Qwen2Model {
+    let model = super::Qwen2Model {
         hparams,
         tok_embd: Some(tok_embd),
         output_norm,
         output: Some(output),
         output_b,
         layers,
-    })
+    };
+
+    // 8p: warm the persistent per-weight f16 dequant cache at load (one
+    // dequant per matmul weight, outside the first prefill's timing).
+    // Only for models big enough to amortize the +2 B/element resident
+    // copy: small fixtures keep the exact pre-8p memory footprint.
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = crate::cuda::CudaState::get() {
+        let warm: Vec<(&Option<crate::tensor::Tensor>, String)> = model
+            .layers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                [
+                    (&l.wq, tn::attn_q(i)),
+                    (&l.wk, tn::attn_k(i)),
+                    (&l.wv, tn::attn_v(i)),
+                    (&l.wo, tn::attn_out(i)),
+                    (&l.ffn_gate, tn::ffn_gate(i)),
+                    (&l.ffn_up, tn::ffn_up(i)),
+                    (&l.ffn_down, tn::ffn_down(i)),
+                ]
+            })
+            .collect();
+        let warm_bytes: usize = warm
+            .iter()
+            .filter_map(|(t, _)| t.as_ref())
+            .map(|t| t.data.len())
+            .sum();
+        let warmable = warm_bytes >= crate::cuda::W16_ENABLE_BYTES;
+        if warmable {
+            cuda.enable_w16_cache();
+        }
+        for (t, name) in &warm {
+            if warmable {
+                if let Some(t) = t {
+                    cuda.warm_w16(name, t);
+                }
+            }
+        }
+        if warmable {
+            if let Some(out) = &model.output {
+                cuda.warm_w16(tn::OUTPUT, out);
+            }
+        }
+    }
+    Some(model)
 }

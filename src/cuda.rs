@@ -291,6 +291,21 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
     );
+    // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
+    // in-register (no f16 weight scratch round trip). type_id mapping as in
+    // launch_dequant_f16; q6_stride = 210 raw / 224 padded (only Q6_K reads
+    // it). Requires id % 256 == 0 (host gate).
+    fn launch_gemm_qb_nt(
+        a: *const std::ffi::c_void,
+        w: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        type_id: i32,
+        q6_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
     // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
     // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
     fn launch_fa_prefill_f16kv(
@@ -497,12 +512,32 @@ impl Drop for PinnedPool {
 unsafe impl Send for PinnedPool {}
 unsafe impl Sync for PinnedPool {}
 
+/// 8p: warm the f16 weight cache only for models whose quantized matmul
+/// weights total at least this much (7B q4_k_m = 4.4 GB warms; the 0.5-1.5B
+/// test fixtures do not, keeping their footprint at pre-8p levels).
+pub const W16_ENABLE_BYTES: usize = 2 << 30;
+
 pub struct CudaState {
     stream: Mutex<CudaPtr>,
     /// Lazy pinned staging ring (7e⑥); None until the first async fill,
     /// and stays None if cudaHostAlloc fails (sync fallback).
     staging: Mutex<Option<PinnedPool>>,
     weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
+    /// 8p: persistent per-weight f16 dequant cache, keyed by the device
+    /// weight pointer → (f16 copy, bytes). The two-pass prefill GEMM used
+    /// to dequantize W on EVERY call (288 ms per 7B @2K forward); weights
+    /// are immutable after registration (register_weight reuses the same
+    /// device copy for same name+size and never frees on replace), so a
+    /// wptr key is stable and the dequant runs once per weight per process.
+    /// Adds 2 B/element (~8.6 GB on 7B q4_k_m) — MINFER_NO_W16CACHE=1
+    /// reverts to the per-call scratch.
+    w16_cache: Mutex<HashMap<usize, (CudaPtr, usize)>>,
+    /// 8p: the f16 cache is enabled only for models whose quantized matmul
+    /// weights total >= W16_ENABLE_BYTES (set by the loader's warm pass).
+    /// Small models keep the per-call scratch: the test suite keeps several
+    /// loaded models resident on a shared overcommitted CUDA pool and a
+    /// +1-2 GB cache per loaded model tipped it over (probability OOMs).
+    w16_enabled: std::sync::atomic::AtomicBool,
     /// Names registered through `register_weight_q6k_padded` (device layout
     /// is 224-byte-padded Q6_K, not the raw GGUF byte stream) → the
     /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
@@ -793,6 +828,8 @@ impl CudaState {
             stream: Mutex::new(CudaPtr(stream)),
             staging: Mutex::new(None),
             weights: Mutex::new(HashMap::new()),
+            w16_cache: Mutex::new(HashMap::new()),
+            w16_enabled: std::sync::atomic::AtomicBool::new(false),
             padded_weights: Mutex::new(HashMap::new()),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
@@ -1654,6 +1691,125 @@ impl CudaState {
         nt: usize,
         padded_q6k: bool,
     ) -> Result<(), String> {
+        // 8p: default is the cp.async f16 GEMM over a PERSISTENT per-weight
+        // f16 copy (dequant runs once per weight per process — the per-call
+        // 288 ms dequant is gone). MINFER_FUSED_B=1 opts into the
+        // dequant-in-GEMM kernel instead (memory-lean: no f16 weight cache,
+        // but re-dequantizes every B tile per nt sweep — slower on large
+        // nt). Both require id % 256 == 0 for alignment/coverage.
+        let fused = id % 256 == 0 && Self::fused_b_on();
+        self.prefill_gemm_f16_inner(wptr, ttype, x, out, od, id, nt, padded_q6k, fused)
+    }
+
+    /// 8p: opt the process into the f16 weight cache (loader-side, for
+    /// models big enough to amortize it — see W16_ENABLE_BYTES).
+    pub fn enable_w16_cache(&self) {
+        self.w16_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 8p: warm the persistent f16 cache for one registered matmul weight
+    /// at LOAD time (the loader has the tensor metadata; the lazy path
+    /// would otherwise put ~8.6 GB of cudaMalloc + the full dequant inside
+    /// the first — timed — prefill). No-op for non-quant types and for
+    /// rows not covered by the fused-GEMM alignment gate.
+    pub fn warm_w16(&self, name: &str, t: &crate::tensor::Tensor) -> bool {
+        let type_id = match t.ttype {
+            TensorType::Q8_0 => 0,
+            TensorType::Q4_0 => 1,
+            TensorType::Q4_1 => 2,
+            TensorType::Q5_0 => 3,
+            TensorType::Q5_1 => 4,
+            TensorType::Q4_K => 5,
+            TensorType::Q5_K => 6,
+            TensorType::Q6_K => 7,
+            _ => return false,
+        };
+        // GGUF convention: metadata [in, out] → od = shape[1], id = shape[0].
+        let od = t.shape[1] as usize;
+        let id = t.shape[0] as usize;
+        if od == 0 || id == 0 || id % 256 != 0 {
+            return false;
+        }
+        let padded_q6k =
+            t.ttype == TensorType::Q6_K && self.padded_weights.lock().unwrap().contains_key(name);
+        let block_stride = if padded_q6k { 224 } else { 210 };
+        let Some(wptr) = self.get_weight_ptr(name) else {
+            return false;
+        };
+        self.w16_get(wptr, type_id, od, id, block_stride).is_some()
+    }
+
+    /// Persistent f16 copy of a registered quantized weight (8p). Returns
+    /// None when the allocation fails (caller falls back to the per-call
+    /// scratch) or when MINFER_NO_W16CACHE=1.
+    fn w16_get(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        type_id: i32,
+        od: usize,
+        id: usize,
+        block_stride: i32,
+    ) -> Option<*mut std::ffi::c_void> {
+        if Self::no_w16cache() || !self.w16_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let bytes = od * id * 2;
+        if let Some((p, sz)) = self.w16_cache.lock().unwrap().get(&(wptr as usize)) {
+            if *sz == bytes {
+                return Some(p.0);
+            }
+        }
+        // Memory-pressure valve: the cache doubles the resident weight
+        // footprint; skip it (caller falls back to the per-call scratch =
+        // pre-8p behavior) unless free memory comfortably covers the copy —
+        // the test suite keeps several loaded models resident (registry
+        // entries are never freed), and +1 GB caches per model exhausted the
+        // ~23 GB free pool and broke later models' weight uploads.
+        {
+            let (mut free_mem, mut total_mem) = (0usize, 0usize);
+            let rc = unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem) };
+            if rc == 0 && free_mem < 2 * bytes + (4usize << 30) {
+                return None;
+            }
+        }
+        let ptr = Self::cuda_malloc(bytes);
+        if ptr.is_null() {
+            eprintln!("CUDA: w16 cache OOM allocating {bytes} bytes");
+            return None;
+        }
+        unsafe {
+            launch_dequant_f16(
+                type_id,
+                wptr as *const u8,
+                ptr,
+                od as i32,
+                id as i32,
+                block_stride,
+                self.stream(),
+            );
+        }
+        self.w16_cache
+            .lock()
+            .unwrap()
+            .insert(wptr as usize, (CudaPtr(ptr), bytes));
+        Some(ptr)
+    }
+
+    /// Prefill GEMM with an explicit fused/legacy switch (test entry point
+    /// for the bit-parity check between the two paths).
+    pub(crate) fn prefill_gemm_f16_inner(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        ttype: TensorType,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        padded_q6k: bool,
+        fused: bool,
+    ) -> Result<(), String> {
         let stream = self.stream();
         let type_id = match ttype {
             TensorType::Q8_0 => 0,
@@ -1673,18 +1829,47 @@ impl CudaState {
         } else {
             210
         };
-        let w16 = Self::get_or_grow(&self.buf_f16_w, od * id * 2);
+        if fused {
+            // 8p: A converts to f16 once (the convert pass stays); the B
+            // side dequantizes raw quantized bytes inside the GEMM — no
+            // buf_f16_w round trip, no launch_dequant_f16.
+            let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
+            unsafe {
+                launch_convert_f16(x as *const f32, x16, (nt * id) as i64, stream);
+                launch_gemm_qb_nt(
+                    x16,
+                    wptr as *const u8,
+                    out as *mut f32,
+                    nt as i32,
+                    od as i32,
+                    id as i32,
+                    type_id,
+                    block_stride,
+                    stream,
+                );
+            }
+            return Ok(());
+        }
         let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
+        let w16 = match self.w16_get(wptr, type_id, od, id, block_stride) {
+            Some(p) => p, // persistent copy, dequant already done
+            None => {
+                let w16 = Self::get_or_grow(&self.buf_f16_w, od * id * 2);
+                unsafe {
+                    launch_dequant_f16(
+                        type_id,
+                        wptr as *const u8,
+                        w16,
+                        od as i32,
+                        id as i32,
+                        block_stride,
+                        stream,
+                    );
+                }
+                w16
+            }
+        };
         unsafe {
-            launch_dequant_f16(
-                type_id,
-                wptr as *const u8,
-                w16,
-                od as i32,
-                id as i32,
-                block_stride,
-                stream,
-            );
             launch_convert_f16(x as *const f32, x16, (nt * id) as i64, stream);
             launch_gemm_f16(
                 x16,
@@ -2117,6 +2302,16 @@ impl CudaState {
     }
 
     /// 8m: force the legacy per-type prefill kernels (A/B escape hatch).
+    // 8p: opt-in dequant-in-GEMM (memory-lean alternative to the f16 cache).
+    fn fused_b_on() -> bool {
+        std::env::var("MINFER_FUSED_B").map_or(false, |v| v == "1")
+    }
+
+    // 8p: disable the persistent per-weight f16 dequant cache.
+    fn no_w16cache() -> bool {
+        std::env::var("MINFER_NO_W16CACHE").map_or(false, |v| v == "1")
+    }
+
     fn no_prefill_gemm() -> bool {
         std::env::var("MINFER_NO_PREFILL_GEMM").map_or(false, |v| v == "1")
     }

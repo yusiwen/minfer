@@ -3030,6 +3030,125 @@ mod tests {
     // kernel reads the same f16 cache; its q and probs carry f16 rounding,
     // measured ~1.4e-4 on the standalone harness, so 5e-3 leaves headroom.
     #[test]
+    #[test]
+    fn cuda_prefill_fused_b_bitparity() {
+        // 8p: the fused dequant-in-GEMM path must be BIT-identical to the
+        // legacy dequant-to-f16 two-pass path (same __float2half rounding,
+        // same wmma accumulate). All 8 types x {1, 2} super-blocks; the
+        // legacy path is reference-validated by cuda_prefill_f16_gemm_parity.
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        crate::cuda::CudaState::init();
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let state = cb.state;
+        let mut seed = 0x9E3779B9u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for (od, id, nt) in [(70usize, 256usize, 33usize), (70usize, 512usize, 70usize)] {
+            let nsp = id / 256;
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|_| (rnd() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut mk =
+                |nbytes: usize| -> Vec<u8> { (0..nbytes).map(|_| (rnd() & 0xFF) as u8).collect() };
+            let xb = cb.alloc_buffer(id * nt);
+            let out = cb.alloc_buffer(od * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let (xptr, optr) = (cb.ptr_of(xb).unwrap(), cb.ptr_of(out).unwrap());
+            let dbytes = |v: f32| half::f16::from_f32(v).to_le_bytes();
+
+            // benign d (and m for the min-carrying types) per block
+            let mut wq80 = mk(od * (id / 32) * 34);
+            let mut wq40 = mk(od * (id / 32) * 18);
+            let mut wq41 = mk(od * (id / 32) * 20);
+            let mut wq50 = mk(od * (id / 32) * 22);
+            let mut wq51 = mk(od * (id / 32) * 24);
+            for g in 0..od * (id / 32) {
+                let set = |w: &mut [u8], base: usize, off: usize, v: f32| {
+                    let db = dbytes(v);
+                    w[base + off] = db[0];
+                    w[base + off + 1] = db[1];
+                };
+                let b32 = g * 34;
+                set(&mut wq80, b32, 0, 0.01);
+                let b18 = g * 18;
+                set(&mut wq40, b18, 0, 0.05);
+                let b20 = g * 20;
+                set(&mut wq41, b20, 0, 0.05);
+                set(&mut wq41, b20, 2, 0.1);
+                let b22 = g * 22;
+                set(&mut wq50, b22, 0, 0.05);
+                let b24 = g * 24;
+                set(&mut wq51, b24, 0, 0.05);
+                set(&mut wq51, b24, 2, 0.1);
+            }
+            let mut wq4k = mk(od * nsp * 144);
+            let mut wq5k = mk(od * nsp * 176);
+            let mut wq6k = mk(od * nsp * 210);
+            for r in 0..od {
+                for sp in 0..nsp {
+                    let base4 = (r * nsp + sp) * 144;
+                    wq4k[base4..base4 + 2].copy_from_slice(&dbytes(0.01));
+                    wq4k[base4 + 2..base4 + 4].copy_from_slice(&dbytes(0.005));
+                    let base5 = (r * nsp + sp) * 176;
+                    wq5k[base5..base5 + 2].copy_from_slice(&dbytes(0.01));
+                    wq5k[base5 + 2..base5 + 4].copy_from_slice(&dbytes(0.005));
+                    let base6 = (r * nsp + sp) * 210;
+                    wq6k[base6 + 208..base6 + 210].copy_from_slice(&dbytes(0.01));
+                }
+            }
+
+            state.register_weight("bp_w80", &wq80);
+            state.register_weight("bp_w40", &wq40);
+            state.register_weight("bp_w41", &wq41);
+            state.register_weight("bp_w50", &wq50);
+            state.register_weight("bp_w51", &wq51);
+            state.register_weight("bp_w4k", &wq4k);
+            state.register_weight("bp_w5k", &wq5k);
+            state.register_weight("bp_w6k_raw", &wq6k);
+            state.register_weight_q6k_padded("bp_w6k_pad", &wq6k, od, id);
+
+            let cases: [(TensorType, &str, bool); 9] = [
+                (TensorType::Q8_0, "bp_w80", false),
+                (TensorType::Q4_0, "bp_w40", false),
+                (TensorType::Q4_1, "bp_w41", false),
+                (TensorType::Q5_0, "bp_w50", false),
+                (TensorType::Q5_1, "bp_w51", false),
+                (TensorType::Q4_K, "bp_w4k", false),
+                (TensorType::Q5_K, "bp_w5k", false),
+                (TensorType::Q6_K, "bp_w6k_raw", false),
+                (TensorType::Q6_K, "bp_w6k_pad", true),
+            ];
+            for (ttype, name, padded) in cases {
+                let wptr = state.get_weight_ptr(name).unwrap();
+                state
+                    .prefill_gemm_f16_inner(wptr, ttype, xptr, optr, od, id, nt, padded, true)
+                    .unwrap();
+                cb.synchronize();
+                let gotf = cb.copy_to_host(out).unwrap();
+                state
+                    .prefill_gemm_f16_inner(wptr, ttype, xptr, optr, od, id, nt, padded, false)
+                    .unwrap();
+                cb.synchronize();
+                let gotl = cb.copy_to_host(out).unwrap();
+                assert_eq!(gotf.len(), gotl.len(), "{name} len");
+                for (i, (a, b)) in gotf.iter().zip(gotl.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{name} od={od} id={id} fused vs legacy bit mismatch at [{i}] ({a} vs {b})"
+                    );
+                }
+            }
+        }
+    }
+
     fn cuda_fa_prefill_attention_parity() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
