@@ -1890,9 +1890,11 @@ mod tests {
     /// 8e follow-up: decode (nt == 1) Q6_K dispatches to the MMVQ structure
     /// kernel (16-element units over q8 activations). The synthetic block
     /// covers a partial tail super-block (id = 2176 = 8×256 + 128) and full
-    /// 6-bit scale/nibble ranges; the padded 224B registration (runtime
-    /// truth) goes through the graph dispatch, the raw 210B stride is
-    /// exercised via a direct `matmul_f32_ptr_layout(padded = false)` call.
+    /// 6-bit scale/nibble ranges; both strides go through direct
+    /// `q6_k_decode_mmvq` calls — the synthetic shape (od=64) is far below
+    /// the measured od*id >= 24M dispatch gate on purpose (small shapes
+    /// stay on the f32 kernel at runtime), and gate coverage comes from the
+    /// full-size 7B ffn_down real-weight section below.
     #[test]
     fn cuda_q6k_decode_mmvq_parity() {
         let Some(mut cb) = pool() else {
@@ -1993,7 +1995,7 @@ mod tests {
         }
         let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
 
-        // ── padded 224B registration through the graph dispatch (runtime) ──
+        // ── padded 224B registration, direct decode call (gate bypassed) ──
         let mut w6t = Tensor::from_data(
             TensorType::Q6_K,
             &[id_ as i64, od as i64, 1, 1],
@@ -2001,15 +2003,18 @@ mod tests {
         );
         w6t.name = "mw6kp".to_string();
         cb.state.register_weight_q6k_padded("mw6kp", &w6b, od, id_);
-        let mut b = GraphBuilder::new();
-        let x = b.input("x", [id_, nt, 1, 1], DType::F32);
-        let m = b.matmul(x, &w6t, None);
-        b.output(m);
-        let g = b.build();
         let xb = cb.alloc_buffer(id_ * nt);
         cb.write_host(xb, &xs).unwrap();
         let ob = cb.alloc_buffer(od * nt);
-        cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+        cb.state.q6_k_decode_mmvq(
+            cb.state.get_weight_ptr("mw6kp").unwrap(),
+            cb.ptr_of(xb).unwrap(),
+            cb.ptr_of(ob).unwrap(),
+            od,
+            id_,
+            nt,
+            true,
+        );
         let got = cb.copy_to_host(ob).unwrap();
         let mut worst = (0f32, 0usize);
         for i in 0..od * nt {
@@ -2026,7 +2031,7 @@ mod tests {
             worst.1
         );
 
-        // ── raw 210B stride via a direct padded=false dispatch ──
+        // ── raw 210B stride via a direct decode call (gate bypassed) ──
         let mut w6tr = Tensor::from_data(
             TensorType::Q6_K,
             &[id_ as i64, od as i64, 1, 1],
@@ -2035,18 +2040,15 @@ mod tests {
         w6tr.name = "mw6kr".to_string();
         cb.state.register_weight("mw6kr", &w6b);
         let obr = cb.alloc_buffer(od * nt);
-        cb.state
-            .matmul_f32_ptr_layout(
-                cb.state.get_weight_ptr("mw6kr").unwrap(),
-                TensorType::Q6_K,
-                cb.ptr_of(xb).unwrap(),
-                cb.ptr_of(obr).unwrap(),
-                od,
-                id_,
-                nt,
-                false,
-            )
-            .unwrap();
+        cb.state.q6_k_decode_mmvq(
+            cb.state.get_weight_ptr("mw6kr").unwrap(),
+            cb.ptr_of(xb).unwrap(),
+            cb.ptr_of(obr).unwrap(),
+            od,
+            id_,
+            nt,
+            false,
+        );
         let gotr = cb.copy_to_host(obr).unwrap();
         for i in 0..od * nt {
             assert!(
@@ -2055,15 +2057,19 @@ mod tests {
             );
         }
         // ── real weights (Q6_K tensors of the decode path) ──
-        // 7B blk.0.attn_v (q4_k_m) and 0.5B blk.0.ffn_down (q5_k_m) dumped
-        // via the ignored helpers; skipped when a file is absent so the
-        // suite stays hermetic. The padded registration repacks the raw
-        // 210B bytes, matching the runtime loader path exactly.
-        let real_shapes = [
-            ("real_blk_0_attn_v_weight.bin", 3584usize, 512usize),
-            ("real05_blk_0_ffn_down_weight.bin", 4864usize, 896usize),
+        // 7B blk.0.ffn_down (q4_k_m, od=3584 x id=18944 — the shape that
+        // passes the od*id >= 24M dispatch gate, so this also covers the
+        // graph-dispatch wiring), 7B blk.0.attn_v and 0.5B blk.0.ffn_down
+        // (both BELOW the gate — direct calls, since runtime keeps those
+        // on the f32 kernel). Dumped via the ignored helpers; skipped when
+        // a file is absent so the suite stays hermetic. The padded
+        // registration repacks the raw 210B bytes, matching the loader.
+        let real_shapes: [(&str, usize, usize, bool); 3] = [
+            ("real_blk_0_ffn_down_weight.bin", 18944, 3584, true),
+            ("real_blk_0_attn_v_weight.bin", 3584, 512, false),
+            ("real05_blk_0_ffn_down_weight.bin", 4864, 896, false),
         ];
-        for (file, id2, od2) in real_shapes {
+        for (file, id2, od2, via_graph) in real_shapes {
             let Ok(wb) = std::fs::read(format!("/tmp/minfer_phase7/{file}")) else {
                 println!("real q6_k [{file}]: absent — skipped");
                 break;
@@ -2115,7 +2121,22 @@ mod tests {
             let xb2 = cb.alloc_buffer(id2);
             cb.write_host(xb2, &xs2).unwrap();
             let ob2 = cb.alloc_buffer(od2);
-            cb.execute_node(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
+            if via_graph {
+                // shape above the od*id gate — dispatch selects the MMVQ
+                cb.execute_node(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
+            } else {
+                // below the gate — runtime dispatch would keep the f32
+                // kernel; call the decode path directly for kernel parity
+                cb.state.q6_k_decode_mmvq(
+                    cb.state.get_weight_ptr("realq6k").unwrap(),
+                    cb.ptr_of(xb2).unwrap(),
+                    cb.ptr_of(ob2).unwrap(),
+                    od2,
+                    id2,
+                    1,
+                    true,
+                );
+            }
             let got2 = cb.copy_to_host(ob2).unwrap();
 
             let mut want2 = vec![0f32; od2];
@@ -2282,15 +2303,22 @@ mod tests {
         );
         w5t.name = "mw5k".to_string();
         cb.state.register_weight("mw5k", &w5b);
-        let mut b = GraphBuilder::new();
-        let x = b.input("x", [id_, nt, 1, 1], DType::F32);
-        let m = b.matmul(x, &w5t, None);
-        b.output(m);
-        let g = b.build();
+        // direct decode call: the synthetic shape (od=128) is far below the
+        // measured od*id >= 24M dispatch gate (small shapes stay on the f32
+        // kernel at runtime); no local model carries Q5_K tensors, so the
+        // gate wiring for q5_K is covered by this kernel parity + the shared
+        // dispatch code path with q6_K.
         let xb = cb.alloc_buffer(id_ * nt);
         cb.write_host(xb, &xs).unwrap();
         let ob = cb.alloc_buffer(od * nt);
-        cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+        cb.state.q5_k_decode_mmvq(
+            cb.state.get_weight_ptr("mw5k").unwrap(),
+            cb.ptr_of(xb).unwrap(),
+            cb.ptr_of(ob).unwrap(),
+            od,
+            id_,
+            nt,
+        );
         let got = cb.copy_to_host(ob).unwrap();
         for i in 0..od * nt {
             assert!(

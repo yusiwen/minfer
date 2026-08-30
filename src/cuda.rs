@@ -1481,7 +1481,13 @@ impl CudaState {
                 }
                 // 8e follow-up: decode (nt == 1) joins the MMVQ structure
                 // (dp4a over q8 activations, one row per 256-thread block).
-                if nt == 1 && id >= 2048 {
+                // Shape gate measured on-device (dbg micro-bench, padded f32
+                // vs mmvq): od*id < ~24M elements loses (od 512 → 4.5x
+                // slower, 896 → 3.0x, 2048x4864 → 1.66x) because 1-2 units
+                // per thread expose the uncoalesced q5/q6 byte loads; large
+                // shapes win (7B ffn_down 3584x18944 → 1.5x faster, lm_head
+                // 152064x3584 → 1.4x). MINFER_NO_KQ_MMVQ=1 forces f32.
+                if nt == 1 && od * id >= 24_000_000 && !Self::no_kq_mmvq() {
                     self.q5_k_decode_mmvq(wptr, x, out, od, id, nt);
                     Ok(())
                 } else {
@@ -1492,7 +1498,10 @@ impl CudaState {
                 // 8e follow-up: decode (nt == 1) joins the MMVQ structure —
                 // 16-element units over q8 activations. blk_stride follows
                 // the weight registration (224 padded 7e② repack / 210 raw).
-                if nt == 1 && id >= 2048 && id % 32 == 0 {
+                // Shape gate: see the Q5_K arm comment (measured od*id
+                // crossover ~24M elements; below it the padded f32 kernel's
+                // coalesced loop wins, above it MMVQ's dp4a wins).
+                if nt == 1 && id % 32 == 0 && od * id >= 24_000_000 && !Self::no_kq_mmvq() {
                     self.q6_k_decode_mmvq(wptr, x, out, od, id, nt, padded_q6k);
                     Ok(())
                 } else if padded_q6k {
@@ -1904,6 +1913,12 @@ impl CudaState {
                 );
             }
         }
+    }
+
+    /// 8e follow-up: `MINFER_NO_KQ_MMVQ=1` forces the K-quant decode matmuls
+    /// back onto the f32 kernels (A/B escape hatch, MINFER_NO_FUSE_* style).
+    fn no_kq_mmvq() -> bool {
+        std::env::var("MINFER_NO_KQ_MMVQ").map_or(false, |v| v == "1")
     }
 
     /// 8e-reversal: decode (nt == 1) q4_K matmul via the llama.cpp MMVQ
