@@ -530,7 +530,13 @@ impl Qwen3Graph {
 
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
-        logits[..n_out * nv].to_vec()
+        // R3-A2: the buffer is always exactly n_out*nv (G3-reduced, or
+        // n_out == nt) — skip the redundant full-logits clone.
+        if logits.len() == n_out * nv {
+            logits
+        } else {
+            logits[..n_out * nv].to_vec()
+        }
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.

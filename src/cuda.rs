@@ -512,6 +512,20 @@ impl Drop for PinnedPool {
 unsafe impl Send for PinnedPool {}
 unsafe impl Sync for PinnedPool {}
 
+/// R3-A2: single grow-on-demand pinned staging buffer for device→host
+/// readbacks (the graph logits path runs this once per decode step).
+struct PinnedBuf {
+    ptr: *mut u8,
+    bytes: usize,
+}
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        unsafe { cudaFreeHost(self.ptr as *mut std::ffi::c_void) };
+    }
+}
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
 /// 8p: warm the f16 weight cache only for models whose quantized matmul
 /// weights total at least this much (7B q4_k_m = 4.4 GB warms; the 0.5-1.5B
 /// test fixtures do not, keeping their footprint at pre-8p levels).
@@ -522,6 +536,13 @@ pub struct CudaState {
     /// Lazy pinned staging ring (7e⑥); None until the first async fill,
     /// and stays None if cudaHostAlloc fails (sync fallback).
     staging: Mutex<Option<PinnedPool>>,
+    /// R3-A2: pinned D2H readback buffer (grown on demand; None until the
+    /// first pinned read, stays None on cudaHostAlloc failure → the pageable
+    /// fallback). A blocking `cudaMemcpy` into a PAGEABLE destination bounces
+    /// through a driver-internal pinned buffer (see write_input_async's
+    /// comment); reading into our own pinned slot skips that bounce. This is
+    /// the per-decode-step logits readback (608 KB on 0.5B/7B-class vocab).
+    readback: Mutex<Option<PinnedBuf>>,
     weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
     /// 8p: persistent per-weight f16 dequant cache, keyed by the device
     /// weight pointer → (f16 copy, bytes). The two-pass prefill GEMM used
@@ -827,6 +848,7 @@ impl CudaState {
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
             staging: Mutex::new(None),
+            readback: Mutex::new(None),
             weights: Mutex::new(HashMap::new()),
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -1152,6 +1174,55 @@ impl CudaState {
                 dst.len(),
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             );
+        }
+    }
+
+    /// R3-A2: D2H read through our own pinned staging buffer. The caller has
+    /// already synchronized the stream; the copy is a blocking `cudaMemcpy`
+    /// whose DESTINATION is pinned — no driver-internal bounce buffer, no
+    /// pageable staging — followed by a plain CPU copy out to the caller's
+    /// (pageable) slice. `MINFER_NO_PINNED_READBACK=1` or a cudaHostAlloc
+    /// failure falls back to the pageable path (`copy_from_device`).
+    pub fn copy_from_device_pinned(&self, src: *const std::ffi::c_void, dst: &mut [u8]) {
+        static FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("MINFER_NO_PINNED_READBACK").as_deref() == Ok("1") {
+            self.copy_from_device(src, dst);
+            return;
+        }
+        // headroom so small size changes don't churn the allocation
+        let need = dst.len().max(4 * 1024 * 1024);
+        let mut guard = self.readback.lock().unwrap();
+        if guard.as_ref().map_or(true, |b| b.bytes < need) {
+            if let Some(old) = guard.take() {
+                drop(old); // cudaFreeHost
+            }
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            let err = unsafe { cudaHostAlloc(&mut p, need, 0) };
+            if err != 0 {
+                drop(guard);
+                if !FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "CUDA: pinned readback alloc failed (err {err}); pageable D2H fallback"
+                    );
+                }
+                self.copy_from_device(src, dst);
+                return;
+            }
+            *guard = Some(PinnedBuf {
+                ptr: p as *mut u8,
+                bytes: need,
+            });
+        }
+        let buf = guard.as_mut().unwrap();
+        unsafe {
+            cudaMemcpy(
+                buf.ptr as *mut std::ffi::c_void,
+                src,
+                dst.len(),
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            );
+            std::ptr::copy_nonoverlapping(buf.ptr, dst.as_mut_ptr(), dst.len());
         }
     }
 

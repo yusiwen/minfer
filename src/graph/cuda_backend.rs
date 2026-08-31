@@ -305,7 +305,9 @@ impl CudaBackend {
         let mut out = vec![0f32; b.bytes / 4];
         self.state.sync();
         let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b.bytes) };
-        self.state.copy_from_device(b.ptr, dst);
+        // R3-A2: read through the pinned staging buffer (pageable-memcpy
+        // bounce removed); MINFER_NO_PINNED_READBACK=1 reverts.
+        self.state.copy_from_device_pinned(b.ptr, dst);
         Some(out)
     }
 }
@@ -1052,6 +1054,24 @@ mod tests {
         let id2 = cb.alloc_buffer(16);
         assert_eq!(id, id2);
         assert_eq!(cb.pool_gen, 2);
+    }
+
+    #[test]
+    fn cuda_pinned_readback_roundtrip() {
+        // 5.6 MB > the 4 MiB initial pinned readback buffer: exercises the
+        // grow-on-demand path of copy_from_device_pinned (R3-A2).
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let mut cb = CudaBackend::new().expect("backend after device init");
+        let n = 1_400_000usize; // elements — alloc_buffer takes an element count
+        let id = cb.alloc_buffer(n);
+        let data: Vec<f32> = (0..n).map(|i| (i % 997) as f32 + 0.5).collect();
+        cb.write_host(id, &data).unwrap();
+        let got = cb.copy_to_host(id).unwrap();
+        assert_eq!(got.len(), n);
+        assert_eq!(got, data, "full roundtrip mismatch");
     }
 
     #[test]
