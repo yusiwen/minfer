@@ -407,6 +407,36 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // R2: weight-streaming rework (one weight byte loaded exactly once per
+    // row; uint4 loads; q6_K needs the padded 224B stride for alignment).
+    fn launch_q4_k_q8_mmvq_v2(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q6_k_q8_mmvq_v2(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        blk_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q5_k_q8_mmvq_v2(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_1_f32_matmul(
         weights: *const u8,
         acts: *const f32,
@@ -2533,15 +2563,27 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
-            launch_q4_k_q8_mmvq(
-                wptr as *const u8,
-                q8 as *const u8,
-                out as *mut f32,
-                od as i32,
-                id as i32,
-                nt as i32,
-                stream,
-            );
+            if Self::mmvq_v2(id) {
+                launch_q4_k_q8_mmvq_v2(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            } else {
+                launch_q4_k_q8_mmvq(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            }
         }
     }
 
@@ -2571,16 +2613,30 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
-            launch_q6_k_q8_mmvq(
-                wptr as *const u8,
-                q8 as *const u8,
-                out as *mut f32,
-                od as i32,
-                id as i32,
-                nt as i32,
-                if blk_stride_padded { 224 } else { 210 },
-                stream,
-            );
+            if Self::mmvq_v2(id) && blk_stride_padded {
+                // v2's uint4 ql/qh loads need the padded 224B stride
+                launch_q6_k_q8_mmvq_v2(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    224,
+                    stream,
+                );
+            } else {
+                launch_q6_k_q8_mmvq(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    if blk_stride_padded { 224 } else { 210 },
+                    stream,
+                );
+            }
         }
     }
 
@@ -2607,16 +2663,35 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
-            launch_q5_k_q8_mmvq(
-                wptr as *const u8,
-                q8 as *const u8,
-                out as *mut f32,
-                od as i32,
-                id as i32,
-                nt as i32,
-                stream,
-            );
+            if Self::mmvq_v2(id) {
+                launch_q5_k_q8_mmvq_v2(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            } else {
+                launch_q5_k_q8_mmvq(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            }
         }
+    }
+
+    /// R2: the v2 weight-streaming MMVQ kernels need full 256-element
+    /// super-blocks (chunk/pair indexing) — `MINFER_MMVQ_V1=1` forces the
+    /// 8e kernels for A/B on shapes that would otherwise take v2.
+    fn mmvq_v2(id: usize) -> bool {
+        id % 256 == 0 && !std::env::var("MINFER_MMVQ_V1").map_or(false, |v| v == "1")
     }
 
     /// Decode I32 graph inputs (f32::from_bits bit patterns, alloc.rs

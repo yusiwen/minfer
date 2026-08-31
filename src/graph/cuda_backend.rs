@@ -1927,158 +1927,166 @@ mod tests {
         };
         // serialize against the other mmvq parity tests (shared scratch)
         let _guard = crate::cuda::CudaState::model_load_guard();
-        let (od, id_, nt) = (64usize, 2176usize, 1usize); // partial tail super-block
-        let mut rng_state = 12345u64;
-        let xs: Vec<f32> = (0..id_ * nt)
-            .map(|_| {
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let u = ((rng_state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
-                let mag = if (rng_state >> 60) & 7 == 0 {
-                    1e-5
-                } else {
-                    3.0
-                };
-                (u as f32) * mag
-            })
-            .collect();
-
-        let nbe = (id_ + 255) / 256;
-        let mut w6b = Vec::new();
-        let mut w6dq = vec![0f32; od * id_];
-        for r in 0..od {
-            for ib in 0..nbe {
-                let d = 0.02f32 + 0.004 * ((r * 7 + ib * 3) % 5) as f32;
-                let mut ql = [0u8; 128];
-                let mut qh = [0u8; 64];
-                let mut sc = [0u8; 16];
-                for s in 0..16usize {
-                    sc[s] = (((r * 11 + s * 5 + ib * 3) % 64) as i32 - 32) as u8;
-                }
-                // only the real elements of a partial tail super-block
-                let n_elem = 256usize.min(id_ - ib * 256);
-                for e in 0..n_elem {
-                    let s = e / 16;
-                    let l = e % 16;
-                    let chunk = s / 8;
-                    let g = (s / 2) % 4;
-                    let is = s % 2;
-                    let q6 = ((r * 13 + e * 7 + ib * 3) % 64) as u8;
-                    w6dq[r * id_ + ib * 256 + e] = d * (sc[s] as i8 as f32) * (q6 as f32 - 32.0);
-                    let nib = q6 & 0xF;
-                    let hi2 = (q6 >> 4) & 3;
-                    let qpos = chunk * 64 + (g % 2) * 32 + is * 16 + l;
-                    if g < 2 {
-                        ql[qpos] |= nib;
+        // two shapes: 2176 (partial tail super-block → v1 kernels) and 2560
+        // (full super-blocks → the R2 v2 weight-streaming kernels)
+        for (i, (od, id_, nt)) in [(64usize, 2176usize, 1usize), (64usize, 2560usize, 1usize)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut rng_state = 12345u64;
+            let xs: Vec<f32> = (0..id_ * nt)
+                .map(|_| {
+                    rng_state = rng_state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = ((rng_state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+                    let mag = if (rng_state >> 60) & 7 == 0 {
+                        1e-5
                     } else {
-                        ql[qpos] |= nib << 4;
-                    }
-                    let hpos = chunk * 32 + is * 16 + l;
-                    qh[hpos] |= hi2 << (2 * g);
-                }
-                // block_q6_K field order: ql[128], qh[64], scales[16], d —
-                // d is the LAST field (offset 208), not the first
-                w6b.extend_from_slice(&ql);
-                w6b.extend_from_slice(&qh);
-                w6b.extend_from_slice(&sc);
-                w6b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
-            }
-        }
-        assert_eq!(w6b.len(), od * nbe * 210);
+                        3.0
+                    };
+                    (u as f32) * mag
+                })
+                .collect();
 
-        // mirror quantize_q8_0_pad40 (padded 40B blocks, payload at offset 4)
-        let mut x8 = vec![0u8; (id_ / 32) * 40];
-        for b in 0..id_ / 32 {
-            let mut am = 0f32;
-            for j in 0..32 {
-                am = am.max(xs[b * 32 + j].abs());
-            }
-            let dd = am / 127.0;
-            let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
-            x8[b * 40..b * 40 + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
-            for j in 0..32 {
-                let q = (xs[b * 32 + j] * di).round().clamp(-128.0, 127.0) as i8;
-                x8[b * 40 + 4 + j] = q as u8;
-            }
-        }
-        let dq8 = |i: usize| -> f32 {
-            half::f16::from_le_bytes([x8[(i / 32) * 40], x8[(i / 32) * 40 + 1]]).to_f32()
-                * (x8[(i / 32) * 40 + 4 + (i % 32)] as i8) as f32
-        };
-
-        let mut want = vec![0f32; od * nt];
-        for t in 0..nt {
+            let nbe = (id_ + 255) / 256;
+            let mut w6b = Vec::new();
+            let mut w6dq = vec![0f32; od * id_];
             for r in 0..od {
-                let mut acc = 0f32;
-                for i in 0..id_ {
-                    acc += w6dq[r * id_ + i] * dq8(t * id_ + i);
+                for ib in 0..nbe {
+                    let d = 0.02f32 + 0.004 * ((r * 7 + ib * 3) % 5) as f32;
+                    let mut ql = [0u8; 128];
+                    let mut qh = [0u8; 64];
+                    let mut sc = [0u8; 16];
+                    for s in 0..16usize {
+                        sc[s] = (((r * 11 + s * 5 + ib * 3) % 64) as i32 - 32) as u8;
+                    }
+                    // only the real elements of a partial tail super-block
+                    let n_elem = 256usize.min(id_ - ib * 256);
+                    for e in 0..n_elem {
+                        let s = e / 16;
+                        let l = e % 16;
+                        let chunk = s / 8;
+                        let g = (s / 2) % 4;
+                        let is = s % 2;
+                        let q6 = ((r * 13 + e * 7 + ib * 3) % 64) as u8;
+                        w6dq[r * id_ + ib * 256 + e] =
+                            d * (sc[s] as i8 as f32) * (q6 as f32 - 32.0);
+                        let nib = q6 & 0xF;
+                        let hi2 = (q6 >> 4) & 3;
+                        let qpos = chunk * 64 + (g % 2) * 32 + is * 16 + l;
+                        if g < 2 {
+                            ql[qpos] |= nib;
+                        } else {
+                            ql[qpos] |= nib << 4;
+                        }
+                        let hpos = chunk * 32 + is * 16 + l;
+                        qh[hpos] |= hi2 << (2 * g);
+                    }
+                    // block_q6_K field order: ql[128], qh[64], scales[16], d —
+                    // d is the LAST field (offset 208), not the first
+                    w6b.extend_from_slice(&ql);
+                    w6b.extend_from_slice(&qh);
+                    w6b.extend_from_slice(&sc);
+                    w6b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
                 }
-                want[t * od + r] = acc;
             }
-        }
-        let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_eq!(w6b.len(), od * nbe * 210);
 
-        // ── padded 224B registration, direct decode call (gate bypassed) ──
-        let mut w6t = Tensor::from_data(
-            TensorType::Q6_K,
-            &[id_ as i64, od as i64, 1, 1],
-            w6b.clone(),
-        );
-        w6t.name = "mw6kp".to_string();
-        cb.state.register_weight_q6k_padded("mw6kp", &w6b, od, id_);
-        let xb = cb.alloc_buffer(id_ * nt);
-        cb.write_host(xb, &xs).unwrap();
-        let ob = cb.alloc_buffer(od * nt);
-        cb.state.q6_k_decode_mmvq(
-            cb.state.get_weight_ptr("mw6kp").unwrap(),
-            cb.ptr_of(xb).unwrap(),
-            cb.ptr_of(ob).unwrap(),
-            od,
-            id_,
-            nt,
-            true,
-        );
-        let got = cb.copy_to_host(ob).unwrap();
-        let mut worst = (0f32, 0usize);
-        for i in 0..od * nt {
-            let e = (got[i] - want[i]).abs();
-            if e > worst.0 {
-                worst = (e, i);
+            // mirror quantize_q8_0_pad40 (padded 40B blocks, payload at offset 4)
+            let mut x8 = vec![0u8; (id_ / 32) * 40];
+            for b in 0..id_ / 32 {
+                let mut am = 0f32;
+                for j in 0..32 {
+                    am = am.max(xs[b * 32 + j].abs());
+                }
+                let dd = am / 127.0;
+                let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                x8[b * 40..b * 40 + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                for j in 0..32 {
+                    let q = (xs[b * 32 + j] * di).round().clamp(-128.0, 127.0) as i8;
+                    x8[b * 40 + 4 + j] = q as u8;
+                }
             }
-        }
-        assert!(
-            worst.0 <= scale * 1e-2,
-            "q6_k mmvq padded err {} > {} at {}",
-            worst.0,
-            scale * 1e-2,
-            worst.1
-        );
+            let dq8 = |i: usize| -> f32 {
+                half::f16::from_le_bytes([x8[(i / 32) * 40], x8[(i / 32) * 40 + 1]]).to_f32()
+                    * (x8[(i / 32) * 40 + 4 + (i % 32)] as i8) as f32
+            };
 
-        // ── raw 210B stride via a direct decode call (gate bypassed) ──
-        let mut w6tr = Tensor::from_data(
-            TensorType::Q6_K,
-            &[id_ as i64, od as i64, 1, 1],
-            w6b.clone(),
-        );
-        w6tr.name = "mw6kr".to_string();
-        cb.state.register_weight("mw6kr", &w6b);
-        let obr = cb.alloc_buffer(od * nt);
-        cb.state.q6_k_decode_mmvq(
-            cb.state.get_weight_ptr("mw6kr").unwrap(),
-            cb.ptr_of(xb).unwrap(),
-            cb.ptr_of(obr).unwrap(),
-            od,
-            id_,
-            nt,
-            false,
-        );
-        let gotr = cb.copy_to_host(obr).unwrap();
-        for i in 0..od * nt {
-            assert!(
-                (gotr[i] - want[i]).abs() <= scale * 1e-2,
-                "q6_k mmvq raw stride mismatch at {i}"
+            let mut want = vec![0f32; od * nt];
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut acc = 0f32;
+                    for i in 0..id_ {
+                        acc += w6dq[r * id_ + i] * dq8(t * id_ + i);
+                    }
+                    want[t * od + r] = acc;
+                }
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+
+            // ── padded 224B registration, direct decode call (gate bypassed) ──
+            let mut w6t = Tensor::from_data(
+                TensorType::Q6_K,
+                &[id_ as i64, od as i64, 1, 1],
+                w6b.clone(),
             );
+            w6t.name = format!("mw6kp{i}");
+            cb.state
+                .register_weight_q6k_padded(&format!("mw6kp{i}"), &w6b, od, id_);
+            let xb = cb.alloc_buffer(id_ * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let ob = cb.alloc_buffer(od * nt);
+            cb.state.q6_k_decode_mmvq(
+                cb.state.get_weight_ptr(&format!("mw6kp{i}")).unwrap(),
+                cb.ptr_of(xb).unwrap(),
+                cb.ptr_of(ob).unwrap(),
+                od,
+                id_,
+                nt,
+                true,
+            );
+            let got = cb.copy_to_host(ob).unwrap();
+            let mut worst = (0f32, 0usize);
+            for i in 0..od * nt {
+                let e = (got[i] - want[i]).abs();
+                if e > worst.0 {
+                    worst = (e, i);
+                }
+            }
+            assert!(
+                worst.0 <= scale * 1e-2,
+                "q6_k mmvq padded err {} > {} at {}",
+                worst.0,
+                scale * 1e-2,
+                worst.1
+            );
+
+            // ── raw 210B stride via a direct decode call (gate bypassed) ──
+            let mut w6tr = Tensor::from_data(
+                TensorType::Q6_K,
+                &[id_ as i64, od as i64, 1, 1],
+                w6b.clone(),
+            );
+            w6tr.name = format!("mw6kr{i}");
+            cb.state.register_weight(&format!("mw6kr{i}"), &w6b);
+            let obr = cb.alloc_buffer(od * nt);
+            cb.state.q6_k_decode_mmvq(
+                cb.state.get_weight_ptr(&format!("mw6kr{i}")).unwrap(),
+                cb.ptr_of(xb).unwrap(),
+                cb.ptr_of(obr).unwrap(),
+                od,
+                id_,
+                nt,
+                false,
+            );
+            let gotr = cb.copy_to_host(obr).unwrap();
+            for i in 0..od * nt {
+                assert!(
+                    (gotr[i] - want[i]).abs() <= scale * 1e-2,
+                    "q6_k mmvq raw stride mismatch at {i}"
+                );
+            }
         }
         // ── real weights (Q6_K tensors of the decode path) ──
         // 7B blk.0.ffn_down (q4_k_m, od=3584 x id=18944 — the shape that
@@ -2224,133 +2232,139 @@ mod tests {
         };
         // serialize against the other mmvq parity tests (shared scratch)
         let _guard = crate::cuda::CudaState::model_load_guard();
-        let (od, id_, nt) = (128usize, 2176usize, 1usize); // partial tail super-block
-        let mut rng_state = 54321u64;
-        let xs: Vec<f32> = (0..id_ * nt)
-            .map(|_| {
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let u = ((rng_state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
-                let mag = if (rng_state >> 60) & 7 == 0 {
-                    1e-5
-                } else {
-                    3.0
-                };
-                (u as f32) * mag
-            })
-            .collect();
-
-        fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
-            if j < 4 {
-                (q[j] & 63, q[j + 4] & 63)
-            } else {
-                (
-                    (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
-                    (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
-                )
-            }
-        }
-
-        let nbe = (id_ + 255) / 256;
-        let mut w5b = Vec::new();
-        let mut w5dq = vec![0f32; od * id_];
-        for r in 0..od {
-            for ib in 0..nbe {
-                let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
-                let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
-                w5b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
-                w5b.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
-                let mut scb = [0u8; 12];
-                for j in 0..12 {
-                    // full byte range — exercises the scale packing hi bits
-                    scb[j] = ((r * 131 + j * 29 + ib * 7) % 256) as u8;
-                }
-                w5b.extend_from_slice(&scb);
-                let mut qh = [0u8; 32];
-                let mut qs = [0u8; 128];
-                let n_elem = 256usize.min(id_ - ib * 256);
-                for e in 0..n_elem {
-                    let s = e / 32;
-                    let l = e % 32;
-                    let u = ((r * 13 + e * 7 + ib * 5) % 32) as u8;
-                    let (s8, m8) = k4_scale(&scb, s);
-                    w5dq[r * id_ + ib * 256 + e] = u as f32 * d * s8 as f32 - dmin * m8 as f32;
-                    if s % 2 == 0 {
-                        qs[(s >> 1) * 32 + l] |= u & 0xF;
+        // two shapes: 2176 (partial tail super-block → v1 kernels) and 2560
+        // (full super-blocks → the R2 v2 weight-streaming kernels)
+        for (i, (od, id_, nt)) in [(128usize, 2176usize, 1usize), (128usize, 2560usize, 1usize)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut rng_state = 54321u64;
+            let xs: Vec<f32> = (0..id_ * nt)
+                .map(|_| {
+                    rng_state = rng_state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = ((rng_state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+                    let mag = if (rng_state >> 60) & 7 == 0 {
+                        1e-5
                     } else {
-                        qs[(s >> 1) * 32 + l] |= (u & 0xF) << 4;
-                    }
-                    qh[l] |= ((u >> 4) & 1) << s;
+                        3.0
+                    };
+                    (u as f32) * mag
+                })
+                .collect();
+
+            fn k4_scale(q: &[u8; 12], j: usize) -> (u8, u8) {
+                if j < 4 {
+                    (q[j] & 63, q[j + 4] & 63)
+                } else {
+                    (
+                        (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                        (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+                    )
                 }
-                w5b.extend_from_slice(&qh);
-                w5b.extend_from_slice(&qs);
             }
-        }
-        assert_eq!(w5b.len(), od * nbe * 176);
 
-        let mut x8 = vec![0u8; (id_ / 32) * 40];
-        for b in 0..id_ / 32 {
-            let mut am = 0f32;
-            for j in 0..32 {
-                am = am.max(xs[b * 32 + j].abs());
-            }
-            let dd = am / 127.0;
-            let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
-            x8[b * 40..b * 40 + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
-            for j in 0..32 {
-                let q = (xs[b * 32 + j] * di).round().clamp(-128.0, 127.0) as i8;
-                x8[b * 40 + 4 + j] = q as u8;
-            }
-        }
-        let dq8 = |i: usize| -> f32 {
-            half::f16::from_le_bytes([x8[(i / 32) * 40], x8[(i / 32) * 40 + 1]]).to_f32()
-                * (x8[(i / 32) * 40 + 4 + (i % 32)] as i8) as f32
-        };
-
-        let mut want = vec![0f32; od * nt];
-        for t in 0..nt {
+            let nbe = (id_ + 255) / 256;
+            let mut w5b = Vec::new();
+            let mut w5dq = vec![0f32; od * id_];
             for r in 0..od {
-                let mut acc = 0f32;
-                for i in 0..id_ {
-                    acc += w5dq[r * id_ + i] * dq8(t * id_ + i);
+                for ib in 0..nbe {
+                    let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
+                    let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
+                    w5b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    w5b.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                    let mut scb = [0u8; 12];
+                    for j in 0..12 {
+                        // full byte range — exercises the scale packing hi bits
+                        scb[j] = ((r * 131 + j * 29 + ib * 7) % 256) as u8;
+                    }
+                    w5b.extend_from_slice(&scb);
+                    let mut qh = [0u8; 32];
+                    let mut qs = [0u8; 128];
+                    let n_elem = 256usize.min(id_ - ib * 256);
+                    for e in 0..n_elem {
+                        let s = e / 32;
+                        let l = e % 32;
+                        let u = ((r * 13 + e * 7 + ib * 5) % 32) as u8;
+                        let (s8, m8) = k4_scale(&scb, s);
+                        w5dq[r * id_ + ib * 256 + e] = u as f32 * d * s8 as f32 - dmin * m8 as f32;
+                        if s % 2 == 0 {
+                            qs[(s >> 1) * 32 + l] |= u & 0xF;
+                        } else {
+                            qs[(s >> 1) * 32 + l] |= (u & 0xF) << 4;
+                        }
+                        qh[l] |= ((u >> 4) & 1) << s;
+                    }
+                    w5b.extend_from_slice(&qh);
+                    w5b.extend_from_slice(&qs);
                 }
-                want[t * od + r] = acc;
             }
-        }
-        let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            assert_eq!(w5b.len(), od * nbe * 176);
 
-        let mut w5t = Tensor::from_data(
-            TensorType::Q5_K,
-            &[id_ as i64, od as i64, 1, 1],
-            w5b.clone(),
-        );
-        w5t.name = "mw5k".to_string();
-        cb.state.register_weight("mw5k", &w5b);
-        // direct decode call: the synthetic shape (od=128) is far below the
-        // measured od*id >= 24M dispatch gate (small shapes stay on the f32
-        // kernel at runtime); no local model carries Q5_K tensors, so the
-        // gate wiring for q5_K is covered by this kernel parity + the shared
-        // dispatch code path with q6_K.
-        let xb = cb.alloc_buffer(id_ * nt);
-        cb.write_host(xb, &xs).unwrap();
-        let ob = cb.alloc_buffer(od * nt);
-        cb.state.q5_k_decode_mmvq(
-            cb.state.get_weight_ptr("mw5k").unwrap(),
-            cb.ptr_of(xb).unwrap(),
-            cb.ptr_of(ob).unwrap(),
-            od,
-            id_,
-            nt,
-        );
-        let got = cb.copy_to_host(ob).unwrap();
-        for i in 0..od * nt {
-            assert!(
-                (got[i] - want[i]).abs() <= scale * 1e-2,
-                "q5_k mmvq mismatch at {i}: got {} want {}",
-                got[i],
-                want[i]
+            let mut x8 = vec![0u8; (id_ / 32) * 40];
+            for b in 0..id_ / 32 {
+                let mut am = 0f32;
+                for j in 0..32 {
+                    am = am.max(xs[b * 32 + j].abs());
+                }
+                let dd = am / 127.0;
+                let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                x8[b * 40..b * 40 + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                for j in 0..32 {
+                    let q = (xs[b * 32 + j] * di).round().clamp(-128.0, 127.0) as i8;
+                    x8[b * 40 + 4 + j] = q as u8;
+                }
+            }
+            let dq8 = |i: usize| -> f32 {
+                half::f16::from_le_bytes([x8[(i / 32) * 40], x8[(i / 32) * 40 + 1]]).to_f32()
+                    * (x8[(i / 32) * 40 + 4 + (i % 32)] as i8) as f32
+            };
+
+            let mut want = vec![0f32; od * nt];
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut acc = 0f32;
+                    for i in 0..id_ {
+                        acc += w5dq[r * id_ + i] * dq8(t * id_ + i);
+                    }
+                    want[t * od + r] = acc;
+                }
+            }
+            let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+
+            let mut w5t = Tensor::from_data(
+                TensorType::Q5_K,
+                &[id_ as i64, od as i64, 1, 1],
+                w5b.clone(),
             );
+            w5t.name = format!("mw5k{i}");
+            cb.state.register_weight(&format!("mw5k{i}"), &w5b);
+            // direct decode call: the synthetic shape (od=128) is far below the
+            // measured od*id >= 24M dispatch gate (small shapes stay on the f32
+            // kernel at runtime); no local model carries Q5_K tensors, so the
+            // gate wiring for q5_K is covered by this kernel parity + the shared
+            // dispatch code path with q6_K.
+            let xb = cb.alloc_buffer(id_ * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let ob = cb.alloc_buffer(od * nt);
+            cb.state.q5_k_decode_mmvq(
+                cb.state.get_weight_ptr(&format!("mw5k{i}")).unwrap(),
+                cb.ptr_of(xb).unwrap(),
+                cb.ptr_of(ob).unwrap(),
+                od,
+                id_,
+                nt,
+            );
+            let got = cb.copy_to_host(ob).unwrap();
+            for i in 0..od * nt {
+                assert!(
+                    (got[i] - want[i]).abs() <= scale * 1e-2,
+                    "q5_k mmvq mismatch at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 

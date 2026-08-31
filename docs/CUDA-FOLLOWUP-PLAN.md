@@ -183,6 +183,27 @@ GB/s probe ceiling at the 7B shapes.
 
 ## 8e②. q6_K / q5_K decode MMVQ — **DONE 2026-08-30 (`1298cb2`, `1d28235`)**
 
+**R2 (2026-08-31): weight-streaming rework of all three K-quant MMVQ
+kernels.** The 8e kernels mapped one thread per 32-element sub-block and
+read each 32B nibble chunk per sub (the sibling sub re-reads the same
+bytes for the other nibble half — 2× the load instructions) and q6_K used
+eight 2-byte loads per 16-byte ql/qh piece. v2 maps one thread to a
+32-element chunk (q4_K/q5_K: a sub-pair sharing its nibble bytes — each
+weight byte now loads exactly once per row; q6_K: an is-pair sharing
+ql/qh bytes), uses uint4 vector loads everywhere the layout allows, and
+the q5_K qh plane (32B shared by all subs, bit-indexed) is read without
+the bogus per-chunk offset. Dispatch prefers v2 when `id % 256 == 0`
+(q6_K additionally requires the padded 224B stride); `MINFER_MMVQ_V1=1`
+forces the old kernels for A/B. 7B q4_k_m quiet-GPU A/B: tg128
+42.2 → 45.1 tok/s, decode @2K 36.7 → 38.8 tok/s (llama.cpp 47.1 / 44.9);
+parity extended to %256 shapes (the original tests' id=2176 exercised
+only v1 — the graph-free greedy check caught a q6_K nibble-group bug the
+suite missed), full suite 164 passing, greedy output v1 ≡ v2.
+
+**R1 prefill note (2026-08-31)**: the int8 MMQ prefill GEMM landed
+opt-in (`MINFER_MMQ=1`); pad40 q8 blocks now carry the per-block int sum
+at byte 36 (MMVQ kernels read only d@0/payload@4..36 — unaffected).
+
 The 8e follow-up candidate, ported to both remaining K-quant types with the
 same llama.cpp GB10 structure (one row per 256-thread block, sub-block units
 round-robin, `__dp4a` over `quantize_q8_0_pad40` activations, 8-warp block

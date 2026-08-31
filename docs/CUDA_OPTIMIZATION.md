@@ -150,6 +150,33 @@ only when MMQ is actually active. Next lever (when a quiet GPU is
 available): llama.cpp-style bigger per-warp output tiles + wide/coalesced
 staging loads, re-rank KD vs occupancy.
 
+### R2 — MMVQ weight-streaming rework (Aug 31, DONE)
+
+The 8e decode kernels ran at ~60% of llama.cpp's effective streaming rate
+(147 vs ~197 GB/s) because each 32B nibble chunk was read per SUB-BLOCK —
+the sibling sub re-reads the same bytes for the other nibble half (2× the
+load instructions; L1 absorbed the traffic, the instruction stream did
+not) — and q6_K fetched its ql/qh pieces as eight 2-byte loads.
+
+v2 (default when `id % 256 == 0`; q6_K also needs the padded 224B stride;
+`MINFER_MMVQ_V1=1` forces the 8e kernels for A/B):
+- q4_K/q5_K: one thread per 32-element chunk = a sub-PAIR sharing its
+  nibble bytes; the 32B chunk loads once (uint4×2) and serves both subs.
+- q6_K: one thread per is-pair (two 16-element subs sharing ql/qh bytes
+  and one q8 block); uint4 loads in the padded layout (all 16B-aligned).
+- q5_K's qh plane is 32 bytes shared by ALL sub-blocks (byte l = one high
+  bit per sub for element l) — bit-indexed, no per-chunk offset.
+
+Numbers (7B q4_k_m, quiet-GPU interleaved A/B, 2 stable runs each):
+tg128 42.2 → 45.1 tok/s (+6.9%), decode @2K 36.7 → 38.8 tok/s (+5.7%) —
+llama.cpp sits at 47.1 / 44.9. Parity: the per-type decode tests extended
+with an id=2560 shape so the suite exercises v2 (the original id=2176
+partial-tail shape dispatched to v1, which is exactly how a q6_K
+nibble-group bug and a q5_K qh-offset bug slipped past the first run —
+the engine-level greedy check caught them); suite 164 passing; greedy
+output v1 ≡ v2 token-for-token. Under sglang load the win holds at ~+5-8%
+relative.
+
 ## Part III — Remaining roadmap
 
 Measured budgets: f16 wmma GEMM ~35 TFLOPS (llama.cpp int8 MMQ ≈ 52
@@ -161,11 +188,10 @@ read-only probe (93% of the 273 GB/s theoretical); llama.cpp achieves
   2026-08-31, **opt-in** (`MINFER_MMQ=1`), not yet competitive — see the
   Part II R1 record for the design, parity evidence, and the measured
   per-shape numbers that keep the f16 8p path as the default.
-- **R2 — MMVQ weight-streaming efficiency**: close 147 → ~197 GB/s
-  (llama) against the 252.7 GB/s platform probe: access-pattern and
-  occupancy work on the per-type decode kernels; lm_head (Q6_K, 444 MB
-  per token) is the single biggest row. Expected: decode @2K 36 → ~40,
-  tg128 40.8 → ~45.
+- **R2 — MMVQ weight-streaming efficiency**: DONE 2026-08-31 (see the
+  Part II R2 record): per-thread chunk mapping + uint4 loads; tg128
+  42.2 → 45.1, decode @2K 36.7 → 38.8 (llama.cpp 47.1 / 44.9). Remaining
+  gap to llama.cpp is ~10% on tg128.
 - **R3 — small-model per-token overhead**: LARGELY DONE (Aug 31, see
   Part II). 0.5B decode was ~4.0 ms/token with ~1.6 ms of GPU floor:
   prefill single-split (A1), pinned logits readback + no clone (A2),

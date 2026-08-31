@@ -793,6 +793,188 @@ __global__ void __launch_bounds__(256) q5_k_q8_mmvq(
     mmvq_block_reduce(acc, output, od, t);
 }
 
+// R2: weight-streaming rework of the K-quant MMVQ kernels. The 8e kernels
+// read each 32B nibble chunk per SUB-BLOCK (the sibling sub re-reads the
+// same bytes for the other nibble half — 2× the load instructions, L1
+// absorbed) and q6_K used eight 2-byte loads per 16-byte ql/qh piece. The
+// v2 kernels map one thread to a 32-element CHUNK (q4_K/q5_K: a sub-pair
+// sharing its nibble bytes; q6_K: an is-pair sharing ql/qh bytes), so each
+// weight byte is loaded exactly once per row and every access in the
+// padded (224B-stride) q6_K layout is 4-byte aligned. Dispatch prefers v2
+// when id % 256 == 0 (full super-blocks); MINFER_MMVQ_V1=1 forces the old
+// kernels for A/B.
+__global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * Q4KB;
+    const int npair = id >> 6;         // 64-element chunks (sub-pairs)
+    const int nsub = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * nsub * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 2, c = u & 3;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * Q4KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        const int s0 = 2 * c, s1 = 2 * c + 1;
+        uint8_t s8a, m8a, s8b, m8b;
+        get_scale_min_k4(s0, blk + 4, &s8a, &m8a);
+        get_scale_min_k4(s1, blk + 4, &s8b, &m8b);
+        // one 32B nibble chunk: lo nibbles = sub s0's 32 elements, hi = sub s1's
+        // (16B-aligned: 144·kbx + 16 + 32·c ≡ 0 mod 16)
+        const uint4 w0 = *reinterpret_cast<const uint4*>(blk + 16 + c * 32);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(blk + 16 + c * 32 + 16);
+        const uint32_t ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const uint8_t* x8a = x8row + (size_t)(kbx * 8 + s0) * Q8PB;
+        const uint8_t* x8b = x8row + (size_t)(kbx * 8 + s1) * Q8PB;
+        const float d8a = h2f(*reinterpret_cast<const uint16_t*>(x8a));
+        const float d8b = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+        const uint32_t* xa = reinterpret_cast<const uint32_t*>(x8a + 4);
+        const uint32_t* xb = reinterpret_cast<const uint32_t*>(x8b + 4);
+        int dota = 0, sxa = 0, dotb = 0, sxb = 0;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            const uint32_t wv = ws[v];
+            const int xa_v = (int)xa[v], xb_v = (int)xb[v];
+            dota = __dp4a((int)(wv & 0x0F0F0F0F), xa_v, dota);
+            sxa  = __dp4a(0x01010101, xa_v, sxa);
+            dotb = __dp4a((int)((wv >> 4) & 0x0F0F0F0F), xb_v, dotb);
+            sxb  = __dp4a(0x01010101, xb_v, sxb);
+        }
+        acc += d8a * ((float)s8a * d * (float)dota - (float)m8a * dm * (float)sxa)
+             + d8b * ((float)s8b * d * (float)dotb - (float)m8b * dm * (float)sxb);
+    }
+
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+__global__ void __launch_bounds__(256) q5_k_q8_mmvq_v2(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * Q5KB;
+    const int npair = id >> 6;
+    const int nsub = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * nsub * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 2, c = u & 3;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * Q5KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        const int s0 = 2 * c, s1 = 2 * c + 1;
+        uint8_t s8a, m8a, s8b, m8b;
+        get_scale_min_k4(s0, blk + 4, &s8a, &m8a);
+        get_scale_min_k4(s1, blk + 4, &s8b, &m8b);
+        const uint4 w0 = *reinterpret_cast<const uint4*>(blk + 48 + c * 32);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(blk + 48 + c * 32 + 16);
+        // the qh plane is 32 bytes SHARED by all 8 sub-blocks (byte l holds
+        // one high bit per sub for element l) — every chunk reads the same
+        // bytes, only the bit index (s0/s1) differs
+        const uint4 h0 = *reinterpret_cast<const uint4*>(blk + 16);
+        const uint4 h1 = *reinterpret_cast<const uint4*>(blk + 16 + 16);
+        const uint32_t ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const uint32_t hs[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        const uint8_t* x8a = x8row + (size_t)(kbx * 8 + s0) * Q8PB;
+        const uint8_t* x8b = x8row + (size_t)(kbx * 8 + s1) * Q8PB;
+        const float d8a = h2f(*reinterpret_cast<const uint16_t*>(x8a));
+        const float d8b = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+        const uint32_t* xa = reinterpret_cast<const uint32_t*>(x8a + 4);
+        const uint32_t* xb = reinterpret_cast<const uint32_t*>(x8b + 4);
+        int dota = 0, sxa = 0, dotb = 0, sxb = 0;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            const uint32_t wv = ws[v];
+            // qh byte l holds one high bit per sub for element l: bit s of
+            // the bytes covering this chunk's elements
+            const uint32_t qhv = hs[v];
+            const uint32_t hia = (((qhv >> s0) & 0x01010101u) << 4);
+            const uint32_t hib = (((qhv >> s1) & 0x01010101u) << 4);
+            const int xa_v = (int)xa[v], xb_v = (int)xb[v];
+            dota = __dp4a((int)((wv & 0x0F0F0F0F) | hia), xa_v, dota);
+            sxa  = __dp4a(0x01010101, xa_v, sxa);
+            dotb = __dp4a((int)(((wv >> 4) & 0x0F0F0F0F) | hib), xb_v, dotb);
+            sxb  = __dp4a(0x01010101, xb_v, sxb);
+        }
+        acc += d8a * ((float)s8a * d * (float)dota - (float)m8a * dm * (float)sxa)
+             + d8b * ((float)s8b * d * (float)dotb - (float)m8b * dm * (float)sxb);
+    }
+
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+// q6_K v2: one thread per 32-element is-pair (two 16-element sub-blocks
+// sharing their ql/qh bytes and one q8 block). Requires the padded 224B
+// block stride so every ql/qh access is 4-byte aligned (u32 loads).
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int blk_stride
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * blk_stride;
+    const int npair = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * (id >> 5) * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 3, pair = u & 7;
+        const int s0 = 2 * pair, s1 = 2 * pair + 1;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * blk_stride;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+        const float sc0 = (float)(int8_t)blk[192 + s0];
+        const float sc1 = (float)(int8_t)blk[192 + s1];
+        // v1 mapping with s = 2*pair + half: chunk = s>>3 = pair>>2,
+        // g = (s>>1)&3 = pair&3, is = s&1 = half (the pair's two subs share
+        // chunk/g; only the 16-byte is-half differs)
+        const int chunk = pair >> 2, g = pair & 3;
+        // padded 224B stride ⇒ every ql/qh piece is 16B aligned
+        const uint4 qla = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32);
+        const uint4 qlb = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32 + 16);
+        const uint4 qha = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32);
+        const uint4 qhb = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32 + 16);
+        const uint32_t qls[8] = {qla.x, qla.y, qla.z, qla.w, qlb.x, qlb.y, qlb.z, qlb.w};
+        const uint32_t qhs[8] = {qha.x, qha.y, qha.z, qha.w, qhb.x, qhb.y, qhb.z, qhb.w};
+        const uint32_t shift = 2 * g;
+        const uint8_t* x8 = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+        int dot0 = 0, dot1 = 0;
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            const uint32_t wl0 = qls[v], wl1 = qls[v + 4];
+            const uint32_t wh0 = qhs[v], wh1 = qhs[v + 4];
+            const uint32_t nib0 = (g < 2) ? (wl0 & 0x0F0F0F0F) : ((wl0 >> 4) & 0x0F0F0F0F);
+            const uint32_t nib1 = (g < 2) ? (wl1 & 0x0F0F0F0F) : ((wl1 >> 4) & 0x0F0F0F0F);
+            const uint32_t hi0 = ((wh0 >> shift) & 0x03030303) << 4;
+            const uint32_t hi1 = ((wh1 >> shift) & 0x03030303) << 4;
+            const int vi0 = __vsubss4((int)(nib0 | hi0), 0x20202020);
+            const int vi1 = __vsubss4((int)(nib1 | hi1), 0x20202020);
+            dot0 = __dp4a(vi0, (int)xw[v], dot0);
+            dot1 = __dp4a(vi1, (int)xw[v + 4], dot1);
+        }
+        acc += d8 * sc0 * d * (float)dot0 + d8 * sc1 * d * (float)dot1;
+    }
+
+    mmvq_block_reduce(acc, output, od, t);
+}
+
 __global__ void q6_k_f32_matmul(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ acts,
@@ -2096,6 +2278,32 @@ void launch_q5_k_q8_mmvq(
 ) {
     dim3 grid(od, nt);
     q5_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+// R2: weight-streaming rework (see the v2 kernel comments). Same signatures
+// as the v1 launchers so dispatch can A/B via MINFER_MMVQ_V1=1.
+void launch_q4_k_q8_mmvq_v2(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q4_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q6_k_q8_mmvq_v2(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int blk_stride, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q6_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+}
+
+void launch_q5_k_q8_mmvq_v2(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q5_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
 }
 
 void launch_q5_1_f32_matmul(
