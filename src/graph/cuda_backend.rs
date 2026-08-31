@@ -3173,6 +3173,317 @@ mod tests {
         }
     }
 
+    // R1 host helpers (module level: the reference fn below can't capture
+    // the test fn's locals)
+    fn mmq_f16v(b: &[u8]) -> f32 {
+        half::f16::from_le_bytes([b[0], b[1]]).to_f32()
+    }
+    // llama.cpp get_scale_min_k4 (host mirror of the device helper)
+    fn mmq_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+        if j < 4 {
+            (q[j] & 63, q[j + 4] & 63)
+        } else {
+            (
+                (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+            )
+        }
+    }
+
+    // R1: the int8 MMQ prefill GEMM must reproduce the CPU q8_0-activation
+    // dot math (the structure llama.cpp's MMQ implements): int8×int8 dots
+    // are exact on both sides and the block scales are f16→f32 on both
+    // sides; only accumulation order differs, so 1e-3 absolute leaves
+    // orders of magnitude of headroom over f32 rounding while still failing
+    // loudly on any fragment-layout or unpacking mistake. All 8 types ×
+    // {odd tile edges, 2 super-blocks}; q6_K in both registered layouts.
+    #[test]
+    fn cuda_prefill_mmq_parity() {
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        crate::cuda::CudaState::init();
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let state = cb.state;
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+
+        // reference: CPU q8_0-activation dot math, per 32-block:
+        //   out += da · (ds · Σ w_i·q_i + dm · Σ q_i)
+        // q6_K carries 16-element sub-scales → two halves per 32-block.
+        fn reference(
+            ttype: TensorType,
+            w: &[u8],
+            x: &[f32],
+            od: usize,
+            id: usize,
+            nt: usize,
+            padded_q6k: bool,
+        ) -> Vec<f32> {
+            let nb = id / 32;
+            let _ = padded_q6k; // the host reference always reads raw 210B rows
+            let mut out = vec![0f32; nt * od];
+            for t in 0..nt {
+                let mut da = vec![0f32; nb];
+                let mut q = vec![0i32; id];
+                let mut sa = vec![0i64; nb];
+                for b in 0..nb {
+                    let blk = &x[t * id + b * 32..t * id + b * 32 + 32];
+                    let am = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let d = am / 127.0;
+                    da[b] = half::f16::from_f32(d).to_f32(); // f16 rounding, as the GPU kernel stores it
+                    let di = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    for (i, v) in blk.iter().enumerate() {
+                        let qi = (*v * di).round_ties_even();
+                        let qi = qi.clamp(-128.0, 127.0) as i32;
+                        q[b * 32 + i] = qi;
+                        sa[b] += qi as i64;
+                    }
+                }
+                for j in 0..od {
+                    let mut acc = 0f32;
+                    for b in 0..nb {
+                        // (ds, dm, val(i)) per type for element i of block b
+                        let mut ds = 0f32;
+                        let mut dm = 0f32;
+                        let mut dot = 0i64;
+                        match ttype {
+                            TensorType::Q8_0 => {
+                                let blk = &w[(j * nb + b) * 34..][..34];
+                                ds = mmq_f16v(blk);
+                                for i in 0..32 {
+                                    dot += (blk[2 + i] as i8 as i64) * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q4_0 => {
+                                let blk = &w[(j * nb + b) * 18..][..18];
+                                ds = mmq_f16v(blk);
+                                for i in 0..32 {
+                                    let byte = blk[2 + (i & 15)];
+                                    let nib = if i < 16 { byte & 0xF } else { byte >> 4 };
+                                    dot += (nib as i64 - 8) * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q4_1 => {
+                                let blk = &w[(j * nb + b) * 20..][..20];
+                                ds = mmq_f16v(blk);
+                                dm = mmq_f16v(&blk[2..]);
+                                for i in 0..32 {
+                                    let byte = blk[4 + (i & 15)];
+                                    let nib = if i < 16 { byte & 0xF } else { byte >> 4 };
+                                    dot += nib as i64 * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q5_0 => {
+                                let blk = &w[(j * nb + b) * 22..][..22];
+                                ds = mmq_f16v(blk);
+                                let qh = blk[2] as u32
+                                    | ((blk[3] as u32) << 8)
+                                    | ((blk[4] as u32) << 16)
+                                    | ((blk[5] as u32) << 24);
+                                for i in 0..32 {
+                                    let byte = blk[6 + (i & 15)];
+                                    let nib = if i < 16 { byte & 0xF } else { byte >> 4 };
+                                    let v = nib as i64 + 16 * ((qh >> i) & 1) as i64 - 16;
+                                    dot += v * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q5_1 => {
+                                let blk = &w[(j * nb + b) * 24..][..24];
+                                ds = mmq_f16v(blk);
+                                dm = mmq_f16v(&blk[2..]);
+                                let qh = blk[4] as u32
+                                    | ((blk[5] as u32) << 8)
+                                    | ((blk[6] as u32) << 16)
+                                    | ((blk[7] as u32) << 24);
+                                for i in 0..32 {
+                                    let byte = blk[8 + (i & 15)];
+                                    let nib = if i < 16 { byte & 0xF } else { byte >> 4 };
+                                    let v = nib as i64 + 16 * ((qh >> i) & 1) as i64;
+                                    dot += v * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q4_K => {
+                                let nsp = nb / 8;
+                                let blk = &w[(j * nsp + b / 8) * 144..][..144];
+                                let s = b % 8;
+                                let (sc, m) = mmq_scale_min_k4(s, &blk[4..]);
+                                ds = mmq_f16v(blk) * sc as f32;
+                                dm = -(mmq_f16v(&blk[2..]) * m as f32);
+                                for i in 0..32 {
+                                    let byte = blk[16 + (s / 2) * 32 + i];
+                                    let nib = if s % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                                    dot += nib as i64 * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q5_K => {
+                                let nsp = nb / 8;
+                                let blk = &w[(j * nsp + b / 8) * 176..][..176];
+                                let s = b % 8;
+                                let (sc, m) = mmq_scale_min_k4(s, &blk[4..]);
+                                ds = mmq_f16v(blk) * sc as f32;
+                                dm = -(mmq_f16v(&blk[2..]) * m as f32);
+                                for i in 0..32 {
+                                    let byte = blk[48 + (s / 2) * 32 + i];
+                                    let nib = if s % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                                    let bit = (blk[16 + i] >> s) & 1;
+                                    dot += (nib as i64 + 16 * bit as i64) * q[b * 32 + i] as i64;
+                                }
+                            }
+                            TensorType::Q6_K => {
+                                let nsp = nb / 8;
+                                // host bytes are the RAW 210B layout — the
+                                // 224B padding only exists on the device
+                                // (register_weight_q6k_padded repack)
+                                let blk = &w[(j * nsp + b / 8) * 210..][..210];
+                                // two 16-element sub-blocks per 32-block
+                                for half in 0..2 {
+                                    let s = (b * 2 + half) % 16;
+                                    let sc = blk[192 + s] as i8 as f32;
+                                    let chunk = s / 8;
+                                    let g = (s / 2) % 4;
+                                    let is = s % 2;
+                                    let ql = chunk * 64 + (g % 2) * 32 + is * 16;
+                                    let qh = 128 + chunk * 32 + is * 16;
+                                    let mut hdot = 0i64;
+                                    for r in 0..16 {
+                                        let byte = blk[ql + r];
+                                        let nib = if g < 2 { byte & 0xF } else { byte >> 4 };
+                                        let q2 = (blk[qh + r] >> (2 * g)) & 3;
+                                        hdot += ((nib as i64) | ((q2 as i64) << 4) - 32)
+                                            * q[b * 32 + half * 16 + r] as i64;
+                                    }
+                                    acc += da[b] * mmq_f16v(&blk[208..]) * sc * hdot as f32;
+                                }
+                                continue;
+                            }
+                            _ => unreachable!(),
+                        }
+                        acc += da[b] * (ds * dot as f32 + dm * sa[b] as f32);
+                    }
+                    out[t * od + j] = acc;
+                }
+            }
+            out
+        }
+
+        // shape sweep: isolate which dimension (k depth / od tiles / token
+        // tiles) breaks the kernel if any — small cases passed first
+        for (od, id, nt) in [
+            (70usize, 256usize, 33usize),
+            (70usize, 512usize, 70usize),
+            (70usize, 1024usize, 70usize),
+            (70usize, 2048usize, 70usize),
+            (70usize, 3584usize, 70usize),
+            (3584usize, 512usize, 33usize),
+            (3584usize, 3584usize, 70usize),
+            (128usize, 512usize, 256usize),
+        ] {
+            let nsp = id / 256;
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|_| (rnd() % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut mk =
+                |nbytes: usize| -> Vec<u8> { (0..nbytes).map(|_| (rnd() & 0xFF) as u8).collect() };
+            let xb = cb.alloc_buffer(id * nt);
+            let out = cb.alloc_buffer(od * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let (xptr, optr) = (cb.ptr_of(xb).unwrap(), cb.ptr_of(out).unwrap());
+            let dbytes = |v: f32| half::f16::from_f32(v).to_le_bytes();
+
+            // benign d (and m for the min-carrying types) per block; payload
+            // nibbles/scales stay random bytes (any int8 value is legal)
+            let mut wq80 = mk(od * (id / 32) * 34);
+            let mut wq40 = mk(od * (id / 32) * 18);
+            let mut wq41 = mk(od * (id / 32) * 20);
+            let mut wq50 = mk(od * (id / 32) * 22);
+            let mut wq51 = mk(od * (id / 32) * 24);
+            for g in 0..od * (id / 32) {
+                let set = |w: &mut [u8], base: usize, off: usize, v: f32| {
+                    let db = dbytes(v);
+                    w[base + off] = db[0];
+                    w[base + off + 1] = db[1];
+                };
+                set(&mut wq80, g * 34, 0, 0.01);
+                set(&mut wq40, g * 18, 0, 0.05);
+                set(&mut wq41, g * 20, 0, 0.05);
+                set(&mut wq41, g * 20, 2, 0.1);
+                set(&mut wq50, g * 22, 0, 0.05);
+                set(&mut wq51, g * 24, 0, 0.05);
+                set(&mut wq51, g * 24, 2, 0.1);
+            }
+            let mut wq4k = mk(od * nsp * 144);
+            let mut wq5k = mk(od * nsp * 176);
+            let mut wq6k = mk(od * nsp * 210);
+            for r in 0..od {
+                for sp in 0..nsp {
+                    let base4 = (r * nsp + sp) * 144;
+                    wq4k[base4..base4 + 2].copy_from_slice(&dbytes(0.01));
+                    wq4k[base4 + 2..base4 + 4].copy_from_slice(&dbytes(0.005));
+                    let base5 = (r * nsp + sp) * 176;
+                    wq5k[base5..base5 + 2].copy_from_slice(&dbytes(0.01));
+                    wq5k[base5 + 2..base5 + 4].copy_from_slice(&dbytes(0.005));
+                    let base6 = (r * nsp + sp) * 210;
+                    wq6k[base6 + 208..base6 + 210].copy_from_slice(&dbytes(0.01));
+                }
+            }
+
+            state.register_weight("mmq_w80", &wq80);
+            state.register_weight("mmq_w40", &wq40);
+            state.register_weight("mmq_w41", &wq41);
+            state.register_weight("mmq_w50", &wq50);
+            state.register_weight("mmq_w51", &wq51);
+            state.register_weight("mmq_w4k", &wq4k);
+            state.register_weight("mmq_w5k", &wq5k);
+            state.register_weight("mmq_w6k_raw", &wq6k);
+            state.register_weight_q6k_padded("mmq_w6k_pad", &wq6k, od, id);
+
+            let cases: [(TensorType, &str, bool); 9] = [
+                (TensorType::Q8_0, "mmq_w80", false),
+                (TensorType::Q4_0, "mmq_w40", false),
+                (TensorType::Q4_1, "mmq_w41", false),
+                (TensorType::Q5_0, "mmq_w50", false),
+                (TensorType::Q5_1, "mmq_w51", false),
+                (TensorType::Q4_K, "mmq_w4k", false),
+                (TensorType::Q5_K, "mmq_w5k", false),
+                (TensorType::Q6_K, "mmq_w6k_raw", false),
+                (TensorType::Q6_K, "mmq_w6k_pad", true),
+            ];
+            for (ttype, name, padded) in cases {
+                if state.cc() < 800 {
+                    eprintln!("skipping: mma.m16n8k32 s8 needs sm_80+ (cc {})", state.cc());
+                    return;
+                }
+                let wbytes: &[u8] = match name {
+                    "mmq_w80" => &wq80,
+                    "mmq_w40" => &wq40,
+                    "mmq_w41" => &wq41,
+                    "mmq_w50" => &wq50,
+                    "mmq_w51" => &wq51,
+                    "mmq_w4k" => &wq4k,
+                    "mmq_w5k" => &wq5k,
+                    // both layouts share the intra-block byte layout; the
+                    // padded variant only widens the row stride
+                    _ => &wq6k,
+                };
+                let wptr = state.get_weight_ptr(name).unwrap();
+                state
+                    .prefill_mmq(wptr, ttype, xptr, optr, od, id, nt, padded)
+                    .unwrap();
+                cb.synchronize();
+                let got = cb.copy_to_host(out).unwrap();
+                let want = reference(ttype, wbytes, &xs, od, id, nt, padded);
+                assert_close(name, &got, &want, 1e-3);
+            }
+        }
+    }
+
     fn cuda_fa_prefill_attention_parity() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");

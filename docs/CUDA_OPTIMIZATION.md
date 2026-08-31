@@ -110,6 +110,46 @@ showed the pinned path at parity to slightly ahead). Clean pre/post
 numbers pending a quiet GPU; decode parity verified via bit-identical
 greedy output and the 163-test suite.
 
+### R1 — int8 MMQ prefill GEMM (Aug 31, opt-in, perf pending)
+
+Design (not a verbatim llama.cpp port — its 128×128 warp-tile structure on
+the 8p skeleton): a custom kernel on minfer's 64×64×256-thread tile
+implementing llama.cpp's MMQ *math*. Activations quantize to q8_0 once per
+launch (pad40 blocks, extended with the per-block int sum at offset 36),
+weights stay RAW — no f16 dequant pass, no w16 cache, 2-4× less weight
+traffic. Tiled `mma.m16n8k32.row.col.s32.s8.s32` (sm_80+; sm_75 keeps the
+f16 path), one 32-k int chunk per step; the int C fragment is rescaled per
+(token, row, k-block): `sum += da·ds·acc + da·dm·sa`. K-quant nibbles stay
+UNSIGNED (q4_K/q5_K: ds=d·sc, dm=−dmin·m); q6_K = k32 chunks with dual
+m16n8k16 mmas + separate accumulators rescaled by (d·sc0, d·sc1); q8_0
+activations contribute the dm·sa offset term. B staging: 2 threads/row
+(q8_0: 4), 8 chunks (256-k) staged per double-buffered dynamic-shared tile
+(~94 KB, opt-in via `cudaFuncSetAttribute`; sm_121 reports 100 KB shared/SM
+→ 1 block/SM).
+
+Evidence:
+- Parity: `cuda_prefill_mmq_parity` — host CPU q8_0-activation reference
+  (llama.cpp's dot math) vs GPU, all 8 types × an 8-shape sweep (k depth
+  8..112 chunks, 1..56 od-tiles, 1..4 token-tiles, q6_K both layouts):
+  max diff < 1e-3 everywhere. Greedy 7B output: MMQ path ≡ f16 path
+  token-for-token.
+- Perf (7B q4_k_m, 2017-token prefill): MMQ 155 tok/s at sglang ~96% util,
+  412 tok/s on a mostly-quiet GPU, vs the f16 w16 path 630-880 / 1460.
+  Isolation probes: fixed overhead (quantize + launch) ≈ 0.6 ms — the
+  matmul itself runs ~2.9 TMAC/s (llama.cpp's MMQ on the same part: ~24).
+- Tuning findings: KD=8 (256-k staging) beat KD=4 (2 blocks/SM) under
+  load; per-chunk (32-k) staging exposed the full load latency (2.5
+  TMAC/s); ncu cannot sample this device (ERR_NVGPUCTRPERM as root:
+  "Unknown Error"), so the remaining gap (≈8×) is unprofiled — likely
+  per-warp tile size (llama.cpp: 2× the mma per fragment load) and 4-byte
+  staging loads (llama.cpp: coalesced 16B row reads).
+
+Status: committed behind `MINFER_MMQ=1` (default stays the f16 8p path —
+MMQ would be a 3.5× prefill regression). Loader skips the w16 warm pass
+only when MMQ is actually active. Next lever (when a quiet GPU is
+available): llama.cpp-style bigger per-warp output tiles + wide/coalesced
+staging loads, re-rank KD vs occupancy.
+
 ## Part III — Remaining roadmap
 
 Measured budgets: f16 wmma GEMM ~35 TFLOPS (llama.cpp int8 MMQ ≈ 52
@@ -117,11 +157,10 @@ equivalent); MMVQ weight streaming 130–147 GB/s effective vs 252.7 GB/s
 read-only probe (93% of the 273 GB/s theoretical); llama.cpp achieves
 ~197 GB/s on the same decode shape.
 
-- **R1 — int8 MMQ prefill GEMM** (the 7B prefill parity lever): quantize
-  activations to q8_0 on the fly (`quantize_q8_0_pad40` already exists
-  from 8e) and run tiled int8 dp4a/tensor-core GEMM per weight type —
-  llama.cpp's MMQ structure. Expected 7B @2K → 3000+ tok/s. The 8p fused
-  kernel (raw B bytes in-register) is the natural skeleton.
+- **R1 — int8 MMQ prefill GEMM** (the 7B prefill parity lever): IMPLEMENTED
+  2026-08-31, **opt-in** (`MINFER_MMQ=1`), not yet competitive — see the
+  Part II R1 record for the design, parity evidence, and the measured
+  per-shape numbers that keep the f16 8p path as the default.
 - **R2 — MMVQ weight-streaming efficiency**: close 147 → ~197 GB/s
   (llama) against the 252.7 GB/s platform probe: access-pattern and
   occupancy work on the per-type decode kernels; lm_head (Q6_K, 444 MB

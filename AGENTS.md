@@ -201,7 +201,7 @@ All non-root documentation lives in **`docs/`** (the project root only keeps `AG
 | CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
 | **CUDA graph backend plan + implementation record (Phase 7a–7e complete: per-op dispatch, capture/replay, K-quant vectorization, F32 matmul, FusedFFN, pinned staging)** | `docs/CUDA-BACKEND-PLAN.md` |
 | **CUDA follow-up plan (Phase 8: correctness debts, KV f16, prefill Q8_0 GEMM, attention, MMQ tiling, Q5_K, prefill graphs)** | `docs/CUDA-FOLLOWUP-PLAN.md` |
-| **CUDA roadmap (live): current GB10 perf vs llama.cpp, 8m–8p + R3 session record, remaining R1–R2 plan; Part IV keeps the pre-Phase-7 draft history with per-item outcomes.** (`docs/CUDA_PROBLEMS.md` = old problems list, pre-Phase-7) | `docs/CUDA_OPTIMIZATION.md` |
+| **CUDA roadmap (live): current GB10 perf vs llama.cpp, 8m–8p + R3 session record, R1 int8 MMQ prefill GEMM (landed opt-in `MINFER_MMQ=1`, parity-verified, perf pending) + R2 plan; Part IV keeps the pre-Phase-7 draft history with per-item outcomes.** (`docs/CUDA_PROBLEMS.md` = old problems list, pre-Phase-7) | `docs/CUDA_OPTIMIZATION.md` |
 | Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
 | KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
 | Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |

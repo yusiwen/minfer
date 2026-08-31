@@ -499,7 +499,9 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
             .filter_map(|(t, _)| t.as_ref())
             .map(|t| t.data.len())
             .sum();
-        let warmable = warm_bytes >= crate::cuda::W16_ENABLE_BYTES;
+        // R1: with the int8 MMQ prefill GEMM active the f16 cache would be
+        // dead weight (MMQ streams raw quantized bytes) — skip the warm pass.
+        let warmable = warm_bytes >= crate::cuda::W16_ENABLE_BYTES && !cuda.mmq_active();
         if warmable {
             cuda.enable_w16_cache();
         }

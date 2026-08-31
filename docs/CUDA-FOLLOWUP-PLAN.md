@@ -485,6 +485,23 @@ should exist exactly once per weight, not once per call.
   loads). The old parity test never exercised Q5_0/Q5_1.
 - Remaining prefill gap to llama.cpp (3401) is the f16 tensor-core
   ceiling (~35 TFLOPS) vs their int8 MMQ (~52) — P2, see 8m.
+- **R1 (2026-08-31, opt-in `MINFER_MMQ=1`)**: the int8 MMQ prefill GEMM
+  landed as a custom kernel on the 64×64 tile skeleton implementing
+  llama.cpp's MMQ math (q8_0 pad40 activations + the block int sum at
+  offset 36, raw quantized weights, `mma.m16n8k32` s8, per-(token,row,
+  k-block) rescale `da·ds·acc + da·dm·sa`; q6_K = k32 chunks with dual
+  m16n8k16 + dual 16-sub rescale). Parity-verified on all 8 types × 8
+  shapes vs a host CPU q8_0-activation reference (max diff < 1e-3);
+  greedy 7B output identical to the f16 path. NOT default: measured
+  ~2.9 TMAC/s per matmul (412 tok/s @2K quiet, 155 under sglang load)
+  vs the f16 path's 1460 — the ~8× gap to llama.cpp's MMQ (~24 TMAC/s on
+  this part) is unprofiled (ncu cannot sample GB10) and is the next
+  lever: bigger per-warp output tiles + coalesced wide staging loads.
+  Layout notes: pad40 q8 blocks now carry `int32 sum` at byte 36 (was
+  slack — MMVQ decode kernels read only d@0/payload@4..36, unaffected);
+  MMQ skips the w16 warm pass when active (`mmq_active()` = cc ≥ 800 &&
+  `MINFER_MMQ=1`); staging depth 8×32-k (~94 KB dynamic shared, opt-in)
+  measured better than 4×32-k (2 blocks/SM) under load.
 
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 

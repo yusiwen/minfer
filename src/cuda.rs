@@ -306,6 +306,22 @@ extern "C" {
         q6_stride: i32,
         stream: *mut std::ffi::c_void,
     );
+    // R1: int8 MMQ prefill GEMM — q8_0-quantized activations (pad40 blocks
+    // with the per-block int sum at offset 36) × raw quantized weights, tiled
+    // mma.m16n8k32/m16n8k16 (s8) with per-k-block scale rescale. type_id as
+    // in launch_dequant_f16; q6_stride = 210 raw / 224 padded (Q6_K only).
+    // Requires id % 32 == 0 and sm_80+ (int8 mma; sm_75 falls back).
+    fn launch_mmq_nt(
+        type_id: i32,
+        w: *const u8,
+        q8: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        q6_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
     // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
     // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
     fn launch_fa_prefill_f16kv(
@@ -559,6 +575,9 @@ pub struct CudaState {
     /// loaded models resident on a shared overcommitted CUDA pool and a
     /// +1-2 GB cache per loaded model tipped it over (probability OOMs).
     w16_enabled: std::sync::atomic::AtomicBool,
+    /// R1: device compute capability ×100 (e.g. 1210 = sm_12.1), read once at
+    /// init. Gates the int8-mma MMQ prefill path (needs sm_80+ — mma.m16n8k32).
+    cc: std::sync::atomic::AtomicI32,
     /// Names registered through `register_weight_q6k_padded` (device layout
     /// is 224-byte-padded Q6_K, not the raw GGUF byte stream) → the
     /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
@@ -852,6 +871,7 @@ impl CudaState {
             weights: Mutex::new(HashMap::new()),
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
+            cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
             padded_weights: Mutex::new(HashMap::new()),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
@@ -1597,14 +1617,16 @@ impl CudaState {
         nt: usize,
         padded_q6k: bool,
     ) -> Result<(), String> {
-        // 8m: prefill (nt >= 16) runs ONE tiled wmma f16 GEMM for every
-        // quantized weight type — dequant weights to f16 scratch once per
-        // call, convert activations, single tensor-core GEMM. The legacy
-        // per-type kernels are decode-shaped (grid.y = nt): every token
-        // block re-streamed the whole weight matrix (7B q4_k_m @2K prefill
-        // 30.7 tok/s vs llama.cpp MMQ 3401). id % 32 == 0 covers the block
-        // math of every type and keeps the GEMM's uint4 tile loads aligned.
-        // MINFER_NO_PREFILL_GEMM=1 forces the legacy kernels (A/B escape).
+        // 8m: prefill (nt >= 16) runs ONE tiled GEMM for every quantized
+        // weight type. R1 (2026-08-31): the int8 MMQ GEMM — activations
+        // quantized to q8_0 once per call, raw weight bytes staged per tile,
+        // mma.m16n8k32 (s8) with per-k-block scale rescale (llama.cpp's MMQ
+        // structure; see mmq_nt_kernel). OPT-IN via MINFER_MMQ=1: correct on
+        // all types/shapes (parity-tested) but currently slower than the f16
+        // path on GB10 (see mmq_enabled doc) — the default stays the 8p/8m
+        // f16 wmma path. MINFER_NO_PREFILL_GEMM=1 still forces the legacy
+        // per-type kernels. id % 32 == 0 covers the block math of every type
+        // (q6_K runs as k32 chunks with dual 16-sub rescale inside).
         if nt >= 16
             && id % 32 == 0
             && !Self::no_prefill_gemm()
@@ -1620,6 +1642,9 @@ impl CudaState {
                     | TensorType::Q6_K
             )
         {
+            if self.mmq_active() {
+                return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k);
+            }
             return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
         }
         let stream = self.stream();
@@ -1745,6 +1770,96 @@ impl CudaState {
                 "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"
             )),
         }
+    }
+
+    /// R1: `MINFER_MMQ=1` opts the prefill path INTO the int8 MMQ GEMM.
+    /// Default OFF (2026-08-31): the kernel is parity-verified on all 8
+    /// types but measures ~2.5-3 GMAC/s per matmul under GPU contention
+    /// vs ~8-11 for the f16 w16-cache path (7B @2K: ~155 vs ~630-880
+    /// tok/s) — needs a big-tile/ILP rework and a quiet GPU to tune
+    /// (llama.cpp's equivalent runs ~24 TMAC/s). All other A/B escapes
+    /// still work: `MINFER_NO_PREFILL_GEMM=1` (legacy per-type kernels).
+    fn mmq_enabled() -> bool {
+        std::env::var("MINFER_MMQ").map_or(false, |v| v == "1")
+    }
+
+    /// R1: the int8 MMQ prefill GEMM is active — sm_80+ (mma.m16n8k32 s8;
+    /// sm_75 only has k16) and opted in via MINFER_MMQ=1. The loader also
+    /// uses this to skip the f16 cache warm pass (MMQ streams raw weight
+    /// bytes; the w16 copy would be dead weight).
+    pub fn mmq_active(&self) -> bool {
+        self.cc.load(std::sync::atomic::Ordering::Relaxed) >= 800 && Self::mmq_enabled()
+    }
+
+    /// Device compute capability × 100 (e.g. 1210 = sm_121); 0 when no
+    /// device is initialized. Used by tests to gate sm_80+ kernels.
+    pub fn cc(&self) -> i32 {
+        self.cc.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// R1: int8 MMQ prefill GEMM — quantize activations to q8_0 (pad40
+    /// blocks; the quantize kernel also emits the per-block int sum used by
+    /// the min-term correction), then one tiled mma.m16n8k32 (s8) launch per
+    /// weight (see mmq_nt_kernel). Caller guarantees nt >= 16, id % 32 == 0,
+    /// and a supported quant type. The q8 scratch follows the same
+    /// grow-on-demand lifecycle as the f16 path's buf_f16_x: the 3-run
+    /// capture protocol sizes it before the capture window opens.
+    pub fn prefill_mmq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        ttype: TensorType,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        padded_q6k: bool,
+    ) -> Result<(), String> {
+        let type_id = match ttype {
+            TensorType::Q8_0 => 0,
+            TensorType::Q4_0 => 1,
+            TensorType::Q4_1 => 2,
+            TensorType::Q5_0 => 3,
+            TensorType::Q5_1 => 4,
+            TensorType::Q4_K => 5,
+            TensorType::Q5_K => 6,
+            TensorType::Q6_K => 7,
+            other => return Err(format!("cuda: prefill MMQ got unsupported type {other:?}")),
+        };
+        let need = nt * (id / 32) * 40;
+        let q8 = Self::get_or_grow(&self.buf_q8_prefill, need);
+        if q8.is_null() {
+            return Err("cuda: prefill MMQ q8 scratch OOM".to_string());
+        }
+        // Q6_K reads whichever layout the weight was registered with
+        // (224-byte padded 7e② repack or raw 210); all others are raw.
+        let block_stride: i32 = if ttype == TensorType::Q6_K && padded_q6k {
+            224
+        } else {
+            210
+        };
+        let stream = self.stream();
+        unsafe {
+            launch_quantize_q8_0_pad40(
+                x as *const f32,
+                q8 as *mut u8,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+            launch_mmq_nt(
+                type_id,
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                nt as i32,
+                od as i32,
+                id as i32,
+                block_stride,
+                stream,
+            );
+        }
+        Ok(())
     }
 
     /// 8m: prefill GEMM — dequant the weight to f16 scratch once, convert
