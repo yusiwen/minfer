@@ -266,7 +266,7 @@ weights over real unpack_q4k_scales, 5e-3); 0.5B q5_k_m E2E — CUDA now
 admits the model (was CPU wholesale), greedy output identical to CPU;
 cuda 155/0. Q5_0 deferred (no model needs it; add when one does).
 
-## 8g. Prefill capture — **8g① DONE (8a batch); 8g② DONE 2026-08-29 (`eb24054`)**
+## 8g. Prefill capture — **8g① DONE (8a batch); 8g② DONE 2026-08-29 (`eb24054`); R3-B default flipped ON 2026-08-31 (`761e236`)**
 
 Two findings from the Phase 8 completeness audit (2026-08-29):
 
@@ -283,6 +283,15 @@ Two findings from the Phase 8 completeness audit (2026-08-29):
    replays bit-identical to direct launches at pp16 AND pp300
    (captured_count == 1 each); real-model smoke unchanged output.
    Default OFF (the 8g① no-capture assertion still holds).
+3. **R3-B — default ON (`761e236`, 2026-08-31):** with the pp16/pp300
+   parity harness green and R3-A1 making the real prefill graph a single
+   split, the gate now defaults ON (3-run protocol still bounds the cost;
+   a one-shot CLI prefill never captures). `MINFER_NO_PREFILL_CAPTURE=1`
+   opts out; `MINFER_CAPTURE_PREFILL=1` is redundant but accepted. The
+   8g① negative test now drives the opt-out via
+   `set_prefill_capture_for_test(false)` (env is process-global and the
+   suite runs in parallel); `cuda_prefill_capture_defaults_on` pins the
+   new default.
 
 ## 8h. Infra / process
 

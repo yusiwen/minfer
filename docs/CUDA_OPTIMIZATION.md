@@ -8,7 +8,7 @@
 > Single-sourced implementation records: `docs/CUDA-BACKEND-PLAN.md`
 > (Phase 7a–7e) and `docs/CUDA-FOLLOWUP-PLAN.md` (Phase 8, 8a–8p).
 
-## Part I — Current state (DGX Spark GB10, master `b9e7a91`)
+## Part I — Current state (DGX Spark GB10, master `761e236`)
 
 llama.cpp baseline: llama-bench `ca3d5a3e1`, 8 threads, `-ngl 99`, GB10
 CUDA. minfer: CLI single-shot, greedy.
@@ -41,14 +41,21 @@ dispatched by `src/graph/cuda_backend.rs`):
 - **Decode (nt == 1)**: per-type MMVQ over q8_0-quantized activations
   (8e/8e②: dp4a, llama.cpp's `MMVQ_PARAMETERS_GB10` launch table), fused
   bias+rope+store, whole-step CUDA-graph capture/replay (7d) — one graph
-  launch (~57 µs) per token instead of ~2.7K kernel launches.
+  launch (~57 µs) per token instead of ~2.7K kernel launches. Logits
+  read back through a pinned staging buffer (R3-A2;
+  `MINFER_NO_PINNED_READBACK=1` reverts).
   A/B: `MINFER_NO_CUDA_GRAPH=1`.
 - A dequant-in-GEMM kernel (`gemm_qb_nt_kernel`, raw quantized B tiles
   unpacked in-register, all 8 types) exists as the memory-lean
   alternative — `MINFER_FUSED_B=1` (8p; slower than the cached f16 path
   on large nt).
+- **Graph capture defaults**: decode steps capture automatically;
+  repeated identical-nt prefill splits capture automatically after the
+  3-run protocol (R3-B — a one-shot CLI prefill never reaches 3 runs and
+  pays nothing). `MINFER_NO_PREFILL_CAPTURE=1` opts out;
+  `MINFER_CAPTURE_PREFILL=1` (the 8g② opt-in) is redundant but accepted.
 
-## Part II — Landed in the Aug 30 session (`ba3f317`…`b9e7a91`)
+## Part II — Landed in the Aug 30 session (`ba3f317`…`761e236`)
 
 - **8m/8m② — wmma prefill GEMM** (`ba3f317`): one 64×64 f16 tensor-core
   GEMM over all 8 quant types replaces per-token weight re-streaming;
@@ -70,6 +77,39 @@ dispatched by `src/graph/cuda_backend.rs`):
   `cudaErrorMisalignedAddress` in `dequant_q5_0_f16` (u32 load at blk+2
   on 22-byte blocks) that would have crashed any Q5_0 prefill GEMM.
 
+### R3 — small-model per-token overhead (Aug 31, `029a9a4`…`761e236`)
+
+Motivation: 0.5B decode is ~4.0 ms/token with ~1.6 ms of GPU floor
+(409 MB weights ÷ the 252.7 GB/s probe) — ~2.4 ms of CPU/sync overhead.
+Findings came from `MINFER_GRAPH_TRACE` + a DOT dump rather than
+assumption:
+
+- **R3-A1 — single-split prefill** (`029a9a4`): the G3 tail-row-reduction
+  input `tail_ids` was declared MID-graph (beside its consumers before the
+  last layer's FFN), splitting every prefill forward into 4 splits — 2
+  extra full-stream syncs + host round-trip copies per forward, and only
+  the body split could capture. Declared at the head next to
+  token_ids/positions (conditional on `n_out < nt`, as before), prefill is
+  one CUDA split. Decode graphs never contained it (already single-split).
+  Greedy output bit-identical.
+- **R3-A2 — pinned D2H readback** (`a213c89`): the per-step logits readback
+  ran a blocking `cudaMemcpy` into a PAGEABLE Vec (driver-internal pinned
+  bounce — the H2D side fixed this in 7e⑥, the D2H side never got the same
+  treatment), then `forward_graph` cloned the full buffer again although
+  the graph output is already exactly n_out×nv. Now: grow-on-demand pinned
+  staging buffer + no redundant clone (`MINFER_NO_PINNED_READBACK=1`
+  reverts).
+- **R3-B — prefill capture defaults ON** (`761e236`): 8g②'s validated
+  opt-in becomes automatic (3-run protocol still bounds the cost; A1 made
+  the real prefill graph a single split). `MINFER_NO_PREFILL_CAPTURE=1`
+  opts out; `MINFER_CAPTURE_PREFILL=1` redundant but accepted.
+
+Bench status: recorded under heavy GPU contention (the shared-box sglang
+server was actively serving, ~96% util — interleaved same-binary A/B
+showed the pinned path at parity to slightly ahead). Clean pre/post
+numbers pending a quiet GPU; decode parity verified via bit-identical
+greedy output and the 163-test suite.
+
 ## Part III — Remaining roadmap
 
 Measured budgets: f16 wmma GEMM ~35 TFLOPS (llama.cpp int8 MMQ ≈ 52
@@ -87,12 +127,13 @@ read-only probe (93% of the 273 GB/s theoretical); llama.cpp achieves
   occupancy work on the per-type decode kernels; lm_head (Q6_K, 444 MB
   per token) is the single biggest row. Expected: decode @2K 36 → ~40,
   tg128 40.8 → ~45.
-- **R3 — small-model per-token overhead**: 0.5B decode is 3.8 ms/token
-  with ~1 ms of GPU work; prefill is 10× behind llama (launch/CPU bound).
-  Prefill CUDA-graph capture exists as an opt-in
-  (`MINFER_CAPTURE_PREFILL=1`, 8g②) — make repeated same-shape prefill
-  capture automatic, audit the per-step input-fill / logits-readback
-  path. Expected: 0.5B decode 257 → 350+.
+- **R3 — small-model per-token overhead**: LARGELY DONE (Aug 31, see
+  Part II). 0.5B decode was ~4.0 ms/token with ~1.6 ms of GPU floor:
+  prefill single-split (A1), pinned logits readback + no clone (A2),
+  prefill capture automatic (B). Remaining: clean pre/post bench numbers
+  on a quiet GPU; the sampler's `apply_top_k` scratch alloc (608 KB/token
+  when top_k is enabled — greedy benches never hit it) if non-greedy
+  numbers justify it.
 - **Not planned** (revisit with a concrete need): cuBLAS/cublasLt
   (evaluated → closed as 8k; 8m's custom wmma GEMM covered the f16 path),
   VMM pool, multi-GPU, node reordering, Windows, IQ/Q2/Q3 quants.
