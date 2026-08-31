@@ -50,6 +50,19 @@ impl Qwen3Graph {
 
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
+        // G3 tail-row reduction input, declared at the graph HEAD (not beside
+        // its consumers at the last layer): an input node mid-graph splits the
+        // forward into extra CPU/CUDA boundaries (2 full-stream syncs + host
+        // round-trip copies per step on the split path). R3-A1,
+        // docs/CUDA_OPTIMIZATION.md Part III. Node order is not semantics —
+        // the consumers below just reference the handle.
+        let tail_ids = (params.n_out < nt).then(|| {
+            b.input(
+                "tail_ids",
+                [params.n_out, 1, 1, 1],
+                crate::graph::DType::I32,
+            )
+        });
 
         let mut h = b.embedding(inp_ids, model.tok_embd.as_ref().unwrap());
 
@@ -166,12 +179,9 @@ impl Qwen3Graph {
             let wo = b.matmul(attn_out, l.wo.as_ref().unwrap(), None);
             let is_last = il == model.layers.len() - 1;
             if is_last && params.n_out < nt {
-                // G3: reduce to the tail n_out rows BEFORE the last layer's FFN
-                let tail_ids = b.input(
-                    "tail_ids",
-                    [params.n_out, 1, 1, 1],
-                    crate::graph::DType::I32,
-                );
+                // G3: reduce to the tail n_out rows BEFORE the last layer's FFN.
+                // The tail_ids input itself is declared at the graph head.
+                let tail_ids = tail_ids.expect("tail_ids input declared when n_out < nt");
                 let cur_tail = b.get_rows(wo, tail_ids, [ne, params.n_out, 1, 1]);
                 let res_tail = b.get_rows(residual, tail_ids, [ne, params.n_out, 1, 1]);
                 h = b.add(res_tail, cur_tail);
