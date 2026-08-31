@@ -50,9 +50,11 @@ pub struct CudaBackend {
     /// `MINFER_NO_CUDA_GRAPH=1` (at construction) or a capture failure
     /// (session-wide) force the plain direct-launch path.
     graphs_mode: GraphMode,
-    /// 8g②: deliberate prefill-capture opt-in (default off). Repeated
-    /// identical-nt prefills (server/slot scenario) may then capture after
-    /// the usual 3-run protocol; MINFER_CAPTURE_PREFILL=1 enables it.
+    /// 8g②: prefill capture gate. R3-B (2026-08-31): DEFAULT ON — repeated
+    /// identical-nt prefills (server/slot scenario) capture after the usual
+    /// 3-run protocol; a one-shot CLI prefill never reaches 3 runs and pays
+    /// nothing. `MINFER_NO_PREFILL_CAPTURE=1` restores the old default-off
+    /// (`MINFER_CAPTURE_PREFILL=1` is now redundant but still accepted).
     prefill_capture: bool,
 }
 
@@ -92,7 +94,7 @@ impl CudaBackend {
         } else {
             GraphMode::Enabled
         };
-        let prefill_capture = std::env::var("MINFER_CAPTURE_PREFILL").as_deref() == Ok("1");
+        let prefill_capture = std::env::var("MINFER_NO_PREFILL_CAPTURE").as_deref() != Ok("1");
         Some(Self {
             state,
             pool: Vec::new(),
@@ -202,13 +204,15 @@ impl CudaBackend {
         }
         let runs = self.graph_runs.entry(key).or_insert(0);
         *runs += 1;
-        // 8g①: capture decode-shaped graphs only (nt_hint None = no matmul
-        // in the graph, synthetic tests). A repeated identical-nt prefill
-        // (server/slot scenario) must not silently start capturing a
-        // ~437-node graph that was never validated for capture. 8g② turns
-        // prefill capture into a DELIBERATE opt-in (test setter or
-        // MINFER_CAPTURE_PREFILL=1) — gated by the pp16/pp300 bit-parity
-        // harness.
+        // 8g①: capture decode-shaped graphs by default (nt_hint None = no
+        // matmul in the graph, synthetic tests). Prefill-shaped graphs
+        // (nt > 1) capture only with the prefill_capture gate: 8g② made
+        // that a deliberate opt-in after an audit caught unvalidated
+        // capture; R3-B (2026-08-31) flips the default ON — the 3-run
+        // protocol bounds the cost, A1 made the real prefill graph a
+        // single split, and the pp16/pp300 bit-parity harness validated
+        // replay at real-prefill scale. MINFER_NO_PREFILL_CAPTURE=1 opts
+        // out (8g① semantics).
         if *runs >= 3
             && self.capturing.is_none()
             && nt_hint.map_or(true, |nt| nt == 1 || self.prefill_capture)
@@ -4235,10 +4239,11 @@ mod tests {
         assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
     }
 
-    /// 8g①: a prefill-shaped graph (any matmul with nt > 1) must NEVER open
-    /// a capture window, even after 3+ executions of the same (uid, range) —
-    /// a repeated identical-nt prefill (server scenario) would otherwise be
-    /// captured without validation.
+    /// 8g①: a prefill-shaped graph (any matmul with nt > 1) must not open a
+    /// capture window while prefill capture is OFF — the R3-B default is ON,
+    /// so this exercises the opt-out (set_prefill_capture_for_test(false)
+    /// standing in for `MINFER_NO_PREFILL_CAPTURE=1`): no capture even after
+    /// 3+ executions of the same (uid, range).
     #[test]
     fn cuda_prefill_shaped_graph_never_captures() {
         // 8m: serialize against other tests' stream users — capture on the shared
@@ -4267,6 +4272,7 @@ mod tests {
 
         let sched = BackendScheduler;
         let mut cap = replay_alloc(true);
+        cap.cuda_mut().unwrap().set_prefill_capture_for_test(false);
         sched.assign_backends(&mut g, &mut cap);
         cap.cuda_mut().unwrap().state.register_weight(
             "w",
@@ -4350,10 +4356,23 @@ mod tests {
         );
     }
 
-    /// 8g②: deliberate prefill capture — with the opt-in ON, a repeated
-    /// identical-nt prefill-shaped graph captures after the 3-run protocol
-    /// and replays BIT-IDENTICAL to direct launches, at both pp16 and pp300
-    /// (the ~437-node real-prefill scale). Default remains OFF (8g① test).
+    /// R3-B: the prefill-capture gate defaults ON (8g②'s opt-in flipped).
+    /// The OFF path is covered by cuda_prefill_shaped_graph_never_captures.
+    #[test]
+    fn cuda_prefill_capture_defaults_on() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let cb = CudaBackend::new().expect("backend after device init");
+        assert!(cb.prefill_capture, "prefill capture must default ON (R3-B)");
+    }
+
+    /// 8g②: prefill capture — with the gate ON, a repeated identical-nt
+    /// prefill-shaped graph captures after the 3-run protocol and replays
+    /// BIT-IDENTICAL to direct launches, at both pp16 and pp300 (the
+    /// ~437-node real-prefill scale). R3-B: the gate now defaults ON (the
+    /// set call below is kept as an explicit statement of intent).
     #[test]
     fn cuda_prefill_capture_bit_parity_pp16_pp300() {
         // 8m: serialize against other tests' stream users — capture on the shared
