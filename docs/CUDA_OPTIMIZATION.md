@@ -185,6 +185,36 @@ the tiles L2-hot, and with ncu blocked there is no second hypothesis
 worth a build cycle. Reverted; fa_prefill_f16kv stays 1.86 ms/layer
 (P5 state), 2.4x behind llama.cpp per layer but only ~6% of the wall.
 
+### P6 r9: the llama.cpp MMQ reference, decoded — and the shape axis closed
+
+Read the actual reference (mmq-config-blackwell.cuh falls through to
+mmq-config-ampere.cuh for Q4_K): 256 threads, targeted occupancy 1,
+SRAM tile I=128 od-rows x J<=128 tokens, ITER_K=256, SYNCHRONOUS
+staging (plain global->smem int loads, no cp.async), float
+sum[J*I/threads] accumulators, 16 mma.m16n8k32 per warp per 32-k chunk.
+Instruction model: ~0.018 inst/MAC/thread vs our raw kernel's 0.133 —
+that ratio, not tile shape alone, is where their ~30 TMAC/s comes from.
+
+Sync-staging applied to our wide kernel (single buffer, 54 KB, 2
+blocks/SM): parity green, 462-466 tok/s vs narrow 481 — still loses.
+Full shape matrix on GB10 @2K (all parity-clean, MINFER_MMQ=1):
+
+  narrow  cp.async 64x64  KD=8  481   <- local optimum
+  sync    wide 128x64     KD=8  464
+  compact cp.async 128x64 KD=8  410   (sda_q sync loads serialise)
+  wide    cp.async 128x64 KD=4  428
+  narrow  cp.async 64x64  KD=4  427
+  R1 word-stage 64x64     KD=8  441
+
+B-DRAM-halving is dead on this device (L2 absorbs re-reads); wider
+tiles pay more in staging/sync than they save. The shape axis is
+exhausted with evidence. The one remaining MMQ lever is llama.cpp's
+MMA data layout: pre-arranged mma fragments for the weight side, which
+could be produced at WEIGHT-LOAD time by our existing w16 dequant pass
+(currently producing f16 we then re-read). That is a load-time format
+change plus a kernel rewrite against a new payload layout — a
+standalone decision, not a shape tweak.
+
 P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
 427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth
 amortization dominates — docs finding above confirmed). The bigger
