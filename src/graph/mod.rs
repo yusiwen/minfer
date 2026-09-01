@@ -119,6 +119,11 @@ impl ComputeGraph {
     /// node's output row count (activations are [d, nt]). `None` when the
     /// graph has no matmul (synthetic test graphs), which leaves the capture
     /// decision untouched.
+    ///
+    /// CUDA-only surface: the sole callers (the scheduler's replay path and
+    /// CUDA tests) are `#[cfg(feature = "cuda")]`, so the method is gated
+    /// too — non-CUDA builds drop it (and its dead-code warning) entirely.
+    #[cfg(feature = "cuda")]
     pub fn capture_nt_hint(&self) -> Option<usize> {
         self.nodes.iter().find_map(|n| match &n.meta {
             crate::graph::ops::NodeMeta::MatMul(_) => Some(n.out_shape[1]),

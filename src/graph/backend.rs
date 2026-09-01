@@ -83,6 +83,12 @@ pub trait Backend: Send + Sync {
     /// `nt_hint`: the graph's token count when it has matmul nodes
     /// (`capture_nt_hint()`), `None` otherwise. Backends that support graph
     /// capture (CUDA) use it to gate capture to decode-shaped graphs (8g①).
+    ///
+    /// CUDA-only surface: the sole caller (the scheduler's replay path) and
+    /// the only override (CudaBackend) are both `#[cfg(feature = "cuda")]`,
+    /// so the method itself is gated too — non-CUDA builds drop it (and its
+    /// dead-code warning) entirely.
+    #[cfg(feature = "cuda")]
     fn graph_replay(&mut self, _uid: u64, _range: (usize, usize), _nt_hint: Option<usize>) -> bool {
         false
     }
