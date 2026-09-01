@@ -294,6 +294,7 @@ extern "C" {
     );
     // P6: A arrives as f32 activations; the GEMM converts on stage — the
     // separate convert_f32_f16 pass disappears for every prefill matmul.
+    fn gemm_prefill_smem_init();
     fn launch_gemm_f32a(
         a: *const f32,
         b: *const std::ffi::c_void,
@@ -1016,6 +1017,13 @@ impl CudaState {
         );
 
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
+        // Eager dynamic-smem opt-in for the prefill GEMM instantiations:
+        // must happen BEFORE any stream capture — capture mode Global
+        // forbids cudaFuncSetAttribute, so a lazy first-use opt-in fails
+        // and the >48KB launch poisons the context (error 700).
+        unsafe {
+            gemm_prefill_smem_init();
+        }
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
             staging: Mutex::new(None),

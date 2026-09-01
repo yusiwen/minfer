@@ -3393,9 +3393,46 @@ static void gemm_smem_optin(K kernel, size_t bytes) {
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
         if (e != cudaSuccess) {
             cudaGetLastError(); // do not poison the stream; the launch errors below
+            fprintf(stderr, "minfer/cuda: gemm smem optin %zu B failed: %s\n", bytes,
+                    cudaGetErrorString(e));
             return;
         }
         done = bytes;
+    }
+}
+
+// Set every prefill-GEMM instantiation's dynamic-smem attribute EAGERLY:
+// the AF32 variants need >48KB, and an attribute set lazily during CUDA
+// graph capture fails silently and poisons the first captured launch.
+extern "C" void gemm_prefill_smem_init() {
+    const int tms[3] = {64, 128, 256};
+    for (int i = 0; i < 3; i++) {
+        int tm = tms[i], threads = (tm >= 256) ? 512 : 256, nw = threads >> 5;
+        for (int ks = 32; ks <= 64; ks += 32) {
+            size_t base = (size_t)(2 * 64 * ks + 2 * tm * ks) * 2 + (size_t)nw * 256 * 4;
+            for (int af32 = 0; af32 <= 1; af32++) {
+                size_t bytes = base + (af32 ? (size_t)2 * 64 * ks * 4 : 0);
+                if (bytes > 48 * 1024) {
+#define OPTIN(TM2, KS2, AF2)                                                       \
+    cudaFuncSetAttribute(gemm_f16_nt_kernel_t<TM2, KS2, AF2>,                      \
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes)
+                    if (tm == 64 && ks == 32 && af32) OPTIN(64, 32, true);
+                    else if (tm == 64 && ks == 32) OPTIN(64, 32, false);
+                    else if (tm == 64 && ks == 64 && af32) OPTIN(64, 64, true);
+                    else if (tm == 64 && ks == 64) OPTIN(64, 64, false);
+                    else if (tm == 128 && ks == 32 && af32) OPTIN(128, 32, true);
+                    else if (tm == 128 && ks == 32) OPTIN(128, 32, false);
+                    else if (tm == 128 && ks == 64 && af32) OPTIN(128, 64, true);
+                    else if (tm == 128 && ks == 64) OPTIN(128, 64, false);
+                    else if (tm == 256 && ks == 32 && af32) OPTIN(256, 32, true);
+                    else if (tm == 256 && ks == 32) OPTIN(256, 32, false);
+                    else if (tm == 256 && ks == 64 && af32) OPTIN(256, 64, true);
+                    else if (tm == 256 && ks == 64) OPTIN(256, 64, false);
+                    cudaGetLastError(); // oversize requests (TM=256+KS=64) are fine to skip
+#undef OPTIN
+                }
+            }
+        }
     }
 }
 
@@ -3487,6 +3524,11 @@ void launch_gemm_f32a(
     int nt, int od, int id, cudaStream_t stream
 ) {
     launch_gemm_f16(reinterpret_cast<const __half*>(a), b, c, nt, od, id, stream, true);
+    // P6 debug: surface the async launch error (A32-in-capture still fails)
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        fprintf(stderr, "minfer/cuda: af32 gemm launch failed: %s\n",
+                cudaGetErrorString(e));
 }
 
 
