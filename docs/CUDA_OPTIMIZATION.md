@@ -178,6 +178,13 @@ the f16 GEMM path (2318); making MMQ default requires the inner-loop
 restructure nobody has a profile for. The default f16 path is
 UNTOUCHED by all P6 work and remains 2320-2370 tok/s.
 
+FA (Step 4): an L2-prefetch of the next KV tile before the
+single-buffered stage measured a null delta (2319-2345 vs 2345) — the
+GQA sharing (7 q-heads per kv head read the same K/V) already keeps
+the tiles L2-hot, and with ncu blocked there is no second hypothesis
+worth a build cycle. Reverted; fa_prefill_f16kv stays 1.86 ms/layer
+(P5 state), 2.4x behind llama.cpp per layer but only ~6% of the wall.
+
 P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
 427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth
 amortization dominates — docs finding above confirmed). The bigger
