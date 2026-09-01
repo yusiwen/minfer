@@ -290,6 +290,18 @@ extern "C" {
         od: i32,
         id: i32,
         stream: *mut std::ffi::c_void,
+        af32: bool,
+    );
+    // P6: A arrives as f32 activations; the GEMM converts on stage — the
+    // separate convert_f32_f16 pass disappears for every prefill matmul.
+    fn launch_gemm_f32a(
+        a: *const f32,
+        b: *const std::ffi::c_void,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        stream: *mut std::ffi::c_void,
     );
     // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
     // in-register (no f16 weight scratch round trip). type_id mapping as in
@@ -2176,7 +2188,6 @@ impl CudaState {
             }
             return Ok(());
         }
-        let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
         let w16 = match self.w16_get(wptr, type_id, od, id, block_stride) {
             Some(p) => p, // persistent copy, dequant already done
             None => {
@@ -2195,6 +2206,30 @@ impl CudaState {
                 w16
             }
         };
+        // P6 negative result: in-kernel f32->f16 A conversion measured
+        // ~8% SLOWER end-to-end (2172-2177 vs 2365 tok/s) — the A stage
+        // loses cp.async and its synchronous 32B loads stall every k-tile,
+        // costing more than the 56 ms convert pass it removes. Kept behind
+        // MINFER_GEMM_A32=1 for the smem-mirror variant follow-up (cp.async
+        // the f32 tile to smem, convert smem->smem — no global round trip).
+        let af32 = std::env::var("MINFER_GEMM_A32")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if af32 {
+            unsafe {
+                launch_gemm_f32a(
+                    x as *const f32,
+                    w16,
+                    out as *mut f32,
+                    nt as i32,
+                    od as i32,
+                    id as i32,
+                    stream,
+                );
+            }
+            return Ok(());
+        }
+        let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
         unsafe {
             launch_convert_f16(x as *const f32, x16, (nt * id) as i64, stream);
             launch_gemm_f16(
@@ -2205,6 +2240,7 @@ impl CudaState {
                 od as i32,
                 id as i32,
                 stream,
+                false,
             );
         }
         Ok(())

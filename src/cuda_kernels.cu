@@ -3123,21 +3123,60 @@ __device__ __forceinline__ void gemm_load_b_sync(
 // templated GEMM.
 } // extern "C"
 
+// One 16B smem chunk (8 halves) of the A tile staged from an F32 source:
+// 32B global read -> 8 converts -> 16B store. No cp.async conversion
+// exists, so the A side loses async staging; the tile is small (4-8KB)
+// and hides behind the B panel's cp.async. Requires id % 8 == 0 (16B
+// row alignment comes from the id % 32 dispatch gate).
+template <int KS>
+__device__ __forceinline__ void gemm_stage_a32(
+    __half* As, int bbuf, const float* A32, int TN,
+    int n0, int k0, int nt, int id, int tid
+) {
+    for (int c = tid; c < TN * KS / 8; c += 256) {
+        int r = (c * 8) / KS, d = (c * 8) % KS;
+        int n = n0 + r;
+        uint4 h = make_uint4(0u, 0u, 0u, 0u);
+        if (n < nt && k0 + d < id) {
+            const float4 f0 = *reinterpret_cast<const float4*>(
+                A32 + (long long)n * id + k0 + d);
+            const float4 f1 = *reinterpret_cast<const float4*>(
+                A32 + (long long)n * id + k0 + d + 4);
+            __half2 p0 = __floats2half2_rn(f0.x, f0.y);
+            __half2 p1 = __floats2half2_rn(f0.z, f0.w);
+            __half2 p2 = __floats2half2_rn(f1.x, f1.y);
+            __half2 p3 = __floats2half2_rn(f1.z, f1.w);
+            h = make_uint4(*reinterpret_cast<unsigned*>(&p0),
+                           *reinterpret_cast<unsigned*>(&p1),
+                           *reinterpret_cast<unsigned*>(&p2),
+                           *reinterpret_cast<unsigned*>(&p3));
+        }
+        *reinterpret_cast<uint4*>(As + bbuf * TN * KS + r * KS + d) = h;
+    }
+}
+
 // P4: stage the A (TN rows) and B (TM rows) k-tiles [k0, k0+KS) into the
 // double-buffered dynamic-smem regions. Chunk-linear mapping: chunk c
 // covers 8 consecutive halves, r = c*8/KS, d = c*8%KS (KS % 8 == 0).
-template <int TM, int KS, int TN>
+// AF32: A arrives as f32 activations and converts on stage (P6), so the
+// separate convert_f32_f16 pass disappears.
+template <int TM, int KS, int TN, bool AF32 = false>
 __device__ __forceinline__ void gemm_stage_ab(
     const __half* __restrict__ A, const __half* __restrict__ B,
     __half* As, __half* Bs, int bbuf,
     int n0, int m0, int k0, int nt, int od, int id, int tid
 ) {
 #if __CUDA_ARCH__ >= 800
-    for (int c = tid; c < TN * KS / 8; c += 256) {
-        int r = (c * 8) / KS, d = (c * 8) % KS;
-        int n = n0 + r;
-        gemm_cp16(As + bbuf * TN * KS + r * KS + d,
-                  A + (long long)n * id + k0 + d, n < nt && k0 + d < id);
+    if (AF32) {
+        gemm_stage_a32<KS>(As, bbuf, reinterpret_cast<const float*>(A), TN,
+                           n0, k0, nt, id, tid);
+    } else {
+        for (int c = tid; c < TN * KS / 8; c += 256) {
+            int r = (c * 8) / KS, d = (c * 8) % KS;
+            int n = n0 + r;
+            gemm_cp16(As + bbuf * TN * KS + r * KS + d,
+                      A + (long long)n * id + k0 + d, n < nt && k0 + d < id);
+        }
     }
     for (int c = tid; c < TM * KS / 8; c += 256) {
         int r = (c * 8) / KS, d = (c * 8) % KS;
@@ -3154,7 +3193,7 @@ __device__ __forceinline__ void gemm_stage_ab(
 // owns 32 nt rows x TM/4 od cols as 2 x TM/64 f32 fragment pairs). f32
 // accumulation. Tails: nt/od masked at store, k-tail zero-filled (id % 8
 // == 0 keeps the uint4 chunk loads aligned).
-template <int TM, int KS>
+template <int TM, int KS, bool AF32 = false>
 __global__ void gemm_f16_nt_kernel_t(
     const __half* __restrict__ A, const __half* __restrict__ B,
     float* __restrict__ C, int nt, int od, int id
@@ -3191,18 +3230,23 @@ __global__ void gemm_f16_nt_kernel_t(
     int buf = 0;
 #if __CUDA_ARCH__ >= 800
     // stage A (64 rows) + B (TM rows) for k = 0
-    gemm_stage_ab<TM, KS, TN>(A, B, As, Bs, 0, n0, m0, 0, nt, od, id, tid);
+    gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, 0, n0, m0, 0, nt, od, id, tid);
     gemm_cp_commit();
 #else
     {
-        for (int c = tid; c < TN * KS / 8; c += 256) {
-            int r = (c * 8) / KS, d = (c * 8) % KS;
-            int n = n0 + r;
-            if (n < nt && d < id) {
-                *reinterpret_cast<uint4*>(As + r * KS + d) =
-                    *reinterpret_cast<const uint4*>(A + (long long)n * id + d);
-            } else {
-                *reinterpret_cast<uint4*>(As + r * KS + d) = make_uint4(0u, 0u, 0u, 0u);
+        if (AF32) {
+            gemm_stage_a32<KS>(As, 0, reinterpret_cast<const float*>(A), TN,
+                               n0, 0, nt, id, tid);
+        } else {
+            for (int c = tid; c < TN * KS / 8; c += 256) {
+                int r = (c * 8) / KS, d = (c * 8) % KS;
+                int n = n0 + r;
+                if (n < nt && d < id) {
+                    *reinterpret_cast<uint4*>(As + r * KS + d) =
+                        *reinterpret_cast<const uint4*>(A + (long long)n * id + d);
+                } else {
+                    *reinterpret_cast<uint4*>(As + r * KS + d) = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
         }
         for (int c = tid; c < TM * KS / 8; c += 256) {
@@ -3221,8 +3265,8 @@ __global__ void gemm_f16_nt_kernel_t(
     for (int k = 0; k < id; k += KS, buf ^= 1) {
 #if __CUDA_ARCH__ >= 800
         if (k + KS < id) {
-            gemm_stage_ab<TM, KS, TN>(A, B, As, Bs, buf ^ 1, n0, m0, k + KS,
-                                      nt, od, id, tid);
+            gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, buf ^ 1, n0, m0,
+                                            k + KS, nt, od, id, tid);
             gemm_cp_commit();
             // wait until the CURRENT tile landed (one group may stay in flight)
             gemm_cp_wait1();
@@ -3232,14 +3276,19 @@ __global__ void gemm_f16_nt_kernel_t(
         __syncthreads();
 #else
         if (k + KS < id) {
-            for (int c = tid; c < TN * KS / 8; c += 256) {
-                int r = (c * 8) / KS, d = (c * 8) % KS;
-                int n = n0 + r;
-                if (n < nt && k + KS + d < id) {
-                    *reinterpret_cast<uint4*>(As + (buf ^ 1) * TN * KS + r * KS + d) =
-                        *reinterpret_cast<const uint4*>(A + (long long)n * id + k + KS + d);
-                } else {
-                    *reinterpret_cast<uint4*>(As + (buf ^ 1) * TN * KS + r * KS + d) = make_uint4(0u, 0u, 0u, 0u);
+            if (AF32) {
+                gemm_stage_a32<KS>(As, buf ^ 1, reinterpret_cast<const float*>(A),
+                                   TN, n0, k + KS, nt, id, tid);
+            } else {
+                for (int c = tid; c < TN * KS / 8; c += 256) {
+                    int r = (c * 8) / KS, d = (c * 8) % KS;
+                    int n = n0 + r;
+                    if (n < nt && k + KS + d < id) {
+                        *reinterpret_cast<uint4*>(As + (buf ^ 1) * TN * KS + r * KS + d) =
+                            *reinterpret_cast<const uint4*>(A + (long long)n * id + k + KS + d);
+                    } else {
+                        *reinterpret_cast<uint4*>(As + (buf ^ 1) * TN * KS + r * KS + d) = make_uint4(0u, 0u, 0u, 0u);
+                    }
                 }
             }
             for (int c = tid; c < TM * KS / 8; c += 256) {
@@ -3345,7 +3394,7 @@ void launch_convert_f16(
 
 void launch_gemm_f16(
     const __half* a, const __half* b, float* c,
-    int nt, int od, int id, cudaStream_t stream
+    int nt, int od, int id, cudaStream_t stream, bool af32
 ) {
     // P2: od-tile width (128 default = halved B re-reads; MINFER_GEMM_TM=64
     // reverts to the 8m② baseline for A/B).
@@ -3363,25 +3412,39 @@ void launch_gemm_f16(
         ks = (e && atoi(e)) ? 64 : 32;
     }
     const size_t dyn_smem = (size_t)(2 * 64 * ks + 2 * tm * ks) * 2 + 8 * 256 * 4;
+#define GEMM_LAUNCH(TM_, KS_)                                                      \
+    do {                                                                           \
+        dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_);                           \
+        if (af32) {                                                                \
+            gemm_smem_optin(gemm_f16_nt_kernel_t<TM_, KS_, true>, dyn_smem);       \
+            gemm_f16_nt_kernel_t<TM_, KS_, true>                                   \
+                <<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);            \
+        } else {                                                                   \
+            gemm_smem_optin(gemm_f16_nt_kernel_t<TM_, KS_, false>, dyn_smem);      \
+            gemm_f16_nt_kernel_t<TM_, KS_, false>                                  \
+                <<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);            \
+        }                                                                          \
+    } while (0)
     if (tm >= 128) {
-        dim3 grid((nt + 63) / 64, (od + 127) / 128);
-        if (ks >= 64) {
-            gemm_smem_optin(gemm_f16_nt_kernel_t<128, 64>, dyn_smem);
-            gemm_f16_nt_kernel_t<128, 64><<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);
-        } else {
-            gemm_smem_optin(gemm_f16_nt_kernel_t<128, 32>, dyn_smem);
-            gemm_f16_nt_kernel_t<128, 32><<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);
-        }
+        if (ks >= 64)
+            GEMM_LAUNCH(128, 64);
+        else
+            GEMM_LAUNCH(128, 32);
     } else {
-        dim3 grid((nt + 63) / 64, (od + 63) / 64);
-        if (ks >= 64) {
-            gemm_smem_optin(gemm_f16_nt_kernel_t<64, 64>, dyn_smem);
-            gemm_f16_nt_kernel_t<64, 64><<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);
-        } else {
-            gemm_smem_optin(gemm_f16_nt_kernel_t<64, 32>, dyn_smem);
-            gemm_f16_nt_kernel_t<64, 32><<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);
-        }
+        if (ks >= 64)
+            GEMM_LAUNCH(64, 64);
+        else
+            GEMM_LAUNCH(64, 32);
     }
+#undef GEMM_LAUNCH
+}
+
+// P6: A arrives as f32 activations; converts inside the kernel on stage.
+void launch_gemm_f32a(
+    const float* a, const __half* b, float* c,
+    int nt, int od, int id, cudaStream_t stream
+) {
+    launch_gemm_f16(reinterpret_cast<const __half*>(a), b, c, nt, od, id, stream, true);
 }
 
 
