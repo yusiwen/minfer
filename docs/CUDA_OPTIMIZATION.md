@@ -236,12 +236,11 @@ residual is NOT the decomposition either. It is:
    by 128 accumulator registers (sum[64] + 16 int C-frags); ours has 8
    chains and ~64 accumulator regs. At 1 block/SM the register file
    (255/thread) is half idle — the compiler cannot create chains the
-   source does not express. CAVEAT (r11, unverified): common.cuh
-   tile<16,8,int>::ne = I*J/64 = 2, which does not match the 4-reg
-   m16n8k32 C fragment — either their tile mma() issues two HW mmas or
-   the chain count above is wrong. Resolving the exact chain count and
-   accumulator structure of the reference (read tile<> + mma() in
-   mma.cuh) is the FIRST step of the next session.
+   source does not express. VERIFIED (r11): the I*J/64 ne seen earlier
+   is the AMD MFMA branch; the NVIDIA (Turing+) tile is ne = I*J/32 =
+   4 regs per m16n8k32 C — so the 16-chain reading stands. Next session
+   step one: widen our warp tile to 16 independent mma chains (sum[64],
+   16 int C-frags) and re-format the A smem for ldmatrix.
 2. ldmatrix A staging: their A fragments load with one LDSM per
    16x32 int8 fragment; ours use 8 LDS.32.
 3. Tile 128 od-rows x 128 tokens (vs our 128 x 64).
