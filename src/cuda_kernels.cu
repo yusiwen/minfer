@@ -3022,89 +3022,182 @@ __device__ __forceinline__ void gemm_load_tile_async(
     int m = m0 + r;
     gemm_cp16(Bs + r * 32 + c4, B + (long long)m * id + k0 + c4, m < od && k_ok);
 }
+
+// P2: B-panel loader for TM-row od tiles (TM > 64 needs a second pass of
+// 64 rows; A always stages TN = 64 rows).
+__device__ __forceinline__ void gemm_load_b_async(
+    const __half* __restrict__ B, __half* Bs,
+    int m0, int k0, int od, int id, int tm
+) {
+    int r0 = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+    bool k_ok = k0 + c4 < id;
+    for (int rep = 0; rep < tm / 64; rep++) {
+        int r = r0 + rep * 64;
+        int m = m0 + r;
+        gemm_cp16(Bs + r * 32 + c4, B + (long long)m * id + k0 + c4, m < od && k_ok);
+    }
+}
+
+// synchronous B loader for pre-sm80 builds lives AFTER the sm_80 guard
+// (sm_75 is still a build target and compiles the fallback paths).
 #endif // __CUDA_ARCH__ >= 800
 
-// C[nt, od] = A[nt, id] · B[od, id]^T. 64x64 output tiles, k-step 32,
-// double-buffered shared staging, 8 warps (each owns a 16 nt x 16 od
-// fragment pair). f32 accumulation. Tails: nt/od masked at store, k-tail
-// zero-filled (id % 8 == 0 keeps the uint4 chunk loads aligned).
-__global__ void gemm_f16_nt_kernel(
+__device__ __forceinline__ void gemm_load_b_sync(
+    const __half* __restrict__ B, __half* Bs,
+    int m0, int k0, int od, int id, int tm
+) {
+    int r0 = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+    bool k_ok = k0 + c4 < id;
+    for (int rep = 0; rep < tm / 64; rep++) {
+        int r = r0 + rep * 64;
+        int m = m0 + r;
+        if (m < od && k_ok) {
+            *reinterpret_cast<uint4*>(Bs + r * 32 + c4) =
+                *reinterpret_cast<const uint4*>(B + (long long)m * id + k0 + c4);
+        } else {
+            *reinterpret_cast<uint4*>(Bs + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+}
+
+// sync B loader lives outside the sm_80 guard: the pre-sm80 fallback paths
+// of gemm_f16_nt_kernel_t reference it (sm_75 is still a build target).
+
+// A template cannot have C linkage: pause the extern "C" block around the
+// templated GEMM.
+} // extern "C"
+
+// C[nt, od] = A[nt, id] · B[od, id]^T. 64 x TM output tiles (TM = 64
+// baseline, 128 halves the B-panel re-reads through L2 and the per-k-step
+// barrier count), k-step 32, double-buffered shared staging, 8 warps (each
+// owns 32 nt rows x TM/4 od cols as 2 x TM/64 f32 fragment pairs). f32
+// accumulation. Tails: nt/od masked at store, k-tail zero-filled (id % 8
+// == 0 keeps the uint4 chunk loads aligned).
+template <int TM>
+__global__ void gemm_f16_nt_kernel_t(
     const __half* __restrict__ A, const __half* __restrict__ B,
     float* __restrict__ C, int nt, int od, int id
 ) {
     using namespace nvcuda;
-    __shared__ __half As[2][64 * 32];
-    __shared__ __half Bs[2][64 * 32];
+    constexpr int TN = 64;
+    constexpr int ODC = TM / 64; // od 16-col fragments per warp row-half
+    __shared__ __half As[2][TN * 32];
+    __shared__ __half Bs[2][TM * 32];
     __shared__ float Cs[8][16 * 16]; // per-warp store staging
 
     int warp = threadIdx.x >> 5;      // 0..7
-    int wm = warp >> 1;               // od sub-tile: 4 x 16 rows
+    int wm = warp >> 1;               // od chunk: 4 x (TM/4) cols
     int wn = warp & 1;                // nt sub-tile: 2 x 32 rows
     // blockIdx.x = nt tile, blockIdx.y = od tile: consecutive blocks share
     // the same od-tile's B panel (64 rows x id f16, ~0.5MB) in L2, so the
     // f16 weight matrix streams from DRAM ~once instead of nt/64 times.
-    int m0 = blockIdx.y * 64;
-    int n0 = blockIdx.x * 64;
+    int m0 = blockIdx.y * TM;
+    int n0 = blockIdx.x * TN;
+    const int ob = wm * (TM / 4); // od row base of this warp's chunk
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[4];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb[2];
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[2];
-    wmma::fill_fragment(fc[0], 0.0f);
-    wmma::fill_fragment(fc[1], 0.0f);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[2][ODC];
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int oc = 0; oc < ODC; oc++) wmma::fill_fragment(fc[j][oc], 0.0f);
 
     int buf = 0;
 #if __CUDA_ARCH__ >= 800
-    gemm_load_tile_async(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
-    gemm_cp_commit();
+    // stage A (64 rows) + B (TM rows) for k = 0
+    {
+        int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+        bool k_ok = c4 < id; // id % 8 == 0 gate keeps chunks inside the row
+        int n = n0 + r;
+        gemm_cp16(As[0] + r * 32 + c4, A + (long long)n * id + c4, n < nt && k_ok);
+        gemm_load_b_async(B, Bs[0], m0, 0, od, id, TM);
+        gemm_cp_commit();
+    }
 #else
-    gemm_load_tile_sync(A, B, As[0], Bs[0], n0, m0, 0, nt, od, id);
-    __syncthreads();
+    {
+        int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+        bool k_ok = c4 < id;
+        int n = n0 + r;
+        if (n < nt && k_ok) {
+            *reinterpret_cast<uint4*>(As[0] + r * 32 + c4) =
+                *reinterpret_cast<const uint4*>(A + (long long)n * id + c4);
+        } else {
+            *reinterpret_cast<uint4*>(As[0] + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        gemm_load_b_sync(B, Bs[0], m0, 0, od, id, TM);
+        __syncthreads();
+    }
 #endif
     for (int k = 0; k < id; k += 32, buf ^= 1) {
 #if __CUDA_ARCH__ >= 800
         if (k + 32 < id) {
-            gemm_load_tile_async(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+            int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+            bool k_ok = k + 32 + c4 < id;
+            int n = n0 + r;
+            gemm_cp16(As[buf ^ 1] + r * 32 + c4,
+                      A + (long long)n * id + k + 32 + c4, n < nt && k_ok);
+            gemm_load_b_async(B, Bs[buf ^ 1], m0, k + 32, od, id, TM);
             gemm_cp_commit();
-        }
-        // wait until the CURRENT tile landed (one group may stay in flight)
-        if (k + 32 < id)
+            // wait until the CURRENT tile landed (one group may stay in flight)
             gemm_cp_wait1();
-        else
+        } else {
             gemm_cp_wait0();
+        }
         __syncthreads();
 #else
-        if (k + 32 < id)
-            gemm_load_tile_sync(A, B, As[buf ^ 1], Bs[buf ^ 1], n0, m0, k + 32, nt, od, id);
+        if (k + 32 < id) {
+            int r = threadIdx.x >> 2, c4 = (threadIdx.x & 3) * 8;
+            bool k_ok = k + 32 + c4 < id;
+            int n = n0 + r;
+            if (n < nt && k_ok) {
+                *reinterpret_cast<uint4*>(As[buf ^ 1] + r * 32 + c4) =
+                    *reinterpret_cast<const uint4*>(A + (long long)n * id + k + 32 + c4);
+            } else {
+                *reinterpret_cast<uint4*>(As[buf ^ 1] + r * 32 + c4) = make_uint4(0u, 0u, 0u, 0u);
+            }
+            gemm_load_b_sync(B, Bs[buf ^ 1], m0, k + 32, od, id, TM);
+        }
         __syncthreads();
 #endif
-        // fa: [n-block 0/1] x [k-half 0/1]; fb: [k-half 0/1] — both k halves
-        // of the 32-wide slice must be accumulated (the v1 bug: only the
-        // first 16 k's were multiplied).
+        // fa: [n-block 0/1] x [k-half 0/1]; fb: [k-half 0/1] per od chunk —
+        // both k halves of the 32-wide slice must be accumulated (the v1
+        // bug: only the first 16 k's were multiplied).
         wmma::load_matrix_sync(fa[0], &As[buf][wn * 32 * 32], 32);
         wmma::load_matrix_sync(fa[1], &As[buf][(wn * 32 + 16) * 32], 32);
         wmma::load_matrix_sync(fa[2], &As[buf][wn * 32 * 32 + 16], 32);
         wmma::load_matrix_sync(fa[3], &As[buf][(wn * 32 + 16) * 32 + 16], 32);
-        wmma::load_matrix_sync(fb[0], &Bs[buf][wm * 16 * 32], 32);
-        wmma::load_matrix_sync(fb[1], &Bs[buf][wm * 16 * 32 + 16], 32);
-        wmma::mma_sync(fc[0], fa[0], fb[0], fc[0]);
-        wmma::mma_sync(fc[1], fa[1], fb[0], fc[1]);
-        wmma::mma_sync(fc[0], fa[2], fb[1], fc[0]);
-        wmma::mma_sync(fc[1], fa[3], fb[1], fc[1]);
+#pragma unroll
+        for (int oc = 0; oc < ODC; oc++) {
+            wmma::load_matrix_sync(fb[0], &Bs[buf][(ob + oc * 16) * 32], 32);
+            // fb[1] is the k=16..32 HALF of the SAME od rows: +16 ELEMENTS
+            // (one f16 k-half), not +16 rows — (base + 16), not ((base+16)*32).
+            wmma::load_matrix_sync(fb[1], &Bs[buf][(ob + oc * 16) * 32 + 16], 32);
+            wmma::mma_sync(fc[0][oc], fa[0], fb[0], fc[0][oc]);
+            wmma::mma_sync(fc[1][oc], fa[1], fb[0], fc[1][oc]);
+            wmma::mma_sync(fc[0][oc], fa[2], fb[1], fc[0][oc]);
+            wmma::mma_sync(fc[1][oc], fa[3], fb[1], fc[1][oc]);
+        }
         __syncthreads();
     }
 
     int lane = threadIdx.x & 31;
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < 2; j++) {
-        wmma::store_matrix_sync(Cs[warp], fc[j], 16, wmma::mem_row_major);
-        int nb = n0 + wn * 32 + j * 16, mb = m0 + wm * 16;
-        for (int e = lane; e < 256; e += 32) {
-            int n = nb + (e >> 4), m = mb + (e & 15);
-            if (n < nt && m < od)
-                C[(long long)n * od + m] = Cs[warp][(e >> 4) * 16 + (e & 15)];
+#pragma unroll
+        for (int oc = 0; oc < ODC; oc++) {
+            wmma::store_matrix_sync(Cs[warp], fc[j][oc], 16, wmma::mem_row_major);
+            int nb = n0 + wn * 32 + j * 16, mb = m0 + ob + oc * 16;
+            for (int e = lane; e < 256; e += 32) {
+                int n = nb + (e >> 4), m = mb + (e & 15);
+                if (n < nt && m < od)
+                    C[(long long)n * od + m] = Cs[warp][(e >> 4) * 16 + (e & 15)];
+            }
         }
     }
 }
+
+extern "C" {
 
 void launch_dequant_f16(
     int type_id, const uint8_t* w, __half* out,
@@ -3142,8 +3235,20 @@ void launch_gemm_f16(
     const __half* a, const __half* b, float* c,
     int nt, int od, int id, cudaStream_t stream
 ) {
-    dim3 grid((nt + 63) / 64, (od + 63) / 64);
-    gemm_f16_nt_kernel<<<grid, 256, 0, stream>>>(a, b, c, nt, od, id);
+    // P2: od-tile width (128 default = halved B re-reads; MINFER_GEMM_TM=64
+    // reverts to the 8m② baseline for A/B).
+    static int tm = -1;
+    if (tm < 0) {
+        const char* e = getenv("MINFER_GEMM_TM");
+        tm = (e && atoi(e) <= 64) ? 64 : 128;
+    }
+    if (tm >= 128) {
+        dim3 grid((nt + 63) / 64, (od + 127) / 128);
+        gemm_f16_nt_kernel_t<128><<<grid, 256, 0, stream>>>(a, b, c, nt, od, id);
+    } else {
+        dim3 grid((nt + 63) / 64, (od + 63) / 64);
+        gemm_f16_nt_kernel_t<64><<<grid, 256, 0, stream>>>(a, b, c, nt, od, id);
+    }
 }
 
 
