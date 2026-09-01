@@ -335,6 +335,18 @@ extern "C" {
         q6_stride: i32,
         stream: *mut std::ffi::c_void,
     );
+    // P6: raw-byte staging MMQ (q4_K, whole 256-k super-blocks).
+    fn launch_mmq_raw_nt(
+        type_id: i32,
+        w: *const u8,
+        q8: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        stream: *mut std::ffi::c_void,
+        kd: i32,
+    );
     // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
     // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
     fn launch_fa_prefill_f16kv(
@@ -1999,6 +2011,39 @@ impl CudaState {
             210
         };
         let stream = self.stream();
+        // P6: raw-byte staging variant (q4_K, whole super-blocks only).
+        // Same quantized activations; the GEMM stages RAW weight bytes via
+        // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
+        if type_id == 5
+            && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
+            && (id / 32) % 8 == 0
+        {
+            let kd: i32 = std::env::var("MINFER_MMQ_RAW_KD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8);
+            unsafe {
+                launch_quantize_q8_0_pad40(
+                    x as *const f32,
+                    q8 as *mut u8,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+                launch_mmq_raw_nt(
+                    type_id,
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    nt as i32,
+                    od as i32,
+                    id as i32,
+                    stream,
+                    kd,
+                );
+            }
+            return Ok(());
+        }
         unsafe {
             launch_quantize_q8_0_pad40(
                 x as *const f32,
