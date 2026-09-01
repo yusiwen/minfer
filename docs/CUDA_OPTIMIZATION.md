@@ -151,6 +151,16 @@ only when MMQ is actually active. Next lever (when a quiet GPU is
 available): llama.cpp-style bigger per-warp output tiles + wide/coalesced
 staging loads, re-rank KD vs occupancy.
 
+P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
+427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth
+amortization dominates — docs finding above confirmed). The bigger
+per-warp tile was also tried: 4 warps x 32x32 (mma per fragment word
+x2, staging loopified for blockDim generality) measured 399 tok/s AND
+broke mmq_w80 parity (zero cells — coverage hole in the hand-mapped
+fragments), so it was reverted. Remaining lever per the note above:
+wide 16B staging loads + raw-byte smem staging (dequant at mma time),
+which is a structural rewrite of mmq_stage_b, not a knob.
+
 ### R2 — MMVQ weight-streaming rework (Aug 31, DONE)
 
 The 8e decode kernels ran at ~60% of llama.cpp's effective streaming rate
