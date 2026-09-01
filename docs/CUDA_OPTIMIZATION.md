@@ -16,16 +16,17 @@ CUDA. minfer: CLI single-shot, greedy.
 | Workload | llama.cpp | minfer | gap |
 |---|---:|---:|---:|
 | 7B q4_k_m prefill @2K | 3401 | ~1400–1500 (±10% thermal) | 2.3× |
-| 7B decode tg128 | 47.1 | 40.5–40.8 | 1.16× |
-| 7B decode @2K | 44.9 | ~36 | 1.25× |
+| 7B decode tg128 | 47.1 | 47.5–47.6 (R4) | ~parity (ahead) |
+| 7B decode @2K | 44.9 | 43.2–45.1 (R4) | ~0–4% |
 | 0.6B q8_0 prefill @2K | 23909 | 4792 | 5.0× |
 | 0.6B decode tg128 | 290 | ~195 | 1.5× |
 | 0.5B q4_0 prefill @2K | 30550 | ~3020 | 10× |
 | 0.5B decode tg128 | 453 | ~257 | 1.8× |
 
-7B prefill went 30.7 → ~1450 tok/s over the Aug 30 session (~47×); decode
-never regressed (41.2 baseline vs 40.8 now — the residual gap is pure
-weight streaming, see R2).
+7B prefill went 30.7 → ~1450 tok/s over the Aug 30 session (~47×); the
+decode path closed its gap in two steps — R2 (weight streaming, tg128
+42.2 → 45.1) and R4 (split-attention rewrite, tg128 → 47.5, @2K 39.2 →
+43.2–45.1 vs llama.cpp's 44.9).
 
 What the engine does now (all in `src/cuda_kernels.cu` + `src/cuda.rs`,
 dispatched by `src/graph/cuda_backend.rs`):
@@ -177,6 +178,34 @@ the engine-level greedy check caught them); suite 164 passing; greedy
 output v1 ≡ v2 token-for-token. Under sglang load the win holds at ~+5-8%
 relative.
 
+### R4 — decode split-attention rewrite: dim-parallel lanes (Sep 1, 2026)
+
+The 8d flash-decoding pass was the whole @2K decode gap: nsys showed
+`gqa_attn_split_partial` at ~150 us/layer (28 × 150 us = 4.2 ms of the
+~25.8 ms 7B @2K step; tg128 carries no such cost) — 28 GB/s effective on
+a 4.3 MB K+V read. Three compounding causes: the runtime-indexed
+`float4 oc[32]` accumulator lived in LOCAL MEMORY (~80 MB/layer of local
+traffic, re-read+re-written on every online-softmax rescale); each lane
+walked whole K/V rows with 4-byte loads (64 scattered sector requests
+per row, 12.5% sector utilization, L1-bandwidth bound); only 224
+single-warp blocks (~4.7 warps/SM). Naively raising the split count made
+it monotonically WORSE (148/172/419/609 us for 8/16/32/64 splits — more
+resident warps thrash L1 with the local oc arrays).
+
+Rewrite: each lane owns 4 fixed dims (the accumulator is ONE float4 in
+registers, zero spill; hd % 4 == 0 && hd <= 128 enforced by the
+dispatch), every K/V access is a perfectly-coalesced row instruction,
+the row dot is a warp reduction, and rows run in batches of 4 to overlap
+the serial online-softmax chain. `ATTN_SPLITS` 8 → 32 (fixed grid stays
+capture-safe; idle splits write mx=-INF/S=0 partials the combine weights
+to zero; scratch 4x bigger, still < 0.5 MB; combine loop widened).
+Kernel: 148 → 79 us/layer. End-to-end (interleaved same-binary A/B,
+-n 96): @2K 39.2 → 43.2–45.1 tok/s (llama.cpp 44.9 — gap 14% → ~4%),
+tg128 45.1 → 47.5–47.6 (llama.cpp 47.1 — at/above parity). Parity:
+`cuda_attn_split_decode_parity` extended to sweep the SPLITS=32 chunk
+boundaries (nkv 3..207 × f16/f32 KV). SPLITS=64 measured no better
+(44.7 vs 45.1 @2K); 32 kept.
+
 ## Part III — Remaining roadmap
 
 Measured budgets: f16 wmma GEMM ~35 TFLOPS (llama.cpp int8 MMQ ≈ 52
@@ -190,8 +219,8 @@ read-only probe (93% of the 273 GB/s theoretical); llama.cpp achieves
   per-shape numbers that keep the f16 8p path as the default.
 - **R2 — MMVQ weight-streaming efficiency**: DONE 2026-08-31 (see the
   Part II R2 record): per-thread chunk mapping + uint4 loads; tg128
-  42.2 → 45.1, decode @2K 36.7 → 38.8 (llama.cpp 47.1 / 44.9). Remaining
-  gap to llama.cpp is ~10% on tg128.
+  42.2 → 45.1, decode @2K 36.7 → 38.8 (llama.cpp 47.1 / 44.9). The
+  remaining tg128/@2K gaps were closed by R4 (see below).
 - **R3 — small-model per-token overhead**: LARGELY DONE (Aug 31, see
   Part II). 0.5B decode was ~4.0 ms/token with ~1.6 ms of GPU floor:
   prefill single-split (A1), pinned logits readback + no clone (A2),
@@ -199,6 +228,11 @@ read-only probe (93% of the 273 GB/s theoretical); llama.cpp achieves
   on a quiet GPU; the sampler's `apply_top_k` scratch alloc (608 KB/token
   when top_k is enabled — greedy benches never hit it) if non-greedy
   numbers justify it.
+- **R4 — decode split-attention efficiency**: DONE 2026-09-01 (see the
+  Part II R4 record): dim-parallel lane rewrite of the 8d flash-decoding
+  pass (register accumulator, coalesced row loads, ATTN_SPLITS 8 → 32).
+  @2K 39.2 → 43.2–45.1 (llama.cpp 44.9), tg128 45.1 → 47.5 (llama.cpp
+  47.1). The @2K decode gap is now ~0–4%.
 - **Not planned** (revisit with a concrete need): cuBLAS/cublasLt
   (evaluated → closed as 8k; 8m's custom wmma GEMM covered the f16 path),
   VMM pool, multi-GPU, node reordering, Windows, IQ/Q2/Q3 quants.

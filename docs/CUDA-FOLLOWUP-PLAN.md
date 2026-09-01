@@ -524,6 +524,28 @@ should exist exactly once per weight, not once per call.
   `MINFER_MMQ=1`); staging depth 8×32-k (~94 KB dynamic shared, opt-in)
   measured better than 4×32-k (2 blocks/SM) under load.
 
+## R4. Decode split-attention: dim-parallel lane rewrite — DONE 2026-09-01
+
+8d's flash-decoding pass was latency/local-memory bound: the
+runtime-indexed `float4 oc[32]` accumulator lived in local memory
+(~80 MB/layer of local traffic, re-touched on every online-softmax
+rescale), each lane walked whole K/V rows with 4-byte loads (64 scattered
+sector requests per row, 12.5% sector utilization), and 224 single-warp
+blocks left ~4.7 warps/SM — ~150 us/layer at 7B @2K, i.e. the entire
+@2K-vs-tg128 decode delta. Naively raising the split count made it
+monotonically worse (148 → 172 → 419 → 609 us/layer for 8/16/32/64
+splits: more resident warps thrash L1 with the local oc arrays).
+
+Rewrite: each lane owns 4 fixed dims (single-float4 register accumulator,
+zero spill — `hd % 4 == 0 && hd <= 128` already enforced by the
+dispatch), K/V loads are fully-coalesced row instructions, the row dot
+is a warp reduction, rows run in batches of 4; `ATTN_SPLITS` 8 → 32
+(fixed grid stays capture-safe; idle splits write -INF/0 partials the
+combine weights to zero). 148 → 79 us/layer; 7B @2K decode 39.2 →
+43.2–45.1 tok/s (llama.cpp 44.9), tg128 45.1 → 47.5 (llama.cpp 47.1).
+Parity locked by the extended `cuda_attn_split_decode_parity`
+(chunk-boundary nkv sweep × f16/f32 KV).
+
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,

@@ -4168,11 +4168,14 @@ mod tests {
         };
         let (nh, nk_h, hd) = (4usize, 2usize, 8usize);
         let nkt = nk_h * hd;
-        let n_ctx = 64usize;
+        // n_ctx sized so pos0 can sweep the ATTN_SPLITS=32 chunk boundaries:
+        // full splits, a partially-filled split, and trailing idle splits
+        // (mx=-INF/S=0 partials) all get exercised (nkv = pos0 + 1).
+        let n_ctx = 208usize;
         let scale = 1.0 / (hd as f32).sqrt();
 
         for kv_f16 in [false, true] {
-            for pos0 in [2usize, 36usize] {
+            for pos0 in [2usize, 32, 62, 63, 64, 126, 127, 128, 190, 206] {
                 let nkv = pos0 + 1;
                 cb.set_kv_f16_for_test(kv_f16);
                 let mut b = GraphBuilder::new();

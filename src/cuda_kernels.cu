@@ -1788,18 +1788,43 @@ __global__ void gqa_attn_f32_f16kv(
 // pstr = (4+hd+3)&~3 — oc starts at float offset 4 so the float4 writes are
 // 16-byte aligned. Scratch is a fixed-size state buffer (nh/hd are graph
 // constants), grown during warmup — never inside a capture window.
+//
+// R-followup rewrite (dim-parallel lanes). nsys on the previous version
+// showed: (a) the hd-wide float4 oc[32] accumulator is runtime-indexed
+// (hd is a kernel argument) so it lives in LOCAL MEMORY — ~80 MB of local
+// traffic per layer, re-read+re-written on every online-softmax rescale;
+// (b) each lane walked whole K/V rows with 4-byte loads — 64 scattered
+// sector requests per row (12.5% sector utilization), L1-bandwidth bound;
+// (c) only 224 single-warp blocks (~4.7 warps/SM). Net: ~150 us/layer at
+// 7B @2K (~28 GB/s effective on a 4.3 MB K+V read) — the entire @2K
+// decode gap to llama.cpp (28 x 151 us = 4.2 ms of a ~25.8 ms step) — and
+// it got MONOTONICALLY worse with more splits (148 -> 172 -> 419 -> 609 us
+// for 8/16/32/64) because more resident warps thrash L1 with the local
+// oc arrays. Now each lane owns 4 fixed dims: the accumulator is ONE
+// float4 in registers (zero spill, hd <= 128 enforced by the dispatch),
+// every K/V access is a perfectly-coalesced row instruction, and the row
+// dot is a warp reduction. Rows run in batches of 4 to overlap the serial
+// online-softmax chain. Idle splits still write an mx=-INF/S=0 partial
+// that the combine weights to zero; the [SPLITS][nh][pstr] layout is
+// unchanged (combine untouched).
+
+#define ATTN_SPLITS 32
 
 template <typename KV>
-__device__ __forceinline__ float2 kv_ld2(const KV* p);
+__device__ __forceinline__ float4 kv_ld4(const KV* p);
 
 template <>
-__device__ __forceinline__ float2 kv_ld2<float>(const float* p) {
-    return make_float2(p[0], p[1]);
+__device__ __forceinline__ float4 kv_ld4<float>(const float* p) {
+    return *reinterpret_cast<const float4*>(p);
 }
 
 template <>
-__device__ __forceinline__ float2 kv_ld2<__half>(const __half* p) {
-    return __half22float2(*reinterpret_cast<const __half2*>(p));
+__device__ __forceinline__ float4 kv_ld4<__half>(const __half* p) {
+    __half2 a = *reinterpret_cast<const __half2*>(p);
+    __half2 b = *reinterpret_cast<const __half2*>(p + 2);
+    float2 x = __half22float2(a);
+    float2 y = __half22float2(b);
+    return make_float4(x.x, x.y, y.x, y.y);
 }
 
 template <typename KV>
@@ -1811,7 +1836,7 @@ __global__ void gqa_attn_split_partial(
     const int* positions,
     int nh, int nk, int hd, float scale, int pstr
 ) {
-    const int SPLITS = 8;
+    const int SPLITS = ATTN_SPLITS;
     int sp = blockIdx.x;
     int h = blockIdx.y;
     int nkv = positions[0] + 1;
@@ -1823,94 +1848,61 @@ __global__ void gqa_attn_split_partial(
     int gqa = nh / nk;
     int hk = h / gqa;
     int stride_kv = nk * hd;
-    const float4* q4 = reinterpret_cast<const float4*>(q + h * hd);
-    int hd4 = hd / 4;
+    // Each lane owns 4 consecutive dims (hd % 4 == 0 and hd <= 128 are
+    // enforced by the dispatch); lanes with d0 >= hd are idle but keep
+    // participating in the warp reductions (zero contribution).
+    int d0 = lane_id * 4;
+    bool live = d0 < hd;
+    const float4 q4 = live ? *reinterpret_cast<const float4*>(q + h * hd + d0)
+                           : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     float mx = -INFINITY, S = 0.0f;
-    float4 oc[32];
-    #pragma unroll
-    for (int i = 0; i < hd4; i++) oc[i] = make_float4(0, 0, 0, 0);
+    float4 oc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    for (int base = lo; base < hi; base += 64) {
-        float s0 = -INFINITY, s1 = -INFINITY;
-        int kv0 = base + lane_id * 2;
-        int kv1 = kv0 + 1;
-        if (kv0 < hi) {
-            const KV* krow = k + (size_t)kv0 * stride_kv + hk * hd;
-            float d = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < hd4; i++) {
-                float4 qv = q4[i];
-                float2 a = kv_ld2<KV>(krow + i * 4);
-                float2 b = kv_ld2<KV>(krow + i * 4 + 2);
-                d += qv.x * a.x + qv.y * a.y + qv.z * b.x + qv.w * b.y;
-            }
-            s0 = d * scale;
-        }
-        if (kv1 < hi) {
-            const KV* krow = k + (size_t)kv1 * stride_kv + hk * hd;
-            float d = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < hd4; i++) {
-                float4 qv = q4[i];
-                float2 a = kv_ld2<KV>(krow + i * 4);
-                float2 b = kv_ld2<KV>(krow + i * 4 + 2);
-                d += qv.x * a.x + qv.y * a.y + qv.z * b.x + qv.w * b.y;
-            }
-            s1 = d * scale;
-        }
-        float bmx = fmaxf(s0, s1);
-        for (int off = 16; off > 0; off >>= 1)
-            bmx = fmaxf(bmx, __shfl_xor_sync(0xFFFFFFFF, bmx, off));
-        float nmx = fmaxf(mx, bmx);
-        float corr = expf(mx - nmx);
-        float e0 = (kv0 < hi) ? expf(s0 - nmx) : 0.0f;
-        float e1 = (kv1 < hi) ? expf(s1 - nmx) : 0.0f;
+    for (int base = lo; base < hi; base += 4) {
+        int nr = min(4, hi - base); // warp-uniform
+        // Stage K for the whole batch first; the V addresses are already
+        // known, so the compiler hoists those loads above the softmax chain.
+        float4 k4[4];
         #pragma unroll
-        for (int i = 0; i < hd4; i++) {
-            oc[i].x *= corr; oc[i].y *= corr; oc[i].z *= corr; oc[i].w *= corr;
+        for (int j = 0; j < 4; j++) {
+            k4[j] = (live && j < nr)
+                ? kv_ld4<KV>(k + (size_t)(base + j) * stride_kv + hk * hd + d0)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-        S *= corr;
-        if (kv0 < hi) {
-            const KV* vrow = v + (size_t)kv0 * stride_kv + hk * hd;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= nr) break; // warp-uniform: all lanes exit together
+            // Full-row dot: this lane's 4-dim partial, then a warp reduction
+            // so every lane holds the row's complete dot (uniform softmax).
+            float d = q4.x * k4[j].x + q4.y * k4[j].y + q4.z * k4[j].z + q4.w * k4[j].w;
             #pragma unroll
-            for (int i = 0; i < hd4; i++) {
-                float2 a = kv_ld2<KV>(vrow + i * 4);
-                float2 b = kv_ld2<KV>(vrow + i * 4 + 2);
-                oc[i].x += e0 * a.x; oc[i].y += e0 * a.y;
-                oc[i].z += e0 * b.x; oc[i].w += e0 * b.y;
+            for (int off = 16; off > 0; off >>= 1)
+                d += __shfl_xor_sync(0xFFFFFFFF, d, off);
+            float s = d * scale;
+            float nmx = fmaxf(mx, s);
+            float corr = expf(mx - nmx);
+            float e = expf(s - nmx);
+            S = S * corr + e;
+            mx = nmx;
+            if (live) {
+                float4 v4 = kv_ld4<KV>(v + (size_t)(base + j) * stride_kv + hk * hd + d0);
+                oc.x = oc.x * corr + e * v4.x;
+                oc.y = oc.y * corr + e * v4.y;
+                oc.z = oc.z * corr + e * v4.z;
+                oc.w = oc.w * corr + e * v4.w;
             }
         }
-        if (kv1 < hi) {
-            const KV* vrow = v + (size_t)kv1 * stride_kv + hk * hd;
-            #pragma unroll
-            for (int i = 0; i < hd4; i++) {
-                float2 a = kv_ld2<KV>(vrow + i * 4);
-                float2 b = kv_ld2<KV>(vrow + i * 4 + 2);
-                oc[i].x += e1 * a.x; oc[i].y += e1 * a.y;
-                oc[i].z += e1 * b.x; oc[i].w += e1 * b.y;
-            }
-        }
-        S += e0 + e1;
-        mx = nmx;
     }
 
-    #pragma unroll
-    for (int i = 0; i < hd4; i++) {
-        oc[i].x = warp_reduce_sum(oc[i].x);
-        oc[i].y = warp_reduce_sum(oc[i].y);
-        oc[i].z = warp_reduce_sum(oc[i].z);
-        oc[i].w = warp_reduce_sum(oc[i].w);
-    }
-    S = warp_reduce_sum(S);
-
+    // No cross-lane reduction needed: each lane owns distinct dims.
+    float* dst = partial + ((size_t)sp * nh + h) * pstr;
     if (lane_id == 0) {
-        float* dst = partial + ((size_t)sp * nh + h) * pstr;
         dst[0] = mx;
         dst[1] = S;
-        float4* o4 = reinterpret_cast<float4*>(dst + 4); // 16B-aligned by pstr
-        #pragma unroll
-        for (int i = 0; i < hd4; i++) o4[i] = oc[i];
+    }
+    if (live) {
+        *reinterpret_cast<float4*>(dst + 4 + d0) = oc; // 16B-aligned via pstr
     }
 }
 
@@ -1923,10 +1915,10 @@ __global__ void gqa_attn_split_combine(
     int i = threadIdx.x; // hd threads
     if (i >= hd) return;
     float gmx = -INFINITY;
-    for (int sp = 0; sp < 8; sp++)
+    for (int sp = 0; sp < ATTN_SPLITS; sp++)
         gmx = fmaxf(gmx, partial[((size_t)sp * nh + h) * pstr]);
     float S = 0.0f, acc = 0.0f;
-    for (int sp = 0; sp < 8; sp++) {
+    for (int sp = 0; sp < ATTN_SPLITS; sp++) {
         const float* p = partial + ((size_t)sp * nh + h) * pstr;
         float w = expf(p[0] - gmx);
         S += p[1] * w;
@@ -2455,7 +2447,7 @@ void launch_gqa_attn_split_f16kv(
     int n_head, int n_head_kv, int hd,
     float scale, int pstr, cudaStream_t stream
 ) {
-    gqa_attn_split_partial<__half><<<dim3(8, n_head), 32, 0, stream>>>(
+    gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
         q, (const __half*)k, (const __half*)v, partial, positions,
         n_head, n_head_kv, hd, scale, pstr
     );
@@ -2470,7 +2462,7 @@ void launch_gqa_attn_split_f32kv(
     int n_head, int n_head_kv, int hd,
     float scale, int pstr, cudaStream_t stream
 ) {
-    gqa_attn_split_partial<float><<<dim3(8, n_head), 32, 0, stream>>>(
+    gqa_attn_split_partial<float><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
         q, (const float*)k, (const float*)v, partial, positions,
         n_head, n_head_kv, hd, scale, pstr
     );

@@ -2568,7 +2568,11 @@ impl CudaState {
 
     /// 8d: split-K decode attention (nt == 1). `pstr` = (4 + hd + 3) & !3 —
     /// the partials' row stride keeps the oc section 16-byte aligned. The
-    /// scratch must be at least 8 * nh * pstr floats (see buf_attn_partial).
+    /// scratch must be at least ATTN_SPLITS * nh * pstr floats (see
+    /// buf_attn_partial). ATTN_SPLITS must mirror the `ATTN_SPLITS` define
+    /// in cuda_kernels.cu (fixed grid — the graph-replay capture depends on
+    /// it; idle splits write an mx=-INF/S=0 partial the combine weights to
+    /// zero).
     pub fn gqa_attn_split(
         &self,
         q: *mut std::ffi::c_void,
@@ -2583,7 +2587,8 @@ impl CudaState {
         f16_kv: bool,
     ) {
         let pstr = ((4 + hd + 3) & !3) as i32;
-        let need = 8 * nh * (pstr as usize) * 4;
+        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in cuda_kernels.cu
+        let need = ATTN_SPLITS * nh * (pstr as usize) * 4;
         let partial = Self::get_or_grow(&self.buf_attn_partial, need);
         let stream = self.stream();
         unsafe {
