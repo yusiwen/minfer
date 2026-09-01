@@ -593,20 +593,39 @@ __global__ void quantize_q8_0_pad40(
     int b = tid % nb;
     const float* src = x + (size_t)t * dim + b * 32;
     uint8_t* dst = y + ((size_t)t * nb + b) * Q8PB;
+    // P6: tree-reduced amax (the serial fmaxf chain was latency-bound)
+    // and 16B loads / 4B register-packed stores. Math is bit-identical:
+    // max is exact for any association, the rintf pass is unchanged.
+    float4 sv[8];
+    #pragma unroll
+    for (int v = 0; v < 8; v++)
+        sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
     float am = 0.0f;
     #pragma unroll
-    for (int j = 0; j < 32; j++) am = fmaxf(am, fabsf(src[j]));
+    for (int v = 0; v < 8; v++)
+        am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
+                             fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
     float d = am / 127.0f;
     float di = (d != 0.0f) ? 1.0f / d : 0.0f;
     *reinterpret_cast<__half*>(dst) = __float2half(d);
     int s = 0;
+    uint32_t packed[8];
     #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        int q = int(rintf(src[j] * di));
-        q = max(-128, min(127, q));
-        dst[4 + j] = uint8_t(int8_t(q));
-        s += q;
+    for (int v = 0; v < 8; v++) {
+        const float* e = &sv[v].x;
+        uint32_t p = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int q = int(rintf(e[j] * di));
+            q = max(-128, min(127, q));
+            p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
+            s += q;
+        }
+        packed[v] = p;
     }
+    #pragma unroll
+    for (int v = 0; v < 8; v++)
+        *reinterpret_cast<uint32_t*>(dst + 4 + 4 * v) = packed[v];
     *reinterpret_cast<uint32_t*>(dst + 36) = uint32_t(s);
 }
 
