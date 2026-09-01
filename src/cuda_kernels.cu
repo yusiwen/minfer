@@ -2490,16 +2490,17 @@ void launch_gqa_attn_f32(
 // staged in shared memory, QK^T on tensor cores, online softmax with the
 // O accumulator in shared memory. K traffic drops to ~0.8 GB per layer.
 //
-// Shared layout (dynamic, ~97 KB — opt-in via cudaFuncSetAttribute):
+// Shared layout (dynamic, ~65 KB — opt-in via cudaFuncSetAttribute):
 //   Qs [64*hd] f16   q tile (scale folded in, f16 for the tensor-core QK^T)
 //   Ks [64*hd] f16   K tile           Vs [64*hd] f16  V tile
 //   S  [64*64]       f32 scores, aliased as f16 probs after the row softmax
-//   O  [64*hd] f32   output accumulator (rescaled by alpha per row)
 //   m/l/alpha [64] f32 per-row online-softmax state
+// Both matmuls run on tensor cores: QK^T computes S into shared memory, and
+// P·V accumulates into per-warp 16x16 f32 fragments that persist across KV
+// tiles (scaled in place by the per-row alpha — see the loop body).
 #define FA_TQ 64
 #define FA_TKV 64
 #define FA_PSTR (FA_TKV * 2) // probs row stride in halves (256B): probs row r aliases only Sf row r's first half, already read by the same thread — no cross-thread race
-#define FA_HQ 32 // hd/4 dims per accumulator thread (kernel is gated to hd == 128)
 
 __global__ void fa_prefill_f16kv(
     const float* __restrict__ q,
@@ -2540,20 +2541,31 @@ __global__ void fa_prefill_f16kv(
         msh[tid] = -INFINITY;
         lsh[tid] = 0.0f;
     }
-    // Per-thread output accumulator: thread owns (row, quadrant) with
-    // row = tid & 63, quadrant = tid >> 6 (FA_HQ dims each). Keeping O in
-    // registers (instead of shared) makes every P·V V-read a warp-wide
-    // broadcast and the alpha reads conflict-free.
-    float acc[FA_HQ];
+    // Output accumulator: P·V runs on tensor cores. Warp w = (wm, wn), with
+    // wm = w>>1 (16-row chunk of the 64-row q tile) and wn = w&1 (64-dim
+    // chunk of hd=128), keeps four 16x16 f32 fragments that persist across
+    // KV tiles; the per-row online-softmax rescale (alpha) multiplies the
+    // fragment lanes directly (m16n16 f32 accumulator layout: lane L holds
+    // fragment rows L>>2 and (L>>2)+8). The previous scalar P·V loop read
+    // Pf[arow*FA_PSTR + kk] with all 32 lanes landing on the SAME shared
+    // bank (row stride 256B ≡ 0 mod 32 banks) — a 32-way conflict per kk —
+    // and ran the whole P·V on CUDA cores; it dominated the kernel.
+    using namespace nvcuda;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
 #pragma unroll
-    for (int dd = 0; dd < FA_HQ; dd++) acc[dd] = 0.0f;
+    for (int nc = 0; nc < 4; nc++) wmma::fill_fragment(acc[nc], 0.0f);
     __syncthreads();
 
     const int last_t = min(nt - 1, tq0 + FA_TQ - 1);
     const int kv_end = positions[last_t] + 1;
+    const bool tile_full = (tq0 + FA_TQ <= nt); // all 64 O rows in-bounds
 
-    const int arow = tid & (FA_TQ - 1);
-    const int aquad = tid >> 6; // 0..3
+    const int warp = tid >> 5; // 0..7
+    const int wm = warp >> 1;  // q 16-block: 4
+    const int wn = warp & 1;   // 64-dim chunk: 2
+    const int lane = tid & 31;
+    const int ar0 = wm * 16 + (lane >> 2); // alpha/l row for fragment row 0
+    const int ar1 = ar0 + 8;               // fragment row 1
 
     for (int kt = 0; kt < kv_end; kt += FA_TKV) {
         // stage K/V tile (16B per lane; rows beyond kv_end zero-filled)
@@ -2576,24 +2588,22 @@ __global__ void fa_prefill_f16kv(
 
         // S = Q · K^T via wmma (reduction over hd)
         {
-            using namespace nvcuda;
-            int warp = tid >> 5;       // 0..7
-            int wm = warp >> 1;        // q 16-block: 4
-            int wk = warp & 1;         // kv 32-block: 2
+            int swm = warp >> 1;
+            int swk = warp & 1;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb[2];
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[2];
             wmma::fill_fragment(fc[0], 0.0f);
             wmma::fill_fragment(fc[1], 0.0f);
             for (int d = 0; d < hd; d += 16) {
-                wmma::load_matrix_sync(fa, &Qs[wm * 16 * hd + d], hd);
-                wmma::load_matrix_sync(fb[0], &Ks[wk * 32 * hd + d], hd);
-                wmma::load_matrix_sync(fb[1], &Ks[(wk * 32 + 16) * hd + d], hd);
+                wmma::load_matrix_sync(fa, &Qs[swm * 16 * hd + d], hd);
+                wmma::load_matrix_sync(fb[0], &Ks[swk * 32 * hd + d], hd);
+                wmma::load_matrix_sync(fb[1], &Ks[(swk * 32 + 16) * hd + d], hd);
                 wmma::mma_sync(fc[0], fa, fb[0], fc[0]);
                 wmma::mma_sync(fc[1], fa, fb[1], fc[1]);
             }
-            wmma::store_matrix_sync(&Sf[wm * 16 * FA_TKV + wk * 32], fc[0], FA_TKV, wmma::mem_row_major);
-            wmma::store_matrix_sync(&Sf[wm * 16 * FA_TKV + wk * 32 + 16], fc[1], FA_TKV, wmma::mem_row_major);
+            wmma::store_matrix_sync(&Sf[swm * 16 * FA_TKV + swk * 32], fc[0], FA_TKV, wmma::mem_row_major);
+            wmma::store_matrix_sync(&Sf[swm * 16 * FA_TKV + swk * 32 + 16], fc[1], FA_TKV, wmma::mem_row_major);
         }
         __syncthreads();
 
@@ -2641,31 +2651,75 @@ __global__ void fa_prefill_f16kv(
         }
         __syncthreads();
 
-        // rescale the accumulator by alpha, then add P · V
-        float ar = alpha[arow];
+        // acc = acc * alpha + P · V on tensor cores. Masked-out probs are
+        // already zero in Pf, and K/V rows beyond kv_end are zero-staged, so
+        // the full 64-wide k-reduction is safe. The per-lane row scale uses
+        // the documented m16n16 f32 accumulator layout (x[0,1,4,5] -> row
+        // lane>>2, x[2,3,6,7] -> row (lane>>2)+8); the parity test locks it.
+        float a0 = alpha[ar0];
+        float a1 = alpha[ar1];
 #pragma unroll
-        for (int dd = 0; dd < FA_HQ; dd++) acc[dd] *= ar;
-        for (int kk = 0; kk < FA_TKV; kk++) {
-            float p = __half2float(Pf[arow * FA_PSTR + kk]);
-            if (p != 0.0f) {
-                const __half* vrow = &Vs[kk * hd + aquad * FA_HQ];
+        for (int nc = 0; nc < 4; nc++) {
+            acc[nc].x[0] *= a0; acc[nc].x[1] *= a0;
+            acc[nc].x[2] *= a1; acc[nc].x[3] *= a1;
+            acc[nc].x[4] *= a0; acc[nc].x[5] *= a0;
+            acc[nc].x[6] *= a1; acc[nc].x[7] *= a1;
+        }
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
 #pragma unroll
-                for (int dd = 0; dd < FA_HQ; dd++) {
-                    acc[dd] += p * __half2float(vrow[dd]);
+            for (int kk0 = 0; kk0 < FA_TKV; kk0 += 16) {
+                wmma::load_matrix_sync(pa, &Pf[wm * 16 * FA_PSTR + kk0], FA_PSTR);
+#pragma unroll
+                for (int nc = 0; nc < 4; nc++) {
+                    wmma::load_matrix_sync(vb, &Vs[kk0 * hd + wn * 64 + nc * 16], hd);
+                    wmma::mma_sync(acc[nc], pa, vb, acc[nc]);
                 }
             }
         }
         __syncthreads();
     }
 
-    // write out: acc / l — rows with l == 0 stay 0 (fully masked)
-    int t = tq0 + arow;
-    if (t < nt) {
-        float l = lsh[arow];
-        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-        float* orow = &o[(size_t)t * ne_q + h * hd + aquad * FA_HQ];
+    // write out: acc / l — rows with l == 0 stay 0 (fully masked). Full
+    // tiles store the fragments straight to global o (every row/col offset
+    // is 16-float aligned); the tail tile stages through shared memory so
+    // rows t >= nt can be skipped.
+    if (tile_full) {
+        float i0 = (lsh[ar0] > 0.0f) ? 1.0f / lsh[ar0] : 0.0f;
+        float i1 = (lsh[ar1] > 0.0f) ? 1.0f / lsh[ar1] : 0.0f;
 #pragma unroll
-        for (int dd = 0; dd < FA_HQ; dd++) orow[dd] = acc[dd] * inv;
+        for (int nc = 0; nc < 4; nc++) {
+            acc[nc].x[0] *= i0; acc[nc].x[1] *= i0;
+            acc[nc].x[2] *= i1; acc[nc].x[3] *= i1;
+            acc[nc].x[4] *= i0; acc[nc].x[5] *= i0;
+            acc[nc].x[6] *= i1; acc[nc].x[7] *= i1;
+            wmma::store_matrix_sync(
+                &o[(size_t)(tq0 + wm * 16) * ne_q + h * hd + wn * 64 + nc * 16],
+                acc[nc], ne_q, wmma::mem_row_major);
+        }
+    } else {
+        // Qs/Ks/Vs regions are free after the KV loop: 48 KB contiguous
+        // staging for the 64x128 f32 O tile.
+        float* stage = reinterpret_cast<float*>(smem);
+        float i0 = (lsh[ar0] > 0.0f) ? 1.0f / lsh[ar0] : 0.0f;
+        float i1 = (lsh[ar1] > 0.0f) ? 1.0f / lsh[ar1] : 0.0f;
+#pragma unroll
+        for (int nc = 0; nc < 4; nc++) {
+            acc[nc].x[0] *= i0; acc[nc].x[1] *= i0;
+            acc[nc].x[2] *= i1; acc[nc].x[3] *= i1;
+            acc[nc].x[4] *= i0; acc[nc].x[5] *= i0;
+            acc[nc].x[6] *= i1; acc[nc].x[7] *= i1;
+            wmma::store_matrix_sync(
+                &stage[(wm * 16) * hd + wn * 64 + nc * 16],
+                acc[nc], hd, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < FA_TQ * hd; idx += 256) {
+            int r = idx / hd, c = idx % hd;
+            int t = tq0 + r;
+            if (t < nt) o[(size_t)t * ne_q + h * hd + c] = stage[idx];
+        }
     }
 }
 

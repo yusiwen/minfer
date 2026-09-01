@@ -3596,6 +3596,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn cuda_fa_prefill_attention_parity() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
