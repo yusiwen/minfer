@@ -169,7 +169,9 @@ impl BackendScheduler {
         let mut staged: Vec<(usize, usize)> = Vec::new();
         // CUDA capture: node ids whose outputs were queued into the pinned
         // capture staging this split, drained (one sync) at the boundary.
-        #[cfg(feature = "cuda")]
+        // Always empty without the `cuda` feature (the push sites below are
+        // gated the same way) — declared unconditionally so the boundary
+        // `flush_cuda_captures` calls compile on every configuration.
         let mut cuda_caps: Vec<usize> = Vec::new();
         for split in &splits {
             if let Some(pb) = prev_backend {
@@ -436,6 +438,20 @@ fn flush_cuda_captures(
         let node = graph.node(nid);
         record_node_data(node, &v, trace_on, live_on);
     }
+}
+
+/// Non-CUDA stub: `caps` is only ever populated by CUDA splits, so without
+/// the `cuda` feature it is always empty here (same pattern as the
+/// non-macOS stub of `flush_metal_captures`).
+#[cfg(not(feature = "cuda"))]
+fn flush_cuda_captures(
+    graph: &ComputeGraph,
+    alloc: &mut GraphAllocator,
+    caps: &mut Vec<usize>,
+    trace_on: bool,
+    live_on: bool,
+) {
+    let _ = (graph, alloc, caps, trace_on, live_on);
 }
 
 #[cfg(test)]
