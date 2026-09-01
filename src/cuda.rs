@@ -346,7 +346,7 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
         kd: i32,
-    );
+    ) -> i32;
     fn launch_mmq_raw_nt(
         type_id: i32,
         w: *const u8,
@@ -2042,19 +2042,21 @@ impl CudaState {
                     nt as i32,
                     stream,
                 );
-                if wide {
-                    launch_mmq_raw_wide_nt(
-                        type_id,
-                        wptr as *const u8,
-                        q8 as *const u8,
-                        out as *mut f32,
-                        nt as i32,
-                        od as i32,
-                        id as i32,
-                        stream,
-                        kd,
-                    );
-                } else {
+                let wide_ok = wide
+                    && unsafe {
+                        launch_mmq_raw_wide_nt(
+                            type_id,
+                            wptr as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            nt as i32,
+                            od as i32,
+                            id as i32,
+                            stream,
+                            kd,
+                        )
+                    } == 1;
+                if !wide_ok {
                     launch_mmq_raw_nt(
                         type_id,
                         wptr as *const u8,

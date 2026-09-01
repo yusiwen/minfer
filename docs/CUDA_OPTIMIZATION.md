@@ -147,9 +147,36 @@ Evidence:
 
 Status: committed behind `MINFER_MMQ=1` (default stays the f16 8p path —
 MMQ would be a 3.5× prefill regression). Loader skips the w16 warm pass
-only when MMQ is actually active. Next lever (when a quiet GPU is
-available): llama.cpp-style bigger per-warp output tiles + wide/coalesced
-staging loads, re-rank KD vs occupancy.
+only when MMQ is actually active.
+
+### P6 raw-byte execution + wide-tile findings (2026-08-31, r7-r8)
+
+Raw kernel landed (`mmq_raw_nt_kernel`, MINFER_MMQ_RAW=1, q4_K): parity
+green, 7B token-identical, 472 vs 441 tok/s (+7%), kernel 20.2 vs
+23.0 ms. Quantize pass 129 -> 74 ms (tree amax + packed stores).
+
+Wide tile (`mmq_raw_wide_nt_kernel`, 128-token block, 8 warps x 32x32,
+MINFER_MMQ_RAW_WIDE=1): mapping PROVEN correct (parity green at KD=4),
+BUT the first measured 2124 tok/s was a phantom — KD=8 needs 135 KB
+dynamic smem, over the ~99 KB opt-in cap; the attr-set AND launch both
+failed silently and the GEMM wrote nothing (fast fake wall time). The
+launcher now guards the cap and reports refusal (Rust falls back to the
+narrow kernel); KD=4 (86 KB) is the only feasible wide depth.
+
+Constraint re-rank from the r8 matrix (all real, parity-clean):
+narrow KD=8 472 > wide KD=4 428 ~= narrow KD=4 427 > R1 441-ish. The
+wide tile's halved B traffic bought NOTHING at KD=4 — B DRAM re-reads
+are absorbed by L2, so traffic is NOT the binding constraint; and the
+2x mma-per-fragment-load did not pay either. The shared bottleneck is
+the per-chunk inner-loop overhead (rescale FMA chain + scale smem
+reads + syncthreads cadence at 32-k granularity), which no staging
+scheme fixes. ncu remains blocked on this device (ERR_NVGPUCTRPERM),
+so further MMQ tuning is hypothesis-cycling at ~15 min per iteration.
+
+Where this leaves the goal: the MMQ path (best 472) is still 4.9x off
+the f16 GEMM path (2318); making MMQ default requires the inner-loop
+restructure nobody has a profile for. The default f16 path is
+UNTOUCHED by all P6 work and remains 2320-2370 tok/s.
 
 P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
 427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth

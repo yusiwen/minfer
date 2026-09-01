@@ -4619,23 +4619,35 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
 }
 
 
-extern "C" void launch_mmq_raw_wide_nt(
+extern "C" int launch_mmq_raw_wide_nt(
     int type_id, const uint8_t* w, const uint8_t* q8, float* c,
     int nt, int od, int id, cudaStream_t stream, int kd
 ) {
     (void)type_id;
+    // KD=8 needs 2*8*128*40 + 36.9KB + 16KB = 135KB — over the ~99KB
+    // opt-in cap; an over-cap request fails SILENTLY (attr + launch both
+    // ignored) and the GEMM silently writes nothing. Guard it: KD=4
+    // (86KB) is the only feasible wide depth. Returns 0 when refused so
+    // the caller can fall back to the narrow raw kernel.
+    if (kd > 4) return 0;
     dim3 grid((nt + 127) / 128, (od + 63) / 64);
-    if (kd <= 4) {
-        const int smem = 2 * 4 * MMQ_WBI * 40 + 2 * MMQ_WBI * 144 + 2 * 2 * 4 * MMQ_WBI * 4;
-        cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<4>),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        mmq_raw_wide_nt_kernel<4><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
-    } else {
-        const int smem = 2 * 8 * MMQ_WBI * 40 + 2 * MMQ_WBI * 144 + 2 * 2 * 8 * MMQ_WBI * 4;
-        cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<8>),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        mmq_raw_wide_nt_kernel<8><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
+    const int smem = 2 * 4 * MMQ_WBI * 40 + 2 * MMQ_WBI * 144
+                   + 2 * 2 * 4 * MMQ_WBI * 4;
+    cudaError_t e = cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<4>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
     }
+    mmq_raw_wide_nt_kernel<4><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "minfer/cuda: mmq raw wide launch failed: %s\n",
+                cudaGetErrorString(e));
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" void launch_mmq_raw_nt(
