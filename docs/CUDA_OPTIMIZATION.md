@@ -161,6 +161,49 @@ fragments), so it was reverted. Remaining lever per the note above:
 wide 16B staging loads + raw-byte smem staging (dequant at mma time),
 which is a structural rewrite of mmq_stage_b, not a knob.
 
+Wall-split correction (P6 r5 profile re-read): the 352 ms dequant pass
+runs at LOAD time (w16 warm pass), NOT inside the Prefill wall — a
+vectorized q4_K dequant measured a null end-to-end delta and was
+reverted (the scalar version was already warp-coalesced). The 890 ms
+Prefill wall is: GEMM ~600 ms + convert 56 + fa 54 + swiglu 51 (re-
+verified at ~257 GB/s = bandwidth peak) + add 19 + host gaps. The GEMM
+is ~85% of the wall: it is the only material lever left.
+
+### MMQ structural rewrite — execution spec (P6 r6, for next session)
+
+Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
+parity) or ~30 (llama.cpp parity). Wall impact: at parity the MMQ path
+(quantize ~130 + GEMM ~600) deletes the 56 ms convert -> ~2670 tok/s;
+at llama.cpp parity the GEMM drops to ~480 ms -> wall ~634 ms -> ~3250
+tok/s (goal met).
+
+Design (llama.cpp mmq structure; q4_K first = 79% of MMQ time):
+1. smem holds RAW bytes only: A per (token, 32-k chunk) = 40 B pad40
+   (2x uint4 qs + uint2 d/ssum); B per (row, 256-k super-block) =
+   144 B Q4KB (9x uint4). KD = 8 chunks (256-k) per double buffer.
+   Footprint: A 2x8x64x40 = 41 KB + B 2x64x144 = 18.4 KB + scales
+   ~ 62 KB -> 1 block/SM at KD=8; KD=4 -> ~31 KB -> 2-3 blocks/SM
+   (re-measure both; r5 showed depth beats occupancy for the word-
+   staging kernel, raw staging shifts the tradeoff).
+2. Staging = pure cp.async 16B chunks (A: 2x16 + 8 B; B: 9x16),
+   commit_group per (kt, buf); NO dequant ALU in the staging path.
+3. The mma loop dequants IN REGISTERS from smem raw bytes (same math
+   as mmq_stage_b TYPE==5: get_scale_min_k4 per (row, sub), nibble
+   unpack, __vsubss4) so the ALU overlaps tensor-core issue instead of
+   serializing before __syncthreads.
+4. Warp tile stays 32(i)x16(j) x 8 warps on 64x64 (the 4-warp 32x32
+   variant measured slower AND broke parity — do not retry).
+5. Land as mmq_raw_nt_kernel<TYPE> beside mmq_nt_kernel; gate
+   MINFER_MMQ_RAW=1 through prefill_mmq so R1 stays intact; q4_K only
+   in the first cut (q6_K KSPLIT=2 later).
+6. Parity: extend cuda_prefill_mmq_parity with a raw-mode arm (same
+   host reference), then the 7B greedy-token-identity check vs the f16
+   path, then quiet-window A/B vs R1 MMQ and vs the default f16 path.
+7. Quantize pass (129 ms) is follow-up work once the GEMM wins: it is
+   convert-bandwidth (~87-102 GB/s) and latency-bound on the serial
+   fmaxf chain — tree-reduce amax + register-packed stores, target
+   ~60-70 ms.
+
 ### R2 — MMVQ weight-streaming rework (Aug 31, DONE)
 
 The 8e decode kernels ran at ~60% of llama.cpp's effective streaming rate
