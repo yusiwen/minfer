@@ -3529,6 +3529,12 @@ void launch_gemm_f32a(
     if (e != cudaSuccess)
         fprintf(stderr, "minfer/cuda: af32 gemm launch failed: %s\n",
                 cudaGetErrorString(e));
+    if (getenv("MINFER_A32_SYNC")) {
+        e = cudaStreamSynchronize(stream);
+        if (e != cudaSuccess)
+            fprintf(stderr, "minfer/cuda: af32 gemm ASYNC FAULT nt=%d od=%d id=%d: %s\n",
+                    nt, od, id, cudaGetErrorString(e));
+    }
 }
 
 

@@ -2225,6 +2225,9 @@ impl CudaState {
             .unwrap_or(false);
         if af32 {
             unsafe {
+                std::env::var("MINFER_A32_DEBUG")
+                    .is_ok()
+                    .then(|| eprintln!("minfer/cuda: af32 gemm nt={nt} od={od} id={id}"));
                 launch_gemm_f32a(
                     x as *const f32,
                     w16,
