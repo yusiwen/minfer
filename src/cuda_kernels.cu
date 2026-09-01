@@ -1634,6 +1634,12 @@ __global__ void store_kv_f32(
 
 // 8b: f16 KV variant — stores f32 rows as half into the same persistent
 // region viewed as half (2 bytes/elem); halves attention read bandwidth.
+// P1: one thread converts 4 dims (float4 read -> 2x __half2 store). The
+// original one-thread-per-element grid (nt x nkt of SINGLE-THREAD blocks)
+// measured ~7 GB/s on the 7B @2K prefill (1.05 M blocks of 1 thread);
+// this shape moves the same bytes with 128-thread blocks and vector loads.
+// nkt is a multiple of 4 on every CUDA f16-KV path (nkt = nk * hd, hd % 4
+// == 0 enforced by the dispatch); the scalar tail keeps odd shapes safe.
 __global__ void store_kv_f16(
     const float* __restrict__ src,
     __half* __restrict__ dst,
@@ -1641,9 +1647,18 @@ __global__ void store_kv_f16(
     const int* positions
 ) {
     int t = blockIdx.x;
-    int j = blockIdx.y;
+    int j = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
     if (t >= nt || j >= nkt) return;
-    dst[positions[t] * nkt + j] = __float2half(src[t * nkt + j]);
+    int p = positions[t];
+    if (j + 3 < nkt) {
+        float4 v = *reinterpret_cast<const float4*>(src + (size_t)t * nkt + j);
+        __half2* d = reinterpret_cast<__half2*>(dst + (size_t)p * nkt + j);
+        d[0] = __floats2half2_rn(v.x, v.y);
+        d[1] = __floats2half2_rn(v.z, v.w);
+    } else {
+        for (int i = j; i < nkt; i++)
+            dst[(size_t)p * nkt + i] = __float2half(src[(size_t)t * nkt + i]);
+    }
 }
 
 // helper: convert a half4 (hd is a multiple of 4) to float4
@@ -2422,8 +2437,9 @@ void launch_store_kv_f16(
     const float* src, void* dst, int nkt, int nt,
     const int* positions, cudaStream_t stream
 ) {
-    dim3 grid(nt, nkt, 1);
-    store_kv_f16<<<grid, dim3(1, 1, 1), 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
+    dim3 block(128, 1, 1);
+    dim3 grid(nt, (nkt / 4 + 127) / 128, 1);
+    store_kv_f16<<<grid, block, 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
 }
 
 void launch_gqa_attn_f32_f16kv(
@@ -2940,8 +2956,20 @@ __global__ void dequant_q6_k_f16(
 __global__ void convert_f32_f16_kernel(
     const float* __restrict__ x, __half* __restrict__ out, long long n
 ) {
-    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (g < n) out[g] = __float2half(x[g]);
+    // P1: 8 elements per thread (2x float4 -> 4x half2) instead of one
+    // scalar element — 8x fewer transactions on the same traffic.
+    long long base = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (base + 7 < n) {
+        float4 a = *reinterpret_cast<const float4*>(x + base);
+        float4 b = *reinterpret_cast<const float4*>(x + base + 4);
+        __half2* o = reinterpret_cast<__half2*>(out + base);
+        o[0] = __floats2half2_rn(a.x, a.y);
+        o[1] = __floats2half2_rn(a.z, a.w);
+        o[2] = __floats2half2_rn(b.x, b.y);
+        o[3] = __floats2half2_rn(b.z, b.w);
+    } else if (base < n) {
+        for (long long i = base; i < n; i++) out[i] = __float2half(x[i]);
+    }
 }
 
 // 8m②: cp.async global→shared staging (sm_80+). The synchronous load
@@ -3105,7 +3133,7 @@ void launch_dequant_f16(
 void launch_convert_f16(
     const float* x, __half* out, long long n, cudaStream_t stream
 ) {
-    long long grid = (n + 255) / 256;
+    long long grid = (n / 8 + 255) / 256;
     if (grid > 2147483647LL) grid = 2147483647LL;
     convert_f32_f16_kernel<<<(int)grid, 256, 0, stream>>>(x, out, n);
 }
