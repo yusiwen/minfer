@@ -2518,6 +2518,48 @@ void launch_gqa_attn_f32(
 #define FA_TKV 64
 #define FA_PSTR (FA_TKV * 2) // probs row stride in halves (256B): probs row r aliases only Sf row r's first half, already read by the same thread — no cross-thread race
 
+// P3: async K/V tile staging (16B cp.async chunks; rows beyond kv_end
+// zero-filled). Overlapped with the previous tile's QK^T/softmax/P·V via
+// double buffering — the synchronous staging version paid the full DRAM
+// latency once per KV tile inside the block's serial k-loop.
+__device__ __forceinline__ void fa_stage_kv_async(
+    const __half* __restrict__ k, const __half* __restrict__ v,
+    __half* Ks, __half* Vs, int kt, int kv_end,
+    int hk, int hd, int stride_kv, int sstr, int tid
+) {
+#if __CUDA_ARCH__ >= 800
+    for (int c = tid; c < FA_TKV * hd / 8; c += 256) {
+        int r = (c * 8) / hd, d = (c * 8) % hd;
+        int p = kt + r;
+        bool full = p < kv_end;
+        unsigned kd = (unsigned)__cvta_generic_to_shared(Ks + r * sstr + d);
+        unsigned vd = (unsigned)__cvta_generic_to_shared(Vs + r * sstr + d);
+        int sz = full ? 16 : 0;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(kd),
+                     "l"(k + (size_t)p * stride_kv + hk * hd + d), "r"(sz));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(vd),
+                     "l"(v + (size_t)p * stride_kv + hk * hd + d), "r"(sz));
+    }
+#else
+    // pre-sm80: synchronous staging (sm_75 stays a build target)
+    const uint4 z4 = make_uint4(0, 0, 0, 0);
+    for (int i = tid * 8; i < FA_TKV * hd; i += 2048) {
+        int r = i / hd, d = i % hd;
+        int p = kt + r;
+        uint4 kk4, vv4;
+        if (p < kv_end) {
+            kk4 = *reinterpret_cast<const uint4*>(&k[(size_t)p * stride_kv + hk * hd + d]);
+            vv4 = *reinterpret_cast<const uint4*>(&v[(size_t)p * stride_kv + hk * hd + d]);
+        } else {
+            kk4 = z4;
+            vv4 = z4;
+        }
+        *reinterpret_cast<uint4*>(&Ks[r * sstr + d]) = kk4;
+        *reinterpret_cast<uint4*>(&Vs[r * sstr + d]) = vv4;
+    }
+#endif
+}
+
 __global__ void fa_prefill_f16kv(
     const float* __restrict__ q,
     const __half* __restrict__ k,
@@ -2529,10 +2571,18 @@ __global__ void fa_prefill_f16kv(
     int nt
 ) {
     extern __shared__ __align__(256) uint8_t smem[];
+    // Padded smem row stride: hd=128 halves = 256B ≡ 0 mod 32 banks makes
+    // every wmma ldmatrix row land on the same bank group (8-way conflict
+    // per load). +8 halves (272B) shifts each row by 4 banks.
+    const int sstr = hd + 8;
     __half* Qs = reinterpret_cast<__half*>(smem);
-    __half* Ks = Qs + FA_TQ * hd;
-    __half* Vs = Ks + FA_TKV * hd;
-    float* Sf = reinterpret_cast<float*>(Vs + FA_TKV * hd);
+    // Single-buffered K/V tiles: double buffering at the padded stride
+    // (5 x 64 x 136 x 2B) exceeds GB10's 99KB/block smem cap and silently
+    // falls back to the legacy attention kernel — padding wins more than
+    // the staging overlap, so the overlap is the feature that goes.
+    __half* Ks = Qs + FA_TQ * sstr;
+    __half* Vs = Ks + FA_TKV * sstr;
+    float* Sf = reinterpret_cast<float*>(Vs + FA_TKV * sstr);
     __half* Pf = reinterpret_cast<__half*>(Sf); // alias: probs after softmax
     float* msh = reinterpret_cast<float*>(Sf + FA_TQ * FA_TKV);
     float* lsh = msh + FA_TQ;
@@ -2551,7 +2601,7 @@ __global__ void fa_prefill_f16kv(
         int r = i / hd, d = i % hd;
         int t = tq0 + r;
         float qv = (t < nt) ? q[(size_t)t * ne_q + h * hd + d] * scale : 0.0f;
-        Qs[i] = __float2half(qv);
+        Qs[r * sstr + d] = __float2half(qv);
     }
     if (tid < FA_TQ) {
         msh[tid] = -INFINITY;
@@ -2584,22 +2634,14 @@ __global__ void fa_prefill_f16kv(
     const int ar1 = ar0 + 8;               // fragment row 1
 
     for (int kt = 0; kt < kv_end; kt += FA_TKV) {
-        // stage K/V tile (16B per lane; rows beyond kv_end zero-filled)
-        const uint4 z4 = make_uint4(0, 0, 0, 0);
-        for (int i = tid * 8; i < FA_TKV * hd; i += 2048) {
-            int r = i / hd, d = i % hd;
-            int p = kt + r;
-            uint4 kk4, vv4;
-            if (p < kv_end) {
-                kk4 = *reinterpret_cast<const uint4*>(&k[(size_t)p * stride_kv + hk * hd + d]);
-                vv4 = *reinterpret_cast<const uint4*>(&v[(size_t)p * stride_kv + hk * hd + d]);
-            } else {
-                kk4 = z4;
-                vv4 = z4;
-            }
-            *reinterpret_cast<uint4*>(&Ks[i]) = kk4;
-            *reinterpret_cast<uint4*>(&Vs[i]) = vv4;
-        }
+        // stage K/V tile (padded stride; synchronous — see the smem note)
+        fa_stage_kv_async(k, v, Ks, Vs, kt, kv_end, hk, hd, stride_kv, sstr, tid);
+#if __CUDA_ARCH__ >= 800
+        // the copies are ASYNC: a bare __syncthreads does NOT order them —
+        // commit + wait_group 0 makes the tile visible before QK^T reads it
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
+#endif
         __syncthreads();
 
         // S = Q · K^T via wmma (reduction over hd)
@@ -2612,9 +2654,9 @@ __global__ void fa_prefill_f16kv(
             wmma::fill_fragment(fc[0], 0.0f);
             wmma::fill_fragment(fc[1], 0.0f);
             for (int d = 0; d < hd; d += 16) {
-                wmma::load_matrix_sync(fa, &Qs[swm * 16 * hd + d], hd);
-                wmma::load_matrix_sync(fb[0], &Ks[swk * 32 * hd + d], hd);
-                wmma::load_matrix_sync(fb[1], &Ks[(swk * 32 + 16) * hd + d], hd);
+                wmma::load_matrix_sync(fa, &Qs[swm * 16 * sstr + d], sstr);
+                wmma::load_matrix_sync(fb[0], &Ks[swk * 32 * sstr + d], sstr);
+                wmma::load_matrix_sync(fb[1], &Ks[(swk * 32 + 16) * sstr + d], sstr);
                 wmma::mma_sync(fc[0], fa, fb[0], fc[0]);
                 wmma::mma_sync(fc[1], fa, fb[1], fc[1]);
             }
@@ -2623,47 +2665,51 @@ __global__ void fa_prefill_f16kv(
         }
         __syncthreads();
 
-        // online softmax per row (thread = row): probs land in Pf (f16)
-        if (tid < FA_TQ) {
-            int r = tid;
-            int t = tq0 + r;
-            int qpos = (t < nt) ? positions[t] : -1;
-            float m_old = msh[r];
-            float m_new = m_old;
-            for (int kk = 0; kk < FA_TKV; kk++) {
-                int kv_g = kt + kk;
-                if (kv_g <= qpos && kv_g < kv_end) {
-                    float s = Sf[r * FA_TKV + kk];
-                    if (s > m_new) m_new = s;
-                }
-            }
-            float a = 1.0f;
-            float l_new = lsh[r];
-            // Pf rows use a 256B stride: row r's probs overlap ONLY Sf row r's
-            // first half, which this same thread has already read (each read
-            // precedes its clobbering write in program order). A 128B stride
-            // would race: probs for row r land on scores of rows 2r/2r+1 that
-            // other softmax threads have not read yet.
-            if (m_new == -INFINITY) {
-                // nothing valid in this tile: keep state, zero probs
-                for (int kk = 0; kk < FA_TKV; kk++) Pf[r * FA_PSTR + kk] = __float2half(0.0f);
-            } else {
-                a = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
-                float sum = 0.0f;
-                for (int kk = 0; kk < FA_TKV; kk++) {
-                    int kv_g = kt + kk;
-                    float p = 0.0f;
-                    if (kv_g <= qpos && kv_g < kv_end) {
-                        p = __expf(Sf[r * FA_TKV + kk] - m_new);
+        // online softmax — one WARP per row (8 warps cover the 64 rows, 8
+        // rows per warp across k-tiles): each lane owns 2 of the 64 columns
+        // and warp shuffles reduce max/sum, replacing the previous
+        // thread-per-row serial scans (64-deep dependent chains on 2 of 8
+        // warps — the kernel's dominant serial cost). Pf rows keep the 256B
+        // stride: lane L's probs clobber exactly the two Sf floats lane L
+        // itself read (per-lane program order, same invariant as before).
+        {
+            for (int rr = warp; rr < FA_TQ; rr += 8) {
+                int t = tq0 + rr;
+                int qpos = (t < nt) ? positions[t] : -1;
+                int c0 = lane * 2, c1 = c0 + 1;
+                bool v0 = kt + c0 <= qpos && kt + c0 < kv_end;
+                bool v1 = kt + c1 <= qpos && kt + c1 < kv_end;
+                // -INF seed: an all-masked row must keep the -INF state (a 0.0
+                // seed would corrupt m/alpha for tiles with nothing valid).
+                float s0 = v0 ? Sf[rr * FA_TKV + c0] : -INFINITY;
+                float s1 = v1 ? Sf[rr * FA_TKV + c1] : -INFINITY;
+                float m_new = fmaxf(s0, s1);
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    m_new = fmaxf(m_new, __shfl_xor_sync(0xffffffffu, m_new, off));
+                float m_old = msh[rr];
+                float a = 1.0f;
+                if (m_new == -INFINITY) {
+                    // nothing valid in this tile: keep state, zero probs
+                    Pf[rr * FA_PSTR + c0] = __float2half(0.0f);
+                    Pf[rr * FA_PSTR + c1] = __float2half(0.0f);
+                } else {
+                    a = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                    float p0 = v0 ? __expf(s0 - m_new) : 0.0f;
+                    float p1 = v1 ? __expf(s1 - m_new) : 0.0f;
+                    Pf[rr * FA_PSTR + c0] = __float2half(p0);
+                    Pf[rr * FA_PSTR + c1] = __float2half(p1);
+                    float sum = p0 + p1;
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                    if (lane == 0) {
+                        lsh[rr] = lsh[rr] * a + sum;
+                        msh[rr] = m_new;
                     }
-                    Pf[r * FA_PSTR + kk] = __float2half(p);
-                    sum += p;
                 }
-                l_new = lsh[r] * a + sum;
+                if (lane == 0) alpha[rr] = a;
             }
-            alpha[r] = a;
-            msh[r] = m_new;
-            lsh[r] = l_new;
         }
         __syncthreads();
 
@@ -2689,7 +2735,7 @@ __global__ void fa_prefill_f16kv(
                 wmma::load_matrix_sync(pa, &Pf[wm * 16 * FA_PSTR + kk0], FA_PSTR);
 #pragma unroll
                 for (int nc = 0; nc < 4; nc++) {
-                    wmma::load_matrix_sync(vb, &Vs[kk0 * hd + wn * 64 + nc * 16], hd);
+                    wmma::load_matrix_sync(vb, &Vs[kk0 * sstr + wn * 64 + nc * 16], sstr);
                     wmma::mma_sync(acc[nc], pa, vb, acc[nc]);
                 }
             }
@@ -2744,13 +2790,23 @@ int launch_fa_prefill_f16kv(
     const int* positions, int nh, int nk, int hd, float scale, int nt,
     cudaStream_t stream
 ) {
-    size_t smem = (size_t)3 * FA_TQ * hd * 2 + (size_t)FA_TQ * FA_TKV * 4 + 3 * FA_TQ * 4;
+    size_t smem = (size_t)3 * FA_TQ * (hd + 8) * 2 + (size_t)FA_TQ * FA_TKV * 4 + 3 * FA_TQ * 4; // Qs/Ks/Vs padded (+8 halves per row)
     static size_t attr_smem = 0;
     if (smem > attr_smem) {
         cudaError_t e = cudaFuncSetAttribute(
             fa_prefill_f16kv, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         if (e != cudaSuccess) {
             cudaGetLastError(); // clear the error so it cannot poison the stream
+            // NOT silent: the caller falls back to the legacy per-token
+            // attention kernel (~50x slower) — this must be visible.
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                        "minfer/cuda: fa_prefill_f16kv smem %zu B exceeds the device "
+                        "limit; falling back to the legacy attention kernel\n",
+                        smem);
+            }
             return -1;
         }
         attr_smem = smem;
