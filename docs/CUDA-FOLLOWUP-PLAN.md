@@ -562,3 +562,13 @@ decode lever with a proven Metal precedent; 8c is a promise to close with a
 measure-first gate; 8d/8e chased the bandwidth/overhead headroom on 7B (8e
 re-examined 2026-08-29 and reversed into the MMVQ decode win, see above); 8f
 widens model coverage; 8g/8h are polish.
+
+## P5 (Sep 1, 2026): prefill gap 2.37× → 1.43×
+
+Landed (details in CUDA_OPTIMIZATION.md §P5): 8p elementwise
+vectorization, 8q TM=128 GEMM tiles, 8r all-warp FA softmax, 8s padded
+smem rows (fa 4.25 → 1.92 ms/layer) + a one-time warning on the FA
+smem-cap fallback; k-step templating with a negative result for KS=64.
+New debts: FA smem-optin fallback must stay loud; `MINFER_GEMM_K64=1`
+and `MINFER_GEMM_TM=64` are the kept A/B knobs; next levers are f16-out
+rms_norm/swiglu (~77 ms) and GEMM mma-level work (597 → 455 ms target).

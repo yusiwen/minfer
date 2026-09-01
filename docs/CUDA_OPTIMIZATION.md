@@ -8,14 +8,14 @@
 > Single-sourced implementation records: `docs/CUDA-BACKEND-PLAN.md`
 > (Phase 7a–7e) and `docs/CUDA-FOLLOWUP-PLAN.md` (Phase 8, 8a–8p).
 
-## Part I — Current state (DGX Spark GB10, master `761e236`)
+## Part I — Current state (DGX Spark GB10, master `1365c82`)
 
 llama.cpp baseline: llama-bench `ca3d5a3e1`, 8 threads, `-ngl 99`, GB10
 CUDA. minfer: CLI single-shot, greedy.
 
 | Workload | llama.cpp | minfer | gap |
 |---|---:|---:|---:|
-| 7B q4_k_m prefill @2K | 3401 | ~1400–1500 (±10% thermal) | 2.3× |
+| 7B q4_k_m prefill @2K | 3401 | 2340–2370 (P5) | 1.43× |
 | 7B decode tg128 | 47.1 | 47.5–47.6 (R4) | ~parity (ahead) |
 | 7B decode @2K | 44.9 | 43.2–45.1 (R4) | ~0–4% |
 | 0.6B q8_0 prefill @2K | 23909 | 4792 | 5.0× |
@@ -23,10 +23,10 @@ CUDA. minfer: CLI single-shot, greedy.
 | 0.5B q4_0 prefill @2K | 30550 | ~3020 | 10× |
 | 0.5B decode tg128 | 453 | ~257 | 1.8× |
 
-7B prefill went 30.7 → ~1450 tok/s over the Aug 30 session (~47×); the
-decode path closed its gap in two steps — R2 (weight streaming, tg128
-42.2 → 45.1) and R4 (split-attention rewrite, tg128 → 47.5, @2K 39.2 →
-43.2–45.1 vs llama.cpp's 44.9).
+7B prefill went 30.7 → ~1450 (Aug 30) → 2340–2370 tok/s (P5, Sep 1);
+the decode path closed its gap in two steps — R2 (weight streaming,
+tg128 42.2 → 45.1) and R4 (split-attention rewrite, tg128 → 47.5, @2K
+39.2 → 43.2–45.1 vs llama.cpp's 44.9).
 
 What the engine does now (all in `src/cuda_kernels.cu` + `src/cuda.rs`,
 dispatched by `src/graph/cuda_backend.rs`):
@@ -205,6 +205,49 @@ tg128 45.1 → 47.5–47.6 (llama.cpp 47.1 — at/above parity). Parity:
 `cuda_attn_split_decode_parity` extended to sweep the SPLITS=32 chunk
 boundaries (nkv 3..207 × f16/f32 KV). SPLITS=64 measured no better
 (44.7 vs 45.1 @2K); 32 kept.
+
+### P5 — prefill gap: GEMM tiles + flash-attn rewrite (Sep 1, `b8568cd`…`1365c82`)
+
+Goal: close the 7B @2K prefill gap (was 1435 vs llama.cpp 3401, 2.37×).
+Four steps, each suite-verified and measured with interleaved same-binary
+A/B runs on the 2K prompt (full-output diff, never prompt-echo grep):
+
+1. **8p — elementwise vectorization** (+4%, 1435 → 1493): store_kv_f16
+   1→4 dims/lane, convert_f32_f16 1→8 elems/lane. The generic 1-elem
+   kernels were launch-bound and left 15/16 of every memory transaction
+   unused.
+2. **8q — 128-wide GEMM tiles** (+30%→2267): `gemm_f16_nt_kernel_t<TM>`
+   with TM=128 halves the B-panel L2 re-reads and the barriers per FLOP
+   vs TM=64 (455→302 ms kernel time); TM=64 kept via `MINFER_GEMM_TM=64`.
+   Isolated with hybrid-kernel bisects after the first version corrupted
+   the GEMM: `fb[1]` must offset +16 ELEMENTS (the k-half) not +16 rows
+   (the next od row) — caught by `cuda_prefill_f16_gemm_parity`.
+3. **8r — FA prefill softmax on all 8 warps** (+3%): warp-per-row online
+   softmax (8 warps × 8 rows, lanes own 2 cols, shuffle reductions)
+   replaced the 64-deep serial chains on 2 of 8 warps; -INF seeds for
+   all-masked rows.
+4. **8s — padded smem rows + the two FA bugs** (2267 → 2365–2371): with
+   hd=128 every smem row was 256 B ≡ 0 mod 32 banks → 8-way bank
+   conflicts on every wmma ldmatrix; +8-half row stride (272 B) shifts
+   rows 4 banks. Two bugs on the way: (a) the double-buffered working
+   set exceeded GB10's 99KB/block smem cap → `cudaFuncSetAttribute`
+   failed → **silent** fallback to the legacy per-token kernel (313
+   tok/s); the fallback now prints a one-time warning and the padded
+   layout ships single-buffered (69KB); (b) dropping the double buffer
+   left cp.async staging without `commit_group`/`wait_group 0` — a bare
+   `__syncthreads` does NOT order async copies (0.28 parity diff).
+   fa_prefill_f16kv: 4.25 → 1.92 ms/layer (llama.cpp flash-attn 0.79).
+
+5. **k-step-64 (negative result, `1365c82`)**: the GEMM is now <TM, KS>
+   with dynamic smem and a chunk-linear staging helper; KS=64 halves the
+   barriers per FLOP but measured 1464 vs 2345 tok/s (-38%) — the 56KB
+   footprint halves resident blocks. KS=32 stays default; `MINFER_GEMM_K64=1`
+   re-tries.
+
+nsys budgets after P5 (per 2K prefill): GEMM ~597 ms (~46 TFLOPS eff,
+llama.cpp 455 ms), FA ~54 ms, convert ~56 ms, swiglu ~51 ms. Remaining
+levers: GEMM k-warp specialization / mma.ptx, f16-out rms_norm+swiglu
+(kills the convert pass), FA KV-split for the last 2.5×.
 
 ## Part III — Remaining roadmap
 
