@@ -3133,7 +3133,7 @@ __device__ __forceinline__ void gemm_stage_a32(
     __half* As, int bbuf, const float* A32, int TN,
     int n0, int k0, int nt, int id, int tid
 ) {
-    for (int c = tid; c < TN * KS / 8; c += 256) {
+    for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
         int r = (c * 8) / KS, d = (c * 8) % KS;
         int n = n0 + r;
         uint4 h = make_uint4(0u, 0u, 0u, 0u);
@@ -3171,14 +3171,14 @@ __device__ __forceinline__ void gemm_stage_ab(
         gemm_stage_a32<KS>(As, bbuf, reinterpret_cast<const float*>(A), TN,
                            n0, k0, nt, id, tid);
     } else {
-        for (int c = tid; c < TN * KS / 8; c += 256) {
+        for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
             int r = (c * 8) / KS, d = (c * 8) % KS;
             int n = n0 + r;
             gemm_cp16(As + bbuf * TN * KS + r * KS + d,
                       A + (long long)n * id + k0 + d, n < nt && k0 + d < id);
         }
     }
-    for (int c = tid; c < TM * KS / 8; c += 256) {
+    for (int c = tid; c < TM * KS / 8; c += blockDim.x) {
         int r = (c * 8) / KS, d = (c * 8) % KS;
         int m = m0 + r;
         gemm_cp16(Bs + bbuf * TM * KS + r * KS + d,
@@ -3206,18 +3206,19 @@ __global__ void gemm_f16_nt_kernel_t(
     extern __shared__ __align__(16) uint8_t smem_raw[];
     __half* As = reinterpret_cast<__half*>(smem_raw);       // 2 x TN*KS
     __half* Bs = As + 2 * TN * KS;                          // 2 x TM*KS
-    float* Cs = reinterpret_cast<float*>(Bs + 2 * TM * KS); // 8 x 256 f32
+    float* Cs = reinterpret_cast<float*>(Bs + 2 * TM * KS); // NW x 256 f32
 
-    const int tid = threadIdx.x;      // 256
-    int warp = tid >> 5;              // 0..7
-    int wm = warp >> 1;               // od chunk: 4 x (TM/4) cols
+    const int tid = threadIdx.x;
+    const int NW = blockDim.x >> 5;   // warps: 8 for TM<=128, 16 for TM=256
+    int warp = tid >> 5;
+    int wm = warp >> 1;               // od chunk of this warp (TM/(NW/2) cols)
     int wn = warp & 1;                // nt sub-tile: 2 x 32 rows
     // blockIdx.x = nt tile, blockIdx.y = od tile: consecutive blocks share
     // the same od-tile's B panel (64 rows x id f16, ~0.5MB) in L2, so the
     // f16 weight matrix streams from DRAM ~once instead of nt/64 times.
     int m0 = blockIdx.y * TM;
     int n0 = blockIdx.x * TN;
-    const int ob = wm * (TM / 4); // od row base of this warp's chunk
+    const int ob = wm * (TM / (NW >> 1)); // od row base of this warp's chunk
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[4];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb[2];
@@ -3238,7 +3239,7 @@ __global__ void gemm_f16_nt_kernel_t(
             gemm_stage_a32<KS>(As, 0, reinterpret_cast<const float*>(A), TN,
                                n0, 0, nt, id, tid);
         } else {
-            for (int c = tid; c < TN * KS / 8; c += 256) {
+            for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
                 int r = (c * 8) / KS, d = (c * 8) % KS;
                 int n = n0 + r;
                 if (n < nt && d < id) {
@@ -3249,7 +3250,7 @@ __global__ void gemm_f16_nt_kernel_t(
                 }
             }
         }
-        for (int c = tid; c < TM * KS / 8; c += 256) {
+        for (int c = tid; c < TM * KS / 8; c += blockDim.x) {
             int r = (c * 8) / KS, d = (c * 8) % KS;
             int m = m0 + r;
             if (m < od && d < id) {
@@ -3280,7 +3281,7 @@ __global__ void gemm_f16_nt_kernel_t(
                 gemm_stage_a32<KS>(As, buf ^ 1, reinterpret_cast<const float*>(A),
                                    TN, n0, k + KS, nt, id, tid);
             } else {
-                for (int c = tid; c < TN * KS / 8; c += 256) {
+                for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
                     int r = (c * 8) / KS, d = (c * 8) % KS;
                     int n = n0 + r;
                     if (n < nt && k + KS + d < id) {
@@ -3291,7 +3292,7 @@ __global__ void gemm_f16_nt_kernel_t(
                     }
                 }
             }
-            for (int c = tid; c < TM * KS / 8; c += 256) {
+            for (int c = tid; c < TM * KS / 8; c += blockDim.x) {
                 int r = (c * 8) / KS, d = (c * 8) % KS;
                 int m = m0 + r;
                 if (m < od && k + KS + d < id) {
@@ -3401,7 +3402,8 @@ void launch_gemm_f16(
     static int tm = -1;
     if (tm < 0) {
         const char* e = getenv("MINFER_GEMM_TM");
-        tm = (e && atoi(e) <= 64) ? 64 : 128;
+        int v = e ? atoi(e) : 128;
+        tm = (v <= 64) ? 64 : (v >= 256) ? 256 : 128;
     }
     // KS = staged k-width per tile. KS=64 halves the barriers per FLOP but
     // measured -38% (56KB dynamic smem halves resident blocks on GB10);
