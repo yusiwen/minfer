@@ -215,6 +215,41 @@ could be produced at WEIGHT-LOAD time by our existing w16 dequant pass
 change plus a kernel rewrite against a new payload layout — a
 standalone decision, not a shape tweak.
 
+### P6 r10: the reference inner-loop decomposition, ported — perf flat; delta localized
+
+The q4_K vec_dot in the reference is the UNIVERSAL q8_1 x q8_1 mma
+(mmq-vec-dot.cuh): the nibble unpack and the dmin fold happen ONCE per
+(row, chunk) inside load_tiles_q4_K, and the compute loop applies
+scales as `sum += dmA.x*dsB.x*C + dmA.y*dsB.y` with the weight-side
+scales preloaded into registers before the j0 loop.
+
+We ported that decomposition into the sync-wide kernel (dequantize
+q4_K to per-k signed int8 in the staging phase — the GGML
+sub-block-pair byte interleave handled — plain q8 x q8 mma, no nibble
+unpack, no dmv/sa term, rescale halved). Parity green. Measured
+462-468 tok/s vs narrow 470: FLAT. Both sit at ~6.4 TMAC/s while the
+reference reaches ~30 TMAC/s with the same decomposition, so the
+residual is NOT the decomposition either. It is:
+
+1. ILP depth: the reference warp carries 16 independent mma chains per
+   chunk (rows_per_warp=32 -> ntx=2 minitiles x J/16 j0-groups) backed
+   by 128 accumulator registers (sum[64] + 16 int C-frags); ours has 8
+   chains and ~64 accumulator regs. At 1 block/SM the register file
+   (255/thread) is half idle — the compiler cannot create chains the
+   source does not express.
+2. ldmatrix A staging: their A fragments load with one LDSM per
+   16x32 int8 fragment; ours use 8 LDS.32.
+3. Tile 128 od-rows x 128 tokens (vs our 128 x 64).
+
+Redo recipe (the edit session was lost to a post-checkout hook revert
+after measurement; measurements above are valid): stage B as per-k
+signed int8 ((nib - m), get_scale_min_k4 in staging, byte k at offset
+(sg>>1)*32 + k, low/high nibble by sg parity), qb8 = 64 x KDR x 32B,
+b-frag words = *(int*)(qb8 + jr*KDR*32 + kd*32 + 4*(lane&3)) [+16],
+rescale = sum += da*dsv*C only. Then widen the warp tile to 16 mma
+chains (sum[64], clow[64][4] -> needs 2 x ntx minitiles like the
+reference) and re-format the A smem for ldmatrix.
+
 P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
 427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth
 amortization dominates — docs finding above confirmed). The bigger
