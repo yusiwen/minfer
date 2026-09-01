@@ -3123,36 +3123,24 @@ __device__ __forceinline__ void gemm_load_b_sync(
 // templated GEMM.
 } // extern "C"
 
-// One 16B smem chunk (8 halves) of the A tile staged from an F32 source:
-// 32B global read -> 8 converts -> 16B store. No cp.async conversion
-// exists, so the A side loses async staging; the tile is small (4-8KB)
-// and hides behind the B panel's cp.async. Requires id % 8 == 0 (16B
-// row alignment comes from the id % 32 dispatch gate).
+// AF32 A staging, mirror scheme: cp.async the F32 k-tile into a smem
+// mirror (16B = 4 f32 chunks; async again — the v1 synchronous global
+// loads stalled every k-tile and measured -8%), then convert
+// smem->smem f32->f16 right before compute. Requires id % 8 == 0.
 template <int KS>
-__device__ __forceinline__ void gemm_stage_a32(
-    __half* As, int bbuf, const float* A32, int TN,
+__device__ __forceinline__ void gemm_mirror_a32(
+    float* Am, int bbuf, const float* A32, int TN,
     int n0, int k0, int nt, int id, int tid
 ) {
-    for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
-        int r = (c * 8) / KS, d = (c * 8) % KS;
+#if __CUDA_ARCH__ >= 800
+    for (int c = tid; c < TN * KS / 4; c += blockDim.x) {
+        int r = (c * 4) / KS, d = (c * 4) % KS;
         int n = n0 + r;
-        uint4 h = make_uint4(0u, 0u, 0u, 0u);
-        if (n < nt && k0 + d < id) {
-            const float4 f0 = *reinterpret_cast<const float4*>(
-                A32 + (long long)n * id + k0 + d);
-            const float4 f1 = *reinterpret_cast<const float4*>(
-                A32 + (long long)n * id + k0 + d + 4);
-            __half2 p0 = __floats2half2_rn(f0.x, f0.y);
-            __half2 p1 = __floats2half2_rn(f0.z, f0.w);
-            __half2 p2 = __floats2half2_rn(f1.x, f1.y);
-            __half2 p3 = __floats2half2_rn(f1.z, f1.w);
-            h = make_uint4(*reinterpret_cast<unsigned*>(&p0),
-                           *reinterpret_cast<unsigned*>(&p1),
-                           *reinterpret_cast<unsigned*>(&p2),
-                           *reinterpret_cast<unsigned*>(&p3));
-        }
-        *reinterpret_cast<uint4*>(As + bbuf * TN * KS + r * KS + d) = h;
+        gemm_cp16(reinterpret_cast<__half*>(Am + bbuf * TN * KS + r * KS + d),
+                  reinterpret_cast<const __half*>(A32 + (long long)n * id + k0 + d),
+                  n < nt && k0 + d < id);
     }
+#endif // pre-sm80 callers use the inline synchronous staging instead
 }
 
 // P4: stage the A (TN rows) and B (TM rows) k-tiles [k0, k0+KS) into the
@@ -3163,13 +3151,13 @@ __device__ __forceinline__ void gemm_stage_a32(
 template <int TM, int KS, int TN, bool AF32 = false>
 __device__ __forceinline__ void gemm_stage_ab(
     const __half* __restrict__ A, const __half* __restrict__ B,
-    __half* As, __half* Bs, int bbuf,
+    __half* As, __half* Bs, float* Am, int bbuf,
     int n0, int m0, int k0, int nt, int od, int id, int tid
 ) {
 #if __CUDA_ARCH__ >= 800
     if (AF32) {
-        gemm_stage_a32<KS>(As, bbuf, reinterpret_cast<const float*>(A), TN,
-                           n0, k0, nt, id, tid);
+        gemm_mirror_a32<KS>(Am, bbuf, reinterpret_cast<const float*>(A), TN,
+                            n0, k0, nt, id, tid);
     } else {
         for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
             int r = (c * 8) / KS, d = (c * 8) % KS;
@@ -3204,8 +3192,11 @@ __global__ void gemm_f16_nt_kernel_t(
     constexpr int KHC = KS / 32;  // k-half PAIRS per staged tile (each loop iteration consumes fa[0]+fa[2] = 2 k-halves)
     // dynamic smem: TM=128 + KS=64 needs 56KB — over the 48KB static cap
     extern __shared__ __align__(16) uint8_t smem_raw[];
-    __half* As = reinterpret_cast<__half*>(smem_raw);       // 2 x TN*KS
-    __half* Bs = As + 2 * TN * KS;                          // 2 x TM*KS
+    __half* As = reinterpret_cast<__half*>(smem_raw); // 2 x TN*KS halves
+    // AF32 adds a 2 x TN*KS f32 mirror right after As (cp.async target)
+    float* Am = reinterpret_cast<float*>(As + 2 * TN * KS);
+    __half* Bs = reinterpret_cast<__half*>(
+        smem_raw + 2 * TN * KS * 2 + (AF32 ? 2 * TN * KS * 4 : 0)); // 2 x TM*KS
     float* Cs = reinterpret_cast<float*>(Bs + 2 * TM * KS); // NW x 256 f32
 
     const int tid = threadIdx.x;
@@ -3231,13 +3222,31 @@ __global__ void gemm_f16_nt_kernel_t(
     int buf = 0;
 #if __CUDA_ARCH__ >= 800
     // stage A (64 rows) + B (TM rows) for k = 0
-    gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, 0, n0, m0, 0, nt, od, id, tid);
+    gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, Am, 0, n0, m0, 0, nt, od, id, tid);
     gemm_cp_commit();
 #else
     {
-        if (AF32) {
-            gemm_stage_a32<KS>(As, 0, reinterpret_cast<const float*>(A), TN,
-                               n0, 0, nt, id, tid);
+        if (AF32) { // pre-sm80: synchronous global->smem convert (no cp.async)
+            for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
+                int r = (c * 8) / KS, d = (c * 8) % KS;
+                int n = n0 + r;
+                uint4 h = make_uint4(0u, 0u, 0u, 0u);
+                if (n < nt && d < id) {
+                    const float4 f0 = *reinterpret_cast<const float4*>(
+                        reinterpret_cast<const float*>(A) + (long long)n * id + d);
+                    const float4 f1 = *reinterpret_cast<const float4*>(
+                        reinterpret_cast<const float*>(A) + (long long)n * id + d + 4);
+                    __half2 p0 = __floats2half2_rn(f0.x, f0.y);
+                    __half2 p1 = __floats2half2_rn(f0.z, f0.w);
+                    __half2 p2 = __floats2half2_rn(f1.x, f1.y);
+                    __half2 p3 = __floats2half2_rn(f1.z, f1.w);
+                    h = make_uint4(*reinterpret_cast<unsigned*>(&p0),
+                                   *reinterpret_cast<unsigned*>(&p1),
+                                   *reinterpret_cast<unsigned*>(&p2),
+                                   *reinterpret_cast<unsigned*>(&p3));
+                }
+                *reinterpret_cast<uint4*>(As + r * KS + d) = h;
+            }
         } else {
             for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
                 int r = (c * 8) / KS, d = (c * 8) % KS;
@@ -3266,8 +3275,8 @@ __global__ void gemm_f16_nt_kernel_t(
     for (int k = 0; k < id; k += KS, buf ^= 1) {
 #if __CUDA_ARCH__ >= 800
         if (k + KS < id) {
-            gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, buf ^ 1, n0, m0,
-                                            k + KS, nt, od, id, tid);
+            gemm_stage_ab<TM, KS, TN, AF32>(A, B, As, Bs, Am, buf ^ 1, n0,
+                                            m0, k + KS, nt, od, id, tid);
             gemm_cp_commit();
             // wait until the CURRENT tile landed (one group may stay in flight)
             gemm_cp_wait1();
@@ -3277,9 +3286,27 @@ __global__ void gemm_f16_nt_kernel_t(
         __syncthreads();
 #else
         if (k + KS < id) {
-            if (AF32) {
-                gemm_stage_a32<KS>(As, buf ^ 1, reinterpret_cast<const float*>(A),
-                                   TN, n0, k + KS, nt, id, tid);
+            if (AF32) { // pre-sm80: synchronous convert into the next buffer
+                for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
+                    int r = (c * 8) / KS, d = (c * 8) % KS;
+                    int n = n0 + r;
+                    uint4 h = make_uint4(0u, 0u, 0u, 0u);
+                    if (n < nt && k + KS + d < id) {
+                        const float4 f0 = *reinterpret_cast<const float4*>(
+                            reinterpret_cast<const float*>(A) + (long long)n * id + k + KS + d);
+                        const float4 f1 = *reinterpret_cast<const float4*>(
+                            reinterpret_cast<const float*>(A) + (long long)n * id + k + KS + d + 4);
+                        __half2 p0 = __floats2half2_rn(f0.x, f0.y);
+                        __half2 p1 = __floats2half2_rn(f0.z, f0.w);
+                        __half2 p2 = __floats2half2_rn(f1.x, f1.y);
+                        __half2 p3 = __floats2half2_rn(f1.z, f1.w);
+                        h = make_uint4(*reinterpret_cast<unsigned*>(&p0),
+                                       *reinterpret_cast<unsigned*>(&p1),
+                                       *reinterpret_cast<unsigned*>(&p2),
+                                       *reinterpret_cast<unsigned*>(&p3));
+                    }
+                    *reinterpret_cast<uint4*>(As + (buf ^ 1) * TN * KS + r * KS + d) = h;
+                }
             } else {
                 for (int c = tid; c < TN * KS / 8; c += blockDim.x) {
                     int r = (c * 8) / KS, d = (c * 8) % KS;
@@ -3305,6 +3332,19 @@ __global__ void gemm_f16_nt_kernel_t(
         }
         __syncthreads();
 #endif
+        if (AF32) {
+            // mirror[buf] landed with the wait above: convert smem->smem
+            for (int c = tid; c < TN * KS / 4; c += blockDim.x) {
+                int r = (c * 4) / KS, d = (c * 4) % KS;
+                float4 f = *reinterpret_cast<float4*>(
+                    &Am[buf * TN * KS + r * KS + d]);
+                __half2 p0 = __floats2half2_rn(f.x, f.y);
+                __half2 p1 = __floats2half2_rn(f.z, f.w);
+                *reinterpret_cast<__half2*>(As + buf * TN * KS + r * KS + d) = p0;
+                *reinterpret_cast<__half2*>(As + buf * TN * KS + r * KS + d + 2) = p1;
+            }
+            __syncthreads();
+        }
         // fa[n-half][k-half]; fb[k-half] per od chunk. Both k halves of each
         // 32-slice must accumulate (the v1 bug: only the first 16 k's were
         // multiplied); fb's k offset is +16 ELEMENTS (one k-half), not +16
