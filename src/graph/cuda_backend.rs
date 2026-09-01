@@ -56,6 +56,11 @@ pub struct CudaBackend {
     /// nothing. `MINFER_NO_PREFILL_CAPTURE=1` restores the old default-off
     /// (`MINFER_CAPTURE_PREFILL=1` is now redundant but still accepted).
     prefill_capture: bool,
+    /// Viz/trace capture staging: async D2H of captured node outputs queued
+    /// right after each node's launch (stream-ordered — pool buffers recycle
+    /// intra-split), drained with one sync at the split boundary. Replaces
+    /// the per-node `copy_to_host` full-stream sync in the scheduler.
+    cap: crate::cuda::CaptureStaging,
 }
 
 /// An instantiated CUDA Graph exec with its capture identity.
@@ -109,6 +114,7 @@ impl CudaBackend {
             graphs_mode,
             prefill_capture,
             kv_f16,
+            cap: crate::cuda::CaptureStaging::new(),
         })
     }
 
@@ -313,6 +319,28 @@ impl CudaBackend {
         // bounce removed); MINFER_NO_PINNED_READBACK=1 reverts.
         self.state.copy_from_device_pinned(b.ptr, dst);
         Some(out)
+    }
+
+    /// Viz/trace capture: queue an async D2H of pool buffer `id` into the
+    /// pinned capture staging (see `CaptureStaging`). `false` = refused
+    /// (unknown/empty buffer, or it does not fit under the staging ceiling) —
+    /// the caller falls back to the per-node sync `copy_to_host`.
+    pub fn capture_enq(&mut self, id: usize) -> bool {
+        let Some(b) = self.pool.get(id) else {
+            return false;
+        };
+        if b.ptr.is_null() || b.bytes == 0 {
+            return false;
+        }
+        let _sg = self.stream_guard();
+        self.cap.queue(self.state.stream(), b.ptr, b.bytes)
+    }
+
+    /// One stream sync, then drain the capture staging: one `Vec<f32>` per
+    /// successfully enqueued buffer, in enqueue order.
+    pub fn capture_drain(&mut self) -> Vec<Vec<f32>> {
+        let _sg = self.stream_guard();
+        self.cap.drain(self.state)
     }
 }
 
@@ -2366,6 +2394,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Viz/trace capture staging: async D2H queued behind the producing
+    /// kernel must survive a later overwrite of the same pool buffer
+    /// (intra-split pool reuse), drain in enqueue order, refuse oversized
+    /// buffers, and leave nothing queued after a drain.
+    #[test]
+    fn cuda_capture_staging_order_and_fallback() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+
+        // 1. stream-order safety: enq BEFORE the buffer is overwritten
+        let a = cb.alloc_buffer(8);
+        let v1: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
+        cb.write_host(a, &v1).unwrap();
+        assert!(
+            cb.capture_enq(a),
+            "enq of a fresh small buffer must succeed"
+        );
+        // overwrite the SAME buffer on the stream after the enqueued D2H —
+        // the staged value must still be v1
+        let v2: Vec<f32> = (0..8).map(|i| -(i as f32) - 1.0).collect();
+        cb.write_host(a, &v2).unwrap();
+        let drained = cb.capture_drain();
+        assert_eq!(drained.len(), 1);
+        assert_close("staged pre-overwrite value", &drained[0], &v1, 1e-6);
+        // the buffer itself holds the overwrite
+        assert_close(
+            "buffer post-overwrite value",
+            &cb.copy_to_host(a).unwrap(),
+            &v2,
+            1e-6,
+        );
+        // drained clean: nothing queued, second drain is empty
+        assert!(cb.capture_drain().is_empty());
+
+        // 2. multiple buffers drain in enqueue order
+        let b0 = cb.alloc_buffer(4);
+        let b1 = cb.alloc_buffer(6);
+        let w0: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        let w1: Vec<f32> = vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0];
+        cb.write_host(b0, &w0).unwrap();
+        cb.write_host(b1, &w1).unwrap();
+        assert!(cb.capture_enq(b0));
+        assert!(cb.capture_enq(b1));
+        let drained = cb.capture_drain();
+        assert_eq!(drained.len(), 2);
+        assert_close("order[0]", &drained[0], &w0, 1e-6);
+        assert_close("order[1]", &drained[1], &w1, 1e-6);
+
+        // 3. oversized buffer: refused (sync fallback in the scheduler), and
+        // the refusal leaves the staging usable
+        let big = cb.alloc_buffer(34 << 20); // 136 MB > 128 MB staging ceiling
+        let bw: Vec<f32> = (0..34 << 20).map(|i| (i % 977) as f32 * 0.5).collect();
+        cb.write_host(big, &bw).unwrap();
+        assert!(!cb.capture_enq(big), "oversized buffer must be refused");
+        assert_close(
+            "fallback readback",
+            &cb.copy_to_host(big).unwrap(),
+            &bw,
+            0.0,
+        );
+        assert!(cb.capture_enq(b0), "staging usable after a refusal");
+        assert_eq!(cb.capture_drain().len(), 1);
+
+        // 4. unknown buffer id: refused
+        assert!(!cb.capture_enq(9_999_999));
     }
 
     #[test]

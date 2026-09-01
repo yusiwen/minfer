@@ -61,9 +61,15 @@ Drop the JSON into `samples/` and register it in `manifest.json` to make it appe
 # Open http://127.0.0.1:8081/ in your browser — the page auto-detects and connects to the stream
 ```
 
-- **MPS (GPU) capture uses a staging blit**: within each split's single submit, node outputs are
-  blitted into host-visible staging and read back after sync — no more per-node flush, so GPU
-  live streaming runs close to native speed
+- **GPU capture is staged, not per-node**: Metal blits each split's node outputs into
+  host-visible staging within its single submit; CUDA queues one async pinned-D2H per node
+  right after its launch (stream-ordered, safe against intra-split pool reuse) and drains the
+  staging with a single sync at the split boundary. Both replace per-node flushes. The
+  remaining capture tax is the host-side stats scan + event serialization of every node
+  (~1.6× slowdown on 7B decode, identical on both backends)
+- **The `/viz/graph` preview mirrors the engine's CParams**: GPU participation is Metal OR
+  CUDA, QKV fusion is Metal-only (no CUDA fused bias+rope+store kernel), FFN gate+up fusion
+  runs on both — node ids match the live per-node events on every backend
 - **Lazy arming**: per-node data is only captured while an SSE client is connected — a `--viz`
   server with nobody watching, and normal CLI / `--server` inference, all cost nothing
   (`--server` is a pure OpenAI API with no viz routes)

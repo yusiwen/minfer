@@ -572,6 +572,116 @@ impl Drop for PinnedBuf {
 unsafe impl Send for PinnedBuf {}
 unsafe impl Sync for PinnedBuf {}
 
+/// Viz/trace capture staging (scheduler's per-node `copy_to_host` full-stream
+/// sync replaced by batched async D2H). The scheduler enqueues one async copy
+/// into this pinned buffer immediately after each captured node's launch —
+/// stream order preserves the value even though the pool recycles buffers
+/// intra-split — and drains everything with ONE sync at the split boundary.
+/// Bounded: a node larger than the remaining capacity is refused (the caller
+/// falls back to the per-node sync copy); growth only happens between drains
+/// (reallocating under undrained pending copies would lose them).
+pub struct CaptureStaging {
+    ptr: *mut u8,
+    bytes: usize,
+    used: usize,
+    /// (offset, bytes) per enqueued copy, in enqueue order.
+    pending: Vec<(usize, usize)>,
+}
+
+/// 128 MB of pinned host memory is the ceiling for one split's captured node
+/// outputs; 7B decode steps (~150 nodes × ≤76 KB) fit ~20× over, prefill's
+/// GB-scale FFN tensors fall back to the sync path.
+const CAPTURE_STAGING_MAX: usize = 128 << 20;
+
+impl CaptureStaging {
+    pub const fn new() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            bytes: 0,
+            used: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Queue an async D2H of `bytes` from device `src` into the staging.
+    /// `false` = refused (alloc failure or no room): the caller must fall
+    /// back to the per-node sync copy for this buffer.
+    pub fn queue(
+        &mut self,
+        stream: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        bytes: usize,
+    ) -> bool {
+        if bytes == 0 || self.used + bytes > CAPTURE_STAGING_MAX {
+            return false;
+        }
+        if self.bytes < self.used + bytes {
+            // grow only between drains (pending must be empty here — a full
+            // buffer with pending entries was refused above)
+            debug_assert!(self.pending.is_empty());
+            if !self.pending.is_empty() {
+                return false;
+            }
+            let need = (self.used + bytes).max(8 << 20);
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            if unsafe { cudaHostAlloc(&mut p, need, 0) } != 0 {
+                return false;
+            }
+            if !self.ptr.is_null() {
+                unsafe { cudaFreeHost(self.ptr as *mut std::ffi::c_void) };
+            }
+            self.ptr = p as *mut u8;
+            self.bytes = need;
+            self.used = 0;
+        }
+        let err = unsafe {
+            cudaMemcpyAsync(
+                self.ptr.add(self.used) as *mut std::ffi::c_void,
+                src,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+                stream,
+            )
+        };
+        if err != 0 {
+            return false;
+        }
+        self.pending.push((self.used, bytes));
+        self.used += bytes;
+        true
+    }
+
+    /// One stream sync, then hand out the queued copies (enqueue order).
+    /// Empty when nothing was queued.
+    pub fn drain(&mut self, state: &CudaState) -> Vec<Vec<f32>> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        state.sync();
+        let mut out = Vec::with_capacity(self.pending.len());
+        for &(off, bytes) in &self.pending {
+            let slice =
+                unsafe { std::slice::from_raw_parts(self.ptr.add(off) as *const f32, bytes / 4) };
+            out.push(slice.to_vec());
+        }
+        self.pending.clear();
+        self.used = 0;
+        out
+    }
+}
+
+impl Drop for CaptureStaging {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { cudaFreeHost(self.ptr as *mut std::ffi::c_void) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for CaptureStaging {}
+unsafe impl Sync for CaptureStaging {}
+
 /// 8p: warm the f16 weight cache only for models whose quantized matmul
 /// weights total at least this much (7B q4_k_m = 4.4 GB warms; the 0.5-1.5B
 /// test fixtures do not, keeping their footprint at pre-8p levels).

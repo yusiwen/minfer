@@ -71,20 +71,24 @@ pub fn run_viz(
     // approximate for the live prefill view).
     let (live_tx, _) = tokio::sync::broadcast::channel::<String>(8192);
     crate::live::init(live_tx.clone());
+    // Mirror the engine's CParams construction (qwen2/qwen3 graph.rs): GPU
+    // participation is Metal OR CUDA; QKV fusion stays Metal-only (the fused
+    // bias+rope+store kernel has no CUDA counterpart — the engine's own gate
+    // is `fuse_qkv = nt==1 && metal_on`); FFN gate+up fusion runs on both
+    // (7e⑤). The preview builds through the same graph builder, so the live
+    // per-node events (matched by node id) only line up when these flags do.
     #[cfg(target_os = "macos")]
-    let gpu = crate::graph::metal_backend::metal_available()
+    let metal_on = crate::graph::metal_backend::metal_available()
         && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
     #[cfg(not(target_os = "macos"))]
-    let gpu = false;
-    let fuse_qkv = gpu && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
-    // match the engine's CParams construction: FFN fusion also runs on CUDA
-    // (device-presence gate, Phase 8 review — was hardcoded false)
+    let metal_on = false;
     #[cfg(feature = "cuda")]
     let cuda_on = crate::cuda::CudaState::get().is_some();
     #[cfg(not(feature = "cuda"))]
     let cuda_on = false;
-    let fuse_ffn =
-        (gpu || cuda_on) && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+    let gpu = metal_on || cuda_on;
+    let fuse_qkv = metal_on && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+    let fuse_ffn = gpu && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
     let model_name = gguf
         .parts
         .first()

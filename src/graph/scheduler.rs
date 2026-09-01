@@ -167,13 +167,18 @@ impl BackendScheduler {
         #[cfg(target_os = "macos")]
         let mut metal_srcs: Vec<(usize, usize)> = Vec::new();
         let mut staged: Vec<(usize, usize)> = Vec::new();
+        // CUDA capture: node ids whose outputs were queued into the pinned
+        // capture staging this split, drained (one sync) at the boundary.
+        #[cfg(feature = "cuda")]
+        let mut cuda_caps: Vec<usize> = Vec::new();
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
                     // 1. flush the previous backend's async work
                     alloc.sync_backend(pb);
-                    // 1b. staged Metal captures are valid now — read them back
+                    // 1b. staged Metal/CUDA captures are valid now — read back
                     flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
+                    flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
                     // 2. copy this split's inputs across backends
                     for &inp in &split.inputs {
                         alloc.copy_across(inp, split.backend)?;
@@ -299,13 +304,19 @@ impl BackendScheduler {
                             BackendTag::Metal => {
                                 metal_srcs.push((id, br.id));
                             }
-                            // CUDA: staged D2H needs an owned buffer (borrowed
-                            // read_host can't survive the sync) — copy_to_host
-                            // synchronizes, which is fine for capture mode
+                            // CUDA: queue an async D2H into the pinned capture
+                            // staging (stream-ordered — pool buffers recycle
+                            // intra-split, so the copy must sit behind the
+                            // producing kernel); ONE sync at the split
+                            // boundary drains it all. Buffers that do not fit
+                            // under the staging ceiling fall back to the
+                            // per-node sync copy (GB-scale prefill tensors).
                             #[cfg(feature = "cuda")]
                             BackendTag::Cuda => {
-                                if let Some(c) = alloc.cuda() {
-                                    if let Some(v) = c.copy_to_host(br.id) {
+                                if let Some(c) = alloc.cuda_mut() {
+                                    if c.capture_enq(br.id) {
+                                        cuda_caps.push(id);
+                                    } else if let Some(v) = c.copy_to_host(br.id) {
                                         record_node_data(node, &v, trace_on, live_on);
                                     }
                                 }
@@ -334,6 +345,7 @@ impl BackendScheduler {
         if let Some(pb) = prev_backend {
             alloc.sync_backend(pb);
             flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
+            flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
         }
         Ok(())
     }
@@ -399,6 +411,31 @@ fn flush_metal_captures(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (graph, alloc, staged, trace_on, live_on);
+}
+
+/// Read back the CUDA capture staging (one stream sync inside `capture_drain`,
+/// valid after the split's `sync_backend` boundary) and emit the queued node
+/// events in enqueue order.
+#[cfg(feature = "cuda")]
+fn flush_cuda_captures(
+    graph: &ComputeGraph,
+    alloc: &mut GraphAllocator,
+    caps: &mut Vec<usize>,
+    trace_on: bool,
+    live_on: bool,
+) {
+    if caps.is_empty() {
+        return;
+    }
+    let Some(c) = alloc.cuda_mut() else {
+        caps.clear();
+        return;
+    };
+    let data = c.capture_drain();
+    for (nid, v) in caps.drain(..).zip(data) {
+        let node = graph.node(nid);
+        record_node_data(node, &v, trace_on, live_on);
+    }
 }
 
 #[cfg(test)]
