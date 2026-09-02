@@ -297,6 +297,37 @@ Prefill wall is: GEMM ~600 ms + convert 56 + fa 54 + swiglu 51 (re-
 verified at ~257 GB/s = bandwidth peak) + add 19 + host gaps. The GEMM
 is ~85% of the wall: it is the only material lever left.
 
+### Wide-tile x-axis closed: 256-token block measured and reverted (2026-09-02)
+
+Hypothesis: widening the wide kernel's token x-tile 128 -> 256 halves
+weight re-reads through L2 (then believed the bottleneck, ~21 re-reads
+per weight row). Implemented per the worked design — block 256 tok x
+64 od, warp = 16 od-rows x one 128-token half (`i0w = (warp&1)*128`,
+`j0w = (warp>>1)*16`), all per-warp structures unchanged; launcher
+grid `(nt+255)/256 x (od+63)/64`, KD=4 smem 59,392B, KD=8 (102,400B)
+refused -> Rust narrow fallback. Parity green on both paths, but perf
+REGRESSED: interleaved 3x on the 2600-token 7B prefill = 927/953/945
+(median ~942 tok/s) vs 1035-1058 for the 128x128 tile (narrow ~476
+unchanged); ncu q-proj: duration 4.584 ms vs 3.619 ms (+27% kernel
+time), Memory SOL 73.6% vs 75.7%, Compute 22.1% vs 22.9% — the memory
+system ran at the same utilization for 27% longer, i.e. MORE bytes
+through L2, not better reuse. Root cause: halving the od tile doubles
+the y-block count, and ACTIVATION re-staging (qa8/sda_q, 4,480 B per
+token at id=3584) scales with `od/WBJ` while weight bytes per x-tile
+visit are only 2,016 B per od-row — A re-reads (~327 MB) were already
+~2x the B re-reads (~152 MB) at 128x128, so trading -72 MB of B for
++327 MB of A is strictly negative. The alternative that would cut A
+re-reads (16 warps x 128 tokens = 128x256) is impossible: the kernel
+needs REG 156-166/thread, so 512 threads cannot be resident (64K
+regfile) and occupancy is pinned at 1 block/SM for every tile in this
+family. Conclusion: within the 16-chain/sum[64]/256-thread structure,
+128x128 is the optimal tile; the token-x-axis and the od-x-axis of
+this kernel are both closed by measurement. If L2 traffic is revisited,
+the only remaining shape is reusing one staged A across two j-tiles
+inside the block (128 tok x 256 od effective; A staged once per k-tile,
+B re-expanded per j-tile; same smem/registers, needs an outer j-loop —
+untested). Tree reverted to 5c34b4e after measurement.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
