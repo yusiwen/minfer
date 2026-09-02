@@ -328,6 +328,40 @@ inside the block (128 tok x 256 od effective; A staged once per k-tile,
 B re-expanded per j-tile; same smem/registers, needs an outer j-loop —
 untested). Tree reverted to 5c34b4e after measurement.
 
+### j-tile A-reuse inside the block (128tok x 256od, outer jh loop) measured — bar missed, reverted (2026-09-02)
+
+The "only remaining shape" above, implemented and measured (HEAD `fabdefb` +
+diff, NOT landed). Block stays 128 tokens wide; od coverage doubled to 256 via
+an outer `jh` loop: `grid.y = (od+255)/256`, A (`qa8`+`sda_q`) staged ONCE per
+k-tile and reused by both 128-od halves, `qb8`/`sds`/`sdm` one shared set
+restaged per (kt, jh) with the jh-shifted row base, `sum[2][64]` accumulator
+sets (REG 156-166 -> 175, LOCAL:0, still 1 block/SM), one stage+sync round per
+half. The old super-block restage-skip is UNSOUND once `qb8` is shared (the
+previous stage always left the other half's rows in the buffer), so B is
+re-expanded every (kt, jh) but only the KDR slots the k-tile consumes (KDR/2
+pairs = 64B/row at KD=4) — 2x the old per-block B bytes, not 4x.
+- Parity: `cuda_prefill_mmq` green on first build at KD=4 and KD=8 default.
+- Perf (interleaved 3x, 2600-tok 7B prefill): wide KD=4 1076/1067/1033
+  (median ~1067 tok/s) vs narrow 483; baseline band 1035-1050 => ~+2.6%,
+  bar (>=1150) missed.
+- ncu q-proj (grid (21,14): grid.y halved 28 -> 14 as designed): duration
+  3.62 -> 3.55 ms (-2%), Memory(SOL) 75.7 -> 74.0%, Compute 22.9 -> 20.3%,
+  issue 0.25 -> 0.22/sched, eligible warps 0.32, active warps 2.00 (1
+  block/SM unchanged).
+- Root cause: the L2-byte premise does not convert to time. A re-reads DID
+  halve as designed (-163MB of ~479MB L2 reads; per-block B materialization
+  doubles but blocks halve, so B total is unchanged), yet the kernel is
+  LATENCY-bound at 1 block/SM (2 active warps/sched, issue ~0.22): staging
+  cost is the per-kt global->smem round trip at 8 resident warps, not L2
+  byte volume, and the added second B-stage + barrier round per k-tile gives
+  back what removing one A-stage per two compute-units saves.
+- Conclusion: the j-tile shape is measured and closed like the x-tile one.
+  Further MMQ GEMM gain needs latency hiding — cp.async/TMA double-buffered
+  staging, or 2 blocks/SM — not tile-shape traffic arithmetic.
+- Tree reverted to `fabdefb` (byte-identical, suite 169/0 re-verified);
+  patched kernel preserved at /tmp/cuda_kernels_jh256.cu (script
+  /tmp/patch_jh.py).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
