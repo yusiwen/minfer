@@ -4436,40 +4436,43 @@ __global__ void __launch_bounds__(256) mmq_raw_nt_kernel(
 }
 
 template <int KDR>
-// (wide clone: 128-token block tile, 8 warps x 32x32 warp tiles)
+// (wide clone: 128-token x 128-od block tile; each warp owns 16 od-rows and
+// issues 16 independent mma chains per 32-k chunk = 2 B-frags (8 od-rows
+// each) x 8 A-frags (16 tokens each) — llama.cpp MMQ accumulator depth.)
 #undef RAW_STAGE
 __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ q8x,
     float* __restrict__ C, int nt, int od, int id
 ) {
 #define MMQ_WBI 128
+#define MMQ_WBJ 128
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_raw_sh[];
-    // Single-buffer sync-staged layout — KD=8 totals 54,272B so TWO blocks
-    // fit per SM (16 resident warps hide the staging latency):
+    // Single-buffer sync-staged layout — KD=8 totals 67,584B (1 block/SM;
+    // KD=4 is 43,008B -> 2 blocks; resident warps hide the staging latency):
     //   qa8   [KDR][128] x 32B  chunk qs only (d/ssum in sda_q)
     //   sda_q [KDR][128] x 8B   (d f16 | ssum i16) packed
-    //   qb8   [64][144]         B super-blocks (64 od-rows per block tile)
-    //   sds   [KDR][64] f32, sdm likewise
+    //   qb8   [128][144]        B super-blocks (128 od-rows per block tile)
+    //   sds   [KDR][128] f32, sdm likewise
     uint8_t* qa8 = mmq_raw_sh;
     uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_WBI * 32);
     uint8_t* qb8 = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_WBI * 2);
-    float* sds = reinterpret_cast<float*>(qb8 + 64 * 144);
-    float* sdm = sds + KDR * 64;
+    float* sds = reinterpret_cast<float*>(qb8 + MMQ_WBJ * 144);
+    float* sdm = sds + KDR * MMQ_WBJ;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int wm = warp >> 2, wn = warp & 3;   // wide: 4x2 subs of 32x32
+    // Each warp owns a private 16-od-row slice and reads the FULL 128-token
+    // tile: B fragments become warp-exclusive, A fragments are warp-shared.
     const int i0 = blockIdx.x * MMQ_WBI;
-    const int j0 = blockIdx.y * MMQ_BJ;
-    const int i0w = wn * 32;
-    const int j0w = wm * 32;
+    const int j0 = blockIdx.y * MMQ_WBJ;
+    const int j0w = warp * 16;
     const int nb32 = id >> 5;
     const int nchunk = nb32;
     const int nsb = nb32 >> 3;
     const int nktile = (nchunk + KDR - 1) / KDR;
 
-    float sum[32] = {0.0f};   // [nh][h][l]: 4 B-frags x 2 A-frags x 4 C regs
+    float sum[64] = {0.0f};   // [g][nh][l]: 8 A-frags x 2 B-frags x 4 C regs
 
 #define RAW_STAGE(kt)                                                          \
     do {                                                                       \
@@ -4498,7 +4501,12 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
             *(unsigned*)(sda_q + ((size_t)kd * MMQ_WBI + r) * 2) =             \
                 d16 | (ss << 16);                                              \
         }                                                                      \
-        for (int x = threadIdx.x; x < 64 * 9; x += blockDim.x) {               \
+        /* B raw bytes cover ONE 256-k super-block; at KDR=4 two consecutive  \
+         * k-tiles share it, and single-buffer sync staging lets the qb8      \
+         * region persist across the kt barrier — restage only when this      \
+         * k-tile starts a new super-block. */                                \
+        if (((kt) * KDR & 7) == 0) {                                           \
+        for (int x = threadIdx.x; x < MMQ_WBJ * 9; x += blockDim.x) {          \
             int u = x % 9, r = x / 9;                                          \
             int j = j0 + r, sb = ((kt) * KDR) >> 3;                            \
             uint4 v = make_uint4(0, 0, 0, 0);                                  \
@@ -4507,8 +4515,9 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
                                     + (size_t)sb * 144 + u * 16);              \
             *(uint4*)(qb8 + ((size_t)r * 9 + u) * 16) = v;                     \
         }                                                                      \
-        for (int x = threadIdx.x; x < 64 * KDR; x += blockDim.x) {             \
-            int r = x % 64, kd = x / 64;                                       \
+        }                                                                      \
+        for (int x = threadIdx.x; x < MMQ_WBJ * KDR; x += blockDim.x) {        \
+            int r = x % MMQ_WBJ, kd = x / MMQ_WBJ;                             \
             int j = j0 + r, c = (kt) * KDR + kd;                               \
             float dv = 0.0f, mv = 0.0f;                                        \
             if (j < od && c < nchunk) {                                        \
@@ -4522,8 +4531,8 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
                 dv = d * (float)sc;                                            \
                 mv = -(dmin * (float)m);                                       \
             }                                                                  \
-            sds[(size_t)kd * 64 + r] = dv;                                     \
-            sdm[(size_t)kd * 64 + r] = mv;                                     \
+            sds[(size_t)kd * MMQ_WBJ + r] = dv;                                \
+            sdm[(size_t)kd * MMQ_WBJ + r] = mv;                                \
         }                                                                      \
     } while (0)
 
@@ -4539,26 +4548,34 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
             if (c >= nchunk) break;
             const int sg = c & 7;
             const uint8_t* qat = qa8 + (size_t)kd * MMQ_WBI * 32;
-            const float* sdst = sds + (size_t)kd * 64;
-            const float* sdmt = sdm + (size_t)kd * 64;
+            const float* sdst = sds + (size_t)kd * MMQ_WBJ;
+            const float* sdmt = sdm + (size_t)kd * MMQ_WBJ;
 
-            // A fragments: int8 lane words straight out of the raw chunk.
-            int a[2][4], b[4][2];
-            int clow[4][2][4], chigh[4][2][4];
+            // A fragments: 8 independent 16-token groups tile the full
+            // 128-token row, one ldmatrix.x4 per group (16 rows x 32B:
+            // lanes 0-7 -> rows 0-7 byte 0, 8-15 -> rows 8-15 byte 0,
+            // 16-23 -> rows 0-7 byte 16, 24-31 -> rows 8-15 byte 16 —
+            // the standard m16n8k32 A-fragment distribution).
+            int a[8][4], b[2][2];
+            int clow[8][2][4];
             #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                const int r0 = i0w + h * 16 + (lane >> 2);
-                const int r1 = r0 + 8;
-                const uint8_t* p0 = qat + (size_t)r0 * 32;
-                const uint8_t* p1 = qat + (size_t)r1 * 32;
-                a[h][0] = *(const int*)(p0 + 4 * (lane & 3));
-                a[h][1] = *(const int*)(p1 + 4 * (lane & 3));
-                a[h][2] = *(const int*)(p0 + 4 * ((lane & 3) + 4));
-                a[h][3] = *(const int*)(p1 + 4 * ((lane & 3) + 4));
+            for (int g = 0; g < 8; g++) {
+                const uint8_t* p = qat
+                    + (size_t)(g * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * 32
+                    + ((lane >> 4) & 1) * 16;
+                unsigned r0_, r1_, r2_, r3_;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                    "{%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(r0_), "=r"(r1_), "=r"(r2_), "=r"(r3_)
+                    : "r"((unsigned)__cvta_generic_to_shared(p)));
+                a[g][0] = (int)r0_; a[g][1] = (int)r1_;
+                a[g][2] = (int)r2_; a[g][3] = (int)r3_;
             }
-            // B fragments: unpack the raw nibbles in registers.
+            // B fragments: 2 minitiles of the warp's private 16 od-rows;
+            // unpack the raw nibbles in registers (staging format unchanged).
             #pragma unroll
-            for (int nh = 0; nh < 4; nh++) {
+            for (int nh = 0; nh < 2; nh++) {
                 const int jr = j0w + nh * 8 + (lane >> 2);
                 const uint8_t* rb8 = qb8 + (size_t)jr * 144;
                 uint32_t n0 = *(const uint32_t*)(rb8 + 16 + (sg >> 1) * 32
@@ -4571,63 +4588,68 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
                                           : (n1 & 0x0F0F0F0Fu));
             }
             #pragma unroll
-            for (int nh = 0; nh < 4; nh++)
+            for (int g = 0; g < 8; g++)
                 #pragma unroll
-                for (int h = 0; h < 2; h++)
+                for (int nh = 0; nh < 2; nh++)
                     #pragma unroll
-                    for (int l = 0; l < 4; l++) { clow[nh][h][l] = 0; chigh[nh][h][l] = 0; }
+                    for (int l = 0; l < 4; l++) clow[g][nh][l] = 0;
+            // 16 independent mma chains per thread per chunk, all C
+            // fragments live simultaneously (llama.cpp accumulator depth).
             #pragma unroll
-            for (int nh = 0; nh < 4; nh++)
+            for (int g = 0; g < 8; g++)
                 #pragma unroll
-                for (int h = 0; h < 2; h++)
-                    mmq_mma_k32(clow[nh][h], a[h], b[nh]);
+                for (int nh = 0; nh < 2; nh++)
+                    mmq_mma_k32(clow[g][nh], a[g], b[nh]);
 
             // rescale: identical math/layout to the R1 kernel; A-side
-            // d/ssum come straight from the raw chunk.
-            float da_q[4];
-            int sa_q[4];
+            // d/ssum come straight from the raw chunk. da/sa load per
+            // token-group to keep registers for the accumulators.
+            float dsv[2][8], dmv[2][8];
             #pragma unroll
-            for (int t4 = 0; t4 < 4; t4++) {
-                const unsigned pk = *(const unsigned*)(sda_q
-                    + (size_t)kd * MMQ_WBI * 2 + (i0w + (lane >> 2) + t4 * 8) * 2);
-                da_q[t4] = h2f((unsigned short)(pk & 0xFFFF));
-                sa_q[t4] = (int)(short)(pk >> 16);
-            }
-            float dsv[4][8], dmv[4][8];
-            #pragma unroll
-            for (int nh = 0; nh < 4; nh++)
+            for (int nh = 0; nh < 2; nh++)
                 #pragma unroll
                 for (int jj = 0; jj < 8; jj++) {
                     dsv[nh][jj] = sdst[j0w + nh * 8 + jj];
                     dmv[nh][jj] = sdmt[j0w + nh * 8 + jj];
                 }
             #pragma unroll
-            for (int nh = 0; nh < 4; nh++)
+            for (int g = 0; g < 8; g++) {
+                float da_q[2];
+                int sa_q[2];
                 #pragma unroll
-                for (int h = 0; h < 2; h++)
+                for (int t4 = 0; t4 < 2; t4++) {
+                    const unsigned pk = *(const unsigned*)(sda_q
+                        + (size_t)kd * MMQ_WBI * 2
+                          + (g * 16 + (lane >> 2) + t4 * 8) * 2);
+                    da_q[t4] = h2f((unsigned short)(pk & 0xFFFF));
+                    sa_q[t4] = (int)(short)(pk >> 16);
+                }
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
                     #pragma unroll
                     for (int l = 0; l < 4; l++) {
-                        const float da = da_q[h * 2 + (l >> 1)];
-                        const float sa = (float)sa_q[h * 2 + (l >> 1)];
+                        const float da = da_q[l >> 1];
+                        const float sa = (float)sa_q[l >> 1];
                         const int jj = (lane & 3) * 2 + (l & 1);
-                        const int idx = nh * 8 + h * 4 + l;
-                        sum[idx] += da * dsv[nh][jj] * (float)clow[nh][h][l];
+                        const int idx = (g * 2 + nh) * 4 + l;
+                        sum[idx] += da * dsv[nh][jj] * (float)clow[g][nh][l];
                         sum[idx] += da * dmv[nh][jj] * sa;
                     }
+            }
         }
         __syncthreads();
     }
 
     #pragma unroll
-    for (int nh = 0; nh < 4; nh++)
+    for (int g = 0; g < 8; g++)
         #pragma unroll
-        for (int h = 0; h < 2; h++)
+        for (int nh = 0; nh < 2; nh++)
             #pragma unroll
             for (int l = 0; l < 4; l++) {
-                const int i = i0 + i0w + h * 16 + (l >> 1) * 8 + (lane >> 2);
+                const int i = i0 + g * 16 + (l >> 1) * 8 + (lane >> 2);
                 const int j = j0 + j0w + nh * 8 + (lane & 3) * 2 + (l & 1);
                 if (i < nt && j < od)
-                    C[(size_t)i * od + j] = sum[nh * 8 + h * 4 + l];
+                    C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
             }
 #endif // __CUDA_ARCH__ >= 800
 }
@@ -4638,14 +4660,14 @@ extern "C" int launch_mmq_raw_wide_nt(
     int nt, int od, int id, cudaStream_t stream, int kd
 ) {
     (void)type_id;
-    // Compact staging: KD=8 totals 100,352B (2*8*128*32 qs + 2*8*128*4
-    // packed d/ssum + 2*64*144 B + 2*2*8*64*4 scales) — inside the ~99KB
-    // opt-in cap; KD=4 is 59,392B. The attr/launch results are checked:
-    // an over-cap request used to fail SILENTLY (r7 phantom 2124 tok/s).
-    dim3 grid((nt + 127) / 128, (od + 63) / 64);
+    // 16-chain layout: 128-token x 128-od block tile. KD=8 totals 67,584B
+    // (1 block/SM); KD=4 is 43,008B (2 blocks/SM) — both inside the ~99KB
+    // opt-in cap. The attr/launch results are checked: an over-cap request
+    // used to fail SILENTLY (r7 phantom 2124 tok/s).
+    dim3 grid((nt + 127) / 128, (od + 127) / 128);
     if (kd <= 4) {
         const int smem = 4 * MMQ_WBI * 32 + 4 * MMQ_WBI * 8
-                       + 64 * 144 + 2 * 4 * 64 * 4;
+                       + MMQ_WBJ * 144 + 2 * 4 * MMQ_WBJ * 4;
         cudaError_t e = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<4>),
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -4653,7 +4675,7 @@ extern "C" int launch_mmq_raw_wide_nt(
         mmq_raw_wide_nt_kernel<4><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
     } else {
         const int smem = 8 * MMQ_WBI * 32 + 8 * MMQ_WBI * 8
-                       + 64 * 144 + 2 * 8 * 64 * 4;
+                       + MMQ_WBJ * 144 + 2 * 8 * MMQ_WBJ * 4;
         cudaError_t e = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<8>),
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

@@ -254,6 +254,31 @@ rescale = sum += da*dsv*C only. Then widen the warp tile to 16 mma
 chains (sum[64], clow[64][4] -> needs 2 x ntx minitiles like the
 reference) and re-format the A smem for ldmatrix.
 
+### P6 r12: 16-chain warp tile + ldmatrix LANDED — wide MMQ 1.44-2.3x
+
+The redo recipe was executed (block 128 tok x 128 od; each warp owns a
+private 16-od-row slice x the full 128-token tile = 8 A-frags x 2
+B-frags = 16 independent mma chains per chunk with sum[64] +
+clow[8][2][4] live; A fragments load via ldmatrix.m8n8.x4; at KDR=4
+the qb8 restage is skipped when two consecutive k-tiles share a
+super-block; B staging format and the two-term rescale untouched;
+A-row 48B padding tried and reverted — flat). Parity green, suite
+169/0, greedy tokens identical to the default path.
+
+Measured (7B @~2K, same session, interleaved): wide-16 KD=4
+1020-1058 tok/s vs narrow raw 441-481 in the same window = ~2.3x;
+KD=8 973-995. vs the pre-rewrite wide (~719 on a faster machine
+state) this is 1.44x; today's machine ran ~38% below the baseline
+session, so the same-session ratio is the meaningful number.
+MMQ is now ~2.3 TMAC/s-class on q4_K but still ~2.2x below the f16
+default GEMM path (2284 tok/s same session) — not yet promotion
+material. Residual per the model: the accumulator depth wall is
+passed; the next q4_K lever is load-time B-side fragment
+pre-formatting (a standalone decision), and the wall is increasingly
+dominated by the non-q4_K GEMMs + the quantize pass. Best config:
+MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_WIDE=1
+MINFER_MMQ_RAW_KD=4 (KD default stays 8, shared with narrow).
+
 P6 re-ranks (2026-08-31, 7B @2K, 2061-token CLI prefill): KD=4 retested
 427 vs 438 tok/s (occupancy 1->2 blocks/SM does not pay; staging-depth
 amortization dominates — docs finding above confirmed). The bigger
