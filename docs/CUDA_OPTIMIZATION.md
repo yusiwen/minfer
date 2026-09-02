@@ -362,6 +362,39 @@ pairs = 64B/row at KD=4) — 2x the old per-block B bytes, not 4x.
   patched kernel preserved at /tmp/cuda_kernels_jh256.cu (script
   /tmp/patch_jh.py).
 
+### cp.async double-buffered raw staging measured — no conversion, reverted (2026-09-02)
+
+The "needs latency hiding" hypothesis above, implemented and measured (HEAD
+`82dfc90` + diff, NOT landed). Two-level staging with the raw global->smem
+transfers moved to cp.async and prefetched one k-tile ahead; expansions run
+smem->smem after the wait. KD=4 (98,304B): raw pad40 A chunks staged 5x 8B
+cp.async into a rawa buffer + expanded to qa8/sda_q in smem; raw q4_K
+super-blocks 9x 16B cp.async into rawb x2 (ping-pong), expanded to a
+partial-slot qb8 `[128][KDR][32]` (only the ktile's KDR slots — odd ktiles
+expand the resident sb's high half, halving expansion work) + scales built
+from rawb in smem; commit discipline {A(kt+1)},{B(kt+2)} with wait_group 1 on
+odd kt leaving the B prefetch in flight. KD=8 (100,352B): same rawb scheme
+x1, legacy sync A staging (no rawa budget).
+- Parity: `cuda_prefill_mmq` green on first build, KD=4 AND default KD=8.
+- Perf (interleaved 3x, 2600-tok 7B prefill): wide KD=4 1030.3/1042.7/1034.1
+  (median ~1034 tok/s) vs narrow 472-488; baseline band 1035-1050 => PERF-
+  NEUTRAL, bar (>=1150) missed.
+- ncu q-proj before -> after: duration 3.62 -> 3.62-3.67 ms (run noise),
+  Memory(SOL) 75.7 -> 78.2%, Compute(SM) 22.9 -> 23.8%, issue 0.25 -> 0.25,
+  eligible 0.33, active warps/sched 2.00 (1 block/SM, REG 167, smem 98,304B).
+- Root cause: the prefetch WORKS — L2 utilization rose (same bytes, better
+  overlap) — but wall time did not drop, i.e. the kernel is L2-THROUGHPUT-
+  bound (~76-78% SOL), not MLP-starved: the old synchronous staging's 8-warp
+  memory-level parallelism already saturates the achievable L2 rate, so
+  re-timing identical bytes wins nothing and the extra expansion + barrier
+  round gives a little back. This closes the last staging-shape lever: with
+  traffic-shape experiments (x-tile, j-tile) and now latency-shape (cp.async
+  double-buffering) both measured flat, the remaining MMQ levers are per-MAC
+  L2-byte reduction (more k-reuse per byte fetched, stream-k-style
+  scheduling) or SM-side instruction efficiency — not staging order.
+- Tree reverted to `82dfc90` (byte-identical, cmp-verified); patched kernel
+  preserved at /tmp/cuda_kernels_cpasync.cu (script /tmp/patch_cpasync.py).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
