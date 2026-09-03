@@ -2,6 +2,19 @@
 
 A minimal local LLM inference engine built from scratch in Rust.
 
+<p align="center">
+
+[![Rust](https://img.shields.io/badge/lang-Rust-orange?logo=rust&logoColor=white)](#)
+[![Rust edition 2021](https://img.shields.io/badge/edition-2021-informational)](#)
+[![License](https://img.shields.io/badge/license-MIT-blue)](#)
+[![Language](https://img.shields.io/github/languages/top/yusiwen/minfer)](#)
+[![Conventional commits](https://img.shields.io/badge/conventional--commits-%E2%9C%93-green)](#)
+[![Apple MPS](https://img.shields.io/badge/Apple-MPS-blue?logo=apple&logoColor=white)](#)
+[![CUDA](https://img.shields.io/badge/CUDA-opt--in-brightgreen)](#)
+[![CI](https://img.shields.io/github/actions/workflow/status/yusiwen/minfer/ci.yml?branch=master&logo=githubactions&label=CI)](#)
+
+</p>
+
 ![minfer CLI conversation (Qwen3-0.6B, Qwen3-0.6B-Q8_0)](docs/cli-conversation.png)
 
 ## Features
