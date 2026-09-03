@@ -545,6 +545,52 @@ mma.m16n8k32.f32.s8.s8.f32 kills the 64 I2F/chunk rescale (per-chunk
 dot ≤ 61,440 < 2^24, so results are bit-identical), and the ~330 rescale
 FMUL/FMA/chunk is the remaining instruction hog.
 
+### P6 r15: f32-accumulate s8 mma does not exist; rank-1 term2 rescale — wide MMQ 1295 @ KD=8 (LANDED, 2026-09-03)
+
+r14's named next lever — replacing the int C fragments + I2F rescale with
+`mma.m16n8k32.row.col.f32.s8.s8.f32` — is IMPOSSIBLE: ptxas (CUDA 13.0)
+rejects the spelling with "Unexpected instruction types specified for
+'mma'" on sm_80/90/100/110/120/121 under both PTX ISA 8.8 and 9.0, while
+the s32-accumulator control assembles on all of them (/tmp/mma_probe_f32.ptx,
+raw-PTX probe). Integer mma has s32-only C/D accumulators; f32 C/D exists
+only for f16/bf16/tf32/fp8 inputs, and none of those can carry this data
+bit-exactly (q8·scale needs ~18 significand bits vs 11 in f16/tf32) — the
+"float-quantized A operand" variant is dead with it.
+
+The planned fallback (accumulate 2 chunks in int before one I2F) is
+mathematically INVALID, independent of the 2^21 overflow bound (which was
+fine): the rescale coefficients da·dsv and da·dmv differ per 32-k chunk
+(`get_scale_min_k4(c & 7, ...)` sub-block scales, per-chunk A d/ssum), so a
+merged int dot no longer carries the split needed to apply both chunks'
+scales. The error is O(Δscale·dot) ≈ 10²–10³ vs the 1e-3 parity gate for
+every possible chunk pairing — the information split dies in the int add.
+
+What DID land, same instruction-stream family: the dmv correction term is
+RANK-1 in (token, od-col) — sa is a per-ROW quantity shared by the od-col
+pair of each C fragment — so `dma = da·(float)sa` replaces 64
+FMUL(da·dmv)/chunk with 16 FMUL(da·sa)/chunk + plain FFMAs (term2 becomes
+one FFMA per C value). Per-chunk scale application and the mma/int-C
+structure are untouched; numerics stay within ~ulp(|sum|) of the old form
+(the new dma rounding is ~1e-6 in the parity fixture).
+
+Measured (7B @2630 tok, interleaved 3x vs narrow, same session):
+baseline KD=4 1235.7/1225.8/1226.4, KD=8 1277.1/1268.3/1270.6, narrow
+487.7/455.8/487.4 → patched KD=4 1231.2/1232.9/1237.9 (+0.5%, noise),
+KD=8 1295.0/1294.5/1295.6 (+1.9%, 3/3 consistent), narrow 473/472/472
+(control stable). ncu q-proj (KD=4, grid (21,28)): warp instructions
+9.45M → 8.69M/GMAC (−8.1%), duration 2.378 → 2.262 ms (−4.9%). The
+sub-1:1 instruction→duration tracking comes with a diagnosis:
+SpeedOfLight shows Compute (SM) throughput at 31.5% — the kernel is
+stall-bound, not issue-saturated, so further pure ALU-count cuts pay out
+sub-linearly. Parity green at KD=4 and KD=8, suite 166/0/3, greedy-32
+token identity vs the default path. The rescale floor is now ~346
+ops/chunk (64 I2F clow + 16 I2F sa + 16 h2f + 16 FMUL dma + 64 FMUL
+da·dsv + 128 FFMA + unpack/LDS); the I2F stream itself is irreducible at
+the ISA level. Next levers: the r13-noted warp-tile shape (a warp over
+2x od-rows halves A-frag LDSM and per-MAC rescale work — llama.cpp's
+structural edge) or prefetch/stall work; the narrow kernel's identical
+rank-1 term2 (3 sites) is the same one-line follow-up.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
