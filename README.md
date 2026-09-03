@@ -54,9 +54,19 @@ A minimal local LLM inference engine built from scratch in Rust.
 
 ## Interactive Web Visualization (viz/)
 
-The inference compute graph can be viewed interactively in the browser — nodes
-colored by backend + data magnitude, per-node tensor stats and heatmaps, logits
-top-5, and live inference over SSE:
+The inference compute graph can be viewed interactively in the browser. A toolbar switch
+offers **two views of the same graph**:
+
+- **Operators** — the layered tensor grid: one node = one operator, one edge = a tensor data
+  flow. Nodes are colored by backend + data magnitude, with per-node tensor stats, heatmaps,
+  and logits top-5.
+- **Pipeline** — a semantic reasoning pipeline: one box = one function/stage
+  (`Input → Embedding → [layer loop: RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual]`
+  `→ Final RMSNorm → Logits → [Sampler]`), with collapsible layers, a `← Back` drill-down
+  inspector, and a context-aware legend. Stages are derived from the exported graph (op + weight
+  name), so it needs no extra instrumentation and works on the same structure/trace/live data.
+
+Both views support playback animation and live inference over SSE:
 
 ![minfer inference graph visualization](docs/viz-demo.png)
 ![minfer inference pipeline visualization](docs/viz-demo2.png)

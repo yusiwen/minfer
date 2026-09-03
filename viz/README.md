@@ -1,8 +1,15 @@
 # minfer Inference Graph Demo (viz/)
 
-An interactive web visualizer for minfer's inference compute graph. **Each node = one step of
-inference** (one operator), and an edge = a tensor data flow. Click a node to see that step's
-data (shape, dtype, the weight it reads, quantization type, etc.).
+An interactive web visualizer for minfer's inference compute graph. Two views of the
+**same** graph are available (toggle on the right of the toolbar):
+
+- **Operators** (default) — the layered tensor grid: one node = one operator, one edge = a
+  tensor data flow.
+- **Pipeline** — a semantic reasoning pipeline: one box = one function/stage
+  (`RMSNorm` / `Attention` / `FFN` / `Logits`…), with arrows for the reasoning sequence.
+
+Click any node/box to see that step's data (shape, dtype, the weight it reads, quantization
+type, etc.).
 
 Three kinds of data are supported:
 - **Structure graph** (`--dump-graph-json`): graph + metadata, plays an execution-order animation.
@@ -116,7 +123,9 @@ Right — filters & view:
 | **Input/Output** | Show/hide input/output nodes |
 | **Attention path** | Only show nodes on the attention path (Q/K/V matmuls, rope, attn, residual adds) |
 | **FFN path** | Only show nodes on the FFN path (gate/up/down matmuls, silu, swiglu) |
+| **Operators \| Pipeline** | Switch render mode: the operator grid vs. the semantic reasoning pipeline (§6) |
 | **Fit** | Fit the whole graph to the window (zoom & pan) |
+| **Legend** | Context-aware legend: operator list (Operators view) or stage/flowing legend (Pipeline view) |
 | **Live** | Toggle the live-streaming panel (top-right) |
 
 ### 3. Reading the graph
@@ -138,6 +147,8 @@ Right — filters & view:
   execution order, the weight it reads + quantization type, bias, in×out dims, upstream/downstream
   links, and "what this step does". With trace data it also shows the **tensor stats table**
   (min/max/mean/abs-mean) and a **downsampled value heatmap**.
+- Following the **Upstream / Downstream** links (or drilling from a Pipeline stage's `Contained ops`)
+  pushes onto a **panel nav stack**; a **`← Back`** button appears at the top-left to step back.
 
 ### 5. Live streaming (`Live` panel)
 - Open the **Live** panel (top-right), point it at `minfer --viz` (default
@@ -145,35 +156,44 @@ Right — filters & view:
 - Nodes light up one by one with live stats/coloring; the token strip and the panel's logits
   distribution update as tokens stream out.
 
-### 6. Pipeline view — the reasoning pipeline (Operators / Pipeline toggle)
-The toolbar has a **`Operators | Pipeline`** view switch. **Operators** is the default
-tensor/layered grid (one box = one operator). **Flow** re-renders the *same* graph
-as a semantic reasoning pipeline, where **one box = one function/stage** and each
-edge is an arrow in the reasoning sequence:
+### 6. Pipeline view — the semantic reasoning pipeline
+
+The toolbar has a **`Operators | Pipeline`** switch. **Operators** is the default layered
+tensor grid (one box = one operator). **Pipeline** re-renders the *same* graph as a semantic
+reasoning pipeline, where **one box = one function/stage** and the arrows are the reasoning
+sequence:
 
 ```
 Input → Embedding → [Transformer Layers × N] → Final RMSNorm → Logits → [Sampler]
 ```
 
-- **Layers are collapsible.** The `Transformer Layers` box is a summary by default
-  (`× N`); click it to expand into one row per layer: `RMSNorm → Attention →
-  +Residual → RMSNorm → FFN → +Residual`. Click the `(click to collapse)` label to fold back.
-- **Each stage box is a function.** Its label is the stage (`Attention`, `FFN`, …),
-  and its sublabel is the aggregate `in×out / h / hd / nf / vocab` + backend, and
-  the contained ops are drawn as small chips inside.
-- **Click a box** → the inspector shows the stage's aggregate (backend, op count,
-  the ops it owns) + a "How this stage works" note. Click a chip inside → the
-  per-op inspector. Clicking an op anywhere lights up its owning stage + layer box.
-- **Same animation/live data.** The stage/layer boxes are driven by the same
-  execution cursor and the same `--viz` SSE stream: as an op runs, its box lights
-  up (and its fill is tinted by that op's abs-mean, same as the grid).
-- **Where the stages come from (no new instrumentation).** The stage for each op is
-  derived at render time from the exported graph — `op` + the weight name in
-  `meta.weight` (`blk.{i}.attn_norm`→`RMSNorm`, `.attn_qkv/.attn_output`→`Attention`,
-  `.ffn_*`→`FFN`, `output_norm`→`Final RMSNorm`, `output/token_embd`→`Logits`,
-  `token_embd`→`Embedding`). The final norm / logits are recognised by weight name so
-  the residual chain's `layerOf` propagation can't fold them into the last layer.
-  This works identically for the structure graph, the `MINFER_TRACE` sample, and live.
+- **Layers are collapsible.** The `Transformer Layers` box is a summary by default (`× N`);
+  click it to expand into one row per layer:
+  `RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual`. Click the `(click to collapse)`
+  label to fold back. Each layer is a **thin dashed group frame** with internal padding, so the
+  stage boxes (and their chips) sit inside it and are fully visible.
+- **Each stage box is a function.** Its label is the stage (`Attention`, `FFN`, …), its sublabel
+  is the aggregate `in×out / h / hd / nf / vocab`, the backend it runs on, and the contained ops
+  are drawn as small chips inside. Executed boxes use a pale magnitude tint (blue→red by
+  abs-mean) with **dark text** for high contrast.
+- **Drill in with Back.** Click a stage/layer box → the inspector shows the stage's aggregate
+  (backend, op count, the ops it owns) + "How this stage works". Click an op chip (or a
+  `Contained ops` link) → the per-op inspector, with a **`← Back`** button in the top-left that
+  returns to the previous view (the nav stack also covers Upstream/Downstream links).
+- **Same animation/live data.** The stage/layer boxes are driven by the same execution cursor and
+  the same `--viz` SSE stream: as an op runs, its box lights up and is tinted by that op's
+  abs-mean. The `Legend` button is **context-aware** — it shows the operator list in the
+  Operators view and the stage/flow explanation (stages, pipeline order, box markings, backend
+  colors) in the Pipeline view.
+- **Empty state.** With no graph loaded, switching to Pipeline just shows the load prompt (no
+  empty stage boxes).
+- **Where the stages come from (no new instrumentation).** The stage for each op is derived at
+  render time from the exported graph — `op` + the weight name in `meta.weight`
+  (`blk.{i}.attn_norm`→`RMSNorm`, `.attn_qkv/.attn_output`→`Attention`, `.ffn_*`→`FFN`,
+  `output_norm`→`Final RMSNorm`, `output/token_embd`→`Logits`, `token_embd`→`Embedding`). The
+  final norm / logits are recognised by weight name so the residual chain's `layerOf` propagation
+  can't fold them into the last layer. This works identically for the structure graph, the
+  `MINFER_TRACE` sample, and live.
 
 ## JSON format
 
