@@ -395,6 +395,98 @@ x1, legacy sync A staging (no rawa budget).
 - Tree reverted to `82dfc90` (byte-identical, cmp-verified); patched kernel
   preserved at /tmp/cuda_kernels_cpasync.cu (script /tmp/patch_cpasync.py).
 
+### P6 r13: counter forensics vs llama.cpp — the gap is the warp-instruction stream, not bytes (2026-09-02)
+
+First working ncu session on this device (metrics gated behind
+`sudo -n env LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu ncu ...`; note GB20B
+has NO `dram__*`/`launch__grid_size`/`l1tex shared-sector` metrics — use
+`lts__t_sectors_aperture_device` for memory-side and the CSV "Grid Size"
+column for identification; int8 mma counts under
+`sm__inst_executed_pipe_tensor_subpipe_imma_op_imma`, NOT the hmma counter,
+which reads 0 for BOTH kernels). Profiled: minfer `mmq_raw_wide_nt_kernel<4>`
+q-proj (nt 2630, od=id=3584, grid (21,28), 3.632 ms) and llama.cpp
+`mul_mat_q<12,128,0>` q-proj-class launches (nt 512 per ubatch, 0.241-0.292
+ms, MAC-normalized; llama-bench splits -p 2600 into ubatches of 512 — the
+592-block grid belongs to the nt-2600-class GEMMs, q/o at nt 512 run grid
+(48,1,1)). Effective MACs used for normalization.
+
+Per-GEMM counter table (q-proj class, per 1e9 effective MACs = GMAC):
+
+| metric (per GMAC)                    | minfer wide KD=4 | llama.cpp mul_mat_q |
+|--------------------------------------|------------------|---------------------|
+| duration (μs/GMAC)                   | 107.7            | 41.1                |
+| warp instructions                    | 10.14 M          | 6.06 M              |
+| IMMA tensor ops                      | 2.05 G (=2×MAC)  | 2.00 G (=2×MAC)     |
+| shared-load instructions (LDS+LDSM)  | 436.7 K          | 329.5 K             |
+| LDS bank conflicts                   | 940.3 K          | 6.5                 |
+| LDSM bank conflicts                  | 499.0 K          | 0                   |
+| L1 global-load REQUESTS              | 75.3 MB          | 18.1 MB             |
+| L2 bytes total                       | 88.0 MB          | 15.2 MB             |
+| L2 read sectors                      | 22.0 MB          | 13.7 MB             |
+| L2 write sectors                     | 66.1 MB          | 1.45 MB             |
+| C-store requests (L1)                | 2.24 MB          | 1.44 MB             |
+| stalls/issue-active: longsb/wait/barrier/shortsb | 2.35/0.83/0.62/0.26 | 1.21/0.58/0.18/0.10 |
+
+Key readings:
+
+1. mma work per MAC is IDENTICAL (IMMA = 2.0-2.05 ops/MAC both sides — the
+   16-chain structure is now at parity). The 3x is everything AROUND the mma.
+2. minfer executes 1.67x more warp instructions per MAC, and duration tracks
+   instruction count ~1:1 across every data point measured this session
+   (minfer old 10.14 M/GMAC -> 107.7 μs/GMAC; minfer +staging-rework
+   13.5 M/GMAC -> 146 μs/GMAC; llama 6.06 M/GMAC -> 41.1 μs/GMAC ≈ 0.10-0.15
+   warp-inst/ns on both engines). Per-MAC instruction count is the
+   first-order predictor of this kernel class on GB10.
+3. The L2-byte story is NOT the binding constraint. minfer's L2 read traffic
+   is only 1.6x llama.cpp's per MAC (22.0 vs 13.7 MB/GMAC — A 40B/chunk
+   staging + per-chunk scale-header re-reads), and fixing the two biggest
+   byte pathologies (below) changed NOTHING in wall time.
+4. UNEXPLAINED RESIDUE: minfer shows ~66 MB/GMAC of L2 WRITE sectors
+   (2.2 GB per q-proj GEMM, 75% of its L2 traffic) that are NOT C stores
+   (requests 2.24 MB/GMAC) and did NOT move when the C-store pattern was
+   fixed (2.23 -> 2.18 GB). No source-level writer exists. llama.cpp shows
+   ~1.4 MB/GMAC (≈ C size, zero amplification). Either a GB20B lts
+   write-counter artifact or a mechanism outside the source model — needs a
+   `lts__t_sectors_srcunit_tex_op_write` decomposition before trusting any
+   "L2-throughput-bound" conclusion (the P6 r12 cp.async framing relied on
+   this SOL number).
+5. llama.cpp on GB10 uses the same mma path (IMMA confirmed), 32 od-rows per
+   warp (2 minitiles x 128-token half), raw-nibble weight planes in smem
+   (65-int padded stride, bank-rotating), q8_1 activations pre-quantized on
+   device in the transposed 144B layout with scales in the pad bytes, B
+   (token) fragments via plain LDS ("faster than load_ldmatrix"), A-side
+   scales preloaded into registers per chunk outside the j0 loop, and
+   stream-k scheduling. Instruction-model differences vs ours per 128k chunk:
+   their warp covers 2x the od-rows (halving A-fragment loads per MAC), and
+   our B-side reads are 16 conflicted LDS.32 vs their 8 LDSM.x4.
+
+Two fixes were implemented and measured (parity-green at KD=4 after fixing a
+missing qb8-region resize and a staging race):
+
+- FULL variant (merged 40B single-pass A staging killing the 2B-at-40B-stride
+  sector-replay loads, per-super-block scale staging with register unpack of
+  all 8 sub-scales, qb8 272B conflict-free stride, float2 C stores):
+  L1 load requests 75.3 -> 33.9 MB/GMAC (-55%), L2 reads -14%, BUT
+  instructions 10.14 -> 13.48 M/GMAC (+33%) and duration 3.63 -> 4.89 ms
+  (+35%) -> 865-871 tok/s (-16%). The staging restructures cost more
+  instructions than the bytes they saved.
+- MINIMAL variant (qb8 272B stride + float2 C stores only; preserves
+  31.8M LDS conflicts killed and halves store instructions): parity green,
+  1041-1046 tok/s vs 1023-1043 baseline = PERF-NEUTRAL (+0.3%, noise).
+
+Conclusion: neither L2 bytes, nor store sector efficiency, nor smem bank
+conflicts bind this kernel — all three were fixed simultaneously with zero
+wall effect. The binding resource is the per-MAC warp-instruction stream
+together with issue efficiency (llama.cpp 0.41 issue vs our 0.25 at 2 active
+warps/sched both). The quantified next lever is instruction-count reduction
+in the per-chunk compute loop itself (fewer, wider smem ops per fragment:
+B-fragments as one LDSM from a layout that serves them, scale reads fused
+into fewer loads per chunk — WITHOUT adding staging ALU), not another
+traffic-shape change. Kernel reverted to HEAD `784786d` (kernel state = `82dfc90`; cmp-verified, suite
+169/0); the minimal variant is preserved at
+/tmp/cuda_kernels_minfix_variant.cu, the full variant's patch script at
+/tmp/patch_fix.py.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
