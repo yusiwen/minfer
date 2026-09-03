@@ -487,6 +487,64 @@ traffic-shape change. Kernel reverted to HEAD `784786d` (kernel state = `82dfc90
 /tmp/cuda_kernels_minfix_variant.cu, the full variant's patch script at
 /tmp/patch_fix.py.
 
+### P6 r14: B-fragments via ldmatrix + widened scale loads — wide MMQ 1225 @ KD=4 / 1273 @ KD=8 (LANDED, 2026-09-03)
+
+The r13 lever, implemented exactly: fewer/wider smem ops in the compute
+loop, zero staging-ALU growth, zero new global traffic. Three changes to
+`mmq_raw_wide_nt_kernel` only (narrow kernel untouched):
+
+1. **B-fragments via ONE `ldmatrix.m8n8.x4`** per (warp, chunk) replacing
+   4 LDS.32. qb8 re-tiled SLOT-MAJOR `[8 sg][128 od-row][48B]` — same
+   expanded per-k int8 bytes, relayout only. The 48B row stride is 16B-
+   aligned (ldmatrix requirement) and gives the 8 matrix rows distinct
+   bank phases (12r mod 32), so the LDSM is conflict-free (a 32B stride
+   would put all 8 rows on one bank phase = 8-way conflict). The reg_i =
+   matrix_i row L/4, bytes (L%4)*4 ldmatrix distribution is exactly the
+   mma.m16n8k32 B-operand layout the plain-LDS pattern produced (verified
+   standalone vs the LDS pattern before integration). Per-lane address
+   parts are loop-invariant; only the uniform sg term moves per chunk.
+2. **od-col scales packed float2** (d | dmin*m) at staging (same staging
+   store count); compute reads ONE float4 per minitile serving the (j, j+1)
+   column pair each C fragment consumes → 8 LDS.32 → 2 LDS.128.
+3. **sda_q uint2-tiling** `[KDR][16 g][8 q]` (same 8B/token region size):
+   token pair (t, t+8) in one LDS.64 → 16 LDS.32 → 8 LDS.64.
+
+First cut used a uint4 tiling needing KDR*2048B in a KDR*1024B region —
+staging overflowed into qb8 and corrupted it (garbage-magnitude parity
+diff; found by bisect after fixing a missing j0w term and a uint4 .y/.z
+word-offset slip). Smem budgets (launcher recomputed): KD=4 73,728B,
+KD=8 98,304B — both inside the ~99KB opt-in cap, 1 block/SM.
+
+Measured (7B @2630 tok, same session, interleaved 3x vs narrow):
+
+| config | baseline (HEAD 5f801fa) | r14 | Δ |
+|---|---|---|---|
+| wide KD=4 | 1036.9 / 1031.8 / 1011.7 | 1228.0 / 1219.7 / 1224.7 | **+18.5%** |
+| narrow (control) | 470.7 / 460.0 / 470.7 | 440.7 / 466.8 / 472.3 | noise |
+| wide KD=8 (default) | ~973-995 (r12) | 1269.5 / 1276.9 | **+23-30%** |
+
+ncu (q-proj, nt 2630, grid (21,28), KD=4, per GMAC = 33.78e9 MACs):
+
+| metric | r13 baseline | r14 |
+|---|---|---|
+| warp instructions (smsp__inst_executed.sum) | 10.14M | **9.45M** (−6.8%) |
+| shared-load instructions | 436.7K | **156.0K** (−64%) |
+| LDS bank conflicts | 940.3K | **499K** (−47%) |
+| duration | 3.632 ms | **2.378 ms** (−34.5%) |
+
+The residual 499K conflicts/GMAC = the A-side LDSM 2-way conflicts (r13's
+499.0K unchanged — qa8 keeps its 32B stride; padding it would need +16KB,
+pushing KD=8 over the cap). Instructions dropped only 6.8% while duration
+dropped 34.5% — most of the win is issue efficiency (smem-op count 44 →
+~24 per chunk and their address ALU), confirming r13's issue-stall
+reading (longsb 2.35/issue). Gap to llama.cpp narrowed: 70.4 vs their
+41.1 μs/GMAC (was 107.7). Parity green at KD=4 and KD=8, suite 166
+passed / 3 ignored / 0 failed, greedy-32 token identity vs the default
+path (timing lines only). Next lever (not attempted): f32-accumulate
+mma.m16n8k32.f32.s8.s8.f32 kills the 64 I2F/chunk rescale (per-chunk
+dot ≤ 61,440 < 2^24, so results are bit-identical), and the ~330 rescale
+FMUL/FMA/chunk is the remaining instruction hog.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
