@@ -606,6 +606,37 @@ within noise of the r15 control 473/472/472). Parity green at default,
 166/0/3. No ncu (the narrow kernel is not the perf path; wide numbers
 unchanged).
 
+### P6 r17: wide warp remap 32 od-rows x 64 tokens — instructions −5.8%, wall NEUTRAL (REVERTED, 2026-09-03)
+
+The r13/r15-noted warp-tile shape lever, implemented exactly as a pure
+index remap of `mmq_raw_wide_nt_kernel` (block tile 128×128, staging, qb8
+layout, sds/sdm, launcher smem all unchanged): `wn = warp&1` (i0w =
+wn*64), `wm = warp>>1` (j0w = wm*32) — each warp owns llama.cpp's
+32-od-row × 64-token shape; A-frags h<4 (`i0w + h*16 + lane>>2`), B-frags
+nh<4 via TWO ldmatrix.x4 (`j0w + half*16 + …`), 16 chains mma over (nh,h)
+both 4, sum[64] budget unchanged (`idx = nh*16 + h*4 + l`); the r15
+dma-fold's da/sa uint2 reads shift by i0w, dsv/dmv float4 covers nh<4.
+Parity green at KD=4, KD=8 and default on the first build.
+
+Measured (7B @2630 tok, interleaved 3x vs the HEAD binary): KD=4 remap
+1231/1250/1257 vs baseline 1246/1230/1239 (medians 1250 vs 1239, +0.9%);
+KD=8 1287/1301/1303 vs 1311/1263/1288 (medians 1301 vs 1288, +1.0%) —
+noise-band, far under the ≥1350 bar. ncu q-proj (KD=4, grid (21,28)):
+warp instructions 8.68 → 8.18 M/GMAC (−5.8%; per-block LDSM.x4 per chunk
+72 → 48: A 64→32 as the 8x A-redundancy halves, B 8→16 as B becomes 2x
+shared), duration 2.262 → 2.256 ms (−0.3%) — the instruction cut did not
+convert to wall time. SpeedOfLight: Compute (SM) 31.5 → 29.75% (still
+stall-bound), SM Active Cycles 4.61 → 5.04 M (+9.2%): per warp the 4 A +
+2 B LDSMs now feed 16 chains with the B side 2x-shared, and issue
+efficiency dropped — the stall profile moved the wrong way, offsetting
+the leaner instruction stream. Third independent confirmation of the r15
+reading: pure per-MAC instruction cuts in this kernel pay ~0 wall time
+while SM% sits at ~30; the binding lever is latency/stall structure
+(prefetch, occupancy), not op count.
+
+Kernel reverted to HEAD `708067d` (r16 narrow fold kept; cmp-verified);
+the remapped kernel preserved at /tmp/cuda_kernels_r16remap_variant.cu.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
