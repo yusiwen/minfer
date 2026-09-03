@@ -882,6 +882,70 @@ samples), prompt512.locked; harnesses /tmp/ncu_r20_matched.sh,
 parser /tmp/parse_ncu_r20.py; SASS dumps /tmp/minfer_phase7/minfer.sass,
 r20_src_{m512,l512}_sass.csv.
 
+### P6 r21: coalesced block-linear A staging — the premise's mechanism CONFIRMED (sectors −29%, lg_throttle −90%) but wall −2%: instruction overhead, not LSU pressure, is the binder (REVERTED, 2026-09-03)
+
+Session question (r20's "remaining gap (1)"): does replacing the wide
+kernel's 8-sector-scattered per-(chunk, u-word) A staging with warp-strided
+uint4 loads over the contiguous per-token KDR×40B regions (d/ssum folded
+out during the store phase, smem addresses unchanged, split-phase schedule
+kept) turn the lg_throttle co-binding into wall clock? The coalescing
+premise verified clean in source: the pad40 q8 layout is token-major
+contiguous per token, and the raw-MMQ dispatch guard `(id / 32) % 8 == 0`
+makes the token stride nb32·40 a multiple of 320B, so every per-token
+region is 32B-sector aligned → 5·KDR/2 full-sector uint4 slices per token,
+lane-strided in 16-token/warp batches (80 sectors/warp-kt at KDR=4),
+nb32 % KDR == 0 ⇒ no partial k-tiles ⇒ per-token validity is exactly
+`tok < nt`. Implemented as a mmq_raw_wide RAW_STAGE rewrite; parity took
+three fixes (per-lane slice count is 5·KDR/4, not 5·KDR/2 — the excess
+iterations re-staged the next warp's tokens and warp 7 wrote past qa8 into
+sda_q; `idx` must be built from `lane`, not `threadIdx.x`; and the global
+token must include i0 — only the sweep's grid.x=2 shape (nt=256) caught
+it). A byte-exact CPU simulator of both staging forms (/tmp/sim_r21.py)
+confirmed identical qa8/sda_q images across all sweep shapes for KDR=4
+and 8.
+
+Measured (2630-tok prompt, interleaved 3x, q-proj class nt-2630 ncu):
+
+| metric | r20 (pre) | r21 (post) | |
+|---|---|---|---|
+| global-load sectors / launch | 79.35 M | 56.67 M | **−28.6%** (premise holds) |
+| lg_throttle /issue-active | 1.42 | 0.14 | **−90%** (lever worked) |
+| mio_throttle / math_pipe | 0.37 / 0.39 | 0.00 / 0.08 | gone |
+| long_scoreboard | 1.23 | 1.24 | unchanged |
+| **wait** | 0.59 | **1.24** | +110% (new binder) |
+| short_scoreboard | 0.23 | 0.52 | +126% |
+| warp-inst / launch | 245.9 M | 274.1 M | **+11.5%** |
+| duration (q-proj) | 1971 μs | 2186 μs | **+10.9%** |
+| wall KD=4 / KD=8 | 1312 / 1311 tok/s | 1282 / 1302 | −2.3% / −0.7% |
+
+Reading: the stall MASS is conserved — the throttle classes r20 named
+co-binding collapsed exactly as predicted, but the freed issue slots
+re-saturated on `wait` (fixed-latency dependency chains) +
+short_scoreboard (smem): per 16B slice the new form pays an idx/spt +
+s%5 decode (mul-hi chains), a 5-way divergent store branch with byte
+extraction from the uint4, and 2×U16 sda stores — where r20's
+LDG.32→STS.32 flowed the loaded register straight to smem. +11.5%
+warp-inst at this occupancy maps ~1:1 onto +10.9% duration. Conclusion:
+**sector efficiency and LSU-queue request count are NOT the wall-clock
+binder for the wide kernel's staging at nt-2630; warp-instruction count
+is.** r20's "remaining gap" list re-ordered: (1) is dead — the 128→80
+sector win is real but buys nothing at this shape; the live levers are
+the r13/r15 compute-loop instruction surplus (499k→418k vs llama 356k
+per tile) and the 3.2M LDS conflicts. A hybrid that keeps r20's
+pass-through LDG.32→STS.32 but folds the separate d/ssum loads into the
+qs loads (shared sectors, no byte extraction) is the only remaining
+staging idea worth trying, and its ceiling is small (the d/ssum loads
+are ~15% of staging requests).
+
+Revert: src/cuda_kernels.cu restored byte-exact to HEAD 9819410
+(md5 a037f0c7286abdae41ef0ea73481ff31 = /tmp/cuda_kernels_pre_r21.cu),
+parity re-verified green after revert. Artifacts: patch script
+/tmp/patch_r21_coalesced_a.py (line-anchored, count-verified), staging
+simulator /tmp/sim_r21.py (byte-exact r20-vs-r21 smem image diff), perf
+harness /tmp/perf_r21_ab.sh + log /tmp/minfer_phase7/r21_perf_ab.log,
+ncu captures /tmp/minfer_phase7/r21_{post,pre,post2,pre2,post_wi,pre_wi}.csv
+(+ .logs), parser /tmp/parse_r21_metrics.py.
+
 
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
