@@ -1033,6 +1033,112 @@ ncu script /tmp/ncu_ldmtest.sh
 (swizzle-only), r22_goff_perf_ab.log (final G-offset form).
 
 
+### P6 r23 — B-line wall decomposition: the default f16 path's full-graph split (2026-09-03)
+
+Pivot session: with the q4_K MMQ kernel campaign at r22, decompose the
+ENTIRE default-path (f16 wmma GEMM) prefill wall to see what is left
+OUTSIDE the GEMM work — and where the non-q4_K weight types actually sit.
+Method: `nsys profile --trace=cuda` on the 7B q4_k_m 2659-token prefill
+(-n 1, default path, HEAD 317c2db), per-launch csv bucketed into op
+classes + GEMM-by-weight-type via the deterministic launch sequence
+(grid gy = od/128: q/o/down 28, k/v 4, gate/up 148; walk order
+q,k,v,o,gate,up,down; weight types from a GGUF metadata census,
+/tmp/gguf_types.py). ncu SOL pass on the first layer's q,k,v,o,gate,up,
+down + FA + swiglu (48 SMs on GB10). Co-tenant contamination: a 77GB
+sglang::scheduler burst cost one run ~74ms of outlier kernels (down L1/L2
+22.3/55.6ms, gate 14.1/19.8ms vs the flat ~8.5/10.2ms) — outlier-cleaned
+numbers below; interleaved medians for any wall claims. Quiet-window
+default path: 2285 tok/s median (3x tight: 2278-2288).
+
+**Graph structure discovery (worth keeping in mind):** the prefill is 27
+full layers + layer 27 attention, then an nt=1 TAIL — the last token's
+FFN and lm_head run as decode-shaped ops (gather-row, 1-token norms,
+MMVQ gate/up/down + 2.5ms q6_K lm_head over 152064 rows). The full
+[nt,vocab] logits GEMM does NOT exist in the prefill wall; the q6_K
+lm_head (1.45 TMAC = 9.6% of model MACs) is therefore already tail-priced.
+193 gemm_f16 launches = 27x7 + 4 (layer 27 = q,k,v,o only), each preceded
+1:1 by a convert_f32_f16 (A-side f32->f16).
+
+**Op-class table (profiled run span 1212 ms, GPU busy 1202.7 ms, host
+gaps 9.3 ms = 0.8%):**
+
+| op class | ms | % span | ncu limiter | plausible lever | est. wall gain |
+|---|---:|---:|---|---|---:|
+| GEMM f16 wmma — gate+up (q4_K) | 458 (clean ~425) | 37.8% | **mem SOL 85%** (L1/L2 B-stream of 16-bit weights), SM 38%, occ 50% | MMQ raw-byte B (r6–r22 campaign) | at MMQ parity: ~+25% tok/s |
+| GEMM — down (14 q4_K + 13 q6_K) | 334 (clean ~277) | 27.5% | mem 74%, SM 34%; **runs 20% slower per-MAC than gate/up** (10.2 vs 8.5 ms, same 180.5 GMAC, same kernel — cause unexplained; K=18944-deep A loop) | same MMQ; ncu A/B of the asymmetry | +4% if down matches gate/up |
+| GEMM — q+o (q4_K) | 91 | 7.5% | latency (SM 17–36%, mem 38–80%, occ 44–49%) | — | small |
+| GEMM — k+v (q4_K/q6_K) | 17 | 1.4% | latency (od 512 -> 168 blocks) | — | — |
+| attention (FA prefill) | 87 | 7.2% | **occupancy 16.7%** (69.4KB smem -> 1 block/SM); SM 25%, mem 31% — nothing saturated | r23 tried tile-shrink (below): fixed costs ate it; needs llama.cpp-style structure (their FA ~1.2 ms/layer vs our 3.1) | +2–4% |
+| convert f32->f16 (A-side) | 73 | 6.0% | DRAM peak (245 GB/s); pure f16-path tax (llama.cpp pays zero — MMQ quantizes in-kernel) | in-kernel convert TRIED (P6: −8%); smem-mirror variant predicted negative (r21/r22 lesson: staging is issue-bound) | ≤ +3% |
+| swiglu | 68 | 5.6% | DRAM peak (245 GB/s) — at bandwidth ceiling | fusion into GEMM epilogue (hard) | ≤ +2% |
+| add (residual) | 24 | 2.0% | bandwidth | f16-out chain (dtype plumbing) | +1% |
+| rms_norm | 23 | 1.9% | 177 GB/s — BELOW the 245 GB/s elementwise peak | block-size/vector tweak | +1% |
+| rope + bias + kv store + misc | ~25 | 2.1% | bandwidth | — | — |
+| host gaps | 9 | 0.8% | launch overhead | prefill CUDA-graph capture | +0.5% |
+
+**GEMM by weight type:** q6_K-weight GEMMs = 194.9 ms (16.1% of span;
+24% of GEMM MACs: 14/28 attn_v, 14/28 ffn_down; lm_head excluded by the
+nt=1 tail). Per-MAC there is NO q6_K penalty — same f16 kernel, same
+~10.2ms down instances after outlier removal (the load-time w16 dequant
+cache erases the type). The "non-q4_K GEMM path" is a non-issue in the
+default path; the only type story is the GGUF census: 169 q4_K + 29
+q6_K (14 attn_v, 14 ffn_down, output.weight), no q8_0/q5_K in this GGUF.
+Per-kernel efficiency: gate 43.4 / up 41.7 / q 41.9 / o 42.0 / down 34.3
+(outlier-cleaned) / k+v 32.5 TFLOPS.
+
+**llama.cpp same-model split (nsys, same noisy window — ratios only):**
+GEMM 597 ms total (MMQ 39.5 µs/GMAC incl. stream-k fixup) vs our f16
+59.5 µs/GMAC + the 73 ms convert tax; A-quantize 48 ms (vs our convert
+73); silu 66 (= ours); FA ~34 ms (1.2 ms/layer — 2.5x ours); add 17,
+norms 10, rope 6. Their total GPU busy ~805 ms ≈ their quiet-window wall
+(2630 tok @3371). The prefill gap IS the GEMM byte-width gap: raw q4_K
+B-stream (4.5 bit/w) at 85% SOL beats an f16 B-stream (16 bit/w) at 85%
+SOL by ~1.5x per MAC — which is exactly the r6–r22 campaign's premise.
+Updated campaign math (2659-tok wall 1160 ms): MMQ at llama.cpp GEMM
+parity = quantize ~130 + GEMM 597 = 727 ms vs f16 900 + 73 = 973 ms ->
+wall ~914 ms -> ~2900 tok/s (r6's estimate of 2670 was conservative).
+
+**r23 experiment (REVERTED, bar not met): FA_TKV 64->32 occupancy lift.**
+Design: FA prefill is smem-capped at 1 block/SM (69.4KB: Q 17.4 + K/V
+34.8 + Sf 16.4 + state 0.8). TKV=32 + a corrected launcher formula
+(Q at TQ rows, K/V at TKV rows — the old one reserved 3xTQ rows) gives
+43,776B -> 2 blocks/SM; the QK^T warp decomposition generalized to
+kvw = FA_TKV/2 mma chunks (bit-identical op order at TKV=64).
+Gates: cuda_prefill 7/7 green; greedy-32 token identity vs pre-change
+binary = timing lines only (a REAL bug was caught on the first cut:
+with TKV=32, lanes 16–31 own nonexistent columns and the mask
+`kt+c0 < kv_end` alone let them read the next row's scores -> garbage
+generation; fixed by adding `c0/c1 < FA_TKV` to the mask — keep in mind
+for any future tile reshrink).
+Result: ncu occupancy 16.7% -> **32.68%** (2 blocks/SM materialized,
+43,776B/block), SM/mem SOL 25.2/30.6 -> 47.8/47.8, kernel duration
+3.45 -> 3.22 ms (-6.7% ncu-serialized) — the 2x k-loop fixed costs
+(barriers, per-tile alpha rescale, half-wasted softmax lanes) consumed
+the latency-hiding gain. Interleaved 3x wall: pre 2284.7 vs post
+2277.4 tok/s median = **-0.3%** — far below the +3% bar, REVERTED
+(git checkout, binary rebuilt at HEAD).
+Consequence: FA's 2.5x/layer gap to llama.cpp is structural (their
+flash_attn_ext_f16<128,128,..> keeps 128-wide KV tiles with warp
+specialization inside the smem budget); a TKV shrink alone cannot
+collect it. Next FA lever, if any: reduce Qs (Q fragments in registers)
+to fit double-buffered 64-wide KV staging in <=50KB — same trap the P5
+note documented (double-buffer at padded stride = 99KB+).
+
+**Priority queue out of this session:** (1) the MMQ campaign itself —
+unchanged, now with a byte-exact wall-impact estimate; (2) the down-GEMM
+20% per-MAC asymmetry vs gate/up (cheap ncu A/B, up to +4%); (3) FA
+prefill structure (needs a redesign, not a knob); (4) rms_norm bandwidth
+(+1%, trivial); everything else is at a hardware ceiling.
+
+Artifacts: /tmp/minfer_phase7/b23_default.nsys-rep (+ trace/kern CSVs),
+b23_llamacpp3.nsys-rep (+ b23_lc_* CSVs), b23_ncu_top.csv,
+b23_ncu_fa_post.csv, r23_perf_ab.log, r23_tok_{pre,post}.txt;
+scripts /tmp/gguf_types.py /tmp/merge_types.py /tmp/agg_b23.py
+/tmp/agg_lc.py /tmp/parse_ncu_b23.py /tmp/ncu_b23.sh /tmp/ncu_r23_fa.sh
+/tmp/perf_r23_ab.sh /tmp/patch_r23_fa.py /tmp/patch_r23_mask.py;
+A/B baseline binary /tmp/minfer_pre_r23 (keep until next B-line session).
+
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
