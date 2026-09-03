@@ -4494,27 +4494,60 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
          * -> smem loads, one syncthreads orders them. At 128x64 tiles the     \
          * smem is small enough for 2 blocks/SM - latency hiding comes from    \
          * occupancy, not prefetch depth. */                                   \
-        for (int x = threadIdx.x; x < MMQ_WBI * KDR * 8; x += blockDim.x) {    \
-            int u = x % 8, r = (x / 8) % MMQ_WBI, kd = x / (8 * MMQ_WBI);      \
-            int tok = i0 + r, c = (kt) * KDR + kd;                             \
-            unsigned v = 0;                                                    \
-            if (tok < nt && c < nchunk)                                        \
-                v = *(const unsigned*)(q8x + ((size_t)tok * nb32 + c) * 40     \
-                                       + 4 + u * 4);                           \
-            *(unsigned*)(qa8 + ((size_t)kd * MMQ_WBI + r) * 32 + u * 4) = v;   \
-        }                                                                      \
-        for (int x = threadIdx.x; x < MMQ_WBI * KDR; x += blockDim.x) {        \
-            int r = x % MMQ_WBI, kd = x / MMQ_WBI;                             \
-            int tok = i0 + r, c = (kt) * KDR + kd;                             \
-            unsigned d16 = 0, ss = 0;                                          \
-            if (tok < nt && c < nchunk) {                                      \
-                const uint8_t* src = q8x + ((size_t)tok * nb32 + c) * 40;      \
-                d16 = *(const unsigned short*)src;                             \
-                ss = (unsigned)(short)*(const int*)(src + 36);                 \
+        /* r20: split-phase A staging. The old interleaved LDG->STS chains    \
+         * stalled the warp at the first store of every 4-deep unroll batch   \
+         * (PC-sampled: the leading STS held 16.7% of all warp stalls = one   \
+         * full memory latency per batch, ~4 batches per kt). Issue ALL       \
+         * global loads into registers first - one deep independent LDG batch \
+         * per warp per kt - then store to smem. Identical addresses, traffic \
+         * and instruction count; only the dependency schedule changes. */    \
+        {                                                                      \
+            unsigned av[KDR * 4];          /* qs words: 128*KDR*8 / 256 thr */ \
+            unsigned short dv[KDR / 2];    /* d f16 words: 128*KDR / 256 */    \
+            unsigned sv[KDR / 2];          /* ssum words */                    \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR * 4; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int u = x & 7, r = (x >> 3) & (MMQ_WBI - 1),             \
+                          kd = x >> 10;    /* x/(8*MMQ_WBI), 8*128 = 1024 */   \
+                const int tok = i0 + r, c = (kt) * KDR + kd;                   \
+                unsigned v = 0;                                                \
+                if (tok < nt && c < nchunk)                                    \
+                    v = *(const unsigned*)(q8x                                 \
+                        + ((size_t)tok * nb32 + c) * 40 + 4 + u * 4);          \
+                av[i] = v;                                                     \
             }                                                                  \
-            *(unsigned*)(sda_q + ((size_t)kd * MMQ_WBI + (r >> 4) * 8         \
-                                  + (r & 7)) * 2 + ((r >> 3) & 1)) =          \
-                d16 | (ss << 16);                                              \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR / 2; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int r = x & (MMQ_WBI - 1), kd = x >> 7;  /* x/MMQ_WBI */ \
+                const int tok = i0 + r, c = (kt) * KDR + kd;                   \
+                unsigned short d16 = 0;                                        \
+                unsigned ss = 0;                                               \
+                if (tok < nt && c < nchunk) {                                  \
+                    const uint8_t* src = q8x                                   \
+                        + ((size_t)tok * nb32 + c) * 40;                       \
+                    d16 = *(const unsigned short*)src;                         \
+                    ss = (unsigned)(short)*(const int*)(src + 36);             \
+                }                                                              \
+                dv[i] = d16;                                                   \
+                sv[i] = ss;                                                    \
+            }                                                                              _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR * 4; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int u = x & 7, r = (x >> 3) & (MMQ_WBI - 1),             \
+                          kd = x >> 10;                                        \
+                *(unsigned*)(qa8 + ((size_t)kd * MMQ_WBI + r) * 32 + u * 4)    \
+                    = av[i];                                                   \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR / 2; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int r = x & (MMQ_WBI - 1), kd = x >> 7;                  \
+                *(unsigned*)(sda_q + ((size_t)kd * MMQ_WBI + (r >> 4) * 8      \
+                                      + (r & 7)) * 2 + ((r >> 3) & 1)) =       \
+                    dv[i] | (sv[i] << 16);                                     \
+            }                                                                  \
         }                                                                      \
         /* B: expand ONE 256-k super-block to per-k int8 AT STAGING - raw     \
          * nibble values 0..15 (folding (nib - m) here would skew the dmin    \

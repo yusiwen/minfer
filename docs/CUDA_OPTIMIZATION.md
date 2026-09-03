@@ -752,6 +752,137 @@ Both levers reverted to HEAD `384b3d9` (cmp-verified). Preserved:
 - /tmp/patch_p7_t2.py (anchored patch script), /tmp/cuda_kernels_p7t2.cu
   (patched kernel file), /tmp/perf_p7t2_ab.sh, /tmp/perf_p7t2_ab.log.
 
+### P6 r20: residual attribution — the issue-efficiency gap is long-scoreboard exposure in the staging LDG→STS chains, not barrier structure (LANDED split-phase staging, +7.1% KD=4, 2026-09-03)
+
+Session question: WHY is llama.cpp `mul_mat_q` at issue 0.41/sched vs our
+0.25 at identical occupancy (2 active warps/sched, 1 block/SM, 8 warps), and
+is the cause portable? Method: exact-512-token prompt (deterministic word
+text tuned to land on exactly 512 BPE tokens,
+/tmp/minfer_phase7/prompt512.locked, 2753 chars), full 15-class
+per-issue-active stall set + cycle counters on BOTH q-proj kernels at matched
+nt=512, plus minfer nt-2630 for the r13 tie-in. All prior minfer captures
+were nt-2630 whole-tensor launches vs llama nt-512 ubatches.
+
+Structural facts established from source (llama.cpp @ ca3d5a3e1, matches the
+profiled `mul_mat_q<12,128,0>` = <GGML_TYPE_Q4_K, J=128, fallback=0>):
+- 256 threads (8 warps), I=J=128 tiles, `MMQ_ITER_K = 256`, occupancy-1
+  launch bounds — same tile shape and occupancy as ours.
+- Per 256-k iteration: `load_tiles (W) → stage y-half-1 → barrier →
+  vec_dot(0..128) → barrier → stage y-half-2 → barrier → vec_dot(128..256) →
+  barrier` = **4 barriers per 256 k = 2 per 128 k — identical barrier
+  density to ours** (2/kt of 128 k). Barrier COUNT is at parity; the old
+  "their staging is less synchronous" hypothesis is false at source level.
+- nt-512 q-proj launch: nty=28 × ntx=4 = 112 tiles, stream-k efficiency
+  77.8% < 90% → **grid (48,1,1) persistent blocks + `mul_mat_q_stream_k_fixup`**
+  (grid (48,4,1), +34 μs). Ours: grid (4,28) = 112 short blocks, 2.33 waves
+  (≈3 × 448 k-cycles/block). Per-tile wall: minfer 211 μs vs llama 113 μs.
+
+Phase-1 table (q-proj class, nt-512, per-issue-active warp ratios; llama =
+launch 0 of 8, identical at launch 6):
+
+| metric | minfer <4> | minfer <8> | llama.cpp <12,128> |
+|---|---|---|---|
+| duration q-proj (μs) | 632.4 | 609.6 | 263.6 |
+| issue /cyc/sched | 0.16–0.26 | 0.20 | 0.42 |
+| eligible /cyc | 0.22–0.28 | 0.28 | 0.64 |
+| warps active /cyc | 2.00 | 2.00 | 2.00 |
+| warp inst / tile (k) | 499 | 488 | 356 |
+| IMMA mma-inst | 1,605,632 | 1,605,632 | 1,605,632 |
+| long_scoreboard | **6.22** | 5.76 | **1.15** |
+| wait | 0.63 | 0.57 | 0.58 |
+| barrier | 0.26 | 0.17 | 0.19 |
+| short_scoreboard | 0.34 | 0.53 | 0.12 |
+| not_selected | 0.41 | 0.40 | 0.50 |
+| math_pipe_throttle | 0.36 | 0.34 | 0.47 |
+| mio_throttle | 0.11 | 0.28 | 0.25 |
+| lg_throttle | 0.33 | 0.60 | 0.09 |
+| dispatch_stall | 0.29 | 0.28 | 0.31 |
+| LDS bank conflicts | 3,211,264 | 3,211,264 | **42** |
+
+Readings:
+1. **The gap carrier is long_scoreboard, not barriers.** Named-stall excess
+   ≈ +5.2 warps/issue-active, of which longsb = +5.07 (97%); barrier delta is
+   +0.07. In warp-time terms: minfer warps spend ~86% of resident cycles
+   stalled on global-load latency (6.2 of 7.7 warps-per-issue-active), llama
+   ~24% (1.15 of 4.76 — its identity closes exactly: 4.76 = 1 + 4.80).
+2. **The r13 stall table was double-distorted**: it compared the PRE-r14
+   kernel (before ldmatrix B-frags/r15 rank-1 fold) at nt-2630 against llama
+   at nt-512, and it lacked the full stall set. Current kernel at nt-2630:
+   issue 0.22, longsb 6.26, barrier 0.40 — barrier was never 0.62-vs-0.18
+   caused by structure; the nt-2630 capture's mix of GEMM classes blurred it.
+3. **Tensor work is EXACTLY at parity**: IMMA = 1,605,632 on both sides for
+   the same q-proj GEMM (mma.m16n8k32 count; 4096 MACs each). The 2.40x
+   duration gap = 1.40x instructions-per-tile (r13/r15 residue) × 1.7x
+   issue-efficiency.
+4. Cycle-counter calibration (r20b): ncu locks 2.14 GHz; smsp active cycles
+   1.12M ≈ 2.33 waves × 448k block cycles; issue_active.sum ==
+   inst_executed.sum EXACTLY (no dual-issue). A 0.16-vs-0.26 capture
+   discrepancy on the SAME kernel was replay-pass clock variance — the
+   0.25-vs-0.41 headline from r13 survives (0.26 vs 0.42 clean re-measure).
+5. **PC-sampling source attribution** (SourceCounters, 51,032 samples):
+   minfer's top stall site is a single `STS [R25], R32` in the A-qs staging
+   loop = **16.7% of ALL warp stalls**; the STS/LDG/unpack-ALU staging path
+   (STS 23.6% + IMAD 13.5% + SHF 8.8% + LOP3/I2F 6.3%) holds ~half the
+   samples, compute (IMMA+FMUL+FFMA) 16%. llama's profile is spread thin
+   (top site 6.4%, compute 41%, staging-path ~27%, LDS conflicts ~0).
+   Mechanism: the interleaved `LDG.32 → address ALU → STS.32` chains let
+   in-order issue stall at the FIRST store of each 4-deep unroll batch —
+   one full memory latency (~600 cycles) per batch, ~4-5 batches per kt,
+   while the A-tile fetch is also 8-sector-scattered (each 4B load spans
+   token stride 4480B → 62.5% sector efficiency, 128 unique sectors per
+   warp-kt vs llama's ~60-120 with L1 reuse).
+
+Phase-3, portable fix LANDED (`split-phase A staging` in
+`mmq_raw_wide_nt_kernel`): issue ALL A-staging global loads into register
+arrays first (`av[KDR*4]`, `dv[]`/`sv[]`), then store to smem — identical
+addresses, traffic, and ~identical instruction count; only the dependency
+schedule changes. The d/ssum loop folds into the same schedule. Gates:
+
+- parity: `cuda_prefill_mmq` green KD=4 AND default KD=8;
+- perf (2630 tok, interleaved 3x vs baseline binary @1e0dded = same wide
+  kernel as HEAD): **KD=4 1230.4 → 1317.7 tok/s (+7.1%), KD=8 1275.8 →
+  1319.9 (+3.5%)**, narrow control +1.2% (noise). The session's ≥1350 bar
+  was NOT met — landed anyway as strictly-positive and reproducible 6/6;
+- ncu re-check (nt-512 q-proj): **longsb 6.22 → 2.92 (−53%), duration 632 →
+  555 μs (−12.2%), warp-inst 55.9 → 46.8 M (−16%: ptxas schedules the
+  register batch leaner)**, IMMA unchanged; the freed stalls moved to
+  **lg_throttle 0.33 → 2.38** — the staging is now LSU-queue/request-count
+  bound, NOT latency bound;
+- suite 166/0/3; greedy 16-token output identical (default vs gated path,
+  wide prompt).
+
+Verdict: the stall-gap carrier is proven (long-scoreboard, 97% of the named
+excess, sampled inside the staging LDG→STS chains), and the portable fix is
+landed. But the wall return on removing 53% of longsb was only
++7.1%/+3.5%: the freed warp-cycles re-saturate on lg_throttle (LSU queue /
+request count) — staging latency and staging request count are serially
+co-binding, so the latency fix alone converts one bound into the other.
+What is NOT the cause (all measured, not assumed): barrier structure
+(density already 2/128k on both sides; barrier stalls 0.26-0.39 vs 0.19),
+launch shape (stream-k vs 3-wave tiling a wash at these shapes; their fixup
+kernel costs +34 μs), occupancy (2.00 warps/sched both), tensor work (IMMA
+identical), and memory bytes (r13). Remaining gap, in measured order:
+(1) staging request count — the coalesced block-linear A-staging rewrite
+(uint4 slices over the KDR×160B contiguous per-token regions, 5-deep
+per-thread batches, d/ssum folded in) cuts unique sectors 128 → 80 per
+warp-kt (−37%) at 100% efficiency and directly attacks lg_throttle;
+requires id % 256 == 0 for 16B-aligned uint4 slices, which the raw-MMQ
+dispatch guard `(id / 32) % 8 == 0` already guarantees; (2) the remaining
+1.17x instruction surplus per tile (499k → 418k after this patch vs llama
+356k) — r13/r15's compute-loop levers, plus extending split-phase to the
+B-expansion loop; (3) 3.2M LDS conflicts per launch vs their 42 (the qb8
+48B-slot stride — re-tile so the compute-loop LDS.64/128 pattern lands
+conflict-free).
+
+Revert anchor: /tmp/cuda_kernels_pre_r20.cu (byte-exact pre-r20 backup,
+md5 2504ac93). Patch script: /tmp/patch_r20_stage.py (line-anchored,
+count-verified). Captures: /tmp/minfer_phase7/r20_*.csv (+ .ncu-rep PC
+samples), prompt512.locked; harnesses /tmp/ncu_r20_matched.sh,
+/tmp/ncu_r20b_cycles.sh, /tmp/ncu_r20c_src.sh, /tmp/perf_r20_ab.sh;
+parser /tmp/parse_ncu_r20.py; SASS dumps /tmp/minfer_phase7/minfer.sass,
+r20_src_{m512,l512}_sass.csv.
+
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
