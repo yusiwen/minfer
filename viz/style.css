@@ -178,6 +178,11 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #panel-body .placeholder { color: var(--fg-faint); font-size: 12px; }
 
 .node-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.panel-back {
+  font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;
+  background: var(--bg-3); color: var(--fg); border: 1px solid var(--border);
+}
+.panel-back:hover { border-color: var(--accent); color: var(--accent); }
 .node-header h3 {
   font-size: 14px; font-family: var(--mono); word-break: break-all;
 }
@@ -191,7 +196,11 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .badge.cuda { background: var(--cuda-fill); color: #86efac; border-color: var(--cuda); }
 .badge.none { background: var(--none-fill); color: var(--fg-dim); }
 .badge.fused { background: #4a0d2b; color: var(--accent-2); border-color: var(--accent-2); }
+.badge.flow { background: #0c3a4e; color: #7dd3fc; border-color: var(--accent); }
 .badge.inout { background: #312e81; color: #c7d2fe; border-color: #6366f1; }
+.link-list { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.link-list .link-node { background: var(--bg-3); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font-family: var(--mono); font-size: 11px; }
+.flow-clickable { cursor: pointer; user-select: none; }
 
 .kv-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
 .kv-table th, .kv-table td {
@@ -276,6 +285,7 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #legend-table td { color: var(--fg-dim); }
 #legend-table .op-name { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
 .legend-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+#legend-table .legend-flow { font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--fg); }
 
 /* ---------- SVG graph ---------- */
 .node-group { cursor: pointer; }
@@ -332,3 +342,63 @@ main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
 /* progress bar under toolbar */
 #progress-wrap { display: none; }
+
+/* ---------- view switch (Dataflow / Flow) ---------- */
+.view-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.view-btn {
+  border: 0; border-radius: 0; background: var(--bg-3); padding: 4px 10px;
+  font-size: 12px; color: var(--fg-dim); cursor: pointer;
+}
+.view-btn:not(.active):hover { background: var(--bg-2); color: var(--fg); }
+.view-btn.active { background: #0c4a6e; color: #e2e8f0; }
+
+/* ---------- Flow view ---------- */
+.flow-seg-label { fill: var(--fg-dim); font-size: 11px; font-family: var(--mono); user-select: none; }
+.flow-seg-caption { fill: var(--fg-faint); font-size: 9px; font-family: var(--mono); user-select: none; }
+
+.flow-box { cursor: pointer; }
+.flow-box rect { fill: var(--none-fill); stroke: var(--border); stroke-width: 1.2; }
+.flow-box .flow-box-label { fill: var(--fg); font-size: 11px; font-family: var(--mono); font-weight: 700; pointer-events: none; }
+.flow-box .flow-box-sub { fill: var(--fg-dim); font-size: 8.5px; font-family: var(--mono); pointer-events: none; }
+.flow-box .flow-box-sublabel { fill: var(--fg-faint); font-size: 8px; font-family: var(--mono); pointer-events: none; }
+.flow-box .flow-dim { fill: var(--accent); font-size: 8.5px; font-family: var(--mono); pointer-events: none; }
+.flow-box.backend-metal rect { fill: var(--metal-fill); stroke: var(--metal); }
+.flow-box.backend-cpu rect { fill: var(--cpu-fill); stroke: var(--cpu); }
+.flow-box.backend-cuda rect { fill: var(--cuda-fill); stroke: var(--cuda); }
+.flow-box.fused rect { stroke-dasharray: 4 2; }
+.flow-box.collapsed rect { stroke-dasharray: 6 3; }
+.flow-box.executed rect { fill: var(--done); stroke: #7dd3fc; }
+/* 已执行/被染色的框：深色文字 + 浅色填充，任何色相下都有强对比 */
+.flow-box.executed .flow-box-label,
+.flow-box.executed .flow-box-sub,
+.flow-box.executed .flow-box-sublabel,
+.flow-box.executed .flow-dim { fill: #0b1220; }
+.flow-box.executed.backend-cpu rect { fill: #fbbf24; stroke: #f59e0b; }
+.flow-box.executed.backend-cuda rect { fill: #4ade80; stroke: #22c55e; }
+.flow-box.current rect { stroke: var(--current); stroke-width: 2.4; }
+.flow-box.selected rect { stroke: #fff; stroke-width: 2.6; }
+
+.flow-op rect { fill: var(--none-fill); stroke: var(--border); stroke-width: 1; }
+.flow-op.backend-metal rect { fill: var(--metal-fill); stroke: var(--metal); }
+.flow-op.backend-cpu rect { fill: var(--cpu-fill); stroke: var(--cpu); }
+.flow-op.backend-cuda rect { fill: var(--cuda-fill); stroke: var(--cuda); }
+.flow-op.fused rect { stroke-dasharray: 3 2; }
+.flow-op .flow-op-label { fill: var(--fg-dim); font-size: 8px; font-family: var(--mono); pointer-events: none; text-anchor: middle; }
+.flow-op.executed rect { fill: var(--done); stroke: #7dd3fc; }
+.flow-op.executed.backend-cpu rect { fill: #fbbf24; stroke: #f59e0b; }
+.flow-op.executed.backend-cuda rect { fill: #4ade80; stroke: #22c55e; }
+.flow-op.executed .flow-op-label { fill: #0b1220; }
+.flow-op.current rect { stroke: var(--current); stroke-width: 1.8; }
+.flow-op.ready rect { stroke: var(--ready); stroke-width: 1.6; stroke-dasharray: 2 1; }
+.flow-op.selected rect { stroke: #fff; stroke-width: 2; }
+.flow-op.hidden { display: none; }
+
+/* layer 分组框：半透明细边框，只做分组，不整块染色/不遮内容 */
+.flow-layer { cursor: pointer; }
+.flow-layer rect.flow-layer-bg { fill: rgba(148, 163, 184, 0.07); stroke: var(--border); stroke-width: 1.2; stroke-dasharray: 6 4; }
+.flow-layer.executed rect.flow-layer-bg { stroke: #7dd3fc; }
+.flow-layer.selected rect.flow-layer-bg { stroke: #fff; stroke-width: 2; stroke-dasharray: none; }
+.flow-layer-label { fill: var(--fg); font-size: 11px; font-weight: 700; font-family: var(--mono); }
+
+.flow-arrow { stroke: var(--fg-faint); stroke-width: 1.4; fill: none; }
+.flow-arrow-label { fill: var(--fg-faint); font-size: 8px; font-family: var(--mono); }

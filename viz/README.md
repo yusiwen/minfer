@@ -145,6 +145,35 @@ Right — filters & view:
 - Nodes light up one by one with live stats/coloring; the token strip and the panel's logits
   distribution update as tokens stream out.
 
+### 6. Pipeline view — the reasoning pipeline (Operators / Pipeline toggle)
+The toolbar has a **`Operators | Pipeline`** view switch. **Operators** is the default
+tensor/layered grid (one box = one operator). **Flow** re-renders the *same* graph
+as a semantic reasoning pipeline, where **one box = one function/stage** and each
+edge is an arrow in the reasoning sequence:
+
+```
+Input → Embedding → [Transformer Layers × N] → Final RMSNorm → Logits → [Sampler]
+```
+
+- **Layers are collapsible.** The `Transformer Layers` box is a summary by default
+  (`× N`); click it to expand into one row per layer: `RMSNorm → Attention →
+  +Residual → RMSNorm → FFN → +Residual`. Click the `(click to collapse)` label to fold back.
+- **Each stage box is a function.** Its label is the stage (`Attention`, `FFN`, …),
+  and its sublabel is the aggregate `in×out / h / hd / nf / vocab` + backend, and
+  the contained ops are drawn as small chips inside.
+- **Click a box** → the inspector shows the stage's aggregate (backend, op count,
+  the ops it owns) + a "How this stage works" note. Click a chip inside → the
+  per-op inspector. Clicking an op anywhere lights up its owning stage + layer box.
+- **Same animation/live data.** The stage/layer boxes are driven by the same
+  execution cursor and the same `--viz` SSE stream: as an op runs, its box lights
+  up (and its fill is tinted by that op's abs-mean, same as the grid).
+- **Where the stages come from (no new instrumentation).** The stage for each op is
+  derived at render time from the exported graph — `op` + the weight name in
+  `meta.weight` (`blk.{i}.attn_norm`→`RMSNorm`, `.attn_qkv/.attn_output`→`Attention`,
+  `.ffn_*`→`FFN`, `output_norm`→`Final RMSNorm`, `output/token_embd`→`Logits`,
+  `token_embd`→`Embedding`). The final norm / logits are recognised by weight name so
+  the residual chain's `layerOf` propagation can't fold them into the last layer.
+  This works identically for the structure graph, the `MINFER_TRACE` sample, and live.
 
 ## JSON format
 

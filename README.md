@@ -59,6 +59,7 @@ colored by backend + data magnitude, per-node tensor stats and heatmaps, logits
 top-5, and live inference over SSE:
 
 ![minfer inference graph visualization](docs/viz-demo.png)
+![minfer inference pipeline visualization](docs/viz-demo2.png)
 
 - **Live streaming**: `minfer --viz <model.gguf>` (default port 8081) serves the
   page + live SSE from a single process.

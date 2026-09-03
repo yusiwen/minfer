@@ -15,7 +15,7 @@ const OP_LABEL = {
   kvcache_store: "KV store", kvcache_load: "KV load", view: "view",
   reshape: "reshape", permute: "permute", swiglu: "swiglu",
   fused_bias_rope: "bias+rope", batch_matmul: "bmm",
-  fused_qkv: "QKV✚", fused_ffn: "FFN✚",
+  fused_qkv: "QKV✚", fused_ffn: "FFN✚", fused_qkv_norm: "QKV✚N",
 };
 
 const OP_EXPLAIN = {
@@ -33,6 +33,7 @@ const OP_EXPLAIN = {
   kvcache_store: "Write the current token's K/V into this layer's persistent cache region. Positions come from the positions input, so the graph topology is independent of context length.",
   kvcache_load: "Read all historical K/V from this layer's KV cache — O(1) incremental autoregressive read, avoiding recompute.",
   fused_qkv: "Decode fusion: concatenated wq|wk|wv matmul + bias + RoPE + KV write, one kernel (llama's attn_bias_rope_store).",
+  fused_qkv_norm: "Decode QKV fusion with per-head Q/K RMSNorm (Qwen3): concatenated wq|wk|wv matmul + per-head qk_norm + no-bias RoPE + KV write, one kernel.",
   fused_ffn: "Decode fusion: concatenated ffn_gate|ffn_up matmul + in-place swiglu, one kernel.",
   fused_bias_rope: "Fused bias + RoPE op.",
   view: "View node (not constructed in the current architecture).",
@@ -69,6 +70,13 @@ const state = {
   stepData: null,     // Map nodeId -> {stats, values, stride, n, dtype}
   live: false,        // P3 live (SSE) mode
   p2: null,
+  // Flow view (semantic reasoning pipeline)
+  viewMode: "graph",      // "graph" (op grid) | "flow"
+  flow: null,             // built in buildFlow()
+  flowBoxEls: new Map(),  // blockKey -> {g, rect, x, y, w, h, members}
+  flowLayerExpanded: false,
+  selectedBlock: null,    // Flow container key (when a stage/segment is selected)
+  panelNav: [],           // right-panel navigation stack: [{kind:"node"|"block", id|key}]
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -247,6 +255,11 @@ const canvas = document.getElementById("canvas");
 let nodeEls = [], edgeEls = [];
 
 function renderGraph() {
+  if (state.viewMode === "flow") { renderFlow(); return; }
+  renderGraphGrid();
+}
+
+function renderGraphGrid() {
   gNodes.textContent = ""; gEdges.textContent = "";
   nodeEls = []; edgeEls = [];
   const pos = layout();
@@ -319,6 +332,456 @@ function edgePath(s, d) {
   return `M ${sx} ${sy} C ${sx + dx} ${sy}, ${tx - dx} ${ty}, ${tx} ${ty}`;
 }
 
+/* ================================================================
+ * Flow 视图：语义推理流水线
+ * 每个框 = 一个函数 / 语义阶段（Input / Embedding / 每层 [norm→attn→ffn] /
+ * Final Norm / Logits / Sampler）。从算子图 + 权重名派生，无需新仪器。
+ * 复用现有播放 / 直播数据：执行某一算子时点亮其所属的阶段框 + 层框。
+ * ================================================================ */
+
+const STAGE_NAME = {
+  norm1: "RMSNorm", norm2: "RMSNorm", attn: "Attention",
+  add_attn: "+ Residual", add_ffn: "+ Residual", ffn: "FFN",
+  add: "+ Residual", other: "Other",
+};
+const STAGE_ORDER = { norm1: 1, attn: 2, add_attn: 3, norm2: 4, ffn: 5, add_ffn: 6, other: 7, add: 3 };
+
+const CHIP_W = 74, CHIP_H = 16, CHIP_GX = 6, CHIP_GY = 4, CHIPS_PER_ROW = 2;
+const SEG_W = 200, SEG_HDR = 44, SEG_GAP = 64, STAGE_GAP = 24, BOX_PAD = 10, LAYER_GAP = 34, LABEL_H = 18;
+const STAGE_MIN_W = 130, LAYER_PAD = 14;
+
+/* 一个 op 属于哪个语义阶段（依赖 meta.weight + op）。 */
+function stageOfNode(n) {
+  const op = n.op;
+  const w = String((n.meta && n.meta.weight) || "");
+  if (op === "rms_norm") return /attn_norm|input_layernorm/.test(w) ? "norm1" : "norm2";
+  if (op === "qk_norm") return "norm1";
+  if (op === "rope" || op === "attn" || op === "kvcache_store" || op === "kvcache_load" || op === "fused_bias_rope" || op === "fused_qkv" || op === "fused_qkv_norm") return "attn";
+  if (op === "matmul") {
+    if (/ffn|_gate|_up|_down|ffn_gu/.test(w)) return "ffn";
+    if (/attn|qkv|q_proj|k_proj|v_proj|attn_output|output/.test(w)) return "attn";
+    return "other";
+  }
+  if (op === "silu" || op === "mul" || op === "swiglu" || op === "fused_ffn") return "ffn";
+  if (op === "add") return "add"; // 由 srcs 再解析
+  return "other";
+}
+
+/* 由算子图派生 flow 结构（phase / layer / sub-stage，以及 op→block 映射）。 */
+function buildFlow() {
+  const nodes = state.nodes, byId = state.byId;
+  const phaseOf = new Map(), layerOf = new Map(), sub = new Map();
+  let maxLayer = -1, firstLayer = Infinity, layerCount = 0;
+  for (const n of nodes) {
+    const op = n.op;
+    let phase;
+    if (op === "input") phase = "input";
+    else if (op === "get_rows") phase = "embed";
+    else {
+      const w = String((n.meta && n.meta.weight) || "");
+      // final norm / logits 按权重名单独识别 —— `prepare` 的 layerOf 会把残差
+      // 链上的 output_norm / logits matmul 也传播进最后一层，不能靠 layer 判定。
+      if (op === "rms_norm" && /output_norm|model\.norm|final_norm/.test(w)) phase = "final_norm";
+      else if (op === "matmul" && !/^blk\./.test(w) && /output|lm_head|token_embd/.test(w)) phase = "logits";
+      else if (op === "add") {
+        // 位置嵌入 add：src 全部来自 input/embed → 并入 embed 段
+        let allEmbed = n.src.length > 0;
+        for (const s of n.src) { const p = phaseOf.get(s); if (p !== "input" && p !== "embed") { allEmbed = false; break; } }
+        phase = allEmbed ? "embed" : (n.layer === null || n.layer === undefined ? "other" : "layer");
+      }
+      else if (n.layer === null || n.layer === undefined) phase = (op === "matmul" ? "logits" : (op === "rms_norm" ? "final_norm" : "other"));
+      else phase = "layer";
+    }
+    phaseOf.set(n.id, phase);
+    const L = n.layer;
+    layerOf.set(n.id, L);
+    let s = phase;
+    if (phase === "layer") {
+      s = stageOfNode(n);
+      if (s === "add") {
+        let attn = false, ffn = false;
+        for (const src of n.src) {
+          const ss = sub.get(src);
+          if (ss === "ffn") { ffn = true; break; }
+          if (ss === "attn" || ss === "add_attn") attn = true;
+        }
+        s = ffn ? "add_ffn" : (attn ? "add_attn" : "add");
+      }
+    }
+    sub.set(n.id, s);
+    if (phase === "layer") { if (L !== null && L !== undefined) { maxLayer = Math.max(maxLayer, L); firstLayer = Math.min(firstLayer, L); } }
+  }
+
+  // 收集各 bucket 的算子 id（按 id 升序 = 构建/执行序）
+  const buckets = { input: [], embed: [], final_norm: [], logits: [], other: [] };
+  const layerBuckets = new Map();  // layer -> { stage: Map<sub, [id]> , ids: [] }
+  for (const n of nodes) {
+    const ph = phaseOf.get(n.id);
+    if (ph === "layer") {
+      const L = layerOf.get(n.id);
+      let lb = layerBuckets.get(L);
+      if (!lb) { lb = { layer: L, stages: new Map(), ids: [] }; layerBuckets.set(L, lb); }
+      lb.ids.push(n.id);
+      const s = sub.get(n.id);
+      if (!lb.stages.has(s)) lb.stages.set(s, []);
+      lb.stages.get(s).push(n.id);
+    } else {
+      buckets[ph].push(n.id);
+    }
+  }
+
+  // 有层数则按层编号排序
+  const layers = [...layerBuckets.values()].sort((a, b) => (a.layer - b.layer));
+  layerCount = layers.length;
+
+  // 组装 segments
+  const segments = [];
+  segments.push({ key: "input", type: "seg", name: "Input", caption: "token_ids · positions", ids: buckets.input });
+  segments.push({ key: "embed", type: "seg", name: "Embedding", caption: "token_embd lookup", ids: buckets.embed });
+  const layersSeg = {
+    key: "layers", type: "layers", name: "Transformer Layers",
+    count: layerCount, allIds: layers.flatMap(l => l.ids),
+    layers: layers.map(l => ({
+      layer: l.layer, ids: l.ids,
+      stages: [...l.stages.entries()].map(([k, ids]) => ({ key: k, name: STAGE_NAME[k] || k, ids }))
+            .sort((a, b) => (STAGE_ORDER[a.key] || 9) - (STAGE_ORDER[b.key] || 9)),
+    })),
+  };
+  segments.push(layersSeg);
+  segments.push({ key: "final_norm", type: "seg", name: "Final RMSNorm", caption: "pre-logits norm", ids: buckets.final_norm });
+  segments.push({ key: "logits", type: "seg", name: "Logits", caption: "lm_head matmul", ids: buckets.logits });
+  if (buckets.other.length) segments.push({ key: "other", type: "seg", name: "Other", caption: "unclassified", ids: buckets.other });
+  if (state.doc && state.doc.kind === "decode") segments.push({ key: "sample", type: "seg", name: "Sampler", caption: "top-k → next token", ids: [], synthetic: true });
+
+  // op -> block 映射
+  const blockKeyOf = new Map(), layerKeyOf = new Map();
+  for (const n of nodes) {
+    const ph = phaseOf.get(n.id);
+    if (ph === "layer") {
+      blockKeyOf.set(n.id, `stage:${layerOf.get(n.id)}:${sub.get(n.id)}`);
+      layerKeyOf.set(n.id, `layer:${layerOf.get(n.id)}`);
+    } else {
+      blockKeyOf.set(n.id, `seg:${ph}`);
+      layerKeyOf.set(n.id, null);
+    }
+  }
+
+  state.flow = {
+    segments, blockKeyOf, layerKeyOf, phaseOf, sub, layerOf,
+    firstLayer, maxLayer, layerCount,
+    stageName: (k) => STAGE_NAME[k] || k,
+  };
+}
+
+/* 一组算子的聚合信息：主导后端 + 一句 sub（该阶段的体量/参数）。 */
+function flowAggregate(ids, stageKey) {
+  let ncpu = 0, nmetal = 0, ncuda = 0;
+  let dim = "", nhead = "", hd = "", nf = "", vocab = "", kind = "";
+  for (const id of (ids || [])) {
+    const n = state.byId.get(id); if (!n) continue;
+    const m = n.meta || {};
+    if (n.backend === "metal") nmetal++; else if (n.backend === "cuda") ncuda++; else if (n.backend === "cpu") ncpu++;
+    if (m.in_dim !== undefined) dim = `${m.in_dim}×${m.out_dim !== undefined ? m.out_dim : (m.nf !== undefined ? m.nf : "…")}`;
+    if (m.n_head !== undefined) nhead = m.n_head;
+    if (m.hd !== undefined) hd = m.hd;
+    if (m.nf !== undefined) nf = m.nf;
+    if (m.vocab_size !== undefined) vocab = m.vocab_size;
+    if (m.mode) kind = `${m.mode}`;
+  }
+  const backend = (nmetal && nmetal >= ncpu && nmetal >= ncuda) ? "metal"
+    : (ncuda && ncuda >= ncpu) ? "cuda"
+    : (ncpu ? "cpu" : "none");
+  let sub = `${(ids || []).length} op${(ids || []).length !== 1 ? "s" : ""}`;
+  if (stageKey === "attn") sub += ` · h=${nhead} hd=${hd}`;
+  if (stageKey === "ffn") sub += ` · nf=${nf}`;
+  if (stageKey === "embed") sub += ` · vocab=${vocab}`;
+  if (stageKey === "logits") sub += ` · in×out=${dim}`;
+  if (!sub && kind) sub = kind;
+  return { backend, sub, dim };
+}
+
+/* 每个算子在 flow 里的一个小框（可点选，复用现有 inspector）。 */
+function flowOp(id, x, y, w, h) {
+  const n = state.byId.get(id);
+  const label = OP_LABEL[n.op] || n.op;
+  const fused = n.op.startsWith("fused") || n.op === "swiglu";
+  const g = el("g", { class: "flow-op backend-" + (n.backend || "none") + (fused ? " fused" : "") }, gNodes);
+  g.setAttribute("data-id", id);
+  el("rect", { x, y, width: w, height: h, rx: 4 }, g);
+  el("text", { class: "flow-op-label", x: x + w / 2, y: y + h / 2 + 3 }, g).textContent = label;
+  const title = el("title", {}, g);
+  title.textContent = `${n.name}\n${label} · ${shapeStr(n.shape)} ${n.dtype}\nbackend: ${BACKEND_NAME[n.backend || "none"]}`;
+  g.addEventListener("click", ev => { ev.stopPropagation(); selectNode(id); });
+  nodeEls[id] = g;
+  return g;
+}
+
+/* 一个可点选的 flow 容器框（阶段 / 段）。 */
+function flowContainer(key, x, y, w, h, o) {
+  const g = el("g", { class: "flow-box backend-" + (o.backend || "none") }, gNodes);
+  g.setAttribute("data-block", key);
+  const rect = el("rect", { class: "flow-box-rect", x, y, width: w, height: h, rx: 8 }, g);
+  el("text", { class: "flow-box-label", x: x + BOX_PAD, y: y + 15 }, g).textContent = o.label;
+  if (o.sub) el("text", { class: "flow-box-sub", x: x + BOX_PAD, y: y + 28 }, g).textContent = o.sub;
+  if (o.dim) el("text", { class: "flow-dim", x: x + BOX_PAD, y: y + 38 }, g).textContent = o.dim;
+  const title = el("title", {}, g);
+  title.textContent = `${o.label}${(o.members && o.members.length) ? ` · ${o.members.length} ops` : ""}${o.sub ? `\n${o.sub}` : ""}`;
+  if (o.onClick) g.addEventListener("click", ev => { ev.stopPropagation(); o.onClick(); });
+  state.flowBoxEls.set(key, { g, rect, x, y, w, h, members: o.members || [], label: o.label });
+  return g;
+}
+
+function flowLayerContainer(key, x, y, w, h, o) {
+  // Layer 容器只是"分组框"：半透明底 + 细边框（不整块染色/不遮内容），stage 框画在其上。
+  const g = el("g", { class: "flow-layer" }, gNodes);
+  g.setAttribute("data-block", key);
+  const rect = el("rect", { class: "flow-layer-bg", x, y, width: w, height: h, rx: 8 }, g);
+  el("text", { class: "flow-layer-label", x: x + LAYER_PAD, y: y + 13 }, g).textContent = o.label;
+  g.addEventListener("click", ev => { ev.stopPropagation(); o.onClick(); });
+  state.flowBoxEls.set(key, { g, rect, x, y, w, h, members: o.members || [], label: o.label });
+  return g;
+}
+
+function stageGeom(st, x, y) {
+  const ids = st.ids;
+  const cols = Math.min(CHIPS_PER_ROW, Math.max(1, ids.length));
+  const rows = Math.ceil(ids.length / Math.max(1, cols));
+  const chipH = rows ? rows * (CHIP_H + CHIP_GY) - CHIP_GY : 0;
+  const h = SEG_HDR + chipH + BOX_PAD;
+  const gridW = cols * (CHIP_W + CHIP_GX) - CHIP_GX + BOX_PAD * 2;
+  const w = Math.max(STAGE_MIN_W, gridW);
+  return { x, y, w, h };
+}
+
+function drawVArrow(a, b) {
+  const ax = a.x + a.w / 2, ay = a.y + a.h, by = b.y;
+  el("path", { class: "flow-arrow", d: `M ${ax} ${ay} L ${ax} ${by - 9} M ${ax} ${by - 9} L ${ax - 5} ${by - 15} M ${ax} ${by - 9} L ${ax + 5} ${by - 15}` }, gEdges);
+}
+function drawHArrow(a, b, y) {
+  const ax = a.x + a.w, bx = b.x;
+  el("path", { class: "flow-arrow", d: `M ${ax} ${y} L ${bx - 6} ${y} M ${bx - 6} ${y} L ${bx - 12} ${y - 5} M ${bx - 6} ${y} L ${bx - 12} ${y + 5}` }, gEdges);
+}
+
+function drawStageBox(st, x, y, layer) {
+  const key = `stage:${layer}:${st.key}`;
+  const ids = st.ids;
+  const agg = flowAggregate(ids, st.key);
+  const geom = stageGeom(st, x, y);
+  const w = geom.w, h = geom.h;
+  const g = flowContainer(key, x, y, w, h, {
+    label: STAGE_NAME[st.key] || st.key, sub: agg.sub, dim: agg.dim ? `in×out ${agg.dim}` : "",
+    backend: agg.backend, members: ids, onClick: () => flowSelectBlock(key),
+  });
+  let cx = x + BOX_PAD, cy = y + SEG_HDR;
+  ids.forEach((id, i) => {
+    if (i > 0 && i % CHIPS_PER_ROW === 0) { cx = x + BOX_PAD; cy += CHIP_H + CHIP_GY; }
+    flowOp(id, cx, cy, CHIP_W, CHIP_H);
+    cx += CHIP_W + CHIP_GX;
+  });
+  return { key, x, y, w, h };
+}
+
+function drawLayerRow(layer, x, y) {
+  // pass 1: 计算各 stage 框位置/尺寸（不绘制），以便先把 layer 分组框垫底。
+  const pad = LAYER_PAD;
+  const geoms = [];
+  let cx = x + pad, boxH = 0, innerTop = y + LABEL_H + pad;
+  for (const st of layer.stages) {
+    const g = stageGeom(st, cx, innerTop);
+    geoms.push(g);
+    boxH = Math.max(boxH, g.h);
+    cx = g.x + g.w + STAGE_GAP;
+  }
+  const w = cx - STAGE_GAP - x + pad;       // 左右各留 pad 内边距
+  const h = LABEL_H + pad + boxH + pad;      // 标签 + 上下 pad + 框体
+  const key = "layer:" + layer.layer;
+  // 先画 layer 分组框（垫底），再让 stage 框/算子画在其上，避免被盖住。
+  flowLayerContainer(key, x, y, w, h, { label: `Layer ${layer.layer}`, members: layer.ids, onClick: () => flowSelectBlock(key) });
+  for (let i = 0; i < layer.stages.length; i++) drawStageBox(layer.stages[i], geoms[i].x, geoms[i].y, layer.layer);
+  for (let i = 1; i < layer.stages.length; i++) drawHArrow(geoms[i - 1], geoms[i], innerTop + boxH / 2);
+  return { key, x, y, w, h };
+}
+
+function drawSegBox(seg, x, y) {
+  const key = "seg:" + seg.key;
+  const ids = seg.ids || [];
+  const agg = flowAggregate(ids, seg.key);
+  const rows = Math.ceil(ids.length / CHIPS_PER_ROW);
+  const chipH = rows ? rows * (CHIP_H + CHIP_GY) - CHIP_GY : 0;
+  const h = SEG_HDR + chipH + BOX_PAD;
+  const w = Math.max(SEG_W, CHIPS_PER_ROW * (CHIP_W + CHIP_GX) - CHIP_GX + BOX_PAD * 2);
+  const dimTxt = seg.synthetic ? "" : (agg.dim ? `in×out ${agg.dim}` : "");
+  flowContainer(key, x, y, w, h, {
+    label: seg.name, sub: seg.synthetic ? (seg.caption || "sample") : agg.sub,
+    dim: dimTxt, backend: agg.backend, members: ids, onClick: () => flowSelectBlock(key),
+  });
+  if (!seg.synthetic) {
+    let cx = x + BOX_PAD, cy = y + SEG_HDR;
+    ids.forEach((id, i) => {
+      if (i > 0 && i % CHIPS_PER_ROW === 0) { cx = x + BOX_PAD; cy += CHIP_H + CHIP_GY; }
+      flowOp(id, cx, cy, CHIP_W, CHIP_H);
+      cx += CHIP_W + CHIP_GX;
+    });
+  }
+  return { key, x, y, w, h };
+}
+
+function drawLayersSegment(seg, x, y) {
+  if (!state.flowLayerExpanded) {
+    const n = seg.count, w = SEG_W, h = 58;
+    const agg = flowAggregate(seg.allIds);
+    const key = "seg:layers";
+    flowContainer(key, x, y, w, h, {
+      label: `${seg.name}  × ${n}`, sub: agg.sub, dim: "click to expand",
+      backend: agg.backend, members: seg.allIds || [],
+      onClick: () => toggleFlowLayers(),
+    });
+    return { key, x, y, w, h };
+  }
+  const label = el("text", { class: "flow-layer-label", x: x + BOX_PAD, y: y + 4 }, gNodes);
+  label.textContent = `${seg.name}  × ${seg.count}  (click to collapse)`;
+  label.classList.add("flow-clickable");
+  label.addEventListener("click", () => toggleFlowLayers());
+  let ly = y + 18;
+  let prev = null, maxW = SEG_W;
+  for (const layer of seg.layers) {
+    const row = drawLayerRow(layer, x, ly);
+    if (prev) drawVArrow(prev, row);
+    prev = row;
+    ly = row.y + row.h + LAYER_GAP;
+    maxW = Math.max(maxW, row.w);
+  }
+  return { key: "seg:layers", x, y, w: maxW, h: ly - y - LAYER_GAP, members: seg.allIds || [] };
+}
+
+function toggleFlowLayers() {
+  state.flowLayerExpanded = !state.flowLayerExpanded;
+  renderFlow();
+  restoreExec();
+  fit();
+}
+
+function setFlowBounds() { /* bounds are stored on flowBoxEls; used by fit() */ }
+
+function renderFlow() {
+  // 没有加载任何图（空态）：清空画布，什么都不画，让 #empty-hint 干净地显示。
+  if (!state.nodes.length) {
+    gNodes.textContent = ""; gEdges.textContent = "";
+    nodeEls = []; edgeEls = [];
+    state.flowBoxEls = new Map();
+    return;
+  }
+  if (!state.flow) buildFlow();
+  const f = state.flow;
+  gNodes.textContent = ""; gEdges.textContent = "";
+  nodeEls = []; edgeEls = [];
+  state.flowBoxEls = new Map();
+  const X0 = 96;
+  let y = 46;
+  let prev = null;
+  for (const seg of f.segments) {
+    const box = seg.type === "layers" ? drawLayersSegment(seg, X0, y) : drawSegBox(seg, X0, y);
+    if (prev) drawVArrow(prev, box);
+    prev = box;
+    y = Math.max(y, box.y + box.h) + SEG_GAP;
+  }
+}
+
+/* 选一个 flow 框 → 面板显示聚合（成员 op 列表 + 体量）。画布点选 = 全新浏览。 */
+function flowSelectBlock(key) {
+  if (state.selectedBlock !== key) state.panelNav = [];
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
+  const b = state.flowBoxEls.get(key);
+  if (b) b.g.classList.add("selected");
+  state.selected = null;
+  state.selectedBlock = key;
+  renderFlowPanel(key);
+}
+
+function renderFlowPanel(key) {
+  const b = state.flowBoxEls.get(key);
+  const body = document.getElementById("panel-body");
+  if (!b) return;
+  const members = b.members || [];
+  let h = `<div class="node-header">${backBtnHtml()}<h3>${htmlEscape(b.label)}</h3>`;
+  h += `<span class="badge flow">flow · ${members.length} ops</span></div>`;
+  if (members.length) {
+    const agg = flowAggregate(members);
+    h += `<table class="kv-table">`;
+    h += row("Backend", BACKEND_NAME[agg.backend]);
+    h += row("Ops", members.length);
+    h += row("Op params", htmlEscape(members.map(id => state.byId.get(id).op).join(" · ")));
+    h += `</table>`;
+    h += `<div class="section-title">Contained ops</div><div class="link-list">`;
+    h += members.map(id => {
+      const n = state.byId.get(id);
+      return `<span class="link-node" data-id="${id}">#${id} ${htmlEscape(n.name)}</span>`;
+    }).join(" ");
+    h += `</div>`;
+    h += `<div class="section-title">How this stage works</div>`;
+    h += `<div class="explain">${OP_EXPLAIN[members[0] ? state.byId.get(members[0]).op : ""] || "(aggregate of ops above)"}</div>`;
+  } else {
+    h += `<div class="explain">Synthetic step box — the sampler picks the next token from the logits distribution.</div>`;
+    if (state.trace) {
+      const phase = state.phases[state.phaseIdx];
+      const step = phase && phase.steps ? phase.steps[state.stepIdx] : null;
+      if (step) h += stepSummaryHtml(step);
+    }
+  }
+  body.innerHTML = h;
+  body.querySelectorAll(".link-node").forEach(s => s.addEventListener("click", () => navigateNode(parseInt(s.dataset.id, 10))));
+  wireBackBtn(body);
+}
+
+/* 点亮某算子所属的阶段框 + 层框（执行态）。 */
+function flowLight(id) {
+  if (state.viewMode !== "flow") return;
+  const f = state.flow; if (!f) return;
+  for (const k of [f.blockKeyOf.get(id), f.layerKeyOf.get(id)]) {
+    if (!k) continue;
+    const b = state.flowBoxEls.get(k);
+    if (b) b.g.classList.add("executed");
+  }
+}
+/* 按该算子数据的 abs-mean 给所属框染色。 */
+function flowTint(id) {
+  if (state.viewMode !== "flow") return;
+  const f = state.flow; if (!f) return;
+  const d = state.stepData && state.stepData.get(id);
+  if (!d || !d.stats) return;
+  const a = Math.abs(d.stats.absmean);
+  const t = Math.min(Math.max((Math.log10(a + 1e-9) + 6) / 8, 0), 1);
+  const hue = 240 - t * 240;
+  // 浅填充：固定 lightness/saturation，只让 hue 表现量级（蓝→红），
+  // 这样配深色文字在任何色相下都有强对比。
+  const fill = `hsl(${hue}, 55%, 62%)`;
+  // 只染阶段框（携带内容与颜色）；layer 分组框保持半透明细边框不整块染色。
+  const k = f.blockKeyOf.get(id);
+  const b = k ? state.flowBoxEls.get(k) : null;
+  if (b) { b.rect.style.fill = fill; b.g.classList.add("executed"); }
+}
+
+/* 在 flow 渲染后恢复当前执行态（直播用 live 数据，否则从 cursor 重放）。 */
+function restoreExec() {
+  if (state.live) { applyLivePhaseState(); return; }
+  if (state.cursor >= 0 && state.order.length) syncExecutionState();
+}
+
+function setViewMode(m) {
+  if (state.viewMode === m) return;
+  state.viewMode = m;
+  const a = document.getElementById("view-dataflow"), b = document.getElementById("view-flow");
+  a.classList.toggle("active", m === "graph");
+  b.classList.toggle("active", m === "flow");
+  if (m === "flow") { if (!state.flow) buildFlow(); }
+  renderGraph();
+  restoreExec();
+  applyFilters();
+  fit();
+  updateStepInfo();
+  buildLegend();
+}
+
 /* ---------------- 动画 ---------------- */
 
 function setPlaying(on) {
@@ -351,16 +814,17 @@ function stepForward() {
   if (state.cursor >= state.order.length - 1) return;
   state.cursor++;
   const id = state.order[state.cursor];
-  // 已执行样式
-  nodeEls[id].classList.remove("ready", "current");
-  nodeEls[id].classList.add("executed");
+  // 已执行样式（flow 折叠态可能未绘制该 op，nodeEls[id] 可能缺失 → 仅点亮所属框）
+  const g = nodeEls[id];
+  if (g) { g.classList.remove("ready", "current"); g.classList.add("executed"); }
   applyTint(id);
+  flowLight(id);
   // 入边点亮
   const node = state.byId.get(id);
   for (const s of node.src) {
     const key = s + ">" + id;
     const e = state.edgeById.get(key);
-    if (e) edgeEls[e.id].classList.add("executed");
+    if (e && edgeEls[e.id]) edgeEls[e.id].classList.add("executed");
   }
   // 更新 ready 集
   updateReady(id);
@@ -385,12 +849,12 @@ function stepBack() {
 
 function updateReady(executedId) {
   for (const c of state.consumers[executedId]) {
-    if (nodeEls[c].classList.contains("executed")) continue;
+    if (!nodeEls[c] || nodeEls[c].classList.contains("executed")) continue;
     let all = true;
     for (const s of state.byId.get(c).src) {
-      if (!nodeEls[s].classList.contains("executed")) { all = false; break; }
+      if (!nodeEls[s] || !nodeEls[s].classList.contains("executed")) { all = false; break; }
     }
-    if (all) nodeEls[c].classList.add("ready");
+    if (all && nodeEls[c]) nodeEls[c].classList.add("ready");
   }
 }
 
@@ -406,8 +870,12 @@ function updateStepInfo() {
 /* ---------------- 选中 / 面板 ---------------- */
 
 function selectNode(id) {
+  // 画布上直接点选任意节点 = 一次全新浏览，清空导航栈（无 back）。
+  state.panelNav = [];
   state.selected = id;
+  state.selectedBlock = null;
   for (const g of nodeEls) if (g) g.classList.remove("selected");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
   nodeEls[id].classList.add("selected");
   try {
     renderPanel(id);
@@ -416,9 +884,71 @@ function selectNode(id) {
   }
 }
 
+// 面板内从"分组"钻到"单节点"（Contained ops / upstream-downstream 链接）：
+// 把当前视图压栈，这样左上角的 Back 能回到之前的面板。
+function navigateNode(id) {
+  const cur = currentView();
+  if (cur) state.panelNav.push(cur);
+  state.selected = id;
+  state.selectedBlock = null;
+  for (const g of nodeEls) if (g) g.classList.remove("selected");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
+  if (nodeEls[id]) nodeEls[id].classList.add("selected");
+  renderPanel(id);
+}
+
+function navigateBlock(key) {
+  const cur = currentView();
+  if (cur) state.panelNav.push(cur);
+  state.selected = null;
+  state.selectedBlock = key;
+  for (const g of nodeEls) if (g) g.classList.remove("selected");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
+  const b = state.flowBoxEls.get(key);
+  if (b) b.g.classList.add("selected");
+  renderFlowPanel(key);
+}
+
+function currentView() {
+  if (state.selectedBlock) return { kind: "block", key: state.selectedBlock };
+  if (state.selected !== null) return { kind: "node", id: state.selected };
+  return null;
+}
+
+// Back：弹出导航栈并渲染上一个视图。
+function goBack() {
+  const prev = state.panelNav.pop();
+  if (!prev) return;
+  for (const g of nodeEls) if (g) g.classList.remove("selected");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
+  if (prev.kind === "block") {
+    state.selected = null; state.selectedBlock = prev.key;
+    const b = state.flowBoxEls.get(prev.key);
+    if (b) b.g.classList.add("selected");
+    renderFlowPanel(prev.key);
+  } else {
+    state.selected = prev.id; state.selectedBlock = null;
+    if (nodeEls[prev.id]) nodeEls[prev.id].classList.add("selected");
+    renderPanel(prev.id);
+  }
+}
+
+function backBtnHtml() {
+  return state.panelNav.length
+    ? '<button class="panel-back" title="Back to the previous panel">← Back</button>'
+    : "";
+}
+function wireBackBtn(body) {
+  const b = body.querySelector(".panel-back");
+  if (b) b.addEventListener("click", () => goBack());
+}
+
 function deselect() {
   state.selected = null;
+  state.selectedBlock = null;
+  state.panelNav = [];
   for (const g of nodeEls) if (g) g.classList.remove("selected");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
   document.getElementById("panel-body").innerHTML =
     '<div class="placeholder">Click any node to view that step\'s data</div>';
 }
@@ -442,7 +972,7 @@ function renderPanel(id) {
     }
   }
 
-  h += `<div class="node-header"><h3>${htmlEscape(n.name)}</h3>`;
+  h += `<div class="node-header">${backBtnHtml()}<h3>${htmlEscape(n.name)}</h3>`;
   h += `<span class="badge op">${htmlEscape(n.op)}</span>`;
   h += `<span class="badge ${n.backend || "none"}">${BACKEND_NAME[n.backend || "none"]}</span>`;
   if (fused) h += `<span class="badge fused">fused</span>`;
@@ -486,8 +1016,9 @@ function renderPanel(id) {
   if (step) h += stepSummaryHtml(step);
   body.innerHTML = h;
   body.querySelectorAll(".link-node").forEach(s => {
-    s.addEventListener("click", () => selectNode(parseInt(s.dataset.id, 10)));
+    s.addEventListener("click", () => navigateNode(parseInt(s.dataset.id, 10)));
   });
+  wireBackBtn(body);
 }
 
 function row(k, v) { return `<tr><th>${k}</th><td>${v || "—"}</td></tr>`; }
@@ -564,6 +1095,7 @@ function applyFilters() {
   }
   for (const e of state.edges) {
     const p = edgeEls[e.id];
+    if (!p) continue; // flow 视图不绘制逐算子边
     const srcN = state.byId.get(e.src), dstN = state.byId.get(e.dst);
     let hide = false;
     if (!state.filters.kv && p.classList.contains("kv")) hide = true;
@@ -579,6 +1111,7 @@ function setView() {
     `translate(${state.view.x} ${state.view.y}) scale(${state.view.k})`);
 }
 function fit() {
+  if (state.viewMode === "flow") { fitFlow(); return; }
   const wrap = document.getElementById("canvas-wrap");
   const W = wrap.clientWidth, H = wrap.clientHeight;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, any = false;
@@ -606,13 +1139,34 @@ function fit() {
   setView();
 }
 
+function fitFlow() {
+  const wrap = document.getElementById("canvas-wrap");
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, any = false;
+  for (const [, b] of state.flowBoxEls) {
+    if (b.g.classList.contains("hidden")) continue;
+    minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
+    maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
+    any = true;
+  }
+  if (!any) { state.view = { x: 30, y: 30, k: 1 }; setView(); return; }
+  const pad = 60;
+  const winW = Math.max(W - pad * 2, 40);
+  const winH = Math.max(H - pad * 2, 40);
+  const k = Math.min(winW / (maxX - minX + 40), winH / (maxY - minY + 40), 1.6);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  state.view = { x: W / 2 - cx * k, y: H / 2 - cy * k, k };
+  setView();
+}
+
 function initPanZoom() {
   let dragging = false, sx = 0, sy = 0, vx = 0, vy = 0;
   canvas.addEventListener("pointerdown", e => {
-    // Let node clicks through: setPointerCapture here would retarget the pointer
+    // Let node/box clicks through: setPointerCapture here would retarget the pointer
     // (and the resulting click) to the canvas, so the node's click handler never
-    // fires and selecting a node by a real mouse click silently fails.
-    if (e.target.closest(".node-group")) return;
+    // fires and selecting a node by a real mouse click silently fails. The grid
+    // uses .node-group; the Pipeline view uses .flow-box / .flow-op / .flow-clickable.
+    if (e.target.closest(".node-group, .flow-box, .flow-op, .flow-layer, .flow-clickable")) return;
     dragging = true; sx = e.clientX; sy = e.clientY; vx = state.view.x; vy = state.view.y;
     canvas.classList.add("panning");
     canvas.setPointerCapture(e.pointerId);
@@ -661,6 +1215,9 @@ async function loadDoc(doc) {
   state.cursor = -1;
   state.collapsed = new Set();
   state.selected = null;
+  state.flow = null;
+  state.flowLayerExpanded = false;
+  state.selectedBlock = null;
 
   document.getElementById("doc-title").textContent =
     `${doc.model} · ${doc.kind} · ${doc.nodes.length} nodes`;
@@ -690,6 +1247,9 @@ function loadPhase(pi) {
   state.collapsed = new Set();
   state.selected = null;
   state.stepIdx = 0;
+  state.flow = null;
+  state.flowLayerExpanded = false;
+  state.selectedBlock = null;
 
   document.getElementById("tracebar").hidden = false;
   renderTracebar();
@@ -723,8 +1283,8 @@ function loadStep(si) {
   state.cursor = -1;
   if (!state.live && nodeEls.length) {
     clearTints();
-    for (const n of state.nodes) nodeEls[n.id].classList.remove("executed", "ready", "current");
-    for (const e of state.edges) edgeEls[e.id].classList.remove("executed", "current");
+    for (const n of state.nodes) if (nodeEls[n.id]) nodeEls[n.id].classList.remove("executed", "ready", "current");
+    for (const e of state.edges) if (edgeEls[e.id]) edgeEls[e.id].classList.remove("executed", "current");
   }
   const slider = document.getElementById("step-slider");
   slider.max = Math.max(0, steps.length - 1);
@@ -840,21 +1400,22 @@ function renderStepPanel(step) {
 function syncExecutionState() {
   if (!nodeEls.length) return;
   clearTints();
-  for (const n of state.nodes) nodeEls[n.id].classList.remove("executed", "ready", "current");
-  for (const e of state.edges) edgeEls[e.id].classList.remove("executed", "current");
+  for (const n of state.nodes) if (nodeEls[n.id]) nodeEls[n.id].classList.remove("executed", "ready", "current");
+  for (const e of state.edges) if (edgeEls[e.id]) edgeEls[e.id].classList.remove("executed", "current");
   const rem = state.nodes.map(n => n.src.length);
   for (let i = 0; i <= state.cursor; i++) {
     const id = state.order[i];
-    nodeEls[id].classList.add("executed");
+    if (nodeEls[id]) nodeEls[id].classList.add("executed");
     applyTint(id);
+    flowLight(id);
     const node = state.byId.get(id);
     for (const s of node.src) {
       const e = state.edgeById.get(s + ">" + id);
-      if (e) edgeEls[e.id].classList.add("executed");
+      if (e && edgeEls[e.id]) edgeEls[e.id].classList.add("executed");
     }
     for (const c of state.consumers[id]) {
       rem[c]--;
-      if (rem[c] === 0 && c > state.cursor) nodeEls[c].classList.add("ready");
+      if (rem[c] === 0 && c > state.cursor && nodeEls[c]) nodeEls[c].classList.add("ready");
     }
   }
 }
@@ -873,12 +1434,17 @@ function applyTint(id) {
   } else {
     rect.style.fill = "";
   }
+  flowTint(id);
 }
 
 function clearTints() {
   for (const n of state.nodes) {
     const rect = nodeEls[n.id] && nodeEls[n.id].querySelector("rect");
     if (rect) rect.style.fill = "";
+  }
+  for (const [, b] of state.flowBoxEls) {
+    if (b.rect) b.rect.style.fill = "";
+    b.g.classList.remove("executed", "current");
   }
 }
 
@@ -901,6 +1467,7 @@ function applyLivePhaseState() {
     if (g.classList.contains("hidden")) continue;
     g.classList.add("executed");
     applyTint(n.id);
+    flowLight(n.id);
   }
 }
 
@@ -1023,6 +1590,7 @@ function handleLiveEvent(ev) {
       if (!state.stepData) state.stepData = new Map();
       state.stepData.set(ev.id, rec);
       applyTint(ev.id);
+      flowLight(ev.id);
       break;
     }
     case "step": {
@@ -1052,8 +1620,8 @@ async function runLive() {
   state.stepData = new Map();
   if (nodeEls.length) {
     clearTints();
-    for (const n of state.nodes) nodeEls[n.id].classList.remove("executed", "ready", "current");
-    for (const e of state.edges) edgeEls[e.id].classList.remove("executed", "current");
+    for (const n of state.nodes) if (nodeEls[n.id]) nodeEls[n.id].classList.remove("executed", "ready", "current");
+    for (const e of state.edges) if (edgeEls[e.id]) edgeEls[e.id].classList.remove("executed", "current");
   }
   renderTokenStrip();
   deselect();
@@ -1167,6 +1735,10 @@ function init() {
     });
   }
 
+  // 视图切换 Operators / Pipeline
+  document.getElementById("view-dataflow").addEventListener("click", () => setViewMode("graph"));
+  document.getElementById("view-flow").addEventListener("click", () => setViewMode("flow"));
+
   // 键盘
   window.addEventListener("keydown", e => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
@@ -1244,12 +1816,38 @@ function init() {
 }
 
 function resetPlayback() {
-  for (const n of state.nodes) nodeEls[n.id].classList.remove("executed", "ready", "current");
-  for (const e of state.edges) edgeEls[e.id].classList.remove("executed", "current");
+  for (const n of state.nodes) if (nodeEls[n.id]) nodeEls[n.id].classList.remove("executed", "ready", "current");
+  for (const e of state.edges) if (edgeEls[e.id]) edgeEls[e.id].classList.remove("executed", "current");
+  for (const [, b] of state.flowBoxEls) b.g.classList.remove("executed", "current");
   updateStepInfo();
 }
 
 function buildLegend() {
+  const title = document.getElementById("legend-title-text");
+  if (state.viewMode === "flow") {
+    if (title) title.textContent = "Pipeline legend";
+    buildPipelineLegend();
+  } else {
+    if (title) title.textContent = "Operator legend";
+    buildOperatorLegend();
+  }
+}
+
+const BACKEND_SWATCHES = [
+  ["metal", "Metal (MPS) backend"],
+  ["cpu", "CPU backend"],
+  ["cuda", "CUDA backend"],
+  ["none", "unassigned"],
+];
+function backendColorRows() {
+  let h = "<tr><th colspan=2 style='padding-top:10px'>Backend colors</th></tr>";
+  for (const [b, desc] of BACKEND_SWATCHES) {
+    h += `<tr><td><span class="legend-swatch" style="background:var(--${b === "none" ? "none" : b})"></span><span class="op-name">${b}</span></td><td>${desc}</td></tr>`;
+  }
+  return h;
+}
+
+function buildOperatorLegend() {
   const ops = [
     ["input", "Leaf input (token/positions/KV indices)"],
     ["get_rows", "Embedding lookup (token embedding)"],
@@ -1266,18 +1864,34 @@ function buildLegend() {
     ["fused_qkv", "Decode QKV fusion (concat matmul + bias + rope + store)"],
     ["fused_ffn", "Decode FFN fusion (concat matmul + swiglu)"],
   ];
-  const be = [
-    ["metal", "Metal (MPS) backend"],
-    ["cpu", "CPU backend"],
-    ["cuda", "CUDA backend"],
-    ["none", "unassigned"],
-  ];
   let h = "<tr><th>Op</th><th>Description</th></tr>";
   for (const [op, desc] of ops) h += `<tr><td class="op-name">${op}</td><td>${desc}</td></tr>`;
-  h += "<tr><th colspan=2 style='padding-top:10px'>Backend colors</th></tr>";
-  for (const [b, desc] of be) {
-    h += `<tr><td><span class="legend-swatch" style="background:var(--${b === "none" ? "none" : b})"></span><span class="op-name">${b}</span></td><td>${desc}</td></tr>`;
-  }
+  h += backendColorRows();
+  document.getElementById("legend-table").innerHTML = h;
+}
+
+function buildPipelineLegend() {
+  const stages = [
+    ["Input", "token_ids / positions (leaf input, filled each step)"],
+    ["Embedding", "token_embd lookup → token vector"],
+    ["RMSNorm", "per-token layer norm (pre-attn / pre-FFN / per-head Q·K)"],
+    ["Attention", "Q·Kᵀ·V (GQA) + RoPE + KV cache read/write"],
+    ["+ Residual", "add the block input back onto the sublayer output"],
+    ["FFN", "gate·up (SwiGLU) → down projection"],
+    ["Final RMSNorm", "pre-logits norm (output_norm)"],
+    ["Logits", "lm_head matmul → vocab scores"],
+    ["Sampler", "top-k / top-p → next token (decode only)"],
+  ];
+  let h = "<tr><th>Stage (one box = one function)</th><th>What it is</th></tr>";
+  for (const [name, desc] of stages) h += `<tr><td class="op-name">${name}</td><td>${desc}</td></tr>`;
+  h += "<tr><th colspan=2 style='padding-top:10px'>Pipeline order</th></tr>";
+  h += `<tr><td colspan=2 class="legend-flow">Input → Embedding → [ RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual ] × N → Final RMSNorm → Logits → [ Sampler ]</td></tr>`;
+  h += "<tr><th colspan=2 style='padding-top:10px'>Box markings</th></tr>";
+  h += `<tr><td><span class="legend-swatch" style="background:hsl(48,55%,62%)"></span><span class="op-name">executed</span></td><td>pale fill by data magnitude (blue→red) + dark text</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--accent-2)"></span><span class="op-name">fused</span></td><td>one fused kernel (QKV✚ / FFN✚, dashed border)</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--fg-dim)"></span><span class="op-name">collapsed</span></td><td>the ×N layer summary — click to expand</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border-top:1.5px solid var(--fg-dim)"></span><span class="op-name">arrow</span></td><td>next reasoning step (a layer also loops at the top)</td></tr>`;
+  h += backendColorRows();
   document.getElementById("legend-table").innerHTML = h;
 }
 

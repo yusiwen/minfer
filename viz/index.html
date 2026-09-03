@@ -36,6 +36,11 @@
     <label title="Show input/output nodes"><input type="checkbox" id="f-io" checked> Input/Output</label>
     <label title="Only show nodes on the attention path"><input type="checkbox" id="f-attn"> Attention path</label>
     <label title="Only show nodes on the FFN path"><input type="checkbox" id="f-ffn"> FFN path</label>
+    <span class="sep"></span>
+    <div class="view-switch" title="Switch render mode: the operator grid (one node = one operator), or the semantic reasoning pipeline (one box = one stage)">
+      <button id="view-dataflow" class="view-btn active" title="Operator grid — one node = one operator, edges = tensor dataflow (the original view)">Operators</button>
+      <button id="view-flow" class="view-btn" title="Semantic reasoning pipeline — one box = one stage (norm / attention / FFN / logits)">Pipeline</button>
+    </div>
     <button id="btn-live" class="live-btn" title="Connect to a minfer server to watch live inference">Live</button>
   </div>
 </header>
@@ -96,7 +101,7 @@
 </footer>
 
 <div id="legend-pop">
-  <div class="legend-title">Operator legend <button id="legend-close">×</button></div>
+  <div class="legend-title"><span id="legend-title-text">Operator legend</span> <button id="legend-close">×</button></div>
   <table id="legend-table"></table>
 </div>
 <div class="corner-tools">
