@@ -1,0 +1,22 @@
+# CI — compile check on push to master and PRs targeting master.
+#
+# GitHub-hosted macOS runners ship a preinstalled Rust toolchain (the same
+# image the release workflow uses), so no explicit toolchain setup is needed
+# here. We only build — the integration tests under tests/ need a GGUF model
+# that is not checked in, so running them here would be flaky. The goal of this
+# badge is "does it compile on a clean checkout".
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release)
+        run: cargo build --release
