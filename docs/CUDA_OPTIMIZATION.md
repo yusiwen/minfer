@@ -947,6 +947,92 @@ ncu captures /tmp/minfer_phase7/r21_{post,pre,post2,pre2,post_wi,pre_wi}.csv
 (+ .logs), parser /tmp/parse_r21_metrics.py.
 
 
+### P6 r22: conflict attribution + qa8 XOR swizzle LANDED (op_ld 16.86M -> 0, KD=8 +1.4%) / d/ssum stream fold NEGATIVE (REVERTED, 2026-09-03)
+
+Step 0 — attribute the residual conflicts (r21's re-ordered lever list).
+There is NO dedicated LDSM conflict metric on GB10 (checked
+`--query-metrics`); LDSM conflicts roll into
+`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`. q-proj
+launch, nt-2630, KD=4, grid (21,28), baseline bd6fd4f:
+
+| metric | value |
+|---|---|
+| op_ld conflicts | **16,859,136** |
+| op_st conflicts | 6,498,453 |
+| LDSM warp-inst (`sm__inst_executed_op_ldsm`) | 4,741,632 |
+
+The op_ld number is EXACTLY the A-side qa8 ldmatrix 2-way: 4.74M LDSM
+x4 inst x 4 phases x 1 extra wavefront per 2-way phase = 16.86M (the
+r14-era 499K/GMAC residual). op_st decomposes as the qb8 staging
+stores (4 p-lanes per row hit the same bank group: slot offset
+6144B*s vanishes mod 128B) + sds float2 stores (2-way, lanes 16 apart)
+— stores, not load-path. Lever 1 targets the A-side; op_st left alone.
+
+**Lever 1 (KEPT): XOR-swizzled qa8, zero smem growth.** qa8 keeps its
+32B rows but consecutive 4 rows form a 128B super-row and the 16B
+granule index is XORed with the super-row index:
+`gr(row, h) = ((row & 3) * 2 + h) ^ ((row >> 2) & 7)`,
+`byte = (row & ~3) * 32 + gr * 16 + intra * 4` — the same map on the
+staging stores and the ldmatrix loads. Rows 4 apart (the 2-way pair)
+land on distinct granule phases; every ldmatrix phase gets 8 distinct
+bank phases. Verified standalone first (/tmp/ldm_a_swizzle_test.cu,
+r14's ldm_b approach): identical A-fragment distribution vs plain LDS
+on the logical layout, and ncu on the test kernel shows
+524,288 -> 0 op_ld conflicts for the same 131,072 LDSM inst. The
+staging STS pattern stays conflict-free under the swizzle (4 consecutive
+rows cover all 8 granule phases exactly once). First integrated cut
+hoisted lane-only terms per chunk — still −2.4%/−0.9% wall: the
+per-ldmatrix XOR/SHL/IADD address ALU ate the freed wavefronts. Final
+form precomputes all 8 A-frag offsets per thread ONCE
+(`G[g] = g*512 + (lane&12)*32 + ((gr ^ lc ^ ((g&1)<<2)) << 4)`, all
+lane-invariant — verified standalone in the same test): each ldmatrix
+address is ONE IADD (`p = qat + G[g]`), below baseline's ~3 ops, and
+registers DROP below baseline (129/145 vs 141/149, zero spill).
+
+Measured (2630-tok, interleaved 3x same-slot pairs vs /tmp/minfer_pre_r22):
+KD=8 (default) 1329.6 vs 1311.8 median = **+1.4%**, 3/3 pairs positive
+(1327.0-1330.1 vs 1305.4-1315.3); KD=4 1309.0 vs 1315.3 median = −0.5%
+(3/3 marginally negative, inside the ±1% drift band the narrow control
+showed) — kept: default path positive, mechanism complete. ncu on the
+final build: **op_ld conflicts 16,859,136 -> 0**, op_st 6.47M unchanged
+(out of scope), same 4.74M LDSM inst. Parity green KD=4 and KD=8; suite
+166/0/3; greedy-32 token identity vs the default path (timing lines
+only); smem budgets unchanged (KD=4 73,728B / KD=8 98,304B). The
+combined >=1350 bar was NOT reached — per the stop conditions the
+positive lever is kept and this entry documents the split outcome.
+
+**Lever 2 (REVERTED): d/ssum fold into the A pass-through** — r21's
+named "only remaining staging idea". Implemented as a single coalesced
+9-word-per-chunk stream (w=0: d f16|pad, w=1..8: qs; word index =
+9*chunk + w, x = tid + i*256) with the w=0 holder grabbing the adjacent
+ssum word (+36, one extra 4B load inside the pass-through) and packing
+d|ss into sda_q in-register; the separate scattered d/ssum loop is
+deleted. Two enumeration variants (per-iteration x/9 magic-div; then a
+division-free (+28/+4 mod 9) incremental counter): BOTH measured
+−19-20% wall (KD=4 ~1050 vs ~1302, KD=8 ~1039 vs ~1303, 3x interleaved,
+parity green). Root cause: the premise "the d/ssum loads are scattered
+sector waste" is void — at lane stride nb32*40 they hit the SAME cache
+lines the qs pass of the same chunks fetched microseconds earlier, so
+they are L1 HITS; folding buys ~no sector traffic while the flat
+enumeration pays ALU (mod-9 chains) plus a branchy in-loop sda
+store that breaks r20's single deep LDG batch, and the extra register
+pressure pushed ptxas to 255 regs + 112B spill at KD=8.
+Lever-2's stall-structure lesson repeats r21's: the wide kernel's
+staging is instruction/issue-bound, and request-count "savings" that
+add ALU lose. The staging book is now closed: the live levers are the
+r13/r15 compute-loop instruction surplus and the (now zero) LDSM
+conflict headroom is spent.
+
+Artifacts: standalone swizzle test /tmp/ldm_a_swizzle_test{,2}.cu +
+ncu script /tmp/ncu_ldmtest.sh
+(/tmp/minfer_phase7/ldmtest_conflicts.csv), attribution captures
+/tmp/ncu_r22_attr.sh ->
+/tmp/minfer_phase7/r22_attr_{pre,swz,final}_kd4.csv (+ .logs), recheck
+/tmp/ncu_r22_recheck.sh, perf harness /tmp/perf_r22_ab.sh + logs
+/tmp/minfer_phase7/r22_perf_ab.log (combined), r22_swonly_perf_ab.log
+(swizzle-only), r22_goff_perf_ab.log (final G-offset form).
+
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

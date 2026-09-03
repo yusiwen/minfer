@@ -4459,7 +4459,14 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
     extern __shared__ uint8_t mmq_raw_sh[];
     // Single-buffer sync-staged layout — KD=8 totals 98,304B (1 block/SM;
     // KD=4 is 73,728B; resident warps hide the staging latency):
-    //   qa8   [KDR][128] x 32B  chunk qs only (d/ssum in sda_q)
+    //   qa8   [KDR][128] x 32B  chunk qs only (d/ssum in sda_q). r22: the
+    //                         16B granules are XOR-swizzled inside 128B
+    //                         super-rows (4 rows each): granule
+    //                         ((row&3)*2 + h) ^ ((row>>2)&7) — the 32B row
+    //                         stride puts ldmatrix rows 4 apart on the same
+    //                         bank phase (2-way conflict); the swizzle gives
+    //                         every ldmatrix phase 8 distinct phases, zero
+    //                         smem growth.
     //   sda_q [KDR][128] x 8B   (d f16 | ssum i16) packed, uint2-tiling
     //                           [KDR][16 g][8 q]: one LDS.64 serves the
     //                           token pair (t, t+8) a C fragment needs
@@ -4501,6 +4508,13 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
          * global loads into registers first - one deep independent LDG batch \
          * per warp per kt - then store to smem. Identical addresses, traffic \
          * and instruction count; only the dependency schedule changes. */    \
+        /* r22: r20's split-phase A staging is kept verbatim; only the qa8    \
+         * store address gained the XOR swizzle. The d/ssum stream fold      \
+         * (single 9-word-per-chunk pass) was tried and REVERTED: the old    \
+         * scattered d/ssum loads are L1 hits (the qs pass of the same       \
+         * chunks has the lines resident), so folding saves little sector    \
+         * traffic while the flat enumeration costs ALU + branchy batches    \
+         * (-19% wall, see docs r22). */                                     \
         {                                                                      \
             unsigned av[KDR * 4];          /* qs words: 128*KDR*8 / 256 thr */ \
             unsigned short dv[KDR / 2];    /* d f16 words: 128*KDR / 256 */    \
@@ -4537,8 +4551,11 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
                 const int x = threadIdx.x + i * 256;                           \
                 const int u = x & 7, r = (x >> 3) & (MMQ_WBI - 1),             \
                           kd = x >> 10;                                        \
-                *(unsigned*)(qa8 + ((size_t)kd * MMQ_WBI + r) * 32 + u * 4)    \
-                    = av[i];                                                   \
+                const int R = kd * MMQ_WBI + r;                                \
+                *(unsigned*)(qa8 + (size_t)(R & ~3) * 32                       \
+                    + (size_t)(((((R & 3) << 1) + (u >> 2))                    \
+                                ^ ((R >> 2) & 7)) << 4)                        \
+                    + (size_t)(u & 3) * 4) = av[i];                            \
             }                                                                  \
             _Pragma("unroll")                                                  \
             for (int i = 0; i < KDR / 2; ++i) {                                \
@@ -4611,6 +4628,21 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
 
     RAW_STAGE(0);
 
+    // r22: precomputed swizzled A-frag byte offsets. The 8 ldmatrix
+    // addresses per chunk are lane-invariant except for the kd base:
+    // addr = qat + G[g], G[g] = g*512 + (lane&12)*32
+    //      + (((lane&3)*2 + (lane>>4&1)) ^ (lane>>2&3) ^ ((g&1)*4)) << 4.
+    // One IADD per ldmatrix (below baseline's 3), and the granule XOR
+    // gives every ldmatrix phase 8 distinct bank phases (the 32B row
+    // stride is 2-way conflicted).
+    const unsigned l12m = (unsigned)(lane & 12) * 32;
+    const unsigned grc = (unsigned)(((lane & 3) << 1) + ((lane >> 4) & 1)
+                             ^ ((lane >> 2) & 3)) << 4;
+    unsigned G[8];
+    #pragma unroll
+    for (int g = 0; g < 8; g++)
+        G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
+
     int buf = 0; (void)buf;
     for (int kt = 0; kt < nktile; ++kt) {
         if (kt > 0) RAW_STAGE(kt);
@@ -4627,13 +4659,14 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
             // lanes 0-7 -> rows 0-7 byte 0, 8-15 -> rows 8-15 byte 0,
             // 16-23 -> rows 0-7 byte 16, 24-31 -> rows 8-15 byte 16 —
             // the standard m16n8k32 A-fragment distribution).
+            // r22: addresses are the precomputed swizzled offsets G[g]
+            // (see above) — XOR-swizzled granule index, same map the
+            // staging stores use.
             int a[8][4], b[2][2];
             int clow[8][2][4];
             #pragma unroll
             for (int g = 0; g < 8; g++) {
-                const uint8_t* p = qat
-                    + (size_t)(g * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * 32
-                    + ((lane >> 4) & 1) * 16;
+                const uint8_t* p = qat + G[g];
                 unsigned r0_, r1_, r2_, r3_;
                 asm volatile(
                     "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
