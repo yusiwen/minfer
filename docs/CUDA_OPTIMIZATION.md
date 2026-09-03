@@ -637,6 +637,76 @@ while SM% sits at ~30; the binding lever is latency/stall structure
 Kernel reverted to HEAD `708067d` (r16 narrow fold kept; cmp-verified);
 the remapped kernel preserved at /tmp/cuda_kernels_r16remap_variant.cu.
 
+### P6 r18: load-time B pre-expansion — staging becomes a bulk copy: wall NEUTRAL (REVERTED, 2026-09-03)
+
+Phase-7 task-1 hypothesis: the wide kernel's per-k-t global->smem B round trip
+(raw 144B superblock staged, then ALU-expanded to qb8 [8][128][48]) sits
+between compute phases at 8 resident warps and is part of the stall structure
+r13/r17 fingered. Fix: materialize the expansion ONCE at weight registration —
+(a) EB, per-k int8 per-superblock copy `[sb][od][8][32]` (256B per
+(superblock, row), slot bytes element-ordered raw nibbles 0..15 — exactly the
+old in-loop expansion's output), laid out so one k-tile's 128 rows x 8 slots
+are ONE contiguous 32KB global range; (b) SB, per-(chunk, row) (dv, mv)
+float2 pairs `[chunk][od]` replacing the per-chunk 144B header parse +
+get_scale_min_k4 unpack. The wide kernel's B + scale staging became pure bulk
+copies (2048 16B LDG/STS per superblock, zero dequant ALU); the raw tensor
+stayed registered for every other path. One device-side `expand_q4k_kernel`
+launch + stream sync per tensor at load; `register_weight_q4k_expanded`
+keyed the buffers by raw wptr in a new `mmq_expanded` registry; wide launch
+required them, falling back to raw-W narrow staging otherwise. Measured
+memory cost on 7B q4_k_m: +5.8 GB device (od·id + 8·od·id/32 bytes; free
+26.1 -> ~20 GB of 130.6 — acceptable as predicted, actuals logged per tensor).
+
+Implementation landed parity-green on the first build (8-shape sweep, KD=4 +
+KD=8 + default; expanded buffers also registered in the parity fixture so the
+wide kernel stayed under test).
+
+Measured (7B @2630 tok, interleaved 3x vs the 1e0dded baseline binary,
+same session — NOTE: the box ran ~9% below the r15/r17 session's absolute
+numbers, baseline KD=8 1155-1171 vs 1295 then; only the interleaved deltas
+are meaningful):
+
+| config | baseline | r18 expanded-B | Δ (medians) |
+|---|---|---|---|
+| wide KD=8 (default) | 1170.9 / 1164.7 / 1155.5 | 929.8 / 1181.7 / 1175.0 | **+0.9%** (noise-band) |
+| wide KD=4 | 1145.7 / 1141.3 / 1130.6 | 1071.6 / 816.2 / 907.5 | **−19% median, high variance** |
+| narrow (control) | 463.3 / 429.9 | 444.5 / 441.5 | noise |
+
+ncu q-proj (launch 1, nt 2630, od=id=3584, grid (21,28), per GMAC = 33.78e9):
+
+| metric | baseline KD=4 | r18 KD=4 | baseline KD=8 | r18 KD=8 |
+|---|---|---|---|---|
+| warp instructions | 8.68 M | 8.65 M (−0.3%) | 8.49 M | 8.46 M (−0.3%) |
+| duration | 2.288 ms | 2.335 ms (+2.1%) | 2.155 ms | **2.059 ms (−4.5%)** |
+| Compute (SM) | 31.1% | 30.4% | 32.4% | 33.7% |
+| Memory Throughput | 44.2% | 36.5% | 46.2% | 43.0% |
+
+Readings:
+1. The staging-ALU cut is instruction-neutral (−0.3%): the expansion ALU was
+   ~0.1% of the per-block warp stream — the r15/r17 "op cuts pay ~0 at
+   SM% 30" rule extends to STAGING op cuts.
+2. The latency win is real but small and config-dependent: KD=8 −4.5%
+   per-kernel duration converts to +0.9% wall (the GEMM is one of ~200
+   launches; only q4_K matmuls benefit). KD=4 REGRESSES +2.1% per-kernel:
+   with the restage-once-per-superblock guard, the bulk copy reads 256B/row
+   where the ALU path read 144B — B-side staging bytes ~2x — and at KD=4
+   that byte excess outweighs the removed latency (also the likely source of
+   the erratic KD=4 wall runs).
+3. Fourth independent confirmation of the r17 reading: the stall structure
+   is NOT meaningfully reduced by removing the B-expansion work between
+   compute phases — SM% stays 30-34, still stall-bound. The binding
+   latency is elsewhere (A-side staging, scoreboards on the mma chain
+   itself), and the quantified ceiling of this lever was ~5% per-kernel.
+
+Bar was >= 1350 tok/s; decisively missed. Reverted to HEAD `1e0dded`
+(cmp-verified). The complete variant is preserved for reuse — the EB/SB
+materialization machinery is a prerequisite for any future L2-persistence
+experiment on expanded weights:
+- /tmp/patch_p7_t1.py (anchored patch script: kernel + registry + loaders)
+- /tmp/cuda_kernels_p7t1_variant.cu (patched kernel file)
+- /tmp/perf_p7t1_ab.sh, /tmp/ncu_p7t1.sh (A/B + ncu harnesses)
+- /tmp/minfer_phase7/ncu_r18exp_kd{4,8}.csv, ncu_base_kd{4,8}.csv
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
