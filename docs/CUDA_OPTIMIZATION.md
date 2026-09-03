@@ -707,6 +707,51 @@ experiment on expanded weights:
 - /tmp/perf_p7t1_ab.sh, /tmp/ncu_p7t1.sh (A/B + ncu harnesses)
 - /tmp/minfer_phase7/ncu_r18exp_kd{4,8}.csv, ncu_base_kd{4,8}.csv
 
+### P6 r19: weight L2 residency — __ldg NEUTRAL, L2 persisting window CATASTROPHIC (REVERTED, 2026-09-03)
+
+Phase-7 task-2, on the HEAD (r16-state) wide kernel — the 21x token-tile
+re-reads (and cross-launch re-reads within a layer) of the same weight bytes
+should hit L2 instead of DRAM. Two levers, one build:
+
+1. **`__ldg` (read-only path) on the wide kernel's weight-side loads** — the
+   B-staging superblock `uint4` loads and the scale-header `uint16` loads
+   (read-only for the kernel's lifetime; parity-neutral by construction).
+2. **`MINFER_MMQ_L2WIN=1`: cudaAccessPolicyWindow** on the raw q4_K weight
+   byte range, set per wide launch (hitRatio 1.0, hitProp Persisting,
+   missProp Streaming), persisting carveout raised to
+   `persistingL2CacheMaxSize` once per process.
+
+Parity green with and without the window (KD=4 + KD=8).
+
+Measured (7B @2630 tok, interleaved 3x, same noisy session — box drifted
+−9% vs the r15/r17 absolutes; only intra-session deltas count):
+
+| config | baseline 1e0dded | r19 __ldg | r19 __ldg + L2WIN |
+|---|---|---|---|
+| wide KD=8 | 780.0 / 1061.7 / 1252.4 | 700.7 / 1278.6 / 1282.3 | **453.6 / 535.4 / 548.2 (−50%)** |
+| wide KD=4 | 1195.8 / 1144.4 / 1240.0 | 1201.9 / 1219.7 / 1229.9 (+2.0% med) | **557.6 / 575.4 / 577.2 (−50%)** |
+
+Readings:
+1. `__ldg` alone: NEUTRAL (+2.0% KD=4 median, KD=8 lost in box noise, no
+   consistent gain). Expected in hindsight — the weight tiles are already
+   re-read from L2 within a launch (r13 measured L2 read traffic only 1.6x
+   llama.cpp per MAC), and nvcc's const-`__restrict__` handling was likely
+   already emitting non-coherent loads; the ncu "L2 Cache Throughput"
+   37-46% SOL readings show L2 was not the constraint.
+2. The persisting window at hitRatio 1.0 is CATASTROPHIC (−50%, 6/6 runs
+   consistent): marking 12.8-34MB per weight persisting fills the carveout
+   with weight lines while the C stores (37MB per GEMM), activations, and
+   KV traffic lose normal L2 — and every re-mark churns the carveout. The
+   access-policy window mechanism WORKS (deterministic effect), just not in
+   this direction at this ratio. Untested cheaper variants (out of budget):
+   hitRatio ~0.25, windowing only the small q/k/v weights, or
+   `cudaCtxResetPersistingL2Cache` between layers.
+
+Bar was >= +5% over the Task-1 state; the only consistent signal was −50%.
+Both levers reverted to HEAD `384b3d9` (cmp-verified). Preserved:
+- /tmp/patch_p7_t2.py (anchored patch script), /tmp/cuda_kernels_p7t2.cu
+  (patched kernel file), /tmp/perf_p7t2_ab.sh, /tmp/perf_p7t2_ab.log.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
