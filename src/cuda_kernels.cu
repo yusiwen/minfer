@@ -4396,6 +4396,15 @@ __global__ void __launch_bounds__(256) mmq_raw_nt_kernel(
                 da_q[t4] = h2f(*(const uint16_t*)at);
                 sa_q[t4] = (int)*(const uint32_t*)(at + 36);
             }
+            // r15: the dmv correction term is rank-1 in (token, od-col) —
+            // the row-side product da*sa is shared by the od-col pair of
+            // each C fragment, so fold it once per row (4 FMUL/chunk)
+            // instead of once per C value (8 FMUL/chunk). The dsv term and
+            // the per-chunk scale application are unchanged.
+            const float dma[4] = { da_q[0] * (float)sa_q[0],
+                                   da_q[1] * (float)sa_q[1],
+                                   da_q[2] * (float)sa_q[2],
+                                   da_q[3] * (float)sa_q[3] };
             float dsv[2][8], dmv[2][8];
             #pragma unroll
             for (int nh = 0; nh < 2; nh++)
@@ -4411,11 +4420,10 @@ __global__ void __launch_bounds__(256) mmq_raw_nt_kernel(
                     #pragma unroll
                     for (int l = 0; l < 4; l++) {
                         const float da = da_q[h * 2 + (l >> 1)];
-                        const float sa = (float)sa_q[h * 2 + (l >> 1)];
                         const int jj = (lane & 3) * 2 + (l & 1);
                         const int idx = nh * 8 + h * 4 + l;
                         sum[idx] += da * dsv[nh][jj] * (float)clow[nh][h][l];
-                        sum[idx] += da * dmv[nh][jj] * sa;
+                        sum[idx] += dma[h * 2 + (l >> 1)] * dmv[nh][jj];
                     }
         }
         __syncthreads();

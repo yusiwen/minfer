@@ -591,6 +591,21 @@ the ISA level. Next levers: the r13-noted warp-tile shape (a warp over
 structural edge) or prefetch/stall work; the narrow kernel's identical
 rank-1 term2 (3 sites) is the same one-line follow-up.
 
+### P6 r16: narrow MMQ gets the r15 rank-1 term2 fold (LANDED, 2026-09-03)
+
+r15's named one-line follow-up, ported to `mmq_raw_nt_kernel` (3 edit
+sites, mirroring the wide kernel's r15 pattern exactly): `dma =
+da·(float)sa` folded once per row (4 FMUL/chunk) replacing the per-C-value
+`I2F(sa)` + `FMUL(da·dmv)` — 8 I2F + 16 FMUL → 4 I2F + 12 FMUL per chunk;
+the dsv term and per-chunk scale application untouched.
+
+Measured (7B @2630 tok, narrow KD=8, interleaved 2x vs the HEAD binary):
+patched 480.2/480.9 vs baseline 447.0/472.6 tok/s — not worse (+1.7%/+1.8%,
+within noise of the r15 control 473/472/472). Parity green at default,
+`MINFER_MMQ=1 MINFER_MMQ_RAW=1` (KD=8) and `MINFER_MMQ_RAW_KD=4`; suite
+166/0/3. No ncu (the narrow kernel is not the perf path; wide numbers
+unchanged).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
