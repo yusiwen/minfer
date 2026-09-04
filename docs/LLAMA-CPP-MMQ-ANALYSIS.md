@@ -811,3 +811,35 @@ suite 166/0/3. ncu: `long_scoreboard` 24.61% → 21.46%, `mio_throttle` 16.53% �
 15.61%. Wall **+1.07%** median across 45 samples — above noise but **below the
 +1.5% bar**. Landed as a positive but sub-bar improvement (mechanism-confirmed,
 register-neutral). See docs/CUDA_OPTIMIZATION.md P6 r31.
+
+### 11.12 Follow-up (r32, 2026-09-04): the finite-lever sweep — the remaining
+integer-ALU surplus is bounded at the compiler floor (both levers REVERTED)
+
+§11.10/§11.11 left the integer-ALU surplus (1.598 e-3/MAC, ~2.1× llama)
+attributed to the A-frag LDSM (irreducible), the staging index math, and the
+epilogue. r32 classified the SASS per region (full kernel = 2,617 instructions:
+prolog+stage0 500, per-kt in-loop staging 455, per-kt compute-kd 1,515,
+run-once epilogue 115) and tested the two cuttable candidates.
+
+**Staging — ptxas already hoisted the kt-independent addressing.** The A-token
+base `(i0+r)*nb32` is materialized once in the prolog, and the A-swizzle STS
+targets are byte-identical between the prolog and the in-loop copy
+(`STS [R57+UR11+0x400..]`, the per-kt term carried only in uniform UR11); the
+av loads group into 3 base regs + immediate offsets (`4 + kd*40`). The
+remainder is per-kt addressing and the intrinsic sds scale-decode — not a
+hoistable index chain, so a source-level staging change is a no-op (the r30
+"compiler already did it" pattern, confirmed by SASS not source intent).
+
+**Epilogue — run-once (0.4% ceiling), store-widening stops at float2.** The
+write-back is 32 scalar `STG.E` (ptxas does not vectorize). A (g,nh) yields two
+float2 pairs at rows iA/iA+8, cols (j,j+1) → 8B-aligned `STG.64` for the
+interior tile, scalar tail for the od/nt boundary block. Implemented: SASS
+32 `STG.E` → 16 `STG.E.64` + 24 `STG.E`, but integer ALU *rose* statically
+(IMAD 55→74, LEA.HI.X 8→24) from the dual-path branch; ptxas 111 regs / 0
+spill. Parity 1/0, greedy-32 byte-identical. Perf **+0.46%** (baseline 1441.5
+→ 1448.15, interleaved 4-pair) — below noise, and capped anyway (run-once).
+
+**Outcome: both reverted (cmp-verified = HEAD).** The NB kernel's remaining
+integer-ALU surplus is at the compiler floor: A-frag LDSM (irreducible) +
+intrinsic sda/sds decode + the fp rescale (FFMA/FMUL/I2FP at parity/deficit).
+No source-level integer-ALU cut remains. Recorded: docs/CUDA_OPTIMIZATION.md P6 r32.

@@ -1516,6 +1516,55 @@ it was not noise-immune but is now minimized; the **integer-ALU surplus
 LDSM (irreducible), the staging index math, and the epilogue. Recorded:
 docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.11.
 
+### P6 r32: finite-lever sweep — both remaining integer-ALU regions are
+bounded, none clears +1.5% (REVERTED, 2026-09-04)
+
+The r31 verdict left the integer-ALU surplus attributed to three regions:
+A-frag LDSM addressing (irreducible), the staging index math, and the epilogue.
+r32 tested the two *termed* cuttable candidates and measured both bounded.
+
+**SASS regional classification first** (sm_121, `cuobjdump -sass`, full
+`mmq_raw_nb_kernel` 2,617 instructions, per-region opcode census):
+prolog+stage0 500, in-loop staging 455 (per-kt), compute-kd 1,515 (per-kt),
+epilogue 115 (run-once). Per-warp dynamic ≈ 27,800 ⇒ staging ≈ 21%, epilogue
+≈ 0.4%. The **staging is the top cuttable block by magnitude** — but its
+**kt-independent addressing is already hoisted by ptxas**: the A-token base
+`(i0+r)*nb32` is computed once in the prolog (`IMAD.WIDE R4, R59, R62`), and
+the A-swizzle STS targets are byte-identical between the prolog and the in-loop
+copy (`STS [R57+UR11+0x400..0x2400]`) with the per-kt term carried only in the
+uniform register UR11. The av loads group into 3 base regs + immediate offsets
+(`R32.64+0x4`, `R30.64+0x54`, … = 4 + kd*40). The remaining in-loop staging
+integer ALU (~199/kt) is per-kt addressing and the intrinsic sds scale-decode
+(`get_scale_min_k4`), not a hoistable index chain → **staging lever effectively
+dead at the source level** (r30 pattern: the compiler already did it).
+
+**Epilogue tested**. The write-back is 32 scalar `STG.E` (ptxas does NOT
+vectorize — verified, no STG.128/STG.64). For a (g,nh) the four l-values are two
+float2 pairs at rows iA/iA+8 and columns (j, j+1) → an 8B-aligned `STG.64`
+covers the interior tile (both rows + both cols in bounds); the od/nt boundary
+block falls back to per-element scalars to preserve exact bounds. Implemented
+the float2 interior + scalar tail. **SASS**: 32 `STG.E` → 16 `STG.E.64` +
+24 `STG.E` (interior dynamic stores halved). **But** integer ALU *increased*
+statically (IMAD 55→74, LEA.HI.X 8→24, IADD3 86→94) — the dual-path branch
+adds guard/address work on the (rarely-executed) tail path. ptxas `<8>`: **111
+regs, 0 spill** (r31 109; 2 blocks/SM preserved, STACK 0 LOCAL 0). Parity
+(NB-active `cuda_prefill_mmq`) **1 passed, 0 failed**; greedy-32 token identity
+vs default **byte-identical**. **Perf** (interleaved alternating 4-pair, 7B
+q4_k_m, warmup ×2): baseline **1441.5** → epilogue **1448.15** = **+0.46%** —
+within the ±1% run noise (round-2 current 1430.9 actually below base 1446.0),
+and **structurally capped**: the epilogue is run-once (~0.4% of warp
+instructions), so even a perfect epilogue change cannot clear the +1.5% bar.
+
+**Verdict — reverted (cmp-verified = HEAD).** Neither remaining integer-ALU
+region is a usable lever: the staging's kt-independent addressing is already
+hoisted by ptxas and the rest is per-kt/intrinsic; the epilogue is run-once
+(~0.4% ceiling) and its store-widening stops at float2 (od-contiguity gives 2
+floats/thread, not 4). The NB kernel is at/near its compiler floor for the
+integer-ALU class. **Convergence**: the residual 1.598 e-3/MAC (~2.1× llama)
+sits in the A-frag LDSM consuming + intrinsic sda/sds decode + the fp rescale
+(FFMA/FMUL/I2FP — at parity or a deficit vs llama); it is not addressable by a
+source-level integer-ALU cut. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.12.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
