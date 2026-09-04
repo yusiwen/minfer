@@ -780,7 +780,7 @@ profiled `mul_mat_q<12,128,0>` (= `mul_mat_q<GGML_TYPE_Q4_K, 128, 0>`):
 Phase-1 table (q-proj class, nt-512, per-issue-active warp ratios; llama =
 launch 0 of 8, identical at launch 6):
 
-| metric | minfer <4> | minfer <8> | llama.cpp <12,128> |
+| metric | minfer `<4>` | minfer `<8>` | llama.cpp `<12,128>` |
 |---|---|---|---|
 | duration q-proj (μs) | 632.4 | 609.6 | 263.6 |
 | issue /cyc/sched | 0.16–0.26 | 0.20 | 0.42 |
@@ -1314,7 +1314,7 @@ Design (llama.cpp mmq structure; q4_K first = 79% of MMQ time):
    serializing before __syncthreads.
 4. Warp tile stays 32(i)x16(j) x 8 warps on 64x64 (the 4-warp 32x32
    variant measured slower AND broke parity — do not retry).
-5. Land as mmq_raw_nt_kernel<TYPE> beside mmq_nt_kernel; gate
+5. Land as `mmq_raw_nt_kernel<TYPE>` beside mmq_nt_kernel; gate
    MINFER_MMQ_RAW=1 through prefill_mmq so R1 stays intact; q4_K only
    in the first cut (q6_K KSPLIT=2 later).
 6. Parity: extend cuda_prefill_mmq_parity with a raw-mode arm (same
