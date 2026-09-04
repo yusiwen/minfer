@@ -735,3 +735,25 @@ falsified** (line-closing positive outcome):
 Verdict: the 2× resident-warps gain hid latency better than the in-loop
 B-expansion ALU cost — exactly the §11 bet. Both kernels kept. Recorded in
 docs/CUDA_OPTIMIZATION.md P6 r28.
+
+### 11.9 Follow-up (r29, 2026-09-04): the kd-unroll — at 2 blocks/SM the
+integer-ALU surplus now moves the wall (+2.80%)
+
+The r25 census proved an instruction-cut lever (−38% integer ALU) was wall-
+inert at **1 block/SM**; that drove §11's occupancy bet, which r28 confirmed
+(2 blocks/SM, +2.56%). r29 re-ran the opcode-class census on the NB kernel
+directly and found the **same dominating class — integer ALU, 2.85× llama
+per-MAC** (2.142 vs 0.751 e-3/MAC) — but now the kernel sits at 2 blocks/SM.
+The two candidate micro-levers were measured and rejected: **(a) PRMT
+nibble extraction** (a sm_120 micro-test showed PRMT still needs shift+mask
+and cannot beat SHF+LOP3; the kernel already emits 0 PRMT) and **(b)
+software-pipelining the B-raw load** (neutral, reg-bloat; reverted). The
+landed fix is the r25 lever applied at the new occupancy: **`#pragma unroll`
+on the NB kd loop** (one line), folding each chunk's `is_hi` select, smem
+base, and bounds into compile-time constants. Result: integer ALU −25%,
+total inst −6.5%, warps_active 3.94 (2 blocks/SM preserved, 123 regs, 0
+spill), parity/greedy/suite all green, **+2.80%** (interleaved 5-pair,
+baseline 1387.9 → 1426.8). This closes the loop on §10's "occupancy is the
+lever": once occupancy is had, the *instruction* surplus becomes visible
+again — the two levers were not independent, just sequenced. Recorded in
+docs/CUDA_OPTIMIZATION.md P6 r29.

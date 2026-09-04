@@ -1364,6 +1364,57 @@ pre-change backups `cuda_kernels_pre_nb.cu`/`cuda_pre_nb.rs`); perf harness
 `/tmp/minfer_pre_nb` (2f783a3, md5 4dc455bf); edits grep-verified, no inline
 heredocs.
 
+### P6 r29: NB-kernel kd-loop unroll — the integer-ALU surplus now moves the wall at 2 blocks/SM (LANDED, +2.80%, 2026-09-04)
+
+Follow-up on r28's occupancy win. Task: shave the NB kernel's remaining
+stall/instruction gap vs llama. Method = the r25 opcode-class census
+re-run on `mmq_raw_nb_kernel` (grid (28,28)=784 tiles, matched layer-0
+qproj nt=1784 id=od=3584; capture /tmp/minfer_phase7/ncu_nb_predon.log).
+
+**Census verdict (per-MAC; NB MAC = 5.62M IMMA × 4096 = 23.0e9, llama/58.7e6):**
+the surplus is again one class — **integer ALU 2.85× llama** (2.142 vs
+0.751 e-3/MAC). FFMA is exactly at parity (1.953 e-3/MAC both). fmul
+(1.28×), conversion (1.26×), misc (2.41×), control (5.25×), uniform
+(10×) are secondary; `bit_pred_on` = 0 (we emit no PRMT); fp16 is a
+*deficit* (llama dequantizes to fp16, we keep fp32). Stalls cluster on the
+shared-memory path (mio_throttle 18.89% + long_scoreboard 16.80% = 35.7%).
+
+**Candidate ladder, all measured:**
+- **(a) PRMT nibble extraction — REFUTED.** A standalone sm_120 micro-test
+  (/tmp/prmt_test.cu) shows PRMT still needs shift+mask (2 ops) for the
+  high nibble and cannot beat SHF+LOP3; the kernel already emits 0 PRMT.
+- **(b) software-pipeline the B-raw load** (prefetch the next chunk's raw
+  nibble words during the current chunk's IMMA) — built and A/B'd:
+  **NEUTRAL/slightly negative** (median 1392.7 vs 1399.0) and bloated
+  regs (123→177 on some archs). **REVERTED.**
+- **(c) LDSM for A-frags** — already in place (4× `LDSM.x4`/chunk). N/A.
+- **LANDED: `#pragma unroll` on the NB kd loop** (r25's lever, applied now
+  that occupancy is achieved). One line. The wrapped kd loop had been left
+  rolled; unrolling makes each chunk's `is_hi` select, smem base, and
+  bounds a compile-time constant, folding the per-chunk integer/address
+  ALU — the exact surplus class the census flagged.
+
+**Gates (all green):** build clean; `<8>` instantiation **123 regs, 0 spill**
+(occupancy 2 blocks/SM preserved — warps_active 3.94 ≈ 4). Parity (NB-active
+`cuda_prefill_mmq`): **1 passed, 0 failed** — unrolling preserves the fp
+accumulation order (same mma + same r15 two-term fold, kd order unchanged).
+Greedy-32 token identity vs the default f16 path: **byte-identical**. Perf
+(7B q4_k_m @ 1784-tok prefill, robust interleaved 5-pair with warmup):
+baseline median **1387.9** (1396.1/1383.9/1387.9/1392.9/1384.6), unroll
+median **1426.8** (1426.8/1427.8/1428.7/1421.2/1415.3) = **+2.80%, 5/5
+positive** (consecutive A/B: 1400.2 vs 1426.5 = +1.88%). A transient
+~1206 outlier in the un-warmed interleaved harness was a GPU power/state
+artifact, gone after warmup. ncu (unroll): **total inst −6.5%**
+(188.1M→175.9M warp), **integer ALU −25%** (49.3M→36.8M warp, 2.142→1.598
+e-3/MAC), memory −8.3%. Suite: **166/0/3**.
+
+**Verdict.** r25 concluded integer-ALU cuts are wall-inert — but that was
+measured at **1 block/SM** (occupancy-bound, latency unhidden). At r28's
+**2 blocks/SM** the same surplus class is now addressable: cutting it 25%
+moves the wall +2.80%. The raw-nibble in-loop unpack remains the structural
+cost (integer/MAC still above llama), but the kd-unroll is a clean, safe
++2.80% and is kept. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

@@ -4920,6 +4920,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
         if (kt > 0) RAW_STAGE_NB(kt);
         __syncthreads();
 
+        #pragma unroll
         for (int kd = 0; kd < KDR; kd++) {
             const int c = kt * KDR + kd;
             if (c >= nchunk) break;
