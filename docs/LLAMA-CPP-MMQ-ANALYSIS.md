@@ -843,3 +843,50 @@ spill. Parity 1/0, greedy-32 byte-identical. Perf **+0.46%** (baseline 1441.5
 integer-ALU surplus is at the compiler floor: A-frag LDSM (irreducible) +
 intrinsic sda/sds decode + the fp rescale (FFMA/FMUL/I2FP at parity/deficit).
 No source-level integer-ALU cut remains. Recorded: docs/CUDA_OPTIMIZATION.md P6 r32.
+
+### 11.13 Follow-up (r33, 2026-09-04): the hybrid inner-loop port — a SASS
+no-op; the "loop organization is the residual" hypothesis is FALSIFIED (REVERTED)
+
+r32 closed every source-level *instruction-count* lever. §11.13 is the decisive
+test of the *remaining* framing — that the 1.15×/GMAC residual is **pure SASS
+codegen from loop organization**: port llama.cpp's `ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma`
+inner-loop *shape* into `mmq_raw_nb_kernel` while keeping minfer's shell, and
+see whether the emitted machine code converges toward llama and the wall turns.
+
+**The port.** Keep the kernel signature, the 64×128 geometry, KD=8, all smem
+layouts (qa8 / sda q-major repack / qb-raw / sds), the r20 split-phase staging,
+the r22 XOR swizzle, the launcher + `MINFER_MMQ_RAW_NB` gate, the fp32 two-term
+rank-1 rescale semantics, and the fp32 write-back. Replace only the compute-loop
+*ordering* with llama's `j0`-outer / `n`-inner structure (their vec_dot is
+`for j0 { for k01 { load B; for n { mma; rescale } } }`; mmq-vec-dot.cuh:414-440).
+Adapted geometry: our warp is **16 od-rows × 64 tokens** (vs their 32 od-rows ×
+64 tokens → `rows_per_warp/tile_C::I = 2` M-minitiles at `ntx=2`), so with the
+same m16n8k32/tile<16,8,int> lane map ours fold to **j0 = 2 od-groups × n = 4
+token-minitiles = 8 mma per 32-k chunk** (same 8 mma as before, just re-ordered
+so a weight B-fragment is reused across the 4 token-minitiles — llama's
+B-reuse-across-n). Our **k01 is degenerate** (one m16n8k32 covers the whole 32-k
+chunk; `nchunk = id/32`), so the per-32-k-chunk rescale boundary is untouched
+and **no fp accumulation order changes** — parity is preserved by construction.
+
+**Result.** Every gate that depends on the *emitted code* came back unchanged:
+ptxas `mmq_raw_nb_kernel<8>` **109 regs, 0 spill** (r31-identical), smem
+43,008 B, 2 blocks/SM; parity 1/0; greedy-32 byte-identical; SASS **byte-identical
+to r31** (same 64 IMMA ordering, same LDS/LDSM counts); perf interleaved 4-pair
+**neutral** (−0.73/−0.59/+1.30/−0.10%, median −0.25%); census **integer ALU
+1.66 e-3/MAC** (did NOT move toward llama's 0.751). Reverted (cmp-verified = HEAD).
+
+**Verdict — the residual is NOT loop-organization codegen.** ptxas already
+schedules the 8 mma + rescale identically whether the source loop is
+g-outer/nh-inner (r28–r32) or llama's j0-outer/n-inner (r33) — the compiler
+flattens the unrolled loop and re-schedules the tensor-core + FP32 stream the
+same way. The 1.15×/GMAC surplus is therefore **intrinsic instruction
+composition** (A-frag LDSM consuming + intrinsic sda/sds scale decode +
+staging index math — the region r32 had already attributed) and **nvcc/ptxas
+scheduling of the whole kernel**, not the source-level ordering of the mma
+loop. A source-level reorder cannot close it. Scope caveat recorded in
+docs/CUDA_OPTIMIZATION.md P6 r33: the deeper llama-faithful port that also
+*transposes* to A=weight (eliminating the A-frag LDSM, B=activation via plain
+LDS) would change instruction *composition* rather than loop organization, and
+was not reached within budget — it is the remaining avenue if the "residual"
+line is to be pursued further. The pure loop-organization hypothesis is falsified
+and this line closes at that finding.

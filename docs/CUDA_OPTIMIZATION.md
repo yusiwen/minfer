@@ -1565,6 +1565,75 @@ sits in the A-frag LDSM consuming + intrinsic sda/sds decode + the fp rescale
 (FFMA/FMUL/I2FP — at parity or a deficit vs llama); it is not addressable by a
 source-level integer-ALU cut. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.12.
 
+### P6 r33: hybrid inner-loop port (llama.cpp vec_dot loop structure) — SASS-
+identical, integer-ALU NOT converged → hypothesis FALSIFIED (REVERTED, 2026-09-04)
+
+Decisive experiment on the r32 verdict ("residual is at the compiler floor",
+attributed to A-frag LDSM + intrinsic sda/sds decode + staging + epilogue).
+The ported hypothesis: **"the remaining 1.15×/GMAC gap is pure SASS codegen
+from loop organization"** — i.e. llama's vec_dot loop shape (j0-outer /
+k01-mid / n-inner, A[ntx][4] fragments, get_i/get_j lane map, rescale-as-you-go,
+a transient per-fragment C accumulator) would emit the mma/rescale instruction
+stream better than our flat 8-mma-then-batch-rescale block.
+
+**What was ported (minfer shell kept, per §11 scope).** `mmq_raw_nb_kernel`
+compute loop restructured to llama's **j0-outer (output N = od) / n-inner
+(M-minitile = token)** nesting replacing the previous g(token)-outer /
+nh(od)-inner order — so a weight B-fragment (od-group) is now reused across all
+4 token-minitiles (llama's B-reuse-across-n pattern). Our warp is 16 od-rows
+× 64 tokens, so j0 folds to **2 od-groups** and n spans **4 token-minitiles** =
+8 mma per 32-k chunk (llama's 8 j0-groups arise at ntx=2 × J=64; ours is the
+same 8 mma at a different od/token tile split), and our **k01 is degenerate** —
+one m16n8k32 covers the whole 32-k chunk (nchunk = id/32), so the per-chunk
+rescale boundary and every numeric point are unchanged. A-fragment (activation
+LDSM from swizzled qa8), B-fragment (weight raw-nibble in-register
+0x0F expansion), the sum[]/write-back mapping, the r15 two-term rank-1 fold
+(d·sc·nib − dmin·m), the r31 q-major sda repack, and the fp32 write-back are
+**all untouched** — the change is a pure source reorder of the existing 8 mma +
+rescale.
+
+**Gates.**
+1. Standalone fragment-map validation (r28 `b_frag_validate`/`b_unpack_validate`
+   re-run): **0 mismatches** — the fragment→byte maps are unchanged, so the
+   reorder cannot break the nibble layout (the r13 82.896 garbage mode is not a
+   risk here).
+2. Build clean; ptxas sm_121 `mmq_raw_nb_kernel<8>`: **109 regs, 0 spill**
+   (identical to r31), smem **43,008 B**, **2 blocks/SM preserved**
+   (warps_active 15.02 ≈ 16 warps for 2 blocks).
+3. Parity (NB-active `cuda_prefill_mmq`): **1 passed, 0 failed** (fp rounding).
+4. Greedy-32 token identity vs default f16 path: **byte-identical**.
+5. **Perf — NEUTRAL.** Interleaved 4-pair (warmup + alternating order):
+   −0.73% / −0.59% / +1.30% / −0.10% → median **−0.25%**. This is *structural*,
+   not noise: the SASS is **byte-identical** to r31 (64 IMMA in the same
+   ordering, 109 regs, same LDS.32/LDS.64/LDS.128/LDSM counts) — ptxas already
+   reschedules the mma/rescale the way llama's loop shape would, so a
+   source-level reorder cannot change the emitted machine code (the r30 pattern
+   again: "the compiler already did it").
+6. **ncu census — integer ALU did NOT converge toward 0.751.** Per-thread
+   `op_integer` 393,842,176 → 12.31M warp-inst; IMMA 1,806,336 × 4096 =
+   7.40e9 MAC → **1.66 e-3/MAC** (r29 was 1.598; llama 0.751) — still **~2.2×
+   llama**. `long_scoreboard` 21.39%, `mio_throttle` 15.61% (≈ r31's 21.46/15.61).
+   FP32 FFMA 462,422,016/32 = 14.45M warp-inst (at parity), conversion/fmul
+   unchanged.
+7. Suite: **166/0/3**.
+
+**Verdict — hypothesis FALSIFIED (reverted, cmp-verified = HEAD).** Porting
+llama's vec_dot loop *ordering* (j0/n) into the raw-nibble NB kernel is a
+**SASS no-op** — ptxas emits byte-identical machine code because the compiler
+already schedules the 8 mma + rescale optimally regardless of the source loop
+order. The integer-ALU surplus (1.66 e-3/MAC, ~2.2× llama) did NOT converge,
+so the residual is **NOT** addressable by re-organizing the existing mma/rescale
+loop. It lives in the *composition* of the support instructions (A-frag LDSM
+consuming + intrinsic sda/sds scale decode + staging index math) that neither
+loop order nor rescale timing changes. Note the scope caveat: this r33 was the
+loop-**reorder** port (shell + orientation kept); the deeper "llama-faithful"
+port that also *transposes* to A=weight (eliminating the A-frag LDSM
+altogether, B=activation via plain LDS) was NOT reached within budget — that
+would change instruction *composition*, not just loop organization. The pure
+"loop organization is the residual" hypothesis is closed as falsified at the
+reorder level; the residual is intrinsic instruction mix + nvcc scheduling of
+the whole kernel. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.13.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
