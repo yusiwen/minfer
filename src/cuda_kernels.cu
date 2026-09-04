@@ -4796,15 +4796,20 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
 ) {
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_nb_sh[];
-    // Single-buffer sync-staged, KD=8 totals 45,056 B -> 2 blocks/SM:
+    // Single-buffer sync-staged, KD=8 totals 43,008 B -> 2 blocks/SM:
     //   qa8     [KDR][64][32]   chunk q8 planes (r22 XOR swizzle, r20 split)
-    //   sda_q   [KDR][64] uint2  (d f16 | ssum i16) packed, token-pair tiling
+    //   sda_q   [KDR][64]         (d f16 | ssum i16) packed, one uint32 per
+    //                             token, Q-MAJOR: within kd the 4 token groups
+    //                             for a given lane's pair q are CONTIGUOUS
+    //                             (uint32 idx = kd*64 + q*8 + g*2 + half), so a
+    //                             lane reads its whole per-chunk d/ssum set with
+    //                             TWO LDS.128 (32 LDS.64 -> 16 LDS.128 / k-tile).
     //   qb_raw  [128][128]        raw GGUF qs plane (2 nibbles/byte, full
     //                             super-block per od-row)
     //   sds     [KDR][128] float2 (d | dmin*m): r15 rank-1 rescale terms
     uint8_t* qa8 = mmq_nb_sh;
     uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
-    uint8_t* qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI * 2);
+    uint8_t* qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
     float2* sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
 
     const int warp = threadIdx.x >> 5;
@@ -4868,8 +4873,11 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
             for (int i = 0; i < 2; ++i) {                                      \
                 const int x = threadIdx.x + i * 256;                           \
                 const int r = x & (MMQ_NBI - 1), kd = x / MMQ_NBI;             \
-                *(unsigned*)(sda_q + ((size_t)kd * MMQ_NBI                     \
-                              + (r >> 4) * 8 + (r & 7)) * 2 + ((r >> 3) & 1)) = \
+                const int g = r >> 4, t = r & 15, q = t & 7, half = t >> 3;    \
+                const int rg = g >> 1, gsel = g & 1;                           \
+                /* conflict-free: region=g/2 block, q*16B stride, gsel*8B */  \
+                *(unsigned*)(sda_q + (size_t)kd * MMQ_NBI                       \
+                              + rg * 32 + q * 4 + gsel * 2 + half) =           \
                     dv[i] | (sv[i] << 16);                                     \
             }                                                                  \
         }                                                                      \
@@ -4982,16 +4990,25 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
                 dsv[nh][0] = sc4.x; dsv[nh][1] = sc4.z;
                 dmv[nh][0] = sc4.y; dmv[nh][1] = sc4.w;
             }
+            // r31: Q-major sda repack — one uint32 per token; the group-region
+            // split (g/2 region block, q*16B stride) makes each warp LDS.128
+            // read 8 unique 16B words at 16B stride = bank-conflict-free.
+            // s0 = groups 0,1, s1 = groups 2,3 (TWO LDS.128 instead of the old
+            // four LDS.64). Same values, same per-chunk application points.
+            const uint32_t* sda_blk = sda_q + (size_t)kd * MMQ_NBI
+                                      + (size_t)(lane >> 2) * 4;
+            const uint4 s0 = *(const uint4*)(sda_blk);
+            const uint4 s1 = *(const uint4*)(sda_blk + 32);
             #pragma unroll
             for (int g = 0; g < 4; g++) {
                 float da_q[2];
                 int sa_q[2];
-                const uint2 pk2 = *(const uint2*)(sda_q
-                    + (size_t)kd * MMQ_NBI * 2 + g * 16 + (lane >> 2) * 2);
-                da_q[0] = h2f((unsigned short)(pk2.x & 0xFFFF));
-                sa_q[0] = (int)(short)(pk2.x >> 16);
-                da_q[1] = h2f((unsigned short)(pk2.y & 0xFFFF));
-                sa_q[1] = (int)(short)(pk2.y >> 16);
+                const unsigned w0 = g == 0 ? s0.x : (g == 1 ? s0.z : (g == 2 ? s1.x : s1.z));
+                const unsigned w1 = g == 0 ? s0.y : (g == 1 ? s0.w : (g == 2 ? s1.y : s1.w));
+                da_q[0] = h2f((unsigned short)(w0 & 0xFFFF));
+                sa_q[0] = (int)(short)(w0 >> 16);
+                da_q[1] = h2f((unsigned short)(w1 & 0xFFFF));
+                sa_q[1] = (int)(short)(w1 >> 16);
                 const float dma[2] = { da_q[0] * (float)sa_q[0],
                                        da_q[1] * (float)sa_q[1] };
                 #pragma unroll
@@ -5028,13 +5045,14 @@ extern "C" int launch_mmq_raw_nb_nt(
 ) {
     (void)type_id;
     // 64-token x 128-od block tile, KD=8 native. Raw qs plane + single-buffer
-    // staging = 45,056 B >>> 2 blocks/SM on GB10. KD!=8 is inapplicable to the
+    // staging = 43,008 B (r31 q-major sda repack shrinks sda_q 4,096 ->
+    // 2,048 B) >>> 2 blocks/SM on GB10. KD!=8 is inapplicable to the
     // raw-nibble variant (the qs plane encodes a FULL 256-k super-block), so
     // clean-fallback (return 0) to the wide kernel. smem/reg guards return 0
     // on any cap failure (never silently launch over cap).
     if (kd != 8) return 0;
     const int smem = 8 * MMQ_NBI * 32   // qa8
-                   + 8 * MMQ_NBI * 8    // sda_q (uint2 = 8B)
+                   + 8 * MMQ_NBI * 4    // sda_q (one uint32 per token)
                    + MMQ_NBJ * 128      // qb_raw
                    + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
