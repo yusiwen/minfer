@@ -25,6 +25,7 @@
           pkgs.curl
           pkgs.uv
           pkgs.libiconv
+          pkgs.mdbook
         ];
         shellHook = ''
           export RUST_BACKTRACE=1

@@ -1,0 +1,14 @@
+[book]
+title = "minfer"
+authors = ["Siwen Yu"]
+description = "minfer — a minimal local LLM inference engine built from scratch in Rust"
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "dark"
+preferred-dark-theme = "dark"
+git-repository-url = "https://github.com/yusiwen/minfer"

@@ -16,5 +16,8 @@ uv.lock
 /.cargo-home/
 /.ccc_config/
 
+# mdBook documentation site build output
+/book/
+
 # stray MINFER_TRACE dump accidentally committed twice (Phase 8 review)
 /1
