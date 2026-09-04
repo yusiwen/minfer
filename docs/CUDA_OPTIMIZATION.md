@@ -1139,6 +1139,70 @@ scripts /tmp/gguf_types.py /tmp/merge_types.py /tmp/agg_b23.py
 A/B baseline binary /tmp/minfer_pre_r23 (keep until next B-line session).
 
 
+### P6 r24: scheduling-structure ladder — tile-order swizzle and persistent blocks both measured-closed/REGRESSIVE (2026-09-04)
+
+The last untried structural family on `mmq_raw_wide_nt_kernel` (the 16-chain
+128tok x 128od block: tile shapes, occupancy, staging, op-cuts, L2 residency —
+r13–r23 — all measured-closed). Two rungs attempted, in order, both reverted.
+NOTE: the box re-measured FASTER than the r13–r23 band — the 7B q4_k_m 2659-tok
+prefill (26k prompt, interleaved same-slot 3x medians) sat at **KD=8 ~1385-1391
+/ KD=4 ~1366-1373 tok/s** vs the documented ~1330/1318. So the session bar was
+interpreted as *relative* (≥ +1.5% over the re-measured baseline) because the
+stale "≥1350" absolute is met by the baseline itself; nothing landed (all
+deltas were ≤ −0.5% at best).
+
+**Rung 1 — tile-order swizzle (pure in-kernel blockIdx→(x,y) remap, grid
+unchanged).** Same binary A/B's the orderings via `MINFER_MMQ_RAW_SCHED`
+(passed host→kernel; a bijection on [0,gx)×[0,gy) so each tile is still
+computed once, bit-identically). The grid is (21,28)=588 = 48 waves + tail.
+| sched | order | KD=8 med | KD=4 med |
+|---|---|---:|---:|
+| 0 | default x-fastest (B-hot) | 1370.0 | 1362.6 |
+| 1 | transposed y-fastest (A-hot) | 1345.0 (−2.3%) | 1307.6 (−4.7%) |
+| 2 | G-grouped (GX=3, B-hot within A-groups) | 1344.3 (−2.4%) | 1315.2 (−4.2%) |
+
+sched 0 vs the pre-change binary was within the ±1% noise band. **The default
+x-fastest / B-hot order is the best; the A-hot transpose and the grouped
+alternate both regress.** A-hot loses because the default already keeps the
+small weight panel (B) resident while streaming the (larger, unique) A tile —
+A is not reusable within the dispatch window regardless of order, and B-hot
+reuse is the one that matters. No L2-lever survives here; consistent with r19
+(L2 read traffic only 1.6×) and r21/r22 (the kernel is instruction/issue-bound,
+not memory-scheduling-bound).
+
+**Rung 2 — persistent blocks (launch nblocks = num_sms, each block walks a
+strided tile list `for (u=blockIdx.x; u<nunits; u+=gridDim.x)`).** The kernel
+body was wrapped in this u-loop (so one code path serves both persistent and,
+when ustep==nunits, non-persistent — which reproduces the original mapping
+exactly). Measured (KD=8, interleaved): baseline 1385.1; u-loop non-persistent
+(env PERSIST unset) 1339.5 (**−3.3%**); persistent occ=1 (48 blocks) 1337.8;
+persistent occ=2 (96 blocks) 1335.8. ptxas `-Xptxas -v` shows the u-loop and
+original kernels are register-identical (115 regs, 0 spill) — so the −3.3% is
+the loop-side structure changing the instruction schedule, not register
+pressure. **Persistent recovered ~0 over the same-wrap non-persistent** (p1 ≈
+p0 within noise), i.e. the claimed "25%-idle 13th wave ≈ 2% wall" tail does NOT
+materialize here — the GPU block scheduler pipelines launches smoothly rather
+than in lockstep waves, so there is no quantization tail to remove. Persistent
+is therefore net regressive: it must carry the loop overhead and buys nothing.
+
+**Rung 3 — full stream-k k-split was NOT attempted** (per the ladder: only if
+rungs 1–2 showed promise). They did not, and stream-k would reorder the fp
+accumulation (the parity gate passes only under the 1e-3 tolerance, and the
+greedy token-identity gate is the killer for any add-reordering variant — the
+task's "document as numerically non-portable" branch applies only if it showed
+promise first, which it does not).
+
+Conclusion: **this whole scheduling-structure family is measured-closed and
+non-helpful for the wide MMQ kernel.** The residual levers remain the
+k-loop instruction surplus (499k→418k per tile vs llama 356k, r13/r15/r17) and
+the 3.2M op_st conflict mass — the compute/instruction side, not block or
+tile scheduling. Artifacts: patch/dev notes /tmp/cuda_kernels_pre_r24.cu,
+sched and persist checkpoints /tmp/minfer_r24_sched and /tmp/minfer_r24_persist;
+harness /tmp/ab_medians.sh + configs /tmp/ab_cfg*.txt; logs
+/tmp/minfer_phase7/r24_{kd4,kd8}_ab.log, r24_kd8_persist_ab.log; prompt
+regenerated at /tmp/minfer_phase7/prompt2k.txt (8400B, `gen_prompt.py`).
+
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
