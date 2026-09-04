@@ -20,6 +20,7 @@
 - [CUDA Backend Plan](./CUDA-BACKEND-PLAN.md)
 - [CUDA Follow-up](./CUDA-FOLLOWUP-PLAN.md)
 - [CUDA Optimization](./CUDA_OPTIMIZATION.md)
+- [llama.cpp MMQ Analysis](./LLAMA-CPP-MMQ-ANALYSIS.md)
 
 # Model Support
 
