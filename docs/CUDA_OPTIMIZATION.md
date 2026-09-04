@@ -1203,6 +1203,93 @@ harness /tmp/ab_medians.sh + configs /tmp/ab_cfg*.txt; logs
 regenerated at /tmp/minfer_phase7/prompt2k.txt (8400B, `gen_prompt.py`).
 
 
+### P6 r25: SASS opcode-class census — the instruction-stream composition attributed (2026-09-04)
+
+The last unexamined layer of `mmq_raw_wide_nt_kernel`: not tile shape, occupancy,
+staging, op-cuts, L2 residency or scheduling (r13–r24 measured-closed), but the
+actual composition of the instruction stream. Method: **ncu per-opcode-class
+metrics** captured on the SAME matched layer-0 q-proj GEMM for both kernels
+(nt=512, id=od=3584, grid (4,28) = 112 output tiles; llama `mul_mat_q<12,128,0>`
+grid (48,1,1)). We use `smsp__sass_thread_inst_executed_op_<class>_pred_on`
+(thread-granularity; /32 → warp, validated: `pred_on.sum/32` reproduces
+`smsp__inst_executed.sum` within ~1.4%) plus the dedicated warp-family metrics
+`smsp__sass_inst_executed_op_*`. Normalization: per-tile = the instruction
+stream of ONE 128×128 output tile, fully reduced over K=id, i.e.
+`total / n_tiles` where `n_tiles = (nt/128)(od/128) = 112` (both kernels produce
+the same 112 output tiles). Captures: /tmp/minfer_phase7/ncu_{ours,theirs}_predon.log,
+ncu_{ours,theirs}_{full,metrics}.log; parser /tmp/census.py.
+
+**Totals reconcile.** ours `smsp__inst_executed.sum` = 49,900,928 → **445,544
+warp-inst/tile**; theirs 39,844,864 → **355,758 warp-inst/tile**; **surplus
++89,786/tile (25.2%)**.
+
+| SASS class (ncu opcode metric)         | ours/tile | theirs/tile | delta/tile |  ratio | verdict |
+|---|---:|---:|---:|---:|---|
+| integer ALU (IADD3/IMAD/LEA/SHF/SEL/ISETP/LOP3) | **113,552** |  44,087 | **+69,465** | 2.58× | ← 77% of surplus |
+| FP32 FMUL (rescale)                    |  72,592 |  57,344 | +15,248 | 1.27× | dequant-rescale |
+| conversion (I2FP/F2I)                  |  72,600 |  58,254 | +14,346 | 1.25× | int-mma→fp32 |
+| misc (NOP/CS2R)                       |  13,336 |   5,851 |  +7,485 | 2.28× | loop/init |
+| control-flow (BRA/isync)               |   3,584 |   1,160 |  +2,424 | 3.09× | loop control |
+| uniform datapath (UR)                  |   1,808 |      55 |  +1,753 | 33×  | uniform regs |
+| FP32 FFMA (rescale/accum)              | 114,688 | 114,688 |     +0 | 1.00× | **identical** |
+| bit (LOP3/PRMT/SHF)                    |       8 |     456 |    -448 | 0.02× | (theirs more) |
+| fp16 HADD2/HFMA path                   |  15,232 |  36,400 | -21,168 | 0.42× | (theirs more) |
+| memory (LDG/STS/LDS/LDSM)              |  31,816 |  36,836 |  -5,020 | 0.86× | (theirs more) |
+
+Dedicated warp-family memory metrics (per tile): global_ld ours 6,944 / theirs
+6,384 (+560); LDSM ours 8,064 / theirs 1,792 (**+6,272**, 4.5×); shared_ld ours
+8,960 / theirs 19,346 (−10,386, theirs 2.2× more); shared_st ours 5,376 / theirs
+7,730 (−2,354).
+
+**Verdict — paradigm difference, not a tuning gap.** IMMA and FFMA are identical
+between the kernels (the 2×MAC tensor + the MAC-scaled fp32 rescale, 114,688
+FFMA/tile both) — the compute is exactly MAC-bound on both sides, so the surplus
+is **100% support instructions**. The composition split is:
+1. **Integer/address ALU, +69.5k/tile (77%)** — our per-chunk address/predicate
+   math. The 128-token warp tile runs 8 A-fragments (ldmatrix.x4) + 1 B-fragment
+   per chunk = 9 LDSM/chunk (→ 8,064 LDSM/tile vs llama's 1,792). llama loads A
+   with plain LDS — hence its 2.2× higher shared_ld (19,346) but much lower LDSM.
+   Combined with the staging bounds/predicate math, ours carries ~2.6× the
+   integer/predicate ALU per MAC.
+2. **FP32 dequant-rescale, +29.6k/tile** (FMUL + I2FP) — our rank-1 rescale
+   converts every int-mma accumulator to fp32 and FMA-recombines it with a
+   per-chunk-varying `d*sc` scale; llama dequantizes to **fp16** (HADD2/HFMA
+   path, its +21k/tile) which needs fewer fp32 FMUL + I2FP conversions.
+3. **Memory movement is NOT the surplus** — ours is LOWER on shared loads
+   (8,960 vs 19,346) and total memory warp-inst (31,816 vs 36,836); the extra
+   stream is pure ALU. That is exactly why the kernel is issue-bound (0.26 vs
+   0.42): the scheduler spends its slots on integer/conversion overhead, not
+   memory or tensor work.
+
+**The fix attempt and what it proved.** The top actionable class (integer ALU)
+was attacked with the one lever that is pure "hoist invariants / widen
+addressing" and keeps r14/r20/r22 intact: `#pragma unroll` on the per-chunk
+`kd` loop (it was being kept as a rolled loop; KDR=4 → fully unrolled, 16→64
+IMMA static, 9→36 LDSM). Parity green KD=4 and KD=8; suite green (0 failed);
+token-identity check passed. ncu on the unrolled binary: **integer ALU
+−38%** (406.97M→251.83M thread-inst), control −19%, **total `smsp__inst_executed`
+−9.7%** (49,900,928→45,063,424 → 402,352/tile, the surplus halved to +46.6k).
+Interleaved 3x/5x medians (re-measured baseline /tmp/minfer_pre_r25: KD=8
+1386.8, KD=4 1376.3): KD=8 +0.37%, KD=4 +0.49% — **well below the +1.5% bar**.
+So the instruction-stream surplus is real and concentrated in the integer/address
+ALU (not evenly spread) — **but it is wall-inert**: a 38% cut in that class,
+which halves the instruction surplus, moves the wall by <0.5%. The wide kernel is
+**not instruction-count-bound**; it is issue/occupancy-bound (98KB smem → 1
+block/SM → ~2 active warps/scheduler → memory latency not hidden), which is the
+r20 "issue-stall, not instruction" hypothesis confirmed from the instruction-
+stream side and closed. **Reverted** (src/cuda_kernels.cu cmp-restored to HEAD
+8a007dc, md5 30135bd); the census above is the deliverable of record.
+Paradigm verdict: to close the wall gap the lever is **occupancy/latency-hiding**
+(more warps per SM), not fewer instructions — llama's 1.92-warp-issue loss is
+structural and cannot be fixed by instruction cuts at 1 block/SM.
+
+Artifacts: /tmp/census.py; SASS dumps /tmp/{kernel_wide4,kernel_mulmatq12}.sass,
+/tmp/miner{,_r25}.sass; ncu captures /tmp/minfer_phase7/ncu_{ours,theirs}_predon.log,
+ncu_{ours,theirs}_{full,metrics}.log, ncu_r25.log; prompt locked at
+/tmp/minfer_phase7/prompt512.locked (512 tok, `gen_prompt512.py`); baseline binary
+/tmp/minfer_pre_r25; patch /tmp/patch_r25_unroll.py (reverted); harnesses /tmp/perf_run.sh
+/tmp/ab_medians.sh (reused); A/B logs r25_{kd8,4}_{a,b}_ab.log.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
