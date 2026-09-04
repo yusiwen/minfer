@@ -1,27 +1,27 @@
 {
   "samples": [
     {
-      "label": "★ Qwen2.5-0.5B · trace：prefill + 3 步 decode（真实数据）",
+      "label": "★ Qwen2.5-0.5B · trace: prefill + 3-step decode (real data)",
       "file": "qwen2.5-0.5b-trace.json"
     },
     {
-      "label": "Qwen2.5-0.5B · prefill · Metal (440 节点)",
+      "label": "Qwen2.5-0.5B · prefill · Metal (440 nodes)",
       "file": "qwen2.5-0.5b-prefill-metal.json"
     },
     {
-      "label": "Qwen2.5-0.5B · prefill · CPU (440 节点)",
+      "label": "Qwen2.5-0.5B · prefill · CPU (440 nodes)",
       "file": "qwen2.5-0.5b-prefill-cpu.json"
     },
     {
-      "label": "Qwen2.5-0.5B · decode · Metal 融合 (305 节点)",
+      "label": "Qwen2.5-0.5B · decode · Metal fused (305 nodes)",
       "file": "qwen2.5-0.5b-decode-metal.json"
     },
     {
-      "label": "Qwen3-0.6B · prefill · Metal (568 节点)",
+      "label": "Qwen3-0.6B · prefill · Metal (568 nodes)",
       "file": "qwen3-0.6b-prefill-metal.json"
     },
     {
-      "label": "Qwen2.5-7B · prefill · Metal (512 节点)",
+      "label": "Qwen2.5-7B · prefill · Metal (512 nodes)",
       "file": "qwen2.5-7b-prefill-metal.json"
     }
   ]
