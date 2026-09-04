@@ -1462,6 +1462,60 @@ problem — they live in the A-frag LDSM, the sda/sds scale reads, the staging
 index math, and the epilogue, which the SWAR does not touch. No further code
 change landed.
 
+### P6 r31: q-major sda scale-read repack — 32 LDS.64 -> 16 LDS.128
+(conflict-free) (LANDED, 2026-09-04)
+
+Follow-up on r30's verdict that the sda/sds scale reads are an untouched surplus
+class. Task: restructure the SDA/SDS smem layout (staging + compute together,
+global-side format untouched) so each warp's per-kt scale data is read with
+fewer wider loads. **SASS first** (r30 lesson): disassembling the r29 kernel
+(sm_121, `cuobjdump -sass`) confirmed ptxas had **not** coalesced the sda reads —
+each kd chunk emits 4 separate `LDS.64` (groups g=0..3 at 0x40 stride) for the
+per-chunk uint2 `(d f16 | ssum i16)` token-pair tiling, plus 2 `LDS.128` for the
+sds float4 pairs. Headroom existed.
+
+**The change.** The old sda layout was g-major (4 token groups at 0x40 stride,
+each lane's pair q at `q*8 + g*64`, so a lane's 4 group reads were 64 B apart).
+Repack sda to one-uint32-per-token with a **group-region split**: within kd the
+uint32 index is `kd*64 + rg*32 + q*4 + gsel*2 + half` (rg = g/2 region block,
+gsel = g&1). A lane then reads its whole per-chunk d/ssum set from `sda_blk =
+sda_q + kd*64 + (lane>>2)*4` as **TWO `LDS.128`** (s0 = groups 0,1, s1 = groups
+2,3) at **16 B stride across the warp → bank-conflict-free**. The `w0`/`w1`
+select mapping reproduces the same `(da_q, sa_q)` values at the same per-chunk
+application points (no rank-1 fold change, r22 qa8 swizzle untouched). The naive
+q-major `[q][g0..g3]` 32B-per-lane first attempt was **2-way bank-conflicted**
+(s0 reads at 0,32,64,…,224 hit banks 0-3 twice) and measured +0.57% — caught by
+the conflict analysis, fixed to the region-split layout.
+
+**Gates (all green except the +1.5% perf bar):**
+- Build clean; ptxas sm_121 `mmq_raw_nb_kernel<8>`: **109 regs, 0 spill** (r29
+  111), 2 blocks/SM preserved (STACK 0, LOCAL 0).
+- SASS before/after: `LDS.64` 32->**0**, `LDS.128` 16->**32**, `LDS.32` 16/16
+  (B-raw), `LDSM` 32/32, `IMMA` 64/64 — the scale path collapsed 48 -> 32
+  LDS-family instructions per k-tile, all max-width.
+- Parity (NB-active `cuda_prefill_mmq`): **1 passed, 0 failed**.
+- Greedy-32 token identity vs default f16 path: **byte-identical**.
+- Suite: **166/0/3** (a flaky 164/2 on one run reverted to 166/0 on rerun).
+- ncu (551-token prefill, `regex:mmq_raw_nb`): `long_scoreboard` **24.61% ->
+  21.46%**, `mio_throttle` **16.53% -> 15.61%**; `smsp__inst_executed.sum` slightly
+  lower. The mechanism is confirmed: the scale-read path stalls dropped.
+- Perf (7B q4_k_m interleaved, warmup + alternating order, grand median of 45
+  samples): baseline **1424.10** -> r31 **1439.40** = **+1.07%** median
+  (+0.98% mean). Below the +1.5% nominal bar; range across runs +0.49% (6-pair)
+  to +2.38% (4-pair with a baseline device dip).
+
+**Verdict — landed as a positive but sub-bar improvement.** The sda repack is a
+real, mechanism-confirmed reduction: ptxas had **not** coalesced the reads and
+the change does (48 -> 32 conflict-free LDS), cutting the shared-memory-path
+stalls (longsb -3.15 pp, mio -0.92 pp) with **111 -> 109 regs (0 spill)** and
+smem 45,056 -> 43,008 B (2 blocks/SM preserved). The wall moved **+1.07%**
+median — real (ncu-confirmed mechanism, no regressing rounds in the hot runs)
+but below the +1.5% bar. The scale-read class is therefore *partially* closed:
+it was not noise-immune but is now minimized; the **integer-ALU surplus
+(1.598 e-3/MAC, ~2.1× llama) remains the dominant class**, sitting in the A-frag
+LDSM (irreducible), the staging index math, and the epilogue. Recorded:
+docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.11.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

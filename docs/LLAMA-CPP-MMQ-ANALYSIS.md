@@ -785,3 +785,29 @@ instruction stream; the remaining integer-ALU surplus (1.598 e-3/MAC) and the
 shared-memory-path stalls (`mio_throttle` 15.4%, `long_scoreboard` 19.0%) come
 from the A-frag LDSM, the sda/sds scale reads, the staging index math, and the
 epilogue — not the byte-vs-word unpack. Recorded: docs/CUDA_OPTIMIZATION.md P6 r30.
+
+### 11.11 Follow-up (r31, 2026-09-04): the sda scale-read repack — a real but
+sub-bar win (LANDED)
+
+§11.10 left the sda/sds scale reads as an untouched surplus class. r31 restaged
+only the **sda** side (the sds path is already at its max-width floor) and the
+compute-side consumption together. SASS-first confirmed ptxas had **not** merged
+the 4 per-kd sda `LDS.64` (each kd emits them at 0x40 stride — headroom existed,
+unlike the r30 B-unpack which the compiler had already CSE'd).
+
+The repack makes sda one-uint32-per-token with a *group-region split*
+(`kd*64 + rg*32 + q*4 + gsel*2 + half`, rg = g/2, gsel = g&1) so a lane's four
+token-groups' `(d|ssum)` are read as **TWO `LDS.128`** (s0 = groups 0,1, s1 =
+groups 2,3) at **16 B warp stride → bank-conflict-free**. A first q-major
+`[q][g0..g3]` attempt (32 B per lane at 32 B stride) was 2-way bank-conflicted
+and reached only +0.57%; the region-split killed the conflict. Same values, same
+per-chunk application points; the r15 two-term rank-1 fold and r22 qa8 swizzle
+are untouched.
+
+**Result:** SASS `LDS.64` 32 → 0, `LDS.128` 16 → 32 (scale path 48 → 32
+conflict-free LDS/kt); sm_121 **109 regs, 0 spill** (was 111); smem 45,056 →
+43,008 B (2 blocks/SM kept). Parity (NB-active) 1/0, greedy-32 byte-identical,
+suite 166/0/3. ncu: `long_scoreboard` 24.61% → 21.46%, `mio_throttle` 16.53% →
+15.61%. Wall **+1.07%** median across 45 samples — above noise but **below the
++1.5% bar**. Landed as a positive but sub-bar improvement (mechanism-confirmed,
+register-neutral). See docs/CUDA_OPTIMIZATION.md P6 r31.
