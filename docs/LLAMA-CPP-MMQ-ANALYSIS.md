@@ -8,9 +8,12 @@ r25 SASS opcode-class census, both reproduced verbatim below.
 
 **Sources.** llama.cpp at `ca3d5a3e1` (matches the `mul_mat_q<12,128,0>` that was profiled):
 `ggml/src/ggml-cuda/{mmq.cuh, mmq-vec-dot.cuh, mmq-load-tiles.cuh, mma.cuh,
-mmq-config-ampere.cuh, mmq.cu}`. minfer at the r25 HEAD: `src/cuda_kernels.cu`
+mmq-config-ampere.cuh, mmq.cu, quantize.cu}`, plus `ggml/src/ggml-common.h` and
+`ggml/src/ggml-quants.c`. minfer at the r25 HEAD: `src/cuda_kernels.cu`
 (`mmq_raw_wide_nt_kernel<KDR>` + `mmq_stage_b`). Where the campaign document and the source
-disagree, the discrepancy is listed in §Corrections rather than silently repeated.
+disagree, the discrepancy is listed in §Corrections rather than silently repeated. (This write-up
+was re-verified against the source line-by-line by the post-r25 audit; the audit's corrections are
+the resolved items in §Corrections.)
 
 Reading convention: `x` = src0 = the **weight** matrix (only quantized tensors reach MMQ; it is
 kept RAW in smem); `y` = src1 = the **activation** tokens (quantized to q8_1 on device); `dst` is
@@ -38,9 +41,10 @@ in the supported switch (mmq.cu:277). The decisive rule on NVIDIA is **Turing+**
 `turing_mma_available` = NVIDIA && highest-compiled-arch ≥ Turing, common.cuh:348-350) MMQ is
 chosen **unconditionally** for every supported quantized type, for any batch size. So the
 "prefill threshold" framing is an AMD-only idea: the `ne11 < MMQ_DP4A_MAX_BATCH_SIZE (=64)` gate
-(mmq.cu:327, constant at mmq.cuh:8) is the non-Turing-NVIDIA / AMD branch; the `ne11 <= 128/256`
-gates are the RDNA branch (mmq.cu:337-345). On GB10 the only extra requirement is ≥48 KiB
-per-block smem (mmq.cu:303-310).
+(mmq.cu:327, constant at mmq.cuh:8) sits **inside the NVIDIA-only branch** (`if
+(GGML_CUDA_CC_IS_NVIDIA(cc))`, mmq.cu:326-328) and applies only when `turing_mma_available` is
+false; the AMD/RDNA gates are **separate** (mmq.cu:330-385, incl. the `ne11 <= 128/256` RDNA branch
+at mmq.cu:337-345). On GB10 the only extra requirement is ≥48 KiB per-block smem (mmq.cu:303-310).
 
 **Ubatch shape.** The "nt-512" the campaign profiled is not a dispatch threshold; it is the ubatch
 (ubatch size) that llama.cpp splits the prefill into. `-p 2600` becomes 512-token ubatches
@@ -59,6 +63,16 @@ src1→ne1 / dst→ne1 (the token dim), sram_layout = the weight-tile byte layou
 K per inner loop (= MMQ_ITER_K = 256, mmq.cuh:9). `fallback` toggles out-of-bounds guards in the
 od direction (selected at mmq.cuh:1560-1566 by `nrows_x % 128 == 0`).
 
+**MoE batch edge cases.** `ggml_cuda_mul_mat_q` has a second (MoE, `ids != nullptr`) arm
+(mmq.cu:179-256) that only differs in how the activation rows are gathered and scattered: it builds
+an `ids_src1`/`ids_dst` inverse map + `expert_bounds` (mmq.cu:187-189) via `ggml_cuda_launch_mm_ids_helper`
+(mmq.cu:200-201), and for the gate/up broadcast case (`dedup_bcast = ne11 == 1 && n_expert_used > 1`,
+mmq.cu:193) it quantizes each token once and scatters to its compact rows through the `ids_src1`
+map (`quantize_scatter_mmq_q8_1_cuda`, mmq.cu:233-234). Both arms pad the activation's inner dim to a
+row-multiple: `ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING)` (mmq.cu:120), which sizes the
+`src1_q8_1` buffer (mmq.cu:136-138, 205-207); the `s12`/`s13` strides and the `ntx`/`nty` grid are
+computed from `ne10_padded`, not `ne10`.
+
 ## 2. Block / warp / tile geometry
 
 | Param | Value | Source |
@@ -70,33 +84,50 @@ od direction (selected at mmq.cuh:1560-1566 by `nrows_x % 128 == 0`).
 | rows_per_warp | 32 (J=128 → `J>=48 && J%16==0` → 32) | mmq.cuh:180-186 |
 | ntx (x-minitiles/warp) | `rows_per_warp / tile_C::I` = 32/16 = **2** | mmq-vec-dot.cuh:377 |
 | accumulator regs | `sum[J*I/(nwarps*warp_size)]` = 128·128/256 = **sum[64]** | mmq.cuh:903 |
-| mma chains per 32-k chunk | 8 j0-steps × ntx=2 = **16 mma.m16n8k32** | mmq-vec-dot.cuh:413-440 |
+| mma per vec_dot (32-k chunk) | j0:8 × k01:4 (step `QI8_1=8`) × ntx:2 = **64 mma.m16n8k32** (16 per k01 sub-iter) | mmq-vec-dot.cuh:414-440 |
 
 Warp-to-tile mapping (mmq-vec-dot.cuh:389-390): the 8 warps split into 4 od-groups by
 `i0 = (threadIdx.y/ntx)*rows_per_warp = (ty/2)*32`, and within each od-group the two warps
 de-interleave the token stream via `y += (ty%ntx)*(tile_C::J*MMQ_TILE_Y_K)` (mmq-vec-dot.cuh:379).
-Each warp covers `rows_per_warp=32` od-rows (`ntx=2` × `tile_C::I=16` minitiles) and the full
-`J=128` token tile in `J/(ntx·tile_C::J) = 128/16 = 8` j0-steps. Each j0-step issues one
-`tile_C::ne = 16·8/32 = 4`-register C fragment per minitile (mma.cuh:108) — so the 16 `mma`
-instances per 32-k chunk produce 16×4 = 64 C values that land in the 64 `sum` registers.
+Each od-group covers `rows_per_warp=32` od-rows (`ntx=2` × `tile_C::I=16` minitiles) and the full
+`J=128` token tile, but **each warp covers only 64 token columns**: a warp does
+`J/(ntx·tile_C::J) = 128/(2·8) = 8` j0-steps of `tile_C::J=8` token columns, and the pair jointly
+covers all 128. Each j0-step × k01-step × n issues one `tile_C::ne = 16·8/32 = 4`-register C fragment
+per minitile (mma.cuh:227) — so the 64 `mma` instances per 32-k chunk (per `vec_dot` call) fill the
+64 `sum` registers, each accumulated 4× (once per k01 sub-iteration).
 
 **tile_C / fragment mapping.** The mma wrapper is `mma(D, A, B)` with `tile<16,8,int>` D (C), A,
 and `tile<8,8,int>` B (mmq-vec-dot.cuh:370-372), which expands to
 `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` (mma.cuh:946). Because each `int` holds four
 int8 (K=32 packed into K/4=8 words), `tile<16,8,int>::ne = 16·8/32 = 4` registers per thread
-(mma.cuh:108). The CAMPAIGN'S "I·J/32 = 4 regs per m16n8k32 C" reading is confirmed (`tile<I,J,T,DATA_LAYOUT_I_MAJOR>`:
+(mma.cuh:227). The CAMPAIGN'S "I·J/32 = 4 regs per m16n8k32 C" reading is confirmed (`tile<I,J,T,DATA_LAYOUT_I_MAJOR>`:
 `ne = I*J/32` on the NVIDIA Turing+ branch, mma.cuh:226-227); the `I·J/64 = 2` figure belongs to the
 AMD MFMA branch (`#if defined(AMD_MFMA_AVAILABLE)`, mma.cuh:107-108) and was corrected in r11.
+
+**Lane-level C-fragment map (NVIDIA `tile<16,8,int>`, `DATA_LAYOUT_I_MAJOR`).** For the C (sum)
+fragment each lane holds `ne = 4` values mapped by `get_i(l) = (l/2)*8 + threadIdx.x/4` and
+`get_j(l) = (threadIdx.x%4)*2 + (l%2)` (mma.cuh:245,262 — note the audit's pointer to
+mmq-vec-dot.cuh is off by file; the helpers live in mma.cuh). So a lane owns a 2×2 block of the
+16×8 C tile at rows `{threadIdx.x/4, threadIdx.x/4+8}` and columns `{(threadIdx.x%4)*2,
+(threadIdx.x%4)*2+1}`: `l=0,1` sit on row `tid/4` (cols `(tid%4)*2` and `+1`), `l=2,3` on row
+`tid/4+8`. Because `tile_C::J=8`, these per-lane columns are the token columns the mma writes, and
+the `get_j` map is what ties the C fragment's columns to the j0-stepped token tile.
 
 ## 3. Activation pipeline
 
 The activation (src1, f32) is quantized to `block_q8_1_mmq` **once per GEMM launch, before the
 kernel**, not per block. In `ggml_cuda_mul_mat_q` (mmq.cu:85-256) a vmem pool buffer
-`src1_q8_1` is allocated (mmq.cu:136) and filled by `ggml_cuda_quantize_q8_1`/`quantize_mmq`
-(mmq.cu:151-175, non-MoE and MoE arms), then `tile_y` is bulk-loaded from it (mmq.cuh:909-939).
-This is a key asymmetry vs minfer: **llama quantizes the activations once per GEMM call; minfer pays
-a separate per-launch quantize pass in its default path** (the campaign's r23 "convert f32→f16"
-73 ms tax maps to this; llama pays zero because MMQ quantizes in-kernel, mmq.cu:137-175).
+`src1_q8_1` is allocated (mmq.cu:138) and filled by a **separate quantize kernel** —
+`quantize_mmq_q8_1` (quantize.cu:458) launched via `quantize_mmq_q8_1_cuda` (quantize.cu:575) inside
+`ggml_cuda_mul_mat_q` (mmq.cu:156-157 non-MoE, :236-237 MoE; `quantize_scatter_mmq_q8_1_cuda` for the
+MoE `dedup_bcast` arm, :233-234) — then `tile_y` is bulk-loaded from it (mmq.cuh:909-939). So llama
+does **not** fuse the activation quantize into the MMQ kernel; it runs a per-GEMM q8_1 quantize pass
+as a separate kernel (once per launch, not per block in the hot loop). The minfer asymmetry stands —
+llama quantizes the activations **once per GEMM call** while minfer's default path pays its own
+r23 "convert f32→f16" 73 ms per-launch tax — but the cost is of the same order: **minfer's r23
+default-path accounting should credit llama with a quantize-pass cost similar to its own convert tax.**
+(The q8_1 quantize is cheaper than minfer's f32→f16 convert; the point is that "llama pays zero"
+is not correct.)
 
 `block_q8_1_mmq` (mmq.cuh:27-46) is a 128-element block (QK8_1_MMQ = 4·QK8_1 = 128): a leading
 16-byte union of scales (`d4[4]`, `ds4[4]`, or `d2s6[8]`) plus `int8_t qs[128]`; `sizeof == 144 B`
@@ -106,11 +137,13 @@ and partial sum** — this is the "d/ssum in pad bytes" claim. For Q4_K/Q5_K the
 (mmq.cuh:82-84): `half2 ds4[4]` carries one 16-bit scale + one 16-bit partial sum per 32 values
 (d0,s0,d1,s1,…).
 
-Inside the kernel the activation tile `tile_y` has row stride `MMQ_TILE_Y_K = 33 ints = 132 B`
-(mmq.cuh:119; `MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 1`). The qs data is read at `y+4` and the
-scale at `(half2*)y` (mmq-vec-dot.cuh:383-384). The "132 B-ish" figure is the **smem row stride**;
-the global block is 144 B — the two differ because the smem tile strips the block's own layout into
-`[scale || qs]` at a 32-int qs stride + 1-int scale word.
+Inside the kernel the activation tile `tile_y` has row stride `MMQ_TILE_Y_K = 36 ints = 144 B`
+(mmq.cuh:119; `MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4`, since `QI8_1 = QK8_1/(4·QR8_1) = 32/4 = 8`,
+ggml-common.h:124,258). The row is `[scale || qs]`: the q8_1 scale union — `half2 ds4[4]` in the DS4
+layout used for Q4_K/Q5_K, i.e. 4 ints — is read at `(half2*)y` and the 32-int qs plane at `y+4`
+(mmq-vec-dot.cuh:383-384). So the smem row stride **equals** the global `block_q8_1_mmq` size (144 B,
+mmq.cuh:56-57); the two were only "different" earlier because the scale word was miscounted as 1 int
+instead of the DS4 layout's 4 ints.
 
 ## 4. Weight staging & smem layout
 
@@ -130,8 +163,9 @@ dmin subtraction at this point)** — the dmin is instead folded into the scale:
 (mmq-load-tiles.cuh:772-777), so the half2 holds `(d·sc, −dmin·m)` per 32-value sub-block.
 
 The smem row stride is `sram_stride = ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)
-= 2·MMQ_TILE_NE_K + 2·MMQ_TILE_NE_K/QI8_1 + 4 = 64 + 2 + 4 = **70 ints (280 B)**` (mmq.cuh:137).
-`K%8 == 4` is statically enforced (mmq.cuh:153-159). The "+4" is the 16-byte pad that makes
+= 2·MMQ_TILE_NE_K + 2·MMQ_TILE_NE_K/QI8_1 + 4 = 64 + 8 + 4 = **76 ints (304 B)**` (mmq.cuh:137;
+`2·MMQ_TILE_NE_K/QI8_1 = (2·32)/8 = 8`, not 2 — the earlier "70 ints (280 B)" undercounted the
+second term). `K%8 == 4` is statically enforced (mmq.cuh:153-159). The "+4" is the 16-byte pad that makes
 consecutive rows rotate bank phases; the nibble plane occupies the leading
 `2·MMQ_TILE_NE_K = 64` ints and the half2 scale plane follows at offset 64 (mmq-vec-dot.cuh:381-382).
 
@@ -146,6 +180,20 @@ finding verified (structurally established from the source, r20).
 cp.async / TMA pipeline** in the classic (non-Blackwell-fp4) MMQ path; the latency hiding comes
 solely from having enough resident warps, not from prefetch depth.
 
+**Q6_K specialization — different scale layout from q4_K.** Q6_K uses `GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K`
+with its own load (`ggml_cuda_mmq_load_tiles_q6_K`, mmq-load-tiles.cuh:938) and vec_dot
+(`ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma`, mmq-vec-dot.cuh:1018), and no raw-nibble dmin fold. Its smem
+row stride is `2·MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K + MMQ_TILE_NE_K/8 + 7 = 64 + 1 + 4 + 7 = 76 ints`
+(mmq.cuh:143; `QI6_K = QK_K/(4·QR6_K) = 256/8 = 32`, ggml-common.h:139). The q6_K nibbles are **fully
+centered at load**: `x_qs[...] = __vsubss4(ql | qh, 0x20202020)` (mmq-load-tiles.cuh:982-983) subtracts
+32 from each byte, producing signed int8 in [−32,31] — no dmin term later (unlike q4_K, which keeps
+raw 0..15 nibbles and removes dmin at accumulate). The scale layout is split rather than a half2:
+one `float d` per row (`x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = bxi->d`, mmq-load-tiles.cuh:1003) plus
+an `int8` scale per 16-value sub-block (`x_sc`, mmq-load-tiles.cuh:1021; unpacked per byte at
+mmq-vec-dot.cuh:1115-1121). The rescale is therefore two-stage: `tmp = (C0·scA0 + C1·scA1)·dB`
+accumulated per j0-step, then `sum += tmp·dA` (mmq-vec-dot.cuh:1161,1170) — i.e. the signed int8 scale
+is folded with the float `d` at the end, a materially different flow from q4_K's `sum += dmA·dsB·C`.
+
 ## 5. Launch schedule
 
 The host launch is `launch_mul_mat_q` (mmq.cuh:1393-1473). It reads `nsm` (mmq.cuh:1397) and
@@ -157,6 +205,14 @@ const int tiles_nwaves = (ntiles_dst + nsm - 1)/nsm;            // mmq.cuh:1440
 const int tiles_efficiency_percent = 100*ntiles_dst/(nsm*tiles_nwaves);  // mmq.cuh:1441
 block_nums_stream_k = (NVIDIA && efficiency >= 90) ? ntiles_dst : nsm;    // mmq.cuh:1442
 ```
+
+**ntx/nty derivation.** The grid dims are host-derived from the tile sizes, not hardcoded:
+`nty = (nrows_x + I - 1)/I` and `ntx = (ncols_max + J - 1)/J` (mmq.cuh:1410-1411); the kernel
+recomputes `nty = (nrows_x + I - 1)/I` from the passed `nrows_x` (mmq.cuh:974) and receives `ntx`
+as a fast-divisor param (`ntx_fd`, mmq.cuh:1421). This parameterization is what drives the
+stream-k `ntiles_dst = ntx·nty·ntzw` (mmq.cuh:1439) and the fixup `ntiles_dst % blocks != 0`
+decision below — so `ntx`/`nty` are dictated by `ncols_max`/`nrows_x` (the ubatch shape), not by a
+dispatch threshold.
 
 For the nt-512 q-proj (`ntx=4, nty=28`): `ntiles_dst = 112`, `tiles_nwaves = ceil(112/48) = 3`,
 `efficiency = 100·112/144 = 77.8% < 90%` → `block_nums_stream_k = nsm = 48` → **grid (48,1,1)
@@ -171,20 +227,39 @@ the accumulation is fp, the order of partial-sum adds is not reproducible. `mul_
 them into `dst`. This is the numeric cost of stream-k: the campaign measured the fixup at **+34 μs**
 (r20).
 
-**Occupancy math.** `nbytes_shared = mmq_get_nbytes_shared` (mmq.cuh:1386-1391):
-`nbs_ids = J·4 = 512`, `nbs_x = I·sram_stride·4 = 128·70·4 = 35,840`, `nbs_y = J·144 = 18,432`
-(+pad to nthreads·4 = 1024) → **54,784 B ≈ 53.5 KB** per block. With ~99 KB shared/SM on GB10 that
+**Write-back epilogue.** The accumulator is already fp32 end-to-end: the C fragment is an int32
+mma result, but it is converted at the rescale `sum += dmA.x·dsB.x·C.x + dmA.y·dsB.y`
+(mmq-vec-dot.cuh:434-437) and `sum[]` is `float` (mmq.cuh:903). So `write_back` is a **plain
+per-value global store** — `dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l]`
+(`ggml_cuda_mmq_write_back_mma`, mmq.cuh:473-525, esp. :519; no NVFP4/y_scale rescale on the
+Q4_K path). For stream-k the `fixup=true` arm writes **contiguous per-block** partials instead:
+`write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J)` (mmq.cuh:943), and the
+separate `mul_mat_q_stream_k_fixup` second launch runs **only** when `ntiles_dst % block_nums_stream_k.x
+!= 0` (`fixup_needed`, mmq.cuh:1446; allocated tmp_fixup :1450-1451, fixup launch :1464-1469).
+
+**Occupancy math.** `nbytes_shared = nbs_ids + nbs_x + GGML_PAD(nbs_y, nthreads·sizeof(int))`
+(mmq.cuh:1386-1391): `nbs_ids = J·4 = 512`, `nbs_x = I·sram_stride·4 = 128·76·4 = 38,912`,
+`nbs_y = J·144 = 18,432`. At the profiled I=J=128 shape `GGML_PAD(18,432, 1024) = 18,432`
+(18,432 = 18×1024, so **no pad step** — the pad only applies for J not a multiple of 64, e.g. J=80)
+→ **57,856 B ≈ 56.5 KB** per block. With ~99 KB shared/SM on GB10 that
 is 1 block/SM, and it is additionally **pinned to 1** by `__launch_bounds__(nthreads, 1)`
 (mmq.cuh:953). 8 warps over 4 schedulers → **2.00 active warps/sched** — matching the r20 capture.
 The occupancy lever that raw-nibble smem buys is real for **smaller J tiles** (e.g. J=64 →
-`nbs_y = 9,216`, total ≈ 44.5 KB → 2 blocks/SM); at the profiled I=J=128 shape llama is 1 block/SM
-exactly like minfer.
+`nbs_y = 9,216`, total 48,384 B ≈ 47.3 KB → 2 blocks/SM); at the profiled I=J=128 shape llama is
+1 block/SM exactly like minfer.
 
 ## 6. Compute loop & numerics
 
 The q4_K compute loop is the **universal `ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma`** (dispatched at
 mmq.cuh:770), with the weight dequantize done once in `load_tiles_q4_K`. Core (mmq-vec-dot.cuh:369-442):
 
+- **Loop granularity (NVIDIA path).** `vec_dot` is called once per 32-k chunk (per `k00`), and each
+  call issues **64 `mma`**: `j0` = {0,16,…,112} (8 steps, stride `ntx·tile_C::J = 16`) × `k01` =
+  {0,8,16,24} (4 steps, step `QI8_1=8`) × `n` = {0,1} (2) (mmq-vec-dot.cuh:414-440). A-frags = `tile_A
+  A[ntx][MMQ_TILE_NE_K/QI8_1]` = A[2][4] = **8** A-frags (mmq-vec-dot.cuh:386, loaded once before the
+  j0 loop), B-frags = **32** `tile_B` (one per j0×k01, :420, reused across the 2 n-iterations). Because
+  the `sum` index does not depend on `k01`, each `sum` slot is accumulated **4×** per vec_dot (once
+  per k01 sub-iteration). (The campaign's "16 mma per 32-k chunk" is the per-k01 count, 8 j0 × 2 n.)
 - A-fragments `tile_A[ntx]` loaded by `load_ldmatrix(A[n], x_qs + (i0+n·tile_A::I)·sram_stride + k0,
   sram_stride)` (mmq-vec-dot.cuh:397) — ldmatrix.m8n8.x4 over the raw-nibble rows.
 - B-fragments `tile_B` loaded by `load_generic(B, y_qs + j0·MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K)`
@@ -299,9 +374,11 @@ smem budget buys*:
    runs through 16-bit half2 scale values rather than a full fp32 I2F → FP32 FMUL chain, so the
    per-chunk `sum += dmA·dsB·C + dmA.y·dsB.y` is few instructions. minfer's fp32 rescale pays more
    FMUL + I2FP (72,592 + 72,600 vs 57,344 + 58,254).
-4. **Tight index math / no redundant work per MAC.** The 32-od-row × 128-token warp shape halves the
-   A-fragment loads per MAC vs a 16-row warp (r13: "their warp covers 2× the od-rows"), and the
-   B-fragment is loaded once per (warp, j0-step) via plain LDS.
+4. **Tight index math / no redundant work per MAC.** The 32-od-row × 64-token warp shape (the two
+   warps of an od-group jointly cover the full 128 tokens; see §2) halves the A-fragment loads per
+   MAC vs a 16-row warp (r13: "their warp covers 2× the od-rows"), and the B-fragment is loaded once
+   per (warp, j0-step) via plain LDS. This is the warp shape minfer's r17 remap tested — measured
+   NEUTRAL for minfer at 1 block/SM (see §10 Direction C).
 5. **The mma work itself is at hard parity** — IMMA and FFMA are byte-identical between the
    engines (r20: 1,605,632; r25: FFMA 114,688/tile both, IMMA 2×MAC both). Compute is never the gap.
 
@@ -327,7 +404,7 @@ chains, `sum[64]`. Its staging layout (cuda_kernels.cu:4459-4482):
 **The design differences and their measured consequences:**
 
 - **Expanded B (qb8) + fp32 rescale.** minfer's smem budget at KD=8 is **98,304 B → 1 block/SM**,
-  vs llama's 53.5 KB (1 block/SM at I=J=128, but with the headroom to reach 2 at smaller J). The r25
+  vs llama's 56.5 KB (1 block/SM at I=J=128, but with the headroom to reach 2 at smaller J). The r25
   census attributes minfer's +89,786 surplus to **integer ALU +69,465 (77%)** (address/predicate
   math for the 8-A-frag LDSM + staging bounds) and **fp32 dequant-rescale +29,594** (FMUL+I2FP).
 - **Measured efficiency.** minfer issue **0.25–0.26** vs llama **0.42** (r13/r20/r25; r15 noted a
@@ -384,11 +461,15 @@ The following are places where the campaign document's claims differ from, or ar
 reconciled with, the source at `ca3d5a3e1`. The empirical core (r20 stall table, r25 census) is
 unchanged; these are precision notes.
 
+The numbered items below fold in the post-r25 source audit. Items marked **(resolved)** supersede the
+corresponding claim; the r13/r25 historical notes are kept but flagged where the audit corrects them.
+
 1. **"65-int padded stride" ≠ source.** `CUDA_OPTIMIZATION.md` r13 describes llama's weight plane as
    "raw-nibble (65-int padded stride, bank-rotating)". The source's `sram_stride` for the Q4_K
-   (Q8_1) layout is **70 ints (280 B)** — `2·32 + 2·32/32 + 4` (mmq.cuh:137), `K%8==4` enforced
+   (Q8_1) layout is **76 ints (304 B)** — `2·32 + 2·32/8 + 4` (mmq.cuh:137), `K%8==4` enforced
    (mmq.cuh:153-159). The "16 B pad" half matches (the `+4` ints), but the "65-int" figure was not
-   reproduced; treat the verified stride as 70.
+   reproduced; treat the verified stride as 76. *(resolved — the audit confirmed the stride but
+   carried the earlier "70 ints" slip; the `2·32/QI8_1` term is 8, so the stride is 76.)*
 2. **"fp16 dequant-rescale" vs source-level fp32.** `CUDA_OPTIMIZATION.md` r25 attributes llama's
    throughput advantage to "llama dequantizes to **fp16** (HADD2/HFMA path)". At the CUDA level the
    `q8_1×q8_1_mma` rescale is **fp32** — `sum += dmA.x·dsB.x·C.x + dmA.y·dsB.y` with `dmA`/`dsB`
@@ -398,13 +479,16 @@ unchanged; these are precision notes.
    half2 scale construction in `load_tiles_q4_K`, mmq-load-tiles.cuh:772-777, is the most likely
    contributor); the campaign's "fp16 rescale" wording is an interpretation, not a source-verified
    arithmetic description. The *direction* of the binary advantage for llama (fewer fp32 FMUL/I2FP,
-   more fp16 ALU) is real and is what the census records.
-3. **"144 B per 256-elem superblock per row"** is correct for the *global* block (block_q4_K = 144 B),
-   and the smem row stride is separately 132 B (`MMQ_TILE_Y_K`·4, mmq.cuh:119) — the two are both
-   quoted in the campaign without distinguishing global-block from smem-row; they are not the same
-   quantity.
+   more fp16 ALU) is real and is what the census records. *(still interpreted, not source-verified.)*
+3. **`MMQ_TILE_Y_K` = 36 ints = 144 B (resolved).** The doc and `CUDA_OPTIMIZATION.md` quoted **33 ints
+   / 132 B** (`MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32+1`). The Q8_1 DS4 scale word is **4 ints**
+   (`half2 ds4[4]`), not 1, so `MMQ_TILE_Y_K = 32 + 32/QI8_1 = 32 + 4 = 36` ints = **144 B**
+   (mmq.cuh:119; `QI8_1 = QK8_1/(4·QR8_1) = 32/4 = 8`, ggml-common.h:124,258). The smem row stride
+   therefore **equals** the global `block_q8_1_mmq` size (144 B, mmq.cuh:56-57); the earlier "global 144 B
+   ≠ smem-row 132 B" distinction (old item 3) is superseded — the two were only different because the
+   scale word was miscounted as 1 int.
 4. **"2 blocks/SM → 4 warps/scheduler" as an explanation of the profiled result.** The profiled
-   `mul_mat_q<12,128,0>` runs at **1 block/SM** (53.5 KB > 99/2, plus `__launch_bounds__(…, 1)`),
+   `mul_mat_q<12,128,0>` runs at **1 block/SM** (56.5 KB > 99/2, plus `__launch_bounds__(…, 1)`),
    exactly like minfer. The 2-blocks/SM benefit is the design's occupancy *lever* that materializes
    at smaller J tiles; it should not be read as the measured occupancy of the nt-512 q-proj capture.
    (Not verified at any J in this campaign.)
@@ -413,3 +497,32 @@ unchanged; these are precision notes.
    the int8 data field is `qs`; in-kernel it is read at `y+4` (mmq-vec-dot.cuh:383). Any
    reference to "x_qs" as the *activation* data in the campaign should be read as the weight's
    nibble plane (`x_qs` inside `load_tiles_*`), not the activation; the activation qs is `y_qs`.
+6. **Compute-loop granularity (resolved).** Per `vec_dot` call (one 32-k `k00` chunk) there are **64
+   `mma`**: `j0` 8 steps × `k01` 4 steps (step `QI8_1=8`) × `n` 2 (mmq-vec-dot.cuh:414-440). The
+   campaign's "16 mma per 32-k chunk" is the per-`k01` count (8 `j0` × 2 `n`). A-frags = `A[2][4]`
+   = 8, B-frags = 32, and each `sum` slot is accumulated 4× per vec_dot.
+7. **"llama pays zero convert tax" ≠ source (resolved).** The activations are quantized by a **separate
+   kernel** — `quantize_mmq_q8_1` (quantize.cu:458), launched by `quantize_mmq_q8_1_cuda`
+   (quantize.cu:575) — inside `ggml_cuda_mul_mat_q` (mmq.cu:156-157 non-MoE, :236-237 MoE). It is not
+   fused in-kernel. minfer's r23 default-path accounting should credit llama with a quantize-pass
+   cost of **similar order to minfer's convert tax** (the q8_1 quantize is cheaper than f32→f16, but
+   "llama pays zero" is wrong).
+8. **nbs_y pad (resolved).** `nbytes_shared = nbs_ids + nbs_x + GGML_PAD(nbs_y, nthreads·sizeof(int))`
+   (mmq.cuh:1386-1391). At J=128, `GGML_PAD(18,432, 1024) = 18,432` (18,432 = 18×1024), i.e. **no pad
+   step** for the profiled shape. The total at this shape is `512 + 128·76·4 + 18,432 = 57,856 B`
+   (≈56.5 KB), not the earlier 54,784 B (53.5 KB) — the audit kept the total unchanged while fixing
+   the pad, but the `nbs_x = I·sram_stride·4` term also rises to 38,912 because `sram_stride` is 76.
+   The pad only applies for J not a multiple of 64.
+9. **`tile<16,8,int>::ne` cite (resolved).** `ne = I·J/32 = 4` is on the NVIDIA Turing+ branch at
+   **mma.cuh:227**; mma.cuh:108 is the AMD MFMA `I·J/64` branch.
+10. **Warp token coverage (resolved).** Each warp covers **64 token columns**, not the full 128:
+    `y += (ty%ntx)*(tile_C::J*MMQ_TILE_Y_K)` (mmq-vec-dot.cuh:379) de-interleaves the od-group pair,
+    whose two warps jointly cover 128. This is the warp shape minfer's r17 remap tested (measured
+    NEUTRAL for minfer).
+11. **Dispatch edge (resolved).** The `ne11 < MMQ_DP4A_MAX_BATCH_SIZE` gate (mmq.cu:327) sits **inside
+    the NVIDIA-only branch** (`GGML_CUDA_CC_IS_NVIDIA`, mmq.cu:326-328); the AMD/RDNA gates are
+    separate (mmq.cu:330-385).
+12. **Audit citation notes.** The GAP A lane-map helpers `get_i`/`get_j` for `tile<16,8,int>` live in
+    **mma.cuh:245,262** (the audit's mmq-vec-dot.cuh:245,262 pointer is off by file — the helpers are
+    in mma.cuh, which mmq-vec-dot.cuh includes). The GAP E host `ntx` is computed at **mmq.cuh:1410-1411**
+    (not :136-158), and the kernel recomputes `nty` at mmq.cuh:974.

@@ -1325,6 +1325,16 @@ Design (llama.cpp mmq structure; q4_K first = 79% of MMQ time):
    fmaxf chain — tree-reduce amax + register-packed stores, target
    ~60-70 ms.
 
+**Audit corrections (post-r25).** `docs/LLAMA-CPP-MMQ-ANALYSIS.md` was re-verified line-by-line
+against the llama.cpp source (ca3d5a3e1); the corrections are folded into that doc's §Corrections.
+Key outcomes: the Q8_1 activation smem stride is **76 ints** (the `2·32/QI8_1` term is 8, not 2,
+so `64+8+4` — this also raises the per-block smem to 57,856 B / 56.5 KB); `MMQ_TILE_Y_K = 36`
+ints (not 33); each warp covers **64 tokens** (the two warps of an od-group jointly cover the 128);
+per-`vec_dot` there are **64** mma (16 per `k01` sub-iter), not "16 per 32-k chunk"; and llama's
+activation quantize is a **separate kernel** (`quantize_mmq_q8_1_cuda`), so minfer's r23
+default-path accounting should credit llama a quantize-pass cost of similar order to its convert tax
+(the "llama pays zero convert tax" framing is incorrect).
+
 ### R2 — MMVQ weight-streaming rework (Aug 31, DONE)
 
 The 8e decode kernels ran at ~60% of llama.cpp's effective streaming rate
