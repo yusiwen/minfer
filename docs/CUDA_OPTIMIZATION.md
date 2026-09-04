@@ -1415,6 +1415,53 @@ moves the wall +2.80%. The raw-nibble in-loop unpack remains the structural
 cost (integer/MAC still above llama), but the kd-unroll is a clean, safe
 +2.80% and is kept. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.
 
+### P6 r30: SWAR word-granular B-nibble unpack — NEUTRAL, compiler already
+realized by the r29 unroll (REVERTED, 2026-09-04)
+
+Follow-up on r29's integer-ALU/mio_throttle surplus. Task: replace the in-loop
+raw-nibble unpack with a word-granular SWAR (read one 32-bit word = 8 nibbles,
+produce both lo/hi unpacked words in ~3 ops — "5x cheaper" and "4x fewer LDS").
+Standalone gate-1 validation built first
+(`/tmp/minfer_nb/b_swar_validate.cu`, extends the r28 `b_frag_derive`/
+`b_unpack_validate` scan): a word-granular variant that reads each raw word
+once (per `(p,nh,k)`) and assigns lo → even chunk / hi → odd chunk byte-equated
+to the verified ldmatrix B-fragment for **all 8 sgs × 32 lanes × 4 regs, 0
+mismatches** — the mapping is byte-exact and safe to integrate.
+
+**But the SASS had already done it.** Disassembling the r29 kernel (sm_121,
+`cuobjdump -sass`) shows the B-raw path is **16 × `LDS.32`** (not 32) — the
+`#pragma unroll` (r29) let ptxas CSE each raw word across the kd-pair, so each
+word is loaded ONCE and reused for the low chunk (`LOP3 v&0x0F0F0F0F`) and the
+high chunk (`SHF.R.U32.HI + LOP3 (v>>4)&0x0F0F0F0F`). That is exactly the SWAR
+read-once the task proposed (16 words ≈ half the naive 32, minimal
+SHF+LOP3/word). There is **no headroom** in a source-level SWAR.
+
+**Measured anyway** (a faithful `b_hi`-carry implementation: even kd loads the
+words once, writes `b[nh][k]=v&M` and stashes `b_hi[nh][k]=(v>>4)&M`, odd kd
+reuses `b_hi`):
+- ptxas `<8>` sm_121: **113 regs, 0 spill** (r29 123), 2 blocks/SM preserved.
+- Parity (NB-active `cuda_prefill_mmq`): **1 passed, 0 failed**. Greedy-32 token
+  identity vs default f16 path: **byte-identical**.
+- Perf vs `/tmp/minfer_pre_r30` (= r29, re-measured NB baseline): no-warmup
+  base-then-cur 5-pair median **1426.0 → 1441.5 = +1.09%** (5/5 positive but
+  round-5 GPU-dip); warm-up + alternating-order 4-pair median **1428.95 →
+  1436.65 = +0.54%**, with round 4 actually regressing (1432.2 vs 1435.8) —
+  **below the +1.5% bar, i.e. measurement noise**.
+- r30 SASS vs r29: `LDS.32` 16/16, `LDS.64` 32/32, `LDS.128` 16/16, `LDSM` 32/32,
+  `IMMA` 64/64, but `SHF` 138/136, `LOP3` 156/153 — the explicit b_hi even/odd
+  branch is a **+2 SHF / +3 LOP3** regression, i.e. behaviorally identical
+  machine code.
+
+**Verdict — NEUTRAL, reverted (cmp-verified byte-identical to HEAD).** The SWAR
+primary lever is a no-op because r29's kd-unroll already induced the exact CSE
+(read-once raw words, shared SHF+LOP3) that the SWAR would produce; a
+source-level version cannot beat the compiler's own scheduling and adds a small
+SHF/LOP3 overhead. The r30 integer-ALU surplus (1.598 e-3/MAC, ~2.1× llama) and
+`mio_throttle` 15.4% / `long_scoreboard` 19.0% are NOT a byte-vs-word unpack
+problem — they live in the A-frag LDSM, the sda/sds scale reads, the staging
+index math, and the epilogue, which the SWAR does not touch. No further code
+change landed.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

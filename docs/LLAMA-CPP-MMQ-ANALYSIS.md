@@ -757,3 +757,31 @@ baseline 1387.9 → 1426.8). This closes the loop on §10's "occupancy is the
 lever": once occupancy is had, the *instruction* surplus becomes visible
 again — the two levers were not independent, just sequenced. Recorded in
 docs/CUDA_OPTIMIZATION.md P6 r29.
+
+### 11.10 Follow-up (r30, 2026-09-04): the SWAR word-granular unpack — a no-op
+(the r29 unroll already realized it), REVERTED
+
+Task 2 (`mmq_raw_nb_kernel`): replace the per-chunk raw-nibble unpack with a
+word-granular SWAR (read one 32-bit word = 8 nibbles, produce lo/hi in ~3 ops,
+"4x fewer LDS"), re-deriving the lane/word→fragment-byte map. A standalone scan
+(`/tmp/minfer_nb/b_swar_validate.cu`) confirmed the word-granular variant is
+**byte-identical** to the verified ldmatrix B-fragment (8 sgs × 32 lanes × 4
+regs, 0 mismatches) — the map is safe.
+
+The gate-1 pass was necessary but insufficient: disassembling the *r29* kernel
+(SM121, `cuobjdump -sass`) shows the B-raw path is already **16 × `LDS.32`** =
+read-once, because the r29 kd-unroll let ptxas CSE each raw word across the
+kd-pair (lo chunk `LOP3 v&M`, hi chunk `SHF.R.U32.HI + LOP3`). That is precisely
+the SWAR win (half the naive loads, minimal SHF/LOP3/word) — already in the
+binary. A source-level SWAR (an explicit `b_hi`-carry: even kd reads + drops lo/
+hi, odd kd reuses) produced essentially identical SASS (**+2 SHF, +3 LOP3**,
+same 16/32/16/32 LDS/LDS.64/LDS.128/LDSM and 64 IMMA), 113 regs/0 spill,
+parity + greedy-32 green, and **+0.54%** median (warm, alternating-order
+4-pair, round-4 regression) — **below the +1.5% bar**.
+
+**Outcome: neutral → reverted (cmp-verified = HEAD).** The §11 direction-A
+raw-nibble kernel is therefore already at the compiler's floor for the B-unpack
+instruction stream; the remaining integer-ALU surplus (1.598 e-3/MAC) and the
+shared-memory-path stalls (`mio_throttle` 15.4%, `long_scoreboard` 19.0%) come
+from the A-frag LDSM, the sda/sds scale reads, the staging index math, and the
+epilogue — not the byte-vs-word unpack. Recorded: docs/CUDA_OPTIMIZATION.md P6 r30.
