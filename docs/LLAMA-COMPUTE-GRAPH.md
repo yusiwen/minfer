@@ -84,7 +84,7 @@ class llm_graph_result {
 };
 ```
 
-**Graph reuse detection**: `llm_graph_result::can_reuse(params)`（声明于 `src/llama-graph.h:888`，比较逻辑在 `llm_graph_params::allow_reuse()`，`src/llama-graph.h:738`）比较新参数与上一步参数是否拓扑等价：`arch`、`gtype`、`cvec`、`loras`、`cparams` 标志位（`embeddings`/`causal_attn`/`nextn_layer_offset`）、ubatch 结构（`n_tokens`/`n_seq_tokens`/`n_seqs`/`equal_seqs`，以及 `equal_seqs` 拆分时的 seq id 集合）、`n_outputs`、samplers 集合（含其输出张量绑定）。**关键不变式：图拓扑是这些参数的确定性函数**——参数等价则拓扑必然相同。因此复用时不重建图、不调 `ggml_backend_sched_alloc_graph()`，仅更新输入张量数据（`res->set_inputs(&ubatch)`）。注意 `n_past` **不参与**比较：KV cache 位置是数据（每步填充的 idx/position 输入张量），不是图结构。
+**Graph reuse detection**: `llm_graph_result::can_reuse(params)` (declared at `src/llama-graph.h:888`; the comparison logic is in `llm_graph_params::allow_reuse()`, `src/llama-graph.h:738`) compares whether the new params are topologically equivalent to the previous step's params: `arch`, `gtype`, `cvec`, `loras`, `cparams` flag bits (`embeddings`/`causal_attn`/`nextn_layer_offset`), ubatch structure (`n_tokens`/`n_seq_tokens`/`n_seqs`/`equal_seqs`, and the seq id set when `equal_seqs` is split), `n_outputs`, sampler set (including its output tensor bindings). **Key invariant: the graph topology is a deterministic function of these params** —— if the params are equivalent, the topology is necessarily identical. Therefore, on reuse, the graph is not rebuilt and `ggml_backend_sched_alloc_graph()` is not called, only the input tensor data is updated (`res->set_inputs(&ubatch)`). Note that `n_past` **does not participate** in the comparison: the KV cache position is data (the idx/position input tensors filled at each step), not graph structure.
 
 ---
 
@@ -136,7 +136,7 @@ for (int il = 0; il < n_layer; ++il) {
     Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, ...);
     Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, ...);
 
-    // KV Cache write + Attention（KV 写入与 wo 投影均在 build_attn 内部完成）
+    // KV Cache write + Attention (KV write and wo projection are both done inside build_attn)
     cur = build_attn(inp_attn, layer.wo, layer.wo_b, layer.wo_s,
                      Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
@@ -186,17 +186,17 @@ Defined in `ggml/src/ggml-backend.cpp:1055`.
 
 **Core idea**: Split the entire `ggml_cgraph` into several contiguous subgraphs (splits) by backend assignment, with each split executed on the same backend.
 
-实际算法是 **5 个 pass**（不是简单的"三趟扫描"）：
+The actual algorithm is **5 passes** (not a simple "three-pass scan"):
 
-1. **Pass 1 — 初始赋值**：遍历所有叶与节点，对无显式 backend 指定的张量按 `backend_id_from_cur()`（即其数据所在 buffer 的 backend，典型是权重所在 GPU）赋值，不覆盖用户指定。
+1. **Pass 1 — Initial assignment**: iterate all leaves and nodes; for tensors without an explicit backend, assign by `backend_id_from_cur()` (i.e. the backend of the buffer holding the data, typically the GPU where weights live), without overriding user-specified assignments.
 
-2. **Pass 2 — 扩展赋值**：共 **4 个子趟**（顺序：expand GPU down → expand GPU up → expand rest down → expand rest up）。前两趟只扩展非 CPU 的 GPU backend（`cur_backend_id == n_backends - 1` 即 CPU 时清零，跳过）；后两趟把剩余未赋值节点扩展给当前 backend（含 CPU）。结果：**CPU 仅在权重在 CPU、或 GPU 之间存在 CPU-only op 时被使用**；不支持的 op 留空待后续处理。
+2. **Pass 2 — Assignment expansion**: a total of **4 sub-passes** (in order: expand GPU down → expand GPU up → expand rest down → expand rest up). The first two only expand non-CPU GPU backends (cleared and skipped when `cur_backend_id == n_backends - 1`, i.e. CPU); the last two expand the remaining unassigned nodes to the current backend (including CPU). Result: **CPU is used only when weights are on CPU, or there is a CPU-only op between GPUs**; unsupported ops are left empty for later handling.
 
-3. **Pass 3 — 升级 + 兜底**：对已赋值节点，若存在"buffer type 相同且优先级更高"的 backend 支持该 op 且所有 src 兼容，则升级（例如 BLAS/CPU 共享 host buffer type 时可把 CPU 节点升到 BLAS）；对仍未赋值的节点，选"支持最多已赋值输入"的 backend。
+3. **Pass 3 — Upgrade + fallback**: for already-assigned nodes, if a backend with the "same buffer type and higher priority" supports the op and all srcs are compatible, upgrade (e.g. when BLAS/CPU share the host buffer type, a CPU node can be upgraded to BLAS); for still-unassigned nodes, choose the backend that "supports the most already-assigned inputs".
 
-4. **Pass 4 — src/view 补齐**：view 节点与其 view_src 同 backend；剩余未赋值 src 继承 dst 的 backend；仍空则选第一个支持的 backend（`GGML_ASSERT` 保证必有——因此必须存在 CPU 兜底）。
+4. **Pass 4 — src/view completion**: a view node shares its backend with its view_src; remaining unassigned srcs inherit the dst's backend; if still empty, choose the first supporting backend (`GGML_ASSERT` guarantees one exists —— therefore a CPU fallback must exist).
 
-5. **Pass 5 — 切分**：遍历 `nodes[]`，除"相邻节点 backend 变化"外，**以下情况也会开启新 split**：当前节点的权重 src（`GGML_BACKEND_BUFFER_USAGE_WEIGHTS`）位于不同且不兼容的 backend（此时可复用上一 split 的显存）；split 的输入/输出张量数量超限。生成 `splits[]` 序列，并记录每个 split 需要跨 backend 拷贝的输入/输出张量。
+5. **Pass 5 — Splitting**: iterate `nodes[]`; apart from "adjacent nodes' backend changes", **the following cases also start a new split**: the current node's weight src (`GGML_BACKEND_BUFFER_USAGE_WEIGHTS`) is on a different and incompatible backend (in which case the previous split's GPU memory can be reused); a split's input/output tensor count exceeds the limit. This produces the `splits[]` sequence, and records the input/output tensors each split needs to copy across backends.
 
 ### 3.2 `graph_compute()` — Per-Split Execution
 
@@ -222,11 +222,11 @@ for (int i = 0; i < n_splits; i++) {
 }
 ```
 
-实现细节（`ggml_backend_sched_compute_splits()`，`ggml-backend.cpp:1594`）：
+Implementation details (`ggml_backend_sched_compute_splits()`, `ggml-backend.cpp:1594`):
 
-- 前一个 split 的同步通过 `ggml_backend_event` 完成（`event_synchronize`/`event_wait`），没有 event 时才退化为 `ggml_backend_synchronize`。
-- 用户输入张量（`GGML_TENSOR_FLAG_INPUT`）必须**立即**同步拷贝，防止用户在拷贝完成前改写数据。
-- **MoE 权重优化**：当 split 的首节点是 `MUL_MAT_ID`（MoE 专家 matmul）且输入权重在 host buffer 时，会读取 expert id 张量、只把本次用到的连续 expert 块拷到 GPU（含尾部 padding 防 NaN），显著减少跨后端拷贝量。
+- Synchronization with the previous split is done via `ggml_backend_event` (`event_synchronize`/`event_wait`), degrading to `ggml_backend_synchronize` only when no event exists.
+- User input tensors (`GGML_TENSOR_FLAG_INPUT`) must be copied **immediately and synchronously**, to prevent the user from modifying data before the copy completes.
+- **MoE weight optimization**: when the split's first node is `MUL_MAT_ID` (MoE expert matmul) and the input weights are in a host buffer, it reads the expert id tensor and copies only the contiguous expert blocks used this time to the GPU (including trailing padding to prevent NaN), significantly reducing cross-backend copy volume.
 
 ### 3.3 Multi-Backend Scenario Example
 
@@ -248,17 +248,17 @@ Tensor copy nodes are automatically inserted between splits. Async transfer via 
 
 ### 4.1 Reuse Conditions
 
-复用判定由 `llm_graph_params::allow_reuse()`（`src/llama-graph.h:738`）实现，`llm_graph_result::can_reuse()`（`src/llama-graph.h:888`）调用它。比较项：
+The reuse decision is implemented by `llm_graph_params::allow_reuse()` (`src/llama-graph.h:738`), called by `llm_graph_result::can_reuse()` (`src/llama-graph.h:888`). Comparison items:
 
 - `arch` — model architecture
 - `gtype` — graph type (decode/prefill/MTP draft, etc.)
-- `cvec` / `loras` / `cross` — 适配器指针
-- `cparams.embeddings` / `cparams.causal_attn` / `cparams.nextn_layer_offset` 等
-- `ubatch` 结构：`n_tokens`、`n_seq_tokens`、`n_seqs`、`n_seqs_unq`、`equal_seqs`、token/embd 输入形态；当 `equal_seqs` 拆分时还逐一比较各 seq 的 `seq_id`
-- `n_outputs` — 输出 token 数
-- `samplers` — sampler 集合（及存在 sampler 时的 `output[i]`/`seq_id[i][0]` 绑定）
+- `cvec` / `loras` / `cross` — adapter pointers
+- `cparams.embeddings` / `cparams.causal_attn` / `cparams.nextn_layer_offset` etc.
+- `ubatch` structure: `n_tokens`, `n_seq_tokens`, `n_seqs`, `n_seqs_unq`, `equal_seqs`, token/embd input shapes; when `equal_seqs` is split, it also compares each seq's `seq_id` one by one
+- `n_outputs` — the number of output tokens
+- `samplers` — sampler set (and the `output[i]`/`seq_id[i][0]` bindings when a sampler is present)
 
-**`n_past`（KV cache 位置）不参与比较**——它只影响输入数据（idx/position 张量的值），不影响图拓扑。
+**`n_past` (the KV cache position) does not participate in the comparison** —— it only affects the input data (the values of the idx/position tensors), not the graph topology.
 
 ### 4.2 Reuse Benefits
 
@@ -286,7 +286,7 @@ Supports both RMSNorm and LayerNorm, distinguished by the `LLM_NORM_RMS` / `LLM_
 
 ### 5.3 `build_qkv()` — Q/K/V Projection
 
-Combines the Q, K, V projections into one or more matrix multiplications (支持融合 wqkv 与分离 wq/wk/wv 两种路径), returning a struct (定义于 `src/llama-graph.h:937`):
+Combines the Q, K, V projections into one or more matrix multiplications (supports both fused wqkv and separate wq/wk/wv paths), returning a struct (defined at `src/llama-graph.h:937`):
 
 ```cpp
 struct llm_graph_qkv {
@@ -298,7 +298,7 @@ struct llm_graph_qkv {
 
 ### 5.4 `build_lora_mm()` — Matrix Multiplication with LoRA
 
-实际签名（`src/llama-graph.h:1006`，权重在前）：`build_lora_mm(w, cur, w_s = nullptr)`：
+Actual signature (`src/llama-graph.h:1006`, weights first): `build_lora_mm(w, cur, w_s = nullptr)`:
 
 ```cpp
 ggml_tensor * build_lora_mm(ggml_tensor * w, ggml_tensor * cur,
@@ -312,7 +312,7 @@ ggml_tensor * build_lora_mm(ggml_tensor * w, ggml_tensor * cur,
 }
 ```
 
-LoRA adapters are statically unrolled during graph construction, adding no runtime branching. 注意：LoRA 展开与否会影响 `loras` 参数进而影响 `allow_reuse()` 的复用判定（切换 LoRA 适配器会改变图拓扑，触发重建）。
+LoRA adapters are statically unrolled during graph construction, adding no runtime branching. Note: whether LoRA is unrolled affects the `loras` param and thus the `allow_reuse()` reuse decision (switching a LoRA adapter changes the graph topology and triggers a rebuild).
 
 ### 5.5 `build_attn()` — Attention
 
@@ -326,17 +326,17 @@ Supports multiple attention modes:
 ### 5.6 KV Cache Interaction
 
 ```
-inp_attn = build_attn_inp_kv()      // create KV cache input descriptor（注册 idx/mask 等输入张量）
+inp_attn = build_attn_inp_kv()      // create KV cache input descriptor (register idx/mask etc. input tensors)
 ...
 cur = build_attn(inp_attn, wo, ..., Qcur, Kcur, Vcur, kq_scale, il)
-        ├─ ggml_build_forward_expand(Qcur/Kcur/Vcur)   // 先展开，防止被重排
-        ├─ mctx_cur->cpy_k(ctx0, Kcur, k_idxs, il)     // ★ 写 KV cache（在 build_attn 内部）
-        ├─ k = mctx_cur->get_k(ctx0, il)               // 读历史 K（cache 张量的 view）
-        ├─ v = ggml_view_4d(ctx0, k, ...)              // V 是 K 张量尾部视图（KV 合存时）
+        ├─ ggml_build_forward_expand(Qcur/Kcur/Vcur)   // expand first, prevent reordering
+        ├─ mctx_cur->cpy_k(ctx0, Kcur, k_idxs, il)     // ★ write KV cache (done inside build_attn)
+        ├─ k = mctx_cur->get_k(ctx0, il)               // read history K (a view of the cache tensor)
+        ├─ v = ggml_view_4d(ctx0, k, ...)              // V is a tail view of the K tensor (when KV is stored together)
         └─ build_attn_mha(q, k, v, kq_mask, ...)       // attention
 ```
 
-注意：**不存在 `inp_attn->set_input_kv()` 接口**。KV 写入是 `build_attn()` 内部经 `mctx_cur->cpy_k()` 完成的图节点（写入索引来自 `llm_graph_input_attn_kv::self_k_idxs`，每步由 `set_input(ubatch)` 填充）；K/V 读取是 KV cache 张量的视图（`get_k()`），因此**图拓扑与 `n_past` 无关**——位置只存在于输入张量的值中，这正是图复用能在 decode 每步生效的原因。
+Note: **the `inp_attn->set_input_kv()` interface does not exist**. The KV write is a graph node done inside `build_attn()` via `mctx_cur->cpy_k()` (the write indices come from `llm_graph_input_attn_kv::self_k_idxs`, filled each step by `set_input(ubatch)`); the K/V read is a view of the KV cache tensor (`get_k()`), so **the graph topology is independent of `n_past`** —— the position exists only in the values of the input tensors, which is exactly why graph reuse works at every decode step.
 
 KV cache memory management is abstracted by the `llama_memory_context_i` interface, supporting multiple implementations (standard cache, ISWA, DSA, MTP, etc.).
 
@@ -349,7 +349,7 @@ KV cache memory management is abstracted by the `llama_memory_context_i` interfa
 | **Execution model** | Declarative DAG, build graph first then execute | Imperative forward, compute while building |
 | **Memory management** | Backend scheduler auto-allocates + reuses | Manual tensor lifecycle management |
 | **Multi-backend** | Auto split + async copy | Manual GPU dispatch (`metal.rs`) |
-| **Operator fusion** | 构图期由模型代码/后端内核层完成（`LLM_FUSED_OP_FLASH_ATTN` 等；CUDA 后端用 `ggml_can_fuse` 在 kernel 层融合 op 序列；CUDA Graph 捕获以 `uid` 为键），scheduler **没有**通用融合 pass | 已有手工融合（GPU: swiglu/attn_bias_rope_store/融合 qkv+gu kernel；CPU: 批量 matmul） |
+| **Operator fusion** | Done at graph-construction time by the model code / backend kernel layer (`LLM_FUSED_OP_FLASH_ATTN` etc.; the CUDA backend uses `ggml_can_fuse` to fuse op sequences at the kernel layer; CUDA Graph capture is keyed on `uid`), and the scheduler has **no** general fusion pass | Already has manual fusion (GPU: swiglu/attn_bias_rope_store/fused qkv+gu kernel; CPU: batched matmul) |
 | **Graph reuse** | `can_reuse()` skips reconstruction | Recompute every step |
 | **Complexity** | ~3800 lines graph framework + ~100-200 lines per model | No independent graph layer, direct implementation in forward.rs |
 | **Flexibility** | New models only need to inherit `llm_graph_context` | New models require writing complete forward |
@@ -378,16 +378,16 @@ The tradeoff is higher code complexity, but this architecture makes llama.cpp a 
 | `ggml/src/ggml-impl.h:329` | `ggml_cgraph` struct definition |
 | `ggml/src/ggml.c` | Graph operation implementations (`ggml_new_graph`, `ggml_build_forward_expand`, `ggml_graph_dump_dot`) |
 | `ggml/src/ggml-backend.cpp:1055` | `ggml_backend_sched_split_graph()` graph partitioning (5 passes) |
-| `ggml/src/ggml-backend.cpp:1594` | `ggml_backend_sched_compute_splits()` per-split execution (含 MoE 专家部分拷贝) |
+| `ggml/src/ggml-backend.cpp:1594` | `ggml_backend_sched_compute_splits()` per-split execution (including MoE expert partial copy) |
 | `ggml/src/ggml-backend.cpp:1961` | `ggml_backend_sched_graph_compute_async()` entry |
 | `ggml/include/ggml-backend.h` | Backend scheduler API documentation |
-| `src/llama-graph.h:738` | `llm_graph_params::allow_reuse()` 复用判定 |
+| `src/llama-graph.h:738` | `llm_graph_params::allow_reuse()` reuse decision |
 | `src/llama-graph.h:859` | `llm_graph_result` result container |
 | `src/llama-graph.h:888` | `llm_graph_result::can_reuse()` |
 | `src/llama-graph.h:950` | `llm_graph_context` graph builder base class |
-| `src/llama-graph.cpp` | `set_input()`/`build_attn()`(含 KV 写入 `cpy_k`)/`build_lora_mm()` 实现 |
+| `src/llama-graph.cpp` | `set_input()`/`build_attn()` (including KV write `cpy_k`)/`build_lora_mm()` implementation |
 | `src/llama-context.cpp:1325` | `process_ubatch()` end-to-end flow |
 | `src/llama-context.cpp:2475` | `graph_compute()` execution entry point |
 | `src/models/llama.cpp` | LLaMA model graph construction example |
-| `src/models/qwen2.cpp:53` | Qwen2 model graph constructor（`llama_model_qwen2::graph::graph`） |
+| `src/models/qwen2.cpp:53` | Qwen2 model graph constructor (`llama_model_qwen2::graph::graph`) |
 | `src/models/models.h` | All model architecture declarations (nested `struct graph : public llm_graph_context`) |

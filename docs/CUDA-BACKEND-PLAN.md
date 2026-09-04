@@ -416,7 +416,7 @@ flag).
   removed CPU stall, µs; 7B n=128 21.7–23.6 tok/s, no regression).
   Suites 144/0 (cuda parallel + single), plain 130/0.
 - ✅ **Docs + cleanup (7e⑦, 2026-08-29)**: `GRAPH-REFACTOR-PLAN.md` §17
-  Phase 7 row → ✅ (stale "本机无 nvcc" blocker replaced with the
+  Phase 7 row → ✅ (stale "no local nvcc" blocker replaced with the
   dfa3516→082095c record); `GPU_SAFETY.md` gains a CUDA section (capture
   windows vs syncs, GB10 non-host-readable device memory, async-fill
   same-stream contract, weight-registry ownership, launch-error policy).

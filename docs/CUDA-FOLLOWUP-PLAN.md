@@ -119,7 +119,7 @@ neutral (3 pairs within noise). cuda 154/0.
 ## 8e. MMQ / MMVQ for decode K-quants — **VERDICT REVERSED → DONE 2026-08-29 (re-examined per llama.cpp)**
 
 **The 2026-08-29 negative result was wrong on both of its load-bearing claims.**
-Re-examination (user request: "8e MMQ tiling 的问题检查一下,参考 llama.cpp 的代码,修复"):
+Re-examination (user request: "look into the 8e MMQ tiling issue, referring to llama.cpp's code, and fix it"):
 
 1. **"116 GB/s = the platform's streaming limit" was false.** A pure read-only
    probe (`bwprobe.cu`: grid-stride `__ldcs` uint4 sum over 6×256 MB buffers,
