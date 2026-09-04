@@ -764,7 +764,7 @@ nt=512, plus minfer nt-2630 for the r13 tie-in. All prior minfer captures
 were nt-2630 whole-tensor launches vs llama nt-512 ubatches.
 
 Structural facts established from source (llama.cpp @ ca3d5a3e1, matches the
-profiled `mul_mat_q<12,128,0>` = <GGML_TYPE_Q4_K, J=128, fallback=0>):
+profiled `mul_mat_q<12,128,0>` (= `mul_mat_q<GGML_TYPE_Q4_K, 128, 0>`):
 - 256 threads (8 warps), I=J=128 tiles, `MMQ_ITER_K = 256`, occupancy-1
   launch bounds — same tile shape and occupancy as ours.
 - Per 256-k iteration: `load_tiles (W) → stage y-half-1 → barrier →
