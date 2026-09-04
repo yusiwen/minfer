@@ -4770,6 +4770,287 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
 }
 
 
+// ─── mmq RAW-NIBBLE kernel (Direction-A "NB" variant, docs §11) ───────────
+// 64 tokens x 128 od, KD=8 native (one full 256-k super-block per k-tile in
+// the raw qs plane), 8 warps x 16 od-rows, sum[32]. The weight B tile is the
+// RAW 2-nibbles/byte qs plane (O*128 = 16,384 B), so the block totals
+// 45,056 B -> 2 blocks/SM on GB10. B fragments are assembled in-loop by
+// reading the packed nibbles (NO staging-ALU expansion, NO ldmatrix for B).
+// Numerics are exact to the wide kernel: the mma consumes the UNSIGNED 0..15
+// nibble as the int8 B operand, and the fp32 two-term rank-1 rescale
+// (d*sc*nib - dmin*m) is applied per chunk — never the (nib - m) fold.
+//
+// The A path is byte-identical to mmq_raw_wide_nt_kernel (r20 split-phase
+// staging + r22 XOR swizzle, 32B rows) but over T=64 (4 A-frag groups).
+// The B unpack was validated standalone against the wide kernel's
+// ldmatrix B-fragment: for chunk sg, od-row jj, lane l:
+//   reg0 byte j = nibble(sg&1 ? hi : lo) of qs[(sg>>1)*32 + (l&3)*4 + j]
+//   reg1 byte j = nibble(sg&1 ? hi : lo) of qs[(sg>>1)*32 + 16 + (l&3)*4 + j]
+// (0x0F0F0F0F low, (v>>4)&0x0F0F0F0F high; upper nibble zero => positive int8).
+static constexpr int MMQ_NBI = 64;   // tokens (i) per block tile
+static constexpr int MMQ_NBJ = 128;  // od rows (j) per block tile
+template <int KDR>
+__global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ q8x,
+    float* __restrict__ C, int nt, int od, int id
+) {
+#if __CUDA_ARCH__ >= 800
+    extern __shared__ uint8_t mmq_nb_sh[];
+    // Single-buffer sync-staged, KD=8 totals 45,056 B -> 2 blocks/SM:
+    //   qa8     [KDR][64][32]   chunk q8 planes (r22 XOR swizzle, r20 split)
+    //   sda_q   [KDR][64] uint2  (d f16 | ssum i16) packed, token-pair tiling
+    //   qb_raw  [128][128]        raw GGUF qs plane (2 nibbles/byte, full
+    //                             super-block per od-row)
+    //   sds     [KDR][128] float2 (d | dmin*m): r15 rank-1 rescale terms
+    uint8_t* qa8 = mmq_nb_sh;
+    uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
+    uint8_t* qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI * 2);
+    float2* sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    // Each warp owns a private 16-od-row slice and reads the FULL 64-token
+    // tile (B fragments warp-exclusive, A fragments warp-shared).
+    const int i0 = blockIdx.x * MMQ_NBI;
+    const int j0 = blockIdx.y * MMQ_NBJ;
+    const int j0w = warp * 16;
+    const int nb32 = id >> 5;
+    const int nchunk = nb32;
+    const int nsb = nb32 >> 3;
+    const int nktile = (nchunk + KDR - 1) / KDR;
+
+    float sum[32] = {0.0f};   // [g=4][nh=2][l=4] C accumulators (fp32)
+
+#define RAW_STAGE_NB(kt)                                                      \
+    do {                                                                       \
+        /* ---- A: r20 split-phase (LDG batch then STS) + r22 XOR swizzle ----*/\
+        {                                                                      \
+            unsigned av[KDR * 2];   /* 8 words x 64 tok x KDR / 256 thr */     \
+            unsigned short dv[2];   /* KDR * NBI/256 = 2 f16 d words */        \
+            unsigned sv[2];                                                     \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR * 2; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int u = x & 7, r = (x >> 3) & (MMQ_NBI - 1),             \
+                          kd = x / (8 * MMQ_NBI);   /* KDR=8, 8*NBI = 512 */  \
+                const int tok = i0 + r, c = (kt) * KDR + kd;                   \
+                unsigned v = 0;                                                \
+                if (tok < nt && c < nchunk)                                    \
+                    v = *(const unsigned*)(q8x                                 \
+                        + ((size_t)tok * nb32 + c) * 40 + 4 + u * 4);          \
+                av[i] = v;                                                     \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < 2; ++i) {                                      \
+                const int x = threadIdx.x + i * 256;                           \
+                const int r = x & (MMQ_NBI - 1), kd = x / MMQ_NBI;  /* x/NBI */ \
+                const int tok = i0 + r, c = (kt) * KDR + kd;                   \
+                unsigned short d16 = 0; unsigned ss = 0;                       \
+                if (tok < nt && c < nchunk) {                                  \
+                    const uint8_t* src = q8x + ((size_t)tok * nb32 + c) * 40;  \
+                    d16 = *(const unsigned short*)src;                         \
+                    ss = (unsigned)(short)*(const int*)(src + 36);             \
+                }                                                              \
+                dv[i] = d16; sv[i] = ss;                                       \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < KDR * 2; ++i) {                                \
+                const int x = threadIdx.x + i * 256;                           \
+                const int u = x & 7, r = (x >> 3) & (MMQ_NBI - 1),             \
+                          kd = x / (8 * MMQ_NBI);                               \
+                const int R = kd * MMQ_NBI + r;                                \
+                *(unsigned*)(qa8 + (size_t)(R & ~3) * 32                       \
+                    + (size_t)(((((R & 3) << 1) + (u >> 2))                    \
+                                ^ ((R >> 2) & 7)) << 4)                        \
+                    + (size_t)(u & 3) * 4) = av[i];                            \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < 2; ++i) {                                      \
+                const int x = threadIdx.x + i * 256;                           \
+                const int r = x & (MMQ_NBI - 1), kd = x / MMQ_NBI;             \
+                *(unsigned*)(sda_q + ((size_t)kd * MMQ_NBI                     \
+                              + (r >> 4) * 8 + (r & 7)) * 2 + ((r >> 3) & 1)) = \
+                    dv[i] | (sv[i] << 16);                                     \
+            }                                                                  \
+        }                                                                      \
+        /* ---- B: bulk raw qs super-block copy (r18-style, no staging ALU) */ \
+        {                                                                      \
+            const int sb = ((kt) * KDR) >> 3;                                  \
+            for (int off = threadIdx.x; off < MMQ_NBJ * 8; off += blockDim.x) {\
+                const int jj = off >> 3, c8 = off & 7;                         \
+                const int j = j0 + jj;                                         \
+                uint4 v = make_uint4(0, 0, 0, 0);                              \
+                if (j < od && sb < nsb)                                        \
+                    v = *(const uint4*)(W + (size_t)j * ((size_t)nsb * 144)    \
+                        + (size_t)sb * 144 + 16 + (size_t)c8 * 16);            \
+                *(uint4*)(qb_raw + (size_t)jj * 128 + (size_t)c8 * 16) = v;    \
+            }                                                                  \
+        }                                                                      \
+        /* ---- B: SDS per-(chunk, od-row) rank-1 rescale terms ---- */        \
+        for (int x = threadIdx.x; x < MMQ_NBJ * KDR; x += blockDim.x) {        \
+            const int r = x % MMQ_NBJ, kd = x / MMQ_NBJ;                       \
+            const int j = j0 + r, c = (kt) * KDR + kd;                         \
+            float dv = 0.0f, mv = 0.0f;                                        \
+            if (j < od && c < nchunk) {                                        \
+                const uint8_t* blk = W + (size_t)j * ((size_t)nsb * 144)       \
+                    + (size_t)(c >> 3) * 144;                                  \
+                const float d = h2f(*(const uint16_t*)blk);                    \
+                const float dmin = h2f(*(const uint16_t*)(blk + 2));           \
+                uint8_t sc, m;                                                 \
+                get_scale_min_k4(c & 7, blk + 4, &sc, &m);                     \
+                dv = d * (float)sc;                                            \
+                mv = -(dmin * (float)m);                                       \
+            }                                                                  \
+            sds[(size_t)kd * MMQ_NBJ + r] = make_float2(dv, mv);               \
+        }                                                                      \
+    } while (0)
+
+    // r22: precomputed swizzled A-frag byte offsets (identical to wide kernel).
+    const unsigned l12m = (unsigned)(lane & 12) * 32;
+    const unsigned grc = (unsigned)(((lane & 3) << 1) + ((lane >> 4) & 1)
+                             ^ ((lane >> 2) & 3)) << 4;
+    unsigned G[4];   // only 4 token groups at T=64
+    #pragma unroll
+    for (int g = 0; g < 4; g++)
+        G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
+
+    RAW_STAGE_NB(0);
+
+    for (int kt = 0; kt < nktile; ++kt) {
+        if (kt > 0) RAW_STAGE_NB(kt);
+        __syncthreads();
+
+        for (int kd = 0; kd < KDR; kd++) {
+            const int c = kt * KDR + kd;
+            if (c >= nchunk) break;
+            const int sg = c & 7;
+            const uint8_t* qat = qa8 + (size_t)kd * MMQ_NBI * 32;
+
+            // A fragments: 4 independent 16-token groups (T=64), r22 G[].
+            int a[4][4], b[2][2];
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                const uint8_t* p = qat + G[g];
+                unsigned r0_, r1_, r2_, r3_;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                    "{%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(r0_), "=r"(r1_), "=r"(r2_), "=r"(r3_)
+                    : "r"((unsigned)__cvta_generic_to_shared(p)));
+                a[g][0] = (int)r0_; a[g][1] = (int)r1_;
+                a[g][2] = (int)r2_; a[g][3] = (int)r3_;
+            }
+            // B fragments: raw-nibble in-loop unpack (validated == wide kernel
+            // ldmatrix). reg0 = qs[(sg>>1)*32 + (l&3)*4 + 0..3],
+            //            reg1 = qs[(sg>>1)*32 + 16 + (l&3)*4 + 0..3].
+            {
+                const int p = sg >> 1, is_hi = sg & 1, lm3 = lane & 3;
+                const unsigned M = 0x0F0F0F0Fu;
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++) {
+                    const int jj = j0w + nh * 8 + (lane >> 2);
+                    const uint8_t* qs = qb_raw + (size_t)jj * 128;
+                    const uint32_t* q0 = (const uint32_t*)(qs + p * 32 + lm3 * 4);
+                    const uint32_t* q1 = (const uint32_t*)(qs + p * 32 + 16 + lm3 * 4);
+                    uint32_t v0 = *q0, v1 = *q1;
+                    b[nh][0] = (int)(is_hi ? ((v0 >> 4) & M) : (v0 & M));
+                    b[nh][1] = (int)(is_hi ? ((v1 >> 4) & M) : (v1 & M));
+                }
+            }
+            int clow[4][2][4];
+            #pragma unroll
+            for (int g = 0; g < 4; g++)
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    #pragma unroll
+                    for (int l = 0; l < 4; l++) clow[g][nh][l] = 0;
+            // 8 independent mma chains per thread per chunk (4 A-frags x 2
+            // B-frags), all C fragments live simultaneously.
+            #pragma unroll
+            for (int g = 0; g < 4; g++)
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    mmq_mma_k32(clow[g][nh], a[g], b[nh]);
+
+            // rescale: exact r15 two-term rank-1 fold (d*sc, -dmin*m).
+            float dsv[2][2], dmv[2][2];
+            #pragma unroll
+            for (int nh = 0; nh < 2; nh++) {
+                const float4 sc4 = *(const float4*)(sds
+                    + (size_t)kd * MMQ_NBJ + j0w + nh * 8 + (lane & 3) * 2);
+                dsv[nh][0] = sc4.x; dsv[nh][1] = sc4.z;
+                dmv[nh][0] = sc4.y; dmv[nh][1] = sc4.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                float da_q[2];
+                int sa_q[2];
+                const uint2 pk2 = *(const uint2*)(sda_q
+                    + (size_t)kd * MMQ_NBI * 2 + g * 16 + (lane >> 2) * 2);
+                da_q[0] = h2f((unsigned short)(pk2.x & 0xFFFF));
+                sa_q[0] = (int)(short)(pk2.x >> 16);
+                da_q[1] = h2f((unsigned short)(pk2.y & 0xFFFF));
+                sa_q[1] = (int)(short)(pk2.y >> 16);
+                const float dma[2] = { da_q[0] * (float)sa_q[0],
+                                       da_q[1] * (float)sa_q[1] };
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    #pragma unroll
+                    for (int l = 0; l < 4; l++) {
+                        const float da = da_q[l >> 1];
+                        const int idx = (g * 2 + nh) * 4 + l;
+                        sum[idx] += da * dsv[nh][l & 1] * (float)clow[g][nh][l];
+                        sum[idx] += dma[l >> 1] * dmv[nh][l & 1];
+                    }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int g = 0; g < 4; g++)
+        #pragma unroll
+        for (int nh = 0; nh < 2; nh++)
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const int i = i0 + g * 16 + (l >> 1) * 8 + (lane >> 2);
+                const int j = j0 + j0w + nh * 8 + (lane & 3) * 2 + (l & 1);
+                if (i < nt && j < od)
+                    C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+            }
+#endif // __CUDA_ARCH__ >= 800
+}
+
+extern "C" int launch_mmq_raw_nb_nt(
+    int type_id, const uint8_t* w, const uint8_t* q8, float* c,
+    int nt, int od, int id, cudaStream_t stream, int kd
+) {
+    (void)type_id;
+    // 64-token x 128-od block tile, KD=8 native. Raw qs plane + single-buffer
+    // staging = 45,056 B >>> 2 blocks/SM on GB10. KD!=8 is inapplicable to the
+    // raw-nibble variant (the qs plane encodes a FULL 256-k super-block), so
+    // clean-fallback (return 0) to the wide kernel. smem/reg guards return 0
+    // on any cap failure (never silently launch over cap).
+    if (kd != 8) return 0;
+    const int smem = 8 * MMQ_NBI * 32   // qa8
+                   + 8 * MMQ_NBI * 8    // sda_q (uint2 = 8B)
+                   + MMQ_NBJ * 128      // qb_raw
+                   + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
+    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_kernel<8>),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    mmq_raw_nb_kernel<8><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "minfer/cuda: mmq raw NB launch failed: %s\n",
+                cudaGetErrorString(e));
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int launch_mmq_raw_wide_nt(
     int type_id, const uint8_t* w, const uint8_t* q8, float* c,
     int nt, int od, int id, cudaStream_t stream, int kd

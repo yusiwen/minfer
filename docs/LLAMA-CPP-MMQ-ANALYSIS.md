@@ -703,3 +703,35 @@ Raw-nibble semantics are **exactly** the r13-era two-term rescale (the parity-sa
   occupancy hypothesis** and closes Direction A (it would show that, like r23's FA TKV=32
   2-blocks/SM, the 2× k-loop fixed costs / added in-loop ALU consume the latency-hiding gain), **or**
 - **Register spill at KD=8** that cannot be recovered without dropping to a smaller O.
+
+### 11.8 Phase-2 outcome — LANDED (2026-09-04)
+
+Direction A was implemented as the parallel `mmq_raw_nb_kernel` (env-gated
+`MINFER_MMQ_RAW_NB=1`; KD=8-native, 64×128, 8 warps × 16 od-rows, `sum[32]`,
+smem 45,056 B = QA8 16,384 + SDA 4,096 + QB(raw) 16,384 + SDS 8,192). The
+existing wide kernel is unchanged and remains the default raw path; NB activates
+only under `MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_NB=1` + `kd==8`, and
+the launcher returns 0 (clean fallback → wide/narrow) on any smem/reg cap
+failure or KD!=8.
+
+All six Phase-2 gates green — **the occupancy hypothesis is CONFIRMED, not
+falsified** (line-closing positive outcome):
+
+1. Build clean; KD=8 instantiation **123 regs, 0 spill** (§11.5 risk #4 clear).
+2. **Parity** (gate 2): NB-active `cuda_prefill_mmq` max diff ~1e-5 (f32
+   rounding); the KD=4 arm is inapplicable (raw qs plane = full 256-k
+   super-block, so KD=8-native) and clean-falls through to the wide kernel. The
+   standalone B-unpack byte-equated to the wide kernel's ldmatrix B-fragment
+   (0 mismatches), de-risking §11.5 risk #1 before integration.
+3. **Greedy-32 identity** (gate 3): byte-identical completion vs the default f16
+   path.
+4. **Perf** (gate 4): NB median **1410.4** vs re-measured wide baseline
+   **1375.2** = **+2.56%** (5/5 positive), ≥ +1.5% bar.
+5. **Occupancy** (gate 5): `sm__warps_active.avg.per_cycle_active` **16.17** =
+   **~4.04 warps/sched → 2 blocks/SM**; `long_scoreboard` 2.03 (from post-r20
+   2.92, toward llama's 1.15); issue_active 37.36%.
+6. **Suite** (gate 6): 166/0/3.
+
+Verdict: the 2× resident-warps gain hid latency better than the in-loop
+B-expansion ALU cost — exactly the §11 bet. Both kernels kept. Recorded in
+docs/CUDA_OPTIMIZATION.md P6 r28.

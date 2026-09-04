@@ -347,6 +347,19 @@ extern "C" {
         stream: *mut std::ffi::c_void,
         kd: i32,
     ) -> i32;
+    // P6 Direction-A: NB raw-nibble MMQ (q4_K, KD=8 native, 64x128, 2 blk/SM).
+    // Returns 1 when it ran (KD=8), 0 on clean fallback (KD!=8 / smem / regs).
+    fn launch_mmq_raw_nb_nt(
+        type_id: i32,
+        w: *const u8,
+        q8: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        stream: *mut std::ffi::c_void,
+        kd: i32,
+    ) -> i32;
     fn launch_mmq_raw_nt(
         type_id: i32,
         w: *const u8,
@@ -2034,6 +2047,8 @@ impl CudaState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8);
             let wide = std::env::var("MINFER_MMQ_RAW_WIDE").as_deref() == Ok("1");
+            let nb = std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1");
+            let nb_debug = std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1");
             unsafe {
                 launch_quantize_q8_0_pad40(
                     x as *const f32,
@@ -2042,22 +2057,12 @@ impl CudaState {
                     nt as i32,
                     stream,
                 );
-                let wide_ok = wide
-                    && unsafe {
-                        launch_mmq_raw_wide_nt(
-                            type_id,
-                            wptr as *const u8,
-                            q8 as *const u8,
-                            out as *mut f32,
-                            nt as i32,
-                            od as i32,
-                            id as i32,
-                            stream,
-                            kd,
-                        )
-                    } == 1;
-                if !wide_ok {
-                    launch_mmq_raw_nt(
+                // Direction-A NB raw-nibble kernel is KD=8-native; it activates
+                // only under the full MMQ gate set (MINFER_MMQ=1 + MINFER_MMQ_RAW
+                // =1 here). launcher returns 0 on KD!=8 or smem/reg cap failure
+                // -> clean fallback to the wide/narrow raw path below.
+                let nb_ok = nb
+                    && launch_mmq_raw_nb_nt(
                         type_id,
                         wptr as *const u8,
                         q8 as *const u8,
@@ -2067,7 +2072,36 @@ impl CudaState {
                         id as i32,
                         stream,
                         kd,
-                    );
+                    ) == 1;
+                if nb_ok && nb_debug {
+                    eprintln!("minfer/cuda: mmq raw NB kernel active (KD=8)");
+                }
+                if !nb_ok {
+                    let wide_ok = wide
+                        && launch_mmq_raw_wide_nt(
+                            type_id,
+                            wptr as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            nt as i32,
+                            od as i32,
+                            id as i32,
+                            stream,
+                            kd,
+                        ) == 1;
+                    if !wide_ok {
+                        launch_mmq_raw_nt(
+                            type_id,
+                            wptr as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            nt as i32,
+                            od as i32,
+                            id as i32,
+                            stream,
+                            kd,
+                        );
+                    }
                 }
             }
             return Ok(());

@@ -1290,6 +1290,80 @@ ncu_{ours,theirs}_{full,metrics}.log, ncu_r25.log; prompt locked at
 /tmp/minfer_pre_r25; patch /tmp/patch_r25_unroll.py (reverted); harnesses /tmp/perf_run.sh
 /tmp/ab_medians.sh (reused); A/B logs r25_{kd8,4}_{a,b}_ab.log.
 
+### P6 r28: Direction-A raw-nibble NB kernel — 2 blocks/SM LANDED, +2.6% @ KD=8 (2026-09-04)
+
+Phase-2 of the §11 "direction A" redesign (docs/LLAMA-CPP-MMQ-ANALYSIS.md §11):
+the one occupancy lever r13–r25 never touched — shrink the weight B smem to the
+**raw-packed 2-nibbles/byte GGUF qs plane** and accept a small in-loop B-expansion
+cost, to buy the **2 blocks/SM** that r25's census verdict (issue/occupancy-bound,
+not instruction-bound) identified as the binding resource. New **parallel**
+kernel `mmq_raw_nb_kernel` (+ launcher `launch_mmq_raw_nb_nt` + env gate
+`MINFER_MMQ_RAW_NB=1`), KD=8-native, 64 tokens × 128 od, 8 warps × 16 od-rows,
+`sum[32]`. The existing wide kernel remains the default raw path and is
+**byte-identical**; NB activates only under `MINFER_MMQ=1 MINFER_MMQ_RAW=1
+MINFER_MMQ_RAW_NB=1` AND `kd==8`, and the launcher returns 0 (clean fallback →
+wide/narrow) on any smem/reg cap failure or KD!=8.
+
+**Smem = 45,056 B → 2 blocks/SM** (was 98,304 B → hard-pinned 1 block/SM):
+QA8 16,384 (r20 split-phase + r22 XOR swizzle) + SDA 4,096 + QB(raw) 16,384 +
+SDS 8,192. `ptxas -v` on the KD=8 instantiation: **123 regs, 0 spill** (r25
+census target ~110–130; dead-on the §11.2 estimate, well below the 255-spill
+cliff).
+
+**The #1 risk — the B-fragment nibble layout.** Per §11.4 the mma consumes the
+**unsigned 0..15 nibble** (upper nibble zero ⇒ positive int8) and the fp32
+two-term rank-1 rescale `d·sc·nib − dmin·m` is applied per chunk — **never**
+the `(nib − m)` fold (the r13-era 82.896 max-diff mode) and never the
+double-dmin. The B-fragment byte mapping was derived from the verified wide
+kernel's ldmatrix path with a standalone CUDA scan and validated before
+integration: for chunk `sg`, od-row `j`, lane `l` → `reg0 byte j =
+nibble(qs[(sg>>1)·32 + (l&3)·4 + j])`, `reg1 byte j =
+nibble(qs[(sg>>1)·32 + 16 + (l&3)·4 + j])`, nibble = `sg&1 ? high : low`
+`(0x0F0F0F0F` low, `(v>>4)&0x0F0F0F0F` high). Standalone kernel byte-equated
+the raw-unpack to the ldmatrix B-fragment for all 8 sgs × 32 lanes × 4 regs
+(0 mismatches).
+
+**Parity** (gate 2, `cuda_prefill_mmq` NB-active @ KD=8): `mmq_w4k` max diff
+1.5e-5 / 4.6e-5 / 9.9e-5 across the shape sweep (7B shape classes) — pure f32
+accumulation-order rounding, no garbage magnitude (a nibble-layout bug would be
+~1e0). The KD=4 arm (`MINFER_MMQ_RAW_KD=4`) is inapplicable to the raw-nibble
+variant (the qs plane encodes a FULL 256-k super-block, so KD=8-native) and
+cleanly falls through to the wide kernel — parity green there too (no
+regression). Greedy-32 token identity vs the default f16 path: **byte-identical**
+completion.
+
+**Perf** (gate 4, interleaved, 7B q4_k_m @ 1784-token prefill, re-measured
+baseline `/tmp/minfer_pre_nb` = pre-change 2f783a3):
+
+| config | runs (tok/s) | median |
+|---|---|---|
+| wide MMQ KD=8 (baseline) | 1377.0 / 1369.5 / 1375.2 / 1361.8 / 1377.4 | **1375.2** |
+| NB KD=8 | 1406.8 / 1415.0 / 1396.8 / 1410.4 / 1417.2 | **1410.4** |
+
+**+2.56% relative, 5/5 pairs positive** (an earlier interleaved 3x batch gave
++2.43%, 3/3 positive). Clears the +1.5% bar over the re-measured baseline.
+
+**ncu** (gate 5, launch 0, grid (28,28), 256 thr): `sm__warps_active
+.avg.per_cycle_active` **16.17** = **~4.04 warps/sched → 2 blocks/SM confirmed**
+(was 8 warps/SM = 2.00 warps/sched at 1 block/SM). Stall set:
+`long_scoreboard` **2.03** (down from post-r20 2.92; trending toward llama's
+1.15), `short_scoreboard` 0.75, `barrier` 0.67, `math_pipe_throttle` 0.50,
+`not_selected` 1.16; `smsp__issue_active.avg.pct_of_peak` **37.36%** (from ~25%
+at 1 block/SM, approaching llama's 42%).
+
+**Verdict — occupancy hypothesis confirmed, not falsified.** The 2 blocks/SM
+materialized (16.17 warps/SM), long_scoreboard fell 2.92→2.03, issue efficiency
+rose to 37%, and the wall moved +2.56% — the occupancy gain hid latency better
+than the added in-loop B-expansion ALU hurt. This is the §11.8 "line-closing"
+positive outcome; both kernels are kept (NB is env-gated parallel, wide stays
+the default raw path). Suite: 166/0/3.
+
+Artifacts: `/tmp/minfer_nb/` (standalone `b_frag_derive.cu`, `b_unpack_validate.cu`,
+pre-change backups `cuda_kernels_pre_nb.cu`/`cuda_pre_nb.rs`); perf harness
+`/tmp/minfer_nb/perf_nb{2,}.sh`; ncu `regex:mmq_raw_nb` captures; baseline binary
+`/tmp/minfer_pre_nb` (2f783a3, md5 4dc455bf); edits grep-verified, no inline
+heredocs.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
