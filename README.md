@@ -15,6 +15,8 @@ A minimal local LLM inference engine built from scratch in Rust.
 
 </p>
 
+**📚 Documentation** — the full project docs site (architecture, compute graph, backends, tooling): [yusiwen.cn/minfer](https://yusiwen.cn/minfer/)
+
 ![minfer CLI conversation (Qwen3-0.6B, Qwen3-0.6B-Q8_0)](docs/cli-conversation.png)
 
 ## Features
