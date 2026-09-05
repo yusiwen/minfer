@@ -2142,7 +2142,16 @@ impl CudaState {
         }
         let qa8 = Self::get_or_grow(&self.buf_qa8_t, need_qa8);
         let sda = Self::get_or_grow(&self.buf_sda_t, need_sda);
-        launch_quantize_q8_0_pad40_t(x, qa8 as *mut u8, sda as *mut u8, id, nt, nchunk, ntb, stream);
+        launch_quantize_q8_0_pad40_t(
+            x,
+            qa8 as *mut u8,
+            sda as *mut u8,
+            id,
+            nt,
+            nchunk,
+            ntb,
+            stream,
+        );
         cache.active = true;
         cache.key = key;
         cache.transposed = true;
