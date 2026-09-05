@@ -1083,3 +1083,27 @@ barrier per kt) plus the intrinsic KSPLIT=2; the named next lever is a **double-
 (pipelined) staging at KDR=2 that keeps 2 blocks/SM (29,696 B) while overlapping kt+1 staging with
 kt compute — the mechanism the outgoing `mmq_nt<7>` used to stay near-parity at long nt.
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r38.
+
+### 11.19 Follow-up (r39, 2026-09-05): the staging pipeline — LANDED (+13.3% whole-prefill, −19.7% attn_v kernel time)
+
+r38's named next lever was executed: `mmq_raw_nb_bt_q6k_kernel` now stages kt+1's global→smem
+expansion into a **second buffer** while kt computes (the `mmq_nt<7,2>` pipeline). Two structural
+points worth recording:
+
+**The correct KDR for a full double-buffer is 2, not 4.** Doubling *all four* per-kt planes
+(qa8 + sda_q + qb_exp + sds) at KDR=4 is 59,392 B → 1 block/SM → the r38 KDR=8 occupancy
+regression. A "double-B-only" KDR=4 variant (~46 KB, 2 blocks) is **not valid**: A stays
+single-buffered, so staging kt+1's A during kt's kd-loop clobbers kt's A mid-read. KDR=2 makes the
+double-buffer **exactly the r38 footprint (29,696 B → 2 blocks/SM)** because 2×2×each-plane
+equals the single-buffer KDR=4 total; nktile doubles but the barrier count is unchanged (57) and
+per-kt work is identical.
+
+**Result.** Parity-clean (validator 0/4096 + 0/64, `cuda_prefill_mmq_parity` 1/0), greedy-32
+byte-identical, suite 166/0/3, ptxas 87 regs / 0 spill. Whole-prefill **1568.7 → 1777.5 tok/s
+(+13.3%, 3/3 interleaved positive)**; matched-nt attn_v kernel **2,046,848 ns vs r38's 2,549,248
+(−19.7%)** with compute throughput 16.7% → 21.52%. This is the **largest single q6_K lever closed**
+(verified the r38 "the lever is occupancy OR pipelining, not instruction count" call — the gain
+is pure staging/compute overlap at constant occupancy). The kernel remains **latency-bound** (74.5%
+No-Eligible, SOL OPT) at 2 blocks/SM, so the q6_K-vs-llama **~3.8× gap stays**; the open levers are
+a 3rd resident block (regs 87→≤80) or KSPLIT=2's inherent 2× mma.k16. Recorded:
+docs/CUDA_OPTIMIZATION.md P6 r39.

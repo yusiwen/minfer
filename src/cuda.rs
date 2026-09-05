@@ -2139,7 +2139,7 @@ impl CudaState {
                         if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
                             eprintln!(
                                 "minfer/cuda: mmq raw NB-BT q6_K kernel active \
-                                 (KD=8, A-transpose)"
+                                 (r39 KDR=2 double-buffer, A-transpose)"
                             );
                         }
                         return Ok(());

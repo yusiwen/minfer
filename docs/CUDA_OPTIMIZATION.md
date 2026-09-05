@@ -1990,6 +1990,50 @@ Artifacts: `/tmp/q6k_validate.cu` (gate-1 validator), `/tmp/gen_q6k_ptxas.py` + 
 (gate-2 ptxas harness), `/tmp/perf_q6k.sh` (interleaved A/B), `/tmp/minfer_q6k_bin` (post-change
 binary), `/tmp/g32_{default,q6k,q6k_kdr4}.txt` (greedy-32 identity).
 
+### P6 r39: double-buffer the q6_K B staging (KDR=2) — LANDED (+13.3% whole-prefill; pipeline beats occupancy) (2026-09-05)
+
+r38 left the q6_K BT kernel **latency-bound** (ncu compute 16.7%, 2 blocks/SM, SOL OPT) with the
+B-side global→smem expansion (ql+qh recomb → centered int8) **serialized behind a per-kt
+single-buffer barrier**. This session pipelines it: stage kt+1's expansion into a second buffer
+while kt computes — the `mmq_nt<7,2>` scheme that keeps that kernel near-parity at long nt.
+
+**KDR=2, full double-buffer — the smem arithmetic comes out for free.** Doubling *every* per-kt
+plane (qa8 + sda_q + qb_exp + sds) at KDR=4 would be **59,392 B → 1 block/SM** (the exact r38
+KDR=8 occupancy-regression number, 1097.8 tok/s), so the r38 brief's pre-authorized fallback
+is used: **KDR=2**, giving `2×(2×64×32) + 2×(2×64×4) + 2×(128×2×32) + 2×(2×128×8)` =
+**29,696 B — exactly the r38 footprint → 2 blocks/SM**, yet now genuinely pipelining *both* A
+(bulk uint4 copy) and B (the ALU expansion). A double-B-only variant at KDR=4 (~46 KB) was
+**rejected on correctness**: A would remain single-buffered, so staging kt+1's A during kt's
+kd-loop would clobber the A still being read — and the only correct KDR=4 full-double-buffer is
+the 1-block/SM 59,392 B variant. Per-kt total work is identical (same chunks/elements staged
+across the doubled kt-count); only the buffering structure changed.
+
+**Gates.** 1) ptxas `<2>` **87 regs, 0 spill, 1 barrier**; smem **29,696 B** (device query:
+sm_121, 48 SMs, sharedMemPerSM 102,400 B, per-block max 49,152 B, regsPerSM 65,536 → 87 regs
+rounds to 88 → 2 blocks/SM; 3 blocks would need ≤80). Standalone validator **0/4096** expansion +
+**0/64** mma.k16 B-frag read (re-run, math unchanged). 2) Parity
+(`MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1 cuda_prefill_mmq_parity`): **1/0**. 3) Greedy-32
+token identity vs default f16: **byte-identical**. 4) Perf interleaved 3× (same full q4_K-BT +
+q6_K env, both binaries): **1568.7 (r38 KDR=4) → 1777.5 (r39 KDR=2) tok/s = +13.3%** (bar +1.5%).
+5) ncu attn_v (grid 52×4, `mmq_raw_nb_bt_q6k_kernel<2>`): duration **2,046,848 ns vs r38
+2,549,248 (−19.7%)**, compute (SM) **21.52% vs 16.7%**, memory **11.77% vs 10.3%** — still
+latency-bound (SOL OPT, No-Eligible 74.54%, Active 3.87 warp/sched ≈ 2 blocks) but strictly better
+metrics. 6) Suite **166/0/3**.
+
+**Verdict — LANDED (+13.3%, far above the +1.5% bar).** The q6_K GEMM (r37: 51.2% of the prefill
+wall at 368.9 µs/GMAC; r38: 221.8 µs/GMAC) is now the whole-prefill's *largest closed lever*, and
+pipelining the staging recovered what r38's occupancy bet could not (r38 was already at 2 blocks,
+so the gain is purely the overlap, not occupancy — confirming r20's split-phase-staging lesson).
+**Remaining vs llama's 57.8 µs/GMAC:** still ~3.8×; the kernel is STILL latency-bound at 2
+blocks/SM (74.5% no-eligible), so the next lever is either a 3rd resident block (regs must drop
+87→≤80 to fit 3 blocks/SM — a re-roll risk, pending) or reducing the intrinsic KSPLIT=2 (2×
+mma.k16 per 32-k is a hard q6_K cost). Artifacts below.
+
+Artifacts: `/tmp/minfer_pre_r39` (r38 KDR=4 binary), `/tmp/gen_q6k_ptxas_r39.py` +
+`/tmp/q6k_ptxas_r39.cu` (gate-1 ptxas harness, `<2>`), `/tmp/q6k_validate`
+(gate-1 validator run), `/tmp/perf_ab_r39.sh` (interleaved A/B), `/tmp/ncu_r39.csv` (gate-5),
+`/tmp/g32_default_r39.txt` + `/tmp/g32_q6k_kdr2_r39.txt`.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

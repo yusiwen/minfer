@@ -5351,10 +5351,17 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
 ) {
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_q6k_sh[];
-    uint8_t* qa8 = mmq_q6k_sh;
-    uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
-    uint8_t* qb_exp = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
-    float2* sds = reinterpret_cast<float2*>(qb_exp + MMQ_NBJ * KDR * 32);
+    // r39: DOUBLE-BUFFERED staging — two copies of every per-kt plane so kt+1's
+    // global->smem expansion (the ql+qh recomb) overlaps kt's compute, hiding the
+    // B-staging latency that left r38 latency-bound. Layout per buffer b below.
+    uint8_t* qa8 = mmq_q6k_sh;                                     // [2][KDR*NBI*32]
+    uint8_t* sda_q = qa8 + 2 * KDR * MMQ_NBI * 32;                 // [2][KDR*NBI*4]
+    uint8_t* qb_exp = sda_q + 2 * KDR * MMQ_NBI * 4;               // [2][NBJ*KDR*32]
+    float2* sds = reinterpret_cast<float2*>(qb_exp + 2 * MMQ_NBJ * KDR * 32);
+    const int qa8_stride = KDR * MMQ_NBI * 32;
+    const int sdaq_stride = KDR * MMQ_NBI * 4;
+    const int qbexp_stride = MMQ_NBJ * KDR * 32;
+    const int sds_stride = KDR * MMQ_NBJ;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -5366,20 +5373,24 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
 
     float sum[32] = {0.0f};   // [g=4][nh=2][l=4]
 
-#define RAW_STAGE_Q6K_BT(kt)                                                   \
+#define RAW_STAGE_Q6K_BT(kt, b)                                                \
     do {                                                                       \
+        uint8_t* qa8b = qa8 + (size_t)(b) * qa8_stride;                        \
+        uint8_t* sdaqb = sda_q + (size_t)(b) * sdaq_stride;                    \
+        uint8_t* qbexpb = qb_exp + (size_t)(b) * qbexp_stride;                 \
+        float2* sdsb = sds + (size_t)(b) * sds_stride;                         \
         /* ---- A: bulk LDG->STS of the pre-transposed qa8/sda (no math) ----*/\
         {                                                                      \
             const size_t qbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_QASZ; \
             for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 32) / 16;       \
                  off += blockDim.x)                                            \
-                ((uint4*)(qa8))[off] = ((const uint4*)(qa8g + qbase))[off];    \
+                ((uint4*)(qa8b))[off] = ((const uint4*)(qa8g + qbase))[off];   \
             const size_t sbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_SDASZ; \
             for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 4) / 16;        \
                  off += blockDim.x)                                            \
-                ((uint4*)(sda_q))[off] = ((const uint4*)(sdag + sbase))[off];  \
+                ((uint4*)(sdaqb))[off] = ((const uint4*)(sdag + sbase))[off];  \
         }                                                                      \
-        /* ---- B: expand KDR*32-chunk super-block (half at KDR=4) ---- */ \
+        /* ---- B: expand KDR*32-chunk super-block (half-super at KDR=4) ---- */ \
         {                                                                      \
             const int sb = ((kt) * KDR) >> 3;                                  \
             const int cbase = ((kt) * KDR) & 7;   /* chunk offset in sb */     \
@@ -5393,7 +5404,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
                         + (size_t)sb * bstride;                                \
                     v = expand_q6_elem(blk, blk + 128, elem);                  \
                 }                                                              \
-                qb_exp[(size_t)jj * (KDR * 32) + bec] = (uint8_t)v;            \
+                qbexpb[(size_t)jj * (KDR * 32) + bec] = (uint8_t)v;            \
             }                                                                  \
         }                                                                      \
         /* ---- B: dsc pair (d*sc[2c%16], d*sc[(2c+1)%16]) per (chunk,row) ----*/\
@@ -5409,7 +5420,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
                 dsc0 = d * (float)(int8_t)blk[192 + s0];                       \
                 dsc1 = d * (float)(int8_t)blk[192 + s0 + 1];                   \
             }                                                                  \
-            sds[(size_t)kd * MMQ_NBJ + r] = make_float2(dsc0, dsc1);           \
+            sdsb[(size_t)kd * MMQ_NBJ + r] = make_float2(dsc0, dsc1);          \
         }                                                                      \
     } while (0)
 
@@ -5421,17 +5432,25 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
     for (int g = 0; g < 4; g++)
         G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
 
-    RAW_STAGE_Q6K_BT(0);
+    RAW_STAGE_Q6K_BT(0, 0);
+    __syncthreads();
 
-    for (int kt = 0; kt < nktile; ++kt) {
-        if (kt > 0) RAW_STAGE_Q6K_BT(kt);
-        __syncthreads();
+    int buf = 0;
+    for (int kt = 0; kt < nktile; ++kt, buf ^= 1) {
+        // Overlap kt+1's global->smem expansion with kt's compute: stage into the
+        // OTHER buffer (buf^1) while reading buffer buf (the mmq_nt<7,2> pipeline).
+        if (kt + 1 < nktile) RAW_STAGE_Q6K_BT(kt + 1, buf ^ 1);
+
+        const uint8_t* qa8c = qa8 + (size_t)buf * qa8_stride;
+        const uint32_t* sdaqc = reinterpret_cast<const uint32_t*>(sda_q + (size_t)buf * sdaq_stride);
+        const uint8_t* qbexpc = qb_exp + (size_t)buf * qbexp_stride;
+        const float2* sdsc = sds + (size_t)buf * sds_stride;
 
         #pragma unroll
         for (int kd = 0; kd < KDR; kd++) {
             const int c = kt * KDR + kd;
             if (c >= nchunk) break;
-            const uint8_t* qat = qa8 + (size_t)kd * MMQ_NBI * 32;
+            const uint8_t* qat = qa8c + (size_t)kd * MMQ_NBI * 32;
 
             int a[4][4], b[2][2];
             #pragma unroll
@@ -5451,7 +5470,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
             #pragma unroll
             for (int nh = 0; nh < 2; nh++) {
                 const int jj = j0w + nh * 8 + (lane >> 2);
-                const uint8_t* qs = qb_exp + (size_t)jj * (KDR * 32) + (size_t)kd * 32;
+                const uint8_t* qs = qbexpc + (size_t)jj * (KDR * 32) + (size_t)kd * 32;
                 b[nh][0] = *(const int*)(qs + (lane & 3) * 4);
                 b[nh][1] = *(const int*)(qs + 16 + (lane & 3) * 4);
             }
@@ -5470,7 +5489,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
                     mmq_mma_k16(chigh[g][nh], a[g] + 2, b[nh][1]);  // high-16, sub 2c+1
                 }
 
-            const uint32_t* sda_blk = sda_q + (size_t)kd * MMQ_NBI
+            const uint32_t* sda_blk = sdaqc + (size_t)kd * MMQ_NBI
                                       + (size_t)(lane >> 2) * 4;
             const uint4 s0 = *(const uint4*)(sda_blk);
             const uint4 s1 = *(const uint4*)(sda_blk + 32);
@@ -5483,7 +5502,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
                 da_q[1] = h2f((unsigned short)(w1 & 0xFFFF));
                 #pragma unroll
                 for (int nh = 0; nh < 2; nh++) {
-                    const float4 sc4 = *(const float4*)(sds
+                    const float4 sc4 = *(const float4*)(sdsc
                         + (size_t)kd * MMQ_NBJ + j0w + nh * 8 + (lane & 3) * 2);
                     #pragma unroll
                     for (int l = 0; l < 4; l++) {
@@ -5543,11 +5562,13 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
     return 1;
 }
 
-// P6 r38: q6_K BT launcher. The B tile is the EXPANDED centered int8 plane
-// (KDR*32 B/row) + the dsc float2 scale plane. KDR=4 stages HALF a super-block
-// per kt -> smem 29,696 B -> 2 blocks/SM (the r28 occupancy lever; the KDR=8
-// full-super-block variant is 59,392 B -> 1 block/SM and was measured slower).
-// Returns 0 (clean fallback to the generic mmq_nt<7,2>) on any cap/mismatch.
+// P6 r39: q6_K BT launcher (double-buffered). The B tile is the EXPANDED centered
+// int8 plane (KDR*32 B/row) + the dsc float2 scale plane. KDR=2 stages a QUARTER
+// super-block per kt, but two buffers (2xA + 2xB) pipeline kt+1's global->smem
+// expansion under kt's compute while keeping the footprint at 29,696 B -> 2 blocks/SM
+// (the r38 figure; full-double-buffer at KDR=4 would be 59,392 B -> 1 block/SM and
+// was excluded on r38's occupancy evidence). Returns 0 (clean fallback to the
+// generic mmq_nt<7,2>) on any cap/mismatch.
 extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     int type_id, const uint8_t* w, const uint8_t* qa8g, const uint8_t* sdag,
     float* c, int nt, int od, int id, int nchunk, int bstride,
@@ -5556,11 +5577,11 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     (void)type_id;
     if (kd != 8) return 0;
     if (qa8g == 0 || sdag == 0) return 0;
-    constexpr int KDR = 4;
-    const int smem = KDR * MMQ_NBI * 32   // qa8
-                   + KDR * MMQ_NBI * 4    // sda_q (one uint32 per token)
-                   + MMQ_NBJ * KDR * 32   // qb_exp (centered int8, half super-block)
-                   + KDR * MMQ_NBJ * 8;   // sds (float2 dsc pair = 8B)
+    constexpr int KDR = 2;
+    const int smem = 2 * KDR * MMQ_NBI * 32   // qa8  (double-buffered)
+                   + 2 * KDR * MMQ_NBI * 4    // sda_q (double-buffered)
+                   + 2 * MMQ_NBJ * KDR * 32   // qb_exp (double-buffered)
+                   + 2 * KDR * MMQ_NBJ * 8;   // sds  (double-buffered)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
     cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR>),
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
