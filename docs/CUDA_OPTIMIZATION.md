@@ -2455,6 +2455,80 @@ Artifacts: `/tmp/minfer_pre_r45` (pre-change r41 baseline binary),
 CP.ASYNC), `/tmp/extract_gen.py` + `/tmp/g32_r45_default.txt` +
 `/tmp/g32_r45_q6k.txt` (gate-3 greedy identity).
 
+### P6 r46 (FAP1): flash-attention audit + occupancy/conflict lever — kernel −11%, but WALL-NEUTRAL (REVERTED, 2026-09-05)
+
+The FA campaign (attention = the largest quantified whole-prefill residual
+after the GEMM lines converged). Task 0 = audit + ncu; Task 1 = implement the
+top lever. Outcome: the audit is sound, the implemented lever (FA_TKV 64→32 +
+S/P smem padding) makes the FA kernel ~11% faster, but the whole-prefill wall
+is **neutral (+0.27%, within ±0.5% noise)** — FA is not the wall-critical
+bottleneck in the converged-GEMM regime — so per the +1.5% bar and the r45
+precedent the change is reverted. This is the positive-mechanism/negative-wall
+record; the FA-open direction is FAP2.
+
+**Task 0 — the FA kernel is already tensor-core + online-softmax, not scalar.**
+`fa_prefill_f16kv` (src/cuda_kernels.cu, launched from `launch_fa_prefill_f16kv`
+when `nt≥64 && hd==128 && !MINFER_NO_FA_PREFILL`): (a) **wmma m16n16k16** for
+BOTH Q·K^T and P·V (not scalar FMA); (b) online softmax, one warp per row
+(8 warps × 8 rows, shuffle max/sum, P5-8r); (c) Q/K/V f16, S f32, P f16 (Pf
+aliases Sf), f32 accumulate; (d) parallel decomposition = one block per
+(FA_TQ=64-query tile, head), grid `(ceil(nt/64), nh)`, 256 threads/8 warps, K/V
+streamed serially in FA_TKV=64 KV-tile chunks (single-buffered cp.async); (e)
+smem = Qs+Ks+Vs (64×136 halves each) + Sf (64×64 f32) + m/l/alpha = **69.38 KB**.
+
+**ncu (r45/HEAD FA kernel, `--set full`, launch 1):** Duration 5.16 ms, Compute
+(SM) 26%, Memory 31%, Issue-slot busy 20.1%, **Achieved occupancy 16.64%**,
+117 regs, **Dynamic smem 69.38 KB → Block Limit Shared Mem = 1** (1 block/SM),
+Warp cycles/inst 9.58. OPT hints: **occupancy 68.7%** (theoretical 16.7%,
+"limited by the amount of shared memory"), shared-load 44% excessive wavefronts
+(~42.35%), global-load 27.4% (19.7M excess sectors, ~10B/sector), FP32-fused
+2.3%. **Diagnosis: occupancy-starved (1 block/SM) + the S/P smem round-trip
+bank-conflicted (Sf 256B / Pf 128B row stride ≡ 0 mod 32 banks).**
+
+**Task 1 — the lever (evidence: occupancy is the #1 ncu limit).** (1) Reduce
+FA_TKV 64→32: Ks/Vs halve (17.4→8.7 KB each) + S/P halve → smem ~43.8 KB →
+**2 blocks/SM (33% occ)**; QK^T becomes a single 16×16 fragment/warp, softmax
+gains `c0 < FA_TKV` guards (lanes 16-31 carry -INF/0), P·V k-loop 2 iters. (2)
+**Fixed a latent smem-over-allocation bug in the launcher**: `3*FA_TQ*(hd+8)*2`
+was only correct because FA_TQ==FA_TKV; the kernel allocates Ks/Vs at FA_TKV
+rows, so with FA_TKV<FA_TQ the calc over-requested K/V smem and re-capped
+residency. (3) **S/P row padding** (FA_SSTR = FA_TKV+8 f32 = 160B stride) to
+kill the 128B≡0-mod-32-bank conflict on the softmax/P·V ldmatrix.
+
+**Gates.** Build clean; `cuda_prefill` **7/0**, `cuda_fa_prefill_attention_parity`
+**1/0**; greedy-32 byte-identical vs default + baseline; ncu (padded): Duration
+**4.58 ms (−11% vs 5.16)**, SM busy 40%, Max Bandwidth 52%, 2 blocks/SM, 31% occ,
+75 regs, 45.82 KB smem. **Perf interleaved 4× (GPU idle): baseline median
+2606.0 → new 2613.1 tok/s = +0.27%** (one baseline outlier 2196 from a co-tenant
+spike excluded) — below the +1.5% bar, wall-neutral. Suite not re-run (only a
+kernel constant/tile change; parity + greedy green; the +1.5% gate failed).
+
+**Verdict — REVERTED.** The FA kernel's structural limit is the **S/P smem
+round-trip** (the reverted change measured MIO/shared-scoreboard stall 36.4%,
+shared-load 3.2-way + shared-store 1.8-way conflicts even after the occupancy
+fix) — the tile-size/occupancy + conflict levers only reach ~11%, and the
+whole-prefill wall does not move, so FA is **not** the wall-critical path now
+(the 124.7ms FA slice is ~9.7% of the wall but the wall is GEMM/A-quantize
+-bound; a −11% FA kernel ≈ −16 ms is in the noise). Change reverted
+(cmp-match HEAD 9825ffd = r45); this is the positive-mechanism/negative-wall
+record.
+
+**Next lever (FAP2):** the flow-through / register-resident softmax — compute
+the online softmax directly on the wmma **accumulator** fragments and feed P
+straight into the P·V wmma (via mma.m16n8k16 PTX, llama fattn-mma style), which
+eliminates the S/P smem round-trip entirely (2 of the 4 __syncthreads per tile,
+the S/P bank conflicts, and the 36% MIO scoreboard stall). Before investing,
+re-verify with a fresh nsys whether the FA slice is genuinely 124.7 ms on the
+converged wall — if it is smaller/overlapped, a larger FA fix is also
+wall-neutral and the campaign should retarget the A-quantize prepass or q4_K
+GEMM share instead.
+
+Artifacts: `/tmp/minfer_pre_fap1` (pre-change r45 baseline, md5 413c3841),
+`/tmp/fa_p1.ncu-rep`/`fa_p2.ncu-rep`/`fa_p3.ncu-rep` (ncu orig / FA_TKV=32 /
+padded), `/tmp/fap1_nsys.nsys-rep` (current-gate-set trace), `/tmp/g32_fa.txt` /
+`g32_default.txt` / `g32_base.txt` (greedy-32), `/tmp/fap1_diff.patch` (the
+reverted 38+/19- diff).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
