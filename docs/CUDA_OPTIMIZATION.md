@@ -2529,6 +2529,124 @@ padded), `/tmp/fap1_nsys.nsys-rep` (current-gate-set trace), `/tmp/g32_fa.txt` /
 `g32_default.txt` / `g32_base.txt` (greedy-32), `/tmp/fap1_diff.patch` (the
 reverted 38+/19- diff).
 
+### P6 r47 — converged-regime wall decomposition: the r37 table is STALE (measurement-only, 2026-09-05)
+
+The r37 table (q6_K GEMM = 51.2% of the wall) is stale **exactly as the task
+predicted**: r38-41 converged the q6_K GEMM, so the whole-prefill wall changed
+shape. Full re-decomposition at the current best gate set
+(`MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_NB=1 MINFER_MMQ_A_TRANSPOSE=1
+MINFER_MMQ_Q6K_NB=1`), qwen2.5-7b q4_k_m, `/tmp/minfer_phase7/prompt2k.txt`
+(3325-token prefill), **no code change** (HEAD a186f51 = r45 code + r46 doc).
+GPU busy 1239.2 ms, wall 1274 ms (2585.4 tok/s in-nsys; clean no-nsys runs
+2597.0–2622.7 tok/s). Co-tenant sglang idle @0–1% the window; no outlier
+kernels. Artifacts: `/tmp/minfer_phase7/r47_bt.{nsys-rep,sqlite}`,
+`r47_gpu_trace.csv`, `r47_bt511.{nsys-rep,sqlite}`, `r47_bt511_trace.csv`.
+
+**Headline: the q6_K GEMM is no longer the #1 slice, nor a lever — it
+CONVERGED.** q6_K GEMM fell **1094.7 → 196.4 ms (51.2% → 15.8% of GPU busy)**.
+The wall fell **2190 → 1274 ms (whole-prefill 1521 → 2610 tok/s; vs-llama gap
+2.15× → 1.27×)**. The q6_K line is now **1.13× vs llama at 3325 (was 6.38× in
+r37)** — i.e. the r37 table's #1 lever is closed; any further q6_K kernel work
+(r42-45 all wall-neutral) is dead.
+
+**Op-class table (nsys per-launch bucketing; r37 vs r47, GPU busy 2139.6 →
+1239.2 ms = 100%):**
+
+| op class | launches r47 | ms r47 | % GPU busy r47 | r37 ms / % | Δ ms |
+|---|---:|---:|---:|---:|---:|
+| **GEMM — q4_K (mmq_raw_nb_bt<8>)** | 166 | **598.1** | **48.3%** | 600.0 / 28.0% | −1.9 |
+| GEMM — q6_K (mmq_raw_nb_bt_q6k) | 27 | 196.4 | 15.8% | 1094.7 / 51.2% | **−898.3** |
+| attention (FA prefill) | 28 | 125.8 | 10.2% | 124.7 / 5.8% | +1.1 |
+| quantize prepass (q8_0_pad40_t) | 193 | 118.4 | 9.6% | 86.8 / 4.1% | **+31.6** |
+| swiglu | 56 | 83.2 | 6.7% | 82.8 / 3.9% | +0.4 |
+| add (residual) | 112 | 30.8 | 2.5% | 30.7 / 1.4% | +0.1 |
+| rms_norm | 114 | 29.4 | 2.4% | 29.2 / 1.4% | +0.2 |
+| mmvq (decode q8/q6) | 187 | 24.5 | 2.0% | 24.1 / 1.1% | +0.4 |
+| rope | 112 | 13.4 | 1.1% | 13.3 / 0.6% | +0.1 |
+| add_bias | 168 | 13.2 | 1.1% | 13.8 / 0.6% | −0.6 |
+| gqa split / kv store / embed / misc | — | ~6.7 | ~0.5% | ~5.4 / 0.3% | +1.3 |
+| **GEMM total** | 193 | **794.5** | **64.1%** | 1694.7 / 79.2% | **−900.2** |
+
+**The wall shift vs r37 is entirely the GEMM line.** q4_K stayed flat
+(−1.9 ms, 598.1 vs 600.0), q6_K dropped 898 ms, so GEMM total fell 1694.7 →
+794.5 ms (79.2% → 64.1%). Every non-GEMM class is flat to within noise
+(±1 ms), EXCEPT the **quantize prepass, which grew +31.6 ms** purely because
+the q6_K BT port (r38-41) routes each q6_K GEMM through the same A-transpose
+prepass — the 166-q4_K prepass launches are unchanged (64.4 ms), and the +27
+q6_K prepass launches add 54.0 ms (grid 7696 = id 18944). So the q6_K
+convergence carried a hidden +31.6 ms prepass tax; the net q6_K wall win is
+898.3 − 31.6 = **866.7 ms**.
+
+**GEMM by weight type (nt=3325):** q4_K = 18,000 GMAC in 598.1 ms =
+**33.2 µs/GMAC** (r37 36.2; llama 31.4 → **1.06×, parity**). q6_K = 3,020 GMAC
+in 196.4 ms = **65.0 µs/GMAC** (r37 368.9; llama 57.8 → **1.13×, converged**).
+
+**Matched-nt pair (nt≈511, current code) vs r37-llama fixups:** q4_K GEMM
+101.56 ms vs llama 86.86 ms = **36.7 → 1.17×** (r37 1.15× — the short-nt
+dilution is UNCHANGED, i.e. the r37 "1.43× per-IMMA at short nt" is a
+short-nt-only effect that does not bind the prefill wall); q6_K GEMM 31.71 ms
+vs 26.83 ms = 68.3 µs/GMAC (r37 368.9 → **1.18×**, converged even at matched
+nt).
+
+**Whole-prefill (nt=3325) vs llama @3325-eq (llama-bench `-p 3325 -n 0 -r 1` =
+3324.42 tok/s):**
+
+| slice | minfer ms | llama ms @3325-eq | gap ms | ratio | verdict |
+|---|---:|---:|---:|---:|---|
+| q4_K GEMM | 598.1 | 565.2 | +32.9 | 1.06× | **parity** — non-addressable |
+| q6_K GEMM | 196.4 | 174.6 | +21.8 | 1.13× | **converged** — non-addressable |
+| attention/FA | 125.8 | ~22 | +103.8 | **5.72×** | **#1 structural residual** |
+| quantize prepass | 118.4 | ~47 | +71.4 | 2.52× | addressable (grew + q6K tax) |
+| swiglu | 83.2 | ~84 | ~0 | parity | bandwidth-bound |
+
+**Deliverable B — ranked next-3 (expected wall saving vs confidence):**
+
+1. **FAP2 — register-resident softmax (FA).** FA = 125.8 ms = **10.2% of the
+   now-smaller wall**, and it is the **largest vs-llama ratio (5.72×) left.**
+   This directly answers r46's open caveat: FA is **NOT smaller/overlapped**
+   — it is 125.8 ms real, and the r46 "wall-neutral" only holds for the
+   ≤11% lever (FA_TKV 32 + padding = −16 ms = 1.3% of wall, below the +1.5%
+   bar). The **register-resident softmax removes the S/P smem round-trip
+   entirely** (the 36% MIO stall + 2 syncs), which the FAP1 tile/conflict
+   lever left intact. Estimated: **2× → −63 ms (−4.9% wall, ~2760 tok/s)**;
+   a conservative >1.6× already clears the +1.5% bar (19 ms). Confidence:
+   **ESTIMATED** (real mechanism; a full rewrite; the r44/r45 q6_K precedent
+   shows small levers were wall-neutral, but FA is genuinely the #1 residual
+   and the mechanism is distinct). Risk: **high** (rewrite).
+
+2. **A-quantize prepass rework.** quantize prepass = 118.4 ms = **9.6% wall**,
+   2.52× vs llama (llama pays 0: in-kernel q8_1). Grew **+31.6 ms** as the
+   hidden tax of the q6_K port. Two addressable sub-gaps: (a) **shared-A
+   redundancy** — q/k/v all consume the same `normed` A, gate/up share the
+   same `normed2` A (confirmed in `src/models/qwen2/graph.rs:121-123,216-217`),
+   so the A-transpose is re-computed per GEMM; deduping → the q4_K prepass
+   (64.4 ms) drops toward ~half; (b) the q6_K prepass (54 ms) is somewhat
+   necessary but its A is the same `normed` as q4_K q/k/v where it shares the
+   layer input. Estimate: −30 to −50 ms (−2.5 to −4% wall). Confidence:
+   **MEDIUM** (redundancy confirmed in the builder; exact split needs a
+   per-GEMM A-identity audit). Not a trivial in-kernel fuse (r34 moved the
+   transform OUT for +9.72% — re-fusing would regress that), but the
+   redundant-A dedup is safe. Risk: **medium**.
+
+3. **q4_K short-nt dilution (1.43× → 1.15×).** Confirmed with current code at
+   matched nt: q4_K 1.17× at nt≈511 but **1.06× at the actual prefill nt
+   3325** → dilution is a **short-nt-only effect** that does NOT bind the
+   whole-prefill wall. The wall's nt-dependence is: q4_K is parity at
+   prefill-scale; the prologue/staging dilution only matters for nt≲512
+   (decode and short prompts). **Not a lever for the 3325-tok wall.** Risk:
+   low, but ~0 wall win here.
+
+**Task 3 — recommendation: FAP2 (register-resident softmax).** The wall is no
+longer GEMM-bound: GEMM total is 64.1% but **both q4_K (1.06×) and q6_K
+(1.13×) are at parity** — the r37 table's "chase the GEMM residual" premise is
+closed. The only remaining **addressable vs-llama residual is FA (5.72×,
+10.2% of wall, 125.8 ms)**, and it is genuinely wall-relevant at the new,
+smaller wall (r46's "if it is smaller/overlapped" caveat does not hold — it is
+neither). A 2× FA fix = ~−63 ms = ~−5% wall, which alone clears the +1.5% bar
+and is the largest single lever available. The A-quantize dedup is the
+higher-confidence-but-smaller fallback and pairs well after FAP2; q4_K
+dilution should be shelved for the prefill wall.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

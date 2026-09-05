@@ -1311,3 +1311,28 @@ The q6_K **line has converged**: kernel ~0.59 ms matched-nt (~3.0× vs llama's
 57.8 µs/GMAC remains) but that gap no longer drives whole-prefill (~2595 tok/s);
 further q6_K-kernel tuning (cp.async B, split-phase, pre-expand-B) is
 wall-neutral. Reverted; recorded: docs/CUDA_OPTIMIZATION.md P6 r45.
+
+### 11.26 Follow-up (r47, 2026-09-05): the converged-regime wall decomposition — the r37 table is STALE
+
+r45 concluded the q6_K line "no longer drives whole-prefill." r47 re-decomposes
+the whole-prefill wall at the current best gate set (`MINFER_MMQ=1
+MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_NB=1 MINFER_MMQ_A_TRANSPOSE=1
+MINFER_MMQ_Q6K_NB=1`), qwen2.5-7b q4_k_m, 3325-token prefill, HEAD a186f51
+(r45 code + r46 doc), no code change. **The r37 table is confirmed stale: q6_K
+GEMM 1094.7 ms (51.2%) → 196.4 ms (15.8%), wall 2190 → 1274 ms (1521 → 2610
+tok/s, vs-llama 2.15× → 1.27×).**
+
+The whole-prefill wall is now **not GEMM-bound**: GEMM total is 64.1% but
+**q4_K = 1.06× and q6_K = 1.13× vs llama at 3325** (both parity/converged).
+The wall is **not FA-bound either in the "small lever" sense**: FA = 125.8 ms
+= 10.2% of the wall, but it is the **largest vs-llama structural residual
+(5.72×)**, and it is **not smaller/overlapped** (which is the condition under
+which r46 predicted a big FA fix would also be wall-neutral). The only
+remaining wall-critical structural residual is FA (the 36% MIO stall + S/P
+smem round-trip), targeted by FAP2 (register-resident softmax); A-quantize
+prepass (2.52×, grew +31.6 ms as the hidden tax of the q6_K BT port) is the
+safer-but-smaller second lever; q4_K short-nt dilution binds only at nt≲512,
+not the prefill wall.
+
+Matches the fresh nsys re-bucket (r47_gpu_trace.csv) and the matched-nt 511
+pair (r47_bt511_trace.csv). Recorded: docs/CUDA_OPTIMIZATION.md P6 r47.
