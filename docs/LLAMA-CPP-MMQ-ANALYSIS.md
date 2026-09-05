@@ -1168,3 +1168,30 @@ greedy-32 byte-identical; suite **166/0/3**; whole-prefill **1979.9→2605.2 tok
 +13.0%) and it is register-neutral, so the occupancy won by r40 is preserved. The
 remaining stall (33.6% L1TEX) is now mainly the dsc `d·sc` byte/16-bit reads
 (uncoalesced) plus the KSPLIT=2 intrinsic. Recorded: docs/CUDA_OPTIMIZATION.md P6 r41.
+
+### 11.22 Follow-up (r42, 2026-09-05): stage-wide dsc scale read — NEUTRAL, dsc-traffic reduced but scoreboard stall unchanged (REVERTED)
+
+r41/§11.21 attributed the residual to the dsc `d·sc` reads. r42 attacked it and
+**refuted** the attribution. The staging dsc plane was written via per-(row,chunk)
+narrow loads (1×f16 `d` @208 + 2×i8 `sc` @192 = 3 LDGs per (row,chunk)); the widen
+loads the KDR=2 chunks' 4 `sc` bytes as one `u32` + `d` as one `u32` = 2 wide loads
+per (row,window) (6 narrow → 2 wide, ~3× instruction-cut on that path).
+
+**Result.** ptxas 80 regs / 4 B spill (3-block budget held); parity **1/0**
+(raw+padded); greedy-32 byte-identical; whole-prefill **2607.5 → 2602.6 tok/s
+(−0.19%, NEUTRAL — bar +1.5% not met)**. ncu: L1/TEX throughput
+**33.64% → 26.45%** and Memory 30.50% → 26.77% (the dsc *data traffic* genuinely
+dropped), duration −1.8%, but **CPIStall long_scoreboard 3.6 → 3.8 cy = 33.6% →
+33.6% (UNCHANGED)** and No-Eligible 58.0% → 58.6%.
+
+**Why it's a falsification.** Widening the dsc load reduces the bytes it moves and
+the kernel is marginally faster (−1.8%), but the *scoreboard stall share* — the 33.6%
+r41 flagged — is unchanged and the wall is a statistical tie. The dsc reads
+contribute to L1TEX *data throughput* but their exposed *latency* was not the
+bottleneck; the stall cycles come from a different source (the strided A qa8/sda /
+qb_exp global→smem loads or remaining LDS latency in the compute loop), and the
+double-buffer already hides staging latency across warps. **Direction for next:**
+Warp-Stall-Sampling source attribution on `mmq_raw_nb_bt_q6k_kernel<2>` to identify
+the actual instruction behind the 33.6% long_scoreboard, rather than assuming the
+scale reads. The KSPLIT=2 intrinsic remains a hard q6_K cost. Recorded:
+docs/CUDA_OPTIMIZATION.md P6 r42.

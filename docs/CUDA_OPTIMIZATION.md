@@ -2182,6 +2182,58 @@ harness), `/tmp/ncu_r41_full.csv` (pre-change ncu) + `/tmp/ncu_r41_new.csv`
 (post-change ncu), `/tmp/perf_r41_interleaved.txt` (gate-5),
 `/tmp/g32_r41_default.txt` + `/tmp/g32_r41_q6k.txt` (gate-4 greedy identity).
 
+### P6 r42: stage-wide dsc scale read in the q6_K BT kernel — NEUTRAL, dsc-traffic reduced but scoreboard stall unchanged (REVERTED, 2026-09-05)
+
+r41 named the residual as "the remaining stall (33.6% L1TEX) is now mainly the
+dsc `d·sc` byte/16-bit reads (uncoalesced) plus the KSPLIT=2 intrinsic". This
+session attacked that lever directly and **refuted it**.
+
+**Change (register-neutral).** In `mmq_raw_nb_bt_q6k_kernel`'s staging the dsc
+plane was written via per-(row,chunk) narrow loads: 1 × f16 (`d` @208) + 2 × i8
+(`sc[2c%16]`, `sc[(2c+1)%16]` @192) = 3 LDGs per (row,chunk), i.e. KDR*3 per row
+per kt-window. r42 replaces that with a stage-wide scale read: per row per
+kt-window the KDR=2 chunks' 4 `sc` bytes (0,4,8,12 @ KDR=2 — 4-aligned) load in
+ONE `u32` and `d` loads in ONE `u32` = **2 wide loads per (row,window)** instead of
+6 narrow. The compute loop already reads `sds` as a wide LDS.128 of f32 pairs, so
+nothing changes there. Same multiply order (`d * (float)(int8_t)sc`) → bit-identical
+dsc. Gated on the 16-aligned padded 224B stride (raw 210B path keeps the scalar loop).
+
+**Gates.** 1) ptxas `<256,3>` KDR=2 sm_121: **80 registers, 4 B spill stores, 4 B
+spill loads** — identical to r41, 3-block/SM budget **HOLDS**. 2) Parity
+(`MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1 cuda_prefill_mmq`): **1/0**
+(raw 210B + padded 224B). 3) Greedy-32 token identity vs default f16: **byte-identical**
+(timing-only diffs). 4) Perf interleaved 3× (full q4_K-BT+q6_K env):
+**2612.7/2604.6/2607.5 (pre_r42) → 2602.6/2619.7/2597.9 (r42) = −0.19% median —
+NEUTRAL** (bar +1.5% NOT met). 5) ncu `mmq_raw_nb_bt_q6k_kernel<2>`: L1/TEX cache
+throughput **33.64% → 26.45%**, Memory throughput 30.50% → 26.77%, duration
+**653,952 → 641,984 ns (−1.8%)**, compute (SM) 37.78% → 38.19% — BUT **CPIStall
+long_scoreboard 3.6 → 3.8 cy, share 33.6% → 33.6% (UNCHANGED)**, warp-cycles/inst
+10.77 → 11.33, No-Eligible 58.04% → 58.55%, Active warps/sched 4.52 → 4.69. 6) Suite (below).
+
+**Verdict — REVERTED (neutral).** The dsc stage-wide read cut the actual L1TEX
+*data traffic* (throughput 33.64→26.45%, Memory 30.50→26.77%, kernel −1.8%) but it
+did **not** move the *scoreboard stall share* (long_scoreboard 3.6→3.8 cy = 33.6%
+both) and the whole-prefill is a statistical tie (−0.19% median, noise). **The r41
+premise is FALSIFIED**: the 33.6% long_scoreboard is **not** dominated by the dsc
+reads. Widening the dsc load reduces the bytes it moves, but the stall cycles come
+from a different latency source (the strided A qa8/sda or qb_exp global→smem
+loads, or the remaining smem/LDS latency in the compute loop) — and because the
+double-buffer already overlaps staging with compute, a per-row staging saving
+doesn't reach the wall. **Next levers:** (a) profile the remaining long_scoreboard
+with Warp Stall Sampling source attribution to locate the actual instruction;
+(b) the qb_exp (B-expand) global→smem and the A-side qa8/sda staging are now the
+prime suspects, not the dsc reads; (c) KSPLIT=2 intrinsic remains. **q6_K
+convergence vs llama's 57.8 µs/GMAC:** r41 reached ~0.65 ms matched-nt attn_v
+(~3.0×); r42 confirms the residual is not the dsc path — still ~3.0×, and further
+q6_K gains must come from the staging/scoreboard source, not the scale reads.
+
+Artifacts: `/tmp/minfer_pre_r42` (r41 baseline binary, pre-change),
+`/tmp/gen_q6k_ptxas_r42.py` + `/tmp/q6k_r42.cu`/`q6k_r42.cubin` (ptxas harness),
+`/tmp/perf_r42.sh` + `/tmp/perf_r42_results.txt` (gate-5 interleave),
+`/tmp/g32_r42.sh` + `/tmp/g32_r42_{default,q6k}.txt`/`.norm` (gate-4 greedy
+identity), `/tmp/ncu_r42.csv` + `/tmp/ncu_r42_ws.csv` (gate-5 ncu: SOL +
+warp-state), `/tmp/cuda_kernels_head.cu` (cmp-verify of the revert).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
