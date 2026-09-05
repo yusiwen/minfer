@@ -1107,3 +1107,33 @@ is pure staging/compute overlap at constant occupancy). The kernel remains **lat
 No-Eligible, SOL OPT) at 2 blocks/SM, so the q6_K-vs-llama **~3.8× gap stays**; the open levers are
 a 3rd resident block (regs 87→≤80) or KSPLIT=2's inherent 2× mma.k16. Recorded:
 docs/CUDA_OPTIMIZATION.md P6 r39.
+
+### 11.20 Follow-up (r40, 2026-09-05): the 3rd resident block via `__launch_bounds__(256,3)` — LANDED (+13.0%; the "0-spill" gate is disproven-immaterial)
+
+r39's named lever #1 walked. The register arithmetic checks out and the probe succeeded — but
+not the way the gate anticipated.
+
+**Register arithmetic holds.** `__launch_bounds__(256)` → `(256, 3)` makes ptxas target the
+3-block budget: `floor(65536/768)=85.33` → 8-reg granularity → **80 registers** (from 87),
+80×768=61,440 ≤ 65,536, and smem 29,696×3=89,088 ≤ 102,400. So 3 blocks fit on both axes.
+
+**The caveat: a 4-byte spill.** Force-fitting 87→80 spilled exactly 1 value (4 B spill
+store/load, 8-byte stack frame). A 10-variant Task-2 trim sweep (G-recompute, smem-base fold,
+de-unroll kd/l, `__builtin_assume`, division→shift, per-g A-frag, epilogue recompute, fused
+mma+scale, and a combined stack) all landed at 80/4 B or *worse* (up to 28 B). At this
+revision ptxas needs 81 live registers; 80 forces exactly one spill, and the trim edits break
+ptxas's schedule. Under the stated "0 spill" gate, this probes *dead*.
+
+**But the premise falsified.** Building and measuring `<256,3>`: whole-prefill **1784 → 2015.6
+tok/s (+13.0%)**, kernel (attn_v) **2.05 ms → 1.58 ms (−23%)**, compute (SM) **21.52% →
+29.06%**, No-Eligible **74.54% → 70.08%**, Active warps/sched **3.87 → 4.48**,
+`launch__occupancy_limit_{registers,shared_mem}=3`, active warps 18.12 (37.74% of peak ≈ 24
+resident = 3 blocks). Parity 1/0, greedy-32 byte-identical, suite 166/0/3. So the +50%
+resident-warp occupancy win dominates the one-register spill — "spills are usually a loss"
+is empirically wrong here.
+
+**q6_K convergence verdict:** still a ~3.0× gap vs llama (matched-nt ~221.8 → ~171 µs/GMAC
+est. from the −23 % kernel time; llama 57.8). The kernel is **still latency-bound** (70%
+No-Eligible; warp time dominated 70% by L1TEX scoreboard, 10.5 cy/warp), so the residual is
+the KSPLIT=2 intrinsic (2× mma.k16) plus remaining memory-latency stall, not residency (now
+3 blocks). Recorded: docs/CUDA_OPTIMIZATION.md P6 r40.

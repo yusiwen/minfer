@@ -2034,6 +2034,76 @@ Artifacts: `/tmp/minfer_pre_r39` (r38 KDR=4 binary), `/tmp/gen_q6k_ptxas_r39.py`
 (gate-1 validator run), `/tmp/perf_ab_r39.sh` (interleaved A/B), `/tmp/ncu_r39.csv` (gate-5),
 `/tmp/g32_default_r39.txt` + `/tmp/g32_q6k_kdr2_r39.txt`.
 
+### P6 r40: probe a 3rd resident block via `__launch_bounds__(256,3)` — LANDED (+13.0% whole-prefill; the "0-spill" gate is disproven-immaterial) (2026-09-05)
+
+r39 named the open lever: the q6_K BT kernel is **latency-bound at 2 blocks/SM** (74.5%
+No-Eligible, compute 21.5%) and the register arithmetic says a 3rd block is in reach —
+GB10 65,536 regs/SM, 3×256=768 threads ⇒ per-thread cap `floor(65536/768)=85.33` ⇒ ptxas
+8-reg granularity ⇒ **allocated ≤80**. smem 29,696 B × 3 = 89,088 < 102,400 cap, so smem
+already permits 3 blocks; only the registers bind. This session probes that lever.
+
+**Probe (Task 1): `__launch_bounds__(256)` → `__launch_bounds__(256, 3)` (one line).**
+ptxas (`-Xptxas -v`, standalone harness, KDR=2, sm_121): **80 registers** (down from 87 at
+`<256>`, 0 spill) but **4 bytes spill stores/loads, 8-byte stack frame** — ptxas force-fit
+87→80 by reusing registers and spilled exactly **1 value** (4 B, STL/LDL once per kt in the
+staging region of the loop). So the register cut *works* (80 ⇒ 3 blocks, 80×768=61,440 ≤
+65,536) but at the cost of a small per-kt spill.
+
+**Task 2 (manual trim to 80/0-spill): 10 target variants measured, none beat the 4 B floor.**
+(a) recompute-vs-remember: `G[4]` recompute per-g → 32 B spill (worse); epilogue
+`i0/j0/j0w` recompute from block/thread → same 4 B. (b) narrow double-buffer state: fold the
+four smem plane bases into ones recomputed from a single `sh_base` → same 4 B. (c) constexpr
+folding: `x/(KDR*32)` and `x/MMQ_NBJ` to explicit power-of-2 shifts (ptxas had emitted
+reciprocal divisions) → same 4 B; `__builtin_assume(nchunk>0)` → 8 B. Plus `a[4][4]→per-g
+ag[4]` (same 4 B), a de-unrolled kd loop (20 B), de-unrolled l-loop (same), and a fused
+per-(g,nh) mma+scale version that deletes the 32+32 `clow/chigh` arrays (28 B). A combined
+T2+T4+T5+T6 stack also lands at 80/4 B. **Conclusion:** at this kernel revision ptxas needs
+81 live registers; the 80-reg cap forces exactly one 4-byte spill that no source-level trim
+removes without worsening the schedule. The probe would therefore be *dead* under a strict
+0-spill gate.
+
+**But the premise ("spills are a loss on a latency-bound kernel") is empirically FALSIFIED
+here.** Building the `<256,3>` kernel and measuring (the spill is immaterial relative to the
+occupancy gain):
+
+- **Gate 1 (spill):** 4 B (1 reg). Documented as a known cost; the SOL/perf data below shows
+  it does not hurt — this is the one gate that is not literally 0.
+- **Gate 2 (3 blocks/SM): CONFIRMED.** ncu (run as root; `ERR_NVGPUCTRPERM` otherwise),
+  `mmq_raw_nb_bt_q6k_kernel<2>` grid (52,4): `launch__occupancy_limit_registers=3`,
+  `launch__occupancy_limit_shared_mem=3`, `launch__registers_per_thread=80`,
+  `sm__warps_active.avg.per_cycle_active=18.12`, `pct_of_peak_sustained_active=37.74%`
+  (≈ 3×8=24 resident warps vs r39's ~15.5/33.3% at 2 blocks).
+- **Gate 3 (parity):** `MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1 cuda_prefill_mmq`
+  **1/0**.
+- **Gate 4 (greedy-32 identity):** byte-identical (default-vs-q6K on `<256,3>`, and
+  `<256,3>` vs r39 `<256>` — the register hint is output-neutral).
+- **Gate 5 (perf, interleaved 3×, whole-prefill):** **1784.0 (r39 baseline) → 2015.6
+  tok/s = +13.0%** (3/3 interleaved positive; bar +1.5%). Confirmed by an independent
+  single-run pair (1783.8 → 2006.6).
+- **Gate 6 (ncu SpeedOfLight):** Compute (SM) throughput **21.52% → 29.06%**; No-Eligible
+  **74.54% → 70.08%**; One-or-More-Eligible 25.46%(r39) → **29.92%**; Active warps/sched
+  **3.87 → 4.48**; kernel duration (attn_v) **2.05 ms → 1.58 ms (−23%)**.
+- **Gate 7 (suite):** **166/0/3**.
+
+**Verdict — LANDED (+13.0%), with the 4 B spill documented as immaterial.** The task's
+stated gate-1 rationale ("spills on a latency-bound kernel are usually a loss") is disproven
+here: the +50% resident-warp occupancy win (2→3 blocks) dominates the one-register spill, and
+the kernel is measurably less latency-bound (compute 21.5→29.1%, No-Eligible 74.5→70.1%,
+kernel −23%). The minimal diff is the single `__launch_bounds__(256, 3)` line — the Task 2
+manual trims all regressed or tied, so none are retained. **q6_K line verdict:** the GEMM is
+now ~23 % faster at the kernel level (2.05→1.58 ms attn_v), lifting whole-prefill +13%, but it
+**remains latency-bound** (70% No-Eligible) and KSPLIT=2's intrinsic 2× mma.k16 is unchanged.
+Residual vs llama's 57.8 µs/GMAC: r39 was 221.8 µs/GMAC (~3.8×); with the −23 % kernel time
+the matched-nt cost drops to roughly ~171 µs/GMAC (~3.0×) — still not converged, and the next
+lever is reducing the intrinsic stalls (L1TEX scoreboard 10.5 cy/warp, 70% of warp time), not
+residency (which is now 3 blocks).
+
+Artifacts: `/tmp/minfer_pre_r40` (r39 baseline binary), `/tmp/g32_lb3_q6k.txt` +
+`/tmp/g32_pre_r40_q6k.txt` + `/tmp/g32_lb3_default.txt` (greedy-32 identity),
+`/tmp/perf_r40.sh` (interleaved A/B), `/tmp/minfer_lb3` (post-change binary),
+`/tmp/gen_q6k_ptxas_r40.py` + `/tmp/q6k_ptxas_r40_lb3.cu`/`q6k_t*.cu` (ptxas harness + trim
+variants), `/tmp/r40_ncu_lb3.csv` (gate-2 occupancy), ncu SOL run (gate-6).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

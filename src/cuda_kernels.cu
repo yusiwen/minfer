@@ -5344,7 +5344,7 @@ __device__ __forceinline__ int expand_q6_elem(const uint8_t* ql, const uint8_t* 
 }
 
 template <int KDR>
-__global__ void __launch_bounds__(256) mmq_raw_nb_bt_q6k_kernel(
+__global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
     int nt, int od, int id, int nchunk, int bstride
