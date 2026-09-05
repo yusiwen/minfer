@@ -1703,6 +1703,63 @@ occupancy landing, and well above the +1.5% bar. The A-frag LDSM consumption and
 the fp rescale remain (intrinsic), but the staging-bound part of the residual is
 now closed. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.14.
 
+### P6 r35: pre-decode the sda d|ssum scale — NEUTRAL, hypothesis FALSIFIED (REVERTED, 2026-09-04)
+
+Fresh regional census of the r34 BT kernel under its new organization, then the
+task's named candidate (pre-decode the sda scales) implemented and measured.
+
+**SASS regional classification** (sm_121, `cuobjdump -sass -arch sm_121`, full
+`mmq_raw_nb_bt_kernel` 2,304 instructions, per-region opcode census):
+prolog+stage0 **387** (~310 int-alu, run-once), in-loop staging **286** (~213
+int-alu, per-kt), compute-kd **1514** (~149 int-alu, per-kt), epilogue **117**
+(~102 int-alu, run-once). Per-kt dynamic ≈ 1,800 ⇒ staging ≈ 16%, compute-kd ≈
+66% of the instruction stream. Hypotheses tested: **(a) compute-kd dominates —
+CONFIRMED**, and its largest cuttable block is the sda d|ssum **decode** (64
+`SHF.R.S32.HI` sign-extends + 64 `HADD2.F32` h2f + 64 `I2FP` for `(float)ssum`);
+**(b) A-frag LDSM irreducible — re-verified**, 32 `LDSM.16.M88.4` (4 per kd × 8
+kd) directly serve the 64 IMMA and cannot be removed without rewiring the mma;
+**(c) index math minimal** — the A staging is a bulk LDG→STS (r34), the remaining
+in-loop integer ALU is the per-kt B weight + SDS staging, inherent.
+
+**The cut (hypothesis FALSIFIED).** Pre-decode the sda scales in the prepass:
+`quantize_q8_0_pad40_t` emits per-token d as **f32** (lossless `__half2float` of
+the stored f16) and ssum as **i32** (exact) — 8 B/token/chunk vs the packed 4 B —
+so the compute loop's 64 SHF sign-extends + 64 h2f converts vanish into
+LDS.128-ready values. `mmq_raw_nb_bt_kernel` smem per-chunk scale plane becomes
+[ d f32 256B ][ ssum i32 256B ] (KDR×512 B = 4,096 B vs 2,048 B), total smem
+**43,008 → 45,056 B** (still under the ~49.5 KB 2-blocks/SM cap); the bulk
+LDG→STS stays contiguous.
+
+**Gates.**
+1. Build clean; ptxas sm_121 `mmq_raw_nb_bt_kernel<8>`: **113 regs, 0 spill**
+   (r34 103; still <128 ⇒ **2 blocks/SM preserved**; the register bump is the four
+   live f32/i32 sda reads), smem 45,056 B.
+2. Parity (BT-active `cuda_prefill_mmq` @ KD=8): **1 passed, 0 failed**.
+3. Greedy-32 identity: the pre-decode is numerically exact — r35 BT output
+   **byte-identical to the r34 BT output** (the BT-vs-f16-default token-2
+   divergence is pre-existing fp-rounding, unchanged by r35).
+4. **SASS before/after**: `SHF.R.S32.HI` **64 → 0**, `HADD2.F32` **64 → 10**,
+   `LDS.128` **32 → 48** (the sda reads *double* as predicted — [d f32] + [ssum
+   i32] need two planes), net **-130** instructions (2304 → 2174).
+5. **Perf — NEUTRAL.** Interleaved 5-round (7B q4_k_m @3354-token prefill):
+   base(r34) median **1493.2** → r35 median **1486.3** = **-0.46%** (within the
+   ±1% run noise; 2 blocks/SM preserved). Does NOT clear the +1.5% bar.
+6. Suite: **166/0/3** (post-revert r34 code, unchanged).
+
+**Verdict — reverted (cmp-verified = HEAD ba977bf).** Removing **128** int/fp
+ALU (`SHF.R.S32.HI` + `HADD2.F32`) from compute-kd while adding **16**
+`LDS.128` (doubled sda reads) moves the wall 0.0% — the compute-loop wall is
+**NOT ALU-bound**. The decode instructions were scheduled in the IMMA shadow
+(they fill idle FP/INT pipe slots under the 64/kt tensor-core mma), so removing
+them frees no critical-resource pressure; what was added (LDS) offsets it. This
+falsifies the "pre-decode the scale/decode class" lever: the residual is the
+intrinsic **composition** — A-frag LDSM consuming (32, irreducible) + the fp
+rescale (FFMA/FMUL/I2FP, at parity) — not a source-level ALU cut. Recorded:
+docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.15. The BT line is **converging**: the
+r28→r34 gains moved the staging/decode *mechanics* out, but the remaining ~1.1×
+llama gap sits in LDSM/IMMA + fp-rescale composition that neither loop reorder
+(r33) nor scale pre-decode (r35) can touch.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

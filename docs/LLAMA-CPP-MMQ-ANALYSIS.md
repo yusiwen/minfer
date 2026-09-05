@@ -933,3 +933,29 @@ staging index math leaves the kernel) and the wall. Recorded:
 docs/CUDA_OPTIMIZATION.md P6 r34. The A-frag LDSM consumption and fp rescale
 remain intrinsic (as r32 concluded), but the staging-bound share of the residual
 is now closed; the "composition" class is no longer monolithic.
+
+### 11.15 Follow-up (r35, 2026-09-04): the scale pre-decode — a SASS-verified
+no-op on the wall; the compute loop is NOT ALU-bound (REVERTED)
+
+§11.14 closed the staging-bound share of the residual. The r35 candidate was the
+other named "composition" piece: **pre-decode the A-side sda d|ssum in the
+prepass** so the mma kernel's compute loop reads LDS.128-ready f32/i32 instead of
+re-deriving d (h2f) and ssum (sign-extend) per (block, kt). `quantize_q8_0_pad40_t`
+was extended to emit per-token d as f32 (exact `__half2float` of the stored f16)
+and ssum as i32 (exact), 8 B/token/chunk, and the BT kernel's smem scale plane
+became [d f32][ssum i32] per chunk (43,008 → 45,056 B, 2 blocks/SM preserved).
+
+**What it proved.** The SASS did what was asked — `SHF.R.S32.HI` 64→**0**,
+`HADD2.F32` 64→**10**, net **-130** instructions (2304 → 2174) — but the sda reads
+**doubled** (`LDS.128` 32→**48**) because two f32/i32 planes replace one packed
+u32. ptxas 113 regs/0 spill (r34 103; <128 keeps 2 blocks/SM). Parity 1/0 and
+greedy-32 byte-identical to r34 (numerically exact). **Perf NEUTRAL**: interleaved
+5-round median **1493.2 → 1486.3 = -0.46%**, within noise; **no +1.5%**.
+
+**Interpretation (the falsification).** Removing 128 int/fp ALU from the compute
+loop moved the wall 0.0% while adding 16 LDS.128. The compute-loop wall is not
+ALU-bound — the decode instructions were scheduled in the IMMA shadow (they use
+spare FP/INT pipe slots under the 64/kt tensor-core mma), so they were never the
+critical resource. The residual is intrinsic **composition** (A-frag LDSM
+consuming + fp rescale), exactly as r32/r33 concluded; the "decode class" is now
+closed as *not* a wall lever. Recorded: docs/CUDA_OPTIMIZATION.md P6 r35.
