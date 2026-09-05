@@ -1011,3 +1011,39 @@ deficit is also absent. **The bt mma kernel is at per-IMMA parity with llama**;
 the remaining prefill gap lives outside a structurally addressable mma lever
 (per-tile prologue/wave amortization, quantize prepass, fixup). No A-side
 implementation is warranted. Recorded: docs/CUDA_OPTIMIZATION.md P6 r36.
+
+### 11.17 Follow-up (r37, 2026-09-05): the post-parity gap is the q6_K path, and
+bt's wall parity only holds at prefill-scale nt (measurement-only)
+
+§11.16 closed the bt kernel's per-IMMA economics, but it measured the bt kernel in
+isolation. A full-graph nsys on the BT path (all four gates, qwen2.5-7b q4_k_m,
+3325-token prefill) shows the bt kernel only covers the **q4_K** weights; the
+**q6_K** weights (attn_v, ffn_down) run through the generic
+`mmq_nt_kernel<(int)7,(int)2,(bool)0>`. Per-launch bucketing (GPU busy 2139.6 ms):
+**GEMM q6_K = 1094.7 ms (51.2%)**, GEMM q4_K bt = 600.0 ms (28.0%), FA 5.8%,
+quantize-prepass 4.1%, swiglu 3.9%, rest ~7%. The single largest slice is the q6_K
+**ffn_down** GEMM — 13 launches @ ~80 ms = **1063.5 ms (48.6% of the prefill wall)**.
+
+**Matched-nucleus wall/GMAC (this is the r37 headline number).** Both kernels at
+nt≈512 (minfer 511-tok prompt, llama-bench `-p 512 -n 0 -r 1 -t 8`), nsys GEMM wall
+normalized to GMAC (identical weights → identical GMAC on both sides):
+
+| GEMM class | minfer wall/GMAC | llama wall/GMAC | ratio |
+|---|---:|---:|---:|
+| q4_K (bt vs `mul_mat_q<12>`) | 36.2 µs/GMAC | 31.4 µs/GMAC | 1.15× |
+| **q6_K (mmq_nt<7> vs `mul_mat_q<14>`)** | **368.9 µs/GMAC** | 57.8 µs/GMAC | **6.38×** |
+| total | 84.0 µs/GMAC | 35.2 µs/GMAC | 2.38× |
+
+ncu single-launch on the matched q GEMM (grid 8×28, both 1,605,632 IMMA): minfer
+379.9 µs / 4.23 G-IMMA/s vs llama 265.7 µs / 6.04 G-IMMA/s — **1.43× wall**. The
+§11.16 "1.05× per-IMMA" compared minfer@3325 to llama@512, i.e. at *different* nt. At
+matched nt, bt's wall per-IMMA is 1.43× slower — the r34/r36 "tile prologue / wave
+amortization" dilution, hidden at prefill-scale nt but exposed at short nt.
+
+**Conclusion.** The bt mma kernel is at per-IMMA parity **and** near wall parity
+(1.15× /AGGREGATE) with llama's mul_mat_q for q4_K. The whole-prefill gap is instead
+concentrated in the **q6_K GEMM path (6.38× wall/GMAC, 11.5× per-MAC vs the q4_K bt
+kernel)** — a structural deficit in how minfer's q6_K is dequantized (fp16-B staging via
+`mmq_nt<7>`), not a per-IMMA rate problem. Bringing the q6_K ffn_down to the q4_K bt
+rate (63.6 TFLOPs) is the single largest lever (~−970 ms wall, ~2720 tok/s). No code
+change. Recorded: docs/CUDA_OPTIMIZATION.md P6 r37.

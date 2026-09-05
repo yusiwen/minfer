@@ -1837,6 +1837,100 @@ so no A-side implementation is warranted. Recorded:
 docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.16. **No code change** (HEAD stays 6112db3);
 this closes the two-named-hypothesis probe at the endpoint.
 
+### P6 r37 — post-parity gap attribution: the whole-prefill wall, decomposed (measurement-only, 2026-09-05)
+
+With the bt mma kernel at per-IMMA parity (r36), this session answers **where the
+remaining whole-prefill gap sits**. Full-graph nsys + matched-nt ncu on the BT-enabled
+path (all four gates `MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_NB=1
+MINFER_MMQ_A_TRANSPOSE=1`), model qwen2.5-7b q4_k_m, `/tmp/minfer_phase7/prompt2k.txt`
+(3325-token prefill). GPU busy 2139.6 ms, wall 2190 ms (1521 tok/s; co-tenant sglang
+idle @0% the whole window — no outlier contamination). **No code change.**
+
+**Headline: the residual is a DIFFERENT kernel, not the bt kernel.** r36 measured the
+bt kernel's per-IMMA rate, but bt only covers the **q4_K** weights. The **q6_K** weights
+(attn_v, ffn_down) run through the generic `mmq_nt_kernel<(int)7,(int)2,(bool)0>` (the
+llama-style fp16-dequant-B staging path, type_id 7 = q6_K). The prefill's single largest
+slice is the **q6_K ffn_down GEMM**: 13 launches @ ~80 ms each = **1063.5 ms = 48.6% of the
+prefill wall**, at **5.5 TFLOPS vs 63.6 TFLOPS for the q4_K gate/up** (same GMAC) — a
+**11.5× per-MAC gap** because q6_K is not on the raw-nibble NN/BT kernel path. That single
+GEMM is larger than the *entire* q4_K BT GEMM (600 ms).
+
+**Op-class table (nsys per-launch bucketing, GPU busy 2139.6 ms = 100%):**
+
+| op class | launches | ms | % GPU busy | vs-r23 (f16 path) |
+|---|---:|---:|---:|---|
+| **GEMM — q6_K (mmq_nt<7,2>)** | 27 | **1094.7** | **51.2%** | r23 had NO q6_K class — q6_K ran on the f16 wmma kernel at 34 TFLOPs (down 27.5%). MMQ made q4_K fast but left q6_K on a slower path than f16. |
+| GEMM — q4_K (mmq_raw_nb_bt<8>) | 166 | 600.0 | 28.0% | r23 GEMM (gate/up 37.8% + down 27.5% + q+o 7.5% + k/v 1.4%) = 74%; MMQ-BT collapses q4_K to 28% (near llama per-IMMA). |
+| attention (FA prefill) | 28 | 124.7 | 5.8% | r23 7.2% — still ~2.5–5×/layer vs llama, structural. |
+| quantize prepass q8_0_pad40_t | 166 | 86.8 | 4.1% | new (r34 A-transpose prepass); llama pays 0 (in-kernel). |
+| swiglu | 56 | 82.8 | 3.9% | r23 5.6% (66 ms @2659-tok) — bandwidth-bound, parity. |
+| quantize_q8_0_pad40 (mmvq A) | 214 | 33.8 | 1.6% | (decode tail A quantize) |
+| add (residual) | 112 | 30.7 | 1.4% | r23 2.0% |
+| rms_norm | 114 | 29.2 | 1.4% | r23 1.9% |
+| mmvq (decode q8) | 187 | 24.1 | 1.1% | tail |
+| add_bias | 168 | 13.8 | 0.6% | — |
+| rope | 112 | 13.3 | 0.6% | r23 ~2.1% (rope+bias+kv store) |
+| gqa split / kv store / embed / misc | — | ~5.4 | ~0.3% | — |
+| **GEMM total** | 193 | **1694.7** | **79.2%** | r23 74% — still ~3/4 of the wall. |
+
+**GEMM by weight type (nt=3325):** q4_K = 18,000 GMAC in 600.0 ms (**60.0 TFLOPs**);
+q6_K = 3,020 GMAC in 1094.7 ms (**5.5 TFLOPs**). Within q6_K: ffn_down (od=3584,
+id=18944) = 1063.5 ms (13 launches), attn_v (od=512) = 31.2 ms (14). Within q4_K BT:
+gate/up (od=18944) 383.7 ms, q/o (od=3584) 206.1 ms, k (od=512) 10.2 ms. Per-MAC the
+q6_K path is **11.5×** slower than the q4_K path.
+
+**Matched-nt kernel pair (nt≈512 — THE r37 number).** minfer @511-tok prompt vs
+llama-bench `-p 512 -n 0 -r 1 -t 8` (llama 3297 t/s at pp512), nsys GEMM wall + ncu
+single-launch (grid 8×28 = the q GEMM od=3584/id=3584) for IMMA:
+
+| class | minfer ms | llama ms | wall/GMAC minfer | wall/GMAC llama | ratio |
+|---|---:|---:|---:|---:|---:|
+| GEMM — q4_K (bt vs mul_mat_q) | 100.22 | 87.07 (+1.15 fixup) | 36.2 µs/GMAC | 31.4 µs/GMAC | **1.15×** |
+| GEMM — q6_K (mmq_nt<7> vs mul_mat_q) | 171.38 | 26.87 (+0.40 fixup) | **368.9 µs/GMAC** | 57.8 µs/GMAC | **6.38×** |
+| GEMM — total | 271.60 | 113.94 | 84.0 µs/GMAC | 35.2 µs/GMAC | **2.38×** |
+
+ncu single-launch (matched q GEMM, both 1,605,632 IMMA): minfer 379.9 µs vs llama
+265.7 µs = **4.23 vs 6.04 G-IMMA/s (1.43× wall)**; warps_active 11.2M vs 4.3M
+(sm__warps_active.avg, cumulative). The r36 "1.05× per-IMMA" was measured at *different*
+nt (minfer 3325 vs llama 512); at matched nt the bt wall is 1.43× slower per-IMMA — that
+**is** the r34/r36 "tile prologue/staging/epilogue dilution" now quantified: the bt kernel
+hides it at prefill-scale nt but not at short nt.
+
+**Quantize prepass (matched nt):** minfer `quantize_q8_0_pad40_t` = 11.54 ms (166
+launches, one per q4_K GEMM — the A transpose is redone for q/k and gate/up which share
+an A) vs llama `quantize_mmq_q8_1` = 6.01 ms (q4_K) + 3.20 ms (q6_K) = 9.21 ms →
+**1.25×**. Residual, but small (4% of wall) and partly a 2× per-shared-A redundancy.
+
+**Task 3 — whole-prefill attribution (nt mismatch explicit).** minfer @3325 = 2190 ms
+(1521 tok/s) vs llama @2600 = ~3270 tok/s (task reference 3255–3280; my pp512 3297) →
+**2.15× whole-prefill gap**. Per-slice (llama scaled to @3325 for the GEMM/FA/quantize —
+llama's GEMM or quantize scale ~linearly with nt):
+
+| slice | minfer ms | llama ms (@3325-eq) | verdict |
+|---|---:|---:|---|
+| GEMM (q4_K + q6_K) | 1694.7 (77.4%) | ~740 | **dominant residual — 2.29×**, and 2.38× at matched nt |
+| — q6_K within GEMM | 1094.7 (50.0%) | ~200 | **structural — 6.38×, not per-IMMA; the Q6_K kernel path** |
+| — q4_K within GEMM | 600.0 (27.4%) | ~520 | parity (1.15×; 1.43× per-IMMA at short nt, dilution) |
+| attention/FA | 124.7 (5.7%) | ~22 | **structural residual (~5.7×)** — r23-known llama FA structure |
+| quantize prepass | 86.8 (4.0%) | ~47 | residual (1.85×) plus per-shared-A 2× redundancy |
+| swiglu | 82.8 (3.8%) | ~84 | parity |
+
+**Caveats:** (1) nt mismatch 3325 vs 2600 (whole-prefill) — handled by reporting
+per-slice at @3325-equivalent and by the matched-nt 512 pair; the 2.15× is wall-to-wall
+at different nt. (2) co-tenant sglang (45 GB resident, `--sleep-on-idle`) was @0% util the
+whole window; no outlier kernels (>2σ from the r23 median) appeared. (3) ncu durations are
+serialized-replay; the authoritative wall/GMAC is the nsys aggregate. (4) IMMA count is
+geometry-identical across minfer/llama (same mma.m16n8k32 tiling), so differences are
+purely rate/dilution, not algorithm.
+
+**Priority queue out of this session:** (1) **q6_K ffn_down + attn_v on a raw byte-width
+NN kernel** (like the bt campaign but 6-bit) — the single largest lever (up to ~−970 ms,
+~2720 tok/s if ffn_down hits the q4_K 63.6 TFLOPs rate); (2) q4_K bt prologue dilution at
+short nt (matched-nt 1.43× per-IMMA); (3) FA structural redesign (5.7×). Artifacts:
+/tmp/minfer_phase7/r37_bt.{nsys-rep,sqlite}, r37_gpu_trace.csv,
+r37_bt511.{nsys-rep,sqlite}, r37_llama512.{nsys-rep,sqlite}, r37_ncu_bt511.csv,
+r37_ncu_llama_mmq.csv.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
