@@ -2234,6 +2234,84 @@ Artifacts: `/tmp/minfer_pre_r42` (r41 baseline binary, pre-change),
 identity), `/tmp/ncu_r42.csv` + `/tmp/ncu_r42_ws.csv` (gate-5 ncu: SOL +
 warp-state), `/tmp/cuda_kernels_head.cu` (cmp-verify of the revert).
 
+### P6 r43: PC-sampling source attribution of the q6_K long_scoreboard — B-expand recomb + A-staging, NOT the dsc; pre-expand-B fix FAILED parity (REVERTED, 2026-09-05)
+
+r42 refuted the dsc reads and left the residual as "the strided A qa8/sda
+and/or qb_exp global→smem loads". This session ran the prescribed PC-sampling
+attribution (ncu `--set full --section SourceCounters`, `--page source`,
+`mmq_raw_nb_bt_q6k_kernel<2>`), which is the first thing in the r42 follow-up
+direction.
+
+**Task 1 — PC-sampling attribution (COMPLETE).** ncu warp-stall sampling on
+`smsp__pcsamp_warps_issue_stalled_long_scoreboard` (per-PC / `--page source`)
+distributes the long_scoreboard samples *to the consuming instruction* (the
+warp is stalled *at* the instruction waiting on the L1TEX data), so the culprit
+of each stall is the dependent op, not the load:
+- **LOP3.LUT `... 0xff` (B-expand ql/qh recomb mask) + SHF.R.U32.HI = 7,578
+  samples (~45%)** — the dominant source. The two `LDG.E.128` (ql/qh, r41's
+  uint4 widen) issue back-to-back, then ~40 ALU ops recomb; the *first* ALU op
+  waits on the load, exposing the L1TEX round-trip. This is the residual of the
+  r41 B-expand widening: it cut the *instruction count* but the *latency* at the
+  recomb consumer remains.
+- **STS.128 (A-side bulk LDG→STS staging, qa8 + sda_q) = 4,741 (~28%)** — the
+  `LDG.E.128 → STS.128` pair; the STS waits on the just-issued load. The A
+  reads are *coalesced contiguous uint4 streams* (r43 confirms) so this is pure
+  copy latency, not uncoalescing.
+- **I2F.S8 (the dsc `(float)(int8_t)sc` recomb) = 4,289 (~26%)** —
+  confirms r42's finding: the dsc *load width* is irrelevant (r42 cut traffic,
+  share stayed 33.6%) because the stall is AT the I2F.S8 consumer waiting on
+  the dsc round-trip. The dsc is a *latency* source, not a width source.
+- SHF.R.U32.HI = 253 (~1.5%); rest ~0.
+Total long_scoreboard = 16,647 / 51,605 samples = 32.3% (matches the reported
+33.6% share). **So the "actual instructions" behind the 33.6% are the B-expand
+recomb (LOP3/SHF, ~45%) + the A-staging copy STS.128 (~28%) + the dsc I2F.S8
+consumer (~26%).** The B-expand recomb is the single largest.
+
+**Task 2 — pre-expand-B fix (FAILED parity, REVERTED).** Uniquely, the B
+weight is static, so the ql+qh recomb can be hoisted to registration: build a
+`W_exp` centered-int8 plane (od×id bytes, byte-for-byte `expand_q6_elem`) in
+`register_weight_q6k_padded`, and the kernel's B staging becomes a bulk uint4
+copy (like the A side) — eliminating the LOP3/SHF recomb and its ~45%
+long_scoreboard share. Implemented: host-side `expanded` built once at
+registration; `q6k_exp_map` maps the padded wptr→W_exp; the kernel took a
+`w_exp` param and copied it in the `W_exp != 0` branch (raw 210-B keeps the
+scalar expand).
+- **W_exp is byte-CORRECT**: a readback test compared the device `W_exp` to a
+  host `expand_q6_elem` mirror — **0 / 17,920 mismatches**.
+- **BUT parity FAILS**: `mmq_w6k_pad` max diff **448** at index 554, identical
+  across three kernel variants: (a) uint4 bulk copy, (b) per-byte copy from
+  `W_exp`, (c) in-kernel `expand_q6_elem` in the same if-branch loop *reading
+  `W`*.
+- **The paradox and why it is unused:** variant (c) — same qbexpb offsets, same
+  values, same if-branch — **passes**, while (a)/(b) reading `W_exp` **fail**,
+  even though `W_exp == expand_q6_elem` byte-for-byte. Force-null (r41 group
+  formula for pad) also passes. So the if-branch placement and the qbexpb
+  indexing are correct; the failure is specific to consuming the companion
+  `W_exp` buffer from the kernel, which I could not isolate to a code bug in
+  the budget (some kernel-side interaction/aliasing not visible in static
+  analysis or the byte readback). The change is therefore REVERTED (cmp-verify
+  clean = HEAD r41).
+
+**Verdict — attribution landed, fix reverted.** The residual 33.6%
+long_scoreboard is **not irreducible** — it is the B-expand recomb latency
+(~45%) + A-staging copy latency (~28%) + dsc consumer latency (~26%), all
+within-warp staging-latency exposures that the double-buffer does not hide
+(only cross-warp occupancy does). The physical fix (pre-expand B) is
+theoretically sound with a byte-correct buffer but a subtle kernel mismatch
+blocks it; the alternative levers are cp.async for the raw A/B staging (hides
+the copy + recomb latency under compute, the llama.cpp structure) or a
+software-pipelined split-phase (register-limited at the 80-reg/3-block cap).
+**q6_K convergence vs llama's 57.8 µs/GMAC:** the ~3.0× gap persists; r41's
+33.6% is now fully attributed but not yet reduced.
+
+Artifacts: `/tmp/r43_pcsrc.ncu-rep` (ncu full-source report),
+`/tmp/r43_pcsrc_source.csv` (imported `--page source`),
+`/tmp/attr_pcsrc.py` (per-opcode long_scoreboard aggregation),
+`/tmp/q6k_r43.cu`/`.sass` (standalone kernel + SASS),
+`/tmp/minfer_pre_r43` (pre-change r41 binary), `/tmp/expand_check2.py` +
+`/tmp/ref_vs_expand.py` (value-formula validators),
+`/tmp/wtest_r43.log` (W_exp 0/17920 readback).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

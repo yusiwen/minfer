@@ -1195,3 +1195,45 @@ Warp-Stall-Sampling source attribution on `mmq_raw_nb_bt_q6k_kernel<2>` to ident
 the actual instruction behind the 33.6% long_scoreboard, rather than assuming the
 scale reads. The KSPLIT=2 intrinsic remains a hard q6_K cost. Recorded:
 docs/CUDA_OPTIMIZATION.md P6 r42.
+
+### 11.23 Follow-up (r43, 2026-09-05): PC-sampling attributes the 33.6% long_scoreboard to the B-expand recomb + A-staging, NOT the dsc; pre-expand-B fix unlanded
+
+r42 refuted the dsc and demanded PC-sampling source attribution. r43 ran it
+(ncu `--set full --section SourceCounters`, `--page source`) on
+`mmq_raw_nb_bt_q6k_kernel<2>`. Warp-stall sampling attributes each stall to the
+*consuming* instruction, so the culprit per stall is the dependent op:
+
+- **LOP3.LUT `...0xff` + SHF (B-expand ql/qh recomb) = 45%** — the dominant.
+  r41's uint4 widen cut the B-expand load *count* but the recomb's first ALU op
+  still waits on the load round-trip (the r40/§11.20 "within-warp latency, not
+  cross-warp occupancy" framing that the double-buffer does not hide).
+- **STS.128 (A-side qa8/sda bulk LDG→STS copy) = 28%** — pure copy latency
+  (the A reads are coalesced contiguous uint4, so NOT the "strided A" r42
+  hypothesized).
+- **I2F.S8 (dsc `(float)(int8_t)sc` consumer) = 26%** — confirms r42: the
+  dsc stall is at the consumer waiting on the load, so widening the load (r42)
+  cannot move it. It is a *latency* source, not a width source.
+
+Total = 16,647/51,605 samples = 32.3% (the reported 33.6% share). **So the
+33.6% is named: B-expand recomb + A-staging copy + dsc consumer, in that order
+— and r42's dsc "falsification" is more precisely that the dsc is a *latency*
+source whose *width* is immaterial.**
+
+**Attempted fix (pre-expand B):** hoist the whole ql+qh recomb to
+registration — build a byte-perfect `W_exp` centered-int8 plane
+(`0/17,920` readback vs a host `expand_q6_elem` mirror), and turn the kernel's
+B staging into a bulk uint4 copy (like the A side), eliminating the LOP3/SHF
+45%. **Parity failed** (max diff 448) identically for three kernel variants
+(uint4 copy, per-byte copy, in-kernel `expand_q6_elem` reading `W`); the
+in-kernel `expand_q6_elem` in the same if-branch *passes*, so the branch and
+indexing are correct and the failure is specific to consuming the companion
+`W_exp` buffer — an unresolved kernel-side interaction beyond the byte
+readback. **Reverted** (cmp-verify = HEAD r41).
+
+**q6_K convergence verdict:** the residual is **not irreducible**; it is
+within-warp staging-latency exposure (the double-buffer overlaps staging with
+compute *across* warps via occupancy, not *within* a warp). The physical
+pre-expand-B fix is blocked by a subtle kernel mismatch; the open levers are
+cp.async for the raw A (and pre-expanded B) staging (llama.cpp's structure) or
+a register-limited split-phase. The ~3.0×-to-llama gap persists. Recorded:
+docs/CUDA_OPTIMIZATION.md P6 r43.
