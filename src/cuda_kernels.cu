@@ -629,6 +629,87 @@ __global__ void quantize_q8_0_pad40(
     *reinterpret_cast<uint32_t*>(dst + 36) = uint32_t(s);
 }
 
+// --- P6 r34: transposed-A q8_0 quantize prepass ----------------------------
+// Quantizes activations to q8_0 and writes the result PRE-TRANSPOSED into the
+// exact layout mmq_raw_nb_bt_kernel stages via bulk LDG->STS (llama.cpp's
+// quantize_mmq_q8_1 design; the transpose that the NB kernel used to do per
+// (block, k-tile) is hoisted into this one-per-GEMM prepass). The qs plane is
+// emitted swizzled per-64-token-block ([ntb][nchunk][2048]) and the d|ssum
+// packed scale into [ntb][nchunk][256], both byte-identical (after the stored
+// swizzle) to what the old NB smem staging produced — the quantized values
+// (qs bytes, d, ssum) are bit-identical to quantize_q8_0_pad40, only reordered.
+#define MMQ_A_BLK 64          // tokens per A block == MMQ_NBI
+#define MMQ_A_QASZ (MMQ_A_BLK * 32)   // 2048 B: one block's swizzled qs plane
+#define MMQ_A_SDASZ (MMQ_A_BLK * 4)   // 256 B: one block's packed d|ssum
+__global__ void quantize_q8_0_pad40_t(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ yqs,    // [ntb][nchunk][2048]
+    uint8_t* __restrict__ ysda,   // [ntb][nchunk][256]
+    int dim, int nt, int nchunk, int ntb
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_pad = ntb * MMQ_A_BLK * nchunk;
+    if (tid >= total_pad) return;
+    int t = tid / nchunk;
+    int b = tid % nchunk;
+    const int r = t & (MMQ_A_BLK - 1);  // local token 0..63
+    const int tb = t >> 6;              // 64-token block index
+
+    // Quantize (t, b). For the padded tail tokens (t >= nt) emit zeros so the
+    // transposed buffer is deterministic regardless of buffer reuse; those rows
+    // are never written to C (the kernel's write-back guards i < nt).
+    float d = 0.0f; int ssum = 0; uint32_t packed[8];
+    #pragma unroll
+    for (int v = 0; v < 8; v++) packed[v] = 0;
+    if (t < nt) {
+        const float* src = x + (size_t)t * dim + b * 32;
+        float4 sv[8];
+        #pragma unroll
+        for (int v = 0; v < 8; v++)
+            sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
+        float am = 0.0f;
+        #pragma unroll
+        for (int v = 0; v < 8; v++)
+            am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
+                                 fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
+        d = am / 127.0f;
+        float di = (d != 0.0f) ? 1.0f / d : 0.0f;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            const float* e = &sv[v].x;
+            uint32_t p = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int q = int(rintf(e[j] * di));
+                q = max(-128, min(127, q));
+                p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
+                ssum += q;
+            }
+            packed[v] = p;
+        }
+    }
+
+    // Swizzled qs write — byte-identical to the NB kernel's old smem staging
+    // (qa8 + (R&~3)*32 + ((((R&3)<<1 + (u>>2)) ^ ((R>>2)&7)) << 4) + (u&3)*4).
+    const int t4 = r & 3, grp = r & ~3;
+    const int xswz = (r >> 2) & 7;
+    size_t qbase = ((size_t)tb * nchunk + b) * MMQ_A_QASZ + grp * 32;
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+        *reinterpret_cast<uint32_t*>(yqs + qbase + off) = packed[u];
+    }
+    // Packed d|ssum (r31 Q-major region split of the old sda_q).
+    const int g = r >> 4, t15 = r & 15, q = t15 & 7, half = t15 >> 3;
+    const int rg = g >> 1, gsel = g & 1;
+    size_t sbase = ((size_t)tb * nchunk + b) * MMQ_A_SDASZ
+                   + (rg * 32 + q * 4 + gsel * 2 + half) * 4;
+    __half dh = __float2half(d);
+    uint16_t dbits = *reinterpret_cast<uint16_t*>(&dh);
+    *reinterpret_cast<uint32_t*>(ysda + sbase) =
+        (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
+}
+
 __global__ void __launch_bounds__(256) q4_k_q8_mmvq(
     const uint8_t* __restrict__ weights,
     const uint8_t* __restrict__ acts8,
@@ -2280,6 +2361,17 @@ void launch_quantize_q8_0_pad40(
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
     quantize_q8_0_pad40<<<(int)grid, block, 0, stream>>>(x, y, dim, nt);
+}
+
+void launch_quantize_q8_0_pad40_t(
+    const float* x, uint8_t* yqs, uint8_t* ysda,
+    int dim, int nt, int nchunk, int ntb, cudaStream_t stream
+) {
+    long long total = (long long)ntb * MMQ_A_BLK * nchunk;
+    int block = 256;
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    quantize_q8_0_pad40_t<<<(int)grid, block, 0, stream>>>(x, yqs, ysda, dim, nt, nchunk, ntb);
 }
 
 void launch_q4_k_q8_mmvq(
@@ -5037,6 +5129,223 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
                     C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
             }
 #endif // __CUDA_ARCH__ >= 800
+}
+
+// --- P6 r34: NB kernel with the A-side layout transform relocated into a
+// quantize-transpose prepass (MINFER_MMQ_A_TRANSPOSE=1). Byte-identical
+// compute to mmq_raw_nb_kernel (same qa8/sda_q smem content, same ldmatrix
+// fragment reads, same rescale) — only the A STAGING differs: the qs plane and
+// the packed d|ssum are emitted PRE-TRANSPOSED (quantize_q8_0_pad40_t) so the
+// per-(kt, warp) A reads become contiguous bulk LDG->STS with no per-element
+// index math (the r22 XOR swizzle and the r31 q-major sda repack are baked into
+// the prepass layout). The B (weight) + SDS staging is unchanged.
+template <int KDR>
+__global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ qa8g,
+    const uint8_t* __restrict__ sdag, float* __restrict__ C,
+    int nt, int od, int id, int nchunk
+) {
+#if __CUDA_ARCH__ >= 800
+    extern __shared__ uint8_t mmq_nb_sh[];
+    uint8_t* qa8 = mmq_nb_sh;
+    uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
+    uint8_t* qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
+    float2* sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int i0 = blockIdx.x * MMQ_NBI;
+    const int j0 = blockIdx.y * MMQ_NBJ;
+    const int j0w = warp * 16;
+    const int nb32 = id >> 5;
+    const int nsb = nb32 >> 3;
+    const int nktile = (nchunk + KDR - 1) / KDR;
+
+    float sum[32] = {0.0f};   // [g=4][nh=2][l=4] C accumulators (fp32)
+
+#define RAW_STAGE_NB_BT(kt)                                                    \
+    do {                                                                       \
+        /* ---- A: bulk LDG->STS of the pre-transposed qa8/sda (no math) ----*/\
+        {                                                                      \
+            const size_t qbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_QASZ; \
+            for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 32) / 16;       \
+                 off += blockDim.x)                                            \
+                ((uint4*)(qa8))[off] = ((const uint4*)(qa8g + qbase))[off];    \
+            const size_t sbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_SDASZ; \
+            for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 4) / 16;        \
+                 off += blockDim.x)                                            \
+                ((uint4*)(sda_q))[off] = ((const uint4*)(sdag + sbase))[off];  \
+        }                                                                      \
+        /* ---- B: bulk raw qs super-block copy (r18-style, no staging ALU) */\
+        {                                                                      \
+            const int sb = ((kt) * KDR) >> 3;                                  \
+            for (int off = threadIdx.x; off < MMQ_NBJ * 8; off += blockDim.x) {\
+                const int jj = off >> 3, c8 = off & 7;                         \
+                const int j = j0 + jj;                                         \
+                uint4 v = make_uint4(0, 0, 0, 0);                              \
+                if (j < od && sb < nsb)                                        \
+                    v = *(const uint4*)(W + (size_t)j * ((size_t)nsb * 144)    \
+                        + (size_t)sb * 144 + 16 + (size_t)c8 * 16);            \
+                *(uint4*)(qb_raw + (size_t)jj * 128 + (size_t)c8 * 16) = v;    \
+            }                                                                  \
+        }                                                                      \
+        /* ---- B: SDS per-(chunk, od-row) rank-1 rescale terms ---- */        \
+        for (int x = threadIdx.x; x < MMQ_NBJ * KDR; x += blockDim.x) {        \
+            const int r = x % MMQ_NBJ, kd = x / MMQ_NBJ;                       \
+            const int j = j0 + r, c = (kt) * KDR + kd;                         \
+            float dv = 0.0f, mv = 0.0f;                                        \
+            if (j < od && c < nchunk) {                                        \
+                const uint8_t* blk = W + (size_t)j * ((size_t)nsb * 144)       \
+                    + (size_t)(c >> 3) * 144;                                  \
+                const float d = h2f(*(const uint16_t*)blk);                    \
+                const float dmin = h2f(*(const uint16_t*)(blk + 2));           \
+                uint8_t sc, m;                                                 \
+                get_scale_min_k4(c & 7, blk + 4, &sc, &m);                     \
+                dv = d * (float)sc;                                            \
+                mv = -(dmin * (float)m);                                       \
+            }                                                                  \
+            sds[(size_t)kd * MMQ_NBJ + r] = make_float2(dv, mv);               \
+        }                                                                      \
+    } while (0)
+
+    const unsigned l12m = (unsigned)(lane & 12) * 32;
+    const unsigned grc = (unsigned)(((lane & 3) << 1) + ((lane >> 4) & 1)
+                             ^ ((lane >> 2) & 3)) << 4;
+    unsigned G[4];
+    #pragma unroll
+    for (int g = 0; g < 4; g++)
+        G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
+
+    RAW_STAGE_NB_BT(0);
+
+    for (int kt = 0; kt < nktile; ++kt) {
+        if (kt > 0) RAW_STAGE_NB_BT(kt);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kd = 0; kd < KDR; kd++) {
+            const int c = kt * KDR + kd;
+            if (c >= nchunk) break;
+            const int sg = c & 7;
+            const uint8_t* qat = qa8 + (size_t)kd * MMQ_NBI * 32;
+
+            int a[4][4], b[2][2];
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                const uint8_t* p = qat + G[g];
+                unsigned r0_, r1_, r2_, r3_;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                    "{%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(r0_), "=r"(r1_), "=r"(r2_), "=r"(r3_)
+                    : "r"((unsigned)__cvta_generic_to_shared(p)));
+                a[g][0] = (int)r0_; a[g][1] = (int)r1_;
+                a[g][2] = (int)r2_; a[g][3] = (int)r3_;
+            }
+            {
+                const int p = sg >> 1, is_hi = sg & 1, lm3 = lane & 3;
+                const unsigned M = 0x0F0F0F0Fu;
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++) {
+                    const int jj = j0w + nh * 8 + (lane >> 2);
+                    const uint8_t* qs = qb_raw + (size_t)jj * 128;
+                    const uint32_t* q0 = (const uint32_t*)(qs + p * 32 + lm3 * 4);
+                    const uint32_t* q1 = (const uint32_t*)(qs + p * 32 + 16 + lm3 * 4);
+                    uint32_t v0 = *q0, v1 = *q1;
+                    b[nh][0] = (int)(is_hi ? ((v0 >> 4) & M) : (v0 & M));
+                    b[nh][1] = (int)(is_hi ? ((v1 >> 4) & M) : (v1 & M));
+                }
+            }
+            int clow[4][2][4];
+            #pragma unroll
+            for (int g = 0; g < 4; g++)
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    #pragma unroll
+                    for (int l = 0; l < 4; l++) clow[g][nh][l] = 0;
+            #pragma unroll
+            for (int g = 0; g < 4; g++)
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    mmq_mma_k32(clow[g][nh], a[g], b[nh]);
+
+            float dsv[2][2], dmv[2][2];
+            #pragma unroll
+            for (int nh = 0; nh < 2; nh++) {
+                const float4 sc4 = *(const float4*)(sds
+                    + (size_t)kd * MMQ_NBJ + j0w + nh * 8 + (lane & 3) * 2);
+                dsv[nh][0] = sc4.x; dsv[nh][1] = sc4.z;
+                dmv[nh][0] = sc4.y; dmv[nh][1] = sc4.w;
+            }
+            const uint32_t* sda_blk = sda_q + (size_t)kd * MMQ_NBI
+                                      + (size_t)(lane >> 2) * 4;
+            const uint4 s0 = *(const uint4*)(sda_blk);
+            const uint4 s1 = *(const uint4*)(sda_blk + 32);
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                float da_q[2];
+                int sa_q[2];
+                const unsigned w0 = g == 0 ? s0.x : (g == 1 ? s0.z : (g == 2 ? s1.x : s1.z));
+                const unsigned w1 = g == 0 ? s0.y : (g == 1 ? s0.w : (g == 2 ? s1.y : s1.w));
+                da_q[0] = h2f((unsigned short)(w0 & 0xFFFF));
+                sa_q[0] = (int)(short)(w0 >> 16);
+                da_q[1] = h2f((unsigned short)(w1 & 0xFFFF));
+                sa_q[1] = (int)(short)(w1 >> 16);
+                const float dma[2] = { da_q[0] * (float)sa_q[0],
+                                       da_q[1] * (float)sa_q[1] };
+                #pragma unroll
+                for (int nh = 0; nh < 2; nh++)
+                    #pragma unroll
+                    for (int l = 0; l < 4; l++) {
+                        const float da = da_q[l >> 1];
+                        const int idx = (g * 2 + nh) * 4 + l;
+                        sum[idx] += da * dsv[nh][l & 1] * (float)clow[g][nh][l];
+                        sum[idx] += dma[l >> 1] * dmv[nh][l & 1];
+                    }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int g = 0; g < 4; g++)
+        #pragma unroll
+        for (int nh = 0; nh < 2; nh++)
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const int i = i0 + g * 16 + (l >> 1) * 8 + (lane >> 2);
+                const int j = j0 + j0w + nh * 8 + (lane & 3) * 2 + (l & 1);
+                if (i < nt && j < od)
+                    C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+            }
+#undef RAW_STAGE_NB_BT
+#endif // __CUDA_ARCH__ >= 800
+}
+
+extern "C" int launch_mmq_raw_nb_bt_nt(
+    int type_id, const uint8_t* w, const uint8_t* qa8g, const uint8_t* sdag,
+    float* c, int nt, int od, int id, int nchunk, cudaStream_t stream, int kd
+) {
+    (void)type_id;
+    if (kd != 8) return 0;
+    if (qa8g == 0 || sdag == 0) return 0;
+    const int smem = 8 * MMQ_NBI * 32   // qa8
+                   + 8 * MMQ_NBI * 4    // sda_q (one uint32 per token)
+                   + MMQ_NBJ * 128      // qb_raw
+                   + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
+    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8>),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    mmq_raw_nb_bt_kernel<8><<<grid, 256, smem, stream>>>(w, qa8g, sdag, c, nt, od, id, nchunk);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "minfer/cuda: mmq raw NB-BT launch failed: %s\n",
+                cudaGetErrorString(e));
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" int launch_mmq_raw_nb_nt(

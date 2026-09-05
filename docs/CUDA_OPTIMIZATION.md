@@ -1634,6 +1634,75 @@ would change instruction *composition*, not just loop organization. The pure
 reorder level; the residual is intrinsic instruction mix + nvcc scheduling of
 the whole kernel. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.13.
 
+### P6 r34: relocate the A-side layout transform into a quantize-transpose prepass — +9.72% @ KD=8, hypothesis CONFIRMED (LANDED, 2026-09-04)
+
+Decisive test of the r33 scope caveat. The r32/r33 verdict left the residual
+~1.15×/GMAC gap attributed to the *composition* of the support instructions
+(A-frag LDSM consuming + intrinsic sda/sds scale decode + staging index math).
+r34 reframes it as **layout-transformation locality**, per llama's
+`quantize_mmq_q8_1` design: llama quantizes activations PRE-TRANSPOSED into the
+exact layout the mma kernel consumes, so its mma-kernel A staging is a near-bulk
+copy. minfer quantizes to native token-major 40B chunks and the NB kernel adapts
+layout **per (block, od-tile-column)** — the A tile is re-staged ~28× per
+activation buffer (once per od-tile column), each re-stage paying the r22 XOR
+swizzle + r31 q-major sda repack index math (r32 measured the in-loop staging
+block at 21% of kernel instructions).
+
+**Implementation (gated `MINFER_MMQ_A_TRANSPOSE=1`, paired with
+`MINFER_MMQ_RAW_NB=1`).** Two new pieces, both A/B-able against the untouched NB
+kernel:
+- `quantize_q8_0_pad40_t` — a q8_0 quantize prepass that writes the result
+  PRE-TRANSPOSED: the qs plane swizzled per 64-token block (`[ntb][nchunk][2048]`)
+  and the packed d|ssum (`[ntb][nchunk][256]`), byte-identical (after the stored
+  swizzle) to what the NB kernel's old smem staging produced. Runs once per
+  GEMM (same frequency as the old quantize), **quantized values bit-identical to
+  `quantize_q8_0_pad40`** — only reordered. Pad tokens (nt not a multiple of 64)
+  are zero-filled so the buffer is deterministic.
+- `mmq_raw_nb_bt_kernel` (`launch_mmq_raw_nb_bt_nt`) — an NB variant whose A
+  staging is a **bulk LDG→STS** of the pre-transposed qa8/sda regions (`uint4`
+  copies over `KDR*NBI*32` + `KDR*NBI*4` bytes, no per-element index math); the B
+  (weight) + SDS staging and the whole compute loop are unchanged.
+- Router: in `prefill_mmq`, under `MINFER_MMQ_A_TRANSPOSE=1` the transposed
+  quantize + bt kernel run; the native quantize + NB kernel run only as the
+  (rare) fallback. `mmq_raw_nb_kernel` is untouched — its SASS is byte-identical
+  between the pre-change and post-change binaries (A/B integrity verified).
+
+**Gates.**
+1. Byte-exactness (standalone validator `validate_transpose.cu`, extracted from
+   the production kernels — no transcription drift): **0 mismatches** across 9
+   shapes (id 256→3584, nt 33/70/256, incl. non-64-multiple nt and the nchunk%8
+   cases). Reassembled (d, ssum, qs×8) per (token, chunk) old-vs-new all match.
+2. Build clean; ptxas sm_121 `mmq_raw_nb_bt_kernel<8>`: **103 regs, 0 spill**
+   (NB r31 = 109), 1 barrier, smem **43,008 B** (unchanged → 2 blocks/SM
+   preserved). Fewer regs than NB — the bulk staging's index math is gone.
+3. Parity (NB+BT-active `cuda_prefill_mmq` @ KD=8): **1 passed, 0 failed**.
+4. Greedy-32 token identity vs the default f16 path: **identical** (diff shows
+   only the Prefill/Generated timing lines).
+5. Prepass cost (CUDA-event timing, id=3584 nt=3354): transposed **0.405 ms** vs
+   native **0.446 ms** = **0.908×** — the transpose does NOT bloat the prepass,
+   it is marginally faster (same order; the swizzle write is off the hot path).
+6. Perf (7B q4_k_m @3354-token prefill, interleaved 4-pair, warmup both, same
+   binary set): baseline median **1364.2** → A-transpose **1496.8** =
+   **+9.72%** (every pair positive, no overlap; clears the +1.5% bar decisively).
+7. ncu census — **not obtainable this session**: ncu fails to inject into BOTH
+   `mmq_raw_nb_kernel` and `mmq_raw_nb_bt_kernel` ("Failed to prepare kernel for
+   profiling / Unknown Error on device 0") — a platform/tooling limitation, not a
+   code issue (the NB kernel fails identically to the bt kernel). The *mechanism*
+   is confirmed by gates 2/5/6 (regs 109→103 = staging ALU dropped; prepass
+   ratio 0.908×; wall +9.7%).
+8. Suite: **166/0/3**.
+
+**Verdict — hypothesis CONFIRMED, landed.** The residual gap was
+layout-transformation locality, not instruction composition per se: hoisting the
+A-side transpose into a per-GEMM quantize prepass (llama's design) and making
+the NB kernel's A staging a bulk copy removes the per-(block, od-tile-column)
+re-staging overhead and its swizzle/repack index math. The bt kernel is 103 regs
+(6 fewer than NB), the prepass is unchanged-or-faster, and the wall moves
+**+9.72%** vs the NB baseline — the largest single-mechanism P6 gain since r28's
+occupancy landing, and well above the +1.5% bar. The A-frag LDSM consumption and
+the fp rescale remain (intrinsic), but the staging-bound part of the residual is
+now closed. Recorded: docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.14.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

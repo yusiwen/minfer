@@ -890,3 +890,46 @@ LDS) would change instruction *composition* rather than loop organization, and
 was not reached within budget — it is the remaining avenue if the "residual"
 line is to be pursued further. The pure loop-organization hypothesis is falsified
 and this line closes at that finding.
+
+### 11.14 Follow-up (r34, 2026-09-04): the quantize-transpose prepass — the
+"composition" residual WAS the A-side layout-transformation locality (LANDED)
+
+§11.13's scope caveat named the deeper port that changes instruction
+*composition* rather than loop organization: eliminate the A-frag LDSM staging
+altogether. r34 tests a narrower, llama-faithful slice of that — **relocate the
+A-side layout transform OUT of the mma kernel into a quantize-transpose
+prepass** (exactly llama's `quantize_mmq_q8_1` design of §3), while keeping the
+mma kernel's A-frag reads (the A-frag LDSM itself is untouched; what changes is
+how the smem qa8/sda_q tiles are *produced*).
+
+**The asymmetry r34 removes.** minfer's NB kernel re-stages the activation tile
+ad hoc: for each (64-token block, od-tile-column) it reads the native token-major
+40B chunks and writes the smem qa8 region through the r22 XOR swizzle plus the
+r31 q-major sda repack — per-element index math in the hot loop. And because the
+grid is `(nt/64, od/128)`, a given 64-token A tile is re-staged once per od-tile
+column (~28× per activation buffer). llama avoids both by having the quantize
+prepass emit the activations already pre-transposed into the mma kernel's layout.
+
+**The port (gated `MINFER_MMQ_A_TRANSPOSE=1`, paired with `MINFER_MMQ_RAW_NB=1`).**
+`quantize_q8_0_pad40_t` emits the qs plane swizzled per-64-token-block
+(`[ntb][nchunk][2048]`) and the packed d|ssum (`[ntb][nchunk][256]`), both
+matching byte-for-byte the smem content the NB kernel's old staging produced
+(quantized values bit-identical to `quantize_q8_0_pad40`, only reordered). The
+new `mmq_raw_nb_bt_kernel` then stages by **bulk LDG→STS** (`uint4` copies of the
+`KDR*NBI*32` qa8 + `KDR*NBI*4` sda bytes) with no per-element index math; the B
+weight staging, SDS fold, mma loop, and fp32 write-back are all unchanged. The
+plain NB kernel is untouched (SASS byte-identical between pre/post binaries).
+
+**Result — hypothesis CONFIRMED.** Gates: byte-exact validator 0/9 shapes;
+ptxas bt kernel **103 regs / 0 spill** (NB 109); `cuda_prefill_mmq` parity 1/0;
+greedy-32 token identity identical to the f16 default; prepass cost **0.405 ms
+vs native 0.446 ms (0.908×)** — the transpose does not bloat the prepass; perf
+(7B q4_k_m @3354-token prefill, interleaved 4-pair) baseline **1364.2 → 1496.8
+tok/s = +9.72%**; suite 166/0/3. The census (op_integer/MAC) could not be
+captured this session — ncu fails to inject into `mmq_raw_nb_kernel` and
+`mmq_raw_nb_bt_kernel` alike ("Unknown Error on device 0", a platform/tooling
+limit), but the mechanism is corroborated by the register drop (109→103, the
+staging index math leaves the kernel) and the wall. Recorded:
+docs/CUDA_OPTIMIZATION.md P6 r34. The A-frag LDSM consumption and fp rescale
+remain intrinsic (as r32 concluded), but the staging-bound share of the residual
+is now closed; the "composition" class is no longer monolithic.

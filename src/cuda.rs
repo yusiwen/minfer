@@ -360,6 +360,22 @@ extern "C" {
         stream: *mut std::ffi::c_void,
         kd: i32,
     ) -> i32;
+    // P6 r34: NB kernel whose A staging is bulk LDG->STS over the
+    // PRE-TRANSPOSED qa8/sda buffers (MINFER_MMQ_A_TRANSPOSE=1). Returns 1 on
+    // KD=8, 0 on clean fallback (KD!=8 / null transposed buffers / smem).
+    fn launch_mmq_raw_nb_bt_nt(
+        type_id: i32,
+        w: *const u8,
+        qa8g: *const u8,
+        sdag: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        nchunk: i32,
+        stream: *mut std::ffi::c_void,
+        kd: i32,
+    ) -> i32;
     fn launch_mmq_raw_nt(
         type_id: i32,
         w: *const u8,
@@ -426,6 +442,19 @@ extern "C" {
         y: *mut u8,
         dim: i32,
         nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    // P6 r34: transposed-A q8_0 quantize prepass — emits the qs plane swizzled
+    // per-64-token-block ([ntb][nchunk][2048]) and the d|ssum packed scale
+    // ([ntb][nchunk][256]) for mmq_raw_nb_bt_kernel's bulk staging.
+    fn launch_quantize_q8_0_pad40_t(
+        x: *const f32,
+        yqs: *mut u8,
+        ysda: *mut u8,
+        dim: i32,
+        nt: i32,
+        nchunk: i32,
+        ntb: i32,
         stream: *mut std::ffi::c_void,
     );
     fn launch_q4_k_q8_mmvq(
@@ -794,6 +823,11 @@ pub struct CudaState {
     /// 8c: prefill Q8_0-activation scratch (quantized activations for the
     /// Q4_0×Q8_0 GEMM, nt > 1). Grown on demand like the layer-path buffers.
     buf_q8_prefill: Mutex<(CudaPtr, usize)>,
+    /// P6 r34: transposed-A q8_0 prepass scratch — the swizzled qs plane
+    /// ([ntb][nchunk][2048]) and the packed d|ssum scale ([ntb][nchunk][256]),
+    /// consumed by mmq_raw_nb_bt_kernel's bulk staging (MINFER_MMQ_A_TRANSPOSE).
+    buf_qa8_t: Mutex<(CudaPtr, usize)>,
+    buf_sda_t: Mutex<(CudaPtr, usize)>,
     /// 8d: split-K attention partials ([8][nh][pstr] floats, nh/hd are graph
     /// constants so the size is stable — grown during warmup, never inside a
     /// capture window).
@@ -1079,6 +1113,8 @@ impl CudaState {
             buf_bg: Mutex::new(dummy),
             buf_q8_bn: Mutex::new(dummy),
             buf_q8_prefill: Mutex::new(dummy),
+            buf_qa8_t: Mutex::new(dummy),
+            buf_sda_t: Mutex::new(dummy),
             buf_attn_partial: Mutex::new(dummy),
             buf_q8_decode: Mutex::new(dummy),
             buf_f16_w: Mutex::new(dummy),
@@ -2049,32 +2085,85 @@ impl CudaState {
             let wide = std::env::var("MINFER_MMQ_RAW_WIDE").as_deref() == Ok("1");
             let nb = std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1");
             let nb_debug = std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1");
+            let at = std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1");
             unsafe {
-                launch_quantize_q8_0_pad40(
-                    x as *const f32,
-                    q8 as *mut u8,
-                    id as i32,
-                    nt as i32,
-                    stream,
-                );
-                // Direction-A NB raw-nibble kernel is KD=8-native; it activates
-                // only under the full MMQ gate set (MINFER_MMQ=1 + MINFER_MMQ_RAW
-                // =1 here). launcher returns 0 on KD!=8 or smem/reg cap failure
-                // -> clean fallback to the wide/narrow raw path below.
-                let nb_ok = nb
-                    && launch_mmq_raw_nb_nt(
-                        type_id,
-                        wptr as *const u8,
-                        q8 as *const u8,
-                        out as *mut f32,
-                        nt as i32,
-                        od as i32,
+                // P6 r34: relocate the A-side layout transform out of the mma
+                // kernel into a quantize-transpose prepass (llama.cpp's design).
+                // Under MINFER_MMQ_A_TRANSPOSE=1 the activations are emitted
+                // PRE-TRANSPOSED (quantize_q8_0_pad40_t) so the NB kernel's A
+                // staging is a bulk LDG->STS; the native q8 buffer is only
+                // filled on the (rare) bb-bt fallback below.
+                let mut nb_ok = false;
+                if nb && at && kd == 8 {
+                    let nchunk = (id / 32) as i32;
+                    let ntb = ((nt as i64 + 63) / 64) as i32;
+                    let qa8g = Self::get_or_grow(
+                        &self.buf_qa8_t,
+                        (ntb as usize) * (id / 32) * 2048,
+                    );
+                    let sdag = Self::get_or_grow(
+                        &self.buf_sda_t,
+                        (ntb as usize) * (id / 32) * 256,
+                    );
+                    if !qa8g.is_null() && !sdag.is_null() {
+                        launch_quantize_q8_0_pad40_t(
+                            x as *const f32,
+                            qa8g as *mut u8,
+                            sdag as *mut u8,
+                            id as i32,
+                            nt as i32,
+                            nchunk,
+                            ntb,
+                            stream,
+                        );
+                        nb_ok = launch_mmq_raw_nb_bt_nt(
+                            type_id,
+                            wptr as *const u8,
+                            qa8g as *const u8,
+                            sdag as *const u8,
+                            out as *mut f32,
+                            nt as i32,
+                            od as i32,
+                            id as i32,
+                            nchunk,
+                            stream,
+                            kd,
+                        ) == 1;
+                        if nb_ok && nb_debug {
+                            eprintln!(
+                                "minfer/cuda: mmq raw NB-BT kernel active \
+                                 (KD=8, A-transpose)"
+                            );
+                        }
+                    }
+                }
+                if !nb_ok {
+                    launch_quantize_q8_0_pad40(
+                        x as *const f32,
+                        q8 as *mut u8,
                         id as i32,
+                        nt as i32,
                         stream,
-                        kd,
-                    ) == 1;
-                if nb_ok && nb_debug {
-                    eprintln!("minfer/cuda: mmq raw NB kernel active (KD=8)");
+                    );
+                    // Direction-A NB raw-nibble kernel is KD=8-native; it
+                    // activates only under the full MMQ gate set. launcher
+                    // returns 0 on KD!=8 or smem/reg cap failure -> clean
+                    // fallback to the wide/narrow raw path below.
+                    nb_ok = nb
+                        && launch_mmq_raw_nb_nt(
+                            type_id,
+                            wptr as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            nt as i32,
+                            od as i32,
+                            id as i32,
+                            stream,
+                            kd,
+                        ) == 1;
+                    if nb_ok && nb_debug {
+                        eprintln!("minfer/cuda: mmq raw NB kernel active (KD=8)");
+                    }
                 }
                 if !nb_ok {
                     let wide_ok = wide
