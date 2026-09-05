@@ -1047,3 +1047,39 @@ kernel)** — a structural deficit in how minfer's q6_K is dequantized (fp16-B s
 `mmq_nt<7>`), not a per-IMMA rate problem. Bringing the q6_K ffn_down to the q4_K bt
 rate (63.6 TFLOPs) is the single largest lever (~−970 ms wall, ~2720 tok/s). No code
 change. Recorded: docs/CUDA_OPTIMIZATION.md P6 r37.
+
+### 11.18 Follow-up (r38, 2026-09-05): the q6_K BT port — layout correction and the
+occupancy-dominant result (LANDED, +2.87% whole-prefill, 1.66× matched-nt; < 2× bar)
+
+r37's priority #1 was executed: the q6_K GEMMs (attn_v + ffn_down) now run on a BT-style
+raw-byte kernel `mmq_raw_nb_bt_q6k_kernel` (gated `MINFER_MMQ_Q6K_NB=1`) instead of the
+generic `mmq_nt_kernel<7,2,0>`.
+
+**The §11 "32-element sub-block" draw was corrected en route.** q6_K's GGUF layout is
+**16 sub-blocks of 16 elements** (sc[16]@192, d@208; block.rs / quants.rs / ggml all agree), not
+8×32. Because a 32-k chunk holds two 16-subs with independent scales, a single mma.m16n8k32
+rescale is impossible: the kernel must use **KSPLIT=2** (two m16n8k16 with per-sub `dsc0`/`dsc1`,
+single-term, no `dmin·m`). This mirrors llama's own q6_K vec_dot (mmq-vec-dot.cuh:1138-1161 splits
+the k loop into two mma with separate `scA`). It is a real per-MAC penalty (2× the IMMA
+instructions vs q4_K), but it is not what made the first build slow.
+
+**The occupancy lever dominated, exactly as r28 predicted.** The B-side runs into the same
+smem-vs-2-blocks tension as §11.3. Two variants measured:
+- **KDR=8** (full 256-elem super-block B, 32,768 B; total 59,392 B) → **1 block/SM**, and
+  whole-prefill **regressed** (1532.6 → 1097.8 tok/s); ncu 16.7% occupancy, latency-bound.
+- **KDR=4** (half super-block B, 16,384 B; total **29,696 B → 2 blocks/SM**) → whole-prefill
+  **1518.4 → 1561.9 tok/s (+2.87%)**, matched-nt q6_K GEMM **221.8 vs 368.9 µs/GMAC (1.66×)**.
+
+So a `q4_K`-style raw-B kernel for q6_K behaves exactly like the §11.5-r28 tradeoff: shrink the
+B tile to buy the second resident block, and the latency-bound loop wins. The value stays
+latency-bound even at 2 blocks (ncu compute 16.7%, memory 10.3%), so the lever is now occupancy
+/ pipelining, not the instruction count.
+
+**Result.** Parity-clean (validator 0-mismatch; `cuda_prefill_mmq` 1/0 for raw + padded q6_K),
+greedy-32 byte-identical, suite 166/0/3, ptxas 85 regs / 0 spill. **Below the 2× bar** (1.66× at
+matched-nt, +2.87% whole-prefill) but strictly positive — landed per the stop condition, with the
+~3.8×-to-5.7×-llama shortfall documented. The residual is the latency (single-buffer staging
+barrier per kt) plus the intrinsic KSPLIT=2; the named next lever is a **double-buffered**
+(pipelined) staging at KDR=2 that keeps 2 blocks/SM (29,696 B) while overlapping kt+1 staging with
+kt compute — the mechanism the outgoing `mmq_nt<7>` used to stay near-parity at long nt.
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r38.

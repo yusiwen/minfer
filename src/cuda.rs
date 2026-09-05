@@ -376,6 +376,24 @@ extern "C" {
         stream: *mut std::ffi::c_void,
         kd: i32,
     ) -> i32;
+    // P6 r38: q6_K BT kernel — the same bulk-LDG->STS A staging as r34, but the
+    // B weight is EXPANDED to centered int8 (256 B/row) in staging and the mma is
+    // m16n8k16 (KSPLIT=2) with a per-16-sub dsc rescale. Returns 1 on KD=8,
+    // 0 on clean fallback.
+    fn launch_mmq_raw_nb_bt_q6k_nt(
+        type_id: i32,
+        w: *const u8,
+        qa8g: *const u8,
+        sdag: *const u8,
+        c: *mut f32,
+        nt: i32,
+        od: i32,
+        id: i32,
+        nchunk: i32,
+        bstride: i32,
+        stream: *mut std::ffi::c_void,
+        kd: i32,
+    ) -> i32;
     fn launch_mmq_raw_nt(
         type_id: i32,
         w: *const u8,
@@ -2071,6 +2089,64 @@ impl CudaState {
             210
         };
         let stream = self.stream();
+        // P6 r38: q6_K on a raw-byte BT-style kernel (expanded centered-int8 B,
+        // m16n8k16 KSPLIT=2). Same A prepass as r34; the B path is q6_K-specific.
+        // Gated MINFER_MMQ_Q6K_NB=1 (paired with MINFER_MMQ=1, MINFER_MMQ_RAW=1;
+        // the q6k path always uses the transposed-A raster). On any cap/mismatch
+        // the launcher returns 0 -> clean fall through to the generic mmq_nt<7,2>.
+        if type_id == 7
+            && std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1")
+            && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
+            && (id / 32) % 8 == 0
+        {
+            let nchunk = (id / 32) as i32;
+            let ntb = ((nt as i64 + 63) / 64) as i32;
+            let qa8g = Self::get_or_grow(
+                &self.buf_qa8_t,
+                (ntb as usize) * (id / 32) * 2048,
+            );
+            let sdag = Self::get_or_grow(
+                &self.buf_sda_t,
+                (ntb as usize) * (id / 32) * 256,
+            );
+            if !qa8g.is_null() && !sdag.is_null() {
+                unsafe {
+                    launch_quantize_q8_0_pad40_t(
+                        x as *const f32,
+                        qa8g as *mut u8,
+                        sdag as *mut u8,
+                        id as i32,
+                        nt as i32,
+                        nchunk,
+                        ntb,
+                        stream,
+                    );
+                    if launch_mmq_raw_nb_bt_q6k_nt(
+                        type_id,
+                        wptr as *const u8,
+                        qa8g as *const u8,
+                        sdag as *const u8,
+                        out as *mut f32,
+                        nt as i32,
+                        od as i32,
+                        id as i32,
+                        nchunk,
+                        block_stride,
+                        stream,
+                        8,
+                    ) == 1
+                    {
+                        if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
+                            eprintln!(
+                                "minfer/cuda: mmq raw NB-BT q6_K kernel active \
+                                 (KD=8, A-transpose)"
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // P6: raw-byte staging variant (q4_K, whole super-blocks only).
         // Same quantized activations; the GEMM stages RAW weight bytes via
         // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).

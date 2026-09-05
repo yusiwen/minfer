@@ -1931,6 +1931,65 @@ short nt (matched-nt 1.43× per-IMMA); (3) FA structural redesign (5.7×). Artif
 r37_bt511.{nsys-rep,sqlite}, r37_llama512.{nsys-rep,sqlite}, r37_ncu_bt511.csv,
 r37_ncu_llama_mmq.csv.
 
+### P6 r38: q6_K on a BT-style raw-byte mma kernel — LANDED (+2.87% whole-prefill, 1.66× matched-nt q6_K; < 2× bar, documented shortfall) (2026-09-05)
+
+r37 named the q6_K path (attn_v + ffn_down, the 51.2% prefill residual at 368.9 µs/GMAC
+vs llama's 57.8) as the single largest lever. This session lands the first cut:
+
+**A key layout finding (correct the draw).** The task's working model was "q6_K = 8
+sub-blocks of 32 elements, sc[8]" — **that is wrong.** The GGUF `block_q6_K` is
+`ql[128] + qh[64] + sc[16] + d[2]` = **16 sub-blocks of 16 elements** (block.rs:162-167,
+confirmed against the CPU reference `dot_q6_k_q8_k_scalar` in quants.rs:958 and llama's
+`dequantize_row_q6_K`). A 32-k mma chunk therefore spans **two differently-scaled 16-element
+sub-blocks** (`sc[2c%16]`, `sc[(2c+1)%16]`), so a single mma.m16n8k32 rescale is invalid.
+The kernel must use **KSPLIT=2** (two m16n8k16, one per 16-sub, each with its own dsc) — the
+same structure the outgoing `mmq_nt_kernel<7,2,0>` used, so this is not the regression source.
+
+**Design (new `mmq_raw_nb_bt_q6k_kernel`, launcher `launch_mmq_raw_nb_bt_q6k_nt`, gated
+`MINFER_MMQ_Q6K_NB=1`, paired with MINFER_MMQ=1 MINFER_MMQ_RAW=1).** Reuses the r34 BT shell
+wholesale — the A side is the same bulk LDG→STS of the pre-transposed qa8/sda
+(weight-type-agnostic) and the same 4× LDSM A-frag consumption. The B side is q6_K-specific:
+- **B staging expands** each q6_K super-block to **centered int8** (-32..31, KDR*32 B/row) so
+  the ql+qh recombination + -32 centering all leave the hot loop (the r21/r22/r31 "keep index
+  math out of the loop" lesson). The element→super-block map was derived and validated
+  standalone (gate 1, 0 mismatches vs the CPU reference) before integration.
+- **mma.m16n8k16 (KSPLIT=2)** per (g, nh): low-16 uses `b[nh][0]` (sub 2c), high-16 uses
+  `b[nh][1]` (sub 2c+1). **Single-term rescale** `sum += da·dsc0·clow; sum += da·dsc1·chigh`
+  (the dmin·m term DROPS for q6_K — confirmed against the CPU reference). The accumulation is
+  **two separate `+=`** (not one fused add) to match the host reference / mmq_nt<7,2> — the
+  fused form rounded 1.2e-3 (just over the 1e-3 parity bar) and two separate adds brought it back.
+
+**The occupancy lever was decisive.** The full-super-block KDR=8 variant (B = 128×256 =
+32,768 B, total smem 59,392 B) is 1 block/SM (Block Limit Shared Mem = 1) and **regressed**
+the whole prefill (BT-gates 1532.6 → **1097.8 tok/s**). ncu: 16.7% theoretical occupancy,
+latency-bound (SOL opt, 9.8% compute). Switching to **KDR=4** (half-super-block B = 128×128
+= 16,384 B, total smem **29,696 B → 2 blocks/SM**) recovered and beat the baseline: whole-prefill
+**1518.4 → 1561.9 tok/s (+2.87%, 3/3 interleaved positive)**, ncu achieved 15.5 warps/SM
+(33.3% occupancy), attn_v launch 2.55 ms.
+
+**Gates.** 1) Standalone validator (expansion 0/4096 + mma.m16n8k16 B-frag read 0/64) green
+before integration. 2) ptxas `<4>` **85 regs, 0 spill** (86 for `<8>`), 1 barrier. 3) Parity
+(`MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1 cuda_prefill_mmq`): **1/0** (both raw 210B
+and padded 224B q6_K). 4) Greedy-32 token identity vs the default f16 path: **byte-identical**.
+5) Perf: whole-prefill **+2.87%**; matched-nt (nt≈511, the r37 number) q6_K GEMM **221.8 µs/GMAC
+vs 368.9 = 1.66×** — **below the ≥2× bar (≤184.5) but strictly positive**. 6) Suite **166/0/3**;
+ncu grid (52,4) attn_v: 2,549,248 ns, 2 blocks/SM, compute 16.7%, memory 10.3% (still latency-bound).
+
+**Verdict — LANDED (strictly positive, < 2×).** Per the stop condition, a parity-clean result
+below 2× lands because the baseline q6_K path is terrible (368.9 vs llama 57.8) and any positive
+movement is meaningful — the q6_K GEMM is now **1.66× faster** at matched nt and the whole
+prefill moved +2.87%. **Shortfall vs the 57.8 target:** still ~3.8× gap; the kernel remains
+**latency-bound** (16.7% compute), and KSPLIT=2 (2× mma.k16) is an intrinsic q6_K cost. **Next
+optimization (r39):** (a) double-buffer the staging (the outgoing `mmq_nt<7,2>` pipelines
+kt+1 during compute — likely why it stays near-parity at long nt despite 1 block/SM; a KDR=2
+double-buffer would keep 2 blocks/SM at 29,696 B); (b) a 3rd block/SM by trimming regs below 85
+to exceed the 2-block register cap — both target the latency, not the IMMA count. The
+`mmq_nt_kernel<7,2,0>` path stays the fallback and is byte-identical when the q6k gate is off.
+
+Artifacts: `/tmp/q6k_validate.cu` (gate-1 validator), `/tmp/gen_q6k_ptxas.py` + `/tmp/q6k_ptxas.cu`
+(gate-2 ptxas harness), `/tmp/perf_q6k.sh` (interleaved A/B), `/tmp/minfer_q6k_bin` (post-change
+binary), `/tmp/g32_{default,q6k,q6k_kdr4}.txt` (greedy-32 identity).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
