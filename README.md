@@ -23,7 +23,7 @@ A minimal local LLM inference engine built from scratch in Rust.
 
 - **Declarative compute graph** — inference builds a `ComputeGraph` (pure IR)
   then assigns backends, fuses ops, allocates and executes via a scheduler,
-  modeled on llama.cpp's `ggml_cgraph` + backend scheduler; params-only graph
+  inspired by llama.cpp's `ggml_cgraph` + backend scheduler; params-only graph
   reuse (decode steps skip reconstruction), per-op backend assignment,
   Graphviz DOT export (`--dump-graph`) and **interactive web visualization**
   (`viz/` — `--dump-graph-json` + zero-dependency flowchart page)
@@ -44,7 +44,7 @@ A minimal local LLM inference engine built from scratch in Rust.
   dot products, plus a persistent row-parallel thread pool (`-t/--threads`;
   Qwen3-4B CPU decode ~52–58 tok/s on M4 Pro vs 1.1 before)
 - **GPU: Metal backend** — Apple Silicon acceleration with flash attention
-  (single fused kernel for decode + prefill, llama.cpp ports), simdgroup GEMM
+  (single fused kernel for decode + prefill), simdgroup GEMM
   prefill for every quant type, SIMD-parallel RMSNorm, float4 vectorized
   kernels, a build-time precompiled `.metallib` (no per-run shader compile),
   and auto-selected f16 KV cache for 7B-class models
