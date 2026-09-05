@@ -778,6 +778,56 @@ impl Drop for CaptureStaging {
 unsafe impl Send for CaptureStaging {}
 unsafe impl Sync for CaptureStaging {}
 
+/// r49: consecutive-window memoization of the MMQ A-quantize prepass.
+///
+/// The three attention GEMMs (q/k/v) all consume the SAME `normed` activation
+/// and the two FFN GEMMs (gate/up) consume the same `normed2`; the MMQ path
+/// re-quantizes (transpose) that A per matmul. This cache holds the quantized
+/// (transposed) form of the last MMQ A so consecutive same-A matmuls reuse it
+/// instead of re-launching `quantize_q8_0_pad40_t`.
+///
+/// Correctness relies on two rules (both conservative, no write-tracking):
+///   * It is valid ONLY across CONSECUTIVE prefill-MMQ MatMul nodes. Any other
+///     node kind clears it (see `CudaBackend::execute_node_inner`), so a late
+///     buffer-id reuse by the liveness allocator can never alias the cached A.
+///   * It is cleared at split boundaries (`CudaBackend::synchronize`) so a
+///     cache from a previous graph execution never leaks stale data into a
+///     later one (the same pool buffer id holds different data each step).
+///
+/// The buffers are the state-level `buf_qa8_t`/`buf_sda_t` (transposed) and
+/// `buf_q8_prefill` (native) scratch — dedicated allocations OUTSIDE the
+/// graph allocator pool, so they never alias a node output buffer. The quantize
+/// output is a pure function of (src, nt, id), so a hit is byte-identical to a
+/// recompute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MmqCache {
+    /// True once a quantize has been recorded into `key`.
+    active: bool,
+    /// (src device pointer, nt, id) of the cached A.
+    key: (usize, usize, usize),
+    /// True when the cached buffers hold the transposed pad40_t layout
+    /// (buf_qa8_t + buf_sda_t); false => native pad40 (buf_q8_prefill).
+    transposed: bool,
+    /// Physical buffer pointers of the cached quantized A (validated on hit —
+    /// `get_or_grow` may realloc on a larger miss).
+    qa8: usize,
+    sda: usize,
+    q8: usize,
+}
+
+impl Default for MmqCache {
+    fn default() -> Self {
+        MmqCache {
+            active: false,
+            key: (0, 0, 0),
+            transposed: false,
+            qa8: 0,
+            sda: 0,
+            q8: 0,
+        }
+    }
+}
+
 /// 8p: warm the f16 weight cache only for models whose quantized matmul
 /// weights total at least this much (7B q4_k_m = 4.4 GB warms; the 0.5-1.5B
 /// test fixtures do not, keeping their footprint at pre-8p levels).
@@ -846,6 +896,10 @@ pub struct CudaState {
     /// consumed by mmq_raw_nb_bt_kernel's bulk staging (MINFER_MMQ_A_TRANSPOSE).
     buf_qa8_t: Mutex<(CudaPtr, usize)>,
     buf_sda_t: Mutex<(CudaPtr, usize)>,
+    /// r49: consecutive-window memoization of the MMQ A-quantize prepass (see
+    /// [`MmqCache`]). Lives on the process singleton so the CUDA backend can
+    /// invalidate it between non-MMQ nodes / graph executions.
+    mmq_cache: Mutex<MmqCache>,
     /// 8d: split-K attention partials ([8][nh][pstr] floats, nh/hd are graph
     /// constants so the size is stable — grown during warmup, never inside a
     /// capture window).
@@ -1133,6 +1187,7 @@ impl CudaState {
             buf_q8_prefill: Mutex::new(dummy),
             buf_qa8_t: Mutex::new(dummy),
             buf_sda_t: Mutex::new(dummy),
+            mmq_cache: Mutex::new(MmqCache::default()),
             buf_attn_partial: Mutex::new(dummy),
             buf_q8_decode: Mutex::new(dummy),
             buf_f16_w: Mutex::new(dummy),
@@ -2047,6 +2102,87 @@ impl CudaState {
         self.cc.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// r49: invalidate the MMQ A-quantize memoization. Called by the CUDA
+    /// backend between non-MMQ nodes (conservative consecutive-window rule)
+    /// and at split boundaries (cross-execution staleness).
+    pub fn clear_mmq_cache(&self) {
+        let mut c = self.mmq_cache.lock().unwrap();
+        c.active = false;
+        c.key = (0, 0, 0);
+    }
+
+    /// r49: transposed-A helper for the MMQ quantize prepass — returns
+    /// `(qa8, sda)` device pointers holding `x`'s q8_0 pad40_t-transposed
+    /// quantized form, launching `quantize_q8_0_pad40_t` ONLY when the
+    /// last MMQ A (consecutive, same (src,nt,id)) is not already there. A
+    /// cache hit therefore skips the prepass launch entirely — the caller
+    /// still feeds the returned pointers to the GEMM, which is byte-identical
+    /// (quantize depends only on x/nt/id, not the weight type).
+    unsafe fn mmq_quantize_transposed(
+        &self,
+        x: *const f32,
+        id: i32,
+        nt: i32,
+        nchunk: i32,
+        ntb: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> (usize, usize) {
+        let need_qa8 = (ntb as usize) * (id as usize / 32) * 2048;
+        let need_sda = (ntb as usize) * (id as usize / 32) * 256;
+        let key = (x as usize, nt as usize, id as usize);
+        let mut cache = self.mmq_cache.lock().unwrap();
+        if cache.active && cache.key == key && cache.transposed {
+            // get_or_grow may have reallocated on a larger miss: validate the
+            // physical pointers so a grown buffer is never reused stale.
+            let qa8 = Self::get_or_grow(&self.buf_qa8_t, need_qa8) as usize;
+            let sda = Self::get_or_grow(&self.buf_sda_t, need_sda) as usize;
+            if qa8 == cache.qa8 && sda == cache.sda {
+                return (qa8, sda);
+            }
+        }
+        let qa8 = Self::get_or_grow(&self.buf_qa8_t, need_qa8);
+        let sda = Self::get_or_grow(&self.buf_sda_t, need_sda);
+        launch_quantize_q8_0_pad40_t(x, qa8 as *mut u8, sda as *mut u8, id, nt, nchunk, ntb, stream);
+        cache.active = true;
+        cache.key = key;
+        cache.transposed = true;
+        cache.qa8 = qa8 as usize;
+        cache.sda = sda as usize;
+        cache.q8 = 0;
+        (qa8 as usize, sda as usize)
+    }
+
+    /// r49: native (non-transposed) counterpart of
+    /// [`Self::mmq_quantize_transposed`] — the pad40 q8_0 `q8` buffer used by
+    /// the fallback NB/wide/narrow kernels. Same consecutive-window rule; the
+    /// quantize output is again a pure function of (x, nt, id).
+    unsafe fn mmq_quantize_native(
+        &self,
+        x: *const f32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> usize {
+        let need = (nt as usize) * (id as usize / 32) * 40;
+        let key = (x as usize, nt as usize, id as usize);
+        let mut cache = self.mmq_cache.lock().unwrap();
+        if cache.active && cache.key == key && !cache.transposed {
+            let q8 = Self::get_or_grow(&self.buf_q8_prefill, need) as usize;
+            if q8 == cache.q8 {
+                return q8;
+            }
+        }
+        let q8 = Self::get_or_grow(&self.buf_q8_prefill, need);
+        launch_quantize_q8_0_pad40(x, q8 as *mut u8, id, nt, stream);
+        cache.active = true;
+        cache.key = key;
+        cache.transposed = false;
+        cache.qa8 = 0;
+        cache.sda = 0;
+        cache.q8 = q8 as usize;
+        q8 as usize
+    }
+
     /// R1: int8 MMQ prefill GEMM — quantize activations to q8_0 (pad40
     /// blocks; the quantize kernel also emits the per-block int sum used by
     /// the min-term correction), then one tiled mma.m16n8k32 (s8) launch per
@@ -2076,9 +2212,11 @@ impl CudaState {
             TensorType::Q6_K => 7,
             other => return Err(format!("cuda: prefill MMQ got unsupported type {other:?}")),
         };
-        let need = nt * (id / 32) * 40;
-        let q8 = Self::get_or_grow(&self.buf_q8_prefill, need);
-        if q8.is_null() {
+        // r49: the native pad40 buffer is sized upfront so an OOM surfaces here
+        // (before any GEMM launch) instead of as a null deref in the q4_K
+        // fallback's final `launch_mmq_raw_nt`. The fallbacks re-derive it via
+        // `mmq_quantize_native` (which dedups); this call only guards OOM.
+        if Self::get_or_grow(&self.buf_q8_prefill, nt * (id / 32) * 40).is_null() {
             return Err("cuda: prefill MMQ q8 scratch OOM".to_string());
         }
         // Q6_K reads whichever layout the weight was registered with
@@ -2101,27 +2239,21 @@ impl CudaState {
         {
             let nchunk = (id / 32) as i32;
             let ntb = ((nt as i64 + 63) / 64) as i32;
-            let qa8g = Self::get_or_grow(
-                &self.buf_qa8_t,
-                (ntb as usize) * (id / 32) * 2048,
-            );
-            let sdag = Self::get_or_grow(
-                &self.buf_sda_t,
-                (ntb as usize) * (id / 32) * 256,
-            );
-            if !qa8g.is_null() && !sdag.is_null() {
-                unsafe {
-                    launch_quantize_q8_0_pad40_t(
-                        x as *const f32,
-                        qa8g as *mut u8,
-                        sdag as *mut u8,
-                        id as i32,
-                        nt as i32,
-                        nchunk,
-                        ntb,
-                        stream,
-                    );
-                    if launch_mmq_raw_nb_bt_q6k_nt(
+            unsafe {
+                // r49: A-quantize prepass via the consecutive-window cache —
+                // a same-A (>q/k/v, gate/up) matmul reuses qa8g/sdag without a
+                // fresh quantize launch.
+                let (qa8g, sdag) = self.mmq_quantize_transposed(
+                    x as *const f32,
+                    id as i32,
+                    nt as i32,
+                    nchunk,
+                    ntb,
+                    stream,
+                );
+                if qa8g != 0
+                    && sdag != 0
+                    && launch_mmq_raw_nb_bt_q6k_nt(
                         type_id,
                         wptr as *const u8,
                         qa8g as *const u8,
@@ -2135,15 +2267,14 @@ impl CudaState {
                         stream,
                         8,
                     ) == 1
-                    {
-                        if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
-                            eprintln!(
-                                "minfer/cuda: mmq raw NB-BT q6_K kernel active \
-                                 (r39 KDR=2 double-buffer, A-transpose)"
-                            );
-                        }
-                        return Ok(());
+                {
+                    if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
+                        eprintln!(
+                            "minfer/cuda: mmq raw NB-BT q6_K kernel active \
+                             (r39 KDR=2 double-buffer, A-transpose)"
+                        );
                     }
+                    return Ok(());
                 }
             }
         }
@@ -2173,26 +2304,19 @@ impl CudaState {
                 if nb && at && kd == 8 {
                     let nchunk = (id / 32) as i32;
                     let ntb = ((nt as i64 + 63) / 64) as i32;
-                    let qa8g = Self::get_or_grow(
-                        &self.buf_qa8_t,
-                        (ntb as usize) * (id / 32) * 2048,
+                    // r49: cache-backed transposed A-quantize prepass (reuses
+                    // the previous same-A matmul's qa8g/sdag when consecutive).
+                    let (qa8g, sdag) = self.mmq_quantize_transposed(
+                        x as *const f32,
+                        id as i32,
+                        nt as i32,
+                        nchunk,
+                        ntb,
+                        stream,
                     );
-                    let sdag = Self::get_or_grow(
-                        &self.buf_sda_t,
-                        (ntb as usize) * (id / 32) * 256,
-                    );
-                    if !qa8g.is_null() && !sdag.is_null() {
-                        launch_quantize_q8_0_pad40_t(
-                            x as *const f32,
-                            qa8g as *mut u8,
-                            sdag as *mut u8,
-                            id as i32,
-                            nt as i32,
-                            nchunk,
-                            ntb,
-                            stream,
-                        );
-                        nb_ok = launch_mmq_raw_nb_bt_nt(
+                    nb_ok = qa8g != 0
+                        && sdag != 0
+                        && launch_mmq_raw_nb_bt_nt(
                             type_id,
                             wptr as *const u8,
                             qa8g as *const u8,
@@ -2205,27 +2329,27 @@ impl CudaState {
                             stream,
                             kd,
                         ) == 1;
-                        if nb_ok && nb_debug {
-                            eprintln!(
-                                "minfer/cuda: mmq raw NB-BT kernel active \
-                                 (KD=8, A-transpose)"
-                            );
-                        }
+                    if nb_ok && nb_debug {
+                        eprintln!(
+                            "minfer/cuda: mmq raw NB-BT kernel active \
+                             (KD=8, A-transpose)"
+                        );
                     }
                 }
                 if !nb_ok {
-                    launch_quantize_q8_0_pad40(
-                        x as *const f32,
-                        q8 as *mut u8,
-                        id as i32,
-                        nt as i32,
-                        stream,
-                    );
+                    // r49: cache-backed native A-quantize prepass. The helper
+                    // returns 0 (no buffer) on OOM; the launchers below only
+                    // run when a buffer is present (the original unconditional
+                    // `q8` came from a pre-call get_or_grow, now inside the
+                    // helper).
+                    let q8 =
+                        self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
                     // Direction-A NB raw-nibble kernel is KD=8-native; it
                     // activates only under the full MMQ gate set. launcher
                     // returns 0 on KD!=8 or smem/reg cap failure -> clean
                     // fallback to the wide/narrow raw path below.
-                    nb_ok = nb
+                    nb_ok = q8 != 0
+                        && nb
                         && launch_mmq_raw_nb_nt(
                             type_id,
                             wptr as *const u8,
@@ -2242,7 +2366,10 @@ impl CudaState {
                     }
                 }
                 if !nb_ok {
-                    let wide_ok = wide
+                    let q8 =
+                        self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
+                    let wide_ok = q8 != 0
+                        && wide
                         && launch_mmq_raw_wide_nt(
                             type_id,
                             wptr as *const u8,
@@ -2272,13 +2399,10 @@ impl CudaState {
             return Ok(());
         }
         unsafe {
-            launch_quantize_q8_0_pad40(
-                x as *const f32,
-                q8 as *mut u8,
-                id as i32,
-                nt as i32,
-                stream,
-            );
+            let q8 = self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
+            if q8 == 0 {
+                return Err("cuda: prefill MMQ q8 scratch OOM".to_string());
+            }
             launch_mmq_nt(
                 type_id,
                 wptr as *const u8,

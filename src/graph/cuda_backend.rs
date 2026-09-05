@@ -398,6 +398,15 @@ impl CudaBackend {
         // one lock acquisition per node; None while this backend itself is
         // capturing (its own enqueues are the recorded work)
         let _sg = self.stream_guard();
+        // r49: the MMQ A-quantize memoization is valid only across CONSECUTIVE
+        // MatMul nodes sharing the same src A. ANY other node kind clears it
+        // (conservative — no write tracking): a matmul src buffer is immutable
+        // within its own run, but the allocator's buffer-id reuse could
+        // otherwise alias a late matmul's A onto a cached one. Transposed-b
+        // matmuls also route here (they error below) but never consult MMQ.
+        if !matches!(&node.op, Op::MatMul { .. }) {
+            self.state.clear_mmq_cache();
+        }
         match &node.op {
             // Inputs are host-filled by the allocator; KvcacheLoad is a view
             // of the persistent K region (out_buf IS the region — no kernel).
@@ -1043,6 +1052,10 @@ impl Backend for CudaBackend {
         if self.capturing.is_none() {
             let _sg = self.stream_guard();
         }
+        // r49: the MMQ A-quantize memoization is bounded to ONE graph execution.
+        // A split boundary / next execution reuses the same pool buffer ids for
+        // different data, so the cached (src,nt,id) must not leak across it.
+        self.state.clear_mmq_cache();
         self.close_capture_or_sync();
     }
 

@@ -2716,6 +2716,89 @@ kernel), `/tmp/minfer_pre_fap2` (pre-change baseline, md5 4eb7d478…),
 FA=2.12 ms), `/tmp/g32_new.txt`/`g32_base.txt` (greedy-32, byte-identical),
 `/tmp/perf_fap2_ab.sh` (interleaved A/B).
 
+### P6 r49: A-quantize prepass shared-A dedup (consecutive-window memoization) — LANDED (prepass 193→110, whole-prefill +2.3%, 2026-09-06)
+
+The r48-flagged #1 addressable residual (the A-quantize prepass, ~9.6% wall,
+2.52× vs llama) is addressed by removing its **shared-A redundancy**: the
+three attention GEMMs (q/k/v) all consume the SAME `normed` activation and the
+two FFN GEMMs (gate/up) consume the same `normed2`
+(`src/models/qwen2/graph.rs:121-123,216-217`), so the MMQ path was re-running
+the `quantize_q8_0_pad40_t` prepass per matmul — **193 prepass launches** where
+~half suffice. HARD RULE: the dedup lives entirely in the CUDA layer
+(`src/cuda.rs` + `src/graph/cuda_backend.rs`); `graph.rs` (shared by all
+backends) is untouched.
+
+**Change (src/cuda.rs, `prefill_mmq` + new `mmq_quantize_transposed` /
+`mmq_quantize_native` helpers):** a small per-execution cache on `CudaState`
+(`MmqCache`) keyed on `(src device pointer, nt, id)` → the quantized-A buffers,
+valid ONLY while the same src pointer arrives on CONSECUTIVE MMQ matmul nodes.
+Any other node kind clears it (the backend's `execute_node_inner` guard
+`if !matches!(&node.op, Op::MatMul{..})`; conservative — no write tracking, so
+a late allocator buffer-id reuse can never alias the cached A), and it is
+cleared at split boundaries (`CudaBackend::synchronize`) so a cache from a
+previous graph execution never leaks stale data into a later one (the same pool
+buffer holds different data each step). The cached buffers are the state-level
+`buf_qa8_t`/`buf_sda_t` (transposed) and `buf_q8_prefill` (native) scratch —
+dedicated allocations OUTSIDE the graph allocator pool. On a hit the quantize
+launch is skipped and the GEMM reads the same (unchanged) buffer; byte-identical
+by construction (quantize is a pure function of (x, nt, id)). A single window
+suffices: on the stream each matmul's GEMM is enqueued right after its
+prepass, so the next (different-A) quantize always lands after the previous A's
+last GEMM — the "2-3 round-robin slots" are not needed for correctness here
+(they would only matter if a quantize could overwrite a still-consumed A, which
+stream order prevents). Both the transposed (`pad40_t`, benchmark) and native
+(`pad40`, fallback) paths share the cache, distinguished by a `transposed` flag
+so the two layouts are never cross-reused.
+
+**Window sanity (verified in `graph.rs`, build order = execution order per rule
+#6):** q/k/v are three consecutive `Op::MatMul` nodes (then RoPE ×2, so the
+window is intact across them); gate/up are two consecutive `Op::MatMul` nodes
+(then Silu/Mul break it). Between the attn window and the FFN window there are
+RoPE/Kvcache/Attn/wo/RmsNorm nodes that clear the cache — so the dedup achieves
+exactly the intended hits and no more. Per layer: q/k/v → 1 prepass (was 3),
+gate/up → 1 (was 2), wo → 1, down → 1 = 4 (was 7), save 3/layer.
+
+**Gates (all green).** Build clean (the only warning is the pre-existing
+`cc()` dead-code in release, test-only use). Parity x3 with the full gate set:
+`cuda_prefill_mmq` **1/0**, `cuda_prefill` **7/0**,
+`cuda_fa_prefill_attention_parity` **1/0** (note: the parity test calls
+`synchronize()` between cases, which clears the cache, so the HIT path is not
+exercised there — it is validated end-to-end by the greedy-32 identity).
+Greedy-32 (`-n 32 --greedy --seed 42`, prompt2k, qwen2.5-7b q4_k_m)
+**byte-identical** to the pre-change binary (`/tmp/minfer_pre_r49`, md5
+71c65976…). Prepass launch count (nsys `cuda_gpu_trace`,
+`/tmp/minfer_phase7/r49_gpu_trace.csv_cuda_gpu_trace.csv`):
+**quantize prepass 193 → 110** (native `pad40` 0 under the full gate set), and
+GEMM launches unchanged at **193** — confirming the dedup removes ONLY the
+redundant prepass, not any GEMM. Per-class in the same trace (GPU busy
+1141.6 ms): quantize prepass **118.4 → 83.9 ms (9.6% → 7.4% of GPU busy,
+−34.5 ms)**, q4_K GEMM 611.4 ms (53.6%), q6_K GEMM 195.9 ms (17.2%), FA 50.2 ms
+(4.4%). Single-run prefill in the nsys window 2811.6
+tok/s (vs r48 nsys-window 2585.4). Suite **166/0/3**.
+
+**Perf (interleaved 3× medians, `MINFER_MMQ=1 MINFER_MMQ_RAW=1
+MINFER_MMQ_RAW_NB=1 MINFER_MMQ_A_TRANSPOSE=1 MINFER_MMQ_Q6K_NB=1`, prompt2k
+3354-tok, `-n 1 --greedy`):** baseline (`/tmp/minfer_pre_r49`) **2734.1**;
+new **2797.5** = **+2.32%** (base 2718.0/2734.1/2735.2, new
+2766.7/2797.5/2837.0). Above the +1.5% bar (the prepass is real and
+wall-relevant at the converged wall). Stopping-condition branch: all gates green
++ ≥ +1.5% → LANDED.
+
+**Verdict — LANDED.** The prepass is not overlapped/absorbed (unlike the r44/45
+q6_K levers): the 83 launch drop is a genuine ~2.3% whole-prefill win. The
+remaining wall is now: q4_K GEMM parity (1.06×), q6_K GEMM converged (1.13×),
+FA reduced to ~4.7% (FAP2). The A-quantize prepass (2.52×→~1.8× vs llama, 83.9 ms in this trace) is no longer
+the #1 addressable residual. Follow-up levers, in order: (1) FA occupancy — the
+kernel is still smem-bound at 2 blocks/SM (a FA_TKV=16 trial); (2) the decode
+MMVQ path; (3) swiglu (bandwidth-bound, parity).
+
+Artifacts: `/tmp/minfer_pre_r49` (pre-change baseline, md5 71c65976…),
+`/tmp/minfer_phase7/run_r49_nsys.sh`, `/tmp/minfer_phase7/r49_bt.nsys-rep`
+(+`.sqlite`), `/tmp/minfer_phase7/r49_gpu_trace.csv_cuda_gpu_trace.csv` (trace
+export), `/tmp/minfer_phase7/r49_nsys_run.log`,
+`/tmp/g32_r49_new.txt`/`g32_r49_base.txt` (greedy-32, byte-identical),
+`/tmp/perf_r49_ab.sh` (interleaved A/B).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

@@ -1360,3 +1360,26 @@ The r47 gap table's FA row (5.72×, 10.2% wall) is now ~4.7% and no longer the
 largest addressable residual — that role passes to the **A-quantize prepass** (the
 r47 fallback: shared-A redundancy in the builder, ~9.6% wall, 2.52× vs llama).
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r48.
+
+### 11.28 Follow-up (r49, 2026-09-06): A-quantize prepass shared-A dedup — LANDED, prepass 193→110, whole-prefill +2.3%
+
+r48 named the A-quantize prepass the largest remaining addressable gap (2.52×
+vs llama). r49 implements the shared-A dedup entirely in the CUDA layer
+(`src/cuda.rs` + `src/graph/cuda_backend.rs`): a consecutive-window
+memoization keyed on `(src ptr, nt, id)` in `prefill_mmq` reuses the quantized
+(transposed) A for consecutive same-A MatMul nodes. q/k/v share `normed`
+(3 GEMMs → 1 prepass), gate/up share `normed2` (2 → 1), wo/down each unique —
+per layer 4 prepasses (was 7), save 3/layer. Cleared on any non-MatMul node
+(conservative, no write tracking) and at `synchronize` (cross-execution
+staleness). Same-A reuse is byte-identical by construction (quantize is a pure
+function of x/nt/id).
+
+**Result: `quantize_q8_0_pad40_t` prepass launches 193 → 110 (GEMM launches
+unchanged at 193); whole-prefill interleaved 3× median 2734.1 → 2797.5 tok/s
+= +2.32% (above the +1.5% bar); greedy-32 byte-identical; parity x3 green;
+suite 166/0/3.** This is the r47 fallback lever landed, and the A-quantize
+prepass is no longer the #1 addressable vs-llama residual (2.52× → ~1.8×). The
+one caveat (the parity test's `synchronize()` between cases clears the cache, so
+the HIT path is only validated end-to-end by greedy-32) is noted in the r49
+record, not a correctness gap. The r47 gap table's quantize row is now closed.
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r49.
