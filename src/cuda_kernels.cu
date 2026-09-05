@@ -5394,17 +5394,65 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
         {                                                                      \
             const int sb = ((kt) * KDR) >> 3;                                  \
             const int cbase = ((kt) * KDR) & 7;   /* chunk offset in sb */     \
-            for (int x = threadIdx.x; x < MMQ_NBJ * (KDR * 32); x += blockDim.x) {\
-                const int jj = x / (KDR * 32), bec = x % (KDR * 32);           \
-                const int j = j0 + jj;                                         \
-                const int elem = cbase * 32 + bec;   /* super-block element */ \
-                int v = 0;                                                     \
-                if (j < od && sb < nsb) {                                      \
-                    const uint8_t* blk = W + (size_t)j * ((size_t)nsb * bstride) \
-                        + (size_t)sb * bstride;                                \
-                    v = expand_q6_elem(blk, blk + 128, elem);                  \
+            if ((bstride & 15) == 0) {                                         \
+                /* r41: 16-elem group expand via uint4 ql+qh global loads.     \
+                 * The padded 224B block stride is 16-aligned, so a group's    \
+                 * ql run [it0*64+gg*16 .. +16) and qh run [it0*32+(gg&1)*16..) \
+                 * each load in ONE uint4 instead of 16 per-byte LDGs — cuts   \
+                 * the B-expand global-load instruction count and its L1TEX    \
+                 * scoreboard exposure ~16x. Element-for-element identical to  \
+                 * expand_q6_elem (gate-1 validator check). Per group (gg=g&3, \
+                 * cbase in {0,2,4,6}): it0=(cbase>>2)&1; qsh=((cbase>>1)&1)*4; \
+                 * qh_shift=qsh+((gg>>1)&1)*2; ql_shift=qsh.                    \
+                 * v[b] = ((ql[it0*64+gg*16+b]>>qsh)&0xF)                      \
+                 *        | ((qh[it0*32+(gg&1)*16+b]>>qh_shift)&3)<<4) - 32. */\
+                const int it0 = (cbase >> 2) & 1;                              \
+                const int qsh = ((cbase >> 1) & 1) * 4;                        \
+                const int ng = MMQ_NBJ * (KDR * 32) / 16;                      \
+                for (int g = threadIdx.x; g < ng; g += blockDim.x) {           \
+                    const int jj = g / 4, gg = g & 3;                          \
+                    const int j = j0 + jj;                                     \
+                    uint8_t* out = qbexpb + (size_t)jj * (KDR * 32) + gg * 16; \
+                    if (j < od && sb < nsb) {                                  \
+                        const uint8_t* blk = W + (size_t)j * ((size_t)nsb * bstride)\
+                            + (size_t)sb * bstride;                            \
+                        const uint4 qlv = *(const uint4*)(blk + it0*64 + gg*16);\
+                        const uint4 qhv = *(const uint4*)(blk + 128 + it0*32    \
+                                          + (gg & 1) * 16);                    \
+                        const int qhs = qsh + ((gg >> 1) & 1) * 2;             \
+                        const uint32_t qx = qlv.x, qy = qlv.y, qz = qlv.z, qw = qlv.w;\
+                        const uint32_t hx = qhv.x, hy = qhv.y, hz = qhv.z, hw = qhv.w;\
+                        _Pragma("unroll")                                      \
+                        for (int e = 0; e < 16; e++) {                         \
+                            const int sidx = e >> 2;                           \
+                            const int sh = (e & 3) * 8;                        \
+                            const uint32_t qsel = (sidx == 0) ? qx : (sidx == 1) ? qy\
+                                              : (sidx == 2) ? qz : qw;         \
+                            const uint32_t hsel = (sidx == 0) ? hx : (sidx == 1) ? hy\
+                                              : (sidx == 2) ? hz : hw;         \
+                            const uint8_t qb_ = (uint8_t)((qsel >> sh) & 0xFF);\
+                            const uint8_t hb_ = (uint8_t)((hsel >> sh) & 0xFF);\
+                            out[e] = (uint8_t)((((qb_ >> qsh) & 0xF)           \
+                                | (((hb_ >> qhs) & 3) << 4)) - 32);            \
+                        }                                                      \
+                    } else {                                                   \
+                        _Pragma("unroll")                                      \
+                        for (int e = 0; e < 16; e++) out[e] = 0;               \
+                    }                                                          \
                 }                                                              \
-                qbexpb[(size_t)jj * (KDR * 32) + bec] = (uint8_t)v;            \
+            } else {                                                           \
+                for (int x = threadIdx.x; x < MMQ_NBJ * (KDR * 32); x += blockDim.x) {\
+                    const int jj = x / (KDR * 32), bec = x % (KDR * 32);       \
+                    const int j = j0 + jj;                                     \
+                    const int elem = cbase * 32 + bec;   /* super-block elem */\
+                    int v = 0;                                                 \
+                    if (j < od && sb < nsb) {                                  \
+                        const uint8_t* blk = W + (size_t)j * ((size_t)nsb * bstride) \
+                            + (size_t)sb * bstride;                            \
+                        v = expand_q6_elem(blk, blk + 128, elem);              \
+                    }                                                          \
+                    qbexpb[(size_t)jj * (KDR * 32) + bec] = (uint8_t)v;         \
+                }                                                              \
             }                                                                  \
         }                                                                      \
         /* ---- B: dsc pair (d*sc[2c%16], d*sc[(2c+1)%16]) per (chunk,row) ----*/\
