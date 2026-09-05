@@ -1237,3 +1237,41 @@ pre-expand-B fix is blocked by a subtle kernel mismatch; the open levers are
 cp.async for the raw A (and pre-expanded B) staging (llama.cpp's structure) or
 a register-limited split-phase. The ~3.0×-to-llama gap persists. Recorded:
 docs/CUDA_OPTIMIZATION.md P6 r43.
+
+### 11.24 Follow-up (r44, 2026-09-05): root-caused the W_exp parity paradox — DENSE-plane stride mismatch; pre-expanded-B fix parity-correct but WALL-NEUTRAL (reverted)
+
+r43 left the pre-expand-B fix "blocked by a subtle kernel mismatch" (in-kernel
+expand of W passes, reading the byte-identical W_exp fails, max diff 448 @ 554
+identically across the uint4/per-byte variants). r44 root-caused it.
+
+**Root cause — a stride mismatch in the W_exp address, not a kernel-side
+aliasing interaction.** The r43 kernel indexed the *dense* `W_exp` (`od×id`, row
+stride = `id`, super-block stride = 256) with the *padded raw-W* expression
+`W + j*(nsb*bstride) + sb*bstride` (row stride = `nsb*bstride` = `(id/256)*224`,
+super-block stride = `bstride` = 224). For id=256, nsb=1, that is row stride 224
+vs the dense 256 for W_exp, so row/super-block offsets land on the wrong
+(row, element) for nearly every group. The in-kernel `expand_q6_elem` variant
+passed because raw `W` IS in the padded layout (that expression is correct *for
+it*); `W_exp` was byte-perfect (0/17,920) but read at the wrong offsets. This
+closes the r43 hypothesis (a) STRIDE MISMATCH and removes the "beyond the byte
+readback" mystery.
+
+**Correct fix verified (then reverted).** Dense index `W_exp + j*id + sb*256 +
+cbase*32 + gg*16` (16-B aligned since id is a multiple of 256). Parity gate
+`cuda_prefill_mmq` 1/0; ptxas 80 regs / 28 B spill (3-block budget held).
+
+**But WALL-NEUTRAL.** Interleaved 3x whole-prefill: 2595.9 → 2584.9 tok/s
+(−0.42%, noise). ncu base-vs-fix: elapsed cycles 1,390,776 → 1,239,847
+(−10.9% — the recomb ALU and its ~45% long_scoreboard samples are gone), yet
+Warp-Cycles/Issued-Inst 11.70→17.84 and long_scoreboard 34.9%→57.1%. The
+explanation: removing the recomb only *transforms* the B global→smem latency
+(recomb-ALU-waits-on-load into copy-STS-waits-on-load) and the kernel is no
+longer the prefill wall bottleneck after r41 (+30.7%). The 34.9%→57%
+delta is a denominator effect (smaller total leaves the unchanged A-staging +
+dsc loads as a larger fraction).
+
+**q6_K convergence verdict:** the pre-expand-B fix is a correctness fix for the
+W_exp addressing but a *dead end for wall perf* — the within-warp global→smem
+staging latency is exposed whether the B bytes come from a recomb or a copy.
+The lever that actually hides it is cp.async (llama.cpp structure). Reverted
+(cmp-match HEAD r41); recorded: docs/CUDA_OPTIMIZATION.md P6 r44.

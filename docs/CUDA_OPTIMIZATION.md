@@ -2312,6 +2312,76 @@ Artifacts: `/tmp/r43_pcsrc.ncu-rep` (ncu full-source report),
 `/tmp/ref_vs_expand.py` (value-formula validators),
 `/tmp/wtest_r43.log` (W_exp 0/17920 readback).
 
+### P6 r44: root-causing the W_exp parity paradox — STRIDE MISMATCH; pre-expanded-B fix parity-correct but WALL-NEUTRAL (REVERTED, 2026-09-05)
+
+This session root-caused r43's "in-kernel expand of W passes but reading the
+byte-identical W_exp fails" paradox. The answer was **not** a kernel-side
+aliasing/consumption issue (r43 could not isolate one); it is a **layout
+stride mismatch in the W_exp address expression**.
+
+**Root cause (one line):** the r43 fix indexed the *dense* `W_exp` (`od×id`
+bytes, row stride = `id`, super-block stride = 256 elements) with the *padded
+raw-W* address expression `W + j*(nsb*bstride) + sb*bstride` (row stride =
+`nsb*bstride`, super-block stride = `bstride`), so for nearly every `(od, sb)`
+it read the wrong row/column of the dense plane; the in-kernel `expand_q6_elem`
+variant passed because the raw `W` **is** in the padded layout and that
+expression is correct *for it*, while the raw bytes of `W_exp` (verified
+0/17,920) were byte-correct but loaded at wrong offsets.
+
+The three r43 variants then split exactly as expected: (a) uint4 bulk copy and
+(b) per-byte copy both read `W_exp` through the same wrong (padded-derived)
+address → identical wrong diff 448 @ index 554; (c) in-kernel `expand_q6_elem`
+reading the padded `W` through the correct (for `W`) expression → passes. This
+settles hypothesis (a) from the r43 follow-up (STRIDE MISMATCH) and refutes the
+"kernel-side interaction beyond the byte readback" framing.
+
+**Correct fix + verification (not landing — see perf).** Implemented the dense
+index `W_exp + j*id + sb*256 + cbase*32 + gg*16` (id a multiple of 256 by the
+`id/32%8==0` gate, so 16-B aligned) in the kernel's B-staging branch, and built
+`W_exp` at registration (`register_weight_q6k_padded`, host `expand_q6_elem_byte`
+mirror of the device `expand_q6_elem`), registered under a `__exp` sibling name
+and looked up by the padded weight's device pointer (`q6k_exp` map, `CudaPtr`
+for Send). Passed the parity gate: `cargo test --release --features cuda
+cuda_prefill_mmq` **1/0** with `MINFER_MMQ=1 MINFER_MMQ_RAW=1
+MINFER_MMQ_Q6K_NB=1`; ptxas `-v` on the `<2>` instantiation = **80 regs,
+20 B spill stores / 28 B spill loads** (r41 was 80 regs + 4 B spill; the
+3-block budget holds: 80 regs × 256 thr × 3 = 61,440 < 65,536 regs/SM and
+29,696 B × 3 = 89,088 < 102,400 B smem/SM).
+
+**Perf: NEUTRAL (the stall was real but OVERLAPPED — not the wall bottleneck).**
+Interleaved 3x whole-prefill (2K+ prompt, q6_K+q4_K-BT env):
+**2595.9 → 2584.9 tok/s median = −0.42%** (baseline runs 2602.1/2572.6/2595.9,
+fix 2575.1/2584.9/2598.2). Well under the +1.5% bar → **REVERTED** (no
+commit; cmp-match HEAD r41).
+
+The reason is the r43 "latency exposure, not cross-warp occupancy" framing plus
+one more layer: **removing the recomb does not remove the global→smem latency —
+it converts it.** ncu (`WarpStateStats`, `mmq_raw_nb_bt_q6k_kernel<2>`) base-r41
+vs fix: elapsed cycles **1,390,776 → 1,239,847 (−10.9%)**, Compute(SM)
+37.9%→28.4%, but Warp-Cycles/Issued-Inst **11.70 → 17.84**, long_scoreboard
+**4.1 cy / 34.9% → 10.2 cy / 57.1%**, eligible warps 0.96→0.47, IssueSlot
+2.5→3.9 cy/inst. So the kernel IS ~11% faster (the recomb ALU and its ~45% of
+samples are gone) — but the whole-prefill wall is unchanged, because the q6_K
+GEMM is no longer the prefill wall bottleneck after r41's +30.7%, and the B
+staging was only *transformed* (load→ALU-recomb into load→smem-store copy, the
+same L1TEX latency exposure the A-side STS.128 already has). **The remaining
+long_scoreboard share rising to 57% is a denominator effect**: a smaller total
+(less compute) leaves the unchanged A-staging + dsc loads as a larger fraction.
+
+**Verdict:** pre-expanded-B fixes correctness of the W_exp addressing (root
+cause found) and speeds the kernel in isolation, but does **not** move the
+prefill wall — the within-warp global→smem staging latency is exposed
+regardless of whether the B bytes come from a recomb or a copy. The physical
+lever that actually hides it remains **cp.async** for the raw A (and B)
+staging (llama.cpp's structure), per the r43 open-lever list. Change reverted;
+this entry is the negative + root-cause record.
+
+Artifacts: `/tmp/r44_stride_demo.py` (stride-mismatch demonstration,
+1952/… tuples where the padded-derived W_exp index ≠ dense index),
+`/tmp/gen_q6k_ptxas_r44.py` + `/tmp/q6k_r44.cu` (ptxas harness, 80 regs /
+28 B spill), `/tmp/perf_r44.sh` (interleaved 3x A/B),
+`/tmp/ncu_r44_fix2.csv` + `/tmp/ncu_r44_base.csv` (ncu baseline-vs-fix).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
