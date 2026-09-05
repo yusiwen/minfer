@@ -2799,6 +2799,67 @@ export), `/tmp/minfer_phase7/r49_nsys_run.log`,
 `/tmp/g32_r49_new.txt`/`g32_r49_base.txt` (greedy-32, byte-identical),
 `/tmp/perf_r49_ab.sh` (interleaved A/B).
 
+### P6 r50: FA_TKV 32→16 occupancy trial — CORRECT but WALL-NEUTRAL (REVERTED, 2026-09-06)
+
+The r48-flagged "next lever" (FA_TKV=16 → 26 KB smem → 3 blocks/SM) is
+tested as a cheap occupancy trial. Outcome: **correct (parity green, suite
+166/0/3) but whole-prefill wall-neutral** (3× −0.5%, 5× −0.01%, both below
+the +1.5% bar) — the r46 pattern (positive-mechanism / negative-wall), so
+**REVERTED**.
+
+**Change (src/cuda_kernels.cu) is a single `#define FA_TKV 32→16`** — every
+other use is symbolic (QK^T fragment `fc[FA_TKV/16]`, P·V k-loop
+`kk0 < FA_TKV`, cp.async staging stride `c < FA_TKV*hd/8`, softmax fragment
+arrays `[FA_TKV/16*4]`, `Vs = Ks + FA_TKV*sstr`, grid/launch). **ONE
+non-symbolic derived constant was a latent bug:** the tail-tile O writeout
+reuses `smem` as a `64×128 f32` `stage` buffer (32 KB), which EXCEEDS the
+FA_TKV=16 KV-staging smem (25.5 KB). The launcher smem had to be taken as
+`max((FA_TQ+2*FA_TKV)*(hd+8)*2, FA_TQ*hd*4)` = 32 KB, not 25.5 — dropping it
+below 32 KB overruns the allocation on the tail block. At FA_TKV=32 this was
+hidden (34.8 KB > 32 KB).
+
+**Occupancy (derived from the r48 ncu device config, CC 12.1, smem/SM =
+102.40 KB):** the new 32 KB launch request + ~1.02 KB driver = `floor(102.4 /
+33.02) = 3` blocks/SM (from 2); registers 124 → Block Limit Registers = 4
+(3×128×124 = 47,616 < 65,536, so regs do NOT block 3). **The task's premise
+is met: FA_TKV=16 reaches 3 blocks/SM.** (ncu/nsys could not be re-run in this
+session — both fail on the stub-libcuda / profiling-env issue — so the
+occupancy figure is derived from the r48 device report + the new 32 KB
+request, not a fresh measurement.)
+
+**Gates.** Build clean (124 regs / 0 spill / STACK 0 / LOCAL 0 via cuobjdump).
+Parity x3 green: `cuda_fa_prefill_attention_parity` 1/0 (max err **0.000282**,
+well within 5e-3), `cuda_prefill_mmq_parity` 1/0, `cuda_prefill` 7/0. Suite
+**166/0/3**. **Greedy-32 (−n 32 --greedy --seed 42, prompt2k) NOT byte-identical**
+— the generated text diverges at one argmax boundary ("…95% DRAM-bound." →
+"…95% smem-bound."). This is benign ULP accumulation-order noise (parity max
+err 1e-4, the values are correct), **INHERENT to any FA_TKV reduction** (the
+online-softmax merge across tiles changes rounding), not a correctness bug —
+but it means the strict "greedy-32 byte-identical" gate is only satisfiable
+for FA changes that preserve accumulation order, not tile-size reductions
+(a NEW caveat for the FA campaign).
+
+**Perf (interleaved, `MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_RAW_NB=1
+MINFER_MMQ_A_TRANSPOSE=1 MINFER_MMQ_Q6K_NB=1`, prompt2k 3325-tok, −n 1
+--greedy):** 3× — base 2834.1/2832.9/2805.7 (med 2832.9) vs new
+2818.8/2823.0/2809.0 (med 2818.8) = **−0.5%**; 5× — base med 2797.1 vs new
+med 2796.7 = **−0.01%**. Both below the +1.5% bar. wall-NEUTRAL.
+
+**Verdict — REVERTED.** The FA line is now **converged**: the FA kernel is
+~4.7% of the whole-prefill wall and tile-size/occupancy levers on it do NOT
+move the wall (r46 FA_TKV 64→32 wall-neutral; r50 FA_TKV 32→16 wall-neutral
+even at 3 blocks/SM). The occupancy gain (2→3 blocks/SM) is cancelled by the
+doubled per-tile sync/softmax overhead (the r46 lesson). FA_TKV reduction is a
+**dead lever**; the remaining addressable residuals are the decode MMVQ path
+and swiglu, not FA. Any future FA work must either target the A-quantize
+prepass (done r49) or accept that byte-identity is not preserved.
+
+Artifacts: `/tmp/minfer_pre_r50` (pre-change baseline, md5 ae0614a6…),
+`/tmp/perf_r50_ab.sh` + `/tmp/perf_r50_5.sh` (interleaved A/B, 3× and 5×),
+`/tmp/g32_r50_base.txt`/`g32_r50_new.txt` (greedy-32, NOT identical),
+`/tmp/r50_suite.log` (suite 166/0/3), `/tmp/r50_parity.log`,
+`/tmp/fa_r50.ncu-rep`-attempt logs (ncu/nsys blocked by the session env).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
