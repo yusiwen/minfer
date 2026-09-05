@@ -1275,3 +1275,39 @@ W_exp addressing but a *dead end for wall perf* — the within-warp global→sme
 staging latency is exposed whether the B bytes come from a recomb or a copy.
 The lever that actually hides it is cp.async (llama.cpp structure). Reverted
 (cmp-match HEAD r41); recorded: docs/CUDA_OPTIMIZATION.md P6 r44.
+
+### 11.25 Follow-up (r45, 2026-09-05): cp.async the A-side staging — mechanism CONFIRMED (kernel ~10% faster, long_scoreboard −18%) but WALL-NEUTRAL (reverted)
+
+r44 left cp.async as the open lever. r45 implemented the first step — **A side
+only** (the pure bulk-copy candidate; B stays r41 recomb). The A block of
+`mmq_raw_nb_bt_q6k_kernel`'s `RAW_STAGE_Q6K_BT(kt,b)` replaces the bulk
+`LDG.128→STS.128` with `cp.async.cg.shared.global [dst],[src],16,16` (inline
+PTX + `gemm_cp_commit`), and the double-buffer wait becomes a group count
+(`gemm_cp_wait1()` after the next-buffer stage, `gemm_cp_wait0()` on the last
+tile; one extra `__syncthreads()` per iteration held for the buffer WAR hazard).
+
+**Note on the SASS grep (gate 1):** `__pipeline_memcpy_async` silently *fell
+back* to LDG+STS — the compiler could not prove the generic `uint8_t*` shared
+pointer 16B-aligned, so 0 CP.ASYNC appeared. Emitting the copy as explicit PTX
+fixed it. In SASS cp.async is **`LDGSTS.E.BYPASS.128`** (not a literal
+`CP.ASYNC` mnemonic), so the gate greps `LDGSTS`. 24 in the `<2>` fn; 80 regs /
+0 spill (r41's 4 B spill dropped), 3-block budget held.
+
+**Gates:** build clean; parity `cuda_prefill_mmq` 1/0; greedy-32 identity
+byte-identical; suite 166/0/3. **Perf (interleaved 3×, whole-prefill, full
+q6_K+q4_K-BT env):** baseline 2604.5 → r45 2595.6 tok/s = **−0.34% — NEUTRAL**
+(bar +1.5% NOT met). **ncu base-vs-r45:** Duration 659,680 → 592,448 ns
+(−10.2%), Elapsed Cycles 1,408,834 → 1,261,636 (−10.4%), Warp-Cycles/Issued-Inst
+11.55 → 10.60, Compute(SM) 37.42% → 42.13%, **long_scoreboard share 37.9% →
+33.7%** (absolute 4.38 → 3.57 cy, −18.4%).
+
+**q6_K convergence verdict:** cp.async **works at the mechanism level** — the
+A-side LDG→REG→STS exposure is handed to the async unit, so the kernel is ~10%
+faster and its long_scoreboard absolute cycles drop ~18% (compute share up).
+But the **prefill wall is unchanged** — after r41 (+30.7%) the q6_K GEMM is no
+longer the prefill bottleneck, so a faster q6_K kernel does not reach the wall
+(the r44 pre-expand-B conclusion, now confirmed with the actual physical lever).
+The q6_K **line has converged**: kernel ~0.59 ms matched-nt (~3.0× vs llama's
+57.8 µs/GMAC remains) but that gap no longer drives whole-prefill (~2595 tok/s);
+further q6_K-kernel tuning (cp.async B, split-phase, pre-expand-B) is
+wall-neutral. Reverted; recorded: docs/CUDA_OPTIMIZATION.md P6 r45.

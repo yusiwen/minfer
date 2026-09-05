@@ -2382,6 +2382,79 @@ Artifacts: `/tmp/r44_stride_demo.py` (stride-mismatch demonstration,
 28 B spill), `/tmp/perf_r44.sh` (interleaved 3x A/B),
 `/tmp/ncu_r44_fix2.csv` + `/tmp/ncu_r44_base.csv` (ncu baseline-vs-fix).
 
+### P6 r45: cp.async the q6_K kernel's A-side staging — kernel ~10% faster + long_scoreboard down, but WALL-NEUTRAL (REVERTED, 2026-09-05)
+
+r44 named the physical lever: the within-warp global→smem staging latency is
+exposed regardless of whether the B bytes come from a recomb or a copy, and the
+fix that hides it is **cp.async** (llama.cpp's structure). This session did the
+first-step cp.async change — the **A side only** (the pure bulk-copy candidate).
+
+**Change (register-neutral, A-side only).** In `mmq_raw_nb_bt_q6k_kernel`'s
+`RAW_STAGE_Q6K_BT(kt, b)` the A block's bulk `LDG.128→STS.128` copy of the
+byte-exact, 16B-aligned prepass planes (qa8/sda_q, `MMQ_A_QASZ=2048` /
+`MMQ_A_SDASZ=256`, block-spanning so every `qbase`/`sbase` is 16-aligned; smem
+dst `qa8b`/`sdaqb` 16-aligned) is replaced with **`cp.async.cg.shared.global
+[dst],[src],16,16`** inline PTX + `gemm_cp_commit`. `__pipeline_memcpy_async`
+first fell back to LDG+STS (the compiler could not prove the generic
+`uint8_t*` shared pointer 16B-aligned → 0 CP.ASYNC in SASS), so the copy is
+emitted as explicit PTX, matching the codebase's existing `gemm_cp16`/
+`gemm_cp_wait1/0` convention. B (qb_exp recomb + dsc) stays r41. The
+double-buffer stays, but the wait becomes a group count: in the loop,
+`if (kt+1<nktile) { RAW_STAGE_Q6K_BT(kt+1, buf^1); gemm_cp_wait1(); } else
+{ gemm_cp_wait0(); }` then `__syncthreads()` before compute (the cross-thread
+A/B visibility point) — so the A copy for `buf^1` stays in flight across the
+current tile's compute while `buf`'s group completes. One **additional**
+`__syncthreads()` per iteration (the original end-of-loop barrier is kept for
+the buffer WAR hazard: a thread finishing compute on `buf` must not be
+overwritten by the next iteration's stage into `buf`).
+
+**Gates.** 1) Build clean; ptxas/sm_121 `--dump-resource-usage` **REG:80,
+LOCAL:0 (0 B spill)** — the r41 4 B spill dropped to 0, and the 80-reg/3-block
+budget HOLDS (80×256×3 = 61,440 < 65,536 regs/SM; 29,696 B × 3 < 102,400 B
+smem/SM). SASS: the CP.ASYNC instruction is **actually emitted** — in SASS it
+is the `cp.async` encoding **`LDGSTS.E.BYPASS.128`** (24 in the `<2>` fn;
+`CP.ASYNC` is the PTX mnemonic, `LDGSTS` the SASS one, so grep `LDGSTS`).
+2) Parity `MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1
+cuda_prefill_mmq`: **1/0**. 3) Greedy-32 token/text identity vs default f16
+path: **byte-identical** (timing-only diffs). 4) Perf interleaved 3× (full
+q6_K+q4_K-BT env, `-n 1`, Prefill tok/s): baseline `/tmp/minfer_pre_r45`
+**2604.5** (2605.6/2604.5/2189.7-cold) → r45 **2595.6** (2592.7/2595.6/2597.1)
+= **−0.34% median — NEUTRAL** (bar +1.5% NOT met). 5) ncu
+(`<2>`, SpeedOfLight + WarpStateStats) base-vs-r45: Duration **659,680 →
+592,448 ns (−10.2%)**, Elapsed Cycles **1,408,834 → 1,261,636 (−10.4%)**,
+Warp-Cycles/Issued-Inst **11.55 → 10.60**, Compute(SM) **37.42% → 42.13%**,
+**CPIStall long_scoreboard share 37.9% → 33.7%** (absolute 4.38 → 3.57 cy,
+**−18.4%**). 6) Suite **166/0/3**.
+
+**Verdict — REVERTED (the mechanism works, the wall does not move).** cp.async
+does exactly what r43/r44 predicted at the kernel level: the A-side
+LDG→REG→STS staging latency is handed to the async copy unit, so the q6_K
+kernel is ~10% faster and its long_scoreboard absolute cycles drop ~18%
+(compute share up 37.4→42.1%). But the **whole-prefill wall is unchanged**
+(−0.34%, noise): after r41's +30.7% the q6_K GEMM is no longer the prefill
+bottleneck, so a faster q6_K kernel does not reach the wall — the same
+conclusion r44 drew from the pre-expand-B experiment, now confirmed with the
+actual physical lever. The r45 delta is the kernel-side speedup in isolation
+that the pref graph does not amplify. This is a **clean negative**: the
+cp.async framing is correct but the line has **converged** — the q6_K kernel
+is no longer the binding constraint (whole-prefill ~2595 tok/s, kernel ~0.59 ms
+matched-nt), and further q6_K-kernel-tuning cannot move the wall.
+
+**q6_K convergence verdict.** Kernel matched-nt ~0.59 ms vs llama's 57.8 µs/GMAC
+r38-r44 target; the ~3.0× q6_K gap persists in isolation, but the whole-prefill
+line has converged: q6_K GEMM is no longer the wall bottleneck, so q6_K-kernel
+levers (cp.async, split-phase, pre-expand-B) are all wall-neutral. The open
+levers for whole-prefill now sit elsewhere (the A-quantize prepass, the q4_K
+GEMM share, attention), not in the q6_K kernel. Change reverted (cmp-match
+HEAD r41 = 6d02017); this entry is the positive-mechanism/negative-wall record.
+
+Artifacts: `/tmp/minfer_pre_r45` (pre-change r41 baseline binary),
+`/tmp/perf_r45.sh` + `/tmp/perf_r45_results.txt` (gate-4 interleaved A/B),
+`/tmp/ncu_r45.csv` + `/tmp/ncu_r45_base.csv` (ncu baseline-vs-r45, SP+LSta+WS),
+`/tmp/q6k_r45_sass.txt` + `/tmp/q6k_r45_fn.txt` (sm_121 SASS; LDGSTS.128 =
+CP.ASYNC), `/tmp/extract_gen.py` + `/tmp/g32_r45_default.txt` +
+`/tmp/g32_r45_q6k.txt` (gate-3 greedy identity).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
