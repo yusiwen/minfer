@@ -2104,6 +2104,84 @@ Artifacts: `/tmp/minfer_pre_r40` (r39 baseline binary), `/tmp/g32_lb3_q6k.txt` +
 `/tmp/gen_q6k_ptxas_r40.py` + `/tmp/q6k_ptxas_r40_lb3.cu`/`q6k_t*.cu` (ptxas harness + trim
 variants), `/tmp/r40_ncu_lb3.csv` (gate-2 occupancy), ncu SOL run (gate-6).
 
+### P6 r41: widen the q6_K B-expand global loads to 16-element uint4 groups — LANDED (+30.7% whole-prefill; L1TEX scoreboard 85.5%→33.6%, kernel time −61.5%) (2026-09-05)
+
+r40 named the residual as the target spec: the q6_K BT kernel was **latency-bound**
+(L1TEX scoreboard 10.5→13.7 cy/warp, ~85% of warp stall time, No-Eligible 70.1%)
+and the open lever was "reducing the intrinsic stalls (L1TEX scoreboard), not
+residency (now 3 blocks)". This session attacks that lever directly.
+
+**The stall source, located (Task 1).** ncu (source/Warp-State attribution) on
+`mmq_raw_nb_bt_q6k_kernel<2>`:
+- `CPIStall` = **85.5% long_scoreboard** (13.7 of 16.0 cy/inst), i.e. waiting on
+  L1TEX global-memory data. The r39/r40 double-buffer hides latency *across warps*
+  (occupancy), not *within* a warp — in program order the kt loop does
+  `RAW_STAGE_Q6K_BT(kt+1, buf^1)` (the B-expand global→smem expansion) **before**
+  compute(kt), and that staging block issues per-element **byte** global loads
+  (`LDG.E.U8` for `ql`/`qh`) and consumes them immediately in the recomb→STS, so the
+  full L1TEX latency is exposed serially in front of compute.
+- SASS confirms the instruction order: the staging (LDG byte + recomb + STS) sits at
+  the top of the loop; the compute (LDSM/LDS/IMMA) is after it. The B-expand does
+  **32 per-byte ql+qh loads per thread per kt** — the dominant L1TEX traffic.
+- The B-expand also showed `UncoalescedGlobalAccess` (52% excessive sectors) and
+  `L1/TEX Cache Throughput` only 14.8%.
+
+**Fix (candidate (b), register-neutral).** Rather than the r20 split-phase
+prefetch (which the 80-reg/3-block budget kills — ptxas needs 81 live regs at this
+revision), widen the B-expand's global loads. The padded 224-byte block stride
+(`register_weight_q6k_padded`, the real-model layout) is **16-aligned**, so each
+16-element group's `ql` run `[it0·64+gg·16 .. +16)` and `qh` run
+`[it0·32+(gg&1)·16 .. +16)` load in **ONE `uint4` each** instead of 16 per-byte
+LDGs → a ~16× cut in B-expand global-load instructions and scoreboard exposure.
+The recomb (nibble + 2-bit field − 32) is then done in registers.
+
+Closed form per group (`gg = g&3`; `cbase = (kt·KDR)&7 ∈ {0,2,4,6}`; derived from
+the CPU `dot_q6_k_q8_k_scalar` dequant and validated element-for-element against
+`expand_q6_elem`):
+```
+it0 = (cbase>>2)&1;  qsh = ((cbase>>1)&1)*4;          // ql_shift == qsh
+qh_shift = qsh + ((gg>>1)&1)*2;
+v[e] = ((ql[it0*64+gg*16+e] >> qsh) & 0xF)
+       | ((qh[it0*32+(gg&1)*16+e] >> qh_shift) & 3) << 4)  - 32;
+```
+The raw 210B (test-only `bp_w6k_raw`) block stride is *not* 16-aligned, so the
+aligned path is gated on `(bstride & 15) == 0` and the original scalar
+`expand_q6_elem` loop is kept as the else branch. This preserves both paths —
+the real model uses the padded 224B layout (the fast path).
+
+**Gates.** 1) Standalone validator (Python mirror of the group formula vs the
+scalar `expand_q6_elem`): **0 mismatches / 512,000 elements**. 2) ptxas (`<256,3>`,
+KDR=2, sm_121): **80 registers, 4 B spill** — identical to r40, so the 3-block/SM
+budget **HOLDS** (no occupancy regression). 3) Parity
+(`MINFER_MMQ=1 MINFER_MMQ_RAW=1 MINFER_MMQ_Q6K_NB=1 cuda_prefill_mmq_parity`):
+**1/0** (both raw 210B + padded 224B q6_K). 4) Greedy-32 token identity vs the
+default f16 path: **byte-identical** (timing-only diffs). 5) Perf interleaved 3×
+(same q6_K env, both binaries): **1979.9/2012.9/1985.3 (pre_r41) → 2605.2/2597.6/
+2608.2 (r41) tok/s = +30.7% median** (bar +1.5%). 6) ncu `mmq_raw_nb_bt_q6k_kernel<2>`:
+kernel duration **1.70 ms → 0.654 ms (−61.5%)**, compute (SM) 27.0%→37.8%, L1/TEX
+throughput 14.8%→33.6%, Memory Throughput 14.7%→30.5%, **CPIStall long_scoreboard
+13.7→3.6 cy (85.5% of warp time → 33.6%)**, warp-cycles/inst 16.0→10.8,
+theoretical occupancy 50% = 6 warps/scheduler (3 blocks, held). 7) Suite **166/0/3**.
+
+**Verdict — LANDED (+30.7%, well above the +1.5% bar).** The q6_K line's residual
+was the intrinsic L1TEX scoreboard stall from the per-byte B-expand global loads;
+widening them to uint4 groups is **register-neutral** (80 regs held, 3 blocks held)
+and cuts the L1TEX scoreboard share from 85.5% to 33.6%. This is the **largest
+single q6_K lever yet** — bigger than r39's double-buffer (+13.3%) and r40's 3rd
+block (+13.0%) — and it further closes the ~3.0×-to-llama gap (matched-nt attn_v
+now ~0.65 ms vs the r40 ~1.58 ms est.). Still latency-bound-ish (No-Eligible, 33.6%
+L1TEX + some barrier), so the next open lever is the remaining global load (the dsc
+`d·sc` reads, also byte-granular and uncoalesced) or a further split-phase of the A
+bulk — both bounded by the same 80-reg/3-block cap.
+
+Artifacts: `/tmp/minfer_pre_r41` (r40 baseline binary, pre-change),
+`/tmp/minfer_r41_bin` (post-change binary), `/tmp/validate_q6k_group_r41.py`
+(gate-1 validator), `/tmp/patch_q6k_pexpand_r41.py` + `/tmp/patch_q6k_rename_b_r41.py`
+(patch scripts), `/tmp/q6k_r41.cu`/`q6k_r41.cubin`/`q6k_r41.sass` (ptxas+SASS
+harness), `/tmp/ncu_r41_full.csv` (pre-change ncu) + `/tmp/ncu_r41_new.csv`
+(post-change ncu), `/tmp/perf_r41_interleaved.txt` (gate-5),
+`/tmp/g32_r41_default.txt` + `/tmp/g32_r41_q6k.txt` (gate-4 greedy identity).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

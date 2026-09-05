@@ -1137,3 +1137,34 @@ est. from the −23 % kernel time; llama 57.8). The kernel is **still latency-bo
 No-Eligible; warp time dominated 70% by L1TEX scoreboard, 10.5 cy/warp), so the residual is
 the KSPLIT=2 intrinsic (2× mma.k16) plus remaining memory-latency stall, not residency (now
 3 blocks). Recorded: docs/CUDA_OPTIMIZATION.md P6 r40.
+
+### 11.21 Follow-up (r41, 2026-09-05): widen the B-expand to uint4 group loads — LANDED (+30.7% whole-prefill; L1TEX scoreboard 85.5%→33.6%)
+
+r40's named lever #1 was reduced, but not via residency. The q6_K BT kernel is
+still latency-bound, but the r40/§11.20 framing ("the residual is KSPLIT=2 intrinsic
+plus memory-latency stall, not residency") is incomplete — the dominant fraction was
+per-byte B-expand global loads.
+
+**Attribution.** ncu Warp State on `mmq_raw_nb_bt_q6k_kernel<2>`: **85.5%** of
+warp-stall cycles are `long_scoreboard` (L1TEX), 13.7 of 16.0 cy/inst. The SASS
+shows the kt loop stages `kt+1`'s B-expand at the *top* of the iteration (before
+compute), and that staging reads `ql`/`qh` **one byte at a time** (`LDG.E.U8`),
+32 per-thread loads per kt, consumed immediately by the recomb→STS. The ~16-byte
+group isn't loaded contiguously, so the L1TEX latency is exposed every iteration.
+
+**Fix — vectorize the group load (register-neutral).** Because the real-model
+padded 224-byte stride is 16-aligned, each 16-element group's `ql`/`qh` byte runs
+load in a single `uint4` each (~16× fewer B-expand global loads). Recomb in
+registers; gate on `bstride & 15 == 0` (raw 210-B test path keeps the scalar
+`expand_q6_elem`). Closed form (validated 0/512k):
+`it0=(cbase>>2)&1; qsh=((cbase>>1)&1)*4; v[e]=((ql[it0*64+gg*16+e]>>qsh)&0xF) |
+((qh[it0*32+(gg&1)*16+e]>>qh_shift)&3)<<4) )-32`, `qh_shift=qsh+((gg>>1)&1)*2`.
+
+**Result.** ptxas 80 regs / 4 B spill (held 3 blocks/SM); parity **1/0** (raw+padded);
+greedy-32 byte-identical; suite **166/0/3**; whole-prefill **1979.9→2605.2 tok/s
+(+30.7%)**; kernel (attn_v) **1.70→0.654 ms (−61.5%)**; **CPIStall long_scoreboard
+13.7→3.6 cy, 85.5%→33.6% of warp time**; L1/TEX throughput 14.8%→33.6%; compute
+27.0%→37.8%. This is the **largest single q6_K lever to date** (vs r39 +13.3%, r40
++13.0%) and it is register-neutral, so the occupancy won by r40 is preserved. The
+remaining stall (33.6% L1TEX) is now mainly the dsc `d·sc` byte/16-bit reads
+(uncoalesced) plus the KSPLIT=2 intrinsic. Recorded: docs/CUDA_OPTIMIZATION.md P6 r41.
