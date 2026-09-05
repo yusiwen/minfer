@@ -959,3 +959,55 @@ spare FP/INT pipe slots under the 64/kt tensor-core mma), so they were never the
 critical resource. The residual is intrinsic **composition** (A-frag LDSM
 consuming + fp rescale), exactly as r32/r33 concluded; the "decode class" is now
 closed as *not* a wall lever. Recorded: docs/CUDA_OPTIMIZATION.md P6 r35.
+
+### 11.16 Follow-up (r36, 2026-09-05): the A-frag wavefront economics — the MIO
+wavefront count is NOT the scarce resource (H1 REFUTED, H2 endpoint)
+
+r35 left one named candidate untested on its own metric: replace the A-frag LDSM
+supply with plain-LDS (llama's `load_generic` style) on the theory that the MIO
+*wavefront* count, not the instruction count, is what gates an IMMA-bound loop.
+The r34 census blockage is first cleared: `ncu` injects into
+`mmq_raw_nb_bt_kernel` under the `sudo -n env LD_LIBRARY_PATH=...` prefix
+(without it the driver returns ERR_NVGPUCTRPERM / "Unknown Error on device 0" —
+the exact failure r34/r35 hit). Profile = qwen2.5-7b q4_k_m nt=3325 prefill (bt)
+vs llama `mul_mat_q` at nt=512 (llama-bench -p 512), launch 1 each.
+
+**wavefronts per IMMA** (`smsp__sass_l1tex_data_pipe_lsu_wavefronts_mem_shared_op_*`
+over `smsp__inst_executed_pipe_tensor_subpipe_imma`):
+
+| per-IMMA | minfer bt | llama | ratio |
+|---|---:|---:|---:|
+| LDSM wf | 2.000 | 0.500 | 4.00× |
+| LDS wf | 3.500 | 2.163 | 1.62× |
+| ST wf | 0.656 | 0.844 | 0.78× |
+| **total wf** | **6.156** | **3.507** | **1.76×** |
+| LDSM inst | 0.500 | 0.125 | 4.00× |
+| LDS inst | 0.750 | 1.349 | 0.56× |
+
+The asymmetry is real — minfer moves 6.156 vs 3.507 shared wavefronts per IMMA
+and exactly 4× the LDSM wavefronts — but the throughput side falsifies the
+"scarce resource" claim: minfer does **1.85× the shared wavefronts/s** (39.0 vs
+21.1 G/s) while landing at the same per-IMMA tensor rate (**6.33 vs 6.02
+G-IMMA/s**, 1.05×). A per-SM fixed shared-memory pipe would cap both kernels at
+the same wavefronts/s if MIO were the limiter; minfer crushes past llama's 21
+G/s, so the bt kernel's MIO pipe has ~1.85× headroom. The loop is tensor/IMMA
+bound (r35 again); the extra LDSM wavefronts are hidden in the tensor shadow.
+
+**Why the LDSM→plain-LDS fix is wavefront-neutral.** LDSM.m8n8.x4 = 512 B = 4.0
+wavefronts (20,873,216/5,218,304); a conflict-free LDS of the same payload = 512
+B = 4 wavefronts. Same bytes → same wavefronts. H1 compared an LDSM.x4 (4 tiles,
+4 wf) to a single-tile plain LDS (1 wf) — apples to oranges; llama's plain-LDS
+average 1.60 wf/inst (also not single-wavefront). The actual cause of llama's
+lower wavefronts/IMMA is **A-fragment reuse**: llama loads 8 A-frags once per
+32-k chunk and reuses them across 64 mma (0.125 LDSM/IMMA), minfer loads 4 per
+chunk and reuses each across 2 mma (0.500 LDSM/IMMA) — a 4× reuse gap from warp
+tiling (llama iterates od in-kernel, minfer's warp owns one 16-od strip). That is
+a loop/tiling restructure, not an access-method swap.
+
+**Verdict — H1 REFUTED, H2 endpoint.** minfer runs 1.85× the shared wavefronts/s
+and still matches llama's per-IMMA tensor throughput, so MIO is not gating. Its
+issue_active/cycle/sched (0.457) is *above* llama's (0.365), so H2's issue-active
+deficit is also absent. **The bt mma kernel is at per-IMMA parity with llama**;
+the remaining prefill gap lives outside a structurally addressable mma lever
+(per-tile prologue/wave amortization, quantize prepass, fixup). No A-side
+implementation is warranted. Recorded: docs/CUDA_OPTIMIZATION.md P6 r36.

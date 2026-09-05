@@ -1760,6 +1760,83 @@ r28→r34 gains moved the staging/decode *mechanics* out, but the remaining ~1.1
 llama gap sits in LDSM/IMMA + fp-rescale composition that neither loop reorder
 (r33) nor scale pre-decode (r35) can touch.
 
+### P6 r36: A-frag wavefront economics — the MIO wavefront count is NOT the
+scarce resource; H1 REFUTED, H2 endpoint reached (measurement-only, 2026-09-05)
+
+Decisive test of the one remaining named H1 candidate (replace the A-frag LDSM
+supply with plain-LDS) under its own metric: **shared-memory wavefronts per
+IMMA**. The setup from r34's blocked census is now unblocked — `ncu` injects into
+`mmq_raw_nb_bt_kernel` when run with the `sudo -n env LD_LIBRARY_PATH=...`
+prefix (r34/r35 used the bare `ncu` and got the ERR_NVGPUCTRPERM/Unknown-Error
+inject failure). Model qwen2.5-7b q4_k_m, nt=3325 prefill; matched llama
+`mul_mat_q` at nt=512 (llama-bench -p 512).
+
+**The measurement.** Per-IMMA shared-memory wavefronts and instruction counts
+(`smsp__sass_l1tex_data_pipe_lsu_wavefronts_mem_shared_op_*` + tensor/ldsm op
+counters, launch 1 of each kernel):
+
+| metric (per IMMA) | minfer bt | llama mul_mat_q | minfer/llama |
+|---|---:|---:|---:|
+| LDSM wavefronts | 2.000 | 0.500 | **4.00×** |
+| plain-LDS wavefronts | 3.500 | 2.163 | 1.62× |
+| ST wavefronts | 0.656 | 0.844 | 0.78× |
+| **total shared wavefronts** | **6.156** | **3.507** | **1.76×** |
+| LDSM instructions | 0.500 | 0.125 | 4.00× |
+| plain-LDS instructions | 0.750 | 1.349 | 0.56× |
+| per-instr wf (LDSM) | 4.000 | 4.000 | — |
+| per-instr wf (LDS) | 4.667 | 1.603 | — |
+
+**The wavefront asymmetry is real but is NOT the binding resource.** minfer does
+move far more MIO work per IMMA — total 6.156 vs 3.507 (1.76×), and the LDSM
+share is exactly 4× (2.000 vs 0.500). That part of H1 is measured true. But the
+causal claim ("the MIO wavefront count is the scarce resource in an IMMA-bound
+loop") fails on the throughput side:
+
+| metric | minfer bt | llama | ratio |
+|---|---:|---:|---:|
+| IMMA performed /s | 6.33 G/s | 6.02 G/s | 1.05× |
+| shared wavefronts /s | 39.0 G/s | 21.1 G/s | 1.85× |
+| avg warps /SM | 15.5 | 7.5 | 2.06× |
+| issue_active /cycle/sched | 0.457 | 0.365 | 1.25× |
+
+minfer performs **1.85× the shared-memory wavefronts per second** yet lands at
+**the same (slightly better) tensor throughput per IMMA**. If the MIO pipe were
+the scarce resource, the SM's fixed per-SM shared pipe would cap both kernels at
+the same wavefronts/s — minfer could not exceed llama's 21 G-wf/s while hitting
+6.3 G-IMMA/s. It does (39 G-wf/s). So the MIO pipe has ~1.85× headroom in the bt
+kernel and is **not** what gates the IMMA throughput. The loop is tensor/IMMA
+bound, exactly as r35 concluded; the extra LDSM wavefronts sit in the tensor
+shadow and are free.
+
+**Why the H1 fix cannot help (logically, independent of wiring).** LDSM.m8n8.x4
+loads 4 8×8-tiles = 512 B and measures at **4.0 wavefronts** (wavefronts/inst =
+20,873,216/5,218,304 = 4.000, exactly bytes/128). A conflict-free plain LDS of
+the same payload also moves 512 B = 4 wavefronts. Swapping the access method
+moves the same bytes → **the same wavefronts**; it is wavefront-neutral unless
+the geometry (A bytes per IMMA) changes. H1's premise compares one LDSM.x4 (4
+tiles, 4 wf) against one plain LDS of a *single* 8×8 tile (1 wf) — an
+apples-to-oranges comparison; llama's own plain-LDS average 1.60 wf/inst (they
+are NOT single-wavefront either — they are the B-frag/scale loads). The real
+source of llama's lower wavefronts/IMMA is **A-fragment reuse**: llama loads its
+8 A-frags once per 32-k chunk and reuses them across the 64 mma (0.125
+LDSM/IMMA), while minfer loads 4 A-frags per chunk and reuses each across 2 mma
+(0.500 LDSM/IMMA) — a 4× reuse difference born of warp tiling (llama iterates
+the od dimension inside the kernel; minfer's warp owns one 16-od strip). That is
+a loop/tiling restructure, not an LDSM→LDS swap.
+
+**Verdict — H1 REFUTED, H2 endpoint reached.** The wavefront asymmetry is
+measured and real (1.76×/4×), but it is not the scarce resource: minfer runs
+1.85× the shared wavefronts/s and still matches llama's per-IMMA tensor
+throughput, so the MIO pipe is not gating. H2's issue-efficiency claim is
+likewise not a deficit: minfer's issue_active/cycle/sched (0.457) is *above*
+llama's (0.365), and its per-IMMA is 1.05×. **The bt mma kernel is at per-IMMA
+parity with llama** on the tensor pipe; the remaining prefill gap (vs llama) is
+not in a structurally addressable mma-kernel lever — it lives in the per-tile
+prologue/wave amortization and the MMQ non-mma path (quantize prepass, fixup) —
+so no A-side implementation is warranted. Recorded:
+docs/LLAMA-CPP-MMQ-ANALYSIS.md §11.16. **No code change** (HEAD stays 6112db3);
+this closes the two-named-hypothesis probe at the endpoint.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
