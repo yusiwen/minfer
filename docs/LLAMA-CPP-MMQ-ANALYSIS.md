@@ -1336,3 +1336,27 @@ not the prefill wall.
 
 Matches the fresh nsys re-bucket (r47_gpu_trace.csv) and the matched-nt 511
 pair (r47_bt511_trace.csv). Recorded: docs/CUDA_OPTIMIZATION.md P6 r47.
+
+### 11.27 Follow-up (r48, 2026-09-06): FAP2 register-resident softmax — LANDED, the FA 5.72× residual is closed
+
+r47 named FAP2 (register-resident softmax) the #1 addressable residual (FA =
+125.8 ms = 10.2% of wall, 5.72× vs llama, not smaller/overlapped). r48 implements
+it: `fa_prefill_f16kv` (src/cuda_kernels.cu) now keeps S and P entirely in wmma
+accumulator/`matrix_a` fragments — no Sf/Pf shared round trip, no m/l/alpha shared
+arrays. Warp-per-row becomes a full-row warp-tile (4 warps x 16 rows, 128 threads,
+each warp owns 16 query rows x all FA_TKV=32 KV), so the online softmax and the
+P·V contraction (P built in place as the f16 A-operand) are both warp-local.
+
+**Result: FA kernel Duration 5.16 → 2.12 ms (2.43×); whole-prefill interleaved
+3× 2603.5 → 2749.9 tok/s (+5.6%); suite 166/0/3; greedy-32 byte-identical.**
+This is the first closed >2× vs-llama structural residual. The key FA numerics
+gotchas (r48 unit-validated standalone before integration): the m16n16k16 f32
+accumulator and the f16 `matrix_a` row_major share the SAME lane→(row,col) map
+(element-wise f32→f16 conversion); **QK^T K is col_major and P@V V is row_major**
+(the two B operands differ in major-ness — using one for both corrupts both, the
+FA parity test's max err went 1e-4 → 0.54 until K was re-set to col_major).
+
+The r47 gap table's FA row (5.72×, 10.2% wall) is now ~4.7% and no longer the
+largest addressable residual — that role passes to the **A-quantize prepass** (the
+r47 fallback: shared-A redundancy in the builder, ~9.6% wall, 2.52× vs llama).
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r48.

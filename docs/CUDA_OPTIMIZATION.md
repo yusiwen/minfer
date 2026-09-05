@@ -2647,6 +2647,75 @@ and is the largest single lever available. The A-quantize dedup is the
 higher-confidence-but-smaller fallback and pairs well after FAP2; q4_K
 dilution should be shelved for the prefill wall.
 
+### P6 r48 (FAP2): register-resident softmax in fa_prefill_f16kv — LANDED (2.43× kernel, +5.6% whole-prefill, 2026-09-06)
+
+The r47 recommendation (FAP2 = register-resident softmax) is implemented and
+LANDED. **FA kernel Duration 5.16 → 2.12 ms (2.43×, below the 2.6 ms target);
+whole-prefill interleaved 3× baseline median 2603.5 → 2749.9 tok/s = +5.6%**
+(the +1.5% bar clears with margin; ~−64 ms = the r47 predicted −5% wall). This
+closes the r46 open caveat definitively: the S/P smem round trip was the FA
+residual, and removing it is a real, wall-relevant win (it was not
+smaller/overlapped).
+
+**Change (src/cuda_kernels.cu, `fa_prefill_f16kv`):** S and P no longer go
+through shared memory. The decomposition changes from the r45 8-warp col-split
+(16 rows × 32 KV per warp, S/P round-tripped through 64×64 f32/f16 smem) to a
+**4-warp (128 thr) full-row warp-tile: warp wm owns a 16-query-row block × all
+FA_TKV=32 KV columns.** QK^T wmma m16n16k16 writes S to the **accumulator
+fragments** (registers); the online softmax runs **on the fragments** (per-row
+max/sum via `__shfl_xor` over the 4-lane row group, `m/l/alpha` register-resident
+per lane); P is **built into the P@V `matrix_a` fragment in place** (f32→f16;
+the m16n16k16 f32 accumulator and the f16 `matrix_a` row_major share the SAME
+lane→(row,col) layout, so `pa.x[i] == fc.x[i]` element-wise — unit-validated);
+P·V runs wmma with **V as row_major B** (QK^T keeps K as col_major B — the two
+operands have opposite major-ness, which is the r46-era trap). Removes **1 of 4
+`__syncthreads`/tile**, the S/P bank conflicts, the 36% MIO/shared-scoreboard
+stall, and the Sf/Pf smem (69.38 → 34.82 KB; **1 → 2 blocks/SM**). `m/l/alpha`
+shared arrays gone (register-resident). The launcher's `3*FA_TQ` K/V smem bug
+(fixed in r46) is now simply `(FA_TQ + 2*FA_TKV)*(hd+8)*2`; threads 256 → 128.
+
+**Unit validation (standalone `.cu`, 0 mismatches, BEFORE integration):** (a) the
+m16n16k16 accumulator **== matrix_a row_major** lane→(row,col) map (lane t holds
+rows t>>2 & t>>2+8, cols 2*(t&3)+{0,1,+8,+9}) — the earlier "row=t>>2" assumption
+was right but confirmed empirically; (b) fragment-resident softmax == smem
+softmax reference on random S incl. -INF masking lanes (round-trips the causal +
+kv_end mask); (c) P@V via register A-fragments == the smem load path, and the
+**QK^T K (col_major) vs P@V V (row_major) operand distinction** was the trap the
+FAP2 rewrite hit first (both look "the B operand"; using row_major for both
+corrupts BOTH — the FA parity test's max err went 1e-4 → 0.54 until K was re-set
+to col_major).
+
+**Gates.** Build clean (124 regs / 0 spill; `fa_stage_kv_async` thread stride
+parameterized — the 256→128-thread change would otherwise leave half the K/V
+tile unstaged, which broke parity at 0.54 until fixed). `cuda_fa_prefill_attention_parity`
+1/0; `cuda_prefill` 7/0; `cuda_prefill_mmq_parity` 1/0; greedy-32 **byte-identical**
+vs the pre-change binary; suite **166/0/3**.
+
+**ncu (`--set full`, launch 1):** Duration **2.12 ms** (vs 5.16), Compute (SM)
+36.3%, Memory 47.7%, **top stall now L1TEX long-scoreboard (global K/V loads)
+34.3%** — the MIO/shared-scoreboard is GONE (shared excessive wavefronts 44% →
+21%). **Occupancy 16.29%** (34.82 KB smem → Block Limit Shared Mem = 2, i.e.
+still smem-bound at 2 blocks/SM; 124 regs → Block Limit Registers = 4). FA is now
+~4.7% of the wall (was 10.2%).
+
+**Verdict — LANDED.** The whol-prefill +5.6% is above the +1.5% bar and FA is the
+first CAMPAIGN-level removal of a structural >2× vs-llama residual; it is no
+longer the #1 addressable gap. The remaining wall is **FA now ~4.7% but the
+A-quantize prepass grew to ~9.6%** (2.52× vs llama) — the r47 fallback
+(quantize-prepass shared-A dedup, `src/models/qwen2/graph.rs:121-123,216-217`)
+is now the largest remaining addressable vs-llama gap. Follow-up levers, in
+order: (1) A-quantize shared-A dedup (−30 to −50 ms est, MEDIUM confidence); (2)
+FA occupancy — the kernel is still smem-bound at 2 blocks/SM with a 21% shared
+wavefront excess (the K/V ldmatrix pacing); a FA_TKV=16 trial (26 KB smem, 3
+blocks/SM) is a candidate but the current 2.43× already cleared the target; (3)
+q6_K line is closed (r42-45 all wall-neutral).
+
+Artifacts: `/tmp/fap2_valid/` (standalone validators + the validated register
+kernel), `/tmp/minfer_pre_fap2` (pre-change baseline, md5 4eb7d478…),
+`/tmp/fa_p1.ncu-rep` (r45 baseline FA=5.16 ms), `/tmp/fap2_ncu.ncu-rep` (r48
+FA=2.12 ms), `/tmp/g32_new.txt`/`g32_base.txt` (greedy-32, byte-identical),
+`/tmp/perf_fap2_ab.sh` (interleaved A/B).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
