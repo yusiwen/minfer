@@ -3982,3 +3982,64 @@ ncu_r59_{before,after,ffn_before,ffn_after}.csv,r59_ncu_parse.py,
 r59_nsys.sh,r59_nsys_base_summary.log,r59_base*/r59_new*.{nsys-rep,
 cuda_gpu_trace.csv,run.log},r59_census.py,r59_ffn_class.py,r59_suite.log}`.
 Code commit: feb37de. Docs commit: this round.
+
+### P6 r59b: clean-machine re-measure + r59 baseline-poisoning correction (measurement-only session, no code change) (2026-09-06)
+
+Goal: the definitive clean-machine number for r59-landed HEAD. Outcome: the
+number, plus a correction — **the r59 session's −12% "co-tenant tax" was a
+misattribution; its baseline binary was itself ~−12.5% deficient**, which
+inflated the recorded +26.2% interleaved delta to a true clean **+11.1%**.
+
+**1. Window validation (sglang resident but idle = clean-equivalent).**
+`sglang::scheduler` (46.3 GB) + a ComfyUI instance were resident all session;
+quiet-window check: 0% GPU util ×15 samples, 10 W floor (pmon log: sm% 0–3
+outside our own runs). Same-window references: llama-bench `-p 3314 -n 0 -r 3
+-t 8` = **3323.29 ± 3.08** (ca3d5a3e1, the documented baseline build) vs the
+clean-machine 3324.42 @pp3325 — 0.03% apart; and `/tmp/minfer_pre_r58` (the
+3219.6-record binary) re-measured **3217.0** interleaved. Two independent
+clean anchors match their records ⇒ idle co-tenant residency taxes nothing.
+(Caveat: whether sglang was actively SERVING during the r59 session can no
+longer be reconstructed — but the poisoning finding below explains the r59
+numbers fully on its own.)
+
+**2. Binary-drift test (the smoking gun).** Interleaved 5×,
+`/tmp/minfer_pre_r58` vs `/tmp/minfer_pre_r59` (same baseline code,
+`2105b08` ≡ `d09280a` — docs-only diff): **3217.0 vs 2824.7 = −12.2%**.
+`pre_r59` has never read above ~2843 in any window; `pre_r58` never below
+~3190. The r59 "baseline" binary did NOT behave like its code. Fresh
+`d09280a` worktree rebuild (nix devShell, CUDA 13.0, 1m03s): **3232.0**
+(3203.6–3238.8) — healthy. Most likely mechanism: the r59 session snapshotted
+the last on-disk binary as its baseline, and that binary was the **r58-delta
+build** (cp.async-db2 transplant) not yet re-built after the revert — the
+deficit (−12.5%) matches the r58 A/B delta (−12.6%) almost exactly.
+
+**3. Definitive clean numbers (interleaved 5×, full gate set, nt=3314).**
+Fresh HEAD rebuild (cargo clean; reproduces the landed 18:53 binary's perf):
+**3590.8 median** (3553.8–3591.2) vs fresh-d09280a **3232.0** = **+11.1%** —
+the true clean r59 delta (vs the r58-era clean record 3219.6: +11.5%).
+Landed 18:53 binary in series 1: 3574.7 median (3565.6–3591.5). All 10 HEAD
+runs 3553.8–3591.5, combined median **3580.7** ⇒ headline **~3581 tok/s**.
+
+**4. vs-llama (same window).** 3590.8 / 3323.29 = **minfer 1.080×** llama-bench
+pp3314 (gap factor llama/minfer = 0.926 in the docs' inverted convention).
+Campaign trajectory: 2.15× behind (r37) → 1.05× behind (r52, 3181 vs 3324.4)
+→ **~8% ahead** (r59 landed, clean machine).
+
+**5. Memory two-mode sanity (per-PID census, constant co-tenant set).**
+Peak device dsc_on **57189** MB vs Q4K_DSC=0 **55735** MB = **+1454 MB**
+(reproduces r59's +1456 MB within sampling granularity; minfer-only ≈ 9482 /
+8028 MB by subtracting the co-tenant set 46295+1242+170 MB).
+
+**Verdict — r59 stands, corrected:** the W_dsc plane is a real **+11.1%**
+clean whole-prefill win (bar +1.5% cleared ~7×), q4_K bt kernel busy −30.9%
+kernel-time attribution unchanged; the +26.2% and the "co-tenant taxes wall
+~12%" claims in the r59 record are superseded by this note. Future protocol
+rule: **any A/B baseline must be behaviorally anchored in the same window**
+(re-measure a known-record binary, or `git worktree`-rebuild the baseline
+commit) before trusting deltas.
+
+Artifacts: `/tmp/minfer_phase7/{r59b_pmon.log,perf_r59b_ab.log,
+perf_r59b_drift.log,perf_r59b_fresh_ab.log,r59b_memcensus.sh,
+r59b_build_head.log,r59b_build_d09280a.log,minfer_head_1853_snapshot,
+minfer_d09280a_binary}`. Binaries: fresh HEAD md5 1f6f9019…, fresh d09280a
+md5 d922861f…, landed 18:53 HEAD md5 97fea5a1… (snapshot).
