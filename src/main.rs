@@ -86,9 +86,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} download ollama <model>[:tag]");
     eprintln!("  {prog} download <hf|ollama>:<name>[:variant]");
     eprintln!("  {prog} list");
-    eprintln!(
-        "  {prog} viz [--port N] <model.gguf>   # self-contained viz server (default port 8081)"
-    );
+    eprintln!("  {prog} viz [--port N] <model>   # self-contained viz server (default port 8081)");
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
@@ -163,8 +161,7 @@ fn main() {
     let mut server_port: u16 = 8080;
     let mut server_n_ctx: usize = params.n_ctx;
     let mut server_n_slots: usize = 1;
-    // Self-contained viz server: `minfer viz [--port N] <model.gguf>` (and the
-    // legacy alias `--viz [port] <model.gguf>`).
+    // Self-contained viz server: `minfer viz [--port N] <model>`.
     let mut viz_mode = false;
     let mut viz_port: u16 = 8081;
     let mut port_provided = false;
@@ -195,20 +192,6 @@ fn main() {
             "--server" => {
                 server_mode = true;
                 i += 1;
-            }
-            "--viz" => {
-                // Optional port value: `--viz 8081` (bare `--viz` → 8081).
-                viz_mode = true;
-                if let Some(v) = raw_args.get(i + 1) {
-                    if let Ok(p) = v.parse::<u16>() {
-                        viz_port = p;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
             }
             "--port" => {
                 if let Some(v) = next_val(a) {
@@ -482,10 +465,10 @@ fn main() {
             return;
         }
         "viz" => {
-            // `minfer viz [--port N] <model.gguf>` — model still specified at
+            // `minfer viz [--port N] <model>` — model still specified at
             // startup, so the rest of main runs the normal load + run_viz path.
             if positional.len() < 2 {
-                eprintln!("Usage: {prog} viz [--port N] <model.gguf>");
+                eprintln!("Usage: {prog} viz [--port N] <model>");
                 std::process::exit(1);
             }
             viz_mode = true;
@@ -537,8 +520,8 @@ fn main() {
     let prompt = if positional.len() > 1 {
         positional[1..].join(" ")
     } else if conv_mode || server_mode || viz_mode {
-        // --server / --viz / --cnv take no positional prompt and never consume
-        // stdin for it. (Bare `minfer viz model.gguf` would otherwise hang on
+        // --server / viz / --cnv take no positional prompt and never consume
+        // stdin for it. (Bare `minfer viz model` would otherwise hang on
         // read_line until you press Enter — the model+grep host already shows
         // startup, so don't block on a prompt these modes don't use.)
         String::new()
@@ -656,7 +639,7 @@ fn main() {
         return;
     }
 
-    // === Self-contained viz server (viz subcommand, or the --viz alias) ===
+    // === Self-contained viz server (viz subcommand) ===
     if viz_mode {
         eprintln!(
             "Starting viz server (model={}, n_ctx={}, slots={})",

@@ -144,7 +144,7 @@ impl BackendScheduler {
             }
         }
         let mut prev_backend: Option<BackendTag> = None;
-        // P2 trace (MINFER_TRACE) + P3 live (--viz): read back every node's
+        // P2 trace (MINFER_TRACE) + P3 live (viz): read back every node's
         // output (stats + downsampled sample). Checked once per execute() call;
         // one step per execute() (prefill = 1 step, each decode forward = 1).
         // Capture happens AFTER each node executes (this step's data):
@@ -188,7 +188,7 @@ impl BackendScheduler {
                 }
             }
             // CUDA Graph replay (Phase 7d): a captured split replays its whole
-            // node loop as one launch. Disabled under MINFER_TRACE/--viz
+            // node loop as one launch. Disabled under MINFER_TRACE/viz
             // capture (per-node host readbacks inside a capture window are
             // illegal — they would corrupt the recorded graph).
             #[cfg(feature = "cuda")]
