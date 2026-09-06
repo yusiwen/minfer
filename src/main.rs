@@ -86,6 +86,9 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} download ollama <model>[:tag]");
     eprintln!("  {prog} download <hf|ollama>:<name>[:variant]");
     eprintln!("  {prog} list");
+    eprintln!(
+        "  {prog} viz [--port N] <model.gguf>   # self-contained viz server (default port 8081)"
+    );
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
@@ -117,8 +120,6 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --server             run as an OpenAI-compatible HTTP server");
     eprintln!("  --port <N>           server port (default 8080)");
-    eprintln!("  viz [--port N] <model>  self-contained viz server (web page + live SSE,");
-    eprintln!("                       default port 8081; legacy alias: --viz [port] <model>)");
     eprintln!(
         "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
     );
