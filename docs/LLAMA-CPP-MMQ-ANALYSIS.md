@@ -1520,3 +1520,27 @@ line is at ~1.1× vs llama kernel-side. The q6_K line is CLOSED; the
 campaign's remaining gap lives in the q4_K GEMM structure (~63% of the
 window at 1.06×) and the producer/FA lines.
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r53.
+
+#### §11.33 P6 r54 — `MINFER_MMQ_Q6K_EXP`: the W_exp plane becomes opt-out
+
+§11.32 left the r53 bundle unconditional: `MINFER_MMQ_Q6K_NB=1` implied the
+1.52 GB W_exp build. r54 decouples them with `MINFER_MMQ_Q6K_EXP` (default
+on; explicit "0" skips the plane at registration) — the `<KDR, EXP=false>`
+r41 in-kernel-expand instantiation that was already compiled in becomes
+user-selectable, i.e. the fallback is now a *mode*. Measured: EXP=0 =
+−5.04% whole-prefill (interleaved medians 3181.0 → 3020.7 tok/s) for
+exactly the W_exp bytes back (7636 → 6182 MiB per-process GPU memory,
+Δ 1454 MiB ≈ the 1,521,237,632 B census); default mode byte-identical to
+r53 (greedy-32 identical to the landed record; parity ×3 under BOTH modes;
+liveness census 27× `W_exp-cp.async` vs 27× `exp=off`, 0 accidental).
+
+Transferable note (extends §11.32's lesson 1): when a fallback becomes a
+*user-selectable mode*, the launch-path label must distinguish the
+intentional case from the accidental one — the `MINFER_MMQ_RAW_NB_DEBUG`
+B-path token gained `in-kernel-expand(exp=off)` (chosen) vs
+`in-kernel-expand(fallback!)` (expected-but-missing: alloc/upload failure
+or a registration bug), with raw 210-B weights (never exp-eligible) staying
+unqualified. Parity and greedy cannot see the difference; only the
+launch-path label can.
+
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r54.

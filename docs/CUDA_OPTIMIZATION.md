@@ -3202,6 +3202,74 @@ Artifacts: `/tmp/minfer_pre_r53` (pre-change baseline, md5 bbe78c11…),
 (window decomposition), `r53_suite.log`, `q6k_wexp_memory.py` (GGUF header
 census), `r53_sanity{1,2}.{txt,err}` (B-path live-proof runs).
 
+### P6 r54: `MINFER_MMQ_Q6K_EXP` — the 1.52 GB W_exp plane becomes opt-out, decoupled from the Q6K_NB kernel gate — LANDED (default byte-identical; EXP=0 = documented ~−5% for ~1.5 GB back) (2026-09-06)
+
+r53 shipped the pre-expanded-B W_exp plane unconditionally under
+`MINFER_MMQ_Q6K_NB=1` (~1.52 GB device-side). This round adds the
+independent **`MINFER_MMQ_Q6K_EXP`** switch (user-approved): unset/"1"
+(default) = r53 behavior; explicit **"0"** = `register_weight_q6k_padded`
+early-returns before the sibling build (device memory back at the pre-r53
+level) → dispatch map-miss → the `<KDR, EXP=false>` r41 in-kernel-expand
+instantiation (byte-identical, parity-proven baseline compiled in since
+r53). ANDed with `MINFER_MMQ_Q6K_NB=1` (EXP only matters when the NB kernel
+is live); parsed in the same inline `std::env::var(...).as_deref()` style
+as the other gates, default-on (`!= Ok("0")`). CUDA-only: 1 file
+(`src/cuda.rs`, +37/−14 — doc comments, the registration gate, the debug
+print); `cuda_kernels.cu` untouched (the EXP=false instantiation already
+existed).
+
+**Liveness visibility (the r53 lesson applied).** The
+`MINFER_MMQ_RAW_NB_DEBUG` B-path label is now three-way so an INTENTIONAL
+fallback is distinguishable from an ACCIDENTAL one: `B=W_exp-cp.async` |
+`B=in-kernel-expand(exp=off)` (Q6K_EXP=0) | `B=in-kernel-expand(fallback!)`
+(a W_exp build was EXPECTED — padded weight, EXP gate on, `id % 256 == 0` —
+but the map missed: alloc/upload failure or a registration bug); raw 210-B
+weights (never exp-eligible) stay unqualified `B=in-kernel-expand`. No new
+eprintln in normal runs.
+
+**Gates (all green).**
+1. Build clean (incremental; the .cu fatbin unchanged).
+2. Parity ×3 under BOTH modes (full gates + A_FUSE=2, separate cargo
+   invocations): (a) `MINFER_MMQ_Q6K_EXP=0` → `cuda_prefill_mmq` **1/0** ×3
+   (the r41 path end-to-end); (b) default → `cuda_prefill_mmq` **1/0** +
+   `cuda_prefill` **7/0** + `cuda_fa_prefill_attention_parity` **1/0** ×3.
+3. Greedy-32 (`-n 32 --greedy --seed 42`, prompt2k, full gates + A_FUSE=2):
+   **TOKEN STREAM IDENTICAL (178 chars)** exp1 vs exp0 — both are
+   bit-identical math — AND exp1 vs the r53 landed record: default mode
+   provably unchanged.
+4. Liveness (RAW_NB_DEBUG census, one prompt2k run per mode): default
+   **27× W_exp-cp.async, 0 fallback!**; EXP=0 **27× exp=off, 0
+   W_exp-cp.async**.
+5. Perf interleaved 3× (single pair each): exp1 3186.8/3181.0/3172.9
+   (median **3181.0** ≈ r53's 3176.9, unchanged); exp0 3035.0/3018.9/3020.7
+   (median **3020.7**) = **−5.04%** — the documented memory-for-speed trade,
+   confirmed.
+6. **Memory measured, not assumed** (per-process GPU memory via
+   `nvidia-smi --query-compute-apps` max during load+prefill — GB10 reports
+   `[N/A]` on the `--query-gpu=memory.used` aggregate, the process table is
+   the working surface): exp1 **7636 MiB** vs exp0 **6182 MiB** =
+   **Δ 1454 MiB ≈ 1.52 GB**, matching the r53 GGUF census W_exp =
+   1,521,237,632 B = 1450.8 MiB (+3 MiB = polling granularity).
+7. Suite **167 passed / 0 failed / 3 ignored** (default mode). First
+   attempt showed 165/2 (`cuda_q5_matmul_parity`,
+   `cuda_graph_recaptures_on_pool_gen_change`) under a 46 GB co-tenant
+   sglang scheduler; both pass `--exact` in isolation and the full-suite
+   rerun is green — co-tenant flake, unrelated to this change (neither
+   test touches q6_K/W_exp).
+
+**Verdict — LANDED.** The switch does exactly what it documents: default
+mode is byte-identical to r53 (same launches, same perf, same memory);
+`MINFER_MMQ_Q6K_EXP=0` trades **−5.04% whole-prefill for 1.52 GB of device
+memory** via the proven r41 EXP=false path. The `fallback!` label keeps the
+r53 liveness lesson honest: parity/greedy cannot distinguish an intentional
+fallback from an accidental one — only the launch-path label can.
+
+Artifacts: `/tmp/minfer_phase7/{parity_r54.sh,g32_r54.sh,liveness_r54.sh,
+perf_r54.sh,mem_r54.sh,gates_r54.sh}` (+ `parity_r54_{a,b}_run{1,2,3}.log`,
+`liveness_r54_{exp1,exp0}.log`, `g32_r54_{exp1,exp0}.txt`, `perf_r54.log`,
+`mem_r54_{exp1,exp0}.poll`, `r54_suite2.log`, `r54_suite3.log`,
+`r54_fail_{q5,recap}.log` isolated-rerun proofs).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
