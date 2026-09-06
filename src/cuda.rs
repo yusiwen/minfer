@@ -931,6 +931,18 @@ pub struct CudaState {
     /// R1: device compute capability ×100 (e.g. 1210 = sm_12.1), read once at
     /// init. Gates the int8-mma MMQ prefill path (needs sm_80+ — mma.m16n8k32).
     cc: std::sync::atomic::AtomicI32,
+    /// r60: true while every quantized weight registered on this device is
+    /// NB-BT-consumable (q4_K / q6_K) — the r52 mode-2 (skip-write fused
+    /// producer) window proof assumes the fused pad40_t plane is consumed
+    /// ONLY by the raw NB-BT GEMM paths. On any other quant mix (Q4_0/Q5_K/
+    /// Q8_0/... or a 2-D F32 matmul weight) a fused rms_norm/swiglu output
+    /// can feed a generic mmq_nt consumer whose native re-quantize would
+    /// read the skipped f32 — deterministic loud refusal (or silent F32
+    /// garbage). The loaders clear this at registration; `mmq_a_fuse_mode`
+    /// degrades mode 2 -> 1 (r51 fused semantics, writes the f32) when it
+    /// is false. All-q4_K/q6_K models (7B q4_k_m: embed q4_K + output q6_K)
+    /// keep mode 2 unchanged.
+    nb_bt_only: std::sync::atomic::AtomicBool,
     /// Names registered through `register_weight_q6k_padded` (device layout
     /// is 224-byte-padded Q6_K, not the raw GGUF byte stream) → the
     /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
@@ -938,8 +950,9 @@ pub struct CudaState {
     padded_weights: Mutex<HashMap<String, usize>>,
     /// r53: pre-expanded q6_K B planes (dense centered-int8, `od * id` bytes,
     /// row stride = id, super-block stride = 256) built at padded registration
-    /// under `MINFER_MMQ_Q6K_NB=1` AND `MINFER_MMQ_Q6K_EXP != "0"` (r54:
-    /// explicit "0" skips the ~1.5 GB plane build entirely), keyed by the
+    /// under `MINFER_MMQ_Q6K_NB` (r60: default-on) AND `MINFER_MMQ_Q6K_EXP
+    /// != "0"` (r54: explicit "0" skips the ~1.5 GB plane build entirely),
+    /// keyed by the
     /// PADDED weight's device pointer. `prefill_mmq` looks the plane up by
     /// `wptr` and passes it to the NB-BT q6_K launcher; a miss (gate off at
     /// load, allocation failure, raw 210-B layout) keeps the r41 in-kernel
@@ -1270,6 +1283,7 @@ impl CudaState {
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
+            nb_bt_only: std::sync::atomic::AtomicBool::new(true),
             padded_weights: Mutex::new(HashMap::new()),
             q6k_exp: Mutex::new(HashMap::new()),
             q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
@@ -1430,8 +1444,9 @@ impl CudaState {
         // build entirely (registration early-returns; device memory stays at
         // the pre-r53 level) so dispatch map-misses into the EXP=false r41
         // in-kernel expand. ANDed with Q6K_NB: EXP only matters when the NB
-        // kernel is live.
-        if std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1")
+        // kernel is live (r60: Q6K_NB is default-on — "0" opts out of the
+        // kernel AND both planes).
+        if Self::mmq_gate_on("MINFER_MMQ_Q6K_NB")
             && std::env::var("MINFER_MMQ_Q6K_EXP").as_deref() != Ok("0")
             && id % 256 == 0
         {
@@ -1448,9 +1463,10 @@ impl CudaState {
 
     /// r53: build + upload the dense pre-expanded B plane for one padded q6_K
     /// tensor and map it from the padded weight's device pointer. Called from
-    /// [`Self::register_weight_q6k_padded`] under the `MINFER_MMQ_Q6K_NB=1` +
-    /// `MINFER_MMQ_Q6K_EXP != "0"` (r54) + `id % 256 == 0` gate; also `pub`
-    /// for the gate-1 byte-exactness test. An alloc/upload failure leaves the
+    /// [`Self::register_weight_q6k_padded`] under the `MINFER_MMQ_Q6K_NB`
+    /// (r60: default-on) + `MINFER_MMQ_Q6K_EXP != "0"` (r54) +
+    /// `id % 256 == 0` gate; also `pub`
+    /// for the gate-on byte-exactness test. An alloc/upload failure leaves the
     /// map empty: the kernel falls back to the r41 in-kernel expand with a
     /// once-per-process loud eprintln.
     pub fn register_weight_q6k_exp(&self, name: &str, padded: &[u8], od: usize, id: usize) {
@@ -1656,7 +1672,7 @@ impl CudaState {
             }
         }
         // (3) MmqCache scratch pre-grow
-        if std::env::var("MINFER_MMQ").as_deref() == Ok("1") {
+        if Self::mmq_gate_on("MINFER_MMQ") {
             let max_nchunk = self.max_nchunk.load(std::sync::atomic::Ordering::Relaxed);
             if max_nchunk > 0 {
                 const NT_PREWARM: usize = 4096; // default n_ctx
@@ -2320,10 +2336,9 @@ impl CudaState {
         // weight type. R1 (2026-08-31): the int8 MMQ GEMM — activations
         // quantized to q8_0 once per call, raw weight bytes staged per tile,
         // mma.m16n8k32 (s8) with per-k-block scale rescale (llama.cpp's MMQ
-        // structure; see mmq_nt_kernel). OPT-IN via MINFER_MMQ=1: correct on
-        // all types/shapes (parity-tested) but currently slower than the f16
-        // path on GB10 (see mmq_enabled doc) — the default stays the 8p/8m
-        // f16 wmma path. MINFER_NO_PREFILL_GEMM=1 still forces the legacy
+        // structure; see mmq_nt_kernel). MINFER_MMQ-gated (r60 PROMOTION:
+        // default ON — the promoted 1.080x path; `MINFER_MMQ=0` = the f16
+        // wmma path). MINFER_NO_PREFILL_GEMM=1 still forces the legacy
         // per-type kernels. id % 32 == 0 covers the block math of every type
         // (q6_K runs as k32 chunks with dual 16-sub rescale inside).
         if nt >= 16
@@ -2471,15 +2486,37 @@ impl CudaState {
         }
     }
 
-    /// R1: `MINFER_MMQ=1` opts the prefill path INTO the int8 MMQ GEMM.
-    /// Default OFF (2026-08-31): the kernel is parity-verified on all 8
-    /// types but measures ~2.5-3 GMAC/s per matmul under GPU contention
-    /// vs ~8-11 for the f16 w16-cache path (7B @2K: ~155 vs ~630-880
-    /// tok/s) — needs a big-tile/ILP rework and a quiet GPU to tune
-    /// (llama.cpp's equivalent runs ~24 TMAC/s). All other A/B escapes
-    /// still work: `MINFER_NO_PREFILL_GEMM=1` (legacy per-type kernels).
+    /// r60: the promoted MMQ gate semantics — unset / any non-"0" value =
+    /// ON (the verified 1.080x path), explicit "0" = opt-out to the pre-r60
+    /// disabled/f16 behavior (the r54 `MINFER_MMQ_Q6K_EXP` pattern).
+    /// Single-sourced: every promoted MINFER_MMQ_* dispatch and
+    /// plane-registration read goes through this.
+    pub fn mmq_gate_on(name: &str) -> bool {
+        std::env::var(name).map_or(true, |v| v != "0")
+    }
+
+    /// r60: the loaders call this when they register a quantized weight that
+    /// is NOT NB-BT-consumable (not q4_K/q6_K), or a 2-D F32 matmul weight:
+    /// mode-2 skip-write fused producers become unsound for such mixes (see
+    /// `nb_bt_only`) and degrade to mode 1 for the rest of the process.
+    /// Registration happens before the first forward, so no per-node cost.
+    pub fn clear_mmq_nb_bt_only(&self) {
+        self.nb_bt_only
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// R1: `MINFER_MMQ` gates the prefill path INTO the int8 MMQ GEMM.
+    /// r60 PROMOTION (2026-09-06): default ON — the full r34-r59 MMQ stack
+    /// is parity-green and measures 3590.8 tok/s clean on 7B q4_K_m @3314
+    /// (1.080x vs-llama, docs/CUDA_OPTIMIZATION.md P6 r59b); `MINFER_MMQ=0`
+    /// opts out to the legacy f16 w16-cache prefill (~2353 tok/s), the
+    /// 2026-08-31 default from when the untuned kernel measured ~2.5-3
+    /// GMAC/s per matmul under GPU contention vs ~8-11 for the f16
+    /// w16-cache path (7B @2K: ~155 vs ~630-880 tok/s). All other A/B
+    /// escapes still work: `MINFER_NO_PREFILL_GEMM=1` (legacy per-type
+    /// kernels).
     fn mmq_enabled() -> bool {
-        std::env::var("MINFER_MMQ").map_or(false, |v| v == "1")
+        Self::mmq_gate_on("MINFER_MMQ")
     }
 
     /// R1: the int8 MMQ prefill GEMM is active — sm_80+ (mma.m16n8k32 s8;
@@ -2498,7 +2535,9 @@ impl CudaState {
 
     /// r51/r52: producer-fused A-quantize mode — 0 off, 1 = fused + f32
     /// output write (MINFER_MMQ_A_FUSE=1 semantics), 2 = fused + SKIP the f32
-    /// output write (MINFER_MMQ_A_FUSE=2). The base gate is the full r49 MMQ
+    /// output write (MINFER_MMQ_A_FUSE=2; r60: mode 2 is the DEFAULT when
+    /// unset — still degrading to mode 1 under any window-reader/fallback
+    /// condition; "0" = off). The base gate is the full r49 MMQ
     /// gate set (the fused plane is only CONSUMED by the raw NB-BT (q4_K) /
     /// q6_K NB transposed GEMM paths, all of which these gates enable; fusing
     /// with any of them off would write a plane the matmul re-quantizes
@@ -2518,27 +2557,41 @@ impl CudaState {
     /// and docs/CUDA_OPTIMIZATION.md P6 r52 for the full proof.
     pub fn mmq_a_fuse_mode(&self) -> u8 {
         if !(self.mmq_active()
-            && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1"))
+            && Self::mmq_gate_on("MINFER_MMQ_RAW")
+            && Self::mmq_gate_on("MINFER_MMQ_RAW_NB")
+            && Self::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
+            && Self::mmq_gate_on("MINFER_MMQ_Q6K_NB"))
         {
             return 0;
         }
-        match std::env::var("MINFER_MMQ_A_FUSE").as_deref() {
+        // r60 promotion: unset = mode 2 (the verified-best skip-write fused
+        // producers); "1"/"2" keep the r51/r52 override semantics; "0" (and
+        // any other unrecognized value, as before r60) = off.
+        let requested = match std::env::var("MINFER_MMQ_A_FUSE").as_deref() {
+            Err(std::env::VarError::NotPresent) => 2,
             Ok("1") => 1,
-            Ok("2")
-                if !Self::no_prefill_gemm()
-                    && std::env::var_os("MINFER_GRAPH_DUMP").is_none()
-                    && std::env::var_os("MINFER_DUMP_DIR").is_none()
-                    && !crate::trace::enabled()
-                    && !crate::live::enabled() =>
+            Ok("2") => 2,
+            _ => 0,
+        };
+        // r60: mode 2 additionally requires the NB-BT-only weight mix (see
+        // `nb_bt_only`) — a mixed-quant model degrades to mode 1 regardless
+        // of how mode 2 was requested (default or explicit "2").
+        let mode2_possible = requested == 2
+            && !Self::no_prefill_gemm()
+            && self.nb_bt_only.load(std::sync::atomic::Ordering::Relaxed);
+        match requested {
+            1 => 1,
+            2 if mode2_possible
+                && std::env::var_os("MINFER_GRAPH_DUMP").is_none()
+                && std::env::var_os("MINFER_DUMP_DIR").is_none()
+                && !crate::trace::enabled()
+                && !crate::live::enabled() =>
             {
                 2
             }
-            // A_FUSE=2 requested but a window-reader/fallback condition is
+            // Mode 2 requested but a window-reader/fallback condition is
             // active: keep the r51 fused semantics (write the f32 output).
-            Ok("2") => 1,
+            2 => 1,
             _ => 0,
         }
     }
@@ -2905,12 +2958,13 @@ impl CudaState {
         let stream = self.stream();
         // P6 r38: q6_K on a raw-byte BT-style kernel (expanded centered-int8 B,
         // m16n8k16 KSPLIT=2). Same A prepass as r34; the B path is q6_K-specific.
-        // Gated MINFER_MMQ_Q6K_NB=1 (paired with MINFER_MMQ=1, MINFER_MMQ_RAW=1;
-        // the q6k path always uses the transposed-A raster). On any cap/mismatch
-        // the launcher returns 0 -> clean fall through to the generic mmq_nt<7,2>.
+        // Gated on MINFER_MMQ_Q6K_NB + MINFER_MMQ_RAW (r60: default-on,
+        // "0" opts out; the q6k path always uses the transposed-A raster).
+        // On any cap/mismatch the launcher returns 0 -> clean fall through
+        // to the generic mmq_nt<7,2>.
         if type_id == 7
-            && std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
+            && Self::mmq_gate_on("MINFER_MMQ_Q6K_NB")
+            && Self::mmq_gate_on("MINFER_MMQ_RAW")
             && (id / 32) % 8 == 0
         {
             let nchunk = (id / 32) as i32;
@@ -3003,18 +3057,15 @@ impl CudaState {
         // P6: raw-byte staging variant (q4_K, whole super-blocks only).
         // Same quantized activations; the GEMM stages RAW weight bytes via
         // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
-        if type_id == 5
-            && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
-            && (id / 32) % 8 == 0
-        {
+        if type_id == 5 && Self::mmq_gate_on("MINFER_MMQ_RAW") && (id / 32) % 8 == 0 {
             let kd: i32 = std::env::var("MINFER_MMQ_RAW_KD")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8);
             let wide = std::env::var("MINFER_MMQ_RAW_WIDE").as_deref() == Ok("1");
-            let nb = std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1");
+            let nb = Self::mmq_gate_on("MINFER_MMQ_RAW_NB");
             let nb_debug = std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1");
-            let at = std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1");
+            let at = Self::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE");
             unsafe {
                 // P6 r34: relocate the A-side layout transform out of the mma
                 // kernel into a quantize-transpose prepass (llama.cpp's design).

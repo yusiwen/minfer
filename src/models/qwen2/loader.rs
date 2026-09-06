@@ -244,17 +244,23 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 );
             } else {
                 cuda.register_weight(&ti.name, tensor.data());
+                // r60: a non-NB-BT-consumable quantized weight (not q4_K/
+                // q6_K) makes mode-2 skip-write fused producers unsound —
+                // see CudaState::clear_mmq_nb_bt_only.
+                if !matches!(ttype, TensorType::Q4_K | TensorType::Q6_K) {
+                    cuda.clear_mmq_nb_bt_only();
+                }
                 // r59: registration-time W_dsc f32-pair plane for the NB-BT
                 // q4_K kernel (r56 q6_K scaffold). MINFER_MMQ_Q4K_DSC=0 opts
                 // out of the memory trade (od*id/4 B per tensor, ~1.4 GB on
                 // 7B q4_k_m); the plane's only consumer is the NB-BT kernel,
                 // so the gate mirrors its dispatch switches (RAW_NB +
-                // A_TRANSPOSE). Geometry gates (id % 256 == 0 like the
+                // A_TRANSPOSE; r60: both default-on). Geometry gates (id % 256 == 0 like the
                 // kernel's launch gate, od % 2 == 0 for the row-pair
                 // cp.async staging) skip the plane: the kernel keeps the
                 // in-kernel scalar decode via map miss.
-                if std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1")
-                    && std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1")
+                if crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
+                    && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
                     && std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() != Ok("0")
                     && tensor.shape[0] as usize % 256 == 0
                     && tensor.shape[1] as usize % 2 == 0
@@ -269,6 +275,12 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
             }
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
+            // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
+            // are 1-D) — its GEMM reads the f32 A directly, so a mode-2
+            // skip-write producer upstream would feed it a dead buffer.
+            if tensor.shape.len() == 2 {
+                cuda.clear_mmq_nb_bt_only();
+            }
         }
     }
 

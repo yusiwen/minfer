@@ -249,6 +249,11 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 | TensorType::Q6_K
                 | TensorType::Q8_0
         ) {
+            if ttype != TensorType::Q4_K && ttype != TensorType::Q6_K {
+                // r60: non-NB-BT-consumable quantized weight — mode-2
+                // skip-write producers unsound (see qwen2 loader twin).
+                cuda.clear_mmq_nb_bt_only();
+            }
             if ttype == TensorType::Q6_K {
                 // 7e②: register Q6_K in the padded 224-byte block layout so
                 // the matmul kernel can use aligned uint4 weight loads
@@ -265,6 +270,11 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
             }
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
+            // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
+            // are 1-D) — mode-2 skip-write producers unsound upstream.
+            if tensor.shape.len() == 2 {
+                cuda.clear_mmq_nb_bt_only();
+            }
         }
     }
 

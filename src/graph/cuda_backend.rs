@@ -500,7 +500,8 @@ impl CudaBackend {
                     return Err(format!("cuda: {}: swiglu input size mismatch", node.name));
                 }
                 // r51/r52: producer-fused A-quantize (MINFER_MMQ_A_FUSE + full
-                // MMQ gate set): in the prefill graph the swiglu output is
+                // MMQ gate set; r60: default-on, "0" opts out): in the prefill
+                // graph the swiglu output is
                 // EXCLUSIVELY the down projection's GEMM input, so compute
                 // the pad40_t plane in the same pass and register it in the
                 // MmqCache — prefill_mmq consumes it with no re-quantize.
