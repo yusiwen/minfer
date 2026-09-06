@@ -3058,6 +3058,150 @@ Artifacts: `/tmp/minfer_pre_r52` (pre-change baseline, md5 de4e30d7…),
 `*_cuda_gpu_trace.csv`, `r52_suite.log`, `valid_r52.cu` (validator source;
 builds but its binary SIGBUSes in this session env — see above).
 
+### P6 r53: q6_K bundle — pre-expanded-B dense W_exp (r44) + cp.async B staging (r45) — LANDED (+5.03% whole-prefill; the two wall-neutral mechanisms compose) (2026-09-06)
+
+r44 and r45 were each parity-green but individually WALL-NEUTRAL and were
+reverted: r44 (pre-expand the ql+qh recomb into a dense centered-int8 plane
+at registration) made the kernel −10.9% but only *transformed* the B
+global→smem latency (load→recomb-ALU into load→STS); r45 (cp.async the
+A-side staging) made it −10.2% but the wall did not move. This session
+landed them TOGETHER as one bundle: the B staging becomes a pure
+**cp.async bulk copy from the pre-expanded plane** — no recomb ALU, no
+register round-trip, no ql/qh reads, AND the copy latency handed to the
+async unit and hidden under compute. The A side stays r41 (r34 prepass
+planes + bulk LDG→STS); geometry unchanged (KDR=2 double-buffer, 3
+blocks/SM). Basket-campaign hypothesis: the two mechanisms overlap in
+traffic but not in mechanism (r44 removes WORK, r45 removes WAIT), so the
+kernel savings compose and finally reach the wall.
+
+**Change (3 files; CUDA-only).**
+- `src/cuda.rs`: `expand_q6k_dense` (host mirror of the device
+  `expand_q6_elem`, r44 dense-index formula, 2 output elements per (ql,qh)
+  byte pair); `register_weight_q6k_exp` builds + uploads the plane as a
+  geometry-encoded `{name}__exp{od}x{id}` sibling and inserts
+  `padded_wptr → exp_ptr` into a new `q6k_exp` map. The build ships with the
+  existing `MINFER_MMQ_Q6K_NB=1` gate (plus `id % 256 == 0`, the kernel's
+  own launch gate) — no new env var, the A/B baseline is the current binary;
+  gate off ⇒ zero memory cost. Alloc/upload failure ⇒ map miss ⇒ the r41
+  in-kernel expand, with a once-per-process loud eprintln.
+- `src/cuda_kernels.cu`: `mmq_raw_nb_bt_q6k_kernel` templated `<KDR, EXP>`
+  with a new `W_exp` param. EXP=true: the B-expand block is
+  `MMQ_NBJ × (KDR*32)/16` chunks (256 threads ⇒ 2 per thread per kt) issued
+  as EXPLICIT PTX `cp.async.cg.shared.global [dst],[src],16,full?16:0` via
+  the existing `gemm_cp16` (rows beyond `od` zero-fill through the src-size
+  qualifier), dense index `W_exp + j*id + sb*256 + cbase*32 + cc*16`
+  (16B-aligned: id is a multiple of 256 on this path — the r44 one-line
+  root cause was indexing W_exp with the padded-raw stride expression), one
+  `gemm_cp_commit()` per stage; the loop waits with r45's group-count
+  pipeline (`stage kt+1 → gemm_cp_wait1()` = group(kt) landed while
+  group(kt+1) flies; `gemm_cp_wait0()` on the last tile) plus one extra
+  `__syncthreads()` before compute for cross-thread visibility of the async
+  copy; the end-of-loop barrier (buffer WAR) is kept. EXP=false compiles
+  the cp.async branch away entirely — byte-identical r41 fallback.
+- `src/graph/cuda_backend.rs`: gate-1 test (below).
+
+**Memory cost (measured exactly, correcting the task's estimate).** The
+task estimated "~+15 MB total" treating one ffn_down's expansion delta as
+the whole-model cost. The real number: W_exp = `od × id` bytes per padded
+q6_K tensor, and the qwen2.5-7b **q4_k_m** quantizer puts q6_K on only HALF
+the layers — **14 attn_v** (1.84 MB each) + **14 ffn_down** (67.9 MB each)
+(GGUF header census; this also finally explains why every trace since r47
+counts **27** q6_K BT launches = 14 attn_v (grid 52,4) + 13 ffn_down (grid
+52,28, the last layer's down runs on the n_out tail via MMVQ)) + output
+.weight (545.0 MB, registered but only ever consumed by the tail MMVQ —
+a known over-allocation accepted for registration-time simplicity):
+**1,521,237,632 B ≈ 1.52 GB (1.42 GiB)** device-side, ~10% of the model's
+~15 GB. `MINFER_MMQ_Q6K_NB=0` skips every plane (the run still works via
+the EXP=false fallback; measured peak-RSS delta of the build path is only
+the transient ~68 MB host buffer).
+
+**Gates (all green).**
+1. **W_exp byte-exactness BEFORE integration**: new
+   `cuda_q6k_exp_dense_byte_exact` cargo test — an independent scalar
+   mirror written straight from the device `expand_q6_elem` formula vs BOTH
+   the host production expander AND the device plane read back through
+   `copy_from_device_pinned`, over 3 shapes (64×256, 40×512, 24×768,
+   deterministic xorshift bytes covering all ql/qh bit fields): **0
+   mismatches**. (The standalone-nvcc validator route was skipped per the
+   r52 SIGBUS caveat; the cargo-test route also validates the upload path,
+   which a standalone binary cannot.)
+2. Build clean; ptxas sm_121: `<2,false>` **80 regs / 4 B spill**
+   (r41-identical); `<2,true>` **80 regs**, 24 B stack (24 B spill stores /
+   32 B spill loads) — the 3-block budget HOLDS (80×256×3 = 61,440 <
+   65,536 regs/SM; smem unchanged 29,696 B × 3 = 89,088 < 102,400). SASS
+   (cuobjdump): `<2,true>` **LDGSTS ×12** (the explicit-PTX cp.async IS
+   emitted — the `__pipeline_memcpy_async` fallback trap avoided), STS 50→36,
+   LDG 88→60; `<2,false>` LDGSTS ×0.
+3. Parity ×3 (full gate set + A_FUSE=2, separate invocations):
+   `cuda_prefill_mmq` **1/0** (both the padded W_exp fixtures AND the raw
+   210-B fixtures — exercising EXP=true and EXP=false in one run),
+   `cuda_prefill` **7/0**, `cuda_fa_prefill_attention_parity` **1/0**.
+4. Greedy-32 (`-n 32 --greedy --seed 42`, prompt2k, full gates + A_FUSE=2):
+   **byte-identical** token streams vs the pre-change binary ("TOKEN STREAM
+   IDENTICAL (178 chars)") — B values are bit-identical by construction.
+5. **Perf interleaved 5× medians** (base `/tmp/minfer_pre_r53` re-measured
+   3010.5 standalone / 3024.7 interleaved; new 3176.9): **3024.7 → 3176.9
+   tok/s = +5.03%** (base 3024.7/3021.8/3037.0/3015.3/3026.2, new
+   3176.9/3178.6/3175.2/3180.0/3172.7 — distributions fully separated, base
+   max 3037.0 < new min 3172.7). Whole-prefill wall 1103.0 → 1043.5 ms =
+   −59.5 ms. Bar +1.5% cleared 3.4×.
+6. ncu (`--kernel-name regex:q6k`, SOL + WarpStateStats, full env):
+   ffn_down launch (grid 52,28): Duration **16.06 → 12.76 ms (−20.5%)**,
+   Elapsed Cycles **34.41M → 27.31M (−20.6%)** — r44's −10.9% + r45's
+   −10.2% compose almost exactly ADDITIVELY at the kernel level; L1/TEX
+   throughput 43.4 → 52.5% (the dense plane is a pure 128B-coalesced
+   stream). attn_v launch (52,4): **678.9 → 570.8 µs (−15.9%**, vs the
+   r45-era 0.592 ms matched-nt reference). Warp-Cycles/Issued-Inst rose
+   (10.65→11.78 / 11.05→15.17) and long_scoreboard share rose (base 3.6 cy
+   = 33.7% → new 4.6 cy = 38.7% ffn_down, 6.9 cy = 45.6% attn_v) — the same
+   denominator effect r44 documented: the kernel does less work in less
+   time, so the REMAINING stalls (A-side staging STS + dsc I2F consumer,
+   exactly the r43 attribution minus the B-recomb) are a larger fraction of
+   a smaller total.
+7. Suite: **167 passed / 0 failed / 3 ignored** (+1 = the new gate-1 test).
+
+**Live-path proof (new gate added by this session).** The first integrated
+build passed parity AND greedy-32 with ZERO fast-path launches: the map
+insert keyed the entry by the exp buffer's own pointer instead of the
+padded weight's, so every GEMM silently took the r41 fallback (a fallback
+is *correct* — all correctness gates stay green). The debug print was
+extended to name the B path (`MINFER_MMQ_RAW_NB_DEBUG=1` →
+"r53 B=W_exp-cp.async / in-kernel-expand") and counted **27 W_exp-cp.async,
+0 in-kernel-expand** after the one-line key fix. **Lesson: a
+fallback-correct optimization needs an "is the fast path actually live"
+check (a launch-path counter or debug print) in addition to the correctness
+gates — parity/greedy cannot see a silently-never-taken fast path.**
+
+**nsys cross-check (concurrent base+new profiles — contention inflates
+absolutes, deltas indicative):** prefill-window q6_K BT class **234.6 →
+148.8 ms (−36.6%)**; ffn_down avg 17.43 → 11.05 ms/launch; q4_K BT class
+(unchanged code) also moved under contention (700.5 → 621.4), so the clean
+−59.5 ms wall figure above is the authoritative record.
+
+**Verdict — LANDED.** The r44/r45 pair was the last proven-parity q6_K
+kernel lever, and the basket thesis is confirmed: individually
+wall-neutral, together +5.03%. Whole-prefill is now **3176.9 tok/s vs
+llama-bench 3325-eq 3324.4 tok/s = 1.05×** (the campaign opened at 2.15× in
+r37, 1.27× at r47, 1.09× at r52). Remaining vs-llama decomposition (r53
+state): q4_K GEMM ~63% of the window at 1.06× (parity, non-addressable
+without llama.cpp's q8_1 GEMM-prologue structure), q6_K GEMM ~15% at ~1.1×
+kernel-side (residual = A-side staging + dsc consumer latency; a W_dsc
+f32 plane would be the symmetric next bundle member, and an A-side cp.async
+redo could now compose with it), fused A-producers ~9%, FA ~5% (2.43×
+already taken), host/launch overhead the rest. The q6_K line is CLOSED at
+converged-vs-llama wall impact; further work belongs to the q4_K/GEMM
+structure or the producer line.
+
+Artifacts: `/tmp/minfer_pre_r53` (pre-change baseline, md5 bbe78c11…),
+`/tmp/patch_r53.py` (exact-string patch script) + `/tmp/q6k_r53.o` /
+`q6k_r53_ptxas.txt` / `q6k_r53_sass.txt` (gate-2 harness),
+`/tmp/minfer_phase7/{parity_r53.sh,g32_r53.sh,perf_r53_base.sh,perf_r53_ab.sh}`
+(+ `parity_r53_run{1,2,3}.log`, `g32_r53_{base,new}.txt`, `perf_r53_ab.log`),
+`ncu_r53_{base,new}.csv` + `ncu_r53_census.csv` + `ncu_r53_summary.py`
+(gate-6), `r53_{base,new}_*.{nsys-rep,sqlite,csv}` + `r53_window.py`
+(window decomposition), `r53_suite.log`, `q6k_wexp_memory.py` (GGUF header
+census), `r53_sanity{1,2}.{txt,err}` (B-path live-proof runs).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

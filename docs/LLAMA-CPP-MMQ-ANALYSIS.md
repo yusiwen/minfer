@@ -1467,6 +1467,56 @@ byte-level or token-identity gate, not just tolerance parity.
 **+5.45%** (distributions separated; one cold base outlier excluded,
 documented); parity ×3 green; greedy-32 byte-identical (A_FUSE=1 vs 2 both
 directions); suite 166/0/3. Recommendation: A_FUSE=2 becomes the default
-(env-docs) — the dead-write backstops turn any future topology drift into a
-hard error.
+**(env-docs) — the dead-write backstops turn any future topology drift into a
+hard error.**
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r52.
+
+#### §11.32 P6 r53 — the r44 + r45 bundle LANDED: pre-expanded-B W_exp staged by cp.async — +5.03% whole-prefill
+
+§11.24 (r44) and §11.25 (r45) each ended with the same verdict: the
+mechanism works, the wall does not move — r44 removed the B recomb WORK but
+left the staging WAIT, r45 removed the A staging WAIT but left the B recomb
+WORK, and neither alone could reach a wall that was no longer q6_K-bound.
+r53 landed them as ONE change: the B staging of `mmq_raw_nb_bt_q6k_kernel`
+becomes a pure **explicit-PTX cp.async bulk copy from the registration-time
+dense centered-int8 plane `W_exp`** (`od × id`, row stride = id,
+super-block stride = 256; dense index `W_exp + j*id + sb*256 + cbase*32`,
+the §11.24 root-cause fix) — no ql/qh reads, no recomb ALU, no register
+round-trip, with r45's commit/wait group pipeline and one extra barrier for
+cross-thread visibility. Kernel template `<KDR, EXP>` keeps the §11.21/11.24
+r41 in-kernel expand as a compiled-away fallback for the raw 210-B layout
+and W_exp misses.
+
+**Result: kernel −20.6% elapsed cycles (r44's −10.9% + r45's −10.2%
+compose additively — the mechanisms remove WORK and WAIT respectively and
+do not overlap), whole-prefill interleaved 5× medians 3024.7 → 3176.9 tok/s
+= +5.03%** (distributions separated; parity ×3, greedy-32 byte-identical,
+suite 167/0/3, W_exp byte-exact 0 mismatches host+device via a new cargo
+test). ptxas 80 regs both instantiations (3-block budget holds); SASS
+LDGSTS ×12 in the EXP=true function.
+
+**Two transferable lessons.** (1) *A fallback-correct fast path needs a
+liveness check, not just correctness gates*: the first integrated build
+passed parity AND greedy-32 with zero fast-path launches (the exp-map was
+keyed by the exp buffer's own pointer instead of the padded weight's, so
+every GEMM silently took the r41 fallback — correct, just not fast). The
+`MINFER_MMQ_RAW_NB_DEBUG` print now names the B path per launch and counted
+27× `W_exp-cp.async` / 0 fallback after the one-line key fix. (2) *The
+task's memory estimate was 100× off and the GGUF quant mix explains stale
+launch counts*: q4_k_m puts q6_K attn_v/ffn_down on only 14 of 28 layers
+each (GGUF-header census), so W_exp is 1.52 GB (not ~15 MB) and the "27
+q6_K launches" every trace since r47 reported is 14 attn_v + 13 ffn_down,
+not "all layers".
+
+**q6_K convergence verdict (final).** Whole-prefill 3176.9 tok/s vs
+llama-bench 3325-eq 3324.4 = **1.05×** (campaign: 2.15× at r37 → 1.27× at
+r47 → 1.09× at r52 → 1.05×). The kernel-side residual is the §11.23
+attribution minus the B-recomb: A-side staging STS (~28%) + the dsc I2F
+consumer (~26%) — a `W_dsc` f32 plane (precompute `d·sc` per chunk) is the
+symmetric next candidate and an A-side cp.async redo would now compose with
+the bundle, but both are bounded by the same within-warp-latency/
+wall-decoupling economics that made r44/r45 individually neutral, and the
+line is at ~1.1× vs llama kernel-side. The q6_K line is CLOSED; the
+campaign's remaining gap lives in the q4_K GEMM structure (~63% of the
+window at 1.06×) and the producer/FA lines.
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r53.
