@@ -909,6 +909,198 @@ __global__ void swiglu_quant_f32_t(
     }
 }
 
+// --- P6 r52: mode-2 skip-write variants (MINFER_MMQ_A_FUSE=2) ---------------
+// Same pad40_t planes as the r51 fused kernels, but the producer's f32 output
+// is NOT written — the global write + L1/L2 re-read round-trip disappears:
+//   rms:    one warp per row as before; each warp re-derives its row's y
+//           values per chunk in registers (phase-1 expression verbatim) and
+//           the 8 lanes owning a 32-float chunk exchange amax/ssum via
+//           shfl_xor (max/int-sum are order-insensitive, so the plane is
+//           byte-identical to the mode-1 kernel's).
+//   swiglu: one thread per (token, chunk) holds the 32 silu*up values in
+//           registers (the r51 phase-2 L2 re-read disappears with the write).
+// LEGAL ONLY when the f32 output is provably dead: its only consumers are the
+// immediately following consecutive MatMul nodes, which consume the PLANE via
+// the r49 MmqCache keyed on the (unwritten) f32 pointer (window-safety proof:
+// docs/CUDA_OPTIMIZATION.md P6 r52). The cache refuses to re-quantize a
+// dead-write buffer (MmqCache::dead_write guard in src/cuda.rs), so any
+// window violation fails loudly instead of silently reading garbage.
+__global__ void rms_norm_quant_nw_f32_t(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    uint8_t* __restrict__ yqs,   // [ntb][nchunk][2048] swizzled qs plane
+    uint8_t* __restrict__ ysda,  // [ntb][nchunk][256] packed d|ssum
+    int d, float eps, int n, int nchunk, int ntb
+) {
+    const int row = blockIdx.x * RMSQ_RPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & (WARP - 1);
+    // Phase 1: identical to rms_norm_quant_f32_t — same lane mapping and
+    // accumulation order over x, so `scale` is bit-identical. No y store.
+    float scale = 0.0f;
+    if (row < n) {
+        const int d4 = d / 4;
+        const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
+        float ss = 0.0f;
+        for (int i = lane; i < d4; i += WARP) {
+            float4 v = x4[i];
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        ss = warp_reduce_sum(ss);
+        scale = rsqrtf(ss / (float)d + eps);
+    }
+    // Common swizzle constants for this row (same expressions as mode 1).
+    const int r = row & (MMQ_A_BLK - 1);
+    const int tb = row >> 6;
+    const int t4 = r & 3, grp = r & ~3, xswz = (r >> 2) & 7;
+    const int g = r >> 4, t15 = r & 15, qq = t15 & 7, h15 = t15 >> 3;
+    const int rg = g >> 1, gsel = g & 1;
+    if (row >= n) {
+        // Padded-tail row: zero-fill this row's plane slots exactly like the
+        // standalone prepass (deterministic plane regardless of scratch
+        // reuse). grid = ntb*(64/RPB) covers every padded row.
+        for (int b = lane; b < nchunk; b += WARP) {
+            size_t qbase = ((size_t)tb * nchunk + b) * MMQ_A_QASZ + grp * 32;
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+                *reinterpret_cast<uint32_t*>(yqs + qbase + off) = 0;
+            }
+            size_t sbase = ((size_t)tb * nchunk + b) * MMQ_A_SDASZ
+                           + (rg * 32 + qq * 4 + gsel * 2 + h15) * 4;
+            *reinterpret_cast<uint32_t*>(ysda + sbase) = 0;
+        }
+        return;
+    }
+    // Phase 2: quantize THIS warp's row (warp-uniform row => the shfl_xor
+    // reductions below never see divergence). Chunk c = 4k + lane/8 covers
+    // float4s 32k+lane; d % 256 == 0 makes d4 % 32 == 0 (exact loop).
+    const int d4 = d / 4;
+    const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    for (int k = 0; k < d4 / 32; k++) {
+        float4 xv = x4[k * 32 + lane];
+        float4 wv = w4[k * 32 + lane];
+        // y expression verbatim from rms_norm_quant_f32_t phase 1 (bit-identical
+        // f32 values — the mode-1 kernel quantizes these after a memory
+        // round-trip, which is exact for f32).
+        float v0 = xv.x * scale * wv.x;
+        float v1 = xv.y * scale * wv.y;
+        float v2 = xv.z * scale * wv.z;
+        float v3 = xv.w * scale * wv.w;
+        float am = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+        // 8-lane group reduce (lanes [g8*8, g8*8+8) own one 32-float chunk).
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+        float dsc = am / 127.0f;
+        float di = (dsc != 0.0f) ? 1.0f / dsc : 0.0f;
+        int q0 = max(-128, min(127, int(rintf(v0 * di))));
+        int q1 = max(-128, min(127, int(rintf(v1 * di))));
+        int q2 = max(-128, min(127, int(rintf(v2 * di))));
+        int q3 = max(-128, min(127, int(rintf(v3 * di))));
+        int ssum = (q0 + q1) + (q2 + q3);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 4);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 2);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 1);
+        const uint32_t p = (uint32_t)(uint8_t)(int8_t)q0
+                         | ((uint32_t)(uint8_t)(int8_t)q1 << 8)
+                         | ((uint32_t)(uint8_t)(int8_t)q2 << 16)
+                         | ((uint32_t)(uint8_t)(int8_t)q3 << 24);
+        const int b = k * 4 + (lane >> 3);   // chunk index: float4 (32k+lane)/8
+        const int u = lane & 7;              // packed word = float4 position
+        size_t qbase = ((size_t)tb * nchunk + b) * MMQ_A_QASZ + grp * 32;
+        const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+        *reinterpret_cast<uint32_t*>(yqs + qbase + off) = p;
+        if (u == 0) {
+            size_t sbase = ((size_t)tb * nchunk + b) * MMQ_A_SDASZ
+                           + (rg * 32 + qq * 4 + gsel * 2 + h15) * 4;
+            __half dh = __float2half(dsc);
+            uint16_t dbits = *reinterpret_cast<uint16_t*>(&dh);
+            *reinterpret_cast<uint32_t*>(ysda + sbase) =
+                (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
+        }
+    }
+}
+
+// Mode-2 swiglu: no dst write, single phase. Per token row, the block sweeps
+// the row's float4s in COALESCED rounds (lane l loads float4 rd*256+l of
+// gate/up — 512 B per warp access, the r51 phase-1 pattern), computes
+// silu*mul in registers, and quantizes via the rms-nw lane mapping: the 8
+// lanes holding one 32-float chunk (float4s 8c..8c+7 = lanes 8g..8g+7 of the
+// round) exchange amax/ssum with 3 __shfl_xor steps. (A naive per-thread
+// chunk mapping — one thread quantizing a whole 128-B chunk — makes the gate/
+// up loads lane-strided and measured SLOWER than the mode-1 write+re-read.)
+// silu*mul expression verbatim from swiglu_f32; tail rows (t >= nt) zero-fill
+// their plane slots exactly like the mode-1 kernel / standalone prepass.
+__global__ void swiglu_quant_nw_f32_t(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    uint8_t* __restrict__ yqs,   // [ntb][nchunk][2048]
+    uint8_t* __restrict__ ysda,  // [ntb][nchunk][256]
+    int dim, int nt, int nchunk, int ntb
+) {
+    const int t = blockIdx.x;  // one token row per block (grid = ntb*64)
+    const int r = t & (MMQ_A_BLK - 1);
+    const int tb = t >> 6;
+    const int t4 = r & 3, grp = r & ~3, xswz = (r >> 2) & 7;
+    const int g = r >> 4, t15 = r & 15, qq = t15 & 7, h15 = t15 >> 3;
+    const int rg = g >> 1, gsel = g & 1;
+    const int n4 = dim / 4;
+    // dim % 256 == 0 => n4 % 64 == 0 => every 8-lane shuffle group maps to
+    // WHOLE chunks (a group's 8 float4s are all < n4 or all >= n4).
+    for (int f = threadIdx.x; f < ((n4 + blockDim.x - 1) / blockDim.x) * blockDim.x;
+         f += blockDim.x) {
+        const bool active = t < nt && f < n4;
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        if (active) {
+            const float4* g4 = reinterpret_cast<const float4*>(gate + (size_t)t * dim);
+            const float4* u4 = reinterpret_cast<const float4*>(up + (size_t)t * dim);
+            float4 gv = g4[f];
+            float4 uv = u4[f];
+            v0 = (gv.x / (1.0f + expf(-gv.x))) * uv.x;
+            v1 = (gv.y / (1.0f + expf(-gv.y))) * uv.y;
+            v2 = (gv.z / (1.0f + expf(-gv.z))) * uv.z;
+            v3 = (gv.w / (1.0f + expf(-gv.w))) * uv.w;
+        }
+        float am = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+        // 8-lane group reduce (lanes 8g..8g+7 hold chunk (f/8)'s 32 values).
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+        float dsc = am / 127.0f;
+        float di = (dsc != 0.0f) ? 1.0f / dsc : 0.0f;
+        int q0 = max(-128, min(127, int(rintf(v0 * di))));
+        int q1 = max(-128, min(127, int(rintf(v1 * di))));
+        int q2 = max(-128, min(127, int(rintf(v2 * di))));
+        int q3 = max(-128, min(127, int(rintf(v3 * di))));
+        int ssum = (q0 + q1) + (q2 + q3);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 4);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 2);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 1);
+        if (f < n4) {
+            // t >= nt rows land here with all-zero v/am/ssum — exactly the
+            // standalone prepass's deterministic padded-tail zero-fill.
+            const uint32_t p = (uint32_t)(uint8_t)(int8_t)q0
+                             | ((uint32_t)(uint8_t)(int8_t)q1 << 8)
+                             | ((uint32_t)(uint8_t)(int8_t)q2 << 16)
+                             | ((uint32_t)(uint8_t)(int8_t)q3 << 24);
+            const int c = f >> 3;                    // chunk index of this float4
+            const int u = f & 7;                     // packed word = float4 position
+            size_t qbase = ((size_t)tb * nchunk + c) * MMQ_A_QASZ + grp * 32;
+            const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+            *reinterpret_cast<uint32_t*>(yqs + qbase + off) = p;
+            if (u == 0) {
+                size_t sbase = ((size_t)tb * nchunk + c) * MMQ_A_SDASZ
+                               + (rg * 32 + qq * 4 + gsel * 2 + h15) * 4;
+                __half dh = __float2half(dsc);
+                uint16_t dbits = *reinterpret_cast<uint16_t*>(&dh);
+                *reinterpret_cast<uint32_t*>(ysda + sbase) =
+                    (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
+            }
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256) q4_k_q8_mmvq(
     const uint8_t* __restrict__ weights,
     const uint8_t* __restrict__ acts8,
@@ -2736,6 +2928,27 @@ void launch_swiglu_quant_f32_t(
 ) {
     swiglu_quant_f32_t<<<ntb * MMQ_A_BLK, 256, 0, stream>>>(
         gate, up, dst, yqs, ysda, dim, nt, nchunk, ntb);
+}
+
+// r52: mode-2 launchers (no f32 output write; see the kernel comments). Grid
+// geometry identical to the mode-1 launchers.
+void launch_rms_norm_quant_nw_f32_t(
+    const float* x, const float* w,
+    uint8_t* yqs, uint8_t* ysda,
+    int d, float eps, int n, int nchunk, int ntb, cudaStream_t stream
+) {
+    int grid = ntb * (MMQ_A_BLK / RMSQ_RPB);
+    rms_norm_quant_nw_f32_t<<<grid, RMSQ_RPB * WARP, 0, stream>>>(
+        x, w, yqs, ysda, d, eps, n, nchunk, ntb);
+}
+
+void launch_swiglu_quant_nw_f32_t(
+    const float* gate, const float* up,
+    uint8_t* yqs, uint8_t* ysda,
+    int dim, int nt, int nchunk, int ntb, cudaStream_t stream
+) {
+    swiglu_quant_nw_f32_t<<<ntb * MMQ_A_BLK, 256, 0, stream>>>(
+        gate, up, yqs, ysda, dim, nt, nchunk, ntb);
 }
 
 void launch_f32_bits_to_i32(

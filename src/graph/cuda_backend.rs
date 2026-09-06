@@ -499,7 +499,7 @@ impl CudaBackend {
                 if self.elems(in_bufs[0]) != n || self.elems(in_bufs[1]) != n {
                     return Err(format!("cuda: {}: swiglu input size mismatch", node.name));
                 }
-                // r51: producer-fused A-quantize (MINFER_MMQ_A_FUSE=1 + full
+                // r51/r52: producer-fused A-quantize (MINFER_MMQ_A_FUSE + full
                 // MMQ gate set): in the prefill graph the swiglu output is
                 // EXCLUSIVELY the down projection's GEMM input, so compute
                 // the pad40_t plane in the same pass and register it in the
@@ -507,27 +507,62 @@ impl CudaBackend {
                 // Rows >= 16 keeps decode (nt==1, capture window, FusedFFN)
                 // and short-prefill (nt < 16 never reaches prefill_mmq) on
                 // the unfused pair; dim % 256 mirrors the transposed GEMM's
-                // nchunk % 8 requirement. OOM falls back to the unfused pair.
+                // nchunk % 8 requirement.
+                // r52 mode 2 additionally SKIPS the f32 output write: the
+                // output's sole consumers are the immediately following
+                // consecutive MatMul nodes reading the plane via the MmqCache
+                // (window-safety proof: docs/CUDA_OPTIMIZATION.md P6 r52; the
+                // dead_write cache guard turns any window violation into a
+                // loud error instead of reading the unwritten buffer). Plane
+                // OOM degrades to mode 1, then to the unfused pair.
                 let dim = node.out_shape[0];
                 let rows = if dim > 0 { n / dim } else { 0 };
-                if dim > 0
-                    && n == dim * rows
-                    && rows >= 16
-                    && dim % 256 == 0
-                    && self.state.mmq_a_fuse_active()
-                {
-                    if self
-                        .state
-                        .swiglu_quant(
-                            self.ptr_of(in_bufs[0])?,
-                            self.ptr_of(in_bufs[1])?,
-                            self.ptr_of(out_buf)?,
-                            dim,
-                            rows,
-                        )
-                        .is_ok()
-                    {
-                        return Ok(());
+                if dim > 0 && n == dim * rows && rows >= 16 && dim % 256 == 0 {
+                    match self.state.mmq_a_fuse_mode() {
+                        2 => {
+                            if self
+                                .state
+                                .swiglu_quant_nw(
+                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of(in_bufs[1])?,
+                                    self.ptr_of(out_buf)?,
+                                    dim,
+                                    rows,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                            if self
+                                .state
+                                .swiglu_quant(
+                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of(in_bufs[1])?,
+                                    self.ptr_of(out_buf)?,
+                                    dim,
+                                    rows,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        1 => {
+                            if self
+                                .state
+                                .swiglu_quant(
+                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of(in_bufs[1])?,
+                                    self.ptr_of(out_buf)?,
+                                    dim,
+                                    rows,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.state.swiglu_f32(
@@ -549,27 +584,61 @@ impl CudaBackend {
                     ));
                 }
                 let n = self.elems(out_buf) / d;
-                // r51: producer-fused A-quantize — see the Op::SwiGLU arm.
+                // r51/r52: producer-fused A-quantize — see the Op::SwiGLU arm.
                 // Every rms_norm output in the prefill graph is exclusively
-                // a GEMM input (q/k/v, gate/up, lm_head); a hypothetical
-                // non-MatMul consumer is still correct (it reads the
-                // bit-identical f32 output, and the plane's cache entry is
-                // cleared by the first non-MatMul node before it could be
-                // misread — the conservative r49 window rule).
-                if n >= 16 && d % 256 == 0 && self.state.mmq_a_fuse_active() {
-                    if self
-                        .state
-                        .rms_norm_quant(
-                            self.ptr_of(in_bufs[0])?,
-                            wptr,
-                            self.ptr_of(out_buf)?,
-                            d,
-                            n,
-                            *eps,
-                        )
-                        .is_ok()
-                    {
-                        return Ok(());
+                // a GEMM input (q/k/v, gate/up; the output-norm/lm_head and
+                // last-layer FFN run on the G3-tail n_out=1 rows, below the
+                // n >= 16 gate). r52 mode 2 additionally skips the f32 output
+                // write — same window-safety contract as the swiglu arm.
+                if n >= 16 && d % 256 == 0 {
+                    match self.state.mmq_a_fuse_mode() {
+                        2 => {
+                            if self
+                                .state
+                                .rms_norm_quant_nw(
+                                    self.ptr_of(in_bufs[0])?,
+                                    wptr,
+                                    self.ptr_of(out_buf)?,
+                                    d,
+                                    n,
+                                    *eps,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                            if self
+                                .state
+                                .rms_norm_quant(
+                                    self.ptr_of(in_bufs[0])?,
+                                    wptr,
+                                    self.ptr_of(out_buf)?,
+                                    d,
+                                    n,
+                                    *eps,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        1 => {
+                            if self
+                                .state
+                                .rms_norm_quant(
+                                    self.ptr_of(in_bufs[0])?,
+                                    wptr,
+                                    self.ptr_of(out_buf)?,
+                                    d,
+                                    n,
+                                    *eps,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.state.rms_norm(

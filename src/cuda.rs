@@ -253,6 +253,31 @@ extern "C" {
         ntb: i32,
         stream: *mut std::ffi::c_void,
     );
+    // r52: mode-2 skip-write variants (MINFER_MMQ_A_FUSE=2) — same planes, no
+    // f32 output write (window-safety proof: docs/CUDA_OPTIMIZATION.md P6 r52).
+    fn launch_rms_norm_quant_nw_f32_t(
+        x: *const f32,
+        w: *const f32,
+        yqs: *mut u8,
+        ysda: *mut u8,
+        d: i32,
+        eps: f32,
+        n: i32,
+        nchunk: i32,
+        ntb: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_swiglu_quant_nw_f32_t(
+        gate: *const f32,
+        up: *const f32,
+        yqs: *mut u8,
+        ysda: *mut u8,
+        dim: i32,
+        nt: i32,
+        nchunk: i32,
+        ntb: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_f32_bits_to_i32(
         src: *const f32,
         dst: *mut i32,
@@ -834,6 +859,12 @@ struct MmqCache {
     /// True when the cached buffers hold the transposed pad40_t layout
     /// (buf_qa8_t + buf_sda_t); false => native pad40 (buf_q8_prefill).
     transposed: bool,
+    /// r52: true when the entry was recorded by a mode-2 (skip-write) fused
+    /// producer — the f32 src was NEVER written, so the plane is the only
+    /// valid form of that activation. Any cache path that would re-quantize
+    /// the src (transposed miss / native prepass) REFUSES on such an entry
+    /// (loud failure) instead of silently reading the dead buffer's garbage.
+    dead_write: bool,
     /// Physical buffer pointers of the cached quantized A (validated on hit —
     /// `get_or_grow` may realloc on a larger miss).
     qa8: usize,
@@ -847,6 +878,7 @@ impl Default for MmqCache {
             active: false,
             key: (0, 0, 0),
             transposed: false,
+            dead_write: false,
             qa8: 0,
             sda: 0,
             q8: 0,
@@ -1394,7 +1426,7 @@ impl CudaState {
             let mut new_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let err = unsafe { cudaMalloc(&mut new_ptr, need) };
             if err != 0 || new_ptr.is_null() {
-                eprintln!("CUDA: OOM allocating {} bytes", need);
+                eprintln!("CUDA: OOM allocating {} bytes (cuda err {err})", need);
                 *ptr = CudaPtr(std::ptr::null_mut());
                 *size = 0;
                 return std::ptr::null_mut();
@@ -2128,18 +2160,51 @@ impl CudaState {
         self.cc.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// r51: producer-fused A-quantize gate — MINFER_MMQ_A_FUSE=1 ANDed with
-    /// the full r49 MMQ gate set. The fused plane is only CONSUMED by the
-    /// raw NB-BT (q4_K) / q6_K NB transposed GEMM paths, all of which these
-    /// gates enable; fusing with any of them off would write a plane the
-    /// matmul re-quantizes natively (correct but pure waste).
-    pub fn mmq_a_fuse_active(&self) -> bool {
-        self.mmq_active()
+    /// r51/r52: producer-fused A-quantize mode — 0 off, 1 = fused + f32
+    /// output write (MINFER_MMQ_A_FUSE=1 semantics), 2 = fused + SKIP the f32
+    /// output write (MINFER_MMQ_A_FUSE=2). The base gate is the full r49 MMQ
+    /// gate set (the fused plane is only CONSUMED by the raw NB-BT (q4_K) /
+    /// q6_K NB transposed GEMM paths, all of which these gates enable; fusing
+    /// with any of them off would write a plane the matmul re-quantizes
+    /// natively — correct but pure waste).
+    ///
+    /// Mode 2 additionally requires the r52 window-safety conditions: the f32
+    /// output is never written, so (a) every debug/trace reader of node
+    /// buffers must be off (MINFER_GRAPH_DUMP layer-0 node dumps, the
+    /// debug_dump feature's MINFER_DUMP_DIR, MINFER_TRACE per-node capture,
+    /// --viz live capture), and (b) no GEMM path that reads the f32 A may be
+    /// reachable (MINFER_NO_PREFILL_GEMM=1 legacy kernels). If any condition
+    /// fails, mode 2 degrades to mode-1 semantics (fused, writes the f32) —
+    /// still the r51 win, just without the skip. The remaining window
+    /// guarantee (producers' outputs consumed only by their immediately
+    /// consecutive MatMul group via the MmqCache plane; any dead-write cache
+    /// miss REFUSES loudly) is enforced structurally — see MmqCache::dead_write
+    /// and docs/CUDA_OPTIMIZATION.md P6 r52 for the full proof.
+    pub fn mmq_a_fuse_mode(&self) -> u8 {
+        if !(self.mmq_active()
             && std::env::var("MINFER_MMQ_RAW").as_deref() == Ok("1")
             && std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1")
             && std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1")
-            && std::env::var("MINFER_MMQ_A_FUSE").as_deref() == Ok("1")
+            && std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1"))
+        {
+            return 0;
+        }
+        match std::env::var("MINFER_MMQ_A_FUSE").as_deref() {
+            Ok("1") => 1,
+            Ok("2")
+                if !Self::no_prefill_gemm()
+                    && std::env::var_os("MINFER_GRAPH_DUMP").is_none()
+                    && std::env::var_os("MINFER_DUMP_DIR").is_none()
+                    && !crate::trace::enabled()
+                    && !crate::live::enabled() =>
+            {
+                2
+            }
+            // A_FUSE=2 requested but a window-reader/fallback condition is
+            // active: keep the r51 fused semantics (write the f32 output).
+            Ok("2") => 1,
+            _ => 0,
+        }
     }
 
     /// r49: invalidate the MMQ A-quantize memoization. Called by the CUDA
@@ -2180,6 +2245,22 @@ impl CudaState {
                 return (qa8, sda);
             }
         }
+        // r52: a mode-2 (skip-write) fused producer left the f32 src UNWRITTEN
+        // and promised its consumers would hit this cache. Reaching the launch
+        // path with a dead-write entry for the SAME buffer means the window
+        // guarantee broke (split boundary, exotic fallback, pointer drift) —
+        // re-quantizing would read the dead buffer's garbage. Refuse: the
+        // callers treat (0, 0) as a failed path and prefill_mmq errors out
+        // loudly instead of silently producing wrong results.
+        if cache.active && cache.dead_write && cache.key.0 == x as usize {
+            eprintln!(
+                "minfer/cuda: MMQ A-quantize refused: mode-2 dead-write A \
+                 (ptr {:#x}) missed the MmqCache window (MINFER_MMQ_A_FUSE=2 \
+                 safety guard; A falls back and errors out)",
+                x as usize
+            );
+            return (0, 0);
+        }
         let qa8 = Self::get_or_grow(&self.buf_qa8_t, need_qa8);
         let sda = Self::get_or_grow(&self.buf_sda_t, need_sda);
         launch_quantize_q8_0_pad40_t(
@@ -2195,6 +2276,7 @@ impl CudaState {
         cache.active = true;
         cache.key = key;
         cache.transposed = true;
+        cache.dead_write = false;
         cache.qa8 = qa8 as usize;
         cache.sda = sda as usize;
         cache.q8 = 0;
@@ -2213,7 +2295,7 @@ impl CudaState {
         stream: *mut std::ffi::c_void,
     ) -> usize {
         let need = (nt as usize) * (id as usize / 32) * 40;
-        let key = (x as usize, nt as usize, id as usize);
+        let key = (x as usize, id as usize, nt as usize);
         let mut cache = self.mmq_cache.lock().unwrap();
         if cache.active && cache.key == key && !cache.transposed {
             let q8 = Self::get_or_grow(&self.buf_q8_prefill, need) as usize;
@@ -2221,11 +2303,23 @@ impl CudaState {
                 return q8;
             }
         }
+        // r52: same dead-write refusal as mmq_quantize_transposed — a mode-2
+        // fused producer's f32 src was never written; re-quantizing it here
+        // would read garbage. Return 0 (callers fail loudly).
+        if cache.active && cache.dead_write && cache.key.0 == x as usize {
+            eprintln!(
+                "minfer/cuda: native A-quantize refused: mode-2 dead-write A \
+                 (ptr {:#x}) (MINFER_MMQ_A_FUSE=2 safety guard)",
+                x as usize
+            );
+            return 0;
+        }
         let q8 = Self::get_or_grow(&self.buf_q8_prefill, need);
         launch_quantize_q8_0_pad40(x, q8 as *mut u8, id, nt, stream);
         cache.active = true;
         cache.key = key;
         cache.transposed = false;
+        cache.dead_write = false;
         cache.qa8 = 0;
         cache.sda = 0;
         cache.q8 = q8 as usize;
@@ -2241,12 +2335,23 @@ impl CudaState {
     /// non-MatMul node clears the entry (the producer's own execution is the
     /// set point — the backend's clear runs before the node executes), and
     /// `synchronize` clears it at split boundaries, so a stale plane can
-    /// never be consumed.
-    fn record_mmq_cache_transposed(&self, src: usize, nt: usize, id: usize, qa8: usize, sda: usize) {
+    /// never be consumed. r52: `dead_write` marks mode-2 entries (the f32
+    /// src was NOT written — see the mode-2 refusal guards in
+    /// `mmq_quantize_transposed`/`mmq_quantize_native`).
+    fn record_mmq_cache_transposed(
+        &self,
+        src: usize,
+        nt: usize,
+        id: usize,
+        qa8: usize,
+        sda: usize,
+        dead_write: bool,
+    ) {
         let mut c = self.mmq_cache.lock().unwrap();
         c.active = true;
         c.key = (src, nt, id);
         c.transposed = true;
+        c.dead_write = dead_write;
         c.qa8 = qa8;
         c.sda = sda;
         c.q8 = 0;
@@ -2295,7 +2400,7 @@ impl CudaState {
                 stream,
             );
         }
-        self.record_mmq_cache_transposed(y as usize, n, d, qa8 as usize, sda as usize);
+        self.record_mmq_cache_transposed(y as usize, n, d, qa8 as usize, sda as usize, false);
         Ok(())
     }
 
@@ -2333,7 +2438,88 @@ impl CudaState {
                 stream,
             );
         }
-        self.record_mmq_cache_transposed(dst as usize, nt, dim, qa8 as usize, sda as usize);
+        self.record_mmq_cache_transposed(dst as usize, nt, dim, qa8 as usize, sda as usize, false);
+        Ok(())
+    }
+
+    /// r52: mode-2 (MINFER_MMQ_A_FUSE=2) variant of [`Self::rms_norm_quant`]
+    /// — SAME pad40_t plane, but the f32 output `y` is NOT written. `y` is
+    /// passed only as the MmqCache key (the consuming matmuls' A pointer);
+    /// its buffer is expected to be dead: consumed exclusively by the
+    /// immediately following consecutive MatMul group through the plane. The
+    /// entry is recorded with `dead_write = true`, so any window violation
+    /// (a GEMM path that would re-quantize the unwritten buffer) refuses and
+    /// fails loudly instead of reading garbage — see
+    /// [`Self::mmq_a_fuse_mode`] for the dispatch conditions and
+    /// docs/CUDA_OPTIMIZATION.md P6 r52 for the proof. Err = plane OOM
+    /// (caller degrades to mode 1 / the unfused pair, both of which write).
+    pub fn rms_norm_quant_nw(
+        &self,
+        x: *mut std::ffi::c_void,
+        w: *mut std::ffi::c_void,
+        y: *mut std::ffi::c_void,
+        d: usize,
+        n: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        let nchunk = d / 32;
+        let ntb = n.div_ceil(64);
+        let qa8 = Self::get_or_grow(&self.buf_qa8_t, ntb * nchunk * 2048);
+        let sda = Self::get_or_grow(&self.buf_sda_t, ntb * nchunk * 256);
+        if qa8.is_null() || sda.is_null() {
+            return Err("cuda: rms_norm_quant_nw plane OOM".to_string());
+        }
+        let stream = self.stream();
+        unsafe {
+            launch_rms_norm_quant_nw_f32_t(
+                x as *const f32,
+                w as *const f32,
+                qa8 as *mut u8,
+                sda as *mut u8,
+                d as i32,
+                eps,
+                n as i32,
+                nchunk as i32,
+                ntb as i32,
+                stream,
+            );
+        }
+        self.record_mmq_cache_transposed(y as usize, n, d, qa8 as usize, sda as usize, true);
+        Ok(())
+    }
+
+    /// r52: mode-2 counterpart of [`Self::swiglu_quant`] — same plane, the
+    /// f32 `dst` is NOT written (key only). See [`Self::rms_norm_quant_nw`].
+    pub fn swiglu_quant_nw(
+        &self,
+        gate: *mut std::ffi::c_void,
+        up: *mut std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        dim: usize,
+        nt: usize,
+    ) -> Result<(), String> {
+        let nchunk = dim / 32;
+        let ntb = nt.div_ceil(64);
+        let qa8 = Self::get_or_grow(&self.buf_qa8_t, ntb * nchunk * 2048);
+        let sda = Self::get_or_grow(&self.buf_sda_t, ntb * nchunk * 256);
+        if qa8.is_null() || sda.is_null() {
+            return Err("cuda: swiglu_quant_nw plane OOM".to_string());
+        }
+        let stream = self.stream();
+        unsafe {
+            launch_swiglu_quant_nw_f32_t(
+                gate as *const f32,
+                up as *const f32,
+                qa8 as *mut u8,
+                sda as *mut u8,
+                dim as i32,
+                nt as i32,
+                nchunk as i32,
+                ntb as i32,
+                stream,
+            );
+        }
+        self.record_mmq_cache_transposed(dst as usize, nt, dim, qa8 as usize, sda as usize, true);
         Ok(())
     }
 
@@ -2522,6 +2708,17 @@ impl CudaState {
                 if !nb_ok {
                     let q8 =
                         self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
+                    if q8 == 0 {
+                        // r52: mmq_quantize_native refuses a mode-2 dead-write
+                        // A (and plain q8 OOM is pre-checked at fn entry) —
+                        // never fall through to a GEMM on a null/garbage A.
+                        return Err(
+                            "cuda: prefill MMQ: A-quantize unavailable (mode-2 \
+                             dead-write A refused or q8 OOM); MINFER_MMQ_A_FUSE=2 \
+                             window violated"
+                                .to_string(),
+                        );
+                    }
                     let wide_ok = q8 != 0
                         && wide
                         && launch_mmq_raw_wide_nt(
