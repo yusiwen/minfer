@@ -710,6 +710,205 @@ __global__ void quantize_q8_0_pad40_t(
         (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
 }
 
+// --- P6 r51: producer-fused A-quantize (rms_norm / swiglu -> pad40_t) ------
+// Fuses the MMQ A-quantize prepass INTO its producers: in the qwen2 prefill
+// graph every rms_norm/swiglu output is EXCLUSIVELY a GEMM input, so the
+// standalone prepass re-reads data the producer JUST wrote (r47 table: the
+// prepass was 7.4% of the wall after r49's shared-A dedup). Each fused
+// kernel emits the producer's f32 output (bit-identical to the standalone
+// kernel: same per-element expressions, same reduction mapping/order) AND
+// the pad40_t transposed quantize plane (bit-identical to
+// quantize_q8_0_pad40_t: the quantize body and swizzled stores are that
+// kernel's code verbatim, reading the just-written rows back through L1/L2).
+// The plane is consumed through the r49 MmqCache — the host wrapper
+// registers it keyed on the f32 output's device pointer, so prefill_mmq
+// needs no change. Gated by MINFER_MMQ_A_FUSE=1 ANDed with the full MMQ
+// gate set; see CudaState::rms_norm_quant / swiglu_quant (src/cuda.rs).
+
+// rms rows per block (one warp per row, the rms_norm_f32 mapping).
+#define RMSQ_RPB 8
+
+__global__ void rms_norm_quant_f32_t(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    uint8_t* __restrict__ yqs,   // [ntb][nchunk][2048] swizzled qs plane
+    uint8_t* __restrict__ ysda,  // [ntb][nchunk][256] packed d|ssum
+    int d, float eps, int n, int nchunk, int ntb
+) {
+    // Phase 1: rms_norm — one warp per row, lane mapping and accumulation
+    // order identical to rms_norm_f32 (bit-identical output).
+    const int row = blockIdx.x * RMSQ_RPB + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & (WARP - 1);
+    if (row < n) {
+        int d4 = d / 4;
+        const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
+        float ss = 0.0f;
+        for (int i = lane; i < d4; i += WARP) {
+            float4 v = x4[i];
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        ss = warp_reduce_sum(ss);
+        float scale = rsqrtf(ss / (float)d + eps);
+        float4* y4 = reinterpret_cast<float4*>(y + row * d);
+        const float4* w4 = reinterpret_cast<const float4*>(w);
+        for (int i = lane; i < d4; i += WARP) {
+            float4 wv = w4[i];
+            float4 xv = x4[i];
+            y4[i].x = xv.x * scale * wv.x;
+            y4[i].y = xv.y * scale * wv.y;
+            y4[i].z = xv.z * scale * wv.z;
+            y4[i].w = xv.w * scale * wv.w;
+        }
+    }
+    __syncthreads();
+    // Phase 2: quantize this block's rows into the pad40_t plane — the
+    // quantize_q8_0_pad40_t body verbatim (one thread per (token, chunk),
+    // strided over the block's 8 rows). The grid covers the 64-padded token
+    // count, so the padded tail rows are zero-filled exactly like the
+    // standalone prepass (deterministic plane regardless of scratch reuse).
+    const int row0 = blockIdx.x * RMSQ_RPB;
+    const int nrows = min(RMSQ_RPB, ntb * 64 - row0);
+    const int tasks = nrows * nchunk;
+    for (int k = threadIdx.x; k < tasks; k += blockDim.x) {
+        const int t = row0 + k / nchunk;
+        const int b = k % nchunk;
+        const int r = t & (MMQ_A_BLK - 1);
+        const int tb = t >> 6;
+        float dsc = 0.0f; int ssum = 0; uint32_t packed[8];
+        #pragma unroll
+        for (int v = 0; v < 8; v++) packed[v] = 0;
+        if (t < n) {
+            const float* src = y + (size_t)t * d + b * 32;
+            float4 sv[8];
+            #pragma unroll
+            for (int v = 0; v < 8; v++)
+                sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
+            float am = 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; v++)
+                am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
+                                     fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
+            dsc = am / 127.0f;
+            float di = (dsc != 0.0f) ? 1.0f / dsc : 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                const float* e = &sv[v].x;
+                uint32_t p = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    int q = int(rintf(e[j] * di));
+                    q = max(-128, min(127, q));
+                    p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
+                    ssum += q;
+                }
+                packed[v] = p;
+            }
+        }
+        const int t4 = r & 3, grp = r & ~3;
+        const int xswz = (r >> 2) & 7;
+        size_t qbase = ((size_t)tb * nchunk + b) * MMQ_A_QASZ + grp * 32;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+            *reinterpret_cast<uint32_t*>(yqs + qbase + off) = packed[u];
+        }
+        const int g = r >> 4, t15 = r & 15, qq = t15 & 7, h15 = t15 >> 3;
+        const int rg = g >> 1, gsel = g & 1;
+        size_t sbase = ((size_t)tb * nchunk + b) * MMQ_A_SDASZ
+                       + (rg * 32 + qq * 4 + gsel * 2 + h15) * 4;
+        __half dh = __float2half(dsc);
+        uint16_t dbits = *reinterpret_cast<uint16_t*>(&dh);
+        *reinterpret_cast<uint32_t*>(ysda + sbase) =
+            (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
+    }
+}
+
+// Fused swiglu + pad40_t quantize: one block per token row. Phase 1 computes
+// dst = silu(gate) * up coalesced (per-element expression identical to
+// swiglu_f32 — bit-identical output); phase 2 re-quantizes the row's chunks
+// with the quantize_q8_0_pad40_t body verbatim, reading dst back through
+// L1/L2 (rows this block just wrote — a cross-thread register hand-off would
+// need the amax groups and lane mapping to align, and an uncoalesced f32
+// store pattern would cost more than the L2 re-read).
+__global__ void swiglu_quant_f32_t(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ dst,
+    uint8_t* __restrict__ yqs,   // [ntb][nchunk][2048]
+    uint8_t* __restrict__ ysda,  // [ntb][nchunk][256]
+    int dim, int nt, int nchunk, int ntb
+) {
+    const int t = blockIdx.x;  // one token row per block (grid = ntb*64)
+    if (t < nt) {
+        const float4* g4 = reinterpret_cast<const float4*>(gate + (size_t)t * dim);
+        const float4* u4 = reinterpret_cast<const float4*>(up + (size_t)t * dim);
+        float4* o4 = reinterpret_cast<float4*>(dst + (size_t)t * dim);
+        const int n4 = dim / 4;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            float4 gv = g4[i];
+            float4 uv = u4[i];
+            float4 ov;
+            ov.x = (gv.x / (1.0f + expf(-gv.x))) * uv.x;
+            ov.y = (gv.y / (1.0f + expf(-gv.y))) * uv.y;
+            ov.z = (gv.z / (1.0f + expf(-gv.z))) * uv.z;
+            ov.w = (gv.w / (1.0f + expf(-gv.w))) * uv.w;
+            o4[i] = ov;
+        }
+    }
+    __syncthreads();
+    const int r = t & (MMQ_A_BLK - 1);
+    const int tb = t >> 6;
+    for (int b = threadIdx.x; b < nchunk; b += blockDim.x) {
+        float dsc = 0.0f; int ssum = 0; uint32_t packed[8];
+        #pragma unroll
+        for (int v = 0; v < 8; v++) packed[v] = 0;
+        if (t < nt) {
+            const float* src = dst + (size_t)t * dim + b * 32;
+            float4 sv[8];
+            #pragma unroll
+            for (int v = 0; v < 8; v++)
+                sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
+            float am = 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; v++)
+                am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
+                                     fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
+            dsc = am / 127.0f;
+            float di = (dsc != 0.0f) ? 1.0f / dsc : 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                const float* e = &sv[v].x;
+                uint32_t p = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    int q = int(rintf(e[j] * di));
+                    q = max(-128, min(127, q));
+                    p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
+                    ssum += q;
+                }
+                packed[v] = p;
+            }
+        }
+        const int t4 = r & 3, grp = r & ~3;
+        const int xswz = (r >> 2) & 7;
+        size_t qbase = ((size_t)tb * nchunk + b) * MMQ_A_QASZ + grp * 32;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int off = (((t4 * 2 + (u >> 2)) ^ xswz) << 4) + (u & 3) * 4;
+            *reinterpret_cast<uint32_t*>(yqs + qbase + off) = packed[u];
+        }
+        const int g = r >> 4, t15 = r & 15, qq = t15 & 7, h15 = t15 >> 3;
+        const int rg = g >> 1, gsel = g & 1;
+        size_t sbase = ((size_t)tb * nchunk + b) * MMQ_A_SDASZ
+                       + (rg * 32 + qq * 4 + gsel * 2 + h15) * 4;
+        __half dh = __float2half(dsc);
+        uint16_t dbits = *reinterpret_cast<uint16_t*>(&dh);
+        *reinterpret_cast<uint32_t*>(ysda + sbase) =
+            (uint32_t)dbits | ((uint32_t)(uint16_t)ssum << 16);
+    }
+}
+
 __global__ void __launch_bounds__(256) q4_k_q8_mmvq(
     const uint8_t* __restrict__ weights,
     const uint8_t* __restrict__ acts8,
@@ -2514,6 +2713,29 @@ void launch_swiglu_f32(
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
     swiglu_f32<<<grid, block, 0, stream>>>(gate, up, dst, n);
+}
+
+// r51: producer-fused rms_norm + pad40_t quantize (see the kernel comment).
+// The grid covers the 64-PADDED token count so the padded tail rows are
+// zero-filled exactly like the standalone quantize_q8_0_pad40_t prepass.
+void launch_rms_norm_quant_f32_t(
+    const float* x, const float* w, float* y,
+    uint8_t* yqs, uint8_t* ysda,
+    int d, float eps, int n, int nchunk, int ntb, cudaStream_t stream
+) {
+    int grid = ntb * (MMQ_A_BLK / RMSQ_RPB);
+    rms_norm_quant_f32_t<<<grid, RMSQ_RPB * WARP, 0, stream>>>(
+        x, w, y, yqs, ysda, d, eps, n, nchunk, ntb);
+}
+
+// r51: producer-fused swiglu + pad40_t quantize (see the kernel comment).
+void launch_swiglu_quant_f32_t(
+    const float* gate, const float* up, float* dst,
+    uint8_t* yqs, uint8_t* ysda,
+    int dim, int nt, int nchunk, int ntb, cudaStream_t stream
+) {
+    swiglu_quant_f32_t<<<ntb * MMQ_A_BLK, 256, 0, stream>>>(
+        gate, up, dst, yqs, ysda, dim, nt, nchunk, ntb);
 }
 
 void launch_f32_bits_to_i32(
