@@ -80,7 +80,7 @@ fn print_usage(prog: &str) {
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("  {prog} <model> [prompt] [OPTIONS]");
-    eprintln!("  {prog} <model> --server [--port N] [--n-ctx N] [--n-slots N]");
+    eprintln!("  {prog} serve [--port N] [--n-ctx N] [--n-slots N] <model>");
     eprintln!("  {prog} info <model>");
     eprintln!("  {prog} download hf <repo> [quant]");
     eprintln!("  {prog} download ollama <model>[:tag]");
@@ -116,8 +116,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --stop <STR>         stop generation at this string (repeatable)");
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
-    eprintln!("  --server             run as an OpenAI-compatible HTTP server");
-    eprintln!("  --port <N>           server port (default 8080)");
+    eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
     eprintln!(
         "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
     );
@@ -188,10 +187,6 @@ fn main() {
                 // for release builds, "v<Cargo pkg version>" otherwise.
                 println!("minfer {}", env!("MINFER_VERSION"));
                 std::process::exit(0);
-            }
-            "--server" => {
-                server_mode = true;
-                i += 1;
             }
             "--port" => {
                 if let Some(v) = next_val(a) {
@@ -477,6 +472,18 @@ fn main() {
                 viz_port = server_port;
             }
         }
+        "serve" => {
+            // `minfer serve [--port N] [--n-ctx N] [--n-slots N] <model>` —
+            // model still specified at startup; the rest of main runs the
+            // normal load + server::run path (--port/--n-ctx/--n-slots already
+            // parsed into the server_* vars).
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} serve [--port N] [--n-ctx N] [--n-slots N] <model>");
+                std::process::exit(1);
+            }
+            server_mode = true;
+            positional.remove(0); // drop "serve"; positional[0] = model
+        }
         _ => {} // fall through to model inference
     }
 
@@ -520,7 +527,7 @@ fn main() {
     let prompt = if positional.len() > 1 {
         positional[1..].join(" ")
     } else if conv_mode || server_mode || viz_mode {
-        // --server / viz / --cnv take no positional prompt and never consume
+        // serve / viz / --cnv take no positional prompt and never consume
         // stdin for it. (Bare `minfer viz model` would otherwise hang on
         // read_line until you press Enter — the model+grep host already shows
         // startup, so don't block on a prompt these modes don't use.)

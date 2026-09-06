@@ -7,7 +7,7 @@
 //! sync; drops when no client is subscribed).
 //!
 //! **Lazy arming**: capture only happens while at least one SSE client is
-//! connected (`clients > 0`). Normal inference (CLI single-shot, `--server`)
+//! connected (`clients > 0`). Normal inference (CLI single-shot, `serve`)
 //! never arms the broadcaster, and a `viz` server with nobody watching pays
 //! nothing either — `enabled()` is a cheap uncontended lock + bool check,
 //! evaluated once per `execute()`.

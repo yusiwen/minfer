@@ -17,7 +17,7 @@ Three kinds of data are supported:
   (min/max/mean/abs-mean) + a downsampled-value heatmap + per-decode-step **token and
   logits top-5 distribution**; nodes are colored by this step's data magnitude and play
   continuously across steps.
-- **Live streaming** (P3, `--server`): the page connects to minfer's OpenAI server and watches
+- **Live streaming** (P3, `serve`): the page connects to minfer's OpenAI server and watches
   inference live over SSE — nodes light up one by one (with real stats and coloring), tokens
   stream out one at a time.
 
@@ -56,7 +56,7 @@ MINFER_TRACE=trace.json ./target/release/minfer <model.gguf> "Hello!" -n 5
   (GPU uses a staging blit, close to native speed; KV nodes are skipped at both ends)
 - Each decode step also carries: the input token (with its decoded text) + this step's logits
   softmax top-5
-- Works in single-shot CLI mode (not under `--cnv` / `--server`)
+- Works in single-shot CLI mode (not under `--cnv` / `serve`)
 
 Drop the JSON into `samples/` and register it in `manifest.json` to make it appear in the dropdown.
 
@@ -78,8 +78,8 @@ Drop the JSON into `samples/` and register it in `manifest.json` to make it appe
   CUDA, QKV fusion is Metal-only (no CUDA fused bias+rope+store kernel), FFN gate+up fusion
   runs on both — node ids match the live per-node events on every backend
 - **Lazy arming**: per-node data is only captured while an SSE client is connected — a `viz`
-  server with nobody watching, and normal CLI / `--server` inference, all cost nothing
-  (`--server` is a pure OpenAI API with no viz routes)
+  server with nobody watching, and normal CLI / `serve` inference, all cost nothing
+  (`serve` is a pure OpenAI API with no viz routes)
 - KV cache nodes (`kvcache_store/load`) are skipped at both ends because their data is huge
   (n_embd×n_ctx per layer) — the panel shows "no data for this step", consistent with fused
   orphan nodes
@@ -243,5 +243,5 @@ output buffer — it has no data in the trace and the page will say so).
 - **P1 (done)**: graph structure + metadata + playback animation + interaction
 - **P2 (done)**: `MINFER_TRACE` real-data trace — node stats + downsampled values +
   decode token / logits top-5, with the page's heatmap, magnitude coloring, and token strip
-- **P3 (done)**: SSE live streaming — `--server` + `/viz/graph` + `/viz/events`, where the page's
+- **P3 (done)**: SSE live streaming — `serve` + `/viz/graph` + `/viz/events`, where the page's
   "Live" panel lights up nodes and tokens in real time

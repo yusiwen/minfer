@@ -6,7 +6,7 @@
 //! - `GET /viz/graph` — prefill + decode graphs (same shape as a trace doc)
 //! - `GET /viz/events` — SSE live inference events
 //! - `POST /viz/run` — `{prompt, max_tokens?, temperature?}` trigger (chat
-//!   template rendered server-side, same slot/worker machinery as `--server`)
+//!   template rendered server-side, same slot/worker machinery as `serve`)
 //!
 //! Live capture is lazy: `live::enabled()` is true only while an SSE client is
 //! connected, so idle viz servers pay nothing.

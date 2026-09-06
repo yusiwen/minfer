@@ -60,7 +60,7 @@ A minimal local LLM inference engine built from scratch in Rust.
   whole conversation accumulates in the KV cache; in-session commands
   (`/clear`, `/regen`, …), automatic overflow truncation, `--session`
   persistence (see [docs/CLI-CONVERSATION-PLAN.md](docs/CLI-CONVERSATION-PLAN.md))
-- **OpenAI-compatible HTTP server** (`--server`) — `/v1/chat/completions`
+- **OpenAI-compatible HTTP server** (`serve`) — `/v1/chat/completions`
   (streaming + non-streaming), `/v1/models`, `/health`; multi-slot with queued
   serial execution (see [docs/OPENAI-CHAT-API-PLAN.md](docs/OPENAI-CHAT-API-PLAN.md))
 - **No external ML framework** — pure Rust; runtime deps are minimal (`rand`,
@@ -279,10 +279,10 @@ oldest turns are dropped automatically and generation continues). Qwen3-style
 `<think>…</think>` reasoning blocks are gray-highlighted (single-shot mode too,
 when stdout is a terminal or `MINFER_COLOR=1`).
 
-**OpenAI-compatible HTTP server** (`--server`):
+**OpenAI-compatible HTTP server** (`serve`):
 
 ```bash
-cargo run --release -- --server --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
+cargo run --release -- serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
 # POST /v1/chat/completions  (stream + non-stream)
 # GET  /v1/models, GET /health
 ```
