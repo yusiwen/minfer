@@ -3701,3 +3701,50 @@ Artifacts: `/tmp/patch_e2_kernel.py` + `/tmp/patch_e2_rust.py` +
 attempt `ncu_e2_err.log` documents the sudo-env-strip gotcha),
 `/tmp/minfer_phase7/suite_e2.log`,
 `/tmp/minfer_phase7/g32_e2.sh` + `parity_e2.sh` + `perf_e_ab.sh` + `ncu_e2.sh`.
+
+### P6 r57 (Session E, basket round 2): FA KV staging double-buffer at FA_TQ=48 — REVERTED (greedy byte-identity lost; the r50 tile-size caveat re-activated) + items 3/4/5 out-of-budget (2026-09-06)
+
+**Item 1 — FA KV double-buffer (REVERTED after 2 attempts).** The smem
+arithmetic (done first, per the r50 launcher lesson) picked FA_TQ=48 + a
+double-buffered K/V pipeline: (48 + 4·32)·136·2 B = 47,872 B → 2 blocks/SM
+(FA_TQ=64 + double-KV = 52.2 KB → 1 block/SM, loses a block; FA_TKV stays 32
+so per-row accumulation order was EXPECTED unchanged). Implementation:
+prologue-staged tile 0, per-tile issue of kt+FA_TKV into buffer buf^1 with
+`wait_group 1` (last tile `wait_group 0`), warp 3 (FA_TQ=48 = three 16-row
+wmma tiles) staging/barriers-only, guarded compute + writeout. Attempt 1
+diverged at greedy-32 token 19; the fix attempt found and fixed a REAL bug
+(the tail-tile stage→global O copy was inside the warp guard, so warp 3's
+lanes never wrote their columns of the tail block's rows) — but attempt 2
+STILL diverged (byte 286), i.e. the residual is the r50-class inherent
+rounding shift from changing a tile size on this kernel (the per-row
+online-softmax merge sequence is NOT partition-invariant under the
+`m0 = mnew0` update — the task premise "the r50 caveat does NOT apply" was
+falsified: FA_TQ is a tile size too). Per the stop rule (drop after failed
+attempts) the item was REVERTED (`git checkout` of the r56 state,
+cmp-verified: rebuild md5 differs from the snapshot — rebuilds are not
+bit-deterministic — but the greedy token stream is IDENTICAL and a perf
+sanity run printed 3222.4 tok/s ≈ the landed median). The double-buffer
+mechanism itself remains viable ONLY for a future FA change that accepts
+non-byte-identical output (or pairs with a numerics-order-preserving
+restructure); FA_TKV=16 and FA_TQ changes are both now known to break the
+strict gate.
+
+**Items 3/4/5 — not reached (session budget).** Item 3 (rms_nw roofline,
+ideal +0.98%) needs an ncu-guided single-variable iteration; Item 4 (2×~3 ms
+one-time host stalls, +0.6%) — first-suspect note for the next session: the
+stalls bracket the first mode-2 swiglu / first q6_K ffn_down dispatch and are
+minfer-host-code (CUPTI: not inside CUDA APIs), consistent with first-launch
+lazy module loads + first-use MmqCache plane get_or_grow (a ~63 MB
+buf_qa8_t/buf_sda_t cudaMalloc for nchunk=592) — a load-time pre-warm
+(cudaFuncGetAttributes on all kernels + pre-grow of the fused-producer
+planes) is the cheap candidate fix; Item 5 (tail get_or_grow pre-grow,
++0.1%) folds into the same pre-warm work. None attempted: the basket bar was
+already cleared by Item 2 alone and the remaining budget went to the Item-1
+two-attempt cycle.
+
+**Session E basket verdict:** first tier landed at **+2.35% whole-prefill
+(3138.6 → 3212.5 tok/s, 1.035× vs-llama)** via the Item-2 bundle alone
+(≥ +1.5% bar cleared; single-item landing rule applied, so no composition
+with dropped items was needed). Next session: the pre-warm/pre-grow host
+work (items 4+5, ~+0.7% combined estimate, low risk), rms_nw (item 3,
+bounded +0.5..1%), then Session F's q8_1 structural lever.
