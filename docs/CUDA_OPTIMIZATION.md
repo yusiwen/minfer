@@ -2955,6 +2955,109 @@ NOTE: `/tmp` was ephemeral this session — `prompt2k.txt` was regenerated
 was gone, so the pre-change baseline was rebuilt at HEAD and re-measured
 (2803.4 median ≈ the historical 2797.5).
 
+### P6 r52: fused-producer phase 2 — skip-write mode (MINFER_MMQ_A_FUSE=2) — LANDED (fused producers 151.9 → 86.5 ms, whole-prefill +5.45%, 2026-09-06)
+
+The r51 fused kernels still pay the f32 output write + L1/L2 re-read
+(swiglu: 251 MB written + re-read per launch; rms: 47.5 MB). r52 adds mode
+`MINFER_MMQ_A_FUSE=2`: the fused kernels compute the pad40_t plane
+REGISTER-RESIDENTLY and never write the f32 output (`*_nw` kernels; the r49
+MmqCache entry is keyed on the unwritten f32 pointer exactly as in r51). The
+mode-2 kernels are new code; the mode-1 kernels are untouched.
+
+**Window-safety proof (dispatch conditions, all checked per node in
+`CudaState::mmq_a_fuse_mode`):** the f32 output is dead iff (1) the full r51
+gate set holds — the consumers then always reach the transposed-plane paths
+in `prefill_mmq` (q4_K NB-BT / q6_K NB-BT); (2) rows ≥ 16 ∧ dim % 256 == 0
+(same as mode 1; dim%256 ⇔ (id/32)%8, the NB launchers' alignment gate, and
+d4%32 for the warp-chunk loop); (3) `!no_prefill_gemm()` — the legacy f32-A
+kernels are excluded; (4) no node-buffer debug reader is active:
+MINFER_GRAPH_DUMP / MINFER_DUMP_DIR / MINFER_TRACE / --viz live capture all
+degrade mode 2 → mode 1 (they read producer outputs after execution).
+Topology (verified in `models/qwen2/graph.rs`): every rms/swiglu output's
+ONLY consumers are its immediately-consecutive plain `Op::MatMul` nodes
+(attn-norm → q,k,v; ffn-norm → gate,up; swiglu → down) — residual adds read
+the PRE-norm buffer; the G3 tail (graph.rs:178-183) puts the last layer's
+FFN + output-norm + lm_head on n_out=1 rows, below the rows≥16 gate (those
+outputs ARE read directly by native-path matmuls and stay written);
+`Op::FusedFFN`/`Op::FusedQkv*` are decode-only (builder gate `nt == 1` +
+backend `nt != 1` Err) so no fused op can consume a producer output in
+prefill; attention/FA reads matmul outputs, not rms outputs; RmsNorm/SwiGLU
+are not in-place ops (no allocator alias). The cache window (r49) is cleared
+by any non-MatMul node and at `synchronize`; the producer re-keys it after
+its own clear, and the single all-CUDA split (weights all-or-nothing gate)
+has no mid-window boundaries; CUDA-graph capture is decode-only. Backstop:
+`MmqCache::dead_write` marks mode-2 entries; if ANY path would re-quantize a
+dead buffer (exotic weight type → native fallback, NB launcher cap failure →
+generic path), `mmq_quantize_transposed`/`mmq_quantize_native` REFUSE
+(return 0) and `prefill_mmq` errors out loudly (new `q8 == 0` guard before
+the `launch_mmq_raw_nt` fallthrough, which previously would have launched on
+a null A) — a window violation can never silently read garbage.
+Unsupported-under-mode-2 (documented): the debug/trace readers above (mode 2
+auto-degrades), and mixed CPU/CUDA splits (unreachable for these models).
+Both producers pass the enumeration with no remaining doubt → both go
+mode 2. (SwiGLU needed the coalesced-round kernel — see below; a naive
+per-thread-chunk mapping was a regression and was discarded.)
+
+**Kernels (`src/cuda_kernels.cu`):** `rms_norm_quant_nw_f32_t` — warp-per-row
+as mode 1; phase 2 re-derives y per chunk from x with the phase-1 expression
+verbatim and the 8 lanes owning a 32-float chunk (float4s 32k+lane → chunk
+4k+lane/8, word u=lane&7) exchange amax/ssum via 3 __shfl_xor steps (max/
+int-sum are order-insensitive → plane byte-identical); NO y store, no
+syncthreads (40 regs, 0 spill, 0 barriers). `swiglu_quant_nw_f32_t` — the
+block sweeps the row's float4s in COALESCED 256-float4 rounds (lane l loads
+float4 rd*256+l; 512 B per warp access) and quantizes with the same 8-lane
+shuffle mapping (f/8 chunk, f&7 word); tail rows zero-fill deterministically
+(52 regs, 0 spill, 0 barriers). Two mode-2 bugs were caught and fixed before
+landing: (a) a transcription bug in the first rms-nw (chunk index
+`k*8 + lane/8` instead of `4k + lane/8`) wrote past the plane end at large
+ntb — IllegalAddress (cuda err 700 surfaced as cascading fake "OOM" in
+`get_or_grow`, which now prints the error code) — caught by the greedy-32
+gate (token stream diverged via early EOS), NOT by parity (the parity
+fixtures never exercise rms-nw: 0.5B d=896 fails d%256, small nt) — fixed;
+(b) the first swiglu-nw (one thread per 128-B chunk, register-resident)
+made the gate/up loads lane-strided: fused swiglu 110.5 → 114.0 ms, whole-
+prefill 5× only +1.39% (below the +1.5% bar) — discarded for the
+coalesced-round form. The standalone-nvcc validator (valid_r52.cu) could
+not run this session — freshly nvcc-linked binaries SIGBUS in this
+environment while cargo-built ones run — kernel-level byte-identity is
+instead covered by greedy-32 token identity.
+
+**Gates (all green).** Build clean (ptxas notes above). Parity ×3 with the
+full gate set + A_FUSE=2: `cuda_prefill_mmq` 1/0, `cuda_prefill` 7/0,
+`cuda_fa_prefill_attention_parity` 1/0 (×3 runs). Greedy-32 byte-identical
+token streams vs the pre-change binary at its best config (A_FUSE=1), and
+new-binary A_FUSE=1 vs A_FUSE=2 also identical. nsys (`r52_final` vs the
+`r51_new` trace = the baseline config): fused rms 41.5 → 22.4 ms (0.77 →
+0.41/launch), fused swiglu 110.5 → 64.1 ms (4.09 → 2.37/launch, −42%),
+fused producers 151.9 → 86.5 ms (−65.4); standalone wo prepass 10.1 →
+10.4 ms; GEMM classes unchanged (q4_K 618.9 → 616.4, q6_K 197.8 → 199.2);
+prefill window 1097.4 → 1030.9 ms (−6.1%). Suite **166/0/3**.
+
+**Perf (interleaved 5× medians, full gates + A_FUSE=1 vs A_FUSE=2):**
+baseline (`/tmp/minfer_pre_r52`, re-measured 2855.7 median over the 4 valid
+runs; run5 was a cold outlier at 2385.5 on the shared box) → **3011.3 tok/s
+= +5.45%** (distributions fully separated: min-new 3009.4 > max-base
+2862.2). Well above the +1.5% bar.
+
+**Mode-2 recommendation: YES — `MINFER_MMQ_A_FUSE=2` should be the default
+recommendation in the env docs** (full gate set + A_FUSE=2): +5.45% with
+all gates green, the window-safety enumeration is closed for both producers,
+and the dead-write backstops turn any future window violation (new consumer
+topology, exotic weight type, launcher fallback) into a loud error instead
+of silent corruption. Caveats to keep documented: mode 2 auto-degrades to
+mode 1 under the debug/trace readers; models whose graphs one day route a
+producer output into a fused op must re-run the enumeration (the backstop
+would surface it as a hard error, not wrong numbers); validated on the
+qwen2.5-7B q4_k_m prefill shape + the suite models.
+
+Artifacts: `/tmp/minfer_pre_r52` (pre-change baseline, md5 de4e30d7…),
+`/tmp/minfer_phase7/{parity_r52.sh,g32_r52.sh,perf_r52_ab.sh,nsys_r52.sh,suite_r52.sh}`
+(+ `gates_r52{,b,c}.sh` chains), `parity_r52_run{1,2,3}.log`,
+`g32_r52_base_a1.txt` / `g32_r52_new_a1.txt` / `g32_r52_new_a2.txt`,
+`perf_r52_ab.log`, `r52_{new,final}.nsys-rep` + `.sqlite` +
+`*_cuda_gpu_trace.csv`, `r52_suite.log`, `valid_r52.cu` (validator source;
+builds but its binary SIGBUSes in this session env — see above).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

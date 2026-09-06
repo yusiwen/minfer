@@ -1423,3 +1423,50 @@ quantize-prepass line is CLOSED as a structural residual; what remains is
 28 wo-quantizes (10.1 ms, producer = FA kernel) and the fused swiglu's own
 phase-2 (~0.5-1 ms/launch theoretical claw-back).
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r51.
+
+#### §11.31 P6 r52 — fused-producer phase 2: skip-write mode (MINFER_MMQ_A_FUSE=2) — LANDED, +5.45%
+
+r51's fused kernels still pay the f32 output write + re-read (the exact
+llama.cpp `quantize_mmq_q8_1` pattern). r52 goes one step further: mode
+`MINFER_MMQ_A_FUSE=2` computes the pad40_t plane REGISTER-RESIDENTLY and
+never writes the f32 output. This is the minfer-specific completion of the
+A-pipeline: where llama.cpp fuses quantization into the GEMM's smem
+prologue (q8_1 needs 4-float groups + half-bdot sums per 8), minfer's BT
+plane format lets a standalone kernel emit the swizzled plane without the
+intermediate at all — the consumer-side code is unchanged (the r49 MmqCache
+still keys on the f32 pointer; the pointer is just never written).
+
+**Why it is safe here and would not be in llama.cpp:** minfer's graph is a
+static build-order node list; the window-safety enumeration (see
+CUDA_OPTIMIZATION.md P6 r52) proves each rms/swiglu output is consumed only
+by the immediately-consecutive MatMul nodes under the full gate set, so the
+"dead write" can never be read by a fallback path without hitting the loud
+refusal backstop (`MmqCache::dead_write` + quantize-helper refusals +
+`prefill_mmq` `q8 == 0` guard). llama.cpp's dynamic graph + fallback-heavy
+dispatch could not make the same closed-world claim, which is why upstream
+fuses into the GEMM instead of skipping the intermediate.
+
+**Kernel-mapping lesson (transferable):** the mode-2 swiglu was first
+written as one thread per 128-B chunk (register-resident v[32]) — that made
+the gate/up loads lane-strided (each load instruction = 32 separate 128-B
+lines) and the kernel SLOWER than the mode-1 write+re-read (114.0 vs
+110.5 ms; whole-prefill +1.39%, below the bar). The fix was to keep the
+r51 phase-1 COALESCED load structure (256 lanes sweep the row's float4s in
+512-B warp accesses) and re-map to chunks for quantization via 8-lane
+__shfl_xor amax/ssum reductions (chunk = float4/8 = f/8; word = f&7; the
+reductions are order-insensitive so the plane stays byte-identical): 110.5 →
+64.1 ms (2.37 ms/launch, −42%), fused rms 41.5 → 22.4 ms, fused producers
+151.9 → 86.5 ms (−65.4), prefill window 1097.4 → 1030.9 ms. An OOB-write
+variant of the same lesson: a transcription bug (chunk `k*8` vs `4k`) in the
+first rms-nw wrote past the plane end at large ntb — cuda err 700 masked as
+cascading "OOM" eprintlns — caught by the greedy-32 gate, NOT by the parity
+fixtures (they never exercise the fused path). Skip-write kernels need a
+byte-level or token-identity gate, not just tolerance parity.
+
+**Numbers:** whole-prefill interleaved 5× medians 2855.7 → 3011.3 tok/s =
+**+5.45%** (distributions separated; one cold base outlier excluded,
+documented); parity ×3 green; greedy-32 byte-identical (A_FUSE=1 vs 2 both
+directions); suite 166/0/3. Recommendation: A_FUSE=2 becomes the default
+(env-docs) — the dead-write backstops turn any future topology drift into a
+hard error.
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r52.
