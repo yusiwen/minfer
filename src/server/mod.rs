@@ -41,7 +41,7 @@ pub struct AppState {
 }
 
 /// Build the axum router (pure OpenAI API; the viz live endpoints live under
-/// `minfer --viz`, see `server::viz`).
+/// `minfer viz`, see `server::viz`).
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))

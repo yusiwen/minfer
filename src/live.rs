@@ -1,5 +1,5 @@
 //! P3 live event broadcast — the web visualizer watches inference in real
-//! time over SSE (`/viz/events`, served by `minfer --viz`).
+//! time over SSE (`/viz/events`, served by `minfer viz`).
 //!
 //! The scheduler emits one event per executed node (reusing the P2 read-back);
 //! the generation loop emits phase / step / token / logits events. Events are
@@ -8,7 +8,7 @@
 //!
 //! **Lazy arming**: capture only happens while at least one SSE client is
 //! connected (`clients > 0`). Normal inference (CLI single-shot, `--server`)
-//! never arms the broadcaster, and a `--viz` server with nobody watching pays
+//! never arms the broadcaster, and a `viz` server with nobody watching pays
 //! nothing either — `enabled()` is a cheap uncontended lock + bool check,
 //! evaluated once per `execute()`.
 //!
@@ -43,7 +43,7 @@ fn live() -> &'static Mutex<Live> {
     })
 }
 
-/// Server startup (`--viz`): arm the broadcaster.
+/// Server startup (`viz` subcommand): arm the broadcaster.
 pub fn init(tx: Tx) {
     live().lock().unwrap().tx = Some(tx);
 }

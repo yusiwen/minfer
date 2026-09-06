@@ -1,4 +1,4 @@
-//! Self-contained visualization server — `minfer --viz [port]`.
+//! Self-contained visualization server — `minfer viz [--port N] <model>`.
 //!
 //! One process serves everything the web visualizer needs:
 //! - the viz/ page itself (embedded at build time; samples/ optionally from

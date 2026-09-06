@@ -655,7 +655,7 @@ fn main() {
         return;
     }
 
-    // === Self-contained viz server (--viz [port]) ===
+    // === Self-contained viz server (viz subcommand, or the --viz alias) ===
     if viz_mode {
         eprintln!(
             "Starting viz server (model={}, n_ctx={}, slots={})",
