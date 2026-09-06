@@ -60,11 +60,11 @@ MINFER_TRACE=trace.json ./target/release/minfer <model.gguf> "Hello!" -n 5
 
 Drop the JSON into `samples/` and register it in `manifest.json` to make it appear in the dropdown.
 
-### Live streaming (P3) — the self-contained `minfer --viz` demo server
+### Live streaming (P3) — the self-contained `minfer viz` demo server
 
 ```bash
 # All in one process: page + live events + trigger endpoint (default port 8081)
-./target/release/minfer --viz <model.gguf>          # or --viz 9000 to pick a port
+./target/release/minfer viz <model.gguf>          # or viz --port 9000 <model.gguf>
 # Open http://127.0.0.1:8081/ in your browser — the page auto-detects and connects to the stream
 ```
 
@@ -77,7 +77,7 @@ Drop the JSON into `samples/` and register it in `manifest.json` to make it appe
 - **The `/viz/graph` preview mirrors the engine's CParams**: GPU participation is Metal OR
   CUDA, QKV fusion is Metal-only (no CUDA fused bias+rope+store kernel), FFN gate+up fusion
   runs on both — node ids match the live per-node events on every backend
-- **Lazy arming**: per-node data is only captured while an SSE client is connected — a `--viz`
+- **Lazy arming**: per-node data is only captured while an SSE client is connected — a `viz`
   server with nobody watching, and normal CLI / `--server` inference, all cost nothing
   (`--server` is a pure OpenAI API with no viz routes)
 - KV cache nodes (`kvcache_store/load`) are skipped at both ends because their data is huge
@@ -151,7 +151,7 @@ Right — filters & view:
   pushes onto a **panel nav stack**; a **`← Back`** button appears at the top-left to step back.
 
 ### 5. Live streaming (`Live` panel)
-- Open the **Live** panel (top-right), point it at `minfer --viz` (default
+- Open the **Live** panel (top-right), point it at `minfer viz` (default
   `http://127.0.0.1:8081`), click **Connect**, enter a prompt, click **Run**.
 - Nodes light up one by one with live stats/coloring; the token strip and the panel's logits
   distribution update as tokens stream out.
@@ -181,7 +181,7 @@ Input → Embedding → [Transformer Layers × N] → Final RMSNorm → Logits �
   `Contained ops` link) → the per-op inspector, with a **`← Back`** button in the top-left that
   returns to the previous view (the nav stack also covers Upstream/Downstream links).
 - **Same animation/live data.** The stage/layer boxes are driven by the same execution cursor and
-  the same `--viz` SSE stream: as an op runs, its box lights up and is tinted by that op's
+  the same `viz` SSE stream: as an op runs, its box lights up and is tinted by that op's
   abs-mean. The `Legend` button is **context-aware** — it shows the operator list in the
   Operators view and the stage/flow explanation (stages, pipeline order, box markings, backend
   colors) in the Pipeline view.

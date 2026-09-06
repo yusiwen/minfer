@@ -87,7 +87,7 @@ MINFER_DISABLE_MPS=1 ./target/release/minfer <model> "hello"      # force CPU
 MINFER_DUMP_DIR=/tmp/dump ./target/release/minfer <model> "hello" # debug dump (debug_dump build)
 MINFER_GRAPH_DUMP=/tmp/d ./target/release/minfer --graph <model> "hello"  # dump graph logits/KV (any build)
 MINFER_TRACE=/tmp/t.json ./target/release/minfer <model> "hello" -n 5      # per-node real-data trace for viz/ (P2)
-MINFER_DISABLE_MPS=1 ./target/release/minfer --viz <model>                  # self-contained viz server (page + live SSE + /viz/run), lazy capture
+MINFER_DISABLE_MPS=1 ./target/release/minfer viz <model>                    # self-contained viz server (page + live SSE + /viz/run), lazy capture
 ```
 
 Split (multi-part) GGUF is supported: entry is part 0; `load_gguf_model` parses every part and builds a merged tensor index; download resume is size-checked (curl `-C -`).

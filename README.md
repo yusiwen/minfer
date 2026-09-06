@@ -28,7 +28,7 @@ A minimal local LLM inference engine built from scratch in Rust.
   Graphviz DOT export (`--dump-graph`) and **interactive web visualization**
   (`viz/` — `--dump-graph-json` + zero-dependency flowchart page)
 - **Interactive graph visualization (`viz/`)** — a zero-dependency browser page
-  for the compute graph. `minfer --viz <model>` serves the page, live SSE
+  for the compute graph. `minfer viz <model>` serves the page, live SSE
   inference, per-node tensor stats/heatmaps and logits top-5 in one process;
   `--dump-graph-json` / `MINFER_TRACE` export graphs and real traces. See the
   [visualization showcase](#interactive-web-visualization-viz) and
@@ -86,8 +86,8 @@ Both views support playback animation and live inference over SSE:
 ![minfer inference graph visualization](docs/viz-demo.png)
 ![minfer inference pipeline visualization](docs/viz-demo2.png)
 
-- **Live streaming**: `minfer --viz <model.gguf>` (default port 8081) serves the
-  page + live SSE from a single process.
+- **Live streaming**: `minfer viz <model.gguf>` (default port 8081; `--port N` to
+  change) serves the page + live SSE from a single process.
 - **Export a graph**: `minfer --dump-graph-json graph.json <model> "Hello"`; or
   pick a canned sample via the page's "Select a sample model" dropdown.
 
@@ -393,14 +393,14 @@ minfer/
 │   ├── tokenizer.rs       # BPE tokenizer (self-contained, GGUF-backed)
 │   ├── template.rs        # Chat template detection + formatting
 │   ├── conversation.rs    # Multi-turn conversation session (append-only KV + Engine abstraction)
-│   ├── live.rs            # P3 live event broadcast (SSE for --viz)
+│   ├── live.rs            # P3 live event broadcast (SSE for the viz subcommand)
 │   ├── trace.rs           # P2 per-node trace data (MINFER_TRACE)
 │   ├── server/            # OpenAI-compatible HTTP server
 │   │   ├── mod.rs         # axum router + handlers (chat completions, models, health)
 │   │   ├── types.rs       # Request/response types + ApiError
 │   │   ├── slot.rs        # Per-slot GraphCache + context budget
 │   │   ├── chat.rs        # Serial worker generation loop + SSE events
-│   │   └── viz.rs         # --viz interactive visualization server
+│   │   └── viz.rs         # viz interactive visualization server
 │   ├── download/          # Model download from HF Hub & Ollama
 │   │   └── mod.rs         # resolve() URI handler, curl-based HTTP, list_local()
 │   └── models/            # Architecture-specific implementations

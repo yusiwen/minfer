@@ -117,9 +117,8 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --server             run as an OpenAI-compatible HTTP server");
     eprintln!("  --port <N>           server port (default 8080)");
-    eprintln!(
-        "  --viz [PORT]         self-contained viz server (web page + live SSE, default port 8081)"
-    );
+    eprintln!("  viz [--port N] <model>  self-contained viz server (web page + live SSE,");
+    eprintln!("                       default port 8081; legacy alias: --viz [port] <model>)");
     eprintln!(
         "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
     );
@@ -163,9 +162,11 @@ fn main() {
     let mut server_port: u16 = 8080;
     let mut server_n_ctx: usize = params.n_ctx;
     let mut server_n_slots: usize = 1;
-    // Self-contained viz server (P3 live demo): `--viz [port]`.
+    // Self-contained viz server: `minfer viz [--port N] <model.gguf>` (and the
+    // legacy alias `--viz [port] <model.gguf>`).
     let mut viz_mode = false;
     let mut viz_port: u16 = 8081;
+    let mut port_provided = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -214,6 +215,7 @@ fn main() {
                         parse_err = Some(format!("invalid --port '{v}'"));
                         8080
                     });
+                    port_provided = true;
                 }
                 i += 2;
             }
@@ -478,6 +480,19 @@ fn main() {
             dump_key_tensors(ctx);
             return;
         }
+        "viz" => {
+            // `minfer viz [--port N] <model.gguf>` — model still specified at
+            // startup, so the rest of main runs the normal load + run_viz path.
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} viz [--port N] <model.gguf>");
+                std::process::exit(1);
+            }
+            viz_mode = true;
+            positional.remove(0); // drop the subcommand token; positional[0] = model
+            if port_provided {
+                viz_port = server_port;
+            }
+        }
         _ => {} // fall through to model inference
     }
 
@@ -522,7 +537,7 @@ fn main() {
         positional[1..].join(" ")
     } else if conv_mode || server_mode || viz_mode {
         // --server / --viz / --cnv take no positional prompt and never consume
-        // stdin for it. (Bare `minfer --viz model.gguf` would otherwise hang on
+        // stdin for it. (Bare `minfer viz model.gguf` would otherwise hang on
         // read_line until you press Enter — the model+grep host already shows
         // startup, so don't block on a prompt these modes don't use.)
         String::new()
@@ -559,7 +574,7 @@ fn main() {
                     eprintln!("       candidates:");
                     for f in &found {
                         eprintln!(
-                            "         minfer --viz {}/{}",
+                            "         minfer viz {}/{}",
                             model_path.trim_end_matches('/'),
                             f
                         );
