@@ -3803,6 +3803,72 @@ mod tests {
     }
 
     #[test]
+    fn cuda_q6k_dsc_dense_byte_exact() {
+        // r56 (Session E item 2b) gate 1: the precomputed dsc f32-pair plane
+        // must be byte-identical to an independent scalar mirror of the
+        // kernel's in-loop dsc computation (d = f16(blk+208); dsc = d *
+        // (int8)blk[192 + 2*(c&7) + {0,1}]) — checked on the HOST expander and
+        // on the DEVICE upload (pinned readback), over shapes covering several
+        // super-blocks per row and od values that exercise the chunk-major
+        // [c*od + j] layout.
+        let Some(state) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let mut s: u64 = 0xC0FF_EE12_3456_789A;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for (od, id) in [(64usize, 256usize), (40usize, 512usize), (24usize, 768usize)] {
+            let nbe = id / 256;
+            let nchunk = id / 32;
+            let row_len = nbe * 210;
+            let raw: Vec<u8> = (0..od * row_len).map(|_| (rnd() & 0xFF) as u8).collect();
+            let mut padded = vec![0u8; od * nbe * 224];
+            for r in 0..od {
+                for ib in 0..nbe {
+                    let src = r * row_len + ib * 210;
+                    let dst = r * nbe * 224 + ib * 224;
+                    padded[dst..dst + 210].copy_from_slice(&raw[src..src + 210]);
+                }
+            }
+            // independent scalar mirror straight from the kernel formula
+            let mut want = vec![0u8; nchunk * od * 8];
+            for j in 0..od {
+                for sb in 0..nbe {
+                    let base = (j * nbe + sb) * 224;
+                    let blk = &padded[base..base + 210];
+                    let d = half::f16::from_bits(u16::from_le_bytes([blk[208], blk[209]])).to_f32();
+                    for cc in 0..8usize {
+                        let sc0 = blk[192 + 2 * cc] as i8 as f32;
+                        let sc1 = blk[192 + 2 * cc + 1] as i8 as f32;
+                        let idx = ((sb * 8 + cc) * od + j) * 8;
+                        want[idx..idx + 4].copy_from_slice(&(d * sc0).to_bits().to_le_bytes());
+                        want[idx + 4..idx + 8].copy_from_slice(&(d * sc1).to_bits().to_le_bytes());
+                    }
+                }
+            }
+            // host-side production expander vs the mirror
+            let host = crate::cuda::CudaState::expand_q6k_dsc(&padded, od, id);
+            let hmis = host.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(hmis, 0, "expand_q6k_dsc vs mirror ({od}x{id})");
+            // device upload path: build + read back + compare
+            let name = format!("r56dsc{od}x{id}");
+            state.register_weight_q6k_padded(&name, &raw, od, id);
+            state.register_weight_q6k_dsc(&name, &padded, od, id);
+            let dsc_name = format!("{name}__dsc{od}x{id}");
+            let p = state.get_weight_ptr(&dsc_name).expect("W_dsc registered");
+            let mut got = vec![0u8; nchunk * od * 8];
+            state.copy_from_device_pinned(p, &mut got);
+            let dmis = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(dmis, 0, "device W_dsc vs mirror ({od}x{id})");
+        }
+    }
+
+    #[test]
     fn cuda_fa_prefill_attention_parity() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");

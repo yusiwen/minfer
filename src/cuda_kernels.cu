@@ -5793,6 +5793,7 @@ __device__ __forceinline__ int expand_q6_elem(const uint8_t* ql, const uint8_t* 
 template <int KDR, bool EXP>
 __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ W_exp,
+    const uint8_t* __restrict__ W_dsc,
     const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
     int nt, int od, int id, int nchunk, int bstride
@@ -5827,16 +5828,27 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
         uint8_t* sdaqb = sda_q + (size_t)(b) * sdaq_stride;                    \
         uint8_t* qbexpb = qb_exp + (size_t)(b) * qbexp_stride;                 \
         float2* sdsb = sds + (size_t)(b) * sds_stride;                         \
-        /* ---- A: bulk LDG->STS of the pre-transposed qa8/sda (no math) ----*/\
+        /* ---- A: r56 cp.async bulk staging of the pre-transposed qa8/sda --*/\
+        /* (r45's mechanism on top of r53: the sync LDG->STS exposed its      */\
+        /* global latency at the top of every staging phase; cp.async hands  */\
+        /* it to the async unit and the group wait below hides it under the  */\
+        /* previous tile's compute. Bytes identical - the plane is always    */\
+        /* full: the prepass zero-fills the padded rows.)                    */\
         {                                                                      \
             const size_t qbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_QASZ; \
             for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 32) / 16;       \
                  off += blockDim.x)                                            \
-                ((uint4*)(qa8b))[off] = ((const uint4*)(qa8g + qbase))[off];   \
+                gemm_cp16((__half*)(void*)(qa8b + (size_t)off * 16),           \
+                          (const __half*)(const void*)(qa8g + qbase            \
+                                                       + (size_t)off * 16),    \
+                          true);                                               \
             const size_t sbase = ((size_t)blockIdx.x * nchunk + (size_t)(kt) * KDR) * MMQ_A_SDASZ; \
             for (int off = threadIdx.x; off < (KDR * MMQ_NBI * 4) / 16;        \
                  off += blockDim.x)                                            \
-                ((uint4*)(sdaqb))[off] = ((const uint4*)(sdag + sbase))[off];  \
+                gemm_cp16((__half*)(void*)(sdaqb + (size_t)off * 16),          \
+                          (const __half*)(const void*)(sdag + sbase            \
+                                                       + (size_t)off * 16),    \
+                          true);                                               \
         }                                                                      \
         /* ---- B: KDR*32-chunk super-block window (half-super at KDR=4) --- */\
         {                                                                      \
@@ -5868,7 +5880,8 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
                                                  + cc * 16),                   \
                         (const __half*)(const void*)src, full);                \
                 }                                                              \
-                gemm_cp_commit();                                              \
+                /* r56: the commit moved to the end of RAW_STAGE so ONE group */\
+                /* per kt covers A + B + dsc together.                       */\
             } else if ((bstride & 15) == 0) {                                  \
                 /* r41: 16-elem group expand via uint4 ql+qh global loads.     \
                  * The padded 224B block stride is 16-aligned, so a group's    \
@@ -5931,6 +5944,30 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
             }                                                                  \
         }                                                                      \
         /* ---- B: dsc pair (d*sc[2c%16], d*sc[(2c+1)%16]) per (chunk,row) ----*/\
+        /* r56: W_dsc f32 plane (registration-time precompute; chunk-major    */\
+        /* layout plane[c*od + j] = float2(d*sc0, d*sc1)) turns the scalar    */\
+        /* blk[192+..]/blk[208] loads + I2F (a leading r43 residual stall     */\
+        /* post-r53) into a contiguous 16-B cp.async stream inside the same   */\
+        /* per-kt commit group. Null plane (raw weights / alloc failure /     */\
+        /* odd od) = the r41 scalar path, byte-identical.                     */\
+        {                                                                      \
+            const int c0d = (kt) * KDR;                                        \
+            if (W_dsc != nullptr) {                                            \
+                const int nc2 = MMQ_NBJ / 2; /* 16-B chunks (2 float2) per kd */\
+                for (int g = threadIdx.x; g < KDR * nc2; g += blockDim.x) {    \
+                    const int kdd = g / nc2, m = g % nc2;                      \
+                    const int j = j0 + 2 * m;                                  \
+                    /* od even (registration gate) => a pair is either fully   */\
+                    /* valid or fully beyond od (src-size zero-fill).          */\
+                    const bool full = (j + 1 < od);                            \
+                    gemm_cp16(                                                 \
+                        (__half*)(void*)(sdsb + (size_t)kdd * MMQ_NBJ          \
+                                                  + 2 * m),                    \
+                        (const __half*)(const void*)(W_dsc                     \
+                            + ((size_t)(c0d + kdd) * (size_t)od + (size_t)j) * 8), \
+                        full);                                                 \
+                }                                                              \
+            } else {                                                           \
         for (int x = threadIdx.x; x < MMQ_NBJ * KDR; x += blockDim.x) {        \
             const int r = x % MMQ_NBJ, kd = x / MMQ_NBJ;                       \
             const int j = j0 + r, c = (kt) * KDR + kd;                         \
@@ -5945,6 +5982,9 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
             }                                                                  \
             sdsb[(size_t)kd * MMQ_NBJ + r] = make_float2(dsc0, dsc1);          \
         }                                                                      \
+            }                                                                  \
+        }                                                                      \
+        gemm_cp_commit();                                                      \
     } while (0)
 
     const unsigned l12m = (unsigned)(lane & 12) * 32;
@@ -5964,17 +6004,17 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
         // OTHER buffer (buf^1) while reading buffer buf (the mmq_nt<7,2> pipeline).
         if (kt + 1 < nktile) {
             RAW_STAGE_Q6K_BT(kt + 1, buf ^ 1);
-            // r53 (EXP): two groups are pending (kt's and kt+1's); wait until
-            // only kt+1's remains — group(kt), the cp.async B copy for `buf`,
-            // has landed, while buf^1's copy stays in flight under kt's
-            // compute (in-order group completion). The sync A staging for
-            // buf^1 above needs no wait.
-            if (EXP) gemm_cp_wait1();
-        } else if (EXP) {
+            // r53 (EXP) / r56: two groups are pending (kt's and kt+1's); wait
+            // until only kt+1's remains — group(kt), the cp.async copies (r56:
+            // A + dsc too, not just B) for `buf`, has landed, while buf^1's
+            // copies stay in flight under kt's compute (in-order group
+            // completion).
+            gemm_cp_wait1();
+        } else {
             gemm_cp_wait0();  // last tile: drain every outstanding group
         }
-        if (EXP) __syncthreads();  // r53 (EXP): cross-thread visibility of the
-                                   // kt buffer's async B copy before compute
+        __syncthreads();  // r53/r56: cross-thread visibility of the kt
+                          // buffer's async copies before compute
 
         const uint8_t* qa8c = qa8 + (size_t)buf * qa8_stride;
         const uint32_t* sdaqc = reinterpret_cast<const uint32_t*>(sda_q + (size_t)buf * sdaq_stride);
@@ -6107,9 +6147,9 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
 // W_exp plane); w_exp == 0 keeps the r41 in-kernel expand. Returns 0 (clean
 // fallback to the generic mmq_nt<7,2>) on any cap/mismatch.
 extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
-    int type_id, const uint8_t* w, const uint8_t* w_exp, const uint8_t* qa8g,
-    const uint8_t* sdag, float* c, int nt, int od, int id, int nchunk,
-    int bstride, cudaStream_t stream, int kd
+    int type_id, const uint8_t* w, const uint8_t* w_exp, const uint8_t* w_dsc,
+    const uint8_t* qa8g, const uint8_t* sdag, float* c, int nt, int od, int id,
+    int nchunk, int bstride, cudaStream_t stream, int kd
 ) {
     (void)type_id;
     if (kd != 8) return 0;
@@ -6136,10 +6176,10 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
     if (exp) {
         mmq_raw_nb_bt_q6k_kernel<KDR, true><<<grid, 256, smem, stream>>>(
-            w, w_exp, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride);
     } else {
         mmq_raw_nb_bt_q6k_kernel<KDR, false><<<grid, 256, smem, stream>>>(
-            w, w_exp, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride);
     }
     e = cudaGetLastError();
     if (e != cudaSuccess) {

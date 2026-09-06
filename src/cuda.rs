@@ -436,6 +436,7 @@ extern "C" {
         type_id: i32,
         w: *const u8,
         w_exp: *const u8,
+        w_dsc: *const u8,
         qa8g: *const u8,
         sdag: *const u8,
         c: *mut f32,
@@ -940,6 +941,14 @@ pub struct CudaState {
     q6k_exp: Mutex<HashMap<usize, CudaPtr>>,
     /// r53: the W_exp allocation-failure warning prints once per process.
     q6k_exp_warned: std::sync::atomic::AtomicBool,
+    /// r56 (Session E item 2b): per-tensor precomputed dsc f32 pairs for the
+    /// NB-BT q6_K kernel — plane[c*od + j] = float2(d*sc0, d*sc1), chunk-major
+    /// so the per-kt staging is a contiguous 16-B cp.async stream. Keyed by the
+    /// PADDED weight's device pointer exactly like `q6k_exp`; a miss (gate off,
+    /// alloc failure, odd od) keeps the r41 scalar dsc path.
+    q6k_dsc: Mutex<HashMap<usize, CudaPtr>>,
+    /// r56: the W_dsc allocation-failure warning prints once per process.
+    q6k_dsc_warned: std::sync::atomic::AtomicBool,
     // Persistent activation buffers (grown on demand) with size tracking
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_hidden: Mutex<(CudaPtr, usize)>,
@@ -1248,6 +1257,8 @@ impl CudaState {
             padded_weights: Mutex::new(HashMap::new()),
             q6k_exp: Mutex::new(HashMap::new()),
             q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
+            q6k_dsc: Mutex::new(HashMap::new()),
+            q6k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
             buf_bq: Mutex::new(dummy),
@@ -1402,6 +1413,13 @@ impl CudaState {
             && id % 256 == 0
         {
             self.register_weight_q6k_exp(name, &padded, od, id);
+            // r56 (Session E item 2b): the dsc f32 plane rides the same gate
+            // (+ od % 2 == 0: the kernel stages row PAIRS per 16-B cp.async
+            // chunk and zero-fills whole pairs, so an odd od row would lose
+            // its scale — such tensors keep the scalar path via map miss).
+            if od % 2 == 0 {
+                self.register_weight_q6k_dsc(name, &padded, od, id);
+            }
         }
     }
 
@@ -1439,6 +1457,69 @@ impl CudaState {
                  r41 in-kernel expand"
             );
         }
+    }
+
+    /// r56 (Session E item 2b): build + upload the precomputed dsc f32-pair
+    /// plane for one padded q6_K tensor and map it from the padded weight's
+    /// device pointer. Called from [`Self::register_weight_q6k_padded`] under
+    /// the same gate as `register_weight_q6k_exp` (+ `od % 2 == 0`). An
+    /// alloc/upload failure leaves the map empty: the kernel falls back to the
+    /// r41 scalar dsc path with a once-per-process loud eprintln.
+    pub fn register_weight_q6k_dsc(&self, name: &str, padded: &[u8], od: usize, id: usize) {
+        // geometry-encoded sibling name (same rationale as the W_exp name).
+        let dsc_name = format!("{name}__dsc{od}x{id}");
+        let dsc = Self::expand_q6k_dsc(padded, od, id);
+        self.register_weight(&dsc_name, &dsc);
+        if let Some(wp) = self.get_weight_ptr(name) {
+            if let Some(dp) = self.get_weight_ptr(&dsc_name) {
+                if !wp.is_null() && !dp.is_null() {
+                    self.q6k_dsc.lock().unwrap().insert(wp as usize, CudaPtr(dp));
+                    return;
+                }
+            }
+        }
+        if !self
+            .q6k_dsc_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "minfer/cuda: q6_K W_dsc plane unavailable for '{name}' \
+                 (alloc/upload failed) - mmq_raw_nb_bt_q6k keeps the r41 \
+                 scalar dsc path"
+            );
+        }
+    }
+
+    /// r56 (Session E item 2b): precomputed dsc pairs of one padded q6_K
+    /// tensor. Output: `nchunk * od * 8` bytes, `out[(c*od + j)*8..+8]` =
+    /// float2(d*sc[2(c&7)], d*sc[2(c&7)+1]) — chunk-major so the kernel's
+    /// per-kt staging (rows j0..j0+MMQ_NBJ of chunk c0+kd contiguous) is a
+    /// pure 16-B cp.async stream. Bit-identical to the in-kernel r41 scalar
+    /// computation: exact f16->f32 (half::f16, = __half2float), exact
+    /// i8->f32, one IEEE f32 multiply, no FMA contraction on either side.
+    pub fn expand_q6k_dsc(padded: &[u8], od: usize, id: usize) -> Vec<u8> {
+        const Q6KB: usize = 210;
+        const Q6KPB: usize = 224;
+        let nbe = id / 256;
+        let row_len = nbe * Q6KPB;
+        let mut out = vec![0u8; (id / 32) * od * 8];
+        for j in 0..od {
+            let prow = &padded[j * row_len..(j + 1) * row_len];
+            for sb in 0..nbe {
+                let blk = &prow[sb * Q6KPB..sb * Q6KPB + Q6KB];
+                let d_bits = u16::from_le_bytes([blk[208], blk[209]]);
+                let d = half::f16::from_bits(d_bits).to_f32();
+                for cc in 0..8usize {
+                    let s0 = 2 * cc;
+                    let sc0 = blk[192 + s0] as i8 as f32;
+                    let sc1 = blk[192 + s0 + 1] as i8 as f32;
+                    let idx = ((sb * 8 + cc) * od + j) * 8;
+                    out[idx..idx + 4].copy_from_slice(&(d * sc0).to_bits().to_le_bytes());
+                    out[idx + 4..idx + 8].copy_from_slice(&(d * sc1).to_bits().to_le_bytes());
+                }
+            }
+        }
+        out
     }
 
     /// r53: dense centered-int8 pre-expansion of one padded q6_K tensor — the
@@ -2710,12 +2791,22 @@ impl CudaState {
                     .get(&(wptr as usize))
                     .map(|cp| cp.0)
                     .unwrap_or(std::ptr::null_mut());
+                // r56 (Session E item 2b): the precomputed dsc f32-pair plane
+                // (null on miss -> the r41 scalar dsc path in-kernel).
+                let w_dsc = self
+                    .q6k_dsc
+                    .lock()
+                    .unwrap()
+                    .get(&(wptr as usize))
+                    .map(|cp| cp.0)
+                    .unwrap_or(std::ptr::null_mut());
                 if qa8g != 0
                     && sdag != 0
                     && launch_mmq_raw_nb_bt_q6k_nt(
                         type_id,
                         wptr as *const u8,
                         w_exp as *const u8,
+                        w_dsc as *const u8,
                         qa8g as *const u8,
                         sdag as *const u8,
                         out as *mut f32,
@@ -2744,10 +2835,19 @@ impl CudaState {
                         } else {
                             "in-kernel-expand(fallback!)"
                         };
+                        // r56: name the A/dsc staging paths too (liveness
+                        // check per the r53 lesson — a fallback-correct fast
+                        // path needs a visible label, parity cannot see it).
+                        let a = if !w_dsc.is_null() {
+                            "A=cp.async DSC=f32-plane"
+                        } else {
+                            "A=cp.async DSC=scalar"
+                        };
                         eprintln!(
                             "minfer/cuda: mmq raw NB-BT q6_K kernel active \
-                             (r54 B={}, r39 KDR=2 double-buffer, A-transpose)",
-                            b
+                             (r56 {}, r54 B={}, r39 KDR=2 double-buffer, \
+                             A-transpose)",
+                            a, b
                         );
                     }
                     return Ok(());
