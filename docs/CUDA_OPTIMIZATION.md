@@ -3270,6 +3270,104 @@ perf_r54.sh,mem_r54.sh,gates_r54.sh}` (+ `parity_r54_{a,b}_run{1,2,3}.log`,
 `mem_r54_{exp1,exp0}.poll`, `r54_suite2.log`, `r54_suite3.log`,
 `r54_fail_{q5,recap}.log` isolated-rerun proofs).
 
+### P6 r55 (Session D, final basket round): fused-swiglu roofline audit + one-shot prefill CUDA-Graph decision — BOTH DOCUMENTED SKIPS (measurement-closed, no code change) (2026-09-06)
+
+The final round proposed two low-risk levers: (1) push
+`swiglu_quant_nw_f32_t` toward the DRAM roofline, (2) enable CUDA-Graph
+capture for the prefill. Both were closed BY MEASUREMENT before any code
+was written — the tree is unchanged at HEAD dd6d842 (baseline binary
+snapshotted to /tmp/minfer_pre_r55, md5 2ba8f1ef…, cmp-verified).
+
+**Lever 1 — swiglu roofline: the proposal's traffic estimate was 2× low;
+the kernel is already at ~89% of peak.** The proposal estimated traffic ≈
+gate+up reads (2 × 18944 × nt × **2 B**) + plane ≈ 318 MB → ~134 GB/s vs
+the ~273 GB/s GB10 roofline. ncu (SpeedOfLight + MemoryWorkloadAnalysis +
+explicit sector counters, first launch, full gate set + A_FUSE=2) proves
+the reads are f32 (4 B):
+- L1 global-load sectors 15,695,104 × 32 B = **502.2 MB = exactly
+  2 × nt(3314) × dim(18944) × 4 B** (gate+up f32), **sectors/request = 16**
+  → the loads are already maximally vectorized float4 (candidate (b)
+  already satisfied);
+- store sectors 3,940,352 × 32 B = 126.1 MB L1-side for 70.9 MB of plane
+  (yqs 63.05 + ysda 7.88; the swizzled pad40 pattern issues 128 B per
+  32-lane request, sectors/request = 4);
+- L2 traffic 628.8 MB @ 17.2% hit → minimal DRAM traffic ≈ 573.1 MB in
+  2.367 ms (production nsys avg; ncu 2.42–2.44 ms) = **242 GB/s ≈ 89% of
+  the 273 GB/s spec roofline** (`dram__bytes*` counters are n/a on GB10's
+  unified memory, so this is byte-count-derived, not counter-read);
+- achieved occupancy 94.6% (38 regs, 0 spill, 6 blocks/SM, 11.56 waves)
+  → candidate (a) already satisfied; stall mix = long_scoreboard 85.6 of
+  111 cycles/issue, all other reasons ≤ 2 → a latency-limited pure stream.
+- The decisive bound: 573.1 MB / 273 GB/s = 2.099 ms ideal → **max saving
+  0.268 ms × 27 launches = 7.2 ms = +0.74% whole-prefill — below the
+  +1.5% bar even for a perfect kernel** (the tail wave alone is ~3.7% of
+  the kernel, so candidate (c) grid-stride caps at ~+0.2%; candidate (d)
+  stays out of scope per r19). Cross-check of the roofline anchor: r51's
+  mode-1 kernel moved 824 MB in 4.09 ms = 201 GB/s; mode-2 improved
+  per-byte efficiency to 242 GB/s. **The lever is measurement-closed: no
+  implementation of this kernel can clear the bar.**
+
+**Lever 2 — prefill capture: already live for the repeat case
+(8g②/R3-B); the one-shot case is a measured no-win and today a hard
+capture-legality failure.** nsys of the full prefill (692 GPU activities,
+984.6 ms window, GPU busy 99.2%): idle 7.84 ms total = (i) two ONE-TIME
+host stalls of 3.05 + 3.00 ms bracketing the first `swiglu_quant_nw`
+launch and the first q6_K ffn_down BT launch — correlated via the CUPTI
+runtime table: NOT inside any CUDA API (launch API durations 16–40 µs),
+i.e. minfer's own host code between launch calls; deterministic across
+the r53 and r55 traces/binaries; (ii) a 0.78 ms one-time `cudaMalloc`
+(get_or_grow) 97.7% into the window (the n_out=1 tail staging growth);
+(iii) recurring per-launch gaps 689 × 2.6 µs ≈ 1.79 ms — under nsys,
+whose per-launch instrumentation (cuKernelGetName + API overhead ~5 µs/
+launch, visible in the runtime table) inflates it; production ≈ 0.7–1.0 ms
+≈ 0.07–0.10% of the window. The 7d 3-run protocol with the 8g② prefill
+gate (default ON since R3-B, validated by the pp16/pp300 bit-parity
+harness) means repeated identical-nt prefills ALREADY capture; a one-shot
+CLI prefill never reaches run 3 by design. Enabling capture on execution 1
+would still pay the 6.05 ms one-time host stalls during the capture pass
+(they precede the launches, not the replay), save only the ~0.1%
+recurring gaps, pay cudaGraphInstantiate for a 692-node split (~1–2 ms),
+and hit a hard blocker: the mid-window get_or_grow `cudaMalloc` is a
+capture-unsafe (potentially synchronizing) API that invalidates a
+Global/ThreadLocal-mode capture — first-execution capture would fail into
+the graphs-disabled path unless all mid-execution growth is eliminated
+first (the "grown during warmup runs" mechanism does not exist for
+prefill). Projected win ≤ 0.1% « the +1% evaluation bar → **documented
+skip**; the capture lever is closed for the one-shot case and already
+live for the server case.
+
+**Residual leads recorded for any future session (none clears the +1.5%
+single-session bar today):** `rms_norm_quant_nw_f32_t` runs 0.408 ms × 54
+= 22.1 ms for ~62.4 MB min traffic = **153 GB/s = 56% of roofline** — the
+last producer with real relative headroom (ideal +0.98% whole-prefill,
+realistic ~+0.5%); the 2 × ~3 ms first-launch host stalls (0.61% of the
+window) deserve a root-cause pass (candidates: first-use MmqCache/plane
+geometry setup in the producer dispatch path); the tail get_or_grow
+(~0.78 ms) could be pre-grown at build time (~0.08%).
+
+**Campaign convergence statement (P6/P7 basket, r38–r55):** whole-prefill
+went from 2.15× vs-llama gap (r37) to **3181 tok/s vs 3324.4 = 1.05×**
+(r53/r54). The r55 wall decomposition (production nsys, 707 launches):
+q4_K BT 63.2% (1.06×, closed absent a llama.cpp-style q8_1 GEMM-prologue
+rewrite — the MMQ structural-rewrite spec below), q6_K BT 15.4% (closed,
+r53), fused A-producers 8.8% (swiglu at 89% roofline = closed; rms at 56%
+= last incremental lead, ideal +1.0%), FA 5.3% (2.43× taken, r48),
+elementwise/rope/kv ~6%, standalone quantize 1.0%, host/launch ~1%
+(one-time stalls 0.6% + gaps 0.1% + tail malloc 0.1%). **No identified
+lever ≥ +1.5% remains within the current architecture; the next meaningful
+step is the step-function q8_1 GEMM-prologue fusion, not incremental
+optimization. Campaign verdict: CONVERGED.**
+
+Gates: none required — nothing landed (tree unchanged, binary cmp-equal
+to the HEAD build; the 167/0/3 suite state is r54's, untouched). Baseline
+sanity re-measured 3144.4–3151.4 tok/s single-run under the live sglang
+co-tenant (r54 interleaved median 3181.0 on a quiet box).
+
+Artifacts: `/tmp/minfer_phase7/{ncu_r55_swiglu.sh,ncu_r55_swiglu.csv,
+ncu_r55_swiglu.err,ncu_r55_swiglu2.sh,ncu_r55_swiglu_metrics.csv,
+ncu_r55_swiglu_metrics.err,nsys_r55.sh,r55_gap.py,r55_outliers.py,
+r55_new.nsys-rep,r55_new.sqlite,r55_new_cuda_gpu_trace.csv,r55_new.run.log}`.
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM

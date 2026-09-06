@@ -1544,3 +1544,34 @@ unqualified. Parity and greedy cannot see the difference; only the
 launch-path label can.
 
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r54.
+
+#### §11.34 P6 r55 (Session D, final round) — fused-swiglu roofline audit: 89% of DRAM peak; the fused-producer line is measurement-closed
+
+The final round proposed pushing `swiglu_quant_nw_f32_t` (the §11.31/§11.32
+skip-write producer) toward the DRAM roofline on the premise that its
+~318 MB of traffic ran at ~134 GB/s (~49% of the 273 GB/s GB10 peak). ncu
+sector counters disproved the premise: the gate/up reads are f32 —
+L1 global-load sectors 15,695,104 × 32 B = 502.2 MB = exactly
+2 × nt × dim × 4 B, already 16 B/thread float4-coalesced (sectors/request
+= 16) — plus the 70.9 MB plane write = **573.1 MB minimal traffic in
+2.367 ms = 242 GB/s ≈ 89% of peak** at 94.6% occupancy and a pure
+long_scoreboard stall profile. The bound that closes the lever: ideal
+100%-roofline time = 2.099 ms → max possible saving 7.2 ms = **+0.74%
+whole-prefill, below the +1.5% bar for ANY implementation of this kernel**.
+
+Transferable process note (extends §11.26's stale-table lesson to
+proposals): **bound a kernel's possible win by minimal-traffic ÷ roofline
+BEFORE writing code, and audit the premise's traffic model element-size
+first** — a single wrong assumption (f32 read as 2 B) halved the traffic,
+halved the apparent bandwidth, and inverted the verdict. The same audit
+that closed swiglu found the real residual next door: the sibling
+`rms_norm_quant_nw_f32_t` runs at 153 GB/s = 56% of roofline (0.408 ms ×
+54 for ~62.4 MB) — ideal +0.98% whole-prefill, the last incremental
+producer lead, still below the bar alone. Host-side: 2 × ~3 ms one-time
+stalls at the first mode-2 swiglu / first q6_K ffn_down dispatch (minfer
+code between launch calls, not CUDA API time) + one capture-illegal
+mid-window get_or_grow — together they also close the one-shot prefill
+CUDA-Graph lever (recurring gaps ~0.1% production; record:
+docs/CUDA_OPTIMIZATION.md P6 r55). Campaign verdict: CONVERGED at 1.05×
+vs-llama; the remaining step-function is the q8_1 GEMM-prologue fusion
+(the structural-rewrite spec).
