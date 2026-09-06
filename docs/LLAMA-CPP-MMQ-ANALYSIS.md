@@ -1383,3 +1383,43 @@ one caveat (the parity test's `synchronize()` between cases clears the cache, so
 the HIT path is only validated end-to-end by greedy-32) is noted in the r49
 record, not a correctness gap. The r47 gap table's quantize row is now closed.
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r49.
+
+### 11.29 Follow-up (r50, 2026-09-06): FA_TKV 32→16 occupancy trial — correct but WALL-NEUTRAL (reverted)
+
+r48's "next lever" (FA_TKV=16 → 26 KB smem → 3 blocks/SM) is tested: correct
+(parity green, suite 166/0/3) but whole-prefill wall-neutral (3× −0.5%, 5×
+−0.01%). One latent derived constant surfaced: the tail-tile O writeout reuses
+`smem` as a 64×128 f32 stage (32 KB) that exceeds the FA_TKV=16 staging smem —
+the launcher smem must be max(staging, 32 KB). The FA line is converged:
+tile-size/occupancy levers do NOT move the wall (r46 + r50 both
+positive-mechanism/negative-wall). Full record: docs/CUDA_OPTIMIZATION.md
+P6 r50 (this MMQ-analysis doc skipped r50; the pointer restores §numbering).
+
+### 11.30 Follow-up (r51, 2026-09-06): producer-fused A-quantize — LANDED, prepass 110→28 launches / 83.0→10.1 ms, whole-prefill +1.9%
+
+The r34 "transforms belong in producers" lesson taken to its end: the
+A-quantize prepass reads activations the producers JUST wrote (every
+rms_norm/swiglu output in the qwen2 prefill graph is exclusively a GEMM
+input). r51 fuses the pad40_t quantize INTO `rms_norm` and `swiglu`:
+`rms_norm_quant_f32_t` / `swiglu_quant_f32_t` emit the bit-identical f32
+output AND the byte-identical transposed plane (quantize body verbatim,
+re-reading the just-written rows through L1/L2; padded-tail zero-fill
+preserved), and the host wrapper registers the plane in the r49 MmqCache
+keyed on the f32 output pointer — prefill_mmq consumes it via the existing
+hit path with no matmul-side change. Gated `MINFER_MMQ_A_FUSE=1` ANDed with
+the full gate set, rows ≥ 16, dim % 256 == 0; plane OOM falls back to the
+unfused pair.
+
+**Result: standalone prepass 110 → 28 launches (only the wo quantize
+remains — its producer is the FA kernel) and 83.0 → 10.1 ms; fused swiglu
+4.09 vs 5.46 ms pair (−25%), fused rms ≈ break-even at d=3584; whole-prefill
+interleaved 5× median 2803.4 → 2856.4 tok/s = +1.89% (distributions
+separated); validator byte-exact on 11 shapes; parity ×3 green; greedy-32
+token streams byte-identical; suite 166/0/3.** The +1.5%-bar expectation
+(−3..5%) landed at its bottom: the fusion deletes the prepass DRAM re-read
+but pays the plane write + L2 re-read + barrier, so only the fat
+swiglu→down fusion (and the launch-count cut) move the wall. The
+quantize-prepass line is CLOSED as a structural residual; what remains is
+28 wo-quantizes (10.1 ms, producer = FA kernel) and the fused swiglu's own
+phase-2 (~0.5-1 ms/launch theoretical claw-back).
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r51.

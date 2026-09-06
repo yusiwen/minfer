@@ -2860,6 +2860,101 @@ Artifacts: `/tmp/minfer_pre_r50` (pre-change baseline, md5 ae0614a6…),
 `/tmp/r50_suite.log` (suite 166/0/3), `/tmp/r50_parity.log`,
 `/tmp/fa_r50.ncu-rep`-attempt logs (ncu/nsys blocked by the session env).
 
+### P6 r51: producer-fused A-quantize (rms_norm/swiglu emit the pad40_t plane) — LANDED (prepass 110→28 launches, 83.0→10.1 ms, whole-prefill +1.9%, 2026-09-06)
+
+The r34 lesson generalized to its end: the remaining A-quantize prepass
+(r49-deduped: 110 launches, 83.9 ms, ~7.4% of wall) reads activations the
+producers JUST wrote — every rms_norm/swiglu output in the qwen2 prefill
+graph is EXCLUSIVELY a GEMM input (verified in graph.rs: attn-norm → q/k/v,
+ffn-norm → gate/up, swiglu → down, output-norm → lm_head). r51 fuses the
+quantize INTO the producers, eliminating the standalone prepass for those
+inputs. HARD RULE respected: `graph.rs`/`cpu_backend.rs`/`metal*.rs`
+untouched; everything lives in `src/cuda_kernels.cu` + `src/cuda.rs` +
+`src/graph/cuda_backend.rs`.
+
+**Kernels (src/cuda_kernels.cu):** `rms_norm_quant_f32_t` (8 warps/block,
+one warp per row — the `rms_norm_f32` lane mapping and accumulation order
+unchanged, so the f32 output is bit-identical; then one `__syncthreads` and
+a thread re-map onto the block's (row, chunk) pairs running the
+`quantize_q8_0_pad40_t` body VERBATIM — quantize input is the just-written
+y re-read through L1/L2; the grid covers the 64-PADDED token count so the
+padded tail rows zero-fill byte-identically to the standalone prepass) and
+`swiglu_quant_f32_t` (block per token row; coalesced float4 silu*mul with
+the per-element expression identical to `swiglu_f32`, then the same
+verbatim quantize of the row). The register-resident quantize variant for
+swiglu was rejected by design: a thread-per-chunk mapping makes the f32 dst
+stores uncoalesced (8× sector amplification on 254 MB) — costlier than the
+L2-hot re-read.
+
+**Host (src/cuda.rs):** `rms_norm_quant` / `swiglu_quant` size the SAME
+`buf_qa8_t`/`buf_sda_t` scratch with the same (ntb, nchunk) formula as
+`mmq_quantize_transposed` and register the plane in the r49 `MmqCache`
+keyed on the f32 output's device pointer — `prefill_mmq`'s existing
+cache-hit path consumes it with NO matmul-side change. Window semantics
+unchanged (backend clears on any non-MatMul node and at `synchronize`); the
+fused producer executes after its node's cache-clear and re-keys the cache,
+and any later quantize re-keys again, so a stale plane is unreachable.
+Gate: NEW `MINFER_MMQ_A_FUSE=1` ANDed with the full r49 gate set
+(`mmq_a_fuse_active`), plus rows ≥ 16 (prefill only — decode/capture/
+tail-truncated n_out=1 keep the unfused pair; the G3 tail section's
+MMVQ/native GEMMs never consult the transposed cache) and dim % 256 == 0
+(the transposed GEMM's nchunk % 8 requirement). Plane OOM falls back to
+the unfused pair (never an error).
+
+**Gates (all green).** Standalone validator (nvcc, `valid_r51.cu`): fused
+vs standalone pair **BYTE-EXACT — 0 mismatches** on 11 shapes (rms d=3584
+nt=3354/129/64/63/1, d=896 nt=300, d=640 nt=100; swiglu nf=18944
+nt=3354/129/63, nf=4864 nt=300) covering both f32 outputs and both planes
+with POISONED plane buffers (proves the padded-tail zero-fill). Build
+clean; ptxas 48-62 regs / 0 spill / 0 local. Parity ×3 under the full gate
+set + A_FUSE: `cuda_prefill_mmq` 1/0, `cuda_prefill` 7/0,
+`cuda_fa_prefill_attention_parity` 1/0. Greedy-32 (3314-tok prompt) token
+streams **byte-identical** vs the pre-change binary. Suite **166/0/3**.
+
+**nsys (clean, one prefill each, 3314 tok; window = mmq-GEMM span):**
+standalone prepass **110 → 28 launches** (only wo remains — the attention
+output's producer is the FA kernel, deliberately not touched in v1) and
+**83.0 → 10.1 ms**; fused rms 54 × 0.77 ms, fused swiglu 27 × 4.09 ms. The
+post-window tail section (last-layer FFN + lm_head on n_out rows) runs the
+MMVQ/native/standalone path as before — explains why r49 counted 110 (4
+windows/layer × 28 minus the tail-truncated layer's 2) and why 28 remain.
+Kernel-time net **−31 ms**: fused swiglu 4.09 vs 5.46 ms pair (−25%); fused
+rms ≈ wash at d=3584 (0.77 vs 0.77); wo prepass unchanged.
+
+**Perf (interleaved 5× medians, full gate set, prompt 3314 tok, −n 1
+--greedy):** baseline (`/tmp/minfer_pre_r51`, re-measured **2803.4**, base
+2795.2/2796.1/2803.4/2816.9/2824.4) → new **2856.4** (2844.3/2844.8/
+2856.4/2857.9/2861.7) = **+1.89%** — above the +1.5% bar, with the
+distributions fully separated (min-new 2844.3 > max-base 2824.4). The
++1.5%-bar expectation (−3..5%) was right at its bottom: the fusion deletes
+the prepass's DRAM re-read but the fused kernel pays the plane write, the
+L2 re-read and the block barrier, and d=3584 producers are small enough
+that the fused rms only breaks even — the win is almost entirely the
+swiglu→down fusion (−1.37 ms/launch) plus launch-count reduction.
+
+**Verdict — LANDED.** The A-quantize prepass is now structurally residual:
+28 wo-quantizes (10.1 ms) are all that remain, and their producer is the
+FA kernel (a v2 could fuse there too — FA emits attn_out; riskier, FA is
+tensor-core-structured). The remaining wall is q4_K GEMM 618.9 ms (56%),
+q6_K GEMM 197.8 ms (18%), fused swiglu 110.5 ms (10%), FA 52.9 ms (4.8%).
+Session-B ranking input: (1) FA deep-opt (4.8% wall, 2.43× already taken
+in r48 — thin), (2) q6_K pre-expanded-B bundle (r44 parity fix exists but
+was wall-neutral standalone), (3) fused-swiglu phase-2 (smem-staged dst or
+register-resident quantize could claw ~0.5-1 ms/launch).
+
+Artifacts: `/tmp/minfer_pre_r51` (pre-change baseline, re-measured
+2803.4 median), `/tmp/minfer_phase7/valid_r51.cu` (+ `valid_r51` binary,
+validator output in session log), `/tmp/minfer_phase7/parity_r51_run{1,2,3}.log`,
+`/tmp/minfer_phase7/g32_r51_{base,new}.txt` (byte-identical token streams),
+`/tmp/minfer_phase7/perf_r51_ab.log` (5× interleaved),
+`/tmp/minfer_phase7/r51_{base,new}_cuda_gpu_trace.csv` + `.sqlite`
+(clean per-kernel windows), `/tmp/minfer_phase7/r51_suite.log`,
+`/tmp/minfer_phase7/{gen_prompt,cmp_g32,window_bucket,edge_kernels}.py`.
+NOTE: `/tmp` was ephemeral this session — `prompt2k.txt` was regenerated
+(16309 B → 3314 tok, same generation recipe) and the r49 baseline binary
+was gone, so the pre-change baseline was rebuilt at HEAD and re-measured
+(2803.4 median ≈ the historical 2797.5).
+
 ### MMQ structural rewrite — execution spec (P6 r6, for next session)
 
 Goal: mmq GEMM 6.1 TMAC/s (23 ms per ffn_gu call) -> >=24 (f16-GEMM
