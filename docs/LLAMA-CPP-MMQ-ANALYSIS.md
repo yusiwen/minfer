@@ -1575,3 +1575,39 @@ CUDA-Graph lever (recurring gaps ~0.1% production; record:
 docs/CUDA_OPTIMIZATION.md P6 r55). Campaign verdict: CONVERGED at 1.05×
 vs-llama; the remaining step-function is the q8_1 GEMM-prologue fusion
 (the structural-rewrite spec).
+
+#### §11.35 P6 r56 (Session E) — the A-side residual closed: A-cp.async + W_dsc f32 plane on top of r53 — +2.35% whole-prefill
+
+§11.32's verdict left two named residuals ("A-side staging STS ~28% + the dsc
+I2F consumer ~26%... an A-side cp.async redo could now compose"). r56 landed
+both: (a) the r45 A-side cp.async redone on the r53 base — the qa8/sda bulk
+LDG->STS loops became explicit-PTX cp.async chunks in the SAME per-kt commit
+group as the r53 B copy (one group per kt now covers A + B + dsc; waits and
+the visibility barrier are unconditional); (b) a registration-time **W_dsc**
+plane — `plane[c*od + j] = float2(d·sc[2(c&7)], d·sc[2(c&7)+1])` f32 pairs,
+chunk-major so the per-kt dsc staging is a contiguous 16-B cp.async stream —
+removing the scalar blk[192+..]/blk[208] loads and the I2F convert from the
+staging critical path entirely (od×id/4 B ≈ 363 MB on 7B q4_k_m; null plane =
+byte-identical r41 scalar path). Result: kernel −4..−6% (ffn_down 12.76 →
+12.01 ms, attn_v 570.8 → 546.8 µs vs the r53 ncu records), whole-prefill
+interleaved 5× medians 3138.6 → **3212.5 tok/s = +2.35%**, parity ×3, greedy
+byte-identical, gate-1 byte-exactness test (host expander + device readback vs
+an independent scalar mirror, 0 mismatches). Whole-prefill is now **1.035×
+vs-llama** (2.15× r37 → 1.05× r53 → 1.035× r56).
+
+Transferable lessons. (1) *The composition thesis now has a third point*: r45
+(A-cp.async) was kernel-real but wall-neutral on the r41 kernel, became part
+of a +5.03% bundle with r44's W_exp on r53, and pays out +2.35% alone once
+the B side stopped dominating — a mechanism whose wall value depends on what
+ELSE is on the critical path is not dead, it is WAITING (re-measure dominated
+mechanisms after each structural change to their siblings). (2) *Registration-
+time precompute generalizes over the whole block header*: r53 precomputed the
+BYTES (W_exp dense centered-int8), r56 precomputed the SCALES (W_dsc f32
+pairs); anything the GEMM consumes that is a pure function of the weight can
+leave the staging critical path the same way, and the same gate/map/label/
+byte-exactness-test scaffold carries over unchanged. (3) *A sudo-invoked
+profiler strips env gates*: `sudo -n ncu ...` with exported MINFER_* gates
+silently profiles the LEGACY path — pass the env through `sudo -n env` and
+read ncu's "Available Kernels" zero-match list as the liveness tell (the r53
+launch-path-label lesson, profiler edition).
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r56.

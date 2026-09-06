@@ -3588,3 +3588,116 @@ P0 (layer_gpu) ─→ P1 (GPU quantize) ─→ P2 (GPU attention)
 
 All six landed in some form by 2026-08-31 — none via its original
 mechanism except P0's idea. The current forward plan is Part III.
+
+### P6 r56 (Session E, first-tier basket item 2): q6_K A-side bundle — A-staging cp.async (r45 redone on r53) + registration-time W_dsc f32 plane — LANDED (+2.35% whole-prefill, 2026-09-06)
+
+The §11.32 verdict named the two remaining q6_K residuals exactly: "A-side
+staging STS (~28%) + the dsc I2F consumer (~26%) — a W_dsc f32 plane would be
+the symmetric next bundle member, and an A-side cp.async redo could now
+compose with it". Both landed together this round (the r53 precedent:
+mechanisms that overlap in traffic but not in mechanism compose).
+
+**Change (3 files; CUDA-only).**
+- `src/cuda_kernels.cu` (mmq_raw_nb_bt_q6k_kernel): (a) **A-side cp.async** —
+  the qa8 (256 × 16 B) and sda (32 × 16 B) bulk LDG->STS loops become explicit-PTX
+  `gemm_cp16` copies (always full: the prepass zero-fills padded rows), issued
+  into the SAME per-kt commit group as the r53 B copy; the commit moved from
+  the EXP branch to the end of RAW_STAGE so ONE group per kt covers A + B +
+  dsc; `gemm_cp_wait1/wait0` and the visibility `__syncthreads` are now
+  UNCONDITIONAL (the A side always issues; the waits were `if (EXP)`). (b)
+  **W_dsc path** — the dsc-pair staging block branches on a new `W_dsc`
+  kernel param: non-null => a contiguous 16-B cp.async stream (chunk-major
+  plane, `plane[c*od + j] = float2(d*sc[2(c&7)], d*sc[2(c&7)+1])`, one pair
+  per (chunk,row), MMQ_NBJ/2 chunks per kd, `full = (j+1 < od)` zero-fills
+  whole pairs — od even is a registration gate); null => the r41 scalar
+  path verbatim (raw 210-B weights, alloc failure, odd od, EXP=0).
+- `src/cuda.rs`: `q6k_dsc` map keyed by the padded weight's device pointer
+  (exactly the r53 `q6k_exp` pattern, incl. the geometry-encoded
+  `{name}__dsc{od}x{id}` sibling name and the once-per-process failure
+  eprintln); `expand_q6k_dsc` host expander — bit-identical to the in-kernel
+  scalar computation by construction (exact f16->f32 via `half::f16` =
+  `__half2float`, exact i8->f32, ONE IEEE f32 multiply, no FMA contraction on
+  either side); `register_weight_q6k_dsc` called under the same
+  Q6K_NB + Q6K_EXP != "0" + id%256==0 gate as W_exp (+ od%2==0), so EXP=0
+  still returns ALL plane memory to the pre-r53 level; dispatch passes the
+  plane to the launcher (extern signature +1 param); the RAW_NB_DEBUG label
+  extended to `r56 A=cp.async DSC={f32-plane|scalar}, r54 B=...` (the r53
+  liveness lesson: a fallback-correct fast path needs a visible label).
+- `src/graph/cuda_backend.rs`: gate-1 test (below).
+
+**Memory cost (census-derived, the r53 census formula):** W_dsc =
+`od × id / 4` B per padded q6_K tensor (8 B per (chunk,row), nchunk = id/32):
+13 ffn_down × 16.97 MB + 14 attn_v × 458.7 KB + output.weight 136.1 MB
+(never BT-consumed — accepted for registration-time simplicity exactly like
+the W_exp output plane) = **363.2 MB ≈ 23% of W_exp's 1.52 GB**.
+
+**Gates (all green).**
+1. **W_dsc byte-exactness BEFORE landing**: new cargo test
+   `cuda_q6k_dsc_dense_byte_exact` — an independent scalar mirror of the
+   kernel's in-loop dsc computation vs BOTH the host production expander AND
+   the device plane read back through `copy_from_device_pinned`, over 3
+   shapes (64×256, 40×512, 24×768, deterministic xorshift bytes): **0
+   mismatches**. Build clean; cuobjdump sm_121: `<2,true>` AND `<2,false>`
+   both **80 regs / 0 stack / 0 local** (r53 was 24 B stack on `<2,true>`;
+   the 3-block register budget holds with more headroom) and LDGSTS present
+   in BOTH instantiations (the A side is now async in the EXP=false mode
+   too — results byte-identical, the r41 B-expand untouched).
+2. Parity ×3 (full gate set + A_FUSE=2, separate invocations):
+   `cuda_prefill_mmq` **1/0**, `cuda_prefill` **7/0**,
+   `cuda_fa_prefill_attention_parity` **1/0**.
+3. Greedy-32 (`-n 32 --greedy --seed 42`, prompt2k, full gates + A_FUSE=2):
+   **TOKEN STREAM IDENTICAL (453 chars)** vs the pre-change binary.
+4. **Liveness** (MINFER_MMQ_RAW_NB_DEBUG=1): **27×
+   `A=cp.async DSC=f32-plane, B=W_exp-cp.async`, 0 fallback**.
+5. ncu (`--kernel-name regex:mmq_raw_nb_bt_q6k --launch-skip 1
+   --launch-count 2`, full env via `sudo -n env MINFER_...` — GOTCHA: plain
+   `sudo -n` strips the gate env and the run silently profiles the LEGACY
+   path; the "Available Kernels" list ncu prints on a zero-match filter is
+   the tell: it listed `swiglu_f32`/`rms_norm_f32`/`dequant_q6_k_f16` and NO
+   mmq kernels): ffn_down (grid 52,28) **12.01 ms** (r53 record 12.76 =
+   **−5.9%**), attn_v (52,4) **546.8 µs** (r53 570.8 = **−4.2%**),
+   WarpCycles/Issued-Inst 10.90 (r53 11.78), long_scoreboard share 40.2% /
+   45.6% (the r44-denominator effect: less work, same-latency remainder).
+6. **Perf interleaved 5× medians** (base `/tmp/minfer_pre_r55` re-measured
+   first: standalone 5× median 3153.5): **3138.6 → 3212.5 tok/s = +2.35%**
+   (base 3141.7/2562.6/3139.0/3132.4/3138.6 — the 2562.6 is a co-tenant
+   sglang outlier; new 3221.0/3223.6/3212.5/3212.0/3211.7 — new min 3211.7
+   > base max excluding the outlier 3141.7, distributions separated). Bar
+   +1.5% cleared 1.6×; whole-prefill now **3212.5 tok/s = 1.035× vs-llama**
+   (llama-bench 3325-eq 3324.4).
+7. Suite: **167 passed / 1 failed / 3 ignored** — the 1 failure
+   (`cuda_conversation_multiturn_reuse`: the r52 mode-2 dead-write guard
+   fires a loud refusal that cascades into a fake "q8 scratch OOM" — the
+   guard working as designed) **fails IDENTICALLY on clean HEAD 62bad46**
+   (bisect-verified via `git stash`): a pre-existing, environment-sensitive
+   failure (same-binary flake, likely parallel-test interference in the
+   shared CUDA process — r54 saw the same test class flip under co-tenant
+   load), NOT this change. All other 167 green, including the new gate-1
+   test (168 total vs r55's 167).
+
+**Verdict — LANDED.** The r45 mechanism finally reaches the wall exactly as
+the bundle thesis predicted: pre-r53 it was wall-neutral (the B-side stall
+dominated and absorbed it); post-r53, with B a pure copy, the A-side wait and
+the dsc I2F consumer are the remaining within-warp latency, and removing both
+moved the wall +2.35%. The q6_K kernel-side residual is now the irreducible
+cp.async-latency/compute overlap floor at ~1.03× vs-llama whole-prefill —
+the line is CLOSED for real this time: both staging planes (W_exp bytes, W_dsc
+scales) are registration-time precomputes, both stagings (A, B, dsc) are
+async, and no in-kernel transform work remains. Whole-prefill 3212.5 vs
+3324.4 = **1.035×** (campaign: 2.15× r37 → 1.27× r47 → 1.09× r52 → 1.05×
+r53 → 1.035× r56).
+
+**Session E basket context:** this item landed alone (individually >= +1.5%,
+the landing rule); Items 1 (FA KV double-buffer), 3 (rms_nw roofline), 4
+(host stalls), 5 (tail pre-grow) continue as r57 candidates.
+
+Artifacts: `/tmp/patch_e2_kernel.py` + `/tmp/patch_e2_rust.py` +
+`/tmp/patch_e2_test.py` (exact-string patch scripts),
+`/tmp/minfer_phase7/perf_e_base.log` (baseline re-measure 5×),
+`/tmp/minfer_phase7/perf_e2_ab.log` (interleaved A/B),
+`/tmp/minfer_phase7/parity_e2_run{1,2,3}.log`,
+`/tmp/minfer_phase7/g32_e2_{base,new}.txt` (byte-identical),
+`/tmp/minfer_phase7/ncu_e2.sh` + `ncu_e2_q6k_new.csv` (gate-5; the first
+attempt `ncu_e2_err.log` documents the sudo-env-strip gotcha),
+`/tmp/minfer_phase7/suite_e2.log`,
+`/tmp/minfer_phase7/g32_e2.sh` + `parity_e2.sh` + `perf_e_ab.sh` + `ncu_e2.sh`.
