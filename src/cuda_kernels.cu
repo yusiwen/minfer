@@ -5581,9 +5581,15 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
 // per-(kt, warp) A reads become contiguous bulk LDG->STS with no per-element
 // index math (the r22 XOR swizzle and the r31 q-major sda repack are baked into
 // the prepass layout). The B (weight) + SDS staging is unchanged.
-template <int KDR>
+// r59: DSC=true stages the per-(chunk, od-row) rescale terms
+// float2(d*sc, -(dmin*m)) from the registration-time W_dsc f32-pair plane
+// (chunk-major, 16-B cp.async stream) instead of decoding them in-staging
+// (get_scale_min_k4 + 2 h2f per (chunk, od-row) — the r58 spec's one real
+// q4_K staging-ALU residual). DSC=false keeps the scalar decode verbatim.
+template <int KDR, bool DSC>
 __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
-    const uint8_t* __restrict__ W, const uint8_t* __restrict__ qa8g,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ W_dsc,
+    const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
     int nt, int od, int id, int nchunk
 ) {
@@ -5632,6 +5638,30 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
             }                                                                  \
         }                                                                      \
         /* ---- B: SDS per-(chunk, od-row) rank-1 rescale terms ---- */        \
+        /* r59: W_dsc f32 plane (registration-time precompute; chunk-major     \
+         * layout plane[c*od + j] = float2(d*sc, -(dmin*m))) removes the       \
+         * per-(chunk,row) get_scale_min_k4 branch + 2 h2f converts + 2        \
+         * multiplies from the staging critical path (the r56 q6_K mechanism  \
+         * applied to the OTHER 63% of bt busy). od even (registration gate)  \
+         * => a row PAIR is fully valid or fully beyond od (src-size           \
+         * zero-fill); nchunk % 8 == 0 (launch gate) with KDR=8 =>             \
+         * c0d+kdd < nchunk always, exactly like the r56 q6_K plane.           \
+         * Null plane = DSC=false scalar path, byte-identical. */             \
+        if (DSC) {                                                             \
+            const int c0d = (kt) * KDR;                                        \
+            const int nc2 = MMQ_NBJ / 2;  /* 16-B chunks (2 float2) per kd */  \
+            for (int g = threadIdx.x; g < KDR * nc2; g += blockDim.x) {        \
+                const int kdd = g / nc2, mm = g % nc2;                         \
+                const int j = j0 + 2 * mm;                                     \
+                const bool full = (j + 1 < od);                                \
+                gemm_cp16(                                                     \
+                    (__half*)(void*)(sds + (size_t)kdd * MMQ_NBJ + 2 * mm),    \
+                    (const __half*)(const void*)(W_dsc                         \
+                        + ((size_t)(c0d + kdd) * (size_t)od + (size_t)j) * 8), \
+                    full);                                                     \
+            }                                                                  \
+            gemm_cp_commit();                                                  \
+        } else {                                                               \
         for (int x = threadIdx.x; x < MMQ_NBJ * KDR; x += blockDim.x) {        \
             const int r = x % MMQ_NBJ, kd = x / MMQ_NBJ;                       \
             const int j = j0 + r, c = (kt) * KDR + kd;                         \
@@ -5648,6 +5678,7 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
             }                                                                  \
             sds[(size_t)kd * MMQ_NBJ + r] = make_float2(dv, mv);               \
         }                                                                      \
+        }                                                                      \
     } while (0)
 
     const unsigned l12m = (unsigned)(lane & 12) * 32;
@@ -5662,6 +5693,10 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
 
     for (int kt = 0; kt < nktile; ++kt) {
         if (kt > 0) RAW_STAGE_NB_BT(kt);
+        // r59: the dsc cp.async group issued in RAW_STAGE must be complete to
+        // THIS thread before the barrier publishes it cross-thread (the r53
+        // visibility rule). DSC=false: no groups are ever issued, no-op.
+        if (DSC) gemm_cp_wait0();
         __syncthreads();
 
         #pragma unroll
@@ -6111,9 +6146,14 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
 #endif // __CUDA_ARCH__ >= 800
 }
 
+// r59: w_dsc != 0 selects the DSC=true instantiation (the registration-time
+// W_dsc f32-pair plane; the SDS staging is a cp.async stream); w_dsc == 0
+// keeps the r34 in-kernel scalar decode. Returns 0 (clean fallback) on any
+// cap/mismatch.
 extern "C" int launch_mmq_raw_nb_bt_nt(
-    int type_id, const uint8_t* w, const uint8_t* qa8g, const uint8_t* sdag,
-    float* c, int nt, int od, int id, int nchunk, cudaStream_t stream, int kd
+    int type_id, const uint8_t* w, const uint8_t* w_dsc, const uint8_t* qa8g,
+    const uint8_t* sdag, float* c, int nt, int od, int id, int nchunk,
+    cudaStream_t stream, int kd
 ) {
     (void)type_id;
     if (kd != 8) return 0;
@@ -6123,11 +6163,28 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
                    + MMQ_NBJ * 128      // qb_raw
                    + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    // r59: DSC is a template constant, so each instantiation keeps only its
+    // own SDS path (the cp.async plane stream vs the scalar decode) — the
+    // r53 pattern (no runtime branch in staging).
+    const bool dsc = w_dsc != 0;
+    if (dsc) {
+        cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, true>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    } else {
+        cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, false>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-    mmq_raw_nb_bt_kernel<8><<<grid, 256, smem, stream>>>(w, qa8g, sdag, c, nt, od, id, nchunk);
+    if (dsc) {
+        mmq_raw_nb_bt_kernel<8, true><<<grid, 256, smem, stream>>>(
+            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk);
+    } else {
+        mmq_raw_nb_bt_kernel<8, false><<<grid, 256, smem, stream>>>(
+            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk);
+    }
     e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "minfer/cuda: mmq raw NB-BT launch failed: %s\n",
@@ -6188,6 +6245,48 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
         return 0;
     }
     return 1;
+}
+
+// r59 rider (r57 items 4+5): force the fatbin module load + first-touch
+// attribute queries at REGISTRATION time — cudaFuncGetAttributes on the
+// launch set loads the module, moving the ~3 ms first-launch host stalls
+// (r58 CUPTI: bracketing the first mode-2 swiglu / first bt matmul) out of
+// the measured prefill window. Attribute errors are ignored (a missing
+// instantiation only means that path was never compiled in).
+extern "C" void minfer_prewarm_kernels(void) {
+    cudaFuncAttributes a;
+#define MINFER_PREWARM(k)                                                      \
+    do {                                                                       \
+        if (cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(&(k)))     \
+            != cudaSuccess) {                                                  \
+            cudaGetLastError();                                                \
+        }                                                                      \
+    } while (0)
+    // MMQ prefill GEMMs (both DSC/EXP instantiations + fallbacks)
+    MINFER_PREWARM((mmq_raw_nb_bt_kernel<8, true>));
+    MINFER_PREWARM((mmq_raw_nb_bt_kernel<8, false>));
+    MINFER_PREWARM((mmq_raw_nb_bt_q6k_kernel<2, true>));
+    MINFER_PREWARM((mmq_raw_nb_bt_q6k_kernel<2, false>));
+    MINFER_PREWARM((mmq_raw_nb_kernel<8>));
+    MINFER_PREWARM((mmq_raw_nt_kernel<8>));
+    MINFER_PREWARM((mmq_raw_wide_nt_kernel<8>));
+    // A-quantize prepass + fused producers
+    MINFER_PREWARM(quantize_q8_0_pad40);
+    MINFER_PREWARM(quantize_q8_0_pad40_t);
+    MINFER_PREWARM(rms_norm_quant_nw_f32_t);
+    MINFER_PREWARM(swiglu_quant_nw_f32_t);
+    MINFER_PREWARM(swiglu_f32_off);
+    MINFER_PREWARM(rms_norm_f32);
+    // attention (FA prefill + decode paths) + KV/rope
+    MINFER_PREWARM(fa_prefill_f16kv);
+    MINFER_PREWARM(gqa_attn_f32_f16kv);
+    MINFER_PREWARM(store_kv_f16);
+    MINFER_PREWARM(rope_f32);
+    // lm_head tail (f32) + decode MMVQ
+    MINFER_PREWARM(f32_f32_matmul_vec);
+    MINFER_PREWARM(q4_k_q8_mmvq);
+    MINFER_PREWARM(q6_k_q8_mmvq);
+#undef MINFER_PREWARM
 }
 
 extern "C" int launch_mmq_raw_nb_nt(

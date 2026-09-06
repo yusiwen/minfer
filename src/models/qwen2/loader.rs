@@ -244,6 +244,28 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 );
             } else {
                 cuda.register_weight(&ti.name, tensor.data());
+                // r59: registration-time W_dsc f32-pair plane for the NB-BT
+                // q4_K kernel (r56 q6_K scaffold). MINFER_MMQ_Q4K_DSC=0 opts
+                // out of the memory trade (od*id/4 B per tensor, ~1.4 GB on
+                // 7B q4_k_m); the plane's only consumer is the NB-BT kernel,
+                // so the gate mirrors its dispatch switches (RAW_NB +
+                // A_TRANSPOSE). Geometry gates (id % 256 == 0 like the
+                // kernel's launch gate, od % 2 == 0 for the row-pair
+                // cp.async staging) skip the plane: the kernel keeps the
+                // in-kernel scalar decode via map miss.
+                if std::env::var("MINFER_MMQ_RAW_NB").as_deref() == Ok("1")
+                    && std::env::var("MINFER_MMQ_A_TRANSPOSE").as_deref() == Ok("1")
+                    && std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() != Ok("0")
+                    && tensor.shape[0] as usize % 256 == 0
+                    && tensor.shape[1] as usize % 2 == 0
+                {
+                    cuda.register_weight_q4k_dsc(
+                        &ti.name,
+                        tensor.data(),
+                        tensor.shape[1] as usize,
+                        tensor.shape[0] as usize,
+                    );
+                }
             }
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&ti.name, tensor.data());
@@ -436,6 +458,13 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
     }
 
     println!("Loaded: {} layers", n_layer);
+
+    // r59 rider: pre-warm the CUDA launch path OUTSIDE the measured prefill
+    // window (kernel module load, MmqCache scratch planes, pinned readback).
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = crate::cuda::CudaState::get() {
+        cuda.prewarm_prefill();
+    }
 
     let model = super::Qwen2Model {
         hparams,

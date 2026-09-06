@@ -414,9 +414,15 @@ extern "C" {
     // P6 r34: NB kernel whose A staging is bulk LDG->STS over the
     // PRE-TRANSPOSED qa8/sda buffers (MINFER_MMQ_A_TRANSPOSE=1). Returns 1 on
     // KD=8, 0 on clean fallback (KD!=8 / null transposed buffers / smem).
+    // r59 rider: kernel module pre-load (cudaFuncGetAttributes over the
+    // MMQ/FA/fused launch set) — see CudaState::prewarm_prefill.
+    fn minfer_prewarm_kernels();
+    // r59: `w_dsc` selects the DSC=true instantiation (registration-time
+    // W_dsc f32-pair plane; null = in-kernel scalar decode, DSC=false).
     fn launch_mmq_raw_nb_bt_nt(
         type_id: i32,
         w: *const u8,
+        w_dsc: *const u8,
         qa8g: *const u8,
         sdag: *const u8,
         c: *mut f32,
@@ -949,6 +955,16 @@ pub struct CudaState {
     q6k_dsc: Mutex<HashMap<usize, CudaPtr>>,
     /// r56: the W_dsc allocation-failure warning prints once per process.
     q6k_dsc_warned: std::sync::atomic::AtomicBool,
+    /// r59: q4_K W_dsc f32-pair planes — float2(d*sc, -(dmin*m)) per
+    /// (chunk, od-row), chunk-major — keyed by the RAW weight's device
+    /// pointer (the r56 q6_K map pattern). A map miss keeps the in-kernel
+    /// get_scale_min_k4 decode (the DSC=false instantiation).
+    q4k_dsc: Mutex<HashMap<usize, CudaPtr>>,
+    /// r59: the q4_K W_dsc allocation-failure warning prints once per process.
+    q4k_dsc_warned: std::sync::atomic::AtomicBool,
+    /// r59 rider: max id/32 seen at K-quant registration — the pre-warm
+    /// MmqCache scratch sizing hint (0 until a K-quant weight registers).
+    max_nchunk: std::sync::atomic::AtomicUsize,
     // Persistent activation buffers (grown on demand) with size tracking
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_hidden: Mutex<(CudaPtr, usize)>,
@@ -1259,6 +1275,9 @@ impl CudaState {
             q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
             q6k_dsc: Mutex::new(HashMap::new()),
             q6k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
+            q4k_dsc: Mutex::new(HashMap::new()),
+            q4k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
+            max_nchunk: std::sync::atomic::AtomicUsize::new(0),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
             buf_bq: Mutex::new(dummy),
@@ -1370,6 +1389,10 @@ impl CudaState {
     /// 16-byte-aligned uint4 weight loads. `od`/`id` are the matmul output/
     /// input dims (GGUF shape [in, out] → id = shape[0], od = shape[1]).
     pub fn register_weight_q6k_padded(&self, name: &str, data: &[u8], od: usize, id: usize) {
+        // r59 rider: track the max nchunk (= id/32) for the pre-warm scratch
+        // sizing (see prewarm_prefill).
+        self.max_nchunk
+            .fetch_max(id / 32, std::sync::atomic::Ordering::Relaxed);
         const Q6KB: usize = 210;
         const Q6KPB: usize = 224;
         let nbe = id.div_ceil(256);
@@ -1520,6 +1543,129 @@ impl CudaState {
             }
         }
         out
+    }
+
+    /// r59 (Session F item 1): build + upload the precomputed dsc f32-pair
+    /// plane for one RAW q4_K tensor and map it from the raw weight's device
+    /// pointer. Called from the qwen2 loader under the NB-BT gate set
+    /// (MINFER_MMQ_RAW_NB=1 + MINFER_MMQ_A_TRANSPOSE=1 + MINFER_MMQ_Q4K_DSC
+    /// != "0") + `id % 256 == 0` + `od % 2 == 0`. An alloc/upload failure
+    /// leaves the map empty: the kernel falls back to the in-kernel scalar
+    /// decode (DSC=false) with a once-per-process loud eprintln.
+    pub fn register_weight_q4k_dsc(&self, name: &str, raw: &[u8], od: usize, id: usize) {
+        // geometry-encoded sibling name (same rationale as the W_exp name).
+        let dsc_name = format!("{name}__q4dsc{od}x{id}");
+        let dsc = Self::expand_q4k_dsc(raw, od, id);
+        self.register_weight(&dsc_name, &dsc);
+        if let Some(wp) = self.get_weight_ptr(name) {
+            if let Some(dp) = self.get_weight_ptr(&dsc_name) {
+                if !wp.is_null() && !dp.is_null() {
+                    self.q4k_dsc.lock().unwrap().insert(wp as usize, CudaPtr(dp));
+                    return;
+                }
+            }
+        }
+        if !self
+            .q4k_dsc_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "minfer/cuda: q4_K W_dsc plane unavailable for '{name}' \
+                 (alloc/upload failed) - mmq_raw_nb_bt keeps the in-kernel \
+                 scalar dsc decode"
+            );
+        }
+    }
+
+    /// r59 (Session F item 1): precomputed dsc pairs of one RAW q4_K tensor.
+    /// Output: `(id / 32) * od * 8` bytes, `out[(c*od + j)*8..+8]` =
+    /// float2(d*sc[c&7], -(dmin*m[c&7])) — chunk-major so the kernel's
+    /// per-kt staging (rows j0..j0+MMQ_NBJ of chunk c0+kd contiguous) is a
+    /// pure 16-B cp.async stream. Bit-identical to the in-kernel scalar
+    /// computation: exact f16->f32 (half::f16 = __half2float), exact
+    /// u8->f32, ONE IEEE f32 multiply, exact negation, no FMA contraction
+    /// on either side.
+    pub fn expand_q4k_dsc(raw: &[u8], od: usize, id: usize) -> Vec<u8> {
+        const Q4KB: usize = 144;
+        let nsb = id / 256;
+        let nchunk = id / 32;
+        let row_len = nsb * Q4KB;
+        let mut out = vec![0u8; nchunk * od * 8];
+        for j in 0..od {
+            let prow = &raw[j * row_len..(j + 1) * row_len];
+            for sb in 0..nsb {
+                let blk = &prow[sb * Q4KB..sb * Q4KB + Q4KB];
+                let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+                let dmin = half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
+                let sc = &blk[4..16]; // 12 packed 6-bit scales+mins
+                for cc in 0..8usize {
+                    // host mirror of the device get_scale_min_k4 (cuda_kernels.cu)
+                    let (s, m) = if cc < 4 {
+                        (sc[cc] & 63, sc[cc + 4] & 63)
+                    } else {
+                        (
+                            (sc[cc + 4] & 0xF) | ((sc[cc - 4] >> 6) << 4),
+                            (sc[cc + 4] >> 4) | ((sc[cc] >> 6) << 4),
+                        )
+                    };
+                    let idx = ((sb * 8 + cc) * od + j) * 8;
+                    out[idx..idx + 4]
+                        .copy_from_slice(&(d * (s as f32)).to_bits().to_le_bytes());
+                    out[idx + 4..idx + 8]
+                        .copy_from_slice(&(-(dmin * (m as f32))).to_bits().to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// r59 (Session F riders, r57 items 4+5): move the one-time first-launch
+    /// costs out of the measured prefill window. Called once at the end of
+    /// model weight registration.
+    /// (1) kernel module pre-load — cudaFuncGetAttributes over the
+    ///     MMQ/FA/fused launch set forces the fatbin to load now instead of
+    ///     at the first dispatch (r58 CUPTI: ~3 ms host stalls bracketing
+    ///     the first mode-2 swiglu / first bt matmul);
+    /// (2) pinned D2H readback pre-grow — the grow-on-demand 4 MB
+    ///     cudaHostAlloc was the "0.78 ms tail malloc" at the n_out=1
+    ///     logits readback;
+    /// (3) MmqCache scratch pre-grow — buf_q8_prefill / buf_qa8_t /
+    ///     buf_sda_t sized for a nominal 4096-token prefill (the default
+    ///     n_ctx) at the max registered nchunk, so the first prefill's
+    ///     get_or_grow hits instead of cudaMalloc-ing ~150 MB mid-window
+    ///     (a larger prompt grows in-window exactly as before). MMQ-gated:
+    ///     the planes are dead weight when the MMQ path is off.
+    pub fn prewarm_prefill(&self) {
+        unsafe {
+            minfer_prewarm_kernels();
+        }
+        // (2) pinned readback pre-grow (same 4 MB floor as
+        // copy_from_device_pinned; failure is non-fatal — the first readback
+        // retries the alloc there).
+        {
+            let mut guard = self.readback.lock().unwrap();
+            if guard.is_none() {
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                let err = unsafe { cudaHostAlloc(&mut p, 4 * 1024 * 1024, 0) };
+                if err == 0 && !p.is_null() {
+                    *guard = Some(PinnedBuf {
+                        ptr: p as *mut u8,
+                        bytes: 4 * 1024 * 1024,
+                    });
+                }
+            }
+        }
+        // (3) MmqCache scratch pre-grow
+        if std::env::var("MINFER_MMQ").as_deref() == Ok("1") {
+            let max_nchunk = self.max_nchunk.load(std::sync::atomic::Ordering::Relaxed);
+            if max_nchunk > 0 {
+                const NT_PREWARM: usize = 4096; // default n_ctx
+                let ntb = NT_PREWARM.div_ceil(64);
+                Self::get_or_grow(&self.buf_q8_prefill, NT_PREWARM * max_nchunk * 40);
+                Self::get_or_grow(&self.buf_qa8_t, ntb * max_nchunk * 2048);
+                Self::get_or_grow(&self.buf_sda_t, ntb * max_nchunk * 256);
+            }
+        }
     }
 
     /// r53: dense centered-int8 pre-expansion of one padded q6_K tensor — the
@@ -2890,11 +3036,21 @@ impl CudaState {
                         ntb,
                         stream,
                     );
+                    // r59: the q4_K W_dsc f32-pair plane (null on miss ->
+                    // the DSC=false in-kernel scalar decode instantiation).
+                    let w_dsc = self
+                        .q4k_dsc
+                        .lock()
+                        .unwrap()
+                        .get(&(wptr as usize))
+                        .map(|cp| cp.0)
+                        .unwrap_or(std::ptr::null_mut());
                     nb_ok = qa8g != 0
                         && sdag != 0
                         && launch_mmq_raw_nb_bt_nt(
                             type_id,
                             wptr as *const u8,
+                            w_dsc as *const u8,
                             qa8g as *const u8,
                             sdag as *const u8,
                             out as *mut f32,
@@ -2906,9 +3062,21 @@ impl CudaState {
                             kd,
                         ) == 1;
                     if nb_ok && nb_debug {
+                        // r59: name the dsc staging path (liveness check per
+                        // the r53 lesson — a fallback-correct fast path needs
+                        // a visible label, parity cannot see it). "fallback!"
+                        // means a plane was expected (gate on) but the map
+                        // missed (alloc/upload failure or registration bug).
+                        let d = if !w_dsc.is_null() {
+                            "DSC=f32-plane"
+                        } else if std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() == Ok("0") {
+                            "DSC=in-kernel(dsc=off)"
+                        } else {
+                            "DSC=in-kernel(fallback!)"
+                        };
                         eprintln!(
                             "minfer/cuda: mmq raw NB-BT kernel active \
-                             (KD=8, A-transpose)"
+                             (KD=8, A-transpose, r59 {d})"
                         );
                     }
                 }
