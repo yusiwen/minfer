@@ -1641,3 +1641,32 @@ staging-ALU residual), per-shape od retiling for the small-od wave tails
 (byte-identical), and the fused ffn_gu re-measure (§11.31 lesson: re-measure
 dominated mechanisms after structural changes).
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r58.
+
+#### §11.37 P6 r59 (Session F phase 2) — the q4_K W_dsc plane lands +26%: the decode-removal win was in the FEW-kt classes, not the many-kt one the spec picked
+
+r58's phase-2 spec ranked the q4_K W_dsc plane top on the theory that
+ffn_down-q4_K's 74-kt staging exposure was `get_scale_min_k4`-decode
+dominated. The plane landed exactly as scaffolded (r56 mechanism, r53
+template pattern; chunk-major `plane[c*od + j] = float2(d·sc, −dmin·m)`,
+16-B cp.async stream, `wait0` before the visibility barrier, bit-exact host
+expander, `MINFER_MMQ_Q4K_DSC=0` opt-out at 1.42 GB) and delivered **+26.2%
+interleaved whole-prefill** (2843.2 → 3588.8 tok/s; measured under a
+46 GB co-tenant sglang that depressed the baseline ~12% from the clean
+3219.6 — matched A/B, two independent 5× series, corroborated by q4_K bt
+kernel-busy 762.6 → 526.8 ms = −30.9% and matched-nt ncu) — but the
+per-class split falsified the ffn_down premise: ffn_down improved only
+−5.2% (5.44 → 5.74 G-IMMA/s) while gate/up improved −37% and q/o −18%.
+The decode's global loads were L1-hot (the B window had just fetched the
+same 144-B blocks), so its true cost was ALU/I2F + issue slots — a large
+fraction of per-kt time only where kts are FEW (staging once per kt
+amortizes over the same compute everywhere; the exposure that scales with
+kt count is the A-plane/B-window DRAM traffic, not the decode). Lesson for
+staging-ALU removals: *classify the removed work by where its operands
+live — L1-hot decode bytes make the removal an ALU win (paying where
+compute-per-kt is thin), not a latency win (paying where stagings are
+many).* The riders (kernel module pre-warm via cudaFuncGetAttributes,
+MmqCache scratch + pinned-readback pre-grow at registration) removed the
+~6.8 ms of one-time first-launch stalls for ~+0.7%. The od re-tile item
+stays closed until regs ≤ 85 (the now-105-reg kernel can't fit 3 blocks/SM,
+which cut the (52,4) bound to ~+0.2%).
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r59.

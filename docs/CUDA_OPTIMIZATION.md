@@ -3865,3 +3865,120 @@ ncu_r58_matched.sh,ncu_r58_M_nt511.csv,ncu_r58_L_nt512.csv,ncu_parse.py,
 gen_prompt511.py,prompt511.txt,perf_f_base.log,perf_f_ab.log,g32_f.sh,
 g32_f_base.txt,g32_f_new.txt,parity_e2_run{1,2,3}.log,r58_blocking*.log,
 r58_memcheck.log,cuda_kernels_r58_cpasync.cu.bak}`. Docs commit: this round.
+
+### P6 r59 (Session F phase 2): q4_K W_dsc f32-pair plane (the r56 scaffold on the OTHER 63%) + pre-warm/pre-grow riders — LANDED (+26.2% interleaved whole-prefill under a co-tenant; q4_K bt kernel busy −30.9%) (2026-09-06)
+
+The r58 phase-2 spec's item 1, implemented exactly as specified: the r56
+q6_K W_dsc scaffold applied to the q4_K bt kernel, plus the r57 items 4+5
+riders. **The environment changed under us mid-session**: a co-tenant
+`sglang::scheduler` (46.3 GB resident) appeared on the GPU, so the absolute
+tok/s this round is NOT comparable to the clean-machine 3219.6 record — the
+pre-change binary re-measured **2836.5 standalone / 2836.3+2843.2
+interleaved** (−12% co-tenant tax vs 3219.6); all deltas below are matched
+A/B under the same conditions, and kernel-time census corroborates.
+
+**Change (4 files; CUDA-only; commit feb37de).**
+- `src/cuda_kernels.cu` (mmq_raw_nb_bt_kernel): `template <int KDR>` →
+  `template <int KDR, bool DSC>` (the r53 pattern — each instantiation keeps
+  only its own SDS path) + a `W_dsc` plane param. DSC=true: the per-(chunk,
+  od-row) rank-1 rescale terms — `get_scale_min_k4` + 2 h2f + 2 multiplies
+  per (chunk,row), 256 per kt per block — are replaced by a contiguous 16-B
+  `gemm_cp16` stream from the chunk-major plane `plane[c*od + j] =
+  float2(d*sc, −dmin*m)`, `full = (j+1 < od)` row-pair zero-fill (od even is
+  the registration gate), `gemm_cp_commit()` at the end of the staging macro
+  and `gemm_cp_wait0()` before the compute-side `__syncthreads` (the r53
+  visibility rule; no other cp.async exists in this kernel). DSC=false: the
+  scalar decode verbatim. The plane arithmetic is the EXACT in-kernel
+  consumption (`d*(float)sc`, `−(dmin*(float)m)`, sc/m the u8 6-bit
+  scales — NOT i8 as in q6_K), one IEEE f32 multiply each, so the mma-side
+  rescale is bit-identical. Launcher `launch_mmq_raw_nb_bt_nt` +1 param,
+  dispatches `<8,true>`/`<8,false>`. Plus `minfer_prewarm_kernels()`: a
+  cudaFuncGetAttributes pass over the MMQ/FA/fused launch set.
+- `src/cuda.rs`: `q4k_dsc` map keyed by the raw weight's device pointer
+  (exactly the r56 `q6k_dsc` pattern incl. the `{name}__q4dsc{od}x{id}`
+  geometry-encoded sibling name and the once-per-process failure eprintln);
+  `expand_q4k_dsc` host expander (exact `half::f16` → f32, u8→f32, one f32
+  multiply, exact negation — no FMA contraction on either side); dispatch
+  lookup + the RAW_NB_DEBUG label extended to `r59
+  DSC={f32-plane|in-kernel(dsc=off)|in-kernel(fallback!)}`; rider
+  `prewarm_prefill()` = (1) kernel module pre-load, (2) pinned D2H readback
+  pre-grow (the grow-on-demand 4 MB cudaHostAlloc = the r58 "0.78 ms tail
+  malloc" at the n_out=1 logits readback), (3) MmqCache scratch pre-grow —
+  buf_q8_prefill/buf_qa8_t/buf_sda_t sized for a nominal 4096-token prefill
+  (default n_ctx) at the max registered nchunk, so the first prefill's
+  get_or_grow hits instead of cudaMalloc-ing ~150 MB mid-window
+  (`max_nchunk` tracked at q6_K/q4_K registration; MMQ-gated).
+- `src/models/qwen2/loader.rs`: q4_K registration calls
+  `register_weight_q4k_dsc` under the NB-BT gate set (`MINFER_MMQ_RAW_NB=1
+  && MINFER_MMQ_A_TRANSPOSE=1 && MINFER_MMQ_Q4K_DSC != "0"` + `id%256==0` +
+  `od%2==0` — Q4K_DSC=0 returns ALL plane memory, mirroring the r54
+  Q6K_EXP pattern); `prewarm_prefill()` at the end of `load()`.
+- `src/graph/cuda_backend.rs`: gate-1 test `cuda_q4k_dsc_dense_byte_exact`.
+
+**Memory cost (measured census, nvidia-smi peak on/off):** +1456 MB device
+with the plane on — the q4_K W_dsc planes (od×id/4 B per tensor; ffn_down
+16.97 MB ×14, gate/up 16.97 MB ×56, q/o 3.21 MB ×56, k/v 458.7 KB ×56,
+output.weight 136.2 MB) + zero scratch delta (the prewarm scratch is
+identical on both sides). The r58 spec estimated ~1.07 GB from
+"q4_K params/4"; the real q4_K byte mass is 5.8 GB, not 4.29 GB.
+
+**Gates (all green).**
+1. `cuda_q4k_dsc_dense_byte_exact`: independent scalar mirror vs the host
+   expander AND the device plane read back through `copy_from_device_pinned`,
+   3 shapes (64×256, 40×512, 24×768, deterministic xorshift): **0
+   mismatches**. Build clean.
+2. Parity ×3 default + ×1 `Q4K_DSC=0` (separate invocations, full gates +
+   A_FUSE=2): `cuda_prefill_mmq` **1/0**, `cuda_prefill` **7/0**,
+   `cuda_fa_prefill_attention_parity` **1/0** every run.
+3. Greedy-32 (prompt2k, full gates + A_FUSE=2): **TOKEN STREAM IDENTICAL
+   (453 bytes)** vs the pre-change binary — BOTH the DSC-plane path and the
+   `Q4K_DSC=0` fallback path.
+4. Liveness (MINFER_MMQ_RAW_NB_DEBUG=1): **166× `r59 DSC=f32-plane`, 0
+   fallback**; with `Q4K_DSC=0`: 166× `DSC=in-kernel(dsc=off)`.
+5. ncu matched-nt (prompt511, `--launch-skip 4 --launch-count 24`):
+   ffn_down-q4_K (52,28) launch **2218.4 → 1450.5 µs = −34.6%**
+   (4.30 → 6.58 G-IMMA/s), gate/up (52,148) **−35%** (4.80 → 7.39),
+   regs **124 → 105** (the DSC=true instantiation drops the decode path).
+6. **Perf interleaved 5× medians ×2 independent series**: base
+   `/tmp/minfer_pre_r59` re-measured first: **2836.3, then 2843.2**;
+   new **3574.7, then 3588.8** = **+26.1% / +26.2%** (both distributions
+   tight; one 2903 outlier on the NEW side confirms the co-tenant hits both
+   sides). Bar +1.5% cleared ~17×.
+7. nsys kernel-busy census at nt=3314 (`r59_census.py`): **q4_K bt busy
+   762.59 → 526.82 ms = −30.9%** (166 launches unchanged); per-class:
+   gate/up mean 9334.6 → 5849.7 µs (−37%), q/o 3497.8 → 2855.7 (−18%),
+   **ffn_down 10134.2 → 9603.0 µs = −5.2% only (5.44 → 5.74 G-IMMA/s —
+   NOT the 7.5 target)**, k/v ±10% noise. Suite **169/0/3** main binary
+   (the known `cuda_conversation_multiturn_reuse` flake passed this run;
+   full cargo sum across binaries 172/0/9).
+
+**Verdict — LANDED (item 1 + riders; item 3 SKIPPED with evidence).**
+Whole-prefill +26.2% interleaved under the co-tenant (base 2843.2 → new
+3588.8; the clean-machine equivalent cannot be measured this session).
+Two honest attribution notes: (a) the riders contribute only ~0.7% — the
+gain is the W_dsc plane; (b) **the r58 premise was half wrong**: the
+ffn_down-q4_K class ("21% below steady state, 74 stagings") improved only
+−5.2% at production nt — its per-kt exposure is NOT decode-dominated (the
+decode's loads hit L1-hot blocks the B window just fetched); the win came
+from gate/up (−37%) and q/o (−18%) where the decode ALU/I2F share of each
+kt was large. The r58 "staging exposure scales with kt count" reading
+confounded per-kt decode cost with per-launch A-plane DRAM traffic (ffn_down
+stages a 61.6 MB qa8 plane per launch vs q/o's 7.2 MB — its deficit was
+L2-reuse-shaped, not decode-shaped).
+**Item 3 (od re-tile) SKIPPED**: the (52,4) BJ=64 arithmetic needs 3
+blocks/SM, i.e. ≤85 regs — the DSC=true kernel has 105 (and the DSC=false
+fallback 124), so at 2 blocks/SM the re-tile yields 4.33 waves (13.4% loss)
+vs 2.17 (27.8%) → ~+0.2% whole-prefill, below the run-to-run noise floor of
+this co-tenant environment; the (52,28) re-tile is similarly ~+0.15%. Both
+remain viable only together with a future register-pressure reduction
+(<85 regs) or a numerics-order-safe K-split.
+
+Artifacts: `/tmp/patch_r59_{kernel,rust,loader,test}.py` (exact-string patch
+scripts), `/tmp/minfer_phase7/{g32_r59.sh,g32_r59_{base,new}.txt,
+g32_r59_dsc0_{base,new}.txt,parity_r59.sh,parity_r59_run{1,2,3,4}.log,
+perf_r59_ab.sh,perf_r59_base.log,perf_r59_ab.log,perf_r59_ab2.log,
+perf_r59_new.log,r59_memcensus.sh,ncu_r59.sh,ncu_r59_ffn.sh,
+ncu_r59_{before,after,ffn_before,ffn_after}.csv,r59_ncu_parse.py,
+r59_nsys.sh,r59_nsys_base_summary.log,r59_base*/r59_new*.{nsys-rep,
+cuda_gpu_trace.csv,run.log},r59_census.py,r59_ffn_class.py,r59_suite.log}`.
+Code commit: feb37de. Docs commit: this round.
