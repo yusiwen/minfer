@@ -429,11 +429,13 @@ extern "C" {
     ) -> i32;
     // P6 r38: q6_K BT kernel — the same bulk-LDG->STS A staging as r34, but the
     // B weight is EXPANDED to centered int8 (256 B/row) in staging and the mma is
-    // m16n8k16 (KSPLIT=2) with a per-16-sub dsc rescale. Returns 1 on KD=8,
-    // 0 on clean fallback.
+    // m16n8k16 (KSPLIT=2) with a per-16-sub dsc rescale. r53: `w_exp` selects
+    // the pre-expanded-B cp.async instantiation (null = r41 in-kernel expand).
+    // Returns 1 on KD=8, 0 on clean fallback.
     fn launch_mmq_raw_nb_bt_q6k_nt(
         type_id: i32,
         w: *const u8,
+        w_exp: *const u8,
         qa8g: *const u8,
         sdag: *const u8,
         c: *mut f32,
@@ -927,6 +929,15 @@ pub struct CudaState {
     /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
     /// tensors by their raw GGUF size.
     padded_weights: Mutex<HashMap<String, usize>>,
+    /// r53: pre-expanded q6_K B planes (dense centered-int8, `od * id` bytes,
+    /// row stride = id, super-block stride = 256) built at padded registration
+    /// under `MINFER_MMQ_Q6K_NB=1`, keyed by the PADDED weight's device
+    /// pointer. `prefill_mmq` looks the plane up by `wptr` and passes it to
+    /// the NB-BT q6_K launcher; a miss (gate off at load, allocation failure,
+    /// raw 210-B layout) keeps the r41 in-kernel expand.
+    q6k_exp: Mutex<HashMap<usize, CudaPtr>>,
+    /// r53: the W_exp allocation-failure warning prints once per process.
+    q6k_exp_warned: std::sync::atomic::AtomicBool,
     // Persistent activation buffers (grown on demand) with size tracking
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_hidden: Mutex<(CudaPtr, usize)>,
@@ -1233,6 +1244,8 @@ impl CudaState {
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
             padded_weights: Mutex::new(HashMap::new()),
+            q6k_exp: Mutex::new(HashMap::new()),
+            q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
             buf_hidden: Mutex::new(dummy),
             buf_bn: Mutex::new(dummy),
             buf_bq: Mutex::new(dummy),
@@ -1369,6 +1382,90 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(name.to_string(), data.len());
+        // r53: pre-expand B into the dense centered-int8 plane (P6 r44) so the
+        // NB-BT q6_K kernel's B staging is a pure cp.async copy. Ships with the
+        // MINFER_MMQ_Q6K_NB gate (the NB-BT kernel is its only consumer; the
+        // A/B baseline is the unchanged env set) and requires id % 256 == 0
+        // (the kernel's own launch gate, which also keeps the dense index
+        // 16B-aligned). Dense bytes = od * id — ~2.4 GiB total on 7B q4_k_m
+        // (ffn_down 67.9 MB x 28 + output 545 MB + attn_v 1.8 MB x 28).
+        if std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1") && id % 256 == 0 {
+            self.register_weight_q6k_exp(name, &padded, od, id);
+        }
+    }
+
+    /// r53: build + upload the dense pre-expanded B plane for one padded q6_K
+    /// tensor and map it from the padded weight's device pointer. Called from
+    /// [`Self::register_weight_q6k_padded`] under the `MINFER_MMQ_Q6K_NB=1` +
+    /// `id % 256 == 0` gate; also `pub` for the gate-1 byte-exactness test.
+    /// An alloc/upload failure leaves the map empty: the kernel falls back to
+    /// the r41 in-kernel expand with a once-per-process loud eprintln.
+    pub fn register_weight_q6k_exp(&self, name: &str, padded: &[u8], od: usize, id: usize) {
+        // geometry-encoded sibling name: a same-name different-shape
+        // re-registration can never collide with (and silently reuse) a stale
+        // plane of the same byte size but a different od/id layout.
+        let exp_name = format!("{name}__exp{od}x{id}");
+        let exp = Self::expand_q6k_dense(padded, od, id);
+        self.register_weight(&exp_name, &exp);
+        // the MAP is keyed by the PADDED weight's device pointer (what
+        // prefill_mmq holds); the value is the W_exp plane's pointer
+        if let Some(wp) = self.get_weight_ptr(name) {
+            if let Some(ep) = self.get_weight_ptr(&exp_name) {
+                if !wp.is_null() && !ep.is_null() {
+                    self.q6k_exp.lock().unwrap().insert(wp as usize, CudaPtr(ep));
+                    return;
+                }
+            }
+        }
+        if !self
+            .q6k_exp_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "minfer/cuda: q6_K W_exp pre-expand unavailable for '{name}' \
+                 (alloc/upload failed) - mmq_raw_nb_bt_q6k falls back to the \
+                 r41 in-kernel expand"
+            );
+        }
+    }
+
+    /// r53: dense centered-int8 pre-expansion of one padded q6_K tensor — the
+    /// host mirror of the device `expand_q6_elem` (P6 r44 / MMQ-analysis
+    /// §11.24). Output: `od * id` bytes, `out[j * id + sb * 256 + e]` =
+    /// super-block element e of row j — the exact tile the kernel's staging
+    /// used to recomb. Requires `id % 256 == 0` (the NB-BT launch gate).
+    /// Two output elements per (ql, qh) byte pair: e = it*128+r and
+    /// e = it*128+r+64 share ql[it*64+r] (nibble shifts 0/4) and
+    /// qh[it*32 + (r&31)] (2-bit-field shifts 2*(r>>5) / 2*((r>>5)+2)).
+    pub fn expand_q6k_dense(padded: &[u8], od: usize, id: usize) -> Vec<u8> {
+        const Q6KB: usize = 210;
+        const Q6KPB: usize = 224;
+        let nbe = id / 256;
+        let row_len = nbe * Q6KPB;
+        let mut out = vec![0u8; od * id];
+        for j in 0..od {
+            let prow = &padded[j * row_len..(j + 1) * row_len];
+            let orow = &mut out[j * id..(j + 1) * id];
+            for sb in 0..nbe {
+                let blk = &prow[sb * Q6KPB..sb * Q6KPB + Q6KB];
+                let (ql, qh) = blk.split_at(128);
+                let obase = &mut orow[sb * 256..sb * 256 + 256];
+                for it in 0..2usize {
+                    for r in 0..64usize {
+                        let qlb = ql[it * 64 + r];
+                        let qhb = qh[it * 32 + (r & 31)];
+                        let s0 = (r >> 5) * 2;
+                        let e0 = it * 128 + r;
+                        obase[e0] =
+                            ((qlb & 0xF) | (((qhb >> s0) & 3) << 4)).wrapping_sub(32);
+                        obase[e0 + 64] = (((qlb >> 4) & 0xF)
+                            | (((qhb >> (s0 + 4)) & 3) << 4))
+                            .wrapping_sub(32);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Whether `name` was registered in the padded Q6_K layout.
@@ -2591,11 +2688,22 @@ impl CudaState {
                     ntb,
                     stream,
                 );
+                // r53: pre-expanded B plane lookup by the padded weight's
+                // device pointer (null on miss -> launcher selects the r41
+                // in-kernel-expand instantiation).
+                let w_exp = self
+                    .q6k_exp
+                    .lock()
+                    .unwrap()
+                    .get(&(wptr as usize))
+                    .map(|cp| cp.0)
+                    .unwrap_or(std::ptr::null_mut());
                 if qa8g != 0
                     && sdag != 0
                     && launch_mmq_raw_nb_bt_q6k_nt(
                         type_id,
                         wptr as *const u8,
+                        w_exp as *const u8,
                         qa8g as *const u8,
                         sdag as *const u8,
                         out as *mut f32,
@@ -2611,7 +2719,12 @@ impl CudaState {
                     if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
                         eprintln!(
                             "minfer/cuda: mmq raw NB-BT q6_K kernel active \
-                             (r39 KDR=2 double-buffer, A-transpose)"
+                             (r53 B={}, r39 KDR=2 double-buffer, A-transpose)",
+                            if w_exp.is_null() {
+                                "in-kernel-expand"
+                            } else {
+                                "W_exp-cp.async"
+                            }
                         );
                     }
                     return Ok(());

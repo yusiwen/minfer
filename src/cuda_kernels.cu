@@ -5768,10 +5768,15 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
 // q6_K uses mma.m16n8k16 (KSPLIT=2) because a 32-k chunk spans TWO 16-element
 // sub-blocks with DIFFERENT scales (sc[2c%16], sc[(2c+1)%16]); the per-half int
 // accumulators are rescaled separately with dsc0/dsc1 (single-term: no dmin).
-// The B tile is EXPANDED in staging to centered int8 (-32..31, 256 B/row, the
-// ql+qh recombination + -32 centering all leave the hot loop — the r21/r22/r31
+// The B tile is EXPANDED to centered int8 (-32..31, 256 B/row, the ql+qh
+// recombination + -32 centering all leave the hot loop — the r21/r22/r31
 // "keep index math out of the loop" lesson) and the A side is the exact BT bulk
 // LDG->STS of the pre-transposed qa8/sda (weight-type-agnostic).
+// r53 bundle (EXP=true): the expansion itself was hoisted to registration — a
+// dense centered-int8 plane W_exp (od x id, row stride = id, super-block
+// stride = 256) built by expand_q6k_dense — so the B staging is a pure
+// cp.async bulk copy (explicit PTX) with no recomb ALU and no ql/qh reads.
+// EXP=false keeps the r41 in-kernel expand (raw 210-B layout / W_exp miss).
 __device__ __forceinline__ int expand_q6_elem(const uint8_t* ql, const uint8_t* qh, int elem) {
     int m  = elem & 31;
     int it = elem >> 7;
@@ -5785,9 +5790,10 @@ __device__ __forceinline__ int expand_q6_elem(const uint8_t* ql, const uint8_t* 
     return v - 32;
 }
 
-template <int KDR>
+template <int KDR, bool EXP>
 __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
-    const uint8_t* __restrict__ W, const uint8_t* __restrict__ qa8g,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ W_exp,
+    const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
     int nt, int od, int id, int nchunk, int bstride
 ) {
@@ -5832,11 +5838,38 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
                  off += blockDim.x)                                            \
                 ((uint4*)(sdaqb))[off] = ((const uint4*)(sdag + sbase))[off];  \
         }                                                                      \
-        /* ---- B: expand KDR*32-chunk super-block (half-super at KDR=4) ---- */ \
+        /* ---- B: KDR*32-chunk super-block window (half-super at KDR=4) --- */\
         {                                                                      \
             const int sb = ((kt) * KDR) >> 3;                                  \
             const int cbase = ((kt) * KDR) & 7;   /* chunk offset in sb */     \
-            if ((bstride & 15) == 0) {                                         \
+            if (EXP) {                                                         \
+                /* r53 bundle: the ql+qh recomb + -32 centering ran ONCE at    \
+                 * registration (expand_q6k_dense -> dense centered-int8 plane \
+                 * W_exp: od x id, row stride = id, super-block stride = 256), \
+                 * so the staging is a pure cp.async bulk copy (explicit PTX)  \
+                 * from W_exp — no recomb ALU, no register round-trip, no      \
+                 * ql/qh reads (r44's -10.9% kernel-cycles mechanism), and the \
+                 * copy latency hides under compute via the group wait (r45's  \
+                 * -10.2% mechanism, applied to the B side). Dense index:      \
+                 * W_exp + j*id + sb*256 + cbase*32 (16B-aligned: id is a      \
+                 * multiple of 256 on this path). Rows beyond od zero-fill via \
+                 * the cp.async src-size qualifier (gemm_cp16 full=0). */      \
+                const int nc = (KDR * 32) / 16;   /* 16B chunks per row */     \
+                const int ncopy = MMQ_NBJ * nc;                                \
+                for (int g = threadIdx.x; g < ncopy; g += blockDim.x) {        \
+                    const int jj = g / nc, cc = g % nc;                        \
+                    const int j = j0 + jj;                                     \
+                    const bool full = (j < od) && (sb < nsb);                  \
+                    const uint8_t* src = W_exp + (size_t)j * id                \
+                        + (size_t)sb * 256                                     \
+                        + (size_t)(cbase * 32 + cc * 16);                      \
+                    gemm_cp16(                                                 \
+                        (__half*)(void*)(qbexpb + (size_t)jj * (KDR * 32)      \
+                                                 + cc * 16),                   \
+                        (const __half*)(const void*)src, full);                \
+                }                                                              \
+                gemm_cp_commit();                                              \
+            } else if ((bstride & 15) == 0) {                                  \
                 /* r41: 16-elem group expand via uint4 ql+qh global loads.     \
                  * The padded 224B block stride is 16-aligned, so a group's    \
                  * ql run [it0*64+gg*16 .. +16) and qh run [it0*32+(gg&1)*16..) \
@@ -5927,9 +5960,21 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
 
     int buf = 0;
     for (int kt = 0; kt < nktile; ++kt, buf ^= 1) {
-        // Overlap kt+1's global->smem expansion with kt's compute: stage into the
+        // Overlap kt+1's global->smem staging with kt's compute: stage into the
         // OTHER buffer (buf^1) while reading buffer buf (the mmq_nt<7,2> pipeline).
-        if (kt + 1 < nktile) RAW_STAGE_Q6K_BT(kt + 1, buf ^ 1);
+        if (kt + 1 < nktile) {
+            RAW_STAGE_Q6K_BT(kt + 1, buf ^ 1);
+            // r53 (EXP): two groups are pending (kt's and kt+1's); wait until
+            // only kt+1's remains — group(kt), the cp.async B copy for `buf`,
+            // has landed, while buf^1's copy stays in flight under kt's
+            // compute (in-order group completion). The sync A staging for
+            // buf^1 above needs no wait.
+            if (EXP) gemm_cp_wait1();
+        } else if (EXP) {
+            gemm_cp_wait0();  // last tile: drain every outstanding group
+        }
+        if (EXP) __syncthreads();  // r53 (EXP): cross-thread visibility of the
+                                   // kt buffer's async B copy before compute
 
         const uint8_t* qa8c = qa8 + (size_t)buf * qa8_stride;
         const uint32_t* sdaqc = reinterpret_cast<const uint32_t*>(sda_q + (size_t)buf * sdaq_stride);
@@ -6057,12 +6102,14 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
 // super-block per kt, but two buffers (2xA + 2xB) pipeline kt+1's global->smem
 // expansion under kt's compute while keeping the footprint at 29,696 B -> 2 blocks/SM
 // (the r38 figure; full-double-buffer at KDR=4 would be 59,392 B -> 1 block/SM and
-// was excluded on r38's occupancy evidence). Returns 0 (clean fallback to the
-// generic mmq_nt<7,2>) on any cap/mismatch.
+// was excluded on r38's occupancy evidence). r53: w_exp != 0 selects the
+// pre-expanded-B instantiation (B staging = cp.async bulk copy from the dense
+// W_exp plane); w_exp == 0 keeps the r41 in-kernel expand. Returns 0 (clean
+// fallback to the generic mmq_nt<7,2>) on any cap/mismatch.
 extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
-    int type_id, const uint8_t* w, const uint8_t* qa8g, const uint8_t* sdag,
-    float* c, int nt, int od, int id, int nchunk, int bstride,
-    cudaStream_t stream, int kd
+    int type_id, const uint8_t* w, const uint8_t* w_exp, const uint8_t* qa8g,
+    const uint8_t* sdag, float* c, int nt, int od, int id, int nchunk,
+    int bstride, cudaStream_t stream, int kd
 ) {
     (void)type_id;
     if (kd != 8) return 0;
@@ -6073,12 +6120,27 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
                    + 2 * MMQ_NBJ * KDR * 32   // qb_exp (double-buffered)
                    + 2 * KDR * MMQ_NBJ * 8;   // sds  (double-buffered)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    // r53: EXP is a template constant, so each instantiation keeps only its
+    // own B path (the cp.async copy vs the r41 recomb) — no runtime branch.
+    const bool exp = w_exp != 0;
+    if (exp) {
+        cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, true>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    } else {
+        cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, false>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-    mmq_raw_nb_bt_q6k_kernel<KDR><<<grid, 256, smem, stream>>>(
-        w, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+    if (exp) {
+        mmq_raw_nb_bt_q6k_kernel<KDR, true><<<grid, 256, smem, stream>>>(
+            w, w_exp, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+    } else {
+        mmq_raw_nb_bt_q6k_kernel<KDR, false><<<grid, 256, smem, stream>>>(
+            w, w_exp, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+    }
     e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "minfer/cuda: mmq raw NB-BT q6_K launch failed: %s\n",

@@ -3732,6 +3732,76 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn cuda_q6k_exp_dense_byte_exact() {
+        // r53 gate 1: the pre-expanded dense W_exp plane must be byte-identical
+        // to an independent scalar mirror of the device expand_q6_elem over the
+        // whole tensor (the r44 readback gate, 0 mismatches) — checked on the
+        // HOST expander and on the DEVICE upload (pinned readback).
+        let Some(state) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for (od, id) in [(64usize, 256usize), (40usize, 512usize), (24usize, 768usize)] {
+            let nbe = id / 256;
+            let row_len = nbe * 210;
+            let raw: Vec<u8> = (0..od * row_len).map(|_| (rnd() & 0xFF) as u8).collect();
+            // padded repack (the register_weight_q6k_padded layout)
+            let mut padded = vec![0u8; od * nbe * 224];
+            for r in 0..od {
+                for ib in 0..nbe {
+                    let src = r * row_len + ib * 210;
+                    let dst = r * nbe * 224 + ib * 224;
+                    padded[dst..dst + 210].copy_from_slice(&raw[src..src + 210]);
+                }
+            }
+            // independent scalar mirror, straight from the device formula
+            let mut want = vec![0u8; od * id];
+            for j in 0..od {
+                for sb in 0..nbe {
+                    let base = (j * nbe + sb) * 224;
+                    let blk = &padded[base..base + 210];
+                    let (ql, rest) = blk.split_at(128);
+                    let qh = &rest[..64];
+                    for e in 0..256usize {
+                        let m = e & 31;
+                        let it = e >> 7;
+                        let n = e & 127;
+                        let ql_idx = it * 64 + (n & 63);
+                        let ql_shift = (n >> 6) * 4;
+                        let qh_idx = it * 32 + m;
+                        let qh_shift = ((n >> 5) & 3) * 2;
+                        let v = ((ql[ql_idx] >> ql_shift) & 0x0F)
+                            | (((qh[qh_idx] >> qh_shift) & 0x03) << 4);
+                        want[j * id + sb * 256 + e] = (v as i32 - 32) as u8;
+                    }
+                }
+            }
+            // host-side production expander vs the mirror
+            let host = crate::cuda::CudaState::expand_q6k_dense(&padded, od, id);
+            let hmis = host.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(hmis, 0, "expand_q6k_dense vs mirror ({od}x{id})");
+            // device upload path: build + read back + compare
+            let name = format!("r53exp{od}x{id}");
+            state.register_weight_q6k_padded(&name, &raw, od, id);
+            state.register_weight_q6k_exp(&name, &padded, od, id);
+            let exp_name = format!("{name}__exp{od}x{id}");
+            let p = state.get_weight_ptr(&exp_name).expect("W_exp registered");
+            let mut got = vec![0u8; od * id];
+            state.copy_from_device_pinned(p, &mut got);
+            let dmis = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(dmis, 0, "device W_exp vs mirror ({od}x{id})");
+        }
+    }
+
     #[test]
     fn cuda_fa_prefill_attention_parity() {
         let Some(mut cb) = pool() else {
