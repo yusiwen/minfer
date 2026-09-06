@@ -3748,3 +3748,120 @@ two-attempt cycle.
 with dropped items was needed). Next session: the pre-warm/pre-grow host
 work (items 4+5, ~+0.7% combined estimate, low risk), rms_nw (item 3,
 bounded +0.5..1%), then Session F's q8_1 structural lever.
+
+### P6 r58 (Session F, second-tier q8_1 structural round): the q4_K BT spec + the cp.async-db2 transplant — REVERTED (parity/greedy green, whole-prefill −12.6%) (2026-09-06)
+
+**Baseline re-measured first** (interleaved 5×, `/tmp/minfer_pre_r58` = the
+r56-code rebuild at HEAD 2105b08): **3219.6 tok/s median** (3209.0–3233.9) —
+consistent with the landed 3212.5.
+
+#### Phase 1a — the structural diff, measured (not read)
+
+Production nsys at the gate set + A_FUSE=2 (prompt2k, nt=3314; artifacts
+`/tmp/minfer_phase7/r58_prod.*`, census via `r58_census.py`): kernel busy
+984.2 ms, **q4_K bt = 622.4 ms across 166 launches = 63.2% of kernel busy**
+(q6K 125.5, fused swiglu 64.0, FA 51.8, mmvq 24.1, fused rms 22.6, a-prepass
+10.0). The per-launch census splits the q4_K bt wall into four classes:
+
+| class | grid | blocks | waves @96 | n | mean µs | IMMA/launch | G-IMMA/s | ceil-wave loss |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| ffn gate / up | (52,148) | 7696 | 80.17 | 54 | 7350 | 55.2M | **7.51** | 1.03% → 4.1 ms |
+| q-proj + o-proj | (52,28) | 1456 | 15.17 | 56 | ~1400 | 10.44M | **7.46** | 5.21% → ~8.2 ms |
+| ffn_down (q4_K half) | (52,28) | 1456 | 15.17 | 14 | ~9300 | 55.2M | **5.94** | 5.21% → 2.9 ms |
+| k-proj + v-proj (q4_K) | (52,4) | 208 | 2.17 | 42 | ~299 | 1.50M | **5.05** | 27.8% → 3.5 ms |
+
+(IMMA = m16n8k32 count = ntb·od·id/64; concurrency 96 = 48 SM × 2 blocks at
+43,008 B smem.) ncu at matched nt (minfer nt≈529, `ncu_r58_M_nt511.csv`):
+achieved occupancy 33%, 103 regs, SOL 43–45% on gate/up, **long_scoreboard
+24–38% (46–54% on k/v)**; ncu llama nt=512 (`ncu_r58_L_nt512.csv`):
+q-proj stream-k grid 48 = 276 µs @5.82 G-IMMA/s, occ 17.8%, long_scoreboard
+25.3%, **plus a 34–37 µs fixup launch per stream-k GEMM (grid 192, 86%
+long_scoreboard — 13% overhead on the q-proj)**; gate/up 592-block (12.33
+waves) 6.55/6.92 G-IMMA/s. Cross-checked against r20/r36/r47: steady-state
+per-IMMA is at parity (ours 7.5 vs llama ~6–6.5 on the big classes); the
+deficit is **not in the mma loop**.
+
+**WHERE the 1.06× lives (the spec answer):** (1) the **ffn_down-q4_K class
+runs 21% below our own steady state** (5.94 vs 7.51 G/s at identical IMMA —
+74 stagings vs 14: the per-kt staging exposure scales with kt count);
+(2) **ceil-wave quantization ≈ 26.1 ms = 3.5% of bt busy ≈ 2.6% of
+whole-prefill**, concentrated in (52,28) 15.17 waves and (52,4) 2.17 waves;
+(3) launch/gap overhead is closed (~1.8 ms recurring, r55). llama's answers
+on the same axes: stream-k + fixup (pays 13% per small launch for zero tail)
+and 1-block/SM tiles — both byte-lossy for us (fixup re-add order) or
+occupancy-negative. The ntx=2 warp-remap candidate is closed by r17 (wall
+neutral) + r36 (per-IMMA already at parity).
+
+**Top delta picked by this evidence:** transplant the r39+r53+r56 staging
+pipeline onto `mmq_raw_nb_bt_kernel` — its staging is still the r34-era
+synchronous LDG→STS bulk copy (the task brief's "cp.async A+B staging" is
+true only of the q6_K kernel; 13 `gemm_cp16` sites, all q6_K) — as KDR=2
+double-buffer + cp.async A/sds + sb-parity cp.async B window, 46,080 B smem,
+`__launch_bounds__(256,2)`, sm_121 122 regs / 0 stack / 0 local, LDGSTS in
+SASS.
+
+#### The transplant: three bugs, then a green-but-slower kernel
+
+Landed en route (all caught by the gates): (a) `sdaqb` declared `uint32_t*`
+so the byte-loop stepped 4× the sda plane → err 700 (OOB) — byte pointer;
+(b) the compute-side `sdaqc = sda_q + buf*sdaq_stride` — same word/byte
+confusion, buffer 1's sda read 2 KB off — the r44-class stride mismatch
+exactly, caught by greedy-32 (diverged at generated-token ~20);
+(c) **the B window must rotate at SUPER-BLOCK parity, not kt parity** —
+with the cadence `((kt·KDR)&7)==0` the stage target is always buffer 0, so
+buffer 1's qb was never written and odd kts consumed uninitialized smem
+(the nt=13 dump looked bit-clean via stale-node-dump luck; the nt=3314 KV
+dump showed the real corruption). After (c): **greedy-32 token stream
+IDENTICAL (453 bytes), parity ×3 green** (mmq_parity 1/0, cuda_prefill 7/0,
+fa_parity 1/0 ×3 runs).
+
+**Perf: interleaved 5× median 2819.3 vs 3227.6 = −12.6% → REVERTED**
+(`perf_f_ab.log`). Why the q6_K winner loses here: the mechanism's cost
+model inverts. q6_K r39/r53/r56 replaced an EXPENSIVE staging (the r41 ql+qh
+recomb + I2F) and its KDR=2 granularity amortized that work; the q4_K bt
+staging is already cheap pure copies (r18 B, r34 A), so KDR=2 buys (i) **4×
+the barrier density** (2 syncs per 2-chunk kt vs per 8-chunk kt — the r20
+"barrier density at parity" lesson, now measured from the other side), (ii)
+a 1-deep cp.async lookahead (~200–400 cyc of per-kt compute) that cannot
+cover the ~600–900 cyc global latency, and (iii) no register/ALU work
+removed. The −12.6% is the price of those three, paid 166 launches per
+prefill. The r45 lesson ("a mechanism whose wall value depends on what ELSE
+is on the critical path is not dead, it is WAITING") gets its mirror image:
+a mechanism whose COST depends on the granularity of what it replaces is not
+free, it is AMORTIZATION-BOUND.
+
+**Riders (r57 items 4+5, pre-warm/pre-grow): NOT attempted** — the delta's
+two bug-fix + measure cycles consumed the session budget; the riders need
+~20 extern `cudaFuncGetAttributes` wirings + MmqCache pre-grow sizing to
+gate properly. They carry over unchanged as the next cheap round.
+
+#### Phase-2 spec (what remains, ranked by the r58 evidence)
+
+1. **q4_K W_dsc plane (the r56 scaffold applied to the OTHER 63%)** —
+   `get_scale_min_k4` + 2 h2f per (chunk, od-row) still run in the staging
+   critical path of every q4_K bt launch (1024 decodes per kt per block;
+   branchy, warp-divergent). Registration-time plane
+   `plane[c·od + j] = float2(d·sc, −dmin·m)`, chunk-major for a 16-B
+   cp.async stream, gate/map/label/byte-exactness-test all reusable from
+   r56; memory ≈ q4_K params/4 ≈ 1.07 GB on 7B q4_k_m (vs W_exp's 1.52 GB).
+   Bound: the r56 dsc member was −4..−6% kernel WITH the A-cp.async; alone,
+   expect +1..+2.5% whole-prefill — the top next candidate, ideally bundled
+   with (2)'s win.
+2. **Wave re-tile for the small-od classes** — (52,4) k/v at BJ=64 (8 od
+   tiles, 416 blocks; 3 blocks/SM at 30.2 KB if regs allow → 416/144 =
+   2.89 waves, 3.7% loss vs 27.8%) and/or (52,28) q/o at BJ=64. Retile is
+   byte-identical (per-element accumulation order is od-agnostic);
+   bounded ≈ +0.3..0.8% whole-prefill total. Persistent grids do NOT fix
+   uniform-tile quantization (makespan is unchanged); K-split fixes it but
+   breaks the byte-identity gate (r50-class) — out.
+3. **fused ffn_gu concat (od 2·18944)** — one GEMM instead of two
+   (52,148) launches halves the per-class prologue and merges their tails;
+   needs the G5 nf≤16384 gate revisited (7B nf=18944 was "measured slower"
+   pre-BT — re-measure on the current kernel).
+4. **Riders** (items 4+5) — unchanged from r57.
+
+Artifacts: `/tmp/minfer_phase7/{r58_census.py,r58_prod_cuda_gpu_trace.csv,
+ncu_r58_matched.sh,ncu_r58_M_nt511.csv,ncu_r58_L_nt512.csv,ncu_parse.py,
+gen_prompt511.py,prompt511.txt,perf_f_base.log,perf_f_ab.log,g32_f.sh,
+g32_f_base.txt,g32_f_new.txt,parity_e2_run{1,2,3}.log,r58_blocking*.log,
+r58_memcheck.log,cuda_kernels_r58_cpasync.cu.bak}`. Docs commit: this round.

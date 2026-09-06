@@ -1611,3 +1611,33 @@ silently profiles the LEGACY path — pass the env through `sudo -n env` and
 read ncu's "Available Kernels" zero-match list as the liveness tell (the r53
 launch-path-label lesson, profiler edition).
 Recorded: docs/CUDA_OPTIMIZATION.md P6 r56.
+
+#### §11.36 P6 r58 (Session F) — the q4_K bt spec: the 1.06× is ffn_down-class staging exposure + ceil-wave tails; the cp.async-db2 transplant is amortization-bound and REVERTED
+
+Session F's spec measured the structural diff instead of reading it. Per-launch
+census at nt=3314: the q4_K bt wall splits into ffn gate/up (7.51 G-IMMA/s, our
+own steady state), q/o (7.46), **ffn_down-q4_K (5.94 — 21% below steady state at
+identical IMMA, 74 stagings vs 14)** and k/v (5.05, 2.17 waves → 27.8% ceil-wave
+loss); total ceil-wave quantization ≈ 2.6% of whole-prefill. ncu: llama's
+stream-k + fixup pays 13% per small launch to buy a zero tail — both fixes for
+the tail are byte-lossy or occupancy-negative for minfer. The ntx=2 remap stays
+closed (r17 wall-neutral, r36 per-IMMA parity).
+
+The picked delta — r39+r53+r56 staging pipeline transplanted onto the q4_K bt
+kernel (KDR=2 double-buffer, cp.async A/sds, sb-parity cp.async B window) —
+passed parity ×3 and greedy-32 byte-identity after three real bugs (two
+word/byte stride confusions = the r44 class; a B-window buffer-parity bug that
+left buffer 1's qb uninitialized) and then measured **−12.6% whole-prefill**
+(2819.3 vs 3227.6) → REVERTED. The transferable lesson inverts r45's: the
+q6_K pipeline won because it replaced an EXPENSIVE staging (ql+qh recomb + I2F)
+at a granularity that amortized it; the q4_K staging is already cheap copies,
+so the same structure only multiplies barrier density 4× (2 syncs per 2 chunks
+vs per 8) with a 1-deep lookahead that cannot hide global latency. **A
+pipeline mechanism's value is bounded by the work it removes minus the
+granularity cost it adds — measure the staging's actual expense before
+transplanting its scheduler.** The remaining q4_K levers are the r56 W_dsc
+scaffold applied to q4_K's in-staging `get_scale_min_k4` (the one real
+staging-ALU residual), per-shape od retiling for the small-od wave tails
+(byte-identical), and the fused ffn_gu re-measure (§11.31 lesson: re-measure
+dominated mechanisms after structural changes).
+Recorded: docs/CUDA_OPTIMIZATION.md P6 r58.
