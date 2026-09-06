@@ -4043,3 +4043,127 @@ perf_r59b_drift.log,perf_r59b_fresh_ab.log,r59b_memcensus.sh,
 r59b_build_head.log,r59b_build_d09280a.log,minfer_head_1853_snapshot,
 minfer_d09280a_binary}`. Binaries: fresh HEAD md5 1f6f9019…, fresh d09280a
 md5 d922861f…, landed 18:53 HEAD md5 97fea5a1… (snapshot).
+
+### P6 r60: PROMOTION — the verified MMQ gate set flips to DEFAULT-ON (opt-out "0") — LANDED (user-approved; default = the verified 1.080x path; + the promotion-blocking multiturn_reuse break found by bisect and fixed via the NB-BT-only mode-2 guard) (2026-09-06)
+
+**Design.** The six promoted gates invert to the r54 opt-out pattern —
+**absent / any non-"0" value = ON (the verified best), explicit "0" = opt-out
+(= the pre-r60 default behavior)**: `MINFER_MMQ`, `MINFER_MMQ_RAW`,
+`MINFER_MMQ_RAW_NB`, `MINFER_MMQ_A_TRANSPOSE`, `MINFER_MMQ_Q6K_NB`,
+`MINFER_MMQ_A_FUSE` (absent = mode 2, the verified-best skip-write; "1"/"2"
+keep the r51/r52 override semantics; "0" or any other unrecognized value =
+off, as before). All reads are single-sourced in
+`CudaState::mmq_gate_on(name)`. Kept unchanged: `MINFER_MMQ_Q6K_EXP` /
+`MINFER_MMQ_Q4K_DSC` (already default-on "!=0" semantics — they now simply
+fire under the promoted parents by default), and the overrides
+`MINFER_MMQ_RAW_KD` (default 8), `MINFER_MMQ_RAW_WIDE`, `MINFER_MMQ_RAW_NB_DEBUG`
+(still "1"-opt-in). Every dispatch guard is UNCHANGED and now protects the
+default path: MMQ entry `nt >= 16 && id % 32 == 0 && !no_prefill_gemm`, NB-BT
+`(id / 32) % 8 == 0`, plane registration `id % 256 == 0` (+ `od % 2 == 0`
+dsc), fused producers `rows/n >= 16 && dim % 256 == 0`, mode-2 window readers
+(NO_PREFILL_GEMM/GRAPH_DUMP/DUMP_DIR/trace/viz).
+
+**Gate-read census (all flipped sites).** cuda.rs: `mmq_enabled`, the
+`mmq_a_fuse_mode` parent set, the W_exp/W_dsc q6_K registration gate
+(`register_weight_q6k_padded`), the q6_K NB-BT dispatch arm, the q4_K arm
+(RAW + nb + at), the pinned-scratch MmqCache pre-grow. qwen2/loader.rs: the
+W_dsc registration gate (RAW_NB + A_TRANSPOSE). qwen3/loader.rs: only the
+`mmq_active()` warm-pass skip (reads the method, not the env; follows the
+promotion automatically, as does qwen2's). cuda_kernels.cu + cuda_backend.rs:
+comments only. `supports_op`/`supports_fused` are env-free.
+
+**Decode (nt==1): untouched — grep + empirical evidence.** The MMQ prefill
+path is entered only inside the `nt >= 16` block (`CudaState::matmul`);
+`mmq_enabled`'s only other consumer chain, `mmq_a_fuse_mode`, is called from
+the cuda_backend SwiGLU/RmsNorm arms strictly behind the `rows/n >= 16`
+guards (decode rows = 1). Decode dispatches to the MMVQ arms
+(`q4_k/q5_k/q6_k_decode_mmvq`, gated by shape + `MINFER_NO_KQ_MMVQ` only) —
+no MINFER_MMQ* read anywhere on the nt==1 path. Empirically: decode -n 16
+--greedy default-env vs snapshot+gated-env byte-identical; tg128 45.2 vs
+45.2 tok/s (identical medians, 3 rounds interleaved).
+
+**GraphCache/reuse identity: dispatch-level only.** Graph topology is built
+from `GraphParams` (qwen2/graph.rs reads only NO_FUSE_QKV / NO_FUSE_FFN /
+GRAPH_DUMP — zero MMQ reads); `CParams` (incl. gpu) is env-free;
+`supports_op`/`supports_fused` are env-free. The gates choose KERNELS at
+dispatch time and PLANES at registration time (memory, not structure); CUDA
+Graph capture (decode + prefill windows) embeds whatever the per-process-
+constant env selects, so replay is self-consistent. No CParams.gpu-style
+recording needed; nothing flipped at build level.
+
+**The promotion blocker the bisect caught (fixed, not reverted).** Gate 7
+first came back 168/1/3: `cuda_conversation_multiturn_reuse` failed with the
+r52 mode-2 dead-write guard firing ("native A-quantize refused: mode-2
+dead-write A") cascading into a mislabeled `Err("cuda: prefill MMQ q8 scratch
+OOM")` — the generic mmq_nt arm at cuda.rs returns that string when
+`mmq_quantize_native` returns 0, and the refusal ALSO returns 0. Stash
+bisect (serial, single test): **clean HEAD default-env PASSES 3/3; clean
+HEAD with the full gated env FAILS 2/2 identically; the r60 build fails 3/3
+identically.** So this was NOT parallel-test interference (the r56 record's
+guess; its bisect had already shown the failure belongs to the gated config)
+and NOT a promotion regression — the r60 default faithfully reproduces the
+verified config, warts included. Root cause: the r52 window proof assumes
+the fused pad40_t plane's consumers are the NB-BT (q4_K) / q6_K transposed
+GEMMs; on ANY other quant mix (the test's 0.5b **q4_0** fixture) a fused
+rms_norm/swiglu producer skips the f32 write that a generic mmq_nt consumer
+then legitimately tries to re-quantize → the guard correctly refuses → loud
+error. Only ever visible under opt-in env until r60. **Fix: mode-2
+skip-write producers are now conditioned on a registration-time
+`nb_bt_only` flag** — cleared by the loaders when a quantized weight that is
+not q4_K/q6_K registers, or when a 2-D F32 weight registers (an f32 MATMUL
+weight — its GEMM reads the f32 A directly, a silent-corruption exposure the
+refusal-based path never had; norms/biases are 1-D and don't clear).
+Mixed-quant models degrade mode 2 → mode 1 (r51 fused semantics: plane AND
+f32 both written, correct everywhere). The promoted 7B q4_k_m is
+all-NB-BT-consumable (token_embd q4_K, output q6_K — verified via `minfer
+info`) so it keeps mode 2 and its exact verified behavior. After the fix:
+`cuda_conversation_multiturn_reuse` ok 3/3 serial, suite **169/0/3** main
+binary (172/0/9 full cargo sum).
+
+**Verification (default env = NO env vars; A/B base =
+`/tmp/minfer_phase7/minfer_head_1853_snapshot` + full gate env; idle
+co-tenants as in r59b).**
+1. Whole-prefill interleaved 5× (pre-fix build): base 3570.3–3604.3 (median
+   3592.1) vs new 3575.3–3595.8 (median 3578.0) = **−0.39%**, distributions
+   fully overlapping — no missed gate (bar: >1% slower). Post-fix 3×
+   re-check: base median 3583.0 vs new 3598.7 = +0.44% the OTHER way — noise
+   both directions, mode 2 confirmed still active on 7B.
+2. Parity ×3 default-env, separate invocations: `cuda_prefill_mmq_parity`,
+   `cuda_prefill_f16_gemm_parity`, `cuda_fa_prefill_attention_parity` — 9/9
+   ok.
+3. Greedy-32 (prompt2k, seed 42): default-env vs snapshot+gated byte-
+   identical (453-byte streams).
+4. Decode: -n 16 --greedy identical (366 bytes); tg128 medians 45.2 = 45.2.
+5. Opt-out: `MINFER_MMQ=0` → zero mmq dispatch labels (vs 166 q4_K NB-BT
+   `DSC=f32-plane` + 27 q6_K `W_exp-cp.async/DSC=f32-plane` labels under
+   default env), f16-path spot perf ~2226 tok/s this window (the documented
+   ~2353-class clean number).
+6. 0.5b q4_k_m smoke (mixed Q5_0/Q8_0/Q4_K/Q6_K — exercises the guards;
+   downloaded for the occasion): greedy-32 default vs gated byte-identical
+   (449 bytes). NOTE: post-fix the 0.5b side runs mode-1 producers (mixed
+   mix clears nb_bt_only) and STILL matches the gated-snapshot stream — the
+   plane is a pure function of A, so producer mode cannot move outputs.
+7. Suite: 169/0/3 default-env (after the fix). One transient SIGSEGV suite
+   run immediately post-fix did NOT reproduce (immediate re-run green
+   172/0/9); consistent with the documented overcommitted-pool hazard class
+   (47.7 GB idle co-tenants), no minfer attribution.
+8. Memory (per-PID peak census, exec-sampled, stable across rechecks):
+   default-on **9484 MiB**; with `Q6K_EXP=0 Q4K_DSC=0` 6217 MiB → **the
+   planes cost +3.27 GB**; `MINFER_MMQ=0` (legacy f16 w16-cache path)
+   **~20.5 GB** — the escape hatch is ~11 GB HEAVIER than the promoted
+   default, not lighter. Fine-grained opt-outs: `MINFER_MMQ_Q6K_EXP=0` +
+   `MINFER_MMQ_Q4K_DSC=0` reclaim the planes (−5%-class prefill cost, r54/r59
+   records); `MINFER_MMQ=0` reverts the whole path.
+
+**Doc rule going forward: default = the verified 1.080x path;
+`MINFER_MMQ=0` = the legacy f16 path (~2353 clean / ~2226 this window).**
+The gate table: absent/non-"0" = on, "0" = off, for all six promoted gates;
+`Q6K_EXP`/`Q4K_DSC` unchanged ("0" = plane off).
+
+Artifacts: `/tmp/minfer_phase7/{perf_r60_ab.log,perf_r60_recheck.log,
+r60_identity.sh,r60_g32_base.txt,r60_g32_new.txt,r60_d16_base.txt,
+r60_d16_new.txt,r60_tg128.log,r60_s05_base.txt,r60_s05_new.txt,
+r60_optout_mem.sh,r60_memcensus2.sh,r60_suite.log,r60_suite2.log,
+r60_suite3.log}` + `/tmp/{r60_promote.py,r60_fix_nbonly.py}` + the
+downloaded `~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/
+qwen2.5-0.5b-instruct-q4_k_m.gguf`.
