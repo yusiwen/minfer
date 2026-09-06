@@ -931,10 +931,12 @@ pub struct CudaState {
     padded_weights: Mutex<HashMap<String, usize>>,
     /// r53: pre-expanded q6_K B planes (dense centered-int8, `od * id` bytes,
     /// row stride = id, super-block stride = 256) built at padded registration
-    /// under `MINFER_MMQ_Q6K_NB=1`, keyed by the PADDED weight's device
-    /// pointer. `prefill_mmq` looks the plane up by `wptr` and passes it to
-    /// the NB-BT q6_K launcher; a miss (gate off at load, allocation failure,
-    /// raw 210-B layout) keeps the r41 in-kernel expand.
+    /// under `MINFER_MMQ_Q6K_NB=1` AND `MINFER_MMQ_Q6K_EXP != "0"` (r54:
+    /// explicit "0" skips the ~1.5 GB plane build entirely), keyed by the
+    /// PADDED weight's device pointer. `prefill_mmq` looks the plane up by
+    /// `wptr` and passes it to the NB-BT q6_K launcher; a miss (gate off at
+    /// load, allocation failure, raw 210-B layout) keeps the r41 in-kernel
+    /// expand.
     q6k_exp: Mutex<HashMap<usize, CudaPtr>>,
     /// r53: the W_exp allocation-failure warning prints once per process.
     q6k_exp_warned: std::sync::atomic::AtomicBool,
@@ -1389,7 +1391,16 @@ impl CudaState {
         // (the kernel's own launch gate, which also keeps the dense index
         // 16B-aligned). Dense bytes = od * id — ~2.4 GiB total on 7B q4_k_m
         // (ffn_down 67.9 MB x 28 + output 545 MB + attn_v 1.8 MB x 28).
-        if std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1") && id % 256 == 0 {
+        // r54: MINFER_MMQ_Q6K_EXP decouples the plane from the kernel gate —
+        // unset/"1" keeps the r53 default (build it), explicit "0" skips the
+        // build entirely (registration early-returns; device memory stays at
+        // the pre-r53 level) so dispatch map-misses into the EXP=false r41
+        // in-kernel expand. ANDed with Q6K_NB: EXP only matters when the NB
+        // kernel is live.
+        if std::env::var("MINFER_MMQ_Q6K_NB").as_deref() == Ok("1")
+            && std::env::var("MINFER_MMQ_Q6K_EXP").as_deref() != Ok("0")
+            && id % 256 == 0
+        {
             self.register_weight_q6k_exp(name, &padded, od, id);
         }
     }
@@ -1397,9 +1408,10 @@ impl CudaState {
     /// r53: build + upload the dense pre-expanded B plane for one padded q6_K
     /// tensor and map it from the padded weight's device pointer. Called from
     /// [`Self::register_weight_q6k_padded`] under the `MINFER_MMQ_Q6K_NB=1` +
-    /// `id % 256 == 0` gate; also `pub` for the gate-1 byte-exactness test.
-    /// An alloc/upload failure leaves the map empty: the kernel falls back to
-    /// the r41 in-kernel expand with a once-per-process loud eprintln.
+    /// `MINFER_MMQ_Q6K_EXP != "0"` (r54) + `id % 256 == 0` gate; also `pub`
+    /// for the gate-1 byte-exactness test. An alloc/upload failure leaves the
+    /// map empty: the kernel falls back to the r41 in-kernel expand with a
+    /// once-per-process loud eprintln.
     pub fn register_weight_q6k_exp(&self, name: &str, padded: &[u8], od: usize, id: usize) {
         // geometry-encoded sibling name: a same-name different-shape
         // re-registration can never collide with (and silently reuse) a stale
@@ -2717,14 +2729,25 @@ impl CudaState {
                     ) == 1
                 {
                     if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
+                        // r54: name WHY the r41 in-kernel expand is running —
+                        // "exp=off" is the intentional MINFER_MMQ_Q6K_EXP=0
+                        // switch; "fallback!" means a W_exp build was expected
+                        // (padded weight, EXP gate on) but the map missed
+                        // (alloc/upload failure or a registration bug). Raw
+                        // 210-B weights never get a plane -> kept unqualified.
+                        let b = if !w_exp.is_null() {
+                            "W_exp-cp.async"
+                        } else if !padded_q6k {
+                            "in-kernel-expand"
+                        } else if std::env::var("MINFER_MMQ_Q6K_EXP").as_deref() == Ok("0") {
+                            "in-kernel-expand(exp=off)"
+                        } else {
+                            "in-kernel-expand(fallback!)"
+                        };
                         eprintln!(
                             "minfer/cuda: mmq raw NB-BT q6_K kernel active \
-                             (r53 B={}, r39 KDR=2 double-buffer, A-transpose)",
-                            if w_exp.is_null() {
-                                "in-kernel-expand"
-                            } else {
-                                "W_exp-cp.async"
-                            }
+                             (r54 B={}, r39 KDR=2 double-buffer, A-transpose)",
+                            b
                         );
                     }
                     return Ok(());
