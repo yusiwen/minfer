@@ -126,6 +126,11 @@ Chapters in §2 follow this table row by row.
 | D1 | decode @1641 KV attribution: `gqa_attn_split_partial` is 100% of the KV-scaling wall (34.1 µs/launch, 76.5% long_scoreboard); ATTN_SPLITS sweep = dead end | measurement-only (`/tmp/d1/`) | tg128 49.3 (KV~1) / 47.2 (@1641) vs llama 49.41 (tg128) | — | 0.956× (tg128) | MEASURED | probe-verified: staging-depth changes bitwise-safe (ndiff=0); ATTN_SPLITS changes reorder the float sum |
 | D2 | explicit K+V register staging in `gqa_attn_split_partial` (4-row window staged before the softmax chain); cp.async smem pipe + pair-lookahead measured worse | D2 commit (this row) | decode @1641 **47.2 → 48.2** (+2.0%); kernel 34.1 → 19.4 µs/launch; tg128 49.4 flat | — | **0.975×** (tg@1641) | LANDED | bitwise-identical end-to-end (greedy-32/256 byte-identical); probe −42%, nsys −43%, wall +2.0% agree |
 
+| D3b-1b | down-q6K pipelined MMVQ `q6_k_q8_mmvq_v2_pf` (npair>256: both serial units' weight+q8 loads issue up front) | `f1825b5` | 7B decode tg128 48.03→**49.47** (+3.0% SEP), @1641 46.66→**47.94** (+2.7% SEP); 14B tg128 22.80→22.90 (+0.44%), @3254 21.01→21.06 (+0.24% SEP) | **+2.7–3.0%** (7B decode) | 0.970× (7B tg@1641, this window) | **LANDED** | bitwise-identical (114/114 dump memcmp, greedy-256 byte-identical, suite 169/0/3); for npair>256 the second serial unit's exposed load latency WAS the 198.9-vs-220 GB/s gap |
+| D3b-1a | attn_v-q6K off the padded-f32 kernel: (a) MMVQ routing via a lowered `od*id>=24M` gate — NOT bitwise (MMVQ quantizes activations to q8, different accumulation semantics); (b) NSG 2→1 row→warp re-map — bitwise-green but kernel 36.4→39.9 µs (2× warps = 2× y re-read L2 traffic) | reverted (both routes) | 14B tg128 −0.74%, @3254 −0.33% | — | — | REVERTED | the padded kernel is not warp-starved; y re-read traffic scales 1:1 with warp count — rows-per-warp is the only bitwise-free knob and 2 is already the sweet spot |
+| D3b-1c | output-head dynamic block size (npair 160 → 160-thread blocks, warp-count-bounded `mmvq_block_reduce`) | reverted (patch `/tmp/d3/patch_1c.py`) | 7B @1641 +0.26% (SEP); 14B tg128 +0.04%, @3254 +0.09% | — | — | REVERTED | GB10's 1536-thread/SM limit: 9 blocks×160 live threads ≈ 6×256 allocated (960 live) — the idle-thread win does not exist at 14B shapes |
+| D3b-2 | short-KV combine skip (single-split path for nkv ≤ threshold) | not implemented | — | — | — | ANALYSIS-NEGATIVE | single-split ≠ 32-split partial+combine bitwise for ANY nkv>1 (the merge reorders the float sum — D1's split-count evidence: ndiff 3.6e-3 of outputs, max\|Δ\|~3e-9); the split grid is frozen by CUDA-graph replay capture; the bitwise-safe residual (combine early-out of empty splits — exact +0.0 terms) is ≤ ~15 µs/step, below every bar |
+
 **Footnotes.**
 
 1. **r59 correction (visible in-table).** The r59 record originally reported
@@ -176,6 +181,14 @@ record): 0.6B q8_0 prefill @2K 4792 (llama 23909), decode tg128 ~195 (290);
 **D2 update (2026-09-07):** decode @1641 KV 47.2 → **48.2** (+2.0%, tg128
 unchanged at 49.4) via explicit K+V staging in `gqa_attn_split_partial` —
 see §2D.
+
+**D3b update (2026-09-07):** decode down-q6K MMVQ pipelined for npair>256
+(`q6_k_q8_mmvq_v2_pf`, bitwise-identical): 7B tg128 → **49.47** / @1641 →
+**47.94** (same-window interleaved A/B vs 48.03/46.66 pre; the @1641 gap to
+llama 49.41 is −3.0%); 14B (48L) decode tg128 → **22.90** / @3254 → **21.06**
+window anchors vs llama 24.31/24.32. The remaining 14B short-KV gap is
+elementwise/launch chain + the two reverted MMVQ straggler routes (§2D D3b);
+attention rewrite = D3a (tolerance-gated, separate session).
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1598,6 +1611,90 @@ llama-vec-style multi-warp 256-row cooperative rewrite, which replaces the
 block/work mapping and is NOT byte-identity-able (tolerance gate required).
 `f32_bits_to_i32` (~0.5%/step) and the short-KV combine idle reads
 (~90 µs/step) remain untouched micro-levers.
+
+### D3 — 14B decode attribution (D3-1, measurement-only) + D3b bitwise MMVQ levers (2026-09-07)
+
+**D3-1** (full report `/tmp/d3/D3_FINDINGS.md`, artifacts retained): 14B
+q4_k_m (48L, hidden 5120, 40:8 GQA) decode-step census at tg128 and nkv=3254.
+The short-KV wall gap vs llama.cpp (43.84 vs 41.14 ms/step) is **not
+attention** (0.75% of the step): ~half is three MMVQ stragglers running
+below the 220–225 GB/s class their siblings hit — attn_v-q6K on the
+padded-f32 kernel (**134.8 GB/s**, dispatched because the `od*id >= 24M`
+MMVQ gate excludes its 5.2M-element shape), ffn_down-q6K (**198.9**),
+output head (**200.1**) — together ≈ +1.2 ms/step; the other half is the
+elementwise/launch chain (97 rms + 265 quantize + ~700 sub-2 µs launches).
+Attention itself scales +3.33 ms/step to 3.3K (the ONLY KV-scaling kernel,
+67% of the DRAM-bytes floor, long_scoreboard-bound) and is D3a's
+tolerance-gated target, not this session's.
+
+**D3b session** (bitwise-gated; bar: ≥ +0.4% on the lever's target or
+revert; one landed):
+
+- **D3b-1b — down-q6K pipelined MMVQ, LANDED (`f1825b5`).** For npair > 256
+  (id > 8192: ffn_down id 13824 → npair 432) `q6_k_q8_mmvq_v2` gives threads
+  0..npair−257 a SECOND serial unit whose weight loads sat exposed on the
+  critical path. `q6_k_q8_mmvq_v2_pf` issues both units' weight+q8 loads
+  back-to-back before either accumulates. Bitwise-identical by construction:
+  same thread→unit map (u = tid, tid+256), same per-unit dp4a tree, the
+  per-unit accumulation statement is textually identical (same FMA
+  contraction shape), ascending-u order, same block reduce — only load
+  scheduling moves (the D2 staging-depth precedent). Gates: 114/114
+  `MINFER_GRAPH_DUMP` files byte-identical vs the pre-change binary (logits
+  prefill+decode, kv0, all 48 layer KV, node dumps), greedy −n 256 stream
+  byte-identical, suite 169/0/3 (+ FA trio, split-decode parity,
+  replay-bit-parity by name). Wall (interleaved 3× medians): **7B tg128
+  48.03 → 49.47 (+3.0%, min-new > max-base), 7B @1641 46.66 → 47.94
+  (+2.7%, SEP)** — down-q6K is ~25% of the 7B per-step weight stream, so
+  the 198.9 → ~220 GB/s projection lands almost exactly; 14B tg128
+  22.80 → 22.90 (+0.44%), @3254 21.01 → 21.06 (+0.24%, SEP).
+- **D3b-1a — attn_v-q6K off the padded-f32 kernel, REVERTED (both routes).**
+  (a) The D3-1-suggested MMVQ routing (lower the `od*id >= 24M` gate for
+  id 5120) is **not bitwise-able at all**: the MMVQ path quantizes
+  activations to q8 (dp4a) while the padded kernel consumes f32 — different
+  accumulation semantics, so 0-byte gate impossible; would need the D3a
+  tolerance session. (b) The bitwise-safe re-map (kernel+launcher NSG 2→1,
+  rows still 2/warp, 2× the warps) passed every bitwise gate but measured
+  kernel 36.4 → 39.9 µs/launch (nsys, same window) and wall −0.74% tg128 /
+  −0.33% @3254: doubling warps doubles the y re-read traffic (every warp
+  streams the full 20 KB activation row for its 2 rows), and the padded
+  kernel at this shape is not warp-starved. Lesson: within byte-identity the
+  padded kernel's only free knob is rows-per-warp, and 2 is the sweet spot;
+  134.8 GB/s here is an L2/latency composition, not a parallelism deficit.
+- **D3b-1c — output-head dynamic block size, REVERTED.** npair = 160 at
+  id 5120 means 96 of 256 threads idle per block; launched warp-round-up
+  blocks (160 threads, 5 warps) with `mmvq_block_reduce` bounded by the
+  actual warp count (idle threads only ever contributed exact +0.0 terms —
+  bitwise-safe). Bitwise-green, but 14B wall +0.04%/+0.09%: GB10's SM limit
+  is 1536 threads, so 6×256-thread blocks already allocate 1536 (960 live)
+  vs 9×160 = 1440 live — the win mechanism does not exist; 7B @1641
+  (+0.26%, SEP; npair 112 → 144 idle) was real but sub-bar.
+- **D3b-2 — short-KV combine skip: NOT implemented (analysis-negative).**
+  A single-split path is bitwise-equal to the landed 32-split
+  partial+combine ONLY when one split is live, which under
+  `chunk = ceil(nkv/32)` means nkv = 1; for any real decode step the combine
+  merges ~nkv/chunk live partials with `exp(mx_sp − gmx)` rescaling, and
+  that merge reorders the float sum relative to the serial online-softmax
+  chain (D1 measured split-count reordering: ndiff ≈ 3.6e-3 of outputs,
+  max|Δ| ~3e-9 — r50/r57 class, not byte-identity). Additionally the
+  split grid is frozen by CUDA-graph replay capture (the kernel reads
+  `positions` at runtime, so a capture-time dispatch branch would lock the
+  capture-step's shape for the whole session). The bitwise-safe residual —
+  combine early-out of empty splits (their contributions are exact +0.0) —
+  is worth ≤ ~15 µs/step at tg128, below every bar. The real ~166 µs/step
+  prize needs the D3a tolerance-gated session.
+- **Dump-gate artifact worth recording:** the `node{3,5,8}_prefill.f32`
+  graph-dump files read ALIASED pool slots whose node→slot identity can
+  differ per binary even when every real value is bit-identical (contents
+  byte-equal modulo slot swap in the D3b-1a run; downstream tensors —
+  logits both phases, all KV, decode nodes — identical in every run). Gate
+  bitwise checks on logits/kv/decode-node files; treat same-size prefill
+  node-slot diffs as aliasing, not numerics.
+
+**Window anchors (interleaved pre-binary medians, this session):** 14B
+tg128 22.80–23.11 (D3-1 window: 22.81), @3254 21.01–21.11 (21.25); 7B tg128
+48.03 (guard 49.4 — co-tenant state; post-1b 49.47 re-reaches it), @1641
+46.66 (guard 48.2). pp512 guard untouched (prefill path unchanged;
+2055 tok/s spot-checked).
 
 ## §3 Appendices
 
