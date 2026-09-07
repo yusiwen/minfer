@@ -245,7 +245,7 @@ option list; the subcommands are:
 | `download hf <repo> [quant]` / `download ollama <model>[:tag]` | fetch models |
 | `list` | list locally cached models |
 | `viz [--port N] <model>` | self-contained viz server (default port 8081) |
-| `bench [-p N] [-n N] [-r N] [-o md\|csv\|json] <model>` | llama-bench-style perf test: `pp<P>` prefill / `tg<T>` decode, mean ± stddev over reps |
+| `bench [-p N] [-n N] [-r N] [-o md\|csv\|json] <model>` | perf test: `pp<P>` prefill / `tg<T>` decode, mean ± stddev over reps |
 
 Sampling options: `--temp` (default 0.8; `--greedy` = 0), `--top-k`/`--top-p`,
 `--repeat-penalty` (+ `--frequency-penalty`/`--presence-penalty`), `--stop`
