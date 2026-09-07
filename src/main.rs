@@ -1,5 +1,6 @@
 // End-to-End Inference Engine
 
+mod bench;
 mod block;
 mod cache;
 mod conversation;
@@ -87,6 +88,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} download <hf|ollama>:<name>[:variant]");
     eprintln!("  {prog} list");
     eprintln!("  {prog} viz [--port N] <model>   # self-contained viz server (default port 8081)");
+    eprintln!("  {prog} bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>");
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
@@ -138,6 +140,14 @@ fn print_usage(prog: &str) {
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
+
+    // `bench` subcommand: parsed separately (its -p/-n/-r/-o flags are
+    // bench-local and must not collide with the global inference options,
+    // which reject unknown flags below).
+    if raw_args.get(1).map_or(false, |s| s == "bench") {
+        let code = bench::run(&prog, &raw_args[2..]);
+        std::process::exit(code);
+    }
 
     // Parse flags + positional args. Sampling flags map to GenParams.
     let mut params = GenParams::default();

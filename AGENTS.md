@@ -109,6 +109,7 @@ cargo build --release --features cuda,cuda_static   # + statically-linked cudart
 ./target/release/minfer --dump-graph graph.dot <model> "hello"    # export the prefill graph as DOT
 ./target/release/minfer --no-template <model> "prompt"            # raw prompt (skip chat template)
 ./target/release/minfer info <model>                              # list tensor names/types/shapes
+./target/release/minfer bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>  # llama-bench-style perf test (pp/tg, mean ± stddev)
 MINFER_DISABLE_MPS=1 ./target/release/minfer <model> "hello"      # force CPU
 MINFER_DUMP_DIR=/tmp/dump ./target/release/minfer <model> "hello" # debug dump (debug_dump build)
 MINFER_GRAPH_DUMP=/tmp/d ./target/release/minfer --graph <model> "hello"  # dump graph logits/KV (any build)

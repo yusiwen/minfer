@@ -245,11 +245,16 @@ option list; the subcommands are:
 | `download hf <repo> [quant]` / `download ollama <model>[:tag]` | fetch models |
 | `list` | list locally cached models |
 | `viz [--port N] <model>` | self-contained viz server (default port 8081) |
+| `bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>` | llama-bench-style perf test: `pp<P>` prefill / `tg<T>` decode, mean ± stddev over reps |
 
 Sampling options: `--temp` (default 0.8; `--greedy` = 0), `--top-k`/`--top-p`,
 `--repeat-penalty` (+ `--frequency-penalty`/`--presence-penalty`), `--stop`
 (repeatable), `-n/--n-predict`, `--seed`. `--n-ctx` sizes the KV cache (clamped
 to the model's max context); `-t/--threads` sets CPU workers.
+
+Example: `./target/release/minfer bench -r 3 <model>` prints a llama-bench-style
+markdown table of prefill (`pp512`) and decode (`tg128`) throughput on the
+engine's active backend; `-o csv|json` emits the same fields machine-readable.
 
 **Multi-turn conversation** (`--cnv`, docs/CLI-CONVERSATION-PLAN.md): append-only
 KV + incremental template rendering — each turn only prefills the new message

@@ -469,7 +469,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
         hparams.n_kv_embd = ti.ne[1];
     }
 
-    println!("Loaded: {} layers", n_layer);
+    eprintln!("Loaded: {} layers", n_layer);
 
     // r59 rider: pre-warm the CUDA launch path OUTSIDE the measured prefill
     // window (kernel module load, MmqCache scratch planes, pinned readback).

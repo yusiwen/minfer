@@ -472,7 +472,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         layers.push(layer);
     }
 
-    println!("Loaded: {} layers", n_layer);
+    eprintln!("Loaded: {} layers", n_layer);
 
     let model = super::Qwen3Model {
         hparams,

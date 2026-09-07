@@ -59,6 +59,10 @@ Append-only KV + incremental chat-template rendering: each turn only prefills th
 
 `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`; multi-slot with queued serial execution. Plan: [OPENAI-CHAT-API-PLAN.md](./OPENAI-CHAT-API-PLAN.md).
 
+### Performance benchmark (`bench`)
+
+`minfer bench <model>` runs llama-bench-style prefill (`pp<P>`) / decode (`tg<T>`) throughput tests on the active backend — mean ± stddev over reps after an untimed warmup, each rep from an empty KV context without a model reload — reported as a markdown/CSV/JSON table.
+
 ## Philosophy
 
 **No external ML framework** — pure Rust; runtime deps are minimal (`rand`, `regex`, `half`, `serde`, `serde_json`, `minijinja`; `axum`/`tokio` only for the HTTP server). Attention, RMSNorm, RoPE, SiLU, Softmax and every quantized dot product are handwritten.
