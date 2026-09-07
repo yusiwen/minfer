@@ -584,6 +584,17 @@ extern "C" {
         blk_stride: i32,
         stream: *mut std::ffi::c_void,
     );
+    // D3b-1b: pipelined q6_K MMVQ for tall rows (npair > 256); bitwise-identical
+    fn launch_q6_k_q8_mmvq_v2_pf(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        blk_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_k_q8_mmvq_v2(
         weights: *const u8,
         acts8: *const u8,
@@ -3984,16 +3995,32 @@ impl CudaState {
             );
             if Self::mmvq_v2(id) && blk_stride_padded {
                 // v2's uint4 ql/qh loads need the padded 224B stride
-                launch_q6_k_q8_mmvq_v2(
-                    wptr as *const u8,
-                    q8 as *const u8,
-                    out as *mut f32,
-                    od as i32,
-                    id as i32,
-                    nt as i32,
-                    224,
-                    stream,
-                );
+                if id > 8192 {
+                    // D3b-1b: tall rows (npair > 256, e.g. ffn_down id 13824)
+                    // run the pipelined variant (bitwise-identical, loads for
+                    // both serial units issue up front).
+                    launch_q6_k_q8_mmvq_v2_pf(
+                        wptr as *const u8,
+                        q8 as *const u8,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        224,
+                        stream,
+                    );
+                } else {
+                    launch_q6_k_q8_mmvq_v2(
+                        wptr as *const u8,
+                        q8 as *const u8,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        224,
+                        stream,
+                    );
+                }
             } else {
                 launch_q6_k_q8_mmvq(
                     wptr as *const u8,

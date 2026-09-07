@@ -1466,6 +1466,91 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2(
     mmvq_block_reduce(acc, output, od, t);
 }
 
+// ─── D3b-1b: software-pipelined q6_K MMVQ (tall rows, npair > 256) ─────────
+// Same mapping and arithmetic as q6_k_q8_mmvq_v2; both units' loads issue
+// before either accumulates so the second unit's weight latency leaves the
+// critical path. Bitwise-identical (see the file comment).
+struct Q6kUnitRegs {
+    uint4 qla, qlb, qha, qhb;
+    const uint32_t* xw;
+    uint32_t shift;
+    int g;
+    float d, sc0, sc1, d8;
+};
+
+__device__ __forceinline__ void q6k_unit_load(
+    int u, const uint8_t* __restrict__ wrow, const uint8_t* __restrict__ x8row,
+    int blk_stride, Q6kUnitRegs* r
+) {
+    const int kbx = u >> 3, pair = u & 7;
+    const uint8_t* blk = wrow + (size_t)kbx * blk_stride;
+    r->d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+    r->sc0 = (float)(int8_t)blk[192 + 2 * pair];
+    r->sc1 = (float)(int8_t)blk[192 + 2 * pair + 1];
+    const int chunk = pair >> 2, g = pair & 3;
+    r->shift = 2 * g;
+    r->g = g;
+    r->qla = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32);
+    r->qlb = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32 + 16);
+    r->qha = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32);
+    r->qhb = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32 + 16);
+    const uint8_t* x8 = x8row + (size_t)u * Q8PB;
+    r->d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+    r->xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+}
+
+__device__ __forceinline__ void q6k_unit_acc(const Q6kUnitRegs* r, float& acc) {
+    const uint32_t qls[8] = {r->qla.x, r->qla.y, r->qla.z, r->qla.w,
+                             r->qlb.x, r->qlb.y, r->qlb.z, r->qlb.w};
+    const uint32_t qhs[8] = {r->qha.x, r->qha.y, r->qha.z, r->qha.w,
+                             r->qhb.x, r->qhb.y, r->qhb.z, r->qhb.w};
+    const uint32_t shift = r->shift;
+    int dot0 = 0, dot1 = 0;
+    #pragma unroll
+    for (int v = 0; v < 4; v++) {
+        const uint32_t wl0 = qls[v], wl1 = qls[v + 4];
+        const uint32_t wh0 = qhs[v], wh1 = qhs[v + 4];
+        const uint32_t nib0 = (r->g < 2) ? (wl0 & 0x0F0F0F0F) : ((wl0 >> 4) & 0x0F0F0F0F);
+        const uint32_t nib1 = (r->g < 2) ? (wl1 & 0x0F0F0F0F) : ((wl1 >> 4) & 0x0F0F0F0F);
+        const uint32_t hi0 = ((wh0 >> shift) & 0x03030303) << 4;
+        const uint32_t hi1 = ((wh1 >> shift) & 0x03030303) << 4;
+        const int vi0 = __vsubss4((int)(nib0 | hi0), 0x20202020);
+        const int vi1 = __vsubss4((int)(nib1 | hi1), 0x20202020);
+        dot0 = __dp4a(vi0, (int)r->xw[v], dot0);
+        dot1 = __dp4a(vi1, (int)r->xw[v + 4], dot1);
+    }
+    // textually identical to the v2 accumulation statement (same contraction)
+    acc += r->d8 * r->sc0 * r->d * (float)dot0 + r->d8 * r->sc1 * r->d * (float)dot1;
+}
+
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_pf(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int blk_stride
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * blk_stride;
+    const int npair = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * (id >> 5) * Q8PB;
+    const uint8_t* wrow = weights + (size_t)row * row_stride;
+
+    float acc = 0.0f;
+    const int u0 = threadIdx.x;
+    const int u1 = u0 + 256;
+    if (u0 < npair) {
+        Q6kUnitRegs r0, r1;
+        q6k_unit_load(u0, wrow, x8row, blk_stride, &r0);
+        const bool two = u1 < npair; // npair > blockDim here (dispatch-gated)
+        if (two) q6k_unit_load(u1, wrow, x8row, blk_stride, &r1);
+        q6k_unit_acc(&r0, acc);
+        if (two) q6k_unit_acc(&r1, acc);
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
 __global__ void q6_k_f32_matmul(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ acts,
@@ -2807,6 +2892,14 @@ void launch_q4_k_q8_mmvq_v2(
 ) {
     dim3 grid(od, nt);
     q4_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q6_k_q8_mmvq_v2_pf(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int blk_stride, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q6_k_q8_mmvq_v2_pf<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
 }
 
 void launch_q6_k_q8_mmvq_v2(
