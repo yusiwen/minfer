@@ -247,10 +247,17 @@ option list; the subcommands are:
 | `viz [--port N] <model>` | self-contained viz server (default port 8081) |
 | `bench [-p N] [-n N] [-r N] [-o md\|csv\|json] <model>` | perf test: `pp<P>` prefill / `tg<T>` decode, mean ± stddev over reps |
 
-Sampling options: `--temp` (default 0.8; `--greedy` = 0), `--top-k`/`--top-p`,
-`--repeat-penalty` (+ `--frequency-penalty`/`--presence-penalty`), `--stop`
-(repeatable), `-n/--n-predict`, `--seed`. `--n-ctx` sizes the KV cache (clamped
-to the model's max context); `-t/--threads` sets CPU workers.
+Sampling and runtime options:
+
+- `--temp <T>` — sampling temperature (default 0.8; `--greedy` = greedy decoding)
+- `--top-k <K>` / `--top-p <P>` — top-K / nucleus sampling (defaults 40 / 0.95)
+- `--repeat-penalty <N>` — repeat penalty (default 1.1; 1.0 = off), plus
+  `--frequency-penalty` / `--presence-penalty`
+- `--stop <STR>` — stop generation at this string (repeatable)
+- `-n, --n-predict <N>` — max tokens to generate (default 512)
+- `--seed <N>` — RNG seed for sampling
+- `--n-ctx <N>` — sizes the KV cache (clamped to the model's max context)
+- `-t, --threads <N>` — CPU worker threads
 
 Example: `./target/release/minfer bench -r 3 <model>` prints a llama-bench-style
 markdown table of prefill (`pp512`) and decode (`tg128`) throughput on the
