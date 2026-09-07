@@ -5,6 +5,7 @@
 # Overview
 
 - [Features](./FEATURES.md)
+- [Build](./BUILD.md)
 - [Usage](./USAGE.md)
 - [Support Matrix](./SUPPORT-MATRIX.md)
 
