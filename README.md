@@ -118,6 +118,43 @@ loader), `kernel.rs`/`quants.rs` (quantized matmul), `metal.rs`+`metal.metal` an
 Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K (CPU + Metal), F32/F16 norms &
 biases.
 
+## Performance
+
+**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-06):**
+
+| Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Device mem |
+|-------|------------------|--------------|----------------|------------|
+| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | ~45 tok/s (parity) | ~9.5 GB |
+
+The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
+8.1× over the 441 tok/s where the path started, with every optimization step
+(measurement, gates and commit) documented in the 75-step history table of
+**[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
+`MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
+`MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
+
+**Metal — Apple M4 Pro (2026-08-21, compute-graph path):**
+
+| Model | Prefill (pp499) | Decode (greedy) |
+|-------|-----------------|-----------------|
+| Qwen2.5-0.5B Q4_K_M | ~4460 tok/s | ~268 tok/s |
+| Qwen2.5-0.5B Q4_0 | ~4775 tok/s | ~321 tok/s |
+| Qwen2.5-1.5B Q4_K_M | ~1750 tok/s | ~153 tok/s |
+| Qwen2.5-7B Q4_K_M | ~430 tok/s (pp31 ~250) | ~48 tok/s |
+
+CPU (AVX2) reference: Qwen2-0.5B on i7-1260P ~27 tok/s prefill / ~21 tok/s
+decode.
+
+Metal prefill uses simdgroup GEMMs for every quant type (dispatched for
+`nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)`); decode uses fused QKV/FFN matmuls + a
+KV-parallel split attention. See
+**[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
+
+Decode optimizations on both GPU backends: CUDA Graph capture/replay (single
+launch per decode step), full-layer GPU offload with zero-copy buffers,
+on-GPU activation quantization (f32 → Q8_0), fused decode QKV/FFN chains,
+flash attention with online softmax, and f16 KV cache for 7B-class models.
+
 ## Build
 
 Requirements: **Rust** (edition 2021, no ML-framework dependencies — runtime
@@ -244,125 +281,6 @@ when stdout is a terminal or `MINFER_COLOR=1`).
 
 # List locally cached models
 ./target/release/minfer list
-```
-
-## Performance
-
-**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-06):**
-
-| Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Device mem |
-|-------|------------------|--------------|----------------|------------|
-| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | ~45 tok/s (parity) | ~9.5 GB |
-
-The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
-8.1× over the 441 tok/s where the path started, with every optimization step
-(measurement, gates and commit) documented in the 75-step history table of
-**[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
-`MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
-`MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
-
-**Metal — Apple M4 Pro (2026-08-21, compute-graph path):**
-
-| Model | Prefill (pp499) | Decode (greedy) |
-|-------|-----------------|-----------------|
-| Qwen2.5-0.5B Q4_K_M | ~4460 tok/s | ~268 tok/s |
-| Qwen2.5-0.5B Q4_0 | ~4775 tok/s | ~321 tok/s |
-| Qwen2.5-1.5B Q4_K_M | ~1750 tok/s | ~153 tok/s |
-| Qwen2.5-7B Q4_K_M | ~430 tok/s (pp31 ~250) | ~48 tok/s |
-
-CPU (AVX2) reference: Qwen2-0.5B on i7-1260P ~27 tok/s prefill / ~21 tok/s
-decode.
-
-Metal prefill uses simdgroup GEMMs for every quant type (dispatched for
-`nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)`); decode uses fused QKV/FFN matmuls + a
-KV-parallel split attention. See
-**[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
-
-Decode optimizations on both GPU backends: CUDA Graph capture/replay (single
-launch per decode step), full-layer GPU offload with zero-copy buffers,
-on-GPU activation quantization (f32 → Q8_0), fused decode QKV/FFN chains,
-flash attention with online softmax, and f16 KV cache for 7B-class models.
-
-## Project Structure
-
-```
-minfer/
-├── Cargo.toml             # crate manifest (deps, [features] cuda / debug_dump)
-├── Cargo.lock
-├── build.rs               # CUDA kernels + Metal metallib (precompiled shaders)
-├── flake.nix / flake.lock # Nix dev shell
-├── pyproject.toml         # Python tooling for the verification scripts
-├── AGENTS.md              # AI-agent project index (architecture, conventions)
-├── LICENSE
-├── README.md
-├── src/
-│   ├── main.rs            # Entry point, CLI (single-shot + --cnv conversation), inference loop
-│   ├── graph/             # ★ Declarative compute graph (the inference core)
-│   │   ├── mod.rs         # ComputeGraph, CNode, DType, Backend, BufRef
-│   │   ├── ops.rs         # Op enum + node metadata
-│   │   ├── builder.rs     # GraphBuilder (declarative construction)
-│   │   ├── alloc.rs       # Per-backend liveness allocator + persistent KV regions
-│   │   ├── backend.rs     # Backend trait + KvProvider
-│   │   ├── cpu_backend.rs # CPU execution
-│   │   ├── metal_backend.rs # Metal (MPS) per-op execution
-│   │   ├── scheduler.rs   # assign → split → execute (+ cross-backend copies)
-│   │   ├── fusion.rs      # Pattern fusion (gated by supports_fused)
-│   │   ├── cache.rs       # GraphCache — params-only graph reuse
-│   │   ├── params.rs      # GraphParams, CParams, GraphType (the reuse identity)
-│   │   ├── dot.rs         # Graphviz DOT export (--dump-graph)
-│   │   └── json.rs        # JSON graph export (interactive viz)
-│   ├── gguf.rs            # GGUF parser (v3) + mmap'd zero-copy loader
-│   ├── block.rs           # Quantized block types + fp16 conversions
-│   ├── quants.rs            # AVX2 + NEON/SDOT dot kernels + Q8_0/Q8_K quantization
-│   ├── cuda.rs            # CUDA GPU state, FFI bindings, graph capture
-│   ├── cuda_kernels.cu    # CUDA kernels (matmul, attention, element-wise ops)
-│   ├── metal.rs           # Metal kernels + per-op dispatch (metallib, mmap weights)
-│   ├── metal.metal        # Metal compute shaders (attention, matmul, norm)
-│   ├── kernel.rs          # Quantized matmul dispatch (CPU/GPU bridge)
-│   ├── tensor.rs          # Tensor struct + data access
-│   ├── vec_ops.rs         # SIMD vector ops (RMSNorm, RoPE, softmax, SiLU)
-│   ├── cache.rs           # Legacy KV cache type (CLI plumbing; the graph owns KV)
-│   ├── dump.rs            # Debug dump module (gated by `--features debug_dump`)
-│   ├── sampler.rs         # Greedy / temperature / top-k / top-p sampling
-│   ├── tokenizer.rs       # BPE tokenizer (self-contained, GGUF-backed)
-│   ├── template.rs        # Chat template detection + formatting
-│   ├── conversation.rs    # Multi-turn conversation session (append-only KV + Engine abstraction)
-│   ├── live.rs            # P3 live event broadcast (SSE for the viz subcommand)
-│   ├── trace.rs           # P2 per-node trace data (MINFER_TRACE)
-│   ├── server/            # OpenAI-compatible HTTP server
-│   │   ├── mod.rs         # axum router + handlers (chat completions, models, health)
-│   │   ├── types.rs       # Request/response types + ApiError
-│   │   ├── slot.rs        # Per-slot GraphCache + context budget
-│   │   ├── chat.rs        # Serial worker generation loop + SSE events
-│   │   └── viz.rs         # viz interactive visualization server
-│   ├── download/          # Model download from HF Hub & Ollama
-│   │   └── mod.rs         # resolve() URI handler, curl-based HTTP, list_local()
-│   └── models/            # Architecture-specific implementations
-│       ├── mod.rs         # ModelDef trait + load_model factory dispatch
-│       ├── qwen2/         # Qwen2 implementation
-│       │   ├── mod.rs     # Qwen2Model + ModelDef impl
-│       │   ├── graph.rs   # build_graph + graph forward (Qwen2Graph)
-│       │   └── loader.rs  # Tensor loading from GGUF
-│       └── qwen3/         # Qwen3 dense (decoupled head dim, per-head Q/K RMSNorm)
-│           ├── mod.rs     # Qwen3Model + ModelDef impl
-│           ├── graph.rs   # build_graph (Op::QkNorm per-head Q/K RMSNorm)
-│           └── loader.rs  # Tensor loading from GGUF
-├── tests/                 # Kernel isolation tests (vs CPU reference)
-│   ├── flash_attn_blk_isolation.rs
-│   ├── flash_attn_isolation.rs
-│   ├── gemm_isolation.rs
-│   ├── gqa_attn_isolation.rs
-│   └── conversation_cli.rs # --cnv process-level tests (arg validation + ignored real-model sessions)
-├── scripts/               # Benchmark + verification tooling
-│   ├── bench.sh           # GPU benchmark wrapper (asserts MPS active)
-│   ├── compare_layers.py  # Layer-by-layer comparison vs llama.cpp dumps
-│   ├── dump_llama_ref.py  # llama.cpp reference dump generator
-│   ├── dump_tensors.py
-│   ├── export_trace.sh
-│   ├── lib.py
-│   └── verify_*.py        # Per-op verifiers (rmsnorm, rope, attention, ...)
-└── experiments/           # Throwaway experiments
-    └── cuda/              # CUDA graph capture prototypes
 ```
 
 ## License
