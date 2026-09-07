@@ -36,7 +36,7 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **OpenAI-compatible server** (`serve`) — `/v1/chat/completions` streaming, multi-slot
 - **No ML framework** — pure Rust, minimal runtime deps, all kernels handwritten
 
-> 具体支持的量化格式与模型架构（Supported quantization formats & model architectures）:
+> Supported quantization formats & model architectures:
 > [docs/SUPPORT-MATRIX.md](docs/SUPPORT-MATRIX.md) — also on the
 > [docs site](https://yusiwen.cn/minfer/SUPPORT-MATRIX.html)
 
@@ -66,11 +66,6 @@ Both views support playback animation and live inference over SSE:
 
 See **[viz/README.md](viz/README.md)** for the full user guide, the JSON format,
 and all page features.
-
-## Supported Quantization Formats & Model Architectures
-
-See **[docs/SUPPORT-MATRIX.md](docs/SUPPORT-MATRIX.md)** — also on the
-[docs site](https://yusiwen.cn/minfer/SUPPORT-MATRIX.html).
 
 ## Architecture
 
