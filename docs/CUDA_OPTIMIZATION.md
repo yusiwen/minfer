@@ -123,6 +123,8 @@ Chapters in §2 follow this table row by row.
 | r59 | q4_K W_dsc f32-pair plane + pre-warm/pre-grow riders | `36a481f` (+`15c04ba` docs) | recorded +26.2% (2843.2 → 3588.8, co-tenant) — superseded by r59b; bt kernel busy −30.9%; +1456 MB | +11.1% (true) | ~ahead | LANDED (Δ corrected) | gate/up (−37%) and q/o (−18%) carried it, not ffn_down — the r58 "staging scales with kt" reading confounded decode cost with A-plane DRAM traffic |
 | r59b | clean-machine re-measure + baseline-poisoning correction | `074ca94` | definitive 3590.8 (HEAD) vs 3232.0 (fresh baseline rebuild) = 1.080× llama-bench 3323.29 @pp3314 | +11.1% | 1.080× (ahead) | MEAS-ONLY (correction) | the r59 "baseline" binary was the stale r58-delta build (−12.5%) — anchor every A/B baseline behaviorally in the same window |
 | r60 | PROMOTION: the verified MMQ gate set flips DEFAULT-ON | `57edcf6` (+`7029ee4` docs) | default ≈3578–3599 (~3581); `MINFER_MMQ=0` legacy f16 ~2226–2353-class; planes +3.27 GB | — | 1.080× | LANDED | promotion = default-on with "0" opt-outs (r54 pattern); the bisect caught the mode-2 multiturn break → NB-BT-only guard |
+| D1 | decode @1641 KV attribution: `gqa_attn_split_partial` is 100% of the KV-scaling wall (34.1 µs/launch, 76.5% long_scoreboard); ATTN_SPLITS sweep = dead end | measurement-only (`/tmp/d1/`) | tg128 49.3 (KV~1) / 47.2 (@1641) vs llama 49.41 (tg128) | — | 0.956× (tg128) | MEASURED | probe-verified: staging-depth changes bitwise-safe (ndiff=0); ATTN_SPLITS changes reorder the float sum |
+| D2 | explicit K+V register staging in `gqa_attn_split_partial` (4-row window staged before the softmax chain); cp.async smem pipe + pair-lookahead measured worse | D2 commit (this row) | decode @1641 **47.2 → 48.2** (+2.0%); kernel 34.1 → 19.4 µs/launch; tg128 49.4 flat | — | **0.975×** (tg@1641) | LANDED | bitwise-identical end-to-end (greedy-32/256 byte-identical); probe −42%, nsys −43%, wall +2.0% agree |
 
 **Footnotes.**
 
@@ -170,6 +172,10 @@ llama.cpp 47.1 / 44.9): **tg128 47.5–47.6** (at/above parity), **@2K
 43.2–45.1** (~0–4% gap). Small models (pre-MMQ-campaign numbers, Part-I
 record): 0.6B q8_0 prefill @2K 4792 (llama 23909), decode tg128 ~195 (290);
 0.5B q4_0 prefill ~3020 (30550), decode ~257 (453).
+
+**D2 update (2026-09-07):** decode @1641 KV 47.2 → **48.2** (+2.0%, tg128
+unchanged at 49.4) via explicit K+V staging in `gqa_attn_split_partial` —
+see §2D.
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1493,6 +1499,105 @@ decode-neutrality, reuse-neutrality, per-gate liveness, mixed-quant
 degradation, AND memory in both directions — then fix the wart the default
 now exposes (loudly, via the existing guard) instead of reverting the
 promotion.
+
+## §2D — Decode campaign (Phase P7-D, D-series): split-attention staging depth (2026-09-07)
+
+Decode is the one phase left with a measurable gap to llama.cpp: tg128 49.3
+vs 49.41 (parity) but **@1641 KV 47.2 vs 49.41-class (−4.5%)** on the 7B
+q4_k_m / GB10. Phase D opened with a measurement-only attribution round (D1,
+artifacts under `/tmp/d1/D1_FINDINGS.md` — ephemeral, key numbers inlined
+here) followed by the D2 landing.
+
+### D1 — attribution (measurement-only, no repo change)
+
+- `Op::Attn` nt==1 → `gqa_attn_split_partial<KV>`: grid (ATTN_SPLITS=32 ×
+  28 heads) = 896 single-warp blocks, serial online-softmax over
+  ceil(nkv/32)=52 rows/split in 4-row batches. **The ONLY decode kernel that
+  scales with KV**: 1.98 → 34.1 µs/launch (1.64 → 1641 KV) = +0.90 ms/step =
+  100% of the measured 0.91 ms/step wall delta. Everything else flat.
+- ncu (standalone probe, minfer's flags): 76.5% long_scoreboard stall, all
+  pipes ≤ 12%, 40 regs, 0.78 waves → the kernel rides the memory-LATENCY
+  roofline (in-situ 34.1 µs ≈ 12 µs of bytes @273 GB/s + ~22 µs exposed
+  latency), not the byte roofline. Root cause: each row's V load is issued
+  inside the dependency chain, and the 4-row batch window gives only 4 rows
+  of load-level parallelism.
+- **ATTN_SPLITS sweep = measured dead end**: 32/64/128 flat partial time,
+  combine cost 2–3×, and any split-count change reorders the float sum
+  (ndiff ≈ 3.6e-3 of outputs differ, max|Δ|~3e-9 — r57-class, not
+  byte-identity). Conversely **staging-depth changes (same split ranges, row
+  order, per-row ops) are bit-identical**: probe-verified ndiff=0.
+- llama.cpp decode uses the same flash-decoding skeleton but consumes
+  256-row × 128-dim windows with 8-warp blocks — latency hidden by per-block
+  load depth instead of per-row chaining.
+
+### D2 — explicit K+V register staging LANDED (+2.0% @1641)
+
+**Change** (`gqa_attn_split_partial<KV>`, both KV=__half and KV=float): stage
+BOTH the K and the V rows of each 4-row window into registers before the
+first online-softmax step, instead of K-only + V loaded inline per row. The
+old comment claimed the compiler hoists the inline V loads above the chain —
+measured false (that is the whole win): the V loads sat behind the
+shfl/expf chain, exposing ~a full memory latency per row. With explicit
+staging all 16 row loads (4 rows × K+V × 2×4B) issue back-to-back — SASS
+confirms: 16 `LDG.E.CONSTANT` clustered at 0x7a0–0x9f0, first
+`SHFL.BFLY`/`MUFU.EX2` at 0xde0. Same rows, same order, same per-row op
+sequence → **bitwise-identical by construction**, verified three ways.
+
+**Results** (7B q4_k_m, GB10, interleaved same-window A/B vs pre-change
+binary):
+
+| Evidence | baseline | D2 | Δ |
+|---|---|---|---|
+| probe, cold-DRAM 28-layer rotation, nkv=1641 | 34.6 µs | 19.9 µs | **−42%** |
+| nsys in-situ per-launch µs @1641 | 34.1 | 19.4 | **−43%** |
+| decode `-n 128` @1641 (3× interleaved medians) | 47.2 tok/s | **48.2 tok/s** | **+2.0%** |
+| decode tg128 (KV~1) | 49.4 | 49.4 | flat |
+| combine kernel | 96.0 µs/step | 95.7 µs/step | flat |
+| ptxas | 40 regs (f16) | 52–58 regs (f16), 72 (f32), STACK/LOCAL 0 | occupancy unchanged (24 blocks/SM cap-bound) |
+
+vs llama.cpp: tg@1641 47.2/49.41 = 0.956× → **48.2/49.41 = 0.975×** (gap
+−4.5% → −2.4%); tg128 already at parity.
+
+**Bitwise gates** (all green): probe partial-buffer memcmp ndiff=0, 45/45
+checks at nkv ∈ {1, 29, 52, 512, 1641} across every candidate variant;
+greedy-32 and greedy-256 token streams on the 1641-token prompt byte-identical
+vs the pre-change binary; parity trio (`cuda_prefill_mmq_parity`,
+`cuda_prefill_capture_bit_parity_pp16_pp300`, `cuda_fa_prefill_attention_parity`)
++ `cuda_attn_split_decode_parity` + q4k/q6k decode MMVQ parity all ok; full
+suite **169/0/3**.
+
+### D2 negative results (do not retry blindly)
+
+All bitwise-safe (after fixing a probe wait-group bug — see below), all
+MEASURED WORSE than the landed form in the realistic cold-DRAM mode:
+
+| Variant | cold-DRAM µs | vs landed 19.9 |
+|---|---|---|
+| register staging NR=8 | 22.7 | worse |
+| cp.async smem K-only pipe NR=4 S=2 / S=3 | 23.4 / 22.4 | worse |
+| cp.async smem K-only pipe NR=8 S=2 | 30.9 | much worse |
+| cp.async smem K+V pipe NR=4 S=2 | 21.0 | worse |
+| pair-unrolled register lookahead (95 regs) | 22.1 | worse |
+
+Read: at 8 B/lane/row (f16) the LDGSTS granularity is too small and the LDS
+round-trip too costly to beat direct LDG→register consumption; deeper
+register windows (NR=8) hit the in-flight-load limit instead of hiding more
+latency. cp.async remains the right tool where staging tiles are ≥16 B/lane
+(the MMQ kernels) — not here.
+
+**Probe-bug lesson (r59b-class):** the first probe run reported several pipe
+variants DIVERGENT (and the rest "OK" by luck). Root cause was in the PROBE,
+not the concept: `cp.async.wait_group <STAGES-1>` only forces the oldest
+group complete when exactly STAGES groups are outstanding; tail iterations
+must `wait_group 0`. Any future cp.async ring over a runtime trip count
+needs the same branchy wait.
+
+**Residual decode levers** (for a future D3): the serial chain itself is now
+the floor (19.4 µs ≈ 12 µs bytes + ~7 µs chain); crossing below it needs the
+llama-vec-style multi-warp 256-row cooperative rewrite, which replaces the
+block/work mapping and is NOT byte-identity-able (tolerance gate required).
+`f32_bits_to_i32` (~0.5%/step) and the short-KV combine idle reads
+(~90 µs/step) remain untouched micro-levers.
 
 ## §3 Appendices
 

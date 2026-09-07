@@ -2309,8 +2309,10 @@ __global__ void gqa_attn_f32_f16kv(
 // oc arrays. Now each lane owns 4 fixed dims: the accumulator is ONE
 // float4 in registers (zero spill, hd <= 128 enforced by the dispatch),
 // every K/V access is a perfectly-coalesced row instruction, and the row
-// dot is a warp reduction. Rows run in batches of 4 to overlap the serial
-// online-softmax chain. Idle splits still write an mx=-INF/S=0 partial
+// dot is a warp reduction. Rows run in batches of 4 with BOTH the K and the
+// V rows of each batch staged into registers before the serial online-softmax
+// chain starts (D2 — the inline-V form exposed a full memory latency per row;
+// see docs/CUDA_OPTIMIZATION.md P7 D2). Idle splits still write an mx=-INF/S=0 partial
 // that the combine weights to zero; the [SPLITS][nh][pstr] layout is
 // unchanged (combine untouched).
 
@@ -2367,13 +2369,21 @@ __global__ void gqa_attn_split_partial(
 
     for (int base = lo; base < hi; base += 4) {
         int nr = min(4, hi - base); // warp-uniform
-        // Stage K for the whole batch first; the V addresses are already
-        // known, so the compiler hoists those loads above the softmax chain.
-        float4 k4[4];
+        // D2: stage BOTH K and V for the whole 4-row window before the first
+        // softmax step. All 8 row loads then issue back-to-back and their
+        // latency overlaps the serial chain; the old form relied on the
+        // compiler hoisting the inline V loads, which it does not do across
+        // the shfl/softmax dependency chain (D1 probe: −11% hot-L2, D2 probe:
+        // −42% cold-DRAM vs inline V; bitwise-identical — same rows, same
+        // order, same per-row ops, only the load scheduling changes).
+        float4 k4[4], v4[4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             k4[j] = (live && j < nr)
                 ? kv_ld4<KV>(k + (size_t)(base + j) * stride_kv + hk * hd + d0)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            v4[j] = (live && j < nr)
+                ? kv_ld4<KV>(v + (size_t)(base + j) * stride_kv + hk * hd + d0)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         #pragma unroll
@@ -2392,11 +2402,11 @@ __global__ void gqa_attn_split_partial(
             S = S * corr + e;
             mx = nmx;
             if (live) {
-                float4 v4 = kv_ld4<KV>(v + (size_t)(base + j) * stride_kv + hk * hd + d0);
-                oc.x = oc.x * corr + e * v4.x;
-                oc.y = oc.y * corr + e * v4.y;
-                oc.z = oc.z * corr + e * v4.z;
-                oc.w = oc.w * corr + e * v4.w;
+                float4 vv = v4[j];
+                oc.x = oc.x * corr + e * vv.x;
+                oc.y = oc.y * corr + e * vv.y;
+                oc.z = oc.z * corr + e * vv.z;
+                oc.w = oc.w * corr + e * vv.w;
             }
         }
     }
