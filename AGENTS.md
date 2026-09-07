@@ -96,6 +96,12 @@ cargo build --release --features cuda,cuda_static   # + statically-linked cudart
 # so on CUDA 13 the probe skips them — to keep Volta coverage build with
 # CUDA 12.8 (the only version supporting both Volta AND the Blackwell RTX 50
 # sm_120/121, which needs >= 12.8).
+#
+# Release target split (release.yml): the x86_64 CUDA job uses CUDA 12.8 (Volta
+# V100 + sm_120, glibc 2.35 floor); the arm64 CUDA job uses CUDA 13 because the
+# DGX Spark GPU (GB10, sm_121) is native to CUDA 13 and was removed from the
+# 12.x arch list — built on a ubuntu-24.04-arm runner to match the Spark's
+# glibc 2.39.
 
 ./target/release/minfer <model.gguf> "hello"                      # run (compute-graph forward)
 ./target/release/minfer --graph <model> "hello"                   # accepted for compat (graph path is default)
