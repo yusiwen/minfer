@@ -175,6 +175,8 @@ still succeeds and the shader is compiled from source at first run.
 ```bash
 # CUDA (NVIDIA GPU) — opt-in feature, requires the CUDA toolkit (nvcc)
 cargo build --release --features cuda
+# statically-linked cudart (no libcudart.so runtime dep)
+cargo build --release --features cuda,cuda_static
 ```
 
 CUDA build details:
@@ -186,9 +188,20 @@ CUDA build details:
   otherwise the first accepted GCC is pinned via `-ccbin` (e.g. a nix devShell
   putting GCC 15 first while CUDA 13 accepts ≤ GCC 13). Force one with
   `MINFER_CUDA_CCBIN=/path/to/g++`.
-- GPU architectures are auto-detected from what the toolkit accepts (candidates
-  `sm_61`…`sm_121`, plus PTX for the highest) — one binary covers older and
-  newer GPUs.
+- GPU architectures are auto-detected from what the toolkit accepts (SASS for
+  `sm_61`…`sm_121` as available, plus PTX for the highest and a backward-JIT
+  `compute_70`/`compute_72` PTX) — one binary covers older and newer GPUs. The
+  Volta V100/Titan-V (sm_70/72) PTX is only emitted when nvcc supports it:
+  CUDA 12.x does, **CUDA 13 removed Volta**, so keep Volta coverage by building
+  with CUDA 12.8 (the only version supporting Volta + the Blackwell RTX 50
+  sm_120/121, which needs ≥ 12.8).
+- **cudart linking** (mirrors llama.cpp's `GGML_STATIC`): by default `-lcudart`
+  is a shared link, so the binary NEEDEDs `libcudart.so.N` and needs the CUDA
+  toolkit runtime present at runtime (an rpath to `<cuda_home>/lib64` is baked
+  in). Adding `cuda_static` links `libcudart_static.a` instead: the binary has
+  **no** `libcudart.so` NEEDED dependency and only needs the NVIDIA driver
+  (`libcuda.so.1`, dlopen'd lazily at runtime) + libstdc++ — deployable without
+  a CUDA toolkit. The driver is never a link-time dependency in either mode.
 - In CUDA builds the int8 tensor-core MMQ prefill path is **default-on**
   (runtime gates `MINFER_MMQ*`, see [Performance](#performance) /
   [CUDA_OPTIMIZATION.md](docs/CUDA_OPTIMIZATION.md)).

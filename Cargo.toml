@@ -1,6 +1,6 @@
 [package]
 name = "minfer"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 description = "A minimal local LLM inference engine built from scratch in Rust"
 license = "MIT"
@@ -24,6 +24,14 @@ futures-util = "0.3"
 
 [features]
 cuda = []
+# llama.cpp-style choice of how the CUDA runtime is linked: with `cuda_static`
+# the cudart archive (libcudart_static.a) is linked statically so the resulting
+# binary has NO `libcudart.so` NEEDED dependency — it only needs the NVIDIA
+# driver (libcuda.so.1, dlopen'd lazily at runtime) + libstdc++ at runtime.
+# Without it (default) `-lcudart` is a shared link and the binary requires a
+# CUDA toolkit runtime to be present (see build.rs). Must be combined with
+# `cuda`. Mirrors llama.cpp's `GGML_STATIC`.
+cuda_static = ["cuda"]
 debug_dump = []
 
 [dev-dependencies]

@@ -71,12 +71,31 @@ src/
 cargo build --release
 cargo build --release --features debug_dump    # + per-layer debug dumps
 cargo build --release --features cuda          # + CUDA backend (opt-in; requires nvcc + CUDA toolkit)
+cargo build --release --features cuda,cuda_static   # + statically-linked cudart (no libcudart.so dep)
 
 # CUDA build notes (build.rs): the host nvcc and a compatible host compiler are
 # auto-detected — when the default cc/g++ on PATH is newer than the toolkit
 # supports (e.g. nix devShells' GCC 15 vs CUDA 13), build.rs pins the first
 # working -ccbin (gcc-13/-12/…). MINFER_CUDA_CCBIN=/path/to/g++ forces one.
 # Without --features cuda, builds never touch nvcc at all.
+#
+# cudart linking (mirrors llama.cpp's GGML_STATIC): by default `-lcudart` is a
+# SHARED link — the binary NEEDEDs libcudart.so.N and only runs on a host that
+# has the CUDA toolkit runtime reachable (an rpath to <cuda_home>/lib64 is
+# baked in). With `cuda_static` it links libcudart_static.a instead, so the
+# binary has NO libcudart.so NEEDED dependency and only needs the NVIDIA driver
+# (libcuda.so.1, dlopen'd lazily at runtime by CudaState::preload_driver) +
+# libstdc++ — deployable without a CUDA toolkit. The driver is never a
+# link-time dependency in either mode.
+#
+# GPU arch coverage (build.rs detect_archs): SASS is compiled for whatever sm_*
+# the toolkit accepts (61..121 as available) + a forward-only PTX for the
+# highest. Volta (V100 sm_70 / Titan V sm_72) is a gap the forward PTX cannot
+# JIT *down* to, so build.rs also embeds a compute_70/72 backward-JIT PTX when
+# nvcc supports it (CUDA 12.x). CUDA 13 REMOVED Volta (won't compile sm_70/72),
+# so on CUDA 13 the probe skips them — to keep Volta coverage build with
+# CUDA 12.8 (the only version supporting both Volta AND the Blackwell RTX 50
+# sm_120/121, which needs >= 12.8).
 
 ./target/release/minfer <model.gguf> "hello"                      # run (compute-graph forward)
 ./target/release/minfer --graph <model> "hello"                   # accepted for compat (graph path is default)

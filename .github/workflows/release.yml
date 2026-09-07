@@ -5,8 +5,13 @@
 # previous "v*" tag (full history for the very first release), and publishes a
 # GitHub Release with the artifact + changelog attached.
 #
-# Currently only macOS arm64 is published. To add more targets later, either
-# extend the job matrix below or add new jobs per platform.
+# Published targets:
+#   - macOS arm64 (release-macos-arm64, Apple Silicon runner)  — creates the
+#     release + changelog.
+#   - Linux x86_64 CUDA with statically-linked cudart
+#     (release-linux-x64-cuda) — runs after the macOS job, then uploads its
+#     artifact to the same release. To add more targets later, either extend a
+#     job matrix below or add new jobs per platform.
 
 name: Release
 
@@ -137,3 +142,87 @@ jobs:
             "minfer-${TAG}-macos-arm64.tar.gz.sha256" \
             --title "${TAG}" \
             --notes-file CHANGELOG.md
+
+  # Linux x86_64, CUDA + statically-linked cudart. Builds in a plain ubuntu-22.04
+  # runner with the CUDA 12.8 toolkit installed via apt — the host needs a GPU
+  # only at RUNTIME, never to build. CUDA 12.8 is chosen deliberately: it is the
+  # last toolkit whose nvcc still accepts the Volta compute targets (sm_70/72,
+  # added to build.rs for V100/Titan-V) AND the first to reach Blackwell
+  # (sm_120/121, RTX 50); CUDA 13 removed Volta. The `cuda_static` feature links
+  # libcudart_static.a, so the artifact has no libcudart.so NEEDED dependency and
+  # only needs the NVIDIA driver at runtime.
+  release-linux-x64-cuda:
+    name: Build & release (Linux x86_64 CUDA, static cudart)
+    # Runs after the macOS job, which created the release, so we can upload to it.
+    needs: release-macos-arm64
+    runs-on: ubuntu-22.04 # x86_64; sets the glibc floor (2.35) for the artifact
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          TAG="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "${GITHUB_REF_NAME}")"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          echo "value=${TAG}(${SHA})" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${TAG}(${SHA})"
+
+      - name: Install CUDA toolkit 12.8 (x86_64)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
+          # cuda-toolkit installs to /usr/local/cuda-12.8 and (usually) symlinks /usr/local/cuda
+          if [ ! -x /usr/local/cuda/bin/nvcc ] && [ -x /usr/local/cuda-12.8/bin/nvcc ]; then
+            sudo ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
+          fi
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          /usr/local/cuda/bin/nvcc --version | tail -1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (CUDA + static cudart)
+        env:
+          MINFER_VERSION: ${{ steps.version.outputs.value }}
+          CUDA_HOME: /usr/local/cuda
+        run: cargo build --release --features cuda,cuda_static
+
+      - name: Verify static cudart (no libcudart.so NEEDED)
+        run: |
+          if readelf -d target/release/minfer | grep -qi cudart; then
+            echo "::error::binary still NEEDED libcudart.so — cudart is not static"
+            exit 1
+          fi
+          echo "OK: no libcudart.so dependency"
+
+      - name: Smoke-test --version
+        run: |
+          ./target/release/minfer --version
+          test "$(./target/release/minfer --version)" = "minfer ${{ steps.version.outputs.value }}"
+
+      - name: Package
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p dist
+          cp target/release/minfer dist/minfer
+          tar -czf "minfer-${TAG}-linux-x64-cuda.tar.gz" -C dist minfer
+          sha256sum "minfer-${TAG}-linux-x64-cuda.tar.gz" > "minfer-${TAG}-linux-x64-cuda.tar.gz.sha256"
+          ls -lh "minfer-${TAG}-linux-x64-cuda.tar.gz"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release upload "${TAG}" \
+            "minfer-${TAG}-linux-x64-cuda.tar.gz" \
+            "minfer-${TAG}-linux-x64-cuda.tar.gz.sha256" \
+            --clobber

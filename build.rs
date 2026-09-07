@@ -196,8 +196,10 @@ fn main() {
         );
     }
     let highest = archs.last().unwrap();
+    let cudart_static = std::env::var_os("CARGO_FEATURE_CUDA_STATIC").is_some();
     println!(
-        "cargo:warning=CUDA: host compiler {ccbin_label}; targets {}; PTX compute_{highest}",
+        "cargo:warning=CUDA: host compiler {ccbin_label}; cudart {}; targets {}; PTX compute_{highest}",
+        if cudart_static { "static" } else { "shared (default)" },
         archs
             .iter()
             .map(|a| format!("sm_{a}"))
@@ -226,6 +228,20 @@ fn main() {
         args.push("-gencode".into());
         args.push(format!("arch=compute_{arch},code=sm_{arch}"));
     }
+    // Backward-JIT PTX. The auto-detected list has no exact sm_70/sm_72 SASS
+    // on toolkits that dropped Volta, and the trailing forward-only PTX for the
+    // *highest* compute can only JIT *up* — it cannot reach an older GPU (e.g.
+    // a V100/sm_70). Embedding a compute_70/72 PTX (only when nvcc accepts the
+    // arch, i.e. CUDA 12.x) lets those cards load by JIT; a compute_70 PTX also
+    // forward-JITs to any GPU >= sm_70. compute_72 is slightly redundant but
+    // kept so sm_72 has its own best-match image.
+    for pa in ["70", "72"] {
+        if archs.iter().any(|a| a.as_str() == pa) {
+            args.push("-gencode".into());
+            args.push(format!("arch=compute_{pa},code=compute_{pa}"));
+        }
+    }
+    // Forward-compat PTX for GPUs newer than the newest SASS.
     args.push("-gencode".into());
     args.push(format!("arch=compute_{highest},code=compute_{highest}"));
 
@@ -248,20 +264,45 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=cuda_kernels");
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
 
+    // How is the CUDA runtime linked? Exactly like llama.cpp: a single build
+    // flag toggles the cudart archive vs the shared library (there GGML_STATIC
+    // picks CUDA::cudart_static vs CUDA::cudart). A static cudart removes the
+    // libcudart.so NEEDED dependency, so the binary can run on a host that has
+    // only the NVIDIA driver + libstdc++ (no CUDA toolkit runtime). The CUDA
+    // driver libcuda.so.1 is not a link dependency in either case — cudart and
+    // CudaState::preload_driver() both load it lazily via dlopen at runtime.
     let lib_dir = format!("{cuda_home}/lib64");
     if Path::new(&lib_dir).exists() {
+        // Needed in BOTH modes so the linker can find libcudart_static.a (static)
+        // and libcudart.so (shared) in the toolkit's lib64.
         println!("cargo:rustc-link-search={}", lib_dir);
-        // Bake an rpath so the binary finds libcudart without relying on
-        // LD_LIBRARY_PATH (host-driven model: run on the machine that built).
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
-        // libcudart needs libstdc++ transitively; DT_RUNPATH is not consulted
-        // for transitive deps (and nix's loader ignores /etc/ld.so.cache), so
-        // emit old-style DT_RPATH, which is.
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
+
+    let cudart_static = std::env::var_os("CARGO_FEATURE_CUDA_STATIC").is_some();
+    if cudart_static {
+        // libcudart_static.a also wants the POSIX threads + dl (for the lazy
+        // driver/dlopen path); harmless no-ops on glibc >= 2.34 (the pthread
+        // and dl symbols moved into libc). No rpath baked — nothing about the
+        // CUDA toolkit is a runtime NEEDED dependency in this mode.
+        println!("cargo:rustc-link-lib=static=cudart_static");
+        // Only strictly needed on older glibc; on newer glibc they resolve to
+        // the merged libc and are effectively no-ops.
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        if Path::new(&lib_dir).exists() {
+            // Bake an rpath so the binary finds libcudart without relying on
+            // LD_LIBRARY_PATH (host-driven model: run on the machine that built).
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+            // libcudart needs libstdc++ transitively; DT_RUNPATH is not consulted
+            // for transitive deps (and nix's loader ignores /etc/ld.so.cache), so
+            // emit old-style DT_RPATH, which is.
+            println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
 // ─── CUDA toolchain discovery ────────────────────────────────────────────────
@@ -365,10 +406,12 @@ fn detect_host_compiler(nvcc: &str, out_dir: &str, include_flag: &str) -> Option
 /// present). Candidates newer than the toolkit — Blackwell sm_100/103/110/120/
 /// 121 require CUDA 12.8+ — simply fail the probe and are skipped, so one list
 /// works on every CUDA version and every GPU gets its native SASS when
-/// available.
+/// available. Volta (sm_70/72) is included: it is the gap the forward-only PTX
+/// (see below) cannot reach, and it is still supported through CUDA 12.x (CUDA
+/// 13 removed it, so the probe skips it there).
 fn detect_archs(nvcc: &str, out_dir: &str, include_flag: &str, ccbin: Option<&str>) -> Vec<String> {
     let candidates = [
-        "61", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
+        "61", "70", "72", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
     ];
     let test_dir = format!("{out_dir}/nvcc_arch_test");
     let _ = std::fs::create_dir_all(&test_dir);
