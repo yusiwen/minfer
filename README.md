@@ -280,43 +280,40 @@ cargo run --release -- list
 
 ## Performance
 
-> The table below was measured on the **legacy `layer_gpu` path** (pre-compute-
-> graph). Since Phase 6 the compute-graph path is the default, and since
-> G1–G5 (2026-08-21) its `MetalBackend` wires the same fast kernels (flash/
-> split/parallel attention dispatch + `rms_norm_256` + the `n_out` tail-row
-> reduction + **fused decode QKV + FFN gate/up**), so graph-path numbers now
-> **match or exceed the legacy path**: 0.5B Q4_0 decode ~300-330 t/s at KV440
-> (**+~15 % over legacy** — G4 fuses the QKV chain into one concat matmul +
-> one bias+rope+store pass, G5 fuses the FFN gate/up the same way), 0.5B
-> prefill ~3900–4000 t/s at pp440 (**+~55 % over legacy** — the G3 tail
-> reduction drops the full-nt last-layer FFN + lm_head), 7B decode ~46-49 t/s
-> (≈ legacy; FFN fusion gated off there — Q4_K concat matmul slower).
-> Remaining gap: 7B prefill ~−10 % (GEMM-bound; attention is not the
-> bottleneck there). Greedy outputs are byte-identical across all graph paths
-> (`MINFER_NO_FUSE_QKV` / `MINFER_NO_FUSE_FFN` revert the decode fusions).
-> See [`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md) §0.1/§4.3.
+**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-06):**
 
-**Qwen2 / Qwen2.5 on Apple M4 Pro / RTX 2080 Ti (2026-08-21):**
+| Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Device mem |
+|-------|------------------|--------------|----------------|------------|
+| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | ~45 tok/s (parity) | ~9.5 GB |
 
-| Backend | Hardware | Model | Prefill (pp499) | Decode (greedy) |
-|---------|----------|-------|---------|--------|
-| CPU (AVX2) | i7-1260P | Qwen2-0.5B | ~27 tok/s | ~21 tok/s |
-| CUDA + Graph | RTX 2080 Ti | Qwen2.5-0.5B | ~593 tok/s | ~486 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_K_M | ~4460 tok/s | ~268 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-0.5B Q4_0 | ~4775 tok/s | ~321 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-1.5B Q4_K_M | ~1750 tok/s | ~153 tok/s |
-| Metal GPU | Apple M4 Pro | Qwen2.5-7B Q4_K_M | ~430 tok/s (pp31 ~250) | ~48 tok/s |
+The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
+8.1× over the 441 tok/s where the path started, with every optimization step
+(measurement, gates and commit) documented in the 75-step history table of
+**[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
+`MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
+`MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
 
-Prefill uses simdgroup GEMMs for every quant type (dispatched for
+**Metal — Apple M4 Pro (2026-08-21, compute-graph path):**
+
+| Model | Prefill (pp499) | Decode (greedy) |
+|-------|-----------------|-----------------|
+| Qwen2.5-0.5B Q4_K_M | ~4460 tok/s | ~268 tok/s |
+| Qwen2.5-0.5B Q4_0 | ~4775 tok/s | ~321 tok/s |
+| Qwen2.5-1.5B Q4_K_M | ~1750 tok/s | ~153 tok/s |
+| Qwen2.5-7B Q4_K_M | ~430 tok/s (pp31 ~250) | ~48 tok/s |
+
+CPU (AVX2) reference: Qwen2-0.5B on i7-1260P ~27 tok/s prefill / ~21 tok/s
+decode.
+
+Metal prefill uses simdgroup GEMMs for every quant type (dispatched for
 `nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)`); decode uses fused QKV/FFN matmuls + a
 KV-parallel split attention. See
 **[`docs/METAL_OPTIMIZATIONS.md`](docs/METAL_OPTIMIZATIONS.md)**.
 
-GPU decode optimizations: CUDA Graph capture/replay (single `cudaGraphLaunch`
-per decode step), full-layer GPU offload with zero-copy buffers, on-GPU
-activation quantization (f32 → Q8_0). Metal: flash attention (online softmax,
-fused decode + prefill kernels), SIMD-parallel RMSNorm with float4
-vectorization, fused QKV/FFN decode matmuls, f16 KV for 7B-class models.
+Decode optimizations on both GPU backends: CUDA Graph capture/replay (single
+launch per decode step), full-layer GPU offload with zero-copy buffers,
+on-GPU activation quantization (f32 → Q8_0), fused decode QKV/FFN chains,
+flash attention with online softmax, and f16 KV cache for 7B-class models.
 
 ## Project Structure
 
