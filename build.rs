@@ -406,12 +406,16 @@ fn detect_host_compiler(nvcc: &str, out_dir: &str, include_flag: &str) -> Option
 /// present). Candidates newer than the toolkit — Blackwell sm_100/103/110/120/
 /// 121 require CUDA 12.8+ — simply fail the probe and are skipped, so one list
 /// works on every CUDA version and every GPU gets its native SASS when
-/// available. Volta (sm_70/72) is included: it is the gap the forward-only PTX
-/// (see below) cannot reach, and it is still supported through CUDA 12.x (CUDA
-/// 13 removed it, so the probe skips it there).
+/// available. The minimum is sm_70 (Volta), not Pascal (sm_61): the kernels in
+/// `cuda_kernels.cu` use WMMA tensor cores (`nvcuda::wmma`, `#if __CUDA_ARCH__ >=
+/// 700` paths), which require sm_70+, so a lower target makes nvcc reject the
+/// file ("name must be a namespace name" for `nvcuda`). Volta (sm_70/72) is
+/// included: it is the gap the forward-only PTX (see below) cannot reach, and it
+/// is still supported through CUDA 12.x (CUDA 13 removed it, so the probe skips
+/// it there).
 fn detect_archs(nvcc: &str, out_dir: &str, include_flag: &str, ccbin: Option<&str>) -> Vec<String> {
     let candidates = [
-        "61", "70", "72", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
+        "70", "72", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
     ];
     let test_dir = format!("{out_dir}/nvcc_arch_test");
     let _ = std::fs::create_dir_all(&test_dir);
