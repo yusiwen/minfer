@@ -130,6 +130,7 @@ Chapters in §2 follow this table row by row.
 | D3b-1a | attn_v-q6K off the padded-f32 kernel: (a) MMVQ routing via a lowered `od*id>=24M` gate — NOT bitwise (MMVQ quantizes activations to q8, different accumulation semantics); (b) NSG 2→1 row→warp re-map — bitwise-green but kernel 36.4→39.9 µs (2× warps = 2× y re-read L2 traffic) | reverted (both routes) | 14B tg128 −0.74%, @3254 −0.33% | — | — | REVERTED | the padded kernel is not warp-starved; y re-read traffic scales 1:1 with warp count — rows-per-warp is the only bitwise-free knob and 2 is already the sweet spot |
 | D3b-1c | output-head dynamic block size (npair 160 → 160-thread blocks, warp-count-bounded `mmvq_block_reduce`) | reverted (patch `/tmp/d3/patch_1c.py`) | 7B @1641 +0.26% (SEP); 14B tg128 +0.04%, @3254 +0.09% | — | — | REVERTED | GB10's 1536-thread/SM limit: 9 blocks×160 live threads ≈ 6×256 allocated (960 live) — the idle-thread win does not exist at 14B shapes |
 | D3b-2 | short-KV combine skip (single-split path for nkv ≤ threshold) | not implemented | — | — | — | ANALYSIS-NEGATIVE | single-split ≠ 32-split partial+combine bitwise for ANY nkv>1 (the merge reorders the float sum — D1's split-count evidence: ndiff 3.6e-3 of outputs, max\|Δ\|~3e-9); the split grid is frozen by CUDA-graph replay capture; the bitwise-safe residual (combine early-out of empty splits — exact +0.0 terms) is ≤ ~15 µs/step, below every bar |
+| D3a | 4-warp fattn-vec-style split-attention rewrite (`gqa_attn_split_partial_h4w`, hd=128: 128 threads, K/V streamed, Q in registers, 8-lane subgroups, 32-row windows/warp, smem LSE merge; grid unchanged, replay-safe) | reverted (patch `/tmp/d3/d3a_kernel_patch.diff`, findings `/tmp/d3/D3A_FINDINGS.md`) | kernel 14B @3254 73.4 → 68.4 µs (−6.9%) but 7B @1641 21.1 → 34.7 µs (+64%); wall 14B @3254 −0.95% (noise), 7B @1641 −3.4% (real), tg128 noise-level | — | — | REVERTED | rows-per-warp pathology: rpw = ceil(ceil(nkv/32)/4) = 26/13/1 at @3254/@1641/tg128 — the 32-row window idles 59–75% of lanes below rpw≈16 and per-block fixed costs amortize over rpw; kernel −6.9% at the best shape is only ~+0.5% wall (attention = 7.4% of the step), under the +1.5% bar and the ±2% A/B noise; numerics fully green (probe ≤1.3e-7 vs CPU, argmax hard-gated, greedy 0/10 diverged) — the session's durable output is the tolerance-gate calibration: end-to-end max|Δlogits| is 0.38/0.39 (14B/7B) for ANY accumulation-order change, so the D3-1 ≤1e-3 logits gate is unsatisfiable; argmax+greedy+A/B are the operative gate set |
 
 **Footnotes.**
 
@@ -189,6 +190,17 @@ llama 49.41 is −3.0%); 14B (48L) decode tg128 → **22.90** / @3254 → **21.0
 window anchors vs llama 24.31/24.32. The remaining 14B short-KV gap is
 elementwise/launch chain + the two reverted MMVQ straggler routes (§2D D3b);
 attention rewrite = D3a (tolerance-gated, separate session).
+
+**D3a update (2026-09-07):** the 4-warp fattn-vec-style split-attention
+rewrite was REVERTED — numerics fully green but the rows-per-warp
+pathology makes it +64% kernel-slower at 7B @1641 and only −6.9%
+(~+0.5% wall, sub-bar/sub-noise) at 14B @3254 (§2D). Session outputs
+that stand: the tolerance-gate calibration (end-to-end logits drift
+0.38/0.39 is the inherent class of ANY accumulation-order change — the
+≤1e-3 logits gate is unsatisfiable; argmax + greedy-divergence + A/B are
+the operative gates) and the 14B @3254 attention bytes-floor gap
+(73.4 µs/layer vs 48.9 µs floor) with window-prefetch pipelining as the
+next lever.
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1695,6 +1707,90 @@ tg128 22.80–23.11 (D3-1 window: 22.81), @3254 21.01–21.11 (21.25); 7B tg128
 48.03 (guard 49.4 — co-tenant state; post-1b 49.47 re-reaches it), @1641
 46.66 (guard 48.2). pp512 guard untouched (prefill path unchanged;
 2055 tok/s spot-checked).
+
+### D3a — 4-warp fattn-vec-style split-attention rewrite, REVERTED (negative result) + tolerance-gate calibration (2026-09-07)
+
+**Method** (full record `/tmp/d3/D3A_FINDINGS.md`, code diff preserved at
+`/tmp/d3/d3a_kernel_patch.diff`, experimental binary `/tmp/d3/minfer_post_d3a`):
+`gqa_attn_split_partial_h4w` re-expressed the f16-KV decode split attention
+(hd==128 dispatch; hd≠128 keeps the 1-warp kernel) with the llama.cpp
+`fattn-vec` structure source-verified @ca3d5a3e1 — 128 threads (4 warps), K/V
+streamed from global (no smem K/V), Q in registers (16 dims/thread), 8-lane
+subgroups (one row each), 32-row windows per warp with ONE online-softmax
+rescale per window, probs staged to a 128-float smem row, 4-warp LSE-merge
+epilogue through `vkq_s`/`mx_sh` smem staging. Grid stayed
+`dim3(ATTN_SPLITS, n_head)` (nkv-independent, replay-safe). `__launch_bounds__(128, 8)`
+→ REG 64 / STACK 0 / SMEM 8960 B = 32 warps/SM vs 24.
+
+**Why it failed — the rows-per-warp pathology.** `rpw = ceil(ceil(nkv/32)/4)`
+is 26 at 14B @3254, 13 at 7B @1641, **1 at tg128**. The 32-row window maps
+live rows onto 32 lane-slots, so rpw=13 idles 59% of the slots (subgroups 2–3
+fully idle) and rpw=1 leaves 3 of 4 warps exited with the live warp using 8 of
+32 lanes; per-block fixed costs (8 KB of Q loads vs the 1-warp kernel's
+512 B, the epilogue sync/staging, partial writes) amortize over rpw rows.
+The incumbent is serial-dense — every lane busy on every row, 0.58–0.83
+waves all-resident. nsys (NO_CUDA_GRAPH, −n 8 mean): 14B @3254 split kernel
+73.4 → 68.4 µs (**−6.9%**, 71.5% of the 48.9 µs bytes floor vs 67%) but 7B
+@1641 21.1 → **34.7 µs (+64%)**; wall (interleaved 3× medians): 14B @3254
+21.04 → 20.84 (−0.95%, inside ±2% noise — a −6.9% kernel is only ~+0.5% of a
+step where attention is 7.4%), 7B @1641 47.53 → 45.91 (**−3.4%**, tight
+clusters, matches the kernel), tg128 noise-level both models. Every bar
+failed (14B @3254 ≥ +1.5%, 7B @1641 ≥ 47.9). **Reverted per the r44
+precedent** (parity-green, wall-sub-bar). Rescue path for lever 2: keep the
+4-warp path for dense chunks and fall back to the D2-staged 1-warp body
+inside the same kernel when rpw < ~16 — the branch is nkv-uniform, so
+replay-safe.
+
+**The durable result — tolerance-gate calibration.** The kernel was
+numerically fully green, which made the session the first exercise of the
+D3-1 tolerance gate — and it failed against the PROPOSED gate, not the code:
+
+- Kernel level: h4w vs CPU ≤ **1.3e-7** (nkv 3..4096 incl. the exact in-situ
+  14B shape and all chunk boundaries); vs the incumbent on identical inputs
+  ≤ 8.9e-8; on realistic outlier-scale data (residual |q|~50, V outliers
+  ±127) new-vs-CPU 6.5e-5 vs old-vs-CPU 3.8e-5 — the same error class.
+- In-situ (NO_CUDA_GRAPH + MINFER_TRACE per-node attn outputs, 14B): prefill
+  attention bitwise; decode per-layer delta L0 2.4e-7, L1–L11 **bitwise 0.0**
+  (the f16-KV store is a noise gate — sub-ULP reorder noise is quantized away
+  at each layer's K/V write), L12+ 1e-3..5e-1 (noise crosses f16 rounding
+  boundaries and amplifies through outlier-dim cancellations).
+- End-to-end logits: max|Δ| **0.376 (14B, 48L) vs 0.389 (7B, 28L)** — the
+  same magnitude at both depths ⇒ depth-independent class, not a bug.
+
+**D3-1's proposed gate "end-to-end max|Δlogits| ≤ 1e-3" is unsatisfiable for
+ANY accumulation-order-changing rewrite on 28–48-layer models** — a
+kernel-level-1e-7 change produces O(0.4) end-to-end drift (the r50/r57
+lesson generalized to decode). The operative tolerance-gate set, all
+demonstrated green here on the experimental kernel: (1) kernel-level parity
+vs CPU ≤ ~1e-4 on realistic data; (2) **argmax identical at every dumped
+step with top-2 margin > 0.1 — HARD** (margins 4.95/10.97); (3) greedy
+−n 256 × 5 seeds × both models **0/10 diverged a single token** + temp 0.8
+seed 7 sampled controls identical; (4) suite 169/0/3 + FA trio +
+split-decode parity (extended with an hd=128/n_ctx 4200 shape driving the
+new kernel — reverted with the code); (5) interleaved A/B bars.
+
+**Dump-gate gotchas (extend D3b's aliasing note).** Decode node dumps
+`node{2,3,5,8,11}_decode` read ALIASED pool slots (node11 = kv_load's dump
+is 20 KB, not the 16.7 MB KV region) — node-diff noise is slot aliasing.
+And KV-region diffs between `-n 1` and `-n 2` dumps are a **pre-existing
+step-dependent row rewrite** present pre-vs-pre (rows 17–20 of layer-10 K
+change between decode steps 1→2 in the incumbent binary too): gate on
+logits + final-step KV with the SAME -n on both sides.
+
+**shfl_sync deadlock (Appendix-B lesson).** `__shfl_xor_sync(0xFFFFFFFF, v,
+off, 8)` inside `if (row < wend)` deadlocks when lanes disagree on row
+validity (the mask names all 32 lanes; some never arrive). Fix: compute the
+contribution conditionally (0.0f default), reduce unconditionally for ALL
+lanes, mask after (`s = -INFINITY`). Presents as a GPU-spin hang in
+`cargo test` and a hang in the standalone probe.
+
+**Follow-ups.** Lever 2 (multi-warp decode attention) must now solve the rpw
+pathology (subgroup-dense row mapping or the runtime small-rpw fallback).
+Lever 3 (attn_v-q6K MMVQ routing) is NOT bitwise-able and needs exactly the
+calibrated gate set above. 14B @3254 attention remains the open KV-scaling
+gap: 73.4 µs/layer vs the 48.9 µs floor; the residual ~20 µs needs
+window-level K/V prefetch pipelining (D2's staging trick at window
+granularity), unattempted.
 
 ## §3 Appendices
 
