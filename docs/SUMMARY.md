@@ -5,6 +5,7 @@
 # Overview
 
 - [Features](./FEATURES.md)
+- [Support Matrix](./SUPPORT-MATRIX.md)
 
 # Architecture
 
