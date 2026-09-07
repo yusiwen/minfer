@@ -163,8 +163,11 @@ cargo build --release --features debug_dump
 
 ## Usage
 
+Examples use the built binary (`cargo build --release` first — see
+[Build](#build)); `cargo run --release -- …` works identically.
+
 ```bash
-cargo run --release -- <model> [prompt] [OPTIONS]
+./target/release/minfer <model> [prompt] [OPTIONS]
 ```
 
 `<model>` can be a local path, a download URI, or a cached model name:
@@ -176,18 +179,30 @@ cargo run --release -- <model> [prompt] [OPTIONS]
 | Ollama | `ollama:qwen2.5:0.5b` (pull) |
 | Cached model name | `qwen2.5-0.5b-instruct-q4_0` (resolved from `~/.cache/minfer/models`, see `list`) |
 
-If `prompt` is omitted, reads from stdin. Run `minfer --help` for full options
-(`--meta`, `--no-template`, `--dump-graph <path>` to export the prefill compute
-graph as Graphviz DOT, `--dump-graph-json <path>` for the interactive web
-visualizer — see `viz/README.md`).
+If `prompt` is omitted, reads from stdin. Run `minfer --help` for the full
+option list; the subcommands are:
+
+| Command | Purpose |
+|---------|---------|
+| `<model> [prompt] [OPTIONS]` | single-shot generation |
+| `serve [--port N] [--n-ctx N] [--n-slots N] <model>` | OpenAI-compatible HTTP server |
+| `info <model>` | print GGUF metadata + key tensors |
+| `download hf <repo> [quant]` / `download ollama <model>[:tag]` | fetch models |
+| `list` | list locally cached models |
+| `viz [--port N] <model>` | self-contained viz server (default port 8081) |
+
+Sampling options: `--temp` (default 0.8; `--greedy` = 0), `--top-k`/`--top-p`,
+`--repeat-penalty` (+ `--frequency-penalty`/`--presence-penalty`), `--stop`
+(repeatable), `-n/--n-predict`, `--seed`. `--n-ctx` sizes the KV cache (clamped
+to the model's max context); `-t/--threads` sets CPU workers.
 
 **Multi-turn conversation** (`--cnv`, docs/CLI-CONVERSATION-PLAN.md): append-only
 KV + incremental template rendering — each turn only prefills the new message
 delta, the whole conversation accumulates in the KV cache:
 
 ```bash
-cargo run --release -- --cnv qwen2.5-0.5b-instruct-q4_0           # interactive REPL
-cargo run --release -- --cnv -st qwen2.5-0.5b-instruct-q4_0 "hi"  # single turn
+./target/release/minfer --cnv qwen2.5-0.5b-instruct-q4_0           # interactive REPL
+./target/release/minfer --cnv -st qwen2.5-0.5b-instruct-q4_0 "hi"  # single turn
 ```
 
 In-conversation commands: `/exit` `/quit`, `/clear`, `/regen` (regenerate the
@@ -201,7 +216,7 @@ when stdout is a terminal or `MINFER_COLOR=1`).
 **OpenAI-compatible HTTP server** (`serve`):
 
 ```bash
-cargo run --release -- serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
+./target/release/minfer serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
 # POST /v1/chat/completions  (stream + non-stream)
 # GET  /v1/models, GET /health
 ```
@@ -210,22 +225,25 @@ cargo run --release -- serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
 
 ```bash
 # Local model
-cargo run --release -- ~/models/qwen2-0.5b-q4_0.gguf "What is the capital of France?"
+./target/release/minfer ~/models/qwen2-0.5b-q4_0.gguf "What is the capital of France?"
 
 # Cached model by name (no full path needed)
-cargo run --release -- qwen2.5-0.5b-instruct-q4_0 "Hello"
+./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Hello"
 
-# Auto-download from Hugging Face + run
-cargo run --release -- hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
+# Auto-download from Hugging Face + run (quant auto-detected, splits included)
+./target/release/minfer hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
+
+# Inspect GGUF metadata + key tensors
+./target/release/minfer info qwen2.5-0.5b-instruct-q4_0
 
 # List available GGUF files in a HF repo (without downloading)
-cargo run --release -- download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF
+./target/release/minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF
 
 # Pull from Ollama and create a symlink
-cargo run --release -- download ollama qwen2.5:0.5b
+./target/release/minfer download ollama qwen2.5:0.5b
 
 # List locally cached models
-cargo run --release -- list
+./target/release/minfer list
 ```
 
 ## Performance
