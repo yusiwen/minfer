@@ -2,6 +2,10 @@
 
 - [Introduction](./intro.md)
 
+# Overview
+
+- [Features](./FEATURES.md)
+
 # Architecture
 
 - [Architecture Overview](./ARCHITECTURE.md)

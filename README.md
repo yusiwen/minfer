@@ -21,51 +21,20 @@ A minimal local LLM inference engine built from scratch in Rust.
 
 ## Features
 
-- **Declarative compute graph** — inference builds a `ComputeGraph` (pure IR)
-  then assigns backends, fuses ops, allocates and executes via a scheduler,
-  inspired by llama.cpp's `ggml_cgraph` + backend scheduler; params-only graph
-  reuse (decode steps skip reconstruction), per-op backend assignment,
-  Graphviz DOT export (`--dump-graph`) and **interactive web visualization**
-  (`viz/` — `--dump-graph-json` + zero-dependency flowchart page)
-- **Interactive graph visualization (`viz/`)** — a zero-dependency browser page
-  for the compute graph. `minfer viz <model>` serves the page, live SSE
-  inference, per-node tensor stats/heatmaps and logits top-5 in one process;
-  `--dump-graph-json` / `MINFER_TRACE` export graphs and real traces. See the
-  [visualization showcase](#interactive-web-visualization-viz) and
-  [viz/README.md](viz/README.md) for the full user guide.
-- **GGUF loader** — parses GGUF v3 files (metadata + quantized tensors), split
-  multi-part support, **mmap'd weights shared zero-copy with the GPU**
-- **Self-contained BPE tokenizer** — loaded directly from GGUF metadata,
-  no external dependency on tiktoken; special tokens (GGUF type 3/4 table plus
-  `<|im_start|>`/EOS fallbacks) match as single IDs before BPE, so
-  special-token templates (DeepSeek-R1's `<｜User｜>`/`<think>`, etc.) tokenize
-  exactly like llama.cpp
-- **CPU: AVX2 (x86) / NEON+SDOT (Apple Silicon) SIMD** — all 8 quantized
-  dot products, plus a persistent row-parallel thread pool (`-t/--threads`;
-  Qwen3-4B CPU decode ~52–58 tok/s on M4 Pro vs 1.1 before)
-- **GPU: Metal backend** — Apple Silicon acceleration with flash attention
-  (single fused kernel for decode + prefill), simdgroup GEMM
-  prefill for every quant type, SIMD-parallel RMSNorm, float4 vectorized
-  kernels, a build-time precompiled `.metallib` (no per-run shader compile),
-  and auto-selected f16 KV cache for 7B-class models
-- **GPU: CUDA backend** (feature-gated `--features cuda`) — NVIDIA GPU
-  acceleration with CUDA Graph capture/replay; **graph integration pending
-  (Phase 7)** — the legacy `layer_gpu` path remains until then
-- **Qwen2 / Qwen3 architecture** — GQA attention, SwiGLU FFN, RoPE (Neox style),
-  RMSNorm; Qwen3 adds the decoupled head dim + per-head Q/K RMSNorm
-  (`attn_q_norm`/`attn_k_norm`, `Op::QkNorm`)
-- **Model download** — auto-download from Hugging Face Hub or Ollama registry
-- **Multi-turn conversation CLI** (`--cnv`) — append-only KV + incremental
-  chat-template rendering: each turn only prefills the new message delta, the
-  whole conversation accumulates in the KV cache; in-session commands
-  (`/clear`, `/regen`, …), automatic overflow truncation, `--session`
-  persistence (see [docs/CLI-CONVERSATION-PLAN.md](docs/CLI-CONVERSATION-PLAN.md))
-- **OpenAI-compatible HTTP server** (`serve`) — `/v1/chat/completions`
-  (streaming + non-streaming), `/v1/models`, `/health`; multi-slot with queued
-  serial execution (see [docs/OPENAI-CHAT-API-PLAN.md](docs/OPENAI-CHAT-API-PLAN.md))
-- **No external ML framework** — pure Rust; runtime deps are minimal (`rand`,
-  `regex`, `half`, `serde`, `serde_json`, `minijinja`; `axum`/`tokio` only for
-  the HTTP server)
+> Full detail: [docs/FEATURES.md](docs/FEATURES.md) — also on the [docs site](https://yusiwen.cn/minfer/FEATURES.html)
+
+- **Declarative compute graph** — pure-IR graph + scheduler (llama.cpp-inspired), params-only reuse, DOT export
+- **Interactive graph visualization** — `minfer viz <model>`: live SSE inference, per-node stats/heatmaps in the browser
+- **GGUF v3 loader** — split multi-part, mmap'd weights shared zero-copy with the GPU
+- **Self-contained BPE tokenizer** — from GGUF metadata, no tiktoken; special-token templates match llama.cpp exactly
+- **CPU: AVX2 / NEON+SDOT** — all 8 quant dots SIMD'd + persistent thread pool
+- **GPU: Metal** — fused flash attention, simdgroup GEMM, precompiled `.metallib`, f16 KV cache
+- **GPU: CUDA** — default-on int8 tensor-core MMQ path: **~3581 tok/s @7B q4_K_m prefill = 1.080× llama.cpp**; CUDA Graph capture, flash attention, memory/speed opt-out gates
+- **Qwen2 / Qwen3** — GQA, SwiGLU, RoPE, RMSNorm; Qwen3 decoupled head dim + per-head Q/K norm
+- **Model download** — Hugging Face Hub / Ollama, resumable
+- **Multi-turn conversation CLI** (`--cnv`) — incremental prefill, session persistence
+- **OpenAI-compatible server** (`serve`) — `/v1/chat/completions` streaming, multi-slot
+- **No ML framework** — pure Rust, minimal runtime deps, all kernels handwritten
 
 ## Interactive Web Visualization (viz/)
 
