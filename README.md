@@ -118,6 +118,49 @@ loader), `kernel.rs`/`quants.rs` (quantized matmul), `metal.rs`+`metal.metal` an
 Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K (CPU + Metal), F32/F16 norms &
 biases.
 
+## Build
+
+Requirements: **Rust** (edition 2021, no ML-framework dependencies — runtime
+deps are minimal). A **Nix flake devShell** (`nix develop`) is available for a
+batteries-included dev environment.
+
+```bash
+# CPU + Metal (macOS) — plain build, never touches nvcc
+cargo build --release
+./target/release/minfer <model.gguf> "hello"
+```
+
+On macOS the Metal backend is built in automatically: `build.rs` compiles
+`src/metal.metal` → a precompiled `.metallib` via `/usr/bin/xcrun` at build
+time (no per-run shader compile). If Xcode tools are unavailable the build
+still succeeds and the shader is compiled from source at first run.
+
+```bash
+# CUDA (NVIDIA GPU) — opt-in feature, requires the CUDA toolkit (nvcc)
+cargo build --release --features cuda
+```
+
+CUDA build details:
+
+- nvcc is located via `PATH`, `CUDA_HOME`/`CUDA_PATH` (e.g. `/usr/local/cuda`);
+  with `--features cuda` a missing toolkit is a **hard error** (with a clear
+  message), and plain builds never touch nvcc at all.
+- The host compiler is auto-detected: nvcc's default works when compatible;
+  otherwise the first accepted GCC is pinned via `-ccbin` (e.g. a nix devShell
+  putting GCC 15 first while CUDA 13 accepts ≤ GCC 13). Force one with
+  `MINFER_CUDA_CCBIN=/path/to/g++`.
+- GPU architectures are auto-detected from what the toolkit accepts (candidates
+  `sm_61`…`sm_121`, plus PTX for the highest) — one binary covers older and
+  newer GPUs.
+- In CUDA builds the int8 tensor-core MMQ prefill path is **default-on**
+  (runtime gates `MINFER_MMQ*`, see [Performance](#performance) /
+  [CUDA_OPTIMIZATION.md](docs/CUDA_OPTIMIZATION.md)).
+
+```bash
+# + per-node debug dumps (MINFER_DUMP_DIR)
+cargo build --release --features debug_dump
+```
+
 ## Usage
 
 ```bash
