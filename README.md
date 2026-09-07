@@ -189,12 +189,14 @@ CUDA build details:
   putting GCC 15 first while CUDA 13 accepts ≤ GCC 13). Force one with
   `MINFER_CUDA_CCBIN=/path/to/g++`.
 - GPU architectures are auto-detected from what the toolkit accepts (SASS for
-  `sm_61`…`sm_121` as available, plus PTX for the highest and a backward-JIT
+  `sm_70`…`sm_121` as available, plus PTX for the highest and a backward-JIT
   `compute_70`/`compute_72` PTX) — one binary covers older and newer GPUs. The
-  Volta V100/Titan-V (sm_70/72) PTX is only emitted when nvcc supports it:
-  CUDA 12.x does, **CUDA 13 removed Volta**, so keep Volta coverage by building
-  with CUDA 12.8 (the only version supporting Volta + the Blackwell RTX 50
-  sm_120/121, which needs ≥ 12.8).
+  minimum is **sm_70 (Volta)**: the kernels in `cuda_kernels.cu` use WMMA tensor
+  cores (`nvcuda::wmma`), which require sm_70+, so Pascal (sm_61) is not a
+  target. The Volta V100/Titan-V (sm_70/72) PTX is only emitted when nvcc
+  supports it: CUDA 12.x does, **CUDA 13 removed Volta**, so keep Volta coverage
+  by building with CUDA 12.8 (the only version supporting Volta + the Blackwell
+  RTX 50 sm_120/121, which needs ≥ 12.8).
 - **cudart linking** (mirrors llama.cpp's `GGML_STATIC`): by default `-lcudart`
   is a shared link, so the binary NEEDEDs `libcudart.so.N` and needs the CUDA
   toolkit runtime present at runtime (an rpath to `<cuda_home>/lib64` is baked

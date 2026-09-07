@@ -89,8 +89,9 @@ cargo build --release --features cuda,cuda_static   # + statically-linked cudart
 # link-time dependency in either mode.
 #
 # GPU arch coverage (build.rs detect_archs): SASS is compiled for whatever sm_*
-# the toolkit accepts (61..121 as available) + a forward-only PTX for the
-# highest. Volta (V100 sm_70 / Titan V sm_72) is a gap the forward PTX cannot
+# the toolkit accepts (70..121 as available; Pascal sm_61 is dropped because the
+# kernels use WMMA tensor cores, sm_70+) + a forward-only PTX for the highest.
+# Volta (V100 sm_70 / Titan V sm_72) is a gap the forward PTX cannot
 # JIT *down* to, so build.rs also embeds a compute_70/72 backward-JIT PTX when
 # nvcc supports it (CUDA 12.x). CUDA 13 REMOVED Volta (won't compile sm_70/72),
 # so on CUDA 13 the probe skips them — to keep Volta coverage build with

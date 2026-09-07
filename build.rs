@@ -191,7 +191,7 @@ fn main() {
     if archs.is_empty() {
         panic!(
             "CUDA feature requested but nvcc accepted none of the candidate \
-             architectures (sm_61…sm_121) — extend detect_archs() in build.rs \
+             architectures (sm_70…sm_121) — extend detect_archs() in build.rs \
              if this toolkit is newer than the list"
         );
     }
