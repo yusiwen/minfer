@@ -272,11 +272,24 @@ fn main() {
     // only the NVIDIA driver + libstdc++ (no CUDA toolkit runtime). The CUDA
     // driver libcuda.so.1 is not a link dependency in either case — cudart and
     // CudaState::preload_driver() both load it lazily via dlopen at runtime.
-    let lib_dir = format!("{cuda_home}/lib64");
-    if Path::new(&lib_dir).exists() {
+    // The cudart library dir is NOT hardcoded to {cuda_home}/lib64: NVIDIA's
+    // .run/installer and CUDA_HOME layouts put libcudart.so in <root>/lib64,
+    // but Debian/Ubuntu distro packages install the runtime into the multiarch
+    // dir (amd64: /usr/lib/x86_64-linux-gnu, arm64: /usr/lib/aarch64-linux-gnu)
+    // with the headers in /usr/include. Probe for the actual location so both
+    // layouts link — otherwise -lcudart silently fails to resolve on distro
+    // installs (linker error: unable to find library -lcudart).
+    let lib_dir = find_cuda_lib_dir(&cuda_home);
+    if let Some(d) = &lib_dir {
         // Needed in BOTH modes so the linker can find libcudart_static.a (static)
-        // and libcudart.so (shared) in the toolkit's lib64.
-        println!("cargo:rustc-link-search={}", lib_dir);
+        // and libcudart.so (shared) in the toolkit's real lib dir.
+        println!("cargo:rustc-link-search={d}");
+    } else {
+        println!(
+            "cargo:warning=CUDA: could not locate libcudart.so / libcudart_static.a \
+             under {cuda_home} (checked {cuda_home}/lib64, {cuda_home}/lib and the \
+             multiarch dirs) — the link will fail unless the CUDA runtime is reachable"
+        );
     }
 
     let cudart_static = std::env::var_os("CARGO_FEATURE_CUDA_STATIC").is_some();
@@ -292,10 +305,10 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=pthread");
     } else {
         println!("cargo:rustc-link-lib=dylib=cudart");
-        if Path::new(&lib_dir).exists() {
+        if let Some(d) = &lib_dir {
             // Bake an rpath so the binary finds libcudart without relying on
             // LD_LIBRARY_PATH (host-driven model: run on the machine that built).
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
             // libcudart needs libstdc++ transitively; DT_RUNPATH is not consulted
             // for transitive deps (and nix's loader ignores /etc/ld.so.cache), so
             // emit old-style DT_RPATH, which is.
@@ -309,7 +322,16 @@ fn main() {
 
 /// Locate nvcc, preferring the toolkit CUDA_HOME/CUDA_PATH points at so the
 /// headers passed with -I and the compiler that is run always come from the
-/// same toolkit. Falls back to PATH (previous behavior).
+/// same toolkit. Falls back to PATH.
+///
+/// The PATH fallback resolves nvcc to its absolute path (via `which`) instead
+/// of returning the bare "nvcc" string: find_cuda_home() derives the toolkit
+/// root by stripping the "/bin/nvcc" suffix, which requires an absolute path.
+/// On Debian/Ubuntu distro packages (nvcc at /usr/bin/nvcc, no /usr/local/cuda,
+/// headers in /usr/include) that derivation correctly yields "/usr", so the
+/// -I/usr/include flag finds the headers. With a bare "nvcc" the derivation
+/// fails and find_cuda_home() would only land on "/usr" by accident; resolving
+/// to the absolute path makes it explicit.
 fn find_nvcc() -> Option<String> {
     for var in ["CUDA_HOME", "CUDA_PATH"] {
         if let Ok(home) = std::env::var(var) {
@@ -318,6 +340,14 @@ fn find_nvcc() -> Option<String> {
                 if Path::new(&candidate).exists() {
                     return Some(candidate);
                 }
+            }
+        }
+    }
+    if let Ok(out) = Command::new("which").arg("nvcc").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && Path::new(&p).exists() {
+                return Some(p);
             }
         }
     }
@@ -346,6 +376,30 @@ fn find_cuda_home(nvcc: &str) -> String {
         }
     }
     "/usr".to_string()
+}
+
+/// Locate the directory that actually contains the CUDA runtime library.
+///
+/// NVIDIA's .run installer and CUDA_HOME layouts put libcudart.so in
+/// <root>/lib64 (and on some toolchains <root>/lib). Debian/Ubuntu distro
+/// packages install it into the multiarch dir instead (amd64
+/// /usr/lib/x86_64-linux-gnu, arm64 /usr/lib/aarch64-linux-gnu), with no
+/// per-toolkit root. Probe every candidate for a real libcudart so both
+/// layouts link. Checking `.so` (shared) and `_static.a` (static) covers the
+/// `cuda_static` toggle too.
+fn find_cuda_lib_dir(cuda_home: &str) -> Option<String> {
+    let candidates = [
+        format!("{cuda_home}/lib64"),
+        format!("{cuda_home}/lib"),
+        "/usr/lib/x86_64-linux-gnu".to_string(),
+        "/usr/lib/aarch64-linux-gnu".to_string(),
+        "/usr/lib64".to_string(),
+        "/usr/lib".to_string(),
+    ];
+    candidates.into_iter().find(|d| {
+        Path::new(d).join("libcudart.so").exists()
+            || Path::new(d).join("libcudart_static.a").exists()
+    })
 }
 
 /// Outcome of probing nvcc's host compiler for the C++ side of the kernels.
