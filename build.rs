@@ -307,8 +307,19 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cudart");
         if let Some(d) = &lib_dir {
             // Bake an rpath so the binary finds libcudart without relying on
-            // LD_LIBRARY_PATH (host-driven model: run on the machine that built).
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+            // LD_LIBRARY_PATH (host-driven model: run on the machine that built) —
+            // BUT only when the cudart dir is NOT a standard system library dir.
+            // Debian/Ubuntu multiarch dirs (/usr/lib/x86_64-linux-gnu etc.) are
+            // already in the loader's default search path, so an rpath there is
+            // unnecessary. Worse, on a nix build the binary links against nix's
+            // glibc, and a leading "/usr/lib/x86_64-linux-gnu" in RPATH makes the
+            // loader pick the SYSTEM libc.so.6 / libgcc_s / libm instead — those
+            // are an older glibc that lacks nix-only private symbols, producing
+            // "undefined symbol: __nptl_change_stack_perm, version GLIBC_PRIVATE"
+            // at load time. Skipping the rpath for system dirs avoids shadowing.
+            if !is_system_default_lib_dir(d) {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+            }
             // libcudart needs libstdc++ transitively; DT_RUNPATH is not consulted
             // for transitive deps (and nix's loader ignores /etc/ld.so.cache), so
             // emit old-style DT_RPATH, which is.
@@ -400,6 +411,25 @@ fn find_cuda_lib_dir(cuda_home: &str) -> Option<String> {
         Path::new(d).join("libcudart.so").exists()
             || Path::new(d).join("libcudart_static.a").exists()
     })
+}
+
+/// Is `d` a directory the dynamic loader already searches by default?
+///
+/// Debian/Ubuntu multiarch dirs and /usr/lib, /lib, /usr/lib64, /lib64 are in
+/// the loader's default search path, so a `-rpath` there is unneeded and can
+/// actively shadow a toolchain-installed glibc (see the cudart rpath comment).
+fn is_system_default_lib_dir(d: &str) -> bool {
+    matches!(
+        d,
+        "/usr/lib/x86_64-linux-gnu"
+            | "/lib/x86_64-linux-gnu"
+            | "/usr/lib/aarch64-linux-gnu"
+            | "/lib/aarch64-linux-gnu"
+            | "/usr/lib64"
+            | "/lib64"
+            | "/usr/lib"
+            | "/lib"
+    )
 }
 
 /// Outcome of probing nvcc's host compiler for the C++ side of the kernels.
