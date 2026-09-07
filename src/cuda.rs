@@ -1481,7 +1481,10 @@ impl CudaState {
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(ep) = self.get_weight_ptr(&exp_name) {
                 if !wp.is_null() && !ep.is_null() {
-                    self.q6k_exp.lock().unwrap().insert(wp as usize, CudaPtr(ep));
+                    self.q6k_exp
+                        .lock()
+                        .unwrap()
+                        .insert(wp as usize, CudaPtr(ep));
                     return;
                 }
             }
@@ -1512,7 +1515,10 @@ impl CudaState {
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {
                 if !wp.is_null() && !dp.is_null() {
-                    self.q6k_dsc.lock().unwrap().insert(wp as usize, CudaPtr(dp));
+                    self.q6k_dsc
+                        .lock()
+                        .unwrap()
+                        .insert(wp as usize, CudaPtr(dp));
                     return;
                 }
             }
@@ -1576,7 +1582,10 @@ impl CudaState {
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {
                 if !wp.is_null() && !dp.is_null() {
-                    self.q4k_dsc.lock().unwrap().insert(wp as usize, CudaPtr(dp));
+                    self.q4k_dsc
+                        .lock()
+                        .unwrap()
+                        .insert(wp as usize, CudaPtr(dp));
                     return;
                 }
             }
@@ -1625,8 +1634,7 @@ impl CudaState {
                         )
                     };
                     let idx = ((sb * 8 + cc) * od + j) * 8;
-                    out[idx..idx + 4]
-                        .copy_from_slice(&(d * (s as f32)).to_bits().to_le_bytes());
+                    out[idx..idx + 4].copy_from_slice(&(d * (s as f32)).to_bits().to_le_bytes());
                     out[idx + 4..idx + 8]
                         .copy_from_slice(&(-(dmin * (m as f32))).to_bits().to_le_bytes());
                 }
@@ -1711,11 +1719,9 @@ impl CudaState {
                         let qhb = qh[it * 32 + (r & 31)];
                         let s0 = (r >> 5) * 2;
                         let e0 = it * 128 + r;
-                        obase[e0] =
-                            ((qlb & 0xF) | (((qhb >> s0) & 3) << 4)).wrapping_sub(32);
-                        obase[e0 + 64] = (((qlb >> 4) & 0xF)
-                            | (((qhb >> (s0 + 4)) & 3) << 4))
-                            .wrapping_sub(32);
+                        obase[e0] = ((qlb & 0xF) | (((qhb >> s0) & 3) << 4)).wrapping_sub(32);
+                        obase[e0 + 64] =
+                            (((qlb >> 4) & 0xF) | (((qhb >> (s0 + 4)) & 3) << 4)).wrapping_sub(32);
                     }
                 }
             }
@@ -3167,12 +3173,10 @@ impl CudaState {
                         // r52: mmq_quantize_native refuses a mode-2 dead-write
                         // A (and plain q8 OOM is pre-checked at fn entry) —
                         // never fall through to a GEMM on a null/garbage A.
-                        return Err(
-                            "cuda: prefill MMQ: A-quantize unavailable (mode-2 \
+                        return Err("cuda: prefill MMQ: A-quantize unavailable (mode-2 \
                              dead-write A refused or q8 OOM); MINFER_MMQ_A_FUSE=2 \
                              window violated"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
                     let wide_ok = q8 != 0
                         && wide

@@ -3733,7 +3733,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn cuda_q6k_exp_dense_byte_exact() {
         // r53 gate 1: the pre-expanded dense W_exp plane must be byte-identical
@@ -3751,7 +3750,11 @@ mod tests {
             s ^= s << 17;
             s
         };
-        for (od, id) in [(64usize, 256usize), (40usize, 512usize), (24usize, 768usize)] {
+        for (od, id) in [
+            (64usize, 256usize),
+            (40usize, 512usize),
+            (24usize, 768usize),
+        ] {
             let nbe = id / 256;
             let row_len = nbe * 210;
             let raw: Vec<u8> = (0..od * row_len).map(|_| (rnd() & 0xFF) as u8).collect();
@@ -3823,7 +3826,11 @@ mod tests {
             s ^= s << 17;
             s
         };
-        for (od, id) in [(64usize, 256usize), (40usize, 512usize), (24usize, 768usize)] {
+        for (od, id) in [
+            (64usize, 256usize),
+            (40usize, 512usize),
+            (24usize, 768usize),
+        ] {
             let nbe = id / 256;
             let nchunk = id / 32;
             let row_len = nbe * 210;
@@ -3890,7 +3897,11 @@ mod tests {
             s ^= s << 17;
             s
         };
-        for (od, id) in [(64usize, 256usize), (40usize, 512usize), (24usize, 768usize)] {
+        for (od, id) in [
+            (64usize, 256usize),
+            (40usize, 512usize),
+            (24usize, 768usize),
+        ] {
             let nbe = id / 256;
             let nchunk = id / 32;
             let row_len = nbe * 144;
@@ -3902,8 +3913,7 @@ mod tests {
                     let base = (j * nbe + sb) * 144;
                     let blk = &raw[base..base + 144];
                     let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
-                    let dmin =
-                        half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
+                    let dmin = half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
                     let q = &blk[4..16]; // 12 packed 6-bit scales+mins
                     for cc in 0..8usize {
                         let (sc, m) = if cc < 4 {
@@ -3917,9 +3927,8 @@ mod tests {
                         let idx = ((sb * 8 + cc) * od + j) * 8;
                         want[idx..idx + 4]
                             .copy_from_slice(&(d * (sc as f32)).to_bits().to_le_bytes());
-                        want[idx + 4..idx + 8].copy_from_slice(
-                            &(-(dmin * (m as f32))).to_bits().to_le_bytes(),
-                        );
+                        want[idx + 4..idx + 8]
+                            .copy_from_slice(&(-(dmin * (m as f32))).to_bits().to_le_bytes());
                     }
                 }
             }
