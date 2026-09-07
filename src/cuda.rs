@@ -2535,6 +2535,7 @@ impl CudaState {
 
     /// Device compute capability × 100 (e.g. 1210 = sm_121); 0 when no
     /// device is initialized. Used by tests to gate sm_80+ kernels.
+    #[cfg(test)]
     pub fn cc(&self) -> i32 {
         self.cc.load(std::sync::atomic::Ordering::Relaxed)
     }

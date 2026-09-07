@@ -140,10 +140,12 @@ impl CudaBackend {
 
     /// 8g②: turn on deliberate prefill capture for tests (the pp16/pp300
     /// bit-parity harness is the validation gate).
+    #[cfg(test)]
     pub(crate) fn set_prefill_capture_for_test(&mut self, enabled: bool) {
         self.prefill_capture = enabled;
     }
 
+    #[cfg(test)]
     pub(crate) fn set_graphs_enabled_for_test(&mut self, enabled: bool) {
         self.graphs_mode = if enabled {
             GraphMode::Enabled
