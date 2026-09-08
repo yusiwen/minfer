@@ -135,7 +135,9 @@ Chapters in §2 follow this table row by row.
 | D3-4 findings | pre-existing behaviors calibrated this session: (a) at long prompts (≥2.8K tokens) `MINFER_GRAPH_DUMP` PREFILL-phase files (all `kv*_prefill`, `logits_prefill`, prefill nodes) are non-deterministic pre-vs-pre (wholesale, garbage-magnitude — aliased dump reads); decode-phase dumps stay deterministic; (b) CLI prompts longer than the n_ctx default 4096 leave zero generation headroom (`position N exceeds n_ctx N` panic, graph.rs:367); bench unaffected | measurement-only | — | — | — | RECORDED | dump gates at long prompts must anchor pre-vs-pre at the EXACT shape and gate only decode-phase files; long-prompt CLI greedy needs `prompt + n ≤ 4096` until n_ctx sizing is fixed |
 | D3-5 1a | fused-producer decode A-quantize: `rms_norm_quant_pad40` (rms body + the standalone per-block quantize body, both verbatim) and `swiglu_quant_pad40` write the pad40 q8 plane beside their f32 output; decode matmuls consult `decode_quantize_native` (MmqCache, native form) and skip the standalone quantize launch on a hit; FusedFFN joins the cache-clear preserve set; `MINFER_NO_DECODE_A_FUSE=1` opt-out | `3230b2b` | nsys 14B @3254 (NO_CUDA_GRAPH): standalone `quantize_q8_0_pad40` 4448 → **964** launches (−78%; the ~50/step remainder = the attn_o class), total kernels 29402 → 25918, sub-2µs 15171 → 11723; wall 14B tg128 23.05 → **23.35** (+1.30% SEP), @3254 21.36 → **21.68** (+1.50% SEP), 7B tg128 49.86 → **50.69** (+1.66% SEP), @1641 48.47 → **49.16** (+1.43% SEP) | **+1.30%** (14B tg128) | 0.961× / 0.891× (14B tg128/@3254 vs llama 24.31/24.32); 7B **1.026×** / 0.995× | **LANDED** | q8 bytes bit-identical by construction (max is exact for any association; rintf/clamp elementwise — the epilogue IS the standalone body) and probe-verified bitwise (rms+swiglu q8 buffers, f32 producer outputs, MMVQ outputs through the cache-hit path); suite 170/0/3; 14B −n 4 dump gate: logits both phases + all KV byte-identical, the 3 node-dump diffs are same-binary pool-slot aliasing reproduced pre-vs-pre AND post-vs-post; greedy −n 256 token streams byte-identical both models; fused epilogues add ~0.2–0.25 µs/launch (swiglu 2.06 → 2.31 µs), priced into the wall |
 | D3-5 1b | output-head od-split / 512-thread re-map (lm_head q6_K od 152064, id 5120, npair 160) | not implemented | — | — | — | ANALYSIS-NEGATIVE | all three candidate mechanisms are measured or computed dead at this shape: (a) idle-thread removal (96 of 256 idle at npair 160) = D3b-1c, measured neutral; (b) rows-in-flight: 288 resident rows either way (6×256-thread blocks/SM vs 3×512 dual-row), and D3b-1c's 9×160 = 432-row form was ALSO neutral — occupancy is not the limiter; (c) block-scheduling rate: the head sustains 47.6 blocks/µs while ffn_gu demonstrates 76/µs — not the limiter. A dual-row 512-thread form is bitwise-capable (per-row half-block reduce with the same 8-warp tree) but carries no mechanism → not built per the "measured mechanism, don't guess" rule |
-| D3-5 1c | ffn_down-q6K 512-thread single-unit variant (id 13824 → npair 432) | not implemented | — | — | — | ANALYSIS-NEGATIVE | NOT bitwise vs the landed v2_pf: in the 256-thread form thread t accumulates fma(u_t) then += fma(u_{t+256}) into ONE float acc before the block reduce; at 512 threads those units live in different threads and their sum happens in the reduce tree (16-warp cross-warp serial order) — a different float sum. A bitwise emulation (smem pair-exchange so thread t still sums u_t+u_{t+256} first) adds a barrier for zero resident-parallelism gain (5120 rows = 18 waves either way), and the exposure mechanism 1c targets was already fixed by v2_pf's up-front load issue (D3b-1b) |
+| D3-5 1c | ffn_down-q6K 512-thread single-unit variant (id 13824 → npair 432) | not implemented | — | — | — | ANALYSIS-NEGATIVE |
+| D3-6 2a | GQA q-head batching in the decode split attention (grid (ATTN_SPLITS, n_kv_heads), 32\*gqa threads, warp w = q head hk\*gqa+w, full split stripe per warp, shared `h4w_warp_windows` window pass, per-warp 8/16-butterfly epilogue; same rpw ≥ 16 dispatch slot, static grids → replay-safe) | reverted (patch `/tmp/d3/patch_2a.py`) | nsys 14B @3254: h4w 63.76 → batched 64.79 µs (+1.6%); ncu `lts__t_sectors`: 2,121,671 (4.63× analytic 1×) → 472,583 (**1.03×**) — traffic ÷4.5 with time flat | −1.6% kernel | — | **REVERTED** | mechanism-nailed: the 5× L2 re-read is fully HIDDEN under the latency roofline in the live regime (D1's latency-bound attribution stands; D3-4's L2-composition re-attribution revised) — ncu's −28% appears only serialized/cold; ALL gates were green first: parity ≤1e-4 at gqa 5/7 incl. exact nkv 2808 + outlier calibration (shapes kept as permanent h4w coverage), dump argmax HARD gate (margins 2.187/0.557), greedy byte-identical with repeat-penalty 1.0 both models, default-penalty flips = 1/256 sampler knife-edges (14B step-63 raw top-2 probgap 0.0167; 7B step-8 penalized rank-6 winner), temp-0.8 controls identical, suite 170/0/3; new gate rule: attribute greedy flips to sampler vs kernel via the penalty-free stream + per-step logits_top trace |
+ NOT bitwise vs the landed v2_pf: in the 256-thread form thread t accumulates fma(u_t) then += fma(u_{t+256}) into ONE float acc before the block reduce; at 512 threads those units live in different threads and their sum happens in the reduce tree (16-warp cross-warp serial order) — a different float sum. A bitwise emulation (smem pair-exchange so thread t still sums u_t+u_{t+256} first) adds a barrier for zero resident-parallelism gain (5120 rows = 18 waves either way), and the exposure mechanism 1c targets was already fixed by v2_pf's up-front load issue (D3b-1b) |
 
 **Footnotes.**
 
@@ -229,6 +231,17 @@ pre-D3-5 anchors: 14B tg128 +1.65% (session bar ≥ +1.5%), @3254 +2.95%. 14B
 decode geometry levers (head od-split, ffn_down 512-thread) resolved
 analysis-negative with the math recorded (§2D D3-5); Stage 2 = GQA q-head
 batching (attention re-read) + rms-launch consolidation.
+
+**D3-6 update (2026-09-08):** Stage 2's GQA q-head batching was built and
+REVERTED with the mechanism nailed: eliminating the 5× K/V L2 re-read
+(2.12M → 473K sectors = the 1× analytic minimum, ncu-verified) leaves live
+kernel time flat (63.8 → 64.8 µs) — the re-read was already hidden under the
+latency roofline, so the 14B attention residual is exposed-latency, NOT
+traffic; no bytes-side attention lever remains (§2D D3-6). Every correctness
+gate was green (incl. byte-identical penalty-free greedy streams on both
+models — the new sampler-vs-kernel attribution gate). attn_v-q6K MMVQ
+routing (2b, ≈ +0.6% projected) deferred; rms-launch consolidation (~1.0 ms)
+is the largest remaining known lever.
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1999,6 +2012,107 @@ remaining single lever (0.63 ms). (3) rms-launch consolidation (97 rms →
 fewer, wider launches) is the remaining elementwise mass (1.15 ms class).
 (4) Long-prompt CLI n_ctx headroom fix (pre-existing, now also blocks
 long-prompt greedy gates).
+
+### D3-6 — Stage 2 of the decode-alignment program: GQA q-head batching in the decode split attention built + gate-green + REVERTED with the mechanism nailed — the 5× L2 re-read is NOT the residual (2026-09-08)
+
+Base binary `/tmp/d3/minfer_pre_d36` (sha1 92485d3c, HEAD 6085928 window);
+sglang co-tenant resident throughout (same-window interleaved methodology).
+
+**2a — GQA q-head batching, REVERTED (mechanism-negative, not gate-failing).**
+The D3-4 follow-up held that the attention residual (62.1 vs the 48.9 µs
+DRAM floor at 14B @3254) is the K/V 5×-re-read composition. The lever was
+built as designed: `gqa_attn_split_partial_gqa` puts ALL gqa q-heads of one
+kv head in ONE block — grid `(ATTN_SPLITS, n_kv_heads)`, `32*gqa` threads
+(warp w = q head `hk*gqa+w`, full split stripe per warp), the per-warp
+32-row-window pass extracted verbatim from `attn_split_h4w_body` into a
+shared `h4w_warp_windows` device function, per-warp epilogue (warp-local LSE
+state is final; the 4 row-class oc copies fold by an 8/16 butterfly), static
+nkv-independent grid/block (replay-safe), same `rpw >= H4W_MIN_RPW` dispatch
+slot (gqa 2..8; gqa 1 and > 8 keep the 4-warp hybrid; rpw < 16 incumbent
+bitwise). Patch preserved at `/tmp/d3/patch_2a.py`.
+
+**Every gate in the calibrated package passed** — the kernel was correct;
+the WALL mechanism was not there:
+
+- Kernel-level vs CPU: the split-decode parity test extended with the 14B
+  (40:8, gqa=5) and 7B (28:4, gqa=7) geometries across nkv 3..4096 (incl.
+  the exact in-situ 2808 divergence-point shape and the rpw 15/16 boundary)
+  plus the D3a outlier calibration (|q|~57, V ±144) at ≤1e-4 — all green
+  (these shapes now permanently cover the LIVE h4w kernel too).
+- Dump gate (both models, 2.8K-token prompt = full batched regime, −n 4):
+  `logits_prefill`/`kv0_prefill`/early-layer KV bitwise (14B kv0–15, 7B
+  kv0–4); `logits_decode` max|Δ| 0.265 (14B) / 0.259 (7B) — the calibrated
+  0.39-class; argmax identical (HARD gate) at margins 2.187 / 0.557;
+  upper-layer KV decode-side drift = the documented f16-boundary class; the
+  node{2,3,5,8,11}_decode + node{3,5,8}_prefill diffs reproduced pre-vs-pre
+  (slot aliasing).
+- Greedy (the sampler-vs-kernel attribution below is the new part):
+  with `--repeat-penalty 1.0` (raw argmax) the −n 256 streams are
+  **byte-identical pre-vs-post on BOTH models** — the kernel never flips a
+  raw argmax in 512 steps. With the default repeat penalty each run shows
+  exactly ONE knife-edge flip (1/256 = 0.4% < 2%): 14B at step 63 where the
+  raw top-2 sat at probgap 0.0167 (logit gap 0.037) and swapped order; 7B at
+  step 8 where the penalized winner was raw-rank 6+ (outside the traced
+  top-5). Post-flip text coherent, no repetition degeneracy; temp-0.8
+  seed-7 sampled controls byte-identical (incumbent regime both sides).
+- Suite 170/0/3 incl. FA trio + the extended split-decode parity.
+
+**Measurement (why it reverted).** nsys (NO_CUDA_GRAPH, bench −n 8, mean of
+last 384): h4w 63.76 → batched 64.79 µs/layer (**+1.6%** — not the projected
+≤54). ncu on the same launches (2-launch capture, serialized):
+
+| kernel | `lts__t_sectors.sum` | vs 1× analytic (458K) | nsys (live) | ncu (serialized) |
+|---|---|---|---|---|
+| h4w hybrid (5× re-read) | 2,121,671 | 4.63× | 63.76 µs | 150.8 µs |
+| GQA-batched (1× read) | 472,583 | 1.03× | 64.79 µs | 108.7 µs |
+
+The batched form eliminates the L2 re-read EXACTLY as designed (1.03× the
+analytic one-pass minimum — L1 catches the sibling warps' same-address
+loads), yet live time is flat: **the 5× L2 re-read was already fully hidden
+under the latency roofline in the live regime** (L2 has bandwidth surplus;
+the kernel is latency/dependency-chain + wave-structure bound — D1's
+original attribution, which D3-4's "L2 composition" note had over-corrected).
+ncu's serialized replay shows the −28% only because cold caches make traffic
+dominant there — the opposite regime. Consequence for Stage 3: the attention
+residual (62.1 − 48.9 = 13.2 µs/layer ≈ 0.63 ms/step) is NOT addressable by
+any bytes-side traffic lever; the next attention lever would have to cut
+exposed latency (cross-window prefetch at retained occupancy — D3-4 L2's
+register-pipeline form lost 1:2 to occupancy; smem-tile cooperative staging
+is the untried remainder, historically disfavored at this granularity by
+D2's cp.async negatives).
+
+**New durable gate methodology (sampler-vs-kernel attribution).** A greedy
+divergence under the default repeat penalty is NOT automatically kernel
+drift: the penalized argmax is a knife-edge among up to 64 penalized
+candidates, and flips there cascade (the next step embeds a different token
+— visible as `embed`-node input change in `MINFER_TRACE`, with steps 0..k−1
+top-5s matching to drift class). The clean kernel-numerics stream is greedy
+with `--repeat-penalty 1.0`; byte-identity there is the strong gate. The
+per-step `logits_top` trace (`cmp_trace.py`) supplies the raw top-2 probgap
+at any flip step.
+
+**2b — attn_v-q6K → MMVQ q8-activation routing: NOT attempted** (time). The
+lever stands as the D3-4/D3-1 follow-up: attn_v (od 1024 × id 5120 = 5.24M
+elements < the 24M MMVQ gate) runs the padded-f32 kernel at 134.8 GB/s vs
+the 220 class; routing = lowering the Q6_K decode gate for this shape
+(mostly a dispatch change; numerics delta confined to f32→q8 rounding of the
+attention output, tolerance-gated per the D3a package). D3-1 estimate
++0.28 ms/step ≈ +0.6% 14B wall. `MINFER_NO_DECODE_A_FUSE=1` semantics
+unaffected (attn_v's producer keeps its standalone quantize either way).
+
+**Window anchors** (unchanged from D3-5, the pre_d36 window): 14B tg128
+23.35, @3254 21.68; 7B tg128 50.69, @1641 49.16. Guards: 7B tg128 ≥ 49.0 /
+@1641 ≥ 47.9; 14B tg128 ≥ 22.7.
+
+**Distance to parity (post-D3-6, 14B @3254, unchanged walls).** minfer
+21.68 t/s = 46.12 ms/step vs llama 24.32 = 41.12 ms → −5.00 ms (−10.8%).
+Stage-2 outcome: the attention residual's 0.63 ms is re-attributed from
+"L2 re-read traffic" to exposed-latency (bytes-side levers dead per the ncu
+sector evidence above). Remaining KNOWN inventory: rms-launch consolidation
+≈ 1.0 ms; attn_v-q6K MMVQ routing ≈ 0.28 ms (2b, deferred); output head
+0.44 ms (mechanism-less per D3-5 1b); attention latency levers ≈ ≤0.63 ms
+mechanism now uncertain. Sum ≈ 1.7–2.35 ms = 34–47% of the gap; the rest is
+the matmul aggregate + launch-structure slack — Stage 3 decision input.
 
 ## §3 Appendices
 

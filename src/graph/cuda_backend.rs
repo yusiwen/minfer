@@ -4571,6 +4571,28 @@ mod tests {
                 4200usize,
                 [2usize, 32, 63, 64, 127, 128, 1023, 1919, 1920, 4094, 4095],
             ),
+            // D3-6 2a: the 14B GQA geometry (40:8, gqa=5) drives the
+            // GQA-batched kernel (grid (ATTN_SPLITS, 8), 160 threads) on the
+            // same pos0 sweep — the 1920/1921 boundary picks between the
+            // bitwise 1-warp incumbent (nkv 1920) and the batched body
+            // (nkv 1921), and 4094/4095 cover full-window chunk tails.
+            (
+                40usize,
+                8usize,
+                128usize,
+                4200usize,
+                [2usize, 32, 63, 64, 127, 128, 1023, 1919, 1920, 4094, 4095],
+            ),
+            // D3-6 2a: the 7B GQA geometry (28:4, gqa=7 → 224-thread blocks).
+            // nkv 2808 (pos0 2807) reproduces the in-situ decode-step shape at
+            // the divergence point seen in the 7B greedy gate.
+            (
+                28usize,
+                4usize,
+                128usize,
+                4200usize,
+                [2usize, 32, 63, 64, 127, 128, 1919, 1920, 2807, 4094, 4095],
+            ),
         ] {
             let nkt = nk_h * hd;
             let scale = 1.0 / (hd as f32).sqrt();
@@ -4678,6 +4700,116 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // D3-6 2a: kernel-level gate of the calibrated tolerance package on
+        // realistic outlier-scale data (docs/CUDA_OPTIMIZATION.md §2D D3a:
+        // residual |q|~50, V outliers ±127 — the h4w body measured 6.5e-5
+        // vs CPU on this class, the incumbent 3.8e-5). The GQA-batched body
+        // shares the h4w window loop verbatim, so the same ≤1e-4 bound
+        // applies; 14B geometry (40:8, gqa=5) inside the batched regime
+        // (nkv 1921 / 4096, f16 KV).
+        for pos0 in [1920usize, 4095usize] {
+            let (nh, nk_h, hd, n_ctx) = (40usize, 8usize, 128usize, 4200usize);
+            let nkt = nk_h * hd;
+            let scale = 1.0 / (hd as f32).sqrt();
+            let nkv = pos0 + 1;
+            cb.set_kv_f16_for_test(true);
+            let mut b = GraphBuilder::new();
+            let q = b.input("q", [nh * hd, 1, 1, 1], DType::F32);
+            let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
+            let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
+            let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
+            let store = b.kvcache_store(0, k, v, pp, n_ctx);
+            let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+            let at = b.attn(
+                q,
+                load,
+                pp,
+                AttnMode::Gqa,
+                AttnMeta {
+                    layer: 0,
+                    n_head: nh,
+                    n_head_kv: nk_h,
+                    hd,
+                    hd_kv: hd,
+                    nkt,
+                    scale,
+                },
+            );
+            b.output(at);
+            let g = b.build();
+
+            let (xb_q, xb_k, xb_v) = (
+                cb.alloc_buffer(nh * hd),
+                cb.alloc_buffer(nkt),
+                cb.alloc_buffer(nkt),
+            );
+            let xb_p = cb.alloc_buffer(1);
+            let ob_at = cb.alloc_buffer(nh * hd);
+            let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
+
+            // Outlier scale: q residual |q|~50-60, V outliers |v|~140 (f16
+            // representable); K stays at the tame scale like the D3a probe.
+            let qs: Vec<f32> = (0..nh * hd)
+                .map(|i| (((i * 37) % 19) as f32 / 5.0 - 1.9) * 30.0)
+                .collect();
+            let ks: Vec<f32> = (0..nkt)
+                .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+                .collect();
+            let vs: Vec<f32> = (0..nkt)
+                .map(|i| (((i * 57) % 11) as f32 / 3.0 - 1.8) * 80.0)
+                .collect();
+            let pb = vec![f32::from_bits(pos0 as u32)];
+            let to_half = |x: &[f32]| -> Vec<f32> {
+                x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+            };
+            let (ks_r, vs_r) = (to_half(&ks), to_half(&vs));
+            cb.write_host(xb_q, &qs).unwrap();
+            cb.write_host(xb_k, &ks).unwrap();
+            cb.write_host(xb_v, &vs).unwrap();
+            cb.write_host(xb_p, &pb).unwrap();
+            cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
+            cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
+
+            cb.execute_node(
+                &g.nodes[store],
+                &[xb_k, xb_v, xb_p],
+                kreg,
+                Some((kreg, vreg)),
+            )
+            .unwrap();
+            cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+                .unwrap();
+
+            let mut kfull = vec![0f32; nkt * n_ctx];
+            let mut vfull = vec![0f32; nkt * n_ctx];
+            kfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&ks_r);
+            vfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&vs_r);
+            let mut aref = vec![0f32; nh * hd];
+            crate::graph::cpu_backend::cpu_gqa_attn(
+                &qs,
+                &kfull,
+                &vfull,
+                &[pos0],
+                1,
+                nkv,
+                nh,
+                nk_h,
+                hd,
+                hd,
+                nkt,
+                &mut aref,
+                scale,
+            )
+            .unwrap();
+            let agot = cb.copy_to_host(ob_at).unwrap();
+            assert_close(
+                &format!("attn_split_gqa_batched_outlier(nkv={nkv})"),
+                &agot,
+                &aref,
+                1e-4,
+            );
         }
     }
 
