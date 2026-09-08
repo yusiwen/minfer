@@ -27,7 +27,6 @@
 - [CUDA Backend Plan](./CUDA-BACKEND-PLAN.md)
 - [CUDA Follow-up](./CUDA-FOLLOWUP-PLAN.md)
 - [CUDA Optimization](./CUDA_OPTIMIZATION.md)
-- [llama.cpp MMQ Analysis](./LLAMA-CPP-MMQ-ANALYSIS.md)
 
 # Model Support
 
@@ -41,4 +40,5 @@
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)
 - [Qwen3-4B perf vs llama.cpp](./PERF-QWEN3-4B-VS-LLAMACPP.md)
+- [llama.cpp MMQ Analysis](./LLAMA-CPP-MMQ-ANALYSIS.md)
 - [llama.cpp Speculative Decoding Analysis](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
