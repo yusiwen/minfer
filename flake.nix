@@ -19,11 +19,19 @@
       };
     in {
       devShells.default = pkgs.mkShell {
-        # Provide a real locale archive so a macos host `LC_ALL=en_US.UTF-8`
-        # is honored — otherwise the nix bash warns "cannot change locale
+        # Provide a real locale archive so a host `LC_ALL=en_US.UTF-8` is
+        # honored — otherwise the nix bash warns "cannot change locale
         # (en_US.UTF-8)" on every command.
-        buildInputs = [ pkgs.glibcLocales ];
-        LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+        #
+        # glibcLocales / locale-archive are Linux-only. On macOS (darwin)
+        # pkgs.glibcLocales evaluates to `null`, so guard every reference
+        # behind stdenv.isLinux — interpolating `null` into the string above
+        # was the "cannot coerce null to a string" build failure.
+        buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+          pkgs.glibcLocales
+        ];
+        LOCALE_ARCHIVE = pkgs.lib.optionalString pkgs.stdenv.isLinux
+          "${pkgs.glibcLocales}/lib/locale/locale-archive";
         nativeBuildInputs = [
           rust
           pkgs.pkg-config

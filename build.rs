@@ -125,6 +125,38 @@ fn main() {
         let hash: String = bytes.iter().map(|b| format!("{b:02x}")).take(16).collect();
         println!("cargo:rustc-env=MINFER_METALLIB_PATH={metallib}");
         println!("cargo:rustc-env=MINFER_METALLIB_HASH={hash}");
+
+        // ─── Real-SDK framework search path for rustc's linker ───────────
+        // In a nix devShell (this repo's flake.nix via direnv) the linker
+        // `cc` is nixpkgs' clang, whose framework search path only covers
+        // nixpkgs' open-source apple-sdk frameworks (Foundation, ...). It does
+        // NOT carry Metal.framework, so linking `-framework Metal` fails with
+        // "ld: framework not found Metal". The REAL Metal.framework lives in
+        // the Xcode SDK, routed to the linker with `-F`:
+        //   cc -F <Xcode SDK>/System/Library/Frameworks -framework Metal ...
+        // We resolve that path via /usr/bin/xcrun --sdk macosx (the same
+        // real-toolchain route used for the metallib above, and the same
+        // rule as docs/METAL_OBJC-ECOSYSTEM.md §2b — do NOT fix this in
+        // flake.nix, which would also redirect rustc's whole linker env).
+        // On a non-nix (system clang) build this is a harmless no-op: the
+        // real SDK dir is already on the implicit search path and adding it
+        // again just picks the same framework. `-F` is a link-search flag the
+        // linker understands natively (no -L semantics), so it never shadows
+        // an nix-provided dylib.
+        if let Ok(out) = Command::new("/usr/bin/xcrun")
+            .args(["--sdk", "macosx", "--show-sdk-path"])
+            .output()
+        {
+            if out.status.success() {
+                let sdk = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !sdk.is_empty() {
+                    let fw = format!("{sdk}/System/Library/Frameworks");
+                    if std::path::Path::new(&fw).is_dir() {
+                        println!("cargo:rustc-link-arg=-F{fw}");
+                    }
+                }
+            }
+        }
     }
 
     // ─── CUDA kernels (opt-in: `--features cuda`) ─────────────────────

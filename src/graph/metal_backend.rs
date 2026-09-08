@@ -276,6 +276,10 @@ impl Backend for MetalBackend {
             Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
+            // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
+            // Metal the graph builder never emits it (qkv_epilogue_ok = false
+            // without `--features cuda`), so it is never assigned here.
+            Op::QkvBiasRopeStore { .. } => false,
         }
     }
 
@@ -981,6 +985,12 @@ impl Backend for MetalBackend {
             }
             Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => {
                 Err(format!("op {:?} unsupported on Metal (Phase 3)", node.op))
+            }
+            // CUDA-only mixed-quant decode epilogue; never emitted on the Metal
+            // graph (builder sets qkv_epilogue_ok = false without --features
+            // cuda), so reaching here is a scheduling invariant violation.
+            Op::QkvBiasRopeStore { .. } => {
+                Err(format!("op {:?} unsupported on Metal (CUDA-only)", node.op))
             }
         }
     }
