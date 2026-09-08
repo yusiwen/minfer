@@ -131,6 +131,9 @@ Chapters in §2 follow this table row by row.
 | D3b-1c | output-head dynamic block size (npair 160 → 160-thread blocks, warp-count-bounded `mmvq_block_reduce`) | reverted (patch `/tmp/d3/patch_1c.py`) | 7B @1641 +0.26% (SEP); 14B tg128 +0.04%, @3254 +0.09% | — | — | REVERTED | GB10's 1536-thread/SM limit: 9 blocks×160 live threads ≈ 6×256 allocated (960 live) — the idle-thread win does not exist at 14B shapes |
 | D3b-2 | short-KV combine skip (single-split path for nkv ≤ threshold) | not implemented | — | — | — | ANALYSIS-NEGATIVE | single-split ≠ 32-split partial+combine bitwise for ANY nkv>1 (the merge reorders the float sum — D1's split-count evidence: ndiff 3.6e-3 of outputs, max\|Δ\|~3e-9); the split grid is frozen by CUDA-graph replay capture; the bitwise-safe residual (combine early-out of empty splits — exact +0.0 terms) is ≤ ~15 µs/step, below every bar |
 | D3a | 4-warp fattn-vec-style split-attention rewrite (`gqa_attn_split_partial_h4w`, hd=128: 128 threads, K/V streamed, Q in registers, 8-lane subgroups, 32-row windows/warp, smem LSE merge; grid unchanged, replay-safe) | reverted (patch `/tmp/d3/d3a_kernel_patch.diff`, findings `/tmp/d3/D3A_FINDINGS.md`) | kernel 14B @3254 73.4 → 68.4 µs (−6.9%) but 7B @1641 21.1 → 34.7 µs (+64%); wall 14B @3254 −0.95% (noise), 7B @1641 −3.4% (real), tg128 noise-level | — | — | REVERTED | rows-per-warp pathology: rpw = ceil(ceil(nkv/32)/4) = 26/13/1 at @3254/@1641/tg128 — the 32-row window idles 59–75% of lanes below rpw≈16 and per-block fixed costs amortize over rpw; kernel −6.9% at the best shape is only ~+0.5% wall (attention = 7.4% of the step), under the +1.5% bar and the ±2% A/B noise; numerics fully green (probe ≤1.3e-7 vs CPU, argmax hard-gated, greedy 0/10 diverged) — the session's durable output is the tolerance-gate calibration: end-to-end max|Δlogits| is 0.38/0.39 (14B/7B) for ANY accumulation-order change, so the D3-1 ≤1e-3 logits gate is unsatisfiable; argmax+greedy+A/B are the operative gate set |
+| D3-4 L1 | hybrid rpw dispatch: dual-kernel self-gating split attention (f16 KV, hd==128) — 4-warp h4w kernel when rpw = ceil(ceil(nkv/32)/4) ≥ 16 (nkv ≥ 1921), incumbent 32-thread kernel below; BOTH launch per layer with static grids, each re-reads `positions[0]` per replay, exactly one is live per nkv (nkv-uniform branch → replay-safe) | `22336b2` | 14B @3254 split 72.1 → 62.1 µs (−13.9%) + 1.5 µs dud launch; wall 14B @3254 21.20 → **21.33** (+0.61%, SEP), tg128 22.96 → 22.94, 7B tg128 50.28 → 50.20, @1641 48.78 → 48.68 (guards hold) | **+0.61%** (14B @3254) | 0.944× / 0.877× (14B tg128/@3254 vs llama 24.31/24.32) | **LANDED** | 1-warp path bitwise (7B @1845 dump: all gated files identical; `node{3,5,8}_prefill` diffs = pre-calibrated slot aliasing); h4w tolerance class (max\|Δlogits\| 0.309, argmax identical margin 0.716, 1 greedy flip at the regime entry = 1/256 < 2%, temp-0.8 controls identical); suite 169/0/3 incl. the hd=128/n_ctx-4200 parity shape sweeping the rpw 15/16 boundary; an in-kernel 1-warp-fallback form was REJECTED pre-commit: inside 128-thread blocks the 1-warp body caps at 12 working warps/SM (1536/128) = **+78% kernel at 7B @1641** (35.4 vs 19.8 µs nsys) — geometry, not math |
+| D3-4 L2 | window-level K/V prefetch pipelining in the h4w body (K-pass software pipeline +2 uint4, 4-deep V-bulk ring +8 uint4; issue-point-only → bitwise vs h4w by construction) | reverted (patch `/tmp/d3/patch_l2.py`) | 14B @3254 h4w 62.1 → 66.5 µs (**+7%**) | −7% kernel | — | REVERTED | the kernel is bytes+tail-bound at 79% of the 48.9 µs floor, not chain-bound enough: funding the pipeline buffers needs `__launch_bounds__` minBlocks 8→4 (64→128 regs) → occupancy 32→16 warps/SM and 3.33→4.44 waves — the occupancy/wave-tail tax outweighs the shorter load chains; the D2 4-row-scale lesson (issue-point moves are free) does NOT transplant to window scale under a 64-reg budget |
+| D3-4 findings | pre-existing behaviors calibrated this session: (a) at long prompts (≥2.8K tokens) `MINFER_GRAPH_DUMP` PREFILL-phase files (all `kv*_prefill`, `logits_prefill`, prefill nodes) are non-deterministic pre-vs-pre (wholesale, garbage-magnitude — aliased dump reads); decode-phase dumps stay deterministic; (b) CLI prompts longer than the n_ctx default 4096 leave zero generation headroom (`position N exceeds n_ctx N` panic, graph.rs:367); bench unaffected | measurement-only | — | — | — | RECORDED | dump gates at long prompts must anchor pre-vs-pre at the EXACT shape and gate only decode-phase files; long-prompt CLI greedy needs `prompt + n ≤ 4096` until n_ctx sizing is fixed |
 
 **Footnotes.**
 
@@ -201,6 +204,17 @@ that stand: the tolerance-gate calibration (end-to-end logits drift
 the operative gates) and the 14B @3254 attention bytes-floor gap
 (73.4 µs/layer vs 48.9 µs floor) with window-prefetch pipelining as the
 next lever.
+
+**D3-4 update (2026-09-07):** L1 hybrid rpw dispatch **LANDED** (`22336b2`):
+the f16-KV hd==128 decode split attention now runs BOTH the D3a 4-warp
+fattn-vec-style kernel (rpw ≥ 16, nkv ≥ 1921 — measured 72.1 → 62.1 µs at
+14B @3254, −13.9%) and the incumbent 32-thread kernel (rpw < 16, bitwise),
+each self-gating per replay from `positions[0]` — 14B @3254 wall +0.61% SEP,
+7B guards hold (48.68 @1641 / 50.20 tg128 this window). L2 (window-level K/V
+prefetch) measured +7% kernel (occupancy/wave-tail tax) and was REVERTED.
+Window (interleaved 3× medians): 14B tg128 22.94 / @3254 21.33 vs llama
+24.31/24.32 (0.944×/0.877×); 7B tg128 50.20 / @1641 48.68 vs 49.41
+(1.016×/0.985×). Distance-to-parity and next levers: §2D D3-4.
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1791,6 +1805,86 @@ calibrated gate set above. 14B @3254 attention remains the open KV-scaling
 gap: 73.4 µs/layer vs the 48.9 µs floor; the residual ~20 µs needs
 window-level K/V prefetch pipelining (D2's staging trick at window
 granularity), unattempted.
+
+### D3-4 — L1 hybrid rpw dispatch LANDED + L2 window-prefetch pipelining REVERTED + long-prompt dump calibration (2026-09-07)
+
+Base binary `/tmp/d3/minfer_pre_d34` (sha1 d25f6d84, HEAD 9d5c24f+docs
+a05af20 window). Anchors this window (interleaved 3× medians, pre): 14B
+tg128 23.81→22.96-class (drifts), @3254 21.90→21.20; 7B tg128 50.90→50.28,
+@1641 49.32→48.78 (co-tenant sglang resident; ±2% window drift — every
+judgment is same-window interleaved A/B).
+
+**L1 — dual-kernel self-gating rpw dispatch, LANDED (`22336b2`).** D3a's
+rescue path, with the geometry lesson applied. `rpw = ceil(chunk/4)`,
+`chunk = ceil(nkv/ATTN_SPLITS)`: rpw ≥ 16 (nkv ≥ 1921) → the D3a 4-warp
+fattn-vec-style kernel (`gqa_attn_split_partial_hybrid`, the D3a body
+verbatim, probe-verified ≤1.3e-7 vs CPU in D3a); rpw < 16 → the incumbent
+D2-staged 32-thread kernel (bitwise, via the shared `attn_split_1w_body`
+device function). The first cut put BOTH bodies inside one 128-thread
+kernel — bitwise-green (7B @1845-token dump identical) but the 1-warp body
+in a 128-thread block runs at 12 working warps/SM (1536/128) vs the
+incumbent's 24-32, and 7B @1641 measured **35.4 vs 19.8 µs (+78%, nsys)** —
+block GEOMETRY, not math. Landed form: launch both kernels (static grids →
+CUDA-graph capture/replay unaffected); each reads `positions[0]` and
+exactly one is live per nkv (the branch is nkv-uniform across the grid).
+Cost: one dud launch/layer (~1.3-1.5 µs, measured).
+
+**L1 results.** nsys (NO_CUDA_GRAPH, bench -p 3254/1641 -n 8, mean of last
+384): 14B @3254 split 72.1 → 62.11 µs (−13.9%; D3-1's window: 73.4 → 68.4
+for the pre-hybrid form) + 1.5 µs dud; 7B @1641 incumbent 20.7 µs + 1.3 µs
+dud (min identical to pre → body intact). Wall (interleaved 3× medians):
+14B @3254 21.20 → 21.33 (**+0.61%**, SEP: min-new 21.25 > max-base 21.23);
+14B tg128 22.96 → 22.94 (−0.09%); 7B tg128 50.28 → 50.20 (−0.16%); 7B
+@1641 48.78 → 48.68 (−0.20%; one 44.40 co-tenant outlier in pre).
+Guards: 7B ≥ 49.0 / ≥ 47.9 and 14B tg128 ≥ 22.7 all hold. Gates: 7B
+@1845-token dump bitwise on every gated file (logits prefill+decode, all
+KV, decode nodes — 71/71; the 3 `node{3,5,8}_prefill` diffs are the
+documented slot-aliasing trio, reproduced pre-vs-pre); 7B @2800 h4w
+tolerance class — max|Δlogits| 0.309 (the calibrated 0.39-class), argmax
+identical at margin 0.716 (HARD gate), upper-layer KV f16-noise pattern
+(kv0-7 bitwise, kv8-27 decode-side drift); greedy −n 256 × 5 seeds × both
+models on h4w-regime prompts: exactly one divergence each at the regime
+entry (1/256 = 0.4% < 2%), coherent continuation (no repetition
+degeneracy), temp 0.8 seed-7 sampled controls identical; suite 169/0/3
+with the parity test extended by an hd=128/n_ctx-4200 shape whose pos0
+sweep crosses the rpw 15/16 dispatch boundary (nkv 1920/1921).
+
+**L2 — window-level K/V prefetch pipelining in the h4w body, REVERTED.**
+The brief's main-lever hypothesis: 62.1 µs is 79% of the 48.9 µs bytes
+floor and the K phase serializes 8 load→reduce passes per 32-row window
+(the V phase 7 load→FMA passes), so issue-point-only pipelining (D2's
+bitwise class) should close toward the floor. Built (`patch_l2.py`): K-pass
+software pipeline (+2 uint4/thread) + 4-deep V-bulk ring (+8 uint4),
+`__launch_bounds__` minBlocks 8→4 to fund the registers (64→128 cap).
+Measured: h4w 62.1 → **66.46 µs (+7%)** — the occupancy halving (32→16
+warps/SM) and wave growth (1280 blocks: 3.33 → 4.44 waves) cost more than
+the shorter chains recover. Read: at 131 KB/SM of loads already in flight
+(≈30× the latency-BW product), the kernel is bytes+tail-bound; the
+remaining 21% over the floor is L2 5×-re-read composition + wave tail, not
+per-warp chain depth. The D2 lesson holds only where registers are free —
+at a 64-reg budget any pipeline funding trades occupancy 1:2. Bitwise gate
+was never reached (no point — regressed before gating).
+
+**Distance to parity (post-D3-4, 14B @3254, this window).** minfer 21.33
+t/s = 46.88 ms/step vs llama 24.32 = 41.12 ms → **−5.76 ms needed (−12.3%)**.
+Known-lever inventory: attention residual (62.1 − 48.9) × 48 = 0.63 ms;
+the three D3-1 MMVQ stragglers (attn_v-q6K 0.28 + ffn_down-q6K 0.49 +
+output-head 0.44) = 1.21 ms; D3c elementwise fusion ≈ 1.0 ms (projected
++2.1% wall, not implemented this session). Sum ≈ 2.84 ms = 49% of the gap
+→ ~22.6 t/s (0.93×) if ALL landed. The remaining ~2.9 ms is the matmul
+aggregate (D3-1's wall-effective 194.9 vs llama 207.6 GB/s, which its
+implied per-kernel BWs exceed) + launch-structure slack — decode-GEMM
+levers beyond the D3 list. 7B: tg128 1.016× (ahead), @1641 0.985× — the
+7B decode campaign is effectively closed.
+
+**Follow-ups.** (1) L3 attn_v-q6K → MMVQ q8-activation routing — NOT
+bitwise-able, needs exactly the calibrated gate set (argmax hard gate +
+greedy + suite + A/B); D3-1 estimate +0.28 ms/step ≈ +0.6% 14B wall;
+skipped here on time. (2) D3c elementwise fusion (rms+quantize, quantize
+into MMVQ prologue) ≈ +2.1% at all lengths — the largest single remaining
+KNOWN lever. (3) The 14B attention residual needs a bytes-side lever (GQA
+q-head batching to cut the 5× L1/L2 re-read), not more pipelining.
+(4) Long-prompt CLI n_ctx headroom fix (pre-existing).
 
 ## §3 Appendices
 
