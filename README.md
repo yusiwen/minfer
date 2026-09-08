@@ -120,19 +120,21 @@ biases.
 
 ## Performance
 
-**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-06):**
+**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-08):**
 
-| Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Decode @1.6K KV | Device mem |
+| Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Decode @long KV | Device mem |
 |-------|------------------|--------------|----------------|-----------------|------------|
-| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | **49.4 tok/s** (parity, −0.8%) | **48.2 tok/s** (−2.4%) | ~9.5 GB |
+| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | **~51.0 tok/s** (**1.032×**) | **49.5 tok/s** @1.6K (**1.002×**) | ~9.5 GB |
+| Qwen2.5-14B-Instruct Q4_K_M | **~1810 tok/s** | **1.072×** (llama-bench 1690, same shape) | **24.6 tok/s** (**1.010×**) | 22.4 tok/s @3.3K (0.921×) | ~12.0 GB |
 
 The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
 8.1× over the 441 tok/s where the path started, with every optimization step
-(measurement, gates and commit) documented in the 75-step history table of
+(measurement, gates and commit) documented in the history table of
 **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
-Decode runs the dp4a MMVQ + split-KV attention kernels at weight-bandwidth
-parity with llama.cpp at short context; the split-attention staging fix (D2)
-keeps long-context decode within 2.4% (campaign §2D).
+Decode runs the dp4a MMVQ + split-KV attention + fused-QKV kernels: short-context
+decode is **ahead of llama.cpp** on both models (the fused-producer A-quantize,
+hybrid split-attention dispatch and fused-QKV epilogue of the D-series campaign,
+§2D); the remaining gap is long-context decode on 14B (weight-streaming bound).
 `MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
 `MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
 
