@@ -117,6 +117,7 @@ impl Qwen2Graph {
                 // persistent regions via the fused store — read them back.
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);
                 (qkv, kv)
+
             } else {
                 let q = b.matmul(normed, l.wq.as_ref().unwrap(), l.bq.as_ref());
                 let k = b.matmul(normed, l.wk.as_ref().unwrap(), l.bk.as_ref());
@@ -248,7 +249,18 @@ impl Qwen2Graph {
         {
             crate::metal::concat_rows(&[wq, wk, wv]).is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        // D3-8: CUDA arm — metadata-only probe (concat_rows_feasible mirrors
+        // concat_rows' preconditions exactly; the loader performs the real
+        // concatenation once at model load and registers blk.{i}.attn_qkv,
+        // so both sides agree with the Metal pattern).
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        {
+            crate::cuda::concat_rows_feasible(&[wq, wk, wv])
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            all(feature = "cuda", not(target_os = "macos"))
+        )))]
         {
             let _ = (wq, wk, wv);
             false
@@ -405,8 +417,13 @@ impl Qwen2Graph {
                 // G5 (FFN gate+up) is decoupled from the QKV fusion gate
                 // (mirrors Qwen3) so A/B-ing one fusion does not flip the
                 // other; 7e⑤ extends it to the CUDA backend.
+                // D3-8: CUDA joins the decode QKV fusion (G4 CUDA port) —
+                // the backend claims Op::FusedQKV in supports_op and the
+                // loader registers blk.{i}.attn_qkv; qkv_concat_available
+                // probes the concat feasibility per backend (same shape as
+                // the fuse_ffn gate below).
                 fuse_qkv: nt == 1
-                    && metal_on
+                    && (metal_on || cuda_on)
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)

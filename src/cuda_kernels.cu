@@ -2375,6 +2375,98 @@ __global__ void store_kv_f16(
     }
 }
 
+// ─── Fused decode QKV epilogue: bias-add + RoPE + KV-store (nt==1) ───
+// D3-8: CUDA port of Metal's kernel_attn_bias_rope_store (G4 FusedQKV). One
+// kernel replaces the 7-launch unfused chain (add_bias×3 + rope×2 +
+// store_kv×2). q/k/v are POINTER-FORM section bases so one kernel serves
+// both decode-QKV layer classes: the concat class (wq|wk|wv same ttype)
+// points them INTO the concat matmul output (q=base, k=base+nqt,
+// v=base+2*nkt) and the mixed-quant class (e.g. Q6_K attn_v, no concat
+// matmul) points them at the three separate matmul outputs. Applies the
+// per-section bias, RoPEs q and k IN PLACE, and stores k/v into the
+// persistent KV regions. The rope math is VERBATIM rope_f32 (NEOX pairing
+// (j, j+half), same freq/theta expression and cosf/sinf — bitwise-identical
+// per-element results), the bias add is verbatim add_bias_f32 (same two
+// operands, one add), and the store addresses/conversions are verbatim
+// store_kv_f32 / store_kv_f16 (dst[pos * nkt + j]; __float2half is RN, the
+// same conversion the unfused f16 store's scalar tail uses) — bit-identical
+// outputs, fewer launches. Thread mapping (Metal's): one thread per
+// (head, d < hd/2) rope pair for q and k, one thread per v element →
+// grid = nqt/2 + nkt/2 + nkt. positions[0] is read device-side (nt==1; no
+// host scalar crosses the launch — CUDA Graph capture/replay safe).
+__global__ void attn_bias_rope_store_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v,
+    float* __restrict__ kv_k,
+    float* __restrict__ kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions,
+    int kv_is_f16
+) {
+    const int half_dim = hd / 2;
+    const int qpairs = nqt / 2;
+    const int kpairs = nkt / 2;
+    const int total = qpairs + kpairs + nkt;
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= total) return;
+    const int pos = positions[0];
+
+    if (u < qpairs) {
+        // q section: bias + rope in place (attention reads q at offset 0)
+        const int head = u / half_dim;
+        const int d    = u % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        float x0 = q[j]  + bias_q[j];
+        float x1 = q[j2] + bias_q[j2];
+        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
+        float theta = pos * freq;
+        float cs = cosf(theta), sn = sinf(theta);
+        q[j]  = x0 * cs - x1 * sn;
+        q[j2] = x0 * sn + x1 * cs;
+    } else if (u < qpairs + kpairs) {
+        // k section: bias + rope in place + store into the K region
+        const int u2   = u - qpairs;
+        const int head = u2 / half_dim;
+        const int d    = u2 % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        float x0 = k[j]  + bias_k[j];
+        float x1 = k[j2] + bias_k[j2];
+        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
+        float theta = pos * freq;
+        float cs = cosf(theta), sn = sinf(theta);
+        const float r0 = x0 * cs - x1 * sn;
+        const float r1 = x0 * sn + x1 * cs;
+        k[j]  = r0;
+        k[j2] = r1;
+        if (kv_is_f16) {
+            ((__half*)kv_k)[(size_t)pos * nkt + j]  = __float2half(r0);
+            ((__half*)kv_k)[(size_t)pos * nkt + j2] = __float2half(r1);
+        } else {
+            kv_k[(size_t)pos * nkt + j]  = r0;
+            kv_k[(size_t)pos * nkt + j2] = r1;
+        }
+    } else {
+        // v section: bias + store into the V region
+        const int j = u - qpairs - kpairs;
+        const float val = v[j] + bias_v[j];
+        v[j] = val;
+        if (kv_is_f16) {
+            ((__half*)kv_v)[(size_t)pos * nkt + j] = __float2half(val);
+        } else {
+            kv_v[(size_t)pos * nkt + j] = val;
+        }
+    }
+}
+
 // helper: convert a half4 (hd is a multiple of 4) to float4
 __device__ __forceinline__ float4 h4_to_f4(const __half* p) {
     float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
@@ -3512,6 +3604,27 @@ void launch_store_kv_f16(
     dim3 block(128, 1, 1);
     dim3 grid(nt, (nkt / 4 + 127) / 128, 1);
     store_kv_f16<<<grid, block, 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
+}
+
+// D3-8: fused decode QKV epilogue launcher — 256-thread blocks over the
+// flat (nqt/2 + nkt/2 + nkt) thread mapping (Metal's dispatch_1d shape).
+void launch_attn_bias_rope_store(
+    float* q, float* k, float* v,
+    const void* bias_q, const void* bias_k, const void* bias_v,
+    void* kv_k, void* kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions, int kv_is_f16,
+    cudaStream_t stream
+) {
+    const int total = nqt / 2 + nkt / 2 + nkt;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    attn_bias_rope_store_f32<<<grid, block, 0, stream>>>(
+        q, k, v,
+        (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
+        (float*)kv_k, (float*)kv_v,
+        nqt, nkt, hd, freq_base, freq_scale, positions, kv_is_f16);
 }
 
 void launch_gqa_attn_f32_f16kv(

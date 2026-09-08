@@ -396,6 +396,34 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
                 }
             }
         }
+        // D3-8: Fused QKV projection (nt==1 decode) — CUDA registration
+        // (mirror of the Metal block above; 7e⑤ ffn_gu pattern). The concat
+        // rows go through register_weight (block-quant types) or the padded
+        // repack (Q6_K: 210→224-byte slots), matching what
+        // matmul_f32_ptr_layout dispatches on via is_weight_padded. Gated on
+        // MINFER_NO_FUSE_QKV like the build-side decision (the A/B control
+        // then also skips the ~0.9 GiB of concat weights at 14B).
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = crate::cuda::CudaState::get() {
+            if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
+                let fuse = !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+                if fuse {
+                    if let Some(data) = crate::cuda::concat_rows(&[wq, wk, wv]) {
+                        let name = format!("blk.{i}.attn_qkv");
+                        if wq.ttype == crate::tensor::TensorType::Q6_K {
+                            cuda.register_weight_q6k_padded(
+                                &name,
+                                &data,
+                                (wq.shape[1] + wk.shape[1] + wv.shape[1]) as usize,
+                                wq.shape[0] as usize,
+                            );
+                        } else {
+                            cuda.register_weight(&name, &data);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ti) = tensor_map.get(&tn::attn_v_bias(i)) {
             layer.bv = Some(load_ti(ti));
         }
