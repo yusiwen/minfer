@@ -4522,115 +4522,135 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
-        let (nh, nk_h, hd) = (4usize, 2usize, 8usize);
-        let nkt = nk_h * hd;
-        // n_ctx sized so pos0 can sweep the ATTN_SPLITS=32 chunk boundaries:
-        // full splits, a partially-filled split, and trailing idle splits
+        // D3-4 L1: shape 2 (hd=128) drives the hybrid kernel on the
+        // kv_f16=true arm — n_ctx 4200 covers the runtime rpw dispatch
+        // boundary (nkv 1920 -> rpw 15 -> 1-warp body; nkv 1921 -> rpw 16 ->
+        // 4-warp body), full 32-row windows and chunk boundaries; shape 1
+        // (hd=8) keeps covering the plain 1-warp kernel. n_ctx of shape 1 is
+        // sized so pos0 can sweep the ATTN_SPLITS=32 chunk boundaries: full
+        // splits, a partially-filled split, and trailing idle splits
         // (mx=-INF/S=0 partials) all get exercised (nkv = pos0 + 1).
-        let n_ctx = 208usize;
-        let scale = 1.0 / (hd as f32).sqrt();
+        for (nh, nk_h, hd, n_ctx, pos0s) in [
+            (
+                4usize,
+                2usize,
+                8usize,
+                208usize,
+                [2usize, 32, 62, 63, 64, 126, 127, 128, 190, 206, 207],
+            ),
+            (
+                4usize,
+                2usize,
+                128usize,
+                4200usize,
+                [2usize, 32, 63, 64, 127, 128, 1023, 1919, 1920, 4094, 4095],
+            ),
+        ] {
+            let nkt = nk_h * hd;
+            let scale = 1.0 / (hd as f32).sqrt();
 
-        for kv_f16 in [false, true] {
-            for pos0 in [2usize, 32, 62, 63, 64, 126, 127, 128, 190, 206] {
-                let nkv = pos0 + 1;
-                cb.set_kv_f16_for_test(kv_f16);
-                let mut b = GraphBuilder::new();
-                let q = b.input("q", [nh * hd, 1, 1, 1], DType::F32);
-                let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
-                let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
-                let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
-                let store = b.kvcache_store(0, k, v, pp, n_ctx);
-                let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
-                let at = b.attn(
-                    q,
-                    load,
-                    pp,
-                    AttnMode::Gqa,
-                    AttnMeta {
-                        layer: 0,
-                        n_head: nh,
-                        n_head_kv: nk_h,
-                        hd,
-                        hd_kv: hd,
-                        nkt,
-                        scale,
-                    },
-                );
-                b.output(at);
-                let g = b.build();
+            for kv_f16 in [false, true] {
+                for pos0 in pos0s {
+                    let nkv = pos0 + 1;
+                    cb.set_kv_f16_for_test(kv_f16);
+                    let mut b = GraphBuilder::new();
+                    let q = b.input("q", [nh * hd, 1, 1, 1], DType::F32);
+                    let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
+                    let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
+                    let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
+                    let store = b.kvcache_store(0, k, v, pp, n_ctx);
+                    let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+                    let at = b.attn(
+                        q,
+                        load,
+                        pp,
+                        AttnMode::Gqa,
+                        AttnMeta {
+                            layer: 0,
+                            n_head: nh,
+                            n_head_kv: nk_h,
+                            hd,
+                            hd_kv: hd,
+                            nkt,
+                            scale,
+                        },
+                    );
+                    b.output(at);
+                    let g = b.build();
 
-                let (xb_q, xb_k, xb_v) = (
-                    cb.alloc_buffer(nh * hd),
-                    cb.alloc_buffer(nkt),
-                    cb.alloc_buffer(nkt),
-                );
-                let xb_p = cb.alloc_buffer(1);
-                let ob_at = cb.alloc_buffer(nh * hd);
-                let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
+                    let (xb_q, xb_k, xb_v) = (
+                        cb.alloc_buffer(nh * hd),
+                        cb.alloc_buffer(nkt),
+                        cb.alloc_buffer(nkt),
+                    );
+                    let xb_p = cb.alloc_buffer(1);
+                    let ob_at = cb.alloc_buffer(nh * hd);
+                    let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
 
-                let qs: Vec<f32> = (0..nh * hd)
-                    .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
-                    .collect();
-                let ks: Vec<f32> = (0..nkt)
-                    .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
-                    .collect();
-                let vs: Vec<f32> = (0..nkt)
-                    .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
-                    .collect();
-                let pb = vec![f32::from_bits(pos0 as u32)];
-                let to_half = |x: &[f32]| -> Vec<f32> {
-                    x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
-                };
-                let (ks_r, vs_r) = if kv_f16 {
-                    (to_half(&ks), to_half(&vs))
-                } else {
-                    (ks.clone(), vs.clone())
-                };
-                cb.write_host(xb_q, &qs).unwrap();
-                cb.write_host(xb_k, &ks).unwrap();
-                cb.write_host(xb_v, &vs).unwrap();
-                cb.write_host(xb_p, &pb).unwrap();
-                cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
-                cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
+                    let qs: Vec<f32> = (0..nh * hd)
+                        .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+                        .collect();
+                    let ks: Vec<f32> = (0..nkt)
+                        .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+                        .collect();
+                    let vs: Vec<f32> = (0..nkt)
+                        .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                        .collect();
+                    let pb = vec![f32::from_bits(pos0 as u32)];
+                    let to_half = |x: &[f32]| -> Vec<f32> {
+                        x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+                    };
+                    let (ks_r, vs_r) = if kv_f16 {
+                        (to_half(&ks), to_half(&vs))
+                    } else {
+                        (ks.clone(), vs.clone())
+                    };
+                    cb.write_host(xb_q, &qs).unwrap();
+                    cb.write_host(xb_k, &ks).unwrap();
+                    cb.write_host(xb_v, &vs).unwrap();
+                    cb.write_host(xb_p, &pb).unwrap();
+                    cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
+                    cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-                cb.execute_node(
-                    &g.nodes[store],
-                    &[xb_k, xb_v, xb_p],
-                    kreg,
-                    Some((kreg, vreg)),
-                )
-                .unwrap();
-                cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+                    cb.execute_node(
+                        &g.nodes[store],
+                        &[xb_k, xb_v, xb_p],
+                        kreg,
+                        Some((kreg, vreg)),
+                    )
                     .unwrap();
+                    cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+                        .unwrap();
 
-                let mut kfull = vec![0f32; nkt * n_ctx];
-                let mut vfull = vec![0f32; nkt * n_ctx];
-                kfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&ks_r);
-                vfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&vs_r);
-                let mut aref = vec![0f32; nh * hd];
-                crate::graph::cpu_backend::cpu_gqa_attn(
-                    &qs,
-                    &kfull,
-                    &vfull,
-                    &[pos0],
-                    1,
-                    nkv,
-                    nh,
-                    nk_h,
-                    hd,
-                    hd,
-                    nkt,
-                    &mut aref,
-                    scale,
-                )
-                .unwrap();
-                let agot = cb.copy_to_host(ob_at).unwrap();
-                assert_close(
-                    &format!("attn_split(f16kv={kv_f16}, nkv={nkv})"),
-                    &agot,
-                    &aref,
-                    1e-4,
-                );
+                    let mut kfull = vec![0f32; nkt * n_ctx];
+                    let mut vfull = vec![0f32; nkt * n_ctx];
+                    kfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&ks_r);
+                    vfull[pos0 * nkt..(pos0 + 1) * nkt].copy_from_slice(&vs_r);
+                    let mut aref = vec![0f32; nh * hd];
+                    crate::graph::cpu_backend::cpu_gqa_attn(
+                        &qs,
+                        &kfull,
+                        &vfull,
+                        &[pos0],
+                        1,
+                        nkv,
+                        nh,
+                        nk_h,
+                        hd,
+                        hd,
+                        nkt,
+                        &mut aref,
+                        scale,
+                    )
+                    .unwrap();
+                    let agot = cb.copy_to_host(ob_at).unwrap();
+                    assert_close(
+                        &format!("attn_split(f16kv={kv_f16}, nkv={nkv})"),
+                        &agot,
+                        &aref,
+                        1e-4,
+                    );
+                }
             }
         }
     }

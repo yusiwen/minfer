@@ -2420,24 +2420,24 @@ __device__ __forceinline__ float4 kv_ld4<__half>(const __half* p) {
     return make_float4(x.x, x.y, y.x, y.y);
 }
 
+// D3-4 L1: the incumbent D2-staged 1-warp body, refactored into a device
+// function so the incumbent kernel and the hybrid dispatch (below) share ONE
+// source. The math is byte-identical to the pre-refactor kernel (same rows,
+// same order, same per-row ops; only the index setup moved to the callers).
 template <typename KV>
-__global__ void gqa_attn_split_partial(
+__device__ __forceinline__ void attn_split_1w_body(
     const float* __restrict__ q,
     const KV* __restrict__ k,
     const KV* __restrict__ v,
     float* __restrict__ partial,
-    const int* positions,
-    int nh, int nk, int hd, float scale, int pstr
+    int nkv, int sp, int h,
+    int nh, int nk, int hd, float scale, int pstr, int lane_id
 ) {
     const int SPLITS = ATTN_SPLITS;
-    int sp = blockIdx.x;
-    int h = blockIdx.y;
-    int nkv = positions[0] + 1;
     int chunk = (nkv + SPLITS - 1) / SPLITS;
     int lo = sp * chunk;
     int hi = min(nkv, lo + chunk);
 
-    int lane_id = threadIdx.x;
     int gqa = nh / nk;
     int hk = h / gqa;
     int stride_kv = nk * hd;
@@ -2507,6 +2507,32 @@ __global__ void gqa_attn_split_partial(
     }
 }
 
+template <typename KV>
+__global__ void gqa_attn_split_partial(
+    const float* __restrict__ q,
+    const KV* __restrict__ k,
+    const KV* __restrict__ v,
+    float* __restrict__ partial,
+    const int* positions,
+    int nh, int nk, int hd, float scale, int pstr,
+    int rpw_gate
+) {
+    // D3-4 L1 dual-kernel dispatch: when rpw_gate > 0 and the 4-warp kernel
+    // owns this nkv (rpw >= rpw_gate), exit before touching anything — the
+    // hybrid kernel writes the partial. The branch is nkv-uniform across the
+    // whole grid (positions[0] is launch-wide), so this stays replay-safe,
+    // and for every nkv the incumbent path takes, the arithmetic in the body
+    // is unchanged (bitwise; dump-memcmp gated).
+    if (rpw_gate > 0) {
+        const int nkv0 = positions[0] + 1;
+        const int chunk0 = (nkv0 + ATTN_SPLITS - 1) / ATTN_SPLITS;
+        if (((chunk0 + 3) >> 2) >= rpw_gate) return;
+    }
+    attn_split_1w_body<KV>(q, k, v, partial, positions[0] + 1,
+                           blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
+                           threadIdx.x);
+}
+
 __global__ void gqa_attn_split_combine(
     const float* __restrict__ partial,
     float* __restrict__ o,
@@ -2526,6 +2552,240 @@ __global__ void gqa_attn_split_combine(
         acc += p[4 + i] * w;
     }
     o[h * hd + i] = (S > 0.0f) ? acc / S : 0.0f;
+}
+
+// ─── D3-4 L1: hybrid rpw dispatch for hd==128 f16-KV decode split attention ───
+// D3a (reverted) built the llama fattn-vec-style 4-warp kernel and measured
+// the rows-per-warp pathology: rpw = ceil(ceil(nkv/32)/4) = 26 / 13 / 1 at
+// 14B @3254 / 7B @1641 / tg128 — the 32-row window idles 59-75% of lanes
+// below rpw≈16 (+64% kernel at 7B @1641) while it wins at rpw=26 (73.4 →
+// 62.1 µs/layer in-situ nsys, −13.9%). Dispatch (D3-4 L1, dual-kernel
+// self-gating — see the f16kv launcher): BOTH kernels launch for hd==128 and
+// each re-reads positions[0] per replay; exactly one is live per nkv:
+//
+//   rpw >= H4W_MIN_RPW (16, i.e. nkv >= 1921): this 4-warp fattn-vec-style
+//   body (D3a code, probe-verified ≤1.3e-7 vs CPU; tolerance-gated class).
+//   rpw <  16: the incumbent 32-thread D2-staged kernel (bitwise incumbent
+//   arithmetic via the shared attn_split_1w_body device function; it
+//   early-exits when this kernel owns the nkv).
+//
+// Running the 1-warp body inside 128-thread blocks was measured +78% kernel
+// at 7B @1641 (35.4 vs 19.8 µs) — a 128-thread block caps the SM at 12
+// working warps (1536/128) vs the incumbent's 24-32 — hence the dual-kernel
+// form. The branch is nkv-uniform and grid/block nkv-independent, so
+// CUDA-graph capture/replay is unaffected and per-nkv output stays
+// deterministic. D3a numerics record: docs/CUDA_OPTIMIZATION.md §2D D3a +
+// /tmp/d3/D3A_FINDINGS.md (kernel-level parity ≤1.3e-7, argmax hard gate,
+// greedy 0/10 diverged).
+
+#define H4W_NTHREADS 128 // 4 warps per block
+#define H4W_MIN_RPW 16   // 4-warp body only when rows/warp amortize the window
+
+// 8 halves (one uint4) vs two float4 Q slices -> 8-dim partial dot
+__device__ __forceinline__ float h4w_dot8(const uint4 ka, const float4 q0, const float4 q1) {
+    const __half2* h = reinterpret_cast<const __half2*>(&ka);
+    float2 a = __half22float2(h[0]);
+    float2 b = __half22float2(h[1]);
+    float2 c = __half22float2(h[2]);
+    float2 d = __half22float2(h[3]);
+    return q0.x * a.x + q0.y * a.y + q0.z * b.x + q0.w * b.y
+         + q1.x * c.x + q1.y * c.y + q1.z * d.x + q1.w * d.y;
+}
+
+// 8-lane subgroup sum (butterfly inside 8-lane segments)
+__device__ __forceinline__ float h4w_subgroup_sum8(float v) {
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, off, 8);
+    return v;
+}
+
+// uint4 of 8 halves -> two float4
+__device__ __forceinline__ void h4w_h8_to_f8(const uint4 u, float4& f0, float4& f1) {
+    const __half2* h = reinterpret_cast<const __half2*>(&u);
+    float2 a = __half22float2(h[0]);
+    float2 b = __half22float2(h[1]);
+    float2 c = __half22float2(h[2]);
+    float2 d = __half22float2(h[3]);
+    f0 = make_float4(a.x, a.y, b.x, b.y);
+    f1 = make_float4(c.x, c.y, d.x, d.y);
+}
+
+__device__ __forceinline__ void attn_split_h4w_body(
+    const float* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    float* __restrict__ partial,
+    int nkv, int sp, int h,
+    int nh, int nk, int hd, float scale, int pstr
+) {
+    const int gqa = nh / nk;
+    const int hk = h / gqa;
+    const size_t stride_kv = (size_t)nk * hd;
+
+    const int lane = threadIdx.x & 31;
+    const int w = threadIdx.x >> 5;  // warp id
+    const int t = lane & 7;          // 16-dim slice (hd=128 -> 8 slices)
+    const int g = lane >> 3;         // row slot within a 4-row pass
+
+    // Same device-side range split as the 1-warp kernel (identical [sp] rows,
+    // so the combine sees the same split partitioning).
+    const int chunk = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
+    const int lo = sp * chunk;
+    const int hi = min(nkv, lo + chunk);
+    // Balanced contiguous stripes: warp w owns rows [lo + w*rpw, +rpw).
+    const int rpw = (chunk + 3) >> 2;
+    const int wlo = lo + w * rpw;
+    const int wend = min(hi, wlo + rpw);
+
+    // Q slice dims [16t, 16t+16): replicated across the 4 subgroups of the
+    // warp (llama keeps the same per-thread Q copy per subgroup).
+    const float4* qp = reinterpret_cast<const float4*>(q + (size_t)h * hd + 16 * t);
+    const float4 qc0 = qp[0], qc1 = qp[1], qc2 = qp[2], qc3 = qp[3];
+
+    // Finite mx base: exp(-INF - base) == 0 exactly, and exp(base - base) == 1
+    // for idle warps — no NaN paths anywhere (the old kernel reached the same
+    // states by skipping its loop; here empty stripes keep the base).
+    float mx = -1e38f;
+    float S = 0.0f;
+    float4 oc0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 oc1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 oc2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 oc3 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    __shared__ float probs[H4W_NTHREADS]; // per-warp 32-float prob stage
+    float* pw = probs + w * 32;
+
+    for (int b = wlo; b < wend; b += 32) {
+        const int wl = min(32, wend - b); // rows in this window (warp-uniform)
+        float kq = -INFINITY;             // this lane's row score
+        float mx_new = mx;
+        const int np = min(8, wl);
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            if (p >= np) break;
+            const int row = b + g * 8 + p;
+            float d = 0.0f;
+            if (row < wend) {
+                const __half* krow = k + row * stride_kv + hk * hd + 16 * t;
+                const uint4 ka = *reinterpret_cast<const uint4*>(krow);
+                const uint4 kb = *reinterpret_cast<const uint4*>(krow + 8);
+                d = h4w_dot8(ka, qc0, qc1) + h4w_dot8(kb, qc2, qc3);
+            }
+            // The subgroup reduce runs for ALL lanes: a shfl_sync with the full
+            // mask deadlocks when subgroups diverge on row validity (found by
+            // the standalone probe at nkv=3), so the guard selects the score
+            // AFTER the reduction.
+            float s = h4w_subgroup_sum8(d) * scale;
+            if (row >= wend) s = -INFINITY;
+            mx_new = fmaxf(mx_new, s);
+            if (t == p) kq = s; // lane (g,t) keeps subgroup g's row (g,p)
+        }
+        // Cross-subgroup window max (llama: offsets nthreads_KQ..WARP_SIZE).
+        #pragma unroll
+        for (int off = 8; off < 32; off <<= 1)
+            mx_new = fmaxf(mx_new, __shfl_xor_sync(0xFFFFFFFFu, mx_new, off));
+        const float wsc = expf(mx - mx_new); // one rescale per 32-row window
+        mx = mx_new;
+        kq = expf(kq - mx); // invalid rows: kq=-INF -> exact 0
+        S = S * wsc + kq;
+        oc0.x *= wsc; oc0.y *= wsc; oc0.z *= wsc; oc0.w *= wsc;
+        oc1.x *= wsc; oc1.y *= wsc; oc1.z *= wsc; oc1.w *= wsc;
+        oc2.x *= wsc; oc2.y *= wsc; oc2.z *= wsc; oc2.w *= wsc;
+        oc3.x *= wsc; oc3.y *= wsc; oc3.z *= wsc; oc3.w *= wsc;
+        __syncwarp();                    // previous window's prob reads done
+        pw[lane] = kq;                   // prob of row b + g*8 + t
+        __syncwarp();
+        // V accumulation: 8 passes of 4 rows, subgroup g on row b+4p+g; every
+        // lane multiplies its 16-dim slice (4 redundant copies per warp,
+        // summed in the epilogue). Loads are predicated off for rows past the
+        // window end — their staged prob is 0 AND the KV bytes behind them are
+        // never written, so both the load and the FMA must be masked.
+        const int nvp = min(8, (wl + 3) >> 2);
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            if (p >= nvp) break;
+            const int row = b + 4 * p + g;
+            const float pr = pw[4 * p + g];
+            float4 v0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float4 v1 = v0, v2 = v0, v3 = v0;
+            if (row < wend) {
+                const __half* vrow = v + row * stride_kv + hk * hd + 16 * t;
+                h4w_h8_to_f8(*reinterpret_cast<const uint4*>(vrow), v0, v1);
+                h4w_h8_to_f8(*reinterpret_cast<const uint4*>(vrow + 8), v2, v3);
+            }
+            oc0.x += pr * v0.x; oc0.y += pr * v0.y; oc0.z += pr * v0.z; oc0.w += pr * v0.w;
+            oc1.x += pr * v1.x; oc1.y += pr * v1.y; oc1.z += pr * v1.z; oc1.w += pr * v1.w;
+            oc2.x += pr * v2.x; oc2.y += pr * v2.y; oc2.z += pr * v2.z; oc2.w += pr * v2.w;
+            oc3.x += pr * v3.x; oc3.y += pr * v3.y; oc3.z += pr * v3.z; oc3.w += pr * v3.w;
+        }
+    }
+
+    // ── block epilogue: LSE-merge the 4 warp states, write ONE partial ──
+    // (w,g) copy of dim d lands at vkq_s[w*512 + g*128 + d]: lane (g,t) stores
+    // dims [16t,+16) at offset w*512 + g*128 + 16t, so the final per-dim sum
+    // is a stride-128 walk — bank-conflict-free across threads.
+    __shared__ __align__(16) float vkq_s[4 * 512];
+    __shared__ float mx_sh[4];
+    __shared__ float s_sh[4];
+    float Sw = warp_reduce_sum(S);
+    if (lane == 0) {
+        mx_sh[w] = mx;
+        s_sh[w] = Sw;
+    }
+    __syncthreads();
+    const float gmax = fmaxf(fmaxf(mx_sh[0], mx_sh[1]), fmaxf(mx_sh[2], mx_sh[3]));
+    const float wsc = expf(mx - gmax); // idle warp: exp(-1e38 - gmax) == 0
+    oc0.x *= wsc; oc0.y *= wsc; oc0.z *= wsc; oc0.w *= wsc;
+    oc1.x *= wsc; oc1.y *= wsc; oc1.z *= wsc; oc1.w *= wsc;
+    oc2.x *= wsc; oc2.y *= wsc; oc2.z *= wsc; oc2.w *= wsc;
+    oc3.x *= wsc; oc3.y *= wsc; oc3.z *= wsc; oc3.w *= wsc;
+    float* vs = vkq_s + (w * 512 + g * 128 + 16 * t);
+    reinterpret_cast<float4*>(vs)[0] = oc0;
+    reinterpret_cast<float4*>(vs)[1] = oc1;
+    reinterpret_cast<float4*>(vs)[2] = oc2;
+    reinterpret_cast<float4*>(vs)[3] = oc3;
+    __syncthreads();
+    float* dst = partial + ((size_t)sp * nh + h) * pstr;
+    const int tid = threadIdx.x;
+    if (tid < hd) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int w2 = 0; w2 < 4; w2++)
+            #pragma unroll
+            for (int g2 = 0; g2 < 4; g2++)
+                acc += vkq_s[w2 * 512 + g2 * 128 + tid];
+        dst[4 + tid] = acc;
+    }
+    if (tid == 0) {
+        float st = 0.0f;
+        #pragma unroll
+        for (int w2 = 0; w2 < 4; w2++)
+            st += s_sh[w2] * expf(mx_sh[w2] - gmax);
+        dst[0] = gmax;
+        dst[1] = st;
+    }
+}
+
+// D3-4 L1: 4-warp fattn-vec-style body in its own kernel; live only when
+// rpw >= H4W_MIN_RPW (the incumbent 32-thread kernel owns smaller rpw — see
+// the f16kv launcher for the dual-kernel dispatch rationale). All-exit
+// otherwise; the branch is nkv-uniform (positions[0] is launch-wide), so
+// CUDA-graph capture/replay stays correct and per-nkv output is deterministic.
+__global__ void __launch_bounds__(H4W_NTHREADS, 8)
+gqa_attn_split_partial_hybrid(
+    const float* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    float* __restrict__ partial,
+    const int* positions,
+    int nh, int nk, int hd, float scale, int pstr
+) {
+    const int nkv = positions[0] + 1;
+    const int chunk = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
+    if (((chunk + 3) >> 2) < H4W_MIN_RPW) return;
+    attn_split_h4w_body(q, k, v, partial, nkv, blockIdx.x, blockIdx.y,
+                        nh, nk, hd, scale, pstr);
 }
 
 __global__ void gqa_attn_f32(
@@ -3112,10 +3372,34 @@ void launch_gqa_attn_split_f16kv(
     int n_head, int n_head_kv, int hd,
     float scale, int pstr, cudaStream_t stream
 ) {
-    gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
-        q, (const __half*)k, (const __half*)v, partial, positions,
-        n_head, n_head_kv, hd, scale, pstr
-    );
+    // D3-4 L1: hd == 128 (Qwen2.5/Qwen3 decode shapes) dual-kernel
+    // self-gating dispatch on rpw = ceil(ceil(nkv/ATTN_SPLITS)/4):
+    // rpw >= H4W_MIN_RPW (nkv >= 1921) -> the 4-warp fattn-vec-style kernel;
+    // rpw < 16 -> the incumbent 32-thread D2-staged kernel. Both launches are
+    // static (grid/block nkv-independent), so CUDA-graph capture/replay is
+    // unaffected; each kernel re-reads positions[0] on every replay and
+    // exactly one is live for the current nkv (the rpw branch is
+    // nkv-uniform). The dud launch costs ~1-2 us/layer but keeps the
+    // small-rpw shapes on the incumbent geometry — running the 1-warp body
+    // inside 128-thread blocks caps the SM at 12 working warps (1536/128)
+    // and measured +78% kernel at 7B @1641 (35.4 vs 19.8 us, nsys). Other
+    // head dims (incl. the hd=8 parity fixtures) keep the single incumbent
+    // launch (rpw_gate=0).
+    if (hd == 128) {
+        gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const __half*)k, (const __half*)v, partial, positions,
+            n_head, n_head_kv, hd, scale, pstr, H4W_MIN_RPW
+        );
+        gqa_attn_split_partial_hybrid<<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+            q, (const __half*)k, (const __half*)v, partial, positions,
+            n_head, n_head_kv, hd, scale, pstr
+        );
+    } else {
+        gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const __half*)k, (const __half*)v, partial, positions,
+            n_head, n_head_kv, hd, scale, pstr, 0
+        );
+    }
     gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
@@ -3129,7 +3413,7 @@ void launch_gqa_attn_split_f32kv(
 ) {
     gqa_attn_split_partial<float><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
         q, (const float*)k, (const float*)v, partial, positions,
-        n_head, n_head_kv, hd, scale, pstr
+        n_head, n_head_kv, hd, scale, pstr, 0
     );
     gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
         partial, o, n_head, hd, pstr
