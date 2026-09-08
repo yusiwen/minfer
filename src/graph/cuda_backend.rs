@@ -34,6 +34,14 @@ pub struct CudaBackend {
     /// I32 input buffers (grown on demand; freed in Drop alongside the pool).
     pos_scratch: *mut std::ffi::c_void,
     pos_scratch_bytes: usize,
+    /// D3-7 2c: one-execution-window memo for positions_i32 — (input buf id,
+    /// pool_gen) of the last conversion. Every Rope/KvcacheStore/Attn node
+    /// re-converted the same positions buffer (240 launches/step at 14B
+    /// decode, ~0.28 ms of pure launch overhead); the i32 result is a pure
+    /// function of the input content, identical for all consumers within one
+    /// serial execution pass. Cleared in synchronize() next to the MmqCache
+    /// clear (same split-boundary reuse-of-pool-ids lifecycle).
+    pos_memo: Option<(usize, u64)>,
     /// Captured CUDA Graphs (Phase 7d), keyed by (graph uid, split node
     /// range) and valid only for the pool_gen captured at. Few entries: one
     /// per executed split of each reused graph (decode captures; a one-shot
@@ -107,6 +115,7 @@ impl CudaBackend {
             pool_gen: 0,
             pos_scratch: std::ptr::null_mut(),
             pos_scratch_bytes: 0,
+            pos_memo: None,
             graph_execs: Vec::new(),
             graph_runs: std::collections::HashMap::new(),
             capturing: None,
@@ -361,6 +370,7 @@ impl Drop for CudaBackend {
             Self::state_free(self.pos_scratch);
             self.pos_scratch = std::ptr::null_mut();
             self.pos_scratch_bytes = 0;
+            self.pos_memo = None;
         }
         for g in &self.graph_execs {
             self.state.graph_destroy(g.exec);
@@ -1003,6 +1013,14 @@ impl CudaBackend {
     /// the whole path on-device — no host sync, and the pointer stays stable
     /// across steps (a precondition for CUDA Graph replay in Phase 7d).
     fn positions_i32(&mut self, id: usize) -> Result<*mut std::ffi::c_void, String> {
+        // D3-7 2c: one conversion per execution window per input buffer.
+        // Capture mode: the first consumer's launch is recorded at capture
+        // time and replay re-executes it every step (memo hits are never
+        // recorded). Non-capture mode: synchronize() clears the memo at the
+        // execution boundary, so each step re-converts exactly once.
+        if self.pos_memo == Some((id, self.pool_gen)) {
+            return Ok(self.pos_scratch);
+        }
         let src = self.ptr_of(id)?;
         let bytes = self.pool[id].bytes;
         if self.pos_scratch_bytes < bytes {
@@ -1023,6 +1041,7 @@ impl CudaBackend {
             self.pool_gen += 1;
         }
         self.state.bits_to_i32(src, self.pos_scratch, bytes / 4);
+        self.pos_memo = Some((id, self.pool_gen));
         Ok(self.pos_scratch)
     }
 
@@ -1208,6 +1227,9 @@ impl Backend for CudaBackend {
         // A split boundary / next execution reuses the same pool buffer ids for
         // different data, so the cached (src,nt,id) must not leak across it.
         self.state.clear_mmq_cache();
+        // D3-7 2c: same one-execution-window lifecycle for the positions
+        // i32-conversion memo (see positions_i32).
+        self.pos_memo = None;
         self.close_capture_or_sync();
     }
 

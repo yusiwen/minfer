@@ -2134,7 +2134,7 @@ __global__ void rms_norm_f32(
 // this block just wrote (L1-hot after __syncthreads) and runs the standalone
 // per-block quantize body verbatim. Same launch geometry as rms_norm_f32
 // (grid n, WARP threads).
-__global__ void rms_norm_quant_pad40(
+__global__ void __launch_bounds__(128) rms_norm_quant_pad40(
     const float* __restrict__ x,
     const float* __restrict__ w,
     float* __restrict__ y,
@@ -2147,22 +2147,38 @@ __global__ void rms_norm_quant_pad40(
     int tid = threadIdx.x;
     int d4 = d / 4;
 
-    const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
+    // D3-7 2c: wide-block geometry (launch picks 32 or 128 threads). The
+    // reduction is bitwise-preserved: lanes 0..31 keep the exact 32-thread
+    // form's element->lane mapping, serial per-lane accumulation order and
+    // warp_reduce_sum tree; the unroll only deepens load pipelining. scale
+    // reaches the whole block through shared memory. The write and quantize
+    // loops are per-element / per-32-block independent, so their wider
+    // thread mapping cannot change any output bit.
+    __shared__ float s_scale;
+    float scale;
+    if (tid < WARP) {
+        const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
 
-    float ss = 0.0f;
-    for (int i = tid; i < d4; i += WARP) {
-        float4 v = x4[i];
-        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        float ss = 0.0f;
+        #pragma unroll 8
+        for (int i = tid; i < d4; i += WARP) {
+            float4 v = x4[i];
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        ss = warp_reduce_sum(ss);
+
+        scale = rsqrtf(ss / (float)d + eps);
+        if (tid == 0) s_scale = scale;
     }
-    ss = warp_reduce_sum(ss);
-
-    float scale = rsqrtf(ss / (float)d + eps);
+    __syncthreads();
+    scale = s_scale;
 
     float4* y4 = reinterpret_cast<float4*>(y + row * d);
     const float4* w4 = reinterpret_cast<const float4*>(w);
-    for (int i = tid; i < d4; i += WARP) {
+    const float4* x4w = reinterpret_cast<const float4*>(x + row * d);
+    for (int i = tid; i < d4; i += blockDim.x) {
         float4 wv = w4[i];
-        float4 xv = x4[i];
+        float4 xv = x4w[i];
         y4[i].x = xv.x * scale * wv.x;
         y4[i].y = xv.y * scale * wv.y;
         y4[i].z = xv.z * scale * wv.z;
@@ -2170,12 +2186,12 @@ __global__ void rms_norm_quant_pad40(
     }
 
     // epilogue: whole block arrives (all threads share `row`), then each
-    // thread quantizes blocks tid, tid+WARP, ... of its own row.
+    // thread quantizes blocks tid, tid+blockDim.x, ... of its own row.
     __syncthreads();
     int nb = d / 32;
     const float* src = y + (size_t)row * d;
     uint8_t* dst = q8 + (size_t)row * nb * Q8PB;
-    for (int b = tid; b < nb; b += WARP)
+    for (int b = tid; b < nb; b += blockDim.x)
         quantize_pad40_block(src + (size_t)b * 32, dst + (size_t)b * Q8PB);
 }
 
@@ -3368,7 +3384,11 @@ void launch_rms_norm_quant_pad40(
     const float* x, const float* w, float* y, uint8_t* q8,
     int d, float eps, int n, cudaStream_t stream
 ) {
-    rms_norm_quant_pad40<<<n, WARP, 0, stream>>>(x, w, y, q8, d, eps, n);
+    // D3-7 2c: 128-thread wide block (was WARP). The body is
+    // blockDim.x-relative and bitwise-identical at either geometry; 128
+    // threads cut the per-row write/quantize latency chains 4x (census:
+    // 9.4 -> target ~4 us at hidden 5120, 94.6 launches/decode-step).
+    rms_norm_quant_pad40<<<n, 128, 0, stream>>>(x, w, y, q8, d, eps, n);
 }
 
 void launch_add_bias_f32(
