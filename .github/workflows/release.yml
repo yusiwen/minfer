@@ -10,7 +10,7 @@
 #     release + changelog.
 #   - Linux x86_64 CUDA with statically-linked cudart
 #     (release-linux-x64-cuda) — CUDA 12.8 (keeps Volta V100 sm_70/72 + up to
-#     sm_120), glibc 2.35 floor.
+#     sm_120), glibc 2.39 floor (Ubuntu 24.04).
 #   - Linux arm64 CUDA with statically-linked cudart (release-linux-arm64-cuda)
 #     — CUDA 13 (the DGX Spark GB10 is sm_121, which CUDA 12.8 cannot build),
 #     glibc 2.39 floor.
@@ -52,6 +52,9 @@ jobs:
           echo "value=${TAG}(${SHA})" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: ${TAG}(${SHA})"
+
+      - name: Install Rust (pinned 1.97.1)
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Build release binary
         env:
@@ -148,7 +151,7 @@ jobs:
             --title "${TAG}" \
             --notes-file CHANGELOG.md
 
-  # Linux x86_64, CUDA + statically-linked cudart. Builds in a plain ubuntu-22.04
+  # Linux x86_64, CUDA + statically-linked cudart. Builds in a plain ubuntu-24.04
   # runner with the CUDA 12.8 toolkit installed via apt — the host needs a GPU
   # only at RUNTIME, never to build. CUDA 12.8 is chosen deliberately: it is the
   # last toolkit whose nvcc still accepts the Volta compute targets (sm_70/72,
@@ -160,7 +163,7 @@ jobs:
     name: Build & release (Linux x86_64 CUDA, static cudart)
     # Runs after the macOS job, which created the release, so we can upload to it.
     needs: release-macos-arm64
-    runs-on: ubuntu-22.04 # x86_64; sets the glibc floor (2.35) for the artifact
+    runs-on: ubuntu-24.04 # x86_64; sets the glibc floor (2.39) for the artifact
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -179,7 +182,7 @@ jobs:
 
       - name: Install CUDA toolkit 12.8 (x86_64)
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
@@ -191,7 +194,7 @@ jobs:
           /usr/local/cuda/bin/nvcc --version | tail -1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Build (CUDA + static cudart)
         env:
@@ -273,7 +276,7 @@ jobs:
           /usr/local/cuda/bin/nvcc --version | tail -1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Build (CUDA + static cudart)
         env:

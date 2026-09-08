@@ -1,0 +1,6 @@
+# Pin the Rust toolchain for the whole repo so builds that use rustup (plain
+# `cargo` outside the nix flake / GH Actions) are reproducible instead of
+# tracking the `stable` channel. The nix flake (rust-overlay) and the release
+# workflow (dtolnay/rust-toolchain@1.97.1) are pinned to the same version.
+[toolchain]
+channel = "1.97.1"

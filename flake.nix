@@ -2,7 +2,7 @@
   description = "minfer — pure Rust LLM inference engine";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -14,7 +14,7 @@
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [ (import rust-overlay) ];
       pkgs = import nixpkgs { inherit system overlays; };
-      rust = pkgs.rust-bin.stable.latest.default.override {
+      rust = pkgs.rust-bin.stable."1.97.1".default.override {
         extensions = [ "rust-src" "rust-analyzer" ];
       };
     in {
