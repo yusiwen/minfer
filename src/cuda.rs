@@ -171,6 +171,25 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     );
     fn launch_swiglu_f32_off(buf: *mut f32, n: i32, off: i32, stream: *mut std::ffi::c_void);
+    // D3-5 1a: fused-producer decode A-quantize (rms_norm/swiglu + pad40
+    // epilogue; q8 bytes bit-identical to quantize_q8_0_pad40).
+    fn launch_rms_norm_quant_pad40(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        q8: *mut u8,
+        d: i32,
+        eps: f32,
+        n: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_swiglu_quant_pad40(
+        buf: *mut f32,
+        q8: *mut u8,
+        n: i32,
+        off: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_gather_rows_f32(
         src: *const f32,
         ids: *const f32,
@@ -2733,6 +2752,64 @@ impl CudaState {
         q8 as usize
     }
 
+    /// D3-5 1a: decode-side native pad40 A-quantize with r49-style
+    /// consecutive-consumer memoization. The fused decode producers
+    /// ([`Self::rms_norm_quant_on_gpu`] / [`Self::swiglu_quant_off_on_gpu`])
+    /// record their pad40 plane here keyed on the producer's f32 output
+    /// pointer; the decode matmul group that consumes it hits the cache and
+    /// skips the standalone `quantize_q8_0_pad40` launch. Same window-safety
+    /// contract as the prefill MmqCache: the plane is a pure function of
+    /// (src, nt, id), any non-(MatMul|FusedFFN) node clears the entry, and
+    /// `synchronize` clears it at execution boundaries. The hit path
+    /// re-validates the physical pointer (a `get_or_grow` between record and
+    /// consult must not have moved the plane — a grown-over entry falls back
+    /// to the standalone launch, which re-quantizes from the live f32 src).
+    /// `MINFER_NO_DECODE_A_FUSE=1` skips the consult AND the record, restoring
+    /// the exact pre-D3-5 per-matmul standalone quantize (A/B gate).
+    fn decode_quantize_native(&self, x: *const f32, id: usize, nt: usize) -> *mut u8 {
+        let need = nt * (id / 32) * 40;
+        let key = (x as usize, nt, id);
+        if !Self::no_decode_a_fuse() {
+            let cache = self.mmq_cache.lock().unwrap();
+            if cache.active && !cache.transposed && !cache.dead_write && cache.key == key {
+                let q8 = Self::get_or_grow(&self.buf_q8_decode, need) as usize;
+                if q8 == cache.q8 {
+                    return q8 as *mut u8;
+                }
+            }
+        }
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, need) as *mut u8;
+        let stream = self.stream();
+        unsafe {
+            launch_quantize_q8_0_pad40(x, q8, id as i32, nt as i32, stream);
+        }
+        if !Self::no_decode_a_fuse() {
+            self.record_mmq_cache_native(key.0, nt, id, q8 as usize);
+        }
+        q8
+    }
+
+    /// D3-5 1a: record a fused-producer NATIVE (pad40, non-transposed) plane
+    /// into the MmqCache (decode counterpart of
+    /// [`Self::record_mmq_cache_transposed`]).
+    fn record_mmq_cache_native(&self, src: usize, nt: usize, id: usize, q8: usize) {
+        let mut c = self.mmq_cache.lock().unwrap();
+        c.active = true;
+        c.key = (src, nt, id);
+        c.transposed = false;
+        c.dead_write = false;
+        c.qa8 = 0;
+        c.sda = 0;
+        c.q8 = q8;
+    }
+
+    /// D3-5 1a: opt-out of the decode fused-producer A-quantize (A/B escape
+    /// hatch): plain rms_norm/swiglu producers + unconditional standalone
+    /// quantize per matmul.
+    pub fn no_decode_a_fuse() -> bool {
+        std::env::var("MINFER_NO_DECODE_A_FUSE").map_or(false, |v| v == "1")
+    }
+
     /// r51: record a PRODUCER-FUSED quantize result into the r49 MmqCache.
     /// The fused rms_norm/swiglu kernel wrote the pad40_t plane for `src`
     /// (the producer's f32 output device pointer) directly, so the following
@@ -3534,6 +3611,58 @@ impl CudaState {
         }
     }
 
+    /// D3-5 1a: decode fused rms_norm + pad40 q8 epilogue — the f32 y write
+    /// is bit-identical to [`Self::rms_norm`] (same kernel body) and the q8
+    /// bytes are bit-identical to `quantize_q8_0_pad40` (epilogue = the
+    /// standalone per-block body verbatim). Records the plane for the
+    /// following decode matmul group (decode_quantize_native). Callers gate
+    /// on the decode shape (n == 1, d % 32 == 0) and MINFER_NO_DECODE_A_FUSE.
+    pub fn rms_norm_quant_on_gpu(
+        &self,
+        x: *mut std::ffi::c_void,
+        w: *mut std::ffi::c_void,
+        y: *mut std::ffi::c_void,
+        d: usize,
+        n: usize,
+        eps: f32,
+    ) {
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, n * (d / 32) * 40);
+        let stream = self.stream();
+        unsafe {
+            launch_rms_norm_quant_pad40(
+                x as *const f32,
+                w as *const f32,
+                y as *mut f32,
+                q8 as *mut u8,
+                d as i32,
+                eps,
+                n as i32,
+                stream,
+            );
+        }
+        self.record_mmq_cache_native(y as usize, n, d, q8 as usize);
+    }
+
+    /// D3-5 1a: decode fused swiglu + pad40 q8 epilogue — the in-place swiglu
+    /// write is bit-identical to [`Self::swiglu_f32_off_on_gpu`] and the q8
+    /// bytes to `quantize_q8_0_pad40`. n % 32 == 0 is the caller's gate
+    /// (whole 32-element blocks; the fused-FFN intermediate is always a
+    /// multiple of 32 on the supported models).
+    pub fn swiglu_quant_off_on_gpu(&self, buf: *mut std::ffi::c_void, n: usize, off: usize) {
+        let q8 = Self::get_or_grow(&self.buf_q8_decode, (n / 32) * 40);
+        let stream = self.stream();
+        unsafe {
+            launch_swiglu_quant_pad40(
+                buf as *mut f32,
+                q8 as *mut u8,
+                n as i32,
+                off as i32,
+                stream,
+            );
+        }
+        self.record_mmq_cache_native(buf as usize, 1, n, q8 as usize);
+    }
+
     /// 7e③: generic f32 row gather on device (`get_rows`: out[t*n+i] =
     /// src[ids[t]*n+i]; ids are I32-as-f32 bit patterns on device).
     pub fn gather_rows_f32_on_gpu(
@@ -3931,18 +4060,14 @@ impl CudaState {
         id: usize,
         nt: usize,
     ) {
-        let nb = id / 32;
-        let need = nt * nb * 40;
-        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        // D3-5 1a: consult the MmqCache first — the fused decode producers
+        // (rms_norm_quant_on_gpu / swiglu_quant_off_on_gpu) recorded their
+        // pad40 plane, so the matmul group following the producer skips the
+        // standalone quantize launch entirely (MINFER_NO_DECODE_A_FUSE=1
+        // restores the unconditional standalone launch).
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
         let stream = self.stream();
         unsafe {
-            launch_quantize_q8_0_pad40(
-                x as *const f32,
-                q8 as *mut u8,
-                id as i32,
-                nt as i32,
-                stream,
-            );
             if Self::mmvq_v2(id) {
                 launch_q4_k_q8_mmvq_v2(
                     wptr as *const u8,
@@ -3981,18 +4106,14 @@ impl CudaState {
         nt: usize,
         blk_stride_padded: bool,
     ) {
-        let nb = id / 32;
-        let need = nt * nb * 40;
-        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        // D3-5 1a: consult the MmqCache first — the fused decode producers
+        // (rms_norm_quant_on_gpu / swiglu_quant_off_on_gpu) recorded their
+        // pad40 plane, so the matmul group following the producer skips the
+        // standalone quantize launch entirely (MINFER_NO_DECODE_A_FUSE=1
+        // restores the unconditional standalone launch).
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
         let stream = self.stream();
         unsafe {
-            launch_quantize_q8_0_pad40(
-                x as *const f32,
-                q8 as *mut u8,
-                id as i32,
-                nt as i32,
-                stream,
-            );
             if Self::mmvq_v2(id) && blk_stride_padded {
                 // v2's uint4 ql/qh loads need the padded 224B stride
                 if id > 8192 {
@@ -4047,18 +4168,14 @@ impl CudaState {
         id: usize,
         nt: usize,
     ) {
-        let nb = id / 32;
-        let need = nt * nb * 40;
-        let q8 = Self::get_or_grow(&self.buf_q8_decode, need);
+        // D3-5 1a: consult the MmqCache first — the fused decode producers
+        // (rms_norm_quant_on_gpu / swiglu_quant_off_on_gpu) recorded their
+        // pad40 plane, so the matmul group following the producer skips the
+        // standalone quantize launch entirely (MINFER_NO_DECODE_A_FUSE=1
+        // restores the unconditional standalone launch).
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
         let stream = self.stream();
         unsafe {
-            launch_quantize_q8_0_pad40(
-                x as *const f32,
-                q8 as *mut u8,
-                id as i32,
-                nt as i32,
-                stream,
-            );
             if Self::mmvq_v2(id) {
                 launch_q5_k_q8_mmvq_v2(
                     wptr as *const u8,
@@ -4486,5 +4603,235 @@ impl CudaState {
             }
         }
         true
+    }
+}
+
+
+#[cfg(test)]
+mod d35_probe_tests {
+    use super::*;
+
+    fn device() -> Option<&'static CudaState> {
+        CudaState::init();
+        CudaState::get()
+    }
+
+    fn dev_alloc(bytes: usize) -> *mut std::ffi::c_void {
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaMalloc(&mut p, bytes) };
+        assert_eq!(err, 0, "cudaMalloc failed");
+        p
+    }
+
+    fn h2d_f32(dst: *mut std::ffi::c_void, src: &[f32]) {
+        let err = unsafe {
+            cudaMemcpy(
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len() * 4,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        assert_eq!(err, 0);
+    }
+
+    fn d2h_f32(src: *mut std::ffi::c_void, n: usize) -> Vec<f32> {
+        let mut out = vec![0f32; n];
+        let err = unsafe {
+            cudaMemcpy(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                n * 4,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        assert_eq!(err, 0);
+        out
+    }
+
+    /// D2H readback of the shared decode q8 scratch (private-field probe).
+    fn read_q8(st: &CudaState, bytes: usize) -> Vec<u8> {
+        let guard = st.buf_q8_decode.lock().unwrap();
+        let (ptr, size) = &*guard;
+        assert!(*size >= bytes, "q8 scratch smaller than probe readback");
+        let mut out = vec![0u8; bytes];
+        let err = unsafe {
+            cudaMemcpy(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr.0 as *const std::ffi::c_void,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        assert_eq!(err, 0);
+        out
+    }
+
+    /// Deterministic activation with real-model spread (RMSNorm outputs reach
+    /// ±3 and some 32-blocks are near-zero).
+    fn gen_acts(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = ((s >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+                let mag = if (s >> 60) & 7 == 0 { 1e-5 } else { 3.0 };
+                (u as f32) * mag
+            })
+            .collect()
+    }
+
+    /// Valid finite q4_K bytes (od x id), deterministic per (r, ib).
+    fn gen_q4_k(od: usize, id: usize) -> Vec<u8> {
+        let nbe = id / 256;
+        let mut b = Vec::with_capacity(od * nbe * 144);
+        for r in 0..od {
+            for ib in 0..nbe {
+                let d = 0.031f32 + 0.005 * ((r * 7 + ib * 3) % 5) as f32;
+                let dmin = 0.002f32 + 0.001 * ((r * 3 + ib) % 4) as f32;
+                b.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                b.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                for j in 0..12 {
+                    b.push(((r * 31 + j * 17 + ib * 5) % 63) as u8);
+                }
+                for j in 0..128 {
+                    let lo = ((r * 13 + j * 7 + ib * 3) % 15) as u8;
+                    let hi = ((r * 5 + j * 11 + ib * 2) % 15) as u8;
+                    b.push(lo | (hi << 4));
+                }
+            }
+        }
+        b
+    }
+
+    fn bits_eq(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// D3-5 1a bitwise probe: fused-producer q8 epilogues vs the standalone
+    /// quantize kernel — identical pad40 bytes, identical f32 producer
+    /// outputs, bit-identical MMVQ outputs through the cache-hit path.
+    #[test]
+    fn cuda_decode_a_quant_fuse_bitwise() {
+        let Some(st) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = CudaState::model_load_guard();
+        let eps = 1e-5f32;
+
+        // ---- rms probe: d 5120 (14B hidden) -> q4_K matmul (MMVQ gate) ----
+        let (d, od) = (5120usize, 256usize);
+        let x = gen_acts(d, 0x9E37);
+        let w: Vec<f32> = (0..d).map(|i| 0.5 + 0.001 * (i % 17) as f32).collect();
+        let dx = dev_alloc(d * 4);
+        h2d_f32(dx, &x);
+        let dw = dev_alloc(d * 4);
+        h2d_f32(dw, &w);
+        let dy_a = dev_alloc(d * 4);
+        let dy_b = dev_alloc(d * 4);
+        let do_a = dev_alloc(od * 4);
+        let do_b = dev_alloc(od * 4);
+        st.register_weight("d35_probe_w4", &gen_q4_k(od, d));
+        let wq = st.get_weight_ptr("d35_probe_w4").expect("weight registered");
+
+        // path A (pre-D3-5 shape): plain rms; matmul cache-cleared -> the
+        // standalone quantize launch inside the decode matmul
+        st.clear_mmq_cache();
+        st.rms_norm(dx, Some(dw), dy_a, d, 1, eps);
+        st.matmul_f32_ptr_layout(
+            wq,
+            TensorType::Q4_K,
+            dy_a,
+            do_a,
+            od,
+            d,
+            1,
+            false,
+        )
+        .unwrap();
+        let q8_a = read_q8(st, (d / 32) * 40);
+
+        // path B: fused rms (records the plane) + matmul (cache hit)
+        st.clear_mmq_cache();
+        st.rms_norm_quant_on_gpu(dx, dw, dy_b, d, 1, eps);
+        st.matmul_f32_ptr_layout(
+            wq,
+            TensorType::Q4_K,
+            dy_b,
+            do_b,
+            od,
+            d,
+            1,
+            false,
+        )
+        .unwrap();
+        let q8_b = read_q8(st, (d / 32) * 40);
+
+        assert_eq!(q8_a, q8_b, "rms epilogue q8 bytes differ from standalone");
+        let y_a = d2h_f32(dy_a, d);
+        let y_b = d2h_f32(dy_b, d);
+        assert!(bits_eq(&y_a, &y_b), "fused rms f32 output not bit-identical");
+        let o_a = d2h_f32(do_a, od);
+        let o_b = d2h_f32(do_b, od);
+        assert!(bits_eq(&o_a, &o_b), "MMVQ output diverged (rms path)");
+
+        // ---- swiglu probe: n 2048 (down id, q4_K MMVQ gate) ----
+        let (nf, odf) = (2048usize, 256usize);
+        let gate = gen_acts(nf, 0x1234);
+        let up = gen_acts(nf, 0x5678);
+        let mut buf = vec![0f32; 2 * nf];
+        buf[..nf].copy_from_slice(&gate);
+        buf[nf..].copy_from_slice(&up);
+        let db_a = dev_alloc(2 * nf * 4);
+        h2d_f32(db_a, &buf);
+        let db_b = dev_alloc(2 * nf * 4);
+        h2d_f32(db_b, &buf);
+        let da_a = dev_alloc(odf * 4);
+        let da_b = dev_alloc(odf * 4);
+        st.register_weight("d35_probe_w4b", &gen_q4_k(odf, nf));
+        let wq2 = st
+            .get_weight_ptr("d35_probe_w4b")
+            .expect("weight registered");
+
+        st.clear_mmq_cache();
+        st.swiglu_f32_off_on_gpu(db_a, nf, nf);
+        st.matmul_f32_ptr_layout(
+            wq2,
+            TensorType::Q4_K,
+            db_a,
+            da_a,
+            odf,
+            nf,
+            1,
+            false,
+        )
+        .unwrap();
+        let q8_a2 = read_q8(st, (nf / 32) * 40);
+
+        st.clear_mmq_cache();
+        st.swiglu_quant_off_on_gpu(db_b, nf, nf);
+        st.matmul_f32_ptr_layout(
+            wq2,
+            TensorType::Q4_K,
+            db_b,
+            da_b,
+            odf,
+            nf,
+            1,
+            false,
+        )
+        .unwrap();
+        let q8_b2 = read_q8(st, (nf / 32) * 40);
+
+        assert_eq!(q8_a2, q8_b2, "swiglu epilogue q8 bytes differ from standalone");
+        let bu_a = d2h_f32(db_a, 2 * nf);
+        let bu_b = d2h_f32(db_b, 2 * nf);
+        assert!(bits_eq(&bu_a, &bu_b), "fused swiglu f32 output not bit-identical");
+        let oa_a = d2h_f32(da_a, odf);
+        let oa_b = d2h_f32(da_b, odf);
+        assert!(bits_eq(&oa_a, &oa_b), "MMVQ output diverged (swiglu path)");
     }
 }

@@ -406,7 +406,12 @@ impl CudaBackend {
         // within its own run, but the allocator's buffer-id reuse could
         // otherwise alias a late matmul's A onto a cached one. Transposed-b
         // matmuls also route here (they error below) but never consult MMQ.
-        if !matches!(&node.op, Op::MatMul { .. }) {
+        // D3-5 1a: Op::FusedFFN joins the preserve set — its input is the
+        // ffn_norm rms output whose pad40 plane the fused rms epilogue just
+        // recorded, and the internal gu matmul is that src's first consumer
+        // (same consecutive-consumer window as MatMul→MatMul; any node
+        // between the producer and here would have cleared the entry).
+        if !matches!(&node.op, Op::MatMul { .. } | Op::FusedFFN) {
             self.state.clear_mmq_cache();
         }
         match &node.op {
@@ -644,6 +649,21 @@ impl CudaBackend {
                         _ => {}
                     }
                 }
+                // D3-5 1a: decode (n==1) producers fuse the pad40 q8
+                // epilogue — bit-identical f32 y and q8 bytes, one launch
+                // fewer per producer, and the following decode matmul group
+                // skips its standalone quantize.
+                if n == 1 && d % 32 == 0 && !crate::cuda::CudaState::no_decode_a_fuse() {
+                    self.state.rms_norm_quant_on_gpu(
+                        self.ptr_of(in_bufs[0])?,
+                        wptr,
+                        self.ptr_of(out_buf)?,
+                        d,
+                        n,
+                        *eps,
+                    );
+                    return Ok(());
+                }
                 self.state.rms_norm(
                     self.ptr_of(in_bufs[0])?,
                     Some(wptr),
@@ -716,8 +736,14 @@ impl CudaBackend {
                 )?;
                 // 2) in-place swiglu: silu(rows 0..nf) × (rows nf..2*nf)
                 let n = nt * meta.nf;
-                self.state
-                    .swiglu_f32_off_on_gpu(self.ptr_of(out_buf)?, n, n);
+                let buf = self.ptr_of(out_buf)?;
+                // D3-5 1a: fuse the pad40 q8 epilogue for the following down
+                // matmul (same fused-producer form as the rms arm).
+                if n % 32 == 0 && !crate::cuda::CudaState::no_decode_a_fuse() {
+                    self.state.swiglu_quant_off_on_gpu(buf, n, n);
+                } else {
+                    self.state.swiglu_f32_off_on_gpu(buf, n, n);
+                }
                 Ok(())
             }
             Op::MatMul { transpose_b } => {

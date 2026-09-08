@@ -576,6 +576,54 @@ __global__ void q4_k_f32_matmul(
 // the warmup runs, never inside a capture window.
 #define Q8PB 40
 
+
+// --- D3-5 1a: fused-producer decode A-quantize ------------------------------
+// The prefill analogue is rms_norm_quant_f32_t (r51). At decode (nt==1) an
+// activation row feeds ONE MMVQ matmul group, and the standalone
+// quantize_q8_0_pad40 launch in front of every matmul is pure launch +
+// global-round-trip overhead (D3-1: ~265 launches = 0.46 ms/step). Fusing the
+// quantize into the PRODUCER (rms_norm / swiglu) removes the launch while
+// keeping every MMVQ consumer byte-identical: the epilogue below is the
+// standalone kernel's per-32-block body VERBATIM (max is exact for any
+// association; the rintf/clamp pass is elementwise), so the pad40 q8 bytes
+// are bit-identical by construction. MINFER_NO_DECODE_A_FUSE=1 reverts to the
+// standalone pair (A/B gate).
+__device__ __forceinline__ void quantize_pad40_block(
+    const float* __restrict__ src, uint8_t* __restrict__ dst
+) {
+    float4 sv[8];
+    #pragma unroll
+    for (int v = 0; v < 8; v++)
+        sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
+    float am = 0.0f;
+    #pragma unroll
+    for (int v = 0; v < 8; v++)
+        am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
+                             fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
+    float d = am / 127.0f;
+    float di = (d != 0.0f) ? 1.0f / d : 0.0f;
+    *reinterpret_cast<__half*>(dst) = __float2half(d);
+    int s = 0;
+    uint32_t packed[8];
+    #pragma unroll
+    for (int v = 0; v < 8; v++) {
+        const float* e = &sv[v].x;
+        uint32_t p = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int q = int(rintf(e[j] * di));
+            q = max(-128, min(127, q));
+            p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
+            s += q;
+        }
+        packed[v] = p;
+    }
+    #pragma unroll
+    for (int v = 0; v < 8; v++)
+        *reinterpret_cast<uint32_t*>(dst + 4 + 4 * v) = packed[v];
+    *reinterpret_cast<uint32_t*>(dst + 36) = uint32_t(s);
+}
+
 // 40B layout: 2B f16 d, 2B pad, 32B int8 payload (offset 4), 4B i32 sum of the
 // quantized values (offset 36 — the pad40 slack). The sum feeds the MMQ prefill
 // GEMM's min-term correction (llama.cpp's q8_1 "s"); the MMVQ decode kernels
@@ -2080,6 +2128,57 @@ __global__ void rms_norm_f32(
 
 // ─── Add bias: y[t][i] += b[i] ───────────────────────────────
 
+
+// D3-5 1a: decode fused rms_norm + pad40 q8 epilogue. The rms body is
+// rms_norm_f32 verbatim (bit-identical f32 y); the epilogue re-reads the row
+// this block just wrote (L1-hot after __syncthreads) and runs the standalone
+// per-block quantize body verbatim. Same launch geometry as rms_norm_f32
+// (grid n, WARP threads).
+__global__ void rms_norm_quant_pad40(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    uint8_t* __restrict__ q8,
+    int d, float eps, int n
+) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    int tid = threadIdx.x;
+    int d4 = d / 4;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x + row * d);
+
+    float ss = 0.0f;
+    for (int i = tid; i < d4; i += WARP) {
+        float4 v = x4[i];
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = warp_reduce_sum(ss);
+
+    float scale = rsqrtf(ss / (float)d + eps);
+
+    float4* y4 = reinterpret_cast<float4*>(y + row * d);
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    for (int i = tid; i < d4; i += WARP) {
+        float4 wv = w4[i];
+        float4 xv = x4[i];
+        y4[i].x = xv.x * scale * wv.x;
+        y4[i].y = xv.y * scale * wv.y;
+        y4[i].z = xv.z * scale * wv.z;
+        y4[i].w = xv.w * scale * wv.w;
+    }
+
+    // epilogue: whole block arrives (all threads share `row`), then each
+    // thread quantizes blocks tid, tid+WARP, ... of its own row.
+    __syncthreads();
+    int nb = d / 32;
+    const float* src = y + (size_t)row * d;
+    uint8_t* dst = q8 + (size_t)row * nb * Q8PB;
+    for (int b = tid; b < nb; b += WARP)
+        quantize_pad40_block(src + (size_t)b * 32, dst + (size_t)b * Q8PB);
+}
+
 __global__ void add_bias_f32(
     float* __restrict__ y,
     const float* __restrict__ b,
@@ -2135,6 +2234,29 @@ __global__ void swiglu_f32_off(float* __restrict__ buf, int n, int off) {
     if (tid >= n) return;
     float g = buf[tid];
     buf[tid] = (g / (1.0f + expf(-g))) * buf[off + tid];
+}
+
+
+// D3-5 1a: decode fused swiglu + pad40 q8 epilogue. Body = swiglu_f32_off
+// verbatim (guarded, no early return — every thread reaches the barrier).
+// Block bx wrote output elements [bx*256, bx*256+256) = quant blocks
+// bx*8 .. bx*8+7, so 8 threads per block re-read them (L1-hot) and quantize;
+// across the grid this is the same thread-count as the standalone kernel
+// (one thread per 32-block). REQUIRES the 256-thread launch geometry.
+__global__ void swiglu_quant_pad40(
+    float* __restrict__ buf,
+    uint8_t* __restrict__ q8,
+    int n, int off
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        float g = buf[tid];
+        buf[tid] = (g / (1.0f + expf(-g))) * buf[off + tid];
+    }
+    __syncthreads();
+    int b = blockIdx.x * 8 + (int)threadIdx.x;
+    if (threadIdx.x < 8 && b < (n >> 5))
+        quantize_pad40_block(buf + (size_t)b * 32, q8 + (size_t)b * Q8PB);
 }
 
 __global__ void swiglu_f32(
@@ -2971,6 +3093,18 @@ void launch_swiglu_f32_off(
     swiglu_f32_off<<<grid, block, 0, stream>>>(buf, n, off);
 }
 
+
+// D3-5 1a: decode fused swiglu + pad40 q8 epilogue. The 256-thread block size
+// is part of the epilogue's block->quant-block mapping (8 blocks per 256
+// elements) — do not change it without changing the kernel.
+void launch_swiglu_quant_pad40(
+    float* buf, uint8_t* q8, int n, int off, cudaStream_t stream
+) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    swiglu_quant_pad40<<<grid, block, 0, stream>>>(buf, q8, n, off);
+}
+
 void launch_gather_rows_f32(
     const float* src, const float* ids, float* out,
     int n, int nt, cudaStream_t stream
@@ -3226,6 +3360,15 @@ void launch_rms_norm_f32(
     dim3 block(WARP, 1, 1);
     dim3 grid(n, 1, 1);
     rms_norm_f32<<<grid, block, 0, stream>>>(x, w, y, d, eps, n);
+}
+
+
+// D3-5 1a: decode fused rms_norm + pad40 q8 epilogue (n==1 decode producers).
+void launch_rms_norm_quant_pad40(
+    const float* x, const float* w, float* y, uint8_t* q8,
+    int d, float eps, int n, cudaStream_t stream
+) {
+    rms_norm_quant_pad40<<<n, WARP, 0, stream>>>(x, w, y, q8, d, eps, n);
 }
 
 void launch_add_bias_f32(
