@@ -133,6 +133,9 @@ Chapters in §2 follow this table row by row.
 | D3-4 L1 | hybrid rpw dispatch: dual-kernel self-gating split attention (f16 KV, hd==128) — 4-warp h4w kernel when rpw = ceil(ceil(nkv/32)/4) ≥ 16 (nkv ≥ 1921), incumbent 32-thread kernel below; BOTH launch per layer with static grids, each re-reads `positions[0]` per replay, exactly one is live per nkv (nkv-uniform branch → replay-safe) | `22336b2` | 14B @3254 split 72.1 → 62.1 µs (−13.9%) + 1.5 µs dud launch; wall 14B @3254 21.20 → **21.33** (+0.61%, SEP), tg128 22.96 → 22.94, 7B tg128 50.28 → 50.20, @1641 48.78 → 48.68 (guards hold) | **+0.61%** (14B @3254) | 0.944× / 0.877× (14B tg128/@3254 vs llama 24.31/24.32) | **LANDED** | 1-warp path bitwise (7B @1845 dump: all gated files identical; `node{3,5,8}_prefill` diffs = pre-calibrated slot aliasing); h4w tolerance class (max\|Δlogits\| 0.309, argmax identical margin 0.716, 1 greedy flip at the regime entry = 1/256 < 2%, temp-0.8 controls identical); suite 169/0/3 incl. the hd=128/n_ctx-4200 parity shape sweeping the rpw 15/16 boundary; an in-kernel 1-warp-fallback form was REJECTED pre-commit: inside 128-thread blocks the 1-warp body caps at 12 working warps/SM (1536/128) = **+78% kernel at 7B @1641** (35.4 vs 19.8 µs nsys) — geometry, not math |
 | D3-4 L2 | window-level K/V prefetch pipelining in the h4w body (K-pass software pipeline +2 uint4, 4-deep V-bulk ring +8 uint4; issue-point-only → bitwise vs h4w by construction) | reverted (patch `/tmp/d3/patch_l2.py`) | 14B @3254 h4w 62.1 → 66.5 µs (**+7%**) | −7% kernel | — | REVERTED | the kernel is bytes+tail-bound at 79% of the 48.9 µs floor, not chain-bound enough: funding the pipeline buffers needs `__launch_bounds__` minBlocks 8→4 (64→128 regs) → occupancy 32→16 warps/SM and 3.33→4.44 waves — the occupancy/wave-tail tax outweighs the shorter load chains; the D2 4-row-scale lesson (issue-point moves are free) does NOT transplant to window scale under a 64-reg budget |
 | D3-4 findings | pre-existing behaviors calibrated this session: (a) at long prompts (≥2.8K tokens) `MINFER_GRAPH_DUMP` PREFILL-phase files (all `kv*_prefill`, `logits_prefill`, prefill nodes) are non-deterministic pre-vs-pre (wholesale, garbage-magnitude — aliased dump reads); decode-phase dumps stay deterministic; (b) CLI prompts longer than the n_ctx default 4096 leave zero generation headroom (`position N exceeds n_ctx N` panic, graph.rs:367); bench unaffected | measurement-only | — | — | — | RECORDED | dump gates at long prompts must anchor pre-vs-pre at the EXACT shape and gate only decode-phase files; long-prompt CLI greedy needs `prompt + n ≤ 4096` until n_ctx sizing is fixed |
+| D3-5 1a | fused-producer decode A-quantize: `rms_norm_quant_pad40` (rms body + the standalone per-block quantize body, both verbatim) and `swiglu_quant_pad40` write the pad40 q8 plane beside their f32 output; decode matmuls consult `decode_quantize_native` (MmqCache, native form) and skip the standalone quantize launch on a hit; FusedFFN joins the cache-clear preserve set; `MINFER_NO_DECODE_A_FUSE=1` opt-out | `3230b2b` | nsys 14B @3254 (NO_CUDA_GRAPH): standalone `quantize_q8_0_pad40` 4448 → **964** launches (−78%; the ~50/step remainder = the attn_o class), total kernels 29402 → 25918, sub-2µs 15171 → 11723; wall 14B tg128 23.05 → **23.35** (+1.30% SEP), @3254 21.36 → **21.68** (+1.50% SEP), 7B tg128 49.86 → **50.69** (+1.66% SEP), @1641 48.47 → **49.16** (+1.43% SEP) | **+1.30%** (14B tg128) | 0.961× / 0.891× (14B tg128/@3254 vs llama 24.31/24.32); 7B **1.026×** / 0.995× | **LANDED** | q8 bytes bit-identical by construction (max is exact for any association; rintf/clamp elementwise — the epilogue IS the standalone body) and probe-verified bitwise (rms+swiglu q8 buffers, f32 producer outputs, MMVQ outputs through the cache-hit path); suite 170/0/3; 14B −n 4 dump gate: logits both phases + all KV byte-identical, the 3 node-dump diffs are same-binary pool-slot aliasing reproduced pre-vs-pre AND post-vs-post; greedy −n 256 token streams byte-identical both models; fused epilogues add ~0.2–0.25 µs/launch (swiglu 2.06 → 2.31 µs), priced into the wall |
+| D3-5 1b | output-head od-split / 512-thread re-map (lm_head q6_K od 152064, id 5120, npair 160) | not implemented | — | — | — | ANALYSIS-NEGATIVE | all three candidate mechanisms are measured or computed dead at this shape: (a) idle-thread removal (96 of 256 idle at npair 160) = D3b-1c, measured neutral; (b) rows-in-flight: 288 resident rows either way (6×256-thread blocks/SM vs 3×512 dual-row), and D3b-1c's 9×160 = 432-row form was ALSO neutral — occupancy is not the limiter; (c) block-scheduling rate: the head sustains 47.6 blocks/µs while ffn_gu demonstrates 76/µs — not the limiter. A dual-row 512-thread form is bitwise-capable (per-row half-block reduce with the same 8-warp tree) but carries no mechanism → not built per the "measured mechanism, don't guess" rule |
+| D3-5 1c | ffn_down-q6K 512-thread single-unit variant (id 13824 → npair 432) | not implemented | — | — | — | ANALYSIS-NEGATIVE | NOT bitwise vs the landed v2_pf: in the 256-thread form thread t accumulates fma(u_t) then += fma(u_{t+256}) into ONE float acc before the block reduce; at 512 threads those units live in different threads and their sum happens in the reduce tree (16-warp cross-warp serial order) — a different float sum. A bitwise emulation (smem pair-exchange so thread t still sums u_t+u_{t+256} first) adds a barrier for zero resident-parallelism gain (5120 rows = 18 waves either way), and the exposure mechanism 1c targets was already fixed by v2_pf's up-front load issue (D3b-1b) |
 
 **Footnotes.**
 
@@ -214,6 +217,18 @@ prefetch) measured +7% kernel (occupancy/wave-tail tax) and was REVERTED.
 Window (interleaved 3× medians): 14B tg128 22.94 / @3254 21.33 vs llama
 24.31/24.32 (0.944×/0.877×); 7B tg128 50.20 / @1641 48.68 vs 49.41
 (1.016×/0.985×). Distance-to-parity and next levers: §2D D3-4.
+
+**D3-5 update (2026-09-08):** fused-producer decode A-quantize
+**LANDED** (`3230b2b`): the decode rms_norm/swiglu producers write the pad40
+q8 plane (bit-identical bytes) and the following decode matmul group skips its
+standalone quantize launch — standalone quantize launches −78% (nsys), sub-2µs
+launches −3448/step-census, and the win shows at all lengths: 14B tg128 23.05
+→ 23.35 (+1.30% SEP) / @3254 21.36 → 21.68 (+1.50% SEP); 7B tg128 50.69
+(**1.026× vs llama — ahead**) / @1641 49.16 (0.995×, parity). Window vs the
+pre-D3-5 anchors: 14B tg128 +1.65% (session bar ≥ +1.5%), @3254 +2.95%. 14B
+decode geometry levers (head od-split, ffn_down 512-thread) resolved
+analysis-negative with the math recorded (§2D D3-5); Stage 2 = GQA q-head
+batching (attention re-read) + rms-launch consolidation.
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -1884,6 +1899,106 @@ into MMVQ prologue) ≈ +2.1% at all lengths — the largest single remaining
 KNOWN lever. (3) The 14B attention residual needs a bytes-side lever (GQA
 q-head batching to cut the 5× L1/L2 re-read), not more pipelining.
 (4) Long-prompt CLI n_ctx headroom fix (pre-existing).
+
+### D3-5 — Stage 1 of the decode-alignment program: fused-producer decode A-quantize LANDED (1a), head/ffn_down geometry levers analysis-negative (1b/1c) (2026-09-08)
+
+Base binary `/tmp/d3/minfer_pre_d35` (sha1 ab09c1de, HEAD 6788e98 window).
+Anchors this window (interleaved 3× medians, pre): 14B tg128 22.97 (A/B
+interleaved pre side 23.05), @3254 21.06 (one 15.87 co-tenant outlier rep;
+interleaved pre 21.36); 7B tg128 49.90 (interleaved 49.86), @1641 48.71
+(interleaved 48.47). sglang co-tenant resident throughout (idle-co-tenancy
+clean-equivalent; per-rep outliers landed in both sides and medians carried).
+
+**1a — fused-producer decode A-quantize, LANDED (`3230b2b`).** D3-1's census
+put ~0.46 ms/step in 265 standalone `quantize_q8_0_pad40` launches (one in
+front of EVERY decode MMVQ matmul, each ~1.7 µs, each re-quantizing a row its
+sibling matmuls also re-quantize — attn_norm's output was quantized 3× per
+layer for q/k/v) plus part of the ~700 sub-2µs launches. The inline-per-block
+form (each MMVQ row-block re-quantizes the row itself) was rejected on paper:
+it multiplies the A-side L2 traffic od×14 KB (ffn_gu alone: +18.6 GB/step) —
+the r49 shared-A lesson. The landed form is the r51 prefill winner transplanted
+to decode: the PRODUCER writes the q8 plane. `rms_norm_quant_pad40` (rms body
+verbatim + the standalone kernel's per-32-block body verbatim, re-reading the
+row the block just wrote — L1-hot after a barrier) and `swiglu_quant_pad40`
+(swiglu body verbatim, 8 threads per 256-thread block quantize the block's own
+8 output blocks — the same per-32-block thread count as the standalone kernel)
+record their plane in the r49 MmqCache (native pad40 form, keyed on the
+producer's f32 output pointer); `decode_quantize_native` consults the cache in
+the three decode MMVQ entries and skips the standalone launch on a hit. The
+FusedFFN node joins the cache-clear preserve set (its input IS the ffn_norm rms
+output and the internal gu matmul is that src's first consumer — same
+consecutive-consumer window as MatMul→MatMul). Attn_o keeps a standalone
+quantize (its producer is the attention node, not touched this session). The
+q8 bytes are bit-identical by construction — max is exact for ANY association,
+the rintf/clamp pass is elementwise — and the whole GEMV byte-consumption is
+unchanged. `MINFER_NO_DECODE_A_FUSE=1` restores the exact pre-D3-5 path.
+
+**1a gates.** Probe (new `cuda_decode_a_quant_fuse_bitwise` test): fused vs
+standalone q8 buffers memcmp-equal at the 14B hidden size and the ffn_down
+shape, f32 producer outputs bit-identical, MMVQ matmul outputs bit-identical
+through the cache-hit path. Suite **170/0/3**. Dump gate (14B, short prompt,
+−n 4): `logits_{prefill,decode}` + all `kv*` byte-identical; 3 same-size
+node-dump diffs (`node{2,3,11}_decode`) are the documented pool-slot aliasing
+class, reproduced pre-vs-pre AND post-vs-post (the same-binary diff sets cover
+every pre-vs-post diff — no numeric delta). Greedy −n 256 token streams
+byte-identical vs pre on both models (14B @2799-token prompt, 7B @1847). One
+operational note: `prompt_3k3` (5451 tokens) panics in BOTH binaries at the
+n_ctx 4096 default (graph.rs:367 — the D3-4 follow-up #4 headroom bug), so
+long-prompt greedy gates must use ≤2.8K-token prompts until n_ctx sizing is
+fixed. nsys (14B @3254, NO_CUDA_GRAPH, bench −n 8): standalone quantize
+launches 4448 → 964 (−78%), total kernels 29402 → 25918, sub-2µs launches
+15171 → 11723 (−3448 = exactly the quantize delta); swiglu 2.06 → 2.31 µs,
+fused rms ~+0.2 µs (epilogue cost, priced into the wall).
+
+**1a results** (interleaved 3× medians, pre vs post, all SEP): 14B tg128
+23.05 → **23.35** (+1.30%), @3254 21.36 → **21.68** (+1.50%); 7B tg128 49.86
+→ **50.69** (+1.66%), @1641 48.47 → **49.16** (+1.43%). The win lands at ALL
+lengths on both models — the launch/round-trip tax was length-independent, as
+projected. vs the pre-D3-5 anchors: 14B tg128 +1.65% (session bar ≥ +1.5%),
+@3254 +2.95%. vs llama.cpp: 14B 0.961× (tg128) / 0.891× (@3254); 7B **1.026×**
+(tg128, ahead) / 0.995× (@1641, parity) — the 7B decode campaign is closed.
+
+**1b — output-head od-split / 512-thread re-map: ANALYSIS-NEGATIVE.** The
+brief's occupancy math, done first: npair = 160 q6_K units/row → 96 of 256
+threads idle (the D3b-1c knob, measured neutral); 6×256-thread blocks/SM =
+288 resident rows, and D3b-1c's 9×160 = 432-row form was ALSO neutral —
+rows-in-flight is not the limiter; the head sustains 47.6 blocks/µs while
+ffn_gu demonstrates 76/µs — block scheduling is not the limiter. The dual-row
+512-thread form is bitwise-capable (each 256-thread half reduces its row with
+the identical 8-warp tree) but moves none of the measured-neutral quantities.
+Per the brief's own rule (pick the variant with a MEASURED mechanism), not
+built. The head's 200.1 vs 220-225 GB/s class remains unexplained by any
+geometry knob tried so far — same conclusion class as D3b-1a's padded-kernel
+verdict (latency/L2 composition, not a parallelism deficit).
+
+**1c — ffn_down-q6K 512-thread single-unit: ANALYSIS-NEGATIVE.** Not bitwise
+vs the landed `q6_k_q8_mmvq_v2_pf`: in the 256-thread form thread t sums
+fma(u_t) + fma(u_{t+256}) into one acc BEFORE the block reduce; at 512 threads
+those units sit in different threads and their sum moves into the 16-warp
+cross-warp reduce order — a different float sum (the r50/r57 class). A bitwise
+pair-exchange emulation adds a barrier for zero resident-parallelism gain
+(5120 rows = 18 waves either way), and the exposure path 1c targets was
+already fixed by v2_pf's up-front dual-unit load issue.
+
+**Distance to parity (post-D3-5-1a, 14B @3254).** minfer 21.68 t/s = 46.12
+ms/step vs llama 24.32 = 41.12 ms → **−5.00 ms needed (−10.8%)**. Known-lever
+inventory: attention residual (62.1 − 48.9) × 48 = 0.63 ms (GQA q-head
+batching to cut the 5× L1/L2 re-read — Stage 2); attn_v-q6K padded-f32
+straggler ≈ 0.28 ms (tolerance-gated MMVQ routing, D3-4 follow-up); output
+head ≈ 0.44 ms (mechanism-less per 1b above); rms/elementwise chain ≈ 1.0 ms
+(97 rms launches — the fused-epilogue rms is now slightly heavier, so the
+next elementwise lever is rms-launch consolidation, D3-1's follow-up class).
+Sum ≈ 2.35 ms = 47% of the remaining gap. The 1a win itself removed
+~0.56–0.69 ms/step (−78% of the quantize launches + their gaps).
+
+**Follow-ups.** (1) attn_o keeps a standalone quantize (48/step, ~0.08 ms) —
+fusing it into the attention combine epilogue touches the D3-4 hybrid kernel
+pair; low value, high regression risk, skipped. (2) Stage 2: GQA q-head
+batching in the decode split attention (the 5× q re-read) is the largest
+remaining single lever (0.63 ms). (3) rms-launch consolidation (97 rms →
+fewer, wider launches) is the remaining elementwise mass (1.15 ms class).
+(4) Long-prompt CLI n_ctx headroom fix (pre-existing, now also blocks
+long-prompt greedy gates).
 
 ## §3 Appendices
 
