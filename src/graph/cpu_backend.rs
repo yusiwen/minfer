@@ -433,6 +433,7 @@ impl Backend for CpuBackend {
             Op::FusedBiasRope
             | Op::BatchMatMul
             | Op::FusedQKV { .. }
+            | Op::QkvBiasRopeStore { .. }
             | Op::FusedQkvNorm { .. }
             | Op::FusedFFN => Err(format!(
                 "op {:?} unsupported on CPU (fusion not enabled for it)",

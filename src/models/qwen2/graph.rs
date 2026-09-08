@@ -20,7 +20,9 @@ use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
 use crate::graph::cache::GraphCache;
 use crate::graph::fusion::FusionPass;
-use crate::graph::ops::{AttnMeta, AttnMode, FusedFfnMeta, FusedQkvMeta, RoPEMeta};
+use crate::graph::ops::{
+    AttnMeta, AttnMode, FusedFfnMeta, FusedQkvMeta, QkvBiasRopeStoreMeta, RoPEMeta,
+};
 use crate::graph::params::{CParams, GraphParams, GraphType};
 use crate::graph::scheduler::BackendScheduler;
 use crate::graph::ComputeGraph;
@@ -79,18 +81,28 @@ impl Qwen2Graph {
             // pre-norm
             let normed = b.rms_norm(h, l.attn_norm.as_ref(), eps);
 
-            // Q/K/V projections (+ biases). decode (nt==1) with GPU QKV concat
-            // uses the fused path (G4): one concat matmul + one fused
-            // bias+rope+store kernel, replacing 3 matmul + 3 bias + 2 rope +
-            // 2 store dispatches.
+            // Q/K/V projections (+ biases). decode (nt==1) with GPU QKV
+            // fusion (G4 + D3-8) has two classes:
+            // - concat class (wq|wk|wv same quant type): `Op::FusedQKV` — one
+            //   concat matmul + one fused bias+rope+store kernel;
+            // - mixed-quant class (e.g. Q6_K attn_v among Q4_K q/k): three
+            //   separate matmuls (no bias) + one `Op::QkvBiasRopeStore`
+            //   epilogue (CUDA-only today; Metal keeps the unfused chain for
+            //   these layers). Both replace 3 matmul + 3 bias + 2 rope +
+            //   2 store dispatches.
             let fuse_qkv = nt == 1
                 && params.cparams.gpu
                 && params.cparams.fuse_qkv
                 && l.bq.is_some()
                 && l.bk.is_some()
-                && l.bv.is_some()
-                && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);
-            let (q, kv) = if fuse_qkv {
+                && l.bv.is_some();
+            // class 2 is CUDA-only: on macOS (feature off) the mixed-quant
+            // layers keep the unfused chain, bitwise-neutral vs pre-D3-8.
+            #[cfg(feature = "cuda")]
+            let qkv_epilogue_ok = crate::cuda::CudaState::get().is_some();
+            #[cfg(not(feature = "cuda"))]
+            let qkv_epilogue_ok = false;
+            let (q, kv) = if fuse_qkv && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv) {
                 let qkv = b.fused_qkv(
                     normed,
                     inp_pos,
@@ -117,7 +129,35 @@ impl Qwen2Graph {
                 // persistent regions via the fused store — read them back.
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);
                 (qkv, kv)
-
+            } else if fuse_qkv && qkv_epilogue_ok {
+                // D3-8 class 2 (mixed quant types): separate matmuls without
+                // bias, then one epilogue pass (bias×3 + rope×2 + store×2 → 1).
+                // Attention is wired to the epilogue node so q's matmul buffer
+                // has exactly one consumer (in-place alias rule, §5).
+                let q = b.matmul(normed, l.wq.as_ref().unwrap(), None);
+                let k = b.matmul(normed, l.wk.as_ref().unwrap(), None);
+                let v = b.matmul(normed, l.wv.as_ref().unwrap(), None);
+                let q = b.qkv_bias_rope_store(
+                    q,
+                    k,
+                    v,
+                    inp_pos,
+                    il,
+                    QkvBiasRopeStoreMeta {
+                        bias_q: l.bq.as_ref().map(|t| t.name.clone()),
+                        bias_k: l.bk.as_ref().map(|t| t.name.clone()),
+                        bias_v: l.bv.as_ref().map(|t| t.name.clone()),
+                        nqt: nh * hd,
+                        nkt,
+                        hd,
+                        freq_base: hp.rope_freq_base,
+                        freq_scale: hp.rope_freq_scale,
+                        rope_style: hp.rope_style,
+                        kv_elems: nkt * n_ctx,
+                    },
+                );
+                let kv = b.kvcache_load(il, nkt, n_ctx, nk);
+                (q, kv)
             } else {
                 let q = b.matmul(normed, l.wq.as_ref().unwrap(), l.bq.as_ref());
                 let k = b.matmul(normed, l.wk.as_ref().unwrap(), l.bk.as_ref());

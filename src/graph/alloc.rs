@@ -260,7 +260,16 @@ impl GraphAllocator {
                         self.node_to_buf.insert(id, BufRef { backend, id: pid });
                     }
                 }
-                Op::Silu | Op::RoPE { .. } => {
+                Op::Silu | Op::RoPE { .. } | Op::QkvBiasRopeStore { .. } => {
+                    // D3-8: the mixed-quant QKV epilogue also needs the layer's
+                    // persistent KV regions (it stores k/v like FusedQKV).
+                    if let Op::QkvBiasRopeStore { layer } = &node.op {
+                        let kv_elems = match &node.meta {
+                            NodeMeta::QkvBiasRopeStore(m) => m.kv_elems,
+                            _ => node.n_elements(),
+                        };
+                        self.ensure_kv(*layer, backend, kv_elems);
+                    }
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend
                     // aliasing avoids a host-side copy between a pending GPU

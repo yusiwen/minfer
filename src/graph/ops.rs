@@ -128,6 +128,17 @@ pub enum Op {
     FusedQKV {
         layer: usize,
     },
+    /// decode (nt==1) QKV epilogue for MIXED-quant layers (D3-8): q/k/v come
+    /// from three SEPARATE matmuls (wq/wk/wv of different quant types cannot
+    /// share a concat matmul); this node applies the three biases, ropes q/k
+    /// in place (math verbatim rope_f32), and stores k/v into the persistent
+    /// regions — the same epilogue kernel as `Op::FusedQKV`'s concat form,
+    /// pointer-form. The builder wires attention to this node, so q's matmul
+    /// buffer has exactly one consumer and the in-place alias rule (§5)
+    /// applies. Carries the layer so the scheduler can resolve kv_pair.
+    QkvBiasRopeStore {
+        layer: usize,
+    },
     /// decode (nt==1) fused FFN gate+up: one concat matmul (ffn_gate|ffn_up,
     /// loader-registered `blk.{i}.ffn_gu`) whose output buffer carries gate
     /// (rows 0..nf) and up (nf..2*nf); a single swiglu pass (silu(gate)*up,
@@ -161,6 +172,7 @@ pub enum NodeMeta {
     Kvcache(KvcacheMeta),
     Embed(EmbedMeta),
     FusedQkv(FusedQkvMeta),
+    QkvBiasRopeStore(QkvBiasRopeStoreMeta),
     FusedFfn(FusedFfnMeta),
     FusedQkvNorm(FusedQkvNormMeta),
 }
@@ -234,6 +246,24 @@ pub struct FusedQkvMeta {
     pub hd: usize,
     pub nh: usize,
     pub nk: usize,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub rope_style: RopeStyle,
+    /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
+    pub kv_elems: usize,
+}
+
+/// decode QKV epilogue metadata (mixed-quant class, D3-8): the three biases
+/// and the rope/store parameters (FusedQkvMeta minus the concat weight — the
+/// q/k/v inputs ARE the three matmul outputs, [nqt]/[nkt]/[nkt] f32, nt==1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QkvBiasRopeStoreMeta {
+    pub bias_q: Option<String>,
+    pub bias_k: Option<String>,
+    pub bias_v: Option<String>,
+    pub nqt: usize,
+    pub nkt: usize,
+    pub hd: usize,
     pub freq_base: f32,
     pub freq_scale: f32,
     pub rope_style: RopeStyle,

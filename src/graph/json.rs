@@ -189,6 +189,7 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
         Op::FusedBiasRope => "fused_bias_rope",
         Op::BatchMatMul => "batch_matmul",
         Op::FusedQKV { .. } => "fused_qkv",
+        Op::QkvBiasRopeStore { .. } => "qkv_bias_rope_store",
         Op::FusedQkvNorm { .. } => "fused_qkv_norm",
         Op::FusedFFN => "fused_ffn",
     }
@@ -220,6 +221,7 @@ fn op_detail(op: &Op) -> Value {
         Op::Reshape { shape } => json!({ "shape": shape }),
         Op::Permute { dims } => json!({ "dims": dims }),
         Op::FusedQKV { layer } => json!({ "layer": layer }),
+        Op::QkvBiasRopeStore { layer } => json!({ "layer": layer }),
     }
 }
 
@@ -277,6 +279,17 @@ fn meta_json(meta: &NodeMeta) -> Value {
             "freq_base": f.freq_base,
             "freq_scale": f.freq_scale,
             "kv_elems": f.kv_elems,
+        }),
+        NodeMeta::QkvBiasRopeStore(m) => json!({
+            "bias_q": m.bias_q,
+            "bias_k": m.bias_k,
+            "bias_v": m.bias_v,
+            "nqt": m.nqt,
+            "nkt": m.nkt,
+            "hd": m.hd,
+            "freq_base": m.freq_base,
+            "freq_scale": m.freq_scale,
+            "kv_elems": m.kv_elems,
         }),
         NodeMeta::FusedFfn(f) => json!({
             "weight": f.gu_weight,

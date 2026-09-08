@@ -766,6 +766,80 @@ impl CudaBackend {
             // cannot depend on od (probe: cuda_fused_qkv_concat_matmul_bitwise);
             // (2) the epilogue — math verbatim add_bias_f32 + rope_f32 +
             // store_kv_f32/f16 (probe: cuda_fused_qkv_epilogue_bitwise).
+            // D3-8: mixed-quant QKV epilogue (class 2): q/k/v come from
+            // three SEPARATE matmuls (mixed quant types — e.g. Q6_K attn_v —
+            // cannot share the concat matmul); the SAME pointer-form kernel as
+            // FusedQKV's epilogue applies the three biases, ropes q/k in
+            // place, and stores k/v. The allocator aliases the output to q's
+            // input buffer (the builder wires attention to this node, so q's
+            // matmul buffer has exactly one consumer); fall back to a D2D copy
+            // if it ever doesn't (RoPE arm pattern). Replaces the 7-launch
+            // small-kernel tail (add_bias×3 + rope×2 + store×2) → 1 launch.
+            Op::QkvBiasRopeStore { layer } => {
+                let meta = match &node.meta {
+                    NodeMeta::QkvBiasRopeStore(m) => m,
+                    other => {
+                        return Err(format!(
+                            "qkv_bias_rope_store node missing QkvBiasRopeStoreMeta: {other:?}"
+                        ));
+                    }
+                };
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "cuda: {}: QkvBiasRopeStore is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
+                if !matches!(meta.rope_style, RopeStyle::NonInterleaved) {
+                    return Err(format!(
+                        "cuda: {}: qkv epilogue rope style {:#?} not supported (rope_f32 is neox/non-interleaved only)",
+                        node.name, meta.rope_style
+                    ));
+                }
+                if meta.hd == 0 || meta.hd % 2 != 0 {
+                    return Err(format!(
+                        "cuda: {}: qkv epilogue head dim {} must be even",
+                        node.name, meta.hd
+                    ));
+                }
+                let (k_id, v_id) = kv_pair
+                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                // q: in-place (out aliases the q input; copy when it doesn't)
+                if in_bufs[0] != out_buf {
+                    self.copy_d2d(in_bufs[0], out_buf)?;
+                }
+                let bias_ptr = |name: &Option<String>| -> Result<*mut std::ffi::c_void, String> {
+                    match name {
+                        Some(n) => self.state.get_weight_ptr(n).ok_or_else(|| {
+                            format!("cuda: qkv epilogue bias '{n}' not registered on CUDA")
+                        }),
+                        None => Err("cuda: qkv epilogue bias missing".into()),
+                    }
+                };
+                let bq = bias_ptr(&meta.bias_q)?;
+                let bk = bias_ptr(&meta.bias_k)?;
+                let bv = bias_ptr(&meta.bias_v)?;
+                let pos = self.positions_i32(in_bufs[3])?;
+                self.state.attn_bias_rope_store(
+                    self.ptr_of(out_buf)?,
+                    self.ptr_of(in_bufs[1])?,
+                    self.ptr_of(in_bufs[2])?,
+                    bq,
+                    bk,
+                    bv,
+                    self.ptr_of(k_id)?,
+                    self.ptr_of(v_id)?,
+                    meta.nqt,
+                    meta.nkt,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    pos,
+                    self.kv_f16,
+                );
+                Ok(())
+            }
             Op::FusedQKV { layer } => {
                 let meta = match &node.meta {
                     NodeMeta::FusedQkv(m) => m,
@@ -1215,6 +1289,9 @@ impl Backend for CudaBackend {
             // when the loader registered blk.{i}.attn_qkv, the same gate as
             // Metal — see qkv_concat_available / CParams.fuse_qkv).
             | Op::FusedQKV { .. }
+            // D3-8: mixed-quant QKV epilogue (class 2) — same pointer-form
+            // kernel as FusedQKV's epilogue on three separate matmul outputs
+            | Op::QkvBiasRopeStore { .. }
             | Op::FusedFFN => true,
             // MatMul ttype gating happens at the model level (weights must all
             // be registered on CUDA — same all-or-nothing rule as Metal).

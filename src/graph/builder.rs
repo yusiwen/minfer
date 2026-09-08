@@ -8,7 +8,7 @@ use crate::vec_ops::RopeStyle;
 
 use super::ops::{
     AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, FusedQkvNormMeta, KvcacheMeta,
-    MatMulMeta, NodeMeta, NormMeta, Op, RoPEMeta,
+    MatMulMeta, NodeMeta, NormMeta, Op, QkvBiasRopeStoreMeta, RoPEMeta,
 };
 use super::{CNode, ComputeGraph, DType, NodeId};
 
@@ -206,6 +206,36 @@ impl GraphBuilder {
             [od_total, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedQkv(meta),
+        )
+    }
+
+    /// decode (nt==1) fused FFN gate+up: one concat matmul (`ffn_gu`) whose
+    /// output buffer carries gate (rows 0..nf) and up (nf..2*nf); a single
+    /// in-place swiglu pass folds silu(gate)*up into the gate rows. The next
+    /// down matmul reads rows 0..nf (od = nf). Output shape = [2*nf, nt].
+    /// decode (nt==1) QKV epilogue for mixed-quant layers (D3-8): q/k/v are
+    /// the THREE SEPARATE wq/wk/wv matmul outputs (no concat matmul — mixed
+    /// quant types); the kernel applies the three biases, ropes q/k in place,
+    /// and stores k/v into the persistent regions (kv_pair). Output aliases
+    /// q's buffer (in-place; the allocator's sole-consumer alias applies
+    /// because attention reads THIS node). Output shape = q's shape [nqt, nt].
+    pub fn qkv_bias_rope_store(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        pos: NodeId,
+        layer: usize,
+        meta: QkvBiasRopeStoreMeta,
+    ) -> NodeId {
+        let shape = self.graph.nodes[q].out_shape;
+        self.node(
+            "qkv_bias_rope_store",
+            Op::QkvBiasRopeStore { layer },
+            &[q, k, v, pos],
+            shape,
+            DType::F32,
+            NodeMeta::QkvBiasRopeStore(meta),
         )
     }
 
