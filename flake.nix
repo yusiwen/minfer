@@ -19,6 +19,11 @@
       };
     in {
       devShells.default = pkgs.mkShell {
+        # Provide a real locale archive so a macos host `LC_ALL=en_US.UTF-8`
+        # is honored — otherwise the nix bash warns "cannot change locale
+        # (en_US.UTF-8)" on every command.
+        buildInputs = [ pkgs.glibcLocales ];
+        LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
         nativeBuildInputs = [
           rust
           pkgs.pkg-config
