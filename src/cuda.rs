@@ -2493,7 +2493,17 @@ impl CudaState {
                 // Shape gate: see the Q5_K arm comment (measured od*id
                 // crossover ~24M elements; below it the padded f32 kernel's
                 // coalesced loop wins, above it MMVQ's dp4a wins).
-                if nt == 1 && id % 32 == 0 && od * id >= 24_000_000 && !Self::no_kq_mmvq() {
+                // D3-7 2b: gate lowered 24M -> 4M for the attn_v class —
+                // the 14B attn_v (od 1024 x id 5120 = 5.24M, 11 layers)
+                // sat on the padded-f32 kernel at 134.8 GB/s (D3-1 census)
+                // while its q6_K MMVQ siblings sustain the 200-225 GB/s
+                // class; attn_v/attn_o share the attention-output buffer
+                // and id, so the D3-5 MmqCache dedupes their standalone
+                // quantize to one launch. GGUF census: no other q6_K shape
+                // falls in (4M, 24M) (7B attn_v 1.8M stays padded-f32).
+                // Tolerance-gated (f32->q8 activation rounding): D3a
+                // package; MINFER_NO_KQ_MMVQ=1 keeps the padded kernel.
+                if nt == 1 && id % 32 == 0 && od * id >= 4_000_000 && !Self::no_kq_mmvq() {
                     self.q6_k_decode_mmvq(wptr, x, out, od, id, nt, padded_q6k);
                     Ok(())
                 } else if padded_q6k {
