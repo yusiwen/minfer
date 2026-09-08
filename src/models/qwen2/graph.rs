@@ -297,10 +297,7 @@ impl Qwen2Graph {
         {
             crate::cuda::concat_rows_feasible(&[wq, wk, wv])
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            all(feature = "cuda", not(target_os = "macos"))
-        )))]
+        #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
         {
             let _ = (wq, wk, wv);
             false
@@ -683,40 +680,44 @@ impl Qwen2Graph {
     /// the weights the graph executes, now INCLUDING `tok_embd` (7e③ gave the
     /// embedding a device gather+dequant kernel — the exclusion was removed).
     /// Two conditions per weight: registered on the CUDA registry, and a type
-    /// with the matching kernel — f32-activation matmuls (Q5_0/Q5_1/Q5_K/F32
-    /// matmuls have none) and embed gathers (F32/Q4_0/Q8_0/Q4_K/Q6_K; Q4_1
-    /// has no embed kernel). The loader registers some unsupported types for
-    /// the legacy path, so the type check is required here. Norm/bias weights
-    /// are f32 and only need registration.
+    /// with the matching kernel — matmuls cover Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and
+    /// the K-quants, embed gathers every type EXCEPT Q4_1 (no embed kernel).
+    /// The loader registers some unsupported types for the legacy path, so the
+    /// type check is required here. Norm/bias weights are f32 and only need
+    /// registration.
     #[cfg(feature = "cuda")]
     fn weights_on_cuda(model: &Qwen2Model) -> bool {
         use crate::tensor::TensorType;
+        fn matmul_t_ok(t: &crate::tensor::Tensor, cuda: &crate::cuda::CudaState) -> bool {
+            matches!(t.ttype, |TensorType::Q4_0| TensorType::Q8_0
+                | TensorType::Q4_1
+                | TensorType::Q4_K
+                | TensorType::Q5_0
+                | TensorType::Q6_K
+                | TensorType::F32
+                | TensorType::Q5_1
+                | TensorType::Q5_K)
+                && cuda.has_weight_of_size(&t.name, t.data().len())
+        }
         fn matmul_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
-                Some(t) => {
-                    matches!(t.ttype, |TensorType::Q4_0| TensorType::Q8_0
-                        | TensorType::Q4_1
-                        | TensorType::Q4_K
-                        | TensorType::Q6_K
-                        | TensorType::F32
-                        | TensorType::Q5_1
-                        | TensorType::Q5_K)
-                        && cuda.has_weight_of_size(&t.name, t.data().len())
-                }
+                Some(t) => matmul_t_ok(t, cuda),
                 None => true,
             }
         }
+        fn embed_t_ok(t: &crate::tensor::Tensor, cuda: &crate::cuda::CudaState) -> bool {
+            matches!(t.ttype, |TensorType::F32| TensorType::Q4_0
+                | TensorType::Q8_0
+                | TensorType::Q4_K
+                | TensorType::Q5_0
+                | TensorType::Q6_K
+                | TensorType::Q5_1
+                | TensorType::Q5_K)
+                && cuda.has_weight_of_size(&t.name, t.data().len())
+        }
         fn embed_ok(t: &Option<crate::tensor::Tensor>, cuda: &crate::cuda::CudaState) -> bool {
             match t {
-                Some(t) => {
-                    matches!(t.ttype, |TensorType::F32| TensorType::Q4_0
-                        | TensorType::Q8_0
-                        | TensorType::Q4_K
-                        | TensorType::Q6_K
-                        | TensorType::Q5_1
-                        | TensorType::Q5_K)
-                        && cuda.has_weight_of_size(&t.name, t.data().len())
-                }
+                Some(t) => embed_t_ok(t, cuda),
                 None => true,
             }
         }
@@ -748,32 +749,38 @@ impl Qwen2Graph {
                 && matmul_ok(&l.ffn_down, &cuda);
         }
         if !ok {
-            // TEMP DIAGNOSTIC: identify the first weight that fails the gate
-            let fail = [&model.output]
-                .into_iter()
+            // Identify the first weight that fails the gate (same checks, same
+            // order as above; 0 = embed, 1 = matmul, 2 = registered-only) so
+            // the message names the tensor instead of a generic complaint.
+            let fail = std::iter::once((&model.tok_embd, 0u8))
+                .chain(std::iter::once((&model.output, 1u8)))
+                .chain(std::iter::once((&model.output_norm, 2u8)))
+                .chain(std::iter::once((&model.output_b, 2u8)))
                 .chain(model.layers.iter().flat_map(|l| {
                     [
-                        &l.attn_norm,
-                        &l.wq,
-                        &l.bq,
-                        &l.wk,
-                        &l.bk,
-                        &l.wv,
-                        &l.bv,
-                        &l.wo,
-                        &l.ffn_norm,
-                        &l.ffn_gate,
-                        &l.ffn_up,
-                        &l.ffn_down,
+                        (&l.attn_norm, 2u8),
+                        (&l.wq, 1u8),
+                        (&l.bq, 2u8),
+                        (&l.wk, 1u8),
+                        (&l.bk, 2u8),
+                        (&l.wv, 1u8),
+                        (&l.bv, 2u8),
+                        (&l.wo, 1u8),
+                        (&l.ffn_norm, 2u8),
+                        (&l.ffn_gate, 1u8),
+                        (&l.ffn_up, 1u8),
+                        (&l.ffn_down, 1u8),
                     ]
                 }))
-                .find(|t| match t {
-                    Some(t) => !cuda.has_weight_of_size(&t.name, t.data().len()),
-                    None => false,
+                .find(|(t, kind)| match (t, kind) {
+                    (Some(t), 0) => !embed_t_ok(t, &cuda),
+                    (Some(t), 1) => !matmul_t_ok(t, &cuda),
+                    (Some(t), _) => !cuda.has_weight_of_size(&t.name, t.data().len()),
+                    (None, _) => false,
                 });
-            if let Some(Some(t)) = fail {
+            if let Some((Some(t), _)) = fail {
                 eprintln!(
-                    "CUDA GATE: weight '{}' (type {:?}) not registered on CUDA",
+                    "CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered",
                     t.name, t.ttype
                 );
             } else {

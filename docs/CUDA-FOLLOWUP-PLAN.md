@@ -546,6 +546,42 @@ combine weights to zero). 148 → 79 us/layer; 7B @2K decode 39.2 →
 Parity locked by the extended `cuda_attn_split_decode_parity`
 (chunk-boundary nkv sweep × f16/f32 KV).
 
+## 8q. Q5_0 CUDA enablement + GB10 misaligned-load fix — DONE 2026-09-08
+
+0.5B q4_k_m GGUFs carry Q5_0 weights (token_embd, per-layer attn_q/k/v/o,
+ffn_gate/up; attn_v q8_0, ffn_down q6_K, output q8_0), but the CUDA
+participation whitelist (`models/{qwen2,qwen3}/graph.rs`) predated Q5_0, so
+the whole model silently fell back to CPU (148.7 tok/s prefill) behind a
+per-token `CUDA GATE: a matmul weight has an unsupported type` spam.
+
+Enablement (type-symmetric, no dispatch changes): gate whitelists extended
+with Q5_0 via `matmul_t_ok`/`embed_t_ok` helpers + a diagnostic that names
+the offending weight, type, and reason; `cuda.rs` gains the
+`embed_rows_on_gpu` arm (type_id 6) and a `launch_q5_0_f32_matmul`
+dispatch arm; `cuda_kernels.cu` gains `embed_rows_q5_0` and
+`q5_0_f32_matmul` (f32-activation legacy structure, warp-per-4-rows).
+Prefill GEMM/MMQ reuse the existing type-agnostic path (Q5_0 was already
+in their type lists).
+
+**The fault that mattered**: the first end-to-end run died in a sticky
+`cudaErrorMisalignedAddress` (716) cascade (allocs/launches/syncs failing
+from the first prefill matmul onward, then a null-device-pointer panic at
+decode). Root cause: the Q5_0 block is 22 bytes, so the `qh` word at block
+offset 2 is NOT 4-byte aligned for even block indices — a
+`reinterpret_cast<const uint32_t*>` load misaligns, which is illegal per
+CUDA's alignment contract; on GB10 unified memory it faults
+nondeterministically depending on page-mapping state (small-shape parity
+tests passed, the real 93.6 MB tok_embd faulted). Fix: both kernels load
+`qh` as two 2-byte-aligned `uint16_t` loads. No shared kernel touched.
+
+Verification: `cuda_q5_0_realshape_isolation` (new device test — embed
+shape-bisect + legacy/f16/MMQ/decode matmuls at the model's exact shapes,
+real `state.sync()` after each step because `Backend::synchronize` does
+not wait on the stream outside capture windows); full suite 173 passed;
+end-to-end clean 3/3 runs — prefill ~1200 tok/s, decode ~306 tok/s (was
+148.7 / 56.9 on CPU fallback). 7B/14B q4_k_m carry no Q5_0 tensors, so
+their dispatch is unchanged.
+
 ## 8k. Explicitly not planned (revisit only with a concrete need)
 
 FP16 activations + cuBLAS/cublasLt (large-GEMM path), VMM pool,

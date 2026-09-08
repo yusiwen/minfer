@@ -803,8 +803,8 @@ impl CudaBackend {
                         node.name, meta.hd
                     ));
                 }
-                let (k_id, v_id) = kv_pair
-                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 // q: in-place (out aliases the q input; copy when it doesn't)
                 if in_bufs[0] != out_buf {
                     self.copy_d2d(in_bufs[0], out_buf)?;
@@ -885,8 +885,8 @@ impl CudaBackend {
                     self.state.is_weight_padded(&meta.qkv_weight),
                 )?;
                 // 2) fused bias + rope + KV store in one kernel pass
-                let (k_id, v_id) = kv_pair
-                    .ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 let bias_ptr = |name: &Option<String>| -> Result<*mut std::ffi::c_void, String> {
                     match name {
                         Some(n) => self.state.get_weight_ptr(n).ok_or_else(|| {
@@ -3078,6 +3078,31 @@ mod tests {
         );
         t40.name = "ewq40".to_string();
 
+        // q5_0 (22B blocks: f16 d + u32 qh + 16 nibble bytes; value =
+        // nibble + 16*high_bit - 16) — the tok_embd type of 0.5B q4_k_m GGUFs
+        let mut w50 = Vec::new();
+        for r in 0..vocab {
+            for ib in 0..n_embd / 32 {
+                let d = 0.03f32 + 0.004 * ((r * 3 + ib * 2) % 5) as f32;
+                w50.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                let qh: u32 = (((r * 13 + ib * 7) % 5) as u32) << 17
+                    | (((r * 5 + ib * 3) % 7) as u32) << 3
+                    | 0b101;
+                w50.extend_from_slice(&qh.to_le_bytes());
+                for i in 0..16 {
+                    let lo = ((r * 11 + ib * 7 + i * 3) % 31) as u8;
+                    let hi = ((r * 7 + ib * 5 + i) % 31) as u8;
+                    w50.push(lo | (hi << 4));
+                }
+            }
+        }
+        let mut t50 = Tensor::from_data(
+            TensorType::Q5_0,
+            &[n_embd as i64, vocab as i64, 1, 1],
+            w50.clone(),
+        );
+        t50.name = "ewq50".to_string();
+
         // q4_k (144B super-blocks) — same generator scheme as the matmul test
         let mut w4k = Vec::new();
         for r in 0..vocab {
@@ -3137,6 +3162,7 @@ mod tests {
         cb.state.register_weight("ewf32", &wf_bytes);
         cb.state.register_weight("ewq8", &w8);
         cb.state.register_weight("ewq40", &w40);
+        cb.state.register_weight("ewq50", &w50);
         cb.state.register_weight("ewq4k", &w4k);
         cb.state.register_weight("ewq6k", &w6k);
         cb.state
@@ -3148,6 +3174,7 @@ mod tests {
         let e_f32 = b.embedding(ids_in, &tf);
         let e_q8 = b.embedding(ids_in, &t8);
         let e_q40 = b.embedding(ids_in, &t40);
+        let e_q50 = b.embedding(ids_in, &t50);
         let e_q4k = b.embedding(ids_in, &t4k);
         let e_q6k = b.embedding(ids_in, &t6k);
         let e_q6kp = b.embedding(ids_in, &t6kp);
@@ -3193,7 +3220,7 @@ mod tests {
         // every id is in range
         let xin = b.input("x", [n_embd, vocab, 1, 1], DType::F32);
         let gr = b.get_rows(xin, ids_in, [n_embd, nt, 1, 1]);
-        for n in [e_f32, e_q8, e_q40, e_q4k, e_q6k, e_q6kp, gr] {
+        for n in [e_f32, e_q8, e_q40, e_q50, e_q4k, e_q6k, e_q6kp, gr] {
             b.output(n);
         }
         let g = b.build();
@@ -3207,7 +3234,7 @@ mod tests {
         cb.write_host(xb, &xvals).unwrap();
 
         let mut outs = Vec::new();
-        for node in [e_f32, e_q8, e_q40, e_q4k, e_q6k, e_q6kp] {
+        for node in [e_f32, e_q8, e_q40, e_q50, e_q4k, e_q6k, e_q6kp] {
             let out = cb.alloc_buffer(n_embd * nt);
             cb.execute_node(&g.nodes[node], &[idsb], out, None).unwrap();
             outs.push(out);
@@ -3217,8 +3244,8 @@ mod tests {
             .unwrap();
 
         // ── references ──
-        let names = ["f32", "q8_0", "q4_0", "q4_k", "q6_k", "q6_k padded"];
-        let tensors = [&tf, &t8, &t40, &t4k, &t6k, &t6kp];
+        let names = ["f32", "q8_0", "q4_0", "q5_0", "q4_k", "q6_k", "q6_k padded"];
+        let tensors = [&tf, &t8, &t40, &t50, &t4k, &t6k, &t6kp];
         for ((name, t), &ob) in names.iter().zip(tensors).zip(outs.iter()) {
             let got = cb.copy_to_host(ob).unwrap();
             let mut want = vec![0f32; n_embd * nt];
@@ -5107,6 +5134,78 @@ mod tests {
             }
         }
 
+        // ── Q5_0: od 8, id 64 (2 blocks / row) — the tok_embd type of the
+        // 0.5B q4_k_m GGUFs; decode f32-activation kernel parity ──
+        {
+            let (od, id) = (8usize, 64usize);
+            let nb = id / 32;
+            let mut wq = Vec::new();
+            for r in 0..od {
+                for b in 0..nb {
+                    let d = 0.02f32 + 0.003 * ((r * 5 + b) % 7) as f32;
+                    wq.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let u_lo = ((r * 11 + b * 7 + j * 3) % 32) as u32;
+                        let u_hi = ((r * 7 + b * 5 + j) % 32) as u32;
+                        qs[j] = ((u_lo & 0xF) | ((u_hi & 0xF) << 4)) as u8;
+                        qh |= ((u_lo >> 4) & 1) << j;
+                        qh |= ((u_hi >> 4) & 1) << (j + 16);
+                    }
+                    wq.extend_from_slice(&qh.to_le_bytes());
+                    wq.extend_from_slice(&qs);
+                }
+            }
+            let state = cb.state;
+            state.register_weight("w50", &wq);
+            let wptr = state.get_weight_ptr("w50").unwrap();
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                .collect();
+            let xb = cb.alloc_buffer(id * nt);
+            let out = cb.alloc_buffer(od * nt);
+            cb.write_host(xb, &xs).unwrap();
+            state
+                .matmul_f32_ptr(
+                    wptr,
+                    TensorType::Q5_0,
+                    cb.ptr_of(xb).unwrap(),
+                    cb.ptr_of(out).unwrap(),
+                    od,
+                    id,
+                    nt,
+                )
+                .unwrap();
+            cb.synchronize();
+            let got = cb.copy_to_host(out).unwrap();
+            // independent dequant reference
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut want = 0f32;
+                    for b in 0..nb {
+                        let blk = &wq[(r * nb + b) * 22..(r * nb + b) * 22 + 22];
+                        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+                        let xrow = &xs[t * id + b * 32..t * id + (b + 1) * 32];
+                        for j in 0..16 {
+                            let v_lo =
+                                ((blk[6 + j] & 0xF) as f32) + 16.0 * ((qh >> j) & 1) as f32 - 16.0;
+                            let v_hi = ((blk[6 + j] >> 4) as f32)
+                                + 16.0 * ((qh >> (j + 16)) & 1) as f32
+                                - 16.0;
+                            want += d * (v_lo * xrow[j] + v_hi * xrow[j + 16]);
+                        }
+                    }
+                    assert!(
+                        (got[t * od + r] - want).abs() < 5e-3,
+                        "q5_0 [{t}][{r}] {} vs {want}",
+                        got[t * od + r]
+                    );
+                }
+            }
+        }
+
         // ── Q5_K: od 8, id 896 (PARTIAL tail super-block: 3.5 × 256) ──
         // Weight values are GENERATED from the decode formula with random
         // per-sub w (0..31) against scales unpacked from random sc bytes —
@@ -5236,6 +5335,197 @@ mod tests {
     // q5_K qh layout: byte l, bit sub = the >16 bit of element (sub, l)
     fn qh_byte(qh: &mut [u8], l: usize, sub: usize, w: u8) {
         qh[l] |= ((w >> 4) & 1) << sub;
+    }
+
+    /// Q5_0 real-shape isolation: 0.5B q4_k_m was the first model to reach
+    /// CUDA with Q5_0 weights, and an end-to-end run died with a sticky
+    /// cudaErrorMisalignedAddress (716). Run every Q5_0 device path at the
+    /// model's REAL shapes with a sync after each step so the first faulting
+    /// path is identified exactly (small-shape parity above already proves
+    /// the math; this test targets shape/alignment coverage).
+    #[test]
+    fn cuda_q5_0_realshape_isolation() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let nt = 30usize; // the "Hello" prompt length
+        macro_rules! step {
+            ($tag:expr, $run:expr) => {{
+                // Backend::synchronize() does NOT wait on the stream outside a
+                // capture window — use the real state sync so an async fault
+                // surfaces HERE, not at the next cudaMalloc.
+                eprintln!("[isolation] begin {}", $tag);
+                $run;
+                cb.state.sync();
+                eprintln!("[isolation] end {}", $tag);
+            }};
+        }
+        cb.state.sync(); // baseline: context healthy after CudaBackend::new()
+        eprintln!("[isolation] baseline sync done");
+
+        // ── 0. embed bisect: isolate the fault dimension. Parity (6-row
+        //    table, ids [0,5,2], nt=3, n_embd=512) is clean; the model-real
+        //    (4096-row table, ids [7,1020,2033]) faults. Vary one dimension
+        //    at a time: table size, id values. ──
+        let n_embd_b = 512usize;
+        let nb_b = n_embd_b / 32; // 16
+        let build_table = |rows: usize| -> Vec<u8> {
+            let mut t = Vec::new();
+            for r in 0..rows {
+                for ib in 0..nb_b {
+                    let d = 0.02f32 + 0.003 * ((r * 5 + ib) % 7) as f32;
+                    t.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let u_lo = ((r * 11 + ib * 7 + j * 3) % 32) as u32;
+                        let u_hi = ((r * 7 + ib * 5 + j) % 32) as u32;
+                        qs[j] = ((u_lo & 0xF) | ((u_hi & 0xF) << 4)) as u8;
+                        qh |= ((u_lo >> 4) & 1) << j;
+                        qh |= ((u_hi >> 4) & 1) << (j + 16);
+                    }
+                    t.extend_from_slice(&qh.to_le_bytes());
+                    t.extend_from_slice(&qs);
+                }
+            }
+            t
+        };
+        let cases: [(&str, usize, &[u32]); 5] = [
+            ("a_smalltable_parityids", 6, &[0, 5, 2]),
+            ("b_bigtable_parityids", 4096, &[0, 5, 2]),
+            ("c_bigtable_bigids", 4096, &[7, 1020, 2033]),
+            ("d_smalltable_midids", 16, &[7, 12, 15]),
+            ("e_bigtable_row7only", 4096, &[7, 7, 7]),
+        ];
+        for &(cname, rows, ids) in &cases {
+            let tbl = build_table(rows);
+            let name = format!("iso_emb_{cname}");
+            cb.state.register_weight(&name, &tbl);
+            let wptr = cb.state.get_weight_ptr(&name).unwrap();
+            let ids_f: Vec<f32> = ids.iter().map(|&i| f32::from_bits(i)).collect();
+            let idb = cb.alloc_buffer(ids.len());
+            cb.write_host(idb, &ids_f).unwrap();
+            let ob = cb.alloc_buffer(n_embd_b * ids.len());
+            step!(format!("embed {cname}"), {
+                cb.state
+                    .embed_rows_on_gpu(
+                        TensorType::Q5_0,
+                        wptr,
+                        cb.ptr_of(idb).unwrap(),
+                        cb.ptr_of(ob).unwrap(),
+                        n_embd_b,
+                        ids.len(),
+                        false,
+                    )
+                    .unwrap();
+            });
+        }
+
+        // ── 2-5. prefill + decode matmuls at the model's real matmul shapes
+        //    (attn_q 896x896, attn_k 896x128, ffn_gu 896x9728, ffn_down-class
+        //    896x4864) through all three prefill paths ──
+        let shapes = [
+            (896usize, 896usize),
+            (896usize, 128usize),
+            (4864usize, 896usize),
+        ];
+        for (si, &(od, id)) in shapes.iter().enumerate() {
+            let nb = id / 32;
+            let mut wq = Vec::new();
+            for r in 0..od {
+                for b in 0..nb {
+                    let d = 0.02f32 + 0.003 * ((r * 5 + b + si) % 7) as f32;
+                    wq.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let u_lo = ((r * 11 + b * 7 + j * 3) % 32) as u32;
+                        let u_hi = ((r * 7 + b * 5 + j) % 32) as u32;
+                        qs[j] = ((u_lo & 0xF) | ((u_hi & 0xF) << 4)) as u8;
+                        qh |= ((u_lo >> 4) & 1) << j;
+                        qh |= ((u_hi >> 4) & 1) << (j + 16);
+                    }
+                    wq.extend_from_slice(&qh.to_le_bytes());
+                    wq.extend_from_slice(&qs);
+                }
+            }
+            let name = format!("iso_w{si}");
+            cb.state.register_weight(&name, &wq);
+            let wptr = cb.state.get_weight_ptr(&name).unwrap();
+            let xs: Vec<f32> = (0..id * nt)
+                .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+                .collect();
+            let xb = cb.alloc_buffer(id * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let out = cb.alloc_buffer(od * nt);
+
+            // 2. legacy f32-activation kernel (also the decode kernel)
+            step!(format!("legacy f32 matmul od={od} id={id} nt={nt}"), {
+                cb.state
+                    .matmul_f32_ptr(
+                        wptr,
+                        TensorType::Q5_0,
+                        cb.ptr_of(xb).unwrap(),
+                        cb.ptr_of(out).unwrap(),
+                        od,
+                        id,
+                        nt,
+                    )
+                    .unwrap();
+            });
+
+            // 3. f16 wmma GEMM path (MINFER_MMQ=0 territory)
+            step!(format!("f16 GEMM od={od} id={id} nt={nt}"), {
+                cb.state
+                    .prefill_gemm_f16_inner(
+                        wptr,
+                        TensorType::Q5_0,
+                        cb.ptr_of(xb).unwrap(),
+                        cb.ptr_of(out).unwrap(),
+                        od,
+                        id,
+                        nt,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+            });
+
+            // 4. MMQ int8 GEMM path (the r60 default)
+            step!(format!("MMQ od={od} id={id} nt={nt}"), {
+                cb.state
+                    .prefill_mmq(
+                        wptr,
+                        TensorType::Q5_0,
+                        cb.ptr_of(xb).unwrap(),
+                        cb.ptr_of(out).unwrap(),
+                        od,
+                        id,
+                        nt,
+                        false,
+                    )
+                    .unwrap();
+            });
+
+            // 5. decode nt==1 through the top dispatch (routing check)
+            let x1 = cb.alloc_buffer(id);
+            cb.write_host(x1, &xs[..id]).unwrap();
+            let o1 = cb.alloc_buffer(od);
+            step!(format!("decode dispatch od={od} id={id} nt=1"), {
+                cb.state
+                    .matmul_f32_ptr(
+                        wptr,
+                        TensorType::Q5_0,
+                        cb.ptr_of(x1).unwrap(),
+                        cb.ptr_of(o1).unwrap(),
+                        od,
+                        id,
+                        1,
+                    )
+                    .unwrap();
+            });
+        }
     }
 
     #[test]

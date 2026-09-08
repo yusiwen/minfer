@@ -652,6 +652,15 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_q5_0_f32_matmul(
+        weights: *const u8,
+        acts: *const f32,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_k_f32_matmul(
         weights: *const u8,
         acts: *const f32,
@@ -2483,6 +2492,7 @@ impl CudaState {
                 }
             }
             TensorType::Q5_1 => launch!(launch_q5_1_f32_matmul),
+            TensorType::Q5_0 => launch!(launch_q5_0_f32_matmul),
             TensorType::Q5_K => {
                 // 8f: partial tail super-blocks are masked at 32-element
                 // granularity inside the kernel — finer tails unsupported.
@@ -2547,7 +2557,7 @@ impl CudaState {
                 Ok(())
             }
             other => Err(format!(
-                "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q8_0/Q4_1/Q4_K/Q6_K)"
+                "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K)"
             )),
         }
     }
@@ -3682,13 +3692,7 @@ impl CudaState {
         let q8 = Self::get_or_grow(&self.buf_q8_decode, (n / 32) * 40);
         let stream = self.stream();
         unsafe {
-            launch_swiglu_quant_pad40(
-                buf as *mut f32,
-                q8 as *mut u8,
-                n as i32,
-                off as i32,
-                stream,
-            );
+            launch_swiglu_quant_pad40(buf as *mut f32, q8 as *mut u8, n as i32, off as i32, stream);
         }
         self.record_mmq_cache_native(buf as usize, 1, n, q8 as usize);
     }
@@ -3734,6 +3738,7 @@ impl CudaState {
             TensorType::Q8_0 => (0i32, 34i32),
             TensorType::Q4_0 => (1, 18),
             TensorType::Q4_K => (2, 144),
+            TensorType::Q5_0 => (6, 22),
             TensorType::Q5_1 => (4, 24),
             TensorType::Q5_K => (5, 176),
             TensorType::Q6_K => (3, if padded_q6k { 224 } else { 210 }),
@@ -4685,7 +4690,6 @@ impl CudaState {
     }
 }
 
-
 #[cfg(test)]
 mod d35_probe_tests {
     use super::*;
@@ -4814,45 +4818,32 @@ mod d35_probe_tests {
         let do_a = dev_alloc(od * 4);
         let do_b = dev_alloc(od * 4);
         st.register_weight("d35_probe_w4", &gen_q4_k(od, d));
-        let wq = st.get_weight_ptr("d35_probe_w4").expect("weight registered");
+        let wq = st
+            .get_weight_ptr("d35_probe_w4")
+            .expect("weight registered");
 
         // path A (pre-D3-5 shape): plain rms; matmul cache-cleared -> the
         // standalone quantize launch inside the decode matmul
         st.clear_mmq_cache();
         st.rms_norm(dx, Some(dw), dy_a, d, 1, eps);
-        st.matmul_f32_ptr_layout(
-            wq,
-            TensorType::Q4_K,
-            dy_a,
-            do_a,
-            od,
-            d,
-            1,
-            false,
-        )
-        .unwrap();
+        st.matmul_f32_ptr_layout(wq, TensorType::Q4_K, dy_a, do_a, od, d, 1, false)
+            .unwrap();
         let q8_a = read_q8(st, (d / 32) * 40);
 
         // path B: fused rms (records the plane) + matmul (cache hit)
         st.clear_mmq_cache();
         st.rms_norm_quant_on_gpu(dx, dw, dy_b, d, 1, eps);
-        st.matmul_f32_ptr_layout(
-            wq,
-            TensorType::Q4_K,
-            dy_b,
-            do_b,
-            od,
-            d,
-            1,
-            false,
-        )
-        .unwrap();
+        st.matmul_f32_ptr_layout(wq, TensorType::Q4_K, dy_b, do_b, od, d, 1, false)
+            .unwrap();
         let q8_b = read_q8(st, (d / 32) * 40);
 
         assert_eq!(q8_a, q8_b, "rms epilogue q8 bytes differ from standalone");
         let y_a = d2h_f32(dy_a, d);
         let y_b = d2h_f32(dy_b, d);
-        assert!(bits_eq(&y_a, &y_b), "fused rms f32 output not bit-identical");
+        assert!(
+            bits_eq(&y_a, &y_b),
+            "fused rms f32 output not bit-identical"
+        );
         let o_a = d2h_f32(do_a, od);
         let o_b = d2h_f32(do_b, od);
         assert!(bits_eq(&o_a, &o_b), "MMVQ output diverged (rms path)");
@@ -4877,38 +4868,26 @@ mod d35_probe_tests {
 
         st.clear_mmq_cache();
         st.swiglu_f32_off_on_gpu(db_a, nf, nf);
-        st.matmul_f32_ptr_layout(
-            wq2,
-            TensorType::Q4_K,
-            db_a,
-            da_a,
-            odf,
-            nf,
-            1,
-            false,
-        )
-        .unwrap();
+        st.matmul_f32_ptr_layout(wq2, TensorType::Q4_K, db_a, da_a, odf, nf, 1, false)
+            .unwrap();
         let q8_a2 = read_q8(st, (nf / 32) * 40);
 
         st.clear_mmq_cache();
         st.swiglu_quant_off_on_gpu(db_b, nf, nf);
-        st.matmul_f32_ptr_layout(
-            wq2,
-            TensorType::Q4_K,
-            db_b,
-            da_b,
-            odf,
-            nf,
-            1,
-            false,
-        )
-        .unwrap();
+        st.matmul_f32_ptr_layout(wq2, TensorType::Q4_K, db_b, da_b, odf, nf, 1, false)
+            .unwrap();
         let q8_b2 = read_q8(st, (nf / 32) * 40);
 
-        assert_eq!(q8_a2, q8_b2, "swiglu epilogue q8 bytes differ from standalone");
+        assert_eq!(
+            q8_a2, q8_b2,
+            "swiglu epilogue q8 bytes differ from standalone"
+        );
         let bu_a = d2h_f32(db_a, 2 * nf);
         let bu_b = d2h_f32(db_b, 2 * nf);
-        assert!(bits_eq(&bu_a, &bu_b), "fused swiglu f32 output not bit-identical");
+        assert!(
+            bits_eq(&bu_a, &bu_b),
+            "fused swiglu f32 output not bit-identical"
+        );
         let oa_a = d2h_f32(da_a, odf);
         let oa_b = d2h_f32(da_b, odf);
         assert!(bits_eq(&oa_a, &oa_b), "MMVQ output diverged (swiglu path)");
@@ -5072,8 +5051,8 @@ mod d38_probe_tests {
                 let dk_f = dev_alloc(ctx_elems * kv_bytes);
                 let dv_f = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
-                    q1, k1, v1, dbq, dbk, dbv, dk_f, dv_f, nqt, nkt, hd, freq_base,
-                    freq_scale, dpos, kv_f16,
+                    q1, k1, v1, dbq, dbk, dbv, dk_f, dv_f, nqt, nkt, hd, freq_base, freq_scale,
+                    dpos, kv_f16,
                 );
 
                 // ---- FUSED form 2: three separate buffers (class-2 shape) --
@@ -5086,8 +5065,8 @@ mod d38_probe_tests {
                 let dk_f2 = dev_alloc(ctx_elems * kv_bytes);
                 let dv_f2 = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
-                    d_q2, d_k2, d_v2, dbq, dbk, dbv, dk_f2, dv_f2, nqt, nkt, hd,
-                    freq_base, freq_scale, dpos, kv_f16,
+                    d_q2, d_k2, d_v2, dbq, dbk, dbv, dk_f2, dv_f2, nqt, nkt, hd, freq_base,
+                    freq_scale, dpos, kv_f16,
                 );
 
                 // ---- UNFUSED: the 7-launch chain on split sections ----
@@ -5120,9 +5099,18 @@ mod d38_probe_tests {
                     &f1[nqt..nqt + nkt],
                     &f1[nqt + nkt..nqt + 2 * nkt],
                 );
-                assert!(bits_eq(qf, &rq), "{tag} f16={kv_f16}: concat q section diverged");
-                assert!(bits_eq(kf, &rk), "{tag} f16={kv_f16}: concat k section diverged");
-                assert!(bits_eq(vf, &rv), "{tag} f16={kv_f16}: concat v section diverged");
+                assert!(
+                    bits_eq(qf, &rq),
+                    "{tag} f16={kv_f16}: concat q section diverged"
+                );
+                assert!(
+                    bits_eq(kf, &rk),
+                    "{tag} f16={kv_f16}: concat k section diverged"
+                );
+                assert!(
+                    bits_eq(vf, &rv),
+                    "{tag} f16={kv_f16}: concat v section diverged"
+                );
                 assert!(
                     bits_eq(&d2h_f32(d_q2, nqt), &rq)
                         && bits_eq(&d2h_f32(d_k2, nkt), &rk)

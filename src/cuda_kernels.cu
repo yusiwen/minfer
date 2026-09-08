@@ -308,6 +308,67 @@ __global__ void q4_1_f32_matmul(
 // Q5_1 block: 24 bytes / 32 elements — f16 d, f16 m, u32 qh (bit j ↔ elem j,
 // bit j+16 ↔ elem j+16), 16 bytes qs (byte j: low nibble = elem j, high =
 // elem j+16). Value = d * unsigned_5bit + m (NO −16 offset — Q5_1 has a min).
+// Structure mirrors q5_1_f32_matmul (4 rows/warp, 2 warps/block, lanes
+// stride 32-element blocks). Q5_0: 22B = f16 d + u32 qh + 16 nibble bytes;
+// value = nibble + 16*high_bit − 16 (no per-block min, unlike Q5_1).
+__global__ void q5_0_f32_matmul(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int t = blockIdx.y;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+    if (t >= nt || r0 >= od) return;
+
+    int nb = id / 32;
+    int row_stride = nb * 22;
+    const float* y = acts + (size_t)t * id;
+
+    float acc[NR0];
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+
+    for (int b = lane_id; b < nb; b += WARP) {
+        const float* xb = y + b * 32;
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) {
+            int o = r0 + rr;
+            if (o >= od) break;
+            const uint8_t* blk = weights + (size_t)o * row_stride + b * 22;
+            float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+            // qh at block offset 2 is not 4-byte aligned (22B stride) — two
+            // aligned u16 loads; misaligned u32 faults nondeterministically
+            // on GB10 unified memory (err 716).
+            uint32_t qh = (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2)
+                        | ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 4) << 16);
+            const uint8_t* qs = blk + 6;
+            float sdot = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                float u_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1) - 16.0f;
+                float u_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1) - 16.0f;
+                sdot += u_lo * xb[j] + u_hi * xb[j + 16];
+            }
+            acc[rr] += d * sdot;
+        }
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < NR0; rr++) {
+        int o = r0 + rr;
+        if (o < od) {
+            float v = warp_reduce_sum(acc[rr]);
+            if (lane_id == 0) output[t * od + o] = v;
+        }
+    }
+}
+
 // Structure mirrors q4_0_f32_matmul (4 rows/warp, 2 warps/block, lanes
 // stride 32-element blocks).
 __global__ void q5_1_f32_matmul(
@@ -3251,6 +3312,40 @@ __global__ void embed_rows_q5_1(
     }
 }
 
+// Q5_0: one thread per 32-element block (22B = f16 d + u32 qh + 16 qs bytes);
+// value = d * (nibble + 16*high_bit - 16) — matches quants.rs dot_q5_0_q8_0
+// and kernel.rs's CPU embed path.
+__global__ void embed_rows_q5_0(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    const int BS = 22;
+    int nb = n_embd / 32;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nb) return;
+    int t = tid / nb, b = tid % nb;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    const uint8_t* blk = w + ((long long)id * nb + b) * BS;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    // qh sits at block offset 2 — NOT 4-byte aligned for even block indices
+    // (22-byte stride). Two 2-byte-aligned u16 loads instead of one misaligned
+    // u32: misaligned u32 loads fault nondeterministically on GB10 unified
+    // memory (err 716) depending on page-mapping state.
+    uint32_t qh = (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2)
+                | ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 4) << 16);
+    const uint8_t* qs = blk + 6;
+    float* o = out + (long long)t * n_embd + b * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        float v_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1) - 16.0f;
+        float v_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1) - 16.0f;
+        o[j] = d * v_lo;
+        o[j + 16] = d * v_hi;
+    }
+}
+
 // Q5_K: one thread per 32-element sub-block (8 per 176-byte super-block);
 // masked at n_embd for partial tail super-blocks (id % 32 == 0 layouts).
 __global__ void embed_rows_q5_k(
@@ -3297,6 +3392,8 @@ void launch_embed_rows(
         total = (long long)nt * (n_embd / 256) * 8;
     } else if (type_id == 4) {          // q5_1: one per 32-element block
         total = (long long)nt * (n_embd / 32);
+    } else if (type_id == 6) {          // q5_0: one per 32-element block
+        total = (long long)nt * (n_embd / 32);
     } else if (type_id == 5) {          // q5_K: one per 32-element sub-block
         total = (long long)nt * ((n_embd + 31) / 32);
     } else {                            // q6_K: one per 16-element sub-block
@@ -3310,6 +3407,7 @@ void launch_embed_rows(
         case 2: embed_rows_q4_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 4: embed_rows_q5_1<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 5: embed_rows_q5_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
+        case 6: embed_rows_q5_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         default: embed_rows_q6_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt, block_stride); break;
     }
 }
@@ -3428,6 +3526,16 @@ void launch_q5_1_f32_matmul(
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
     q5_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+}
+
+void launch_q5_0_f32_matmul(
+    const uint8_t* weights, const float* acts, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const int NR0 = 4, NSG = 2;
+    dim3 block(64, 1, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    q5_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
 void launch_q5_k_f32_matmul(
