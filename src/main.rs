@@ -242,10 +242,13 @@ fn main() {
             }
             "--gpu" => {
                 if let Some(v) = next_val(a) {
-                    gpu = v.parse().unwrap_or_else(|_| {
-                        parse_err = Some(format!("invalid --gpu '{v}'"));
-                        None
-                    });
+                    gpu = match v.parse::<i32>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            parse_err = Some(format!("invalid --gpu '{v}'"));
+                            None
+                        }
+                    };
                 }
                 i += 2;
             }
