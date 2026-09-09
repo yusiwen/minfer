@@ -1660,6 +1660,90 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_pf(
     mmvq_block_reduce(acc, output, od, t);
 }
 
+// ─── D4-4 L1: dense split-plane (dpl) q6_K decode MMVQ ─────────────────────
+// Sibling plane built at registration (q6k_dpl map, keyed by the padded
+// weight's device pointer): per row [ql: nbe*128][qh: nbe*64][sc: nbe*16]
+// [d: nbe*2] at a 16B-aligned row stride — 210B of content per 256-elem
+// block, zero 224B pad sectors, every uint4 load 16B-aligned. Per-unit
+// values are byte-identical to the padded layout and the unit/accumulation
+// order is unchanged, so outputs are bitwise-identical (probe
+// /tmp/d4/probe_l1_dpl.cu: memcmp-equal vs the padded kernels on the
+// ffn_down + lm_head shapes; kernels −17%/−16.7% mean there).
+
+__device__ __forceinline__ void q6k_unit_load_dpl(
+    int u, const uint8_t* __restrict__ wrow, const uint8_t* __restrict__ x8row,
+    int nbe, Q6kUnitRegs* r
+) {
+    const int kbx = u >> 3, pair = u & 7;
+    const uint8_t* ql_row = wrow;
+    const uint8_t* qh_row = wrow + (size_t)nbe * 128;
+    const uint8_t* sc_row = wrow + (size_t)nbe * 192;
+    const uint8_t* d_row  = wrow + (size_t)nbe * 208;
+    r->d = h2f(*reinterpret_cast<const uint16_t*>(d_row + (size_t)kbx * 2));
+    r->sc0 = (float)(int8_t)sc_row[(size_t)kbx * 16 + 2 * pair];
+    r->sc1 = (float)(int8_t)sc_row[(size_t)kbx * 16 + 2 * pair + 1];
+    const int chunk = pair >> 2, g = pair & 3;
+    r->shift = 2 * g;
+    r->g = g;
+    const uint8_t* qlp = ql_row + (size_t)kbx * 128 + chunk * 64 + (g & 1) * 32;
+    r->qla = *reinterpret_cast<const uint4*>(qlp);
+    r->qlb = *reinterpret_cast<const uint4*>(qlp + 16);
+    const uint8_t* qhp = qh_row + (size_t)kbx * 64 + chunk * 32;
+    r->qha = *reinterpret_cast<const uint4*>(qhp);
+    r->qhb = *reinterpret_cast<const uint4*>(qhp + 16);
+    const uint8_t* x8 = x8row + (size_t)u * Q8PB;
+    r->d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+    r->xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+}
+
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_pf_dpl(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int nbe
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int row_stride = (nbe * 210 + 15) & ~15;
+    const int npair = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * (id >> 5) * Q8PB;
+    const uint8_t* wrow = weights + (size_t)row * row_stride;
+
+    float acc = 0.0f;
+    const int u0 = threadIdx.x;
+    const int u1 = u0 + 256;
+    if (u0 < npair) {
+        Q6kUnitRegs r0, r1;
+        q6k_unit_load_dpl(u0, wrow, x8row, nbe, &r0);
+        const bool two = u1 < npair;
+        if (two) q6k_unit_load_dpl(u1, wrow, x8row, nbe, &r1);
+        q6k_unit_acc(&r0, acc);
+        if (two) q6k_unit_acc(&r1, acc);
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_dpl(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int nbe
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int row_stride = (nbe * 210 + 15) & ~15;
+    const int npair = id >> 5;
+    const uint8_t* x8row = acts8 + (size_t)t * (id >> 5) * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        Q6kUnitRegs r;
+        q6k_unit_load_dpl(u, weights + (size_t)row * row_stride, x8row, nbe, &r);
+        q6k_unit_acc(&r, acc);
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
 __global__ void q6_k_f32_matmul(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ acts,
@@ -3508,6 +3592,23 @@ void launch_q6_k_q8_mmvq_v2(
 ) {
     dim3 grid(od, nt);
     q6_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+}
+
+// D4-4 L1: dense split-plane (dpl) decode launchers — see the kernel comments.
+void launch_q6_k_q8_mmvq_v2_pf_dpl(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int nbe, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q6_k_q8_mmvq_v2_pf_dpl<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
+}
+
+void launch_q6_k_q8_mmvq_v2_dpl(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int nbe, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q6_k_q8_mmvq_v2_dpl<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
 }
 
 void launch_q5_k_q8_mmvq_v2(

@@ -634,6 +634,28 @@ extern "C" {
         blk_stride: i32,
         stream: *mut std::ffi::c_void,
     );
+    // D4-4 L1: dense split-plane (dpl) decode kernels — bitwise-identical
+    // to the padded forms, no 224B pad sectors (see the kernel comments).
+    fn launch_q6_k_q8_mmvq_v2_pf_dpl(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        nbe: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q6_k_q8_mmvq_v2_dpl(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        nbe: i32,
+        stream: *mut std::ffi::c_void,
+    );
     fn launch_q5_k_q8_mmvq_v2(
         weights: *const u8,
         acts8: *const u8,
@@ -1024,6 +1046,7 @@ pub struct CudaState {
     /// so the per-kt staging is a contiguous 16-B cp.async stream. Keyed by the
     /// PADDED weight's device pointer exactly like `q6k_exp`; a miss (gate off,
     /// alloc failure, odd od) keeps the r41 scalar dsc path.
+    q6k_dpl: Mutex<HashMap<usize, CudaPtr>>,
     q6k_dsc: Mutex<HashMap<usize, CudaPtr>>,
     /// r56: the W_dsc allocation-failure warning prints once per process.
     q6k_dsc_warned: std::sync::atomic::AtomicBool,
@@ -1356,6 +1379,7 @@ impl CudaState {
             padded_weights: Mutex::new(HashMap::new()),
             q6k_exp: Mutex::new(HashMap::new()),
             q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
+            q6k_dpl: Mutex::new(HashMap::new()),
             q6k_dsc: Mutex::new(HashMap::new()),
             q6k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
             q4k_dsc: Mutex::new(HashMap::new()),
@@ -1510,6 +1534,46 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(name.to_string(), data.len());
+        // D4-4 L1: dense split-plane (dpl) decode sibling plane — per row
+        // [ql nbe*128][qh nbe*64][sc nbe*16][d nbe*2] at a 16B-aligned row
+        // stride, 210B of content per 256-elem block (no 224B pad sectors).
+        // The decode MMVQ reads it when present; per-unit values and the
+        // accumulation order are unchanged, so outputs stay bitwise-identical
+        // (probe /tmp/d4/probe_l1_dpl.cu). Requires id % 256 == 0 (exact
+        // nbe, like the W_exp plane); MINFER_Q6K_DPL=0 skips the build and
+        // decode keeps the padded kernels.
+        if Self::mmq_gate_on("MINFER_Q6K_DPL") && id % 256 == 0 {
+            let nbe = id / 256;
+            let dpl_row = (nbe * 210 + 15) & !15usize;
+            let raw_row = nbe * 210;
+            let mut dpl = vec![0u8; od * dpl_row];
+            for r in 0..od {
+                let src = &data[r * raw_row..(r + 1) * raw_row];
+                let dst = &mut dpl[r * dpl_row..(r + 1) * dpl_row];
+                let (ql, rest) = dst.split_at_mut(nbe * 128);
+                let (qh, rest) = rest.split_at_mut(nbe * 64);
+                let (sc, dd) = rest.split_at_mut(nbe * 16);
+                for ib in 0..nbe {
+                    let blk = &src[ib * 210..(ib + 1) * 210];
+                    ql[ib * 128..(ib + 1) * 128].copy_from_slice(&blk[..128]);
+                    qh[ib * 64..(ib + 1) * 64].copy_from_slice(&blk[128..192]);
+                    sc[ib * 16..(ib + 1) * 16].copy_from_slice(&blk[192..208]);
+                    dd[ib * 2..(ib + 1) * 2].copy_from_slice(&blk[208..210]);
+                }
+            }
+            let dpl_name = format!("{name}__dpl");
+            self.register_weight(&dpl_name, &dpl);
+            if let (Some(wp), Some(ep)) =
+                (self.get_weight_ptr(name), self.get_weight_ptr(&dpl_name))
+            {
+                if !wp.is_null() && !ep.is_null() {
+                    self.q6k_dpl
+                        .lock()
+                        .unwrap()
+                        .insert(wp as usize, CudaPtr(ep));
+                }
+            }
+        }
         // r53: pre-expand B into the dense centered-int8 plane (P6 r44) so the
         // NB-BT q6_K kernel's B staging is a pure cp.async copy. Ships with the
         // MINFER_MMQ_Q6K_NB gate (the NB-BT kernel is its only consumer; the
@@ -4167,6 +4231,51 @@ impl CudaState {
         // restores the unconditional standalone launch).
         let q8 = self.decode_quantize_native(x as *const f32, id, nt);
         let stream = self.stream();
+        // D4-4 L1: dense split-plane fast path (bitwise — see the
+        // registration comment). Falls through to the padded kernels when
+        // the plane is absent (MINFER_Q6K_DPL=0 / id not a multiple of
+        // 256 / map miss). The pf-vs-loop shape gate mirrors the padded
+        // dispatch below (same MINFER_Q6K_PF opt-out semantics).
+        if blk_stride_padded && Self::mmq_gate_on("MINFER_Q6K_DPL") {
+            let dwp = self
+                .q6k_dpl
+                .lock()
+                .unwrap()
+                .get(&(wptr as usize))
+                .map(|cp| cp.0);
+            if let Some(dwp) = dwp {
+                unsafe {
+                    let nbe = (id >> 8) as i32;
+                    if id > 8192
+                        && id <= 16384
+                        && !std::env::var("MINFER_Q6K_PF").map_or(false, |v| v == "0")
+                    {
+                        launch_q6_k_q8_mmvq_v2_pf_dpl(
+                            dwp as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            od as i32,
+                            id as i32,
+                            nt as i32,
+                            nbe,
+                            stream,
+                        );
+                    } else {
+                        launch_q6_k_q8_mmvq_v2_dpl(
+                            dwp as *const u8,
+                            q8 as *const u8,
+                            out as *mut f32,
+                            od as i32,
+                            id as i32,
+                            nt as i32,
+                            nbe,
+                            stream,
+                        );
+                    }
+                }
+                return;
+            }
+        }
         unsafe {
             if Self::mmvq_v2(id) && blk_stride_padded {
                 // v2's uint4 ql/qh loads need the padded 224B stride
@@ -5253,5 +5362,73 @@ mod d38_probe_tests {
             assert!(bits_eq(&cat[oq + okv..], &sv), "{tag}: v rows diverged");
             eprintln!("{tag}: concat matmul bitwise OK ({od_total} rows)");
         }
+    }
+
+    // D4-4 L1: the dense split-plane (dpl) decode path must be bitwise
+    // identical to the padded path. Registers the same raw q6_K bytes twice
+    // (dpl built vs MINFER_Q6K_DPL=0) and compares decode outputs bit-exact.
+    #[test]
+    fn cuda_q6k_dpl_bitwise() {
+        let Some(st) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = CudaState::model_load_guard();
+        // (od, id): a v2_pf_dpl shape (id in (8192, 16384]) and a v2_dpl
+        // loop shape; both must clear the decode MMVQ gate (nt==1, id%32==0,
+        // od*id >= 4M).
+        for (od, id) in [(512usize, 8960usize), (4096usize, 1024usize)] {
+            let raw = gen_q6_k_raw(od, id);
+            std::env::remove_var("MINFER_Q6K_DPL");
+            st.register_weight_q6k_padded("d44_dpl_a", &raw, od, id);
+            std::env::set_var("MINFER_Q6K_DPL", "0");
+            st.register_weight_q6k_padded("d44_dpl_b", &raw, od, id);
+            std::env::remove_var("MINFER_Q6K_DPL");
+            let wa = st.get_weight_ptr("d44_dpl_a").expect("a registered");
+            let wb = st.get_weight_ptr("d44_dpl_b").expect("b registered");
+            let x: Vec<f32> = (0..id).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
+            let dx = dev_alloc(id * 4);
+            h2d_f32(dx, &x);
+            let oa = dev_alloc(od * 4);
+            let ob = dev_alloc(od * 4);
+            st.matmul_f32_ptr_layout(wa, TensorType::Q6_K, dx, oa, od, id, 1, true)
+                .unwrap();
+            st.matmul_f32_ptr_layout(wb, TensorType::Q6_K, dx, ob, od, id, 1, true)
+                .unwrap();
+            let ra = d2h_f32(oa, od);
+            let rb = d2h_f32(ob, od);
+            assert_eq!(
+                ra, rb,
+                "dpl-vs-padded decode outputs must be bit-identical (od {od} id {id})"
+            );
+            eprintln!("d44_dpl: od {od} id {id} bitwise OK");
+        }
+    }
+
+    // raw GGUF-layout q6_K bytes: random ql/qh nibbles, small int8 scales,
+    // d = 1.0 (finite outputs so the bit-exact compare is meaningful).
+    fn gen_q6_k_raw(od: usize, id: usize) -> Vec<u8> {
+        let nbe = id.div_ceil(256);
+        let mut v = vec![0u8; od * nbe * 210];
+        let mut s: u32 = 0x5DEE_CE6D;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for r in 0..od {
+            for b in 0..nbe {
+                let blk = &mut v[(r * nbe + b) * 210..(r * nbe + b + 1) * 210];
+                for i in 0..192 {
+                    blk[i] = (next() & 0x55) as u8;
+                }
+                for i in 0..16 {
+                    blk[192 + i] = (next() % 15) as u8;
+                }
+                blk[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+            }
+        }
+        v
     }
 }
