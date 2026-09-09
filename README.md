@@ -124,20 +124,21 @@ biases.
 
 | Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Decode @long KV | Device mem |
 |-------|------------------|--------------|----------------|-----------------|------------|
-| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | **~49.3 tok/s** (**1.035×**) | **48.5 tok/s** @1.6K (**1.017×**) | ~9.5 GB |
-| Qwen2.5-14B-Instruct Q4_K_M | **~1830 tok/s** | **1.12×** (llama-bench 1634, same window) | **24.0 tok/s** (0.995×) | 22.4 tok/s @3.3K (0.928×) | ~12.0 GB |
+| Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | **~51.2 tok/s** (**1.074×**) | **50.2 tok/s** @1.6K (**1.052×**) | ~10.4 GB |
+| Qwen2.5-14B-Instruct Q4_K_M | **~1830 tok/s** | **1.12×** (llama-bench 1634, same window) | **24.6 tok/s** (**1.018×**) | 22.9 tok/s @3.3K (0.950×) | ~14.1 GB |
 
 Decode numbers are same-window matched-anchor pairs against llama-bench
-(ca3d3a3e1) on the shared GPU; window drift between sessions is ±2%.
+(ca3d5a3e1) on the shared GPU; window drift between sessions is ±2%.
 
 The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
 8.1× over the 441 tok/s where the path started, with every optimization step
 (measurement, gates and commit) documented in the history table of
 **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
-Decode runs the dp4a MMVQ + split-KV attention + fused-QKV kernels: 7B decode is
-**ahead of llama.cpp at every context length**; 14B sits at short-context parity
-with the remaining gap in long-context attention structure (the D/D4-series
-campaign record is §2D).
+Decode runs the dp4a MMVQ (q6_K on a dense split-plane layout, `MINFER_Q6K_DPL=0`
+opt-out) + split-KV attention + fused-QKV kernels: 7B decode is **ahead of
+llama.cpp at every measured context length**; 14B is ahead at short context with
+the remaining ~5% gap at 3.3K KV in attention structure (the D/D4-series campaign
+record is §2D).
 `MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
 `MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
 
