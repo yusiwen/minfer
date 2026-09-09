@@ -118,6 +118,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --stop <STR>         stop generation at this string (repeatable)");
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
+    eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
     eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
     eprintln!(
         "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
@@ -174,6 +175,8 @@ fn main() {
     let mut viz_mode = false;
     let mut viz_port: u16 = 8081;
     let mut port_provided = false;
+    // CUDA-only: --gpu N selects a device index; no-op on CPU/Metal builds.
+    let mut gpu: Option<i32> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -233,6 +236,15 @@ fn main() {
                     server_n_slots = v.parse().unwrap_or_else(|_| {
                         parse_err = Some(format!("invalid --n-slots '{v}'"));
                         1
+                    });
+                }
+                i += 2;
+            }
+            "--gpu" => {
+                if let Some(v) = next_val(a) {
+                    gpu = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --gpu '{v}'"));
+                        None
                     });
                 }
                 i += 2;
@@ -612,7 +624,10 @@ fn main() {
     #[cfg(target_os = "macos")]
     metal::MpsState::init();
     #[cfg(feature = "cuda")]
-    cuda::CudaState::init();
+    cuda::CudaState::init_with_gpu(gpu);
+    // On CPU/Metal builds `--gpu` is a no-op: it is parsed but unused.
+    #[cfg(not(feature = "cuda"))]
+    let _ = gpu;
 
     // === Load model (dispatches on general.architecture) ===
     let model = models::load_model(&gguf_model).expect("load model");

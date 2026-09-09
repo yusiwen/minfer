@@ -1247,7 +1247,7 @@ impl CudaState {
         }
     }
 
-    fn try_new() -> Option<Self> {
+    fn try_new(requested: Option<i32>) -> Option<Self> {
         Self::preload_driver();
         if std::env::var("MINFER_DISABLE_CUDA").is_ok() {
             eprintln!("CUDA: disabled by MINFER_DISABLE_CUDA");
@@ -1261,22 +1261,32 @@ impl CudaState {
             return None;
         }
 
-        // Auto-select the device with highest compute capability
-        let mut best_device: i32 = 0;
-        let mut best_score: i32 = 0;
-        for dev in 0..count {
-            let mut major: i32 = 0;
-            let mut minor: i32 = 0;
-            unsafe {
-                cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_MAJOR, dev);
-                cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_MINOR, dev);
+        // Device selection: honor `--gpu N` when given and in range; otherwise
+        // auto-select the device with the highest compute capability.
+        let best_device: i32 = match requested {
+            Some(n) if (0..count).contains(&n) => n,
+            _ => {
+                if let Some(n) = requested {
+                    eprintln!("CUDA: --gpu {n} out of range (found {count} device(s)); auto-selecting");
+                }
+                let mut best_device: i32 = 0;
+                let mut best_score: i32 = 0;
+                for dev in 0..count {
+                    let mut major: i32 = 0;
+                    let mut minor: i32 = 0;
+                    unsafe {
+                        cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_MAJOR, dev);
+                        cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_MINOR, dev);
+                    }
+                    let score = major * 100 + minor;
+                    if score > best_score {
+                        best_score = score;
+                        best_device = dev;
+                    }
+                }
+                best_device
             }
-            let score = major * 100 + minor;
-            if score > best_score {
-                best_score = score;
-                best_device = dev;
-            }
-        }
+        };
 
         let err = unsafe { cudaSetDevice(best_device) };
         if err != 0 {
@@ -1383,9 +1393,18 @@ impl CudaState {
         CUDA.get().and_then(|s| s.as_ref())
     }
 
+    /// Default: auto-select the device (highest compute capability).
     pub fn init() {
+        Self::init_with_gpu(None);
+    }
+
+    /// Auto-select, or honor an explicit `--gpu N` device index.
+    ///
+    /// `requested` is the CUDA device index from `--gpu`; `None` = auto-select.
+    /// An out-of-range index warns and falls back to auto-select.
+    pub fn init_with_gpu(requested: Option<i32>) {
         CUDA.get_or_init(|| {
-            let s = Self::try_new();
+            let s = Self::try_new(requested);
             if s.is_some() {
                 eprintln!("CUDA: GPU acceleration enabled");
             } else {
