@@ -144,6 +144,8 @@ Chapters in §2 follow this table row by row.
 
 | D4-2 | Decode-GEMM Tier B session (design `/tmp/d4/D4_DESIGN.md`): (B0) **correctness** — v2_pf dispatch bounded to npair ≤ 512 (see the D4-2 chapter; D3b-1b's 7B gains were mostly dropped units); (A) llama L2-prefetch port closed PRE-BUILD: prefetch distance 2·bpi requires bpr > 32 blocks (QI4_K=16/VDR=2, QI6_K=8/VDR=1 → bpi = 4·nwarps) — at 14B only ffn_down (bpr 54) qualifies, and our kernels map one 64-elem unit per thread over 256 threads → exactly ONE K-loop iteration at every decode shape (npair 80/216/160; v2_pf's 432 are unrolled u0/u1): there is no "2 iterations ahead" to prefetch, and where llama's prefetch does fire its ffn_down-q4K runs 224.1 GB/s vs our 228.6; (B1) `__launch_bounds__(256,6)` on v2_pf: 48→40 regs + 40 B stack spill, probe tg128 +0.25% / @3254 **−0.75%** → killed; (B1c) v2-loop at npair 432 via `MINFER_Q6K_PF=0`: v2_pf wins/ties (the 5-block × 2-unit-MLP form beats 6-block × 1-unit) → default kept, env kept as opt-out; (B2) 160-thread v2 right-size (= D3b-1c repeat, re-measured with per-kernel isolation): bitwise 98/98 but nsys lm_head **+1.51%**, attn_v **+3.04%** → killed | `b31084c` (B0) + docs commit | per-kernel nsys deltas above; walls ≈ 0 as expected for a fix-only tree | correctness fix; perf-neutral | see D4-2 | Dump gates 107/107 (14B pre-vs-post) + 98/98 (B2 bitwise check); greedy byte-identical 14B pre-vs-post; 7B fixed-vs-v1 first-step logits at the v1-vs-v2 rounding class (max\|Δ\| 0.254, argmax same) vs 4.72-4.79 pre-bug; suite 173/0/3 |
 
+| D4-3 | Attention-structure attempt 2 (probe `/tmp/d4/probe_attn2.cu`, 690-row sweep, 0 skips): llama-fattn-geometry split-attention kernel `vec_attn` over pb/T/R/minb/STG (load-scheduling axis); **NO-GO per the pre-registered bar** — best 41.07 µs kernel-total @14B (bar ≤~32; 1.64× vs current 67.4) and 16.22 @7B@1641 (bar ≤~10.35; 1.53×) → projected wall +1.6–1.8% < the +2% bar → no integration. **Headline: the D4-1 llama attention target (14.02 µs/layer @14B/@3254) is a llama-bench artifact** — ncu: the bench decode fattn-vec (grid (1,2,40)) loads a constant 5,427,200 B ≈ one 128-row KV iteration per block = 256 of 3255 rows covered, byte-identical at KV 1024/2474/3255, while llama-cli's decode (grid (1,7,40)) loads 53.2/142.7 MB scaling with context (mid-prompt recall A/B confirms). Honest llama full-context decode attention ≈ 2.0–2.1 TB/s ≈ 1.7 ms/step @14B — minfer's 3.32 ms is ~1.9× off, not 4.9×; the honest @3254 gap is ~10% wall (~3.5% attention) | docs commit | sweep table in the D4-3 chapter | line closed (measurement-corrected) | see D4-3 | probe gate 0.05 abs w/ adversarial outliers, CPU ref in double; SASS-level LDG counts + recall A/B + reductio (9.6 TB/s impossible) all consistent |
+
 **Footnotes.**
 
 1. **r59 correction (visible in-table).** The r59 record originally reported
@@ -219,6 +221,18 @@ guards are re-anchored on the fixed engine: **tg128 ≥ 48.3 / @1641 ≥ 47.5**
 correct-over-fast). Same-window vs-llama on the fixed engine: 7B tg128
 1.035× / @1641 1.017× (llama 47.65/47.69); 14B tg128 parity 0.995×, @3254
 0.928×, pp3254 1.11-1.14×.
+
+**D4-3 CORRECTION (2026-09-09): the 14B @3254 "0.928×" gap is mostly a
+llama-bench artifact.** ncu proves the bench decode fattn-vec covers only
+256 of 3255 KV rows (constant 5.43 MB of loads at any context) while
+llama-cli's decode covers everything (53–143 MB, scaling with ctx;
+mid-prompt recall A/B green). Honest-llama @3254 ≈ 23.3–23.5 tok/s, so
+minfer 21.06 is ~10% behind, of which attention is ~3.5% (the D4-1
+"~2.53 ms attention prize" recalibrates to ~1.6 ms). The attention-structure
+rewrite attempt itself (vec_attn sweep) measured NO-GO per the
+pre-registered bar (best 41.07 µs @14B / 16.22 @7B, bars ≤32/≤10.35) — see
+the D4-3 chapter. Do not quote llama-bench long-ctx tg rates as attention
+targets without an ncu byte-count or llama-cli recall cross-check.
 
 **D3a update (2026-09-07):** the 4-warp fattn-vec-style split-attention
 rewrite was REVERTED — numerics fully green but the rows-per-warp
@@ -2515,8 +2529,107 @@ class 228.6, so the true remaining q6_K-vs-class deficit is ≈ 0.42 ms/step,
 not 1.1-1.2; (2) the bitwise occupancy axes are closed (above), so that
 0.42 ms needs a tolerance-gated redesign (or the attention-structure lever)
 to reach; (3) **the attention-structure ~2.53 ms item is untouched and
-remains the D4-3 prize**; (4) 7B decode numbers before `b31084c` are not
+remains the D4-3 prize** *(superseded by the D4-3 chapter below: ~1.6 ms
+honest — the 2.53 ms was anchored on a llama-bench artifact)*; (4) 7B
+decode numbers before `b31084c` are not
 comparable to anything after it.
+
+### D4-3 — attention-structure attempt 2 (llama fattn-vec geometry rewrite): NO-GO per the pre-registered bar, and the D4-1 llama target is a llama-bench artifact — the honest llama decode attention is ~2× off, not 4.9× (2026-09-09)
+
+Session against the D4-1 census (brief: the traced llama attention
+"6.94 µs split + 7.20 µs combine = 14.02 µs/layer" at 14B/@3254 implies
+~9.6 TB/s effective L2 read vs our kernels' 1.0–1.4 TB/s; prize ~2.3–2.5
+ms/step). Pre-registered GO bar: a llama-structured kernel (pb splits ×
+windows × subgroup lanes, Q-in-regs, direct-global K/V, shfl-broadcast
+probs — no smem in the hot loop) must show **≥2× kernel-total vs the
+current dispatch kernel at BOTH 14B/@3254 (≤~32 µs) and 7B/@1641
+(≤~10.35 µs)**; probe-first with hard go/no-go, tolerance-gated
+integration only on GO.
+
+**Probe** (`/tmp/d4/probe_attn2.cu`, nvcc -O3 -arch=sm_121a): verbatim
+incumbent bodies (`attn_split_1w_body`, `gqa_attn_split_partial_hybrid`,
+`gqa_attn_split_combine`) as baselines + a `vec_attn<T,R,MINB,STG>`
+llama-geometry kernel swept over pb∈{2,4,8,16,32}, threads∈{32,64,128},
+window R∈{32,64,128}, minb∈{1,4,8}, and a load-scheduling axis
+STG∈{0,1,2} (0 = chunked staging CS=8 rows; 1 = whole-window K+V
+staging; 2 = STG1 + next-window K prefetch). Timing batch-of-32 min-of-8
+with 2 rotating L2-hot KV copies; CPU reference in double; correctness
+gate 0.05 abs with adversarial outliers (q ±57 every 911th, v ±138 every
+1543rd). **690 sweep rows, 0 correctness skips** (`/tmp/d4/d43_sweep5.csv`).
+Two probe bugs found and fixed during bring-up (subgroup row-map missing
+the warp stripe offset; a refactor dropped the chunked V-pass's initial
+staging) — both were correctness-FAILs caught by the gate, not silent
+numbers.
+
+**THE DECISIVE FINDING — the D4-1 llama target is an artifact.** ncu on
+the traced binary's own decode `flash_attn_ext_vec<128,1,F16,F16,false>`
+at 14B:
+
+| capture | grid | SASS global-load bytes | LDG/warp | KV rows covered |
+|---|---|---|---|---|
+| **llama-bench** decode, KV≈1024 / 2474 / 3255 | (1,**2**,40) | **5,427,200 — byte-identical at all three** | 44 ≈ one 128-row KV iteration (K 16 + V 16 + Q 4 + mask 8) | **2 splits × 128 = 256 of 3255 (7.9%)** |
+| **llama-cli** decode, KV≈2477 (`-c 2610`) | (1,**7**,40) | **53.2 MB** (≈ the 50.7 MB full-coverage arithmetic) | — | full |
+| **llama-cli** decode, KV≈4869 (`-c 0`) | (1,**7**,40) | **142.7 MB**, scales with ctx | — | full |
+
+The bench-path kernel's load traffic is **context-independent** (68
+KB/block whether KV is 1k or 3.3k), i.e. its 2-split grid runs ~one
+128-row KV iteration per block and covers only the first 256 rows. The
+CLI path picks 7 splits and full coverage. End-to-end A/B: a mid-prompt
+secret (KESTREL-5150 at ~row 1200 of 2470) is recalled correctly by
+llama-cli at both `-c 0` and bench-like `-c 2610`; the bench's tg output
+is never validated by llama-bench. Reductio on the D4-1 reading: 48
+layers × 66.8 MB in 0.333 ms/step = **9.6 TB/s L2** — beyond the fabric;
+the traced kernel's own 5.43 MB × 48 = 260 MB at 0.333 ms = 0.78 TB/s —
+exactly the latency-bound class everything else lives in. (Why the bench
+host picks pb=2 where ca3d5a3e1's occupancy loop would pick 7 is not
+pinned — the observed facts above are unambiguous and reproducible; the
+binary is `b10665-ca3d5a3e1` per its own banner.)
+
+**Recalibration.** llama's honest full-context decode fattn-vec at 14B
+runs at ≈ **2.0–2.1 TB/s effective** (53.2 MB/60 µs-ncu ≈ 25 µs live at
+KV 2477; 142.7/171.5 ≈ 70 µs live at 4869), i.e. ~33–36 µs/layer at
+KV 3254 including combine ≈ **1.7 ms/step, not 0.69**. minfer's current
+3.32 ms/step is **~1.9× off, not 4.9×**, and the honest llama-vs-minfer
+@3254 wall gap shrinks from 13.4% to ~10%, of which attention is ~3.5%.
+The D4-1 "attention is the 14B decode gap" story was mostly the artifact.
+
+**Sweep result (all correctness-gated; split+combine totals):**
+
+| shape | best vec geometry | split | combine | total | probe baselines (1w/h4w) | in-situ dispatch today | GO bar |
+|---|---|---|---|---|---|---|---|
+| 14B @3254 | pb=4 T=128 R=64 STG=1 | 38.89 | 2.17 | **41.07** | 49.74 / 55.26 | 67.4 (63.8+3.6) | ≤~32 → **FAIL (1.64×)** |
+| 7B @1641 | pb=16 T=32 R=32 STG=1 | 12.17 | 4.04 | **16.22** | 20.45 / 32.78 | 24.8 (20.7+4.1) | ≤~10.35 → **FAIL (1.53×)** |
+| 7B @512 | pb=4 T=128 R=32 STG=1 | 8.04 | 2.12 | **10.16** | 11.61 / 24.59 | ~11.8 | — |
+
+The geometry plateau is flat (pb 2–8 within 1.5 µs at 14B) and the STG
+axis is inside noise at the plateau — once loads are batched per window,
+more scheduling depth buys nothing at these block counts. The probe's
+transient headline (interleaved load→dot→shfl per row ≈ 1.0 TB/s,
+100 µs @14B) vs staged (1.7 TB/s) is the transferable mechanism: **SASS
+load batching is the whole game at ≤2 blocks/SM** (llama's SASS batches
+~21 LDGs ahead; ptxas does NOT do it from a natural loop shape — it took
+explicit staging loops).
+
+**GO/NO-GO arithmetic:** best kernel-total 41.07 vs bar ≤32 @14B (1.64×
+vs current dispatch), 16.22 vs ≤10.35 @7B (1.53×) — **NO-GO on the
+pre-registered bar**. In-situ projection via the probe→in-situ factor
+measured on the h4w baseline (63.8/51.2 = 1.25): 14B ≈ 48.5+3.6 ≈ 52 µs
+→ +0.72–0.82 ms/step ≈ **+1.6–1.8% wall < the +2% integration bar**; 7B
+≈ +0.7%. Both bars fail → **no integration, line closed.** The honest
+remaining attention headroom (~1.6 ms/step at 14B) would need ~2.1 TB/s
+— llama's own rate — i.e. roughly the pb=7 (280-block) geometry plus the
+staged-load recipe beyond what the sweep plateau shows; that is a fresh
+session with a re-anchored bar, not a D4-3 continuation.
+
+**Verdict: D-series attention line closed as measurement-corrected.**
+D4-1's census stands (the traced kernels DID run 48×6.94+48×7.20 µs and
+the books close); what was wrong was reading those kernels as
+full-context attention. Actionable carry-forward: (1) never take
+llama-bench long-ctx tg rates as attention targets — validate with
+llama-cli recall or ncu byte counts; (2) the honest 14B decode gap to
+llama is ~10% wall with ~3.5% attention; (3) any future attention
+session starts from the (1,7,40)-class geometry + explicit load staging
+and a ≤25–32 µs @14B bar.
 
 ## §3 Appendices
 
