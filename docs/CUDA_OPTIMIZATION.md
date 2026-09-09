@@ -145,6 +145,7 @@ Chapters in §2 follow this table row by row.
 | D4-2 | Decode-GEMM Tier B session (design `/tmp/d4/D4_DESIGN.md`): (B0) **correctness** — v2_pf dispatch bounded to npair ≤ 512 (see the D4-2 chapter; D3b-1b's 7B gains were mostly dropped units); (A) llama L2-prefetch port closed PRE-BUILD: prefetch distance 2·bpi requires bpr > 32 blocks (QI4_K=16/VDR=2, QI6_K=8/VDR=1 → bpi = 4·nwarps) — at 14B only ffn_down (bpr 54) qualifies, and our kernels map one 64-elem unit per thread over 256 threads → exactly ONE K-loop iteration at every decode shape (npair 80/216/160; v2_pf's 432 are unrolled u0/u1): there is no "2 iterations ahead" to prefetch, and where llama's prefetch does fire its ffn_down-q4K runs 224.1 GB/s vs our 228.6; (B1) `__launch_bounds__(256,6)` on v2_pf: 48→40 regs + 40 B stack spill, probe tg128 +0.25% / @3254 **−0.75%** → killed; (B1c) v2-loop at npair 432 via `MINFER_Q6K_PF=0`: v2_pf wins/ties (the 5-block × 2-unit-MLP form beats 6-block × 1-unit) → default kept, env kept as opt-out; (B2) 160-thread v2 right-size (= D3b-1c repeat, re-measured with per-kernel isolation): bitwise 98/98 but nsys lm_head **+1.51%**, attn_v **+3.04%** → killed | `b31084c` (B0) + docs commit | per-kernel nsys deltas above; walls ≈ 0 as expected for a fix-only tree | correctness fix; perf-neutral | see D4-2 | Dump gates 107/107 (14B pre-vs-post) + 98/98 (B2 bitwise check); greedy byte-identical 14B pre-vs-post; 7B fixed-vs-v1 first-step logits at the v1-vs-v2 rounding class (max\|Δ\| 0.254, argmax same) vs 4.72-4.79 pre-bug; suite 173/0/3 |
 
 | D4-3 | Attention-structure attempt 2 (probe `/tmp/d4/probe_attn2.cu`, 690-row sweep, 0 skips): llama-fattn-geometry split-attention kernel `vec_attn` over pb/T/R/minb/STG (load-scheduling axis); **NO-GO per the pre-registered bar** — best 41.07 µs kernel-total @14B (bar ≤~32; 1.64× vs current 67.4) and 16.22 @7B@1641 (bar ≤~10.35; 1.53×) → projected wall +1.6–1.8% < the +2% bar → no integration. **Headline: the D4-1 llama attention target (14.02 µs/layer @14B/@3254) is a llama-bench artifact** — ncu: the bench decode fattn-vec (grid (1,2,40)) loads a constant 5,427,200 B ≈ one 128-row KV iteration per block = 256 of 3255 rows covered, byte-identical at KV 1024/2474/3255, while llama-cli's decode (grid (1,7,40)) loads 53.2/142.7 MB scaling with context (mid-prompt recall A/B confirms). Honest llama full-context decode attention ≈ 2.0–2.1 TB/s ≈ 1.7 ms/step @14B — minfer's 3.32 ms is ~1.9× off, not 4.9×; the honest @3254 gap is ~10% wall (~3.5% attention) | docs commit | sweep table in the D4-3 chapter | line closed (measurement-corrected) | see D4-3 | probe gate 0.05 abs w/ adversarial outliers, CPU ref in double; SASS-level LDG counts + recall A/B + reductio (9.6 TB/s impossible) all consistent |
+| D4-4 | Final decode-kernel session (three levers, `/tmp/d4/probe_l1_dpl.cu` + `/tmp/d4/probe_l3_fuse.cu`): **(L1) dense split-plane (dpl) q6_K decode MMVQ LANDED** — the padded 256-elem/224B row layout streams 14 dead bytes per super-block (215/256 useful = 84%); dpl repacks to `[ql: nbe×128][qh: nbe×64][sc: nbe×16][d: nbe×2]` = 210B content/row at row stride `(nbe·210+15)&~15` (16B-aligned uint4, zero pad sectors), same per-unit values + accumulation order → bitwise; sibling plane (+2.0 GB 14B, +0.9 GB 7B) under `MINFER_Q6K_DPL` ("0" opt-out), only `id % 256 == 0` shapes, padded plane retained (prefill MMQ block_stride 224 + W_exp/W_dsc derivation + dequant/embed fallback). Probe: ffn_down 176.5→212.9 GB/s content (−17.1%), lm_head 208.3→250.0 (−16.7%); the group-split (gs) probe variant (−7.9/−10.7%, tolerance) dominated → dropped. **(L2) PDL on the decode chain NO-GO in-situ**: standalone probe green (graph capture+instantiate with `cudaLaunchAttributeProgrammaticStreamSerialization` OK on driver 580.173.02, 200 replays stable, PDL-graph vs plain-eager bitwise; but a compute-bound chain probe ran +2.8% slower — co-residency tax warning), full integration (PSS launch attribute + `cudaGridDependencySynchronize()` on 13 decode-chain kernels, `MINFER_PDL` gate) passed all bitwise gates, then the same-binary env-flip isolation A/B read 14B tg128 **−2.6%/−1.8%**, 7B ≈ 0%, @3254 within noise → below the +0.3% bar → reverted; mechanism: PSS early-launch co-residency taxes the compute-tail kernels (attention h4w, lm_head) more than the ~2 µs/launch graph-gap pool it recovers. **(L3) fused gate+up+SwiGLU+q8 (Form B) NO-GO**: 32-row-block fused q4_K kernel (grid nf/32 = 432 blocks, 64 serial per-row dots each, in-kernel silu + `quantize_pad40_block`) measured **+28.2%** vs the incumbent gu-matmul + swiglu_quant pair (412.1 vs 321.4 µs at 27648×5120; 193.2 vs 247.8 GB/s content) — grid = 1.5 waves at 6 blocks/SM (wave quantization) + exposed per-row latency; Form A (fused gu+swiglu f32, separate quantize) saves ~2–5 µs/step by arithmetic = sub-bar, not probed | code commit + docs commit | wall deltas this row (3× interleaved same-window A/B, medians of 3) | 14B tg128 23.28→**24.57** (+5.53%) / @3254 22.00→**22.94** (+4.27%); 7B tg128 47.55→**51.20** (+7.68%) / @1641 46.44→**50.18** (+8.05%) | **+5.53%/+4.27%** (14B) | vs-llama: 14B tg128 **1.018×**, @3254 **0.950×**; 7B tg128 **1.074×**, @1641 **1.052×** (llama 24.14/24.14/47.65/47.69) | **LANDED (L1)**; L2/L3 closed with mechanism | L1: dpl kernels bitwise vs padded (probe + unit test both forms: od 512/id 8960 pf-form, od 4096/id 1024 loop-form); 14B −n 1 dumps 107 identical + 7 node{N} diffs (= the documented D4-2 pool-slot aliasing class), 7B 72 + 2; greedy rp=1.0 byte-identical both models; suite 174/0/3 (incl. the new dpl bitwise test; one earlier full-suite run flaked 2 pool/parity tests under the sglang co-tenant window — both pass in isolation and the rerun is green) |
 
 **Footnotes.**
 
@@ -204,6 +205,14 @@ llama 49.41 is −3.0%); 14B (48L) decode tg128 → **22.90** / @3254 → **21.0
 window anchors vs llama 24.31/24.32. The remaining 14B short-KV gap is
 elementwise/launch chain + the two reverted MMVQ straggler routes (§2D D3b);
 attention rewrite = D3a (tolerance-gated, separate session).
+
+**D4-4 update (2026-09-09, CUDA):** the final decode session landed the
+dense split-plane q6_K MMVQ (bitwise): 14B tg128 23.28 → **24.57** (+5.53%),
+@3254 22.00 → **22.94** (+4.27%); 7B tg128 47.55 → **51.20** (+7.68%),
+@1641 46.44 → **50.18** (+8.05%). vs-llama: 7B **1.074×/1.052×** (tg128/
+@1641), 14B **1.018×** tg128 / **0.950×** @3254. PDL on the decode chain and
+the fused gate+up+SwiGLU+q8 kernel probed and closed with mechanism (§2D
+D4-4); `MINFER_Q6K_DPL=0` opts the planes out.
 **D4-2 CORRECTION (2026-09-09):** the 7B half of this row is void — the
 v2_pf dispatch dropped units 512..591 on npair-592 rows (7B ffn_down), so
 the 7B "+3.0 %/+2.7 %" was mostly the missing 13.5 % of down-q6K work, not
@@ -2631,6 +2640,120 @@ llama is ~10% wall with ~3.5% attention; (3) any future attention
 session starts from the (1,7,40)-class geometry + explicit load staging
 and a ≤25–32 µs @14B bar.
 
+### D4-4 — the final kernel session: dense split-plane q6_K decode MMVQ lands (+5.5%/+4.3% @14B, +7.7%/+8.1% @7B, bitwise); PDL and fused-FFN closed with mechanism (2026-09-09)
+
+Three levers, one session, decode program closed. Baseline binary preserved at
+`/tmp/d4/minfer_pre_d44`; all A/Bs are same-window interleaved (sglang
+co-tenant resident, ±1–2% window drift — pair medians decide).
+
+#### L1 — dense split-plane (dpl) q6_K decode MMVQ (LANDED, bitwise)
+
+The padded MMVQ row layout (256-elem super-blocks at 224 B stride, Q6KB) pays
+14 dead bytes per block — 215/256 = 84% useful — and those bytes are exactly
+what the decode kernel streams. The D4-2 padded-vs-bitwise axis closed the
+accounting: the padded kernels were already optimal *for their layout*; the
+layout itself was the deficit (0.42 ms true deficit @14B @3254 estimated).
+
+**Layout:** per row `[ql: nbe×128][qh: nbe×64][sc: nbe×16][d: nbe×2]` =
+nbe·210 B of content, row stride `(nbe·210+15)&~15` (54·210 = 11340 → 11344)
+keeps every uint4 load 16B-aligned with zero pad sectors. Same per-unit
+values, same unit→thread map, same accumulation order → **bitwise**.
+
+**Probe** (`/tmp/d4/probe_l1_dpl.cu`): ffn_down (od 5120, id 13824)
+176.5 → 212.9 GB/s content (−17.1% mean kernel time); lm_head (od 152064,
+id 5120) 208.3 → 250.0 (−16.7%). The group-split variant (gs: re-lay
+q4_K-style 16B groups) probed −7.9/−10.7% — dominated by dpl → dropped. Two
+probe fixes worth remembering: dpl row bases are not naturally 16B-aligned
+(the stride fix above), and bitwise checks with random f16 `d` bytes
+NaN-trap (`NaN != NaN` reads as DIFF with max|Δ| = 0) — synth 0x3C00.
+
+**Integration:** dpl is a SIBLING plane, not a replacement — the padded plane
+stays for prefill MMQ (block_stride 224), W_exp/W_dsc derivation, and the
+dequant-f16/embed-gather fallbacks. `register_weight_q6k_padded` builds
+`{name}__dpl` from the raw GGUF bytes under `MINFER_Q6K_DPL` (r60 semantics,
+"0" opt-out), only `id % 256 == 0` shapes (all real decode shapes qualify:
+5120/13824/18944). Dispatch: fast-path at the top of `q6_k_decode_mmvq` —
+plane hit → `q6_k_q8_mmvq_v2_pf_dpl` (npair 432 class, pf gate) or
+`q6_k_q8_mmvq_v2_dpl`, else fall through to the padded path. Cost: +2.0 GB
+(14B), +0.9 GB (7B).
+
+**Gates:** unit test `cuda_q6k_dpl_bitwise` (both kernel forms, bitwise vs
+padded); 14B `-n 1` first-step dumps 107 identical + 7 node{N} diffs (the
+exact D4-2 pool-slot aliasing class, reproduced pre-vs-pre), 7B 72 + 2;
+greedy rp=1.0 byte-identical on both models; suite 174/0/3. One full-suite
+run flaked `cuda_graph_recaptures_on_pool_gen_change` +
+`cuda_q4_0_prefill_q8_0_gemm_parity` (co-tenant window): both pass in
+isolation and the rerun is green — recorded as window flakes, not defects.
+
+**Walls** (3× interleaved A/B medians, pre → post):
+
+| Config | pre | post | Δ |
+|---|---|---|---|
+| 14B tg128 | 23.28 | **24.57** | **+5.53%** |
+| 14B @3254 | 22.00 | **22.94** | **+4.27%** |
+| 7B tg128 | 47.55 | **51.20** | **+7.68%** |
+| 7B @1641 | 46.44 | **50.18** | **+8.05%** |
+
+Bar was ≥ +0.4% on 14B @3254; the lever over-delivered 10×. Post-L1 14B
+q6_K DRAM-true classes: ffn_down ~213, lm_head ~250 GB/s (q4_K decode class
+is 228.6 — the padded 84% useful ratio explains the residual gap).
+
+#### L2 — PDL on the decode chain (probe green, in-situ NO-GO, reverted)
+
+`cudaLaunchAttributeProgrammaticStreamSerialization` (PSS) +
+`cudaGridDependencySynchronize()` at kernel entry (sm_90+ guard). The
+standalone probe (`/tmp/d4/probe_pdl.cu`) was fully green: graph
+capture+instantiate with PSS attributes composes on driver 580.173.02, 200
+replays stable, PDL-graph vs plain-eager bitwise — the known graphs-interplay
+risk did NOT materialize. The warning sign was in the same probe: a
+compute-bound chain of 24 kernels ran **+2.8% slower** under PDL (bandwidth
+chain: −0.1%, neutral).
+
+The integration (PSS on the 13 decode-chain kernels: rms/swiglu/quantize/
+add/matmuls/rope-store/attention split+combine, pdl_sync at every PSS kernel
+entry, `MINFER_PDL` gate) passed every bitwise gate (dumps, greedy rp=1.0).
+The decision gate was a same-binary env-flip isolation A/B (MINFER_PDL=0 vs
+=1, 3 pairs): 14B tg128 **−2.6%/−1.8%** (consistent), 7B all ≈ 0%, @3254
+within window noise. Below the +0.3% bar → **reverted** (the tree ships L1
+only). Mechanism: PSS lets the next kernel's waiting blocks co-reside with
+the current kernel's draining tail — on the 14B's compute-tail kernels
+(attention h4w, lm_head) that co-residency steals SM slots from later waves,
+and the recovered prize (the ~2 µs/launch graph-gap residue, ≈0.3 ms/step)
+is smaller than the tax. The D3-4 CUDA-graph capture already absorbs the
+launch-gap pool that PDL targets on eager stacks.
+
+#### L3 — fused gate+up+SwiGLU+q8 (Form B probe, NO-GO)
+
+Form B (full fusion, one launch replacing gu-concat matmul +
+`swiglu_quant_pad40`): one block per 32-value output q8 block computes the 32
+gate rows AND the 32 up rows with the exact 256-thread per-row unit map
+(bitwise dots), applies silu(g)·u in-register, and quantizes in-block with
+the verbatim `quantize_pad40_block`. Probe (`/tmp/d4/probe_l3_fuse.cu`,
+27648×5120 q4_K): **+28.2%** vs the incumbent pair (412.1 vs 321.4 µs; 193.2
+vs 247.8 GB/s content). Mechanism: grid = nf/32 = 432 blocks = 1.5 waves at
+6 blocks/SM (wave quantization, structurally ~+10–17%) plus 64 serial
+row-dots per block each paying the reduce barrier chain — without cross-row
+register staging the load latency is exposed per row, and staging doubles
+register pressure (occupancy → 5 blocks/SM, worse tail). Form A (fused
+gu+swiglu → f32, keep the separate quantize) saves only ~2–5 µs/step by
+arithmetic — sub-bar, not probed. Line closed: the swiglu round-trip is real
+(~106 µs/step execution + 2.2 µs launch) but every fusion geometry that
+preserves bitwise numerics loses more to wave quantization than it saves.
+
+#### Final decode state vs llama.cpp (q4_k_m, llama-bench ca3d5a3e1)
+
+| Model | Config | minfer (D4-4) | llama | ratio |
+|---|---|---|---|---|
+| 14B (48L) | tg128 | **24.57** | 24.14 | **1.018×** |
+| 14B (48L) | @3254 | **22.94** | 24.14 | **0.950×** |
+| 7B | tg128 | **51.20** | 47.65 | **1.074×** |
+| 7B | @1641 | **50.18** | 47.69 | **1.052×** |
+
+Decode program status: 7B is at/above parity everywhere measured; 14B is
+above parity at short KV and −5% at 3254 KV (attention ~1.9× off is the
+remaining honest gap — D4-3's measurement correction; the next lever there
+is a tolerance-gated attention rewrite, a separate session per D4-3's bar).
+
 ## §3 Appendices
 
 ### Appendix A — Env-gate reference (post-r60 semantics)
@@ -2649,6 +2772,7 @@ single-sourced in `CudaState::mmq_gate_on`.
 | `MINFER_MMQ_A_FUSE` | absent = mode 2 (skip-write) | off (mode 1 = "1": fused producers write plane AND f32; "2" = skip-write override) | r51/r52, r60 |
 | `MINFER_MMQ_Q6K_EXP` | on | q6_K W_exp plane not built (−1.52 GB, ~−5% prefill) → EXP=false r41 path | r54 |
 | `MINFER_MMQ_Q4K_DSC` | on | q4_K/q6_K W_dsc planes not built (−1.46 GB) → in-kernel decode | r59 |
+| `MINFER_Q6K_DPL` | on | dense split-plane q6_K decode planes not built (−2.0 GB 14B / −0.9 GB 7B) → padded-224B MMVQ path (bitwise) | D4-4 |
 
 **Overrides / debug (opt-in "1"):** `MINFER_MMQ_RAW_KD` (default 8),
 `MINFER_MMQ_RAW_WIDE` (wide 128×128 kernel), `MINFER_MMQ_RAW_NB_DEBUG`
