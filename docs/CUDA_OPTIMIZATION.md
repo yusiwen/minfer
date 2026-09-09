@@ -125,7 +125,7 @@ Chapters in §2 follow this table row by row.
 | r60 | PROMOTION: the verified MMQ gate set flips DEFAULT-ON | `57edcf6` (+`7029ee4` docs) | default ≈3578–3599 (~3581); `MINFER_MMQ=0` legacy f16 ~2226–2353-class; planes +3.27 GB | — | 1.080× | LANDED | promotion = default-on with "0" opt-outs (r54 pattern); the bisect caught the mode-2 multiturn break → NB-BT-only guard |
 | D1 | decode @1641 KV attribution: `gqa_attn_split_partial` is 100% of the KV-scaling wall (34.1 µs/launch, 76.5% long_scoreboard); ATTN_SPLITS sweep = dead end | measurement-only (`/tmp/d1/`) | tg128 49.3 (KV~1) / 47.2 (@1641) vs llama 49.41 (tg128) | — | 0.956× (tg128) | MEASURED | probe-verified: staging-depth changes bitwise-safe (ndiff=0); ATTN_SPLITS changes reorder the float sum |
 | D2 | explicit K+V register staging in `gqa_attn_split_partial` (4-row window staged before the softmax chain); cp.async smem pipe + pair-lookahead measured worse | D2 commit (this row) | decode @1641 **47.2 → 48.2** (+2.0%); kernel 34.1 → 19.4 µs/launch; tg128 49.4 flat | — | **0.975×** (tg@1641) | LANDED | bitwise-identical end-to-end (greedy-32/256 byte-identical); probe −42%, nsys −43%, wall +2.0% agree |
-| D3b-1b | down-q6K pipelined MMVQ `q6_k_q8_mmvq_v2_pf` (npair>256: both serial units' weight+q8 loads issue up front) | `f1825b5` | 7B decode tg128 48.03→**49.47** (+3.0% SEP), @1641 46.66→**47.94** (+2.7% SEP); 14B tg128 22.80→22.90 (+0.44%), @3254 21.01→21.06 (+0.24% SEP) | **+2.7–3.0%** (7B decode) | 0.970× (7B tg@1641, this window) | **LANDED** | bitwise-identical (114/114 dump memcmp, greedy-256 byte-identical, suite 169/0/3); for npair>256 the second serial unit's exposed load latency WAS the 198.9-vs-220 GB/s gap |
+| D3b-1b | down-q6K pipelined MMVQ `q6_k_q8_mmvq_v2_pf` (npair>256: both serial units' weight+q8 loads issue up front) | `f1825b5` | 7B decode tg128 48.03→**49.47** (+3.0% SEP), @1641 46.66→**47.94** (+2.7% SEP); 14B tg128 22.80→22.90 (+0.44%), @3254 21.01→21.06 (+0.24% SEP) | **+2.7–3.0%** (7B decode) | 0.970× (7B tg@1641, this window) | **LANDED** | bitwise-identical (114/114 dump memcmp, greedy-256 byte-identical, suite 169/0/3); for npair>256 the second serial unit's exposed load latency WAS the 198.9-vs-220 GB/s gap — **D4-2 CORRECTION: the 7B numbers are void (the dispatch dropped units 512..591 on npair-592 rows; the "gain" was mostly the missing work — see the D4-2 chapter); 14B numbers stand** |
 | D3b-1a | attn_v-q6K off the padded-f32 kernel: (a) MMVQ routing via a lowered `od*id>=24M` gate — NOT bitwise (MMVQ quantizes activations to q8, different accumulation semantics); (b) NSG 2→1 row→warp re-map — bitwise-green but kernel 36.4→39.9 µs (2× warps = 2× y re-read L2 traffic) | reverted (both routes) | 14B tg128 −0.74%, @3254 −0.33% | — | — | REVERTED | the padded kernel is not warp-starved; y re-read traffic scales 1:1 with warp count — rows-per-warp is the only bitwise-free knob and 2 is already the sweet spot |
 | D3b-1c | output-head dynamic block size (npair 160 → 160-thread blocks, warp-count-bounded `mmvq_block_reduce`) | reverted (patch `/tmp/d3/patch_1c.py`) | 7B @1641 +0.26% (SEP); 14B tg128 +0.04%, @3254 +0.09% | — | — | REVERTED | GB10's 1536-thread/SM limit: 9 blocks×160 live threads ≈ 6×256 allocated (960 live) — the idle-thread win does not exist at 14B shapes |
 | D3b-2 | short-KV combine skip (single-split path for nkv ≤ threshold) | not implemented | — | — | — | ANALYSIS-NEGATIVE | single-split ≠ 32-split partial+combine bitwise for ANY nkv>1 (the merge reorders the float sum — D1's split-count evidence: ndiff 3.6e-3 of outputs, max\|Δ\|~3e-9); the split grid is frozen by CUDA-graph replay capture; the bitwise-safe residual (combine early-out of empty splits — exact +0.0 terms) is ≤ ~15 µs/step, below every bar |
@@ -141,6 +141,8 @@ Chapters in §2 follow this table row by row.
 | D3-7 2c | rms/elementwise-launch consolidation, two bitwise sub-levers: (i) `rms_norm_quant_pad40` wide-block geometry (launch 32 → 128 threads; the reduction keeps lanes 0..31 exactly — same element→lane map, serial per-lane chains, `warp_reduce_sum` tree; scale broadcasts via smem; write/quantize loops are element/per-32-block independent so their wider mapping cannot move a bit; reduce loop `#pragma unroll 8` deepens load pipelining), (ii) `positions_i32` one-execution-window memo (every Rope/KvcacheStore/Attn node re-converted the same positions buffer: 240 launches/step at 14B; key (buf id, pool_gen), cleared in `synchronize` next to the MmqCache clear; capture-safe: only the first consumer's conversion is recorded and replay re-executes it) | this commit | nsys 14B @3254 decode census: rms_norm_quant_pad40 9.43 → **5.66 µs** (−40%), 94.6–96/step; f32_bits_to_i32 239.6 → **1.2** launches/step; wall-effective ≈ −0.62 ms/step (rms −0.348 + bits −0.275) | **+1.76%** (14B @3254 cumulative with 2b, SEP) | see D3-7 | **LANDED** | Bitwise end-to-end: dump gate (both sides under `MINFER_NO_KQ_MMVQ=1`) 109/114 files byte-identical, the 5 diffs = the documented slot-aliasing class; logits both phases + all KV byte-identical; 7B greedy streams byte-identical 5/5 seeds + temp-0.8 control; suite green. GATE GOTCHA recorded: `MINFER_NO_KQ_MMVQ=1` also reverts the Q5_K decode arm (pre-existing), so a 2b-off control must set it on BOTH sides — a one-sided control shows a fake 0.22-logit drift from the Q5_K f32-activation fallback |
 | D3-8 | FusedQKV decode fusion ported to CUDA (Stage-3 Tier A; the G4 Metal fusion): (1) `attn_bias_rope_store_f32` kernel + `launch_attn_bias_rope_store` — one launch replaces the per-layer add_bias×3 + rope×2 + store_kv×2 chain, pointer-form (serves concat sections q=base/k=base+nqt/v=base+2nkt AND three separate buffers), positions read device-side (`positions[0]`) so the launch is capture-safe, math verbatim `add_bias_f32`+`rope_f32`+`store_kv_f32/f16`; (2) class 1 (wq\|wk\|wv same quant type): `Op::FusedQKV` — one concat matmul (`blk.{i}.attn_qkv` loader-registered wq\|wk\|wv rows) + the fused epilogue (MMVQ is per-row, dispatch on (ttype,id,nt) only → concat bitwise-equal to 3 separate matmuls, probe-proven); (3) class 2 (mixed quant, e.g. Q6_K attn_v among Q4_K q/k — 24/48 layers at 14B, 14/28 at 7B): new `Op::QkvBiasRopeStore` — the three SEPARATE matmuls (bias-free) + one epilogue launch (CUDA-only; Metal keeps the unfused chain for these layers), builder wires attention to the epilogue node so q's matmul buffer has exactly one consumer and the §5 in-place alias applies; gated by `nt==1 && gpu && fuse_qkv` (part of the reuse identity — `MINFER_NO_FUSE_QKV=1` reverts both classes for A/B) | this commit | nsys 14B @3254: total launches −4968/trace (−22.5%); per decode step **−310** (add_bias −144, rope −96, store_kv −96, fused +48, mmvq −48 (24 concat layers 3→1), quantize +24) ≈ the D3-7 §2-listed 0.45 ms/step qkv-chain item | **+1.63%** (14B @3254; tg128 **+3.11%**; 7B +1.23%/+1.05%; isolation A/B post-vs-post NO_FUSE_QKV: +2.28%/+3.15%/+1.00%/+1.03% — all 3/3 pairs clean-separated) | see D3-8 | **LANDED** | Bitwise: probe tests (epilogue vs the 7-launch chain bitwise on q/k/v sections + KV rows, f32+f16 KV, both pointer forms, 14B+7B shapes; concat matmul vs 3 separate bitwise) + dump gate logits_prefill/decode + ALL kv\*.f32 byte-identical both models (98/98 + 58/58; the informational node\* dumps are a documented instrument limitation — recycled pool slots, binary-layout-dependent) + greedy −n 256 **byte-identical 5/5 seeds × both models** + rp=1.0 + `MINFER_NO_FUSE_QKV=1` control + temp-0.8 controls (the only diffs are the perf-banner tok/s numbers); prefill DOT graph byte-identical (prefill untouched); suite 172/0/3 (D3-7's 170 + 2 probes); prefill graph topology unchanged (nt>1 gate) so prefill perf untouched (pp3254 1833 t/s pre-vs-post) |
  NOT bitwise vs the landed v2_pf: in the 256-thread form thread t accumulates fma(u_t) then += fma(u_{t+256}) into ONE float acc before the block reduce; at 512 threads those units live in different threads and their sum happens in the reduce tree (16-warp cross-warp serial order) — a different float sum. A bitwise emulation (smem pair-exchange so thread t still sums u_t+u_{t+256} first) adds a barrier for zero resident-parallelism gain (5120 rows = 18 waves either way), and the exposure mechanism 1c targets was already fixed by v2_pf's up-front load issue (D3b-1b) |
+
+| D4-2 | Decode-GEMM Tier B session (design `/tmp/d4/D4_DESIGN.md`): (B0) **correctness** — v2_pf dispatch bounded to npair ≤ 512 (see the D4-2 chapter; D3b-1b's 7B gains were mostly dropped units); (A) llama L2-prefetch port closed PRE-BUILD: prefetch distance 2·bpi requires bpr > 32 blocks (QI4_K=16/VDR=2, QI6_K=8/VDR=1 → bpi = 4·nwarps) — at 14B only ffn_down (bpr 54) qualifies, and our kernels map one 64-elem unit per thread over 256 threads → exactly ONE K-loop iteration at every decode shape (npair 80/216/160; v2_pf's 432 are unrolled u0/u1): there is no "2 iterations ahead" to prefetch, and where llama's prefetch does fire its ffn_down-q4K runs 224.1 GB/s vs our 228.6; (B1) `__launch_bounds__(256,6)` on v2_pf: 48→40 regs + 40 B stack spill, probe tg128 +0.25% / @3254 **−0.75%** → killed; (B1c) v2-loop at npair 432 via `MINFER_Q6K_PF=0`: v2_pf wins/ties (the 5-block × 2-unit-MLP form beats 6-block × 1-unit) → default kept, env kept as opt-out; (B2) 160-thread v2 right-size (= D3b-1c repeat, re-measured with per-kernel isolation): bitwise 98/98 but nsys lm_head **+1.51%**, attn_v **+3.04%** → killed | `b31084c` (B0) + docs commit | per-kernel nsys deltas above; walls ≈ 0 as expected for a fix-only tree | correctness fix; perf-neutral | see D4-2 | Dump gates 107/107 (14B pre-vs-post) + 98/98 (B2 bitwise check); greedy byte-identical 14B pre-vs-post; 7B fixed-vs-v1 first-step logits at the v1-vs-v2 rounding class (max\|Δ\| 0.254, argmax same) vs 4.72-4.79 pre-bug; suite 173/0/3 |
 
 **Footnotes.**
 
@@ -200,6 +202,23 @@ llama 49.41 is −3.0%); 14B (48L) decode tg128 → **22.90** / @3254 → **21.0
 window anchors vs llama 24.31/24.32. The remaining 14B short-KV gap is
 elementwise/launch chain + the two reverted MMVQ straggler routes (§2D D3b);
 attention rewrite = D3a (tolerance-gated, separate session).
+**D4-2 CORRECTION (2026-09-09):** the 7B half of this row is void — the
+v2_pf dispatch dropped units 512..591 on npair-592 rows (7B ffn_down), so
+the 7B "+3.0 %/+2.7 %" was mostly the missing 13.5 % of down-q6K work, not
+pipelining. The pipelining gain itself is the 14B-sized +0.2-0.4 % class
+(14B numbers in this row stand; npair 432 ≤ 512 was always correct). 7B
+decode re-anchors lower on the fixed engine — see the D4-2 chapter.
+
+**D4-2 update (2026-09-09):** a silent 7B decode correctness bug (D3b-1b's
+v2_pf dispatch, units dropped on npair > 512 rows) found and fixed
+(`b31084c`); the llama L2-prefetch port closed pre-build (mechanism inert at
+our decode shapes); the bitwise q6_K occupancy axes (reg-shave, pipeline
+depth, block geometry) all measured closed — see the D4-2 chapter. 7B
+guards are re-anchored on the fixed engine: **tg128 ≥ 48.3 / @1641 ≥ 47.5**
+(the old 49.0/47.9 were set on the dropping kernel and are superseded —
+correct-over-fast). Same-window vs-llama on the fixed engine: 7B tg128
+1.035× / @1641 1.017× (llama 47.65/47.69); 14B tg128 parity 0.995×, @3254
+0.928×, pp3254 1.11-1.14×.
 
 **D3a update (2026-09-07):** the 4-warp fattn-vec-style split-attention
 rewrite was REVERTED — numerics fully green but the rows-per-warp
@@ -1731,6 +1750,13 @@ revert; one landed):
   (+2.7%, SEP)** — down-q6K is ~25% of the 7B per-step weight stream, so
   the 198.9 → ~220 GB/s projection lands almost exactly; 14B tg128
   22.80 → 22.90 (+0.44%), @3254 21.01 → 21.06 (+0.24%, SEP).
+  **D4-2 CORRECTION (2026-09-09): the 7B legs are void** — v2_pf's dispatch
+  had no npair upper bound, so on the 7B ffn_down (npair 592) it dropped
+  units 512..591: most of the "gain" was 13.5 % of the down-q6K work never
+  performed, not pipelining (the bitwise gates compared v2_pf-to-v2_pf
+  binaries and could not see it). The pipelining gain itself is the
+  14B-sized +0.2-0.4 % class. See the D4-2 chapter for the fix and the
+  re-anchored 7B numbers.
 - **D3b-1a — attn_v-q6K off the padded-f32 kernel, REVERTED (both routes).**
   (a) The D3-1-suggested MMVQ routing (lower the `od*id >= 24M` gate for
   id 5120) is **not bitwise-able at all**: the MMVQ path quantizes
@@ -2355,6 +2381,142 @@ ms/step vs llama 24.32 = 41.12 ms → **−3.52 ms (−7.9%)** (vs −4.44 ms /
 exposed-latency attention ≤0.63 ms (mechanism uncertain), output head 0.44
 ms, ffn_down-q6K 0.49 ms, launch-structure residue (add/add/swiglu tail,
 dud split ~0.07 ms) — the qkv-chain item is CLOSED.
+
+### D4-2 — Decode-GEMM Tier B: a silent 7B correctness bug found and fixed (B0), the bitwise occupancy/prefetch axes closed with mechanisms (2026-09-09)
+
+Session against the D4-1 census (`/tmp/d4/D4_DESIGN.md`: minfer's decode GEMV
+aggregate is already 0.85 ms AHEAD of llama; the gap is attention structure
+2.53 ms + q6_K occupancy + tail). Budget ~3 h, r44/r46 discipline. Outcomes:
+one critical correctness fix landed (`b31084c`), four levers closed with
+measured mechanisms and zero perf regressions, the @3254 gap decomposition
+re-confirmed for the D4-3 brief.
+
+**B0 — the headline: 7B ffn_down-q6K decode was silently wrong since
+D3b-1b.** `q6_k_q8_mmvq_v2_pf` processes exactly two units per thread
+(u = tid, tid+256 → covers npair ≤ 512), but its dispatch gate was only
+`id > 8192` with no upper bound. Qwen2.5-7B ffn_down (10 q6_K layers,
+id 18944, npair 592) therefore dropped units 512..591 — 13.5 % of every
+down-projection row, every decode step, for the whole D3b-1b→D4-2 period.
+Why every gate missed it: (a) the argmax at the gated prompt survived (the
+first-decode-step top-1 was unchanged; logit corruption max|Δ| 4.79 shows up
+only in the dump), (b) every pre-vs-post gate compared v2_pf-to-v2_pf
+binaries — the bug was on BOTH sides. The fix bounds the pipelined route to
+`8192 < id ≤ 16384`; taller rows take the v2 loop form (identical per-unit
+arithmetic, ascending-u order — D3b-1b's bitwise invariant). Gates: 14B
+(npair 432, unaffected) pre-vs-post `MINFER_GRAPH_DUMP` 107/107 gate files
+byte-identical (7 node{N} diffs = the documented pool-slot instrument class)
++ greedy byte-identical; 7B first-decode-step (−n 1) logits post-fix vs the
+full-coverage v1 reference differ only at the v1-vs-v2 rounding class
+(max|Δ| 0.254 — the same class 14B's own v2-vs-v1 shows, 0.231; argmax
+identical) while pre-vs-v1 differs by 4.72 (the bug); 7B greedy now follows
+the v1 reference stream; suite 173/0/3.
+
+**Why the bug was invisible in the KV/logit dumps, and the instrument
+lessons.** Comparing full-run dumps across binaries whose generated tokens
+diverge is invalid twice over: (1) after the first divergent token the two
+runs feed different contexts — later-step logits/KV differences are cascade
+noise (measured up to 1e18 "deltas" that are NOT compute corruption); (2)
+the persistent KV regions' unwritten tail slots contain pool garbage whose
+layout is binary-dependent. The clean comparable point is the FIRST decode
+step (`-n 1`: prompt-only context, identical inputs). Also recorded: the
+v1-vs-v2 MMVQ rounding class (max|Δlogit| ≈ 0.23-0.25, argmax-preserving at
+the gated prompt) is pre-existing (R2-era) — v1 is not a bitwise reference
+for v2, only a semantic one.
+
+**Lever A — llama GB10 L2 weight prefetch: closed PRE-BUILD.** llama's
+prefetch distance is 2 loop iterations = 2·blocks_per_iter with
+blocks_per_iter = vdr·nwarps·32/qi; from vecdotq.cuh: VDR_Q4_K_Q8_1_MMVQ=2 /
+QI4_K=16 and VDR_Q6_K_Q8_1_MMVQ=1 / QI6_K=8 → 8 threads per 256-elem block
+and bpi = 4·nwarps = 16 (GB10 ncols_dst=1 nwarps 4). The prefetch fires only
+where bpr > 2·bpi = 32 blocks: at 14B that is ONLY ffn_down (bpr 54); every
+id-5120 shape (gu, qkv, q/o, lm_head, attn_v; bpr 20) never prefetches. Our
+kernels map one 64-element unit per thread over 256 threads (npair =
+4·bpr: 80 gu/qkv/qo, 216 down-q4K, 160 lm_head/attn_v; v2_pf's 432 units are
+unrolled as u0/u1) — exactly ONE K-loop iteration at every 14B/7B decode
+shape, so a faithful port is runtime-dead code. And where llama's prefetch
+does fire, its ffn_down-q4K rate (224.1 GB/s) is BELOW our unprefetched
+228.6 — the mechanism buys llama nothing net. Both families sit at 75-84 %
+of GB10's DRAM peak: a bandwidth-saturated regime where L2 prefetch adds no
+bandwidth. No build; no commit (D4-1 §3 precedent).
+
+**Lever B — the bitwise occupancy axes, all measured closed.** Fresh ncu
+(2025.3.1, sudo recipe, 14B @3254): v2_pf holds 48 regs/thread →
+Block-Limit-Registers 5 blocks/SM vs Block-Limit-Warps 6 (the at-class q4_K
+v2 and v2 both sit at 40/39 regs and 6 blocks). Candidates:
+
+| variant | change | result |
+|---|---|---|
+| B1 | `__launch_bounds__(256,6)` on v2_pf (48→40 regs, funds the 6th block) | SASS: REG 40 + **STACK 40** (10 spilled words); probe: tg128 +0.25 %, @3254 **−0.75 %** (22.54→22.37 medians) → **KILLED** — the spill costs more than the 6th block pays |
+| B1c | route npair-432 to the v2 loop (`MINFER_Q6K_PF=0`): 6 blocks × 1-unit-MLP vs 5 blocks × 2-unit-MLP | v2_pf wins/ties (tg128 24.08 vs 24.02/24.08; @3254 medians 22.28 vs 22.16, one noisy pair each) → **default kept**; env kept as the documented opt-out |
+| B2 | v2 right-size to 160 threads (npair 160; zero idle warps, 9 resident blocks × 5 active warps vs 6 × 5) — a **repeat of D3b-1c**, re-measured with per-kernel isolation | bitwise 98/98 gate files, but nsys: lm_head 3243.7 → 3292.7 µs (**+1.51 %**), attn_v 24.41 → 25.15 µs (**+3.04 %**), v2_pf/q4_K rows unchanged (±0.6 % control) → **KILLED** |
+
+B2's prior art was in the §0 table all along (D3b-1c: "9 blocks×160 live
+threads ≈ 6×256 allocated — the idle-thread win does not exist"; D3-5 1b:
+"occupancy is not the limiter") — it should have been checked BEFORE
+building; the re-measurement at least upgrades "neutral" to "measured worse
+with a clean per-kernel control". Process lesson: grep the master table for
+prior art on the exact mechanism before writing a line of kernel code.
+
+Per the brief's stop rule: the q6_K occupancy gap cannot be closed bitwise
+on this kernel family; the limiter record stands (v2_pf is register-funded
+for its dual-unit pipeline and register-capped one block below the warp cap;
+shaving spills, un-funding the pipeline loses more, and block geometry is
+already at its measured optimum). Tolerance-gated redesigns remain out of
+scope this session.
+
+**Lever C — PDL: documented as follow-up, not built** (time + CUDA-graph
+capture interplay risk; llama launches every decode kernel with
+`cudaGridDependencySynchronize` + programmatic-stream-serialization — the
+graphs-banked ~0.3 ms residue is the target, and a graph-capture-safe PDL
+integration wants its own session).
+
+**Measurements (interleaved 3× medians, pre = `b31084c` binary, post =
+final tree):**
+
+| config | pre (B0) | post (final) | Δ | note |
+|---|---:|---:|---:|---|
+| 14B tg128 | 24.13 | 24.01 | ≈ 0 (noise; pair-3 straddle) | fix-only tree behaves identically, as designed |
+| 14B @3254 | 22.12 | 22.42 | ≈ 0 (noise) | guards hold (≥ 24.0 / ≥ 21.9) |
+| 7B tg128 | 49.21 | 49.29 | +0.2 % | guard re-anchored below |
+| 7B @1641 | 48.41 | 48.50 | +0.2 % | guards hold |
+
+**7B fix re-anchor (pre-D4-2 buggy binary vs the fixed B0 binary, 3×
+interleaved medians):** tg128 **50.67 → 49.30 (−2.7 %)**, @1641
+**49.84 → 48.49 (−2.7 %)** — both shapes exactly −2.7 %, the honest cost of
+decoding correctly (13.5 % of the down-q6K work the bug skipped; down-q6K ≈
+20 % of the 7B per-step stream). The old 7B guards (49.0 / 47.9) were set
+on the dropping kernel and are superseded: **7B guards tg128 ≥ 48.3 /
+@1641 ≥ 47.5** on the fixed engine. 14B buggy-vs-fixed crosscheck: medians
+straddle inside window noise (bitwise-identical binary paths — the fix does
+not touch npair ≤ 512 dispatch).
+
+**Same-window vs-llama table (llama-bench `ca3d5a3e1`, 2026-09-09 window,
+matched -n 128 anchors):**
+
+| config | minfer (post-D4-2) | llama | ratio |
+|---|---:|---:|---:|
+| 14B tg128 (KV≈0) | 24.01 | 24.14 ± 0.02 | **0.995× (parity)** |
+| 14B @3254 | 22.42 | 24.14 (tg128 @ -p 3254) | **0.928×** |
+| 14B pp3254 | ~1816-1859 | 1634 ± 112 | **1.11-1.14×** |
+| 7B tg128 (KV≈0) | 49.30 | 47.65 ± 0.09 | **1.035×** |
+| 7B @1641 | 48.49 | 47.69 ± 0.01 | **1.017×** |
+
+Note: D4-1's 0.921× headline compared minfer tg64-exclusive against llama
+tg8 in the sglang-co-tenant window; at matched tg128 anchors the 14B
+short-KV decode is at parity, and the 14B long-KV gap (0.928×) is the
+attention-structure item below. The 7B ratios are on the CORRECT engine
+(pre-fix numbers were flattered by the dropped units).
+
+**Updated @3254 gap decomposition (for the D4-3 brief).** The census
+corrections this session: (1) the q6_K "205 GB/s" census rate counted
+210-byte blocks while the padded stride streams 224 — the DRAM-true q6_K
+rates are ≈ 218.9 (ffn_down), 221.6 (lm_head), 189.5 (attn_v) vs the q4_K
+class 228.6, so the true remaining q6_K-vs-class deficit is ≈ 0.42 ms/step,
+not 1.1-1.2; (2) the bitwise occupancy axes are closed (above), so that
+0.42 ms needs a tolerance-gated redesign (or the attention-structure lever)
+to reach; (3) **the attention-structure ~2.53 ms item is untouched and
+remains the D4-3 prize**; (4) 7B decode numbers before `b31084c` are not
+comparable to anything after it.
 
 ## §3 Appendices
 

@@ -4179,7 +4179,12 @@ impl CudaState {
                 // walks any npair with identical per-unit arithmetic and the
                 // same ascending-u accumulation order (bitwise for every
                 // npair ≤ 512 shape, which keep the pipelined kernel).
-                if id > 8192 && id <= 16384 {
+                // D4-2 B1c: MINFER_Q6K_PF=0 A/Bs the pipelined form against
+                // the v2 loop at these shapes (both cover the full unit set).
+                if id > 8192
+                    && id <= 16384
+                    && !std::env::var("MINFER_Q6K_PF").map_or(false, |v| v == "0")
+                {
                     // D3b-1b: tall rows (npair > 256, e.g. ffn_down id 13824)
                     // run the pipelined variant (bitwise-identical, loads for
                     // both serial units issue up front).
