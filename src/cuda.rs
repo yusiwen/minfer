@@ -4170,7 +4170,16 @@ impl CudaState {
         unsafe {
             if Self::mmvq_v2(id) && blk_stride_padded {
                 // v2's uint4 ql/qh loads need the padded 224B stride
-                if id > 8192 {
+                // D4-2 B0 correctness fix: v2_pf processes exactly TWO units
+                // per thread (u = tid, tid+256 → npair ≤ 512), but the old
+                // gate (id > 8192) had no upper bound — npair=592 shapes
+                // (7B ffn_down id 18944, 10 q6_K layers) silently dropped
+                // units 512..591, corrupting 7B decode since D3b-1b. Guard
+                // the upper bound; taller rows take the v2 loop form, which
+                // walks any npair with identical per-unit arithmetic and the
+                // same ascending-u accumulation order (bitwise for every
+                // npair ≤ 512 shape, which keep the pipelined kernel).
+                if id > 8192 && id <= 16384 {
                     // D3b-1b: tall rows (npair > 256, e.g. ffn_down id 13824)
                     // run the pipelined variant (bitwise-identical, loads for
                     // both serial units issue up front).
