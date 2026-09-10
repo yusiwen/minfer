@@ -142,6 +142,37 @@ the campaign after the primitive") triggers. D5 is closed after D5-1a; no
 `Speculator` trait, no KV rollback, no loop plumbing will be built. The
 instrument (`specverify`) remains as the primitive's usable residue.
 
+### 4.1 External reference — llama.cpp itself lands at 1.00×
+
+The gate's arithmetic is only as good as its input costs, so the same model
+pair was rerun through llama.cpp's own mature speculative implementation as
+an outside check (llama-cli build `b10665-ca3d5a3e1`, CUDA: 7B q4_k_m
+`-ngl 99` + 0.5B q4_0 `-md -ngld 99`, greedy `--temp 0 -n 128 -t 20 -s 42`,
+medians of 3 interleaved reps, prose and code prompts; raw log
+`/tmp/d51a/llama/battery.txt`):
+
+| config | prose t/s (median) | code t/s (median) | speedup vs base |
+|---|---|---|---|
+| baseline (no draft) | 47.8 | 47.6 | 1.00× |
+| draft `--spec-draft-n-max 2` | 47.7 | — | 1.00× |
+| draft `--spec-draft-n-max 8` | 47.7 | 47.5 | 1.00× |
+| draft `--spec-draft-n-max 16` | 47.2 | — | 0.99× |
+
+llama.cpp's speculative decoding is a **wash on this box** — not a
+regression of their implementation but the same physics doc 80 projected:
+with C_T(nt) near the weight-streaming floor (their batched verify is
+efficient), the win is capped at ~1.04–1.2×, and the per-drafted-token
+draft-model cost eats all of it at measured acceptance p≈0.69 (long drafts
+slightly negative). Two conclusions:
+
+- minfer's D5 negative is not an engine defect of ambition — the strategy
+  itself has no headroom on GB10 at these costs; the external reference
+  confirms doc 80's ceiling from the outside.
+- The minfer-specific finding stands unchanged: llama.cpp loses only the
+  ~0% residual, while minfer's batched path would *lose 2×* before drafting
+  even starts (the 0.52× graph-level gate) — the dispatch fix remains
+  worthwhile for any future multi-token feature, just not for D5.
+
 ## 5. Lessons
 
 - **The gate did its job — 90 minutes of measurement against days of
