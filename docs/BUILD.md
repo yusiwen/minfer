@@ -20,6 +20,21 @@ cargo build --release --features cuda,cuda_static
 cargo build --release --features debug_dump
 ```
 
+## Git hooks (git-hooks.nix)
+
+The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git-hooks.nix)
+(flake input) instead of a Cargo dev-dependency. Pinned in `flake.lock`; the
+`rustfmt --check` hook runs with the project's pinned toolchain (1.97.1).
+
+- The hook is **installed when entering the devShell** (`nix develop` installs
+  `.git/hooks/pre-commit` + the `.pre-commit-config.yaml` symlink into the nix
+  store). Committing **outside** the shell has no hook — those contributors
+  should run `cargo fmt --all -- --check` manually first.
+- Format drift is rejected, not auto-fixed: run `cargo fmt --all`, re-stage the
+  changed files, then commit again.
+- The same check runs sandboxed as a derivation: `nix flake check`
+  (`checks.pre-commit-check`), or `nix develop -c pre-commit run --all-files`.
+
 ## macOS / Metal notes
 
 On macOS the Metal backend is built in automatically: `build.rs` compiles

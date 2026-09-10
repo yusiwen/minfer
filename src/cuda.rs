@@ -1290,7 +1290,9 @@ impl CudaState {
             Some(n) if (0..count).contains(&n) => n,
             _ => {
                 if let Some(n) = requested {
-                    eprintln!("CUDA: --gpu {n} out of range (found {count} device(s)); auto-selecting");
+                    eprintln!(
+                        "CUDA: --gpu {n} out of range (found {count} device(s)); auto-selecting"
+                    );
                 }
                 let mut best_device: i32 = 0;
                 let mut best_score: i32 = 0;

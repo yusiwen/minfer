@@ -19,5 +19,8 @@ uv.lock
 # mdBook documentation site build output
 /book/
 
+# git-hooks.nix auto-generated pre-commit config (symlink into the nix store)
+/.pre-commit-config.yaml
+
 # stray MINFER_TRACE dump accidentally committed twice (Phase 8 review)
 /1
