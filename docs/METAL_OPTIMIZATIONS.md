@@ -957,6 +957,11 @@ For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
 
 ### 5.6 Glossary — variables and functions used in this document
 
+> This table covers only this document's variable/function symbols.
+> Concept-level terms (quant formats, kernel techniques, methodology) are
+> classified corpus-wide in [GLOSSARY.md](./GLOSSARY.md); the ggml layout
+> symbols below are also collected there (L2).
+
 > Common (both kernels, GGUF/model dims):
 
 | Symbol | Meaning |

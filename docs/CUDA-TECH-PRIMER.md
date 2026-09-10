@@ -145,6 +145,9 @@ architecture generations.
 
 ## 4. The CUDA programming model — the vocabulary every kernel section uses
 
+> Every term in this section also appears, classified by layer, in the
+> corpus-wide [GLOSSARY.md](./GLOSSARY.md) (L4/L5).
+
 - **Host / device**: the CPU side (Rust) and the GPU side (.cu). They have
   separate address spaces; all data crossing the boundary goes through
   explicit copies (`cudaMemcpy`) or pinned-memory staging (§5.4).

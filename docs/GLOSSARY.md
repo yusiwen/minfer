@@ -45,6 +45,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | BACKEND | `CUDA-BACKEND-PLAN.md` |
 | BUILD | `BUILD.md` |
 | SAFETY | `GPU_SAFETY.md` |
+| METAL | `METAL_OPTIMIZATIONS.md` (its §5.6 is a doc-local symbol glossary) |
 
 ---
 
@@ -101,6 +102,20 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | split-k (dpl) | "dpl" = split-plane B layout used by the final q6_K BT kernel (doc 76). | STEPS 76 |
 | MMVQ `uint4` sub-pairs | Vectorized 16-byte loads split per-thread sub-pairs in the MMVQ weight-streaming rework. | STEPS 12+ |
 | `QI8_1` | llama.cpp MMQ tiling constant: int8-activation tile width per 32-k chunk (= QK8_1/(4·QR8_1) = 8). | MMQ |
+
+### Tensor-layout symbols (from METAL §5.6)
+
+| Symbol | One-line meaning | Source |
+|---|---|---|
+| `n_embd` / `n_head` / `nk` | Model hidden size, query-head count, KV-head count; `gqa = n_head/nk`. | METAL |
+| `hd` / `hd_kv` | Attention head dim and KV head dim (may differ under GQA). | METAL |
+| `nt` / `nkv` / `nkt` | Tokens in the batch (decode nt==1), KV positions used, KV capacity. | METAL |
+| `od` / `id` / `nf` | Matmul output/input dims (weight rows/cols) and FFN intermediate dim. | METAL |
+| `positions` | Per-token KV position array; `nkv = positions[t] + 1`. | METAL |
+| `ne00..ne33` | ggml tensor dims: `ne0x` = dim0 of the x-th src, `ne1x` = dim1, etc. | METAL |
+| `nb10..nb33` | ggml byte strides per dim for src1 (`nb10` elem stride, `nb11` row/token stride). | METAL |
+| `ns10` / `ns20` | Element counts per head/row/token (`nb11/nb10`, `nb21/nb20`) — flash-KV inner-loop stride. | METAL |
+| `nwg` / `nsg` | Workgroups and simdgroups per threadgroup (Metal launch geometry). | METAL |
 
 ## L3 — Performance model
 
