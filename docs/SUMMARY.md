@@ -113,6 +113,7 @@
     - [D4-2 — B0 latent correctness fix + all bitwise occupancy/prefetch axes closed (LANDED)](./cuda_optimization_steps/74-d4-2-b0-correctness-fix.md)
     - [D4-3 — attention structure rewrite attempt 2 NO-GO + D4-1's llama target was a llama-bench artifact (CLOSED)](./cuda_optimization_steps/75-d4-3-attention-attempt2-artifact.md)
     - [D4-4 — the endgame kernel session: dpl dense split-plane q6_K decode MMVQ lands (bitwise); PDL and fused-FFN closed with mechanism (LANDED)](./cuda_optimization_steps/76-d4-4-dpl-q6k-final.md)
+    - [D5-0 — speculative-decoding cost model: measured baseline, acceptance, and the d=2 gate (MEAS-ONLY)](./cuda_optimization_steps/80-d5-0-cost-model.md)
 
 # Speculative Decoding (D5)
 

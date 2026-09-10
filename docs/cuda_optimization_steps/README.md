@@ -122,6 +122,7 @@ The writing contract is in [STYLE.md](STYLE.md).
 | 74 | [d4-2-b0-correctness-fix](74-d4-2-b0-correctness-fix.md) | D4-2: the B0 latent correctness fix (7B dropped 13.5% of down-proj) + all bitwise axes closed | 🟢 |
 | 75 | [d4-3-attention-attempt2-artifact](75-d4-3-attention-attempt2-artifact.md) | D4-3: attention attempt 2 NO-GO + the llama-bench artifact correction | 🔴 |
 | 76 | [d4-4-dpl-q6k-final](76-d4-4-dpl-q6k-final.md) | D4-4: dpl dense split-plane q6_K (+5.5/+4.3%, +7.7/+8.1%); PDL/fused-FFN closed | 🟢 |
+| 80 | [d5-0-cost-model](80-d5-0-cost-model.md) | D5-0: the speculative-decoding gate — measured costs + acceptance p≈0.68–0.70; conditional go at d=2, gate = nt=3 verify amortization ≥ 2.5× | 📏 |
 
 ## Part VI · Methodology
 

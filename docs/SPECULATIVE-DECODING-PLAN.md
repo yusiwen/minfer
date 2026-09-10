@@ -1,8 +1,9 @@
 # Speculative Decoding (D5) — Plan
 
-Status: **planned, not started**. This document is the working plan for the D5
-campaign; per-phase records will land in `docs/cuda_optimization_steps/` as
-they complete (continuing the numbering from 79).
+Status: **D5-0 complete (2026-09-10) — conditional go, d=2 regime only**
+(record: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md)).
+This document is the working plan for the D5 campaign; per-phase records
+land in `docs/cuda_optimization_steps/` as they complete (numbering from 80).
 
 The reference study is [`LLAMA-CPP-SPECULATIVE-ANALYSIS.md`](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
 (llama.cpp `draft-simple`, source-verified: speculator framework §3, draft
@@ -94,26 +95,31 @@ shape.
 
 ## 5. Phases
 
-### D5-0 — baseline & cost model (go/no-go gate)
+### D5-0 — baseline & cost model (go/no-go gate) — DONE 2026-09-10
 
-Measure, decide, THEN build. On GB10, same-window interleaved A/B:
+Record: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md).
+Measured (3× interleaved medians, tg128): 7B q4_k_m CUDA **54.3** tok/s;
+0.5B q4_0 CUDA **342.2** / CPU **73.3**. Measured acceptance (llama.cpp
+`speculative-simple`, greedy, prose + code, both draft quants): conditional
+**p ≈ 0.68–0.70**. Break-even: p\* = 0.73 / 0.81 / 0.90 at d = 2/4/8 —
+measured p is below the line at every d unless the verify batch earns the
+BT-MMQ amortization. Verdict: **conditional go at d=2 only** — the gate is
+now the single number `C_T(3)`: minfer's measured nt=3 verify-batch
+amortization must be **≥ 2.5×** (anchor 2.7× at nt=4; interpolation 2.28× vs
+tile-step 2.7× disagree). Projected at the anchor: 1.04–1.05×; ceiling ~1.2×.
+CPU-draft cross-device: dead (1.35× — no break-even at any p, d). d ≥ 4: dead
+(≥ 4.5× amortization required).
 
-- per-token cost: 7B q4_k_m target decode (~48.5 tok/s class) vs 0.5B draft
-  decode (~200+ tok/s class, to be measured — the draft's d+1 serial steps are
-  pure latency on the SAME GPU);
-- break-even acceptance: from the §9 model, `1+a` tokens per target round of
-  cost `T(d+1)` plus draft cost `2(d+1)·D` — solve for the acceptance rate the
-  draft model must sustain at d ∈ {2,4,8} for net wall-clock win;
-- deliverable: a small table (d × required-accept-rate × projected tok/s) and
-  the go/no-go call. If the GPU-draft cost dominates, test the CPU-draft /
-  GPU-target cross-device variant (minfer's dual-backend design supports it
-  naturally) before deciding.
+### D5-1 — engine primitives (no behavior change) — RE-ORDERED: gate number first
 
-### D5-1 — engine primitives (no behavior change)
-
-`Speculator` trait + chain, KV rollback primitive, `n_out = d+1` verify-batch
-dispatch, batched sampler. Each lands with its own parity test; the default
-path (`spec = off`) is byte-identical to today.
+1. **D5-1a (gate measurement)**: the `n_out = d+1` verify-batch dispatch +
+   a micro-bench of the target at nt ∈ {3, 5} — **measure the nt=3
+   amortization before any other plumbing**. ≥ 2.5× → proceed to D5-1b;
+   < 2.5× → STOP, document the negative, close the campaign after the
+   primitive (the entire go/no-go hangs on this one number).
+2. **D5-1b**: `Speculator` trait + chain, KV rollback primitive, batched
+   sampler. Each lands with its own parity test; the default path
+   (`spec = off`) is byte-identical to today.
 
 ### D5-2 — greedy closed loop
 
