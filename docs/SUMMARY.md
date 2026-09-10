@@ -115,6 +115,10 @@
     - [D4-4 — the endgame kernel session: dpl dense split-plane q6_K decode MMVQ lands (bitwise); PDL and fused-FFN closed with mechanism (LANDED)](./cuda_optimization_steps/76-d4-4-dpl-q6k-final.md)
     - [D5-0 — speculative-decoding cost model: measured baseline, acceptance, and the d=2 gate (MEAS-ONLY)](./cuda_optimization_steps/80-d5-0-cost-model.md)
 
+# CUDA Reference
+
+- [Technology Primer — every CUDA/GPU technique minfer uses, explained](./CUDA-TECH-PRIMER.md)
+
 # Speculative Decoding (D5)
 
 - [Plan — scope, mechanism, touch points, phases, risks](./SPECULATIVE-DECODING-PLAN.md)
