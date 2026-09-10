@@ -17,7 +17,6 @@
 # Compute Graph
 
 - [Graph Refactor Plan](./GRAPH-REFACTOR-PLAN.md)
-- [llama.cpp Compute Graph](./LLAMA-COMPUTE-GRAPH.md)
 
 # Backends
 
@@ -131,5 +130,6 @@
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)
 - [Qwen3-4B perf vs llama.cpp](./PERF-QWEN3-4B-VS-LLAMACPP.md)
+- [llama.cpp Compute Graph](./LLAMA-COMPUTE-GRAPH.md)
 - [llama.cpp MMQ Analysis](./LLAMA-CPP-MMQ-ANALYSIS.md)
 - [llama.cpp Speculative Decoding Analysis](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
