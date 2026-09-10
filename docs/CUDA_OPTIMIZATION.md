@@ -262,6 +262,11 @@ All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
 
 ### 1.4 Remaining roadmap (post-campaign)
 
+- **Next campaign — D5 speculative decoding**: plan in
+  [`SPECULATIVE-DECODING-PLAN.md`](./SPECULATIVE-DECODING-PLAN.md) —
+  `draft-simple` first (MTP/EAGLE3 deferred on architecture prerequisites),
+  go/no-go decided by the D5-0 cost model; the D-series `nt=4 → BT-MMQ 2.7×`
+  evidence is the kernel-side foundation.
 - **Not planned** (revisit with a concrete need): cuBLAS/cublasLt (closed as
   8k — 8m's wmma GEMM covered the f16 path), VMM pool, multi-GPU, node
   reordering, Windows, IQ/Q2/Q3 quants.

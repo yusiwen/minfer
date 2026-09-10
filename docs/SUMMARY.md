@@ -115,6 +115,10 @@
     - [D4-3 — attention structure rewrite attempt 2 NO-GO + D4-1's llama target was a llama-bench artifact (CLOSED)](./cuda_optimization_steps/75-d4-3-attention-attempt2-artifact.md)
     - [D4-4 — the endgame kernel session: dpl dense split-plane q6_K decode MMVQ lands (bitwise); PDL and fused-FFN closed with mechanism (LANDED)](./cuda_optimization_steps/76-d4-4-dpl-q6k-final.md)
 
+# Speculative Decoding (D5)
+
+- [Plan — scope, mechanism, touch points, phases, risks](./SPECULATIVE-DECODING-PLAN.md)
+
 # Model Support
 
 - [Qwen3](./QWEN3-SUPPORT-PLAN.md)
