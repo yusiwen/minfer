@@ -271,12 +271,16 @@ All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
   gate re-measured); FA deep-opt only with numerics-order-preserving
   structure (r50/r57 caveat).
 - Open Phase-8 ledger items (inherited from the retired `CUDA-FOLLOWUP-PLAN.md`;
-  records in step docs 78/79): **8a①** macOS Metal regression run (fuse_ffn
-  decoupling + the `MINFER_NO_FUSE_FFN` A/B on 0.5B + 7B) — BLOCKED on
-  hardware; **8e② follow-up** — llama.cpp's shape-dependent `halve_iters`
-  idle-tail rule, not started; **8h②** — self-hosted CUDA CI runner, DEFERRED
-  (needs standing runner infrastructure); **8h③** — the Phase-7
-  `/tmp/minfer_phase7/` ledger cleanup, awaiting user decision.
+  records in step docs 78/79): **8e② follow-up** — llama.cpp's
+  shape-dependent `halve_iters` idle-tail rule, not started; **8h②** —
+  self-hosted CUDA CI runner, DEFERRED (needs standing runner infrastructure);
+  **8h③** — the Phase-7 `/tmp/minfer_phase7/` ledger cleanup, awaiting user
+  decision.
+- Closed Phase-8 ledger item: **8a①** macOS Metal regression run (fuse_ffn
+  decoupling + the `MINFER_NO_FUSE_FFN` A/B on 0.5B + 7B) — was BLOCKED on
+  hardware; **DONE 2026-09-10** on an Apple M4 Pro, all three checks green
+  (pre/post greedy byte-identity, fused-vs-unfused byte-identity, 0.5B decode
+  graph still emitting 24 × `fused_ffn` on Metal). Record: doc 78 §3.2.
 
 ## §2 Step documents — one doc per history row
 
@@ -298,7 +302,7 @@ Appendix B points at the cross-cutting methodology.
 | 04 | [8o — Killing the CPU stall at decode start (LANDED)](./cuda_optimization_steps/04-decode-start-stall-8o.md) |
 | 05 | [8p — Persistent f16 weight cache + fused dequant-in-GEMM (LANDED)](./cuda_optimization_steps/05-persistent-f16-cache-8p.md) |
 | 06 | [8e/8e② — decode MMVQ: dp4a integer dot products + the llama.cpp launch table (LANDED)](./cuda_optimization_steps/06-decode-mmvq-8e.md) |
-| 78 | [Phase-8 correctness & engineering-debt batch — 8a/8h①/8i (LANDED; 8a① hardware-blocked)](./cuda_optimization_steps/78-phase8-correctness-batch.md) |
+| 78 | [Phase-8 correctness & engineering-debt batch — 8a/8h①/8i (LANDED; 8a① closed 2026-09-10)](./cuda_optimization_steps/78-phase8-correctness-batch.md) |
 | 79 | [Phase-8 coverage & first-measurement batch — 8b/8c/8d/8f/8l/8q (LANDED)](./cuda_optimization_steps/79-phase8-coverage-batch.md) |
 
 ### Part II · Era B — R and P5 sessions (rows 7–13)

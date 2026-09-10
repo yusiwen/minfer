@@ -1,12 +1,13 @@
-# 78 · Phase-8 correctness & engineering-debt batch — 8a review fixes, 8h①, 8i (LANDED; 8a① hardware-blocked)
+# 78 · Phase-8 correctness & engineering-debt batch — 8a review fixes, 8h①, 8i (LANDED, ledger closed)
 
 > **Result**: 11 Phase-8 review findings fixed (`961f696`); the F32-weight E2E
 > exercise (8a②) caught a latent CPU bug — `vec_ops::mat_mul_f32` wrote
 > token-TRANSPOSED output for nt > 1; rebuild-gate, multi-split-capture and
 > multiturn-reuse tests added; device suite grew 147 → 158 across the batch.
-> One item (8a① macOS Metal regression run) remains BLOCKED on hardware.
+> The last open item (8a① macOS Metal regression run) was hardware-blocked at
+> the time and **closed on 2026-09-10** on an Apple M4 Pro — §3.2.
 > **Commits**: `961f696` (review batch), `789e64b`→`b849601` (batch-1 + 8g①),
-> `60e9cc1` (8h① + 8i). **Date**: 2026-08-29.
+> `60e9cc1` (8h① + 8i). **Date**: 2026-08-29 (8a① closed 2026-09-10).
 
 ## 1. Background — where things stood
 
@@ -91,15 +92,44 @@ Suites re-verified after the batch: cuda 147/0, plain 133/0, fmt clean; 7B and
   qwen3-0.6B) produce identical greedy text on CPU and CUDA. Regression test:
   `f32_matmul_nt2_token_major`.
 
-- **8a① (macOS Metal regression run) — BLOCKED on hardware.** The qwen2
-  FFN-fusion gate was decoupled from `fuse_qkv` to `CParams.fuse_ffn` in 7e⑤
-  (mirroring Qwen3's existing intent), and `961f696` additionally gated the
-  Metal `ffn_gu` loader registration on the same condition. What remains
-  pending a Mac: 0.5B + 7B greedy text must match the pre-change record; A/B
-  `MINFER_NO_FUSE_FFN` (fused vs unfused WITH FusionPass, per the AGENTS.md
-  test rule); confirm 0.5B still fuses on Metal (nf=2944 → gate open). No
-  macOS machine existed in this environment — the item stays on the open
-  ledger (CUDA_OPTIMIZATION.md §1.4), not silently dropped.
+- **8a① (macOS Metal regression run) — CLOSED 2026-09-10** (Apple M4 Pro,
+  Metal 4, `cargo build --release`, rustc 1.92.0). The qwen2 FFN-fusion gate
+  was decoupled from `fuse_qkv` to `CParams.fuse_ffn` in 7e⑤ (mirroring
+  Qwen3's existing intent), and `961f696` additionally gated the Metal
+  `ffn_gu` loader registration on the same condition (nf ≤ 16384 +
+  `MINFER_NO_FUSE_FFN`) — the two edits were Metal-relevant but had never run
+  on a Mac. Verification, all three checks green:
+  1. **Post-vs-pre-change greedy identity** — the pre-change tree
+     (`78d410a`, = `f54f721~1`: FFN fusion keyed off `fuse_qkv`, `ffn_gu`
+     registered unconditionally) was built in a worktree and A/B'd against the
+     current tree, same prompt/seed/`--greedy`: **byte-identical** on 0.5B
+     q4_k_m ×2 prompts, 0.5B q4_0 ×1, 7B q4_k_m ×2 (64 tokens each), all on
+     Metal.
+  2. **`MINFER_NO_FUSE_FFN` A/B** — fused vs unfused (unfused still running
+     the FusionPass, per the AGENTS.md comparison rule) is **byte-identical**
+     on the same 5 model/prompt pairs, so the decoupled gate does not change
+     numerics. This also closes the pre-change footgun: before 7e⑤ the toggle
+     was read inline in the build gate but was *not* part of the reuse
+     identity (`fuse_flags_are_part_of_the_reuse_identity` now asserts it).
+  3. **0.5B still fuses on Metal** — `MINFER_TRACE` decode graph: 24 ×
+     `fused_ffn` nodes with `weight: blk.{i}.ffn_gu`, `nf: 4864`,
+     `backend: metal`; the 7B decode graph has 0 × `fused_ffn` and 28 ×
+     `swiglu` (nf = 18944 > 16384, gate closed, exactly as intended). The
+     fused run succeeding at all proves the loader registration happened —
+     execution aborts if any weight the graph reads is unregistered.
+  - Doc correction: the nf quoted for the 0.5B gate check was 2944; the actual
+    `blk.0.ffn_gate.weight` out-dim is **4864** (`[896, 4864]`, well under the
+    16384 gate). Conclusion unchanged.
+  - Suites on the same Metal machine: `cargo test --release` **169 passed /
+    0 failed / 11 ignored** = 155 bin + 14 integration (`conversation_cli` 3,
+    `gemm_isolation` 5, `flash_attn_isolation` 2, `flash_attn_blk_isolation` 1,
+    `gqa_attn_isolation` 3 — the four Metal isolation suites ran on device and
+    are green). The 11 ignored are the env-dependent helpers (real-data dumps,
+    throughput profiling, and the `conversation_cli` model-dependent cases),
+    unchanged from before this check. `cargo fmt --check` clean.
+
+  The interim state (2026-08-29 → 2026-09-10) stayed on the open ledger rather
+  than being silently dropped; this entry is that ledger item being closed.
 
 ### 3.3 8h① — stale docs marked SUPERSEDED (`60e9cc1`)
 
@@ -154,7 +184,7 @@ CUDA_OPTIMIZATION.md Appendix C.)
 A correctness-only tree: no perf deltas intended or claimed. The concrete
 outcomes are the 11 review fixes, the fixed nt>1 F32 CPU matmul, three new
 permanent tests, and the completed Phase-8 ledger (8a③/8g①/8a②/8h①/8i DONE;
-8a① hardware-blocked; 8h② deferred; 8h③ user-decision). The batch also
+8h② deferred; 8h③ user-decision; 8a① closed 2026-09-10, §3.2). The batch also
 unblocked the rest of Phase 8: 8c's capture-safety argument ("prefill never
 captures since 8g①") and the 8f model-coverage work both stand on this
 foundation.
@@ -168,7 +198,10 @@ foundation.
    hidden forever (nt>1 transpose).
 3. **Env toggles must join the reuse identity** — otherwise A/B comparisons
    silently compare identical graphs; assert it, don't remember it.
-4. **Hardware-blocked verification stays on the open ledger** (8a①), never
-   silently dropped from the record.
+4. **Hardware-blocked verification stays on the open ledger** — never silently
+   dropped, and never assumed to be free once the hardware appears. 8a① sat
+   blocked for 12 days and, on being re-run (2026-09-10), was green on all
+   three checks — but that verdict had to be *produced*, not inferred from
+   "the change looked memory-only".
 
 ← 77 · [Index](./README.md) · 79 →
