@@ -71,6 +71,9 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | `E[a] = Σ_{i=1..d} p^i` | Expected tokens accepted per round under independence. | D5, PRIMER |
 | verify pass | One batched forward (nt = d+1) checking all drafted tokens at target cost C_T(n). | D5 |
 | speculative speedup rule | Win only if `E[a]·C_T(1) > C_T(d+1) + d·C_D` — the whole D5 plan reduces to this inequality. | D5, STEPS 80 |
+| MTP (multi-token prediction) | Draft source using MTP heads (DeepSeek-V3 / Qwen3-Next GGUFs); unavailable to minfer's dense models. | SPEC, D5 |
+| EAGLE-3 / DFlash / DSpark / n-gram self-speculators | The other draft mechanisms in llama.cpp's speculative zoo, outside `draft-simple`'s scope. | SPEC |
+| MoE + MLA | Architecture prerequisite for MTP drafts — its own future campaign; minfer targets dense. | SPEC, D5 |
 
 ## L2 — Numerics & data formats
 
@@ -97,6 +100,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | W16 cache | CUDA-side cache of weights converted to f16 for some paths (`MINFER_NO_W16CACHE` to disable). | STEPS 34+ |
 | split-k (dpl) | "dpl" = split-plane B layout used by the final q6_K BT kernel (doc 76). | STEPS 76 |
 | MMVQ `uint4` sub-pairs | Vectorized 16-byte loads split per-thread sub-pairs in the MMVQ weight-streaming rework. | STEPS 12+ |
+| `QI8_1` | llama.cpp MMQ tiling constant: int8-activation tile width per 32-k chunk (= QK8_1/(4·QR8_1) = 8). | MMQ |
 
 ## L3 — Performance model
 
@@ -164,6 +168,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | griddepcontrol | The SASS/PTX-level instruction pair behind PDL. | STEPS 74 |
 | wave (n) | One full pass of all resident blocks; kernel iteration wave counting for sched analysis. | STEPS 36 |
 | elect.sync | Warp election intrinsic seen in SASS forensics. | STEPS 65 |
+| `MMQ_TILE_NE_K` / `MMQ_TILE_Y_K` | llama.cpp MMQ shared-memory tile pitches (B tile 32+4 ints; y-tile row stride 36 ints = 144 B, the +4 avoids bank conflicts). | MMQ |
 
 ## L5 — Platform & tooling
 
@@ -217,6 +222,13 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | `submit()` bounded wait | GPU submission waits bounded and checks status — never blocks forever. | SAFETY |
 | no early return past barrier | Metal/CUDA rule: no exit path may skip a `threadgroup_barrier`/`__syncthreads`. | SAFETY |
 | prefill capture | Backend feature storing the captured prefill graph for replay. | BACKEND |
+| IR (intermediate representation) | The graph as an op-level IR; fusion makes fused ops first-class IR citizens. | GRAPH |
+| NodeId / DType | Node handle and tensor data-type enum carried by every CNode. | GRAPH |
+| `GetRows` | Row-selection op: embedding lookup, and the n_out tail-row optimization (G3). | GRAPH |
+| `BatchMatMul` | Batched matmul op (shared activation quantization, Q4_0); composable with fusion. | GRAPH |
+| FusedOp / `supports_fused` | Pattern-matched fusion ops (SwiGLU / FusedBiasRope) dispatched by backend capability. | GRAPH |
+| `n_out` tail-row optimization | After the final `wo`, run FFN/norm/lm_head only on the tail n_out rows (llama `inp_out_ids` style); `GraphParams.n_out` joins the reuse decision. | GRAPH |
+| DOT / JSON export | `graph/dot.rs` and `graph/json.rs` render the graph for viz. | GRAPH |
 
 ## L7 — Methodology
 
@@ -239,3 +251,4 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | llama.cpp as reference | `$HOME/git/reading/llama.cpp` is the ground truth for both parity and technique adoption. | MMQ, SPEC |
 | doc-per-step convention | Every step writes one numbered record with a fixed six-section structure (STYLE.md). | STEPS STYLE |
 | measurement artifacts | Raw bench JSONs kept under `/tmp` per step and reported, never committed. | STEPS 77-80 |
+| G1 / G2 / G3 | Graph-refactor Phase-9 sub-experiment labels (attention dispatch, `rms_norm_256`, n_out tail-row). | GRAPH |
