@@ -122,6 +122,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | CUDA backend design + implementation record (Phase 7a–7e) | `docs/CUDA-BACKEND-PLAN.md` |
 | **CUDA optimization history (live status) + per-step records (incl. Phase 8)** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` |
 | CUDA / GPU technology primer (every technique explained) | `docs/CUDA-TECH-PRIMER.md` |
+| Campaign glossary (every term/formula, classified into 7 layers) | `docs/GLOSSARY.md` |
 | llama.cpp MMQ / speculative-decoding analyses | `docs/LLAMA-CPP-MMQ-ANALYSIS.md`, `docs/LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
 | **Speculative decoding plan (D5, live)** | `docs/SPECULATIVE-DECODING-PLAN.md` |
 | Qwen3 support plan (+ minijinja gotcha §5#9) | `docs/QWEN3-SUPPORT-PLAN.md` |

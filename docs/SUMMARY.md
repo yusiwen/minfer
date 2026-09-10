@@ -118,6 +118,7 @@
 # CUDA Reference
 
 - [Technology Primer — every CUDA/GPU technique minfer uses, explained](./CUDA-TECH-PRIMER.md)
+- [Glossary — every term/formula in the campaign docs, classified into 7 layers](./GLOSSARY.md)
 
 # Speculative Decoding (D5)
 

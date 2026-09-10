@@ -35,6 +35,11 @@ fate was decided by a micro-architectural regime measurement. That
 cross-layer interaction is exactly what the campaign's step docs record, and
 what this primer maps.
 
+> **Full taxonomy:** a corpus-wide audit extended these three layers to
+> **seven** (adding Platform & tooling, Engine architecture, Methodology) and
+> classified every term and formula in the campaign docs — see
+> [GLOSSARY.md](./GLOSSARY.md).
+
 Code surfaces referenced throughout:
 
 | File | Lines | Role |
