@@ -7,6 +7,34 @@ it lives in the code, and what the optimization campaign (step docs
 first: every concept is explained before it is used. Deep-dive narratives stay
 in the step docs; this file is the map.
 
+## 0. How to read this document — the three layers (and which layer each term lives in)
+
+The campaign's vocabulary mixes three different technical domains. When a
+term confuses you, first ask which layer it belongs to:
+
+| Layer | Domain | Terms that live here | Decided by |
+|---|---|---|---|
+| **Algorithm** | LLM inference algorithms (the speculative-decoding literature: Leviathan/Chen 2023; llama.cpp's `draft-simple`) | `d` (draft length, e.g. "d=2"), acceptance rate `p`, `E[a] = Σp^i`, break-even | probability & decision math — hardware-independent |
+| **Performance model** | computer-architecture performance analysis (the roofline model, arithmetic intensity) | "amortization" (spreading fixed costs over more work), memory-bound vs compute-bound, bytes-per-token | measured bytes/FLOPs against hardware ceilings |
+| **Micro-architecture (kernel implementation)** | GPU GEMM kernel engineering (tiling, CUTLASS-style vocabulary) | tile shape, "tile-regime", wave quantization, occupancy, `__launch_bounds__`, coalescing | the kernel's tiling configuration vs the shape it is launched with |
+
+A concrete chain from the D5-0 gate (doc 80) showing all three at once:
+
+```
+d=2 (algorithm layer: draft 2 tokens per round)
+  → the verify forward is a batched nt=3 decode step (a SHAPE)
+    → which tile-regime does M=3 land in? (micro-architecture layer)
+      → 2.28x (interpolation) or 2.7x (same-tile-as-M=4)? = the amortization
+        (performance-model layer: fixed weight-traffic cost spread over rows)
+        → ≥ 2.5x needed for break-even at measured p≈0.68
+          → back up: is the algorithm parameter d=2 worth it?
+```
+
+No single layer could answer the gate question — the algorithm parameter's
+fate was decided by a micro-architectural regime measurement. That
+cross-layer interaction is exactly what the campaign's step docs record, and
+what this primer maps.
+
 Code surfaces referenced throughout:
 
 | File | Lines | Role |
@@ -212,7 +240,7 @@ weight traffic.
 |---|---|---|---|
 | `q*_f32_matmul` (q4_0, q4_1, q5_0, q5_1, q4_k, q5_k, q6_k) | CUDA cores, per-thread dot over dequantized weights | pre-Phase-7 / fallback paths, GPU reads f32 activations | — |
 | `gemm_f16_nt_kernel_t` (+ `gemm_qb_nt`) | **Tensor cores via `nvcuda::wmma`** (f16 in, f32 accumulate) | prefill GEMM on the f16 weight cache (8m) — 30.7→1204 tok/s (39×) | 02, 05 |
-| `mmq_nt_kernel`, `mmq_raw_nt/wide/nb/bt(_q6k)` | integer dp4a/imad over **int8-quantized activations** × quantized weights | prefill MMQ (R1 parity-first, opt-in → default), the r5–r59 line — 8.1× arc | 08, 13–31, 33–40 |
+| `mmq_nt_kernel`, `mmq_raw_nt/wide/nb/bt(_q6k)` | integer dp4a/imad over **int8-quantized activations** × quantized weights | prefill MMQ (R1 parity-first, opt-in → default), the r5–r59 line — 8.1× arc. **"BT"** names the raw-byte BT-style kernel variant of this family (introduced r38 as the q6_K BT-style kernel; `mmq_raw_nb_bt_kernel`) — the form whose batched (nt>1) executions the D series measured; "BT-MMQ 2.7× at nt=4" (doc 80's gate anchor) refers to this family running the multi-token batch | 08, 13–31, 33–40, 67, 76 |
 | `q*_q8_mmvq`, `v2`, `v2_pf`, `_dpl` | **dp4a** (4-way int8 dot) per weight row | decode matrix-vector (one token): q4_K/q5_K/q6_K; v2 = D3b bitwise re-tile, pf = D4-2 padded-form dispatch, dpl = D4-4 dense split-plane | 06, 67, 74, 76 |
 | `dequant_*_f16` | per-block dequant to f16 | feeds the f16 GEMM path | 05 |
 | `embed_rows_*`, `gather_rows_f32` | row-gather | embedding lookup on GPU | — |
