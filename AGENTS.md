@@ -1,247 +1,134 @@
 # minfer — AI Agent Context
 
-minfer is a pure Rust LLM inference engine written from scratch (~4400 LOC), inspired by llama.cpp with 0 ML framework dependencies.
-Supports **Qwen2/Qwen2.5 architecture**, **CPU + Apple MPS (Metal) GPU** inference, and **GGUF v3 format**.
-Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels), modeled on llama.cpp's `ggml_cgraph` + backend scheduler — see `docs/GRAPH-REFACTOR-PLAN.md` for the design and implementation record.
+Pure-Rust LLM inference engine written from scratch (~4400 LOC), llama.cpp-inspired, 0 ML framework deps.
+Qwen2/Qwen2.5 + Qwen3 (dense) · CPU + Metal (macOS) + CUDA (opt-in) · GGUF v3.
+Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels) — design + implementation record: `docs/GRAPH-REFACTOR-PLAN.md`.
 
-This file is the always-loaded project index. Deep dives, performance analysis, and historical fixes live in `docs/` (index at the bottom) — don't re-litigate them here.
+This file is the always-loaded index. Deep dives live in `docs/` (index at the bottom) — don't duplicate them here.
 
 ## Code Search (ccc)
 
-minfer is a llama.cpp-inspired engine; both codebases are indexed with [ccc](https://cocoindex.io/cocoindex-code/). When the question is "where / how is X implemented", prefer ccc semantic search over whole-repo grep/rg.
+For "where / how is X implemented", prefer [ccc](https://cocoindex.io/cocoindex-code/) semantic search over grep:
 
-- **minfer's own code** -> use the `ccc` MCP `search` tool, or CLI: `ccc search "<query>"` from this directory (index: `.cocoindex_code/`, 1255 chunks).
-- **llama.cpp reference source** (`$HOME/git/reading/llama.cpp`, C++ upstream: ggml, quantization kernels, sampler, tokenizer, llama_server, etc.) -> use the `ccc-llamacpp` MCP `search` tool, or CLI: `cd $HOME/git/reading/llama.cpp && ccc search "<query>"` (index: 47326 chunks).
-- **Structural search**: `ccc grep '<pattern>'` -- e.g. `ccc grep 'fn \NAME(\(A*\))' src/` for Rust functions, or `ccc grep '\NAME(\(A*\))'` inside llama.cpp for call sites.
-- **Filters**: `--lang rust|cpp|...`, `--path 'src/**'` to narrow results.
-- Both MCP servers auto-refresh their indexes (`refresh_index=true` default); stale results -> pass `refresh_index=true` explicitly or run `ccc index` / `ccc search --refresh`.
+- minfer: `ccc search "<query>"` (or the `ccc` MCP tool). llama.cpp reference ($HOME/git/reading/llama.cpp): `ccc-llamacpp` MCP tool, or `cd` there and run `ccc search`.
+- Structural: `ccc grep '<pattern>'` (e.g. `ccc grep 'fn \NAME(\(A*\))' src/`); narrow with `--lang` / `--path`.
+- Indexes auto-refresh; if stale: `ccc index` / `ccc search --refresh`.
 
-## Architecture at a Glance
+## Layout
 
 ```
 src/
-├── main.rs          # CLI + inference loop (prefill → autoregressive generation)
-├── graph/           # ★ declarative compute graph — the inference core (see below)
+├── main.rs          # CLI + inference loop (prefill → autoregressive decode)
+├── graph/           # ★ compute graph — the inference core (files below)
 ├── gguf.rs          # GGUF v3 parser (~1650 lines, largest file)
-├── block.rs         # 20+ quantized block types (repr(C), matching ggml-common.h)
-├── quants.rs          # AVX2 + aarch64 NEON/SDOT dot kernels + Q8_0/Q8_K quantization
-├── kernel.rs        # Quantized matmul dispatch + CPU scalar fallbacks (+ embed_tokens row getter)
-├── vec_ops.rs       # SIMD vector ops (RMSNorm, RoPE, Softmax, SiLU)
+├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
+├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization
+├── kernel.rs        # quantized matmul dispatch + CPU scalar fallbacks
+├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
-├── cache.rs         # Legacy KV Cache type (graph path owns KV in the allocator)
-├── dump.rs          # Debug dump module (gated by `--features debug_dump`)
-├── tokenizer.rs     # BPE tokenizer (self-contained, loaded from GGUF metadata)
-├── sampler.rs       # Repeat-penalty / Top-K / Top-P / Temperature (seeded) sampling
-├── template.rs      # ChatML / Llama3 / Mistral template rendering (minijinja) — ⚠ minijinja 2.21.0 has no `str` methods; Qwen3's Python-style template fails → falls back to ChatML (see docs/QWEN3-SUPPORT-PLAN §5#9)
-├── conversation.rs  # Multi-turn conversation session (append-only KV + Engine abstraction)
-├── server/          # OpenAI-compatible HTTP server (axum; types/slot/chat)
-├── download/mod.rs  # HuggingFace + Ollama auto-download + cached-name resolution
-├── metal.rs         # MPS kernels + per-op GPU methods (graph backend entry points)
-├── metal.metal      # Metal GPU shaders (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0 kernels)
-├── cuda.rs          # CUDA device layer (feature-gated; CudaState singleton, weight registry, kernels, pinned staging; graph backend in graph/cuda_backend.rs — Phase 7 complete: 7a–7e)
-└── models/
-    ├── mod.rs       # ModelDef trait + factory dispatch
-    └── qwen2/
-        ├── mod.rs   # Qwen2Model + ModelDef implementation
-        ├── graph.rs # ★ build_graph + graph forward (Qwen2Graph)
-        └── loader.rs # GGUF weight loading + GPU registration
+├── cache.rs         # legacy KV cache type (graph path owns KV in the allocator)
+├── dump.rs          # debug dump module (--features debug_dump)
+├── tokenizer.rs     # BPE tokenizer (self-contained, from GGUF metadata)
+├── sampler.rs       # repeat-penalty / top-k / top-p / temperature
+├── template.rs      # chat templates (minijinja) — 2.21.0 has no `str` methods; Qwen3's template falls back to ChatML (docs/QWEN3-SUPPORT-PLAN §5#9)
+├── conversation.rs  # multi-turn session (append-only KV)
+├── server/          # OpenAI-compatible HTTP server (axum)
+├── download/mod.rs  # HuggingFace + Ollama auto-download
+├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
+├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)
+└── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```
 
-### src/graph/ — the compute graph core
-
-| File | Role |
-|------|------|
-| `mod.rs` | `ComputeGraph` (topo-validated node list + inputs/outputs), `CNode`, `DType`, `Backend`, `BufRef` |
-| `ops.rs` | `Op` enum (full payload `PartialEq`), `NodeMeta`, `AttnMode`, `FusedOp` |
-| `builder.rs` | `GraphBuilder` — declarative construction (embedding/matmul/rope/attn/kvcache/…) |
-| `alloc.rs` | Per-backend liveness allocator + persistent per-layer KV regions + `KvProvider` |
-| `backend.rs` | `Backend` trait (pool alloc/execute/host access/synchronize) + `KvProvider` |
-| `cpu_backend.rs` | CPU execution (wraps kernel.rs + vec_ops.rs) |
-| `metal_backend.rs` | Metal execution (per-op MPS kernels; `cfg(target_os = "macos")`) |
-| `scheduler.rs` | assign → split → execute (+ cross-backend copies at split boundaries) |
-| `fusion.rs` | Pattern-matching fusion (SwiGLU/BiasRope), gated by backend `supports_fused` |
-| `models/qwen3/` | Qwen3 dense (mod/loader/graph) — Qwen2 + decoupled head dim + `Op::QkNorm` per-head Q/K RMSNorm |
-| `cache.rs` | `GraphCache` — params-only deterministic graph reuse |
-| `params.rs` | `GraphParams`/`CParams`/`GraphType` — the reuse identity |
-| `dot.rs` | Graphviz DOT export (`--dump-graph`) |
+`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op enum + NodeMeta · `builder.rs` GraphBuilder · `alloc.rs` liveness allocator + persistent KV regions · `backend.rs` Backend trait · `cpu_backend.rs` / `metal_backend.rs` / `cuda_backend.rs` executors · `scheduler.rs` assign → split → execute · `fusion.rs` SwiGLU/BiasRope fusion · `cache.rs` + `params.rs` params-only graph reuse · `dot.rs` DOT export · `json.rs` graph JSON export for viz.
 
 ## Build & Run
 
 ```bash
-cargo build --release
-cargo build --release --features debug_dump    # + per-layer debug dumps
-cargo build --release --features cuda          # + CUDA backend (opt-in; requires nvcc + CUDA toolkit)
-cargo build --release --features cuda,cuda_static   # + statically-linked cudart (no libcudart.so dep)
+cargo build --release                             # CPU + Metal; never touches nvcc
+cargo build --release --features cuda             # + CUDA backend (needs nvcc)
+cargo build --release --features cuda,cuda_static # + static cudart (no libcudart.so dep)
+cargo build --release --features debug_dump       # + MINFER_DUMP_DIR per-layer dumps
 
-# CUDA build notes (build.rs): the host nvcc and a compatible host compiler are
-# auto-detected — when the default cc/g++ on PATH is newer than the toolkit
-# supports (e.g. nix devShells' GCC 15 vs CUDA 13), build.rs pins the first
-# working -ccbin (gcc-13/-12/…). MINFER_CUDA_CCBIN=/path/to/g++ forces one.
-# Without --features cuda, builds never touch nvcc at all.
-#
-# cudart linking (mirrors llama.cpp's GGML_STATIC): by default `-lcudart` is a
-# SHARED link — the binary NEEDEDs libcudart.so.N and only runs on a host that
-# has the CUDA toolkit runtime reachable (an rpath to <cuda_home>/lib64 is
-# baked in). With `cuda_static` it links libcudart_static.a instead, so the
-# binary has NO libcudart.so NEEDED dependency and only needs the NVIDIA driver
-# (libcuda.so.1, dlopen'd lazily at runtime by CudaState::preload_driver) +
-# libstdc++ — deployable without a CUDA toolkit. The driver is never a
-# link-time dependency in either mode.
-#
-# GPU arch coverage (build.rs detect_archs): SASS is compiled for whatever sm_*
-# the toolkit accepts (70..121 as available; Pascal sm_61 is dropped because the
-# kernels use WMMA tensor cores, sm_70+) + a forward-only PTX for the highest.
-# Volta (V100 sm_70 / Titan V sm_72) is a gap the forward PTX cannot
-# JIT *down* to, so build.rs also embeds a compute_70/72 backward-JIT PTX when
-# nvcc supports it (CUDA 12.x). CUDA 13 REMOVED Volta (won't compile sm_70/72),
-# so on CUDA 13 the probe skips them — to keep Volta coverage build with
-# CUDA 12.8 (the only version supporting both Volta AND the Blackwell RTX 50
-# sm_120/121, which needs >= 12.8).
-#
-# Release target split (release.yml): the x86_64 CUDA job uses CUDA 12.8 (Volta
-# V100 + sm_120, glibc 2.35 floor); the arm64 CUDA job uses CUDA 13 because the
-# DGX Spark GPU (GB10, sm_121) is native to CUDA 13 and was removed from the
-# 12.x arch list — built on a ubuntu-24.04-arm runner to match the Spark's
-# glibc 2.39.
-
-./target/release/minfer <model.gguf> "hello"                      # run (compute-graph forward)
-./target/release/minfer --graph <model> "hello"                   # accepted for compat (graph path is default)
-./target/release/minfer --dump-graph graph.dot <model> "hello"    # export the prefill graph as DOT
-./target/release/minfer --no-template <model> "prompt"            # raw prompt (skip chat template)
-./target/release/minfer info <model>                              # list tensor names/types/shapes
-./target/release/minfer bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>  # llama-bench-style perf test (pp/tg, mean ± stddev)
-MINFER_DISABLE_MPS=1 ./target/release/minfer <model> "hello"      # force CPU
-MINFER_DUMP_DIR=/tmp/dump ./target/release/minfer <model> "hello" # debug dump (debug_dump build)
-MINFER_GRAPH_DUMP=/tmp/d ./target/release/minfer --graph <model> "hello"  # dump graph logits/KV (any build)
-MINFER_TRACE=/tmp/t.json ./target/release/minfer <model> "hello" -n 5      # per-node real-data trace for viz/ (P2)
-MINFER_DISABLE_MPS=1 ./target/release/minfer viz <model>                    # self-contained viz server (page + live SSE + /viz/run), lazy capture
+./target/release/minfer <model.gguf> "hello"                       # run (graph path; --graph accepted for compat)
+./target/release/minfer info <model>                               # tensor names/types/shapes
+./target/release/minfer bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>
+MINFER_DISABLE_MPS=1 ./target/release/minfer <model> "hello"       # force CPU
+MINFER_GRAPH_DUMP=/tmp/d  ./target/release/minfer <model> "hello"  # graph logits/KV dump (any build)
+MINFER_TRACE=/tmp/t.json  ./target/release/minfer <model> "hello"  # per-node real-data trace for viz/
+./target/release/minfer viz <model>                                # viz server (page + live SSE)
 ```
 
-Split (multi-part) GGUF is supported: entry is part 0; `load_gguf_model` parses every part and builds a merged tensor index; download resume is size-checked (curl `-C -`).
+- Full CLI + options: `docs/USAGE.md`. CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
+- Multi-part GGUF: entry is part 0, all parts parsed into one merged tensor index; download resume is size-checked.
 
-## Debug Dump
+## Support
 
-`MINFER_DUMP_DIR` + `--features debug_dump` writes per-layer hidden states (embed out, per-layer attn/FFN stages, final logits; `_gen0` suffix = first generation step). Full file list: `docs/debug-dump.md`. The graph path additionally supports `MINFER_GRAPH_DUMP=<dir>` (any build): writes `logits_<prefill|decode>.f32`, `kv0_<prefill|decode>.f32` and layer-0 intermediate nodes — useful for GPU-vs-CPU graph comparison.
-
-## Quantization Support
-
-Working: **Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K** (CPU + Metal GPU, see matrix below). CPU activations: Q8_0 for the simple weight types, **Q8_K for K-quant weights** (llama.cpp's format: 256-element blocks with precomputed bsums).
-Not supported (CLI): Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ3_XXS, IQ4_NL, etc.
-
-## GPU Support Matrix
-
-| Quant | MPS (Metal) | CPU |
-|-------|-------------|-----|
-| Q4_0, Q4_1 | ✓ (Q8_0-activation path + f32 path) | ✓ |
-| Q4_K, Q6_K | ✓ (f32 path) | ✓ |
-| Q8_0 | ✓ (f32 path) | ✓ |
-| Q5_0 | ✓ (f32 path) | ✓ |
-| Q5_1 | ✓ (f32 path) | ✓ |
-| Q5_K | ✓ (f32 path, `kernel_q5_k_f32_matmul` + `_multi`) | ✓ |
-| F32 | ✓ (RMSNorm, biases, etc.) | ✓ |
-
-Prefill GEMM: Q4_0 simdgroup GEMM for nt ≥ 16 (`MINFER_GEMM=0` forces f32 multi); other quants use the f32 multi kernel. Perf/progress tracking (single source): `docs/METAL_OPTIMIZATIONS.md` §0.
-
-## Model Support Matrix
-
-| Model | CPU | MPS GPU (graph path) | Notes |
-|-------|-----|---------|-------|
-| Q4_0 (qwen2.5-0.5b-instruct-q4_0) | ✓ | ✓ (~200+ tok/s) | All weights Q4_0; graph-vs-old-forward logits bit-identical (max diff 0.0) |
-| Q4_K_M (qwen2.5-0.5b-instruct-q4_k_m) | ✓ | ✓ | Q5_0/Q8_0/Q4_K/Q6_K mixed |
-| Q5_K_M (qwen2.5-0.5b-instruct-q5_k_m) | ✓ | ✓ | Q5_1/Q8_0/Q5_K/Q6_K, full GPU |
-| Q4_K_M (qwen2.5-7b-instruct-q4_k_m) | ✓ | ✓ (~42 tok/s) | hd=128, split GGUF, graph path verified end-to-end |
-| Q8_0 (qwen3-0.6b-instruct-q8_0) | ✓ (~160 tok/s) | ✓ (~215 tok/s) | Dense Qwen3: decoupled head dim (128) + per-head Q/K RMSNorm (`Op::QkNorm`); decode uses the fused QKV path (`Op::FusedQkvNorm` — concat matmul + per-head norm + no-bias rope+store) since 2026-08-27; greedy 60-token sequence identical to llama.cpp (same GGUF, temp 0, no penalties); hd=128, kv dim 1024 |
-| Q4_K_M (qwen3-4b-instruct-q4_k_m) | ✓ (~52–58 tok/s, -t 8) | ✓ (~78 tok/s) | Q4_K/Q6_K mixed, 36 layers, hd=128 (decoupled from 2560/32=80), kv dim 1024; decode uses the fused QKV path (`Op::FusedQkvNorm`); greedy 40-token sequence identical to llama.cpp on CPU and Metal; KV sized by `--n-ctx` (default 4096, clamped to model context — 40960 would allocate 12.1 GB + ~275 ms first-submit Metal tax, see `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) |
-| Q4_K_M (DeepSeek-R1-Distill-Qwen-1.5B) | ✓ | ✓ (~130 tok/s) | Qwen2.5 arch (`general.architecture = "qwen2"`), 28 layers, GQA 12:2, vocab 151936; special-token template (`<｜User｜>`/`<think>`) needs the tokenizer special-token match (GGUF type 3/4 table + `<|im_start|>`/EOS fallbacks) — added for R1 support; without it the prompt gets BPE-split (28 vs 12 tokens) |
+- Quants (CPU + GPU): **Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K**. Not supported: Q2_K/Q3_K/I-quants. Full matrix incl. CUDA notes: `docs/SUPPORT-MATRIX.md`.
+- Activations: CPU quantizes to Q8_0 on the fly (Q8_K for K-quant weights); GPU backends read f32 (CUDA prefill uses int8 MMQ).
+- Verified models (CPU + graph-GPU, greedy output matches llama.cpp where noted in docs): Qwen2.5-0.5B Q4_0/Q4_K_M/Q5_K_M · Qwen2.5-7B Q4_K_M · Qwen3-0.6B Q8_0 · Qwen3-4B Q4_K_M (KV sized by `--n-ctx`, see `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) · DeepSeek-R1-Distill-Qwen-1.5B (needs the tokenizer special-token match).
 
 ## GPU Safety
 
-Read `docs/GPU_SAFETY.md` before touching Metal code. Hard rules (apply to the per-op kernels in `metal.rs` and to `MetalBackend`): `submit()` waits bounded (10 s) + checks status, reports the dispatch trace (`MINFER_TRACE=1`) and exits — never blocks forever; no early return past a `threadgroup_barrier` in a kernel (GPU deadlock/freeze); device limits (threadgroup memory/threads) queried at runtime, never hardcoded; all guard failures `gpu_abort` with actual values. In the graph architecture, **kernel-invariant violations return `Err` from `execute_node` and must NOT be treated as a silent CPU fallback** — backend assignment at build time decides which ops run where; only genuine support limitations (e.g. Raw weights) select the CPU backend.
+Read `docs/GPU_SAFETY.md` before touching Metal/CUDA code. Hard rules: `submit()` waits bounded + checks status (never blocks forever); no early return past a `threadgroup_barrier`; device limits queried at runtime, never hardcoded; guard failures abort with actual values. In the graph, **kernel-invariant violations return `Err` from `execute_node` — never a silent CPU fallback**; backend assignment is decided at build time.
 
-## Compute Graph Architecture (core rules)
+## Compute Graph — core rules
 
-Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backends → fuse → allocate → execute**. The graph is built once per distinct `GraphParams` and reused (decode steps reuse the same graph). The model's `forward()` routes through this (Qwen2's imperative forward was deleted in Phase 6).
+Inference = build `ComputeGraph` → assign backends → fuse → allocate → execute; one graph per `GraphParams`, reused across decode steps. Full design: `docs/GRAPH-REFACTOR-PLAN.md`.
 
-1. **KV positions are data, not structure.** `Op::KvcacheStore/Load` carry only the layer index; write positions come from the `positions` input node. Graph topology **never** depends on `n_past` — this is the precondition for decode-time reuse (llama.cpp `allow_reuse` same invariant).
-2. **Each layer owns TWO persistent KV regions (K and V)**, resolved by `kv_pair(layer)` (a `KvProvider` the allocator implements). The store node's output buffer is the K region; backends write the V sibling via `kv_pair`. Regions survive graph rebuilds (the allocator lives inside `GraphCache`).
-3. **Reuse is params-only.** `GraphParams` (n_tokens/n_seqs/gtype/cparams/weights_version) deterministically determines the topology; `n_past` is absent, and `CParams.gpu` records backend participation (a backend config change forces a rebuild). `GraphCache::try_reuse` compares params only; debug builds assert structural consistency.
-4. **Weight layout is llama.cpp/GGUF convention.** Tensor metadata `[in, out]` (ne[0] fastest) with memory `[out][in]` row-major → matmul `od = shape[1]`, `id = shape[0]`. Activations: shape metadata `[d, nt, 1, 1]`, memory token-major `[nt][d]`. I32 inputs (token ids/positions) are stored as `f32::from_bits` bit patterns (exact for |v| < 2^24); use `fill_input_i32`.
-5. **In-place ops (`Silu`, `RoPE`) alias their input buffer** — the allocator maps their output to the input's `BufRef` (only when the input's sole consumer is this op AND it is on the same backend). **Never host-copy a GPU-pending buffer**: a host `copy_in` of a producer that has been encoded but not submitted reads stale data (the Phase-3 KV-corruption bug). Cross-backend in-place inputs get a fresh buffer (the producer completed before the split boundary, so the copy is safe there).
-6. **Execution follows build order** (the builder appends sources before consumers, so node order is a valid topological order — ggml executes `nodes[0..n]` the same way). This guarantees a KV store executes before the attention that reads it. Nodes with no allocated buffer (dead, e.g. fusion orphans) are skipped. **The allocator's liveness uses the same build order** (`topo_order()` may reorder srcless nodes like `kv_load` ahead and would let reuse clobber a still-alive input — G3 regression); **input buffers are never freed** (all inputs are host-filled before execution, so two inputs sharing a buffer would clobber each other at fill time).
-7. **decode (nt==1) QKV fusion (G4, `Op::FusedQKV`)** replaces the 3 matmul + 3 bias + 2 rope + 2 store chain with one concat matmul (`blk.{i}.attn_qkv`, loader-registered `wq|wk|wv` rows) + one `attn_bias_rope_store` pass; attention reads q from concat offset 0 (nt==1 ⇒ no stride issue). Gated by `nt==1 && gpu && fuse_qkv` (part of the reuse identity — `MINFER_NO_FUSE_QKV=1` forces a rebuild for A/B). **`attn()` output shape comes from `AttnMeta` (n_head*hd), not the q input's shape** — the fused q is a larger concat buffer. Fused vs unfused decode logits are bit-identical (0.0, verified 0.5B + 7B). **FFN gate+up fusion (G5, `Op::FusedFFN`)** does the same for the FFN: one concat matmul (`blk.{i}.ffn_gu`) + one in-place `swiglu_f32_off` (same kernel as the fused `Op::SwiGLU` — bit-identical), down reads rows 0..nf. Gated `nf ≤ 16384` (7B Q4_K concat matmul measured slower); `MINFER_NO_FUSE_FFN=1` reverts. Test rule: when comparing fused vs unfused graphs, the unfused path MUST run the FusionPass (silu+mul → SwiGLU) — otherwise the two-kernel silu+mul differs from the one-kernel swiglu by ~1e-6 float noise.
-8. **Backends own their buffer pools; the allocator is the single owner.** The scheduler orchestrates assign → fuse → alloc → execute and performs cross-backend copies (`copy_across`, a host round trip through shared memory) at split boundaries after `sync_backend`. Metal batching: one `MpsCommandBuffer` per split, submitted at `synchronize()`.
-9. **CPU activations are Q8_0-quantized on the fly** (Q4_0×Q8_0 etc.); **Metal reads f32 activations directly** — so graph-CPU vs graph-Metal logits differ by the activation-quantization path (~1e1 on logits; each path is internally correct). Compare Metal against manual Q8_0×f32 references or layer-gpu-style math, not against the Q8_0-activation CPU path.
+1. **KV positions are data, not structure** — topology never depends on `n_past` (precondition for decode reuse).
+2. Each layer owns **two persistent KV regions** (K/V) via `kv_pair(layer)`; they survive rebuilds (allocator lives in `GraphCache`).
+3. **Reuse is params-only**: `GraphParams` (+ `CParams.gpu`) deterministically fixes the topology; `GraphCache::try_reuse` compares params only.
+4. Weight layout = GGUF: metadata `[in, out]`, memory row-major `[out][in]`; activations token-major `[nt][d]`. I32 inputs stored as `f32::from_bits` via `fill_input_i32`.
+5. In-place ops (`Silu`, `RoPE`) alias their input buffer (sole consumer + same backend only). **Never host-copy a GPU-pending buffer** (Phase-3 KV-corruption bug).
+6. Execution follows build order (valid topo order); allocator liveness uses the same order, not `topo_order()` (G3 regression); input buffers are never freed.
+7. Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store) and `Op::FusedFFN` (gate+up concat + swiglu) — gated, and part of the reuse identity (`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` to revert). Fused vs unfused is bit-identical; when comparing, the unfused path MUST run the FusionPass.
+8. Backends own their buffer pools; the allocator is the single owner. The scheduler syncs + copies cross-backend at split boundaries; one Metal command buffer per split.
+9. CPU quantizes activations to Q8_0, GPU reads f32 — CPU-vs-GPU logits differ by design; compare each path against its own reference.
 
 ## Core Conventions
 
-1. Activations quantized to Q8_0 on-the-fly — all CPU matmuls use Q8_0 quantized activations (Q5_0 → `dot_q5_0_q8_0()`, Q4_K → `dot_q4_k_q8_0()`). Metal reads f32 activations directly for all weight types (Q4_0 included since P1), matching llama.cpp's Metal backend.
-2. AVX2 (x86) / NEON+SDOT (aarch64) dispatch with scalar fallbacks; `MINFER_NO_NEON=1` forces scalar on ARM. SDOT is emitted via inline asm (`vdotq_s32` is unstable in std::arch).
-3. No ML frameworks — Attention, RMSNorm, RoPE, SiLU, Softmax all handwritten.
-4. Tensor data uses raw `&[u8]` — quants.rs dot products operate on byte slices, not structs.
-5. GGUF padding: `ggml_pad()`: `(x + n - 1) & !(n - 1)`.
-6. Cross-backend execution: splits sync and copy at boundaries; per-op backend assignment is decided at graph build time by `supports_op` (weights registered on the backend decide feasibility); guard failures abort (see GPU Safety) — never silent mid-execution fallback.
+1. CPU matmuls: quantized weight × Q8_0 activations (`dot_q*_q8_0()`); GPU reads f32 activations directly.
+2. SIMD: AVX2 (x86) / NEON+SDOT (aarch64, inline asm) with scalar fallbacks; `MINFER_NO_NEON=1` forces scalar.
+3. No ML frameworks — all ops handwritten; tensor data is raw `&[u8]`; GGUF padding via `ggml_pad()`.
+4. Cross-backend: per-op assignment decided at build time via `supports_op`; guard failures abort — never silent mid-run fallback.
 
-## Adding a New Architecture
+## Extending
 
-1. Create `models/<name>/` with `mod.rs`, `graph.rs`, `loader.rs`
-2. Add dispatch branch in `models/mod.rs::load_model()`
-3. Define `HParams` (including `n_kv_embd`) and `LayerWeights` in `loader.rs`
-4. Implement `build_graph(&self, params: &GraphParams) -> ComputeGraph` in `graph.rs` — deterministic in params (reuse invariant). Use `GraphBuilder` (embedding/rms_norm/matmul/rope/kvcache_store/load/attn/swiglu/add), mirroring llama.cpp's `llm_graph_context` builder methods.
-5. Implement `ModelDef` in `mod.rs`: `forward` (Qwen2 routes it through the graph path), `build_graph`, `forward_graph`, `as_any` (downcast for weight registration). `weights_version` lives in `GraphParams` (bump on LoRA/weight changes to break reuse).
-6. Add template format support in `template.rs` if needed
+**New architecture** (mirror `models/qwen2/` / `qwen3/`): create `models/<name>/{mod,graph,loader}.rs` with `HParams` + `LayerWeights`; dispatch in `models/mod.rs::load_model()`; build the graph with `GraphBuilder` — deterministic in `GraphParams` (reuse invariant); implement `ModelDef` (`forward`/`build_graph`/`forward_graph`/`as_any`); add a chat template if needed.
 
-## Adding a New Backend (e.g. CUDA — Phase 7)
-
-1. Implement the `Backend` trait (`src/graph/backend.rs`) for the new device:
-   - `supports_op(op, dtype)` / `supports_fused(fused)` — capability gates for assignment and the fusion pass
-   - `alloc_buffer`/`free_buffer` — the backend's own buffer pool (ids are resolved inside `execute_node`)
-   - `execute_node(node, in_bufs, out_buf, kv_pair)` — per-op dispatch; resolve weights by name from the backend's registry (`metal.rs` pattern: `weight_buf(name) -> (buffer, offset)`); honor the **in-place alias** rule (see Compute Graph rules §5) and the GGUF weight layout (§4)
-   - `read_host`/`write_host` — host access for input filling and cross-backend copies (shared-memory or staged transfers)
-   - `synchronize` — flush async work (split boundaries)
-2. Register it in `GraphAllocator` (follow `enable_metal`/`metal_mut`): add an `Option<CudaBackend>`, a `supports()` priority (GPU before CPU), and a `sync_backend`/`copy_across` arm.
-3. Wire the model layer: register weights on the new backend at load (`loader.rs`), and gate graph execution on "all weights registered" (mirror `Qwen2Graph::weights_on_gpu`). Record backend participation in `CParams.gpu` so a backend toggle forces a graph rebuild.
-4. CUDA specifics (recorded in the plan §9/§17): wrap the existing `cuda.rs` (do NOT stub it — it already has `layer_gpu` + CUDA Graph capture), keep CUDA Graph caching keyed on the graph `uid`, and map `supports_op` from the existing capability matrix. Requires nvcc to build (`cargo build --features cuda`).
+**New backend** (CUDA is the worked example — `docs/CUDA-BACKEND-PLAN.md`): implement the `Backend` trait (`src/graph/backend.rs`: `supports_op`/`supports_fused`, buffer pool, `execute_node`, host read/write, `synchronize`); register it in `GraphAllocator` (priority + sync/copy arms); register weights at load and gate execution on all-weights-registered; record participation in `CParams.gpu`.
 
 ## Sampling
 
-`sampler.rs`: repetition penalty → top-k → top-p → temperature, seeded `StdRng`. Defaults match llama.cpp: `temp=0.8`, `top_p=0.95`, `repeat_penalty=1.1`. CLI: `--temp`, `--greedy` (temp=0), `--top-k`, `--top-p`, `--repeat-penalty`, `-n/--n-predict`, `--seed`, `-t/--threads` (CPU workers, default macOS P-cores; E-cores hurt). Repetition penalty applies to the last 64 tokens (llama `repeat_last_n`): positive logits ÷ penalty, negative ×; alone fixes the 0.5B greedy repetition loops.
+`sampler.rs`: repeat-penalty (last 64 tokens) → top-k → top-p → temperature, seeded `StdRng`; defaults match llama.cpp (0.8 / 0.95 / 1.1). CLI: `--temp --greedy --top-k --top-p --repeat-penalty -n --seed -t`.
 
 ## Dependencies
 
-Core inference deps are minimal: `rand` (sampling), `regex` (BPE pre-tokenization), `half` (fp16),
-`serde+serde_json` (download API + `--session` history), `minijinja` (template rendering).
-The OpenAI-compatible server adds `axum`/`tokio`/`tokio-stream`/`tower-http`/`uuid`/`futures-util`;
-macOS adds `objc2-metal`/`block2`/`objc2-foundation`/`objc2`/`dispatch2` (the old `metal`/`block`/`vendor` were removed in the 2026-08-25 objc2 migration).
+Core: `rand`, `regex`, `half`, `serde`+`serde_json`, `minijinja`. Server: `axum`/`tokio`/`tower-http`/`uuid`/… macOS: `objc2-*` family (2026-08-25 objc2 migration).
 
-## Documentation Locations
+## Docs Index
 
-All non-root documentation lives in **`docs/`** (the project root only keeps `AGENTS.md` and `README.md`).
+All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 
-| Topic | Location |
+| Topic | Where |
 |---|---|
-| Overall architecture design (module map, pipeline, backend layering, quant layout, adding an arch) | `docs/ARCHITECTURE.md` |
-| **Compute graph design + rewrite plan + implementation record (per-phase commits)** | `docs/GRAPH-REFACTOR-PLAN.md` |
-| llama.cpp compute-graph design analysis (ggml_cgraph / scheduler / reuse) | `docs/LLAMA-COMPUTE-GRAPH.md` |
-| Metal backend optimization plans/gap analysis (primary tracking doc) | `docs/METAL_OPTIMIZATIONS.md` |
-| objc 0.2 vs objc2 ecosystem — why block was vendored, nix devShell xcrun fix, and the objc2 migration (done 2026-08-25) | `docs/METAL_OBJC-ECOSYSTEM.md` |
+| Architecture design (module map, pipeline, adding an arch) | `docs/ARCHITECTURE.md` |
+| Compute graph design + implementation record | `docs/GRAPH-REFACTOR-PLAN.md` |
+| llama.cpp compute-graph analysis | `docs/LLAMA-COMPUTE-GRAPH.md` |
+| Metal optimization plans / gap analysis | `docs/METAL_OPTIMIZATIONS.md` |
+| objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
-| CPU backend optimizations (NEON/SDOT + thread pool) | `docs/CPU_OPTIMIZATIONS.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3 |
-| **CUDA graph backend plan + implementation record (Phase 7a–7e complete: per-op dispatch, capture/replay, K-quant vectorization, F32 matmul, FusedFFN, pinned staging)** | `docs/CUDA-BACKEND-PLAN.md` |
-| **CUDA follow-up plan (Phase 8: correctness debts, KV f16, prefill Q8_0 GEMM, attention, MMQ tiling, Q5_K, prefill graphs)** | `docs/CUDA-FOLLOWUP-PLAN.md` |
-| **CUDA roadmap (live): current GB10 perf vs llama.cpp, 8m–8p + R3 session record, R1 int8 MMQ prefill GEMM (r60 PROMOTED default-on with the full r34–r59 gate set — default = the verified 1.080x path, `MINFER_MMQ=0` = legacy f16 ~2353; decode (nt==1) untouched), R2 MMVQ weight-streaming rework + R4 split-attention dim-parallel rewrite (decode at parity: tg128 47.5 vs 47.1, @2K ~43–45 vs 44.9) + P5 prefill gap session (TM=128 GEMM tiles + FA rewrite: 7B @2K 1435 → 2340–2370 tok/s, gap 2.37× → 1.43×) + P6 q6_K MMQ (r38–r41 landed: BT-style raw-byte kernel, KDR=2 double-buffer, 3rd block, uint4 B-expand widen → +2.9/+13.3/+13.0/+30.7%; r42 dsc read NEUTRAL reverted; r43 PC-sampling attribution; r44 root-caused the pre-expand-B W_exp parity paradox to a DENSE-plane stride mismatch — the correct fix is parity-green but WALL-NEUTRAL, reverted; next lever cp.async) + P6 r45–r53 cp.async bundle LANDED (pre-expanded-B W_exp plane + cp.async B staging: +5.03% whole-prefill, 3176.9 tok/s = 1.05× vs-llama, q6_K line closed; r54 adds `MINFER_MMQ_Q6K_EXP=0` opt-out of the 1.52 GB W_exp plane — measured −5.04% for 1.52 GB back, default byte-identical, launch-path label distinguishes exp=off vs fallback!) + P6 FAP1 flash-attn audit (r46: the FA kernel is already wmma tensor-core + online-softmax, not scalar — but occupancy-starved: 69KB/block smem → 1 block/SM (16.7% occ) + a bank-conflicted S/P smem round-trip; FA_TKV 64→32 + S/P row padding gave kernel −11% (5.16→4.58 ms) but whole-prefill WALL-NEUTRAL (+0.27%, below the +1.5% bar — FA is not the wall-critical path in the converged-GEMM regime; also fixed a latent launcher smem over-allocation), reverted; next lever register-resident softmax) + P6 FAP2 r48 register-resident softmax LANDED (S/P smem round-trip removed — softmax on the QK^T accumulator fragments, P built in-register as the P@V A-operand; FA kernel 5.16→2.12 ms = 2.43×, whole-prefill +5.6% (2603→2750 tok/s), FA 10.2%→~4.7% wall, suite 166/0/3; the A-quantize prepass shared-A dedup is now the #1 addressable residual) + P6 r60 PROMOTION LANDED (the six MMQ gates default-on with "0" opt-outs, r54 pattern; mode-2 fused producers guarded by a registration-time NB-BT-only weight-mix flag — mixed-quant models degrade to mode 1; default 7B pp3314 ~3580 tok/s, planes +3.27 GB, `MINFER_MMQ=0` f16 escape ~20.5 GB; the deterministic gated-config multiturn_reuse break bisected + fixed) + D-series + D4 decode campaigns (12 sessions, D1→D4-4, 2026-09: decode 14B tg128 22.81→24.57 = **1.018×** vs llama, @3.3K **0.950×**; 7B tg128 **1.074×**, @1.6K **1.052×** — ahead everywhere measured; landed: fused-producer decode A-quantize (rms/swiglu pad40 epilogues + MmqCache consult), D2 K/V register staging, D3-4 hybrid rpw dual-kernel split attention (self-gating dispatch, replay-safe), FusedQKV port to CUDA (concat + mixed-quant `Op::QkvBiasRopeStore` classes), attn_v q6_K→MMVQ routing (gate 24M→4M), rms wide-block + positions-i32 memo, **dpl dense split-plane q6_K decode MMVQ** (padded-224B rows streamed 14 dead bytes/super-block; repack = bitwise, +5.5/+4.3% 14B, +7.7/+8.1% 7B, `MINFER_Q6K_DPL=0` opt-out, +2.0/+0.9 GB), **B0 correctness fix** (v2_pf dispatch was unbounded — 7B ffn_down npair 592 dropped 80 units/row every step since D3b-1b; 7B re-anchored lower, correct engine); closed with mechanism: GQA q-head batching (ncu: 5× L2 re-read already latency-hidden), PDL (probe green but co-residency tax > graph-gap pool), fused gu+SwiGLU (wave quantization), MMQ-at-M=1 (0.14-wave collapse; **nt=4 → BT-MMQ 2.7× cheaper/step = the spec-decode foundation**), attention attempt 2 (**llama-bench fattn-vec covers only 7.9% of KV rows — an artifact; honest llama decode attention ≈1.7 ms/step, minfer 1.9× off**); standing rules: never quote llama-bench long-ctx tg rates as attention targets (ncu byte counts or llama-cli recall), `-n 1` first-step dumps are the only clean cross-binary comparable point, `MINFER_NO_KQ_MMVQ=1` also flips the Q5_K arm (controls need it both sides); next stop: speculative decoding; remaining plan; Part IV keeps the pre-Phase-7 draft history with per-item outcomes; the per-step chapters (one doc per row, process + code + lessons) live in `docs/cuda_optimization_steps/` (index: `README.md`)** (`docs/CUDA_PROBLEMS.md` = old problems list, pre-Phase-7) | `docs/CUDA_OPTIMIZATION.md` |
-| Analysis of llama.cpp's MMQ (quantized int8 tensor-core GEMM): source-verified structure (tile geometry, raw-nibble smem, q8_1 activation pipeline, stream-k launch + fixup, numerics), the r20 stall table + r25 SASS opcode-class census verbatim, and the minfer contrast + redesign directions | `docs/LLAMA-CPP-MMQ-ANALYSIS.md` |
-| Analysis of llama.cpp's small-draft-model speculative decoding (`draft-simple`): pluggable speculator framework + priority chain, greedy argmax drafting (top-k/p_min), target-sampler-authoritative verification (`sample_and_accept_n`), KV rollback (seq_rm / checkpoint / replay), server multi-slot batching, cost model, minfer port notes | `docs/LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
-| Parameter audit vs llama.cpp | `docs/PARAMETER_AUDIT.md` |
-| KV cache indexing bug #6 | `docs/BUG-6-KV-CACHE-INDEXING.md` |
-| Debugging plans / summaries | `docs/DEBUGGING-PLAN.md`, `docs/DEBUGGING-SUMMARY.md` |
-| Qwen2.5-1.5B bugs / debugging notes | `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` |
-| **Qwen3 dense support plan + implementation record** | `docs/QWEN3-SUPPORT-PLAN.md` |
-| **Qwen3 chat-template / minijinja incompatibility (falls back to ChatML)** | `docs/QWEN3-SUPPORT-PLAN.md` §5 gotcha #9 |
-| **Architecture roadmap (which model families to support next, tiered by reuse)** | `docs/ARCHITECTURE-ROADMAP.md` |
-| Debug dump format reference | `docs/debug-dump.md` |
-| Metal inference / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
-| **Qwen3-4B perf vs llama.cpp (decode parity, CPU gap, KV-commit finding)** | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
-| **OpenAI-compatible Chat API plan (Plan B: multi-slot + serial)** | `docs/OPENAI-CHAT-API-PLAN.md` |
-| **CLI multi-turn conversation plan (append-only KV + incremental template diff)** | `docs/CLI-CONVERSATION-PLAN.md` |
-| **Interactive inference-graph web visualization** (`--dump-graph-json` + zero-dep flowchart page + `MINFER_TRACE` real-data trace: per-node stats/values, decode tokens & logits top-5) | `viz/README.md` |
-| **Known CPU-path issues (resolved): graph-vs-forward divergence = test omitted `tail_ids`; parallel worker-pool non-reentrancy = pool gate mutex; Metal cross-backend = stale staging-buffer lookup** | `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |
+| CPU optimizations | `docs/CPU_OPTIMIZATIONS.md` |
+| CUDA backend (Phase 7) + follow-up (Phase 8) | `docs/CUDA-BACKEND-PLAN.md`, `docs/CUDA-FOLLOWUP-PLAN.md` |
+| **CUDA optimization roadmap (live status) + per-step records** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` (`CUDA_PROBLEMS.md` = pre-Phase-7 issues) |
+| llama.cpp MMQ / speculative-decoding analyses | `docs/LLAMA-CPP-MMQ-ANALYSIS.md`, `docs/LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
+| Qwen3 support plan (+ minijinja gotcha §5#9) | `docs/QWEN3-SUPPORT-PLAN.md` |
+| Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
+| Architecture roadmap | `docs/ARCHITECTURE-ROADMAP.md` |
+| OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
+| CLI conversation plan | `docs/CLI-CONVERSATION-PLAN.md` |
+| Inference-graph viz (`MINFER_TRACE` etc.) | `viz/README.md` |
+| Debug dump format | `docs/debug-dump.md` |
+| Metal / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
+| Parameter audit, bug/debug notes, known issues | `docs/PARAMETER_AUDIT.md`, `docs/BUG-6-KV-CACHE-INDEXING.md`, `docs/DEBUGGING-*.md`, `docs/QWEN2.5-*.md`, `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |
+| Build / usage / support reference | `docs/BUILD.md`, `docs/USAGE.md`, `docs/SUPPORT-MATRIX.md`, `docs/FEATURES.md` |
