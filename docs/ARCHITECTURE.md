@@ -370,7 +370,7 @@ argument.
 | Metal backend optimizations / gap analysis (primary tracking) | `docs/METAL_OPTIMIZATIONS.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU backend optimizations | `docs/CPU_OPTIMIZATIONS.md` |
-| CUDA backend roadmap / problems | `docs/CUDA_OPTIMIZATION.md`, `docs/CUDA_PROBLEMS.md` |
+| CUDA optimization history + per-step records | `docs/CUDA_OPTIMIZATION.md` (+ `docs/cuda_optimization_steps/`) |
 | Debug dump format | `docs/debug-dump.md` |
 | Historical bugs / debugging notes | `docs/BUG-6-KV-CACHE-INDEXING.md`, `docs/QWEN2.5-*`, `docs/DEBUGGING-*` |
 

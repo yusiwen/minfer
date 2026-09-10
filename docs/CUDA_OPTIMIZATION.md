@@ -6,9 +6,11 @@
 > measured lever with its commit and perf delta), §1 is the current state,
 > §2 is one chapter per table row, and §3 holds the appendices (env-gate
 > reference, methodology, and the pre-Phase-7 legacy history). Single-sourced
-> implementation records: `docs/CUDA-BACKEND-PLAN.md` (Phase 7a–7e) and
-> `docs/CUDA-FOLLOWUP-PLAN.md` (Phase 8, 8a–8p); the per-round MMQ redesign
-> records are mirrored in `docs/LLAMA-CPP-MMQ-ANALYSIS.md` §11.
+> implementation records: `docs/CUDA-BACKEND-PLAN.md` (Phase 7a–7e) and the
+> per-step documents of §2 (Phase 8: docs 01–11 plus the supplementary records
+> 78–79 — the former `CUDA-FOLLOWUP-PLAN.md` was consolidated into them and
+> retired on 2026-09-10); the per-round MMQ redesign records are mirrored in
+> `docs/LLAMA-CPP-MMQ-ANALYSIS.md` §11.
 > Default env = the verified 1.080×-vs-llama path; `MINFER_MMQ=0` = the
 > legacy f16 escape (§1, Appendix A).
 
@@ -53,7 +55,13 @@ Chapters in §2 follow this table row by row.
 | 8n | FA-style tiled prefill attention | `cb66fca` | 176 → 8.5 ms/layer @2K | 20× | — | LANDED | online softmax + register O accumulator; 256 B P stride avoids a score-clobber race |
 | 8o | decode-start CPU stalls killed | `65b686c` | first decode step 724 → 35 ms | 20× | — | LANDED | `Cow::Owned` clone + eager concat probe cost ~1.6 s per graph rebuild |
 | 8p | persistent f16 weight cache + fused dequant-in-GEMM | `2992f57` (+`b9e7a91` docs) | 7B @2K prefill → ~1400–1500 | ~4.7× vs 8m | ~2.3× | LANDED | dequant once per weight at load (≥2 GB gate); exposed a latent Q5_0 misaligned load |
+| 8b | KV f16 on CUDA (`store_kv_f16` + f16-KV attention mirror) | `f7b0036` | 7B @2K decode +~11% | +11% | — | LANDED | auto-f16 at n_layers×n_kv_embd ≥ 8192 (`MINFER_CACHE_TYPE` override); f32 accumulation |
+| 8c | prefill Q8_0-activation GEMM, shape-gated | `69a27c5` | 0.5B @3.6K 1005 → 1246 tok/s | +24% | — | LANDED | the shape gate is load-bearing: −63% at 7B ffn_down (weight-bound shapes stream slower) |
+| 8d | split-K flash-decoding decode attention | `a5af60f` | 7B @2K decode 10.1 → 13.7 tok/s | +36% | — | LANDED | 28 warps → an 8-way KV-split scan; superseded by R4's dim-parallel rewrite |
+| 8f | Q5_K + Q5_1 f32-activation kernels | `b959ec9` | 0.5B q5_k_m admitted to CUDA (was CPU wholesale) | — | — | LANDED | the all-or-nothing gate needs a kernel for EVERY matmul weight type |
 | 8e/8e② | decode MMVQ (dp4a, per-type kernels, shape gate) | `b7b8e73`, `1298cb2`, `1d28235` | 7B decode +37% (q4_K), then q6_K/q5_K | +37% | — | LANDED | integer dp4a dots + llama.cpp `MMVQ_PARAMETERS_GB10` launch table |
+| 8l | llama.cpp parity benchmark (the decode + prefill gap sheet) | `acca28f` | decode 1.15–1.76×, prefill 18–110× | — | — | MEAS-ONLY | found the Q5_K registration gap (51.6 → 246.3 tok/s, 4.8×); the sheet ranked 8m–8p / R1 / the r-campaign |
+| 8q | Q5_0 CUDA enablement + u16 qh loads | `9f419f9` | 0.5B q4_k_m 148.7 → ~1200 prefill / 56.9 → ~306 decode | — | — | LANDED | a 22-byte block's qh word is not 4-byte aligned — two u16 loads; the CPU fallback eliminated |
 | R3-A1 | single-split prefill (tail_ids input at graph head) | `029a9a4` | 4 splits → 1 per prefill forward | — | — | LANDED | a mid-graph declared input forced 2 extra full-stream syncs per forward |
 | R3-A2 | pinned D2H logits readback, no redundant clone | `a213c89` | parity-to-slightly-ahead under load | — | — | LANDED | pageable readback paid a driver-internal pinned bounce |
 | R3-B | prefill capture defaults ON (3-run protocol) | `761e236` | repeated identical-nt prefills capture automatically | — | — | LANDED | one-shot CLI prefill never reaches 3 runs and pays nothing |
@@ -172,7 +180,7 @@ Chapters in §2 follow this table row by row.
 4. **Campaign arc**: R1 MMQ 441 tok/s (first parity-clean MMQ measurement,
    r7–r8 window) → 3590.8 tok/s (r59b definitive) = **8.1×**.
 
-## §1 Current state (post-D3-8, 2026-09-08)
+## §1 Current state (post-D4-4, 2026-09-09)
 
 ### 1.1 Performance summary (DGX Spark GB10, 7B q4_k_m unless noted)
 
@@ -187,134 +195,29 @@ llama.cpp reference: llama-bench @ `ca3d5a3e1` (upstream build), 8 threads,
 | llama-bench pp3314 (r59b window) | 3323.29 ± 3.08 | — | minfer 3590.8 / 3323.29 = **1.080×** |
 
 Decode (nt==1) is untouched by the MMQ campaign (r60 evidence: no
-`MINFER_MMQ*` read on the nt==1 path; decode `-n 16 --greedy` byte-identical;
-tg128 45.2 = 45.2 in the r60 window). Recorded decode state (R4-era session,
-llama.cpp 47.1 / 44.9): **tg128 47.5–47.6** (at/above parity), **@2K
-43.2–45.1** (~0–4% gap). Small models (pre-MMQ-campaign numbers, Part-I
-record): 0.6B q8_0 prefill @2K 4792 (llama 23909), decode tg128 ~195 (290);
-0.5B q4_0 prefill ~3020 (30550), decode ~257 (453).
+`MINFER_MMQ*` read on the nt==1 path; decode `-n 16 --greedy` byte-identical).
+Final decode-campaign state (D1→D4-4, 2026-09, all measured on the B0-fixed
+engine — the D4-2 correction found the v2_pf dispatch dropping units on
+npair-592 rows and re-anchored every 7B claim):
 
-**D2 update (2026-09-07):** decode @1641 KV 47.2 → **48.2** (+2.0%, tg128
-unchanged at 49.4) via explicit K+V staging in `gqa_attn_split_partial` —
-see §2D.
+| model | tg128 | long-ctx | vs-llama (same-window) |
+|---|---|---|---|
+| 7B q4_k_m | **51.20** | @1641 **50.18** | **1.074× / 1.052×** (ahead) |
+| 14B (48L) | **24.57** | @3254 **22.94** | **1.018×** tg128 / **0.950×** @3254 |
 
-**D3b update (2026-09-07):** decode down-q6K MMVQ pipelined for npair>256
-(`q6_k_q8_mmvq_v2_pf`, bitwise-identical): 7B tg128 → **49.47** / @1641 →
-**47.94** (same-window interleaved A/B vs 48.03/46.66 pre; the @1641 gap to
-llama 49.41 is −3.0%); 14B (48L) decode tg128 → **22.90** / @3254 → **21.06**
-window anchors vs llama 24.31/24.32. The remaining 14B short-KV gap is
-elementwise/launch chain + the two reverted MMVQ straggler routes (§2D D3b);
-attention rewrite = D3a (tolerance-gated, separate session).
+Small models (pre-MMQ-campaign numbers, Part-I record): 0.6B q8_0 prefill @2K
+4792 (llama 23909), decode tg128 ~195 (290); 0.5B q4_0 prefill ~3020 (30550),
+decode ~257 (453).
 
-**D4-4 update (2026-09-09, CUDA):** the final decode session landed the
-dense split-plane q6_K MMVQ (bitwise): 14B tg128 23.28 → **24.57** (+5.53%),
-@3254 22.00 → **22.94** (+4.27%); 7B tg128 47.55 → **51.20** (+7.68%),
-@1641 46.44 → **50.18** (+8.05%). vs-llama: 7B **1.074×/1.052×** (tg128/
-@1641), 14B **1.018×** tg128 / **0.950×** @3254. PDL on the decode chain and
-the fused gate+up+SwiGLU+q8 kernel probed and closed with mechanism (§2D
-D4-4); `MINFER_Q6K_DPL=0` opts the planes out.
-**D4-2 CORRECTION (2026-09-09):** the 7B half of this row is void — the
-v2_pf dispatch dropped units 512..591 on npair-592 rows (7B ffn_down), so
-the 7B "+3.0 %/+2.7 %" was mostly the missing 13.5 % of down-q6K work, not
-pipelining. The pipelining gain itself is the 14B-sized +0.2-0.4 % class
-(14B numbers in this row stand; npair 432 ≤ 512 was always correct). 7B
-decode re-anchors lower on the fixed engine — see the D4-2 chapter.
-
-**D4-2 update (2026-09-09):** a silent 7B decode correctness bug (D3b-1b's
-v2_pf dispatch, units dropped on npair > 512 rows) found and fixed
-(`b31084c`); the llama L2-prefetch port closed pre-build (mechanism inert at
-our decode shapes); the bitwise q6_K occupancy axes (reg-shave, pipeline
-depth, block geometry) all measured closed — see the D4-2 chapter. 7B
-guards are re-anchored on the fixed engine: **tg128 ≥ 48.3 / @1641 ≥ 47.5**
-(the old 49.0/47.9 were set on the dropping kernel and are superseded —
-correct-over-fast). Same-window vs-llama on the fixed engine: 7B tg128
-1.035× / @1641 1.017× (llama 47.65/47.69); 14B tg128 parity 0.995×, @3254
-0.928×, pp3254 1.11-1.14×.
-
-**D4-3 CORRECTION (2026-09-09): the 14B @3254 "0.928×" gap is mostly a
-llama-bench artifact.** ncu proves the bench decode fattn-vec covers only
-256 of 3255 KV rows (constant 5.43 MB of loads at any context) while
-llama-cli's decode covers everything (53–143 MB, scaling with ctx;
-mid-prompt recall A/B green). Honest-llama @3254 ≈ 23.3–23.5 tok/s, so
-minfer 21.06 is ~10% behind, of which attention is ~3.5% (the D4-1
-"~2.53 ms attention prize" recalibrates to ~1.6 ms). The attention-structure
-rewrite attempt itself (vec_attn sweep) measured NO-GO per the
-pre-registered bar (best 41.07 µs @14B / 16.22 @7B, bars ≤32/≤10.35) — see
-the D4-3 chapter. Do not quote llama-bench long-ctx tg rates as attention
-targets without an ncu byte-count or llama-cli recall cross-check.
-
-**D3a update (2026-09-07):** the 4-warp fattn-vec-style split-attention
-rewrite was REVERTED — numerics fully green but the rows-per-warp
-pathology makes it +64% kernel-slower at 7B @1641 and only −6.9%
-(~+0.5% wall, sub-bar/sub-noise) at 14B @3254 (§2D). Session outputs
-that stand: the tolerance-gate calibration (end-to-end logits drift
-0.38/0.39 is the inherent class of ANY accumulation-order change — the
-≤1e-3 logits gate is unsatisfiable; argmax + greedy-divergence + A/B are
-the operative gates) and the 14B @3254 attention bytes-floor gap
-(73.4 µs/layer vs 48.9 µs floor) with window-prefetch pipelining as the
-next lever.
-
-**D3-4 update (2026-09-07):** L1 hybrid rpw dispatch **LANDED** (`22336b2`):
-the f16-KV hd==128 decode split attention now runs BOTH the D3a 4-warp
-fattn-vec-style kernel (rpw ≥ 16, nkv ≥ 1921 — measured 72.1 → 62.1 µs at
-14B @3254, −13.9%) and the incumbent 32-thread kernel (rpw < 16, bitwise),
-each self-gating per replay from `positions[0]` — 14B @3254 wall +0.61% SEP,
-7B guards hold (48.68 @1641 / 50.20 tg128 this window). L2 (window-level K/V
-prefetch) measured +7% kernel (occupancy/wave-tail tax) and was REVERTED.
-Window (interleaved 3× medians): 14B tg128 22.94 / @3254 21.33 vs llama
-24.31/24.32 (0.944×/0.877×); 7B tg128 50.20 / @1641 48.68 vs 49.41
-(1.016×/0.985×). Distance-to-parity and next levers: §2D D3-4.
-
-**D3-5 update (2026-09-08):** fused-producer decode A-quantize
-**LANDED** (`3230b2b`): the decode rms_norm/swiglu producers write the pad40
-q8 plane (bit-identical bytes) and the following decode matmul group skips its
-standalone quantize launch — standalone quantize launches −78% (nsys), sub-2µs
-launches −3448/step-census, and the win shows at all lengths: 14B tg128 23.05
-→ 23.35 (+1.30% SEP) / @3254 21.36 → 21.68 (+1.50% SEP); 7B tg128 50.69
-(**1.026× vs llama — ahead**) / @1641 49.16 (0.995×, parity). Window vs the
-pre-D3-5 anchors: 14B tg128 +1.65% (session bar ≥ +1.5%), @3254 +2.95%. 14B
-decode geometry levers (head od-split, ffn_down 512-thread) resolved
-analysis-negative with the math recorded (§2D D3-5); Stage 2 = GQA q-head
-batching (attention re-read) + rms-launch consolidation.
-
-**D3-7 update (2026-09-08):** the two remaining Stage-2 levers both LANDED.
-2b attn_v-q6K → MMVQ routing (Q6_K decode gate 24M → 4M; 14B attn_v 33.16 →
-24.32 µs × 11 layers) and 2c rms/elementwise consolidation (wide-block rms
-9.43 → 5.66 µs bitwise; positions i32 conversion 240 → 1 launch/step
-bitwise). Cumulative wall (interleaved SEP): 14B tg128 23.31 → **23.73**
-(+1.80%), @3254 21.57 → **21.95** (+1.76%); 7B tg128 **50.47** / @1641
-**48.99** (+1.04/+1.07%). 14B @3254 distance-to-parity: −10.8% → **−9.7%**
-(21.95 vs llama 24.32). Stage-3 front: matmul aggregate (~2.9 ms) + launch
-structure (unfused decode qkv chain ~0.45 ms/step — FusedQKV not active on
-CUDA — plus the small-kernel tail) + exposed-latency attention (≤0.63 ms,
-mechanism uncertain) + mechanism-less stragglers (§2D D3-7).
-
-**D3-8 update (2026-09-08):** the G4 FusedQKV decode fusion is now ACTIVE on
-CUDA, both layer classes (Stage-3 Tier A). One `attn_bias_rope_store` kernel
-(pointer-form: concat sections OR three separate buffers) replaces the
-per-layer bias×3 + rope×2 + store×2 chain; class 1 (same-quant wq|wk|wv —
-24/48 layers at 14B, 14/28 at 7B) also collapses 3 matmuls into one concat
-matmul; class 2 (mixed quant) keeps its 3 matmuls and fuses only the
-epilogue (`Op::QkvBiasRopeStore`, CUDA-only). Decode launch census −310/step
-(−22.5% trace total). Wall (interleaved, every pair clean): 14B tg128 23.81
-→ **24.55** (+3.11%), @3254 22.04 → **22.40** (+1.63%); 7B tg128 **50.98**
-(+1.05%), @1641 **49.51** (+1.23%); isolation (post vs post
-`MINFER_NO_FUSE_QKV=1`): +3.15/+2.28/+1.03/+1.00%. Bitwise throughout:
-probe tests + dump gate (logits + ALL KV byte-identical both models) +
-greedy 5/5 seeds × 2 models byte-identical + NO_FUSE control + rp=1.0 +
-sampled controls; suite 172/0/3. 14B tg128 crosses parity (24.55 vs llama
-24.31, 1.010×); 14B @3254 distance-to-parity −9.7% → **−7.9%** (§2D D3-8).
-
-**D3-6 update (2026-09-08):** Stage 2's GQA q-head batching was built and
-REVERTED with the mechanism nailed: eliminating the 5× K/V L2 re-read
-(2.12M → 473K sectors = the 1× analytic minimum, ncu-verified) leaves live
-kernel time flat (63.8 → 64.8 µs) — the re-read was already hidden under the
-latency roofline, so the 14B attention residual is exposed-latency, NOT
-traffic; no bytes-side attention lever remains (§2D D3-6). Every correctness
-gate was green (incl. byte-identical penalty-free greedy streams on both
-models — the new sampler-vs-kernel attribution gate). attn_v-q6K MMVQ
-routing (2b, ≈ +0.6% projected) deferred; rms-launch consolidation (~1.0 ms)
-is the largest remaining known lever.
+The per-session narratives (D2/D3-4/D3-5/D3-7/D3-8 updates), the D4-2/D4-3
+correction chain, and the standing measurement rules live in the §0 rows
+D1–D4-4 and step docs 65–76. Two rules worth surfacing: never quote
+llama-bench long-ctx tg rates as attention targets without an ncu byte-count
+or llama-cli recall cross-check (D4-3: the bench decode fattn-vec covers only
+~8% of KV rows; honest llama decode attention ≈ 1.7 ms/step, minfer ~1.9×
+off), and an end-to-end max\|Δlogits\| ≈ 0.38/0.39 is the inherent class of
+ANY accumulation-order change — argmax + greedy-divergence + A/B are the
+operative gates (D3a calibration).
 
 ### 1.2 Wall decomposition (converged regime, r55/r58/r59-era records)
 
@@ -370,17 +273,25 @@ All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
   (+0.3–0.8%, needs ≤85 regs); fused ffn_gu concat (needs the G5 nf≤16384
   gate re-measured); FA deep-opt only with numerics-order-preserving
   structure (r50/r57 caveat).
+- Open Phase-8 ledger items (inherited from the retired `CUDA-FOLLOWUP-PLAN.md`;
+  records in step docs 78/79): **8a①** macOS Metal regression run (fuse_ffn
+  decoupling + the `MINFER_NO_FUSE_FFN` A/B on 0.5B + 7B) — BLOCKED on
+  hardware; **8e② follow-up** — llama.cpp's shape-dependent `halve_iters`
+  idle-tail rule, not started; **8h②** — self-hosted CUDA CI runner, DEFERRED
+  (needs standing runner infrastructure); **8h③** — the Phase-7
+  `/tmp/minfer_phase7/` ledger cleanup, awaiting user decision.
 
 ## §2 Step documents — one doc per history row
 
 The full per-step chapters (process narrative, principle explanations, real code
 excerpts, verification gates, lessons — previously inlined here) now live in
-**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 77
-standalone documents (01–76 + the verification-methodology capstone). The §0
-master table above remains the one-row-per-step index; the tables below link
-each row to its step document. Appendix B keeps the cross-cutting methodology.
+**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 79
+standalone documents (01–76, the Phase-8 supplementary records 78–79, and the
+verification-methodology capstone 77). The §0 master table above remains the
+one-row-per-step index; the tables below link each row to its step document.
+Appendix B points at the cross-cutting methodology.
 
-### Part I · Era A — Phase 7/8 foundations (rows 1–6)
+### Part I · Era A — Phase 7/8 foundations (rows 1–6 + 78–79)
 
 | # | doc |
 |---|---|
@@ -390,6 +301,8 @@ each row to its step document. Appendix B keeps the cross-cutting methodology.
 | 04 | [8o — Killing the CPU stall at decode start (LANDED)](./cuda_optimization_steps/04-decode-start-stall-8o.md) |
 | 05 | [8p — Persistent f16 weight cache + fused dequant-in-GEMM (LANDED)](./cuda_optimization_steps/05-persistent-f16-cache-8p.md) |
 | 06 | [8e/8e② — decode MMVQ: dp4a integer dot products + the llama.cpp launch table (LANDED)](./cuda_optimization_steps/06-decode-mmvq-8e.md) |
+| 78 | [Phase-8 correctness & engineering-debt batch — 8a/8h①/8i (LANDED; 8a① hardware-blocked)](./cuda_optimization_steps/78-phase8-correctness-batch.md) |
+| 79 | [Phase-8 coverage & first-measurement batch — 8b/8c/8d/8f/8l/8q (LANDED)](./cuda_optimization_steps/79-phase8-coverage-batch.md) |
 
 ### Part II · Era B — R and P5 sessions (rows 7–13)
 
@@ -524,83 +437,21 @@ for dsc); fused producers `rows >= 16 && dim % 256 == 0`; mode-2 auto-degrade
 under MINFER_GRAPH_DUMP / MINFER_DUMP_DIR / MINFER_TRACE / viz capture; the
 r60 `nb_bt_only` flag degrades mode 2 → mode 1 on mixed-quant models.
 
-### Appendix B — Verification methodology and transferable lessons
+### Appendix B — Verification methodology (summary)
 
-**The gate chain (every landed round).**
-
-1. **Parity ×3**, separate invocations under the candidate gate set:
-   `cuda_prefill_mmq` (1/0 — the 8-type × 8-shape host-reference sweep),
-   `cuda_prefill` (7/0), `cuda_fa_prefill_attention_parity` (1/0). Tolerance
-   1e-3; a nibble-layout bug presents as ~1e0, f32 rounding as ~1e-5.
-2. **Greedy-32 token identity**: `-n 32 --greedy --seed 42` on prompt2k vs
-   the pre-change binary — byte-identical streams. Catches corruption parity
-   fixtures miss (r52's rms-nw OOB, r58's buffer-1 smem). FA exception:
-   tile-size changes inherently shift accumulation order (r50/r57).
-3. **Interleaved A/B medians**: 3×/5× same-slot pairs, warmup, alternating
-   order; distributions must separate (min-new > max-base) for a headline;
-   the +1.5% whole-prefill bar (relative to the re-measured baseline, r24).
-4. **Suite**: 166 → 169 passed / 0 failed / 3 ignored (grew with gate-1
-   byte-exactness tests); co-tenant flakes re-run `--exact` in isolation.
-5. **ncu/nsys protocols**: ncu behind `sudo -n env LD_LIBRARY_PATH=...`
-   (plain sudo strips gate env and silently profiles the legacy path —
-   r56); GB10/GB20B has NO `dram__*`/`launch__grid_size`/shared-sector
-   metrics — use `lts__t_sectors_aperture_device` and byte-count-derived
-   rooflines (r55); ncu serializes replay — nsys is authoritative for
-   walls; PC-sampling (`--page source`) attributes stalls to the CONSUMING
-   instruction (r20/r43); SASS via `cuobjdump -sass` before writing levers
-   (r30/r32) — CP.ASYNC is emitted as `LDGSTS.E.BYPASS.128` (grep LDGSTS,
-   r45); ptxas `-Xptxas -v` for regs/spill/occupancy budgets.
-
-**Transferable lessons (the campaign's durable rules).**
-
-- **Baseline-anchoring (r59b)**: every A/B baseline must be behaviorally
-  anchored in the same window (re-measure a known-record binary or
-  worktree-rebuild the baseline commit); idle co-tenancy is
-  clean-equivalent; never infer a co-tenant tax without an anchor.
-- **Liveness check (r53/r54)**: a fallback-correct optimization needs an
-  "is the fast path actually live" counter/label — parity and greedy cannot
-  see a silently-never-taken fast path; distinguish intentional fallback
-  (`exp=off`) from accidental (`fallback!`).
-- **Tile-size vs greedy-identity (r50/r57)**: on FA (and any
-  accumulation-order-sensitive kernel), strict byte-identity is only
-  satisfiable for changes that preserve accumulation order — every tile-size
-  change breaks it by ULP regrouping, even when parity stays green.
-- **Pipeline-value formula (r58, the r45 mirror)**: a staging mechanism's
-  wall value = what it removes MINUS what its granularity costs. It replaced
-  expensive work (q6_K r39/r53/r56) → +13/+5/+2.35%; it replaced cheap
-  copies (q4_K r58) → −12.6%. "Not dead, WAITING" applies only when the
-  mechanism's cost model is preserved.
-- **Roofline-bound-before-coding (r55)**: derive the byte-traffic bound
-  first (sector counters × 32 B when `dram__*` is absent); if the perfect
-  kernel cannot clear the bar, skip the implementation.
-- **Issue/occupancy, not instructions (r13→r25→r28/r29)**: instruction-count
-  surplus is real but wall-inert at 1 block/SM; buy occupancy first, then
-  the same cuts pay (+2.6/+2.8%). At 3 blocks/SM a 4 B spill is immaterial
-  (r40).
-- **The compiler already did it (r30/r32/r33)**: read the SASS before
-  writing a lever; source reorders that ptxas already schedules are
-  SASS-identical no-ops.
-- **Stall mass is conserved (r20/r21)**: fixing one binder moves the stall
-  to the next (latency → lg_throttle → wait); stage levers in that order.
-- **Layout-transformation locality (r34)**: hoist layout transformation into
-  a prepass (or the producer) instead of adapting per tile-consumer —
-  +9.72% for moving the transform OUT of the kernel.
-- **Mechanisms compose across traffic, not mechanism (r53/r56)**: two
-  individually-wall-neutral levers (one removes WORK, one removes WAIT)
-  compose almost additively when the first de-bottlenecks the line.
-- **Attribute to the consumer (r42/r43)**: stall counters name the resource,
-  PC-sampling names the instruction that WAITS on it — cut latency where it
-  is exposed, not where bytes move.
-- **Wall decompositions expire (r37→r47)**: re-attribute the whole wall
-  after every line converges; net hidden taxes (the q6_K prepass +31.6 ms)
-  against wins.
-- **Phantom results (r8, P5·3, r52a)**: silent fallbacks / attr failures /
-  OOM-masks produce fast wrong timings and fake errors — guard caps loudly,
-  verify launches happened.
-- **Memory etiquette (shared box, 2026-08-31)**: kernel OOM under pool
-  exhaustion kills the OTHER workload (it happened once); no raw allocation
-  probes; check `free -g` before suite runs; single-process 7B-scale benches
-  while sglang serves.
+The full capstone — the five-gate chain (① parity ×3 via
+`cuda_prefill_mmq` / `cuda_prefill` / `cuda_fa_prefill_attention_parity`, ②
+greedy-32 token identity, ③ interleaved A/B medians with the +1.5%
+whole-prefill bar, ④ the device suite, ⑤ the ncu/nsys/SASS protocol incl. the
+GB10 metric gaps and the sudo-LD_LIBRARY_PATH gotcha) and the campaign's
+transferable lessons (baseline anchoring, liveness labels, tile-size vs
+greedy-identity, the pipeline-value formula, roofline-before-coding,
+occupancy-before-instructions, SASS-first, stall-mass conservation,
+layout-transformation locality, mechanism composition, consumer attribution,
+expiring wall decompositions, phantom results, shared-box memory etiquette) —
+lives in
+[`cuda_optimization_steps/77-verification-methodology.md`](./cuda_optimization_steps/77-verification-methodology.md).
+Read it before running any A/B on this engine.
 
 ### Appendix C — Part IV legacy: the pre-Phase-7 roadmap (2026-08-29) and where it ended
 

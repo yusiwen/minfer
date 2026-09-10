@@ -25,7 +25,6 @@
 - [CPU](./CPU_OPTIMIZATIONS.md)
 - [GPU Safety](./GPU_SAFETY.md)
 - [CUDA Backend Plan](./CUDA-BACKEND-PLAN.md)
-- [CUDA Follow-up](./CUDA-FOLLOWUP-PLAN.md)
 - [CUDA Optimization](./CUDA_OPTIMIZATION.md)
 
 # CUDA Optimization Steps
@@ -39,6 +38,8 @@
     - [8o — Killing the CPU stall at decode start (LANDED)](./cuda_optimization_steps/04-decode-start-stall-8o.md)
     - [8p — Persistent f16 weight cache + fused dequant-in-GEMM (LANDED)](./cuda_optimization_steps/05-persistent-f16-cache-8p.md)
     - [8e/8e② — decode MMVQ: dp4a integer dot products + the llama.cpp launch table (LANDED)](./cuda_optimization_steps/06-decode-mmvq-8e.md)
+    - [Phase-8 correctness & engineering-debt batch — 8a/8h①/8i (LANDED)](./cuda_optimization_steps/78-phase8-correctness-batch.md)
+    - [Phase-8 coverage & first-measurement batch — 8b/8c/8d/8f/8l/8q (LANDED)](./cuda_optimization_steps/79-phase8-coverage-batch.md)
 - [Part II — Era B: R and P5 sessions]()
     - [R3 — Small-model per-token overhead: single-split prefill (LANDED)](./cuda_optimization_steps/07-r3-small-model-overhead.md)
     - [R1 — int8 MMQ prefill GEMM (opt-in): the parity-first strategy (LANDED)](./cuda_optimization_steps/08-r1-int8-mmq-prefill-gemm.md)

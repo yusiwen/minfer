@@ -399,7 +399,7 @@ flag).
   (nf = 18944 > 16384 gate, unfused). Suites 144/0 (cuda parallel +
   single), plain 130/0.
 - FusedQKV decomposition (concat matmul + bias/rope/store chain under one node) — only if it beats the unfused chain.
-- ✅ **8c (2026-08-29, `69a27c5`): prefill Q4_0 GEMM via Q8_0 activations, SHAPED** — standalone A/B: +38–44% at id ≤ 8192, +4.7% at 7B ffn_gu, **−63% at 7B ffn_down (id=18944)** → wired only `nt>1 && id≤8192`; 0.5B prefill +24% E2E. Full record in CUDA-FOLLOWUP-PLAN §8c.
+- ✅ **8c (2026-08-29, `69a27c5`): prefill Q4_0 GEMM via Q8_0 activations, SHAPED** — standalone A/B: +38–44% at id ≤ 8192, +4.7% at 7B ffn_gu, **−63% at 7B ffn_down (id=18944)** → wired only `nt>1 && id≤8192`; 0.5B prefill +24% E2E. Full record in `cuda_optimization_steps/79-phase8-coverage-batch.md` (§8c).
 - ✅ **Async H2D input fill + pinned staging (7e⑥, 2026-08-29)** — first half
   of the original bullet (the Q8_0 prefill GEMM half above stays open):
   `CudaState::write_input_async` — a lazy ring of 8 × 2 MiB

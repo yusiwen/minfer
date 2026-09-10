@@ -119,8 +119,8 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU optimizations | `docs/CPU_OPTIMIZATIONS.md` |
-| CUDA backend (Phase 7) + follow-up (Phase 8) | `docs/CUDA-BACKEND-PLAN.md`, `docs/CUDA-FOLLOWUP-PLAN.md` |
-| **CUDA optimization roadmap (live status) + per-step records** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` (`CUDA_PROBLEMS.md` = pre-Phase-7 issues) |
+| CUDA backend design + implementation record (Phase 7a–7e) | `docs/CUDA-BACKEND-PLAN.md` |
+| **CUDA optimization history (live status) + per-step records (incl. Phase 8)** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` |
 | llama.cpp MMQ / speculative-decoding analyses | `docs/LLAMA-CPP-MMQ-ANALYSIS.md`, `docs/LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
 | Qwen3 support plan (+ minijinja gotcha §5#9) | `docs/QWEN3-SUPPORT-PLAN.md` |
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |

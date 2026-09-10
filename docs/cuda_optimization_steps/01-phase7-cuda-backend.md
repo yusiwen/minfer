@@ -7,7 +7,7 @@
 
 Before this step, minfer's GPU story existed only on macOS: the Metal backend (`metal.rs` + `metal.metal`) ran on the same compute-graph architecture (Phase 6 had already deleted Qwen2's imperative forward, so all inference went through build graph → assign backend → allocate → execute). On x86-64 Linux there was no GPU path at all — every token came out of the CPU's AVX2 kernels.
 
-There was also an earlier failure on record (kept in `docs/CUDA_PROBLEMS.md`, the "Part IV" history): a CUDA attempt made without the compute graph, shaped so that every op call moved weights/activations back and forth between CPU and GPU. That experiment's outcome was distilled into the Part-IV diagnosis: per-op H2D/D2H round trips are fatal at the 7B scale — the GPU idles between ops waiting for transfers, the transfer cost eats the entire speedup, and in the end the whole path was abandoned, leaving only a problem list.
+There was also an earlier failure on record (kept in `CUDA_OPTIMIZATION.md` Appendix C, the "Part IV" history): a CUDA attempt made without the compute graph, shaped so that every op call moved weights/activations back and forth between CPU and GPU. That experiment's outcome was distilled into the Part-IV diagnosis: per-op H2D/D2H round trips are fatal at the 7B scale — the GPU idles between ops waiting for transfers, the transfer cost eats the entire speedup, and in the end the whole path was abandoned, leaving only a problem list.
 
 The goal of Phase 7 was therefore explicit: not "port a few kernels to CUDA", but **make CUDA the compute-graph architecture's third backend** — peer to CPU and Metal, behind the same `Backend` trait and the same scheduler. Two preconditions make that possible, and they are also the thesis of this document:
 

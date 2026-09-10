@@ -1,8 +1,9 @@
 # CUDA Optimization Step Documents — Master Index
 
 This directory is the expansion layer of [`docs/CUDA_OPTIMIZATION.md`](../CUDA_OPTIMIZATION.md):
-it writes **every step** of the twelve sessions and ~60 optimization levers from
-2026-08-30 → 2026-09-09 as a standalone, readable document — background, the GPU
+it writes **every step** of the twelve sessions, the two Phase-8 batch records
+(78–79), and ~60 optimization levers from
+2026-08-29 → 2026-09-09 as a standalone, readable document — background, the GPU
 principle (arguing with arithmetic), real code before/after, verification methods,
 results, and lessons.
 
@@ -19,7 +20,7 @@ The writing contract is in [STYLE.md](STYLE.md).
 
 ---
 
-## Part I · Foundations (Era A: Phase 7/8, 2026-08-30)
+## Part I · Foundations (Era A: Phase 7/8, 2026-08-29 → 08-30)
 
 | # | doc | topic | status |
 |---|---|---|---|
@@ -29,6 +30,8 @@ The writing contract is in [STYLE.md](STYLE.md).
 | 04 | [decode-start-stall-8o](04-decode-start-stall-8o.md) | decode start stall: killing the 635 ms heavyweight clone (724→35 ms first step) | 🟢 |
 | 05 | [persistent-f16-cache-8p](05-persistent-f16-cache-8p.md) | resident f16 weight cache + dequant folded into the GEMM (→~1400 tok/s) | 🟢 |
 | 06 | [decode-mmvq-8e](06-decode-mmvq-8e.md) | decode MMVQ (dp4a × q8_0): +37% on q4_K | 🟢 |
+| 78 | [phase8-correctness-batch](78-phase8-correctness-batch.md) | the 8a review batch (11 fixes) + the F32-matmul latent bug + 8h①/8i tests | 🟢 |
+| 79 | [phase8-coverage-batch](79-phase8-coverage-batch.md) | KV f16, shaped Q8_0 GEMM, split-K attention, Q5_K/Q5_1/Q5_0 kernels, the 8l llama baseline | 🟢/🔵 |
 
 ## Part II · The R-and-P5 sessions (Era B: R/P5, 2026-08-31 → 09-01)
 
