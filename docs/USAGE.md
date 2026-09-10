@@ -29,6 +29,7 @@ option list; the subcommands are:
 | `list` | list locally cached models |
 | `viz [--port N] <model>` | self-contained viz server (default port 8081) |
 | `bench [-p N] [-n N] [-r N] [-o md\|csv\|json] <model>` | perf test: `pp<P>` prefill / `tg<T>` decode, mean ± stddev over reps |
+| `specverify [-p N] [-r N] [-o json\|md] <model>` | D5-1a gate bench: batched verify cost C_T(nt) + per-token amortization at deep KV |
 
 Sampling and runtime options:
 
@@ -88,6 +89,20 @@ prefills the context then decodes T tokens. `-p 0` / `-n 0` skip a test, `-r`
 sets the measured reps (1 untimed warmup each), `-o csv|json` emits the same
 fields machine-readable, `--n-ctx` only ever grows the auto KV sizing
 (`P+T+16`, clamped to the model's context length).
+
+## Verify-step gate bench (specverify)
+
+```bash
+./target/release/minfer specverify -p 512 -r 40 -o json <model>
+```
+
+Measures the batched verify-step cost `C_T(nt)` (nt = 1, 3, 5 by default) at
+a fixed deep KV depth and reports the per-token amortization
+`nt·C_T(1)/C_T(nt)` — the D5 speculative-decoding gate instrument (step doc
+81). `-p` sets the depth, `-r` the timed reps (3 untimed warmups each),
+`MINFER_SPECVERIFY_NTS=1,3,16` overrides the phase list,
+`MINFER_SPECVERIFY_NOUT=1` forces prefill-style `n_out=1`. Exit code is 0
+whenever the measurement completes; the PASS/FAIL verdict is in the JSON.
 
 ## Examples
 

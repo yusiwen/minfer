@@ -1,9 +1,18 @@
 # Speculative Decoding (D5) — Plan
 
-Status: **D5-0 complete (2026-09-10) — conditional go, d=2 regime only**
-(record: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md)).
-This document is the working plan for the D5 campaign; per-phase records
-land in `docs/cuda_optimization_steps/` as they complete (numbering from 80).
+Status: **D5 CLOSED (2026-09-10) — the D5-1a gate failed by measurement**
+(records: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md),
+[step doc 81](./cuda_optimization_steps/81-d5-1a-verify-gate-measured.md)).
+Doc 80's conditional go rested on one number: the nt=3 verify amortization
+≥ 2.5×. Doc 81 measured it end-to-end with the `minfer specverify`
+instrument: C_T(3)=106 ms → per-token amortization **0.52×** (needed ≤ 22.1
+ms). The nt=2–8 batched path costs a flat ~35 ms per token (weights
+re-streamed per row — no amortization anywhere; the real tile-regime step
+sits at M≥16, unreachable for verify), so even a dispatch fix or batch
+padding caps below break-even. Per the stop rule pre-registered in D5-0 and
+§D5-1 below, the campaign stops after the primitive (the instrument); no
+`Speculator` trait, KV rollback, or loop plumbing will be built. The rest of
+this document is kept as the record of what was planned.
 
 The reference study is [`LLAMA-CPP-SPECULATIVE-ANALYSIS.md`](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
 (llama.cpp `draft-simple`, source-verified: speculator framework §3, draft

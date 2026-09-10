@@ -124,7 +124,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | CUDA / GPU technology primer (every technique explained) | `docs/CUDA-TECH-PRIMER.md` |
 | Campaign glossary (every term/formula, classified into 7 layers) | `docs/GLOSSARY.md` |
 | llama.cpp MMQ / speculative-decoding analyses | `docs/LLAMA-CPP-MMQ-ANALYSIS.md`, `docs/LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
-| **Speculative decoding plan (D5, live)** | `docs/SPECULATIVE-DECODING-PLAN.md` |
+| **Speculative decoding plan (D5, closed by measurement — doc 81)** | `docs/SPECULATIVE-DECODING-PLAN.md` |
 | Qwen3 support plan (+ minijinja gotcha §5#9) | `docs/QWEN3-SUPPORT-PLAN.md` |
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | Architecture roadmap | `docs/ARCHITECTURE-ROADMAP.md` |

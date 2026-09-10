@@ -18,6 +18,7 @@ mod models;
 mod quants;
 mod sampler;
 mod server;
+mod spec_verify;
 mod template;
 mod tensor;
 mod tokenizer;
@@ -89,6 +90,9 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} list");
     eprintln!("  {prog} viz [--port N] <model>   # self-contained viz server (default port 8081)");
     eprintln!("  {prog} bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>");
+    eprintln!(
+        "  {prog} specverify [-p N] [-r N] [-o json|md] <model>   # D5-1a C_T(nt) gate bench"
+    );
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
@@ -147,6 +151,13 @@ fn main() {
     // which reject unknown flags below).
     if raw_args.get(1).map_or(false, |s| s == "bench") {
         let code = bench::run(&prog, &raw_args[2..]);
+        std::process::exit(code);
+    }
+
+    // `specverify` subcommand: D5-1a verify-step cost micro-bench (its -p/-r/-o
+    // flags are bench-local too, so it parses separately like `bench`).
+    if raw_args.get(1).map_or(false, |s| s == "specverify") {
+        let code = spec_verify::run(&prog, &raw_args[2..]);
         std::process::exit(code);
     }
 
