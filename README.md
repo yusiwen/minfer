@@ -75,15 +75,16 @@ quantization layout, KV cache, adding a new architecture / backend) is
 documented in **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
 
 At a glance: a GGUF v3 model is loaded and dispatched on `general.architecture`
-to an implementation of the `ModelDef` trait; every forward call **builds a
-declarative compute graph** (`ComputeGraph`), then the scheduler assigns
-backends per op (Metal before CPU), applies pattern-based fusion, allocates
+to an implementation of the `ModelDef` trait; every forward call runs through a
+**declarative compute graph** (`ComputeGraph`) — built once per `GraphParams`,
+then reused params-only via `GraphCache` — while the scheduler assigns backends
+per op (priority Metal → CUDA → CPU), applies pattern-based fusion, allocates
 buffers with liveness analysis, and executes in per-backend splits:
 
 ```mermaid
 flowchart LR
     subgraph GRAPH["build → assign → fuse → alloc → execute"]
-        B1["GraphBuilder<br/>build_graph (pure IR)"] --> B2["assign backends<br/>per op: supports_op"]
+        B1["GraphBuilder<br/>build_graph (pure IR)"] --> B2["assign backends<br/>Metal → CUDA → CPU"]
         B2 --> B3["fuse<br/>SwiGLU / BiasRope (gated)"]
         B3 --> B4["alloc<br/>liveness + persistent KV"]
         B4 --> B5["execute<br/>per split, cross-backend copies"]
@@ -94,7 +95,7 @@ flowchart LR
     C --> D["PREFILL<br/>graph forward, all prompt tokens"]
     D --> E["last-token logits"]
     E --> F{"DECODE loop"}
-    F -->|sample| G["sample next token<br/>penalty → top-k → top-p → temp"]
+    F -->|sample| G["sample next token<br/>penalties → top-k → top-p → temp"]
     G -->|stop| H["text out"]
     G -->|continue| I["graph forward, 1 token<br/>KV persists in the allocator"]
     I --> F

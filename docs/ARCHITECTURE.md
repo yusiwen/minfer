@@ -48,15 +48,19 @@
 | `vec_ops.rs` | SIMD vector ops: RMSNorm, RoPE (Qwen2/Llama styles), softmax, SiLU, add/scale/mul |
 | `tensor.rs` | 4D `Tensor` (type/shape/strides/`Vec<u8>` data), ggml-compatible strides & byte sizing |
 | `cache.rs` | **Legacy** per-layer KV cache type (the graph path owns KV in the allocator; kept for the CLI's `KVCache` plumbing) |
-| `sampler.rs` | Repeat-penalty → top-k → top-p → temperature, seeded `StdRng` |
+| `sampler.rs` | Repeat/frequency/presence penalties → top-k → top-p → temperature, seeded `StdRng` |
 | `tokenizer.rs` | Self-contained BPE tokenizer, loaded from GGUF metadata (no tiktoken) |
-| `template.rs` | ChatML / Llama3 / Mistral chat template rendering (minijinja) |
+| `template.rs` | GGUF `chat_template` rendering via minijinja; ChatML fallback (minijinja 2.21 has no `str` filters, so e.g. Qwen3's template falls back) |
 | `models/` | Architecture implementations. `mod.rs` has the `ModelDef` trait + factory dispatch |
 | `models/qwen2/` | Qwen2/Qwen2.5: `mod.rs` (model struct + trait impl), `graph.rs` (`Qwen2Graph::build`/`forward`), `loader.rs` (GGUF weights + hparams) |
+| `models/qwen3/` | Qwen3 (dense): same triple — decoupled head dim + per-head Q/K norm (`qk_norm`), ChatML template fallback |
+| `conversation.rs` | Multi-turn session state (append-only KV) behind `--cnv` |
+| `server/` | OpenAI-compatible HTTP server (`serve`): axum + tokio, multi-slot, `/v1/chat/completions` streaming; `viz.rs` serves the viz page |
 | `metal.rs` + `metal.metal` | Apple MPS (Metal) backend: per-op kernels + command-buffer encoding (the legacy whole-layer `layer_gpu` is retained for tests) |
-| `cuda.rs` + `cuda_kernels.cu` | NVIDIA CUDA backend (feature-gated `--features cuda`): kernels + CUDA Graph capture; graph integration pending (Phase 7) |
+| `cuda.rs` + `cuda_kernels.cu` | NVIDIA CUDA device layer + kernels (feature-gated `--features cuda`); executed through the graph via `graph/cuda_backend.rs` |
 | `download/` | Hugging Face Hub + Ollama download, cached-name resolution, resume support |
 | `dump.rs` | Per-layer hidden-state debug dump (gated by `--features debug_dump`) |
+| `bench.rs` / `live.rs` / `trace.rs` / `spec_verify.rs` | llama-bench-style bench, live viz inference host, per-node trace export (`MINFER_TRACE`), D5 verify-step gate bench |
 
 ### src/graph/ — the compute graph core
 
@@ -69,11 +73,13 @@
 | `backend.rs` | `Backend` trait + `KvProvider` |
 | `cpu_backend.rs` | CPU execution (wraps kernel.rs + vec_ops.rs) |
 | `metal_backend.rs` | Metal execution (per-op MPS kernels; `cfg(target_os = "macos")`) |
+| `cuda_backend.rs` | CUDA execution (feature-gated): int8 MMQ prefill + MMVQ decode (default-on), split-KV attention, CUDA Graph capture/replay |
 | `scheduler.rs` | assign → split → execute (+ cross-backend copies at split boundaries) |
 | `fusion.rs` | Pattern-matching fusion (SwiGLU/BiasRope), gated by backend `supports_fused` |
 | `cache.rs` | `GraphCache` — params-only deterministic graph reuse |
 | `params.rs` | `GraphParams`/`CParams`/`GraphType` — the reuse identity |
 | `dot.rs` | Graphviz DOT export (`--dump-graph`) |
+| `json.rs` | Graph JSON export for the viz page (`--dump-graph-json`, `MINFER_TRACE`) |
 
 ---
 
@@ -81,37 +87,54 @@
 
 The top-level flow lives in `main.rs`. The whole engine is a **single-pass
 prefill** followed by an **autoregressive decode loop**; both call
-`ModelDef::forward`, which routes through the compute graph.
+`ModelDef::forward`, which routes through the compute graph. Every forward is
+**build → assign → fuse → alloc → execute** (the subgraph below), but the
+built graph is cached per `GraphParams` and reused — only the first call with
+new params pays the build/assign/alloc cost.
 
 ```mermaid
 flowchart TD
-    A["CLI args: model, prompt, flags"] --> B{"resolve model"}
-    B -->|local path| C["load GGUF v3<br/>single or split parts"]
-    B -->|"hf:… / ollama:…"| D["auto-download"]
+    A["CLI args: model, prompt, flags"] --> B{"resolve model<br/>download::resolve"}
+    B -->|local path| C["load GGUF v3<br/>single or split parts (mmap)"]
+    B -->|"hf:… / ollama:…"| D["auto-download → path"]
     B -->|cached name| C
     C --> E["parse metadata KV + tensor table"]
     E --> F["init GPU backend<br/>MPS / CUDA"]
-    E --> G["load model<br/>dispatch on general.architecture"]
-    G --> H["load BPE tokenizer from GGUF"]
+    F --> G["load model<br/>dispatch on general.architecture"]
+    G --> MODE{"mode?"}
+    MODE -->|"--cnv"| CV["conversation REPL<br/>(run_conversation)"]
+    MODE -->|"serve"| SV["OpenAI-compatible HTTP server<br/>multi-slot, streaming"]
+    MODE -->|"viz"| VZ["viz server (page + live SSE)"]
+    MODE -->|single shot| H["load BPE tokenizer from GGUF"]
     H --> J{"no-template?"}
-    J -->|no| K["render chat template<br/>tokenizer.chat_template via minijinja"]
+    J -->|no| K["render chat template<br/>GGUF chat_template via minijinja<br/>(ChatML fallback)"]
     J -->|yes| L["raw prompt"]
-    K --> M["tokenize prompt"]
+    K --> M["tokenize prompt<br/>n_ctx = max(--n-ctx, prompt len)<br/>(sizes the KV regions once)"]
     L --> M
     M --> N["PREFILL<br/>graph forward, all prompt tokens at once"]
-    N --> O["last-token logits"]
+    N --> O["last-token logits (n_out = 1)"]
     O --> P{"DECODE loop<br/>while generated < n_predict"}
-    P --> Q["sample next token<br/>repeat-penalty → top-k → top-p → temp"]
-    Q --> R["stop token?"]
+    P --> Q["sample next token<br/>penalties → top-k → top-p → temp"]
+    Q --> R{"stop token or<br/>stop string match?"}
     R -->|yes| S["done"]
     R -->|no| T["append token, decode+print"]
     T --> U["graph forward, single token<br/>KV persists in the allocator"]
     U --> P
+
+    subgraph GRAPH["every forward: build → assign → fuse → alloc → execute"]
+        G1["GraphBuilder<br/>build_graph (pure IR)"] --> G2["assign backends<br/>priority Metal → CUDA → CPU"]
+        G2 --> G3["fuse<br/>SwiGLU / BiasRope (gated)"]
+        G3 --> G4["alloc<br/>liveness + persistent KV"]
+        G4 --> G5["execute<br/>per split, cross-backend copies"]
+    end
+    N -.->|"GraphCache: params-only reuse"| GRAPH
+    U -.->|"GraphCache: params-only reuse"| GRAPH
 ```
 
 **Generation parameters** (defaults match llama.cpp): `temp=0.8`, `top_k=40`,
-`top_p=0.95`, `repeat_penalty=1.1` (last 64 tokens), `seed=42`, `n_ctx=4096`,
-`n_predict=512`.
+`top_p=0.95`, `repeat_penalty=1.1` (last 64 tokens), `frequency_penalty=0.0`,
+`presence_penalty=0.0`, `seed=42`, `n_ctx=4096`, `n_predict=512`. Sampling
+applies the three penalties in one pass, then top-k → top-p → temperature.
 
 Timing is dual-caliber: `Prefill:` = prompt tokens / prefill wall time;
 `Generated:` = generated tokens / decode wall time (pure decode, matches
@@ -138,8 +161,10 @@ Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backend
 ### 4.2 Builder (`GraphBuilder`)
 
 Per-architecture code calls builder methods (mirroring llama.cpp's
-`llm_graph_context`): `embedding`, `rms_norm`, `matmul`, `rope`, `silu`, `add`,
-`mul`, `swiglu`, `kvcache_store`/`kvcache_load`, `attn`. Building is pure —
+`llm_graph_context`): `embedding`, `rms_norm`, `qk_norm` (Qwen3 per-head Q/K
+norm), `matmul`, `get_rows`, `rope`, `silu`, `add`, `mul`, `swiglu`,
+`softmax`, `attn`, `kvcache_store`/`kvcache_load`, plus the decode-fusion
+constructors `fused_qkv`/`qkv_bias_rope_store`/`fused_ffn`. Building is pure —
 no computation happens at build time.
 
 ### 4.3 Scheduler pipeline
@@ -149,8 +174,8 @@ assign_backends → fuse → alloc_graph → execute
 ```
 
 1. **assign_backends** — capability-driven: each node gets the highest-priority
-   backend whose `supports_op` returns true (Metal before CPU). Weight
-   registration decides GPU feasibility.
+   backend whose `supports_op` returns true (priority Metal → CUDA → CPU).
+   Weight registration decides GPU feasibility.
 2. **fuse** — pattern matching (`Mul(Silu(X),Y) → SwiGLU`, `RoPE(Add(X,B)) →
    FusedBiasRope`) gated per backend by `supports_fused` (no double-fusion with
    hand-written kernels). BatchMatMul is deferred (single-output IR limitation,
@@ -166,8 +191,10 @@ assign_backends → fuse → alloc_graph → execute
 ### 4.4 Reuse (`GraphCache`)
 
 **Params-only deterministic reuse** (llama.cpp `allow_reuse` invariant):
-`GraphParams` = `n_tokens` / `n_seqs` / `gtype` / `cparams` / `weights_version`
-deterministically determines the topology — equal params ⇒ identical graph.
+`GraphParams` = `n_tokens` / `n_seqs` / `n_out` (tail rows) / `gtype` /
+`cparams` (`n_ctx`, `n_batch`, `flash_attn`, `gpu`, `fuse_qkv`, `fuse_ffn`) /
+`weights_version` deterministically determines the topology — equal params ⇒
+identical graph.
 `n_past` is deliberately absent (it is execution data). `CParams.gpu` records
 backend participation so a backend toggle forces a rebuild. `GraphCache` owns
 the allocator (so the KV regions persist across rebuilds, e.g. the
@@ -197,10 +224,10 @@ assert structural consistency (`Op: PartialEq`).
    construction) — guarantees a KV store executes before the attention that
    reads it. Nodes with no allocated buffer (dead, e.g. fusion orphans) are
    skipped.
-6. **CPU vs Metal activation paths differ numerically**: CPU matmuls are
-   Q8_0×Q8_0 (activation-quantized), Metal is Q8_0/Q4_0×f32. Compare Metal
-   against manual quant×f32 references or layer-gpu-style math, not against the
-   Q8_0-activation CPU path.
+6. **CPU vs GPU activation paths differ numerically**: CPU matmuls are
+   Q8_0×Q8_0 (activation-quantized), the GPU backends read f32 activations for
+   all weight types (CUDA prefill additionally offers the default-on int8 MMQ
+   path). Compare each path against its own reference, not against the other.
 
 ### 4.6 Per-layer computation (Qwen2) — as built by `graph.rs`
 
@@ -249,11 +276,16 @@ pub trait Backend: Send + Sync {
     fn supports_fused(&self, fused: &FusedOp) -> bool;
     fn alloc_buffer(&mut self, size: usize) -> usize;   // backend's own pool
     fn free_buffer(&mut self, id: usize);
+    fn alloc_fresh(&mut self, size: usize) -> usize;    // bypasses the recycle free list (split-boundary staging)
     fn execute_node(&mut self, node: &CNode, in_bufs: &[usize],
                     out_buf: usize, kv_pair: Option<(usize, usize)>) -> Result<(), String>;
     fn read_host(&self, id: usize) -> Option<&[f32]>;
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;
     fn synchronize(&mut self);
+    // CUDA only: try to replay a captured graph for (uid, range); capture is
+    // gated to decode-shaped graphs. Default impl returns false.
+    #[cfg(feature = "cuda")]
+    fn graph_replay(&mut self, uid: u64, range: (usize, usize), nt_hint: Option<usize>) -> bool;
 }
 ```
 
@@ -265,10 +297,12 @@ pub trait Backend: Send + Sync {
   rope, silu, add, mul, swiglu, embed_tokens_gpu, store_kv, gqa_attn_f32);
   one command buffer per split. Weights resolve by name from MpsState's
   registry (`weight_buf(name) -> (buffer, offset)`).
-- **CUDA** (pending — Phase 7): wrap the existing `cuda.rs` (do NOT stub; keep
-  CUDA Graph capture keyed on the graph `uid`), map `supports_op` from the
-  existing capability matrix. See the plan §9/§17 and AGENTS.md "Adding a New
-  Backend".
+- **CUDA** (`cuda_backend.rs`, feature-gated `--features cuda`): wraps the
+  `cuda.rs` device layer — per-op dispatch with int8 MMQ prefill + MMVQ decode
+  (default-on; `MINFER_MMQ=0` reverts), split-KV attention, and CUDA Graph
+  capture/replay keyed on the graph `uid` (`graph_replay`, decode-shaped only).
+  Implementation record: `docs/CUDA-BACKEND-PLAN.md`; per-step optimization
+  history in `docs/CUDA_OPTIMIZATION.md`.
 
 The **allocator owns every backend pool** (single source of truth); the
 scheduler orchestrates assignment, cross-backend copies, and sync.
@@ -278,7 +312,8 @@ scheduler orchestrates assignment, cross-backend copies, and sync.
 - **Metal**: all graph weights must be GPU-registered (`Qwen2Graph::weights_on_gpu`
   mirrors the old per-layer check). `MINFER_DISABLE_MPS=1` forces CPU.
 - **CPU**: always available; AVX2 dispatch via
-  `is_x86_feature_detected!("avx2")`, scalar fallback elsewhere.
+  `is_x86_feature_detected!("avx2")` on x86, NEON+SDOT on aarch64, scalar
+  fallback elsewhere (`MINFER_NO_NEON=1` forces scalar).
 
 ### 5.3 GPU safety
 
@@ -341,8 +376,11 @@ type remains only as CLI plumbing.
 4. In `graph.rs`: implement `build_graph(&self, params: &GraphParams) ->
    ComputeGraph` **deterministically in params** (the reuse invariant), using
    `GraphBuilder` — mirror llama.cpp's `llm_graph_context` builder methods.
-5. In `mod.rs`: implement `ModelDef` (forward, build_graph, forward_graph,
-   as_any, format_chat, special_tokens, dims, rope_style).
+5. In `mod.rs`: implement `ModelDef` (`forward`, `build_graph`,
+   `forward_graph`, `forward_graph_cached`, `as_any`, `format_chat`,
+   `special_tokens`, `n_layer`/`n_head_kv`/`n_embd_head`/`n_kv_embd`/`n_vocab`,
+   `rope_style`). `models/qwen3/` is the worked example of a second
+   architecture (decoupled head dim + per-head Q/K norm).
 6. If needed, add a chat template format in `template.rs`.
 
 Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral,
