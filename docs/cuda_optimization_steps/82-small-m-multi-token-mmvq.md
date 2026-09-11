@@ -1,7 +1,7 @@
 # 82 · small-M dispatch fix — multi-token MMVQ + token-looped legacy kernels (LANDED)
 
 > **Result**: 7B q4_k_m batched decode nt=3 105.9 → 29.4 ms (3.60×), nt=8 279.3 → 48.6 ms (5.75×); weight traffic is now independent of nt (marginal cost 34.4 → 4.3 ms/token); batched forwards are bitwise-equal to serial nt=1 runs on all 8 quant types. The pre-registered amortization bar (2.5× at nt=3) was missed at 1.87× — a cost-model error, dissected in §5.
-> **Commit**: `<hash>` **Date**: 2026-09-11
+> **Commit**: `65ef00f` (code + docs) **Date**: 2026-09-11
 
 ## 1. Background — where things stood
 
