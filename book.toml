@@ -14,6 +14,10 @@ preferred-dark-theme = "dark"
 git-repository-url = "https://github.com/yusiwen/minfer"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
+[output.html.fold]
+enable = true
+level = 1
+
 [preprocessor]
 
 [preprocessor.mermaid]
