@@ -602,6 +602,65 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // Step 82: multi-token (nt in [2, 8]) MMVQ variants — the token loop is
+    // in-block (one block per weight row, grid.y = 1), so the weight stream
+    // is paid once regardless of nt (the doc 81 D5-1a dispatch hole).
+    fn launch_q4_k_q8_mmvq_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q4_k_q8_mmvq_v2_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q5_k_q8_mmvq_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q5_k_q8_mmvq_v2_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q6_k_q8_mmvq_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        blk_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q6_k_q8_mmvq_v2_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        blk_stride: i32,
+        stream: *mut std::ffi::c_void,
+    );
     // R2: weight-streaming rework (one weight byte loaded exactly once per
     // row; uint4 loads; q6_K needs the padded 224B stride for alignment).
     fn launch_q4_k_q8_mmvq_v2(
@@ -2482,7 +2541,10 @@ impl CudaState {
         nt: usize,
         padded_q6k: bool,
     ) -> Result<(), String> {
-        // 8m: prefill (nt >= 16) runs ONE tiled GEMM for every quantized
+        // 8m: prefill (nt >= 16 — Step 82 lowered the gate to >= 9: batches
+        // of 2..8 run the multi-token MMVQ / token-looped legacy kernels,
+        // which are weights-once without the M-tile padding waste; doc 81)
+        // runs ONE tiled GEMM for every quantized
         // weight type. R1 (2026-08-31): the int8 MMQ GEMM — activations
         // quantized to q8_0 once per call, raw weight bytes staged per tile,
         // mma.m16n8k32 (s8) with per-k-block scale rescale (llama.cpp's MMQ
@@ -2491,7 +2553,7 @@ impl CudaState {
         // wmma path). MINFER_NO_PREFILL_GEMM=1 still forces the legacy
         // per-type kernels. id % 32 == 0 covers the block math of every type
         // (q6_K runs as k32 chunks with dual 16-sub rescale inside).
-        if nt >= 16
+        if nt >= 9
             && id % 32 == 0
             && !Self::no_prefill_gemm()
             && matches!(
@@ -2572,6 +2634,10 @@ impl CudaState {
                 if nt == 1 && id >= 2048 && id % 32 == 0 {
                     self.q4_k_decode_mmvq(wptr, x, out, od, id, nt);
                     Ok(())
+                } else if nt >= 2 && nt <= 8 && id % 32 == 0 {
+                    // Step 82: multi-token MMVQ (in-block token loop).
+                    self.q4_k_decode_mmvq_multi(wptr, x, out, od, id, nt);
+                    Ok(())
                 } else {
                     launch!(launch_q4_k_f32_matmul)
                 }
@@ -2597,6 +2663,12 @@ impl CudaState {
                 if nt == 1 && od * id >= 24_000_000 && !Self::no_kq_mmvq() {
                     self.q5_k_decode_mmvq(wptr, x, out, od, id, nt);
                     Ok(())
+                } else if nt >= 2 && nt <= 8 && !Self::no_kq_mmvq() {
+                    // Step 82: multi-token MMVQ — weights-once at any shape
+                    // (the 24M nt == 1 crossover does not apply: the in-block
+                    // token loop amortizes the uncoalesced load latency).
+                    self.q5_k_decode_mmvq_multi(wptr, x, out, od, id, nt);
+                    Ok(())
                 } else {
                     launch!(launch_q5_k_f32_matmul)
                 }
@@ -2620,6 +2692,13 @@ impl CudaState {
                 // package; MINFER_NO_KQ_MMVQ=1 keeps the padded kernel.
                 if nt == 1 && id % 32 == 0 && od * id >= 4_000_000 && !Self::no_kq_mmvq() {
                     self.q6_k_decode_mmvq(wptr, x, out, od, id, nt, padded_q6k);
+                    Ok(())
+                } else if nt >= 2 && nt <= 8 && id % 32 == 0 && !Self::no_kq_mmvq() {
+                    // Step 82: multi-token MMVQ (v2 needs the padded 224B
+                    // stride; the v1 form handles raw 210B too). The 4M
+                    // nt == 1 crossover does not apply — weights-once at
+                    // any shape once nt >= 2.
+                    self.q6_k_decode_mmvq_multi(wptr, x, out, od, id, nt, padded_q6k);
                     Ok(())
                 } else if padded_q6k {
                     launch!(launch_q6_k_f32_matmul_padded)
@@ -4330,6 +4409,131 @@ impl CudaState {
                     id as i32,
                     nt as i32,
                     if blk_stride_padded { 224 } else { 210 },
+                    stream,
+                );
+            }
+        }
+    }
+
+    /// Step 82: multi-token (nt in 2..=8) q4_K matmul via the MMVQ
+    /// structure with an in-block token loop — the weight stream is paid
+    /// once regardless of nt (the doc 81 D5-1a dispatch hole). The
+    /// nt == 1 id >= 2048 shape gate does not apply: at nt >= 2 a
+    /// weights-once kernel wins at any shape.
+    pub fn q4_k_decode_mmvq_multi(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        // decode_quantize_native is nt-parameterized (the pad40 q8 plane
+        // covers all nt rows), so no scratch change is needed here.
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            if Self::mmvq_v2(id) {
+                launch_q4_k_q8_mmvq_v2_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            } else {
+                launch_q4_k_q8_mmvq_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            }
+        }
+    }
+
+    /// Step 82: multi-token (nt in 2..=8) q5_K matmul — the q4_K multi
+    /// structure with the q5 high-bit plane folded in.
+    pub fn q5_k_decode_mmvq_multi(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            if Self::mmvq_v2(id) {
+                launch_q5_k_q8_mmvq_v2_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            } else {
+                launch_q5_k_q8_mmvq_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stream,
+                );
+            }
+        }
+    }
+
+    /// Step 82: multi-token (nt in 2..=8) q6_K matmul — 16-element units
+    /// over q8 activations with an in-block token loop. The v2 form needs
+    /// the padded 224B block stride (u32/uint4 loads); the v1 form handles
+    /// the raw 210B stride too (2-byte loads).
+    pub fn q6_k_decode_mmvq_multi(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+        blk_stride_padded: bool,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        let stride: i32 = if blk_stride_padded { 224 } else { 210 };
+        unsafe {
+            if blk_stride_padded && Self::mmvq_v2(id) {
+                launch_q6_k_q8_mmvq_v2_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stride,
+                    stream,
+                );
+            } else {
+                launch_q6_k_q8_mmvq_multi(
+                    wptr as *const u8,
+                    q8 as *const u8,
+                    out as *mut f32,
+                    od as i32,
+                    id as i32,
+                    nt as i32,
+                    stride,
                     stream,
                 );
             }

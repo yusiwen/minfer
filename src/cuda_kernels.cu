@@ -43,56 +43,63 @@ __global__ void q4_0_q8_0_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
 
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nb = id / 32;
     int q4s = nb * Q4B;
     int q8s = nb * Q8B;
 
-    const uint8_t* xr = acts + t * q8s;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const uint8_t* xr = acts + t * q8s;
 
-    float sumf[NR0];
-    #pragma unroll
-    for (int row = 0; row < NR0; row++) sumf[row] = 0.0f;
+        float sumf[NR0];
+        #pragma unroll
+        for (int row = 0; row < NR0; row++) sumf[row] = 0.0f;
 
-    // Each lane handles every WARP-th block
-    for (int b = lane_id; b < nb; b += WARP) {
-        // Q8_0 block
-        float d8 = h2f(*reinterpret_cast<const uint16_t*>(xr + b * Q8B));
-        const int8_t* xq = reinterpret_cast<const int8_t*>(xr + b * Q8B + 2);
+        // Each lane handles every WARP-th block
+        for (int b = lane_id; b < nb; b += WARP) {
+            // Q8_0 block
+            float d8 = h2f(*reinterpret_cast<const uint16_t*>(xr + b * Q8B));
+            const int8_t* xq = reinterpret_cast<const int8_t*>(xr + b * Q8B + 2);
 
+            for (int row = 0; row < NR0; row++) {
+                int o = r0 + row;
+                if (o >= od) break;
+
+                const uint8_t* wr = weights + o * q4s;
+                float d4 = h2f(*reinterpret_cast<const uint16_t*>(wr + b * Q4B));
+                const uint8_t* wq = wr + b * Q4B + 2;
+
+                int bs = 0;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    uint8_t byte = wq[j];
+                    bs += (int(byte & 0x0F) - 8) * int(xq[j])
+                        + (int(byte >> 4) - 8) * int(xq[j + 16]);
+                }
+                sumf[row] += float(bs) * d4 * d8;
+            }
+        }
+
+        // Warp-level reduction and write
         for (int row = 0; row < NR0; row++) {
             int o = r0 + row;
-            if (o >= od) break;
-
-            const uint8_t* wr = weights + o * q4s;
-            float d4 = h2f(*reinterpret_cast<const uint16_t*>(wr + b * Q4B));
-            const uint8_t* wq = wr + b * Q4B + 2;
-
-            int bs = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t byte = wq[j];
-                bs += (int(byte & 0x0F) - 8) * int(xq[j])
-                    + (int(byte >> 4) - 8) * int(xq[j + 16]);
-            }
-            sumf[row] += float(bs) * d4 * d8;
-        }
-    }
-
-    // Warp-level reduction and write
-    for (int row = 0; row < NR0; row++) {
-        int o = r0 + row;
-        if (o < od) {
-            float total = warp_reduce_sum(sumf[row]);
-            if (lane_id == 0) {
-                output[t * od + o] = total;
+            if (o < od) {
+                float total = warp_reduce_sum(sumf[row]);
+                if (lane_id == 0) {
+                    output[t * od + o] = total;
+                }
             }
         }
     }
+
 }
 
 // ─── Q4_0 × f32 matrix multiplication ─────────────────────────
@@ -128,10 +135,8 @@ __global__ void q4_0_f32_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
 
-    if (t >= nt) return;
 
     int nb = id / QK;
     int q4s = nb * Q4B;
@@ -140,44 +145,52 @@ __global__ void q4_0_f32_matmul(
     const uint8_t* ax1 = weights + (r0 + 1) * q4s;
     const uint8_t* ax2 = weights + (r0 + 2) * q4s;
     const uint8_t* ax3 = weights + (r0 + 3) * q4s;
-    const float* y = acts + t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + t * id;
 
-    int ix = lane_id / (NW / NQ);
-    int il = (lane_id % (NW / NQ)) * 8;
+        int ix = lane_id / (NW / NQ);
+        int il = (lane_id % (NW / NQ)) * 8;
 
-    float sumf0 = 0, sumf1 = 0, sumf2 = 0, sumf3 = 0;
-    float yl[16];
-    const float* yb = y + ix * QK + il;
+        float sumf0 = 0, sumf1 = 0, sumf2 = 0, sumf3 = 0;
+        float yl[16];
+        const float* yb = y + ix * QK + il;
 
-    for (int ib = ix; ib < nb; ib += NQ) {
-        float sumy0 = 0, sumy1 = 0;
-        #pragma unroll
-        for (int i = 0; i < 8; i += 2) {
-            sumy0 += yb[i + 0] + yb[i + 1];
-            yl[i + 0] = yb[i + 0];
-            yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
-            sumy1 += yb[i + 16] + yb[i + 17];
-            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
-            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+        for (int ib = ix; ib < nb; ib += NQ) {
+            float sumy0 = 0, sumy1 = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                sumy0 += yb[i + 0] + yb[i + 1];
+                yl[i + 0] = yb[i + 0];
+                yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+                sumy1 += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+                yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+            }
+            float sy = sumy0 + sumy1;
+            if (r0 + 0 < od) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
+            if (r0 + 1 < od) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
+            if (r0 + 2 < od) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
+            if (r0 + 3 < od) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
+            yb += QK * NQ;
         }
-        float sy = sumy0 + sumy1;
-        if (r0 + 0 < od) sumf0 += block_q4_0_dot_y(ax0 + ib * Q4B, sy, yl, il);
-        if (r0 + 1 < od) sumf1 += block_q4_0_dot_y(ax1 + ib * Q4B, sy, yl, il);
-        if (r0 + 2 < od) sumf2 += block_q4_0_dot_y(ax2 + ib * Q4B, sy, yl, il);
-        if (r0 + 3 < od) sumf3 += block_q4_0_dot_y(ax3 + ib * Q4B, sy, yl, il);
-        yb += QK * NQ;
+
+        sumf0 = warp_reduce_sum(sumf0);
+        sumf1 = warp_reduce_sum(sumf1);
+        sumf2 = warp_reduce_sum(sumf2);
+        sumf3 = warp_reduce_sum(sumf3);
+        if (lane_id == 0) {
+            if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
+            if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
+            if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
+            if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
+        }
     }
 
-    sumf0 = warp_reduce_sum(sumf0);
-    sumf1 = warp_reduce_sum(sumf1);
-    sumf2 = warp_reduce_sum(sumf2);
-    sumf3 = warp_reduce_sum(sumf3);
-    if (lane_id == 0) {
-        if (r0 + 0 < od) output[t * od + r0 + 0] = sumf0;
-        if (r0 + 1 < od) output[t * od + r0 + 1] = sumf1;
-        if (r0 + 2 < od) output[t * od + r0 + 2] = sumf2;
-        if (r0 + 3 < od) output[t * od + r0 + 3] = sumf3;
-    }
 }
 
 // ─── Q8_0 × f32 matrix multiplication ─────────────────────────
@@ -198,46 +211,53 @@ __global__ void q8_0_f32_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
 
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nb = id / QK;
     int ws = nb * Q8B;
-    const float* y = acts + t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + t * id;
 
-    float sumf[NR0] = {0};
+        float sumf[NR0] = {0};
 
-    for (int row = 0; row < NR0 && r0 + row < od; row++) {
-        const uint8_t* wr = weights + (r0 + row) * ws;
-        float sum = 0.0f;
+        for (int row = 0; row < NR0 && r0 + row < od; row++) {
+            const uint8_t* wr = weights + (r0 + row) * ws;
+            float sum = 0.0f;
 
-        for (int b = lane_id; b < nb; b += WARP) {
-            float d8 = h2f(*reinterpret_cast<const uint16_t*>(wr + b * Q8B));
-            const int8_t* qs = reinterpret_cast<const int8_t*>(wr + b * Q8B + 2);
-            const float4* x4 = reinterpret_cast<const float4*>(y + b * QK);
+            for (int b = lane_id; b < nb; b += WARP) {
+                float d8 = h2f(*reinterpret_cast<const uint16_t*>(wr + b * Q8B));
+                const int8_t* qs = reinterpret_cast<const int8_t*>(wr + b * Q8B + 2);
+                const float4* x4 = reinterpret_cast<const float4*>(y + b * QK);
 
-            float bs = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < QK4; i++) {
-                float4 xv = x4[i];
-                bs += float(qs[i*4 + 0]) * xv.x
-                    + float(qs[i*4 + 1]) * xv.y
-                    + float(qs[i*4 + 2]) * xv.z
-                    + float(qs[i*4 + 3]) * xv.w;
+                float bs = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < QK4; i++) {
+                    float4 xv = x4[i];
+                    bs += float(qs[i*4 + 0]) * xv.x
+                        + float(qs[i*4 + 1]) * xv.y
+                        + float(qs[i*4 + 2]) * xv.z
+                        + float(qs[i*4 + 3]) * xv.w;
+                }
+                sum += bs * d8;
             }
-            sum += bs * d8;
+            sumf[row] = sum;
         }
-        sumf[row] = sum;
+
+        for (int row = 0; row < NR0 && r0 + row < od; row++) {
+            sumf[row] = warp_reduce_sum(sumf[row]);
+            if (lane_id == 0) {
+                output[t * od + r0 + row] = sumf[row];
+            }
+        }
     }
 
-    for (int row = 0; row < NR0 && r0 + row < od; row++) {
-        sumf[row] = warp_reduce_sum(sumf[row]);
-        if (lane_id == 0) {
-            output[t * od + r0 + row] = sumf[row];
-        }
-    }
 }
 
 // ─── Q4_1 × f32 matrix multiplication ─────────────────────────
@@ -258,50 +278,57 @@ __global__ void q4_1_f32_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
 
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nb = id / QK;
     int ws = nb * Q41B;
-    const float* y = acts + t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + t * id;
 
-    float sumf[NR0] = {0};
+        float sumf[NR0] = {0};
 
-    for (int row = 0; row < NR0 && r0 + row < od; row++) {
-        const uint8_t* wr = weights + (r0 + row) * ws;
-        float sum = 0.0f;
+        for (int row = 0; row < NR0 && r0 + row < od; row++) {
+            const uint8_t* wr = weights + (r0 + row) * ws;
+            float sum = 0.0f;
 
-        for (int b = lane_id; b < nb; b += WARP) {
-            const uint8_t* block = wr + b * Q41B;
-            float d = h2f(*reinterpret_cast<const uint16_t*>(block));
-            float m = h2f(*reinterpret_cast<const uint16_t*>(block + 2));
-            const uint8_t* qs = block + 4;
-            const float* xb = y + b * QK;
+            for (int b = lane_id; b < nb; b += WARP) {
+                const uint8_t* block = wr + b * Q41B;
+                float d = h2f(*reinterpret_cast<const uint16_t*>(block));
+                float m = h2f(*reinterpret_cast<const uint16_t*>(block + 2));
+                const uint8_t* qs = block + 4;
+                const float* xb = y + b * QK;
 
-            float sumx = 0.0f;
-            float sumq = 0.0f;
+                float sumx = 0.0f;
+                float sumq = 0.0f;
 
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t byte = qs[j];
-                float x0 = xb[j];
-                float x1 = xb[j + 16];
-                sumx += x0 + x1;
-                sumq += float(byte & 0x0F) * x0 + float(byte >> 4) * x1;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    uint8_t byte = qs[j];
+                    float x0 = xb[j];
+                    float x1 = xb[j + 16];
+                    sumx += x0 + x1;
+                    sumq += float(byte & 0x0F) * x0 + float(byte >> 4) * x1;
+                }
+                sum += sumq * d + sumx * m;
             }
-            sum += sumq * d + sumx * m;
+            sumf[row] = sum;
         }
-        sumf[row] = sum;
+
+        for (int row = 0; row < NR0 && r0 + row < od; row++) {
+            sumf[row] = warp_reduce_sum(sumf[row]);
+            if (lane_id == 0) {
+                output[t * od + r0 + row] = sumf[row];
+            }
+        }
     }
 
-    for (int row = 0; row < NR0 && r0 + row < od; row++) {
-        sumf[row] = warp_reduce_sum(sumf[row]);
-        if (lane_id == 0) {
-            output[t * od + r0 + row] = sumf[row];
-        }
-    }
 }
 
 // ─── Q5_1 × f32 matrix multiplication ─────────────────────────
@@ -322,51 +349,58 @@ __global__ void q5_0_f32_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nb = id / 32;
     int row_stride = nb * 22;
-    const float* y = acts + (size_t)t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + (size_t)t * id;
 
-    float acc[NR0];
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+        float acc[NR0];
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
 
-    for (int b = lane_id; b < nb; b += WARP) {
-        const float* xb = y + b * 32;
+        for (int b = lane_id; b < nb; b += WARP) {
+            const float* xb = y + b * 32;
+            #pragma unroll
+            for (int rr = 0; rr < NR0; rr++) {
+                int o = r0 + rr;
+                if (o >= od) break;
+                const uint8_t* blk = weights + (size_t)o * row_stride + b * 22;
+                float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+                // qh at block offset 2 is not 4-byte aligned (22B stride) — two
+                // aligned u16 loads; misaligned u32 faults nondeterministically
+                // on GB10 unified memory (err 716).
+                uint32_t qh = (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2)
+                            | ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 4) << 16);
+                const uint8_t* qs = blk + 6;
+                float sdot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    float u_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1) - 16.0f;
+                    float u_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1) - 16.0f;
+                    sdot += u_lo * xb[j] + u_hi * xb[j + 16];
+                }
+                acc[rr] += d * sdot;
+            }
+        }
+
         #pragma unroll
         for (int rr = 0; rr < NR0; rr++) {
             int o = r0 + rr;
-            if (o >= od) break;
-            const uint8_t* blk = weights + (size_t)o * row_stride + b * 22;
-            float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
-            // qh at block offset 2 is not 4-byte aligned (22B stride) — two
-            // aligned u16 loads; misaligned u32 faults nondeterministically
-            // on GB10 unified memory (err 716).
-            uint32_t qh = (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2)
-                        | ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 4) << 16);
-            const uint8_t* qs = blk + 6;
-            float sdot = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                float u_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1) - 16.0f;
-                float u_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1) - 16.0f;
-                sdot += u_lo * xb[j] + u_hi * xb[j + 16];
+            if (o < od) {
+                float v = warp_reduce_sum(acc[rr]);
+                if (lane_id == 0) output[t * od + o] = v;
             }
-            acc[rr] += d * sdot;
         }
     }
 
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) {
-        int o = r0 + rr;
-        if (o < od) {
-            float v = warp_reduce_sum(acc[rr]);
-            if (lane_id == 0) output[t * od + o] = v;
-        }
-    }
 }
 
 // Structure mirrors q4_0_f32_matmul (4 rows/warp, 2 warps/block, lanes
@@ -382,54 +416,61 @@ __global__ void q5_1_f32_matmul(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nb = id / 32;
     int row_stride = nb * 24;
-    const float* y = acts + (size_t)t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + (size_t)t * id;
 
-    float acc[NR0];
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
-
-    for (int b = lane_id; b < nb; b += WARP) {
-        const float* xb = y + b * 32;
-        float sumx = 0.0f;
+        float acc[NR0];
         #pragma unroll
-        for (int v = 0; v < 8; v++) {
-            float4 xv = *reinterpret_cast<const float4*>(xb + v * 4);
-            sumx += xv.x + xv.y + xv.z + xv.w;
+        for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+
+        for (int b = lane_id; b < nb; b += WARP) {
+            const float* xb = y + b * 32;
+            float sumx = 0.0f;
+            #pragma unroll
+            for (int v = 0; v < 8; v++) {
+                float4 xv = *reinterpret_cast<const float4*>(xb + v * 4);
+                sumx += xv.x + xv.y + xv.z + xv.w;
+            }
+            #pragma unroll
+            for (int rr = 0; rr < NR0; rr++) {
+                int o = r0 + rr;
+                if (o >= od) break;
+                const uint8_t* blk = weights + (size_t)o * row_stride + b * 24;
+                float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+                float m = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+                uint32_t qh = *reinterpret_cast<const uint32_t*>(blk + 4);
+                const uint8_t* qs = blk + 8;
+                float sdot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    float u_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1);
+                    float u_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1);
+                    sdot += u_lo * xb[j] + u_hi * xb[j + 16];
+                }
+                acc[rr] += d * sdot + m * sumx;
+            }
         }
+
         #pragma unroll
         for (int rr = 0; rr < NR0; rr++) {
             int o = r0 + rr;
-            if (o >= od) break;
-            const uint8_t* blk = weights + (size_t)o * row_stride + b * 24;
-            float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
-            float m = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
-            uint32_t qh = *reinterpret_cast<const uint32_t*>(blk + 4);
-            const uint8_t* qs = blk + 8;
-            float sdot = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                float u_lo = float(qs[j] & 0x0F) + 16.0f * float((qh >> j) & 1);
-                float u_hi = float(qs[j] >> 4) + 16.0f * float((qh >> (j + 16)) & 1);
-                sdot += u_lo * xb[j] + u_hi * xb[j + 16];
+            if (o < od) {
+                float v = warp_reduce_sum(acc[rr]);
+                if (lane_id == 0) output[t * od + o] = v;
             }
-            acc[rr] += d * sdot + m * sumx;
         }
     }
 
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) {
-        int o = r0 + rr;
-        if (o < od) {
-            float v = warp_reduce_sum(acc[rr]);
-            if (lane_id == 0) output[t * od + o] = v;
-        }
-    }
 }
 
 // forward declaration (defined with the Q4_K section below)
@@ -2145,40 +2186,47 @@ __global__ void f32_f32_matmul_vec(
 
     int warp_id = threadIdx.x / WARP;
     int lane_id = threadIdx.x % WARP;
-    int t = blockIdx.y;
     int r0 = (blockIdx.x * NSG + warp_id) * NR0;
-    if (t >= nt || r0 >= od) return;
+    if (r0 >= od) return;
 
     int nch = (id + CHK - 1) / CHK;
-    const float* y = acts + (size_t)t * id;
+    // Step 82: the token dimension lives in this in-block loop, not in the
+    // launch grid (grid.y used to be nt = one full weight re-stream per
+    // token). The weight bytes for the block's rows are re-read across
+    // tokens from L1, so DRAM sees one weight stream per block; nt==1
+    // keeps the exact single-token op order (bitwise).
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + (size_t)t * id;
 
-    float acc[NR0];
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+        float acc[NR0];
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
 
-    for (int u = lane_id; u < nch * NR0; u += WARP) {
-        int ic = u % nch, rr = u / nch;
-        const float* wr = weights + (size_t)(r0 + rr) * id + ic * CHK;
-        const float* yc = y + ic * CHK;
-        int len = min(CHK, id - ic * CHK);
-        float p = 0.0f;
-        // the unit's lane streams the WHOLE chunk (8 floats per pass)
-        for (int i = 0; i < len; i += 8) {
-            float4 a0 = *reinterpret_cast<const float4*>(wr + i);
-            float4 a1 = *reinterpret_cast<const float4*>(wr + i + 4);
-            float4 b0 = *reinterpret_cast<const float4*>(yc + i);
-            float4 b1 = *reinterpret_cast<const float4*>(yc + i + 4);
-            p += a0.x * b0.x + a0.y * b0.y + a0.z * b0.z + a0.w * b0.w
-               + a1.x * b1.x + a1.y * b1.y + a1.z * b1.z + a1.w * b1.w;
+        for (int u = lane_id; u < nch * NR0; u += WARP) {
+            int ic = u % nch, rr = u / nch;
+            const float* wr = weights + (size_t)(r0 + rr) * id + ic * CHK;
+            const float* yc = y + ic * CHK;
+            int len = min(CHK, id - ic * CHK);
+            float p = 0.0f;
+            // the unit's lane streams the WHOLE chunk (8 floats per pass)
+            for (int i = 0; i < len; i += 8) {
+                float4 a0 = *reinterpret_cast<const float4*>(wr + i);
+                float4 a1 = *reinterpret_cast<const float4*>(wr + i + 4);
+                float4 b0 = *reinterpret_cast<const float4*>(yc + i);
+                float4 b1 = *reinterpret_cast<const float4*>(yc + i + 4);
+                p += a0.x * b0.x + a0.y * b0.y + a0.z * b0.z + a0.w * b0.w
+                   + a1.x * b1.x + a1.y * b1.y + a1.z * b1.z + a1.w * b1.w;
+            }
+            acc[rr] += p;
         }
-        acc[rr] += p;
+
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) {
+            float v = warp_reduce_sum(acc[rr]);
+            if (lane_id == 0 && r0 + rr < od) output[(size_t)t * od + r0 + rr] = v;
+        }
     }
 
-    #pragma unroll
-    for (int rr = 0; rr < NR0; rr++) {
-        float v = warp_reduce_sum(acc[rr]);
-        if (lane_id == 0 && r0 + rr < od) output[(size_t)t * od + r0 + rr] = v;
-    }
 }
 
 // General-case fallback: one thread per (token, output) pair, scalar dot.
@@ -3294,7 +3342,7 @@ void launch_q4_0_q8_0_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q4_0_q8_0_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -3304,7 +3352,7 @@ void launch_q4_0_f32_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q4_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -3314,7 +3362,7 @@ void launch_q8_0_f32_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q8_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -3324,7 +3372,7 @@ void launch_q4_1_f32_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q4_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -3501,7 +3549,7 @@ void launch_f32_f32_matmul(
     int od, int id, int nt, cudaStream_t stream
 ) {
     if (id % 8 == 0) {
-        dim3 grid((od + 7) / 8, nt), block(64);
+        dim3 grid((od + 7) / 8, 1), block(64);
         f32_f32_matmul_vec<<<grid, block, 0, stream>>>(w, x, out, od, id, nt);
     } else {
         long long total = (long long)nt * od;
@@ -3625,7 +3673,7 @@ void launch_q5_1_f32_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q5_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -3635,7 +3683,7 @@ void launch_q5_0_f32_matmul(
 ) {
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
-    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
+    dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
     q5_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
 }
 
@@ -7290,3 +7338,405 @@ extern "C" void launch_mmq_nt(
     }
 #undef MMQ_LAUNCH
 }
+
+// ─── Step 82: multi-token MMVQ (nt in [2, 8]) ──────────────────────────
+// The decode kernels above fix the token in the launch grid (grid.y = nt):
+// every (row, token) block re-streams its whole weight row, so nt in
+// [2, 15] costs nt full weight passes — the dispatch hole measured in doc
+// 81 (D5-1a). The llama.cpp mul_mat_vec_q structure instead keeps the
+// token loop inside the block (LLAMA-CPP-MMQ-ANALYSIS.md §12): weight
+// bytes are loaded once per row and dotted against ≤ 8 activation rows.
+// The kernels below are the multi-token variants of the v1/v2 decode
+// kernels; the single-token kernels stay the nt == 1 hot path (unchanged
+// code, capture graphs included). Accumulators are a fixed 8-lane array
+// with a uniform `t < nt` guard so every index stays compile-time (no
+// local-memory spill); nt is uniform across the block (no divergence).
+// Per (row, token) the op order matches the sibling single-token kernel,
+// so a multi launch is bitwise-equal to nt separate single launches.
+
+__device__ __forceinline__ void mmvq_block_reduce_multi(
+    const float* acc /* [nt <= 8] */, float* __restrict__ output, int od, int nt
+) {
+    __shared__ float warp_sums[8];
+    for (int t = 0; t < nt; ++t) {
+        float a = acc[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xFFFFFFFF, a, off);
+        if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = a;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) v += warp_sums[k];
+            output[(size_t)t * od + (size_t)blockIdx.x] = v;
+        }
+        __syncthreads(); // warp_sums is rewritten by the next iteration
+    }
+}
+
+__global__ void __launch_bounds__(256) q4_k_q8_mmvq_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nbe = (id + 255) / 256;
+    const int row_stride = nbe * Q4KB;
+    const int nsub = (id + 31) / 32; // ceil — partial tail super-blocks excluded
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 3, sub = u & 7;
+        const uint8_t* blk = weights + (size_t)row * row_stride + blk_i * Q4KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        uint8_t s8, m8;
+        get_scale_min_k4(sub, blk + 4, &s8, &m8);
+        const uint32_t* qw = reinterpret_cast<const uint32_t*>(blk + 16 + (sub >> 1) * 32);
+        const bool lo = (sub & 1) == 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8 = acts8 + ((size_t)t * nsub + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+                int dot = 0, sx = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const uint32_t w = qw[v];
+                    const int n = lo ? (int)(w & 0x0F0F0F0F) : (int)((w >> 4) & 0x0F0F0F0F);
+                    const int xa = (int)xw[v];
+                    dot = __dp4a(n, xa, dot);
+                    sx  = __dp4a(0x01010101, xa, sx);
+                }
+                acc[t] += d8 * ((float)s8 * (float)d * (float)dot - (float)m8 * (float)dm * (float)sx);
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+__global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * Q4KB;
+    const int npair = id >> 6;         // 64-element chunks (sub-pairs)
+    const int nsub = id >> 5;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 2, c = u & 3;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * Q4KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        const int s0 = 2 * c, s1 = 2 * c + 1;
+        uint8_t s8a, m8a, s8b, m8b;
+        get_scale_min_k4(s0, blk + 4, &s8a, &m8a);
+        get_scale_min_k4(s1, blk + 4, &s8b, &m8b);
+        const uint4 w0 = *reinterpret_cast<const uint4*>(blk + 16 + c * 32);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(blk + 16 + c * 32 + 16);
+        const uint32_t ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8a = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s0)) * Q8PB;
+                const uint8_t* x8b = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s1)) * Q8PB;
+                const float d8a = h2f(*reinterpret_cast<const uint16_t*>(x8a));
+                const float d8b = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+                const uint32_t* xa = reinterpret_cast<const uint32_t*>(x8a + 4);
+                const uint32_t* xb = reinterpret_cast<const uint32_t*>(x8b + 4);
+                int dota = 0, sxa = 0, dotb = 0, sxb = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const uint32_t wv = ws[v];
+                    const int xa_v = (int)xa[v], xb_v = (int)xb[v];
+                    dota = __dp4a((int)(wv & 0x0F0F0F0F), xa_v, dota);
+                    sxa  = __dp4a(0x01010101, xa_v, sxa);
+                    dotb = __dp4a((int)((wv >> 4) & 0x0F0F0F0F), xb_v, dotb);
+                    sxb  = __dp4a(0x01010101, xb_v, sxb);
+                }
+                acc[t] += d8a * ((float)s8a * d * (float)dota - (float)m8a * dm * (float)sxa)
+                        + d8b * ((float)s8b * d * (float)dotb - (float)m8b * dm * (float)sxb);
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+__global__ void __launch_bounds__(256) q5_k_q8_mmvq_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nbe = (id + 255) >> 8;
+    const int row_stride = nbe * Q5KB;
+    const int nsub = (id + 31) >> 5; // ceil — partial tail super-blocks excluded
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 3, sub = u & 7;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)blk_i * Q5KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        uint8_t s8, m8;
+        get_scale_min_k4(sub, blk + 4, &s8, &m8);
+        const uint32_t* qw = reinterpret_cast<const uint32_t*>(blk + 48 + (sub >> 1) * 32);
+        const bool lo = (sub & 1) == 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8 = acts8 + ((size_t)t * nsub + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+                int dot = 0, sx = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const uint32_t w = qw[v];
+                    const uint32_t qh32 = *reinterpret_cast<const uint32_t*>(blk + 16 + 4 * v);
+                    const uint32_t nib = lo ? (w & 0x0F0F0F0F) : ((w >> 4) & 0x0F0F0F0F);
+                    const uint32_t hi = ((qh32 >> sub) & 0x01010101) << 4;
+                    const int xa = (int)xw[v];
+                    dot = __dp4a((int)(nib | hi), xa, dot);
+                    sx  = __dp4a(0x01010101, xa, sx);
+                }
+                acc[t] += d8 * ((float)s8 * (float)d * (float)dot - (float)m8 * (float)dm * (float)sx);
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+__global__ void __launch_bounds__(256) q5_k_q8_mmvq_v2_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * Q5KB;
+    const int npair = id >> 6;
+    const int nsub = id >> 5;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 2, c = u & 3;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * Q5KB;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const float dm = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+        const int s0 = 2 * c, s1 = 2 * c + 1;
+        uint8_t s8a, m8a, s8b, m8b;
+        get_scale_min_k4(s0, blk + 4, &s8a, &m8a);
+        get_scale_min_k4(s1, blk + 4, &s8b, &m8b);
+        const uint4 w0 = *reinterpret_cast<const uint4*>(blk + 48 + c * 32);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(blk + 48 + c * 32 + 16);
+        // the qh plane is 32 bytes SHARED by all 8 sub-blocks (byte l holds
+        // one high bit per sub for element l) — every chunk reads the same
+        // bytes, only the bit index (s0/s1) differs
+        const uint4 h0 = *reinterpret_cast<const uint4*>(blk + 16);
+        const uint4 h1 = *reinterpret_cast<const uint4*>(blk + 16 + 16);
+        const uint32_t ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const uint32_t hs[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8a = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s0)) * Q8PB;
+                const uint8_t* x8b = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s1)) * Q8PB;
+                const float d8a = h2f(*reinterpret_cast<const uint16_t*>(x8a));
+                const float d8b = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+                const uint32_t* xa = reinterpret_cast<const uint32_t*>(x8a + 4);
+                const uint32_t* xb = reinterpret_cast<const uint32_t*>(x8b + 4);
+                int dota = 0, sxa = 0, dotb = 0, sxb = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const uint32_t wv = ws[v];
+                    const uint32_t qhv = hs[v];
+                    const uint32_t hia = (((qhv >> s0) & 0x01010101u) << 4);
+                    const uint32_t hib = (((qhv >> s1) & 0x01010101u) << 4);
+                    const int xa_v = (int)xa[v], xb_v = (int)xb[v];
+                    dota = __dp4a((int)((wv & 0x0F0F0F0F) | hia), xa_v, dota);
+                    sxa  = __dp4a(0x01010101, xa_v, sxa);
+                    dotb = __dp4a((int)(((wv >> 4) & 0x0F0F0F0F) | hib), xb_v, dotb);
+                    sxb  = __dp4a(0x01010101, xb_v, sxb);
+                }
+                acc[t] += d8a * ((float)s8a * d * (float)dota - (float)m8a * dm * (float)sxa)
+                        + d8b * ((float)s8b * d * (float)dotb - (float)m8b * dm * (float)sxb);
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int blk_stride
+) {
+    const int row = blockIdx.x;
+    const int nbe = (id + 255) >> 8;
+    const int row_stride = nbe * blk_stride;
+    const int nsub = (id + 15) >> 4; // ceil — partial tail super-blocks excluded
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nsub; u += 256) {
+        const int blk_i = u >> 4, s = u & 15;
+        const int chunk = s >> 3, g = (s >> 1) & 3, is = s & 1;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)blk_i * blk_stride;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+        const float sc = (float)(int8_t)blk[192 + s];
+        const uint8_t* ql = blk + chunk * 64 + (g & 1) * 32 + is * 16;
+        const uint8_t* qh = blk + 128 + chunk * 32 + is * 16;
+        // the four 2-byte weight pairs are token-independent: dequant once
+        // per u, then dot against each token's q8 block
+        int vi[4];
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            const uint32_t wl = (uint32_t)*reinterpret_cast<const uint16_t*>(ql + 4 * v) |
+                                ((uint32_t)*reinterpret_cast<const uint16_t*>(ql + 4 * v + 2) << 16);
+            const uint32_t wh = (uint32_t)*reinterpret_cast<const uint16_t*>(qh + 4 * v) |
+                                ((uint32_t)*reinterpret_cast<const uint16_t*>(qh + 4 * v + 2) << 16);
+            const uint32_t nib = (g < 2) ? (wl & 0x0F0F0F0F) : ((wl >> 4) & 0x0F0F0F0F);
+            const uint32_t hi = ((wh >> (2 * g)) & 0x03030303) << 4;
+            // q6 nibble+high pair is 0..63; subtract 32 per byte (in-range,
+            // never saturates) to get the signed value for dp4a
+            vi[v] = __vsubss4((int)(nib | hi), 0x20202020);
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8 = acts8 + ((size_t)t * (size_t)(id >> 5) + (size_t)(u >> 1)) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4) + (u & 1) * 4;
+                int dot = 0;
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    dot = __dp4a(vi[v], (int)xw[v], dot);
+                }
+                acc[t] += d8 * sc * d * (float)dot;
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+__global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt, int blk_stride
+) {
+    const int row = blockIdx.x;
+    const int nbe = id >> 8;
+    const int row_stride = nbe * blk_stride;
+    const int npair = id >> 5;
+    const int nsub = id >> 5;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < npair; u += 256) {
+        const int kbx = u >> 3, pair = u & 7;
+        const int s0 = 2 * pair, s1 = 2 * pair + 1;
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)kbx * blk_stride;
+        const float d = h2f(*reinterpret_cast<const uint16_t*>(blk + 208));
+        const float sc0 = (float)(int8_t)blk[192 + s0];
+        const float sc1 = (float)(int8_t)blk[192 + s1];
+        // v1 mapping with s = 2*pair + half: chunk = s>>3 = pair>>2,
+        // g = (s>>1)&3 = pair&3, is = s&1 = half (the pair's two subs share
+        // chunk/g; only the 16-byte is-half differs)
+        const int chunk = pair >> 2, g = pair & 3;
+        // padded 224B stride ⇒ every ql/qh piece is 16B aligned
+        const uint4 qla = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32);
+        const uint4 qlb = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32 + 16);
+        const uint4 qha = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32);
+        const uint4 qhb = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32 + 16);
+        const uint32_t qls[8] = {qla.x, qla.y, qla.z, qla.w, qlb.x, qlb.y, qlb.z, qlb.w};
+        const uint32_t qhs[8] = {qha.x, qha.y, qha.z, qha.w, qhb.x, qhb.y, qhb.z, qhb.w};
+        const uint32_t shift = 2 * g;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < nt) {
+                const uint8_t* x8 = acts8 + ((size_t)t * nsub + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
+                int dot0 = 0, dot1 = 0;
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const uint32_t wl0 = qls[v], wl1 = qls[v + 4];
+                    const uint32_t wh0 = qhs[v], wh1 = qhs[v + 4];
+                    const uint32_t nib0 = (g < 2) ? (wl0 & 0x0F0F0F0F) : ((wl0 >> 4) & 0x0F0F0F0F);
+                    const uint32_t nib1 = (g < 2) ? (wl1 & 0x0F0F0F0F) : ((wl1 >> 4) & 0x0F0F0F0F);
+                    const uint32_t hi0 = ((wh0 >> shift) & 0x03030303) << 4;
+                    const uint32_t hi1 = ((wh1 >> shift) & 0x03030303) << 4;
+                    const int vi0 = __vsubss4((int)(nib0 | hi0), 0x20202020);
+                    const int vi1 = __vsubss4((int)(nib1 | hi1), 0x20202020);
+                    dot0 = __dp4a(vi0, (int)xw[v], dot0);
+                    dot1 = __dp4a(vi1, (int)xw[v + 4], dot1);
+                }
+                // textually identical to the v2 accumulation statement (same contraction)
+                acc[t] += d8 * sc0 * d * (float)dot0 + d8 * sc1 * d * (float)dot1;
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, nt);
+}
+
+// Launchers: one block per weight row (grid.x = od, grid.y = 1) — the
+// token loop is in-block, so the launch grid no longer multiplies weight
+// traffic by nt.
+extern "C" {
+void launch_q4_k_q8_mmvq_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q4_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q4_k_q8_mmvq_v2_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q4_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q5_k_q8_mmvq_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q5_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q5_k_q8_mmvq_v2_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q5_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+void launch_q6_k_q8_mmvq_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int blk_stride, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q6_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+}
+
+void launch_q6_k_q8_mmvq_v2_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, int blk_stride, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q6_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+}
+} // extern "C"

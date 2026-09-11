@@ -2039,18 +2039,47 @@ mod tests {
             ("q6_k padded matmul", o6p, &w6dq),
         ] {
             let got = cb.copy_to_host(o).unwrap();
+            // Step 82: at nt in [2, 8] the q4_K/q6_K arms dispatch to the
+            // multi-token MMVQ kernels, whose activations are the pad40 q8
+            // plane (f16 d + 2B pad + 32 i8 per 32-element block, per
+            // token) — the reference dots the dequantized q8 values, with
+            // the same 1e-2 relative tolerance the mmvq parity tests use
+            // for the kernel-side quantization rounding.
+            let mut x8 = vec![0u8; nt * (id_ / 32) * 40];
+            for t in 0..nt {
+                for blk in 0..id_ / 32 {
+                    let base = t * id_ + blk * 32;
+                    let mut am = 0f32;
+                    for j in 0..32 {
+                        am = am.max(xs[base + j].abs());
+                    }
+                    let dd = am / 127.0;
+                    let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                    let off = (t * (id_ / 32) + blk) * 40;
+                    x8[off..off + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                    for j in 0..32 {
+                        let q = (xs[base + j] * di).round().clamp(-128.0, 127.0) as i8;
+                        x8[off + 4 + j] = q as u8;
+                    }
+                }
+            }
+            let dq8 = |t: usize, i: usize| -> f32 {
+                let off = (t * (id_ / 32) + i / 32) * 40;
+                half::f16::from_le_bytes([x8[off], x8[off + 1]]).to_f32()
+                    * (x8[off + 4 + (i % 32)] as i8) as f32
+            };
             let mut want = vec![0f32; od * nt];
             for t in 0..nt {
                 for r in 0..od {
                     let mut acc = 0f32;
                     for i in 0..id_ {
-                        acc += dq[r * id_ + i] * xs[t * id_ + i];
+                        acc += dq[r * id_ + i] * dq8(t, i);
                     }
                     want[t * od + r] = acc;
                 }
             }
             let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
-            assert_close(name, &got, &want, scale * 2e-3);
+            assert_close(name, &got, &want, scale * 1e-2);
         }
 
         // F32 matmul (aligned + odd-id scalar path) vs the same reference rows
@@ -2831,6 +2860,223 @@ mod tests {
 
         // 4. unknown buffer id: refused
         assert!(!cb.capture_enq(9_999_999));
+    }
+
+    /// Step 82: multi-token matmul dispatch — for every quant type, one
+    /// nt = 3 batched forward must be BITWISE-equal to three nt = 1
+    /// forwards over the same weight bytes and the same per-token
+    /// activations. The Step 82 kernels (multi-token MMVQ for the
+    /// K-quants, in-block token loops for the legacy f32 kernels and the
+    /// 8c q8-GEMM) preserve the per-(row, token) op order by
+    /// construction; this test pins it. Shapes are chosen so the nt = 1
+    /// and nt = 3 paths share the kernel family:
+    ///   - q4_K id 3584 (3584 % 256 == 0 → v2 family) and id 3904
+    ///     (id % 256 != 0 → v1 family), both above the nt == 1 id >= 2048
+    ///     gate,
+    ///   - q5_K od·id >= 24M so nt == 1 rides MMVQ too (v2: id 3072,
+    ///     v1: id 3104),
+    ///   - q6_K od·id >= 4M (padded 224B registration → v2 family; raw
+    ///     210B → v1 family),
+    ///   - the legacy f32 kernels (q8_0 / q4_0 with id > 8192 so the 8c
+    ///     q8-GEMM gate is out / q4_1 / q5_0 / q5_1 / f32) run the same
+    ///     token-looped kernel at nt == 1 and nt == 3.
+    /// The 8c q4_0 × q8-GEMM arm (nt > 1, id <= 8192) has no nt == 1
+    /// sibling, so it is checked against an independent host dequant
+    /// reference with the standard q8-activation tolerance instead.
+    #[test]
+    fn cuda_multi_token_matmul_bitwise() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        let nt = 3usize;
+
+        fn gen_f32(n: usize, seed: u64) -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = ((s >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+                    let mag = if (s >> 60) & 7 == 0 { 1e-5 } else { 3.0 };
+                    (u as f32) * mag
+                })
+                .collect()
+        }
+
+        fn gen_bytes(n: usize, seed: u64) -> Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 33) as u8
+                })
+                .collect()
+        }
+
+        // (label, type, od, id, q6_padded). Weight-byte lengths per type:
+        // K-quants ceil(id/256) blocks per row (144/176/210 B), the rest
+        // id/32 blocks per row (18/20/22/24/34 B), f32 raw.
+        let cases: Vec<(&str, TensorType, usize, usize, bool)> = vec![
+            ("q4k_v2", TensorType::Q4_K, 2048, 3584, false),
+            ("q4k_v1", TensorType::Q4_K, 512, 3904, false),
+            ("q5k_v2", TensorType::Q5_K, 8192, 3072, false),
+            ("q5k_v1", TensorType::Q5_K, 8192, 3104, false),
+            ("q6k_padded", TensorType::Q6_K, 2048, 2048, true),
+            ("q6k_raw", TensorType::Q6_K, 2048, 2048, false),
+            ("q8_0", TensorType::Q8_0, 512, 2048, false),
+            ("q4_0_big", TensorType::Q4_0, 512, 9216, false),
+            ("q4_1", TensorType::Q4_1, 512, 2048, false),
+            ("q5_0", TensorType::Q5_0, 512, 2048, false),
+            ("q5_1", TensorType::Q5_1, 512, 2048, false),
+            ("f32", TensorType::F32, 512, 2048, false),
+        ];
+
+        for (i, (label, tt, od, id_, padded)) in cases.into_iter().enumerate() {
+            let nbe = (id_ + 255) / 256;
+            let row_bytes = match tt {
+                TensorType::Q4_K => nbe * 144,
+                TensorType::Q5_K => nbe * 176,
+                TensorType::Q6_K => nbe * 210,
+                TensorType::Q8_0 => (id_ / 32) * 34,
+                TensorType::Q4_0 => (id_ / 32) * 18,
+                TensorType::Q4_1 => (id_ / 32) * 20,
+                TensorType::Q5_0 => (id_ / 32) * 22,
+                TensorType::Q5_1 => (id_ / 32) * 24,
+                TensorType::F32 => id_ * 4,
+                other => panic!("unexpected type {other:?}"),
+            };
+            let wb = gen_bytes(od * row_bytes, 0x5EED_0000 + i as u64);
+            let xs = gen_f32(id_ * nt, 0xA11C_0000 + i as u64);
+
+            let wt_name = format!("wbit{i}");
+            let mut wt = Tensor::from_data(tt, &[id_ as i64, od as i64, 1, 1], wb.clone());
+            wt.name = wt_name.clone();
+            if tt == TensorType::Q6_K && padded {
+                cb.state.register_weight_q6k_padded(&wt_name, &wb, od, id_);
+            } else {
+                cb.state.register_weight(&wt_name, &wb);
+            }
+
+            // batched: one nt = 3 forward
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+            let m = b.matmul(x, &wt, None);
+            b.output(m);
+            let g = b.build();
+            let xb = cb.alloc_buffer(id_ * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let ob = cb.alloc_buffer(od * nt);
+            cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+            let got = cb.copy_to_host(ob).unwrap();
+
+            // reference: nt separate nt = 1 forwards over the same weights
+            let mut refs: Vec<Vec<f32>> = Vec::with_capacity(nt);
+            for t in 0..nt {
+                let mut b1 = GraphBuilder::new();
+                let x1 = b1.input("x1", [id_, 1, 1, 1], DType::F32);
+                let m1 = b1.matmul(x1, &wt, None);
+                b1.output(m1);
+                let g1 = b1.build();
+                let xb1 = cb.alloc_buffer(id_);
+                cb.write_host(xb1, &xs[t * id_..(t + 1) * id_]).unwrap();
+                let ob1 = cb.alloc_buffer(od);
+                cb.execute_node(&g1.nodes[m1], &[xb1], ob1, None).unwrap();
+                refs.push(cb.copy_to_host(ob1).unwrap());
+            }
+
+            for t in 0..nt {
+                for (r, (a, bref)) in got[t * od..(t + 1) * od]
+                    .iter()
+                    .zip(refs[t].iter())
+                    .enumerate()
+                {
+                    assert_eq!(
+                        a.to_bits(),
+                        bref.to_bits(),
+                        "{label} token {t} row {r}: batched nt={nt} vs single nt=1 mismatch"
+                    );
+                }
+            }
+        }
+
+        // ── 8c q4_0 × q8-GEMM arm (nt > 1, id <= 8192) — tolerance vs the
+        // independent host reference (dequant + the same q8 activation
+        // quantization the kernel applies), the cuda_kquant_matmul_parity
+        // method. The in-block token loop does not change per-token math.
+        {
+            let (od, id_) = (512usize, 2048usize);
+            let wb = gen_bytes(od * (id_ / 32) * 18, 0x5EED_00C0);
+            let xs = gen_f32(id_ * nt, 0xA11C_00C0);
+            let mut wt =
+                Tensor::from_data(TensorType::Q4_0, &[id_ as i64, od as i64, 1, 1], wb.clone());
+            wt.name = "w8c".to_string();
+            cb.state.register_weight("w8c", &wb);
+
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+            let m = b.matmul(x, &wt, None);
+            b.output(m);
+            let g = b.build();
+            let xb = cb.alloc_buffer(id_ * nt);
+            cb.write_host(xb, &xs).unwrap();
+            let ob = cb.alloc_buffer(od * nt);
+            cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+            let got = cb.copy_to_host(ob).unwrap();
+
+            // host reference: q4_0 dequant (val = (nib - 8) * d) dotted with
+            // the q8-quantized activations
+            let mut x8 = vec![0u8; nt * (id_ / 32) * 40];
+            for t in 0..nt {
+                for blk in 0..id_ / 32 {
+                    let base = t * id_ + blk * 32;
+                    let mut am = 0f32;
+                    for j in 0..32 {
+                        am = am.max(xs[base + j].abs());
+                    }
+                    let dd = am / 127.0;
+                    let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                    let off = (t * (id_ / 32) + blk) * 40;
+                    x8[off..off + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                    for j in 0..32 {
+                        let q = (xs[base + j] * di).round().clamp(-128.0, 127.0) as i8;
+                        x8[off + 4 + j] = q as u8;
+                    }
+                }
+            }
+            let dq8 = |t: usize, i: usize| -> f32 {
+                let off = (t * (id_ / 32) + i / 32) * 40;
+                half::f16::from_le_bytes([x8[off], x8[off + 1]]).to_f32()
+                    * (x8[off + 4 + (i % 32)] as i8) as f32
+            };
+            // The per-block contraction order mirrors the kernel (d applied
+            // per block); compare with the standard q8 tolerance.
+            let mut want = vec![0f32; od * nt];
+            let mut scale = 1e-9f32;
+            for t in 0..nt {
+                for r in 0..od {
+                    let mut acc = 0f32;
+                    for blk in 0..id_ / 32 {
+                        let blkb = &wb[(r * (id_ / 32) + blk) * 18..];
+                        let d = half::f16::from_le_bytes([blkb[0], blkb[1]]).to_f32();
+                        let mut sdot = 0f32;
+                        for j in 0..16 {
+                            let b0 = blkb[2 + j];
+                            sdot += ((b0 & 0x0F) as f32 - 8.0) * dq8(t, blk * 32 + j)
+                                + ((b0 >> 4) as f32 - 8.0) * dq8(t, blk * 32 + 16 + j);
+                        }
+                        acc += d * sdot;
+                    }
+                    want[t * od + r] = acc;
+                    scale = scale.max(acc.abs());
+                }
+            }
+            assert_close("q4_0 8c multi-token", &got, &want, scale * 1e-2);
+        }
     }
 
     #[test]
@@ -5261,6 +5507,33 @@ mod tests {
             let xs: Vec<f32> = (0..id * nt)
                 .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
                 .collect();
+            // Step 82: nt = 3 dispatches Q5_K to the multi-token MMVQ
+            // kernel (weights-once; the 24M nt == 1 crossover does not
+            // apply in-block) — the reference dots the pad40 q8 activation
+            // round-trip, tolerance as in the mmvq parity tests.
+            let mut x8 = vec![0u8; nt * (id / 32) * 40];
+            for t in 0..nt {
+                for blk in 0..id / 32 {
+                    let base = t * id + blk * 32;
+                    let mut am = 0f32;
+                    for j in 0..32 {
+                        am = am.max(xs[base + j].abs());
+                    }
+                    let dd = am / 127.0;
+                    let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                    let off = (t * (id / 32) + blk) * 40;
+                    x8[off..off + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                    for j in 0..32 {
+                        let q = (xs[base + j] * di).round().clamp(-128.0, 127.0) as i8;
+                        x8[off + 4 + j] = q as u8;
+                    }
+                }
+            }
+            let dq8 = |t: usize, i: usize| -> f32 {
+                let off = (t * (id / 32) + i / 32) * 40;
+                half::f16::from_le_bytes([x8[off], x8[off + 1]]).to_f32()
+                    * (x8[off + 4 + (i % 32)] as i8) as f32
+            };
             let xb = cb.alloc_buffer(id * nt);
             let out = cb.alloc_buffer(od * nt);
             cb.write_host(xb, &xs).unwrap();
@@ -5306,17 +5579,25 @@ mod tests {
                 }
                 outv
             };
+            let mut wants = vec![0f32; od * nt];
             for t in 0..nt {
                 for r in 0..od {
                     let dq = deq(r);
                     let mut want = 0f32;
                     for i in 0..id {
-                        want += dq[i] * xs[t * id + i];
+                        want += dq[i] * dq8(t, i);
                     }
+                    wants[t * od + r] = want;
+                }
+            }
+            let scale = wants.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
+            for t in 0..nt {
+                for r in 0..od {
                     assert!(
-                        (got[t * od + r] - want).abs() < 5e-3,
-                        "q5_K [{t}][{r}] {} vs {want}",
-                        got[t * od + r]
+                        (got[t * od + r] - wants[t * od + r]).abs() < scale * 1e-2,
+                        "q5_K [{t}][{r}] {} vs {}",
+                        got[t * od + r],
+                        wants[t * od + r]
                     );
                 }
             }

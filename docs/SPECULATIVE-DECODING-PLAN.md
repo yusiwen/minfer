@@ -14,6 +14,14 @@ padding caps below break-even. Per the stop rule pre-registered in D5-0 and
 `Speculator` trait, KV rollback, or loop plumbing will be built. The rest of
 this document is kept as the record of what was planned.
 
+Postscript (2026-09-11): the underlying dispatch hole was **fixed separately**
+in [step doc 82](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md) —
+multi-token MMVQ + token-looped legacy kernels restore the batching invariant
+(7B nt=3 105.9 → 29.4 ms, 3.60×; marginal 34.4 → 4.3 ms/token) for the small-M
+prefill tax and future multi-token features. The D5 verdict is unchanged:
+C_T(3)=29.4 ms still exceeds the 22.1 ms the speculative economics required,
+and the llama.cpp external reference (1.00×) stands.
+
 The reference study is [`LLAMA-CPP-SPECULATIVE-ANALYSIS.md`](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
 (llama.cpp `draft-simple`, source-verified: speculator framework §3, draft
 model setup §4, drafting loop §5, verification §6, KV rollback §7, cost model

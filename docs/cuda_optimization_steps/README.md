@@ -124,6 +124,7 @@ The writing contract is in [STYLE.md](STYLE.md).
 | 76 | [d4-4-dpl-q6k-final](76-d4-4-dpl-q6k-final.md) | D4-4: dpl dense split-plane q6_K (+5.5/+4.3%, +7.7/+8.1%); PDL/fused-FFN closed | 🟢 |
 | 80 | [d5-0-cost-model](80-d5-0-cost-model.md) | D5-0: the speculative-decoding gate — measured costs + acceptance p≈0.68–0.70; conditional go at d=2, gate = nt=3 verify amortization ≥ 2.5× | 📏 |
 | 81 | [d5-1a-verify-gate-measured](81-d5-1a-verify-gate-measured.md) | D5-1a: the gate measured end-to-end (`specverify` instrument) — C_T(3)=106 ms, per-token amortization 0.52× vs ≥2.5× required; nt=2–8 batched path costs a flat ~35 ms/token (no regime anywhere), real tile step only at M≥16 → **D5 CLOSED** by the pre-registered stop rule; external check: llama-cli `-md` (same pair) lands at 0.99–1.00× | 🔴 |
+| 82 | [small-m-multi-token-mmvq](82-small-m-multi-token-mmvq.md) | small-M dispatch fix: multi-token MMVQ + token-looped legacy kernels — 7B nt=3 105.9→29.4 ms (3.60×), nt=8 5.75×, marginal 34.4→4.3 ms/token; bitwise batched-vs-serial on all 8 quants; pre-registered 2.5× bar missed at 1.87× (cost-model error recorded); D5 verdict unchanged | 🟢 |
 
 ## Part VI · Methodology
 
