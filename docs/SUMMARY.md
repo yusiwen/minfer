@@ -9,6 +9,11 @@
 - [Usage](./USAGE.md)
 - [Support Matrix](./SUPPORT-MATRIX.md)
 
+# Architecture
+
+- [Architecture Overview](./ARCHITECTURE.md)
+- [Roadmap](./ARCHITECTURE-ROADMAP.md)
+
 # Inference E2E Walkthrough
 
 - [Overview & Index](./inference_e2e_walkthrough/README.md)
@@ -31,11 +36,6 @@
     - [13 — The decode loop and graph reuse](./inference_e2e_walkthrough/13-decode-loop-graph-reuse.md)
     - [14 — The Metal backend](./inference_e2e_walkthrough/14-metal-backend.md)
     - [15 — The CUDA backend](./inference_e2e_walkthrough/15-cuda-backend.md)
-
-# Architecture
-
-- [Architecture Overview](./ARCHITECTURE.md)
-- [Roadmap](./ARCHITECTURE-ROADMAP.md)
 
 # Compute Graph
 
