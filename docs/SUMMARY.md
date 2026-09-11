@@ -9,6 +9,29 @@
 - [Usage](./USAGE.md)
 - [Support Matrix](./SUPPORT-MATRIX.md)
 
+# Inference E2E Walkthrough
+
+- [Overview & Index](./inference_e2e_walkthrough/README.md)
+- [Part I — From CLI to weights (01–04)]()
+    - [01 — CLI args and model resolution](./inference_e2e_walkthrough/01-cli-args-model-resolution.md)
+    - [02 — GGUF load](./inference_e2e_walkthrough/02-gguf-load.md)
+    - [03 — Model dispatch and weights](./inference_e2e_walkthrough/03-model-dispatch-weights.md)
+    - [04 — Tokenizer and chat template](./inference_e2e_walkthrough/04-tokenizer-template.md)
+- [Part II — Building the compute graph (05–08)]()
+    - [05 — Graph build: the IR and the builder](./inference_e2e_walkthrough/05-graph-builder-ir.md)
+    - [06 — Backend assignment and fusion](./inference_e2e_walkthrough/06-assign-fusion.md)
+    - [07 — Memory allocation: liveness and the KV regions](./inference_e2e_walkthrough/07-allocator-liveness-kv.md)
+    - [08 — The scheduler: splits, copies, execution](./inference_e2e_walkthrough/08-scheduler-execute.md)
+- [Part III — Executing a forward (09–12)]()
+    - [09 — Prefill: the first forward](./inference_e2e_walkthrough/09-prefill-forward-path.md)
+    - [10 — CPU matmul: quantized weights × Q8_0 activations](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md)
+    - [11 — Attention, vec ops, and the KV cache](./inference_e2e_walkthrough/11-attention-vecops-kv.md)
+    - [12 — The sampler: from logits to a token](./inference_e2e_walkthrough/12-sampler.md)
+- [Part IV — The decode loop and the GPUs (13–15)]()
+    - [13 — The decode loop and graph reuse](./inference_e2e_walkthrough/13-decode-loop-graph-reuse.md)
+    - [14 — The Metal backend](./inference_e2e_walkthrough/14-metal-backend.md)
+    - [15 — The CUDA backend](./inference_e2e_walkthrough/15-cuda-backend.md)
+
 # Architecture
 
 - [Architecture Overview](./ARCHITECTURE.md)
