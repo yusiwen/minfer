@@ -115,11 +115,6 @@
     - [D4-4 — the endgame kernel session: dpl dense split-plane q6_K decode MMVQ lands (bitwise); PDL and fused-FFN closed with mechanism (LANDED)](./cuda_optimization_steps/76-d4-4-dpl-q6k-final.md)
     - [D5-0 — speculative-decoding cost model: measured baseline, acceptance, and the d=2 gate (MEAS-ONLY)](./cuda_optimization_steps/80-d5-0-cost-model.md)
 
-# CUDA Reference
-
-- [Technology Primer — every CUDA/GPU technique minfer uses, explained](./CUDA-TECH-PRIMER.md)
-- [Glossary — every term/formula in the campaign docs, classified into 7 layers](./GLOSSARY.md)
-
 # Speculative Decoding (D5)
 
 - [Plan — scope, mechanism, touch points, phases, risks](./SPECULATIVE-DECODING-PLAN.md)
@@ -136,6 +131,9 @@
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)
 - [Qwen3-4B perf vs llama.cpp](./PERF-QWEN3-4B-VS-LLAMACPP.md)
+- [Technology Primer — every CUDA/GPU technique minfer uses, explained](./CUDA-TECH-PRIMER.md)
+- [Glossary — every term/formula in the campaign docs, classified into 7 layers](./GLOSSARY.md)
+- [llama.cpp Metal (MPS) End-to-End Inference Path ](./LLAMA_METAL_E2E.md)
 - [llama.cpp Compute Graph](./LLAMA-COMPUTE-GRAPH.md)
 - [llama.cpp MMQ Analysis](./LLAMA-CPP-MMQ-ANALYSIS.md)
 - [llama.cpp Speculative Decoding Analysis](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
