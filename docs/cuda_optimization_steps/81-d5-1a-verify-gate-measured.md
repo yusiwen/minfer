@@ -173,6 +173,13 @@ slightly negative). Two conclusions:
   even starts (the 0.52× graph-level gate) — the dispatch fix remains
   worthwhile for any future multi-token feature, just not for D5.
 
+The llama.cpp-side mechanism behind the reference numbers — the quantized
+`mul_mat` dispatch chain (MMVQ for ne11 ≤ 8 with tokens-in-registers, MMQ
+for ne11 ≥ 9 with M-tiles floored at 8; "M never enters the grid as a
+weight-multiplier dimension") and the point-by-point contrast with minfer's
+`grid(od/4, nt)` hole — is documented in
+[`LLAMA-CPP-MMQ-ANALYSIS.md` §12](../LLAMA-CPP-MMQ-ANALYSIS.md).
+
 ## 5. Lessons
 
 - **The gate did its job — 90 minutes of measurement against days of

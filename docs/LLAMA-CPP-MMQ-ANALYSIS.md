@@ -39,7 +39,10 @@ kernel family is the entry point (mmq.cuh:952-1237).
 in the supported switch (mmq.cu:277). The decisive rule on NVIDIA is **Turing+**: `if
 (turing_mma_available(cc)) return true;` (mmq.cu:312-314) — i.e. on GB10 (Blackwell, sm_121;
 `turing_mma_available` = NVIDIA && highest-compiled-arch ≥ Turing, common.cuh:348-350) MMQ is
-chosen **unconditionally** for every supported quantized type, for any batch size. So the
+chosen **unconditionally** for every supported quantized type, for any batch size. (Unconditionally
+*for the MMQ-vs-cuBLAS question* — the `ggml_cuda_mul_mat` chain upstream asks MMVQ first for
+ne11 ≤ 8, so small batches never reach this predicate; see §12 for the full chain and the MMVQ
+kernel structure.) So the
 "prefill threshold" framing is an AMD-only idea: the `ne11 < MMQ_DP4A_MAX_BATCH_SIZE (=64)` gate
 (mmq.cu:327, constant at mmq.cuh:8) sits **inside the NVIDIA-only branch** (`if
 (GGML_CUDA_CC_IS_NVIDIA(cc))`, mmq.cu:326-328) and applies only when `turing_mma_available` is
@@ -722,3 +725,103 @@ Anchors for older cross-references: former §11.8 = r28 Phase-2 outcome,
 (§11.1–§11.7) keeps the Direction-A design: tile geometry, warp shape, staging
 plan, numerics, risk table, gate plan, and kill criteria.
 
+
+## 12. The other side of the dispatch — MMVQ and the small-M chain
+
+Recorded after step doc 81 (2026-09-10). Doc 81 measured minfer's batched
+verify step at 0.52× per-token amortization — nt=2–15 falls into a legacy
+kernel whose grid is `grid(od/4, nt)`, i.e. one full weight re-stream per
+token at ~125 GB/s — and closed the D5 campaign. The external reference
+(doc 81 §4.1) showed llama.cpp landing at 1.00× on the same pair. The
+mechanism behind both numbers is the dispatch chain **upstream** of MMQ,
+which §1 does not cover: on small batch sizes llama.cpp never reaches the
+`should_use_mmq` question, because MMVQ answers first — and the MMVQ
+kernel's structure makes weight traffic independent of M.
+
+### 12.1 The full quantized mul_mat dispatch chain — no hole
+
+`ggml_cuda_mul_mat` (ggml-cuda.cu:1836–1872) dispatches quantized weights in
+this order:
+
+1. **MMVF** — `should_use_mmvf` (ggml-cuda.cu:1840): f16-activation vector
+   kernel over thin matrices / small batches (GGML types without quant
+   vec-dot support);
+2. **MMF** — `should_use_mmf` (ggml-cuda.cu:1860): f32/f16 GEMV for small
+   batches on f16/f32 weights;
+3. **MMVQ** — `should_use_mmvq` (ggml-cuda.cu:1864, impl mmvq.cu:318): the
+   quantized vector kernel, gate `MMVQ_MAX_BATCH_SIZE = 8` (mmvq.cuh:3),
+   **with per-arch tuned threshold tables** (mmvq.cu:320–361):
+   - Ada / RTX 4090: Q2_K ≤ 4, Q3_K ≤ 6, everything else ≤ 8;
+   - Blackwell / RTX 5090: Q2_K–Q4_K ≤ 5, Q5_K ≤ 6, Q6_K ≤ 7;
+   - **DGX Spark GB10** (mmvq.cu:348–355, "tuned on DGX Spark GB10"):
+     Q2_K ≤ 6, everything else ≤ 8 — the reference tunes the 2–8 window
+     per chip; it never leaves it unhandled;
+4. **MMQ** — `should_use_mmq` (ggml-cuda.cu:1868, impl mmq.cu:259): Turing+
+   mma → true for **any** ne11 (§1);
+5. cuBLAS — only for types MMQ does not support.
+
+So every M has a dedicated kernel: 1–8 → MMVQ, 9–∞ → MMQ. minfer's hole
+(nt=2–15 → legacy `*_f32_matmul`, from the `nt >= 16` tiled-GEMM gate at
+`src/cuda.rs:2494` and the `nt == 1` MMVQ gates, e.g. `src/cuda.rs:2572`)
+is exactly the seam between two tuned regimes that this chain does not
+have.
+
+### 12.2 The MMVQ kernel — M lives in registers, not in the grid
+
+`mul_mat_vec_q` (mmvq.cu:585). The launch grid is
+`(od_rows / rows_per_cuda_block, channel, sample)` — **ne11 is not a grid
+dimension** (`rows_per_cuda_block` comes from the per-arch MMVQ parameter
+table, `calc_rows_per_block`, mmvq.cu:563, 602). Each block owns a few
+weight rows, streams each weight block ONCE per K-iteration, and dots it
+against ALL M tokens:
+
+```c
+float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};   // mmvq.cu:693
+for (int kbx = ...; kbx < blocks_per_row_x; kbx += blocks_per_iter) {  // K loop
+    ...                                                  // weight block loads
+    for (int j = 0; j < ncols_dst; ++j) {                // mmvq.cu:724 — ALL M tokens
+        for (int i = 0; i < rows_per_cuda_block; ++i)
+            tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], ...);
+```
+
+The kernel is template-instantiated per `c_ncols_dst` = 1…8; the M token
+activations are register/L1-resident, so DRAM weight traffic equals the
+nt=1 case **by construction**. GB10 even has a dedicated L2-prefetch branch
+inside this K loop (`__CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK`,
+mmvq.cu:704–723, `mmvq_prefetch_l2` at distance 2 K-iterations).
+
+### 12.3 MMQ at small M — the M-tile floors at 8
+
+For ne11 above the MMVQ gate, MMQ's M-tile J is selected by
+`ggml_cuda_mmq_get_J_max` (mmq.cuh:366–374): the largest per-arch
+configured tile ≤ ne11, stepping down in multiples of 8 (J ≤ 512, config
+tables `mmq-config-*.cuh`). M=9–15 runs as a partial J=8 tile sweep —
+weights still stream once; an under-filled tile costs compute, not
+bandwidth. (Tile I/J semantics: §2.)
+
+### 12.4 The invariant, and the contrast with minfer
+
+Design invariant: **M never appears in the launch grid as a dimension that
+multiplies weight traffic** — it is either a register loop (MMVQ, ≤8) or a
+tiled dimension with partial-tile masking (MMQ, ≥9). minfer's legacy
+kernel violates it — `launch_q4_k_f32_matmul`
+(src/cuda_kernels.cu:3515–3522): `dim3 grid((od + NR0*NSG - 1)/(NR0*NSG),
+nt, 1)`, grid.y = nt, one full weight pass per token, on a 64-thread
+f32-dequantizing kernel at ~125 GB/s (vs the MMVQ path's ~238 GB/s). That
+is the measured 34.9 ms/token linear regime of doc 81 §4 (4.36 GiB /
+125 GB/s ≈ 34.9 ms), and the 14× gap at nt=8 (277.5 ms vs ≈ 18–20 ms
+weights-once):
+
+| nt | llama.cpp path | weight passes | minfer path | weight passes |
+|---|---|---|---|---|
+| 1 | MMVQ | 1 | MMVQ (`nt == 1` gate) | 1 |
+| 2–8 | MMVQ (tokens in registers) | 1 | legacy f32 kernel | **nt** |
+| 9–15 | MMQ (partial J=8 tiles) | 1 | legacy f32 kernel | **nt** |
+| ≥ 16 | MMQ | 1 | tiled MMQ GEMM | 1 |
+
+Fix shape for minfer (a future-feature fix, not a D5 revival — doc 81 §5):
+lift the MMVQ `nt == 1` gate to `nt <= 8` (the register-loop structure
+extends directly; the activations of 8 tokens are 8·id/32 q8 blocks ≈
+negligible), or let the tiled GEMM accept nt < 16 with partial-tile
+masking. Either restores the weights-once invariant; §11's Direction-A
+raw-nibble kernel would also close it if it ever lands.

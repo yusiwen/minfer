@@ -424,6 +424,18 @@ per-position acceptance rates — the practical knob is `n_max`: beyond the posi
 per-position acceptance rate collapses, drafted tokens only cost decode steps (also
 benchmarked cheaply via synthetic acceptance, §10).
 
+**Postscript (2026-09-10, after step doc 81).** The "one batched decode ≈ prefill-like
+efficiency" assumption in the table above is *dispatch-dependent*, not a law. Measured on GB10
+with the same 7B-target/0.5B-draft pair: llama.cpp's own `speculative-simple` nets **1.00×**
+end-to-end (the draft cost eats the whole gain at real acceptance p≈0.69 — the efficiency
+ceiling holds, the win does not), while minfer's batched path is *not* prefill-like at
+nt=2–15 (legacy kernel, one weight re-stream per token → per-token amortization 0.52×) and
+would have lost 2× before drafting even started. The mechanism on both sides — llama.cpp's
+MMVQ≤8/MMQ≥9 chain vs minfer's `grid(od/4, nt)` hole — is recorded in
+[`LLAMA-CPP-MMQ-ANALYSIS.md` §12](./LLAMA-CPP-MMQ-ANALYSIS.md); the measurements are step doc
+81. Consequence: minfer's D5 campaign is closed by measurement; a future multi-token feature
+would first need the small-M dispatch fix.
+
 ## 10. Observability & benchmarking hooks
 
 - **Stats**: impl-level counters printed by `common_speculative_print_stats`
