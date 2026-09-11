@@ -20,7 +20,7 @@ For "where / how is X implemented", prefer [ccc](https://cocoindex.io/cocoindex-
 src/
 ├── main.rs          # CLI + inference loop (prefill → autoregressive decode)
 ├── graph/           # ★ compute graph — the inference core (files below)
-├── gguf.rs          # GGUF v3 parser (~1650 lines, largest file)
+├── gguf.rs          # GGUF v3 parser (~2100 lines, largest file)
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization
 ├── kernel.rs        # quantized matmul dispatch + CPU scalar fallbacks
@@ -113,6 +113,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Topic | Where |
 |---|---|
 | Architecture design (module map, pipeline, adding an arch) | `docs/ARCHITECTURE.md` |
+| **End-to-end inference walkthrough (15-doc beginner series: CLI → GGUF → graph → kernels → backends)** | `docs/inference_e2e_walkthrough/` (index: `README.md`) |
 | Compute graph design + implementation record | `docs/GRAPH-REFACTOR-PLAN.md` |
 | llama.cpp compute-graph analysis | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal optimization plans / gap analysis | `docs/METAL_OPTIMIZATIONS.md` |

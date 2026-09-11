@@ -179,7 +179,11 @@ assign_backends → fuse → alloc_graph → execute
 2. **fuse** — pattern matching (`Mul(Silu(X),Y) → SwiGLU`, `RoPE(Add(X,B)) →
    FusedBiasRope`) gated per backend by `supports_fused` (no double-fusion with
    hand-written kernels). BatchMatMul is deferred (single-output IR limitation,
-   plan §17.10).
+   plan §17.10). Note: the `FusedBiasRope` rule is currently **dormant** — the
+   pattern exists in `fusion.rs` but no backend accepts `FusedBiasRope` in
+   `supports_fused` (Metal only accepts `SwiGLU`/`QKVBiasRopeStore`,
+   `metal_backend.rs:289`); decode instead uses the strictly stronger
+   `QKVBiasRopeStore` fusion, which subsumes the bias+rope part.
 3. **alloc_graph** — per-backend liveness allocator: buffers shared between
    nodes whose live ranges don't overlap; **persistent per-layer KV regions**
    survive rebuilds; in-place ops alias their input buffer (see §4.5).
