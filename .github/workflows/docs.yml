@@ -28,8 +28,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned to 0.4.37 — the same version nixpkgs 24.05 ships in the local
+      # devShell. mdbook 0.5 changed the preprocessor input protocol, and
+      # mdbook-mermaid 0.13.0 (below) only understands the 0.4.x format
+      # ("Unable to parse the input" otherwise).
       - name: Install mdBook
-        uses: taiki-e/install-action@mdbook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.4.37
       # Mermaid preprocessor (book.toml [preprocessor.mermaid]); pinned to
       # 0.13.0 — the same version nixpkgs 24.05 ships in the devShell, so
       # local and CI builds preprocess identically. The JS assets are
