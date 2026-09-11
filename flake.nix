@@ -58,6 +58,7 @@
           pkgs.uv
           pkgs.libiconv
           pkgs.mdbook
+          pkgs.mdbook-mermaid
         ];
         # The rusty-hook pre-commit (cargo fmt + re-stage) was removed; the
         # git hook is now provided by git-hooks.nix as a rustfmt --check gate.

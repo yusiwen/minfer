@@ -12,3 +12,9 @@ build-dir = "book"
 default-theme = "dark"
 preferred-dark-theme = "dark"
 git-repository-url = "https://github.com/yusiwen/minfer"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
