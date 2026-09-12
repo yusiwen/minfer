@@ -1,6 +1,6 @@
 # Speculative Decoding (D5-R) — Plan
 
-Status: **D5-R stage ① LANDED (2026-09-12, doc 83: 14B d=2 = 1.34×/1.58× prose/code) — stage ② next.**
+Status: **D5-R stages ①+② LANDED (2026-09-12, docs 83–84: 14B d=2 = 1.33×/1.59×, same-window vs llama 1.64×/2.08×) — stage ③ (ncu verify-marginal attribution) next.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
@@ -105,7 +105,7 @@ Deliberately smaller than the retired plan's machinery:
 | Stage | Work | Gate |
 |---|---|---|
 | ① d=2 loop (greedy) — **LANDED 2026-09-12, doc 83** | `src/spec.rs` + CLI wiring | **G1 (re-scoped by measurement)**: (a) accept-rule unit tests with synthetic logits; (b) d=0 fallback == non-spec path to one exact-tie flap (buffer-placement numerics, any draft quant); (c) self-draft divergences attributed to near-ties (first-flap margin 0.043). Batched-verify (nt=d+1 Prefill graph) vs nt=1 decode kernels differ ~0.01–0.05 logits — same rule-9 class; exact identity returns only with nt-invariant accumulation (stage ④ candidate). **G2**: 179 tests green; off-path untouched. **G3**: per-round stats on stderr |
-| ② end-to-end battery | 14B+0.5B d=2, same-window A/B vs spec-off; llama measured 1.86× as the reference | t/s ≥ **1.2×** (predicted 1.34×); below that, profile before optimizing |
+| ② end-to-end battery — **LANDED 2026-09-12, doc 84** | same-window dual-engine protocol (3 reps × prose/code × 4 cells) | **1.33×/1.59× ≥ 1.2× PASS**; llama same-window 1.64×/2.08×; gap fully priced: verify row marginal 8.8 vs 2.5 ms/row → 1.62× recoverable |
 | ③ verify-marginal attribution | ncu on the nt=3 and nt=9 rounds: nt=9 GEMM M-pad waste (doc 82 multi-MMVQ caps at nt≤8), dp4a utilization, attention query-tiling (KV read once per nt rows vs per row), logits/sampling | one session; a cost ledger with per-item ms |
 | ④ kernel attack | per ③'s ledger: multi-MMVQ extended to nt=9–16 (16-lane accumulators) and/or small-M GEMM tiles; graph capture for the fixed verify shapes (kills the +1.2 ms eager round overhead) | marginal 7.8 → ≤2.5 ms/tok (14B), then → ~1.5 |
 | ⑤ d=8 + tuning | re-measure the d=8 economics; adaptive d (truncate at acceptance collapse); stretch: ngram | d=8 ≥ 1.5× end-to-end (14B) |

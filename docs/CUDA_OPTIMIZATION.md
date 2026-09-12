@@ -154,6 +154,8 @@ Chapters in §2 follow this table row by row.
 | D5-0 | Speculative-decoding cost model (gate, no engine change): measured per-token costs (7B q4_k_m CUDA **54.3** tok/s; 0.5B q4_0 CUDA **342.2** / CPU **73.3**; q4_k_m 365.0; q5_k_m 321.8) + real greedy acceptance via llama.cpp `speculative-simple` (0.5B-on-7B: aggregate 58.8/42.6/25.0% at d=2/4/8 → conditional **p ≈ 0.68–0.70**, stable across prose/code and draft quant) → break-even requires p\* = 0.73/0.81/0.90 at d=2/4/8 → **conditional go at d=2 only**, gate = minfer measured nt=3 verify-batch amortization **≥ 2.5×** (D4-1 anchor 2.7× at nt=4; interpolation 2.28× vs tile-step 2.7× disagree — D5-1 re-ordered primitive-first to measure); projected 1.04–1.05× at the anchor, ceiling ~1.2×; CPU-draft cross-device dead (1.35×) | docs commit | battery: 3× interleaved `-p 0 -n 128` medians; acceptance n=256 greedy, prose+code | — | — | MEAS-ONLY (gate open) | measure the gate variable with someone else's binary; the cross-device fallback died by measurement not argument; interpolation is not measurement — nt=3 lands either side of the 2.5× line and only `C_T(3)` arbitrates |
 | D5-1a | The gate measured end-to-end — **FAILED, D5 closed**: new `minfer specverify` instrument (`src/spec_verify.rs`; fixed-depth protocol, warmups absorb the graph rebuild, two-pass drift check) drives the generic `forward_graph_cached` at nt>1/n_out=nt; 7B q4_k_m CUDA @KV512: C_T(1)=18.33 ms, **C_T(3)=106.0 ms → per-token amortization 0.52×** vs ≥2.5× (needed C_T(3) ≤ 22.1 ms). Full curve: nt=2–8 costs a flat **~35 ms/token** (batched path re-streams weights per row — 1.9× worse per token than the nt=1 MMVQ path; zero amortization anywhere), the real tile-regime step sits at **M≥16** (nt=16 = 56.7 ms total, 3.1× the weight floor; nt=64 = 64.9 ms) — unreachable for verify (nt=d+1 ≤ 9), and even padding nt=3→16 caps at 0.97×. Five probes eliminated alternatives (graph-launch asymmetry, KV depth, FA kernel, n_out path, drift). The D4-1 2.7×@nt=4 anchor was a kernel micro-bench that never existed at graph level | this commit + docs addendum | medians of 15–40 reps × 2 passes, ±2% spread; probes + llama-cli battery in doc 81 | gate FAIL 4.8× (0.52× vs 2.5×); external check: llama-cli `-md` same pair lands 0.99–1.00× (doc 81 §4.1) — **VOID, see doc 81 §4.3 errata: the battery never engaged the draft (missing `--spec-type`); corrected = 1.53–2.43×** | — | see D5-1a | **LANDED** (instrument) · **D5 CLOSED** per the pre-registered stop rule | kernel micro-benchmarks are not engine facts — anchors must be measured at the level they are consumed; a batched path that re-streams weights per row is worse than no batching; the strategy itself has no headroom on GB10 (llama.cpp also lands at 1.00×) — the dispatch fix matters only for future multi-token features |
 | 82 | small-M dispatch fix: multi-token MMVQ (K-quants, nt 2–8, in-block token loop) + token-looped legacy kernels (grid.y=nt removed) + GEMM gate 16→9 | this commit | 7B batched decode nt=3 105.9 → 29.4 ms (**3.60×**), nt=8 279.3 → 48.6 ms (**5.75×**); marginal 34.4 → 4.3 ms/token; nt=1 paths bitwise-unchanged (tg128/pp512 clean) | — | — | LANDED | the pre-registered 2.5× amortization bar was mis-derived (marginal ≈ nt×(attention+compute), not ε) — measured 1.87×; weight traffic is nt-independent now, D5 stays closed (C_T(3)=29.4 > 22.1); small models gain ~1.0× only (per-layer weights already L2-buffered) |
+| D5-R ① | speculative loop LANDED (reopen per doc 81 §4.3 + doc 82): `src/spec.rs` SpecEngine — d×nt==1 draft forwards + one nt=d+1 verify through `forward_graph_cached`, lazy accept loop (unit-tested), full-accept draft-KV repair, CLI `--spec-draft/--spec-draft-n`; two-model process fixes: namespaced GPU weight registries (`load_model_ns`), `nb_bt_only` global-mix semantics (q4_0 draft degrades mode-2→mode-1) | this commit + doc 83 | 14B+0.5B q4_0 d=2 greedy n=128: **34.0/40.6 tok/s = 1.34×/1.58×** vs serial 25.5/25.5; 7B 1.18×; suite 179 green | G1 re-scoped by measurement: batched-verify vs decode kernels differ ~0.01–0.05 logits → near-tie flaps only (first-flap margin 0.043); d=0 fallback == non-spec to one exact-tie flap | — | LANDED | "single-model-per-process" was load-bearing in three places (registry, dispatch flags, prewarm); all-or-nothing CUDA failure is silent CPU — watch tok/s, not errors; greedy equivalence across kernel paths is a numerics statement, not a logic statement |
+| D5-R ② | same-window dual-engine battery: 3 interleaved reps × prose/code × 4 cells (minfer off/d2 × llama base/d2), doc 81 §4.3 protocol | this commit + doc 84 | minfer **1.33×/1.59×** (34.0/40.6) vs llama **1.64×/2.08×** (38.8/49.0) in one window; minfer = 88%/83% of llama's absolute spec speed; gate ≥1.2× PASS | — | — | LANDED | same-window interleaving beats rep count (llama's spec cell moved 13% between windows, base <1%); the whole gap to llama is the verify row marginal (minfer 8.8 vs llama 2.5 ms/row) — closing it prices at 1.62×; acceptance prose 51.6% (near-tie dilution) / code 73.1% |
 
 **Footnotes.**
 
@@ -265,13 +267,15 @@ All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
 
 ### 1.4 Remaining roadmap (post-campaign)
 
-- **D5 speculative decoding — CLOSED by measurement (doc 81)**: the D5-0
-  conditional go rested on the nt=3 verify amortization ≥ 2.5×; the D5-1a
-  end-to-end measurement (`minfer specverify`) returned 0.52× — the nt=2–8
-  batched path re-streams weights per row (~35 ms/token flat) and the real
-  tile-regime step only starts at M≥16, unreachable for verify. Stop rule
-  pre-registered in D5-0 triggered; plan kept as record in
-  [`SPECULATIVE-DECODING-PLAN.md`](./SPECULATIVE-DECODING-PLAN.md).
+- **D5 speculative decoding — CLOSED 2026-09-10, REOPENED as D5-R 2026-09-12
+  (docs 81 §4.3, 82, 83, 84)**: the original closure's bar was mis-derived
+  and its llama-cli anchor was a measurement artifact (`--spec-type`
+  silently defaults to none); doc 82's small-M dispatch fix made the verify
+  amortization 2.14×. D5-R stage ① landed the loop (1.34×/1.58× at 14B d=2),
+  stage ② priced the gap to llama (verify row marginal 8.8 vs 2.5 ms/row →
+  1.62× recoverable). Current plan:
+  [`SPECULATIVE-DECODING-PLAN.md`](./SPECULATIVE-DECODING-PLAN.md) (the old
+  plan is an appendix there).
 - **Not planned** (revisit with a concrete need): cuBLAS/cublasLt (closed as
   8k — 8m's wmma GEMM covered the f16 path), VMM pool, multi-GPU, node
   reordering, Windows, IQ/Q2/Q3 quants.
@@ -407,6 +411,8 @@ Appendix B points at the cross-cutting methodology.
 | 80 | [D5-0 — speculative-decoding cost model: measured baseline, acceptance, and the d=2 gate (MEAS-ONLY)](./cuda_optimization_steps/80-d5-0-cost-model.md) |
 | 81 | [D5-1a — the verify-batch gate measured end-to-end: no amortization at any nt, D5 closed (LANDED · gate FAIL)](./cuda_optimization_steps/81-d5-1a-verify-gate-measured.md) |
 | 82 | [small-M dispatch fix — multi-token MMVQ + token-looped legacy kernels: the batching invariant restored, D5 verdict unchanged (LANDED)](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md) |
+| 83 | [D5-R stage 1 — speculative decode loop: two-model process fixes, accept-loop unit tests, greedy-identity investigation (LANDED)](./cuda_optimization_steps/83-d5-r-stage1-spec-loop.md) |
+| 84 | [D5-R stage 2 — same-window dual-engine battery vs llama.cpp: 1.33×/1.59× vs 1.64×/2.08×, gap = verify row marginal (LANDED)](./cuda_optimization_steps/84-d5-r-stage2-dual-engine-battery.md) |
 
 ### Methodology
 
