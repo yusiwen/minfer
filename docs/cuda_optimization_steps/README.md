@@ -144,6 +144,7 @@ old plan kept as an appendix. Six records:
 | 89 | [d5-r-row-marginal-localization](89-d5-r-row-marginal-localization.md) | the absolute-gap leader localized without ncu: cold-L2 real-kernel bench + chain nsys + ablation — q4_K 2.4 / q6_K 1.0 / norm-quant 0.7 ms/row; ~half the matmul term = block-per-row activation re-read; fix menu priced (R-rows-per-block, small-M mma, chain hygiene) | 📏 |
 | 90 | [d5-r-rrows-per-block-closed](90-d5-r-rrows-per-block-closed.md) | menu item 1 implemented → measured → reverted: ~0 at d=2 (chain keeps act rows L2-hot; block-parallel latency hiding dominates utilization); nt≥6 flatten recorded; small-M mma re-confirmed as the only lever of size | 🔴 |
 | 91 | [mma-path-block-starvation](91-mma-path-block-starvation.md) | BT GEMM already mma.m16n8k32; small-M floor root-caused to block starvation (ntb=1 → 40 blocks); conditional double-buffer shipped (bitwise-safe, prefill guarded); K-split designed as the fix that revives d=8 | 🔬 |
+| 92 | [ksplit-shipped-flip-resolved-no](92-ksplit-shipped-flip-resolved-no.md) | K-split (grid.z + deterministic reduce) shipped for both BT kernels behind the gate; C_T(9) 86.4→72.9 but the ≤55 flip condition failed — multi-MMVQ stays production; residual = per-tile staging serialization; nt 9..64 auto-ksplit proposal deferred | 🔴 |
 
 ## Part VI · Methodology
 

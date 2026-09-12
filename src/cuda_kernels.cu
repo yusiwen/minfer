@@ -6815,7 +6815,8 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
     const uint8_t* __restrict__ W_dsc,
     const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
-    int nt, int od, int id, int nchunk, int bstride
+    int nt, int od, int id, int nchunk, int bstride,
+    float* __restrict__ Cpart, int ksplit
 ) {
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_q6k_sh[];
@@ -6838,6 +6839,14 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
     const int j0w = warp * 16;
     const int nsb = (id >> 5) >> 3;
     const int nktile = (nchunk + KDR - 1) / KDR;
+
+    // doc 92: K-split, same contract as the q4_K BT kernel — each grid.z
+    // slot owns a contiguous tile range, sums it in ascending kt order and
+    // writes fp32 partials; the shared reduce kernel sums slots in fixed
+    // z order (run-to-run bit-stable).
+    const int per = ksplit > 1 ? (nktile + ksplit - 1) / ksplit : nktile;
+    const int kt_lo = (int)blockIdx.z * per;
+    const int kt_hi = min(kt_lo + per, nktile);
 
     float sum[32] = {0.0f};   // [g=4][nh=2][l=4]
 
@@ -7014,14 +7023,14 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
     for (int g = 0; g < 4; g++)
         G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
 
-    RAW_STAGE_Q6K_BT(0, 0);
+    RAW_STAGE_Q6K_BT(kt_lo, 0);
     __syncthreads();
 
     int buf = 0;
-    for (int kt = 0; kt < nktile; ++kt, buf ^= 1) {
+    for (int kt = kt_lo; kt < kt_hi; ++kt, buf ^= 1) {
         // Overlap kt+1's global->smem staging with kt's compute: stage into the
         // OTHER buffer (buf^1) while reading buffer buf (the mmq_nt<7,2> pipeline).
-        if (kt + 1 < nktile) {
+        if (kt + 1 < kt_hi) {
             RAW_STAGE_Q6K_BT(kt + 1, buf ^ 1);
             // r53 (EXP) / r56: two groups are pending (kt's and kt+1's); wait
             // until only kt+1's remains — group(kt), the cp.async copies (r56:
@@ -7124,7 +7133,11 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
                 const int i = i0 + g * 16 + (l >> 1) * 8 + (lane >> 2);
                 const int j = j0 + j0w + nh * 8 + (lane & 3) * 2 + (l & 1);
                 if (i < nt && j < od)
-                    C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+                    if (ksplit == 1)
+                        C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+                    else
+                        Cpart[((size_t)blockIdx.z * nt + i) * od + j] =
+                            sum[(g * 2 + nh) * 4 + l];
             }
 #undef RAW_STAGE_Q6K_BT
 #endif // __CUDA_ARCH__ >= 800
@@ -7231,7 +7244,8 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
 extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     int type_id, const uint8_t* w, const uint8_t* w_exp, const uint8_t* w_dsc,
     const uint8_t* qa8g, const uint8_t* sdag, float* c, int nt, int od, int id,
-    int nchunk, int bstride, cudaStream_t stream, int kd
+    int nchunk, int bstride, cudaStream_t stream, int kd, float* cpart,
+    int ksplit
 ) {
     (void)type_id;
     if (kd != 8) return 0;
@@ -7241,7 +7255,17 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
                    + 2 * KDR * MMQ_NBI * 4    // sda_q (double-buffered)
                    + 2 * MMQ_NBJ * KDR * 32   // qb_exp (double-buffered)
                    + 2 * KDR * MMQ_NBJ * 8;   // sds  (double-buffered)
-    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
+    // doc 92: refine the requested ksplit so every z-slot owns a non-empty
+    // tile range (KDR=2 tiles here)
+    int ks = ksplit > 1 ? ksplit : 1;
+    {
+        const int nktile_all = (nchunk + 1) / 2;
+        if (ks > nktile_all) ks = nktile_all;
+        if (ks < 1) ks = 1;
+        const int per = (nktile_all + ks - 1) / ks;
+        ks = (nktile_all + per - 1) / per;
+    }
+    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ, ks);
     // r53: EXP is a template constant, so each instantiation keeps only its
     // own B path (the cp.async copy vs the r41 recomb) — no runtime branch.
     const bool exp = w_exp != 0;
@@ -7258,16 +7282,29 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
     if (exp) {
         mmq_raw_nb_bt_q6k_kernel<KDR, true><<<grid, 256, smem, stream>>>(
-            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride,
+            cpart, ks);
     } else {
         mmq_raw_nb_bt_q6k_kernel<KDR, false><<<grid, 256, smem, stream>>>(
-            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride);
+            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride,
+            cpart, ks);
     }
     e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "minfer/cuda: mmq raw NB-BT q6_K launch failed: %s\n",
                 cudaGetErrorString(e));
         return 0;
+    }
+    if (ks > 1) {
+        const int total = nt * od;
+        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            cpart, c, total, ks);
+        e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "minfer/cuda: mmq ksplit q6_K reduce failed: %s\n",
+                    cudaGetErrorString(e));
+            return 0;
+        }
     }
     return 1;
 }

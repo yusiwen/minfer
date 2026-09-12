@@ -474,6 +474,8 @@ extern "C" {
         bstride: i32,
         stream: *mut std::ffi::c_void,
         kd: i32,
+        cpart: *mut f32,
+        ksplit: i32,
     ) -> i32;
     fn launch_mmq_raw_nt(
         type_id: i32,
@@ -3314,8 +3316,31 @@ impl CudaState {
                     .get(&(wptr as usize))
                     .map(|cp| cp.0)
                     .unwrap_or(std::ptr::null_mut());
+                // doc 92: same K-split contract as the q4_K path
+                let ksplit: usize = if ksplit_req < 0 {
+                    let nbt_y = (od + 127) / 128;
+                    let nktile = (nchunk as usize + 1) / 2;
+                    if nt <= 64 && nbt_y > 0 && nktile > 1 {
+                        let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(256);
+                        let want = (target + nbt_y - 1) / nbt_y;
+                        want.clamp(2, nktile)
+                    } else {
+                        1
+                    }
+                } else {
+                    ksplit_req.max(1) as usize
+                };
+                let cpart = if ksplit > 1 {
+                    Self::get_or_grow(&self.buf_mmq_ksplit, ksplit * nt * od * 4) as *mut f32
+                } else {
+                    std::ptr::null_mut()
+                };
                 if qa8g != 0
                     && sdag != 0
+                    && (ksplit == 1 || !cpart.is_null())
                     && launch_mmq_raw_nb_bt_q6k_nt(
                         type_id,
                         wptr as *const u8,
@@ -3331,6 +3356,8 @@ impl CudaState {
                         block_stride,
                         stream,
                         8,
+                        cpart,
+                        ksplit as i32,
                     ) == 1
                 {
                     if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
