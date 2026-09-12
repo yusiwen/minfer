@@ -1,7 +1,7 @@
 # 92 · D5-R follow-up 3 — K-split shipped behind the gate; the ≤55 flip condition resolved to "no"
 
 > **Result**: the doc-91 §4 K-split is implemented for both BT GEMM kernels (q4_K and q6_K): grid.z slots own contiguous k-tile ranges, write fp32 partials `[ksplit][nt][od]`, and a deterministic two-pass reduce sums them in fixed z order — run-to-run bit-stable, capture-replay parity preserved. Fully gated (`MINFER_SMALL_M_GEMM=1`, default off; the default prefill passes `ksplit=1` and is unchanged). Measured convergence: C_T(9) 86.4 → 74.7 (q4_K split) → **72.9 ms** (+q6_K split); C_T(3) 85.4 → 70.9; C_T(5) 71.8; pp512 = 2005 tok/s (no prefill regression); suite 180 green; e2e acceptance with the gate on is bit-for-bit the doc-88 baseline (50.8% prose / 73.1% code). The pre-registered flip condition — C_T(9) ≤ 55, which would have made the mma path the production route for nt 2..16 — was **not met** (72.9): multi-MMVQ stays the production verify path, and the remaining ~18 ms is a kernel-redesign item, not a tuning item.
-> **Commit**: this document's commit. **Date**: 2026-09-12.
+> **Commit**: this document's commit. **Resolution (§3b)**: the deferred auto-ksplit proposal was accepted — default C_T(9) 86.4 → 73.0 ms; d=8 still acceptance-bound (code needs p ≈ 0.755, measured 0.731). **Date**: 2026-09-12.
 
 ## 1. What shipped
 
@@ -29,6 +29,29 @@ The residual is **per-tile staging serialization**: every k-tile pays a bulk sta
 - **Dispatch flip: NO.** The pre-registered condition (C_T(9) ≤ 55) failed; multi-MMVQ remains the production nt 2..8 path and the strict bitwise net is untouched. The K-split ships as infrastructure behind `MINFER_SMALL_M_GEMM=1`.
 - **Deferred proposal (measured, not flipped)**: auto-ksplit for the *default* nt 9..64 prefill path would take C_T(9) 86.4 → 72.9 today (−13.5 ms) with deterministic capture-replay, since capture and replay would both use the same ksplit. Not enabled unilaterally because it shifts default-prefill numerics (fp32 association) outside any pre-registered condition; it is a one-line `ksplit_req` change when wanted.
 - **The campaign's small-M ledger**: doc 89 priced the menu at 1.7 ms/row (R-rows) + mma tiles + hygiene; doc 90 falsified the R-rows pricing and re-confirmed mma as the only lever of size; docs 91–92 built the mma path's missing parallelism and measured its floor at ~1.7× — the verify marginal that remains (~4 ms/row → now ~3.3 ms/row-equivalent in mma terms) is structural for this kernel family. The next real step is the tile-geometry redesign above, or accepting the multi-MMVQ production path and moving to the campaign's open non-kernel leads (nt-invariant accumulation, conversation/server modes).
+
+## 3b. Resolution — the deferred proposal was accepted and flipped
+
+The user approved enabling auto-ksplit on the default path. The dispatch now
+passes `ksplit_req = -1` (auto) for every route into the BT GEMM; the auto
+formula itself activates only while the grid is M-starved (nt <= 64, i.e.
+ntb == 1) and returns 1 above that, so prefill at nt >= 65 keeps the unsplit
+single-pass association. ksplit is deterministic per (nt, od, id), so graph
+capture and replay follow the same partial-sum order; the partials buffer is
+sized during warmup like the other prepass scratches (the capture suite is
+green).
+
+Measured on the default path after the flip (no env): **C_T(9) 86.4 →
+73.0 ms**; C_T(5) 55.8 and C_T(3) 48.1 unchanged (multi-MMVQ still serves
+nt 2..8); C_T(1) 39.4; pp512 = 1999 tok/s; suite 180 green; e2e acceptance
+51.6% prose / 73.1% code — the code cell identical to baseline, prose within
+run noise of the doc-88 50.8%.
+
+d=8 economics at the new C_T(9): round ≈ 73.0 + 8·2.9 + 2.4 = 98.6 ms;
+tokens/round 3.50 (code, p=0.731) → 35.4 tok/s vs d=2's 42.5 — still loses;
+prose 20.6 vs 35.7 — loses. d=8 becomes competitive on the code cell only at
+p ≈ 0.755 (currently 0.731). The flip's present value is short-prompt prefill
+(nt 10..64) and the option value on acceptance improvements.
 
 ## 4. Verification
 
