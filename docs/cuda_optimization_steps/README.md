@@ -126,6 +126,22 @@ The writing contract is in [STYLE.md](STYLE.md).
 | 81 | [d5-1a-verify-gate-measured](81-d5-1a-verify-gate-measured.md) | D5-1a: the gate measured end-to-end (`specverify` instrument) — C_T(3)=106 ms, per-token amortization 0.52× vs ≥2.5× required; nt=2–8 batched path costs a flat ~35 ms/token (no regime anywhere), real tile step only at M≥16 → **D5 CLOSED** by the pre-registered stop rule; external check: llama-cli `-md` (same pair) lands at 0.99–1.00× | 🔴 |
 | 82 | [small-m-multi-token-mmvq](82-small-m-multi-token-mmvq.md) | small-M dispatch fix: multi-token MMVQ + token-looped legacy kernels — 7B nt=3 105.9→29.4 ms (3.60×), nt=8 5.75×, marginal 34.4→4.3 ms/token; bitwise batched-vs-serial on all 8 quants; pre-registered 2.5× bar missed at 1.87× (cost-model error recorded); D5 verdict unchanged | 🟢 |
 
+## Part V-B · D5-R — speculative decoding reopened and closed (2026-09-12)
+
+The doc 81 §4.3 errata voided the original closure's external anchor, doc 82
+made the verify amortization real (2.14× at nt=3), and the plan was rewritten
+([`SPECULATIVE-DECODING-PLAN.md`](../SPECULATIVE-DECODING-PLAN.md)) with the
+old plan kept as an appendix. Six records:
+
+| # | doc | what | verdict |
+|---|---|---|---|
+| 83 | [d5-r-stage1-spec-loop](83-d5-r-stage1-spec-loop.md) | the greedy d=2 loop (`--spec-draft`): second GraphCache, lazy accept loop (unit-tested), namespaced weight registries + `nb_bt_only` global-mix fix — the three single-model assumptions a second model breaks; 14B d=2 = 1.34×/1.58× | 🟢 |
+| 84 | [d5-r-stage2-dual-engine-battery](84-d5-r-stage2-dual-engine-battery.md) | same-window dual-engine protocol (3 reps × prose/code × 4 cells): minfer 1.33×/1.59× vs llama 1.64×/2.08× — the whole gap = verify row marginal (8.8 vs 2.5 ms/row) | 🟢 |
+| 85 | [d5-r-stage3-verify-marginal-ledger](85-d5-r-stage3-verify-marginal-ledger.md) | nsys per-kernel ledger: nt=3 marginal 17.6 ms = attention nt 2–63 hole 9.0 (legacy per-(token,head) kernel vs the 0.8 ms split path) + matmul 8.1 + elt 1.9 + idle 0.7; nt=9 = dispatch cliff onto padded GEMM | 📏 |
+| 86 | [d5-r-stage4a-attention-verify-shapes](86-d5-r-stage4a-attention-verify-shapes.md) | one gate: fa_prefill nt≥64 → nt≥2 — C_T(3) 56.9→48.8, C_T(9) 101.3→86.4; e2e 1.42×/1.68× (code ≥ llama's same-window 1.64×); ledger projection validated ~5% | 🟢 |
+| 87 | [d5-r-stage4b-multi-mmvq-nt16-closed](87-d5-r-stage4b-multi-mmvq-nt16-closed.md) | multi-MMVQ nt 9–16: groups-of-8 = parity (weights re-streamed per group), acc[16] = register spill (111 ms) → doc-82 GEMM boundary stands; d=8 retired (0.71× prose projected, 0.63× measured in doc 88) | 🔴 |
+| 88 | [d5-r-stage5-final-battery](88-d5-r-stage5-final-battery.md) | final battery: minfer d=2 **1.42×/1.68×** (35.7/42.5 tok/s) = 95%/88% of llama's absolute speed; capture prize verified already banked (R3-B); D5-R closes | 🟢 |
+
 ## Part VI · Methodology
 
 | # | doc | topic |
@@ -134,7 +150,7 @@ The writing contract is in [STYLE.md](STYLE.md).
 
 ---
 
-## State at the campaign's close (2026-09-09)
+## State at the campaign's close (2026-09-12, after D5-R)
 
 | | tg128 | @long KV | device memory |
 |---|---:|---:|---:|
@@ -142,4 +158,8 @@ The writing contract is in [STYLE.md](STYLE.md).
 | Qwen2.5-14B Q4_K_M | **1.018×** | 0.950× @3.3K | ~14.1 GB |
 
 Prefill: 7B pp3314 ~3581 tok/s (**1.080×**); 14B pp3254 ~1830 tok/s (**1.12×**).
-All measured with same-window paired anchoring. Next stop: speculative decoding.
+Speculative decoding (D5-R, closed): 14B+0.5B q4_0 d=2 = **1.42×/1.68×**
+(prose/code, 35.7/42.5 tok/s) = 95%/88% of llama.cpp's absolute speculative
+speed in the same window; d=8 measured 0.63× (retired). Open leads: ncu on
+the small-M MMQ gap (counter permissions), nt-invariant accumulation
+(prose acceptance + exact greedy identity).
