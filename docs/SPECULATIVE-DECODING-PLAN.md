@@ -1,6 +1,6 @@
 # Speculative Decoding (D5-R) — Plan
 
-Status: **D5-R stages ①+②+③ LANDED (2026-09-12, docs 83–85): 14B d=2 = 1.33×/1.59× vs llama 1.64×/2.08× same-window; the marginal is priced (doc 85 ledger) — attention nt 2–63 hole ≈ 9 ms, multi-MMVQ nt≤8 cap ≈ 14 ms at nt=9, capture ≈ 2 ms; priced recovery → 1.64× ≈ llama parity. Stage ④ (kernel attack) next.**
+Status: **D5-R stages ①+②+③+④a LANDED (2026-09-12, docs 83–86): 14B d=2 = 1.39×/1.66× (code ≥ llama's same-window 1.64×); C_T(3) 48.78, C_T(9) 86.44. Stage ④b (multi-MMVQ nt 9–16) and ④c (graph capture) next, then stage ⑤ re-battery with d=8.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing

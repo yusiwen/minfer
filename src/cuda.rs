@@ -4122,7 +4122,15 @@ impl CudaState {
         // and measured 176 ms/layer, 76% of the whole 2K prefill. hd % 16
         // is hard-wired (FA_HQ = hd/4 = 32) and the shared-memory opt-in
         // can fail on constrained devices, hence the rc fallback.
-        if nt >= 64 && hd == 128 && !Self::no_fa_prefill() {
+        //
+        // D5-R stage 4 (doc 86): the verify shapes (nt = d+1, i.e. 2..=9)
+        // used to fall through to the legacy per-(token,head) kernel — the
+        // doc 85 ledger prices that hole at ~9 ms of the 17.6 ms nt=3
+        // marginal (the nt=1 split-KV path does the same KV read in 0.8 ms).
+        // fa_prefill masks rows causally from the positions array ("positions
+        // are data"), which is exactly the verify block's structure, so the
+        // gate is lowered to nt >= 2; nt == 1 keeps the split-KV decode path.
+        if nt >= 2 && hd == 128 && !Self::no_fa_prefill() {
             let rc = unsafe {
                 launch_fa_prefill_f16kv(
                     q as *const f32,
