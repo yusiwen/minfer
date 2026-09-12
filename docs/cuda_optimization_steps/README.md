@@ -141,6 +141,7 @@ old plan kept as an appendix. Six records:
 | 86 | [d5-r-stage4a-attention-verify-shapes](86-d5-r-stage4a-attention-verify-shapes.md) | one gate: fa_prefill nt≥64 → nt≥2 — C_T(3) 56.9→48.8, C_T(9) 101.3→86.4; e2e 1.42×/1.68× (code ≥ llama's same-window 1.64×); ledger projection validated ~5% | 🟢 |
 | 87 | [d5-r-stage4b-multi-mmvq-nt16-closed](87-d5-r-stage4b-multi-mmvq-nt16-closed.md) | multi-MMVQ nt 9–16: groups-of-8 = parity (weights re-streamed per group), acc[16] = register spill (111 ms) → doc-82 GEMM boundary stands; d=8 retired (0.71× prose projected, 0.63× measured in doc 88) | 🔴 |
 | 88 | [d5-r-stage5-final-battery](88-d5-r-stage5-final-battery.md) | final battery: minfer d=2 **1.42×/1.68×** (35.7/42.5 tok/s) = 95%/88% of llama's absolute speed; capture prize verified already banked (R3-B); D5-R closes | 🟢 |
+| 89 | [d5-r-row-marginal-localization](89-d5-r-row-marginal-localization.md) | the absolute-gap leader localized without ncu: cold-L2 real-kernel bench + chain nsys + ablation — q4_K 2.4 / q6_K 1.0 / norm-quant 0.7 ms/row; ~half the matmul term = block-per-row activation re-read; fix menu priced (R-rows-per-block, small-M mma, chain hygiene) | 📏 |
 
 ## Part VI · Methodology
 

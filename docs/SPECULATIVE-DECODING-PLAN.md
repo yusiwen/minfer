@@ -1,6 +1,6 @@
 # Speculative Decoding (D5-R) — Plan
 
-Status: **D5-R CLOSED (2026-09-12, docs 83–88): all stages landed or closed by measurement. 14B d=2 = 1.42×/1.68× (95%/88% of llama's absolute speed, same-window); d=8 retired (0.63× e2e); graph-capture prize verified already banked (R3-B); open leads = ncu on MMQ small-M (2× over floor), nt-invariant accumulation (acceptance + identity), conversation/server modes.**
+Status: **D5-R CLOSED (2026-09-12, docs 83–88): all stages landed or closed by measurement. 14B d=2 = 1.42×/1.68× (95%/88% of llama's absolute speed, same-window); d=8 retired (0.63× e2e); graph-capture prize verified already banked (R3-B); open leads localized (doc 89): row marginal = q4_K 2.4 + q6_K 1.0 + norm/quant 0.7 ms/row; fix menu = R-rows-per-block (~1.7), small-M mma tiles, chain hygiene; then nt-invariant accumulation (acceptance + identity), conversation/server modes.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing

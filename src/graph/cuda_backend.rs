@@ -1571,6 +1571,126 @@ mod tests {
         CudaBackend::new()
     }
 
+    /// D5-R follow-up (doc 89): row-marginal localization bench for the
+    /// multi-token matmul kernels. Runs the REAL dispatch path (graph
+    /// execute_node -> quantize + kernel) at nt = 1..8 over real 14B shapes
+    /// with a cold-L2 protocol: each nt owns NC independent weight copies
+    /// (>L2 aggregate) cycled so no copy is revisited within 2 runs — L2 is
+    /// evicted between uses exactly like in a real forward, and runs per
+    /// (uid, range) stay below the 3-run capture trigger so timing is never
+    /// capture/replay. Per-run cost = one synchronized burst / R; the
+    /// per-row marginal = (t(nt) - t(1)) / (nt - 1), attributable to extra
+    /// in-kernel row work only (launch count is nt-invariant).
+    #[test]
+    fn cuda_row_marginal_bench() {
+        if std::env::var("MINFER_BENCH_ROW_MARGINAL").is_err() {
+            return;
+        }
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+
+        fn gen_bytes(n: usize, seed: u64) -> Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 33) as u8
+                })
+                .collect()
+        }
+
+        // (label, type, od, id, padded, weight copies). Aggregate weight
+        // footprint per case > 126 MB L2, and >= 8x per-copy footprint
+        // streams between revisits.
+        let cases: Vec<(&str, TensorType, usize, usize, bool, usize)> = vec![
+            ("q4k_attn_qo", TensorType::Q4_K, 5120, 5120, false, 40),
+            ("q4k_ffn_up", TensorType::Q4_K, 13824, 5120, false, 40),
+            ("q6k_ffn_down", TensorType::Q6_K, 5120, 13824, true, 24),
+        ];
+        let nts = [1usize, 2, 3, 4, 6, 8];
+
+        for (ci, (label, tt, od, id_, padded, nc)) in cases.into_iter().enumerate() {
+            let nbe = (id_ + 255) / 256;
+            let row_bytes = match tt {
+                TensorType::Q4_K => nbe * 144,
+                TensorType::Q6_K => nbe * 210,
+                other => panic!("unexpected {other:?}"),
+            };
+            let wb = gen_bytes(od * row_bytes, 0x5EED_C0DE + ci as u64);
+            let mut wts = Vec::with_capacity(nc);
+            for j in 0..nc {
+                let name = format!("w{ci}_{j}");
+                let mut wt = Tensor::from_data(tt, &[id_ as i64, od as i64, 1, 1], wb.clone());
+                wt.name = name.clone();
+                if tt == TensorType::Q6_K && padded {
+                    cb.state.register_weight_q6k_padded(&name, &wb, od, id_);
+                } else {
+                    cb.state.register_weight(&name, &wb);
+                }
+                wts.push(wt);
+            }
+
+            let mut lines = Vec::new();
+            for &nt in nts.iter() {
+                // NC graphs (one per weight copy) sharing one x/out buffer.
+                let xs: Vec<f32> = (0..id_ * nt)
+                    .map(|i| ((i * 2654435761 % 2000) as f32 / 1000.0 - 1.0))
+                    .collect();
+                let mut graphs = Vec::with_capacity(nc);
+                for wt in &wts {
+                    let mut b = GraphBuilder::new();
+                    let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+                    let m = b.matmul(x, wt, None);
+                    b.output(m);
+                    let g = b.build();
+                    graphs.push(g);
+                }
+                let xb = cb.alloc_buffer(id_ * nt);
+                cb.write_host(xb, &xs).unwrap();
+                let ob = cb.alloc_buffer(od * nt);
+
+                let reps = 2 * nc; // < 3 runs per (uid, range): no capture
+                let t0 = std::time::Instant::now();
+                for r in 0..reps {
+                    cb.execute_node(
+                        &graphs[r % nc].nodes[graphs[r % nc].outputs[0]],
+                        &[xb],
+                        ob,
+                        None,
+                    )
+                    .unwrap();
+                }
+                cb.synchronize();
+                let per_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                lines.push((nt, per_us));
+                let _ = cb.copy_to_host(ob).unwrap(); // keep result live
+            }
+            let t1 = lines[0].1;
+            let gb = (od * row_bytes) as f64 / 1e9;
+            eprintln!("[bench] {label} ({tt:?} {od}x{id_}, {gb:.1} MB/copy, NC={nc}):");
+            for (nt, us) in &lines {
+                let bw = gb * 1e3 / (us / 1e3) / 1e3;
+                eprintln!(
+                    "[bench]   nt={nt}: {:9.1} us/run  ({bw:5.0} GB/s w-stream)",
+                    us
+                );
+            }
+            for w in [2usize, 3, 4] {
+                let tn = lines[w - 1].1;
+                eprintln!(
+                    "[bench]   marginal/row (1->{w}): {:6.2} us per matmul per forward",
+                    (tn - t1) / (w - 1) as f64
+                );
+            }
+            let _ = &cb;
+        }
+    }
+
     fn assert_close(name: &str, got: &[f32], want: &[f32], tol: f32) {
         assert_eq!(got.len(), want.len(), "{name}: length mismatch");
         let mut worst = (0.0f32, 0usize);
