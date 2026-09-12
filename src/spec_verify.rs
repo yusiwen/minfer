@@ -5,7 +5,7 @@
 //! forward at `nt = d+1` with `n_out = d+1` (every row needs logits). The
 //! D5-0 gate (step doc 80) hangs on ONE number: the per-step amortization
 //!
-//!   amortization(nt) = C_T(1) / C_T(nt)   — required ≥ 2.5× at nt=3 (d=2)
+//!   amortization(nt) = nt · C_T(1) / C_T(nt)   — required ≥ 2.5× at nt=3 (d=2)
 //!
 //! This subcommand measures that ratio directly, with no engine changes:
 //! the generic `forward_graph_cached(tokens, positions, n_out)` primitive
@@ -50,7 +50,9 @@ pub fn print_usage(prog: &str) {
     eprintln!("  -h, --help show this help");
     eprintln!();
     eprintln!("Phases: nt = 1 (baseline C_T(1)), 3 (d=2 verify), 5 (d=4 verify).");
-    eprintln!("Gate (D5-0): amortization = C_T(1)/C_T(3) must be ≥ 2.5× to proceed.");
+    eprintln!(
+        "Gate (D5-0): amortization = nt·C_T(1)/C_T(3) (doc 81 §2) must be ≥ 2.5× to proceed."
+    );
     eprintln!("The model may be a path or a cached name (see `list`).");
 }
 
@@ -303,8 +305,13 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     let c1 = get(&pass1, 1);
     let c3 = get(&pass1, 3);
     let c5 = get(&pass1, 5);
-    let amort3 = c1 / c3;
-    let amort5 = c1 / c5;
+    // Doc 80/81 definition: amortization(nt) = nt * C_T(1) / C_T(nt) — the
+    // serial-time equivalent of one batched verify step. (The C_T(1)/C_T(nt)
+    // ratio shipped here originally missed the nt factor and understated the
+    // metric by exactly nt; docs 81/82 computed their tables from the raw
+    // medians with the correct formula.)
+    let amort3 = 3.0 * c1 / c3;
+    let amort5 = 5.0 * c1 / c5;
     let gate_pass = amort3 >= 2.5;
     let model_name = std::path::Path::new(&model_path)
         .file_name()

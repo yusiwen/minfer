@@ -180,6 +180,41 @@ weight-multiplier dimension") and the point-by-point contrast with minfer's
 `grid(od/4, nt)` hole — is documented in
 [`LLAMA-CPP-MMQ-ANALYSIS.md` §12](../LLAMA-CPP-MMQ-ANALYSIS.md).
 
+### 4.2 14B replication + post-fix gate re-read (2026-09-12, after doc 82)
+
+The external battery was replicated on the 14B pair after doc 82 restored
+the batching invariant (Qwen2.5-14B-Instruct Q4_K_M + 0.5B q4_0 draft, same
+protocol as §4.1, 3 interleaved reps; a root-owned sglang server was
+co-resident but idle — `--sleep-on-idle`, 44 GB reserved, no compute in the
+window):
+
+| config | prose t/s (median) | code t/s (median) | speedup vs base |
+|---|---|---|---|
+| baseline (no draft) | 23.9 | 24.0 | 1.00× |
+| draft `--spec-draft-n-max 2` | 23.9 | 24.1 | 1.002× |
+| draft `--spec-draft-n-max 8` | 23.8 | 23.7 | 0.992× |
+| draft `--spec-draft-n-max 16` | 24.2 | 24.0 | 1.006× |
+
+llama.cpp's speculative decoding is a wash on the 14B too — the doc 80
+ceiling argument is target-scale-invariant on GB10.
+
+minfer's verify gate re-measured post-doc-82 (`specverify -p 512 -r 40`,
+median of both passes): C_T(1) = 42.15 ms, C_T(3) = 59.14 ms, C_T(8) =
+91.56 ms → amortization(nt=3) = 2.14× (the pre-fix 7B shapes measured
+0.52×), amortization(nt=8) = 3.68×, marginal cost ≈ 7.1 ms/token — weight
+traffic is nt-independent at 14B as well. The pre-registered gate still
+fails (2.14 < 2.5): the residual per-token marginal is attention +
+q8-quantize + dp4a compute, exactly the doc 82 §5 cost model. D5 stays
+closed, now with external confirmation at a second target scale.
+
+Instrument errata (fixed this session): the `specverify` JSON's
+`amortization_nt3`/`amortization_nt5` fields shipped computing
+`C_T(1)/C_T(nt)` — missing the `nt` factor of the §2 definition, which made
+the reported metric unsatisfiable by construction (≤ 1.0). The doc 81/82
+tables were computed from the raw medians with the correct
+`nt·C_T(1)/C_T(nt)` formula and are unaffected; raw medians are unchanged
+by the fix.
+
 ## 5. Lessons
 
 - **The gate did its job — 90 minutes of measurement against days of
