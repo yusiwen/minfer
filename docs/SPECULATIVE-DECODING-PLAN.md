@@ -1,6 +1,6 @@
 # Speculative Decoding (D5-R) — Plan
 
-Status: **D5-R stages ①+②+③+④a+④b done (2026-09-12, docs 83–87): 14B d=2 = 1.39×/1.66×; ④b measured negative (nt 9–16 multi-MMVQ cannot beat the padded GEMM — parity/spill; d=8 not viable at the current verify curve, ≥1.5× d=8 target retired; MMQ small-M 65-vs-30 ms gap = open kernel question). Next: ④c graph capture (~2.4 ms/round), stage ⑤ d=2 re-battery.**
+Status: **D5-R CLOSED (2026-09-12, docs 83–88): all stages landed or closed by measurement. 14B d=2 = 1.42×/1.68× (95%/88% of llama's absolute speed, same-window); d=8 retired (0.63× e2e); graph-capture prize verified already banked (R3-B); open leads = ncu on MMQ small-M (2× over floor), nt-invariant accumulation (acceptance + identity), conversation/server modes.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
