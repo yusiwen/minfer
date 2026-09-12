@@ -6515,10 +6515,22 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
 ) {
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_nb_sh[];
-    uint8_t* qa8 = mmq_nb_sh;
-    uint32_t* sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
-    uint8_t* qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
-    float2* sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
+    // doc 91: two staging buffer sets — tile kt+1's bulk LDG->STS (and the
+    // DSC cp.async sds stream) is prefetched into the other buffer while
+    // tile kt computes, hiding the per-tile staging latency that serialised
+    // the single-buffer loop (the small-M floor: ntb=1 leaves only od/NBJ
+    // blocks, so no other block hides the stall either). Pure data-movement
+    // restructure: fragments, operand values and accumulation order are
+    // unchanged, so results are bitwise identical to the single-buffer
+    // kernel.
+    constexpr size_t BUF = (size_t)KDR * MMQ_NBI * 32      // qa8
+                         + (size_t)KDR * MMQ_NBI * 4       // sda_q
+                         + (size_t)MMQ_NBJ * 128           // qb_raw
+                         + (size_t)8 * MMQ_NBJ * 8;        // sds
+    uint8_t* qa8;
+    uint32_t* sda_q;
+    uint8_t* qb_raw;
+    float2* sds;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -6609,14 +6621,50 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
     for (int g = 0; g < 4; g++)
         G[g] = (unsigned)g * 512 + l12m + ((g & 1) ? (grc ^ 64u) : grc);
 
+    // doc 91: double-buffer only when the grid is M-starved (ntb == 1, the
+    // small-M regime): there the staging latency of tile kt+1 has no other
+    // block to hide behind and pipelining pays. With ntb >= 2 the extra
+    // buffer set halves SM residency (84 KB vs 42 KB per block) and cost
+    // prefill ~10% (measured), so the single-buffer r59 sequence is kept.
+    const bool dbuf = nt <= MMQ_NBI;
+
+    // prologue: bind buffer 0, stage tile 0 (its DSC commit group included)
+    qa8 = mmq_nb_sh;
+    sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
+    qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
+    sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
     RAW_STAGE_NB_BT(0);
 
     for (int kt = 0; kt < nktile; ++kt) {
-        if (kt > 0) RAW_STAGE_NB_BT(kt);
-        // r59: the dsc cp.async group issued in RAW_STAGE must be complete to
-        // THIS thread before the barrier publishes it cross-thread (the r53
-        // visibility rule). DSC=false: no groups are ever issued, no-op.
-        if (DSC) gemm_cp_wait0();
+        if (dbuf) {
+            // prefetch tile kt+1 into the OTHER buffer while tile kt computes
+            if (kt + 1 < nktile) {
+                uint8_t* nb = mmq_nb_sh + (size_t)((kt + 1) & 1) * BUF;
+                qa8 = nb;
+                sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
+                qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
+                sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
+                RAW_STAGE_NB_BT(kt + 1);
+            }
+        } else if (kt > 0) {
+            // original r59 sequence: restage into the single buffer
+            RAW_STAGE_NB_BT(kt);
+        }
+        // r59 visibility rule: tile kt's DSC cp.async group must be complete
+        // to THIS thread before the barrier publishes it cross-thread; in the
+        // double-buffered regime tile kt+1's group (already issued) may stay
+        // in flight (wait_group 1). DSC=false: no groups are issued, no-op.
+        if (dbuf) {
+            qa8 = mmq_nb_sh + (size_t)(kt & 1) * BUF;
+        } else {
+            qa8 = mmq_nb_sh;
+        }
+        sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
+        qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
+        sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
+        if (DSC) {
+            if (dbuf && kt + 1 < nktile) gemm_cp_wait1(); else gemm_cp_wait0();
+        }
         __syncthreads();
 
         #pragma unroll
@@ -7078,10 +7126,14 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
     (void)type_id;
     if (kd != 8) return 0;
     if (qa8g == 0 || sdag == 0) return 0;
-    const int smem = 8 * MMQ_NBI * 32   // qa8
+    // doc 91: the second staging buffer set only for the M-starved regime
+    // (ntb == 1, matching the kernel's dbuf flag) — prefill keeps the
+    // original 42 KB footprint and its higher SM residency.
+    const bool dbuf_smem = (nt + MMQ_NBI - 1) / MMQ_NBI <= 1;
+    const int smem = (dbuf_smem ? 2 : 1) * (8 * MMQ_NBI * 32   // qa8
                    + 8 * MMQ_NBI * 4    // sda_q (one uint32 per token)
                    + MMQ_NBJ * 128      // qb_raw
-                   + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
+                   + 8 * MMQ_NBJ * 8);  // sds (float2 = 8B)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
     // r59: DSC is a template constant, so each instantiation keeps only its
     // own SDS path (the cp.async plane stream vs the scalar decode) — the

@@ -2553,7 +2553,13 @@ impl CudaState {
         // wmma path). MINFER_NO_PREFILL_GEMM=1 still forces the legacy
         // per-type kernels. id % 32 == 0 covers the block math of every type
         // (q6_K runs as k32 chunks with dual 16-sub rescale inside).
-        if nt >= 9
+        // doc 91 experiment gate: route nt 2..8 to the mma BT path. Off by
+        // default — at nt<=64 the BT grid has only od/NBJ blocks (40 on the
+        // 14B shapes) and runs ~1.7x over the multi-MMVQ path; the K-split
+        // follow-up raises the block count before this can win.
+        let small_m_gemm =
+            std::env::var("MINFER_SMALL_M_GEMM").map_or(false, |v| v == "1") && nt >= 2;
+        if (nt >= 9 || small_m_gemm)
             && id % 32 == 0
             && !Self::no_prefill_gemm()
             && matches!(
