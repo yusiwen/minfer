@@ -7355,7 +7355,7 @@ extern "C" void launch_mmq_nt(
 // so a multi launch is bitwise-equal to nt separate single launches.
 
 __device__ __forceinline__ void mmvq_block_reduce_multi(
-    const float* acc /* [nt <= 8] */, float* __restrict__ output, int od, int nt
+    const float* acc /* [8] */, float* __restrict__ output, int od, int nt, int t0
 ) {
     __shared__ float warp_sums[8];
     for (int t = 0; t < nt; ++t) {
@@ -7368,7 +7368,7 @@ __device__ __forceinline__ void mmvq_block_reduce_multi(
             float v = 0.0f;
             #pragma unroll
             for (int k = 0; k < 8; k++) v += warp_sums[k];
-            output[(size_t)t * od + (size_t)blockIdx.x] = v;
+            output[(size_t)(t0 + t) * od + (size_t)blockIdx.x] = v;
         }
         __syncthreads(); // warp_sums is rewritten by the next iteration
     }
@@ -7384,6 +7384,15 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_multi(
     const int nbe = (id + 255) / 256;
     const int row_stride = nbe * Q4KB;
     const int nsub = (id + 31) / 32; // ceil — partial tail super-blocks excluded
+    // D5-R stage 4b (doc 87): token groups of 8 — nt <= 8 runs exactly one
+    // group with the original accumulation order (bitwise). Group g>0
+    // re-reads the row's weights from DRAM (L2 cannot hold the streamed
+    // rows) and measured at parity with the padded GEMM, so the dispatch
+    // stays at nt <= 8; the group structure makes the acc[8] cap explicit.
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
 
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (int u = threadIdx.x; u < nsub; u += 256) {
@@ -7397,8 +7406,8 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_multi(
         const bool lo = (sub & 1) == 0;
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            if (t < nt) {
-                const uint8_t* x8 = acts8 + ((size_t)t * nsub + (size_t)u) * Q8PB;
+            if (t < tmax) {
+                const uint8_t* x8 = acts8 + ((size_t)(t0 + t) * nsub + (size_t)u) * Q8PB;
                 const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
                 const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
                 int dot = 0, sx = 0;
@@ -7414,7 +7423,8 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
 }
 
 __global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2_multi(
@@ -7428,6 +7438,15 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2_multi(
     const int row_stride = nbe * Q4KB;
     const int npair = id >> 6;         // 64-element chunks (sub-pairs)
     const int nsub = id >> 5;
+    // D5-R stage 4b (doc 87): token groups of 8 — nt <= 8 runs exactly one
+    // group with the original accumulation order (bitwise). Group g>0
+    // re-reads the row's weights from DRAM (L2 cannot hold the streamed
+    // rows) and measured at parity with the padded GEMM, so the dispatch
+    // stays at nt <= 8; the group structure makes the acc[8] cap explicit.
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
 
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (int u = threadIdx.x; u < npair; u += 256) {
@@ -7444,9 +7463,9 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2_multi(
         const uint32_t ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            if (t < nt) {
-                const uint8_t* x8a = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s0)) * Q8PB;
-                const uint8_t* x8b = acts8 + ((size_t)t * nsub + (size_t)(kbx * 8 + s1)) * Q8PB;
+            if (t < tmax) {
+                const uint8_t* x8a = acts8 + ((size_t)(t0 + t) * nsub + (size_t)(kbx * 8 + s0)) * Q8PB;
+                const uint8_t* x8b = acts8 + ((size_t)(t0 + t) * nsub + (size_t)(kbx * 8 + s1)) * Q8PB;
                 const float d8a = h2f(*reinterpret_cast<const uint16_t*>(x8a));
                 const float d8b = h2f(*reinterpret_cast<const uint16_t*>(x8b));
                 const uint32_t* xa = reinterpret_cast<const uint32_t*>(x8a + 4);
@@ -7466,7 +7485,8 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq_v2_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
 }
 
 __global__ void __launch_bounds__(256) q5_k_q8_mmvq_multi(
@@ -7511,7 +7531,7 @@ __global__ void __launch_bounds__(256) q5_k_q8_mmvq_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, nt, 0);
 }
 
 __global__ void __launch_bounds__(256) q5_k_q8_mmvq_v2_multi(
@@ -7572,7 +7592,7 @@ __global__ void __launch_bounds__(256) q5_k_q8_mmvq_v2_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, nt, 0);
 }
 
 __global__ void __launch_bounds__(256) q6_k_q8_mmvq_multi(
@@ -7625,7 +7645,7 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, nt, 0);
 }
 
 __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
@@ -7639,6 +7659,15 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
     const int row_stride = nbe * blk_stride;
     const int npair = id >> 5;
     const int nsub = id >> 5;
+    // D5-R stage 4b (doc 87): token groups of 8 — nt <= 8 runs exactly one
+    // group with the original accumulation order (bitwise). Group g>0
+    // re-reads the row's weights from DRAM (L2 cannot hold the streamed
+    // rows) and measured at parity with the padded GEMM, so the dispatch
+    // stays at nt <= 8; the group structure makes the acc[8] cap explicit.
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
 
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (int u = threadIdx.x; u < npair; u += 256) {
@@ -7651,19 +7680,19 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
         // v1 mapping with s = 2*pair + half: chunk = s>>3 = pair>>2,
         // g = (s>>1)&3 = pair&3, is = s&1 = half (the pair's two subs share
         // chunk/g; only the 16-byte is-half differs)
-        const int chunk = pair >> 2, g = pair & 3;
+        const int chunk = pair >> 2, gq = pair & 3;
         // padded 224B stride ⇒ every ql/qh piece is 16B aligned
-        const uint4 qla = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32);
-        const uint4 qlb = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (g & 1) * 32 + 16);
+        const uint4 qla = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (gq & 1) * 32);
+        const uint4 qlb = *reinterpret_cast<const uint4*>(blk + chunk * 64 + (gq & 1) * 32 + 16);
         const uint4 qha = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32);
         const uint4 qhb = *reinterpret_cast<const uint4*>(blk + 128 + chunk * 32 + 16);
         const uint32_t qls[8] = {qla.x, qla.y, qla.z, qla.w, qlb.x, qlb.y, qlb.z, qlb.w};
         const uint32_t qhs[8] = {qha.x, qha.y, qha.z, qha.w, qhb.x, qhb.y, qhb.z, qhb.w};
-        const uint32_t shift = 2 * g;
+        const uint32_t shift = 2 * gq;
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            if (t < nt) {
-                const uint8_t* x8 = acts8 + ((size_t)t * nsub + (size_t)u) * Q8PB;
+            if (t < tmax) {
+                const uint8_t* x8 = acts8 + ((size_t)(t0 + t) * nsub + (size_t)u) * Q8PB;
                 const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8));
                 const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8 + 4);
                 int dot0 = 0, dot1 = 0;
@@ -7671,8 +7700,8 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
                 for (int v = 0; v < 4; v++) {
                     const uint32_t wl0 = qls[v], wl1 = qls[v + 4];
                     const uint32_t wh0 = qhs[v], wh1 = qhs[v + 4];
-                    const uint32_t nib0 = (g < 2) ? (wl0 & 0x0F0F0F0F) : ((wl0 >> 4) & 0x0F0F0F0F);
-                    const uint32_t nib1 = (g < 2) ? (wl1 & 0x0F0F0F0F) : ((wl1 >> 4) & 0x0F0F0F0F);
+                    const uint32_t nib0 = (gq < 2) ? (wl0 & 0x0F0F0F0F) : ((wl0 >> 4) & 0x0F0F0F0F);
+                    const uint32_t nib1 = (gq < 2) ? (wl1 & 0x0F0F0F0F) : ((wl1 >> 4) & 0x0F0F0F0F);
                     const uint32_t hi0 = ((wh0 >> shift) & 0x03030303) << 4;
                     const uint32_t hi1 = ((wh1 >> shift) & 0x03030303) << 4;
                     const int vi0 = __vsubss4((int)(nib0 | hi0), 0x20202020);
@@ -7685,7 +7714,8 @@ __global__ void __launch_bounds__(256) q6_k_q8_mmvq_v2_multi(
             }
         }
     }
-    mmvq_block_reduce_multi(acc, output, od, nt);
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
 }
 
 // Launchers: one block per weight row (grid.x = od, grid.y = 1) — the
