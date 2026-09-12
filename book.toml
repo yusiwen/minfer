@@ -9,8 +9,11 @@ src = "docs"
 build-dir = "book"
 
 [output.html]
-default-theme = "dark"
-preferred-dark-theme = "dark"
+# mdbook 0.4.37 has no "dark" theme id (valid: light/rust/coal/navy/ayu);
+# an invalid default makes book.js's updateThemeSelected throw at load and
+# kills the theme-toggle + sidebar fold handlers. "coal" is the dark one.
+default-theme = "coal"
+preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/yusiwen/minfer"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
