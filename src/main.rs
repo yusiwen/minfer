@@ -18,6 +18,7 @@ mod models;
 mod quants;
 mod sampler;
 mod server;
+mod spec;
 mod spec_verify;
 mod template;
 mod tensor;
@@ -123,6 +124,10 @@ fn print_usage(prog: &str) {
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
+    eprintln!("  --spec-draft <model> speculative decoding: draft model (D5-R)");
+    eprintln!(
+        "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)"
+    );
     eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
     eprintln!(
         "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
@@ -188,6 +193,9 @@ fn main() {
     let mut port_provided = false;
     // CUDA-only: --gpu N selects a device index; no-op on CPU/Metal builds.
     let mut gpu: Option<i32> = None;
+    // D5-R speculative decoding (--spec-draft <model>, --spec-draft-n <d>).
+    let mut spec_draft: Option<String> = None;
+    let mut spec_draft_n: usize = 2;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -260,6 +268,21 @@ fn main() {
                             None
                         }
                     };
+                }
+                i += 2;
+            }
+            "--spec-draft" => {
+                if let Some(v) = next_val(a) {
+                    spec_draft = Some(v);
+                }
+                i += 2;
+            }
+            "--spec-draft-n" => {
+                if let Some(v) = next_val(a) {
+                    spec_draft_n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --spec-draft-n '{v}'"));
+                        2
+                    });
                 }
                 i += 2;
             }
@@ -697,6 +720,10 @@ fn main() {
 
     // === Multi-turn conversation mode (--cnv) ===
     if conv_mode {
+        if spec_draft.is_some() {
+            eprintln!("Error: --spec-draft is not supported in conversation mode yet");
+            std::process::exit(1);
+        }
         let code = run_conversation(
             model,
             &tokenizer,
@@ -711,6 +738,29 @@ fn main() {
         );
         std::process::exit(code);
     }
+
+    // === D5-R speculative decoding: load the draft model + its graph cache ===
+    // The target's KV moves to a GraphCache too: verify rounds drive
+    // forward_graph_cached at nt=d+1 (the primitive the specverify instrument
+    // validated end-to-end), so both models live in the same plumbing.
+    let mut spec_engine = match &spec_draft {
+        Some(p) => match spec::SpecEngine::new(
+            &spec::SpecConfig {
+                draft_path: p.clone(),
+                draft_n: spec_draft_n,
+            },
+            &tokenizer,
+            model.n_vocab(),
+        ) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let mut target_cache = graph::cache::GraphCache::new();
 
     // === Chat template (need tokenizer for bos_token text) ===
     let processed = if no_template {
@@ -754,7 +804,19 @@ fn main() {
     if trace_on {
         crate::trace::begin_phase("prefill");
     }
-    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx);
+    let logits = if spec_engine.is_some() {
+        // Spec mode: drive the target through forward_graph_cached so its KV
+        // lives in the cache the verify rounds reuse; the draft prefills the
+        // same tokens into its own cache.
+        let l = model.forward_graph_cached(&input_ids, &positions, 1, ctx, &mut target_cache);
+        spec_engine
+            .as_mut()
+            .expect("spec engine checked above")
+            .prefill(&input_ids, ctx);
+        l
+    } else {
+        model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx)
+    };
     let last_logits: Vec<f32> = logits;
     if trace_on {
         crate::trace::attach_step(&last_logits);
@@ -880,10 +942,24 @@ fn main() {
         },
     );
 
-    while generated.len() < params.n_predict {
-        t0 = std::time::Instant::now();
+    // === D5-R spec round loop ===
+    // Each round emits 1..=d+1 tokens (draft-accepted prefix + the target
+    // sampler's bonus); the per-token output machinery below is the same
+    // sequence the non-spec loop runs, applied per emitted token.
+    if let Some(engine) = spec_engine.as_mut() {
+        let sparams = spec::SpecSampler {
+            temp: params.temp,
+            top_k: params.top_k,
+            top_p: params.top_p,
+            repeat_penalty: params.repeat_penalty,
+            frequency_penalty: params.frequency_penalty,
+            presence_penalty: params.presence_penalty,
+        };
+        // Seed token: the prefill's last-row logits, sampled exactly like the
+        // normal path — G1 token identity starts at token 0.
+        let mut seed_logits = std::mem::take(&mut logits);
         let sampled = sampler::sample_with_penalties(
-            &mut logits,
+            &mut seed_logits,
             params.temp,
             params.top_k,
             params.top_p,
@@ -893,51 +969,159 @@ fn main() {
             &prev_tokens,
             &mut rng,
         );
-        if timing {
-            t_samp += t0.elapsed().as_secs_f64();
-        }
-
-        if is_stop_token(sampled.token_id, &special) {
-            break;
-        }
-        generated.push(sampled.token_id);
-        prev_tokens.push(sampled.token_id);
-        if prev_tokens.len() > REPEAT_LAST_N {
-            prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
-        }
-
-        // Stop-string detection on the FULL byte stream before emitting.
-        full.extend_from_slice(&tokenizer.decode_bytes(&[sampled.token_id]));
-        if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
-            full.truncate(cut);
-            if cut > emitted {
+        let mut next_token = sampled.token_id;
+        let mut stop = false;
+        if is_stop_token(next_token, &special) {
+            stop = true;
+        } else {
+            generated.push(next_token);
+            prev_tokens.push(next_token);
+            full.extend_from_slice(&tokenizer.decode_bytes(&[next_token]));
+            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                full.truncate(cut);
+                if cut > emitted {
+                    hi.feed(&full[emitted..]);
+                    emitted = full.len();
+                }
+                stop = true;
+            }
+            if !stop && emitted < full.len() {
                 hi.feed(&full[emitted..]);
                 emitted = full.len();
             }
-            break;
+            if trace_on {
+                let text =
+                    String::from_utf8_lossy(&tokenizer.decode_bytes(&[next_token])).into_owned();
+                crate::trace::set_token(next_token, &text);
+            }
         }
-        if emitted < full.len() {
-            hi.feed(&full[emitted..]);
-            emitted = full.len();
+        while !stop && generated.len() < params.n_predict {
+            let t0r = std::time::Instant::now();
+            let round_toks = engine.round(
+                &*model,
+                &mut target_cache,
+                next_token,
+                current_pos,
+                ctx,
+                &sparams,
+                &mut prev_tokens,
+                &mut rng,
+            );
+            if timing {
+                t_fwd += t0r.elapsed().as_secs_f64();
+                n_tok += round_toks.len();
+            }
+            let mut consumed = 0usize;
+            while consumed < round_toks.len() && generated.len() < params.n_predict {
+                let tok = round_toks[consumed];
+                if is_stop_token(tok, &special) {
+                    stop = true;
+                    break;
+                }
+                generated.push(tok);
+                full.extend_from_slice(&tokenizer.decode_bytes(&[tok]));
+                if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                    full.truncate(cut);
+                    if cut > emitted {
+                        hi.feed(&full[emitted..]);
+                        emitted = full.len();
+                    }
+                    stop = true;
+                    break;
+                }
+                if emitted < full.len() {
+                    hi.feed(&full[emitted..]);
+                    emitted = full.len();
+                }
+                if trace_on {
+                    let text =
+                        String::from_utf8_lossy(&tokenizer.decode_bytes(&[tok])).into_owned();
+                    crate::trace::set_token(tok, &text);
+                }
+                consumed += 1;
+            }
+            if stop {
+                break;
+            }
+            // The round already pushed every emitted token into prev_tokens
+            // (the accept loop's penalty windows depend on it). Bookkeeping
+            // follows what was actually emitted: an n_predict cut mid-round
+            // discards the tail (we exit right after, so the KV state that
+            // would have served those tokens is never read).
+            next_token = round_toks[consumed - 1];
+            current_pos += consumed;
         }
+        let st = &engine.stats;
+        eprintln!(
+            "\n[spec] rounds={} drafted={} accepted={} ({:.1}% of drafted) repairs={} tokens/round={:.2}",
+            st.rounds,
+            st.drafted,
+            st.accepted,
+            if st.drafted > 0 { st.accepted as f64 / st.drafted as f64 * 100.0 } else { 0.0 },
+            st.repairs,
+            if st.rounds > 0 { generated.len() as f64 / st.rounds as f64 } else { 0.0 }
+        );
+    }
+    if spec_engine.is_none() {
+        while generated.len() < params.n_predict {
+            t0 = std::time::Instant::now();
+            let sampled = sampler::sample_with_penalties(
+                &mut logits,
+                params.temp,
+                params.top_k,
+                params.top_p,
+                params.repeat_penalty,
+                params.frequency_penalty,
+                params.presence_penalty,
+                &prev_tokens,
+                &mut rng,
+            );
+            if timing {
+                t_samp += t0.elapsed().as_secs_f64();
+            }
 
-        // forward() returns n_out*nv logits (n_out=1 for single-token decode,
-        // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
-        if trace_on {
-            let text =
-                String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id])).into_owned();
-            crate::trace::set_token(sampled.token_id, &text);
+            if is_stop_token(sampled.token_id, &special) {
+                break;
+            }
+            generated.push(sampled.token_id);
+            prev_tokens.push(sampled.token_id);
+            if prev_tokens.len() > REPEAT_LAST_N {
+                prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
+            }
+
+            // Stop-string detection on the FULL byte stream before emitting.
+            full.extend_from_slice(&tokenizer.decode_bytes(&[sampled.token_id]));
+            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                full.truncate(cut);
+                if cut > emitted {
+                    hi.feed(&full[emitted..]);
+                    emitted = full.len();
+                }
+                break;
+            }
+            if emitted < full.len() {
+                hi.feed(&full[emitted..]);
+                emitted = full.len();
+            }
+
+            // forward() returns n_out*nv logits (n_out=1 for single-token decode,
+            // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
+            if trace_on {
+                let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
+                    .into_owned();
+                crate::trace::set_token(sampled.token_id, &text);
+            }
+            t1 = std::time::Instant::now();
+            logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
+            if trace_on {
+                crate::trace::attach_step(&logits);
+            }
+            if timing {
+                t_fwd += t1.elapsed().as_secs_f64();
+                n_tok += 1;
+            }
+            current_pos += 1;
         }
-        t1 = std::time::Instant::now();
-        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
-        if trace_on {
-            crate::trace::attach_step(&logits);
-        }
-        if timing {
-            t_fwd += t1.elapsed().as_secs_f64();
-            n_tok += 1;
-        }
-        current_pos += 1;
     }
     // Final flush of any bytes not yet written (incl. a dangling partial
     // <think> marker, emitted raw).

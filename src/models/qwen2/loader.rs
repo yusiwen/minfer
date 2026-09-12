@@ -173,8 +173,22 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 // Tensor loading
 // ============================================================
 
-fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTensorInfo) -> Tensor {
+fn load_tensor(
+    ctx: &GgufContext,
+    raw: &'static [u8],
+    ti: &crate::gguf::GgufTensorInfo,
+    ns: &str,
+) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
+    // Registry names are namespaced for non-primary models (see Qwen2Model::ns):
+    // the tensor's logical name (set_name) and every GPU registration use the
+    // prefixed form, so a second model cannot collide with the first one's
+    // name-keyed registry entries.
+    let reg_name = if ns.is_empty() {
+        ti.name.clone()
+    } else {
+        format!("{ns}{}", ti.name)
+    };
     let mut shape = [1i64; 4];
     for j in 0..4 {
         shape[j] = ti.ne[j];
@@ -197,7 +211,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
     }
 
     let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
-    tensor.set_name(&ti.name);
+    tensor.set_name(&reg_name);
 
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
@@ -213,9 +227,9 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 | TensorType::Q6_K
                 | TensorType::Q8_0
         ) {
-            mps.register_weight(&ti.name, tensor.data());
+            mps.register_weight(&reg_name, tensor.data());
         } else if ttype == TensorType::F32 {
-            mps.register_weight(&ti.name, tensor.data());
+            mps.register_weight(&reg_name, tensor.data());
         }
     }
     #[cfg(feature = "cuda")]
@@ -237,16 +251,20 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 // (the raw 210-byte stride forces 1-byte-per-instruction
                 // reads and caps 7B decode near ~38 GB/s).
                 cuda.register_weight_q6k_padded(
-                    &ti.name,
+                    &reg_name,
                     tensor.data(),
                     tensor.shape[1] as usize,
                     tensor.shape[0] as usize,
                 );
             } else {
-                cuda.register_weight(&ti.name, tensor.data());
+                cuda.register_weight(&reg_name, tensor.data());
                 // r60: a non-NB-BT-consumable quantized weight (not q4_K/
                 // q6_K) makes mode-2 skip-write fused producers unsound —
-                // see CudaState::clear_mmq_nb_bt_only.
+                // see CudaState::clear_mmq_nb_bt_only. Global flag, global
+                // mix: ANY registered weight counts, namespaced or not — a
+                // q4_0 draft must degrade the primary model to mode 1 (a
+                // kept-true flag leaves mode 2 armed while the two-model
+                // process violates its single-window guarantee).
                 if !matches!(ttype, TensorType::Q4_K | TensorType::Q6_K) {
                     cuda.clear_mmq_nb_bt_only();
                 }
@@ -266,7 +284,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                     && tensor.shape[1] as usize % 2 == 0
                 {
                     cuda.register_weight_q4k_dsc(
-                        &ti.name,
+                        &reg_name,
                         tensor.data(),
                         tensor.shape[1] as usize,
                         tensor.shape[0] as usize,
@@ -274,7 +292,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 }
             }
         } else if ttype == TensorType::F32 {
-            cuda.register_weight(&ti.name, tensor.data());
+            cuda.register_weight(&reg_name, tensor.data());
             // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
             // are 1-D) — its GEMM reads the f32 A directly, so a mode-2
             // skip-write producer upstream would feed it a dead buffer.
@@ -291,7 +309,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
 // Architecture loader
 // ============================================================
 
-pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
+pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen2Model> {
     #[cfg(feature = "cuda")]
     // Initialize CUDA BEFORE registering any weight: init() blocks while
     // another thread is mid-init, so the per-tensor `CudaState::get()` below
@@ -338,12 +356,12 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
     let load_one = |n: &str| -> Option<Tensor> {
         tensor_map.get(n).map(|(pi, ti)| {
             let part = &model.parts[*pi];
-            load_tensor(&part.ctx, &part.data, ti)
+            load_tensor(&part.ctx, &part.data, ti, ns)
         })
     };
     let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
         let part = &model.parts[*pi];
-        load_tensor(&part.ctx, &part.data, ti)
+        load_tensor(&part.ctx, &part.data, ti, ns)
     };
 
     // Token embedding
@@ -392,7 +410,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
         if let Some(mps) = crate::metal::MpsState::get() {
             if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
                 if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
-                    mps.register_weight(&format!("blk.{i}.attn_qkv"), &data);
+                    mps.register_weight(&format!("{ns}blk.{i}.attn_qkv"), &data);
                 }
             }
         }
@@ -409,7 +427,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
                 let fuse = !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
                 if fuse {
                     if let Some(data) = crate::cuda::concat_rows(&[wq, wk, wv]) {
-                        let name = format!("blk.{i}.attn_qkv");
+                        let name = format!("{ns}blk.{i}.attn_qkv");
                         if wq.ttype == crate::tensor::TensorType::Q6_K {
                             cuda.register_weight_q6k_padded(
                                 &name,
@@ -455,7 +473,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
                     && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
                 if fuse {
                     if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
-                        mps.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                        mps.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
                     }
                 }
             }
@@ -477,13 +495,13 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
                     if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
                         if fg.ttype == crate::tensor::TensorType::Q6_K {
                             cuda.register_weight_q6k_padded(
-                                &format!("blk.{i}.ffn_gu"),
+                                &format!("{ns}blk.{i}.ffn_gu"),
                                 &data,
                                 (fg.shape[1] + fu.shape[1]) as usize,
                                 fg.shape[0] as usize,
                             );
                         } else {
-                            cuda.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                            cuda.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
                         }
                     }
                 }
@@ -513,6 +531,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen2Model> {
         output: Some(output),
         output_b,
         layers,
+        ns: ns.to_string(),
     };
 
     // 8p: warm the persistent per-weight f16 dequant cache at load (one

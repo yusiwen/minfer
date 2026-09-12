@@ -18,6 +18,16 @@ pub struct Qwen2Model {
     pub output: Option<Tensor>,
     pub output_b: Option<Tensor>,
     pub layers: Vec<LayerWeights>,
+    /// GPU weight-registry namespace. The registry is process-global and
+    /// name-keyed ("single-model-per-process" held until D5-R speculative
+    /// decoding loaded a second, draft model whose GGUF tensor names collide
+    /// with the target's — the collision silently failed the target's
+    /// all-or-nothing CUDA check and dropped it to CPU). The first model
+    /// loads with `""` (all names unchanged); every later model gets a
+    /// prefix ("draft.") applied to its tensor names at load, so
+    /// registration, graph build, and the participation checks all resolve
+    /// namespaced keys consistently.
+    pub ns: String,
 }
 
 impl Qwen2Model {

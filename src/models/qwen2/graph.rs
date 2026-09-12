@@ -37,6 +37,9 @@ impl Qwen2Graph {
     /// `params` — the reuse invariant).
     pub fn build(model: &Qwen2Model, params: &GraphParams) -> ComputeGraph {
         let hp = &model.hparams;
+        // Namespaced fused-weight names must match the loader's registration
+        // keys (Qwen2Model::ns; empty for the primary model).
+        let wns = &model.ns;
         let nt = params.n_tokens;
         let ne = hp.n_embd as usize;
         let nh = hp.n_head as usize;
@@ -108,7 +111,7 @@ impl Qwen2Graph {
                     inp_pos,
                     il,
                     FusedQkvMeta {
-                        qkv_weight: format!("blk.{il}.attn_qkv"),
+                        qkv_weight: format!("{wns}blk.{il}.attn_qkv"),
                         bias_q: l.bq.as_ref().map(|t| t.name.clone()),
                         bias_k: l.bk.as_ref().map(|t| t.name.clone()),
                         bias_v: l.bv.as_ref().map(|t| t.name.clone()),
@@ -244,7 +247,7 @@ impl Qwen2Graph {
                 let gu = b.fused_ffn(
                     normed,
                     FusedFfnMeta {
-                        gu_weight: format!("blk.{il}.ffn_gu"),
+                        gu_weight: format!("{wns}blk.{il}.ffn_gu"),
                         weight_ttype: l.ffn_gate.as_ref().unwrap().ttype,
                         in_dim: ne,
                         nf,

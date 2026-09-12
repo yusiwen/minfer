@@ -192,8 +192,19 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 // Tensor loading
 // ============================================================
 
-fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTensorInfo) -> Tensor {
+fn load_tensor(
+    ctx: &GgufContext,
+    raw: &'static [u8],
+    ti: &crate::gguf::GgufTensorInfo,
+    ns: &str,
+) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
+    // Registry names are namespaced for non-primary models (see Qwen3Model::ns).
+    let reg_name = if ns.is_empty() {
+        ti.name.clone()
+    } else {
+        format!("{ns}{}", ti.name)
+    };
     let mut shape = [1i64; 4];
     for j in 0..4 {
         shape[j] = ti.ne[j];
@@ -216,7 +227,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
     }
 
     let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
-    tensor.set_name(&ti.name);
+    tensor.set_name(&reg_name);
 
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
@@ -232,9 +243,9 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                 | TensorType::Q6_K
                 | TensorType::Q8_0
         ) {
-            mps.register_weight(&ti.name, tensor.data());
+            mps.register_weight(&reg_name, tensor.data());
         } else if ttype == TensorType::F32 {
-            mps.register_weight(&ti.name, tensor.data());
+            mps.register_weight(&reg_name, tensor.data());
         }
     }
     #[cfg(feature = "cuda")]
@@ -252,6 +263,8 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
             if ttype != TensorType::Q4_K && ttype != TensorType::Q6_K {
                 // r60: non-NB-BT-consumable quantized weight — mode-2
                 // skip-write producers unsound (see qwen2 loader twin).
+                // Global flag, global mix: any registered weight counts,
+                // namespaced or not.
                 cuda.clear_mmq_nb_bt_only();
             }
             if ttype == TensorType::Q6_K {
@@ -266,10 +279,10 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
                     tensor.shape[0] as usize,
                 );
             } else {
-                cuda.register_weight(&ti.name, tensor.data());
+                cuda.register_weight(&reg_name, tensor.data());
             }
         } else if ttype == TensorType::F32 {
-            cuda.register_weight(&ti.name, tensor.data());
+            cuda.register_weight(&reg_name, tensor.data());
             // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
             // are 1-D) — mode-2 skip-write producers unsound upstream.
             if tensor.shape.len() == 2 {
@@ -285,7 +298,7 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &crate::gguf::GgufTens
 // Architecture loader
 // ============================================================
 
-pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
+pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Model> {
     #[cfg(feature = "cuda")]
     // Same rationale as qwen2/loader.rs: block until CUDA init completes so
     // per-tensor registration is all-or-nothing (no partial gate flips).
@@ -343,12 +356,12 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
     let load_one = |n: &str| -> Option<Tensor> {
         tensor_map.get(n).map(|(pi, ti)| {
             let part = &model.parts[*pi];
-            load_tensor(&part.ctx, &part.data, ti)
+            load_tensor(&part.ctx, &part.data, ti, ns)
         })
     };
     let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
         let part = &model.parts[*pi];
-        load_tensor(&part.ctx, &part.data, ti)
+        load_tensor(&part.ctx, &part.data, ti, ns)
     };
 
     // Token embedding
@@ -393,7 +406,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         if let Some(mps) = crate::metal::MpsState::get() {
             if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
                 if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
-                    mps.register_weight(&format!("blk.{i}.attn_qkv"), &data);
+                    mps.register_weight(&format!("{ns}blk.{i}.attn_qkv"), &data);
                 }
             }
         }
@@ -435,7 +448,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
                     && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
                 if fuse {
                     if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
-                        mps.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                        mps.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
                     }
                 }
             }
@@ -457,13 +470,13 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
                     if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
                         if fg.ttype == crate::tensor::TensorType::Q6_K {
                             cuda.register_weight_q6k_padded(
-                                &format!("blk.{i}.ffn_gu"),
+                                &format!("{ns}blk.{i}.ffn_gu"),
                                 &data,
                                 (fg.shape[1] + fu.shape[1]) as usize,
                                 fg.shape[0] as usize,
                             );
                         } else {
-                            cuda.register_weight(&format!("blk.{i}.ffn_gu"), &data);
+                            cuda.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
                         }
                     }
                 }
@@ -481,6 +494,7 @@ pub fn load(model: &crate::gguf::GgufModel) -> Option<super::Qwen3Model> {
         output: Some(output),
         output_b,
         layers,
+        ns: ns.to_string(),
     };
 
     // 8p: warm the persistent per-weight f16 dequant cache at load.

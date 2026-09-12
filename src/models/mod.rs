@@ -93,15 +93,25 @@ pub struct SpecialTokens {
 /// Load a model from GGUF (single file or multi-part split), dispatching on
 /// `general.architecture` from part 0.
 pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
+    load_model_ns(model, "")
+}
+
+/// Load with a GPU weight-registry namespace. The first (primary) model of a
+/// process uses `""` — every name resolves exactly as before. A second model
+/// (the D5-R spec-decode draft) must pass a distinct prefix (e.g. "draft."):
+/// the registry is process-global and name-keyed, and without the prefix the
+/// second load collides with the first, fails its all-or-nothing CUDA check,
+/// and silently drops the primary model to CPU.
+pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
     let ctx = &model.parts[0].ctx;
     let arch = ctx.get_key_val_str("general.architecture")?;
     match arch.as_str() {
         "qwen2" => {
-            let m = qwen2::loader::load(model)?;
+            let m = qwen2::loader::load(model, ns)?;
             Some(Box::new(m))
         }
         "qwen3" => {
-            let m = qwen3::loader::load(model)?;
+            let m = qwen3::loader::load(model, ns)?;
             Some(Box::new(m))
         }
         other => {

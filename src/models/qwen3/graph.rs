@@ -35,6 +35,9 @@ impl Qwen3Graph {
     /// `params` — the reuse invariant).
     pub fn build(model: &Qwen3Model, params: &GraphParams) -> ComputeGraph {
         let hp = &model.hparams;
+        // Namespaced fused-weight names must match the loader's registration
+        // keys (Qwen3Model::ns; empty for the primary model).
+        let wns = &model.ns;
         let nt = params.n_tokens;
         let ne = hp.n_embd as usize;
         let nh = hp.n_head as usize;
@@ -98,7 +101,7 @@ impl Qwen3Graph {
                     inp_pos,
                     il,
                     FusedQkvNormMeta {
-                        qkv_weight: format!("blk.{il}.attn_qkv"),
+                        qkv_weight: format!("{wns}blk.{il}.attn_qkv"),
                         q_norm_name: l.q_norm.as_ref().map(|t| t.name.clone()),
                         k_norm_name: l.k_norm.as_ref().map(|t| t.name.clone()),
                         weight_ttype: l.wq.as_ref().unwrap().ttype,
@@ -206,7 +209,7 @@ impl Qwen3Graph {
                 let gu = b.fused_ffn(
                     normed,
                     crate::graph::ops::FusedFfnMeta {
-                        gu_weight: format!("blk.{il}.ffn_gu"),
+                        gu_weight: format!("{wns}blk.{il}.ffn_gu"),
                         weight_ttype: l.ffn_gate.as_ref().unwrap().ttype,
                         in_dim: ne,
                         nf,

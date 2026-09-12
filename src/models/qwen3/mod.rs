@@ -28,6 +28,10 @@ pub struct Qwen3Model {
     pub output: Option<Tensor>,
     pub output_b: Option<Tensor>,
     pub layers: Vec<LayerWeights>,
+    /// GPU weight-registry namespace (see Qwen2Model::ns): empty for the
+    /// primary model, "draft." for a spec-decode draft, so a second model's
+    /// name-keyed registrations cannot collide with the first one's.
+    pub ns: String,
 }
 
 impl Qwen3Model {
