@@ -413,6 +413,7 @@ Appendix B points at the cross-cutting methodology.
 | 82 | [small-M dispatch fix — multi-token MMVQ + token-looped legacy kernels: the batching invariant restored, D5 verdict unchanged (LANDED)](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md) |
 | 83 | [D5-R stage 1 — speculative decode loop: two-model process fixes, accept-loop unit tests, greedy-identity investigation (LANDED)](./cuda_optimization_steps/83-d5-r-stage1-spec-loop.md) |
 | 84 | [D5-R stage 2 — same-window dual-engine battery vs llama.cpp: 1.33×/1.59× vs 1.64×/2.08×, gap = verify row marginal (LANDED)](./cuda_optimization_steps/84-d5-r-stage2-dual-engine-battery.md) |
+| D5-R ③ | verify marginal priced with an nsys per-kernel ledger (specverify per-nt runs, exact forward spans) | this commit + doc 85 | nt=3 marginal 17.6 ms = attention +9.0 (nt 2–63 legacy per-(token,head) kernel; nt=1 split path does the same KV in 0.8 ms) + matmul +8.1 (multi-MMVQ row slope 4.05 ms/row) + elt +1.9 + idle +0.7; nt=9 falls off multi-MMVQ onto padded GEMM (48.4→84.9 ms matmul) | ncu counters permission-blocked (ERR_NVGPUCTRPERM); durations from nsys suffice for pricing | — | LANDED | the marginal was not where the plan looked — the batched-attention nt 2–63 hole (a shape range no caller ever exercised before spec decode) is half the prize; d=8's loss is a dispatch cliff, not a slope; priced recovery at d=2 → C_T(3) ≈ 42 ms → 1.64× ≈ llama parity |
 
 ### Methodology
 
