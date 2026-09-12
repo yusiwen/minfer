@@ -16,9 +16,7 @@ additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.fold]
 enable = true
-level = 1
-
-[preprocessor]
+level = 0
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
