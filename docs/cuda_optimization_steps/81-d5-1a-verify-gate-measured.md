@@ -280,6 +280,33 @@ Consequences for the D5 record:
   plumbing — or adopting llama.cpp's already-working implementation) is a
   scope decision, not a measurement.
 
+**Addendum (same session): the minfer-vs-llama speculative comparison,
+predicted from measured components.** minfer has no spec loop, so the
+prediction multiplies the engine-independent terms (per-position acceptance
+p, draft cost C_D ≈ 2.9 ms/token for the 0.5B q4_0 on either engine) by
+each engine's measured verify curve. C_T(9) was measured for this table
+(`specverify -p 512 -r 40`, both passes; 14B C_T(1)=39.0 this window vs
+42.15 the prior day — machine-state drift, ratios stable):
+
+| pair | d | minfer (predicted) | llama.cpp (measured) |
+|---|---:|---:|---:|
+| 7B + 0.5B | 2 | 1.02× | 1.53× |
+| 7B + 0.5B | 8 | **0.74× (a loss)** | 1.60× |
+| 14B + 0.5B | 2 | 1.34× | 1.86× |
+| 14B + 0.5B | 8 | 1.09× | 2.42× |
+
+Model: speedup = E(d,p)·C_T(1) / (C_T(d+1) + (d+1)·C_D + 1.2 ms eager
+overhead), E = 1+Σp^k, p = 0.69 (7B, doc 80) / 0.74 (14B, §4.3). The two
+engines share p, C_D, and even C_T(1) (minfer's single-token decode is
+marginally faster: 39.0 vs 41.8 ms) — **the entire gap is the batched-verify
+marginal**: minfer pays 3.9 (7B) / 7.8 (14B) ms per extra verified token vs
+llama's ~1.0–1.5, making its nt=9 verify round 1.64× (7B) / 2.02× (14B)
+more expensive. If minfer's marginal reached llama's, the predictions
+converge to llama's measured gains. Note the 7B d=8 entry: with a fat
+verify marginal, long drafts are a net loss — a reopened campaign should
+start at d=2 on the 14B pair, where plumbing alone (no kernel work) is
+worth ≈ +34% today.
+
 ## 5. Lessons
 
 - **The gate did its job — 90 minutes of measurement against days of
