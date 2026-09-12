@@ -18,9 +18,12 @@ Postscript (2026-09-11): the underlying dispatch hole was **fixed separately**
 in [step doc 82](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md) —
 multi-token MMVQ + token-looped legacy kernels restore the batching invariant
 (7B nt=3 105.9 → 29.4 ms, 3.60×; marginal 34.4 → 4.3 ms/token) for the small-M
-prefill tax and future multi-token features. The D5 verdict is unchanged:
-C_T(3)=29.4 ms still exceeds the 22.1 ms the speculative economics required,
-and the llama.cpp external reference (1.00×) stands.
+prefill tax and future multi-token features. (Correction, 2026-09-12: the "external reference 1.00×" cited that day was
+a measurement artifact — llama-cli silently ignores `-md` without
+`--spec-type draft-simple`. Corrected batteries measure 1.53–1.60× (7B) /
+1.86–2.43× (14B) for llama.cpp's own speculative decoding, and minfer's
+post-fix primitive implies ≈1.42× at d=2 on the 14B. The closure verdict is
+under campaign review — see doc 81 §4.3.)
 
 The reference study is [`LLAMA-CPP-SPECULATIVE-ANALYSIS.md`](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
 (llama.cpp `draft-simple`, source-verified: speculator framework §3, draft

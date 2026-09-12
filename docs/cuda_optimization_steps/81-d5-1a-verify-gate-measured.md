@@ -1,5 +1,15 @@
 # 81 · D5-1a — the verify-batch gate measured end-to-end: no amortization at any nt, D5 closed (LANDED · gate FAIL)
 
+> ⚠️ **ERRATA (2026-09-12, §4.3): the §4.1/§4.2 llama-cli external batteries
+> never engaged the draft model** — llama-cli silently ignores `-md` unless
+> `--spec-type draft-simple` is passed (default `none`). The "external 1.00×"
+> anchor was base-vs-base. Corrected batteries measure **1.53–1.60× (7B) and
+> 1.86–2.43× (14B)** for llama.cpp's own speculative decoding on the same
+> pairs. The minfer-side gate numbers (0.52× pre-fix) are unaffected; the
+> closure verdict's external pillar is void. See §4.3 and the doc 82 §5
+> cost-model errata. Whether D5 reopens is a campaign decision, not settled
+> by this errata.
+
 > **Result**: the pre-registered D5-0 gate FAILED decisively. End-to-end
 > target verify cost at KV depth 512 (7B q4_k_m, CUDA): C_T(1)=18.33 ms,
 > C_T(3)=106.0 ms → per-token amortization **0.52×** vs the required ≥ 2.5×
@@ -214,6 +224,61 @@ the reported metric unsatisfiable by construction (≤ 1.0). The doc 81/82
 tables were computed from the raw medians with the correct
 `nt·C_T(1)/C_T(nt)` formula and are unaffected; raw medians are unchanged
 by the fix.
+
+### 4.3 Measurement errata — the external batteries never engaged the draft (2026-09-12)
+
+The §4.1 and §4.2 llama-cli batteries are **invalid**: at build
+`b10665-ca3d5a3e1`, llama-cli's `--spec-type` defaults to `none`, and `-md`
+without an explicit `--spec-type draft-simple` is **silently ignored** — no
+draft is loaded, no warning is printed (verified: zero draft-related lines
+in every captured battery log, and identical speeds across all "draft"
+lengths). Both batteries therefore measured base-vs-base and their "1.00×"
+conclusions are void.
+
+The acceptance tool (`llama-speculative-simple`, which doc 80 invoked WITH
+`--spec-type draft-simple`) was never affected. Re-running the corrected
+battery (llama-cli, explicit `--spec-type draft-simple`, 3 interleaved reps,
+prose/code prompts, same greedy protocol):
+
+| pair | base | draft n=2 | draft n=8 | draft n=16 |
+|---|---|---|---|---|
+| 7B + 0.5B q4_0 | 46.0 t/s | 70.6 (**1.53×**) | 73.4 (**1.60×**) | 58.0 (1.26×) |
+| 14B + 0.5B q4_0 | 23.9 t/s | 44.5 (**1.86×**) | 57.9 (**2.42×**) | 58.1 (**2.43×**) |
+
+llama.cpp's own speculative decoding does NOT land at 1.00× on GB10 — it
+lands at **1.5–1.6× (7B) and 1.9–2.4× (14B)** with the generic 0.5B draft
+(code prompts gain most: 14B d=8 code = 74.9 t/s = 3.1× base). The
+mechanism: llama's batched verify is nearly weights-once — decomposing the
+`speculative-simple` runs gives C_T(3) ≈ 47 ms vs C_T(1) = 42 ms and a
+~1.5 ms/token marginal at nt≈9 on the 14B, i.e. an amortization (~2.7× at
+nt=3, ~5×+ at nt=9) that clears doc 80's break-even comfortably. Per-
+position greedy acceptance is **p ≈ 0.74** at 14B (consistent across d=2
+and d=8; the tool's printed "accept = 61.7%/31.5%" divides by ALL drafted
+tokens including the fixed-length overdraw, diluting the rate).
+
+Consequences for the D5 record:
+
+- The §4.1 conclusion "the strategy itself has no headroom on GB10" and the
+  "llama.cpp also lands at 1.00×" external pillar are **retracted**. Doc 80's
+  break-even table (p\* = 0.73/0.81/0.90) assumed minfer's then-projected
+  verify cost (C_T(3) ≈ 2·C_T(1)); with an actually-efficient verify the
+  break-even p\* at d=2 is ≈ 0.18–0.35, and the measured p ≈ 0.68–0.74 is far
+  above it.
+- The minfer-side measurements stand: pre-fix the batched path really was
+  0.52× (weights re-streamed per row), and doc 82 fixed it to 2.14× (14B) /
+  1.87× (7B) at nt=3. Applying the measured costs (C_T(3)=59.14 ms, C_D=2.92
+  ms, p=0.74) to minfer's post-fix primitive implies d=2 speculative decoding
+  would net ≈ **1.42× on the 14B** and ≈ 1.05× on the 7B today — positive but
+  below llama's 1.86×, the gap being minfer's nt≥3 batched marginal
+  (~7.1 ms/token vs llama's ~1.5).
+- The pre-registered 2.5×-amortization gate itself was derived from the
+  flawed cost model dissected in doc 82 §5; with the corrected model the gate
+  was miscalibrated, so "gate FAIL ⇒ no headroom" no longer follows.
+- **The D5 CLOSED status is left standing in the records pending a campaign
+  decision** — this errata voids the external pillar and revises the
+  economics, but reopening the campaign (a Speculator, KV rollback, loop
+  plumbing — or adopting llama.cpp's already-working implementation) is a
+  scope decision, not a measurement.
 
 ## 5. Lessons
 

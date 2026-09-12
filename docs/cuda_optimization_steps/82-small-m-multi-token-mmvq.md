@@ -222,7 +222,10 @@ nt × token-work (≈ 4.3 ms). The 2.5× figure was in fact the doc 81 D5
 spec-economics threshold (C_T(3) ≤ 22.1 ms) smuggled in as a fix bar. The
 fix's actual goal — weight traffic independent of nt — is fully achieved, and
 the pre-fix amortization regression (0.52×) is gone. D5 stays closed:
-C_T(3) = 29.4 ms > 22.1 ms required.
+C_T(3) = 29.4 ms > 22.1 ms required. (⚠️ see the doc 81 §4.3 errata, same
+day: the 22.1 threshold traced to a cost model and an external anchor that
+were both later invalidated — corrected economics put post-fix minfer at
+≈1.42× for d=2 on the 14B; the closure verdict is under campaign review.)
 
 Regression: pp512 4075.96 ± 52.96 → 4072.79 ± 62.43 t/s (−0.08%, noise; the
 retimed ≥ 9 GEMM gate does not touch nt ≥ 16 prefill), tg128 51.86 ± 2.93 →
