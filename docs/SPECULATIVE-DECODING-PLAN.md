@@ -1,181 +1,147 @@
-# Speculative Decoding (D5) — Plan
+# Speculative Decoding (D5-R) — Plan
 
-Status: **D5 CLOSED (2026-09-10) — the D5-1a gate failed by measurement**
-(records: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md),
-[step doc 81](./cuda_optimization_steps/81-d5-1a-verify-gate-measured.md)).
-Doc 80's conditional go rested on one number: the nt=3 verify amortization
-≥ 2.5×. Doc 81 measured it end-to-end with the `minfer specverify`
-instrument: C_T(3)=106 ms → per-token amortization **0.52×** (needed ≤ 22.1
-ms). The nt=2–8 batched path costs a flat ~35 ms per token (weights
-re-streamed per row — no amortization anywhere; the real tile-regime step
-sits at M≥16, unreachable for verify), so even a dispatch fix or batch
-padding caps below break-even. Per the stop rule pre-registered in D5-0 and
-§D5-1 below, the campaign stops after the primitive (the instrument); no
-`Speculator` trait, KV rollback, or loop plumbing will be built. The rest of
-this document is kept as the record of what was planned.
-
-Postscript (2026-09-11): the underlying dispatch hole was **fixed separately**
-in [step doc 82](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md) —
-multi-token MMVQ + token-looped legacy kernels restore the batching invariant
-(7B nt=3 105.9 → 29.4 ms, 3.60×; marginal 34.4 → 4.3 ms/token) for the small-M
-prefill tax and future multi-token features. (Correction, 2026-09-12: the "external reference 1.00×" cited that day was
-a measurement artifact — llama-cli silently ignores `-md` without
-`--spec-type draft-simple`. Corrected batteries measure 1.53–1.60× (7B) /
-1.86–2.43× (14B) for llama.cpp's own speculative decoding, and minfer's
-post-fix primitive implies ≈1.42× at d=2 on the 14B. The closure verdict is
-under campaign review — see doc 81 §4.3.)
+Status: **D5-R OPENED (2026-09-12) — stage ① (greedy d=2 loop) in progress.**
+Speculative decoding reopened by decision after the doc 81 §4.3 errata
+invalidated the original closure's external pillar and doc 82 restored the
+batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
+will be built") is retired; its errors are recorded in the Appendix.
 
 The reference study is [`LLAMA-CPP-SPECULATIVE-ANALYSIS.md`](./LLAMA-CPP-SPECULATIVE-ANALYSIS.md)
 (llama.cpp `draft-simple`, source-verified: speculator framework §3, draft
 model setup §4, drafting loop §5, verification §6, KV rollback §7, cost model
-§9, minfer port notes §11).
+§9, minfer port notes §11). Records: docs
+[80](./cuda_optimization_steps/80-d5-0-cost-model.md),
+[81](./cuda_optimization_steps/81-d5-1a-verify-gate-measured.md),
+[82](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md).
 
-## 1. Why now — the evidence
+## 1. Why reopened — the corrected evidence
 
-- **The kernel-side foundation is already paid for.** The D series quantified
-  the decode GEMM regime: MMQ at M=1 collapses to a 0.14-wave launch (step doc
-  08), while at nt=4 the BT-MMQ path is **2.7× cheaper per token** (D4-1). A
-  verification round is exactly an `nt = d+1` batched decode — it lands in the
-  cheap regime by construction.
-- **The engine already has the three structural prerequisites**:
-  1. **Params-only graph reuse** — a fixed draft length `d` makes the verify
-     graph a single `GraphParams` identity, captured once and replayed.
-  2. **KV positions are data, not structure** — rollback never touches graph
-     topology; it only rewinds the write position.
-  3. **Per-layer persistent KV regions** (`KvProvider`) — a `seq_rm`-style
-     truncation is a region-level operation, no snapshot machinery (the
-     `PART` fast path analog; analysis §7, §11#5).
-- **The decode campaign closed with parity/ahead against llama.cpp** (7B tg128
-  1.074×, 14B 1.018×; hub §1), so the next meaningful decode-side lever is
-  wall-clock-per-token, not kernel micro-optimization.
+Every number below is measured (docs 80–82 + the doc 81 §4.3 corrected
+batteries):
+
+- **Doc 82 fixed the dispatch hole**: verify amortization at nt=3 went
+  0.52× → **2.14×** (14B q4_k_m, C_T(3)=56.6 ms vs C_T(1)=39.0); the batched
+  verify is now a weights-once round, not a per-row restream.
+- **llama.cpp's own speculative decoding demonstrably wins on GB10**:
+  **1.53–1.60× (7B) / 1.86–2.43× (14B)** with the *generic* Qwen2.5-0.5B q4_0
+  draft (the original "1.00× external anchor" was a measurement artifact —
+  see Appendix).
+- **The engine-independent terms are known**: per-position greedy acceptance
+  p ≈ 0.74 (14B pair) / 0.69 (7B), draft cost C_D ≈ 2.9 ms/token — identical
+  for both engines, as is C_T(1) (minfer 39.0 vs llama 41.8 ms on the 14B).
+- **Predicted minfer economics** (measured components, doc 81 §4.3 addendum):
+  d=2 → **1.34×** on the 14B from plumbing alone today; d=8 → 1.09× until the
+  verify marginal shrinks. The entire gap to llama is the batched-verify
+  marginal (minfer 3.9/7.8 vs llama ~1.0–1.5 ms per extra token).
+- **The original go/no-go bar was mis-derived** (doc 82 §5): it took the
+  per-token marginal as ε. With the corrected cost model, break-even
+  acceptance at d=2 with an efficient verify is p\* ≈ 0.18–0.35 — the measured
+  p clears it comfortably.
 
 ## 2. Scope
 
-### In scope (D5): `draft-simple` — the small draft model
+### In scope (D5-R): `draft-simple`, greedy first
 
-One draft GGUF (e.g. Qwen2.5-0.5B-Instruct) drafting greedily for a target
-(7B q4_k_m), verified by the target in one `nt = d+1` batched forward. This is
-the only speculator type that requires **no new architecture support**: it runs
-today on Qwen2/Qwen2.5/Qwen3 dense models with existing GGUFs.
+One draft GGUF (Qwen2.5-0.5B q4_0) drafting greedily for a target
+(Qwen2.5-14B q4_k_m primary — the 7B is marginal at d=2 — verified in one
+`nt = d+1` batched forward through the existing `forward_graph_cached`
+primitive). d=2 is the gate configuration; d=8 the end state.
 
-### Deferred (not in D5)
+### Deferred (not in D5-R)
 
-| Type | Why deferred |
-|---|---|
-| `draft-mtp` (MTP heads) | MTP weights exist only in DeepSeek-V3 / Qwen3-Next-class GGUFs; minfer does not support those architectures (MoE + MLA is a prerequisite campaign of its own), and current Qwen3 dense GGUFs carry no MTP tensors. |
-| `draft-eagle3` | Draft weights consume the target's hidden states — needs a target-side feature export seam; tractable after D5 but a separate session. |
-| `draft-dflash` / `draft-dspark` | Same architecture-prerequisite class as MTP. |
-
-### Stretch (decide after D5-0): `ngram-simple`
-
-Prompt/recent-output n-gram lookup drafts for free — no model, no architecture
-prerequisite, no VRAM. In llama.cpp's priority chain all n-gram impls run
-BEFORE draft models (analysis §3.1: if they fill the draft, the draft model
-never runs). Strong for summarization / code-editing / long-context-copy
-workloads. Cheap to add once the `Speculator` chain exists; keep as a stretch
-goal, not a gate.
+`draft-mtp` / `draft-eagle3` / `draft-dflash` (a trained draft is the
+obvious follow-up lever — llama.cpp natively supports all three spec types —
+but each needs target-side feature seams or new architectures); n-gram
+stretch; temp>0 target-authoritative verification; server multi-slot.
 
 ## 3. Mechanism — one round
 
-With draft length `d` and acceptance count `a` (`a ≤ d`):
+With draft length `d` and accept count `a` (greedy: keep while the target's
+argmax equals the drafted token):
 
 ```
-draft phase     draft model: seed + d sequential nt==1 decode steps (latency-bound)
-verification    target: ONE nt=d+1 batched forward (throughput-bound, BT-MMQ sweet spot)
-accept/cut      sample each verify row with the user's sampler chain; keep while
-                equal to the draft token; always emit ≥ 1 token (the last verify row)
-rollback        drop KV rows beyond the accept point (positions-as-data; topology intact)
-commit          append accepted tokens; next round seeds from the last verify row
+draft phase     draft model: d sequential nt==1 forwards (second GraphCache)
+verification    target: ONE nt=d+1 forward, n_out=d+1 (rows: next_token +
+                the d drafted candidates, positions contiguous)
+accept/cut      greedy argmax per verify row; accept while equal to the
+                drafted token; always emit ≥ 1 token (the deepest accepted
+                row's logits = the bonus)
+KV              NO rollback kernels: the target wrote d+1 KV rows in place;
+                rejected slots are simply overwritten next round
+                ("positions are data" — the graph design makes rollback a
+                position-bookkeeping operation)
+commit          append accepted tokens; next round seeds from the bonus
 ```
 
-Net cost model (analysis §9): one target batched decode of `d+1` rows yields
-`1+a` tokens; the draft pays `≈ 2(1+d)` token-evaluations of a model that is
-several times cheaper per token. The practical knob is `d`: beyond the position
-where per-position acceptance collapses, drafted tokens only cost decode steps.
+**Greedy equivalence** is the primary correctness gate: at temp=0 the spec
+path MUST produce a token-identical stream to the non-spec path (both are
+argmax chains).
 
-**Greedy equivalence**: with `temp=0` the spec path MUST produce a byte-identical
-token stream to the non-spec path (both are argmax chains; verification replays
-the same math). This is the primary correctness gate. For `temp>0`,
-target-sampler-authoritative verification (analysis §6.3) preserves the target
-distribution but not the stream — documented, tested only for distribution
-shape.
+## 4. Design — stage ① minimal loop
 
-## 4. Touch points (file-level)
+Deliberately smaller than the retired plan's machinery:
 
-| # | Location | Change |
+- **`src/spec.rs`** — one concrete `SpecEngine` (no `Speculator` trait chain;
+  the chain seat opens in a later stage if a second speculator type lands):
+  holds the draft model (second `load_model` + its own `GraphCache`), runs d
+  draft forwards + 1 verify forward per round, returns 1..=d+1 tokens plus
+  the last row's logits.
+- **Vocab compatibility gate at load** (kept from the D5 analysis §4.2):
+  same vocab type, BOS/EOS, size delta ≤ 128, token-text equality.
+- **CLI**: `--spec-draft <model>` + `--spec-draft-n <d>` (default 2), round
+  stats (rounds / drafted / accepted / tokens-per-round) to stderr. The
+  `spec = off` path stays byte-identical to today.
+- **Sampling**: greedy argmax over the returned n_out rows (stage ① only;
+  temp>0 chains deferred). Logits readback is nt×n_vocab×4 B ≈ 1.8 MB/round
+  at d=2 — acceptable for the loop; on-GPU argmax is a stage ④ candidate.
+
+## 5. Stages & gates
+
+| Stage | Work | Gate |
 |---|---|---|
-| 1 | **new `src/spec/mod.rs`** | `Speculator` trait (ordered chain, llama-style: first impl producing a non-empty draft wins) + `DraftModel` impl + stats (accept %, per-position rates, tokens/round). The draft result carries optional per-token probabilities (`p_min` gate), NOT hardcoded greedy — leaves MTP/EAGLE3/n-gram a clean seat. |
-| 2 | **`src/main.rs` / `src/conversation.rs`** | Largest change: the decode loop becomes a round loop (draft d steps → verify → accept/cut → rollback → commit). The single-token fast path stays for `spec = off`. |
-| 3 | **`src/models/` + load path** | Second model instance: independent `GraphCache`, weights registry, KV regions. Hard gates: draft `n_ctx` ≥ target usage; vocab compatibility check over GGUF tokenizer tables (vocab type, BOS/EOS, ≤128 size delta, token-text equality; analysis §4.2). |
-| 4 | **`src/graph/params.rs` + `graph/cuda_backend.rs`** | Verify batch needs logits on EVERY row: `n_out = d+1` instead of decode's `n_out = 1` — touches the lm_head tail-rows dispatch assumption. Fixed `d` ⇒ one verify graph captured once and replayed; `positions` input refilled host-side per round (existing capture-safe mechanism). |
-| 5 | **`src/sampler.rs`** | `sample_and_accept_n` equivalent: run the user's chain per verify row, accept while equal to the draft token, always emit ≥ 1 token. |
-| 6 | **`src/graph/alloc.rs` / backends** | KV rollback: per-layer region truncation by position (dense models — no snapshots). CUDA path: rollback only moves the write position; stale rows beyond it are never read. Dedicated dump test required. |
-| 7 | **CLI / bench** | `--draft-model <gguf>`, `--draft-n <d>`, `--spec-stats`; `minfer bench` speculative mode + synthetic-acceptance rates (`--spec-synth-rates`, output invalid, throughput ceiling only; analysis §10). |
-| 8 | `src/server/` | Multi-slot integration — postposed to D5-4. |
+| ① d=2 loop (greedy) | `src/spec.rs` + CLI wiring | **G1**: spec-ON tokens == spec-OFF tokens, exact, ≥3 prompts (prose + code), 14B pair. **G2**: full suite green; off-path untouched. **G3**: per-round stats on stderr |
+| ② end-to-end battery | 14B+0.5B d=2, same-window A/B vs spec-off; llama measured 1.86× as the reference | t/s ≥ **1.2×** (predicted 1.34×); below that, profile before optimizing |
+| ③ verify-marginal attribution | ncu on the nt=3 and nt=9 rounds: nt=9 GEMM M-pad waste (doc 82 multi-MMVQ caps at nt≤8), dp4a utilization, attention query-tiling (KV read once per nt rows vs per row), logits/sampling | one session; a cost ledger with per-item ms |
+| ④ kernel attack | per ③'s ledger: multi-MMVQ extended to nt=9–16 (16-lane accumulators) and/or small-M GEMM tiles; graph capture for the fixed verify shapes (kills the +1.2 ms eager round overhead) | marginal 7.8 → ≤2.5 ms/tok (14B), then → ~1.5 |
+| ⑤ d=8 + tuning | re-measure the d=8 economics; adaptive d (truncate at acceptance collapse); stretch: ngram | d=8 ≥ 1.5× end-to-end (14B) |
 
-## 5. Phases
-
-### D5-0 — baseline & cost model (go/no-go gate) — DONE 2026-09-10
-
-Record: [step doc 80](./cuda_optimization_steps/80-d5-0-cost-model.md).
-Measured (3× interleaved medians, tg128): 7B q4_k_m CUDA **54.3** tok/s;
-0.5B q4_0 CUDA **342.2** / CPU **73.3**. Measured acceptance (llama.cpp
-`speculative-simple`, greedy, prose + code, both draft quants): conditional
-**p ≈ 0.68–0.70**. Break-even: p\* = 0.73 / 0.81 / 0.90 at d = 2/4/8 —
-measured p is below the line at every d unless the verify batch earns the
-BT-MMQ amortization. Verdict: **conditional go at d=2 only** — the gate is
-now the single number `C_T(3)`: minfer's measured nt=3 verify-batch
-amortization must be **≥ 2.5×** (anchor 2.7× at nt=4; interpolation 2.28× vs
-tile-step 2.7× disagree). Projected at the anchor: 1.04–1.05×; ceiling ~1.2×.
-CPU-draft cross-device: dead (1.35× — no break-even at any p, d). d ≥ 4: dead
-(≥ 4.5× amortization required).
-
-### D5-1 — engine primitives (no behavior change) — RE-ORDERED: gate number first
-
-1. **D5-1a (gate measurement)**: the `n_out = d+1` verify-batch dispatch +
-   a micro-bench of the target at nt ∈ {3, 5} — **measure the nt=3
-   amortization before any other plumbing**. ≥ 2.5× → proceed to D5-1b;
-   < 2.5× → STOP, document the negative, close the campaign after the
-   primitive (the entire go/no-go hangs on this one number).
-2. **D5-1b**: `Speculator` trait + chain, KV rollback primitive, batched
-   sampler. Each lands with its own parity test; the default path
-   (`spec = off`) is byte-identical to today.
-
-### D5-2 — greedy closed loop
-
-Minimal `draft-simple`: 0.5B draft, greedy drafting, d=4, 7B q4_k_m target.
-Acceptance: greedy output token-identical to the non-spec path on the parity
-prompts; acceptance-rate + tokens/round stats; same-window A/B tok/s at
-d ∈ {2,4,8}.
-
-### D5-3 — tuning
-
-temp>0 target-authoritative verification; verify-graph capture/replay soak
-(pool_gen stability across rounds); adaptive d (truncate at the per-position
-acceptance collapse point, llama's `n_max` logic); (stretch) `ngram-simple` as
-the chain's first impl.
-
-### D5-4 — integration & records
-
-CLI flags finalized, `minfer bench` speculative mode, server multi-slot,
-per-phase step docs in `docs/cuda_optimization_steps/` (80+), hub §0/§1 rows.
+Each stage records per `cuda_optimization_steps/STYLE.md` (English, six
+sections, real numbers) — docs 83+.
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| **Net win may be small** (draft's serial steps are latency on the same GPU) | D5-0 is the go/no-go gate; synthetic-acceptance ceiling measurement; CPU-draft/GPU-target cross-device variant as the fallback design. |
-| `n_out = d+1` touches lm_head/FFN tail-rows dispatch | Parity tests at d ∈ {1,4,8}; the decode `n_out = 1` path must stay untouched when `spec = off`. |
-| KV rollback correctness under CUDA graph replay | Rollback only rewinds positions (never topology); stale rows are dead by construction — dedicated graph-dump test at round boundaries. |
-| Vocab/tokenizer mismatch between draft and target | Hard gate at load (analysis §4.2): same vocab type, BOS/EOS, size delta ≤ 128, token-text equality. |
-| Draft model doubles memory | 0.5B q4_0 ≈ 0.5 GB on top of 7B — fine on GB10 (32 GB); document the footprint, opt-in flag only. |
-| Metal backend parity | CUDA first (the decode campaign's home turf); Metal parity is a follow-up session, not a D5 gate. |
+| The verify marginal may not reach llama's ~1.5 ms/token (their small-M MMQ tuning is multi-campaign depth, MMQ-analysis §7–12) | The ladder is staged: d=2 pays from plumbing alone (1.34×); ③ prices each candidate before any kernel work |
+| Acceptance p is prompt-dependent (code 3.1×, prose 1.7× in the battery) | Report per-prompt, never averages alone; stats per round |
+| `n_out = d+1` lm_head path | Already validated end-to-end by the specverify instrument (docs 81–82); n_out=1 decode path untouched when spec=off |
+| Draft model doubles footprint | 0.5 GB on top of 9 GB — fine on GB10; opt-in flag only |
+| Metal parity | CUDA first (campaign home turf); Metal is a follow-up, not a gate |
 
 ## 7. Acceptance gates (campaign rules apply unchanged)
 
-- Greedy token-identity vs the non-spec path (the spec path is an optimization,
-  never a behavior change, at temp=0);
-- full suite green; interleaved same-window A/B medians;
-- acceptance-rate and tokens/round instrumentation on every round;
-- every phase documented per `cuda_optimization_steps/STYLE.md` (English,
-  six-section structure, real numbers, code provenance rules).
+Greedy token-identity vs the non-spec path (the spec path is an optimization,
+never a behavior change, at temp=0); full suite green; interleaved same-window
+A/B medians; acceptance-rate and tokens/round instrumentation on every round;
+every stage documented per STYLE.md.
+
+## Appendix — what the D5 closure got wrong (2026-09-10 → 09-12)
+
+Kept brief; details in docs 80/81 (§4.3) / 82 (§5):
+
+1. **The go/no-go bar was mis-derived.** The 2.5×-amortization gate treated
+   the per-token marginal (attention + q8 quantize + dp4a compute) as ε;
+   the correct model is C_T(nt) ≈ weights + nt·token-work, so break-even
+   acceptance at d=2 is far lower than the p\* = 0.73 the old model printed.
+2. **The external anchor was a measurement artifact.** The llama-cli
+   batteries passed `-md` without `--spec-type draft-simple` (default
+   `none`) — the draft was silently never loaded, so "llama.cpp also lands
+   at 1.00×" was base-vs-base. Corrected: 1.53–2.43×.
+3. **The instrument's summary field was wrong** (amortization computed as
+   C_T(1)/C_T(nt), missing the nt factor; fixed 2026-09-12; doc tables were
+   computed from raw medians and unaffected).
+
+Net: the closure rested on a real 0.52× measurement but a miscalibrated bar
+and a void anchor. Doc 82 fixed the underlying dispatch hole (0.52× → 2.14×),
+the corrected batteries showed the strategy wins on GB10, and the campaign
+reopens as D5-R.
