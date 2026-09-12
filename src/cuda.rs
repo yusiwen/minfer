@@ -451,6 +451,8 @@ extern "C" {
         nchunk: i32,
         stream: *mut std::ffi::c_void,
         kd: i32,
+        cpart: *mut f32,
+        ksplit: i32,
     ) -> i32;
     // P6 r38: q6_K BT kernel — the same bulk-LDG->STS A staging as r34, but the
     // B weight is EXPANDED to centered int8 (256 B/row) in staging and the mma is
@@ -1146,6 +1148,10 @@ pub struct CudaState {
     /// consumed by mmq_raw_nb_bt_kernel's bulk staging (MINFER_MMQ_A_TRANSPOSE).
     buf_qa8_t: Mutex<(CudaPtr, usize)>,
     buf_sda_t: Mutex<(CudaPtr, usize)>,
+    /// doc 92: K-split fp32 partials ([ksplit][nt][od]) for the BT GEMM's
+    /// block-starvation fix at small nt. Grown on demand like the other
+    /// prepass scratches; the reduce kernel consumes it on the same stream.
+    buf_mmq_ksplit: Mutex<(CudaPtr, usize)>,
     /// r49: consecutive-window memoization of the MMQ A-quantize prepass (see
     /// [`MmqCache`]). Lives on the process singleton so the CUDA backend can
     /// invalidate it between non-MMQ nodes / graph executions.
@@ -1458,6 +1464,7 @@ impl CudaState {
             buf_q8_prefill: Mutex::new(dummy),
             buf_qa8_t: Mutex::new(dummy),
             buf_sda_t: Mutex::new(dummy),
+            buf_mmq_ksplit: Mutex::new(dummy),
             mmq_cache: Mutex::new(MmqCache::default()),
             buf_attn_partial: Mutex::new(dummy),
             buf_q8_decode: Mutex::new(dummy),
@@ -2575,7 +2582,8 @@ impl CudaState {
             )
         {
             if self.mmq_active() {
-                return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k);
+                let ksplit_req = if small_m_gemm { -1 } else { 1 };
+                return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k, ksplit_req);
             }
             return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
         }
@@ -3234,6 +3242,7 @@ impl CudaState {
         id: usize,
         nt: usize,
         padded_q6k: bool,
+        ksplit_req: i32,
     ) -> Result<(), String> {
         let type_id = match ttype {
             TensorType::Q8_0 => 0,
@@ -3401,8 +3410,39 @@ impl CudaState {
                         .get(&(wptr as usize))
                         .map(|cp| cp.0)
                         .unwrap_or(std::ptr::null_mut());
+                    // doc 92: K-split the K range across grid.z slots when
+                    // the grid is M-starved (ntb == 1 => only od/128 blocks).
+                    // ksplit_req < 0 = auto (small-M gate): target >= 256
+                    // resident blocks (about 2/SM); 1 = the unsplit path
+                    // (default prefill, bitwise unchanged).
+                    let ksplit: usize = if ksplit_req < 0 {
+                        let nbt_y = (od + 127) / 128;
+                        let nktile = (nchunk as usize + 7) / 8;
+                        if nt <= 64 && nbt_y > 0 && nktile > 1 {
+                            // doc 92: target ~2 resident blocks/SM (block
+                            // count = nbt_y * ksplit). The target is env-
+                            // tunable while the per-tile latency term is
+                            // being characterised.
+                            let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(256);
+                            let want = (target + nbt_y - 1) / nbt_y;
+                            want.clamp(2, nktile)
+                        } else {
+                            1
+                        }
+                    } else {
+                        ksplit_req.max(1) as usize
+                    };
+                    let cpart = if ksplit > 1 {
+                        Self::get_or_grow(&self.buf_mmq_ksplit, ksplit * nt * od * 4) as *mut f32
+                    } else {
+                        std::ptr::null_mut()
+                    };
                     nb_ok = qa8g != 0
                         && sdag != 0
+                        && (ksplit == 1 || !cpart.is_null())
                         && launch_mmq_raw_nb_bt_nt(
                             type_id,
                             wptr as *const u8,
@@ -3416,6 +3456,8 @@ impl CudaState {
                             nchunk,
                             stream,
                             kd,
+                            cpart,
+                            ksplit as i32,
                         ) == 1;
                     if nb_ok && nb_debug {
                         // r59: name the dsc staging path (liveness check per

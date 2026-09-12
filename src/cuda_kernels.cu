@@ -6511,7 +6511,8 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ W_dsc,
     const uint8_t* __restrict__ qa8g,
     const uint8_t* __restrict__ sdag, float* __restrict__ C,
-    int nt, int od, int id, int nchunk
+    int nt, int od, int id, int nchunk,
+    float* __restrict__ Cpart, int ksplit
 ) {
 #if __CUDA_ARCH__ >= 800
     extern __shared__ uint8_t mmq_nb_sh[];
@@ -6540,6 +6541,15 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
     const int nb32 = id >> 5;
     const int nsb = nb32 >> 3;
     const int nktile = (nchunk + KDR - 1) / KDR;
+
+    // doc 92: K-split — grid.z slots each own a contiguous tile range and
+    // write fp32 partials; ksplit == 1 keeps the single-pass C write. Each
+    // slot sums its range in ascending kt order (same per-slot order as the
+    // unsplit kernel) and the reduce kernel sums slots in fixed z order,
+    // so results are run-to-run bit-stable.
+    const int per = ksplit > 1 ? (nktile + ksplit - 1) / ksplit : nktile;
+    const int kt_lo = (int)blockIdx.z * per;
+    const int kt_hi = min(kt_lo + per, nktile);
 
     float sum[32] = {0.0f};   // [g=4][nh=2][l=4] C accumulators (fp32)
 
@@ -6626,19 +6636,23 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
     // block to hide behind and pipelining pays. With ntb >= 2 the extra
     // buffer set halves SM residency (84 KB vs 42 KB per block) and cost
     // prefill ~10% (measured), so the single-buffer r59 sequence is kept.
-    const bool dbuf = nt <= MMQ_NBI;
+    // doc 92: with a K-split active the grid already has block-level
+    // parallelism to spare — keep the single-buffer 42 KB footprint for its
+    // higher SM residency (4 vs 2 blocks/SM) and drop the prefetch.
+    const bool dbuf = nt <= MMQ_NBI && ksplit == 1;
 
-    // prologue: bind buffer 0, stage tile 0 (its DSC commit group included)
-    qa8 = mmq_nb_sh;
+    // prologue: stage the slot's first tile into the buffer the regime owns
+    // (double-buffered: the kt_lo parity buffer; single-buffer: buffer 0)
+    qa8 = dbuf ? mmq_nb_sh + (size_t)(kt_lo & 1) * BUF : mmq_nb_sh;
     sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
     qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
     sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
-    RAW_STAGE_NB_BT(0);
+    RAW_STAGE_NB_BT(kt_lo);
 
-    for (int kt = 0; kt < nktile; ++kt) {
+    for (int kt = kt_lo; kt < kt_hi; ++kt) {
         if (dbuf) {
             // prefetch tile kt+1 into the OTHER buffer while tile kt computes
-            if (kt + 1 < nktile) {
+            if (kt + 1 < kt_hi) {
                 uint8_t* nb = mmq_nb_sh + (size_t)((kt + 1) & 1) * BUF;
                 qa8 = nb;
                 sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
@@ -6646,24 +6660,21 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
                 sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
                 RAW_STAGE_NB_BT(kt + 1);
             }
-        } else if (kt > 0) {
-            // original r59 sequence: restage into the single buffer
+        } else if (kt > kt_lo) {
+            // original r59 sequence: restage into the single buffer (the
+            // first tile was staged by the prologue)
             RAW_STAGE_NB_BT(kt);
         }
         // r59 visibility rule: tile kt's DSC cp.async group must be complete
         // to THIS thread before the barrier publishes it cross-thread; in the
         // double-buffered regime tile kt+1's group (already issued) may stay
         // in flight (wait_group 1). DSC=false: no groups are issued, no-op.
-        if (dbuf) {
-            qa8 = mmq_nb_sh + (size_t)(kt & 1) * BUF;
-        } else {
-            qa8 = mmq_nb_sh;
-        }
+        qa8 = dbuf ? mmq_nb_sh + (size_t)(kt & 1) * BUF : mmq_nb_sh;
         sda_q = reinterpret_cast<uint32_t*>(qa8 + KDR * MMQ_NBI * 32);
         qb_raw = reinterpret_cast<uint8_t*>(sda_q + KDR * MMQ_NBI);
         sds = reinterpret_cast<float2*>(qb_raw + MMQ_NBJ * 128);
         if (DSC) {
-            if (dbuf && kt + 1 < nktile) gemm_cp_wait1(); else gemm_cp_wait0();
+            if (dbuf && kt + 1 < kt_hi) gemm_cp_wait1(); else gemm_cp_wait0();
         }
         __syncthreads();
 
@@ -6760,8 +6771,13 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
             for (int l = 0; l < 4; l++) {
                 const int i = i0 + g * 16 + (l >> 1) * 8 + (lane >> 2);
                 const int j = j0 + j0w + nh * 8 + (lane & 3) * 2 + (l & 1);
-                if (i < nt && j < od)
-                    C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+                if (i < nt && j < od) {
+                    if (ksplit == 1)
+                        C[(size_t)i * od + j] = sum[(g * 2 + nh) * 4 + l];
+                    else
+                        Cpart[((size_t)blockIdx.z * nt + i) * od + j] =
+                            sum[(g * 2 + nh) * 4 + l];
+                }
             }
 #undef RAW_STAGE_NB_BT
 #endif // __CUDA_ARCH__ >= 800
@@ -7118,10 +7134,25 @@ __global__ void __launch_bounds__(256, 3) mmq_raw_nb_bt_q6k_kernel(
 // W_dsc f32-pair plane; the SDS staging is a cp.async stream); w_dsc == 0
 // keeps the r34 in-kernel scalar decode. Returns 0 (clean fallback) on any
 // cap/mismatch.
+// doc 92: deterministic K-split reduce — sums the per-slot fp32 partial
+// planes in fixed ascending z order (run-to-run bit-stable, capture-replay
+// parity safe; atomicAdd would not be).
+__global__ void mmq_ksplit_reduce_kernel(
+    const float* __restrict__ parts, float* __restrict__ C,
+    int total, int ksplit
+) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)total) return;
+    float acc = parts[idx];
+    for (int z = 1; z < ksplit; ++z)
+        acc += parts[(size_t)z * (size_t)total + idx];
+    C[idx] = acc;
+}
+
 extern "C" int launch_mmq_raw_nb_bt_nt(
     int type_id, const uint8_t* w, const uint8_t* w_dsc, const uint8_t* qa8g,
     const uint8_t* sdag, float* c, int nt, int od, int id, int nchunk,
-    cudaStream_t stream, int kd
+    cudaStream_t stream, int kd, float* cpart, int ksplit
 ) {
     (void)type_id;
     if (kd != 8) return 0;
@@ -7129,12 +7160,23 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
     // doc 91: the second staging buffer set only for the M-starved regime
     // (ntb == 1, matching the kernel's dbuf flag) — prefill keeps the
     // original 42 KB footprint and its higher SM residency.
-    const bool dbuf_smem = (nt + MMQ_NBI - 1) / MMQ_NBI <= 1;
+    // doc 92: refine the requested ksplit so every z-slot owns a non-empty
+    // tile range (an empty slot would leave garbage partials for the reduce)
+    int ks = ksplit > 1 ? ksplit : 1;
+    {
+        const int nktile_all = (nchunk + 7) / 8;
+        if (ks > nktile_all) ks = nktile_all;
+        if (ks < 1) ks = 1;
+        const int per = (nktile_all + ks - 1) / ks;
+        ks = (nktile_all + per - 1) / per;
+    }
+    const bool dbuf_smem =
+        (nt + MMQ_NBI - 1) / MMQ_NBI <= 1 && ks <= 1;
     const int smem = (dbuf_smem ? 2 : 1) * (8 * MMQ_NBI * 32   // qa8
                    + 8 * MMQ_NBI * 4    // sda_q (one uint32 per token)
                    + MMQ_NBJ * 128      // qb_raw
                    + 8 * MMQ_NBJ * 8);  // sds (float2 = 8B)
-    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
+    dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ, ks);
     // r59: DSC is a template constant, so each instantiation keeps only its
     // own SDS path (the cp.async plane stream vs the scalar decode) — the
     // r53 pattern (no runtime branch in staging).
@@ -7152,16 +7194,27 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
     if (dsc) {
         mmq_raw_nb_bt_kernel<8, true><<<grid, 256, smem, stream>>>(
-            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk);
+            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, cpart, ks);
     } else {
         mmq_raw_nb_bt_kernel<8, false><<<grid, 256, smem, stream>>>(
-            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk);
+            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, cpart, ks);
     }
     e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "minfer/cuda: mmq raw NB-BT launch failed: %s\n",
                 cudaGetErrorString(e));
         return 0;
+    }
+    if (ks > 1) {
+        const int total = nt * od;
+        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            cpart, c, total, ks);
+        e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "minfer/cuda: mmq ksplit reduce failed: %s\n",
+                    cudaGetErrorString(e));
+            return 0;
+        }
     }
     return 1;
 }

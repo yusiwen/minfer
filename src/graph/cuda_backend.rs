@@ -4346,7 +4346,7 @@ mod tests {
                 };
                 let wptr = state.get_weight_ptr(name).unwrap();
                 state
-                    .prefill_mmq(wptr, ttype, xptr, optr, od, id, nt, padded)
+                    .prefill_mmq(wptr, ttype, xptr, optr, od, id, nt, padded, 1)
                     .unwrap();
                 cb.synchronize();
                 let got = cb.copy_to_host(out).unwrap();
@@ -5905,6 +5905,7 @@ mod tests {
                         id,
                         nt,
                         false,
+                        1,
                     )
                     .unwrap();
             });
