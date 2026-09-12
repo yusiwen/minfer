@@ -2584,7 +2584,15 @@ impl CudaState {
             )
         {
             if self.mmq_active() {
-                let ksplit_req = if small_m_gemm { -1 } else { 1 };
+                // doc 92 resolution: auto-ksplit is the DEFAULT for every
+                // route into the BT GEMM. The auto formula activates only
+                // while the grid is M-starved (nt <= 64 => ntb == 1) and
+                // falls back to 1 above that, so prefill at nt >= 65 keeps
+                // the unsplit single-pass association. Deterministic per
+                // (nt, od, id), so capture and replay follow the same
+                // partial-sum order.
+                let ksplit_req = -1;
+                let _ = small_m_gemm;
                 return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k, ksplit_req);
             }
             return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
