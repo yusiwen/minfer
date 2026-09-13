@@ -287,6 +287,16 @@ fn load_tensor(
                 );
             } else {
                 cuda.register_weight(&reg_name, tensor.data());
+                // doc 104: q8_0 also registers the p32 split planes for the
+                // decode MMVQ (raw registration stays; method self-gates).
+                if ttype == TensorType::Q8_0 {
+                    cuda.register_weight_q80_p32(
+                        &reg_name,
+                        tensor.data(),
+                        tensor.shape[1] as usize,
+                        tensor.shape[0] as usize,
+                    );
+                }
             }
         } else if ttype == TensorType::F32 {
             cuda.register_weight(&reg_name, tensor.data());

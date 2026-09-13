@@ -644,6 +644,27 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // doc 104: q8_0 p32 split-plane variants (payload plane + dense d plane)
+    fn launch_q8_0_p32_q8_mmvq(
+        plane_p: *const u8,
+        plane_d: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q8_0_p32_q8_mmvq_multi(
+        plane_p: *const u8,
+        plane_d: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     // Step 82: multi-token (nt in [2, 8]) MMVQ variants — the token loop is
     // in-block (one block per weight row, grid.y = 1), so the weight stream
     // is paid once regardless of nt (the doc 81 D5-1a dispatch hole).
@@ -1162,6 +1183,8 @@ pub struct CudaState {
     /// ORIGINAL raw byte length, so `has_weight_of_size` can still match
     /// tensors by their raw GGUF size.
     padded_weights: Mutex<HashMap<String, usize>>,
+    // doc 104: q8_0 p32 split planes — original weight device ptr -> (payload, d)
+    q80_p32: Mutex<HashMap<usize, (usize, usize)>>,
     /// r53: pre-expanded q6_K B planes (dense centered-int8, `od * id` bytes,
     /// row stride = id, super-block stride = 256) built at padded registration
     /// under `MINFER_MMQ_Q6K_NB` (r60: default-on) AND `MINFER_MMQ_Q6K_EXP
@@ -1516,6 +1539,7 @@ impl CudaState {
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
             nb_bt_only: std::sync::atomic::AtomicBool::new(true),
             padded_weights: Mutex::new(HashMap::new()),
+            q80_p32: Mutex::new(HashMap::new()),
             q6k_exp: Mutex::new(HashMap::new()),
             q6k_exp_warned: std::sync::atomic::AtomicBool::new(false),
             q6k_dpl: Mutex::new(HashMap::new()),
@@ -2734,6 +2758,15 @@ impl CudaState {
                 // the fallback (MINFER_NO_Q80_MMVQ=1) and for every shape
                 // the gates exclude.
                 if nt == 1 && id >= 2048 && id % 32 == 0 && !Self::no_q80_mmvq() {
+                    // doc 104: prefer the p32 split planes when registered
+                    // (byte-equal output, +6-10% kernel bandwidth); the raw
+                    // doc 103 kernel stays as the fallback.
+                    if !Self::no_q80_p32() {
+                        if let Some((pp, pd)) = self.q80_p32_planes(wptr as usize) {
+                            self.q8_0_p32_decode_mmvq(pp, pd, x, out, od, id, nt);
+                            return Ok(());
+                        }
+                    }
                     self.q8_0_decode_mmvq(wptr, x, out, od, id, nt);
                     Ok(())
                 } else if nt >= 2 && nt <= 8 && id >= 2048 && id % 32 == 0 && !Self::no_q80_mmvq() {
@@ -2741,6 +2774,12 @@ impl CudaState {
                     // quantize launch and the q8 activation rounding lose to
                     // the f32 kernel (and tiny shapes keep the exact f32
                     // numerics the small-shape tests pin down)
+                    if !Self::no_q80_p32() {
+                        if let Some((pp, pd)) = self.q80_p32_planes(wptr as usize) {
+                            self.q8_0_p32_decode_mmvq_multi(pp, pd, x, out, od, id, nt);
+                            return Ok(());
+                        }
+                    }
                     self.q8_0_decode_mmvq_multi(wptr, x, out, od, id, nt);
                     Ok(())
                 } else {
@@ -4485,6 +4524,67 @@ impl CudaState {
     fn no_q80_mmvq() -> bool {
         std::env::var("MINFER_NO_Q80_MMVQ").map_or(false, |v| v == "1")
     }
+    fn no_q80_p32() -> bool {
+        std::env::var("MINFER_NO_Q80_P32").map_or(false, |v| v == "1")
+    }
+    /// doc 104: register a Q8_0 tensor ALSO as the p32 split-plane layout —
+    /// payload plane (32 B/block, 16B-aligned for uint4 loads) + dense d
+    /// plane (2 B/block). The raw registration stays untouched (the f32
+    /// fallback and every existing kernel keep reading it); the planes are
+    /// extra device memory (~+94% of the tensor) keyed by the original
+    /// weight pointer for the decode dispatch. Host repack at load, like
+    /// the q6_K padded precedent — no capture-window hazard. Registered
+    /// under private keys (`\u{1}`-prefixed suffixes) so they can never
+    /// collide with a real tensor name (the doc 102 lesson).
+    pub fn register_weight_q80_p32(&self, name: &str, data: &[u8], od: usize, id: usize) {
+        if od == 0
+            || id == 0
+            || id % 32 != 0
+            || id < 2048
+            || std::env::var("MINFER_NO_Q80_P32").map_or(false, |v| v == "1")
+        {
+            return;
+        }
+        let nb = id / 32;
+        if data.len() < od * nb * 34 {
+            return;
+        }
+        let mut pp = vec![0u8; od * nb * 32];
+        let mut pd = vec![0u8; od * nb * 2];
+        for r in 0..od {
+            let row = r * nb;
+            for b in 0..nb {
+                let src = (row + b) * 34;
+                pp[(row + b) * 32..(row + b) * 32 + 32].copy_from_slice(&data[src + 2..src + 34]);
+                pd[(row + b) * 2..(row + b) * 2 + 2].copy_from_slice(&data[src..src + 2]);
+            }
+        }
+        let orig = {
+            let w = self.weights.lock().unwrap();
+            match w.get(name) {
+                Some((p, sz)) if *sz == data.len() => p.0 as usize,
+                _ => return,
+            }
+        };
+        let pname = format!("{name}\u{1}p32");
+        let dname = format!("{name}\u{1}p32d");
+        self.register_weight(&pname, &pp);
+        self.register_weight(&dname, &pd);
+        let w = self.weights.lock().unwrap();
+        if let (Some((ppp, _)), Some((pdp, _))) = (w.get(&pname), w.get(&dname)) {
+            self.q80_p32
+                .lock()
+                .unwrap()
+                .insert(orig, (ppp.0 as usize, pdp.0 as usize));
+        }
+    }
+
+    /// doc 104: p32 plane pair for a registered q8_0 weight, if built.
+    pub fn q80_p32_planes(&self, wptr: usize) -> Option<(*const u8, *const u8)> {
+        let map = self.q80_p32.lock().unwrap();
+        map.get(&wptr)
+            .map(|(pp, pd)| (*pp as *const u8, *pd as *const u8))
+    }
 
     /// doc 103: decode (nt == 1) q4_0 matmul via the MMVQ structure — dp4a
     /// over the shared pad40 q8 activation plane, one row per 256-thread
@@ -4582,6 +4682,63 @@ impl CudaState {
         unsafe {
             launch_q8_0_q8_mmvq_multi(
                 wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// doc 104: decode q8_0 matmul over the p32 split planes — byte-equal
+    /// arithmetic to `q8_0_decode_mmvq`, wider weight loads (uint4 x2 per
+    /// 32-element unit instead of 16 scattered u16s).
+    pub fn q8_0_p32_decode_mmvq(
+        &self,
+        pp: *const u8,
+        pd: *const u8,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q8_0_p32_q8_mmvq(
+                pp,
+                pd,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// doc 104: multi-token p32 variant (weight words hoisted out of the
+    /// token loop; bitwise-consistent with the nt == 1 p32 kernel).
+    pub fn q8_0_p32_decode_mmvq_multi(
+        &self,
+        pp: *const u8,
+        pd: *const u8,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q8_0_p32_q8_mmvq_multi(
+                pp,
+                pd,
                 q8 as *const u8,
                 out as *mut f32,
                 od as i32,

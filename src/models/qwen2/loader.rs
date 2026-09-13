@@ -258,6 +258,18 @@ fn load_tensor(
                 );
             } else {
                 cuda.register_weight(&reg_name, tensor.data());
+                // doc 104: q8_0 also registers the p32 split planes (payload
+                // 32B/block aligned + dense d) for the decode MMVQ — the raw
+                // registration above stays for every other consumer; the
+                // method no-ops unless the geometry/env gates pass.
+                if ttype == TensorType::Q8_0 {
+                    cuda.register_weight_q80_p32(
+                        &reg_name,
+                        tensor.data(),
+                        tensor.shape[1] as usize,
+                        tensor.shape[0] as usize,
+                    );
+                }
                 // r60: a non-NB-BT-consumable quantized weight (not q4_K/
                 // q6_K) makes mode-2 skip-write fused producers unsound —
                 // see CudaState::clear_mmq_nb_bt_only. Global flag, global

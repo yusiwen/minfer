@@ -8241,3 +8241,111 @@ extern "C" void launch_q8_0_q8_mmvq_multi(
     dim3 grid(od, 1);
     q8_0_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
 }
+
+// === doc 104: q8_0 p32 split-plane decode MMVQ ============================
+// Doc 103's raw-34B kernel costs ~2x the L1TEX wavefront work per weight
+// byte of the q4_0 kernel (16 two-byte loads per block at a 34-byte lane
+// stride, each instruction scattering across ~34 32B sectors). Measured
+// (cold-L2 rotating microbench, 7B shapes): the raw kernel runs 235-250
+// GB/s while this split-plane variant runs 260-266 — closing to the doc-99
+// probe ceiling — and its output is BYTE-EQUAL to the raw kernel (same
+// int8 values, same dp4a order, same reduction): pure load-pattern change.
+// Layout: payload plane 32 B/block (16B-aligned, uint4 x2 loads) + dense
+// d plane 2 B/block (one u16). Total = the raw 34 B/block; the raw
+// registration stays untouched for the f32 fallback (memory +~94% for the
+// planes, MINFER_NO_Q80_P32=1 reverts both the planes and the dispatch).
+__global__ void __launch_bounds__(256) q8_0_p32_q8_mmvq(
+    const uint8_t* __restrict__ planeP,
+    const uint8_t* __restrict__ planeD,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nb = id >> 5;
+    const uint4* prow = reinterpret_cast<const uint4*>(planeP + (size_t)row * nb * 32);
+    const uint16_t* drow = reinterpret_cast<const uint16_t*>(planeD + (size_t)row * nb * 2);
+    const uint8_t* x8row = acts8 + (size_t)t * nb * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint4 p0 = __ldg(&prow[2 * u]);
+        const uint4 p1 = __ldg(&prow[2 * u + 1]);
+        const float d4 = h2f(drow[u]);
+        const uint8_t* x8b = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+        const uint32_t w0[4] = {p0.x, p0.y, p0.z, p0.w};
+        const uint32_t w1[4] = {p1.x, p1.y, p1.z, p1.w};
+        int dot = 0;
+        #pragma unroll
+        for (int v = 0; v < 4; v++) dot = __dp4a((int)w0[v], (int)xw[v], dot);
+        #pragma unroll
+        for (int v = 0; v < 4; v++) dot = __dp4a((int)w1[v], (int)xw[v + 4], dot);
+        acc += d8 * d4 * (float)dot;
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+// Multi-token variant: the weight words are loaded ONCE per unit (hoisted
+// out of the token loop — doc 103's multi re-read them per token from L1)
+// and the per-token accumulation order matches the nt == 1 kernel exactly
+// (Step 82 bitwise rule, verified by the doc 93/94 identity battery).
+__global__ void __launch_bounds__(256) q8_0_p32_q8_mmvq_multi(
+    const uint8_t* __restrict__ planeP,
+    const uint8_t* __restrict__ planeD,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nb = id >> 5;
+    const uint4* prow = reinterpret_cast<const uint4*>(planeP + (size_t)row * nb * 32);
+    const uint16_t* drow = reinterpret_cast<const uint16_t*>(planeD + (size_t)row * nb * 2);
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint4 p0 = __ldg(&prow[2 * u]);
+        const uint4 p1 = __ldg(&prow[2 * u + 1]);
+        const float d4 = h2f(drow[u]);
+        const uint32_t w0[4] = {p0.x, p0.y, p0.z, p0.w};
+        const uint32_t w1[4] = {p1.x, p1.y, p1.z, p1.w};
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < tmax) {
+                const uint8_t* x8b = acts8 + ((size_t)(t0 + t) * nb + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+                int dot = 0;
+                #pragma unroll
+                for (int v = 0; v < 4; v++) dot = __dp4a((int)w0[v], (int)xw[v], dot);
+                #pragma unroll
+                for (int v = 0; v < 4; v++) dot = __dp4a((int)w1[v], (int)xw[v + 4], dot);
+                acc[t] += d8 * d4 * (float)dot;
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
+}
+
+extern "C" void launch_q8_0_p32_q8_mmvq(
+    const uint8_t* planeP, const uint8_t* planeD, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q8_0_p32_q8_mmvq<<<grid, 256, 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+}
+
+extern "C" void launch_q8_0_p32_q8_mmvq_multi(
+    const uint8_t* planeP, const uint8_t* planeD, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q8_0_p32_q8_mmvq_multi<<<grid, 256, 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+}
