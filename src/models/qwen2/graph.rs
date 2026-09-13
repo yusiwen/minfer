@@ -5,7 +5,7 @@
 //! the full forward pass. `forward_graph` runs it through the graph stack
 //! (builder → assign → fuse → alloc → execute) with a params-only reuse cache.
 //!
-//! Deviations recorded in docs/GRAPH-REFACTOR-PLAN.md §17:
+//! Deviations recorded in docs/COMPUTE-GRAPH-DESIGN.md §17:
 //! - Full-nt computation (the n_out tail-row `GetRows` optimization is
 //!   deferred; tail-row extraction happens on the logits only, which is
 //!   numerically identical for the sampled rows).

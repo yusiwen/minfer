@@ -33,7 +33,7 @@ but are just as load-bearing:
 
 Why not just give every node its own fresh buffer and be done? Arithmetic
 makes the naive version ugly fast. The 0.5B decode graph has **437 nodes**
-(recorded in `docs/GRAPH-REFACTOR-PLAN.md` Phase 8), so naive allocation means
+(recorded in `docs/COMPUTE-GRAPH-DESIGN.md` Phase 8), so naive allocation means
 437 separate memory regions per backend — and for the GPU that is 437 driver
 buffer objects to create, register, and keep alive. Worse, the two persistent
 things (KV regions) must be sized *once* and survive; a throwaway
@@ -794,7 +794,7 @@ scheme: if topology depended on `n_past`, every decode step would rebuild.
 ### 3.3 Design choices (why this shape and not another)
 
 **Why does the allocator own the backend pools? Why is the scheduler a pure
-orchestrator?** (`GRAPH-REFACTOR-PLAN.md` deviation 11.) Three forces point
+orchestrator?** (`COMPUTE-GRAPH-DESIGN.md` deviation 11.) Three forces point
 the same way. *One id space*: buffer ids appear in `node_to_buf`, in split
 input lists, in kernel launches, and in captured CUDA Graphs; if two
 components each held a pool, every id would need a "whose?" qualifier and
@@ -874,7 +874,7 @@ the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,
 so every attention read garbage and the output was unintelligible. The
-recorded fix (`GRAPH-REFACTOR-PLAN.md` deviation 18; ARCHITECTURE.md invariant
+recorded fix (`COMPUTE-GRAPH-DESIGN.md` deviation 18; ARCHITECTURE.md invariant
 4): same-backend in-place ops **alias** their input (the read and the write
 happen inside the same command buffer, in kernel order, so coherence is
 guaranteed by the GPU's own queue), and cross-backend inputs get a **fresh
@@ -896,7 +896,7 @@ allocated (after `h`'s supposed last use, in Kahn order), the sweep had
 already recycled `h`'s buffer to it. Execution then ran in build order: the
 attention node wrote its output into what was still `h`'s buffer, and the
 later `get_rows(h)` read the attention output instead of the residual —
-logits off by **21.79** (`GRAPH-REFACTOR-PLAN.md` deviation 22). The fix is
+logits off by **21.79** (`COMPUTE-GRAPH-DESIGN.md` deviation 22). The fix is
 excerpt 2: call `topo_order()?` purely to reject cycles, then compute
 liveness over `0..n_nodes` — the order the scheduler actually runs. (Small
 forensics note: the doc comment on `topo_order` still says "used by the
@@ -955,14 +955,14 @@ longer matters.
   (§2.8) while the node/buffer mapping is recomputed.
 - **Greedy equivalence checks** — the recorded acceptance for both bug fixes:
   `--temp 0` output identical pre/post fix, and fused-vs-unfused decode
-  logits diff 0.000 (`GRAPH-REFACTOR-PLAN.md` deviations 18, 22-24, 25-26).
+  logits diff 0.000 (`COMPUTE-GRAPH-DESIGN.md` deviations 18, 22-24, 25-26).
 
 ## 5. Cross-references
 
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §4.3 (pipeline position),
   §4.4 (GraphCache), §4.5 (the invariants this doc expanded, esp. 1, 2, 4, 5),
   §7 (KV cache summary) — the compressed version of this stage.
-- [`docs/GRAPH-REFACTOR-PLAN.md`](../GRAPH-REFACTOR-PLAN.md) §3.3 (original
+- [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) §3.3 (original
   allocator design — note where the implementation diverged: per-backend
   pools, build-order liveness, two regions instead of one `[K|V]` block),
   §17 deviations 11 (pool ownership), 14 (allocator survives rebuilds), 18

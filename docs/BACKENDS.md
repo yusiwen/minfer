@@ -1,7 +1,7 @@
 # Backends — the three execution engines
 
 minfer runs one declarative compute graph (build → assign → fuse → allocate →
-execute, `docs/GRAPH-REFACTOR-PLAN.md`) on three interchangeable backends:
+execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 
 | | **CPU** | **Metal** | **CUDA** |
 |---|---|---|---|

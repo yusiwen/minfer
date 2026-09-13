@@ -21,7 +21,7 @@
    assigned to backends, fused, allocated, and executed by the scheduler. This
    mirrors llama.cpp (`ggml_cgraph` + `ggml_backend_sched`) and enables graph
    reuse, per-op backend assignment, DOT export, and a clean path to new
-   backends. Design and implementation record: `docs/GRAPH-REFACTOR-PLAN.md`.
+   backends. Design and implementation record: `docs/COMPUTE-GRAPH-DESIGN.md`.
 3. **Bytes-in / bytes-out tensors** — weight tensors are raw `&[u8]`; SIMD
    dot-product kernels (AVX2 / Metal shaders) operate on byte slices matching
    the exact GGML quantized block layout (`repr(C)` in `block.rs`).
@@ -407,7 +407,7 @@ argument.
 
 | Topic | Location |
 |---|---|
-| Compute graph design + rewrite plan + implementation record (per-phase commits) | `docs/GRAPH-REFACTOR-PLAN.md` |
+| Compute graph design + rewrite plan + implementation record (per-phase commits) | `docs/COMPUTE-GRAPH-DESIGN.md` |
 | llama.cpp compute-graph design analysis (ggml_cgraph / scheduler / reuse) | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal backend optimizations / gap analysis (primary tracking) | `docs/METAL_OPTIMIZATIONS.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |

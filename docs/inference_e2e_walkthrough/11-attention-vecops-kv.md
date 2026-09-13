@@ -390,6 +390,6 @@ It is the FFN's activation (doc 05's `silu(gate) × up`); doc 06 fused it into `
 - [12 — Sampler](12-sampler.md) — the next stage: what happens to the logits the last layer produces.
 - [13 — Decode loop](13-decode-loop-graph-reuse.md) — the cache in action: one position written per step, `nkv` growing by one.
 - [14](14-metal-backend.md)/[15](15-cuda-backend.md) — the same attention on GPU (flash/split variants on Metal; split-KV on CUDA).
-- `docs/GRAPH-REFACTOR-PLAN.md` §17 deviations 4/5 — the KV layout and `pos`-input decisions this doc's mechanics implement.
+- `docs/COMPUTE-GRAPH-DESIGN.md` §17 deviations 4/5 — the KV layout and `pos`-input decisions this doc's mechanics implement.
 
 ← [10 — CPU matmul: quantized weights × Q8_0 activations](10-cpu-matmul-kernels.md) · [Index](./README.md) · [12 — The sampler: from logits to a token](12-sampler.md) →

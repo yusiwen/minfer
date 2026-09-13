@@ -6,7 +6,7 @@ This page expands the feature list from the [README](https://github.com/yusiwen/
 
 ### Declarative compute graph
 
-Inference builds a `ComputeGraph` (pure IR) then assigns backends, fuses ops, allocates and executes via a scheduler — inspired by llama.cpp's `ggml_cgraph` + backend scheduler. Graph reuse is params-only (decode steps skip reconstruction), backend assignment is per-op, and the whole design is documented in [GRAPH-REFACTOR-PLAN.md](./GRAPH-REFACTOR-PLAN.md).
+Inference builds a `ComputeGraph` (pure IR) then assigns backends, fuses ops, allocates and executes via a scheduler — inspired by llama.cpp's `ggml_cgraph` + backend scheduler. Graph reuse is params-only (decode steps skip reconstruction), backend assignment is per-op, and the whole design is documented in [COMPUTE-GRAPH-DESIGN.md](./COMPUTE-GRAPH-DESIGN.md).
 
 ### Interactive graph visualization (`viz/`)
 

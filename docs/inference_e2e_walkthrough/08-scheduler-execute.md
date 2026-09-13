@@ -641,7 +641,7 @@ Four reasons stack up:
    `kv_load`) earlier, liveness concluded a buffer was dead before the
    build-order executor had read it, attention reused the residual buffer, and
    the tail `get_rows` read the attention output instead of the residual —
-   logits off by **21.79** (`docs/GRAPH-REFACTOR-PLAN.md` §22, fixed in commit
+   logits off by **21.79** (`docs/COMPUTE-GRAPH-DESIGN.md` §22, fixed in commit
    `8febf4c`). The fix was not "sort better"; it was "everyone uses build
    order".
 3. *Store-before-attention for free.* With explicit KV nodes (doc 05) plus
@@ -708,7 +708,7 @@ input/output vectors.
   "buffer may be freed" logic all use build order; `topo_order()` only proves
   acyclicity. Origin: the G3 regression — 21.79 of logit drift traced to an
   executor/allocator order mismatch, fixed in `8febf4c` together with "inputs
-  are never freed" (GRAPH-REFACTOR-PLAN §23: two inputs whose liveness-shared
+  are never freed" (COMPUTE-GRAPH-DESIGN §23: two inputs whose liveness-shared
   buffer got refilled by the *later* input's fill, clobbering the first — the
   `embedding_and_rope` case).
 - **Never host-copy a GPU-pending buffer (invariant 4's corollary).** A host
@@ -787,7 +787,7 @@ input/output vectors.
   enforces: bounded submit + status check (§2.1), `Err`-not-fallback (§2.3),
   no sync inside a capture window (CUDA rule 2), stream order as the async
   contract (CUDA rule 5).
-- [`docs/GRAPH-REFACTOR-PLAN.md`](../GRAPH-REFACTOR-PLAN.md) §16/§22/§23
+- [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) §16/§22/§23
   (L948–955) — the G3 tail-row optimization and the two liveness-vs-order bugs
   (21.79 logit drift; input-buffer clobber) that made build order the one
   order.

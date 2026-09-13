@@ -1,6 +1,6 @@
 # CUDA Graph Backend Plan (Phase 7)
 
-> Status: **plan** (not started). Extends `docs/GRAPH-REFACTOR-PLAN.md` §9/§14
+> Status: **plan** (not started). Extends `docs/COMPUTE-GRAPH-DESIGN.md` §9/§14
 > Phase 7 with the concrete design. Prerequisite already landed: the CUDA build
 > chain rework (`081cf24` — opt-in `--features cuda`, auto-detected nvcc +
 > `-ccbin`, multi-arch SASS/PTX incl. native sm_121, cudart rpath).
@@ -415,7 +415,7 @@ flag).
   Qwen3-0.6B ~188 tok/s — H2D per step is KB-scale so the win is the
   removed CPU stall, µs; 7B n=128 21.7–23.6 tok/s, no regression).
   Suites 144/0 (cuda parallel + single), plain 130/0.
-- ✅ **Docs + cleanup (7e⑦, 2026-08-29)**: `GRAPH-REFACTOR-PLAN.md` §17
+- ✅ **Docs + cleanup (7e⑦, 2026-08-29)**: `COMPUTE-GRAPH-DESIGN.md` §17
   Phase 7 row → ✅ (stale "no local nvcc" blocker replaced with the
   dfa3516→082095c record); `GPU_SAFETY.md` gains a CUDA section (capture
   windows vs syncs, GB10 non-host-readable device memory, async-fill

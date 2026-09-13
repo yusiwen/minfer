@@ -57,7 +57,7 @@ There was an older design: `models/qwen2/forward.rs`, an imperative per-layer
 loop that computed as it went and hard-coded its GPU fallbacks. It is gone —
 deleted in Phase 6 of the graph refactor (commit `6af12a4`) only after the
 graph path reproduced its logits bit-identically, prefill and decode
-(`docs/GRAPH-REFACTOR-PLAN.md` §17, Phases 5–6 and 8). Its shape survives as
+(`docs/COMPUTE-GRAPH-DESIGN.md` §17, Phases 5–6 and 8). Its shape survives as
 a historical record in `docs/ARCHITECTURE.md` Appendix A.
 
 So this document is the heart of the engine: the transformer forward pass,
@@ -265,7 +265,7 @@ builder constructors that emit fewer, bigger nodes. They are decided inside
   dispatches**, one concat matmul against `blk.{i}.ffn_gu` plus one in-place
   SwiGLU pass — **2 dispatches**. Measured on the 0.5B: decode ~269 → ~299
   tok/s (+~11%) for QKV, ~303 → ~312–331 (+~3%) for FFN
-  (`GRAPH-REFACTOR-PLAN.md` §17, Phases 10–11).
+  (`COMPUTE-GRAPH-DESIGN.md` §17, Phases 10–11).
 
 Both fusions are **gated by measurement, not ideology**: FusedFFN is built
 only when `nf ≤ 16384`, because on the 7B model (`nf = 18944`, so the concat
@@ -421,7 +421,7 @@ execution order (a G3 bug story told in doc 07).
 ```rust
 /// Operator type. Implements full `PartialEq` (payloads included) so debug
 /// builds can verify graph-rebuild structural identity; the production graph
-/// reuse decision is params-only (see docs/GRAPH-REFACTOR-PLAN.md §6).
+/// reuse decision is params-only (see docs/COMPUTE-GRAPH-DESIGN.md §6).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     /// Leaf input node (token ids, positions, KV idx, ...). Filled externally
@@ -893,7 +893,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §4 — the verified design summary
   this doc expands (§4.6 has the mermaid layer diagram); Appendix A preserves
   the imperative design this replaced.
-- [`docs/GRAPH-REFACTOR-PLAN.md`](../GRAPH-REFACTOR-PLAN.md) §3–6 — the
+- [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) §3–6 — the
   design record (IR, builder, fusion rules, reuse) and §17 — the
   phase-by-phase implementation log with the measured fusion/tail numbers
   quoted above and the full deviation list.

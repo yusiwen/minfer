@@ -137,4 +137,4 @@ Qwen2 is the worked example for new architectures: mirror
 wire tensor names, set the correct `RopeStyle` and `attention_scale`, register
 in `models/mod.rs::load_model()`, and keep `build_graph` deterministic in
 `GraphParams` (the reuse invariant). Details: `docs/ARCHITECTURE.md` §5,
-`docs/GRAPH-REFACTOR-PLAN.md`.
+`docs/COMPUTE-GRAPH-DESIGN.md`.

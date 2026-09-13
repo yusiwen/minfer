@@ -182,7 +182,7 @@ clearest way to understand this stage:
   labor) go much further but only for `nt == 1` on GPU: `Op::FusedQKV` replaces 3 matmul + 3
   bias + 2 rope + 2 KV-store dispatches with 2 dispatches (**10 → 2**, measured ~+11% decode
   throughput on 0.5B), and `Op::FusedFFN` replaces 2 matmul + silu + mul with 2 dispatches
-  (**4 → 2**, ~+3%; `docs/GRAPH-REFACTOR-PLAN.md` §17 rows G4/G5). Those are *built* as single
+  (**4 → 2**, ~+3%; `docs/COMPUTE-GRAPH-DESIGN.md` §17 rows G4/G5). Those are *built* as single
   nodes because they need special kernels with unusual shapes (a concat weight
   `blk.{i}.attn_qkv`, an in-place offset swiglu), not because a pattern matcher found them.
 
@@ -233,7 +233,7 @@ worth spelling out because the code and an old comment disagree:
   answers `false` for the *op* `Op::FusedBiasRope` in `supports_op` (metal_backend.rs:278), and
   CUDA lists only `SwiGLU` (cuda_backend.rs:1304). So with today's capability tables the
   rewrite is **wired but dormant** — the gate never opens, and `FusedBiasRope` nodes are never
-  produced. (The plan-doc sketch in `GRAPH-REFACTOR-PLAN.md` §7 did include `BiasRope` for
+  produced. (The plan-doc sketch in `COMPUTE-GRAPH-DESIGN.md` §7 did include `BiasRope` for
   Metal; the shipped code went further: the *aggressive* version of the same idea — 3 biases +
   2 ropes + 2 KV stores in one kernel — ships as the builder-built `FusedQKV`/`QkvBiasRopeStore`
   decode nodes, which is where the Metal `attn_bias_rope_store` kernel actually gets used.)
@@ -321,7 +321,7 @@ MINFER_NO_FUSE_FFN=1  →  CParams.fuse_ffn = false  →  builder emits matmul +
 3. The comparison is **bit-identical**, not approximately equal. Fused kernels were written to
    produce exactly the same bits as the decomposed chain; the G4/G5 records measured
    fused-vs-unfused logit differences of **0.000** on 0.5B and 7B
-   (`GRAPH-REFACTOR-PLAN.md` §17 G4/G5), and the test `fused_qkv_matches_unfused_decode`
+   (`COMPUTE-GRAPH-DESIGN.md` §17 G4/G5), and the test `fused_qkv_matches_unfused_decode`
    asserts it (§4).
 
 That bit-identity has one famous footnote — the `~1e-6 noise lesson` (plan doc deviation 26):
@@ -492,7 +492,7 @@ Op::SwiGLU => {
 One *node*, executed as two vector passes with one intermediate copy in scratch memory. The
 CPU-side win of the fusion is therefore modest — one node dispatch and one fewer live buffer —
 not a true single-pass kernel; §2.3's 2A arithmetic applies fully only to the GPU
-`swiglu_f32` kernel. The plan doc anticipated exactly this (`GRAPH-REFACTOR-PLAN.md` §5.1:
+`swiglu_f32` kernel. The plan doc anticipated exactly this (`COMPUTE-GRAPH-DESIGN.md` §5.1:
 *"if CPU `supports_fused(SwiGLU)` returns true, a single-pass fused kernel must be added"*).
 
 **Metal's table, with the decode fusions and the BiasRope negative** —
@@ -582,7 +582,7 @@ pub fn run(
     n += self.fuse_swiglu(graph, backends, backend_of);
     n += self.fuse_bias_rope(graph, backends, backend_of);
     // BatchMatMul fusion is deferred: the single-output IR cannot express a
-    // multi-output fused node (see docs/GRAPH-REFACTOR-PLAN.md §17 notes).
+    // multi-output fused node (see docs/COMPUTE-GRAPH-DESIGN.md §17 notes).
     n
 }
 ```
@@ -836,7 +836,7 @@ Reuse exists so decode steps don't rebuild the graph; it is *safe* only if equal
 guarantee an identical graph. Fusion decisions are topology: a fused decode graph and an
 unfused one are different graphs by any structural measure. Since `try_reuse` compares params
 *only* (deliberately — node-by-node structural comparison was rejected as unnecessary given
-deterministic building, `GRAPH-REFACTOR-PLAN.md` §6), the fusion switches must ride along in
+deterministic building, `COMPUTE-GRAPH-DESIGN.md` §6), the fusion switches must ride along in
 those params or the cache could hand back a graph that contradicts the current configuration:
 you'd set `MINFER_NO_FUSE_QKV=1` for your A/B run and the engine would quietly reuse the fused
 graph — the experiment would show "no difference" and teach you nothing. Determinism and
@@ -938,7 +938,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §4.3 (the assign → fuse → alloc → execute
   pipeline), §4.5 (invariants 4–5: aliasing, dead nodes), §5.1–5.3 (Backend trait, selection
   rules, GPU safety) — the condensed version of this doc.
-- [`docs/GRAPH-REFACTOR-PLAN.md`](../GRAPH-REFACTOR-PLAN.md) §5 (fusion rules incl. the
+- [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) §5 (fusion rules incl. the
   deferred BatchMatMul), §7 (Metal per-op mapping — where `Op::SwiGLU`'s kernel comes from),
   §17 rows G4/G5 (decode fusion measurements: 10→2 and 4→2 dispatches, +11%/+3% on 0.5B,
   fused-vs-unfused diff 0.000) and deviation 26 (the ~1e-6 FusionPass-must-run lesson).

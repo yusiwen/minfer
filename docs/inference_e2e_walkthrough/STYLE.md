@@ -83,7 +83,7 @@ stages) with one line on what each adds.
 2. **Pace: write the doc to disk as soon as its forensics is done** — do not
    stage everything in memory first.
 3. Facts and numbers must come from the code or from the existing docs
-   (`docs/ARCHITECTURE.md`, `docs/GRAPH-REFACTOR-PLAN.md`, the
+   (`docs/ARCHITECTURE.md`, `docs/COMPUTE-GRAPH-DESIGN.md`, the
    `docs/*OPTIMIZATION*.md` series). Do not invent; when a number is
    measured elsewhere, cite the doc.
 4. File naming: `NN-english-dash-slug.md`; NN is assigned by the task.

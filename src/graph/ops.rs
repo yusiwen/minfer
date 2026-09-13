@@ -1,6 +1,6 @@
 //! Operator definitions and node metadata (Phase 1).
 //!
-//! Mirrors the `Op` enum in docs/GRAPH-REFACTOR-PLAN.md §3.1. Key invariant:
+//! Mirrors the `Op` enum in docs/COMPUTE-GRAPH-DESIGN.md §3.1. Key invariant:
 //! **KV cache positions are data, not structure** — `KvcacheStore`/`KvcacheLoad`
 //! carry only the layer index; the write position is injected via an input node
 //! (`positions`), so the graph topology never depends on `n_past`.
@@ -35,7 +35,7 @@ pub enum FusedOp {
 
 /// Operator type. Implements full `PartialEq` (payloads included) so debug
 /// builds can verify graph-rebuild structural identity; the production graph
-/// reuse decision is params-only (see docs/GRAPH-REFACTOR-PLAN.md §6).
+/// reuse decision is params-only (see docs/COMPUTE-GRAPH-DESIGN.md §6).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     /// Leaf input node (token ids, positions, KV idx, ...). Filled externally

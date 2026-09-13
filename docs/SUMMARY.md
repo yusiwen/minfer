@@ -44,7 +44,7 @@
 
 # Compute Graph
 
-- [Graph Refactor Plan](./GRAPH-REFACTOR-PLAN.md)
+- [Compute Graph Design](./COMPUTE-GRAPH-DESIGN.md)
 - [Backends](./BACKENDS.md)
     - [GPU Safety](./GPU_SAFETY.md)
     - [CUDA Backend Plan](./CUDA-BACKEND-PLAN.md)

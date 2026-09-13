@@ -916,7 +916,7 @@ and ignored).
 - `docs/ARCHITECTURE.md` §2 (module map), §3 (pipeline position of this
   stage), §5 (backend layering + selection rules), §8 (the
   add-a-new-architecture checklist that mirrors this doc).
-- `docs/GRAPH-REFACTOR-PLAN.md` — Phase 5/6 record: how the imperative
+- `docs/COMPUTE-GRAPH-DESIGN.md` — Phase 5/6 record: how the imperative
   forward became `build_graph` + registries, and why nodes carry names.
 - `docs/CUDA-BACKEND-PLAN.md` — Phase 7 design and §2 inventory of the CUDA
   weight registry; the resident-weights thesis this doc leans on.

@@ -108,7 +108,7 @@ token, no streaming, no chat. And without *graph reuse*, every one of the
 hundreds of decode steps would pay the build → assign → fuse → allocate tax
 again — the plan document estimated the wasted work as "recomputes topology
 every step + CPU scratch reallocation" and made parameter-deterministic reuse
-a headline goal of the rewrite (`docs/GRAPH-REFACTOR-PLAN.md` §1, "Graph
+a headline goal of the rewrite (`docs/COMPUTE-GRAPH-DESIGN.md` §1, "Graph
 reuse" row). The rest of this document walks the loop one excerpt at a time:
 the per-step data flow (§2, §3.1), the code of the loop and the reuse
 machinery (§3.2), why it is built this way (§3.3), and the traps the design
@@ -190,7 +190,7 @@ a matmul scales with the number of token rows. Prefill of a 128-token prompt
 does 128× the arithmetic of a decode step for the identical weights. This is
 why prefill shows high tok/s (the cost is amortized over many tokens) while
 decode shows the raw weight-streaming rate: the plan document records ~100
-tok/s CPU decode for 0.5B (`docs/GRAPH-REFACTOR-PLAN.md` §12, first row) —
+tok/s CPU decode for 0.5B (`docs/COMPUTE-GRAPH-DESIGN.md` §12, first row) —
 the loop is running as fast as RAM allows.
 
 **Budget 3 — attention (shrinks from quadratic to one scan).** Prefill
@@ -222,7 +222,7 @@ costs, not per-token math. Reuse means a decode step pays only: two small
 input fills (a 4-byte token id and a 4-byte position), one scheduler walk
 over the cached graph, and the math. The plan document's expected-gains
 table puts it plainly: decode's gain is "skips topology rebuild and CPU
-scratch allocation" (`docs/GRAPH-REFACTOR-PLAN.md` §12).
+scratch allocation" (`docs/COMPUTE-GRAPH-DESIGN.md` §12).
 
 ### 2.3 One rebuild, then none: the params identity
 
@@ -262,7 +262,7 @@ into input nodes after the reuse check (`graph.rs:522-536`). The plan
 document records this as the design's founding correction: an earlier
 sketch encoded `n_past` into the KV-cache op, which "causes the decode
 topology to change at every step and structurally breaks graph reuse"
-(`docs/GRAPH-REFACTOR-PLAN.md`, revision note 1). Moving the position from
+(`docs/COMPUTE-GRAPH-DESIGN.md`, revision note 1). Moving the position from
 the graph's *structure* into its *data* is what makes row 3 of the table
 possible at all.
 
@@ -312,7 +312,7 @@ new graph first and compared node sequences ("build then compare") — which
 can never skip the rebuild, defeating the purpose. The plan document
 records the correction: "no graph build, no node-sequence comparison; the
 graph topology is a deterministic function of the parameters — the same
-invariant as llama.cpp `allow_reuse()`" (`docs/GRAPH-REFACTOR-PLAN.md` §6).
+invariant as llama.cpp `allow_reuse()`" (`docs/COMPUTE-GRAPH-DESIGN.md` §6).
 
 ### 2.5 What survives a rebuild vs what is recomputed
 
@@ -1106,7 +1106,7 @@ preserves).
 
 **Params-only comparison, not build-then-compare.** The original plan
 sketch built the new graph and diffed node sequences against the cached one
-(`docs/GRAPH-REFACTOR-PLAN.md` §6 records the correction). That design can
+(`docs/COMPUTE-GRAPH-DESIGN.md` §6 records the correction). That design can
 never skip the build — the expensive half of the rebuild — so it saves
 nothing. The shipped design inverts the burden of proof: the *builder* is
 required to be deterministic in `GraphParams` (each architecture's `build`
@@ -1144,7 +1144,7 @@ its own cache via `forward_graph_cached` (`models/mod.rs:65-75`). Same
 mechanism, scoped ownership.
 
 **Positions as data — the founding decision.** The plan's first revision
-note tells the story of the alternative (`docs/GRAPH-REFACTOR-PLAN.md`
+note tells the story of the alternative (`docs/COMPUTE-GRAPH-DESIGN.md`
 revision note 1): an early design encoded `n_past` into the KV-cache op,
 meaning the decode topology changed *every step* and reuse was structurally
 impossible. The fix was to make the KV a persistent external buffer
@@ -1207,7 +1207,7 @@ producer mid-flight.** RoPE and the fused KV-store ops alias their input
 buffers in place (sole-consumer rule, doc 07); on a GPU backend the
 "buffer" may be un-submitted device memory. Host-copying it at the wrong
 moment was the Phase-3 KV-corruption bug (recorded in
-`docs/GRAPH-REFACTOR-PLAN.md` and AGENTS.md rule 5): the copy read stale
+`docs/COMPUTE-GRAPH-DESIGN.md` and AGENTS.md rule 5): the copy read stale
 bytes and wrote them back over freshly stored K/V. The scheduler's split
 boundaries (`sync_backend` before any cross-backend read,
 `scheduler.rs:177-189`) are the only sanctioned sync points — which is
@@ -1366,7 +1366,7 @@ in the output and watch the trace stop mid-stream without a final forward.
   [15 — The CUDA backend](15-cuda-backend.md) — this loop unchanged, with
   different `execute_node` implementations; doc 15's CUDA Graph replay is
   keyed by the graph `uid` this doc's cache mints (§3.4 #6).
-- [`docs/GRAPH-REFACTOR-PLAN.md`](../GRAPH-REFACTOR-PLAN.md) — §6 is the
+- [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) — §6 is the
   design record of params-only reuse (including the rejected
   build-then-compare sketch); the revision notes record the
   positions-as-data correction; §11/§12 sketch the loop refactor and its

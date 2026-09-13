@@ -30,7 +30,7 @@ impl FusionPass {
         n += self.fuse_swiglu(graph, backends, backend_of);
         n += self.fuse_bias_rope(graph, backends, backend_of);
         // BatchMatMul fusion is deferred: the single-output IR cannot express a
-        // multi-output fused node (see docs/GRAPH-REFACTOR-PLAN.md §17 notes).
+        // multi-output fused node (see docs/COMPUTE-GRAPH-DESIGN.md §17 notes).
         n
     }
 

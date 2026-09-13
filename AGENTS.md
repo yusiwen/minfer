@@ -2,7 +2,7 @@
 
 Pure-Rust LLM inference engine written from scratch (~4400 LOC), llama.cpp-inspired, 0 ML framework deps.
 Qwen2/Qwen2.5 + Qwen3 (dense) · CPU + Metal (macOS) + CUDA (opt-in) · GGUF v3.
-Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels) — design + implementation record: `docs/GRAPH-REFACTOR-PLAN.md`.
+Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels) — design + implementation record: `docs/COMPUTE-GRAPH-DESIGN.md`.
 
 This file is the always-loaded index. Deep dives live in `docs/` (index at the bottom) — don't duplicate them here.
 
@@ -73,7 +73,7 @@ Read `docs/GPU_SAFETY.md` before touching Metal/CUDA code. Hard rules: `submit()
 
 ## Compute Graph — core rules
 
-Inference = build `ComputeGraph` → assign backends → fuse → allocate → execute; one graph per `GraphParams`, reused across decode steps. Full design: `docs/GRAPH-REFACTOR-PLAN.md`.
+Inference = build `ComputeGraph` → assign backends → fuse → allocate → execute; one graph per `GraphParams`, reused across decode steps. Full design: `docs/COMPUTE-GRAPH-DESIGN.md`.
 
 1. **KV positions are data, not structure** — topology never depends on `n_past` (precondition for decode reuse).
 2. Each layer owns **two persistent KV regions** (K/V) via `kv_pair(layer)`; they survive rebuilds (allocator lives in `GraphCache`).
@@ -114,7 +114,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 |---|---|
 | Architecture design (module map, pipeline, adding an arch) | `docs/ARCHITECTURE.md` |
 | **End-to-end inference walkthrough (15-doc beginner series: CLI → GGUF → graph → kernels → backends)** | `docs/inference_e2e_walkthrough/` (index: `README.md`) |
-| Compute graph design + implementation record | `docs/GRAPH-REFACTOR-PLAN.md` |
+| Compute graph design + implementation record | `docs/COMPUTE-GRAPH-DESIGN.md` |
 | llama.cpp compute-graph analysis | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal optimization plans / gap analysis | `docs/METAL_OPTIMIZATIONS.md` |
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |

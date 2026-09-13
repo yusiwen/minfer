@@ -41,7 +41,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | MMQ | `LLAMA-CPP-MMQ-ANALYSIS.md` |
 | SPEC | `LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
 | D5 | `SPECULATIVE-DECODING-PLAN.md` |
-| GRAPH | `GRAPH-REFACTOR-PLAN.md` |
+| GRAPH | `COMPUTE-GRAPH-DESIGN.md` |
 | BACKEND | `CUDA-BACKEND-PLAN.md` |
 | BUILD | `BUILD.md` |
 | SAFETY | `GPU_SAFETY.md` |

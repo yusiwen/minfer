@@ -15,7 +15,7 @@ dependencies**.
 ## Explore
 
 - [Architecture](ARCHITECTURE.md) — module map, pipeline, backend layering, adding an arch.
-- [Compute Graph](GRAPH-REFACTOR-PLAN.md) — the declarative graph design + rewrite record.
+- [Compute Graph](COMPUTE-GRAPH-DESIGN.md) — the declarative graph design + rewrite record.
 - Backends: [Metal](METAL_OPTIMIZATIONS.md) · [CPU](CPU_OPTIMIZATIONS.md) · [GPU Safety](GPU_SAFETY.md).
 - [Qwen3 Support](QWEN3-SUPPORT-PLAN.md) and the [Architecture Roadmap](ARCHITECTURE-ROADMAP.md).
 - Tooling: [Debug Dump](debug-dump.md), web visualizer (`viz/`).

@@ -1,7 +1,7 @@
 //! Declarative compute graph IR (Phase 1).
 //!
 //! Mirrors llama.cpp's `ggml_cgraph` + `llm_graph_context` layering; see
-//! docs/GRAPH-REFACTOR-PLAN.md. The IR is pure data: building a
+//! docs/COMPUTE-GRAPH-DESIGN.md. The IR is pure data: building a
 //! `ComputeGraph` is side-effect free, and execution is delegated to the
 //! backend scheduler (Phase 4).
 

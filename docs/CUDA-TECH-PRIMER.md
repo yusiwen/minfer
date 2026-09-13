@@ -410,5 +410,5 @@ tricks on this workload.
 - Build specifics (toolkit install, ccbin, cudart modes): `docs/BUILD.md`
 - GPU safety rules: `docs/GPU_SAFETY.md`
 - The campaign's full history, one doc per step: `docs/cuda_optimization_steps/README.md`
-- The compute graph these kernels serve: `docs/GRAPH-REFACTOR-PLAN.md`
+- The compute graph these kernels serve: `docs/COMPUTE-GRAPH-DESIGN.md`
 - The spec-decode consumer of the nt>1 regime: `docs/SPECULATIVE-DECODING-PLAN.md`
