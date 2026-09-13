@@ -98,7 +98,7 @@ const AD_MIN_TRIALS: u32 = 8;
 
 /// Min over a bounded trailing window — the steady-state estimator for a
 /// deterministic cost (rejects capture/warm-up spikes).
-fn min_window_update(current: f64, sample: f64, win: &mut Vec<f64>) -> f64 {
+fn min_window_update(sample: f64, win: &mut Vec<f64>) -> f64 {
     win.push(sample);
     if win.len() > AD_COST_WINDOW {
         win.remove(0);
@@ -149,13 +149,13 @@ impl AdaptiveD {
             return;
         }
         let per = total_ms / n as f64;
-        self.t_draft = min_window_update(self.t_draft, per, &mut self.t_draft_win);
+        self.t_draft = min_window_update(per, &mut self.t_draft_win);
     }
 
     pub fn observe_verify(&mut self, nt: usize, ms: f64) {
         if let Some(idx) = nt.checked_sub(2) {
             if idx < self.v.len() {
-                self.v[idx] = min_window_update(self.v[idx], ms, &mut self.v_win[idx]);
+                self.v[idx] = min_window_update(ms, &mut self.v_win[idx]);
             }
         }
     }
@@ -354,6 +354,12 @@ impl SpecEngine {
             adaptive: cfg.adaptive.then(|| AdaptiveD::new(cap)),
             stats: SpecStats::default(),
         })
+    }
+
+    /// doc 97: drop the draft KV (conversation `/clear` / full re-render —
+    /// draft positions are absolute and must rewind with the target).
+    pub fn reset_draft(&mut self) {
+        self.draft_cache = GraphCache::new();
     }
 
     /// Draft-side prefill: same prompt tokens/positions as the target, so the

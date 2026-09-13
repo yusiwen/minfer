@@ -34,6 +34,25 @@ pub trait Engine {
     fn forward(&mut self, tokens: &[u32], positions: &[usize], n_out: usize) -> Vec<f32>;
     /// Drops all KV state (called on full re-render / `/clear`).
     fn reset_cache(&mut self);
+    /// doc 97: whether speculative rounds are available (mock/plain engines: no).
+    fn has_spec(&self) -> bool {
+        false
+    }
+    /// doc 97: one speculative round — draft `d` tokens, verify at nt=d+1,
+    /// return the accepted prefix + bonus (the emitted token batch). The
+    /// round writes the KV rows for the seed and every batch token except
+    /// the LAST one (it becomes the next round's seed). Returns None when
+    /// the engine carries no draft.
+    fn spec_round(
+        &mut self,
+        _seed: u32,
+        _pos: usize,
+        _s: &crate::spec::SpecSampler,
+        _prev_tokens: &mut Vec<u32>,
+        _rng: &mut StdRng,
+    ) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// Byte-level encode/decode abstraction: trait-ified `Tokenizer` (mock-friendly).
@@ -66,6 +85,73 @@ impl<'a> GraphEngine<'a> {
             cache: GraphCache::new(),
             n_ctx,
         }
+    }
+    /// doc 97: the wrapped model (spec rounds drive it directly).
+    pub fn model(&self) -> &'a dyn ModelDef {
+        self.model
+    }
+    /// doc 97: the session KV cache (the spec verify writes the same regions).
+    pub fn cache_mut(&mut self) -> &mut GraphCache {
+        &mut self.cache
+    }
+    /// doc 97: the session context size (the round's KV horizon).
+    pub fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+}
+
+/// doc 97: a `GraphEngine` carrying an optional speculative draft
+/// (`--cnv --spec-draft <model>`). `forward`/`reset_cache` delegate; the
+/// spec round drives the same target model + KV cache the plain path uses,
+/// so spec and sequential share one KV state (doc 94's identity contract).
+pub struct SpecAwareEngine<'a> {
+    inner: GraphEngine<'a>,
+    spec: Option<crate::spec::SpecEngine>,
+    sparams: crate::spec::SpecSampler,
+}
+
+impl<'a> SpecAwareEngine<'a> {
+    pub fn new(
+        inner: GraphEngine<'a>,
+        spec: Option<crate::spec::SpecEngine>,
+        sparams: crate::spec::SpecSampler,
+    ) -> Self {
+        Self {
+            inner,
+            spec,
+            sparams,
+        }
+    }
+}
+
+impl Engine for SpecAwareEngine<'_> {
+    fn forward(&mut self, tokens: &[u32], positions: &[usize], n_out: usize) -> Vec<f32> {
+        self.inner.forward(tokens, positions, n_out)
+    }
+    fn reset_cache(&mut self) {
+        self.inner.reset_cache();
+        // the draft KV must rewind with the target (positions are absolute)
+        if let Some(sp) = self.spec.as_mut() {
+            sp.reset_draft();
+        }
+    }
+    fn has_spec(&self) -> bool {
+        self.spec.is_some()
+    }
+    fn spec_round(
+        &mut self,
+        seed: u32,
+        pos: usize,
+        _s: &crate::spec::SpecSampler,
+        prev_tokens: &mut Vec<u32>,
+        rng: &mut StdRng,
+    ) -> Option<Vec<u32>> {
+        let model = self.inner.model();
+        let n_ctx = self.inner.n_ctx();
+        let sparams = &self.sparams;
+        let cache = self.inner.cache_mut();
+        let sp = self.spec.as_mut()?;
+        Some(sp.round(model, cache, seed, pos, n_ctx, sparams, prev_tokens, rng))
     }
 }
 
@@ -105,6 +191,15 @@ pub struct TurnParams {
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
     pub stop_strings: Vec<String>,
+}
+
+/// doc 97: how a speculative batch ended (drives the position bookkeeping).
+#[derive(Debug)]
+enum BreakKind {
+    None,
+    Eog,
+    Stop,
+    Cap,
 }
 
 /// The result of one generation turn.
@@ -253,6 +348,204 @@ impl Conversation {
         let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
         out.prefill_tokens = toks.len();
         Ok(Some(out))
+    }
+
+    /// doc 97: speculative decode turn — mirrors `generate_assistant_with_logits`
+    /// token-for-token (the identity contract) while the Engine's spec round
+    /// commits 1..=d+1 tokens per call. Position bookkeeping: `current_pos`
+    /// is the slot of the newest committed-but-unwritten token (the round's
+    /// seed); the round writes the seed's row plus every batch row except the
+    /// last, so after a full batch `current_pos += batch.len()`. At any
+    /// turn-ending break the newest committed token is forwarded explicitly
+    /// if still unwritten, keeping the §5.4 KV-consistency across turns
+    /// (stop-string tokens are never committed; their spec-written rows are
+    /// stale and get overwritten before they are ever read).
+    fn generate_assistant_spec(
+        &mut self,
+        decoder: &dyn TokenCodec,
+        cfg: &TurnParams,
+        engine: &mut dyn Engine,
+        emit: &mut dyn FnMut(&[u8]),
+        mut logits: Vec<f32>,
+    ) -> Result<TurnOutcome, ConvError> {
+        let stop_refs: Vec<&[u8]> = Vec::new();
+        let _ = stop_refs; // replaced below (borrow of cfg)
+        let stop_bytes: Vec<Vec<u8>> = cfg
+            .stop_strings
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
+        let mut full: Vec<u8> = Vec::new();
+        let mut emitted = 0usize;
+        let mut n_gen = 0usize;
+        let mut stopped_by_eog = false;
+        let mut stopped_by_string = false;
+        let mut hit_n_predict = false;
+        // The seed: sampled from the entry logits exactly like the plain
+        // path's first iteration (G1 token identity starts at token 0).
+        let sampled = sampler::sample_with_penalties(
+            &mut logits,
+            cfg.temp,
+            cfg.top_k,
+            cfg.top_p,
+            cfg.repeat_penalty,
+            cfg.frequency_penalty,
+            cfg.presence_penalty,
+            &self.prev_tokens,
+            &mut self.rng,
+        );
+        let mut seed = sampled.token_id;
+        // Commit the seed (its KV row is written by the first round).
+        if self.is_eog(seed) {
+            stopped_by_eog = true;
+            self.prev_tokens.push(seed);
+            if self.prev_tokens.len() > REPEAT_LAST_N {
+                self.prev_tokens
+                    .drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
+            }
+            self.stream_tokens.push(seed);
+            let _ = engine.forward(&[seed], &[self.current_pos], 1);
+            self.current_pos += 1;
+        } else {
+            n_gen += 1;
+            full.extend_from_slice(&decoder.decode_bytes(&[seed]));
+            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                stopped_by_string = true;
+                full.truncate(cut);
+            } else {
+                self.prev_tokens.push(seed);
+                if self.prev_tokens.len() > REPEAT_LAST_N {
+                    self.prev_tokens
+                        .drain(0..self.prev_tokens.len() - REPEAT_LAST_N);
+                }
+                self.stream_tokens.push(seed);
+                let complete =
+                    emitted + crate::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+                if complete > emitted {
+                    emit(&full[emitted..complete]);
+                    emitted = complete;
+                }
+            }
+        }
+        loop {
+            // Loop-top exits: the newest committed token (the seed) sits at
+            // current_pos UNWRITTEN — flush it (one nt=1 forward) so the
+            // §5.4 KV-consistency holds across turns.
+            if n_gen >= cfg.n_predict {
+                hit_n_predict = true;
+                let _ = engine.forward(&[seed], &[self.current_pos], 1);
+                self.current_pos += 1;
+                break;
+            }
+            if self.current_pos >= self.n_ctx {
+                hit_n_predict = true;
+                let _ = engine.forward(&[seed], &[self.current_pos], 1);
+                self.current_pos += 1;
+                break;
+            }
+            if stopped_by_eog || stopped_by_string {
+                break;
+            }
+            let toks = engine
+                .spec_round(
+                    seed,
+                    self.current_pos,
+                    &crate::spec::SpecSampler {
+                        temp: cfg.temp,
+                        top_k: cfg.top_k,
+                        top_p: cfg.top_p,
+                        repeat_penalty: cfg.repeat_penalty,
+                        frequency_penalty: cfg.frequency_penalty,
+                        presence_penalty: cfg.presence_penalty,
+                    },
+                    &mut self.prev_tokens,
+                    &mut self.rng,
+                )
+                .expect("spec engine present (has_spec)");
+            let mut consumed = 0usize;
+            let mut break_kind = BreakKind::None;
+            for (i, &tok) in toks.iter().enumerate() {
+                if n_gen >= cfg.n_predict {
+                    hit_n_predict = true;
+                    break_kind = BreakKind::Cap;
+                    break;
+                }
+                if self.is_eog(tok) {
+                    stopped_by_eog = true;
+                    // prev_tokens: the round's accept loop already pushed it.
+                    self.stream_tokens.push(tok);
+                    // The batch's last token is the unwritten seed-slot: write
+                    // it explicitly (§5.4, mirroring the plain loop's EOG).
+                    if i + 1 == toks.len() {
+                        let _ = engine.forward(&[tok], &[self.current_pos + 1 + i], 1);
+                    }
+                    // The EOG is not counted in tokens_generated (the plain
+                    // loop breaks before its `n_gen += 1` — mirror exactly).
+                    self.current_pos += 1 + i + 1;
+                    break_kind = BreakKind::Eog;
+                    break;
+                }
+                n_gen += 1;
+                full.extend_from_slice(&decoder.decode_bytes(&[tok]));
+                if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                    stopped_by_string = true;
+                    full.truncate(cut);
+                    // toks[i] is NOT committed (stop strings are not part of
+                    // the canonical text); committed slots = seed + toks[0..i].
+                    self.current_pos += 1 + i;
+                    break_kind = BreakKind::Stop;
+                    break;
+                }
+                // prev_tokens: the round's accept loop already pushed every
+                // emitted token (main's consumption loop relies on the same
+                // fact — pushing again would duplicate window entries and
+                // skew the repeat penalty).
+                self.stream_tokens.push(tok);
+                let complete =
+                    emitted + crate::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+                if complete > emitted {
+                    emit(&full[emitted..complete]);
+                    emitted = complete;
+                }
+                consumed = i + 1;
+            }
+            match break_kind {
+                BreakKind::None => {
+                    // Full batch committed: toks[len-1] is the new seed
+                    // (committed, its row written by the next round).
+                    seed = toks[toks.len() - 1];
+                    self.current_pos += toks.len();
+                }
+                BreakKind::Eog => break,
+                BreakKind::Stop => break,
+                BreakKind::Cap => {
+                    // toks[0..consumed] committed and written; the round's
+                    // would-be seed was never committed — nothing unwritten.
+                    self.current_pos += consumed;
+                    break;
+                }
+            }
+        }
+        if emitted < full.len() {
+            emit(&full[emitted..]);
+        }
+
+        let text = String::from_utf8(full.clone())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&full).into_owned());
+        self.messages
+            .push(("assistant".to_string(), Some(text.clone())));
+        self.need_insert_eot = !stopped_by_eog;
+
+        Ok(TurnOutcome {
+            text,
+            stopped_by_eog,
+            stopped_by_string,
+            hit_n_predict,
+            prefill_tokens: 0, // filled in by the caller
+            tokens_generated: n_gen,
+            dropped_turns: 0,
+        })
     }
 
     /// Appends a user message and generates the assistant reply.
@@ -495,6 +788,15 @@ impl Conversation {
         emit: &mut dyn FnMut(&[u8]),
         mut logits: Vec<f32>,
     ) -> Result<TurnOutcome, ConvError> {
+        // doc 97: speculative rounds when the engine carries a draft. The
+        // spec loop is a sibling of the plain loop (not a branch inside it)
+        // because a round commits a BATCH of pre-sampled tokens — the
+        // per-token machinery (EOG / stop strings / penalty window / UTF-8
+        // holdback) is mirrored token-for-token, so the emitted stream is
+        // byte-identical (doc 94/95 identity contract).
+        if engine.has_spec() {
+            return self.generate_assistant_spec(decoder, cfg, engine, emit, logits);
+        }
         let stop_bytes: Vec<Vec<u8>> = cfg
             .stop_strings
             .iter()
@@ -608,6 +910,9 @@ mod tests {
         calls: Vec<(Vec<u32>, Vec<usize>, usize)>,
         resets: usize,
         vocab: usize,
+        /// doc 97: when non-empty the engine carries a speculative draft;
+        /// each spec_round pops one pre-accepted batch.
+        spec_batches: VecDeque<Vec<u32>>,
     }
 
     impl MockEngine {
@@ -617,6 +922,7 @@ mod tests {
                 calls: Vec::new(),
                 resets: 0,
                 vocab: 4096,
+                spec_batches: VecDeque::new(),
             }
         }
         fn call_tokens(&self) -> Vec<u32> {
@@ -635,6 +941,19 @@ mod tests {
         }
         fn reset_cache(&mut self) {
             self.resets += 1;
+        }
+        fn has_spec(&self) -> bool {
+            !self.spec_batches.is_empty()
+        }
+        fn spec_round(
+            &mut self,
+            _seed: u32,
+            _pos: usize,
+            _s: &crate::spec::SpecSampler,
+            _prev_tokens: &mut Vec<u32>,
+            _rng: &mut StdRng,
+        ) -> Option<Vec<u32>> {
+            Some(self.spec_batches.pop_front().expect("batch queued"))
         }
     }
 
@@ -866,6 +1185,67 @@ mod tests {
         // t2's old content 'P' has been removed from the stream
         assert!(!c.stream_tokens.contains(&80));
         assert_eq!(c.turn_pos, turn2_start);
+    }
+
+    #[test]
+    fn spec_rounds_commit_batches_and_stop_at_eog() {
+        // doc 97: the spec loop must mirror the plain loop's stream/window
+        // semantics. The mock's spec batches replace the sampling: the seed
+        // comes from the prefill spike, then each round commits one batch.
+        let mut c = conv(512);
+        // program[0] spikes the prefill logits → the turn's seed ('z');
+        // the spares back the mock's per-forward logits afterwards.
+        let mut eng = MockEngine::new(vec![b'z' as u32, EOS, EOS, EOS]);
+        // The prefill consumes program[0] (its spike seeds the turn); the
+        // remaining spikes back the mock's per-call logits if a plain forward
+        // ever runs (it should not, beyond the EOG slot write).
+        eng.spec_batches = vec![
+            vec![b'a' as u32, b'b' as u32, b'c' as u32], // round 1 batch
+            vec![IM_END],                                // round 2: EOG in-batch
+        ]
+        .into();
+        let out = c
+            .start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap()
+            .unwrap();
+        // The seed ('z', sampled from the prefill spike) is the first
+        // committed token; the batch follows it.
+        assert_eq!(out.text, "zabc");
+        assert!(out.stopped_by_eog);
+        assert!(!out.stopped_by_string);
+        // The EOG is not counted (plain-loop mirror).
+        assert_eq!(out.tokens_generated, 4);
+        // The assistant message holds the batch text; the stream holds the
+        // committed tokens plus the EOG.
+        assert_eq!(c.messages.last().unwrap().1.as_deref(), Some("zabc"));
+        assert!(c.stream_tokens.contains(&(b'a' as u32)));
+        assert!(c.stream_tokens.contains(&IM_END));
+        // need_insert_eot stays false: the turn reached EOG.
+        assert!(!c.need_insert_eot);
+    }
+
+    #[test]
+    fn spec_round_mid_batch_stop_string_truncates() {
+        // The stop string lands mid-batch: committed tokens stop at the cut,
+        // the stop tokens are not part of the canonical text.
+        let mut cfgv = cfg();
+        cfgv.stop_strings = vec!["bc".to_string()];
+        let mut c = conv(512);
+        let mut eng = MockEngine::new(vec![b'z' as u32, EOS, EOS]);
+        eng.spec_batches = vec![vec![b'a' as u32, b'b' as u32, b'c' as u32, b'd' as u32]].into();
+        let out = c
+            .start(Some("hi"), &FakeCodec, &cfgv, &mut eng, &mut noop_emit())
+            .unwrap()
+            .unwrap();
+        // The cut lands mid-batch (at 'c'): committed text stops before the
+        // stop string, the batch tail ('d') is discarded uncommitted. The
+        // tokens through the stop-completing one are counted (the plain loop
+        // increments n_gen before its stop check — mirror exactly).
+        assert_eq!(out.text, "za");
+        assert!(out.stopped_by_string);
+        assert!(!out.stopped_by_eog);
+        assert_eq!(out.tokens_generated, 4);
+        assert_eq!(c.messages.last().unwrap().1.as_deref(), Some("za"));
     }
 
     #[test]

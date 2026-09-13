@@ -109,7 +109,10 @@ pub fn run_viz(
     }));
 
     let worker_tokenizer = tokenizer.clone();
-    std::thread::spawn(move || super::chat::worker_loop(model, worker_tokenizer, slots, job_rx));
+    // doc 97: the viz path wires no speculative draft.
+    std::thread::spawn(move || {
+        super::chat::worker_loop(model, worker_tokenizer, slots, job_rx, None)
+    });
 
     let template = super::chat_template_from_gguf(&gguf.parts[0].data);
     let app = Arc::new(AppState {

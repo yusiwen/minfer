@@ -714,6 +714,21 @@ fn main() {
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
 
     // === OpenAI-compatible HTTP server mode ===
+    // Resolve the engine depth cap: adaptive uses 8 unless the user set
+    // --spec-draft-n; static runs use --spec-draft-n as-is (default 2).
+    // (Bugfix: this used to be gated on the adaptive flag, silently turning
+    // every static --spec-draft-n 3..7 run into a d=8 run.)
+    if spec_draft_n_set {
+        spec_d_max = spec_draft_n;
+    } else if spec_draft_adaptive {
+        spec_d_max = 8;
+    }
+    // mirror the engine's identity cap (verify nt <= 8; see spec.rs)
+    if spec_draft_adaptive {
+        spec_d_max = spec_d_max.min(7);
+    }
+
+    // === Multi-turn conversation mode (--cnv) ===
     if server_mode {
         if server_n_slots == 0 {
             eprintln!("Error: --n-slots must be >= 1");
@@ -727,6 +742,11 @@ fn main() {
             "Starting OpenAI-compatible server (model={}, n_ctx={}, n_slots={})",
             model_path, server_n_ctx, server_n_slots
         );
+        let server_spec = spec_draft.as_ref().map(|p| spec::SpecConfig {
+            draft_path: p.clone(),
+            draft_n: spec_d_max,
+            adaptive: spec_draft_adaptive,
+        });
         server::run(
             model,
             tokenizer,
@@ -734,6 +754,7 @@ fn main() {
             server_port,
             server_n_ctx,
             server_n_slots,
+            server_spec,
         );
         return;
     }
@@ -750,10 +771,26 @@ fn main() {
 
     // === Multi-turn conversation mode (--cnv) ===
     if conv_mode {
-        if spec_draft.is_some() {
-            eprintln!("Error: --spec-draft is not supported in conversation mode yet");
-            std::process::exit(1);
-        }
+        // doc 97: the draft loads here (before the target's KV goes to the
+        // gen-loop path) so the conversation can wrap its engine.
+        let conv_spec_engine = match &spec_draft {
+            Some(p) => match spec::SpecEngine::new(
+                &spec::SpecConfig {
+                    draft_path: p.clone(),
+                    draft_n: spec_d_max,
+                    adaptive: spec_draft_adaptive,
+                },
+                &tokenizer,
+                model.n_vocab(),
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("Error: failed to load draft model: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
         let code = run_conversation(
             model,
             &tokenizer,
@@ -765,25 +802,13 @@ fn main() {
             color_mode,
             session_file,
             first_prompt,
+            conv_spec_engine,
         );
         std::process::exit(code);
     }
 
     // === D5-R speculative decoding: load the draft model + its graph cache ===
     // The target's KV moves to a GraphCache too: verify rounds drive
-    // Resolve the engine depth cap: adaptive uses 8 unless the user set
-    // --spec-draft-n; static runs use --spec-draft-n as-is (default 2).
-    // (Bugfix: this used to be gated on the adaptive flag, silently turning
-    // every static --spec-draft-n 3..7 run into a d=8 run.)
-    if spec_draft_n_set {
-        spec_d_max = spec_draft_n;
-    } else if spec_draft_adaptive {
-        spec_d_max = 8;
-    }
-    // mirror the engine's identity cap (verify nt <= 8; see spec.rs)
-    if spec_draft_adaptive {
-        spec_d_max = spec_d_max.min(7);
-    }
     // forward_graph_cached at nt=d+1 (the primitive the specverify instrument
     // validated end-to-end), so both models live in the same plumbing.
     let mut spec_engine = match &spec_draft {
@@ -1404,6 +1429,7 @@ fn run_conversation(
     color_mode: ColorMode,
     session_file: Option<String>,
     first_prompt: Option<String>,
+    mut spec_engine: Option<spec::SpecEngine>,
 ) -> i32 {
     use crate::conversation::Engine as _;
     use std::io::Write; // reset_cache / forward trait methods
@@ -1434,7 +1460,16 @@ fn run_conversation(
         system_prompt,
     };
     let mut conv = conversation::Conversation::new(spec);
-    let mut engine = conversation::GraphEngine::new(&*model, params.n_ctx);
+    let graph_engine = conversation::GraphEngine::new(&*model, params.n_ctx);
+    let sparams = spec::SpecSampler {
+        temp: params.temp,
+        top_k: params.top_k,
+        top_p: params.top_p,
+        repeat_penalty: params.repeat_penalty,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+    };
+    let mut engine = conversation::SpecAwareEngine::new(graph_engine, spec_engine.take(), sparams);
 
     // --session load: history JSON → full KV re-seed (§5.8).
     if let Some(path) = &session_file {

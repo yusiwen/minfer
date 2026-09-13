@@ -61,14 +61,16 @@ pub fn run(
     port: u16,
     n_ctx: usize,
     n_slots: usize,
+    spec_cfg: Option<crate::spec::SpecConfig>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
 
     let worker_tokenizer = tokenizer.clone();
-    let worker =
-        std::thread::spawn(move || chat::worker_loop(model, worker_tokenizer, slots, job_rx));
+    let worker = std::thread::spawn(move || {
+        chat::worker_loop(model, worker_tokenizer, slots, job_rx, spec_cfg)
+    });
     let _ = worker;
 
     let template = chat_template_from_gguf(&gguf.parts[0].data);

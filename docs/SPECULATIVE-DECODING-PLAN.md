@@ -10,7 +10,11 @@ static sweep, which a CLI bug had silently pinned to d=8); doc 96 Phase 0: the n
 verify path profiled — BT-MMQ = 84% of GPU time, smem scoreboard stalls 40–59%
 inside the BT kernels (stop-gate ≥30% → tile/staging work may proceed, re-priced
 separately; the bitwise-preserving lever is cp.async double-buffered staging);
-open: conversation/server modes (战役 97).**
+doc 97: conversation/server integration LANDED — `--cnv --spec-draft` and
+`serve --spec-draft` are live with byte-identical identity gates (all frontends
+now share one spec implementation; a pre-existing plain-server cross-request
+KV-contamination bug was found and fixed in passing). Open: nt=9 Phase 1
+(cp.async staging), re-priced separately.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
