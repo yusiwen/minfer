@@ -3042,118 +3042,123 @@ mod tests {
         };
         let _guard = crate::cuda::CudaState::model_load_guard();
 
-        let nt = 3usize;
+        let nts = [3usize, 8usize];
         let shapes: [(usize, usize, usize, usize, f32); 2] = [
             (4, 2, 8, 100, 0.3),                    // parity fixture dims
             (40, 8, 128, 512, 0.08838834764831845), // 14B decode dims
         ];
         for (nh, nk, hd, prefix, scale) in shapes {
-            let rows = prefix + nt;
+            for nt in nts {
+                let rows = prefix + nt;
 
-            // deterministic inputs
-            let mut s: u64 = 0x9E3779B97F4A7C15;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            let q: Vec<f32> = (0..nt * nh * hd)
-                .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
-                .collect();
-            // f16 K/V bit patterns packed two-per-f32
-            let kv_f16: Vec<u16> = (0..rows * nk * hd)
-                .map(|_| half::f16::from_f32(((next() % 2001) as f32 - 1000.0) / 1000.0).to_bits())
-                .collect();
-            let kv_f32: Vec<f32> = (0..rows * nk * hd)
-                .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
-                .collect();
-
-            let pack_u16 = |v: &[u16]| -> Vec<f32> {
-                v.chunks(2)
-                    .map(|c| {
-                        f32::from_bits(
-                            (*c.first().unwrap()) as u32 | ((*c.get(1).unwrap_or(&0)) as u32) << 16,
-                        )
-                    })
-                    .collect()
-            };
-
-            for f16_kv in [true, false] {
-                // f32 KV needs rows*nk*hd f32 slots; f16 needs half — allocate
-                // the max and write the right byte count per variant
-                let kb = cb.alloc_buffer(rows * nk * hd);
-                let vb = cb.alloc_buffer(rows * nk * hd);
-                if f16_kv {
-                    cb.write_host(kb, &pack_u16(&kv_f16)).unwrap();
-                    cb.write_host(vb, &pack_u16(&kv_f16)).unwrap();
-                } else {
-                    cb.write_host(kb, &kv_f32).unwrap();
-                    cb.write_host(vb, &kv_f32).unwrap();
-                }
-                let qb = cb.alloc_buffer(nt * nh * hd);
-                cb.write_host(qb, &q).unwrap();
-                let obt = cb.alloc_buffer(nt * nh * hd);
-                let oseq = cb.alloc_buffer(nt * nh * hd);
-                let post = cb.alloc_buffer(nt);
-                let posv: Vec<f32> = (0..nt)
-                    .map(|t| f32::from_bits((prefix as i32 + t as i32) as u32))
+                // deterministic inputs
+                let mut s: u64 = 0x9E3779B97F4A7C15;
+                let mut next = move || {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s
+                };
+                let q: Vec<f32> = (0..nt * nh * hd)
+                    .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
                     .collect();
-                cb.write_host(post, &posv).unwrap();
+                // f16 K/V bit patterns packed two-per-f32
+                let kv_f16: Vec<u16> = (0..rows * nk * hd)
+                    .map(|_| {
+                        half::f16::from_f32(((next() % 2001) as f32 - 1000.0) / 1000.0).to_bits()
+                    })
+                    .collect();
+                let kv_f32: Vec<f32> = (0..rows * nk * hd)
+                    .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
+                    .collect();
 
-                // batched verify: one call, positions [P, P+1, P+2]
-                cb.state.gqa_attn_split_batched(
-                    cb.ptr_of(qb).unwrap(),
-                    cb.ptr_of(kb).unwrap(),
-                    cb.ptr_of(vb).unwrap(),
-                    cb.ptr_of(obt).unwrap(),
-                    cb.ptr_of(post).unwrap(),
-                    nh,
-                    nk,
-                    hd,
-                    scale,
-                    f16_kv,
-                    nt,
-                );
+                let pack_u16 = |v: &[u16]| -> Vec<f32> {
+                    v.chunks(2)
+                        .map(|c| {
+                            f32::from_bits(
+                                (*c.first().unwrap()) as u32
+                                    | ((*c.get(1).unwrap_or(&0)) as u32) << 16,
+                            )
+                        })
+                        .collect()
+                };
 
-                // sequential decode: three nt=1 calls at the same positions
-                let qrow = cb.alloc_buffer(nh * hd);
-                let o1 = cb.alloc_buffer(nh * hd);
-                let p1 = cb.alloc_buffer(1);
-                for t in 0..nt {
-                    cb.write_host(qrow, &q[t * nh * hd..(t + 1) * nh * hd])
-                        .unwrap();
-                    cb.write_host(p1, &[f32::from_bits((prefix as i32 + t as i32) as u32)])
-                        .unwrap();
-                    cb.state.gqa_attn_split(
-                        cb.ptr_of(qrow).unwrap(),
+                for f16_kv in [true, false] {
+                    // f32 KV needs rows*nk*hd f32 slots; f16 needs half — allocate
+                    // the max and write the right byte count per variant
+                    let kb = cb.alloc_buffer(rows * nk * hd);
+                    let vb = cb.alloc_buffer(rows * nk * hd);
+                    if f16_kv {
+                        cb.write_host(kb, &pack_u16(&kv_f16)).unwrap();
+                        cb.write_host(vb, &pack_u16(&kv_f16)).unwrap();
+                    } else {
+                        cb.write_host(kb, &kv_f32).unwrap();
+                        cb.write_host(vb, &kv_f32).unwrap();
+                    }
+                    let qb = cb.alloc_buffer(nt * nh * hd);
+                    cb.write_host(qb, &q).unwrap();
+                    let obt = cb.alloc_buffer(nt * nh * hd);
+                    let oseq = cb.alloc_buffer(nt * nh * hd);
+                    let post = cb.alloc_buffer(nt);
+                    let posv: Vec<f32> = (0..nt)
+                        .map(|t| f32::from_bits((prefix as i32 + t as i32) as u32))
+                        .collect();
+                    cb.write_host(post, &posv).unwrap();
+
+                    // batched verify: one call, positions [P, P+1, P+2]
+                    cb.state.gqa_attn_split_batched(
+                        cb.ptr_of(qb).unwrap(),
                         cb.ptr_of(kb).unwrap(),
                         cb.ptr_of(vb).unwrap(),
-                        cb.ptr_of(o1).unwrap(),
-                        cb.ptr_of(p1).unwrap(),
+                        cb.ptr_of(obt).unwrap(),
+                        cb.ptr_of(post).unwrap(),
                         nh,
                         nk,
                         hd,
                         scale,
                         f16_kv,
+                        nt,
                     );
-                    let got = cb.copy_to_host(o1).unwrap();
-                    let mut full = cb.copy_to_host(oseq).unwrap();
-                    full[t * nh * hd..(t + 1) * nh * hd].copy_from_slice(&got);
-                    cb.write_host(oseq, &full).unwrap();
-                }
 
-                let bt = cb.copy_to_host(obt).unwrap();
-                let sq = cb.copy_to_host(oseq).unwrap();
-                for (i, (a, b)) in bt.iter().zip(sq.iter()).enumerate() {
-                    assert_eq!(
+                    // sequential decode: three nt=1 calls at the same positions
+                    let qrow = cb.alloc_buffer(nh * hd);
+                    let o1 = cb.alloc_buffer(nh * hd);
+                    let p1 = cb.alloc_buffer(1);
+                    for t in 0..nt {
+                        cb.write_host(qrow, &q[t * nh * hd..(t + 1) * nh * hd])
+                            .unwrap();
+                        cb.write_host(p1, &[f32::from_bits((prefix as i32 + t as i32) as u32)])
+                            .unwrap();
+                        cb.state.gqa_attn_split(
+                            cb.ptr_of(qrow).unwrap(),
+                            cb.ptr_of(kb).unwrap(),
+                            cb.ptr_of(vb).unwrap(),
+                            cb.ptr_of(o1).unwrap(),
+                            cb.ptr_of(p1).unwrap(),
+                            nh,
+                            nk,
+                            hd,
+                            scale,
+                            f16_kv,
+                        );
+                        let got = cb.copy_to_host(o1).unwrap();
+                        let mut full = cb.copy_to_host(oseq).unwrap();
+                        full[t * nh * hd..(t + 1) * nh * hd].copy_from_slice(&got);
+                        cb.write_host(oseq, &full).unwrap();
+                    }
+
+                    let bt = cb.copy_to_host(obt).unwrap();
+                    let sq = cb.copy_to_host(oseq).unwrap();
+                    for (i, (a, b)) in bt.iter().zip(sq.iter()).enumerate() {
+                        assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
                         "nh={nh} nk={nk} hd={hd} prefix={prefix} kv_f16={f16_kv} elem {i}: batched {a} vs sequential {b}"
                     );
+                    }
                 }
             }
-        }
+        } // nt sweep
     }
 
     #[test]
@@ -3163,199 +3168,202 @@ mod tests {
             return;
         };
         let _guard = crate::cuda::CudaState::model_load_guard();
-        let nt = 3usize;
-
-        fn gen_f32(n: usize, seed: u64) -> Vec<f32> {
-            let mut s = seed;
-            (0..n)
-                .map(|_| {
-                    s = s
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    let u = ((s >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
-                    let mag = if (s >> 60) & 7 == 0 { 1e-5 } else { 3.0 };
-                    (u as f32) * mag
-                })
-                .collect()
-        }
-
-        fn gen_bytes(n: usize, seed: u64) -> Vec<u8> {
-            let mut s = seed;
-            (0..n)
-                .map(|_| {
-                    s = s
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    (s >> 33) as u8
-                })
-                .collect()
-        }
-
-        // (label, type, od, id, q6_padded). Weight-byte lengths per type:
-        // K-quants ceil(id/256) blocks per row (144/176/210 B), the rest
-        // id/32 blocks per row (18/20/22/24/34 B), f32 raw.
-        let cases: Vec<(&str, TensorType, usize, usize, bool)> = vec![
-            ("q4k_v2", TensorType::Q4_K, 2048, 3584, false),
-            ("q4k_v1", TensorType::Q4_K, 512, 3904, false),
-            ("q5k_v2", TensorType::Q5_K, 8192, 3072, false),
-            ("q5k_v1", TensorType::Q5_K, 8192, 3104, false),
-            ("q6k_padded", TensorType::Q6_K, 2048, 2048, true),
-            ("q6k_raw", TensorType::Q6_K, 2048, 2048, false),
-            ("q8_0", TensorType::Q8_0, 512, 2048, false),
-            ("q4_0_big", TensorType::Q4_0, 512, 9216, false),
-            // 14B decode/verify shapes (doc 94): the identity chain needs
-            // single-MMVQ (nt=1) == multi-MMVQ (nt 2..8) bitwise at the real
-            // Qwen2.5-14B q4_k_m dims, not just the small fixtures.
-            ("q4k_14b_attn", TensorType::Q4_K, 5120, 5120, false),
-            ("q4k_14b_gu", TensorType::Q4_K, 13824, 5120, false),
-            ("q6k_14b_down", TensorType::Q6_K, 5120, 13824, false),
-            ("q4_1", TensorType::Q4_1, 512, 2048, false),
-            ("q5_0", TensorType::Q5_0, 512, 2048, false),
-            ("q5_1", TensorType::Q5_1, 512, 2048, false),
-            ("f32", TensorType::F32, 512, 2048, false),
-        ];
-
-        for (i, (label, tt, od, id_, padded)) in cases.into_iter().enumerate() {
-            let nbe = (id_ + 255) / 256;
-            let row_bytes = match tt {
-                TensorType::Q4_K => nbe * 144,
-                TensorType::Q5_K => nbe * 176,
-                TensorType::Q6_K => nbe * 210,
-                TensorType::Q8_0 => (id_ / 32) * 34,
-                TensorType::Q4_0 => (id_ / 32) * 18,
-                TensorType::Q4_1 => (id_ / 32) * 20,
-                TensorType::Q5_0 => (id_ / 32) * 22,
-                TensorType::Q5_1 => (id_ / 32) * 24,
-                TensorType::F32 => id_ * 4,
-                other => panic!("unexpected type {other:?}"),
-            };
-            let wb = gen_bytes(od * row_bytes, 0x5EED_0000 + i as u64);
-            let xs = gen_f32(id_ * nt, 0xA11C_0000 + i as u64);
-
-            let wt_name = format!("wbit{i}");
-            let mut wt = Tensor::from_data(tt, &[id_ as i64, od as i64, 1, 1], wb.clone());
-            wt.name = wt_name.clone();
-            if tt == TensorType::Q6_K && padded {
-                cb.state.register_weight_q6k_padded(&wt_name, &wb, od, id_);
-            } else {
-                cb.state.register_weight(&wt_name, &wb);
+        // doc 95: sweep the verify depths the adaptive controller may pick —
+        // the identity needs multi-MMVQ bitwise-equal to single at every nt,
+        // not just the historical nt=3 probe.
+        for nt in [3usize, 5, 8] {
+            fn gen_f32(n: usize, seed: u64) -> Vec<f32> {
+                let mut s = seed;
+                (0..n)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let u = ((s >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+                        let mag = if (s >> 60) & 7 == 0 { 1e-5 } else { 3.0 };
+                        (u as f32) * mag
+                    })
+                    .collect()
             }
 
-            // batched: one nt = 3 forward
-            let mut b = GraphBuilder::new();
-            let x = b.input("x", [id_, nt, 1, 1], DType::F32);
-            let m = b.matmul(x, &wt, None);
-            b.output(m);
-            let g = b.build();
-            let xb = cb.alloc_buffer(id_ * nt);
-            cb.write_host(xb, &xs).unwrap();
-            let ob = cb.alloc_buffer(od * nt);
-            cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
-            let got = cb.copy_to_host(ob).unwrap();
-
-            // reference: nt separate nt = 1 forwards over the same weights
-            let mut refs: Vec<Vec<f32>> = Vec::with_capacity(nt);
-            for t in 0..nt {
-                let mut b1 = GraphBuilder::new();
-                let x1 = b1.input("x1", [id_, 1, 1, 1], DType::F32);
-                let m1 = b1.matmul(x1, &wt, None);
-                b1.output(m1);
-                let g1 = b1.build();
-                let xb1 = cb.alloc_buffer(id_);
-                cb.write_host(xb1, &xs[t * id_..(t + 1) * id_]).unwrap();
-                let ob1 = cb.alloc_buffer(od);
-                cb.execute_node(&g1.nodes[m1], &[xb1], ob1, None).unwrap();
-                refs.push(cb.copy_to_host(ob1).unwrap());
+            fn gen_bytes(n: usize, seed: u64) -> Vec<u8> {
+                let mut s = seed;
+                (0..n)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (s >> 33) as u8
+                    })
+                    .collect()
             }
 
-            for t in 0..nt {
-                for (r, (a, bref)) in got[t * od..(t + 1) * od]
-                    .iter()
-                    .zip(refs[t].iter())
-                    .enumerate()
-                {
-                    assert_eq!(
-                        a.to_bits(),
-                        bref.to_bits(),
-                        "{label} token {t} row {r}: batched nt={nt} vs single nt=1 mismatch"
-                    );
+            // (label, type, od, id, q6_padded). Weight-byte lengths per type:
+            // K-quants ceil(id/256) blocks per row (144/176/210 B), the rest
+            // id/32 blocks per row (18/20/22/24/34 B), f32 raw.
+            let cases: Vec<(&str, TensorType, usize, usize, bool)> = vec![
+                ("q4k_v2", TensorType::Q4_K, 2048, 3584, false),
+                ("q4k_v1", TensorType::Q4_K, 512, 3904, false),
+                ("q5k_v2", TensorType::Q5_K, 8192, 3072, false),
+                ("q5k_v1", TensorType::Q5_K, 8192, 3104, false),
+                ("q6k_padded", TensorType::Q6_K, 2048, 2048, true),
+                ("q6k_raw", TensorType::Q6_K, 2048, 2048, false),
+                ("q8_0", TensorType::Q8_0, 512, 2048, false),
+                ("q4_0_big", TensorType::Q4_0, 512, 9216, false),
+                // 14B decode/verify shapes (doc 94): the identity chain needs
+                // single-MMVQ (nt=1) == multi-MMVQ (nt 2..8) bitwise at the real
+                // Qwen2.5-14B q4_k_m dims, not just the small fixtures.
+                ("q4k_14b_attn", TensorType::Q4_K, 5120, 5120, false),
+                ("q4k_14b_gu", TensorType::Q4_K, 13824, 5120, false),
+                ("q6k_14b_down", TensorType::Q6_K, 5120, 13824, false),
+                ("q4_1", TensorType::Q4_1, 512, 2048, false),
+                ("q5_0", TensorType::Q5_0, 512, 2048, false),
+                ("q5_1", TensorType::Q5_1, 512, 2048, false),
+                ("f32", TensorType::F32, 512, 2048, false),
+            ];
+
+            for (i, (label, tt, od, id_, padded)) in cases.into_iter().enumerate() {
+                let nbe = (id_ + 255) / 256;
+                let row_bytes = match tt {
+                    TensorType::Q4_K => nbe * 144,
+                    TensorType::Q5_K => nbe * 176,
+                    TensorType::Q6_K => nbe * 210,
+                    TensorType::Q8_0 => (id_ / 32) * 34,
+                    TensorType::Q4_0 => (id_ / 32) * 18,
+                    TensorType::Q4_1 => (id_ / 32) * 20,
+                    TensorType::Q5_0 => (id_ / 32) * 22,
+                    TensorType::Q5_1 => (id_ / 32) * 24,
+                    TensorType::F32 => id_ * 4,
+                    other => panic!("unexpected type {other:?}"),
+                };
+                let wb = gen_bytes(od * row_bytes, 0x5EED_0000 + i as u64);
+                let xs = gen_f32(id_ * nt, 0xA11C_0000 + i as u64);
+
+                let wt_name = format!("wbit{i}");
+                let mut wt = Tensor::from_data(tt, &[id_ as i64, od as i64, 1, 1], wb.clone());
+                wt.name = wt_name.clone();
+                if tt == TensorType::Q6_K && padded {
+                    cb.state.register_weight_q6k_padded(&wt_name, &wb, od, id_);
+                } else {
+                    cb.state.register_weight(&wt_name, &wb);
                 }
-            }
-        }
 
-        // ── 8c q4_0 × q8-GEMM arm (nt > 1, id <= 8192) — tolerance vs the
-        // independent host reference (dequant + the same q8 activation
-        // quantization the kernel applies), the cuda_kquant_matmul_parity
-        // method. The in-block token loop does not change per-token math.
-        {
-            let (od, id_) = (512usize, 2048usize);
-            let wb = gen_bytes(od * (id_ / 32) * 18, 0x5EED_00C0);
-            let xs = gen_f32(id_ * nt, 0xA11C_00C0);
-            let mut wt =
-                Tensor::from_data(TensorType::Q4_0, &[id_ as i64, od as i64, 1, 1], wb.clone());
-            wt.name = "w8c".to_string();
-            cb.state.register_weight("w8c", &wb);
+                // batched: one nt = 3 forward
+                let mut b = GraphBuilder::new();
+                let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+                let m = b.matmul(x, &wt, None);
+                b.output(m);
+                let g = b.build();
+                let xb = cb.alloc_buffer(id_ * nt);
+                cb.write_host(xb, &xs).unwrap();
+                let ob = cb.alloc_buffer(od * nt);
+                cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+                let got = cb.copy_to_host(ob).unwrap();
 
-            let mut b = GraphBuilder::new();
-            let x = b.input("x", [id_, nt, 1, 1], DType::F32);
-            let m = b.matmul(x, &wt, None);
-            b.output(m);
-            let g = b.build();
-            let xb = cb.alloc_buffer(id_ * nt);
-            cb.write_host(xb, &xs).unwrap();
-            let ob = cb.alloc_buffer(od * nt);
-            cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
-            let got = cb.copy_to_host(ob).unwrap();
+                // reference: nt separate nt = 1 forwards over the same weights
+                let mut refs: Vec<Vec<f32>> = Vec::with_capacity(nt);
+                for t in 0..nt {
+                    let mut b1 = GraphBuilder::new();
+                    let x1 = b1.input("x1", [id_, 1, 1, 1], DType::F32);
+                    let m1 = b1.matmul(x1, &wt, None);
+                    b1.output(m1);
+                    let g1 = b1.build();
+                    let xb1 = cb.alloc_buffer(id_);
+                    cb.write_host(xb1, &xs[t * id_..(t + 1) * id_]).unwrap();
+                    let ob1 = cb.alloc_buffer(od);
+                    cb.execute_node(&g1.nodes[m1], &[xb1], ob1, None).unwrap();
+                    refs.push(cb.copy_to_host(ob1).unwrap());
+                }
 
-            // host reference: q4_0 dequant (val = (nib - 8) * d) dotted with
-            // the q8-quantized activations
-            let mut x8 = vec![0u8; nt * (id_ / 32) * 40];
-            for t in 0..nt {
-                for blk in 0..id_ / 32 {
-                    let base = t * id_ + blk * 32;
-                    let mut am = 0f32;
-                    for j in 0..32 {
-                        am = am.max(xs[base + j].abs());
-                    }
-                    let dd = am / 127.0;
-                    let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
-                    let off = (t * (id_ / 32) + blk) * 40;
-                    x8[off..off + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
-                    for j in 0..32 {
-                        let q = (xs[base + j] * di).round().clamp(-128.0, 127.0) as i8;
-                        x8[off + 4 + j] = q as u8;
+                for t in 0..nt {
+                    for (r, (a, bref)) in got[t * od..(t + 1) * od]
+                        .iter()
+                        .zip(refs[t].iter())
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            a.to_bits(),
+                            bref.to_bits(),
+                            "{label} token {t} row {r}: batched nt={nt} vs single nt=1 mismatch"
+                        );
                     }
                 }
             }
-            let dq8 = |t: usize, i: usize| -> f32 {
-                let off = (t * (id_ / 32) + i / 32) * 40;
-                half::f16::from_le_bytes([x8[off], x8[off + 1]]).to_f32()
-                    * (x8[off + 4 + (i % 32)] as i8) as f32
-            };
-            // The per-block contraction order mirrors the kernel (d applied
-            // per block); compare with the standard q8 tolerance.
-            let mut want = vec![0f32; od * nt];
-            let mut scale = 1e-9f32;
-            for t in 0..nt {
-                for r in 0..od {
-                    let mut acc = 0f32;
+
+            // ── 8c q4_0 × q8-GEMM arm (nt > 1, id <= 8192) — tolerance vs the
+            // independent host reference (dequant + the same q8 activation
+            // quantization the kernel applies), the cuda_kquant_matmul_parity
+            // method. The in-block token loop does not change per-token math.
+            {
+                let (od, id_) = (512usize, 2048usize);
+                let wb = gen_bytes(od * (id_ / 32) * 18, 0x5EED_00C0);
+                let xs = gen_f32(id_ * nt, 0xA11C_00C0);
+                let mut wt =
+                    Tensor::from_data(TensorType::Q4_0, &[id_ as i64, od as i64, 1, 1], wb.clone());
+                wt.name = "w8c".to_string();
+                cb.state.register_weight("w8c", &wb);
+
+                let mut b = GraphBuilder::new();
+                let x = b.input("x", [id_, nt, 1, 1], DType::F32);
+                let m = b.matmul(x, &wt, None);
+                b.output(m);
+                let g = b.build();
+                let xb = cb.alloc_buffer(id_ * nt);
+                cb.write_host(xb, &xs).unwrap();
+                let ob = cb.alloc_buffer(od * nt);
+                cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+                let got = cb.copy_to_host(ob).unwrap();
+
+                // host reference: q4_0 dequant (val = (nib - 8) * d) dotted with
+                // the q8-quantized activations
+                let mut x8 = vec![0u8; nt * (id_ / 32) * 40];
+                for t in 0..nt {
                     for blk in 0..id_ / 32 {
-                        let blkb = &wb[(r * (id_ / 32) + blk) * 18..];
-                        let d = half::f16::from_le_bytes([blkb[0], blkb[1]]).to_f32();
-                        let mut sdot = 0f32;
-                        for j in 0..16 {
-                            let b0 = blkb[2 + j];
-                            sdot += ((b0 & 0x0F) as f32 - 8.0) * dq8(t, blk * 32 + j)
-                                + ((b0 >> 4) as f32 - 8.0) * dq8(t, blk * 32 + 16 + j);
+                        let base = t * id_ + blk * 32;
+                        let mut am = 0f32;
+                        for j in 0..32 {
+                            am = am.max(xs[base + j].abs());
                         }
-                        acc += d * sdot;
+                        let dd = am / 127.0;
+                        let di = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+                        let off = (t * (id_ / 32) + blk) * 40;
+                        x8[off..off + 2].copy_from_slice(&half::f16::from_f32(dd).to_le_bytes());
+                        for j in 0..32 {
+                            let q = (xs[base + j] * di).round().clamp(-128.0, 127.0) as i8;
+                            x8[off + 4 + j] = q as u8;
+                        }
                     }
-                    want[t * od + r] = acc;
-                    scale = scale.max(acc.abs());
                 }
+                let dq8 = |t: usize, i: usize| -> f32 {
+                    let off = (t * (id_ / 32) + i / 32) * 40;
+                    half::f16::from_le_bytes([x8[off], x8[off + 1]]).to_f32()
+                        * (x8[off + 4 + (i % 32)] as i8) as f32
+                };
+                // The per-block contraction order mirrors the kernel (d applied
+                // per block); compare with the standard q8 tolerance.
+                let mut want = vec![0f32; od * nt];
+                let mut scale = 1e-9f32;
+                for t in 0..nt {
+                    for r in 0..od {
+                        let mut acc = 0f32;
+                        for blk in 0..id_ / 32 {
+                            let blkb = &wb[(r * (id_ / 32) + blk) * 18..];
+                            let d = half::f16::from_le_bytes([blkb[0], blkb[1]]).to_f32();
+                            let mut sdot = 0f32;
+                            for j in 0..16 {
+                                let b0 = blkb[2 + j];
+                                sdot += ((b0 & 0x0F) as f32 - 8.0) * dq8(t, blk * 32 + j)
+                                    + ((b0 >> 4) as f32 - 8.0) * dq8(t, blk * 32 + 16 + j);
+                            }
+                            acc += d * sdot;
+                        }
+                        want[t * od + r] = acc;
+                        scale = scale.max(acc.abs());
+                    }
+                }
+                assert_close("q4_0 8c multi-token", &got, &want, scale * 1e-2);
             }
-            assert_close("q4_0 8c multi-token", &got, &want, scale * 1e-2);
-        }
+        } // nt sweep
     }
 
     #[test]

@@ -473,6 +473,8 @@ impl Qwen2Graph {
         };
 
         if !cache.try_reuse(&params) {
+            let rebuild_t0 = std::time::Instant::now();
+            let trace_rb = std::env::var("MINFER_REBUILD_TRACE").map_or(false, |v| v == "1");
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
             {
@@ -517,6 +519,13 @@ impl Qwen2Graph {
                 });
                 alloc.alloc_graph(&graph).unwrap();
             }
+            if trace_rb {
+                eprintln!(
+                    "[rebuild] nt={} params rebuilt in {:.1} ms (build+assign+alloc; capture lands on the next 3 executions)",
+                    params.n_tokens,
+                    rebuild_t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
             cache.replace_graph(graph, params);
         }
 
@@ -555,9 +564,11 @@ impl Qwen2Graph {
         // debug dump: MINFER_GRAPH_DUMP=/tmp/x writes the logits and layer-0 KV
         // so GPU vs CPU graph runs can be compared (Phase 3 debugging)
         if let Ok(dir) = std::env::var("MINFER_GRAPH_DUMP") {
+            static DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dump_n = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
             let tag = if nt == 1 { "decode" } else { "prefill" };
-            let _ = std::fs::write(format!("{dir}/logits_{tag}.f32"), {
+            let _ = std::fs::write(format!("{dir}/logits_{tag}_{dump_n:05}.f32"), {
                 let mut b = Vec::with_capacity(logits.len() * 4);
                 for x in &logits {
                     b.extend_from_slice(&x.to_le_bytes());
@@ -575,22 +586,17 @@ impl Qwen2Graph {
                     }
                 }
             }
-            // every layer's K region (persistent buffers — always live, so
-            // these dumps are reliable for GPU-vs-CPU layer bisection)
+            // every layer's K AND V regions (persistent buffers — always
+            // live, so these dumps are reliable for GPU-vs-CPU layer
+            // bisection; doc 95 identity debugging dumps both halves)
             for layer in 0..model.n_layer() {
-                if let Some(kvid) = graph
-                    .nodes
-                    .iter()
-                    .position(|n| {
-                        matches!(n.op, crate::graph::ops::Op::KvcacheLoad { layer: l } if l == layer)
-                    })
-                {
-                    if let Some(kv) = alloc.copy_to_cpu(kvid) {
-                        let mut b = Vec::with_capacity(kv.len() * 4);
-                        for x in &kv {
+                if let Some((k, v)) = alloc.copy_kv_to_cpu(layer) {
+                    for (kind, data) in [("k", k), ("v", v)] {
+                        let mut b = Vec::with_capacity(data.len() * 4);
+                        for x in &data {
                             b.extend_from_slice(&x.to_le_bytes());
                         }
-                        let _ = std::fs::write(format!("{dir}/kv{layer}_{tag}.f32"), b);
+                        let _ = std::fs::write(format!("{dir}/kv{layer}{kind}_{tag}.f32"), b);
                     }
                 }
             }

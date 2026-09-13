@@ -147,6 +147,7 @@ old plan kept as an appendix. Six records:
 | 92 | [ksplit-shipped-flip-resolved-no](92-ksplit-shipped-flip-resolved-no.md) | K-split (grid.z + deterministic reduce) shipped for both BT kernels behind the gate; C_T(9) 86.4→72.9 but the ≤55 flip condition failed — multi-MMVQ stays production; residual = per-tile staging serialization; nt 9..64 auto-ksplit → §3b: enabled on the default path by user decision (default C_T(9) 73.0; d=8 still acceptance-bound) | ✅ |
 | 93 | [draft-quant-and-greedy-identity](93-draft-quant-and-greedy-identity.md) | draft-quant swap is a mixed knob (±3 pts acceptance, opposite signs per cell); greedy identity test FAILS — spec ≠ sequential, flips traced to batched verify attention/softmax; nt-invariance campaign proposed with the identity test as acceptance criterion | 🔬 |
 | 94 | [greedy-identity-and-d8-crossing](94-greedy-identity-and-d8-crossing.md) | greedy identity achieved (spec = sequential byte-for-byte; attention nt-invariance + penalty-window cap); d=8 crosses on code with q4_k_m (46.6 tok/s, 96% of llama); prose stays d=2 | ✅ |
+| 95 | [adaptive-draft-depth](95-adaptive-draft-depth.md) | adaptive per-round draft depth (beta acceptance + min-window costs + 10% hysteresis + optimism for unseen depths); identity boundary pinned — verify nt ≤ 8 bitwise (multi-MMVQ), nt=9 BT lm_head tolerance-class → adaptive capped at d=7; all four gates pass; adaptive BEATS the best static on both code cells (46.5/48.4 vs 43.9/46.6 tok/s) — the buggy static sweep had never measured d=3..7 | ✅ |
 
 ## Part VI · Methodology
 

@@ -27,7 +27,10 @@ use rand::Rng;
 /// CLI inputs (`--spec-draft <model>`, `--spec-draft-n <d>`).
 pub struct SpecConfig {
     pub draft_path: String,
+    /// static depth, or the depth CAP when `adaptive` is set
     pub draft_n: usize,
+    /// doc 95: adaptive depth controller (`--spec-draft-adaptive`)
+    pub adaptive: bool,
 }
 
 /// Per-round counters (reported on stderr after generation).
@@ -37,6 +40,233 @@ pub struct SpecStats {
     pub drafted: u64,
     pub accepted: u64,
     pub repairs: u64,
+    /// sum of chosen depths (doc 95: dmean = d_sum / drafted rounds)
+    pub d_sum: u64,
+}
+
+/// doc 95: adaptive draft-depth controller. Per-depth acceptance EWMA
+/// (p_k = P(draft k accepted | drafts 1..k-1 accepted)) plus an online
+/// verify-cost curve per nt and a draft-cost EWMA; each round picks the d
+/// maximizing projected throughput E[tokens]/(V(d+1) + d*t_draft).
+///
+/// Greedy-identity note (doc 94): the verify forward is bitwise
+/// position-invariant in nt and the penalty window is d-independent, so
+/// varying d changes speed only — the emitted token stream stays
+/// byte-identical to sequential decode.
+pub struct AdaptiveD {
+    d_max: usize,
+    /// acceptance observations per depth: successes / trials (index 0 = depth 1)
+    succ: Vec<u32>,
+    n: Vec<u32>,
+    /// verify-round wall time per nt: min over the last AD_COST_WINDOW
+    /// samples (index 0 = nt 2), ms
+    v: Vec<f64>,
+    /// raw verify samples per nt (the min window)
+    v_win: Vec<Vec<f64>>,
+    /// draft per-token wall time EWMA, ms
+    t_draft: f64,
+    t_draft_win: Vec<f64>,
+    rounds: u64,
+    /// incumbent pick (hysteresis baseline; 0 = none yet)
+    last_pick: usize,
+    /// incumbent's score at its last decision
+    last_score: f64,
+    /// chosen-d histogram (index 0 = d 1) for the stats line
+    d_counts: Vec<u64>,
+}
+
+/// Cost estimator: min over the last AD_COST_WINDOW samples — a deterministic
+/// kernel's steady-state time; the min rejects capture/warm-up spikes on the
+/// first execution after a depth switch (an EWMA would let those spikes
+/// poison the cost curve and lock the controller shallow).
+const AD_COST_WINDOW: usize = 4;
+/// Beta prior for an observed depth's acceptance (Laplace smoothing): with a
+/// handful of trials the mean stays near the prior and converges within a few
+/// rounds — no EWMA alpha to tune, no separate exploration schedule.
+const AD_BETA_A: f64 = 0.5;
+const AD_BETA_B: f64 = 1.5;
+const AD_PRIOR_P: f64 = 0.75;
+const AD_PRIOR_T_DRAFT: f64 = 1.7;
+/// A depth switch requires this score advantage — prevents the pick from
+/// collapsing on early unlucky deep rounds (a 3-trial Laplace mean can read
+/// a true-0.85 depth as 0.14; without hysteresis the pick then starves that
+/// depth forever).
+const AD_SWITCH_MARGIN: f64 = 0.10;
+/// Trials before a depth's beta mean is trusted; below this the estimate is
+/// floored at the depth-1 rate (optimism keeps the depth reachable).
+const AD_MIN_TRIALS: u32 = 8;
+
+/// Min over a bounded trailing window — the steady-state estimator for a
+/// deterministic cost (rejects capture/warm-up spikes).
+fn min_window_update(current: f64, sample: f64, win: &mut Vec<f64>) -> f64 {
+    win.push(sample);
+    if win.len() > AD_COST_WINDOW {
+        win.remove(0);
+    }
+    win.iter().cloned().fold(f64::INFINITY, f64::min)
+}
+
+impl AdaptiveD {
+    pub fn new(d_max: usize) -> Self {
+        let d_max = d_max.max(1);
+        // Verify-cost priors: the doc-94 measured curve at 14B/GB10
+        // (C_T(1)=39.7, 3=48.6, 5=56.2, 9=73.0 ms) interpolated per nt.
+        // Machine/model-specific priors — the online EWMA corrects them for
+        // every visited depth as rounds accumulate.
+        let pts = [(1usize, 39.7f64), (3, 48.6), (5, 56.2), (9, 73.0)];
+        let prior = |nt: usize| -> f64 {
+            if nt <= 1 {
+                return pts[0].1;
+            }
+            for w in pts.windows(2) {
+                let (a, b) = (w[0].0, w[1].0);
+                if nt <= b {
+                    let t = (nt - a) as f64 / (b - a) as f64;
+                    return w[0].1 + t * (w[1].1 - w[0].1);
+                }
+            }
+            let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+            let slope = (b.1 - a.1) / (b.0 - a.0) as f64;
+            b.1 + slope * (nt - b.0) as f64
+        };
+        Self {
+            d_max,
+            succ: vec![0; d_max],
+            n: vec![0; d_max],
+            v: (2..=d_max + 1).map(|nt| prior(nt)).collect(),
+            v_win: (2..=d_max + 1).map(|_| Vec::new()).collect(),
+            t_draft: AD_PRIOR_T_DRAFT,
+            t_draft_win: Vec::new(),
+            rounds: 0,
+            last_pick: 0,
+            last_score: 0.0,
+            d_counts: vec![0; d_max],
+        }
+    }
+
+    pub fn observe_draft(&mut self, total_ms: f64, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let per = total_ms / n as f64;
+        self.t_draft = min_window_update(self.t_draft, per, &mut self.t_draft_win);
+    }
+
+    pub fn observe_verify(&mut self, nt: usize, ms: f64) {
+        if let Some(idx) = nt.checked_sub(2) {
+            if idx < self.v.len() {
+                self.v[idx] = min_window_update(self.v[idx], ms, &mut self.v_win[idx]);
+            }
+        }
+    }
+
+    pub fn observe_round(&mut self, d_r: usize, accepted: usize) {
+        for j in 0..d_r.min(self.succ.len()) {
+            if j < accepted {
+                self.succ[j] += 1;
+            }
+            self.n[j] = self.n[j].saturating_add(1);
+        }
+    }
+
+    /// Pick the draft depth for this round (0 when the KV horizon is spent —
+    /// the caller's d==0 fallback path). Exploration: the first
+    /// AD_EXPLORE_ROUNDS rounds and every AD_EXPLORE_EVERY-th round run at
+    /// d_max so deeper-depth estimates stay live.
+    pub fn pick(&mut self, horizon: usize) -> usize {
+        let d_cap = self.d_max.min(horizon);
+        if d_cap == 0 {
+            return 0;
+        }
+        self.rounds += 1;
+        // Acceptance estimate per depth: Laplace-smoothed mean when observed;
+        // an UNOBSERVED depth inherits the depth-1 rate (optimism that is
+        // right for the flat acceptance curve of code-heavy text and merely
+        // optimistic for collapsing prose — the first deep pick then observes
+        // and corrects). Exploration is therefore emergent: a high depth-1
+        // rate pulls unobserved depths up until real samples say otherwise.
+        let p1 = if self.n[0] > 0 {
+            (self.succ[0] as f64 + AD_BETA_A) / (self.n[0] as f64 + AD_BETA_B)
+        } else {
+            AD_PRIOR_P
+        };
+        let rate = |j: usize| -> f64 {
+            if self.n[j] == 0 {
+                p1
+            } else {
+                let mean = (self.succ[j] as f64 + AD_BETA_A) / (self.n[j] as f64 + AD_BETA_B);
+                // optimism floor: an early-unlucky depth stays reachable
+                mean.max(if self.n[j] < AD_MIN_TRIALS { p1 } else { mean })
+            }
+        };
+        let mut best_d = 1usize;
+        let mut best_score = f64::NEG_INFINITY;
+        for cand in 1..=d_cap {
+            let mut run_p = 1.0f64;
+            let mut e = 1.0f64;
+            for j in 0..cand {
+                run_p *= rate(j);
+                e += run_p;
+            }
+            let cost = self.v[cand - 1] + cand as f64 * self.t_draft;
+            let score = e / cost;
+            if score > best_score {
+                best_score = score;
+                best_d = cand;
+            }
+        }
+        // Hysteresis: keep the incumbent depth unless the challenger wins by
+        // AD_SWITCH_MARGIN (see the constant's note on starvation).
+        let d = if self.last_pick >= 1
+            && self.last_pick <= d_cap
+            && best_d != self.last_pick
+            && best_score < self.last_score * (1.0 + AD_SWITCH_MARGIN)
+        {
+            self.last_pick
+        } else {
+            best_d
+        };
+        self.last_score = if d == best_d {
+            best_score
+        } else {
+            self.score_of(d, p1, d_cap)
+        };
+        self.d_counts[d - 1] += 1;
+        d
+    }
+
+    /// Score of a specific depth under the current estimates (the
+    /// hysteresis baseline for the incumbent pick).
+    fn score_of(&self, cand: usize, p1: f64, _d_cap: usize) -> f64 {
+        let rate = |j: usize| -> f64 {
+            if self.n[j] == 0 {
+                p1
+            } else {
+                (self.succ[j] as f64 + AD_BETA_A) / (self.n[j] as f64 + AD_BETA_B)
+            }
+        };
+        let mut run_p = 1.0f64;
+        let mut e = 1.0f64;
+        for j in 0..cand {
+            run_p *= rate(j);
+            e += run_p;
+        }
+        e / (self.v[cand - 1] + cand as f64 * self.t_draft)
+    }
+
+    /// Mean chosen depth for the stats line (0 when nothing picked yet).
+    pub fn mean_d(&self) -> f64 {
+        let n: u64 = self.d_counts.iter().sum();
+        if n == 0 {
+            return 0.0;
+        }
+        self.d_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i + 1) as f64 * c as f64)
+            .sum::<f64>()
+            / n as f64
+    }
 }
 
 /// Sampler inputs mirrored from GenParams so spec.rs does not depend on
@@ -54,6 +284,7 @@ pub struct SpecEngine {
     draft: Box<dyn ModelDef>,
     draft_cache: GraphCache,
     draft_n: usize,
+    adaptive: Option<AdaptiveD>,
     pub stats: SpecStats,
 }
 
@@ -105,10 +336,22 @@ impl SpecEngine {
                 ));
             }
         }
+        // Identity cap (doc 95): the greedy identity is bitwise-proven for
+        // verify nt <= 8 (single + multi MMVQ, kernel-level tests at nt
+        // 3/5/8). d=8 -> verify nt=9 crosses into the BT-MMQ GEMM family,
+        // whose lm_head accumulation is tolerance-class, so the adaptive
+        // controller is capped at d=7. A static --spec-draft-n 8 stays
+        // available (max throughput, documented as not identity-safe).
+        let cap = if cfg.adaptive {
+            cfg.draft_n.min(7)
+        } else {
+            cfg.draft_n
+        };
         Ok(Self {
             draft,
             draft_cache: GraphCache::new(),
-            draft_n: cfg.draft_n,
+            draft_n: cap,
+            adaptive: cfg.adaptive.then(|| AdaptiveD::new(cap)),
             stats: SpecStats::default(),
         })
     }
@@ -140,8 +383,14 @@ impl SpecEngine {
         rng: &mut StdRng,
     ) -> Vec<u32> {
         // Clamp the draft depth to the KV horizon; at the context edge fall
-        // back to a plain single-token step (same sampler, one row).
-        let d = self.draft_n.min(n_ctx.saturating_sub(pos + 1));
+        // back to a plain single-token step (same sampler, one row). doc 95:
+        // adaptive mode picks the depth from the per-depth acceptance and
+        // cost EWMA curve instead of the static draft_n cap.
+        let horizon = n_ctx.saturating_sub(pos + 1);
+        let d = match self.adaptive.as_mut() {
+            Some(ad) => ad.pick(horizon),
+            None => self.draft_n.min(horizon),
+        };
         let debug = std::env::var("MINFER_SPEC_DEBUG").map_or(false, |v| v == "1" || v == "2");
         if d == 0 {
             let mut row =
@@ -171,6 +420,7 @@ impl SpecEngine {
         // Draft phase: d forwards → d proposals for positions pos+1..pos+d.
         // Raw draft argmax (no penalties — penalties are target-sampler
         // semantics; a penalized proposal would only fail to match).
+        let draft_t0 = std::time::Instant::now();
         let mut tok = next_token;
         let mut proposals = Vec::with_capacity(d);
         for k in 0..d {
@@ -184,7 +434,12 @@ impl SpecEngine {
             tok = argmax(&logits);
             proposals.push(tok);
         }
+        let draft_ms = draft_t0.elapsed().as_secs_f64() * 1e3;
+        if let Some(ad) = self.adaptive.as_mut() {
+            ad.observe_draft(draft_ms, d);
+        }
         self.stats.drafted += d as u64;
+        self.stats.d_sum += d as u64;
 
         // Verify: one nt=d+1 forward with logits on every row. Row i predicts
         // position pos+i+1.
@@ -192,7 +447,12 @@ impl SpecEngine {
         rows.push(next_token);
         rows.extend_from_slice(&proposals);
         let positions: Vec<usize> = (pos..=pos + d).collect();
+        let verify_t0 = std::time::Instant::now();
         let logits = target.forward_graph_cached(&rows, &positions, d + 1, n_ctx, target_cache);
+        let verify_ms = verify_t0.elapsed().as_secs_f64() * 1e3;
+        if let Some(ad) = self.adaptive.as_mut() {
+            ad.observe_verify(d + 1, verify_ms);
+        }
         if debug {
             eprintln!(
                 "[spec] r{} pos={pos} next={next_token} d={d} rows={rows:?} prop={proposals:?}",
@@ -213,7 +473,11 @@ impl SpecEngine {
             rng,
             trace,
             self.stats.rounds,
+            pos,
         );
+        if let Some(ad) = self.adaptive.as_mut() {
+            ad.observe_round(d, accepted);
+        }
         self.stats.accepted += accepted as u64;
         self.stats.rounds += 1;
 
@@ -253,6 +517,7 @@ pub fn accept_loop<R: Rng>(
     rng: &mut R,
     trace: u8,
     round: u64,
+    base_pos: usize,
 ) -> (Vec<u32>, usize) {
     let d = proposals.len();
     let nv = logits.len() / (d + 1);
@@ -283,6 +548,7 @@ pub fn accept_loop<R: Rng>(
         if i < d && t.token_id == proposals[i] {
             emitted.push(proposals[i]);
             push_capped(prev_tokens, proposals[i]);
+            crate::token_trace(base_pos + i + 1, proposals[i]);
             accepted += 1;
         } else {
             // Mismatch (or the last row): this sample IS the next token.
@@ -296,6 +562,7 @@ pub fn accept_loop<R: Rng>(
             }
             emitted.push(t.token_id);
             push_capped(prev_tokens, t.token_id);
+            crate::token_trace(base_pos + i + 1, t.token_id);
             break;
         }
     }
@@ -347,6 +614,53 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
+    #[test]
+    fn adaptive_picks_deep_when_acceptance_stays_high() {
+        // code-like acceptance (~0.8 flat) with the doc-94 cost curve: the
+        // deep-depth expected tokens amortize the verify round -> d_max wins.
+        let mut ad = AdaptiveD::new(8);
+        for _ in 0..40 {
+            ad.observe_round(8, 8); // everything accepted at every depth
+        }
+        let d = ad.pick(64);
+        assert_eq!(d, 8, "flat-high acceptance should pick the cap, got {d}");
+    }
+
+    #[test]
+    fn adaptive_picks_shallow_when_acceptance_collapses() {
+        // prose-like: p1 ~0.5, deeper depths collapse — deep rounds pay the
+        // C_T(9) premium for nothing -> the controller must stay shallow.
+        let mut ad = AdaptiveD::new(8);
+        for _ in 0..40 {
+            ad.observe_round(8, 1); // only the first draft ever survives
+        }
+        let d = ad.pick(64);
+        assert!(d <= 2, "collapsing acceptance should pick d<=2, got {d}");
+    }
+
+    #[test]
+    fn adaptive_respects_horizon_and_explores() {
+        let mut ad = AdaptiveD::new(8);
+        assert_eq!(ad.pick(0), 0, "spent horizon -> the d==0 fallback");
+        assert_eq!(ad.pick(3), 3, "horizon caps the pick (prior curve)");
+    }
+
+    #[test]
+    fn adaptive_online_cost_observations_shift_the_pick() {
+        // With flat-high acceptance but an absurd observed deep-verify cost,
+        // the controller must back off the cap (online correction beats the
+        // hardcoded prior).
+        let mut ad = AdaptiveD::new(8);
+        for _ in 0..30 {
+            ad.observe_round(8, 8);
+        }
+        for _ in 0..30 {
+            ad.observe_verify(9, 400.0); // 400 ms per nt=9 verify
+        }
+        let d = ad.pick(64);
+        assert!(d < 8, "prohibitive deep-verify cost must back off, got {d}");
+    }
+
     fn sampler() -> SpecSampler {
         SpecSampler {
             temp: 0.0,
@@ -374,7 +688,7 @@ mod tests {
         let logits = rows(&[10, 11, 12], 32);
         // proposals match rows 0 and 1 (d=2); row 2 is the bonus.
         let (emitted, accepted) =
-            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0);
+            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0, 0);
         assert_eq!(emitted, vec![10, 11, 12]);
         assert_eq!(accepted, 2);
         // prev_tokens grew by the two accepted proposals + the bonus.
@@ -387,7 +701,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let logits = rows(&[10, 31, 12], 32); // row 1 disagrees with proposal 11
         let (emitted, accepted) =
-            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0);
+            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0, 0);
         assert_eq!(emitted, vec![10, 31]);
         assert_eq!(accepted, 1);
         assert_eq!(prev, vec![10, 31]);
@@ -399,7 +713,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let logits = rows(&[31, 11, 12], 32);
         let (emitted, accepted) =
-            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0);
+            accept_loop(&logits, &[10, 11], &sampler(), &mut prev, &mut rng, 0, 0, 0);
         assert_eq!(emitted, vec![31]);
         assert_eq!(accepted, 0);
     }
@@ -418,7 +732,7 @@ mod tests {
         // row-1 sample must be 2, not 1.
         let mut logits = rows(&[1, 1], 4);
         logits[1 * 4 + 2] = 1.4; // runner-up wins once the 1.5 penalty demotes the repeat
-        let (emitted, accepted) = accept_loop(&logits, &[1], &s, &mut prev, &mut rng, 0, 0);
+        let (emitted, accepted) = accept_loop(&logits, &[1], &s, &mut prev, &mut rng, 0, 0, 0);
         assert_eq!(accepted, 1);
         assert_eq!(emitted, vec![1, 2]);
         assert_eq!(prev, vec![1, 2]);

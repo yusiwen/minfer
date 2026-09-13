@@ -126,7 +126,10 @@ fn print_usage(prog: &str) {
     eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
     eprintln!("  --spec-draft <model> speculative decoding: draft model (D5-R)");
     eprintln!(
-        "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)"
+        "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)",
+    );
+    eprintln!(
+        "  --spec-draft-adaptive  pick d per round from per-depth acceptance x cost (d_max 8)"
     );
     eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
     eprintln!(
@@ -145,6 +148,21 @@ fn print_usage(prog: &str) {
     eprintln!("  --dump-graph-json <PATH>  export the compute graph as JSON (web visualizer, viz/) and exit");
     eprintln!("  -h, --help           show this help");
     eprintln!("  -V, --version        print version and exit");
+}
+
+/// doc 95 diagnostic: append `pos<TAB>token_id` per committed token when
+/// MINFER_TOKEN_TRACE is set — the position-wise identity battery alignment.
+fn token_trace(pos: usize, tok: u32) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("MINFER_TOKEN_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{pos}\t{tok}");
+        }
+    }
 }
 
 fn main() {
@@ -196,6 +214,10 @@ fn main() {
     // D5-R speculative decoding (--spec-draft <model>, --spec-draft-n <d>).
     let mut spec_draft: Option<String> = None;
     let mut spec_draft_n: usize = 2;
+    let mut spec_draft_adaptive = false;
+    let mut spec_draft_n_set = false;
+    // resolved before engine construction: the adaptive depth cap
+    let mut spec_d_max = 2usize;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     let mut parse_err: Option<String> = None;
@@ -283,8 +305,16 @@ fn main() {
                         parse_err = Some(format!("invalid --spec-draft-n '{v}'"));
                         2
                     });
+                    spec_draft_n_set = true;
                 }
                 i += 2;
+            }
+            // doc 95: adaptive draft depth — the controller picks d per round
+            // from per-depth acceptance and cost EWMA (d_max = 8 unless
+            // --spec-draft-n explicitly sets the cap).
+            "--spec-draft-adaptive" => {
+                spec_draft_adaptive = true;
+                i += 1;
             }
             "--meta" => {
                 meta_flag = true;
@@ -741,13 +771,27 @@ fn main() {
 
     // === D5-R speculative decoding: load the draft model + its graph cache ===
     // The target's KV moves to a GraphCache too: verify rounds drive
+    // Resolve the engine depth cap: adaptive uses 8 unless the user set
+    // --spec-draft-n; static runs use --spec-draft-n as-is (default 2).
+    // (Bugfix: this used to be gated on the adaptive flag, silently turning
+    // every static --spec-draft-n 3..7 run into a d=8 run.)
+    if spec_draft_n_set {
+        spec_d_max = spec_draft_n;
+    } else if spec_draft_adaptive {
+        spec_d_max = 8;
+    }
+    // mirror the engine's identity cap (verify nt <= 8; see spec.rs)
+    if spec_draft_adaptive {
+        spec_d_max = spec_d_max.min(7);
+    }
     // forward_graph_cached at nt=d+1 (the primitive the specverify instrument
     // validated end-to-end), so both models live in the same plumbing.
     let mut spec_engine = match &spec_draft {
         Some(p) => match spec::SpecEngine::new(
             &spec::SpecConfig {
                 draft_path: p.clone(),
-                draft_n: spec_draft_n,
+                draft_n: spec_d_max,
+                adaptive: spec_draft_adaptive,
             },
             &tokenizer,
             model.n_vocab(),
@@ -1061,6 +1105,13 @@ fn main() {
             st.repairs,
             if st.rounds > 0 { generated.len() as f64 / st.rounds as f64 } else { 0.0 }
         );
+        if spec_draft_adaptive && st.rounds > 0 {
+            eprintln!(
+                "[spec] adaptive dmean={:.2} (d_max={})",
+                st.d_sum as f64 / st.rounds as f64,
+                spec_d_max
+            );
+        }
     }
     if spec_engine.is_none() {
         while generated.len() < params.n_predict {
@@ -1084,6 +1135,7 @@ fn main() {
                 break;
             }
             generated.push(sampled.token_id);
+            token_trace(current_pos, sampled.token_id);
             prev_tokens.push(sampled.token_id);
             if prev_tokens.len() > REPEAT_LAST_N {
                 prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);

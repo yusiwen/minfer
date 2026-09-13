@@ -512,6 +512,23 @@ impl GraphAllocator {
         }
     }
 
+    /// Host copy of a layer's persistent KV regions (K, V) by pool buffer
+    /// id — doc 95 identity debugging (the graph holds one KvcacheLoad node
+    /// per layer, so the V half is reachable only through `kv_pair`).
+    pub fn copy_kv_to_cpu(&mut self, layer: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        let rd = |s: &mut Self, br: BufRef| -> Option<Vec<f32>> {
+            match br.backend {
+                Backend::CPU => s.cpu.read_host(br.id).map(|x| x.to_vec()),
+                #[cfg(feature = "cuda")]
+                Backend::Cuda => s.cuda.as_ref().and_then(|c| c.copy_to_host(br.id)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            }
+        };
+        let pair = *self.kv.get(&layer)?;
+        Some((rd(self, pair[0])?, rd(self, pair[1])?))
+    }
+
     /// Host view of a persistent region by name (CPU pool).
     /// (Test helper.)
     #[allow(dead_code)]
