@@ -14,10 +14,13 @@ doc 97: conversation/server integration LANDED — `--cnv --spec-draft` and
 `serve --spec-draft` are live with byte-identical identity gates (all frontends
 now share one spec implementation; a pre-existing plain-server cross-request
 KV-contamination bug was found and fixed in passing). doc 98: the 96-Phase-1
-cp.async staging lever measured NULL (the BT stall is compute-side, not
-staging; the remaining levers are tolerance-class) → reverted, and the
-performance line **closed** at its identity-safe ceiling: multi-MMVQ verify +
-adaptive d (doc 95) is the final production configuration.**
+cp.async staging lever measured NULL → reverted. doc 99: the fast-verify
+P0/P1 pass corrected the stall attribution (L1TEX latency at a
+register-file-capped 16 warps/SM — not smem, not staging, not scheduling),
+landed one bitwise micro-fix (B-plane XOR swizzle), measured three further
+scheduling levers NULL, and re-priced the tolerance-class knob down to
+single-digit percent → **not built**. The performance line stays closed:
+multi-MMVQ verify + adaptive d (doc 95) is the final production configuration.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing

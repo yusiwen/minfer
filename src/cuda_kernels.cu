@@ -6439,7 +6439,14 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
                 if (j < od && sb < nsb)                                        \
                     v = *(const uint4*)(W + (size_t)j * ((size_t)nsb * 144)    \
                         + (size_t)sb * 144 + 16 + (size_t)c8 * 16);            \
-                *(uint4*)(qb_raw + (size_t)jj * 128 + (size_t)c8 * 16) = v;    \
+                /* doc 99 P1 XOR swizzle (the A-plane r22 trick applied to  */\
+                /* B): rows are 128 B = the full 32-bank span, so unswizzled*/\
+                /* rows alias the same banks and the compute's 8-row reads  */\
+                /* 4-way-conflict (ncu: 40% excessive shared wavefronts).   */\
+                /* Scramble the 16-B chunk index by the row; the compute    */\
+                /* read applies the same XOR, so the bytes are unchanged.   */\
+                *(uint4*)(qb_raw + (size_t)jj * 128                            \
+                          + (size_t)(c8 ^ (jj & 7)) * 16) = v;                 \
             }                                                                  \
         }                                                                      \
         /* ---- B: SDS per-(chunk, od-row) rank-1 rescale terms ---- */        \
@@ -6506,9 +6513,19 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
                 #pragma unroll
                 for (int nh = 0; nh < 2; nh++) {
                     const int jj = j0w + nh * 8 + (lane >> 2);
-                    const uint8_t* qs = qb_raw + (size_t)jj * 128;
-                    const uint32_t* q0 = (const uint32_t*)(qs + p * 32 + lm3 * 4);
-                    const uint32_t* q1 = (const uint32_t*)(qs + p * 32 + 16 + lm3 * 4);
+                    // doc 99 P1: mirror the staging XOR. Logical 16-B chunks
+                    // p*2 and p*2+1 of row jj map to ((p*2) ^ ph) and
+                    // ((p*2+1) ^ ph) — XOR each chunk index separately (it
+                    // does NOT distribute over the +1).
+                    const int ph = jj & 7;
+                    const uint8_t* qs0 =
+                        qb_raw + (size_t)jj * 128
+                        + (size_t)((p * 2) ^ ph) * 16;
+                    const uint8_t* qs1 =
+                        qb_raw + (size_t)jj * 128
+                        + (size_t)((p * 2 + 1) ^ ph) * 16;
+                    const uint32_t* q0 = (const uint32_t*)(qs0 + lm3 * 4);
+                    const uint32_t* q1 = (const uint32_t*)(qs1 + lm3 * 4);
                     uint32_t v0 = *q0, v1 = *q1;
                     b[nh][0] = (int)(is_hi ? ((v0 >> 4) & M) : (v0 & M));
                     b[nh][1] = (int)(is_hi ? ((v1 >> 4) & M) : (v1 & M));
@@ -6670,7 +6687,14 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
                 if (j < od && sb < nsb)                                        \
                     v = *(const uint4*)(W + (size_t)j * ((size_t)nsb * 144)    \
                         + (size_t)sb * 144 + 16 + (size_t)c8 * 16);            \
-                *(uint4*)(qb_raw + (size_t)jj * 128 + (size_t)c8 * 16) = v;    \
+                /* doc 99 P1 XOR swizzle (the A-plane r22 trick applied to  */\
+                /* B): rows are 128 B = the full 32-bank span, so unswizzled*/\
+                /* rows alias the same banks and the compute's 8-row reads  */\
+                /* 4-way-conflict (ncu: 40% excessive shared wavefronts).   */\
+                /* Scramble the 16-B chunk index by the row; the compute    */\
+                /* read applies the same XOR, so the bytes are unchanged.   */\
+                *(uint4*)(qb_raw + (size_t)jj * 128                            \
+                          + (size_t)(c8 ^ (jj & 7)) * 16) = v;                 \
             }                                                                  \
         }                                                                      \
         /* ---- B: SDS per-(chunk, od-row) rank-1 rescale terms ---- */        \
@@ -6798,9 +6822,19 @@ __global__ void __launch_bounds__(256) mmq_raw_nb_bt_kernel(
                 #pragma unroll
                 for (int nh = 0; nh < 2; nh++) {
                     const int jj = j0w + nh * 8 + (lane >> 2);
-                    const uint8_t* qs = qb_raw + (size_t)jj * 128;
-                    const uint32_t* q0 = (const uint32_t*)(qs + p * 32 + lm3 * 4);
-                    const uint32_t* q1 = (const uint32_t*)(qs + p * 32 + 16 + lm3 * 4);
+                    // doc 99 P1: mirror the staging XOR. Logical 16-B chunks
+                    // p*2 and p*2+1 of row jj map to ((p*2) ^ ph) and
+                    // ((p*2+1) ^ ph) — XOR each chunk index separately (it
+                    // does NOT distribute over the +1).
+                    const int ph = jj & 7;
+                    const uint8_t* qs0 =
+                        qb_raw + (size_t)jj * 128
+                        + (size_t)((p * 2) ^ ph) * 16;
+                    const uint8_t* qs1 =
+                        qb_raw + (size_t)jj * 128
+                        + (size_t)((p * 2 + 1) ^ ph) * 16;
+                    const uint32_t* q0 = (const uint32_t*)(qs0 + lm3 * 4);
+                    const uint32_t* q1 = (const uint32_t*)(qs1 + lm3 * 4);
                     uint32_t v0 = *q0, v1 = *q1;
                     b[nh][0] = (int)(is_hi ? ((v0 >> 4) & M) : (v0 & M));
                     b[nh][1] = (int)(is_hi ? ((v1 >> 4) & M) : (v1 & M));
