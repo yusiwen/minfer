@@ -145,6 +145,7 @@ old plan kept as an appendix. Six records:
 | 90 | [d5-r-rrows-per-block-closed](90-d5-r-rrows-per-block-closed.md) | menu item 1 implemented → measured → reverted: ~0 at d=2 (chain keeps act rows L2-hot; block-parallel latency hiding dominates utilization); nt≥6 flatten recorded; small-M mma re-confirmed as the only lever of size | 🔴 |
 | 91 | [mma-path-block-starvation](91-mma-path-block-starvation.md) | BT GEMM already mma.m16n8k32; small-M floor root-caused to block starvation (ntb=1 → 40 blocks); conditional double-buffer shipped (bitwise-safe, prefill guarded); K-split designed as the fix that revives d=8 | 🔬 |
 | 92 | [ksplit-shipped-flip-resolved-no](92-ksplit-shipped-flip-resolved-no.md) | K-split (grid.z + deterministic reduce) shipped for both BT kernels behind the gate; C_T(9) 86.4→72.9 but the ≤55 flip condition failed — multi-MMVQ stays production; residual = per-tile staging serialization; nt 9..64 auto-ksplit → §3b: enabled on the default path by user decision (default C_T(9) 73.0; d=8 still acceptance-bound) | ✅ |
+| 93 | [draft-quant-and-greedy-identity](93-draft-quant-and-greedy-identity.md) | draft-quant swap is a mixed knob (±3 pts acceptance, opposite signs per cell); greedy identity test FAILS — spec ≠ sequential, flips traced to batched verify attention/softmax; nt-invariance campaign proposed with the identity test as acceptance criterion | 🔬 |
 
 ## Part VI · Methodology
 
