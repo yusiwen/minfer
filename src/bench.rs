@@ -37,7 +37,11 @@ pub fn print_usage(prog: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  -p <N>       prompt tokens for the pp test (default 512; 0 = skip)");
     eprintln!("  -n <N>       tokens to generate for the tg test (default 128; 0 = skip)");
-    eprintln!("  -r <N>       measured reps per test, plus 1 untimed warmup rep each (default 3;");
+    eprintln!(
+        "  -r <N>       measured reps per test, plus a steady-clock warmup
+               (MINFER_BENCH_WARMUP_MS, default 2000 ms; doc 100/101
+               clock-ramp rule). (default 3;"
+    );
     eprintln!("               reports mean ± stddev over the reps)");
     eprintln!("  -o <FMT>     output format: md | csv | json (default md)");
     eprintln!("  --n-ctx <N>  KV cache size for the run (default pp+tg+16; clamped to the");
@@ -286,14 +290,27 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
 
     let mut cache = GraphCache::new();
 
+    // doc 100/101: steady-clock warmup budget shared by the pp/tg loops.
+    let warmup_ms: u128 = std::env::var("MINFER_BENCH_WARMUP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(2000);
+
     // === Run the test matrix ===
     let mut rows: Vec<BenchRow> = Vec::new();
     if p_prompt > 0 {
         eprintln!("bench: pp{p_prompt} (prefill-only), {reps} reps + 1 warmup, n_ctx={n_ctx} ...");
         let positions: Vec<usize> = (0..p_prompt).collect();
-        // Warmup rep (untimed): builds/first-executes the prefill graph (CUDA
-        // Graph capture, buffer pools) so measured reps reuse it by params.
-        let _ = model.forward_graph_cached(&prompt_tokens, &positions, 1, n_ctx, &mut cache);
+        // Warmup (untimed): builds/first-executes the prefill graph (CUDA
+        // Graph capture, buffer pools) so measured reps reuse it by params —
+        // then keeps loading until the steady-clock budget is spent (doc 100:
+        // the SM idles at 208 MHz and ramps under load; 1 rep ramps nothing).
+        let warm_start = std::time::Instant::now();
+        let mut warm_iters = 0usize;
+        while warm_iters < 1 || warm_start.elapsed().as_millis() < warmup_ms {
+            let _ = model.forward_graph_cached(&prompt_tokens, &positions, 1, n_ctx, &mut cache);
+            warm_iters += 1;
+        }
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
             let t0 = Instant::now();
@@ -313,16 +330,22 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         eprintln!(
             "bench: tg{n_gen} (prefill {p_prompt} + decode {n_gen}), {reps} reps + 1 warmup, n_ctx={n_ctx} ..."
         );
-        // Warmup rep (untimed), same fresh-context shape as a measured rep.
-        let _ = decode_once(
-            &*model,
-            &mut cache,
-            &prompt_tokens,
-            n_ctx,
-            p_prompt,
-            n_gen,
-            seed_tok,
-        );
+        // Warmup (untimed), same fresh-context shape as a measured rep —
+        // time-based steady-clock budget as in the pp loop (doc 100/101).
+        let warm_start = std::time::Instant::now();
+        let mut warm_iters = 0usize;
+        while warm_iters < 1 || warm_start.elapsed().as_millis() < warmup_ms {
+            let _ = decode_once(
+                &*model,
+                &mut cache,
+                &prompt_tokens,
+                n_ctx,
+                p_prompt,
+                n_gen,
+                seed_tok,
+            );
+            warm_iters += 1;
+        }
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
             samples.push(decode_once(

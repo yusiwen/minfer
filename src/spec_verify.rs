@@ -46,7 +46,11 @@ pub fn print_usage(prog: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  -p <N>     KV depth: prefill P tokens, then measure every nt at that");
     eprintln!("             depth (default 512)");
-    eprintln!("  -r <N>     timed reps per nt phase, after 3 untimed warmups (default 40;");
+    eprintln!(
+        "  -r <N>     timed reps per nt phase, after a steady-clock warmup
+             (MINFER_SPECVERIFY_WARMUP_MS, default 2000 ms; doc 100/101
+             clock-ramp rule). (default 40;"
+    );
     eprintln!("             reports median / p10 / p90 in ms)");
     eprintln!("  -o <FMT>   output format: json | md (default json)");
     eprintln!("  -t, --threads <N>  CPU worker threads (GPU backends are unaffected)");
@@ -76,6 +80,7 @@ fn measure_phase(
     depth: usize,
     nt: usize,
     warmups: usize,
+    warmup_ms: u128,
     reps: usize,
     n_out: usize,
 ) -> Phase {
@@ -84,8 +89,11 @@ fn measure_phase(
         .map(|i| (((i as u64) * 7919 + 13) % n_vocab) as u32)
         .collect();
     let positions: Vec<usize> = (depth - nt..depth).collect();
-    for _ in 0..warmups {
+    let warm_start = Instant::now();
+    let mut warm_iters = 0usize;
+    while warm_iters < warmups || warm_start.elapsed().as_millis() < warmup_ms {
         let _ = model.forward_graph_cached(&tokens, &positions, n_out, n_ctx, cache);
+        warm_iters += 1;
     }
     let mut samples_ms = Vec::with_capacity(reps);
     for _ in 0..reps {
@@ -279,15 +287,25 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         })
         .unwrap_or_else(|| vec![1, 3, 5]);
     let force_nout1 = std::env::var("MINFER_SPECVERIFY_NOUT").map_or(false, |v| v == "1");
+    // doc 101: time-based steady-clock warmup — the SM idles at 208 MHz and
+    // ramps under load (doc 100), and 3 iterations ramp nothing. Warm until
+    // the budget is spent (MINFER_SPECVERIFY_WARMUP_MS, default 2000) with a
+    // floor of 3 iterations for allocator/graph stability.
+    let warmup_ms: u128 = std::env::var("MINFER_SPECVERIFY_WARMUP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(2000);
     let warmups = 3;
     let measure_at = |model: &dyn ModelDef, cache: &mut GraphCache, nt: usize| {
         let n_out = if force_nout1 { 1 } else { nt };
-        measure_phase(model, cache, n_ctx, depth, nt, warmups, reps, n_out)
+        measure_phase(
+            model, cache, n_ctx, depth, nt, warmups, warmup_ms, reps, n_out,
+        )
     };
     let mut pass1: Vec<Phase> = Vec::new();
     for &nt in &nts {
         eprintln!(
-            "specverify: pass 1 nt={nt} n_out={} ({warmups} warmup + {reps} timed) ...",
+            "specverify: pass 1 nt={nt} n_out={} (warmup {warmup_ms} ms + {reps} timed) ...",
             if force_nout1 { 1 } else { nt }
         );
         pass1.push(measure_at(&*model, &mut cache, nt));

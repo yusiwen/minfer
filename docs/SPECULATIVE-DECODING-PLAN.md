@@ -23,7 +23,9 @@ single-digit percent → **not built**. doc 100: the last
 priced lever (aligned qs plane) measured timing-NULL under interleaved A/B,
 and exposed a ±7–12% clock-ramp band that invalidates sequential benchmark
 comparisons on this box. The performance line stays closed — now with the
-mechanism mapped and the measurement method corrected: multi-MMVQ verify +
+mechanism mapped and the measurement method corrected (doc 101: time-budget
+warmups; the headline table re-measured tight — adaptive 35.9 prose / 44.8
+code tok/s, 1.42×/1.77× sequential): multi-MMVQ verify +
 adaptive d (doc 95) is the final production configuration.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
