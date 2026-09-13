@@ -6,7 +6,11 @@ optimism for unseen depths; **identity boundary pinned: verify nt ≤ 8 bitwise
 (multi-MMVQ), nt=9 (BT-MMQ lm_head) tolerance-class → adaptive capped at d=7**; all
 four gates pass and adaptive beats the best static on both code cells
 (46.5/48.4 vs 43.9/46.6 tok/s — the true optimum dmean ≈ 3.5 was never in the
-static sweep, which a CLI bug had silently pinned to d=8); open: conversation/server modes.**
+static sweep, which a CLI bug had silently pinned to d=8); doc 96 Phase 0: the nt=9
+verify path profiled — BT-MMQ = 84% of GPU time, smem scoreboard stalls 40–59%
+inside the BT kernels (stop-gate ≥30% → tile/staging work may proceed, re-priced
+separately; the bitwise-preserving lever is cp.async double-buffered staging);
+open: conversation/server modes (战役 97).**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
