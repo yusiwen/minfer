@@ -154,6 +154,7 @@ old plan kept as an appendix. Six records:
 | 99 | [fastverify-p0-p1](99-fastverify-p0-p1.md) | fast-verify P0/P1: doc 98's tolerance-class claim corrected (int mma exact → wider bitwise-safe set); fragment prefetch / non-volatile mma / cp.async all measured NULL; **B-plane XOR swizzle landed** (shared wavefront excess 40%→0, −4.3% kernel instance, bitwise 4/4); pc-sampling re-attributes the stall to **L1TEX latency × 16-warp occupancy ceiling** → knob not built, EV re-priced down | ✅ |
 | 100 | [qs-plane-drift](100-qs-plane-drift.md) | the last priced lever (aligned qs plane) measured **timing-NULL under interleaved A/B**; sequential "−12.4%" was clock-ramp drift (±7–12% band, 208 MHz idle → 3 GHz) — sequential before/after runs on this box are invalid instruments; repack family closed, D5-R fully closed | ⚫ |
 | 101 | [steady-state-method](101-steady-state-method.md) | doc 100's rule made executable: time-budget warmups in specverify/bench; headline table re-measured tight (pp512 2083 ± 7.2; adaptive 35.9 prose / 44.8 code; d8 collapse reproduced) — doc-95 absolutes confirmed as drift artifacts, structure exact | ✅ |
+| 102 | [draft-scale-sweep](102-draft-scale-sweep.md) | bigger drafts lose (acceptance bounded by the target, not draft capacity) — default draft stays 0.5B Q4_K_M; flushed + fixed a latent qwen3-loader namespaced-registration bug (Q6_K padded weights under raw name → both models to CPU); post-EOS token-text gate relaxed to warning, cross-family identity 4/4 | ✅ fix + null |
 
 ## Part VI · Methodology
 

@@ -272,8 +272,15 @@ fn load_tensor(
                 // the matmul kernel can use aligned uint4 weight loads
                 // (the raw 210-byte stride forces 1-byte-per-instruction
                 // reads and caps 7B decode near ~38 GB/s).
+                // NOTE: under the NAMESPACED draft load the registry key
+                // must be the namespaced reg_name, not the raw GGUF tensor
+                // name - `ti.name` here silently REPLACED the target's
+                // registry entry for the same tensor name (e.g.
+                // 'token_embd.weight'), which failed the target's
+                // has_weight_of_size at the next build_graph and dropped
+                // BOTH graphs to CPU (doc 102).
                 cuda.register_weight_q6k_padded(
-                    &ti.name,
+                    &reg_name,
                     tensor.data(),
                     tensor.shape[1] as usize,
                     tensor.shape[0] as usize,

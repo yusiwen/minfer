@@ -25,7 +25,11 @@ and exposed a ±7–12% clock-ramp band that invalidates sequential benchmark
 comparisons on this box. The performance line stays closed — now with the
 mechanism mapped and the measurement method corrected (doc 101: time-budget
 warmups; the headline table re-measured tight — adaptive 35.9 prose / 44.8
-code tok/s, 1.42×/1.77× sequential): multi-MMVQ verify +
+code tok/s, 1.42×/1.77× sequential). The draft-scale sweep (doc 102) closes
+the last speculative-quality axis: bigger drafts lose (acceptance is bounded
+by the target's predictability), so the 0.5B Q4_K_M draft stays; cross-family
+drafts are identity-safe (4/4 byte-identical vs sequential) and the sweep
+flushed a latent qwen3-loader namespaced-registration bug. Multi-MMVQ verify +
 adaptive d (doc 95) is the final production configuration.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the

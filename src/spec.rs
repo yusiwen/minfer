@@ -328,13 +328,41 @@ impl SpecEngine {
                 target_tokenizer.eos_token
             ));
         }
+        // Token-text equality over the shared id range: the spec loop
+        // exchanges token IDs (the draft proposes an id, verify accepts on
+        // the target's argmax id) and decoding always uses the target's
+        // vocabulary, so a text disagreement is not a correctness risk —
+        // but in the control region (ids up to and including EOS) it means
+        // the models disagree about the conversation's special tokens, so
+        // it stays a hard error there. Beyond EOS the families legitimately
+        // differ (e.g. Qwen3 fills the post-EOS ids with tool tokens where
+        // Qwen2.5 keeps PAD placeholders): warn once and continue — this
+        // degrades acceptance quality at worst, never identity (which the
+        // per-config battery re-proves).
+        let eos_bound = target_tokenizer.eos_token.max(dtok.eos_token) as usize;
+        let mut diverged = 0usize;
+        let mut first_div = None;
         for i in 0..tv.min(dv) {
             if dtok.id_to_token[i] != target_tokenizer.id_to_token[i] {
-                return Err(format!(
-                    "spec draft: token text mismatch at id {i}: '{}' vs '{}'",
-                    dtok.id_to_token[i], target_tokenizer.id_to_token[i]
-                ));
+                if i <= eos_bound {
+                    return Err(format!(
+                        "spec draft: token text mismatch at id {i}: '{}' vs '{}'",
+                        dtok.id_to_token[i], target_tokenizer.id_to_token[i]
+                    ));
+                }
+                diverged += 1;
+                if first_div.is_none() {
+                    first_div = Some(i);
+                }
             }
+        }
+        if diverged > 0 {
+            eprintln!(
+                "minfer/spec: draft/target token texts diverge at {diverged} post-EOS ids \
+                 (first id {}; control region matches) - exchange is by id and decode is \
+                 by the target, so identity holds; acceptance quality may degrade",
+                first_div.unwrap_or(0)
+            );
         }
         // Identity cap (doc 95): the greedy identity is bitwise-proven for
         // verify nt <= 8 (single + multi MMVQ, kernel-level tests at nt
