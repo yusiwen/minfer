@@ -30,7 +30,10 @@ the last speculative-quality axis: bigger drafts lose (acceptance is bounded
 by the target's predictability), so the 0.5B Q4_K_M draft stays; cross-family
 drafts are identity-safe (4/4 byte-identical vs sequential) and the sweep
 flushed a latent qwen3-loader namespaced-registration bug. Multi-MMVQ verify +
-adaptive d (doc 95) is the final production configuration.**
+adaptive d (doc 95) is the final production configuration; doc 103 extends the
+same verify machinery to q8_0/q4_0-weighted targets (the q8_0 verify batch had
+been running the f32-activation kernel — 7B Q8_0 spec e2e jumps
+26.8 → 68.0 tok/s, +154%).**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing

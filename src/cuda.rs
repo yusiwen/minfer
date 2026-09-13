@@ -606,6 +606,44 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // doc 103: q4_0 / q8_0 decode MMVQ (the 8e structure on the legacy
+    // f32-activation types; new code only — see cuda_kernels.cu tail).
+    fn launch_q4_0_q8_mmvq(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q4_0_q8_mmvq_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q8_0_q8_mmvq(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    fn launch_q8_0_q8_mmvq_multi(
+        weights: *const u8,
+        acts8: *const u8,
+        output: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    );
     // Step 82: multi-token (nt in [2, 8]) MMVQ variants — the token loop is
     // in-block (one block per weight row, grid.y = 1), so the weight stream
     // is paid once regardless of nt (the doc 81 D5-1a dispatch hole).
@@ -2675,11 +2713,40 @@ impl CudaState {
                         );
                     }
                     Ok(())
+                } else if nt == 1 && id >= 2048 && id % 32 == 0 && !Self::no_q40_mmvq() {
+                    // doc 103: decode MMVQ (the 8c int8 branch above owns
+                    // nt > 1 && id <= 8192 and is untouched; these branches
+                    // only claim shapes that previously ran the f32 kernel).
+                    self.q4_0_decode_mmvq(wptr, x, out, od, id, nt);
+                    Ok(())
+                } else if nt >= 2 && nt <= 8 && id > 8192 && id % 32 == 0 && !Self::no_q40_mmvq() {
+                    self.q4_0_decode_mmvq_multi(wptr, x, out, od, id, nt);
+                    Ok(())
                 } else {
                     launch!(launch_q4_0_f32_matmul)
                 }
             }
-            TensorType::Q8_0 => launch!(launch_q8_0_f32_matmul),
+            TensorType::Q8_0 => {
+                // doc 103: decode joins the MMVQ structure (dp4a over the
+                // shared pad40 q8 activations; the 34-B block stride keeps
+                // the f32 kernel's coalesced weight loop out of the picture
+                // — measured crossover in doc 103). The f32 kernel stays as
+                // the fallback (MINFER_NO_Q80_MMVQ=1) and for every shape
+                // the gates exclude.
+                if nt == 1 && id >= 2048 && id % 32 == 0 && !Self::no_q80_mmvq() {
+                    self.q8_0_decode_mmvq(wptr, x, out, od, id, nt);
+                    Ok(())
+                } else if nt >= 2 && nt <= 8 && id >= 2048 && id % 32 == 0 && !Self::no_q80_mmvq() {
+                    // size floor as in nt == 1: below ~2048 the extra
+                    // quantize launch and the q8 activation rounding lose to
+                    // the f32 kernel (and tiny shapes keep the exact f32
+                    // numerics the small-shape tests pin down)
+                    self.q8_0_decode_mmvq_multi(wptr, x, out, od, id, nt);
+                    Ok(())
+                } else {
+                    launch!(launch_q8_0_f32_matmul)
+                }
+            }
             TensorType::Q4_1 => launch!(launch_q4_1_f32_matmul),
             TensorType::Q4_K => {
                 // 8e-reversal: decode (nt == 1) runs the MMVQ structure
@@ -4409,6 +4476,120 @@ impl CudaState {
     /// back onto the f32 kernels (A/B escape hatch, MINFER_NO_FUSE_* style).
     fn no_kq_mmvq() -> bool {
         std::env::var("MINFER_NO_KQ_MMVQ").map_or(false, |v| v == "1")
+    }
+    // doc 103: per-type opt-outs for the new q4_0/q8_0 MMVQ decode paths
+    // (A/B switches; the f32-activation kernels remain the fallback).
+    fn no_q40_mmvq() -> bool {
+        std::env::var("MINFER_NO_Q40_MMVQ").map_or(false, |v| v == "1")
+    }
+    fn no_q80_mmvq() -> bool {
+        std::env::var("MINFER_NO_Q80_MMVQ").map_or(false, |v| v == "1")
+    }
+
+    /// doc 103: decode (nt == 1) q4_0 matmul via the MMVQ structure — dp4a
+    /// over the shared pad40 q8 activation plane, one row per 256-thread
+    /// block, nibble offset -8 folded into the dot via the 8*sx correction.
+    pub fn q4_0_decode_mmvq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q4_0_q8_mmvq(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// doc 103: multi-token (nt in [2, 8]) q4_0 MMVQ — same in-block token
+    /// loop as the K-quant multi variants; bitwise-consistent with the
+    /// nt == 1 kernel (same per-u order and reduction).
+    pub fn q4_0_decode_mmvq_multi(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q4_0_q8_mmvq_multi(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// doc 103: decode (nt == 1) q8_0 matmul via the MMVQ structure — the
+    /// 34-B block stride is only 2B-aligned, so the payload reads use the
+    /// q6_K two-u16-halves pattern.
+    pub fn q8_0_decode_mmvq(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q8_0_q8_mmvq(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
+    }
+
+    /// doc 103: multi-token (nt in [2, 8]) q8_0 MMVQ.
+    pub fn q8_0_decode_mmvq_multi(
+        &self,
+        wptr: *mut std::ffi::c_void,
+        x: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) {
+        let q8 = self.decode_quantize_native(x as *const f32, id, nt);
+        let stream = self.stream();
+        unsafe {
+            launch_q8_0_q8_mmvq_multi(
+                wptr as *const u8,
+                q8 as *const u8,
+                out as *mut f32,
+                od as i32,
+                id as i32,
+                nt as i32,
+                stream,
+            );
+        }
     }
 
     /// 8m: force the legacy per-type prefill kernels (A/B escape hatch).

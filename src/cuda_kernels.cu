@@ -8040,3 +8040,204 @@ void launch_q6_k_q8_mmvq_v2_multi(
     q6_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
 }
 } // extern "C"
+
+// === doc 103: q4_0 / q8_0 decode MMVQ =====================================
+// The 8e MMVQ structure (one row per 256-thread block, 32-element units
+// round-robin across lanes, dp4a over the shared pad40 q8 activation plane)
+// applied to the two legacy f32-activation types. NEW CODE ONLY — every
+// landed kernel/dispatch (q4_K/q5_K/q6_K MMVQ, raw-BT) is untouched; the
+// dispatch arms below the new branches keep the f32 kernels verbatim.
+// Weight strides are 18 B (q4_0) / 34 B (q8_0): even but not 4-aligned, so
+// the payload reads use the q6_K 2-byte-half pattern (get_int_b2 style).
+// nt-invariance: the multi variant is the nt=1 kernel with the per-u
+// accumulation order and the block reduction kept bitwise (Step 82 rule),
+// which is what the doc 93/94 identity contract needs.
+
+__global__ void __launch_bounds__(256) q4_0_q8_mmvq(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nb = id >> 5; // dispatch gate: id % 32 == 0
+    const int row_stride = nb * Q4B;
+    const uint8_t* x8row = acts8 + (size_t)t * nb * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)u * Q4B;
+        const float d4 = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const uint8_t* x8b = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+        int dot = 0, sx = 0;
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            // 18-B stride: payload is 2B-aligned only — two u16 halves/word
+            const uint32_t w =
+                (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v) |
+                ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v + 2) << 16);
+            const uint32_t lo = w & 0x0F0F0F0F;           // elements 4v..4v+3
+            const uint32_t hi = (w >> 4) & 0x0F0F0F0F;    // elements 16+4v..
+            dot = __dp4a((int)lo, (int)xw[v], dot);
+            dot = __dp4a((int)hi, (int)xw[v + 4], dot);
+            sx  = __dp4a(0x01010101, (int)xw[v], sx);
+            sx  = __dp4a(0x01010101, (int)xw[v + 4], sx);
+        }
+        // q4_0 value = (nibble - 8) * d  →  Σ = d * (dot - 8 * sx)
+        acc += d8 * d4 * (float)(dot - 8 * sx);
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+__global__ void __launch_bounds__(256) q8_0_q8_mmvq(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int t = blockIdx.y;
+    const int nb = id >> 5;
+    const int row_stride = nb * Q8B;
+    const uint8_t* x8row = acts8 + (size_t)t * nb * Q8PB;
+
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)u * Q8B;
+        const float d4 = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        const uint8_t* x8b = x8row + (size_t)u * Q8PB;
+        const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+        const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+        int dot = 0;
+        #pragma unroll
+        for (int v = 0; v < 8; v++) {
+            // 34-B stride: 2B-aligned payload, two u16 halves per word
+            const uint32_t w =
+                (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v) |
+                ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v + 2) << 16);
+            dot = __dp4a((int)w, (int)xw[v], dot);
+        }
+        acc += d8 * d4 * (float)dot;
+    }
+    mmvq_block_reduce(acc, output, od, t);
+}
+
+__global__ void __launch_bounds__(256) q4_0_q8_mmvq_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nb = id >> 5;
+    const int row_stride = nb * Q4B;
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)u * Q4B;
+        const float d4 = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < tmax) {
+                const uint8_t* x8b = acts8 + ((size_t)(t0 + t) * nb + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+                int dot = 0, sx = 0;
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const uint32_t w =
+                        (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v) |
+                        ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v + 2) << 16);
+                    const uint32_t lo = w & 0x0F0F0F0F;
+                    const uint32_t hi = (w >> 4) & 0x0F0F0F0F;
+                    dot = __dp4a((int)lo, (int)xw[v], dot);
+                    dot = __dp4a((int)hi, (int)xw[v + 4], dot);
+                    sx  = __dp4a(0x01010101, (int)xw[v], sx);
+                    sx  = __dp4a(0x01010101, (int)xw[v + 4], sx);
+                }
+                acc[t] += d8 * d4 * (float)(dot - 8 * sx);
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
+}
+
+__global__ void __launch_bounds__(256) q8_0_q8_mmvq_multi(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ acts8,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int row = blockIdx.x;
+    const int nb = id >> 5;
+    const int row_stride = nb * Q8B;
+    const int ngrp = (nt + 7) >> 3;
+    for (int g = 0; g < ngrp; ++g) {
+    const int t0 = g << 3;
+    const int tmax = min(8, nt - t0);
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = threadIdx.x; u < nb; u += 256) {
+        const uint8_t* blk = weights + (size_t)row * row_stride + (size_t)u * Q8B;
+        const float d4 = h2f(*reinterpret_cast<const uint16_t*>(blk));
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t < tmax) {
+                const uint8_t* x8b = acts8 + ((size_t)(t0 + t) * nb + (size_t)u) * Q8PB;
+                const float d8 = h2f(*reinterpret_cast<const uint16_t*>(x8b));
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(x8b + 4);
+                int dot = 0;
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const uint32_t w =
+                        (uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v) |
+                        ((uint32_t)*reinterpret_cast<const uint16_t*>(blk + 2 + 4 * v + 2) << 16);
+                    dot = __dp4a((int)w, (int)xw[v], dot);
+                }
+                acc[t] += d8 * d4 * (float)dot;
+            }
+        }
+    }
+    mmvq_block_reduce_multi(acc, output, od, tmax, t0);
+    }
+}
+
+extern "C" void launch_q4_0_q8_mmvq(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q4_0_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+extern "C" void launch_q4_0_q8_mmvq_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q4_0_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+extern "C" void launch_q8_0_q8_mmvq(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, nt);
+    q8_0_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
+
+extern "C" void launch_q8_0_q8_mmvq_multi(
+    const uint8_t* weights, const uint8_t* acts8, float* output,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    dim3 grid(od, 1);
+    q8_0_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+}
