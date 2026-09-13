@@ -769,6 +769,38 @@ extern "C" {
         pstr: i32,
         stream: *mut std::ffi::c_void,
     );
+    // doc 94: batched split attention for the verify shapes (1 < nt <= 16) —
+    // bitwise-equal per position to the nt=1 decode split path.
+    fn launch_gqa_attn_split_batched_f16kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        partial: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        pstr: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+    fn launch_gqa_attn_split_batched_f32kv(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        partial: *mut f32,
+        positions: *const i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        pstr: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
 }
 
 // ─── CudaState singleton ───────────────────────────────────────
@@ -4179,6 +4211,69 @@ impl CudaState {
                 nt as i32,
                 stream,
             );
+        }
+    }
+
+    /// doc 94: batched split attention for the verify shapes (1 < nt <= 16).
+    /// Per-token nkv = positions[t]+1 with the decode path's exact
+    /// attn_split_1w_body arithmetic and combine merge order, so a verify
+    /// batch's logits are bitwise-equal to running the nt=1 decode path at
+    /// each position (the greedy identity). The partials scratch grows to
+    /// nt * SPLITS * nh * pstr — sized at warmup for the verify nt, stable
+    /// within a capture window.
+    pub fn gqa_attn_split_batched(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        f16_kv: bool,
+        nt: usize,
+    ) {
+        let pstr = ((4 + hd + 3) & !3) as i32;
+        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in cuda_kernels.cu
+        let need = nt * ATTN_SPLITS * nh * (pstr as usize) * 4;
+        let partial = Self::get_or_grow(&self.buf_attn_partial, need);
+        let stream = self.stream();
+        unsafe {
+            if f16_kv {
+                launch_gqa_attn_split_batched_f16kv(
+                    q as *const f32,
+                    k,
+                    v,
+                    o as *mut f32,
+                    partial as *mut f32,
+                    positions as *const i32,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    pstr,
+                    nt as i32,
+                    stream,
+                );
+            } else {
+                launch_gqa_attn_split_batched_f32kv(
+                    q as *const f32,
+                    k,
+                    v,
+                    o as *mut f32,
+                    partial as *mut f32,
+                    positions as *const i32,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    pstr,
+                    nt as i32,
+                    stream,
+                );
+            }
         }
     }
 

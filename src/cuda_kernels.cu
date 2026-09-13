@@ -2977,6 +2977,100 @@ __global__ void gqa_attn_split_combine(
     o[h * hd + i] = (S > 0.0f) ? acc / S : 0.0f;
 }
 
+// ─── doc 94: batched split attention for the verify shapes (1 < nt <= 16) ────
+// The greedy identity (spec-draft output token-for-token equal to sequential
+// decode) requires a verify batch's attention logits to be bitwise-equal to
+// the nt=1 decode path at every position. The incumbent nt>1 kernel
+// (gqa_attn_f32_f16kv) walks the keys with a different reduction schedule
+// than the decode split path, which flips argmax on near-ties. These batched
+// variants reuse attn_split_1w_body VERBATIM (same per-token nkv =
+// positions[t]+1, same 32-split chunking, same combine merge order), so a
+// verify batch's partials and merged output are bitwise-equal to running the
+// decode kernel at each position. Scope: the 1-warp incumbent body only —
+// the rpw>=16 hybrid (nkv >= 1921) is not batched, so the identity guarantee
+// covers nkv < 1921 (the batteries run at 512-640). Grid z = nt keeps the
+// launch static per captured graph; per-token nkv comes from positions[t]
+// device-side, so replay stays capture-safe.
+template <typename KV>
+__global__ void gqa_attn_split_partial_bt(
+    const float* __restrict__ q,
+    const KV* __restrict__ k,
+    const KV* __restrict__ v,
+    float* __restrict__ partial,
+    const int* positions,
+    int nh, int nk, int hd, float scale, int pstr
+) {
+    const int t = blockIdx.z;
+    attn_split_1w_body<KV>(
+        q + (size_t)t * nh * hd, k, v,
+        partial + (size_t)t * ATTN_SPLITS * nh * pstr,
+        positions[t] + 1,
+        blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr, threadIdx.x);
+}
+
+__global__ void gqa_attn_split_combine_bt(
+    const float* __restrict__ partial,
+    float* __restrict__ o,
+    int nh, int hd, int pstr
+) {
+    const int t = blockIdx.z;
+    const size_t base = (size_t)t * ATTN_SPLITS * nh * pstr;
+    int h = blockIdx.y;
+    int i = threadIdx.x;
+    if (i >= hd) return;
+    float gmx = -INFINITY;
+    for (int sp = 0; sp < ATTN_SPLITS; sp++)
+        gmx = fmaxf(gmx, partial[base + ((size_t)sp * nh + h) * pstr]);
+    float S = 0.0f, acc = 0.0f;
+    for (int sp = 0; sp < ATTN_SPLITS; sp++) {
+        const float* p = partial + base + ((size_t)sp * nh + h) * pstr;
+        float w = expf(p[0] - gmx);
+        S += p[1] * w;
+        acc += p[4 + i] * w;
+    }
+    o[(size_t)t * nh * hd + h * hd + i] = (S > 0.0f) ? acc / S : 0.0f;
+}
+
+template <typename KV>
+static void launch_gqa_attn_split_batched_kv(
+    const float* q, const void* k, const void* v, float* o,
+    float* partial, const int* positions,
+    int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
+    cudaStream_t stream
+) {
+    gqa_attn_split_partial_bt<KV><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+        q, (const KV*)k, (const KV*)v, partial, positions,
+        n_head, n_head_kv, hd, scale, pstr
+    );
+    gqa_attn_split_combine_bt<<<dim3(1, n_head, nt), hd, 0, stream>>>(
+        partial, o, n_head, hd, pstr
+    );
+}
+
+extern "C" int launch_gqa_attn_split_batched_f16kv(
+    const float* q, const void* k, const void* v, float* o,
+    float* partial, const int* positions,
+    int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
+    cudaStream_t stream
+) {
+    launch_gqa_attn_split_batched_kv<__half>(
+        q, k, v, o, partial, positions, n_head, n_head_kv, hd, scale, pstr,
+        nt, stream);
+    return 1;
+}
+
+extern "C" int launch_gqa_attn_split_batched_f32kv(
+    const float* q, const void* k, const void* v, float* o,
+    float* partial, const int* positions,
+    int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
+    cudaStream_t stream
+) {
+    launch_gqa_attn_split_batched_kv<float>(
+        q, k, v, o, partial, positions, n_head, n_head_kv, hd, scale, pstr,
+        nt, stream);
+    return 1;
+}
+
 // ─── D3-4 L1: hybrid rpw dispatch for hd==128 f16-KV decode split attention ───
 // D3a (reverted) built the llama fattn-vec-style 4-warp kernel and measured
 // the rows-per-warp pathology: rpw = ceil(ceil(nkv/32)/4) = 26 / 13 / 1 at

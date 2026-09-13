@@ -1120,7 +1120,30 @@ impl CudaBackend {
                     );
                     return Ok(());
                 }
-                // nt > 1 (prefill): single-warp-per-(token, head) kernel —
+                // doc 94: verify shapes (1 < nt <= 16) route through the
+                // batched split path — bitwise-equal per position to the
+                // nt=1 decode path (the greedy identity). The incumbent
+                // single-warp-per-(token, head) kernel walks the keys with
+                // a different reduction schedule, which flipped argmax on
+                // near-ties and made spec output diverge from sequential
+                // greedy decode. Prefill (nt > 16) keeps the incumbent.
+                if nt <= 16 {
+                    self.state.gqa_attn_split_batched(
+                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        self.ptr_of(out_buf)?,
+                        pos,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        self.kv_f16,
+                        nt,
+                    );
+                    return Ok(());
+                }
+                // nt > 16 (prefill): single-warp-per-(token, head) kernel —
                 // the grid already covers nt × nh blocks.
                 // 8b: f16-KV variant reads half K/V (q/o stay f32)
                 if self.kv_f16 {
@@ -3004,6 +3027,136 @@ mod tests {
     /// sibling, so it is checked against an independent host dequant
     /// reference with the standard q8-activation tolerance instead.
     #[test]
+    fn cuda_verify_attention_nt_invariance() {
+        // doc 94: the verify batch's attention must be bitwise-equal to the
+        // nt=1 decode path at every position — the greedy identity at the
+        // kernel level. Same KV buffer (prefix + the 3 intra-batch rows),
+        // same queries; batched (positions [P, P+1, P+2]) vs three decode
+        // calls; compare outputs bitwise. Both KV dtype variants, the small
+        // parity fixture AND the 14B decode dims (hd=128 -> the decode
+        // path's dual-kernel gate is live; prefix 512 keeps rpw < 16 so the
+        // incumbent 1-warp body owns both paths).
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+
+        let nt = 3usize;
+        let shapes: [(usize, usize, usize, usize, f32); 2] = [
+            (4, 2, 8, 100, 0.3),                    // parity fixture dims
+            (40, 8, 128, 512, 0.08838834764831845), // 14B decode dims
+        ];
+        for (nh, nk, hd, prefix, scale) in shapes {
+            let rows = prefix + nt;
+
+            // deterministic inputs
+            let mut s: u64 = 0x9E3779B97F4A7C15;
+            let mut next = move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            let q: Vec<f32> = (0..nt * nh * hd)
+                .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
+                .collect();
+            // f16 K/V bit patterns packed two-per-f32
+            let kv_f16: Vec<u16> = (0..rows * nk * hd)
+                .map(|_| half::f16::from_f32(((next() % 2001) as f32 - 1000.0) / 1000.0).to_bits())
+                .collect();
+            let kv_f32: Vec<f32> = (0..rows * nk * hd)
+                .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
+                .collect();
+
+            let pack_u16 = |v: &[u16]| -> Vec<f32> {
+                v.chunks(2)
+                    .map(|c| {
+                        f32::from_bits(
+                            (*c.first().unwrap()) as u32 | ((*c.get(1).unwrap_or(&0)) as u32) << 16,
+                        )
+                    })
+                    .collect()
+            };
+
+            for f16_kv in [true, false] {
+                // f32 KV needs rows*nk*hd f32 slots; f16 needs half — allocate
+                // the max and write the right byte count per variant
+                let kb = cb.alloc_buffer(rows * nk * hd);
+                let vb = cb.alloc_buffer(rows * nk * hd);
+                if f16_kv {
+                    cb.write_host(kb, &pack_u16(&kv_f16)).unwrap();
+                    cb.write_host(vb, &pack_u16(&kv_f16)).unwrap();
+                } else {
+                    cb.write_host(kb, &kv_f32).unwrap();
+                    cb.write_host(vb, &kv_f32).unwrap();
+                }
+                let qb = cb.alloc_buffer(nt * nh * hd);
+                cb.write_host(qb, &q).unwrap();
+                let obt = cb.alloc_buffer(nt * nh * hd);
+                let oseq = cb.alloc_buffer(nt * nh * hd);
+                let post = cb.alloc_buffer(nt);
+                let posv: Vec<f32> = (0..nt)
+                    .map(|t| f32::from_bits((prefix as i32 + t as i32) as u32))
+                    .collect();
+                cb.write_host(post, &posv).unwrap();
+
+                // batched verify: one call, positions [P, P+1, P+2]
+                cb.state.gqa_attn_split_batched(
+                    cb.ptr_of(qb).unwrap(),
+                    cb.ptr_of(kb).unwrap(),
+                    cb.ptr_of(vb).unwrap(),
+                    cb.ptr_of(obt).unwrap(),
+                    cb.ptr_of(post).unwrap(),
+                    nh,
+                    nk,
+                    hd,
+                    scale,
+                    f16_kv,
+                    nt,
+                );
+
+                // sequential decode: three nt=1 calls at the same positions
+                let qrow = cb.alloc_buffer(nh * hd);
+                let o1 = cb.alloc_buffer(nh * hd);
+                let p1 = cb.alloc_buffer(1);
+                for t in 0..nt {
+                    cb.write_host(qrow, &q[t * nh * hd..(t + 1) * nh * hd])
+                        .unwrap();
+                    cb.write_host(p1, &[f32::from_bits((prefix as i32 + t as i32) as u32)])
+                        .unwrap();
+                    cb.state.gqa_attn_split(
+                        cb.ptr_of(qrow).unwrap(),
+                        cb.ptr_of(kb).unwrap(),
+                        cb.ptr_of(vb).unwrap(),
+                        cb.ptr_of(o1).unwrap(),
+                        cb.ptr_of(p1).unwrap(),
+                        nh,
+                        nk,
+                        hd,
+                        scale,
+                        f16_kv,
+                    );
+                    let got = cb.copy_to_host(o1).unwrap();
+                    let mut full = cb.copy_to_host(oseq).unwrap();
+                    full[t * nh * hd..(t + 1) * nh * hd].copy_from_slice(&got);
+                    cb.write_host(oseq, &full).unwrap();
+                }
+
+                let bt = cb.copy_to_host(obt).unwrap();
+                let sq = cb.copy_to_host(oseq).unwrap();
+                for (i, (a, b)) in bt.iter().zip(sq.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "nh={nh} nk={nk} hd={hd} prefix={prefix} kv_f16={f16_kv} elem {i}: batched {a} vs sequential {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cuda_multi_token_matmul_bitwise() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
@@ -3050,6 +3203,12 @@ mod tests {
             ("q6k_raw", TensorType::Q6_K, 2048, 2048, false),
             ("q8_0", TensorType::Q8_0, 512, 2048, false),
             ("q4_0_big", TensorType::Q4_0, 512, 9216, false),
+            // 14B decode/verify shapes (doc 94): the identity chain needs
+            // single-MMVQ (nt=1) == multi-MMVQ (nt 2..8) bitwise at the real
+            // Qwen2.5-14B q4_k_m dims, not just the small fixtures.
+            ("q4k_14b_attn", TensorType::Q4_K, 5120, 5120, false),
+            ("q4k_14b_gu", TensorType::Q4_K, 13824, 5120, false),
+            ("q6k_14b_down", TensorType::Q6_K, 5120, 13824, false),
             ("q4_1", TensorType::Q4_1, 512, 2048, false),
             ("q5_0", TensorType::Q5_0, 512, 2048, false),
             ("q5_1", TensorType::Q5_1, 512, 2048, false),

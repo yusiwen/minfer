@@ -163,7 +163,7 @@ impl SpecEngine {
                     self.stats.rounds, t.token_id
                 );
             }
-            prev_tokens.push(t.token_id);
+            push_capped(prev_tokens, t.token_id);
             self.stats.rounds += 1;
             return vec![t.token_id];
         }
@@ -282,7 +282,7 @@ pub fn accept_loop<R: Rng>(
         }
         if i < d && t.token_id == proposals[i] {
             emitted.push(proposals[i]);
-            prev_tokens.push(proposals[i]);
+            push_capped(prev_tokens, proposals[i]);
             accepted += 1;
         } else {
             // Mismatch (or the last row): this sample IS the next token.
@@ -295,11 +295,24 @@ pub fn accept_loop<R: Rng>(
                 );
             }
             emitted.push(t.token_id);
-            prev_tokens.push(t.token_id);
+            push_capped(prev_tokens, t.token_id);
             break;
         }
     }
     (emitted, accepted)
+}
+
+/// Push a committed token into the penalty window, trimming to
+/// `sampler::REPEAT_LAST_N` — the same window the sequential decode loop
+/// maintains. Without the cap the spec path's window grows to the whole
+/// generation and the repeat penalty reaches tokens the sequential run no
+/// longer penalizes (doc 94: the greedy identity broke at the first
+/// >64-distant repeat).
+fn push_capped(prev_tokens: &mut Vec<u32>, t: u32) {
+    prev_tokens.push(t);
+    if prev_tokens.len() > crate::sampler::REPEAT_LAST_N {
+        prev_tokens.drain(0..prev_tokens.len() - crate::sampler::REPEAT_LAST_N);
+    }
 }
 
 fn argmax(logits: &[f32]) -> u32 {

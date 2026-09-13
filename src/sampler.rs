@@ -278,6 +278,14 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
 }
 
 /// Complete sampling pipeline: penalties → top-k → top-p → temperature.
+/// The repeat-penalty window (llama.cpp `repeat_last_n` default): penalties
+/// apply to the last 64 tokens. Callers pass `prev_tokens` already trimmed to
+/// this length (main decode loop, server, conversation) — doc 94: the
+/// speculative path must trim too, or its penalty window silently grows to
+/// the whole generation and its greedy picks diverge from sequential decode
+/// past the first >64-distant repeat.
+pub const REPEAT_LAST_N: usize = 64;
+
 /// `temp < 1e-6` (greedy) skips the stochastic steps but still applies the
 /// penalties.
 pub fn sample_with_penalties<R: Rng>(

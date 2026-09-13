@@ -10,9 +10,12 @@
 //! This subcommand measures that ratio directly, with no engine changes:
 //! the generic `forward_graph_cached(tokens, positions, n_out)` primitive
 //! already accepts `nt > 1, n_out = nt`, and at `nt > 1` the CUDA backend
-//! dispatches the batched path (BT-MMQ GEMM + full attention) — exactly the
-//! verify regime. The decode-only fast paths (MMVQ, FusedQKV/FusedFFN,
-//! split-K flash-decoding) are `nt == 1`-gated and correctly stay off.
+//! dispatches the verify regime — doc 94: nt 2..16 now routes attention
+//! through the batched split path (bitwise-equal per position to the nt=1
+//! decode path) and matmuls through multi-MMVQ, so a verify round's numerics
+//! are position-invariant by construction. The nt == 1 fast paths (single
+//! MMVQ, FusedQKV/FusedFFN, the decode split-K dispatch with its rpw hybrid)
+//! stay off at nt > 1.
 //!
 //! Protocol (campaign methodology: fixed-depth reps, medians, drift check):
 //! 1. prefill `P` prompt tokens (untimed) — fills KV slots `0..P` so every
