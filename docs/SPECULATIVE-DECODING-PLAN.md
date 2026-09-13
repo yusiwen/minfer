@@ -19,8 +19,12 @@ P0/P1 pass corrected the stall attribution (L1TEX latency at a
 register-file-capped 16 warps/SM — not smem, not staging, not scheduling),
 landed one bitwise micro-fix (B-plane XOR swizzle), measured three further
 scheduling levers NULL, and re-priced the tolerance-class knob down to
-single-digit percent → **not built**. The performance line stays closed:
-multi-MMVQ verify + adaptive d (doc 95) is the final production configuration.**
+single-digit percent → **not built**. doc 100: the last
+priced lever (aligned qs plane) measured timing-NULL under interleaved A/B,
+and exposed a ±7–12% clock-ramp band that invalidates sequential benchmark
+comparisons on this box. The performance line stays closed — now with the
+mechanism mapped and the measurement method corrected: multi-MMVQ verify +
+adaptive d (doc 95) is the final production configuration.**
 Speculative decoding reopened by decision after the doc 81 §4.3 errata
 invalidated the original closure's external pillar and doc 82 restored the
 batching invariant. The previous plan (closed 2026-09-10, "no loop plumbing
