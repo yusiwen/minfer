@@ -16,6 +16,12 @@
 > see [§0.1 Graph-path (MetalBackend) integration status](#01-graph-path-metalbackend-integration-status-2026-08-21).
 > The old-path measurements in §1 are pre-graph references; graph-path numbers
 > live in §0.1.
+>
+> 📖 **Backend design of record**: [`METAL-BACKEND-DESIGN.md`](METAL-BACKEND-DESIGN.md)
+> (`MetalBackend` lifecycle, dispatch, command buffers, model wiring, safety). This
+> document stays the optimization ledger; commit hashes printed below predate a
+> history rewrite and no longer resolve — see the design doc's §5.2 for
+> subject-matched equivalents.
 
 ---
 

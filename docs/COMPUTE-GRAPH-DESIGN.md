@@ -800,6 +800,9 @@ without matmuls).
 
 ## 7. CPU and Metal Backend Mapping
 
+The full Metal backend design (device/kernel layer, dispatch, command buffers, model wiring, safety)
+is `docs/METAL-BACKEND-DESIGN.md`; this section is the condensed mapping of the graph-facing surface.
+
 ### 7.1 CPU (`graph/cpu_backend.rs`)
 
 `CpuBackend` is `{ buffers: Vec<Vec<f32>>, free: Vec<usize>, weights: HashMap<String, Tensor> }`.

@@ -47,6 +47,7 @@
 - [Compute Graph Design](./COMPUTE-GRAPH-DESIGN.md)
 - [Backends](./BACKENDS.md)
     - [GPU Safety](./GPU_SAFETY.md)
+    - [Metal Backend Design](./METAL-BACKEND-DESIGN.md)
     - [CUDA Backend Design](./CUDA-BACKEND-DESIGN.md)
 
 # Optimization

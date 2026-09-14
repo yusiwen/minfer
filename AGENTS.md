@@ -120,6 +120,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU optimizations | `docs/CPU_OPTIMIZATIONS.md` |
+| Metal backend design + implementation record (device layer, dispatch, command buffers, safety) | `docs/METAL-BACKEND-DESIGN.md` |
 | CUDA backend design + implementation record (device layer, dispatch, capture, safety) | `docs/CUDA-BACKEND-DESIGN.md` |
 | **CUDA optimization history (live status) + per-step records (incl. Phase 8)** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` |
 | CUDA / GPU technology primer (every technique explained) | `docs/CUDA-TECH-PRIMER.md` |
