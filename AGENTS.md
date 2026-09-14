@@ -39,7 +39,7 @@ src/
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```
 
-`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op enum + NodeMeta · `builder.rs` GraphBuilder · `alloc.rs` liveness allocator + persistent KV regions · `backend.rs` Backend trait · `cpu_backend.rs` / `metal_backend.rs` / `cuda_backend.rs` executors · `scheduler.rs` assign → split → execute · `fusion.rs` SwiGLU/BiasRope fusion · `cache.rs` + `params.rs` params-only graph reuse · `dot.rs` DOT export · `json.rs` graph JSON export for viz.
+`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op enum + NodeMeta · `builder.rs` GraphBuilder · `alloc.rs` liveness allocator + persistent KV regions · `backend.rs` Backend trait · `cpu_backend.rs` / `metal_backend.rs` / `cuda_backend.rs` executors · `scheduler.rs` assign → split → execute · `fusion.rs` SwiGLU fusion · `cache.rs` + `params.rs` params-only graph reuse · `dot.rs` DOT export · `json.rs` graph JSON export for viz.
 
 ## Build & Run
 

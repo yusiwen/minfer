@@ -152,6 +152,14 @@
 # Reference
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)
+- [CUDA Tutorial](cuda_tutorial/README.md)
+    - [01 — What kind of machine is a GPU](cuda_tutorial/01-gpu-mental-model.md)
+    - [02 — The minimal CUDA you actually need](cuda_tutorial/02-minimal-cuda.md)
+    - [03 — Kernels I: elementwise, dequant, embedding](cuda_tutorial/03-kernels-elementwise.md)
+    - [04 — Kernels II: from GEMV to tiled GEMM](cuda_tutorial/04-kernels-matmul.md)
+    - [05 — Kernels III: attention & the host side](cuda_tutorial/05-kernels-attention-host.md)
+    - [06 — Optimization methods](cuda_tutorial/06-optimization-methods.md)
+    - [07 — Where to go next](cuda_tutorial/07-where-next.md)
 - [Qwen3-4B perf vs llama.cpp](./PERF-QWEN3-4B-VS-LLAMACPP.md)
 - [Technology Primer — every CUDA/GPU technique minfer uses, explained](./CUDA-TECH-PRIMER.md)
 - [Glossary — every term/formula in the campaign docs, classified into 7 layers](./GLOSSARY.md)
