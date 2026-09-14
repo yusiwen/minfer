@@ -31,9 +31,10 @@ engine can actually run:
 2. **Fusion.** A **rewrite pass** walks the graph and looks for small, fixed *patterns* of nodes
    that some backend knows how to compute in a single kernel — a **fused op**. When both the
    pattern matches *and* the node's assigned backend says "I have a kernel for that", the pass
-   replaces the pattern with one fused node. This stage ships two patterns: `Mul(Silu(x), y)`
-   folds into a single `SwiGLU` node, and `RoPE(Add(x, b))` folds into `FusedBiasRope`
-   (gated per backend — see §2.4 for the honest, verified status of that second pattern).
+   replaces the pattern with one fused node. This stage ships one pattern: `Mul(Silu(x), y)`
+   folds into a single `SwiGLU` node. (The plan's second pattern, `RoPE(Add(x, b))` →
+   `FusedBiasRope`, was removed once it became clear no backend would claim the capability —
+   the bias+rope work ships as the builder-built decode nodes; see §2.3.)
 
 Both transformations happen **once per graph build**, not once per token. The engine builds the
 graph on the first forward (and on any rebuild), runs assign → fusion immediately after, and
@@ -220,35 +221,16 @@ The matcher's exact logic (`fusion.rs:48-79`, read in full in §3.2):
    `[gate, up]`. Shapes are unchanged (`SwiGLU`'s output shape equals the Mul's), so nothing
    downstream moves.
 
-The second pattern is `RoPE(Add(x, b), pos)` → `Op::FusedBiasRope(base, bias, pos)` — one kernel
-doing the attention bias-add and the rotary-embedding rotation together (RoPE, **Rotary Position
-Embedding**, encodes token position by rotating pairs of feature dimensions; doc 11 details the
-math). Its gate is `supports_fused(FusedOp::BiasRope)`, and here the honest, verified status is
-worth spelling out because the code and an old comment disagree:
-
-- The pattern-matching code is fully implemented (`fusion.rs:91-130`) and the file header
-  comment says *"Metal only today"* (`fusion.rs:90`).
-- But **no backend currently claims `FusedOp::BiasRope`**: CPU lists only `SwiGLU`
-  (cpu_backend.rs:104), Metal lists `SwiGLU | QKVBiasRopeStore` (metal_backend.rs:289) and even
-  answers `false` for the *op* `Op::FusedBiasRope` in `supports_op` (metal_backend.rs:278), and
-  CUDA lists only `SwiGLU` (cuda_backend.rs:1304). So with today's capability tables the
-  rewrite is **wired but dormant** — the gate never opens, and `FusedBiasRope` nodes are never
-  produced. (The plan-doc sketch in `COMPUTE-GRAPH-DESIGN.md` §7 did include `BiasRope` for
-  Metal; the shipped code went further: the *aggressive* version of the same idea — 3 biases +
-  2 ropes + 2 KV stores in one kernel — ships as the builder-built `FusedQKV`/`QkvBiasRopeStore`
-  decode nodes, which is where the Metal `attn_bias_rope_store` kernel actually gets used.)
-- The dormant gate is still load-bearing: it is the *proof* that fusion can never invent an op
-  the executing backend cannot run. The unit test `bias_rope_fusion_gated_by_metal_only`
-  (fusion.rs:204) pins the CPU side of that promise.
-
-```
-BEFORE                                   AFTER — only if supports_fused(BiasRope)
-
-  x ──► Add(bias) ──► RoPE(pos)            x ──► FusedBiasRope(bias, pos)
-
-  Add out: [nt, d] written + read          today: no backend claims BiasRope,
-  RoPE out: [nt, d] written                so this rewrite never fires
-```
+The plan's second pattern, `RoPE(Add(x, b), pos)` → `Op::FusedBiasRope(base, bias, pos)`, is
+**gone**. It was implemented and gated on `supports_fused(FusedOp::BiasRope)`, but no backend ever
+claimed that capability (CPU, Metal and CUDA each list only `SwiGLU`), so the rewrite was dormant
+by construction and no `Op::FusedBiasRope` node could exist. Rather than keep an unreachable arm,
+the rule, the op and the capability tag were removed. The bias+rope work it described is covered by
+the builder-built decode nodes: Metal/CUDA `attn_bias_rope_store` folds 3 biases + 2 ropes + 2 KV
+stores into one kernel — a strictly more aggressive version of the same idea. The invariant that
+matters is the *gating* (fusion can never invent an op its backend did not claim), not this
+particular pattern: a future backend with a standalone bias+rope kernel would re-add the rule
+together with its capability tag.
 
 For contrast, the *builder-built* decode fusion (not this pass) collapses ten nodes into two:
 
@@ -268,9 +250,9 @@ The pass never decides alone. Every rewrite is gated by the *target backend's ow
 
 | backend | `supports_fused` claims | consequence for the pass |
 |---|---|---|
-| CPU | `SwiGLU` | silu+mul folds on CPU too — into one node executed as two vector passes (§3.4) |
-| Metal | `SwiGLU`, `QKVBiasRopeStore` | silu+mul folds; `BiasRope` **not** claimed → that rewrite is dormant |
-| CUDA | `SwiGLU` | silu+mul folds; same dormancy for `BiasRope` |
+| CPU | `SwiGLU` | silu+mul folds on CPU too — one node, executed as one single-pass vector kernel (§3.4) |
+| Metal | `SwiGLU` | silu+mul folds (the kernel is `swiglu_f32`) |
+| CUDA | `SwiGLU` | silu+mul folds |
 
 Why does the *decoder-side* `FusedQKV`/`FusedFFN` not appear in this table, even though they are
 fused ops? Because they are not produced by this pass at all. The division of labor:
@@ -288,7 +270,7 @@ This split is what makes **double fusion impossible** by construction. Double fu
 fusing an already-fused node again — e.g. wrapping `FusedQKV` in another pattern. It cannot
 happen here, for three independent reasons:
 
-1. The pass's patterns match only *decomposed* ops (`Mul`, `Silu`, `RoPE`, `Add`). Fused nodes
+1. The pass's patterns match only *decomposed* ops (`Mul`, `Silu`). Fused nodes
    (`SwiGLU`, `FusedQKV`, `FusedFFN`, …) are not triggers, so a rewritten graph matches nothing
    the second time around — the pass is **idempotent**.
 2. The pass runs **exactly once** per build, at a single call site right after
@@ -348,7 +330,6 @@ feature is on and a device exists).
 
 - every node has `backend: Some(…)`,
 - some `Mul` nodes are now `Op::SwiGLU` nodes with re-routed `src = [gate, up]`,
-- (dormant today) `RoPE(Add)` pairs would become `Op::FusedBiasRope`,
 - nothing else: no node is added or removed, no shape changes, build order is untouched. The
   orphaned `Silu` nodes are still in the list — they only die at allocation time.
 
@@ -463,39 +444,37 @@ fn supports_op(&self, op: &Op, dtype: DType) -> bool {
 }
 
 fn supports_fused(&self, fused: &FusedOp) -> bool {
-    // CPU has no dedicated fused kernels yet: silu+mul stays decomposed
-    // (the fusion pass leaves it as-is on CPU); bias+rope and batch-matmul
-    // are not fused either (batch QKV quantize-sharing is a Phase 5+ win).
+    // The SwiGLU rewrite IS applied to CPU nodes (CPU is first in the
+    // fusion pass's backend list); `Op::SwiGLU` below executes it as a
+    // single pass. bias+rope and batch-matmul are not fused (batch QKV
+    // quantize-sharing is a Phase 5+ win).
     matches!(fused, FusedOp::SwiGLU)
 }
 ```
 
 The CPU claims the whole per-layer vocabulary — everything is F32-only, and the `matches!` list
 *is* the CPU's capability table. Note `Op::SwiGLU` is claimed but `FusedQKV`/`FusedFFN` are not:
-decode fusions are GPU-only (§2.3). And note the comment above the `matches!`: it says silu+mul
-"stays decomposed" on CPU — **stale relative to its own code**, because returning `true` for
-`SwiGLU` means the pass *does* fold on CPU. What "no dedicated kernel" actually means is visible
-in the executor, next excerpt.
+decode fusions are GPU-only (§2.3). The `supports_fused` answer is `true` for `SwiGLU`, so the
+pass *does* fold on CPU; what "fused" means there is a single-pass kernel, shown next.
 
 **What a "fused" SwiGLU means on CPU** — `src/graph/cpu_backend.rs:373-379`:
 
 ```rust
 Op::SwiGLU => {
-    // silu(gate) * up
-    crate::vec_ops::vec_silu_f32(out.len(), out, ins[0]);
-    let g = out.to_vec();
-    crate::vec_ops::vec_mul_f32(out.len(), out, &g, ins[1]);
+    // silu(gate) * up, one pass: bit-identical to the old
+    // vec_silu_f32 + vec_mul_f32 pair (same formula and
+    // per-element order) without its full-size temp buffer.
+    crate::vec_ops::vec_swiglu_f32(out.len(), out, ins[0], ins[1]);
     Ok(())
 }
 ```
 
-One *node*, executed as two vector passes with one intermediate copy in scratch memory. The
-CPU-side win of the fusion is therefore modest — one node dispatch and one fewer live buffer —
-not a true single-pass kernel; §2.3's 2A arithmetic applies fully only to the GPU
-`swiglu_f32` kernel. The plan doc anticipated exactly this (`COMPUTE-GRAPH-DESIGN.md` §5.1:
-*"if CPU `supports_fused(SwiGLU)` returns true, a single-pass fused kernel must be added"*).
+One *node*, one pass (`vec_ops::vec_swiglu_f32`), no intermediate buffer. The earlier form ran
+`vec_silu_f32` then `vec_mul_f32` through a full-size scratch copy (`out.to_vec()`); the fused
+version computes `silu(gate[i]) * up[i]` in one loop and is bit-identical to that pair (same
+formula, same per-element order — pinned by `vec_ops::tests::swiglu_matches_silu_then_mul`).
 
-**Metal's table, with the decode fusions and the BiasRope negative** —
+**Metal's table, with the decode fusions and the CUDA-only epilogue negative** —
 `src/graph/metal_backend.rs:265-290`:
 
 ```rust
@@ -512,7 +491,7 @@ fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
         Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
         Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
-        Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
+        Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
         // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
         // Metal the graph builder never emits it (qkv_epilogue_ok = false
         // without `--features cuda`), so it is never assigned here.
@@ -521,17 +500,18 @@ fn supports_op(&self, op: &Op, dtype: DType) -> bool {
 }
 
 fn supports_fused(&self, fused: &FusedOp) -> bool {
-    // swiglu_f32 and attn_bias_rope_store kernels exist (the latter is the
-    // fused decode QKV store path, nt==1 only)
-    matches!(fused, FusedOp::SwiGLU | FusedOp::QKVBiasRopeStore)
+    // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
+    // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
+    // FusionPass target, so it is not advertised here.
+    matches!(fused, FusedOp::SwiGLU)
 }
 ```
 
-Read the two negative arms as design statements, not gaps: `Op::FusedBiasRope => false` is the
-line that keeps the pass's second rewrite dormant on Metal (§2.3), and `Op::QkvBiasRopeStore =>
-false` documents that the mixed-quant decode epilogue belongs to CUDA only. Metal *does* claim
-the builder's decode fusions (`FusedQKV`, `FusedQkvNorm` — the Qwen3 per-head-norm variant — and
-`FusedFFN`), which is what makes the builder's `fuse_qkv` gate safe.
+The negative arms are design statements, not gaps: `Op::QkvBiasRopeStore => false` documents that
+the mixed-quant decode epilogue belongs to CUDA only, and `Op::BatchMatMul => false` is a deferred
+vocabulary entry. Metal *does* claim the builder's decode fusions (`FusedQKV`, `FusedQkvNorm` —
+the Qwen3 per-head-norm variant — and `FusedFFN`), which is what makes the builder's `fuse_qkv`
+gate safe.
 
 **CUDA's table differs where its kernels differ** — `src/graph/cuda_backend.rs:1254-1301`,
 trimmed to the interesting arms:
@@ -580,9 +560,6 @@ pub fn run(
 ) -> usize {
     let mut n = 0;
     n += self.fuse_swiglu(graph, backends, backend_of);
-    n += self.fuse_bias_rope(graph, backends, backend_of);
-    // BatchMatMul fusion is deferred: the single-output IR cannot express a
-    // multi-output fused node (see docs/COMPUTE-GRAPH-DESIGN.md §17 notes).
     n
 }
 ```
@@ -640,36 +617,9 @@ node's *input* (skipping the dead Silu — the `silu_in` binding holds the same 
 why the source discards it with `let _ =`), `up` is the other operand. Shapes never change
 because `SwiGLU`'s output shape equals the Mul's by definition.
 
-**The second matcher, dormant** — `src/graph/fusion.rs:101-123` (inside `fuse_bias_rope`):
-
-```rust
-let rope = graph.node(id);
-if !matches!(rope.op, Op::RoPE { .. }) || rope.src.len() != 2 {
-    continue;
-}
-let (x, pos) = (rope.src[0], rope.src[1]);
-let add = graph.node(x);
-let (base, bias) = match &add.op {
-    Op::Add if add.src.len() == 2 => (add.src[0], add.src[1]),
-    _ => continue,
-};
-let ok = match backend_of(graph, id) {
-    Some(bi) => backends[bi].supports_fused(&FusedOp::BiasRope),
-    None => false,
-};
-if !ok {
-    continue;
-}
-new_ops[id] = Some(Op::FusedBiasRope);
-if let Some(node) = graph.nodes.get_mut(id) {
-    node.src = vec![base, bias, pos];
-}
-```
-
-Same shape as the first matcher — find the consumer op (`RoPE`), inspect its producer (`Add`),
-gate on `supports_fused(FusedOp::BiasRope)` — and since no backend claims `BiasRope` today
-(§2.3), the `ok` branch is unreachable in production. It is kept because the gating design (not
-the specific pattern) is the invariant being enforced.
+**The second matcher is gone.** The old `fuse_bias_rope` (`RoPE(Add(x, b))` → `Op::FusedBiasRope`)
+and its `FusedOp::BiasRope` capability tag were removed (§2.3): no backend claimed the capability,
+so the matcher was unreachable code. `run()` now composes exactly one rewrite.
 
 **The call site that wires it all together** — `src/models/qwen2/graph.rs:472-517`, trimmed:
 
@@ -800,7 +750,7 @@ runtime, CUDA's RoPE answer depends on the payload style — which a static tabl
 Because gating needs an answer to "fused for *whom*?", and only assignment provides it. The
 pass's gate is literally `backend_of(mul_node) → supports_fused(...)`. Fuse before assignment
 and the pass would have to guess a backend (fusing against Metal and CUDA "just in case") or
-fuse unconditionally (producing `FusedBiasRope` nodes that CPU cannot execute — aborting the
+fuse unconditionally (producing a fused node its eventual owner cannot execute — aborting the
 run later, or worse, tempting someone to add a fallback). Assignment-first means each node's
 rewrite is decided by the engine that will actually run it; the graph can never contain a fused
 op its owner didn't claim. There is a bonus: the order is safe in the other direction too,
@@ -863,8 +813,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   `cpu_backend.rs:433-441`:
 
   ```rust
-  Op::FusedBiasRope
-  | Op::BatchMatMul
+  Op::BatchMatMul
   | Op::FusedQKV { .. }
   | Op::QkvBiasRopeStore { .. }
   | Op::FusedQkvNorm { .. }
@@ -886,13 +835,11 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 - **Double-fusion is impossible by construction** (§2.4): patterns match only decomposed ops,
   the pass is idempotent, it runs once per build, and builder-fused nodes have no graph-visible
   insides. If you add a third fusion pattern, preserve all four properties.
-- **The `FusedBiasRope` rewrite is dormant** — pattern implemented, gate never true with
-  current capability tables (metal_backend.rs:278 and :289 both say no). Do not "fix" it by
-  fusing unconditionally; either claim `FusedOp::BiasRope` in a backend that has (or gains) the
-  kernel, or leave it as the worked example of gating. The `fusion.rs` header comment ("Metal
-  only today", line 90) and the stale `supports_fused` comment on CPU (cpu_backend.rs:100-104,
-  contradicted by its own `matches!(fused, FusedOp::SwiGLU)`) are doc debt to be aware of when
-  reading this file — the code is the truth, and this doc cites the code.
+- **The pass has exactly one rule.** `RoPE(Add)` → `FusedBiasRope` was removed (§2.3) because no
+  backend ever claimed the capability. If a future backend gains a standalone bias+rope kernel,
+  re-add the rule together with its `FusedOp` tag and a test that pins the negative case — the
+  gating design is the invariant, and the removed rule is the worked example of what *not* to
+  advertise.
 - **Fusion never changes shapes or node count.** Orphans stay, ids stay, shapes stay. Anything
   that *does* change the node set (decode fusions) happens in the builder, where shapes are
   computed with full context (`FusedQKV`'s `[nqt+2·nkt, 1]` output, `FusedFFN`'s `[2·nf, 1]`).
@@ -926,7 +873,8 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   to CPU (everything in the trace census becomes `backend CPU`).
 - **Tests** (all `cargo test`): `fusion.rs` — `swiglu_fusion_applies_when_backend_supports`
   (rewrite happens, `src == [gate, up]`), `swiglu_fusion_skipped_when_backend_does_not_support`
-  (unassigned node ⇒ no fusion), `bias_rope_fusion_gated_by_metal_only` (CPU ⇒ 0 rewrites);
+  (unassigned node ⇒ no fusion); `vec_ops::tests::swiglu_matches_silu_then_mul` (the CPU
+  single-pass kernel is bit-identical to the old silu+mul pair);
   `cache.rs::fuse_flags_are_part_of_the_reuse_identity` (flag flip ⇒ no reuse);
   `qwen2/graph.rs::fused_qkv_matches_unfused_decode` (fused nodes present iff gated on, logits
   **bit-identical**, plus per-layer output comparison); the tail-reduction test asserts the

@@ -176,14 +176,13 @@ assign_backends → fuse → alloc_graph → execute
 1. **assign_backends** — capability-driven: each node gets the highest-priority
    backend whose `supports_op` returns true (priority Metal → CUDA → CPU).
    Weight registration decides GPU feasibility.
-2. **fuse** — pattern matching (`Mul(Silu(X),Y) → SwiGLU`, `RoPE(Add(X,B)) →
-   FusedBiasRope`) gated per backend by `supports_fused` (no double-fusion with
-   hand-written kernels). BatchMatMul is deferred (single-output IR limitation,
-   plan §17.10). Note: the `FusedBiasRope` rule is currently **dormant** — the
-   pattern exists in `fusion.rs` but no backend accepts `FusedBiasRope` in
-   `supports_fused` (Metal only accepts `SwiGLU`/`QKVBiasRopeStore`,
-   `metal_backend.rs:289`); decode instead uses the strictly stronger
-   `QKVBiasRopeStore` fusion, which subsumes the bias+rope part.
+2. **fuse** — pattern matching (`Mul(Silu(X),Y) → SwiGLU`) gated per backend by
+   `supports_fused` (no double-fusion with hand-written kernels). The plan's
+   second rule (`RoPE(Add(X,B)) → FusedBiasRope`) was **removed**: no backend
+   ever claimed the capability, and the bias+rope work ships as the builder's
+   decode nodes (`FusedQKV`/`QkvBiasRopeStore`, whose `attn_bias_rope_store`
+   kernel subsumes the bias+rope part). `BatchMatMul` stays deferred
+   (single-output IR limitation, `COMPUTE-GRAPH-DESIGN.md` §5.4).
 3. **alloc_graph** — per-backend liveness allocator: buffers shared between
    nodes whose live ranges don't overlap; **persistent per-layer KV regions**
    survive rebuilds; in-place ops alias their input buffer (see §4.5).

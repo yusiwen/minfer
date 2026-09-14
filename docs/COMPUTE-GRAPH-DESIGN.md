@@ -7,7 +7,8 @@ mapping.
 
 > **Status.** Landed. Every mechanism described here is implemented in the tree; the phase ledger and
 > the deviations from the original plan are in [§17](#17-implementation-record).
-> Baseline: `HEAD = 5471680` (2026-09-13).
+> Baseline: `HEAD = 5471680` (2026-09-13); the working tree additionally carries the post-baseline
+> fixes listed at the end of §17.3.
 >
 > **Provenance.** This file was `docs/GRAPH-REFACTOR-PLAN.md`, written before the rewrite as a plan.
 > The section skeleton is preserved; the body has been rewritten in the present tense against the
@@ -54,9 +55,10 @@ scratch buffers per step. That shape had four structural costs:
 
 - **Multi-sequence batching.** `GraphParams.n_seqs` exists and is part of the reuse identity, but the
   supported models build single-sequence graphs.
-- **A generic ggml operator set.** `Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha`,
-  `FusedOp::BatchMatMul` and `Op::FusedBiasRope` are present in the vocabulary but no supported
-  architecture emits them; they are kept for parity and future use.
+- **A generic ggml operator set.** `Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha`
+  and `FusedOp::BatchMatMul` are present in the vocabulary but no supported architecture emits
+  them; they are kept for parity and future use. `Op::FusedBiasRope` and its fusion rule were
+  *removed* outright (the capability was never claimed — see §5.2).
 - **Cross-vendor graph transpilation.** Each backend implements its own `execute_node`; there is no
   lowering pass.
 
@@ -217,7 +219,7 @@ pub enum Op {
     View { offset: usize, shape: [usize; 4] },
     Reshape { shape: [usize; 4] },
     Permute { dims: [usize; 4] },
-    SwiGLU, FusedBiasRope,                     // FusionPass output
+    SwiGLU,                                    // FusionPass output
     BatchMatMul,                               // planned, not emitted (single-output IR)
     FusedQKV { layer: usize },                 // decode: concat matmul + bias/rope/store
     QkvBiasRopeStore { layer: usize },         // decode mixed-quant: 3 matmuls + one epilogue
@@ -231,8 +233,8 @@ it — it compares `GraphParams` only — but the debug structural check compare
 dependencies, so a payload that silently changed is caught.
 
 The variants marked "vocabulary only" (`Scale`, `Softmax`, `View`, `Reshape`, `Permute`,
-`BatchMatMul`, `FusedBiasRope`, `AttnMode::Mha`) carry `#[allow(dead_code)]` and no supported
-architecture emits them (§5.5). The KV rule from invariant 1 is visible directly in the payloads:
+`BatchMatMul`, `AttnMode::Mha`) carry `#[allow(dead_code)]` and no supported architecture emits
+them (§5.5). The KV rule from invariant 1 is visible directly in the payloads:
 `KvcacheStore`/`KvcacheLoad` carry the layer index and nothing else.
 
 #### Node metadata
@@ -632,7 +634,7 @@ minfer fuses in two distinct ways, and the distinction matters when reading the 
 | Mechanism | When | Examples | Gated by |
 |---|---|---|---|
 | **Build-time fused node** | The builder knows the pattern statically at graph construction | `FusedQKV`, `QkvBiasRopeStore`, `FusedFFN`, `FusedQkvNorm` | `CParams.fuse_qkv` / `fuse_ffn` (+ weight availability, quant class, `nf` cap) |
-| **`FusionPass` rewrite** | A peephole pass over the built graph, per node's assigned backend | `SwiGLU` (applied); `FusedBiasRope` (recognized, never accepted — see below) | backend `supports_fused` |
+| **`FusionPass` rewrite** | A peephole pass over the built graph, per node's assigned backend | `SwiGLU` (the only rule) | backend `supports_fused` |
 
 Build-time fusion is preferred where the pattern spans weight registration (concat weights) or where
 the fused node needs extra metadata (layer index, biases, rope parameters). The peephole pass covers
@@ -650,18 +652,21 @@ impl FusionPass {
 
 - **SwiGLU**: `Mul(Silu(x), y)` → `SwiGLU(x, y)`; recognized with `Silu` on either side. Gate: the
   mul node's backend reports `supports_fused(FusedOp::SwiGLU)` — true for CPU, Metal and CUDA.
-- **FusedBiasRope**: `RoPE(Add(x, b), pos)` → `FusedBiasRope(x, b, pos)`. The rule is implemented,
-  but **no backend advertises `FusedOp::BiasRope` today**, so the rewrite never fires and
-  `Op::FusedBiasRope` is dormant. The bias+rope work it was meant to express is covered by the
-  build-time fused kernels instead (Metal's `attn_bias_rope_store`, CUDA's port of it).
+- **FusedBiasRope (removed)**: the plan's `RoPE(Add(x, b), pos)` → `FusedBiasRope(x, b, pos)` rule
+  was implemented but **no backend ever advertised `FusedOp::BiasRope`**, so the rewrite was
+  unreachable and `Op::FusedBiasRope` could never be constructed. Rule, op and capability tag were
+  removed; `FusedOp` now has a single variant (`SwiGLU`). The bias+rope work is covered by the
+  build-time fused nodes instead (Metal/CUDA `attn_bias_rope_store`, which also does the KV store —
+  a strictly stronger fusion).
 
-The pass rewrites `op` and re-points `src`; orphaned producers (the old `Silu`, the old `Add`) become
-dead nodes and are skipped by the scheduler and the allocator. It returns the rewrite count, which the
-tests use.
+The pass rewrites `op` and re-points `src`; orphaned producers (the old `Silu`) become dead nodes
+and are skipped by the scheduler and the allocator. It returns the rewrite count, which the tests
+use.
 
-One CPU nuance: `CpuBackend::supports_fused` accepts only `SwiGLU`, and its `Op::SwiGLU` execution is
-still two kernels (`vec_silu_f32` then `vec_mul_f32`) with a temporary. On CPU the rewrite therefore
-does not save a dispatch; it only makes the pattern explicit. A CPU fused kernel was never added.
+One CPU nuance: `CpuBackend::supports_fused` accepts `SwiGLU`, and its `Op::SwiGLU` execution is a
+single pass (`vec_ops::vec_swiglu_f32`, `dst[i] = silu(gate[i]) * up[i]`). It is bit-identical to
+the `vec_silu_f32` + `vec_mul_f32` pair it replaced (same formula, same per-element order) but does
+not allocate the full-size intermediate buffer that pair needed.
 
 Because fusion rewrites the IR, an unfused-vs-fused comparison must run `FusionPass` on the unfused
 side too; otherwise `silu` + `mul` execute as two kernels and differ from the single swiglu kernel by
@@ -687,15 +692,16 @@ The plan proposed folding three sibling matmuls sharing one activation into one 
 to quantize the activation once on the CPU path. It is **not implemented**: the IR gives every node
 exactly one output buffer, and `BatchMatMul` is inherently multi-output. Expressing it needs either a
 multi-output node kind or a concat-plus-view encoding, and both are larger IR changes than the
-measured CPU prefill gain justifies today. The variant remains in the enum with a comment recording
-the reason, and `FusionPass::run` notes the deferral in place.
+measured CPU prefill gain justifies today. The `Op::BatchMatMul` variant remains in the IR with a
+comment recording the reason; the corresponding `FusedOp::BatchMatMul` capability tag was removed
+(no rule ever probed it).
 
 ### 5.5 Operator vocabulary not emitted
 
-`Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha`, `BatchMatMul` and `FusedBiasRope`
+`Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha` and `BatchMatMul`
 are represented in the IR for ggml parity but no supported architecture builds them: attention
-kernels fuse their own softmax, the Qwen2/Qwen3 graphs need no view/reshape node, and no backend
-accepts the bias+rope rewrite. `Scale` and `Softmax` are additionally unsupported by Metal and CUDA
+kernels fuse their own softmax, the Qwen2/Qwen3 graphs need no view/reshape node, and the bias+rope
+rewrite was removed (§5.2). `Scale` and `Softmax` are additionally unsupported by Metal and CUDA
 at execution time.
 
 ### 5.6 Toggles
@@ -817,7 +823,7 @@ therefore not "supported" by CPU in the capability sense and land on CPU only th
 | `GetRows` | embedding path (`kernel::embed_tokens`) or generic gather |
 | `RoPE` | local `cpu_rope` (copy then transform) |
 | `Softmax` | dims 0/1 only; other dims are an `Err` |
-| `SwiGLU` | `vec_silu_f32` + `vec_mul_f32` (two passes) |
+| `SwiGLU` | `vec_ops::vec_swiglu_f32`, one pass (`dst[i] = silu(gate[i]) * up[i]`) |
 | `KvcacheStore` | per-token copy into the K and V regions; `pos >= n_ctx` is an `Err` |
 | `KvcacheLoad` | no-op — the node buffer *is* the K region |
 | `Attn` | `cpu_gqa_attn`, parallelized over heads via `kernel::par_for` |
@@ -841,9 +847,7 @@ registered in `MpsState` as zero-copy `newBufferWithBytesNoCopy` slices over the
 
 `supports_op` accepts `Input` at any dtype and F32 for the element-wise, norm, matmul, rope,
 attention, KV, `GetRows` and decode-fused ops; `View`/`Reshape`/`Permute` are accepted.
-`supports_fused` is `matches!(fused, FusedOp::SwiGLU | FusedOp::QKVBiasRopeStore)` — it advertises
-the decode-QKV capability tag even though `Op::QkvBiasRopeStore` itself is CUDA-only and would be an
-`Err` if it reached Metal.
+`supports_fused` is `matches!(fused, FusedOp::SwiGLU)` — the only fusion rule that exists (§5.2).
 
 | Graph op | MpsState method / kernel |
 |---|---|
@@ -861,7 +865,7 @@ the decode-QKV capability tag even though `Op::QkvBiasRopeStore` itself is CUDA-
 | `FusedQKV` | concat `quant_matmul_f32_on_gpu_buf` + `attn_bias_rope_store` (3 bias + q/k rope + K/V store in one pass) |
 | `FusedFFN` | concat matmul + `swiglu_f32_off` (in-place on the concat buffer, gate at offset 0, up at `nf`) |
 | `FusedQkvNorm` | concat matmul + two in-place per-head `rms_norm[_256]` (q at byte offset 0, k at `nqt*4`) + `attn_rope_store` |
-| `Scale` / `Softmax` / `FusedBiasRope` / `BatchMatMul` | `Err` (no kernel) |
+| `Scale` / `Softmax` / `BatchMatMul` | `Err` (no kernel) |
 | `QkvBiasRopeStore` | `Err` (CUDA-only epilogue) |
 
 The `*_off` kernel variants (`swiglu_f32_off`, `rope_f32(off)`, `rms_norm(off_x, off_y)`,
@@ -984,11 +988,13 @@ documents the page, the SSE endpoints (`GET /viz/graph`, `GET /viz/events`, `POS
 | `MINFER_VIZ_DIR` | directory for viz samples (default `viz`) |
 | `MINFER_BENCH_WARMUP_MS` | `bench` warmup budget |
 
-> **Known inconsistency (recorded, not fixed).** The export/trace paths gate `fuse_qkv` on
-> `metal_on` only, while the runtime gates it on `metal_on || cuda_on`. On a CUDA-only run the
-> exported and traced graph can therefore lack the `FusedQKV` nodes the runtime actually builds, so
-> exported node ids can diverge from live node ids. `viz/README.md` still says "QKV fusion is
-> Metal-only", which the CUDA port superseded (commit `3857633`).
+> **Resolved (2026-09): export/trace fusion gate.** The export/trace paths used to gate `fuse_qkv`
+> on `metal_on` only while the Qwen2 runtime gates it on `metal_on || cuda_on`, so a CUDA-only run
+> exported a graph without the `FusedQKV` nodes the runtime built — diverging node ids. Both paths
+> (and the model's own `CParams` construction) now share
+> `graph::json::preview_fuse_flags(nt, metal_on, cuda_on)`, and `viz/README.md` no longer claims QKV
+> fusion is Metal-only. The gate is pinned by
+> `graph::json::tests::preview_fuse_flags_include_cuda_only_runs`.
 
 ---
 
@@ -1223,9 +1229,10 @@ as evidence that the design works, not as a benchmark suite.
 | CUDA Phase 8 / R / MMQ (r56, R4) | 7B @2K prefill / decode | ~3212 tok/s (≈1.035× llama.cpp) / ~43–45 tok/s — details in `docs/CUDA_OPTIMIZATION.md` |
 
 Test surface: **83 `#[test]`** across `src/graph/*.rs` (CUDA backend 40, Metal 14, CPU 6, allocator 5,
-cache 4, mod 4, builder/fusion/scheduler 3 each, dot 1; `ops.rs`, `params.rs`, `json.rs` have none
-directly). The model graph modules add their own end-to-end tests. Not all 83 compile in a single
-configuration because the Metal and CUDA backends are platform/feature-gated.
+cache 4, mod 4, builder/scheduler 3 each, fusion 2, dot/json 1 each; `ops.rs`, `params.rs`,
+`backend.rs` have none directly), plus 2 in `vec_ops` for the CPU SwiGLU kernel. The model graph
+modules add their own end-to-end tests. Not all 83 compile in a single configuration because the
+Metal and CUDA backends are platform/feature-gated.
 
 ---
 
@@ -1236,19 +1243,19 @@ The plan's file-change manifest, replaced by the landed inventory.
 | File | Lines | Role |
 |---|---:|---|
 | `src/graph/mod.rs` | 273 | IR types, `topo_order`, `capture_nt_hint` |
-| `src/graph/ops.rs` | 322 | `Op`, `NodeMeta`, metadata structs |
+| `src/graph/ops.rs` | 319 | `Op`, `NodeMeta`, metadata structs |
 | `src/graph/builder.rs` | 496 | `GraphBuilder` |
 | `src/graph/params.rs` | 71 | `GraphType`, `CParams`, `GraphParams` |
 | `src/graph/cache.rs` | 235 | `GraphCache`, `uid`, structural check |
 | `src/graph/backend.rs` | 95 | `Backend`, `KvProvider` |
 | `src/graph/alloc.rs` | 795 | liveness allocator, KV regions, staging |
 | `src/graph/scheduler.rs` | 519 | assign / split / execute, capture hook |
-| `src/graph/fusion.rs` | 234 | `FusionPass` |
+| `src/graph/fusion.rs` | 151 | `FusionPass` |
 | `src/graph/cpu_backend.rs` | 916 | CPU executor |
-| `src/graph/metal_backend.rs` | 2080 | Metal executor |
+| `src/graph/metal_backend.rs` | 2081 | Metal executor |
 | `src/graph/cuda_backend.rs` | 6662 | CUDA executor + graph capture |
 | `src/graph/dot.rs` | 80 | DOT export |
-| `src/graph/json.rs` | 317 | JSON export |
+| `src/graph/json.rs` | 357 | JSON export, `preview_fuse_flags` |
 | `src/models/qwen2/graph.rs` | 2253 | Qwen2 build + weights + tests |
 | `src/models/qwen3/graph.rs` | 1132 | Qwen3 build + weights + tests |
 
@@ -1315,8 +1322,8 @@ These were deviations from the original plan that are now deliberate design:
 | GPU safety rules broken | Resolved: `execute_node` returns `Err`; `docs/GPU_SAFETY.md` rules are enforced in the guards |
 | CUDA functionality regression | Resolved: CUDA Graph capture/replay preserved and default-on for decode |
 | `BatchMatMul` fusion | **Open by design**: deferred (single-output IR); recorded in §5.4 |
-| `FusedBiasRope` | **Dormant**: rule implemented, no backend advertises the capability (§5.2) |
-| Dump/trace fusion gate differs from runtime on CUDA | **Open (documentation-level)**: see §8.4 |
+| `FusedBiasRope` rule | Removed: no backend ever claimed the capability; the op, rule and tag are gone (§5.2) |
+| Dump/trace fusion gate differs from runtime on CUDA | Resolved: shared `preview_fuse_flags` gate + test (§8.4) |
 
 ---
 
@@ -1477,12 +1484,28 @@ Post-plan additions:
     live path (P3) are graph consumers added after the plan.
 35. **Runtime consumers of `forward_graph_cached`**: the server's per-slot caches, the conversation
     engine and the D5-R draft/verify loops.
-36. **Known inconsistency**: the export/trace paths gate `fuse_qkv` on Metal only while the runtime
-    gates it on `metal_on || cuda_on`; on CUDA the exported graph can lack `FusedQKV` (§8.4).
+36. **Export/trace fusion gate (fixed)**: the export and trace paths used to gate `fuse_qkv` on Metal
+    only while the Qwen2 runtime used `metal_on || cuda_on`, so CUDA previews lacked `FusedQKV` and
+    node ids diverged from live events. Both call sites now share
+    `graph::json::preview_fuse_flags`, pinned by a unit test (§8.4).
+
+Post-baseline additions (working-tree changes made while writing this document, after `HEAD`
+`5471680`):
+
+37. **CPU single-pass SwiGLU**: `vec_ops::vec_swiglu_f32` replaces the `vec_silu_f32` +
+    `vec_mul_f32` + full-size temporary pair in `CpuBackend::execute_node`. Bit-identical to the
+    pair (same formula and per-element order); pinned by `vec_ops::tests::swiglu_matches_silu_then_mul`.
+38. **Dormant `FusedBiasRope` removed**: `Op::FusedBiasRope`, `FusionPass::fuse_bias_rope`, the
+    `FusedOp::BiasRope` tag and the never-probed `FusedOp::BatchMatMul`/`FusedOp::QKVBiasRopeStore`
+    tags are gone; `FusedOp` now has a single variant. Metal's `supports_fused` no longer advertises
+    a tag whose op it cannot execute (§5.2/§5.4).
+39. **Shared preview gate**: `graph::json::preview_fuse_flags(nt, metal_on, cuda_on)` is the single
+    source for the `--dump-graph*` / `MINFER_TRACE` preview's fusion flags (item 36).
 
 ### 17.4 Test surface and baseline
 
-83 inline `#[test]` functions live in `src/graph/*.rs` (distribution in §12). The CUDA backend
+83 inline `#[test]` functions live in `src/graph/*.rs` (distribution in §12), plus 2 in `vec_ops` for
+the CPU SwiGLU kernel. The CUDA backend
 dominates because capture/replay needs bit-parity tests
 (`cuda_graph_replay_bit_parity`, `cuda_prefill_shaped_graph_never_captures`,
 `cuda_multisplit_capture_bit_parity`, `cuda_graph_recaptures_on_pool_gen_change`, and the prefill

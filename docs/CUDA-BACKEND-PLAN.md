@@ -110,7 +110,7 @@ pub struct CudaBackend {
 |---|---|
 | `name()` | `"cuda"` |
 | `supports_op(op, dtype)` | §4.3 matrix |
-| `supports_fused(fused)` | `SwiGLU → true` (kernel exists); `QKVBiasRopeStore/BiasRope/BatchMatMul → false` |
+| `supports_fused(fused)` | `SwiGLU → true` (kernel exists); the removed `BiasRope/BatchMatMul` tags and the CUDA-side `QKVBiasRopeStore` tag are no longer in the enum (`FusedOp` ships only `SwiGLU`) |
 | `alloc_buffer/free_buffer` | pool §4.1 |
 | `execute_node(node, in_bufs, out_buf, kv_pair)` | §4.4 dispatch |
 | `read_host(id)` | **`None`** — staged D2H cannot return a borrow (trait takes `&self`); the only consumer `copy_to_cpu` gets a direct-D2H arm instead (`alloc.rs:392`) |

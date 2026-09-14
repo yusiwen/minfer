@@ -458,7 +458,7 @@ pub enum Op {
     KvcacheLoad {
         layer: usize,
     },
-    // ... fused: SwiGLU, FusedBiasRope, FusedQKV{layer},
+    // ... fused: SwiGLU, FusedQKV{layer},
     //     QkvBiasRopeStore{layer}, FusedFFN, FusedQkvNorm{layer}
 ```
 

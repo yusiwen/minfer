@@ -200,7 +200,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | cuda_static feature | Link cudart statically so no libcudart.so is needed at runtime. | BUILD |
 | CUDA driver vs runtime API | `libcuda` low-level vs `libcudart` convenience layer; minfer binds runtime via hand-written externs. | PRIMER, BACKEND |
 | CUDA Graphs | Captured kernel sequence replayed with one launch (`cudaStreamBeginCapture`/`cudaGraphLaunch`/`cudaGraphInstantiate`); `MINFER_NO_CUDA_GRAPH` to disable. | BACKEND, STEPS 19 |
-| graph capture (prefill) | Pre-capturing the prefill segment (`MINFER_CAPTURE_PREFILL`). | STEPS 57+ |
+| graph capture (prefill) | Pre-capturing the prefill segment; default-ON since R3-B (`MINFER_NO_PREFILL_CAPTURE=1` opts out). | STEPS 57+ |
 | pinned memory | Page-locked host memory (`cudaHostAlloc`) for fast H2D/D2H; readback path has a kill switch. | BACKEND, STEPS |
 | `cudaMemcpyAsync` / streams | Async copies on streams (`cudaStreamCreate`); decode uses graph launch, prefill streams. | BACKEND |
 | cudaMallocManaged / unified memory | Memory visible to both CPU and GPU (used once; avoided on GB10 due to bandwidth sharing). | PRIMER |
@@ -241,7 +241,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | NodeId / DType | Node handle and tensor data-type enum carried by every CNode. | GRAPH |
 | `GetRows` | Row-selection op: embedding lookup, and the n_out tail-row optimization (G3). | GRAPH |
 | `BatchMatMul` | Batched matmul op (shared activation quantization, Q4_0); composable with fusion. | GRAPH |
-| FusedOp / `supports_fused` | Pattern-matched fusion ops (SwiGLU / FusedBiasRope) dispatched by backend capability. | GRAPH |
+| FusedOp / `supports_fused` | Fusion capability tag (currently only `SwiGLU`) checked by the fusion pass against each backend. | GRAPH |
 | `n_out` tail-row optimization | After the final `wo`, run FFN/norm/lm_head only on the tail n_out rows (llama `inp_out_ids` style); `GraphParams.n_out` joins the reuse decision. | GRAPH |
 | DOT / JSON export | `graph/dot.rs` and `graph/json.rs` render the graph for viz. | GRAPH |
 

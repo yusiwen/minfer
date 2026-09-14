@@ -84,7 +84,7 @@ One more subtlety hides inside the encoder: within a split, kernels run back-to-
 
 ### 2.5 The dispatch matrix: which op runs which kernel
 
-`supports_op` (`metal_backend.rs:265-283`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax`, `FusedBiasRope`, and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; the fusion pass only rewrites `RoPE∘Add` where the backend claims it) — and it refuses `QkvBiasRopeStore`, a CUDA-only fusion (doc 15). Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary.
+`supports_op` (`metal_backend.rs:265-283`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax` and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; `BatchMatMul` is a deferred vocabulary entry) — and it refuses `QkvBiasRopeStore`, a CUDA-only fusion (doc 15). Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary.
 
 Within the ops Metal *does* run, the dispatch is a decision tree of kernel *families* — this is where `docs/METAL_OPTIMIZATIONS.md`'s campaign lives, so here is the map (the doc has the measurements):
 
@@ -202,7 +202,7 @@ The command buffer is created lazily on the first op of a split:
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
             Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
-            Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
+            Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
             // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
             // Metal the graph builder never emits it (qkv_epilogue_ok = false
             // without `--features cuda`), so it is never assigned here.
@@ -211,13 +211,14 @@ The command buffer is created lazily on the first op of a split:
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // swiglu_f32 and attn_bias_rope_store kernels exist (the latter is the
-        // fused decode QKV store path, nt==1 only)
-        matches!(fused, FusedOp::SwiGLU | FusedOp::QKVBiasRopeStore)
+        // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
+        // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
+        // FusionPass target, so it is not advertised here.
+        matches!(fused, FusedOp::SwiGLU)
     }
 ```
 
-Two things to notice. The `dtype` checks are almost tautological — the graph's node outputs are `DType::F32` everywhere — but the *weight* type is not part of this signature; it lives in `NodeMeta::MatMul.weight_ttype` and is checked at dispatch time against the shader families that exist (§3.2.4). And the two `false` arms are informative negatives: `QkvBiasRopeStore` is refused *with a comment explaining that the builder never emits it on macOS* — the support table and the builder's emission rules are kept in lockstep by that comment, and doc 15's backend claims the same op because CUDA *can* fuse it. `supports_fused` similarly gates the fusion pass (doc 06): `FusedBiasRope` is not claimed, so on a Metal-assigned node chain the fusion pass leaves it unfused while `SwiGLU` (whose kernel exists) gets rewritten.
+Two things to notice. The `dtype` checks are almost tautological — the graph's node outputs are `DType::F32` everywhere — but the *weight* type is not part of this signature; it lives in `NodeMeta::MatMul.weight_ttype` and is checked at dispatch time against the shader families that exist (§3.2.4). And the two `false` arms are informative negatives: `QkvBiasRopeStore` is refused *with a comment explaining that the builder never emits it on macOS* — the support table and the builder's emission rules are kept in lockstep by that comment, and doc 15's backend claims the same op because CUDA *can* fuse it. `supports_fused` similarly gates the fusion pass (doc 06): only `SwiGLU` is claimed (its kernel exists, and the fusion pass has no other rule), so a `Mul(Silu(x), y)` chain gets rewritten while everything else is left alone.
 
 #### 3.2.3 The buffer pool: recycle vs fresh
 
