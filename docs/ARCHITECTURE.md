@@ -304,7 +304,7 @@ pub trait Backend: Send + Sync {
   `cuda.rs` device layer — per-op dispatch with int8 MMQ prefill + MMVQ decode
   (default-on; `MINFER_MMQ=0` reverts), split-KV attention, and CUDA Graph
   capture/replay keyed on the graph `uid` (`graph_replay`, decode-shaped only).
-  Implementation record: `docs/CUDA-BACKEND-PLAN.md`; per-step optimization
+  Implementation record: `docs/CUDA-BACKEND-DESIGN.md`; per-step optimization
   history in `docs/CUDA_OPTIMIZATION.md`.
 
 The **allocator owns every backend pool** (single source of truth); the

@@ -513,15 +513,18 @@ vocabulary entry. Metal *does* claim the builder's decode fusions (`FusedQKV`, `
 the Qwen3 per-head-norm variant — and `FusedFFN`), which is what makes the builder's `fuse_qkv`
 gate safe.
 
-**CUDA's table differs where its kernels differ** — `src/graph/cuda_backend.rs:1254-1301`,
+**CUDA's table differs where its kernels differ** — `src/graph/cuda_backend.rs:supports_op`,
 trimmed to the interesting arms:
 
 ```rust
-/// v1 capability matrix (docs/CUDA-BACKEND-PLAN.md §4.3): the full
-/// per-layer chain runs on CUDA; Embed/GetRows, Scale, Softmax and the
-/// fused decode ops have no kernels and stay on the CPU backend. RoPE is
-/// gated to the neox (non-interleaved) layout — the only style the
-/// supported architectures emit.
+/// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
+/// chain runs on CUDA, including the embedding/tail gather (7e③) and the
+/// decode fusions FusedQKV/QkvBiasRopeStore/FusedFFN. Scale, Softmax,
+/// BatchMatMul and the Qwen3-only FusedQkvNorm have no kernels and stay on
+/// the CPU backend; weight-quant eligibility is the model-level
+/// all-weights-registered gate. RoPE is gated to the neox
+/// (non-interleaved) layout — the only style the supported architectures
+/// emit.
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
     if dtype != DType::F32 {
         return false;
@@ -540,8 +543,7 @@ fn supports_op(&self, op: &Op, dtype: DType) -> bool {
 }
 ```
 
-(Since that record was written, 7e③/7e⑤ added `GetRows` and the decode fusions to CUDA — the
-arms are in the tree; the doc comment predates them.) The instructive line is `RoPE`: capability
+The instructive line is `RoPE`: capability
 can be *payload-conditional* — CUDA rotates only the `NonInterleaved` style, so a hypothetical
 interleaved-RoPE node would silently route to CPU instead of producing wrong numbers. This is
 `supports_op` earning its keep as a per-node query rather than a per-backend yes/no.

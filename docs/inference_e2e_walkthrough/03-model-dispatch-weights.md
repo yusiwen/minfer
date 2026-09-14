@@ -918,7 +918,7 @@ and ignored).
   add-a-new-architecture checklist that mirrors this doc).
 - `docs/COMPUTE-GRAPH-DESIGN.md` — Phase 5/6 record: how the imperative
   forward became `build_graph` + registries, and why nodes carry names.
-- `docs/CUDA-BACKEND-PLAN.md` — Phase 7 design and §2 inventory of the CUDA
+- `docs/CUDA-BACKEND-DESIGN.md` — Phase 7 design and §2 inventory of the CUDA
   weight registry; the resident-weights thesis this doc leans on.
 - `docs/CUDA_OPTIMIZATION.md` (+ `docs/cuda_optimization_steps/`) — the
   measured cost of per-step host round-trips that resident weights delete;

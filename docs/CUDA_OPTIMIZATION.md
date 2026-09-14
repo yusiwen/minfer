@@ -6,7 +6,7 @@
 > measured lever with its commit and perf delta), §1 is the current state,
 > §2 is one chapter per table row, and §3 holds the appendices (env-gate
 > reference, methodology, and the pre-Phase-7 legacy history). Single-sourced
-> implementation records: `docs/CUDA-BACKEND-PLAN.md` (Phase 7a–7e) and the
+> implementation records: `docs/CUDA-BACKEND-DESIGN.md` (Phase 7a–7e) and the
 > per-step documents of §2 (Phase 8: docs 01–11 plus the supplementary records
 > 78–79 — the former `CUDA-FOLLOWUP-PLAN.md` was consolidated into them and
 > retired on 2026-09-10); the per-round MMQ redesign records are mirrored in
@@ -300,10 +300,10 @@ All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
 
 The full per-step chapters (process narrative, principle explanations, real code
 excerpts, verification gates, lessons — previously inlined here) now live in
-**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 79
-standalone documents (01–76, the Phase-8 supplementary records 78–79, and the
-verification-methodology capstone 77). The §0 master table above remains the
-one-row-per-step index; the tables below link each row to its step document.
+**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 104
+standalone documents (01–104, including the Phase-8 supplementary records 78–79
+and the verification-methodology capstone 77). The §0 master table above remains
+the one-row-per-step index; the tables below link each row to its step document.
 Appendix B points at the cross-cutting methodology.
 
 ### Part I · Era A — Phase 7/8 foundations (rows 1–6 + 78–79)
@@ -477,6 +477,24 @@ entry `nt >= 16 && id % 32 == 0 && !no_prefill_gemm`; NB-BT
 for dsc); fused producers `rows >= 16 && dim % 256 == 0`; mode-2 auto-degrade
 under MINFER_GRAPH_DUMP / MINFER_DUMP_DIR / MINFER_TRACE / viz capture; the
 r60 `nb_bt_only` flag degrades mode 2 → mode 1 on mixed-quant models.
+
+**Post-r60 gates (D3–D5-R and the spec/bench harness)** — added after the
+promotion round, so they are not in the table above:
+
+| Gate | Default | Effect |
+|---|---|---|
+| `MINFER_NO_DECODE_A_FUSE` | off | `1` skips the decode fused-producer A-quantize, restoring the standalone quantize launch (D3-5) |
+| `MINFER_NO_Q40_MMVQ` / `MINFER_NO_Q80_MMVQ` | off | `1` forces Q4_0/Q8_0 decode off the MMVQ path (f32 kernels) |
+| `MINFER_NO_Q80_P32` | off | `1` reverts the q8_0 p32 split planes and their dispatch (doc 104) |
+| `MINFER_Q6K_PF` | on | `0` disables the q6_K prefetching MMVQ form (D4-2) |
+| `MINFER_SMALL_M_GEMM` | off | `1` routes nt 2..8 into the mma BT path (doc 91; measured ~1.7× worse) |
+| `MINFER_MMQ_KSPLIT_TARGET` | 256 | target resident-block count for the auto-K-split (doc 92) |
+
+Instrument / harness (not backend gates): the `specverify` instrument reads
+`MINFER_SPECVERIFY_WARMUP_MS` / `_NTS` / `_NOUT`, spec round tracing uses
+`MINFER_SPEC_DEBUG`, `bench` takes its steady-clock warmup budget from
+`MINFER_BENCH_WARMUP_MS`, and `MINFER_BENCH_ROW_MARGINAL` gates the cold-L2
+row-marginal device bench test.
 
 ### Appendix B — Verification methodology (summary)
 

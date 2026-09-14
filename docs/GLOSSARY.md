@@ -42,7 +42,7 @@ d=2 (L1) → verify = batched nt=3 decode step (shape) → which tile-regime (L4
 | SPEC | `LLAMA-CPP-SPECULATIVE-ANALYSIS.md` |
 | D5 | `SPECULATIVE-DECODING-PLAN.md` |
 | GRAPH | `COMPUTE-GRAPH-DESIGN.md` |
-| BACKEND | `CUDA-BACKEND-PLAN.md` |
+| BACKEND | `CUDA-BACKEND-DESIGN.md` |
 | BUILD | `BUILD.md` |
 | SAFETY | `GPU_SAFETY.md` |
 | METAL | `METAL_OPTIMIZATIONS.md` (its §5.6 is a doc-local symbol glossary) |

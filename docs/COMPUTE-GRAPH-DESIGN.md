@@ -20,7 +20,7 @@ mapping.
 > (`docs/inference_e2e_walkthrough/05-graph-builder-ir.md` … `08-scheduler-execute.md`) narrates the
 > same machinery line by line for a first-time reader; this document is the design of record and does
 > not repeat that narrative. Backend-specific optimization history lives in
-> `docs/CUDA-BACKEND-PLAN.md`, `docs/CUDA_OPTIMIZATION.md`, `docs/cuda_optimization_steps/` and
+> `docs/CUDA-BACKEND-DESIGN.md`, `docs/CUDA_OPTIMIZATION.md`, `docs/cuda_optimization_steps/` and
 > `docs/METAL_OPTIMIZATIONS.md`.
 
 ---
@@ -1002,7 +1002,7 @@ documents the page, the SSE endpoints (`GET /viz/graph`, `GET /viz/events`, `POS
 
 > The kernel-level optimization campaign — MMQ (int8 quantized GEMM), MMVQ (quantized
 > matrix-vector), FA (flash attention) tiling, weight-plane prepasses, occupancy work and the
-> per-step measurements — is documented in `docs/CUDA-BACKEND-PLAN.md`,
+> per-step measurements — is documented in `docs/CUDA-BACKEND-DESIGN.md`,
 > `docs/CUDA_OPTIMIZATION.md` and `docs/cuda_optimization_steps/`. This section covers only what the
 > graph design depends on.
 
@@ -1037,7 +1037,7 @@ inside `execute_node` and return `Err` — never a silent CPU fallback.
 ### 9.3 Execution dispatch
 
 `execute_node` maps each op to a CUDA path selected by shape and weight type. Representative mapping
-(the full table is `docs/CUDA-BACKEND-PLAN.md` §4.4 and the per-round records):
+(the full table is `docs/CUDA-BACKEND-DESIGN.md` §4.4 and the per-round records):
 
 | Op | CUDA path |
 |---|---|
@@ -1336,7 +1336,7 @@ These were deviations from the original plan that are now deliberate design:
 | IR / builder / scheduler / allocator walkthrough | `docs/inference_e2e_walkthrough/05-graph-builder-ir.md` … `08-scheduler-execute.md` |
 | Architecture overview, adding an architecture | `docs/ARCHITECTURE.md` |
 | Backend overview (CPU/Metal/CUDA, feature gates) | `docs/BACKENDS.md` |
-| CUDA backend design + Phase 7 record | `docs/CUDA-BACKEND-PLAN.md` |
+| CUDA backend design + Phase 7 record | `docs/CUDA-BACKEND-DESIGN.md` |
 | CUDA optimization history + env-gate reference | `docs/CUDA_OPTIMIZATION.md`, `docs/cuda_optimization_steps/` |
 | Metal optimization plans | `docs/METAL_OPTIMIZATIONS.md` |
 | CPU optimization record | `docs/CPU_OPTIMIZATIONS.md` |
@@ -1377,7 +1377,7 @@ because the repository history was rewritten; the resolvable documentation commi
 | 4 | Scheduler + fusion + diagnostics (`scheduler.rs`, `fusion.rs`, `dot.rs`, `cache.rs`, `params.rs`) | ✅ | fusion apply/gate, DOT format, cache reuse semantics, split boundaries |
 | 5 | Qwen2 graph construction | ✅ | real model logits: graph vs imperative **max diff 0.000** (prefill + decode, KV across steps) |
 | 6 | Wiring + cleanup: `forward.rs` deleted, `ModelDef` on the graph path, `--graph` a compatibility no-op | ✅ | full suite green after deletion; CLI output consistent |
-| 7 | CUDA backend wrapping `cuda.rs` (7a–7e: skeleton, per-op dispatch, graph integration + staging, CUDA Graph, kernel/path optimizations) | ✅ | GB10: 7B Q4_K_M decode 8.4 → 26.4 tok/s; test suites pass; see `docs/CUDA-BACKEND-PLAN.md` |
+| 7 | CUDA backend wrapping `cuda.rs` (7a–7e: skeleton, per-op dispatch, graph integration + staging, CUDA Graph, kernel/path optimizations) | ✅ | GB10: 7B Q4_K_M decode 8.4 → 26.4 tok/s; test suites pass; see `docs/CUDA-BACKEND-DESIGN.md` |
 | 8 | Verification: old/new logits, 7B GPU, `--dump-graph` export, graph path default | ✅ | 0.5B Q4_0 bit-identical; 7B Q4_K_M GPU fluent (~42 tok/s at the time); 437-node DOT |
 | 9 (G1–G3) | Metal attention dispatch, `rms_norm_256`, `n_out` tail rows; two allocator liveness fixes | ✅ | 0.5B decode 2.1×; prefill +55%; 7B decode ≈ old; tail-reduction per-node comparison 0.000 |
 | 10 (G4) | Decode QKV fusion `Op::FusedQKV` (concat matmul + bias/rope/store), flags in `CParams`, env revert | ✅ | 0.5B decode +11%; fused vs unfused logits 0.000 (0.5B + 7B); `fused_qkv_matches_unfused_decode` |

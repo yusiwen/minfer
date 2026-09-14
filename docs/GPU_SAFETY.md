@@ -1,7 +1,9 @@
-# GPU Safety (Metal Backend)
+# GPU Safety (Metal + CUDA Backends)
 
 > **Scope**: preventing GPU faults/hangs from freezing the machine, and the
-> review discipline that produced these guards. See
+> review discipline that produced these guards. The Metal sections are the
+> original incident-driven rules; the CUDA section at the end translates them
+> for the graph CUDA backend. See
 > [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) for performance work and
 > [`AGENTS.md`](AGENTS.md) for the project overview.
 

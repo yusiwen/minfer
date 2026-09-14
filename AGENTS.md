@@ -96,7 +96,7 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 
 **New architecture** (mirror `models/qwen2/` / `qwen3/`): create `models/<name>/{mod,graph,loader}.rs` with `HParams` + `LayerWeights`; dispatch in `models/mod.rs::load_model()`; build the graph with `GraphBuilder` — deterministic in `GraphParams` (reuse invariant); implement `ModelDef` (`forward`/`build_graph`/`forward_graph`/`as_any`); add a chat template if needed.
 
-**New backend** (CUDA is the worked example — `docs/CUDA-BACKEND-PLAN.md`): implement the `Backend` trait (`src/graph/backend.rs`: `supports_op`/`supports_fused`, buffer pool, `execute_node`, host read/write, `synchronize`); register it in `GraphAllocator` (priority + sync/copy arms); register weights at load and gate execution on all-weights-registered; record participation in `CParams.gpu`.
+**New backend** (CUDA is the worked example — `docs/CUDA-BACKEND-DESIGN.md`): implement the `Backend` trait (`src/graph/backend.rs`: `supports_op`/`supports_fused`, buffer pool, `execute_node`, host read/write, `synchronize`); register it in `GraphAllocator` (priority + sync/copy arms); register weights at load and gate execution on all-weights-registered; record participation in `CParams.gpu`.
 
 ## Sampling
 
@@ -120,7 +120,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
 | CPU optimizations | `docs/CPU_OPTIMIZATIONS.md` |
-| CUDA backend design + implementation record (Phase 7a–7e) | `docs/CUDA-BACKEND-PLAN.md` |
+| CUDA backend design + implementation record (device layer, dispatch, capture, safety) | `docs/CUDA-BACKEND-DESIGN.md` |
 | **CUDA optimization history (live status) + per-step records (incl. Phase 8)** | `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` |
 | CUDA / GPU technology primer (every technique explained) | `docs/CUDA-TECH-PRIMER.md` |
 | Campaign glossary (every term/formula, classified into 7 layers) | `docs/GLOSSARY.md` |

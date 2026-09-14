@@ -5,7 +5,7 @@
 //! the mechanics allow: a device buffer pool with a byte-length free list,
 //! name → device-pointer weight resolution, sync H2D/D2H host transfers, and
 //! per-op kernel dispatch on the shared stream. Design + rollout:
-//! `docs/CUDA-BACKEND-PLAN.md`.
+//! `docs/CUDA-BACKEND-DESIGN.md`.
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
@@ -1274,11 +1274,14 @@ impl Backend for CudaBackend {
         "cuda"
     }
 
-    /// v1 capability matrix (docs/CUDA-BACKEND-PLAN.md §4.3): the full
-    /// per-layer chain runs on CUDA; Embed/GetRows, Scale, Softmax and the
-    /// fused decode ops have no kernels and stay on the CPU backend. RoPE is
-    /// gated to the neox (non-interleaved) layout — the only style the
-    /// supported architectures emit.
+    /// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
+    /// chain runs on CUDA, including the embedding/tail gather (7e③) and the
+    /// decode fusions FusedQKV/QkvBiasRopeStore/FusedFFN. Scale, Softmax,
+    /// BatchMatMul and the Qwen3-only FusedQkvNorm have no kernels and stay on
+    /// the CPU backend; weight-quant eligibility is the model-level
+    /// all-weights-registered gate. RoPE is gated to the neox
+    /// (non-interleaved) layout — the only style the supported architectures
+    /// emit.
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         if dtype != DType::F32 {
             return false;
@@ -4092,7 +4095,6 @@ mod tests {
     // O accumulator). Reference: cpu_gqa_attn over the f16-rounded KV — the
     // kernel reads the same f16 cache; its q and probs carry f16 rounding,
     // measured ~1.4e-4 on the standalone harness, so 5e-3 leaves headroom.
-    #[test]
     #[test]
     fn cuda_prefill_fused_b_bitparity() {
         // 8p: the fused dequant-in-GEMM path must be BIT-identical to the

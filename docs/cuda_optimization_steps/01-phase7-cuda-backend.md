@@ -1,7 +1,7 @@
 # 01 · Phase 7 — CUDA backend: raw FFI device layer + graph backend 7a–7e (LANDED)
 
 > **Result**: the first working NVIDIA GPU inference path; 7B q4_k_m @2K prefill **30.7 tok/s** (the Era-A baseline anchor — ~110× behind llama-bench at the time, but from here on every optimization step had ground to stand on).
-> **Commit**: `0dc2a54` (raw-CUDA-FFI device layer; graph backend 7a–7e landed phase by phase per `docs/CUDA-BACKEND-PLAN.md`, with the 7e series closing out on 2026-08-29). **Date**: 2026-07-15 (device-layer commit) / 2026-08-30 (Era A record).
+> **Commit**: `0dc2a54` (raw-CUDA-FFI device layer; graph backend 7a–7e landed phase by phase per `docs/CUDA-BACKEND-DESIGN.md`, with the 7e series closing out on 2026-08-29). **Date**: 2026-07-15 (device-layer commit) / 2026-08-30 (Era A record).
 
 ## 1. Background — where things stood
 

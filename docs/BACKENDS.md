@@ -12,7 +12,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
 | KV cache | f32 regions | f32 or f16 (`MINFER_CACHE_TYPE=f16`) | f32 or f16 |
 | Async model | synchronous | one `MpsCommandBuffer` per split | stream + CUDA Graph capture/replay |
-| Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-PLAN.md), [campaign](./CUDA_OPTIMIZATION.md) |
+| Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-DESIGN.md), [campaign](./CUDA_OPTIMIZATION.md) |
 
 This page is the overview: what the backend contract is, how nodes land on a
 backend, and where the three differ. The linked pages carry the per-backend
@@ -149,4 +149,4 @@ CPU-vs-GPU logits differ; every path is verified against its own reference
 1. [walkthrough 08 — the scheduler](./inference_e2e_walkthrough/08-scheduler-execute.md) — splits, copies, execution.
 2. Backend episodes of the walkthrough: [10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md) / [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md) (CPU), [14](./inference_e2e_walkthrough/14-metal-backend.md) (Metal), [15](./inference_e2e_walkthrough/15-cuda-backend.md) (CUDA).
 3. `docs/GPU_SAFETY.md` — the hard rules before touching GPU code.
-4. Per-backend history: `docs/CPU_OPTIMIZATIONS.md`, `docs/METAL_OPTIMIZATIONS.md`, `docs/CUDA-BACKEND-PLAN.md` + `docs/CUDA_OPTIMIZATION.md`.
+4. Per-backend history: `docs/CPU_OPTIMIZATIONS.md`, `docs/METAL_OPTIMIZATIONS.md`, `docs/CUDA-BACKEND-DESIGN.md` + `docs/CUDA_OPTIMIZATION.md`.

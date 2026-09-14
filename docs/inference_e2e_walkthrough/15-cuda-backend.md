@@ -65,7 +65,7 @@ mechanisms, each answering a question the other backends never had to ask:
 The implementation arc itself is worth knowing up front, because the code
 carries its history in comments: the backend was built in five planned
 sub-phases (7a skeleton → 7b per-op parity → 7c model wiring → 7d graph
-replay → 7e polish, all recorded in `docs/CUDA-BACKEND-PLAN.md`), and then a
+replay → 7e polish, all recorded in `docs/CUDA-BACKEND-DESIGN.md`), and then a
 long measurement-driven optimization campaign (Phase 8 and the r-series,
 recorded in `docs/CUDA_OPTIMIZATION.md` plus one document per step in
 `docs/cuda_optimization_steps/`) turned a working backend that ran 7B prefill
@@ -326,7 +326,7 @@ ten documents building them and the CUDA backend preserves every one:
   causal bound from the device positions buffer at run time.
 - **Weights are the GGUF bytes** — registered to the device once at load;
   execution never host-copies a weight (llama.cpp's "ops follow their
-  weights" rule, `CUDA-BACKEND-PLAN.md` §3).
+  weights" rule, `CUDA-BACKEND-DESIGN.md` §3).
 - **Backend assignment is a build-time decision** — `supports_op` + the
   all-weights gate decide placement before the first forward; a mid-run
   invariant violation is an `Err`, never a silent CPU detour (§3.4).
@@ -1073,7 +1073,7 @@ after a batch of launches observes all of their errors.
 
 **Why two layers (a `CudaState` singleton wrapped by a `CudaBackend`)?**
 `cuda.rs` predates the graph (it began as a direct-inference device layer)
-and `CUDA-BACKEND-PLAN.md` §2.3 made the call explicit: *wrap, do not
+and `CUDA-BACKEND-DESIGN.md` §2.3 made the call explicit: *wrap, do not
 rewrite*. The singleton owns everything device-global (the stream, the
 weight registry, the KV regions, staging pools) and is shared by tests and
 the legacy surface; the backend owns everything graph-shaped (the buffer
@@ -1265,7 +1265,7 @@ story of §3.2.1.
   same `Backend` trait, same pool/free-list shape, same f16-KV policy; Metal
   dispatches one command buffer per split where CUDA captures one graph per
   split, and Metal's norm arm degrades silently where CUDA's returns `Err`.
-- `docs/CUDA-BACKEND-PLAN.md` — the backend's design + implementation
+- `docs/CUDA-BACKEND-DESIGN.md` — the backend's design + implementation
   record: §3's llama.cpp reference map, §4 the design, §5 phases 7a–7e with
   per-item A/B numbers (7e②'s 3.1× decode, 7d's +18% replay).
 - `docs/CUDA_OPTIMIZATION.md` + `docs/cuda_optimization_steps/` — the
