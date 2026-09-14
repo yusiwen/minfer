@@ -275,7 +275,7 @@ impl Backend for MetalBackend {
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
             Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
-            Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => false,
+            Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
             // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
             // Metal the graph builder never emits it (qkv_epilogue_ok = false
             // without `--features cuda`), so it is never assigned here.
@@ -284,9 +284,10 @@ impl Backend for MetalBackend {
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // swiglu_f32 and attn_bias_rope_store kernels exist (the latter is the
-        // fused decode QKV store path, nt==1 only)
-        matches!(fused, FusedOp::SwiGLU | FusedOp::QKVBiasRopeStore)
+        // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
+        // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
+        // FusionPass target, so it is not advertised here.
+        matches!(fused, FusedOp::SwiGLU)
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
@@ -983,7 +984,7 @@ impl Backend for MetalBackend {
                 );
                 Ok(())
             }
-            Op::Scale(_) | Op::Softmax { .. } | Op::FusedBiasRope | Op::BatchMatMul => {
+            Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => {
                 Err(format!("op {:?} unsupported on Metal (Phase 3)", node.op))
             }
             // CUDA-only mixed-quant decode epilogue; never emitted on the Metal

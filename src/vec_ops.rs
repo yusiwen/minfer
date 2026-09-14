@@ -201,6 +201,56 @@ unsafe fn vec_silu_f32_avx2(n: usize, y: &mut [f32], x: &[f32]) {
     }
 }
 
+// === vec_swiglu_f32 ===
+// dst[i] = silu(gate[i]) * up[i]  (llama `ggml_swiglu_split` semantics).
+// Single pass: avoids the full-size intermediate a silu-then-mul pair needs,
+// and is bit-identical to that pair (same formula, same per-element order).
+pub fn vec_swiglu_f32(n: usize, dst: &mut [f32], gate: &[f32], up: &[f32]) {
+    debug_assert!(dst.len() >= n && gate.len() >= n && up.len() >= n);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { vec_swiglu_f32_avx2(n, dst, gate, up) };
+            return;
+        }
+    }
+
+    // Scalar fallback (same formula as vec_silu_f32 + vec_mul_f32; the multiply
+    // is exact, so composing it here stays bit-identical to the AVX2 mul path
+    // on machines that have AVX2 but not FMA).
+    for i in 0..n {
+        dst[i] = (gate[i] / (1.0 + (-gate[i]).exp())) * up[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_swiglu_f32_avx2(n: usize, dst: &mut [f32], gate: &[f32], up: &[f32]) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0;
+    for i_step in (0..n).step_by(8) {
+        if i_step + 7 >= n {
+            break;
+        }
+        let vg = _mm256_loadu_ps(gate.as_ptr().add(i_step));
+        let vu = _mm256_loadu_ps(up.as_ptr().add(i_step));
+        let one = _mm256_set1_ps(1.0);
+        let zero = _mm256_setzero_ps();
+        let neg_g = _mm256_sub_ps(zero, vg);
+        let exp_neg_g = vec_exp_f32_avx2(neg_g);
+        let silu = _mm256_div_ps(vg, _mm256_add_ps(one, exp_neg_g));
+        let result = _mm256_mul_ps(silu, vu);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i_step), result);
+        i = i_step + 8;
+    }
+
+    for j in i..n {
+        dst[j] = (gate[j] / (1.0 + (-gate[j]).exp())) * up[j];
+    }
+}
+
 // === vec_soft_max_f32 (vec.cpp lines 531-560, simplified) ===
 // Computes softmax: y[i] = exp(x[i] - max) / sum(exp(x[i] - max))
 // Returns the sum before scaling
@@ -872,3 +922,41 @@ use neon_vec::{
     vec_muladd_f32 as vec_muladd_f32_neon, vec_scale_f32 as vec_scale_f32_neon,
     vec_soft_max_f32 as vec_soft_max_f32_neon,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fused pass replaces the silu-then-mul pair, so it must agree with it
+    /// bit for bit (the unfused execution is the reference for `Op::SwiGLU`).
+    #[test]
+    fn swiglu_matches_silu_then_mul() {
+        let gate: Vec<f32> = (0..37).map(|i| (i as f32 - 18.0) * 0.37).collect();
+        let up: Vec<f32> = (0..37).map(|i| i as f32 * 0.11 - 2.0).collect();
+        let n = gate.len();
+
+        let mut want = vec![0f32; n];
+        vec_silu_f32(n, &mut want, &gate);
+        let silu = want.clone();
+        vec_mul_f32(n, &mut want, &silu, &up);
+
+        let mut got = vec![0f32; n];
+        vec_swiglu_f32(n, &mut got, &gate, &up);
+
+        assert_eq!(got, want, "fused swiglu must be bit-identical to silu+mul");
+    }
+
+    /// Tail handling: `vec_swiglu_f32`'s vector loop stops before the last
+    /// partial chunk, so exercise a non-multiple-of-8 length too.
+    #[test]
+    fn swiglu_scalar_tail() {
+        let gate = [-3.0f32, 0.0, 0.5, 7.25];
+        let up = [1.5f32, -2.0, 0.0, 4.0];
+        let mut got = [0f32; 4];
+        vec_swiglu_f32(4, &mut got, &gate, &up);
+        for i in 0..4 {
+            let want = (gate[i] / (1.0 + (-gate[i]).exp())) * up[i];
+            assert_eq!(got[i], want);
+        }
+    }
+}

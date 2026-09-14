@@ -914,12 +914,11 @@ fn main() {
         let cuda_on = crate::cuda::CudaState::get().is_some();
         #[cfg(not(feature = "cuda"))]
         let cuda_on = false;
-        let fuse_qkv = input_ids.len() == 1
-            && metal_on
-            && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
-        let fuse_ffn = input_ids.len() == 1
-            && (metal_on || cuda_on)
-            && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+        // Shared gate (json::preview_fuse_flags) so the preview cannot drift
+        // from the engine: Qwen2's runtime joins the decode QKV fusion on CUDA
+        // too, and a Metal-only gate here used to drop its FusedQKV nodes.
+        let (fuse_qkv, fuse_ffn) =
+            crate::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
         let model_name = std::path::Path::new(&model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1231,11 +1230,8 @@ fn main() {
         let cuda_on = crate::cuda::CudaState::get().is_some();
         #[cfg(not(feature = "cuda"))]
         let cuda_on = false;
-        let fuse_qkv = metal_on && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
-        // device-presence gate (matches the engine's CParams construction,
-        // Phase 8 review: cfg!(feature) claims CUDA without a device)
-        let fuse_ffn = (metal_on || cuda_on)
-            && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+        // Decode-graph gates, shared with the dump block (and the engine).
+        let (fuse_qkv, fuse_ffn) = crate::graph::json::preview_fuse_flags(1, metal_on, cuda_on);
         let prefill_graph = export_graph_json(
             &*model,
             &model_name,

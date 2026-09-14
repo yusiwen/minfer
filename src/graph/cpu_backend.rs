@@ -98,9 +98,10 @@ impl Backend for CpuBackend {
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // CPU has no dedicated fused kernels yet: silu+mul stays decomposed
-        // (the fusion pass leaves it as-is on CPU); bias+rope and batch-matmul
-        // are not fused either (batch QKV quantize-sharing is a Phase 5+ win).
+        // The SwiGLU rewrite IS applied to CPU nodes (CPU is first in the
+        // fusion pass's backend list); `Op::SwiGLU` below executes it as a
+        // single pass. bias+rope and batch-matmul are not fused (batch QKV
+        // quantize-sharing is a Phase 5+ win).
         matches!(fused, FusedOp::SwiGLU)
     }
 
@@ -371,10 +372,10 @@ impl Backend for CpuBackend {
                 }
             }
             Op::SwiGLU => {
-                // silu(gate) * up
-                crate::vec_ops::vec_silu_f32(out.len(), out, ins[0]);
-                let g = out.to_vec();
-                crate::vec_ops::vec_mul_f32(out.len(), out, &g, ins[1]);
+                // silu(gate) * up, one pass: bit-identical to the old
+                // vec_silu_f32 + vec_mul_f32 pair (same formula and
+                // per-element order) without its full-size temp buffer.
+                crate::vec_ops::vec_swiglu_f32(out.len(), out, ins[0], ins[1]);
                 Ok(())
             }
             Op::KvcacheStore { .. } => unreachable!("KV store handled in the dedicated path"),
@@ -430,8 +431,7 @@ impl Backend for CpuBackend {
                 )?;
                 Ok(())
             }
-            Op::FusedBiasRope
-            | Op::BatchMatMul
+            Op::BatchMatMul
             | Op::FusedQKV { .. }
             | Op::QkvBiasRopeStore { .. }
             | Op::FusedQkvNorm { .. }

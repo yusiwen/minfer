@@ -21,16 +21,14 @@ pub enum AttnMode {
 
 /// Fused-op capability tag: drives the fusion pass (Phase 4) — a fusion is only
 /// applied when the target backend reports `supports_fused(FusedOp)`.
-// BatchMatMul / QKVBiasRopeStore are the planned fused variants (the decode
-// path uses FusedQKV today).
+///
+/// `SwiGLU` is the only fusion produced. The plan also sketched `BiasRope`
+/// (removed: no backend ever claimed the capability — bias+rope is covered by
+/// the build-time fused decode nodes) and `BatchMatMul` (deferred together with
+/// its `Op` variant: the single-output IR cannot express it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusedOp {
-    SwiGLU,   // silu(gate) * up
-    BiasRope, // add_bias + rope (+ kv store on GPU: attn_bias_rope_store)
-    #[allow(dead_code)]
-    BatchMatMul, // multiple matmuls sharing one quantized activation
-    #[allow(dead_code)]
-    QKVBiasRopeStore, // decode QKV: concat matmul + bias+rope+store (nt==1)
+    SwiGLU, // silu(gate) * up
 }
 
 /// Operator type. Implements full `PartialEq` (payloads included) so debug
@@ -119,7 +117,6 @@ pub enum Op {
 
     // ---- fused ops (fusion pass output, gated by backend supports_fused) ----
     SwiGLU,
-    FusedBiasRope,
     #[allow(dead_code)]
     BatchMatMul,
     /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store

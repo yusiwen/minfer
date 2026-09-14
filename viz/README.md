@@ -75,8 +75,9 @@ Drop the JSON into `samples/` and register it in `manifest.json` to make it appe
   remaining capture tax is the host-side stats scan + event serialization of every node
   (~1.6× slowdown on 7B decode, identical on both backends)
 - **The `/viz/graph` preview mirrors the engine's CParams**: GPU participation is Metal OR
-  CUDA, QKV fusion is Metal-only (no CUDA fused bias+rope+store kernel), FFN gate+up fusion
-  runs on both — node ids match the live per-node events on every backend
+  CUDA, and both decode fusions (QKV concat/mixed-quant, FFN gate+up) run on either GPU backend
+  when the engine enables them — node ids match the live per-node events on every backend
+  (`json::preview_fuse_flags` is shared by the export/trace/live paths and the engine)
 - **Lazy arming**: per-node data is only captured while an SSE client is connected — a `viz`
   server with nobody watching, and normal CLI / `serve` inference, all cost nothing
   (`serve` is a pure OpenAI API with no viz routes)

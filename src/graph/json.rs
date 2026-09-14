@@ -47,6 +47,28 @@ pub fn runtime_gparams(
     }
 }
 
+/// Fusion gates the graph export/trace preview must use so its node ids match
+/// the live engine.
+///
+/// The engine builds its `CParams` in the model modules: Qwen2 joins the decode
+/// QKV fusion when *either* GPU backend participates (`metal_on || cuda_on`,
+/// the D3-8 CUDA port), and the FFN fusion has always used the same disjunction.
+/// The previews must use the same rule — gating QKV on Metal alone dropped the
+/// runtime's `FusedQKV` nodes from CUDA previews and shifted every later node id
+/// relative to the live events (`viz/README.md` promises they match).
+///
+/// Being permissive here cannot change topology: the model's own build narrows
+/// further (Qwen3's fused-QKV concat probe is macOS-only, Qwen2's concat probe
+/// is per-layer), so an extra `true` on a layer that cannot fuse is a no-op.
+pub fn preview_fuse_flags(nt: usize, metal_on: bool, cuda_on: bool) -> (bool, bool) {
+    let enabled = |var: &str| !std::env::var(var).map_or(false, |v| v == "1");
+    let gpu = metal_on || cuda_on;
+    (
+        nt == 1 && gpu && enabled("MINFER_NO_FUSE_QKV"),
+        nt == 1 && gpu && enabled("MINFER_NO_FUSE_FFN"),
+    )
+}
+
 /// Build the graph the runtime would execute for `gparams` (mirroring the
 /// cache: build → assign → FusionPass), so node ids/ops always match what the
 /// scheduler actually ran. Used by `--dump-graph*`, the P2 trace, and the P3
@@ -186,7 +208,6 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
         Op::Reshape { .. } => "reshape",
         Op::Permute { .. } => "permute",
         Op::SwiGLU => "swiglu",
-        Op::FusedBiasRope => "fused_bias_rope",
         Op::BatchMatMul => "batch_matmul",
         Op::FusedQKV { .. } => "fused_qkv",
         Op::QkvBiasRopeStore { .. } => "qkv_bias_rope_store",
@@ -204,7 +225,6 @@ fn op_detail(op: &Op) -> Value {
         | Op::Silu
         | Op::GetRows
         | Op::SwiGLU
-        | Op::FusedBiasRope
         | Op::FusedFFN
         | Op::BatchMatMul
         | Op::FusedQkvNorm { .. } => json!({}),
@@ -313,5 +333,25 @@ fn meta_json(meta: &NodeMeta) -> Value {
             "kv_elems": f.kv_elems,
             "eps": f.eps,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The export/trace preview must offer the decode fusions on CUDA-only runs
+    /// too — the old Metal-only gate dropped `FusedQKV` from CUDA previews and
+    /// shifted node ids away from the live events (`viz/README.md`).
+    #[test]
+    fn preview_fuse_flags_include_cuda_only_runs() {
+        // prefill never fuses, regardless of backends
+        assert_eq!(preview_fuse_flags(4, false, false), (false, false));
+        assert_eq!(preview_fuse_flags(4, true, true), (false, false));
+        // decode + CUDA only: the shipped divergence
+        assert_eq!(preview_fuse_flags(1, false, true), (true, true));
+        // decode + Metal only, and decode + no GPU
+        assert_eq!(preview_fuse_flags(1, true, false), (true, true));
+        assert_eq!(preview_fuse_flags(1, false, false), (false, false));
     }
 }
