@@ -253,20 +253,6 @@ impl AdaptiveD {
         }
         e / (self.v[cand - 1] + cand as f64 * self.t_draft)
     }
-
-    /// Mean chosen depth for the stats line (0 when nothing picked yet).
-    pub fn mean_d(&self) -> f64 {
-        let n: u64 = self.d_counts.iter().sum();
-        if n == 0 {
-            return 0.0;
-        }
-        self.d_counts
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (i + 1) as f64 * c as f64)
-            .sum::<f64>()
-            / n as f64
-    }
 }
 
 /// Sampler inputs mirrored from GenParams so spec.rs does not depend on
