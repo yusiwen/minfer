@@ -17,23 +17,39 @@ point, and the reasoning behind every design choice.
 
 ## The run in one paragraph
 
+Numbers in parentheses are chapter numbers of this series — each one below is
+a link to its chapter; the [master table](#master-table--stage--document--code)
+lists them with descriptions.
+
 You type `./target/release/minfer model.gguf "Hello"`. minfer resolves the
 model name to a GGUF file, memory-maps it, and parses its metadata and
-quantized weight tensors (01–02). Metadata dispatches the file to a model
+quantized weight tensors
+([01](01-cli-args-model-resolution.md)–[02](02-gguf-load.md)). Metadata
+dispatches the file to a model
 implementation (Qwen2/Qwen3) whose weights register into the compute-graph
-allocator and, when eligible, into the GPU backend (03). Your prompt is
+allocator and, when eligible, into the GPU backend
+([03](03-model-dispatch-weights.md)). Your prompt is
 rendered through the model's chat template and tokenized into integer ids
-(04). For those ids the engine **builds a declarative compute graph** — a pure
+([04](04-tokenizer-template.md)). For those ids the engine **builds a
+declarative compute graph** — a pure
 data structure describing every math op of the transformer — assigns each node
 to a backend, fuses op patterns, and allocates buffers by liveness with
-persistent per-layer KV regions (05–08). The prefill forward executes the
-graph once over all prompt tokens (09): quantized matmuls on CPU (10), RoPE /
-RMSNorm / GQA attention over the fresh KV (11), producing the **last-token
+persistent per-layer KV regions
+([05](05-graph-builder-ir.md)–[08](08-scheduler-execute.md)). The prefill
+forward executes the
+graph once over all prompt tokens ([09](09-prefill-forward-path.md)):
+quantized matmuls on CPU ([10](10-cpu-matmul-kernels.md)), RoPE /
+RMSNorm / GQA attention over the fresh KV
+([11](11-attention-vecops-kv.md)), producing the **last-token
 logits** — a score per vocabulary entry. The sampler turns those scores into
-one next token (12). From then on the decode loop repeats with a single token
-per step, reusing the cached graph and the KV accumulated so far (13). On
-macOS the same graph runs on Metal (14); with `--features cuda` it runs on
-NVIDIA GPUs with int8 MMQ prefill and CUDA Graph replay (15).
+one next token ([12](12-sampler.md)). From then on the decode loop repeats
+with a single token
+per step, reusing the cached graph and the KV accumulated so far
+([13](13-decode-loop-graph-reuse.md)). On
+macOS the same graph runs on Metal ([14](14-metal-backend.md)); with
+`--features cuda` it runs on
+NVIDIA GPUs with int8 MMQ prefill and CUDA Graph replay
+([15](15-cuda-backend.md)).
 
 ```mermaid
 flowchart LR
