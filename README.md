@@ -121,27 +121,39 @@ biases.
 
 ## Performance
 
-**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-08):**
+**CUDA — NVIDIA GB10 (DGX Spark, sm_121), default path (2026-09-14):**
 
 | Model | Prefill (pp3314) | vs llama.cpp | Decode (tg128) | Decode @long KV | Device mem |
 |-------|------------------|--------------|----------------|-----------------|------------|
 | Qwen2.5-7B-Instruct Q4_K_M | **~3581 tok/s** | **1.080×** (llama-bench 3323.3, same shape) | **~51.2 tok/s** (**1.074×**) | **50.2 tok/s** @1.6K (**1.052×**) | ~10.4 GB |
 | Qwen2.5-14B-Instruct Q4_K_M | **~1830 tok/s** | **1.12×** (llama-bench 1634, same window) | **24.6 tok/s** (**1.018×**) | 22.9 tok/s @3.3K (0.950×) | ~14.1 GB |
+| Qwen2.5-7B-Instruct Q4_0 | — | — | **56.8 tok/s** (**1.045×**, llama 54.39) | — | ~4.3 GB |
+| Qwen2.5-7B-Instruct Q8_0 | — | — | **~32.0 tok/s** (**~1.00×**, llama 32.05) | — | ~14.6 GB |
 
 Decode numbers are same-window matched-anchor pairs against llama-bench
-(ca3d5a3e1) on the shared GPU; window drift between sessions is ±2%.
+(ca3d5a3e1) on the shared GPU; window drift between sessions is ±2%. The
+Q4_0/Q8_0 rows are interleaved steady-state A/B from docs 103–104 (±0.05
+tok/s error bars). Both engines are bounded by the same ~253–266 GB/s
+weight-streaming ceiling at these shapes.
 
 The int8 tensor-core MMQ path is **default-on** in CUDA builds — ~3581 tok/s is
 8.1× over the 441 tok/s where the path started, with every optimization step
 (measurement, gates and commit) documented in the history table of
 **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)**.
-Decode runs the dp4a MMVQ (q6_K on a dense split-plane layout, `MINFER_Q6K_DPL=0`
-opt-out) + split-KV attention + fused-QKV kernels: 7B decode is **ahead of
-llama.cpp at every measured context length**; 14B is ahead at short context with
-the remaining ~5% gap at 3.3K KV in attention structure (the D/D4-series campaign
-record is §2D).
+Decode runs the dp4a MMVQ family (q4_K/q5_K/q6_K; q4_0/q8_0 since doc 103 —
+q8_0 on p32 split planes with 16B-aligned `uint4` weight loads, byte-equal
+outputs, `MINFER_NO_Q80_P32=1` opt-out) + split-KV attention + fused-QKV
+kernels: 7B Q4_K_M decode is **ahead of llama.cpp at every measured context
+length**; 14B is ahead at short context with the remaining ~5% gap at 3.3K KV
+in attention structure (the D/D4-series campaign record is §2D); the legacy
+quants close at q4_0 **1.045× faster** and q8_0 parity (docs 103–104).
+Speculative decoding (0.5B Q4_K_M draft, adaptive depth): 14B target = 35.9
+prose / 44.8 code tok/s adaptive (1.42×/1.77× sequential); 7B Q8_0 target =
+**79.0 tok/s = 2.47× sequential**.
 `MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
-`MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory.
+`MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory;
+`MINFER_NO_Q40_MMVQ=1` / `MINFER_NO_Q80_MMVQ=1` / `MINFER_NO_Q80_P32=1`
+revert the legacy-quant decode paths.
 
 **Metal — Apple M4 Pro (2026-08-21, compute-graph path):**
 
