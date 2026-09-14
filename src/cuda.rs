@@ -4122,6 +4122,7 @@ impl CudaState {
         let (type_id, block_stride) = match ttype {
             TensorType::Q8_0 => (0i32, 34i32),
             TensorType::Q4_0 => (1, 18),
+            TensorType::Q4_1 => (7, 20),
             TensorType::Q4_K => (2, 144),
             TensorType::Q5_0 => (6, 22),
             TensorType::Q5_1 => (4, 24),
@@ -5668,6 +5669,66 @@ mod d35_probe_tests {
     /// D3-5 1a bitwise probe: fused-producer q8 epilogues vs the standalone
     /// quantize kernel — identical pad40 bytes, identical f32 producer
     /// outputs, bit-identical MMVQ outputs through the cache-hit path.
+    #[test]
+    fn cuda_embed_rows_q4_1_reference() {
+        let Some(st) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = CudaState::model_load_guard();
+        let (vocab, d) = (5usize, 64usize);
+        let nb = d / 32;
+        // synthetic Q4_1 blocks (20B: f16 d, f16 m, 16 nibble bytes)
+        let mut w = vec![0u8; vocab * nb * 20];
+        for r in 0..vocab {
+            for b in 0..nb {
+                let off = (r * nb + b) * 20;
+                let dbits = 0x3800u16.wrapping_add(((r * 7 + b * 3) as u16) * 64);
+                let mbits = 0x3800u16.wrapping_add(((r * 5 + b) as u16) * 32);
+                w[off..off + 2].copy_from_slice(&dbits.to_le_bytes());
+                w[off + 2..off + 4].copy_from_slice(&mbits.to_le_bytes());
+                for j in 0..16usize {
+                    w[off + 4 + j] = ((j * 17 + r * 13 + b * 29) & 0xFF) as u8;
+                }
+            }
+        }
+        st.register_weight("q41_embed_w", &w);
+        let wptr = st.get_weight_ptr("q41_embed_w").unwrap();
+        // row ids travel as I32-as-f32 bit patterns (graph rule §4)
+        let ids: Vec<i32> = vec![0, 3, 4, 1];
+        let nt = ids.len();
+        let ids_f: Vec<f32> = ids.iter().map(|&i| f32::from_bits(i as u32)).collect();
+        let dids = dev_alloc(nt * 4);
+        h2d_f32(dids, &ids_f);
+        let dout = dev_alloc(nt * d * 4);
+        st.embed_rows_on_gpu(TensorType::Q4_1, wptr, dids, dout, d, nt, false)
+            .unwrap();
+        let got = d2h_f32(dout, nt * d);
+        for (t, &row) in ids.iter().enumerate() {
+            for b in 0..nb {
+                let off = (row as usize * nb + b) * 20;
+                let dv = half::f16::from_bits(u16::from_le_bytes([w[off], w[off + 1]])).to_f32();
+                let mv =
+                    half::f16::from_bits(u16::from_le_bytes([w[off + 2], w[off + 3]])).to_f32();
+                for j in 0..16usize {
+                    let lo = (w[off + 4 + j] & 0x0F) as f32;
+                    let hi = (w[off + 4 + j] >> 4) as f32;
+                    // the kernel's d*q+m may compile to a fused multiply-add;
+                    // accept either rounding (both are one-ulp forms)
+                    for (e, v) in [(b * 32 + j, lo), (b * 32 + j + 16, hi)] {
+                        let sep = dv * v + mv;
+                        let fma = dv.mul_add(v, mv);
+                        assert!(
+                            got[t * d + e] == sep || got[t * d + e] == fma,
+                            "row {row} elem {e}: got {} want {sep} (fma {fma})",
+                            got[t * d + e]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn cuda_decode_a_quant_fuse_bitwise() {
         let Some(st) = device() else {

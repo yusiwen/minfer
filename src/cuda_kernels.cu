@@ -3606,13 +3606,47 @@ __global__ void embed_rows_q5_k(
     }
 }
 
+// Q4_1: one thread per 32-element block (20B = f16 d + f16 m + 16 qs
+// bytes); value = d * nibble + m (unsigned nibbles, no centering) —
+// matches quants.rs dot_q4_1_q8_0 and kernel.rs's CPU embed path. No
+// high-bit plane; the 20B stride keeps blk+4 4-byte-aligned for every
+// row, so the nibble bytes are read as four ALIGNED u32s (GB10
+// misaligned-load rule, see the q5_0 note).
+__global__ void embed_rows_q4_1(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    const int BS = 20;
+    int nb = n_embd / 32;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt * nb) return;
+    int t = tid / nb, b = tid % nb;
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    const uint8_t* blk = w + ((long long)id * nb + b) * BS;
+    float d = h2f(*reinterpret_cast<const uint16_t*>(blk));
+    float m = h2f(*reinterpret_cast<const uint16_t*>(blk + 2));
+    const uint32_t* qs = reinterpret_cast<const uint32_t*>(blk + 4);
+    float* o = out + (long long)t * n_embd + b * 32;
+    #pragma unroll
+    for (int v = 0; v < 4; v++) {
+        const uint32_t q = qs[v];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            o[v * 4 + k] = d * float((q >> (8 * k)) & 0x0F) + m;
+            o[v * 4 + k + 16] = d * float((q >> (8 * k + 4)) & 0x0F) + m;
+        }
+    }
+}
+
 void launch_embed_rows(
     const uint8_t* w, const float* ids, float* out,
     int n_embd, int nt, int type_id, int block_stride, cudaStream_t stream
 ) {
     int block = 256;
     long long total = 0;
-    if (type_id == 0 || type_id == 1) { // q8_0 / q4_0: one thread per 32-group
+    if (type_id == 0 || type_id == 1 || type_id == 7) { // q8_0 / q4_0 / q4_1: one thread per 32-group
         total = (long long)nt * (n_embd / 32);
     } else if (type_id == 2) {          // q4_K: one per 32-element sub-block
         total = (long long)nt * (n_embd / 256) * 8;
@@ -3631,6 +3665,7 @@ void launch_embed_rows(
         case 0: embed_rows_q8_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 1: embed_rows_q4_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 2: embed_rows_q4_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
+        case 7: embed_rows_q4_1<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 4: embed_rows_q5_1<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 5: embed_rows_q5_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
         case 6: embed_rows_q5_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
