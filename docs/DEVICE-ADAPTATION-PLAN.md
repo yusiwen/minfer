@@ -226,10 +226,13 @@ when a formula basis exists (T2 for ksplit).
 Runs inside the existing `prewarm` window, strictly before any graph capture;
 if prewarm is skipped, the tier table stands (calibration is best-effort).
 
-**Hard rule (review finding R5): auto-selection may only choose among
-variants proven bitwise-identical** (e.g., thread-count variants whose
-reduction differences are exact-zero contributions). Anything that changes
-accumulation order — tile shapes, ksplit depth — is tolerance-class and must
+**Hard rule (review finding R5, evidence-checked): auto-selection may only
+choose among variants proven bitwise-identical by a byte-equal harness gate.**
+The one documented pair today is p32 vs the raw q8_0 MMVQ kernel (doc 104:39,
+:68 — byte-equal on all five verified shapes). Claims without such a gate
+(e.g. hypothetical thread-count variants) do not qualify — when in doubt, a
+variant is treated as tolerance-class. Anything that changes accumulation
+order — tile shapes, ksplit depth — is tolerance-class and must
 remain pinned by tables/formulas, never by timing; otherwise cross-run greedy
 reproducibility on the same device breaks. Non-bitwise knobs get one-time,
 version-boundary changes with a full gate rerun instead.
