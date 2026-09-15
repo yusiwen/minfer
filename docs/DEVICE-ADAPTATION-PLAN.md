@@ -1,9 +1,13 @@
 # Device Adaptation Layer — Design Plan (T-series)
 
-**Status**: 📐 proposed (not implemented). This document consolidates the design
-workspan from the post-doc-104 review sessions: minfer's device-parameter gating
-audited against llama.cpp's, a GB10 tier cross-check, and a three-phase plan to
-make minfer's dispatch adapt to devices it has never been measured on.
+**Status**: ✅ T1 + T2 LANDED on branch `device-adaptation` (T1 = `7793419`
++ doc 105, T2 = `0b2258c` + doc 106; review pass: LGTM, 0 blockers — 3
+SHOULD-FIXes applied in the follow-up commit). T3 (auto-calibration) and the
+T2 tile-candidate search remain deferred by design — see §12 and the T2
+closure notes. This document consolidates the design workspan from the
+post-doc-104 review sessions: minfer's device-parameter gating audited
+against llama.cpp's, a GB10 tier cross-check, and a three-phase plan to make
+minfer's dispatch adapt to devices it has never been measured on.
 
 Naming: campaign **T-series (Tiering)**, deliverable module **设备适配层 /
 Device Adaptation Layer**, code `src/device_tier.rs`. Doc numbering for the
@@ -157,7 +161,7 @@ that llama.cpp cannot express.
 | 1200 | Blackwell consumer (RTX 5090/5080/5070) | default 8; **q4_K → 5, q5_K → 6, q6_K → 7** | yes | Adopted | llama.cpp mmvq.cu:335 (tuned on RTX 5090) |
 | 89 | Ada (RTX 4090/4080/4070) | 8 (their overrides touch only unsupported q2_k/q3_k) | yes | Adopted | llama.cpp mmvq.cu:323 (tuned on RTX 4090) |
 | 86 | Ampere (RTX 3090/3080/3070/3060) | 8 | yes | Adopted | llama.cpp generic — no Ampere batch specialization exists |
-| 870 | Jetson Orin (Nano/NX/AGX, owner has an Orin Nano) | default 8; **q4_K/q5_K/q6_K → 1** | yes | Adopted | llama.cpp mmvq.cu:368 (tuned for Jetson Orin, key 870, common.cuh:55); field TODO §9.1 |
+| 870 | Jetson Orin (Nano/NX/AGX, owner has an Orin Nano) | default 8; **q4_K/q5_K/q6_K → 1** | yes | Adopted | llama.cpp mmvq.cu:356 (tuned for Jetson Orin, key 870, common.cuh:55); field TODO §9.2 |
 | 75 | Turing (RTX 2080/2060) | 8 | **no** | Adopted / provisional | batch: generic; mmq: divergence ruling #4 (§9, field TODO §9.1) |
 | −1 | GENERIC (unknown, incl. Pascal GTX 10-series) | 8 | cc ≥ 800 | Generic | fallback convention; Pascal resolves here with batch 8 + no MMQ, so no dedicated row is needed |
 
@@ -375,6 +379,20 @@ caveats shape this experiment:
 
 T1 (half day) → T2 (one day; item 4 optional/last) → T3 (later, independent).
 Each phase = one doc (`105-…`, `106-…`, `107-…`) + the full gate set.
+
+**Actual outcome (2026-09-16)**: T1 + T2 landed as `7793419` (doc 105) and
+`0b2258c` (doc 106). T2 item 4 (tile candidates) NOT built — same deferral
+rationale as the batch-cap activation (§14 R8): both wait on the Orin Nano
+field A/B that decides whether a small-nt BT destination is worth building.
+T3 untouched (its value materializes only on devices minfer has not
+measured; on the one measured device it can only reproduce the table).
+R9 (build.rs nvcc candidates "87"/"88") also deferred — it is the Orin Nano
+build prerequisite, to land with the §9.2 field campaign. All acceptance
+gates passed at close: suite 196/0/3; forced-tier soaks 890/870/750/610 all
+196/0/3; identity battery 4/4 (native AND forced-750); tg128 7B Q8_0
+32.19 ± 0.01 (doc-104 baseline band); interleaved A/B vs master (doc 77
+method): C1–C5 all within the doc-101 repetition band, ksplit-firing pp32
+dead even — zero GB10 impact, empirically confirmed.
 
 ## 13. Explicitly out of scope (pointer)
 

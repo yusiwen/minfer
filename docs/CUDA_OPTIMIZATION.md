@@ -490,7 +490,8 @@ promotion round, so they are not in the table above:
 | `MINFER_NO_Q80_P32` | off | `1` reverts the q8_0 p32 split planes and their dispatch (doc 104) |
 | `MINFER_Q6K_PF` | on | `0` disables the q6_K prefetching MMVQ form (D4-2) |
 | `MINFER_SMALL_M_GEMM` | off | `1` routes nt 2..8 into the mma BT path (doc 91; measured ~1.7× worse) |
-| `MINFER_MMQ_KSPLIT_TARGET` | 256 | target resident-block count for the auto-K-split (doc 92) |
+| `MINFER_MMQ_KSPLIT_TARGET` | max(256, 2×SM) | target resident-block count for the auto-K-split (doc 92; doc 106 SM-parameterized — GB10 keeps 256; an explicit value overrides the formula) |
+| `MINFER_DEVICE_TIER` | off | llama.cpp-style tier key forced onto the selector, e.g. `870` (Orin) / `750` (Turing, MMQ off) / `-1` (GENERIC) — soak-test override for the doc-105 device tier tables; the banner logs it as FORCED |
 
 Instrument / harness (not backend gates): the `specverify` instrument reads
 `MINFER_SPECVERIFY_WARMUP_MS` / `_NTS` / `_NOUT`, spec round tracing uses

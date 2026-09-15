@@ -38,6 +38,7 @@ The performance headline of the project. The int8 tensor-core MMQ path is **defa
 - Raw-nibble int8 `mma.m16n8k32` GEMMs for q4_K and q6_K with producer-fused activation quantization (rms-norm/swiglu emit the transposed q8 plane directly, skipping intermediate writes), registration-time weight-expansion planes (W_exp / W_dsc) staged by `cp.async`, and flash attention with register-resident softmax (2.43× kernel).
 - CUDA Graph capture/replay for repeated identical-length prefills; decode uses the MMVQ weight-streaming path.
 - Memory/speed knobs: the weight-expansion planes cost ~3.3 GB device for ~+6% prefill; `MINFER_MMQ_Q6K_EXP=0` / `MINFER_MMQ_Q4K_DSC=0` return the memory.
+- Device adaptation (doc 105): the CUDA banner reports the resolved device tier — `CUDA: device tier <name> (<provenance>, mmq <bool>)` — from a cc-keyed table (GB10 measured; consumer GPUs adopted from llama.cpp; unknown → GENERIC). Dispatch gates (MMQ prefill availability, future batch caps) read the tier; on foreign devices the smem/VRAM feasibility checks self-degrade to slower-but-correct paths. `MINFER_DEVICE_TIER=<key>` forces a row for soak testing.
 
 ## Model Support
 

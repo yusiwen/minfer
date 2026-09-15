@@ -78,6 +78,7 @@ there is never a silent mid-run fallback.
 |---|---|---|
 | Graph executor | `src/graph/cuda_backend.rs` | Implements `Backend`: device buffer pool, per-op dispatch, positions conversion, CUDA Graph state machine, trace staging, error contract |
 | Device layer | `src/cuda.rs` | `CudaState` singleton: device probe, weight registry, the one stream + stream lock, `extern "C"` kernel launchers, CUDA Graph API, pinned/staging memory, MMQ caches and gate reads |
+| Device tier table | `src/device_tier.rs` | cc-keyed tier rows (measured GB10 + llama.cpp-adopted consumer rows + GENERIC) resolved once at init; feeds the MMQ gate, smem feasibility and plane-VRAM budget checks. Design + status: `DEVICE-ADAPTATION-PLAN.md`, docs 105–106 |
 | Kernels | `src/cuda_kernels.cu` | The `__global__` kernels (quantized matmul families, attention, norms, elementwise, KV store, embedding gather, quantize planes) |
 | Build chain | `build.rs` | Opt-in `--features cuda`, nvcc/`-ccbin` probe, per-arch SASS/PTX (incl. native sm_121), cudart link + rpath |
 
