@@ -53,8 +53,11 @@ still succeeds and the shader is compiled from source at first run.
   `MINFER_CUDA_CCBIN=/path/to/g++`.
 - GPU architectures are auto-detected from what the toolkit accepts (SASS for
   `sm_70`…`sm_121` as available, plus PTX for the highest and a backward-JIT
-  `compute_70`/`compute_72` PTX) — one binary covers older and newer GPUs. The
-  minimum is **sm_70 (Volta)**: the kernels in `cuda_kernels.cu` use WMMA tensor
+  `compute_70`/`compute_72` PTX) — one binary covers older and newer GPUs.
+  The candidate list includes **sm_87/sm_88 (Jetson Orin)** explicitly: the
+  device-tier gate routes sm_87 to the int8 BT path, which is compiled out of
+  any PTX below sm_80 — native SASS per target is mandatory because PTX JITs
+  forward only (docs 105–106, plan §14 R9). The minimum is **sm_70 (Volta)**: the kernels in `cuda_kernels.cu` use WMMA tensor
   cores (`nvcuda::wmma`), which require sm_70+, so Pascal (sm_61) is not a
   target. The Volta V100/Titan-V (sm_70/72) PTX is only emitted when nvcc
   supports it: CUDA 12.x does, **CUDA 13 removed Volta**, so keep Volta coverage

@@ -386,8 +386,10 @@ rationale as the batch-cap activation (§14 R8): both wait on the Orin Nano
 field A/B that decides whether a small-nt BT destination is worth building.
 T3 untouched (its value materializes only on devices minfer has not
 measured; on the one measured device it can only reproduce the table).
-R9 (build.rs nvcc candidates "87"/"88") also deferred — it is the Orin Nano
-build prerequisite, to land with the §9.2 field campaign. All acceptance
+R9 (build.rs nvcc candidates "87"/"88") was ruled to land EARLY at campaign
+close (2026-09-16) — it is the Orin Nano build prerequisite, and with it on
+the branch a GB10-built binary carries Orin SASS ready for the §9.2 field
+campaign (BUILD.md documents the native-SASS-per-target requirement). All acceptance
 gates passed at close: suite 196/0/3; forced-tier soaks 890/870/750/610 all
 196/0/3; identity battery 4/4 (native AND forced-750); tg128 7B Q8_0
 32.19 ± 0.01 (doc-104 baseline band); interleaved A/B vs master (doc 77

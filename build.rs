@@ -530,8 +530,12 @@ fn detect_host_compiler(nvcc: &str, out_dir: &str, include_flag: &str) -> Option
 /// is still supported through CUDA 12.x (CUDA 13 removed it, so the probe skips
 /// it there).
 fn detect_archs(nvcc: &str, out_dir: &str, include_flag: &str, ccbin: Option<&str>) -> Vec<String> {
+    // 87/88 (Orin) are in the list because the runtime tier gate (docs 105-106,
+    // plan §14 R9) routes sm_87 to the int8 BT path — and that path is compiled
+    // out of any PTX below sm_80, so native SASS per target is mandatory (PTX
+    // JITs forward only; compute_121 PTX cannot serve an sm_87 GPU).
     let candidates = [
-        "70", "72", "75", "80", "86", "89", "90", "100", "103", "110", "120", "121",
+        "70", "72", "75", "80", "86", "87", "88", "89", "90", "100", "103", "110", "120", "121",
     ];
     let test_dir = format!("{out_dir}/nvcc_arch_test");
     let _ = std::fs::create_dir_all(&test_dir);

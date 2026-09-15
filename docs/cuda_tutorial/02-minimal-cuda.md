@@ -684,9 +684,9 @@ compilation) does the whole pipeline:
    nvcc's default first, then `g++-15 … g++-11, g++, clang++`; the winner is
    passed as `-ccbin` (`build.rs:201-220`, `:255-258`), and
    `MINFER_CUDA_CCBIN` overrides the probe.
-4. **Probe the architectures.** `detect_archs()` (`build.rs:532-559`)
+4. **Probe the architectures.** `detect_archs()` (`build.rs:532-561`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
-   `sm_121` (`build.rs:533-535`) and keeps the ones this nvcc accepts —
+   `sm_121` (`build.rs:537-539`) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
    so one list works on every CUDA version. (The floor is sm_70, not Pascal:
    the prefill GEMM uses WMMA tensor-core intrinsics that require Volta+,
