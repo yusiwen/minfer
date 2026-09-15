@@ -106,10 +106,23 @@ pub enum Vendor { Nvidia, Amd, Mthreads, Apple, Unknown }
 pub struct DeviceKey { pub vendor: Vendor, pub cap_key: u32 }
 // Nvidia: cc (1210); Amd: llama.cpp offset scheme; Apple: chip generation.
 
+/// Where a tier's numbers come from — the data-model encoding of the
+/// adoption principle in §5.2 ("measured on a device where we matched or
+/// beat llama.cpp → ours; untested devices → theirs").
+pub enum Provenance {
+    /// minfer measured on this device; parity-or-better vs llama.cpp verified.
+    Measured,
+    /// Adopted from llama.cpp community tables; never run on minfer.
+    Adopted,
+    /// Fallback convention for unknown devices.
+    Generic,
+}
+
 pub struct DeviceTier {
     pub key: DeviceKey,
     pub name: &'static str,
     pub source: &'static str,          // provenance: minfer doc or llama.cpp file:line
+    pub provenance: Provenance,        // drives future Adopted → Measured promotion
     pub mmvq_batch_default: i32,       // batch limit for quantized decode kernels
     pub mmvq_batch_by_type: &'static [(QuantClass, i32)],  // per-type overrides (sparse)
     pub mmq_available: bool,           // int8 BT path availability
@@ -125,18 +138,35 @@ CUDA-semantic until a second backend actually populates rows.
 
 ### 5.2 Tier table contents
 
-| key | name | mmvq_batch | mmq | source |
-|---|---|---|---|---|
-| 1210 | DGX Spark GB10 | 8 (all supported types) | yes | **minfer docs 94–104 (measured)**; agrees with llama.cpp mmvq.cu:349 |
-| 1200 | Blackwell (5090 tier) | default 8; q4_k → 5, q5_k → 6, q6_k → 7 | yes | llama.cpp mmvq.cu:335 (tuned on RTX 5090) |
-| 89 | Ada (4090 tier) | default 8 (no overrides for supported types) | yes | llama.cpp mmvq.cu:325 (tuned on RTX 4090) |
-| 86 | Ampere | 8 | yes | llama.cpp generic (no ampere-specific mmvq overrides) |
-| 75 | Turing | 8 | **no** | divergence ruling #4 (§9) |
-| −1 | GENERIC (unknown) | 8 | cc ≥ 800 | llama.cpp fallback convention |
+**Adoption principle** (ruled 2026-09-14): on devices where minfer has been
+measured at parity or better vs llama.cpp, minfer's own values win; on devices
+minfer has never been measured on, llama.cpp's community-calibrated values are
+adopted. The principle applies **per knob, not just per device**: knobs that
+exist on both sides (batch thresholds) get adopted; knobs tied to kernel
+internals that differ structurally (launch configs — their nwarps tables
+cannot drive minfer kernels) keep minfer values and lean on the
+correctness-first property (every kernel choice is correct everywhere; only
+performance varies). Note the principle never has to adjudicate on GB10: the
+§8 cross-check showed the directly comparable values already agree there — its
+real job is protecting minfer-only knobs (p32 planes, 8c branch, shape floors)
+that llama.cpp cannot express.
 
-Q2_K / Q3_K / IQ* rows from llama.cpp are dropped (minfer does not support
-these types). License note: llama.cpp is MIT; every adopted row carries an
-attribution comment.
+| key | name | mmvq_batch | mmq | provenance | source |
+|---|---|---|---|---|---|
+| 1210 | DGX Spark GB10 | 8 (all supported types) | yes | **Measured** | minfer docs 94–104; agrees with llama.cpp mmvq.cu:349 |
+| 1200 | Blackwell consumer (RTX 5090/5080/5070) | default 8; **q4_K → 5, q5_K → 6, q6_K → 7** | yes | Adopted | llama.cpp mmvq.cu:335 (tuned on RTX 5090) |
+| 89 | Ada (RTX 4090/4080/4070) | 8 (their overrides touch only unsupported q2_k/q3_k) | yes | Adopted | llama.cpp mmvq.cu:323 (tuned on RTX 4090) |
+| 86 | Ampere (RTX 3090/3080/3070/3060) | 8 | yes | Adopted | llama.cpp generic — no Ampere batch specialization exists |
+| 75 | Turing (RTX 2080/2060) | 8 | **no** | Adopted / provisional | batch: generic; mmq: divergence ruling #4 (§9, field TODO §9.1) |
+| −1 | GENERIC (unknown, incl. Pascal GTX 10-series) | 8 | cc ≥ 800 | Generic | fallback convention; Pascal resolves here with batch 8 + no MMQ, so no dedicated row is needed |
+
+Scope notes from the source audit: llama.cpp's NVIDIA batch specializations in
+`should_use_mmvq` are **exactly Ada and Blackwell** (plus DGX Spark, which we
+own, and Jetson Orin, ruled out — OQ3); Ampere/Turing have no batch
+specializations and fall through to the generic ≤ 8. Q2_K / Q3_K / IQ* rows
+are dropped (unsupported types), which is why the Ada tier carries no
+overrides for minfer's types. License note: llama.cpp is MIT; every adopted
+row carries an attribution comment.
 
 ### 5.3 Selection algorithm
 
@@ -224,12 +254,50 @@ agree exactly on this machine; the only true data disagreement is #4.
 
 ## 9. Divergence rulings
 
-- **#4 sm_75 MMQ**: keep minfer's conservative `cc ≥ 800`. Turing MMA layouts
-  differ from Ampere; porting BT for one legacy card costs more than it
-  returns. The 75 tier row encodes `mmq_available = false` with a comment
-  citing this ruling. *(Pending final user confirmation.)*
+- **#4 sm_75 MMQ**: keep minfer's conservative `cc ≥ 800` for now — the
+  ruling is **provisional**, pending field measurement on an RTX 2080 Ti
+  (§9.1). The 75 tier row encodes `mmq_available = false` with a comment
+  citing this ruling.
 - #3/#5/#6/#7/#8: keep current values — each has minfer measurements behind it
   or is a competitive advantage with no llama.cpp counterpart.
+
+### 9.1 Field-measurement TODO — RTX 2080 Ti (sm_75)
+
+A 2080 Ti is available to the project owner. This is the first foreign-device
+measurement opportunity and doubles as the T1 field-validation run.
+
+**What runs on it today (zero new code needed — sm_75 is already a build
+target, build.rs:534):** MMVQ family (dp4a works on Turing), f16 GEMM prefill
+(`gemm_f16_nt` compiles for sm_75), f32 fallbacks. The BT kernel family is
+**compile-time excluded** on sm_75 (`#if __CUDA_ARCH__ >= 800` guards in
+cuda_kernels.cu) on top of the runtime `cc ≥ 800` gate — so a Turing run
+exercises everything except BT.
+
+**Phase A — T1 validation + #4 data (no code changes):**
+
+1. Build (`--features cuda`) and run the full suite + identity battery on the
+   2080 Ti; confirm the 75 tier resolves (batch 8, mmq off) and everything
+   passes — correctness must be device-independent.
+2. tg128 A/B vs llama-bench (same window discipline as the GB10 campaign).
+   Expected shape: decode competitive (MMVQ vs their MMVQ), prefill behind
+   (our f16 GEMM vs their Turing int8 MMQ). The size of the prefill gap is
+   the decision input.
+
+**Phase B — outcome branches:**
+
+- If the prefill gap is small or the owner deems it acceptable: close #4 as
+  "conservative by choice", promote the 75 row's mmq ruling from provisional
+  to final, and flip its provenance toward Measured.
+- If the gap is large: two candidate remedies, to be scoped then:
+  (a) port BT to Turing MMA layouts (Turing has int8 MMA but different
+  instruction shapes than Ampere — a real kernel campaign, llama.cpp ships
+  separate Turing paths for exactly this reason), or
+  (b) the cheaper cuBLAS prefill fallback for cc < 800 (per the cuBLAS
+  analysis, Turing is precisely where a cuBLAS fallback is strongest relative
+  to hand-written code).
+
+Either way the measurement promotes the 75 row from Adopted to Measured for
+the knobs it covers — the first exercise of the provenance workflow.
 
 ## 10. Cross-vendor extension
 
@@ -296,17 +364,18 @@ layer here is a prerequisite consumer of its decisions.
 
 ## 15. Open questions
 
-- OQ1: should the 1200-tier per-type overrides be adopted verbatim when they
-  were tuned on RTX 5090 (GB10's big sibling, 170 SMs) while GB10 itself
-  measures 8 everywhere? Adopting is self-consistent (their card, their
-  numbers) but untested on minfer kernels. Default: adopt verbatim with
-  provenance; revisit with the first real Blackwell-consumer report.
-- OQ2: T2's tile candidate search changes accumulation order for foreign
-  shapes only if it picks a different tile than today's fixed 64×64 — on GB10
-  the assertion pins 64×64; on foreign devices the output changes once at
-  adoption. Confirm this is acceptable at the T2 boundary (it is the same
-  class of change as any kernel improvement, gated by the suite + battery).
-- OQ3: does the Orin-style tier (mmvq_batch < 8 for some types) deserve a row
-  in T1, given minfer cannot validate it? Default: omit until a consumer
-  exists; the GENERIC fallback covers unknown devices more honestly than an
+All three resolved by ruling (2026-09-14), see §5.2 / §9:
+
+- **OQ1 — resolved**: adopt consumer-GPU tiers only. The audited scope is
+  smaller than expected: llama.cpp's NVIDIA batch specializations are exactly
+  Ada and Blackwell-consumer, so the only non-trivial adoption is the 1200
+  tier's q4_K/q5_K/q6_K overrides (tuned on RTX 5090). Ampere/Turing carry
+  generic values. The adopted-vs-measured distinction is carried by the
+  `Provenance` field.
+- **OQ2 — resolved by the adoption principle**: the tile candidate search is
+  untested territory for minfer → follow llama.cpp's proven approach (J-search
+  + smem filter); GB10 pinned to 64×64 by test assertion; the one-time
+  tolerance-class change on foreign devices is accepted at the T2 boundary.
+- **OQ3 — resolved**: Jetson Orin rows are dropped per the consumer-only
+  scope; the GENERIC fallback covers unknown devices more honestly than an
   untested copied row.
