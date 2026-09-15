@@ -6,6 +6,7 @@ mod cache;
 mod conversation;
 #[cfg(feature = "cuda")]
 mod cuda;
+mod device_tier;
 mod download;
 mod dump;
 mod gguf;

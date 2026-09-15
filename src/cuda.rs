@@ -9,6 +9,7 @@
 // module-wide opt-out (7e⑦).
 
 use crate::block::Q8B;
+use crate::device_tier;
 use crate::tensor::{Tensor, TensorType};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1163,9 +1164,27 @@ pub struct CudaState {
     /// loaded models resident on a shared overcommitted CUDA pool and a
     /// +1-2 GB cache per loaded model tipped it over (probability OOMs).
     w16_enabled: std::sync::atomic::AtomicBool,
-    /// R1: device compute capability ×100 (e.g. 1210 = sm_12.1), read once at
-    /// init. Gates the int8-mma MMQ prefill path (needs sm_80+ — mma.m16n8k32).
+    /// R1: device compute capability ×100 in `major*100 + minor` encoding
+    /// (GB10 sm_12.1 → 1201; note: NOT the llama.cpp tier-key encoding
+    /// 1210 — see `device_tier::llama_key`), read once at init. Gates the
+    /// int8-mma MMQ prefill path (needs sm_80+ — mma.m16n8k32).
+    /// Test-only readers today (cuda_backend probe tests); the tier selector
+    /// consumes the value at init before the field is stored.
+    #[allow(dead_code)]
     cc: std::sync::atomic::AtomicI32,
+    /// T1: resolved device tier (plan §5) — exact key match → family
+    /// inheritance → GENERIC. Resolved once at init (also honors the
+    /// MINFER_DEVICE_TIER override); dispatch reads plain fields, never
+    /// re-scans the table. Direct consumers arrive with the batch-cap
+    /// activation (plan §14 R8); the effective gate travels via `tier_mmq`.
+    #[allow(dead_code)]
+    tier: &'static device_tier::DeviceTier,
+    /// T1: effective MMQ gate — the tier's own flag, or `cc >= 800` for the
+    /// GENERIC row (unknown architectures keep the conservative gate).
+    tier_mmq: bool,
+    /// T2: SM count (queried at init, previously print-only) — feeds the
+    /// auto-ksplit target parameterization.
+    sm_count: i32,
     /// r60: true while every quantized weight registered on this device is
     /// NB-BT-consumable (q4_K / q6_K) — the r52 mode-2 (skip-write fused
     /// producer) window proof assumes the fused pad40_t plane is consumed
@@ -1520,6 +1539,32 @@ impl CudaState {
             total_mem / 1048576,
             sm_count
         );
+        // T1: resolve the device tier (plan §5.3). MINFER_DEVICE_TIER=<key>
+        // forces a row by llama.cpp-style key (1210/1200/890/870/860/750) —
+        // the forced-tier soak runs the whole suite under a foreign tier to
+        // prove gates only ever choose among correct kernels.
+        let cc_val = major * 100 + minor;
+        let (tier, tier_mmq) = match std::env::var("MINFER_DEVICE_TIER")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            Some(key) => {
+                let s = device_tier::select_forced(key);
+                eprintln!(
+                    "CUDA: device tier FORCED {} ({:?}, mmq {}) — key {}",
+                    s.tier.name, s.tier.provenance, s.mmq_available, key
+                );
+                (s.tier, s.mmq_available)
+            }
+            None => {
+                let s = device_tier::select(cc_val);
+                eprintln!(
+                    "CUDA: device tier {} ({:?}, mmq {})",
+                    s.tier.name, s.tier.provenance, s.mmq_available
+                );
+                (s.tier, s.mmq_available)
+            }
+        };
 
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
         // Eager dynamic-smem opt-in for the prefill GEMM instantiations:
@@ -1537,6 +1582,9 @@ impl CudaState {
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
+            tier,
+            tier_mmq,
+            sm_count,
             nb_bt_only: std::sync::atomic::AtomicBool::new(true),
             padded_weights: Mutex::new(HashMap::new()),
             q80_p32: Mutex::new(HashMap::new()),
@@ -2692,6 +2740,13 @@ impl CudaState {
             return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
         }
         let stream = self.stream();
+        // T1 tier note (plan §5.4/§14 R8): the resolved tier's per-type batch
+        // limits are tabled and unit-tested (`device_tier::mmvq_cap`) but NOT
+        // wired into the decode arms yet — a limit < 8 has no destination for
+        // the vacated nt range (BT starts at nt >= 9; the MINFER_SMALL_M_GEMM
+        // experiment measured ~1.7x over multi-MMVQ at small nt, doc 91) and
+        // would strip the spec identity family (R3). Activation waits for a
+        // small-nt BT destination (T2 tile candidates) or field A/B data.
         macro_rules! launch {
             ($f:ident) => {{
                 unsafe {
@@ -2925,12 +2980,16 @@ impl CudaState {
     /// sm_75 only has k16) and opted in via MINFER_MMQ=1. The loader also
     /// uses this to skip the f16 cache warm pass (MMQ streams raw weight
     /// bytes; the w16 copy would be dead weight).
+    /// T1: the sm_80+ check is now the resolved tier's MMQ flag
+    /// (`tier_mmq`: table flag, or `cc >= 800` for the GENERIC row) — same
+    /// verdict on every currently-built-for device, tier-aware elsewhere.
     pub fn mmq_active(&self) -> bool {
-        self.cc.load(std::sync::atomic::Ordering::Relaxed) >= 800 && Self::mmq_enabled()
+        self.tier_mmq && Self::mmq_enabled()
     }
 
-    /// Device compute capability × 100 (e.g. 1210 = sm_121); 0 when no
-    /// device is initialized. Used by tests to gate sm_80+ kernels.
+    /// Device compute capability in `major*100 + minor` encoding (GB10
+    /// sm_12.1 = 1201); 0 when no device is initialized. Used by tests to
+    /// gate sm_80+ kernels.
     #[cfg(test)]
     pub fn cc(&self) -> i32 {
         self.cc.load(std::sync::atomic::Ordering::Relaxed)
