@@ -143,8 +143,8 @@ is why `matmul_f32_ptr_layout` — the single dispatch every CUDA matmul flows
 through — opens with a token-count gate:
 
 ```rust
-// src/cuda.rs:2556-2575 (dispatch gate; abridged comment)
-if nt >= 9
+// cuda.rs:2754-2776 (dispatch gate; abridged comment)
+if (nt >= 9 || small_m_gemm)
     && id % 32 == 0
     && !Self::no_prefill_gemm()
     && matches!(ttype, TensorType::Q4_0 | TensorType::Q4_1
@@ -152,7 +152,9 @@ if nt >= 9
         | TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K)
 {
     if self.mmq_active() {
-        return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k);
+        // doc 92 resolution: auto-ksplit is the DEFAULT for every route
+        // into the BT GEMM (ksplit_req = -1 lets prefill_mmq decide).
+        return self.prefill_mmq(wptr, ttype, x, out, od, id, nt, padded_q6k, ksplit_req);
     }
     return self.prefill_gemm_f16(wptr, ttype, x, out, od, id, nt, padded_q6k);
 }
@@ -164,7 +166,10 @@ kernels that keep the f32 activations and optimize for weight streaming.
 There is even a middle band: `nt` 2–8 runs *multi-token MMVQ* — MMVQ with an
 in-block token loop — because a batch that small still cannot fill GEMM
 tiles, but re-running the whole per-token path per token wastes weight reads
-(Step 82, `docs/CUDA_OPTIMIZATION.md` §0 row 82).
+(Step 82, `docs/CUDA_OPTIMIZATION.md` §0 row 82). The `small_m_gemm` term in
+the gate is the doc-91 experiment knob (`MINFER_SMALL_M_GEMM=1`) that routes
+that middle band into the BT path instead — measured ~1.7× *slower* than
+multi-MMVQ at small nt, so it stays off by default.
 
 So the answer to "why does prefill use int8 MMQ while decode uses a different
 path?" is not taste — it is which resource is scarce in each phase:
@@ -442,9 +447,12 @@ stream, queries the device properties at run time — SM count, compute
 capability, free/total memory, name — and prints the banner you see at
 startup (`CUDA: using ... (SM 12.1, ... MB, ... SMs)`). Two details are
 load-bearing beyond the boilerplate: the compute capability is stored as an
-integer (`major*100 + minor`) and later gates the int8 MMQ path
-(`mmq_active` requires `cc >= 800`, i.e. sm_80+, because `mma.m16n8k32`
-exists only from Ampere on); and `gemm_prefill_smem_init()` runs *eagerly* —
+integer (`major*100 + minor`) and feeds the device-tier resolution
+(`src/device_tier.rs`, docs 105–106) — the resolved tier's MMQ availability
+plus a dynamic-smem feasibility check gate the int8 MMQ path
+(`mmq_active()`; the fallback rule for unknown devices is still `cc >= 800`,
+i.e. sm_80+, because `mma.m16n8k32` exists only from Ampere on); and
+`gemm_prefill_smem_init()` runs *eagerly* —
 opting the prefill GEMM into >48 KB dynamic shared memory is illegal inside
 a stream-capture window, so it must happen before any capture can open.
 
@@ -452,7 +460,7 @@ Weights register through `register_weight` — a `cudaMalloc` plus one
 blocking H2D `cudaMemcpy` of the raw GGUF bytes:
 
 ```rust
-// src/cuda.rs:1528-1561 (core of register_weight)
+// cuda.rs:1701-1737 (core of register_weight)
 let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
 if err != 0 || ptr.is_null() {
@@ -668,7 +676,7 @@ GEMM). What falls through is the decode-side dispatch, and reading one arm
 teaches you the shape of all of them:
 
 ```rust
-// src/cuda.rs:2628-2644 (Q4_K arm; abridged comment)
+// cuda.rs:2886-2902 (Q4_K arm; abridged comment)
 TensorType::Q4_K => {
     // 8e-reversal: decode (nt == 1) runs the MMVQ structure
     // (dp4a over q8 activations, one row per 256-thread block) —
@@ -725,7 +733,7 @@ picks the Q6_K block stride (224 padded vs 210 raw), and then walks a
 first and each failure falls through cleanly:
 
 ```rust
-// src/cuda.rs:3356-3413 (the q4_K raw-byte branch, abridged)
+// cuda.rs:3652-3727 (the q4_K raw-byte branch, abridged)
 // P6: raw-byte staging variant (q4_K, whole super-blocks only).
 // Same quantized activations; the GEMM stages RAW weight bytes via
 // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
@@ -767,7 +775,7 @@ fail — which is how the ladder degrades to the generic `launch_mmq_nt`
 fallback at the bottom:
 
 ```rust
-// src/cuda.rs:3504-3521 (generic tail)
+// cuda.rs:3820-3837 (generic tail)
 unsafe {
     let q8 = self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
     if q8 == 0 {
@@ -795,7 +803,7 @@ correctness fallbacks are not, and the code keeps the distinction visible.
 
 #### 3.2.7 Split-KV attention, the kernel
 
-The host side (`gqa_attn_split`, `cuda.rs:4169`) computes the partial-row
+The host side (`gqa_attn_split`, `cuda.rs:4558`) computes the partial-row
 stride `pstr = (4 + hd + 3) & !3` (running max, running sum, then the
 `hd`-wide output accumulator, rounded to a 16-byte boundary for the `float4`
 writes), grows the partials scratch *once* (a fixed `[32][nh][pstr]` slab —
@@ -1052,7 +1060,7 @@ i32 conversion), because at a boundary the pool reuses buffer ids for
 The sync itself is bounded and checked, per GPU_SAFETY:
 
 ```rust
-// src/cuda.rs:2200-2209
+// cuda.rs:2392-2401
 pub fn sync(&self) {
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
@@ -1090,7 +1098,7 @@ against the `mma` instruction, and the plan doc lists "cuBLAS paths" under
 deliberately-skipped llama.cpp machinery. The payoff is that weights are
 *never* materialized in f32 — the 8p f16 cache, the one exception, costs
 +8.6 GB on 7B and was itself made obsolete by MMQ (the MMQ gate skips the
-warm pass, `cuda.rs:2762-2765`).
+warm pass, `cuda.rs:3022-3025`).
 
 **Why is capture keyed on `(uid, range, pool_gen)` instead of llama.cpp's
 node-props snapshot?** llama.cpp memcmps per-node properties and can update a

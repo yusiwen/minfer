@@ -514,7 +514,7 @@ from llama.cpp (the MMQ analysis doc), then re-derived kernel by kernel over
   64-token-blocked layout), the raw-byte NB/BT GEMM family
   (`mmq_raw_nb_bt_kernel` :6656, q6_K variant :6976), dispatched for
   `nt ≥ 16` under the `MINFER_MMQ` gate read through `CudaState::mmq_gate_on`
-  (`src/cuda.rs:2896`).
+  (`cuda.rs:2992`).
 - **Step records**: [08-r1-int8-mmq-prefill-gemm.md](../cuda_optimization_steps/08-r1-int8-mmq-prefill-gemm.md)
   (R1: parity-first strategy — "parity-clean but ~2.9 TMAC/s vs llama ~24: the
   8× gap was unprofiled"), the r9→r59 redesign ladder
