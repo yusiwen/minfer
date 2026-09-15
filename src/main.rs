@@ -6,6 +6,9 @@ mod cache;
 mod conversation;
 #[cfg(feature = "cuda")]
 mod cuda;
+// Consumers live in the CUDA backend; the offline unit tests still run
+// without the feature, so silence dead-code only in CPU-only builds.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 mod device_tier;
 mod download;
 mod dump;

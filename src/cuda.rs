@@ -1850,11 +1850,14 @@ impl CudaState {
         // re-registration can never collide with (and silently reuse) a stale
         // plane of the same byte size but a different od/id layout.
         let exp_name = format!("{name}__exp{od}x{id}");
-        let exp = Self::expand_q6k_dense(padded, od, id);
-        // T2: budget-gate the device upload of this optional plane.
-        if !self.plane_budget_ok(exp.len()) {
+        // T2: budget-gate BEFORE the host expansion (review NIT #6) — the
+        // dense plane is od*id bytes; a tripped device must not pay the
+        // full host build only to discard it.
+        if !self.plane_budget_ok(od * id) {
             return;
         }
+        let exp = Self::expand_q6k_dense(padded, od, id);
+        debug_assert_eq!(exp.len(), od * id);
         self.register_weight(&exp_name, &exp);
         // the MAP is keyed by the PADDED weight's device pointer (what
         // prefill_mmq holds); the value is the W_exp plane's pointer
@@ -1890,11 +1893,13 @@ impl CudaState {
     pub fn register_weight_q6k_dsc(&self, name: &str, padded: &[u8], od: usize, id: usize) {
         // geometry-encoded sibling name (same rationale as the W_exp name).
         let dsc_name = format!("{name}__dsc{od}x{id}");
-        let dsc = Self::expand_q6k_dsc(padded, od, id);
-        // T2: budget-gate the device upload of this optional plane.
-        if !self.plane_budget_ok(dsc.len()) {
+        // T2: budget-gate BEFORE the host expansion (review NIT #6) — the
+        // dsc plane is (id/32)*od*8 bytes.
+        if !self.plane_budget_ok((id / 32) * od * 8) {
             return;
         }
+        let dsc = Self::expand_q6k_dsc(padded, od, id);
+        debug_assert_eq!(dsc.len(), (id / 32) * od * 8);
         self.register_weight(&dsc_name, &dsc);
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {
@@ -1961,11 +1966,13 @@ impl CudaState {
     pub fn register_weight_q4k_dsc(&self, name: &str, raw: &[u8], od: usize, id: usize) {
         // geometry-encoded sibling name (same rationale as the W_exp name).
         let dsc_name = format!("{name}__q4dsc{od}x{id}");
-        let dsc = Self::expand_q4k_dsc(raw, od, id);
-        // T2: budget-gate the device upload of this optional plane.
-        if !self.plane_budget_ok(dsc.len()) {
+        // T2: budget-gate BEFORE the host expansion (review NIT #6) — the
+        // dsc plane is (id/32)*od*8 bytes.
+        if !self.plane_budget_ok((id / 32) * od * 8) {
             return;
         }
+        let dsc = Self::expand_q4k_dsc(raw, od, id);
+        debug_assert_eq!(dsc.len(), (id / 32) * od * 8);
         self.register_weight(&dsc_name, &dsc);
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {

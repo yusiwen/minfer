@@ -120,7 +120,7 @@ pub const TIERS: &[DeviceTier] = &[
             cap_key: 870,
         },
         name: "Jetson Orin (Nano/NX/AGX)",
-        source: "llama.cpp mmvq.cu:368 (tuned for Jetson Orin); field TODO plan §9.2",
+        source: "llama.cpp mmvq.cu:356 (tuned for Jetson Orin); field TODO plan §9.2",
         provenance: Provenance::Adopted,
         mmvq_batch_default: 8,
         mmvq_batch_by_type: &[(QClass::K4, 1), (QClass::K5, 1), (QClass::K6, 1)],
@@ -133,7 +133,7 @@ pub const TIERS: &[DeviceTier] = &[
         },
         name: "Ada (RTX 4090/4080/4070)",
         source:
-            "llama.cpp mmvq.cu:323 (tuned on RTX 4090); overrides touch only unsupported q2_k/q3_k",
+            "llama.cpp mmvq.cu:324 (tuned on RTX 4090); overrides touch only unsupported q2_k/q3_k",
         provenance: Provenance::Adopted,
         mmvq_batch_default: 8,
         mmvq_batch_by_type: &[],
@@ -215,6 +215,15 @@ pub fn select_forced(llama_style_key: i32) -> Selected {
     select_by_key(llama_style_key, i32::MIN)
 }
 
+/// Family-row lookup by key, NOT by position — the [`TIERS`] doc comment
+/// promises row order is free, so the inheritance chain must never index the
+/// array (reordering rows would otherwise silently misroute the fallback).
+fn family_row(cap_key: i32) -> Option<&'static DeviceTier> {
+    TIERS
+        .iter()
+        .find(|t| t.key.vendor == Vendor::Nvidia && t.key.cap_key == cap_key)
+}
+
 fn select_by_key(key: i32, minfer_cc: i32) -> Selected {
     for tier in TIERS {
         if tier.key.vendor == Vendor::Nvidia && tier.key.cap_key == key {
@@ -224,13 +233,14 @@ fn select_by_key(key: i32, minfer_cc: i32) -> Selected {
             };
         }
     }
-    // Family inheritance (llama.cpp-style fallback chain).
+    // Family inheritance — a minfer extension: llama.cpp matches per-CC by
+    // exact equality, unknown revisions inherit the nearest measured family.
     let family = if key >= 1200 {
-        Some(&TIERS[1]) // Blackwell consumer
+        family_row(1200) // Blackwell consumer
     } else if key >= 800 {
-        Some(&TIERS[4]) // Ampere
+        family_row(860) // Ampere
     } else if key >= 750 {
-        Some(&TIERS[5]) // Turing
+        family_row(750) // Turing
     } else {
         None
     };

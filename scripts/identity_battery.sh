@@ -16,7 +16,7 @@ BIN=./target/release/minfer
 TARGET=${1:-$HOME/.cache/minfer/models/hf/Qwen/Qwen2.5-7B-Instruct-GGUF-q8_0/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf}
 DRAFT=${2:-$HOME/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf}
 N=200
-STRIP='Prefill:|Generated:|Total:|^\[spec\]|^ *$|^---$|^Model loaded|^Vocabulary|^Loaded:|^CUDA:|^CUDA device tier|^GGUF:|bytes \(|tolerate|Loading model|minfer/spec'
+STRIP='Prefill:|Generated:|Total:|^\[spec\]|^ *$|^---$|^Model loaded|^Vocabulary|^Loaded:|^CUDA:|^GGUF:|bytes \(|tolerate|Loading model|minfer/spec'
 
 prompts=(
   "Write a short essay about how rivers shaped the growth of ancient cities, covering water supply, trade routes, and defense."
@@ -30,6 +30,13 @@ for i in "${!prompts[@]}"; do
   p="${prompts[$i]}"
   seq_out=$(timeout 600 "$BIN" --greedy -n "$N" "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
   spec_out=$(timeout 600 "$BIN" --greedy -n "$N" --spec-draft "$DRAFT" --spec-draft-adaptive "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
+  # Empty output = the run failed to produce text (missing binary/model);
+  # an empty-vs-empty pair must NEVER count as an identity pass.
+  if [ -z "$seq_out" ]; then
+    echo "prompt $((i+1)) [${p:0:40}...]: EMPTY OUTPUT (run failed — check binary/model path)"
+    fail=$((fail+1))
+    continue
+  fi
   if [ "$seq_out" == "$spec_out" ]; then
     echo "prompt $((i+1)) [${p:0:40}...]: IDENTICAL"
     pass=$((pass+1))
