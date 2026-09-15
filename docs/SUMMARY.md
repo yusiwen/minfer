@@ -12,10 +12,11 @@
 # Architecture
 
 - [Architecture Overview](./ARCHITECTURE.md)
-- [Roadmap](./ARCHITECTURE-ROADMAP.md)
+- [Architecture Roadmap](./ARCHITECTURE-ROADMAP.md)
 
 # Model Support
 
+- [Model Support Roadmap](./MODEL-SUPPORT-ROADMAP.md)
 - [Qwen2](./QWEN2-SUPPORT.md)
 - [Qwen3](./QWEN3-SUPPORT-PLAN.md)
 

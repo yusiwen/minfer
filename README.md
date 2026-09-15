@@ -85,7 +85,7 @@ buffers with liveness analysis, and executes in per-backend splits:
 flowchart LR
     subgraph GRAPH["build → assign → fuse → alloc → execute"]
         B1["GraphBuilder<br/>build_graph (pure IR)"] --> B2["assign backends<br/>Metal → CUDA → CPU"]
-        B2 --> B3["fuse<br/>SwiGLU / BiasRope (gated)"]
+        B2 --> B3["fuse<br/>SwiGLU + decode fusions (gated)"]
         B3 --> B4["alloc<br/>liveness + persistent KV"]
         B4 --> B5["execute<br/>per split, cross-backend copies"]
     end

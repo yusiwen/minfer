@@ -3,7 +3,22 @@
 This document analyzes minfer's CPU inference performance, compares with
 llama.cpp, and documents optimization attempts and their outcomes.
 
-Last updated: 2026-07-01.
+> **Status and scope (updated 2026-09-15).** This file is a layered record.
+> The sections from the top down to **§Conclusion** are a **2026-07-01
+> snapshot taken before the compute-graph rewrite**: their
+> `src/models/qwen2/forward.rs:NNN` line references point at a file that was
+> **deleted in Phase 6**, and their "minfer is single-threaded" premise no
+> longer holds. The current numbers are in **§"NEON + Threading Overhaul"
+> (2026-08)** below and in `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3.
+>
+> Three of the four "Remaining Optimization Opportunities" from that snapshot
+> have since shipped: **P4 multi-threading** (persistent CPU thread pool,
+> `src/kernel.rs`), **P2 f16 KV cache** (`MINFER_CACHE_TYPE`, auto-selected for
+> 7B-class models), and **flash attention** (on both GPU backends; the CPU path
+> keeps the multi-pass form). **P1 — AVX2 dot products for the K-quant types —
+> is still open** and remains the largest CPU gap: only Q4_0 and Q8_0 have AVX2
+> kernels today (`src/quants.rs`). That gap is tracked in
+> `docs/ARCHITECTURE-ROADMAP.md` §2.7 and `docs/SUPPORT-MATRIX.md`.
 
 ## Current State
 
@@ -343,6 +358,10 @@ minfer and llama.cpp is due to:
 
 ## Remaining Optimization Opportunities
 
+> **Superseded in part (2026-09-15).** P2, P3 and P4 below have shipped since
+> this section was written; **P1 (Q4_K AVX2) is still open**. See the status
+> banner at the top of this document.
+
 ### P1: Q4_K AVX2 Dot Product
 
 **Impact:** Huge for Q4_K models (all matmul operations).
@@ -643,6 +662,13 @@ parallelization if needed.
 ---
 
 ## Conclusion
+
+> **Superseded (2026-09-15).** This conclusion predates the 2026-08
+> NEON/threading work and the compute-graph rewrite: minfer is no longer
+> single-threaded, and the CPU path described as "production-ready for
+> single-threaded use cases" has since gained a persistent thread pool and
+> Q8_K activation quantization. Read §"NEON + Threading Overhaul" for the
+> current state.
 
 The minfer codebase is already well-optimized for single-threaded CPU inference
 on small models. The initial analysis incorrectly identified "scalar hotspots"

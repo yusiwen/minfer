@@ -184,9 +184,14 @@ touch behavior):
 |------|-------|
 | KV context shift | llama.cpp's default overflow handling; MVP rejects with 400 `exceed_context_size_error` (§Error Handling) |
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
-| f16 KV cache | Currently f32 (~2× llama.cpp memory, see §Slot Management) |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
 | Multimodal content arrays / embeddings / tools | Non-goals (MVP) |
+
+> **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
+> since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
+> models (`src/metal.rs:141-153`). It is no longer a post-MVP item. See
+> `docs/ARCHITECTURE-ROADMAP.md` §2.4/§2.7 for what remains open around the KV
+> cache (quantized KV, prefix reuse, sequence addressing).
 
 ---
 
@@ -824,9 +829,12 @@ Prerequisite: `Qwen2Graph::forward` currently hardcodes `cparams.n_ctx = hparams
 (`src/models/qwen2/graph.rs`) — this must accept the per-slot `n_ctx` as a parameter, otherwise KV is
 always sized for the model's full max_seq_len (32768 for Qwen2.5-7B) and the division is a no-op.
 
-Memory note: minfer stores KV as **f32** (the allocator pools are `Vec<f32>`); llama.cpp defaults to
-f16. For Qwen2.5-7B at n_ctx 4096 the f32 KV is ~460 MB/slot (vs ~230 MB f16). Sizing n_ctx_slot is
-the only lever the MVP has until an f16 KV store lands — budget it explicitly.
+Memory note: the KV element type is selectable and **auto-selects f16 for
+7B-class models** (`n_layers * n_kv_embd >= 8192`; `MINFER_CACHE_TYPE`
+overrides — `src/metal.rs:141-153`), so the earlier "always f32" figures no
+longer apply. For Qwen2.5-7B at n_ctx 4096 the cache is ~230 MB/slot at f16
+(~460 MB if forced to f32). Sizing n_ctx_slot remains the main lever; a
+quantized KV would be the next one (not implemented).
 
 ### Concurrency Model
 

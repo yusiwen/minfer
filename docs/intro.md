@@ -16,8 +16,9 @@ dependencies**.
 
 - [Architecture](ARCHITECTURE.md) — module map, pipeline, backend layering, adding an arch.
 - [Compute Graph](COMPUTE-GRAPH-DESIGN.md) — the declarative graph design + rewrite record.
+- [Architecture Roadmap](ARCHITECTURE-ROADMAP.md) — system-layer gaps and the prioritized backlog.
 - Backends: [Metal](METAL_OPTIMIZATIONS.md) · [CPU](CPU_OPTIMIZATIONS.md) · [GPU Safety](GPU_SAFETY.md).
-- [Qwen3 Support](QWEN3-SUPPORT-PLAN.md) and the [Architecture Roadmap](ARCHITECTURE-ROADMAP.md).
+- [Qwen3 Support](QWEN3-SUPPORT-PLAN.md) and the [Model Support Roadmap](MODEL-SUPPORT-ROADMAP.md).
 - Tooling: [Debug Dump](debug-dump.md), web visualizer (`viz/`).
 
 > **Build & run**

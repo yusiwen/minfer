@@ -4,9 +4,10 @@
 > and Metal GPU. See **§6 Implementation Record** below; the rest of this
 > document remains the design record the implementation followed.
 
-Status: **Qwen3 is NOT supported by minfer today.** `load_model()` (`src/models/mod.rs`)
-only dispatches on `"qwen2"`; a `general.architecture = "qwen3"` GGUF fails with
-`Unsupported architecture: 'qwen3'` and `main.rs` panics at "load model".
+Status at the time of writing — **historical; superseded by the STATUS banner
+above.** Qwen3 was not supported then: `load_model()` (`src/models/mod.rs`)
+only dispatched on `"qwen2"`, and a `general.architecture = "qwen3"` GGUF
+failed with `Unsupported architecture: 'qwen3'`.
 
 This document analyzes the Qwen3 dense architecture against minfer's existing
 Qwen2 support (which already implements all the primitives Qwen3 needs) and

@@ -76,7 +76,7 @@
 | `metal_backend.rs` | Metal execution (per-op MPS kernels; `cfg(target_os = "macos")`) |
 | `cuda_backend.rs` | CUDA execution (feature-gated): int8 MMQ prefill + MMVQ decode (default-on), split-KV attention, CUDA Graph capture/replay |
 | `scheduler.rs` | assign → split → execute (+ cross-backend copies at split boundaries) |
-| `fusion.rs` | Pattern-matching fusion (SwiGLU/BiasRope), gated by backend `supports_fused` |
+| `fusion.rs` | Pattern-matching fusion (SwiGLU), gated by backend `supports_fused` |
 | `cache.rs` | `GraphCache` — params-only deterministic graph reuse |
 | `params.rs` | `GraphParams`/`CParams`/`GraphType` — the reuse identity |
 | `dot.rs` | Graphviz DOT export (`--dump-graph`) |
@@ -124,7 +124,7 @@ flowchart TD
 
     subgraph GRAPH["every forward: build → assign → fuse → alloc → execute"]
         G1["GraphBuilder<br/>build_graph (pure IR)"] --> G2["assign backends<br/>priority Metal → CUDA → CPU"]
-        G2 --> G3["fuse<br/>SwiGLU / BiasRope (gated)"]
+        G2 --> G3["fuse<br/>SwiGLU + decode fusions (gated)"]
         G3 --> G4["alloc<br/>liveness + persistent KV"]
         G4 --> G5["execute<br/>per split, cross-backend copies"]
     end
@@ -389,8 +389,13 @@ type remains only as CLI plumbing.
 6. If needed, add a chat template format in `template.rs`.
 
 Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral,
-Phi) are the easiest ports. The `RopeStyle` enum already covers Qwen2
-(non-interleaved) and Llama (interleaved).
+Phi) are the easiest ports. The `RopeStyle` enum defines both Qwen2
+(non-interleaved) and Llama (interleaved) pairings, but **only the
+non-interleaved form is wired up**: both loaders hard-code it
+(`models/qwen2/loader.rs:154`, `models/qwen3/loader.rs:172`) and the CUDA
+backend refuses the interleaved style (`graph/cuda_backend.rs:1324`). A family
+that needs interleaved RoPE requires a loader change plus a CUDA kernel — see
+`docs/MODEL-SUPPORT-ROADMAP.md`, "Cost model: what a port actually costs".
 
 ---
 
@@ -461,9 +466,11 @@ Decode-time optimizations: fused QKV (nt==1) via a concatenated
 `blk.{il}.attn_qkv` weight, fused bias+rope+store (`attn_bias_rope_store`),
 fused SwiGLU kernel, and the last layer computed only the tail `n_out` rows
 (an `inp_out_ids`-style partial-row optimization). The `n_out` tail-row
-optimization is not yet ported to the graph path (plan §17.16 — the graph
-computes full `nt` and extracts the tail logits rows, which is numerically
-identical for the sampled rows).
+optimization **was subsequently carried into the graph path** as the G3 work:
+the builder inserts `GetRows(wo, tail_ids)` (and the same for the residual)
+before the last layer's FFN, so the last FFN, the final norm and `lm_head` all
+run on `n_out` rows only (`models/qwen2/graph.rs:64`, `:222-225`;
+`GraphParams.n_out` is part of the reuse identity).
 
 ## A.3 Old backend layering & fallback
 
