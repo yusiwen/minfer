@@ -7604,16 +7604,34 @@ extern "C" void launch_mmq_raw_nt(
 }
 
 extern "C" int cuda_shared_per_sm() {
+    // T2 (plan R2 fix): query the CURRENT device, not a hardcoded 0 —
+    // cudaSetDevice(best_device) ran at init, so this is the selected GPU.
+    int dev = 0;
+    cudaGetDevice(&dev);
     int v = 0;
-    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0);
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
     return v;
 }
 
 extern "C" int cuda_shared_per_block_optin() {
+    int dev = 0;
+    cudaGetDevice(&dev);
     int v = 0;
-    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     return v;
 }
+
+// T2 (plan §6.2): the BT tile config's dynamic-smem demand — single source of
+// truth shared by launch_mmq_nt and the Rust-side feasibility check (the
+// formula is owned by the kernel it serves; MMQ_BI/BJ/KD/WS are the tile
+// constants at the top of this file).
+static int mmq_dynamic_smem_bytes() {
+    return (2 * MMQ_KD * (MMQ_BI * MMQ_WS) + 2 * MMQ_KD * (MMQ_BJ * MMQ_WS)
+            + 2 * MMQ_KD * MMQ_BI + 4 * 2 * MMQ_KD * MMQ_BI)
+           * 4;
+}
+
+extern "C" int cuda_mmq_smem_bytes() { return mmq_dynamic_smem_bytes(); }
 
 extern "C" void launch_mmq_nt(
     int type_id, const uint8_t* w, const uint8_t* q8, float* c,
@@ -7621,10 +7639,7 @@ extern "C" void launch_mmq_nt(
 ) {
     dim3 grid((nt + 63) / 64, (od + 63) / 64);
     // dynamic shared: qa+qb tiles, sda/sds/sds1/sdm (float) + ssa (int)
-    const int smem =
-        (2 * MMQ_KD * (MMQ_BI * MMQ_WS) + 2 * MMQ_KD * (MMQ_BJ * MMQ_WS)
-         + 2 * MMQ_KD * MMQ_BI + 4 * 2 * MMQ_KD * MMQ_BI)
-        * 4;
+    const int smem = mmq_dynamic_smem_bytes();
 #define MMQ_LAUNCH(KERN)                                                       \
     do {                                                                       \
         cudaFuncSetAttribute(reinterpret_cast<const void*>(&KERN),             \

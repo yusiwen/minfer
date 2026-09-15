@@ -55,6 +55,12 @@ extern "C" {
     fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     fn cudaGetDeviceProperties(prop: *mut CudaDevicePropBuf, device: i32) -> i32;
+    // T2 device-adaptation queries (plan §6): smem feasibility for the BT
+    // tile config. The externs query the CURRENT device (R2 fix).
+    // cuda_shared_per_sm stays C-side only: per-block optin <= per-SM on
+    // every arch, so the per-block check below subsumes it.
+    fn cuda_shared_per_block_optin() -> i32;
+    fn cuda_mmq_smem_bytes() -> i32;
     // CUDA Graph APIs
     fn cudaStreamBeginCapture(stream: *mut std::ffi::c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(
@@ -1565,6 +1571,22 @@ impl CudaState {
                 (s.tier, s.mmq_available)
             }
         };
+        // T2 (plan §6.2): BT dynamic-smem feasibility — the tile config's
+        // demand (single-source formula in cuda_kernels.cu) must fit the
+        // device's opt-in limit. Degrading here routes prefill to the f16
+        // GEMM path instead of failing launches on 100 KB-class devices.
+        // GB10 passes (identical to the previous unconditional behavior).
+        let mut tier_mmq = tier_mmq;
+        if tier_mmq {
+            let smem_need = unsafe { cuda_mmq_smem_bytes() };
+            let smem_have = unsafe { cuda_shared_per_block_optin() };
+            if smem_need > smem_have {
+                eprintln!(
+                    "CUDA: BT tile smem {smem_need} B > device optin {smem_have} B — MMQ prefill disabled, f16 GEMM path serves"
+                );
+                tier_mmq = false;
+            }
+        }
 
         let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
         // Eager dynamic-smem opt-in for the prefill GEMM instantiations:
@@ -1829,6 +1851,10 @@ impl CudaState {
         // plane of the same byte size but a different od/id layout.
         let exp_name = format!("{name}__exp{od}x{id}");
         let exp = Self::expand_q6k_dense(padded, od, id);
+        // T2: budget-gate the device upload of this optional plane.
+        if !self.plane_budget_ok(exp.len()) {
+            return;
+        }
         self.register_weight(&exp_name, &exp);
         // the MAP is keyed by the PADDED weight's device pointer (what
         // prefill_mmq holds); the value is the W_exp plane's pointer
@@ -1865,6 +1891,10 @@ impl CudaState {
         // geometry-encoded sibling name (same rationale as the W_exp name).
         let dsc_name = format!("{name}__dsc{od}x{id}");
         let dsc = Self::expand_q6k_dsc(padded, od, id);
+        // T2: budget-gate the device upload of this optional plane.
+        if !self.plane_budget_ok(dsc.len()) {
+            return;
+        }
         self.register_weight(&dsc_name, &dsc);
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {
@@ -1932,6 +1962,10 @@ impl CudaState {
         // geometry-encoded sibling name (same rationale as the W_exp name).
         let dsc_name = format!("{name}__q4dsc{od}x{id}");
         let dsc = Self::expand_q4k_dsc(raw, od, id);
+        // T2: budget-gate the device upload of this optional plane.
+        if !self.plane_budget_ok(dsc.len()) {
+            return;
+        }
         self.register_weight(&dsc_name, &dsc);
         if let Some(wp) = self.get_weight_ptr(name) {
             if let Some(dp) = self.get_weight_ptr(&dsc_name) {
@@ -3439,6 +3473,24 @@ impl CudaState {
     /// and a supported quant type. The q8 scratch follows the same
     /// grow-on-demand lifecycle as the f16 path's buf_f16_x: the 3-run
     /// capture protocol sizes it before the capture window opens.
+    /// doc 92 auto-ksplit, parameterized (T2, plan §6.1): the M-starve gate
+    /// stays `nt <= 64` (ntb == 1 — a single M tile row) and the resident-
+    /// block target becomes `max(256, 2*SM)`. On GB10 (48 SMs) that is
+    /// exactly the calibrated 256 — zero behavior change — while larger SM
+    /// counts scale the target proportionally. `MINFER_MMQ_KSPLIT_TARGET`
+    /// still overrides everything (explicit human choice beats the formula).
+    fn auto_ksplit(&self, nt: usize, nbt_y: usize, nktile: usize) -> usize {
+        if nt > 64 || nbt_y == 0 || nktile <= 1 {
+            return 1;
+        }
+        let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| (256usize).max(2 * self.sm_count as usize));
+        let want = (target + nbt_y - 1) / nbt_y;
+        want.clamp(2, nktile)
+    }
+
     pub fn prefill_mmq(
         &self,
         wptr: *mut std::ffi::c_void,
@@ -3521,20 +3573,10 @@ impl CudaState {
                     .get(&(wptr as usize))
                     .map(|cp| cp.0)
                     .unwrap_or(std::ptr::null_mut());
-                // doc 92: same K-split contract as the q4_K path
+                // doc 92: same K-split contract as the q4_K path (T2: the
+                // target is SM-count-parameterized — see auto_ksplit).
                 let ksplit: usize = if ksplit_req < 0 {
-                    let nbt_y = (od + 127) / 128;
-                    let nktile = (nchunk as usize + 1) / 2;
-                    if nt <= 64 && nbt_y > 0 && nktile > 1 {
-                        let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(256);
-                        let want = (target + nbt_y - 1) / nbt_y;
-                        want.clamp(2, nktile)
-                    } else {
-                        1
-                    }
+                    self.auto_ksplit(nt, (od + 127) / 128, (nchunk as usize + 1) / 2)
                 } else {
                     ksplit_req.max(1) as usize
                 };
@@ -3647,23 +3689,10 @@ impl CudaState {
                     // ksplit_req < 0 = auto (small-M gate): target >= 256
                     // resident blocks (about 2/SM); 1 = the unsplit path
                     // (default prefill, bitwise unchanged).
+                    // T2: the auto formula moved into auto_ksplit (shared
+                    // with the q6_K NB path; SM-count-parameterized target).
                     let ksplit: usize = if ksplit_req < 0 {
-                        let nbt_y = (od + 127) / 128;
-                        let nktile = (nchunk as usize + 7) / 8;
-                        if nt <= 64 && nbt_y > 0 && nktile > 1 {
-                            // doc 92: target ~2 resident blocks/SM (block
-                            // count = nbt_y * ksplit). The target is env-
-                            // tunable while the per-tile latency term is
-                            // being characterised.
-                            let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(256);
-                            let want = (target + nbt_y - 1) / nbt_y;
-                            want.clamp(2, nktile)
-                        } else {
-                            1
-                        }
+                        self.auto_ksplit(nt, (od + 127) / 128, (nchunk as usize + 7) / 8)
                     } else {
                         ksplit_req.max(1) as usize
                     };
@@ -4596,6 +4625,21 @@ impl CudaState {
     /// the q6_K padded precedent — no capture-window hazard. Registered
     /// under private keys (`\u{1}`-prefixed suffixes) so they can never
     /// collide with a real tensor name (the doc 102 lesson).
+    /// T2 (plan §6.3): free-VRAM budget gate for OPTIONAL weight planes
+    /// (q8_0 p32 pairs, q4_K/q6_K dsc + dense expansions). Requires free >
+    /// extra + extra/4 — the headroom covers the activation/KV working set
+    /// that lands after registration. On GB10's 128 GB this always passes
+    /// (zero change); on 8 GB unified-memory devices (Orin Nano) it
+    /// self-disables the planes and the raw paths serve (raw lookup miss).
+    /// Deliberately silent: registration is best-effort by design — every
+    /// consumer already falls back to its raw path on a map miss.
+    fn plane_budget_ok(&self, extra_bytes: usize) -> bool {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        free > extra_bytes + extra_bytes / 4
+    }
+
     pub fn register_weight_q80_p32(&self, name: &str, data: &[u8], od: usize, id: usize) {
         if od == 0
             || id == 0
@@ -4607,6 +4651,11 @@ impl CudaState {
         }
         let nb = id / 32;
         if data.len() < od * nb * 34 {
+            return;
+        }
+        // T2: the p32 pair adds od*nb*34 B (pp 32 + pd 2) = +100% of the raw
+        // weight — budget-gate before building/uploading (plan §6.3).
+        if !self.plane_budget_ok(od * nb * 34) {
             return;
         }
         let mut pp = vec![0u8; od * nb * 32];
