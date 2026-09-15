@@ -113,7 +113,8 @@ alias their input buffer; matmuls follow the GGUF weight layout
 Key modules: `src/graph/` (IR / builder / scheduler / backends / reuse cache),
 `gguf.rs` (parser + mmap'd zero-copy loader), `models/qwen2/` (build_graph +
 loader), `kernel.rs`/`quants.rs` (quantized matmul), `metal.rs`+`metal.metal` and
-`cuda.rs`+`cuda_kernels.cu` (GPU kernels), `sampler.rs`/`tokenizer.rs`/
+`cuda.rs`+`cuda_kernels.cu` (GPU kernels) with `device_tier.rs` (cc-keyed
+per-device dispatch tiers), `sampler.rs`/`tokenizer.rs`/
 `template.rs` (sampling + tokenization + chat templates), `conversation.rs`
 (multi-turn sessions), `server/` (HTTP). Supported quants:
 Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K (CPU + Metal), F32/F16 norms &
@@ -153,7 +154,9 @@ prose / 44.8 code tok/s adaptive (1.42×/1.77× sequential); 7B Q8_0 target =
 `MINFER_MMQ=0` restores the legacy f16 path; `MINFER_MMQ_Q6K_EXP=0` /
 `MINFER_MMQ_Q4K_DSC=0` trade ~6% prefill for ~3.3 GB of device memory;
 `MINFER_NO_Q40_MMVQ=1` / `MINFER_NO_Q80_MMVQ=1` / `MINFER_NO_Q80_P32=1`
-revert the legacy-quant decode paths.
+revert the legacy-quant decode paths. Dispatch gates resolve from a cc-keyed
+device-tier table (`MINFER_DEVICE_TIER=<key>` forces a row for soak testing;
+docs 105–106).
 
 **Metal — Apple M4 Pro (2026-08-21, compute-graph path):**
 

@@ -58,6 +58,7 @@
 | `server/` | OpenAI-compatible HTTP server (`serve`): axum + tokio, multi-slot, `/v1/chat/completions` streaming; `viz.rs` serves the viz page |
 | `metal.rs` + `metal.metal` | Apple MPS (Metal) backend: per-op kernels + command-buffer encoding (the legacy whole-layer `layer_gpu` is retained for tests) |
 | `cuda.rs` + `cuda_kernels.cu` | NVIDIA CUDA device layer + kernels (feature-gated `--features cuda`); executed through the graph via `graph/cuda_backend.rs` |
+| `device_tier.rs` | cc-keyed device tier table + selector (measured GB10 row, llama.cpp-adopted consumer rows, GENERIC fallback); resolved once at init, feeds the MMQ gate, smem feasibility and plane-VRAM budget checks (docs 105–106) |
 | `download/` | Hugging Face Hub + Ollama download, cached-name resolution, resume support |
 | `dump.rs` | Per-layer hidden-state debug dump (gated by `--features debug_dump`) |
 | `bench.rs` / `live.rs` / `trace.rs` / `spec_verify.rs` | llama-bench-style bench, live viz inference host, per-node trace export (`MINFER_TRACE`), D5 verify-step gate bench |
@@ -302,7 +303,8 @@ pub trait Backend: Send + Sync {
   registry (`weight_buf(name) -> (buffer, offset)`).
 - **CUDA** (`cuda_backend.rs`, feature-gated `--features cuda`): wraps the
   `cuda.rs` device layer — per-op dispatch with int8 MMQ prefill + MMVQ decode
-  (default-on; `MINFER_MMQ=0` reverts), split-KV attention, and CUDA Graph
+  (default-on; `MINFER_MMQ=0` reverts; the MMQ gate resolves from the
+  `device_tier.rs` device-tier table), split-KV attention, and CUDA Graph
   capture/replay keyed on the graph `uid` (`graph_replay`, decode-shaped only).
   Implementation record: `docs/CUDA-BACKEND-DESIGN.md`; per-step optimization
   history in `docs/CUDA_OPTIMIZATION.md`.
