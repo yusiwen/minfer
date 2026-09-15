@@ -157,14 +157,16 @@ that llama.cpp cannot express.
 | 1200 | Blackwell consumer (RTX 5090/5080/5070) | default 8; **q4_K → 5, q5_K → 6, q6_K → 7** | yes | Adopted | llama.cpp mmvq.cu:335 (tuned on RTX 5090) |
 | 89 | Ada (RTX 4090/4080/4070) | 8 (their overrides touch only unsupported q2_k/q3_k) | yes | Adopted | llama.cpp mmvq.cu:323 (tuned on RTX 4090) |
 | 86 | Ampere (RTX 3090/3080/3070/3060) | 8 | yes | Adopted | llama.cpp generic — no Ampere batch specialization exists |
+| 870 | Jetson Orin (Nano/NX/AGX, owner has an Orin Nano) | default 8; **q4_K/q5_K/q6_K → 1** | yes | Adopted | llama.cpp mmvq.cu:368 (tuned for Jetson Orin, key 870, common.cuh:55); field TODO §9.1 |
 | 75 | Turing (RTX 2080/2060) | 8 | **no** | Adopted / provisional | batch: generic; mmq: divergence ruling #4 (§9, field TODO §9.1) |
 | −1 | GENERIC (unknown, incl. Pascal GTX 10-series) | 8 | cc ≥ 800 | Generic | fallback convention; Pascal resolves here with batch 8 + no MMQ, so no dedicated row is needed |
 
 Scope notes from the source audit: llama.cpp's NVIDIA batch specializations in
-`should_use_mmvq` are **exactly Ada and Blackwell** (plus DGX Spark, which we
-own, and Jetson Orin, ruled out — OQ3); Ampere/Turing have no batch
-specializations and fall through to the generic ≤ 8. Q2_K / Q3_K / IQ* rows
-are dropped (unsupported types), which is why the Ada tier carries no
+`should_use_mmvq` are Ada, Blackwell, DGX Spark (which we own), and Jetson
+Orin (included per owner device availability — an Orin Nano is on hand;
+previously ruled out as OQ3, re-included 2026-09-14). Ampere/Turing have no
+batch specializations and fall through to the generic ≤ 8. Q2_K / Q3_K / IQ*
+rows are dropped (unsupported types), which is why the Ada tier carries no
 overrides for minfer's types. License note: llama.cpp is MIT; every adopted
 row carries an attribution comment.
 
@@ -299,6 +301,49 @@ exercises everything except BT.
 Either way the measurement promotes the 75 row from Adopted to Measured for
 the knobs it covers — the first exercise of the provenance workflow.
 
+### 9.2 Field-measurement TODO — Jetson Orin Nano (sm_87)
+
+Second field device, maximally different from GB10 (68 GB/s unified memory vs
+273 GB/s, 1024 Ampere cores @ 25 W vs 48 Blackwell SMs @ ~140 W) — it stresses
+the shape-dimension gates in ways GB10 never could.
+
+**Build prerequisites (blocking — today's CUDA-13 binary cannot run there):**
+
+1. The target list (build.rs:534) has no `87`, and the only embedded PTX is
+   compute_121, which forward-JITs upward only — sm_87 cannot load it. Either
+   add `87` to the targets (preferred) or rebuild on the Jetson with its
+   JetPack CUDA 12.x (which also embeds the compute_70/72 backward-JIT PTX).
+2. **JIT is not an acceptable shortcut**: PTX compiled for compute_70 has the
+   `__CUDA_ARCH__ >= 800` BT regions preprocessed out, so a JIT-loaded module
+   on sm_87 lacks the BT functions while the runtime gate (cc = 870 ≥ 800)
+   believes they exist → launch failure at first BT dispatch. Native sm_87
+   SASS is required (this also fixes the latent compile-gate/runtime-gate
+   mismatch hazard for any ≥ 800 device without its own SASS — review
+   finding R9).
+3. Verify the local toolkit can emit sm_87 (`nvcc --list-gpu-arch`); if CUDA
+   13 dropped the embedded arch, build on the Jetson itself.
+4. 8 GB unified memory: 7B Q8_0 will not fit (7.2 GB weights alone); test
+   models are Qwen3-0.6B/1.7B and Qwen2.5-7B-Q4_K_M. The T2 plane-VRAM-budget
+   gate (§6.3) goes from defensive to **mandatory** here — p32's +3.3 GB
+   must self-disable on this device.
+
+**What to measure (Phase A):** suite + identity battery; tg128 A/B vs
+llama-bench; and the decisive experiment for the adopted ≤ 1 thresholds —
+MMVQ-for-all-nt vs adopted-threshold routing for q4_K/q5_K/q6_K. Two known
+caveats shape this experiment:
+
+- **R8 (vacated-range routing)**: with the current dispatch structure, a tier
+  batch limit < 8 shuttles the vacated nt 2–8 range into the f32/padded
+  fallbacks — NOT into BT (whose gate is nt ≥ 9). Acting on the Orin
+  thresholds is therefore a likely pessimization until the vacated range has
+  a destination: small-J BT configs (T2 item 4, tile candidates) or measured
+  evidence that the fallback wins. The A/B on the Nano decides this with
+  data.
+- The R3 spec-verify exemption gets its first real consumer here: on Orin,
+  regular decode for K-quants at nt 2–8 would use BT (tolerance class) while
+  spec verify stays on multi-MMVQ (bitwise) — two numeric classes coexisting
+  per type, by design.
+
 ## 10. Cross-vendor extension
 
 - **AMD (ROCm/HIP)**: keys via the llama.cpp offset scheme; tier rows copied
@@ -361,6 +406,16 @@ layer here is a prerequisite consumer of its decisions.
 - **R7 — gate ownership boundary**: explicit list of which gates stay global
   in T1 (§5.5) — shape-dimension crossovers have no llama.cpp counterpart and
   cannot be "adopted" from their tables.
+- **R8 — vacated-range routing**: tier batch limits < 8 have no destination
+  for the vacated nt 2–8 range under the current dispatch structure (BT gate
+  is nt ≥ 9; the range falls to f32 fallbacks) — adopting the Orin ≤ 1
+  thresholds requires small-J BT configs (T2 item 4) or field evidence first
+  (§9.2).
+- **R9 — compile/runtime gate mismatch on JIT**: for ≥ 800-class devices
+  without native SASS (e.g. sm_87 via compute_70 JIT), the BT code is
+  preprocessed out of the PTX while the runtime cc gate still believes it
+  exists → guaranteed launch failure. Native SASS per target is mandatory for
+  any tier the runtime gate will route to BT (§9.2).
 
 ## 15. Open questions
 
@@ -376,6 +431,8 @@ All three resolved by ruling (2026-09-14), see §5.2 / §9:
   untested territory for minfer → follow llama.cpp's proven approach (J-search
   + smem filter); GB10 pinned to 64×64 by test assertion; the one-time
   tolerance-class change on foreign devices is accepted at the T2 boundary.
-- **OQ3 — resolved**: Jetson Orin rows are dropped per the consumer-only
-  scope; the GENERIC fallback covers unknown devices more honestly than an
-  untested copied row.
+- **OQ3 — resolved, then revised**: initially dropped per the consumer-only
+  scope; re-included (2026-09-14) when the owner revealed an Orin Nano on
+  hand — the 870 row enters as Adopted with its build prerequisites and the
+  decisive A/B experiment recorded in §9.2. Field data, not the table, is
+  what makes its thresholds load-bearing.
