@@ -498,12 +498,13 @@ class for an inference engine.
 **Testing.** Five integration files, four of them `#![cfg(target_os = "macos")]`
 Metal kernel isolation tests; CPU/CUDA correctness rests on inline unit tests
 plus real-model tests that skip when a GGUF is not cached
-(`tests/conversation_cli.rs:1-12`). CI (Continuous Integration) is
-`cargo build --release` on macOS only (`.github/workflows/ci.yml`) — no test run,
-no CUDA build, no Linux build. 🟠 The highest-value addition is a systematic
-op × dtype × backend correctness matrix (every op checked on every backend
-against a CPU reference); it would have caught several items in §4
-automatically.
+(`tests/conversation_cli.rs:1-12`). ~~CI is `cargo build --release` on macOS only
+— no test run, no CUDA build, no Linux build.~~ **Fixed in A2**: CI now runs
+`cargo test --release` on Linux/CPU, compiles the CUDA backend in NVIDIA's devel
+image, and keeps the macOS build. 🟠 The remaining highest-value addition is a
+systematic op × dtype × backend correctness matrix (every op checked on every
+backend against a CPU reference); it would have caught several items in §4
+automatically — that is ticket A1.
 
 **Observability.** No metrics endpoint, no queue-depth or KV-occupancy
 exposure, no per-op timing in production (only the heavy `MINFER_TRACE` path),
@@ -560,7 +561,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | 23 | **Op × dtype × backend matrix test**. | §2.8 | M |
-| 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. | §2.8 | S |
+| 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. — **done in A2** | §2.8 | S |
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |

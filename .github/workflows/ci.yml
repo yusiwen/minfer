@@ -1,10 +1,15 @@
-# CI — compile check on push to master and PRs targeting master.
+# CI — three jobs, one per backend that can be checked without a device.
 #
-# GitHub-hosted macOS runners ship a preinstalled Rust toolchain (the same
-# image the release workflow uses), so no explicit toolchain setup is needed
-# here. We only build — the integration tests under tests/ need a GGUF model
-# that is not checked in, so running them here would be flaky. The goal of this
-# badge is "does it compile on a clean checkout".
+# 1. test-linux-cpu   : the runtime net. Runs the whole unit suite (the
+#                       integration tests under tests/ need a GGUF model that is
+#                       not checked in and stay #[ignore]d) plus the CPU-side
+#                       graph/allocator/scheduler tests. This is the job that
+#                       must go red when a change breaks behaviour rather than
+#                       compilation.
+# 2. build-linux-cuda : compile check for the CUDA backend in NVIDIA's own devel
+#                       image. GitHub runners have no GPU, so this cannot run
+#                       anything — it catches nvcc/kernel-compile breakage only.
+# 3. build-macos      : unchanged macOS/Metal compile check (Apple Silicon).
 name: CI
 
 on:
@@ -14,7 +19,26 @@ on:
     branches: [master]
 
 jobs:
-  build:
+  test-linux-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Test (release, CPU)
+        run: cargo test --release
+
+  # The container tag carries the CUDA toolkit; bump it together with the
+  # toolkits build.rs is known to support (12.x and 13.x today).
+  build-linux-cuda:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Build (release, cuda)
+        run: cargo build --release --features cuda
+
+  build-macos:
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v4
