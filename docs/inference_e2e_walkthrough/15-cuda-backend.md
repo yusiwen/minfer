@@ -582,7 +582,6 @@ let cuda_on = crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(m
 ...
 cparams: CParams {
     n_ctx,
-    n_batch: nt,
     flash_attn: false,
     gpu: metal_on || cuda_on,
     ...

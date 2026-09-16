@@ -196,7 +196,7 @@ assign_backends → fuse → alloc_graph → execute
 
 **Params-only deterministic reuse** (llama.cpp `allow_reuse` invariant):
 `GraphParams` = `n_tokens` / `n_seqs` / `n_out` (tail rows) / `gtype` /
-`cparams` (`n_ctx`, `n_batch`, `flash_attn`, `gpu`, `fuse_qkv`, `fuse_ffn`) /
+`cparams` (`n_ctx`, `flash_attn`, `gpu`, `fuse_qkv`, `fuse_ffn`) /
 `weights_version` deterministically determines the topology — equal params ⇒
 identical graph.
 `n_past` is deliberately absent (it is execution data). `CParams.gpu` records

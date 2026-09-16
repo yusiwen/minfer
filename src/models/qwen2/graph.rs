@@ -449,7 +449,6 @@ impl Qwen2Graph {
             },
             cparams: CParams {
                 n_ctx,
-                n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on || cuda_on,
                 // G4/G5: decode fusions are part of the topology — the env
@@ -926,7 +925,6 @@ mod tests {
                 gtype: GraphType::Prefill,
                 cparams: CParams {
                     n_ctx,
-                    n_batch: nt,
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
@@ -975,7 +973,6 @@ mod tests {
                 gtype: GraphType::Decode,
                 cparams: CParams {
                     n_ctx,
-                    n_batch: 1,
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
@@ -1568,7 +1565,6 @@ mod tail_tests {
                 gtype: GraphType::Prefill,
                 cparams: CParams {
                     n_ctx: 4096,
-                    n_batch: nt,
                     flash_attn: false,
                     gpu: false,
                     fuse_qkv: false,
@@ -1747,7 +1743,6 @@ mod tail_tests {
                     gtype: GraphType::Decode,
                     cparams: CParams {
                         n_ctx,
-                        n_batch: 1,
                         flash_attn: false,
                         gpu: true,
                         fuse_qkv: fuse,
@@ -1821,7 +1816,6 @@ mod tail_tests {
                     gtype: GraphType::Decode,
                     cparams: CParams {
                         n_ctx: 4096,
-                        n_batch: 1,
                         flash_attn: false,
                         gpu: true,
                         fuse_qkv: fuse,

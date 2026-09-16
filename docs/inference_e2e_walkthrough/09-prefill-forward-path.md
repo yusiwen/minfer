@@ -475,7 +475,7 @@ implementation, not one per caller.
             n_seqs: 1,
             n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
-            cparams: CParams { n_ctx, n_batch: nt, flash_attn: false,
+            cparams: CParams { n_ctx, flash_attn: false,
                                gpu: metal_on || cuda_on,
                                fuse_qkv: nt == 1 && (metal_on || cuda_on) && ...,
                                fuse_ffn: nt == 1 && (metal_on || cuda_on) && ... },
@@ -511,7 +511,7 @@ is worth reading as five beats:
    call's arguments plus device availability. This is the prefill graph's
    birth certificate — for a 512-token CPU prompt: `n_tokens = 512`,
    `n_seqs = 1`, `n_out = 1`, `gtype = Prefill`, `cparams = { n_ctx: 4096,
-   n_batch: 512, flash_attn: false, gpu: false, fuse_qkv: false,
+   flash_attn: false, gpu: false, fuse_qkv: false,
    fuse_ffn: false }`. Note the fusion flags are `nt == 1 && gpu`: the
    decode fusions of doc 05 §2.6 are **off** during prefill by construction —
    they pay off at `nt = 1` only, and their being params-derived is what

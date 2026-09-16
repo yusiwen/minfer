@@ -324,11 +324,12 @@ defragmentation (a cell-copy op that a strided-view IR makes expressible).
 
 **Today.** Single sequence, end to end. `GraphParams.n_seqs` exists and is part
 of the reuse identity (`params.rs:54`, `cache.rs:59`) but is set to `1` at every
-construction site (`models/qwen2/graph.rs:443` etc.); no builder consults it.
-`CParams.n_batch` (`params.rs:25`) is likewise dead — every construction site
-assigns it `n_tokens` (`models/qwen2/graph.rs:452`), and no scheduler or builder
-ever chunks against it. Attention derives its causal bound from the per-token
-positions input (`cpu_backend.rs:411-416`, `cuda_backend.rs:1100-1102`), so two
+construction site (`models/qwen2/graph.rs:443` etc.); no builder consults it
+(it is kept, documented as *reserved for item 3* — see
+`ARCHITECTURE-EXECUTION-PLAN.md` §8). The other dead identity field,
+`CParams.n_batch`, was **deleted** in Phase A7; chunked prefill (item 10) will
+reintroduce it with its real semantics. Attention derives its causal bound from
+the per-token positions input (`cpu_backend.rs:411-416`, `cuda_backend.rs:1100-1102`), so two
 sequences in one batch would attend to each other.
 
 The prefill is one graph covering the entire prompt (`main.rs:862-890`):
@@ -557,7 +558,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 23 | **Op × dtype × backend matrix test**. | §2.8 | M |
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. | §2.8 | S |
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
-| 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). | §2.5 | S |
+| 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. | §2.2 | S |
 | 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. | §2.3 | S |
 
@@ -592,9 +593,11 @@ Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
    advertises both styles as available.
 7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
    (`alloc.rs:332`, `:356`) — misleading text in a live panic path.
-8. **Dead fields in the reuse identity**: `CParams.n_batch` and
+8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
    `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:57-64`) but no
-   builder reads them; every construction site hard-codes 1 / `n_tokens`.
+   builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
+   **Fixed in A7**: `n_batch` is deleted; `n_seqs` is kept and documented as
+   reserved for item 3.
 9. **Single-entry cross-backend staging** (`alloc.rs:34`, `:645`), mitigated by
    the consumer-side filter at `scheduler.rs:252-255`.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the

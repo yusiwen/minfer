@@ -655,7 +655,6 @@ The loop's `forward` call lands in `forward_cached`, which first expresses
             },
             cparams: CParams {
                 n_ctx,
-                n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on || cuda_on,
                 // G4/G5: decode fusions are part of the topology — the env
@@ -757,8 +756,8 @@ pub struct GraphParams {
 }
 ```
 
-and inside `CParams`: `n_ctx`, `n_batch`, `flash_attn`, `gpu`,
-`fuse_qkv`, `fuse_ffn` (`params.rs:22-35`) — each documented there with the
+and inside `CParams`: `n_ctx`, `flash_attn`, `gpu`,
+`fuse_qkv`, `fuse_ffn` (`src/graph/params.rs`) — each documented there with the
 reason it belongs in the identity. The module's opening comment is the
 invariant in one breath (`params.rs:1-7`): these are "the ONLY inputs to
 graph reuse … `n_past` (KV position) is deliberately absent: it is

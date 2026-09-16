@@ -37,7 +37,6 @@ pub fn runtime_gparams(
         },
         cparams: CParams {
             n_ctx,
-            n_batch: n_tokens,
             flash_attn: false,
             gpu,
             fuse_qkv,
