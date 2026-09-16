@@ -194,11 +194,12 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    and no overlap of CPU and GPU work. On Metal this is a `memcpy` both ways; on
    CUDA it is real PCIe traffic, fully serialized.
 
-**Also:** the cross-boundary staging map is keyed by node id alone
+**Also:** ~~the cross-boundary staging map is keyed by node id alone
 (`alloc.rs:34`), so a node consumed by two different foreign backends can only
 have one staging buffer; the scheduler compensates by filtering on backend
 (`scheduler.rs:252-255`), which is correct only while at most two backends are
-enabled. 🟡 with a third backend it becomes a correctness hazard.
+enabled.~~ **Fixed in A5**: the map is keyed by `(node, destination backend)`,
+one node can feed two foreign consumers, and the consumer-side filter is gone.
 
 **Recommendation.** Add an assignment pass that (a) propagates support backwards
 from unsupported ops and (b) scores a candidate assignment by crossing count;
@@ -562,7 +563,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. | §2.8 | S |
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
-| 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. | §2.2 | S |
+| 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
 | 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. | §2.3 | S |
 
 ---
@@ -602,8 +603,9 @@ Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
    **Fixed in A7**: `n_batch` is deleted; `n_seqs` is kept and documented as
    reserved for item 3.
-9. **Single-entry cross-backend staging** (`alloc.rs:34`, `:645`), mitigated by
-   the consumer-side filter at `scheduler.rs:252-255`.
+9. ~~**Single-entry cross-backend staging** (`alloc.rs:34`, `:645`), mitigated by
+   the consumer-side filter at `scheduler.rs:252-255`.~~ **Fixed in A5** — keyed
+   by `(node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:509`).

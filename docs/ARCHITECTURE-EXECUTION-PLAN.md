@@ -71,7 +71,7 @@ roadmap §4 defects automatically.
 | A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
 | A4 | 6 | Server worker panic isolation | S | ✅ done |
-| A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | |
+| A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | ✅ done |
 | A6 | 28 | Remove CPU per-op allocations | S | |
 | A7 | 26 | Dead identity fields | S | ✅ done |
 | A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | |
@@ -152,12 +152,23 @@ roadmap §4 defects automatically.
   too — now contained per job, but the server would still fail every request.
   Recorded for the CUDA-verifiable phase.
 
-### A5 — Staging map re-key  · item 27 · S
-- **Files:** `src/graph/alloc.rs:34`, `:592-653`; `src/graph/scheduler.rs:252-255`.
-- **Deliverable:** `cross` keyed by `(NodeId, Backend)`; the consumer-side
-  backend filter becomes unnecessary and is removed.
-- **Acceptance:** existing scheduler tests pass; a synthetic graph feeding one
-  node to two foreign backends stages correctly (new test).
+### A5 — Staging map re-key  · item 27 · S — **DONE**
+- **Files:** `src/graph/alloc.rs` (`cross`, `copy_across`, `cross_buffer`, plus
+  a new `write_pool` helper that removes the duplicated four-arm write) and
+  `src/graph/scheduler.rs` (the consumer-side filter).
+- **Deliverable:** `cross` is keyed by `(NodeId, Backend)`. The scheduler's
+  `.filter(|cb| cb.backend == split.backend)` is gone — the map itself can no
+  longer offer a consumer the other backend's copy, and one node feeding two
+  foreign backends now gets one staging buffer each instead of a single entry
+  that only one of them could use.
+- **Acceptance:** `staging_is_keyed_by_destination_backend` (stages one node for
+  CPU, asserts the CUDA consumer gets `None`, then stages CUDA and asserts the
+  CPU entry survives); the existing scheduler tests still pass;
+  `cargo test --release` 159 passed / 0 failed.
+- **Honest limitation:** a *behavioural* test needs a second usable backend,
+  which this box does not have (A0: CUDA unavailable; Metal not compiled). The
+  test asserts the new keying contract directly through a `#[cfg(test)]` hook
+  rather than through a real split boundary. Phase G should re-test it on a Mac.
 
 ### A6 — CPU per-op allocations  · item 28 · S
 - **Files:** `src/graph/cpu_backend.rs:157-158` (K/V source clone), `:195`
