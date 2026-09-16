@@ -72,7 +72,7 @@ roadmap §4 defects automatically.
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
 | A4 | 6 | Server worker panic isolation | S | ✅ done |
 | A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | ✅ done |
-| A6 | 28 | Remove CPU per-op allocations | S | |
+| A6 | 28 | Remove CPU per-op allocations | S | ✅ measured — refuted, reverted |
 | A7 | 26 | Dead identity fields | S | ✅ done |
 | A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | ✅ done (docs route) |
 
@@ -199,12 +199,35 @@ roadmap §4 defects automatically.
   test asserts the new keying contract directly through a `#[cfg(test)]` hook
   rather than through a real split boundary. Phase G should re-test it on a Mac.
 
-### A6 — CPU per-op allocations  · item 28 · S
-- **Files:** `src/graph/cpu_backend.rs:157-158` (K/V source clone), `:195`
-  (`Vec<&[f32]>` per node).
-- **Deliverable:** borrow instead of clone; reuse a scratch `Vec` across nodes.
-- **Acceptance:** CPU decode tok/s on Qwen2.5-7B Q4_K_M does not regress;
-  output bit-identical; fewer allocations per token (measured, not asserted).
+### A6 — CPU per-op allocations  · item 28 · S — **DONE: measured, refuted, reverted**
+- **Files (measured, not changed):** `src/graph/cpu_backend.rs` — the
+  per-node `Vec<&[f32]>` of resolved inputs, and the K/V source clone in the KV
+  store arm.
+- **What was tried:** replace the per-node input `Vec` with a fixed
+  `[&[f32]; 4]` array (every op the builders emit has ≤ 4 inputs) plus a heap
+  spill for anything larger — i.e. zero allocation per node execution instead of
+  one.
+- **Measurement** (Qwen2.5-0.5B Q4_0, CPU, 20 threads, `bench -r 3`, three
+  interleaved before/after pairs, `minfer-a6-before` vs `minfer-a6-after`):
+
+  | pair | before pp512 | after pp512 | before tg128 | after tg128 |
+  |---|---|---|---|---|
+  | 1 | 76.08 ± 0.03 | 74.79 ± 0.03 | 40.30 ± 0.09 | 39.60 ± 0.28 |
+  | 2 | 76.05 ± 0.01 | 75.33 ± 0.02 | 40.25 ± 0.16 | 39.07 ± 0.40 |
+  | 3 | 76.14 ± 0.03 | 75.39 ± 0.05 | 40.00 ± 0.31 | 39.68 ± 0.29 |
+
+  The change is **consistently slower** (−1.2 % prefill, −1.8 % decode; every
+  pair separated, and the intra-run error is ±0.05 or less). Reverting restores
+  the baseline (76.10 / 76.06 pp512, 40.79 / 40.21 tg128), which confirms the
+  cause.
+- **Why it does not matter anyway:** the decode loop is weight-streaming bound.
+  At ~250 nodes/token the per-node `Vec` was one small allocation each, on the
+  order of 0.1 % of the step — below what the harness can resolve. The K/V clone
+  was left alone for the same reason: it is ~2 KB per layer and the buffers are
+  needed for the borrow structure (the store arm needs disjoint access to four
+  pool slots).
+- **Outcome:** no code change; the negative result is recorded so nobody
+  re-opens it. Item 28 is closed as "not worth doing" rather than done.
 
 ### A7 — Dead identity fields  · item 26 · S
 - **Decision taken: option (a)** — delete `CParams.n_batch`, keep `GraphParams.n_seqs`
@@ -450,7 +473,7 @@ tickets and everything after them.
 
 | Phase | Done when |
 |---|---|
-| A | `cargo test` green on Linux/CPU; A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**. |
+| A | `cargo test` green on Linux/CPU; A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
 | B | A multi-turn conversation prefills only the new turns; the contamination test passes; numbers recorded interleaved. |
 | C | Cell store lands bitwise; shift is a documented tolerance class; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
