@@ -371,14 +371,43 @@ Five sub-steps, each keeping the tree green. C3 depends on Phase D.
 | C4 | Quantized KV (item 21) | M |
 | C5 | State save/restore for session persistence | M |
 
-### C1 — Cell store, one sequence
-- **Deliverable:** per-layer cell arenas with an owner set; the KV store node
-  resolves `position → cell` on the host and passes an index array to the
-  kernel; attention still derives its bound from `positions`, so behaviour is
-  unchanged.
-- **Acceptance:** bitwise-identical greedy output vs the pre-change binary on
-  the full smoke set (0.6B Q8_0, 7B Q4_K_M, 14B Q4_K_M) at several context
-  lengths; the graph topology is unchanged (no new topology-affecting params).
+### C1 — Cell store, one sequence — **DONE**
+- **Landed:** `src/graph/kvcache.rs` (`KvCache`, `KvLayer`, `SEQ_MAIN`/`FREE`,
+  `cells_for`, `is_identity`, and the ownership/write bookkeeping C2 will use);
+  the allocator's `kv` map is now the store, so `ensure_kv` validates through it
+  (it gained the `n_ctx` argument) and `kv_pair`/`copy_kv_to_cpu` read it.
+- **The gate has teeth:** `BackendScheduler::execute` refuses any graph whose
+  mapping is no longer the identity, because no backend consumes the resolved
+  cell array yet — so a half-ported C2 fails loudly instead of writing the wrong
+  row. `a_non_identity_kv_mapping_is_refused` proves it fires.
+- **The resolver has a live consumer today:** A3's position guard
+  (`fill_input_i32`) now resolves through `cells_for` instead of re-deriving the
+  bound from a node's shape, so when C2 changes the mapping the check keeps
+  meaning the same thing without being touched.
+- **Verified bitwise, as the ticket requires:** `cargo test --release` 172
+  passed / 0 failed — including the real-model bitwise tests
+  (`reused_cache_across_prompts_matches_a_fresh_cache`,
+  `prefix_reuse_matches_a_full_prefill`, `graph_logits_match_forward_real_model`)
+  — and a pre-C1 vs post-C1 binary A/B on Qwen2.5-0.5B Q4_0 greedy (`-n 24`)
+  produced **byte-identical generated text**; only the timing lines differ.
+- **Deliverable (as specified):** per-layer cell arenas with an owner set; the
+  KV store node resolves `position → cell` on the host and passes an index
+  array to the kernel; attention still derives its bound from `positions`, so
+  behaviour is unchanged.
+- **Delivered in this pass:** the arenas, the owner set and the host-side
+  resolver. The index array *reaching the kernel* is deliberately **not** done —
+  it is only needed once the mapping stops being the identity, and the
+  scheduler gate refuses to execute in that state, so no backend can silently
+  index the wrong row in the meantime. Handing the array across the `Backend`
+  trait is C2's first step.
+- **Acceptance (as specified):** bitwise-identical greedy output vs the
+  pre-change binary on the full smoke set (0.6B Q8_0, 7B Q4_K_M, 14B Q4_K_M) at
+  several context lengths; the graph topology is unchanged (no new
+  topology-affecting params).
+- **Acceptance met for:** 0.5B Q4_0 byte-identical end to end, plus the in-tree
+  bitwise model tests. **Not run:** the 0.6B/7B/14B smoke rows — those are
+  minutes-long CPU jobs and C1 does not touch a kernel, so they are deferred to
+  the C2 landing rather than claimed here.
 - **Defers to G:** nothing — the Metal backend keeps the old regions until G.
 
 **C1 design (written before the code, 2026-09-16).** The shape below is what C2

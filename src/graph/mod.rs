@@ -15,6 +15,8 @@ pub mod cuda_backend;
 pub mod dot;
 pub mod fusion;
 pub mod json;
+/// Sequence-addressable KV cell store (Phase C / C1).
+pub mod kvcache;
 #[cfg(target_os = "macos")]
 pub mod metal_backend;
 pub mod ops;
