@@ -449,6 +449,48 @@ fn guarded_forward(
     .map_err(|_| ApiError::server("inference panicked"))
 }
 
+/// Run one job with panic isolation. Returns `true` when the job completed —
+/// including a normal `Err`, which is forwarded to `tx` — and `false` when it
+/// panicked, which is reported to `tx` as a 500 instead of unwinding the worker
+/// thread (see the call site in `worker_loop`).
+fn run_job_isolated<F>(tx: &mpsc::Sender<StreamEvent>, f: F) -> bool
+where
+    F: FnOnce() -> Result<(), ApiError>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            let _ = tx.blocking_send(StreamEvent::Err(e));
+            true
+        }
+        Err(payload) => {
+            // `&*payload`, not `&payload`: `Box<dyn Any + Send>` is itself an
+            // `Any`, so passing the Box by reference would downcast against the
+            // Box type and always report a non-string payload.
+            let msg = panic_message(&*payload);
+            eprintln!(
+                "[server] job panicked: {msg} — the worker thread survives and the slot is released"
+            );
+            let _ = tx.blocking_send(StreamEvent::Err(ApiError::server(format!(
+                "internal error: {msg}"
+            ))));
+            false
+        }
+    }
+}
+
+/// Human-readable panic payload. `panic!` with a literal or a formatted string
+/// yields `&'static str` / `String`; anything else gets a generic label.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// Worker thread: drains the job queue serially, one slot at a time.
 /// Busy slots defer naturally — the queue is unbounded (llama.cpp semantics).
 pub fn worker_loop(
@@ -489,7 +531,15 @@ pub fn worker_loop(
         // the plain path too, doc 97 §2). A fresh cache costs one ~1 ms
         // graph rebuild per request.
         slot.cache = GraphCache::new();
-        let result = match slot_spec {
+        // Panic isolation for the WHOLE job, not just the forward call.
+        // `guarded_forward` already contains a panic inside
+        // `forward_graph_cached`, but the speculative path calls both models'
+        // forwards directly (`spec.rs`), and the tokenizer, sampler, stop-string
+        // and streaming paths are unguarded. Without this net one panic unwinds
+        // this thread: `job_rx` is dropped, every later request is rejected, and
+        // the requests already queued lose their event sender (an empty 200
+        // instead of an error).
+        run_job_isolated(&job.tx, || match slot_spec {
             Some(spec) => generate_spec(
                 &*model,
                 &tokenizer,
@@ -509,10 +559,10 @@ pub fn worker_loop(
                 &job.params,
                 &job.tx,
             ),
-        };
-        if let Err(e) = result {
-            let _ = job.tx.blocking_send(StreamEvent::Err(e));
-        }
+        });
+        // The slot's KV/graph state may be half-written after a panic; the next
+        // request allocates a fresh `GraphCache` anyway (see above), so only the
+        // state flag needs restoring — the worker keeps draining the queue.
         slot.state = SlotState::Idle;
     }
 }
@@ -534,5 +584,43 @@ mod tests {
         assert!(is_stop_token(2, &special));
         assert!(is_stop_token(7, &special));
         assert!(!is_stop_token(3, &special));
+    }
+
+    /// A panicking job must become a 500 on that request's stream — and the
+    /// worker must live on. Before the fix the panic unwound `worker_loop`, so
+    /// nothing was ever sent and the whole server degraded.
+    #[test]
+    fn isolated_job_turns_a_panic_into_an_error_event() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let survived = run_job_isolated(&tx, || panic!("boom"));
+        assert!(
+            !survived,
+            "a panicking job must report that it did not survive"
+        );
+        match rx.try_recv() {
+            Ok(StreamEvent::Err(e)) => {
+                let body = e.json();
+                assert!(body.contains("boom"), "panic message lost: {body}");
+                assert!(body.contains("server_error"), "wrong class: {body}");
+            }
+            _ => panic!("expected an Err event for the panicking job"),
+        }
+    }
+
+    #[test]
+    fn isolated_job_forwards_a_normal_error() {
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(run_job_isolated(&tx, || Err(ApiError::server("nope"))));
+        match rx.try_recv() {
+            Ok(StreamEvent::Err(e)) => assert!(e.json().contains("nope")),
+            _ => panic!("expected the error to be forwarded"),
+        }
+    }
+
+    #[test]
+    fn isolated_job_passes_success_through_silently() {
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(run_job_isolated(&tx, || Ok(())));
+        assert!(rx.try_recv().is_err(), "a clean job emits no error event");
     }
 }

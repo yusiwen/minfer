@@ -361,14 +361,17 @@ Two smaller but immediate items sit in this layer:
   pays KV + pool re-allocation (≈235 MB for 7B at `n_ctx=4096`, f16) and
   invalidates the CUDA Graph capture warm-up (`pool_gen` bump,
   `cuda_backend.rs:1342`).
-- **No panic isolation.** `worker_loop` (`chat.rs:454-518`) has no
-  `catch_unwind` and no supervision. A panic inside `generate` unwinds the
-  worker thread permanently: the bounded job channel (capacity 64,
-  `server/mod.rs:66`) then rejects — so subsequent requests get 503 — and
-  already-queued jobs have their `StreamEvent` sender dropped, which ends the
-  SSE (Server-Sent Events) stream after an empty `[DONE]` rather than an error
-  (`server/mod.rs:198-216`). One `expect()` in a kernel path takes the server
-  down without a log line.
+- ~~**No panic isolation.**~~ **Fixed in A4.** The guard that existed
+  (`guarded_forward`, `chat.rs:438-450`) only covered
+  `forward_graph_cached`; the speculative path calls both models' forwards
+  directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
+  bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
+  channel (capacity 64, `server/mod.rs:66`) — later requests got 503 — and the
+  queued jobs' `StreamEvent` senders, ending their SSE
+  (Server-Sent Events) stream after an empty `[DONE]` rather than an error
+  (`server/mod.rs:198-216`). The whole per-job body now runs under
+  `run_job_isolated`, which turns a panic into a logged 500 for that request
+  and keeps the worker draining the queue.
 
 ---
 
@@ -523,7 +526,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). | §2.5 | XL |
 | 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. | §2.5 | M |
 | 5 | **Fix `ensure_kv` size handling** and add the missing `pos < n_ctx` guard on both GPU backends. | §2.4 | S |
-| 6 | **Worker panic isolation** (`catch_unwind` + supervision + an error event instead of a silent empty stream). | §2.5 | S |
+| 6 | **Worker panic isolation** (`catch_unwind` + supervision + an error event instead of a silent empty stream). — **done in A4** | §2.5 | S |
 
 ### P1 — material capability or performance
 
@@ -579,9 +582,10 @@ Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
    (`metal_backend.rs:749`, `:800`, `:891`) and a silent weightless RMSNorm when
    a weight is missing (`:403-414`, `:457-468`) — both contradict
    `docs/GPU_SAFETY.md` and `AGENTS.md`'s no-silent-fallback rule.
-4. **Server worker has no panic isolation or supervision** (`chat.rs:454-518`).
-   A panic permanently degrades the server (503 for new jobs, empty 200/SSE for
-   queued ones) with no log.
+4. ~~**Server worker had no panic isolation outside the forward call**
+   (`chat.rs:454-518`): a panic anywhere else unwound the worker, permanently
+   degrading the server (503 for new jobs, empty 200/SSE for queued ones) with
+   no log.~~ **Fixed in A4** — the whole per-job body is now guarded.
 5. **Backend op-set asymmetry drives silent path changes.** `FusedQkvNorm` is
    Metal-only (`metal_backend.rs:276`) but absent from CUDA's `supports_op`
    (`cuda_backend.rs:1289-1321`), so Qwen3 decode takes the fused path on Metal

@@ -70,7 +70,7 @@ roadmap §4 defects automatically.
 | A1 | 23 | Op × dtype × backend correctness matrix | M | |
 | A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
-| A4 | 6 | Server worker panic isolation | S | |
+| A4 | 6 | Server worker panic isolation | S | ✅ done |
 | A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | |
 | A6 | 28 | Remove CPU per-op allocations | S | |
 | A7 | 26 | Dead identity fields | S | ✅ done |
@@ -125,13 +125,32 @@ roadmap §4 defects automatically.
 - **Defers to G:** nothing — the Metal path is covered by the same allocator
   guard. Phase G keeps only the *style* asymmetry (`debug_assert!` vs `Err`).
 
-### A4 — Worker panic isolation  · item 6 · S
-- **Files:** `src/server/chat.rs:454-518`.
-- **Deliverable:** the worker runs each job under `catch_unwind`; a panic emits
-  `StreamEvent::Err` for that job, logs it, and the loop continues. Slot state
-  returns to `Idle`.
-- **Acceptance:** a test that injects a panicking job gets an error response and
-  the *next* request succeeds.
+### A4 — Worker panic isolation  · item 6 · S — **DONE**
+- **Correction to the ticket as written:** the worker did have a
+  `catch_unwind` — `guarded_forward` (`chat.rs:438-450`) contains a panic inside
+  `forward_graph_cached`. It is just too narrow: the speculative path calls both
+  models' forwards **directly** (`spec.rs:385/417/447/471/509`), and the
+  tokenizer, sampler, stop-string and streaming paths were unguarded too. One
+  panic there unwound `worker_loop`, dropping `job_rx` (every later request is
+  rejected) and the already-queued jobs' event senders (an empty 200 instead of
+  an error).
+- **Files:** `src/server/chat.rs` — `run_job_isolated` + `panic_message`, called
+  around the whole per-job body in `worker_loop`; the inner `guarded_forward`
+  stays for the better message on the common case.
+- **Deliverable:** any panic in a job becomes a 500 on that request's stream,
+  is logged, and the worker keeps draining the queue with the slot released.
+- **Acceptance:** `isolated_job_turns_a_panic_into_an_error_event`,
+  `isolated_job_forwards_a_normal_error`,
+  `isolated_job_passes_success_through_silently`; `cargo test --release`
+  158 passed / 0 failed.
+- **Found while writing the test:** `panic_message(&payload)` on a
+  `Box<dyn Any + Send>` downcasts against the *Box* (which is itself `Any`) and
+  always reports a non-string payload; `&*payload` is required. Verified against
+  a throwaway `rustc` probe.
+- **Not fixed (needs a device):** a panic while the CUDA capture window holds
+  the process-wide stream mutex poisons it, so every later request would panic
+  too — now contained per job, but the server would still fail every request.
+  Recorded for the CUDA-verifiable phase.
 
 ### A5 — Staging map re-key  · item 27 · S
 - **Files:** `src/graph/alloc.rs:34`, `:592-653`; `src/graph/scheduler.rs:252-255`.
