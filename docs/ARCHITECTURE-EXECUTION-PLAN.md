@@ -324,6 +324,17 @@ re-prefilling it every turn.
   `cudaMemGetInfo`-style allocation churn (or an instrumented counter) drops.
 - **Risk:** if append-only reuse cannot be made safe without cells, stop and
   promote Phase C1 ahead of B2.
+- **Prerequisite found and cleared while testing it:** prefix reuse first
+  *failed* — suffix-only prefill differed from a full prefill by
+  `max|Δlogits| = 0.31`, and the cause was not the KV cache (its rows were
+  bitwise identical) but a genuinely `nt`-dependent CPU attention: the scores
+  were padded to the batch-wide `nkv` and the softmax/normalisation/weighted sum
+  ran over that length, so the reduction's rounding depended on how many tokens
+  shared the batch. Restricting the window to each token's own `vl = pos+1`
+  makes the path `nt`-invariant (one-token decode now reproduces a single-shot
+  prefill bitwise), which is what makes reuse safe **by construction** rather
+  than by tolerance. Recorded as roadmap §4 item 14; the pinning test is
+  `prefix_reuse_matches_a_full_prefill`.
 
 ### B3 — Measurement
 - **Deliverable:** prefill tokens and time-to-first-token per turn, before/after,
