@@ -484,7 +484,9 @@ parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `transpose_b` matmul (`cuda_backend.rs:932-937`) and `FusedQkvNorm`
 (`:1289-1321`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:282`) —
 so the two GPU backends do not implement the same op set, and a model's decode
-path differs by platform in ways not stated in `SUPPORT-MATRIX.md`.
+path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
+**Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
+Backend" table with the four asymmetric rows and their consequences.
 
 **Guard asymmetry.** Metal uses `debug_assert!` where CUDA returns `Err` for the
 same invariants (`metal_backend.rs:749`, `:800`, `:891`), so release builds pass
@@ -540,7 +542,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. | §2.5 | M |
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
 | 12 | **Backend registry** decoupling the enum from the nine match sites. | §2.6 | M |
-| 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. | §2.8 | S |
+| 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the Metal half defers to Phase G | §2.8 | S |
 | 14 | **Async cross-backend copy + events** (needed for any heterogeneous split and for multi-device execution). | §2.2 | M |
 
 ### P2 — coverage
@@ -588,11 +590,13 @@ Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
    (`chat.rs:454-518`): a panic anywhere else unwound the worker, permanently
    degrading the server (503 for new jobs, empty 200/SSE for queued ones) with
    no log.~~ **Fixed in A4** — the whole per-job body is now guarded.
-5. **Backend op-set asymmetry drives silent path changes.** `FusedQkvNorm` is
+5. ~~**Backend op-set asymmetry drives silent path changes.** `FusedQkvNorm` is
    Metal-only (`metal_backend.rs:276`) but absent from CUDA's `supports_op`
    (`cuda_backend.rs:1289-1321`), so Qwen3 decode takes the fused path on Metal
    and the unfused path on CUDA. `QkvBiasRopeStore` is the mirror case
-   (`metal_backend.rs:282`). Neither is documented in `SUPPORT-MATRIX.md`.
+   (`metal_backend.rs:282`). Neither is documented in `SUPPORT-MATRIX.md`.~~
+   **Documented in A8**: `SUPPORT-MATRIX.md` now has an "Operator Coverage by
+   Backend" table; the asymmetry is visible rather than silent.
 6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1324`), so any model
    needing the interleaved style splits every layer between CUDA and CPU,
    producing two host round trips per layer (§2.2). `ARCHITECTURE.md:391-393`
