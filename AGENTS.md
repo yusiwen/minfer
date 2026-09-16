@@ -31,7 +31,8 @@ src/
 ├── tokenizer.rs     # BPE tokenizer (self-contained, from GGUF metadata)
 ├── sampler.rs       # repeat-penalty / top-k / top-p / temperature
 ├── template.rs      # chat templates (minijinja) — 2.21.0 has no `str` methods; Qwen3's template falls back to ChatML (docs/QWEN3-SUPPORT-PLAN §5#9)
-├── conversation.rs  # multi-turn session (append-only KV)
+├── conversation.rs  # multi-turn session (append-only KV; overflow drops the oldest
+│                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
 ├── server/          # OpenAI-compatible HTTP server (axum)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
@@ -40,7 +41,7 @@ src/
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```
 
-`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op enum + NodeMeta · `builder.rs` GraphBuilder · `alloc.rs` liveness allocator + persistent KV regions · `backend.rs` Backend trait · `cpu_backend.rs` / `metal_backend.rs` / `cuda_backend.rs` executors · `scheduler.rs` assign → split → execute · `fusion.rs` SwiGLU fusion · `cache.rs` + `params.rs` params-only graph reuse · `dot.rs` DOT export · `json.rs` graph JSON export for viz.
+`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op enum + NodeMeta · `builder.rs` GraphBuilder · `alloc.rs` liveness allocator + persistent KV regions · `kvcache.rs` cell store + removal/shift (C1/C2) · `backend.rs` Backend trait · `cpu_backend.rs` / `metal_backend.rs` / `cuda_backend.rs` executors · `scheduler.rs` assign → split → execute · `fusion.rs` SwiGLU fusion · `cache.rs` + `params.rs` params-only graph reuse · `dot.rs` DOT export · `json.rs` graph JSON export for viz.
 
 ## Build & Run
 
@@ -77,7 +78,7 @@ Read `docs/GPU_SAFETY.md` before touching Metal/CUDA code. Hard rules: `submit()
 Inference = build `ComputeGraph` → assign backends → fuse → allocate → execute; one graph per `GraphParams`, reused across decode steps. Full design: `docs/COMPUTE-GRAPH-DESIGN.md`.
 
 1. **KV positions are data, not structure** — topology never depends on `n_past` (precondition for decode reuse).
-2. Each layer owns **two persistent KV regions** (K/V) via `kv_pair(layer)`; they survive rebuilds (allocator lives in `GraphCache`).
+2. Each layer owns **two persistent KV regions** (K/V) via `kv_pair(layer)`; they survive rebuilds (allocator lives in `GraphCache`). `kvcache.rs` tracks the owner of every cell (C1) and can drop a row range in place (C2): a *physical* `kv_rm`/`kv_shift` keeps `cell == pos`, so it stays host-side and no backend gains a kernel.
 3. **Reuse is params-only**: `GraphParams` (+ `CParams.gpu`) deterministically fixes the topology; `GraphCache::try_reuse` compares params only.
 4. Weight layout = GGUF: metadata `[in, out]`, memory row-major `[out][in]`; activations token-major `[nt][d]`. I32 inputs stored as `f32::from_bits` via `fill_input_i32`.
 5. In-place ops (`Silu`, `RoPE`) alias their input buffer (sole consumer + same backend only). **Never host-copy a GPU-pending buffer** (Phase-3 KV-corruption bug).

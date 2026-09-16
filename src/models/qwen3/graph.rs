@@ -530,6 +530,12 @@ impl Qwen3Graph {
             );
         }
 
+        // Phase C / C2: record how far the KV store wrote, so a context shift
+        // knows what it is allowed to drop. `max(position) + 1` is exactly the
+        // row count the store just wrote.
+        if let Some(&maxp) = positions.iter().max() {
+            alloc.kv_note_used(maxp + 1);
+        }
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
         // R3-A2: the buffer is always exactly n_out*nv (G3-reduced, or

@@ -34,6 +34,19 @@ pub trait Engine {
     fn forward(&mut self, tokens: &[u32], positions: &[usize], n_out: usize) -> Vec<f32>;
     /// Drops all KV state (called on full re-render / `/clear`).
     fn reset_cache(&mut self);
+    /// Phase C / C2: remove the KV rows of `[start, start + len)` and re-base the
+    /// rows after them by `-len`, re-roping their K, so a token that was at
+    /// position `p >= start + len` becomes addressable at `p - len`. Returns the
+    /// new written-row count.
+    ///
+    /// `Err` when this engine has no KV to remove rows from (mock/plain engines,
+    /// a fresh cache) or when the backend cannot physically move rows (Metal is
+    /// Phase G). The caller then falls back to the exact drop-and-re-render path,
+    /// so an unavailable shift costs time and is logged — it is never silent and
+    /// never corrupts the session.
+    fn kv_rm(&mut self, _start: usize, _len: usize) -> Result<usize, String> {
+        Err("this engine has no KV rows to remove".to_string())
+    }
     /// doc 97: whether speculative rounds are available (mock/plain engines: no).
     fn has_spec(&self) -> bool {
         false
@@ -135,6 +148,15 @@ impl Engine for SpecAwareEngine<'_> {
             sp.reset_draft();
         }
     }
+    fn kv_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
+        // The draft carries its own KV indexed by the same absolute positions;
+        // moving the target's rows without moving the draft's would desync the
+        // two, so a speculative session re-renders instead (the caller logs it).
+        if self.spec.is_some() {
+            return Err("context shift with a speculative draft is not wired".to_string());
+        }
+        self.inner.kv_rm(start, len)
+    }
     fn has_spec(&self) -> bool {
         self.spec.is_some()
     }
@@ -162,6 +184,21 @@ impl Engine for GraphEngine<'_> {
     }
     fn reset_cache(&mut self) {
         self.cache = GraphCache::new();
+    }
+    fn kv_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
+        // The physical removal is host-side by design (memmove + re-rope through
+        // the existing `copy_kv_to_cpu` / `write_host` pair), so it needs no
+        // backend kernel — but a backend that cannot hand its KV to the host
+        // fails here and the caller re-renders.
+        let (freq_base, freq_scale) = self.model.rope_params();
+        let rope = crate::graph::kvcache::KvRope {
+            freq_base,
+            freq_scale,
+            n_head_kv: self.model.n_head_kv(),
+            hd: self.model.n_embd_head(),
+            style: self.model.rope_style(),
+        };
+        self.cache.alloc().kv_rm(start, len, &rope)
     }
 }
 
@@ -268,6 +305,34 @@ pub struct Conversation {
 
 const REPEAT_LAST_N: usize = 64;
 
+/// Renders a message list the way a session does: the model's own chat template
+/// when it has one, the ChatML fallback otherwise.
+fn render_messages_with(
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    add_generation_prompt: bool,
+    bos_text: &str,
+) -> String {
+    match template {
+        Some(t) => template::render_messages(t, messages, add_generation_prompt, bos_text),
+        None => template::fallback_chatml_messages(messages, add_generation_prompt),
+    }
+}
+
+/// Start of the oldest droppable turn: the index of the first user message before
+/// the last user message. `None` when only the system prompt and the current user
+/// message are left.
+fn oldest_droppable_turn_start(messages: &[(String, Option<String>)]) -> Option<usize> {
+    let last_user = messages.iter().rposition(|m| m.0 == "user")?;
+    (0..last_user).find(|&i| messages[i].0 == "user")
+}
+
+/// C2's context shift is on by default (llama.cpp's server does the same);
+/// `MINFER_NO_CONTEXT_SHIFT=1` forces the exact drop-and-re-render overflow path.
+fn context_shift_enabled() -> bool {
+    !std::env::var("MINFER_NO_CONTEXT_SHIFT").map_or(false, |v| v == "1")
+}
+
 impl Conversation {
     pub fn new(spec: ConversationSpec) -> Self {
         let messages = spec
@@ -297,12 +362,12 @@ impl Conversation {
 
     /// Fully renders the current messages (with/without the generation prompt).
     fn render_full(&self, add_generation_prompt: bool) -> String {
-        match &self.template {
-            Some(t) => {
-                template::render_messages(t, &self.messages, add_generation_prompt, &self.bos_text)
-            }
-            None => template::fallback_chatml_messages(&self.messages, add_generation_prompt),
-        }
+        render_messages_with(
+            self.template.as_deref(),
+            &self.messages,
+            add_generation_prompt,
+            &self.bos_text,
+        )
     }
 
     /// Resets the cache and prefills the given token stream from scratch (the full re-render path).
@@ -558,10 +623,17 @@ impl Conversation {
         emit: &mut dyn FnMut(&[u8]),
     ) -> Result<TurnOutcome, ConvError> {
         // 1. Previous turn did not reach EOG → insert EOT first, keeping the KV consistent with the template's canonical output (§5.4).
-        if self.need_insert_eot {
+        //
+        // (C2) When the context is already full the EOT cannot be written yet:
+        // the overflow path below makes room first, and the token — which belongs
+        // at the *end* of the stream in both cases — commutes with the removal.
+        let mut eot_written = false;
+        if self.need_insert_eot && self.current_pos < self.n_ctx {
             let _ = engine.forward(&[self.eot], &[self.current_pos], 1);
             self.stream_tokens.push(self.eot);
             self.current_pos += 1;
+            self.need_insert_eot = false;
+            eot_written = true;
         }
 
         // 2. Incremental rendering (diff-based, §5.3).
@@ -594,36 +666,147 @@ impl Conversation {
             return Ok(out);
         }
 
-        // 4. Context overflow: drop the oldest non-system turn + full re-render (§5.7).
-        if self.current_pos + delta_toks.len() > self.n_ctx {
+        // 4. Context overflow: drop the oldest non-system turns (§5.7).
+        //
+        // C2: when the engine can remove KV rows, the retained turns keep their
+        // rows — the dropped turn's token region is removed physically and the
+        // rows after it are re-based (K re-roped) — so the turn costs one delta
+        // prefill instead of a re-prefill of the whole retained conversation.
+        // The retained rows keep the values they were computed with, i.e. the
+        // influence of the dropped turns: that is C2's named tolerance class
+        // (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §5). `MINFER_NO_CONTEXT_SHIFT=1`
+        // forces the exact drop-and-re-render path instead.
+        let eot_budget = usize::from(self.need_insert_eot);
+        if self.current_pos + eot_budget + delta_toks.len() > self.n_ctx {
             self.messages
                 .push(("user".to_string(), Some(input.to_string())));
-            let dropped = self.drop_oldest_turns_until_fits(decoder);
-            if dropped == 0 {
+            let (first, dropped_msg) = self.plan_overflow_drop(decoder);
+            if dropped_msg == 0 {
                 // Only [system?, last user] left and it still does not fit: a single message is too long, error out.
                 // Roll back: pop the just-pushed user message and reset the EOT flag (if EOT was written this turn,
                 // it already closed the previous turn correctly and must not be inserted again next turn).
                 self.messages.pop();
-                self.need_insert_eot = false;
+                // If the EOT was written this turn it already closed the previous
+                // turn; otherwise it is still pending for the next attempt.
+                self.need_insert_eot = !eot_written;
                 return Err(ConvError::ContextFull {
-                    needed: self.current_pos + delta_toks.len(),
+                    needed: self.current_pos + eot_budget + delta_toks.len(),
                     available: self.n_ctx,
                 });
             }
+            // Both boundaries are verified against the stream before anything is
+            // touched; an unverifiable one (an exotic template, a backend that
+            // cannot move rows) falls back to the exact re-render.
+            let region = self.overflow_region(first, dropped_msg, decoder);
+            self.messages.drain(first..first + dropped_msg);
             let full = self.render_full(true);
             let toks = decoder.encode(&full);
-            let logits = self.rehydrate_full(engine, &toks);
+
+            let mut used_shift = false;
+            let mut shifted_logits = None;
+            if context_shift_enabled() {
+                match region {
+                    Some((start, len))
+                        if len > 0
+                            && start + len <= self.current_pos
+                            && self.current_pos - len + eot_budget + delta_toks.len()
+                                <= self.n_ctx =>
+                    {
+                        match engine.kv_rm(start, len) {
+                            Ok(n) => {
+                                // `n` is the engine's written-row count. It can
+                                // exceed the stream length because a `/regen`
+                                // rollback leaves stale rows behind, so the only
+                                // invariant to hold it to is that nothing that
+                                // was addressable got lost.
+                                debug_assert!(
+                                    n + len >= self.current_pos,
+                                    "the removal dropped addressable rows ({n} + {len} < {})",
+                                    self.current_pos
+                                );
+                                self.stream_tokens.drain(start..start + len);
+                                self.current_pos = self.stream_tokens.len();
+                                // The pending EOT belongs at the end of the
+                                // stream, so it survives the removal and lands at
+                                // its shifted position.
+                                if self.need_insert_eot {
+                                    let _ = engine.forward(&[self.eot], &[self.current_pos], 1);
+                                    self.stream_tokens.push(self.eot);
+                                    self.current_pos += 1;
+                                    self.need_insert_eot = false;
+                                    eot_written = true;
+                                }
+                                self.turn_pos = self.current_pos;
+                                let positions: Vec<usize> =
+                                    (self.current_pos..self.current_pos + delta_toks.len()).collect();
+                                let logits = engine.forward(&delta_toks, &positions, 1);
+                                self.stream_tokens.extend_from_slice(&delta_toks);
+                                self.current_pos += delta_toks.len();
+                                used_shift = true;
+                                shifted_logits = Some(logits);
+                                eprintln!(
+                                    "[conversation] context shift: dropped {len} KV rows at {start} \
+                                     ({dropped_msg} messages), prefill {} tokens instead of {}",
+                                    delta_toks.len(),
+                                    toks.len()
+                                );
+                            }
+                            Err(e) => eprintln!(
+                                "[conversation] context shift unavailable ({e}); re-rendering the retained turns"
+                            ),
+                        }
+                    }
+                    // The dropped region could not be located in the KV stream
+                    // (or the result would not fit): re-render, which is exact.
+                    _ => eprintln!(
+                        "[conversation] context shift not applicable (region {region:?} against {} \
+                         written rows); re-rendering the retained turns",
+                        self.current_pos
+                    ),
+                }
+            }
+            let logits = match shifted_logits {
+                Some(l) => l,
+                None => {
+                    // The re-rendered prompt carries the assistant's <|im_end|>,
+                    // so a pending EOT is already covered by it.
+                    self.need_insert_eot = false;
+                    self.rehydrate_full(engine, &toks)
+                }
+            };
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
             let mut out =
                 self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
-            out.prefill_tokens = toks.len();
-            out.dropped_turns = dropped;
+            out.prefill_tokens = if used_shift {
+                delta_toks.len()
+            } else {
+                toks.len()
+            };
+            out.dropped_turns = dropped_msg / 2;
             return Ok(out);
         }
 
         // 5. Record the user message, set the rollback point, prefill the delta.
         self.messages
             .push(("user".to_string(), Some(input.to_string())));
+        // The very first turn has no KV yet, and `delta_toks` covers only the new
+        // message: whatever already sits in `messages` (the `--system` prompt) has
+        // to be prefilled too, or the stream would not be the canonical render
+        // (§5.4) — and the system prompt would silently never reach the model.
+        if self.current_pos == 0 {
+            let full = self.render_full(true);
+            let toks = decoder.encode(&full);
+            if toks.is_empty() {
+                self.messages.pop();
+                return Err(ConvError::EmptyInput);
+            }
+            let logits = self.rehydrate_full(engine, &toks);
+            self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
+            let mut out =
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+            out.prefill_tokens = toks.len();
+            return Ok(out);
+        }
         self.turn_pos = self.current_pos;
         let positions: Vec<usize> =
             (self.current_pos..self.current_pos + delta_toks.len()).collect();
@@ -708,31 +891,91 @@ impl Conversation {
         self.need_insert_eot = false;
     }
 
-    /// Context overflow: drop the oldest non-system turns (a user + its assistant pair) until
-    /// the token count of `render(messages, true)` is ≤ n_ctx. Returns the number of dropped turns;
-    /// returns 0 when only [system?, last user] is left and it still does not fit (the caller errors out).
-    fn drop_oldest_turns_until_fits(&mut self, decoder: &dyn TokenCodec) -> usize {
-        let mut dropped = 0;
+    /// Context overflow plan: drop the oldest non-system turns (a user + its
+    /// assistant pair) until the token count of `render(messages, true)` fits
+    /// `n_ctx`. Returns the index of the first message to drop and how many
+    /// consecutive messages that is; `(0, 0)` when only `[system?, last user]` is
+    /// left and it still does not fit (the caller reports `ContextFull`).
+    ///
+    /// Planned against a copy of the message list, so the caller can still
+    /// resolve the dropped region's token span in the KV *before* the messages
+    /// change.
+    fn plan_overflow_drop(&self, decoder: &dyn TokenCodec) -> (usize, usize) {
+        let mut msgs = self.messages.clone();
+        // Indices in the *original* message list: `removed` messages before the
+        // current drop have already gone, and drops always take the oldest turn,
+        // so `idx + removed` maps the working index back.
+        let mut first = usize::MAX;
+        let mut end = 0usize;
+        let mut removed = 0usize;
         loop {
-            let full = self.render_full(true);
+            let full = render_messages_with(self.template.as_deref(), &msgs, true, &self.bos_text);
             if decoder.encode(&full).len() <= self.n_ctx {
-                return dropped;
+                break;
             }
-            let Some(idx) = self.oldest_droppable_turn_start() else {
-                return dropped;
+            let Some(idx) = oldest_droppable_turn_start(&msgs) else {
+                break;
             };
-            self.messages.remove(idx);
-            if idx < self.messages.len() && self.messages[idx].0 == "assistant" {
-                self.messages.remove(idx);
+            msgs.remove(idx);
+            let mut n = 1;
+            if idx < msgs.len() && msgs[idx].0 == "assistant" {
+                msgs.remove(idx);
+                n = 2;
             }
-            dropped += 1;
+            if first == usize::MAX {
+                first = idx + removed;
+            }
+            removed += n;
+            end = idx + removed;
+        }
+        if first == usize::MAX {
+            (0, 0)
+        } else {
+            (first, end - first)
         }
     }
 
-    /// Start of the oldest droppable turn: the position of the first user message before the last user message.
-    fn oldest_droppable_turn_start(&self) -> Option<usize> {
-        let last_user = self.messages.iter().rposition(|m| m.0 == "user")?;
-        (0..last_user).find(|&i| self.messages[i].0 == "user")
+    /// Token region `[start, start + len)` of the KV stream that messages
+    /// `[first, first + count)` occupy, or `None` when the region cannot be
+    /// verified against the stream (see [`Conversation::stream_boundary`]).
+    fn overflow_region(
+        &self,
+        first: usize,
+        count: usize,
+        decoder: &dyn TokenCodec,
+    ) -> Option<(usize, usize)> {
+        if count == 0 {
+            return None;
+        }
+        let start = self.stream_boundary(first, decoder)?;
+        let end = self.stream_boundary(first + count, decoder)?;
+        (end > start).then_some((start, end - start))
+    }
+
+    /// Token offset at which message `upto` starts in the KV stream, verified:
+    /// `messages[..upto]` must render to a token *prefix* of the stream.
+    ///
+    /// The stream is the canonical render (§5.4), but it was built from
+    /// incremental deltas, so a boundary is only usable when re-encoding the
+    /// render of the messages before it reproduces the stream's first tokens
+    /// exactly. A template whose deltas do not line up that way — or a session
+    /// state where they do not — yields `None`, and the caller falls back to the
+    /// exact re-render path instead of shifting the wrong rows.
+    fn stream_boundary(&self, upto: usize, decoder: &dyn TokenCodec) -> Option<usize> {
+        if upto == 0 {
+            return Some(0);
+        }
+        if upto > self.messages.len() {
+            return None;
+        }
+        let text = render_messages_with(
+            self.template.as_deref(),
+            &self.messages[..upto],
+            false,
+            &self.bos_text,
+        );
+        let toks = decoder.encode(&text);
+        self.stream_tokens.starts_with(&toks).then_some(toks.len())
     }
 
     /// `--session`: serializes messages as an OpenAI-style JSON array
@@ -913,6 +1156,13 @@ mod tests {
         /// doc 97: when non-empty the engine carries a speculative draft;
         /// each spec_round pops one pre-accepted batch.
         spec_batches: VecDeque<Vec<u32>>,
+        /// C2: when true the mock accepts KV row removals and records them;
+        /// false is the plain engine (and GraphEngine without a shiftable
+        /// backend), which makes the conversation re-render instead.
+        shiftable: bool,
+        /// C2: virtual written rows, so `kv_rm` can report the new count.
+        rows: usize,
+        shifts: Vec<(usize, usize)>,
     }
 
     impl MockEngine {
@@ -923,6 +1173,9 @@ mod tests {
                 resets: 0,
                 vocab: 4096,
                 spec_batches: VecDeque::new(),
+                shiftable: false,
+                rows: 0,
+                shifts: Vec::new(),
             }
         }
         fn call_tokens(&self) -> Vec<u32> {
@@ -934,6 +1187,9 @@ mod tests {
         fn forward(&mut self, tokens: &[u32], positions: &[usize], n_out: usize) -> Vec<f32> {
             self.calls
                 .push((tokens.to_vec(), positions.to_vec(), n_out));
+            if let Some(&p) = positions.last() {
+                self.rows = self.rows.max(p + 1);
+            }
             let id = self.program.pop_front().unwrap_or(EOS);
             let mut logits = vec![0.0f32; self.vocab];
             logits[id as usize] = 100.0;
@@ -941,6 +1197,16 @@ mod tests {
         }
         fn reset_cache(&mut self) {
             self.resets += 1;
+            self.rows = 0;
+        }
+        fn kv_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
+            if !self.shiftable {
+                return Err("mock engine without a KV".to_string());
+            }
+            assert!(start + len <= self.rows, "removal past the written rows");
+            self.shifts.push((start, len));
+            self.rows -= len;
+            Ok(self.rows)
         }
         fn has_spec(&self) -> bool {
             !self.spec_batches.is_empty()
@@ -1369,6 +1635,111 @@ mod tests {
 
     // === Phase 3: overflow truncation + session persistence ===
 
+    /// C2: with a shiftable engine, an overflowing turn removes the dropped
+    /// turn's rows from the KV instead of re-rendering, so it prefills only its
+    /// own delta — and the resulting stream is still the canonical render of the
+    /// new message list (the §5.4 invariant), which is what makes the shortcut
+    /// safe to take.
+    #[test]
+    fn overflow_shift_removes_the_turn_and_prefills_only_the_delta() {
+        let mut c = conv(50);
+        let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        assert_eq!(c.stream_tokens.len(), 44);
+
+        let mut eng3 = MockEngine::new(vec![IM_END, EOS]);
+        eng3.shiftable = true;
+        eng3.rows = c.current_pos; // the stub mirrors the session's written rows
+        let out = c
+            .user_turn("X", &FakeCodec, &cfg(), &mut eng3, &mut noop_emit())
+            .unwrap();
+
+        assert_eq!(out.dropped_turns, 1, "the oldest turn is dropped");
+        assert_eq!(eng3.resets, 0, "a shift must not reset the cache");
+        assert_eq!(eng3.shifts.len(), 1, "exactly one KV removal");
+        let (start, len) = eng3.shifts[0];
+        // "hi" and its reply are gone; Q's turn is still at the stream head.
+        assert_eq!(start, 0, "Q's turn starts at the stream head");
+        assert_eq!(
+            len, 23,
+            "the dropped turn's span, including its trailing newline"
+        );
+        // The overflow turn prefills its own delta, not the whole render.
+        // (`c.messages` now ends with the new reply; the canonical prompt is the
+        // messages as they were when the turn's prefill ran.)
+        let full = fallback_full(&c.messages[..c.messages.len() - 1]);
+        let delta = format_single(
+            None,
+            &c.messages[..c.messages.len() - 2],
+            ("user".to_string(), Some("X".to_string())),
+            true,
+            "",
+        );
+        assert_eq!(
+            out.prefill_tokens,
+            FakeCodec.encode(&delta.text).len(),
+            "only the overflow turn's own delta is prefilled"
+        );
+        assert!(
+            out.prefill_tokens < full.len(),
+            "the shift must not re-prefill the render ({} vs {})",
+            out.prefill_tokens,
+            full.len()
+        );
+
+        // The §5.4 invariant survives the removal: the stream is exactly the
+        // canonical render of the final message list.
+        assert_eq!(c.messages.len(), 4);
+        assert_eq!(c.stream_tokens, [&full[..], &[IM_END]].concat());
+        assert_eq!(c.current_pos, c.stream_tokens.len());
+    }
+
+    /// C2: a system prompt is *not* part of the removed region — the drop starts
+    /// after it, so the shift is a middle removal (`start > 0`), and the system
+    /// prompt's rows are not even re-roped.
+    #[test]
+    fn overflow_shift_keeps_the_system_prompt_in_place() {
+        let mut spec = spec(60);
+        spec.system_prompt = Some("sys".to_string());
+        let mut c = Conversation::new(spec);
+        // The system prompt is part of the first turn's delta; the boundary check
+        // must still resolve it (ChatML renders it as its own block).
+        let mut eng = MockEngine::new(vec![IM_END, EOS, IM_END, EOS]);
+        eng.shiftable = true;
+        c.user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        let sys_tokens = canonical(&[("system".into(), Some("sys".into()))]);
+        let mut eng3 = MockEngine::new(vec![IM_END, EOS]);
+        eng3.shiftable = true;
+        eng3.rows = c.current_pos; // the stub mirrors the session's written rows
+        let out = c
+            .user_turn("X", &FakeCodec, &cfg(), &mut eng3, &mut noop_emit())
+            .unwrap();
+        assert_eq!(out.dropped_turns, 1);
+        assert_eq!(eng3.shifts.len(), 1, "the shift must fire");
+        let (start, _) = eng3.shifts[0];
+        assert_eq!(
+            start,
+            sys_tokens.len(),
+            "the removed region starts right after the system prompt"
+        );
+        assert_eq!(
+            &c.stream_tokens[..sys_tokens.len()],
+            &sys_tokens[..],
+            "the system prompt's tokens stay at the head"
+        );
+        assert_eq!(
+            c.messages[0],
+            ("system".into(), Some("sys".into())),
+            "the system prompt survives the drop"
+        );
+    }
+
     #[test]
     fn overflow_truncates_oldest_turns_and_rehydrates() {
         // n_ctx=50: turn1(22) + turn2(44) both fit; turn3's delta makes
@@ -1490,18 +1861,52 @@ mod tests {
         assert_eq!(c2.current_pos, c2.stream_tokens.len());
     }
 
+    /// The very first `user_turn` has no KV yet, so it must prefill the whole
+    /// render — including anything already in `messages`, i.e. the `--system`
+    /// prompt. Before C2 the delta was prefilled on its own, which silently
+    /// dropped the system prompt from the KV.
+    #[test]
+    fn first_user_turn_prefills_the_system_prompt() {
+        let mut sp = spec(128);
+        sp.system_prompt = Some("be brief".to_string());
+        let mut c = Conversation::new(sp);
+        let mut eng = MockEngine::new(vec![IM_END]);
+        let out = c
+            .user_turn("hi", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+
+        let full = fallback_full(&[
+            ("system".into(), Some("be brief".into())),
+            ("user".into(), Some("hi".into())),
+        ]);
+        assert_eq!(
+            c.stream_tokens,
+            [&full[..], &[IM_END]].concat(),
+            "the first turn's KV must be the canonical render + EOG"
+        );
+        assert_eq!(out.prefill_tokens, full.len());
+        let sys = canonical(&[("system".into(), Some("be brief".into()))]);
+        assert_eq!(
+            &c.stream_tokens[..sys.len()],
+            &sys[..],
+            "the system prompt must reach the KV"
+        );
+    }
+
+    /// The locally cached Qwen2.5-0.5B q4_0 the real-model tests run against.
+    fn cached_qwen05_q4_0() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
+        p.exists().then_some(p)
+    }
+
     /// Real-model 2-turn smoke test (part of L2; ignored by default, consistent with the existing realdata tests):
     ///   cargo test --bin minfer conversation_real_model_smoke -- --ignored
     /// Requires the locally cached Qwen2.5-0.5B q4_0 (skips if absent).
     #[test]
     #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
     fn conversation_real_model_smoke() {
-        fn cached_qwen05_q4_0() -> Option<std::path::PathBuf> {
-            let home = std::env::var_os("HOME")?;
-            let mut p = std::path::PathBuf::from(home);
-            p.push(".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf");
-            p.exists().then_some(p)
-        }
         let Some(path) = cached_qwen05_q4_0() else {
             eprintln!("0.5B q4_0 not cached; skipping conversation smoke");
             return;
@@ -1583,6 +1988,124 @@ mod tests {
         assert!(
             !conv.need_insert_eot,
             "greedy 0.5B usually EOGs; if this trips, inspect output"
+        );
+    }
+
+    /// C2 real-model measurement: with a small context the conversation must
+    /// overflow, and the overflowing turn must *shift* the KV window — prefilling
+    /// only its own delta — instead of re-prefilling the retained render.
+    ///
+    ///   cargo test --release --bin minfer context_shift_real_model -- --ignored --nocapture
+    ///
+    /// This is the check that the shift is actually reachable on a real model:
+    /// the token boundaries are re-derived from the chat template and verified
+    /// against the KV stream, which a byte-level test codec cannot exercise. The
+    /// printed numbers are the ones recorded in the execution plan's C2 record;
+    /// the assertion is that the shift fires, not that its logits match a fresh
+    /// prefill (they cannot — that is C2's tolerance class).
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn context_shift_real_model_measurement() {
+        let Some(path) = cached_qwen05_q4_0() else {
+            eprintln!("0.5B q4_0 not cached; skipping the context-shift measurement");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ctx = &gguf.parts[0].ctx;
+        let template = ctx
+            .kv
+            .iter()
+            .find(|kv| kv.key == "tokenizer.chat_template")
+            .map(|kv| kv.get_val_str(0).to_string());
+        let special = model.special_tokens();
+        let bos_text = tok
+            .id_to_token
+            .get(tok.bos_token as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        // A context this small overflows after a handful of short turns; the
+        // system prompt makes the retained prefix non-empty, which is the
+        // conversation case the shift exists for.
+        let n_ctx = 192;
+        let spec = ConversationSpec {
+            template,
+            bos_text,
+            eog: {
+                let mut v = vec![special.eos];
+                if let Some(im) = special.im_end {
+                    v.push(im);
+                }
+                v
+            },
+            eot: special.im_end.unwrap_or(special.eos),
+            seed: 42,
+            n_ctx,
+            system_prompt: Some("You are a terse assistant: answer in one short sentence.".into()),
+        };
+        let mut conv = Conversation::new(spec);
+        let mut engine = GraphEngine::new(&*model, n_ctx);
+        let tp = TurnParams {
+            n_predict: 8, // keep the run short; a few tokens per reply still overflow n_ctx
+            temp: 0.0,
+            top_k: 40,
+            top_p: 0.95,
+            repeat_penalty: 1.1,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            stop_strings: Vec::new(),
+        };
+        let prompts = [
+            "The capital of France is",
+            "The capital of Japan is",
+            "The capital of Italy is",
+            "The capital of Spain is",
+            "The capital of Egypt is",
+            "The capital of Peru is",
+            "The capital of Kenya is",
+            "The capital of Norway is",
+            "The capital of Sweden is",
+            "The capital of Greece is",
+            "The capital of Poland is",
+            "The capital of Portugal is",
+        ];
+        let mut shifted = 0usize;
+        let mut rehydrated = 0usize;
+        for (i, p) in prompts.iter().enumerate() {
+            let before = conv.stream_tokens.len();
+            let out = conv
+                .user_turn(p, &tok, &tp, &mut engine, &mut |_| {})
+                .expect("turn");
+            eprintln!(
+                "[c2] real-model turn {i}: prefill {} tokens (stream {before} -> {}), \
+                 dropped {} turn(s), reply {:?}",
+                out.prefill_tokens,
+                conv.stream_tokens.len(),
+                out.dropped_turns,
+                out.text
+            );
+            if out.dropped_turns > 0 {
+                if out.prefill_tokens < 40 {
+                    shifted += 1;
+                } else {
+                    rehydrated += 1;
+                }
+            }
+            assert_eq!(conv.current_pos, conv.stream_tokens.len());
+            assert!(
+                conv.stream_tokens.len() <= n_ctx,
+                "the KV must stay inside n_ctx"
+            );
+        }
+        assert_eq!(
+            rehydrated, 0,
+            "an overflow must shift the window, not re-prefill the retained render"
+        );
+        assert!(shifted > 0, "no turn overflowed n_ctx = {n_ctx}");
+        eprintln!(
+            "[c2] context shift fired on {shifted} overflow(s); no full re-render was needed"
         );
     }
 }

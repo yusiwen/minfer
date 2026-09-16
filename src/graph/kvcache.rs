@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use super::BufRef;
+use crate::vec_ops::RopeStyle;
 
 /// Sequence identifier. C1 has exactly one implicit sequence; C2/E add more.
 pub type SeqId = u32;
@@ -177,6 +178,105 @@ impl KvCache {
     pub fn clear_identity(&mut self) {
         self.identity = false;
     }
+
+    /// Bookkeeping for a physical removal of rows `[start, start + len)`: the
+    /// caller has already moved the rows after them down by `len` in every
+    /// arena (see the allocator's `kv_rm`), so the store only renumbers.
+    ///
+    /// The mapping stays the **identity** — a physical removal leaves `cell ==
+    /// pos` for every surviving row (rows `[0, start)` do not even move) —
+    /// which is why C2 needs no Backend-trait hand-off and no GPU kernel: the
+    /// removal is a host-side memmove plus a re-rope, both done through the
+    /// existing `copy_kv_to_cpu`/`write_host` pair. Returns the new `n_used`.
+    ///
+    /// Removing everything written (`start == 0`, `len == n_used`) is allowed and
+    /// empties the arena; removing past the end is an error, not a silent
+    /// truncation.
+    pub fn after_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
+        let mut new_used = 0usize;
+        for (layer, l) in self.layers.iter_mut() {
+            if start + len > l.n_used {
+                return Err(format!(
+                    "KV layer {layer}: cannot remove {len} rows at {start} of {} written rows",
+                    l.n_used
+                ));
+            }
+            // Rows [start + len, n_used) slide down; the freed tail becomes FREE.
+            l.owner.copy_within(start + len..l.n_used, start);
+            for cell in (l.n_used - len)..l.n_used {
+                l.owner[cell] = FREE;
+            }
+            l.n_used -= len;
+            new_used = l.n_used;
+        }
+        Ok(new_used)
+    }
+
+    /// Sliding-window special case of [`KvCache::after_rm`]: drop the oldest
+    /// `drop` rows, so every survivor's position decreases by `drop`.
+    pub fn after_shift(&mut self, drop: usize) -> Result<usize, String> {
+        self.after_rm(0, drop)
+    }
+}
+
+/// RoPE parameters a KV shift needs to re-rope the stored K rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KvRope {
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    /// KV heads in one row (`n_head_kv`).
+    pub n_head_kv: usize,
+    /// Per-head width.
+    pub hd: usize,
+    pub style: RopeStyle,
+}
+
+/// Re-rope `k` in place so that every row that was written at position `p`
+/// becomes consistent with position `p - delta`.
+///
+/// RoPE applies the pair rotation `theta_i = p * freq_i`, so changing the
+/// position by `-delta` is a rotation by `-delta * freq_i` — the same angle for
+/// every row, which is why a whole window can be shifted in one pass.
+///
+/// **Not bitwise with a fresh prefill.** Re-roping an already-roped vector
+/// composes two rotations instead of applying one, so the result differs in the
+/// last ulp or two; the measured size of that difference is what C2 records as
+/// its named tolerance class (the alternative is re-prefilling the window).
+///
+/// `k` is the whole arena (`n_ctx * n_head_kv * hd` floats, row-major with the
+/// heads contiguous inside a row); only the first `rows` rows are touched.
+/// `delta` is signed so the rotation can be undone (`-delta` restores the rows
+/// to within the same tolerance class), which is what the tests check.
+pub fn rope_shift_kv(k: &mut [f32], rows: usize, delta: isize, rope: &KvRope) {
+    let hd = rope.hd;
+    let half = hd / 2;
+    if half == 0 || delta == 0 || rows == 0 {
+        return;
+    }
+    let row_elems = rope.n_head_kv * hd;
+    debug_assert!(k.len() >= rows * row_elems, "K arena shorter than `rows`");
+    // The shift is a rotation by `-delta * freq_i`, the same for every row.
+    let angles: Vec<f32> = (0..half)
+        .map(|i| {
+            let freq = rope.freq_scale / rope.freq_base.powf((2 * i) as f32 / hd as f32);
+            -(delta as f32) * freq
+        })
+        .collect();
+    for r in 0..rows {
+        for h in 0..rope.n_head_kv {
+            let b = r * row_elems + h * hd;
+            for (i, &th) in angles.iter().enumerate() {
+                let (sn, cs) = th.sin_cos();
+                let (i0, i1) = match rope.style {
+                    RopeStyle::NonInterleaved => (b + i, b + i + half),
+                    RopeStyle::Interleaved => (b + 2 * i, b + 2 * i + 1),
+                };
+                let (x0, x1) = (k[i0], k[i1]);
+                k[i0] = x0 * cs - x1 * sn;
+                k[i1] = x0 * sn + x1 * cs;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +360,106 @@ mod tests {
             !c.is_identity(),
             "once false, positions are no longer cells"
         );
+    }
+
+    #[test]
+    fn after_shift_renumbers_and_frees_the_tail() {
+        let mut c = cache(4);
+        c.own_prefix(SEQ_MAIN, 4);
+        assert_eq!(c.after_shift(1).unwrap(), 3, "new n_used");
+        for (_, l) in c.iter() {
+            assert_eq!(l.n_used, 3);
+            assert_eq!(l.owner, vec![SEQ_MAIN, SEQ_MAIN, SEQ_MAIN, FREE]);
+        }
+        // Removing past the end is an error, not a silent truncation.
+        let err = c.after_shift(4).unwrap_err();
+        assert!(err.contains("cannot remove 4 rows at 0 of 3"), "got: {err}");
+        // A physical shift keeps the identity mapping: no backend hand-off.
+        assert!(c.is_identity());
+    }
+
+    #[test]
+    fn after_rm_removes_a_middle_range_and_frees_the_tail() {
+        let mut c = cache(6);
+        c.own_prefix(SEQ_MAIN, 6);
+        // Drop cells 2..4: [0,1] stay, [4,5] slide to [2,3], the tail frees.
+        assert_eq!(c.after_rm(2, 2).unwrap(), 4, "new n_used");
+        for (_, l) in c.iter() {
+            assert_eq!(l.n_used, 4);
+            assert_eq!(
+                l.owner,
+                vec![SEQ_MAIN, SEQ_MAIN, SEQ_MAIN, SEQ_MAIN, FREE, FREE]
+            );
+        }
+        // Removing every written row empties the arena.
+        assert_eq!(c.after_rm(0, 4).unwrap(), 0);
+        for (_, l) in c.iter() {
+            assert_eq!(l.n_used, 0);
+            assert!(l.owner.iter().all(|&o| o == FREE));
+        }
+        assert!(c.is_identity(), "a physical removal keeps cell == pos");
+    }
+
+    /// A shift must reproduce "the same tokens, roped at their new positions".
+    /// It cannot be bitwise (two composed rotations vs one), so this pins both
+    /// the equivalence and the size of the difference — C2's tolerance class.
+    #[test]
+    fn rope_shift_matches_roping_at_the_new_position() {
+        let rope = KvRope {
+            freq_base: 10_000.0,
+            freq_scale: 1.0,
+            n_head_kv: 2,
+            hd: 4,
+            style: RopeStyle::NonInterleaved,
+        };
+        // Rope a row at `pos` exactly the way the kernels do.
+        fn rope_at(x: &mut [f32], pos: usize, rope: &KvRope) {
+            let half = rope.hd / 2;
+            for h in 0..rope.n_head_kv {
+                let b = h * rope.hd;
+                for i in 0..half {
+                    let f = rope.freq_scale / rope.freq_base.powf((2 * i) as f32 / rope.hd as f32);
+                    let (sn, cs) = (pos as f32 * f).sin_cos();
+                    let (i0, i1) = (b + i, b + i + half);
+                    let (x0, x1) = (x[i0], x[i1]);
+                    x[i0] = x0 * cs - x1 * sn;
+                    x[i1] = x0 * sn + x1 * cs;
+                }
+            }
+        }
+
+        let base: Vec<f32> = (0..(rope.n_head_kv * rope.hd))
+            .map(|i| (i as f32 + 1.0) * 0.25)
+            .collect();
+        let pos = 7;
+        let delta = 3;
+
+        let mut shifted = base.clone();
+        rope_at(&mut shifted, pos, &rope);
+        rope_shift_kv(&mut shifted, 1, delta, &rope);
+
+        let mut reference = base.clone();
+        rope_at(&mut reference, pos - delta as usize, &rope);
+
+        let worst = shifted
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = reference.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
+        eprintln!(
+            "[c2] rope-shift tolerance class: max |Δ| = {worst} (relative {})",
+            worst / scale
+        );
+        assert!(
+            worst < 1e-5,
+            "shift must land on the new-position rope, got |Δ| = {worst}"
+        );
+        // delta = 0 must be a no-op.
+        let mut untouched = base.clone();
+        rope_at(&mut untouched, pos, &rope);
+        let mut same = untouched.clone();
+        rope_shift_kv(&mut same, 1, 0, &rope);
+        assert_eq!(same, untouched);
     }
 }

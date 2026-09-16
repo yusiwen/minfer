@@ -64,7 +64,12 @@ Conversation options:
 - `-mli, --multiline-input` — submit input on an empty line
 - `--color on|off|auto` — color output (default auto = tty)
 - `--session <FILE>` — save/load the conversation history as JSON; on overflow
-  the oldest turns are dropped automatically and generation continues
+  the oldest turns are dropped automatically and generation continues. The
+  dropped turn's KV rows are removed in place and the tail is re-based (Phase C
+  / C2), so only the new turn's delta is prefilled; `MINFER_NO_CONTEXT_SHIFT=1`
+  forces the older, exact "drop the turns and re-prefill the rest" behaviour
+  (an engine that cannot move rows — e.g. Metal, where it is Phase G — falls
+  back to that path on its own and says so on stderr)
 
 Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 (single-shot mode too, when stdout is a terminal or `MINFER_COLOR=1`).

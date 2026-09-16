@@ -622,6 +622,12 @@ impl Qwen2Graph {
         // reduced the last layer + lm_head to n_out rows (buffer = n_out*nv);
         // without it (decode, n_out == nt) the buffer is nv*nt == n_out*nv.
         // Either way the first n_out*nv elements are the answer.
+        // Phase C / C2: record how far the KV store wrote, so a context shift
+        // knows what it is allowed to drop. `max(position) + 1` is exactly the
+        // row count the store just wrote.
+        if let Some(&maxp) = positions.iter().max() {
+            alloc.kv_note_used(maxp + 1);
+        }
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
         // R3-A2: the buffer is always exactly n_out*nv (G3-reduced, or
@@ -999,6 +1005,232 @@ mod tests {
             "prefix reuse changed the logits (max |Δ| = {worst}, head {} tail {})",
             head.len(),
             tail.len()
+        );
+    }
+
+    /// C2 (Phase C): a physical KV removal, and the sliding-window shift built
+    /// on it.
+    ///
+    /// Three things are asserted **bitwise**, because a fresh prefill is an exact
+    /// reference for them:
+    ///
+    /// 1. Removing a *tail* range invalidates exactly those rows: what is left
+    ///    equals what a fresh prefill of the retained prefix computed, at every
+    ///    layer, so continuing from it is bitwise-identical.
+    /// 2. Removing a *middle* range (the conversation's overflow case: keep the
+    ///    system prompt, drop an old turn) copies V byte-for-byte — only K is
+    ///    re-roped — and leaves `[0, start)` completely untouched.
+    /// 3. Removing everything written empties the arena; `len == 0` is a no-op
+    ///    and removing past the end is an error.
+    ///
+    /// The fourth measurement is the one a fresh prefill cannot be a reference
+    /// for. Shifting the window re-ropes the survivors, but their *values* were
+    /// computed in the pre-shift context: a row that attended to the dropped
+    /// prefix keeps that influence. That is inherent to any shift that avoids
+    /// re-prefilling (llama.cpp's context shift has the same property), so C2
+    /// records it as a named tolerance class instead of asserting equality. The
+    /// numbers are printed on every run and pinned in the execution plan; the
+    /// assertion here only guards against a *mechanism* regression, which the
+    /// exact per-layer checks above already catch.
+    #[test]
+    fn kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvcache::{rope_shift_kv, KvRope};
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the KV removal test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let a = tok.encode("The capital of France is Paris and");
+        let b = tok.encode(" the capital of Japan is Tokyo and");
+        let c = tok.encode(" the capital of Italy is Rome");
+        let d = tok.encode(" the capital of Spain is Madrid");
+        let ab: Vec<u32> = a.iter().chain(&b).copied().collect();
+        let cd: Vec<u32> = c.iter().chain(&d).copied().collect();
+        let abc: Vec<u32> = a.iter().chain(&b).chain(&c).copied().collect();
+        let bc: Vec<u32> = b.iter().chain(&c).copied().collect();
+        let nkt = model.n_kv_embd();
+        let (freq_base, freq_scale) = model.rope_params();
+        let rope = KvRope {
+            freq_base,
+            freq_scale,
+            n_head_kv: model.n_head_kv(),
+            hd: model.n_embd_head(),
+            style: model.rope_style(),
+        };
+        let layers: Vec<usize> = (0..24).collect();
+        // Max |Δ| between two equal-length windows; a mismatch is a bug, not a
+        // short comparison.
+        let delta = |x: &[f32], y: &[f32]| {
+            assert_eq!(x.len(), y.len(), "compared windows must have equal length");
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let snapshot = |cache: &mut GraphCache| -> Vec<(Vec<f32>, Vec<f32>)> {
+            layers
+                .iter()
+                .map(|&l| cache.alloc().copy_kv_to_cpu(l).expect("kv read"))
+                .collect()
+        };
+
+        // (1) Remove the *tail*: the retained head must stay exactly what a fresh
+        // prefill of it computed, so the continuation is bitwise-identical.
+        let mut cut = GraphCache::new();
+        let pos_ab: Vec<usize> = (0..ab.len()).collect();
+        let _ = model.forward_graph_cached(&ab, &pos_ab, 1, n_ctx, &mut cut);
+        let before = snapshot(&mut cut);
+        assert_eq!(
+            cut.alloc()
+                .kv_rm(a.len(), b.len(), &rope)
+                .expect("remove the tail range"),
+            a.len(),
+            "only A survives removing B"
+        );
+        for (i, &l) in layers.iter().enumerate() {
+            let (k, v) = cut.alloc().copy_kv_to_cpu(l).expect("kv read");
+            assert_eq!(
+                delta(&k[..a.len() * nkt], &before[i].0[..a.len() * nkt]),
+                0.0,
+                "layer {l}: removing the tail must not touch the retained K"
+            );
+            assert_eq!(
+                delta(&v[..a.len() * nkt], &before[i].1[..a.len() * nkt]),
+                0.0,
+                "layer {l}: removing the tail must not touch the retained V"
+            );
+        }
+        let pos_cd: Vec<usize> = (a.len()..a.len() + cd.len()).collect();
+        let l_cut = model.forward_graph_cached(&cd, &pos_cd, 1, n_ctx, &mut cut);
+        let mut fresh = GraphCache::new();
+        let pos_a: Vec<usize> = (0..a.len()).collect();
+        let _ = model.forward_graph_cached(&a, &pos_a, 1, n_ctx, &mut fresh);
+        let l_ref = model.forward_graph_cached(&cd, &pos_cd, 1, n_ctx, &mut fresh);
+        assert_eq!(l_cut.len(), l_ref.len());
+        let worst = delta(&l_cut, &l_ref);
+        assert_eq!(
+            worst, 0.0,
+            "removing B must leave A + (C, D) bitwise equal to a fresh A + (C, D)"
+        );
+
+        // (2) Remove a *middle* range: V copies byte-for-byte, [0, start) is
+        // untouched, only the moved K is re-roped.
+        let mut mid = GraphCache::new();
+        let pos_abc: Vec<usize> = (0..abc.len()).collect();
+        let _ = model.forward_graph_cached(&abc, &pos_abc, 1, n_ctx, &mut mid);
+        let before = snapshot(&mut mid);
+        let keep = a.len() + c.len();
+        assert_eq!(
+            mid.alloc()
+                .kv_rm(a.len(), b.len(), &rope)
+                .expect("remove the middle range"),
+            keep,
+            "A and C survive removing the middle range B"
+        );
+        let src = a.len() + b.len()..a.len() + b.len() + c.len();
+        for (i, &l) in layers.iter().enumerate() {
+            let (k, v) = mid.alloc().copy_kv_to_cpu(l).expect("kv read");
+            assert_eq!(
+                delta(&k[..a.len() * nkt], &before[i].0[..a.len() * nkt]),
+                0.0,
+                "layer {l}: K before the removal must not move"
+            );
+            assert_eq!(
+                delta(&v[..a.len() * nkt], &before[i].1[..a.len() * nkt]),
+                0.0,
+                "layer {l}: V before the removal must not move"
+            );
+            // V has no rope: the moved rows must be byte-for-byte the old ones.
+            assert_eq!(
+                &v[a.len() * nkt..keep * nkt],
+                &before[i].1[src.start * nkt..src.end * nkt],
+                "layer {l}: V must move verbatim"
+            );
+            // K must be the moved rows re-roped by -b.len(): undoing the shift
+            // with the opposite angle must land back on the source within the
+            // rope tolerance class. A wrong sign, or re-roping the wrong rows,
+            // cannot survive this.
+            let mut back: Vec<f32> = k[a.len() * nkt..keep * nkt].to_vec();
+            rope_shift_kv(&mut back, c.len(), -(b.len() as isize), &rope);
+            let worst = delta(&back, &before[i].0[src.start * nkt..src.end * nkt]);
+            assert!(
+                worst < 1e-4,
+                "layer {l}: the moved K must be the source K re-roped, got |Δ| = {worst}"
+            );
+        }
+
+        // (3) Removing everything written empties the arena; `len == 0` is a
+        // no-op and removing past the end is an error.
+        let mut empty = GraphCache::new();
+        let _ = model.forward_graph_cached(&ab, &pos_ab, 1, n_ctx, &mut empty);
+        assert_eq!(empty.alloc().kv_rm(0, ab.len(), &rope).unwrap(), 0);
+        assert_eq!(empty.alloc().kv_n_used(0), Some(0));
+        let mut noop = GraphCache::new();
+        let _ = model.forward_graph_cached(&ab, &pos_ab, 1, n_ctx, &mut noop);
+        assert_eq!(noop.alloc().kv_rm(3, 0, &rope).unwrap(), ab.len());
+        assert!(noop.alloc().kv_rm(0, ab.len() + 1, &rope).is_err());
+
+        // (4) The sliding window: `kv_shift(drop)` == `kv_rm(0, drop)`. The
+        // mechanism is checked exactly per layer; the deviation from a fresh
+        // window is measured and recorded, not asserted away.
+        let mut shifted_cache = GraphCache::new();
+        let _ = model.forward_graph_cached(&ab, &pos_ab, 1, n_ctx, &mut shifted_cache);
+        let before = snapshot(&mut shifted_cache);
+        assert_eq!(
+            shifted_cache
+                .alloc()
+                .kv_shift(a.len(), &rope)
+                .expect("context shift"),
+            b.len(),
+            "only B survives the shift"
+        );
+        // Cells keep `cell == pos`, so the scheduler's identity gate stays
+        // satisfied and no backend needs a new kernel.
+        assert!(
+            shifted_cache.alloc().kv_is_identity(),
+            "a physical shift must keep the identity cell mapping"
+        );
+        for (i, &l) in layers.iter().enumerate() {
+            let (k, v) = shifted_cache.alloc().copy_kv_to_cpu(l).expect("kv read");
+            assert_eq!(
+                &v[..b.len() * nkt],
+                &before[i].1[a.len() * nkt..ab.len() * nkt],
+                "layer {l}: V must survive the shift verbatim"
+            );
+            let mut back: Vec<f32> = k[..b.len() * nkt].to_vec();
+            rope_shift_kv(&mut back, b.len(), -(a.len() as isize), &rope);
+            let worst = delta(&back, &before[i].0[a.len() * nkt..ab.len() * nkt]);
+            assert!(
+                worst < 1e-4,
+                "layer {l}: shifted K must be the source K re-roped, got |Δ| = {worst}"
+            );
+        }
+        let pos_c: Vec<usize> = (b.len()..bc.len()).collect();
+        let l_shifted = model.forward_graph_cached(&c, &pos_c, 1, n_ctx, &mut shifted_cache);
+        let mut virgin = GraphCache::new();
+        let pos_bc: Vec<usize> = (0..bc.len()).collect();
+        let l_fresh = model.forward_graph_cached(&bc, &pos_bc, 1, n_ctx, &mut virgin);
+        assert_eq!(l_shifted.len(), l_fresh.len());
+        let worst = delta(&l_shifted, &l_fresh);
+        eprintln!(
+            "[c2] window shift vs a fresh window: max|Δlogits| = {worst} \
+             (a={} b={} c={} tokens) — inherent: B's rows keep A's context",
+            a.len(),
+            b.len(),
+            c.len()
+        );
+        assert!(
+            worst.is_finite() && worst < 25.0,
+            "the shift is degraded far beyond the recorded tolerance class: max|Δ| = {worst}"
         );
     }
 
