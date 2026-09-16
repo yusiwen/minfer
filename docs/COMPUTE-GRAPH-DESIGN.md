@@ -482,7 +482,6 @@ pub enum GraphType { Decode, Prefill }
 
 pub struct CParams {
     pub n_ctx: usize,
-    pub n_batch: usize,
     pub flash_attn: bool,
     pub gpu: bool,        // whether a GPU backend participates (assignment is part of topology)
     pub fuse_qkv: bool,   // G4 decode QKV fusion (MINFER_NO_FUSE_QKV=1 disables)
@@ -772,7 +771,6 @@ therefore necessarily rebuilds.
 | `n_out` | decides whether the G3 tail reduction nodes exist |
 | `gtype` | Decode vs Prefill, and the decode-only fused branches |
 | `cparams.n_ctx` | sizes the persistent KV regions |
-| `cparams.n_batch` | reserved runtime parameter |
 | `cparams.flash_attn` | selects `AttnMode::Flash` vs `Gqa` |
 | `cparams.gpu` | backend assignment is a build-time decision |
 | `cparams.fuse_qkv` / `fuse_ffn` | fused nodes are topology |

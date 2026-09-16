@@ -668,7 +668,6 @@ mirrors this block at `src/models/qwen3/graph.rs:419-446`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CParams {
     pub n_ctx: usize,
-    pub n_batch: usize,
     pub flash_attn: bool,
     pub gpu: bool,
     /// G4 decode QKV fusion enabled (part of the topology: toggling

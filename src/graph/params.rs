@@ -22,7 +22,6 @@ pub enum GraphType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CParams {
     pub n_ctx: usize,
-    pub n_batch: usize,
     pub flash_attn: bool,
     pub gpu: bool,
     /// G4 decode QKV fusion enabled (part of the topology: toggling
@@ -38,7 +37,6 @@ impl Default for CParams {
     fn default() -> Self {
         Self {
             n_ctx: 4096,
-            n_batch: 128,
             flash_attn: false,
             gpu: false,
             fuse_qkv: false,
@@ -51,6 +49,11 @@ impl Default for CParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphParams {
     pub n_tokens: usize,
+    /// Number of sequences the batch covers. **Inert today**: every
+    /// construction site hard-codes `1` and no builder reads it (see
+    /// `docs/ARCHITECTURE-EXECUTION-PLAN.md` §8). It is kept in the reuse
+    /// identity because item 3 (continuous batching) will make it real; until
+    /// then a change here only forces a pointless rebuild.
     pub n_seqs: usize,
     /// Number of output (tail) rows: the last layer's FFN + lm_head run on the
     /// last `n_out` rows only (llama `inp_out_ids`). Part of the topology —

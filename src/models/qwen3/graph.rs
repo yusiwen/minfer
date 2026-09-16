@@ -388,7 +388,6 @@ impl Qwen3Graph {
             },
             cparams: CParams {
                 n_ctx,
-                n_batch: nt,
                 flash_attn: false,
                 gpu: metal_on || cuda_on,
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
@@ -892,7 +891,6 @@ mod tests {
                 gtype: GraphType::Decode,
                 cparams: CParams {
                     n_ctx,
-                    n_batch: 1,
                     flash_attn: false,
                     gpu: true,
                     fuse_qkv: true,
@@ -1083,7 +1081,6 @@ mod tests {
                 gtype: GraphType::Prefill,
                 cparams: CParams {
                     n_ctx: 512,
-                    n_batch: nt,
                     flash_attn: false,
                     gpu: true,
                     fuse_qkv: false,

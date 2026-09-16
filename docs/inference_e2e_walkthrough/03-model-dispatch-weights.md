@@ -770,7 +770,7 @@ And where the verdict lands (`src/models/qwen2/graph.rs:425-451,462-470`):
             n_tokens: nt, n_seqs: 1, n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams {
-                n_ctx, n_batch: nt, flash_attn: false,
+                n_ctx, flash_attn: false,
                 gpu: metal_on || cuda_on,          // ← participation recorded
                 fuse_qkv: nt == 1 && (metal_on || cuda_on) && !env("MINFER_NO_FUSE_QKV"),
                 fuse_ffn: nt == 1 && (metal_on || cuda_on) && !env("MINFER_NO_FUSE_FFN"),
