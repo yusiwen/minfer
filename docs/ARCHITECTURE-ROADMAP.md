@@ -567,7 +567,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
-| 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. | §2.3 | S |
+| 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
 
 ---
 
