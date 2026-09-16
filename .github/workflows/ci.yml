@@ -29,6 +29,11 @@ jobs:
 
   # The container tag carries the CUDA toolkit; bump it together with the
   # toolkits build.rs is known to support (12.x and 13.x today).
+  #
+  # `cargo test --no-run` matters as much as the build: the `#[cfg(test)]`
+  # modules in cuda_backend.rs are only compiled when tests are compiled, so
+  # `cargo build` alone silently skips them (that is how the A5 signature
+  # change broke four CUDA test call sites without any local or CI signal).
   build-linux-cuda:
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.8.0-devel-ubuntu22.04
@@ -37,6 +42,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Build (release, cuda)
         run: cargo build --release --features cuda
+      - name: Compile the test harness (no device on a hosted runner)
+        run: cargo test --release --features cuda --no-run
 
   build-macos:
     runs-on: macos-14 # Apple Silicon (arm64)
