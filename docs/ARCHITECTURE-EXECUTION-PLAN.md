@@ -281,17 +281,38 @@ re-prefilling it every turn.
 
 | ID | Item | Title | Effort |
 |---|---|---|---|
-| B1 | 4 | Reproduce the doc-97 contamination | S |
-| B2 | 4 | Slot cache retention + prefix check | M |
-| B3 | 4 | Measurement + docs | S |
+| B1 | 4 | Reproduce the doc-97 contamination | S | ✅ done — mechanism refuted, property pinned |
+| B2 | 4 | Slot cache retention + prefix check | M | |
+| B3 | 4 | Measurement + docs | S | |
 
-### B1 — Reproduce contamination
-- **Deliverable:** a failing test that drives the server (or `worker_loop`)
-  through two requests on one slot with different prompts and shows the stale-row
-  read documented in `chat.rs:483-490`.
-- **Acceptance:** the test fails on today's code for the *documented* reason,
-  or the ticket reports that the documented reason does not reproduce and the
-  real cause is something else. **Do not build B2 on an unverified cause.**
+### B1 — Reproduce contamination — **DONE: the documented mechanism does not reproduce**
+- **What the docs claimed.** `chat.rs` reset the slot cache on every request
+  because "re-prefilling a DIFFERENT prompt over the same regions leaves stale
+  rows inside the new attention window" — the message of `39eceaa` (doc 97),
+  which fixed a cross-request KV bug and added the reset.
+- **What was tested.** `reused_cache_across_prompts_matches_a_fresh_cache`
+  (`src/models/qwen2/graph.rs`) runs real prompts through one `GraphCache` and
+  compares **bitwise** against a virgin cache, in three orderings:
+  1. long prompt → short prompt (the stale-row case);
+  2. short → long (the append case B2 wants);
+  3. prefill → 3 decode steps → shorter prompt (the server's actual sequence,
+     including the generated rows the comment is about).
+  All three are bitwise equal.
+- **Why.** A prefill writes rows `0..nt` and attention reads
+  `[0, max(pos)+1) = [0, nt)` — i.e. only rows this request just wrote. Stale
+  rows survive *above* the window, where nothing reads them. The original bug is
+  consistent with the state recorded in the OpenAI plan's revision notes: the
+  cache was **process-global** at the time, so two slots shared one set of
+  regions. That is already fixed by per-slot caches; the reset was belt-and-braces
+  whose stated mechanism does not hold on the current tree.
+- **Residual uncertainty (why the reset stays until B2).** This box can only run
+  the CPU path. The fused GPU stores (`FusedQKV`, `FusedQkvNorm`,
+  `QkvBiasRopeStore`) write K/V inside their own kernels and are unverified here
+  (A0: CUDA compile-only; Metal not built). The `chat.rs` comment now records the
+  finding and this caveat instead of the unverified mechanism.
+- **Consequence for B2.** Reuse is safe *by construction* if it is gated on an
+  exact token-prefix match: every row read is then a row whose contents were
+  verified to be the same tokens. That is what B2 implements.
 
 ### B2 — Retention + prefix reuse
 - **Deliverable:** the slot keeps its `GraphCache`; a new request reuses the

@@ -862,6 +862,90 @@ mod tests {
         );
     }
 
+    /// B1 (Phase B): does reusing one `GraphCache` for a **different** prompt
+    /// contaminate the result?
+    ///
+    /// `worker_loop` throws the slot's cache away on every request, because the
+    /// comment there (`chat.rs:483-490`) claims re-prefilling a different prompt
+    /// over the same persistent KV regions "leaves stale rows below the new
+    /// attention window". Prefix reuse (B2) is only safe if that claim is
+    /// understood, so verify it instead of inheriting it: run A then B on one
+    /// cache and B on a virgin cache, and compare. Both orders are exercised,
+    /// because "B shorter than A" is the case the comment worries about and
+    /// "A longer than B" is the case B2 wants to reuse.
+    #[test]
+    fn reused_cache_across_prompts_matches_a_fresh_cache() {
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping cache-reuse test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        // Keep the weight registry stable for this whole test (same reason as
+        // the parity test below).
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let long = tok.encode("The capital of France is Paris and the capital of Japan is");
+        let short = tok.encode("Water boils at one hundred degrees");
+        assert_ne!(long, short, "the two prompts must differ");
+        assert!(
+            long.len() > short.len(),
+            "need a longer and a shorter prompt ({} vs {})",
+            long.len(),
+            short.len()
+        );
+
+        let run = |cache: &mut GraphCache, ids: &[u32]| {
+            let pos: Vec<usize> = (0..ids.len()).collect();
+            model.forward_graph_cached(ids, &pos, 1, n_ctx, cache)
+        };
+
+        // (a) A then B, where B is SHORTER: the stale-row scenario.
+        let mut reused = GraphCache::new();
+        let _ = run(&mut reused, &long);
+        let b_reused = run(&mut reused, &short);
+        let mut virgin = GraphCache::new();
+        let b_virgin = run(&mut virgin, &short);
+        assert_eq!(
+            b_reused, b_virgin,
+            "reusing a cache for a shorter prompt changed the logits"
+        );
+
+        // (b) B then A, where A is LONGER: the append case B2 relies on.
+        let mut reused2 = GraphCache::new();
+        let _ = run(&mut reused2, &short);
+        let a_reused = run(&mut reused2, &long);
+        let mut virgin2 = GraphCache::new();
+        let a_virgin = run(&mut virgin2, &long);
+        assert_eq!(
+            a_reused, a_virgin,
+            "reusing a cache for a longer prompt changed the logits"
+        );
+
+        // (c) The exact server sequence: prompt A, then decoded tokens written
+        //     past A's length, then a new (shorter) request. Those generated
+        //     rows are what the chat.rs comment is about.
+        let mut reused3 = GraphCache::new();
+        let a_pos: Vec<usize> = (0..long.len()).collect();
+        let _ = model.forward_graph_cached(&long, &a_pos, 1, n_ctx, &mut reused3);
+        for t in 0..3usize {
+            let pos = long.len() + t;
+            let _ = model.forward_graph_cached(&[100 + t as u32], &[pos], 1, n_ctx, &mut reused3);
+        }
+        let short_pos: Vec<usize> = (0..short.len()).collect();
+        let b_reused3 = model.forward_graph_cached(&short, &short_pos, 1, n_ctx, &mut reused3);
+        assert_eq!(
+            b_reused3, b_virgin,
+            "reusing a cached+decoded cache for a shorter prompt changed the logits"
+        );
+    }
+
     /// Phase 6 verification (hermetic on CPU builds): the graph path must
     /// reproduce forward.rs logits on a real model — prefill and a decode
     /// step (KV carried across). Built and executed locally (no global
