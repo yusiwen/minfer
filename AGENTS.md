@@ -132,6 +132,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Qwen3 support plan (+ minijinja gotcha §5#9) | `docs/QWEN3-SUPPORT-PLAN.md` |
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **Architecture roadmap (system layers: IR, scheduler, allocator, KV, batching, backends — gaps + prioritized backlog)** | `docs/ARCHITECTURE-ROADMAP.md` |
+| **Architecture execution plan (phase-by-phase tickets, acceptance criteria, verification matrix)** | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
 | Model support roadmap (which model families to port next) | `docs/MODEL-SUPPORT-ROADMAP.md` |
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
 | CLI conversation plan | `docs/CLI-CONVERSATION-PLAN.md` |

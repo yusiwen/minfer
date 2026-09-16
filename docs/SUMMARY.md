@@ -13,6 +13,7 @@
 
 - [Architecture Overview](./ARCHITECTURE.md)
 - [Architecture Roadmap](./ARCHITECTURE-ROADMAP.md)
+- [Architecture Execution Plan](./ARCHITECTURE-EXECUTION-PLAN.md)
 
 # Model Support
 
