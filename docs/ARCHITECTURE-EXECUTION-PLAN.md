@@ -67,7 +67,7 @@ roadmap §4 defects automatically.
 | ID | Item | Title | Effort | Status |
 |---|---|---|---|---|
 | A0 | — | CUDA access spike on this box | S | ✅ done — **unavailable** (compile-only) |
-| A1 | 23 | Op × dtype × backend correctness matrix | M | |
+| A1 | 23 | Op × dtype × backend correctness matrix | M | ✅ done — found + fixed an op defect |
 | A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | ✅ done |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
 | A4 | 6 | Server worker panic isolation | S | ✅ done |
@@ -85,16 +85,38 @@ roadmap §4 defects automatically.
   (Qwen3-0.6B Q8_0: 120 tok/s prefill, 64.7 tok/s decode).
 - **Consequence:** the CUDA half of every later ticket is compile-verified only.
 
-### A1 — Op × dtype × backend matrix  · item 23 · M
-- **Files:** new `tests/op_matrix.rs` (or `src/graph/*` test module), driven by a
-  small table of (op, dtype, backend) cases.
-- **Deliverable:** every op in `Backend::supports_op` exercised on every backend
-  that claims it, compared against the CPU reference; failures reported as a
-  matrix, not as individual panics.
-- **Acceptance:** the matrix runs under `cargo test`; the current op-set
-  asymmetry (roadmap §4 defect 5) shows up as an explicit row rather than a
-  surprise; ≥ 1 real defect is either found or proven absent.
-- **Deps:** A0 for the CUDA rows (CPU rows can land first).
+### A1 — Op × dtype × backend matrix  · item 23 · M — **DONE**
+- **Files:** new `src/graph/op_matrix.rs`, registered as `#[cfg(test)] mod
+  op_matrix;`. It needs the crate's internals (the allocator, the backends), so
+  it lives in the module tree rather than under `tests/` — the crate is a
+  binary, and the existing `tests/*.rs` files get at the code with `#[path]`
+  includes, which this would have made worse.
+- **Three tests:**
+  1. `matrix_cases_match_their_reference` — 17 cases (Add, Mul, Scale, Silu,
+     SwiGLU, Softmax, RmsNorm, QkNorm, MatMul, GetRows, View/Reshape/Permute,
+     RoPE, Attn, KvcacheStore/Load) run on **every backend that claims the op**,
+     each compared against an analytic reference written in the test — never
+     against another backend. Unavailable backends report
+     `SKIP (reason)`, never `PASS`: on this box that is 17 CPU cells + 34 skips.
+  2. `support_table_matches_support_matrix_doc` — `supports_op` for 23 op rows
+     against the table published in `SUPPORT-MATRIX.md`, so the A8 doc and the
+     code cannot drift. The CPU column is checked here; the Metal/CUDA columns
+     check themselves wherever they are compiled in.
+  3. `every_op_has_a_matrix_decision` — every `Op` variant is either covered or
+     excused in `EXCUSED`. `op_label` matches with **no wildcard arm**, so adding
+     an `Op` variant is a compile error until the matrix is updated.
+- **Found a real defect, fixed here:** the CPU `Op::Softmax` arm called
+  `vec_soft_max_f32` (which writes `exp(x - max)` and *returns* the sum) and
+  discarded the return, so the op produced **unnormalised** output. Nothing
+  caught it because no architecture emits a standalone `Softmax` node. The arm
+  now scales by `1/sum`; verified by neutering that line (the Softmax cell goes
+  red) and restoring it.
+- **Acceptance met:** the matrix runs under `cargo test`; the A8 asymmetry table
+  is now machine-checked; one real defect found and fixed; `cargo test --release`
+  162 passed / 0 failed.
+- **Left for a GPU-verifiable run:** the Metal and CUDA columns, and the four
+  GPU-only fused ops (`FusedQKV`/`FusedFFN`/`FusedQkvNorm`/`QkvBiasRopeStore`)
+  which are excused on a CPU-only box.
 
 ### A2 — CI  · item 24 · S — **DONE**
 - **Files:** `.github/workflows/ci.yml`.

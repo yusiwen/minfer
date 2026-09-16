@@ -562,7 +562,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| 23 | **Op × dtype × backend matrix test**. | §2.8 | M |
+| 23 | **Op × dtype × backend matrix test**. — **done in A1** | §2.8 | M |
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. — **done in A2** | §2.8 | S |
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
@@ -573,7 +573,8 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 ## 4. Concrete defects found (verified in code)
 
-Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
+Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene; 13 is a
+behavioural defect the A1 op matrix found and that is already fixed.
 
 1. **GPU KV store has no bounds check.** CPU returns `Err` for `pos >= n_ctx`
    (`cpu_backend.rs:170-172`); CUDA (`cuda_backend.rs:1028-1061`) and Metal do
@@ -617,8 +618,16 @@ Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene.
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:1355-1362`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.
-12. **Tests**: no Linux/CUDA/CPU in CI, four of five integration files macOS-only
-    (`.github/workflows/ci.yml`, `tests/*.rs`).
+12. ~~**Tests**: no Linux/CUDA/CPU in CI, four of five integration files macOS-only
+    (`.github/workflows/ci.yml`, `tests/*.rs`).~~ **Fixed in A2** for the CI half
+    (Linux/CPU tests, CUDA compile, plus `--no-run` test compilation); the four
+    macOS-only kernel-isolation files remain macOS-only by nature.
+13. ~~**`Op::Softmax` returned unnormalised values on the CPU backend**
+    (`cpu_backend.rs`): it called `vec_soft_max_f32`, which writes
+    `exp(x - max)` and *returns* the sum, and discarded the return. No
+    architecture emits a standalone `Softmax` node, so nothing exercised it.~~
+    **Found by the A1 op matrix and fixed**: the arm now scales by `1/sum`, with
+    an op-matrix case pinning it.
 
 ---
 

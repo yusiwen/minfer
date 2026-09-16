@@ -365,7 +365,16 @@ impl Backend for CpuBackend {
                     }
                     out.copy_from_slice(ins[0]);
                     let s_in = out.to_vec();
-                    crate::vec_ops::vec_soft_max_f32(out.len(), out, &s_in, mx);
+                    // `vec_soft_max_f32` writes exp(x - max) and RETURNS the sum
+                    // (same contract the attention kernels use); without this
+                    // division the op produced unnormalised values. Caught by
+                    // the op matrix (ticket A1) — no architecture emits a
+                    // standalone Softmax node, so nothing else exercised it.
+                    let sum = crate::vec_ops::vec_soft_max_f32(out.len(), out, &s_in, mx);
+                    let inv = (1.0 / sum) as f32;
+                    for v in out.iter_mut() {
+                        *v *= inv;
+                    }
                     Ok(())
                 } else {
                     Err(format!("Softmax dim {dim} not supported (Phase 2)"))
