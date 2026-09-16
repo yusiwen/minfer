@@ -44,13 +44,17 @@ This machine is a **DGX Spark (GB10), aarch64 Linux, CUDA 13.0**
 | Backend | Build | Run/verify | Note |
 |---|---|---|---|
 | CPU (aarch64 NEON+SDOT) | ✅ | ✅ | Primary correctness net here |
-| CUDA (sm_121) | ✅ (nvcc present) | ⚠️ **unverified** — `nvidia-smi` fails with `NVML: Unknown Error` | A0 must establish whether the runtime works at all |
+| CUDA (sm_121) | ✅ | ❌ **unavailable** (A0, 2026-09-16) | Builds; at runtime `cudaGetDeviceCount` returns err 304 (OS/driver call failed) → `CUDA: no CUDA devices found`, graceful CPU fallback |
 | Metal | ❌ | ❌ | macOS-only code, not compilable here → Phase G |
 | x86 AVX2 / AVX-512 | ❌ | ❌ | Item 11 needs an x86 box or CI |
 
-If A0 finds CUDA unusable in this environment, every CUDA-touching ticket's
-acceptance drops to "compile-verified + flagged unverified", and the CUDA-gated
-claims in this plan must be revisited before Phase C.
+**A0 verdict (2026-09-16): CUDA is compile-only in this environment.** Every
+CUDA-touching ticket's acceptance is therefore "compiles + reviewer-inspected",
+never "measured here"; the CPU path is the only runtime net. Design
+consequence, already applied in A3: where a guard is needed on all three
+backends, put it in the **backend-agnostic** layer (the allocator) rather than
+in `cuda_backend.rs` — that keeps the fix fully verified on CPU and needs no
+unverifiable GPU code.
 
 ## 3. Phase A — instrument, then hazard removal
 
@@ -60,26 +64,26 @@ front of that batch** — they are the instrument that keeps Phases B–E honest
 and one of them (the op/dtype/backend matrix) would have caught several of the
 roadmap §4 defects automatically.
 
-| ID | Item | Title | Effort |
-|---|---|---|---|
-| A0 | — | CUDA access spike on this box | S |
-| A1 | 23 | Op × dtype × backend correctness matrix | M |
-| A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S |
-| A3 | 5 | KV bounds guard + `ensure_kv` size check | S |
-| A4 | 6 | Server worker panic isolation | S |
-| A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S |
-| A6 | 28 | Remove CPU per-op allocations | S |
-| A7 | 26 | Dead identity fields | S |
-| A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S |
+| ID | Item | Title | Effort | Status |
+|---|---|---|---|---|
+| A0 | — | CUDA access spike on this box | S | ✅ done — **unavailable** (compile-only) |
+| A1 | 23 | Op × dtype × backend correctness matrix | M | |
+| A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | |
+| A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
+| A4 | 6 | Server worker panic isolation | S | |
+| A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | |
+| A6 | 28 | Remove CPU per-op allocations | S | |
+| A7 | 26 | Dead identity fields | S | ✅ done |
+| A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | |
 
-### A0 — CUDA access spike
-- **Deliverable:** a written yes/no on whether the CUDA backend can build and
-  execute a forward on this box, plus the exact command and observed error if
-  not.
-- **Acceptance:** `cargo build --release --features cuda` succeeds;
-  `./target/release/minfer qwen3-0.6b-q8_0 "hi"` either runs (record tok/s) or
-  fails with a captured message.
-- **Blocks:** the CUDA half of every later ticket.
+### A0 — CUDA access spike — **DONE (2026-09-16): unavailable**
+- **Verdict:** `cargo build --release --features cuda` succeeds (1m23s, targets
+  `sm_75…sm_121`, PTX `compute_121`), but at runtime
+  `cudaGetDeviceCount` returns err 304 and the engine logs
+  `CUDA: no CUDA devices found (cudaGetDeviceCount err 304, count 0)` then
+  `CUDA: not available, using CPU fallback`. The CPU path is unaffected
+  (Qwen3-0.6B Q8_0: 120 tok/s prefill, 64.7 tok/s decode).
+- **Consequence:** the CUDA half of every later ticket is compile-verified only.
 
 ### A1 — Op × dtype × backend matrix  · item 23 · M
 - **Files:** new `tests/op_matrix.rs` (or `src/graph/*` test module), driven by a
@@ -99,16 +103,27 @@ roadmap §4 defects automatically.
   `#[ignore]`d.
 - **Acceptance:** a deliberately broken commit fails the Linux job.
 
-### A3 — KV bounds guard + `ensure_kv` size check  · item 5 · S
-- **Files:** `src/graph/alloc.rs:384-392`, `src/graph/cuda_backend.rs:1028-1061`.
-- **Deliverable:** `ensure_kv` compares the requested element count against the
-  existing region and returns `Err` on a mismatch instead of silently reusing a
-  wrongly sized region; CUDA's `KvcacheStore` validates `pos < n_ctx` and
-  returns `Err` (mirroring `cpu_backend.rs:170-172`).
-- **Acceptance:** a unit test with a changed `n_ctx` on a live cache fails
-  loudly; a store at `pos == n_ctx` returns `Err`; CPU and (if A0 permits) CUDA
-  greedy output unchanged on 0.6B Q8_0 / 7B Q4_K_M.
-- **Defers to G:** the same guard in Metal's `KvcacheStore`.
+### A3 — KV bounds guard + `ensure_kv` size check  · item 5 · S — **DONE**
+- **Files:** `src/graph/alloc.rs` (only — see the deviation note).
+- **Deliverable, part 1:** `ensure_kv` now records the element count and the
+  backend each region was allocated for, and returns `Err` when a later graph
+  asks for a different size or assigns the layer elsewhere. Before this, the
+  early return silently handed back a wrongly sized region; the CPU backend
+  then failed with a position error and the GPU backends wrote out of bounds.
+- **Deliverable, part 2 (deviation from the ticket as written):** the
+  `pos < n_ctx` guard was **not** added to `cuda_backend.rs`. Because A0 found
+  CUDA unverifiable here, the guard went into
+  `GraphAllocator::fill_input_i32` — the single point where positions become
+  graph data. It is structural (an I32 input consumed by a KV-writing or
+  attention op is bounded by the graph's `n_ctx`, taken from the `kv_load`
+  node), so it covers **all three backends including Metal without touching
+  `metal.rs`**, costs one O(nt) host scan, and is fully testable on CPU.
+  `token_ids` is deliberately exempt (vocabularies exceed `n_ctx`).
+- **Acceptance:** `kv_region_size_change_is_a_loud_error`,
+  `position_beyond_n_ctx_is_rejected`, `token_ids_are_not_bounded_by_n_ctx`
+  (all fail before this change); `cargo test --release` 155 passed / 0 failed.
+- **Defers to G:** nothing — the Metal path is covered by the same allocator
+  guard. Phase G keeps only the *style* asymmetry (`debug_assert!` vs `Err`).
 
 ### A4 — Worker panic isolation  · item 6 · S
 - **Files:** `src/server/chat.rs:454-518`.
