@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1). | Phase B is the next tranche; Phases C–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16). | Phase C is the next tranche; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -282,8 +282,8 @@ re-prefilling it every turn.
 | ID | Item | Title | Effort |
 |---|---|---|---|
 | B1 | 4 | Reproduce the doc-97 contamination | S | ✅ done — mechanism refuted, property pinned |
-| B2 | 4 | Slot cache retention + prefix check | M | |
-| B3 | 4 | Measurement + docs | S | |
+| B2 | 4 | Slot cache retention + prefix check | M | ✅ done |
+| B3 | 4 | Measurement + docs | S | ✅ done — ≈11× on turn 2 |
 
 ### B1 — Reproduce contamination — **DONE: the documented mechanism does not reproduce**
 - **What the docs claimed.** `chat.rs` reset the slot cache on every request
@@ -314,34 +314,50 @@ re-prefilling it every turn.
   exact token-prefix match: every row read is then a row whose contents were
   verified to be the same tokens. That is what B2 implements.
 
-### B2 — Retention + prefix reuse
-- **Deliverable:** the slot keeps its `GraphCache`; a new request reuses the
-  cached KV only when the new prompt's first `cached_len` tokens equal the
-  cached sequence (append-only cases); otherwise it prefills from position 0
-  over the same regions. No cell machinery yet.
-- **Acceptance:** B1's test passes; the slot no longer re-allocates KV per
-  request; a second turn that extends the first prefills only the new tokens;
-  `cudaMemGetInfo`-style allocation churn (or an instrumented counter) drops.
-- **Risk:** if append-only reuse cannot be made safe without cells, stop and
-  promote Phase C1 ahead of B2.
-- **Prerequisite found and cleared while testing it:** prefix reuse first
-  *failed* — suffix-only prefill differed from a full prefill by
-  `max|Δlogits| = 0.31`, and the cause was not the KV cache (its rows were
-  bitwise identical) but a genuinely `nt`-dependent CPU attention: the scores
-  were padded to the batch-wide `nkv` and the softmax/normalisation/weighted sum
-  ran over that length, so the reduction's rounding depended on how many tokens
-  shared the batch. Restricting the window to each token's own `vl = pos+1`
-  makes the path `nt`-invariant (one-token decode now reproduces a single-shot
-  prefill bitwise), which is what makes reuse safe **by construction** rather
-  than by tolerance. Recorded as roadmap §4 item 14; the pinning test is
-  `prefix_reuse_matches_a_full_prefill`.
+### B2 — Retention + prefix reuse — **DONE**
+- **Files:** `src/server/slot.rs` (`Slot.cached_tokens`), `src/server/chat.rs`
+  (`common_prefix_len`, `prefill_span`, the suffix prefill, the per-token
+  record, `worker_loop` no longer resets the cache).
+- **Deliverable:** the slot keeps its `GraphCache` and a record of the token
+  sequence its KV rows hold; `generate_seq` reuses the cache only when the new
+  prompt starts with exactly that sequence (else it prefills from position 0),
+  and always feeds at least the last token because its logits seed the sampler.
+- **Why it is safe by construction:** the reuse gate *is* the verification —
+  every row attention reads is a row `common_prefix_len` just proved to hold the
+  same token. It is also bitwise: the CPU attention is now `nt`-invariant
+  (item 14), so feeding a suffix at its own positions reproduces a single-shot
+  prefill exactly.
+- **Deliberate limits:** the speculative path neither reuses nor records (a
+  verify round writes rows past the committed tokens); a panicking job clears
+  the record; `MINFER_NO_PREFIX_REUSE=1` restores the pre-B2 behaviour for A/B.
+- **Tests:** `common_prefix_len_finds_the_exact_match`,
+  `prefill_span_always_feeds_the_last_token` (pure), and
+  `prefix_reuse_matches_a_full_prefill` (real model, bitwise).
+- **Not covered here:** the fused GPU stores are unverified on this box, so the
+  gate stays conservative; Phase G re-tests on Metal.
 
-### B3 — Measurement
-- **Deliverable:** prefill tokens and time-to-first-token per turn, before/after,
-  on a fixed multi-turn conversation; recorded in `docs/ARCHITECTURE-ROADMAP.md`
-  §2.5 or the OpenAI plan.
-- **Acceptance:** numbers are interleaved A/B, not sequential (the campaign's
-  own clock-drift rule).
+### B3 — Measurement — **DONE (interleaved A/B, same binary)**
+- **Setup:** `serve --n-ctx 1024 --n-slots 1` on Qwen2.5-0.5B Q4_0, one long
+  system prompt (203 tokens) plus a second turn that appends an assistant reply
+  and a new question (219 tokens), `max_tokens=1` so the wall time is
+  essentially time-to-first-token. Four alternating runs; `after` vs `before`
+  differ only by `MINFER_NO_PREFIX_REUSE=1`.
+
+  | mode | turn | prompt tok | fed | reused | wall |
+  |---|---|---|---|---|---|
+  | after | 1 | 203 | 203 | 0 | 2.66 s |
+  | after | 2 | 219 | **16** | **203** | **0.24 s** |
+  | before | 1 | 203 | 203 | 0 | 2.60 s |
+  | before | 2 | 219 | 219 | 0 | 2.71 s |
+  | after | 1 | 203 | 203 | 0 | 2.66 s |
+  | after | 2 | 219 | **16** | **203** | **0.26 s** |
+  | before | 1 | 203 | 203 | 0 | 2.88 s (turn 2) |
+
+- **Result:** turn 2's prefill drops from 219 to 16 tokens and its
+  time-to-first-token from ~2.7–2.9 s to ~0.24–0.26 s — **≈ 11×** — while turn 1
+  (cold slot) is unchanged, as it must be. The per-request line
+  `[server] prefill fed N/M prompt tokens (R reused)` is what the numbers come
+  from, and it stays in the server so the behaviour is observable in production.
 
 ## 5. Phase C — KV cell store (item 1)
 
@@ -523,7 +539,7 @@ tickets and everything after them.
 | Phase | Done when |
 |---|---|
 | A | **Complete 2026-09-16.** `cargo test` green on Linux/CPU (aarch64 locally, x86_64 in CI); A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
-| B | A multi-turn conversation prefills only the new turns; the contamination test passes; numbers recorded interleaved. |
+| B | **Complete 2026-09-16.** A multi-turn conversation prefills only the new turns (219 → 16 tokens, ≈11× TTFT); the contamination property is pinned by a bitwise test; numbers recorded interleaved with the same binary. |
 | C | Cell store lands bitwise; shift is a documented tolerance class; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
 | E | Two sequences can be batched without cross-attention; `--n-slots 4` beats serial; `n_batch` chunks prefill; an over-VRAM model runs with layer offload. |

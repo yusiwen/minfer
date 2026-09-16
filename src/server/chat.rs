@@ -37,6 +37,32 @@ fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
     id == special.eos || Some(id) == special.im_end
 }
 
+/// B2: length of the common token prefix of the slot's recorded sequence and
+/// the incoming prompt.
+///
+/// Prefix reuse is safe *because of this comparison*: the slot reuses rows
+/// `0..reuse`, and every one of them holds the same token the new prompt has at
+/// that position — the contents were verified, not assumed. A mismatch (or an
+/// empty record) yields 0, which means a full prefill from position 0.
+fn common_prefix_len(cached: &[u32], prompt: &[u32]) -> usize {
+    cached
+        .iter()
+        .zip(prompt.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// B2: which slice of the prompt this request must feed, given how many tokens
+/// the slot's KV already holds. Returns `(feed_from, feed_len)`.
+///
+/// Always at least the last token: its logits are what the sampler consumes, so
+/// a fully-cached prompt still costs one row (a decode step rather than a
+/// prefill).
+fn prefill_span(nt: usize, reuse: usize) -> (usize, usize) {
+    let feed_from = reuse.min(nt.saturating_sub(1));
+    (feed_from, nt - feed_from)
+}
+
 /// Run one job on `slot` to completion, pushing events into `job.tx`.
 ///
 /// Termination: EOS / im_end -> "stop"; stop string -> "stop" (truncated);
@@ -48,6 +74,7 @@ pub fn generate(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
     n_ctx_slot: usize,
     input_ids: &[u32],
     params: &SamplingParams,
@@ -57,7 +84,15 @@ pub fn generate(
         return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
     }
     generate_seq(
-        model, tokenizer, cache, n_ctx_slot, input_ids, params, tx, None,
+        model,
+        tokenizer,
+        cache,
+        cached_tokens,
+        n_ctx_slot,
+        input_ids,
+        params,
+        tx,
+        None,
     )
 }
 
@@ -74,6 +109,7 @@ pub fn generate_spec(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
     n_ctx_slot: usize,
     input_ids: &[u32],
     params: &SamplingParams,
@@ -93,6 +129,7 @@ pub fn generate_spec(
         model,
         tokenizer,
         cache,
+        cached_tokens,
         n_ctx_slot,
         input_ids,
         params,
@@ -106,6 +143,7 @@ fn generate_seq(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
     n_ctx_slot: usize,
     input_ids: &[u32],
     params: &SamplingParams,
@@ -124,8 +162,36 @@ fn generate_seq(
     }
 
     let nt = input_ids.len();
-    let positions: Vec<usize> = (0..nt).collect();
     let special = model.special_tokens();
+
+    // B2: how much of this prompt the slot's KV rows already hold.
+    //
+    // `cached_tokens` names the tokens those rows were written for, and reuse
+    // is gated on an exact prefix match — so every row attention will read has
+    // been verified to hold the same token. That is what makes reuse safe
+    // regardless of the historical staleness question (see the B1 note in
+    // `worker_loop`), and it is now bitwise too: the CPU attention is
+    // nt-invariant (roadmap §4 item 14), so feeding a suffix at its own
+    // positions reproduces a single-shot prefill exactly
+    // (`prefix_reuse_matches_a_full_prefill`).
+    //
+    // The speculative path neither reuses nor records: a verify round writes
+    // rows past the committed tokens, so the "row i holds cached_tokens[i]"
+    // invariant is not one this path maintains for free.
+    // `MINFER_NO_PREFIX_REUSE=1` disables reuse entirely (the pre-B2 behaviour);
+    // it is an A/B switch for the measurement, not a topology change, so it is
+    // not part of any graph identity.
+    let track =
+        spec.is_none() && !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
+    let reuse = if track {
+        common_prefix_len(cached_tokens, input_ids)
+    } else {
+        0
+    };
+    // Always feed at least the last token: its logits are what the sampler
+    // consumes, so a fully-cached prompt still costs one row.
+    let (feed_from, _feed_len) = prefill_span(nt, reuse);
+    let positions: Vec<usize> = (feed_from..nt).collect();
 
     // P3 live (server): phase/token/logits events for the web visualizer.
     let live_on = crate::live::enabled();
@@ -136,12 +202,34 @@ fn generate_seq(
     if live_on {
         crate::live::begin_phase("prefill");
     }
-    let last_logits = guarded_forward(model, input_ids, &positions, 1, n_ctx_slot, cache)?;
+    let last_logits = guarded_forward(
+        model,
+        &input_ids[feed_from..],
+        &positions,
+        1,
+        n_ctx_slot,
+        cache,
+    )?;
     if live_on {
         crate::live::attach_step(&last_logits);
     }
     let mut logits = last_logits;
     let mut current_pos = nt;
+    // One line per request: makes the reuse (or its absence) observable in
+    // production, and it is what B3's measurement reads.
+    eprintln!(
+        "[server] prefill fed {}/{} prompt tokens ({} reused from the slot's KV)",
+        nt - feed_from,
+        nt,
+        feed_from
+    );
+    // Rows 0..nt now hold `input_ids` (the reused prefix because it matched,
+    // the fed suffix because it was just written).
+    cached_tokens.clear();
+    if track {
+        cached_tokens.extend_from_slice(input_ids);
+    }
+    debug_assert!(cached_tokens.is_empty() || cached_tokens.len() == current_pos);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
@@ -399,6 +487,11 @@ fn generate_seq(
             crate::live::attach_step(&logits);
         }
         current_pos += 1;
+        if track {
+            // Row `current_pos - 1` now holds this token.
+            cached_tokens.push(sampled.token_id);
+            debug_assert_eq!(cached_tokens.len(), current_pos);
+        }
     }
 
     // Final flush: everything after `emitted` — but if we stopped on a stop
@@ -523,22 +616,26 @@ pub fn worker_loop(
         let slot = &mut slots[slot_idx];
         let slot_spec = slot_specs[slot_idx].as_mut();
         slot.state = SlotState::Processing;
-        // Each request starts from a fresh KV/graph state.
+        // B2: the slot KEEPS its cache and its `cached_tokens` record across
+        // requests; `generate_seq` reuses the KV only when the new prompt
+        // starts with exactly the recorded sequence, and prefills from position
+        // 0 otherwise. The per-request reset this replaces came from commit
+        // 39eceaa (doc 97), whose message described the cross-request bug as
+        // "stale rows inside the new attention window". B1 tested that
+        // mechanism directly (`reused_cache_across_prompts_matches_a_fresh_cache`
+        // in `models/qwen2/graph.rs`: A→B, B→A, prefill+decode→B, each compared
+        // bitwise against a virgin cache — all agree), so the reset was guarding
+        // against something that does not happen on the plain path; the original
+        // bug is consistent with the process-global cache the OpenAI plan's
+        // revision notes record, which per-slot caches already fixed.
         //
-        // History: commit 39eceaa (doc 97) fixed a cross-request KV bug by
-        // resetting the slot cache here, describing the mechanism as "stale
-        // rows inside the new attention window". B1 re-tested that mechanism
-        // directly — `reused_cache_across_prompts_matches_a_fresh_cache` in
-        // `models/qwen2/graph.rs` runs A→B, B→A and prefill+decode→B on one
-        // cache and compares BITWISE against a virgin cache; all three agree.
-        // The plain path does not contaminate: a prefill rewrites rows
-        // 0..nt and attention reads only the written prefix.
+        // `cached_tokens` is cleared on every error below: a failed request may
+        // have written part of a row, and claiming otherwise is the one way this
+        // could silently go wrong. The fused GPU stores (FusedQKV /
+        // FusedQkvNorm / QkvBiasRopeStore) write K/V in-kernel and are
+        // unverified on this box (A0: CUDA compile-only, Metal not built), so
+        // the reuse gate stays conservative.
         //
-        // The reset is kept until B2 replaces it with prefix-matched reuse,
-        // because the fused GPU stores (FusedQKV / FusedQkvNorm /
-        // QkvBiasRopeStore) write K/V themselves and are unverified on this
-        // box (A0: CUDA is compile-only, Metal is not built here).
-        slot.cache = GraphCache::new();
         // Panic isolation for the WHOLE job, not just the forward call.
         // `guarded_forward` already contains a panic inside
         // `forward_graph_cached`, but the speculative path calls both models'
@@ -547,11 +644,12 @@ pub fn worker_loop(
         // this thread: `job_rx` is dropped, every later request is rejected, and
         // the requests already queued lose their event sender (an empty 200
         // instead of an error).
-        run_job_isolated(&job.tx, || match slot_spec {
+        let completed = run_job_isolated(&job.tx, || match slot_spec {
             Some(spec) => generate_spec(
                 &*model,
                 &tokenizer,
                 &mut slot.cache,
+                &mut slot.cached_tokens,
                 slot.n_ctx_slot,
                 &job.input_ids,
                 &job.params,
@@ -562,15 +660,21 @@ pub fn worker_loop(
                 &*model,
                 &tokenizer,
                 &mut slot.cache,
+                &mut slot.cached_tokens,
                 slot.n_ctx_slot,
                 &job.input_ids,
                 &job.params,
                 &job.tx,
             ),
         });
-        // The slot's KV/graph state may be half-written after a panic; the next
-        // request allocates a fresh `GraphCache` anyway (see above), so only the
-        // state flag needs restoring — the worker keeps draining the queue.
+        // A panic may have written part of a KV row, so the record is no longer
+        // trustworthy: drop it and make the next request prefill from position 0.
+        // A *completed* job needs no such care — `generate_seq` only records a
+        // token after its row was written, and returns early (before touching the
+        // KV) for a rejected request, leaving the previous record valid.
+        if !completed {
+            slot.cached_tokens.clear();
+        }
         slot.state = SlotState::Idle;
     }
 }
@@ -582,6 +686,42 @@ fn sampler_recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_span_always_feeds_the_last_token() {
+        assert_eq!(prefill_span(10, 0), (0, 10), "cold slot: full prefill");
+        assert_eq!(prefill_span(10, 4), (4, 6), "reuse a 4-token prefix");
+        assert_eq!(
+            prefill_span(10, 10),
+            (9, 1),
+            "fully cached: still one row for the logits"
+        );
+        assert_eq!(prefill_span(1, 0), (0, 1));
+        assert_eq!(prefill_span(1, 1), (0, 1));
+        assert_eq!(
+            prefill_span(10, 99),
+            (9, 1),
+            "reuse cannot exceed the prompt"
+        );
+    }
+
+    #[test]
+    fn common_prefix_len_finds_the_exact_match() {
+        assert_eq!(common_prefix_len(&[], &[1, 2, 3]), 0, "nothing recorded");
+        assert_eq!(common_prefix_len(&[1, 2], &[]), 0, "empty prompt");
+        assert_eq!(common_prefix_len(&[1, 2], &[1, 2]), 2, "identical");
+        assert_eq!(
+            common_prefix_len(&[1, 2], &[1, 2, 3]),
+            2,
+            "the record is a true prefix of the prompt"
+        );
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 9]), 1, "diverges early");
+        assert_eq!(
+            common_prefix_len(&[5], &[1, 2, 3]),
+            0,
+            "a different first token must force a full prefill"
+        );
+    }
 
     #[test]
     fn stop_token_matches_eos_and_im_end() {

@@ -19,6 +19,13 @@ pub struct Slot {
     pub id: usize,
     pub state: SlotState,
     pub cache: GraphCache,
+    /// B2: the token sequence the slot's KV rows currently hold — row `i` holds
+    /// `cached_tokens[i]`. Kept in lockstep with the KV writes (the prefill and
+    /// every committed decode token) so the next request can reuse the cache
+    /// when its prompt starts with exactly this sequence, and prefills from
+    /// position 0 otherwise. Cleared on any error, because a failed request may
+    /// have written part of a row.
+    pub cached_tokens: Vec<u32>,
     pub n_ctx_slot: usize,
 }
 
@@ -31,6 +38,7 @@ pub fn new_slots(n_slots: usize, n_ctx_total: usize) -> Vec<Slot> {
             id,
             state: SlotState::Idle,
             cache: GraphCache::new(),
+            cached_tokens: Vec::new(),
             n_ctx_slot: per,
         })
         .collect()
