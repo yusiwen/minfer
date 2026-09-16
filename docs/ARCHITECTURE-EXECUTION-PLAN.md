@@ -1,10 +1,11 @@
 # minfer Architecture Execution Plan
 
-**Status:** Phase A in progress (campaign branch, tickets A0–A8).
+**Status:** Phase A **complete** (2026-09-16); Phase B not started.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
-**Baseline:** `HEAD = f32daa7` (2026-09-16).
+**Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
+`architecture-phase-a` (PR #1).
 
 ## 0. Decisions already taken
 
@@ -12,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **The campaign starts with Phase A (A0–A8).** | Phases B–G are planned but out of scope until A's exit criteria are met. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1). | Phase B is the next tranche; Phases C–G remain planned. |
 
 ## 1. Standing rules
 
@@ -118,7 +119,7 @@ roadmap §4 defects automatically.
   GPU-only fused ops (`FusedQKV`/`FusedFFN`/`FusedQkvNorm`/`QkvBiasRopeStore`)
   which are excused on a CPU-only box.
 
-### A2 — CI  · item 24 · S — **DONE**
+### A2 — CI  · item 24 · S — **DONE (verified in CI)**
 - **Files:** `.github/workflows/ci.yml`.
 - **Deliverable:** three jobs — `test-linux-cpu` (`cargo test --release`, the
   runtime net), `build-linux-cuda` (`cargo build --release --features cuda` in
@@ -127,10 +128,26 @@ roadmap §4 defects automatically.
 - **Acceptance:** the workflow parses and declares all three jobs; a broken
   commit now fails `test-linux-cpu` (unit tests run there, including the
   allocator/scheduler tests added in A3/A5).
-- **Unverified from this box:** the dev machine is aarch64, so the x86_64
-  Linux job's *first* run is the first time the AVX2 paths see CI. If it comes
-  back red, that is a real finding, not a CI defect — fix or `#[ignore]` the
-  individual test with the reason recorded, do not soften the job.
+- **Verified outcome** (PR #1, run [35080755969](https://github.com/yusiwen/minfer/actions/runs/35080755969)):
+
+  | job | result | time |
+  |---|---|---|
+  | `test-linux-cpu` | ✅ | 1m09s |
+  | `build-macos` | ✅ | 1m26s |
+  | `build-linux-cuda` | ✅ (incl. `cargo test --features cuda --no-run`) | 4m36s |
+
+- **The x86_64 question is answered: the Linux/CPU suite passes.** `running 163
+  tests → 160 passed; 0 failed; 3 ignored`, plus `3 passed; 6 ignored` for the
+  integration file. That is 2 fewer than the aarch64 dev box, and the difference
+  is exactly the `quants::neon_correctness` module, gated
+  `#[cfg(all(test, target_arch = "aarch64"))]` — no test is silently missing.
+- **First CI run failed, and that was the point.** Run 35080525201 came back
+  `build-linux-cuda` ❌ at the `dtolnay/rust-toolchain` step:
+  `curl: command not found` — the CUDA devel images are minimal, so rustup could
+  not bootstrap and the CUDA build never started. Fixed by installing
+  `curl ca-certificates build-essential` before the toolchain step (the last
+  also supplies nvcc's host compiler). Only the fix commit's push turned all
+  three green.
 
 ### A3 — KV bounds guard + `ensure_kv` size check  · item 5 · S — **DONE**
 - **Files:** `src/graph/alloc.rs` (only — see the deviation note).
@@ -473,9 +490,45 @@ tickets and everything after them.
 
 | Phase | Done when |
 |---|---|
-| A | `cargo test` green on Linux/CPU; A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
+| A | **Complete 2026-09-16.** `cargo test` green on Linux/CPU (aarch64 locally, x86_64 in CI); A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
 | B | A multi-turn conversation prefills only the new turns; the contamination test passes; numbers recorded interleaved. |
 | C | Cell store lands bitwise; shift is a documented tolerance class; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
 | E | Two sequences can be batched without cross-attention; `--n-slots 4` beats serial; `n_batch` chunks prefill; an over-VRAM model runs with layer offload. |
 | G | Three backends agree with the op matrix and the support table. |
+
+## 13. Phase A outcome (2026-09-16)
+
+**Branch:** `architecture-phase-a` (PR #1). All nine tickets closed.
+
+| Check | Result |
+|---|---|
+| Unit suite (aarch64, this box) | `162 passed / 0 failed / 3 ignored` |
+| Unit suite (x86_64, CI runner) | `running 163 → 160 passed / 0 failed / 3 ignored`; the 2-test delta is `quants::neon_correctness`, gated `cfg(all(test, target_arch = "aarch64"))` |
+| Op matrix | 17 cases × 3 backends (17 CPU cells, 34 explicit skips), 23 support rows, exhaustive `Op` enumeration |
+| CI | three jobs green: 1m09s / 1m26s / 4m36s |
+| `rustfmt --check`, pre-commit | clean; the hook ran on every commit |
+| `mdbook build` | passes |
+
+Defects found and fixed during the phase — none of them were on the ticket list,
+which is the point of A1 and A2:
+
+- **`Op::Softmax` returned unnormalised values** on the CPU backend (found by
+  A1's matrix; pinned by a case).
+- **Four CUDA test call sites** broken by A5's signature change — invisible to
+  `cargo build` because it does not compile `#[cfg(test)]`; the CUDA CI job now
+  runs `cargo test --features cuda --no-run`.
+- **`panic_message(&payload)`** downcast against the `Box` (itself `Any`)
+  instead of the payload, so every panic reported a non-string payload.
+- **CI could not bootstrap rustup** in the CUDA container (no `curl`).
+
+Deliberately not done, and where it is recorded:
+
+- **GPU columns of the matrix** and the four GPU-only fused ops → a
+  GPU-verifiable run (A0: CUDA is compile-only here).
+- **Metal** — untouched by decision; its debt is Phase G.
+- **A6** — no code change; the measurement is the deliverable.
+
+Open for the maintainer: the three CI jobs carry a pre-existing
+`Node.js 20 is deprecated` annotation for `actions/checkout@v4`; bumping to
+`v5` silences it.
