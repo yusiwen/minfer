@@ -121,6 +121,22 @@ impl BackendScheduler {
 
     /// Execute the graph split by split (llama.cpp `compute_splits` shape).
     pub fn execute(&self, graph: &ComputeGraph, alloc: &mut GraphAllocator) -> Result<(), String> {
+        // C1 gate (Phase C). While the KV mapping is the identity, a backend may
+        // index the arenas with the raw `positions` input — which is what all
+        // three implement. Once C2 introduces a hole or a window the mapping
+        // stops being the identity, the resolved cell array must reach the
+        // kernel instead, and a backend that has not been ported has to refuse
+        // the node rather than write the wrong row (standing rule 2: never a
+        // silent wrong answer). It never fires today; it exists so C2 cannot
+        // ship the hazard by accident, and the day it fires is the day a backend
+        // is missing its port.
+        if !alloc.kv_is_identity() {
+            return Err(
+                "KV cell mapping is no longer the identity: the resolved cell array must be \
+                 passed to the backend, and no backend consumes it yet (Phase C / C2)"
+                    .to_string(),
+            );
+        }
         #[cfg(debug_assertions)]
         debug_assert!(graph.topo_order().is_ok(), "graph is not a valid DAG");
         let splits = self.split_graph(graph);
@@ -498,6 +514,28 @@ mod tests {
         assert_eq!(splits[1].inputs, vec![0]);
         assert_eq!(splits[1].outputs, vec![1]);
         assert_eq!(splits[2].inputs, vec![1, 0]);
+    }
+
+    /// C1 gate (Phase C): the executor must refuse a graph whose KV mapping is
+    /// no longer the identity, because no backend consumes the resolved cell
+    /// array yet — a half-ported C2 has to fail loudly, not write the wrong row.
+    #[test]
+    fn a_non_identity_kv_mapping_is_refused() {
+        let g = small_graph();
+        let sched = BackendScheduler::new();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+
+        // The identity mapping is what every backend implements: it executes.
+        sched.execute(&g, &mut alloc).unwrap();
+
+        // Flip the gate the way C2 would (a hole, a window, …).
+        alloc.kv_clear_identity();
+        let err = sched.execute(&g, &mut alloc).unwrap_err();
+        assert!(
+            err.contains("no longer the identity"),
+            "expected the C1 gate to fire, got: {err}"
+        );
     }
 
     #[test]

@@ -35,18 +35,13 @@ pub struct GraphAllocator {
     cross: HashMap<(NodeId, Backend), BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
-    /// per-layer KV persistent regions (K, V) + the element count they were
-    /// allocated for; `ensure_kv` refuses a size or backend change.
-    kv: HashMap<usize, KvRegion>,
+    /// Per-layer KV **cell store**: the persistent regions plus per-cell
+    /// sequence ownership (Phase C / C1). The allocator only allocates the
+    /// arenas; the store owns their bookkeeping and the `position -> cell`
+    /// resolution.
+    kv: super::kvcache::KvCache,
     /// All persistent regions (never freed).
     pub persistent: Vec<PersistentBuf>,
-}
-
-/// A layer's persistent KV pair plus the element count it was allocated for
-/// (see `ensure_kv`).
-struct KvRegion {
-    pair: [BufRef; 2],
-    elems: usize,
 }
 
 impl Default for GraphAllocator {
@@ -60,7 +55,7 @@ impl Default for GraphAllocator {
             node_to_buf: HashMap::new(),
             cross: HashMap::new(),
             buf_alive: HashMap::new(),
-            kv: HashMap::new(),
+            kv: super::kvcache::KvCache::new(),
             persistent: Vec::new(),
         }
     }
@@ -233,7 +228,8 @@ impl GraphAllocator {
             let backend = node.backend.unwrap_or(Backend::CPU);
             match node.op {
                 Op::KvcacheStore { layer } | Op::KvcacheLoad { layer } => {
-                    let pair = self.ensure_kv(layer, backend, node.n_elements())?;
+                    let pair =
+                        self.ensure_kv(layer, backend, node.n_elements(), node.out_shape[1])?;
                     // the node's buffer = the K region
                     self.node_to_buf.insert(id, pair[0]);
                 }
@@ -241,11 +237,11 @@ impl GraphAllocator {
                     // fused decode QKV: also needs the layer's persistent KV
                     // regions (the kernel stores K/V), but its output is a
                     // normal concat buffer (q|k|v), not the K region.
-                    let kv_elems = match &node.meta {
-                        NodeMeta::FusedQkv(m) => m.kv_elems,
-                        _ => node.n_elements(),
+                    let (kv_elems, n_ctx) = match &node.meta {
+                        NodeMeta::FusedQkv(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
+                        _ => (node.n_elements(), node.out_shape[1]),
                     };
-                    self.ensure_kv(layer, backend, kv_elems)?;
+                    self.ensure_kv(layer, backend, kv_elems, n_ctx)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -257,11 +253,11 @@ impl GraphAllocator {
                     // fused decode QKV with per-head Q/K RMSNorm (Qwen3): same
                     // layout as FusedQKV — persistent KV regions + a normal
                     // concat (q|k|v) output buffer for the attention q input.
-                    let kv_elems = match &node.meta {
-                        NodeMeta::FusedQkvNorm(m) => m.kv_elems,
-                        _ => node.n_elements(),
+                    let (kv_elems, n_ctx) = match &node.meta {
+                        NodeMeta::FusedQkvNorm(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
+                        _ => (node.n_elements(), node.out_shape[1]),
                     };
-                    self.ensure_kv(layer, backend, kv_elems)?;
+                    self.ensure_kv(layer, backend, kv_elems, n_ctx)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -273,11 +269,13 @@ impl GraphAllocator {
                     // D3-8: the mixed-quant QKV epilogue also needs the layer's
                     // persistent KV regions (it stores k/v like FusedQKV).
                     if let Op::QkvBiasRopeStore { layer } = &node.op {
-                        let kv_elems = match &node.meta {
-                            NodeMeta::QkvBiasRopeStore(m) => m.kv_elems,
-                            _ => node.n_elements(),
+                        let (kv_elems, n_ctx) = match &node.meta {
+                            NodeMeta::QkvBiasRopeStore(m) => {
+                                (m.kv_elems, m.kv_elems / m.nkt.max(1))
+                            }
+                            _ => (node.n_elements(), node.out_shape[1]),
                         };
-                        self.ensure_kv(*layer, backend, kv_elems)?;
+                        self.ensure_kv(*layer, backend, kv_elems, n_ctx)?;
                     }
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend
@@ -401,33 +399,28 @@ impl GraphAllocator {
         &mut self,
         layer: usize,
         backend: Backend,
-        size: usize,
+        elems: usize,
+        n_ctx: usize,
     ) -> Result<[BufRef; 2], String> {
-        if let Some(region) = self.kv.get(&layer) {
-            if region.elems != size {
+        if let Some(region) = self.kv.get(layer) {
+            if region.elems != elems {
                 return Err(format!(
-                    "KV region for layer {layer} was allocated with {} elements but {size} are \
+                    "KV region for layer {layer} was allocated with {} elements but {elems} are \
                      requested (n_ctx changed on a live GraphCache; the regions are persistent)",
                     region.elems
                 ));
             }
-            if region.pair[0].backend != backend {
+            if region.k.backend != backend {
                 return Err(format!(
                     "KV region for layer {layer} lives on {:?} but this graph assigns it to {:?}",
-                    region.pair[0].backend, backend
+                    region.k.backend, backend
                 ));
             }
-            return Ok(region.pair);
+            return Ok([region.k, region.v]);
         }
-        let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, size);
-        let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, size);
-        self.kv.insert(
-            layer,
-            KvRegion {
-                pair: [k, v],
-                elems: size,
-            },
-        );
+        let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, elems);
+        let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, elems);
+        self.kv.insert(layer, k, v, elems, n_ctx);
         Ok([k, v])
     }
 
@@ -445,6 +438,29 @@ impl GraphAllocator {
     /// Buffer handle for a node (None if the node is dead / not allocated).
     pub fn node_buffer(&self, id: NodeId) -> Option<BufRef> {
         self.node_to_buf.get(&id).copied()
+    }
+
+    /// True while the KV mapping is the identity, i.e. while a backend may keep
+    /// indexing the arenas with the raw `positions` input (Phase C / C1). The
+    /// scheduler refuses to execute once this is false, because no backend
+    /// consumes the resolved cell array yet.
+    pub fn kv_is_identity(&self) -> bool {
+        self.kv.is_identity()
+    }
+
+    /// Host-side `position -> cell` resolution for a layer (Phase C / C1).
+    /// Today the identity; C2 is the only thing that changes its behaviour.
+    #[allow(dead_code)] // the resolver's C2 consumers are the backends
+    pub fn kv_cells_for(&self, layer: usize, positions: &[usize]) -> Result<Vec<u32>, String> {
+        self.kv.cells_for(layer, positions)
+    }
+
+    /// Drop the identity fast path (Phase C / C2). After this the scheduler
+    /// refuses to execute until the backends consume the resolved cell array,
+    /// so a half-ported C2 fails loudly instead of writing the wrong row.
+    #[allow(dead_code)] // C2 calls it
+    pub fn kv_clear_identity(&mut self) {
+        self.kv.clear_identity();
     }
 
     /// Mark buffers whose liveness ended before exec index `i` as reusable.
@@ -525,19 +541,38 @@ impl GraphAllocator {
         if !indexes_kv {
             return Ok(());
         }
-        // Every KV region in one graph is sized by the same `CParams.n_ctx`, so
-        // any kv_load node carries the bound.
-        let Some(n_ctx) = graph.nodes.iter().find_map(|n| match n.op {
-            Op::KvcacheLoad { .. } => Some(n.out_shape[1]),
-            _ => None,
-        }) else {
+        // Resolve through the cell store rather than re-deriving the bound from
+        // a node's shape: the store owns `n_ctx` and the position→cell mapping,
+        // so when C2 makes that mapping non-identity this check keeps meaning
+        // the same thing (it becomes an ownership check) without being touched.
+        let mut layers: Vec<usize> = graph
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                Op::KvcacheStore { layer }
+                | Op::KvcacheLoad { layer }
+                | Op::FusedQKV { layer }
+                | Op::FusedQkvNorm { layer }
+                | Op::QkvBiasRopeStore { layer } => Some(*layer),
+                Op::Attn { .. } => match &n.meta {
+                    NodeMeta::Attn(m) => Some(m.layer),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
             return Ok(());
-        };
-        if let Some(&p) = data.iter().find(|&&p| p as usize >= n_ctx) {
-            return Err(format!(
-                "input '{name}': position {p} >= n_ctx {n_ctx} — the KV store would write past \
-                 the persistent region (`docs/ARCHITECTURE-ROADMAP.md` §2.4)"
-            ));
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        let positions: Vec<usize> = data.iter().map(|&p| p as usize).collect();
+        for layer in layers {
+            if self.kv.contains(layer) {
+                self.kv.cells_for(layer, &positions).map_err(|e| {
+                    format!("input '{name}': {e} (`docs/ARCHITECTURE-ROADMAP.md` §2.4)")
+                })?;
+            }
         }
         Ok(())
     }
@@ -622,7 +657,8 @@ impl GraphAllocator {
                 _ => None,
             }
         };
-        let pair = self.kv.get(&layer)?.pair;
+        let l = self.kv.get(layer)?;
+        let pair = [l.k, l.v];
         Some((rd(self, pair[0])?, rd(self, pair[1])?))
     }
 
@@ -757,7 +793,7 @@ impl GraphAllocator {
 
 impl KvProvider for GraphAllocator {
     fn kv_pair(&self, layer: usize) -> Option<(usize, usize)> {
-        self.kv.get(&layer).map(|r| (r.pair[0].id, r.pair[1].id))
+        self.kv.get(layer).map(|r| (r.k.id, r.v.id))
     }
 }
 
