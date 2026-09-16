@@ -381,6 +381,38 @@ Five sub-steps, each keeping the tree green. C3 depends on Phase D.
   lengths; the graph topology is unchanged (no new topology-affecting params).
 - **Defers to G:** nothing — the Metal backend keeps the old regions until G.
 
+**C1 design (written before the code, 2026-09-16).** The shape below is what C2
+needs, so C1 builds it rather than a type with no consumer:
+
+1. `KvCache` (new `src/graph/kvcache.rs`) owns, per layer, the two persistent
+   regions plus `owner: Vec<SeqId>` — one entry per cell, `FREE` for a cell no
+   sequence holds. One implicit sequence for now, so every cell of a written row
+   is owned by it.
+2. `KvCache::cells_for(positions: &[usize]) -> Result<Vec<u32>, String>` — the
+   host-side resolver. Today it is the identity (`cell == pos`) and returns
+   `Err` for a position outside the arena; C2 changes exactly this function to
+   consult `owner` and the layer's window start.
+3. `KvCache::is_identity() -> bool` — true until C2 introduces a hole or a
+   window. The scheduler consults it: while true the existing `positions` input
+   reaches the backend exactly as today (so no kernel changes), and once false
+   the resolved cell array must be passed instead. **A backend that has not been
+   ported returns `Err` instead of indexing the wrong row** (standing rule 2).
+   On this box that means CPU first: CUDA is compile-verified only (A0) and
+   Metal stays untouched (G), so C2 must either keep the mapping identity for
+   them or refuse to run there.
+4. The index array travels as a graph **input** (`kv_cells`, I32), filled by the
+   allocator from `positions` — positions stay data, so the topology and the
+   params-only reuse identity are untouched.
+5. Tests: resolver edge cases (out-of-range → `Err`, identity while there are no
+   holes), `is_identity` flipping exactly when C2 introduces one, and the
+   existing model tests (B1, B2's prefix reuse, `graph_logits_match_forward`)
+   staying bitwise — that is the refactor's acceptance gate.
+
+The first thing to change is therefore the *resolution*, not the kernels: the
+Backend trait gains the resolved cell slice alongside `kv_pair`, and each
+backend uses it for row indexing while still using `positions` for the causal
+bound and RoPE.
+
 ### C2 — Removal and shift
 - **Deliverable:** `seq_rm` (drop a range) and `seq_add` (shift positions),
   surfaced as graph-level operations; `conversation.rs:597-732` overflow switches
