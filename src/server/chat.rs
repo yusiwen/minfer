@@ -523,13 +523,21 @@ pub fn worker_loop(
         let slot = &mut slots[slot_idx];
         let slot_spec = slot_specs[slot_idx].as_mut();
         slot.state = SlotState::Processing;
-        // Each request starts from a fresh KV/graph state: the graph path's
-        // persistent KV regions were built for append-only sessions (the
-        // conversation resets on any full re-render) — re-prefilling a
-        // DIFFERENT prompt over the same regions leaves stale rows below the
-        // new attention window (observed as cross-request contamination on
-        // the plain path too, doc 97 §2). A fresh cache costs one ~1 ms
-        // graph rebuild per request.
+        // Each request starts from a fresh KV/graph state.
+        //
+        // History: commit 39eceaa (doc 97) fixed a cross-request KV bug by
+        // resetting the slot cache here, describing the mechanism as "stale
+        // rows inside the new attention window". B1 re-tested that mechanism
+        // directly — `reused_cache_across_prompts_matches_a_fresh_cache` in
+        // `models/qwen2/graph.rs` runs A→B, B→A and prefill+decode→B on one
+        // cache and compares BITWISE against a virgin cache; all three agree.
+        // The plain path does not contaminate: a prefill rewrites rows
+        // 0..nt and attention reads only the written prefix.
+        //
+        // The reset is kept until B2 replaces it with prefix-matched reuse,
+        // because the fused GPU stores (FusedQKV / FusedQkvNorm /
+        // QkvBiasRopeStore) write K/V themselves and are unverified on this
+        // box (A0: CUDA is compile-only, Metal is not built here).
         slot.cache = GraphCache::new();
         // Panic isolation for the WHOLE job, not just the forward call.
         // `guarded_forward` already contains a panic inside
