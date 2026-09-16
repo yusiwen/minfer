@@ -21,6 +21,12 @@ pub mod ops;
 pub mod params;
 pub mod scheduler;
 
+/// Op × dtype × backend correctness matrix (ticket A1). Test-only: it exists to
+/// keep the op semantics and the `supports_op` contract honest, not to run in
+/// production builds.
+#[cfg(test)]
+mod op_matrix;
+
 use ops::{NodeMeta, Op};
 
 /// Node index in `ComputeGraph::nodes`.
