@@ -946,6 +946,62 @@ mod tests {
         );
     }
 
+    /// B2 (Phase B): the numeric property prefix reuse rests on.
+    ///
+    /// If a cache already holds rows `0..L` for tokens `P[0..L]`, then
+    /// prefilling only `P[L..]` at positions `L..` must give exactly the same
+    /// last-row logits as prefilling all of `P` from position 0 — because
+    /// attention for each new token reads `[0, pos+1)`, and rows `0..L` were
+    /// verified to hold the same tokens. The server's reuse is gated on that
+    /// exact token match (`common_prefix_len`), so this is the safety proof.
+    #[test]
+    fn prefix_reuse_matches_a_full_prefill() {
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping prefix-reuse test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let prompt: Vec<u32> =
+            tok.encode("The capital of France is Paris and the capital of Japan is Tokyo");
+        let split = prompt.len() / 2;
+        let (head, tail) = prompt.split_at(split);
+        assert!(!head.is_empty() && !tail.is_empty());
+
+        // (a) Warm the cache with the head, then prefill only the tail.
+        let mut incremental = GraphCache::new();
+        let hpos: Vec<usize> = (0..head.len()).collect();
+        let _ = model.forward_graph_cached(head, &hpos, 1, n_ctx, &mut incremental);
+        let tpos: Vec<usize> = (head.len()..prompt.len()).collect();
+        let l_incremental = model.forward_graph_cached(tail, &tpos, 1, n_ctx, &mut incremental);
+
+        // (b) A virgin cache prefills the whole prompt in one shot.
+        let mut whole = GraphCache::new();
+        let ppos: Vec<usize> = (0..prompt.len()).collect();
+        let l_whole = model.forward_graph_cached(&prompt, &ppos, 1, n_ctx, &mut whole);
+
+        assert_eq!(l_incremental.len(), l_whole.len());
+        let worst = l_incremental
+            .iter()
+            .zip(&l_whole)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst == 0.0,
+            "prefix reuse changed the logits (max |Δ| = {worst}, head {} tail {})",
+            head.len(),
+            tail.len()
+        );
+    }
+
     /// Phase 6 verification (hermetic on CPU builds): the graph path must
     /// reproduce forward.rs logits on a real model — prefill and a decode
     /// step (KV carried across). Built and executed locally (no global

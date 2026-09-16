@@ -601,17 +601,22 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
                     mx = s;
                 }
             }
-            for kv in vl..c.nkv {
-                scrs[kv] = f32::NEG_INFINITY;
-            }
-            let sm = crate::vec_ops::vec_soft_max_inplace_f32(c.nkv, &mut scrs, mx);
+            // Softmax and accumulate over the token's OWN causal window `vl`
+            // rather than over the batch-wide `nkv`. Padding to `nkv` and
+            // softmaxing over it makes every reduction's *length* depend on how
+            // many tokens the batch holds, which makes a token's result depend
+            // on `nt` (measured: a 6-token and a 13-token batch diverge from
+            // layer 3 on). Restricting the window to `vl` = `pos[t] + 1` makes
+            // the numerics a function of the token alone, so incremental prefill
+            // and decode reproduce a single-shot prefill bitwise.
+            let sm = crate::vec_ops::vec_soft_max_inplace_f32(vl, &mut scrs, mx);
             let is = (1.0 / sm) as f32;
-            crate::vec_ops::vec_scale_f32(c.nkv, &mut scrs, is);
+            crate::vec_ops::vec_scale_f32(vl, &mut scrs, is);
             let os = t * ne_q + h * c.hd;
             let out_slice = std::slice::from_raw_parts_mut(c.out.add(os), c.hd);
             out_slice.fill(0.0);
             let vs_base = hk * c.hd_kv;
-            for kv in 0..c.nkv {
+            for kv in 0..vl {
                 crate::vec_ops::vec_muladd_f32(
                     c.hd_kv,
                     std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
