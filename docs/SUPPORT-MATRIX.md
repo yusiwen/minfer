@@ -53,6 +53,47 @@ for those ops.
 Q5_K and Q5_1 are **fully supported on CPU and both GPU backends** — Q5_K_M
 models run at full GPU speed.
 
+## Operator Coverage by Backend
+
+`supports_op` decides at graph-build time which backend runs each node
+(`docs/ARCHITECTURE.md` §5). This table is the contract, generated from the
+three implementations — keep it in step with them.
+
+| Operator | CPU | Metal | CUDA |
+|---|:---:|:---:|:---:|
+| `Input`, `KvcacheLoad`, `View`/`Reshape`/`Permute` | ✅ | ✅ | ✅ |
+| `Add`, `Mul`, `Silu` | ✅ | ✅ | ✅ |
+| `RmsNorm`, `QkNorm` | ✅ | ✅ | ✅ |
+| `MatMul` | ✅ | ✅ | ✅ |
+| `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
+| `Attn` | ✅ | ✅ | ✅ |
+| `KvcacheStore` | ✅ | ✅ | ✅ |
+| `SwiGLU` (fused) | ✅ | ✅ | ✅ |
+| `RoPE` non-interleaved | ✅ | ✅ | ✅ |
+| `RoPE` interleaved | ✅ | ✅ | ❌ |
+| `FusedQKV` (decode) | ❌ | ✅ | ✅ |
+| `FusedFFN` (decode) | ❌ | ✅ | ✅ |
+| `FusedQkvNorm` (Qwen3 decode) | ❌ | ✅ | ❌ |
+| `QkvBiasRopeStore` (mixed-quant decode) | ❌ | ❌ | ✅ |
+| `Scale`, `Softmax`, `BatchMatMul` | ✅ / ✅ / ❌ | ❌ / ❌ / ❌ | ❌ / ❌ / ❌ |
+
+Notes on the asymmetries — these are the rows where a model's decode path
+differs by platform:
+
+- **`FusedQkvNorm` is Metal-only.** Qwen3 decode on CUDA takes the unfused
+  `QkNorm` path, which is numerically equivalent but issues more dispatches.
+  Making CUDA fused is a Phase G / CUDA-verifiable ticket, not a correctness gap.
+- **`QkvBiasRopeStore` is CUDA-only.** On Metal the mixed-quant decode layers
+  keep the unfused bias+rope+store chain; the graph builder never emits the node
+  there (`metal_backend.rs`'s `false` arm is a design statement, not a gap).
+- **Interleaved RoPE is CPU-only.** Both loaders hard-code `NonInterleaved`
+  today, so no shipped model hits this; a family that needs interleaved RoPE
+  needs a loader change plus a CUDA kernel.
+- **`Scale`/`Softmax` are CPU-only and unused.** Attention kernels fuse the
+  softmax and carry the scale in `AttnMeta`, so no supported architecture emits
+  either node.
+- `BatchMatMul` is deferred everywhere (single-output IR) and nothing emits it.
+
 ## Supported Model Architectures
 
 minfer currently supports **two** model architectures.

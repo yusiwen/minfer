@@ -74,7 +74,7 @@ roadmap §4 defects automatically.
 | A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | ✅ done |
 | A6 | 28 | Remove CPU per-op allocations | S | |
 | A7 | 26 | Dead identity fields | S | ✅ done |
-| A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | |
+| A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | ✅ done (docs route) |
 
 ### A0 — CUDA access spike — **DONE (2026-09-16): unavailable**
 - **Verdict:** `cargo build --release --features cuda` succeeds (1m23s, targets
@@ -196,15 +196,20 @@ roadmap §4 defects automatically.
 - **Acceptance:** no occurrence of `n_batch` remains in `src/graph/`; every
   field compared by `params_match` has at least one reader; `cargo test` green.
 
-### A8 — Guard symmetry  · item 13 · S
-- **Files:** `docs/SUPPORT-MATRIX.md` (op × backend column), `src/graph/cuda_backend.rs`.
-- **Deliverable:** `SUPPORT-MATRIX.md` gains a per-backend op column so a
-  platform-dependent decode path is visible; CUDA gains `FusedQkvNorm` **or**
-  the matrix records that it does not have it.
-- **Acceptance:** the asymmetry in roadmap §4 defect 5 is either fixed or
-  documented; A1's matrix agrees with the table.
+### A8 — Guard symmetry  · item 13 · S — **DONE (docs route)**
+- **Files:** `docs/SUPPORT-MATRIX.md` — a new "Operator Coverage by Backend"
+  section.
+- **Route taken:** the ticket offered "CUDA gains `FusedQkvNorm` **or** the
+  matrix records that it does not have it". A0 made CUDA unverifiable here, so
+  writing a new CUDA kernel blind is strictly worse than documenting the
+  asymmetry: the table now lists every op against CPU/Metal/CUDA, generated from
+  the three `supports_op` implementations, with the four asymmetric rows called
+  out and their consequences (Qwen3 decode is fused on Metal and unfused on
+  CUDA; `QkvBiasRopeStore` is the mirror case; interleaved RoPE is CPU-only).
+- **Acceptance:** the roadmap §4 defect 5 asymmetry is now visible in the
+  support matrix; A1's matrix must agree with this table.
 - **Defers to G:** the Metal half (`debug_assert!` → `Err`; the weightless
-  RMSNorm fallback).
+  RMSNorm fallback) and any decision to port `FusedQkvNorm` to CUDA.
 
 ## 4. Phase B — persistent server context
 
