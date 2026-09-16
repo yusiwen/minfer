@@ -355,13 +355,17 @@ cannot be made correct first.
 
 Two smaller but immediate items sit in this layer:
 
-- **Persistent server context.** `chat.rs:491` discards the `GraphCache` per
+- ~~**Persistent server context.** `chat.rs:491` discards the `GraphCache` per
   request. The comment justifies it as avoiding cross-request KV contamination
   (a real bug fixed in doc 97) — but the correct fix is sequence-aware KV
   invalidation (§2.4), not discarding the whole cache. As written, every request
   pays KV + pool re-allocation (≈235 MB for 7B at `n_ctx=4096`, f16) and
   invalidates the CUDA Graph capture warm-up (`pool_gen` bump,
-  `cuda_backend.rs:1342`).
+  `cuda_backend.rs:1342`).~~ **Fixed in B2**: the slot keeps its cache and a
+  record of the tokens its rows hold; a request reuses the KV only when its
+  prompt starts with exactly that sequence. Measured end-to-end (0.5B Q4_0,
+  219-token second turn): prefill 219 → 16 tokens, time-to-first-token
+  ≈2.8 s → 0.25 s (≈11×), with the cold-slot turn unchanged.
 - ~~**No panic isolation.**~~ **Fixed in A4.** The guard that existed
   (`guarded_forward`, `chat.rs:438-450`) only covered
   `forward_graph_cached`; the speculative path calls both models' forwards
@@ -528,7 +532,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. | §2.4 | XL |
 | 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. | §2.5 | L |
 | 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). | §2.5 | XL |
-| 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. | §2.5 | M |
+| 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. — **done in B2/B3** (prefix-matched reuse, ≈11× TTFT on turn 2) | §2.5 | M |
 | 5 | **Fix `ensure_kv` size handling** and add the missing `pos < n_ctx` guard on both GPU backends. | §2.4 | S |
 | 6 | **Worker panic isolation** (`catch_unwind` + supervision + an error event instead of a silent empty stream). — **done in A4** | §2.5 | S |
 
