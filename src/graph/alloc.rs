@@ -26,12 +26,13 @@ pub struct GraphAllocator {
     cuda: Option<super::cuda_backend::CudaBackend>,
     node_to_buf: HashMap<NodeId, BufRef>,
     /// Cross-backend copies for the CURRENT graph (split-boundary staging):
-    /// node → buffer on the consuming split's backend. NOT part of the node's
-    /// canonical assignment — node_to_buf must stay re-executable (a remap
-    /// would break the next execute of a reused graph, whose producing split
-    /// would find its buffer on another backend). The same staging buffer is
-    /// rewritten on every execute (no per-step allocation).
-    cross: HashMap<NodeId, BufRef>,
+    /// `(node, destination backend)` → buffer on that backend. NOT part of the
+    /// node's canonical assignment — node_to_buf must stay re-executable (a
+    /// remap would break the next execute of a reused graph, whose producing
+    /// split would find its buffer on another backend). The same staging buffer
+    /// is rewritten on every execute (no per-step allocation). Keying on the
+    /// destination as well is what lets one node feed two foreign backends.
+    cross: HashMap<(NodeId, Backend), BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
     /// per-layer KV persistent regions (K, V) + the element count they were
@@ -179,7 +180,7 @@ impl GraphAllocator {
         // cross-backend staging buffers belong to the previous graph (their
         // sizes follow that graph's shapes) — free and re-materialize on the
         // first execute of the new graph
-        let prev_cross: Vec<(NodeId, BufRef)> = self.cross.drain().collect();
+        let prev_cross: Vec<((NodeId, Backend), BufRef)> = self.cross.drain().collect();
         for (_, cb) in prev_cross {
             self.free_in_pool(cb.backend, cb.id);
         }
@@ -692,67 +693,65 @@ impl GraphAllocator {
         if br.backend == dst_backend {
             return Ok(());
         }
-        // one staging buffer per (node, dst backend) per graph: reuse it when
-        // this execute (or a previous one) already made the copy
-        let staged = self.cross.get(&node_id).map(|cb| (cb.backend, cb.id));
-        if let Some((cb_backend, cb_id)) = staged {
-            if cb_backend == dst_backend {
-                let data = self
-                    .copy_to_cpu(node_id)
-                    .ok_or_else(|| format!("node {node_id} host read failed"))?;
-                match dst_backend {
-                    Backend::CPU => self.cpu.write_host(cb_id, &data)?,
-                    #[cfg(target_os = "macos")]
-                    Backend::Metal => self.metal.as_mut().unwrap().write_host(cb_id, &data)?,
-                    #[cfg(not(target_os = "macos"))]
-                    Backend::Metal => return Err("Metal unavailable".into()),
-                    #[cfg(feature = "cuda")]
-                    Backend::Cuda => self
-                        .cuda
-                        .as_mut()
-                        .expect("CUDA pool not enabled")
-                        .write_host(cb_id, &data)?,
-                    #[cfg(not(feature = "cuda"))]
-                    Backend::Cuda => return Err("CUDA unavailable".into()),
-                }
-                return Ok(());
-            }
-        }
         let data = self
             .copy_to_cpu(node_id)
             .ok_or_else(|| format!("node {node_id} host read failed"))?;
-        let new_id = self.alloc_fresh_in(dst_backend, data.len());
-        // write into the destination backend pool
-        match dst_backend {
-            Backend::CPU => self.cpu.write_host(new_id, &data)?,
+        // One staging buffer per (node, dst backend) per graph, reused on every
+        // execute. Keyed by the destination too, because a node consumed by two
+        // different foreign backends needs two buffers — the old single-entry
+        // map forced the consumer-side filter in the scheduler, which `None`
+        // here now expresses structurally.
+        let dst_id = match self.cross.get(&(node_id, dst_backend)) {
+            Some(&cb) => cb.id,
+            None => {
+                let id = self.alloc_fresh_in(dst_backend, data.len());
+                self.cross.insert(
+                    (node_id, dst_backend),
+                    BufRef {
+                        backend: dst_backend,
+                        id,
+                    },
+                );
+                id
+            }
+        };
+        self.write_pool(dst_backend, dst_id, &data)
+    }
+
+    /// Write host data into a pool buffer of `backend` (shared by the staging
+    /// paths of `copy_across`).
+    fn write_pool(&mut self, backend: Backend, id: usize, data: &[f32]) -> Result<(), String> {
+        match backend {
+            Backend::CPU => self.cpu.write_host(id, data),
             #[cfg(target_os = "macos")]
-            Backend::Metal => self.metal.as_mut().unwrap().write_host(new_id, &data)?,
+            Backend::Metal => self.metal.as_mut().unwrap().write_host(id, data),
             #[cfg(not(target_os = "macos"))]
-            Backend::Metal => return Err("Metal unavailable".into()),
+            Backend::Metal => Err("Metal unavailable".into()),
             #[cfg(feature = "cuda")]
             Backend::Cuda => self
                 .cuda
                 .as_mut()
                 .expect("CUDA pool not enabled")
-                .write_host(new_id, &data)?,
+                .write_host(id, data),
             #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => return Err("CUDA unavailable".into()),
+            Backend::Cuda => Err("CUDA unavailable".into()),
         }
-        self.cross.insert(
-            node_id,
-            BufRef {
-                backend: dst_backend,
-                id: new_id,
-            },
-        );
-        Ok(())
     }
 
-    /// The node's cross-backend staging buffer, if a split boundary copied it
-    /// for the current graph. Consumers on another backend read this instead
-    /// of the node's canonical buffer.
-    pub fn cross_buffer(&self, node_id: NodeId) -> Option<BufRef> {
-        self.cross.get(&node_id).copied()
+    /// The staging buffer a consumer on `backend` must read for `node_id`, if a
+    /// split boundary copied it for the current graph. Consumers on the node's
+    /// own backend read the canonical buffer instead.
+    pub fn cross_buffer(&self, node_id: NodeId, backend: Backend) -> Option<BufRef> {
+        self.cross.get(&(node_id, backend)).copied()
+    }
+
+    /// Test hook: stage `node_id`'s output on `backend` as if a split boundary
+    /// had copied it. The real path needs a second usable backend, which a
+    /// CPU-only build does not have.
+    #[cfg(test)]
+    pub fn stage_cross_for_test(&mut self, node_id: NodeId, backend: Backend, id: usize) {
+        self.cross
+            .insert((node_id, backend), BufRef { backend, id });
     }
 }
 
@@ -931,6 +930,29 @@ mod tests {
             .expect("token ids are not positions");
         let err = alloc.fill_input_i32(&g, "positions", &[8]).unwrap_err();
         assert!(err.contains(">= n_ctx 8"), "got: {err}");
+    }
+
+    /// A staging buffer is keyed by (node, destination backend): one node
+    /// feeding two foreign backends gets one buffer each, and a consumer is
+    /// never offered the other backend's copy. The old single-entry map forced
+    /// the scheduler to filter by backend on every read (and could not serve
+    /// two foreign consumers at all).
+    #[test]
+    fn staging_is_keyed_by_destination_backend() {
+        let mut alloc = GraphAllocator::new();
+        alloc.stage_cross_for_test(7, Backend::CPU, 3);
+        assert_eq!(alloc.cross_buffer(7, Backend::CPU).map(|b| b.id), Some(3));
+        assert!(
+            alloc.cross_buffer(7, Backend::Cuda).is_none(),
+            "a CPU staging buffer must not be offered to a CUDA consumer"
+        );
+        alloc.stage_cross_for_test(7, Backend::Cuda, 4);
+        assert_eq!(alloc.cross_buffer(7, Backend::Cuda).map(|b| b.id), Some(4));
+        assert_eq!(
+            alloc.cross_buffer(7, Backend::CPU).map(|b| b.id),
+            Some(3),
+            "staging for a second backend must not clobber the first"
+        );
     }
 
     #[test]
