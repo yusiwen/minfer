@@ -1526,7 +1526,9 @@ mod tests {
         // broke re-execution of reused graphs — the producing split found its
         // buffer remapped to another backend on the next execute)
         alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
-        let cross = alloc.cross_buffer(x).expect("cross staging buffer");
+        let cross = alloc
+            .cross_buffer(x, crate::graph::Backend::Cuda)
+            .expect("cross staging buffer");
         assert_eq!(cross.backend, crate::graph::Backend::Cuda);
         assert_eq!(
             alloc.node_buffer(x).unwrap(),
@@ -1536,13 +1538,23 @@ mod tests {
         assert_eq!(alloc.copy_to_cpu(x).unwrap(), data.to_vec());
         // re-copy (same dst) reuses the same staging buffer id
         alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
-        assert_eq!(alloc.cross_buffer(x).unwrap().id, cross.id);
-        // same-backend copy is a no-op
+        assert_eq!(
+            alloc
+                .cross_buffer(x, crate::graph::Backend::Cuda)
+                .unwrap()
+                .id,
+            cross.id
+        );
+        // a same-backend copy is a no-op and does not create staging for CPU
         alloc.copy_across(x, crate::graph::Backend::CPU).unwrap();
-        assert!(alloc.cross_buffer(x).unwrap().backend == crate::graph::Backend::Cuda);
+        assert!(
+            alloc.cross_buffer(x, crate::graph::Backend::CPU).is_none(),
+            "the copy was already on the destination backend"
+        );
+        assert!(alloc.cross_buffer(x, crate::graph::Backend::Cuda).is_some());
         // rebuild clears staging (buffers freed, map empty)
         alloc.alloc_graph(&g).unwrap();
-        assert!(alloc.cross_buffer(x).is_none());
+        assert!(alloc.cross_buffer(x, crate::graph::Backend::Cuda).is_none());
     }
 
     #[test]
