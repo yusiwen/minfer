@@ -39,6 +39,13 @@ jobs:
     container: nvidia/cuda:12.8.0-devel-ubuntu22.04
     steps:
       - uses: actions/checkout@v4
+      # The CUDA devel images are minimal: no curl, so `dtolnay/rust-toolchain`
+      # cannot bootstrap rustup (it failed with "curl: command not found").
+      # build-essential also gives nvcc its host compiler and the linker.
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Build (release, cuda)
         run: cargo build --release --features cuda
