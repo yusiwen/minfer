@@ -33,11 +33,14 @@ The remaining work is at the **system layer**, and three items dominate it:
    (Key/Value) allocator and the server are all single-sequence. `n_seqs`
    exists in the graph-reuse identity but is hard-wired to 1 everywhere.
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
-   store: no sequence ids, no prefix reuse, no eviction/context shift, no
-   defragmentation, no state save/restore, no quantized KV.
-3. **The server has no persistent context.** Every request builds a fresh
+   store: no sequence ids, no eviction/context shift, no defragmentation, no
+   state save/restore, no quantized KV. (Phase C's C1/C2 have since landed the
+   cell store and physical removal/shift; see §2.4.)
+3. ~~**The server has no persistent context.** Every request builds a fresh
    `GraphCache` (KV regions + device pool re-allocated, CUDA Graph capture
-   re-warmed) and re-prefills the whole prompt.
+   re-warmed) and re-prefills the whole prompt.~~ **Fixed in B2/B3** for the
+   prefix-matched case: a slot keeps its cache and reuses the rows its prompt
+   already covers (measured ≈11× TTFT on a second turn).
 
 Everything else — IR expressiveness (views, multi-output), memory placement
 policy (VRAM budget, layer offload), backend pluggability, grammar-constrained
@@ -271,15 +274,15 @@ it stops at the single-sequence append-only case. What is missing:
 
 | Capability | Status |
 |---|---|
-| Sequence ids / per-sequence views of one cache | ✗ — one implicit sequence per `GraphCache` |
-| Partial removal / keep / copy between sequences | ✗ |
-| Defragmentation | ✗ |
-| Sliding-window eviction | ✗ |
+| Sequence ids / per-sequence views of one cache | ◐ **C1**: per-cell `owner` (`SeqId`) with one implicit sequence; several views of one cache is E1/E2 |
+| Partial removal / keep / copy between sequences | ◐ **C2**: physical removal of a row range; copying rows *between* sequences is C3 |
+| Defragmentation | ✗ — C3, needs D1 |
+| Sliding-window eviction | ◐ **C2**: physical shift + re-rope (exact mechanism; the retained rows keep the context they were written in, see below) |
 | Recurrent / hybrid memory (state-space models) | ✗ |
-| Context shift (keep KV, shift positions) | ✗ — `conversation.rs` drops the oldest turns and fully re-renders (`:597-732`) |
-| State save/restore (session persistence) | ✗ |
-| Prefix reuse across requests | ✗ — the server drops the cache every request (`chat.rs:491`) |
-| Quantized KV | ✗ (f16 at best) |
+| Context shift (keep KV, shift positions) | ✔ **C2**: `kv_rm`/`kv_shift` plus the conversation's overflow shift — 185 → 14 prefilled tokens per overflowing turn on the 0.5B probe; `MINFER_NO_CONTEXT_SHIFT=1` restores the exact re-render |
+| State save/restore (session persistence) | ✗ — C5 |
+| Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
+| Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
 | Multi-sequence attention masks | ✗ — the causal bound is derived per token from `positions` |
 
@@ -305,6 +308,21 @@ Two concrete defects live here as well:
   caller violating the documented contract produces an out-of-bounds device
   write instead of an error. `docs/GPU_SAFETY.md`'s rule — "guard failures abort
   with actual values" — is enforced on CPU and not on GPU here.
+
+**What C1/C2 landed (2026-09-16).** `src/graph/kvcache.rs` now owns a
+per-layer arena with an owner per cell, and `GraphAllocator::kv_rm(start, len,
+&rope)` removes a row range and re-bases the rows after it — a *physical*
+operation, so `cell == pos` survives and no backend needed a new kernel. The
+conversation's overflow path uses it instead of dropping turns and re-prefilling
+them. Its one approximation is inherent and recorded in
+`ARCHITECTURE-EXECUTION-PLAN.md` §5 (C2 record): the retained rows hold the
+values they were written with, so rows that attended to the dropped turns keep
+that influence — no shift that avoids re-prefilling can avoid it (llama.cpp's
+context shift behaves the same way). What is exact is the mechanism, and that is
+what the tests pin bitwise: a tail removal leaves the retained head
+byte-identical (so continuing from it matches a fresh prefill *exactly*), a
+middle removal copies V verbatim and re-ropes only K, and the whole operation
+keeps the identity cell mapping C1's scheduler gate requires.
 
 **Recommendation.** Redesign the KV layer as a sequence-addressable cell store
 *before* adding batched attention, because batching without per-sequence KV

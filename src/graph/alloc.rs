@@ -463,6 +463,113 @@ impl GraphAllocator {
         self.kv.clear_identity();
     }
 
+    /// Context removal (Phase C / C2): remove rows `[start, start + len)` from
+    /// every layer's KV arena and re-rope the rows after them by `-len`, so a
+    /// token that was at position `p >= start + len` becomes addressable at
+    /// `p - len`. Rows `[0, start)` keep both their cells and their positions —
+    /// that is what lets a sliding window keep a prefix (a system prompt) while
+    /// dropping a middle range, which is the conversation's overflow case
+    /// (`docs/ARCHITECTURE-EXECUTION-PLAN.md` C2). [`Self::kv_shift`] is the
+    /// `start == 0` special case.
+    ///
+    /// Host-side by design. A *physical* removal leaves `cell == pos` for every
+    /// surviving row, so the mapping stays the identity and no backend needs a
+    /// new kernel — the only backend involvement is the existing
+    /// `copy_kv_to_cpu` / `write_host` pair. That is why this is the one Phase C
+    /// operation that can land without touching CUDA or Metal. Cost is O(n_ctx)
+    /// per layer, once per overflow, against a re-prefill of the whole window.
+    ///
+    /// Two things C2 does **not** make exact, both recorded in the plan:
+    /// the re-rope is not bitwise with a fresh prefill (two composed rotations
+    /// vs one), and the surviving rows keep the values they were computed with —
+    /// so rows that attended to the removed ones are a documented approximation
+    /// of a fresh prefill, not an equivalent of it.
+    pub fn kv_rm(
+        &mut self,
+        start: usize,
+        len: usize,
+        rope: &super::kvcache::KvRope,
+    ) -> Result<usize, String> {
+        let layers: Vec<usize> = self.kv.iter().map(|(l, _)| l).collect();
+        if layers.is_empty() {
+            return Err("kv_rm: no KV arena allocated".into());
+        }
+        // Validate every layer first: a rejected removal must not leave the
+        // arenas half-shifted.
+        for &layer in &layers {
+            let l = self
+                .kv
+                .get(layer)
+                .ok_or_else(|| format!("kv_rm: no arena for layer {layer}"))?;
+            if start + len > l.n_used {
+                return Err(format!(
+                    "kv_rm: cannot remove {len} rows at {start} of {} written rows (layer {layer})",
+                    l.n_used
+                ));
+            }
+        }
+        let mut new_used = 0usize;
+        for layer in layers {
+            let (n_used, row, kref, vref) = {
+                let l = self
+                    .kv
+                    .get(layer)
+                    .ok_or_else(|| format!("kv_rm: no arena for layer {layer}"))?;
+                (l.n_used, l.elems / l.n_ctx.max(1), l.k, l.v)
+            };
+            let (mut k, mut v) = self
+                .copy_kv_to_cpu(layer)
+                .ok_or_else(|| format!("kv_rm: layer {layer} host read failed"))?;
+            new_used = n_used - len;
+            // Slide the survivors down, re-rope their K (rows [0, start) do not
+            // move and are not touched), and clear the tail: the arena must
+            // never hold rows that no position can address.
+            k.copy_within((start + len) * row..n_used * row, start * row);
+            v.copy_within((start + len) * row..n_used * row, start * row);
+            super::kvcache::rope_shift_kv(
+                &mut k[start * row..],
+                new_used - start,
+                len as isize,
+                rope,
+            );
+            for x in &mut k[new_used * row..] {
+                *x = 0.0;
+            }
+            for x in &mut v[new_used * row..] {
+                *x = 0.0;
+            }
+            self.write_pool(kref.backend, kref.id, &k)?;
+            self.write_pool(vref.backend, vref.id, &v)?;
+        }
+        let n = self.kv.after_rm(start, len)?;
+        debug_assert_eq!(n, new_used);
+        Ok(n)
+    }
+
+    /// Sliding-window special case of [`Self::kv_rm`]: drop the oldest `drop`
+    /// rows of every layer's KV arena and re-rope the survivors by `-drop`, so
+    /// the same tokens become addressable at `pos - drop`. Returns the new
+    /// written-row count.
+    pub fn kv_shift(
+        &mut self,
+        drop: usize,
+        rope: &super::kvcache::KvRope,
+    ) -> Result<usize, String> {
+        self.kv_rm(0, drop, rope)
+    }
+
+    /// Written rows in a layer's arena (`n_used`), or `None` before allocation.
+    pub fn kv_n_used(&self, layer: usize) -> Option<usize> {
+        self.kv.get(layer).map(|l| l.n_used)
+    }
+
+    /// Record that the arena now holds rows `0..n_used` (Phase C / C2). The
+    /// model calls this after a forward with `max(positions) + 1`, which is the
+    /// only place that knows how far the KV store wrote.
+    pub fn kv_note_used(&mut self, n_used: usize) {
+        self.kv.own_prefix(super::kvcache::SEQ_MAIN, n_used);
+    }
+
     /// Mark buffers whose liveness ended before exec index `i` as reusable.
     fn sweep(&mut self, i: usize) {
         let expired: Vec<(Backend, usize)> = self

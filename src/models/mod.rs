@@ -82,6 +82,11 @@ pub trait ModelDef: Send + Sync {
     fn n_kv_embd(&self) -> usize;
     fn n_vocab(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
+
+    /// RoPE base and frequency scale (`(freq_base, freq_scale)`). The context
+    /// shift re-ropes stored K rows after a position change, which needs both
+    /// (Phase C / C2).
+    fn rope_params(&self) -> (f32, f32);
 }
 
 /// Token IDs used by the sampler to stop generation.

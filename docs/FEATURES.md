@@ -54,7 +54,7 @@ Auto-download from the Hugging Face Hub or the Ollama registry, with resume and 
 
 ### Multi-turn conversation CLI (`--cnv`)
 
-Append-only KV + incremental chat-template rendering: each turn only prefills the new message delta while the whole conversation accumulates in the KV cache. In-session commands (`/clear`, `/regen`, …), automatic overflow truncation, `--session` persistence. Plan: [CLI-CONVERSATION-PLAN.md](./CLI-CONVERSATION-PLAN.md).
+Append-only KV + incremental chat-template rendering: each turn only prefills the new message delta while the whole conversation accumulates in the KV cache. In-session commands (`/clear`, `/regen`, …), automatic overflow handling, `--session` persistence. On overflow the dropped turn's KV rows are removed in place and the tail is re-based/re-roped (Phase C / C2), so the turn prefills its own delta instead of the retained history (measured 185 → 14 tokens per overflowing turn on the 0.5B probe); `MINFER_NO_CONTEXT_SHIFT=1` restores the exact drop-and-re-render path. Plan: [CLI-CONVERSATION-PLAN.md](./CLI-CONVERSATION-PLAN.md).
 
 ### OpenAI-compatible HTTP server (`serve`)
 

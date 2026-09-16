@@ -31,6 +31,13 @@
 > （`tests/conversation_cli.rs`，stdin 管道脚本化会话；标量 CPU 上 ~10 分钟）。决策点 3 落地：
 > **MVP 不做 Ctrl+C 打断**（EOF 退出；Ctrl+C 走默认终止），信号语义留待后续。
 >
+> **Revision 5 (2026-09-16) — 溢出路径升级为 KV 上下文平移（C2）。** §5.7 的"未来项"已落地：
+> `Conversation::user_turn` 溢出时先用 `Engine::kv_rm` 物理删除被丢弃回合的 KV 行段（保留
+> system 段不动），再只 prefill 本回合 delta；token 边界由 chat template 反推并**逐段对 KV
+> 流校验**，不可验证即回退到截断+重灌（精确）。顺带修掉两个既有缺陷：首回合漏 prefill
+> `--system`（system prompt 从未进入 KV）、上下文已满时待写 EOT 触发越界 panic。详见
+> `ARCHITECTURE-EXECUTION-PLAN.md` §5 C2 记录。
+>
 > **Revision 4 (2026-08-22) — Phase 3 implemented.** 溢出截断 + 重灌（§5.7）与 `--session`
 > 持久化（§5.8）落地：
 > - `user_turn` 溢出路径：丢弃最旧非 system 回合（`drop_oldest_turns_until_fits`，user+
@@ -380,10 +387,14 @@ UX（对齐 llama.cpp）：
 
 成本：一次 O(剩余历史) prefill（0.5B @ n_ctx=4096 秒级），MVP 可接受。
 
-**未来：KV 上下文平移（llama.cpp `seq_rm`/`seq_add`）**
-minfer 中位置是数据、KV 区域是每层连续 f32 数组 → 平移 = 每层区域 memmove + `current_pos`
-调整，**无图结构改动**。但需要给 allocator 加"区域平移"原语（Phase 4 可选），并注意
-与 `CParams.n_ctx` 边界检查的配合。
+**已落地（2026-09-16，Phase C / C2）：KV 上下文平移（llama.cpp `seq_rm`/`seq_add`）**
+minfer 中位置是数据、KV 区域是每层连续 f32 数组 → 平移 = 每层区域 memmove + 重做 RoPE +
+`current_pos` 调整，**无图结构改动**（`GraphAllocator::kv_rm(start, len, &rope)`；`start > 0`
+即"保留 system + 丢掉中间一段"，正是本节的场景）。溢出回合不再重灌保留历史，只 prefill
+自己的 delta：0.5B Q4_0 / `n_ctx=192` 实测 185 → 14 tokens（≈13×）。
+保留行的数值仍是写入时的（它们见过被丢掉的那段上下文），这是固有的近似，记为命名容差类，
+见 `ARCHITECTURE-EXECUTION-PLAN.md` §5 的 C2 记录；`MINFER_NO_CONTEXT_SHIFT=1` 回到"截断 +
+全量重灌"的精确路径（边界无法验证时也自动回退到该路径并打印原因）。
 
 **兜底**：截断后仍放不下（单条消息超长）→ 报错退出。
 
@@ -427,7 +438,7 @@ minfer 中位置是数据、KV 区域是每层连续 f32 数组 → 平移 = 每
 | EOG → 记 assistant 历史 → `\n> ` 读输入 | 同（§5.5） | — |
 | `need_insert_eot`（仅 Ctrl+C） | **统一**：任何未达 EOG 的结束都置位（§5.5-b） | 比 llama.cpp 更严格，保持 §5.4 不变量；代价是一次 EOT decode |
 | `common_sampler_reset` + prompt 消费喂采样器 | `prev_tokens = recent_window(stream_tokens, 64)` 每回合重灌 | 等价效果，更简单 |
-| KV context shift（`seq_rm/add`） | MVP：截断 + 重灌；未来：区域 memmove（§5.7） | 实现差异见 §5.7 |
+| KV context shift（`seq_rm/add`） | 区域 memmove + 重做 RoPE（§5.7，C2） | 机制精确（保留段逐字节不变）、结果近似（保留行保留原上下文），见 §5.7 注 |
 | `--prompt-cache`（token + KV state） | Phase 3：仅 messages JSON + 重灌（§5.8） | KV 序列化后续项 |
 | 现行 CLI 的 `/exit /regen /clear` | 同 + `/help`（§5.6） | `/regen` 走 KV 回退指针，见 §5.6 注 |
 | `-cnv` 自动开启 | `--cnv` 显式开启（§5.9） | 向后兼容 |

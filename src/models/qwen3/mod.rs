@@ -116,6 +116,9 @@ impl ModelDef for Qwen3Model {
     fn rope_style(&self) -> crate::vec_ops::RopeStyle {
         self.hparams.rope_style
     }
+    fn rope_params(&self) -> (f32, f32) {
+        (self.hparams.rope_freq_base, self.hparams.rope_freq_scale)
+    }
 }
 
 /// Simple ChatML formatting (fallback; template.rs renders the model's own

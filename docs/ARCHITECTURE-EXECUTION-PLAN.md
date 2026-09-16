@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16). | Phase C is the next tranche; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16); **Phase C's C1 and C2 are complete** (2026-09-16). | C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -366,7 +366,7 @@ Five sub-steps, each keeping the tree green. C3 depends on Phase D.
 | ID | Title | Effort |
 |---|---|---|
 | C1 | `KvCache` with cells, single implicit sequence (behaviour-preserving) | L |
-| C2 | `seq_rm` / `seq_add`: prefix truncation + context shift | L |
+| C2 | `seq_rm` / `seq_add`: prefix truncation + context shift — **DONE** | L |
 | C3 | Defragmentation (cell copy) — **needs D1** | M |
 | C4 | Quantized KV (item 21) | M |
 | C5 | State save/restore for session persistence | M |
@@ -399,15 +399,20 @@ Five sub-steps, each keeping the tree green. C3 depends on Phase D.
   it is only needed once the mapping stops being the identity, and the
   scheduler gate refuses to execute in that state, so no backend can silently
   index the wrong row in the meantime. Handing the array across the `Backend`
-  trait is C2's first step.
+  trait was planned as C2's first step; C2 landed without it because it removes
+  rows *physically* and therefore never leaves the identity mapping (see the C2
+  record below) — so the hand-off stays available, not urgent.
 - **Acceptance (as specified):** bitwise-identical greedy output vs the
   pre-change binary on the full smoke set (0.6B Q8_0, 7B Q4_K_M, 14B Q4_K_M) at
   several context lengths; the graph topology is unchanged (no new
   topology-affecting params).
 - **Acceptance met for:** 0.5B Q4_0 byte-identical end to end, plus the in-tree
-  bitwise model tests. **Not run:** the 0.6B/7B/14B smoke rows — those are
-  minutes-long CPU jobs and C1 does not touch a kernel, so they are deferred to
-  the C2 landing rather than claimed here.
+  bitwise model tests. **Deferred at the time:** the 0.6B/7B/14B smoke rows —
+  minutes-long CPU jobs and C1 does not touch a kernel, so they were left to the
+  C2 landing rather than claimed here. **Discharged at C2** (2026-09-16): the
+  pre-C2 (C1) binary and the C2 binary generate **byte-identical text** greedily
+  (`-n 16`, `-t 8`, single-shot) on Qwen3-0.6B Q8_0, Qwen2.5-7B Q4_K_M and
+  Qwen2.5-14B Q4_K_M; only the timing lines differ.
 - **Defers to G:** nothing — the Metal backend keeps the old regions until G.
 
 **C1 design (written before the code, 2026-09-16).** The shape below is what C2
@@ -442,15 +447,112 @@ Backend trait gains the resolved cell slice alongside `kv_pair`, and each
 backend uses it for row indexing while still using `positions` for the causal
 bound and RoPE.
 
-### C2 — Removal and shift
+### C2 — Removal and shift — **DONE**
 - **Deliverable:** `seq_rm` (drop a range) and `seq_add` (shift positions),
-  surfaced as graph-level operations; `conversation.rs:597-732` overflow switches
+  surfaced as graph-level operations; `conversation.rs` overflow switches
   from "drop the oldest turns + full re-render" to a context shift.
 - **Acceptance:** the conversation overflow test passes; a turn that overflows
   no longer re-prefills the whole conversation; the shift path is a **named
   tolerance class** with the reason recorded (positions change ⇒ RoPE inputs
   change ⇒ not bitwise).
 - **Defers to G:** n/a.
+
+#### C2 record (2026-09-16)
+
+**What landed.** `GraphAllocator::kv_rm(start, len, &KvRope)` removes KV rows
+`[start, start + len)` from every layer and re-bases the rows after them by
+`-len`, re-roping their K; `kv_shift(drop, rope)` is the `start == 0` case
+(`KvCache::after_rm` / `after_shift` do the bookkeeping). `rope_shift_kv` now
+takes a **signed** delta so a rotation can be undone (the tests use that).
+
+The removal is **physical**, which is the whole point: `cell == pos` survives, so
+`is_identity()` stays true, C1's scheduler gate stays satisfied, and no backend
+gains a kernel. The work is a host-side memmove plus one re-rope pass per layer,
+both through the existing `copy_kv_to_cpu` / `write_host` pair — which is also
+why CUDA/Metal need no change here (`copy_kv_to_cpu` has no Metal arm, so a
+Metal session falls back loudly rather than shifting wrongly; the port is G5).
+
+`Engine::kv_rm(start, len)` is the conversation-facing hook (`Err` by default,
+so a mock or a non-shiftable backend is handled explicitly). `Conversation`
+plans the drop on a copy of the message list, resolves the dropped turn's token
+span from the chat template, and **verifies both boundaries against the KV
+stream** before touching anything; an unverifiable boundary or an engine that
+refuses falls back to the exact drop-and-re-render path, with the reason logged.
+`MINFER_NO_CONTEXT_SHIFT=1` forces that path.
+
+**The retained rows keep the context they were computed with.** This is the
+ticket's named tolerance class, and its cause is not rounding. Re-roping is
+exact to the rope tolerance (measured `max|Δ| = 2.38e-7`, relative `1.14e-7`, by
+`rope_shift_matches_roping_at_the_new_position`), but a shifted row's *value* is
+whatever it was when it was written — it attended to the tokens that were later
+dropped. Measured on Qwen2.5-0.5B Q4_0 with the `a`/`b`/`c` probe (drop `a`,
+keep `b`, continue with `c`):
+
+| Layer | 0 | 1 | 5 | 12 | 23 |
+|---|---|---|---|---|---|
+| retained-K `max|Δ|` vs a fresh `b` prefill | 1.5e-5 | 2.55 | 7.80 | 8.26 | 3.81 |
+
+Last-token logits after continuing with `c`: `max|Δ| = 16.75` vs a fresh `b+c`
+prefill, and the argmax changes. **This is inherent**: recomputing the retained
+rows is exactly the re-prefill the shift exists to avoid. llama.cpp's context
+shift (`llama_kv_cache_seq_rm` + `seq_add` + `llama_kv_cache_update`) has the
+same property. What C2 guarantees instead is exactness of the *mechanism*, and
+that is what the tests assert bitwise:
+
+- removing a **tail** range leaves the retained head byte-identical, so
+  continuing from it is **bitwise** equal to a fresh prefill of that head
+  (`kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class`);
+- removing a **middle** range copies V byte-for-byte, leaves `[0, start)`
+  untouched, and moves K by exactly the re-rope (undone to `< 1e-4` per layer);
+- removing everything written empties the arena, `len == 0` is a no-op, and
+  removing past the end is an `Err`, not a silent truncation.
+
+**Model-path A/B (discharging C1's deferral).** The pre-C2 binary (HEAD at C1)
+and this build produce **byte-identical generated text** greedily (`-n 16`,
+`-t 8`, single-shot, CPU) on Qwen3-0.6B Q8_0, Qwen2.5-7B Q4_K_M and
+Qwen2.5-14B Q4_K_M — only the timing lines differ — which is the evidence that
+adding the removal path did not perturb the model path.
+
+**Conversation measurement.** `context_shift_real_model_measurement` (0.5B
+Q4_0, `n_ctx = 192`, 12 turns with a system prompt) overflows on turns 8–11 and
+shifts on every one:
+
+```
+turn 8:  dropped 22 KV rows at 17 (2 messages), prefill 14 tokens instead of 185
+turn 9:  dropped 23 KV rows at 17 (2 messages), prefill 14 tokens instead of 180
+turn 10: dropped 23 KV rows at 17 (2 messages), prefill 14 tokens instead of 175
+turn 11: dropped 23 KV rows at 17 (2 messages), prefill 14 tokens instead of 170
+```
+
+— a **~13× cut in prefill tokens** per overflowing turn, `start = 17` (the
+system prompt is retained and not even re-roped), no full re-render, and the
+answers stay correct on the shifted window (`Stockholm,`/`Athens,`/`Warsaw,`/
+`Lisbon,` for Sweden/Greece/Poland/Portugal). `prefill_tokens` is the observable
+that makes "no longer re-prefills the whole conversation" checkable, so the
+ticket's acceptance is a test, not a claim.
+
+**Two pre-existing bugs the C2 tests found and fixed** (both outside the ticket
+but blocking it, and both user-visible in `--cnv`):
+
+1. The **first `user_turn` never prefilled pre-existing messages** — it wrote
+   only the new message's delta, so the `--system` prompt never reached the KV
+   while still being rendered into every later delta. The first turn now
+   prefills the whole canonical render (`first_user_turn_prefills_the_system_prompt`).
+2. A **pending EOT was written before the overflow check**, so a full context
+   with a reply that had not reached EOG called `forward` at `position == n_ctx`
+   and tripped the KV-region guard. The EOT is now deferred into the overflow
+   path (it belongs at the end of the stream, so it commutes with the removal),
+   and `ContextFull` keeps it pending for the next attempt.
+
+**Not done here.** The *logical* mapping (a hole or a window with `cell != pos`,
+which is what would let a backend keep the old rows in place) is deliberately
+still refused by C1's scheduler gate — nothing consumes the resolved cell array
+yet, and the physical removal makes it unnecessary for the sliding-window case.
+C3's defragmentation, C4's quantized KV and C5's state save/restore are
+untouched. The **server** path is untouched too: a full slot is still reported
+as `finish_reason: "length"` and relies on B2's prefix-matched reuse, so a
+server-side shift policy (and the `n_keep`-style rule that protects a system
+prompt) belongs with E2's batching work.
 
 ### C3 — Defragmentation
 - **Deliverable:** a cell-copy operation that compacts the arena; triggered when
@@ -569,7 +671,7 @@ forgotten:
 | G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` |
 | G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) |
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` |
-| G5 | C1/C2/E1 | Port the cell store and the explicit attention mask to Metal |
+| G5 | C1/C2/E1 | Port the cell store, the KV removal and the explicit attention mask to Metal (`copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting) |
 | G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool |
 | G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3, since both change a kernel path |
 
@@ -583,7 +685,7 @@ all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ─ C2 ────────────────► C3 ─ C4 ─ C5        (C3 needs D1)
+Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ─ E2 ─ E3 ─ E4 ─ E5
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
