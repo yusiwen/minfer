@@ -34,10 +34,18 @@ pub struct GraphAllocator {
     cross: HashMap<NodeId, BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
-    /// per-layer KV persistent regions: [k, v]
-    kv: HashMap<usize, [BufRef; 2]>,
+    /// per-layer KV persistent regions (K, V) + the element count they were
+    /// allocated for; `ensure_kv` refuses a size or backend change.
+    kv: HashMap<usize, KvRegion>,
     /// All persistent regions (never freed).
     pub persistent: Vec<PersistentBuf>,
+}
+
+/// A layer's persistent KV pair plus the element count it was allocated for
+/// (see `ensure_kv`).
+struct KvRegion {
+    pair: [BufRef; 2],
+    elems: usize,
 }
 
 impl Default for GraphAllocator {
@@ -224,7 +232,7 @@ impl GraphAllocator {
             let backend = node.backend.unwrap_or(Backend::CPU);
             match node.op {
                 Op::KvcacheStore { layer } | Op::KvcacheLoad { layer } => {
-                    let pair = self.ensure_kv(layer, backend, node.n_elements());
+                    let pair = self.ensure_kv(layer, backend, node.n_elements())?;
                     // the node's buffer = the K region
                     self.node_to_buf.insert(id, pair[0]);
                 }
@@ -236,7 +244,7 @@ impl GraphAllocator {
                         NodeMeta::FusedQkv(m) => m.kv_elems,
                         _ => node.n_elements(),
                     };
-                    self.ensure_kv(layer, backend, kv_elems);
+                    self.ensure_kv(layer, backend, kv_elems)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -252,7 +260,7 @@ impl GraphAllocator {
                         NodeMeta::FusedQkvNorm(m) => m.kv_elems,
                         _ => node.n_elements(),
                     };
-                    self.ensure_kv(layer, backend, kv_elems);
+                    self.ensure_kv(layer, backend, kv_elems)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -268,7 +276,7 @@ impl GraphAllocator {
                             NodeMeta::QkvBiasRopeStore(m) => m.kv_elems,
                             _ => node.n_elements(),
                         };
-                        self.ensure_kv(*layer, backend, kv_elems);
+                        self.ensure_kv(*layer, backend, kv_elems)?;
                     }
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend
@@ -381,14 +389,45 @@ impl GraphAllocator {
 
     /// Per-layer KV persistent regions (K and V), created on first use on the
     /// layer's assigned backend.
-    fn ensure_kv(&mut self, layer: usize, backend: Backend, size: usize) -> [BufRef; 2] {
-        if let Some(&pair) = self.kv.get(&layer) {
-            return pair;
+    ///
+    /// Returns `Err` when the layer already owns a region whose element count
+    /// or backend differs from the request. The regions outlive graph rebuilds
+    /// (they ARE the KV cache), so a session that changes `n_ctx` — or moves a
+    /// layer to another backend — must fail loudly here rather than silently
+    /// reuse an under-sized or wrong-backend region and corrupt memory
+    /// (`docs/ARCHITECTURE-ROADMAP.md` §2.4).
+    fn ensure_kv(
+        &mut self,
+        layer: usize,
+        backend: Backend,
+        size: usize,
+    ) -> Result<[BufRef; 2], String> {
+        if let Some(region) = self.kv.get(&layer) {
+            if region.elems != size {
+                return Err(format!(
+                    "KV region for layer {layer} was allocated with {} elements but {size} are \
+                     requested (n_ctx changed on a live GraphCache; the regions are persistent)",
+                    region.elems
+                ));
+            }
+            if region.pair[0].backend != backend {
+                return Err(format!(
+                    "KV region for layer {layer} lives on {:?} but this graph assigns it to {:?}",
+                    region.pair[0].backend, backend
+                ));
+            }
+            return Ok(region.pair);
         }
         let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, size);
         let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, size);
-        self.kv.insert(layer, [k, v]);
-        [k, v]
+        self.kv.insert(
+            layer,
+            KvRegion {
+                pair: [k, v],
+                elems: size,
+            },
+        );
+        Ok([k, v])
     }
 
     /// Allocate a persistent (never-freed) region on a backend.
@@ -441,8 +480,65 @@ impl GraphAllocator {
         name: &str,
         data: &[u32],
     ) -> Result<(), String> {
+        // Positions are the one I32 input that indexes a persistent region: the
+        // KV store writes row `positions[t]` of an `[n_kv_embd, n_ctx]` region,
+        // so a position >= n_ctx is an out-of-bounds write. The CPU backend
+        // re-checks this per store node; the GPU backends write unconditionally.
+        // Validating here — the single point where positions become graph data —
+        // covers every backend without a per-backend guard, Metal included, and
+        // costs one O(nt) scan over data that is already on the host.
+        self.check_positions_bound(graph, name, data)?;
         let bits: Vec<f32> = data.iter().map(|&v| f32::from_bits(v)).collect();
         self.fill_input_impl(graph, name, &bits)
+    }
+
+    /// Reject values in an I32 input that would index past the KV region (see
+    /// `fill_input_i32`). Only inputs actually consumed by a KV-writing or
+    /// attention node are bounded — `token_ids` is I32 too, and vocabularies are
+    /// routinely larger than `n_ctx`.
+    fn check_positions_bound(
+        &self,
+        graph: &ComputeGraph,
+        name: &str,
+        data: &[u32],
+    ) -> Result<(), String> {
+        let Some(id) = graph
+            .inputs
+            .iter()
+            .copied()
+            .find(|&i| graph.node(i).name == name)
+        else {
+            return Ok(()); // unknown name: fill_input_impl reports it
+        };
+        let indexes_kv = graph.nodes.iter().any(|n| {
+            n.src.contains(&id)
+                && matches!(
+                    n.op,
+                    Op::KvcacheStore { .. }
+                        | Op::FusedQKV { .. }
+                        | Op::FusedQkvNorm { .. }
+                        | Op::QkvBiasRopeStore { .. }
+                        | Op::Attn { .. }
+                )
+        });
+        if !indexes_kv {
+            return Ok(());
+        }
+        // Every KV region in one graph is sized by the same `CParams.n_ctx`, so
+        // any kv_load node carries the bound.
+        let Some(n_ctx) = graph.nodes.iter().find_map(|n| match n.op {
+            Op::KvcacheLoad { .. } => Some(n.out_shape[1]),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        if let Some(&p) = data.iter().find(|&&p| p as usize >= n_ctx) {
+            return Err(format!(
+                "input '{name}': position {p} >= n_ctx {n_ctx} — the KV store would write past \
+                 the persistent region (`docs/ARCHITECTURE-ROADMAP.md` §2.4)"
+            ));
+        }
+        Ok(())
     }
 
     fn fill_input_impl(
@@ -525,7 +621,7 @@ impl GraphAllocator {
                 _ => None,
             }
         };
-        let pair = *self.kv.get(&layer)?;
+        let pair = self.kv.get(&layer)?.pair;
         Some((rd(self, pair[0])?, rd(self, pair[1])?))
     }
 
@@ -662,7 +758,7 @@ impl GraphAllocator {
 
 impl KvProvider for GraphAllocator {
     fn kv_pair(&self, layer: usize) -> Option<(usize, usize)> {
-        self.kv.get(&layer).map(|pair| (pair[0].id, pair[1].id))
+        self.kv.get(&layer).map(|r| (r.pair[0].id, r.pair[1].id))
     }
 }
 
@@ -764,6 +860,77 @@ mod tests {
         assert_eq!(alloc.persistent[1].name, "kv.0.v");
         // mapped buffers: positions/k/v (3 liveness) + K region (shared) = 4
         assert_eq!(alloc.n_mapped_buffers(), 4);
+    }
+
+    /// The KV regions are persistent across rebuilds (they ARE the cache), so a
+    /// graph that asks for a different `n_ctx` on the same allocator must be a
+    /// loud error, not a silent reuse of the older, smaller region.
+    #[test]
+    fn kv_region_size_change_is_a_loud_error() {
+        fn kv_graph(n_ctx: usize) -> ComputeGraph {
+            let mut b = GraphBuilder::new();
+            let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+            let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
+            let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
+            let _store = b.kvcache_store(0, k, v, pos, n_ctx);
+            let load = b.kvcache_load(0, 16, n_ctx, 2);
+            b.output(load);
+            b.build()
+        }
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&kv_graph(1024)).unwrap();
+        // Unchanged shape: reuse is fine (this is the decode-reuse path).
+        alloc.alloc_graph(&kv_graph(1024)).unwrap();
+        // Changed n_ctx on a live cache: must fail loudly.
+        let err = alloc.alloc_graph(&kv_graph(2048)).unwrap_err();
+        assert!(err.contains("KV region for layer 0"), "got: {err}");
+    }
+
+    /// Positions index the persistent KV region, so a value past `n_ctx` is an
+    /// out-of-bounds write on every backend that does not re-check it (the GPU
+    /// ones). The guard lives in the allocator so all three backends share it.
+    #[test]
+    fn position_beyond_n_ctx_is_rejected() {
+        let mut b = GraphBuilder::new();
+        let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+        let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
+        let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
+        let _store = b.kvcache_store(0, k, v, pos, 1024);
+        let load = b.kvcache_load(0, 16, 1024, 2);
+        b.output(load);
+        let g = b.build();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+
+        // The last legal row is n_ctx - 1.
+        alloc.fill_input_i32(&g, "positions", &[1023]).unwrap();
+        let err = alloc.fill_input_i32(&g, "positions", &[1024]).unwrap_err();
+        assert!(err.contains(">= n_ctx 1024"), "got: {err}");
+    }
+
+    /// The same guard must NOT bound `token_ids`: a vocabulary is routinely
+    /// larger than `n_ctx`.
+    #[test]
+    fn token_ids_are_not_bounded_by_n_ctx() {
+        let mut b = GraphBuilder::new();
+        let ids = b.input("token_ids", [1, 1, 1, 1], crate::graph::DType::I32);
+        let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+        let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
+        let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
+        let emb = b.get_rows(k, ids, [16, 1, 1, 1]);
+        let _store = b.kvcache_store(0, emb, v, pos, 8);
+        let load = b.kvcache_load(0, 16, 8, 2);
+        b.output(load);
+        let g = b.build();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+
+        alloc
+            .fill_input_i32(&g, "token_ids", &[50_000])
+            .expect("token ids are not positions");
+        let err = alloc.fill_input_i32(&g, "positions", &[8]).unwrap_err();
+        assert!(err.contains(">= n_ctx 8"), "got: {err}");
     }
 
     #[test]
