@@ -573,8 +573,8 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 ## 4. Concrete defects found (verified in code)
 
-Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene; 13 is a
-behavioural defect the A1 op matrix found and that is already fixed.
+Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene; 13–14 are
+behavioural defects found while executing the plan, already fixed.
 
 1. **GPU KV store has no bounds check.** CPU returns `Err` for `pos >= n_ctx`
    (`cpu_backend.rs:170-172`); CUDA (`cuda_backend.rs:1028-1061`) and Metal do
@@ -628,6 +628,19 @@ behavioural defect the A1 op matrix found and that is already fixed.
     architecture emits a standalone `Softmax` node, so nothing exercised it.~~
     **Found by the A1 op matrix and fixed**: the arm now scales by `1/sum`, with
     an op-matrix case pinning it.
+14. ~~**The CPU attention was not `nt`-invariant.** Each token's scores were
+    padded to the batch-wide `nkv`, and the softmax, the normalisation and the
+    weighted sum all ran over `nkv` instead of the token's own causal window
+    `vl = pos+1`. The padded entries are `-inf → 0`, so the arithmetic reads as
+    equivalent — but the reduction *length*, and with it the rounding, depended
+    on how many tokens shared the batch. Measured on 0.5B: a one-token decode
+    step differed from a single-shot prefill by `max|Δlogits| = 0.41`, and the
+    same token's K rows differed from layer 3 on (`nt=6` vs `nt=13`).~~
+    **Found while testing prefix reuse for B2 and fixed**: restricting the
+    window to `vl` makes incremental prefill, the decode loop and a single-shot
+    prefill bitwise identical, and removes the padding pass. It also matters
+    beyond B2 — the speculative-decoding identity gates assume exactly this
+    property.
 
 ---
 
