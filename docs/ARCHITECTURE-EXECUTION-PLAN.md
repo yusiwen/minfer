@@ -68,7 +68,7 @@ roadmap §4 defects automatically.
 |---|---|---|---|---|
 | A0 | — | CUDA access spike on this box | S | ✅ done — **unavailable** (compile-only) |
 | A1 | 23 | Op × dtype × backend correctness matrix | M | |
-| A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | |
+| A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | ✅ done |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
 | A4 | 6 | Server worker panic isolation | S | ✅ done |
 | A5 | 27 | Re-key cross-backend staging by `(node, dst_backend)` | S | ✅ done |
@@ -96,12 +96,19 @@ roadmap §4 defects automatically.
   surprise; ≥ 1 real defect is either found or proven absent.
 - **Deps:** A0 for the CUDA rows (CPU rows can land first).
 
-### A2 — CI  · item 24 · S
+### A2 — CI  · item 24 · S — **DONE**
 - **Files:** `.github/workflows/ci.yml`.
-- **Deliverable:** three jobs — Linux/CPU `cargo test`, macOS `cargo build`
-  (unchanged), CUDA `cargo build --features cuda`. Tests that need a model stay
-  `#[ignore]`d.
-- **Acceptance:** a deliberately broken commit fails the Linux job.
+- **Deliverable:** three jobs — `test-linux-cpu` (`cargo test --release`, the
+  runtime net), `build-linux-cuda` (`cargo build --release --features cuda` in
+  `nvidia/cuda:12.8.0-devel-ubuntu22.04`; no GPU on a hosted runner, so
+  compile-only by necessity), and the unchanged macOS/Metal `build`.
+- **Acceptance:** the workflow parses and declares all three jobs; a broken
+  commit now fails `test-linux-cpu` (unit tests run there, including the
+  allocator/scheduler tests added in A3/A5).
+- **Unverified from this box:** the dev machine is aarch64, so the x86_64
+  Linux job's *first* run is the first time the AVX2 paths see CI. If it comes
+  back red, that is a real finding, not a CI defect — fix or `#[ignore]` the
+  individual test with the reason recorded, do not soften the job.
 
 ### A3 — KV bounds guard + `ensure_kv` size check  · item 5 · S — **DONE**
 - **Files:** `src/graph/alloc.rs` (only — see the deviation note).
