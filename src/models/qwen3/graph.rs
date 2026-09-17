@@ -52,6 +52,11 @@ impl Qwen3Graph {
         let mut b = crate::graph::builder::GraphBuilder::new();
 
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
+        // E1: a batch with more than one sequence cannot bound attention from
+        // positions, so the attention nodes carry the flag and a backend that has
+        // not been ported refuses them instead of deriving a wrong window.
+        b.set_multi_seq(params.n_seqs > 1);
+
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
         // its consumers at the last layer): an input node mid-graph splits the
@@ -457,6 +462,16 @@ impl Qwen3Graph {
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         let pos: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
+        // E1: one sequence today (batch composition is E2). The allocator
+        // resolves each query's allowed cells from the cell store, so the IR's
+        // seq ids and the kernel's window cannot disagree.
+        // Phase C / C2 + E1: record how far the KV store writes and resolve the
+        // attention spans in one call (one sequence today; batch composition is
+        // E2). Both are data, so the graph and its reuse identity are untouched.
+        let seq_ids = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+        alloc
+            .fill_attn_inputs(graph, &seq_ids, &pos)
+            .unwrap_or_else(|e| panic!("attn inputs: {e}"));
         if graph
             .inputs
             .iter()
@@ -530,12 +545,6 @@ impl Qwen3Graph {
             );
         }
 
-        // Phase C / C2: record how far the KV store wrote, so a context shift
-        // knows what it is allowed to drop. `max(position) + 1` is exactly the
-        // row count the store just wrote.
-        if let Some(&maxp) = positions.iter().max() {
-            alloc.kv_note_used(maxp + 1);
-        }
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
         // R3-A2: the buffer is always exactly n_out*nv (G3-reduced, or
@@ -1114,6 +1123,8 @@ mod tests {
                 alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
                 let pos32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
                 alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
+                let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+                alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
                 sched.execute(&graph, &mut alloc).unwrap();
                 let mut run_dumps = Vec::new();
                 for &nid in &keep {

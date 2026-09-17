@@ -29,6 +29,17 @@ pub trait Backend: Send + Sync {
     fn supports_op(&self, op: &Op, dtype: DType) -> bool;
     fn supports_fused(&self, fused: &FusedOp) -> bool;
 
+    /// Whether this backend bounds attention from the explicit `attn_span` input
+    /// (E1) instead of deriving the causal window from `positions`.
+    ///
+    /// The default is `false` on purpose: a backend that has not been ported
+    /// must never receive a multi-sequence attention node, and
+    /// `GraphAllocator::supports` reads this instead of the backend's own
+    /// source deciding (Metal is the unported one today — Phase G).
+    fn supports_attn_span(&self) -> bool {
+        false
+    }
+
     /// Buffer pool: allocate / release a buffer of `size` f32 elements.
     fn alloc_buffer(&mut self, size: usize) -> usize;
     fn free_buffer(&mut self, id: usize);

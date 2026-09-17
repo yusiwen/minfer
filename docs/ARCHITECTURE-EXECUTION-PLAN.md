@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 is in design**. | E1 is next on the critical path; C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1's CPU half is complete** (2026-09-17; the CUDA half is ticket E1b). | E1b (the CUDA half of E1) and E2 are next on the critical path; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -589,7 +589,8 @@ prompt) belongs with E2's batching work.
 
 | ID | Item | Title | Effort |
 |---|---|---|---|
-| E1 | 2 | IR `seq_id` + explicit attention masks (CPU + CUDA) — **design** | L |
+| E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
+| E1b | 2 | CUDA attention kernels read `attn_span` (E1's deferred half; needs a device to verify) | M |
 | E2 | 3 | Batch composition + continuous batching; make `n_seqs` real | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
@@ -642,13 +643,72 @@ other. E1 replaces the derivation with **data**:
 6. **CUDA.** Both attention kernels (`gqa_attn_split` and the non-split path)
    take the span; the I32 input reaches the device through the existing
    capture-safe `positions_i32` conversion. This box has no device (A0), so the
-   CUDA half is **compile-verified only** and is recorded that way.
+   CUDA half can only be compile-verified — see the landing record below: it is
+   deferred to **E1b** rather than changed blind, and the assignment gate keeps
+   CUDA correct (single-sequence) in the meantime.
 
 **Not in E1:** batch composition and continuous batching (E2 — nothing composes
 several sequences into one forward yet, so the model path fills `seq_ids` with
 `SEQ_MAIN` and stays a single-sequence caller); chunked prefill (E3); a full
 per-cell mask, which only a layout with holes needs (C3/D1 — a range covers
 every layout the engine can currently produce); Metal (G5).
+
+#### E1 record (2026-09-17)
+
+**What landed.** `seq_ids` and `attn_span` are IR inputs (`Op::Input` leaves,
+filled per step like `positions`); `Op::Attn { mode }` became
+`Op::Attn { mode, multi_seq }` with sources `[q, kv, pos, span]` — `positions`
+stays at index 2 because the Metal and CUDA arms read it there, and the span is
+the new fourth input. `KvCache::seq_range` / `attn_span` resolve each query's
+`[lo, hi)` from per-cell ownership (start) and its position (causal end), and
+`GraphAllocator::fill_attn_inputs` is the single call that records how far the
+forward writes, fills the ids and resolves the span, so the IR's ids and the
+kernel's window cannot drift apart. The CPU kernel now walks `lo..hi` instead of
+`0..pos[t] + 1`.
+
+**The refusal has one definition.** `Backend::supports_attn_span` (default
+`false`) plus `graph::backend_takes` decide assignment; `GraphAllocator::supports`
+and A1's op matrix both call it, so a backend that still derives its bound from
+positions is never handed a `multi_seq` node — and the op matrix gained an
+explicit asymmetric row for it.
+
+**Bitwise for one sequence, as specified.** With one sequence `lo = 0` and
+`hi = min(n_used, pos + 1) = pos + 1`, which is exactly the old derivation, so
+the loop bounds, reduction length and accumulation order are unchanged. Unit
+suite `179 → 183 passed / 0 failed`; the real-model bitwise tests
+(`graph_logits_match_forward_real_model`, `prefix_reuse_matches_a_full_prefill`,
+`reused_cache_across_prompts_matches_a_fresh_cache`, the C2 tests) never moved,
+and the pre-E1 vs E1 binaries generate byte-identical greedy text on
+Qwen2.5-0.5B Q4_0, Qwen3-0.6B Q8_0, Qwen2.5-7B Q4_K_M and Qwen2.5-14B Q4_K_M
+(only timing lines differ).
+
+**No cross-attention (`two_sequences_do_not_cross_attend`).** One arena, two
+sequences: sequence 0 owns row 0, sequence 1 owns row 2, queries at positions 0
+and 2 with spans `[0, 1)` and `[2, 3)`. The K/V values are chosen so a leak
+*changes the answer*: query 1 scores 1.0 against sequence 0's key, so a window
+that wrongly started at 0 would return `[0.73, 0.27]` instead of sequence 1's
+`V = [0, 1]`. The test asserts the exact window and the output, and the resolver
+has its own store-level tests (`two_sequences_resolve_to_disjoint_windows`, plus
+`Err` on non-contiguous ownership and on an empty window).
+
+**The CUDA half is deferred, and why.** The ticket says "CPU + CUDA". CUDA's
+attention kernels still compute `positions[t] + 1` (six of them:
+`gqa_attn_f32_f16kv`, `gqa_attn_f32`, the split partial/combine pairs,
+the batched variants and the flash-attention prefill path at
+`cuda_kernels.cu:4194`). A window with `lo > 0` changes what the split-K chunking
+covers, so the port is not mechanical; and this box has **no device** (A0), which
+makes it the one class of change that cannot be verified at all — a mistake would
+silently corrupt *single-sequence* GPU output that is known-good today. So: CUDA
+keeps its existing behavior, `supports_attn_span()` stays `false` for it (the
+trait default), the assignment gate refuses it a `multi_seq` node, and the port
+is ticket **E1b**. E1's acceptance is therefore met on CPU and **not** met on
+CUDA — recorded here rather than claimed.
+
+**Not in E1:** batch composition and continuous batching (E2 — nothing composes
+several sequences into one forward yet, so the model path fills `seq_ids` with
+`SEQ_MAIN` and stays a single-sequence caller); chunked prefill (E3); a full
+per-cell mask, which only a layout with holes needs (C3/D1 — a range covers
+every layout the engine can currently produce); Metal (G5); the CUDA port (E1b).
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
@@ -734,7 +794,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ◐ ─ E2 ─ E3 ─ E4 ─ E5
+Phase E  ├──────────────────── E1 ✔ ─ E2 ─ E3 ─ E4 ─ E5        (E1b: CUDA half)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └────────────────────────────────────────────►  (needs a Mac)
 ```

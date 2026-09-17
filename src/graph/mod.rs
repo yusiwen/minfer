@@ -7,6 +7,21 @@
 
 pub mod alloc;
 pub mod backend;
+
+/// Whether `backend` may take `(op, dtype)`: ordinary op support **plus** E1's
+/// span capability for a multi-sequence attention node, which no positions-based
+/// kernel can bound. The allocator and A1's op matrix both ask this, so the
+/// assignment rule has one definition (`docs/ARCHITECTURE-EXECUTION-PLAN.md` E1).
+pub fn backend_takes(b: &dyn backend::Backend, op: &ops::Op, dtype: DType) -> bool {
+    let span_ok = !matches!(
+        op,
+        ops::Op::Attn {
+            multi_seq: true,
+            ..
+        }
+    ) || b.supports_attn_span();
+    span_ok && b.supports_op(op, dtype)
+}
 pub mod builder;
 pub mod cache;
 pub mod cpu_backend;

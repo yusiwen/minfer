@@ -213,7 +213,10 @@ pub enum Op {
     MatMul { transpose_b: bool },              // linear algebra
     GetRows,                                   // embedding lookup / tail-row selection
     RoPE { style: RopeStyle },                 // positional encoding
-    Attn { mode: AttnMode },                   // attention (softmax fused inside the kernel)
+    Attn { mode: AttnMode, multi_seq: bool },  // attention (softmax fused inside the kernel);
+                                               //   `multi_seq` = the batch spans several
+                                               //   sequences, so only a backend that reads
+                                               //   the explicit span may take the node
     KvcacheStore { layer: usize },             // persistent KV write; position comes from `positions`
     KvcacheLoad  { layer: usize },             // view of the persistent KV region
     View { offset: usize, shape: [usize; 4] },
@@ -257,7 +260,7 @@ pub enum NodeMeta {
 | `MatMulMeta` | `weight_name`, `bias_name`, `weight_ttype`, `in_dim`, `out_dim` | backends pick the kernel by `weight_ttype` without holding the `Tensor` |
 | `NormMeta` | optional weight/bias names (shared by `RmsNorm` and `QkNorm`) | CPU / Metal / CUDA |
 | `RoPEMeta` | `freq_base`, `freq_scale`, `n_head`, `hd` | rope kernel |
-| `AttnMeta` | `layer`, `n_head`, `n_head_kv`, `hd`, `hd_kv`, `nkt` (KV row stride), `scale` | attention; `layer` resolves `kv_pair` |
+| `AttnMeta` | `layer`, `n_head`, `n_head_kv`, `hd`, `hd_kv`, `nkt` (KV row stride), `scale` | attention; `layer` resolves `kv_pair`. The allowed cells are **data** (`attn_span`, E1), not a field |
 | `KvcacheMeta` | `n_embd`, `n_head_kv` | KV region sizing / attention strides |
 | `EmbedMeta` | `vocab_size`, `weight_name`, `weight_ttype` | embedding lookup |
 | `FusedQkvMeta` | concat weight name, three bias names, `in_dim`, `nqt`, `nkt`, `hd`, `nh`, `nk`, rope params, `kv_elems` | `FusedQKV` |
@@ -296,7 +299,7 @@ impl GraphBuilder {
     pub fn mul(&mut self, a: NodeId, b: NodeId) -> NodeId;
     pub fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId;
     pub fn attn(&mut self, q: NodeId, kv: NodeId, pos: NodeId,
-                mode: AttnMode, meta: AttnMeta) -> NodeId;
+                mode: AttnMode, meta: AttnMeta) -> NodeId;  // src = [q, kv, pos, span]
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId;
     pub fn kvcache_store(&mut self, layer: usize, k: NodeId, v: NodeId,
                          pos: NodeId, n_ctx: usize) -> NodeId;

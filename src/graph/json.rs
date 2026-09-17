@@ -233,7 +233,9 @@ fn op_detail(op: &Op) -> Value {
         Op::QkNorm { hd, nh, eps } => json!({ "hd": hd, "nh": nh, "eps": eps }),
         Op::MatMul { transpose_b } => json!({ "transpose_b": transpose_b }),
         Op::RoPE { style } => json!({ "style": format!("{style:?}") }),
-        Op::Attn { mode } => json!({ "mode": format!("{mode:?}") }),
+        Op::Attn { mode, multi_seq } => {
+            json!({ "mode": format!("{mode:?}"), "multi_seq": multi_seq })
+        }
         Op::KvcacheStore { layer } => json!({ "layer": layer }),
         Op::KvcacheLoad { layer } => json!({ "layer": layer }),
         Op::View { offset, shape } => json!({ "offset": offset, "shape": shape }),

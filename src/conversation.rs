@@ -734,7 +734,6 @@ impl Conversation {
                                     self.stream_tokens.push(self.eot);
                                     self.current_pos += 1;
                                     self.need_insert_eot = false;
-                                    eot_written = true;
                                 }
                                 self.turn_pos = self.current_pos;
                                 let positions: Vec<usize> =

@@ -122,12 +122,15 @@ fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
 /// which the matrix reports as a skip.
 fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
     match tag {
-        Backend::CPU => Ok(CpuBackend::new().supports_op(op, DType::F32)),
+        Backend::CPU => {
+            let b = CpuBackend::new();
+            Ok(super::backend_takes(&b, op, DType::F32))
+        }
         Backend::Metal => {
             #[cfg(target_os = "macos")]
             {
                 match super::metal_backend::MetalBackend::new() {
-                    Some(m) => Ok(m.supports_op(op, DType::F32)),
+                    Some(m) => Ok(super::backend_takes(&m, op, DType::F32)),
                     None => Err("no Metal device".into()),
                 }
             }
@@ -141,7 +144,7 @@ fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
             #[cfg(feature = "cuda")]
             {
                 match super::cuda_backend::CudaBackend::new() {
-                    Some(c) => Ok(c.supports_op(op, DType::F32)),
+                    Some(c) => Ok(super::backend_takes(&c, op, DType::F32)),
                     None => Err("no CUDA device".into()),
                 }
             }
@@ -421,9 +424,9 @@ fn build_rope(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
 }
 
 fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
-    // One head, one KV head, hd = 2, one query at position 0: the causal window
-    // holds exactly one KV row, so softmax over a single score is 1 and the
-    // output is V.
+    // One head, one KV head, hd = 2, one query at position 0: the window the
+    // span input names holds exactly one KV row, so softmax over a single score
+    // is 1 and the output is V.
     let pos = b.input("positions", [1, 1, 1, 1], DType::I32);
     let q = b.input("q", [2, 1, 1, 1], DType::F32);
     let k = b.input("k", [2, 1, 1, 1], DType::F32);
@@ -452,6 +455,9 @@ fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
             ("k", vec![1.0, 0.0]),
             ("v", vec![0.25, -0.75]),
             ("positions", vec![0.0]),
+            // E1: one sequence, one query, window [0, 1).
+            ("seq_ids", vec![0.0]),
+            ("attn_span", vec![0.0, 1.0]),
         ],
         vec![0.25, -0.75],
         vec![],
@@ -579,6 +585,7 @@ fn cases() -> Vec<Case> {
             name: "Attn",
             op: Op::Attn {
                 mode: AttnMode::Gqa,
+                multi_seq: false,
             },
             build: build_attn,
             note: "",
@@ -622,6 +629,7 @@ fn all_ops() -> Vec<Op> {
         },
         Op::Attn {
             mode: AttnMode::Gqa,
+            multi_seq: false,
         },
         Op::KvcacheStore { layer: 0 },
         Op::KvcacheLoad { layer: 0 },
@@ -768,10 +776,25 @@ fn support_table_matches_support_matrix_doc() {
             "Attn",
             Op::Attn {
                 mode: AttnMode::Gqa,
+                multi_seq: false,
             },
             true,
             true,
             true,
+        ),
+        // E1's asymmetric row: only CPU reads the explicit span so far (CUDA's
+        // port follows in the same ticket). Metal and CUDA still derive their
+        // bound from positions and must refuse a multi-sequence attention node
+        // (`backend_takes`), so neither can be assigned one.
+        (
+            "Attn multi-seq",
+            Op::Attn {
+                mode: AttnMode::Gqa,
+                multi_seq: true,
+            },
+            true,
+            false,
+            false,
         ),
         (
             "KvcacheStore",

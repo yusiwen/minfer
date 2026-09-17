@@ -142,19 +142,20 @@ impl GraphAllocator {
 
     /// Which backend supports this op/dtype (highest priority first).
     pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
+        let eligible = |b: &dyn BackendTrait| -> bool { super::backend_takes(b, op, dtype) };
         #[cfg(target_os = "macos")]
         if let Some(m) = &self.metal {
-            if m.supports_op(op, dtype) {
+            if eligible(m) {
                 return Some(Backend::Metal);
             }
         }
         #[cfg(feature = "cuda")]
         if let Some(c) = &self.cuda {
-            if c.supports_op(op, dtype) {
+            if eligible(c) {
                 return Some(Backend::Cuda);
             }
         }
-        if self.cpu.supports_op(op, dtype) {
+        if eligible(&self.cpu) {
             return Some(Backend::CPU);
         }
         None
@@ -596,6 +597,51 @@ impl GraphAllocator {
         self.fill_input_impl(graph, name, data)
     }
 
+    /// Fill the E1 attention inputs and record how far this forward writes:
+    /// `positions` are cell indices, `seq_ids` names each query's sequence.
+    ///
+    /// This is the one call a caller needs — the model path and hand-built graphs
+    /// both use it — so the seq ids, the resolved span and the store's ownership
+    /// cannot drift apart. `max(positions) + 1` is exactly the row count the KV
+    /// store writes in this forward, recorded *before* the span is resolved
+    /// because the span has to describe the cache the store is about to fill.
+    pub fn fill_attn_inputs(
+        &mut self,
+        graph: &ComputeGraph,
+        seq_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<(), String> {
+        if let Some(&maxp) = positions.iter().max() {
+            self.kv_note_used(maxp as usize + 1);
+        }
+        let pos: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        self.fill_seq_ids(graph, seq_ids, &pos)
+    }
+
+    /// Fill the per-query sequence ids and resolve the matching `attn_span`
+    /// input from the KV cell store (Phase E / E1).
+    ///
+    /// `attn_span` is *derived*, never supplied by the caller: the store owns the
+    /// per-sequence cell ranges, so resolving both here is what keeps the IR's
+    /// seq ids and the kernel's window from disagreeing. A graph with no
+    /// attention (no `attn_span` input) only records the ids.
+    pub fn fill_seq_ids(
+        &mut self,
+        graph: &ComputeGraph,
+        seq_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<(), String> {
+        let has = |name: &str| graph.inputs.iter().any(|&i| graph.node(i).name == name);
+        if has("seq_ids") {
+            self.fill_input_i32(graph, "seq_ids", seq_ids)?;
+        }
+        if !has("attn_span") {
+            return Ok(());
+        }
+        let span = self.kv.attn_span(seq_ids, positions)?;
+        self.fill_input_i32(graph, "attn_span", &span)
+    }
+
     /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
     /// patterns — exact for |v| < 2^24.
     pub fn fill_input_i32(
@@ -617,9 +663,10 @@ impl GraphAllocator {
     }
 
     /// Reject values in an I32 input that would index past the KV region (see
-    /// `fill_input_i32`). Only inputs actually consumed by a KV-writing or
-    /// attention node are bounded — `token_ids` is I32 too, and vocabularies are
-    /// routinely larger than `n_ctx`.
+    /// `fill_input_i32`). An input consumed by `Op::Attn` is the E1 **span**
+    /// (`[lo, hi)` pairs, checked as such); one consumed by the KV-writing ops
+    /// is positions. Everything else (`token_ids`, `seq_ids`, …) is unbounded —
+    /// vocabularies and sequence counts are routinely larger than `n_ctx`.
     fn check_positions_bound(
         &self,
         graph: &ComputeGraph,
@@ -634,6 +681,12 @@ impl GraphAllocator {
         else {
             return Ok(()); // unknown name: fill_input_impl reports it
         };
+        // The span input's name is the IR contract (`fill_seq_ids` looks it up
+        // that way too), and it is the fourth input of an `Attn` node: `positions`
+        // stays at index 2 for the backends that still derive from it.
+        if name == "attn_span" {
+            return self.check_attn_span(graph, name, data);
+        }
         let indexes_kv = graph.nodes.iter().any(|n| {
             n.src.contains(&id)
                 && matches!(
@@ -679,6 +732,49 @@ impl GraphAllocator {
                 self.kv.cells_for(layer, &positions).map_err(|e| {
                     format!("input '{name}': {e} (`docs/ARCHITECTURE-ROADMAP.md` §2.4)")
                 })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the E1 attention span: `2 * nt` values, `lo <= hi <= n_ctx`. The
+    /// arena size comes from the cell store of the attention node's layer, so the
+    /// check keeps meaning the same thing if the mapping stops being the identity.
+    fn check_attn_span(
+        &self,
+        graph: &ComputeGraph,
+        name: &str,
+        data: &[u32],
+    ) -> Result<(), String> {
+        if data.len() % 2 != 0 {
+            return Err(format!(
+                "input '{name}': attention span has {} values (expected lo/hi pairs)",
+                data.len()
+            ));
+        }
+        let layer = graph.nodes.iter().find_map(|n| match (&n.op, &n.meta) {
+            (Op::Attn { .. }, NodeMeta::Attn(m)) => Some(m.layer),
+            _ => None,
+        });
+        let Some(n_ctx) = layer
+            .and_then(|l| self.kv.get(l))
+            .map(|l| l.n_ctx)
+            .or_else(|| {
+                graph.nodes.iter().find_map(|n| match &n.op {
+                    Op::KvcacheStore { layer } => self.kv.get(*layer).map(|l| l.n_ctx),
+                    _ => None,
+                })
+            })
+        else {
+            return Ok(()); // no arena yet: nothing to bound against
+        };
+        let n = data.len() / 2;
+        for t in 0..n {
+            let (lo, hi) = (data[t] as usize, data[n + t] as usize);
+            if lo > hi || hi > n_ctx {
+                return Err(format!(
+                    "input '{name}': query {t} has span [{lo}, {hi}) outside the {n_ctx}-cell arena"
+                ));
             }
         }
         Ok(())

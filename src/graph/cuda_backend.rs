@@ -3946,10 +3946,12 @@ mod tests {
             kfull[pp * nkt..(pp + 1) * nkt].copy_from_slice(&ks[t * nkt..(t + 1) * nkt]);
             vfull[pp * nkt..(pp + 1) * nkt].copy_from_slice(&vs[t * nkt..(t + 1) * nkt]);
         }
-        let nkv = pos.iter().copied().max().unwrap() + 1;
+        // E1: the CPU reference takes the allowed-cell span; this is the
+        // single-sequence causal window the test compares against.
+        let span = crate::graph::cpu_backend::causal_span(&pos);
         let mut aref = vec![0f32; nh * hd * nt];
         crate::graph::cpu_backend::cpu_gqa_attn(
-            &qref, &kfull, &vfull, &pos, nt, nkv, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+            &qref, &kfull, &vfull, &span, nt, nh, nk_h, hd, hd, nkt, &mut aref, scale,
         )
         .unwrap();
         let agot = cb.copy_to_host(ob_at).unwrap();
@@ -4092,10 +4094,12 @@ mod tests {
             kfull[p * nkt..(p + 1) * nkt].copy_from_slice(&ks_h[t * nkt..(t + 1) * nkt]);
             vfull[p * nkt..(p + 1) * nkt].copy_from_slice(&vs_h[t * nkt..(t + 1) * nkt]);
         }
-        let nkv = pos.iter().copied().max().unwrap() + 1;
+        // E1: the CPU reference takes the allowed-cell span; this is the
+        // single-sequence causal window the test compares against.
+        let span = crate::graph::cpu_backend::causal_span(&pos);
         let mut aref = vec![0f32; nh * hd * nt];
         crate::graph::cpu_backend::cpu_gqa_attn(
-            &qref, &kfull, &vfull, &pos, nt, nkv, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+            &qref, &kfull, &vfull, &span, nt, nh, nk_h, hd, hd, nkt, &mut aref, scale,
         )
         .unwrap();
         let agot = cb.copy_to_host(ob_at).unwrap();
@@ -4838,10 +4842,10 @@ mod tests {
             kfull[p * nkt..(p + 1) * nkt].copy_from_slice(&ks_h[t * nkt..(t + 1) * nkt]);
             vfull[p * nkt..(p + 1) * nkt].copy_from_slice(&vs_h[t * nkt..(t + 1) * nkt]);
         }
-        let nkv = pos.iter().copied().max().unwrap() + 1;
+        let span = crate::graph::cpu_backend::causal_span(&pos);
         let mut aref = vec![0f32; nh * hd * nt];
         crate::graph::cpu_backend::cpu_gqa_attn(
-            &qs, &kfull, &vfull, &pos, nt, nkv, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+            &qs, &kfull, &vfull, &span, nt, nh, nk_h, hd, hd, nkt, &mut aref, scale,
         )
         .unwrap();
         let agot = cb.copy_to_host(ob_at).unwrap();
@@ -5455,9 +5459,8 @@ mod tests {
                         &qs,
                         &kfull,
                         &vfull,
-                        &[pos0],
+                        &crate::graph::cpu_backend::causal_span(&[pos0]),
                         1,
-                        nkv,
                         nh,
                         nk_h,
                         hd,
@@ -5567,9 +5570,8 @@ mod tests {
                 &qs,
                 &kfull,
                 &vfull,
-                &[pos0],
+                &crate::graph::cpu_backend::causal_span(&[pos0]),
                 1,
-                nkv,
                 nh,
                 nk_h,
                 hd,

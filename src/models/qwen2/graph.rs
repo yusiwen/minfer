@@ -54,6 +54,11 @@ impl Qwen2Graph {
         let mut b = crate::graph::builder::GraphBuilder::new();
 
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
+        // E1: a batch with more than one sequence cannot bound attention from
+        // positions, so the attention nodes carry the flag and a backend that has
+        // not been ported refuses them instead of deriving a wrong window.
+        b.set_multi_seq(params.n_seqs > 1);
+
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
         // its consumers at the last layer): an input node mid-graph splits the
@@ -535,6 +540,16 @@ impl Qwen2Graph {
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         let pos: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
+        // E1: one sequence today (batch composition is E2). The allocator
+        // resolves each query's allowed cells from the cell store, so the IR's
+        // seq ids and the kernel's window cannot disagree.
+        // Phase C / C2 + E1: record how far the KV store writes and resolve the
+        // attention spans in one call (one sequence today; batch composition is
+        // E2). Both are data, so the graph and its reuse identity are untouched.
+        let seq_ids = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+        alloc
+            .fill_attn_inputs(graph, &seq_ids, &pos)
+            .unwrap_or_else(|e| panic!("attn inputs: {e}"));
         // G3: the last-layer tail-row reduction reads `tail_ids` (filled when
         // the graph was built with n_out < nt, i.e. prefill)
         if graph
@@ -622,12 +637,6 @@ impl Qwen2Graph {
         // reduced the last layer + lm_head to n_out rows (buffer = n_out*nv);
         // without it (decode, n_out == nt) the buffer is nv*nt == n_out*nv.
         // Either way the first n_out*nv elements are the answer.
-        // Phase C / C2: record how far the KV store wrote, so a context shift
-        // knows what it is allowed to drop. `max(position) + 1` is exactly the
-        // row count the store just wrote.
-        if let Some(&maxp) = positions.iter().max() {
-            alloc.kv_note_used(maxp + 1);
-        }
         let nv = model.hparams.n_vocab as usize;
         let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
         // R3-A2: the buffer is always exactly n_out*nv (G3-reduced, or
@@ -1318,6 +1327,8 @@ mod tests {
             let pos32: Vec<u32> = (0..nt as u32).collect();
             alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
             alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
+            let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+            alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
             // G3 tail-reduction input: forward_cached fills it (see
             // forward_cached); the manual graph must do the same, otherwise the
             // reduce picks row 0 instead of the last row → logits of a different
@@ -1360,6 +1371,9 @@ mod tests {
             alloc.fill_input_i32(&dgraph, "token_ids", &[next]).unwrap();
             alloc
                 .fill_input_i32(&dgraph, "positions", &[nt as u32])
+                .unwrap();
+            alloc
+                .fill_attn_inputs(&dgraph, &[crate::graph::kvcache::SEQ_MAIN], &[nt as u32])
                 .unwrap();
             sched.execute(&dgraph, &mut alloc).unwrap();
             let dlogits = alloc.copy_to_cpu(dgraph.outputs[0]).unwrap();
@@ -1510,6 +1524,8 @@ mod tests {
             ca.fill_input_i32(&g, "token_ids", &ids).unwrap();
             let pos32: Vec<u32> = (0..nt as u32).collect();
             ca.fill_input_i32(&g, "positions", &pos32).unwrap();
+            let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+            ca.fill_attn_inputs(&g, &seqs, &pos32).unwrap();
             sched.execute(&g, &mut ca).unwrap();
             let expect = ca.copy_to_cpu(g.outputs[0]).unwrap();
 
@@ -1533,6 +1549,8 @@ mod tests {
                 alloc.fill_input_i32(&g2, "token_ids", &ids).unwrap();
                 let pos32: Vec<u32> = (0..nt as u32).collect();
                 alloc.fill_input_i32(&g2, "positions", &pos32).unwrap();
+                let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+                alloc.fill_attn_inputs(&g2, &seqs, &pos32).unwrap();
                 sched.execute(&g2, &mut alloc).unwrap();
                 let got = alloc.copy_to_cpu(g2.outputs[0]).unwrap();
                 let mut maxd = 0.0f32;
@@ -1961,6 +1979,8 @@ mod tail_tests {
             let pos32: Vec<u32> = (0..nt as u32).collect();
             alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
             alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
+            let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+            alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
             if graph
                 .inputs
                 .iter()
@@ -2162,6 +2182,7 @@ mod tail_tests {
                     .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
                     .unwrap();
                 alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
+                alloc.fill_attn_inputs(&graph, &[0], &[0]).unwrap();
                 sched.execute(&graph, &mut alloc).unwrap();
                 alloc.copy_to_cpu(graph.outputs[0]).unwrap()
             }
@@ -2257,6 +2278,7 @@ mod tail_tests {
                     .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
                     .unwrap();
                 alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
+                alloc.fill_attn_inputs(&graph, &[0], &[0]).unwrap();
                 sched.execute(&graph, &mut alloc).unwrap();
                 let logits = alloc.copy_to_cpu(graph.outputs[0]).unwrap();
                 let layers: Vec<Vec<f32>> = ffn_adds
