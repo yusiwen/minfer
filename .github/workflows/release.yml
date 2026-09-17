@@ -34,7 +34,7 @@ jobs:
     runs-on: macos-14 # Apple Silicon (arm64) GitHub-hosted runner
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Full history + tags so `git describe` can resolve the most
           # recent "v"-prefixed release tag.
@@ -166,7 +166,7 @@ jobs:
     runs-on: ubuntu-24.04 # x86_64; sets the glibc floor (2.39) for the artifact
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -248,7 +248,7 @@ jobs:
     runs-on: ubuntu-24.04-arm # aarch64; glibc 2.39 (matches the DGX Spark)
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 

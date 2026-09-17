@@ -10,6 +10,11 @@
 #                       image. GitHub runners have no GPU, so this cannot run
 #                       anything — it catches nvcc/kernel-compile breakage only.
 # 3. build-macos      : unchanged macOS/Metal compile check (Apple Silicon).
+#
+# `actions/checkout` is pinned to its Node.js 24 major (v5): the v4 line still
+# ships the Node.js 20 runtime, which GitHub now force-runs on 24 and reports as
+# a deprecation annotation on every job. `dtolnay/rust-toolchain` is a composite
+# action and brings no Node runtime of its own.
 name: CI
 
 on:
@@ -22,7 +27,7 @@ jobs:
   test-linux-cpu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Test (release, CPU)
         run: cargo test --release
@@ -38,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.8.0-devel-ubuntu22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The CUDA devel images are minimal: no curl, so `dtolnay/rust-toolchain`
       # cannot bootstrap rustup (it failed with "curl: command not found").
       # build-essential also gives nvcc its host compiler and the linker.
@@ -55,6 +60,6 @@ jobs:
   build-macos:
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build (release)
         run: cargo build --release
