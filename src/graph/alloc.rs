@@ -597,6 +597,33 @@ impl GraphAllocator {
         self.fill_input_impl(graph, name, data)
     }
 
+    /// Reserve a contiguous cell run for `seq` (Phase E / E2). Several
+    /// sequences share one arena this way; `Err` when no run fits (moving a
+    /// sequence is C3's cell copy, needs Phase D's views).
+    pub fn kv_reserve_seq(
+        &mut self,
+        seq: super::kvcache::SeqId,
+        cap: usize,
+    ) -> Result<super::kvcache::SeqSlot, String> {
+        self.kv.reserve_seq(seq, cap)
+    }
+
+    /// Release everything `seq` reserved and owned; returns the freed capacity.
+    pub fn kv_release_seq(&mut self, seq: super::kvcache::SeqId) -> usize {
+        self.kv.release_seq(seq)
+    }
+
+    /// The run `seq` holds, or `None`.
+    pub fn kv_seq_slot(&self, seq: super::kvcache::SeqId) -> Option<super::kvcache::SeqSlot> {
+        self.kv.seq_slot(seq)
+    }
+
+    /// Mark cells `[from, to)` as written by `seq` in every layer (E2's batched
+    /// forwards write several sequences per step).
+    pub fn kv_own_range(&mut self, seq: super::kvcache::SeqId, from: usize, to: usize) {
+        self.kv.own_range(seq, from, to);
+    }
+
     /// Fill the E1 attention inputs and record how far this forward writes:
     /// `positions` are cell indices, `seq_ids` names each query's sequence.
     ///

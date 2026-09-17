@@ -591,7 +591,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **design** | XL |
+| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **in progress** (reservations landed) | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -645,6 +645,27 @@ sequence-aware:
 sequence's cells when the arena fragments (C3 needs D1; E2 reserves a slot's
 budget up front and fails loudly instead), layer offload (E5), Metal (G5), and
 CUDA runtime verification (no device here).
+
+**E2 progress (2026-09-17).** Step 1 of the design landed: `KvCache` holds
+per-sequence reservations (`SeqSlot { start, cap }`, `reserve_seq` first-fit,
+`release_seq`, `seq_slot`) and per-sequence ownership (`own_range`, replacing
+`own_prefix`'s hard-coded sequence 0), and `attn_span` resolves a query's window
+from its sequence's reservation — with a **written-row check** (`owner[pos] ==
+seq`), so a window can never include rows nobody wrote. A reservation is not
+ownership: reserving cells does not let a query attend to them, which is what
+keeps a batch's unwritten rows out of attention. `after_rm`/`after_shift` now
+refuse a multi-sequence cache explicitly (C2's shift is the single-sequence
+sliding window; a general move is C3).
+
+The single-sequence path is the `cap == n_ctx` special case: `own_prefix`
+reserves the whole arena for `SEQ_MAIN`, so `attn_span` still returns
+`[0, pos + 1)` and the real-model bitwise tests are the refactor's gate — they
+did not move (`cargo test --release` 183 → 184 passed / 0 failed, the +1 being
+the new reservation test). The allocator exposes the E2-facing surface
+(`kv_reserve_seq`/`kv_release_seq`/`kv_seq_slot`/`kv_own_range`).
+
+Still to come in E2: the batch type + `forward` entry point, the server's shared
+cache and decode batching, and the `--n-slots 4` measurement.
 
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
