@@ -733,14 +733,44 @@ weight-bandwidth bound (a GPU) batching is the standard win, but nothing here ca
 verify that (A0), so `MINFER_BATCH=1` is **opt-in** and the default stays with the
 measured-better serial path, exactly as A6 was reverted on measurement.
 
-What would change the verdict, recorded so the decision can be revisited: a
-usable GPU (or a bandwidth-bound model/hardware) to re-measure; a CPU `nt > 1`
-kernel improvement for the K-quants (the F1 family); and removing the
-reuse/concurrency conflict by warming each slot with the shared template prefix
-(a cell copy across slots is C3's operation — there is no such op yet).
+**E2 progress, step 4 (2026-09-17): batching the prefills too, and the trace that
+closes the diagnosis.** `BatchEngine::admit` now places a group of arriving
+requests and combines their prefills into **one** forward when the group fits
+`MAX_PREFILL_BATCH` (per request otherwise, so the graph width does not churn;
+with a CUDA device the prefills stay per request, because `fa_prefill`'s query
+tile must not span two sequences — E1b). `MINFER_BATCH_TRACE=1` prints per-forward
+timings, which is how the numbers below were obtained.
+
+On Qwen2.5-7B Q4_K_M, `--n-slots 4`, four identical prompts, `max_tokens=4`, equal
+work (16 tokens each side), reuse on:
+
+```
+serial:     7.65 s   (1 full prefill 4936 ms + 3 reused prefills ~140 ms + decode)
+concurrent: 17.12 s  (batched prefill: 3 prompts, 129 tokens, 14788 ms + decode)
+```
+
+- **Prefill batching is exactly neutral on this CPU**: 129 tokens in one forward
+  cost 14788 ms = 3 x 4936 ms, three separate prefills to the millisecond. The
+  prefill is compute-bound, so sharing one weight pass buys nothing here (it is
+  the case a bandwidth-bound device would change).
+- **The whole gap is B2's prefix reuse**: the serial path re-feeds 1 token per
+  request after the first (42 of 43 reused, ~140 ms), while four concurrent
+  requests need four KV homes and each pays the full 4936 ms. Concurrency cannot
+  reuse across slots without a cell copy — C3's operation, which needs D1.
+- **Decode batching is neutral on this model**: a 4-wide step costs 4.0x a
+  single-token step (the engine measurement: 1.00x on the 7B, 1.45x on the 0.5B).
+
+So `--n-slots 4` cannot "materially exceed" the serial baseline on this box: for
+identical prompts the serial path is ~3x cheaper on prefills that batching cannot
+recover, and for distinct prompts the two tie (neutral prefill batching + neutral
+decode batching). The remaining route to the acceptance on CPU is a `nt > 1`
+decode kernel that actually exploits the shared weight read (the F1 family); on a
+bandwidth-bound device batching is the standard win, and the trace above is what a
+GPU re-measurement should compare.
 
 Still to come in E2: nothing is left to *build* for the deliverable; what remains
-is the acceptance, which this box cannot demonstrate.
+is the acceptance, which this box cannot demonstrate (the step-4 trace above shows
+why, and `MINFER_BATCH_TRACE=1` is the instrument for re-measuring elsewhere).
 
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
