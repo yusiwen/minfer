@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16); **Phase C's C1 and C2 are complete** (2026-09-16). | C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2). | C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
