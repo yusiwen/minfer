@@ -702,7 +702,8 @@ silently corrupt *single-sequence* GPU output that is known-good today. So: CUDA
 keeps its existing behavior, `supports_attn_span()` stays `false` for it (the
 trait default), the assignment gate refuses it a `multi_seq` node, and the port
 is ticket **E1b**. E1's acceptance is therefore met on CPU and **not** met on
-CUDA — recorded here rather than claimed.
+CUDA — recorded here rather than claimed, and **the deferral was agreed with the
+maintainer on 2026-09-17** rather than taken unilaterally.
 
 **Not in E1:** batch composition and continuous batching (E2 — nothing composes
 several sequences into one forward yet, so the model path fills `seq_ids` with
