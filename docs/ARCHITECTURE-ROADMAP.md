@@ -284,7 +284,7 @@ it stops at the single-sequence append-only case. What is missing:
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
 | Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
-| Multi-sequence attention masks | ◐ **E1**: the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, and the CPU kernel reads it; Metal and CUDA still derive from `positions` and refuse a multi-sequence node (E1b / G5) |
+| Multi-sequence attention masks | ✔ **E1 + E1b**: the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations (compile-verified — no device here). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four
 separate user-visible capabilities at once: multi-slot serving throughput,
@@ -552,7 +552,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. | §2.4 | XL |
-| 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. — **CPU half done in E1** (span input + resolver + CPU kernel + two-sequence test); the CUDA kernels are E1b | §2.5 | L |
+| 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. — **done** (E1: span input + resolver + CPU kernel + two-sequence test; E1b: CUDA windowed kernels, compile-verified) | §2.5 | L |
 | 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). | §2.5 | XL |
 | 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. — **done in B2/B3** (prefix-matched reuse, ≈11× TTFT on turn 2) | §2.5 | M |
 | 5 | **Fix `ensure_kv` size handling** and add the missing `pos < n_ctx` guard on both GPU backends. | §2.4 | S |
