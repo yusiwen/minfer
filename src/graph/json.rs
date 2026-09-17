@@ -38,6 +38,7 @@ pub fn runtime_gparams(
         cparams: CParams {
             n_ctx,
             flash_attn: false,
+            explicit_span: false,
             gpu,
             fuse_qkv,
             fuse_ffn,
@@ -233,8 +234,11 @@ fn op_detail(op: &Op) -> Value {
         Op::QkNorm { hd, nh, eps } => json!({ "hd": hd, "nh": nh, "eps": eps }),
         Op::MatMul { transpose_b } => json!({ "transpose_b": transpose_b }),
         Op::RoPE { style } => json!({ "style": format!("{style:?}") }),
-        Op::Attn { mode, multi_seq } => {
-            json!({ "mode": format!("{mode:?}"), "multi_seq": multi_seq })
+        Op::Attn {
+            mode,
+            explicit_span,
+        } => {
+            json!({ "mode": format!("{mode:?}"), "explicit_span": explicit_span })
         }
         Op::KvcacheStore { layer } => json!({ "layer": layer }),
         Op::KvcacheLoad { layer } => json!({ "layer": layer }),

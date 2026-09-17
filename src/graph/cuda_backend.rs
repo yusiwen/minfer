@@ -1105,7 +1105,7 @@ impl CudaBackend {
                 let windowed = matches!(
                     &node.op,
                     Op::Attn {
-                        multi_seq: true,
+                        explicit_span: true,
                         ..
                     }
                 );
@@ -3081,7 +3081,7 @@ mod tests {
         let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 2usize, 2usize, 4usize);
         let nkt = nk * hd;
         let mut gb = GraphBuilder::new();
-        gb.set_multi_seq(true);
+        gb.set_explicit_span(true);
         let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
         let q = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
         let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
@@ -3109,11 +3109,11 @@ mod tests {
             g.nodes.iter().any(|n| matches!(
                 n.op,
                 crate::graph::ops::Op::Attn {
-                    multi_seq: true,
+                    explicit_span: true,
                     ..
                 }
             )),
-            "the attention node must declare multi_seq"
+            "the attention node must declare explicit_span"
         );
 
         let i32bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };

@@ -31,6 +31,14 @@ pub struct CParams {
     /// `MINFER_NO_FUSE_FFN` must force a rebuild). Decoupled from `fuse_qkv`
     /// so A/B-ing one fusion does not flip the other.
     pub fuse_ffn: bool,
+    /// E2: attention must read the explicit span because `positions` alone
+    /// cannot bound it — more than one sequence in the batch, or a window that
+    /// does not start at cell 0. It selects a *kernel instantiation*, so it is
+    /// topology (like the fusion flags), bounded to two graphs per shape; the
+    /// model derives it from the KV reservations, never from `n_past`, and the
+    /// classic single-sequence path (one sequence starting at 0) keeps the
+    /// causal instantiation.
+    pub explicit_span: bool,
 }
 
 impl Default for CParams {
@@ -41,6 +49,7 @@ impl Default for CParams {
             gpu: false,
             fuse_qkv: false,
             fuse_ffn: false,
+            explicit_span: false,
         }
     }
 }

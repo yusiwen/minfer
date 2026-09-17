@@ -22,7 +22,7 @@ pub struct GraphBuilder {
     /// Whether this graph's attention covers more than one sequence — set from
     /// `GraphParams.n_seqs` by the model builders. Recorded in the op so a
     /// backend that still derives its bound from positions refuses it.
-    multi_seq: bool,
+    explicit_span: bool,
 }
 
 impl GraphBuilder {
@@ -31,16 +31,17 @@ impl GraphBuilder {
             graph: ComputeGraph::default(),
             seq_ids: None,
             attn_span: None,
-            multi_seq: false,
+            explicit_span: false,
         }
     }
 
-    /// Declare that this graph's attention spans more than one sequence (E1).
-    /// Must be called before the first `attn`/fused-attention node, since it is
-    /// part of the op the builder emits; the model builders pass
-    /// `params.n_seqs > 1`.
-    pub fn set_multi_seq(&mut self, on: bool) {
-        self.multi_seq = on;
+    /// Declare that this graph's attention must read the explicit span (E1/E2):
+    /// the batch spans more than one sequence, or a window does not start at
+    /// cell 0. Must be called before the first `attn`/fused-attention node, since
+    /// it is part of the op the builder emits; the model builders pass
+    /// `params.cparams.explicit_span`.
+    pub fn set_explicit_span(&mut self, on: bool) {
+        self.explicit_span = on;
     }
 
     /// The per-query sequence-id input, created on first call.
@@ -392,7 +393,7 @@ impl GraphBuilder {
             "attn",
             Op::Attn {
                 mode,
-                multi_seq: self.multi_seq,
+                explicit_span: self.explicit_span,
             },
             &[q, kv, pos, span],
             [meta.n_head * meta.hd, nt, 1, 1],

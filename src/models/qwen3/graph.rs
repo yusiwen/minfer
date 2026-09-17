@@ -52,10 +52,11 @@ impl Qwen3Graph {
         let mut b = crate::graph::builder::GraphBuilder::new();
 
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
-        // E1: a batch with more than one sequence cannot bound attention from
-        // positions, so the attention nodes carry the flag and a backend that has
-        // not been ported refuses them instead of deriving a wrong window.
-        b.set_multi_seq(params.n_seqs > 1);
+        // E1/E2: when positions cannot bound a query's window (several
+        // sequences, or a window that does not start at cell 0) the attention
+        // nodes carry the flag, so a backend still deriving the bound refuses
+        // them instead of using a wrong window.
+        b.set_explicit_span(params.cparams.explicit_span);
 
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
@@ -361,7 +362,52 @@ impl Qwen3Graph {
         n_ctx: usize,
         cache: &mut GraphCache,
     ) -> Vec<f32> {
-        let nt = tokens.len();
+        // The classic single-sequence forward IS a one-sequence batch (E2).
+        Self::forward_batch(
+            model,
+            &crate::graph::batch::Batch::single(tokens, positions),
+            n_out,
+            n_ctx,
+            cache,
+        )
+    }
+
+    /// One forward over a batch: `nt` query tokens belonging to `n_seqs`
+    /// sequences, each attending only to its own KV cells (Phase E / E2).
+    ///
+    /// `n_out` keeps its single-sequence meaning (the last `n_out` rows); a
+    /// multi-sequence batch returns one logits row per sequence instead, in
+    /// batch order (`Batch::out_rows`).
+    pub fn forward_batch(
+        model: &Qwen3Model,
+        batch: &crate::graph::batch::Batch,
+        n_out: usize,
+        n_ctx: usize,
+        cache: &mut GraphCache,
+    ) -> Vec<f32> {
+        if let Err(e) = batch.check() {
+            panic!("forward_batch: {e}");
+        }
+        let tokens = &batch.tokens;
+        let positions = &batch.positions;
+        let nt = batch.len();
+        let n_seqs = batch.n_seqs();
+        let out_rows = batch.out_rows(n_out);
+        let n_out = out_rows.len();
+        // E2: whether the causal (positions-based) attention instantiation is
+        // exact for this batch, taken from the KV reservations — the authority on
+        // where each sequence's window starts — so no caller can get it wrong.
+        // One sequence starting at cell 0 keeps the classic path; a second
+        // sequence, or a non-zero start, takes the explicit span.
+        let explicit_span = {
+            let mut need = n_seqs > 1;
+            for (seq, _, _) in batch.groups() {
+                if cache.alloc().kv_seq_slot(seq).map(|s| s.start).unwrap_or(0) != 0 {
+                    need = true;
+                }
+            }
+            need
+        };
         debug_assert!(n_out <= nt);
         if let Some(&maxp) = positions.iter().max() {
             assert!(
@@ -384,7 +430,7 @@ impl Qwen3Graph {
         let cuda_on = false;
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs: 1,
+            n_seqs,
             n_out,
             gtype: if nt == 1 {
                 GraphType::Decode
@@ -394,6 +440,7 @@ impl Qwen3Graph {
             cparams: CParams {
                 n_ctx,
                 flash_attn: false,
+                explicit_span,
                 gpu: metal_on || cuda_on,
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
                 // + no-bias rope+store) is part of the topology; the env toggle
@@ -465,20 +512,19 @@ impl Qwen3Graph {
         // E1: one sequence today (batch composition is E2). The allocator
         // resolves each query's allowed cells from the cell store, so the IR's
         // seq ids and the kernel's window cannot disagree.
-        // Phase C / C2 + E1: record how far the KV store writes and resolve the
-        // attention spans in one call (one sequence today; batch composition is
-        // E2). Both are data, so the graph and its reuse identity are untouched.
-        let seq_ids = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+        // Phase C / C2 + E1 + E2: mark each sequence's written rows, fill the
+        // sequence ids and resolve every query's attention span from the cell
+        // store — one call, so the ids and the kernels' windows cannot disagree.
+        // All of it is data, so the graph and its reuse identity are untouched.
         alloc
-            .fill_attn_inputs(graph, &seq_ids, &pos)
-            .unwrap_or_else(|e| panic!("attn inputs: {e}"));
+            .fill_batch_inputs(graph, batch)
+            .unwrap_or_else(|e| panic!("batch inputs: {e}"));
         if graph
             .inputs
             .iter()
             .any(|&i| graph.node(i).name == "tail_ids")
         {
-            let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
-            alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
+            alloc.fill_input_i32(graph, "tail_ids", &out_rows).unwrap();
         }
         if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
             if let Some(idsbuf) = graph
@@ -907,6 +953,7 @@ mod tests {
                 cparams: CParams {
                     n_ctx,
                     flash_attn: false,
+                    explicit_span: false,
                     gpu: true,
                     fuse_qkv: true,
                     fuse_ffn: false,
@@ -1097,6 +1144,7 @@ mod tests {
                 cparams: CParams {
                     n_ctx: 512,
                     flash_attn: false,
+                    explicit_span: false,
                     gpu: true,
                     fuse_qkv: false,
                     fuse_ffn: false,

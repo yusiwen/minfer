@@ -284,7 +284,7 @@ it stops at the single-sequence append-only case. What is missing:
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
 | Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
-| Multi-sequence attention masks | ✔ **E1 + E1b**: the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations (compile-verified — no device here). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
+| Multi-sequence attention masks | ✔ **E1 + E1b + E2**: the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations (compile-verified — no device here). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four
 separate user-visible capabilities at once: multi-slot serving throughput,

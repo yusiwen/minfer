@@ -54,10 +54,11 @@ impl Qwen2Graph {
         let mut b = crate::graph::builder::GraphBuilder::new();
 
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
-        // E1: a batch with more than one sequence cannot bound attention from
-        // positions, so the attention nodes carry the flag and a backend that has
-        // not been ported refuses them instead of deriving a wrong window.
-        b.set_multi_seq(params.n_seqs > 1);
+        // E1/E2: when positions cannot bound a query's window (several
+        // sequences, or a window that does not start at cell 0) the attention
+        // nodes carry the flag, so a backend still deriving the bound refuses
+        // them instead of using a wrong window.
+        b.set_explicit_span(params.cparams.explicit_span);
 
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
@@ -416,7 +417,52 @@ impl Qwen2Graph {
         n_ctx: usize,
         cache: &mut GraphCache,
     ) -> Vec<f32> {
-        let nt = tokens.len();
+        // The classic single-sequence forward IS a one-sequence batch (E2).
+        Self::forward_batch(
+            model,
+            &crate::graph::batch::Batch::single(tokens, positions),
+            n_out,
+            n_ctx,
+            cache,
+        )
+    }
+
+    /// One forward over a batch: `nt` query tokens belonging to `n_seqs`
+    /// sequences, each attending only to its own KV cells (Phase E / E2).
+    ///
+    /// `n_out` keeps its single-sequence meaning (the last `n_out` rows); a
+    /// multi-sequence batch returns one logits row per sequence instead, in
+    /// batch order (`Batch::out_rows`).
+    pub fn forward_batch(
+        model: &Qwen2Model,
+        batch: &crate::graph::batch::Batch,
+        n_out: usize,
+        n_ctx: usize,
+        cache: &mut GraphCache,
+    ) -> Vec<f32> {
+        if let Err(e) = batch.check() {
+            panic!("forward_batch: {e}");
+        }
+        let tokens = &batch.tokens;
+        let positions = &batch.positions;
+        let nt = batch.len();
+        let n_seqs = batch.n_seqs();
+        let out_rows = batch.out_rows(n_out);
+        let n_out = out_rows.len();
+        // E2: whether the causal (positions-based) attention instantiation is
+        // exact for this batch, taken from the KV reservations — the authority on
+        // where each sequence's window starts — so no caller can get it wrong.
+        // One sequence starting at cell 0 keeps the classic path; a second
+        // sequence, or a non-zero start, takes the explicit span.
+        let explicit_span = {
+            let mut need = n_seqs > 1;
+            for (seq, _, _) in batch.groups() {
+                if cache.alloc().kv_seq_slot(seq).map(|s| s.start).unwrap_or(0) != 0 {
+                    need = true;
+                }
+            }
+            need
+        };
         debug_assert!(n_out <= nt);
         // Out-of-range positions would write past the KV regions (which are
         // sized n_kv_embd * n_ctx): fail loudly instead of corrupting memory.
@@ -445,7 +491,7 @@ impl Qwen2Graph {
         let cuda_on = false;
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs: 1,
+            n_seqs,
             n_out,
             gtype: if nt == 1 {
                 GraphType::Decode
@@ -455,6 +501,7 @@ impl Qwen2Graph {
             cparams: CParams {
                 n_ctx,
                 flash_attn: false,
+                explicit_span,
                 gpu: metal_on || cuda_on,
                 // G4/G5: decode fusions are part of the topology — the env
                 // toggles force a rebuild so they can be A/B'd reliably.
@@ -543,13 +590,13 @@ impl Qwen2Graph {
         // E1: one sequence today (batch composition is E2). The allocator
         // resolves each query's allowed cells from the cell store, so the IR's
         // seq ids and the kernel's window cannot disagree.
-        // Phase C / C2 + E1: record how far the KV store writes and resolve the
-        // attention spans in one call (one sequence today; batch composition is
-        // E2). Both are data, so the graph and its reuse identity are untouched.
-        let seq_ids = vec![crate::graph::kvcache::SEQ_MAIN; nt];
+        // Phase C / C2 + E1 + E2: mark each sequence's written rows, fill the
+        // sequence ids and resolve every query's attention span from the cell
+        // store — one call, so the ids and the kernels' windows cannot disagree.
+        // All of it is data, so the graph and its reuse identity are untouched.
         alloc
-            .fill_attn_inputs(graph, &seq_ids, &pos)
-            .unwrap_or_else(|e| panic!("attn inputs: {e}"));
+            .fill_batch_inputs(graph, batch)
+            .unwrap_or_else(|e| panic!("batch inputs: {e}"));
         // G3: the last-layer tail-row reduction reads `tail_ids` (filled when
         // the graph was built with n_out < nt, i.e. prefill)
         if graph
@@ -557,8 +604,7 @@ impl Qwen2Graph {
             .iter()
             .any(|&i| graph.node(i).name == "tail_ids")
         {
-            let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
-            alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
+            alloc.fill_input_i32(graph, "tail_ids", &out_rows).unwrap();
         }
         if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
             if let Some(idsbuf) = graph
@@ -838,6 +884,15 @@ mod tests {
         }
     }
 
+    /// Max |Δ| between two equal-length logit vectors.
+    fn max_delta(x: &[f32], y: &[f32]) -> f32 {
+        assert_eq!(x.len(), y.len(), "compared vectors must have equal length");
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    }
+
     fn argmax(x: &[f32]) -> u32 {
         let mut best = 0usize;
         for i in 1..x.len() {
@@ -1014,6 +1069,143 @@ mod tests {
             "prefix reuse changed the logits (max |Δ| = {worst}, head {} tail {})",
             head.len(),
             tail.len()
+        );
+    }
+
+    /// E2's evidence gate: a forward carrying two sequences must equal running
+    /// those sequences one at a time, **bitwise** — the prefill (both prompts in
+    /// one forward) and a decode step (one token each).
+    ///
+    /// Both sides use the *same* KV layout — one arena, sequence 7 reserved at
+    /// `[0, la)` and sequence 9 at `[la, la + lb)` — so the only difference is
+    /// whether one forward carries two sequences or two forwards carry one each.
+    /// The batched side takes the windowed attention path
+    /// (`Op::Attn { explicit_span: true }`), where sequence 9's window starts at
+    /// `la`; equal logits mean the windows are per-sequence and the KV rows do
+    /// not leak.
+    #[test]
+    fn a_two_sequence_batch_matches_two_single_sequence_forwards() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the batch test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let nv = model.n_vocab();
+        let a = tok.encode("The capital of France is");
+        let b = tok.encode("The capital of Japan is");
+        let (la, lb) = (a.len(), b.len());
+        let (s7, s9) = (7u32, 9u32);
+
+        // The layout both sides use: two reserved runs, deterministic placement.
+        let layout = |cache: &mut GraphCache| -> (usize, usize) {
+            cache.alloc().kv_set_capacity(n_ctx);
+            let r7 = cache.alloc().kv_reserve_seq(s7, la + 4).expect("reserve 7");
+            let r9 = cache.alloc().kv_reserve_seq(s9, lb + 4).expect("reserve 9");
+            (r7.start, r9.start)
+        };
+
+        // ---- batched: both sequences, one forward per step ----
+        let mut batched = GraphCache::new();
+        let (p7, p9) = layout(&mut batched);
+        let pos7: Vec<usize> = (p7..p7 + la).collect();
+        let pos9: Vec<usize> = (p9..p9 + lb).collect();
+
+        let mut tokens = a.clone();
+        tokens.extend_from_slice(&b);
+        let mut positions = pos7.clone();
+        positions.extend_from_slice(&pos9);
+        let mut seq_ids = vec![s7; la];
+        seq_ids.extend(std::iter::repeat(s9).take(lb));
+        let l_pre = model.forward_batch(
+            &Batch::new(tokens, positions, seq_ids),
+            1,
+            n_ctx,
+            &mut batched,
+        );
+        assert_eq!(l_pre.len(), 2 * nv, "one logits row per sequence");
+        let (pre7, pre9) = (l_pre[..nv].to_vec(), l_pre[nv..].to_vec());
+
+        let (t7, t9) = (argmax(&pre7), argmax(&pre9));
+        let l_step = model.forward_batch(
+            &Batch::new(vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9]),
+            1,
+            n_ctx,
+            &mut batched,
+        );
+        assert_eq!(l_step.len(), 2 * nv);
+
+        // ---- reference: the same layout, one sequence per forward ----
+        let mut ref7 = GraphCache::new();
+        let (q7, _) = layout(&mut ref7);
+        assert_eq!(q7, p7, "the reference must place sequence 7 identically");
+        let r_pre7 = model.forward_batch(
+            &Batch::new(a.clone(), pos7.clone(), vec![s7; la]),
+            1,
+            n_ctx,
+            &mut ref7,
+        );
+        let r_next7 = model.forward_batch(
+            &Batch::new(vec![t7], vec![p7 + la], vec![s7]),
+            1,
+            n_ctx,
+            &mut ref7,
+        );
+        assert_eq!(r_pre7.len(), nv);
+        assert_eq!(r_next7.len(), nv);
+
+        let mut ref9 = GraphCache::new();
+        let (_, q9) = layout(&mut ref9);
+        assert_eq!(q9, p9, "the reference must place sequence 9 identically");
+        let r_pre9 = model.forward_batch(
+            &Batch::new(b.clone(), pos9.clone(), vec![s9; lb]),
+            1,
+            n_ctx,
+            &mut ref9,
+        );
+        let r_next9 = model.forward_batch(
+            &Batch::new(vec![t9], vec![p9 + lb], vec![s9]),
+            1,
+            n_ctx,
+            &mut ref9,
+        );
+
+        // ---- bitwise, on all four comparisons ----
+        assert_eq!(
+            max_delta(&pre7, &r_pre7),
+            0.0,
+            "batched prefill of sequence {s7} diverged"
+        );
+        assert_eq!(
+            max_delta(&pre9, &r_pre9),
+            0.0,
+            "batched prefill of sequence {s9} diverged"
+        );
+        assert_eq!(
+            max_delta(&l_step[..nv], &r_next7),
+            0.0,
+            "batched decode of sequence {s7} diverged"
+        );
+        assert_eq!(
+            max_delta(&l_step[nv..], &r_next9),
+            0.0,
+            "batched decode of sequence {s9} diverged"
+        );
+        // The fixture must discriminate: two sequences in one forward must not
+        // collapse onto the same answer.
+        assert_ne!(
+            argmax(&l_step[..nv]),
+            argmax(&l_step[nv..]),
+            "both sequences produced the same argmax - the fixture is not discriminating"
         );
     }
 
@@ -1307,6 +1499,7 @@ mod tests {
                 cparams: CParams {
                     n_ctx,
                     flash_attn: false,
+                    explicit_span: false,
                     gpu: false,
                     fuse_qkv: false,
                     fuse_ffn: false,
@@ -1357,6 +1550,7 @@ mod tests {
                 cparams: CParams {
                     n_ctx,
                     flash_attn: false,
+                    explicit_span: false,
                     gpu: false,
                     fuse_qkv: false,
                     fuse_ffn: false,
@@ -1956,6 +2150,7 @@ mod tail_tests {
                 cparams: CParams {
                     n_ctx: 4096,
                     flash_attn: false,
+                    explicit_span: false,
                     gpu: false,
                     fuse_qkv: false,
                     fuse_ffn: false,
@@ -2136,6 +2331,7 @@ mod tail_tests {
                     cparams: CParams {
                         n_ctx,
                         flash_attn: false,
+                        explicit_span: false,
                         gpu: true,
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,
@@ -2210,6 +2406,7 @@ mod tail_tests {
                     cparams: CParams {
                         n_ctx: 4096,
                         flash_attn: false,
+                        explicit_span: false,
                         gpu: true,
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,

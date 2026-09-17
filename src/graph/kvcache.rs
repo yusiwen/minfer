@@ -84,6 +84,18 @@ impl KvCache {
         }
     }
 
+    /// Arena capacity in rows (`n_ctx`), 0 before the first `insert`.
+    pub fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+
+    /// Declare the arena's row capacity up front (E2). The first `alloc_graph`
+    /// sets the same number from `CParams.n_ctx`; declaring it earlier lets a
+    /// caller reserve sequences before the first forward, which batching needs.
+    pub fn set_n_ctx(&mut self, n_ctx: usize) {
+        self.n_ctx = n_ctx;
+    }
+
     pub fn get(&self, layer: usize) -> Option<&KvLayer> {
         self.layers.get(&layer)
     }

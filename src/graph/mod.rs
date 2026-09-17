@@ -7,6 +7,7 @@
 
 pub mod alloc;
 pub mod backend;
+pub mod batch;
 
 /// Whether `backend` may take `(op, dtype)`: ordinary op support **plus** E1's
 /// span capability for a multi-sequence attention node, which no positions-based
@@ -16,7 +17,7 @@ pub fn backend_takes(b: &dyn backend::Backend, op: &ops::Op, dtype: DType) -> bo
     let span_ok = !matches!(
         op,
         ops::Op::Attn {
-            multi_seq: true,
+            explicit_span: true,
             ..
         }
     ) || b.supports_attn_span();
