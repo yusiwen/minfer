@@ -86,8 +86,13 @@ pub enum Op {
     },
 
     // ---- attention ----
+    /// Attention. `multi_seq` is set when the batch covers more than one
+    /// sequence: `positions` alone cannot bound a query's window then, so a
+    /// backend that has not been ported to the explicit span input must refuse
+    /// the op (`Backend::supports_attn_span`) instead of deriving a wrong bound.
     Attn {
         mode: AttnMode,
+        multi_seq: bool,
     },
 
     // ---- KV cache (persistent external buffer; positions are data) ----

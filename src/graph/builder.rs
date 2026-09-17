@@ -14,13 +14,54 @@ use super::{CNode, ComputeGraph, DType, NodeId};
 
 pub struct GraphBuilder {
     graph: ComputeGraph,
+    /// E1: the per-query sequence ids / allowed cell spans. Created on first use
+    /// (one node for the whole graph, however many layers call `attn`) and filled
+    /// per step by the allocator, like `positions`.
+    seq_ids: Option<NodeId>,
+    attn_span: Option<NodeId>,
+    /// Whether this graph's attention covers more than one sequence — set from
+    /// `GraphParams.n_seqs` by the model builders. Recorded in the op so a
+    /// backend that still derives its bound from positions refuses it.
+    multi_seq: bool,
 }
 
 impl GraphBuilder {
     pub fn new() -> Self {
         Self {
             graph: ComputeGraph::default(),
+            seq_ids: None,
+            attn_span: None,
+            multi_seq: false,
         }
+    }
+
+    /// Declare that this graph's attention spans more than one sequence (E1).
+    /// Must be called before the first `attn`/fused-attention node, since it is
+    /// part of the op the builder emits; the model builders pass
+    /// `params.n_seqs > 1`.
+    pub fn set_multi_seq(&mut self, on: bool) {
+        self.multi_seq = on;
+    }
+
+    /// The per-query sequence-id input, created on first call.
+    fn seq_ids_input(&mut self, nt: usize) -> NodeId {
+        if let Some(id) = self.seq_ids {
+            return id;
+        }
+        let id = self.input("seq_ids", [nt, 1, 1, 1], DType::I32);
+        self.seq_ids = Some(id);
+        id
+    }
+
+    /// The per-query allowed-cell-span input, created on first call: `lo` of
+    /// token `t` at `[t]`, `hi` at `[nt + t]`.
+    fn attn_span_input(&mut self, nt: usize) -> NodeId {
+        if let Some(id) = self.attn_span {
+            return id;
+        }
+        let id = self.input("attn_span", [2 * nt, 1, 1, 1], DType::I32);
+        self.attn_span = Some(id);
+        id
     }
 
     /// Create an operator node; returns its id.
@@ -325,6 +366,14 @@ impl GraphBuilder {
     /// Attention over a KV region produced by `kvcache_load`. `pos` carries the
     /// per-token write positions (I32 input), needed for causal masking
     /// (`vl = pos[t]+1`). Output shape = q shape.
+    /// Attention over the cells the `attn_span` input names.
+    ///
+    /// Inputs are `[q, kv, pos, span]`: the span (index 3) is the bound E1 makes
+    /// explicit, and `positions` stays at index 2 because the Metal and CUDA arms
+    /// still read it there — they derive the bound host-side/on device and are
+    /// refused a multi-sequence node until their port lands
+    /// (`Backend::supports_attn_span`). The span and seq-id inputs are created on
+    /// first use and filled per step.
     pub fn attn(
         &mut self,
         q: NodeId,
@@ -337,10 +386,15 @@ impl GraphBuilder {
         // input may be a larger fused concat buffer (G4 FusedQKV carries
         // q|k|v), so the output shape comes from the meta, not from q.
         let nt = self.graph.nodes[q].out_shape[1];
+        let span = self.attn_span_input(nt);
+        self.seq_ids_input(nt);
         self.node(
             "attn",
-            Op::Attn { mode },
-            &[q, kv, pos],
+            Op::Attn {
+                mode,
+                multi_seq: self.multi_seq,
+            },
+            &[q, kv, pos, span],
             [meta.n_head * meta.hd, nt, 1, 1],
             DType::F32,
             NodeMeta::Attn(meta),

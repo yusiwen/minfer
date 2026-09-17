@@ -67,6 +67,7 @@ three implementations — keep it in step with them.
 | `MatMul` | ✅ | ✅ | ✅ |
 | `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
 | `Attn` | ✅ | ✅ | ✅ |
+| `Attn` with `multi_seq` (explicit span) | ✅ | ❌ | ❌ — Metal and CUDA still derive the bound from `positions`; E1b ports CUDA |
 | `KvcacheStore` | ✅ | ✅ | ✅ |
 | `SwiGLU` (fused) | ✅ | ✅ | ✅ |
 | `RoPE` non-interleaved | ✅ | ✅ | ✅ |

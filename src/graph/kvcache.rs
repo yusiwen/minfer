@@ -217,6 +217,91 @@ impl KvCache {
     pub fn after_shift(&mut self, drop: usize) -> Result<usize, String> {
         self.after_rm(0, drop)
     }
+
+    /// The cell range a sequence owns in `layer`, as `(start, len)`; `None` when
+    /// it owns nothing.
+    ///
+    /// Ownership is contiguous by construction — a sequence's cells are written
+    /// in position order and a removal slides the survivors down (C2) — so one
+    /// range describes it completely. A gap is a bug rather than a supported
+    /// layout, and this returns `Err` instead of letting attention bound itself
+    /// to the wrong window; a per-cell mask is what a hole-creating layout would
+    /// need (C3/D1).
+    pub fn seq_range(&self, layer: usize, seq: SeqId) -> Result<Option<(usize, usize)>, String> {
+        let l = self
+            .layers
+            .get(&layer)
+            .ok_or_else(|| format!("no KV arena for layer {layer}"))?;
+        let mut start: Option<usize> = None;
+        let mut end = 0usize;
+        for (cell, &owner) in l.owner.iter().enumerate() {
+            if owner != seq {
+                continue;
+            }
+            match start {
+                None => start = Some(cell),
+                Some(_) if cell != end => {
+                    return Err(format!(
+                        "KV layer {layer}: sequence {seq} owns cell {cell} after {end} — \
+                         non-contiguous ownership, which a range cannot describe"
+                    ))
+                }
+                Some(_) => {}
+            }
+            end = cell + 1;
+        }
+        Ok(start.map(|s| (s, end - s)))
+    }
+
+    /// Resolve each query token's allowed cell range into the `attn_span` input
+    /// layout: `lo` of token `t` at `span[t]`, `hi` at `span[n + t]`.
+    ///
+    /// `seq_ids[t]` names the sequence query `t` belongs to; `positions[t]` is
+    /// its write position, i.e. a cell index. The start comes from ownership and
+    /// **not** from the position (that is the point of E1); the position only
+    /// truncates the end, because a token may not attend to cells written after
+    /// it.
+    ///
+    /// Every layer owns the same cells — all mutations go through this store —
+    /// so the first layer resolves and a debug assertion checks the rest agree.
+    pub fn attn_span(&self, seq_ids: &[u32], positions: &[usize]) -> Result<Vec<u32>, String> {
+        let n = seq_ids.len();
+        if positions.len() != n {
+            return Err(format!(
+                "attn_span: {} sequence ids but {} positions",
+                n,
+                positions.len()
+            ));
+        }
+        let layer = *self
+            .layers
+            .keys()
+            .next()
+            .ok_or("attn_span: no KV arena allocated")?;
+        let mut span = vec![0u32; 2 * n];
+        for t in 0..n {
+            let seq = seq_ids[t];
+            let (start, len) = self.seq_range(layer, seq)?.ok_or_else(|| {
+                format!("attn_span: query {t} belongs to sequence {seq}, which owns no KV cells")
+            })?;
+            let hi = (start + len).min(positions[t] + 1);
+            if hi <= start {
+                return Err(format!(
+                    "attn_span: query {t} (sequence {seq}, position {}) has an empty window \
+                     [{start}, {hi})",
+                    positions[t]
+                ));
+            }
+            span[t] = start as u32;
+            span[n + t] = hi as u32;
+        }
+        let first = self.layers.values().next().map(|l| l.n_used);
+        debug_assert!(
+            self.layers.values().all(|l| Some(l.n_used) == first),
+            "KV layers disagree about how much is written"
+        );
+        Ok(span)
+    }
 }
 
 /// RoPE parameters a KV shift needs to re-rope the stored K rows.
@@ -398,6 +483,73 @@ mod tests {
             assert!(l.owner.iter().all(|&o| o == FREE));
         }
         assert!(c.is_identity(), "a physical removal keeps cell == pos");
+    }
+
+    /// E1: a single sequence's window is the one positions used to derive —
+    /// `[0, pos + 1)` — which is why the kernel change stays bitwise.
+    #[test]
+    fn a_single_sequence_resolves_to_the_causal_window() {
+        let mut c = cache(8);
+        c.own_prefix(SEQ_MAIN, 4);
+        c.note_written(0, &[0, 1, 2, 3]);
+        // Query at position 2 may see cells 0..3; the last query sees 0..4.
+        assert_eq!(
+            c.attn_span(&[SEQ_MAIN, SEQ_MAIN], &[2, 3]).unwrap(),
+            vec![0, 0, 3, 4],
+            "lo row then hi row"
+        );
+    }
+
+    /// E1's acceptance at the store level: two sequences in one arena get two
+    /// disjoint windows, so no query can see the other's cells.
+    #[test]
+    fn two_sequences_resolve_to_disjoint_windows() {
+        let mut c = cache(8);
+        // Sequence 1 owns cells 0..3, sequence 2 owns cells 3..6. Ownership is
+        // written through the same method for every layer, as the allocator's
+        // `own_prefix`/`after_rm` do.
+        c.own_prefix(SEQ_MAIN, 3);
+        for cell in 3..6 {
+            for layer in [0usize, 1] {
+                c.set_owner(layer, cell, 1).unwrap();
+            }
+        }
+        assert_eq!(c.seq_range(0, SEQ_MAIN).unwrap(), Some((0, 3)));
+        assert_eq!(c.seq_range(0, 1).unwrap(), Some((3, 3)));
+        assert_eq!(c.seq_range(1, 1).unwrap(), Some((3, 3)), "layers agree");
+        // A token of each sequence, each at its own last position.
+        let span = c.attn_span(&[SEQ_MAIN, 1], &[2, 5]).unwrap();
+        assert_eq!(&span[..2], &[0, 3], "starts are each sequence's own");
+        assert_eq!(&span[2..], &[3, 6], "ends are exclusive and causal");
+        // The windows do not overlap: sequence 2 never sees cells 0..3.
+        assert!(
+            span[2] >= span[1],
+            "sequence 2's window starts where sequence 1's ends"
+        );
+    }
+
+    /// A layout the resolver cannot describe must be loud, not a wrong bound.
+    #[test]
+    fn ownership_gaps_and_empty_windows_are_errors() {
+        let mut c = cache(8);
+        c.set_owner(0, 0, SEQ_MAIN).unwrap();
+        c.set_owner(0, 2, SEQ_MAIN).unwrap(); // cell 1 belongs to nobody
+        let err = c.seq_range(0, SEQ_MAIN).unwrap_err();
+        assert!(err.contains("non-contiguous"), "got: {err}");
+        let err = c.attn_span(&[SEQ_MAIN], &[2]).unwrap_err();
+        assert!(err.contains("non-contiguous"), "got: {err}");
+
+        // A query whose sequence owns nothing has no window at all.
+        let mut c = cache(8);
+        c.set_owner(0, 0, SEQ_MAIN).unwrap();
+        let err = c.attn_span(&[1], &[0]).unwrap_err();
+        assert!(err.contains("owns no KV cells"), "got: {err}");
+
+        // A query at a position before its sequence's cells is empty too.
+        let mut c = cache(8);
+        c.note_written(0, &[3]);
+        let err = c.attn_span(&[SEQ_MAIN], &[2]).unwrap_err();
+        assert!(err.contains("empty window"), "got: {err}");
     }
 
     /// A shift must reproduce "the same tokens, roped at their new positions".

@@ -105,6 +105,12 @@ impl Backend for CpuBackend {
         matches!(fused, FusedOp::SwiGLU)
     }
 
+    fn supports_attn_span(&self) -> bool {
+        // E1: the CPU attention kernel reads `attn_span` (the window the KV
+        // store resolved), so it can take a multi-sequence attention node.
+        true
+    }
+
     fn alloc_buffer(&mut self, size: usize) -> usize {
         if let Some(idx) = self
             .free
@@ -416,20 +422,40 @@ impl Backend for CpuBackend {
                     &after[v_id - out_buf - 1]
                 };
                 let n_ctx = k_slice.len() / nkt;
-                // current KV size = max position + 1
-                let nkv = (0..nt)
-                    .map(|t| ins[2][t].to_bits() as usize + 1)
-                    .max()
-                    .unwrap_or(0)
-                    .min(n_ctx);
-                let pos: Vec<usize> = (0..nt).map(|t| ins[2][t].to_bits() as usize).collect();
+                // E1: the allowed cells are an explicit input (`attn_span`), not
+                // a bound derived from `positions` — that is what lets a batch
+                // hold several sequences. The allocator resolved it from the
+                // cell store's ownership; here it is only validated.
+                let span_in = ins[3];
+                if span_in.len() != 2 * nt {
+                    return Err(format!(
+                        "attn: span input has {} values, expected {} (2 per query token)",
+                        span_in.len(),
+                        2 * nt
+                    ));
+                }
+                let span: Vec<(usize, usize)> = (0..nt)
+                    .map(|t| {
+                        (
+                            span_in[t].to_bits() as usize,
+                            span_in[nt + t].to_bits() as usize,
+                        )
+                    })
+                    .collect();
+                for (t, &(lo, hi)) in span.iter().enumerate() {
+                    if hi > n_ctx || hi <= lo {
+                        return Err(format!(
+                            "attn: query {t} has span [{lo}, {hi}) — outside the {n_ctx}-cell \
+                             arena, or empty (a span input that was never filled is all zeros)"
+                        ));
+                    }
+                }
                 cpu_gqa_attn(
                     ins[0],
                     k_slice,
                     v_slice,
-                    &pos,
+                    &span,
                     nt,
-                    nkv,
                     meta.n_head,
                     meta.n_head_kv,
                     meta.hd,
@@ -509,13 +535,20 @@ pub(crate) fn cpu_rope(
 }
 
 /// GQA attention (same math as forward.rs's gqa_attn).
+/// The causal span for a single sequence, in the `attn_span` layout E1 defines:
+/// token `t` may see the cells `[0, pos[t] + 1)`. Test/reference helper — the
+/// model path resolves the span from the KV store's ownership instead.
+#[allow(dead_code)]
+pub fn causal_span(pos: &[usize]) -> Vec<(usize, usize)> {
+    pos.iter().map(|&p| (0, p + 1)).collect()
+}
+
 pub(crate) fn cpu_gqa_attn(
     q: &[f32],
     ka: &[f32],
     va: &[f32],
-    pos: &[usize],
+    span: &[(usize, usize)],
     nt: usize,
-    nkv: usize,
     nh: usize,
     nk: usize,
     hd: usize,
@@ -534,13 +567,20 @@ pub(crate) fn cpu_gqa_attn(
     // Each worker computes its own head range with a private scores buffer,
     // so the output is bit-identical to the single-threaded order (no
     // cross-head reduction).
+    if span.len() != nt {
+        return Err(format!(
+            "attention: {} spans for {nt} query tokens",
+            span.len()
+        ));
+    }
+    let max_vl = span.iter().map(|&(lo, hi)| hi.saturating_sub(lo)).max();
     let ctx = AttnCtx {
         q: q.as_ptr(),
         ka: ka.as_ptr(),
         va: va.as_ptr(),
-        pos: pos.as_ptr(),
+        span: span.as_ptr(),
         nt,
-        nkv,
+        max_vl: max_vl.unwrap_or(0),
         nh,
         hk: nk,
         hd,
@@ -562,9 +602,11 @@ struct AttnCtx {
     q: *const f32,
     ka: *const f32,
     va: *const f32,
-    pos: *const usize,
+    /// Per-query allowed cell range `[lo, hi)` (E1).
+    span: *const (usize, usize),
     nt: usize,
-    nkv: usize,
+    /// Longest window in the batch: sizes the per-head score scratch.
+    max_vl: usize,
     nh: usize,
     hk: usize,
     hd: usize,
@@ -575,40 +617,43 @@ struct AttnCtx {
 }
 
 /// Compute attention for heads [h0, h1). SAFETY: `ctx` points to a live
-/// `AttnCtx` for the duration; each head h writes the disjoint output range
-/// out[t*ne_q + h*hd .. +hd], so concurrent calls over disjoint head ranges
-/// cannot race.
+/// `AttnCtx` (whose `span` outlives the call) for the duration; each head h
+/// writes the disjoint output range out[t*ne_q + h*hd .. +hd], so concurrent
+/// calls over disjoint head ranges cannot race.
 unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
     let c = &*(ctx as *const AttnCtx);
     let gqa = c.nh / c.hk;
     let ne_q = c.nh * c.hd;
-    let mut scrs = vec![0.0f32; c.nkv.max(1)];
+    let mut scrs = vec![0.0f32; c.max_vl.max(1)];
     for h in h0..h1 {
         let hk = h / gqa;
         for t in 0..c.nt {
             let qs = t * ne_q + h * c.hd;
-            let vl = (*c.pos.add(t) + 1).min(c.nkv);
+            let (lo, hi) = *c.span.add(t);
+            let vl = hi.saturating_sub(lo);
             let mut mx = f32::NEG_INFINITY;
-            for kv in 0..vl {
+            for (i, kv) in (lo..hi).enumerate() {
                 let ks = kv * c.nkt + hk * c.hd_kv;
                 let s = crate::vec_ops::vec_dot_f32(
                     c.hd_kv,
                     std::slice::from_raw_parts(c.q.add(qs), c.hd_kv),
                     std::slice::from_raw_parts(c.ka.add(ks), c.hd_kv),
                 ) * c.scale;
-                scrs[kv] = s;
+                scrs[i] = s;
                 if s > mx {
                     mx = s;
                 }
             }
-            // Softmax and accumulate over the token's OWN causal window `vl`
-            // rather than over the batch-wide `nkv`. Padding to `nkv` and
-            // softmaxing over it makes every reduction's *length* depend on how
-            // many tokens the batch holds, which makes a token's result depend
-            // on `nt` (measured: a 6-token and a 13-token batch diverge from
-            // layer 3 on). Restricting the window to `vl` = `pos[t] + 1` makes
-            // the numerics a function of the token alone, so incremental prefill
-            // and decode reproduce a single-shot prefill bitwise.
+            // Softmax and accumulate over the token's OWN window `[lo, hi)`, the
+            // one the span input names, rather than over a batch-wide range.
+            // Padding the reduction and softmaxing over it makes every
+            // reduction's *length* depend on how many tokens the batch holds,
+            // which makes a token's result depend on `nt` (measured: a 6-token
+            // and a 13-token batch diverge from layer 3 on). With the window a
+            // function of the token alone, incremental prefill and decode
+            // reproduce a single-shot prefill bitwise — and with one sequence
+            // the window is exactly `[0, pos + 1)`, which is what the old
+            // derivation produced.
             let sm = crate::vec_ops::vec_soft_max_inplace_f32(vl, &mut scrs, mx);
             let is = (1.0 / sm) as f32;
             crate::vec_ops::vec_scale_f32(vl, &mut scrs, is);
@@ -616,12 +661,12 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
             let out_slice = std::slice::from_raw_parts_mut(c.out.add(os), c.hd);
             out_slice.fill(0.0);
             let vs_base = hk * c.hd_kv;
-            for kv in 0..vl {
+            for (i, kv) in (lo..hi).enumerate() {
                 crate::vec_ops::vec_muladd_f32(
                     c.hd_kv,
                     std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
                     std::slice::from_raw_parts(c.va.add(kv * c.nkt + vs_base), c.hd_kv),
-                    scrs[kv],
+                    scrs[i],
                 );
             }
         }
@@ -816,6 +861,9 @@ mod tests {
         h.alloc.alloc_graph(&g).unwrap();
         h.alloc.fill_input_i32(&g, "token_ids", &[0, 2]).unwrap();
         h.alloc.fill_input_i32(&g, "positions", &[0, 1]).unwrap();
+        // E1: the attention window is data the graph carries, not a bound it
+        // derives — a hand-built graph fills it like the model path does.
+        h.alloc.fill_attn_inputs(&g, &[0, 0], &[0, 1]).unwrap();
         h.sched.execute(&g, &mut h.alloc).unwrap();
         let got = h.out(&g, rope);
         // reference: embed rows then rope per head
@@ -874,6 +922,7 @@ mod tests {
         // q = [1,0, 0,1], k = [1,0, 0,1], v = [0.5,0.5, 0.25,0.75] at pos 0
         h.alloc.alloc_graph(&g).unwrap();
         h.alloc.fill_input_i32(&g, "positions", &[0]).unwrap();
+        h.alloc.fill_attn_inputs(&g, &[0], &[0]).unwrap();
         h.alloc.fill_input(&g, "q", &[1.0, 0.0, 0.0, 1.0]).unwrap();
         h.alloc.fill_input(&g, "k", &[1.0, 0.0, 0.0, 1.0]).unwrap();
         h.alloc
@@ -887,6 +936,85 @@ mod tests {
         assert!((got[1] - 0.5).abs() < 1e-5, "got[1]={}", got[1]);
         assert!((got[2] - 0.25).abs() < 1e-5, "got[2]={}", got[2]);
         assert!((got[3] - 0.75).abs() < 1e-5, "got[3]={}", got[3]);
+    }
+
+    /// E1's acceptance: two sequences sharing one KV arena must not see each
+    /// other. The windows are the input, so the test supplies them directly —
+    /// the resolver that produces them is covered by `graph::kvcache`'s tests.
+    ///
+    /// The values are chosen so a leak *changes the answer*: query 1 would score
+    /// 1.0 against sequence 0's key if its window wrongly reached cell 0, which
+    /// would blend V(0) into the output instead of returning V(2).
+    #[test]
+    fn two_sequences_do_not_cross_attend() {
+        let mut h = Harness::new();
+        let mut gb = GraphBuilder::new();
+        gb.set_multi_seq(true);
+        // k/v are [nkt, nt] so the store node sizes the region as nkt * n_ctx.
+        let pos = gb.input("positions", [2, 1, 1, 1], DType::I32);
+        let q = gb.input("q", [2, 2, 1, 1], DType::F32);
+        let k = gb.input("k", [2, 2, 1, 1], DType::F32);
+        let v = gb.input("v", [2, 2, 1, 1], DType::F32);
+        let _st = gb.kvcache_store(0, k, v, pos, 4);
+        let kv = gb.kvcache_load(0, 2, 4, 1);
+        let out = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
+            super::super::ops::AttnMeta {
+                layer: 0,
+                n_head: 1,
+                n_head_kv: 1,
+                hd: 2,
+                hd_kv: 2,
+                nkt: 2,
+                scale: 1.0,
+            },
+        );
+        gb.output(out);
+        let g = gb.build();
+        // The graph must carry the multi-sequence flag: it is what stops a
+        // backend that still derives its bound from positions from taking it.
+        assert!(
+            g.nodes.iter().any(|n| matches!(
+                n.op,
+                crate::graph::ops::Op::Attn {
+                    multi_seq: true,
+                    ..
+                }
+            )),
+            "the attention node must declare multi_seq"
+        );
+
+        h.alloc.alloc_graph(&g).unwrap();
+        // Sequence 0 owns row 0, sequence 1 owns row 2 (rows 1 and 3 stay free).
+        h.alloc.fill_input_i32(&g, "positions", &[0, 2]).unwrap();
+        h.alloc.fill_input_i32(&g, "seq_ids", &[0, 1]).unwrap();
+        // The span layout is the `lo` block then the `hi` block: token 0 gets
+        // `[0, 1)` (sequence 0's only row) and token 1 `[2, 3)` (sequence 1's).
+        h.alloc
+            .fill_input_i32(&g, "attn_span", &[0, 2, 1, 3])
+            .unwrap();
+        // token 0 = [1, 0], token 1 = [1, 0]
+        h.alloc.fill_input(&g, "q", &[1.0, 0.0, 1.0, 0.0]).unwrap();
+        // row 0 = k [1, 0] / v [1, 0]; row 2 = k [0, 1] / v [0, 1]
+        h.alloc.fill_input(&g, "k", &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        h.alloc.fill_input(&g, "v", &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        h.sched.execute(&g, &mut h.alloc).unwrap();
+        let got = h.out(&g, out);
+        assert_eq!(got.len(), 4);
+        // Token 0 attends to its own row only -> V(0).
+        assert!(
+            (got[0] - 1.0).abs() < 1e-6 && got[1].abs() < 1e-6,
+            "token 0: {got:?}"
+        );
+        // Token 1 attends to its own row only -> V(2). A cross-sequence leak
+        // would show up here as roughly [0.73, 0.27].
+        assert!(
+            got[2].abs() < 1e-6 && (got[3] - 1.0).abs() < 1e-6,
+            "token 1 saw the other sequence: {got:?}"
+        );
     }
 
     /// Generic get_rows (n_out tail selection): out[t] = x[ids[t]].
