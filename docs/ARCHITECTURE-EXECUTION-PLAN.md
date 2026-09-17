@@ -591,7 +591,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real | XL |
+| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **design** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -602,6 +602,50 @@ prompt) belongs with E2's batching work.
 - **E2 acceptance:** aggregate throughput at `--n-slots 4` materially exceeds
   the serial baseline on a fixed workload; the `n_seqs` field is either real or
   deleted (closes A7 if it was kept).
+**E2 design (written before the code, 2026-09-17).** `--n-slots N` does not
+serve concurrently today: each `Slot` owns its own `GraphCache` and the worker is
+serial (`server/slot.rs`), so `N` only divides the context budget
+(`n_ctx_slot = n_ctx / n_slots`) — four slots buy nothing. E1 made the *attention*
+side sequence-aware; E2 has to make the *bookkeeping and the serving loop*
+sequence-aware:
+
+1. **`KvCache` gains reservations.** A sequence is a `SeqId` owning a contiguous
+   cell run: `reserve_seq(seq, cap)` (first-fit over free cells, `Err` when the
+   arena cannot fit it), `release_seq(seq)`, and `seq_range(seq) -> (start, cap)`
+   from the reservation rather than from a scan of `owner`. Ownership keeps its
+   C1 meaning — it marks *written* cells — and becomes per-sequence:
+   `own_range(seq, from, to)`, replacing today's `own_prefix(SEQ_MAIN, n)` which
+   would clobber a second sequence's cells.
+2. **The single-sequence path is the `cap == n_ctx` special case.** `SEQ_MAIN`
+   takes the whole arena, so `seq_range` is `(0, n_ctx)` and `attn_span` still
+   yields `[0, pos + 1)` — the existing model path stays bitwise, which is the
+   refactor's acceptance gate.
+3. **A batch is data.** `Batch { tokens, positions, seq_ids, n_out }` with
+   `n_seqs` = distinct ids; the graph is built per `(n_tokens, n_seqs)` (both
+   already in `GraphParams`), and the allocator fills `seq_ids`/`attn_span` from
+   the batch exactly as E1 does for one sequence. `n_seqs` becomes a real field
+   (it now gates the `multi_seq` op flag and the graph identity) — A7's "real or
+   deleted" question answered with *real*.
+4. **The server batches decode steps.** One shared cache for the batch; each
+   active slot holds a reservation and its token stream; one forward per step
+   carries every ready slot's next token (`nt = ready slots`, `n_seqs = ready
+   slots`), so one weight pass serves all of them. Prefill stays per-slot in this
+   increment (mixing prefill into a decode batch is E3's chunked prefill), and a
+   decode batch is capped at 16 tokens so it rides the batched split-attention
+   path on CUDA (`fa_prefill`'s tile must not span two sequences — documented in
+   E1b).
+5. **Tests and measurement.** Bitwise: a multi-sequence decode batch must equal
+   the same sequences run one at a time on the CPU reference. Resolver: two
+   reservations do not overlap, `release_seq` frees exactly its rows, `Err` when
+   the arena is full. Serving: aggregate throughput at `--n-slots 4` against the
+   same workload run serially (the ticket's acceptance), reported as a ratio with
+   the workload recorded.
+
+**Not in E2:** mixed prefill+decode batches and chunked prefill (E3), moving a
+sequence's cells when the arena fragments (C3 needs D1; E2 reserves a slot's
+budget up front and fails loudly instead), layer offload (E5), Metal (G5), and
+CUDA runtime verification (no device here).
+
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
 **E1 design (written before the code, 2026-09-17).** The bound a query may attend
