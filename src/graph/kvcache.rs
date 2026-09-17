@@ -48,6 +48,18 @@ pub struct KvLayer {
     pub n_used: usize,
 }
 
+/// A sequence's reserved cell run: cells `[start, start + cap)` (Phase E / E2).
+///
+/// A reservation is **not** ownership: it says which cells the sequence *may*
+/// write, so a query can never attend to rows its sequence has not written yet
+/// (`attn_span` still caps the window at the query's own position). Ownership
+/// (C1) marks the rows actually written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqSlot {
+    pub start: usize,
+    pub cap: usize,
+}
+
 /// The KV cell store for one allocator (one graph cache, one session).
 #[derive(Debug, Clone, Default)]
 pub struct KvCache {
@@ -55,6 +67,11 @@ pub struct KvCache {
     /// False once C2 has introduced a hole or a window, i.e. once `cell` is no
     /// longer equal to `pos` for every row in use.
     identity: bool,
+    /// Reserved runs, one per live sequence. Several sequences share one arena
+    /// through these (E2); one implicit sequence takes the whole of it.
+    seqs: BTreeMap<SeqId, SeqSlot>,
+    /// Arena capacity in rows (`n_ctx`), from the first `insert`.
+    n_ctx: usize,
 }
 
 impl KvCache {
@@ -62,6 +79,8 @@ impl KvCache {
         Self {
             layers: BTreeMap::new(),
             identity: true,
+            seqs: BTreeMap::new(),
+            n_ctx: 0,
         }
     }
 
@@ -70,6 +89,7 @@ impl KvCache {
     }
 
     pub fn insert(&mut self, layer: usize, k: BufRef, v: BufRef, elems: usize, n_ctx: usize) {
+        self.n_ctx = self.n_ctx.max(n_ctx);
         self.layers.insert(
             layer,
             KvLayer {
@@ -144,27 +164,112 @@ impl KvCache {
         Ok(())
     }
 
-    /// Take ownership of `0..n_used` for `seq` in every layer, marking the rows
-    /// written so far. C1 calls this after a prefill flushes the rows it wrote.
-    #[allow(dead_code)] // C2 surface
-    pub fn own_prefix(&mut self, seq: SeqId, n_used: usize) {
+    /// Reserve a contiguous run of `cap` cells for `seq` (E2).
+    ///
+    /// First-fit over cells no live sequence covers, so several sequences share
+    /// one arena; an existing reservation is returned unchanged when `cap` fits
+    /// in it, and `Err` (never a move) when the arena cannot hold it — moving a
+    /// sequence is C3's cell copy, which needs Phase D's views.
+    pub fn reserve_seq(&mut self, seq: SeqId, cap: usize) -> Result<SeqSlot, String> {
+        if cap == 0 {
+            return Err(format!("reserve_seq: sequence {seq} asked for 0 cells"));
+        }
+        if let Some(slot) = self.seqs.get(&seq) {
+            if slot.cap >= cap {
+                return Ok(*slot);
+            }
+            return Err(format!(
+                "reserve_seq: sequence {seq} already holds {} cells, {cap} requested (no growth)",
+                slot.cap
+            ));
+        }
+        if self.n_ctx == 0 {
+            return Err("reserve_seq: no KV arena allocated".to_string());
+        }
+        // Cells a live sequence covers, whether or not they are written yet.
+        let mut taken = vec![false; self.n_ctx];
+        for slot in self.seqs.values() {
+            for c in slot.start..(slot.start + slot.cap).min(self.n_ctx) {
+                taken[c] = true;
+            }
+        }
+        let mut run = 0usize;
+        for start in 0..self.n_ctx {
+            if taken[start] {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run == cap {
+                let slot = SeqSlot {
+                    start: start + 1 - cap,
+                    cap,
+                };
+                self.seqs.insert(seq, slot);
+                return Ok(slot);
+            }
+        }
+        Err(format!(
+            "reserve_seq: no free run of {cap} cells for sequence {seq} ({} of {} cells reserved)",
+            self.seqs.values().map(|s| s.cap).sum::<usize>(),
+            self.n_ctx
+        ))
+    }
+
+    /// Release everything `seq` reserved and owned; returns the freed capacity.
+    pub fn release_seq(&mut self, seq: SeqId) -> usize {
+        let Some(slot) = self.seqs.remove(&seq) else {
+            return 0;
+        };
         for l in self.layers.values_mut() {
-            let upto = n_used.min(l.owner.len());
-            for cell in 0..upto {
+            for cell in slot.start..(slot.start + slot.cap).min(l.owner.len()) {
+                if l.owner[cell] == seq {
+                    l.owner[cell] = FREE;
+                }
+            }
+        }
+        slot.cap
+    }
+
+    /// The run `seq` reserved, or `None` when it holds none.
+    pub fn seq_slot(&self, seq: SeqId) -> Option<SeqSlot> {
+        self.seqs.get(&seq).copied()
+    }
+
+    /// Take ownership of cells `[from, to)` for `seq` in every layer — the rows
+    /// this forward wrote. Replaces C1's `own_prefix`, which hard-coded sequence
+    /// 0 and would clobber a second sequence's cells.
+    pub fn own_range(&mut self, seq: SeqId, from: usize, to: usize) {
+        for l in self.layers.values_mut() {
+            let upto = to.min(l.owner.len());
+            for cell in from.min(upto)..upto {
                 l.owner[cell] = seq;
             }
             l.n_used = l.n_used.max(upto);
         }
     }
 
-    /// Record that `rows` were written at the given resolved cells.
-    #[allow(dead_code)] // C2 surface
-    pub fn note_written(&mut self, layer: usize, cells: &[u32]) {
+    /// The single-sequence case: reserve the whole arena for `seq` if it has no
+    /// reservation yet, then take ownership of `0..n_used`.
+    pub fn own_prefix(&mut self, seq: SeqId, n_used: usize) {
+        if !self.seqs.contains_key(&seq) {
+            let cap = self.n_ctx;
+            if let Err(e) = self.reserve_seq(seq, cap) {
+                debug_assert!(false, "own_prefix: {e}");
+                return;
+            }
+        }
+        self.own_range(seq, 0, n_used);
+    }
+
+    /// Record that `rows` were written at the given resolved cells by `seq`.
+    #[allow(dead_code)] // E2 surface (per-token writes)
+    pub fn note_written(&mut self, seq: SeqId, layer: usize, cells: &[u32]) {
         if let Some(l) = self.layers.get_mut(&layer) {
             for &c in cells {
                 let c = c as usize;
                 if c < l.owner.len() {
-                    l.owner[c] = SEQ_MAIN;
+                    l.owner[c] = seq;
                     l.n_used = l.n_used.max(c + 1);
                 }
             }
@@ -193,6 +298,15 @@ impl KvCache {
     /// empties the arena; removing past the end is an error, not a silent
     /// truncation.
     pub fn after_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
+        // A physical removal moves cells, which would invalidate the other
+        // sequences' reservations. C2 is the single-sequence sliding window:
+        // refuse the rest loudly rather than shift someone else's rows.
+        if self.seqs.keys().any(|&s| s != SEQ_MAIN) {
+            return Err(
+                "after_rm: a context shift is single-sequence; release the other sequences first"
+                    .to_string(),
+            );
+        }
         let mut new_used = 0usize;
         for (layer, l) in self.layers.iter_mut() {
             if start + len > l.n_used {
@@ -228,29 +342,10 @@ impl KvCache {
     /// to the wrong window; a per-cell mask is what a hole-creating layout would
     /// need (C3/D1).
     pub fn seq_range(&self, layer: usize, seq: SeqId) -> Result<Option<(usize, usize)>, String> {
-        let l = self
-            .layers
-            .get(&layer)
-            .ok_or_else(|| format!("no KV arena for layer {layer}"))?;
-        let mut start: Option<usize> = None;
-        let mut end = 0usize;
-        for (cell, &owner) in l.owner.iter().enumerate() {
-            if owner != seq {
-                continue;
-            }
-            match start {
-                None => start = Some(cell),
-                Some(_) if cell != end => {
-                    return Err(format!(
-                        "KV layer {layer}: sequence {seq} owns cell {cell} after {end} — \
-                         non-contiguous ownership, which a range cannot describe"
-                    ))
-                }
-                Some(_) => {}
-            }
-            end = cell + 1;
+        if !self.layers.contains_key(&layer) {
+            return Err(format!("no KV arena for layer {layer}"));
         }
-        Ok(start.map(|s| (s, end - s)))
+        Ok(self.seqs.get(&seq).map(|s| (s.start, s.cap)))
     }
 
     /// Resolve each query token's allowed cell range into the `attn_span` input
@@ -278,20 +373,29 @@ impl KvCache {
             .keys()
             .next()
             .ok_or("attn_span: no KV arena allocated")?;
+        let owner = &self
+            .layers
+            .get(&layer)
+            .ok_or_else(|| format!("no KV arena for layer {layer}"))?
+            .owner;
         let mut span = vec![0u32; 2 * n];
         for t in 0..n {
             let seq = seq_ids[t];
-            let (start, len) = self.seq_range(layer, seq)?.ok_or_else(|| {
-                format!("attn_span: query {t} belongs to sequence {seq}, which owns no KV cells")
+            let slot = self.seqs.get(&seq).ok_or_else(|| {
+                format!("attn_span: query {t} belongs to sequence {seq}, which holds no cells")
             })?;
-            let hi = (start + len).min(positions[t] + 1);
-            if hi <= start {
+            let (start, cap) = (slot.start, slot.cap);
+            let pos = positions[t];
+            // The query's own row must have been written by this sequence: a
+            // window that included rows nobody wrote would attend to zeroes.
+            if pos < start || pos >= start + cap || owner.get(pos) != Some(&seq) {
                 return Err(format!(
-                    "attn_span: query {t} (sequence {seq}, position {}) has an empty window \
-                     [{start}, {hi})",
-                    positions[t]
+                    "attn_span: query {t} (sequence {seq}, position {pos}) is outside its \
+                     reserved run [{start}, {}) or its row is not written",
+                    start + cap
                 ));
             }
+            let hi = (start + cap).min(pos + 1);
             span[t] = start as u32;
             span[n + t] = hi as u32;
         }
@@ -410,7 +514,7 @@ mod tests {
 
         let mut c = cache(4);
         let cells = c.cells_for(0, &[0, 1]).unwrap();
-        c.note_written(0, &cells);
+        c.note_written(SEQ_MAIN, 0, &cells);
         assert_eq!(
             c.get(0).unwrap().owner,
             vec![SEQ_MAIN, SEQ_MAIN, FREE, FREE]
@@ -491,7 +595,7 @@ mod tests {
     fn a_single_sequence_resolves_to_the_causal_window() {
         let mut c = cache(8);
         c.own_prefix(SEQ_MAIN, 4);
-        c.note_written(0, &[0, 1, 2, 3]);
+        c.note_written(SEQ_MAIN, 0, &[0, 1, 2, 3]);
         // Query at position 2 may see cells 0..3; the last query sees 0..4.
         assert_eq!(
             c.attn_span(&[SEQ_MAIN, SEQ_MAIN], &[2, 3]).unwrap(),
@@ -500,19 +604,22 @@ mod tests {
         );
     }
 
-    /// E1's acceptance at the store level: two sequences in one arena get two
-    /// disjoint windows, so no query can see the other's cells.
+    /// E1's acceptance at the store level, on E2's reservations: two sequences
+    /// in one arena get two disjoint windows, so no query can see the other's
+    /// cells.
     #[test]
     fn two_sequences_resolve_to_disjoint_windows() {
         let mut c = cache(8);
-        // Sequence 1 owns cells 0..3, sequence 2 owns cells 3..6. Ownership is
-        // written through the same method for every layer, as the allocator's
-        // `own_prefix`/`after_rm` do.
-        c.own_prefix(SEQ_MAIN, 3);
-        for cell in 3..6 {
-            for layer in [0usize, 1] {
-                c.set_owner(layer, cell, 1).unwrap();
-            }
+        // Sequence 0 reserves cells 0..3, sequence 1 the next free run of 3.
+        let a = c.reserve_seq(SEQ_MAIN, 3).unwrap();
+        let b = c.reserve_seq(1, 3).unwrap();
+        assert_eq!((a.start, a.cap), (0, 3));
+        assert_eq!((b.start, b.cap), (3, 3), "first-fit after the first run");
+        // Each sequence owns the rows it wrote (E1's window cap is the
+        // reservation; the written-row check keeps unwritten rows out).
+        for layer in [0usize, 1] {
+            c.note_written(SEQ_MAIN, layer, &[0, 1, 2]);
+            c.note_written(1, layer, &[3, 4, 5]);
         }
         assert_eq!(c.seq_range(0, SEQ_MAIN).unwrap(), Some((0, 3)));
         assert_eq!(c.seq_range(0, 1).unwrap(), Some((3, 3)));
@@ -521,35 +628,66 @@ mod tests {
         let span = c.attn_span(&[SEQ_MAIN, 1], &[2, 5]).unwrap();
         assert_eq!(&span[..2], &[0, 3], "starts are each sequence's own");
         assert_eq!(&span[2..], &[3, 6], "ends are exclusive and causal");
-        // The windows do not overlap: sequence 2 never sees cells 0..3.
         assert!(
             span[2] >= span[1],
-            "sequence 2's window starts where sequence 1's ends"
+            "sequence 1's window starts where sequence 0's ends"
         );
     }
 
-    /// A layout the resolver cannot describe must be loud, not a wrong bound.
+    /// E2's reservations: disjoint, first-fit, released, and loud when the arena
+    /// cannot hold a sequence (no silent overlap, no moving).
     #[test]
-    fn ownership_gaps_and_empty_windows_are_errors() {
+    fn reservations_are_disjoint_first_fit_and_releasable() {
         let mut c = cache(8);
-        c.set_owner(0, 0, SEQ_MAIN).unwrap();
-        c.set_owner(0, 2, SEQ_MAIN).unwrap(); // cell 1 belongs to nobody
-        let err = c.seq_range(0, SEQ_MAIN).unwrap_err();
-        assert!(err.contains("non-contiguous"), "got: {err}");
-        let err = c.attn_span(&[SEQ_MAIN], &[2]).unwrap_err();
-        assert!(err.contains("non-contiguous"), "got: {err}");
+        assert_eq!(c.reserve_seq(0, 3).unwrap().start, 0);
+        assert_eq!(c.reserve_seq(1, 3).unwrap().start, 3);
+        // An existing reservation is returned unchanged when it fits.
+        assert_eq!(c.reserve_seq(0, 2).unwrap().start, 0);
+        // …and growth is refused, not silently relocated.
+        let err = c.reserve_seq(0, 4).unwrap_err();
+        assert!(err.contains("no growth"), "got: {err}");
+        // The arena is full: 2 free cells cannot hold a third sequence of 3.
+        let err = c.reserve_seq(2, 3).unwrap_err();
+        assert!(err.contains("no free run of 3"), "got: {err}");
+        // Releasing frees exactly its cells, and the next sequence reuses them.
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[3, 4, 5]);
+        }
+        assert_eq!(c.release_seq(1), 3);
+        assert_eq!(c.seq_range(0, 1).unwrap(), None);
+        assert!(
+            c.get(0).unwrap().owner[3..6].iter().all(|&o| o == FREE),
+            "released cells lose their owner"
+        );
+        assert_eq!(c.reserve_seq(2, 3).unwrap().start, 3, "freed run reused");
+        assert_eq!(
+            c.release_seq(7),
+            0,
+            "releasing an unknown sequence is a no-op"
+        );
+    }
 
-        // A query whose sequence owns nothing has no window at all.
+    /// A window the resolver cannot justify must be loud, not a wrong bound.
+    #[test]
+    fn unwritten_rows_and_unknown_sequences_are_errors() {
+        // No reservation for the sequence at all.
         let mut c = cache(8);
-        c.set_owner(0, 0, SEQ_MAIN).unwrap();
         let err = c.attn_span(&[1], &[0]).unwrap_err();
-        assert!(err.contains("owns no KV cells"), "got: {err}");
+        assert!(err.contains("holds no cells"), "got: {err}");
 
-        // A query at a position before its sequence's cells is empty too.
+        // A query outside its reserved run, and a row inside the run that was
+        // never written (it would attend to zeroes).
         let mut c = cache(8);
-        c.note_written(0, &[3]);
-        let err = c.attn_span(&[SEQ_MAIN], &[2]).unwrap_err();
-        assert!(err.contains("empty window"), "got: {err}");
+        c.reserve_seq(SEQ_MAIN, 2).unwrap();
+        let err = c.attn_span(&[SEQ_MAIN], &[5]).unwrap_err();
+        assert!(err.contains("outside its reserved run"), "got: {err}");
+        let err = c.attn_span(&[SEQ_MAIN], &[1]).unwrap_err();
+        assert!(err.contains("not written"), "got: {err}");
+        // Once written, the same query resolves.
+        for layer in [0usize, 1] {
+            c.note_written(SEQ_MAIN, layer, &[0, 1]);
+        }
+        assert_eq!(c.attn_span(&[SEQ_MAIN], &[1]).unwrap(), vec![0, 2]);
     }
 
     /// A shift must reproduce "the same tokens, roped at their new positions".
