@@ -45,6 +45,10 @@ enum StepOutcome {
 /// (E1b); keeping the batch within it avoids the flash-attention path, whose
 /// query tile must not span two sequences.
 pub const MAX_BATCH: usize = 16;
+
+/// Largest combined prompt (in fed tokens) that one prefill forward carries.
+/// Above this the prefills go one at a time, so the graph width does not churn.
+pub const MAX_PREFILL_BATCH: usize = 512;
 const REPEAT_LAST_N: usize = 64;
 
 /// One slot's persistent state: its reservation, the tokens its rows hold, and
@@ -142,32 +146,177 @@ impl BatchEngine {
 
     /// Admit a request into an idle slot and prefill it. Returns the slot index,
     /// or `unavailable` when every slot is busy (today's behaviour).
+    /// Admit a group of requests that arrived together.
+    ///
+    /// Requests are placed first (reuse-aware), then their prefills go through
+    /// **one** forward where that pays: prefill is a weight-bound share of a
+    /// served request, so four prompts sharing one weight pass cost far less
+    /// than four passes. They are only combined when the group fits
+    /// [`MAX_PREFILL_BATCH`]; otherwise each is prefilled alone, because a
+    /// varying batch width rebuilds the graph (one graph per cache today — E4's
+    /// allocator work is what lifts that).
+    ///
+    /// Returns one result per job, in the order the jobs were given.
+    pub fn admit(
+        &mut self,
+        model: &dyn ModelDef,
+        tokenizer: &Tokenizer,
+        jobs: Vec<Job>,
+    ) -> Vec<Result<usize, ApiError>> {
+        let mut answers: Vec<Option<Result<usize, ApiError>>> =
+            (0..jobs.len()).map(|_| None).collect();
+        // Place the jobs: within the group, an already-taken slot is skipped, so
+        // two jobs never land on one slot.
+        let mut taken: Vec<bool> = self.slots.iter().map(|s| s.run.is_some()).collect();
+        let mut placed: Vec<(usize, Job, usize)> = Vec::new(); // (job index, job, slot)
+        for (i, job) in jobs.into_iter().enumerate() {
+            let mut best: Option<(usize, usize)> = None; // (prefix match, slot)
+            for slot in 0..self.slots.len() {
+                if taken[slot] {
+                    continue;
+                }
+                let n = common_prefix_len(&self.slots[slot].cached_tokens, &job.input_ids);
+                if best.map_or(true, |(bn, _)| n > bn) {
+                    best = Some((n, slot));
+                }
+            }
+            match best {
+                Some((_, slot)) => {
+                    taken[slot] = true;
+                    placed.push((i, job, slot));
+                }
+                None => answers[i] = Some(Err(ApiError::unavailable("no idle slot"))),
+            }
+        }
+        let total: usize = placed
+            .iter()
+            .map(|(_, job, slot)| self.feed_span(*slot, &job.input_ids).0)
+            .sum();
+        if placed.len() > 1 && total <= MAX_PREFILL_BATCH && self.prefill_batch_ok() {
+            match self.prefill_group(model, &placed) {
+                Ok(()) => {
+                    for (i, _, slot) in &placed {
+                        answers[*i] = Some(Ok(*slot));
+                    }
+                }
+                Err(e) => {
+                    for (i, _, _) in &placed {
+                        answers[*i] = Some(Err(ApiError::server(e.clone())));
+                    }
+                }
+            }
+        } else {
+            for (i, job, slot) in placed {
+                answers[i] = Some(self.submit_on(model, tokenizer, slot, job));
+            }
+        }
+        answers
+            .into_iter()
+            .map(|a| a.expect("every job has an answer"))
+            .collect()
+    }
+
+    /// Admit a single request: [`BatchEngine::admit`] with one job.
     pub fn submit(
         &mut self,
         model: &dyn ModelDef,
         tokenizer: &Tokenizer,
         job: Job,
     ) -> Result<usize, ApiError> {
-        // Reuse-aware admission: among the idle slots, take the one whose KV
-        // already holds the longest prefix of this prompt. Round-robin would
-        // send the second turn of a conversation to a cold slot and throw away
-        // B2's prefix reuse — the measurement in the plan shows exactly that
-        // (4-slot batching was *slower* than serial before this). Ties go to the
-        // lowest index, so admission stays deterministic.
-        let mut best: Option<(usize, usize)> = None; // (prefix, slot)
-        for (i, s) in self.slots.iter().enumerate() {
-            if s.run.is_some() {
-                continue;
-            }
-            let n = common_prefix_len(&s.cached_tokens, &job.input_ids);
-            if best.map_or(true, |(bn, _)| n > bn) {
-                best = Some((n, i));
-            }
-        }
-        let Some((_, idx)) = best else {
-            return Err(ApiError::unavailable("no idle slot"));
+        self.admit(model, tokenizer, vec![job])
+            .into_iter()
+            .next()
+            .expect("one job in, one answer out")
+    }
+
+    /// Tokens this slot would have to feed for `input_ids` (reuse-aware): the
+    /// suffix after the longest prefix its KV already holds.
+    fn feed_span(&self, slot: usize, input_ids: &[u32]) -> (usize, usize) {
+        let track = !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
+        let reuse = if track {
+            common_prefix_len(&self.slots[slot].cached_tokens, input_ids)
+        } else {
+            0
         };
-        self.submit_on(model, tokenizer, idx, job)
+        prefill_span(input_ids.len(), reuse)
+    }
+
+    /// Whether several sequences may share one prefill forward on the active
+    /// backend. CUDA's flash-attention prefill stages a query tile per block and
+    /// a tile must not span two sequences (E1b), so with a CUDA device the
+    /// prefills stay per request until that port lands; CPU has no such limit.
+    fn prefill_batch_ok(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if crate::cuda::CudaState::get().is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// One forward for several requests' prefills. Each sequence's suffix is
+    /// contiguous in the batch, its positions are its slot's cells, and the
+    /// logits come back one row per sequence, in `placed` order.
+    fn prefill_group(
+        &mut self,
+        model: &dyn ModelDef,
+        placed: &[(usize, Job, usize)],
+    ) -> Result<(), String> {
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        let mut seq_ids: Vec<SeqId> = Vec::new();
+        let mut feeds: Vec<usize> = Vec::new();
+        for (_, job, slot) in placed {
+            let (feed_from, _) = self.feed_span(*slot, &job.input_ids);
+            let nt = job.input_ids.len();
+            let cap = self.slots[*slot].cap;
+            if nt > cap {
+                return Err(format!(
+                    "prompt of {nt} tokens exceeds slot context of {cap}"
+                ));
+            }
+            let start = self.slots[*slot].start;
+            tokens.extend_from_slice(&job.input_ids[feed_from..]);
+            positions.extend((feed_from..nt).map(|i| start + i));
+            seq_ids.extend(std::iter::repeat(self.slots[*slot].seq).take(nt - feed_from));
+            feeds.push(feed_from);
+        }
+        let batch = Batch::new(tokens, positions, seq_ids);
+        let live_on = crate::live::enabled();
+        if live_on {
+            crate::live::begin_phase("prefill");
+        }
+        let trace = std::env::var("MINFER_BATCH_TRACE").is_ok();
+        let t0 = std::time::Instant::now();
+        let logits = guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)
+            .map_err(|e| e.message)?;
+        if trace {
+            eprintln!(
+                "[batch] batched prefill: {} prompts, {} tokens, {:.0} ms",
+                placed.len(),
+                batch.len(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let k = placed.len();
+        if logits.len() % k != 0 {
+            return Err(format!(
+                "batched prefill returned {} logits for {k} sequences",
+                logits.len()
+            ));
+        }
+        let nv = logits.len() / k;
+        if live_on {
+            crate::live::attach_step(&logits[..nv.min(logits.len())]);
+        }
+        for (r, (_, job, slot)) in placed.iter().enumerate() {
+            self.install_run(
+                *slot,
+                job.clone(),
+                logits[r * nv..(r + 1) * nv].to_vec(),
+                feeds[r],
+            );
+        }
+        Ok(())
     }
 
     /// Admit a request on a **specific** slot.
@@ -185,6 +334,7 @@ impl BatchEngine {
         idx: usize,
         job: Job,
     ) -> Result<usize, ApiError> {
+        let _ = tokenizer;
         if idx >= self.slots.len() {
             return Err(ApiError::invalid_request(format!(
                 "slot {idx} does not exist ({} slots)",
@@ -194,8 +344,7 @@ impl BatchEngine {
         if self.slots[idx].run.is_some() {
             return Err(ApiError::unavailable(format!("slot {idx} is busy")));
         }
-        let input_ids = job.input_ids;
-        let nt = input_ids.len();
+        let nt = job.input_ids.len();
         let cap = self.slots[idx].cap;
         if nt > cap {
             return Err(ApiError::exceed_context(format!(
@@ -203,66 +352,73 @@ impl BatchEngine {
             )));
         }
         let (start, seq) = (self.slots[idx].start, self.slots[idx].seq);
-
-        // B2: reuse the tail of what this slot's rows already hold, gated on an
-        // exact prefix match (`MINFER_NO_PREFIX_REUSE=1` disables it for A/B).
-        let track = !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
-        let reuse = if track {
-            common_prefix_len(&self.slots[idx].cached_tokens, &input_ids)
-        } else {
-            0
-        };
-        let (feed_from, _) = prefill_span(nt, reuse);
+        let (feed_from, _) = self.feed_span(idx, &job.input_ids);
         // Positions are cell indices in the shared arena: the slot's reservation
         // starts at `start`, so its row `i` is `start + i` (E1/E2).
         let positions: Vec<usize> = (feed_from..nt).map(|i| start + i).collect();
         let seq_ids = vec![seq; nt - feed_from];
-        let batch = Batch::new(input_ids[feed_from..].to_vec(), positions, seq_ids);
+        let batch = Batch::new(job.input_ids[feed_from..].to_vec(), positions, seq_ids);
         let live_on = crate::live::enabled();
         if live_on {
             crate::live::begin_phase("prefill");
         }
+        let trace = std::env::var("MINFER_BATCH_TRACE").is_ok();
+        let t0 = std::time::Instant::now();
         let last_logits =
             guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)?;
+        if trace {
+            eprintln!(
+                "[batch] single prefill: slot {idx}, {} tokens, {:.0} ms",
+                batch.len(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if live_on {
             crate::live::attach_step(&last_logits);
         }
-        eprintln!(
-            "[server] slot {idx} prefill fed {}/{} prompt tokens ({} reused from its KV)",
-            nt - feed_from,
-            nt,
-            feed_from
-        );
+        self.install_run(idx, job, last_logits, feed_from);
+        Ok(idx)
+    }
+
+    /// Put a request into `slot` with the logits of its last prompt row.
+    fn install_run(&mut self, idx: usize, job: Job, last_logits: Vec<f32>, feed_from: usize) {
+        let nt = job.input_ids.len();
+        let track = !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
+        if track {
+            eprintln!(
+                "[server] slot {idx} prefill fed {}/{} prompt tokens ({} reused from its KV)",
+                nt - feed_from,
+                nt,
+                feed_from
+            );
+        }
         self.slots[idx].cached_tokens.clear();
         if track {
-            self.slots[idx].cached_tokens.extend_from_slice(&input_ids);
+            self.slots[idx]
+                .cached_tokens
+                .extend_from_slice(&job.input_ids);
         }
         debug_assert_eq!(self.slots[idx].cached_tokens.len(), nt);
         self.slots[idx].run = Some(Run {
             tx: job.tx,
+            rng: StdRng::seed_from_u64(job.params.seed),
+            prev_tokens: super::chat::sampler_recent_window(&job.input_ids, REPEAT_LAST_N),
+            stop_bytes: job
+                .params
+                .stop_strings
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
             params: job.params,
-            rng: StdRng::seed_from_u64(0),
-            prev_tokens: super::chat::sampler_recent_window(&input_ids, REPEAT_LAST_N),
-            stop_bytes: Vec::new(),
             full: Vec::new(),
             emitted: 0,
             completion_tokens: 0,
             current_pos: nt,
             last_logits,
             needs_forward: None,
-            live_on,
+            live_on: crate::live::enabled(),
             finish: None,
         });
-        // Per-request sampler state (seed comes from the request).
-        let run = self.slots[idx].run.as_mut().expect("just set");
-        run.rng = StdRng::seed_from_u64(run.params.seed);
-        run.stop_bytes = run
-            .params
-            .stop_strings
-            .iter()
-            .map(|s| s.as_bytes().to_vec())
-            .collect();
-        Ok(idx)
     }
 
     /// One step: forward every ready slot's pending token in a single batch,
@@ -470,12 +626,16 @@ pub fn serve_loop(
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        while !pending.is_empty() && engine.idle_slots() > 0 {
-            let job = pending.pop_front().expect("checked");
-            if let Err(e) = engine.submit(model, tokenizer, job) {
-                // `submit` consumed the job; report to its stream.
-                // (The job's tx is gone by now, so this only logs.)
-                eprintln!("[server] job rejected: {}", e.message);
+        // Admit everything that arrived as one group, so their prefills can
+        // share a forward (`admit` places each request on its own slot and
+        // combines the prefills when they fit).
+        let group: Vec<Job> = pending.drain(..).collect();
+        if !group.is_empty() {
+            for r in engine.admit(model, tokenizer, group) {
+                if let Err(e) = r {
+                    // The engine could not place the request (no idle slot).
+                    eprintln!("[server] job rejected: {}", e.message);
+                }
             }
         }
         if engine.busy() {

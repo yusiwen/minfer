@@ -40,6 +40,7 @@ pub enum StopCondition {
 }
 
 /// Concrete sampling parameters, resolved once per request.
+#[derive(Clone, Debug)]
 pub struct SamplingParams {
     pub temp: f32,
     pub top_k: usize,

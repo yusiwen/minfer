@@ -27,6 +27,7 @@ pub enum StreamEvent {
 
 /// One queued inference task. `input_ids` is the rendered+tokenized prompt
 /// (the handler tokenizes so context-overflow checks happen before queuing).
+#[derive(Clone)]
 pub struct Job {
     pub input_ids: Vec<u32>,
     pub params: SamplingParams,
