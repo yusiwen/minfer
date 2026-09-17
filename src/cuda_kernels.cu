@@ -2674,12 +2674,35 @@ __device__ __forceinline__ float4 h4_to_f4(const __half* p) {
 // gqa_attn_f32 (same online softmax, same reductions); the ONLY difference
 // is the K/V load mechanics: half4 → float4 conversions, f32 accumulation
 // everywhere (Metal pl_gqa_attn_f16 precision class).
+// ─── E1: the per-query attention window ───────────────────────────────────────
+// `CAUSAL` is the pre-E1 behaviour, still what every single-sequence caller uses:
+// the bound is `positions[t] + 1` and rows start at 0. The windowed
+// instantiation (E1b, reached only when the node is `Attn { multi_seq: true }`)
+// reads the `[lo, hi)` pair the KV store's ownership resolved, with `lo` at
+// `bound[t]` and `hi` at `bound[nt + t]`.
+//
+// `CAUSAL` is a template parameter, not a runtime flag, so the causal kernels
+// compile to exactly the instructions they did before E1b — no extra index
+// arithmetic in the hot loop, which the SASS diff of the two revisions checks.
+template <bool CAUSAL>
+__device__ __forceinline__ void attn_window(
+    const int* __restrict__ bound, int t, int nt, int& row0, int& nkv) {
+    if (CAUSAL) {
+        row0 = 0;
+        nkv = bound[t] + 1;
+    } else {
+        row0 = bound[t];
+        nkv = bound[nt + t] - bound[t];
+    }
+}
+
+template <bool CAUSAL>
 __global__ void gqa_attn_f32_f16kv(
     const float* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     float* __restrict__ o,
-    const int* positions,
+    const int* bound,
     int nh, int nk, int hd,
     float scale, int nt
 ) {
@@ -2687,7 +2710,8 @@ __global__ void gqa_attn_f32_f16kv(
     int h = blockIdx.y;
     if (t >= nt || h >= nh) return;
 
-    int nkv = positions[t] + 1;
+    int row0, nkv;
+    attn_window<CAUSAL>(bound, t, nt, row0, nkv);
     int gqa = nh / nk;
     int hk = h / gqa;
     int ne_q = nh * hd;
@@ -2716,7 +2740,7 @@ __global__ void gqa_attn_f32_f16kv(
         int kv1 = kv0 + 1;
 
         if (kv0 < nkv) {
-            const __half* krow = k + (size_t)kv0 * stride_kv + hk * hd;
+            const __half* krow = k + (size_t)(row0 + kv0) * stride_kv + hk * hd;
             float d = 0.0f;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
@@ -2726,7 +2750,7 @@ __global__ void gqa_attn_f32_f16kv(
             s0 = d * scale;
         }
         if (kv1 < nkv) {
-            const __half* krow = k + (size_t)kv1 * stride_kv + hk * hd;
+            const __half* krow = k + (size_t)(row0 + kv1) * stride_kv + hk * hd;
             float d = 0.0f;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
@@ -2751,7 +2775,7 @@ __global__ void gqa_attn_f32_f16kv(
         S *= corr;
 
         if (kv0 < nkv) {
-            const __half* vrow = v + (size_t)kv0 * stride_kv + hk * hd;
+            const __half* vrow = v + (size_t)(row0 + kv0) * stride_kv + hk * hd;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
                 float4 vv = h4_to_f4(vrow + i * 4);
@@ -2760,7 +2784,7 @@ __global__ void gqa_attn_f32_f16kv(
             }
         }
         if (kv1 < nkv) {
-            const __half* vrow = v + (size_t)kv1 * stride_kv + hk * hd;
+            const __half* vrow = v + (size_t)(row0 + kv1) * stride_kv + hk * hd;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
                 float4 vv = h4_to_f4(vrow + i * 4);
@@ -2843,17 +2867,18 @@ __device__ __forceinline__ float4 kv_ld4<__half>(const __half* p) {
     return make_float4(x.x, x.y, y.x, y.y);
 }
 
+
 // D3-4 L1: the incumbent D2-staged 1-warp body, refactored into a device
 // function so the incumbent kernel and the hybrid dispatch (below) share ONE
 // source. The math is byte-identical to the pre-refactor kernel (same rows,
 // same order, same per-row ops; only the index setup moved to the callers).
-template <typename KV>
+template <typename KV, bool CAUSAL>
 __device__ __forceinline__ void attn_split_1w_body(
     const float* __restrict__ q,
     const KV* __restrict__ k,
     const KV* __restrict__ v,
     float* __restrict__ partial,
-    int nkv, int sp, int h,
+    int row0, int nkv, int sp, int h,
     int nh, int nk, int hd, float scale, int pstr, int lane_id
 ) {
     const int SPLITS = ATTN_SPLITS;
@@ -2888,10 +2913,10 @@ __device__ __forceinline__ void attn_split_1w_body(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             k4[j] = (live && j < nr)
-                ? kv_ld4<KV>(k + (size_t)(base + j) * stride_kv + hk * hd + d0)
+                ? kv_ld4<KV>(k + (size_t)(row0 + base + j) * stride_kv + hk * hd + d0)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             v4[j] = (live && j < nr)
-                ? kv_ld4<KV>(v + (size_t)(base + j) * stride_kv + hk * hd + d0)
+                ? kv_ld4<KV>(v + (size_t)(row0 + base + j) * stride_kv + hk * hd + d0)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         #pragma unroll
@@ -2930,30 +2955,34 @@ __device__ __forceinline__ void attn_split_1w_body(
     }
 }
 
-template <typename KV>
+template <typename KV, bool CAUSAL>
 __global__ void gqa_attn_split_partial(
     const float* __restrict__ q,
     const KV* __restrict__ k,
     const KV* __restrict__ v,
     float* __restrict__ partial,
-    const int* positions,
+    const int* bound,
     int nh, int nk, int hd, float scale, int pstr,
     int rpw_gate
 ) {
+    // E1b: `bound` is `positions` when CAUSAL (nt == 1 for this decode path) and
+    // the `[lo, hi)` span otherwise; row0 is 0 and nkv is `positions[0] + 1` in
+    // the causal instantiation, so its arithmetic is the pre-E1 code.
+    int row0, nkv;
+    attn_window<CAUSAL>(bound, 0, 1, row0, nkv);
     // D3-4 L1 dual-kernel dispatch: when rpw_gate > 0 and the 4-warp kernel
     // owns this nkv (rpw >= rpw_gate), exit before touching anything — the
     // hybrid kernel writes the partial. The branch is nkv-uniform across the
-    // whole grid (positions[0] is launch-wide), so this stays replay-safe,
+    // whole grid (bound[0] is launch-wide), so this stays replay-safe,
     // and for every nkv the incumbent path takes, the arithmetic in the body
     // is unchanged (bitwise; dump-memcmp gated).
     if (rpw_gate > 0) {
-        const int nkv0 = positions[0] + 1;
-        const int chunk0 = (nkv0 + ATTN_SPLITS - 1) / ATTN_SPLITS;
+        const int chunk0 = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
         if (((chunk0 + 3) >> 2) >= rpw_gate) return;
     }
-    attn_split_1w_body<KV>(q, k, v, partial, positions[0] + 1,
-                           blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
-                           threadIdx.x);
+    attn_split_1w_body<KV, CAUSAL>(q, k, v, partial, row0, nkv,
+                                   blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
+                                   threadIdx.x);
 }
 
 __global__ void gqa_attn_split_combine(
@@ -2991,20 +3020,22 @@ __global__ void gqa_attn_split_combine(
 // covers nkv < 1921 (the batteries run at 512-640). Grid z = nt keeps the
 // launch static per captured graph; per-token nkv comes from positions[t]
 // device-side, so replay stays capture-safe.
-template <typename KV>
+template <typename KV, bool CAUSAL>
 __global__ void gqa_attn_split_partial_bt(
     const float* __restrict__ q,
     const KV* __restrict__ k,
     const KV* __restrict__ v,
     float* __restrict__ partial,
-    const int* positions,
-    int nh, int nk, int hd, float scale, int pstr
+    const int* bound,
+    int nh, int nk, int hd, float scale, int pstr, int nt
 ) {
     const int t = blockIdx.z;
-    attn_split_1w_body<KV>(
+    int row0, nkv;
+    attn_window<CAUSAL>(bound, t, nt, row0, nkv);
+    attn_split_1w_body<KV, CAUSAL>(
         q + (size_t)t * nh * hd, k, v,
         partial + (size_t)t * ATTN_SPLITS * nh * pstr,
-        positions[t] + 1,
+        row0, nkv,
         blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr, threadIdx.x);
 }
 
@@ -3034,14 +3065,22 @@ __global__ void gqa_attn_split_combine_bt(
 template <typename KV>
 static void launch_gqa_attn_split_batched_kv(
     const float* q, const void* k, const void* v, float* o,
-    float* partial, const int* positions,
+    float* partial, const int* bound, int windowed,
     int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
     cudaStream_t stream
 ) {
-    gqa_attn_split_partial_bt<KV><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
-        q, (const KV*)k, (const KV*)v, partial, positions,
-        n_head, n_head_kv, hd, scale, pstr
-    );
+    // E1b: `bound` is positions (causal) or the [lo, hi) span (multi-sequence).
+    if (windowed) {
+        gqa_attn_split_partial_bt<KV, false><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+            q, (const KV*)k, (const KV*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, nt
+        );
+    } else {
+        gqa_attn_split_partial_bt<KV, true><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+            q, (const KV*)k, (const KV*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, nt
+        );
+    }
     gqa_attn_split_combine_bt<<<dim3(1, n_head, nt), hd, 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
@@ -3049,24 +3088,24 @@ static void launch_gqa_attn_split_batched_kv(
 
 extern "C" int launch_gqa_attn_split_batched_f16kv(
     const float* q, const void* k, const void* v, float* o,
-    float* partial, const int* positions,
+    float* partial, const int* bound, int windowed,
     int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
     cudaStream_t stream
 ) {
     launch_gqa_attn_split_batched_kv<__half>(
-        q, k, v, o, partial, positions, n_head, n_head_kv, hd, scale, pstr,
+        q, k, v, o, partial, bound, windowed, n_head, n_head_kv, hd, scale, pstr,
         nt, stream);
     return 1;
 }
 
 extern "C" int launch_gqa_attn_split_batched_f32kv(
     const float* q, const void* k, const void* v, float* o,
-    float* partial, const int* positions,
+    float* partial, const int* bound, int windowed,
     int n_head, int n_head_kv, int hd, float scale, int pstr, int nt,
     cudaStream_t stream
 ) {
     launch_gqa_attn_split_batched_kv<float>(
-        q, k, v, o, partial, positions, n_head, n_head_kv, hd, scale, pstr,
+        q, k, v, o, partial, bound, windowed, n_head, n_head_kv, hd, scale, pstr,
         nt, stream);
     return 1;
 }
@@ -3133,7 +3172,7 @@ __device__ __forceinline__ void attn_split_h4w_body(
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     float* __restrict__ partial,
-    int nkv, int sp, int h,
+    int row0, int nkv, int sp, int h,
     int nh, int nk, int hd, float scale, int pstr
 ) {
     const int gqa = nh / nk;
@@ -3184,7 +3223,7 @@ __device__ __forceinline__ void attn_split_h4w_body(
             const int row = b + g * 8 + p;
             float d = 0.0f;
             if (row < wend) {
-                const __half* krow = k + row * stride_kv + hk * hd + 16 * t;
+                const __half* krow = k + (size_t)(row0 + row) * stride_kv + hk * hd + 16 * t;
                 const uint4 ka = *reinterpret_cast<const uint4*>(krow);
                 const uint4 kb = *reinterpret_cast<const uint4*>(krow + 8);
                 d = h4w_dot8(ka, qc0, qc1) + h4w_dot8(kb, qc2, qc3);
@@ -3227,7 +3266,7 @@ __device__ __forceinline__ void attn_split_h4w_body(
             float4 v0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             float4 v1 = v0, v2 = v0, v3 = v0;
             if (row < wend) {
-                const __half* vrow = v + row * stride_kv + hk * hd + 16 * t;
+                const __half* vrow = v + (size_t)(row0 + row) * stride_kv + hk * hd + 16 * t;
                 h4w_h8_to_f8(*reinterpret_cast<const uint4*>(vrow), v0, v1);
                 h4w_h8_to_f8(*reinterpret_cast<const uint4*>(vrow + 8), v2, v3);
             }
@@ -3289,28 +3328,31 @@ __device__ __forceinline__ void attn_split_h4w_body(
 // the f16kv launcher for the dual-kernel dispatch rationale). All-exit
 // otherwise; the branch is nkv-uniform (positions[0] is launch-wide), so
 // CUDA-graph capture/replay stays correct and per-nkv output is deterministic.
+template <bool CAUSAL>
 __global__ void __launch_bounds__(H4W_NTHREADS, 8)
 gqa_attn_split_partial_hybrid(
     const float* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     float* __restrict__ partial,
-    const int* positions,
+    const int* bound,
     int nh, int nk, int hd, float scale, int pstr
 ) {
-    const int nkv = positions[0] + 1;
+    int row0, nkv;
+    attn_window<CAUSAL>(bound, 0, 1, row0, nkv);
     const int chunk = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
     if (((chunk + 3) >> 2) < H4W_MIN_RPW) return;
-    attn_split_h4w_body(q, k, v, partial, nkv, blockIdx.x, blockIdx.y,
+    attn_split_h4w_body(q, k, v, partial, row0, nkv, blockIdx.x, blockIdx.y,
                         nh, nk, hd, scale, pstr);
 }
 
+template <bool CAUSAL>
 __global__ void gqa_attn_f32(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
     float* __restrict__ o,
-    const int* positions,
+    const int* bound,
     int nh, int nk, int hd,
     float scale, int nt
 ) {
@@ -3318,7 +3360,8 @@ __global__ void gqa_attn_f32(
     int h = blockIdx.y;
     if (t >= nt || h >= nh) return;
 
-    int nkv = positions[t] + 1;
+    int row0, nkv;
+    attn_window<CAUSAL>(bound, t, nt, row0, nkv);
     int gqa = nh / nk;
     int hk = h / gqa;
     int ne_q = nh * hd;
@@ -3347,7 +3390,7 @@ __global__ void gqa_attn_f32(
         int kv1 = kv0 + 1;
 
         if (kv0 < nkv) {
-            const float4* k4 = reinterpret_cast<const float4*>(k + kv0 * stride_kv + hk * hd);
+            const float4* k4 = reinterpret_cast<const float4*>(k + (row0 + kv0) * stride_kv + hk * hd);
             float d = 0.0f;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
@@ -3357,7 +3400,7 @@ __global__ void gqa_attn_f32(
             s0 = d * scale;
         }
         if (kv1 < nkv) {
-            const float4* k4 = reinterpret_cast<const float4*>(k + kv1 * stride_kv + hk * hd);
+            const float4* k4 = reinterpret_cast<const float4*>(k + (row0 + kv1) * stride_kv + hk * hd);
             float d = 0.0f;
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
@@ -3382,7 +3425,7 @@ __global__ void gqa_attn_f32(
         S *= corr;
 
         if (kv0 < nkv) {
-            const float4* v4 = reinterpret_cast<const float4*>(v + kv0 * stride_kv + hk * hd);
+            const float4* v4 = reinterpret_cast<const float4*>(v + (row0 + kv0) * stride_kv + hk * hd);
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
                 float4 vv = v4[i];
@@ -3391,7 +3434,7 @@ __global__ void gqa_attn_f32(
             }
         }
         if (kv1 < nkv) {
-            const float4* v4 = reinterpret_cast<const float4*>(v + kv1 * stride_kv + hk * hd);
+            const float4* v4 = reinterpret_cast<const float4*>(v + (row0 + kv1) * stride_kv + hk * hd);
             #pragma unroll
             for (int i = 0; i < hd4; i++) {
                 float4 vv = v4[i];
@@ -4015,22 +4058,27 @@ void launch_attn_bias_rope_store(
 
 void launch_gqa_attn_f32_f16kv(
     const float* q, const void* k, const void* v, float* o,
-    const int* positions,
+    const int* bound, int windowed,
     int n_head, int n_head_kv, int hd,
     float scale, int nt, cudaStream_t stream
 ) {
     int block_sz = 32; // one warp per (token, head)
     dim3 block(block_sz, 1, 1);
     dim3 grid(nt, n_head, 1);
-    gqa_attn_f32_f16kv<<<grid, block, 0, stream>>>(
-        q, (__half*)k, (__half*)v, o, positions,
-        n_head, n_head_kv, hd, scale, nt
-    );
+    if (windowed) {
+        gqa_attn_f32_f16kv<false><<<grid, block, 0, stream>>>(
+            q, (__half*)k, (__half*)v, o, bound,
+            n_head, n_head_kv, hd, scale, nt);
+    } else {
+        gqa_attn_f32_f16kv<true><<<grid, block, 0, stream>>>(
+            q, (__half*)k, (__half*)v, o, bound,
+            n_head, n_head_kv, hd, scale, nt);
+    }
 }
 
 void launch_gqa_attn_split_f16kv(
     const float* q, const void* k, const void* v, float* o,
-    float* partial, const int* positions,
+    float* partial, const int* bound, int windowed,
     int n_head, int n_head_kv, int hd,
     float scale, int pstr, cudaStream_t stream
 ) {
@@ -4048,19 +4096,29 @@ void launch_gqa_attn_split_f16kv(
     // head dims (incl. the hd=8 parity fixtures) keep the single incumbent
     // launch (rpw_gate=0).
     if (hd == 128) {
-        gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
-            q, (const __half*)k, (const __half*)v, partial, positions,
-            n_head, n_head_kv, hd, scale, pstr, H4W_MIN_RPW
-        );
-        gqa_attn_split_partial_hybrid<<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
-            q, (const __half*)k, (const __half*)v, partial, positions,
-            n_head, n_head_kv, hd, scale, pstr
-        );
+        if (windowed) {
+            gqa_attn_split_partial<__half, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+                q, (const __half*)k, (const __half*)v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, H4W_MIN_RPW);
+            gqa_attn_split_partial_hybrid<false><<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+                q, (const __half*)k, (const __half*)v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr);
+        } else {
+            gqa_attn_split_partial<__half, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+                q, (const __half*)k, (const __half*)v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, H4W_MIN_RPW);
+            gqa_attn_split_partial_hybrid<true><<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+                q, (const __half*)k, (const __half*)v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr);
+        }
+    } else if (windowed) {
+        gqa_attn_split_partial<__half, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const __half*)k, (const __half*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, 0);
     } else {
-        gqa_attn_split_partial<__half><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
-            q, (const __half*)k, (const __half*)v, partial, positions,
-            n_head, n_head_kv, hd, scale, pstr, 0
-        );
+        gqa_attn_split_partial<__half, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const __half*)k, (const __half*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, 0);
     }
     gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
         partial, o, n_head, hd, pstr
@@ -4069,14 +4127,19 @@ void launch_gqa_attn_split_f16kv(
 
 void launch_gqa_attn_split_f32kv(
     const float* q, const void* k, const void* v, float* o,
-    float* partial, const int* positions,
+    float* partial, const int* bound, int windowed,
     int n_head, int n_head_kv, int hd,
     float scale, int pstr, cudaStream_t stream
 ) {
-    gqa_attn_split_partial<float><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
-        q, (const float*)k, (const float*)v, partial, positions,
-        n_head, n_head_kv, hd, scale, pstr, 0
-    );
+    if (windowed) {
+        gqa_attn_split_partial<float, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const float*)k, (const float*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, 0);
+    } else {
+        gqa_attn_split_partial<float, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            q, (const float*)k, (const float*)v, partial, bound,
+            n_head, n_head_kv, hd, scale, pstr, 0);
+    }
     gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
@@ -4084,12 +4147,16 @@ void launch_gqa_attn_split_f32kv(
 
 void launch_gqa_attn_f32(
     const float* q, const float* k, const float* v, float* o,
-    const int* positions, int nh, int nk, int hd,
+    const int* bound, int windowed, int nh, int nk, int hd,
     float scale, int nt, cudaStream_t stream
 ) {
     dim3 block(WARP, 1, 1); // 32 threads per block (1 warp)
     dim3 grid(nt, nh, 1);
-    gqa_attn_f32<<<grid, block, 0, stream>>>(q, k, v, o, positions, nh, nk, hd, scale, nt);
+    if (windowed) {
+        gqa_attn_f32<false><<<grid, block, 0, stream>>>(q, k, v, o, bound, nh, nk, hd, scale, nt);
+    } else {
+        gqa_attn_f32<true><<<grid, block, 0, stream>>>(q, k, v, o, bound, nh, nk, hd, scale, nt);
+    }
 }
 
 // ─── 8n: FA-style prefill attention (f16 KV) ────────────────────────────
@@ -4154,12 +4221,15 @@ __device__ __forceinline__ void fa_stage_kv_async(
 #endif
 }
 
+} // extern "C" (a template cannot have C linkage; the launcher below stays inside)
+
+template <bool CAUSAL>
 __global__ void fa_prefill_f16kv(
     const float* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
     float* __restrict__ o,
-    const int* __restrict__ positions,
+    const int* __restrict__ bound,
     int nh, int nk, int hd,
     float scale,
     int nt
@@ -4191,7 +4261,23 @@ __global__ void fa_prefill_f16kv(
     __syncthreads();
 
     const int last_t = min(nt - 1, tq0 + FA_TQ - 1);
-    const int kv_end = positions[last_t] + 1;
+    // E1b: the staged extent is tile-wide, so the window is taken tile-wide too
+    // (min lo, max hi) and the per-row mask trims it exactly. A query tile must
+    // therefore not span two sequences — E2's composition keeps a sequence's
+    // tokens contiguous, and the CPU path carries no such constraint.
+    // CAUSAL is the pre-E1 expression, unchanged.
+    int kv_end, win_lo;
+    if (CAUSAL) {
+        kv_end = bound[last_t] + 1;
+        win_lo = 0;
+    } else {
+        kv_end = 0;
+        win_lo = bound[tq0];
+        for (int t = tq0; t <= last_t; t++) {
+            kv_end = max(kv_end, bound[nt + t]);
+            win_lo = min(win_lo, bound[t]);
+        }
+    }
     const bool tile_full = (tq0 + FA_TQ <= nt); // all 64 O rows in-bounds
 
     // FAP2 decomposition: 4 warps (128 threads), warp wm owns a full 16-query-row
@@ -4210,8 +4296,8 @@ __global__ void fa_prefill_f16kv(
     const int row1 = wm * 16 + r1;
     const int c0 = 2 * l;          // fragment col group (2l, 2l+1, 2l+8, 2l+9)
     const int t0 = tq0 + row0, t1 = tq0 + row1;
-    const int qpos0 = (t0 < nt) ? positions[t0] : -1;
-    const int qpos1 = (t1 < nt) ? positions[t1] : -1;
+    const int qpos0 = (t0 < nt) ? bound[t0] : -1;
+    const int qpos1 = (t1 < nt) ? bound[t1] : -1;
 
     // O accumulator: P@V over hd=128 per 16-row block -> 8 x 16x16 fragments.
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[8];
@@ -4219,7 +4305,8 @@ __global__ void fa_prefill_f16kv(
     for (int ob = 0; ob < 8; ob++) wmma::fill_fragment(acc[ob], 0.0f);
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
-    for (int kt = 0; kt < kv_end; kt += FA_TKV) {
+    const int kt0 = CAUSAL ? 0 : (win_lo / FA_TKV) * FA_TKV;
+    for (int kt = kt0; kt < kv_end; kt += FA_TKV) {
         // stage K/V tile (padded stride, zero-filled beyond kv_end)
         fa_stage_kv_async(k, v, Ks, Vs, kt, kv_end, hk, hd, stride_kv, sstr, tid, 128);
 #if __CUDA_ARCH__ >= 800
@@ -4267,8 +4354,8 @@ __global__ void fa_prefill_f16kv(
         for (int q = 0; q < FA_TKV / 16 * 4; q++) {
             // valid = causal (kv <= query pos) AND within the stored KV range
             // (rows >= kv_end are zero-staged and must NOT contribute).
-            bool v0 = (gcol[q] <= qpos0) && (gcol[q] < kv_end);
-            bool v1 = (gcol[q] <= qpos1) && (gcol[q] < kv_end);
+            bool v0 = (gcol[q] <= qpos0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
+            bool v1 = (gcol[q] <= qpos1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
             if (v0) mnew0 = fmaxf(mnew0, sm[q]);
             if (v1) mnew1 = fmaxf(mnew1, sm1_[q]);
         }
@@ -4287,9 +4374,9 @@ __global__ void fa_prefill_f16kv(
         float sum0 = 0.0f, sum1 = 0.0f;
 #pragma unroll
         for (int q = 0; q < FA_TKV / 16 * 4; q++) {
-            p0[q] = (((gcol[q] <= qpos0) && (gcol[q] < kv_end)))
+            p0[q] = ((gcol[q] <= qpos0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
                         ? __expf(sm[q] - mnew0) : 0.0f;
-            p1[q] = (((gcol[q] <= qpos1) && (gcol[q] < kv_end)))
+            p1[q] = ((gcol[q] <= qpos1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
                         ? __expf(sm1_[q] - mnew1) : 0.0f;
             sum0 += p0[q]; sum1 += p1[q];
         }
@@ -4385,9 +4472,11 @@ __global__ void fa_prefill_f16kv(
     }
 }
 
+extern "C" {
+
 int launch_fa_prefill_f16kv(
     const float* q, const __half* k, const __half* v, float* o,
-    const int* positions, int nh, int nk, int hd, float scale, int nt,
+    const int* bound, int windowed, int nh, int nk, int hd, float scale, int nt,
     cudaStream_t stream
 ) {
     // Qs + Ks + Vs only (S/P no longer go through shared memory). sstr = hd+8
@@ -4396,7 +4485,9 @@ int launch_fa_prefill_f16kv(
     static size_t attr_smem = 0;
     if (smem > attr_smem) {
         cudaError_t e = cudaFuncSetAttribute(
-            fa_prefill_f16kv, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            windowed ? (const void*)&fa_prefill_f16kv<false>
+                     : (const void*)&fa_prefill_f16kv<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         if (e != cudaSuccess) {
             cudaGetLastError(); // clear the error so it cannot poison the stream
             // NOT silent: the caller falls back to the legacy per-token
@@ -4414,7 +4505,11 @@ int launch_fa_prefill_f16kv(
         attr_smem = smem;
     }
     dim3 grid((nt + FA_TQ - 1) / FA_TQ, nh, 1);
-    fa_prefill_f16kv<<<grid, 128, smem, stream>>>(q, k, v, o, positions, nh, nk, hd, scale, nt);
+    if (windowed) {
+        fa_prefill_f16kv<false><<<grid, 128, smem, stream>>>(q, k, v, o, bound, nh, nk, hd, scale, nt);
+    } else {
+        fa_prefill_f16kv<true><<<grid, 128, smem, stream>>>(q, k, v, o, bound, nh, nk, hd, scale, nt);
+    }
     return 0;
 }
 
@@ -7503,8 +7598,12 @@ extern "C" void minfer_prewarm_kernels(void) {
     MINFER_PREWARM(swiglu_f32_off);
     MINFER_PREWARM(rms_norm_f32);
     // attention (FA prefill + decode paths) + KV/rope
-    MINFER_PREWARM(fa_prefill_f16kv);
-    MINFER_PREWARM(gqa_attn_f32_f16kv);
+    // E1b: both instantiations, so the first windowed launch does not pay a
+    // one-off module load / JIT (the causal one is what runs today).
+    MINFER_PREWARM((fa_prefill_f16kv<true>));
+    MINFER_PREWARM((fa_prefill_f16kv<false>));
+    MINFER_PREWARM((gqa_attn_f32_f16kv<true>));
+    MINFER_PREWARM((gqa_attn_f32_f16kv<false>));
     MINFER_PREWARM(store_kv_f16);
     MINFER_PREWARM(rope_f32);
     // lm_head tail (f32) + decode MMVQ

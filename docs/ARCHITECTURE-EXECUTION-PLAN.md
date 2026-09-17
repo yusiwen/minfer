@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1's CPU half is complete** (2026-09-17; the CUDA half is ticket E1b). | E1b (the CUDA half of E1) and E2 are next on the critical path; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run. | E2 is next on the critical path; a GPU run should re-check E1b's windowed path and its timing; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -590,7 +590,7 @@ prompt) belongs with E2's batching work.
 | ID | Item | Title | Effort |
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
-| E1b | 2 | CUDA attention kernels read `attn_span` (E1's deferred half; needs a device to verify) | M |
+| E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
 | E2 | 3 | Batch composition + continuous batching; make `n_seqs` real | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
@@ -711,6 +711,51 @@ several sequences into one forward yet, so the model path fills `seq_ids` with
 per-cell mask, which only a layout with holes needs (C3/D1 — a range covers
 every layout the engine can currently produce); Metal (G5); the CUDA port (E1b).
 
+#### E1b record (2026-09-17) — CUDA's windowed attention
+
+**Shape.** Every attention kernel is now `template <bool CAUSAL>`. `CAUSAL`
+(the existing behaviour) keeps `nkv = positions[t] + 1` and a row base of 0; the
+windowed instantiation reads the `[lo, hi)` pair (`bound[t]`, `bound[nt + t]`)
+and indexes rows as `row0 + j`. Row arithmetic is the *only* difference — loop
+trip counts, split chunking, merge order and the per-row op order are untouched,
+which is what preserves the doc-94 bitwise identity between the verify batch and
+sequential decode. Kernels: `attn_split_1w_body`, `attn_split_h4w_body`,
+`gqa_attn_split_partial`, `_hybrid`, `_bt`, `gqa_attn_f32_f16kv`, `gqa_attn_f32`
+and `fa_prefill_f16kv` (whose tile-wide extent is `max(hi)`/`min(lo)` so a query
+tile must not span two sequences — E2's composition keeps a sequence
+contiguous). `Op::Attn { multi_seq }` picks the pointer (positions vs span) *and*
+the instantiation host-side, so a causal node never touches the span input;
+`supports_attn_span()` is now `true` for CUDA, and the op matrix's asymmetric row
+flips accordingly.
+
+**The performance constraint, with evidence.** The requirement was "do not
+affect existing CUDA performance", and there is no device here to measure
+(`cuInit` → 304, re-confirmed 2026-09-17: no seccomp, no container, the
+580.178.04 module loaded, nodes present). So the evidence is the generated code:
+both revisions compiled with the project's own nvcc flags (`-O3`,
+`-gencode arch=compute_121,code=sm_121`) and `cuobjdump -sass` compared per
+kernel:
+
+- **instruction counts identical** for every causal instantiation —
+  `gqa_attn_split_partial` 448/416, `_hybrid` 1664, `_bt` 464/416,
+  `gqa_attn_f32_f16kv` 1952, `gqa_attn_f32` 1520, `fa_prefill_f16kv` 2104 (the
+  pre-E1b numbers);
+- **opcode histograms identical** for `gqa_attn_split_partial[float]` and
+  `gqa_attn_split_partial_hybrid[half]`; the others differ only by
+  `LDG.E → LDG.E.CONSTANT` (the `bound` parameter is `const __restrict__`, so the
+  loads take the read-only path — a caching upgrade, not added work) and by
+  `MOV`/`CS2R`/`NOP` register-allocation substitutions of equal count.
+
+No kernel gained an instruction, none lost one. What is *not* verified is
+wall-clock time on a GPU: the windowed path is unreachable until E2 composes
+batches, and the first GPU session should re-check both the numbers and the
+timing (recorded in the status line).
+
+**Tests.** `cuda_two_sequences_do_not_cross_attend` mirrors the CPU test at the
+backend level (device-gated: it compiles here and skips without a device), and
+the existing CUDA attention tests — including `cuda_verify_attention_nt_invariance`,
+the doc-94 identity — call the causal instantiation as before.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
@@ -795,7 +840,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ✔ ─ E2 ─ E3 ─ E4 ─ E5        (E1b: CUDA half)
+Phase E  ├──────────────────── E1 ✔ ─ E2 ─ E3 ─ E4 ─ E5        (E1b ✔: CUDA half)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └────────────────────────────────────────────►  (needs a Mac)
 ```

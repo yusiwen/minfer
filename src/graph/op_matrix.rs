@@ -782,10 +782,10 @@ fn support_table_matches_support_matrix_doc() {
             true,
             true,
         ),
-        // E1's asymmetric row: only CPU reads the explicit span so far (CUDA's
-        // port follows in the same ticket). Metal and CUDA still derive their
-        // bound from positions and must refuse a multi-sequence attention node
-        // (`backend_takes`), so neither can be assigned one.
+        // E1's asymmetric row: CPU and CUDA have a windowed attention path that
+        // reads the explicit span (E1b ported CUDA's kernels); Metal still
+        // derives its bound from positions and must refuse a multi-sequence
+        // attention node (`backend_takes`), so it cannot be assigned one.
         (
             "Attn multi-seq",
             Op::Attn {
@@ -794,7 +794,7 @@ fn support_table_matches_support_matrix_doc() {
             },
             true,
             false,
-            false,
+            true,
         ),
         (
             "KvcacheStore",

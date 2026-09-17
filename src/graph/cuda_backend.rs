@@ -1096,10 +1096,21 @@ impl CudaBackend {
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
                 let nt = node.out_shape[1];
-                let pos = self.positions_i32(in_bufs[2])?;
-                // The causal bound (positions[t]+1) is derived from the device
-                // positions inside the kernel — no host scalar crosses here
+                // E1b: a multi-sequence node carries an explicit `[lo, hi)` span
+                // (input 3) and runs the windowed kernel instantiations; every
+                // other node is the causal case and reads `positions` (input 2)
+                // exactly as before — same kernels, same instructions, same
+                // captures. The bound still never crosses to the host
                 // (precondition for CUDA Graph replay, Phase 7d).
+                let windowed = matches!(
+                    &node.op,
+                    Op::Attn {
+                        multi_seq: true,
+                        ..
+                    }
+                );
+                let bound_buf = if windowed { in_bufs[3] } else { in_bufs[2] };
+                let pos = self.positions_i32(bound_buf)?;
                 // 8d: decode (nt == 1) uses split-K flash-decoding — the
                 // single-warp kernel leaves the GPU idle at nt == 1 (nsys:
                 // 48% of the 7B decode step at 2K ctx). Fixed grid +
@@ -1112,6 +1123,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of(out_buf)?,
                         pos,
+                        windowed,
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1134,6 +1146,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of(out_buf)?,
                         pos,
+                        windowed,
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1153,6 +1166,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of(out_buf)?,
                         pos,
+                        windowed,
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1166,6 +1180,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of(out_buf)?,
                         pos,
+                        windowed,
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1328,6 +1343,12 @@ impl Backend for CudaBackend {
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
         matches!(fused, FusedOp::SwiGLU)
+    }
+
+    fn supports_attn_span(&self) -> bool {
+        // E1b: the attention kernels gained a windowed instantiation that reads
+        // the `[lo, hi)` span, so CUDA can take a multi-sequence attention node.
+        true
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
@@ -3040,6 +3061,93 @@ mod tests {
     ///     token-looped kernel at nt == 1 and nt == 3.
     /// The 8c q4_0 × q8-GEMM arm (nt > 1, id <= 8192) has no nt == 1
     /// sibling, so it is checked against an independent host dequant
+    /// E1b: the CUDA windowed instantiations must give each sequence its own
+    /// window, matching `cpu_backend`'s `two_sequences_do_not_cross_attend`.
+    /// Device-gated — a hosted runner and this box have no usable device
+    /// (`cuInit` returns 304), so it compiles here and runs where a GPU exists.
+    #[test]
+    fn cuda_two_sequences_do_not_cross_attend() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        cb.kv_f16 = false; // f32 KV keeps the store and the attention in one dtype
+
+        // One head, hd = 2, two sequences: sequence 0 owns row 0, sequence 1
+        // owns row 2. The values make a leak change the answer — query 1 scores
+        // 1.0 against sequence 0's key, so a window starting at 0 would blend
+        // V(0) into the result instead of returning V(2).
+        let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 2usize, 2usize, 4usize);
+        let nkt = nk * hd;
+        let mut gb = GraphBuilder::new();
+        gb.set_multi_seq(true);
+        let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+        let q = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
+        let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
+        let st = gb.kvcache_store(0, k, v, pos, n_ctx);
+        let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
+        let at = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
+            crate::graph::ops::AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale: 1.0,
+            },
+        );
+        gb.output(at);
+        let g = gb.build();
+        assert!(
+            g.nodes.iter().any(|n| matches!(
+                n.op,
+                crate::graph::ops::Op::Attn {
+                    multi_seq: true,
+                    ..
+                }
+            )),
+            "the attention node must declare multi_seq"
+        );
+
+        let i32bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+        let kreg = cb.alloc_buffer(n_ctx * nkt);
+        let vreg = cb.alloc_buffer(n_ctx * nkt);
+        let kb = cb.alloc_buffer(nkt * nt);
+        let vb = cb.alloc_buffer(nkt * nt);
+        let qb = cb.alloc_buffer(nh * hd * nt);
+        let pb = cb.alloc_buffer(nt);
+        let sb = cb.alloc_buffer(2 * nt);
+        let ob = cb.alloc_buffer(nh * hd * nt);
+        // token 0 = [1, 0] (sequence 0), token 1 = [1, 0] (sequence 1)
+        cb.write_host(qb, &[1.0, 0.0, 1.0, 0.0]).unwrap();
+        // row 0 = k [1,0] / v [1,0]; row 2 = k [0,1] / v [0,1]
+        cb.write_host(kb, &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        cb.write_host(vb, &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        cb.write_host(pb, &i32bits(&[0, 2])).unwrap();
+        cb.write_host(sb, &i32bits(&[0, 2, 1, 3])).unwrap(); // lo block, hi block
+
+        cb.execute_node(&g.nodes[st], &[kb, vb, pb], kreg, Some((kreg, vreg)))
+            .unwrap();
+        cb.execute_node(&g.nodes[at], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
+            .unwrap();
+        let got = cb.read_host(ob).unwrap();
+        assert!(
+            (got[0] - 1.0).abs() < 1e-4 && got[1].abs() < 1e-4,
+            "token 0 must attend to its own row: {got:?}"
+        );
+        assert!(
+            got[2].abs() < 1e-4 && (got[3] - 1.0).abs() < 1e-4,
+            "token 1 saw the other sequence: {got:?}"
+        );
+    }
+
     /// reference with the standard q8-activation tolerance instead.
     #[test]
     fn cuda_verify_attention_nt_invariance() {
@@ -3127,6 +3235,7 @@ mod tests {
                         cb.ptr_of(vb).unwrap(),
                         cb.ptr_of(obt).unwrap(),
                         cb.ptr_of(post).unwrap(),
+                        false, // single-sequence: the causal instantiation
                         nh,
                         nk,
                         hd,
@@ -3150,6 +3259,7 @@ mod tests {
                             cb.ptr_of(vb).unwrap(),
                             cb.ptr_of(o1).unwrap(),
                             cb.ptr_of(p1).unwrap(),
+                            false, // single-sequence: the causal instantiation
                             nh,
                             nk,
                             hd,
