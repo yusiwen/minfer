@@ -446,16 +446,18 @@ impl Qwen2Graph {
         let tokens = &batch.tokens;
         let positions = &batch.positions;
         let nt = batch.len();
-        let n_seqs = batch.n_seqs();
         let out_rows = batch.out_rows(n_out);
         let n_out = out_rows.len();
         // E2: whether the causal (positions-based) attention instantiation is
         // exact for this batch, taken from the KV reservations — the authority on
         // where each sequence's window starts — so no caller can get it wrong.
         // One sequence starting at cell 0 keeps the classic path; a second
-        // sequence, or a non-zero start, takes the explicit span.
+        // sequence (whose reservation cannot also start at 0), or a non-zero
+        // start, takes the explicit span. This reads the *batch*, never
+        // `GraphParams`: the sequence count is data (A7/E2), so it is not part
+        // of the reuse identity.
         let explicit_span = {
-            let mut need = n_seqs > 1;
+            let mut need = batch.n_seqs() > 1;
             for (seq, _, _) in batch.groups() {
                 if cache.alloc().kv_seq_slot(seq).map(|s| s.start).unwrap_or(0) != 0 {
                     need = true;
@@ -491,7 +493,6 @@ impl Qwen2Graph {
         let cuda_on = false;
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs,
             n_out,
             gtype: if nt == 1 {
                 GraphType::Decode
@@ -1209,6 +1210,139 @@ mod tests {
         );
     }
 
+    /// E2 / A7: the *number of sequences* is data, not topology.
+    ///
+    /// `explicit_span` (derived from the KV reservations) already fixes every
+    /// topology decision a batch can make, so two batches with the same token
+    /// count, output count and span requirement describe **the same graph**
+    /// whether the tokens belong to one sequence or two. While `GraphParams`
+    /// also carried the sequence count, that pair rebuilt - a rebuild with no
+    /// topological cause, which is why the field was deleted in E2 instead of
+    /// kept "reserved" (A7 closure).
+    ///
+    /// The test pins both halves: the graph uid is unchanged across the pair (no
+    /// rebuild) and the reused graph still computes what a fresh
+    /// single-sequence forward computes, bitwise.
+    #[test]
+    fn sequence_count_is_data_not_topology() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the sequence-count test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let nv = model.n_vocab();
+        let a = tok.encode("The capital of France is");
+        let b = tok.encode("The capital of Japan is");
+        let (la, lb) = (a.len(), b.len());
+        let (s7, s9) = (7u32, 9u32);
+
+        // The same reservation order in every cache, so the layout - and with it
+        // every position below - is deterministic. Both starts are non-zero, so
+        // every forward here needs the explicit span.
+        let layout = |cache: &mut GraphCache| -> (usize, usize) {
+            cache.alloc().kv_set_capacity(n_ctx);
+            let r7 = cache.alloc().kv_reserve_seq(s7, la + 2).expect("reserve 7");
+            let r9 = cache.alloc().kv_reserve_seq(s9, lb + 4).expect("reserve 9");
+            (r7.start, r9.start)
+        };
+        let uid = |c: &mut GraphCache| c.current().map(|(g, _)| g.uid).unwrap();
+
+        // ---- batched cache: one graph is asked for both shapes ----
+        let mut c = GraphCache::new();
+        let (p7, p9) = layout(&mut c);
+        let pos7: Vec<usize> = (p7..p7 + la).collect();
+        let pos9: Vec<usize> = (p9..p9 + lb).collect();
+
+        let pre7 = model.forward_batch(
+            &Batch::new(a.clone(), pos7.clone(), vec![s7; la]),
+            1,
+            n_ctx,
+            &mut c,
+        );
+        let t7 = argmax(&pre7);
+        let pre9 = model.forward_batch(
+            &Batch::new(b.clone(), pos9.clone(), vec![s9; lb]),
+            1,
+            n_ctx,
+            &mut c,
+        );
+        let t9 = argmax(&pre9);
+
+        // Two sequences, one token each: nt = 2, n_out = 2 (a row per sequence).
+        let two = model.forward_batch(
+            &Batch::new(vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9]),
+            1,
+            n_ctx,
+            &mut c,
+        );
+        assert_eq!(two.len(), 2 * nv, "one logits row per sequence");
+        let uid_two = uid(&mut c);
+
+        // One sequence, two tokens: the same nt, the same n_out (a caller that
+        // wants both rows' distributions), the same span requirement. Only the
+        // sequence count differs, so this must reuse the graph above.
+        let tail = [a[0], a[1]];
+        let tail_pos = [p9 + lb + 1, p9 + lb + 2];
+        let one = model.forward_batch(
+            &Batch::new(tail.to_vec(), tail_pos.to_vec(), vec![s9; 2]),
+            2,
+            n_ctx,
+            &mut c,
+        );
+        assert_eq!(one.len(), 2 * nv, "nt = 2, n_out = 2");
+        assert_eq!(
+            uid_two,
+            uid(&mut c),
+            "a change in the number of sequences rebuilt an otherwise identical graph"
+        );
+
+        // ---- reference: the same layout, sequence 9 alone ----
+        let mut ref9 = GraphCache::new();
+        let (_, q9) = layout(&mut ref9);
+        assert_eq!(q9, p9, "the reference must place sequence 9 identically");
+        let r_pre9 = model.forward_batch(
+            &Batch::new(b.clone(), pos9.clone(), vec![s9; lb]),
+            1,
+            n_ctx,
+            &mut ref9,
+        );
+        assert_eq!(
+            argmax(&r_pre9),
+            t9,
+            "the reference must agree on sequence 9's first token"
+        );
+        let _ = model.forward_batch(
+            &Batch::new(vec![t9], vec![p9 + lb], vec![s9]),
+            1,
+            n_ctx,
+            &mut ref9,
+        );
+        let r_one = model.forward_batch(
+            &Batch::new(tail.to_vec(), tail_pos.to_vec(), vec![s9; 2]),
+            2,
+            n_ctx,
+            &mut ref9,
+        );
+
+        // Bitwise: sequence 7's work (and reusing the graph) must not have
+        // touched sequence 9's rows.
+        assert_eq!(
+            max_delta(&one, &r_one),
+            0.0,
+            "the reused graph diverged from a fresh single-sequence forward"
+        );
+    }
+
     /// C2 (Phase C): a physical KV removal, and the sliding-window shift built
     /// on it.
     ///
@@ -1493,7 +1627,6 @@ mod tests {
             let nt = ids.len();
             let params = GraphParams {
                 n_tokens: nt,
-                n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Prefill,
                 cparams: CParams {
@@ -1544,7 +1677,6 @@ mod tests {
             // decode graph (same allocator: KV persists through the rebuild)
             let dparams = GraphParams {
                 n_tokens: 1,
-                n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Decode,
                 cparams: CParams {
@@ -2144,7 +2276,6 @@ mod tail_tests {
             let nt = ids.len();
             let params = GraphParams {
                 n_tokens: nt,
-                n_seqs: 1,
                 n_out,
                 gtype: GraphType::Prefill,
                 cparams: CParams {
@@ -2325,7 +2456,6 @@ mod tail_tests {
             ) -> Vec<f32> {
                 let params = GraphParams {
                     n_tokens: 1,
-                    n_seqs: 1,
                     n_out: 1,
                     gtype: GraphType::Decode,
                     cparams: CParams {
@@ -2400,7 +2530,6 @@ mod tail_tests {
             ) {
                 let params = GraphParams {
                     n_tokens: 1,
-                    n_seqs: 1,
                     n_out: 1,
                     gtype: GraphType::Decode,
                     cparams: CParams {

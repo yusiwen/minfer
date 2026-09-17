@@ -81,7 +81,6 @@ struct Run {
     /// forward carries it (that is what makes the step batched).
     needs_forward: Option<u32>,
     live_on: bool,
-    finish: Option<String>,
 }
 
 pub struct BatchEngine {
@@ -417,7 +416,6 @@ impl BatchEngine {
             last_logits,
             needs_forward: None,
             live_on: crate::live::enabled(),
-            finish: None,
         });
     }
 

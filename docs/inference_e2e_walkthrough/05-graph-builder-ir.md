@@ -289,7 +289,7 @@ counts are 24. In the DOT dump you can literally see the stale edge
 Here is the sentence the whole design stands on: **the graph topology is a
 deterministic function of `GraphParams`** — equal parameters produce an
 identical graph, node for node. `GraphParams` (`src/graph/params.rs:52`)
-contains exactly `n_tokens`, `n_seqs`, `n_out` (tail rows, §2.8), `gtype`
+contains exactly `n_tokens`, `n_out` (tail rows, §2.8), `gtype`
 (prefill or decode), `cparams` (context size, flash-attn flag, GPU
 participation, the two fusion toggles), and `weights_version`.
 
@@ -694,7 +694,6 @@ sides of the add must shrink or the shapes would disagree.
 
     fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
         a.n_tokens == b.n_tokens
-            && a.n_seqs == b.n_seqs
             && a.n_out == b.n_out
             && a.gtype == b.gtype
             && a.cparams == b.cparams

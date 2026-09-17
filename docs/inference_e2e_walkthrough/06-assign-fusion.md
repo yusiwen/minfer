@@ -695,7 +695,6 @@ pub fn try_reuse(&mut self, params: &GraphParams) -> bool {
 
 fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
     a.n_tokens == b.n_tokens
-        && a.n_seqs == b.n_seqs
         && a.n_out == b.n_out
         && a.gtype == b.gtype
         && a.cparams == b.cparams

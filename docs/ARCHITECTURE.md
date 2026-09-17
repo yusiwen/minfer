@@ -195,9 +195,10 @@ assign_backends → fuse → alloc_graph → execute
 ### 4.4 Reuse (`GraphCache`)
 
 **Params-only deterministic reuse** (llama.cpp `allow_reuse` invariant):
-`GraphParams` = `n_tokens` / `n_seqs` / `n_out` (tail rows) / `gtype` /
-`cparams` (`n_ctx`, `flash_attn`, `gpu`, `fuse_qkv`, `fuse_ffn`) /
-`weights_version` deterministically determines the topology — equal params ⇒
+`GraphParams` = `n_tokens` / `n_out` (tail rows) / `gtype` /
+`cparams` (`n_ctx`, `flash_attn`, `gpu`, `fuse_qkv`, `fuse_ffn`,
+`explicit_span`) / `weights_version` deterministically determines the topology —
+equal params ⇒
 identical graph.
 `n_past` is deliberately absent (it is execution data). `CParams.gpu` records
 backend participation so a backend toggle forces a rebuild. `GraphCache` owns

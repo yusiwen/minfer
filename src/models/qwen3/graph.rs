@@ -391,16 +391,18 @@ impl Qwen3Graph {
         let tokens = &batch.tokens;
         let positions = &batch.positions;
         let nt = batch.len();
-        let n_seqs = batch.n_seqs();
         let out_rows = batch.out_rows(n_out);
         let n_out = out_rows.len();
         // E2: whether the causal (positions-based) attention instantiation is
         // exact for this batch, taken from the KV reservations — the authority on
         // where each sequence's window starts — so no caller can get it wrong.
         // One sequence starting at cell 0 keeps the classic path; a second
-        // sequence, or a non-zero start, takes the explicit span.
+        // sequence (whose reservation cannot also start at 0), or a non-zero
+        // start, takes the explicit span. This reads the *batch*, never
+        // `GraphParams`: the sequence count is data (A7/E2), so it is not part
+        // of the reuse identity.
         let explicit_span = {
-            let mut need = n_seqs > 1;
+            let mut need = batch.n_seqs() > 1;
             for (seq, _, _) in batch.groups() {
                 if cache.alloc().kv_seq_slot(seq).map(|s| s.start).unwrap_or(0) != 0 {
                     need = true;
@@ -430,7 +432,6 @@ impl Qwen3Graph {
         let cuda_on = false;
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs,
             n_out,
             gtype: if nt == 1 {
                 GraphType::Decode
@@ -947,7 +948,6 @@ mod tests {
             // --- node presence (build only, no execute) ---
             let fused_params = GraphParams {
                 n_tokens: 1,
-                n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Decode,
                 cparams: CParams {
@@ -1138,7 +1138,6 @@ mod tests {
             let nt = ids.len();
             let params = GraphParams {
                 n_tokens: nt,
-                n_seqs: 1,
                 n_out: 1,
                 gtype: GraphType::Prefill,
                 cparams: CParams {

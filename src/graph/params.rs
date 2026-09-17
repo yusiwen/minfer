@@ -4,6 +4,13 @@
 //! deterministic function of `GraphParams` (llama.cpp `allow_reuse` invariant),
 //! so `GraphCache::try_reuse` compares params only — never the node sequence.
 //! `n_past` (KV position) is deliberately absent: it is execution data.
+//!
+//! So is the **number of sequences** a batch covers (E2): `CParams.explicit_span`
+//! carries the only topology decision a multi-sequence batch can force, the
+//! per-query sequence ids and allowed cell spans are inputs. Carrying the count
+//! as well bought nothing and cost a rebuild whenever the batching changed shape
+//! with the topology unchanged (see the `sequence_count_is_data_not_topology`
+//! test in `models/qwen2/graph.rs`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,12 +65,6 @@ impl Default for CParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphParams {
     pub n_tokens: usize,
-    /// Number of sequences the batch covers. **Inert today**: every
-    /// construction site hard-codes `1` and no builder reads it (see
-    /// `docs/ARCHITECTURE-EXECUTION-PLAN.md` §8). It is kept in the reuse
-    /// identity because item 3 (continuous batching) will make it real; until
-    /// then a change here only forces a pointless rebuild.
-    pub n_seqs: usize,
     /// Number of output (tail) rows: the last layer's FFN + lm_head run on the
     /// last `n_out` rows only (llama `inp_out_ids`). Part of the topology —
     /// a change forces a rebuild.

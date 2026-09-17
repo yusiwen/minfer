@@ -416,7 +416,7 @@ The final principle is an ownership decision that makes §2.5 possible.
 `GraphCache` (`src/graph/cache.rs`) is a tiny struct with three fields: the
 current graph, **the allocator**, and the params the graph was built for
 (`cache.rs:24-28`). Reuse is decided by `try_reuse`, which compares
-`GraphParams` only — `n_tokens`, `n_seqs`, `n_out`, `gtype`, `cparams`
+`GraphParams` only — `n_tokens`, `n_out`, `gtype`, `cparams`
 (including `n_ctx`, the GPU flag, and the fusion toggles), `weights_version`
 (`cache.rs:47-64`). Equal params ⇒ the topology is deterministic ⇒ reuse the
 graph and just refresh input data (§2.6). Mismatched params ⇒ the caller
@@ -770,7 +770,6 @@ pub fn try_reuse(&mut self, params: &GraphParams) -> bool {
 
 fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
     a.n_tokens == b.n_tokens
-        && a.n_seqs == b.n_seqs
         && a.n_out == b.n_out
         && a.gtype == b.gtype
         && a.cparams == b.cparams

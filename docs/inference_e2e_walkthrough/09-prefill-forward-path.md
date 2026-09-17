@@ -472,7 +472,6 @@ implementation, not one per caller.
            all-or-nothing GPU participation (docs 03/14/15) */
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs: 1,
             n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams { n_ctx, flash_attn: false,
@@ -507,10 +506,10 @@ is worth reading as five beats:
 1. **Pre-flight assert** (L415–420): every position must be `< n_ctx` — the
    loud version of the KV-overflow check that the store kernel also enforces
    (doc 07 §3.2, excerpt 8).
-2. **GraphParams construction** (L438–470): six fields, all derived from the
+2. **GraphParams construction** (L438–470): every field derived from the
    call's arguments plus device availability. This is the prefill graph's
    birth certificate — for a 512-token CPU prompt: `n_tokens = 512`,
-   `n_seqs = 1`, `n_out = 1`, `gtype = Prefill`, `cparams = { n_ctx: 4096,
+   `n_out = 1`, `gtype = Prefill`, `cparams = { n_ctx: 4096,
    flash_attn: false, gpu: false, fuse_qkv: false,
    fuse_ffn: false }`. Note the fusion flags are `nt == 1 && gpu`: the
    decode fusions of doc 05 §2.6 are **off** during prefill by construction —
@@ -539,7 +538,6 @@ the field's home in `params.rs`:
 | Field (`params.rs`) | Prefill value (CLI) | Topology effect (doc 05 §) |
 |---|---|---|
 | `n_tokens` | prompt length | every activation shape's `nt`; decode-fusion gates read `nt == 1` |
-| `n_seqs` | 1 | batch dimension placeholder (single sequence) |
 | `n_out` | 1 | tail `get_rows` pair after the last attention projection (§2.8); the whole output stack runs on 1 row |
 | `gtype` | `Prefill` | part of the reuse identity; with `nt` it names the graph class (§2.6) |
 | `cparams.n_ctx` | `max(--n-ctx, prompt)` | KV store/load node shape `[n_kv_embd, n_ctx]` → region size (doc 07 §2.5) |

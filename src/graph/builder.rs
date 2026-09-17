@@ -19,8 +19,10 @@ pub struct GraphBuilder {
     /// per step by the allocator, like `positions`.
     seq_ids: Option<NodeId>,
     attn_span: Option<NodeId>,
-    /// Whether this graph's attention covers more than one sequence — set from
-    /// `GraphParams.n_seqs` by the model builders. Recorded in the op so a
+    /// Whether this graph's attention window cannot be derived from `positions`
+    /// alone (more than one sequence, or a window not starting at cell 0) — set
+    /// by the model builders from the *batch* and its KV reservations, never from
+    /// `GraphParams` (E2/A7: the sequence count is data). Recorded in the op so a
     /// backend that still derives its bound from positions refuses it.
     explicit_span: bool,
 }

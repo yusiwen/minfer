@@ -767,7 +767,7 @@ And where the verdict lands (`src/models/qwen2/graph.rs:425-451,462-470`):
         let cuda_on = crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model);
         ...
         let params = GraphParams {
-            n_tokens: nt, n_seqs: 1, n_out,
+            n_tokens: nt, n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
             cparams: CParams {
                 n_ctx, flash_attn: false,
