@@ -30,8 +30,10 @@ measured as not source-addressable.
 The remaining work is at the **system layer**, and three items dominate it:
 
 1. **No multi-sequence batching.** The IR, the attention kernels, the KV
-   (Key/Value) allocator and the server are all single-sequence. `n_seqs`
-   exists in the graph-reuse identity but is hard-wired to 1 everywhere.
+   (Key/Value) allocator and the server are all single-sequence. E1/E1b made the
+   *attention* side sequence-aware and E2 landed sequence-addressable batches
+   and a batching server worker (opt-in), but the CPU payoff measured negative,
+   so the system still runs one sequence at a time by default.
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
    store: no sequence ids, no eviction/context shift, no defragmentation, no
    state save/restore, no quantized KV. (Phase C's C1/C2 have since landed the
@@ -345,11 +347,12 @@ defragmentation (a cell-copy op that a strided-view IR makes expressible).
 
 ### 2.5 L5 — Batching and serving 🔴
 
-**Today.** Single sequence, end to end. `GraphParams.n_seqs` exists and is part
-of the reuse identity (`params.rs:54`, `cache.rs:59`) but is set to `1` at every
-construction site (`models/qwen2/graph.rs:443` etc.); no builder consults it
-(it is kept, documented as *reserved for item 3* — see
-`ARCHITECTURE-EXECUTION-PLAN.md` §8). The other dead identity field,
+**Today.** Single sequence by default, end to end — batching exists but is
+opt-in because it measured slower here (E2). `GraphParams` carries no sequence
+count at all: E2 deleted `n_seqs`, which A7 had kept as *reserved for item 3*,
+once item 3 landed and showed the count is data rather than topology
+(`CParams.explicit_span` carries the only topology decision it can force —
+see `ARCHITECTURE-EXECUTION-PLAN.md` §8). The other dead identity field,
 `CParams.n_batch`, was **deleted** in Phase A7; chunked prefill (item 10) will
 reintroduce it with its real semantics. Attention derives its causal bound from
 the per-token positions input (`cpu_backend.rs:411-416`, `cuda_backend.rs:1100-1102`), so two
@@ -553,7 +556,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 |---|---|---|---|
 | 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. | §2.4 | XL |
 | 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. — **done** (E1: span input + resolver + CPU kernel + two-sequence test; E1b: CUDA windowed kernels, compile-verified) | §2.5 | L |
-| 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). — **mechanism landed in E2**: sequence-addressable batches, per-sequence reservations, `n_seqs` real, the server composes one decode batch; **opt-in** (`MINFER_BATCH=1`) because the measured payoff on this box is negative (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0) — see the plan's E2 record | §2.5 | XL |
+| 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). — **mechanism landed in E2**: sequence-addressable batches, per-sequence reservations, the server composes one decode batch and batched prefills; `n_seqs` **deleted** (it turned out to be data, closing A7); **opt-in** (`MINFER_BATCH=1`) because the measured payoff on this box is negative (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0) — see the plan's E2 record | §2.5 | XL |
 | 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. — **done in B2/B3** (prefix-matched reuse, ≈11× TTFT on turn 2) | §2.5 | M |
 | 5 | **Fix `ensure_kv` size handling** and add the missing `pos < n_ctx` guard on both GPU backends. | §2.4 | S |
 | 6 | **Worker panic isolation** (`catch_unwind` + supervision + an error event instead of a silent empty stream). — **done in A4** | §2.5 | S |
@@ -591,7 +594,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 | 23 | **Op × dtype × backend matrix test**. — **done in A1** | §2.8 | M |
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. — **done in A2** | §2.8 | S |
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. | §2.8 | M |
-| 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7** | §2.5 | S |
+| 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7; fully closed in E2**, which deleted `n_seqs` too after item 3 showed it was redundant, not just unread | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
 | 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
 
@@ -633,8 +636,11 @@ behavioural defects found while executing the plan, already fixed.
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
    `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:57-64`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
-   **Fixed in A7**: `n_batch` is deleted; `n_seqs` is kept and documented as
-   reserved for item 3.
+   **Fixed in A7, closed in E2**: `n_batch` is deleted; `n_seqs` was kept for
+   item 3 and then deleted by it (the sequence count is data — the topology
+   decision lives in `CParams.explicit_span`), with
+   `sequence_count_is_data_not_topology` pinning that a sequence-count change no
+   longer rebuilds an otherwise identical graph.
 9. ~~**Single-entry cross-backend staging** (`alloc.rs:34`, `:645`), mitigated by
    the consumer-side filter at `scheduler.rs:252-255`.~~ **Fixed in A5** — keyed
    by `(node, dst_backend)`; two foreign consumers can now be served.

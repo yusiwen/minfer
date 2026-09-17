@@ -12,7 +12,7 @@ deliverables, acceptance criteria and dependencies.
 | Decision | Consequence for this plan |
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
-| **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
+| **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
 | **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2's mechanism landed** (2026-09-17) but its throughput acceptance is **not met on this box** (see §7). | E2's acceptance needs a GPU (or a CPU `nt>1` kernel win) to re-measure; a GPU run should also re-check E1b's windowed path and timing; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
@@ -246,7 +246,7 @@ roadmap §4 defects automatically.
 - **Outcome:** no code change; the negative result is recorded so nobody
   re-opens it. Item 28 is closed as "not worth doing" rather than done.
 
-### A7 — Dead identity fields  · item 26 · S
+### A7 — Dead identity fields  · item 26 · S — **DONE, closed in E2**
 - **Decision taken: option (a)** — delete `CParams.n_batch`, keep `GraphParams.n_seqs`
   marked *reserved for item 3* (rationale in §8).
 - **Files:** `src/graph/params.rs`, `src/graph/cache.rs:57-64`,
@@ -257,6 +257,19 @@ roadmap §4 defects automatically.
   read it.
 - **Acceptance:** no occurrence of `n_batch` remains in `src/graph/`; every
   field compared by `params_match` has at least one reader; `cargo test` green.
+- **E2 closure (the second half of the ticket).** Keeping `n_seqs` *reserved*
+  was the right call only until item 3 landed. It did — and the field turned out
+  not merely unread but **redundant**: the only topology decision a
+  multi-sequence batch can force is the attention instantiation, and
+  `CParams.explicit_span`, derived from the KV reservations (the authority on
+  where each window starts), already carries it. E2 therefore **deleted**
+  `GraphParams.n_seqs`, satisfying the acceptance by the "or deleted" branch.
+  Measured justification (`sequence_count_is_data_not_topology`,
+  `models/qwen2/graph.rs`): with the field present, a 2-sequence batch and a
+  1-sequence batch with the same `n_tokens`/`n_out`/`gtype`/`explicit_span`
+  rebuilt the graph (uid 3 → 4); without it the same graph is reused **and** its
+  logits are bitwise-identical to a fresh single-sequence forward. The test is
+  permanent, so the claim cannot silently regress.
 
 ### A8 — Guard symmetry  · item 13 · S — **DONE (docs route)**
 - **Files:** `docs/SUPPORT-MATRIX.md` — a new "Operator Coverage by Backend"
@@ -591,7 +604,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **landed, acceptance not met** (mechanism in, measured slower here; `MINFER_BATCH=1` opts in) | XL |
+| E2 | 3 | Batch composition + continuous batching — **mechanism landed, acceptance not met** (measured slower here; `MINFER_BATCH=1` opts in); A7 closed by **deleting** `n_seqs` | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -626,6 +639,13 @@ sequence-aware:
    the batch exactly as E1 does for one sequence. `n_seqs` becomes a real field
    (it now gates the `multi_seq` op flag and the graph identity) — A7's "real or
    deleted" question answered with *real*.
+   - **As implemented (outcome, 2026-09-17):** the second half of that sentence
+     did not survive contact. `n_seqs` was made real for one commit, then the
+     flag it was said to gate moved to `CParams.explicit_span` (the *reservation*
+     is the authority on the window, not the count), and a test showed the count
+     now changed nothing about the topology while still forcing a rebuild. The
+     field was **deleted** — A7's question answered with *deleted*, the other
+     branch of the same acceptance clause. See §8 and the A7 ticket.
 4. **The server batches decode steps.** One shared cache for the batch; each
    active slot holds a reservation and its token stream; one forward per step
    carries every ready slot's next token (`nt = ready slots`, `n_seqs = ready
@@ -772,6 +792,26 @@ Still to come in E2: nothing is left to *build* for the deliverable; what remain
 is the acceptance, which this box cannot demonstrate (the step-4 trace above shows
 why, and `MINFER_BATCH_TRACE=1` is the instrument for re-measuring elsewhere).
 
+**E2 progress, step 5 (2026-09-17): A7's second half — `n_seqs` deleted.** The
+ticket's second acceptance clause is "the `n_seqs` field is either real or
+deleted (closes A7 if it was kept)". Step 1 had made it real (the `multi_seq`
+flag), step 3 moved that flag to `CParams.explicit_span` for a reason that has
+nothing to do with the count — a slot's *reservation* decides whether positions
+alone can bound the window — leaving `n_seqs` set on every path and read by none.
+Rather than "keep it reserved" a second time, the question was measured: a
+2-sequence batch and a 1-sequence batch with the same `n_tokens`, `n_out`,
+`gtype` and `explicit_span` describe the **same topology**, and with the field in
+the identity they still rebuilt (uid 3 → 4, `sequence_count_is_data_not_topology`).
+The field is therefore **deleted** from `GraphParams` (and from `params_match`,
+the JSON export and every construction site); the builder's "more than one
+sequence involved" test now reads the batch. The test that exposed the rebuild is
+permanent and also asserts the reused graph's logits are bitwise-identical to a
+fresh single-sequence forward, so the deletion is pinned from both sides. A7 is
+now fully closed: both fields the A7 note called dead are gone. One incidental
+dead field went with it — `BatchEngine`'s `Run.finish`, set to `None` and never
+read (the finish reason is a parameter of `finish()`), removed with the build
+warning it produced.
+
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
 **E1 design (written before the code, 2026-09-17).** The bound a query may attend
@@ -799,6 +839,11 @@ other. E1 replaces the derivation with **data**:
    falling back to the positions derivation — Metal (untouched, Phase G) is that
    backend. `n_seqs > 1` is what sets the flag, giving `GraphParams.n_seqs` its
    first reader (E2 is what will make it a batch).
+   - **As built:** the flag is named `explicit_span` (`Op::Attn { mode,
+     explicit_span }`), and it is set from the *batch and its KV reservations* —
+     "more than one sequence involved, or a window that does not start at cell 0"
+     — never from `GraphParams`. E2 deleted `n_seqs` for exactly that reason
+     (§8); this paragraph is the E1-era design that predicted otherwise.
 4. **Bitwise for one sequence.** With a single sequence, `lo = 0` and
    `hi = min(n_used, pos + 1) = pos + 1`, so the CPU kernel's loop bounds,
    reduction length and accumulation order are unchanged — the existing
@@ -963,6 +1008,19 @@ forces that realisation at the point where it is cheap.
 
 **Decision (2026-09-16): option (a).** Delete `n_batch` in A7; keep `n_seqs`
 with a comment naming item 3 as its future reader.
+
+**Follow-up (E2, the rounding-out of this note).** Option (a) assumed `n_seqs`
+would be *made real* by item 3. Item 3 landed and the assumption was wrong in an
+instructive way: the sequence count is **data**, exactly like `n_past`, and never
+needed to be in the identity at all. What item 3 did add to the identity is
+`CParams.explicit_span` — the one decision (which attention instantiation to
+build) that depends on how a batch is *composed*, derived from the KV
+reservations rather than from a count. So the field was deleted in E2 instead of
+being populated: option (c), chosen late, with the measurement that makes the
+case (`sequence_count_is_data_not_topology`). The general lesson this note now
+records: an identity field earns its place only if some *topology* decision
+reads it — "a future feature will need it" is not enough, because a redundant
+field costs a rebuild every time it changes shape with the topology unchanged.
 
 ## 9. Phase F — independent tracks
 

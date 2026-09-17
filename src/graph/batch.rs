@@ -1,10 +1,12 @@
 //! Batch composition (Phase E / E2).
 //!
 //! A `Batch` is one forward's worth of *data*: every query token with the
-//! sequence it belongs to and the KV position it writes. It is not part of the
-//! graph's identity — `GraphParams` sees only `n_tokens` and `n_seqs` — so the
-//! params-only reuse rule is untouched: two batches of the same shape share one
-//! graph and refill the inputs.
+//! sequence it belongs to and the KV position it writes. Nothing here is part
+//! of the graph's identity — `GraphParams` carries `n_tokens` and the
+//! *topology* flags, never the sequence count (E2 deleted it; see
+//! `params.rs`'s module docs) — so the params-only reuse rule is untouched: two
+//! batches of the same shape share one graph and refill the inputs, whether they
+//! carry one sequence or several.
 //!
 //! **Contiguity.** A sequence's tokens must be contiguous in the batch. The CPU
 //! attention path could tolerate interleaving (E1's span is per token), but CUDA

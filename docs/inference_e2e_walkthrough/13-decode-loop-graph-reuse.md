@@ -277,7 +277,11 @@ is worth checking each one (`params.rs:52-63`, defined below in §3.2):
 - **`n_tokens`** — every activation buffer's shape and loop trip counts
   derive from it; also selects the per-layer QKV build path (`nt == 1`
   enables the decode fusions, `graph.rs:93-98`).
-- **`n_seqs`** — batch dimension (always 1 today; part of the shape identity).
+- **~~`n_seqs`~~** — *deleted in E2 (A7 closure).* A batch's sequence count is
+  data, like `n_past`: the one topology decision it can force — `explicit_span`,
+  the explicit attention window — lives in `cparams` and is derived from the KV
+  reservations. Carrying the count here bought nothing and cost a rebuild
+  whenever batching changed shape with the topology unchanged.
 - **`n_out`** — decides whether the G3 `tail_ids` input + tail `GetRows`
   nodes exist (`n_out < nt`) and how many rows the output buffer has.
 - **`gtype`** — Decode vs Prefill; today it is redundant with
@@ -646,7 +650,6 @@ The loop's `forward` call lands in `forward_cached`, which first expresses
 ```rust
         let params = GraphParams {
             n_tokens: nt,
-            n_seqs: 1,
             n_out,
             gtype: if nt == 1 {
                 GraphType::Decode
@@ -720,7 +723,6 @@ machinery:
 
     fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
         a.n_tokens == b.n_tokens
-            && a.n_seqs == b.n_seqs
             && a.n_out == b.n_out
             && a.gtype == b.gtype
             && a.cparams == b.cparams
@@ -744,7 +746,6 @@ argued for in §2.4:
 ```rust
 pub struct GraphParams {
     pub n_tokens: usize,
-    pub n_seqs: usize,
     /// Number of output (tail) rows: the last layer's FFN + lm_head run on the
     /// last `n_out` rows only (llama `inp_out_ids`). Part of the topology —
     /// a change forces a rebuild.
@@ -1270,11 +1271,17 @@ and — worse — `ensure_kv` would have sized regions from the prefill graph
 that the decode graph considers too small. One variable, computed early,
 keeps the whole run inside one region geometry.
 
-**9. `n_seqs` is always 1 today — but it is in the identity anyway.**
-Batched sequences (multiple independent token streams in one graph) are
-not implemented; the field is carried in `GraphParams` and compared so
-that adding batching later cannot silently reuse a single-sequence graph
-for a two-sequence call. Cheap insurance: one integer comparison.
+**9. The field that looked like cheap insurance — and was not.**
+`GraphParams` used to carry `n_seqs`, "so that adding batching later cannot
+silently reuse a single-sequence graph for a two-sequence call". E2 added the
+batching and found the reasoning backwards: what a multi-sequence batch changes
+about the *topology* is which attention instantiation is built, and that is
+`cparams.explicit_span`, decided by the KV reservations. The count itself is
+data. Keeping it meant a 2-sequence and a 1-sequence batch of the same shape
+described the same graph and still rebuilt it — measured (uid 3 → 4) by
+`sequence_count_is_data_not_topology` in `models/qwen2/graph.rs`, which now
+pins the reuse instead. An identity field earns its place only if some topology
+decision reads it.
 
 ## 4. Observe & verify
 

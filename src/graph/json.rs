@@ -28,7 +28,6 @@ pub fn runtime_gparams(
 ) -> GraphParams {
     GraphParams {
         n_tokens,
-        n_seqs: 1,
         n_out: 1,
         gtype: if n_tokens == 1 {
             GraphType::Decode

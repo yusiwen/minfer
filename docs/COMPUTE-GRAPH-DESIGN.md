@@ -53,8 +53,11 @@ scratch buffers per step. That shape had four structural costs:
 
 ### 1.3 Non-goals
 
-- **Multi-sequence batching.** `GraphParams.n_seqs` exists and is part of the reuse identity, but the
-  supported models build single-sequence graphs.
+- **Multi-sequence batching by default.** The IR, the allocator and the attention kernels are
+  sequence-aware (E1/E1b/E2: `seq_ids`, `attn_span`, per-sequence KV reservations, `Batch`), and the
+  server can compose a batch — but it is **opt-in** (`MINFER_BATCH=1`) because batching measured
+  slower than the serial path on CPU (E2's acceptance is not met on this box; see
+  `ARCHITECTURE-EXECUTION-PLAN.md` §7).
 - **A generic ggml operator set.** `Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha`
   and `FusedOp::BatchMatMul` are present in the vocabulary but no supported architecture emits
   them; they are kept for parity and future use. `Op::FusedBiasRope` and its fusion rule were
@@ -493,7 +496,6 @@ pub struct CParams {
 
 pub struct GraphParams {
     pub n_tokens: usize,
-    pub n_seqs: usize,
     pub n_out: usize,          // tail rows (G3): part of topology, not just execution
     pub gtype: GraphType,
     pub cparams: CParams,
@@ -507,9 +509,10 @@ pub struct GraphCache {
 }
 ```
 
-`GraphCache::try_reuse` compares `params_match` — `n_tokens`, `n_seqs`, `n_out`, `gtype`, `cparams`
-(all of it, including `gpu`/`fuse_qkv`/`fuse_ffn`) and `weights_version`. It never inspects the node
-sequence. `replace_graph` assigns a fresh monotonic `uid` for CUDA Graph caching and leaves the
+`GraphCache::try_reuse` compares `params_match` — `n_tokens`, `n_out`, `gtype`, `cparams`
+(all of it, including `gpu`/`fuse_qkv`/`fuse_ffn`/`explicit_span`) and `weights_version`. It never
+inspects the node sequence. A batch's *sequence count* is deliberately absent: it is data (A7/E2), and
+a 1-sequence and a 2-sequence batch of the same shape share one graph. `replace_graph` assigns a fresh monotonic `uid` for CUDA Graph caching and leaves the
 allocator in place. See §6 for the full reuse story.
 
 `weights_version` is currently a constant `1` at both model call sites: there is no LoRA or weight
@@ -770,7 +773,6 @@ therefore necessarily rebuilds.
 | Parameter | Why it changes topology |
 |---|---|
 | `n_tokens` | matmul output shapes, KV store shape, `n_out < nt` decision |
-| `n_seqs` | reserved; part of the identity |
 | `n_out` | decides whether the G3 tail reduction nodes exist |
 | `gtype` | Decode vs Prefill, and the decode-only fused branches |
 | `cparams.n_ctx` | sizes the persistent KV regions |
@@ -1155,7 +1157,7 @@ would collide and silently drop the primary model to CPU.
 Every path funnels through `QwenXGraph::forward_cached`:
 
 ```
-params = GraphParams { n_tokens, n_seqs: 1, n_out, gtype, cparams, weights_version: 1 }
+params = GraphParams { n_tokens, n_out, gtype, cparams, weights_version: 1 }
 if !cache.try_reuse(&params) {
     graph = model.build_graph(&params)
     register_graph_weights(...)          // CPU/Metal/CUDA registration
