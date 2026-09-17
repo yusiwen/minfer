@@ -348,7 +348,8 @@ defragmentation (a cell-copy op that a strided-view IR makes expressible).
 ### 2.5 L5 — Batching and serving 🔴
 
 **Today.** Single sequence by default, end to end — batching exists but is
-opt-in because it measured slower here (E2). `GraphParams` carries no sequence
+opt-in because it measured slower here (E2, whose throughput acceptance was
+refuted and accepted as the outcome). `GraphParams` carries no sequence
 count at all: E2 deleted `n_seqs`, which A7 had kept as *reserved for item 3*,
 once item 3 landed and showed the count is data rather than topology
 (`CParams.explicit_span` carries the only topology decision it can force —
@@ -556,7 +557,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 |---|---|---|---|
 | 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. | §2.4 | XL |
 | 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. — **done** (E1: span input + resolver + CPU kernel + two-sequence test; E1b: CUDA windowed kernels, compile-verified) | §2.5 | L |
-| 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). — **mechanism landed in E2**: sequence-addressable batches, per-sequence reservations, the server composes one decode batch and batched prefills; `n_seqs` **deleted** (it turned out to be data, closing A7); **opt-in** (`MINFER_BATCH=1`) because the measured payoff on this box is negative (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0) — see the plan's E2 record | §2.5 | XL |
+| 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). — **mechanism landed in E2**: sequence-addressable batches, per-sequence reservations, the server composes one decode batch and batched prefills; `n_seqs` **deleted** (it turned out to be data, closing A7); **opt-in** (`MINFER_BATCH=1`) because the measured payoff on this box is negative (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0) — the throughput acceptance was **refuted by measurement and accepted**, closing the ticket; see the plan's E2 record | §2.5 | XL |
 | 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. — **done in B2/B3** (prefix-matched reuse, ≈11× TTFT on turn 2) | §2.5 | M |
 | 5 | **Fix `ensure_kv` size handling** and add the missing `pos < n_ctx` guard on both GPU backends. | §2.4 | S |
 | 6 | **Worker panic isolation** (`catch_unwind` + supervision + an error event instead of a silent empty stream). — **done in A4** | §2.5 | S |

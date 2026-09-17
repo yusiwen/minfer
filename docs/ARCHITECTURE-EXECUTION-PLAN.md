@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2's mechanism landed** (2026-09-17) but its throughput acceptance is **not met on this box** (see §7). | E2's acceptance needs a GPU (or a CPU `nt>1` kernel win) to re-measure; a GPU run should also re-check E1b's windowed path and timing; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2 landed and is closed** (2026-09-17): mechanism in, A7 closed by deleting `n_seqs`, throughput acceptance **refuted on this box and accepted** (see §7's closure note). | The next work the closure names is **C3/D1** (cross-slot prefix reuse — the actual cause of the 0.49x) and **C4/C5**; a GPU run should re-measure with `MINFER_BATCH_TRACE=1` and re-check E1b's windowed path; a CPU `nt>1` decode kernel (F1 family) is the only CPU route to the original throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -604,7 +604,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching — **mechanism landed, acceptance not met** (measured slower here; `MINFER_BATCH=1` opts in); A7 closed by **deleting** `n_seqs` | XL |
+| E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU throughput acceptance refuted and accepted** (opt-in `MINFER_BATCH=1`); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -811,6 +811,20 @@ now fully closed: both fields the A7 note called dead are gone. One incidental
 dead field went with it — `BatchEngine`'s `Run.finish`, set to `None` and never
 read (the finish reason is a parameter of `finish()`), removed with the build
 warning it produced.
+
+**E2 closed (2026-09-17, maintainer decision).** With the mechanism landed, A7
+closed, and the throughput acceptance refuted *with* its two causes measured
+(steps 3–4), the maintainer accepted the refutation: E2 is recorded as **mechanism
+landed, CPU throughput acceptance refuted — needs a bandwidth-bound device**, the
+server keeps the measured-better serial path by default, and `MINFER_BATCH=1`
+stays the documented opt-in. This follows the A6 precedent (a ticket may close on
+a measured negative result, recorded so nobody re-opens it). The follow-on work
+the decision names is C3/D1 (cross-slot prefix reuse via a cell copy, which is
+what the 0.49x gap is actually made of) and C4/C5; a CPU `nt > 1` decode kernel
+(the F1 family) is the only CPU-side route to the original throughput claim and is
+*not* part of E2. A GPU re-measurement should re-run the step-4 trace before
+concluding anything about batching on device — with a CUDA device the prefills
+stay per request (E1b), so the comparison there starts from a different baseline.
 
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
