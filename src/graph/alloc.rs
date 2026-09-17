@@ -624,6 +624,54 @@ impl GraphAllocator {
         self.kv.own_range(seq, from, to);
     }
 
+    /// Arena capacity in rows (`n_ctx`), 0 before allocation.
+    pub fn kv_n_ctx(&self) -> usize {
+        self.kv.n_ctx()
+    }
+
+    /// Declare the KV arena's capacity before the first `alloc_graph`, so
+    /// sequences can be reserved up front (E2's server does this per slot).
+    /// Must match the `n_ctx` the graphs are built with; `ensure_kv` re-checks
+    /// the region size on every rebuild.
+    pub fn kv_set_capacity(&mut self, n_ctx: usize) {
+        self.kv.set_n_ctx(n_ctx);
+    }
+
+    /// Fill a batch's inputs: mark each sequence's written rows, fill `seq_ids`
+    /// and resolve `attn_span` (Phase E / E2).
+    ///
+    /// A sequence with no reservation is refused unless it is the only one — the
+    /// single-sequence path takes the whole arena, which is exactly E1's
+    /// behaviour and keeps the classic forward bitwise; a batched caller must
+    /// reserve each run first (`kv_reserve_seq`), so a missing reservation is a
+    /// loud error rather than an overlap.
+    pub fn fill_batch_inputs(
+        &mut self,
+        graph: &ComputeGraph,
+        batch: &super::batch::Batch,
+    ) -> Result<(), String> {
+        for (seq, from, to) in batch.groups() {
+            if self.kv.seq_slot(seq).is_none() {
+                if batch.n_seqs() > 1 {
+                    return Err(format!(
+                        "sequence {seq} holds no KV cells; reserve it before batching                          (GraphAllocator::kv_reserve_seq)"
+                    ));
+                }
+                let cap = self.kv.n_ctx();
+                self.kv.reserve_seq(seq, cap)?;
+            }
+            let lo = batch.positions[from..to].iter().min().copied().unwrap_or(0);
+            let hi = batch.positions[from..to]
+                .iter()
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(lo);
+            self.kv.own_range(seq, lo, hi);
+        }
+        let positions: Vec<usize> = batch.positions.clone();
+        self.fill_seq_ids(graph, &batch.seq_ids, &positions)
+    }
+
     /// Fill the E1 attention inputs and record how far this forward writes:
     /// `positions` are cell indices, `seq_ids` names each query's sequence.
     ///

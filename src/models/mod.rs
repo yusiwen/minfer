@@ -74,6 +74,22 @@ pub trait ModelDef: Send + Sync {
         unimplemented!("forward_graph_cached not implemented for this architecture")
     }
 
+    /// One forward over a batch of sequences (Phase E / E2). Returns one logits
+    /// row per sequence in batch order (`n_tokens * n_vocab` for a decode batch
+    /// of `n_tokens` sequences, one token each).
+    ///
+    /// The default refuses: an architecture that has not been taught batching
+    /// must not silently serve a batch as if it were one sequence.
+    fn forward_batch(
+        &self,
+        _batch: &crate::graph::batch::Batch,
+        _n_out: usize,
+        _n_ctx: usize,
+        _cache: &mut crate::graph::cache::GraphCache,
+    ) -> Vec<f32> {
+        unimplemented!("forward_batch not implemented for this architecture")
+    }
+
     fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;

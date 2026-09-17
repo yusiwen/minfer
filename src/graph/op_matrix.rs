@@ -585,7 +585,7 @@ fn cases() -> Vec<Case> {
             name: "Attn",
             op: Op::Attn {
                 mode: AttnMode::Gqa,
-                multi_seq: false,
+                explicit_span: false,
             },
             build: build_attn,
             note: "",
@@ -629,7 +629,7 @@ fn all_ops() -> Vec<Op> {
         },
         Op::Attn {
             mode: AttnMode::Gqa,
-            multi_seq: false,
+            explicit_span: false,
         },
         Op::KvcacheStore { layer: 0 },
         Op::KvcacheLoad { layer: 0 },
@@ -776,7 +776,7 @@ fn support_table_matches_support_matrix_doc() {
             "Attn",
             Op::Attn {
                 mode: AttnMode::Gqa,
-                multi_seq: false,
+                explicit_span: false,
             },
             true,
             true,
@@ -790,7 +790,7 @@ fn support_table_matches_support_matrix_doc() {
             "Attn multi-seq",
             Op::Attn {
                 mode: AttnMode::Gqa,
-                multi_seq: true,
+                explicit_span: true,
             },
             true,
             false,

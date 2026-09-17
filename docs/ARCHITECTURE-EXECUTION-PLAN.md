@@ -591,7 +591,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **in progress** (reservations landed) | XL |
+| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **in progress** (reservations + batch forward landed) | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -664,8 +664,41 @@ did not move (`cargo test --release` 183 → 184 passed / 0 failed, the +1 being
 the new reservation test). The allocator exposes the E2-facing surface
 (`kv_reserve_seq`/`kv_release_seq`/`kv_seq_slot`/`kv_own_range`).
 
-Still to come in E2: the batch type + `forward` entry point, the server's shared
-cache and decode batching, and the `--n-slots 4` measurement.
+**E2 progress, step 2 (2026-09-17).** The batch entry point landed:
+`graph/batch.rs` defines `Batch { tokens, positions, seq_ids }` with `groups()`
+(contiguous runs), `out_rows()` (one logits row per sequence for a batch; the
+last `n_out` rows for a single sequence) and `check()`, which **refuses an
+interleaved batch** — the CPU path could tolerate it, but CUDA stages a query
+tile against one window (E1b), so an interleaved batch would be right on CPU and
+wrong on CUDA; that is the silent divergence the project refuses.
+`ModelDef::forward_batch` (default: refuse) runs one forward over a batch, and
+`forward_graph_cached` is now its one-sequence case, which is why the classic
+path's tests did not move. `GraphAllocator::fill_batch_inputs` marks each
+sequence's written rows, fills `seq_ids` and resolves the span in one call, and
+`kv_set_capacity` lets a caller reserve before the first `alloc_graph`.
+
+**The flag had to change meaning.** E2 makes a *single* sequence start at a
+non-zero cell (a slot's reserved run), and CUDA's causal instantiation derives
+`nkv = positions[t] + 1` — correct only when the window starts at cell 0. So
+`Op::Attn { multi_seq }` became `Op::Attn { explicit_span }`, meaning “positions
+alone cannot bound this node”: more than one sequence **or** a window that does
+not start at 0. The model derives it from the KV reservations
+(`kv_seq_slot(seq).start != 0`), never from `n_past`, and it lives in `CParams`
+because it selects a kernel instantiation (two graphs per shape at most, exactly
+like the fusion flags). The classic path — one sequence, `SEQ_MAIN`, start 0 —
+keeps the causal instantiation, so E1b's SASS/performance argument still holds,
+and Metal refuses the flagged node as before (G5).
+
+**Evidence gate (`a_two_sequence_batch_matches_two_single_sequence_forwards`).**
+Both sides use the *same* KV layout (sequence 7 at `[0, la)`, sequence 9 at
+`[la, la + lb)`), so the only difference is one forward carrying two sequences
+versus two forwards carrying one each: the batched prefill of both prompts and
+the batched decode step are **bitwise equal** to the per-sequence runs on
+Qwen2.5-0.5B Q4_0, and the fixture is discriminating (the two sequences' argmaxes
+differ). `cargo test --release` 184 → 189 passed / 0 failed.
+
+Still to come in E2: the server's shared cache and decode batching, and the
+`--n-slots 4` measurement.
 
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 

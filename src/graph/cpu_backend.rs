@@ -949,7 +949,7 @@ mod tests {
     fn two_sequences_do_not_cross_attend() {
         let mut h = Harness::new();
         let mut gb = GraphBuilder::new();
-        gb.set_multi_seq(true);
+        gb.set_explicit_span(true);
         // k/v are [nkt, nt] so the store node sizes the region as nkt * n_ctx.
         let pos = gb.input("positions", [2, 1, 1, 1], DType::I32);
         let q = gb.input("q", [2, 2, 1, 1], DType::F32);
@@ -980,11 +980,11 @@ mod tests {
             g.nodes.iter().any(|n| matches!(
                 n.op,
                 crate::graph::ops::Op::Attn {
-                    multi_seq: true,
+                    explicit_span: true,
                     ..
                 }
             )),
-            "the attention node must declare multi_seq"
+            "the attention node must declare explicit_span"
         );
 
         h.alloc.alloc_graph(&g).unwrap();

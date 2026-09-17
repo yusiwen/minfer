@@ -84,6 +84,16 @@ impl ModelDef for Qwen2Model {
         graph::Qwen2Graph::forward_cached(self, tokens, positions, n_out, n_ctx, cache)
     }
 
+    fn forward_batch(
+        &self,
+        batch: &crate::graph::batch::Batch,
+        n_out: usize,
+        n_ctx: usize,
+        cache: &mut crate::graph::cache::GraphCache,
+    ) -> Vec<f32> {
+        graph::Qwen2Graph::forward_batch(self, batch, n_out, n_ctx, cache)
+    }
+
     fn format_chat(&self, messages: &[(String, String)]) -> String {
         format_chatml(messages)
     }
