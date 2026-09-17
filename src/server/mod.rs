@@ -4,6 +4,7 @@
 //! pushes per-request events into per-request `tokio::sync::mpsc` channels,
 //! which the async handlers drain (backpressure = client consumption speed).
 
+pub mod batch;
 pub mod chat;
 pub mod slot;
 pub mod types;

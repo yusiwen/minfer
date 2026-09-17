@@ -33,7 +33,8 @@ src/
 ├── template.rs      # chat templates (minijinja) — 2.21.0 has no `str` methods; Qwen3's template falls back to ChatML (docs/QWEN3-SUPPORT-PLAN §5#9)
 ├── conversation.rs  # multi-turn session (append-only KV; overflow drops the oldest
 │                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
-├── server/          # OpenAI-compatible HTTP server (axum)
+├── server/          # OpenAI-compatible HTTP server (axum); `batch.rs` = continuous
+│                    #   batching (E2, opt-in via MINFER_BATCH=1 — measured slower on CPU)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)

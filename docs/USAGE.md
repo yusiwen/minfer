@@ -76,6 +76,16 @@ Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 
 ## OpenAI-compatible HTTP server
 
+`MINFER_BATCH=1` (opt-in) makes the worker compose one decode batch across the
+active slots instead of one forward per slot (Phase E / E2). It is off by default
+because on this project's reference CPU it measures *slower* than serving
+requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with
+`--n-slots 4`): the CPU decode kernels gain nothing from `nt > 1`, and concurrency
+forfeits the cross-request prefix reuse each slot otherwise keeps. Where decode is
+weight-bandwidth bound (a GPU) batching is the expected win; the plan's E2 record
+has the table and the reasoning.
+
+
 ```bash
 ./target/release/minfer serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
 # POST /v1/chat/completions  (stream + non-stream)

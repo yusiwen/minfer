@@ -33,7 +33,7 @@ pub struct Job {
     pub tx: mpsc::Sender<StreamEvent>,
 }
 
-fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
+pub(crate) fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
     id == special.eos || Some(id) == special.im_end
 }
 
@@ -44,7 +44,7 @@ fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
 /// `0..reuse`, and every one of them holds the same token the new prompt has at
 /// that position — the contents were verified, not assumed. A mismatch (or an
 /// empty record) yields 0, which means a full prefill from position 0.
-fn common_prefix_len(cached: &[u32], prompt: &[u32]) -> usize {
+pub(crate) fn common_prefix_len(cached: &[u32], prompt: &[u32]) -> usize {
     cached
         .iter()
         .zip(prompt.iter())
@@ -58,7 +58,7 @@ fn common_prefix_len(cached: &[u32], prompt: &[u32]) -> usize {
 /// Always at least the last token: its logits are what the sampler consumes, so
 /// a fully-cached prompt still costs one row (a decode step rather than a
 /// prefill).
-fn prefill_span(nt: usize, reuse: usize) -> (usize, usize) {
+pub(crate) fn prefill_span(nt: usize, reuse: usize) -> (usize, usize) {
     let feed_from = reuse.min(nt.saturating_sub(1));
     (feed_from, nt - feed_from)
 }
@@ -526,6 +526,29 @@ fn generate_seq(
     Ok(())
 }
 
+/// `forward_batch` wrapped like [`guarded_forward`]: a panic becomes an `Err`
+/// instead of unwinding the worker. A panic inside a *batched* forward is worse
+/// than a per-request one — the shared arena may be half-written — so `tick`
+/// fails the whole batch and the caller re-seeds the engine's caches.
+pub(crate) fn guarded_forward_batch(
+    model: &dyn ModelDef,
+    batch: &crate::graph::batch::Batch,
+    n_out: usize,
+    n_ctx: usize,
+    cache: &mut GraphCache,
+) -> Result<Vec<f32>, ApiError> {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.forward_batch(batch, n_out, n_ctx, cache)
+    }));
+    match r {
+        Ok(v) => Ok(v),
+        Err(payload) => Err(ApiError::server(format!(
+            "inference panicked: {}",
+            panic_message(&*payload)
+        ))),
+    }
+}
+
 /// `forward_graph_cached` wrapped so an unexpected panic (e.g. an internal
 /// invariant) becomes a 500 instead of killing the worker thread.
 fn guarded_forward(
@@ -587,6 +610,56 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Worker thread: drains the job queue serially, one slot at a time.
 /// Busy slots defer naturally — the queue is unbounded (llama.cpp semantics).
 pub fn worker_loop(
+    model: Box<dyn ModelDef>,
+    tokenizer: Tokenizer,
+    slots: Vec<Slot>,
+    job_rx: mpsc::Receiver<Job>,
+    spec_cfg: Option<crate::spec::SpecConfig>,
+) {
+    // E2: the plain path *can* batch every ready slot into one forward per step.
+    //
+    // It is **opt-in** (`MINFER_BATCH=1`), because on this project's reference
+    // box continuous batching is not a win: measured end to end, `--n-slots 4`
+    // against the same workload served serially was 0.88x on Qwen2.5-0.5B Q4_0
+    // and 0.49x on Qwen2.5-7B Q4_K_M (the plan's E2 record has the table and
+    // the diagnosis). Two causes, both measured rather than assumed: the CPU
+    // decode kernels' nt > 1 path is not more efficient per token (the 7B's
+    // batched forward is exactly 1.00x the serial one, the 0.5B's 1.45x), and
+    // concurrency forfeits B2's cross-request prefix reuse — each concurrent
+    // request needs its own KV home and starts cold, which on a model with a
+    // slow prefill (the 7B) dominates. The engine is kept because the same
+    // batching is the standard win where decode is weight-bandwidth bound (a
+    // GPU) — but nothing here can verify that (A0), so the default stays with
+    // the measured-better path, as A6 did.
+    //
+    // A session with a speculative draft keeps the per-slot caches and the
+    // run-to-completion loop below too, because doc 94/97's identity contract is
+    // per request.
+    let batch_on = std::env::var("MINFER_BATCH").map_or(false, |v| v == "1");
+    if spec_cfg.is_none() && batch_on {
+        let n_ctx_total: usize = slots.iter().map(|s| s.n_ctx_slot).sum();
+        match super::batch::BatchEngine::new(&*model, slots.len(), n_ctx_total) {
+            Ok(mut engine) => {
+                eprintln!(
+                    "[server] continuous batching: {} slot(s), {n_ctx_total} KV rows shared",
+                    engine.n_slots()
+                );
+                super::batch::serve_loop(&*model, &tokenizer, job_rx, &mut engine);
+            }
+            Err(e) => {
+                eprintln!("[server] continuous batching unavailable ({e}); serving serially");
+                worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg);
+            }
+        }
+        return;
+    }
+    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg);
+}
+
+/// The pre-E2 loop: one request at a time, each on its own slot cache. Kept for
+/// speculative sessions (the identity contract is per request) and as the loud
+/// fallback when the shared arena cannot be built.
+fn worker_loop_serial(
     model: Box<dyn ModelDef>,
     tokenizer: Tokenizer,
     mut slots: Vec<Slot>,
@@ -679,7 +752,7 @@ pub fn worker_loop(
     }
 }
 
-fn sampler_recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
+pub(crate) fn sampler_recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     crate::sampler::recent_window(tokens, last_n)
 }
 
