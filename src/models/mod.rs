@@ -106,6 +106,7 @@ pub trait ModelDef: Send + Sync {
 }
 
 /// Token IDs used by the sampler to stop generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpecialTokens {
     pub eos: u32,
     pub im_end: Option<u32>,

@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run. | E2 is next on the critical path; a GPU run should re-check E1b's windowed path and its timing; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2's mechanism landed** (2026-09-17) but its throughput acceptance is **not met on this box** (see §7). | E2's acceptance needs a GPU (or a CPU `nt>1` kernel win) to re-measure; a GPU run should also re-check E1b's windowed path and timing; C3 needs D1; C4/C5 finish Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -591,7 +591,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **in progress** (reservations + batch forward landed) | XL |
+| E2 | 3 | Batch composition + continuous batching; make `n_seqs` real — **landed, acceptance not met** (mechanism in, measured slower here; `MINFER_BATCH=1` opts in) | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -697,8 +697,50 @@ the batched decode step are **bitwise equal** to the per-sequence runs on
 Qwen2.5-0.5B Q4_0, and the fixture is discriminating (the two sequences' argmaxes
 differ). `cargo test --release` 184 → 189 passed / 0 failed.
 
-Still to come in E2: the server's shared cache and decode batching, and the
-`--n-slots 4` measurement.
+**E2 progress, step 3 (2026-09-17): the server batches, and the measurement says
+not to default to it.** `server/batch.rs` implements the design: one shared arena
+with one reservation per slot (`BatchEngine`, `n_ctx_total` rows split
+`n_slots` ways), a slot keeping its KV and its `cached_tokens` across requests so
+B2's prefix reuse still works, a submit path that pre-fills one request
+(reuse-aware admission: among idle slots it picks the one whose KV holds the
+longest prompt prefix), and a `tick` that carries every ready slot's next token
+in one `forward_batch` and then samples, commits and streams per slot. A
+speculative session keeps the per-slot caches and the run-to-completion loop
+(doc 94/97's identity contract is per request), and a panic in a batched forward
+fails the whole batch loudly, because the arenas may be half-written.
+
+The measurement, end to end through the HTTP server with `--n-slots 4` and
+`max_tokens` reached on every request (so both sides do equal work):
+
+| Workload | Serial | Concurrent | Ratio |
+|---|---|---|---|
+| Qwen2.5-0.5B Q4_0, prefix reuse on | 136 tok / 4.47 s | 143 tok / 5.08 s | **0.88x** |
+| Qwen2.5-0.5B Q4_0, `MINFER_NO_PREFIX_REUSE=1` | 136 tok / 6.36 s | 143 tok / 5.70 s | 1.12x |
+| Qwen2.5-7B Q4_K_M, prefix reuse on | 32 tok / 16.50 s | 32 tok / 18.42 s | **0.49x** |
+
+At the engine level (same slot layout on both sides, 4 requests × 16 tokens) the
+batched *forward* is 1.45x on the 0.5B and **1.00x** on the 7B.
+
+**Verdict: the acceptance is not met, and the two causes are measurable.**
+(1) The CPU decode kernels' `nt > 1` path is not more efficient per token — the
+7B's batched forward is exactly as fast as four serial forwards, so batching buys
+nothing there (the 0.5B, whose decode is launch/compute bound rather than weight
+bandwidth bound, gains 1.45x). (2) Concurrency *forfeits* B2's cross-request
+prefix reuse: each concurrent request needs its own KV home and starts cold,
+which on a model with a slow prefill (the 7B pays ~6 s for a 34-token chat
+prompt) dominates — hence 0.49x despite the neutral forward. Where decode is
+weight-bandwidth bound (a GPU) batching is the standard win, but nothing here can
+verify that (A0), so `MINFER_BATCH=1` is **opt-in** and the default stays with the
+measured-better serial path, exactly as A6 was reverted on measurement.
+
+What would change the verdict, recorded so the decision can be revisited: a
+usable GPU (or a bandwidth-bound model/hardware) to re-measure; a CPU `nt > 1`
+kernel improvement for the K-quants (the F1 family); and removing the
+reuse/concurrency conflict by warming each slot with the shared template prefix
+(a cell copy across slots is C3's operation — there is no such op yet).
+
+Still to come in E2: nothing is left to *build* for the deliverable; what remains
+is the acceptance, which this box cannot demonstrate.
 
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
 
@@ -938,7 +980,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ✔ ─ E2 ─ E3 ─ E4 ─ E5        (E1b ✔: CUDA half)
+Phase E  ├──────────────────── E1 ✔ ─ E2 ◐ ─ E3 ─ E4 ─ E5        (E1b ✔; E2 mechanism in, acceptance open)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └────────────────────────────────────────────►  (needs a Mac)
 ```
