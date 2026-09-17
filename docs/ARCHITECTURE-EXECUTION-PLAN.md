@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a).** | Delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3*. A7 is unblocked — rationale in §8. |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2). | C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 is in design**. | E1 is next on the critical path; C3 needs D1; C4/C5 are the rest of Phase C; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -589,7 +589,7 @@ prompt) belongs with E2's batching work.
 
 | ID | Item | Title | Effort |
 |---|---|---|---|
-| E1 | 2 | IR `seq_id` + explicit attention masks (CPU + CUDA) | L |
+| E1 | 2 | IR `seq_id` + explicit attention masks (CPU + CUDA) — **design** | L |
 | E2 | 3 | Batch composition + continuous batching; make `n_seqs` real | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
@@ -602,6 +602,53 @@ prompt) belongs with E2's batching work.
   the serial baseline on a fixed workload; the `n_seqs` field is either real or
   deleted (closes A7 if it was kept).
 - **E4/E5** are what make a model that does not fit in VRAM runnable at all.
+
+**E1 design (written before the code, 2026-09-17).** The bound a query may attend
+over is derived from `positions` today (`cpu_backend.rs`: `let vl = pos[t] + 1`,
+and the same derivation on device in CUDA). That is correct only while one
+sequence owns every written cell, and it is the one thing that makes E2
+impossible: a batch holding two sequences would let each one attend to the
+other. E1 replaces the derivation with **data**:
+
+1. **Two new inputs, not new topology.** `seq_ids` (I32 `[nt]`, one sequence id
+   per query token) and `attn_span` (I32 `[2*nt]`, the allowed cell range
+   `[lo, hi)` per query). Both are `Op::Input` leaves filled per step by the
+   allocator, exactly like `positions` — so `GraphParams`/`CParams` and the
+   params-only reuse identity do not move.
+2. **`KvCache` resolves the span.** The cell store already owns `owner[cell]`;
+   E1 adds `seq_range(seq) -> Option<(start, len)>` and
+   `attn_span(seq_ids, positions) -> Result<Vec<u32>, String>`, which returns
+   `lo = start`, `hi = min(start + len, pos + 1)`. Ownership must be contiguous
+   per sequence — that is the invariant the resolver asserts instead of
+   silently producing a wrong bound, and the reason a *range* is enough.
+3. **`Op::Attn` consumes it, and declares when positions would be wrong.**
+   `Op::Attn { mode }` becomes `Op::Attn { mode, multi_seq }`. The kernels always
+   read the span (single code path, no "derive or read" branch); `multi_seq`
+   exists so a backend that has not been ported **refuses** the op instead of
+   falling back to the positions derivation — Metal (untouched, Phase G) is that
+   backend. `n_seqs > 1` is what sets the flag, giving `GraphParams.n_seqs` its
+   first reader (E2 is what will make it a batch).
+4. **Bitwise for one sequence.** With a single sequence, `lo = 0` and
+   `hi = min(n_used, pos + 1) = pos + 1`, so the CPU kernel's loop bounds,
+   reduction length and accumulation order are unchanged — the existing
+   real-model bitwise tests (`graph_logits_match_forward_real_model`,
+   `reused_cache_across_prompts_matches_a_fresh_cache`, the C2 tests) are the
+   gate, not a new tolerance class.
+5. **Tests.** The cell store resolves two sequences in one arena (and errors on
+   non-contiguous ownership); an op-level two-sequence graph — one query per
+   sequence, distinctive V rows — must reproduce the single-sequence result
+   **bitwise**, which is what "no cross-attention" means; A1's op matrix gains
+   the `multi_seq` cell so the Metal refusal is recorded rather than assumed.
+6. **CUDA.** Both attention kernels (`gqa_attn_split` and the non-split path)
+   take the span; the I32 input reaches the device through the existing
+   capture-safe `positions_i32` conversion. This box has no device (A0), so the
+   CUDA half is **compile-verified only** and is recorded that way.
+
+**Not in E1:** batch composition and continuous batching (E2 — nothing composes
+several sequences into one forward yet, so the model path fills `seq_ids` with
+`SEQ_MAIN` and stays a single-sequence caller); chunked prefill (E3); a full
+per-cell mask, which only a layout with holes needs (C3/D1 — a range covers
+every layout the engine can currently produce); Metal (G5).
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
@@ -687,7 +734,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ─ E2 ─ E3 ─ E4 ─ E5
+Phase E  ├──────────────────── E1 ◐ ─ E2 ─ E3 ─ E4 ─ E5
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └────────────────────────────────────────────►  (needs a Mac)
 ```
