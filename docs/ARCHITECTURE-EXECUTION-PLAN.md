@@ -84,8 +84,9 @@ roadmap §4 defects automatically.
   `CUDA: no CUDA devices found (cudaGetDeviceCount err 304, count 0)` then
   `CUDA: not available, using CPU fallback`. The CPU path was unaffected
   (Qwen3-0.6B Q8_0: 120 tok/s prefill, 64.7 tok/s decode).
-- **Correction (2026-09-18).** The device was there the whole time; the *agent's
-  execution sandbox* was not. Under the harness's default file sandbox (Landlock)
+- **Correction (2026-09-18).** The *agent's execution sandbox* is enough to
+  produce every symptom A0 recorded, on a device that works. Under the harness's
+  default file sandbox (Landlock)
   every `open("/dev/nvidia*")` returns `EACCES` even though the nodes are
   `crw-rw-rw-`, so `cuInit` fails with 304 and NVML prints
   `Failed to initialize NVML: Unknown Error` — **the exact signature A0 recorded**.
@@ -93,10 +94,15 @@ roadmap §4 defects automatically.
   driver-upgrade state the maintainer had flagged): `NVIDIA GB10`, `sm_121`,
   121.6 GiB, driver 580.178.04, CUDA 13.0, `cuInit` → `CUDA_SUCCESS`.
   Every A0-era probe was therefore run inside a sandbox that cannot reach a GPU
-  **even when the GPU is healthy**, which makes "no device" an invalid
-  conclusion from those probes — and it means the CUDA half of every ticket
-  between then and now was compile-verified *and, in this session, finally
-  device-verified* (see the E1b record's device section).
+  **even when the GPU is healthy**, so those probes could not establish anything
+  about the driver's state: "no device" was unsupported rather than merely
+  pessimistic. (The maintainer recalls a driver upgrade without a reboot at the
+  time; that account and the sandbox are both consistent with the record, and
+  only the sandbox is reproducible today — which is why the correction is to
+  *re-run* the verification, not to assume it always would have passed.) What is
+  certain now: the CUDA half of every ticket between A0 and this session was
+  compile-verified only, and in this session it is **device-verified** (see the
+  E1b record's device section).
 - **Consequence for the plan:** tickets that were closed "compile-verified only"
   because of A0 are re-opened *as verification*, not as code: E1b's kernels, the
   A1 matrix's CUDA column, and the CUDA-side test suite all get their first
