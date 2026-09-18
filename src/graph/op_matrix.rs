@@ -817,7 +817,7 @@ fn support_table_matches_support_matrix_doc() {
         // derives its bound from positions and must refuse a multi-sequence
         // attention node (`backend_takes`), so it cannot be assigned one.
         (
-            "Attn multi-seq",
+            "Attn explicit-span",
             Op::Attn {
                 mode: AttnMode::Gqa,
                 explicit_span: true,

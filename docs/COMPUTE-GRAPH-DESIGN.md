@@ -216,10 +216,11 @@ pub enum Op {
     MatMul { transpose_b: bool },              // linear algebra
     GetRows,                                   // embedding lookup / tail-row selection
     RoPE { style: RopeStyle },                 // positional encoding
-    Attn { mode: AttnMode, multi_seq: bool },  // attention (softmax fused inside the kernel);
-                                               //   `multi_seq` = the batch spans several
-                                               //   sequences, so only a backend that reads
-                                               //   the explicit span may take the node
+    Attn { mode: AttnMode, explicit_span: bool },  // attention (softmax fused inside the kernel);
+                                               //   `explicit_span` = `positions` cannot bound the
+                                               //   node (several sequences, or a window that does
+                                               //   not start at cell 0), so only a backend that
+                                               //   reads the explicit span may take it
     KvcacheStore { layer: usize },             // persistent KV write; position comes from `positions`
     KvcacheLoad  { layer: usize },             // view of the persistent KV region
     View { offset: usize, shape: [usize; 4] },

@@ -2677,7 +2677,7 @@ __device__ __forceinline__ float4 h4_to_f4(const __half* p) {
 // ─── E1: the per-query attention window ───────────────────────────────────────
 // `CAUSAL` is the pre-E1 behaviour, still what every single-sequence caller uses:
 // the bound is `positions[t] + 1` and rows start at 0. The windowed
-// instantiation (E1b, reached only when the node is `Attn { multi_seq: true }`)
+// instantiation (E1b, reached only when the node is `Attn { explicit_span: true }`)
 // reads the `[lo, hi)` pair the KV store's ownership resolved, with `lo` at
 // `bound[t]` and `hi` at `bound[nt + t]`.
 //
