@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17, PR #3) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17, PR #4; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -163,6 +163,13 @@ roadmap §4 defects automatically.
      It now writes every cell, so the expectation is defined on every backend.
 - **Acceptance met for the CUDA column too (2026-09-18):** on GB10 (sm_121) the
   matrix is 17 CPU cells + 17 CUDA cells with no `FAIL` in either column.
+- **Recorded limitation (2026-09-18):** `support_table_matches_support_matrix_doc`
+  compares the code against a **mirror table hard-coded in Rust** and only *names*
+  `SUPPORT-MATRIX.md` in its failure message — it does not parse the markdown. A
+  stale row label therefore survives a green suite (it did: the `Attn` row still
+  said `multi_seq` after the field was renamed to `explicit_span`). Parsing the
+  published table would make the drift impossible rather than merely visible; it
+  is a hardening item for A1/A8, not a defect.
 
 ### A2 — CI  · item 24 · S — **DONE (verified in CI)**
 - **Files:** `.github/workflows/ci.yml`.
@@ -654,6 +661,7 @@ prompt) belongs with E2's batching work.
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
+| E6 | 3 (follow-up) | **Device-aware batching default**: enable continuous batching automatically when a CUDA device participates, keeping the serial path on CPU. E2 measured the sign of the effect per device (CPU 0.49x, GPU 1.9x) but left `MINFER_BATCH=1` opt-in; this ticket turns that measurement into the default. Needs its own change because it flips server behaviour, and it must keep the trace and the opt-out | S |
 
 - **E1 acceptance:** the mask is an explicit input, not a derivation from
   `positions`; a two-sequence test proves no cross-attention; single-sequence
@@ -898,6 +906,7 @@ GB10, and the ones that could not be *asserted* were made assertable:
 | CUDA Graph capture under batching | no capture failure or self-disable in any run |
 | C2's conversation path on device (adjacent: merged in PR #2, but it shares the KV cell store) | `context_shift_real_model_measurement` passes on GPU: incremental prefills 30 then 14 tokens/turn, and the physical removal + re-rope shift takes 185 -> 14 prefill tokens with correct replies throughout |
 | `conversation_real_model_smoke` (ignored, model-behaviour assertion) | **pre-existing red**: fails identically on master + device at the same `need_insert_eot` assertion, so it is not from these PRs |
+| `dump_real_q4k_tensor` / `dump_real_q5k_tensor` (ignored) | **pre-existing red** debug dumps (they compare against llama.cpp artifacts); unrelated to these PRs and not used as gates |
 | Full CUDA suite | 236 -> 237 passed / 0 failed / 5 ignored |
 | Full CPU suite | 191 passed / 0 failed / 5 ignored |
 
@@ -1108,6 +1117,12 @@ for, and it is correct and free:
   sequence's logits **bitwise** when their order in the batch is swapped. It
   passes on the device — and it is only bitwise because the window follows the
   sequence and its reservation, never the row index.
+- **Still open on the timing side (2026-09-18):** the *bitwise* equivalence is
+  now asserted, but the windowed instantiation's **cost at the same width** was
+  never measured — the GPU numbers in this record compare a 4-wide windowed step
+  against a 1-wide causal step (6.5 vs ~19 ms/token), which mixes the width and
+  the instantiation. A same-width A/B (windowed vs causal over identical rows,
+  timed) is the remaining question, and it needs a device.
 - **The causal-vs-windowed gap is closed (2026-09-18).** The record previously
   left this open: the windowed test exercises the row arithmetic but never the
   causal pointer against it. `cuda_causal_and_windowed_agree_on_the_same_rows`
@@ -1180,6 +1195,7 @@ Can run in parallel with A–E by a different workstream.
 | F5 | 14 | Async cross-backend copy + events | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality | M | this box |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
@@ -1269,3 +1285,21 @@ Deliberately not done, and where it is recorded:
 Open for the maintainer: the three CI jobs carry a pre-existing
 `Node.js 20 is deprecated` annotation for `actions/checkout@v4`; bumping to
 `v5` silences it.
+
+## 14. Known gaps and open risks (2026-09-18)
+
+Everything the campaign *measured* is recorded where it happened (the phase records
+above). This section exists because a risk that lives only in a chat message is
+not recorded at all: it lists what is **known to be unfinished or unverified**, in
+one place, so the next session does not have to rediscover it.
+
+| # | Gap / risk | Kind | Home / next step |
+|---|---|---|---|
+| 1 | **CI has no GPU.** The CUDA job only compiles the harness, so every device-gated test is a local, manual run — which is exactly how six device-only test bugs survived to 2026-09-18. | process | A **self-hosted runner on this DGX Spark** would put `cargo test --features cuda` into CI; nothing else does. Until then, anyone changing CUDA code must run it by hand and say so. |
+| 2 | **The windowed instantiation's cost at equal width is unmeasured** (`cuda_causal_and_windowed_agree_on_the_same_rows` proves equality, not speed). | measurement | E1b record; needs a device A/B over identical rows at one width. |
+| 3 | **A varying batch width rebuilds the graph** (`GraphCache` holds one graph at a time), so a server alternating 1-wide and N-wide decode steps re-allocates. | design | **E4** (allocator reserve/assign + multi-graph cache). |
+| 4 | **The op matrix's support table does not parse `SUPPORT-MATRIX.md`** — it checks a Rust mirror, so a stale doc row stays green (it did, for `multi_seq`). | test hardening | A1/A8; recorded in the A1 record. |
+| 5 | **Batching is opt-in** even where it is measured faster (`MINFER_BATCH=1`; GPU 1.9x). | product | **E6**. |
+| 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
+| 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
+| 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |
