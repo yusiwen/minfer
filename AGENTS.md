@@ -34,7 +34,7 @@ src/
 ├── conversation.rs  # multi-turn session (append-only KV; overflow drops the oldest
 │                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
 ├── server/          # OpenAI-compatible HTTP server (axum); `batch.rs` = continuous
-│                    #   batching (E2, opt-in via MINFER_BATCH=1 — measured slower on CPU)
+│                    #   batching (E2, opt-in via MINFER_BATCH=1 — 0.49x on CPU, 1.9x on GPU)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)
@@ -61,6 +61,8 @@ MINFER_TRACE=/tmp/t.json  ./target/release/minfer <model> "hello"  # per-node re
 ./target/release/minfer viz <model>                                # viz server (page + live SSE)
 ```
 
+- CUDA test suite on a real GPU: `cargo test --release --features cuda` (CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box: 236 passed / 0 failed, GB10 sm_121). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA.
+- Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device" (A0 was wrong for exactly this reason).
 - Full CLI + options: `docs/USAGE.md`. CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
 - Multi-part GGUF: entry is part 0, all parts parsed into one merged tensor index; download resume is size-checked.
 

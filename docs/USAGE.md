@@ -82,8 +82,19 @@ because on this project's reference CPU it measures *slower* than serving
 requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with
 `--n-slots 4`): the CPU decode kernels gain nothing from `nt > 1`, and concurrency
 forfeits the cross-request prefix reuse each slot otherwise keeps. Where decode is
-weight-bandwidth bound (a GPU) batching is the expected win; the plan's E2 record
-has the table and the reasoning.
+weight-bandwidth bound (a GPU) batching is the win, and it is now measured rather
+than expected: **1.9x on the GB10** (7B Q4_K_M, four identical prompts, equal
+work, `--n-slots 4`). The plan's E2 record has both tables.
+
+Two environment switches around the GPU are easy to get wrong:
+
+- `MINFER_DISABLE_CUDA` is checked for **presence**, not value: setting it to
+  `0` *disables* CUDA. To force the CPU path deliberately use
+  `MINFER_DISABLE_CUDA=1`; to use the GPU, leave it unset.
+- On a device, batched *prefills* stay per request by construction (CUDA's
+  `fa_prefill` tiles one query tile against one KV window — E1b), so `--n-slots`
+  concurrency still pays one prefill per request, and prefix reuse across slots
+  needs a cell copy (C3/D1). The batched-decode win is unaffected.
 
 
 ```bash
