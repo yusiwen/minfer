@@ -894,6 +894,51 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    /// The named tolerance class for comparisons whose two sides were computed
+    /// at **different batch shapes** (a different `nt` anywhere in their
+    /// history) — the project's rule is "bitwise-identity *or* a named tolerance
+    /// class", and this is the second.
+    ///
+    /// On CPU these comparisons are bitwise and stay bitwise: the kernels are
+    /// per-token, so shape never enters the arithmetic. CUDA's prefill kernels
+    /// tile by `nt` and quantize activations to int8 (MMQ), so the *same* tokens
+    /// processed at a different `nt` land on slightly different K/V values. The
+    /// drift is bounded and small — measured on GB10 (sm_121) as ≤ 0.37 absolute
+    /// on these fixtures' logits (each test prints its value on device) — but it
+    /// is far above 0, so a bitwise assertion would be a false claim there.
+    ///
+    /// This is a gross-error detector for device runs, not a proof of
+    /// correctness: the same-shape gates (`batch_order_does_not_change_a_sequences_logits`,
+    /// `cuda_two_sequences_do_not_cross_attend`) and the CPU bitwise assertions
+    /// are what pin the mechanism.
+    fn cross_shape_tolerance() -> f32 {
+        #[cfg(feature = "cuda")]
+        if crate::cuda::CudaState::get().is_some() {
+            return 1.0;
+        }
+        0.0
+    }
+
+    /// Assert two forwards that differ in shape agree: bitwise on CPU, within
+    /// [`cross_shape_tolerance`] on a device (where `what` is printed with the
+    /// measured |Δ| so drift regressions are visible in the log).
+    fn assert_across_shapes(what: &str, a: &[f32], b: &[f32]) {
+        let d = max_delta(a, b);
+        let tol = cross_shape_tolerance();
+        if tol > 0.0 {
+            eprintln!("[cuda] {what}: max |Δ| = {d} (named class: <= {tol})");
+        }
+        assert!(
+            d <= tol,
+            "{what}: max |Δ| = {d} exceeds {} tolerance ({tol})",
+            if tol == 0.0 {
+                "the bitwise"
+            } else {
+                "the CUDA cross-shape"
+            }
+        );
+    }
+
     fn argmax(x: &[f32]) -> u32 {
         let mut best = 0usize;
         for i in 1..x.len() {
@@ -1060,16 +1105,17 @@ mod tests {
         let l_whole = model.forward_graph_cached(&prompt, &ppos, 1, n_ctx, &mut whole);
 
         assert_eq!(l_incremental.len(), l_whole.len());
-        let worst = l_incremental
-            .iter()
-            .zip(&l_whole)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            worst == 0.0,
-            "prefix reuse changed the logits (max |Δ| = {worst}, head {} tail {})",
-            head.len(),
-            tail.len()
+        // Prefix reuse re-feeds the prefix at one shape and the tail at another,
+        // so this is a cross-shape comparison: bitwise on CPU, the named CUDA
+        // class on a device (`cross_shape_tolerance`).
+        assert_across_shapes(
+            &format!(
+                "prefix reuse against a full prefill (head {} tail {})",
+                head.len(),
+                tail.len()
+            ),
+            &l_incremental,
+            &l_whole,
         );
     }
 
@@ -1180,26 +1226,22 @@ mod tests {
             &mut ref9,
         );
 
-        // ---- bitwise, on all four comparisons ----
-        assert_eq!(
-            max_delta(&pre7, &r_pre7),
-            0.0,
-            "batched prefill of sequence {s7} diverged"
+        // ---- all four comparisons ----
+        // The batch carries both sequences in one forward, the reference carries
+        // them one per forward: cross-shape, so bitwise on CPU and the named
+        // CUDA class on a device. `batch_order_does_not_change_a_sequences_logits`
+        // is the same-shape gate that stays bitwise on both.
+        assert_across_shapes(&format!("batched prefill of sequence {s7}"), &pre7, &r_pre7);
+        assert_across_shapes(&format!("batched prefill of sequence {s9}"), &pre9, &r_pre9);
+        assert_across_shapes(
+            &format!("batched decode of sequence {s7}"),
+            &l_step[..nv],
+            &r_next7,
         );
-        assert_eq!(
-            max_delta(&pre9, &r_pre9),
-            0.0,
-            "batched prefill of sequence {s9} diverged"
-        );
-        assert_eq!(
-            max_delta(&l_step[..nv], &r_next7),
-            0.0,
-            "batched decode of sequence {s7} diverged"
-        );
-        assert_eq!(
-            max_delta(&l_step[nv..], &r_next9),
-            0.0,
-            "batched decode of sequence {s9} diverged"
+        assert_across_shapes(
+            &format!("batched decode of sequence {s9}"),
+            &l_step[nv..],
+            &r_next9,
         );
         // The fixture must discriminate: two sequences in one forward must not
         // collapse onto the same answer.
@@ -1334,12 +1376,123 @@ mod tests {
             &mut ref9,
         );
 
-        // Bitwise: sequence 7's work (and reusing the graph) must not have
-        // touched sequence 9's rows.
+        // Sequence 7's work (and reusing the graph) must not have touched
+        // sequence 9's rows. The batched side's keys were written by a two-token
+        // forward and one of the pair's, the reference's by single-sequence
+        // forwards — cross-shape, so CPU stays bitwise and a device uses the
+        // named class.
+        assert_across_shapes(
+            "the reused graph against a fresh single-sequence forward",
+            &one,
+            &r_one,
+        );
+    }
+
+    /// E1b/E2: a query's attention window follows from **which sequence it
+    /// belongs to and where that sequence is reserved** — never from its row
+    /// index inside the batch. Swapping two sequences in an otherwise identical
+    /// batch must therefore reproduce each sequence's logits *bitwise*, on CPU
+    /// and on CUDA alike.
+    ///
+    /// This is the device-capable form of E1's "two sequences do not
+    /// cross-attend" gate. The earlier batched tests compare forwards of
+    /// *different shapes* (a batched prefill against per-sequence prefills),
+    /// which is bitwise only on CPU: CUDA's prefill kernels tile by `nt` and
+    /// store quantized activations, so a different shape changes the K/V values
+    /// by ~1e-3 relative — measured on this box as ~0.3 absolute on logits, and
+    /// already true on master for B2's and C2's cross-shape tests. A swap keeps
+    /// the shape, the layout, the KV history and the graph identical, leaving
+    /// the window assignment as the only thing that can move the numbers, so
+    /// bitwise equality is the right expectation on every backend.
+    #[test]
+    fn batch_order_does_not_change_a_sequences_logits() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the batch-order test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let nv = model.n_vocab();
+        let a = tok.encode("The capital of France is");
+        let b = tok.encode("The capital of Japan is");
+        let (la, lb) = (a.len(), b.len());
+        let (s7, s9) = (7u32, 9u32);
+
+        // Same reservations, same order, in both caches: first-fit makes the two
+        // layouts identical, so the only difference below is the batch order.
+        let layout = |cache: &mut GraphCache| -> (usize, usize) {
+            cache.alloc().kv_set_capacity(n_ctx);
+            let r7 = cache.alloc().kv_reserve_seq(s7, la + 2).expect("reserve 7");
+            let r9 = cache.alloc().kv_reserve_seq(s9, lb + 2).expect("reserve 9");
+            (r7.start, r9.start)
+        };
+
+        // The whole run, with sequence 7 either first or second in the decode
+        // batch. Returns `(logits of 7, logits of 9)`.
+        let run = |cache: &mut GraphCache, seq7_first: bool| -> (Vec<f32>, Vec<f32>) {
+            let (p7, p9) = layout(cache);
+            let pos7: Vec<usize> = (p7..p7 + la).collect();
+            let pos9: Vec<usize> = (p9..p9 + lb).collect();
+            let pre7 = model.forward_batch(
+                &Batch::new(a.clone(), pos7.clone(), vec![s7; la]),
+                1,
+                n_ctx,
+                cache,
+            );
+            let t7 = argmax(&pre7);
+            let pre9 = model.forward_batch(
+                &Batch::new(b.clone(), pos9.clone(), vec![s9; lb]),
+                1,
+                n_ctx,
+                cache,
+            );
+            let t9 = argmax(&pre9);
+
+            // One token per sequence, nt = 2 either way.
+            let (tokens, positions, seq_ids) = if seq7_first {
+                (vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9])
+            } else {
+                (vec![t9, t7], vec![p9 + lb, p7 + la], vec![s9, s7])
+            };
+            let rows =
+                model.forward_batch(&Batch::new(tokens, positions, seq_ids), 1, n_ctx, cache);
+            assert_eq!(rows.len(), 2 * nv, "one logits row per sequence");
+            if seq7_first {
+                (rows[..nv].to_vec(), rows[nv..].to_vec())
+            } else {
+                (rows[nv..].to_vec(), rows[..nv].to_vec())
+            }
+        };
+
+        let mut c1 = GraphCache::new();
+        let (r7_first, r9_second) = run(&mut c1, true);
+        let mut c2 = GraphCache::new();
+        let (r7_second, r9_first) = run(&mut c2, false);
+
         assert_eq!(
-            max_delta(&one, &r_one),
+            max_delta(&r7_first, &r7_second),
             0.0,
-            "the reused graph diverged from a fresh single-sequence forward"
+            "sequence 7's logits depend on its row index in the batch"
+        );
+        assert_eq!(
+            max_delta(&r9_second, &r9_first),
+            0.0,
+            "sequence 9's logits depend on its row index in the batch"
+        );
+        // The fixture must discriminate: swapping must not have collapsed the
+        // two sequences onto the same distribution.
+        assert!(
+            max_delta(&r7_first, &r9_second) > 0.0,
+            "both sequences produced identical logits - the fixture is not discriminating"
         );
     }
 
@@ -1451,11 +1604,9 @@ mod tests {
         let _ = model.forward_graph_cached(&a, &pos_a, 1, n_ctx, &mut fresh);
         let l_ref = model.forward_graph_cached(&cd, &pos_cd, 1, n_ctx, &mut fresh);
         assert_eq!(l_cut.len(), l_ref.len());
-        let worst = delta(&l_cut, &l_ref);
-        assert_eq!(
-            worst, 0.0,
-            "removing B must leave A + (C, D) bitwise equal to a fresh A + (C, D)"
-        );
+        // A's rows were computed in the A+B forward, the reference's in an A-only
+        // forward: a cross-shape comparison, so the CUDA tolerance class applies.
+        assert_across_shapes("removing B against a fresh A + (C, D)", &l_cut, &l_ref);
 
         // (2) Remove a *middle* range: V copies byte-for-byte, [0, start) is
         // untouched, only the moved K is re-roped.

@@ -3074,11 +3074,16 @@ mod tests {
         let _guard = crate::cuda::CudaState::model_load_guard();
         cb.kv_f16 = false; // f32 KV keeps the store and the attention in one dtype
 
-        // One head, hd = 2, two sequences: sequence 0 owns row 0, sequence 1
+        // One head, hd = 4, two sequences: sequence 0 owns row 0, sequence 1
         // owns row 2. The values make a leak change the answer — query 1 scores
         // 1.0 against sequence 0's key, so a window starting at 0 would blend
         // V(0) into the result instead of returning V(2).
-        let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 2usize, 2usize, 4usize);
+        //
+        // hd must be a multiple of 4: the CUDA attention kernels reject anything
+        // else (`attention head dim ... outside the kernel's supported range`),
+        // so the original hd = 2 fixture could never execute on a device — the
+        // test compiled and skipped everywhere until this box got a working GPU.
+        let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 4usize, 2usize, 4usize);
         let nkt = nk * hd;
         let mut gb = GraphBuilder::new();
         gb.set_explicit_span(true);
@@ -3125,11 +3130,14 @@ mod tests {
         let pb = cb.alloc_buffer(nt);
         let sb = cb.alloc_buffer(2 * nt);
         let ob = cb.alloc_buffer(nh * hd * nt);
-        // token 0 = [1, 0] (sequence 0), token 1 = [1, 0] (sequence 1)
-        cb.write_host(qb, &[1.0, 0.0, 1.0, 0.0]).unwrap();
-        // row 0 = k [1,0] / v [1,0]; row 2 = k [0,1] / v [0,1]
-        cb.write_host(kb, &[1.0, 0.0, 0.0, 1.0]).unwrap();
-        cb.write_host(vb, &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        // token 0 = [1,0,0,0] (sequence 0), token 1 = [1,0,0,0] (sequence 1)
+        cb.write_host(qb, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        // row 0 = k [1,0,0,0] / v [1,0,0,0]; row 2 = k [0,1,0,0] / v [0,1,0,0]
+        cb.write_host(kb, &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        cb.write_host(vb, &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+            .unwrap();
         cb.write_host(pb, &i32bits(&[0, 2])).unwrap();
         cb.write_host(sb, &i32bits(&[0, 2, 1, 3])).unwrap(); // lo block, hi block
 
@@ -3137,13 +3145,22 @@ mod tests {
             .unwrap();
         cb.execute_node(&g.nodes[at], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
             .unwrap();
-        let got = cb.read_host(ob).unwrap();
+        // `copy_to_host`, not the trait's `read_host`: CUDA cannot return a
+        // borrowed slice of device memory, so its `read_host` is `None` by
+        // design (alloc.rs's `copy_to_cpu` CUDA arm does the same copy).
+        let got = cb.copy_to_host(ob).unwrap();
         assert!(
-            (got[0] - 1.0).abs() < 1e-4 && got[1].abs() < 1e-4,
+            (got[0] - 1.0).abs() < 1e-4
+                && got[1].abs() < 1e-4
+                && got[2].abs() < 1e-4
+                && got[3].abs() < 1e-4,
             "token 0 must attend to its own row: {got:?}"
         );
         assert!(
-            got[2].abs() < 1e-4 && (got[3] - 1.0).abs() < 1e-4,
+            got[4].abs() < 1e-4
+                && (got[5] - 1.0).abs() < 1e-4
+                && got[6].abs() < 1e-4
+                && got[7].abs() < 1e-4,
             "token 1 saw the other sequence: {got:?}"
         );
     }

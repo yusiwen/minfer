@@ -143,6 +143,12 @@ fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
         Backend::Cuda => {
             #[cfg(feature = "cuda")]
             {
+                // `CudaState::get()` stays `None` until something initializes the
+                // process-wide state: `main` does it at startup, the model tests
+                // through the loader. A harness that runs CUDA cells must do it
+                // itself, or the column silently depends on *test order* (it ran
+                // on a device in a full-suite run and skipped in a filtered one).
+                crate::cuda::CudaState::init();
                 match super::cuda_backend::CudaBackend::new() {
                     Some(c) => Ok(super::backend_takes(&c, op, DType::F32)),
                     None => Err("no CUDA device".into()),
@@ -184,6 +190,7 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
         Backend::Cuda => {
             #[cfg(feature = "cuda")]
             {
+                crate::cuda::CudaState::init();
                 if !alloc.enable_cuda() {
                     return Err("no CUDA device".into());
                 }
@@ -196,6 +203,16 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
     alloc.alloc_graph(&g)?;
     for w in &weights {
         alloc.register_weight(&w.name, w.clone());
+        // The CPU registry is not the CUDA one: in the product the *loader*
+        // registers each weight into `CudaState` (`models/*/loader.rs`), which a
+        // synthetic harness has no equivalent of. Without this the matrix's
+        // weight ops could only ever report "weight not registered on CUDA".
+        #[cfg(feature = "cuda")]
+        if tag == Backend::Cuda {
+            if let Some(state) = crate::cuda::CudaState::get() {
+                state.register_weight(&w.name, w.data());
+            }
+        }
     }
     for (name, data) in &inputs {
         let id = graph_input_id(&g, name).ok_or_else(|| format!("no input '{name}'"))?;
@@ -301,18 +318,22 @@ fn build_rms_norm(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor
 }
 
 fn build_qk_norm(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
-    // [nt * nh, hd] = [2, 2]: two heads, each normalized with the same weight.
-    let x = b.input("x", [4, 1, 1, 1], DType::F32);
-    let w = t("q_norm.weight", [2, 1, 1, 1], &[1.0, 2.0]);
-    let o = b.qk_norm(x, Some(&w), 2, 2, 1e-5);
-    let a = vec![1.0, 2.0, 3.0, 4.0];
-    let mut exp = Vec::with_capacity(4);
+    // [nt * nh, hd] = [2, 4]: two heads, each normalized with the same weight.
+    // hd is a multiple of 4 because CUDA's qk_norm kernel is a float4 kernel
+    // ("qk_norm head dim 2 must be a nonzero multiple of 4"), so the hd = 2
+    // fixture could only ever pass on CPU.
+    let x = b.input("x", [8, 1, 1, 1], DType::F32);
+    let w = t("q_norm.weight", [4, 1, 1, 1], &[1.0, 2.0, 3.0, 4.0]);
+    let o = b.qk_norm(x, Some(&w), 4, 2, 1e-5);
+    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut exp = Vec::with_capacity(8);
     for h in 0..2 {
-        let row = &a[h * 2..h * 2 + 2];
-        let mean: f32 = row.iter().map(|v| v * v).sum::<f32>() / 2.0;
+        let row = &a[h * 4..h * 4 + 4];
+        let mean: f32 = row.iter().map(|v| v * v).sum::<f32>() / 4.0;
         let scale = 1.0 / (mean + 1e-5).sqrt();
-        exp.push(row[0] * scale * 1.0);
-        exp.push(row[1] * scale * 2.0);
+        for (i, v) in row.iter().enumerate() {
+            exp.push(v * scale * (i as f32 + 1.0));
+        }
     }
     (o, vec![("x", a)], exp, vec![w])
 }
@@ -424,15 +445,20 @@ fn build_rope(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
 }
 
 fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
-    // One head, one KV head, hd = 2, one query at position 0: the window the
+    // One head, one KV head, hd = 4, one query at position 0: the window the
     // span input names holds exactly one KV row, so softmax over a single score
     // is 1 and the output is V.
+    //
+    // hd is a multiple of 4 because CUDA's attention kernels require it
+    // (`attn head dim outside the kernel's supported range` otherwise); with
+    // hd = 2 this case could only ever PASS on CPU, which made the matrix's
+    // CUDA column a compile-check rather than a run.
     let pos = b.input("positions", [1, 1, 1, 1], DType::I32);
-    let q = b.input("q", [2, 1, 1, 1], DType::F32);
-    let k = b.input("k", [2, 1, 1, 1], DType::F32);
-    let v = b.input("v", [2, 1, 1, 1], DType::F32);
+    let q = b.input("q", [4, 1, 1, 1], DType::F32);
+    let k = b.input("k", [4, 1, 1, 1], DType::F32);
+    let v = b.input("v", [4, 1, 1, 1], DType::F32);
     let _store = b.kvcache_store(0, k, v, pos, 4);
-    let load = b.kvcache_load(0, 2, 4, 1);
+    let load = b.kvcache_load(0, 4, 4, 1);
     let o = b.attn(
         q,
         load,
@@ -442,44 +468,48 @@ fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
             layer: 0,
             n_head: 1,
             n_head_kv: 1,
-            hd: 2,
-            hd_kv: 2,
-            nkt: 2,
+            hd: 4,
+            hd_kv: 4,
+            nkt: 4,
             scale: 0.5,
         },
     );
     (
         o,
         vec![
-            ("q", vec![1.0, 1.0]),
-            ("k", vec![1.0, 0.0]),
-            ("v", vec![0.25, -0.75]),
+            ("q", vec![1.0, 1.0, 0.0, 0.0]),
+            ("k", vec![1.0, 0.0, 0.0, 0.0]),
+            ("v", vec![0.25, -0.75, 0.0, 0.0]),
             ("positions", vec![0.0]),
             // E1: one sequence, one query, window [0, 1).
             ("seq_ids", vec![0.0]),
             ("attn_span", vec![0.0, 1.0]),
         ],
-        vec![0.25, -0.75],
+        vec![0.25, -0.75, 0.0, 0.0],
         vec![],
     )
 }
 
 fn build_kv_roundtrip(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
-    let pos = b.input("positions", [2, 1, 1, 1], DType::I32);
-    let k = b.input("k", [2, 2, 1, 1], DType::F32);
-    let v = b.input("v", [2, 2, 1, 1], DType::F32);
+    // Every cell of the region is written, so the expectation below is fully
+    // defined on every backend. (Leaving rows unwritten and expecting zeros is a
+    // CPU-buffer property, not a contract: a fresh CPU pool is zeroed, a device
+    // region is not, and no kernel ever reads an unwritten cell.)
+    let pos = b.input("positions", [4, 1, 1, 1], DType::I32);
+    let k = b.input("k", [2, 4, 1, 1], DType::F32);
+    let v = b.input("v", [2, 4, 1, 1], DType::F32);
     let _store = b.kvcache_store(0, k, v, pos, 4);
     let load = b.kvcache_load(0, 2, 4, 1);
-    // The load node's buffer IS the K region: [n_embd, n_ctx] = 2 x 4, with the
-    // two written rows first and the rest zero.
+    // The load node's buffer IS the K region: [n_embd, n_ctx] = 2 x 4, in cell
+    // order.
     (
         load,
         vec![
-            ("k", vec![1.0, 2.0, 3.0, 4.0]),
-            ("v", vec![9.0, 9.0, 9.0, 9.0]),
-            ("positions", vec![0.0, 1.0]),
+            ("k", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            ("v", vec![9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0]),
+            ("positions", vec![0.0, 1.0, 2.0, 3.0]),
         ],
-        vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         vec![],
     )
 }
