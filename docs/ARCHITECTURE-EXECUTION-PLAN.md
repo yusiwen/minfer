@@ -710,7 +710,7 @@ sequence-aware:
 **Not in E2:** mixed prefill+decode batches and chunked prefill (E3), moving a
 sequence's cells when the arena fragments (C3 needs D1; E2 reserves a slot's
 budget up front and fails loudly instead), layer offload (E5), Metal (G5), and
-CUDA runtime verification (deferred under A0; done 2026-09-18 for E1b, still open for C2's CUDA arm).
+CUDA runtime verification (deferred under A0; **done 2026-09-18 for E1b and for C2's CUDA arm** — see the sweep below).
 
 **E2 progress (2026-09-17).** Step 1 of the design landed: `KvCache` holds
 per-sequence reservations (`SeqSlot { start, cap }`, `reserve_seq` first-fit,
@@ -873,9 +873,33 @@ The trace explains where it comes from, and confirms the E1b constraint still
 holds on device: with a CUDA device the prefills stay per request
 (`prefill_batch_ok()` is false, because `fa_prefill_f16kv` tiles a query against
 one window) — 83 ms for the first 40-token prompt, 41 ms for each of the other
-three — so the whole win is the **batched decode**: 16 four-wide steps instead of
-64 single-token ones. On CPU the same workload was 0.49x (step 3): the sign of the
-effect is a property of the device, exactly as the closure predicted.
+three — so the whole win is the **batched decode**. That used to be an inference
+from the totals; `MINFER_BATCH_TRACE=1` now also prints the decode step itself,
+and the re-run shows it directly: **15 steps of 4 sequences (plus one of 3 and one
+of 1) for the 64 tokens, at 6.5–6.7 ms/token**, against ~19 ms/token for the
+serial path (1.23 s of decode for 64 tokens) — ~2.9x per decoded token, which the
+four full prefills the batched side pays turn into the 1.9x end to end. On CPU the
+same workload was 0.49x (step 3): the sign of the effect is a property of the
+device, exactly as the closure predicted.
+
+**Device verification sweep before merging (2026-09-18).** Everything in PR #3
+and PR #4 that had been left unverified for lack of a device was re-run on the
+GB10, and the ones that could not be *asserted* were made assertable:
+
+| Item | Result |
+|---|---|
+| E1b windowed kernels (`cuda_two_sequences_do_not_cross_attend`) | passes on device, after fixing its `hd = 2` fixture and `read_host` read |
+| E1b causal vs windowed, same rows | new gate, bitwise equal on device (closes the gap above) |
+| E2 batched decode windows with a real model | `batch_order_does_not_change_a_sequences_logits` passes bitwise on device |
+| E2 engine acceptance (`server_batch_matches_serial_and_is_faster`, ignored) | passes: 1.32x at 0.5B, all four continuations share a non-empty prefix |
+| E2 server, 7B Q4_K_M, `--n-slots 4` | 1.9x, 15 four-wide decode steps traced |
+| Wider windowed batch | `--n-slots 8`, 8 concurrent prompts: 11 eight-wide steps, ~1.2–1.9 ms/token, all eight answers distinct |
+| Qwen3 (the other model E1/E2 touched) multi-sequence | `--n-slots 2` on Qwen3-0.6B Q8_0: 12 two-wide steps, both answers correct — the path had no test coverage on any backend before this |
+| CUDA Graph capture under batching | no capture failure or self-disable in any run |
+| C2's conversation path on device (adjacent: merged in PR #2, but it shares the KV cell store) | `context_shift_real_model_measurement` passes on GPU: incremental prefills 30 then 14 tokens/turn, and the physical removal + re-rope shift takes 185 -> 14 prefill tokens with correct replies throughout |
+| `conversation_real_model_smoke` (ignored, model-behaviour assertion) | **pre-existing red**: fails identically on master + device at the same `need_insert_eot` assertion, so it is not from these PRs |
+| Full CUDA suite | 236 -> 237 passed / 0 failed / 5 ignored |
+| Full CPU suite | 191 passed / 0 failed / 5 ignored |
 
 **E2 closed (2026-09-17, maintainer decision; re-measured 2026-09-18).** With the
 mechanism landed, A7 closed, and the throughput acceptance refuted *with* its two
@@ -1084,12 +1108,13 @@ for, and it is correct and free:
   sequence's logits **bitwise** when their order in the batch is swapped. It
   passes on the device — and it is only bitwise because the window follows the
   sequence and its reservation, never the row index.
-- **Residual gap, recorded rather than papered over:** a *causal*-vs-*windowed*
-  comparison on the same rows is not directly asserted on device (the windowed
-  test uses `lo = 0` for one query, which exercises the same row arithmetic but
-  not the causal pointer). The equivalence rests on the SASS identity plus the
-  CPU-side tests; a GPU-only A/B of the two instantiations over identical data
-  would close it.
+- **The causal-vs-windowed gap is closed (2026-09-18).** The record previously
+  left this open: the windowed test exercises the row arithmetic but never the
+  causal pointer against it. `cuda_causal_and_windowed_agree_on_the_same_rows`
+  now runs the *same* queries, K/V and rows through both instantiations — a
+  window that starts at cell 0, so `positions[t] + 1` and the explicit span name
+  the same rows — and asserts the outputs are **bitwise equal** on the device. It
+  passes on GB10, so the equivalence no longer rests on the SASS identity alone.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
