@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2 landed and is closed** (2026-09-17): mechanism in, A7 closed by deleting `n_seqs`, throughput acceptance **refuted on this box and accepted** (see §7's closure note). | The next work the closure names is **C3/D1** (cross-slot prefix reuse — the actual cause of the 0.49x) and **C4/C5**; a GPU run should re-measure with `MINFER_BATCH_TRACE=1` and re-check E1b's windowed path; a CPU `nt>1` decode kernel (F1 family) is the only CPU route to the original throughput claim; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2 landed and is closed** (2026-09-17; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -77,14 +77,30 @@ roadmap §4 defects automatically.
 | A7 | 26 | Dead identity fields | S | ✅ done |
 | A8 | 13 | Guard symmetry (docs half + CUDA `FusedQkvNorm`) | S | ✅ done (docs route) |
 
-### A0 — CUDA access spike — **DONE (2026-09-16): unavailable**
-- **Verdict:** `cargo build --release --features cuda` succeeds (1m23s, targets
-  `sm_75…sm_121`, PTX `compute_121`), but at runtime
+### A0 — CUDA access spike — **SUPERSEDED (2026-09-18): the device is available**
+- **Original verdict (2026-09-16):** `cargo build --release --features cuda`
+  succeeds (1m23s, targets `sm_75…sm_121`, PTX `compute_121`), but at runtime
   `cudaGetDeviceCount` returns err 304 and the engine logs
   `CUDA: no CUDA devices found (cudaGetDeviceCount err 304, count 0)` then
-  `CUDA: not available, using CPU fallback`. The CPU path is unaffected
+  `CUDA: not available, using CPU fallback`. The CPU path was unaffected
   (Qwen3-0.6B Q8_0: 120 tok/s prefill, 64.7 tok/s decode).
-- **Consequence:** the CUDA half of every later ticket is compile-verified only.
+- **Correction (2026-09-18).** The device was there the whole time; the *agent's
+  execution sandbox* was not. Under the harness's default file sandbox (Landlock)
+  every `open("/dev/nvidia*")` returns `EACCES` even though the nodes are
+  `crw-rw-rw-`, so `cuInit` fails with 304 and NVML prints
+  `Failed to initialize NVML: Unknown Error` — **the exact signature A0 recorded**.
+  With the sandbox widened (2026-09-18, after a reboot that also cleared a
+  driver-upgrade state the maintainer had flagged): `NVIDIA GB10`, `sm_121`,
+  121.6 GiB, driver 580.178.04, CUDA 13.0, `cuInit` → `CUDA_SUCCESS`.
+  Every A0-era probe was therefore run inside a sandbox that cannot reach a GPU
+  **even when the GPU is healthy**, which makes "no device" an invalid
+  conclusion from those probes — and it means the CUDA half of every ticket
+  between then and now was compile-verified *and, in this session, finally
+  device-verified* (see the E1b record's device section).
+- **Consequence for the plan:** tickets that were closed "compile-verified only"
+  because of A0 are re-opened *as verification*, not as code: E1b's kernels, the
+  A1 matrix's CUDA column, and the CUDA-side test suite all get their first
+  execution on hardware below.
 
 ### A1 — Op × dtype × backend matrix  · item 23 · M — **DONE**
 - **Files:** new `src/graph/op_matrix.rs`, registered as `#[cfg(test)] mod
@@ -118,6 +134,29 @@ roadmap §4 defects automatically.
 - **Left for a GPU-verifiable run:** the Metal and CUDA columns, and the four
   GPU-only fused ops (`FusedQKV`/`FusedFFN`/`FusedQkvNorm`/`QkvBiasRopeStore`)
   which are excused on a CPU-only box.
+- **CUDA column executed on hardware (2026-09-18).** With the sandbox corrected
+  (A0) the CUDA column finally ran, and every cell it claimed passed: Add, Mul,
+  Silu, SwiGLU, RmsNorm, QkNorm, MatMul, GetRows, View, Reshape, Permute, RoPE,
+  Attn, KvcacheStore, KvcacheLoad (Scale/Softmax stay `SKIP (Cuda does not claim
+  …)`, which the support table asserts). Running it exposed four harness defects,
+  all fixed here — the kind that only a device can show:
+  1. the CUDA column silently depended on **test order**: `CudaState::get()` is
+     `None` until something calls `init()`, which `main` does at startup and the
+     model tests do through the loader, so a *filtered* run reported
+     `SKIP (no CUDA device)` while a full-suite run used the device. The harness
+     now initialises the state itself (in `backend_claims` and `run_on`).
+  2. the synthetic weights were registered only on CPU (`alloc.register_weight`
+     delegates to the CPU pool; in the product the *loader* registers each weight
+     into `CudaState`), so every weight op failed with "weight not registered on
+     CUDA". The harness now registers them into `CudaState` too.
+  3. `Attn` (hd 2) and `QkNorm` (hd 2) used a head dim the CUDA kernels reject
+     (`must be a nonzero multiple of 4`) — cells that could only ever pass on
+     CPU. Both fixtures now use hd 4.
+  4. the `KvcacheStore`/`Load` case wrote two of its four region rows and expected
+     the rest to be **zero**: true for a fresh CPU pool, false for device memory.
+     It now writes every cell, so the expectation is defined on every backend.
+- **Acceptance met for the CUDA column too (2026-09-18):** on GB10 (sm_121) the
+  matrix is 17 CPU cells + 17 CUDA cells with no `FAIL` in either column.
 
 ### A2 — CI  · item 24 · S — **DONE (verified in CI)**
 - **Files:** `.github/workflows/ci.yml`.
@@ -603,8 +642,8 @@ prompt) belongs with E2's batching work.
 | ID | Item | Title | Effort |
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
-| E1b | 2 | CUDA attention kernels read `attn_span` — **DONE** (compile-verified + SASS-checked; no device to run) | M |
-| E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU throughput acceptance refuted and accepted** (opt-in `MINFER_BATCH=1`); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
+| E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
+| E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in `MINFER_BATCH=1`; A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
@@ -812,12 +851,36 @@ dead field went with it — `BatchEngine`'s `Run.finish`, set to `None` and neve
 read (the finish reason is a parameter of `finish()`), removed with the build
 warning it produced.
 
-**E2 closed (2026-09-17, maintainer decision).** With the mechanism landed, A7
-closed, and the throughput acceptance refuted *with* its two causes measured
-(steps 3–4), the maintainer accepted the refutation: E2 is recorded as **mechanism
-landed, CPU throughput acceptance refuted — needs a bandwidth-bound device**, the
-server keeps the measured-better serial path by default, and `MINFER_BATCH=1`
-stays the documented opt-in. This follows the A6 precedent (a ticket may close on
+**E2 progress, step 6 (2026-09-18): the acceptance is MET on the GPU.** A0's
+"no device" verdict turned out to be an artefact of the agent sandbox, not the
+machine, so the re-measurement the closure note asked for was run on the GB10 —
+7B Q4_K_M, `--n-slots 4`, four **identical** prompts, `max_tokens=16`, equal work
+on both sides (64 tokens each), CUDA confirmed active in both server logs:
+
+| Mode | Wall clock | Ratio |
+|---|---|---|
+| serial (default) | 1.314 s | — |
+| `MINFER_BATCH=1` | **0.686 s** | **1.9x** |
+
+The trace explains where it comes from, and confirms the E1b constraint still
+holds on device: with a CUDA device the prefills stay per request
+(`prefill_batch_ok()` is false, because `fa_prefill_f16kv` tiles a query against
+one window) — 83 ms for the first 40-token prompt, 41 ms for each of the other
+three — so the whole win is the **batched decode**: 16 four-wide steps instead of
+64 single-token ones. On CPU the same workload was 0.49x (step 3): the sign of the
+effect is a property of the device, exactly as the closure predicted.
+
+**E2 closed (2026-09-17, maintainer decision; re-measured 2026-09-18).** With the
+mechanism landed, A7 closed, and the throughput acceptance refuted *with* its two
+causes measured (steps 3–4), the maintainer accepted the refutation for the CPU
+and E2 was closed as **mechanism landed, CPU throughput acceptance refuted — needs
+a bandwidth-bound device**, with the serial path kept as the default and
+`MINFER_BATCH=1` as the documented opt-in. Step 6 then supplied the
+bandwidth-bound device and the acceptance **holds there (1.9x)**: the CPU result
+stands as the reason the default stays serial *on CPU*, and a device-aware default
+(enable batching automatically when a CUDA device participates) is now a
+supportable follow-up rather than a guess — it needs its own ticket, since it
+changes the server's default behaviour. This follows the A6 precedent (a ticket may close on
 a measured negative result, recorded so nobody re-opens it). The follow-on work
 the decision names is C3/D1 (cross-slot prefix reuse via a cell copy, which is
 what the 0.49x gap is actually made of) and C4/C5; a CPU `nt > 1` decode kernel
@@ -984,6 +1047,39 @@ timing (recorded in the status line).
 backend level (device-gated: it compiles here and skips without a device), and
 the existing CUDA attention tests — including `cuda_verify_attention_nt_invariance`,
 the doc-94 identity — call the causal instantiation as before.
+
+**Device verification (2026-09-18) — the first execution on hardware.** With the
+sandbox corrected (A0), E1b's windowed path was run on the GB10 it was written
+for, and it is correct and free:
+- **The E1b test could not have passed anywhere.** As written it used `hd = 2`,
+  which the CUDA attention kernels reject (`attention head dim 2 outside the
+  kernel's supported range (multiple of 4, 1..=128)`), and it read its result with
+  the trait's `read_host`, which is `None` on CUDA by design (device memory cannot
+  be borrowed). Both are fixed — `hd = 4`, `copy_to_host` — and the test now
+  **passes on the device**: token 0 returns `V(0)`, token 1 returns `V(2)`, so a
+  window that started at 0 (the pre-E1b derivation) would fail it. This is the
+  window arithmetic itself, checked row by row.
+- **The claim "no CPU behaviour change" holds**: E1b's diff touches only
+  `src/cuda.rs`, `src/cuda_kernels.cu`, `src/graph/cuda_backend.rs` and the
+  `op_matrix` support-table test, and the CPU suite is green (191 passed / 0
+  failed / 5 ignored).
+- **The claim "no causal-path performance change" now has wall-clock evidence**
+  next to the SASS instruction counts: pre-E1b (`82f5109`) vs this branch, 7B
+  Q4_K_M, same prompt, greedy, on GB10 — prefill 529.8 → 530.3 tok/s, decode
+  51.2 → 51.1 tok/s, identical output text. The windowed instantiations cost
+  nothing when they are not selected, exactly as the opcode histograms said.
+- **The multi-sequence path is right with a real model.** New gate
+  `batch_order_does_not_change_a_sequences_logits`: two sequences in one batch
+  (batch shape, KV layout, history and graph all held fixed) must reproduce each
+  sequence's logits **bitwise** when their order in the batch is swapped. It
+  passes on the device — and it is only bitwise because the window follows the
+  sequence and its reservation, never the row index.
+- **Residual gap, recorded rather than papered over:** a *causal*-vs-*windowed*
+  comparison on the same rows is not directly asserted on device (the windowed
+  test uses `lo = 0` for one query, which exercises the same row arithmetic but
+  not the causal pointer). The equivalence rests on the SASS identity plus the
+  CPU-side tests; a GPU-only A/B of the two instantiations over identical data
+  would close it.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
