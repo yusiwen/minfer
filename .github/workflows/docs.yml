@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
       # Pinned to 0.4.37 — the same version nixpkgs 24.05 ships in the local
@@ -53,7 +53,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

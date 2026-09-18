@@ -25,7 +25,7 @@ on:
 
 jobs:
   test-linux-cpu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -40,7 +40,7 @@ jobs:
   # `cargo build` alone silently skips them (that is how the A5 signature
   # change broke four CUDA test call sites without any local or CI signal).
   build-linux-cuda:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     container: nvidia/cuda:12.8.0-devel-ubuntu22.04
     steps:
       - uses: actions/checkout@v5
