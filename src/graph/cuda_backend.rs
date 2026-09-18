@@ -3063,8 +3063,9 @@ mod tests {
     /// sibling, so it is checked against an independent host dequant
     /// E1b: the CUDA windowed instantiations must give each sequence its own
     /// window, matching `cpu_backend`'s `two_sequences_do_not_cross_attend`.
-    /// Device-gated — a hosted runner and this box have no usable device
-    /// (`cuInit` returns 304), so it compiles here and runs where a GPU exists.
+    /// Device-gated — CI has no GPU, so it compiles there and runs where one
+    /// exists (on this box it passes on GB10/sm_121; the original `hd = 2`
+    /// fixture could not have, see the E1b record).
     #[test]
     fn cuda_two_sequences_do_not_cross_attend() {
         let Some(mut cb) = pool() else {
@@ -3162,6 +3163,132 @@ mod tests {
                 && got[6].abs() < 1e-4
                 && got[7].abs() < 1e-4,
             "token 1 saw the other sequence: {got:?}"
+        );
+    }
+
+    /// E1b's recorded residual gap, closed: the **causal** and the **windowed**
+    /// instantiation must compute the same numbers over the same rows.
+    ///
+    /// The equivalence rests on row arithmetic being the only difference between
+    /// the two kernels (the SASS comparison showed identical instruction counts
+    /// and opcode histograms). This is the direct check: one query per token, a
+    /// window that starts at cell 0 (so `positions[t] + 1` and the explicit span
+    /// describe the *same* rows), the same K/V, executed through both
+    /// instantiations — the outputs must be bitwise equal.
+    ///
+    /// Without this, "the windowed path is correct" rested on the SASS identity
+    /// plus a windowed-only test with `lo = 0`; the E1b record named that as the
+    /// gap to close on the first device session.
+    #[test]
+    fn cuda_causal_and_windowed_agree_on_the_same_rows() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        cb.kv_f16 = false; // f32 KV keeps the store and the attention in one dtype
+
+        // Two tokens at cells 0 and 1: token 0's window is [0, 1), token 1's is
+        // [0, 2) — exactly what `positions[t] + 1` gives, so both instantiations
+        // must agree. hd = 4 (CUDA requires a nonzero multiple of 4).
+        let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 4usize, 2usize, 4usize);
+        let nkt = nk * hd;
+        let meta = crate::graph::ops::AttnMeta {
+            layer: 0,
+            n_head: nh,
+            n_head_kv: nk,
+            hd,
+            hd_kv: hd,
+            nkt,
+            scale: 1.0,
+        };
+        let i32bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+        let q = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // token 0 = e0, token 1 = e1
+        let k = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let positions = [0u32, 1u32];
+
+        // Build one graph per instantiation; both store into and read the same
+        // region, so they see identical K/V.
+        let build = |explicit: bool| -> crate::graph::ComputeGraph {
+            let mut gb = GraphBuilder::new();
+            gb.set_explicit_span(explicit);
+            let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+            let qq = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
+            let kk = gb.input("k", [nkt, nt, 1, 1], DType::F32);
+            let vv = gb.input("v", [nkt, nt, 1, 1], DType::F32);
+            let _st = gb.kvcache_store(0, kk, vv, pos, n_ctx);
+            let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
+            let at = gb.attn(qq, kv, pos, crate::graph::ops::AttnMode::Gqa, meta.clone());
+            gb.output(at);
+            gb.build()
+        };
+        let causal = build(false);
+        let windowed = build(true);
+        assert!(
+            !causal.nodes.iter().any(|n| matches!(
+                n.op,
+                crate::graph::ops::Op::Attn {
+                    explicit_span: true,
+                    ..
+                }
+            )),
+            "the causal graph must not declare an explicit span"
+        );
+        assert!(
+            windowed.nodes.iter().any(|n| matches!(
+                n.op,
+                crate::graph::ops::Op::Attn {
+                    explicit_span: true,
+                    ..
+                }
+            )),
+            "the windowed graph must declare an explicit span"
+        );
+
+        let mut run = |g: &crate::graph::ComputeGraph| -> Vec<f32> {
+            let kreg = cb.alloc_buffer(n_ctx * nkt);
+            let vreg = cb.alloc_buffer(n_ctx * nkt);
+            let kb = cb.alloc_buffer(nkt * nt);
+            let vb = cb.alloc_buffer(nkt * nt);
+            let qb = cb.alloc_buffer(nh * hd * nt);
+            let pb = cb.alloc_buffer(nt);
+            let sb = cb.alloc_buffer(2 * nt);
+            let ob = cb.alloc_buffer(nh * hd * nt);
+            cb.write_host(qb, &q).unwrap();
+            cb.write_host(kb, &k).unwrap();
+            cb.write_host(vb, &v).unwrap();
+            cb.write_host(pb, &i32bits(&positions)).unwrap();
+            // token 0: [0, 1); token 1: [0, 2) — the same rows `positions` names.
+            cb.write_host(sb, &i32bits(&[0, 0, 1, 2])).unwrap();
+            let sti = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, crate::graph::ops::Op::KvcacheStore { .. }))
+                .expect("store node");
+            let ati = g
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, crate::graph::ops::Op::Attn { .. }))
+                .expect("attn node");
+            cb.execute_node(&g.nodes[sti], &[kb, vb, pb], kreg, Some((kreg, vreg)))
+                .unwrap();
+            cb.execute_node(&g.nodes[ati], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
+                .unwrap();
+            cb.copy_to_host(ob).unwrap()
+        };
+        let a = run(&causal);
+        let b = run(&windowed);
+        assert_eq!(a.len(), b.len());
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            worst, 0.0,
+            "the causal and windowed instantiations disagree over the same rows: \
+             causal {a:?} vs windowed {b:?}"
         );
     }
 
