@@ -13,7 +13,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b is compile-verified and SASS-checked, not GPU-run; **E2 landed and is closed** (2026-09-17; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -483,9 +483,10 @@ needs, so C1 builds it rather than a type with no consumer:
    reaches the backend exactly as today (so no kernel changes), and once false
    the resolved cell array must be passed instead. **A backend that has not been
    ported returns `Err` instead of indexing the wrong row** (standing rule 2).
-   On this box that means CPU first: CUDA is compile-verified only (A0) and
-   Metal stays untouched (G), so C2 must either keep the mapping identity for
-   them or refuse to run there.
+   On this box that means CPU first: CUDA was compile-verified only at the time
+   (A0 — **superseded 2026-09-18**, the device is available) and Metal stays
+   untouched (G), so C2 must either keep the mapping identity for them or refuse
+   to run there.
 4. The index array travels as a graph **input** (`kv_cells`, I32), filled by the
    allocator from `positions` — positions stay data, so the topology and the
    params-only reuse identity are untouched.
@@ -703,7 +704,7 @@ sequence-aware:
 **Not in E2:** mixed prefill+decode batches and chunked prefill (E3), moving a
 sequence's cells when the arena fragments (C3 needs D1; E2 reserves a slot's
 budget up front and fails loudly instead), layer offload (E5), Metal (G5), and
-CUDA runtime verification (no device here).
+CUDA runtime verification (deferred under A0; done 2026-09-18 for E1b, still open for C2's CUDA arm).
 
 **E2 progress (2026-09-17).** Step 1 of the design landed: `KvCache` holds
 per-sequence reservations (`SeqSlot { start, cap }`, `reserve_seq` first-fit,
@@ -934,8 +935,8 @@ other. E1 replaces the derivation with **data**:
    the `multi_seq` cell so the Metal refusal is recorded rather than assumed.
 6. **CUDA.** Both attention kernels (`gqa_attn_split` and the non-split path)
    take the span; the I32 input reaches the device through the existing
-   capture-safe `positions_i32` conversion. This box has no device (A0), so the
-   CUDA half can only be compile-verified — see the landing record below: it is
+   capture-safe `positions_i32` conversion. This box had no device at the time
+   (A0 — **superseded 2026-09-18**), so the CUDA half could only be compile-verified then — see the landing record below: it is
    deferred to **E1b** rather than changed blind, and the assignment gate keeps
    CUDA correct (single-sequence) in the meantime.
 
@@ -988,8 +989,9 @@ attention kernels still compute `positions[t] + 1` (six of them:
 `gqa_attn_f32_f16kv`, `gqa_attn_f32`, the split partial/combine pairs,
 the batched variants and the flash-attention prefill path at
 `cuda_kernels.cu:4194`). A window with `lo > 0` changes what the split-K chunking
-covers, so the port is not mechanical; and this box has **no device** (A0), which
-makes it the one class of change that cannot be verified at all — a mistake would
+covers, so the port is not mechanical; and this box had **no device at the time**
+(A0 — **superseded 2026-09-18**: E1b is now device-verified), which made it the
+one class of change that could not be verified then — a mistake would
 silently corrupt *single-sequence* GPU output that is known-good today. So: CUDA
 keeps its existing behavior, `supports_attn_span()` stays `false` for it (the
 trait default), the assignment gate refuses it a `multi_seq` node, and the port
@@ -1021,9 +1023,11 @@ the instantiation host-side, so a causal node never touches the span input;
 flips accordingly.
 
 **The performance constraint, with evidence.** The requirement was "do not
-affect existing CUDA performance", and there is no device here to measure
+affect existing CUDA performance", and there was no device to measure it on
 (`cuInit` → 304, re-confirmed 2026-09-17: no seccomp, no container, the
-580.178.04 module loaded, nodes present). So the evidence is the generated code:
+580.178.04 module loaded, nodes present — all of it an artefact of the agent
+sandbox, see A0; the wall-clock half of this section was added 2026-09-18). So the
+evidence at the time was the generated code:
 both revisions compiled with the project's own nvcc flags (`-O3`,
 `-gencode arch=compute_121,code=sm_121`) and `cuobjdump -sass` compared per
 kernel:
@@ -1178,7 +1182,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ✔ ─ E2 ◐ ─ E3 ─ E4 ─ E5        (E1b ✔; E2 mechanism in, acceptance open)
+Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └────────────────────────────────────────────►  (needs a Mac)
 ```
