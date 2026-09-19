@@ -451,6 +451,17 @@ impl BatchEngine {
             let logits =
                 guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)?;
             if trace {
+                let rows_desc: Vec<String> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(r, &slot)| {
+                        format!(
+                            "slot{slot}/seq{}/pos{}",
+                            self.slots[slot].seq, batch.positions[r]
+                        )
+                    })
+                    .collect();
+                eprintln!("[batch] rows: {}", rows_desc.join(" "));
                 eprintln!(
                     "[batch] decode step: {} sequence(s), {} tokens, {:.1} ms ({:.1} ms/token)",
                     rows.len(),
