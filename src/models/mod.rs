@@ -37,6 +37,42 @@ impl Device {
     }
 }
 
+/// D3: should the FFN decode fusion be built as a **composition** (concat
+/// `MatMul` + gate/up windows + in-place `SwiGLU`) rather than as the hand-written
+/// `Op::FusedFFN` node?
+///
+/// The default is the **node**: it is the device-specific fast path (D2 measured
+/// the composition 0.3-0.8% slower on CUDA for the models that actually fuse),
+/// and Metal needs it until G5, since a partial window at a non-zero offset is
+/// refused there. The composition stays reachable — `MINFER_FFN_COMPOSITION=1` —
+/// because it is the *proof* that the fused node is expressible without special
+/// cases, and the reference an A/B is run against.
+///
+/// Pure on purpose (CI has no GPU), and loud about the one combination that
+/// cannot work: forcing the composition on a backend without offset views falls
+/// back to the node with a warning rather than building a graph that would fail
+/// at allocation.
+pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
+    let forced = match requested {
+        None => false,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => {
+            eprintln!("[model] MINFER_FFN_COMPOSITION={other:?} is neither \"0\" nor \"1\"; using the default");
+            false
+        }
+    };
+    if forced && !matches!(device, Device::Cuda) {
+        eprintln!(
+            "[model] MINFER_FFN_COMPOSITION=1 ignored on {}: the composition needs a partial window at a \
+             non-zero offset, which that backend does not have (D1/G5)",
+            device.name()
+        );
+        return false;
+    }
+    forced
+}
+
 /// Architecture-agnostic model interface.
 ///
 /// `Send + Sync` so a model can be shared across threads (the HTTP server's
@@ -173,6 +209,34 @@ pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
         other => {
             eprintln!("Unsupported architecture: '{}'", other);
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D3: the gate's whole matrix, with no device — the same reason E6 made
+    /// `batch_mode` pure: CI has no GPU, and this decides which graph a GPU run
+    /// builds.
+    #[test]
+    fn ffn_composition_is_opt_in_and_refuses_where_it_cannot_work() {
+        // Default: the hand-written node, on every device.
+        for d in [Device::Cpu, Device::Metal, Device::Cuda] {
+            assert!(!ffn_composition(None, d), "{d:?}");
+        }
+        // Forced on: allowed where offset views exist (CUDA), refused elsewhere
+        // (loudly, in the function) so a Metal graph is never built with a
+        // partial window it cannot express.
+        assert!(ffn_composition(Some("1"), Device::Cuda));
+        assert!(!ffn_composition(Some("1"), Device::Metal));
+        assert!(!ffn_composition(Some("1"), Device::Cpu));
+        // Forced off, and anything unrecognised, keeps the default.
+        for v in ["0", "true", "banana", ""] {
+            for d in [Device::Cpu, Device::Metal, Device::Cuda] {
+                assert!(!ffn_composition(Some(v), d), "{v:?} {d:?}");
+            }
         }
     }
 }

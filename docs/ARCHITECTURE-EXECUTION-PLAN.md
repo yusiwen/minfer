@@ -640,7 +640,7 @@ prompt) belongs with E2's batching work.
 |---|---|---|
 | D1 | Strided views with allocator-known aliasing + multi-output nodes — **increments 1–2 landed (2026-09-19): exact views are zero-copy, offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait), Metal is exact-only**; multi-output nodes remain | L |
 | D2 | Re-express one decode fusion as a composition (proof) — **DONE (2026-09-19)**: `FusedFFN` as concat `MatMul` + two partial windows + in-place `SwiGLU`; CUDA takes the composition, Metal keeps the node until G5; env gate `MINFER_FFN_NODE=1` for the A/B; three models byte-identical, decode cost **≤0.8%** (recorded) | M |
-| D3 | Decide the fate of the four hand-written fused ops | S |
+| D3 | Decide the fate of the four hand-written fused ops — **DONE (2026-09-19)**: `FusedFFN` keeps the default (the proven composition is 0.3–0.8% slower on CUDA and Metal needs the node until G5); the QKV family keeps (no composition proof); `QkvBiasRopeStore` is a fallback epilogue, not a redundancy. Policy rule + gate clarity recorded | S |
 
 - **D1 acceptance:** `Op::View` becomes zero-copy (a test asserts the allocator
   maps a view onto its parent's buffer); the allocator's liveness understands
@@ -873,6 +873,49 @@ node, and the CUDA-specific kernels (fused epilogue, MMQ tiling) exist for
 reasons the composition cannot express; D3 owns that call.
 - **D3:** with D2 proven, decide per fusion whether to keep the hand-written
   node (performance) or delete it (simplicity). MoE (item 17) is unblocked here.
+
+#### D3 record (2026-09-19) — the fate of the four hand-written fusions
+
+**Decisions.**
+
+| Op | Decision | Evidence / why |
+|---|---|---|
+| `FusedFFN` | **keep as the default**; the composition stays behind `MINFER_FFN_COMPOSITION=1` | D2 measured the composition 0.3–0.8% slower on CUDA on the models that actually fuse (0.5B `nf` 4864, Qwen3-0.6B; the 7B never fuses — `nf` 18944 > the 16384 gate — and its row is recorded as vacuous), and **Metal requires the node until G5**, since a partial window at a non-zero offset is refused there. Deleting it would cost performance on CUDA and break Metal. |
+| `FusedQKV` | **keep** — no deletion decided | Both GPU backends support it and it carries the bias+rope+store epilogue; no composition proof exists. A D2-style proof is expressible now (concat `MatMul` → three windows → in-place rope → store via `Op::KvcacheStore`) but unmeasured, so deleting it would be an unmeasured simplification that also has to hold on Metal. |
+| `FusedQkvNorm` | **keep**, same as `FusedQKV` | Adds per-head Q/K RMSNorm inside the epilogue (Qwen3); a composition would need a norm on a window — expressible, still unproven. |
+| `QkvBiasRopeStore` | **keep — it is not a redundant fusion** | It is the *fallback epilogue* for the mixed-quant case: three separate q/k/v matmuls without bias, plus one combined pass (bias×3 + rope×2 + store×2). Deleting it would slow that path, not simplify anything. |
+
+**The policy rule (reusable).** A hand-written fusion may be deleted only when all
+four hold: (1) a composition exists in the builder; (2) it is byte-identical on
+**every** backend that emits the fusion, not just the one measured; (3) its measured
+cost is within a **recorded budget** on those backends; (4) no backend needs the
+node for lack of a composition primitive. Otherwise the node stays and its A/B gate
+is documented. `FusedFFN` fails (3) on CUDA and (4) on Metal → kept. The QKV family
+fails (1) → kept.
+
+**Gate clarity (the follow-through).** Two classes of environment gate exist and
+mean different things:
+
+- `MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` — **disable the fusion** entirely
+  (build the plain `MatMul` + rope/store, or gate+up+silu+mul, path). Unchanged.
+- `MINFER_FFN_COMPOSITION=1` — keep fusing, but build the fusion as the
+  **composition** (`MatMul` + gate/up windows + in-place `SwiGLU`) instead of the
+  hand-written node. This is the D2 proof path and the A/B reference; it is refused
+  with a warning on a backend without offset views (Metal until G5; CPU, which
+  never fuses in the first place).
+
+The choice is a pure function (`models::ffn_composition`) unit-tested across the
+matrix, so CI covers it without a GPU — the same shape as E6's `batch_mode`.
+
+**MoE prerequisite, honestly.** Phase D's note says MoE is unblocked here; it is
+**not**. MoE and MLA need **multi-output nodes** — D1's third increment, which is
+not landed (D1 has delivered exact views and offset/partial windows). Nothing in D3
+changes that.
+
+**Evidence run.** With the new default, the node and the composition still produce
+byte-identical greedy text on the models that fuse: Qwen2.5-0.5B Q4_K_M (n=32) and
+Qwen3-0.6B Q8_0 (n=32), both `IDENTICAL`. Suites: CPU 198 passed / 0 failed / 5
+ignored, `--features cuda` 244 / 0 / 5.
 
 ## 7. Phase E — batching, then memory policy
 
