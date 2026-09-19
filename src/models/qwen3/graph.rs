@@ -417,19 +417,12 @@ impl Qwen3Graph {
                 "position {maxp} exceeds n_ctx {n_ctx} (KV region overflow)"
             );
         }
-        #[cfg(target_os = "macos")]
-        let metal_on =
-            crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model);
-        #[cfg(not(target_os = "macos"))]
-        let metal_on = false;
-        // CUDA participation (Phase 7): requires a usable device AND every
-        // matmul weight registered on the CUDA registry in a kernel-supported
-        // type (all-or-nothing; 7e③ moved the embedding gather on device, so
-        // tok_embd is gated like every other weight).
-        #[cfg(feature = "cuda")]
-        let cuda_on = crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model);
-        #[cfg(not(feature = "cuda"))]
-        let cuda_on = false;
+        // GPU participation is part of the reuse identity (backend assignment
+        // lives in the built graph), and it comes from `Self::device` so the
+        // builder and the server's batching default (E6) cannot disagree.
+        let device = Self::device(model);
+        let metal_on = device == crate::models::Device::Metal;
+        let cuda_on = device == crate::models::Device::Cuda;
         let params = GraphParams {
             n_tokens: nt,
             n_out,
@@ -601,6 +594,36 @@ impl Qwen3Graph {
         } else {
             logits[..n_out * nv].to_vec()
         }
+    }
+
+    /// The backend this model's forwards will run on — the **single authority**
+    /// for the GPU gates (E6).
+    ///
+    /// `forward_batch` derives `CParams.gpu` from it and the server derives its
+    /// batching default from it, so "the device participates" means one thing
+    /// everywhere. Metal wins when both are available, matching the allocator's
+    /// backend priority. Uses attributes rather than `cfg!()` so the
+    /// `metal_backend` path is not resolved on non-macOS builds (the module does
+    /// not exist there).
+    pub fn device(model: &Qwen3Model) -> crate::models::Device {
+        #[cfg(any(target_os = "macos", feature = "cuda"))]
+        {
+            #[cfg(target_os = "macos")]
+            if crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model) {
+                return crate::models::Device::Metal;
+            }
+            // CUDA participation (Phase 7): requires a usable device AND every
+            // matmul weight registered on the CUDA registry in a kernel-supported
+            // type (all-or-nothing; 7e③ moved the embedding gather on device, so
+            // tok_embd is gated like every other weight).
+            #[cfg(feature = "cuda")]
+            if crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model) {
+                return crate::models::Device::Cuda;
+            }
+        }
+        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        let _ = model;
+        crate::models::Device::Cpu
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.

@@ -59,6 +59,12 @@ impl ModelDef for Qwen3Model {
         self
     }
 
+    /// Where this model's forwards run (E6) — delegated to the graph's single
+    /// authority, so the server's batching default and `CParams.gpu` agree.
+    fn device(&self) -> crate::models::Device {
+        graph::Qwen3Graph::device(self)
+    }
+
     fn build_graph(
         &self,
         params: &crate::graph::params::GraphParams,

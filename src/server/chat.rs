@@ -608,6 +608,33 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// How the worker composes work (E6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchMode {
+    Serial,
+    Batched,
+}
+
+/// Decide the batching mode from `MINFER_BATCH` and the device the model's
+/// forwards actually run on.
+///
+/// Pure on purpose: CI has no GPU, so the matrix (unset / "1" / "0" / invalid x
+/// cpu / metal / cuda) is unit-tested here instead of being discovered in
+/// production. `Device::Metal` follows CPU: the batched path needs an explicit
+/// attention span, which Metal refuses until G5 (see the caller).
+pub(crate) fn batch_mode(requested: Option<&str>, device: crate::models::Device) -> BatchMode {
+    match requested {
+        Some("1") => BatchMode::Batched,
+        Some("0") => BatchMode::Serial,
+        // Unset, or a value the caller already warned about: follow the device —
+        // batching is the measured win on CUDA only.
+        _ => match device {
+            crate::models::Device::Cuda => BatchMode::Batched,
+            _ => BatchMode::Serial,
+        },
+    }
+}
+
 /// Worker thread: drains the job queue serially, one slot at a time.
 /// Busy slots defer naturally — the queue is unbounded (llama.cpp semantics).
 pub fn worker_loop(
@@ -617,27 +644,45 @@ pub fn worker_loop(
     job_rx: mpsc::Receiver<Job>,
     spec_cfg: Option<crate::spec::SpecConfig>,
 ) {
-    // E2: the plain path *can* batch every ready slot into one forward per step.
+    // E2/E6: the plain path *can* batch every ready slot into one forward per
+    // step, and **whether that is a win is a property of the device** — measured
+    // end to end at `--n-slots 4`: 0.88x on Qwen2.5-0.5B Q4_0 and 0.49x on 7B
+    // Q4_K_M on CPU (the plan's E2 record has the table and the diagnosis: the
+    // CPU `nt > 1` decode path is not cheaper per token, and concurrency forfeits
+    // B2's cross-request prefix reuse), versus **1.9x on the GB10**, where decode
+    // is weight-bandwidth bound. So the default follows the device (E6):
     //
-    // It is **opt-in** (`MINFER_BATCH=1`), because on this project's reference
-    // box continuous batching is not a win: measured end to end, `--n-slots 4`
-    // against the same workload served serially was 0.88x on Qwen2.5-0.5B Q4_0
-    // and 0.49x on Qwen2.5-7B Q4_K_M (the plan's E2 record has the table and
-    // the diagnosis). Two causes, both measured rather than assumed: the CPU
-    // decode kernels' nt > 1 path is not more efficient per token (the 7B's
-    // batched forward is exactly 1.00x the serial one, the 0.5B's 1.45x), and
-    // concurrency forfeits B2's cross-request prefix reuse — each concurrent
-    // request needs its own KV home and starts cold, which on a model with a
-    // slow prefill (the 7B) dominates. The engine is kept because the same
-    // batching is the standard win where decode is weight-bandwidth bound (a
-    // GPU) — but nothing here can verify that (A0), so the default stays with
-    // the measured-better path, as A6 did.
+    //   MINFER_BATCH unset -> batched iff the model's forwards run on **CUDA**
+    //   MINFER_BATCH=1     -> batched (forced; also the way to batch on CPU)
+    //   MINFER_BATCH=0     -> serial (forced)
+    //
+    // Metal is deliberately not included even where a Metal device participates:
+    // the batched path needs an explicit attention span and Metal refuses that
+    // node (`supports_attn_span()` is false there), so batching would fail loudly
+    // rather than serve — it waits for G5.
     //
     // A session with a speculative draft keeps the per-slot caches and the
     // run-to-completion loop below too, because doc 94/97's identity contract is
     // per request.
-    let batch_on = std::env::var("MINFER_BATCH").map_or(false, |v| v == "1");
-    if spec_cfg.is_none() && batch_on {
+    let requested = std::env::var("MINFER_BATCH").ok();
+    if let Some(v) = requested.as_deref() {
+        if v != "0" && v != "1" {
+            eprintln!(
+                "[server] MINFER_BATCH={v:?} is neither \"0\" nor \"1\"; using the default for this device"
+            );
+        }
+    }
+    let device = model.device();
+    let mode = batch_mode(requested.as_deref(), device);
+    eprintln!(
+        "[server] batching: {} (device {}; MINFER_BATCH=1 forces it on, =0 forces it off)",
+        match mode {
+            BatchMode::Batched => "on",
+            BatchMode::Serial => "off",
+        },
+        device.name()
+    );
+    if spec_cfg.is_none() && mode == BatchMode::Batched {
         let n_ctx_total: usize = slots.iter().map(|s| s.n_ctx_slot).sum();
         match super::batch::BatchEngine::new(&*model, slots.len(), n_ctx_total) {
             Ok(mut engine) => {
@@ -760,6 +805,36 @@ pub(crate) fn sampler_recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Device;
+
+    /// E6: the whole decision matrix, with no device involved — which is the
+    /// point, since CI has no GPU and the default it guards is what a GPU server
+    /// now gets.
+    #[test]
+    fn batch_mode_follows_the_device_and_honours_the_override() {
+        // Unset: follow the device. CUDA batches (measured 1.9x), CPU and Metal
+        // do not (CPU is measured slower; Metal refuses the span node until G5).
+        assert_eq!(batch_mode(None, Device::Cuda), BatchMode::Batched);
+        assert_eq!(batch_mode(None, Device::Cpu), BatchMode::Serial);
+        assert_eq!(batch_mode(None, Device::Metal), BatchMode::Serial);
+
+        // Explicit override wins on every device.
+        for d in [Device::Cpu, Device::Metal, Device::Cuda] {
+            assert_eq!(batch_mode(Some("1"), d), BatchMode::Batched, "{d:?}");
+            assert_eq!(batch_mode(Some("0"), d), BatchMode::Serial, "{d:?}");
+        }
+
+        // A value that is neither 0 nor 1 (the caller warns) falls back to the
+        // device's default rather than guessing an intent.
+        for v in ["true", "yes", "2", ""] {
+            assert_eq!(
+                batch_mode(Some(v), Device::Cuda),
+                BatchMode::Batched,
+                "{v:?}"
+            );
+            assert_eq!(batch_mode(Some(v), Device::Cpu), BatchMode::Serial, "{v:?}");
+        }
+    }
 
     #[test]
     fn prefill_span_always_feeds_the_last_token() {
