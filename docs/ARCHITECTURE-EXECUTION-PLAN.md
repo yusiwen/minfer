@@ -641,6 +641,88 @@ prompt) belongs with E2's batching work.
 - **Acceptance:** node-count and arena-utilisation counters before/after; output
   bit-identical.
 
+#### C3 design (written before the code, 2026-09-19)
+
+**The problem the arena has.** `KvCache::reserve_seq` is first-fit over
+`[0, n_ctx)`: it needs a *contiguous* free run of `cap` cells, while
+`release_seq` frees whatever run a sequence held. Two sequences that finish out
+of admission order therefore leave a hole in the middle, and the next admission
+can fail with `no free run of N cells` while the arena has far more than `N`
+free cells. That is fragmentation, and it is the one failure mode of E2's
+per-sequence reservations that no amount of capacity fixes.
+
+**Scope.** C3 compacts **downward**: live runs are packed from cell 0 in
+ascending old-start order, each keeping its `cap`, so free space coalesces at the
+top of the arena. Compaction never changes a run's `cap`, never reallocates a KV
+region (the copy is *within* the same K/V buffer) and never changes a query's
+logical position — but it does change the *cell* a sequence's rows live in, so
+the caller that reserved the run must be told (the contract below).
+
+**Where the copy executes.** The K/V regions are backend buffers (host memory on
+CPU, device memory on CUDA), so the copy is a backend operation:
+`Backend::copy_cells(&mut self, dst: BufRef, src: BufRef, rows, elems_per_cell)`
+— a new trait method, implemented by CPU and CUDA in this ticket and refused
+**loudly** by Metal (Phase G), which keeps standing rule 2: a backend that cannot
+move cells fails the request instead of skipping the compaction.
+
+The contract is `dst_row <= src_row` (downward only) and the implementation must
+be correct for **overlapping** ranges, which the two obvious implementations are
+not:
+- CPU: `copy_within` (memmove semantics) is exactly right.
+- CUDA: device-to-device `cudaMemcpyAsync` is documented **undefined** for
+  overlapping ranges, so the kernel is one block that walks rows in **ascending**
+  order with a `__syncthreads()` between rows. Ascending is the safe direction
+  when `dst <= src` (the row a write could clobber is already copied), and a
+  row's `elems_per_cell` (<= `n_kv_embd`) parallelises across the block's
+  threads. No staging buffer and no second pass.
+
+**The planner is pure.** `KvCache::compaction_plan(need)` is a host-side function
+over the run table with no backend calls: it returns the moves (`seq`, `from`,
+`to`, `rows`) that compact the live runs, or — with `Some(n)` — the shortest prefix
+of that plan which opens a free run of `n` cells (`None` compacts fully). `rows`
+is the sequence's **written** length (`last owned cell + 1 - start`), not `cap`:
+unwritten cells hold no data worth copying, and moving them would shuffle another
+sequence's stale bytes. Because the planner is pure, its policy is unit-tested
+without a device — that is the half CI can prove.
+
+**The contract with the caller.** Only whoever reserved a run caches its `start`:
+E2's server keeps one per slot (`SlotState.start`) and passes `start +
+current_pos` as the store position, so a move must be reported.
+`GraphAllocator::kv_defrag(need)` returns the applied moves plus before/after
+stats, and `BatchEngine` applies the new `start` to the slots it owns; everything
+else follows, because the graph's window (`attn_span`) is *derived* from
+`seq_slot` on every forward. A caller that ignores the report is not silently
+wrong in a hard-to-find way: its next store would write to the old cells and the
+span check would reject the query.
+
+**Trigger.** `GraphAllocator::kv_reserve_seq` retries once through a compaction
+when first-fit fails, unless `MINFER_NO_KV_DEFRAG=1` — the A/B gate standing rule 3
+requires: the same workload must produce identical output with and without the
+compaction, and the counters must show what it bought.
+
+**Counters (the ticket's other deliverable).** `KvArenaStats` carries `n_ctx`,
+reserved/owned/free cells, the number of **free runs** (the "node count" C3
+compacts), the largest free run, the live run count, and cumulative
+`defrags`/`cells_moved`. The acceptance test records them before and after; the
+same struct is what F8 (observability) will export.
+
+**Increments.**
+1. Planner + counters + `KvCache` bookkeeping (`apply_moves`) with unit tests —
+   pure host-side logic, so CI proves it.
+2. `Backend::copy_cells` (CPU + CUDA), `GraphAllocator::kv_defrag`, the
+   reservation retry and the `MINFER_NO_KV_DEFRAG` gate.
+3. Integration: fragment the arena on purpose (`--n-slots N`, prompts of
+   different lengths) so an admission needs the compaction, and assert the
+   server's replies stay bit-identical to the serial path, plus a device run for
+   the CUDA copy.
+
+**Deferred (recorded, not silently skipped).** Compaction does not *grow* a
+sequence's run, does not evict, does not move a sequence up to make room for a
+larger one, and does not run inside a forward (it is a between-forwards,
+host-driven operation, so CUDA Graph capture is unaffected). Compacting the
+arena *per layer* separately is also out of scope: one plan moves every layer
+together, which is what keeps `owner[]` consistent across layers.
+
 ### C4 / C5
 - C4: Q8_0 KV first, behind `MINFER_CACHE_TYPE`, gated to where the kernels
   support it; acceptance = named tolerance class (dequantisation is not
@@ -771,6 +853,40 @@ View/Reshape/Permute cells are the regression net for it.
 - **D2 acceptance:** `FusedFFN` re-expressed as `MatMul` + views + in-place
   `SwiGLU`; the hand-written node stays behind an env gate for A/B; bitwise
   identity; no decode regression beyond a recorded budget.
+
+#### D1 increment 3 design (written before the code, 2026-09-19) — multi-part outputs via views
+
+The ticket row above says "multi-output nodes". Before giving `CNode` a second
+output — which would touch the allocator, the scheduler, all three backends and the
+JSON/DOT/trace exporters, for a capability only MoE would exercise — consider what
+D1 increments 1–2 already bought: an output can be an **offset view** of another
+buffer (`BufRef { offset, len }`, `CNode::view`) and liveness follows views
+(`extend_through_views`). A node that produces several tensors therefore needs one
+output *buffer*, not several outputs: its parts are views over it, and consumers
+bind to those views exactly as they bind to any other producer's output.
+
+Increment 3 is therefore:
+
+- `Op::SplitParts { sizes: Vec<usize> }` — the output buffer is the concatenation
+  of its parts, along the leading (element) axis;
+- `GraphBuilder::split_parts(input, sizes) -> Vec<NodeId>` — emits the owning node
+  plus one view node per part (offsets from the cumulative sizes), so a caller
+  wires the parts like any other producer;
+- a CPU kernel (one contiguous copy per part) and a CUDA kernel for it, bitwise
+  equal by construction, plus the `SUPPORT-MATRIX`/op-matrix rows;
+- a test that a two-part split feeds two consumers whose results are bitwise
+  identical to slicing the source tensor in Rust, on both backends.
+
+The property that makes this the right shape: the graph stays **single-output**, so
+no allocator, scheduler or backend grows a second-output path that only MoE will
+ever use, and the parts are ordinary graph tensors (so `MINFER_TRACE`, the JSON
+export and DOT already show them).
+
+What increment 3 does **not** do — correcting "D1 unblocks MoE/MLA" a second time,
+after D1's own design already scaled it back: MoE still needs its architecture work
+(expert weights, routing, the grouped GEMM) and MLA needs its latent projections.
+Increment 3 removes the *IR* blocker and proves the mechanism with a kernel any
+model can use; it is not a MoE implementation.
 
 #### D2 design (written before the code, 2026-09-19)
 
