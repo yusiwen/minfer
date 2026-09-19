@@ -1610,7 +1610,31 @@ one place, so the next session does not have to rediscover it.
 
 So it is **not** the server, **not** batching, **not** the slot layout or the offset magnitude, and **not** the model per se — it is the **prompt length combined with a non-zero start**. Slot 0 (start 0) takes the *causal* attention instantiation and is always right; every slot with a non-zero start takes the **windowed** instantiation, and it produces garbage once the window is ~34 rows rather than ~5. That is consistent with everything measured: model-dependent because the two models select different kernel variants (hd 128/n_kv 4 vs hd 64/n_kv 2), unaffected by batching (the kernel is chosen by `explicit_span` = "start != 0", not by batch width), and invisible to E1b's device tests, which only ever exercised tiny windows (a synthetic `hd = 4` fixture, and ~7-token sequences in the order-invariance gate).
 
-**Next step:** a focused device test of the **windowed** instantiation with a *long* window at a non-zero start (34-64 rows) against the causal instantiation over the same rows — that should pin the exact kernel variant (the split/rows-per-warp bodies and the `_bt` variants are the candidates) and give a minimal reproduction, then the fix. The engine test as it stands is the end-to-end reproduction and now renders the server's prompt, so it fails the moment the bug is present and passes when it is fixed. Note also that this *corrects* the earlier "server-only, engine is fine" conclusion: that comparison used 5-token prompts on the engine side and 34-token ones on the server side. **Impact: E6 made batching the default on CUDA, so this is the default behaviour on a GPU server today**; E2's "GPU acceptance 1.9x" measurement inspected only request 0's text, so its *timing* stands but its *correctness* was never checked per request — that record is corrected here. **Immediate mitigation to decide: revert E6's CUDA default (back to opt-in) until this is fixed.** |
+**Minimal reproduction found (same day, fourth round).** The focused device test
+(`cuda_windowed_attention_matches_causal_for_long_windows`) hands the *same* inputs
+to both instantiations and reports **which side is wrong**, by checking the one case
+where the expected value is unambiguous: a single-row window must return `V(row 0)`.
+
+- The **causal** instantiation returns `V(row 0)` exactly ✓ (so the harness, the
+  span layout and the data are sound).
+- The **windowed** instantiation returns something else — at `n = 2`, `start = 0`,
+  `hd = 128`, 4 KV heads, i.e. for a **two-row window at offset 0**, with inputs
+  identical to the causal run's. So the fault is in the windowed kernel itself, not
+  in the offset arithmetic the earlier hypotheses blamed.
+- That also **corrects E1b's device evidence**: `cuda_causal_and_windowed_agree_on_the_same_rows`
+  used a degenerate fixture (one-hot queries/values), which made the output
+  insensitive to the scores, so it passed while the windowed path was wrong. Both
+  tests now say so, and the randomized one is the gate — it is `#[ignore]`d (red)
+  until the kernel is fixed, so the suite stays green while the reproduction is
+  preserved.
+
+**Next step:** fix the windowed instantiation. Start from the launcher
+(`src/cuda.rs`) and the `template <bool CAUSAL>` entry points in
+`src/cuda_kernels.cu`: the reproduction says the windowed body is wrong even when
+`lo == 0`, which points at the variant selection or the body's row/reduction
+arithmetic rather than at `row0`.
+
+Earlier text (kept for the record of how the diagnosis narrowed): a focused device test of the **windowed** instantiation with a *long* window at a non-zero start (34-64 rows) against the causal instantiation over the same rows — that should pin the exact kernel variant (the split/rows-per-warp bodies and the `_bt` variants are the candidates) and give a minimal reproduction, then the fix. The engine test as it stands is the end-to-end reproduction and now renders the server's prompt, so it fails the moment the bug is present and passes when it is fixed. Note also that this *corrects* the earlier "server-only, engine is fine" conclusion: that comparison used 5-token prompts on the engine side and 34-token ones on the server side. **Impact: E6 made batching the default on CUDA, so this is the default behaviour on a GPU server today**; E2's "GPU acceptance 1.9x" measurement inspected only request 0's text, so its *timing* stands but its *correctness* was never checked per request — that record is corrected here. **Immediate mitigation to decide: revert E6's CUDA default (back to opt-in) until this is fixed.** |
 | 1 | **CI has no GPU.** The CUDA job only compiles the harness, so every device-gated test is a local, manual run — which is exactly how six device-only test bugs survived to 2026-09-18. | process | A **self-hosted runner on this DGX Spark** would put `cargo test --features cuda` into CI; nothing else does. Until then, anyone changing CUDA code must run it by hand and say so. |
 | 2 | **The windowed instantiation's cost at equal width is unmeasured** (`cuda_causal_and_windowed_agree_on_the_same_rows` proves equality, not speed). | measurement | E1b record; needs a device A/B over identical rows at one width. |
 | 3 | **A varying batch width rebuilds the graph** (`GraphCache` holds one graph at a time), so a server alternating 1-wide and N-wide decode steps re-allocates. | design | **E4** (allocator reserve/assign + multi-graph cache). |
