@@ -793,7 +793,8 @@ impl Backend for MetalBackend {
                         )
                     };
                     eprintln!(
-                        "[ffn-out] FusedFFN out_buf={out_buf} len={nb} first4={:?} last4={:?}",
+                        "[ffn-out] FusedFFN out_buf={} len={nb} first4={:?} last4={:?}",
+                        out_buf.id,
                         &ob[..4],
                         &ob[nb - 4..]
                     );
