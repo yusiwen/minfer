@@ -66,6 +66,7 @@ three implementations — keep it in step with them.
 | `RmsNorm`, `QkNorm` | ✅ | ✅ | ✅ |
 | `MatMul` | ✅ | ✅ | ✅ |
 | `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
+| `View` with `offset != 0` or a partial window (D1) | ✅ | ❌ | ✅ — Metal's kernels take a buffer and a length with no element offset, so it can express exact views only (G5); the allocator backstops the partial case, which `supports_op` cannot see |
 | `Attn` | ✅ | ✅ | ✅ |
 | `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ❌ | ✅ — Metal still derives the bound from `positions` (G5); CUDA's windowed instantiation (E1b) is **device-verified** on GB10 (sm_121), including a bitwise batch-order-invariance gate |
 | `KvcacheStore` | ✅ | ✅ | ✅ |

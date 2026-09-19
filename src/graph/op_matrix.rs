@@ -392,6 +392,26 @@ fn build_view(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
     (o, vec![("x", a.clone())], a, vec![])
 }
 
+/// D1 increment 2: a **partial** window at a non-zero offset — the shape D2
+/// needs (q, k and v are windows of one concat buffer). `copy_to_cpu` must read
+/// exactly the window, not the parent's whole buffer.
+fn build_view_offset(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
+    let x = b.input("x", [8, 1, 1, 1], DType::F32);
+    let o = b.node(
+        "view_at_2",
+        Op::View {
+            offset: 2,
+            shape: [4, 1, 1, 1],
+        },
+        &[x],
+        [4, 1, 1, 1],
+        DType::F32,
+        NodeMeta::None,
+    );
+    let a: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    (o, vec![("x", a)], vec![3.0, 4.0, 5.0, 6.0], vec![])
+}
+
 fn build_reshape(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
     let x = b.input("x", [4, 1, 1, 1], DType::F32);
     let o = b.node(
@@ -588,6 +608,15 @@ fn cases() -> Vec<Case> {
             },
             build: build_view,
             note: "",
+        },
+        Case {
+            name: "View offset",
+            op: Op::View {
+                offset: 2,
+                shape: [4, 1, 1, 1],
+            },
+            build: build_view_offset,
+            note: "D1: a partial window at a non-zero offset",
         },
         Case {
             name: "Reshape",

@@ -249,13 +249,6 @@ impl GraphAllocator {
             // two refusals below are loud on purpose: a view this increment
             // cannot express must not silently become a copy.
             if let Some(v) = node.view {
-                if v.offset != 0 {
-                    return Err(format!(
-                        "node {id} ('{}') is a view at element offset {} — offset views are D1's \
-                         second increment (`BufRef` carries no offset yet); build a copy instead",
-                        node.name, v.offset
-                    ));
-                }
                 let parent = self.node_to_buf.get(&v.src).copied().ok_or_else(|| {
                     format!(
                         "view node {id} ('{}') has no buffer for its parent {}",
@@ -272,19 +265,37 @@ impl GraphAllocator {
                         parent.backend
                     ));
                 }
+                // D1 increment 2: the window may start at a non-zero offset and
+                // be shorter than its parent, so the window must fit *inside* it
+                // (`offset + len <= parent`), and the reference carries both so
+                // every consumer slices exactly.
                 let parent_elems = graph.node(v.src).n_elements();
-                if node.n_elements() != parent_elems {
+                let window = node.n_elements();
+                // D1: Metal's kernels have no element offset, so it can express
+                // an exact view only (offset 0 and the parent's own length) —
+                // `supports_op` already refuses a non-zero offset there, and this
+                // backstops the partial window, which the op cannot see. Loud,
+                // because the alternative is reading the wrong bytes.
+                if parent.backend == Backend::Metal && (v.offset != 0 || window != parent_elems) {
                     return Err(format!(
-                        "view node {id} ('{}') spans {} elements but its parent {} spans {parent_elems}: \
-                         this increment aliases exact views only (`copy_to_cpu` on a partial view \
-                         would read the parent's whole buffer)",
+                        "view node {id} ('{}') is a window of {} elements at offset {} of a \
+                         {parent_elems}-element buffer on Metal, whose kernels take a buffer and a \
+                         length with no offset; Metal supports exact views only (G5)",
+                        node.name, window, v.offset
+                    ));
+                }
+                if v.offset + window > parent_elems {
+                    return Err(format!(
+                        "view node {id} ('{}') spans [{}, {}) but its parent {} has {parent_elems} \
+                         elements — the window does not fit",
                         node.name,
-                        node.n_elements(),
+                        v.offset,
+                        v.offset + window,
                         v.src
                     ));
                 }
                 let lu = last_use[id];
-                self.node_to_buf.insert(id, parent);
+                self.node_to_buf.insert(id, parent.window(v.offset, window));
                 extend_through_views(graph, &mut last_use, id, lu);
                 continue;
             }
@@ -308,7 +319,7 @@ impl GraphAllocator {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
                         self.buf_alive.insert((backend, pid), last_use[id]);
-                        self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                        self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
                 }
                 Op::FusedQkvNorm { layer } => {
@@ -324,7 +335,7 @@ impl GraphAllocator {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
                         self.buf_alive.insert((backend, pid), last_use[id]);
-                        self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                        self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
                 }
                 Op::Silu | Op::RoPE { .. } | Op::QkvBiasRopeStore { .. } => {
@@ -365,7 +376,7 @@ impl GraphAllocator {
                             let size = node.n_elements();
                             let pid = self.alloc_in_pool(backend, size);
                             self.buf_alive.insert((backend, pid), last_use[id]);
-                            self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                            self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                         }
                     }
                 }
@@ -374,7 +385,7 @@ impl GraphAllocator {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
                         self.buf_alive.insert((backend, pid), last_use[id]);
-                        self.node_to_buf.insert(id, BufRef { backend, id: pid });
+                        self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
                 }
             }
@@ -496,7 +507,7 @@ impl GraphAllocator {
             backend,
             id,
         });
-        BufRef { backend, id }
+        BufRef::own(backend, id, size)
     }
 
     /// Buffer handle for a node (None if the node is dead / not allocated).
@@ -968,18 +979,25 @@ impl GraphAllocator {
     /// Host copy of any node's buffer (cross-backend reads).
     pub fn copy_to_cpu(&mut self, id: NodeId) -> Option<Vec<f32>> {
         let br = self.node_buffer(id)?;
+        // D1: a view's reference is a window, so read exactly it — the parent's
+        // buffer is longer (and may hold another view's data).
+        let window = |v: Vec<f32>| -> Vec<f32> { v[br.offset..br.offset + br.len].to_vec() };
         match br.backend {
-            Backend::CPU => self.cpu.read_host(br.id).map(|s| s.to_vec()),
+            Backend::CPU => self.cpu.read_host(br.id).map(|s| window(s.to_vec())),
             #[cfg(target_os = "macos")]
             Backend::Metal => self
                 .metal
                 .as_mut()
                 .and_then(|m| m.read_host(br.id))
-                .map(|s| s.to_vec()),
+                .map(|s| window(s.to_vec())),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => None,
             #[cfg(feature = "cuda")]
-            Backend::Cuda => self.cuda.as_ref().and_then(|c| c.copy_to_host(br.id)),
+            Backend::Cuda => self
+                .cuda
+                .as_ref()
+                .and_then(|c| c.copy_to_host(br.id))
+                .map(window),
             #[cfg(not(feature = "cuda"))]
             Backend::Cuda => None,
         }
@@ -1084,10 +1102,7 @@ impl GraphAllocator {
                 let id = self.alloc_fresh_in(dst_backend, data.len());
                 self.cross.insert(
                     (node_id, dst_backend),
-                    BufRef {
-                        backend: dst_backend,
-                        id,
-                    },
+                    BufRef::own(dst_backend, id, data.len()),
                 );
                 id
             }
@@ -1126,9 +1141,15 @@ impl GraphAllocator {
     /// had copied it. The real path needs a second usable backend, which a
     /// CPU-only build does not have.
     #[cfg(test)]
-    pub fn stage_cross_for_test(&mut self, node_id: NodeId, backend: Backend, id: usize) {
+    pub fn stage_cross_for_test(
+        &mut self,
+        node_id: NodeId,
+        backend: Backend,
+        id: usize,
+        len: usize,
+    ) {
         self.cross
-            .insert((node_id, backend), BufRef { backend, id });
+            .insert((node_id, backend), BufRef::own(backend, id, len));
     }
 }
 
@@ -1188,24 +1209,33 @@ mod tests {
         );
     }
 
-    /// D1: what this increment cannot express is refused **loudly** — never
-    /// silently copied (standing rule 2).
+    /// D1 increment 2: a partial window at a non-zero offset maps onto the
+    /// parent's buffer with exactly that window (the op matrix's `View offset`
+    /// case proves the bytes; this pins the bookkeeping).
     #[test]
-    fn views_that_need_more_than_exact_aliasing_are_refused() {
-        // An offset view is increment 2 (BufRef carries no offset yet).
-        let g = view_graph(1, [4, 1, 1, 1], [8, 1, 1, 1]);
-        let err = GraphAllocator::new()
-            .alloc_graph(&g)
-            .expect_err("offset view must be refused");
-        assert!(err.contains("second increment"), "{err}");
+    fn an_offset_view_names_a_window_of_its_parent() {
+        let g = view_graph(2, [4, 1, 1, 1], [8, 1, 1, 1]);
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let parent = alloc.node_buffer(0).expect("parent");
+        let view = alloc.node_buffer(1).expect("view");
+        assert_eq!(
+            (view.id, view.offset, view.len),
+            (parent.id, 2, 4),
+            "the view must be the parent's buffer, windowed to [2, 6)"
+        );
+    }
 
-        // A partial window would make `copy_to_cpu(view)` read the parent's
-        // whole buffer, so it is refused too.
-        let g = view_graph(0, [2, 1, 1, 1], [4, 1, 1, 1]);
+    /// D1: what cannot be expressed is refused **loudly** — never silently
+    /// copied or mis-read (standing rule 2). Increment 2 accepts offset and
+    /// partial windows, so what remains here is a window that does not fit.
+    #[test]
+    fn views_that_do_not_fit_their_parent_are_refused() {
+        let g = view_graph(4, [4, 1, 1, 1], [6, 1, 1, 1]);
         let err = GraphAllocator::new()
             .alloc_graph(&g)
-            .expect_err("partial view must be refused");
-        assert!(err.contains("exact views only"), "{err}");
+            .expect_err("a window past the parent must be refused");
+        assert!(err.contains("does not fit"), "{err}");
     }
 
     /// D1: an in-place op on a view writes through to the buffer it is a window
@@ -1417,13 +1447,13 @@ mod tests {
     #[test]
     fn staging_is_keyed_by_destination_backend() {
         let mut alloc = GraphAllocator::new();
-        alloc.stage_cross_for_test(7, Backend::CPU, 3);
+        alloc.stage_cross_for_test(7, Backend::CPU, 3, 4);
         assert_eq!(alloc.cross_buffer(7, Backend::CPU).map(|b| b.id), Some(3));
         assert!(
             alloc.cross_buffer(7, Backend::Cuda).is_none(),
             "a CPU staging buffer must not be offered to a CUDA consumer"
         );
-        alloc.stage_cross_for_test(7, Backend::Cuda, 4);
+        alloc.stage_cross_for_test(7, Backend::Cuda, 4, 4);
         assert_eq!(alloc.cross_buffer(7, Backend::Cuda).map(|b| b.id), Some(4));
         assert_eq!(
             alloc.cross_buffer(7, Backend::CPU).map(|b| b.id),

@@ -566,7 +566,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **increment 1 done (D1, 2026-09-19)**: exact views are zero-copy and aliasing is allocator-known (`CNode.view`, allocator mapping + liveness, view kernels are no-ops with loud refusals); offset views and multi-output nodes remain (D2 needs the former) | §2.1 | L |
+| 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **increments 1–2 done (D1, 2026-09-19)**: exact views are zero-copy with allocator-known aliasing (`CNode.view` + liveness + no-op kernels), and **offset/partial windows work on CPU and CUDA** (`BufRef` carries `offset`+`len` through the `Backend` trait; Metal is exact-only until G5). Multi-output nodes remain — that is what MoE/MLA need; D2's windows now exist | §2.1 | L |
 | 8 | **Allocator reserve/assign split** + size-class rounding + real memory accounting + VRAM feasibility gate. | §2.3 | L |
 | 9 | **Layer offload policy** on top of (8); needs a layer-granular assignment pass. | §2.6 | L |
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. | §2.5 | M |

@@ -7,7 +7,7 @@
 //! boundaries — Phase 3).
 
 use super::ops::{FusedOp, Op};
-use super::{CNode, DType};
+use super::{BufRef, CNode, DType};
 
 /// KV-region access: each layer owns two persistent regions (K and V).
 /// Backends resolve the sibling buffer (e.g. the V region when executing
@@ -52,16 +52,23 @@ pub trait Backend: Send + Sync {
     /// free_buffer (at graph rebuild), where liveness recycling is safe.
     fn alloc_fresh(&mut self, size: usize) -> usize;
 
-    /// Execute one node: inputs and output are ids in this backend's pool.
-    /// `kv_pair` is the layer's (k, v) region buffer ids for KV ops
-    /// (None for non-KV ops or when the layer has no regions). The output
-    /// buffer may alias an input buffer (liveness reuse) — the backend must
-    /// handle in-place execution safely.
+    /// Execute one node: inputs and output are [`BufRef`]s into this backend's
+    /// pool. A reference carries an element `offset` and `len` (D1 views), so a
+    /// backend must apply the offset when it resolves the buffer — an owning
+    /// node's reference has `offset == 0` and covers the whole buffer, and a
+    /// view's is a window of its parent's.
+    ///
+    /// `kv_pair` is the layer's (k, v) region buffer *ids* for KV ops (None for
+    /// non-KV ops or when the layer has no regions); the persistent KV regions
+    /// are never views, so they stay ids.
+    ///
+    /// The output buffer may alias an input buffer (liveness reuse, in-place
+    /// ops, D1 views) — the backend must handle that safely.
     fn execute_node(
         &mut self,
         node: &CNode,
-        in_bufs: &[usize],
-        out_buf: usize,
+        in_bufs: &[BufRef],
+        out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String>;
 

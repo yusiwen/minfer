@@ -93,6 +93,38 @@ pub enum Backend {
 pub struct BufRef {
     pub backend: Backend,
     pub id: usize,
+    /// D1: element offset into the pool buffer. 0 for an owning node; non-zero
+    /// for an offset view (see [`CNode::view`]).
+    pub offset: usize,
+    /// D1: how many elements this reference covers — the node's element count.
+    /// An owning node covers its whole pool buffer; a view covers its window,
+    /// which is why the length travels with the reference instead of being
+    /// recovered from the pool (`copy_to_cpu`, slicing and the GPU pointer
+    /// arithmetic all need it).
+    pub len: usize,
+}
+
+impl BufRef {
+    /// An owning reference to a whole pool buffer.
+    pub fn own(backend: Backend, id: usize, len: usize) -> Self {
+        Self {
+            backend,
+            id,
+            offset: 0,
+            len,
+        }
+    }
+
+    /// A window into this reference (D1 views): same pool buffer, offset
+    /// advanced, length replaced by the window's.
+    pub fn window(&self, offset: usize, len: usize) -> Self {
+        Self {
+            backend: self.backend,
+            id: self.id,
+            offset: self.offset + offset,
+            len,
+        }
+    }
 }
 
 /// Persistent (never-freed) region — KV cache, etc.

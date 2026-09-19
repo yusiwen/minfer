@@ -268,7 +268,7 @@ impl BackendScheduler {
                         .cross_buffer(s, split.backend)
                         .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
-                    in_bufs.push(sbr.id);
+                    in_bufs.push(sbr);
                 }
                 // resolve the layer's KV region pair BEFORE the mutable backend
                 // borrow (the backend needs it for KV store / attention)
@@ -286,20 +286,18 @@ impl BackendScheduler {
                 // NOTE: execution follows node id order (build order), which is
                 // the graph's topological order by construction.
                 match split.backend {
-                    BackendTag::CPU => alloc
-                        .cpu_mut()
-                        .execute_node(node, &in_bufs, br.id, kv_pair)?,
+                    BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br, kv_pair)?,
                     #[cfg(target_os = "macos")]
                     BackendTag::Metal => {
                         let m = alloc.metal_mut().ok_or("Metal backend not enabled")?;
-                        m.execute_node(node, &in_bufs, br.id, kv_pair)?;
+                        m.execute_node(node, &in_bufs, br, kv_pair)?;
                     }
                     #[cfg(not(target_os = "macos"))]
                     BackendTag::Metal => return Err("Metal unavailable".into()),
                     #[cfg(feature = "cuda")]
                     BackendTag::Cuda => {
                         let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
-                        c.execute_node(node, &in_bufs, br.id, kv_pair)?;
+                        c.execute_node(node, &in_bufs, br, kv_pair)?;
                     }
                     #[cfg(not(feature = "cuda"))]
                     BackendTag::Cuda => return Err("CUDA backend not implemented".into()),

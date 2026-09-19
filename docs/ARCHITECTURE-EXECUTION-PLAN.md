@@ -638,7 +638,7 @@ prompt) belongs with E2's batching work.
 
 | ID | Title | Effort |
 |---|---|---|
-| D1 | Strided views with allocator-known aliasing + multi-output nodes — **increment 1 landed (2026-09-19): exact views are zero-copy, aliasing is allocator-known**; offset views and multi-output nodes remain | L |
+| D1 | Strided views with allocator-known aliasing + multi-output nodes — **increments 1–2 landed (2026-09-19): exact views are zero-copy, offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait), Metal is exact-only**; multi-output nodes remain | L |
 | D2 | Re-express one decode fusion as a composition (proof) | M |
 | D3 | Decide the fate of the four hand-written fused ops | S |
 
