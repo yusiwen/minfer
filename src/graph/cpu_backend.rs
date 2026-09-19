@@ -499,6 +499,54 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn copy_cells(
+        &mut self,
+        dst: BufRef,
+        src: BufRef,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems_per_cell: usize,
+    ) -> Result<(), String> {
+        if dst_row > src_row {
+            return Err(format!(
+                "copy_cells: dst row {dst_row} is below src row {src_row}; the contract is \
+                 downward-only (ascending copies are the safe direction)"
+            ));
+        }
+        if dst.id != src.id {
+            return Err(format!(
+                "copy_cells: CPU moves cells within one buffer ({} -> {})",
+                src.id, dst.id
+            ));
+        }
+        let buf = self
+            .buffers
+            .get_mut(dst.id)
+            .ok_or_else(|| format!("copy_cells: unknown buffer {}", dst.id))?;
+        let src_start = src_row
+            .checked_mul(elems_per_cell)
+            .ok_or("copy_cells: src range overflows")?;
+        let dst_start = dst_row
+            .checked_mul(elems_per_cell)
+            .ok_or("copy_cells: dst range overflows")?;
+        let len = rows
+            .checked_mul(elems_per_cell)
+            .ok_or("copy_cells: length overflows")?;
+        if src_start + len > buf.len() || dst_start + len > buf.len() {
+            return Err(format!(
+                "copy_cells: {} rows x {elems_per_cell} elements at src {src_start} / dst \
+                 {dst_start} does not fit a {} element buffer",
+                rows,
+                buf.len()
+            ));
+        }
+        // `copy_within` is a memmove: correct for overlapping ranges, whichever
+        // way they overlap, which is what the contract needs.
+        buf.copy_within(src_start..src_start + len, dst_start);
+        Ok(())
+    }
+
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         self.buffers.get(id).map(|b| b.as_slice())
     }
@@ -698,6 +746,30 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_rows_move_down_safely() {
+        let mut b = CpuBackend::new();
+        let id = b.alloc_buffer(16);
+        b.write_host(id, &(0..16).map(|i| i as f32).collect::<Vec<_>>())
+            .unwrap();
+        let r = BufRef::own(crate::graph::Backend::CPU, id, 16);
+        // Rows of 4 elements: row 0 <- row 1, overlapping by design.
+        b.copy_cells(r, r, 0, 1, 2, 4).unwrap();
+        assert_eq!(
+            b.read_host(id).unwrap(),
+            &[
+                4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                15.0
+            ]
+        );
+        // The safe direction is downward: an upward move is refused, not guessed.
+        let err = b.copy_cells(r, r, 1, 0, 2, 4).unwrap_err();
+        assert!(err.contains("downward-only"), "{err}");
+        // A range leaving the buffer is an error, never a truncation.
+        assert!(b.copy_cells(r, r, 0, 3, 4, 4).is_err());
+        assert!(b.copy_cells(r, r, 0, 0, 1, 32).is_err());
+    }
     use crate::graph::alloc::GraphAllocator;
     use crate::graph::builder::GraphBuilder;
     use crate::graph::scheduler::BackendScheduler;

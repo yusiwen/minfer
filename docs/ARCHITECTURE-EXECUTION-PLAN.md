@@ -1,7 +1,8 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **2/5** (C1, C2 done; C3=C4=C5 open); Phase D **2/3** (D2, D3
+2026-09-16); Phase C **2/5** (C1, C2 done; C3 landed increments 1-2, its integration run open;
+C4=C5 open); Phase D **2/3** (D2, D3
 done; D1 landed increments 1-2, multi-output nodes open); Phase E **4/7** (E1, E1b,
 E2, E6 done; E3-E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by
 decision (needs macOS). **Next: C3 + D1 increment 3.** Per-ticket evidence is in
@@ -695,10 +696,14 @@ else follows, because the graph's window (`attn_span`) is *derived* from
 wrong in a hard-to-find way: its next store would write to the old cells and the
 span check would reject the query.
 
-**Trigger.** `GraphAllocator::kv_reserve_seq` retries once through a compaction
-when first-fit fails, unless `MINFER_NO_KV_DEFRAG=1` — the A/B gate standing rule 3
-requires: the same workload must produce identical output with and without the
-compaction, and the counters must show what it bought.
+**Trigger.** `GraphAllocator::kv_reserve_seq_with_defrag` retries once through a
+compaction when first-fit fails, unless `MINFER_NO_KV_DEFRAG` (presence-checked)
+disables it — the A/B gate standing rule 3 requires: the same workload must
+produce identical output with and without the compaction, and the counters must
+show what it bought. The plain `kv_reserve_seq` stays pure, so a caller that keeps
+no run bookkeeping (the single-sequence path, the graph tests) is unaffected; the
+defrag-capable variant returns the moved runs precisely because a caller that
+*does* keep one (E2's server) has to follow them.
 
 **Counters (the ticket's other deliverable).** `KvArenaStats` carries `n_ctx`,
 reserved/owned/free cells, the number of **free runs** (the "node count" C3
@@ -722,6 +727,36 @@ larger one, and does not run inside a forward (it is a between-forwards,
 host-driven operation, so CUDA Graph capture is unaffected). Compacting the
 arena *per layer* separately is also out of scope: one plan moves every layer
 together, which is what keeps `owner[]` consistent across layers.
+
+#### C3 record (2026-09-19) — increments 1 and 2
+
+Landed: the planner, the counters and the bookkeeping (increment 1), and the copy
+path (increment 2) — `Backend::copy_cells` on CPU (`copy_within`, i.e. memmove) and
+on CUDA (a new `kv_move_rows` kernel: one block, ascending rows, a barrier between
+them, no staging buffer), Metal refusing loudly (G5),
+`GraphAllocator::kv_defrag` + `kv_reserve_seq_with_defrag` + the
+`MINFER_NO_KV_DEFRAG` gate, and the server applying the returned moves to its slot
+starts.
+
+Evidence:
+
+- CPU end to end: `kv_defrag_moves_the_bytes_and_opens_the_run` fragments a real
+  16-cell arena (K/V regions allocated by a `kvcache_store` graph), asserts the
+  8-cell reservation is **refused**, compacts, then checks the *bytes* at the new
+  cells, the counters (`free_runs` 2 -> 1, `defrags`/`cells_moved`), and that the
+  refused reservation now fits — and repeats the fragmentation so the retry
+  helper has to hand the moves back. CPU suite: 207 passed / 0 failed / 5 ignored.
+- Device: `cuda_copy_cells_moves_overlapping_rows_down` moves rows `[1, 4)` to
+  `[0, 3)` — two of the three rows are read *and* overwritten — compares the whole
+  buffer, and checks that the downward-only contract is refused before a launch.
+  CUDA suite: 255 passed / 0 failed / 5 ignored.
+- Coverage split, stated rather than implied: the allocator's **CPU** arm is proven
+  end to end and the CUDA *primitive* is device-proven, but "the allocator drives
+  the CUDA copy" is glue that only increment 3's integration run exercises.
+
+Increment 3 remains: fragment the arena through the **server's** dynamic runs and
+assert the replies stay identical to the serial path, which is also where
+`MINFER_NO_KV_DEFRAG` gets its A/B.
 
 ### C4 / C5
 - C4: Q8_0 KV first, behind `MINFER_CACHE_TYPE`, gated to where the kernels

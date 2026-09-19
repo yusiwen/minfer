@@ -72,6 +72,31 @@ pub trait Backend: Send + Sync {
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String>;
 
+    /// Move `rows` rows of `elems_per_cell` f32 elements between two rows of the
+    /// **same** pool buffer — C3's compaction primitive.
+    ///
+    /// Contract: `dst_row <= src_row` and the two ranges may **overlap**, which
+    /// is the entire point of the primitive (a compaction slides a run down to
+    /// the lowest free gap, and the gap is usually inside the same buffer). A
+    /// GPU backend therefore cannot use a bulk device-to-device copy — CUDA
+    /// documents overlapping `cudaMemcpyAsync` as undefined — and must walk rows
+    /// in the safe (ascending) direction instead. A backend that supports the KV
+    /// ops but not this one returns `Err`: the compaction is then refused, never
+    /// silently skipped (standing rule 2).
+    ///
+    /// The destination buffer may be larger than `rows * elems_per_cell`; only
+    /// the named rows are touched, so a stale tail needs no clearing (the cell
+    /// store marks the vacated cells free, and nothing addresses them).
+    fn copy_cells(
+        &mut self,
+        dst: BufRef,
+        src: BufRef,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems_per_cell: usize,
+    ) -> Result<(), String>;
+
     /// Host read/write of a pool buffer (for input filling and output
     /// extraction; GPU backends implement these as staged transfers).
     fn read_host(&self, id: usize) -> Option<&[f32]>;
