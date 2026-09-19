@@ -72,6 +72,10 @@ pub struct KvCache {
     seqs: BTreeMap<SeqId, SeqSlot>,
     /// Arena capacity in rows (`n_ctx`), from the first `insert`.
     n_ctx: usize,
+    /// C3: how many compactions ran, and how many cell rows they copied
+    /// (summed over layers) — the counters the ticket's acceptance records.
+    defrags: u64,
+    cells_moved: u64,
 }
 
 impl KvCache {
@@ -81,6 +85,8 @@ impl KvCache {
             identity: true,
             seqs: BTreeMap::new(),
             n_ctx: 0,
+            defrags: 0,
+            cells_moved: 0,
         }
     }
 
@@ -418,6 +424,244 @@ impl KvCache {
         );
         Ok(span)
     }
+
+    /// The maximal **free** cell runs, in cell order: free means "not covered by
+    /// any live reservation" — the same notion `reserve_seq` uses, so a written
+    /// row inside a released run counts as free even though its bytes are still
+    /// there.
+    pub fn free_runs(&self) -> Vec<(usize, usize)> {
+        let n = self.n_ctx;
+        let mut taken = vec![false; n];
+        for slot in self.seqs.values() {
+            for c in slot.start..(slot.start + slot.cap).min(n) {
+                taken[c] = true;
+            }
+        }
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<usize> = None;
+        for (c, &t) in taken.iter().enumerate() {
+            match (t, open) {
+                (false, None) => open = Some(c),
+                (true, Some(start)) => {
+                    runs.push((start, c - start));
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = open {
+            runs.push((start, n - start));
+        }
+        runs
+    }
+
+    /// Rows sequence `seq` actually wrote, counted from its run's start.
+    ///
+    /// Ownership is contiguous by construction (`seq_range` documents why), so
+    /// this is the sequence's live prefix — and the number of rows a compaction
+    /// has to copy for it. `cap` bounds it: cells past the reservation belong to
+    /// nobody, whatever `owner[]` still says.
+    pub fn written_rows(&self, seq: SeqId) -> usize {
+        let (Some(slot), Some(layer)) = (self.seqs.get(&seq), self.layers.values().next()) else {
+            return 0;
+        };
+        let mut rows = 0;
+        while rows < slot.cap
+            && slot.start + rows < layer.owner.len()
+            && layer.owner[slot.start + rows] == seq
+        {
+            rows += 1;
+        }
+        rows
+    }
+
+    /// Fragmentation and utilisation counters (C3's acceptance surface; the
+    /// same numbers F8 exports).
+    pub fn arena_stats(&self) -> KvArenaStats {
+        let reserved_cells: usize = self.seqs.values().map(|s| s.cap.min(self.n_ctx)).sum();
+        let runs = self.free_runs();
+        KvArenaStats {
+            n_ctx: self.n_ctx,
+            reserved_cells,
+            owned_cells: self
+                .layers
+                .values()
+                .next()
+                .map_or(0, |l| l.owner.iter().filter(|&&o| o != FREE).count()),
+            free_cells: self.n_ctx.saturating_sub(reserved_cells),
+            free_runs: runs.len(),
+            largest_free_run: runs.iter().map(|&(_, len)| len).max().unwrap_or(0),
+            sequences: self.seqs.len(),
+            defrags: self.defrags,
+            cells_moved: self.cells_moved,
+        }
+    }
+
+    /// The moves that compact the live runs **downward**, in application order.
+    ///
+    /// Runs are packed from cell 0 in ascending `start` order, each keeping its
+    /// `cap`, so free space coalesces at the top of the arena. `need`: `None`
+    /// compacts fully; `Some(n)` keeps only the shortest prefix of the plan whose
+    /// last move leaves a free gap of at least `n` cells, which is what makes
+    /// `reserve_seq(n)` succeed — moving runs that buy nothing is exactly what a
+    /// defragmentation should not do.
+    ///
+    /// Pure: no mutation and no backend call, so the policy is unit-tested
+    /// without a device. The data copy is the allocator's job
+    /// (`Backend::copy_cells`), driven by the returned `rows`.
+    pub fn compaction_plan(&self, need: Option<usize>) -> Vec<KvMove> {
+        let mut runs: Vec<(SeqId, SeqSlot)> = self
+            .seqs
+            .iter()
+            .filter(|(_, s)| s.cap > 0)
+            .map(|(&seq, &slot)| (seq, slot))
+            .collect();
+        runs.sort_by_key(|&(seq, slot)| (slot.start, seq));
+        let mut cursor = 0usize;
+        let mut moves = Vec::new();
+        for (i, &(seq, slot)) in runs.iter().enumerate() {
+            if slot.start != cursor {
+                moves.push(KvMove {
+                    seq,
+                    from: slot.start,
+                    to: cursor,
+                    rows: self.written_rows(seq),
+                });
+            }
+            cursor += slot.cap;
+            if let Some(n) = need {
+                // Contiguous free space this prefix of the plan opens: from the
+                // packed cursor up to the next run that stays where it is.
+                let gap_end = runs.get(i + 1).map_or(self.n_ctx, |&(_, next)| next.start);
+                if gap_end.saturating_sub(cursor) >= n {
+                    break;
+                }
+            }
+        }
+        moves
+    }
+
+    /// Apply the **bookkeeping** half of a plan: move each run's ownership in
+    /// every layer and renumber the run table. Returns the rows moved per layer.
+    ///
+    /// The caller has already copied (or is about to copy) the data with
+    /// `Backend::copy_cells`; this function never touches a buffer, so it stays
+    /// backend-agnostic and provable on CPU. It also leaves `identity` alone: a
+    /// compaction renumbers *cells* while every caller's position follows its
+    /// run's new `start` (the report), so the position-to-cell relationship the
+    /// flag describes is unchanged.
+    ///
+    /// Refuses anything that is not a downward move onto an unclaimed layout —
+    /// a plan violation is a bug, and the alternative (overwriting a live
+    /// sequence's rows) corrupts a session silently.
+    pub fn apply_moves(&mut self, moves: &[KvMove]) -> Result<usize, String> {
+        if moves.is_empty() {
+            return Ok(0);
+        }
+        // Validate against the post-state layout before mutating anything.
+        let mut planned: Vec<(usize, usize)> = Vec::with_capacity(self.seqs.len());
+        for (&seq, slot) in self.seqs.iter() {
+            let to = match moves.iter().find(|m| m.seq == seq) {
+                Some(m) => {
+                    if slot.start != m.from {
+                        return Err(format!(
+                            "apply_moves: sequence {seq} starts at {}, the plan says {}",
+                            slot.start, m.from
+                        ));
+                    }
+                    if m.to > m.from {
+                        return Err(format!("apply_moves: {m:?} is not a downward move"));
+                    }
+                    if m.rows > slot.cap {
+                        return Err(format!(
+                            "apply_moves: {m:?} copies {} rows but the run holds {}",
+                            m.rows, slot.cap
+                        ));
+                    }
+                    m.to
+                }
+                None => slot.start,
+            };
+            planned.push((to, slot.cap));
+        }
+        planned.sort_unstable();
+        for w in planned.windows(2) {
+            if w[0].0 + w[0].1 > w[1].0 {
+                return Err(format!(
+                    "apply_moves: runs would overlap after the plan ({}..{} then {})",
+                    w[0].0,
+                    w[0].0 + w[0].1,
+                    w[1].0
+                ));
+            }
+        }
+        if let Some(&(start, cap)) = planned.last() {
+            if start + cap > self.n_ctx {
+                return Err(format!(
+                    "apply_moves: the plan ends at {} but the arena holds {} cells",
+                    start + cap,
+                    self.n_ctx
+                ));
+            }
+        }
+
+        let layers = self.layers.len();
+        let mut rows_moved = 0usize;
+        for m in moves {
+            rows_moved += m.rows;
+            for layer in self.layers.values_mut() {
+                let rows = m.rows.min(layer.owner.len().saturating_sub(m.from));
+                if rows > 0 {
+                    // `to <= from`, so an ascending memmove is what `copy_within`
+                    // already does — no temp buffer and no direction flag.
+                    layer.owner.copy_within(m.from..m.from + rows, m.to);
+                    for cell in (m.to + rows)..(m.from + rows) {
+                        if cell < layer.owner.len() {
+                            layer.owner[cell] = FREE;
+                        }
+                    }
+                }
+                layer.n_used = layer
+                    .owner
+                    .iter()
+                    .rposition(|&o| o != FREE)
+                    .map_or(0, |i| i + 1);
+            }
+            if let Some(slot) = self.seqs.get_mut(&m.seq) {
+                slot.start = m.to;
+            }
+        }
+        self.defrags += 1;
+        self.cells_moved += (rows_moved * layers) as u64;
+        Ok(rows_moved)
+    }
+}
+
+/// One run relocation produced by [`KvCache::compaction_plan`] (C3).
+///
+/// `from`/`to` are cell indices; `rows` is the sequence's **written** length, so
+/// `rows <= cap` and `rows == 0` means the run moves without a data copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvMove {
+    pub seq: SeqId,
+    pub from: usize,
+    pub to: usize,
+    pub rows: usize,
+}
+
+/// Fragmentation and utilisation counters (C3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvArenaStats {
+    pub n_ctx: usize,
+    pub reserved_cells: usize,
+    pub owned_cells: usize,
+    pub free_cells: usize,
+    /// Maximal free runs — the "node count" a compaction reduces.
+    pub free_runs: usize,
+    pub largest_free_run: usize,
+    pub sequences: usize,
+    pub defrags: u64,
+    pub cells_moved: u64,
 }
 
 /// RoPE parameters a KV shift needs to re-rope the stored K rows.
@@ -760,5 +1004,184 @@ mod tests {
         let mut same = untouched.clone();
         rope_shift_kv(&mut same, 1, 0, &rope);
         assert_eq!(same, untouched);
+    }
+
+    /// Reserve `seq` a `cap`-cell run and take ownership of all of it, so the
+    /// run has a live prefix a compaction must carry.
+    fn place(c: &mut KvCache, seq: SeqId, cap: usize) -> usize {
+        let slot = c.reserve_seq(seq, cap).unwrap();
+        c.own_range(seq, slot.start, slot.start + cap);
+        slot.start
+    }
+
+    #[test]
+    fn a_fresh_arena_is_one_free_run() {
+        let c = cache(16);
+        let st = c.arena_stats();
+        assert_eq!(
+            (st.free_cells, st.free_runs, st.largest_free_run),
+            (16, 1, 16)
+        );
+        assert_eq!((st.reserved_cells, st.owned_cells, st.sequences), (0, 0, 0));
+    }
+
+    #[test]
+    fn fragmentation_refuses_a_run_the_arena_could_hold() {
+        let mut c = cache(16);
+        // A[0,4) B[4,4) C[8,4) D[12,4), all written.
+        for seq in 1u32..=4 {
+            place(&mut c, seq, 4);
+        }
+        // Free A and C: two 4-cell runs, 8 free cells, none of them 8 long.
+        c.release_seq(1);
+        c.release_seq(3);
+        let st = c.arena_stats();
+        assert_eq!(
+            (st.free_cells, st.free_runs, st.largest_free_run),
+            (8, 2, 4)
+        );
+        let err = c.reserve_seq(5, 8).unwrap_err();
+        assert!(err.contains("no free run of 8 cells"), "{err}");
+        // This is the failure C3 exists for: capacity is not the constraint.
+        assert!(st.free_cells >= 8);
+    }
+
+    #[test]
+    fn the_plan_stops_as_soon_as_it_opens_the_run_it_needs() {
+        let mut c = cache(16);
+        for seq in 1u32..=4 {
+            place(&mut c, seq, 4);
+        }
+        c.release_seq(1);
+        c.release_seq(3);
+        // Moving B down to 0 opens [4, 12): enough for 8 cells, so D stays put.
+        assert_eq!(
+            c.compaction_plan(Some(8)),
+            vec![KvMove {
+                seq: 2,
+                from: 4,
+                to: 0,
+                rows: 4
+            }]
+        );
+        // Without `need`, the whole live set is packed.
+        assert_eq!(
+            c.compaction_plan(None),
+            vec![
+                KvMove {
+                    seq: 2,
+                    from: 4,
+                    to: 0,
+                    rows: 4
+                },
+                KvMove {
+                    seq: 4,
+                    from: 12,
+                    to: 4,
+                    rows: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn applying_a_plan_opens_the_run_and_keeps_every_sequences_rows() {
+        let mut c = cache(16);
+        for seq in 1u32..=4 {
+            place(&mut c, seq, 4);
+        }
+        c.release_seq(1);
+        c.release_seq(3);
+        let before = c.arena_stats();
+        // The full plan packs both live runs, so the free tail is the whole top.
+        let plan = c.compaction_plan(None);
+        assert_eq!(c.apply_moves(&plan).unwrap(), 8, "4 written rows per run");
+        let after = c.arena_stats();
+        assert_eq!(after.largest_free_run, 8, "{after:?}");
+        assert_eq!(after.free_runs, 1);
+        assert_eq!(
+            (after.defrags, after.cells_moved),
+            (1, 16),
+            "8 rows x 2 layers"
+        );
+        assert!(before.largest_free_run < 8);
+        // The reservation that first-fit refused now fits, in the opened tail.
+        assert_eq!(c.reserve_seq(5, 8).unwrap().start, 8);
+        // Ownership travelled with each sequence; the vacated cells are FREE.
+        let owner = &c.get(0).unwrap().owner;
+        assert_eq!(owner[0..4], [2, 2, 2, 2]);
+        assert_eq!(owner[4..8], [4, 4, 4, 4]);
+        assert!(owner[8..16].iter().all(|&o| o == FREE));
+        assert_eq!(c.seq_slot(4).unwrap().start, 4);
+        assert_eq!(
+            c.get(0).unwrap().n_used,
+            8,
+            "n_used must follow the rows down, not stay at the old top"
+        );
+        // The data the caller will copy is the sequence's live prefix.
+        assert_eq!(c.written_rows(4), 4);
+    }
+
+    #[test]
+    fn an_unwritten_run_moves_its_reservation_without_copying_rows() {
+        let mut c = cache(16);
+        c.reserve_seq(1, 4).unwrap();
+        c.reserve_seq(2, 4).unwrap();
+        c.release_seq(1);
+        let plan = c.compaction_plan(None);
+        assert_eq!(
+            plan,
+            vec![KvMove {
+                seq: 2,
+                from: 4,
+                to: 0,
+                rows: 0
+            }]
+        );
+        assert_eq!(c.apply_moves(&plan).unwrap(), 0);
+        assert_eq!(c.seq_slot(2).unwrap().start, 0);
+        assert_eq!(c.arena_stats().cells_moved, 0);
+        assert_eq!(c.get(0).unwrap().n_used, 0);
+    }
+
+    #[test]
+    fn a_plan_that_would_overlap_a_live_run_is_refused() {
+        let mut c = cache(16);
+        place(&mut c, 1, 4); // [0, 4)
+        place(&mut c, 2, 4); // [4, 8)
+        let bad = vec![KvMove {
+            seq: 2,
+            from: 4,
+            to: 2,
+            rows: 4,
+        }];
+        let err = c.apply_moves(&bad).unwrap_err();
+        assert!(err.contains("would overlap"), "{err}");
+        // Nothing moved: the run table and the counters are untouched.
+        assert_eq!(c.seq_slot(2).unwrap().start, 4);
+        assert_eq!(c.arena_stats().defrags, 0);
+        // A stale `from` and an upward move are refused too.
+        let stale = vec![KvMove {
+            seq: 2,
+            from: 0,
+            to: 0,
+            rows: 0,
+        }];
+        assert!(c.apply_moves(&stale).unwrap_err().contains("the plan says"));
+        let up = vec![KvMove {
+            seq: 2,
+            from: 4,
+            to: 8,
+            rows: 0,
+        }];
+        assert!(c.apply_moves(&up).unwrap_err().contains("downward"));
+        // Rows past the run's cap are a bug, not a bigger copy.
+        let too_many = vec![KvMove {
+            seq: 2,
+            from: 4,
+            to: 0,
+            rows: 5,
+        }];
+        assert!(c.apply_moves(&too_many).unwrap_err().contains("rows"));
     }
 }
