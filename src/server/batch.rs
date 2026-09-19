@@ -873,18 +873,56 @@ mod tests {
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
-        let prompts: Vec<Vec<u32>> = [
+        let texts = [
             "The capital of France is",
             "The capital of Japan is",
             "The capital of Italy is",
             "The capital of Spain is",
-        ]
-        .iter()
-        .map(|p| tok.encode(p))
-        .collect();
-        let n_ctx = 512;
-        let n_slots = 4;
+        ];
+        // Configurable so a bisect can put the *server's* exact configuration on
+        // this path: the field bug of 2026-09-19 (plan §14) reproduces through the
+        // server with the 7B and two slots, but not here with the 0.5B and four —
+        // and these three knobs are the differences that are left.
+        let templated = std::env::var("MINFER_BATCH_TEST_TEMPLATED").is_ok();
+        let prompts: Vec<Vec<u32>> = texts
+            .iter()
+            .map(|p| {
+                if templated {
+                    // Exactly what the server does (`server::mod`): the GGUF's
+                    // chat template, rendered with a generation prompt, then
+                    // tokenized. `model.format_chat` is a *different* path and
+                    // produced a 13-token prompt where the server's is 34 — which
+                    // is why the first bisect compared unequal inputs.
+                    let tpl = super::super::chat_template_from_gguf(&gguf.parts[0].data)
+                        .unwrap_or_default();
+                    let msgs = vec![("user".to_string(), Some(p.to_string()))];
+                    tok.encode(&crate::template::render_messages(
+                        &tpl,
+                        &msgs,
+                        true,
+                        &tok.bos_text(),
+                    ))
+                } else {
+                    tok.encode(p)
+                }
+            })
+            .collect();
+        let n_ctx: usize = std::env::var("MINFER_BATCH_TEST_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let n_slots: usize = std::env::var("MINFER_BATCH_TEST_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let n_req = n_slots.min(prompts.len());
+        let prompts: Vec<Vec<u32>> = prompts.into_iter().take(n_req).collect();
         let max_tokens = 16;
+        eprintln!(
+            "[e2] config: {n_slots} slot(s), n_ctx {n_ctx}, {n_req} request(s), templated={templated}, \
+             prompt len {}",
+            prompts[0].len()
+        );
 
         let (batched, t_batch) =
             run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens, false);
