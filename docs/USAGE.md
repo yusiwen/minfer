@@ -95,6 +95,16 @@ default settings). The plan's E2 and E6 records have the tables.
 - The server prints its choice at startup:
   `[server] batching: on (device cuda; MINFER_BATCH=1 forces it on, =0 forces it off)`.
 
+Two fuse-related switches are easy to confuse (D3):
+
+- `MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` **disable** the corresponding
+  decode fusion (the decoder builds the plain matmul/rope/store — or gate+up+
+  silu+mul — path instead).
+- `MINFER_FFN_COMPOSITION=1` keeps the FFN fusion but builds it as the proven
+  **composition** (concat matmul + gate/up windows + in-place SwiGLU) instead of the
+  hand-written fused node. It is the reference the A/B is run against, and it is
+  ignored with a warning on a backend without offset views (Metal until G5).
+
 Two environment switches around the GPU are easy to get wrong:
 
 - `MINFER_DISABLE_CUDA` is checked for **presence**, not value: setting it to

@@ -88,7 +88,7 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 4. Weight layout = GGUF: metadata `[in, out]`, memory row-major `[out][in]`; activations token-major `[nt][d]`. I32 inputs stored as `f32::from_bits` via `fill_input_i32`.
 5. In-place ops (`Silu`, `RoPE`) alias their input buffer (sole consumer + same backend only). **Never host-copy a GPU-pending buffer** (Phase-3 KV-corruption bug).
 6. Execution follows build order (valid topo order); allocator liveness uses the same order, not `topo_order()` (G3 regression); input buffers are never freed.
-7. Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store) and `Op::FusedFFN` (gate+up concat + swiglu) — gated, and part of the reuse identity (`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` to revert). Fused vs unfused is bit-identical; when comparing, the unfused path MUST run the FusionPass.
+7. Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store) and `Op::FusedFFN` (gate+up concat + swiglu) — gated, and part of the reuse identity (`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` disable the fusion; `MINFER_FFN_COMPOSITION=1` builds the proven D2 *composition* instead of the hand-written node — see plan §D3). Fused vs unfused is bit-identical; when comparing, the unfused path MUST run the FusionPass.
 8. Backends own their buffer pools; the allocator is the single owner. The scheduler syncs + copies cross-backend at split boundaries; one Metal command buffer per split.
 9. CPU quantizes activations to Q8_0, GPU reads f32 — CPU-vs-GPU logits differ by design; compare each path against its own reference.
 

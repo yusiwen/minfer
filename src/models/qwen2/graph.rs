@@ -252,13 +252,16 @@ impl Qwen2Graph {
             let ffn_out = if fuse_gu {
                 let gu_weight = format!("{wns}blk.{il}.ffn_gu");
                 let weight_ttype = l.ffn_gate.as_ref().unwrap().ttype;
-                // D2: the composition (concat matmul + gate/up windows + in-place
-                // swiglu) is the default where the backend can express a partial
-                // window at a non-zero offset — CUDA. Metal keeps the hand-written
-                // node until G5 gives it offset views, and `MINFER_FFN_NODE=1`
-                // forces the node anywhere, which is the A/B gate.
-                let ffn_node = std::env::var("MINFER_FFN_NODE").is_ok()
-                    || !matches!(Self::device(model), crate::models::Device::Cuda);
+                // D3: the hand-written node is the default (it is faster where it
+                // fuses, and Metal needs it until G5); `MINFER_FFN_COMPOSITION=1`
+                // selects the proven composition instead. See
+                // `models::ffn_composition` for the rule and the loud refusal on a
+                // backend without offset views.
+                let ffn_composition = crate::models::ffn_composition(
+                    std::env::var("MINFER_FFN_COMPOSITION").ok().as_deref(),
+                    Self::device(model),
+                );
+                let ffn_node = !ffn_composition;
                 let gu = if ffn_node {
                     b.fused_ffn(
                         normed,
