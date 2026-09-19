@@ -4296,8 +4296,14 @@ __global__ void fa_prefill_f16kv(
     const int row1 = wm * 16 + r1;
     const int c0 = 2 * l;          // fragment col group (2l, 2l+1, 2l+8, 2l+9)
     const int t0 = tq0 + row0, t1 = tq0 + row1;
-    const int qpos0 = (t0 < nt) ? bound[t0] : -1;
-    const int qpos1 = (t1 < nt) ? bound[t1] : -1;
+    // E1b: the per-row limit is *exclusive*. Causal (`bound` is `positions`)
+    // keeps the pre-E1 expression `positions[t] + 1`; with an explicit span
+    // (`bound` is `[lo, hi)` pairs) the limit is the window's `hi = bound[nt+t]`.
+    // Using `bound[t]` there read the window's `lo`, so every row kept only the
+    // `lo` column: prefill of any non-zero-start sequence silently attended to a
+    // single row (token 0 looked right because its window *is* that row).
+    const int qlim0 = (t0 < nt) ? (CAUSAL ? bound[t0] + 1 : bound[nt + t0]) : 0;
+    const int qlim1 = (t1 < nt) ? (CAUSAL ? bound[t1] + 1 : bound[nt + t1]) : 0;
 
     // O accumulator: P@V over hd=128 per 16-row block -> 8 x 16x16 fragments.
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[8];
@@ -4354,8 +4360,8 @@ __global__ void fa_prefill_f16kv(
         for (int q = 0; q < FA_TKV / 16 * 4; q++) {
             // valid = causal (kv <= query pos) AND within the stored KV range
             // (rows >= kv_end are zero-staged and must NOT contribute).
-            bool v0 = (gcol[q] <= qpos0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
-            bool v1 = (gcol[q] <= qpos1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
+            bool v0 = (gcol[q] < qlim0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
+            bool v1 = (gcol[q] < qlim1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo);
             if (v0) mnew0 = fmaxf(mnew0, sm[q]);
             if (v1) mnew1 = fmaxf(mnew1, sm1_[q]);
         }
@@ -4374,9 +4380,9 @@ __global__ void fa_prefill_f16kv(
         float sum0 = 0.0f, sum1 = 0.0f;
 #pragma unroll
         for (int q = 0; q < FA_TKV / 16 * 4; q++) {
-            p0[q] = ((gcol[q] <= qpos0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
+            p0[q] = ((gcol[q] < qlim0) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
                         ? __expf(sm[q] - mnew0) : 0.0f;
-            p1[q] = ((gcol[q] <= qpos1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
+            p1[q] = ((gcol[q] < qlim1) && (gcol[q] < kv_end) && (CAUSAL || gcol[q] >= win_lo))
                         ? __expf(sm1_[q] - mnew1) : 0.0f;
             sum0 += p0[q]; sum1 += p1[q];
         }

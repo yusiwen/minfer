@@ -1203,6 +1203,8 @@ GB10, and the ones that could not be *asserted* were made assertable:
 |---|---|
 | E1b windowed kernels (`cuda_two_sequences_do_not_cross_attend`) | passes on device, after fixing its `hd = 2` fixture and `read_host` read |
 | E1b causal vs windowed, same rows | new gate, bitwise equal on device (closes the gap above) |
+| E1b causal vs windowed, **both KV dtypes** (`f32` and `f16`) | `cuda_windowed_attention_matches_causal_for_long_windows`: **22/22 bitwise equal** on device after fixing `fa_prefill_f16kv`'s windowed row mask (§14 row 0) — the f16 prefill case (`hd = 128, n = 34, start = 64`) was the one the fix is about |
+| Server batching, four **different** prompts, 7B Q4_K_M (f16 KV), `--n-slots 4` | after the fix: batched **and** serial both 4/4 correct and identical (before it: batched = slot 0 right + slots 1-3 derailed, e.g. `0.1555555555555555555555`) |
 | E2 batched decode windows with a real model | `batch_order_does_not_change_a_sequences_logits` passes bitwise on device |
 | E2 engine acceptance (`server_batch_matches_serial_and_is_faster`, ignored) | passes: 1.32x at 0.5B, all four continuations share a non-empty prefix |
 | E2 server, 7B Q4_K_M, `--n-slots 4` | 1.9x, 15 four-wide decode steps traced |
@@ -1435,6 +1437,15 @@ for, and it is correct and free:
   window that starts at cell 0, so `positions[t] + 1` and the explicit span name
   the same rows — and asserts the outputs are **bitwise equal** on the device. It
   passes on GB10, so the equivalence no longer rests on the SASS identity alone.
+- **The f16 half of the windowed path was untested until 2026-09-19.** That gate
+  forced `cb.kv_f16 = false` (f32 KV), while the production default is f16 whenever
+  `n_layers * n_kv_embd >= 8192` (`cuda::set_kv_cache_type`): the 7B (14336) runs
+  f16, the 0.5B (3072) f32. The sweep now loops over **both** dtypes and at once
+  caught a real fault in `fa_prefill_f16kv`'s windowed row mask (`bound[t]` is the
+  window's `lo`, not its `hi`) — plan §14 row 0 has the root cause, the fix and the
+  end-to-end server evidence. With the fix, 22/22 cases (11 shapes x 2 dtypes) are
+  bitwise equal on device, including the `hd = 128, n = 34, start = 64` prefill case
+  the fault lived in.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
@@ -1610,29 +1621,85 @@ one place, so the next session does not have to rediscover it.
 
 So it is **not** the server, **not** batching, **not** the slot layout or the offset magnitude, and **not** the model per se — it is the **prompt length combined with a non-zero start**. Slot 0 (start 0) takes the *causal* attention instantiation and is always right; every slot with a non-zero start takes the **windowed** instantiation, and it produces garbage once the window is ~34 rows rather than ~5. That is consistent with everything measured: model-dependent because the two models select different kernel variants (hd 128/n_kv 4 vs hd 64/n_kv 2), unaffected by batching (the kernel is chosen by `explicit_span` = "start != 0", not by batch width), and invisible to E1b's device tests, which only ever exercised tiny windows (a synthetic `hd = 4` fixture, and ~7-token sequences in the order-invariance gate).
 
-**Minimal reproduction found (same day, fourth round).** The focused device test
-(`cuda_windowed_attention_matches_causal_for_long_windows`) hands the *same* inputs
-to both instantiations and reports **which side is wrong**, by checking the one case
-where the expected value is unambiguous: a single-row window must return `V(row 0)`.
+**RETRACTED (same day, fifth round): the windowed kernel is NOT at fault — the
+"minimal reproduction" above was a bug in its own harness.** `run` was called twice
+(causal, then windowed) while it drew q/k/v from a **single advancing LCG declared
+outside the closure**, so the two calls compared *different* random data. The one
+assertion that kept passing, `causal == V(row 0)`, is a single-key-softmax identity
+that holds whatever the data are — which is exactly why the failure looked like
+"the windowed path returns the wrong numbers". Two probes settled it:
 
-- The **causal** instantiation returns `V(row 0)` exactly ✓ (so the harness, the
-  span layout and the data are sound).
-- The **windowed** instantiation returns something else — at `n = 2`, `start = 0`,
-  `hd = 128`, 4 KV heads, i.e. for a **two-row window at offset 0**, with inputs
-  identical to the causal run's. So the fault is in the windowed kernel itself, not
-  in the offset arithmetic the earlier hypotheses blamed.
-- That also **corrects E1b's device evidence**: `cuda_causal_and_windowed_agree_on_the_same_rows`
-  used a degenerate fixture (one-hot queries/values), which made the output
-  insensitive to the scores, so it passed while the windowed path was wrong. Both
-  tests now say so, and the randomized one is the gate — it is `#[ignore]`d (red)
-  until the kernel is fixed, so the suite stays green while the reproduction is
-  preserved.
+- A device `printf` in both instantiation entry points (`gqa_attn_split_partial`
+  and `gqa_attn_split_partial_bt`) printed, for `n = 1, start = 0`: causal
+  `bound[0]=0 -> row0=0, nkv=1` and windowed `bound[0]=0, bound[1]=1 -> row0=0,
+  nkv=1` — **identical**, so the windowed path derived the right window from the
+  right cells and the divergence had to be in the data itself.
+- With the LCG re-seeded from the shape *inside* `run` (never from `start` or
+  `explicit`, which are precisely what the two calls differ in), the whole sweep is
+  **bitwise equal**: 11 cases over `(nh, nk, hd)` = (1,1,4)/(1,1,128)/(2,2,64)/
+  (4,4,128), `n` = 1/2/16/34, `start` = 0/1/64/256. The test is un-`#[ignore]`d and
+  is now the E1b/E2 gate it was meant to be (device run 2026-09-19: 11/11 bitwise
+  equal, 249 other tests filtered out).
 
-**Next step:** fix the windowed instantiation. Start from the launcher
-(`src/cuda.rs`) and the `template <bool CAUSAL>` entry points in
-`src/cuda_kernels.cu`: the reproduction says the windowed body is wrong even when
-`lo == 0`, which points at the variant selection or the body's row/reduction
-arithmetic rather than at `row0`.
+Consequences recorded here rather than silently dropped:
+
+- The "root-caused to the windowed-attention kernel" paragraph above is
+  **withdrawn**, and with it the **retraction of E1b's device evidence**:
+  `cuda_causal_and_windowed_agree_on_the_same_rows` was called degenerate; it is
+  weak on its own (one-hot queries make the output score-insensitive) but nothing
+  contradicts it, and its note now says so instead of blaming the kernel.
+- What the fourth round got right and keeps: the engine test *did* compare unequal
+  inputs to the server's (`model.format_chat`'s 13-token prompt vs the server's
+  34-token render), and it now renders the prompt exactly as the server does
+  (`chat_template_from_gguf` + `template::render_messages`) — that part of the
+  bisect stands and is an improvement to the test.
+- **The server blocker itself is therefore unexplained again**, and the earlier
+  chain of eliminations must be re-read with that in mind: it is *not* prefix
+  reuse, admission placement, D2's in-place SwiGLU, layout magnitude, CUDA Graph or
+  prefill capture, staggered admission, model-specific kernel variants, or the
+  windowed instantiation. The reproduction is re-run on the current build (below)
+  to establish whether the symptom still exists at all.
+
+**Root cause found and fixed (same day, sixth round): the f16-KV FA prefill
+kernel's windowed row mask.** The server blocker is real and still reproduced on
+the current build — 4 different prompts, `--n-ctx 2048 --n-slots 4`, greedy: the
+batched run returned slot 0 correct and slots 1-3 derailed (slot 3 literally
+`0.1555555555555555555555`, the value in the original report), while
+`MINFER_BATCH=0` returned 4/4 correct. Two facts broke it open:
+
+1. **The dtype gate.** `cuda::set_kv_cache_type` chooses f16 KV whenever
+   `n_layers * n_kv_embd >= 8192` — true for the 7B (28 x 512 = 14336), false for
+   the 0.5B (24 x 128 = 3072). That *is* the recorded "model dependence". The new
+   gate forced `cb.kv_f16 = false`, so **no f16 windowed path was ever tested**.
+2. **The sweep extended to both dtypes** went red immediately at exactly one
+   point: `kv_f16=true (4,4,128) n=34 start=64 -> DIVERGES, first=(512, ...)`.
+   Index 512 is the first element of token 1's output — token 0 was bitwise
+   correct, so the fault was per-row, not per-tile.
+
+`nt >= 2 && hd == 128 && !MINFER_NO_FA_PREFILL` routes to `fa_prefill_f16kv`, whose
+per-row limit was `qpos = bound[t]`. With an explicit span `bound[t]` is the
+window's **`lo`**, not the causal upper bound, so every row kept only the `lo`
+column (`win_lo <= col <= lo`). Token 0 came out right because its window *is*
+`{lo}`. That is why the 7B's per-slot prefill (34-44 tokens, non-zero start) fed
+the rest of the network from corrupted hidden states: its KV *and* its logits were
+wrong from the first prefill, so every decoded token was garbage, while slot 0
+(start 0, causal) stayed correct. The 0.5B never reproduced because it runs f32 KV,
+whose prefill kernel (`gqa_attn_f32`) had the windowed mask right.
+
+The fix is the exclusive per-row limit
+`qlim = CAUSAL ? bound[t] + 1 : bound[nt + t]` (four mask sites). For the causal
+instantiation `col <= bound[t]` and `col < bound[t] + 1` are the same integer
+comparison, so the pre-E1 instantiation keeps its codegen and output; only the
+windowed instantiation changes behaviour.
+
+**Evidence after the fix:** the sweep is **22/22 bitwise equal** (11 shapes x both
+KV dtypes, including the `n=34, start=64, hd=128` prefill case); the server
+reproduction returns distinct, correct replies in both modes; the full CUDA suite
+passes on the device. What this also says about the earlier rounds: the single
+*broad* structural fact they established still holds and was the useful half —
+**the server exercises non-zero-start prefills that the engine test's 512-row
+single-sequence arena does not**, which is why the gate now sweeps `start = 64..256`
+and both dtypes.
 
 Earlier text (kept for the record of how the diagnosis narrowed): a focused device test of the **windowed** instantiation with a *long* window at a non-zero start (34-64 rows) against the causal instantiation over the same rows — that should pin the exact kernel variant (the split/rows-per-warp bodies and the `_bt` variants are the candidates) and give a minimal reproduction, then the fix. The engine test as it stands is the end-to-end reproduction and now renders the server's prompt, so it fails the moment the bug is present and passes when it is fixed. Note also that this *corrects* the earlier "server-only, engine is fine" conclusion: that comparison used 5-token prompts on the engine side and 34-token ones on the server side. **Impact: E6 made batching the default on CUDA, so this is the default behaviour on a GPU server today**; E2's "GPU acceptance 1.9x" measurement inspected only request 0's text, so its *timing* stands but its *correctness* was never checked per request — that record is corrected here. **Immediate mitigation to decide: revert E6's CUDA default (back to opt-in) until this is fixed.** |
 | 1 | **CI has no GPU.** The CUDA job only compiles the harness, so every device-gated test is a local, manual run — which is exactly how six device-only test bugs survived to 2026-09-18. | process | A **self-hosted runner on this DGX Spark** would put `cargo test --features cuda` into CI; nothing else does. Until then, anyone changing CUDA code must run it by hand and say so. |

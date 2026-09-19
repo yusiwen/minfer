@@ -283,6 +283,7 @@ Two layers of checks are deliberately *not* in `supports_op`:
 | `RoPE` | `copy_d2d` if not aliased, then `rope_f32` | neox; `hd` even |
 | `KvcacheStore` | `store_kv_f16` or `store_kv_f32` (K then V) | `out_buf == k_id`; `nt = elems(K_in)/nkt`; positions are device data and are not re-validated against `n_ctx` here (session-level clamping owns that) |
 | `Attn` | `nt == 1` → `gqa_attn_split`; `1 < nt <= 16` → `gqa_attn_split_batched`; `nt > 16` → `gqa_attn_f16kv` (FA prefill when `hd == 128 && !MINFER_NO_FA_PREFILL`, else legacy) or `gqa_attn_f32` for f32 KV | the attention guards of §4.3; the batched verify path is bitwise-equal per position |
+| `Attn` **windowed** (`explicit_span`) | the same entry points, instantiated with `CAUSAL = false`; `bound` carries `[lo, hi)` pairs (`bound[t]` = `lo`, `bound[nt + t]` = `hi`) instead of `positions`, and every per-row limit must come from `hi` | `cuda_windowed_attention_matches_causal_for_long_windows` sweeps `(nh, nk, hd)` × `n` × `start` × **both KV dtypes**; 22/22 bitwise equal. `fa_prefill_f16kv` used `bound[t]` (the window's `lo`) as the causal limit until 2026-09-19, which made every non-zero-start prefill attend to a single row — see `ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0 |
 | `FusedFFN` | concat `matmul_f32_ptr_layout` + in-place `swiglu_quant_off`/`swiglu_f32_off` | `nt == 1`; offset fuse when `n % 32 == 0` |
 | `FusedQKV` | concat matmul over `[wq\|wk\|wv]` + `attn_bias_rope_store` | `nt == 1`, neox, even `hd`; concat weight + 3 biases registered; KV pair present |
 | `QkvBiasRopeStore` | `copy_d2d` for q + `attn_bias_rope_store` over three separate matmul outputs | `nt == 1`, neox, even `hd`; 3 biases registered |
@@ -530,7 +531,10 @@ tests skip when no CUDA device is present. Categories and the invariants they pi
   `cuda_verify_attention_nt_invariance`, `cuda_rope_kv_attn_roundtrip`, `cuda_kv_f16_roundtrip_attn`),
   embedding gather (`cuda_embed_getrows_parity`), fused FFN (`cuda_fused_ffn_parity`).
 - **Prefill GEMM / MMQ / FA** — `cuda_prefill_mmq_parity`, `cuda_prefill_f16_gemm_parity`,
-  `cuda_q4_0_prefill_q8_0_gemm_parity`, `cuda_fa_prefill_attention_parity`, the byte-exact plane
+  `cuda_q4_0_prefill_q8_0_gemm_parity`, `cuda_fa_prefill_attention_parity` (note: causal,
+  single-sequence, `start = 0` — the *windowed* FA mask is covered by
+  `cuda_windowed_attention_matches_causal_for_long_windows`, which is what caught the
+  `fa_prefill_f16kv` window-limit fault on 2026-09-19), the byte-exact plane
   tests (`cuda_q6k_exp_dense_byte_exact`, `cuda_q6k_dsc_dense_byte_exact`,
   `cuda_q4k_dsc_dense_byte_exact`), `cuda_prefill_fused_b_bitparity`, and
   `cuda_multi_token_matmul_bitwise` (one nt=3 forward bitwise-equal to three nt=1 forwards).
