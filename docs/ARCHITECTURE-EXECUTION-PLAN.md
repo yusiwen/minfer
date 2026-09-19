@@ -691,6 +691,35 @@ parent's buffer id), liveness understands `view_src` (the parent is not recycled
 while the view is live, and is freed after), and existing graphs are unchanged —
 the real-model bitwise tests and the op matrix are the evidence.
 
+**Increment 2 record (2026-09-19).** `BufRef` now carries `offset` and `len`
+(the window, not just a buffer id), the `Backend` trait passes references instead
+of raw ids, and the allocator maps a view to `parent.window(offset, len)` after
+checking the window fits inside the parent:
+
+- Every backend applies the offset where it resolves a buffer: CPU slices each
+  input/output window out of the pool (the `split_at_mut` plumbing is otherwise
+  unchanged), CUDA adds `offset * 4` bytes in a new `ptr_of_ref` and takes element
+  counts from the window (`in_bufs[k].len`, which also corrected `copy_d2d`'s size
+  check), and the host paths are window-aware — `copy_to_cpu` returns exactly the
+  window.
+- Metal is **exact views only**, and that is a capability boundary rather than an
+  oversight: its kernels take a buffer and a length with no element offset, so a
+  window would silently read the wrong bytes. `supports_op(Op::View{offset})` is
+  `offset == 0` there, the allocator backstops the partial-window case (which
+  `supports_op` cannot see, since the parent's length is not in the op), and
+  `SUPPORT-MATRIX.md` gains the asymmetric row; G5 is where Metal would learn
+  offsets. That path is compile-verified by CI's macOS job alone, and the job
+  earned its keep on this change: it caught a `BufRef` passed to a Metal debug
+  `Display` format, which no Linux build can see.
+- Evidence: a new op-matrix case, `View offset` (a partial window at offset 2 over
+  an 8-element parent, expected `[3,4,5,6]`), passes on **CPU and CUDA** and is
+  skipped on Metal; two allocator tests pin the mapping
+  (`(id, offset, len) == (parent, 2, 4)`) and the new refusal boundary (a window
+  past the parent); the device-gated CUDA test call sites were re-pointed through
+  a test-only `exec_ids` shim that derives each reference's length from the pool
+  (the A5 lesson: a trait change skips them unless the test harness is compiled);
+  and the real-model bitwise gates are unchanged.
+
 **Increment 1 record (2026-09-19).** Landed as designed:
 
 - `CNode.view: Option<ViewAlias>` (with `offset` present from the start), set
