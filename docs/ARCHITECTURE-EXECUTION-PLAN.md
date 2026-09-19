@@ -639,11 +639,25 @@ prompt) belongs with E2's batching work.
 - **Deliverable:** a cell-copy operation that compacts the arena; triggered when
   fragmentation exceeds a threshold.
 - **Deps:** D1 (a copy needs either a view or an explicit copy op).
-- **Acceptance:** node-count and arena-utilisation counters before/after; the
-  moved bytes are exact (V verbatim; K exactly `rope_shift_kv(old, delta)`) and a
-  mid-session compaction leaves the continuation's greedy token intact. Bit-identical
-  *logits* are **not** claimable today — not because of the copy, but because a
-  sequence's logits already depend on its absolute arena offset (§14 row 9).
+- **Acceptance (as resolved, 2026-09-19):** node-count and arena-utilisation
+  counters before/after; the moved bytes are exact — `V` verbatim and `K` exactly
+  `rope_shift_kv(old, delta)`, both asserted — and a mid-session compaction leaves
+  the continuation's **greedy token** intact (asserted; a wrong re-rope flips it).
+  Bit-identical *logits* are not claimed, and that is now a measured property
+  rather than an open question: a sequence's logits' tail already depends on its
+  absolute arena offset because the offset shifts every RoPE angle, and layer 0 is
+  exact within that rotation's rounding (1.5e-5 on the ropes, 7.3e-7 on the
+  attention output) while a quantised 24-layer stack amplifies it downstream —
+  `§14` row 9 carries the four probes. The criterion is therefore standing rule 3's
+  **named amplified-rounding class**, with the cause measured.
+- **Follow-up (recorded, not started):** if bit-identical *logits* are ever
+  required — for a caller that compares exact outputs rather than decisions — the
+  route is **logical positions**: let callers pass sequence-relative `positions`
+  and let the allocator resolve `cells` (a new input for the store and the fused
+  store ops), so a token's RoPE angle is its index within its sequence and a cell
+  move changes nothing. That removes the offset sensitivity and C3's K re-rope
+  together. It touches the CUDA/Metal `FusedQKV` and `QkvBiasRopeStore` decode
+  paths, which is why it is a ticket of its own rather than a footnote here.
 
 #### C3 design (written before the code, 2026-09-19)
 
