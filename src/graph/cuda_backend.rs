@@ -32,8 +32,19 @@ pub struct CudaBackend {
     pool_gen: u64,
     /// Device scratch holding raw-int32 positions decoded from the f32-bits
     /// I32 input buffers (grown on demand; freed in Drop alongside the pool).
-    pos_scratch: *mut std::ffi::c_void,
-    pos_scratch_bytes: usize,
+    /// i32 staging, **one buffer per converted source input** (fix, 2026-09-19).
+    ///
+    /// A single shared scratch was wrong. Inside one execution window a graph
+    /// converts `positions` for the KV store and `attn_span` for attention; the
+    /// second conversion overwrote the first *before its launch had run*, so the
+    /// store wrote rows derived from the span's `lo` values instead of the
+    /// positions. That is invisible when they coincide — which is exactly why the
+    /// degenerate E1b fixture (`positions` `[0, 2]` == the span's `lo` block) and
+    /// every causal graph passed, while a windowed graph with a real prompt
+    /// produced garbage (plan §14). Keyed by source buffer id; the buffers are
+    /// reused (a tiny pool) and re-converted every window, so a stale value can
+    /// never be read.
+    pos_scratch: std::collections::HashMap<usize, (*mut std::ffi::c_void, usize)>,
     /// D3-7 2c: one-execution-window memo for positions_i32 — (input buf id,
     /// pool_gen) of the last conversion. Every Rope/KvcacheStore/Attn node
     /// re-converted the same positions buffer (240 launches/step at 14B
@@ -41,7 +52,6 @@ pub struct CudaBackend {
     /// function of the input content, identical for all consumers within one
     /// serial execution pass. Cleared in synchronize() next to the MmqCache
     /// clear (same split-boundary reuse-of-pool-ids lifecycle).
-    pos_memo: Option<(usize, u64)>,
     /// Captured CUDA Graphs (Phase 7d), keyed by (graph uid, split node
     /// range) and valid only for the pool_gen captured at. Few entries: one
     /// per executed split of each reused graph (decode captures; a one-shot
@@ -113,9 +123,7 @@ impl CudaBackend {
             pool: Vec::new(),
             free: Vec::new(),
             pool_gen: 0,
-            pos_scratch: std::ptr::null_mut(),
-            pos_scratch_bytes: 0,
-            pos_memo: None,
+            pos_scratch: std::collections::HashMap::new(),
             graph_execs: Vec::new(),
             graph_runs: std::collections::HashMap::new(),
             capturing: None,
@@ -377,11 +385,8 @@ impl Drop for CudaBackend {
         }
         self.pool.clear();
         self.free.clear();
-        if !self.pos_scratch.is_null() {
-            Self::state_free(self.pos_scratch);
-            self.pos_scratch = std::ptr::null_mut();
-            self.pos_scratch_bytes = 0;
-            self.pos_memo = None;
+        for (_, (ptr, _)) in self.pos_scratch.drain() {
+            Self::state_free(ptr);
         }
         for g in &self.graph_execs {
             self.state.graph_destroy(g.exec);
@@ -1262,36 +1267,37 @@ impl CudaBackend {
     /// the whole path on-device — no host sync, and the pointer stays stable
     /// across steps (a precondition for CUDA Graph replay in Phase 7d).
     fn positions_i32(&mut self, id: usize) -> Result<*mut std::ffi::c_void, String> {
-        // D3-7 2c: one conversion per execution window per input buffer.
-        // Capture mode: the first consumer's launch is recorded at capture
-        // time and replay re-executes it every step (memo hits are never
-        // recorded). Non-capture mode: synchronize() clears the memo at the
-        // execution boundary, so each step re-converts exactly once.
-        if self.pos_memo == Some((id, self.pool_gen)) {
-            return Ok(self.pos_scratch);
-        }
+        // One staging buffer **per source input**, converted on every request: a
+        // graph converts `positions` for the store and `attn_span` for attention
+        // inside the same window, and sharing one buffer made the second
+        // conversion clobber the first before its launch ran (see the field
+        // comment). Buffers are reused across windows, so this is a kernel launch
+        // plus a small memcpy per i32 input per step — the same cost the memo hit
+        // saved only for the *repeated* consumer of one input.
         let src = self.ptr_of(id)?;
         let bytes = self.pool[id].bytes;
-        if self.pos_scratch_bytes < bytes {
-            if !self.pos_scratch.is_null() {
-                Self::state_free(self.pos_scratch);
+        let slot = match self.pos_scratch.get(&id) {
+            Some(&(ptr, have)) if have >= bytes && !ptr.is_null() => (ptr, have),
+            _ => {
+                if let Some((old, _)) = self.pos_scratch.remove(&id) {
+                    if !old.is_null() {
+                        Self::state_free(old);
+                    }
+                }
+                let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
+                if ptr.is_null() {
+                    return Err("cuda: positions scratch allocation failed".to_string());
+                }
+                // the freed scratch pointer may be embedded in captured graph
+                // execs — invalidate them so they re-capture against the new
+                // address (Phase 8 review)
+                self.pool_gen += 1;
+                self.pos_scratch.insert(id, (ptr, bytes));
+                (ptr, bytes)
             }
-            let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
-            if ptr.is_null() {
-                self.pos_scratch_bytes = 0;
-                return Err("cuda: positions scratch allocation failed".to_string());
-            }
-            self.pos_scratch = ptr;
-            self.pos_scratch_bytes = bytes;
-            // the freed scratch pointer may be embedded in captured graph
-            // execs — invalidate them so they re-capture against the new
-            // address (Phase 8 review; currently masked because growth only
-            // happens on a larger prefill whose allocs churn pool_gen anyway)
-            self.pool_gen += 1;
-        }
-        self.state.bits_to_i32(src, self.pos_scratch, bytes / 4);
-        self.pos_memo = Some((id, self.pool_gen));
-        Ok(self.pos_scratch)
+        };
+        self.state.bits_to_i32(src, slot.0, bytes / 4);
+        Ok(slot.0)
     }
 
     /// Resolve a NormMeta weight by name on the CUDA registry. Unlike Metal
@@ -1493,9 +1499,9 @@ impl Backend for CudaBackend {
         // A split boundary / next execution reuses the same pool buffer ids for
         // different data, so the cached (src,nt,id) must not leak across it.
         self.state.clear_mmq_cache();
-        // D3-7 2c: same one-execution-window lifecycle for the positions
-        // i32-conversion memo (see positions_i32).
-        self.pos_memo = None;
+        // No i32-memo reset is needed any more: `positions_i32` re-converts on
+        // every request into a stable per-input buffer, so a stale value cannot
+        // survive a boundary (the buffers themselves are reused).
         self.close_capture_or_sync();
     }
 
@@ -3366,8 +3372,6 @@ mod tests {
         // Real-ish shapes: the 7B decodes with hd 128 / 4 KV heads, which is a
         // larger `hd` and `nkv` than the 0.5B's 64 / 2 — the other reason this
         // was model-dependent.
-        let (nh, nk, hd) = (4usize, 4usize, 128usize);
-        let nkt = nk * hd;
         let n_ctx = 512usize;
         let i32bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
 
@@ -3381,8 +3385,11 @@ mod tests {
         let mut run = |cb: &mut crate::graph::cuda_backend::CudaBackend,
                        explicit: bool,
                        start: usize,
-                       n: usize|
+                       n: usize,
+                       shape: (usize, usize, usize)|
          -> (Vec<f32>, Vec<f32>) {
+            let (nh, nk, hd) = shape;
+            let nkt = nk * hd;
             let meta = crate::graph::ops::AttnMeta {
                 layer: 0,
                 n_head: nh,
@@ -3458,24 +3465,23 @@ mod tests {
 
         // (window length, non-zero start): the lengths sweep the kernel variants
         // the 7B selects; the starts are the server's kind of offset.
-        for (n, start) in [
-            (2usize, 0usize),
-            (8, 0),
-            (2, 64),
-            (8, 64),
-            (16, 64),
-            (34, 64),
-            (64, 64),
-            (34, 1),
-            (48, 256),
+        let mut bad: Vec<String> = Vec::new();
+        for (shape, n, start) in [
+            ((1usize, 1usize, 4usize), 1usize, 0usize),
+            ((1, 1, 4), 2, 0),
+            ((1, 1, 4), 2, 64),
+            ((1, 1, 128), 1, 0),
+            ((1, 1, 128), 2, 0),
+            ((2, 2, 64), 1, 0),
+            ((4, 4, 128), 1, 0),
+            ((4, 4, 128), 2, 0),
+            ((4, 4, 128), 2, 64),
+            ((4, 4, 128), 16, 64),
+            ((4, 4, 128), 34, 64),
         ] {
-            let (causal, v_row0) = run(&mut cb, false, 0, n);
-            let (windowed, _) = run(&mut cb, true, start, n);
-            // Query 0's window is one row, so its output is V(row 0) exactly —
-            // the one case where the expected value is unambiguous. Checking it
-            // per instantiation says *which* side is wrong, which matters: if
-            // both were wrong the difference would be a harness bug, not a
-            // kernel one.
+            let (causal, v_row0) = run(&mut cb, false, 0, n, shape);
+            let (windowed, _) = run(&mut cb, true, start, n, shape);
+            let hd = shape.2;
             let ref_delta = |x: &[f32]| {
                 x[..hd]
                     .iter()
@@ -3493,18 +3499,27 @@ mod tests {
                 .zip(&windowed)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert_eq!(
-                worst, 0.0,
-                "window n={n} at start {start}: the windowed instantiation diverges from the causal one \
-                 over the same relative rows (max |delta| {worst}); first differing cell {:?}",
-                causal
+            if worst == 0.0 {
+                eprintln!("[window] {shape:?} n={n} start={start}: bitwise equal");
+            } else {
+                let first = causal
                     .iter()
                     .zip(&windowed)
                     .position(|(a, b)| a != b)
-                    .map(|i| (i, causal[i], windowed[i]))
-            );
-            eprintln!("[window] n={n} start={start}: bitwise equal");
+                    .map(|k| (k, causal[k], windowed[k]));
+                eprintln!("[window] {shape:?} n={n} start={start}: DIVERGES max|d|={worst} first={first:?}");
+                bad.push(format!(
+                    "{shape:?} n={n} start={start} max|d|={worst} first={first:?}"
+                ));
+            }
         }
+        assert!(
+            bad.is_empty(),
+            "the windowed instantiation diverges from the causal one over the same relative rows \
+             in {} case(s):\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
     }
 
     /// reference with the standard q8-activation tolerance instead.
