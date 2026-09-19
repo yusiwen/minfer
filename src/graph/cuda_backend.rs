@@ -3237,14 +3237,12 @@ mod tests {
         // [0, 2) — exactly what `positions[t] + 1` gives, so both instantiations
         // must agree. hd = 4 (CUDA requires a nonzero multiple of 4).
         //
-        // NOTE (2026-09-19): this fixture is **degenerate** — one-hot queries and
-        // values make the output insensitive to the scores, so it passed while the
-        // windowed kernel was in fact wrong (see
-        // `cuda_windowed_attention_matches_causal_for_long_windows`, which fails on
-        // random data with hd 128 / 4 KV heads even for a two-row window at start
-        // 0, while the causal instantiation returns V(row 0) exactly). Do not read
-        // this test as the windowed path's correctness evidence; the randomized
-        // one is the gate, and it is red until the kernel is fixed.
+        // NOTE (2026-09-19, corrected): this fixture is **degenerate** — one-hot
+        // queries and values make the output insensitive to the scores, so it is
+        // weak evidence on its own and was never the windowed path's gate. The
+        // randomized `cuda_windowed_attention_matches_causal_for_long_windows` is
+        // that gate, and it is green (see its note: it first ran red because of a
+        // harness bug — one advancing LCG shared by both calls — not the kernel).
         let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 4usize, 2usize, 4usize);
         let nkt = nk * hd;
         let meta = crate::graph::ops::AttnMeta {
@@ -3352,15 +3350,17 @@ mod tests {
     ///
     /// Why this shape: the server puts every slot but the first at a non-zero
     /// KV offset, so every slot but the first uses the windowed instantiation.
-    /// A 5-token prompt was fine; a 34-token prompt (the server's rendered chat
-    /// prompt) produced identical garbage in *both* the batched and the serial
-    /// engine paths. That points at a windowed-kernel variant selected by the
-    /// window length (`nkv`) rather than at anything about batching, so the test
-    /// sweeps `nkv` — and, because the kernels' row arithmetic is the only
-    /// intended difference, asserts **bitwise** equality against the causal run
-    /// over rows `0..n`.
+    /// Because the kernels' row arithmetic is the only intended difference, the
+    /// assertion is **bitwise** equality against the causal run over rows `0..n`.
+    ///
+    /// Note (2026-09-19): this test first ran RED, and the failure was the
+    /// **harness**, not the kernel — the two `run` calls shared one advancing LCG,
+    /// so "causal" and "windowed" were compared over *different* q/k/v (the
+    /// causal-vs-`V(row 0)` check still passed, because a single-key softmax is
+    /// that identity whatever the data). With the data now seeded per shape inside
+    /// `run`, every case is bitwise equal; plan §14's "narrowed to the windowed
+    /// instantiation" entry is retracted on that evidence.
     #[test]
-    #[ignore = "FAILS until the windowed-attention kernel is fixed: plan §14's blocker — run with `-- --ignored --nocapture`"]
     fn cuda_windowed_attention_matches_causal_for_long_windows() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
@@ -3390,6 +3390,19 @@ mod tests {
          -> (Vec<f32>, Vec<f32>) {
             let (nh, nk, hd) = shape;
             let nkt = nk * hd;
+            // The two calls this test compares (causal / windowed) MUST see the
+            // same q/k/v: the outer LCG advances on every call, so using it here
+            // compared different data and reported a divergence that was an
+            // artefact of the harness. Seed a local LCG from the shape only —
+            // never from `start`/`explicit`, which are what the calls differ in.
+            let mut lseed = 0x9e37_79b9u32
+                ^ (n as u32).wrapping_mul(0x85eb_ca6b)
+                ^ (nh as u32).wrapping_mul(0xc2b2_ae35)
+                ^ (hd as u32).wrapping_mul(0x27d4_eb2f);
+            let mut next = || {
+                lseed = lseed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((lseed >> 8) as f32 / 8_388_608.0) - 1.0
+            };
             let meta = crate::graph::ops::AttnMeta {
                 layer: 0,
                 n_head: nh,
@@ -3474,51 +3487,62 @@ mod tests {
         // (window length, non-zero start): the lengths sweep the kernel variants
         // the 7B selects; the starts are the server's kind of offset.
         let mut bad: Vec<String> = Vec::new();
-        for (shape, n, start) in [
-            ((1usize, 1usize, 4usize), 1usize, 0usize),
-            ((1, 1, 4), 2, 0),
-            ((1, 1, 4), 2, 64),
-            ((1, 1, 128), 1, 0),
-            ((1, 1, 128), 2, 0),
-            ((2, 2, 64), 1, 0),
-            ((4, 4, 128), 1, 0),
-            ((4, 4, 128), 2, 0),
-            ((4, 4, 128), 2, 64),
-            ((4, 4, 128), 16, 64),
-            ((4, 4, 128), 34, 64),
-        ] {
-            let (causal, v_row0) = run(&mut cb, false, 0, n, shape);
-            let (windowed, _) = run(&mut cb, true, start, n, shape);
-            let hd = shape.2;
-            let ref_delta = |x: &[f32]| {
-                x[..hd]
-                    .iter()
-                    .zip(&v_row0)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max)
-            };
-            assert_eq!(
-                ref_delta(&causal),
-                0.0,
-                "the CAUSAL instantiation does not return V(row 0) for a single-row window (n={n})"
-            );
-            let worst = causal
-                .iter()
-                .zip(&windowed)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            if worst == 0.0 {
-                eprintln!("[window] {shape:?} n={n} start={start}: bitwise equal");
-            } else {
-                let first = causal
+        // Both KV dtypes: the production default is chosen by
+        // `cuda::set_kv_cache_type` (f16 when `n_layers * n_kv_embd >= 8192`) — so
+        // the 7B runs f16 KV while the 0.5B runs f32, and a gate that forces f32
+        // cannot see a windowed-f16 fault at all.
+        for f16 in [false, true] {
+            for (shape, n, start) in [
+                ((1usize, 1usize, 4usize), 1usize, 0usize),
+                ((1, 1, 4), 2, 0),
+                ((1, 1, 4), 2, 64),
+                ((1, 1, 128), 1, 0),
+                ((1, 1, 128), 2, 0),
+                ((2, 2, 64), 1, 0),
+                ((4, 4, 128), 1, 0),
+                ((4, 4, 128), 2, 0),
+                ((4, 4, 128), 2, 64),
+                ((4, 4, 128), 16, 64),
+                ((4, 4, 128), 34, 64),
+            ] {
+                cb.kv_f16 = f16;
+                let (causal, v_row0) = run(&mut cb, false, 0, n, shape);
+                let (windowed, _) = run(&mut cb, true, start, n, shape);
+                let hd = shape.2;
+                let ref_delta = |x: &[f32]| {
+                    x[..hd]
+                        .iter()
+                        .zip(&v_row0)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max)
+                };
+                // The f16 KV rounds V, so the exactness check is f32-only; the
+                // causal-vs-windowed comparison below is unaffected (bitwise for
+                // both dtypes, since both runs see the same stored K/V).
+                assert!(
+                    f16 || ref_delta(&causal) == 0.0,
+                    "the CAUSAL instantiation does not return V(row 0) for a single-row window (n={n})"
+                );
+                let worst = causal
                     .iter()
                     .zip(&windowed)
-                    .position(|(a, b)| a != b)
-                    .map(|k| (k, causal[k], windowed[k]));
-                eprintln!("[window] {shape:?} n={n} start={start}: DIVERGES max|d|={worst} first={first:?}");
-                bad.push(format!(
-                    "{shape:?} n={n} start={start} max|d|={worst} first={first:?}"
-                ));
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                if worst == 0.0 {
+                    eprintln!("[window] kv_f16={f16} {shape:?} n={n} start={start}: bitwise equal");
+                } else {
+                    let first = causal
+                        .iter()
+                        .zip(&windowed)
+                        .position(|(a, b)| a != b)
+                        .map(|k| (k, causal[k], windowed[k]));
+                    eprintln!(
+                        "[window] kv_f16={f16} {shape:?} n={n} start={start}: DIVERGES max|d|={worst} first={first:?}"
+                    );
+                    bad.push(format!(
+                        "kv_f16={f16} {shape:?} n={n} start={start} max|d|={worst} first={first:?}"
+                    ));
+                }
             }
         }
         assert!(
