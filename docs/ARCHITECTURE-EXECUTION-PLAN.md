@@ -1,12 +1,13 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **2/5** (C1, C2 done; C3 landed increments 1-2, its integration run open;
-C4=C5 open); Phase D **2/3** (D2, D3
-done; D1 landed increments 1-2, multi-output nodes open); Phase E **4/7** (E1, E1b,
-E2, E6 done; E3-E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by
-decision (needs macOS). **Next: C3 + D1 increment 3.** Per-ticket evidence is in
-each phase's record and in the §14 open-risks table.
+2026-09-16); Phase C **3/5** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
+its acceptance resolved on measured grounds, with the server-side dynamic-run
+trigger deliberately deferred; C4=C5 open); Phase D **3/3** (**D1 done**: views,
+multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
+E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
+macOS). **Next: C4/C5, then E3–E5.** Per-ticket evidence is in each phase's record
+and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
