@@ -105,15 +105,24 @@ impl BatchEngine {
         }
         let mut cache = GraphCache::new();
         cache.alloc().kv_set_capacity(n_ctx_total);
-        let mut slots = Vec::with_capacity(n_slots);
+        let mut slots: Vec<SlotState> = Vec::with_capacity(n_slots);
         for i in 0..n_slots {
             // Sequence ids start at 1: 0 is SEQ_MAIN's, and a slot must never
             // look like the classic single-sequence path.
             let seq = 1 + i as SeqId;
-            let slot = cache
+            // C3: a reservation that only fits after a compaction returns the
+            // runs it moved, and the slots already handed out must follow them.
+            // (At startup the runs are exact-fit and packed, so nothing moves;
+            // this is the path that stays correct once runs are dynamic.)
+            let (slot, moves) = cache
                 .alloc()
-                .kv_reserve_seq(seq, cap)
+                .kv_reserve_seq_with_defrag(seq, cap)
                 .map_err(|e| format!("slot {i}: {e}"))?;
+            for m in &moves {
+                if let Some(s) = slots.iter_mut().find(|s| s.seq == m.seq) {
+                    s.start = m.to;
+                }
+            }
             slots.push(SlotState {
                 seq,
                 start: slot.start,

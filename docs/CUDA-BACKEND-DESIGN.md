@@ -305,6 +305,14 @@ Two layers of checks are deliberately *not* in `supports_op`:
 
 - `GraphAllocator::supports` priority is **Metal → CUDA → CPU**; `enable_cuda()` mirrors
   `enable_metal()`. On a CUDA-only host the practical effect is CUDA first.
+- **KV compaction (C3) is not a node op** — it is the `Backend::copy_cells` trait method, called by
+  `GraphAllocator::kv_defrag` between forwards. CUDA implements it with `kv_move_rows`: one block,
+  rows walked **ascending** with a `__syncthreads()` between them, because the contract is
+  `dst_row <= src_row` with **overlapping** ranges (a compaction slides a run into the gap just below
+  it) and device-to-device `cudaMemcpyAsync` is documented undefined for overlap. No staging buffer,
+  no second pass. The launcher returns non-zero on a contract violation and the Rust side turns that
+  into an `Err`, so the allocator fails the compaction **before** it renumbers any run. It runs on the
+  backend's own stream, so it is ordered after the previous forward's kernels.
 - KV regions are created by `ensure_kv` on the layer's assigned backend, so with CUDA assignment the
   per-layer K/V regions live in the CUDA pool and `KvProvider::kv_pair` returns pool ids that
   `execute_node` resolves to device pointers. `init_kv_cache` is bypassed.
@@ -530,6 +538,9 @@ tests skip when no CUDA device is present. Categories and the invariants they pi
   parity tests for q4_K/q6_K/q5_K), attention (`cuda_attn_split_decode_parity`,
   `cuda_verify_attention_nt_invariance`, `cuda_rope_kv_attn_roundtrip`, `cuda_kv_f16_roundtrip_attn`),
   embedding gather (`cuda_embed_getrows_parity`), fused FFN (`cuda_fused_ffn_parity`).
+- **KV cell movement (C3)** — `cuda_copy_cells_moves_overlapping_rows_down` (rows `[1, 4)` -> `[0, 3)`,
+  i.e. two of three rows are read *and* overwritten; the whole buffer is compared, and the
+  downward-only contract is checked to be refused before a launch).
 - **Prefill GEMM / MMQ / FA** — `cuda_prefill_mmq_parity`, `cuda_prefill_f16_gemm_parity`,
   `cuda_q4_0_prefill_q8_0_gemm_parity`, `cuda_fa_prefill_attention_parity` (note: causal,
   single-sequence, `start = 0` — the *windowed* FA mask is covered by

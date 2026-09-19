@@ -1010,6 +1010,21 @@ impl Backend for MetalBackend {
         }
     }
 
+    /// C3: the compaction primitive is not ported to Metal, and saying so is the
+    /// point — a backend that cannot move cells must fail the compaction rather
+    /// than let the allocator renumber runs whose data it did not move (Phase G).
+    fn copy_cells(
+        &mut self,
+        _dst: BufRef,
+        _src: BufRef,
+        _dst_row: usize,
+        _src_row: usize,
+        _rows: usize,
+        _elems_per_cell: usize,
+    ) -> Result<(), String> {
+        Err("copy_cells: Metal does not move KV cells yet (Phase G, G5)".to_string())
+    }
+
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;

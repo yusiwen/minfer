@@ -682,14 +682,123 @@ impl GraphAllocator {
     }
 
     /// Reserve a contiguous cell run for `seq` (Phase E / E2). Several
-    /// sequences share one arena this way; `Err` when no run fits (moving a
-    /// sequence is C3's cell copy, needs Phase D's views).
+    /// sequences share one arena this way; `Err` when no run fits — see
+    /// [`Self::kv_reserve_seq_with_defrag`] for the C3 retry.
     pub fn kv_reserve_seq(
         &mut self,
         seq: super::kvcache::SeqId,
         cap: usize,
     ) -> Result<super::kvcache::SeqSlot, String> {
         self.kv.reserve_seq(seq, cap)
+    }
+
+    /// Reserve `cap` cells, compacting the arena once (C3) when first-fit
+    /// cannot — fragmentation, not capacity, is what first-fit trips over.
+    ///
+    /// Returns the slot **and** the runs the compaction moved: a caller that
+    /// keeps a run's `start` (E2's server keeps one per slot) must apply those
+    /// moves to its own bookkeeping before the next forward, and the return
+    /// type is what makes that unavoidable. `MINFER_NO_KV_DEFRAG` (presence
+    /// checked, the A/B gate of standing rule 3) disables the retry.
+    ///
+    /// A compaction that moves nothing is a real answer ("it does not fit"), so
+    /// the original reservation error is the one reported.
+    pub fn kv_reserve_seq_with_defrag(
+        &mut self,
+        seq: super::kvcache::SeqId,
+        cap: usize,
+    ) -> Result<(super::kvcache::SeqSlot, Vec<super::kvcache::KvMove>), String> {
+        let first = match self.kv.reserve_seq(seq, cap) {
+            Ok(slot) => return Ok((slot, Vec::new())),
+            Err(e) => e,
+        };
+        if !kv_defrag_enabled() {
+            return Err(format!("{first} (KV defragmentation disabled)"));
+        }
+        let report = self.kv_defrag(Some(cap))?;
+        if report.moves.is_empty() {
+            return Err(first);
+        }
+        let slot = self.kv.reserve_seq(seq, cap).map_err(|e| {
+            format!(
+                "{e} (after a compaction that moved {} run(s): {first})",
+                report.moves.len()
+            )
+        })?;
+        Ok((slot, report.moves))
+    }
+
+    /// Compact the KV arena downward (C3): slide every live run to the lowest
+    /// free gap, moving its written rows with [`BackendTrait::copy_cells`].
+    ///
+    /// `need = Some(n)` compacts only as far as opening a free run of `n` cells
+    /// (the shortest prefix of the plan); `None` compacts fully. The data copy
+    /// happens **before** the run table is renumbered, and a backend that cannot
+    /// move cells fails the whole call — no renumbering without the copy.
+    ///
+    /// The returned moves are mandatory for whoever reserved a run: the graph
+    /// itself needs nothing (every forward derives `attn_span` from the run
+    /// table), but a caller that passes `start + pos` as a store position would
+    /// otherwise write to cells that now belong to someone else.
+    pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
+        let before = self.kv.arena_stats();
+        let moves = self.kv.compaction_plan(need);
+        if moves.is_empty() {
+            return Ok(KvDefragReport {
+                moves,
+                rows_moved: 0,
+                before: before.clone(),
+                after: before,
+            });
+        }
+        // Snapshot the regions: `kv.iter()` borrows the store, and the copies
+        // below need `&mut self`.
+        let regions: Vec<(BufRef, BufRef, usize)> = self
+            .kv
+            .iter()
+            .map(|(_, l)| (l.k, l.v, (l.elems / l.n_ctx.max(1)).max(1)))
+            .collect();
+        for &(k, v, elems_per_cell) in &regions {
+            for m in &moves {
+                if m.rows == 0 {
+                    continue;
+                }
+                for region in [k, v] {
+                    self.copy_cells_in_pool(
+                        region.backend,
+                        region,
+                        region,
+                        m.to,
+                        m.from,
+                        m.rows,
+                        elems_per_cell,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "kv_defrag: moving sequence {} rows {}..{} -> {} failed: {e}",
+                            m.seq,
+                            m.from,
+                            m.from + m.rows,
+                            m.to
+                        )
+                    })?;
+                }
+            }
+        }
+        let rows_moved = self.kv.apply_moves(&moves)?;
+        let after = self.kv.arena_stats();
+        Ok(KvDefragReport {
+            moves,
+            rows_moved,
+            before,
+            after,
+        })
+    }
+
+    /// Fragmentation and utilisation counters for every arena layer's shared
+    /// cell table (C3's acceptance surface; F8 exports the same numbers).
+    pub fn kv_arena_stats(&self) -> super::kvcache::KvArenaStats {
+        self.kv.arena_stats()
     }
 
     /// Release everything `seq` reserved and owned; returns the freed capacity.
@@ -1122,6 +1231,40 @@ impl GraphAllocator {
 
     /// Write host data into a pool buffer of `backend` (shared by the staging
     /// paths of `copy_across`).
+    /// Dispatch `Backend::copy_cells` to the pool that owns the region (C3).
+    /// Kept beside `write_pool` so every backend arm stays in one file.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_cells_in_pool(
+        &mut self,
+        backend: Backend,
+        dst: BufRef,
+        src: BufRef,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems_per_cell: usize,
+    ) -> Result<(), String> {
+        match backend {
+            Backend::CPU => self
+                .cpu
+                .copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => match self.metal.as_mut() {
+                Some(m) => m.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
+                None => Err("copy_cells: Metal pool not enabled".into()),
+            },
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => Err("copy_cells: Metal is not compiled in this build".into()),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => match self.cuda.as_mut() {
+                Some(c) => c.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
+                None => Err("copy_cells: CUDA pool not enabled".into()),
+            },
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => Err("copy_cells: CUDA is not compiled in this build".into()),
+        }
+    }
+
     fn write_pool(&mut self, backend: Backend, id: usize, data: &[f32]) -> Result<(), String> {
         match backend {
             Backend::CPU => self.cpu.write_host(id, data),
@@ -1167,6 +1310,31 @@ impl KvProvider for GraphAllocator {
     fn kv_pair(&self, layer: usize) -> Option<(usize, usize)> {
         self.kv.get(layer).map(|r| (r.k.id, r.v.id))
     }
+}
+
+/// What a C3 compaction did, with the arena's counters before and after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDefragReport {
+    /// The applied relocations, in application order — a caller holding a
+    /// run's `start` must follow these.
+    pub moves: Vec<super::kvcache::KvMove>,
+    /// Written rows copied per layer (0 when only reservations moved).
+    pub rows_moved: usize,
+    pub before: super::kvcache::KvArenaStats,
+    pub after: super::kvcache::KvArenaStats,
+}
+
+/// `MINFER_NO_KV_DEFRAG` (presence-checked, like the other `NO_*` gates):
+/// disables the C3 compaction retry, so the same workload can be A/B'd with and
+/// without it (standing rule 3).
+pub fn kv_defrag_enabled() -> bool {
+    kv_defrag_enabled_from(std::env::var_os("MINFER_NO_KV_DEFRAG").as_deref())
+}
+
+/// The pure half of [`kv_defrag_enabled`], so the gate's meaning is unit-tested
+/// instead of only existing at runtime.
+fn kv_defrag_enabled_from(no_flag: Option<&std::ffi::OsStr>) -> bool {
+    no_flag.is_none()
 }
 
 #[cfg(test)]
@@ -1445,6 +1613,94 @@ mod tests {
         assert_eq!(alloc.persistent[1].name, "kv.0.v");
         // mapped buffers: positions/k/v (3 liveness) + K region (shared) = 4
         assert_eq!(alloc.n_mapped_buffers(), 4);
+    }
+
+    /// C3 end to end on CPU: a fragmented arena refuses an 8-cell reservation,
+    /// the compaction moves the real KV bytes *and* renumbers the runs, and the
+    /// reservation then fits — with the moved rows byte-identical at their new
+    /// cells.
+    #[test]
+    fn kv_defrag_moves_the_bytes_and_opens_the_run() {
+        const N_CTX: usize = 16;
+        const ROW: usize = 4; // elements per cell (n_kv_embd)
+        let mut b = GraphBuilder::new();
+        let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+        let k = b.input("k", [ROW, 1, 1, 1], crate::graph::DType::F32);
+        let v = b.input("v", [ROW, 1, 1, 1], crate::graph::DType::F32);
+        let _store = b.kvcache_store(0, k, v, pos, N_CTX);
+        let load = b.kvcache_load(0, ROW, N_CTX, 1);
+        b.output(load);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.kv_set_capacity(N_CTX);
+        alloc.alloc_graph(&g).unwrap();
+        for seq in 1u32..=3 {
+            assert_eq!(
+                alloc.kv_reserve_seq(seq, 4).unwrap().start,
+                (seq as usize - 1) * 4
+            );
+            alloc.kv_own_range(seq, (seq as usize - 1) * 4, seq as usize * 4);
+        }
+        let (kid, vid) = alloc.kv_pair(0).unwrap();
+        let pattern = |base: f32| -> Vec<f32> {
+            (0..N_CTX * ROW)
+                .map(|i| base + (i / ROW) as f32 + (i % ROW) as f32 / 10.0)
+                .collect()
+        };
+        alloc
+            .write_pool(crate::graph::Backend::CPU, kid, &pattern(0.0))
+            .unwrap();
+        alloc
+            .write_pool(crate::graph::Backend::CPU, vid, &pattern(100.0))
+            .unwrap();
+        // Release the middle run: free runs [4,8) and [12,16), 8 cells, none 8 long.
+        alloc.kv_release_seq(2);
+        let before = alloc.kv_arena_stats();
+        assert_eq!((before.free_cells, before.free_runs), (8, 2));
+        assert!(alloc.kv_reserve_seq(4, 8).is_err());
+
+        let report = alloc.kv_defrag(Some(8)).unwrap();
+        assert_eq!(report.moves.len(), 1, "{report:?}");
+        assert_eq!(report.moves[0].seq, 3);
+        assert_eq!((report.moves[0].from, report.moves[0].to), (8, 4));
+        assert_eq!(report.rows_moved, 4);
+        assert_eq!((report.before.free_runs, report.after.free_runs), (2, 1));
+        assert_eq!(report.after.largest_free_run, 8);
+        assert_eq!((report.after.defrags, report.after.cells_moved), (1, 4));
+        // The bytes moved with the run: cell 4 now holds what cell 8 held.
+        let (k_now, v_now) = alloc.copy_kv_to_cpu(0).unwrap();
+        for e in 0..ROW {
+            assert_eq!(k_now[4 * ROW + e], 8.0 + e as f32 / 10.0, "K element {e}");
+            assert_eq!(v_now[4 * ROW + e], 108.0 + e as f32 / 10.0, "V element {e}");
+        }
+        // The reservation that first-fit refused now fits, in the opened tail.
+        assert_eq!(alloc.kv_reserve_seq(4, 8).unwrap().start, 8);
+        // The same helper, on a fresh fragmentation: free the lowest run and the
+        // 8-cell one, and ask for 12 contiguous cells. First-fit fails (the free
+        // space is two runs); compacting the single survivor down opens the tail,
+        // and the helper reports the move it relied on.
+        alloc.kv_release_seq(1);
+        alloc.kv_release_seq(4);
+        let (slot, moves) = alloc.kv_reserve_seq_with_defrag(5, 12).unwrap();
+        assert_eq!(
+            slot.start, 4,
+            "the retry packs the survivor down, then takes the tail"
+        );
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!((moves[0].seq, moves[0].from, moves[0].to), (3, 4, 0));
+        // The helper also answers "it still does not fit" with the original
+        // first-fit error, after compaction moved nothing.
+        let err = alloc.kv_reserve_seq_with_defrag(6, 4).unwrap_err();
+        assert!(err.contains("no free run of 4 cells"), "{err}");
+    }
+
+    #[test]
+    fn the_defrag_gate_is_off_only_when_the_flag_is_present() {
+        assert!(super::kv_defrag_enabled_from(None));
+        assert!(!super::kv_defrag_enabled_from(Some(std::ffi::OsStr::new(
+            "1"
+        ))));
     }
 
     /// The KV regions are persistent across rebuilds (they ARE the cache), so a

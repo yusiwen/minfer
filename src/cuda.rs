@@ -554,6 +554,15 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn launch_kv_move_rows(
+        dst: *mut f32,
+        src: *const f32,
+        dst_row: i32,
+        src_row: i32,
+        rows: i32,
+        elems: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     fn launch_gqa_attn_split_f16kv(
         q: *const f32,
         k: *const std::ffi::c_void,
@@ -4569,6 +4578,49 @@ impl CudaState {
     /// in cuda_kernels.cu (fixed grid — the graph-replay capture depends on
     /// it; idle splits write an mx=-INF/S=0 partial the combine weights to
     /// zero).
+    /// C3: move `rows` rows of `elems` f32 elements inside one KV arena, from
+    /// `src_row` down to `dst_row` (`dst_row <= src_row`; overlapping is fine).
+    ///
+    /// The kernel walks rows ascending with a barrier between them; a contract
+    /// violation is an `Err` here rather than a silent no-op, so the allocator's
+    /// compaction fails before it renumbers anything.
+    pub fn kv_move_rows(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems: usize,
+    ) -> Result<(), String> {
+        if rows == 0 || elems == 0 {
+            return Ok(());
+        }
+        if dst_row > src_row {
+            return Err(format!(
+                "cuda: kv_move_rows is downward-only ({dst_row} > {src_row})"
+            ));
+        }
+        let rc = unsafe {
+            launch_kv_move_rows(
+                dst as *mut f32,
+                src as *const f32,
+                dst_row as i32,
+                src_row as i32,
+                rows as i32,
+                elems as i32,
+                self.stream(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "cuda: kv_move_rows({dst_row}<-{src_row}, {rows} rows x {elems} elements) failed \
+                 (rc {rc})"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn gqa_attn_split(
         &self,
         q: *mut std::ffi::c_void,

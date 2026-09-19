@@ -1466,6 +1466,38 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// C3: move KV rows inside one arena on the device (the compaction copy).
+    ///
+    /// Issued on the backend's own stream, so it is ordered after every kernel
+    /// the previous forward launched — the compacted bytes are the ones the
+    /// forwards wrote. Overlap is safe by the kernel's construction (ascending
+    /// rows with a barrier), which is why this does not stage through a temp.
+    fn copy_cells(
+        &mut self,
+        dst: BufRef,
+        src: BufRef,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems_per_cell: usize,
+    ) -> Result<(), String> {
+        if dst.id != src.id {
+            return Err(format!(
+                "cuda: copy_cells moves cells within one arena ({} -> {})",
+                src.id, dst.id
+            ));
+        }
+        if dst_row > src_row {
+            return Err(format!(
+                "cuda: copy_cells is downward-only ({dst_row} > {src_row})"
+            ));
+        }
+        let dst_ptr = self.ptr_of_ref(dst)?;
+        let src_ptr = self.ptr_of_ref(src)? as *const std::ffi::c_void;
+        self.state
+            .kv_move_rows(dst_ptr, src_ptr, dst_row, src_row, rows, elems_per_cell)
+    }
+
     fn read_host(&self, _id: usize) -> Option<&[f32]> {
         // A staged D2H transfer cannot return a borrowed slice (this method
         // takes &self; the host staging buffer would escape its guard). Use
@@ -4477,6 +4509,39 @@ mod tests {
     // kernel reads half4. The reference builds its KV from the SAME
     // half-rounded values so the comparison isolates the kernel from the
     // f16 quantization noise (tolerance stays tight).
+    /// C3's copy primitive on the device: the rows land where the plan says,
+    /// *including when source and destination overlap* — the case a bulk
+    /// device-to-device copy cannot express (CUDA documents overlapping
+    /// `cudaMemcpyAsync` as undefined).
+    #[test]
+    fn cuda_copy_cells_moves_overlapping_rows_down() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        // 6 rows x 4 elements; a row's value identifies the row it came from.
+        let id = cb.alloc_buffer(24);
+        let data: Vec<f32> = (0..24)
+            .map(|i| (i / 4) as f32 + (i % 4) as f32 / 10.0)
+            .collect();
+        cb.write_host(id, &data).unwrap();
+        let r = BufRef::own(crate::graph::Backend::Cuda, id, 24);
+        // Rows [1, 4) -> rows [0, 3): rows 1 and 2 are both read and overwritten.
+        cb.copy_cells(r, r, 0, 1, 3, 4).unwrap();
+        let got = cb.copy_to_host(id).unwrap();
+        let want: Vec<f32> = (0..24)
+            .map(|i| {
+                let row = if i / 4 < 3 { i / 4 + 1 } else { i / 4 };
+                row as f32 + (i % 4) as f32 / 10.0
+            })
+            .collect();
+        assert_eq!(got, want, "the moved rows must be byte-identical");
+        // The contract is enforced before anything is launched.
+        let err = cb.copy_cells(r, r, 1, 0, 3, 4).unwrap_err();
+        assert!(err.contains("downward-only"), "{err}");
+    }
+
     #[test]
     fn cuda_kv_f16_roundtrip_attn() {
         let Some(mut cb) = pool() else {
