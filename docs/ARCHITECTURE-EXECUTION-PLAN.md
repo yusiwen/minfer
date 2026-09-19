@@ -803,7 +803,7 @@ offset sensitivity altogether.
 
 | ID | Title | Effort |
 |---|---|---|
-| D1 | Strided views with allocator-known aliasing + multi-output nodes — **increments 1–2 landed (2026-09-19): exact views are zero-copy, offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait), Metal is exact-only**; multi-output nodes remain | L |
+| D1 | Strided views with allocator-known aliasing + multi-output nodes — **DONE (2026-09-19), increments 1–3**: exact views are zero-copy and offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait; Metal is exact-only), and the "multi-output node" is `GraphBuilder::split_parts` — one owning node plus one `Op::View` per part, so the graph stays single-output and no backend changed. The design's sketched `Op::SplitParts` was **not** added: a split op over one input is just views of that input. MoE/MLA remain model work (producer ops, weights, routing) | L |
 | D2 | Re-express one decode fusion as a composition (proof) — **DONE (2026-09-19)**: `FusedFFN` as concat `MatMul` + two partial windows + in-place `SwiGLU`; CUDA takes the composition, Metal keeps the node until G5; env gate `MINFER_FFN_NODE=1` for the A/B; three models byte-identical, decode cost **≤0.8%** (recorded) | M |
 | D3 | Decide the fate of the four hand-written fused ops — **DONE (2026-09-19)**: `FusedFFN` keeps the default (the proven composition is 0.3–0.8% slower on CUDA and Metal needs the node until G5); the QKV family keeps (no composition proof); `QkvBiasRopeStore` is a fallback epilogue, not a redundancy. Policy rule + gate clarity recorded | S |
 
@@ -934,22 +934,50 @@ buffer (`BufRef { offset, len }`, `CNode::view`) and liveness follows views
 output *buffer*, not several outputs: its parts are views over it, and consumers
 bind to those views exactly as they bind to any other producer's output.
 
-Increment 3 is therefore:
+**Landing correction (2026-09-19, before the code): no new op is needed, and none
+was added.** The sketch above proposed `Op::SplitParts`, but a *split* op taking
+one input is either an identity copy or — what it really is — a set of windows over
+its input, which `Op::View` already expresses. What the increment needs is the
+**helper**: `GraphBuilder::split_parts(owner, sizes) -> Vec<NodeId>` emits one
+`Op::View` per part (cumulative offsets, the owner's trailing dims, the owner's
+dtype), so:
 
-- `Op::SplitParts { sizes: Vec<usize> }` — the output buffer is the concatenation
-  of its parts, along the leading (element) axis;
-- `GraphBuilder::split_parts(input, sizes) -> Vec<NodeId>` — emits the owning node
-  plus one view node per part (offsets from the cumulative sizes), so a caller
-  wires the parts like any other producer;
-- a CPU kernel (one contiguous copy per part) and a CUDA kernel for it, bitwise
-  equal by construction, plus the `SUPPORT-MATRIX`/op-matrix rows;
-- a test that a two-part split feeds two consumers whose results are bitwise
-  identical to slicing the source tensor in Rust, on both backends.
+- a node whose one kernel writes several logical tensors keeps writing **one**
+  output buffer and the parts are ordinary graph tensors — the graph stays
+  single-output, no backend grows a second-output path, and the parts inherit the
+  owner's liveness through the existing `extend_through_views`;
+- a `(values, indices)` pair needs no second output *dtype*: an indices part is
+  i32 in f32 bit patterns (rule 4), which is what lets it drive `Op::GetRows`;
+- and the shape is already in production — D2's `fused_ffn_composition` is a concat
+  matmul whose gate/up halves are consumed through two such windows.
 
 The property that makes this the right shape: the graph stays **single-output**, so
 no allocator, scheduler or backend grows a second-output path that only MoE will
 ever use, and the parts are ordinary graph tensors (so `MINFER_TRACE`, the JSON
 export and DOT already show them).
+
+#### D1 increment 3 record (2026-09-19)
+
+Landed as `GraphBuilder::split_parts` (builder helper: no new `Op`, no kernel, no
+backend change — `Op::View`'s arm is a debug assertion because the allocator maps
+a part onto the owner's buffer). Two tests, both CPU-runnable:
+
+- `split_parts_maps_every_part_onto_the_owners_buffer` — structural: a real producer
+  (a concat matmul) split into `[3, 3]`; each part's `BufRef` is
+  `(owner.id, offset, len)` with cumulative offsets, and the record is a view
+  (`CNode::view`), which is what extends the owner's liveness.
+- `split_parts_parts_feed_independent_consumers` — functional, in the shape MoE
+  routing needs: one owner buffer holding four value rows plus two indices, split
+  into `[8, 2]`, with the **indices part driving `Op::GetRows`** over the values
+  part. The gathered rows are asserted against the Rust-side expectation, so the
+  mechanism is proven end to end (one owner, two parts, two consumers, no copy).
+
+What this closes and what it does not: the **IR** blocker is gone — a producer can
+feed several consumers with independently bindable tensors without a second output
+— and it is closed without touching the allocator, the scheduler or any backend.
+MoE and MLA still need their own work (expert weights, routing, the grouped GEMM;
+latent projections, per-head latents), which is model work rather than IR work, and
+is recorded as such instead of implied to be unblocked.
 
 What increment 3 does **not** do — correcting "D1 unblocks MoE/MLA" a second time,
 after D1's own design already scaled it back: MoE still needs its architecture work

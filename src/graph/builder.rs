@@ -67,6 +67,58 @@ impl GraphBuilder {
         id
     }
 
+    /// D1 increment 3: expose `owner`'s **single** output as independent **part**
+    /// tensors — contiguous runs along the leading (element) axis, each a
+    /// zero-copy window.
+    ///
+    /// This is the "multi-output node" the plan reserved for this increment,
+    /// realized without giving `CNode` a second output. A node whose one kernel
+    /// writes several logical tensors (MoE's router logits plus the expert rows
+    /// they select, MLA's per-head latents) writes them into one output buffer;
+    /// this helper turns that buffer into the parts a consumer binds to. The
+    /// allocator, the scheduler and all three backends therefore keep their
+    /// single-output contract, no backend grows a second-output path, and the
+    /// parts inherit the owner's liveness (`extend_through_views`). The backend
+    /// never sees a part node at all: `Op::View` is an alias (`CNode::view`), and
+    /// its arm is a debug assertion.
+    ///
+    /// `sizes` are **element counts along the leading axis** and must sum to the
+    /// owner's leading dimension; each part keeps the owner's trailing dims. A
+    /// part's dtype is the owner's, and an indices part is i32 stored as f32 bit
+    /// patterns (rule 4) — which is exactly what makes a `(values, indices)`
+    /// pair expressible without a second output dtype, so a part can drive
+    /// `Op::GetRows` (see `split_parts_parts_feed_independent_consumers`).
+    ///
+    /// The composition is proven in production by D2: `fused_ffn_composition` is
+    /// a concat matmul whose gate/up halves are consumed through two such
+    /// windows.
+    pub fn split_parts(&mut self, owner: NodeId, sizes: &[usize]) -> Vec<NodeId> {
+        let out_shape = self.graph.nodes[owner].out_shape;
+        let total: usize = sizes.iter().sum();
+        assert_eq!(
+            total, out_shape[0],
+            "split_parts: parts sum to {total} but node '{}' has leading dim {}",
+            self.graph.nodes[owner].name, out_shape[0]
+        );
+        let owner_name = self.graph.nodes[owner].name.clone();
+        let dtype = self.graph.nodes[owner].out_dtype;
+        let mut offset = 0usize;
+        let mut parts = Vec::with_capacity(sizes.len());
+        for (i, &len) in sizes.iter().enumerate() {
+            let shape = [len, out_shape[1], out_shape[2], out_shape[3]];
+            parts.push(self.node(
+                &format!("{owner_name}_part{i}"),
+                Op::View { offset, shape },
+                &[owner],
+                shape,
+                dtype,
+                NodeMeta::None,
+            ));
+            offset += len;
+        }
+        parts
+    }
+
     /// Create an operator node; returns its id.
     pub fn node(
         &mut self,

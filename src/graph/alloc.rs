@@ -1788,6 +1788,85 @@ mod tests {
         ))));
     }
 
+    /// D1 increment 3, structural half: `split_parts` maps each part onto the
+    /// owner's buffer as a window, so a producer's one output feeds several
+    /// consumers without a copy and without a second output on `CNode`.
+    #[test]
+    fn split_parts_maps_every_part_onto_the_owners_buffer() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [4, 1, 1, 1], crate::graph::DType::F32);
+        // A real producer whose single kernel output carries both parts (the D2
+        // shape: one concat matmul, two halves).
+        let concat = b.matmul_by_name(x, "blk.0.w", crate::tensor::TensorType::F32, 6, 4);
+        let parts = b.split_parts(concat, &[3, 3]);
+        let (gate, up) = (parts[0], parts[1]);
+        b.output(up);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let owner = alloc.node_buffer(concat).expect("owner");
+        assert_eq!(
+            (
+                alloc.node_buffer(gate).unwrap().offset,
+                alloc.node_buffer(gate).unwrap().len
+            ),
+            (0, 3),
+            "the first part is the owner's first window"
+        );
+        assert_eq!(
+            (
+                alloc.node_buffer(up).unwrap().offset,
+                alloc.node_buffer(up).unwrap().len
+            ),
+            (3, 3),
+            "the second part starts where the first ends"
+        );
+        assert_eq!(
+            alloc.node_buffer(gate).unwrap().id,
+            owner.id,
+            "a part aliases the owner's buffer"
+        );
+        assert_eq!(alloc.node_buffer(up).unwrap().id, owner.id);
+        assert_eq!(
+            g.nodes[gate].view.as_ref().map(|v| (v.src, v.offset)),
+            Some((concat, 0)),
+            "and it is recorded as a view, so liveness follows the owner"
+        );
+    }
+
+    /// D1 increment 3, functional half: the parts are independently consumable —
+    /// here the second part is an **indices** part (i32 bit patterns in an f32
+    /// buffer, rule 4) driving `Op::GetRows` over the first part. That is the
+    /// shape MoE routing needs (a router's top-k indices selecting expert rows)
+    /// and it exercises the mechanism end to end: one owner, two parts, two
+    /// different consumers, no second output and no backend change.
+    #[test]
+    fn split_parts_parts_feed_independent_consumers() {
+        let mut b = GraphBuilder::new();
+        // 4 value rows of width 2, then 2 indices: one flat buffer.
+        let both = b.input("both", [10, 1, 1, 1], crate::graph::DType::F32);
+        let parts = b.split_parts(both, &[8, 2]);
+        let (values, indices) = (parts[0], parts[1]);
+        let gathered = b.get_rows(values, indices, [2, 2, 1, 1]);
+        b.output(gathered);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let mut data: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        data.push(f32::from_bits(3)); // gather row 3
+        data.push(f32::from_bits(0)); // then row 0
+        alloc.fill_input(&g, "both", &data).expect("fill");
+        let mut sched = crate::graph::scheduler::BackendScheduler::new();
+        sched.execute(&g, &mut alloc).expect("execute");
+        assert_eq!(
+            alloc.copy_to_cpu(gathered).expect("read"),
+            vec![7.0, 8.0, 1.0, 2.0],
+            "rows 3 and 0 of the values part, in the indices part's order"
+        );
+    }
+
     /// The KV regions are persistent across rebuilds (they ARE the cache), so a
     /// graph that asks for a different `n_ctx` on the same allocator must be a
     /// loud error, not a silent reuse of the older, smaller region.
