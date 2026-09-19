@@ -731,8 +731,13 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
+                // D1: the view is the parent's buffer; nothing to copy.
                 if in_bufs[0] != out_buf {
-                    self.copy_in(out_buf, in_bufs[0]);
+                    return Err(format!(
+                        "metal: {} is a view but its output buffer is not its source's (D1 aliasing \
+                         missing); refusing to copy silently",
+                        node.name
+                    ));
                 }
                 Ok(())
             }

@@ -115,6 +115,22 @@ pub struct CNode {
     /// Backend assigned by the scheduler (Phase 4); None = undecided.
     pub backend: Option<Backend>,
     pub meta: NodeMeta,
+    /// D1: `Some` when this node does not own its output — it is a window into
+    /// another node's buffer. Set by `GraphBuilder::node` for the view-like ops
+    /// (`View`/`Reshape`/`Permute`); the allocator maps it onto the parent's
+    /// buffer and keeps the parent alive instead of copying.
+    pub view: Option<ViewAlias>,
+}
+
+/// D1: a node's output *is* (a window of) another node's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewAlias {
+    pub src: NodeId,
+    /// Element offset into the parent's buffer. Always 0 in D1's first
+    /// increment: an offset view needs `BufRef` to carry an offset through the
+    /// `Backend` trait, which is increment 2. The field exists from the start so
+    /// the IR does not change shape twice.
+    pub offset: usize,
 }
 
 impl CNode {
@@ -261,6 +277,7 @@ mod tests {
             out_dtype: DType::F32,
             backend: None,
             meta: NodeMeta::None,
+            view: None,
         });
         g.nodes.push(CNode {
             id: 1,
@@ -271,6 +288,7 @@ mod tests {
             out_dtype: DType::F32,
             backend: None,
             meta: NodeMeta::None,
+            view: None,
         });
         assert!(g.topo_order().is_err());
     }
