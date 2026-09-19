@@ -1423,6 +1423,100 @@ mod tests {
         }
     }
 
+    /// Plan §14 row 9's attempted confirmation — which **refuted** the
+    /// amplification hypothesis instead.
+    ///
+    /// Three runs of the same prompt: (A) prefill and one step at cell 0, (B) the
+    /// same at cell 0 but with one element of layer 0's K nudged by the magnitude
+    /// of the rotation-rounding discrepancy the offset itself produces (~1e-5),
+    /// and (C) the same at cell 8. The amplification story required B to move the
+    /// logits about as much as C; measured, **B moves them by 0** while C moves
+    /// them by 0.43. A single K element of one layer is therefore not a lever on
+    /// the tail, and the cell-offset effect is **structural**, not the rotation's
+    /// rounding amplified by depth.
+    ///
+    /// Only the existence of the offset effect is asserted; the perturbation is
+    /// printed, because "a tiny nudge does nothing" is a measurement of the
+    /// current graph rather than a property to freeze.
+    #[test]
+    fn a_tiny_kv_perturbation_does_not_explain_the_cell_offset_effect() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+        let step_tok = ids[n - 1];
+
+        let run = |start: usize, perturb: Option<f32>| -> Vec<f32> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            if start > 0 {
+                cache.alloc().kv_reserve_seq(3, start).expect("holder");
+            }
+            cache.alloc().kv_reserve_seq(7, n + 4).expect("subject");
+            if start == 0 {
+                cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
+            }
+            let _ = model.forward_batch(
+                &Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]),
+                1,
+                n_ctx,
+                &mut cache,
+            );
+            if let Some(d) = perturb {
+                // One element of layer 0's K, at the cell the first token wrote.
+                cache
+                    .alloc()
+                    .kv_perturb_for_test(0, true, start, 0, d)
+                    .expect("perturb");
+            }
+            model.forward_batch(
+                &Batch::new(vec![step_tok], vec![start + n], vec![7u32]),
+                1,
+                n_ctx,
+                &mut cache,
+            )
+        };
+        let d = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        let reference = run(0, None);
+        // The offset effect, and the same effect's magnitude of K discrepancy
+        // (measured: aligning cell 8's K onto cell 0 leaves ~1.5e-5).
+        let offset = d(&reference, &run(8, None));
+        let perturbed = d(&reference, &run(0, Some(1e-5)));
+        let smaller = d(&reference, &run(0, Some(1e-7)));
+        // Probe validity: a *large* change to the same element must move the
+        // logits, or the hook (or the read path) is not reaching the kernel and
+        // the zero above would mean nothing.
+        let loud = d(&reference, &run(0, Some(1.0)));
+        eprintln!(
+            "[amplify] offset 0-vs-8 {offset} | K +1e-5 {perturbed} | K +1e-7 {smaller} | K +1.0 {loud}"
+        );
+        assert!(
+            loud > 0.0,
+            "probe validity: a +1.0 change to one K element must move the logits"
+        );
+        assert!(offset > 0.0, "the offset effect itself must be present");
+        assert!(
+            perturbed.is_finite() && smaller.is_finite(),
+            "the perturbation runs must produce finite logits"
+        );
+    }
+
     /// C3's end-to-end gate: compacting the arena **between steps** must leave a
     /// session's continuation intact.
     ///
