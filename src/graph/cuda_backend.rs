@@ -3230,6 +3230,15 @@ mod tests {
         // Two tokens at cells 0 and 1: token 0's window is [0, 1), token 1's is
         // [0, 2) — exactly what `positions[t] + 1` gives, so both instantiations
         // must agree. hd = 4 (CUDA requires a nonzero multiple of 4).
+        //
+        // NOTE (2026-09-19): this fixture is **degenerate** — one-hot queries and
+        // values make the output insensitive to the scores, so it passed while the
+        // windowed kernel was in fact wrong (see
+        // `cuda_windowed_attention_matches_causal_for_long_windows`, which fails on
+        // random data with hd 128 / 4 KV heads even for a two-row window at start
+        // 0, while the causal instantiation returns V(row 0) exactly). Do not read
+        // this test as the windowed path's correctness evidence; the randomized
+        // one is the gate, and it is red until the kernel is fixed.
         let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 4usize, 2usize, 4usize);
         let nkt = nk * hd;
         let meta = crate::graph::ops::AttnMeta {
@@ -3329,6 +3338,173 @@ mod tests {
             "the causal and windowed instantiations disagree over the same rows: \
              causal {a:?} vs windowed {b:?}"
         );
+    }
+
+    /// The 2026-09-19 blocker, isolated: the **windowed** attention
+    /// instantiation must agree with the causal one over the *same relative
+    /// rows*, and it does not once the window is longer than a handful of rows.
+    ///
+    /// Why this shape: the server puts every slot but the first at a non-zero
+    /// KV offset, so every slot but the first uses the windowed instantiation.
+    /// A 5-token prompt was fine; a 34-token prompt (the server's rendered chat
+    /// prompt) produced identical garbage in *both* the batched and the serial
+    /// engine paths. That points at a windowed-kernel variant selected by the
+    /// window length (`nkv`) rather than at anything about batching, so the test
+    /// sweeps `nkv` — and, because the kernels' row arithmetic is the only
+    /// intended difference, asserts **bitwise** equality against the causal run
+    /// over rows `0..n`.
+    #[test]
+    #[ignore = "FAILS until the windowed-attention kernel is fixed: plan §14's blocker — run with `-- --ignored --nocapture`"]
+    fn cuda_windowed_attention_matches_causal_for_long_windows() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        cb.kv_f16 = false;
+
+        // Real-ish shapes: the 7B decodes with hd 128 / 4 KV heads, which is a
+        // larger `hd` and `nkv` than the 0.5B's 64 / 2 — the other reason this
+        // was model-dependent.
+        let (nh, nk, hd) = (4usize, 4usize, 128usize);
+        let nkt = nk * hd;
+        let n_ctx = 512usize;
+        let i32bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+
+        // Deterministic pseudo-random data (an LCG, so a failure is reproducible).
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((seed >> 8) as f32 / 8_388_608.0) - 1.0
+        };
+
+        let mut run = |cb: &mut crate::graph::cuda_backend::CudaBackend,
+                       explicit: bool,
+                       start: usize,
+                       n: usize|
+         -> (Vec<f32>, Vec<f32>) {
+            let meta = crate::graph::ops::AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale: 1.0,
+            };
+            let mut gb = GraphBuilder::new();
+            gb.set_explicit_span(explicit);
+            let pos = gb.input("positions", [n, 1, 1, 1], DType::I32);
+            let qq = gb.input("q", [nh * hd, n, 1, 1], DType::F32);
+            let kk = gb.input("k", [nkt, n, 1, 1], DType::F32);
+            let vv = gb.input("v", [nkt, n, 1, 1], DType::F32);
+            let _st = gb.kvcache_store(0, kk, vv, pos, n_ctx);
+            let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
+            let at = gb.attn(qq, kv, pos, crate::graph::ops::AttnMode::Gqa, meta);
+            gb.output(at);
+            let g = gb.build();
+
+            let posv: Vec<usize> = (start..start + n).collect();
+            let qv: Vec<f32> = (0..nh * hd * n).map(|_| next()).collect();
+            let kvv: Vec<f32> = (0..nkt * n).map(|_| next()).collect();
+            let vvv: Vec<f32> = (0..nkt * n).map(|_| next()).collect();
+            let span: Vec<u32> = (0..n)
+                .flat_map(|t| [(start as u32), (start + t + 1) as u32])
+                .collect();
+            // The span array is laid out as all `lo`s then all `hi`s.
+            let mut span_u32 = vec![0u32; 2 * n];
+            for t in 0..n {
+                span_u32[t] = start as u32;
+                span_u32[n + t] = (start + t + 1) as u32;
+            }
+            let _ = span;
+
+            let kreg = cb.alloc_buffer(n_ctx * nkt);
+            let vreg = cb.alloc_buffer(n_ctx * nkt);
+            let kb = cb.alloc_buffer(nkt * n);
+            let vb = cb.alloc_buffer(nkt * n);
+            let qb = cb.alloc_buffer(nh * hd * n);
+            let pb = cb.alloc_buffer(n);
+            let sb = cb.alloc_buffer(2 * n);
+            let ob = cb.alloc_buffer(nh * hd * n);
+            cb.write_host(qb, &qv).unwrap();
+            cb.write_host(kb, &kvv).unwrap();
+            cb.write_host(vb, &vvv).unwrap();
+            cb.write_host(
+                pb,
+                &i32bits(&posv.iter().map(|&p| p as u32).collect::<Vec<u32>>()),
+            )
+            .unwrap();
+            cb.write_host(sb, &i32bits(&span_u32)).unwrap();
+            let sti = g
+                .nodes
+                .iter()
+                .position(|nd| matches!(nd.op, crate::graph::ops::Op::KvcacheStore { .. }))
+                .unwrap();
+            let ati = g
+                .nodes
+                .iter()
+                .position(|nd| matches!(nd.op, crate::graph::ops::Op::Attn { .. }))
+                .unwrap();
+            cb.exec_ids(&g.nodes[sti], &[kb, vb, pb], kreg, Some((kreg, vreg)))
+                .unwrap();
+            cb.exec_ids(&g.nodes[ati], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
+                .unwrap();
+            let out = cb.copy_to_host(ob).unwrap();
+            // Token t's V block is contiguous (`[t*nkt, (t+1)*nkt)`), so this is
+            // the exact expected output of query 0, whose window is a single row.
+            (out, vvv[..hd].to_vec())
+        };
+
+        // (window length, non-zero start): the lengths sweep the kernel variants
+        // the 7B selects; the starts are the server's kind of offset.
+        for (n, start) in [
+            (2usize, 0usize),
+            (8, 0),
+            (2, 64),
+            (8, 64),
+            (16, 64),
+            (34, 64),
+            (64, 64),
+            (34, 1),
+            (48, 256),
+        ] {
+            let (causal, v_row0) = run(&mut cb, false, 0, n);
+            let (windowed, _) = run(&mut cb, true, start, n);
+            // Query 0's window is one row, so its output is V(row 0) exactly —
+            // the one case where the expected value is unambiguous. Checking it
+            // per instantiation says *which* side is wrong, which matters: if
+            // both were wrong the difference would be a harness bug, not a
+            // kernel one.
+            let ref_delta = |x: &[f32]| {
+                x[..hd]
+                    .iter()
+                    .zip(&v_row0)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            assert_eq!(
+                ref_delta(&causal),
+                0.0,
+                "the CAUSAL instantiation does not return V(row 0) for a single-row window (n={n})"
+            );
+            let worst = causal
+                .iter()
+                .zip(&windowed)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                worst, 0.0,
+                "window n={n} at start {start}: the windowed instantiation diverges from the causal one \
+                 over the same relative rows (max |delta| {worst}); first differing cell {:?}",
+                causal
+                    .iter()
+                    .zip(&windowed)
+                    .position(|(a, b)| a != b)
+                    .map(|i| (i, causal[i], windowed[i]))
+            );
+            eprintln!("[window] n={n} start={start}: bitwise equal");
+        }
     }
 
     /// reference with the standard q8-activation tolerance instead.
