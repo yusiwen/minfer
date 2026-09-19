@@ -829,6 +829,47 @@ impl GraphAllocator {
         })
     }
 
+    /// Test-only: add `delta` to one element of a layer's K or V region, in
+    /// place (plan §14 row 9's amplification probe).
+    ///
+    /// The probe measures how much a perturbation of the *rotation's own
+    /// rounding magnitude* moves the logits, to decide whether the cell-offset
+    /// effect is that rounding amplified by depth or something systematic. It
+    /// lives in the model tests (which own their allocator through a
+    /// `GraphCache`), hence a public hook rather than a private helper.
+    #[cfg(test)]
+    pub fn kv_perturb_for_test(
+        &mut self,
+        layer: usize,
+        k_region: bool,
+        cell: usize,
+        elem: usize,
+        delta: f32,
+    ) -> Result<(), String> {
+        let (region, elems_per_cell) = {
+            let l = self
+                .kv
+                .get(layer)
+                .ok_or_else(|| format!("kv_perturb_for_test: no arena for layer {layer}"))?;
+            (
+                if k_region { l.k } else { l.v },
+                (l.elems / l.n_ctx.max(1)).max(1),
+            )
+        };
+        let mut buf = self
+            .read_pool(region)
+            .ok_or_else(|| format!("kv_perturb_for_test: layer {layer} read failed"))?;
+        let i = cell * elems_per_cell + elem;
+        if i >= buf.len() {
+            return Err(format!(
+                "kv_perturb_for_test: cell {cell} element {elem} is past the region ({} elements)",
+                buf.len()
+            ));
+        }
+        buf[i] += delta;
+        self.write_pool(region.backend, region.id, &buf)
+    }
+
     /// Fragmentation and utilisation counters for every arena layer's shared
     /// cell table (C3's acceptance surface; F8 exports the same numbers).
     pub fn kv_arena_stats(&self) -> super::kvcache::KvArenaStats {
