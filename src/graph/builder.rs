@@ -205,9 +205,9 @@ impl GraphBuilder {
         )
     }
 
-    /// Matmul against a GPU-registered weight by name (probes/tests only):
-    /// builds a MatMul node whose meta references `weight_name` directly.
-    #[allow(dead_code)]
+    /// Matmul against a GPU-registered weight by name: builds a MatMul node
+    /// whose meta references `weight_name` directly (D2's composition uses it for
+    /// the concatenated gate|up weight, which is registered on device by name).
     pub fn matmul_by_name(
         &mut self,
         x: NodeId,
@@ -313,6 +313,59 @@ impl GraphBuilder {
             [2 * meta.nf, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedFfn(meta),
+        )
+    }
+
+    /// D2: the FFN decode fusion expressed as a **composition** — concat
+    /// `MatMul` → gate/up windows → in-place `SwiGLU`.
+    ///
+    /// This is the same arithmetic `Op::FusedFFN` performs (one matmul over the
+    /// concatenated gate|up weight, then `silu(gate) * up`), and the result lands
+    /// in the **same bytes**: the gate window is rows `0..nf` of the concat
+    /// buffer, which is where the fused kernel leaves its result, so downstream
+    /// reads are unchanged and the two paths are comparable element by element.
+    /// It needs D1's partial windows at a non-zero offset — before those, the
+    /// gate/up halves could only have been copies.
+    pub fn fused_ffn_composition(
+        &mut self,
+        x: NodeId,
+        gu_weight: &str,
+        ttype: crate::tensor::TensorType,
+        in_dim: usize,
+        nf: usize,
+    ) -> NodeId {
+        let nt = self.graph.nodes[x].out_shape[1];
+        let concat = self.matmul_by_name(x, gu_weight, ttype, 2 * nf, in_dim);
+        let gate = self.node(
+            "ffn_gate_window",
+            Op::View {
+                offset: 0,
+                shape: [nf, nt, 1, 1],
+            },
+            &[concat],
+            [nf, nt, 1, 1],
+            DType::F32,
+            NodeMeta::None,
+        );
+        let up = self.node(
+            "ffn_up_window",
+            Op::View {
+                offset: nf,
+                shape: [nf, nt, 1, 1],
+            },
+            &[concat],
+            [nf, nt, 1, 1],
+            DType::F32,
+            NodeMeta::None,
+        );
+        // in place into the gate window (the allocator aliases a view input)
+        self.node(
+            "ffn_swiglu",
+            Op::SwiGLU,
+            &[gate, up],
+            [nf, nt, 1, 1],
+            DType::F32,
+            NodeMeta::None,
         )
     }
 

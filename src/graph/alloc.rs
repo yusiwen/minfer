@@ -338,7 +338,7 @@ impl GraphAllocator {
                         self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
                 }
-                Op::Silu | Op::RoPE { .. } | Op::QkvBiasRopeStore { .. } => {
+                Op::Silu | Op::RoPE { .. } | Op::QkvBiasRopeStore { .. } | Op::SwiGLU => {
                     // D3-8: the mixed-quant QKV epilogue also needs the layer's
                     // persistent KV regions (it stores k/v like FusedQKV).
                     if let Op::QkvBiasRopeStore { layer } = &node.op {
@@ -365,7 +365,17 @@ impl GraphAllocator {
                         // alias only when the input's sole consumer is this op
                         // (in-place overwrites the input) AND it is on the same
                         // backend
-                        if in_ref.backend == backend && n_consumers[node.src[0]] == 1 {
+                        // D2: the FFN composition's SwiGLU writes into its *gate
+                        // window* — the same bytes the fused node leaves its result
+                        // in — so it joins the in-place set, but only when its first
+                        // input is a view. A non-view SwiGLU (the fusion pass's, on
+                        // CPU) keeps its own buffer, so existing graphs do not move.
+                        let in_place_ok = match &node.op {
+                            Op::SwiGLU => graph.node(node.src[0]).view.is_some(),
+                            _ => true,
+                        };
+                        if in_place_ok && in_ref.backend == backend && n_consumers[node.src[0]] == 1
+                        {
                             self.node_to_buf.insert(id, in_ref);
                             // the aliased input must stay alive through this
                             // node's consumers — and, if it is itself a view,
@@ -1236,6 +1246,75 @@ mod tests {
             .alloc_graph(&g)
             .expect_err("a window past the parent must be refused");
         assert!(err.contains("does not fit"), "{err}");
+    }
+
+    /// D2: the FFN composition's `SwiGLU` writes into its **gate window**, so the
+    /// node's buffer *is* the concat buffer at offset 0 — the same bytes the
+    /// hand-written `Op::FusedFFN` leaves its result in, which is what makes the
+    /// two paths comparable. No GPU needed: this is allocator bookkeeping.
+    #[test]
+    fn ffn_composition_swiglu_aliases_the_gate_window() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [4, 1, 1, 1], crate::graph::DType::F32);
+        let out = b.fused_ffn_composition(
+            x,
+            "blk.0.ffn_gu",
+            crate::tensor::TensorType::F32,
+            4, // in_dim
+            3, // nf
+        );
+        b.output(out);
+        let g = b.build();
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"matmul_named"), "{names:?}");
+        assert!(names.contains(&"ffn_gate_window"), "{names:?}");
+        assert!(names.contains(&"ffn_up_window"), "{names:?}");
+        assert!(names.contains(&"ffn_swiglu"), "{names:?}");
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let concat = alloc
+            .node_buffer(
+                g.nodes
+                    .iter()
+                    .position(|n| n.name == "matmul_named")
+                    .unwrap(),
+            )
+            .expect("concat");
+        let gate = alloc
+            .node_buffer(
+                g.nodes
+                    .iter()
+                    .position(|n| n.name == "ffn_gate_window")
+                    .unwrap(),
+            )
+            .expect("gate");
+        let up = alloc
+            .node_buffer(
+                g.nodes
+                    .iter()
+                    .position(|n| n.name == "ffn_up_window")
+                    .unwrap(),
+            )
+            .expect("up");
+        let swiglu = alloc
+            .node_buffer(g.nodes.iter().position(|n| n.name == "ffn_swiglu").unwrap())
+            .expect("swiglu");
+        assert_eq!(
+            (gate.id, gate.offset, gate.len),
+            (concat.id, 0, 3),
+            "the gate is the concat's first window"
+        );
+        assert_eq!(
+            (up.id, up.offset, up.len),
+            (concat.id, 3, 3),
+            "the up half is the concat's second window"
+        );
+        assert_eq!(
+            (swiglu.id, swiglu.offset, swiglu.len),
+            (concat.id, 0, 3),
+            "in-place swiglu writes into the gate window, exactly where the fused node puts its result"
+        );
     }
 
     /// D1: an in-place op on a view writes through to the buffer it is a window

@@ -250,15 +250,28 @@ impl Qwen2Graph {
             let residual = h;
             let normed = b.rms_norm(h, l.ffn_norm.as_ref(), eps);
             let ffn_out = if fuse_gu {
-                let gu = b.fused_ffn(
-                    normed,
-                    FusedFfnMeta {
-                        gu_weight: format!("{wns}blk.{il}.ffn_gu"),
-                        weight_ttype: l.ffn_gate.as_ref().unwrap().ttype,
-                        in_dim: ne,
-                        nf,
-                    },
-                );
+                let gu_weight = format!("{wns}blk.{il}.ffn_gu");
+                let weight_ttype = l.ffn_gate.as_ref().unwrap().ttype;
+                // D2: the composition (concat matmul + gate/up windows + in-place
+                // swiglu) is the default where the backend can express a partial
+                // window at a non-zero offset — CUDA. Metal keeps the hand-written
+                // node until G5 gives it offset views, and `MINFER_FFN_NODE=1`
+                // forces the node anywhere, which is the A/B gate.
+                let ffn_node = std::env::var("MINFER_FFN_NODE").is_ok()
+                    || !matches!(Self::device(model), crate::models::Device::Cuda);
+                let gu = if ffn_node {
+                    b.fused_ffn(
+                        normed,
+                        FusedFfnMeta {
+                            gu_weight,
+                            weight_ttype,
+                            in_dim: ne,
+                            nf,
+                        },
+                    )
+                } else {
+                    b.fused_ffn_composition(normed, &gu_weight, weight_ttype, ne, nf)
+                };
                 // down reads rows 0..nf of the concat buffer (gate rows, now
                 // holding silu(gate)*up); nt==1 makes the concat layout safe
                 b.matmul(gu, l.ffn_down.as_ref().unwrap(), None)

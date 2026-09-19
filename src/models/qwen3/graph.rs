@@ -212,15 +212,25 @@ impl Qwen3Graph {
             let residual = h;
             let normed = b.rms_norm(h, l.ffn_norm.as_ref(), eps);
             let ffn_out = if fuse_gu {
-                let gu = b.fused_ffn(
-                    normed,
-                    crate::graph::ops::FusedFfnMeta {
-                        gu_weight: format!("{wns}blk.{il}.ffn_gu"),
-                        weight_ttype: l.ffn_gate.as_ref().unwrap().ttype,
-                        in_dim: ne,
-                        nf,
-                    },
-                );
+                let gu_weight = format!("{wns}blk.{il}.ffn_gu");
+                let weight_ttype = l.ffn_gate.as_ref().unwrap().ttype;
+                // D2: composition on CUDA, hand-written node on Metal (no offset
+                // views until G5), `MINFER_FFN_NODE=1` forces the node (A/B).
+                let ffn_node = std::env::var("MINFER_FFN_NODE").is_ok()
+                    || !matches!(Self::device(model), crate::models::Device::Cuda);
+                let gu = if ffn_node {
+                    b.fused_ffn(
+                        normed,
+                        crate::graph::ops::FusedFfnMeta {
+                            gu_weight,
+                            weight_ttype,
+                            in_dim: ne,
+                            nf,
+                        },
+                    )
+                } else {
+                    b.fused_ffn_composition(normed, &gu_weight, weight_ttype, ne, nf)
+                };
                 b.matmul(gu, l.ffn_down.as_ref().unwrap(), None)
             } else {
                 let gate = b.matmul(normed, l.ffn_gate.as_ref().unwrap(), None);

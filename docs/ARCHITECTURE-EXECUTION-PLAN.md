@@ -639,7 +639,7 @@ prompt) belongs with E2's batching work.
 | ID | Title | Effort |
 |---|---|---|
 | D1 | Strided views with allocator-known aliasing + multi-output nodes — **increments 1–2 landed (2026-09-19): exact views are zero-copy, offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait), Metal is exact-only**; multi-output nodes remain | L |
-| D2 | Re-express one decode fusion as a composition (proof) — **design recorded (2026-09-19)**: `FusedFFN` (GPU-only decode fusion) as concat `MatMul` + two partial windows + in-place `SwiGLU`, CUDA-only until G5 gives Metal offsets; the bitwise A/B and the budget measurement are the next increment | M |
+| D2 | Re-express one decode fusion as a composition (proof) — **DONE (2026-09-19)**: `FusedFFN` as concat `MatMul` + two partial windows + in-place `SwiGLU`; CUDA takes the composition, Metal keeps the node until G5; env gate `MINFER_FFN_NODE=1` for the A/B; three models byte-identical, decode cost **≤0.8%** (recorded) | M |
 | D3 | Decide the fate of the four hand-written fused ops | S |
 
 - **D1 acceptance:** `Op::View` becomes zero-copy (a test asserts the allocator
@@ -813,6 +813,48 @@ recorded budget (the composition adds one `2*nf` f32 read+write per layer per
 token for the SwiGLU pass, and it may pick a different GEMM kernel than the fused
 special case — that is exactly what the budget is for); the real-model bitwise
 gates and the op matrix unchanged; `cargo test --release --features cuda` green.
+
+**Increment record (2026-09-19) — landed.** `GraphBuilder::fused_ffn_composition`
+builds the composition (`matmul_by_name` over the concatenated gate|up weight →
+`View{offset: 0}` gate → `View{offset: nf}` up → `Op::SwiGLU`), and:
+
+- the allocator's in-place set accepts `Op::SwiGLU` **only when its first input is
+  a view** — the fusion pass's own `SwiGLU` (CPU, non-view) keeps its separate
+  buffer, so no existing graph moves;
+- the models pick per backend: **CUDA takes the composition**, **Metal keeps the
+  hand-written node** (partial/offset windows are refused there until G5 — a
+  build-time choice, never a runtime copy), and `MINFER_FFN_NODE=1` forces the
+  node anywhere, which is the A/B gate;
+- a CI-verifiable test (`ffn_composition_swiglu_aliases_the_gate_window`) pins the
+  structure and, with no device, that the `SwiGLU`'s buffer **is** the concat
+  buffer at offset 0 — the same bytes the fused node writes.
+
+**Evidence (device, GB10, greedy, equal work).** Same-mode repeat is the
+determinism control (identical), and the comparison strips the timing lines:
+
+| Model | Hand-written node | Composition | Generated text |
+|---|---|---|---|
+| Qwen2.5-0.5B Q4_0, n=64 | 516.3 tok/s | 513.6 tok/s | **byte-identical** |
+| Qwen3-0.6B Q8_0, n=32 | 228.9 tok/s | 228.2 tok/s | **byte-identical** |
+| Qwen2.5-7B Q4_K_M, n=64 | 199.7 tok/s | 198.2 tok/s | **byte-identical** |
+
+So the acceptance is met: re-expressed as a composition, identical greedy output
+(the project's established proxy for bitwise), and a **recorded budget of <=0.8%
+decode** (measured 0.3–0.75% slower, consistently — the separate SwiGLU pass costs
+one `2*nf` f32 read+write per layer per token, and it is not offset by the fused
+epilogue on this device). Suites: CPU 197 / 0, `--features cuda` 243 / 0.
+
+**Method note, because it cost a false alarm.** The first A/B hashed *stdout*,
+which includes the `Prefill:`/`Generated:` timing lines that differ every run, and
+therefore reported `DIFFER` on all three models. The same-mode repeat caught it:
+if a mode does not reproduce itself, the comparison is measuring the harness. Any
+future A/B of this kind must strip those lines (or compare token ids) and keep the
+repeat control.
+
+**What D3 inherits.** The composition is proven and *slightly* slower on CUDA,
+which is exactly the trade D3 decides: keep the hand-written node (and its
+device-specific kernels) or delete it for simplicity. It cannot be deleted
+outright regardless — Metal needs it until G5.
 
 **Risks.** The budget is the honest risk: if the separate SwiGLU pass costs more
 than the fused epilogue saves on this device, D2's outcome is "re-expressed,
