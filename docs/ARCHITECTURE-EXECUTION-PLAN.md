@@ -639,8 +639,11 @@ prompt) belongs with E2's batching work.
 - **Deliverable:** a cell-copy operation that compacts the arena; triggered when
   fragmentation exceeds a threshold.
 - **Deps:** D1 (a copy needs either a view or an explicit copy op).
-- **Acceptance:** node-count and arena-utilisation counters before/after; output
-  bit-identical.
+- **Acceptance:** node-count and arena-utilisation counters before/after; the
+  moved bytes are exact (V verbatim; K exactly `rope_shift_kv(old, delta)`) and a
+  mid-session compaction leaves the continuation's greedy token intact. Bit-identical
+  *logits* are **not** claimable today — not because of the copy, but because a
+  sequence's logits already depend on its absolute arena offset (§14 row 9).
 
 #### C3 design (written before the code, 2026-09-19)
 
@@ -754,9 +757,40 @@ Evidence:
   end to end and the CUDA *primitive* is device-proven, but "the allocator drives
   the CUDA copy" is glue that only increment 3's integration run exercises.
 
-Increment 3 remains: fragment the arena through the **server's** dynamic runs and
-assert the replies stay identical to the serial path, which is also where
-`MINFER_NO_KV_DEFRAG` gets its A/B.
+Increment 3 (2026-09-19) added the part that makes a compaction *correct* rather
+than merely well-bookkept, and the model-level gate:
+
+- **A compaction must re-rope the K rows it moves.** `positions` are cells today,
+  so RoPE angles are absolute: a K row copied from cell `from` to cell `to` still
+  carries the angle of `from`, and the next decode step attends to it at the wrong
+  relative angle. `kv_defrag(need, rope)` now re-ropes the moved K rows through the
+  model's own `rope_shift_kv` — the C2 path, one host pass per moved run, with
+  **delta = `from - to`** (C2's convention: `rope_shift_kv(d)` means
+  `new_pos = old_pos - d`). V carries no rotation and moves verbatim.
+- **The gate caught its own sign bug.** `a_compaction_between_steps_keeps_the_continuation`
+  (real 0.5B: prefill + one step at a non-zero start, release the holder below it,
+  compact, then one more step) first failed on its argmax assertion because the
+  delta was written as `to - from`; the allocator's *unit* test had passed anyway,
+  because it computed its expectation with the same wrong sign. That is the whole
+  argument for a behavioural gate next to a byte-level one.
+- **The offset-alone effect, measured while gating.** The control run differs from
+  the compacted one only in the subject's cell offset, and that alone moves the
+  logits by **2.6% relative** (0.43 absolute) on the 0.5B *before* any compaction;
+  the compaction's own contribution is the remaining ~0.2pp. A uniform RoPE shift is
+  attention-neutral and V is unrotated, so an unidentified op is offset-sensitive.
+  This is now §14 row 9 — it is why the C3 acceptance is a surviving greedy token
+  plus byte-exact K/V rather than bit-identical logits, and it is the floor the
+  compaction test prints.
+
+Coverage: the planner, the counters and the bookkeeping are unit-tested; the
+compaction's bytes, ownership and counters are asserted end to end on CPU
+(`kv_defrag_moves_the_bytes_and_opens_the_run`, with the K re-rope computed
+independently through `rope_shift_kv`); the CUDA copy primitive is device-proven
+(`cuda_copy_cells_moves_overlapping_rows_down`); and the continuation gate runs the
+real model. Still open: driving the compaction from the **server's** dynamic runs
+(today every slot is reserved once at startup and packed, so the trigger cannot fire
+there), and the logical-positions change that would remove the re-rope and the
+offset sensitivity altogether.
 
 ### C4 / C5
 - C4: Q8_0 KV first, behind `MINFER_CACHE_TYPE`, gated to where the kernels
@@ -1881,3 +1915,4 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
 | 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |
+| 9 | **A sequence's logits depend on its absolute arena offset** (found 2026-09-19 while gating C3). Same tokens, same relative window, both attention instantiations explicit, differing only in whether the subject's run starts at cell 8 or cell 0: **2.6% relative** on the 0.5B, before any compaction (the compaction adds ~0.2pp on top). A uniform RoPE shift is attention-neutral and V is unrotated, so an unidentified op in the forward is offset-sensitive. Consequences: (a) C3 cannot claim bit-identical *logits*, only byte-exact K/V + a surviving greedy token; (b) anything that moves or reuses a slot's cells (cross-slot prefix reuse, dynamic runs) inherits it; (c) it is the floor of the compaction test's delta, and why the server's serial-vs-batched comparisons had to reuse the same slot layout to come out bitwise. | correctness | `a_compaction_between_steps_keeps_the_continuation -- --nocapture` prints both deltas. Next: bisect the forward for position-dependent ops (RoPE invariance itself is pinned by `rope_shift_matches_roping_at_the_new_position`), then the **logical-positions** change (sequence-relative `positions` + an allocator-resolved `cells` input for the store and the fused store ops), which removes this and the C3 re-rope together. |

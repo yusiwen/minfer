@@ -96,6 +96,16 @@ impl BatchEngine {
     /// `cached_tokens`, which is exactly what B2's cross-request prefix reuse
     /// needs.
     pub fn new(model: &dyn ModelDef, n_slots: usize, n_ctx_total: usize) -> Result<Self, String> {
+        // C3's compaction re-ropes the K rows it moves, so it needs the model's
+        // own RoPE parameters (the same ones `conversation.rs` hands to `kv_rm`).
+        let (freq_base, freq_scale) = model.rope_params();
+        let rope = crate::graph::kvcache::KvRope {
+            freq_base,
+            freq_scale,
+            n_head_kv: model.n_head_kv(),
+            hd: model.n_embd_head(),
+            style: model.rope_style(),
+        };
         let n_slots = n_slots.max(1);
         let cap = n_ctx_total / n_slots;
         if cap == 0 {
@@ -116,7 +126,7 @@ impl BatchEngine {
             // this is the path that stays correct once runs are dynamic.)
             let (slot, moves) = cache
                 .alloc()
-                .kv_reserve_seq_with_defrag(seq, cap)
+                .kv_reserve_seq_with_defrag(seq, cap, &rope)
                 .map_err(|e| format!("slot {i}: {e}"))?;
             for m in &moves {
                 if let Some(s) = slots.iter_mut().find(|s| s.seq == m.seq) {

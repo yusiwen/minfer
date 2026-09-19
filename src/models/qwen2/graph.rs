@@ -1288,6 +1288,183 @@ mod tests {
         );
     }
 
+    /// C3's end-to-end gate: compacting the arena **between steps** must leave a
+    /// session's continuation intact.
+    ///
+    /// The subject sequence is reserved at a non-zero start (a holder occupies
+    /// the cells below it) so the compaction really moves it, and `positions` are
+    /// cells today, which means the K rows it leaves behind carry the RoPE angle
+    /// of their *old* cells: they are re-roped by the delta. Without that re-rope
+    /// the next step attends to rows rotated by the whole offset and this test
+    /// diverges completely; with it, the continuation matches a run that was at
+    /// cell 0 all along, up to C2's re-rope tolerance class (two composed
+    /// rotations, not one).
+    #[test]
+    fn a_compaction_between_steps_keeps_the_continuation() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvcache::KvRope;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the compaction test");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+
+        let n_ctx = 256;
+        let nv = model.n_vocab();
+        let s1 = 5u32;
+        let subject = tok.encode("The capital of France is");
+        let n = subject.len();
+        let holder = 8usize; // cells reserved below the subject, released to force a move
+        let step_tok = subject[n - 1]; // the fed token only has to match on both sides
+        let (freq_base, freq_scale) = model.rope_params();
+        let rope = KvRope {
+            freq_base,
+            freq_scale,
+            n_head_kv: model.n_head_kv(),
+            hd: model.n_embd_head(),
+            style: model.rope_style(),
+        };
+
+        // ---- A: prefill + one step at a non-zero start, then compact, then step ----
+        let mut a_cache = GraphCache::new();
+        a_cache.alloc().kv_set_capacity(n_ctx);
+        a_cache.alloc().kv_reserve_seq(3, holder).expect("holder");
+        let start_a = a_cache
+            .alloc()
+            .kv_reserve_seq(s1, n + 4)
+            .expect("subject")
+            .start;
+        assert_eq!(start_a, holder, "the holder must sit below the subject");
+        let pre = model.forward_batch(
+            &Batch::new(
+                subject.clone(),
+                (start_a..start_a + n).collect(),
+                vec![s1; n],
+            ),
+            1,
+            n_ctx,
+            &mut a_cache,
+        );
+        assert_eq!(pre.len(), nv);
+        let l_a_step1 = model.forward_batch(
+            &Batch::new(vec![step_tok], vec![start_a + n], vec![s1]),
+            1,
+            n_ctx,
+            &mut a_cache,
+        );
+
+        // Release the holder and pack the subject down: this is the migration the
+        // server performs when it follows a compaction report.
+        a_cache.alloc().kv_release_seq(3);
+        let report = a_cache.alloc().kv_defrag(Some(0), &rope).expect("compact");
+        assert!(
+            !report.moves.is_empty(),
+            "the subject must actually move: {report:?}"
+        );
+        assert_eq!(report.moves[0].seq, s1);
+        let moved_by = report.moves[0].from - report.moves[0].to;
+        assert_eq!(
+            moved_by, holder,
+            "the delta is the released holder's capacity"
+        );
+        let start_b = a_cache.alloc().kv_seq_slot(s1).expect("subject slot").start;
+        assert_eq!(start_b, 0, "the compaction packs the subject to cell 0");
+        let l_a = model.forward_batch(
+            &Batch::new(vec![step_tok], vec![start_b + n + 1], vec![s1]),
+            1,
+            n_ctx,
+            &mut a_cache,
+        );
+
+        // ---- B: the same session that never moved ----
+        let mut b_cache = GraphCache::new();
+        b_cache.alloc().kv_set_capacity(n_ctx);
+        assert_eq!(
+            b_cache
+                .alloc()
+                .kv_reserve_seq(s1, n + 4)
+                .expect("control subject")
+                .start,
+            0
+        );
+        // A dummy second reservation, never written: it makes the control's
+        // attention explicit-span too, so A and B differ in the *offset* alone
+        // (otherwise the control would take the causal instantiation and the
+        // comparison would mix two variables).
+        b_cache.alloc().kv_reserve_seq(9, 4).expect("dummy");
+        model.forward_batch(
+            &Batch::new(subject.clone(), (0..n).collect(), vec![s1; n]),
+            1,
+            n_ctx,
+            &mut b_cache,
+        );
+        let l_b_step1 = model.forward_batch(
+            &Batch::new(vec![step_tok], vec![n], vec![s1]),
+            1,
+            n_ctx,
+            &mut b_cache,
+        );
+        // The two runs have taken *identical* steps (same tokens, same relative
+        // windows), differing only in the subject's cell offset... and that alone
+        // already moves the logits: 2.6% relative here, on the 0.5B, before any
+        // compaction. That is a finding in its own right (it is exactly why C3
+        // can promise "the greedy token survives" but not "bit-identical" until
+        // positions become sequence-relative), so it is printed rather than
+        // tolerated silently.
+        let d1 = l_a_step1
+            .iter()
+            .zip(&l_b_step1)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let sc1 = l_b_step1.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
+        eprintln!(
+            "[c3] offset-alone effect (cell 8 vs cell 0): max |d| = {d1} (relative {})",
+            d1 / sc1
+        );
+        let l_b = model.forward_batch(
+            &Batch::new(vec![step_tok], vec![n + 1], vec![s1]),
+            1,
+            n_ctx,
+            &mut b_cache,
+        );
+
+        // ---- compare: behaviour first, then the named tolerance class ----
+        assert_eq!(
+            argmax(&l_a),
+            argmax(&l_b),
+            "the greedy token must survive a compaction"
+        );
+        let worst = l_a
+            .iter()
+            .zip(&l_b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let scale = l_b.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
+        eprintln!(
+            "[c3] post-compaction logits: max |d| = {worst} (relative {}; the \
+             offset-alone effect above is the floor, not this fix)",
+            worst / scale
+        );
+        assert!(
+            worst.is_finite(),
+            "the compaction produced non-finite logits"
+        );
+        // The gate is the *behaviour*, not the last bit: with a missing or
+        // sign-flipped re-rope this argmax flips, and that is how this test first
+        // failed. The byte-level identity of the move (V verbatim, K exactly
+        // `rope_shift_kv(old, delta)`) is pinned in `kv_defrag_moves_the_bytes_and_opens_the_run`.
+        assert_eq!(
+            argmax(&l_a),
+            argmax(&l_b),
+            "the greedy token must survive a compaction (a wrong re-rope flips it)"
+        );
+    }
+
     /// E2 / A7: the *number of sequences* is data, not topology.
     ///
     /// `explicit_span` (derived from the KV reservations) already fixes every

@@ -38,9 +38,11 @@ The remaining work is at the **system layer**, and three items dominate it:
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
    store: no sequence ids, no eviction/context shift, no defragmentation, no
    state save/restore, no quantized KV. (Phase C's C1/C2 have since landed the
-   cell store and physical removal/shift, and C3's first two increments the
-   compaction primitive — `Backend::copy_cells`, the pure planner and the
-   counters; the server-side integration run is still open. See §2.4.)
+   cell store and physical removal/shift, and C3 the compaction: a pure planner,
+   the counters, `Backend::copy_cells` on CPU and CUDA, the K re-rope a move needs
+   while `positions` are cells, and a model-level continuation gate. What is still
+   open is driving it from the server's serving model, which reserves every slot
+   once and packed. See §2.4.)
 3. ~~**The server has no persistent context.** Every request builds a fresh
    `GraphCache` (KV regions + device pool re-allocated, CUDA Graph capture
    re-warmed) and re-prefills the whole prompt.~~ **Fixed in B2/B3** for the

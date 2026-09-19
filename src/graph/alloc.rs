@@ -707,6 +707,7 @@ impl GraphAllocator {
         &mut self,
         seq: super::kvcache::SeqId,
         cap: usize,
+        rope: &super::kvcache::KvRope,
     ) -> Result<(super::kvcache::SeqSlot, Vec<super::kvcache::KvMove>), String> {
         let first = match self.kv.reserve_seq(seq, cap) {
             Ok(slot) => return Ok((slot, Vec::new())),
@@ -715,7 +716,7 @@ impl GraphAllocator {
         if !kv_defrag_enabled() {
             return Err(format!("{first} (KV defragmentation disabled)"));
         }
-        let report = self.kv_defrag(Some(cap))?;
+        let report = self.kv_defrag(Some(cap), rope)?;
         if report.moves.is_empty() {
             return Err(first);
         }
@@ -740,7 +741,21 @@ impl GraphAllocator {
     /// itself needs nothing (every forward derives `attn_span` from the run
     /// table), but a caller that passes `start + pos` as a store position would
     /// otherwise write to cells that now belong to someone else.
-    pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
+    ///
+    /// **A compaction must re-rope the K rows it moves.** `positions` are cells
+    /// today, so RoPE angles are absolute cell indices: a row copied from cell
+    /// `from` to cell `to` still carries the angle of `from`, and the next
+    /// decode step would attend to it at the wrong relative angle. The moved K
+    /// rows are therefore re-roped by `from - to` — C2's convention, where
+    /// `rope_shift_kv(delta)` means `new_pos = old_pos - delta` — with the model's own
+    /// [`super::kvcache::rope_shift_kv`] — the C2 path, two composed rotations,
+    /// which is a named tolerance class rather than a bitwise identity (see the
+    /// plan's C3 record; the fix that makes it bitwise is logical positions).
+    pub fn kv_defrag(
+        &mut self,
+        need: Option<usize>,
+        rope: &super::kvcache::KvRope,
+    ) -> Result<KvDefragReport, String> {
         let before = self.kv.arena_stats();
         let moves = self.kv.compaction_plan(need);
         if moves.is_empty() {
@@ -782,6 +797,25 @@ impl GraphAllocator {
                             m.to
                         )
                     })?;
+                }
+                // RoPE angles are cells today, so a moved K row must be re-roped
+                // to its new angle; V carries no rotation. The delta is uniform
+                // over the run, which is what makes one host pass enough.
+                if m.to != m.from {
+                    let mut k_host = self.read_pool(k).ok_or_else(|| {
+                        format!(
+                            "kv_defrag: layer K rows {}..{} could not be read for the re-rope",
+                            m.to,
+                            m.to + m.rows
+                        )
+                    })?;
+                    super::kvcache::rope_shift_kv(
+                        &mut k_host[m.to * elems_per_cell..],
+                        m.rows,
+                        m.from as isize - m.to as isize,
+                        rope,
+                    );
+                    self.write_pool(k.backend, k.id, &k_host)?;
                 }
             }
         }
@@ -1265,6 +1299,34 @@ impl GraphAllocator {
         }
     }
 
+    /// Host read of one pool region by reference (the read side of
+    /// [`Self::write_pool`]): C3's re-rope needs the K rows on the host.
+    fn read_pool(&mut self, r: BufRef) -> Option<Vec<f32>> {
+        let window = |s: &[f32]| -> Vec<f32> {
+            let end = (r.offset + r.len).min(s.len());
+            s[r.offset.min(end)..end].to_vec()
+        };
+        match r.backend {
+            Backend::CPU => self.cpu.read_host(r.id).map(window),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => self
+                .metal
+                .as_mut()
+                .and_then(|m| m.read_host(r.id))
+                .map(window),
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => None,
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self
+                .cuda
+                .as_ref()
+                .and_then(|c| c.copy_to_host(r.id))
+                .map(|v| window(&v)),
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => None,
+        }
+    }
+
     fn write_pool(&mut self, backend: Backend, id: usize, data: &[f32]) -> Result<(), String> {
         match backend {
             Backend::CPU => self.cpu.write_host(id, data),
@@ -1642,6 +1704,13 @@ mod tests {
             );
             alloc.kv_own_range(seq, (seq as usize - 1) * 4, seq as usize * 4);
         }
+        let rope = crate::graph::kvcache::KvRope {
+            freq_base: 10_000.0,
+            freq_scale: 1.0,
+            n_head_kv: 1,
+            hd: ROW,
+            style: crate::vec_ops::RopeStyle::NonInterleaved,
+        };
         let (kid, vid) = alloc.kv_pair(0).unwrap();
         let pattern = |base: f32| -> Vec<f32> {
             (0..N_CTX * ROW)
@@ -1660,7 +1729,7 @@ mod tests {
         assert_eq!((before.free_cells, before.free_runs), (8, 2));
         assert!(alloc.kv_reserve_seq(4, 8).is_err());
 
-        let report = alloc.kv_defrag(Some(8)).unwrap();
+        let report = alloc.kv_defrag(Some(8), &rope).unwrap();
         assert_eq!(report.moves.len(), 1, "{report:?}");
         assert_eq!(report.moves[0].seq, 3);
         assert_eq!((report.moves[0].from, report.moves[0].to), (8, 4));
@@ -1668,12 +1737,28 @@ mod tests {
         assert_eq!((report.before.free_runs, report.after.free_runs), (2, 1));
         assert_eq!(report.after.largest_free_run, 8);
         assert_eq!((report.after.defrags, report.after.cells_moved), (1, 4));
-        // The bytes moved with the run: cell 4 now holds what cell 8 held.
+        // V moved verbatim; K moved *and* was re-roped to its new angle, because
+        // `positions` are cells today (the plan's C3 record: two composed
+        // rotations, the C2 tolerance class).
         let (k_now, v_now) = alloc.copy_kv_to_cpu(0).unwrap();
         for e in 0..ROW {
-            assert_eq!(k_now[4 * ROW + e], 8.0 + e as f32 / 10.0, "K element {e}");
             assert_eq!(v_now[4 * ROW + e], 108.0 + e as f32 / 10.0, "V element {e}");
         }
+        let mut k_expect: Vec<f32> = (0..ROW).map(|e| 8.0 + e as f32 / 10.0).collect();
+        // C2's convention: `rope_shift_kv(delta)` moves a row's angle to
+        // `pos - delta`, so a row that moved 8 -> 4 is re-roped by +4.
+        crate::graph::kvcache::rope_shift_kv(&mut k_expect, 1, 8 - 4, &rope);
+        for e in 0..ROW {
+            assert_eq!(k_now[4 * ROW + e], k_expect[e], "K element {e}");
+        }
+        assert_ne!(
+            k_expect,
+            (0..ROW)
+                .map(|e| 8.0 + e as f32 / 10.0)
+                .collect::<Vec<f32>>(),
+            "the fixture must be a rotation that actually moves the numbers, or the \
+             re-rope assertion above would pass on a blind copy"
+        );
         // The reservation that first-fit refused now fits, in the opened tail.
         assert_eq!(alloc.kv_reserve_seq(4, 8).unwrap().start, 8);
         // The same helper, on a fresh fragmentation: free the lowest run and the
@@ -1682,7 +1767,7 @@ mod tests {
         // and the helper reports the move it relied on.
         alloc.kv_release_seq(1);
         alloc.kv_release_seq(4);
-        let (slot, moves) = alloc.kv_reserve_seq_with_defrag(5, 12).unwrap();
+        let (slot, moves) = alloc.kv_reserve_seq_with_defrag(5, 12, &rope).unwrap();
         assert_eq!(
             slot.start, 4,
             "the retry packs the survivor down, then takes the tail"
@@ -1691,7 +1776,7 @@ mod tests {
         assert_eq!((moves[0].seq, moves[0].from, moves[0].to), (3, 4, 0));
         // The helper also answers "it still does not fit" with the original
         // first-fit error, after compaction moved nothing.
-        let err = alloc.kv_reserve_seq_with_defrag(6, 4).unwrap_err();
+        let err = alloc.kv_reserve_seq_with_defrag(6, 4, &rope).unwrap_err();
         assert!(err.contains("no free run of 4 cells"), "{err}");
     }
 
