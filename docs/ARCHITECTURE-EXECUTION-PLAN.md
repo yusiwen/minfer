@@ -661,7 +661,46 @@ prompt) belongs with E2's batching work.
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
-| E6 | 3 (follow-up) | **Device-aware batching default**: enable continuous batching automatically when a CUDA device participates, keeping the serial path on CPU. E2 measured the sign of the effect per device (CPU 0.49x, GPU 1.9x) but left `MINFER_BATCH=1` opt-in; this ticket turns that measurement into the default. Needs its own change because it flips server behaviour, and it must keep the trace and the opt-out | S |
+| E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E6 record (2026-09-19) — a device-aware default
+
+**Why it needed its own change.** E2 measured the *sign* of the batching effect
+per device (CPU 0.49x, GPU 1.9x) and, correctly, left the default with the
+measured-better path on the box it could measure. With the GPU available that
+stopped being the honest default: a CUDA server was leaving a ~2x win on the
+table behind an environment variable almost nobody would set.
+
+**Rule.** `MINFER_BATCH` unset -> batched iff the model's forwards run on
+**CUDA**; `=1` -> batched (also the way to batch on CPU); `=0` -> serial; any
+other value warns and falls back to the device default. Metal is excluded *by
+construction*, not caution: the batched path needs `attn_span` and Metal refuses
+that node (`supports_attn_span()` is false there), so batching a Metal server
+would fail loudly instead of serving; it waits for G5.
+
+**The decision has one authority.** "The device participates" used to be
+recomputed inside each model's `forward_batch` (`metal_available() &&
+weights_on_gpu`, `CudaState::get().is_some() && weights_on_cuda`). It is now
+`Qwen2Graph::device` / `Qwen3Graph::device` (an E6 addition), which the builder
+derives `CParams.gpu` from **and** the server derives its default from — so the
+two cannot disagree, and a partial weight registration (device present, weights
+not all registered) correctly keeps the server serial. `ModelDef::device()`
+exposes it as a `Device::{Cpu, Metal, Cuda}` with a CPU default.
+
+**The decision is pure and tested without a device**, which matters because CI has
+no GPU: `server::chat::batch_mode(requested, device)` is a pure function and
+`batch_mode_follows_the_device_and_honours_the_override` covers the matrix
+(unset / "1" / "0" / invalid x cpu / metal / cuda). Every server now also prints
+the outcome at startup (`[server] batching: on|off (device cuda|cpu|metal; ...)`),
+so the default is observable rather than inferred.
+
+**Device verification (2026-09-19).** CPU build: unset -> `off (device cpu)`,
+`=1` -> `on`, `banana` -> warning + `off`. CUDA build on the GB10: unset ->
+`on (device cuda)`, `=0` -> `off`. Acceptance re-measured with the **default**,
+no environment variable: 7B Q4_K_M, `--n-slots 4`, four identical prompts,
+`max_tokens=16`, equal work — **0.66 s batched (default) vs 1.30 s with
+`MINFER_BATCH=0` = 1.97x**, matching E2's 1.9x (1.314 vs 0.686) within noise.
+Suites: CPU 192 passed / 0 failed, `--features cuda` 238 / 0.
 
 - **E1 acceptance:** the mask is an explicit input, not a derivation from
   `positions`; a two-sequence test proves no cross-attention; single-sequence
@@ -1299,7 +1338,7 @@ one place, so the next session does not have to rediscover it.
 | 2 | **The windowed instantiation's cost at equal width is unmeasured** (`cuda_causal_and_windowed_agree_on_the_same_rows` proves equality, not speed). | measurement | E1b record; needs a device A/B over identical rows at one width. |
 | 3 | **A varying batch width rebuilds the graph** (`GraphCache` holds one graph at a time), so a server alternating 1-wide and N-wide decode steps re-allocates. | design | **E4** (allocator reserve/assign + multi-graph cache). |
 | 4 | **The op matrix's support table does not parse `SUPPORT-MATRIX.md`** — it checks a Rust mirror, so a stale doc row stays green (it did, for `multi_seq`). | test hardening | A1/A8; recorded in the A1 record. |
-| 5 | **Batching is opt-in** even where it is measured faster (`MINFER_BATCH=1`; GPU 1.9x). | product | **E6**. |
+| 5 | ~~**Batching is opt-in** even where it is measured faster.~~ **Closed by E6 (2026-09-19)**: the default follows the device (CUDA on, CPU/Metal off), with `=1`/`=0` as the override. | product | done |
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
 | 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |

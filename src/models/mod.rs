@@ -9,6 +9,34 @@ use crate::gguf::GgufModel;
 use crate::graph::cache::GraphCache;
 use crate::vec_ops::RopeStyle;
 
+/// Which backend a model's forwards actually run on (E6).
+///
+/// The variants exist unconditionally so callers need no `cfg`: an unavailable
+/// backend is simply never returned. This is the *fact* the server's batching
+/// default keys off (continuous batching is a measured win on CUDA and a
+/// measured loss on CPU), and it is deliberately the same gate the graph builder
+/// uses — see `graph::Qwen2Graph::device`, the single authority for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl Device {
+    pub fn is_gpu(self) -> bool {
+        !matches!(self, Device::Cpu)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Device::Cpu => "cpu",
+            Device::Metal => "metal",
+            Device::Cuda => "cuda",
+        }
+    }
+}
+
 /// Architecture-agnostic model interface.
 ///
 /// `Send + Sync` so a model can be shared across threads (the HTTP server's
@@ -88,6 +116,12 @@ pub trait ModelDef: Send + Sync {
         _cache: &mut crate::graph::cache::GraphCache,
     ) -> Vec<f32> {
         unimplemented!("forward_batch not implemented for this architecture")
+    }
+
+    /// Where this model's forwards run (E6). The default is CPU, which is the
+    /// truth for any implementation that does not override it.
+    fn device(&self) -> Device {
+        Device::Cpu
     }
 
     fn format_chat(&self, messages: &[(String, String)]) -> String;

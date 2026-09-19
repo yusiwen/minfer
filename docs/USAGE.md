@@ -76,20 +76,30 @@ Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 
 ## OpenAI-compatible HTTP server
 
-`MINFER_BATCH=1` (opt-in) makes the worker compose one decode batch across the
-active slots instead of one forward per slot (Phase E / E2). It is off by default
-because on this project's reference CPU it measures *slower* than serving
-requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with
-`--n-slots 4`): the CPU decode kernels gain nothing from `nt > 1`, and concurrency
-forfeits the cross-request prefix reuse each slot otherwise keeps. Where decode is
-weight-bandwidth bound (a GPU) batching is the win, and it is now measured rather
-than expected: **1.9x on the GB10** (7B Q4_K_M, four identical prompts, equal
-work, `--n-slots 4`). The plan's E2 record has both tables.
+Continuous batching (the worker composes one decode batch across the active slots
+instead of one forward per slot — Phase E / E2) is **on by default when the
+model's forwards run on CUDA, and off on CPU/Metal** (E6). The reason is measured,
+not assumed: on this project's reference CPU batching is *slower* than serving
+requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with `--n-slots 4`
+— the CPU decode kernels gain nothing from `nt > 1`, and concurrency forfeits the
+cross-request prefix reuse each slot otherwise keeps), while on the GB10 it is
+**1.97x faster** (7B Q4_K_M, four identical prompts, equal work, `--n-slots 4`,
+default settings). The plan's E2 and E6 records have the tables.
+
+- `MINFER_BATCH=1` forces batching on (this is how to batch on CPU, for
+  experiments or for a machine where your own measurement says it wins).
+- `MINFER_BATCH=0` forces it off.
+- Any other value warns and uses the device default.
+- Metal is deliberately never auto-enabled: the batched path needs an explicit
+  attention span and Metal refuses that node, so it waits for Phase G.
+- The server prints its choice at startup:
+  `[server] batching: on (device cuda; MINFER_BATCH=1 forces it on, =0 forces it off)`.
 
 Two environment switches around the GPU are easy to get wrong:
 
 - `MINFER_DISABLE_CUDA` is checked for **presence**, not value: setting it to
-  `0` *disables* CUDA. To force the CPU path deliberately use
+  `0` *disables* CUDA (and therefore also turns the batching default off, since
+  the model then runs on CPU). To force the CPU path deliberately use
   `MINFER_DISABLE_CUDA=1`; to use the GPU, leave it unset.
 - On a device, batched *prefills* stay per request by construction (CUDA's
   `fa_prefill` tiles one query tile against one KV window — E1b), so `--n-slots`
