@@ -61,6 +61,23 @@ impl Default for GraphAllocator {
     }
 }
 
+/// D1: extend a node's liveness past `to`, walking its `view_src` ancestors —
+/// a view shares its parent's buffer, so the parent must not be recycled while
+/// the view (or anything aliasing it) is still read.
+fn extend_through_views(graph: &ComputeGraph, last_use: &mut [usize], from: NodeId, to: usize) {
+    let mut cur = from;
+    loop {
+        if last_use[cur] >= to {
+            break;
+        }
+        last_use[cur] = to;
+        match graph.node(cur).view {
+            Some(v) => cur = v.src,
+            None => break,
+        }
+    }
+}
+
 impl GraphAllocator {
     pub fn new() -> Self {
         Self::default()
@@ -227,6 +244,50 @@ impl GraphAllocator {
             self.sweep(i);
             let node = graph.node(id);
             let backend = node.backend.unwrap_or(Backend::CPU);
+            // D1: a view allocates nothing. It *is* its parent's buffer, so the
+            // parent's liveness must cover it (and every consumer of it) — the
+            // two refusals below are loud on purpose: a view this increment
+            // cannot express must not silently become a copy.
+            if let Some(v) = node.view {
+                if v.offset != 0 {
+                    return Err(format!(
+                        "node {id} ('{}') is a view at element offset {} — offset views are D1's \
+                         second increment (`BufRef` carries no offset yet); build a copy instead",
+                        node.name, v.offset
+                    ));
+                }
+                let parent = self.node_to_buf.get(&v.src).copied().ok_or_else(|| {
+                    format!(
+                        "view node {id} ('{}') has no buffer for its parent {}",
+                        node.name, v.src
+                    )
+                })?;
+                if parent.backend != backend {
+                    return Err(format!(
+                        "view node {id} ('{}') is assigned to {backend:?} but its parent {} lives on \
+                         {:?}: a cross-backend view would need a staged copy, so build a materialized \
+                         copy instead of a view",
+                        node.name,
+                        v.src,
+                        parent.backend
+                    ));
+                }
+                let parent_elems = graph.node(v.src).n_elements();
+                if node.n_elements() != parent_elems {
+                    return Err(format!(
+                        "view node {id} ('{}') spans {} elements but its parent {} spans {parent_elems}: \
+                         this increment aliases exact views only (`copy_to_cpu` on a partial view \
+                         would read the parent's whole buffer)",
+                        node.name,
+                        node.n_elements(),
+                        v.src
+                    ));
+                }
+                let lu = last_use[id];
+                self.node_to_buf.insert(id, parent);
+                extend_through_views(graph, &mut last_use, id, lu);
+                continue;
+            }
             match node.op {
                 Op::KvcacheStore { layer } | Op::KvcacheLoad { layer } => {
                     let pair =
@@ -296,8 +357,10 @@ impl GraphAllocator {
                         if in_ref.backend == backend && n_consumers[node.src[0]] == 1 {
                             self.node_to_buf.insert(id, in_ref);
                             // the aliased input must stay alive through this
-                            // node's consumers
-                            last_use[node.src[0]] = last_use[node.src[0]].max(last_use[id]);
+                            // node's consumers — and, if it is itself a view,
+                            // so must the buffer it is a window of (D1)
+                            let lu = last_use[id];
+                            extend_through_views(graph, &mut last_use, node.src[0], lu);
                         } else {
                             let size = node.n_elements();
                             let pid = self.alloc_in_pool(backend, size);
@@ -1080,6 +1143,106 @@ mod tests {
     use super::*;
     use crate::graph::builder::GraphBuilder;
 
+    /// D1: a graph whose output is a *view* of an input, so the allocator must
+    /// alias rather than copy. `offset`/`shape` are parameters so the refusal
+    /// cases can be built too.
+    fn view_graph(offset: usize, shape: [usize; 4], parent_shape: [usize; 4]) -> ComputeGraph {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", parent_shape, crate::graph::DType::F32);
+        let v = b.node(
+            "view",
+            Op::View { offset, shape },
+            &[x],
+            shape,
+            crate::graph::DType::F32,
+            NodeMeta::None,
+        );
+        b.output(v);
+        b.build()
+    }
+
+    /// D1 acceptance: the view is **zero-copy** — it maps onto its parent's
+    /// buffer, and the parent is not recycled while the view lives.
+    #[test]
+    fn a_view_aliases_its_parent_buffer_and_keeps_it_alive() {
+        let g = view_graph(0, [4, 1, 1, 1], [4, 1, 1, 1]);
+        assert!(
+            g.node(1).view.is_some(),
+            "the builder must mark View as an alias"
+        );
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let parent = alloc.node_buffer(0).expect("parent buffer");
+        let view = alloc.node_buffer(1).expect("view buffer");
+        assert_eq!(
+            (view.backend, view.id),
+            (parent.backend, parent.id),
+            "the view must reuse its parent's buffer id (zero-copy)"
+        );
+        // Liveness: the parent's deadline covers the view (the view is an
+        // output here, so both run to the end of the graph).
+        let parent_deadline = alloc.buf_alive.get(&(parent.backend, parent.id)).copied();
+        assert!(
+            parent_deadline.is_some(),
+            "the aliased parent must be registered as alive"
+        );
+    }
+
+    /// D1: what this increment cannot express is refused **loudly** — never
+    /// silently copied (standing rule 2).
+    #[test]
+    fn views_that_need_more_than_exact_aliasing_are_refused() {
+        // An offset view is increment 2 (BufRef carries no offset yet).
+        let g = view_graph(1, [4, 1, 1, 1], [8, 1, 1, 1]);
+        let err = GraphAllocator::new()
+            .alloc_graph(&g)
+            .expect_err("offset view must be refused");
+        assert!(err.contains("second increment"), "{err}");
+
+        // A partial window would make `copy_to_cpu(view)` read the parent's
+        // whole buffer, so it is refused too.
+        let g = view_graph(0, [2, 1, 1, 1], [4, 1, 1, 1]);
+        let err = GraphAllocator::new()
+            .alloc_graph(&g)
+            .expect_err("partial view must be refused");
+        assert!(err.contains("exact views only"), "{err}");
+    }
+
+    /// D1: an in-place op on a view writes through to the buffer it is a window
+    /// of, so liveness must follow the chain (view -> parent).
+    #[test]
+    fn in_place_on_a_view_extends_the_parents_liveness() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [4, 1, 1, 1], crate::graph::DType::F32);
+        let v = b.node(
+            "view",
+            Op::View {
+                offset: 0,
+                shape: [4, 1, 1, 1],
+            },
+            &[x],
+            [4, 1, 1, 1],
+            crate::graph::DType::F32,
+            NodeMeta::None,
+        );
+        // sole consumer of the view, same backend -> the in-place rule aliases
+        let s = b.silu(v);
+        b.output(s);
+        let g = b.build();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).expect("alloc");
+        let parent = alloc.node_buffer(0).expect("parent");
+        assert_eq!(
+            alloc.node_buffer(2).expect("silu").id,
+            parent.id,
+            "the in-place op must alias through the view onto the parent"
+        );
+        assert!(
+            alloc.buf_alive.contains_key(&(parent.backend, parent.id)),
+            "parent must still be alive for the in-place consumer"
+        );
+    }
+
     fn chain(n_ops: usize) -> ComputeGraph {
         let mut b = GraphBuilder::new();
         let x = b.input("x", [4, 1, 1, 1], crate::graph::DType::F32);
@@ -1281,6 +1444,7 @@ mod tests {
             out_dtype: super::super::DType::F32,
             backend: None,
             meta: super::super::ops::NodeMeta::None,
+            view: None,
         });
         g.nodes.push(super::super::CNode {
             id: 1,
@@ -1291,6 +1455,7 @@ mod tests {
             out_dtype: super::super::DType::F32,
             backend: None,
             meta: super::super::ops::NodeMeta::None,
+            view: None,
         });
         let mut alloc = GraphAllocator::new();
         assert!(alloc.alloc_graph(&g).is_err());

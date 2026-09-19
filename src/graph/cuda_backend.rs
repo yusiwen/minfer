@@ -428,13 +428,20 @@ impl CudaBackend {
             // Inputs are host-filled by the allocator; KvcacheLoad is a view
             // of the persistent K region (out_buf IS the region — no kernel).
             Op::Input | Op::KvcacheLoad { .. } => Ok(()),
-            // Layout-only nodes: identity copy of the source buffer (same
-            // semantics as cpu_backend's View/Reshape/Permute handling).
+            // D1: view-like nodes own nothing — the allocator mapped the node
+            // onto its parent's buffer, so there is no copy to perform (and a
+            // d2d copy from a buffer to itself would be wasted traffic at best).
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
                 let src = *in_bufs
                     .first()
                     .ok_or_else(|| format!("cuda: {} without source buffer", node.name))?;
-                self.copy_d2d(src, out_buf)
+                if src != out_buf {
+                    return Err(format!(
+                        "cuda: {} is a view but its output buffer is not its source's (D1 aliasing                          missing); refusing to copy silently",
+                        node.name
+                    ));
+                }
+                Ok(())
             }
             // 7e③: row gather. Embed meta = weight gather + dequantize (the
             // embedding, type dispatched on device); no meta = generic f32

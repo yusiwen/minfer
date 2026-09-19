@@ -397,8 +397,17 @@ impl Backend for CpuBackend {
             Op::KvcacheLoad { .. } => Ok(()), // view of the K region
 
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
-                // Phase 2: identity (shape/layout metadata; data unchanged)
-                out.copy_from_slice(ins[0]);
+                // D1: a view does not own its output — the allocator mapped it
+                // onto its parent's buffer, so `out` and `ins[0]` are the same
+                // allocation and there is nothing to copy. The assert is the
+                // guard against a future non-view use of these ops silently
+                // passing through.
+                debug_assert!(
+                    node.view.is_some(),
+                    "{}: view-like op without a view alias (allocator should have refused)",
+                    node.name
+                );
+                debug_assert_eq!(out.as_ptr(), ins[0].as_ptr(), "view is not aliased");
                 Ok(())
             }
             Op::Attn { .. } => {

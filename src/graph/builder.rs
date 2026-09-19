@@ -10,7 +10,7 @@ use super::ops::{
     AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, FusedQkvNormMeta, KvcacheMeta,
     MatMulMeta, NodeMeta, NormMeta, Op, QkvBiasRopeStoreMeta, RoPEMeta,
 };
-use super::{CNode, ComputeGraph, DType, NodeId};
+use super::{CNode, ComputeGraph, DType, NodeId, ViewAlias};
 
 pub struct GraphBuilder {
     graph: ComputeGraph,
@@ -78,6 +78,22 @@ impl GraphBuilder {
         meta: NodeMeta,
     ) -> NodeId {
         let id = self.graph.nodes.len();
+        // D1: the view-like ops do not own their output — they are windows into
+        // their single source's buffer. Recorded here (the one construction
+        // point, so hand-built graphs get it too) and honoured by the allocator,
+        // which maps the node onto the parent's buffer and extends the parent's
+        // liveness instead of allocating a copy.
+        let view = match (&op, src.len()) {
+            (Op::View { offset, .. }, 1) => Some(ViewAlias {
+                src: src[0],
+                offset: *offset,
+            }),
+            (Op::Reshape { .. }, 1) | (Op::Permute { .. }, 1) => Some(ViewAlias {
+                src: src[0],
+                offset: 0,
+            }),
+            _ => None,
+        };
         self.graph.nodes.push(CNode {
             id,
             name: name.to_string(),
@@ -87,6 +103,7 @@ impl GraphBuilder {
             out_dtype,
             backend: None,
             meta,
+            view,
         });
         id
     }

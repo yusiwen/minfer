@@ -638,13 +638,93 @@ prompt) belongs with E2's batching work.
 
 | ID | Title | Effort |
 |---|---|---|
-| D1 | Strided views with allocator-known aliasing + multi-output nodes | L |
+| D1 | Strided views with allocator-known aliasing + multi-output nodes — **increment 1 landed (2026-09-19): exact views are zero-copy, aliasing is allocator-known**; offset views and multi-output nodes remain | L |
 | D2 | Re-express one decode fusion as a composition (proof) | M |
 | D3 | Decide the fate of the four hand-written fused ops | S |
 
 - **D1 acceptance:** `Op::View` becomes zero-copy (a test asserts the allocator
   maps a view onto its parent's buffer); the allocator's liveness understands
   `view_src`; existing graphs unchanged and bitwise.
+
+#### D1 design (written before the code, 2026-09-19)
+
+**What D1 is actually for.** C3's own text allows either route ("a copy needs
+either a view or an explicit copy op"), so views are **not** on C3's critical
+path; what needs them is **D2** (a decode fusion re-expressed as a composition:
+`FusedQKV` leaves `q|k|v` in one concat buffer, and the composition feeds
+attention from three *windows* of it), and what needs multi-output nodes is
+**MoE/MLA** (item 17). The diagram's "C3 needs D1" is therefore softer than it
+looks; the honest dependency is D2 → D1.
+
+**Today (measured in the code, not assumed).** `Op::View`/`Reshape`/`Permute` are
+**copies**: the CPU arm is `out.copy_from_slice(ins[0])`, i.e. the IR has no
+aliasing at all. The one alias that exists is the *in-place elementwise* rule in
+`GraphAllocator::alloc_graph` (Silu/RoPE): when the input's sole consumer is the
+op and both are on the same backend, the op's output **is** the input's buffer
+(`node_to_buf[op] = node_to_buf[src]`) and the input's `last_use` is extended past
+it. `BufRef` is `{ backend, id }` — no offset — and the `Backend` trait hands the
+backends plain ids (`in_bufs: &[usize]`, `out_buf: usize`). An *offset* view
+therefore cannot be expressed without threading offsets through the trait, all
+three backends and their call sites (the A5 lesson: a trait-signature change
+silently skips the CUDA test call sites unless CI compiles them).
+
+**Three increments.**
+
+1. **Exact views — landed here.** `CNode` gains `view: Option<ViewAlias>` where
+   `ViewAlias { src: NodeId, offset: usize }` (the field carries `offset` from the
+   start so the IR shape does not change again later), the builder marks
+   `View`/`Reshape`/`Permute` as views of their single source, the allocator maps
+   `node_to_buf[view] = node_to_buf[parent]` and extends the parent's liveness
+   through the `view_src` chain, and the view kernels become no-ops (the alias
+   *is* the output). The backend trait is untouched: an exact view is the same
+   buffer id. Loud refusals: `offset != 0` in this increment, a missing parent, a
+   parent on another backend, or a window that would not fit inside the parent.
+2. **Offset views.** `BufRef` gains `offset: usize`, the trait passes `BufRef`,
+   and each backend adds the offset where it resolves an id (CPU's
+   `split_at_mut` plumbing, CUDA/Metal's `ptr_of`). This is what D2 needs.
+3. **Multi-output nodes** (`CNode` grows a list of outputs), which is what MoE
+   and MLA need.
+
+**Acceptance for increment 1** (the D1 acceptance above, narrowed to what is
+landed): a view is zero-copy (a unit test asserts the allocator maps it onto the
+parent's buffer id), liveness understands `view_src` (the parent is not recycled
+while the view is live, and is freed after), and existing graphs are unchanged —
+the real-model bitwise tests and the op matrix are the evidence.
+
+**Increment 1 record (2026-09-19).** Landed as designed:
+
+- `CNode.view: Option<ViewAlias>` (with `offset` present from the start), set
+  automatically for `View`/`Reshape`/`Permute` in `GraphBuilder::node` — the one
+  construction point, so hand-built graphs and the op matrix get it too.
+- `GraphAllocator::alloc_graph` maps such a node onto its parent's buffer and
+  extends the parent's liveness through the `view_src` chain
+  (`extend_through_views`), which is also now used by the in-place branch (an
+  in-place op on a view writes through to the buffer it windows).
+- The three view kernels became **no-ops** on all backends, with the aliasing
+  asserted instead of assumed: CPU `debug_assert_eq!` on the pointers, CUDA/Metal
+  return `Err` rather than copying if the output is not the source's buffer
+  (standing rule 2 — the previous arms performed a silent identity copy).
+- Refusals, all loud: `offset != 0` (increment 2), a partial window (its element
+  count differs from the parent's, which would make `copy_to_cpu` read the whole
+  parent), a cross-backend view, a missing parent buffer.
+- Evidence: three new tests in `graph::alloc::tests`
+  (`a_view_aliases_its_parent_buffer_and_keeps_it_alive`,
+  `views_that_need_more_than_exact_aliasing_are_refused`,
+  `in_place_on_a_view_extends_the_parents_liveness`); the op matrix's
+  View/Reshape/Permute cells now exercise the alias on CPU **and** CUDA; and the
+  real-model bitwise gates (B2, C2, prefix reuse) are unchanged: CPU 195 passed /
+  0 failed, `--features cuda` 241 / 0. No architecture emits these ops yet, so
+  the payoff is D2's: it is the machinery a `FusedQKV`-as-composition needs, one
+  increment short of the offsets it will actually use.
+
+**Risks.** Aliasing changes who may write whose bytes: a view's consumer can now
+write into the parent's buffer (in-place ops on a view), so the existing
+"sole consumer + same backend" rule and the transitive liveness extension are both
+load-bearing, and chains (view of a view, in-place on a view) need their own
+tests. A backend that cannot express an alias must refuse loudly rather than
+copy silently (standing rule 2). And `copy_to_cpu`/`fill_input` on a view now read
+the parent's bytes — which is the point, but it is also why the op matrix's
+View/Reshape/Permute cells are the regression net for it.
 - **D2 acceptance:** `FusedFFN` re-expressed as `MatMul` + views + in-place
   `SwiGLU`; the hand-written node stays behind an env gate for A/B; bitwise
   identity; no decode regression beyond a recorded budget.
