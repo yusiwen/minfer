@@ -150,7 +150,7 @@ aliasing for views, so a view costs a full tensor copy. The builder appends
 sources before consumers, so node-id order *is* the execution order
 (`scheduler.rs:214`).
 
-**Gap.** 🔴 Strided, zero-copy views and multi-output nodes are missing. Without
+**Gap.** 🔴 Strided, zero-copy views and multi-output nodes were missing — **closed by D1 (2026-09-19)**: views are zero-copy with allocator-known aliasing, and `GraphBuilder::split_parts` exposes a node's single output as independent parts, so what remains under this header is model work (item 17), not IR work. Without
 them the IR cannot express slicing, concatenation, or a copy between
 overlapping regions as compositions of primitive ops — which is why minfer
 carries four hand-written decode-specific fused ops instead: `FusedQKV`,
@@ -572,7 +572,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **increments 1–2 done (D1, 2026-09-19)**: exact views are zero-copy with allocator-known aliasing (`CNode.view` + liveness + no-op kernels), and **offset/partial windows work on CPU and CUDA** (`BufRef` carries `offset`+`len` through the `Backend` trait; Metal is exact-only until G5). Multi-output nodes remain — that is what MoE/MLA need; D2's windows now exist | §2.1 | L |
+| 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **DONE (D1, 2026-09-19), increments 1–3**: exact views are zero-copy with allocator-known aliasing (`CNode.view` + liveness + no-op kernels), **offset/partial windows work on CPU and CUDA** (`BufRef` carries `offset`+`len` through the `Backend` trait; Metal is exact-only until G5), and the "multi-output node" is `GraphBuilder::split_parts` — one owning node plus one `Op::View` per part, so a producer's single output feeds several consumers with independently bindable tensors while the graph stays single-output. D2's windows are in production; the sketched `Op::SplitParts` was deliberately not added (a split op over one input is just views of that input). **Item 17 (MoE) therefore no longer waits on an IR blocker** — what it needs now is model work (expert weights, routing, the grouped GEMM), and item 16 (MLA) likewise | §2.1 | L |
 | 8 | **Allocator reserve/assign split** + size-class rounding + real memory accounting + VRAM feasibility gate. | §2.3 | L |
 | 9 | **Layer offload policy** on top of (8); needs a layer-granular assignment pass. | §2.6 | L |
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. | §2.5 | M |
