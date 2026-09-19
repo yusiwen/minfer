@@ -3443,6 +3443,14 @@ mod tests {
             )
             .unwrap();
             cb.write_host(sb, &i32bits(&span_u32)).unwrap();
+            // Harness self-check: the buffers the launch will read must hold
+            // exactly what this test wrote. If they do, the inputs are not the
+            // explanation for the divergence and the launch/kernel is.
+            let pos_back = cb.copy_to_host(pb).unwrap();
+            let want_pos: Vec<f32> = i32bits(&posv.iter().map(|&p| p as u32).collect::<Vec<u32>>());
+            assert_eq!(pos_back, want_pos, "positions buffer read back wrong");
+            let span_back = cb.copy_to_host(sb).unwrap();
+            assert_eq!(span_back, i32bits(&span_u32), "span buffer read back wrong");
             let sti = g
                 .nodes
                 .iter()
