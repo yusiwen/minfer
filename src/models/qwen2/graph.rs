@@ -1591,6 +1591,249 @@ mod tests {
         );
     }
 
+    /// Plan §14 row 9's decisive measurement: **layer 0 is offset-consistent
+    /// within the rotation's own rounding**, and the divergence therefore appears
+    /// downstream of it.
+    ///
+    /// Reading an intermediate buffer *after* `execute` is unsafe (liveness
+    /// recycling), so this mirrors the scheduler's loop instead: execute the
+    /// model's graph **node by node in build order**, capture layer 0's two rope
+    /// outputs and its attention output immediately after each runs, and skip
+    /// nodes the fusion pass orphaned (they have no buffer and the scheduler skips
+    /// them too). The alignment numbers are their own validity check — the q and k
+    /// ropes align to the same 1.5e-5 the independent KV-level measurement
+    /// produced — and they say:
+    ///
+    /// | Buffer | cell 0 vs cell 8, after aligning the rotation |
+    /// |---|---|
+    /// | layer 0 q_roped | 1.5e-5 (rel 1.9e-7) |
+    /// | layer 0 k_roped | 1.5e-5 (rel 1.2e-7) |
+    /// | layer 0 attention output | 7.3e-7 (rel 7.3e-7) |
+    ///
+    /// So the ops are exact here, and the earlier KV bisect's layer-1 difference
+    /// (3.6e-3) is that rounding **amplified downstream** — which is why C3's
+    /// acceptance is byte-exact K/V plus a surviving greedy token with the
+    /// logits' tail in a named class, not bit-identical logits.
+    #[test]
+    fn layer_0_is_offset_consistent_within_the_rotation_rounding_class() {
+        use crate::graph::backend::Backend as _;
+        use crate::graph::backend::KvProvider;
+        use crate::graph::batch::Batch;
+        use crate::graph::fusion::FusionPass;
+        use crate::graph::kvcache::{rope_shift_kv, KvRope};
+        use crate::graph::params::{CParams, GraphParams, GraphType};
+        use crate::graph::scheduler::BackendScheduler;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+        let (freq_base, freq_scale) = model.rope_params();
+        let style = model.rope_style();
+        let hd = model.n_embd_head();
+
+        // (q rope, k rope, attention output) of layer 0.
+        type Captured = (Vec<f32>, Vec<f32>, Vec<f32>);
+        let run = |start: usize| -> Captured {
+            let params = GraphParams {
+                n_tokens: n,
+                n_out: 1,
+                gtype: GraphType::Prefill,
+                cparams: CParams {
+                    n_ctx,
+                    flash_attn: false,
+                    explicit_span: true,
+                    gpu: false,
+                    fuse_qkv: false,
+                    fuse_ffn: false,
+                },
+                weights_version: 1,
+            };
+            let mut graph = model.build_graph(&params);
+            let ropes: Vec<crate::graph::NodeId> = graph
+                .nodes
+                .iter()
+                .filter(|nd| matches!(nd.op, crate::graph::ops::Op::RoPE { .. }))
+                .take(2)
+                .map(|nd| nd.id)
+                .collect();
+            let (q_node, k_node) =
+                if graph.nodes[ropes[0]].out_shape[0] > graph.nodes[ropes[1]].out_shape[0] {
+                    (ropes[0], ropes[1])
+                } else {
+                    (ropes[1], ropes[0])
+                };
+            let attn = graph
+                .nodes
+                .iter()
+                .find(|nd| matches!(nd.op, crate::graph::ops::Op::Attn { .. }))
+                .expect("attention node")
+                .id;
+
+            let mut alloc = GraphAllocator::new();
+            alloc.kv_set_capacity(n_ctx);
+            if start > 0 {
+                alloc.kv_reserve_seq(3, start).expect("holder");
+            }
+            alloc.kv_reserve_seq(7, n + 4).expect("subject");
+            if start == 0 {
+                alloc.kv_reserve_seq(3, 4).expect("dummy");
+            }
+
+            let concrete = model
+                .as_any()
+                .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+                .expect("Qwen2Model");
+            Qwen2Graph::register_graph_weights(concrete, &mut alloc);
+            let mut sched = BackendScheduler::new();
+            sched.assign_backends(&mut graph, &mut alloc);
+            {
+                let backends: Vec<&dyn crate::graph::backend::Backend> = vec![alloc.cpu()];
+                FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
+                    Some(crate::graph::Backend::CPU) => Some(0),
+                    _ => None,
+                });
+            }
+            alloc.alloc_graph(&graph).expect("alloc");
+
+            let batch = Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]);
+            alloc.fill_input_i32(&graph, "token_ids", &ids).unwrap();
+            let pos: Vec<u32> = (start..start + n).map(|p| p as u32).collect();
+            alloc.fill_input_i32(&graph, "positions", &pos).unwrap();
+            alloc.fill_batch_inputs(&graph, &batch).unwrap();
+            if graph
+                .inputs
+                .iter()
+                .any(|&i| graph.node(i).name == "tail_ids")
+            {
+                let rows: Vec<u32> = batch.out_rows(1).iter().map(|&r| r as u32).collect();
+                alloc.fill_input_i32(&graph, "tail_ids", &rows).unwrap();
+            }
+
+            // Build order is a valid topological order (source before consumer),
+            // so executing node by node in id order is what the scheduler does.
+            let order: Vec<crate::graph::NodeId> = graph.nodes.iter().map(|nd| nd.id).collect();
+            let mut captured: Captured = (Vec::new(), Vec::new(), Vec::new());
+            for id in order {
+                let node = graph.node(id);
+                if matches!(node.op, crate::graph::ops::Op::Input) {
+                    continue;
+                }
+                let ins: Vec<crate::graph::BufRef> = node
+                    .src
+                    .iter()
+                    .map(|&s| alloc.node_buffer(s).expect("input buffer"))
+                    .collect();
+                // A node the fusion pass orphaned (e.g. a silu folded into
+                // SwiGLU) has no buffer and is skipped, not executed — the same
+                // rule the scheduler applies.
+                let Some(out) = alloc.node_buffer(id) else {
+                    continue;
+                };
+                let kv = match &node.op {
+                    crate::graph::ops::Op::KvcacheStore { layer } => alloc.kv_pair(*layer),
+                    crate::graph::ops::Op::Attn { .. } => match &node.meta {
+                        crate::graph::ops::NodeMeta::Attn(m) => alloc.kv_pair(m.layer),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                alloc
+                    .cpu_mut()
+                    .execute_node(node, &ins, out, kv)
+                    .unwrap_or_else(|e| panic!("node {} ({}): {e}", node.id, node.name));
+                let slot = if id == q_node {
+                    Some(0)
+                } else if id == k_node {
+                    Some(1)
+                } else if id == attn {
+                    Some(2)
+                } else {
+                    None
+                };
+                if let Some(slot) = slot {
+                    let host = alloc.cpu().read_host(out.id).expect("host read");
+                    let window = host[out.offset..out.offset + out.len].to_vec();
+                    match slot {
+                        0 => captured.0 = window,
+                        1 => captured.1 = window,
+                        _ => captured.2 = window,
+                    }
+                }
+            }
+            captured
+        };
+        let d = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let scale = |v: &[f32]| v.iter().map(|x| x.abs()).fold(1.0f32, f32::max);
+
+        let (q0, k0, a0) = run(0);
+        let (q8, k8, a8) = run(8);
+        let nh = q0.len() / (n * hd);
+        let nk = k0.len() / (n * hd);
+        let mut q8a = q8.clone();
+        rope_shift_kv(
+            &mut q8a,
+            n,
+            8,
+            &KvRope {
+                freq_base,
+                freq_scale,
+                n_head_kv: nh,
+                hd,
+                style,
+            },
+        );
+        let mut k8a = k8.clone();
+        rope_shift_kv(
+            &mut k8a,
+            n,
+            8,
+            &KvRope {
+                freq_base,
+                freq_scale,
+                n_head_kv: nk,
+                hd,
+                style,
+            },
+        );
+        eprintln!(
+            "[per-node] nh={nh} nk={nk}: q aligned {} (rel {}) | k aligned {} (rel {}) | \
+             attn {} (rel {})",
+            d(&q0, &q8a),
+            d(&q0, &q8a) / scale(&q0),
+            d(&k0, &k8a),
+            d(&k0, &k8a) / scale(&k0),
+            d(&a0, &a8),
+            d(&a0, &a8) / scale(&a0),
+        );
+        // The rotation's own rounding class, measured: the ropes are the only
+        // inputs the offset touches, and layer 0's output follows them.
+        assert!(
+            d(&q0, &q8a) / scale(&q0) < 1e-5,
+            "the query rope must be offset-consistent"
+        );
+        assert!(
+            d(&k0, &k8a) / scale(&k0) < 1e-5,
+            "the key rope must be offset-consistent"
+        );
+        assert!(
+            d(&a0, &a8) / scale(&a0) < 1e-5,
+            "layer 0's attention output must be offset-consistent"
+        );
+    }
+
     /// C3's end-to-end gate: compacting the arena **between steps** must leave a
     /// session's continuation intact.
     ///
