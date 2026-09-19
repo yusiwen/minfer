@@ -32,8 +32,9 @@ The remaining work is at the **system layer**, and three items dominate it:
 1. **No multi-sequence batching.** The IR, the attention kernels, the KV
    (Key/Value) allocator and the server are all single-sequence. E1/E1b made the
    *attention* side sequence-aware and E2 landed sequence-addressable batches
-   and a batching server worker (opt-in), but the CPU payoff measured negative,
-   so the system still runs one sequence at a time by default.
+   and a batching server worker; the CPU payoff measured negative while the GPU
+   payoff was 1.9x, so the default now follows the device (**E6**: batches iff the
+   model runs on CUDA, off on CPU/Metal).
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
    store: no sequence ids, no eviction/context shift, no defragmentation, no
    state save/restore, no quantized KV. (Phase C's C1/C2 have since landed the
@@ -286,7 +287,7 @@ it stops at the single-sequence append-only case. What is missing:
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
 | Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
-| Multi-sequence attention masks | ✔ **E1 + E1b + E2** (opt-in: see the batching row below): the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations (compile-verified — no device here). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
+| Multi-sequence attention masks | ✔ **E1 + E1b + E2** (device-aware default: see the batching row below): the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations — **device-verified on GB10 since 2026-09-18**, and since 2026-09-19 swept over **both** KV dtypes (f16 and f32), which is what caught the f16 prefill mask fault (`ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four
 separate user-visible capabilities at once: multi-slot serving throughput,
@@ -347,9 +348,10 @@ defragmentation (a cell-copy op that a strided-view IR makes expressible).
 
 ### 2.5 L5 — Batching and serving 🔴
 
-**Today.** Single sequence by default on CPU — batching exists and is opt-in
-(`MINFER_BATCH=1`), slower on CPU (0.49x) and 1.9x faster on the GPU, where the
-E2 acceptance is met. `GraphParams` carries no sequence
+**Today.** Single sequence by default on CPU — batching exists and its default
+follows the device (E6: on for CUDA, off for CPU/Metal; `MINFER_BATCH=0/1` forces
+it), slower on CPU (0.49x) and 1.9x faster on the GPU, where the E2 acceptance is
+met. `GraphParams` carries no sequence
 count at all: E2 deleted `n_seqs`, which A7 had kept as *reserved for item 3*,
 once item 3 landed and showed the count is data rather than topology
 (`CParams.explicit_span` carries the only topology decision it can force —

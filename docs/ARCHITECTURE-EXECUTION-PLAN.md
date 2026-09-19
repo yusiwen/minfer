@@ -1,11 +1,17 @@
 # minfer Architecture Execution Plan
 
-**Status:** Phase A **complete** (2026-09-16); Phase B not started.
+**Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
+2026-09-16); Phase C **2/5** (C1, C2 done; C3=C4=C5 open); Phase D **2/3** (D2, D3
+done; D1 landed increments 1-2, multi-output nodes open); Phase E **4/7** (E1, E1b,
+E2, E6 done; E3-E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by
+decision (needs macOS). **Next: C3 + D1 increment 3.** Per-ticket evidence is in
+each phase's record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
 **Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
-`architecture-phase-a` (PR #1).
+`architecture-phase-a` (PR #1). This status was refreshed against `master =
+4e4b0a4` (2026-09-19).
 
 ## 0. Decisions already taken
 
@@ -13,7 +19,7 @@ deliverables, acceptance criteria and dependencies.
 |---|---|
 | **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
 | **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
-| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17, PR #3) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17, PR #4; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3/D1** (cross-slot prefix reuse — the actual cause of the CPU 0.49x), then **C4/C5**; a follow-up ticket should decide whether the server enables batching automatically when a CUDA device participates (now measured, not guessed); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
+| **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17, PR #3) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17, PR #4; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3 + D1 increment 3** (the explicit cell-copy op C3 needs, and multi-output nodes — also the MoE/MLA prerequisite), then **C4/C5**; **E6 settled the batching default** (device-aware: batches iff the model runs on CUDA, off on CPU/Metal, `MINFER_BATCH=0/1` to force either way), and **§14 row 0 closed the GPU-batching correctness blocker** behind it (the f16 windowed FA prefill mask, fixed 2026-09-19); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
 
@@ -45,17 +51,25 @@ This machine is a **DGX Spark (GB10), aarch64 Linux, CUDA 13.0**
 | Backend | Build | Run/verify | Note |
 |---|---|---|---|
 | CPU (aarch64 NEON+SDOT) | ✅ | ✅ | Primary correctness net here |
-| CUDA (sm_121) | ✅ | ❌ **unavailable** (A0, 2026-09-16) | Builds; at runtime `cudaGetDeviceCount` returns err 304 (OS/driver call failed) → `CUDA: no CUDA devices found`, graceful CPU fallback |
+| CUDA (sm_121) | ✅ | ✅ **device since 2026-09-18** | GB10 (121.6 GiB, driver 580.178.04, CUDA 13.0). Device-gated tests are still **local-only**: CI has no GPU, so its CUDA job only compiles the harness (F-campaign note in §14 row 1) |
 | Metal | ❌ | ❌ | macOS-only code, not compilable here → Phase G |
 | x86 AVX2 / AVX-512 | ❌ | ❌ | Item 11 needs an x86 box or CI |
 
-**A0 verdict (2026-09-16): CUDA is compile-only in this environment.** Every
-CUDA-touching ticket's acceptance is therefore "compiles + reviewer-inspected",
-never "measured here"; the CPU path is the only runtime net. Design
-consequence, already applied in A3: where a guard is needed on all three
-backends, put it in the **backend-agnostic** layer (the allocator) rather than
-in `cuda_backend.rs` — that keeps the fix fully verified on CPU and needs no
-unverifiable GPU code.
+**A0 verdict (2026-09-16) — superseded (2026-09-18).** It read "CUDA is
+compile-only in this environment", and for two days every CUDA ticket's acceptance
+was "compiles + reviewer-inspected". The reading was wrong: those probes ran under
+an agent file sandbox whose Landlock rules denied `open()` on `/dev/nvidia*` even
+though the nodes exist and are world-writable, so `cuInit` failed with err 304 for
+a reason unrelated to the driver. The device has been available since 2026-09-18,
+and CUDA work is now **measured** on it — E1b's windowed attention, E2's 1.9x, and
+the f16 windowed-prefill fix recorded in §14 row 0 all carry device evidence.
+
+The design consequence worth keeping is about *coverage*, not capability: CI has no
+GPU (§14 row 1), so a device-gated assertion is a local, manual run. Where a guard
+can live in the **backend-agnostic** layer (the allocator) instead of
+`cuda_backend.rs`, put it there so CI still proves it — that reasoning is
+independent of whether a device happens to be present (applied in A3, and again by
+C3 below).
 
 ## 3. Phase A — instrument, then hazard removal
 
@@ -67,7 +81,7 @@ roadmap §4 defects automatically.
 
 | ID | Item | Title | Effort | Status |
 |---|---|---|---|---|
-| A0 | — | CUDA access spike on this box | S | ✅ done — **unavailable** (compile-only) |
+| A0 | — | CUDA access spike on this box | S | ✅ done — but the verdict is **superseded (2026-09-18)**: the device is available; "unavailable" was an agent-sandbox artefact (§2) |
 | A1 | 23 | Op × dtype × backend correctness matrix | M | ✅ done — found + fixed an op defect |
 | A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | ✅ done |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
@@ -923,7 +937,7 @@ ignored, `--features cuda` 244 / 0 / 5.
 |---|---|---|---|
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
-| E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in `MINFER_BATCH=1`; A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
+| E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
