@@ -9,7 +9,7 @@
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
-use super::{CNode, DType};
+use super::{BufRef, CNode, DType};
 use crate::vec_ops::RopeStyle;
 
 struct CudaBuf {
@@ -305,6 +305,17 @@ impl CudaBackend {
         self.state.sync();
     }
 
+    /// D1: a reference's device pointer with its window applied. D1 views are
+    /// `F32` (the allocator refuses anything else), so the element offset is
+    /// scaled by 4 bytes.
+    fn ptr_of_ref(&self, r: BufRef) -> Result<*mut std::ffi::c_void, String> {
+        let base = self.ptr_of(r.id)?;
+        if r.offset == 0 {
+            return Ok(base);
+        }
+        Ok(unsafe { (base as *mut u8).add(r.offset * 4) as *mut std::ffi::c_void })
+    }
+
     fn ptr_of(&self, id: usize) -> Result<*mut std::ffi::c_void, String> {
         match self.pool.get(id) {
             Some(b) if !b.ptr.is_null() => Ok(b.ptr),
@@ -381,6 +392,26 @@ impl Drop for CudaBackend {
 }
 
 impl CudaBackend {
+    /// Test-only shim: the device tests address pool buffers by id (they always
+    /// did), so convert to owning `BufRef`s here — `elems(id)` gives the real
+    /// length, which the D1 window arithmetic relies on. Views are exercised
+    /// through the op matrix (which goes through the allocator), not here.
+    #[cfg(test)]
+    fn exec_ids(
+        &mut self,
+        node: &CNode,
+        in_ids: &[usize],
+        out_id: usize,
+        kv_pair: Option<(usize, usize)>,
+    ) -> Result<(), String> {
+        let ins: Vec<BufRef> = in_ids
+            .iter()
+            .map(|&id| BufRef::own(crate::graph::Backend::Cuda, id, self.elems(id)))
+            .collect();
+        let out = BufRef::own(crate::graph::Backend::Cuda, out_id, self.elems(out_id));
+        self.execute_node(node, &ins, out, kv_pair)
+    }
+
     /// End an open capture window WITHOUT launching it (error path, Phase 8
     /// review): the recorded launches never executed, so the split's outputs
     /// are invalid. Disables graph capture for the session.
@@ -403,8 +434,8 @@ impl CudaBackend {
     fn execute_node_inner(
         &mut self,
         node: &CNode,
-        in_bufs: &[usize],
-        out_buf: usize,
+        in_bufs: &[BufRef],
+        out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
         // one lock acquisition per node; None while this backend itself is
@@ -435,7 +466,7 @@ impl CudaBackend {
                 let src = *in_bufs
                     .first()
                     .ok_or_else(|| format!("cuda: {} without source buffer", node.name))?;
-                if src != out_buf {
+                if src.id != out_buf.id {
                     return Err(format!(
                         "cuda: {} is a view but its output buffer is not its source's (D1 aliasing                          missing); refusing to copy silently",
                         node.name
@@ -459,8 +490,8 @@ impl CudaBackend {
                     self.state.embed_rows_on_gpu(
                         m.weight_ttype,
                         wptr,
-                        self.ptr_of(in_bufs[0])?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(in_bufs[0])?,
+                        self.ptr_of_ref(out_buf)?,
                         n_embd,
                         nt,
                         self.state.is_weight_padded(&m.weight_name),
@@ -471,9 +502,9 @@ impl CudaBackend {
                     let n_embd = node.out_shape[0];
                     let nt = node.out_shape[1];
                     self.state.gather_rows_f32_on_gpu(
-                        self.ptr_of(in_bufs[0])?,
-                        self.ptr_of(in_bufs[1])?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[1])?,
+                        self.ptr_of_ref(out_buf)?,
                         n_embd,
                         nt,
                     );
@@ -483,27 +514,27 @@ impl CudaBackend {
             },
 
             Op::Add => {
-                let n = self.elems(out_buf);
-                if self.elems(in_bufs[0]) != n || self.elems(in_bufs[1]) != n {
+                let n = out_buf.len;
+                if in_bufs[0].len != n || in_bufs[1].len != n {
                     return Err(format!("cuda: {}: add input size mismatch", node.name));
                 }
                 self.state.add_f32(
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(in_bufs[1])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(in_bufs[1])?,
+                    self.ptr_of_ref(out_buf)?,
                     n,
                 );
                 Ok(())
             }
             Op::Mul => {
-                let n = self.elems(out_buf);
-                if self.elems(in_bufs[0]) != n || self.elems(in_bufs[1]) != n {
+                let n = out_buf.len;
+                if in_bufs[0].len != n || in_bufs[1].len != n {
                     return Err(format!("cuda: {}: mul input size mismatch", node.name));
                 }
                 self.state.mul_f32(
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(in_bufs[1])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(in_bufs[1])?,
+                    self.ptr_of_ref(out_buf)?,
                     n,
                 );
                 Ok(())
@@ -511,16 +542,15 @@ impl CudaBackend {
             // In-place op (alias rule, graph rules §5): stage via D2D copy when
             // the allocator did not alias the input, then run on the output.
             Op::Silu => {
-                if in_bufs[0] != out_buf {
+                if in_bufs[0].id != out_buf.id {
                     self.copy_d2d(in_bufs[0], out_buf)?;
                 }
-                self.state
-                    .silu_f32(self.ptr_of(out_buf)?, self.elems(out_buf));
+                self.state.silu_f32(self.ptr_of_ref(out_buf)?, out_buf.len);
                 Ok(())
             }
             Op::SwiGLU => {
-                let n = self.elems(out_buf);
-                if self.elems(in_bufs[0]) != n || self.elems(in_bufs[1]) != n {
+                let n = out_buf.len;
+                if in_bufs[0].len != n || in_bufs[1].len != n {
                     return Err(format!("cuda: {}: swiglu input size mismatch", node.name));
                 }
                 // r51/r52: producer-fused A-quantize (MINFER_MMQ_A_FUSE + full
@@ -548,9 +578,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .swiglu_quant_nw(
-                                    self.ptr_of(in_bufs[0])?,
-                                    self.ptr_of(in_bufs[1])?,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[1])?,
+                                    self.ptr_of_ref(out_buf)?,
                                     dim,
                                     rows,
                                 )
@@ -561,9 +591,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .swiglu_quant(
-                                    self.ptr_of(in_bufs[0])?,
-                                    self.ptr_of(in_bufs[1])?,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[1])?,
+                                    self.ptr_of_ref(out_buf)?,
                                     dim,
                                     rows,
                                 )
@@ -576,9 +606,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .swiglu_quant(
-                                    self.ptr_of(in_bufs[0])?,
-                                    self.ptr_of(in_bufs[1])?,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[1])?,
+                                    self.ptr_of_ref(out_buf)?,
                                     dim,
                                     rows,
                                 )
@@ -591,9 +621,9 @@ impl CudaBackend {
                     }
                 }
                 self.state.swiglu_f32(
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(in_bufs[1])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(in_bufs[1])?,
+                    self.ptr_of_ref(out_buf)?,
                     n,
                 );
                 Ok(())
@@ -602,13 +632,13 @@ impl CudaBackend {
             Op::RmsNorm { eps } => {
                 let wptr = self.norm_weight(node)?;
                 let d = node.out_shape[0];
-                if d % 4 != 0 || d == 0 || self.elems(out_buf) % d != 0 {
+                if d % 4 != 0 || d == 0 || out_buf.len % d != 0 {
                     return Err(format!(
                         "cuda: {}: rms_norm dim {d} must be a nonzero multiple of 4 (float4 kernel)",
                         node.name
                     ));
                 }
-                let n = self.elems(out_buf) / d;
+                let n = out_buf.len / d;
                 // r51/r52: producer-fused A-quantize — see the Op::SwiGLU arm.
                 // Every rms_norm output in the prefill graph is exclusively
                 // a GEMM input (q/k/v, gate/up; the output-norm/lm_head and
@@ -621,9 +651,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .rms_norm_quant_nw(
-                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[0])?,
                                     wptr,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(out_buf)?,
                                     d,
                                     n,
                                     *eps,
@@ -635,9 +665,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .rms_norm_quant(
-                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[0])?,
                                     wptr,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(out_buf)?,
                                     d,
                                     n,
                                     *eps,
@@ -651,9 +681,9 @@ impl CudaBackend {
                             if self
                                 .state
                                 .rms_norm_quant(
-                                    self.ptr_of(in_bufs[0])?,
+                                    self.ptr_of_ref(in_bufs[0])?,
                                     wptr,
-                                    self.ptr_of(out_buf)?,
+                                    self.ptr_of_ref(out_buf)?,
                                     d,
                                     n,
                                     *eps,
@@ -672,9 +702,9 @@ impl CudaBackend {
                 // skips its standalone quantize.
                 if n == 1 && d % 32 == 0 && !crate::cuda::CudaState::no_decode_a_fuse() {
                     self.state.rms_norm_quant_on_gpu(
-                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[0])?,
                         wptr,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(out_buf)?,
                         d,
                         n,
                         *eps,
@@ -682,9 +712,9 @@ impl CudaBackend {
                     return Ok(());
                 }
                 self.state.rms_norm(
-                    self.ptr_of(in_bufs[0])?,
+                    self.ptr_of_ref(in_bufs[0])?,
                     Some(wptr),
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(out_buf)?,
                     d,
                     n,
                     *eps,
@@ -697,17 +727,17 @@ impl CudaBackend {
             Op::QkNorm { hd, eps, .. } => {
                 let wptr = self.norm_weight(node)?;
                 let d = *hd;
-                if d % 4 != 0 || d == 0 || self.elems(out_buf) % d != 0 {
+                if d % 4 != 0 || d == 0 || out_buf.len % d != 0 {
                     return Err(format!(
                         "cuda: {}: qk_norm head dim {d} must be a nonzero multiple of 4 (float4 kernel)",
                         node.name
                     ));
                 }
-                let n = self.elems(out_buf) / d;
+                let n = out_buf.len / d;
                 self.state.rms_norm(
-                    self.ptr_of(in_bufs[0])?,
+                    self.ptr_of_ref(in_bufs[0])?,
                     Some(wptr),
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(out_buf)?,
                     d,
                     n,
                     *eps,
@@ -744,8 +774,8 @@ impl CudaBackend {
                 self.state.matmul_f32_ptr_layout(
                     wptr,
                     meta.weight_ttype,
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(out_buf)?,
                     od_total,
                     meta.in_dim,
                     nt,
@@ -753,7 +783,7 @@ impl CudaBackend {
                 )?;
                 // 2) in-place swiglu: silu(rows 0..nf) × (rows nf..2*nf)
                 let n = nt * meta.nf;
-                let buf = self.ptr_of(out_buf)?;
+                let buf = self.ptr_of_ref(out_buf)?;
                 // D3-5 1a: fuse the pad40 q8 epilogue for the following down
                 // matmul (same fused-producer form as the rms arm).
                 if n % 32 == 0 && !crate::cuda::CudaState::no_decode_a_fuse() {
@@ -813,7 +843,7 @@ impl CudaBackend {
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 // q: in-place (out aliases the q input; copy when it doesn't)
-                if in_bufs[0] != out_buf {
+                if in_bufs[0].id != out_buf.id {
                     self.copy_d2d(in_bufs[0], out_buf)?;
                 }
                 let bias_ptr = |name: &Option<String>| -> Result<*mut std::ffi::c_void, String> {
@@ -827,11 +857,11 @@ impl CudaBackend {
                 let bq = bias_ptr(&meta.bias_q)?;
                 let bk = bias_ptr(&meta.bias_k)?;
                 let bv = bias_ptr(&meta.bias_v)?;
-                let pos = self.positions_i32(in_bufs[3])?;
+                let pos = self.positions_i32(in_bufs[3].id)?;
                 self.state.attn_bias_rope_store(
-                    self.ptr_of(out_buf)?,
-                    self.ptr_of(in_bufs[1])?,
-                    self.ptr_of(in_bufs[2])?,
+                    self.ptr_of_ref(out_buf)?,
+                    self.ptr_of_ref(in_bufs[1])?,
+                    self.ptr_of_ref(in_bufs[2])?,
                     bq,
                     bk,
                     bv,
@@ -884,8 +914,8 @@ impl CudaBackend {
                 self.state.matmul_f32_ptr_layout(
                     wptr,
                     meta.weight_ttype,
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(out_buf)?,
                     od_total,
                     meta.in_dim,
                     nt,
@@ -905,11 +935,11 @@ impl CudaBackend {
                 let bq = bias_ptr(&meta.bias_q)?;
                 let bk = bias_ptr(&meta.bias_k)?;
                 let bv = bias_ptr(&meta.bias_v)?;
-                let pos = self.positions_i32(in_bufs[1])?;
+                let pos = self.positions_i32(in_bufs[1].id)?;
                 // pointer-form section bases into the concat output
                 // [q|k|v]: q at 0, k at nqt, v at nqt+nkt (in-bounds by
                 // construction: out = od_total = nqt + 2*nkt f32)
-                let q_ptr = self.ptr_of(out_buf)? as *mut f32;
+                let q_ptr = self.ptr_of_ref(out_buf)? as *mut f32;
                 let (k_ptr, v_ptr) = unsafe {
                     (
                         q_ptr.add(meta.nqt) as *mut std::ffi::c_void,
@@ -968,7 +998,7 @@ impl CudaBackend {
                         node.name
                     ));
                 }
-                if self.elems(in_bufs[0]) < id * nt || self.elems(out_buf) < od * nt {
+                if in_bufs[0].len < id * nt || out_buf.len < od * nt {
                     return Err(format!(
                         "cuda: {}: buffer size mismatch for [{od}x{id}] x nt={nt}",
                         node.name
@@ -977,8 +1007,8 @@ impl CudaBackend {
                 self.state.matmul_f32_ptr_layout(
                     wptr,
                     meta.weight_ttype,
-                    self.ptr_of(in_bufs[0])?,
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(out_buf)?,
                     od,
                     id,
                     nt,
@@ -994,7 +1024,8 @@ impl CudaBackend {
                     // add_bias_f32's last argument is the ROW COUNT (nt), not
                     // the total element count — the kernel grid maps one block
                     // row per token (a wrong count writes out of bounds).
-                    self.state.add_bias_f32(self.ptr_of(out_buf)?, bptr, od, nt);
+                    self.state
+                        .add_bias_f32(self.ptr_of_ref(out_buf)?, bptr, od, nt);
                 }
                 Ok(())
             }
@@ -1015,13 +1046,13 @@ impl CudaBackend {
                         node.name, meta.hd
                     ));
                 }
-                if in_bufs[0] != out_buf {
+                if in_bufs[0].id != out_buf.id {
                     self.copy_d2d(in_bufs[0], out_buf)?;
                 }
                 let nt = node.out_shape[1];
-                let pos = self.positions_i32(in_bufs[1])?;
+                let pos = self.positions_i32(in_bufs[1].id)?;
                 self.state.rope_f32(
-                    self.ptr_of(out_buf)?,
+                    self.ptr_of_ref(out_buf)?,
                     meta.n_head,
                     meta.hd,
                     nt,
@@ -1035,27 +1066,28 @@ impl CudaBackend {
             Op::KvcacheStore { layer } => {
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
-                if out_buf != k_id {
+                if out_buf.id != k_id {
                     return Err(format!(
-                        "cuda: kv store output buffer {out_buf} is not the K region {k_id}"
+                        "cuda: kv store output buffer {} is not the K region {k_id}",
+                        out_buf.id
                     ));
                 }
                 let nkt = node.out_shape[0];
-                if nkt == 0 || self.elems(in_bufs[0]) % nkt != 0 {
+                if nkt == 0 || in_bufs[0].len % nkt != 0 {
                     return Err(format!(
                         "cuda: kv store k input {} elems not a multiple of nkt {nkt}",
-                        self.elems(in_bufs[0])
+                        in_bufs[0].len
                     ));
                 }
-                let nt = self.elems(in_bufs[0]) / nkt;
-                let pos = self.positions_i32(in_bufs[2])?;
+                let nt = in_bufs[0].len / nkt;
+                let pos = self.positions_i32(in_bufs[2].id)?;
                 // Note: positions >= n_ctx are not validated here (device-side
                 // data); the CPU backend checks them, the GPU backends trust
                 // session-level clamping like Metal's store_kv dispatch.
                 // 8b: f16 KV stores into the same persistent region viewed as
                 // half (2 bytes/elem) — halves attention read bandwidth, same
                 // trade-off as Metal's store_kv dispatch.
-                let (sk, sv) = (self.ptr_of(in_bufs[0])?, self.ptr_of(in_bufs[1])?);
+                let (sk, sv) = (self.ptr_of_ref(in_bufs[0])?, self.ptr_of_ref(in_bufs[1])?);
                 let (dk, dv) = (self.ptr_of(k_id)?, self.ptr_of(v_id)?);
                 if self.kv_f16 {
                     self.state.store_kv_f16(sk, dk, nkt, nt, pos);
@@ -1117,7 +1149,7 @@ impl CudaBackend {
                     }
                 );
                 let bound_buf = if windowed { in_bufs[3] } else { in_bufs[2] };
-                let pos = self.positions_i32(bound_buf)?;
+                let pos = self.positions_i32(bound_buf.id)?;
                 // 8d: decode (nt == 1) uses split-K flash-decoding — the
                 // single-warp kernel leaves the GPU idle at nt == 1 (nsys:
                 // 48% of the 7B decode step at 2K ctx). Fixed grid +
@@ -1125,10 +1157,10 @@ impl CudaBackend {
                 // the partials scratch is size-stable (nh/hd constants).
                 if nt == 1 {
                     self.state.gqa_attn_split(
-                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
                         self.ptr_of(v_id)?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(out_buf)?,
                         pos,
                         windowed,
                         meta.n_head,
@@ -1148,10 +1180,10 @@ impl CudaBackend {
                 // greedy decode. Prefill (nt > 16) keeps the incumbent.
                 if nt <= 16 {
                     self.state.gqa_attn_split_batched(
-                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
                         self.ptr_of(v_id)?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(out_buf)?,
                         pos,
                         windowed,
                         meta.n_head,
@@ -1168,10 +1200,10 @@ impl CudaBackend {
                 // 8b: f16-KV variant reads half K/V (q/o stay f32)
                 if self.kv_f16 {
                     self.state.gqa_attn_f16kv(
-                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
                         self.ptr_of(v_id)?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(out_buf)?,
                         pos,
                         windowed,
                         meta.n_head,
@@ -1182,10 +1214,10 @@ impl CudaBackend {
                     );
                 } else {
                     self.state.gqa_attn_f32(
-                        self.ptr_of(in_bufs[0])?,
+                        self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
                         self.ptr_of(v_id)?,
-                        self.ptr_of(out_buf)?,
+                        self.ptr_of_ref(out_buf)?,
                         pos,
                         windowed,
                         meta.n_head,
@@ -1212,9 +1244,9 @@ impl CudaBackend {
         self.pool[id].bytes / 4
     }
 
-    fn copy_d2d(&self, src: usize, dst: usize) -> Result<(), String> {
-        let (s, d) = (self.ptr_of(src)?, self.ptr_of(dst)?);
-        let (sb, db) = (self.pool[src].bytes, self.pool[dst].bytes);
+    fn copy_d2d(&self, src: BufRef, dst: BufRef) -> Result<(), String> {
+        let (s, d) = (self.ptr_of_ref(src)?, self.ptr_of_ref(dst)?);
+        let (sb, db) = (src.len * 4, dst.len * 4);
         if sb != db {
             return Err(format!(
                 "cuda: device copy size mismatch src {sb} vs dst {db} bytes"
@@ -1408,8 +1440,8 @@ impl Backend for CudaBackend {
     fn execute_node(
         &mut self,
         node: &CNode,
-        in_bufs: &[usize],
-        out_buf: usize,
+        in_bufs: &[BufRef],
+        out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
         match self.execute_node_inner(node, in_bufs, out_buf, kv_pair) {
@@ -1723,7 +1755,7 @@ mod tests {
                 let reps = 2 * nc; // < 3 runs per (uid, range): no capture
                 let t0 = std::time::Instant::now();
                 for r in 0..reps {
-                    cb.execute_node(
+                    cb.exec_ids(
                         &graphs[r % nc].nodes[graphs[r % nc].outputs[0]],
                         &[xb],
                         ob,
@@ -1801,12 +1833,12 @@ mod tests {
         cb.write_host(x, &xs).unwrap();
         cb.write_host(y, &ys).unwrap();
 
-        cb.execute_node(&g.nodes[add], &[x, y], t1, None).unwrap();
-        cb.execute_node(&g.nodes[mul], &[t1, y], t2, None).unwrap();
+        cb.exec_ids(&g.nodes[add], &[x, y], t1, None).unwrap();
+        cb.exec_ids(&g.nodes[mul], &[t1, y], t2, None).unwrap();
         // SwiGLU consumes the RAW mul output, so it must run before the
         // in-place Silu overwrites t2 (alias path, graph rules §5).
-        cb.execute_node(&g.nodes[sw], &[t2, y], t3, None).unwrap();
-        cb.execute_node(&g.nodes[silu], &[t2], t2, None).unwrap();
+        cb.exec_ids(&g.nodes[sw], &[t2, y], t3, None).unwrap();
+        cb.exec_ids(&g.nodes[silu], &[t2], t2, None).unwrap();
 
         // Host reference through the same vec_ops the CPU backend uses.
         let mut r1 = vec![0f32; n];
@@ -1861,7 +1893,7 @@ mod tests {
             .collect();
         cb.write_host(xb, &xs).unwrap();
         let ob = cb.alloc_buffer(d * nt);
-        cb.execute_node(&g.nodes[rn], &[xb], ob, None).unwrap();
+        cb.exec_ids(&g.nodes[rn], &[xb], ob, None).unwrap();
 
         let qb = cb.alloc_buffer(hd * nh * nt2);
         let qs: Vec<f32> = (0..hd * nh * nt2)
@@ -1869,7 +1901,7 @@ mod tests {
             .collect();
         cb.write_host(qb, &qs).unwrap();
         let qo = cb.alloc_buffer(hd * nh * nt2);
-        cb.execute_node(&g.nodes[qn], &[qb], qo, None).unwrap();
+        cb.exec_ids(&g.nodes[qn], &[qb], qo, None).unwrap();
 
         let mut want = vec![0f32; d * nt];
         for t in 0..nt {
@@ -1968,8 +2000,8 @@ mod tests {
         let xb = cb.alloc_buffer(id_ * nt);
         cb.write_host(xb, &xs).unwrap();
         let (o8, o4) = (cb.alloc_buffer(od * nt), cb.alloc_buffer(od * nt));
-        cb.execute_node(&g.nodes[m8], &[xb], o8, None).unwrap();
-        cb.execute_node(&g.nodes[m4], &[xb], o4, None).unwrap();
+        cb.exec_ids(&g.nodes[m8], &[xb], o8, None).unwrap();
+        cb.exec_ids(&g.nodes[m4], &[xb], o4, None).unwrap();
 
         // References: dequantized weight rows × f32 activations + bias
         // (embed_tokens doubles as the row dequantizer for these types).
@@ -2208,16 +2240,16 @@ mod tests {
             cb.alloc_buffer(od * nt),
         );
         let of = cb.alloc_buffer(od * nt);
-        cb.execute_node(&g.nodes[m4], &[xb], o4, None).unwrap();
-        cb.execute_node(&g.nodes[m6], &[xb], o6, None).unwrap();
-        cb.execute_node(&g.nodes[m6p], &[xb], o6p, None).unwrap();
-        cb.execute_node(&g.nodes[mf], &[xb], of, None).unwrap();
+        cb.exec_ids(&g.nodes[m4], &[xb], o4, None).unwrap();
+        cb.exec_ids(&g.nodes[m6], &[xb], o6, None).unwrap();
+        cb.exec_ids(&g.nodes[m6p], &[xb], o6p, None).unwrap();
+        cb.exec_ids(&g.nodes[mf], &[xb], of, None).unwrap();
         let mut xso = xs.clone();
         xso.resize(id_o * nt, 0.25f32); // extend for the odd-id input
         let xob = cb.alloc_buffer(id_o * nt);
         cb.write_host(xob, &xso).unwrap();
         let ofo = cb.alloc_buffer(od_o * nt);
-        cb.execute_node(&g.nodes[mfo], &[xob], ofo, None).unwrap();
+        cb.exec_ids(&g.nodes[mfo], &[xob], ofo, None).unwrap();
 
         for (name, o, dq) in [
             ("q4_k matmul", o4, &w4dq),
@@ -2423,7 +2455,7 @@ mod tests {
         let xb = cb.alloc_buffer(id_ * nt);
         cb.write_host(xb, &xs).unwrap();
         let ob = cb.alloc_buffer(od * nt);
-        cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+        cb.exec_ids(&g.nodes[m], &[xb], ob, None).unwrap();
         let got = cb.copy_to_host(ob).unwrap();
 
         let mut want = vec![0f32; od * nt];
@@ -2469,7 +2501,7 @@ mod tests {
             let xb2 = cb.alloc_buffer(id2);
             cb.write_host(xb2, &xs).unwrap();
             let ob2 = cb.alloc_buffer(od2);
-            cb.execute_node(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
+            cb.exec_ids(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
             let got2 = cb.copy_to_host(ob2).unwrap();
 
             // CPU reference over the real bytes: dequant (same map as the
@@ -2765,7 +2797,7 @@ mod tests {
             let ob2 = cb.alloc_buffer(od2);
             if via_graph {
                 // shape above the od*id gate — dispatch selects the MMVQ
-                cb.execute_node(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
+                cb.exec_ids(&g2.nodes[m2], &[xb2], ob2, None).unwrap();
             } else {
                 // below the gate — runtime dispatch would keep the f32
                 // kernel; call the decode path directly for kernel parity
@@ -3149,9 +3181,9 @@ mod tests {
         cb.write_host(pb, &i32bits(&[0, 2])).unwrap();
         cb.write_host(sb, &i32bits(&[0, 2, 1, 3])).unwrap(); // lo block, hi block
 
-        cb.execute_node(&g.nodes[st], &[kb, vb, pb], kreg, Some((kreg, vreg)))
+        cb.exec_ids(&g.nodes[st], &[kb, vb, pb], kreg, Some((kreg, vreg)))
             .unwrap();
-        cb.execute_node(&g.nodes[at], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
+        cb.exec_ids(&g.nodes[at], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
             .unwrap();
         // `copy_to_host`, not the trait's `read_host`: CUDA cannot return a
         // borrowed slice of device memory, so its `read_host` is `None` by
@@ -3278,9 +3310,9 @@ mod tests {
                 .iter()
                 .position(|n| matches!(n.op, crate::graph::ops::Op::Attn { .. }))
                 .expect("attn node");
-            cb.execute_node(&g.nodes[sti], &[kb, vb, pb], kreg, Some((kreg, vreg)))
+            cb.exec_ids(&g.nodes[sti], &[kb, vb, pb], kreg, Some((kreg, vreg)))
                 .unwrap();
-            cb.execute_node(&g.nodes[ati], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
+            cb.exec_ids(&g.nodes[ati], &[qb, kreg, pb, sb], ob, Some((kreg, vreg)))
                 .unwrap();
             cb.copy_to_host(ob).unwrap()
         };
@@ -3533,7 +3565,7 @@ mod tests {
                 let xb = cb.alloc_buffer(id_ * nt);
                 cb.write_host(xb, &xs).unwrap();
                 let ob = cb.alloc_buffer(od * nt);
-                cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+                cb.exec_ids(&g.nodes[m], &[xb], ob, None).unwrap();
                 let got = cb.copy_to_host(ob).unwrap();
 
                 // reference: nt separate nt = 1 forwards over the same weights
@@ -3547,7 +3579,7 @@ mod tests {
                     let xb1 = cb.alloc_buffer(id_);
                     cb.write_host(xb1, &xs[t * id_..(t + 1) * id_]).unwrap();
                     let ob1 = cb.alloc_buffer(od);
-                    cb.execute_node(&g1.nodes[m1], &[xb1], ob1, None).unwrap();
+                    cb.exec_ids(&g1.nodes[m1], &[xb1], ob1, None).unwrap();
                     refs.push(cb.copy_to_host(ob1).unwrap());
                 }
 
@@ -3587,7 +3619,7 @@ mod tests {
                 let xb = cb.alloc_buffer(id_ * nt);
                 cb.write_host(xb, &xs).unwrap();
                 let ob = cb.alloc_buffer(od * nt);
-                cb.execute_node(&g.nodes[m], &[xb], ob, None).unwrap();
+                cb.exec_ids(&g.nodes[m], &[xb], ob, None).unwrap();
                 let got = cb.copy_to_host(ob).unwrap();
 
                 // host reference: q4_0 dequant (val = (nib - 8) * d) dotted with
@@ -3796,7 +3828,7 @@ mod tests {
             );
             b.output(gu);
             let g = b.build();
-            cb.execute_node(&g.nodes[gu], &[xb], ogu, None).unwrap();
+            cb.exec_ids(&g.nodes[gu], &[xb], ogu, None).unwrap();
 
             // host reference: silu(gate·x) × (up·x)
             let got = cb.copy_to_host(ogu).unwrap();
@@ -4015,7 +4047,7 @@ mod tests {
         let me_node = mb.embedding(mi, &mt);
         mb.output(me_node);
         let mg = mb.build();
-        cb.execute_node(&mg.nodes[me_node], &[midb], mout, None)
+        cb.exec_ids(&mg.nodes[me_node], &[midb], mout, None)
             .unwrap();
         {
             let got = cb.copy_to_host(mout).unwrap();
@@ -4045,12 +4077,11 @@ mod tests {
         let mut outs = Vec::new();
         for node in [e_f32, e_q8, e_q40, e_q50, e_q4k, e_q6k, e_q6kp] {
             let out = cb.alloc_buffer(n_embd * nt);
-            cb.execute_node(&g.nodes[node], &[idsb], out, None).unwrap();
+            cb.exec_ids(&g.nodes[node], &[idsb], out, None).unwrap();
             outs.push(out);
         }
         let grb = cb.alloc_buffer(n_embd * nt);
-        cb.execute_node(&g.nodes[gr], &[xb, idsb], grb, None)
-            .unwrap();
+        cb.exec_ids(&g.nodes[gr], &[xb, idsb], grb, None).unwrap();
 
         // ── references ──
         let names = ["f32", "q8_0", "q4_0", "q5_0", "q4_k", "q6_k", "q6_k padded"];
@@ -4161,16 +4192,16 @@ mod tests {
         cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
         cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-        cb.execute_node(
+        cb.exec_ids(
             &g.nodes[store],
             &[xb_k, xb_v, xb_p],
             kreg,
             Some((kreg, vreg)),
         )
         .unwrap();
-        cb.execute_node(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
+        cb.exec_ids(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
             .unwrap();
-        cb.execute_node(
+        cb.exec_ids(
             &g.nodes[at],
             &[ob_qr, kreg, xb_p],
             ob_at,
@@ -4305,16 +4336,16 @@ mod tests {
         cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
         cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-        cb.execute_node(
+        cb.exec_ids(
             &g.nodes[store],
             &[xb_k, xb_v, xb_p],
             kreg,
             Some((kreg, vreg)),
         )
         .unwrap();
-        cb.execute_node(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
+        cb.exec_ids(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
             .unwrap();
-        cb.execute_node(
+        cb.exec_ids(
             &g.nodes[at],
             &[ob_qr, kreg, xb_p],
             ob_at,
@@ -5087,14 +5118,14 @@ mod tests {
         cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
         cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-        cb.execute_node(
+        cb.exec_ids(
             &g.nodes[_store],
             &[xb_k, xb_v, xb_p],
             kreg,
             Some((kreg, vreg)),
         )
         .unwrap();
-        cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+        cb.exec_ids(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
             .unwrap();
 
         let mut kfull = vec![0f32; nkt * n_ctx];
@@ -5701,14 +5732,14 @@ mod tests {
                     cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
                     cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-                    cb.execute_node(
+                    cb.exec_ids(
                         &g.nodes[store],
                         &[xb_k, xb_v, xb_p],
                         kreg,
                         Some((kreg, vreg)),
                     )
                     .unwrap();
-                    cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+                    cb.exec_ids(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
                         .unwrap();
 
                     let mut kfull = vec![0f32; nkt * n_ctx];
@@ -5812,14 +5843,14 @@ mod tests {
             cb.write_host(kreg, &vec![0f32; nkt * n_ctx]).unwrap();
             cb.write_host(vreg, &vec![0f32; nkt * n_ctx]).unwrap();
 
-            cb.execute_node(
+            cb.exec_ids(
                 &g.nodes[store],
                 &[xb_k, xb_v, xb_p],
                 kreg,
                 Some((kreg, vreg)),
             )
             .unwrap();
-            cb.execute_node(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+            cb.exec_ids(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
                 .unwrap();
 
             let mut kfull = vec![0f32; nkt * n_ctx];

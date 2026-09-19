@@ -486,10 +486,7 @@ mod tests {
     use crate::graph::Backend;
 
     fn buf(id: usize) -> BufRef {
-        BufRef {
-            backend: Backend::CPU,
-            id,
-        }
+        BufRef::own(Backend::CPU, id, usize::MAX)
     }
 
     fn cache(n_ctx: usize) -> KvCache {

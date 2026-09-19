@@ -13,7 +13,7 @@ use crate::vec_ops::RopeStyle;
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
-use super::{CNode, DType};
+use super::{BufRef, CNode, DType};
 
 /// CPU buffer pool + weight registry.
 pub struct CpuBackend {
@@ -54,6 +54,13 @@ impl CpuBackend {
 
     /// Pool size (for tests).
     #[allow(dead_code)]
+    /// D1: the `f32` window a [`BufRef`] names — the whole buffer for an owning
+    /// node (offset 0, len = its element count), the parent's bytes at the
+    /// window for a view.
+    fn window(&self, r: BufRef) -> &[f32] {
+        &self.buffers[r.id][r.offset..r.offset + r.len]
+    }
+
     pub fn pool_len(&self) -> usize {
         self.buffers.len()
     }
@@ -140,8 +147,8 @@ impl Backend for CpuBackend {
     fn execute_node(
         &mut self,
         node: &CNode,
-        in_bufs: &[usize],
-        out_buf: usize,
+        in_bufs: &[BufRef],
+        out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
         // KV store needs mutable access to both K and V persistent regions
@@ -150,18 +157,19 @@ impl Backend for CpuBackend {
         if let Op::KvcacheStore { layer } = &node.op {
             let (k_id, v_id) =
                 kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
-            if k_id != out_buf {
+            if k_id != out_buf.id {
                 return Err("KV store out buffer must be the K region".into());
             }
             let nkt = node.out_shape[0];
             let n_ctx = node.out_shape[1];
-            let nt = self.buffers[in_bufs[0]].len() / nkt;
-            let pos: Vec<usize> = self.buffers[in_bufs[2]]
+            let nt = in_bufs[0].len / nkt;
+            let pos: Vec<usize> = self
+                .window(in_bufs[2])
                 .iter()
                 .map(|b| b.to_bits() as usize)
                 .collect();
-            let k_src = self.buffers[in_bufs[0]].clone();
-            let v_src = self.buffers[in_bufs[1]].clone();
+            let k_src = self.window(in_bufs[0]).to_vec();
+            let v_src = self.window(in_bufs[1]).to_vec();
             // k region = out_buf, v region = sibling; both in this pool.
             // Disjoint mutable access via split_at_mut.
             let (k_dst, v_dst): (&mut [f32], &mut [f32]) = if v_id < k_id {
@@ -187,23 +195,28 @@ impl Backend for CpuBackend {
         // the same physical buffer. Snapshot aliased inputs, then carve the
         // output region out of the pool with split_at_mut so the remaining
         // inputs can be borrowed immutably alongside it.
+        // D1: every reference is a *window* (offset + len) of a pool buffer, so
+        // an owning node's `out`/`ins` are exactly what they were before views
+        // existed (offset 0, len = its element count) and a view's are the
+        // parent's bytes at the window.
         let mut aliased: Vec<Vec<f32>> = Vec::new();
         let mut alias_of: Vec<Option<usize>> = in_bufs.iter().map(|_| None).collect();
         for (k, &i) in in_bufs.iter().enumerate() {
-            if i == out_buf {
+            if i.id == out_buf.id {
                 alias_of[k] = Some(aliased.len());
-                aliased.push(self.buffers[out_buf].clone());
+                aliased.push(self.buffers[out_buf.id].clone());
             }
         }
-        let (before, rest) = self.buffers.split_at_mut(out_buf);
+        let (before, rest) = self.buffers.split_at_mut(out_buf.id);
         let (out0, after) = rest.split_at_mut(1);
-        let out = &mut out0[0];
+        let out = &mut out0[0][out_buf.offset..out_buf.offset + out_buf.len];
         let mut ins: Vec<&[f32]> = Vec::with_capacity(in_bufs.len());
         for (k, &i) in in_bufs.iter().enumerate() {
+            let (off, len) = (i.offset, i.len);
             match alias_of[k] {
-                Some(ai) => ins.push(&aliased[ai]),
-                None if i < out_buf => ins.push(&before[i]),
-                _ => ins.push(&after[i - out_buf - 1]),
+                Some(ai) => ins.push(&aliased[ai][off..off + len]),
+                None if i.id < out_buf.id => ins.push(&before[i.id][off..off + len]),
+                _ => ins.push(&after[i.id - out_buf.id - 1][off..off + len]),
             }
         }
 
@@ -420,15 +433,15 @@ impl Backend for CpuBackend {
                 // K and V are separate persistent regions per layer
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
-                let k_slice: &[f32] = if k_id < out_buf {
+                let k_slice: &[f32] = if k_id < out_buf.id {
                     &before[k_id]
                 } else {
-                    &after[k_id - out_buf - 1]
+                    &after[k_id - out_buf.id - 1]
                 };
-                let v_slice: &[f32] = if v_id < out_buf {
+                let v_slice: &[f32] = if v_id < out_buf.id {
                     &before[v_id]
                 } else {
-                    &after[v_id - out_buf - 1]
+                    &after[v_id - out_buf.id - 1]
                 };
                 let n_ctx = k_slice.len() / nkt;
                 // E1: the allowed cells are an explicit input (`attn_span`), not

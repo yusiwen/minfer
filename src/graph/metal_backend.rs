@@ -21,7 +21,7 @@ use objc2_metal::MTLBuffer;
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
-use super::{CNode, DType};
+use super::{BufRef, CNode, DType};
 
 // ─── op profiler (MINFER_OP_PROFILE=1, debug aid) ────────────────────
 // Host-side encode time per op label (accumulated across the process) plus
@@ -274,7 +274,15 @@ impl Backend for MetalBackend {
             Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
             Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
             Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
-            Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
+            // D1: Metal's kernels take a buffer and a length, with no element
+            // offset, so it can only express an *exact* view (offset 0 == the
+            // parent's own buffer, which is what the allocator maps). An offset
+            // window would read the wrong bytes, so it is refused here rather
+            // than silently mis-computed — the allocator backstops the partial
+            // case, which `supports_op` cannot see (the parent's length is not
+            // in the op). G5 is where Metal would learn offsets.
+            Op::View { offset, .. } => *offset == 0,
+            Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
             // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
             // Metal the graph builder never emits it (qkv_epilogue_ok = false
@@ -317,8 +325,8 @@ impl Backend for MetalBackend {
     fn execute_node(
         &mut self,
         node: &CNode,
-        in_bufs: &[usize],
-        out_buf: usize,
+        in_bufs: &[BufRef],
+        out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
         let cb = self.cb();
@@ -333,28 +341,28 @@ impl Backend for MetalBackend {
         match &node.op {
             Op::Input => Ok(()),
             Op::Silu => {
-                if in_bufs[0] != out_buf {
-                    self.copy_in(out_buf, in_bufs[0]);
+                if in_bufs[0].id != out_buf.id {
+                    self.copy_in(out_buf.id, in_bufs[0].id);
                 }
-                let n = self.pool[out_buf].length() as usize / 4;
-                cb.silu_f32(self.buf(out_buf), n);
+                let n = self.pool[out_buf.id].length() as usize / 4;
+                cb.silu_f32(self.buf(out_buf.id), n);
                 Ok(())
             }
             Op::Add => {
                 cb.add_f32(
-                    self.buf(in_bufs[0]),
-                    self.buf(in_bufs[1]),
-                    self.buf(out_buf),
-                    self.pool[out_buf].length() as usize / 4,
+                    self.buf(in_bufs[0].id),
+                    self.buf(in_bufs[1].id),
+                    self.buf(out_buf.id),
+                    self.pool[out_buf.id].length() as usize / 4,
                 );
                 Ok(())
             }
             Op::Mul => {
                 cb.mul_f32(
-                    self.buf(in_bufs[0]),
-                    self.buf(in_bufs[1]),
-                    self.buf(out_buf),
-                    self.pool[out_buf].length() as usize / 4,
+                    self.buf(in_bufs[0].id),
+                    self.buf(in_bufs[1].id),
+                    self.buf(out_buf.id),
+                    self.pool[out_buf.id].length() as usize / 4,
                 );
                 Ok(())
             }
@@ -373,10 +381,10 @@ impl Backend for MetalBackend {
                     Some((wb, w_off)) => {
                         if crate::metal::rms_norm_256_enabled() {
                             cb.rms_norm_256(
-                                self.buf(in_bufs[0]),
+                                self.buf(in_bufs[0].id),
                                 Some(&wb),
                                 w_off,
-                                self.buf(out_buf),
+                                self.buf(out_buf.id),
                                 d,
                                 n,
                                 *eps,
@@ -385,10 +393,10 @@ impl Backend for MetalBackend {
                             );
                         } else {
                             cb.rms_norm(
-                                self.buf(in_bufs[0]),
+                                self.buf(in_bufs[0].id),
                                 Some(&wb),
                                 w_off,
-                                self.buf(out_buf),
+                                self.buf(out_buf.id),
                                 d,
                                 n,
                                 *eps,
@@ -398,10 +406,10 @@ impl Backend for MetalBackend {
                         }
                     }
                     None => cb.rms_norm(
-                        self.buf(in_bufs[0]),
+                        self.buf(in_bufs[0].id),
                         None,
                         0,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         d,
                         n,
                         *eps,
@@ -422,16 +430,16 @@ impl Backend for MetalBackend {
                     _ => None,
                 };
                 let d = *hd;
-                let n = (self.pool[out_buf].length() as usize / 4) / d;
+                let n = (self.pool[out_buf.id].length() as usize / 4) / d;
                 let _ = nh;
                 match w {
                     Some((wb, w_off)) => {
                         if crate::metal::rms_norm_256_enabled() {
                             cb.rms_norm_256(
-                                self.buf(in_bufs[0]),
+                                self.buf(in_bufs[0].id),
                                 Some(&wb),
                                 w_off,
-                                self.buf(out_buf),
+                                self.buf(out_buf.id),
                                 d,
                                 n,
                                 *eps,
@@ -440,10 +448,10 @@ impl Backend for MetalBackend {
                             );
                         } else {
                             cb.rms_norm(
-                                self.buf(in_bufs[0]),
+                                self.buf(in_bufs[0].id),
                                 Some(&wb),
                                 w_off,
-                                self.buf(out_buf),
+                                self.buf(out_buf.id),
                                 d,
                                 n,
                                 *eps,
@@ -453,10 +461,10 @@ impl Backend for MetalBackend {
                         }
                     }
                     None => cb.rms_norm(
-                        self.buf(in_bufs[0]),
+                        self.buf(in_bufs[0].id),
                         None,
                         0,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         d,
                         n,
                         *eps,
@@ -481,9 +489,9 @@ impl Backend for MetalBackend {
                     &wb,
                     w_off,
                     meta.weight_ttype,
-                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[0].id),
                     0,
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     meta.out_dim,
                     meta.in_dim,
                     nt,
@@ -493,7 +501,7 @@ impl Backend for MetalBackend {
                         .state
                         .weight_buf(bname)
                         .ok_or_else(|| format!("bias '{}' not on GPU", bname))?;
-                    cb.add_bias_f32(self.buf(out_buf), &bb, b_off, meta.out_dim, nt, 0);
+                    cb.add_bias_f32(self.buf(out_buf.id), &bb, b_off, meta.out_dim, nt, 0);
                 }
                 Ok(())
             }
@@ -509,8 +517,8 @@ impl Backend for MetalBackend {
                         cb.embed_tokens_gpu(
                             &wb,
                             w_off,
-                            self.buf(in_bufs[0]),
-                            self.buf(out_buf),
+                            self.buf(in_bufs[0].id),
+                            self.buf(out_buf.id),
                             ne,
                             nt,
                             m.weight_ttype,
@@ -522,9 +530,9 @@ impl Backend for MetalBackend {
                         let ne = node.out_shape[0];
                         let nt = node.out_shape[1];
                         cb.get_rows_f32(
-                            self.buf(in_bufs[0]),
-                            self.buf(in_bufs[1]),
-                            self.buf(out_buf),
+                            self.buf(in_bufs[0].id),
+                            self.buf(in_bufs[1].id),
+                            self.buf(out_buf.id),
                             ne,
                             nt,
                         );
@@ -538,29 +546,29 @@ impl Backend for MetalBackend {
                     NodeMeta::Rope(m) => m,
                     other => return Err(format!("rope node missing RoPEMeta: {other:?}")),
                 };
-                if in_bufs[0] != out_buf {
-                    self.copy_in(out_buf, in_bufs[0]);
+                if in_bufs[0].id != out_buf.id {
+                    self.copy_in(out_buf.id, in_bufs[0].id);
                 }
                 let nt = node.out_shape[1];
                 cb.rope_f32(
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     meta.n_head,
                     meta.hd,
                     nt,
                     meta.freq_base,
                     meta.freq_scale,
-                    self.buf(in_bufs[1]),
+                    self.buf(in_bufs[1].id),
                     *style as i32,
                     0,
                 );
                 Ok(())
             }
             Op::SwiGLU => {
-                let n = self.pool[out_buf].length() as usize / 4;
+                let n = self.pool[out_buf.id].length() as usize / 4;
                 cb.swiglu_f32(
-                    self.buf(in_bufs[0]),
-                    self.buf(in_bufs[1]),
-                    self.buf(out_buf),
+                    self.buf(in_bufs[0].id),
+                    self.buf(in_bufs[1].id),
+                    self.buf(out_buf.id),
                     n,
                 );
                 Ok(())
@@ -569,21 +577,21 @@ impl Backend for MetalBackend {
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 let nkt = node.out_shape[0];
-                let nt = (self.pool[in_bufs[0]].length() as usize / 4) / nkt;
+                let nt = (self.pool[in_bufs[0].id].length() as usize / 4) / nkt;
                 cb.store_kv(
-                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[0].id),
                     self.buf(k_id),
                     nkt,
                     nt,
-                    self.buf(in_bufs[2]),
+                    self.buf(in_bufs[2].id),
                     0,
                 );
                 cb.store_kv(
-                    self.buf(in_bufs[1]),
+                    self.buf(in_bufs[1].id),
                     self.buf(v_id),
                     nkt,
                     nt,
-                    self.buf(in_bufs[2]),
+                    self.buf(in_bufs[2].id),
                     0,
                 );
                 Ok(())
@@ -616,9 +624,9 @@ impl Backend for MetalBackend {
                 // anything else falls back to the classic kernel.
                 let k = self.buf(k_id);
                 let v = self.buf(v_id);
-                let q = self.buf(in_bufs[0]);
-                let o = self.buf(out_buf);
-                let positions = self.buf(in_bufs[2]);
+                let q = self.buf(in_bufs[0].id);
+                let o = self.buf(out_buf.id);
+                let positions = self.buf(in_bufs[2].id);
                 if nt == 1 {
                     if crate::metal::flash_attn_enabled(meta.hd) {
                         let chunks = self.attention_chunks(positions);
@@ -732,7 +740,7 @@ impl Backend for MetalBackend {
             }
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => {
                 // D1: the view is the parent's buffer; nothing to copy.
-                if in_bufs[0] != out_buf {
+                if in_bufs[0].id != out_buf.id {
                     return Err(format!(
                         "metal: {} is a view but its output buffer is not its source's (D1 aliasing \
                          missing); refusing to copy silently",
@@ -758,9 +766,9 @@ impl Backend for MetalBackend {
                     &wb,
                     w_off,
                     meta.weight_ttype,
-                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[0].id),
                     0,
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     od_total,
                     meta.in_dim,
                     nt,
@@ -769,18 +777,18 @@ impl Backend for MetalBackend {
                 //    (llama ggml_swiglu_split); result written back to gate rows
                 let n = nt * meta.nf;
                 cb.swiglu_f32_off(
-                    self.buf(out_buf),
-                    self.buf(out_buf),
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
+                    self.buf(out_buf.id),
+                    self.buf(out_buf.id),
                     n,
                     n,
                 );
                 if std::env::var("MINFER_FFNDEBUG").is_ok() {
                     self.submit_pending();
-                    let nb = (self.pool[out_buf].length() as usize) / 4;
+                    let nb = (self.pool[out_buf.id].length() as usize) / 4;
                     let ob = unsafe {
                         std::slice::from_raw_parts(
-                            self.buf(out_buf).contents().as_ptr() as *const f32,
+                            self.buf(out_buf.id).contents().as_ptr() as *const f32,
                             nb,
                         )
                     };
@@ -809,9 +817,9 @@ impl Backend for MetalBackend {
                     &wb,
                     w_off,
                     meta.weight_ttype,
-                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[0].id),
                     0,
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     od_total,
                     meta.in_dim,
                     nt,
@@ -836,10 +844,10 @@ impl Backend for MetalBackend {
                 let (bk_b, bk_o) = bk;
                 let (bv_b, bv_o) = bv;
                 let pos = {
-                    let n = (self.buf(in_bufs[1]).length() as usize) / 4;
+                    let n = (self.buf(in_bufs[1].id).length() as usize) / 4;
                     let p = unsafe {
                         std::slice::from_raw_parts(
-                            self.buf(in_bufs[1]).contents().as_ptr() as *const u32,
+                            self.buf(in_bufs[1].id).contents().as_ptr() as *const u32,
                             n,
                         )
                     };
@@ -847,7 +855,7 @@ impl Backend for MetalBackend {
                 };
 
                 cb.attn_bias_rope_store(
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     &bq_b,
                     bq_o,
                     &bk_b,
@@ -900,9 +908,9 @@ impl Backend for MetalBackend {
                     &wb,
                     w_off,
                     meta.weight_ttype,
-                    self.buf(in_bufs[0]),
+                    self.buf(in_bufs[0].id),
                     0,
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     od_total,
                     meta.in_dim,
                     nt,
@@ -919,10 +927,10 @@ impl Backend for MetalBackend {
                 let n_k = meta.nk;
                 if crate::metal::rms_norm_256_enabled() {
                     cb.rms_norm_256(
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         Some(&qn_b),
                         qn_o,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         meta.hd,
                         n_q,
                         meta.eps,
@@ -930,10 +938,10 @@ impl Backend for MetalBackend {
                         off_q,
                     );
                     cb.rms_norm_256(
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         Some(&kn_b),
                         kn_o,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         meta.hd,
                         n_k,
                         meta.eps,
@@ -942,10 +950,10 @@ impl Backend for MetalBackend {
                     );
                 } else {
                     cb.rms_norm(
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         Some(&qn_b),
                         qn_o,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         meta.hd,
                         n_q,
                         meta.eps,
@@ -953,10 +961,10 @@ impl Backend for MetalBackend {
                         off_q,
                     );
                     cb.rms_norm(
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         Some(&kn_b),
                         kn_o,
-                        self.buf(out_buf),
+                        self.buf(out_buf.id),
                         meta.hd,
                         n_k,
                         meta.eps,
@@ -966,17 +974,17 @@ impl Backend for MetalBackend {
                 }
                 // 3) no-bias rope + KV store (q in place, k rope+store, v store)
                 let pos = {
-                    let n = (self.buf(in_bufs[1]).length() as usize) / 4;
+                    let n = (self.buf(in_bufs[1].id).length() as usize) / 4;
                     let p = unsafe {
                         std::slice::from_raw_parts(
-                            self.buf(in_bufs[1]).contents().as_ptr() as *const u32,
+                            self.buf(in_bufs[1].id).contents().as_ptr() as *const u32,
                             n,
                         )
                     };
                     p[0] as i32
                 };
                 cb.attn_rope_store(
-                    self.buf(out_buf),
+                    self.buf(out_buf.id),
                     self.buf(k_id),
                     self.buf(v_id),
                     meta.nqt,
