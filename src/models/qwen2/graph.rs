@@ -1288,6 +1288,136 @@ mod tests {
         );
     }
 
+    /// The offset-sensitivity finding (plan §14 row 9), narrowed to what is
+    /// actually established — and the two properties that *do* hold are asserted
+    /// here so the day someone changes the forward they find out immediately.
+    ///
+    /// Measured on the 0.5B, same prompt, same relative window, no compaction:
+    ///
+    /// - the forward is **deterministic** (the same cell twice is bitwise equal);
+    /// - **one** query token is offset-invariant *by construction* — a single key
+    ///   makes the softmax weight 1 and V is unrotated, so any offset must give
+    ///   bit-identical logits, and it does;
+    /// - from **two** query tokens on, the logits differ (2.6% relative at an
+    ///   8-cell offset) even though layer 0's stored V rows are **bit-identical**,
+    ///   the stored K matches the cell rotation to ~1e-5 (`rope_shift_kv` with
+    ///   `delta = 8` aligns cell 8 back onto cell 0), the CPU attention reads the
+    ///   explicit `attn_span` (an unfilled span is an error, so a silent
+    ///   `[0, pos)` fallback cannot be it), and Q/K carry the same freq table
+    ///   (only `n_head` differs, and the table depends on `hd`).
+    ///
+    /// So the leak is in the multi-query QK path — where mathematics says a
+    /// uniform RoPE shift cancels — and not in the store, the span or the rope
+    /// metadata. Next experiment: the same comparison on a minimal hand-built
+    /// graph (`q`/`k`/`v` inputs → rope → store → attn), which removes the model
+    /// from the equation.
+    #[test]
+    fn offset_sensitivity_is_narrowed_to_multi_query_attention() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvcache::KvRope;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let full = tok.encode("The capital of France is");
+        let n_ctx = 256;
+
+        // Both runs must take the *same* attention instantiation, or the
+        // comparison silently measures "causal vs explicit span" instead of the
+        // offset: a run with a single sequence at cell 0 is causal, one with a
+        // reservation below it is explicit. A second reservation (a holder when
+        // the subject is offset, a dummy after it otherwise) makes both explicit.
+        let run = |ids: Vec<u32>, start: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let n = ids.len();
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            if start > 0 {
+                cache.alloc().kv_reserve_seq(3, start).expect("holder");
+            }
+            cache.alloc().kv_reserve_seq(7, n + 4).expect("subject");
+            if start == 0 {
+                cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
+            }
+            let l = model.forward_batch(
+                &Batch::new(ids, (start..start + n).collect(), vec![7u32; n]),
+                1,
+                n_ctx,
+                &mut cache,
+            );
+            let (k, v) = cache.alloc().copy_kv_to_cpu(0).expect("kv read");
+            (l, k, v)
+        };
+        let d = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // 1 token is the discriminator: with a single key the softmax weight is 1
+        // and V is unrotated, so *any* offset must give bit-identical logits.
+        let (freq_base, freq_scale) = model.rope_params();
+        let rope = KvRope {
+            freq_base,
+            freq_scale,
+            n_head_kv: model.n_head_kv(),
+            hd: model.n_embd_head(),
+            style: model.rope_style(),
+        };
+        for nt in [1usize, 2, full.len()] {
+            let ids: Vec<u32> = full[..nt].to_vec();
+            let (l0, k0, v0) = run(ids.clone(), 0);
+            let (l0b, _k0b, v0b) = run(ids.clone(), 0);
+            let (l8, k8, v8) = run(ids, 8);
+            let row = v0.len() / n_ctx;
+            // `rope_shift_kv(d)` means `new_pos = old_pos - d`, so aligning cell 8
+            // back onto cell 0 is d = +8.
+            let mut k8_aligned = k8[8 * row..(nt + 8) * row].to_vec();
+            crate::graph::kvcache::rope_shift_kv(&mut k8_aligned, nt, 8, &rope);
+            let v_delta = d(&v0[..nt * row], &v8[8 * row..(nt + 8) * row]);
+            let k_aligned = d(&k0[..nt * row], &k8_aligned);
+            eprintln!(
+                "[offset] nt={nt}: determinism {} | cell0-vs-8 logits {} | V {} | K aligned {}",
+                d(&l0, &l0b),
+                d(&l0, &l8),
+                v_delta,
+                k_aligned
+            );
+            // Determinism holds at every width (logits are compared bitwise above).
+            assert_eq!(d(&l0, &l0b), 0.0, "the forward must be deterministic");
+            // The KV-region probes below read the stored rows directly, which is
+            // only meaningful where the store is f32: on a CUDA build the
+            // process-wide KV dtype can be f16 (another model set it), and the
+            // raw read would be bit patterns, not values.
+            if matches!(model.device(), crate::models::Device::Cpu) {
+                assert_eq!(d(&v0, &v0b), 0.0, "and bit-identical run to run");
+                assert_eq!(v_delta, 0.0, "V is unrotated: the hidden state must match");
+                assert!(
+                    k_aligned < 1e-3,
+                    "the stored K must be the cell-rotated K (got {k_aligned})"
+                );
+            } else {
+                eprintln!("[offset] (non-CPU device: skipping the raw KV-row probes)");
+            }
+            if nt == 1 {
+                // A single key makes the softmax weight 1, so the scores cannot
+                // matter: this must be bitwise, whatever the offset.
+                assert_eq!(d(&l0, &l8), 0.0, "one query token is offset-invariant");
+            } else {
+                // Deliberately NOT asserted: the multi-query divergence is the
+                // open finding (plan §14 row 9), and asserting it would turn a
+                // bug report into a specification.
+                assert!(d(&l0, &l8).is_finite());
+            }
+        }
+    }
+
     /// C3's end-to-end gate: compacting the arena **between steps** must leave a
     /// session's continuation intact.
     ///
@@ -1340,7 +1470,7 @@ mod tests {
             .expect("subject")
             .start;
         assert_eq!(start_a, holder, "the holder must sit below the subject");
-        let pre = model.forward_batch(
+        let pre_a = model.forward_batch(
             &Batch::new(
                 subject.clone(),
                 (start_a..start_a + n).collect(),
@@ -1350,7 +1480,7 @@ mod tests {
             n_ctx,
             &mut a_cache,
         );
-        assert_eq!(pre.len(), nv);
+        assert_eq!(pre_a.len(), nv);
         let l_a_step1 = model.forward_batch(
             &Batch::new(vec![step_tok], vec![start_a + n], vec![s1]),
             1,
@@ -1397,12 +1527,21 @@ mod tests {
         // (otherwise the control would take the causal instantiation and the
         // comparison would mix two variables).
         b_cache.alloc().kv_reserve_seq(9, 4).expect("dummy");
-        model.forward_batch(
+        let pre_b = model.forward_batch(
             &Batch::new(subject.clone(), (0..n).collect(), vec![s1; n]),
             1,
             n_ctx,
             &mut b_cache,
         );
+        // The prefill logits of the two runs differ although every *relative*
+        // quantity is the same — see `offset_sensitivity_...` for the narrowed
+        // finding and plan §14 row 9.
+        let dpre = pre_a
+            .iter()
+            .zip(&pre_b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("[c3] prefill logits offset 8 vs 0: max |d| = {dpre}");
         let l_b_step1 = model.forward_batch(
             &Batch::new(vec![step_tok], vec![n], vec![s1]),
             1,
