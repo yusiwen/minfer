@@ -725,6 +725,7 @@ mod tests {
         n_slots: usize,
         n_ctx: usize,
         max_tokens: i64,
+        stagger: bool,
     ) -> (Vec<Reply>, f64) {
         let mut engine = BatchEngine::new(model, n_slots, n_ctx).expect("engine");
         let mut out: Vec<Option<Reply>> = (0..prompts.len()).map(|_| None).collect();
@@ -746,11 +747,19 @@ mod tests {
         let t0 = Instant::now();
         // Admit, then step until every request has finished.
         while !queue.is_empty() || engine.busy() {
-            while !queue.is_empty() && engine.idle_slots() > 0 {
+            // `stagger` reproduces the **server's** admission pattern: requests
+            // arrive while others decode, so `serve_loop` admits one per step and
+            // the step sequence mixes widths (a 1-sequence step, then wider
+            // ones). Without it, everything is admitted before the first tick and
+            // every step has the same width — which is what this helper always
+            // did, and why the blocker below hid from it.
+            let mut admit = if stagger { 1 } else { engine.idle_slots() };
+            while !queue.is_empty() && engine.idle_slots() > 0 && admit > 0 {
                 let (i, job) = queue.remove(0);
                 engine
                     .submit(model, tok, job)
                     .unwrap_or_else(|e| panic!("submit request {i}: {}", e.message));
+                admit -= 1;
             }
             engine.tick(model, tok).expect("tick");
             // Drain events; a finished request is reported by `Finish`, and its
@@ -877,7 +886,8 @@ mod tests {
         let n_slots = 4;
         let max_tokens = 16;
 
-        let (batched, t_batch) = run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens);
+        let (batched, t_batch) =
+            run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens, false);
         let (serial, t_serial) = run_serial(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens);
 
         // Byte-equality is a **CPU** property: both sides drive the same engine
@@ -923,6 +933,49 @@ mod tests {
                 assert_eq!(b.tokens, s.tokens, "request {i}: token count differs");
             }
         }
+        // ---- the server's pattern: staggered admission (mixed step widths) ----
+        let (staggered, t_stag) =
+            run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens, true);
+        let device = cuda_device_active();
+        for (i, (st, s)) in staggered.iter().zip(&serial).enumerate() {
+            assert_eq!(
+                st.reason, s.reason,
+                "staggered request {i}: finish reason differs"
+            );
+            assert!(
+                !st.text.is_empty(),
+                "staggered request {i} generated nothing"
+            );
+            if device {
+                let common = st
+                    .text
+                    .bytes()
+                    .zip(s.text.bytes())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                assert!(
+                    common > 0,
+                    "staggered request {i} diverges from its serial reference at the first byte, \
+                     which numerics cannot explain: staggered {:?} vs serial {:?}",
+                    st.text,
+                    s.text
+                );
+                eprintln!(
+                    "[e2] staggered request {i}: {common} leading byte(s) shared; {:?} vs serial {:?}",
+                    st.text, s.text
+                );
+            } else {
+                assert_eq!(
+                    st.text, s.text,
+                    "staggered request {i}: {:?} vs serial {:?}",
+                    st.text, s.text
+                );
+            }
+        }
+        eprintln!(
+            "[e2] staggered {:.2}s vs simultaneous {:.2}s for {n_slots} slots",
+            t_stag, t_batch
+        );
         let total: usize = serial.iter().map(|r| r.tokens).sum();
         assert!(total > 0, "the workload generated nothing");
         eprintln!(
