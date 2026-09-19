@@ -639,7 +639,7 @@ prompt) belongs with E2's batching work.
 | ID | Title | Effort |
 |---|---|---|
 | D1 | Strided views with allocator-known aliasing + multi-output nodes — **increments 1–2 landed (2026-09-19): exact views are zero-copy, offset/partial windows work on CPU and CUDA (`BufRef` carries offset+len through the `Backend` trait), Metal is exact-only**; multi-output nodes remain | L |
-| D2 | Re-express one decode fusion as a composition (proof) | M |
+| D2 | Re-express one decode fusion as a composition (proof) — **design recorded (2026-09-19)**: `FusedFFN` (GPU-only decode fusion) as concat `MatMul` + two partial windows + in-place `SwiGLU`, CUDA-only until G5 gives Metal offsets; the bitwise A/B and the budget measurement are the next increment | M |
 | D3 | Decide the fate of the four hand-written fused ops | S |
 
 - **D1 acceptance:** `Op::View` becomes zero-copy (a test asserts the allocator
@@ -757,6 +757,70 @@ View/Reshape/Permute cells are the regression net for it.
 - **D2 acceptance:** `FusedFFN` re-expressed as `MatMul` + views + in-place
   `SwiGLU`; the hand-written node stays behind an env gate for A/B; bitwise
   identity; no decode regression beyond a recorded budget.
+
+#### D2 design (written before the code, 2026-09-19)
+
+**What `FusedFFN` is today (read from the code, not remembered).** The model
+builders emit it only for a GPU decode step: `nt == 1 && cparams.gpu &&
+cparams.fuse_ffn && gu_concat_available(...) && nf <= 16384`
+(`models/qwen2/graph.rs:243`, qwen3 likewise). Its output shape is
+`[2 * nf, nt]` — a *concatenated* gate|up buffer — and its consumer (the `down`
+matmul) reads **rows `0..nf`**, where the fused kernel leaves `silu(gate) * up`.
+CPU never sees the op: `cpu_backend` returns `Err` for `Op::FusedFFN` ("fusion
+not enabled for it"), and the GPU gate is what keeps it off the CPU path.
+
+**The composition, and why it is bitwise-comparable.** With D1 increment 2 in
+place, the same graph is expressible as:
+
+```
+MatMul(x, gu_concat_weight) -> concat [2*nf, nt]
+View { offset: 0,  shape: [nf, nt] } -> gate      (a partial window of concat)
+View { offset: nf, shape: [nf, nt] } -> up        (the second window)
+SwiGLU(gate, up) -> out                            (in place, into the gate window)
+```
+
+`out` occupies the **same bytes** the fused node leaves its result in (rows
+`0..nf` of the concat), so the `down` matmul and everything downstream are
+unchanged and the two paths are comparable element by element. That is the whole
+point of doing D2 *after* D1: before offset views, the gate/up windows could only
+be copies.
+
+**What must change.**
+
+1. A builder path that emits the composition (`fused_ffn_composition`), with the
+   hand-written `Op::FusedFFN` kept behind an env gate for the A/B — the plan's
+   wording, and the reason D3 exists: the node is not deleted until the
+   composition is *measured*.
+2. The allocator's in-place rule must accept `Op::SwiGLU` writing into its first
+   input's window. The two inputs are windows of the *same* pool buffer at
+   different offsets, which the CPU's aliasing snapshot already handles (it
+   clones each aliased input); the rule and a test for the two-input case are what
+   is missing.
+3. A per-backend capability decision, and it is not uniform:
+   - **CPU** never emits FFN fusion (`cparams.gpu` is required), so nothing
+     changes there;
+   - **CUDA** takes the composition (MatMul and SwiGLU are both long-supported
+     ops, views landed in D1 increment 2);
+   - **Metal keeps the hand-written node**: the composition's views are *partial*
+     windows at a non-zero offset, which Metal's exact-view rule refuses until G5
+     (`SUPPORT-MATRIX.md`'s D1 row). Falling back must be a *build-time* choice
+     per backend, not a runtime copy.
+
+**Evidence plan (the increment this round did not reach).** Bitwise A/B on the
+device with a real model: one binary, the env gate selecting node vs composition,
+comparing the token stream and the logits; a decode tokens/s measurement for the
+recorded budget (the composition adds one `2*nf` f32 read+write per layer per
+token for the SwiGLU pass, and it may pick a different GEMM kernel than the fused
+special case — that is exactly what the budget is for); the real-model bitwise
+gates and the op matrix unchanged; `cargo test --release --features cuda` green.
+
+**Risks.** The budget is the honest risk: if the separate SwiGLU pass costs more
+than the fused epilogue saves on this device, D2's outcome is "re-expressed,
+measured slower, node stays" — which is a *result*, not a failure, and is why D3
+is a decision ticket rather than a deletion. The second risk is the reverse of
+D1's: a composition that *works* everywhere invites deleting the hand-written
+node, and the CUDA-specific kernels (fused epilogue, MMQ tiling) exist for
+reasons the composition cannot express; D3 owns that call.
 - **D3:** with D2 proven, decide per fusion whether to keep the hand-written
   node (performance) or delete it (simplicity). MoE (item 17) is unblocked here.
 
