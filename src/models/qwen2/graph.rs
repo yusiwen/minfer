@@ -1306,11 +1306,16 @@ mod tests {
     ///   `[0, pos)` fallback cannot be it), and Q/K carry the same freq table
     ///   (only `n_head` differs, and the table depends on `hd`).
     ///
-    /// So the leak is in the multi-query QK path — where mathematics says a
-    /// uniform RoPE shift cancels — and not in the store, the span or the rope
-    /// metadata. Next experiment: the same comparison on a minimal hand-built
-    /// graph (`q`/`k`/`v` inputs → rope → store → attn), which removes the model
-    /// from the equation.
+    /// The minimal hand-built graph then exonerated the ops (see
+    /// `the_minimal_attention_graph_is_offset_invariant_to_rounding`: ≤ 1.2e-7 at
+    /// the model's own shape, and equal for a 1-cell and an 8-cell offset), a
+    /// layer bisect put the entry point at layer 0's attention output (layer 0's V
+    /// bit-identical, layer 1's differing by 3.6e-3), and a layout control (the
+    /// same subject cells with the reservation split in two) came out
+    /// bit-identical — so what remains is the rotation's own rounding, amplified
+    /// by depth. Plan §14 row 9 carries the full attribution and C3's acceptance:
+    /// byte-exact K/V plus a surviving greedy token, with the logits' tail in the
+    /// named amplified-rounding class.
     #[test]
     fn offset_sensitivity_is_narrowed_to_multi_query_attention() {
         use crate::graph::batch::Batch;

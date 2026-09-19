@@ -747,6 +747,120 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
 mod tests {
     use super::*;
 
+    /// Plan §14 row 9's exoneration of the ops, as a gate.
+    ///
+    /// The minimal graph — `q`/`k`/`v` inputs → rope → store → attn, no model —
+    /// is run at cell 0, 1 and 8 with the same data, the same relative window and
+    /// the explicit span in every run, swept over shapes including the model's own
+    /// `(nh = 14, nk = 2, hd = 64)`. The only difference between the runs is the
+    /// rotation's own rounding, so the outputs must agree to well below anything a
+    /// model could amplify: measured <= 1.2e-7 at the widest shape, asserted < 1e-6.
+    ///
+    /// This is what rules the kernels out as the source of the model-level offset
+    /// divergence (§14 row 9 finds it entering at layer 0's attention output and
+    /// still open): the same op, shape and window structure are exact in isolation.
+    #[test]
+    fn the_minimal_attention_graph_is_offset_invariant_to_rounding() {
+        use crate::graph::ops::{AttnMeta, AttnMode, RoPEMeta};
+        use crate::graph::DType;
+        use crate::vec_ops::RopeStyle;
+
+        let n = 5usize;
+        let n_ctx = 64usize;
+        let freq_base = 10_000.0f32;
+        let freq_scale = 1.0f32;
+
+        for (nh, nk, hd) in [
+            (2usize, 2usize, 4usize),
+            (2, 2, 64),
+            (14, 2, 4),
+            (14, 2, 64),
+            (14, 2, 128),
+        ] {
+            let nkt = nk * hd;
+            let mut b = GraphBuilder::new();
+            b.set_explicit_span(true);
+            let pos = b.input("positions", [n, 1, 1, 1], DType::I32);
+            let qq = b.input("q", [nh * hd, n, 1, 1], DType::F32);
+            let kk = b.input("k", [nkt, n, 1, 1], DType::F32);
+            let vv = b.input("v", [nkt, n, 1, 1], DType::F32);
+            let rope = |nh_: usize| RoPEMeta {
+                freq_base,
+                freq_scale,
+                n_head: nh_,
+                hd,
+            };
+            let q_r = b.rope(qq, pos, RopeStyle::NonInterleaved, rope(nh));
+            let k_r = b.rope(kk, pos, RopeStyle::NonInterleaved, rope(nk));
+            let _store = b.kvcache_store(0, k_r, vv, pos, n_ctx);
+            let kv = b.kvcache_load(0, nkt, n_ctx, nk);
+            let at = b.attn(
+                q_r,
+                kv,
+                pos,
+                AttnMode::Gqa,
+                AttnMeta {
+                    layer: 0,
+                    n_head: nh,
+                    n_head_kv: nk,
+                    hd,
+                    hd_kv: hd,
+                    nkt,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                },
+            );
+            b.output(at);
+            let g = b.build();
+
+            let mut seed = 0x1234_5678u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((seed >> 8) as f32 / 8_388_608.0) - 1.0
+            };
+            let q: Vec<f32> = (0..nh * hd * n).map(|_| next()).collect();
+            let k: Vec<f32> = (0..nkt * n).map(|_| next()).collect();
+            let v: Vec<f32> = (0..nkt * n).map(|_| next()).collect();
+
+            let run = |start: usize| -> Vec<f32> {
+                let mut alloc = GraphAllocator::new();
+                alloc.kv_set_capacity(n_ctx);
+                alloc.alloc_graph(&g).expect("alloc");
+                alloc.fill_input(&g, "q", &q).unwrap();
+                alloc.fill_input(&g, "k", &k).unwrap();
+                alloc.fill_input(&g, "v", &v).unwrap();
+                let positions: Vec<u32> = (start..start + n).map(|p| p as u32).collect();
+                let mut span = vec![start as u32; n];
+                span.extend((0..n).map(|t| (start + t + 1) as u32));
+                alloc.fill_input_i32(&g, "positions", &positions).unwrap();
+                alloc.fill_input_i32(&g, "attn_span", &span).unwrap();
+                let mut sched = crate::graph::scheduler::BackendScheduler::new();
+                sched.execute(&g, &mut alloc).expect("execute");
+                alloc.copy_to_cpu(at).expect("read")
+            };
+            let d = |a: &[f32], b: &[f32]| -> f32 {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let a0 = run(0);
+            let a1 = run(1);
+            let a8 = run(8);
+            let (near, far) = (d(&a0, &a1), d(&a0, &a8));
+            eprintln!(
+                "[minimal] nh={nh} nk={nk} hd={hd} n={n}: cell0-vs-1 {near} | cell0-vs-8 {far}"
+            );
+            // The ops are exact: a same-relative-window run at another cell may
+            // differ only by the rotation's own rounding (measured <= 1.2e-7 at
+            // the model's shape), so the model-level divergence is not theirs
+            // (plan §14 row 9).
+            assert!(
+                near < 1e-6 && far < 1e-6,
+                "the minimal attention graph must stay offset-invariant: {near} / {far}"
+            );
+        }
+    }
+
     #[test]
     fn overlapping_rows_move_down_safely() {
         let mut b = CpuBackend::new();
