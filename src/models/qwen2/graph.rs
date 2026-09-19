@@ -1517,6 +1517,80 @@ mod tests {
         );
     }
 
+    /// Plan §14 row 9's safe observation point: the **persistent KV regions**.
+    ///
+    /// A previous version of this probe exposed layer 0's rope and attention
+    /// nodes through `graph.outputs` and compared them across offsets. That read
+    /// **recycled** data: adding a node to `outputs` does not extend its
+    /// liveness, so an intermediate buffer read after `execute` is whatever the
+    /// allocator reused it for (the q/k "misalignment" and the suspiciously tiny
+    /// attention delta it produced were both artefacts). The KV regions are the
+    /// exception — persistent, never recycled — so they are the only
+    /// model-level buffers a test may compare after the forward.
+    ///
+    /// Measured that way: layer 0's V rows are **bit-identical** at cell 0 and
+    /// cell 8, and layer 1's are not (the delta is printed). The entry point is
+    /// therefore at or before layer 0's attention output, and localising it
+    /// *inside* layer 0 needs a per-node execution path (as the CUDA tests use
+    /// `exec_ids`) or a liveness-aware capture — recorded as the next step
+    /// rather than faked by reading recycled memory.
+    #[test]
+    fn the_offset_divergence_appears_between_layer_0_and_layer_1_kv() {
+        use crate::graph::batch::Batch;
+        use crate::graph::cache::GraphCache;
+        use crate::models::ModelDef;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+
+        let run = |start: usize| -> Vec<Vec<f32>> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            if start > 0 {
+                cache.alloc().kv_reserve_seq(3, start).expect("holder");
+            }
+            cache.alloc().kv_reserve_seq(7, n + 4).expect("subject");
+            if start == 0 {
+                cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
+            }
+            let _ = model.forward_batch(
+                &Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]),
+                1,
+                n_ctx,
+                &mut cache,
+            );
+            (0..64)
+                .filter_map(|l| cache.alloc().copy_kv_to_cpu(l).map(|(_k, v)| v))
+                .collect()
+        };
+        let (v0, v8) = (run(0), run(8));
+        let row = v0[0].len() / n_ctx;
+        let delta = |l: usize| -> f32 {
+            (0..n * row)
+                .map(|i| (v0[l][i] - v8[l][8 * row + i]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        eprintln!(
+            "[kv-bisect] layer 0 V {} | layer 1 V {} | layer 2 V {}",
+            delta(0),
+            delta(1),
+            delta(2)
+        );
+        assert_eq!(delta(0), 0.0, "layer 0's V comes from the embedding alone");
+        assert!(
+            delta(1) > 0.0,
+            "layer 1's V differs, so the divergence is at or before layer 0's attention output"
+        );
+    }
+
     /// C3's end-to-end gate: compacting the arena **between steps** must leave a
     /// session's continuation intact.
     ///
