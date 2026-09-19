@@ -1333,12 +1333,7 @@ mod tests {
         // offset: a run with a single sequence at cell 0 is causal, one with a
         // reservation below it is explicit. A second reservation (a holder when
         // the subject is offset, a dummy after it otherwise) makes both explicit.
-        // `dup` makes every token take the same position, which removes the
-        // *relative* rotation between queries and keys (theta_t - theta_j = 0 in
-        // both runs) while keeping the absolute offset. If the divergence
-        // survives that, it is an absolute-position dependence; if it vanishes,
-        // it lives in the relative rotation.
-        let run = |ids: Vec<u32>, start: usize, dup: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let run = |ids: Vec<u32>, start: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let n = ids.len();
             let mut cache = GraphCache::new();
             cache.alloc().kv_set_capacity(n_ctx);
@@ -1349,13 +1344,8 @@ mod tests {
             if start == 0 {
                 cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
             }
-            let positions: Vec<usize> = if dup {
-                vec![start; n]
-            } else {
-                (start..start + n).collect()
-            };
             let l = model.forward_batch(
-                &Batch::new(ids, positions, vec![7u32; n]),
+                &Batch::new(ids, (start..start + n).collect(), vec![7u32; n]),
                 1,
                 n_ctx,
                 &mut cache,
@@ -1382,15 +1372,9 @@ mod tests {
         };
         for nt in [1usize, 2, full.len()] {
             let ids: Vec<u32> = full[..nt].to_vec();
-            let (l0, k0, v0) = run(ids.clone(), 0, false);
-            let (l0b, _k0b, v0b) = run(ids.clone(), 0, false);
-            let (l8, k8, v8) = run(ids.clone(), 8, false);
-            let (d0, _kd0, _vd0) = run(ids.clone(), 0, true);
-            let (d8, _kd8, _vd8) = run(ids, 8, true);
-            eprintln!(
-                "[offset] nt={nt}: same-position variant cell0-vs-8 logits {}",
-                d(&d0, &d8)
-            );
+            let (l0, k0, v0) = run(ids.clone(), 0);
+            let (l0b, _k0b, v0b) = run(ids.clone(), 0);
+            let (l8, k8, v8) = run(ids, 8);
             let row = v0.len() / n_ctx;
             // `rope_shift_kv(d)` means `new_pos = old_pos - d`, so aligning cell 8
             // back onto cell 0 is d = +8.
