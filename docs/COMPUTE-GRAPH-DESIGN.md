@@ -71,8 +71,11 @@ scratch buffers per step. That shape had four structural costs:
 These are the rules the rest of the document elaborates. Breaking one is a bug, not a tuning choice.
 
 1. **KV positions are data, not structure.** `KvcacheStore`/`KvcacheLoad` carry only the layer index;
-   the write position arrives through the `positions` input node. The topology never depends on
-   `n_past` — this is the precondition for decode reuse (llama.cpp `allow_reuse` behaves the same).
+   the write row arrives through the `cells` input node (C6: `positions` is the token's index *within
+   its sequence* and drives RoPE and the causal bound, while the allocator resolves `cells` — the
+   arena row — from the run table; the two coincide only while a run starts at cell 0). The topology
+   never depends on `n_past` — this is the precondition for decode reuse (llama.cpp `allow_reuse`
+   behaves the same).
 2. **Topology is a deterministic function of `GraphParams`.** Equal params ⇒ identical node sequence
    ⇒ the graph may be reused without rebuilding. The debug build asserts this structurally.
 3. **Weights are named, not copied.** A node references its weight by name (`MatMulMeta.weight_name`);
@@ -222,7 +225,7 @@ pub enum Op {
                                                //   node (several sequences, or a window that does
                                                //   not start at cell 0), so only a backend that
                                                //   reads the explicit span may take it
-    KvcacheStore { layer: usize },             // persistent KV write; position comes from `positions`
+    KvcacheStore { layer: usize },             // persistent KV write; the row comes from `cells`
     KvcacheLoad  { layer: usize },             // view of the persistent KV region
     View { offset: usize, shape: [usize; 4] },
     Reshape { shape: [usize; 4] },
@@ -560,8 +563,8 @@ The Q/K/V construction is where topology differs materially between prefill and 
 
 | Class | Condition | Graph |
 |---|---|---|
-| Concat (G4/D3-8 class 1) | `qkv_concat_available(wq, wk, wv)` — same quant type, same input dim, block-aligned, so the loader registered `blk.{i}.attn_qkv` | one `fused_qkv(normed, positions, il, ...)` node, then `kvcache_load` for attention |
-| Mixed quant (D3-8 class 2) | concat unavailable, CUDA present | three bias-less `matmul`s + one `qkv_bias_rope_store(q, k, v, positions, il, ...)` epilogue; attention is wired to the epilogue node so `q`'s matmul has exactly one consumer and can be aliased in place |
+| Concat (G4/D3-8 class 1) | `qkv_concat_available(wq, wk, wv)` — same quant type, same input dim, block-aligned, so the loader registered `blk.{i}.attn_qkv` | one `fused_qkv(normed, positions, il, ...)` node (the builder also wires `cells`), then `kvcache_load` for attention |
+| Mixed quant (D3-8 class 2) | concat unavailable, CUDA present | three bias-less `matmul`s + one `qkv_bias_rope_store(q, k, v, positions, il, ...)` epilogue (plus `cells` from the builder); attention is wired to the epilogue node so `q`'s matmul has exactly one consumer and can be aliased in place |
 | Unfused | any gate off (or a Metal-only mixed-quant layer) | `matmul`×3 (+bias) → `rope`×2 → `kvcache_store` → `kvcache_load` |
 
 Class 2 is CUDA-only: without the `cuda` feature `qkv_epilogue_ok` is `false` and those layers keep
@@ -623,7 +626,8 @@ which drives the Q/K/V/wo widths, the RoPE dims, the attention scale and the KV 
 | Input | Shape | DType | Present when |
 |---|---|---|---|
 | `token_ids` | `[nt, 1, 1, 1]` | I32 | always |
-| `positions` | `[nt, 1, 1, 1]` | I32 | always (KV write position + causal mask) |
+| `positions` | `[nt, 1, 1, 1]` | I32 | always (sequence-relative: RoPE + the causal mask) |
+| `cells` | `[nt, 1, 1, 1]` | I32 | when the graph writes or resolves KV (`KvcacheStore`, `FusedQKV`, `QkvBiasRopeStore`): the arena row per token (C6) |
 | `tail_ids` | `[n_out, 1, 1, 1]` | I32 | `n_out < nt` (prefill with the G3 reduction) |
 
 The prefill / decode call sites fill `tail_ids` with `[(nt - n_out) .. nt)`; decode leaves it absent.
