@@ -4,7 +4,7 @@
 2026-09-16); Phase C **3/6** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
 its acceptance resolved on measured grounds, with the server-side dynamic-run
 trigger deliberately deferred; **C6 (logical positions) in progress on
-`feat/logical-positions` — S0/S1/S2 landed, S3 (CUDA fused QKV family) next**; C4, C5
+`feat/logical-positions` — S0–S3 landed, docs closure + PR next**; C4, C5
 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
@@ -832,7 +832,7 @@ be written to:
 | Input | Meaning | Consumed by |
 |---|---|---|
 | `positions` | sequence-relative token index | RoPE (q and k), the causal bound |
-| `cells` (new) | the row `KvCache` resolves for `(seq, position)` | `KvcacheStore` (and the fused QKV family, S3) |
+| `cells` (new) | the row `KvCache` resolves for `(seq, position)` | `KvcacheStore` and the fused decode QKV family (`Op::FusedQKV`, `Op::QkvBiasRopeStore`) |
 | `attn_span` | unchanged: the `[lo, hi)` **cell** range | attention |
 
 The single-sequence case is unchanged by construction: its run starts at cell 0,
@@ -882,7 +882,7 @@ CUDA, then a docs progress update, then a commit on `feat/logical-positions`).
 | S1 | `cells` wiring + allocator/kvcache resolver + model/server switch + fused QKV gated off under `explicit_span` | invariants 1–2, 4; CPU+CUDA suites |
 | S2 | compaction without a re-rope; the bit-identity gate | invariants 1–3 |
 | S1∪S2 | *merged in execution:* the re-rope removal is **not** optional once S1 lands — S1 makes the stored K rows' angles sequence-relative, so a compaction that still re-roped them by `from - to` would rotate them *away* from the correct angle. The first S1 run showed exactly that: `a_compaction_between_steps_keeps_the_continuation` failed with a flipped greedy token until `kv_defrag` stopped re-roping. Semantics switch and re-rope removal must therefore land in the **same** commit. | as above |
-| S3 | CUDA fused QKV family takes `cells`; the gate re-enabled for CUDA | invariant 5 + fused-vs-unfused bitwise + capture regression |
+| S3 | CUDA fused QKV family takes `cells`; the gate re-enabled for CUDA — **landed**, plus a server position bug the gate exposed | invariant 5 + fused-vs-unfused bitwise + capture regression |
 | S4 | docs closure (roadmap §2.4, AGENTS rules, design docs) | docs build |
 | S5 | PR, CI three jobs green with zero annotations, rebase merge | CI |
 
@@ -913,10 +913,55 @@ placement changes nothing" (logits, per-layer V, per-node `q`/`k`/attention); an
 the perturbation probe was **deleted**, because its premise — that the offset
 effect needs explaining — is gone.
 
-One cosmetic follow-up for S3: the CUDA fixtures that drive `exec_ids` by hand
-still pass their `positions` buffer as the store's row input (they fill it with
-cells, so they are correct, but they do not fill the new `cells` input); they
-should bind the `cells` input for coherence once S3 touches those files.
+**S3 done** — the CUDA fused decode QKV family takes `cells`:
+
+- `attn_bias_rope_store_f32` gained a `cells` parameter: `pos` rotates q/k and
+  `row = cells[0]` addresses the four KV store writes. The launcher, the FFI
+  declaration and `CudaState::attn_bias_rope_store` carry it; the builder wires
+  the shared `cells` input into `fused_qkv` (sources `[x, pos, cells]`) and
+  `qkv_bias_rope_store` (`[q, k, v, pos, cells]`), so no model call site changed;
+- the qwen2 gate becomes `(cuda_on || !explicit_span)`: CUDA keeps the fused
+  chain under an explicit span, Metal keeps the pre-C6 gate (it has no
+  explicit-span attention at all, G5). Qwen3 needs nothing: its fused family is
+  Metal-only, so no CUDA arm existed to port. The hand fixtures in
+  `cuda.rs::d38_probe_tests` pass their positions buffer as `cells` — identity
+  by construction, which is the case they assert.
+
+Suites: **CPU 213 passed / 0 failed / 5 ignored**, **CUDA 261 passed / 0 failed /
+5 ignored**. End-to-end gate on GB10 (`Qwen2.5-0.5B` Q4_0, `--n-slots 2
+--n-ctx 1024`, one short + one long request submitted together): `cap = n_ctx/2 =
+512`, so the long request ran in **slot 1** (server log) and, once the short one
+answered in a token, **alone** — a single-token (`nt == 1`) step in a run whose
+start is not 0, which is exactly the path the S1 gate had closed. Fused vs
+`MINFER_NO_FUSE_QKV=1` produced **byte-identical** completions (`sha1
+36c55ed81464`, 319/319 expected words): the `cells` port and the S1/S2
+`KvcacheStore` path agree on a non-zero run start.
+
+**The gate also caught a real server bug, now fixed:** `BatchEngine::submit_on`
+still built positions as `start + i` — the pre-C6 "positions are cells"
+semantics — so a request placed in a non-zero-start slot fed position 512 into a
+512-cell run and `kv_cells_for_seq` rejected it ("past sequence 2's reserved
+run"), rejecting the job. Both the batch prefill path and `current_pos` were
+already relative; only this entry point had not been migrated, and no earlier
+test exercised a second slot's run (the CPU suite batches nothing by default, so
+every server test ran the single-sequence path). It now passes `feed_from..nt`.
+
+Regression coverage: `server_batch_matches_serial_and_is_faster` pins each of four
+requests to the slot it would occupy through `submit_on`, so it drives runs with
+non-zero starts — it is `#[ignore]`d only because CI has no cached model, and it
+must be run locally for any change to positions or the run table:
+`cargo test --release -- --ignored server_batch_matches_serial`. It passes both on
+CPU (byte-equality of batched vs serial, 1.43x) and on CUDA (structural
+assertions, 1.28x).
+
+One measurement note worth keeping: an end-to-end A/B of the fusion on the
+*batched* decode path cannot isolate this gate, because `fuse_qkv` requires
+`nt == 1` — a step carrying four streams is unfused in **both** configurations.
+The measurement that matters is the single-stream step in a non-zero-start run
+above; a 4-slot throughput A/B (master, 7B Q4_K_M, 4 concurrent requests) showed
+the fused and unfused chains within noise (92.6 vs 92.7 tok/s best case), which
+is expected for a bandwidth-bound model and is why the port's value is
+correctness and parity, not throughput.
 
 **Not in this ticket:** sharing one cell range across sequences (`owner[cell]`
 becomes a set/refcount — the real cross-slot prefix reuse, which this ticket makes
