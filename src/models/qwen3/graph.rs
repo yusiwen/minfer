@@ -95,6 +95,9 @@ impl Qwen3Graph {
             // 2 qk_norm + 2 rope + 2 store dispatches. Qwen3 has no attention
             // biases, so the fused kernel applies the per-head norm (which the
             // Qwen2 bias+rope+store kernel cannot express).
+            // C6/S1: the fused QKV family writes K/V at `positions`, which are
+            // sequence-relative once the span is explicit, so it is gated off
+            // until S3 gives the kernels a `cells` pointer.
             let fuse_qkv_norm = nt == 1
                 && params.cparams.gpu
                 && params.cparams.fuse_qkv
@@ -162,7 +165,7 @@ impl Qwen3Graph {
                     },
                 );
 
-                b.kvcache_store(il, k, v, inp_pos, n_ctx);
+                b.kvcache_store(il, k, v, n_ctx);
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);
                 (q, kv)
             };
@@ -458,6 +461,7 @@ impl Qwen3Graph {
                 // FusedQKV). Prefill (nt>1) never uses it.
                 fuse_qkv: nt == 1
                     && metal_on
+                    && !explicit_span
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)

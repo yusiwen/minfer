@@ -707,7 +707,6 @@ impl GraphAllocator {
         &mut self,
         seq: super::kvcache::SeqId,
         cap: usize,
-        rope: &super::kvcache::KvRope,
     ) -> Result<(super::kvcache::SeqSlot, Vec<super::kvcache::KvMove>), String> {
         let first = match self.kv.reserve_seq(seq, cap) {
             Ok(slot) => return Ok((slot, Vec::new())),
@@ -716,7 +715,7 @@ impl GraphAllocator {
         if !kv_defrag_enabled() {
             return Err(format!("{first} (KV defragmentation disabled)"));
         }
-        let report = self.kv_defrag(Some(cap), rope)?;
+        let report = self.kv_defrag(Some(cap))?;
         if report.moves.is_empty() {
             return Err(first);
         }
@@ -742,20 +741,13 @@ impl GraphAllocator {
     /// table), but a caller that passes `start + pos` as a store position would
     /// otherwise write to cells that now belong to someone else.
     ///
-    /// **A compaction must re-rope the K rows it moves.** `positions` are cells
-    /// today, so RoPE angles are absolute cell indices: a row copied from cell
-    /// `from` to cell `to` still carries the angle of `from`, and the next
-    /// decode step would attend to it at the wrong relative angle. The moved K
-    /// rows are therefore re-roped by `from - to` — C2's convention, where
-    /// `rope_shift_kv(delta)` means `new_pos = old_pos - delta` — with the model's own
-    /// [`super::kvcache::rope_shift_kv`] — the C2 path, two composed rotations,
-    /// which is a named tolerance class rather than a bitwise identity (see the
-    /// plan's C3 record; the fix that makes it bitwise is logical positions).
-    pub fn kv_defrag(
-        &mut self,
-        need: Option<usize>,
-        rope: &super::kvcache::KvRope,
-    ) -> Result<KvDefragReport, String> {
+    /// **No re-rope (C6).** `positions` are sequence-relative now, so a token's
+    /// RoPE angle is its index within its sequence and a *cell* move changes
+    /// nothing: the rows are copied verbatim and a mid-session compaction is
+    /// bitwise identical. (Before C6 the angles were cell indices, which is why
+    /// this function used to re-rope every moved K row — see the plan's C3 record.
+    /// C2's `kv_rm`/`kv_shift` still re-rope: those move *positions*.)
+    pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
         let before = self.kv.arena_stats();
         let moves = self.kv.compaction_plan(need);
         if moves.is_empty() {
@@ -798,25 +790,6 @@ impl GraphAllocator {
                         )
                     })?;
                 }
-                // RoPE angles are cells today, so a moved K row must be re-roped
-                // to its new angle; V carries no rotation. The delta is uniform
-                // over the run, which is what makes one host pass enough.
-                if m.to != m.from {
-                    let mut k_host = self.read_pool(k).ok_or_else(|| {
-                        format!(
-                            "kv_defrag: layer K rows {}..{} could not be read for the re-rope",
-                            m.to,
-                            m.to + m.rows
-                        )
-                    })?;
-                    super::kvcache::rope_shift_kv(
-                        &mut k_host[m.to * elems_per_cell..],
-                        m.rows,
-                        m.from as isize - m.to as isize,
-                        rope,
-                    );
-                    self.write_pool(k.backend, k.id, &k_host)?;
-                }
             }
         }
         let rows_moved = self.kv.apply_moves(&moves)?;
@@ -827,47 +800,6 @@ impl GraphAllocator {
             before,
             after,
         })
-    }
-
-    /// Test-only: add `delta` to one element of a layer's K or V region, in
-    /// place (plan §14 row 9's amplification probe).
-    ///
-    /// The probe measures how much a perturbation of the *rotation's own
-    /// rounding magnitude* moves the logits, to decide whether the cell-offset
-    /// effect is that rounding amplified by depth or something systematic. It
-    /// lives in the model tests (which own their allocator through a
-    /// `GraphCache`), hence a public hook rather than a private helper.
-    #[cfg(test)]
-    pub fn kv_perturb_for_test(
-        &mut self,
-        layer: usize,
-        k_region: bool,
-        cell: usize,
-        elem: usize,
-        delta: f32,
-    ) -> Result<(), String> {
-        let (region, elems_per_cell) = {
-            let l = self
-                .kv
-                .get(layer)
-                .ok_or_else(|| format!("kv_perturb_for_test: no arena for layer {layer}"))?;
-            (
-                if k_region { l.k } else { l.v },
-                (l.elems / l.n_ctx.max(1)).max(1),
-            )
-        };
-        let mut buf = self
-            .read_pool(region)
-            .ok_or_else(|| format!("kv_perturb_for_test: layer {layer} read failed"))?;
-        let i = cell * elems_per_cell + elem;
-        if i >= buf.len() {
-            return Err(format!(
-                "kv_perturb_for_test: cell {cell} element {elem} is past the region ({} elements)",
-                buf.len()
-            ));
-        }
-        buf[i] += delta;
-        self.write_pool(region.backend, region.id, &buf)
     }
 
     /// Fragmentation and utilisation counters for every arena layer's shared
@@ -928,13 +860,15 @@ impl GraphAllocator {
                 let cap = self.kv.n_ctx();
                 self.kv.reserve_seq(seq, cap)?;
             }
-            let lo = batch.positions[from..to].iter().min().copied().unwrap_or(0);
-            let hi = batch.positions[from..to]
+            // C6: `positions` are sequence-relative, so the rows this forward
+            // writes are `[start, start + max(position) + 1)`.
+            let start = self.kv.seq_slot(seq).map(|s| s.start).unwrap_or(0);
+            let rows = batch.positions[from..to]
                 .iter()
                 .max()
                 .map(|m| m + 1)
-                .unwrap_or(lo);
-            self.kv.own_range(seq, lo, hi);
+                .unwrap_or(0);
+            self.kv.own_range(seq, start, start + rows);
         }
         let positions: Vec<usize> = batch.positions.clone();
         self.fill_seq_ids(graph, &batch.seq_ids, &positions)
@@ -954,11 +888,70 @@ impl GraphAllocator {
         seq_ids: &[u32],
         positions: &[u32],
     ) -> Result<(), String> {
-        if let Some(&maxp) = positions.iter().max() {
-            self.kv_note_used(maxp as usize + 1);
-        }
         let pos: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        // C6: the written extent is a *cell* extent, resolved through the runs —
+        // but only a graph that actually stores K/V has a `cells` input (a
+        // rope-only fixture does not, and must not need a KV arena).
+        let has_cells = graph.inputs.iter().any(|&i| graph.node(i).name == "cells");
+        if has_cells && !pos.is_empty() {
+            let cells = self.kv_cells_for_seq(seq_ids, &pos)?;
+            if let Some(&maxc) = cells.iter().max() {
+                self.kv_note_used(maxc as usize + 1);
+            }
+        }
         self.fill_seq_ids(graph, seq_ids, &pos)
+    }
+
+    /// Resolve each query's **cell** from the store: `start + position`, for the
+    /// runs the caller reserved (C6). This is what the KV store writes to, while
+    /// `positions` stays the token's index within its sequence (what RoPE needs).
+    pub fn kv_cells_for_seq(
+        &self,
+        seq_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<u32>, String> {
+        if seq_ids.len() != positions.len() {
+            return Err(format!(
+                "kv_cells_for_seq: {} sequence ids but {} positions",
+                seq_ids.len(),
+                positions.len()
+            ));
+        }
+        let mut cells = Vec::with_capacity(positions.len());
+        // The classic single-sequence path holds no reservation: the sequence owns
+        // the whole arena, so `cell == position` (C1's identity). Any other
+        // unreserved sequence is an error — the same rule `fill_batch_inputs`
+        // applies when it reserves implicitly.
+        let classic = self.kv.arena_stats().sequences == 0;
+        let n_ctx = self.kv.n_ctx();
+        for (t, (&seq, &rel)) in seq_ids.iter().zip(positions).enumerate() {
+            let Some(slot) = self.kv.seq_slot(seq) else {
+                if !classic {
+                    return Err(format!(
+                        "kv_cells_for_seq: query {t} has no reserved run (seq {seq})"
+                    ));
+                }
+                if n_ctx == 0 {
+                    return Err("kv_cells_for_seq: no KV arena allocated".to_string());
+                }
+                if rel >= n_ctx {
+                    return Err(format!(
+                        "kv_cells_for_seq: query {t} position {rel} is past the {n_ctx}-cell arena"
+                    ));
+                }
+                cells.push(rel as u32);
+                continue;
+            };
+            if rel >= slot.cap {
+                return Err(format!(
+                    "kv_cells_for_seq: query {t} position {rel} is past sequence {seq}'s \
+                     reserved run ({} cells at {})",
+                    slot.cap, slot.start
+                ));
+            }
+            cells.push((slot.start + rel) as u32);
+        }
+        Ok(cells)
     }
 
     /// Fill the per-query sequence ids and resolve the matching `attn_span`
@@ -977,6 +970,12 @@ impl GraphAllocator {
         let has = |name: &str| graph.inputs.iter().any(|&i| graph.node(i).name == name);
         if has("seq_ids") {
             self.fill_input_i32(graph, "seq_ids", seq_ids)?;
+        }
+        // C6: the store writes at the cells this resolves, while `positions`
+        // (already filled by the caller) stays sequence-relative.
+        if has("cells") {
+            let cells = self.kv_cells_for_seq(seq_ids, positions)?;
+            self.fill_input_i32(graph, "cells", &cells)?;
         }
         if !has("attn_span") {
             return Ok(());
@@ -1699,23 +1698,27 @@ mod tests {
         let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
         let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
         let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
-        let _store = b.kvcache_store(0, k, v, pos, 1024);
+        let _store = b.kvcache_store(0, k, v, 1024);
         let load = b.kvcache_load(0, 16, 1024, 2);
         b.output(load);
         let g = b.build();
 
         let mut alloc = GraphAllocator::new();
         alloc.alloc_graph(&g).unwrap();
+        // C6: the store now also consumes a `cells` input, so node ids shifted —
+        // look the nodes up by name instead of by position.
+        let store = g.nodes.iter().position(|n| n.name == "kv_store.0").unwrap();
+        let load = g.nodes.iter().position(|n| n.name == "kv_load.0").unwrap();
         // store and load share the K region; V is a sibling
-        assert_eq!(alloc.node_buffer(3), alloc.node_buffer(4));
+        assert_eq!(alloc.node_buffer(store), alloc.node_buffer(load));
         let pair = alloc.kv_pair(0).unwrap();
-        assert_eq!(alloc.node_buffer(3).unwrap().id, pair.0);
+        assert_eq!(alloc.node_buffer(store).unwrap().id, pair.0);
         assert_ne!(pair.0, pair.1);
         assert_eq!(alloc.persistent.len(), 2);
         assert_eq!(alloc.persistent[0].name, "kv.0.k");
         assert_eq!(alloc.persistent[1].name, "kv.0.v");
-        // mapped buffers: positions/k/v (3 liveness) + K region (shared) = 4
-        assert_eq!(alloc.n_mapped_buffers(), 4);
+        // mapped buffers: positions/k/v/cells (4 liveness) + K region (shared) = 5
+        assert_eq!(alloc.n_mapped_buffers(), 5);
     }
 
     /// C3 end to end on CPU: a fragmented arena refuses an 8-cell reservation,
@@ -1730,7 +1733,7 @@ mod tests {
         let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
         let k = b.input("k", [ROW, 1, 1, 1], crate::graph::DType::F32);
         let v = b.input("v", [ROW, 1, 1, 1], crate::graph::DType::F32);
-        let _store = b.kvcache_store(0, k, v, pos, N_CTX);
+        let _store = b.kvcache_store(0, k, v, N_CTX);
         let load = b.kvcache_load(0, ROW, N_CTX, 1);
         b.output(load);
         let g = b.build();
@@ -1770,7 +1773,7 @@ mod tests {
         assert_eq!((before.free_cells, before.free_runs), (8, 2));
         assert!(alloc.kv_reserve_seq(4, 8).is_err());
 
-        let report = alloc.kv_defrag(Some(8), &rope).unwrap();
+        let report = alloc.kv_defrag(Some(8)).unwrap();
         assert_eq!(report.moves.len(), 1, "{report:?}");
         assert_eq!(report.moves[0].seq, 3);
         assert_eq!((report.moves[0].from, report.moves[0].to), (8, 4));
@@ -1778,28 +1781,16 @@ mod tests {
         assert_eq!((report.before.free_runs, report.after.free_runs), (2, 1));
         assert_eq!(report.after.largest_free_run, 8);
         assert_eq!((report.after.defrags, report.after.cells_moved), (1, 4));
-        // V moved verbatim; K moved *and* was re-roped to its new angle, because
-        // `positions` are cells today (the plan's C3 record: two composed
-        // rotations, the C2 tolerance class).
+        // C6: both K and V move **verbatim** — a cell move no longer changes any
+        // rotation, because a token's angle is its index within its sequence.
         let (k_now, v_now) = alloc.copy_kv_to_cpu(0).unwrap();
         for e in 0..ROW {
             assert_eq!(v_now[4 * ROW + e], 108.0 + e as f32 / 10.0, "V element {e}");
         }
-        let mut k_expect: Vec<f32> = (0..ROW).map(|e| 8.0 + e as f32 / 10.0).collect();
-        // C2's convention: `rope_shift_kv(delta)` moves a row's angle to
-        // `pos - delta`, so a row that moved 8 -> 4 is re-roped by +4.
-        crate::graph::kvcache::rope_shift_kv(&mut k_expect, 1, 8 - 4, &rope);
+        let k_expect: Vec<f32> = (0..ROW).map(|e| 8.0 + e as f32 / 10.0).collect();
         for e in 0..ROW {
             assert_eq!(k_now[4 * ROW + e], k_expect[e], "K element {e}");
         }
-        assert_ne!(
-            k_expect,
-            (0..ROW)
-                .map(|e| 8.0 + e as f32 / 10.0)
-                .collect::<Vec<f32>>(),
-            "the fixture must be a rotation that actually moves the numbers, or the \
-             re-rope assertion above would pass on a blind copy"
-        );
         // The reservation that first-fit refused now fits, in the opened tail.
         assert_eq!(alloc.kv_reserve_seq(4, 8).unwrap().start, 8);
         // The same helper, on a fresh fragmentation: free the lowest run and the
@@ -1808,7 +1799,7 @@ mod tests {
         // and the helper reports the move it relied on.
         alloc.kv_release_seq(1);
         alloc.kv_release_seq(4);
-        let (slot, moves) = alloc.kv_reserve_seq_with_defrag(5, 12, &rope).unwrap();
+        let (slot, moves) = alloc.kv_reserve_seq_with_defrag(5, 12).unwrap();
         assert_eq!(
             slot.start, 4,
             "the retry packs the survivor down, then takes the tail"
@@ -1817,7 +1808,7 @@ mod tests {
         assert_eq!((moves[0].seq, moves[0].from, moves[0].to), (3, 4, 0));
         // The helper also answers "it still does not fit" with the original
         // first-fit error, after compaction moved nothing.
-        let err = alloc.kv_reserve_seq_with_defrag(6, 4, &rope).unwrap_err();
+        let err = alloc.kv_reserve_seq_with_defrag(6, 4).unwrap_err();
         assert!(err.contains("no free run of 4 cells"), "{err}");
     }
 
@@ -1918,7 +1909,7 @@ mod tests {
             let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
             let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
             let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
-            let _store = b.kvcache_store(0, k, v, pos, n_ctx);
+            let _store = b.kvcache_store(0, k, v, n_ctx);
             let load = b.kvcache_load(0, 16, n_ctx, 2);
             b.output(load);
             b.build()
@@ -1942,7 +1933,7 @@ mod tests {
         let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
         let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
         let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
-        let _store = b.kvcache_store(0, k, v, pos, 1024);
+        let _store = b.kvcache_store(0, k, v, 1024);
         let load = b.kvcache_load(0, 16, 1024, 2);
         b.output(load);
         let g = b.build();
@@ -1950,8 +1941,9 @@ mod tests {
         alloc.alloc_graph(&g).unwrap();
 
         // The last legal row is n_ctx - 1.
-        alloc.fill_input_i32(&g, "positions", &[1023]).unwrap();
-        let err = alloc.fill_input_i32(&g, "positions", &[1024]).unwrap_err();
+        // C6: the KV row input is `cells` (positions are relative now).
+        alloc.fill_input_i32(&g, "cells", &[1023]).unwrap();
+        let err = alloc.fill_input_i32(&g, "cells", &[1024]).unwrap_err();
         assert!(err.contains(">= n_ctx 1024"), "got: {err}");
     }
 
@@ -1965,7 +1957,7 @@ mod tests {
         let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
         let v = b.input("v", [16, 1, 1, 1], crate::graph::DType::F32);
         let emb = b.get_rows(k, ids, [16, 1, 1, 1]);
-        let _store = b.kvcache_store(0, emb, v, pos, 8);
+        let _store = b.kvcache_store(0, emb, v, 8);
         let load = b.kvcache_load(0, 16, 8, 2);
         b.output(load);
         let g = b.build();
@@ -1975,7 +1967,7 @@ mod tests {
         alloc
             .fill_input_i32(&g, "token_ids", &[50_000])
             .expect("token ids are not positions");
-        let err = alloc.fill_input_i32(&g, "positions", &[8]).unwrap_err();
+        let err = alloc.fill_input_i32(&g, "cells", &[8]).unwrap_err();
         assert!(err.contains(">= n_ctx 8"), "got: {err}");
     }
 

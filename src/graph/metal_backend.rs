@@ -1627,7 +1627,7 @@ mod tests {
         let q = gb.input("q", [8, 2, 1, 1], DType::F32);
         let k = gb.input("k", [8, 2, 1, 1], DType::F32);
         let v = gb.input("v", [8, 2, 1, 1], DType::F32);
-        gb.kvcache_store(0, k, v, pos, 16);
+        gb.kvcache_store(0, k, v, 16);
         let kv = gb.kvcache_load(0, 8, 16, 2);
         let o = gb.attn(
             q,
@@ -1810,7 +1810,7 @@ mod tests {
         let q = gb.input("q", [nqt, nt, 1, 1], DType::F32);
         let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
-        gb.kvcache_store(0, k, v, pos, 4096);
+        gb.kvcache_store(0, k, v, 4096);
         let kv = gb.kvcache_load(0, nkt, 4096, nk);
         let o = gb.attn(
             q,
@@ -1895,7 +1895,7 @@ mod tests {
         let q = gb.input("q", [nqt, nkv_prev + 1, 1, 1], DType::F32);
         let k = gb.input("k", [nkt, nkv_prev + 1, 1, 1], DType::F32);
         let v = gb.input("v", [nkt, nkv_prev + 1, 1, 1], DType::F32);
-        gb.kvcache_store(0, k, v, pos, 4096);
+        gb.kvcache_store(0, k, v, 4096);
         let kv = gb.kvcache_load(0, nkt, 4096, nk);
         let o = gb.attn(
             q,
@@ -1974,7 +1974,7 @@ mod tests {
         let k = gb.input("k", [8, 2, 1, 1], DType::F32);
         let v = gb.input("v", [8, 2, 1, 1], DType::F32);
         let ks = gb.silu(k); // GPU-computed K input
-        gb.kvcache_store(0, ks, v, pos, 16);
+        gb.kvcache_store(0, ks, v, 16);
         let kv = gb.kvcache_load(0, 8, 16, 2);
         let o = gb.attn(
             q,
@@ -2049,7 +2049,7 @@ mod tests {
         let q = gb.input("q", [nqt, nt, 1, 1], DType::F32);
         let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
-        gb.kvcache_store(0, k, v, pos, 32768);
+        gb.kvcache_store(0, k, v, 32768);
         let kv = gb.kvcache_load(0, nkt, 32768, nk);
         let o = gb.attn(
             q,

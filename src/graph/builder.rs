@@ -19,6 +19,8 @@ pub struct GraphBuilder {
     /// per step by the allocator, like `positions`.
     seq_ids: Option<NodeId>,
     attn_span: Option<NodeId>,
+    /// C6: the KV row input, created by `kvcache_store`.
+    cells: Option<NodeId>,
     /// Whether this graph's attention window cannot be derived from `positions`
     /// alone (more than one sequence, or a window not starting at cell 0) — set
     /// by the model builders from the *batch* and its KV reservations, never from
@@ -33,6 +35,7 @@ impl GraphBuilder {
             graph: ComputeGraph::default(),
             seq_ids: None,
             attn_span: None,
+            cells: None,
             explicit_span: false,
         }
     }
@@ -58,6 +61,20 @@ impl GraphBuilder {
 
     /// The per-query allowed-cell-span input, created on first call: `lo` of
     /// token `t` at `[t]`, `hi` at `[nt + t]`.
+    /// The KV **row** input, created on first call: the cell each query token
+    /// must be written to. C6: `positions` is the token's index within its
+    /// sequence (which is what RoPE needs) and this is the cell the allocator
+    /// resolves for `(sequence, position)` — they coincide only while a run
+    /// starts at cell 0.
+    fn cells_input(&mut self, nt: usize) -> NodeId {
+        if let Some(id) = self.cells {
+            return id;
+        }
+        let id = self.input("cells", [nt, 1, 1, 1], DType::I32);
+        self.cells = Some(id);
+        id
+    }
+
     fn attn_span_input(&mut self, nt: usize) -> NodeId {
         if let Some(id) = self.attn_span {
             return id;
@@ -544,20 +561,19 @@ impl GraphBuilder {
 
     /// Write this step's K/V into the layer's persistent KV region at the
     /// positions carried by `pos`. `n_ctx` sizes the persistent region.
-    pub fn kvcache_store(
-        &mut self,
-        layer: usize,
-        k: NodeId,
-        v: NodeId,
-        pos: NodeId,
-        n_ctx: usize,
-    ) -> NodeId {
+    /// Write this forward's K/V into the layer's persistent regions. C6: the row
+    /// input is the allocator-resolved `cells` (created here, like `attn_span`),
+    /// not `positions` — callers no longer pass a buffer, because the mapping
+    /// `(sequence, position) -> cell` belongs to the cell store.
+    pub fn kvcache_store(&mut self, layer: usize, k: NodeId, v: NodeId, n_ctx: usize) -> NodeId {
         let n_embd = self.graph.nodes[k].out_shape[0];
+        let nt = self.graph.nodes[k].out_shape[1];
+        let cells = self.cells_input(nt);
         // shape mirrors the persistent region so the allocator can size it
         self.node(
             &format!("kv_store.{layer}"),
             Op::KvcacheStore { layer },
-            &[k, v, pos],
+            &[k, v, cells],
             [n_embd, n_ctx, 1, 1],
             DType::F32,
             NodeMeta::Kvcache(KvcacheMeta {
@@ -651,7 +667,7 @@ mod tests {
         let pos = b.input("positions", [1, 1, 1, 1], DType::I32);
         let k = b.input("k", [16, 1, 1, 1], DType::F32);
         let v = b.input("v", [16, 1, 1, 1], DType::F32);
-        let store = b.kvcache_store(3, k, v, pos, 1024);
+        let store = b.kvcache_store(3, k, v, 1024);
         let load = b.kvcache_load(3, 16, 1024, 2);
         let g = b.build();
 

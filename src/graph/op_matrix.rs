@@ -477,7 +477,7 @@ fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
     let q = b.input("q", [4, 1, 1, 1], DType::F32);
     let k = b.input("k", [4, 1, 1, 1], DType::F32);
     let v = b.input("v", [4, 1, 1, 1], DType::F32);
-    let _store = b.kvcache_store(0, k, v, pos, 4);
+    let _store = b.kvcache_store(0, k, v, 4);
     let load = b.kvcache_load(0, 4, 4, 1);
     let o = b.attn(
         q,
@@ -501,6 +501,8 @@ fn build_attn(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
             ("k", vec![1.0, 0.0, 0.0, 0.0]),
             ("v", vec![0.25, -0.75, 0.0, 0.0]),
             ("positions", vec![0.0]),
+            // C6: the query's sequence-relative position is 0 and its KV row is 0.
+            ("cells", vec![0.0]),
             // E1: one sequence, one query, window [0, 1).
             ("seq_ids", vec![0.0]),
             ("attn_span", vec![0.0, 1.0]),
@@ -518,7 +520,7 @@ fn build_kv_roundtrip(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Te
     let pos = b.input("positions", [4, 1, 1, 1], DType::I32);
     let k = b.input("k", [2, 4, 1, 1], DType::F32);
     let v = b.input("v", [2, 4, 1, 1], DType::F32);
-    let _store = b.kvcache_store(0, k, v, pos, 4);
+    let _store = b.kvcache_store(0, k, v, 4);
     let load = b.kvcache_load(0, 2, 4, 1);
     // The load node's buffer IS the K region: [n_embd, n_ctx] = 2 x 4, in cell
     // order.
@@ -528,6 +530,9 @@ fn build_kv_roundtrip(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Te
             ("k", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
             ("v", vec![9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0]),
             ("positions", vec![0.0, 1.0, 2.0, 3.0]),
+            // C6: the rows are the resolved cells — the same numbers here, because
+            // this fixture's single run starts at cell 0.
+            ("cells", vec![0.0, 1.0, 2.0, 3.0]),
         ],
         vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         vec![],

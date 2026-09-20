@@ -369,11 +369,11 @@ impl KvCache {
     /// Resolve each query token's allowed cell range into the `attn_span` input
     /// layout: `lo` of token `t` at `span[t]`, `hi` at `span[n + t]`.
     ///
-    /// `seq_ids[t]` names the sequence query `t` belongs to; `positions[t]` is
-    /// its write position, i.e. a cell index. The start comes from ownership and
-    /// **not** from the position (that is the point of E1); the position only
-    /// truncates the end, because a token may not attend to cells written after
-    /// it.
+    /// `seq_ids[t]` names the sequence query `t` belongs to; `positions[t]` is its
+    /// **sequence-relative** index (C6), resolved to a cell as `start + position`.
+    /// The start comes from ownership and **not** from the position (that is the
+    /// point of E1); the position only truncates the end, because a token may not
+    /// attend to cells written after it.
     ///
     /// Every layer owns the same cells — all mutations go through this store —
     /// so the first layer resolves and a debug assertion checks the rest agree.
@@ -403,17 +403,22 @@ impl KvCache {
                 format!("attn_span: query {t} belongs to sequence {seq}, which holds no cells")
             })?;
             let (start, cap) = (slot.start, slot.cap);
-            let pos = positions[t];
+            // C6: `positions[t]` is the token's index *within its sequence*, and
+            // the cell that row lives in is `start + position`. While a run starts
+            // at cell 0 the two coincide, which is why the single-sequence path is
+            // unchanged.
+            let rel = positions[t];
+            let cell = start + rel;
             // The query's own row must have been written by this sequence: a
             // window that included rows nobody wrote would attend to zeroes.
-            if pos < start || pos >= start + cap || owner.get(pos) != Some(&seq) {
+            if rel >= cap || owner.get(cell) != Some(&seq) {
                 return Err(format!(
-                    "attn_span: query {t} (sequence {seq}, position {pos}) is outside its \
-                     reserved run [{start}, {}) or its row is not written",
+                    "attn_span: query {t} (sequence {seq}, position {rel}) is outside its \
+                     reserved run [{start}, {}) or its row {cell} is not written",
                     start + cap
                 ));
             }
-            let hi = (start + cap).min(pos + 1);
+            let hi = (start + cap).min(cell + 1);
             span[t] = start as u32;
             span[n + t] = hi as u32;
         }
@@ -878,7 +883,8 @@ mod tests {
         assert_eq!(c.seq_range(0, 1).unwrap(), Some((3, 3)));
         assert_eq!(c.seq_range(1, 1).unwrap(), Some((3, 3)), "layers agree");
         // A token of each sequence, each at its own last position.
-        let span = c.attn_span(&[SEQ_MAIN, 1], &[2, 5]).unwrap();
+        // C6: positions are sequence-relative; cell = start + position.
+        let span = c.attn_span(&[SEQ_MAIN, 1], &[2, 2]).unwrap();
         assert_eq!(&span[..2], &[0, 3], "starts are each sequence's own");
         assert_eq!(&span[2..], &[3, 6], "ends are exclusive and causal");
         assert!(

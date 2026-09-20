@@ -4,7 +4,8 @@
 2026-09-16); Phase C **3/6** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
 its acceptance resolved on measured grounds, with the server-side dynamic-run
 trigger deliberately deferred; **C6 (logical positions) in progress on
-`feat/logical-positions`**; C4, C5 open); Phase D **3/3** (**D1 done**: views,
+`feat/logical-positions` — S0/S1/S2 landed, S3 (CUDA fused QKV family) next**; C4, C5
+open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
 macOS). **Next: C6, then C4/C5, then E3–E5.** Per-ticket evidence is in each phase's
@@ -645,13 +646,13 @@ prompt) belongs with E2's batching work.
   counters before/after; the moved bytes are exact — `V` verbatim and `K` exactly
   `rope_shift_kv(old, delta)`, both asserted — and a mid-session compaction leaves
   the continuation's **greedy token** intact (asserted; a wrong re-rope flips it).
-  Bit-identical *logits* are not claimed, and that is now a measured property
-  rather than an open question: a sequence's logits' tail already depends on its
-  absolute arena offset because the offset shifts every RoPE angle, and layer 0 is
-  exact within that rotation's rounding (1.5e-5 on the ropes, 7.3e-7 on the
-  attention output) while a quantised 24-layer stack amplifies it downstream —
-  `§14` row 9 carries the four probes. The criterion is therefore standing rule 3's
-  **named amplified-rounding class**, with the cause measured.
+  Bit-identical *logits* were **not** claimable before C6 (a cell move shifted every
+  RoPE angle, so the tail moved by the amplified rounding of that shift — `§14`
+  row 9 carries the four probes that attributed it). **C6 landed the construction
+  that removes it**: `positions` are sequence-relative and the allocator resolves
+  `cells`, so a compaction now changes no angle and the continuation is bitwise
+  (gated by `a_compaction_between_steps_keeps_the_continuation` and the inverted
+  offset tests).
 - **Follow-up: [C6](#c6--logical-positions-positions--cells)** does exactly this —
   sequence-relative `positions` plus an allocator-resolved `cells` input — which
   makes a cell move change nothing (a token's RoPE angle is its index within its
@@ -887,34 +888,35 @@ CUDA, then a docs progress update, then a commit on `feat/logical-positions`).
 
 #### C6 progress (2026-09-19)
 
-**S0 done** (`71b86da`, docs). **S1 code written, not yet green** — it lives in the
-branch's stash (`stash@{0}`) until the test migration finishes, because a step is
-committed only once its gate passes.
+**S0 done** (`71b86da`). **S1 + S2 landed** — the semantics switch and the re-rope
+removal went in as one commit, as the merged-step row above requires. Suites:
+**CPU 213 passed / 0 failed / 5 ignored**, **CUDA 261 passed / 0 failed / 5 ignored**.
 
-- **Done in the WIP**: `GraphBuilder::cells_input` and `kvcache_store` creating and
-  using it (callers no longer pass a row buffer); `KvCache::attn_span` resolving
-  `cell = run.start + position`; `GraphAllocator::kv_cells_for_seq` filling `cells`
-  (with the classic single-sequence identity fallback when no run is reserved);
-  `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` switched to relative
-  positions; qwen2/qwen3 gating the fused QKV family off under `explicit_span`;
-  `server/batch.rs` passing relative positions; `kv_defrag` no longer re-roping,
-  with the `KvRope` plumbing removed. CPU suite: **201 passed / 14 failed**, with
-  the compaction gate already passing once the re-rope was gone.
-- **Remaining, all in tests**: migrate the ones that still pass absolute cells as
-  positions (`kvcache::two_sequences_resolve_to_disjoint_windows`,
-  `cpu_backend::{embedding_and_rope, two_sequences_do_not_cross_attend,
-  the_minimal_attention_graph_is_offset_invariant_to_rounding}`,
-  `op_matrix::matrix_cases_match_their_reference`,
-  `models::qwen2::tests::batch_order_does_not_change_a_sequences_logits`); fill the
-  new `cells` input where a hand-built graph drives the store; move the bound checks
-  from `positions` to `cells` (`alloc::{position_beyond_n_ctx_is_rejected,
-  token_ids_are_not_bounded_by_n_ctx}`); look nodes up by name where the hardcoded
-  id shifted (`alloc::kv_regions_two_per_layer`); assert the moved K rows verbatim
-  instead of re-roped (`alloc::kv_defrag_moves_the_bytes_and_opens_the_run`); and
-  rewrite the four offset-sensitivity tests as **C6 gates** — with relative
-  positions a cell placement must no longer change anything, so they invert into
-  "bitwise equal at any cell", which is also the evidence §14 row 9 needs to be
-  rewritten as *resolved by C6*.
+What S1 changed (production):
+
+- `GraphBuilder::cells_input`; `kvcache_store` creates and consumes it, so callers
+  no longer pass a row buffer (26 call sites migrated);
+- `KvCache::attn_span` resolves `cell = run.start + position`;
+  `GraphAllocator::kv_cells_for_seq` fills `cells`, with the classic
+  single-sequence identity fallback when no run is reserved;
+- `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` use relative positions,
+  and `fill_attn_inputs` only resolves `cells` when the graph has that input (a
+  rope-only fixture must not need a KV arena);
+- qwen2/qwen3 gate the fused QKV family off while `explicit_span` is set (S3 ports
+  it for CUDA), and `server/batch.rs` passes relative positions;
+- `kv_defrag` no longer re-ropes and the `KvRope` plumbing is gone (S2).
+
+What the tests became, i.e. the new gates: the minimal hand-built attention graph
+asserts **bitwise** invariance to the cell placement (it used to be "within the
+rotation's rounding"); the four offset-sensitivity tests invert into "a cell
+placement changes nothing" (logits, per-layer V, per-node `q`/`k`/attention); and
+the perturbation probe was **deleted**, because its premise — that the offset
+effect needs explaining — is gone.
+
+One cosmetic follow-up for S3: the CUDA fixtures that drive `exec_ids` by hand
+still pass their `positions` buffer as the store's row input (they fill it with
+cells, so they are correct, but they do not fill the new `cells` input); they
+should bind the `cells` input for coherence once S3 touches those files.
 
 **Not in this ticket:** sharing one cell range across sequences (`owner[cell]`
 becomes a set/refcount — the real cross-slot prefix reuse, which this ticket makes
@@ -2068,4 +2070,4 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
 | 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |
-| 9 | **A sequence's logits' tail depends on its absolute arena offset — measured, attributed, closed** (found 2026-09-19 while gating C3). Same prompt at cell 0 vs cell 8, same relative window, both explicit: **2.6% relative** (0.43 absolute) in the **max |Δ| over the whole vocabulary**, greedy token unchanged, the run deterministic. Attribution, four probes that are now tests: (1) **the ops are exact** — the hand-built `q`/`k`/`v` → rope → store → attn graph at cells 0, 1 and 8 over five shapes including the model's `(nh=14, nk=2, hd=64)` is ≤ 1.2e-7, and equal for a 1-cell and an 8-cell offset (`the_minimal_attention_graph_is_offset_invariant_to_rounding`); (2) **the arena layout is irrelevant** — the same subject cells with the reservation split in two are bit-identical in every layer's V; (3) **`positions` has no hidden consumer** — exactly four nodes per layer (two ropes, the store, attention; 96 = 24×4); (4) **layer 0 is exact within the rotation's rounding** — `layer_0_is_offset_consistent_within_the_rotation_rounding_class` mirrors the scheduler's node loop and measures `q_roped` 1.5e-5 (rel 1.9e-7), `k_roped` 1.5e-5 (rel 1.2e-7) and the attention output 7.3e-7 (rel 7.3e-7) after aligning the rotation (the ropes matching the independent KV-level number is the probe's own validity check), while `the_offset_divergence_appears_between_layer_0_and_layer_1_kv` has layer 0's V bit-identical, layer 1's differing by 3.6e-3 and layer 2's by 1.2e-2. The layer-0 rounding is therefore **amplified downstream** by the quantised 24-layer stack: a rounding-sensitivity effect, not a kernel defect. Three method notes, each earned here: **a zero from a perturbation probe means nothing without a loud control**; **a control validates the path, not the equivalence of the perturbation** (a single K element nudged by 1e-5 is not the offset's *distributed* 1.5e-5 perturbation, so the round-5 "refutation" was an over-read — corrected); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness, and the recycled-memory artefacts it produced looked plausible enough to be believed). | measurement | Consequence for C3: acceptance is **byte-exact K/V** (`V` verbatim, `K` exactly `rope_shift_kv(old, delta)`, both gated) plus **a surviving greedy token** across a mid-session compaction (gated), with the logits' tail in the named amplified-rounding class — standing rule 3's tolerance-class route with the cause measured, not assumed. |
+| 9 | **A sequence's logits' tail depended on its absolute arena offset — resolved by C6 (2026-09-19)** (found while gating C3). The pre-C6 measurements stand and are what justified the fix: at cell 0 vs cell 8 the max |Δ| over the vocabulary was 2.6% relative with the greedy token unchanged and the run deterministic; the hand-built `q`/`k`/`v` → rope → store → attn graph is exact to ≤ 1.2e-7 at the model's own shape *and* equal for a 1-cell and an 8-cell offset; the arena layout is irrelevant (a split reservation is bit-identical per layer); `positions` had exactly four consumers per layer (96 = 24×4); a layer bisect put the entry at layer 0's attention output; and the **rope-injection intervention** proved the entry is RoPE alone (injecting run A's 48 rope outputs into run B made the logits bitwise identical), while a distributed ~1e-6 rope perturbation already saturates the tail (0.44 vs 0.43) with the greedy token stable from 1e-6 to 1e-2. **C6 removed the coupling** — `positions` are sequence-relative and the allocator resolves `cells` — so a cell move changes no angle: the offset tests now assert bitwise equality, C3's acceptance tightens from the named amplified-rounding class to bit-identical, and a compaction no longer re-ropes. Three method notes earned here: a zero from a perturbation probe means nothing without a loud control; **a control validates the path, not the equivalence of the perturbation** (a single element nudged by 1e-5 is not the offset's distributed 1.5e-5 — the earlier "refutation" was an over-read); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness). | measurement | Done by C6; the logical-positions design, its gates and the CUDA fused-op port (S3) are in §5. |

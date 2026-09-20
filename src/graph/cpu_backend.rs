@@ -792,7 +792,7 @@ mod tests {
             };
             let q_r = b.rope(qq, pos, RopeStyle::NonInterleaved, rope(nh));
             let k_r = b.rope(kk, pos, RopeStyle::NonInterleaved, rope(nk));
-            let _store = b.kvcache_store(0, k_r, vv, pos, n_ctx);
+            let _store = b.kvcache_store(0, k_r, vv, n_ctx);
             let kv = b.kvcache_load(0, nkt, n_ctx, nk);
             let at = b.attn(
                 q_r,
@@ -828,10 +828,16 @@ mod tests {
                 alloc.fill_input(&g, "q", &q).unwrap();
                 alloc.fill_input(&g, "k", &k).unwrap();
                 alloc.fill_input(&g, "v", &v).unwrap();
-                let positions: Vec<u32> = (start..start + n).map(|p| p as u32).collect();
+                // C6: `positions` are sequence-relative (the token's index), the
+                // KV rows are the resolved `cells`, and the span stays a cell
+                // range. The rotation therefore sees the same angles at every
+                // `start`, which is what makes the comparison bitwise.
+                let positions: Vec<u32> = (0..n).map(|p| p as u32).collect();
+                let cells: Vec<u32> = (start..start + n).map(|p| p as u32).collect();
                 let mut span = vec![start as u32; n];
                 span.extend((0..n).map(|t| (start + t + 1) as u32));
                 alloc.fill_input_i32(&g, "positions", &positions).unwrap();
+                alloc.fill_input_i32(&g, "cells", &cells).unwrap();
                 alloc.fill_input_i32(&g, "attn_span", &span).unwrap();
                 let mut sched = crate::graph::scheduler::BackendScheduler::new();
                 sched.execute(&g, &mut alloc).expect("execute");
@@ -850,13 +856,15 @@ mod tests {
             eprintln!(
                 "[minimal] nh={nh} nk={nk} hd={hd} n={n}: cell0-vs-1 {near} | cell0-vs-8 {far}"
             );
-            // The ops are exact: a same-relative-window run at another cell may
-            // differ only by the rotation's own rounding (measured <= 1.2e-7 at
-            // the model's shape), so the model-level divergence is not theirs
-            // (plan §14 row 9).
-            assert!(
-                near < 1e-6 && far < 1e-6,
-                "the minimal attention graph must stay offset-invariant: {near} / {far}"
+            // C6: with relative positions a cell placement changes nothing at
+            // all — the rows are written verbatim and read through the same
+            // relative window, so this is bitwise, not a tolerance class. (Before
+            // C6 the same comparison differed by the rotation's own rounding,
+            // measured <= 1.2e-7; plan §14 row 9.)
+            assert_eq!(
+                (near, far),
+                (0.0, 0.0),
+                "a cell placement must not change the attention output"
             );
         }
     }
@@ -1107,7 +1115,7 @@ mod tests {
         let q = gb.input("q", [4, 1, 1, 1], DType::F32);
         let k = gb.input("k", [4, 1, 1, 1], DType::F32);
         let v = gb.input("v", [4, 1, 1, 1], DType::F32);
-        let _st = gb.kvcache_store(0, k, v, pos, 8);
+        let _st = gb.kvcache_store(0, k, v, 8);
         let kv = gb.kvcache_load(0, 4, 8, 2);
         let out = gb.attn(
             q,
@@ -1163,7 +1171,7 @@ mod tests {
         let q = gb.input("q", [2, 2, 1, 1], DType::F32);
         let k = gb.input("k", [2, 2, 1, 1], DType::F32);
         let v = gb.input("v", [2, 2, 1, 1], DType::F32);
-        let _st = gb.kvcache_store(0, k, v, pos, 4);
+        let _st = gb.kvcache_store(0, k, v, 4);
         let kv = gb.kvcache_load(0, 2, 4, 1);
         let out = gb.attn(
             q,
@@ -1197,8 +1205,11 @@ mod tests {
 
         h.alloc.alloc_graph(&g).unwrap();
         // Sequence 0 owns row 0, sequence 1 owns row 2 (rows 1 and 3 stay free).
-        h.alloc.fill_input_i32(&g, "positions", &[0, 2]).unwrap();
+        // C6: `positions` are each token's index within its sequence, while the
+        // store's rows come from the resolved `cells`.
+        h.alloc.fill_input_i32(&g, "positions", &[0, 0]).unwrap();
         h.alloc.fill_input_i32(&g, "seq_ids", &[0, 1]).unwrap();
+        h.alloc.fill_input_i32(&g, "cells", &[0, 2]).unwrap();
         // The span layout is the `lo` block then the `hi` block: token 0 gets
         // `[0, 1)` (sequence 0's only row) and token 1 `[2, 3)` (sequence 1's).
         h.alloc
