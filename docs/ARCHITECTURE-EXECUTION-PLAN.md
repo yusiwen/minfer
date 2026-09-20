@@ -963,6 +963,10 @@ the fused and unfused chains within noise (92.6 vs 92.7 tok/s best case), which
 is expected for a bandwidth-bound model and is why the port's value is
 correctness and parity, not throughput.
 
+The two pre-C6 experiments that established the attribution above — the RoPE
+injection (EXP1) and the distributed perturbation sweep (EXP2) — are archived with
+their code and measured numbers in `experiments/logical-positions/`.
+
 **Not in this ticket:** sharing one cell range across sequences (`owner[cell]`
 becomes a set/refcount — the real cross-slot prefix reuse, which this ticket makes
 possible), C4 (quantized KV) and C5 (state save/restore) — both should follow this,
