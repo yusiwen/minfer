@@ -35,7 +35,10 @@ src/
 │                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
 ├── server/          # OpenAI-compatible HTTP server (axum); `batch.rs` = continuous
 │                    #   batching (E2/E6: default follows the device — on for CUDA, off
-│                    #   for CPU/Metal; 0.49x on CPU, 1.97x on GPU; MINFER_BATCH=0/1 overrides)
+│                    #   for CPU/Metal; 0.49x on CPU, 1.97x on GPU; MINFER_BATCH=0/1 overrides);
+│                    #   C7: the per-slot partition is elastic — a request that needs more
+│                    #   than its share reclaims the idle slots above it and re-reserves in
+│                    #   place, so a grown run keeps its rows and its `start`
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)

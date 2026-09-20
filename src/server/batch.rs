@@ -90,6 +90,42 @@ pub struct BatchEngine {
     special: SpecialTokens,
 }
 
+/// C7: the cells a request wants reserved — pure, so the growth policy is
+/// unit-tested without a model (the same reason `batch_mode` is pure).
+///
+/// A bounded request asks for its prompt plus its whole `max_tokens`; an
+/// unbounded one asks for the prompt plus the slot's current capacity as
+/// headroom, which is enough to serve it without claiming the arena for an
+/// answer that may stop after a few tokens. The result is clamped to the arena
+/// and never falls below the prompt: a prompt that does not fit at all stays the
+/// caller's loud `exceed_context` error instead of becoming a smaller number here.
+fn wanted_cells_from(nt: usize, max_tokens: i64, slot_cap: usize, n_ctx_total: usize) -> usize {
+    let headroom = if max_tokens < 0 {
+        slot_cap
+    } else {
+        max_tokens as usize
+    };
+    // `+ 1`: the served request forwards one token past its last generated one
+    // before it can report `length` (see the bound in `advance`), and that step
+    // writes a cell.
+    nt.saturating_add(headroom)
+        .saturating_add(1)
+        .min(n_ctx_total)
+        .max(nt)
+}
+
+/// Follow the run moves a KV operation returned (C3/C7): every slot that caches
+/// its run's `start` adopts the new position. The engine is the one place that
+/// keeps a `start` across calls, so this is where the contract `kv_defrag`
+/// documents is discharged.
+fn apply_run_moves(slots: &mut [SlotState], moves: &[crate::graph::kvcache::KvMove]) {
+    for m in moves {
+        if let Some(s) = slots.iter_mut().find(|s| s.seq == m.seq) {
+            s.start = m.to;
+        }
+    }
+}
+
 impl BatchEngine {
     /// Reserve one run per slot in a single arena. The reservations are made
     /// once and kept: a slot that finishes a request keeps its rows and its
@@ -118,11 +154,7 @@ impl BatchEngine {
                 .alloc()
                 .kv_reserve_seq_with_defrag(seq, cap)
                 .map_err(|e| format!("slot {i}: {e}"))?;
-            for m in &moves {
-                if let Some(s) = slots.iter_mut().find(|s| s.seq == m.seq) {
-                    s.start = m.to;
-                }
-            }
+            apply_run_moves(&mut slots, &moves);
             slots.push(SlotState {
                 seq,
                 start: slot.start,
@@ -137,6 +169,142 @@ impl BatchEngine {
             slots,
             special: model.special_tokens(),
         })
+    }
+
+    /// C7: make slot `idx` hold at least `want` cells, by **reclaiming idle
+    /// capacity above it** and re-reserving the slot in place.
+    ///
+    /// Why this shape. C6 makes a cell move free of arithmetic — a moved row
+    /// keeps its sequence-relative position, so no other slot's logits change and
+    /// nothing re-ropes — which is what makes an elastic partition possible at
+    /// all. The reservation still has to be *contiguous per sequence*, and the
+    /// arena is packed from cell 0, so growing a slot means the runs above it must
+    /// get out of the way. This increment moves them by **releasing the idle ones**
+    /// (their only cost is B2's prefix hint, which the slot re-prefills when it is
+    /// next used) and then re-reserving this slot's run at its existing `start`,
+    /// where its written rows already are. A *busy* run above the slot is never
+    /// touched: that case needs an upward row move, which `Backend::copy_cells`
+    /// does not implement yet, so it stays a loud refusal (recorded as C7's
+    /// follow-up) rather than a silent repartition.
+    ///
+    /// Failing soft is deliberate: a slot that cannot grow keeps its rows and its
+    /// capacity when they can be restored, and otherwise drops to "no reservation"
+    /// and re-prefills on its next request. What it never does is keep reading
+    /// rows at an offset its run no longer has.
+    fn ensure_slot_capacity(&mut self, idx: usize, want: usize) {
+        let want = want.min(self.n_ctx_total);
+        if want == 0 || self.slots[idx].cap >= want {
+            return;
+        }
+        // A slot whose run was reclaimed earlier (or that never had one) reserves
+        // from scratch; first-fit plus C3's compaction decides where it lands.
+        if self.slots[idx].cap == 0 {
+            let seq = self.slots[idx].seq;
+            if let Ok((slot, moves)) = self.cache.alloc().kv_reserve_seq_with_defrag(seq, want) {
+                apply_run_moves(&mut self.slots, &moves);
+                self.slots[idx].start = slot.start;
+                self.slots[idx].cap = slot.cap;
+            }
+            return;
+        }
+        let mut reclaimed = 0usize;
+        for j in (idx + 1)..self.slots.len() {
+            if self.slots[j].run.is_none() && self.slots[j].cap > 0 {
+                self.cache.alloc().kv_release_seq(self.slots[j].seq);
+                self.slots[j].cached_tokens.clear();
+                self.slots[j].cap = 0;
+                reclaimed += 1;
+            }
+        }
+        let start = self.slots[idx].start;
+        let before = self.slots[idx].cap;
+        let grew = self.reserve_in_place(idx, want, start);
+        // A reclaimed idle slot loses B2's prefix hint (it re-prefills next time),
+        // so say so once per growth — silence would make that invisible.
+        eprintln!(
+            "[server] slot {idx}: capacity {before} -> {} cells for a request wanting {want} \
+             (released {reclaimed} idle slot(s) above; rows kept: {grew})",
+            self.slots[idx].cap
+        );
+    }
+
+    /// Reserve `cells` for `self.slots[idx]`'s sequence and adopt the result
+    /// **only if it lands at `expect`**, which is where the slot's written rows
+    /// physically are. Returns whether the slot kept them.
+    fn reserve_in_place(&mut self, idx: usize, cells: usize, expect: usize) -> bool {
+        let seq = self.slots[idx].seq;
+        let written = self.slots[idx].cached_tokens.len();
+        let (old_start, old_cap) = (self.slots[idx].start, self.slots[idx].cap);
+        self.cache.alloc().kv_release_seq(seq);
+        let attempt = self.cache.alloc().kv_reserve_seq_with_defrag(seq, cells);
+        match attempt {
+            Ok((slot, moves)) if slot.start == expect => {
+                apply_run_moves(&mut self.slots, &moves);
+                if written > 0 {
+                    let cells = written.min(slot.cap);
+                    self.cache
+                        .alloc()
+                        .kv_own_range(seq, slot.start, slot.start + cells);
+                }
+                self.slots[idx].start = slot.start;
+                self.slots[idx].cap = slot.cap;
+                true
+            }
+            Ok((slot, moves)) => {
+                // First-fit put the run somewhere its rows are not. Give the
+                // rows up (the next request re-prefills) instead of reading them
+                // at the wrong offset — a silent wrong-row read is the one
+                // outcome C6 exists to prevent.
+                let _ = slot;
+                apply_run_moves(&mut self.slots, &moves);
+                self.cache.alloc().kv_release_seq(seq);
+                self.forget_slot(idx);
+                false
+            }
+            Err(_) => {
+                // Could not fit the request after all: put the slot back the way
+                // it was, rows and all (nothing has moved), so it keeps serving.
+                match self
+                    .cache
+                    .alloc()
+                    .kv_reserve_seq_with_defrag(seq, old_cap.max(1))
+                {
+                    Ok((slot, moves)) if slot.start == old_start => {
+                        apply_run_moves(&mut self.slots, &moves);
+                        if written > 0 {
+                            let cells = written.min(slot.cap);
+                            self.cache
+                                .alloc()
+                                .kv_own_range(seq, slot.start, slot.start + cells);
+                        }
+                        self.slots[idx].start = slot.start;
+                        self.slots[idx].cap = slot.cap;
+                    }
+                    _ => {
+                        self.cache.alloc().kv_release_seq(seq);
+                        self.forget_slot(idx);
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Drop a slot's reservation bookkeeping: no run, no rows, no prefix hint.
+    fn forget_slot(&mut self, idx: usize) {
+        self.slots[idx].start = 0;
+        self.slots[idx].cap = 0;
+        self.slots[idx].cached_tokens.clear();
+    }
+
+    /// C7: the cells a request wants reserved, clamped to the arena. A bounded
+    /// request asks for its prompt plus its whole `max_tokens`; an unbounded one
+    /// asks for the prompt plus the slot's current capacity as headroom — enough
+    /// to serve it without claiming the arena for an answer that may stop early.
+    /// A prompt that already fits its slot asks for nothing new, so the common
+    /// case does not repartition at all.
+    fn wanted_cells(&self, idx: usize, nt: usize, max_tokens: i64) -> usize {
+        wanted_cells_from(nt, max_tokens, self.slots[idx].cap, self.n_ctx_total)
     }
 
     pub fn n_slots(&self) -> usize {
@@ -278,6 +446,8 @@ impl BatchEngine {
         for (_, job, slot) in placed {
             let (feed_from, _) = self.feed_span(*slot, &job.input_ids);
             let nt = job.input_ids.len();
+            let want = self.wanted_cells(*slot, nt, job.params.max_tokens);
+            self.ensure_slot_capacity(*slot, want);
             let cap = self.slots[*slot].cap;
             if nt > cap {
                 return Err(format!(
@@ -356,6 +526,10 @@ impl BatchEngine {
             return Err(ApiError::unavailable(format!("slot {idx} is busy")));
         }
         let nt = job.input_ids.len();
+        // C7: size the slot from this request instead of leaving the startup
+        // partition in place (see `ensure_slot_capacity`).
+        let want = self.wanted_cells(idx, nt, job.params.max_tokens);
+        self.ensure_slot_capacity(idx, want);
         let cap = self.slots[idx].cap;
         if nt > cap {
             return Err(ApiError::exceed_context(format!(
@@ -545,6 +719,12 @@ impl BatchEngine {
         if params.max_tokens >= 0 && *completion_tokens as i64 >= params.max_tokens {
             return Ok(StepOutcome::Finish("length"));
         }
+        // C7: `tick` forwards the committed token *before* this check runs, so a
+        // generation that reaches its cap performs one more forward at the cell
+        // after its last token and stops here — which is why `wanted_cells`
+        // reserves `max_tokens + 1` (see `wanted_cells_from`): asking for exactly
+        // `prompt + max_tokens` leaves that boundary step without a cell, and
+        // `kv_cells_for_seq` rejects the batch.
         if *current_pos >= cap {
             return Ok(StepOutcome::Finish("length"));
         }
@@ -879,6 +1059,74 @@ mod tests {
     ///
     /// Ignored by default like the other real-model tests:
     ///   cargo test --release --bin minfer -- --ignored server_batch --nocapture
+    /// C7: the growth policy is pure, and it plans from the request rather than
+    /// from the startup partition.
+    #[test]
+    fn wanted_cells_plans_from_the_request() {
+        // 4 slots over 2048 cells: 512 each. A prompt plus its answer that fit
+        // ask for nothing new, so the common case never repartitions.
+        assert_eq!(wanted_cells_from(100, 64, 512, 2048), 165);
+        assert!(wanted_cells_from(100, 64, 512, 2048) <= 512);
+        // An unbounded answer takes the slot's current capacity as headroom.
+        assert_eq!(wanted_cells_from(100, -1, 512, 2048), 613);
+        // A prompt past the partition asks for the prompt plus that headroom...
+        assert_eq!(wanted_cells_from(1000, -1, 512, 2048), 1513);
+        // ...clamped to the arena...
+        assert_eq!(wanted_cells_from(1000, 100_000, 512, 2048), 2048);
+        // ...and never below the prompt, so an impossible request stays the
+        // caller's loud error instead of quietly shrinking into a smaller ask.
+        assert_eq!(wanted_cells_from(4000, 8, 512, 2048), 4000);
+    }
+
+    /// C7 acceptance: a request whose prompt does not fit its share of the arena
+    /// is served anyway, and the repartition cannot change the answer.
+    ///
+    /// Four slots over `n_ctx` give each slot `n_ctx/4`, and the prompt below
+    /// needs most of the arena, so it can only be served by reclaiming the idle
+    /// slots above it. Both admission paths are driven — `run_batched` goes
+    /// through `submit`/`prefill_group`, `run_serial` through `submit_on`, which
+    /// is the one the server uses — and both must agree with a one-slot engine,
+    /// which needs no reclaim at all. That equality is the C6 payoff: a moved row
+    /// keeps its sequence-relative position, so where the partition puts a
+    /// sequence cannot show up in its logits.
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn a_long_request_may_use_the_whole_arena() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the C7 gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode(&"buffalo ".repeat(300));
+        let n_ctx = ids.len() + 64;
+        assert!(
+            ids.len() > n_ctx / 2,
+            "the prompt must not fit a quarter-slot partition: {} tokens over {n_ctx} cells",
+            ids.len()
+        );
+        let (group, _) = run_batched(&*model, &tok, &[ids.clone()], 4, n_ctx, 8, false);
+        let (slot, _) = run_serial(&*model, &tok, &[ids.clone()], 4, n_ctx, 8);
+        let (alone, _) = run_batched(&*model, &tok, &[ids], 1, n_ctx, 8, false);
+        assert!(
+            !group[0].text.is_empty() && !slot[0].text.is_empty(),
+            "the long request must be served, not rejected ({} / {})",
+            group[0].reason,
+            slot[0].reason
+        );
+        assert_eq!(
+            group[0].text, alone[0].text,
+            "reclaiming idle capacity changed the continuation ({} vs {} tokens)",
+            group[0].tokens, alone[0].tokens
+        );
+        assert_eq!(
+            slot[0].text, alone[0].text,
+            "the server's own admission path disagrees after a reclaim ({} vs {} tokens)",
+            slot[0].tokens, alone[0].tokens
+        );
+    }
+
     #[test]
     #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
     fn server_batch_matches_serial_and_is_faster() {

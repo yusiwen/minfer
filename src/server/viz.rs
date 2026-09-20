@@ -122,6 +122,7 @@ pub fn run_viz(
             .first()
             .and_then(|p| p.ctx.get_key_val_str("general.name"))
             .unwrap_or_else(|| "minfer-model".to_string()),
+        n_ctx,
         n_ctx_slot,
         tokenizer: Arc::new(tokenizer),
         chat_template: template,

@@ -35,6 +35,10 @@ use types::{ApiError, ChatCompletionRequest, SamplingParams};
 pub struct AppState {
     pub job_tx: mpsc::Sender<Job>,
     pub model_name: String,
+    /// The whole arena. C7: an admission may repartition it, so the request bound
+    /// is this, not `n_ctx_slot` (which is only the startup share a slot holds
+    /// before a long request reclaims the idle slots above it).
+    pub n_ctx: usize,
     pub n_ctx_slot: usize,
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template: Option<String>,
@@ -84,6 +88,7 @@ pub fn run(
     let state = Arc::new(AppState {
         job_tx,
         model_name,
+        n_ctx,
         n_ctx_slot,
         tokenizer: Arc::new(tokenizer),
         chat_template: template,
@@ -156,11 +161,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
             "rendered prompt tokenizes to nothing",
         ));
     }
+    // C7: the bound is the whole arena, not a slot's share. The batched engine
+    // repartitions on admission (an idle slot's cells are reclaimable) and answers
+    // with its own `exceed_context` when even that cannot serve the request; the
+    // serial path (batching off) still holds only its slot's share and reports the
+    // same error from `generate_seq`.
     let prompt_tokens = input_ids.len();
-    if prompt_tokens > state.n_ctx_slot {
+    if prompt_tokens > state.n_ctx {
         return error_response(&ApiError::exceed_context(format!(
-            "prompt of {prompt_tokens} tokens exceeds slot context of {}",
-            state.n_ctx_slot
+            "prompt of {prompt_tokens} tokens exceeds the context of {}",
+            state.n_ctx
         )));
     }
 
