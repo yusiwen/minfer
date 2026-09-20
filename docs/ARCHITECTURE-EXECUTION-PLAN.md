@@ -1,13 +1,14 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **3/5** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
+2026-09-16); Phase C **3/6** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
 its acceptance resolved on measured grounds, with the server-side dynamic-run
-trigger deliberately deferred; C4=C5 open); Phase D **3/3** (**D1 done**: views,
+trigger deliberately deferred; **C6 (logical positions) in progress on
+`feat/logical-positions`**; C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
-macOS). **Next: C4/C5, then E3–E5.** Per-ticket evidence is in each phase's record
-and in the §14 open-risks table.
+macOS). **Next: C6, then C4/C5, then E3–E5.** Per-ticket evidence is in each phase's
+record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
@@ -651,14 +652,11 @@ prompt) belongs with E2's batching work.
   attention output) while a quantised 24-layer stack amplifies it downstream —
   `§14` row 9 carries the four probes. The criterion is therefore standing rule 3's
   **named amplified-rounding class**, with the cause measured.
-- **Follow-up (recorded, not started):** if bit-identical *logits* are ever
-  required — for a caller that compares exact outputs rather than decisions — the
-  route is **logical positions**: let callers pass sequence-relative `positions`
-  and let the allocator resolve `cells` (a new input for the store and the fused
-  store ops), so a token's RoPE angle is its index within its sequence and a cell
-  move changes nothing. That removes the offset sensitivity and C3's K re-rope
-  together. It touches the CUDA/Metal `FusedQKV` and `QkvBiasRopeStore` decode
-  paths, which is why it is a ticket of its own rather than a footnote here.
+- **Follow-up: [C6](#c6--logical-positions-positions--cells)** does exactly this —
+  sequence-relative `positions` plus an allocator-resolved `cells` input — which
+  makes a cell move change nothing (a token's RoPE angle is its index within its
+  sequence) and drops C3's K re-rope. When C6 lands, this ticket's acceptance
+  tightens from the named amplified-rounding class back to **bit-identical logits**.
 
 #### C3 design (written before the code, 2026-09-19)
 
@@ -813,6 +811,86 @@ offset sensitivity altogether.
   bitwise) plus a memory-footprint measurement.
 - C5: write/read the KV state to a file; acceptance = a session resumed from
   disk produces the same continuation as one that stayed in memory.
+
+### C6 — Logical positions (`positions` ≠ cells)
+
+**Why.** §14 row 9 closed the cell-offset sensitivity by measurement: a sequence's
+logits' tail changes when its run moves because `positions` is *both* the RoPE angle
+and the KV cell index, so a cell move shifts every rotation. The intervention
+experiment proved that RoPE is the **only** entry (`offset_divergence_is_caused_by_the_rope_rounding_alone`:
+injecting run A's 48 rope outputs into run B makes the logits bitwise identical),
+and the sweep showed the effect saturates at a ~1e-6 distributed perturbation
+(`a_distributed_rope_perturbation_saturates_the_logits_tail`). Two consequences
+drive this ticket: C3's compaction needs a K re-rope (and can never be
+bit-identical), and any future cross-slot sharing inherits the same coupling.
+
+**Semantics.** `positions` becomes what a caller naturally has — the token's index
+*within its sequence* — and the allocator resolves, per token, the KV row it must
+be written to:
+
+| Input | Meaning | Consumed by |
+|---|---|---|
+| `positions` | sequence-relative token index | RoPE (q and k), the causal bound |
+| `cells` (new) | the row `KvCache` resolves for `(seq, position)` | `KvcacheStore` (and the fused QKV family, S3) |
+| `attn_span` | unchanged: the `[lo, hi)` **cell** range | attention |
+
+The single-sequence case is unchanged by construction: its run starts at cell 0,
+so `cells[t] == positions[t]`, and the classic path stays bitwise.
+
+**Invariants / gates.**
+1. every existing single-sequence test stays bitwise (regression);
+2. batched forward == the same sequences run one at a time, **same layout**,
+   bitwise (the existing gate, migrated to relative positions);
+3. **a compaction between steps leaves the logits bitwise identical** — the literal
+   acceptance C3 could not claim before, and the reason this ticket exists;
+4. a backend that cannot resolve `cells` refuses the node (`Err`, no silent
+   fallback); Metal is out of reach by construction because it already refuses
+   multi-sequence attention (`supports_attn_span() == false`), so it never sees a
+   non-zero run start and keeps `positions == cells` (recorded as G5, no Metal code
+   change in this ticket);
+5. decode timing on GB10 does not regress (the fused QKV family is the only hot
+   path this touches, ported in S3 with its own A/B).
+
+**Change surface.**
+- **IR**: `GraphBuilder::kvcache_store` wires its row input to a new `cells` node
+  (created like `attn_span`); the fused QKV family (`FusedQKV`,
+  `QkvBiasRopeStore`, `FusedQkvNorm`) is gated off while `explicit_span` is set
+  (S1) and takes `cells` in S3.
+- **Allocator**: `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` stop
+  treating `positions` as cells — `own_range`, `kv_note_used` and `attn_span`
+  resolve through the run table — and fill `cells`.
+- **KV store**: `KvCache::cells_for` (today the identity) and `attn_span` (today
+  requires `position ∈ run` and `owner[position] == seq`) become the resolver;
+  `check_positions_bound` / `check_attn_span` check the *cells* form.
+- **Models**: `forward_batch`'s `explicit_span` decision and positions stay as they
+  are semantically; the store wiring is inside `kvcache_store`.
+- **Server**: `positions = slot.start + current_pos` becomes `current_pos`;
+  `SlotState.start` drops to reporting/diagnostics.
+- **Backends**: the `KvcacheStore` arms need **no change** — they already write at
+  the rows their third input names; only that input's producer changes. This is
+  what makes S1 landable with the suite green on all three backends.
+- **C3**: `kv_defrag(need, rope)` loses the rope parameter, and the `KvRope` plumbing
+  added for the re-rope goes away.
+
+**Staged plan** (each step: local CPU suite, plus the CUDA suite when it touches
+CUDA, then a docs progress update, then a commit on `feat/logical-positions`).
+
+| Step | Content | Gate |
+|---|---|---|
+| S0 | this design, the roadmap/status corrections | docs build |
+| S1 | `cells` wiring + allocator/kvcache resolver + model/server switch + fused QKV gated off under `explicit_span` | invariants 1–2, 4; CPU+CUDA suites |
+| S2 | compaction without a re-rope; the bit-identity gate | invariants 1–3 |
+| S3 | CUDA fused QKV family takes `cells`; the gate re-enabled for CUDA | invariant 5 + fused-vs-unfused bitwise + capture regression |
+| S4 | docs closure (roadmap §2.4, AGENTS rules, design docs) | docs build |
+| S5 | PR, CI three jobs green with zero annotations, rebase merge | CI |
+
+**Not in this ticket:** sharing one cell range across sequences (`owner[cell]`
+becomes a set/refcount — the real cross-slot prefix reuse, which this ticket makes
+possible), C4 (quantized KV) and C5 (state save/restore) — both should follow this,
+because each would otherwise multiply the addressing surface.
+- **Explicitly not changed:** C2's `kv_rm`/`kv_shift` re-rope stays: it changes
+  *positions*, not cells, so the angles genuinely have to move. Only the
+  *compaction* re-rope disappears.
 
 ## 6. Phase D — IR expressiveness (item 7)
 
