@@ -1,14 +1,16 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **3/6** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
-its acceptance resolved on measured grounds, with the server-side dynamic-run
-trigger deliberately deferred; **C6 (logical positions) in progress on
-`feat/logical-positions` — S0–S4 landed (code + docs), PR/CI next**; C4, C5
+2026-09-16); Phase C **4/8** (C1, C2, **C3** and **C6 (logical positions)** done —
+C6 merged 2026-09-20 as `001b8cc`; **C7 (dynamic runs: one request may use the whole
+arena)** and **C8 (cross-sequence cell sharing)** are the two user-visible limits
+C6's design left open and are **scheduled ahead of the rest of the phase**; C4, C5
 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
-E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
-macOS). **Next: C6, then C4/C5, then E3–E5.** Per-ticket evidence is in each phase's
+E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** (G1–G3 now, then
+the KV path port **G5 after C8**; device claims need a Mac — CI's `build-macos` is
+the compile check). **Next: G1–G3 (small, independent), then C7, C8, then G5, then
+C4/C5, then E3–E5.** Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
@@ -975,6 +977,68 @@ because each would otherwise multiply the addressing surface.
   *positions*, not cells, so the angles genuinely have to move. Only the
   *compaction* re-rope disappears.
 
+### C7 — Dynamic runs: one request may use the whole arena · follows C6 · M
+
+**Why (user-visible).** `BatchEngine::new` hands every slot a fixed
+`cap = n_ctx_total / n_slots` up front, and `submit_on` rejects anything whose
+`prompt + generation` exceeds that cap (`prompt of N tokens exceeds slot context of
+M`). With `--n-slots 4 --n-ctx 8192`, a single 6000-token request is refused while
+three slots sit idle and their rows are free: the **arena** is sized for the total,
+the **partition** is the limit. This is the most user-visible consequence of the
+fixed reservation and the reason C3's "server-side dynamic-run trigger" was recorded
+as a follow-up instead of being closed with C3.
+
+**What.** Make the partition elastic instead of fixed:
+- a slot may grow past its initial cap when the admitted request needs it, via
+  `kv_reserve_seq_with_defrag(seq, need)` — C3 already plans the move, copies the
+  rows through `Backend::copy_cells` and returns the moves;
+- the shrinking slots are re-reserved around the growth, and **every caller that
+  cached a run `start`** (E2's `SlotState`) applies the returned moves — the contract
+  `kv_defrag` already documents. C6 is what makes this safe: a moved row keeps its
+  sequence-relative position, so no other slot's logits change and nothing re-ropes;
+- the repartition happens at one serialization point (admission), so no in-flight
+  step can observe a half-moved arena;
+- a genuinely full arena still rejects loudly with the existing message shape — one
+  request never silently shrinks another's context.
+
+**Gates.** (1) `--n-slots 4 --n-ctx 8192` serves one request of ~8k tokens while the
+other slots are idle (the literal requirement); (2) after a grow, each idle slot's
+next request is **bitwise identical** to the same request on a fresh engine; (3) the
+4-slot batched-vs-serial byte-equality test stays green
+(`server_batch_matches_serial_and_is_faster`, run locally with `--ignored`); (4) the
+CUDA batched-decode throughput stays within noise of the recorded numbers.
+
+**Not in this ticket:** sharing (C8) — C7 only makes the partition elastic, two
+sequences still never look at the same cell.
+
+### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L
+
+**Why.** A prefix shared by several sequences (a system prompt on every slot; B2's
+prefix reuse, but *across* slots) is duplicated today: each slot stores its own copy
+and pays its own prefill, so N sharers cost N× the memory and N× the prefill for the
+same tokens. llama.cpp's unified cache shares one cell between sequences through a
+per-cell sequence set (`seq[i]` is a bitset, with `seq_cp`/`seq_rm`/`seq_keep` over
+it); this ticket is that capability, scoped to what minfer's server needs.
+
+**What.** `KvCache::owner[cell]` becomes a set (bitset or refcount); `attn_span` and
+`kv_cells_for_seq` accept "owned by any of these sequences"; a new
+`kv_seq_cp(src, dst, range)` shares a prefix's cells with another sequence; `kv_rm`
+frees a cell only when its last owner drops it; and the store must not write *into* a
+shared prefix — the first divergent token copies the shared cell it would have
+overwritten into a private one (copy-on-write). The CoW rule is the delicate part: a
+store that wrote through a shared row would corrupt every sharer, so it is either
+implemented or refused, never ignored.
+
+**Gates.** (1) two slots sharing a prefix produce continuations **bitwise identical**
+to the same two slots run with private copies (CPU first; CUDA may take a named
+tolerance class only if a kernel shape differs); (2) removing one sharing sequence
+leaves the other's logits bitwise; (3) a store that would write into a shared cell
+copies it or fails loudly; (4) `KvArenaStats` counts a shared cell once, not once per
+owner (memory-footprint measurement).
+
+**Depends on:** C7 (elastic runs — shared prefix plus growth is what the server
+actually needs); C1's owner table and C6's resolver are the hooks.
+
 ## 6. Phase D — IR expressiveness (item 7)
 
 | ID | Title | Effort |
@@ -1921,24 +1985,38 @@ F1 is the only item in this plan that **cannot be verified on this machine**
 single CPU win, so it should be scheduled against hardware availability, not
 against the critical path.
 
-## 10. Phase G — Metal alignment round (deferred by decision)
+## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
-Nothing in this plan edits Metal. This phase collects the debt so it is not
-forgotten:
+Metal is a first-class target — it is the default backend on macOS and a plain
+`cargo build --release` builds it — so this phase is **scheduled, not deferred**.
+Only the *device* half waits: CI's `build-macos` job already compile-checks any
+Metal change, and per the standing rule a Metal-only change is recorded as
+compile-verified or left behind a build-time gate when it cannot be run here.
 
-| ID | Origin | Work |
-|---|---|---|
-| G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` |
-| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` |
-| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) |
-| G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` |
-| G5 | C1/C2/E1 | Port the cell store, the KV removal and the explicit attention mask to Metal (`copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting) |
-| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool |
-| G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3, since both change a kernel path |
+**Order and rationale.** G1–G3 first: each is small, independent of the KV semantics,
+and removes a way Metal can be *wrong* (missing guard, `debug_assert!` on a release
+path, a silent weightless-RMSNorm fallback). Then **G5 after C7/C8**, deliberately:
+porting the cell store before the arena becomes elastic (C7) and shareable (C8) would
+mean writing the same semantics into Metal twice. G4/G6/G7 follow G5.
 
-Entry condition: a machine that can build and run the Metal backend. Exit
-condition: `SUPPORT-MATRIX.md`'s per-backend op column matches `supports_op` on
-all three backends, with A1's matrix green.
+| ID | Origin | Work | Position |
+|---|---|---|---|
+| G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` | now |
+| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` | now |
+| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) | now |
+| G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) | after C8 |
+| G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` | after G5 |
+| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool | after G5 |
+| G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path | last |
+
+**G5 acceptance** (on a Mac; the CPU/CUDA equivalents are the gates already in the
+suite): two sequences do not cross-attend, bitwise; a mid-session compaction is
+bit-identical; the C2 context shift matches CPU; and `MINFER_BATCH` unset may then
+batch on Metal, which is what E6's Metal exclusion is waiting for.
+
+Entry condition: G1–G3 need only a machine that builds Metal (CI's `build-macos`);
+G5's device claims need a Mac. Exit condition: `SUPPORT-MATRIX.md`'s per-backend op
+column matches `supports_op` on all three backends, with A1's matrix green.
 
 ## 11. Sequencing
 
@@ -1946,14 +2024,14 @@ all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ─ C2 ✔ ──────────────► C3 ─ C4 ─ C5        (C3 needs D1)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ──────────► C3 ✔ ─ C6 ✔ ─ C7 ─ C8 ─ C4 ─ C5   (C3 needed D1; C7/C8 are user-visible limits, scheduled first)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
-Phase G  └────────────────────────────────────────────►  (needs a Mac)
+Phase G  └─ G1 ─ G2 ─ G3 ──────────────────► G5 ─ G4 ─ G6 ─ G7   (G1–G3 compile-verified in CI; G5 after C8; device claims need a Mac)
 ```
 
-**Critical path:** A0 → A1 → C1 → C2 → E1 → E2.
+**Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C8 → G5.
 **Deliberate exception to the roadmap's ordering:** A1/A2 run *before* the
 hazard-removal tickets, because they are the instrument that proves those
 tickets and everything after them.
@@ -1964,7 +2042,7 @@ tickets and everything after them.
 |---|---|
 | A | **Complete 2026-09-16.** `cargo test` green on Linux/CPU (aarch64 locally, x86_64 in CI); A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
 | B | **Complete 2026-09-16.** A multi-turn conversation prefills only the new turns (219 → 16 tokens, ≈11× TTFT); the contamination property is pinned by a bitwise test; numbers recorded interleaved with the same binary. |
-| C | Cell store lands bitwise; shift is a documented tolerance class; quantized KV behind its gate; session save/restore round-trips. |
+| C | Cell store lands bitwise; shift is a documented tolerance class; **a single request may use the whole arena while the other slots are idle (C7) and one cell range can be shared across sequences, counted once (C8)**; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
 | E | Two sequences can be batched without cross-attention; `--n-slots 4` beats serial; `n_batch` chunks prefill; an over-VRAM model runs with layer offload. |
 | G | Three backends agree with the op matrix and the support table. |
