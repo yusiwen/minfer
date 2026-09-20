@@ -262,8 +262,10 @@ impl BatchEngine {
     }
 
     /// One forward for several requests' prefills. Each sequence's suffix is
-    /// contiguous in the batch, its positions are its slot's cells, and the
-    /// logits come back one row per sequence, in `placed` order.
+    /// contiguous in the batch, its positions are its index *within its
+    /// sequence* (C6 — the KV row comes from the slot's run, not from the
+    /// position), and the logits come back one row per sequence, in `placed`
+    /// order.
     fn prefill_group(
         &mut self,
         model: &dyn ModelDef,
@@ -282,7 +284,6 @@ impl BatchEngine {
                     "prompt of {nt} tokens exceeds slot context of {cap}"
                 ));
             }
-            let start = self.slots[*slot].start;
             tokens.extend_from_slice(&job.input_ids[feed_from..]);
             // C6: positions are the token's index within its sequence; the
             // allocator resolves the KV row from the slot's run.
@@ -361,11 +362,15 @@ impl BatchEngine {
                 "prompt of {nt} tokens exceeds slot context of {cap}"
             )));
         }
-        let (start, seq) = (self.slots[idx].start, self.slots[idx].seq);
+        let seq = self.slots[idx].seq;
         let (feed_from, _) = self.feed_span(idx, &job.input_ids);
-        // Positions are cell indices in the shared arena: the slot's reservation
-        // starts at `start`, so its row `i` is `start + i` (E1/E2).
-        let positions: Vec<usize> = (feed_from..nt).map(|i| start + i).collect();
+        // C6: positions are a token's index *within its sequence* — what RoPE
+        // rotates by — so the slot's reservation start is not part of them. The
+        // allocator resolves the KV row from the run table (`cells` =
+        // `start + position`); adding `start` here would double-count it and
+        // `kv_cells_for_seq` rejects the result (a run of `cap` cells at `start`
+        // cannot hold position `start + i`).
+        let positions: Vec<usize> = (feed_from..nt).collect();
         let seq_ids = vec![seq; nt - feed_from];
         let batch = Batch::new(job.input_ids[feed_from..].to_vec(), positions, seq_ids);
         let live_on = crate::live::enabled();
