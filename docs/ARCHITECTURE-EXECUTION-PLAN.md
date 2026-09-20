@@ -2,17 +2,16 @@
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
 2026-09-16); Phase C **4/8** (C1, C2, **C3** and **C6 (logical positions)** done —
-C6 merged 2026-09-20 as `001b8cc`; **C7 increment 1 landed 2026-09-20** (the partition
-is elastic: a request reclaims idle capacity from the slots above it) and **C8
-(cross-sequence cell sharing)** is next; C4, C5
-open); Phase D **3/3** (**D1 done**: views,
+C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
+is elastic, and growth moves runs in **both** directions, so a busy neighbour above
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next; C4,
+C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8, then C7b (upward row moves), then G1–G3 and G5, then C4/C5, then
-E3–E5.** The order is deliberate: the Metal KV port (G5) comes **after** the CUDA
-arena stops changing shape (C7, C7b, C8), so those semantics are written into Metal
-once. Per-ticket evidence is in each phase's
+check). **Next: C8, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
+so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
@@ -1053,13 +1052,40 @@ the same bytes as `--n-slots 1`, which needs no reclaim at all. Gate (5) is the 
 of the ticket: C6 makes a moved row arithmetic-free, so where the partition puts a
 sequence cannot show up in its output.
 
-**Increment 2 (C7b, scheduled after C8).** Growth needs the cells above the slot to be
-free, so a **busy** run sitting above it still blocks the request (loudly, with the
-existing `exceed_context`). Lifting that needs an upward row move: `Backend::copy_cells`
-and CUDA's `kv_move_rows` kernel are downward-only (ascending rows with a barrier),
-`apply_moves` refuses `to > from`, and a full repack would need the moves ordered so no
-destination clobbers a run that has not moved yet (top-down for upward moves, bottom-up
-for downward).
+**C7b — both directions, so a busy neighbour is not a wall (2026-09-20).** The
+increment-1 caveat is gone: `Backend::copy_cells` and CUDA's `kv_move_rows` kernel now
+move rows **up** as well as down (the kernel walks one row at a time with a barrier,
+descending when the run slides up), `apply_moves` accepts `to > from` and frees the
+vacated cells in either direction (guarded by the sequence's own stamp, so a plan can
+never clear another sequence's ownership), and `KvCache::set_cap` grows or shrinks a
+reservation and returns the plan — shrinking below a sequence's written rows is
+refused, and so is a growth the arena cannot hold with the other reservations. The
+allocator's `kv_set_cap_with_defrag` copies the rows and then renumbers, like
+`kv_defrag`.
+
+The subtle half is **order**: wherever ranges overlap, a destination must never land on
+a row that has not been copied yet. `kvcache::order_moves` is the single rule — upward
+moves top-down, downward bottom-up, upward first — and both the data copy and the
+bookkeeping follow it (the owner table is a mirror of where the rows live, so they have
+to travel together). The unit test caught exactly this: applying the plan in its raw
+ascending order moved one sequence's stamps through cells another had already
+overwritten.
+
+**Gates.** (1) `growing_a_run_pushes_the_runs_above_it_up` — a pure test of the plan,
+the upward move and the owner stamps; (2) `a_resize_refuses_to_eat_rows_or_overcommit_the_arena`;
+(3) the CPU and CUDA twins that used to pin "upward is refused" now pin the *result* of
+an overlapping upward move (a memmove's output) — the CUDA one on GB10;
+(4) on GB10 the CUDA twin pins the upward *kernel* path (the bytes a memmove would
+produce). Suites: CPU **216** passed, CUDA **264** passed (0 failed, 6 ignored each).
+
+**Not verified end-to-end:** the engine-level scenario "grow while a *busy* slot sits
+above me". Two attempts ran against a CPU binary — `cargo test --release` overwrites
+`target/release/minfer` with a CPU-only build, so the server logged `batching: off
+(device cpu)` and served the serial path — and the device evidence for C7b is therefore
+the kernel test plus the pure unit tests, not a served request. Re-running it needs a
+fresh `cargo build --release --features cuda` and a 4-slot server whose busy slot sits
+above the growing one (slot 0 freed by a short request, slot 1 mid-generation, the long
+prompt landing back on slot 0).
 
 
 ### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L
@@ -2075,14 +2101,14 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ──────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ─ C8 ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ──────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8 ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
-Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C7b/C8; G1–G3 compile-verified in CI; device claims need a Mac)
+Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
 
-**Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C7b → C8 → G5.
+**Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C8 → G5.
 **Deliberate exception to the roadmap's ordering:** A1/A2 run *before* the
 hazard-removal tickets, because they are the instrument that proves those
 tickets and everything after them.
@@ -2093,7 +2119,7 @@ tickets and everything after them.
 |---|---|
 | A | **Complete 2026-09-16.** `cargo test` green on Linux/CPU (aarch64 locally, x86_64 in CI); A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
 | B | **Complete 2026-09-16.** A multi-turn conversation prefills only the new turns (219 → 16 tokens, ≈11× TTFT); the contamination property is pinned by a bitwise test; numbers recorded interleaved with the same binary. |
-| C | Cell store lands bitwise; shift is a documented tolerance class; **a single request may use the whole arena while the other slots are idle (C7 increment 1 ✔) — including when a busy run above it blocks a full repack (C7b) — and one cell range can be shared across sequences, counted once (C8)**; quantized KV behind its gate; session save/restore round-trips. |
+| C | Cell store lands bitwise; shift is a documented tolerance class; **a single request may use the whole arena while the other slots are idle, even with a busy run above it (C7 + C7b ✔), and one cell range can be shared across sequences, counted once (C8)**; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
 | E | Two sequences can be batched without cross-attention; `--n-slots 4` beats serial; `n_batch` chunks prefill; an over-VRAM model runs with layer offload. |
 | G | Three backends agree with the op matrix and the support table. |

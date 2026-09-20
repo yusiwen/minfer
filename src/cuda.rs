@@ -4597,11 +4597,6 @@ impl CudaState {
         if rows == 0 || elems == 0 {
             return Ok(());
         }
-        if dst_row > src_row {
-            return Err(format!(
-                "cuda: kv_move_rows is downward-only ({dst_row} > {src_row})"
-            ));
-        }
         let rc = unsafe {
             launch_kv_move_rows(
                 dst as *mut f32,

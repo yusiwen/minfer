@@ -747,6 +747,83 @@ impl GraphAllocator {
     /// bitwise identical. (Before C6 the angles were cell indices, which is why
     /// this function used to re-rope every moved K row — see the plan's C3 record.
     /// C2's `kv_rm`/`kv_shift` still re-rope: those move *positions*.)
+    /// C7b: resize a sequence's run, moving whatever is in the way — in **either**
+    /// direction — and return the moves the caller must follow. Rows are copied
+    /// before the run table is renumbered, exactly like [`Self::kv_defrag`].
+    pub fn kv_set_cap_with_defrag(
+        &mut self,
+        seq: super::kvcache::SeqId,
+        cap: usize,
+    ) -> Result<(super::kvcache::SeqSlot, Vec<super::kvcache::KvMove>), String> {
+        let old = self
+            .kv
+            .seq_slot(seq)
+            .map(|s| s.cap)
+            .ok_or_else(|| format!("kv_set_cap: sequence {seq} holds no run"))?;
+        let moves = self.kv.set_cap(seq, cap)?;
+        if moves.is_empty() {
+            let slot = self
+                .kv
+                .seq_slot(seq)
+                .ok_or_else(|| "kv_set_cap: the run vanished".to_string())?;
+            return Ok((slot, moves));
+        }
+        if !kv_defrag_enabled() {
+            // The gate means "never compact": undo the resize and refuse loudly
+            // rather than leave a run table the rows do not match.
+            self.kv.set_cap(seq, old)?;
+            return Err(format!(
+                "resizing sequence {seq} to {cap} cells needs a compaction and KV \
+                 defragmentation is disabled"
+            ));
+        }
+        // Order matters wherever ranges overlap: runs moving **up** go top-down and
+        // runs moving **down** bottom-up, so a destination never lands on a row that
+        // has not been copied yet. The plan is emitted in ascending `from` order, so
+        // reorder here and hand the same order to `apply_moves`, which shifts the
+        // owner table by exactly these ranges.
+        let mut ordered = moves.clone();
+        super::kvcache::order_moves(&mut ordered);
+        let regions: Vec<(BufRef, BufRef, usize)> = self
+            .kv
+            .iter()
+            .map(|(_, l)| (l.k, l.v, (l.elems / l.n_ctx.max(1)).max(1)))
+            .collect();
+        for &(k, v, elems_per_cell) in &regions {
+            for m in &ordered {
+                if m.rows == 0 {
+                    continue;
+                }
+                for region in [k, v] {
+                    self.copy_cells_in_pool(
+                        region.backend,
+                        region,
+                        region,
+                        m.to,
+                        m.from,
+                        m.rows,
+                        elems_per_cell,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "kv_set_cap: moving sequence {} rows {}..{} -> {} failed: {e}",
+                            m.seq,
+                            m.from,
+                            m.from + m.rows,
+                            m.to
+                        )
+                    })?;
+                }
+            }
+        }
+        self.kv.apply_moves(&ordered)?;
+        let slot = self
+            .kv
+            .seq_slot(seq)
+            .ok_or_else(|| "kv_set_cap: the run vanished".to_string())?;
+        Ok((slot, ordered))
+    }
+
     pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
         let before = self.kv.arena_stats();
         let moves = self.kv.compaction_plan(need);

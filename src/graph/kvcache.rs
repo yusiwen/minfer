@@ -249,6 +249,53 @@ impl KvCache {
         slot.cap
     }
 
+    /// Set `seq`'s reservation to `cap` cells and return the compaction plan that
+    /// reconciles the arena (C7b).
+    ///
+    /// Growing is refused when every reservation cannot fit at once — capacity has
+    /// to come from somewhere, which is the caller's decision (the server releases
+    /// idle runs first) — and shrinking is refused below the rows already written,
+    /// so space can never be traded for data. The run table is updated **before**
+    /// planning, which is what lets the planner see the new size; the rows travel
+    /// with the plan (the allocator copies them before [`Self::apply_moves`]
+    /// renumbers), in whichever direction the plan needs.
+    pub fn set_cap(&mut self, seq: SeqId, cap: usize) -> Result<Vec<KvMove>, String> {
+        let Some(slot) = self.seqs.get(&seq).copied() else {
+            return Err(format!("set_cap: sequence {seq} holds no run"));
+        };
+        if cap == slot.cap {
+            return Ok(Vec::new());
+        }
+        if cap == 0 {
+            self.release_seq(seq);
+            return Ok(self.compaction_plan(None));
+        }
+        if cap < slot.cap {
+            let written = self.written_rows(seq);
+            if cap < written {
+                return Err(format!(
+                    "set_cap: sequence {seq} has written {written} rows and cannot shrink to {cap}"
+                ));
+            }
+        } else {
+            let others: usize = self
+                .seqs
+                .iter()
+                .filter(|(&s, _)| s != seq)
+                .map(|(_, s)| s.cap)
+                .sum();
+            if others + cap > self.n_ctx {
+                return Err(format!(
+                    "set_cap: sequence {seq} asked for {cap} cells, {others} are reserved \
+                     elsewhere and the arena holds {}",
+                    self.n_ctx
+                ));
+            }
+        }
+        self.seqs.get_mut(&seq).expect("checked above").cap = cap;
+        Ok(self.compaction_plan(None))
+    }
+
     /// The run `seq` reserved, or `None` when it holds none.
     pub fn seq_slot(&self, seq: SeqId) -> Option<SeqSlot> {
         self.seqs.get(&seq).copied()
@@ -556,13 +603,20 @@ impl KvCache {
     /// run's new `start` (the report), so the position-to-cell relationship the
     /// flag describes is unchanged.
     ///
-    /// Refuses anything that is not a downward move onto an unclaimed layout —
-    /// a plan violation is a bug, and the alternative (overwriting a live
-    /// sequence's rows) corrupts a session silently.
+    /// Refuses any plan whose destinations overlap, or that would run past the
+    /// arena — a plan violation is a bug, and the alternative (overwriting a live
+    /// sequence's rows) corrupts a session silently. Moves in **both** directions
+    /// are accepted (C7b: growing a run pushes the runs above it up).
     pub fn apply_moves(&mut self, moves: &[KvMove]) -> Result<usize, String> {
         if moves.is_empty() {
             return Ok(0);
         }
+        // The caller copied the rows in this order (`order_moves`), so the table has
+        // to follow it: shifting owner stamps in the plan's raw order would move a
+        // sequence's stamps through cells another sequence has already overwritten.
+        let mut ordered = moves.to_vec();
+        order_moves(&mut ordered);
+        let moves: &[KvMove] = &ordered;
         // Validate against the post-state layout before mutating anything.
         let mut planned: Vec<(usize, usize)> = Vec::with_capacity(self.seqs.len());
         for (&seq, slot) in self.seqs.iter() {
@@ -574,9 +628,10 @@ impl KvCache {
                             slot.start, m.from
                         ));
                     }
-                    if m.to > m.from {
-                        return Err(format!("apply_moves: {m:?} is not a downward move"));
-                    }
+                    // Both directions are legal (C7b): the backend copies rows so
+                    // an overlapping move never clobbers a row still to be read, and
+                    // the non-overlap check below is what makes a plan valid,
+                    // whichever way each run travels.
                     if m.rows > slot.cap {
                         return Err(format!(
                             "apply_moves: {m:?} copies {} rows but the run holds {}",
@@ -617,11 +672,17 @@ impl KvCache {
             for layer in self.layers.values_mut() {
                 let rows = m.rows.min(layer.owner.len().saturating_sub(m.from));
                 if rows > 0 {
-                    // `to <= from`, so an ascending memmove is what `copy_within`
-                    // already does — no temp buffer and no direction flag.
+                    // `copy_within` is a memmove, so the owner table follows the same
+                    // direction the backend moved the rows.
                     layer.owner.copy_within(m.from..m.from + rows, m.to);
-                    for cell in (m.to + rows)..(m.from + rows) {
-                        if cell < layer.owner.len() {
+                    // Free the cells the move vacated: every cell in the span the move
+                    // covered that is outside the destination and still carries *this*
+                    // sequence's stamp. The stamp guard means a plan can never clear
+                    // another sequence's ownership, whichever way the run travelled.
+                    let lo = m.to.min(m.from);
+                    let hi = (m.to.max(m.from) + rows).min(layer.owner.len());
+                    for cell in lo..hi {
+                        if !(m.to..m.to + rows).contains(&cell) && layer.owner[cell] == m.seq {
                             layer.owner[cell] = FREE;
                         }
                     }
@@ -640,6 +701,24 @@ impl KvCache {
         self.cells_moved += (rows_moved * layers) as u64;
         Ok(rows_moved)
     }
+}
+
+/// Order relocations so that an overlapping move never lands on a row that has not
+/// been copied yet: runs moving **up** go top-down, runs moving **down** bottom-up,
+/// and every upward move precedes the downward ones — a downward destination is
+/// always below its own source and below every run above it, so nothing is in its
+/// way once the upward moves are done.
+///
+/// Both the data copy (the allocator) and the bookkeeping ([`KvCache::apply_moves`])
+/// use this order, because the owner table is a mirror of where the rows live: they
+/// have to move together, in the same sequence.
+pub fn order_moves(moves: &mut [KvMove]) {
+    moves.sort_by(|a, b| match (a.to > a.from, b.to > b.from) {
+        (true, true) => b.from.cmp(&a.from),
+        (false, false) => a.from.cmp(&b.from),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+    });
 }
 
 /// One run relocation produced by [`KvCache::compaction_plan`] (C3).
@@ -926,6 +1005,66 @@ mod tests {
         );
     }
 
+    /// C7b: growing a run moves the runs above it **up**, and their ownership
+    /// travels with the rows. This is the direction CUDA's row-move kernel could not
+    /// do before, and the plan — not the caller — decides it.
+    #[test]
+    fn growing_a_run_pushes_the_runs_above_it_up() {
+        let mut c = cache(16);
+        assert_eq!(c.reserve_seq(0, 4).unwrap().start, 0);
+        assert_eq!(c.reserve_seq(1, 4).unwrap().start, 4);
+        assert_eq!(c.reserve_seq(2, 4).unwrap().start, 8);
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[4, 5, 6]);
+            c.note_written(2, layer, &[8, 9]);
+        }
+        // Growing the *lowest* run pushes both runs above it up by two.
+        let plan = c.set_cap(0, 6).unwrap();
+        assert_eq!(plan.len(), 2, "both runs above move: {plan:?}");
+        assert!(
+            plan.iter().all(|m| m.to > m.from),
+            "both moves are upward: {plan:?}"
+        );
+        assert_eq!(c.seq_slot(0).unwrap().cap, 6);
+        c.apply_moves(&plan).unwrap();
+        assert_eq!(c.seq_slot(1).unwrap().start, 6);
+        assert_eq!(c.seq_slot(2).unwrap().start, 10);
+        let owner = |cell: usize| c.get(0).unwrap().owner[cell];
+        assert_eq!(
+            (owner(6), owner(7), owner(8)),
+            (1, 1, 1),
+            "run 1's three rows"
+        );
+        assert_eq!((owner(10), owner(11)), (2, 2), "run 2's two rows");
+        for cell in [4usize, 5, 12, 13] {
+            assert_eq!(owner(cell), FREE, "cell {cell} is vacant after the move");
+        }
+    }
+
+    /// C7b: the two refusals that keep a resize from trading data or truth away.
+    #[test]
+    fn a_resize_refuses_to_eat_rows_or_overcommit_the_arena() {
+        let mut c = cache(8);
+        c.reserve_seq(0, 3).unwrap();
+        c.reserve_seq(1, 3).unwrap();
+        for layer in [0usize, 1] {
+            c.note_written(0, layer, &[0, 1]);
+        }
+        // Shrinking below the rows a sequence has written would lose them.
+        let err = c.set_cap(0, 1).unwrap_err();
+        assert!(err.contains("cannot shrink"), "got: {err}");
+        // Growing past what the arena holds with the other reservations is refused
+        // *before* the table changes, so there is nothing to undo.
+        let err = c.set_cap(0, 6).unwrap_err();
+        assert!(err.contains("reserved elsewhere"), "got: {err}");
+        assert_eq!(c.seq_slot(0).unwrap().cap, 3, "the refusal left it alone");
+        // What does fit (3 + 5 = 8) is allowed, and it moves the run above up.
+        let plan = c.set_cap(0, 5).unwrap();
+        assert_eq!(plan.len(), 1, "run 1 moves: {plan:?}");
+        assert_eq!((plan[0].from, plan[0].to), (3, 5));
+        assert_eq!(c.seq_slot(0).unwrap().cap, 5);
+    }
+
     /// A window the resolver cannot justify must be loud, not a wrong bound.
     #[test]
     fn unwritten_rows_and_unknown_sequences_are_errors() {
@@ -1174,13 +1313,23 @@ mod tests {
             rows: 0,
         }];
         assert!(c.apply_moves(&stale).unwrap_err().contains("the plan says"));
-        let up = vec![KvMove {
-            seq: 2,
-            from: 4,
-            to: 8,
-            rows: 0,
-        }];
-        assert!(c.apply_moves(&up).unwrap_err().contains("downward"));
+        // C7b: an upward move is legal now — what a plan may never do is land two
+        // runs on the same cells, in either direction.
+        let up_overlap = vec![
+            KvMove {
+                seq: 1,
+                from: 0,
+                to: 8,
+                rows: 0,
+            },
+            KvMove {
+                seq: 2,
+                from: 4,
+                to: 8,
+                rows: 0,
+            },
+        ];
+        assert!(c.apply_moves(&up_overlap).unwrap_err().contains("overlap"));
         // Rows past the run's cap are a bug, not a bigger copy.
         let too_many = vec![KvMove {
             seq: 2,
