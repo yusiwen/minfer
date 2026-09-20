@@ -880,9 +880,41 @@ CUDA, then a docs progress update, then a commit on `feat/logical-positions`).
 | S0 | this design, the roadmap/status corrections | docs build |
 | S1 | `cells` wiring + allocator/kvcache resolver + model/server switch + fused QKV gated off under `explicit_span` | invariants 1–2, 4; CPU+CUDA suites |
 | S2 | compaction without a re-rope; the bit-identity gate | invariants 1–3 |
+| S1∪S2 | *merged in execution:* the re-rope removal is **not** optional once S1 lands — S1 makes the stored K rows' angles sequence-relative, so a compaction that still re-roped them by `from - to` would rotate them *away* from the correct angle. The first S1 run showed exactly that: `a_compaction_between_steps_keeps_the_continuation` failed with a flipped greedy token until `kv_defrag` stopped re-roping. Semantics switch and re-rope removal must therefore land in the **same** commit. | as above |
 | S3 | CUDA fused QKV family takes `cells`; the gate re-enabled for CUDA | invariant 5 + fused-vs-unfused bitwise + capture regression |
 | S4 | docs closure (roadmap §2.4, AGENTS rules, design docs) | docs build |
 | S5 | PR, CI three jobs green with zero annotations, rebase merge | CI |
+
+#### C6 progress (2026-09-19)
+
+**S0 done** (`71b86da`, docs). **S1 code written, not yet green** — it lives in the
+branch's stash (`stash@{0}`) until the test migration finishes, because a step is
+committed only once its gate passes.
+
+- **Done in the WIP**: `GraphBuilder::cells_input` and `kvcache_store` creating and
+  using it (callers no longer pass a row buffer); `KvCache::attn_span` resolving
+  `cell = run.start + position`; `GraphAllocator::kv_cells_for_seq` filling `cells`
+  (with the classic single-sequence identity fallback when no run is reserved);
+  `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` switched to relative
+  positions; qwen2/qwen3 gating the fused QKV family off under `explicit_span`;
+  `server/batch.rs` passing relative positions; `kv_defrag` no longer re-roping,
+  with the `KvRope` plumbing removed. CPU suite: **201 passed / 14 failed**, with
+  the compaction gate already passing once the re-rope was gone.
+- **Remaining, all in tests**: migrate the ones that still pass absolute cells as
+  positions (`kvcache::two_sequences_resolve_to_disjoint_windows`,
+  `cpu_backend::{embedding_and_rope, two_sequences_do_not_cross_attend,
+  the_minimal_attention_graph_is_offset_invariant_to_rounding}`,
+  `op_matrix::matrix_cases_match_their_reference`,
+  `models::qwen2::tests::batch_order_does_not_change_a_sequences_logits`); fill the
+  new `cells` input where a hand-built graph drives the store; move the bound checks
+  from `positions` to `cells` (`alloc::{position_beyond_n_ctx_is_rejected,
+  token_ids_are_not_bounded_by_n_ctx}`); look nodes up by name where the hardcoded
+  id shifted (`alloc::kv_regions_two_per_layer`); assert the moved K rows verbatim
+  instead of re-roped (`alloc::kv_defrag_moves_the_bytes_and_opens_the_run`); and
+  rewrite the four offset-sensitivity tests as **C6 gates** — with relative
+  positions a cell placement must no longer change anything, so they invert into
+  "bitwise equal at any cell", which is also the evidence §14 row 9 needs to be
+  rewritten as *resolved by C6*.
 
 **Not in this ticket:** sharing one cell range across sequences (`owner[cell]`
 becomes a set/refcount — the real cross-slot prefix reuse, which this ticket makes
