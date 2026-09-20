@@ -291,7 +291,7 @@ it stops at the single-sequence append-only case. What is missing:
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
 | Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
-| Position vs cell (`positions` are cells today) | ✗ — **C6 (in progress on `feat/logical-positions`)**: sequence-relative `positions` + an allocator-resolved `cells` input. Required for bit-identical compaction (C3) and the precondition for sharing cell ranges across sequences |
+| Position vs cell | ✔ **C6 (S1/S2 landed 2026-09-19)**: sequence-relative `positions` + an allocator-resolved `cells` input, so a cell move changes no rotation and compaction is bit-identical. Remaining: the CUDA fused QKV family takes `cells` (S3), after which the build-time gate that keeps it on the unfused chain under `explicit_span` comes off |
 | Multi-sequence attention masks | ✔ **E1 + E1b + E2** (device-aware default: see the batching row below): the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations — **device-verified on GB10 since 2026-09-18**, and since 2026-09-19 swept over **both** KV dtypes (f16 and f32), which is what caught the f16 prefill mask fault (`ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four

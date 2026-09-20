@@ -195,7 +195,7 @@ impl Qwen2Graph {
                     },
                 );
 
-                b.kvcache_store(il, k, v, inp_pos, n_ctx);
+                b.kvcache_store(il, k, v, n_ctx);
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);
                 (q, kv)
             };
@@ -522,6 +522,7 @@ impl Qwen2Graph {
                 // the fuse_ffn gate below).
                 fuse_qkv: nt == 1
                     && (metal_on || cuda_on)
+                    && !explicit_span
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)
@@ -1200,8 +1201,8 @@ mod tests {
         // ---- batched: both sequences, one forward per step ----
         let mut batched = GraphCache::new();
         let (p7, p9) = layout(&mut batched);
-        let pos7: Vec<usize> = (p7..p7 + la).collect();
-        let pos9: Vec<usize> = (p9..p9 + lb).collect();
+        let pos7: Vec<usize> = (0..la).collect();
+        let pos9: Vec<usize> = (0..lb).collect();
 
         let mut tokens = a.clone();
         tokens.extend_from_slice(&b);
@@ -1220,7 +1221,7 @@ mod tests {
 
         let (t7, t9) = (argmax(&pre7), argmax(&pre9));
         let l_step = model.forward_batch(
-            &Batch::new(vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9]),
+            &Batch::new(vec![t7, t9], vec![la, lb], vec![s7, s9]),
             1,
             n_ctx,
             &mut batched,
@@ -1238,7 +1239,7 @@ mod tests {
             &mut ref7,
         );
         let r_next7 = model.forward_batch(
-            &Batch::new(vec![t7], vec![p7 + la], vec![s7]),
+            &Batch::new(vec![t7], vec![la], vec![s7]),
             1,
             n_ctx,
             &mut ref7,
@@ -1256,7 +1257,7 @@ mod tests {
             &mut ref9,
         );
         let r_next9 = model.forward_batch(
-            &Batch::new(vec![t9], vec![p9 + lb], vec![s9]),
+            &Batch::new(vec![t9], vec![lb], vec![s9]),
             1,
             n_ctx,
             &mut ref9,
@@ -1350,7 +1351,7 @@ mod tests {
                 cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
             }
             let l = model.forward_batch(
-                &Batch::new(ids, (start..start + n).collect(), vec![7u32; n]),
+                &Batch::new(ids, (0..n).collect(), vec![7u32; n]),
                 1,
                 n_ctx,
                 &mut cache,
@@ -1383,8 +1384,8 @@ mod tests {
             let row = v0.len() / n_ctx;
             // `rope_shift_kv(d)` means `new_pos = old_pos - d`, so aligning cell 8
             // back onto cell 0 is d = +8.
-            let mut k8_aligned = k8[8 * row..(nt + 8) * row].to_vec();
-            crate::graph::kvcache::rope_shift_kv(&mut k8_aligned, nt, 8, &rope);
+            // C6: compare the same relative rows directly — no rotation to undo.
+            let k8_aligned = k8[8 * row..(nt + 8) * row].to_vec();
             let v_delta = d(&v0[..nt * row], &v8[8 * row..(nt + 8) * row]);
             let k_aligned = d(&k0[..nt * row], &k8_aligned);
             eprintln!(
@@ -1402,10 +1403,12 @@ mod tests {
             // raw read would be bit patterns, not values.
             if matches!(model.device(), crate::models::Device::Cpu) {
                 assert_eq!(d(&v0, &v0b), 0.0, "and bit-identical run to run");
-                assert_eq!(v_delta, 0.0, "V is unrotated: the hidden state must match");
-                assert!(
-                    k_aligned < 1e-3,
-                    "the stored K must be the cell-rotated K (got {k_aligned})"
+                // C6: the same relative row at a different cell holds the same
+                // bytes — no rotation is involved in a cell move any more.
+                assert_eq!(v_delta, 0.0, "V is unrotated and cell-independent");
+                assert_eq!(
+                    k_aligned, 0.0,
+                    "the stored K is verbatim at the sequence's new cell"
                 );
             } else {
                 eprintln!("[offset] (non-CPU device: skipping the raw KV-row probes)");
@@ -1421,174 +1424,6 @@ mod tests {
                 assert!(d(&l0, &l8).is_finite());
             }
         }
-    }
-
-    /// Plan §14 row 9's attempted confirmation — which **refuted** the
-    /// amplification hypothesis instead.
-    ///
-    /// Three runs of the same prompt: (A) prefill and one step at cell 0, (B) the
-    /// same at cell 0 but with one element of layer 0's K nudged by the magnitude
-    /// of the rotation-rounding discrepancy the offset itself produces (~1e-5),
-    /// and (C) the same at cell 8. The amplification story required B to move the
-    /// logits about as much as C; measured, **B moves them by 0** while C moves
-    /// them by 0.43. A single K element of one layer is therefore not a lever on
-    /// the tail, and the cell-offset effect is **structural**, not the rotation's
-    /// rounding amplified by depth.
-    ///
-    /// Only the existence of the offset effect is asserted; the perturbation is
-    /// printed, because "a tiny nudge does nothing" is a measurement of the
-    /// current graph rather than a property to freeze.
-    #[test]
-    fn a_tiny_kv_perturbation_does_not_explain_the_cell_offset_effect() {
-        use crate::graph::batch::Batch;
-        use crate::graph::cache::GraphCache;
-        use crate::models::ModelDef;
-
-        let Some(path) = cached_model_path() else {
-            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
-            return;
-        };
-        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
-        let ids = tok.encode("The capital of France is");
-        let n = ids.len();
-        let n_ctx = 256;
-        let step_tok = ids[n - 1];
-
-        let run = |start: usize, perturb: Option<f32>| -> Vec<f32> {
-            let mut cache = GraphCache::new();
-            cache.alloc().kv_set_capacity(n_ctx);
-            if start > 0 {
-                cache.alloc().kv_reserve_seq(3, start).expect("holder");
-            }
-            cache.alloc().kv_reserve_seq(7, n + 4).expect("subject");
-            if start == 0 {
-                cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
-            }
-            let _ = model.forward_batch(
-                &Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]),
-                1,
-                n_ctx,
-                &mut cache,
-            );
-            if let Some(d) = perturb {
-                // One element of layer 0's K, at the cell the first token wrote.
-                cache
-                    .alloc()
-                    .kv_perturb_for_test(0, true, start, 0, d)
-                    .expect("perturb");
-            }
-            model.forward_batch(
-                &Batch::new(vec![step_tok], vec![start + n], vec![7u32]),
-                1,
-                n_ctx,
-                &mut cache,
-            )
-        };
-        let d = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
-        };
-
-        let reference = run(0, None);
-        // The offset effect, and the same effect's magnitude of K discrepancy
-        // (measured: aligning cell 8's K onto cell 0 leaves ~1.5e-5).
-        let offset = d(&reference, &run(8, None));
-        let perturbed = d(&reference, &run(0, Some(1e-5)));
-        let smaller = d(&reference, &run(0, Some(1e-7)));
-        // Probe validity: a *large* change to the same element must move the
-        // logits, or the hook (or the read path) is not reaching the kernel and
-        // the zero above would mean nothing.
-        let loud = d(&reference, &run(0, Some(1.0)));
-        eprintln!(
-            "[amplify] offset 0-vs-8 {offset} | K +1e-5 {perturbed} | K +1e-7 {smaller} | K +1.0 {loud}"
-        );
-        assert!(
-            loud > 0.0,
-            "probe validity: a +1.0 change to one K element must move the logits"
-        );
-        assert!(offset > 0.0, "the offset effect itself must be present");
-        assert!(
-            perturbed.is_finite() && smaller.is_finite(),
-            "the perturbation runs must produce finite logits"
-        );
-    }
-
-    /// Plan §14 row 9's safe observation point: the **persistent KV regions**.
-    ///
-    /// A previous version of this probe exposed layer 0's rope and attention
-    /// nodes through `graph.outputs` and compared them across offsets. That read
-    /// **recycled** data: adding a node to `outputs` does not extend its
-    /// liveness, so an intermediate buffer read after `execute` is whatever the
-    /// allocator reused it for (the q/k "misalignment" and the suspiciously tiny
-    /// attention delta it produced were both artefacts). The KV regions are the
-    /// exception — persistent, never recycled — so they are the only
-    /// model-level buffers a test may compare after the forward.
-    ///
-    /// Measured that way: layer 0's V rows are **bit-identical** at cell 0 and
-    /// cell 8, and layer 1's are not (the delta is printed). The entry point is
-    /// therefore at or before layer 0's attention output, and localising it
-    /// *inside* layer 0 needs a per-node execution path (as the CUDA tests use
-    /// `exec_ids`) or a liveness-aware capture — recorded as the next step
-    /// rather than faked by reading recycled memory.
-    #[test]
-    fn the_offset_divergence_appears_between_layer_0_and_layer_1_kv() {
-        use crate::graph::batch::Batch;
-        use crate::graph::cache::GraphCache;
-        use crate::models::ModelDef;
-
-        let Some(path) = cached_model_path() else {
-            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
-            return;
-        };
-        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
-        let ids = tok.encode("The capital of France is");
-        let n = ids.len();
-        let n_ctx = 256;
-
-        let run = |start: usize| -> Vec<Vec<f32>> {
-            let mut cache = GraphCache::new();
-            cache.alloc().kv_set_capacity(n_ctx);
-            if start > 0 {
-                cache.alloc().kv_reserve_seq(3, start).expect("holder");
-            }
-            cache.alloc().kv_reserve_seq(7, n + 4).expect("subject");
-            if start == 0 {
-                cache.alloc().kv_reserve_seq(3, 4).expect("dummy");
-            }
-            let _ = model.forward_batch(
-                &Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]),
-                1,
-                n_ctx,
-                &mut cache,
-            );
-            (0..64)
-                .filter_map(|l| cache.alloc().copy_kv_to_cpu(l).map(|(_k, v)| v))
-                .collect()
-        };
-        let (v0, v8) = (run(0), run(8));
-        let row = v0[0].len() / n_ctx;
-        let delta = |l: usize| -> f32 {
-            (0..n * row)
-                .map(|i| (v0[l][i] - v8[l][8 * row + i]).abs())
-                .fold(0.0f32, f32::max)
-        };
-        eprintln!(
-            "[kv-bisect] layer 0 V {} | layer 1 V {} | layer 2 V {}",
-            delta(0),
-            delta(1),
-            delta(2)
-        );
-        assert_eq!(delta(0), 0.0, "layer 0's V comes from the embedding alone");
-        assert!(
-            delta(1) > 0.0,
-            "layer 1's V differs, so the divergence is at or before layer 0's attention output"
-        );
     }
 
     /// Plan §14 row 9's decisive measurement: **layer 0 is offset-consistent
@@ -1703,9 +1538,9 @@ mod tests {
             }
             alloc.alloc_graph(&graph).expect("alloc");
 
-            let batch = Batch::new(ids.clone(), (start..start + n).collect(), vec![7u32; n]);
+            let batch = Batch::new(ids.clone(), (0..n).collect(), vec![7u32; n]);
             alloc.fill_input_i32(&graph, "token_ids", &ids).unwrap();
-            let pos: Vec<u32> = (start..start + n).map(|p| p as u32).collect();
+            let pos: Vec<u32> = (0..n).map(|p| p as u32).collect();
             alloc.fill_input_i32(&graph, "positions", &pos).unwrap();
             alloc.fill_batch_inputs(&graph, &batch).unwrap();
             if graph
@@ -1780,37 +1615,12 @@ mod tests {
 
         let (q0, k0, a0) = run(0);
         let (q8, k8, a8) = run(8);
-        let nh = q0.len() / (n * hd);
-        let nk = k0.len() / (n * hd);
-        let mut q8a = q8.clone();
-        rope_shift_kv(
-            &mut q8a,
-            n,
-            8,
-            &KvRope {
-                freq_base,
-                freq_scale,
-                n_head_kv: nh,
-                hd,
-                style,
-            },
-        );
-        let mut k8a = k8.clone();
-        rope_shift_kv(
-            &mut k8a,
-            n,
-            8,
-            &KvRope {
-                freq_base,
-                freq_scale,
-                n_head_kv: nk,
-                hd,
-                style,
-            },
-        );
+        // C6: a token's RoPE angle is its index within its sequence, so the same
+        // relative token roped at cell 0 and at cell 8 is **bitwise** the same
+        // — there is no rotation left to align.
+        let (q8a, k8a) = (q8.clone(), k8.clone());
         eprintln!(
-            "[per-node] nh={nh} nk={nk}: q aligned {} (rel {}) | k aligned {} (rel {}) | \
-             attn {} (rel {})",
+            "[per-node] q {} (rel {}) | k {} (rel {}) | attn {} (rel {})",
             d(&q0, &q8a),
             d(&q0, &q8a) / scale(&q0),
             d(&k0, &k8a),
@@ -1887,18 +1697,14 @@ mod tests {
             .start;
         assert_eq!(start_a, holder, "the holder must sit below the subject");
         let pre_a = model.forward_batch(
-            &Batch::new(
-                subject.clone(),
-                (start_a..start_a + n).collect(),
-                vec![s1; n],
-            ),
+            &Batch::new(subject.clone(), (0..n).collect(), vec![s1; n]),
             1,
             n_ctx,
             &mut a_cache,
         );
         assert_eq!(pre_a.len(), nv);
         let l_a_step1 = model.forward_batch(
-            &Batch::new(vec![step_tok], vec![start_a + n], vec![s1]),
+            &Batch::new(vec![step_tok], vec![n], vec![s1]),
             1,
             n_ctx,
             &mut a_cache,
@@ -1907,7 +1713,7 @@ mod tests {
         // Release the holder and pack the subject down: this is the migration the
         // server performs when it follows a compaction report.
         a_cache.alloc().kv_release_seq(3);
-        let report = a_cache.alloc().kv_defrag(Some(0), &rope).expect("compact");
+        let report = a_cache.alloc().kv_defrag(Some(0)).expect("compact");
         assert!(
             !report.moves.is_empty(),
             "the subject must actually move: {report:?}"
@@ -1921,7 +1727,7 @@ mod tests {
         let start_b = a_cache.alloc().kv_seq_slot(s1).expect("subject slot").start;
         assert_eq!(start_b, 0, "the compaction packs the subject to cell 0");
         let l_a = model.forward_batch(
-            &Batch::new(vec![step_tok], vec![start_b + n + 1], vec![s1]),
+            &Batch::new(vec![step_tok], vec![n + 1], vec![s1]),
             1,
             n_ctx,
             &mut a_cache,
@@ -2070,8 +1876,8 @@ mod tests {
         // ---- batched cache: one graph is asked for both shapes ----
         let mut c = GraphCache::new();
         let (p7, p9) = layout(&mut c);
-        let pos7: Vec<usize> = (p7..p7 + la).collect();
-        let pos9: Vec<usize> = (p9..p9 + lb).collect();
+        let pos7: Vec<usize> = (0..la).collect();
+        let pos9: Vec<usize> = (0..lb).collect();
 
         let pre7 = model.forward_batch(
             &Batch::new(a.clone(), pos7.clone(), vec![s7; la]),
@@ -2090,7 +1896,7 @@ mod tests {
 
         // Two sequences, one token each: nt = 2, n_out = 2 (a row per sequence).
         let two = model.forward_batch(
-            &Batch::new(vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9]),
+            &Batch::new(vec![t7, t9], vec![la, lb], vec![s7, s9]),
             1,
             n_ctx,
             &mut c,
@@ -2102,7 +1908,7 @@ mod tests {
         // wants both rows' distributions), the same span requirement. Only the
         // sequence count differs, so this must reuse the graph above.
         let tail = [a[0], a[1]];
-        let tail_pos = [p9 + lb + 1, p9 + lb + 2];
+        let tail_pos = [lb + 1, lb + 2];
         let one = model.forward_batch(
             &Batch::new(tail.to_vec(), tail_pos.to_vec(), vec![s9; 2]),
             2,
@@ -2132,7 +1938,7 @@ mod tests {
             "the reference must agree on sequence 9's first token"
         );
         let _ = model.forward_batch(
-            &Batch::new(vec![t9], vec![p9 + lb], vec![s9]),
+            &Batch::new(vec![t9], vec![lb], vec![s9]),
             1,
             n_ctx,
             &mut ref9,
@@ -2208,8 +2014,8 @@ mod tests {
         // batch. Returns `(logits of 7, logits of 9)`.
         let run = |cache: &mut GraphCache, seq7_first: bool| -> (Vec<f32>, Vec<f32>) {
             let (p7, p9) = layout(cache);
-            let pos7: Vec<usize> = (p7..p7 + la).collect();
-            let pos9: Vec<usize> = (p9..p9 + lb).collect();
+            let pos7: Vec<usize> = (0..la).collect();
+            let pos9: Vec<usize> = (0..lb).collect();
             let pre7 = model.forward_batch(
                 &Batch::new(a.clone(), pos7.clone(), vec![s7; la]),
                 1,
@@ -2227,9 +2033,9 @@ mod tests {
 
             // One token per sequence, nt = 2 either way.
             let (tokens, positions, seq_ids) = if seq7_first {
-                (vec![t7, t9], vec![p7 + la, p9 + lb], vec![s7, s9])
+                (vec![t7, t9], vec![la, lb], vec![s7, s9])
             } else {
-                (vec![t9, t7], vec![p9 + lb, p7 + la], vec![s9, s7])
+                (vec![t9, t7], vec![lb, la], vec![s9, s7])
             };
             let rows =
                 model.forward_batch(&Batch::new(tokens, positions, seq_ids), 1, n_ctx, cache);
@@ -2742,7 +2548,7 @@ mod tests {
             };
             let qr = gb.rope(q, pos, hp.rope_style, rm(hd, nh));
             let kr = gb.rope(k, pos, hp.rope_style, rm(hd, nk));
-            gb.kvcache_store(0, kr, v, pos, 32768);
+            gb.kvcache_store(0, kr, v, 32768);
             let kv = gb.kvcache_load(0, nkt, 32768, nk);
             let ao = gb.attn(
                 qr,

@@ -1665,7 +1665,7 @@ mod tests {
         let pos = b.input("positions", [1, 1, 1, 1], DType::I32);
         let k = b.input("k", [16, 1, 1, 1], DType::F32);
         let v = b.input("v", [16, 1, 1, 1], DType::F32);
-        let store = b.kvcache_store(0, k, v, pos, 1024);
+        let store = b.kvcache_store(0, k, v, 1024);
         let load = b.kvcache_load(0, 16, 1024, 2);
         b.output(load);
         let mut g = b.build();
@@ -3169,7 +3169,7 @@ mod tests {
         let q = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
         let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
-        let st = gb.kvcache_store(0, k, v, pos, n_ctx);
+        let st = gb.kvcache_store(0, k, v, n_ctx);
         let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
         let at = gb.attn(
             q,
@@ -3301,7 +3301,7 @@ mod tests {
             let qq = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
             let kk = gb.input("k", [nkt, nt, 1, 1], DType::F32);
             let vv = gb.input("v", [nkt, nt, 1, 1], DType::F32);
-            let _st = gb.kvcache_store(0, kk, vv, pos, n_ctx);
+            let _st = gb.kvcache_store(0, kk, vv, n_ctx);
             let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
             let at = gb.attn(qq, kv, pos, crate::graph::ops::AttnMode::Gqa, meta.clone());
             gb.output(at);
@@ -3450,7 +3450,7 @@ mod tests {
             let qq = gb.input("q", [nh * hd, n, 1, 1], DType::F32);
             let kk = gb.input("k", [nkt, n, 1, 1], DType::F32);
             let vv = gb.input("v", [nkt, n, 1, 1], DType::F32);
-            let _st = gb.kvcache_store(0, kk, vv, pos, n_ctx);
+            let _st = gb.kvcache_store(0, kk, vv, n_ctx);
             let kv = gb.kvcache_load(0, nkt, n_ctx, nk);
             let at = gb.attn(qq, kv, pos, crate::graph::ops::AttnMode::Gqa, meta);
             gb.output(at);
@@ -4387,7 +4387,7 @@ mod tests {
         let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
         let p = b.input("positions", [nt, 1, 1, 1], DType::I32);
-        let store = b.kvcache_store(0, k, v, p, n_ctx);
+        let store = b.kvcache_store(0, k, v, n_ctx);
         let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
         let qr = b.rope(
             q,
@@ -4560,7 +4560,7 @@ mod tests {
         let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
         let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
-        let store = b.kvcache_store(0, k, v, pp, n_ctx);
+        let store = b.kvcache_store(0, k, v, n_ctx);
         let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
         let qr = b.rope(
             q,
@@ -5355,7 +5355,7 @@ mod tests {
         let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
         let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
         let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
-        let _store = b.kvcache_store(0, k, v, pp, n_ctx);
+        let _store = b.kvcache_store(0, k, v, n_ctx);
         let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
         let at = b.attn(
             q,
@@ -5966,7 +5966,7 @@ mod tests {
                     let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
                     let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
                     let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
-                    let store = b.kvcache_store(0, k, v, pp, n_ctx);
+                    let store = b.kvcache_store(0, k, v, n_ctx);
                     let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
                     let at = b.attn(
                         q,
@@ -6079,7 +6079,7 @@ mod tests {
             let k = b.input("k", [nkt, 1, 1, 1], DType::F32);
             let v = b.input("v", [nkt, 1, 1, 1], DType::F32);
             let pp = b.input("positions", [1, 1, 1, 1], DType::I32);
-            let store = b.kvcache_store(0, k, v, pp, n_ctx);
+            let store = b.kvcache_store(0, k, v, n_ctx);
             let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
             let at = b.attn(
                 q,
