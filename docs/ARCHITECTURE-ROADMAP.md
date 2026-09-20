@@ -281,9 +281,9 @@ it stops at the single-sequence append-only case. What is missing:
 
 | Capability | Status |
 |---|---|
-| Sequence ids / per-sequence views of one cache | ◐ **C1**: per-cell `owner` (`SeqId`) with one implicit sequence; several views of one cache is E1/E2 |
-| Partial removal / keep / copy between sequences | ◐ **C2**: physical removal of a row range; copying rows *between* sequences is C3 |
-| Defragmentation | ✗ — C3, needs D1 |
+| Sequence ids / per-sequence views of one cache | ✔ **C1** per-cell `owner` (`SeqId`); **E1/E2** made several views of one cache real (reservations + explicit `attn_span`, device-aware batching default via E6) |
+| Partial removal / keep / copy between sequences | ◐ **C2**: physical removal of a row range; **compaction inside one arena is C3 (done)**, while *sharing* one cell range across sequences still needs `owner[cell]` to become a set/refcount (recorded after C6) |
+| Defragmentation | ✔ **C3 (2026-09-19)**: pure planner + `KvArenaStats` counters + `Backend::copy_cells` (CPU `copy_within`; CUDA `kv_move_rows`, one block walking rows ascending with a barrier, because overlapping device-to-device copies are undefined; Metal refuses it, G5) + host K re-rope while `positions` are cells + a mid-session compaction gate. The re-rope disappears with **C6** |
 | Sliding-window eviction | ◐ **C2**: physical shift + re-rope (exact mechanism; the retained rows keep the context they were written in, see below) |
 | Recurrent / hybrid memory (state-space models) | ✗ |
 | Context shift (keep KV, shift positions) | ✔ **C2**: `kv_rm`/`kv_shift` plus the conversation's overflow shift — 185 → 14 prefilled tokens per overflowing turn on the 0.5B probe; `MINFER_NO_CONTEXT_SHIFT=1` restores the exact re-render |
@@ -291,6 +291,7 @@ it stops at the single-sequence append-only case. What is missing:
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
 | Quantized KV | ✗ (f16 at best) — C4 |
 | KV memory growth | fixed at first allocation, **never resized** |
+| Position vs cell (`positions` are cells today) | ✗ — **C6 (in progress on `feat/logical-positions`)**: sequence-relative `positions` + an allocator-resolved `cells` input. Required for bit-identical compaction (C3) and the precondition for sharing cell ranges across sequences |
 | Multi-sequence attention masks | ✔ **E1 + E1b + E2** (device-aware default: see the batching row below): the allowed window is an explicit `attn_span` input resolved from per-sequence cell ownership, read by the CPU kernel and by CUDA's windowed kernel instantiations — **device-verified on GB10 since 2026-09-18**, and since 2026-09-19 swept over **both** KV dtypes (f16 and f32), which is what caught the f16 prefill mask fault (`ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0). Metal still derives from `positions` and refuses a multi-sequence node (G5) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four
@@ -561,7 +562,7 @@ Effort: S ≤ 2 d · M ≤ 1 w · L ≤ 2 w · XL > 2 w.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. | §2.4 | XL |
+| 1 | **KV cache → sequence-addressable cell store** (cells + seq-id sets; host-resolved `(layer, seq)` → cell indices; explicit per-query mask passed to attention). Prerequisite for everything in P0. — **C1/C2/C3 landed** (cell store, physical removal/shift, compaction); the remaining half is the *host-resolved position → cell* mapping itself: **C6, in progress** (sequence-relative `positions` + a resolved `cells` input). Sharing a cell range across sequences (`owner` → set/refcount) follows it | §2.4 | XL |
 | 2 | **IR `seq_id` + attention-mask inputs**; attention kernels take an allowed-cell mask instead of deriving the bound from `positions`. — **done** (E1: span input + resolver + CPU kernel + two-sequence test; E1b: CUDA windowed kernels, compile-verified) | §2.5 | L |
 | 3 | **Batch composition + continuous batching** in the scheduler and server worker; make `n_seqs` real (or delete it). — **mechanism landed in E2**: sequence-addressable batches, per-sequence reservations, the server composes one decode batch and batched prefills; `n_seqs` **deleted** (it turned out to be data, closing A7); **opt-in** (`MINFER_BATCH=1`): the payoff is **device-dependent** — 0.49x on CPU (7B Q4_K_M) but **1.9x on the GB10 GPU** (measured 2026-09-18, after A0's "no device" verdict turned out to be an agent-sandbox artefact); the CPU refutation closed the ticket and the GPU result is the acceptance the closure predicted; the device-aware **default** landed in follow-up ticket **E6** (2026-09-19: unset batches iff the model runs on CUDA, with `MINFER_BATCH=0/1` to override — 1.97x on the 7B with no environment variable); see the plan's E2/E6 records | §2.5 | XL |
 | 4 | **Persistent server context**: keep the `GraphCache` across requests, invalidate per sequence id; stop re-allocating KV and re-warming CUDA Graph capture per request. — **done in B2/B3** (prefix-matched reuse, ≈11× TTFT on turn 2) | §2.5 | M |
