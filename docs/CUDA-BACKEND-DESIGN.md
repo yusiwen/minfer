@@ -281,12 +281,12 @@ Two layers of checks are deliberately *not* in `supports_op`:
 | `QkNorm` | `rms_norm` with `d = hd` over the flat `[nt*nh, hd]` view | `hd % 4 == 0`, nonzero, divides the element count |
 | `MatMul` | `matmul_f32_ptr_layout` + optional `add_bias_f32` | see the family table below |
 | `RoPE` | `copy_d2d` if not aliased, then `rope_f32` | neox; `hd` even |
-| `KvcacheStore` | `store_kv_f16` or `store_kv_f32` (K then V) | `out_buf == k_id`; `nt = elems(K_in)/nkt`; positions are device data and are not re-validated against `n_ctx` here (session-level clamping owns that) |
+| `KvcacheStore` | `store_kv_f16` or `store_kv_f32` (K then V) | `out_buf == k_id`; `nt = elems(K_in)/nkt`; the rows are the `cells` input (C6) — device data, not re-validated against `n_ctx` here (the allocator's `kv_cells_for_seq` and `fill_input_i32` own that) |
 | `Attn` | `nt == 1` → `gqa_attn_split`; `1 < nt <= 16` → `gqa_attn_split_batched`; `nt > 16` → `gqa_attn_f16kv` (FA prefill when `hd == 128 && !MINFER_NO_FA_PREFILL`, else legacy) or `gqa_attn_f32` for f32 KV | the attention guards of §4.3; the batched verify path is bitwise-equal per position |
 | `Attn` **windowed** (`explicit_span`) | the same entry points, instantiated with `CAUSAL = false`; `bound` carries `[lo, hi)` pairs (`bound[t]` = `lo`, `bound[nt + t]` = `hi`) instead of `positions`, and every per-row limit must come from `hi` | `cuda_windowed_attention_matches_causal_for_long_windows` sweeps `(nh, nk, hd)` × `n` × `start` × **both KV dtypes**; 22/22 bitwise equal. `fa_prefill_f16kv` used `bound[t]` (the window's `lo`) as the causal limit until 2026-09-19, which made every non-zero-start prefill attend to a single row — see `ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0 |
 | `FusedFFN` | concat `matmul_f32_ptr_layout` + in-place `swiglu_quant_off`/`swiglu_f32_off` | `nt == 1`; offset fuse when `n % 32 == 0` |
-| `FusedQKV` | concat matmul over `[wq\|wk\|wv]` + `attn_bias_rope_store` | `nt == 1`, neox, even `hd`; concat weight + 3 biases registered; KV pair present |
-| `QkvBiasRopeStore` | `copy_d2d` for q + `attn_bias_rope_store` over three separate matmul outputs | `nt == 1`, neox, even `hd`; 3 biases registered |
+| `FusedQKV` | concat matmul over `[wq\|wk\|wv]` + `attn_bias_rope_store` (sources `[x, positions, cells]`) | `nt == 1`, neox, even `hd`; concat weight + 3 biases registered; KV pair present. `positions[0]` ropes q/k, `cells[0]` addresses the four KV writes (C6), so the node is valid for a run that does not start at cell 0 |
+| `QkvBiasRopeStore` | `copy_d2d` for q + `attn_bias_rope_store` over three separate matmul outputs (sources `[q, k, v, positions, cells]`) | `nt == 1`, neox, even `hd`; 3 biases registered; same positions/cells split |
 | anything else | `Err("cuda: op ... has no kernel ...")` | — |
 
 **MatMul family selection** (`matmul_f32_ptr_layout` in `cuda.rs`):

@@ -4,7 +4,7 @@
 2026-09-16); Phase C **3/6** (C1, C2 done; **C3 done 2026-09-19** — increments 1–3,
 its acceptance resolved on measured grounds, with the server-side dynamic-run
 trigger deliberately deferred; **C6 (logical positions) in progress on
-`feat/logical-positions` — S0–S3 landed, docs closure + PR next**; C4, C5
+`feat/logical-positions` — S0–S4 landed (code + docs), PR/CI next**; C4, C5
 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G deferred by decision (needs
