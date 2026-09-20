@@ -2,15 +2,17 @@
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
 2026-09-16); Phase C **4/8** (C1, C2, **C3** and **C6 (logical positions)** done —
-C6 merged 2026-09-20 as `001b8cc`; **C7 (dynamic runs: one request may use the whole
-arena)** and **C8 (cross-sequence cell sharing)** are the two user-visible limits
-C6's design left open and are **scheduled ahead of the rest of the phase**; C4, C5
+C6 merged 2026-09-20 as `001b8cc`; **C7 increment 1 landed 2026-09-20** (the partition
+is elastic: a request reclaims idle capacity from the slots above it) and **C8
+(cross-sequence cell sharing)** is next; C4, C5
 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
-E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** (G1–G3 now, then
-the KV path port **G5 after C8**; device claims need a Mac — CI's `build-macos` is
-the compile check). **Next: G1–G3 (small, independent), then C7, C8, then G5, then
-C4/C5, then E3–E5.** Per-ticket evidence is in each phase's
+E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
+KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
+check). **Next: C8, then C7b (upward row moves), then G1–G3 and G5, then C4/C5, then
+E3–E5.** The order is deliberate: the Metal KV port (G5) comes **after** the CUDA
+arena stops changing shape (C7, C7b, C8), so those semantics are written into Metal
+once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
@@ -1010,6 +1012,55 @@ CUDA batched-decode throughput stays within noise of the recorded numbers.
 
 **Not in this ticket:** sharing (C8) — C7 only makes the partition elastic, two
 sequences still never look at the same cell.
+
+#### C7 increment 1 (2026-09-20) — the partition is elastic
+
+**What landed.** `BatchEngine` now sizes a slot from the request instead of from the
+startup partition: `wanted_cells_from` (pure, unit-tested) asks for
+`prompt + max_tokens + 1` for a bounded request and `prompt + slot cap + 1` for an
+unbounded one, clamped to the arena and never below the prompt. When that exceeds the
+slot's `cap`, `ensure_slot_capacity` reclaims the **idle** runs above it (they hold at
+most B2's prefix hint, which the slot re-prefills when it is next used), then
+re-reserves this slot's run **at its existing `start`** and re-owns its written prefix;
+the moves the KV store returns are applied to every slot's cached `start`
+(`apply_run_moves`, the contract C3 documented).
+
+No new KV primitive was needed — `kv_release_seq`, `kv_reserve_seq_with_defrag` and
+`kv_own_range` compose into "grow in place" — and no backend changed, because the store
+already writes at the allocator-resolved `cells` (C6). A reservation that would land
+anywhere other than where the rows physically are is refused and the slot is left to
+re-prefill: the one outcome C6 exists to prevent (reading rows at an offset they do not
+have) cannot happen. The HTTP layer's request bound moved from a slot's share to the
+whole arena (`AppState::n_ctx`); the serial path (batching off) keeps its own
+slot-sized bound, because its graph region really is that size.
+
+**Why `+ 1`.** `tick` forwards the committed token *before* `advance` can report
+`length`, so a generation that reaches its cap performs one more forward at the cell
+after its last token. A reservation of exactly `prompt + max_tokens` therefore rejected
+that batch (`kv_cells_for_seq: position N is past sequence S's reserved run`). The
+engine's stopping bound (`current_pos >= cap`) is the correct one; the fix is the extra
+cell in the policy, and both places now say so.
+
+**Gates.** (1) `wanted_cells_plans_from_the_request` — the policy, no model needed;
+(2) `a_long_request_may_use_the_whole_arena` — a 302-token prompt on `n_ctx = 366` with
+four slots (91 cells each) is served, and **both** admission paths (`submit` /
+`prefill_group` and `submit_on`, the one the server uses) produce a continuation
+byte-identical to a one-slot engine that needs no reclaim; (3) the four-slot
+batched-vs-serial byte-equality test still passes; (4) CPU and CUDA suites green;
+(5) on GB10, `--n-slots 4 --n-ctx 8192` with a 2054-token prompt logs
+`slot 0: capacity 2048 -> 2071 cells ... (released 3 idle slot(s) above)` and answers
+the same bytes as `--n-slots 1`, which needs no reclaim at all. Gate (5) is the point
+of the ticket: C6 makes a moved row arithmetic-free, so where the partition puts a
+sequence cannot show up in its output.
+
+**Increment 2 (C7b, scheduled after C8).** Growth needs the cells above the slot to be
+free, so a **busy** run sitting above it still blocks the request (loudly, with the
+existing `exceed_context`). Lifting that needs an upward row move: `Backend::copy_cells`
+and CUDA's `kv_move_rows` kernel are downward-only (ascending rows with a barrier),
+`apply_moves` refuses `to > from`, and a full repack would need the moves ordered so no
+destination clobbers a run that has not moved yet (top-down for upward moves, bottom-up
+for downward).
+
 
 ### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L
 
@@ -2024,14 +2075,14 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ──────────► C3 ✔ ─ C6 ✔ ─ C7 ─ C8 ─ C4 ─ C5   (C3 needed D1; C7/C8 are user-visible limits, scheduled first)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ──────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ─ C8 ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
-Phase G  └─ G1 ─ G2 ─ G3 ──────────────────► G5 ─ G4 ─ G6 ─ G7   (G1–G3 compile-verified in CI; G5 after C8; device claims need a Mac)
+Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C7b/C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
 
-**Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C8 → G5.
+**Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C7b → C8 → G5.
 **Deliberate exception to the roadmap's ordering:** A1/A2 run *before* the
 hazard-removal tickets, because they are the instrument that proves those
 tickets and everything after them.
@@ -2042,7 +2093,7 @@ tickets and everything after them.
 |---|---|
 | A | **Complete 2026-09-16.** `cargo test` green on Linux/CPU (aarch64 locally, x86_64 in CI); A1's matrix green (or every red row explained); A0's CUDA verdict recorded; **each hazard ticket has a test that fails before and passes after**; A6 is closed by measurement instead — a refuted hypothesis with numbers is a result, not a gap. |
 | B | **Complete 2026-09-16.** A multi-turn conversation prefills only the new turns (219 → 16 tokens, ≈11× TTFT); the contamination property is pinned by a bitwise test; numbers recorded interleaved with the same binary. |
-| C | Cell store lands bitwise; shift is a documented tolerance class; **a single request may use the whole arena while the other slots are idle (C7) and one cell range can be shared across sequences, counted once (C8)**; quantized KV behind its gate; session save/restore round-trips. |
+| C | Cell store lands bitwise; shift is a documented tolerance class; **a single request may use the whole arena while the other slots are idle (C7 increment 1 ✔) — including when a busy run above it blocks a full repack (C7b) — and one cell range can be shared across sequences, counted once (C8)**; quantized KV behind its gate; session save/restore round-trips. |
 | D | A view is provably zero-copy; one hand-written fusion is replaced by a composition, bitwise. |
 | E | Two sequences can be batched without cross-attention; `--n-slots 4` beats serial; `n_batch` chunks prefill; an over-VRAM model runs with layer offload. |
 | G | Three backends agree with the op matrix and the support table. |
