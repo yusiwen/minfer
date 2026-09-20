@@ -508,12 +508,6 @@ impl Backend for CpuBackend {
         rows: usize,
         elems_per_cell: usize,
     ) -> Result<(), String> {
-        if dst_row > src_row {
-            return Err(format!(
-                "copy_cells: dst row {dst_row} is below src row {src_row}; the contract is \
-                 downward-only (ascending copies are the safe direction)"
-            ));
-        }
         if dst.id != src.id {
             return Err(format!(
                 "copy_cells: CPU moves cells within one buffer ({} -> {})",
@@ -870,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_rows_move_down_safely() {
+    fn overlapping_rows_move_safely_in_both_directions() {
         let mut b = CpuBackend::new();
         let id = b.alloc_buffer(16);
         b.write_host(id, &(0..16).map(|i| i as f32).collect::<Vec<_>>())
@@ -885,9 +879,16 @@ mod tests {
                 15.0
             ]
         );
-        // The safe direction is downward: an upward move is refused, not guessed.
-        let err = b.copy_cells(r, r, 1, 0, 2, 4).unwrap_err();
-        assert!(err.contains("downward-only"), "{err}");
+        // C7b: the upward direction is supported as well — `copy_within` is a
+        // memmove — and an overlapping upward move must land exactly where a copy
+        // through a temporary would (row 1 <- row 0, overlapping).
+        b.write_host(id, &(0..16).map(|i| i as f32).collect::<Vec<_>>())
+            .unwrap();
+        b.copy_cells(r, r, 1, 0, 2, 4).unwrap();
+        assert_eq!(
+            b.read_host(id).unwrap(),
+            &[0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 12.0, 13.0, 14.0, 15.0]
+        );
         // A range leaving the buffer is an error, never a truncation.
         assert!(b.copy_cells(r, r, 0, 3, 4, 4).is_err());
         assert!(b.copy_cells(r, r, 0, 0, 1, 32).is_err());

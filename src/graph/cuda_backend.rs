@@ -1491,11 +1491,6 @@ impl Backend for CudaBackend {
                 src.id, dst.id
             ));
         }
-        if dst_row > src_row {
-            return Err(format!(
-                "cuda: copy_cells is downward-only ({dst_row} > {src_row})"
-            ));
-        }
         let dst_ptr = self.ptr_of_ref(dst)?;
         let src_ptr = self.ptr_of_ref(src)? as *const std::ffi::c_void;
         self.state
@@ -4518,7 +4513,7 @@ mod tests {
     /// device-to-device copy cannot express (CUDA documents overlapping
     /// `cudaMemcpyAsync` as undefined).
     #[test]
-    fn cuda_copy_cells_moves_overlapping_rows_down() {
+    fn cuda_copy_cells_moves_overlapping_rows_in_both_directions() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
             return;
@@ -4541,9 +4536,26 @@ mod tests {
             })
             .collect();
         assert_eq!(got, want, "the moved rows must be byte-identical");
-        // The contract is enforced before anything is launched.
-        let err = cb.copy_cells(r, r, 1, 0, 3, 4).unwrap_err();
-        assert!(err.contains("downward-only"), "{err}");
+        // C7b: the upward direction works too. The kernel walks the rows in the
+        // order the overlap requires — descending here — so the result is what a
+        // copy through a temporary would give.
+        cb.write_host(id, &data).unwrap();
+        cb.copy_cells(r, r, 1, 0, 3, 4).unwrap();
+        let got = cb.copy_to_host(id).unwrap();
+        let want: Vec<f32> = (0..24)
+            .map(|i| {
+                let row = match i / 4 {
+                    0 => 0,
+                    n if n <= 3 => n - 1,
+                    n => n,
+                };
+                row as f32 + (i % 4) as f32 / 10.0
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "an upward overlapping move must be byte-identical"
+        );
     }
 
     #[test]

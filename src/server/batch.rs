@@ -207,94 +207,41 @@ impl BatchEngine {
             }
             return;
         }
-        let mut reclaimed = 0usize;
-        for j in (idx + 1)..self.slots.len() {
-            if self.slots[j].run.is_none() && self.slots[j].cap > 0 {
-                self.cache.alloc().kv_release_seq(self.slots[j].seq);
-                self.slots[j].cached_tokens.clear();
-                self.slots[j].cap = 0;
-                reclaimed += 1;
-            }
-        }
-        let start = self.slots[idx].start;
-        let before = self.slots[idx].cap;
-        let grew = self.reserve_in_place(idx, want, start);
-        // A reclaimed idle slot loses B2's prefix hint (it re-prefills next time),
-        // so say so once per growth — silence would make that invisible.
-        eprintln!(
-            "[server] slot {idx}: capacity {before} -> {} cells for a request wanting {want} \
-             (released {reclaimed} idle slot(s) above; rows kept: {grew})",
-            self.slots[idx].cap
-        );
-    }
-
-    /// Reserve `cells` for `self.slots[idx]`'s sequence and adopt the result
-    /// **only if it lands at `expect`**, which is where the slot's written rows
-    /// physically are. Returns whether the slot kept them.
-    fn reserve_in_place(&mut self, idx: usize, cells: usize, expect: usize) -> bool {
         let seq = self.slots[idx].seq;
-        let written = self.slots[idx].cached_tokens.len();
-        let (old_start, old_cap) = (self.slots[idx].start, self.slots[idx].cap);
-        self.cache.alloc().kv_release_seq(seq);
-        let attempt = self.cache.alloc().kv_reserve_seq_with_defrag(seq, cells);
-        match attempt {
-            Ok((slot, moves)) if slot.start == expect => {
+        // Capacity has to come from somewhere. Idle runs contribute theirs (their
+        // only cost is B2's prefix hint, which the slot re-prefills); a **busy** run
+        // is never touched — C7b moves the rows around it instead.
+        let need = want - self.slots[idx].cap;
+        let mut reclaimed = 0usize;
+        for j in 0..self.slots.len() {
+            if j == idx || self.slots[j].run.is_some() || self.slots[j].cap == 0 {
+                continue;
+            }
+            if self.cache.alloc().kv_arena_stats().free_cells >= need {
+                break;
+            }
+            self.cache.alloc().kv_release_seq(self.slots[j].seq);
+            self.slots[j].cached_tokens.clear();
+            self.slots[j].cap = 0;
+            reclaimed += 1;
+        }
+        let before = self.slots[idx].cap;
+        match self.cache.alloc().kv_set_cap_with_defrag(seq, want) {
+            Ok((slot, moves)) => {
                 apply_run_moves(&mut self.slots, &moves);
-                if written > 0 {
-                    let cells = written.min(slot.cap);
-                    self.cache
-                        .alloc()
-                        .kv_own_range(seq, slot.start, slot.start + cells);
-                }
                 self.slots[idx].start = slot.start;
                 self.slots[idx].cap = slot.cap;
-                true
+                // Say it once per growth: a reclaimed slot's prefix hint is gone and
+                // rows may have moved, and silence would make both invisible.
+                eprintln!(
+                    "[server] slot {idx}: capacity {before} -> {} cells for a request wanting \
+                     {want} (released {reclaimed} idle slot(s); {} run(s) moved)",
+                    slot.cap,
+                    moves.len()
+                );
             }
-            Ok((slot, moves)) => {
-                // First-fit put the run somewhere its rows are not. Give the
-                // rows up (the next request re-prefills) instead of reading them
-                // at the wrong offset — a silent wrong-row read is the one
-                // outcome C6 exists to prevent.
-                let _ = slot;
-                apply_run_moves(&mut self.slots, &moves);
-                self.cache.alloc().kv_release_seq(seq);
-                self.forget_slot(idx);
-                false
-            }
-            Err(_) => {
-                // Could not fit the request after all: put the slot back the way
-                // it was, rows and all (nothing has moved), so it keeps serving.
-                match self
-                    .cache
-                    .alloc()
-                    .kv_reserve_seq_with_defrag(seq, old_cap.max(1))
-                {
-                    Ok((slot, moves)) if slot.start == old_start => {
-                        apply_run_moves(&mut self.slots, &moves);
-                        if written > 0 {
-                            let cells = written.min(slot.cap);
-                            self.cache
-                                .alloc()
-                                .kv_own_range(seq, slot.start, slot.start + cells);
-                        }
-                        self.slots[idx].start = slot.start;
-                        self.slots[idx].cap = slot.cap;
-                    }
-                    _ => {
-                        self.cache.alloc().kv_release_seq(seq);
-                        self.forget_slot(idx);
-                    }
-                }
-                false
-            }
+            Err(e) => eprintln!("[server] slot {idx}: cannot grow to {want} cells ({e})"),
         }
-    }
-
-    /// Drop a slot's reservation bookkeeping: no run, no rows, no prefix hint.
-    fn forget_slot(&mut self, idx: usize) {
-        self.slots[idx].start = 0;
-        self.slots[idx].cap = 0;
-        self.slots[idx].cached_tokens.clear();
     }
 
     /// C7: the cells a request wants reserved, clamped to the arena. A bounded

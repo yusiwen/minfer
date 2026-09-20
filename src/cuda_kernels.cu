@@ -8511,14 +8511,15 @@ extern "C" void launch_q8_0_p32_q8_mmvq_multi(
     q8_0_p32_q8_mmvq_multi<<<grid, 256, 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
 }
 
-// ─── C3: move KV rows within one arena (arena compaction) ───────────────────
-// One block walks the rows in **ascending** order with a barrier between them.
-// With `dst_row <= src_row` (the caller's contract), the row a write could
-// clobber is a row already copied, so ascending is the safe direction for
-// overlapping ranges — and overlapping is the normal case, because a compaction
-// slides a run down into the gap just below it. `cudaMemcpyAsync` device-to-device
-// is documented undefined for overlapping ranges, which is exactly why this is a
-// kernel and not a memcpy: no staging buffer, no second pass.
+// ─── C3/C7b: move KV rows within one arena (arena compaction) ───────────────
+// One block walks the rows one at a time with a barrier between them, **in the
+// direction the overlap requires**: ascending when the run slides down, descending
+// when it slides up (C7b, where growing a run pushes the runs above it up). Either
+// way the row a write could clobber has already been copied. Overlapping is the
+// normal case — a compaction slides a run into the gap next to it — and
+// `cudaMemcpyAsync` device-to-device is documented undefined for overlapping
+// ranges, which is exactly why this is a kernel and not a memcpy: no staging
+// buffer, no second pass.
 __global__ void kv_move_rows(
     float* __restrict__ dst,
     const float* __restrict__ src,
@@ -8526,12 +8527,14 @@ __global__ void kv_move_rows(
 ) {
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
-    for (int r = 0; r < rows; r++) {
+    const bool down = dst_row <= src_row;
+    for (int k = 0; k < rows; k++) {
+        const int r = down ? k : (rows - 1 - k);
         const float* s = src + ((size_t)src_row + (size_t)r) * (size_t)elems;
         float* d = dst + ((size_t)dst_row + (size_t)r) * (size_t)elems;
         for (int i = tid; i < elems; i += nth) d[i] = s[i];
-        // Every thread must finish row r before any thread touches row r+1: a
-        // later write can land on an earlier row that is still being read.
+        // Every thread must finish this row before any thread touches the next one:
+        // a later write can land on a row that is still being read.
         __syncthreads();
     }
 }
@@ -8544,7 +8547,7 @@ extern "C" int launch_kv_move_rows(
     cudaStream_t stream
 ) {
     if (rows <= 0 || elems <= 0) return 0;
-    if (dst_row > src_row || dst_row < 0 || src_row < 0) return 1;
+    if (dst_row < 0 || src_row < 0) return 1;
     kv_move_rows<<<1, 256, 0, stream>>>(dst, src, dst_row, src_row, rows, elems);
     return (int)(cudaGetLastError() != cudaSuccess);
 }
