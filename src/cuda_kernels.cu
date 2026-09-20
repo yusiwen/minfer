@@ -2599,6 +2599,7 @@ __global__ void attn_bias_rope_store_f32(
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
     const int* positions,
+    const int* cells,
     int kv_is_f16
 ) {
     const int half_dim = hd / 2;
@@ -2607,7 +2608,12 @@ __global__ void attn_bias_rope_store_f32(
     const int total = qpairs + kpairs + nkt;
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= total) return;
+    // C6: `positions[0]` is the token's index within its sequence (what RoPE
+    // rotates by); `cells[0]` is the allocator-resolved KV row. They differ
+    // whenever the run does not start at cell 0 (multi-slot server), so the
+    // store below addresses rows by `row`, never by `pos`.
     const int pos = positions[0];
+    const int row = cells[0];
 
     if (u < qpairs) {
         // q section: bias + rope in place (attention reads q at offset 0)
@@ -2641,11 +2647,11 @@ __global__ void attn_bias_rope_store_f32(
         k[j]  = r0;
         k[j2] = r1;
         if (kv_is_f16) {
-            ((__half*)kv_k)[(size_t)pos * nkt + j]  = __float2half(r0);
-            ((__half*)kv_k)[(size_t)pos * nkt + j2] = __float2half(r1);
+            ((__half*)kv_k)[(size_t)row * nkt + j]  = __float2half(r0);
+            ((__half*)kv_k)[(size_t)row * nkt + j2] = __float2half(r1);
         } else {
-            kv_k[(size_t)pos * nkt + j]  = r0;
-            kv_k[(size_t)pos * nkt + j2] = r1;
+            kv_k[(size_t)row * nkt + j]  = r0;
+            kv_k[(size_t)row * nkt + j2] = r1;
         }
     } else {
         // v section: bias + store into the V region
@@ -2653,9 +2659,9 @@ __global__ void attn_bias_rope_store_f32(
         const float val = v[j] + bias_v[j];
         v[j] = val;
         if (kv_is_f16) {
-            ((__half*)kv_v)[(size_t)pos * nkt + j] = __float2half(val);
+            ((__half*)kv_v)[(size_t)row * nkt + j] = __float2half(val);
         } else {
-            kv_v[(size_t)pos * nkt + j] = val;
+            kv_v[(size_t)row * nkt + j] = val;
         }
     }
 }
@@ -4043,7 +4049,7 @@ void launch_attn_bias_rope_store(
     void* kv_k, void* kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
-    const int* positions, int kv_is_f16,
+    const int* positions, const int* cells, int kv_is_f16,
     cudaStream_t stream
 ) {
     const int total = nqt / 2 + nkt / 2 + nkt;
@@ -4053,7 +4059,7 @@ void launch_attn_bias_rope_store(
         q, k, v,
         (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
         (float*)kv_k, (float*)kv_v,
-        nqt, nkt, hd, freq_base, freq_scale, positions, kv_is_f16);
+        nqt, nkt, hd, freq_base, freq_scale, positions, cells, kv_is_f16);
 }
 
 void launch_gqa_attn_f32_f16kv(

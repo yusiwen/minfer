@@ -520,9 +520,15 @@ impl Qwen2Graph {
                 // loader registers blk.{i}.attn_qkv; qkv_concat_available
                 // probes the concat feasibility per backend (same shape as
                 // the fuse_ffn gate below).
+                // C6/S3: the fused epilogue stores K/V at the
+                // allocator-resolved `cells` row, so the CUDA path may stay
+                // fused even when the run does not start at cell 0
+                // (`explicit_span`). Metal keeps the pre-C6 gate: it has no
+                // explicit-span attention at all (G5), so every run it can
+                // fuse starts at cell 0 and positions == cells.
                 fuse_qkv: nt == 1
                     && (metal_on || cuda_on)
-                    && !explicit_span
+                    && (cuda_on || !explicit_span)
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)

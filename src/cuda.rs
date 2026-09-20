@@ -537,6 +537,7 @@ extern "C" {
         freq_base: f32,
         freq_scale: f32,
         positions: *const i32,
+        cells: *const i32,
         kv_is_f16: i32,
         stream: *mut std::ffi::c_void,
     );
@@ -5335,7 +5336,11 @@ impl CudaState {
     }
 
     /// D3-8: fused decode QKV epilogue (G4 CUDA port of Metal's
-    /// `attn_bias_rope_store`). `q`/`k`/`v` are POINTER-FORM section bases:
+    /// `attn_bias_rope_store`). `positions` drives RoPE (sequence-relative);
+    /// `cells` is the allocator-resolved KV row for the store (C6) — the two
+    /// differ when the run does not start at cell 0.
+    ///
+    /// `q`/`k`/`v` are POINTER-FORM section bases:
     /// the concat class passes sections of the concat matmul output [q|k|v]
     /// (nt==1), the mixed-quant class passes the three separate matmul
     /// outputs. Biases added per section, q/k roped in place (math verbatim
@@ -5358,6 +5363,7 @@ impl CudaState {
         freq_base: f32,
         freq_scale: f32,
         positions: *mut std::ffi::c_void,
+        cells: *mut std::ffi::c_void,
         kv_is_f16: bool,
     ) {
         let stream = self.stream();
@@ -5377,6 +5383,7 @@ impl CudaState {
                 freq_base,
                 freq_scale,
                 positions as *const i32,
+                cells as *const i32,
                 kv_is_f16 as i32,
                 stream,
             );
@@ -6174,7 +6181,7 @@ mod d38_probe_tests {
                 let dv_f = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
                     q1, k1, v1, dbq, dbk, dbv, dk_f, dv_f, nqt, nkt, hd, freq_base, freq_scale,
-                    dpos, kv_f16,
+                    dpos, dpos, kv_f16,
                 );
 
                 // ---- FUSED form 2: three separate buffers (class-2 shape) --
@@ -6188,7 +6195,7 @@ mod d38_probe_tests {
                 let dv_f2 = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
                     d_q2, d_k2, d_v2, dbq, dbk, dbv, dk_f2, dv_f2, nqt, nkt, hd, freq_base,
-                    freq_scale, dpos, kv_f16,
+                    freq_scale, dpos, dpos, kv_f16,
                 );
 
                 // ---- UNFUSED: the 7-launch chain on split sections ----

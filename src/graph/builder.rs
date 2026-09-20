@@ -329,10 +329,13 @@ impl GraphBuilder {
     ) -> NodeId {
         let nt = self.graph.nodes[x].out_shape[1];
         let od_total = meta.nqt + 2 * meta.nkt;
+        // C6: the epilogue stores K/V at allocator-resolved rows, so the node
+        // takes the same shared `cells` input `kvcache_store` uses.
+        let cells = self.cells_input(nt);
         self.node(
             "fused_qkv",
             Op::FusedQKV { layer },
-            &[x, pos],
+            &[x, pos, cells],
             [od_total, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedQkv(meta),
@@ -359,10 +362,12 @@ impl GraphBuilder {
         meta: QkvBiasRopeStoreMeta,
     ) -> NodeId {
         let shape = self.graph.nodes[q].out_shape;
+        // C6: same split as `fused_qkv` — `pos` for RoPE, `cells` for the store.
+        let cells = self.cells_input(shape[1]);
         self.node(
             "qkv_bias_rope_store",
             Op::QkvBiasRopeStore { layer },
-            &[q, k, v, pos],
+            &[q, k, v, pos, cells],
             shape,
             DType::F32,
             NodeMeta::QkvBiasRopeStore(meta),

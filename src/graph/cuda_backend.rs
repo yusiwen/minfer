@@ -863,6 +863,7 @@ impl CudaBackend {
                 let bk = bias_ptr(&meta.bias_k)?;
                 let bv = bias_ptr(&meta.bias_v)?;
                 let pos = self.positions_i32(in_bufs[3].id)?;
+                let cells = self.positions_i32(in_bufs[4].id)?;
                 self.state.attn_bias_rope_store(
                     self.ptr_of_ref(out_buf)?,
                     self.ptr_of_ref(in_bufs[1])?,
@@ -878,6 +879,7 @@ impl CudaBackend {
                     meta.freq_base,
                     meta.freq_scale,
                     pos,
+                    cells,
                     self.kv_f16,
                 );
                 Ok(())
@@ -941,6 +943,7 @@ impl CudaBackend {
                 let bk = bias_ptr(&meta.bias_k)?;
                 let bv = bias_ptr(&meta.bias_v)?;
                 let pos = self.positions_i32(in_bufs[1].id)?;
+                let cells = self.positions_i32(in_bufs[2].id)?;
                 // pointer-form section bases into the concat output
                 // [q|k|v]: q at 0, k at nqt, v at nqt+nkt (in-bounds by
                 // construction: out = od_total = nqt + 2*nkt f32)
@@ -966,6 +969,7 @@ impl CudaBackend {
                     meta.freq_base,
                     meta.freq_scale,
                     pos,
+                    cells,
                     self.kv_f16,
                 );
                 Ok(())
