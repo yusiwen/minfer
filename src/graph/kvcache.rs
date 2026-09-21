@@ -29,6 +29,14 @@ pub const SEQ_MAIN: SeqId = 0;
 /// A cell no sequence owns (dropped, or never written).
 pub const FREE: SeqId = u32::MAX;
 
+/// C8b S2: how many `(cell, len)` runs one query's `kv_map` entry carries.
+///
+/// Two suffice for what the store builds today — a shared prefix plus a private run
+/// — and the padding is what keeps the input a fixed shape (an input's size is
+/// topology, so it cannot depend on the batch). A window that needs more is refused
+/// loudly by [`KvCache::attn_map`] rather than truncated.
+pub const KV_MAP_MAX_SPANS: usize = 4;
+
 /// One layer's KV arena: the two persistent regions plus per-cell ownership.
 #[derive(Debug, Clone)]
 pub struct KvLayer {
@@ -678,6 +686,72 @@ impl KvCache {
             "KV layers disagree about how much is written"
         );
         Ok(span)
+    }
+
+    /// Resolve each query's allowed cells into the **`kv_map`** input layout (C8b
+    /// S2): `KV_MAP_MAX_SPANS` `(cell, len)` runs per query, zero-padded.
+    ///
+    /// `attn_span` names one contiguous range, which is exactly what a sequence
+    /// reading part of its prefix in place does not have. This is the same
+    /// resolution kept as a list: every span of the sequence that starts at or
+    /// before the query's position, the last one clipped to the query's own row (a
+    /// token may not attend to rows written after it). A window that needs more runs
+    /// than the input carries is an error, never a truncated window.
+    pub fn attn_map(&self, seq_ids: &[u32], positions: &[usize]) -> Result<Vec<u32>, String> {
+        let n = seq_ids.len();
+        if positions.len() != n {
+            return Err(format!(
+                "attn_map: {} sequence ids but {} positions",
+                n,
+                positions.len()
+            ));
+        }
+        if self.layers.is_empty() {
+            return Err("attn_map: no KV arena allocated".to_string());
+        }
+        let mut out = vec![0u32; n * KV_MAP_MAX_SPANS * 2];
+        for t in 0..n {
+            let seq = seq_ids[t];
+            let rel = positions[t];
+            let spans = self.spans_of(seq);
+            if spans.is_empty() {
+                return Err(format!(
+                    "attn_map: query {t} belongs to sequence {seq}, which holds no cells"
+                ));
+            }
+            if rel >= self.written_rows(seq) {
+                return Err(format!(
+                    "attn_map: query {t} (sequence {seq}, position {rel}) has not been written"
+                ));
+            }
+            let mut k = 0usize;
+            for &(base, cell, len) in spans {
+                if base > rel {
+                    break;
+                }
+                let take = len.min(rel + 1 - base);
+                if take == 0 {
+                    continue;
+                }
+                if k == KV_MAP_MAX_SPANS {
+                    return Err(format!(
+                        "attn_map: query {t} (sequence {seq}, position {rel}) needs more than \
+                         {KV_MAP_MAX_SPANS} cell runs (spans {spans:?})"
+                    ));
+                }
+                let at = (t * KV_MAP_MAX_SPANS + k) * 2;
+                out[at] = cell as u32;
+                out[at + 1] = take as u32;
+                k += 1;
+            }
+            if k == 0 {
+                return Err(format!(
+                    "attn_map: query {t} (sequence {seq}, position {rel}) resolves to no cells \
+                     (spans {spans:?})"
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// The maximal **free** cell runs, in cell order: free means "not covered by
@@ -1570,6 +1644,60 @@ mod tests {
             Some(dst.start),
             "the refusal changed nothing"
         );
+    }
+
+    /// C8b S2: the map is `attn_span` kept as a list — one run when a sequence shares
+    /// nothing, two when it reads a prefix in place, and a refusal (never a truncated
+    /// window) when the input cannot carry the runs.
+    #[test]
+    fn the_map_lists_a_querys_runs_and_refuses_to_truncate() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 2).unwrap(); // [4, 6)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        c.own_positions(2, &[4, 5]).unwrap();
+        let map = c.attn_map(&[2, 2, 2], &[2, 4, 5]).unwrap();
+        let k = KV_MAP_MAX_SPANS * 2;
+        assert_eq!(
+            &map[0..k],
+            &[donor.start as u32, 3, 0, 0, 0, 0, 0, 0],
+            "only the shared prefix is in reach at position 2"
+        );
+        assert_eq!(
+            &map[k..2 * k],
+            &[donor.start as u32, 4, dst.start as u32, 1, 0, 0, 0, 0],
+            "position 4 crosses into the private run"
+        );
+        assert_eq!(
+            &map[2 * k..3 * k],
+            &[donor.start as u32, 4, dst.start as u32, 2, 0, 0, 0, 0]
+        );
+        // With one span the map and the span agree, which is what keeps the
+        // single-span path bitwise.
+        let span = c.attn_span(&[1], &[3]).unwrap();
+        let single = c.attn_map(&[1], &[3]).unwrap();
+        assert_eq!(&single[0..2], &[span[0], span[1] - span[0]]);
+        assert_eq!(&single[2..], &[0u32; 6], "unused slots are zero-length");
+        assert!(c
+            .attn_map(&[2], &[6])
+            .unwrap_err()
+            .contains("has not been written"));
+        assert!(c
+            .attn_map(&[9], &[0])
+            .unwrap_err()
+            .contains("holds no cells"));
+        // More runs than the input carries: written directly, because no store
+        // mutation produces five spans yet.
+        c.spans.insert(
+            1,
+            vec![(0, 0, 1), (1, 1, 1), (2, 2, 1), (3, 3, 1), (4, 4, 1)],
+        );
+        c.note_written(1, 0, &[4]); // the fifth span's row
+        let err = c.attn_map(&[1], &[4]).unwrap_err();
+        assert!(err.contains("more than"), "got: {err}");
     }
 
     /// A physical removal (C2) renumbers cells across the whole arena, so it cannot
