@@ -824,6 +824,82 @@ impl GraphAllocator {
         Ok((slot, ordered))
     }
 
+    /// C8a: copy the first `rows` written K/V rows of `src` into `dst`'s run and
+    /// give `dst` their ownership, so a prefix that another slot already computed is
+    /// **not prefilled again**.
+    ///
+    /// This is the cheap half of cross-sequence sharing: the rows are duplicated
+    /// (memory stays per-sequence) and **no read path changes**, because `dst` keeps
+    /// one contiguous run — the copy exists precisely so it can. True sharing, where a
+    /// block is stored once and the attention kernels gather it, is C8b.
+    ///
+    /// Both runs must be contiguous, which they are today (`cells[t] = start + t`); the
+    /// move is bounded by `src`'s written rows and by `dst`'s capacity, and it fails
+    /// loudly rather than copying a row that does not exist. The whole copy is within
+    /// one region per layer, so `copy_cells`' overlap-safe ordering applies (a single
+    /// move per region, in either direction).
+    pub fn kv_copy_prefix(
+        &mut self,
+        src: super::kvcache::SeqId,
+        dst: super::kvcache::SeqId,
+        rows: usize,
+    ) -> Result<(), String> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let from = self
+            .kv
+            .seq_slot(src)
+            .ok_or_else(|| format!("kv_copy_prefix: source sequence {src} holds no run"))?;
+        let to = self
+            .kv
+            .seq_slot(dst)
+            .ok_or_else(|| format!("kv_copy_prefix: destination sequence {dst} holds no run"))?;
+        let written = self.kv.written_rows(src);
+        if rows > written {
+            return Err(format!(
+                "kv_copy_prefix: sequence {src} has written {written} rows, {rows} requested"
+            ));
+        }
+        if rows > to.cap {
+            return Err(format!(
+                "kv_copy_prefix: destination sequence {dst} reserved {} cells, {rows} requested",
+                to.cap
+            ));
+        }
+        if from.start == to.start {
+            return Ok(()); // same run: nothing to copy
+        }
+        let regions: Vec<(BufRef, BufRef, usize, crate::graph::Backend)> = self
+            .kv
+            .iter()
+            .map(|(_, l)| (l.k, l.v, (l.elems / l.n_ctx.max(1)).max(1), l.k.backend))
+            .collect();
+        for (k, v, elems_per_cell, backend) in regions {
+            for region in [k, v] {
+                self.copy_cells_in_pool(
+                    backend,
+                    region,
+                    region,
+                    to.start,
+                    from.start,
+                    rows,
+                    elems_per_cell,
+                )
+                .map_err(|e| {
+                    format!(
+                        "kv_copy_prefix: copying {rows} rows of sequence {src} ({}) into \
+                         sequence {dst} ({}) failed: {e}",
+                        from.start, to.start
+                    )
+                })?;
+            }
+        }
+        // One call for every layer: `own_range` sets the owner in all of them.
+        self.kv.own_range(dst, to.start, to.start + rows);
+        Ok(())
+    }
+
     pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
         let before = self.kv.arena_stats();
         let moves = self.kv.compaction_plan(need);
@@ -1540,6 +1616,32 @@ fn kv_defrag_enabled_from(no_flag: Option<&std::ffi::OsStr>) -> bool {
 mod tests {
     use super::*;
     use crate::graph::builder::GraphBuilder;
+
+    /// C8a S1: the prefix copy refuses what it cannot do instead of copying a row that
+    /// does not exist or writing past the destination's reservation.
+    ///
+    /// These are the checks that run before any backend work. The data path, and the
+    /// written/capacity bounds (which need real KV regions), are covered by the S2 gate:
+    /// the same prompt served via a copy and via a re-prefill must produce byte-identical
+    /// continuations.
+    #[test]
+    fn copying_a_prefix_refuses_what_it_cannot_copy() {
+        let mut a = GraphAllocator::new();
+        a.kv_set_capacity(16);
+        // Neither sequence holds a run yet.
+        let err = a.kv_copy_prefix(0, 1, 4).unwrap_err();
+        assert!(err.contains("holds no run"), "got: {err}");
+        a.kv_reserve_seq(0, 8).unwrap();
+        // The destination has no run.
+        let err = a.kv_copy_prefix(0, 1, 4).unwrap_err();
+        assert!(err.contains("holds no run"), "got: {err}");
+        a.kv_reserve_seq(1, 4).unwrap();
+        // Zero rows is a no-op, whatever the two runs are.
+        a.kv_copy_prefix(0, 0, 0).expect("zero rows");
+        // A source with nothing written is refused before any copy is attempted.
+        let err = a.kv_copy_prefix(0, 1, 2).unwrap_err();
+        assert!(err.contains("has written 0 rows"), "got: {err}");
+    }
 
     /// C6/C7: `cells` is an absolute arena row, so it is bounded by the arena — not
     /// by the per-sequence position rule it used to be checked with. The two bounds
