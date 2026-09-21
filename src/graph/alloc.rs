@@ -1102,7 +1102,18 @@ impl GraphAllocator {
                     slot.cap, slot.start
                 ));
             }
-            cells.push((slot.start + rel) as u32);
+            // C8b S1: resolve through the sequence's span list. With one span this is
+            // exactly `slot.start + rel`; a list that does not cover the position is an
+            // invariant violation, so it is refused loudly instead of falling back to
+            // the contiguous form.
+            let cell = self.kv.cell_of(seq, rel).ok_or_else(|| {
+                format!(
+                    "kv_cells_for_seq: query {t} position {rel} is outside sequence {seq}'s \
+                     span list ({:?})",
+                    self.kv.spans_of(seq)
+                )
+            })?;
+            cells.push(cell as u32);
         }
         Ok(cells)
     }
