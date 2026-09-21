@@ -1262,6 +1262,16 @@ the map, as it already refuses the explicit span.
 4. `KvArenaStats` counts a shared block once; a compaction moves it once and renumbers **every**
    sharer's span list; the memory saving is measured.
 
+**Why S1 is a *used* generalization, not dead bookkeeping.** The first draft of this plan put the
+refcounts in S1 and the span list in S2. That is the shape A7 deleted: the campaign's own note says
+an identity field earns its place only if some *topology* decision reads it — "a future feature will
+need it" is not enough, and `n_seqs` was removed for exactly that reason. Refcounts are only read by
+the sharing that S2 introduces, so they move to S2 and S1 becomes the span list **plus the two
+resolvers that read it** (`kv_cells_for_seq` and `attn_span`). Those are live paths for every
+request, which is what makes S1's gate meaningful: a single-entry span list must reproduce today's
+answers bit for bit, and any slip shows up in the existing suites rather than in a field nobody
+consults.
+
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
 (3) CoW's per-token private rows must not fragment the arena beyond what C7's growth can absorb;
@@ -1269,8 +1279,8 @@ the stats gate watches exactly that.
 
 | Step | Content | Gate |
 |---|---|---|
-| S1 | Per-cell refcounts at block granularity + stats/compaction awareness | no behaviour change: suites stay bitwise |
-| S2 | Per-sequence span list + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
+| S1 | Per-sequence **span list** + the resolvers (`kv_cells_for_seq`, `attn_span`) reading through it — single-entry in practice, so nothing observable changes | no behaviour change: suites stay bitwise |
+| S2 | Block-granular **refcounts** + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
 | S3 | Copy-on-write: `kv_private_row_for` at store resolution | gate 3 |
 | S4 | CUDA attention gather + device A/B | gate 2 on GB10 + timing |
 | S5 | Metal behind G5 (refuse the map, as it refuses the span) + docs closure | compile check + G5 record |
