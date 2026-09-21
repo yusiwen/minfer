@@ -70,6 +70,15 @@ pub struct KvCache {
     /// Reserved runs, one per live sequence. Several sequences share one arena
     /// through these (E2); one implicit sequence takes the whole of it.
     seqs: BTreeMap<SeqId, SeqSlot>,
+    /// C8b S1: each sequence's rows as spans `(position base, first cell, length)`.
+    ///
+    /// Resolution goes through this list, not through `slot.start` directly, because C8b
+    /// will let a sequence's rows be *several* spans (a shared prefix plus a private
+    /// tail). Today every sequence has exactly one span covering its whole reservation,
+    /// so this must reproduce `start + position` exactly — and a missed maintenance
+    /// point is loud rather than silent: `cell_of` returns `None` and the resolver
+    /// refuses the query.
+    spans: BTreeMap<SeqId, Vec<(usize, usize, usize)>>,
     /// Arena capacity in rows (`n_ctx`), from the first `insert`.
     n_ctx: usize,
     /// C3: how many compactions ran, and how many cell rows they copied
@@ -84,6 +93,7 @@ impl KvCache {
             layers: BTreeMap::new(),
             identity: true,
             seqs: BTreeMap::new(),
+            spans: BTreeMap::new(),
             n_ctx: 0,
             defrags: 0,
             cells_moved: 0,
@@ -224,6 +234,7 @@ impl KvCache {
                     cap,
                 };
                 self.seqs.insert(seq, slot);
+                self.refresh_spans(seq);
                 return Ok(slot);
             }
         }
@@ -239,6 +250,7 @@ impl KvCache {
         let Some(slot) = self.seqs.remove(&seq) else {
             return 0;
         };
+        self.refresh_spans(seq);
         for l in self.layers.values_mut() {
             for cell in slot.start..(slot.start + slot.cap).min(l.owner.len()) {
                 if l.owner[cell] == seq {
@@ -293,7 +305,37 @@ impl KvCache {
             }
         }
         self.seqs.get_mut(&seq).expect("checked above").cap = cap;
+        self.refresh_spans(seq);
         Ok(self.compaction_plan(None))
+    }
+
+    /// Refresh `seq`'s span list from its slot. C8b S1 keeps the slot authoritative and
+    /// the span list derived; every path that changes a run's `start`/`cap` (or drops the
+    /// run) calls this, so the two cannot drift silently.
+    fn refresh_spans(&mut self, seq: SeqId) {
+        match self.seqs.get(&seq) {
+            Some(slot) if slot.cap > 0 => {
+                self.spans.insert(seq, vec![(0, slot.start, slot.cap)]);
+            }
+            _ => {
+                self.spans.remove(&seq);
+            }
+        }
+    }
+
+    /// C8b S1: the cell `pos` resolves to for `seq`, through the span list. `None` means
+    /// the position is outside every span the sequence has — for a correctly maintained
+    /// list that cannot happen for a position inside the run, which is why the resolver
+    /// treats it as an error rather than falling back.
+    pub fn cell_of(&self, seq: SeqId, pos: usize) -> Option<usize> {
+        self.spans.get(&seq)?.iter().find_map(|&(base, cell, len)| {
+            (pos >= base && pos < base + len).then_some(cell + (pos - base))
+        })
+    }
+
+    /// The span list of `seq` (diagnostics and tests).
+    pub fn spans_of(&self, seq: SeqId) -> &[(usize, usize, usize)] {
+        self.spans.get(&seq).map_or(&[], |v| v.as_slice())
     }
 
     /// The run `seq` reserved, or `None` when it holds none.
@@ -696,6 +738,7 @@ impl KvCache {
             if let Some(slot) = self.seqs.get_mut(&m.seq) {
                 slot.start = m.to;
             }
+            self.refresh_spans(m.seq);
         }
         self.defrags += 1;
         self.cells_moved += (rows_moved * layers) as u64;
@@ -1003,6 +1046,40 @@ mod tests {
             0,
             "releasing an unknown sequence is a no-op"
         );
+    }
+
+    /// C8b S1: with one span per sequence, the span list must resolve exactly like the
+    /// run it describes — and it must follow the run when the run moves, or when it goes
+    /// away. A miss here is what the resolver turns into a loud error.
+    #[test]
+    fn a_single_span_resolves_exactly_like_its_run() {
+        let mut c = cache(16);
+        c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let slot = c.reserve_seq(0, 4).unwrap(); // [4, 8)
+        assert_eq!(c.spans_of(0), &[(0, slot.start, 4)]);
+        for pos in 0..4 {
+            assert_eq!(c.cell_of(0, pos), Some(slot.start + pos), "pos {pos}");
+        }
+        assert_eq!(c.cell_of(0, 4), None, "past the run");
+        assert_eq!(c.spans_of(9), &[] as &[(usize, usize, usize)], "no run");
+
+        // A compaction moves the run down into the gap sequence 1 left, and the span
+        // list has to follow it (this is the maintenance point that would otherwise
+        // drift silently).
+        c.release_seq(1);
+        let plan = c.compaction_plan(None);
+        assert!(!plan.is_empty(), "sequence 0 must move down: {plan:?}");
+        c.apply_moves(&plan).unwrap();
+        let moved = c.seq_slot(0).unwrap().start;
+        assert_eq!(moved, 0, "packed to the bottom");
+        assert_eq!(c.spans_of(0), &[(0, 0, 4)]);
+        assert_eq!(c.cell_of(0, 3), Some(3));
+
+        // Growing republishes it, and releasing drops it.
+        assert_eq!(c.set_cap(0, 6).unwrap(), Vec::new());
+        assert_eq!(c.spans_of(0), &[(0, 0, 6)]);
+        c.release_seq(0);
+        assert_eq!(c.cell_of(0, 0), None);
     }
 
     /// C7b: growing a run moves the runs above it **up**, and their ownership
