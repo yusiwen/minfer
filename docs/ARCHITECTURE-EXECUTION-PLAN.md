@@ -4,8 +4,7 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next; C4,
-C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
@@ -1145,6 +1144,50 @@ owner (memory-footprint measurement).
 **Depends on:** C7 (elastic runs — shared prefix plus growth is what the server
 actually needs); C1's owner table and C6's resolver are the hooks.
 
+
+#### C8 design (2026-09-21) — the read path, not the refcount, is the cost
+
+**Why.** A prefix used by several sequences (a system prompt on every slot, a conversation
+resumed twice) is prefilled and stored once per sequence. B2 reuses a prefix *within* a
+slot; across slots there is no reuse at all. `KvCache::owner[cell]` holds a single `SeqId`,
+so a cell belongs to exactly one sequence.
+
+**The constraint that shapes everything.** A sequence's rows are one **contiguous run**, and
+the read path depends on that: `cells[t] = start + position`, and attention reads a single
+`[lo, hi)` span from `attn_span`. The *write* path is already general — the allocator hands
+the backend a per-token `cells` vector, so a store may target any row (C6) — but a **read**
+cannot follow a sequence whose rows are not contiguous. Now let two sequences share a prefix
+and then diverge: only one of them can keep a contiguous layout (its tail sits right after
+the prefix); every other sharer's rows become `[0, p) ∪ [private, ...)` — two ranges. So true
+sharing is not "a refcount in the cell store"; it is a **paged read path** (a per-sequence
+block map and a gather in the attention kernels of each backend). That is the whole cost of
+this ticket, and it is why it was estimated L rather than M.
+
+**Two increments, because the cheap half is independent of the read path.**
+
+| Step | Content | Benefit | Cost |
+|---|---|---|---|
+| **C8a** | *Shared prefill, duplicated rows*: a slot that matches another slot's prefix copies its K/V rows with `copy_cells` instead of re-running the forward, then diverges privately. | Removes the N× **prefill** for a shared system prompt — the latency that is actually paid on the first turn. No IR change, no read-path work, works on every backend that already copies cells (CPU, CUDA; Metal behind G5). | Memory stays N×: each slot holds its own copy. |
+| **C8b** | *True sharing*: `owner[cell]` becomes a refcount; the allocator resolves a per-sequence **block map** (64-cell blocks) into the per-token `cells` vector the write path already accepts; attention gains a block gather (`supports_attn_span()` is replaced by a block-map capability), CPU first, then CUDA; Metal stays behind its gate (G5). | The blocks are stored once, so memory follows the sharing, on top of C8a's prefill win. | Every kernel that reads a window needs the gather; `attn_span` is replaced (or supplemented) by the map; compaction and the arena counters must understand refcounts. |
+
+**Invariants / gates.**
+1. C8a: a prefix copied from another slot produces continuations **byte-identical** to the
+   same prefix re-prefilled, on CPU and on CUDA (the same named-tolerance caveat as any
+   device comparison).
+2. C8a: the copy must be measurably cheaper than the prefill it replaces (it is the point).
+3. C8b: two sharers are byte-identical to the same two sequences with private copies.
+4. C8b: `kv_rm` frees a block only when its last owner drops it; a store into a shared block
+   copies it (copy-on-write) or fails loudly — never writes through.
+5. C8b: `KvArenaStats` counts a shared block once, and a compaction moves it once (not once
+   per owner); the memory saving is measured.
+
+**Order.** C8a first: it delivers the user-visible half with the machinery that already
+exists (C3's row copy + C7's moves) and its gate is byte-equality. C8b is then a read-path
+project, and it can be scheduled on its own evidence rather than on this ticket's estimate.
+
+**Not in this ticket:** C4 (quantized KV) and C5 (state save/restore) — each multiplies the
+addressing surface this ticket touches, which is why C6 preceded C7 for the same reason.
+
 ## 6. Phase D — IR expressiveness (item 7)
 
 | ID | Title | Effort |
@@ -2130,7 +2173,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ──────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8 ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ─ C8b ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
