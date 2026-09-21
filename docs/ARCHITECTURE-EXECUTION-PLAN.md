@@ -1205,9 +1205,16 @@ A failed copy falls back to the slot's own cache and prefills the rest — never
 The test-only counter `prefix_rows_copied` makes the copy observable, so the gate asserts both
 that it happened and that it changed nothing: the same prompt served via a copy and on a private
 single-slot run answers **byte-identically** (CPU, where the comparison is exact; a device
-comparison takes the usual named-tolerance caveat). Still open for C8a: the *cost* gate — the
-copy must be measurably cheaper than the prefill it replaces, which needs the end-to-end
-measurement, and the log line that reports each copy for an operator.
+comparison takes the usual named-tolerance caveat). **C8a cost gate (2026-09-21, GB10).** With a 1450-token prompt on `--n-slots 2 --n-ctx 8192` and
+the donor held **busy** (a second request generating), the same prompt served through the copy
+costs **0.013 s** against **0.467 s** with prefix reuse switched off
+(`MINFER_NO_PREFIX_REUSE=1`) — **36.6×** — and both answers are identical. Two scenario traps had
+to be fixed before the number meant anything, and both are easy to repeat: (a) if the sharing
+slot is *idle*, the engine simply places the request **there** and reuses its own cache (B2), so
+no copy happens at all — the donor has to be busy; (b) if the donor's own request needs more than
+its share of the arena, C7's growth reclaims the idle slot the measurement needs, leaving one slot
+and self-defeating the scenario. Each copy is reported for an operator as
+`[server] slot N: copied R prefix row(s) from slot M`.
 
 **Order.** C8a first: it delivers the user-visible half with the machinery that already
 exists (C3's row copy + C7's moves) and its gate is byte-equality. C8b is then a read-path
