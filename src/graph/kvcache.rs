@@ -48,7 +48,22 @@ pub struct KvLayer {
     pub n_used: usize,
 }
 
-/// A sequence's reserved cell run: cells `[start, start + cap)` (Phase E / E2).
+/// A prefix a sequence reads from **another** sequence's rows (C8b S2).
+///
+/// Sequence `s` with `shared.rows = r` reads positions `[0, r)` at the donor's
+/// cells `[cell, cell + r)` and writes its own positions from `r` on into its
+/// private run. The donor is not told: its rows stay its own, and occupancy keeps
+/// them taken for as long as any sharer's span list names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SharedPrefix {
+    /// First cell of the prefix (the donor's first written cell).
+    pub cell: usize,
+    /// Rows the prefix covers; 0 means the sequence shares nothing.
+    pub rows: usize,
+}
+
+/// A sequence's reserved cell run: cells `[start, start + cap)` hold positions
+/// `[shared.rows, shared.rows + cap)` (Phase E / E2, C8b S2).
 ///
 /// A reservation is **not** ownership: it says which cells the sequence *may*
 /// write, so a query can never attend to rows its sequence has not written yet
@@ -58,6 +73,30 @@ pub struct KvLayer {
 pub struct SeqSlot {
     pub start: usize,
     pub cap: usize,
+    /// C8b S2: rows read in place from another sequence (positions `[0, rows)`).
+    pub shared: SharedPrefix,
+    /// Positions written so far — the shared prefix plus the rows this sequence
+    /// wrote itself. Explicit rather than derived from `owner`, because a shared
+    /// row carries the **donor's** stamp.
+    pub written: usize,
+}
+
+impl SeqSlot {
+    /// A private run: cells `[start, start + cap)`, positions from 0, nothing written.
+    pub fn new(start: usize, cap: usize) -> Self {
+        Self {
+            start,
+            cap,
+            shared: SharedPrefix::default(),
+            written: 0,
+        }
+    }
+
+    /// Rows this sequence wrote into its **own** run (`0..=cap`) — the rows a
+    /// relocation has to copy, since the shared prefix lives elsewhere.
+    pub fn private_written(&self) -> usize {
+        self.written.saturating_sub(self.shared.rows)
+    }
 }
 
 /// The KV cell store for one allocator (one graph cache, one session).
@@ -70,14 +109,16 @@ pub struct KvCache {
     /// Reserved runs, one per live sequence. Several sequences share one arena
     /// through these (E2); one implicit sequence takes the whole of it.
     seqs: BTreeMap<SeqId, SeqSlot>,
-    /// C8b S1: each sequence's rows as spans `(position base, first cell, length)`.
+    /// C8b S1/S2: each sequence's address space as spans
+    /// `(position base, first cell, length)`.
     ///
-    /// Resolution goes through this list, not through `slot.start` directly, because C8b
-    /// will let a sequence's rows be *several* spans (a shared prefix plus a private
-    /// tail). Today every sequence has exactly one span covering its whole reservation,
-    /// so this must reproduce `start + position` exactly — and a missed maintenance
-    /// point is loud rather than silent: `cell_of` returns `None` and the resolver
-    /// refuses the query.
+    /// Resolution goes through this list, not through `slot.start` directly, because a
+    /// sequence's rows can be *several* spans (a shared prefix plus a private tail).
+    /// A sequence that shares nothing has exactly one span covering its whole
+    /// reservation, so it must reproduce `start + position` exactly — and a missed
+    /// maintenance point is loud rather than silent: `cell_of` returns `None` and the
+    /// resolver refuses the query. Occupancy (`reserve_seq`, `free_runs`) is derived
+    /// from this list too, which is what keeps a released donor's shared rows taken.
     spans: BTreeMap<SeqId, Vec<(usize, usize, usize)>>,
     /// Arena capacity in rows (`n_ctx`), from the first `insert`.
     n_ctx: usize,
@@ -215,12 +256,7 @@ impl KvCache {
             return Err("reserve_seq: no KV arena allocated".to_string());
         }
         // Cells a live sequence covers, whether or not they are written yet.
-        let mut taken = vec![false; self.n_ctx];
-        for slot in self.seqs.values() {
-            for c in slot.start..(slot.start + slot.cap).min(self.n_ctx) {
-                taken[c] = true;
-            }
-        }
+        let taken = self.occupied();
         let mut run = 0usize;
         for start in 0..self.n_ctx {
             if taken[start] {
@@ -229,10 +265,7 @@ impl KvCache {
             }
             run += 1;
             if run == cap {
-                let slot = SeqSlot {
-                    start: start + 1 - cap,
-                    cap,
-                };
+                let slot = SeqSlot::new(start + 1 - cap, cap);
                 self.seqs.insert(seq, slot);
                 self.refresh_spans(seq);
                 return Ok(slot);
@@ -283,7 +316,9 @@ impl KvCache {
             return Ok(self.compaction_plan(None));
         }
         if cap < slot.cap {
-            let written = self.written_rows(seq);
+            // Only the rows in its *own* run bound the shrink: a shared prefix lives
+            // in cells this reservation never covered (C8b S2).
+            let written = slot.private_written();
             if cap < written {
                 return Err(format!(
                     "set_cap: sequence {seq} has written {written} rows and cannot shrink to {cap}"
@@ -309,18 +344,64 @@ impl KvCache {
         Ok(self.compaction_plan(None))
     }
 
-    /// Refresh `seq`'s span list from its slot. C8b S1 keeps the slot authoritative and
-    /// the span list derived; every path that changes a run's `start`/`cap` (or drops the
-    /// run) calls this, so the two cannot drift silently.
+    /// Refresh `seq`'s span list from its slot. The slot is authoritative and the
+    /// span list derived; every path that changes a run's `start`/`cap`/`shared`
+    /// (or drops the run) calls this, so the two cannot drift silently.
+    ///
+    /// C8b S2: a sharing sequence gets two entries — the shared prefix at positions
+    /// `[0, rows)` (the donor's cells) and its private run covering positions
+    /// `[rows, rows + cap)`. A sequence that shares nothing gets one entry, which is
+    /// the shape S1 kept bitwise.
     fn refresh_spans(&mut self, seq: SeqId) {
-        match self.seqs.get(&seq) {
-            Some(slot) if slot.cap > 0 => {
-                self.spans.insert(seq, vec![(0, slot.start, slot.cap)]);
+        let entry = match self.seqs.get(&seq) {
+            Some(slot) => {
+                let mut v = Vec::with_capacity(2);
+                if slot.shared.rows > 0 {
+                    v.push((0, slot.shared.cell, slot.shared.rows));
+                }
+                if slot.cap > 0 {
+                    v.push((slot.shared.rows, slot.start, slot.cap));
+                }
+                Some(v)
+            }
+            None => None,
+        };
+        match entry {
+            Some(v) if !v.is_empty() => {
+                self.spans.insert(seq, v);
             }
             _ => {
                 self.spans.remove(&seq);
             }
         }
+    }
+
+    /// The cells covered by **any** live sequence's address space — a reservation
+    /// or a shared prefix (C8b S2).
+    ///
+    /// Derived from the span lists and not from `seqs`, because a shared prefix lives
+    /// inside the donor's run: releasing the donor removes its own spans, and the
+    /// cells have to stay taken for the sharers that still read them. With one span
+    /// per sequence this is exactly the set `reserve_seq` used before.
+    fn occupied(&self) -> Vec<bool> {
+        let mut taken = vec![false; self.n_ctx];
+        for spans in self.spans.values() {
+            for &(_, cell, len) in spans {
+                for c in cell..(cell + len).min(self.n_ctx) {
+                    taken[c] = true;
+                }
+            }
+        }
+        taken
+    }
+
+    /// The position `cell` holds for `seq`, inverting the span list (`None` when no
+    /// span of that sequence covers the cell).
+    fn pos_of_cell(&self, seq: SeqId, cell: usize) -> Option<usize> {
+        self.spans
+            .get(&seq)?
+            .iter()
+            .find_map(|&(base, c, len)| (cell >= c && cell < c + len).then_some(base + (cell - c)))
     }
 
     /// C8b S1: the cell `pos` resolves to for `seq`, through the span list. `None` means
@@ -346,6 +427,11 @@ impl KvCache {
     /// Take ownership of cells `[from, to)` for `seq` in every layer — the rows
     /// this forward wrote. Replaces C1's `own_prefix`, which hard-coded sequence
     /// 0 and would clobber a second sequence's cells.
+    ///
+    /// C8b S2: a written cell is also a written *position*, so this raises
+    /// `written`. The cells have to lie inside the sequence's span list (the
+    /// reservation is what bounds a write); a cell outside it is a caller bug,
+    /// which the debug assertion reports rather than folding into a wrong count.
     pub fn own_range(&mut self, seq: SeqId, from: usize, to: usize) {
         for l in self.layers.values_mut() {
             let upto = to.min(l.owner.len());
@@ -354,6 +440,39 @@ impl KvCache {
             }
             l.n_used = l.n_used.max(upto);
         }
+        let mut written = self.seqs.get(&seq).map_or(0, |s| s.written);
+        for cell in from..to {
+            match self.pos_of_cell(seq, cell) {
+                Some(pos) => written = written.max(pos + 1),
+                None => debug_assert!(
+                    false,
+                    "own_range: cell {cell} is outside sequence {seq}'s spans {:?}",
+                    self.spans_of(seq)
+                ),
+            }
+        }
+        if let Some(slot) = self.seqs.get_mut(&seq) {
+            slot.written = written;
+        }
+    }
+
+    /// Mark the rows this forward wrote, given the **positions** it wrote them at.
+    ///
+    /// C8b S2: a sharing sequence's positions do not map to `start + pos`, so the
+    /// caller cannot hand over a cell range derived from a position count the way
+    /// `own_range(seq, start, start + rows)` assumed.
+    pub fn own_positions(&mut self, seq: SeqId, positions: &[usize]) -> Result<(), String> {
+        for &pos in positions {
+            let cell = self.cell_of(seq, pos).ok_or_else(|| {
+                format!(
+                    "own_positions: sequence {seq} wrote position {pos}, which its span list \
+                     {:?} does not cover",
+                    self.spans_of(seq)
+                )
+            })?;
+            self.own_range(seq, cell, cell + 1);
+        }
+        Ok(())
     }
 
     /// The single-sequence case: reserve the whole arena for `seq` if it has no
@@ -380,6 +499,16 @@ impl KvCache {
                     l.n_used = l.n_used.max(c + 1);
                 }
             }
+        }
+        // C8b S2: a recorded row is a written position, whatever the cell holds.
+        let mut written = self.seqs.get(&seq).map_or(0, |s| s.written);
+        for &c in cells {
+            if let Some(pos) = self.pos_of_cell(seq, c as usize) {
+                written = written.max(pos + 1);
+            }
+        }
+        if let Some(slot) = self.seqs.get_mut(&seq) {
+            slot.written = written;
         }
     }
 
@@ -413,6 +542,19 @@ impl KvCache {
                 "after_rm: a context shift is single-sequence; release the other sequences first"
                     .to_string(),
             );
+        }
+        // C8b S2: a shared prefix is another sequence's memory, so a shift cannot
+        // move it (and a sharer's positions would no longer line up with its
+        // prefix). Refuse rather than rewrite half a window; sharing is a server
+        // path, a shift is the CLI conversation's.
+        if let Some(slot) = self.seqs.get(&SEQ_MAIN) {
+            if slot.shared.rows > 0 {
+                return Err(format!(
+                    "after_rm: sequence {SEQ_MAIN} shares a {}-row prefix, which a physical \
+                     removal would have to move",
+                    slot.shared.rows
+                ));
+            }
         }
         let mut new_used = 0usize;
         for (layer, l) in self.layers.iter_mut() {
@@ -482,16 +624,9 @@ impl KvCache {
                 positions.len()
             ));
         }
-        let layer = *self
-            .layers
-            .keys()
-            .next()
-            .ok_or("attn_span: no KV arena allocated")?;
-        let owner = &self
-            .layers
-            .get(&layer)
-            .ok_or_else(|| format!("no KV arena for layer {layer}"))?
-            .owner;
+        if self.layers.is_empty() {
+            return Err("attn_span: no KV arena allocated".to_string());
+        }
         let mut span = vec![0u32; 2 * n];
         for t in 0..n {
             let seq = seq_ids[t];
@@ -523,9 +658,11 @@ impl KvCache {
                     first_cell + len
                 )
             })?;
-            // The query's own row must have been written by this sequence: a
-            // window that included rows nobody wrote would attend to zeroes.
-            if owner.get(cell) != Some(&seq) {
+            // The query's own row must have been written by (or for) this
+            // sequence: a window that included rows nobody wrote would attend to
+            // zeroes. With a shared prefix the row carries the donor's stamp, so
+            // the written count — not `owner[]` — is what answers this.
+            if rel >= self.written_rows(seq) {
                 return Err(format!(
                     "attn_span: query {t} (sequence {seq}, position {rel}) resolves to cell \
                      {cell}, which was not written by sequence {seq}"
@@ -549,12 +686,7 @@ impl KvCache {
     /// there.
     pub fn free_runs(&self) -> Vec<(usize, usize)> {
         let n = self.n_ctx;
-        let mut taken = vec![false; n];
-        for slot in self.seqs.values() {
-            for c in slot.start..(slot.start + slot.cap).min(n) {
-                taken[c] = true;
-            }
-        }
+        let taken = self.occupied();
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut open: Option<usize> = None;
         for (c, &t) in taken.iter().enumerate() {
@@ -573,24 +705,90 @@ impl KvCache {
         runs
     }
 
-    /// Rows sequence `seq` actually wrote, counted from its run's start.
+    /// Positions sequence `seq` has written — its shared prefix plus the rows it
+    /// wrote itself (C8b S2: explicit, because a shared row carries the donor's
+    /// ownership stamp and a scan of `owner[]` would stop at the first of them).
     ///
-    /// Ownership is contiguous by construction (`seq_range` documents why), so
-    /// this is the sequence's live prefix — and the number of rows a compaction
-    /// has to copy for it. `cap` bounds it: cells past the reservation belong to
-    /// nobody, whatever `owner[]` still says.
+    /// This is the number of rows a reader may see and the bound `attn_span` uses.
     pub fn written_rows(&self, seq: SeqId) -> usize {
-        let (Some(slot), Some(layer)) = (self.seqs.get(&seq), self.layers.values().next()) else {
-            return 0;
-        };
-        let mut rows = 0;
-        while rows < slot.cap
-            && slot.start + rows < layer.owner.len()
-            && layer.owner[slot.start + rows] == seq
-        {
-            rows += 1;
+        self.seqs.get(&seq).map_or(0, |s| s.written)
+    }
+
+    /// Rows `seq` wrote into its **own** run — the rows a relocation copies, since
+    /// the shared prefix is another sequence's memory (C8b S2).
+    pub fn private_written(&self, seq: SeqId) -> usize {
+        self.seqs.get(&seq).map_or(0, |s| s.private_written())
+    }
+
+    /// C8b S2: let `dst` read the first `rows` positions of `src` **in place**.
+    ///
+    /// The rows are not copied: `dst`'s span list gains an entry naming the donor's
+    /// cells, so both sequences read one copy — which is the whole point, and the
+    /// reason the read path needs a span map (`attn_map`) instead of one range.
+    ///
+    /// Refused loudly rather than approximated when the sharing cannot be expressed:
+    /// an empty share, a donor that has not written that far, a destination that
+    /// already shares or has written rows of its own (its positions would be
+    /// displaced), and a donor prefix that is not **one contiguous cell range** —
+    /// that last case is a donor which itself shares a prefix plus private rows, and
+    /// it needs a multi-entry map the caller has to fall back from.
+    pub fn share_prefix(&mut self, src: SeqId, dst: SeqId, rows: usize) -> Result<(), String> {
+        if rows == 0 {
+            return Err("share_prefix: asked to share 0 rows".to_string());
         }
-        rows
+        if src == dst {
+            return Err(format!(
+                "share_prefix: sequence {src} cannot share with itself"
+            ));
+        }
+        let donor = self
+            .seqs
+            .get(&src)
+            .copied()
+            .ok_or_else(|| format!("share_prefix: source sequence {src} holds no run"))?;
+        if donor.written < rows {
+            return Err(format!(
+                "share_prefix: sequence {src} has written {} rows, {rows} requested",
+                donor.written
+            ));
+        }
+        let dst_slot = self
+            .seqs
+            .get(&dst)
+            .copied()
+            .ok_or_else(|| format!("share_prefix: destination sequence {dst} holds no run"))?;
+        if dst_slot.shared.rows > 0 {
+            return Err(format!(
+                "share_prefix: sequence {dst} already shares {} rows",
+                dst_slot.shared.rows
+            ));
+        }
+        if dst_slot.written > 0 {
+            return Err(format!(
+                "share_prefix: sequence {dst} has written {} rows of its own",
+                dst_slot.written
+            ));
+        }
+        let cell = self
+            .cell_of(src, 0)
+            .ok_or_else(|| format!("share_prefix: sequence {src} has no first cell"))?;
+        // Contiguity: `rows` positions of the donor must be `rows` adjacent cells,
+        // or the prefix would need more than one span entry.
+        match self.cell_of(src, rows - 1) {
+            Some(last) if last == cell + rows - 1 => {}
+            _ => {
+                return Err(format!(
+                    "share_prefix: sequence {src} does not hold positions [0, {rows}) as one \
+                     contiguous range (spans {:?})",
+                    self.spans_of(src)
+                ))
+            }
+        }
+        let slot = self.seqs.get_mut(&dst).expect("checked above");
+        slot.shared = SharedPrefix { cell, rows };
+        slot.written = rows;
+        self.refresh_spans(dst);
+        Ok(())
     }
 
     /// Fragmentation and utilisation counters (C3's acceptance surface; the
@@ -601,6 +799,10 @@ impl KvCache {
         KvArenaStats {
             n_ctx: self.n_ctx,
             reserved_cells,
+            // C8b S2: rows read in place from another sequence. They are one copy of
+            // the arena's bytes shared by two sequences, so `reserved_cells` (the
+            // private runs) does not count them and `owned_cells` (below) does — once.
+            shared_cells: self.seqs.values().map(|s| s.shared.rows).sum(),
             owned_cells: self
                 .layers
                 .values()
@@ -643,7 +845,7 @@ impl KvCache {
                     seq,
                     from: slot.start,
                     to: cursor,
-                    rows: self.written_rows(seq),
+                    rows: slot.private_written(),
                 });
             }
             cursor += slot.cap;
@@ -763,6 +965,44 @@ impl KvCache {
                 slot.start = m.to;
             }
             self.refresh_spans(m.seq);
+            // C8b S2: another sequence may read these rows in place (a shared
+            // prefix), so its pointer has to follow them. Only a sharer's prefix is
+            // affected — every other span either belongs to the moved run itself or
+            // is some sequence's own reservation, which its own move (or nothing)
+            // handles. The plan copies `m.rows` contiguous rows and a share is always
+            // a prefix of a run's written rows, so an overlapping share is either
+            // entirely inside the copied range (renumber) or entirely outside it; a
+            // straddling one would have to split, which no plan produces — refuse it
+            // rather than point half a window at stale rows.
+            if m.rows > 0 {
+                let (mlo, mhi) = (m.from, m.from + m.rows);
+                let mut sharers: Vec<SeqId> = Vec::new();
+                for (&other, slot) in self.seqs.iter() {
+                    if other == m.seq || slot.shared.rows == 0 {
+                        continue;
+                    }
+                    let (lo, hi) = (slot.shared.cell, slot.shared.cell + slot.shared.rows);
+                    if lo >= mhi || hi <= mlo {
+                        continue;
+                    }
+                    if lo < mlo || hi > mhi {
+                        return Err(format!(
+                            "apply_moves: sequence {other}'s {}-row shared prefix ({lo}, {hi}) \
+                             straddles the {}-row range moved from {mlo} to {} — it would have \
+                             to split",
+                            slot.shared.rows, m.rows, m.to
+                        ));
+                    }
+                    sharers.push(other);
+                }
+                for other in sharers {
+                    {
+                        let slot = self.seqs.get_mut(&other).expect("checked above");
+                        slot.shared.cell = m.to + (slot.shared.cell - m.from);
+                    }
+                    self.refresh_spans(other);
+                }
+            }
         }
         self.defrags += 1;
         self.cells_moved += (rows_moved * layers) as u64;
@@ -805,6 +1045,10 @@ pub struct KvMove {
 pub struct KvArenaStats {
     pub n_ctx: usize,
     pub reserved_cells: usize,
+    /// C8b S2: rows a sequence reads in place from another sequence's run. Two
+    /// sharers of one prefix report the same cells here and `owned_cells` counts
+    /// them once, so the saving is visible without double-counting the arena.
+    pub shared_cells: usize,
     pub owned_cells: usize,
     pub free_cells: usize,
     /// Maximal free runs — the "node count" a compaction reduces.
@@ -1171,6 +1415,178 @@ mod tests {
         let err = c.attn_span(&[SEQ_MAIN], &[3]).unwrap_err();
         assert!(err.contains("2 spans"), "got: {err}");
         assert!(err.contains("kv_map"), "got: {err}");
+    }
+
+    /// C8b S2: sharing a prefix means the destination reads the donor's cells — one
+    /// copy of the bytes, two sequences — and keeps writing its own positions into
+    /// its own run. The two halves of the address space have to come back out of the
+    /// span list as one entry each.
+    #[test]
+    fn a_shared_prefix_is_read_in_place_and_written_past() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 2).unwrap(); // [4, 6)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        assert_eq!(c.share_prefix(1, 2, 4), Ok(()));
+        assert_eq!(
+            c.spans_of(2),
+            &[(0, donor.start, 4), (4, dst.start, 2)],
+            "shared prefix then the private tail"
+        );
+        assert_eq!(c.cell_of(2, 0), Some(donor.start), "read in place");
+        assert_eq!(c.cell_of(2, 3), Some(donor.start + 3));
+        assert_eq!(c.cell_of(2, 4), Some(dst.start), "then its own run");
+        assert_eq!(c.written_rows(2), 4, "the shared rows count as written");
+        assert_eq!(c.private_written(2), 0, "but none of them are its own");
+        // The sharer's own storage is not in its run's cells.
+        assert_eq!(c.get(0).unwrap().owner[dst.start], FREE);
+
+        c.own_positions(2, &[4, 5]).unwrap();
+        assert_eq!(c.written_rows(2), 6);
+        assert_eq!(c.private_written(2), 2);
+        assert_eq!(c.get(0).unwrap().owner[dst.start], 2, "its own rows");
+        assert_eq!(
+            c.get(0).unwrap().owner[donor.start],
+            1,
+            "a shared row keeps the donor's stamp"
+        );
+        let stats = c.arena_stats();
+        assert_eq!(stats.shared_cells, 4, "the saving is visible");
+        assert_eq!(stats.reserved_cells, 6, "only the two private runs");
+        // The donor is untouched by any of it and still reads its own rows.
+        assert_eq!(c.spans_of(1), &[(0, donor.start, 4)]);
+        assert_eq!(c.written_rows(1), 4);
+    }
+
+    /// A released donor must not hand its rows to somebody else while a sharer
+    /// still reads them (C8b S2 gate 3): occupancy comes from the span lists, so
+    /// the cells stay taken even though no slot reserves them any more.
+    #[test]
+    fn releasing_the_donor_keeps_the_shared_rows_taken() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 2).unwrap(); // [4, 6)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        assert_eq!(c.release_seq(1), 4, "the donor's run is what it freed");
+        assert_eq!(c.cell_of(2, 0), Some(donor.start), "still reading the rows");
+        assert_eq!(c.written_rows(2), 4);
+        let held = donor.start..donor.start + 4;
+        assert!(
+            c.free_runs()
+                .iter()
+                .all(|&(s, l)| s + l <= held.start || s >= held.end),
+            "the shared rows are not free: {:?}",
+            c.free_runs()
+        );
+        // A third sequence cannot be placed on top of them.
+        let err = c.reserve_seq(3, 16).unwrap_err();
+        assert!(err.contains("no free run"), "got: {err}");
+        // Once the sharer drops them they are free again.
+        c.release_seq(2);
+        assert_eq!(c.free_runs(), vec![(0, 16)]);
+    }
+
+    /// A compaction moves the donor's rows and **every sharer's pointer has to
+    /// follow** — the requirement the plan calls out for a shared block.
+    #[test]
+    fn a_shared_prefix_follows_the_donors_rows_when_they_move() {
+        let mut c = cache(16);
+        c.reserve_seq(0, 4).unwrap(); // [0, 4) — released below, opening the gap
+        let donor = c.reserve_seq(1, 4).unwrap(); // [4, 8)
+        let dst = c.reserve_seq(2, 2).unwrap(); // [8, 10)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[4, 5, 6, 7]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        assert_eq!(c.spans_of(2), &[(0, 4, 4), (4, dst.start, 2)]);
+        c.release_seq(0);
+        let plan = c.compaction_plan(None);
+        assert_eq!(plan.len(), 2, "both runs pack down: {plan:?}");
+        c.apply_moves(&plan).unwrap();
+        let moved_donor = c.seq_slot(1).unwrap();
+        let moved_dst = c.seq_slot(2).unwrap();
+        assert_eq!(moved_donor.start, 0, "the donor packed to the bottom");
+        assert_eq!(moved_dst.start, 4);
+        assert_eq!(
+            moved_dst.shared.cell, 0,
+            "the sharer's prefix followed the donor"
+        );
+        assert_eq!(c.cell_of(2, 0), Some(0));
+        assert_eq!(c.cell_of(2, 4), Some(4), "and its own run moved with it");
+        assert_eq!(c.spans_of(2), &[(0, 0, 4), (4, 4, 2)]);
+    }
+
+    /// What sharing cannot express is refused, never approximated: an empty share,
+    /// a donor that has not written that far, itself, a destination that already
+    /// shares or has written rows, and a donor prefix that is not one cell range.
+    #[test]
+    fn sharing_refuses_what_it_cannot_express() {
+        let mut c = cache(16);
+        let err = c.share_prefix(1, 2, 4).unwrap_err();
+        assert!(err.contains("holds no run"), "got: {err}");
+        c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        c.reserve_seq(2, 2).unwrap(); // [4, 6)
+        c.reserve_seq(3, 2).unwrap(); // [6, 8)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        assert!(c.share_prefix(1, 2, 0).unwrap_err().contains("0 rows"));
+        assert!(c
+            .share_prefix(1, 2, 5)
+            .unwrap_err()
+            .contains("has written 4"));
+        assert!(c
+            .share_prefix(1, 1, 2)
+            .unwrap_err()
+            .contains("cannot share with itself"));
+        c.share_prefix(1, 2, 4).unwrap();
+        assert!(c
+            .share_prefix(1, 2, 2)
+            .unwrap_err()
+            .contains("already shares"));
+        // A destination that has written rows of its own would have them displaced.
+        let own = c.reserve_seq(4, 2).unwrap(); // [8, 10)
+        c.own_positions(4, &[0]).unwrap();
+        let err = c.share_prefix(1, 4, 2).unwrap_err();
+        assert!(err.contains("written 1 rows of its own"), "got: {err}");
+        assert_eq!(c.cell_of(4, 0), Some(own.start), "and it still resolves");
+        // Sequence 3 shares 4 rows and then writes two of its own at [6, 8):
+        // positions [0, 6) are two cell ranges, so a 5-row share from it must
+        // refuse instead of pointing the prefix across the gap.
+        c.share_prefix(1, 3, 4).unwrap();
+        c.own_positions(3, &[4, 5]).unwrap();
+        assert_eq!(c.spans_of(3).len(), 2);
+        let dst = c.reserve_seq(5, 2).unwrap(); // [10, 12)
+        let err = c.share_prefix(3, 5, 5).unwrap_err();
+        assert!(err.contains("one"), "got: {err}");
+        assert!(err.contains("contiguous"), "got: {err}");
+        assert_eq!(
+            c.cell_of(5, 0),
+            Some(dst.start),
+            "the refusal changed nothing"
+        );
+    }
+
+    /// A physical removal (C2) renumbers cells across the whole arena, so it cannot
+    /// run while a prefix is shared — the rows it would move belong to someone else.
+    #[test]
+    fn a_shared_prefix_stops_a_physical_removal() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        c.reserve_seq(SEQ_MAIN, 4).unwrap(); // [4, 8)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, SEQ_MAIN, 4).unwrap();
+        c.release_seq(1);
+        assert_eq!(c.cell_of(SEQ_MAIN, 0), Some(donor.start));
+        let err = c.after_shift(1).unwrap_err();
+        assert!(err.contains("shares a 4-row prefix"), "got: {err}");
     }
 
     /// C7b: growing a run moves the runs above it **up**, and their ownership

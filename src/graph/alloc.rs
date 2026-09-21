@@ -851,6 +851,16 @@ impl GraphAllocator {
             .kv
             .seq_slot(src)
             .ok_or_else(|| format!("kv_copy_prefix: source sequence {src} holds no run"))?;
+        // C8b S2: a copy is contiguous rows, so a source that reads part of its
+        // prefix in place has no single run to copy. Refuse rather than copy the
+        // wrong rows — sharing replaces this path where the device can gather.
+        if from.shared.rows > 0 {
+            return Err(format!(
+                "kv_copy_prefix: source sequence {src} shares a {}-row prefix in place; there is \
+                 no contiguous run to copy",
+                from.shared.rows
+            ));
+        }
         let to = self
             .kv
             .seq_slot(dst)
@@ -898,6 +908,20 @@ impl GraphAllocator {
         // One call for every layer: `own_range` sets the owner in all of them.
         self.kv.own_range(dst, to.start, to.start + rows);
         Ok(())
+    }
+
+    /// C8b S2: let `dst` read the first `rows` positions of `src` **in place** —
+    /// no copy, one shared copy of the arena's bytes. Returns the cells the sharing
+    /// pinned, for the caller's log. The store refuses what it cannot express (see
+    /// `KvCache::share_prefix`), and the caller falls back to `kv_copy_prefix`.
+    pub fn kv_share_prefix(
+        &mut self,
+        src: super::kvcache::SeqId,
+        dst: super::kvcache::SeqId,
+        rows: usize,
+    ) -> Result<usize, String> {
+        self.kv.share_prefix(src, dst, rows)?;
+        Ok(rows)
     }
 
     pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
@@ -1013,15 +1037,10 @@ impl GraphAllocator {
                 let cap = self.kv.n_ctx();
                 self.kv.reserve_seq(seq, cap)?;
             }
-            // C6: `positions` are sequence-relative, so the rows this forward
-            // writes are `[start, start + max(position) + 1)`.
-            let start = self.kv.seq_slot(seq).map(|s| s.start).unwrap_or(0);
-            let rows = batch.positions[from..to]
-                .iter()
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
-            self.kv.own_range(seq, start, start + rows);
+            // C6/C8b S2: `positions` are sequence-relative, so the rows this forward
+            // writes are exactly those positions — resolved through the sequence's
+            // span list, because a sharing sequence's cells are not `start + pos`.
+            self.kv.own_positions(seq, &batch.positions[from..to])?;
         }
         let positions: Vec<usize> = batch.positions.clone();
         self.fill_seq_ids(graph, &batch.seq_ids, &positions)
