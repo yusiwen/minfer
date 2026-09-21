@@ -1078,14 +1078,26 @@ an overlapping upward move (a memmove's output) — the CUDA one on GB10;
 (4) on GB10 the CUDA twin pins the upward *kernel* path (the bytes a memmove would
 produce). Suites: CPU **216** passed, CUDA **264** passed (0 failed, 6 ignored each).
 
-**Not verified end-to-end:** the engine-level scenario "grow while a *busy* slot sits
-above me". Two attempts ran against a CPU binary — `cargo test --release` overwrites
-`target/release/minfer` with a CPU-only build, so the server logged `batching: off
-(device cpu)` and served the serial path — and the device evidence for C7b is therefore
-the kernel test plus the pure unit tests, not a served request. Re-running it needs a
-fresh `cargo build --release --features cuda` and a 4-slot server whose busy slot sits
-above the growing one (slot 0 freed by a short request, slot 1 mid-generation, the long
-prompt landing back on slot 0).
+**End-to-end (2026-09-20) — the engine scenario is verified.** Four slots at
+`--n-ctx 8192`: a short request, then a long generation on another slot, then a
+2148-token prompt admitted while that generation is still running. On GB10 the server
+logs `slot 0: capacity 2048 -> 2157 cells for a request wanting 2157 (released 1 idle
+slot(s); 2 run(s) moved)` — two runs moved, one of them the live generation above — and
+on CPU (forced with `MINFER_BATCH=1`, which makes the comparison deterministic) the same
+scenario moves one run. In **both** runs the live neighbour's continuation is
+**byte-identical to the same request served alone**: its rows travelled up under it and
+its answer did not change, which is exactly what C6 + C7b promise. The grown request
+itself is compared structurally (a shared 38-byte opening with its one-slot baseline),
+because it shares the batch with the live request and therefore takes the windowed
+(`explicit_span`) attention path while the baseline takes the causal one — a named
+tolerance class, not a bitwise property.
+
+That gate was missed twice for an environmental reason worth recording: `cargo test
+--release` overwrites `target/release/minfer` with a CPU-only build, so the server logged
+`batching: off (device cpu)` and served the *serial* path while the script believed it was
+testing the engine. The script now asserts `batching: on` **and** the device line in the
+log before it measures anything — a gate that cannot check its own preconditions is not a
+gate.
 
 
 ### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L
