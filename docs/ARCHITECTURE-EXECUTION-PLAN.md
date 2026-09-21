@@ -1181,6 +1181,20 @@ this ticket, and it is why it was estimated L rather than M.
 5. C8b: `KvArenaStats` counts a shared block once, and a compaction moves it once (not once
    per owner); the memory saving is measured.
 
+**C8a increment 1 (2026-09-21) — the copy primitive.** `GraphAllocator::kv_copy_prefix(src, dst, rows)`
+copies the first `rows` written K/V rows of one sequence's run into another's (per layer,
+through `Backend::copy_cells`, which handles either direction — C7b) and hands `dst` their
+ownership via `own_range`. It refuses a missing run, a source with fewer written rows than
+requested, and a destination that reserved fewer cells than that, and it is a no-op for zero
+rows or a same-run copy. Unit coverage is the region-free half of those refusals; the data
+path and the written/capacity bounds are covered by the S3 gate, because they need real KV
+regions and the honest test for a copy is "the answer does not change".
+
+The engine is **not** wired to it yet. S2 does that at admission: placement already prefers
+the slot with the best-matching prefix, but only among *idle* slots and only for the slot's
+own rows — what is missing is that the donor may be **another** slot (possibly busy, and its
+rows are stable while it generates).
+
 **Order.** C8a first: it delivers the user-visible half with the machinery that already
 exists (C3's row copy + C7's moves) and its gate is byte-equality. C8b is then a read-path
 project, and it can be scheduled on its own evidence rather than on this ticket's estimate.
