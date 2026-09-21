@@ -1,7 +1,7 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **4/8** (C1, C2, **C3** and **C6 (logical positions)** done —
+2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
 the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next; C4,
@@ -18,7 +18,7 @@ is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
 **Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
 `architecture-phase-a` (PR #1). This status was refreshed against `master =
-4e4b0a4` (2026-09-19).
+bff0d02` (2026-09-21); it is refreshed with every PR that lands a ticket.
 
 ## 0. Decisions already taken
 
@@ -768,7 +768,7 @@ Evidence:
   helper has to hand the moves back. CPU suite: 207 passed / 0 failed / 5 ignored.
 - Device: `cuda_copy_cells_moves_overlapping_rows_down` moves rows `[1, 4)` to
   `[0, 3)` — two of the three rows are read *and* overwritten — compares the whole
-  buffer, and checks that the downward-only contract is refused before a launch.
+  buffer, and checks that the downward-only at the time (C7b later added the upward direction — see §5) contract is refused before a launch.
   CUDA suite: 255 passed / 0 failed / 5 ignored.
 - Coverage split, stated rather than implied: the allocator's **CPU** arm is proven
   end to end and the CUDA *primitive* is device-proven, but "the allocator drives

@@ -858,8 +858,10 @@ Prompt: 23 tokens
   `--cnv` design: REPL, turn params, color/session flags parsed here and
   consumed by `run_conversation`.
 - [`docs/OPENAI-CHAT-API-PLAN.md`](../OPENAI-CHAT-API-PLAN.md) — the `serve`
-  design: how `--n-ctx`/`--n-slots` split the context across concurrent
-  requests.
+  design: how `--n-ctx`/`--n-slots` divide the context across concurrent
+  requests. The division is an *initial, elastic* partition — a request that
+  needs more than its share reclaims idle capacity from the other slots
+  (`ARCHITECTURE-EXECUTION-PLAN.md` §5, C7/C7b).
 - [`docs/PERF-QWEN3-4B-VS-LLAMACPP.md`](../PERF-QWEN3-4B-VS-LLAMACPP.md) §2
   — why `--n-ctx` sizes KV instead of the model maximum (the 12 GB
   arithmetic and the Metal first-submit tax).

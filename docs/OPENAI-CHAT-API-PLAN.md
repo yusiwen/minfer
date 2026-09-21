@@ -532,7 +532,9 @@ struct Slot {
     id: usize,
     state: SlotState,
     cache: GraphCache,          // per-slot graph + allocator + KV regions (NOT src/cache.rs)
-    n_ctx_slot: usize,          // per-slot context (n_ctx / n_slots); passed into forward()
+    n_ctx_slot: usize,          // initial per-slot share (n_ctx / n_slots); the batched
+                                // engine may repartition it — see the note in "Context Size
+                                // Allocation" below
     current_pos: usize,         // == n tokens stored in KV since the last reset
     generated_tokens: Vec<u32>,
     rng: StdRng,                // seeded from `seed`; random (time/entropy) when the request omits it
@@ -819,6 +821,16 @@ inside the allocator, and `GraphParams` includes `n_tokens`/`gtype`, so a per-re
 the graph anyway).
 
 ### Context Size Allocation
+
+> **Shipped state (2026-09-21).** The batched engine no longer treats the per-slot share as a
+> hard bound. It still starts from `n_ctx / n_slots`, but the partition is **elastic**: a request
+> that needs more than its share reclaims capacity from idle slots (releasing their cached
+> prefixes) and the planner moves whatever runs are in the way, in either direction. The HTTP
+> request bound is therefore the **whole arena**, and `n_ctx_slot` remains (a) the initial share
+> and (b) the real bound of the serial path, whose graph region is that size. See
+> `ARCHITECTURE-EXECUTION-PLAN.md` §5 (C7, C7b) and issue #41 for the sharing step that follows.
+>
+> The design below is the original plan and is kept as the record of it.
 
 Total context (n_ctx) is divided equally among slots:
 - n_ctx_slot = n_ctx / n_slots

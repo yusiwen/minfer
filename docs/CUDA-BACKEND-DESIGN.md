@@ -538,9 +538,12 @@ tests skip when no CUDA device is present. Categories and the invariants they pi
   parity tests for q4_K/q6_K/q5_K), attention (`cuda_attn_split_decode_parity`,
   `cuda_verify_attention_nt_invariance`, `cuda_rope_kv_attn_roundtrip`, `cuda_kv_f16_roundtrip_attn`),
   embedding gather (`cuda_embed_getrows_parity`), fused FFN (`cuda_fused_ffn_parity`).
-- **KV cell movement (C3)** — `cuda_copy_cells_moves_overlapping_rows_down` (rows `[1, 4)` -> `[0, 3)`,
-  i.e. two of three rows are read *and* overwritten; the whole buffer is compared, and the
-  downward-only contract is checked to be refused before a launch).
+- **KV cell movement (C3/C7b)** — `cuda_copy_cells_moves_overlapping_rows_in_both_directions`
+  (rows `[1, 4)` -> `[0, 3)` and then `[0, 3)` -> `[1, 4)`, i.e. two of three rows are read *and*
+  overwritten in each direction; the whole buffer is compared against the bytes a copy through a
+  temporary would produce. The kernel walks the rows in the order the overlap requires — ascending
+  when the run slides down, descending when it slides up — and `kvcache::order_moves` fixes that
+  order across several runs).
 - **Prefill GEMM / MMQ / FA** — `cuda_prefill_mmq_parity`, `cuda_prefill_f16_gemm_parity`,
   `cuda_q4_0_prefill_q8_0_gemm_parity`, `cuda_fa_prefill_attention_parity` (note: causal,
   single-sequence, `start = 0` — the *windowed* FA mask is covered by
