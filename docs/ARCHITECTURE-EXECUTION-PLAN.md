@@ -4,11 +4,11 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel); C4, C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, staged S1–S5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: finish C8a (the copy-cost gate and its end-to-end measurement), then C8b, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: C8b S1 (refcounts that change nothing observable), then S2–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1223,6 +1223,59 @@ project, and it can be scheduled on its own evidence rather than on this ticket'
 **Not in this ticket:** C4 (quantized KV) and C5 (state save/restore) — each multiplies the
 addressing surface this ticket touches, which is why C6 preceded C7 for the same reason.
 
+
+#### C8b design (2026-09-21) — a block map for the read path
+
+**What sharing needs that C8a does not.** C8a duplicated the rows so the destination could keep
+one contiguous run. Sharing for real means a block exists once, several sequences refer to it,
+and a sequence's rows become a **list of spans** rather than one run
+(`cells[t] = span_of(t).start + offset`). The write path needs nothing new — since C6 it takes an
+arbitrary per-token `cells` vector. The **read path is the whole change**: `attn_span` hands each
+query a single `[lo, hi)` range, while a sharing sequence's window is a set of ranges.
+
+**Data.** `KvCache` gains (a) a per-cell **refcount** at block granularity (64 cells — small
+integers, and the unit that compaction moves and the stats count), and (b) a per-sequence **span
+list** covering `[0, written)`. A sequence that shares nothing has a one-entry span list, which is
+the property that keeps this incremental: **its code path stays today's, bitwise.**
+
+**IR — additive, never a replacement.** A graph whose sequences share blocks gets a `kv_map` input
+(per query, the sequence's spans) alongside `attn_span`; attention uses the map when the input is
+present and the span otherwise. `attn_span`'s single range is load-bearing — the `CAUSAL` fast path
+and Metal's refusal (G5) both rest on it — so it is not generalized in place.
+
+**Allocator.** `kv_cells_for_seq` and `attn_span` resolve through the span list. A store that would
+land in a shared block takes a **private row for that token** (`kv_private_row_for(seq, t)`): the
+allocator decides *before* the forward, so no backend learns that sharing exists and a shared block
+is never written through. That is the copy-on-write rule, and it is why the store path did not have
+to change.
+
+**Backends.** CPU attention gains the span-list gather first (it is the reference), then CUDA's
+`gqa_attn_*` inner loop, whose KV walk becomes (block, offset); Metal stays behind G5 and refuses
+the map, as it already refuses the explicit span.
+
+**Gates.**
+1. S1 changes nothing observable: the full suites stay bitwise (refcounts are carried, unused).
+2. Two sharers answer byte-identically to the same two sequences with private copies (CPU; CUDA
+   takes the usual named tolerance).
+3. `kv_rm` frees a block only when its last owner drops it, and a store into a shared block either
+   takes a private row or fails loudly — never writes through.
+4. `KvArenaStats` counts a shared block once; a compaction moves it once and renumbers **every**
+   sharer's span list; the memory saving is measured.
+
+**Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
+backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
+(3) CoW's per-token private rows must not fragment the arena beyond what C7's growth can absorb;
+the stats gate watches exactly that.
+
+| Step | Content | Gate |
+|---|---|---|
+| S1 | Per-cell refcounts at block granularity + stats/compaction awareness | no behaviour change: suites stay bitwise |
+| S2 | Per-sequence span list + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
+| S3 | Copy-on-write: `kv_private_row_for` at store resolution | gate 3 |
+| S4 | CUDA attention gather + device A/B | gate 2 on GB10 + timing |
+| S5 | Metal behind G5 (refuse the map, as it refuses the span) + docs closure | compile check + G5 record |
+
+
 ## 6. Phase D — IR expressiveness (item 7)
 
 | ID | Title | Effort |
@@ -2208,7 +2261,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ─ C8b ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
