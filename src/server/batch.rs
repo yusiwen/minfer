@@ -105,13 +105,11 @@ fn wanted_cells_from(nt: usize, max_tokens: i64, slot_cap: usize, n_ctx_total: u
     } else {
         max_tokens as usize
     };
-    // `+ 1`: the served request forwards one token past its last generated one
-    // before it can report `length` (see the bound in `advance`), and that step
-    // writes a cell.
-    nt.saturating_add(headroom)
-        .saturating_add(1)
-        .min(n_ctx_total)
-        .max(nt)
+    // The bound is exact: a request may use `prompt + max_tokens` cells, because
+    // `advance` decides whether another token fits *before* committing it (see the
+    // commit-time check there), so no forward is issued for a token that could only
+    // be discarded.
+    nt.saturating_add(headroom).min(n_ctx_total).max(nt)
 }
 
 /// Follow the run moves a KV operation returned (C3/C7): every slot that caches
@@ -666,12 +664,10 @@ impl BatchEngine {
         if params.max_tokens >= 0 && *completion_tokens as i64 >= params.max_tokens {
             return Ok(StepOutcome::Finish("length"));
         }
-        // C7: `tick` forwards the committed token *before* this check runs, so a
-        // generation that reaches its cap performs one more forward at the cell
-        // after its last token and stops here — which is why `wanted_cells`
-        // reserves `max_tokens + 1` (see `wanted_cells_from`): asking for exactly
-        // `prompt + max_tokens` leaves that boundary step without a cell, and
-        // `kv_cells_for_seq` rejects the batch.
+        // Safety net: admission guarantees `cap` covers the request, and the
+        // commit-time check below stops a generation exactly at its last usable
+        // cell, so this fires only if a caller ever admits a wider request than the
+        // run it reserved (then it ends the turn instead of writing past the run).
         if *current_pos >= cap {
             return Ok(StepOutcome::Finish("length"));
         }
@@ -714,6 +710,16 @@ impl BatchEngine {
         if *live_on {
             let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[tok])).into_owned();
             crate::live::set_token(tok, &text);
+        }
+        // Decide *now* whether another token can still be used, instead of committing
+        // one and discovering on the next step that it must be discarded: that wasted
+        // a whole weight pass and wrote a cell nothing would ever read (C7 reserved an
+        // extra cell to make room for it). `current_pos` is the cell this token
+        // occupies, and the next step forwards the committed token at `current_pos + 1`,
+        // so the two bounds are the request's token budget and the run's capacity.
+        let budget_done = params.max_tokens >= 0 && *completion_tokens as i64 >= params.max_tokens;
+        if budget_done || *current_pos + 1 >= cap {
+            return Ok(StepOutcome::Finish("length"));
         }
         // `tok`'s row is written by the NEXT step's batch, at `current_pos`.
         *needs_forward = Some(tok);
@@ -1012,12 +1018,12 @@ mod tests {
     fn wanted_cells_plans_from_the_request() {
         // 4 slots over 2048 cells: 512 each. A prompt plus its answer that fit
         // ask for nothing new, so the common case never repartitions.
-        assert_eq!(wanted_cells_from(100, 64, 512, 2048), 165);
+        assert_eq!(wanted_cells_from(100, 64, 512, 2048), 164);
         assert!(wanted_cells_from(100, 64, 512, 2048) <= 512);
         // An unbounded answer takes the slot's current capacity as headroom.
-        assert_eq!(wanted_cells_from(100, -1, 512, 2048), 613);
+        assert_eq!(wanted_cells_from(100, -1, 512, 2048), 612);
         // A prompt past the partition asks for the prompt plus that headroom...
-        assert_eq!(wanted_cells_from(1000, -1, 512, 2048), 1513);
+        assert_eq!(wanted_cells_from(1000, -1, 512, 2048), 1512);
         // ...clamped to the arena...
         assert_eq!(wanted_cells_from(1000, 100_000, 512, 2048), 2048);
         // ...and never below the prompt, so an impossible request stays the
@@ -1071,6 +1077,32 @@ mod tests {
             slot[0].text, alone[0].text,
             "the server's own admission path disagrees after a reclaim ({} vs {} tokens)",
             slot[0].tokens, alone[0].tokens
+        );
+
+        // #59: a request with no token budget is bounded by its run alone, and it must
+        // stop *at* its last cell instead of forwarding one past it. Before the
+        // commit-time check that forward was issued, `kv_cells_for_seq` rejected the
+        // batch, and this request failed instead of finishing — so `reason == "length"`
+        // with exactly the run's capacity in tokens is the regression test.
+        let counter = tok.encode("Count slowly from 1 to 400, one number per line: 1,");
+        let budget = 48;
+        let (open_ended, _) = run_batched(
+            &*model,
+            &tok,
+            &[counter.clone()],
+            1,
+            counter.len() + budget,
+            -1,
+            false,
+        );
+        assert_eq!(
+            open_ended[0].reason, "length",
+            "an unbounded request must end on the context bound, not fail: {:?}",
+            open_ended[0]
+        );
+        assert_eq!(
+            open_ended[0].tokens, budget,
+            "it must use exactly the cells its run has"
         );
     }
 
