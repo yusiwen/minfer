@@ -459,10 +459,17 @@ impl KvCache {
     /// layout: `lo` of token `t` at `span[t]`, `hi` at `span[n + t]`.
     ///
     /// `seq_ids[t]` names the sequence query `t` belongs to; `positions[t]` is its
-    /// **sequence-relative** index (C6), resolved to a cell as `start + position`.
-    /// The start comes from ownership and **not** from the position (that is the
-    /// point of E1); the position only truncates the end, because a token may not
-    /// attend to cells written after it.
+    /// **sequence-relative** index (C6), resolved to a cell through the sequence's
+    /// span list (C8b S1), not by `position` arithmetic. The window start comes
+    /// from ownership and **not** from the position (that is the point of E1); the
+    /// position only truncates the end, because a token may not attend to cells
+    /// written after it.
+    ///
+    /// The window is one contiguous `[lo, hi)` range, which is what the input
+    /// layout can carry. S1b therefore resolves only the single-span case: a
+    /// sequence laid out in several spans is refused loudly here rather than
+    /// collapsed to the span that happens to hold the query, because a set-valued
+    /// window needs the C8b S2 `kv_map` input.
     ///
     /// Every layer owns the same cells — all mutations go through this store —
     /// so the first layer resolves and a debug assertion checks the rest agree.
@@ -488,27 +495,44 @@ impl KvCache {
         let mut span = vec![0u32; 2 * n];
         for t in 0..n {
             let seq = seq_ids[t];
-            let slot = self.seqs.get(&seq).ok_or_else(|| {
-                format!("attn_span: query {t} belongs to sequence {seq}, which holds no cells")
-            })?;
-            let (start, cap) = (slot.start, slot.cap);
-            // C6: `positions[t]` is the token's index *within its sequence*, and
-            // the cell that row lives in is `start + position`. While a run starts
-            // at cell 0 the two coincide, which is why the single-sequence path is
-            // unchanged.
+            let (first_cell, len) = match self.spans_of(seq) {
+                [] => {
+                    return Err(format!(
+                        "attn_span: query {t} belongs to sequence {seq}, which holds no cells"
+                    ))
+                }
+                [one] => (one.1, one.2),
+                many => {
+                    return Err(format!(
+                        "attn_span: query {t} belongs to sequence {seq}, which is laid out in \
+                         {} spans; a window that is not one contiguous range needs the C8b S2 \
+                         `kv_map` input",
+                        many.len()
+                    ))
+                }
+            };
+            // C6: `positions[t]` is the token's index *within its sequence*, and the
+            // cell that row lives in is whatever the span list says it is. While a
+            // run starts at cell 0 the two coincide, which is why the single-sequence
+            // path is unchanged.
             let rel = positions[t];
-            let cell = start + rel;
+            let cell = self.cell_of(seq, rel).ok_or_else(|| {
+                format!(
+                    "attn_span: query {t} (sequence {seq}, position {rel}) is outside its \
+                     reserved run [{first_cell}, {})",
+                    first_cell + len
+                )
+            })?;
             // The query's own row must have been written by this sequence: a
             // window that included rows nobody wrote would attend to zeroes.
-            if rel >= cap || owner.get(cell) != Some(&seq) {
+            if owner.get(cell) != Some(&seq) {
                 return Err(format!(
-                    "attn_span: query {t} (sequence {seq}, position {rel}) is outside its \
-                     reserved run [{start}, {}) or its row {cell} is not written",
-                    start + cap
+                    "attn_span: query {t} (sequence {seq}, position {rel}) resolves to cell \
+                     {cell}, which was not written by sequence {seq}"
                 ));
             }
-            let hi = (start + cap).min(cell + 1);
-            span[t] = start as u32;
+            let hi = (first_cell + len).min(cell + 1);
+            span[t] = first_cell as u32;
             span[n + t] = hi as u32;
         }
         let first = self.layers.values().next().map(|l| l.n_used);
@@ -1080,6 +1104,73 @@ mod tests {
         assert_eq!(c.spans_of(0), &[(0, 0, 6)]);
         c.release_seq(0);
         assert_eq!(c.cell_of(0, 0), None);
+    }
+
+    /// C8b S1b: the **read** path resolves through the same span list the write path
+    /// uses, and with one span it must produce exactly the range the old `start +
+    /// position` arithmetic produced. The two are compared here rather than trusted,
+    /// because this is the change that would silently shift an attention window.
+    #[test]
+    fn a_single_span_attn_window_equals_the_run_arithmetic() {
+        let mut c = cache(16);
+        // A run that does not start at cell 0, so `cell == position` cannot hide a
+        // regression in the resolution.
+        c.reserve_seq(7, 3).unwrap(); // [0, 3)
+        let a = c.reserve_seq(SEQ_MAIN, 4).unwrap(); // [3, 7)
+        let b = c.reserve_seq(1, 2).unwrap(); // [7, 9)
+        assert_eq!((a.start, b.start), (3, 7));
+        for layer in [0usize, 1] {
+            c.note_written(SEQ_MAIN, layer, &[3, 4, 5, 6]);
+            c.note_written(1, layer, &[7, 8]);
+        }
+        for positions in [vec![0], vec![0, 1, 2, 3], vec![3, 3, 0], vec![1, 0]] {
+            let seqs = vec![SEQ_MAIN; positions.len()];
+            let span = c.attn_span(&seqs, &positions).unwrap();
+            let n = positions.len();
+            for (t, &rel) in positions.iter().enumerate() {
+                assert_eq!(
+                    (span[t], span[n + t]),
+                    (a.start as u32, (a.start + rel + 1) as u32),
+                    "position {rel} of sequence {SEQ_MAIN}"
+                );
+            }
+        }
+        // Two sequences still get their own disjoint windows through the span list.
+        assert_eq!(
+            c.attn_span(&[SEQ_MAIN, 1], &[2, 1]).unwrap(),
+            vec![3, 7, 6, 9]
+        );
+        // A sequence whose span list is gone is a loud error, never a window at 0.
+        c.release_seq(SEQ_MAIN);
+        let err = c.attn_span(&[SEQ_MAIN], &[0]).unwrap_err();
+        assert!(err.contains("holds no cells"), "got: {err}");
+    }
+
+    /// C8b S1b's boundary: a multi-span sequence has no single contiguous window to
+    /// hand the kernel, so the read path must refuse it instead of guessing a span.
+    /// The span list is written directly here — no mutation produces several spans
+    /// yet, that is S2 — so the test pins the refusal before the layout exists.
+    #[test]
+    fn a_multi_span_sequence_is_refused_by_the_read_path() {
+        let mut c = cache(16);
+        c.reserve_seq(SEQ_MAIN, 4).unwrap();
+        for layer in [0usize, 1] {
+            c.note_written(SEQ_MAIN, layer, &[0, 1, 2, 3]);
+        }
+        // A shared prefix would look like this: rows 0..2 at cell 0, the rest private
+        // at cell 8 — two ranges, no single `[lo, hi)` window.
+        let mut slot = c.seq_slot(SEQ_MAIN).unwrap();
+        slot.start = 8;
+        c.seqs.insert(SEQ_MAIN, slot);
+        c.spans.insert(SEQ_MAIN, vec![(0, 0, 2), (2, 8, 2)]);
+        assert_eq!(
+            c.cell_of(SEQ_MAIN, 3),
+            Some(9),
+            "the resolver still reads it"
+        );
+        let err = c.attn_span(&[SEQ_MAIN], &[3]).unwrap_err();
+        assert!(err.contains("2 spans"), "got: {err}");
+        assert!(err.contains("kv_map"), "got: {err}");
     }
 
     /// C7b: growing a run moves the runs above it **up**, and their ownership
