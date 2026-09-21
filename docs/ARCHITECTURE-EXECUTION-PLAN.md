@@ -4,11 +4,11 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, staged S1–S5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, staged S1a/S1b (both landed) then S2–S5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8b S1 (refcounts that change nothing observable), then S2–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: C8b S2 (block refcounts and `kv_seq_cp`, shipped together with the sharing that reads them), then S3–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1284,8 +1284,20 @@ byte-equality gate still passes — the four-slot batched-vs-serial test, the C7
 the C8a prefix copy. The unit test pins the resolution against `start + position`, including a real
 compaction move and a release.
 
-S1b takes `attn_span` through the same list (the read-path half of S1); S2 then adds the block
-refcounts and `kv_seq_cp` together with the sharing that reads them.
+S1b **landed 2026-09-21** — the read path (`attn_span`) now resolves through the same list. A
+sequence's window is still one contiguous `[lo, hi)` range, which is all the current input layout
+can carry, so S1b resolves only the single-span case and **refuses a multi-span sequence loudly**
+(a window that is not one range needs S2's `kv_map`). With one span the answer is identical by
+construction: `lo` is the span's first cell and `hi` is `min(span end, query cell + 1)`, which for
+`rel < length` is exactly the old `start + rel + 1`. The unit tests pin both halves — the window is
+compared against the old arithmetic for a run that does **not** start at cell 0 (where a
+`cell == position` slip could hide), and a hand-written two-span list proves the refusal. Full
+suites after S1b: CPU **221 passed / 0 failed / 7 ignored** (two tests added; the S1a figures of
+218 CPU / 267 CUDA were each one under the state they described — that state measures 219 / 268),
+CUDA **270 passed / 0 failed / 7 ignored**, and the
+byte-equality gates (batched-vs-serial, C7 boundary, C8a prefix copy) unchanged.
+
+S2 then adds the block refcounts and `kv_seq_cp` together with the sharing that reads them.
 
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
@@ -2286,7 +2298,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
