@@ -1083,9 +1083,12 @@ impl GraphAllocator {
 
     /// Reject values in an I32 input that would index past the KV region (see
     /// `fill_input_i32`). An input consumed by `Op::Attn` is the E1 **span**
-    /// (`[lo, hi)` pairs, checked as such); one consumed by the KV-writing ops
-    /// is positions. Everything else (`token_ids`, `seq_ids`, …) is unbounded —
-    /// vocabularies and sequence counts are routinely larger than `n_ctx`.
+    /// (`[lo, hi)` pairs, checked as such); one consumed by the KV-writing ops is
+    /// positions, and the `cells` input they also consume is the **arena row** —
+    /// bounded by the arena, with its own message, because the two only coincide
+    /// while a cell equals its position. Everything else (`token_ids`, `seq_ids`, …)
+    /// is unbounded — vocabularies and sequence counts are routinely larger than
+    /// `n_ctx`.
     fn check_positions_bound(
         &self,
         graph: &ComputeGraph,
@@ -1105,6 +1108,23 @@ impl GraphAllocator {
         // stays at index 2 for the backends that still derive from it.
         if name == "attn_span" {
             return self.check_attn_span(graph, name, data);
+        }
+        if name == "cells" {
+            let n_ctx = self.kv.n_ctx();
+            if n_ctx == 0 {
+                // No arena to bound against; `fill_seq_ids` reports that case when it
+                // tries to resolve the input, so nothing is silent here.
+                return Ok(());
+            }
+            if let Some(&cell) = data.iter().max() {
+                if cell as usize >= n_ctx {
+                    return Err(format!(
+                        "input 'cells': cell {cell} is past the {n_ctx}-cell arena \
+                         (`docs/ARCHITECTURE-ROADMAP.md` §2.4)"
+                    ));
+                }
+            }
+            return Ok(());
         }
         let indexes_kv = graph.nodes.iter().any(|n| {
             n.src.contains(&id)
@@ -1520,6 +1540,33 @@ fn kv_defrag_enabled_from(no_flag: Option<&std::ffi::OsStr>) -> bool {
 mod tests {
     use super::*;
     use crate::graph::builder::GraphBuilder;
+
+    /// C6/C7: `cells` is an absolute arena row, so it is bounded by the arena — not
+    /// by the per-sequence position rule it used to be checked with. The two bounds
+    /// coincide today, which is exactly why the difference is written down: sharing a
+    /// cell range across sequences is what stops them coinciding.
+    #[test]
+    fn the_cells_input_is_bounded_by_the_arena() {
+        let mut b = GraphBuilder::new();
+        let cells = b.input("cells", [1, 1, 1, 1], crate::graph::DType::I32);
+        b.output(cells);
+        let g = b.build();
+        let mut alloc = GraphAllocator::new();
+        alloc.kv_set_capacity(8);
+        alloc.alloc_graph(&g).expect("alloc the graph");
+        alloc
+            .fill_input_i32(&g, "cells", &[7])
+            .expect("the last cell of an 8-cell arena is valid");
+        let err = alloc.fill_input_i32(&g, "cells", &[8]).unwrap_err();
+        assert!(err.contains("cell 8 is past the 8-cell arena"), "{err}");
+        // Without an arena there is nothing to bound against, and the resolver reports
+        // that case itself when it runs.
+        let mut fresh = GraphAllocator::new();
+        fresh.alloc_graph(&g).expect("alloc the graph");
+        fresh
+            .fill_input_i32(&g, "cells", &[3])
+            .expect("no arena, no bound to check");
+    }
 
     /// D1: a graph whose output is a *view* of an input, so the allocator must
     /// alias rather than copy. `offset`/`shape` are parameters so the refusal
@@ -2001,11 +2048,13 @@ mod tests {
         assert!(err.contains("KV region for layer 0"), "got: {err}");
     }
 
-    /// Positions index the persistent KV region, so a value past `n_ctx` is an
-    /// out-of-bounds write on every backend that does not re-check it (the GPU
-    /// ones). The guard lives in the allocator so all three backends share it.
+    /// The KV row input is `cells` (C6), and a cell is an index into the arena, so a
+    /// value at or past the arena is an out-of-bounds write on every backend that does
+    /// not re-check it (the GPU ones). It is bounded by the *arena* (C7/#60), not by the
+    /// per-sequence position rule — the two only coincide while a cell equals its
+    /// position. The guard lives in the allocator so all three backends share it.
     #[test]
-    fn position_beyond_n_ctx_is_rejected() {
+    fn a_cell_beyond_the_arena_is_rejected() {
         let mut b = GraphBuilder::new();
         let pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
         let k = b.input("k", [16, 1, 1, 1], crate::graph::DType::F32);
@@ -2018,10 +2067,12 @@ mod tests {
         alloc.alloc_graph(&g).unwrap();
 
         // The last legal row is n_ctx - 1.
-        // C6: the KV row input is `cells` (positions are relative now).
         alloc.fill_input_i32(&g, "cells", &[1023]).unwrap();
         let err = alloc.fill_input_i32(&g, "cells", &[1024]).unwrap_err();
-        assert!(err.contains(">= n_ctx 1024"), "got: {err}");
+        assert!(
+            err.contains("cell 1024 is past the 1024-cell arena"),
+            "got: {err}"
+        );
     }
 
     /// The same guard must NOT bound `token_ids`: a vocabulary is routinely
@@ -2045,7 +2096,10 @@ mod tests {
             .fill_input_i32(&g, "token_ids", &[50_000])
             .expect("token ids are not positions");
         let err = alloc.fill_input_i32(&g, "cells", &[8]).unwrap_err();
-        assert!(err.contains(">= n_ctx 8"), "got: {err}");
+        assert!(
+            err.contains("cell 8 is past the 8-cell arena"),
+            "got: {err}"
+        );
     }
 
     /// A staging buffer is keyed by (node, destination backend): one node

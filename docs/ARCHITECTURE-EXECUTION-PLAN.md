@@ -1033,12 +1033,21 @@ have) cannot happen. The HTTP layer's request bound moved from a slot's share to
 whole arena (`AppState::n_ctx`); the serial path (batching off) keeps its own
 slot-sized bound, because its graph region really is that size.
 
-**Why `+ 1`.** `tick` forwards the committed token *before* `advance` can report
-`length`, so a generation that reaches its cap performs one more forward at the cell
-after its last token. A reservation of exactly `prompt + max_tokens` therefore rejected
-that batch (`kv_cells_for_seq: position N is past sequence S's reserved run`). The
-engine's stopping bound (`current_pos >= cap`) is the correct one; the fix is the extra
-cell in the policy, and both places now say so.
+**The boundary, and why it is no longer padded.** `tick` forwards the committed token
+*before* `advance` can report `length`, so a generation that reaches its cap used to
+perform one more forward at the cell after its last token — a whole weight pass whose
+logits are discarded, plus a cell nothing reads. The reservation was therefore padded
+with one cell, and a reservation of exactly `prompt + max_tokens` rejected that batch
+(`kv_cells_for_seq: position N is past sequence S's reserved run`).
+
+That padding is gone: `advance` now decides **before committing** whether another token
+can still be used (the request's token budget, and `current_pos + 1 < cap`), and ends the
+turn instead of committing one that could only be discarded. `wanted_cells_from` is
+exact — `prompt + max_tokens`, clamped to the arena — and the top-of-`advance` bound is
+the safety net it always was. The regression is a request with no token budget
+(`max_tokens = -1`) on a run sized to its prompt plus 48 cells: it must end with
+`length` and exactly 48 tokens, because a forward past the run is rejected by
+`kv_cells_for_seq` — before this change that request failed instead of finishing.
 
 **Gates.** (1) `wanted_cells_plans_from_the_request` — the policy, no model needed;
 (2) `a_long_request_may_use_the_whole_arena` — a 302-token prompt on `n_ctx = 366` with
@@ -1077,6 +1086,14 @@ the upward move and the owner stamps; (2) `a_resize_refuses_to_eat_rows_or_overc
 an overlapping upward move (a memmove's output) — the CUDA one on GB10;
 (4) on GB10 the CUDA twin pins the upward *kernel* path (the bytes a memmove would
 produce). Suites: CPU **216** passed, CUDA **264** passed (0 failed, 6 ignored each).
+
+**The `cells` bound is its own rule (2026-09-21).** `check_positions_bound` classified any
+I32 input consumed by a KV-writing op as positions, and `cells` — which now feeds the same
+ops (C6) — was measured by that rule. It cannot false-reject (a cell always indexes the
+arena, which is exactly `n_ctx` cells), but the two bounds only coincide *because* a cell
+equals its position, which is the coincidence C8 removes. `cells` now has its own bound and
+its own message (`input 'cells': cell N is past the M-cell arena`), pinned by a test that
+also covers the no-arena case.
 
 **End-to-end (2026-09-20) — the engine scenario is verified.** Four slots at
 `--n-ctx 8192`: a short request, then a long generation on another slot, then a
