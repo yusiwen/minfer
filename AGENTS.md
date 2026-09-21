@@ -39,7 +39,9 @@ src/
 │                    #   C7/C7b: the per-slot partition is elastic — a request that needs
 │                    #   more than its share reclaims idle capacity, and the planner moves
 │                    #   whatever is in the way in either direction, so a grown run keeps
-│                    #   its rows while a busy neighbour moves out of the way
+│                    #   its rows while a busy neighbour moves out of the way; C8a: a request
+│                    #   whose prefix another slot already computed copies those rows instead
+│                    #   of prefilling them (donor may be busy; C8b would share them in place)
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)
