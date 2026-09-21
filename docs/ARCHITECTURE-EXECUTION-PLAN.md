@@ -8,7 +8,7 @@ the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next �
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: finish C8a (the copy-cost gate and its end-to-end measurement), then C8b, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1194,6 +1194,20 @@ The engine is **not** wired to it yet. S2 does that at admission: placement alre
 the slot with the best-matching prefix, but only among *idle* slots and only for the slot's
 own rows — what is missing is that the donor may be **another** slot (possibly busy, and its
 rows are stable while it generates).
+
+**C8a increment 2 (2026-09-21) — admission uses it.** The reuse source is now every slot, not
+just the admitting slot's own rows: when another slot holds the longer match, its written rows
+are copied into this slot's run (the donor may be *busy* — its rows are stable for the duration
+of the copy) and only the suffix is prefilled. The reuse is clamped to leave one token to feed,
+exactly as the slot's own reuse is, because a forward with nothing to run produces no logits.
+A failed copy falls back to the slot's own cache and prefills the rest — never a wrong-row read.
+
+The test-only counter `prefix_rows_copied` makes the copy observable, so the gate asserts both
+that it happened and that it changed nothing: the same prompt served via a copy and on a private
+single-slot run answers **byte-identically** (CPU, where the comparison is exact; a device
+comparison takes the usual named-tolerance caveat). Still open for C8a: the *cost* gate — the
+copy must be measurably cheaper than the prefill it replaces, which needs the end-to-end
+measurement, and the log line that reports each copy for an operator.
 
 **Order.** C8a first: it delivers the user-visible half with the machinery that already
 exists (C3's row copy + C7's moves) and its gate is byte-equality. C8b is then a read-path

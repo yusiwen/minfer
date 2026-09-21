@@ -88,6 +88,8 @@ pub struct BatchEngine {
     n_ctx_total: usize,
     slots: Vec<SlotState>,
     special: SpecialTokens,
+    /// C8a: prefix rows copied from another slot instead of being prefilled.
+    prefix_rows_copied: usize,
 }
 
 /// C7: the cells a request wants reserved — pure, so the growth policy is
@@ -166,6 +168,7 @@ impl BatchEngine {
             n_ctx_total,
             slots,
             special: model.special_tokens(),
+            prefix_rows_copied: 0,
         })
     }
 
@@ -362,6 +365,60 @@ impl BatchEngine {
         prefill_span(input_ids.len(), reuse)
     }
 
+    /// C8a: the longest prefix this slot may start from, and the slot holding it when
+    /// that is not this slot's own rows. `own` is what this slot already has (0 when
+    /// prefix reuse is switched off), so disabling reuse disables the copy path with it.
+    fn shared_prefix(&self, idx: usize, prompt: &[u32], own: usize) -> (usize, Option<usize>) {
+        if own == 0 && std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1") {
+            return (0, None);
+        }
+        // One token must always be fed, or the forward has nothing to run and produces
+        // no logits to sample from — the same bound the slot's own reuse lives under.
+        let usable = prompt.len().saturating_sub(1);
+        let mut best = (own.min(usable), None);
+        for (j, slot) in self.slots.iter().enumerate() {
+            if j == idx || slot.cached_tokens.is_empty() {
+                continue;
+            }
+            let n = common_prefix_len(&slot.cached_tokens, prompt).min(usable);
+            if n > best.0 {
+                best = (n, Some(j));
+            }
+        }
+        best
+    }
+
+    /// C8a: copy `rows` rows from `src`'s run into this slot's and record the tokens they
+    /// hold, so the prefill only feeds the suffix. Returns the rows actually reusable —
+    /// `own` when the copy fails, because a failed copy must not lose the slot's own
+    /// cache, and the request then simply prefills what it cannot reuse.
+    fn copy_prefix_from(&mut self, src: usize, idx: usize, rows: usize, own: usize) -> usize {
+        let (src_seq, dst_seq) = (self.slots[src].seq, self.slots[idx].seq);
+        match self.cache.alloc().kv_copy_prefix(src_seq, dst_seq, rows) {
+            Ok(()) => {
+                self.slots[idx].cached_tokens = self.slots[src].cached_tokens[..rows].to_vec();
+                self.prefix_rows_copied += rows;
+                eprintln!(
+                    "[server] slot {idx}: copied {rows} prefix row(s) from slot {src} instead of \
+                     prefilling them"
+                );
+                rows
+            }
+            Err(e) => {
+                eprintln!(
+                    "[server] slot {idx}: prefix copy from slot {src} failed ({e}); prefilling"
+                );
+                own
+            }
+        }
+    }
+
+    /// C8a: prefix rows copied rather than prefilled (tests assert the copy happened).
+    #[cfg(test)]
+    pub fn prefix_rows_copied(&self) -> usize {
+        self.prefix_rows_copied
+    }
+
     /// Whether several sequences may share one prefill forward on the active
     /// backend. CUDA's flash-attention prefill stages a query tile per block and
     /// a tile must not span two sequences (E1b), so with a CUDA device the
@@ -389,7 +446,12 @@ impl BatchEngine {
         let mut seq_ids: Vec<SeqId> = Vec::new();
         let mut feeds: Vec<usize> = Vec::new();
         for (_, job, slot) in placed {
-            let (feed_from, _) = self.feed_span(*slot, &job.input_ids);
+            let (own, _) = self.feed_span(*slot, &job.input_ids);
+            let (want_rows, donor) = self.shared_prefix(*slot, &job.input_ids, own);
+            let feed_from = match donor {
+                Some(src) => self.copy_prefix_from(src, *slot, want_rows, own),
+                None => want_rows,
+            };
             let nt = job.input_ids.len();
             let want = self.wanted_cells(*slot, nt, job.params.max_tokens);
             self.ensure_slot_capacity(*slot, want);
@@ -482,7 +544,18 @@ impl BatchEngine {
             )));
         }
         let seq = self.slots[idx].seq;
-        let (feed_from, _) = self.feed_span(idx, &job.input_ids);
+        // C8a: the rows this request can start from may live in *another* slot — the
+        // slot that already computed the same prefix (possibly while still generating:
+        // its rows are stable for the duration of the copy). The match is verified
+        // against the donor's recorded tokens, so the rows are known to hold this
+        // prompt's prefix, and C6 makes the donor's different run start irrelevant to
+        // this slot's arithmetic — which is why the gate can demand byte equality.
+        let (own, _) = self.feed_span(idx, &job.input_ids);
+        let (want_rows, donor) = self.shared_prefix(idx, &job.input_ids, own);
+        let feed_from = match donor {
+            Some(src) => self.copy_prefix_from(src, idx, want_rows, own),
+            None => want_rows,
+        };
         // C6: positions are a token's index *within its sequence* — what RoPE
         // rotates by — so the slot's reservation start is not part of them. The
         // allocator resolves the KV row from the run table (`cells` =
@@ -1012,6 +1085,85 @@ mod tests {
     ///
     /// Ignored by default like the other real-model tests:
     ///   cargo test --release --bin minfer -- --ignored server_batch --nocapture
+    /// C8a: admit `prompt` on `slot` and drive the engine until it finishes, returning
+    /// the text the client would have streamed.
+    fn serve_on(
+        engine: &mut BatchEngine,
+        model: &dyn ModelDef,
+        tok: &Tokenizer,
+        slot: usize,
+        prompt: Vec<u32>,
+        max_tokens: i64,
+    ) -> String {
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+        engine
+            .submit_on(
+                model,
+                tok,
+                slot,
+                Job {
+                    input_ids: prompt,
+                    params: sampling_params(max_tokens),
+                    tx,
+                },
+            )
+            .expect("admit");
+        let mut text = String::new();
+        while engine.busy() {
+            engine.tick(model, tok).expect("tick");
+            while let Ok(ev) = rx.try_recv() {
+                if let StreamEvent::Text(t) = ev {
+                    text.push_str(&t);
+                }
+            }
+        }
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Text(t) = ev {
+                text.push_str(&t);
+            }
+        }
+        text
+    }
+
+    /// C8a gate: a prompt served from *another* slot's rows must answer exactly as the
+    /// same prompt served on a private run, and the rows must actually be copied rather
+    /// than prefilled. The copy is what the counter proves; the equality is the whole
+    /// point — C6 makes the donor's different run start arithmetic-free, so a copied
+    /// prefix cannot change this slot's answer.
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn a_prefix_copied_from_another_slot_answers_identically() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the C8a gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let prompt = tok.encode("The capital of France is");
+        let n_ctx = prompt.len() + 64;
+
+        // Slot 0 computes the prompt; slot 1 must *copy* those rows.
+        let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
+        let first = serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 8);
+        let before = engine.prefix_rows_copied();
+        let second = serve_on(&mut engine, &*model, &tok, 1, prompt.clone(), 8);
+        assert!(
+            engine.prefix_rows_copied() > before,
+            "slot 1 prefilled the prompt instead of copying slot 0's {} rows",
+            prompt.len()
+        );
+        assert_eq!(first, second, "a copied prefix must not change the answer");
+
+        // And the same prompt on a single-slot engine, which has nothing to copy.
+        let mut alone = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
+        let solo = serve_on(&mut alone, &*model, &tok, 0, prompt, 8);
+        assert_eq!(
+            second, solo,
+            "the copied run must answer like a private one"
+        );
+    }
+
     /// C7: the growth policy is pure, and it plans from the request rather than
     /// from the startup partition.
     #[test]
