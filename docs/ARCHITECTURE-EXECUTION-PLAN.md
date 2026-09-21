@@ -1272,6 +1272,21 @@ request, which is what makes S1's gate meaningful: a single-entry span list must
 answers bit for bit, and any slip shows up in the existing suites rather than in a field nobody
 consults.
 
+**C8b S1a landed (2026-09-21) — the write path resolves through spans.** `KvCache` carries a
+per-sequence span list `(position base, first cell, length)`, and `GraphAllocator::kv_cells_for_seq`
+resolves every store row through `KvCache::cell_of` instead of `slot.start + position`. Every path
+that changes a run's `start`/`cap` or drops the run republishes the list (`refresh_spans`: reserve,
+release, resize, and each relocation `apply_moves` performs), and a position outside the list is a
+**loud error**, not a fallback to the contiguous form — which is what makes a missed maintenance
+point visible rather than silent. Today the list always holds exactly one entry, so nothing
+observable changed: the full suites keep their counts (CPU 218 / CUDA 267, 0 failed) and every
+byte-equality gate still passes — the four-slot batched-vs-serial test, the C7 boundary case, and
+the C8a prefix copy. The unit test pins the resolution against `start + position`, including a real
+compaction move and a release.
+
+S1b takes `attn_span` through the same list (the read-path half of S1); S2 then adds the block
+refcounts and `kv_seq_cp` together with the sharing that reads them.
+
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
 (3) CoW's per-token private rows must not fragment the arena beyond what C7's growth can absorb;
