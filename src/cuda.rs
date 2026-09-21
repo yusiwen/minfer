@@ -1427,17 +1427,44 @@ pub fn concat_rows_feasible(tensors: &[&Tensor]) -> bool {
 /// `MINFER_CACHE_TYPE=f16|f32` forces one; unset auto-selects f16 for the
 /// 7B class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for
 /// small models. Read once per CudaBackend at construction.
-static KV_F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static KV_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn kv_cache_is_f16() -> bool {
-    *KV_F16.get_or_init(|| false)
+    KV_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Called at model load with the model dims, BEFORE the first forward.
 pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
     let f16 =
         std::env::var("MINFER_CACHE_TYPE").map_or(n_layers * n_kv_embd >= 8192, |v| v == "f16");
-    let _ = KV_F16.set(f16);
+    set_kv_cache_f16(f16);
+}
+
+/// Set the KV element type directly: the loader passes the policy for the model it
+/// just loaded, and device tests use it to exercise one layout explicitly.
+///
+/// This deliberately **overwrites**. The value is a per-load policy, and a process that
+/// loads a second model must be able to change it — as a `OnceLock` the first load
+/// froze the dtype for every backend constructed afterwards, so a second model silently
+/// ran under the first one's choice (its own layer/embedding dims never re-decided).
+pub fn set_kv_cache_f16(f16: bool) {
+    KV_F16.store(f16, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod kv_dtype_tests {
+    use super::{kv_cache_is_f16, set_kv_cache_f16};
+
+    /// The dtype is a policy that a later load must be able to change; the previous
+    /// one-shot global made the first decision permanent for the whole process.
+    #[test]
+    fn the_kv_element_type_can_be_redecided() {
+        let before = kv_cache_is_f16();
+        set_kv_cache_f16(!before);
+        assert_eq!(kv_cache_is_f16(), !before, "the new value must be visible");
+        set_kv_cache_f16(before);
+        assert_eq!(kv_cache_is_f16(), before, "and the old one can be restored");
+    }
 }
 
 impl CudaState {
