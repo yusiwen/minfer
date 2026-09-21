@@ -1253,8 +1253,23 @@ to change.
 `gqa_attn_*` inner loop, whose KV walk becomes (block, offset); Metal stays behind G5 and refuses
 the map, as it already refuses the explicit span.
 
+**Why S2 does not split the way S1 did (2026-09-21, found while sizing it).** S1 split cleanly
+because its two consumers already existed — the write resolver and `attn_span` — so each half was a
+live path with a bitwise gate. S2's halves are coupled instead. Sharing means one cell has several
+owners, and the store's ownership representation is *per cell*: `Layer::owner` is a `Vec<SeqId>`,
+`written_rows` scans it contiguously for `owner[cell] == seq`, and `attn_span`'s written check
+compares it against the query's sequence. A shared prefix cannot be expressed without changing what
+"written by this sequence" means (block refcounts plus the span list as the read-side authority),
+and until the read path gathers over several spans a sharing sequence would resolve a **wrong**
+window. So the store half and the read half have to land together: staging them separately would
+add machinery nothing reads, which is the shape A7 deleted. Concretely S2 = block refcounts (64
+cells), `kv_seq_cp`, refcount-aware release/`kv_rm`, and a compaction that moves a shared block once
+and renumbers every sharer's span list — **plus** the additive `kv_map` input, the CPU gather, and
+admission wired to `kv_seq_cp`, accepted by gate 2 below.
+
 **Gates.**
-1. S1 changes nothing observable: the full suites stay bitwise (refcounts are carried, unused).
+1. S1 changed nothing observable (S1a + S1b landed: both resolvers read the list, and the suites
+   stayed bitwise); the refcounts arrive in S2 together with the readers that justify them.
 2. Two sharers answer byte-identically to the same two sequences with private copies (CPU; CUDA
    takes the usual named tolerance).
 3. `kv_rm` frees a block only when its last owner drops it, and a store into a shared block either
