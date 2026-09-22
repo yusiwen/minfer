@@ -17,7 +17,18 @@ is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
 **Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
 `architecture-phase-a` (PR #1). This status was refreshed against `master =
-bff0d02` (2026-09-21); it is refreshed with every PR that lands a ticket.
+8f25904` (2026-09-22); it is refreshed with every PR that lands a ticket.
+
+**Issue links.** Work tracked on GitHub carries its issue link in its table row
+(prose sections carry it in the heading), and the record written when that work lands
+keeps the link. Tickets that predate the tracker — Phase A and B, C1–C3, C6/C7/C7b,
+C8a, D1–D3, E1/E1b/E2/E6 — have no issue, and their record here is the only one; the
+tickets below that *do* have one are exactly the open list in the
+[tracker](https://github.com/yusiwen/minfer/issues). Doc debt and test health are filed
+the same way: [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`
+staleness), [#63](https://github.com/yusiwen/minfer/issues/63) (CI does not enforce the
+docs build), [#82](https://github.com/yusiwen/minfer/issues/82) (three ignored
+real-model tests fail on master).
 
 ## 0. Decisions already taken
 
@@ -453,8 +464,8 @@ Five sub-steps, each keeping the tree green. C3 depends on Phase D.
 | C1 | `KvCache` with cells, single implicit sequence (behaviour-preserving) | L |
 | C2 | `seq_rm` / `seq_add`: prefix truncation + context shift — **DONE** | L |
 | C3 | Defragmentation (cell copy) — **needs D1** | M |
-| C4 | Quantized KV (item 21) | M |
-| C5 | State save/restore for session persistence | M |
+| C4 | Quantized KV (item 21) · [#42](https://github.com/yusiwen/minfer/issues/42) | M |
+| C5 | State save/restore for session persistence · [#43](https://github.com/yusiwen/minfer/issues/43) | M |
 
 ### C1 — Cell store, one sequence — **DONE**
 - **Landed:** `src/graph/kvcache.rs` (`KvCache`, `KvLayer`, `SEQ_MAIN`/`FREE`,
@@ -977,7 +988,7 @@ because each would otherwise multiply the addressing surface.
   *positions*, not cells, so the angles genuinely have to move. Only the
   *compaction* re-rope disappears.
 
-### C7 — Dynamic runs: one request may use the whole arena · follows C6 · M
+### C7 — Dynamic runs: one request may use the whole arena · follows C6 · M · [#59](https://github.com/yusiwen/minfer/issues/59)
 
 **Why (user-visible).** `BatchEngine::new` hands every slot a fixed
 `cap = n_ctx_total / n_slots` up front, and `submit_on` rejects anything whose
@@ -1086,7 +1097,8 @@ an overlapping upward move (a memmove's output) — the CUDA one on GB10;
 (4) on GB10 the CUDA twin pins the upward *kernel* path (the bytes a memmove would
 produce). Suites: CPU **216** passed, CUDA **264** passed (0 failed, 6 ignored each).
 
-**The `cells` bound is its own rule (2026-09-21).** `check_positions_bound` classified any
+**The `cells` bound is its own rule (2026-09-21) — [#60](https://github.com/yusiwen/minfer/issues/60).**
+`check_positions_bound` classified any
 I32 input consumed by a KV-writing op as positions, and `cells` — which now feeds the same
 ops (C6) — was measured by that rule. It cannot false-reject (a cell always indexes the
 arena, which is exactly `n_ctx` cells), but the two bounds only coincide *because* a cell
@@ -1116,7 +1128,7 @@ log before it measures anything — a gate that cannot check its own preconditio
 gate.
 
 
-### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L
+### C8 — Cross-sequence cell sharing (`owner` → set/refcount) · follows C7 · L · [#41](https://github.com/yusiwen/minfer/issues/41)
 
 **Why.** A prefix shared by several sequences (a system prompt on every slot; B2's
 prefix reuse, but *across* slots) is duplicated today: each slot stores its own copy
@@ -1408,7 +1420,7 @@ so on a Mac the server keeps C8a's copy path — and since Metal's `copy_cells` 
 refused until G5, admission logs the failed copy and prefills, which is the same loud
 fallback it has always taken. S5's gate is the **compile check** (Metal is
 `cfg(target_os = "macos")`, so CI's `build-macos` is the only compile this box cannot
-do) plus this record; the device claims stay G5's, on a Mac.
+do) plus this record; the device claims stay [#44](https://github.com/yusiwen/minfer/issues/44)'s, on a Mac.
 
 That closes C8b: S1a/S1b (the span list and its two resolvers), S2 (sharing in place +
 the CPU gather), S3 (copy-on-write), S4 (the CUDA gather in every kernel) and S5
@@ -1848,9 +1860,9 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
-| E3 | 10 | Chunked prefill: make `n_batch` real | M |
-| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting | L |
-| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) | L |
+| E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) | M |
+| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) | L |
+| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
 
 #### E6 record (2026-09-19) — a device-aware default
@@ -2428,14 +2440,14 @@ Can run in parallel with A–E by a different workstream.
 
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
-| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking | L | **x86** |
-| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding | M | this box |
-| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias | M | this box |
-| F4 | 12 | Backend registry (drop the compile-time enum) | M | this box |
-| F5 | 14 | Async cross-backend copy + events | M | this box (CUDA) |
-| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) | L | this box |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality | M | this box |
-| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table | M | this box |
+| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
+| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) | M | this box |
+| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) | M | this box |
+| F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
+| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
+| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) | M | this box |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
@@ -2458,13 +2470,13 @@ mean writing the same semantics into Metal twice. G4/G6/G7 follow G5.
 
 | ID | Origin | Work | Position |
 |---|---|---|---|
-| G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` | now |
-| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` | now |
-| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) | now |
-| G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) | after C8 |
-| G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` | after G5 |
-| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool | after G5 |
-| G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path | last |
+| G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` · [#38](https://github.com/yusiwen/minfer/issues/38) | now |
+| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` · [#39](https://github.com/yusiwen/minfer/issues/39) | now |
+| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) · [#40](https://github.com/yusiwen/minfer/issues/40) | now |
+| G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) · [#44](https://github.com/yusiwen/minfer/issues/44) | after C8 |
+| G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | after G5 |
+| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | after G5 |
+| G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path · [#54](https://github.com/yusiwen/minfer/issues/54) | last |
 
 **G5 acceptance** (on a Mac; the CPU/CUDA equivalents are the gates already in the
 suite): two sequences do not cross-attend, bitwise; a mid-session compaction is
