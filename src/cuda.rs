@@ -15,6 +15,32 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// How an attention node's KV window is expressed (mirrors `ATTN_WIN_*` in
+/// `cuda_kernels.cu`). The **size** of the node's window input is what selects it
+/// (C8b S2's departure 2: the layout is topology, so it is fixed at build time),
+/// and each mode is a separate template instantiation — the causal one keeps the
+/// pre-E1 instruction stream (E1b).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttnWindow {
+    /// `positions`: rows `[0, positions[t] + 1)` of the contiguous arena.
+    Causal,
+    /// `attn_span`: one `[lo, hi)` pair per query (E1).
+    Span,
+    /// `kv_map`: a zero-padded list of `(cell, len)` runs per query (C8b S4).
+    Map,
+}
+
+impl AttnWindow {
+    /// The C-side mode constant.
+    pub fn code(self) -> i32 {
+        match self {
+            AttnWindow::Causal => 0,
+            AttnWindow::Span => 1,
+            AttnWindow::Map => 2,
+        }
+    }
+}
+
 /// Wrapper to make `*mut c_void` Send+Sync for use in Mutex.
 #[derive(Clone, Copy)]
 struct CudaPtr(*mut std::ffi::c_void);
@@ -334,7 +360,7 @@ extern "C" {
         v: *const f32,
         o: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -504,7 +530,7 @@ extern "C" {
         v: *const std::ffi::c_void,
         o: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -547,7 +573,7 @@ extern "C" {
         v: *const std::ffi::c_void,
         o: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -571,7 +597,7 @@ extern "C" {
         o: *mut f32,
         partial: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -842,7 +868,7 @@ extern "C" {
         o: *mut f32,
         partial: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -859,7 +885,7 @@ extern "C" {
         o: *mut f32,
         partial: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -875,7 +901,7 @@ extern "C" {
         o: *mut f32,
         partial: *mut f32,
         bound: *const i32,
-        windowed: i32,
+        mode: i32,
         nh: i32,
         nk: i32,
         hd: i32,
@@ -4436,7 +4462,7 @@ impl CudaState {
         v: *mut std::ffi::c_void,
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
-        windowed: bool,
+        mode: i32,
         nh: usize,
         nk: usize,
         hd: usize,
@@ -4451,7 +4477,7 @@ impl CudaState {
                 v as *const f32,
                 o as *mut f32,
                 positions as *const i32,
-                windowed as i32,
+                mode,
                 nh as i32,
                 nk as i32,
                 hd as i32,
@@ -4476,7 +4502,7 @@ impl CudaState {
         v: *mut std::ffi::c_void,
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
-        windowed: bool,
+        mode: i32,
         nh: usize,
         nk: usize,
         hd: usize,
@@ -4498,7 +4524,7 @@ impl CudaState {
                     o as *mut f32,
                     partial as *mut f32,
                     positions as *const i32,
-                    windowed as i32,
+                    mode,
                     nh as i32,
                     nk as i32,
                     hd as i32,
@@ -4515,7 +4541,7 @@ impl CudaState {
                     o as *mut f32,
                     partial as *mut f32,
                     positions as *const i32,
-                    windowed as i32,
+                    mode,
                     nh as i32,
                     nk as i32,
                     hd as i32,
@@ -4538,7 +4564,7 @@ impl CudaState {
         v: *mut std::ffi::c_void,
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
-        windowed: bool,
+        mode: i32,
         nh: usize,
         nk: usize,
         hd: usize,
@@ -4560,6 +4586,11 @@ impl CudaState {
         // fa_prefill masks rows causally from the positions array ("positions
         // are data"), which is exactly the verify block's structure, so the
         // gate is lowered to nt >= 2; nt == 1 keeps the split-KV decode path.
+        //
+        // C8b S4: a `kv_map` window is gathered here too — the staging resolves
+        // each linear window index through the runs, and the tile's per-row mask is
+        // that query's row count (a map window is a prefix of the sequence's address
+        // space, so the existing `gcol < limit` form stays exact).
         if nt >= 2 && hd == 128 && !Self::no_fa_prefill() {
             let rc = unsafe {
                 launch_fa_prefill_f16kv(
@@ -4568,7 +4599,7 @@ impl CudaState {
                     v as *const std::ffi::c_void,
                     o as *mut f32,
                     positions as *const i32,
-                    windowed as i32,
+                    mode,
                     nh as i32,
                     nk as i32,
                     hd as i32,
@@ -4588,7 +4619,7 @@ impl CudaState {
                 v as *const std::ffi::c_void,
                 o as *mut f32,
                 positions as *const i32,
-                windowed as i32,
+                mode,
                 nh as i32,
                 nk as i32,
                 hd as i32,
@@ -4651,7 +4682,7 @@ impl CudaState {
         v: *mut std::ffi::c_void,
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
-        windowed: bool,
+        mode: i32,
         nh: usize,
         nk: usize,
         hd: usize,
@@ -4672,7 +4703,7 @@ impl CudaState {
                     o as *mut f32,
                     partial as *mut f32,
                     positions as *const i32,
-                    windowed as i32,
+                    mode,
                     nh as i32,
                     nk as i32,
                     hd as i32,
@@ -4688,7 +4719,7 @@ impl CudaState {
                     o as *mut f32,
                     partial as *mut f32,
                     positions as *const i32,
-                    windowed as i32,
+                    mode,
                     nh as i32,
                     nk as i32,
                     hd as i32,
@@ -5677,7 +5708,7 @@ impl CudaState {
             kv_v as *mut std::ffi::c_void,
             ba_buf,
             pos_buf,
-            false,
+            AttnWindow::Causal.code(),
             nh,
             nk,
             hd,

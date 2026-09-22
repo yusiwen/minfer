@@ -1157,19 +1157,28 @@ impl CudaBackend {
                         ..
                     }
                 );
-                // C8b S2: a sharing sequence's explicit window is a list of
-                // `(cell, len)` runs (`kv_map`), which this kernel does not gather
-                // (C8b S4). Refuse it loudly rather than stride `(cell, len)` pairs as
-                // `(lo, hi)` — the layout is the input's size, and the model only asks
-                // for a map on a device that can gather one, so this is the backstop.
-                if windowed && in_bufs[3].len != 2 * nt {
+                // C8b S2/S4: an explicit window is either one `(lo, hi)` pair per
+                // query (`attn_span`) or `KV_MAP_MAX_SPANS` `(cell, len)` runs per
+                // query (`kv_map`) — the **size** says which, and each mode is its own
+                // kernel instantiation. A size that matches neither is refused rather
+                // than mis-strided: a `(cell, len)` pair read as `(lo, hi)` would
+                // attend to the wrong rows silently.
+                let mode = if !windowed {
+                    crate::cuda::AttnWindow::Causal
+                } else if in_bufs[3].len == 2 * nt {
+                    crate::cuda::AttnWindow::Span
+                } else if in_bufs[3].len == nt * super::kvcache::KV_MAP_MAX_SPANS * 2 {
+                    crate::cuda::AttnWindow::Map
+                } else {
                     return Err(format!(
-                        "cuda: attention window has {} values, not the {} of one (lo, hi) per \
-                         query — a kv_map needs the C8b S4 gather",
+                        "cuda: attention window input has {} values; one query needs either a \
+                         single (lo, hi) pair ({}) or {} (cell, len) runs ({})",
                         in_bufs[3].len,
-                        2 * nt
+                        2 * nt,
+                        super::kvcache::KV_MAP_MAX_SPANS,
+                        nt * super::kvcache::KV_MAP_MAX_SPANS * 2
                     ));
-                }
+                };
                 let bound_buf = if windowed { in_bufs[3] } else { in_bufs[2] };
                 let pos = self.positions_i32(bound_buf.id)?;
                 // 8d: decode (nt == 1) uses split-K flash-decoding — the
@@ -1184,7 +1193,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of_ref(out_buf)?,
                         pos,
-                        windowed,
+                        mode.code(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1207,7 +1216,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of_ref(out_buf)?,
                         pos,
-                        windowed,
+                        mode.code(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1227,7 +1236,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of_ref(out_buf)?,
                         pos,
-                        windowed,
+                        mode.code(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1241,7 +1250,7 @@ impl CudaBackend {
                         self.ptr_of(v_id)?,
                         self.ptr_of_ref(out_buf)?,
                         pos,
-                        windowed,
+                        mode.code(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
@@ -1506,6 +1515,18 @@ impl Backend for CudaBackend {
         }
         let dst_ptr = self.ptr_of_ref(dst)?;
         let src_ptr = self.ptr_of_ref(src)? as *const std::ffi::c_void;
+        // With an f16 KV cache the rows are stored as halves (`store_kv_f16` indexes
+        // a row by `nkt` half slots), while the move kernel strides in **f32**
+        // elements — the unit `elems_per_cell` is expressed in. A row is `nkt / 2`
+        // f32 then, so passing `nkt` walked twice as far per row and every moved row
+        // landed in the wrong cell: a copy-on-write or a compaction on an f16 device
+        // silently corrupted the arena. (Found by the C8b S4 real-model gate on a
+        // model whose KV is f16 — the copy gates all ran on an f32-KV model.)
+        let elems_per_cell = if self.kv_f16 {
+            (elems_per_cell / 2).max(1)
+        } else {
+            elems_per_cell
+        };
         self.state
             .kv_move_rows(dst_ptr, src_ptr, dst_row, src_row, rows, elems_per_cell)
     }
@@ -3598,6 +3619,518 @@ mod tests {
         );
     }
 
+    /// C8b S4: a `kv_map` window must give each query exactly the rows the
+    /// equivalent `attn_span` gives it — the same cells, named through a run list
+    /// instead of one range. **Bitwise**, both KV dtypes: the two modes differ in
+    /// how they resolve a row, not in what they compute over it.
+    ///
+    /// The shapes sweep the kernel families a map can land in: `nt == 1` (split-K
+    /// flash decoding — a sharing slot's decode step), `1 < nt <= 16` (the batched
+    /// split path) and `nt > 16` (prefill: FA when hd = 128, the legacy per-(token,
+    /// head) kernel otherwise). Both a prefill-shaped batch and a **decode-shaped**
+    /// one are run: a single token at the end of the window, whose window is several
+    /// runs. A first draft of this test only ever gave one token at position 0,
+    /// which touches the first run alone — the multi-run decode case is exactly what
+    /// the real-model gate caught it missing.
+    #[test]
+    fn cuda_map_window_matches_the_span_over_the_same_rows() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        const N_CTX: usize = 512;
+        const KMAX: usize = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+
+        // Reference rows [0, n) of both regions, seeded from (n, shape) alone so
+        // every call compared here sees the same bytes.
+        let reference = |n: usize, shape: (usize, usize, usize)| -> (Vec<f32>, Vec<f32>) {
+            let (nh, nk, hd) = shape;
+            let nkt = nk * hd;
+            let mut seed = 0x51ed_2701u32
+                ^ (n as u32).wrapping_mul(0x9e37_79b9)
+                ^ (nh as u32).wrapping_mul(0x85eb_ca6b)
+                ^ (nkt as u32).wrapping_mul(0xc2b2_ae35);
+            let mut next = || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((seed >> 8) as f32 / 8_388_608.0) - 1.0
+            };
+            let k: Vec<f32> = (0..n * nkt).map(|_| next()).collect();
+            let v: Vec<f32> = (0..n * nkt).map(|_| next()).collect();
+            (k, v)
+        };
+
+        // One attention call. `runs` are `(cell, len, base)`: `len` cells from
+        // `cell` hold the reference rows starting at `base`, which is how a
+        // non-contiguous window is compared against the span over the same bytes.
+        let mut run = |cb: &mut crate::graph::cuda_backend::CudaBackend,
+                       map: bool,
+                       pos: &[u32],
+                       window: &[u32],
+                       shape: (usize, usize, usize),
+                       runs: &[(usize, usize, usize)],
+                       reference: &(Vec<f32>, Vec<f32>),
+                       f16: bool|
+         -> Vec<f32> {
+            let nt = pos.len();
+            let (nh, nk, hd) = shape;
+            let nkt = nk * hd;
+            let meta = crate::graph::ops::AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale: 1.0,
+            };
+            let mut gb = GraphBuilder::new();
+            gb.set_explicit_span(true);
+            gb.set_kv_map(map);
+            let p = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+            let qq = gb.input("q", [nh * hd, nt, 1, 1], DType::F32);
+            let _kk = gb.input("k", [nkt, nt, 1, 1], crate::graph::DType::F32);
+            let _vv = gb.input("v", [nkt, nt, 1, 1], crate::graph::DType::F32);
+            let kv = gb.kvcache_load(0, nkt, N_CTX, nk);
+            let at = gb.attn(qq, kv, p, crate::graph::ops::AttnMode::Gqa, meta);
+            gb.output(at);
+            let g = gb.build();
+
+            // The KV region as the runs describe it. With an f16 cache the kernel
+            // reads the *low half* of each 4-byte slot, so a value is written as the
+            // half's bit pattern there: clean f16 data rather than the garbage an
+            // arbitrary f32 write leaves behind — which would make a wrong-row
+            // comparison compare zero to zero.
+            let (rk, rv) = reference;
+            let mut region_k = vec![0.0f32; N_CTX * nkt];
+            let mut region_v = vec![0.0f32; N_CTX * nkt];
+            let enc = |x: f32| -> f32 {
+                if f16 {
+                    f32::from_bits(half::f16::from_f32(x).to_bits() as u32)
+                } else {
+                    x
+                }
+            };
+            for &(cell, len, base) in runs {
+                for i in 0..len {
+                    let src = (base + i) * nkt;
+                    let dst = (cell + i) * nkt;
+                    for e in 0..nkt {
+                        region_k[dst + e] = enc(rk[src + e]);
+                        region_v[dst + e] = enc(rv[src + e]);
+                    }
+                }
+            }
+            // q is its own data (the comparison is over the same q in both modes).
+            let mut seed = 0x1234_abcdu32
+                ^ (nt as u32).wrapping_mul(0x27d4_eb2f)
+                ^ (nh as u32).wrapping_mul(0x9e37_79b9);
+            let qv: Vec<f32> = (0..nh * hd * nt)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    ((seed >> 8) as f32 / 8_388_608.0) - 1.0
+                })
+                .collect();
+
+            let kreg = cb.alloc_buffer(N_CTX * nkt);
+            let vreg = cb.alloc_buffer(N_CTX * nkt);
+            let qb = cb.alloc_buffer(nh * hd * nt);
+            let pb = cb.alloc_buffer(nt);
+            let wb = cb.alloc_buffer(window.len());
+            let ob = cb.alloc_buffer(nh * hd * nt);
+            let i32bits =
+                |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+            cb.write_host(qb, &qv).unwrap();
+            cb.write_host(kreg, &region_k).unwrap();
+            cb.write_host(vreg, &region_v).unwrap();
+            cb.write_host(pb, &i32bits(pos)).unwrap();
+            cb.write_host(wb, &i32bits(window)).unwrap();
+            let ati = g
+                .nodes
+                .iter()
+                .position(|nd| matches!(nd.op, crate::graph::ops::Op::Attn { .. }))
+                .unwrap();
+            cb.exec_ids(&g.nodes[ati], &[qb, kreg, pb, wb], ob, Some((kreg, vreg)))
+                .unwrap();
+            cb.copy_to_host(ob).unwrap()
+        };
+
+        // A span window for a batch at `pos`: one `[lo, hi)` pair per query.
+        let span_batch = |pos: &[u32]| -> Vec<u32> {
+            let mut w = vec![0u32; 2 * pos.len()];
+            for (i, &p) in pos.iter().enumerate() {
+                w[i] = 64;
+                w[pos.len() + i] = 64 + p + 1;
+            }
+            w
+        };
+        // ...and the runs `attn_map` would emit for it (in position order, each
+        // query's own run clipped to its row).
+        let map_batch = |runs: &[(usize, usize, usize)], pos: &[u32]| -> Vec<u32> {
+            let mut w = Vec::with_capacity(pos.len() * KMAX * 2);
+            for &p in pos {
+                let mut left = p as usize + 1;
+                let mut kk = 0usize;
+                for &(cell, len, _) in runs {
+                    let take = len.min(left);
+                    if take == 0 {
+                        continue;
+                    }
+                    assert!(kk < KMAX, "the fixture needs more than {KMAX} runs");
+                    w.push(cell as u32);
+                    w.push(take as u32);
+                    left -= take;
+                    kk += 1;
+                }
+                assert_eq!(left, 0, "the runs must cover query {p}'s window");
+                while kk < KMAX {
+                    w.push(0);
+                    w.push(0);
+                    kk += 1;
+                }
+            }
+            w
+        };
+
+        let mut bad: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for f16 in [false, true] {
+            cb.kv_f16 = f16;
+            for (shape, n) in [
+                ((1usize, 1usize, 4usize), 1usize),
+                ((2, 2, 64), 1),
+                ((4, 4, 128), 1),
+                ((2, 2, 64), 6),
+                ((4, 4, 128), 8),  // 1 < nt <= 16: the batched split path
+                ((4, 4, 128), 34), // nt > 16: FA prefill (hd = 128)
+                ((2, 2, 64), 34),  // nt > 16 with f32 KV: the legacy kernel
+            ] {
+                let reference = reference(n, shape);
+                let mut variants: Vec<(&str, Vec<(usize, usize, usize)>)> = vec![
+                    ("one run", vec![(64, n, 0)]),
+                    (
+                        "two runs",
+                        vec![(64, 4.min(n), 0), (300, n - 4.min(n), 4.min(n))],
+                    ),
+                ];
+                if n >= 6 {
+                    // Three runs, so the walk is exercised past its second entry.
+                    let (l0, l1) = (n / 3, n / 3);
+                    variants.push((
+                        "three runs",
+                        vec![(64, l0, 0), (200, l1, l0), (300, n - l0 - l1, l0 + l1)],
+                    ));
+                }
+                for (label, runs) in variants {
+                    if runs.iter().map(|r| r.1).sum::<usize>() != n {
+                        continue; // a window this short cannot be split that far
+                    }
+                    // (a) a prefill-shaped batch (one query per window row) and
+                    // (b) a decode-shaped one (a single token at the window's end,
+                    //     which is the multi-run case a sharing slot decodes).
+                    let prefill: Vec<u32> = (0..n as u32).collect();
+                    let decode = [n as u32 - 1];
+                    for (which, pos) in [("prefill", &prefill[..]), ("decode", &decode[..])] {
+                        let span = run(
+                            &mut cb,
+                            false,
+                            pos,
+                            &span_batch(pos),
+                            shape,
+                            &[(64, n, 0)],
+                            &reference,
+                            f16,
+                        );
+                        let map = run(
+                            &mut cb,
+                            true,
+                            pos,
+                            &map_batch(&runs, pos),
+                            shape,
+                            &runs,
+                            &reference,
+                            f16,
+                        );
+                        checked += 1;
+                        let worst = span
+                            .iter()
+                            .zip(map.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        if worst != 0.0 {
+                            bad.push(format!(
+                                "kv_f16={f16} {shape:?} n={n} {label} {which}: max|d|={worst}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 20, "the fixture checked only {checked} cases");
+        assert!(
+            bad.is_empty(),
+            "the map window disagrees with the span over the same bytes in {} case(s):\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+        // A window that attended to *no* row would compare equal trivially (both
+        // sides zero), so the gate has to see real output too.
+        cb.kv_f16 = false;
+        let reference8 = reference(8, (2, 2, 64));
+        let out = run(
+            &mut cb,
+            false,
+            &(0..8u32).collect::<Vec<u32>>(),
+            &span_batch(&(0..8u32).collect::<Vec<u32>>()),
+            (2, 2, 64),
+            &[(64, 8, 0)],
+            &reference8,
+            false,
+        );
+        assert!(
+            out.iter().any(|&x| x != 0.0 && x.is_finite()),
+            "the fixture attends to no row — the comparison above would be vacuous"
+        );
+        eprintln!("[map] {checked} cases bitwise-equal to the span over the same rows");
+    }
+
+    /// C8b S4: a cell move must stride by a **row's** size, whatever the KV dtype
+    /// stores. With an f16 cache a row is `nkt` halves = `nkt / 2` f32 elements,
+    /// while `copy_cells`'s `elems_per_cell` is a count of f32 — the unit the move
+    /// kernel walks by. Passing `nkt` there moved every row twice as far as it
+    /// should, so a copy-on-write (or a compaction) on an f16 device wrote the
+    /// wrong cells; the real-model hd = 128 gate found it, and this pins it.
+    #[test]
+    fn cuda_f16_kv_cell_move_strides_by_row_bytes() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        const N_CTX: usize = 64;
+        // A row of `nkt` halves, stored in the first `nkt / 2` f32 slots.
+        let nkt = 8usize;
+        cb.kv_f16 = true;
+        let (src_row, dst_row, rows) = (2usize, 10usize, 4usize);
+        let slots = N_CTX * (nkt / 2);
+        let region = cb.alloc_buffer(slots);
+        // Every f32 slot carries its own index in its low 16 bits, so the halves a
+        // kernel would read are distinct and the *slot* layout is verifiable.
+        let pattern: Vec<f32> = (0..slots)
+            .map(|i| f32::from_bits(((i as u32) * 7 + 1) & 0xFFFF))
+            .collect();
+        cb.write_host(region, &pattern).unwrap();
+        let before = pattern.clone();
+        let r = BufRef::own(crate::graph::Backend::Cuda, region, slots);
+        cb.copy_cells(r, r, dst_row, src_row, rows, nkt).unwrap();
+        let after = cb.copy_to_host(region).unwrap();
+        assert_eq!(after.len(), slots);
+        for r in 0..rows {
+            // Slot view of a row: `row * nkt / 2` f32.
+            let sd = (src_row + r) * (nkt / 2);
+            let dd = (dst_row + r) * (nkt / 2);
+            assert_eq!(
+                &after[dd..dd + nkt / 2],
+                &before[sd..sd + nkt / 2],
+                "row {r} did not land at row {} (f16 KV strides in f32 elements)",
+                dst_row + r
+            );
+        }
+        // Nothing outside the destination rows may move.
+        for (i, (x, y)) in before.iter().zip(&after).enumerate() {
+            let moved = (dst_row * nkt / 2..(dst_row + rows) * nkt / 2).contains(&i);
+            if !moved {
+                assert_eq!(x, y, "cell move touched f32 slot {i} outside its rows");
+            }
+        }
+    }
+
+    /// C8b S4 device A/B: what naming a row through the run list costs over the
+    /// span's `row0 + i`, at the decode shape that pays it on every step. Both
+    /// modes attend to the *same* rows (one run each), so the difference is the
+    /// row resolution alone — S4's "each backend gets its own A/B".
+    ///
+    /// Run with `--ignored --nocapture` on a quiet box; the medians it prints are
+    /// the numbers the plan records.
+    #[test]
+    #[ignore = "timing: needs a CUDA device and an otherwise quiet box"]
+    fn cuda_map_window_costs_no_more_than_the_span_it_replaces() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        const KMAX: usize = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+        // The 7B decode shape (hd 128, 4 KV heads) at a 2K window: long enough
+        // that the split-K body does real work, short enough that the 4-warp
+        // hybrid gate stays out of it.
+        let (nh, nk, hd, nkv) = (28usize, 4usize, 128usize, 2048usize);
+        let nkt = nk * hd;
+        let n_ctx = 4096usize;
+        cb.kv_f16 = false;
+        let qb = cb.alloc_buffer(nh * hd);
+        let kreg = cb.alloc_buffer(n_ctx * nkt);
+        let vreg = cb.alloc_buffer(n_ctx * nkt);
+        let ob = cb.alloc_buffer(nh * hd);
+        let spb = cb.alloc_buffer(2);
+        let mpb = cb.alloc_buffer(KMAX * 2);
+        cb.write_host(qb, &vec![0.01f32; nh * hd]).unwrap();
+        cb.write_host(kreg, &vec![0.02f32; n_ctx * nkt]).unwrap();
+        cb.write_host(vreg, &vec![0.03f32; n_ctx * nkt]).unwrap();
+        let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+        cb.write_host(spb, &bits(&[0, nkv as u32])).unwrap();
+        let mut map = vec![0u32; KMAX * 2];
+        map[0] = 0;
+        map[1] = nkv as u32;
+        cb.write_host(mpb, &bits(&map)).unwrap();
+
+        let scale = 1.0 / (hd as f32).sqrt();
+        let time = |cb: &mut crate::graph::cuda_backend::CudaBackend,
+                    mode: crate::cuda::AttnWindow,
+                    reps: usize|
+         -> f64 {
+            let win = if mode == crate::cuda::AttnWindow::Map {
+                mpb
+            } else {
+                spb
+            };
+            let mut call = |cb: &mut crate::graph::cuda_backend::CudaBackend| {
+                cb.state.gqa_attn_split(
+                    cb.ptr_of(qb).unwrap(),
+                    cb.ptr_of(kreg).unwrap(),
+                    cb.ptr_of(vreg).unwrap(),
+                    cb.ptr_of(ob).unwrap(),
+                    cb.ptr_of(win).unwrap(),
+                    mode.code(),
+                    nh,
+                    nk,
+                    hd,
+                    scale,
+                    false,
+                );
+            };
+            // Warm-up: a first launch pays the module load, which is not the
+            // measurement (the prewarm list covers the production instantiations,
+            // not necessarily these).
+            for _ in 0..3 {
+                call(cb);
+            }
+            cb.state.sync();
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                call(cb);
+            }
+            cb.state.sync();
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+
+        let (reps, rounds) = (200usize, 5usize);
+        let mut span_ms: Vec<f64> = Vec::new();
+        let mut map_ms: Vec<f64> = Vec::new();
+        for _ in 0..rounds {
+            span_ms.push(time(&mut cb, crate::cuda::AttnWindow::Span, reps));
+            map_ms.push(time(&mut cb, crate::cuda::AttnWindow::Map, reps));
+        }
+        span_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        map_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (s_ms, m_ms) = (span_ms[rounds / 2], map_ms[rounds / 2]);
+        eprintln!(
+            "[s4-ab] nkv={nkv} nh={nh} nk={nk} hd={hd}: span {s_ms:.3} ms / map {m_ms:.3} ms over \
+             {reps} launches ({:.1} vs {:.1} us/launch) — {:.3}x",
+            s_ms * 1000.0 / reps as f64,
+            m_ms * 1000.0 / reps as f64,
+            m_ms / s_ms
+        );
+        assert!(
+            m_ms <= s_ms * 1.25,
+            "the map window costs {:.3}x the span it replaces ({m_ms:.3} vs {s_ms:.3} ms); S4's \
+             claim is that resolving a row through runs is not a new bottleneck",
+            m_ms / s_ms
+        );
+
+        // The other half of the A/B: a *prefill* window (each query's whole
+        // prefix), where the window is walked tile by tile. Both modes run FA here
+        // since S4 taught its staging loop to resolve runs, so this measures the
+        // resolution cost on the prefill path too.
+        let nt = 512usize;
+        let spb2 = cb.alloc_buffer(2 * nt);
+        let mpb2 = cb.alloc_buffer(nt * KMAX * 2);
+        let ob2 = cb.alloc_buffer(nh * hd * nt);
+        cb.kv_f16 = true;
+        let enc = |x: f32| -> f32 { f32::from_bits(half::f16::from_f32(x).to_bits() as u32) };
+        cb.write_host(kreg, &vec![enc(0.02f32); n_ctx * nkt])
+            .unwrap();
+        cb.write_host(vreg, &vec![enc(0.03f32); n_ctx * nkt])
+            .unwrap();
+        cb.write_host(qb, &vec![enc(0.01f32); nh * hd]).unwrap();
+        let mut span2 = vec![0u32; 2 * nt];
+        let mut map2 = vec![0u32; nt * KMAX * 2];
+        for t in 0..nt {
+            span2[t] = 0;
+            span2[nt + t] = (t + 1) as u32;
+            map2[t * KMAX * 2] = 0;
+            map2[t * KMAX * 2 + 1] = (t + 1) as u32;
+        }
+        cb.write_host(spb2, &bits(&span2)).unwrap();
+        cb.write_host(mpb2, &bits(&map2)).unwrap();
+        let time_prefill = |cb: &mut crate::graph::cuda_backend::CudaBackend,
+                            mode: crate::cuda::AttnWindow,
+                            reps: usize|
+         -> f64 {
+            let win = if mode == crate::cuda::AttnWindow::Map {
+                mpb2
+            } else {
+                spb2
+            };
+            let mut call = |cb: &mut crate::graph::cuda_backend::CudaBackend| {
+                cb.state.gqa_attn_f16kv(
+                    cb.ptr_of(qb).unwrap(),
+                    cb.ptr_of(kreg).unwrap(),
+                    cb.ptr_of(vreg).unwrap(),
+                    cb.ptr_of(ob2).unwrap(),
+                    cb.ptr_of(win).unwrap(),
+                    mode.code(),
+                    nh,
+                    nk,
+                    hd,
+                    scale,
+                    nt,
+                );
+            };
+            for _ in 0..2 {
+                call(cb);
+            }
+            cb.state.sync();
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                call(cb);
+            }
+            cb.state.sync();
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        let (preps, hd_ok) = (20usize, hd == 128);
+        let (p_span, p_map) = if hd_ok {
+            (
+                time_prefill(&mut cb, crate::cuda::AttnWindow::Span, preps),
+                time_prefill(&mut cb, crate::cuda::AttnWindow::Map, preps),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        if hd_ok {
+            eprintln!(
+                "[s4-ab] prefill nt={nt} nkv={nt} hd={hd}: span {p_span:.3} ms / map {p_map:.3} \
+                 ms over {preps} launches — {:.3}x",
+                p_map / p_span
+            );
+            assert!(
+                p_map <= p_span * 1.25,
+                "a map prefill costs {:.3}x the span it replaces ({p_map:.3} vs {p_span:.3} ms)",
+                p_map / p_span
+            );
+        }
+    }
+
     /// reference with the standard q8-activation tolerance instead.
     #[test]
     fn cuda_verify_attention_nt_invariance() {
@@ -3685,7 +4218,7 @@ mod tests {
                         cb.ptr_of(vb).unwrap(),
                         cb.ptr_of(obt).unwrap(),
                         cb.ptr_of(post).unwrap(),
-                        false, // single-sequence: the causal instantiation
+                        crate::cuda::AttnWindow::Causal.code(), // single-sequence
                         nh,
                         nk,
                         hd,
@@ -3709,7 +4242,7 @@ mod tests {
                             cb.ptr_of(vb).unwrap(),
                             cb.ptr_of(o1).unwrap(),
                             cb.ptr_of(p1).unwrap(),
-                            false, // single-sequence: the causal instantiation
+                            crate::cuda::AttnWindow::Causal.code(), // single-sequence
                             nh,
                             nk,
                             hd,
