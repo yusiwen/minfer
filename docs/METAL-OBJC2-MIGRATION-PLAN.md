@@ -14,7 +14,7 @@ minfer's Metal backend uses the `metal` 0.28 crate, which is built on the legacy
 - **`block` 0.1.6** → **`block2`** (the `objc2`-based block runtime wrapper)
 - **`objc` 0.2.x** (internal to `metal`) → **`objc2`** (modern, typed, ARC-based)
 
-See [`docs/METAL_OBJC-ECOSYSTEM.md`](../METAL_OBJC-ECOSYSTEM.md) for the full ecosystem analysis.
+See [`METAL_OBJC-ECOSYSTEM.md`](METAL_OBJC-ECOSYSTEM.md) for the full ecosystem analysis.
 
 ---
 
