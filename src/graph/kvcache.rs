@@ -134,6 +134,11 @@ pub struct KvCache {
     /// (summed over layers) — the counters the ticket's acceptance records.
     defrags: u64,
     cells_moved: u64,
+    /// C8b S3: how many copy-on-write events ran, and how many of a sequence's own
+    /// rows they moved (summed over layers). Like `defrags`, this exists to make
+    /// the mechanism observable in a gate that has to *see* it happen.
+    cows: u64,
+    cow_cells: u64,
 }
 
 impl KvCache {
@@ -146,6 +151,8 @@ impl KvCache {
             n_ctx: 0,
             defrags: 0,
             cells_moved: 0,
+            cows: 0,
+            cow_cells: 0,
         }
     }
 
@@ -865,6 +872,115 @@ impl KvCache {
         Ok(())
     }
 
+    /// C8b S3: the copy-on-write a store at position `t` needs, or `None` when `t`
+    /// already resolves into the sequence's own run.
+    ///
+    /// A sequence that reads its prefix in place must never **write** through it: the
+    /// cells belong to the donor, and a store there would corrupt every sharer. The
+    /// sequence therefore gives the share up from `t` on — the first position this
+    /// forward writes privately — and this returns the move that keeps the rows it
+    /// already wrote at their positions while their run's base drops.
+    ///
+    /// Requirements, checked here rather than assumed: the run must have room for
+    /// `shared.rows - t` more positions (`written` of them, plus the new ones, all
+    /// inside `cap`). A sequence that cannot take the position privately is **no
+    /// longer shareable** — the caller gets `Err`, and the alternative (writing into
+    /// the donor's block) is exactly what this ticket forbids.
+    pub fn private_row_for(&self, seq: SeqId, t: usize) -> Result<Option<KvShift>, String> {
+        let Some(slot) = self.seqs.get(&seq).copied() else {
+            // No run, no share: the classic single-sequence path.
+            return Ok(None);
+        };
+        if slot.shared.rows == 0 || t >= slot.shared.rows {
+            return Ok(None);
+        }
+        let d = slot.shared.rows - t;
+        let rows = slot.private_written();
+        if rows + d > slot.cap {
+            return Err(format!(
+                "private_row_for: sequence {seq} cannot take position {t} privately: its {rows} \
+                 written row(s) would move {d} cell(s) into a run of {} cells (shared prefix of \
+                 {})",
+                slot.cap, slot.shared.rows
+            ));
+        }
+        Ok(Some(KvShift {
+            seq,
+            base: t,
+            from: slot.start,
+            to: slot.start + d,
+            rows,
+        }))
+    }
+
+    /// Apply the **bookkeeping** half of a copy-on-write: the caller has already
+    /// moved the rows with `Backend::copy_cells`, so this shifts the owner table by
+    /// the same range and drops the share to `shift.base`.
+    ///
+    /// `written` is deliberately untouched: the sequence's readable positions are
+    /// unchanged (`[0, written)`), only *where* `[base, written)` lives inside the
+    /// run changes — which is why `private_written` grows by the shift's `d`.
+    pub fn apply_private_row(&mut self, shift: &KvShift) -> Result<(), String> {
+        let Some(slot) = self.seqs.get(&shift.seq).copied() else {
+            return Err(format!(
+                "apply_private_row: sequence {} holds no run",
+                shift.seq
+            ));
+        };
+        if slot.start != shift.from
+            || slot.shared.rows <= shift.base
+            || slot.private_written() != shift.rows
+        {
+            return Err(format!(
+                "apply_private_row: sequence {} is not in the state the shift was planned from \
+                 (run at {}, {} shared row(s), {} private row(s); shift {shift:?})",
+                shift.seq,
+                slot.start,
+                slot.shared.rows,
+                slot.private_written()
+            ));
+        }
+        // Validate against every layer before mutating any of them: a partial
+        // owner shift would leave the table describing rows that are not there.
+        for l in self.layers.values() {
+            if shift.to + shift.rows > l.owner.len() || shift.from + shift.rows > l.owner.len() {
+                return Err(format!(
+                    "apply_private_row: {:?} does not fit a {}-cell arena",
+                    shift,
+                    l.owner.len()
+                ));
+            }
+        }
+        let mut rows_moved = 0usize;
+        for l in self.layers.values_mut() {
+            rows_moved += shift.rows;
+            if shift.rows > 0 {
+                l.owner
+                    .copy_within(shift.from..shift.from + shift.rows, shift.to);
+            }
+            // The cells the move vacated no longer hold a written row: they are the
+            // new base's unwritten rows (this forward is about to write them).
+            for cell in shift.from..shift.to {
+                if l.owner[cell] == shift.seq {
+                    l.owner[cell] = FREE;
+                }
+            }
+            l.n_used = l
+                .owner
+                .iter()
+                .rposition(|&o| o != FREE)
+                .map_or(0, |i| i + 1);
+        }
+        {
+            let slot = self.seqs.get_mut(&shift.seq).expect("checked above");
+            slot.shared.rows = shift.base;
+        }
+        self.refresh_spans(shift.seq);
+        self.cows += 1;
+        self.cow_cells += rows_moved as u64;
+        Ok(())
+    }
+
     /// Fragmentation and utilisation counters (C3's acceptance surface; the
     /// same numbers F8 exports).
     pub fn arena_stats(&self) -> KvArenaStats {
@@ -888,6 +1004,8 @@ impl KvCache {
             sequences: self.seqs.len(),
             defrags: self.defrags,
             cells_moved: self.cells_moved,
+            cows: self.cows,
+            cow_cells: self.cow_cells,
         }
     }
 
@@ -1102,6 +1220,29 @@ pub fn order_moves(moves: &mut [KvMove]) {
     });
 }
 
+/// C8b S3: the move a copy-on-write performs inside one sequence's own run.
+///
+/// A sequence that reads its prefix in place (C8b S2) owns the positions
+/// `[shared.rows, shared.rows + cap)` of its run. A store at an earlier position `t`
+/// would land in the **donor's** cells, so the sequence gives the share up from `t`
+/// on: the run's position base drops to `t` and the rows it already wrote shift up
+/// by `shared.rows - t` to keep their positions. `rows` is that move's length in
+/// cells — 0 when the sequence has not written privately yet, in which case the
+/// rebase stands alone. The data copy is the allocator's job
+/// ([`KvMove`]'s arrangement), which is why this plan is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvShift {
+    pub seq: SeqId,
+    /// Position the run's first cell holds after the shift (the new `shared.rows`).
+    pub base: usize,
+    /// Cell the sequence's written rows move from (the run's `start`).
+    pub from: usize,
+    /// ... and to: `from + (old shared rows - base)`.
+    pub to: usize,
+    /// Rows the move covers (the sequence's own written rows).
+    pub rows: usize,
+}
+
 /// One run relocation produced by [`KvCache::compaction_plan`] (C3).
 ///
 /// `from`/`to` are cell indices; `rows` is the sequence's **written** length, so
@@ -1131,6 +1272,10 @@ pub struct KvArenaStats {
     pub sequences: usize,
     pub defrags: u64,
     pub cells_moved: u64,
+    /// C8b S3: copy-on-write events, and the sequence rows they moved (summed over
+    /// layers) — a shared prefix costs nothing until a store lands inside it.
+    pub cows: u64,
+    pub cow_cells: u64,
 }
 
 /// RoPE parameters a KV shift needs to re-rope the stored K rows.
@@ -1532,6 +1677,188 @@ mod tests {
         // The donor is untouched by any of it and still reads its own rows.
         assert_eq!(c.spans_of(1), &[(0, donor.start, 4)]);
         assert_eq!(c.written_rows(1), 4);
+    }
+
+    /// C8b S3: a store inside a shared prefix takes a **private row** — the share
+    /// shrinks to the first position the forward writes, and the rows the sequence
+    /// already owns shift up inside its own run so they keep their positions. The
+    /// donor's cells are never named again by that position.
+    #[test]
+    fn a_store_inside_a_shared_prefix_takes_a_private_row() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 4).unwrap(); // [4, 8)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        c.own_positions(2, &[4, 5]).unwrap(); // two rows of its own at [4, 6)
+        assert_eq!(c.spans_of(2), &[(0, donor.start, 4), (4, dst.start, 4)]);
+        assert_eq!(c.private_written(2), 2);
+
+        // Position 3 and everything after it is written privately; 4 is already
+        // private, and an unknown sequence has nothing to copy.
+        assert_eq!(c.private_row_for(2, 4), Ok(None), "already private");
+        assert_eq!(c.private_row_for(7, 0), Ok(None), "no run, no share");
+        let shift = c.private_row_for(2, 3).unwrap().expect("a copy is needed");
+        assert_eq!(
+            shift,
+            KvShift {
+                seq: 2,
+                base: 3,
+                from: dst.start,
+                to: dst.start + 1,
+                rows: 2,
+            }
+        );
+        c.apply_private_row(&shift).unwrap();
+
+        // The address space is the remaining share plus the whole run, whose base
+        // dropped to the position the store starts at.
+        assert_eq!(c.spans_of(2), &[(0, donor.start, 3), (3, dst.start, 4)]);
+        for p in 0..3 {
+            assert_eq!(c.cell_of(2, p), Some(donor.start + p), "still shared");
+        }
+        assert_eq!(c.cell_of(2, 3), Some(dst.start), "private from here on");
+        assert_eq!(c.cell_of(2, 4), Some(dst.start + 1), "the row it moved up");
+        assert_eq!(c.cell_of(2, 5), Some(dst.start + 2));
+        assert_eq!(c.written_rows(2), 6, "no readable position was lost");
+        assert_eq!(c.private_written(2), 3, "and the run holds three of them");
+        // The owner table followed the move: [4, 6) -> [5, 7), and the vacated cell
+        // is the new base's unwritten row.
+        let owner = &c.get(0).unwrap().owner;
+        assert_eq!(owner[dst.start], FREE, "vacated");
+        assert_eq!(owner[dst.start + 1], 2);
+        assert_eq!(owner[dst.start + 2], 2);
+        assert_eq!(owner[donor.start], 1, "the donor keeps its own row");
+        let stats = c.arena_stats();
+        assert_eq!((stats.cows, stats.cow_cells), (1, 4), "2 rows x 2 layers");
+        assert_eq!(stats.shared_cells, 3, "the saving shrank with the share");
+        // A query at the copy-on-written row reads the private cells and the
+        // remaining share — and the donor is untouched.
+        let map = c.attn_map(&[2], &[4]).unwrap();
+        assert_eq!(&map[..4], &[donor.start as u32, 3, dst.start as u32, 2]);
+        assert_eq!(c.written_rows(1), 4);
+        assert_eq!(c.spans_of(1), &[(0, donor.start, 4)]);
+    }
+
+    /// A sequence that diverges earlier than it did last time copies again: the share
+    /// only ever shrinks and the run only ever extends its own written range, so the
+    /// address space stays at most two spans however often this happens.
+    #[test]
+    fn a_copy_on_write_can_shrink_the_share_twice() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 6).unwrap(); // [4, 10)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        c.own_positions(2, &[4, 5]).unwrap();
+        // First the store reaches position 3, then 1, then 0.
+        let steps = [
+            (3usize, 3usize, 4usize, 5usize, 2usize),
+            (1, 1, 4, 6, 3),
+            (0, 0, 4, 5, 5),
+        ];
+        for (t, base, from, to, rows) in steps {
+            let shift = c.private_row_for(2, t).unwrap().expect("a copy is needed");
+            assert_eq!(
+                (shift.base, shift.from, shift.to, shift.rows),
+                (base, from, to, rows)
+            );
+            c.apply_private_row(&shift).unwrap();
+        }
+        assert_eq!(c.spans_of(2), &[(0, dst.start, 6)], "the share is gone");
+        assert_eq!(c.cell_of(2, 0), Some(dst.start));
+        assert_eq!(c.cell_of(2, 4), Some(dst.start + 4));
+        assert_eq!(c.cell_of(2, 5), Some(dst.start + 5));
+        assert_eq!(c.written_rows(2), 6);
+        assert_eq!(c.private_written(2), 6);
+        assert_eq!(
+            c.spans_of(1),
+            &[(0, donor.start, 4)],
+            "the donor is untouched"
+        );
+        assert_eq!(c.arena_stats().cows, 3);
+    }
+
+    /// The other end of the same rule: a store at position 0 gives the share up
+    /// entirely, and the sequence's whole run becomes its own.
+    #[test]
+    fn a_copy_on_write_to_the_first_position_drops_the_share() {
+        let mut c = cache(16);
+        let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 6).unwrap(); // [4, 10)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        c.own_positions(2, &[4, 5]).unwrap();
+        let shift = c.private_row_for(2, 0).unwrap().expect("a copy is needed");
+        assert_eq!((shift.base, shift.from, shift.to, shift.rows), (0, 4, 8, 2));
+        c.apply_private_row(&shift).unwrap();
+        assert_eq!(
+            c.spans_of(2),
+            &[(0, dst.start, 6)],
+            "one run, no share left"
+        );
+        assert_eq!(c.cell_of(2, 0), Some(dst.start));
+        assert_eq!(c.cell_of(2, 4), Some(dst.start + 4), "its own row, moved");
+        assert_eq!(c.seq_slot(2).unwrap().shared.rows, 0);
+        assert_eq!(c.written_rows(2), 6);
+    }
+
+    /// A sequence whose run has no room for the extra rows cannot take the store
+    /// privately: that is a loud refusal (gate 3), never a write into the donor's
+    /// cells.
+    #[test]
+    fn a_copy_on_write_refuses_a_run_without_room() {
+        let mut c = cache(16);
+        c.reserve_seq(1, 4).unwrap(); // [0, 4)
+        let dst = c.reserve_seq(2, 2).unwrap(); // [4, 6)
+        for layer in [0usize, 1] {
+            c.note_written(1, layer, &[0, 1, 2, 3]);
+        }
+        c.share_prefix(1, 2, 4).unwrap();
+        c.own_positions(2, &[4, 5]).unwrap(); // the run is exactly full
+        let err = c.private_row_for(2, 0).unwrap_err();
+        assert!(
+            err.contains("cannot take position 0 privately"),
+            "got: {err}"
+        );
+        assert!(err.contains("run of 2 cells"), "got: {err}");
+        let err = c.private_row_for(2, 2).unwrap_err();
+        assert!(
+            err.contains("cannot take position 2 privately"),
+            "got: {err}"
+        );
+        assert_eq!(c.spans_of(2).len(), 2, "the refusals changed nothing");
+        assert_eq!(c.written_rows(2), 6);
+        // A plan from a state the store is no longer in is refused rather than
+        // applied to the wrong rows.
+        let stale = KvShift {
+            seq: 2,
+            base: 3,
+            from: dst.start + 1,
+            to: dst.start + 2,
+            rows: 1,
+        };
+        let err = c.apply_private_row(&stale).unwrap_err();
+        assert!(err.contains("not in the state"), "got: {err}");
+        let gone = KvShift {
+            seq: 9,
+            base: 0,
+            from: 0,
+            to: 1,
+            rows: 1,
+        };
+        assert!(c
+            .apply_private_row(&gone)
+            .unwrap_err()
+            .contains("holds no run"));
+        let stats = c.arena_stats();
+        assert_eq!((stats.cows, stats.cow_cells), (0, 0), "nothing ran");
     }
 
     /// A released donor must not hand its rows to somebody else while a sharer
