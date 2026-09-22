@@ -392,28 +392,59 @@ impl BatchEngine {
     /// hold, so the prefill only feeds the suffix. Returns the rows actually reusable —
     /// `own` when the copy fails, because a failed copy must not lose the slot's own
     /// cache, and the request then simply prefills what it cannot reuse.
-    fn copy_prefix_from(&mut self, src: usize, idx: usize, rows: usize, own: usize) -> usize {
+    fn copy_prefix_from(
+        &mut self,
+        src: usize,
+        idx: usize,
+        rows: usize,
+        own: usize,
+        gathers: bool,
+    ) -> usize {
         let (src_seq, dst_seq) = (self.slots[src].seq, self.slots[idx].seq);
-        match self.cache.alloc().kv_copy_prefix(src_seq, dst_seq, rows) {
+        // C8b S2: a device whose kernel gathers a `kv_map` (CPU) **shares** the
+        // donor's rows instead of copying them — one copy of the bytes read by both
+        // sequences. Other devices keep C8a's copy (CUDA is C8b S4, Metal is G5).
+        let (verb, fail) = if gathers {
+            ("shared", "sharing")
+        } else {
+            ("copied", "copy")
+        };
+        let done = if gathers {
+            self.cache
+                .alloc()
+                .kv_share_prefix(src_seq, dst_seq, rows)
+                .map(|_| ())
+        } else {
+            self.cache.alloc().kv_copy_prefix(src_seq, dst_seq, rows)
+        };
+        match done {
             Ok(()) => {
                 self.slots[idx].cached_tokens = self.slots[src].cached_tokens[..rows].to_vec();
                 self.prefix_rows_copied += rows;
                 eprintln!(
-                    "[server] slot {idx}: copied {rows} prefix row(s) from slot {src} instead of \
+                    "[server] slot {idx}: {verb} {rows} prefix row(s) from slot {src} instead of \
                      prefilling them"
                 );
                 rows
             }
             Err(e) => {
                 eprintln!(
-                    "[server] slot {idx}: prefix copy from slot {src} failed ({e}); prefilling"
+                    "[server] slot {idx}: prefix {fail} from slot {src} failed ({e}); prefilling"
                 );
                 own
             }
         }
     }
 
-    /// C8a: prefix rows copied rather than prefilled (tests assert the copy happened).
+    /// C8b S2: whether this device's kernel gathers a `kv_map` — the CPU one does, so
+    /// a prefix another slot already computed is read in place instead of copied.
+    /// CUDA is C8b S4 and Metal is G5, and both keep C8a's copy.
+    fn gathers_kv_map(model: &dyn ModelDef) -> bool {
+        matches!(model.device(), crate::models::Device::Cpu)
+    }
+
+    /// C8a/C8b S2: prefix rows shared or copied rather than prefilled (tests assert
+    /// that the reuse happened).
     #[cfg(test)]
     pub fn prefix_rows_copied(&self) -> usize {
         self.prefix_rows_copied
@@ -449,7 +480,9 @@ impl BatchEngine {
             let (own, _) = self.feed_span(*slot, &job.input_ids);
             let (want_rows, donor) = self.shared_prefix(*slot, &job.input_ids, own);
             let feed_from = match donor {
-                Some(src) => self.copy_prefix_from(src, *slot, want_rows, own),
+                Some(src) => {
+                    self.copy_prefix_from(src, *slot, want_rows, own, Self::gathers_kv_map(model))
+                }
                 None => want_rows,
             };
             let nt = job.input_ids.len();
@@ -553,7 +586,9 @@ impl BatchEngine {
         let (own, _) = self.feed_span(idx, &job.input_ids);
         let (want_rows, donor) = self.shared_prefix(idx, &job.input_ids, own);
         let feed_from = match donor {
-            Some(src) => self.copy_prefix_from(src, idx, want_rows, own),
+            Some(src) => {
+                self.copy_prefix_from(src, idx, want_rows, own, Self::gathers_kv_map(model))
+            }
             None => want_rows,
         };
         // C6: positions are a token's index *within its sequence* — what RoPE
