@@ -436,11 +436,17 @@ impl BatchEngine {
         }
     }
 
-    /// C8b S2: whether this device's kernel gathers a `kv_map` — the CPU one does, so
-    /// a prefix another slot already computed is read in place instead of copied.
-    /// CUDA is C8b S4 and Metal is G5, and both keep C8a's copy.
+    /// C8b S2/S4: whether this device's kernel gathers a `kv_map` — the CPU and CUDA
+    /// ones do (since S4), so a prefix another slot already computed is read in place
+    /// instead of copied. Metal keeps C8a's copy until G5. The answer comes from
+    /// `Device::gathers_attn_map`, the same authority the model's graph builder reads,
+    /// so the share and the window layout cannot disagree.
+    ///
+    /// `MINFER_NO_KV_SHARE=1` (presence-checked) forces C8a's copy where the device
+    /// could read in place: the A/B gate for the share itself, and the shape-matched
+    /// baseline the real-model S3 gate compares a shared run against.
     fn gathers_kv_map(model: &dyn ModelDef) -> bool {
-        matches!(model.device(), crate::models::Device::Cpu)
+        !super::kv_share_disabled() && model.device().gathers_attn_map()
     }
 
     /// C8a/C8b S2: prefix rows shared or copied rather than prefilled (tests assert
@@ -734,7 +740,17 @@ impl BatchEngine {
                 run.last_logits = logits[r * nv..(r + 1) * nv].to_vec();
                 let live_on = run.live_on;
                 slot.cached_tokens.push(tok);
-                debug_assert_eq!(slot.cached_tokens.len(), pos);
+                // The row this forward wrote is exactly position `pos`, so the
+                // slot's mirror now covers `0..=pos` and the next token belongs at
+                // `pos + 1`. Advancing here — where the row exists — is what keeps
+                // the mirror and the KV layout in step: `advance` used to move it
+                // one step early, so the first token after a prefill was written at
+                // `nt + 1` and position `nt` was never written at all (a stale row
+                // the next step's attention then read).
+                debug_assert_eq!(slot.cached_tokens.len(), pos + 1);
+                if let Some(run) = slot.run.as_mut() {
+                    run.current_pos = pos + 1;
+                }
                 if live_on {
                     crate::live::attach_step(&slot.run.as_ref().expect("run").last_logits);
                 }
@@ -831,16 +847,19 @@ impl BatchEngine {
         // Decide *now* whether another token can still be used, instead of committing
         // one and discovering on the next step that it must be discarded: that wasted
         // a whole weight pass and wrote a cell nothing would ever read (C7 reserved an
-        // extra cell to make room for it). `current_pos` is the cell this token
-        // occupies, and the next step forwards the committed token at `current_pos + 1`,
-        // so the two bounds are the request's token budget and the run's capacity.
+        // extra cell to make room for it). `current_pos` is the cell the committed
+        // token occupies, so continuing is only legal while the *next* one (`+ 1`)
+        // still fits the run — the two bounds are the request's token budget and the
+        // run's capacity.
         let budget_done = params.max_tokens >= 0 && *completion_tokens as i64 >= params.max_tokens;
         if budget_done || *current_pos + 1 >= cap {
             return Ok(StepOutcome::Finish("length"));
         }
-        // `tok`'s row is written by the NEXT step's batch, at `current_pos`.
+        // `tok`'s row is written by the NEXT step's batch, at `current_pos` — which
+        // this function deliberately does not move: the forward that writes the row
+        // is the one that advances the position (`tick`), so a token's position and
+        // its row cannot drift apart.
         *needs_forward = Some(tok);
-        *current_pos += 1;
         Ok(StepOutcome::Continue)
     }
 
@@ -1236,24 +1255,6 @@ mod tests {
         assert!(prompt.len() > 8, "the prompt has to be worth sharing");
         let n_ctx = prompt.len() + 64;
 
-        // Slot 0 computes the prompt; slot 1 reads it in place (C8a/C8b S2).
-        let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
-        let (donor_seq, dst_seq) = (engine.slots[0].seq, engine.slots[1].seq);
-        serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 8);
-        serve_on(&mut engine, &*model, &tok, 1, prompt.clone(), 8);
-        let shared_rows = engine
-            .cache
-            .alloc()
-            .kv_seq_slot(dst_seq)
-            .expect("slot 1 has a run")
-            .shared
-            .rows;
-        assert!(
-            shared_rows > 3,
-            "slot 1 must read {shared_rows} rows in place for the gate to mean anything"
-        );
-        assert_eq!(engine.cow_stats().0, 0, "nothing needed a copy yet");
-
         // A request on slot 1 matching only the prompt's first three tokens: its
         // prefill starts inside the shared prefix, so the store has to copy.
         let mut diverging = prompt[..3].to_vec();
@@ -1263,29 +1264,93 @@ mod tests {
             3,
             "the divergence point is the gate's input"
         );
-        let donor_before = kv_rows_of(&mut engine, donor_seq);
-        assert!(!donor_before.is_empty(), "the donor must hold rows");
-        let cow = serve_on(&mut engine, &*model, &tok, 1, diverging.clone(), 8);
-        let (cows, cells) = engine.cow_stats();
+
+        // One whole scenario — donor, sharer, then the diverging request — with the
+        // share either on (the ticket's path) or replaced by C8a's **copy** (the
+        // A/B). The copy variant is the baseline the answer is compared against
+        // because it is *shape-matched*: the same requests, the same fed positions
+        // and the same K/V bytes, with the donor's rows duplicated instead of
+        // referenced. A one-slot baseline cannot be: on CUDA a prefill's GEMM shape
+        // changes the K/V it computes, so a run that feeds a different number of
+        // tokens answers differently for reasons that have nothing to do with
+        // sharing — the first form of this gate passed on CPU and failed on CUDA for
+        // exactly that reason.
+        let mut scenario =
+            |share: bool| -> (String, usize, usize, u64, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+                if !share {
+                    std::env::set_var("MINFER_NO_KV_SHARE", "1");
+                }
+                let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
+                let (donor_seq, dst_seq) = (engine.slots[0].seq, engine.slots[1].seq);
+                serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 8);
+                serve_on(&mut engine, &*model, &tok, 1, prompt.clone(), 8);
+                let shared_rows = engine
+                    .cache
+                    .alloc()
+                    .kv_seq_slot(dst_seq)
+                    .expect("slot 1 has a run")
+                    .shared
+                    .rows;
+                let shared_cells = engine.cache.alloc().kv_arena_stats().shared_cells;
+                let cows_before = engine.cow_stats().0;
+                let donor_before = kv_rows_of(&mut engine, donor_seq);
+                let answer = serve_on(&mut engine, &*model, &tok, 1, diverging.clone(), 8);
+                let cows = engine.cow_stats().0 - cows_before;
+                // The donor is still a live run — a reclaim would make the byte check
+                // vacuous rather than wrong, which is the kind of silent pass this
+                // assertion exists to prevent.
+                assert!(engine.cache.alloc().kv_seq_slot(donor_seq).is_some());
+                assert_eq!(
+                    kv_rows_of(&mut engine, donor_seq),
+                    donor_before,
+                    "the diverging request wrote through the shared prefix"
+                );
+                let dst_rows = kv_rows_of(&mut engine, dst_seq);
+                if !share {
+                    std::env::remove_var("MINFER_NO_KV_SHARE");
+                }
+                (
+                    answer,
+                    shared_rows,
+                    shared_cells,
+                    cows,
+                    donor_before,
+                    dst_rows,
+                )
+            };
+
+        let (shared_answer, shared_rows, shared_cells, cows, donor_rows, dst_a) = scenario(true);
+        // Two identical share runs must agree byte for byte — the property that
+        // caught the decode-position bug this gate first ran into: a skipped
+        // position left an unwritten row that attention read, so the answer
+        // depended on the arena's history.
+        let (shared_answer2, _, _, _, _, dst_b) = scenario(true);
+        assert_eq!(shared_answer, shared_answer2, "two share runs must agree");
+        assert_eq!(dst_a, dst_b, "two share runs must write the same rows");
+        assert!(
+            shared_rows > 3,
+            "slot 1 must read {shared_rows} rows in place for the gate to mean anything"
+        );
+        assert!(!donor_rows.is_empty(), "the donor must hold rows");
+        // (1) The mechanism ran, (2) the rows really are shared in place on this
+        // device (before S4 a CUDA run copied them), and (3) the donor survived it.
         assert!(cows > 0, "the store must have copied a private row");
-        assert!(cells > 0, "and the copy has to have moved rows");
-        // The donor is still a live run — a reclaim would make the byte check below
-        // vacuous rather than wrong, which is exactly the kind of silent pass this
-        // assertion exists to prevent.
-        assert!(engine.cache.alloc().kv_seq_slot(donor_seq).is_some());
-        assert_eq!(
-            kv_rows_of(&mut engine, donor_seq),
-            donor_before,
-            "the diverging request wrote through the shared prefix"
+        assert!(
+            shared_cells >= shared_rows,
+            "the prefix was copied, not shared, on device {}",
+            model.device().name()
         );
 
-        // The answer is the private run's: the same request where there is nothing
-        // to share with.
-        let mut alone = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
-        let solo = serve_on(&mut alone, &*model, &tok, 0, diverging, 8);
+        let (copied_answer, copied_rows, copied_cells, copied_cows, _, _) = scenario(false);
+        assert_eq!(copied_rows, 0, "MINFER_NO_KV_SHARE must not share");
+        assert_eq!(copied_cells, 0);
+        assert_eq!(copied_cows, 0);
+        // (4) And the answers agree: the shared run holds the same bytes in the same
+        // order as the copied one, so a copy-on-write that moved the wrong rows (or
+        // did not move them at all) shows up here.
         assert_eq!(
-            cow, solo,
-            "the copy-on-written run must answer like a private one"
+            shared_answer, copied_answer,
+            "the shared run must answer like the shape-matched copied one"
         );
     }
 
@@ -1309,10 +1374,29 @@ mod tests {
                     .unwrap_or_else(|| panic!("no cell for sequence {seq} position {p}"))
             })
             .collect();
+        // The region is over-allocated as f32 slots, but an f16 cache stores a row
+        // as `nkt / 2` f32 slots (`store_kv_f16` indexes halves), so the window a
+        // position covers is half as wide there. Reading it at the f32 width mixed
+        // two rows per window and made this snapshot report differences in cells
+        // nothing had written.
+        let half_width = {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::kv_cache_is_f16()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        };
         let mut out: Vec<Vec<f32>> = Vec::new();
         let mut layer = 0;
         while let Some((k, v)) = engine.cache.alloc().copy_kv_to_cpu(layer) {
-            let row = k.len() / n_ctx;
+            let row = if half_width {
+                (k.len() / n_ctx / 2).max(1)
+            } else {
+                k.len() / n_ctx
+            };
             for &cell in &cells {
                 let at = cell * row;
                 out.push(k[at..at + row].to_vec());
