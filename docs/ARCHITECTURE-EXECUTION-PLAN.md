@@ -34,8 +34,11 @@ tickets below that *do* have one are exactly the open list in the
 [tracker](https://github.com/yusiwen/minfer/issues). Doc debt and test health are filed
 the same way: [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`
 staleness), [#63](https://github.com/yusiwen/minfer/issues/63) (CI does not enforce the
-docs build), [#82](https://github.com/yusiwen/minfer/issues/82) (three ignored
-real-model tests fail on master).
+docs build). Test health was [#82](https://github.com/yusiwen/minfer/issues/82) — the three
+`#[ignore]`d real-model tests that failed on `master` — and it is **closed**: two were
+writing into a directory nothing created, and the third asserted a *model behaviour* (the
+greedy 0.5B stopping on EOG within 16 tokens) instead of the engine's rule that ties
+`need_insert_eot` to the stream.
 
 ## 0. Decisions already taken
 
