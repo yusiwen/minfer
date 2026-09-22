@@ -35,6 +35,8 @@ pub mod json;
 pub mod kvcache;
 /// KV cache storage format + its `MINFER_CACHE_TYPE` gate (C4).
 pub mod kvformat;
+/// KV session save/restore container (C5).
+pub mod kvsession;
 #[cfg(target_os = "macos")]
 pub mod metal_backend;
 pub mod ops;

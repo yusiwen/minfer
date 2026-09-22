@@ -1,0 +1,860 @@
+//! KV session save and restore (Phase C / ticket C5).
+//!
+//! A session's KV rows and run table live only in memory (`KvCache`), so a restart
+//! has to re-prefill everything. This module is the **container**: a versioned,
+//! checksummed file holding one header, one K/V blob per layer, and the arena's
+//! bookkeeping ([`KvSessionState`]).
+//!
+//! Design choices worth naming:
+//!
+//! - **Everything a reader needs to validate comes first.** The header carries the
+//!   format, the backend and the shape, so a file from another model, another
+//!   `n_ctx`, another KV format or another device is rejected before a single byte
+//!   is applied.
+//! - **Validate before apply.** [`verify`] walks the whole file (header, payload
+//!   lengths, bookkeeping, checksum, and that nothing follows it) without touching
+//!   an arena; the allocator only then runs the applying pass. A truncated or
+//!   corrupted file therefore cannot leave a half-restored cache behind.
+//! - **Truncation is caught by construction**, not by a checksum alone: every read
+//!   is exact against a length the header fixes, so a short file fails with
+//!   "truncated" wherever it stops, and `read_exact` cannot silently stop early.
+//!
+//! The bytes travel as f32 *words* (the pool's unit), exactly as the backend holds
+//! them — a packed Q8_0 region is words too, which is why the format is recorded
+//! and checked rather than inferred.
+//!
+//! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C5).
+
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+use super::kvcache::{KvSessionState, SeqId, SeqSlot, SharedPrefix};
+use super::kvformat::KvFormat;
+use super::Backend;
+
+/// File magic, first bytes of every session file.
+pub const MAGIC: [u8; 8] = *b"MINFERKV";
+/// Container version. A reader refuses anything else, loudly.
+pub const VERSION: u32 = 1;
+/// Flags bit 0: the regions are packed Q8_0 cells (C4).
+const FLAG_PACKED: u32 = 1 << 0;
+
+/// What a reader must check before it applies anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvSessionHeader {
+    pub version: u32,
+    pub format: KvFormat,
+    pub backend: Backend,
+    pub n_layer: usize,
+    pub n_ctx: usize,
+    /// Logical row width (`n_kv_embd`) — what the store's K/V input means.
+    pub n_embd: usize,
+    /// Stored f32 words per cell (C4: a packed Q8_0 cell is narrower per element).
+    pub row_elems: usize,
+}
+
+impl KvSessionHeader {
+    /// Bytes one layer's K and V regions occupy together.
+    pub fn layer_words(&self) -> usize {
+        self.n_ctx * self.row_elems
+    }
+}
+
+/// What the caller knows about the arena a file must describe (C5): the backend
+/// the layers will live on, the context length, and the model's logical KV row
+/// width. A header that disagrees is refused before anything is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSessionExpect {
+    pub backend: Backend,
+    pub n_ctx: usize,
+    pub n_embd: usize,
+}
+
+/// What a save wrote or a load read (the caller logs it; the gates assert it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvSessionReport {
+    pub layers: usize,
+    pub cells: usize,
+    pub bytes: u64,
+    /// Highest written position — where the resumed session continues.
+    pub written: usize,
+}
+
+// ---- FNV-1a, the container's integrity check ---------------------------------
+//
+// Not cryptographic: it catches a truncated or bit-flipped file, which is what
+// "rejected loudly" means here. A hash that needs a dependency for a few hundred
+// MB/s of startup I/O is not worth it.
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn hash_bytes(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn tag_of(backend: Backend) -> u32 {
+    match backend {
+        Backend::CPU => 0,
+        Backend::Metal => 1,
+        Backend::Cuda => 2,
+    }
+}
+
+fn backend_of_tag(tag: u32) -> Result<Backend, String> {
+    match tag {
+        0 => Ok(Backend::CPU),
+        1 => Ok(Backend::Metal),
+        2 => Ok(Backend::Cuda),
+        other => Err(format!(
+            "KV session: unknown backend tag {other} (this file was written by a newer build?)"
+        )),
+    }
+}
+
+// ---- writing ----------------------------------------------------------------
+
+struct Sink<W: Write> {
+    w: W,
+    hash: u64,
+    written: u64,
+}
+
+impl<W: Write> Sink<W> {
+    fn new(w: W) -> Self {
+        Self {
+            w,
+            hash: FNV_OFFSET,
+            written: 0,
+        }
+    }
+
+    fn bytes(&mut self, b: &[u8]) -> Result<(), String> {
+        self.w
+            .write_all(b)
+            .map_err(|e| format!("KV session write: {e}"))?;
+        hash_bytes(&mut self.hash, b);
+        self.written += b.len() as u64;
+        Ok(())
+    }
+
+    fn u32(&mut self, v: u32) -> Result<(), String> {
+        self.bytes(&v.to_le_bytes())
+    }
+
+    fn u64(&mut self, v: u64) -> Result<(), String> {
+        self.bytes(&v.to_le_bytes())
+    }
+
+    fn words(&mut self, w: &[f32]) -> Result<(), String> {
+        // Chunked so a multi-hundred-MB region does not need a second copy, and
+        // hashed word by word in the same order the reader will hash it.
+        const CHUNK: usize = 1 << 14;
+        let mut buf = [0u8; CHUNK * 4];
+        for chunk in w.chunks(CHUNK) {
+            for (i, &x) in chunk.iter().enumerate() {
+                buf[i * 4..(i + 1) * 4].copy_from_slice(&x.to_bits().to_le_bytes());
+            }
+            self.bytes(&buf[..chunk.len() * 4])?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<u64, String> {
+        let sum = self.hash;
+        self.w
+            .write_all(&sum.to_le_bytes())
+            .map_err(|e| format!("KV session write: {e}"))?;
+        self.w
+            .flush()
+            .map_err(|e| format!("KV session flush: {e}"))?;
+        Ok(self.written + 8)
+    }
+}
+
+/// Streaming writer: create it, hand it one layer at a time, then finish with the
+/// arena's bookkeeping. Nothing is buffered whole in memory.
+pub struct KvSessionWriter {
+    sink: Sink<BufWriter<File>>,
+    header: KvSessionHeader,
+    layers: usize,
+}
+
+impl KvSessionWriter {
+    pub fn create(path: &Path, header: &KvSessionHeader) -> Result<Self, String> {
+        let file = File::create(path)
+            .map_err(|e| format!("KV session: cannot create {}: {e}", path.display()))?;
+        let mut sink = Sink::new(BufWriter::new(file));
+        sink.bytes(&MAGIC)?;
+        sink.u32(header.version)?;
+        let flags = if header.format.is_packed() {
+            FLAG_PACKED
+        } else {
+            0
+        };
+        sink.u32(flags)?;
+        sink.u32(tag_of(header.backend))?;
+        sink.u32(header.n_layer as u32)?;
+        sink.u32(header.n_ctx as u32)?;
+        sink.u32(header.n_embd as u32)?;
+        sink.u32(header.row_elems as u32)?;
+        Ok(Self {
+            sink,
+            header: header.clone(),
+            layers: 0,
+        })
+    }
+
+    /// One layer's two regions, in pool words.
+    pub fn layer(&mut self, layer: usize, k: &[f32], v: &[f32]) -> Result<(), String> {
+        let want = self.header.layer_words();
+        if k.len() != want || v.len() != want {
+            return Err(format!(
+                "KV session: layer {layer} has {} K / {} V words, expected {want} each \
+                 (n_ctx {} x row_elems {})",
+                k.len(),
+                v.len(),
+                self.header.n_ctx,
+                self.header.row_elems
+            ));
+        }
+        if self.layers >= self.header.n_layer {
+            return Err(format!(
+                "KV session: more than {} layers were written",
+                self.header.n_layer
+            ));
+        }
+        self.sink.u32(layer as u32)?;
+        self.sink.u32(k.len() as u32)?;
+        self.sink.u32(v.len() as u32)?;
+        self.sink.words(k)?;
+        self.sink.words(v)?;
+        self.layers += 1;
+        Ok(())
+    }
+
+    /// Write the bookkeeping and the checksum. Refuses a short file: a container
+    /// that claims `n_layer` and holds fewer is corrupt by construction.
+    pub fn finish(self, state: &KvSessionState) -> Result<KvSessionReport, String> {
+        if self.layers != self.header.n_layer {
+            return Err(format!(
+                "KV session: the header declares {} layers but {} were written",
+                self.header.n_layer, self.layers
+            ));
+        }
+        if state.n_ctx != self.header.n_ctx {
+            return Err(format!(
+                "KV session: the bookkeeping describes {}-cell runs, the header {}",
+                state.n_ctx, self.header.n_ctx
+            ));
+        }
+        let layers = self.layers;
+        let cells = state.n_ctx;
+        let written = state.written();
+        let mut sink = self.sink;
+        write_state(&mut sink, state)?;
+        let bytes = sink.finish()?;
+        Ok(KvSessionReport {
+            layers,
+            cells,
+            bytes,
+            written,
+        })
+    }
+}
+
+fn write_state(sink: &mut Sink<impl Write>, st: &KvSessionState) -> Result<(), String> {
+    sink.u32(st.identity as u32)?;
+    sink.u32(st.n_ctx as u32)?;
+    sink.u32(st.seqs.len() as u32)?;
+    for (seq, slot) in &st.seqs {
+        sink.u32(*seq)?;
+        sink.u32(slot.start as u32)?;
+        sink.u32(slot.cap as u32)?;
+        sink.u32(slot.shared.cell as u32)?;
+        sink.u32(slot.shared.rows as u32)?;
+        sink.u32(slot.written as u32)?;
+    }
+    sink.u32(st.spans.len() as u32)?;
+    for (seq, spans) in &st.spans {
+        sink.u32(*seq)?;
+        sink.u32(spans.len() as u32)?;
+        for &(base, cell, len) in spans {
+            sink.u32(base as u32)?;
+            sink.u32(cell as u32)?;
+            sink.u32(len as u32)?;
+        }
+    }
+    sink.u32(st.layers.len() as u32)?;
+    for ls in &st.layers {
+        sink.u32(ls.layer as u32)?;
+        sink.u32(ls.n_used as u32)?;
+        sink.u32(ls.owner.len() as u32)?;
+        for &o in &ls.owner {
+            sink.u32(o)?;
+        }
+    }
+    sink.u64(st.defrags)?;
+    sink.u64(st.cells_moved)?;
+    sink.u64(st.cows)?;
+    sink.u64(st.cow_cells)?;
+    Ok(())
+}
+
+// ---- reading ----------------------------------------------------------------
+
+struct Source<R: Read> {
+    r: R,
+    hash: u64,
+    read: u64,
+}
+
+impl<R: Read> Source<R> {
+    fn new(r: R) -> Self {
+        Self {
+            r,
+            hash: FNV_OFFSET,
+            read: 0,
+        }
+    }
+
+    fn bytes(&mut self, n: usize, what: &str) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; n];
+        self.r.read_exact(&mut buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                format!(
+                    "KV session: truncated — the file ends inside {what} (wanted {n} more bytes)"
+                )
+            } else {
+                format!("KV session read: {e}")
+            }
+        })?;
+        hash_bytes(&mut self.hash, &buf);
+        self.read += n as u64;
+        Ok(buf)
+    }
+
+    fn u32(&mut self, what: &str) -> Result<u32, String> {
+        let b = self.bytes(4, what)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self, what: &str) -> Result<u64, String> {
+        let b = self.bytes(8, what)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b);
+        Ok(u64::from_le_bytes(a))
+    }
+
+    fn words(&mut self, n: usize, what: &str) -> Result<Vec<f32>, String> {
+        const CHUNK: usize = 1 << 14;
+        let mut out = Vec::with_capacity(n);
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(CHUNK);
+            let b = self.bytes(take * 4, what)?;
+            for w in b.chunks_exact(4) {
+                out.push(f32::from_bits(u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+            }
+            left -= take;
+        }
+        Ok(out)
+    }
+
+    /// Read the trailing checksum and compare, then require end-of-file.
+    fn finish(mut self, what: &str) -> Result<u64, String> {
+        let want = self.hash;
+        let mut sum = [0u8; 8];
+        self.r.read_exact(&mut sum).map_err(|_| {
+            format!("KV session: truncated — the file ends before the checksum of {what}")
+        })?;
+        let got = u64::from_le_bytes(sum);
+        if got != want {
+            return Err(format!(
+                "KV session: checksum mismatch ({got:#018x} in the file, {want:#018x} computed) \
+                 — the file is corrupt"
+            ));
+        }
+        let mut extra = [0u8; 1];
+        match self.r.read(&mut extra) {
+            Ok(0) => Ok(self.read + 8),
+            Ok(_) => Err("KV session: trailing bytes after the checksum".into()),
+            Err(e) => Err(format!("KV session read: {e}")),
+        }
+    }
+}
+
+/// Streaming reader: `open` validates the header, `next_layer` yields one layer at
+/// a time, `finish` returns the bookkeeping after checking the checksum.
+pub struct KvSessionReader {
+    src: Source<BufReader<File>>,
+    header: KvSessionHeader,
+    layers: usize,
+}
+
+impl KvSessionReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = File::open(path)
+            .map_err(|e| format!("KV session: cannot open {}: {e}", path.display()))?;
+        let mut src = Source::new(BufReader::new(file));
+        let magic = src.bytes(8, "the magic")?;
+        if magic != MAGIC {
+            return Err(format!(
+                "KV session: {} does not start with the {}-byte magic {:?} (it is not a minfer \
+                 KV session file)",
+                path.display(),
+                MAGIC.len(),
+                String::from_utf8_lossy(&MAGIC)
+            ));
+        }
+        let version = src.u32("the version")?;
+        if version != VERSION {
+            return Err(format!(
+                "KV session: version {version} cannot be read by this build (version {VERSION}); \
+                 refusing rather than guessing the layout"
+            ));
+        }
+        let flags = src.u32("the flags")?;
+        if flags & !FLAG_PACKED != 0 {
+            return Err(format!(
+                "KV session: unknown flags {flags:#x} (this file was written by a newer build?)"
+            ));
+        }
+        let backend = backend_of_tag(src.u32("the backend tag")?)?;
+        let n_layer = src.u32("the layer count")? as usize;
+        let n_ctx = src.u32("n_ctx")? as usize;
+        let n_embd = src.u32("n_kv_embd")? as usize;
+        let row_elems = src.u32("the cell width")? as usize;
+        let format = if flags & FLAG_PACKED != 0 {
+            KvFormat::Q8_0
+        } else {
+            KvFormat::F32
+        };
+        if n_layer == 0 || n_ctx == 0 || n_embd == 0 || row_elems == 0 {
+            return Err(format!(
+                "KV session: the header declares {n_layer} layers of {n_ctx} cells x {row_elems} \
+                 words ({n_embd} elements/cell) — a zero-sized arena is not a session"
+            ));
+        }
+        // The packed flag and the cell width must agree: a file claiming packed
+        // cells with an f32-shaped width (or the reverse) would be applied as the
+        // wrong layout, which is exactly the silent corruption the format check is
+        // for.
+        let expect_row = format.row_elems(n_embd);
+        if row_elems != expect_row {
+            return Err(format!(
+                "KV session: the header says {} with {row_elems} words per {n_embd}-element cell, \
+                 but that format packs a cell into {expect_row}",
+                format.name()
+            ));
+        }
+        Ok(Self {
+            src,
+            header: KvSessionHeader {
+                version,
+                format,
+                backend,
+                n_layer,
+                n_ctx,
+                n_embd,
+                row_elems,
+            },
+            layers: 0,
+        })
+    }
+
+    pub fn header(&self) -> &KvSessionHeader {
+        &self.header
+    }
+
+    /// The next layer's `(index, K words, V words)`, or `None` once all layers the
+    /// header declared have been read.
+    pub fn next_layer(&mut self) -> Result<Option<(usize, Vec<f32>, Vec<f32>)>, String> {
+        if self.layers == self.header.n_layer {
+            return Ok(None);
+        }
+        let what = format!("layer {}", self.layers);
+        let layer = self.src.u32(&format!("{what}: its index"))? as usize;
+        let kw = self.src.u32(&format!("{what}: its K length"))? as usize;
+        let vw = self.src.u32(&format!("{what}: its V length"))? as usize;
+        let want = self.header.layer_words();
+        if kw != want || vw != want {
+            return Err(format!(
+                "KV session: layer {layer} declares {kw} K / {vw} V words, expected {want} \
+                 ({} x {})",
+                self.header.n_ctx, self.header.row_elems
+            ));
+        }
+        let k = self.src.words(kw, &format!("{what}: its K rows"))?;
+        let v = self.src.words(vw, &format!("{what}: its V rows"))?;
+        self.layers += 1;
+        Ok(Some((layer, k, v)))
+    }
+
+    /// Read the bookkeeping and the checksum. Everything before this is validated
+    /// against the header, so a state that arrives here is structurally sound.
+    pub fn finish(mut self) -> Result<(KvSessionState, KvSessionReport), String> {
+        if self.layers != self.header.n_layer {
+            return Err(format!(
+                "KV session: the header declares {} layers, the file holds {}",
+                self.header.n_layer, self.layers
+            ));
+        }
+        let state = read_state(&mut self.src, &self.header)?;
+        let layers = self.layers;
+        let cells = self.header.n_ctx;
+        let written = state.written();
+        let bytes = self.src.finish("the bookkeeping")?;
+        Ok((
+            state,
+            KvSessionReport {
+                layers,
+                cells,
+                bytes,
+                written,
+            },
+        ))
+    }
+}
+
+fn read_state(
+    src: &mut Source<impl Read>,
+    header: &KvSessionHeader,
+) -> Result<KvSessionState, String> {
+    let identity = src.u32("the identity flag")? != 0;
+    let n_ctx = src.u32("the bookkeeping's n_ctx")? as usize;
+    if n_ctx != header.n_ctx {
+        return Err(format!(
+            "KV session: the bookkeeping describes {n_ctx}-cell runs, the header {}",
+            header.n_ctx
+        ));
+    }
+    let n_seq = src.u32("the sequence count")? as usize;
+    let mut seqs = Vec::with_capacity(n_seq);
+    for i in 0..n_seq {
+        let what = format!("sequence {i}");
+        let seq = src.u32(&format!("{what}: its id"))? as SeqId;
+        let start = src.u32(&format!("{what}: its start"))? as usize;
+        let cap = src.u32(&format!("{what}: its capacity"))? as usize;
+        let cell = src.u32(&format!("{what}: its shared prefix cell"))? as usize;
+        let rows = src.u32(&format!("{what}: its shared prefix rows"))? as usize;
+        let written = src.u32(&format!("{what}: its written extent"))? as usize;
+        seqs.push((
+            seq,
+            SeqSlot {
+                start,
+                cap,
+                shared: SharedPrefix { cell, rows },
+                written,
+            },
+        ));
+    }
+    let n_spans = src.u32("the span-list count")? as usize;
+    let mut spans = Vec::with_capacity(n_spans);
+    for i in 0..n_spans {
+        let what = format!("span list {i}");
+        let seq = src.u32(&format!("{what}: its sequence"))? as SeqId;
+        let count = src.u32(&format!("{what}: its length"))? as usize;
+        let mut v = Vec::with_capacity(count);
+        for j in 0..count {
+            let base = src.u32(&format!("{what} entry {j}: position base"))? as usize;
+            let cell = src.u32(&format!("{what} entry {j}: first cell"))? as usize;
+            let len = src.u32(&format!("{what} entry {j}: length"))? as usize;
+            v.push((base, cell, len));
+        }
+        spans.push((seq, v));
+    }
+    let n_layers = src.u32("the bookkeeping's layer count")? as usize;
+    let mut layers = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        let what = format!("bookkeeping layer {i}");
+        let layer = src.u32(&format!("{what}: its index"))? as usize;
+        let n_used = src.u32(&format!("{what}: its written extent"))? as usize;
+        let owners = src.u32(&format!("{what}: its owner-table length"))? as usize;
+        if owners != header.n_ctx {
+            return Err(format!(
+                "KV session: layer {layer} carries a {owners}-entry owner table for a {}-cell \
+                 arena",
+                header.n_ctx
+            ));
+        }
+        let mut owner = Vec::with_capacity(owners);
+        for j in 0..owners {
+            owner.push(src.u32(&format!("{what} owner {j}"))?);
+        }
+        layers.push(super::kvcache::KvLayerSession {
+            layer,
+            n_used,
+            owner,
+        });
+    }
+    let defrags = src.u64("the defrag counter")?;
+    let cells_moved = src.u64("the cells-moved counter")?;
+    let cows = src.u64("the copy-on-write counter")?;
+    let cow_cells = src.u64("the copied-cells counter")?;
+    Ok(KvSessionState {
+        identity,
+        n_ctx,
+        seqs,
+        spans,
+        layers,
+        defrags,
+        cells_moved,
+        cows,
+        cow_cells,
+    })
+}
+
+/// Walk a session file end to end **without applying anything** — the pass that
+/// makes a failed load a no-op. Returns the header it validated.
+pub fn verify(path: &Path) -> Result<KvSessionHeader, String> {
+    let mut r = KvSessionReader::open(path)?;
+    let header = r.header().clone();
+    while let Some((_, k, v)) = r.next_layer()? {
+        // Dropped: the point of this pass is the lengths, the state and the
+        // checksum, in file order.
+        let _ = (k, v);
+    }
+    let (_state, _report) = r.finish()?;
+    Ok(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::kvcache::{FREE, SEQ_MAIN};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "minfer-kvsession-{}-{name}.bin",
+            std::process::id()
+        ));
+        p
+    }
+
+    fn header(n_layer: usize, n_ctx: usize, n_embd: usize, format: KvFormat) -> KvSessionHeader {
+        KvSessionHeader {
+            version: VERSION,
+            format,
+            backend: Backend::CPU,
+            n_layer,
+            n_ctx,
+            n_embd,
+            row_elems: format.row_elems(n_embd),
+        }
+    }
+
+    fn state(n_ctx: usize) -> KvSessionState {
+        KvSessionState {
+            identity: true,
+            n_ctx,
+            seqs: vec![(
+                SEQ_MAIN,
+                SeqSlot {
+                    start: 0,
+                    cap: n_ctx,
+                    shared: SharedPrefix::default(),
+                    written: 3,
+                },
+            )],
+            spans: vec![(SEQ_MAIN, vec![(0, 0, 3)])],
+            layers: vec![
+                crate::graph::kvcache::KvLayerSession {
+                    layer: 0,
+                    n_used: 3,
+                    owner: {
+                        let mut o = vec![FREE; n_ctx];
+                        o[0] = SEQ_MAIN;
+                        o[1] = SEQ_MAIN;
+                        o[2] = SEQ_MAIN;
+                        o
+                    },
+                },
+                crate::graph::kvcache::KvLayerSession {
+                    layer: 1,
+                    n_used: 3,
+                    owner: vec![SEQ_MAIN; n_ctx],
+                },
+            ],
+            defrags: 1,
+            cells_moved: 7,
+            cows: 2,
+            cow_cells: 5,
+        }
+    }
+
+    fn write_session(path: &Path, h: &KvSessionHeader, st: &KvSessionState) -> KvSessionReport {
+        let mut w = KvSessionWriter::create(path, h).expect("create");
+        for layer in 0..h.n_layer {
+            let k: Vec<f32> = (0..h.layer_words())
+                .map(|i| (i as f32) * 0.5 + layer as f32)
+                .collect();
+            let v: Vec<f32> = (0..h.layer_words())
+                .map(|i| 1.0 / (i as f32 + 1.0))
+                .collect();
+            w.layer(layer, &k, &v).expect("layer");
+        }
+        w.finish(st).expect("finish")
+    }
+
+    #[test]
+    fn a_session_round_trips_including_the_run_table() {
+        let path = temp_path("roundtrip");
+        let h = header(2, 16, 32, KvFormat::F32);
+        let st = state(16);
+        let report = write_session(&path, &h, &st);
+        assert_eq!(report.layers, 2);
+        assert_eq!(report.cells, 16);
+        assert_eq!(report.written, 3);
+        assert_eq!(report.bytes, std::fs::metadata(&path).unwrap().len());
+
+        let mut r = KvSessionReader::open(&path).expect("open");
+        assert_eq!(r.header(), &h);
+        let mut seen = Vec::new();
+        while let Some((layer, k, v)) = r.next_layer().expect("layer") {
+            assert_eq!(k.len(), h.layer_words());
+            assert_eq!(v.len(), h.layer_words());
+            assert_eq!(k[1], 0.5 + layer as f32);
+            seen.push(layer);
+        }
+        assert_eq!(seen, vec![0, 1]);
+        let (read_state, r2) = r.finish().expect("finish");
+        assert_eq!(read_state, st);
+        assert_eq!(r2, report);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_packed_session_records_its_cell_width() {
+        let path = temp_path("packed");
+        let h = header(1, 8, 128, KvFormat::Q8_0);
+        assert_eq!(h.row_elems, 34);
+        let st = KvSessionState {
+            layers: vec![crate::graph::kvcache::KvLayerSession {
+                layer: 0,
+                n_used: 1,
+                owner: vec![SEQ_MAIN; 8],
+            }],
+            ..state(8)
+        };
+        write_session(&path, &h, &st);
+        let r = KvSessionReader::open(&path).expect("open");
+        assert_eq!(r.header().format, KvFormat::Q8_0);
+        assert!(r.header().format.is_packed());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_truncated_file_is_refused_and_says_so() {
+        let path = temp_path("truncated");
+        let h = header(2, 16, 32, KvFormat::F32);
+        write_session(&path, &h, &state(16));
+        let full = std::fs::read(&path).unwrap();
+        // Cut in the middle of the payload: the reader must fail on a short read,
+        // not stop early with a half-restored arena.
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+        let err = verify(&path).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+        assert!(err.contains("the file ends"), "{err}");
+        // The streaming walk fails in the same place — the header itself fits, so
+        // this is the payload read refusing, which is why `kv_load` runs `verify`
+        // before it applies anything.
+        let mut r = KvSessionReader::open(&path).expect("the header survives a cut in the payload");
+        let err = loop {
+            match r.next_layer() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a truncated payload must not read to the end"),
+                Err(e) => break e,
+            }
+        };
+        assert!(err.contains("truncated"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_version_mismatch_is_refused_loudly() {
+        let path = temp_path("version");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = KvSessionReader::open(&path).err().expect("must be refused");
+        assert!(err.contains("version"), "{err}");
+        assert!(err.contains(&format!("version {}", VERSION)), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_flipped_byte_is_caught_by_the_checksum() {
+        let path = temp_path("checksum");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() / 2; // inside the payload
+        bytes[at] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = verify(&path).unwrap_err();
+        assert!(err.contains("checksum mismatch"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_checksum_are_refused() {
+        let path = temp_path("trailing");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = verify(&path).unwrap_err();
+        assert!(err.contains("trailing bytes"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_session_is_refused() {
+        let path = temp_path("magic");
+        std::fs::write(
+            &path,
+            b"not a session at all, but long enough to read the magic",
+        )
+        .unwrap();
+        let err = KvSessionReader::open(&path).err().expect("must be refused");
+        assert!(err.contains("magic"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_header_whose_flag_and_width_disagree_is_refused() {
+        let path = temp_path("flagwidth");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Claim packed cells while keeping the f32-shaped width: the applying pass
+        // would then dequantize f32 rows.
+        let flags = FLAG_PACKED.to_le_bytes();
+        bytes[12..16].copy_from_slice(&flags);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = KvSessionReader::open(&path).err().expect("must be refused");
+        assert!(err.contains("packs a cell into"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_writer_that_is_short_a_layer_refuses_to_finish() {
+        let path = temp_path("short");
+        let h = header(2, 8, 32, KvFormat::F32);
+        let mut w = KvSessionWriter::create(&path, &h).expect("create");
+        w.layer(0, &vec![0.0; h.layer_words()], &vec![0.0; h.layer_words()])
+            .expect("layer 0");
+        let err = w.finish(&state(8)).unwrap_err();
+        assert!(err.contains("2 layers but 1 were written"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+}
