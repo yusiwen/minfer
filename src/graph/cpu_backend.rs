@@ -12,6 +12,7 @@ use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
 use super::backend::Backend;
+use super::kvformat::{self, KvFormat};
 use super::ops::{FusedOp, NodeMeta, Op};
 use super::{BufRef, CNode, DType};
 
@@ -20,6 +21,14 @@ pub struct CpuBackend {
     buffers: Vec<Vec<f32>>,
     free: Vec<usize>,
     weights: HashMap<String, Tensor>,
+    /// C4: the KV storage format this backend's kernels speak, snapshotted from the
+    /// process-wide policy at construction (like CUDA's `kv_f16`). A packed region
+    /// makes the store quantize and the attention read dequantize.
+    kv_format: KvFormat,
+    /// Reusable f32 scratch the packed read path dequantizes a query window into
+    /// (one per region). Kept across calls: it is one window, not the whole cache.
+    kv_scratch_k: Vec<f32>,
+    kv_scratch_v: Vec<f32>,
 }
 
 impl CpuBackend {
@@ -28,7 +37,21 @@ impl CpuBackend {
             buffers: Vec::new(),
             free: Vec::new(),
             weights: HashMap::new(),
+            kv_format: super::kvformat::kv_format(),
+            kv_scratch_k: Vec::new(),
+            kv_scratch_v: Vec::new(),
         }
+    }
+
+    /// C4: the KV format this backend was built with (`MINFER_CACHE_TYPE` policy).
+    pub fn kv_format(&self) -> KvFormat {
+        self.kv_format
+    }
+
+    /// Device tests exercise one layout explicitly instead of through the process
+    /// environment (`cuda_backend` does the same with `set_kv_f16_for_test`).
+    pub fn set_kv_format_for_test(&mut self, format: KvFormat) {
+        self.kv_format = format;
     }
 
     /// Register a weight tensor by name (Phase 6 wires this from the model).
@@ -160,7 +183,14 @@ impl Backend for CpuBackend {
             if k_id != out_buf.id {
                 return Err("KV store out buffer must be the K region".into());
             }
-            let nkt = node.out_shape[0];
+            // C4: the region's cell width comes from the meta (`row_elems`, packed
+            // under a Q8_0 policy); the node's shapes stay logical, so `nt` is the K
+            // input's logical row count either way.
+            let nkt = match &node.meta {
+                NodeMeta::Kvcache(m) => m.n_embd,
+                other => return Err(format!("KV store node missing KvcacheMeta: {other:?}")),
+            };
+            let row_elems = self.kv_format.row_elems(nkt);
             let n_ctx = node.out_shape[1];
             let nt = in_bufs[0].len / nkt;
             let pos: Vec<usize> = self
@@ -179,14 +209,29 @@ impl Backend for CpuBackend {
                 let (before, after) = self.buffers.split_at_mut(v_id);
                 (&mut before[k_id], &mut after[0])
             };
+            let packed = self.kv_format.is_packed();
             for t in 0..nt {
                 let p = pos[t];
                 if p >= n_ctx {
                     return Err(format!("KV store position {p} >= n_ctx {n_ctx}"));
                 }
-                let ks = p * nkt;
-                k_dst[ks..ks + nkt].copy_from_slice(&k_src[t * nkt..(t + 1) * nkt]);
-                v_dst[ks..ks + nkt].copy_from_slice(&v_src[t * nkt..(t + 1) * nkt]);
+                let ks = p * row_elems;
+                let src = t * nkt;
+                if packed {
+                    kvformat::pack_q8_0_cell(
+                        &mut k_dst[ks..ks + row_elems],
+                        nkt,
+                        &k_src[src..src + nkt],
+                    );
+                    kvformat::pack_q8_0_cell(
+                        &mut v_dst[ks..ks + row_elems],
+                        nkt,
+                        &v_src[src..src + nkt],
+                    );
+                } else {
+                    k_dst[ks..ks + row_elems].copy_from_slice(&k_src[src..src + nkt]);
+                    v_dst[ks..ks + row_elems].copy_from_slice(&v_src[src..src + nkt]);
+                }
             }
             return Ok(());
         }
@@ -430,6 +475,7 @@ impl Backend for CpuBackend {
                 };
                 let nt = node.out_shape[1];
                 let nkt = meta.nkt;
+                let row_elems = self.kv_format.row_elems(nkt);
                 // K and V are separate persistent regions per layer
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
@@ -443,13 +489,45 @@ impl Backend for CpuBackend {
                 } else {
                     &after[v_id - out_buf.id - 1]
                 };
-                let n_ctx = k_slice.len() / nkt;
+                // C4: the region holds `n_ctx * row_elems` words, not `n_ctx * nkt`.
+                let n_ctx = k_slice.len() / row_elems;
                 // E1/C8b S2: the allowed cells are an explicit input, not a bound
                 // derived from `positions` — that is what lets a batch hold several
                 // sequences, and (S2) what lets one query's window be a list of runs.
                 // The allocator resolved it from the cell store; here it is only
                 // validated and decoded.
                 let (runs, off) = decode_window(ins[3], nt, n_ctx)?;
+                if self.kv_format.is_packed() {
+                    // C4 S1: dequantize the union of this batch's windows into the
+                    // reusable scratch and run the unchanged f32 kernel over it. The
+                    // runs stay cell-indexed, only rebased to the scratch's start;
+                    // the fused Q8_0 dot that removes this pass is C4 S2 (issue #87).
+                    let lo = runs.iter().map(|r| r.0).min().unwrap_or(0);
+                    let hi = runs.iter().map(|r| r.0 + r.1).max().unwrap_or(lo);
+                    let rows = hi.saturating_sub(lo);
+                    self.kv_scratch_k.resize(rows * nkt, 0.0);
+                    self.kv_scratch_v.resize(rows * nkt, 0.0);
+                    kvformat::unpack_q8_0_cells(k_slice, nkt, lo, rows, &mut self.kv_scratch_k);
+                    kvformat::unpack_q8_0_cells(v_slice, nkt, lo, rows, &mut self.kv_scratch_v);
+                    let rebased: Vec<(usize, usize)> =
+                        runs.iter().map(|&(cell, len)| (cell - lo, len)).collect();
+                    cpu_gqa_attn_runs(
+                        ins[0],
+                        &self.kv_scratch_k,
+                        &self.kv_scratch_v,
+                        &rebased,
+                        &off,
+                        nt,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.hd_kv,
+                        nkt,
+                        out,
+                        meta.scale,
+                    )?;
+                    return Ok(());
+                }
                 cpu_gqa_attn_runs(
                     ins[0],
                     k_slice,
@@ -1302,6 +1380,209 @@ mod tests {
         assert!((got[1] - 0.5).abs() < 1e-5, "got[1]={}", got[1]);
         assert!((got[2] - 0.25).abs() < 1e-5, "got[2]={}", got[2]);
         assert!((got[3] - 0.75).abs() < 1e-5, "got[3]={}", got[3]);
+    }
+
+    /// C4: a packed Q8_0 KV region answers like the f32 one and occupies about a
+    /// third of the memory. The store quantizes, the attention read dequantizes the
+    /// window it is about to use; three rows and three causal queries make the
+    /// softmax weights depend on the *quantized scores*, so a broken K read cannot
+    /// pass by returning V verbatim.
+    #[test]
+    fn a_packed_kv_region_answers_like_the_f32_one_and_is_smaller() {
+        use super::super::kvformat::KvFormat;
+        let nkt = 32usize; // Q8_0 quantizes in 32-element blocks
+        let hd = 32usize;
+        let nt = 3usize;
+        let n_ctx = 8usize;
+        let qv: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i as f32) * 0.13).sin() * 0.7)
+            .collect();
+        let kk: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i as f32) * 0.29).cos() * 1.3 + 0.04 * (i % 7) as f32)
+            .collect();
+        let vv: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i as f32) * 0.07).sin() * 0.5 - 0.02 * (i % 3) as f32)
+            .collect();
+
+        let run = |format: KvFormat| -> (Vec<f32>, usize, Vec<f32>) {
+            let mut h = Harness::new();
+            // Both halves of the decision, without touching the process-wide policy:
+            // the builder stamps the cell width, the backend reads it.
+            h.alloc.cpu_mut().set_kv_format_for_test(format);
+            let mut gb = GraphBuilder::new();
+            gb.set_kv_format(format);
+            let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+            let q = gb.input("q", [nkt, nt, 1, 1], DType::F32);
+            let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
+            let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
+            let store = gb.kvcache_store(0, k, v, n_ctx);
+            let kv = gb.kvcache_load(0, nkt, n_ctx, 1);
+            let out = gb.attn(
+                q,
+                kv,
+                pos,
+                crate::graph::ops::AttnMode::Gqa,
+                super::super::ops::AttnMeta {
+                    layer: 0,
+                    n_head: 1,
+                    n_head_kv: 1,
+                    hd,
+                    hd_kv: hd,
+                    nkt,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                },
+            );
+            gb.output(out);
+            let g = gb.build();
+            h.alloc.alloc_graph(&g).unwrap();
+            h.alloc.fill_input_i32(&g, "positions", &[0, 1, 2]).unwrap();
+            h.alloc
+                .fill_attn_inputs(&g, &[0, 0, 0], &[0, 1, 2])
+                .unwrap();
+            h.alloc.fill_input(&g, "q", &qv).unwrap();
+            h.alloc.fill_input(&g, "k", &kk).unwrap();
+            h.alloc.fill_input(&g, "v", &vv).unwrap();
+            h.sched.execute(&g, &mut h.alloc).unwrap();
+            // The store node's buffer *is* the K region, so this is what the
+            // attention read dequantized.
+            (h.out(&g, out), h.alloc.kv_region_bytes(), h.out(&g, store))
+        };
+
+        let (f32_out, f32_bytes, f32_region) = run(KvFormat::F32);
+        let (q8_out, q8_bytes, q8_region) = run(KvFormat::Q8_0);
+        assert_eq!(f32_out.len(), nkt * nt);
+        assert_eq!(q8_out.len(), nkt * nt);
+        // Footprint: 4 bytes/element against ceil(34/4) words per 32 elements.
+        assert_eq!(f32_bytes, n_ctx * nkt * 4 * 2);
+        assert_eq!(q8_bytes, n_ctx * 9 * 4 * 2);
+        assert!(
+            q8_bytes * 3 <= f32_bytes,
+            "the packed region must be at least 3x smaller: {q8_bytes} vs {f32_bytes}"
+        );
+        // The stored cell must be exactly the Q8_0 quantizate of the input row —
+        // bitwise, not merely close. This is what separates "the packed layout is
+        // addressed correctly" from "the numbers happen to be near": the packed
+        // store's bytes and an independent `quantize -> dequantize` of the same
+        // row must agree to the last bit, and the f32 run's region must hold the
+        // *un*quantized row.
+        let row_zero = &kk[..nkt];
+        let mut want = vec![0.0f32; nkt];
+        let bytes = crate::quants::quantize_row_q8_0(row_zero);
+        crate::quants::dequantize_row_q8_0(&bytes, &mut want);
+        let mut got = vec![0.0f32; nkt];
+        super::super::kvformat::unpack_q8_0_cells(&q8_region, nkt, 0, 1, &mut got);
+        assert_eq!(got, want, "the packed cell is not the Q8_0 quantizate");
+        assert_eq!(
+            &f32_region[..nkt],
+            row_zero,
+            "the f32 region must hold the row verbatim"
+        );
+        // Tolerance class: the per-block step of Q8_0, softened by the softmax over
+        // three rows (a wrong cell width or a byte-order slip is off by orders of
+        // magnitude more, which is what the gate is for).
+        let worst = (0..f32_out.len())
+            .map(|i| (f32_out[i] - q8_out[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 5e-2,
+            "packed KV vs f32 KV: max |Δ| = {worst} over {} outputs",
+            f32_out.len()
+        );
+    }
+
+    /// C4: a row width Q8_0 cannot express is refused where the region is sized,
+    /// not truncated into a layout that would mis-address every cell.
+    #[test]
+    fn a_packed_region_refuses_a_width_q8_0_cannot_express() {
+        use super::super::kvformat::KvFormat;
+        let mut h = Harness::new();
+        h.alloc.cpu_mut().set_kv_format_for_test(KvFormat::Q8_0);
+        let mut gb = GraphBuilder::new();
+        gb.set_kv_format(KvFormat::Q8_0);
+        let pos = gb.input("positions", [1, 1, 1, 1], DType::I32);
+        let q = gb.input("q", [4, 1, 1, 1], DType::F32);
+        let k = gb.input("k", [4, 1, 1, 1], DType::F32);
+        let v = gb.input("v", [4, 1, 1, 1], DType::F32);
+        let _store = gb.kvcache_store(0, k, v, 8);
+        let kv = gb.kvcache_load(0, 4, 8, 2);
+        let out = gb.attn(
+            q,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
+            super::super::ops::AttnMeta {
+                layer: 0,
+                n_head: 2,
+                n_head_kv: 2,
+                hd: 2,
+                hd_kv: 2,
+                nkt: 4,
+                scale: 0.5,
+            },
+        );
+        gb.output(out);
+        let g = gb.build();
+        let err = h.alloc.alloc_graph(&g).unwrap_err();
+        assert!(err.contains("multiple of 32"), "{err}");
+    }
+
+    /// C4 regression: `ensure_kv` takes a **logical** cell width and a **stored**
+    /// one, and the D3-8 mixed-quant epilogue — which also stores K/V — must hand in
+    /// the same `n_kv_embd` the store node does. Passing `n_ctx` in its place made
+    /// `packed` compare two unrelated numbers, so a *CPU* graph with this node failed
+    /// with "the node declares N words per cell but the Q8_0 layout packs ..."; no
+    /// cached model here builds the epilogue (their q/k/v share a quant type), which
+    /// is why only this hand-built graph covers the line.
+    #[test]
+    fn the_qkv_epilogue_sizes_its_kv_region_by_n_kv_embd() {
+        let (nkt, nqt, n_ctx) = (4usize, 8usize, 16usize);
+        let mut h = Harness::new();
+        let mut gb = GraphBuilder::new();
+        let pos = gb.input("positions", [1, 1, 1, 1], DType::I32);
+        let q = gb.input("q", [nqt, 1, 1, 1], DType::F32);
+        let k = gb.input("k", [nkt, 1, 1, 1], DType::F32);
+        let v = gb.input("v", [nkt, 1, 1, 1], DType::F32);
+        let ep = gb.qkv_bias_rope_store(
+            q,
+            k,
+            v,
+            pos,
+            0,
+            crate::graph::ops::QkvBiasRopeStoreMeta {
+                bias_q: None,
+                bias_k: None,
+                bias_v: None,
+                nqt,
+                nkt,
+                hd: 4,
+                freq_base: 10_000.0,
+                freq_scale: 1.0,
+                rope_style: crate::vec_ops::RopeStyle::NonInterleaved,
+                kv_elems: nkt * n_ctx,
+            },
+        );
+        let kv = gb.kvcache_load(0, nkt, n_ctx, 1);
+        let out = gb.attn(
+            ep,
+            kv,
+            pos,
+            crate::graph::ops::AttnMode::Gqa,
+            super::super::ops::AttnMeta {
+                layer: 0,
+                n_head: 1,
+                n_head_kv: 1,
+                hd: nkt,
+                hd_kv: nkt,
+                nkt,
+                scale: 1.0,
+            },
+        );
+        gb.output(out);
+        let g = gb.build();
+        h.alloc.alloc_graph(&g).unwrap();
+        // Unpacked: one f32 word per element, K and V.
+        assert_eq!(h.alloc.kv_region_bytes(), n_ctx * nkt * 4 * 2);
+        assert!(!h.alloc.kv_is_packed());
     }
 
     /// E1's acceptance: two sequences sharing one KV arena must not see each

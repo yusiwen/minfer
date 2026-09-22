@@ -42,11 +42,18 @@ pub const KV_MAP_MAX_SPANS: usize = 4;
 pub struct KvLayer {
     pub k: BufRef,
     pub v: BufRef,
-    /// Element count of one region (`n_kv_embd * n_ctx`) — the value
-    /// `ensure_kv` compares on a rebuild so a changed `n_ctx` fails loudly.
+    /// Element count of one region (`row_elems * n_ctx`, where `row_elems` is the
+    /// logical `n_kv_embd` for f32/f16 and a packed Q8_0 cell's word count for
+    /// `MINFER_CACHE_TYPE=q8_0`) — the value `ensure_kv` compares on a rebuild so a
+    /// changed `n_ctx` fails loudly. `elems / n_ctx` is one cell's width for every
+    /// copy the C3/C8b machinery makes.
     pub elems: usize,
     /// Rows the arena can hold (`n_ctx`).
     pub n_ctx: usize,
+    /// C4: whether a cell is a packed Q8_0 block row rather than f32 words. The
+    /// host-side paths that read rows as f32 (the C2 shift's re-rope) refuse a packed
+    /// region instead of reinterpreting its bytes.
+    pub packed: bool,
     /// `owner[cell]` — one entry per cell, `FREE` when unowned.
     #[allow(dead_code)] // read by C2's resolver and the tests; C1 only writes it
     pub owner: Vec<SeqId>,
@@ -172,7 +179,18 @@ impl KvCache {
         self.layers.get(&layer)
     }
 
-    pub fn insert(&mut self, layer: usize, k: BufRef, v: BufRef, elems: usize, n_ctx: usize) {
+    /// Register a layer's regions. `elems` is one region's element count
+    /// (`row_elems * n_ctx`) and `packed` says whether a cell is a packed Q8_0 row
+    /// (C4); the two are decided together by the allocator's `ensure_kv`.
+    pub fn insert(
+        &mut self,
+        layer: usize,
+        k: BufRef,
+        v: BufRef,
+        elems: usize,
+        n_ctx: usize,
+        packed: bool,
+    ) {
         self.n_ctx = self.n_ctx.max(n_ctx);
         self.layers.insert(
             layer,
@@ -181,10 +199,26 @@ impl KvCache {
                 v,
                 elems,
                 n_ctx,
+                packed,
                 owner: vec![FREE; n_ctx],
                 n_used: 0,
             },
         );
+    }
+
+    /// Whether any layer stores packed cells (C4). The host-side paths that treat a
+    /// region as f32 rows (the C2 shift's re-rope) consult this and refuse.
+    pub fn any_packed(&self) -> bool {
+        self.layers.values().any(|l| l.packed)
+    }
+
+    /// Bytes the persistent KV regions occupy (`elems * 4` per region), summed over
+    /// layers — the footprint C4 measures a packed region against.
+    pub fn region_bytes(&self) -> usize {
+        self.layers
+            .values()
+            .map(|l| (l.elems * std::mem::size_of::<f32>()) * 2)
+            .sum()
     }
 
     pub fn contains(&self, layer: usize) -> bool {
@@ -1349,8 +1383,8 @@ mod tests {
 
     fn cache(n_ctx: usize) -> KvCache {
         let mut c = KvCache::new();
-        c.insert(0, buf(1), buf(2), n_ctx * 4, n_ctx);
-        c.insert(1, buf(3), buf(4), n_ctx * 4, n_ctx);
+        c.insert(0, buf(1), buf(2), n_ctx * 4, n_ctx, false);
+        c.insert(1, buf(3), buf(4), n_ctx * 4, n_ctx, false);
         c
     }
 

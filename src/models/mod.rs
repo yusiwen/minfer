@@ -210,20 +210,29 @@ pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
 pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
     let ctx = &model.parts[0].ctx;
     let arch = ctx.get_key_val_str("general.architecture")?;
-    match arch.as_str() {
-        "qwen2" => {
-            let m = qwen2::loader::load(model, ns)?;
-            Some(Box::new(m))
-        }
-        "qwen3" => {
-            let m = qwen3::loader::load(model, ns)?;
-            Some(Box::new(m))
-        }
+    let loaded: Box<dyn ModelDef> = match arch.as_str() {
+        "qwen2" => Box::new(qwen2::loader::load(model, ns)?),
+        "qwen3" => Box::new(qwen3::loader::load(model, ns)?),
         other => {
             eprintln!("Unsupported architecture: '{}'", other);
-            None
+            return None;
+        }
+    };
+    // C4: the KV storage format is a per-load policy, resolved once the device is
+    // known (weights are registered by the arch loader, so `device()` is the same
+    // all-or-nothing answer every forward will use). This is the loud gate an
+    // unsupported `MINFER_CACHE_TYPE` fails on — an unknown spelling, or a packed
+    // format the device has no kernel for, ends the load here instead of quietly
+    // running f32.
+    let cache_type = std::env::var("MINFER_CACHE_TYPE").ok();
+    match crate::graph::kvformat::resolve(loaded.device(), cache_type.as_deref()) {
+        Ok(format) => crate::graph::kvformat::set_kv_format(format),
+        Err(e) => {
+            eprintln!("minfer: {e}");
+            return None;
         }
     }
+    Some(loaded)
 }
 
 #[cfg(test)]

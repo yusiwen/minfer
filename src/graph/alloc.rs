@@ -301,8 +301,15 @@ impl GraphAllocator {
             }
             match node.op {
                 Op::KvcacheStore { layer } | Op::KvcacheLoad { layer } => {
+                    // C4: the persistent region is sized by the meta's *cell width*
+                    // (`row_elems` — packed under Q8_0) times the node's `n_ctx`; the
+                    // node's own element count stays the logical `n_embd * n_ctx`.
+                    let (n_embd, row_elems) = match &node.meta {
+                        NodeMeta::Kvcache(m) => (m.n_embd, m.row_elems),
+                        _ => (node.out_shape[0], node.out_shape[0]),
+                    };
                     let pair =
-                        self.ensure_kv(layer, backend, node.n_elements(), node.out_shape[1])?;
+                        self.ensure_kv(layer, backend, n_embd, row_elems, node.out_shape[1])?;
                     // the node's buffer = the K region
                     self.node_to_buf.insert(id, pair[0]);
                 }
@@ -314,7 +321,17 @@ impl GraphAllocator {
                         NodeMeta::FusedQkv(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
                         _ => (node.n_elements(), node.out_shape[1]),
                     };
-                    self.ensure_kv(layer, backend, kv_elems, n_ctx)?;
+                    // The fusion is GPU-only, so its logical width is also its cell
+                    // width. Under a packed format this layer's region would be sized
+                    // differently from its store node's, and `ensure_kv` refuses that
+                    // mismatch loudly — the two node kinds cannot disagree.
+                    self.ensure_kv(
+                        layer,
+                        backend,
+                        kv_elems / n_ctx.max(1),
+                        kv_elems / n_ctx.max(1),
+                        n_ctx,
+                    )?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -330,7 +347,13 @@ impl GraphAllocator {
                         NodeMeta::FusedQkvNorm(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
                         _ => (node.n_elements(), node.out_shape[1]),
                     };
-                    self.ensure_kv(layer, backend, kv_elems, n_ctx)?;
+                    self.ensure_kv(
+                        layer,
+                        backend,
+                        kv_elems / n_ctx.max(1),
+                        kv_elems / n_ctx.max(1),
+                        n_ctx,
+                    )?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size);
@@ -348,7 +371,17 @@ impl GraphAllocator {
                             }
                             _ => (node.n_elements(), node.out_shape[1]),
                         };
-                        self.ensure_kv(*layer, backend, kv_elems, n_ctx)?;
+                        // The epilogue stores K/V like the fusion, so it too hands in
+                        // its logical width as its cell width (a packed format never
+                        // reaches it: the graph would then also carry a store node
+                        // whose region size disagrees, which `ensure_kv` refuses).
+                        self.ensure_kv(
+                            *layer,
+                            backend,
+                            kv_elems / n_ctx.max(1),
+                            kv_elems / n_ctx.max(1),
+                            n_ctx,
+                        )?;
                     }
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend
@@ -474,6 +507,11 @@ impl GraphAllocator {
     /// Per-layer KV persistent regions (K and V), created on first use on the
     /// layer's assigned backend.
     ///
+    /// `n_embd` is the node's *logical* row width (`n_kv_embd`, what its K/V input
+    /// carries) and `row_elems` is the width the region stores one cell in — the same
+    /// value for f32/f16, a packed Q8_0 cell's word count under `MINFER_CACHE_TYPE=q8_0`
+    /// (C4). The persistent region is `row_elems * n_ctx` elements.
+    ///
     /// Returns `Err` when the layer already owns a region whose element count
     /// or backend differs from the request. The regions outlive graph rebuilds
     /// (they ARE the KV cache), so a session that changes `n_ctx` — or moves a
@@ -484,9 +522,41 @@ impl GraphAllocator {
         &mut self,
         layer: usize,
         backend: Backend,
-        elems: usize,
+        n_embd: usize,
+        row_elems: usize,
         n_ctx: usize,
     ) -> Result<[BufRef; 2], String> {
+        // `row_elems != n_embd` is what says "this node stores packed cells": the
+        // graph is the authority (a builder under a Q8_0 policy stamps the packed
+        // width), not a process global read a second time here.
+        let packed = row_elems != n_embd;
+        if packed {
+            // Two loud checks, because both would otherwise corrupt silently: a row
+            // width Q8_0 cannot express, and a KV node that does not carry the packed
+            // width (the decode QKV fusion is GPU-only, so it hands in its logical
+            // width) sizing a region whose kernel writes the other layout.
+            let format = super::kvformat::KvFormat::Q8_0;
+            format.check_width(n_embd)?;
+            if backend != Backend::CPU {
+                return Err(format!(
+                    "KV region for layer {layer} would live on {backend:?}, which has no kernel \
+                     that reads a packed {} region (only CPU does — C4 S1); refusing rather than \
+                     sizing a region its kernels would address as f32 rows (issue #87)",
+                    format.name()
+                ));
+            }
+            let expected = format.row_elems(n_embd);
+            if row_elems != expected {
+                return Err(format!(
+                    "KV region for layer {layer}: the node declares {row_elems} words per cell but \
+                     the {} layout packs one cell of {n_embd} elements into {expected}; only a node \
+                     that carries `KvcacheMeta::row_elems` may size a packed region (the decode \
+                     QKV fusion is GPU-only and never runs packed)",
+                    format.name()
+                ));
+            }
+        }
+        let elems = row_elems * n_ctx;
         if let Some(region) = self.kv.get(layer) {
             if region.elems != elems {
                 return Err(format!(
@@ -501,11 +571,23 @@ impl GraphAllocator {
                     region.k.backend, backend
                 ));
             }
+            if region.packed != packed {
+                return Err(format!(
+                    "KV region for layer {layer} was allocated {} but this graph asks for {} \
+                     (the KV format changed on a live GraphCache; the regions are persistent)",
+                    if region.packed { "packed" } else { "unpacked" },
+                    if packed {
+                        "packed Q8_0"
+                    } else {
+                        "unpacked f32"
+                    }
+                ));
+            }
             return Ok([region.k, region.v]);
         }
         let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, elems);
         let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, elems);
-        self.kv.insert(layer, k, v, elems, n_ctx);
+        self.kv.insert(layer, k, v, elems, n_ctx, packed);
         Ok([k, v])
     }
 
@@ -578,6 +660,17 @@ impl GraphAllocator {
         let layers: Vec<usize> = self.kv.iter().map(|(l, _)| l).collect();
         if layers.is_empty() {
             return Err("kv_rm: no KV arena allocated".into());
+        }
+        // C4: the survivors are re-roped in f32 below, and a packed Q8_0 region is
+        // not f32 rows — reinterpreting its bytes would rotate noise. Refuse; the
+        // quantize-aware shift is C4 S2 (issue #87).
+        if self.kv.any_packed() {
+            return Err(
+                "kv_rm: a physical removal re-ropes the surviving K rows in f32, and this KV \
+                 cache is a packed Q8_0 region; a quantize-aware shift is C4 S2 (issue #87) — \
+                 run without MINFER_CACHE_TYPE=q8_0, or without a context shift"
+                    .into(),
+            );
         }
         // Validate every layer first: a rejected removal must not leave the
         // arenas half-shifted.
@@ -1034,6 +1127,17 @@ impl GraphAllocator {
     /// cell table (C3's acceptance surface; F8 exports the same numbers).
     pub fn kv_arena_stats(&self) -> super::kvcache::KvArenaStats {
         self.kv.arena_stats()
+    }
+
+    /// Bytes the persistent KV regions occupy, summed over layers and both regions
+    /// (C4's footprint surface: a packed Q8_0 cache is measured against f32 here).
+    pub fn kv_region_bytes(&self) -> usize {
+        self.kv.region_bytes()
+    }
+
+    /// Whether the persistent KV regions store packed cells (C4).
+    pub fn kv_is_packed(&self) -> bool {
+        self.kv.any_packed()
     }
 
     /// Release everything `seq` reserved and owned; returns the freed capacity.

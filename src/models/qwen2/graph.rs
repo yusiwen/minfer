@@ -957,6 +957,128 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    /// C4's acceptance on the real model: the packed regions are measurably smaller,
+    /// and the Q8_0 cache stays inside a **named logit tolerance** of the f32 one.
+    /// The class is not bitwise, and not greedy equality either: the store rounds
+    /// every K/V cell, so an argmax can legitimately flip a few tokens in (the CLI
+    /// does exactly that on a chat-templated prompt — 5 tokens, then EOS on the
+    /// 0.5B), which is why the continuation agreement is *reported* and the
+    /// perturbation's size is asserted.
+    ///
+    /// What pins the format itself is one level down: `cpu_backend`'s
+    /// `a_packed_kv_region_answers_like_the_f32_one_and_is_smaller` asserts that a
+    /// stored cell is **bitwise** the Q8_0 quantizate of the row it was given.
+    ///
+    /// Ignored because the format is a process-wide policy and this test flips it;
+    /// run it alone (the CPU test binary is the configuration it is written for —
+    /// with the `cuda` feature on a CUDA box the load refuses `q8_0`, as designed).
+    /// `MINFER_C4_MODEL` points it at another cached model:
+    ///
+    /// ```text
+    /// cargo test --release a_packed_kv_cache_answers_like_the_f32_one -- --ignored --test-threads=1
+    /// MINFER_C4_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
+    ///   cargo test --release a_packed_kv_cache_answers_like_the_f32_one -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires the cached 0.5B model and sets the process-wide KV format"]
+    fn a_packed_kv_cache_answers_like_the_f32_one() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvformat::{set_kv_format, KvFormat};
+        use crate::models::ModelDef;
+
+        let Some(path) = std::env::var_os("MINFER_C4_MODEL")
+            .map(std::path::PathBuf::from)
+            .or_else(cached_model_path)
+        else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the C4 packed-cache gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let n_ctx = 256;
+        let steps = 8;
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+
+        let run = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+            set_kv_format(format);
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let positions: Vec<usize> = (0..n).collect();
+            let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+            let mut logits = vec![l.clone()];
+            let mut next = argmax(&l);
+            let mut toks = vec![next];
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                logits.push(l.clone());
+                next = argmax(&l);
+                toks.push(next);
+            }
+            (logits, toks, cache.alloc().kv_region_bytes())
+        };
+
+        let (l_ref, t_ref, b_ref) = run(KvFormat::F32);
+        let (l_q8, t_q8, b_q8) = run(KvFormat::Q8_0);
+        set_kv_format(KvFormat::F32);
+        let ratio = b_ref as f64 / b_q8 as f64;
+        let worst = l_ref
+            .iter()
+            .zip(&l_q8)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        let step_deltas: Vec<f32> = l_ref
+            .iter()
+            .zip(&l_q8)
+            .map(|(a, b)| max_delta(a, b))
+            .collect();
+        let spread = l_ref
+            .iter()
+            .flatten()
+            .fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+            - l_ref.iter().flatten().fold(f32::INFINITY, |m, x| m.min(*x));
+        let at_argmax: Vec<f32> = l_ref
+            .iter()
+            .zip(&l_q8)
+            .map(|(a, b)| {
+                let i = argmax(a) as usize;
+                (a[i] - b[i]).abs()
+            })
+            .collect();
+        let matched = t_ref.iter().zip(&t_q8).take_while(|(a, b)| a == b).count();
+        eprintln!(
+            "[c4] KV regions: f32 {b_ref} B vs q8_0 {b_q8} B ({ratio:.2}x smaller); \
+             max |Δlogit| = {worst} of a {spread} spread; per step {step_deltas:?}"
+        );
+        eprintln!("[c4] |Δ| at the reference argmax per step: {at_argmax:?}");
+        eprintln!(
+            "[c4] greedy continuation: {matched}/{} steps agree (reported, not asserted — \
+             see the note on this test)",
+            t_ref.len()
+        );
+        assert!(
+            b_q8 * 3 <= b_ref,
+            "packed regions must be at least 3x smaller: {b_q8} vs {b_ref}"
+        );
+        // Named class, measured on the 0.5B Q4_0 and on Qwen3-0.6B Q8_0 before being
+        // fixed here. Q8_0 rounds every K/V cell, so this is never bitwise. The two
+        // numbers say different things on purpose:
+        //  * at the reference's argmax the logits move by <= 1.0 (measured 0.60 on the
+        //    0.5B, 0.55 on Qwen3) — the decoding-relevant error;
+        //  * over the whole 152k-way logit vector the tail moves by <= 3.0 (measured
+        //    2.50, <= 8% of the 37.8 spread) — a gross-error detector: a wrong row
+        //    width or byte order is off by orders of magnitude, not 8%.
+        assert!(
+            at_argmax.iter().fold(0.0f32, |m, d| m.max(*d)) <= 1.0,
+            "packed vs f32 at the argmax: {at_argmax:?}"
+        );
+        assert!(
+            worst <= 3.0,
+            "packed vs f32 logits: max |Δ| = {worst} of a {spread} spread"
+        );
+    }
+
     /// The named tolerance class for comparisons whose two sides were computed
     /// at **different batch shapes** (a different `nt` anywhere in their
     /// history) — the project's rule is "bitwise-identity *or* a named tolerance

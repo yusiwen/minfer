@@ -304,6 +304,44 @@ fn quantize_row_q8_0_to(x: &[f32], y: &mut [u8]) {
     quantize_scalar(x, y, k);
 }
 
+/// Quantize one row into caller-owned Q8_0 bytes (`y.len() == x.len()/32 * Q8B`).
+///
+/// C4's KV store writes a whole row at a time into a packed region, so it needs the
+/// same routine the weight quantizer uses without a per-row allocation.
+pub(crate) fn quantize_row_q8_0_into(x: &[f32], y: &mut [u8]) {
+    assert_eq!(
+        y.len(),
+        (x.len() / 32) * Q8B,
+        "Q8_0 row buffer must be {} bytes for {} elements",
+        (x.len() / 32) * Q8B,
+        x.len()
+    );
+    debug_assert_eq!(x.len() % 32, 0);
+    quantize_row_q8_0_to(x, y);
+}
+
+/// Dequantize one Q8_0 row (`x.len()` = whole 34-byte blocks) into `out`.
+///
+/// The exact inverse of [`quantize_row_q8_0_into`] up to the per-block rounding, and
+/// the read side of a packed KV region: `out[i] = d_b * q[i]` with `d_b` the block's
+/// f16 scale.
+pub fn dequantize_row_q8_0(x: &[u8], out: &mut [f32]) {
+    let nb = x.len() / Q8B;
+    assert!(
+        out.len() >= nb * 32,
+        "Q8_0 dequant needs {} outputs for {nb} blocks, got {}",
+        nb * 32,
+        out.len()
+    );
+    for b in 0..nb {
+        let off = b * Q8B;
+        let d = block::fp16_to_f32(u16::from_le_bytes([x[off], x[off + 1]]));
+        for j in 0..32 {
+            out[b * 32 + j] = d * x[off + 2 + j] as i8 as f32;
+        }
+    }
+}
+
 /// Test helper: quantize a full row and return the Q8_0 bytes (the graph path
 /// quantizes into caller-owned buffers via `quantize_row_q8_0_buf` instead).
 #[cfg(test)]

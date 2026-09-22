@@ -6,6 +6,7 @@
 use crate::tensor::Tensor;
 use crate::vec_ops::RopeStyle;
 
+use super::kvformat::KvFormat;
 use super::ops::{
     AttnMeta, AttnMode, EmbedMeta, FusedFfnMeta, FusedQkvMeta, FusedQkvNormMeta, KvcacheMeta,
     MatMulMeta, NodeMeta, NormMeta, Op, QkvBiasRopeStoreMeta, RoPEMeta,
@@ -33,6 +34,12 @@ pub struct GraphBuilder {
     /// difference: a backend that cannot gather a map validates the input's size
     /// and refuses the node (CPU can; CUDA is C8b S4; Metal is G5).
     kv_map: bool,
+    /// C4: the storage format of this graph's persistent KV regions. Read from the
+    /// process-wide policy (`kvformat::kv_format`, set once at model load) at
+    /// construction; it is what decides a region's *cell width*
+    /// (`KvcacheMeta::row_elems`), so a graph built under one format and executed
+    /// against an allocator that sized the other refuses loudly in `ensure_kv`.
+    kv_format: KvFormat,
 }
 
 impl GraphBuilder {
@@ -44,6 +51,9 @@ impl GraphBuilder {
             cells: None,
             explicit_span: false,
             kv_map: false,
+            // C4: the per-load policy. Tests that need a packed region set the
+            // process-wide format (or use `set_kv_format`) before building.
+            kv_format: super::kvformat::kv_format(),
         }
     }
 
@@ -53,6 +63,15 @@ impl GraphBuilder {
     /// the caller sets only for a device that can gather a map.
     pub fn set_kv_map(&mut self, on: bool) {
         self.kv_map = on;
+    }
+
+    /// C4: build this graph's KV nodes for a storage format other than the
+    /// process-wide one. Production callers do **not** call this — the format comes
+    /// from `kvformat::kv_format()`, which `load_model_ns` sets once from
+    /// `MINFER_CACHE_TYPE` — but a test that wants a packed region must be able to
+    /// ask for one without mutating a process global every other test reads.
+    pub fn set_kv_format(&mut self, format: KvFormat) {
+        self.kv_format = format;
     }
 
     /// Declare that this graph's attention must read the explicit span (E1/E2):
@@ -610,7 +629,10 @@ impl GraphBuilder {
         let n_embd = self.graph.nodes[k].out_shape[0];
         let nt = self.graph.nodes[k].out_shape[1];
         let cells = self.cells_input(nt);
-        // shape mirrors the persistent region so the allocator can size it
+        // shape mirrors the *logical* region ([n_kv_embd, n_ctx]) so it is what the
+        // store's K/V input means; the allocator sizes the persistent region from
+        // this meta's `row_elems` (C4: a packed region is narrower per cell than
+        // `n_embd`).
         self.node(
             &format!("kv_store.{layer}"),
             Op::KvcacheStore { layer },
@@ -620,6 +642,7 @@ impl GraphBuilder {
             NodeMeta::Kvcache(KvcacheMeta {
                 n_embd,
                 n_head_kv: 0,
+                row_elems: self.kv_format.row_elems(n_embd),
             }),
         )
     }
@@ -640,7 +663,11 @@ impl GraphBuilder {
             &[],
             [n_embd, n_ctx, 1, 1],
             DType::F32,
-            NodeMeta::Kvcache(KvcacheMeta { n_embd, n_head_kv }),
+            NodeMeta::Kvcache(KvcacheMeta {
+                n_embd,
+                n_head_kv,
+                row_elems: self.kv_format.row_elems(n_embd),
+            }),
         )
     }
 
