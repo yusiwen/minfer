@@ -50,6 +50,10 @@ pub struct KvLayer {
     pub elems: usize,
     /// Rows the arena can hold (`n_ctx`).
     pub n_ctx: usize,
+    /// C4: the **logical** row width (`n_kv_embd`) — what the store's K/V input
+    /// carries, and what a session header records so a file can be matched to the
+    /// model that wrote it. `elems / n_ctx` is the stored width instead.
+    pub n_embd: usize,
     /// C4: whether a cell is a packed Q8_0 block row rather than f32 words. The
     /// host-side paths that read rows as f32 (the C2 shift's re-rope) refuse a packed
     /// region instead of reinterpreting its bytes.
@@ -148,6 +152,46 @@ pub struct KvCache {
     cow_cells: u64,
 }
 
+/// One layer's share of a [`KvSessionState`] (C5): what the region bytes do not
+/// carry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvLayerSession {
+    pub layer: usize,
+    /// Highest written row + 1.
+    pub n_used: usize,
+    /// `owner[cell]`, one entry per cell (including `FREE`).
+    pub owner: Vec<SeqId>,
+}
+
+/// The KV arena's bookkeeping, everything `KvCache` holds except the region bytes
+/// themselves (C5).
+///
+/// `GraphAllocator::kv_save` writes it next to the bytes and `kv_load` puts it
+/// back through [`KvCache::restore_session`], which validates it first. Kept
+/// separate from the container so the round trip is testable without a device.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct KvSessionState {
+    pub identity: bool,
+    pub n_ctx: usize,
+    /// The run table: `(sequence, reservation)`, written extent included.
+    pub seqs: Vec<(SeqId, SeqSlot)>,
+    /// Each sequence's span list, `(position base, first cell, length)`.
+    pub spans: Vec<(SeqId, Vec<(usize, usize, usize)>)>,
+    pub layers: Vec<KvLayerSession>,
+    pub defrags: u64,
+    pub cells_moved: u64,
+    pub cows: u64,
+    pub cow_cells: u64,
+}
+
+impl KvSessionState {
+    /// Highest position any sequence has written — where a resumed session
+    /// continues from.
+    pub fn written(&self) -> usize {
+        self.seqs.iter().map(|(_, s)| s.written).max().unwrap_or(0)
+    }
+}
+
 impl KvCache {
     pub fn new() -> Self {
         Self {
@@ -179,15 +223,17 @@ impl KvCache {
         self.layers.get(&layer)
     }
 
-    /// Register a layer's regions. `elems` is one region's element count
-    /// (`row_elems * n_ctx`) and `packed` says whether a cell is a packed Q8_0 row
-    /// (C4); the two are decided together by the allocator's `ensure_kv`.
+    /// Register a layer's regions. `n_embd` is the **logical** row width
+    /// (`n_kv_embd`, what the store's K/V input means) and `row_elems` the stored
+    /// one (C4: a packed Q8_0 cell is narrower); `packed` says which layout it is.
+    /// The three are decided together by the allocator's `ensure_kv`.
     pub fn insert(
         &mut self,
         layer: usize,
         k: BufRef,
         v: BufRef,
-        elems: usize,
+        n_embd: usize,
+        row_elems: usize,
         n_ctx: usize,
         packed: bool,
     ) {
@@ -197,8 +243,9 @@ impl KvCache {
             KvLayer {
                 k,
                 v,
-                elems,
+                elems: row_elems * n_ctx,
                 n_ctx,
+                n_embd,
                 packed,
                 owner: vec![FREE; n_ctx],
                 n_used: 0,
@@ -210,6 +257,11 @@ impl KvCache {
     /// region as f32 rows (the C2 shift's re-rope) consult this and refuse.
     pub fn any_packed(&self) -> bool {
         self.layers.values().any(|l| l.packed)
+    }
+
+    /// Layers with an allocated arena (C5's session header records the count).
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 
     /// Bytes the persistent KV regions occupy (`elems * 4` per region), summed over
@@ -1043,6 +1095,122 @@ impl KvCache {
         }
     }
 
+    /// Everything about the arena that is **not** the region bytes (C5): the owner
+    /// table, the written extent, the run table and each sequence's span list.
+    ///
+    /// The bytes live in the backends' pools and travel through
+    /// `GraphAllocator::kv_save`/`kv_load`; this is the bookkeeping half, kept
+    /// separate so it can round-trip (and be unit-tested) without a device.
+    pub fn session_state(&self) -> KvSessionState {
+        KvSessionState {
+            identity: self.identity,
+            n_ctx: self.n_ctx,
+            seqs: self.seqs.iter().map(|(&s, &slot)| (s, slot)).collect(),
+            spans: self.spans.iter().map(|(&s, v)| (s, v.clone())).collect(),
+            layers: self
+                .layers
+                .iter()
+                .map(|(&layer, l)| KvLayerSession {
+                    layer,
+                    n_used: l.n_used,
+                    owner: l.owner.clone(),
+                })
+                .collect(),
+            defrags: self.defrags,
+            cells_moved: self.cells_moved,
+            cows: self.cows,
+            cow_cells: self.cow_cells,
+        }
+    }
+
+    /// Put a saved state back (C5), after validating it against **this** cache: a
+    /// state that does not describe this arena must leave it untouched rather than
+    /// half-applied.
+    pub fn restore_session(&mut self, st: &KvSessionState) -> Result<(), String> {
+        if st.n_ctx != self.n_ctx {
+            return Err(format!(
+                "KV session: the file holds {}-row runs but this arena has {} (n_ctx differs; \
+                 the regions are persistent and cannot be resized)",
+                st.n_ctx, self.n_ctx
+            ));
+        }
+        for ls in &st.layers {
+            let layer = self.layers.get(&ls.layer).ok_or_else(|| {
+                format!(
+                    "KV session: layer {} has no arena here (the file and the model disagree on \
+                     the layer count)",
+                    ls.layer
+                )
+            })?;
+            if ls.owner.len() != self.n_ctx {
+                return Err(format!(
+                    "KV session: layer {} carries a {}-entry owner table for a {}-cell arena",
+                    ls.layer,
+                    ls.owner.len(),
+                    self.n_ctx
+                ));
+            }
+            if ls.n_used > self.n_ctx {
+                return Err(format!(
+                    "KV session: layer {} claims {} written rows of {}",
+                    ls.layer, ls.n_used, self.n_ctx
+                ));
+            }
+            let _ = layer;
+        }
+        for (seq, slot) in &st.seqs {
+            if slot.start + slot.cap > self.n_ctx {
+                return Err(format!(
+                    "KV session: sequence {seq} reserves cells {}..{} of {}",
+                    slot.start,
+                    slot.start + slot.cap,
+                    self.n_ctx
+                ));
+            }
+            if slot.written > slot.shared.rows + slot.cap {
+                return Err(format!(
+                    "KV session: sequence {seq} claims {} written positions of {} reserved (+{} \
+                     shared)",
+                    slot.written, slot.cap, slot.shared.rows
+                ));
+            }
+            let spans = st
+                .spans
+                .iter()
+                .find(|(s, _)| s == seq)
+                .map(|(_, v)| v.as_slice())
+                .ok_or_else(|| {
+                    format!(
+                        "KV session: sequence {seq} has a reserved run but no span list — the \
+                         resolver reads it, so the state is not restorable"
+                    )
+                })?;
+            for &(base, cell, len) in spans {
+                if base + len > slot.shared.rows + slot.cap || cell + len > self.n_ctx {
+                    return Err(format!(
+                        "KV session: sequence {seq} span ({base}, {cell}, {len}) is outside its \
+                         reservation or the arena"
+                    ));
+                }
+            }
+        }
+        // Validated: apply.
+        for ls in &st.layers {
+            if let Some(l) = self.layers.get_mut(&ls.layer) {
+                l.owner = ls.owner.clone();
+                l.n_used = ls.n_used;
+            }
+        }
+        self.identity = st.identity;
+        self.seqs = st.seqs.iter().copied().collect();
+        self.spans = st.spans.iter().cloned().collect();
+        self.defrags = st.defrags;
+        self.cells_moved = st.cells_moved;
+        self.cows = st.cows;
+        self.cow_cells = st.cow_cells;
+        Ok(())
+    }
+
     /// The moves that compact the live runs **downward**, in application order.
     ///
     /// Runs are packed from cell 0 in ascending `start` order, each keeping its
@@ -1383,8 +1551,8 @@ mod tests {
 
     fn cache(n_ctx: usize) -> KvCache {
         let mut c = KvCache::new();
-        c.insert(0, buf(1), buf(2), n_ctx * 4, n_ctx, false);
-        c.insert(1, buf(3), buf(4), n_ctx * 4, n_ctx, false);
+        c.insert(0, buf(1), buf(2), 4, 4, n_ctx, false);
+        c.insert(1, buf(3), buf(4), 4, 4, n_ctx, false);
         c
     }
 

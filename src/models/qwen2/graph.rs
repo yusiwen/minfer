@@ -1079,6 +1079,104 @@ mod tests {
         );
     }
 
+    /// C5's acceptance on the real model: a session resumed from disk continues
+    /// **bitwise** like the one that stayed in memory. The restored rows *are* the
+    /// bytes the in-memory run wrote, so this is an equality claim, not a tolerance
+    /// one — and it fails on anything that loses a row, a run, or a written extent.
+    ///
+    /// Ignored because it writes a session file; run it alone:
+    ///
+    /// ```text
+    /// cargo test --release a_session_resumed_from_disk_continues_bitwise -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires the cached 0.5B model and writes a session file"]
+    fn a_session_resumed_from_disk_continues_bitwise() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvsession::KvSessionExpect;
+        use crate::graph::Backend;
+        use crate::models::{Device, ModelDef};
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the C5 session gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let backend = match model.device() {
+            Device::Cpu => Backend::CPU,
+            Device::Metal => Backend::Metal,
+            Device::Cuda => Backend::Cuda,
+        };
+        let n_ctx = 256;
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let positions: Vec<usize> = (0..n).collect();
+
+        // A: the session that never leaves memory.
+        let mut a = GraphCache::new();
+        a.alloc().kv_set_capacity(n_ctx);
+        let l_a = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut a);
+
+        // B: the same prefill, then saved and forgotten.
+        let mut b = GraphCache::new();
+        b.alloc().kv_set_capacity(n_ctx);
+        let l_b = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut b);
+        assert_eq!(
+            max_delta(&l_a, &l_b),
+            0.0,
+            "the fixture must be deterministic before anything is saved"
+        );
+        let file = std::env::temp_dir().join(format!(
+            "minfer-c5-session-{}-{}.bin",
+            std::process::id(),
+            n
+        ));
+        let report = b.alloc().kv_save(&file).expect("kv_save");
+        assert_eq!(report.written, n, "the prefill wrote positions 0..{n}");
+        eprintln!(
+            "[c5] saved {} layers / {} cells / {} written / {} bytes to {}",
+            report.layers,
+            report.cells,
+            report.written,
+            report.bytes,
+            file.display()
+        );
+        drop(b);
+
+        // C: a **fresh** cache, restored from the file alone.
+        let mut c = GraphCache::new();
+        c.alloc().kv_set_capacity(n_ctx);
+        let expect = KvSessionExpect {
+            backend,
+            n_ctx,
+            n_embd: model.n_head_kv() * model.n_embd_head(),
+        };
+        let loaded = c.alloc().kv_load(&file, &expect).expect("kv_load");
+        assert_eq!(loaded, report);
+
+        // Continue both greedily: A and C must agree to the last bit.
+        let mut next = argmax(&l_a);
+        let mut pos = n;
+        let mut worst = 0.0f32;
+        for step in 0..8 {
+            let la = model.forward_graph_cached(&[next], &[pos], 1, n_ctx, &mut a);
+            let lc = model.forward_graph_cached(&[next], &[pos], 1, n_ctx, &mut c);
+            let d = max_delta(&la, &lc);
+            worst = worst.max(d);
+            assert_eq!(
+                d, 0.0,
+                "step {step}: a session resumed from disk must be bitwise identical \
+                 (max |Δ| = {d})"
+            );
+            next = argmax(&la);
+            pos += 1;
+        }
+        eprintln!("[c5] 8 greedy steps after the restore: max |Δlogit| = {worst}");
+        std::fs::remove_file(&file).ok();
+    }
+
     /// The named tolerance class for comparisons whose two sides were computed
     /// at **different batch shapes** (a different `nt` anywhere in their
     /// history) — the project's rule is "bitwise-identity *or* a named tolerance

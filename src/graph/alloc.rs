@@ -10,10 +10,15 @@
 //! symmetric across backends). Persistent regions survive graph rebuilds.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use super::backend::Backend as BackendTrait;
 use super::backend::KvProvider;
 use super::cpu_backend::CpuBackend;
+use super::kvformat::KvFormat;
+use super::kvsession::{
+    KvSessionExpect, KvSessionHeader, KvSessionReader, KvSessionReport, KvSessionWriter, VERSION,
+};
 use super::ops::{NodeMeta, Op};
 use super::{Backend, BufRef, ComputeGraph, NodeId, PersistentBuf};
 
@@ -587,7 +592,8 @@ impl GraphAllocator {
         }
         let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, elems);
         let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, elems);
-        self.kv.insert(layer, k, v, elems, n_ctx, packed);
+        self.kv
+            .insert(layer, k, v, n_embd, row_elems, n_ctx, packed);
         Ok([k, v])
     }
 
@@ -1650,6 +1656,192 @@ impl GraphAllocator {
         Some((rd(self, pair[0])?, rd(self, pair[1])?))
     }
 
+    /// The KV element type a session on `backend` stores its rows in (C5). A
+    /// session records it so a file written under one width cannot be resumed
+    /// under another — an f16 region's second half is not meaningful data.
+    fn kv_element_format(&self, backend: Backend) -> KvFormat {
+        match backend {
+            Backend::CPU => self.cpu.kv_format(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => {
+                if crate::metal::kv_cache_is_f16() {
+                    KvFormat::F16
+                } else {
+                    KvFormat::F32
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => KvFormat::F32,
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                if crate::cuda::kv_cache_is_f16() {
+                    KvFormat::F16
+                } else {
+                    KvFormat::F32
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => KvFormat::F32,
+        }
+    }
+
+    /// Write the whole KV session — every layer's K/V region bytes plus the
+    /// arena's run table, owner map and written extents — to `path` (C5).
+    ///
+    /// The header records the shape, the KV element type and the backend, so a
+    /// load can refuse a file that does not describe *this* arena instead of
+    /// applying it. All layers must agree on the shape: a session is one arena.
+    pub fn kv_save(&mut self, path: &Path) -> Result<KvSessionReport, String> {
+        let layers: Vec<usize> = self.kv.iter().map(|(l, _)| l).collect();
+        let first = self
+            .kv
+            .get(*layers.first().ok_or("KV session: no KV arena to save")?)
+            .ok_or("KV session: no KV arena to save")?;
+        let (n_ctx, n_embd, backend) = (first.n_ctx, first.n_embd, first.k.backend);
+        let row_elems = first.elems / first.n_ctx.max(1);
+        let format = self.kv_element_format(backend);
+        let header = KvSessionHeader {
+            version: VERSION,
+            format,
+            backend,
+            n_layer: layers.len(),
+            n_ctx,
+            n_embd,
+            row_elems,
+        };
+        for &layer in &layers {
+            let l = self.kv.get(layer).ok_or("KV session: layer vanished")?;
+            if l.n_ctx != n_ctx || l.n_embd != n_embd || l.k.backend != backend {
+                return Err(format!(
+                    "KV session: layer {layer} is {}x{} cells on {:?} while the first layer is \
+                     {n_ctx}x{n_embd} on {backend:?} — a session is one arena",
+                    l.n_ctx, l.n_embd, l.k.backend
+                ));
+            }
+            if l.elems / l.n_ctx.max(1) != row_elems {
+                return Err(format!(
+                    "KV session: layer {layer} stores {} words per cell, the first layer \
+                     {row_elems}",
+                    l.elems / l.n_ctx.max(1)
+                ));
+            }
+        }
+        let mut w = KvSessionWriter::create(path, &header)?;
+        for &layer in &layers {
+            let (k, v) = self
+                .copy_kv_to_cpu(layer)
+                .ok_or_else(|| format!("KV session: layer {layer} host read failed"))?;
+            w.layer(layer, &k, &v)?;
+        }
+        w.finish(&self.kv.session_state())
+    }
+
+    /// Restore this allocator's KV arena from a session file (C5), creating the
+    /// regions if they do not exist yet.
+    ///
+    /// The file is walked end to end (header, payload lengths, bookkeeping,
+    /// checksum, end-of-file) **before** a single byte is written into a pool, so
+    /// a truncated, corrupted or foreign file leaves the allocator untouched. The
+    /// header must match what the caller knows from the model (`expect`).
+    pub fn kv_load(
+        &mut self,
+        path: &Path,
+        expect: &KvSessionExpect,
+    ) -> Result<KvSessionReport, String> {
+        let header = super::kvsession::verify(path)?;
+        if header.backend != expect.backend {
+            return Err(format!(
+                "KV session: the file holds a {:?} session, this run uses {:?}",
+                header.backend, expect.backend
+            ));
+        }
+        if header.n_ctx != expect.n_ctx {
+            return Err(format!(
+                "KV session: the file describes a {}-cell arena, this run has {} (--n-ctx)",
+                header.n_ctx, expect.n_ctx
+            ));
+        }
+        if header.n_embd != expect.n_embd {
+            return Err(format!(
+                "KV session: the file holds {}-element KV rows, this model has {} (a session \
+                 belongs to the model that wrote it)",
+                header.n_embd, expect.n_embd
+            ));
+        }
+        let live = self.kv_element_format(expect.backend);
+        if header.format != live {
+            return Err(format!(
+                "KV session: the file was written with the {} KV element type, this run uses \
+                 {} (MINFER_CACHE_TYPE)",
+                header.format.name(),
+                live.name()
+            ));
+        }
+        let mut r = KvSessionReader::open(path)?;
+        // A restore happens before the first graph is built, so the pool the file
+        // names may not exist yet: enable it here (the same lazy enable the graph
+        // builder does), or refuse when this build/box cannot have it.
+        match expect.backend {
+            Backend::CPU => {}
+            #[cfg(target_os = "macos")]
+            Backend::Metal => {
+                if !self.enable_metal() {
+                    return Err(
+                        "KV session: the file holds a Metal session but MPS is unavailable".into(),
+                    );
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => {
+                return Err(
+                    "KV session: the file holds a Metal session and this build has no Metal \
+                     backend (macOS only)"
+                        .into(),
+                );
+            }
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                if !self.enable_cuda() {
+                    return Err(
+                        "KV session: the file holds a CUDA session but no CUDA device is \
+                         available (or MINFER_DISABLE_CUDA is set)"
+                            .into(),
+                    );
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => {
+                return Err(
+                    "KV session: the file holds a CUDA session and this build has no cuda \
+                     feature (rebuild with --features cuda)"
+                        .into(),
+                );
+            }
+        }
+        let mut seen = 0usize;
+        while let Some((layer, k, v)) = r.next_layer()? {
+            let [kref, vref] = self.ensure_kv(
+                layer,
+                expect.backend,
+                header.n_embd,
+                header.row_elems,
+                header.n_ctx,
+            )?;
+            self.write_pool(kref.backend, kref.id, &k)?;
+            self.write_pool(vref.backend, vref.id, &v)?;
+            seen += 1;
+        }
+        let (state, report) = r.finish()?;
+        if state.layers.len() != seen {
+            return Err(format!(
+                "KV session: {seen} layers were read but the bookkeeping describes {}",
+                state.layers.len()
+            ));
+        }
+        self.kv.restore_session(&state)?;
+        Ok(report)
+    }
+
     /// Host view of a persistent region by name (CPU pool).
     /// (Test helper.)
     #[allow(dead_code)]
@@ -2208,6 +2400,139 @@ mod tests {
         assert_eq!(alloc.persistent[1].name, "kv.0.v");
         // mapped buffers: positions/k/v/cells (4 liveness) + K region (shared) = 5
         assert_eq!(alloc.n_mapped_buffers(), 5);
+    }
+
+    /// C5 end to end on CPU: a session's region bytes **and** its run table
+    /// (reservation, ownership, written extent) survive a save and a load into a
+    /// **fresh** allocator, and the loaded arena resolves the same cells.
+    ///
+    /// The refusals are the other half of the ticket: a file that does not describe
+    /// this arena is rejected loudly, and because `kv_load` verifies the whole file
+    /// before it applies anything, a rejected load leaves no arena behind.
+    #[test]
+    fn kv_session_round_trips_the_rows_and_the_run_table() {
+        const N_CTX: usize = 16;
+        const ROW: usize = 4;
+        const SEQ: u32 = 7;
+        let kk: Vec<f32> = (0..ROW * 2).map(|i| 0.25 + i as f32 * 0.5).collect();
+        let vv: Vec<f32> = (0..ROW * 2).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+
+        let graph = |alloc: &mut GraphAllocator| -> ComputeGraph {
+            let mut b = GraphBuilder::new();
+            let pos = b.input("positions", [2, 1, 1, 1], crate::graph::DType::I32);
+            let k = b.input("k", [ROW, 2, 1, 1], crate::graph::DType::F32);
+            let v = b.input("v", [ROW, 2, 1, 1], crate::graph::DType::F32);
+            let _store = b.kvcache_store(0, k, v, N_CTX);
+            let load = b.kvcache_load(0, ROW, N_CTX, 1);
+            b.output(load);
+            let g = b.build();
+            alloc.kv_set_capacity(N_CTX);
+            alloc.alloc_graph(&g).unwrap();
+            g
+        };
+
+        // ---- the session that stays in memory ----
+        let mut a = GraphAllocator::new();
+        let ga = graph(&mut a);
+        a.kv_reserve_seq(SEQ, N_CTX).unwrap();
+        a.fill_input_i32(&ga, "positions", &[1, 3]).unwrap();
+        a.fill_attn_inputs(&ga, &[SEQ, SEQ], &[1, 3]).unwrap();
+        a.fill_input(&ga, "k", &kk).unwrap();
+        a.fill_input(&ga, "v", &vv).unwrap();
+        let mut sched = crate::graph::scheduler::BackendScheduler::new();
+        sched.execute(&ga, &mut a).unwrap();
+        a.kv_own_range(SEQ, 0, 4);
+        let want_kv = a.copy_kv_to_cpu(0).unwrap();
+        let want_stats = a.kv_arena_stats();
+        let want_cells = a.kv_cells_for_seq(&[SEQ, SEQ], &[1, 3]).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "minfer-c5-alloc-{}-roundtrip.bin",
+            std::process::id()
+        ));
+        let report = a.kv_save(&path).unwrap();
+        assert_eq!(report.layers, 1);
+        assert_eq!(report.cells, N_CTX);
+        assert_eq!(report.written, 4, "positions 0..4 are written");
+        assert_eq!(report.bytes, std::fs::metadata(&path).unwrap().len());
+
+        // ---- a fresh allocator, restored from the file ----
+        let expect = KvSessionExpect {
+            backend: Backend::CPU,
+            n_ctx: N_CTX,
+            n_embd: ROW,
+        };
+        let mut b = GraphAllocator::new();
+        let gb = graph(&mut b);
+        let loaded = b.kv_load(&path, &expect).unwrap();
+        assert_eq!(loaded, report);
+        assert_eq!(
+            b.copy_kv_to_cpu(0).unwrap(),
+            want_kv,
+            "the region bytes must be identical"
+        );
+        assert_eq!(b.kv_arena_stats(), want_stats);
+        assert_eq!(
+            b.kv_cells_for_seq(&[SEQ, SEQ], &[1, 3]).unwrap(),
+            want_cells,
+            "the restored run table must resolve the same cells"
+        );
+        assert_eq!(b.kv_n_used(0), a.kv_n_used(0));
+        let _ = gb;
+
+        // ---- refusals ----
+        for (what, expect_bad, needle) in [
+            (
+                "a different n_ctx",
+                KvSessionExpect {
+                    n_ctx: N_CTX + 1,
+                    ..expect
+                },
+                "-cell arena",
+            ),
+            (
+                "a different row width",
+                KvSessionExpect {
+                    n_embd: ROW + 4,
+                    ..expect
+                },
+                "KV rows",
+            ),
+            (
+                "another backend",
+                KvSessionExpect {
+                    backend: Backend::Metal,
+                    ..expect
+                },
+                "session",
+            ),
+        ] {
+            let mut fresh = GraphAllocator::new();
+            let err = fresh.kv_load(&path, &expect_bad).unwrap_err();
+            assert!(err.contains(needle), "{what}: {err}");
+            assert!(
+                fresh.kv_n_used(0).is_none(),
+                "{what}: a refused load must not create an arena"
+            );
+        }
+        // A different KV element type for the same shape.
+        let mut fresh = GraphAllocator::new();
+        fresh
+            .cpu_mut()
+            .set_kv_format_for_test(super::super::kvformat::KvFormat::Q8_0);
+        let err = fresh.kv_load(&path, &expect).unwrap_err();
+        assert!(err.contains("element type"), "{err}");
+        assert!(fresh.kv_n_used(0).is_none());
+
+        // A truncated file: rejected, and (because `kv_load` verifies first) the
+        // allocator is untouched.
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+        let mut fresh = GraphAllocator::new();
+        let err = fresh.kv_load(&path, &expect).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+        assert!(fresh.kv_n_used(0).is_none());
+        std::fs::remove_file(&path).ok();
     }
 
     /// C3 end to end on CPU: a fragmented arena refuses an 8-cell reservation,
