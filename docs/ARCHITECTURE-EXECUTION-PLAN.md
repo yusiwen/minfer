@@ -8,7 +8,7 @@ the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next �
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8b S2 (block refcounts and `kv_seq_cp`, shipped together with the sharing that reads them), then S3–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: C8b S3 (copy-on-write for a store that would land in a shared block), then S4–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1312,7 +1312,36 @@ suites after S1b: CPU **221 passed / 0 failed / 7 ignored** (two tests added; th
 CUDA **270 passed / 0 failed / 7 ignored**, and the
 byte-equality gates (batched-vs-serial, C7 boundary, C8a prefix copy) unchanged.
 
-S2 then adds the block refcounts and `kv_seq_cp` together with the sharing that reads them.
+**C8b S2 landed 2026-09-21 — sequences share a prefix in place.** A sequence's address space is now
+its span list: a `SharedPrefix { cell, rows }` it reads from a donor plus its private run, which holds
+positions `[rows, rows + cap)`. `KvCache::share_prefix` establishes that by pointer — no bytes copied —
+and refuses loudly what it cannot express: an empty share, an unwritten donor range, a destination that
+already shares or has written rows of its own, itself, and a donor prefix that is not one contiguous
+cell range (the caller then falls back to C8a's copy). `KvCache::attn_map` resolves a query's window as
+`KV_MAP_MAX_SPANS` `(cell, len)` runs, and `CParams.kv_map` selects that layout for the window input
+instead of `attn_span`'s single range: an input's size is topology, so the difference is fixed at build
+time, and a size that matches neither form is refused rather than guessed. The CPU kernel gathers the
+runs (`decode_window` + `cpu_gqa_attn_runs`, with `cpu_gqa_attn` kept as the one-range wrapper); CUDA's
+windowed arm refuses a window that is not `2 * nt` (S4 ports the gather), and both models ask for a map
+only on CPU. Admission uses it: at C8a's reuse site `kv_share_prefix` replaces `kv_copy_prefix` where
+the device can gather, so the arena holds one copy of those bytes, and every other device keeps the
+copy. **Gate 2 holds**: sharing answers byte-identically to a private run, on the same gate that
+validated the copy (`a_prefix_copied_from_another_slot_answers_identically`), and
+`server_batch_matches_serial_and_is_faster` still passes with the sharing path live. Suites: CPU 228 /
+CUDA 277, 0 failed.
+
+**Two deliberate departures from the design above.** (1) **No block refcounts.** Occupancy
+(`reserve_seq`, `free_runs`) and the written count are derived from the span lists: a released donor's
+rows stay taken for as long as a sharer's spans name them, they come back when the sharer drops them,
+and a compaction moves each run's own rows and renumbers every sharer's pointer. A per-block refcount
+would be a derived cache of exactly that union and could drift from it — the shape A7 deleted — and
+the four gates it was meant to serve hold without it. (2) **The layout rides the window input's size**
+rather than a new op field. A `kv_map` flag on `Op::Attn` would have touched every construction site
+across three backends, the models and the tests for no behavioural gain; the size *is* the topology
+here, and every backend that cannot gather refuses loudly instead of misreading pairs.
+
+S3 then adds copy-on-write (`kv_private_row_for`) for a store that would land in a shared block; S4
+ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
 
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
@@ -2313,7 +2342,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
