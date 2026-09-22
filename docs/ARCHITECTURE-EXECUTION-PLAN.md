@@ -9,11 +9,13 @@ directions, so a busy neighbour above the slot no longer blocks it); **C8** spli
 block map and a gather in every attention kernel — S1a/S1b/S2/S3/S4/S5 landed, closed on
 CPU and CUDA, Metal's share path at G5); **C4 (quantized Q8_0 cache, CPU)** landed
 2026-09-22 as S1 — its fused dots and the CUDA/Metal kernels are
-[#87](https://github.com/yusiwen/minfer/issues/87). C5 open. Phase D **3/3** (**D1 done**:
+[#87](https://github.com/yusiwen/minfer/issues/87) — and **C5 (session save/restore)**
+landed the same day (the CLI/server surfaces it enables are
+[#89](https://github.com/yusiwen/minfer/issues/89)), closing Phase C. Phase D **3/3** (**D1 done**:
 views, multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C5, then G1–G3 and G5 (Metal, on a Mac), then E3–E5.** The order is
+check). **Phase C is complete (8/8); next: G1–G3 and G5 (Metal, on a Mac), then E3–E5.** The order is
 deliberate: the Metal KV port (G5) comes **after** the CUDA arena stops changing shape
 (C7, C7b, C8), so those semantics are written into Metal once. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -881,10 +883,56 @@ CI. The real-model gate is `#[ignore]`d (it flips a process-wide policy) and was
 both cached models. Not verified here: any packed region on a GPU (by design, S1 refuses
 it), and the fused dots' performance (S2).
 
-### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43)
-- Write/read the KV state (rows + ownership + the run table) to a file; acceptance = a
-  session resumed from disk produces the same continuation as one that stayed in memory,
-  and a truncated or version-mismatched file is rejected loudly.
+### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
+
+**Why.** A session's KV rows, ownership and run table lived only in memory, so every
+restart re-prefilled the whole context.
+
+**What landed:**
+
+- **`src/graph/kvsession.rs` is the container.** An 8-byte magic, a version, flags, the
+  backend tag and the shape (`n_layer`, `n_ctx`, `n_embd`, `row_elems`), then one K/V blob
+  per layer as raw little-endian pool words, then the bookkeeping, then an FNV-1a
+  checksum. It streams both ways: a save never holds a second copy of a 6 MB–1 GB arena,
+  and a load materializes one layer at a time.
+- **`KvCache::session_state` / `restore_session`** is the bookkeeping half — the owner
+  table, `n_used`, the run table (`SeqSlot`: start, cap, shared prefix, written extent),
+  each sequence's span list, `identity` and the C3/C8b counters — kept separate so it
+  round-trips in unit tests without a device. `restore_session` validates before it
+  applies: arena capacity, the owner table's length, every reservation and span inside the
+  arena, and every live sequence carrying a span list.
+- **`GraphAllocator::kv_save` / `kv_load`** move the bytes through the backends'
+  `read_host`/`write_host` (CUDA included) and enable the pool a file names if it does not
+  exist yet, because a restore happens before the first graph — which is also how the CUDA
+  run of the gate found the gap. The header records the KV element type
+  (`f32`/`f16`/`q8_0`), so a file written under one width cannot be resumed under another.
+- **A failed load is a no-op.** `kv_load` runs `kvsession::verify` — a full pass over the
+  header, every layer's declared length, the bookkeeping, the checksum and end-of-file —
+  **before** `ensure_kv` creates a single region. Every refusal path is asserted to leave
+  no arena behind (`kv_n_used(0).is_none()`).
+- **Truncation is caught by construction**, not only by the checksum: every read is exact
+  against a length the header fixes, so a short file fails wherever it stops with
+  "truncated — the file ends inside …". A version bump, a bad magic, trailing bytes, an
+  unknown flag, a header whose packed flag and cell width disagree, and a file whose
+  backend / `n_ctx` / `n_embd` / element type does not describe this run are each refused
+  with the reason.
+
+**Acceptance, as measured** (2026-09-22):
+
+- *Container, in CI*: 9 unit tests — a round trip including the run table, a packed
+  session, truncation, a version mismatch, a flipped byte (checksum), trailing bytes, a
+  foreign file, a header whose flag and width disagree, and a writer short a layer.
+- *Allocator, in CI*: the region bytes **and** the run table survive a save and a load
+  into a **fresh** allocator, the restored table resolves the same cells, and four refusal
+  paths (another `n_ctx`, another row width, another backend, another element type) plus a
+  truncated file each leave the allocator untouched.
+- *Real model* (0.5B q4_0, `#[ignore]`d, run on the **CPU and on CUDA**): prefill, save
+  (24 layers / 256 cells / 5 written / 6 316 748 bytes), drop the cache, restore into a
+  fresh one, then 8 greedy steps against the session that never left memory — **max
+  |Δlogit| = 0**, i.e. bitwise, which is the strongest form of "the same continuation".
+- Handed off: resuming the CLI's `--session` (which still re-prefills its history JSON)
+  from this container, and an E2 slot-table snapshot for the server, are
+  [#89](https://github.com/yusiwen/minfer/issues/89).
 
 ### C6 — Logical positions (`positions` ≠ cells)
 
@@ -2553,7 +2601,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5 ✔   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
