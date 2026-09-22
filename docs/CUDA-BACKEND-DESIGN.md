@@ -375,6 +375,9 @@ kernels can run an f16 cache: `set_kv_cache_type` auto-selects f16 when
 `n_layers × n_kv_embd >= 8192` (the 7B class, KV-bandwidth-bound decode) and f32 otherwise;
 `MINFER_CACHE_TYPE=f16|f32` overrides. The backend snapshots the decision into `kv_f16` at
 construction, and `store_kv_f16`/`gqa_attn_*_f16kv` are the kernels that honour it.
+`MINFER_CACHE_TYPE=q8_0` (C4) is **refused at load** on CUDA — a packed region needs kernels
+that read Q8_0 rows, which is [issue #87](https://github.com/yusiwen/minfer/issues/87); the
+refusal is the point, since the old parser read any unknown value as f32.
 
 **Host transfers.**
 
