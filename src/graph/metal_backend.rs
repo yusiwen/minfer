@@ -291,6 +291,15 @@ impl Backend for MetalBackend {
         }
     }
 
+    /// C8b S5: Metal has no cell-store read path yet (G5), so it refuses **both**
+    /// explicit window layouts the KV store can hand a node — `attn_span`'s single
+    /// `[lo, hi)` pair per query and `kv_map`'s `(cell, len)` runs. The trait
+    /// default is already `false`; this override is where a reader looks, and
+    /// `execute_node`'s Attn arm backstops it.
+    fn supports_attn_span(&self) -> bool {
+        false
+    }
+
     fn supports_fused(&self, fused: &FusedOp) -> bool {
         // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
         // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
@@ -597,7 +606,23 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::KvcacheLoad { .. } => Ok(()), // view of the K region
-            Op::Attn { .. } => {
+            Op::Attn { explicit_span, .. } => {
+                // C8b S5: Metal derives every query's window from `positions` (the
+                // pre-E1 form) and has no cell-store read path, so **both** explicit
+                // window layouts — `attn_span`'s one `[lo, hi)` pair per query and
+                // `kv_map`'s `(cell, len)` runs (C8b S4) — are refused here rather
+                // than computed as if they were causal. Assignment already keeps them
+                // off this backend (`Backend::supports_attn_span` is false), so this
+                // is the backstop that makes a slip loud instead of wrong; G5 is
+                // where Metal learns the cell store and this goes away.
+                if *explicit_span {
+                    return Err(
+                        "Metal attention: this node carries an explicit window (attn_span or \
+                         kv_map), which Metal does not read yet (G5) — backend assignment \
+                         should have kept it on a backend with a cell-store read path"
+                            .to_string(),
+                    );
+                }
                 let meta = match &node.meta {
                     NodeMeta::Attn(m) => m,
                     other => return Err(format!("attn node missing AttnMeta: {other:?}")),
