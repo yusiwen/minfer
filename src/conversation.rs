@@ -1983,10 +1983,27 @@ mod tests {
         // Strong invariant: current_pos == stream_tokens.len() (the KV mirror is consistent)
         assert_eq!(conv.current_pos, conv.stream_tokens.len());
         assert_eq!(conv.messages.len(), 4, "user, assistant, user, assistant");
-        // No EOT needed after EOG (the model stops on its own)
-        assert!(
-            !conv.need_insert_eot,
-            "greedy 0.5B usually EOGs; if this trips, inspect output"
+        // The model's own stop behaviour is **not** the engine's contract: on these
+        // prompts the greedy 0.5B runs to the 16-token cap instead of emitting EOG
+        // (t1 stops mid-sentence), so `need_insert_eot` is true. That is a fact about
+        // a small model, not a defect — both stop branches are pinned by the
+        // scripted-engine tests `first_turn_full_render_and_eog` (EOG -> no EOT) and
+        // `n_predict_exhaustion_sets_eot` (cap -> EOT). What this real-model run must
+        // hold is the rule that ties the flag to the state the *next* turn reads:
+        // the EOT is owed exactly when the stream does not end on an EOG.
+        let last = *conv.stream_tokens.last().expect("the session wrote tokens");
+        eprintln!(
+            "[smoke] t1 stopped_by_eog={} t2 stopped_by_eog={} last_stream_token={last} \
+             need_insert_eot={}",
+            t1.stopped_by_eog, t2.stopped_by_eog, conv.need_insert_eot
+        );
+        assert_eq!(
+            conv.need_insert_eot,
+            !conv.eog.contains(&last),
+            "need_insert_eot ({}) must mirror whether the stream ends on an EOG (last stream \
+             token {last}, eog {:?})",
+            conv.need_insert_eot,
+            conv.eog
         );
     }
 
