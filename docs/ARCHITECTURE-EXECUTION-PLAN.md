@@ -4,11 +4,11 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3/S4 landed, S5 next); C4, C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3/S4/S5 landed — closed on CPU and CUDA, Metal's share path at G5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8b S5 (Metal behind G5), then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: G1–G3 and G5 (Metal, on a Mac), then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1394,7 +1394,27 @@ the resolver's guard makes the store write through, and the gate fails on exactl
 ("the diverging request wrote through the shared prefix"). Gate 3's `kv_rm` half (`occupied()` derived
 from the span lists) landed with S2. Suites: CPU 233 / CUDA 282, 0 failed.
 
-S4 ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
+**C8b S5 landed (2026-09-22) — Metal refuses both window layouts, and C8b closes.**
+Metal derives every query's window from `positions` (the pre-E1 form) and has no
+cell-store read path, so **both** explicit layouts — `attn_span`'s one `[lo, hi)`
+pair per query and `kv_map`'s `(cell, len)` runs — are refused. Two layers say so:
+`Backend::supports_attn_span` (the trait default, now an explicit override on Metal)
+keeps such a node off the backend at assignment time, and the `Op::Attn` arm of
+`execute_node` returns a loud `Err` if one ever arrives — the alternative would be
+computing a *causal* window from `positions` and attending to the wrong rows, which is
+the silent-wrong this project refuses. Nothing else changes for Metal: the models ask
+for a map only where `Device::gathers_attn_map()` says a kernel reads one (CPU, CUDA),
+so on a Mac the server keeps C8a's copy path — and since Metal's `copy_cells` is also
+refused until G5, admission logs the failed copy and prefills, which is the same loud
+fallback it has always taken. S5's gate is the **compile check** (Metal is
+`cfg(target_os = "macos")`, so CI's `build-macos` is the only compile this box cannot
+do) plus this record; the device claims stay G5's, on a Mac.
+
+That closes C8b: S1a/S1b (the span list and its two resolvers), S2 (sharing in place +
+the CPU gather), S3 (copy-on-write), S4 (the CUDA gather in every kernel) and S5
+(Metal's refusal). The ticket C8 itself is **closed on CPU and CUDA** — a prefix is
+stored once and shared, and a store into it never writes through — with Metal's share
+path moving to **G5**, where the cell store is ported.
 
 **C8b S4 landed (2026-09-22) — every CUDA attention path gathers the map.**
 `attn_span`'s single range became three *window modes* selected by the **size** of
@@ -1473,7 +1493,7 @@ the stats gate watches exactly that.
 | S2 | Block-granular **refcounts** + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
 | S3 | Copy-on-write: `kv_private_row_for` at store resolution — **landed 2026-09-22**: the share shrinks to the first position this forward writes and the run's own rows shift up inside it (two spans, no arena space needed), the store resolver refuses a shared position, and a run without room is a loud `Err` | gate 3 on CPU + the real-model donor-byte check |
 | S4 | CUDA attention gather + device A/B — **landed 2026-09-22**: three window modes (causal / span / map) selected by the window input's size, the `MAP` flag threaded through every attention kernel including FA prefill, and the batch-level row resolution that makes the gather free | gate 2 on GB10 (bitwise, f32 *and* f16 KV) + the decode/prefill A/B |
-| S5 | Metal behind G5 (refuse the map, as it refuses the span) + docs closure | compile check + G5 record |
+| S5 | Metal behind G5 — **landed 2026-09-22**: both explicit window layouts refused (`supports_attn_span` keeps them off the backend; the `Op::Attn` arm backstops with a loud `Err`), admission keeps C8a's copy, docs closed | compile check (CI `build-macos`) + G5 record |
 
 
 ## 6. Phase D — IR expressiveness (item 7)
@@ -2461,7 +2481,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3–S5) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
