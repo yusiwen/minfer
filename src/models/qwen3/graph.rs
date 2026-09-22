@@ -445,12 +445,12 @@ impl Qwen3Graph {
         let device = Self::device(model);
         let metal_on = device == crate::models::Device::Metal;
         let cuda_on = device == crate::models::Device::Cuda;
-        // C8b S2: a sequence that reads part of its prefix in place needs the
+        // C8b S2/S4: a sequence that reads part of its prefix in place needs the
         // window as a list of cell runs rather than one range. Only a device whose
-        // kernel can gather a map is asked (CPU today; CUDA is C8b S4, Metal is
-        // G5), and *whether* to share is the caller's decision — this only
-        // reflects it, read from the reservations the cache already holds.
-        let kv_map = device == crate::models::Device::Cpu
+        // kernel can gather a map is asked (CPU and CUDA; Metal is G5), and
+        // *whether* to share is the caller's decision — this only reflects it,
+        // read from the reservations the cache already holds.
+        let kv_map = device.gathers_attn_map()
             && batch.groups().iter().any(|&(seq, _, _)| {
                 cache
                     .alloc()
@@ -471,7 +471,8 @@ impl Qwen3Graph {
                 flash_attn: false,
                 explicit_span,
                 // C8b S2: the window as a list of cell runs. The caller sets it on
-                // a `CParams` only for a device that can gather a map (CPU).
+                // a `CParams` only for a device that can gather a map
+                // (`Device::gathers_attn_map`).
                 kv_map,
                 gpu: metal_on || cuda_on,
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm

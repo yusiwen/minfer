@@ -28,6 +28,19 @@ impl Device {
         !matches!(self, Device::Cpu)
     }
 
+    /// Whether this device's attention kernel can gather a `kv_map` window — a
+    /// query's allowed cells as a list of `(cell, len)` runs (C8b S4).
+    ///
+    /// This is the **single** authority for it, shared by the models' graph
+    /// builder (which asks for the map input) and the server's admission (which
+    /// shares a prefix in place only where a kernel can read one): if the two
+    /// ever disagreed, the graph would be built with a one-range window and the
+    /// share would make attention resolve a *set* of cells — the S2 refusal
+    /// catches that loudly, but the point is that they cannot disagree.
+    pub fn gathers_attn_map(self) -> bool {
+        matches!(self, Device::Cpu | Device::Cuda)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Device::Cpu => "cpu",
