@@ -38,6 +38,7 @@ pub fn runtime_gparams(
             n_ctx,
             flash_attn: false,
             explicit_span: false,
+            kv_map: false,
             gpu,
             fuse_qkv,
             fuse_ffn,

@@ -1160,6 +1160,12 @@ impl GraphAllocator {
             let cells = self.kv_cells_for_seq(seq_ids, positions)?;
             self.fill_input_i32(graph, "cells", &cells)?;
         }
+        if has("kv_map") {
+            // C8b S2: this graph reads its window as a list of cell runs, which is
+            // what a sequence sharing a prefix needs (one `[lo, hi)` cannot name it).
+            let map = self.kv.attn_map(seq_ids, positions)?;
+            return self.fill_input_i32(graph, "kv_map", &map);
+        }
         if !has("attn_span") {
             return Ok(());
         }
@@ -1227,6 +1233,24 @@ impl GraphAllocator {
                     return Err(format!(
                         "input 'cells': cell {cell} is past the {n_ctx}-cell arena \
                          (`docs/ARCHITECTURE-ROADMAP.md` §2.4)"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if name == "kv_map" {
+            // C8b S2: `(cell, len)` runs, not positions — the generic arm below
+            // would resolve them through the store as if they were token indices.
+            let n_ctx = self.kv.n_ctx();
+            for pair in data.chunks_exact(2) {
+                let (cell, len) = (pair[0] as usize, pair[1] as usize);
+                if len == 0 {
+                    continue; // padding slot
+                }
+                if cell + len > n_ctx {
+                    return Err(format!(
+                        "input 'kv_map': run [{cell}, {}) is past the {n_ctx}-cell arena",
+                        cell + len
                     ));
                 }
             }
