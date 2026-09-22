@@ -68,7 +68,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator | L3+L6 | L | 1–2 w |
 | 12 | Backend registry (drop the hard-coded 3-way enum/match) | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
-| 10 | Chunked prefill (`n_batch` actually used) | L2+L5 | M | 3–5 d |
+| 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
 | 15 | Grammar / JSON-schema constrained decoding | L7 | M | 4–6 d |
 | 23 | Op × dtype × backend correctness matrix in CI | L8 | M | 3–5 d |
 
@@ -582,7 +582,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **DONE (D1, 2026-09-19), increments 1–3**: exact views are zero-copy with allocator-known aliasing (`CNode.view` + liveness + no-op kernels), **offset/partial windows work on CPU and CUDA** (`BufRef` carries `offset`+`len` through the `Backend` trait; Metal is exact-only until G5), and the "multi-output node" is `GraphBuilder::split_parts` — one owning node plus one `Op::View` per part, so a producer's single output feeds several consumers with independently bindable tensors while the graph stays single-output. D2's windows are in production; the sketched `Op::SplitParts` was deliberately not added (a split op over one input is just views of that input). **Item 17 (MoE) therefore no longer waits on an IR blocker** — what it needs now is model work (expert weights, routing, the grouped GEMM), and item 16 (MLA) likewise | §2.1 | L |
 | 8 | **Allocator reserve/assign split** + size-class rounding + real memory accounting + VRAM feasibility gate. | §2.3 | L |
 | 9 | **Layer offload policy** on top of (8); needs a layer-granular assignment pass. | §2.6 | L |
-| 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. | §2.5 | M |
+| 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. — **landed in E3 (2026-09-22)**: `prefill_chunks` + `MINFER_N_BATCH` (default 2048, a no-op for prompts that fit), remainder-last so the final forward carries the tail row, and the other slots take their decode step *between* chunks. Measured: 5 forwards / max `nt` 24 vs 1 / 98 for a 98-token prompt; logits bitwise on CPU and ≤ 0.218 (class 1.0) on CUDA; the interleaving A/B is 3 decode steps vs 0; the split costs one forward's fixed overhead per chunk (514 tokens in 4 forwards: CUDA 1.11x, CPU 1.005x; 98 tokens in 5: CUDA 2.0x). Not mixed prefill+decode batches yet · [#45](https://github.com/yusiwen/minfer/issues/45) | §2.5 | M |
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
 | 12 | **Backend registry** decoupling the enum from the nine match sites. | §2.6 | M |
 | 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the Metal half defers to Phase G | §2.8 | S |
