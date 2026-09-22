@@ -49,7 +49,54 @@ pub const MAX_BATCH: usize = 16;
 /// Largest combined prompt (in fed tokens) that one prefill forward carries.
 /// Above this the prefills go one at a time, so the graph width does not churn.
 pub const MAX_PREFILL_BATCH: usize = 512;
+
+/// E3: the default prefill chunk, in fed tokens — `n_batch` made real.
+///
+/// A prefill used to be **one** forward over the whole prompt, so activation memory
+/// scaled with the prompt and a long prompt blocked every other slot's decode for its
+/// whole duration. Chunking bounds the first and interleaves the second, at a measured
+/// cost: each chunk re-streams the weights and re-fills the graph (the graph is keyed
+/// on `n_tokens`, and E4's allocator work is what makes several live at once). 2048
+/// keeps the default identical to the pre-E3 behaviour for every prompt that fits it,
+/// which is what makes this safe to land on by default.
+pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+
 const REPEAT_LAST_N: usize = 64;
+
+/// The prefill chunk size for `MINFER_N_BATCH` (`None`/empty → the default).
+/// `0` disables chunking — one forward per prefill, the pre-E3 behaviour — and a
+/// value that is not a number falls back to the default. Pure, so its matrix is
+/// covered without a server.
+pub fn prefill_chunk_size(requested: Option<&str>) -> usize {
+    match requested {
+        None | Some("") => DEFAULT_PREFILL_CHUNK,
+        Some(v) => v.trim().parse::<usize>().unwrap_or(DEFAULT_PREFILL_CHUNK),
+    }
+}
+
+/// Split the fed tokens `[from, total)` into prefill forwards of at most `chunk`
+/// tokens, in order (E3).
+///
+/// `chunk == 0`, or a suffix no longer than one chunk, yields the whole suffix as a
+/// single span: that is "chunking off", and it is also what keeps short prompts
+/// bit-for-bit on the pre-E3 path. The last span is the remainder, so the final
+/// forward carries the tail row whose logits the request samples from.
+pub fn prefill_chunks(from: usize, total: usize, chunk: usize) -> Vec<(usize, usize)> {
+    if from >= total {
+        return Vec::new();
+    }
+    if chunk == 0 || total - from <= chunk {
+        return vec![(from, total)];
+    }
+    let mut spans = Vec::new();
+    let mut at = from;
+    while at < total {
+        let end = (at + chunk).min(total);
+        spans.push((at, end));
+        at = end;
+    }
+    spans
+}
 
 /// One slot's persistent state: its reservation, the tokens its rows hold, and
 /// the request currently running on it.
@@ -90,6 +137,15 @@ pub struct BatchEngine {
     special: SpecialTokens,
     /// C8a: prefix rows copied from another slot instead of being prefilled.
     prefix_rows_copied: usize,
+    /// E3: prefill forwards carry at most this many fed tokens (`0` = no chunking).
+    n_batch: usize,
+    /// E3: prefill forwards run so far, and the largest `nt` any of them carried —
+    /// the activation bound the ticket demands is an observable, not a claim.
+    prefill_forwards: usize,
+    prefill_max_nt: usize,
+    /// E3: decode steps run *between* the chunks of a prefill — the interleaving's
+    /// observable (0 whenever chunking is off).
+    interleaved_ticks: u64,
 }
 
 /// C7: the cells a request wants reserved — pure, so the growth policy is
@@ -169,6 +225,10 @@ impl BatchEngine {
             slots,
             special: model.special_tokens(),
             prefix_rows_copied: 0,
+            n_batch: DEFAULT_PREFILL_CHUNK,
+            prefill_forwards: 0,
+            prefill_max_nt: 0,
+            interleaved_ticks: 0,
         })
     }
 
@@ -316,7 +376,15 @@ impl BatchEngine {
             .iter()
             .map(|(_, job, slot)| self.feed_span(*slot, &job.input_ids).0)
             .sum();
-        if placed.len() > 1 && total <= MAX_PREFILL_BATCH && self.prefill_batch_ok() {
+        // A group forward is still one forward, so it must respect the chunk too:
+        // with `n_batch` below the group cap the requests are prefilled one at a
+        // time instead (each of them chunked), which keeps a single chunking path.
+        let group_cap = if self.n_batch == 0 {
+            MAX_PREFILL_BATCH
+        } else {
+            self.n_batch.min(MAX_PREFILL_BATCH)
+        };
+        if placed.len() > 1 && total <= group_cap && self.prefill_batch_ok() {
             match self.prefill_group(model, &placed) {
                 Ok(()) => {
                     for (i, _, slot) in &placed {
@@ -563,6 +631,32 @@ impl BatchEngine {
     /// argmax on a near-tie. A slot is therefore a *session's KV home*, not an
     /// interchangeable resource, which is also what makes B2's cross-request
     /// prefix reuse possible; this entry point is how a caller pins one.
+    /// E3: set the prefill chunk size (fed tokens per prefill forward; `0` = one
+    /// forward per prefill, the pre-E3 behaviour).
+    pub fn set_prefill_chunk(&mut self, n_batch: usize) {
+        self.n_batch = n_batch;
+    }
+
+    /// E3: `(largest nt any prefill forward carried, prefill forwards run)`. The
+    /// activation-memory bound is `max_nt`, so the gate asserts on this rather than
+    /// on a claim about buffers.
+    pub fn prefill_stats(&self) -> (usize, usize) {
+        (self.prefill_max_nt, self.prefill_forwards)
+    }
+
+    /// E3: decode steps run between the chunks of a prefill (0 with chunking off).
+    pub fn interleaved_ticks(&self) -> u64 {
+        self.interleaved_ticks
+    }
+
+    /// Whether an already admitted request has a token waiting for its decode
+    /// forward — what interleaving a prefill is *for*.
+    fn has_pending_decode(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.run.as_ref().is_some_and(|r| r.needs_forward.is_some()))
+    }
+
     pub fn submit_on(
         &mut self,
         model: &dyn ModelDef,
@@ -570,7 +664,6 @@ impl BatchEngine {
         idx: usize,
         job: Job,
     ) -> Result<usize, ApiError> {
-        let _ = tokenizer;
         if idx >= self.slots.len() {
             return Err(ApiError::invalid_request(format!(
                 "slot {idx} does not exist ({} slots)",
@@ -612,21 +705,52 @@ impl BatchEngine {
         // `start + position`); adding `start` here would double-count it and
         // `kv_cells_for_seq` rejects the result (a run of `cap` cells at `start`
         // cannot hold position `start + i`).
-        let positions: Vec<usize> = (feed_from..nt).collect();
-        let seq_ids = vec![seq; nt - feed_from];
-        let batch = Batch::new(job.input_ids[feed_from..].to_vec(), positions, seq_ids);
+        // E3: feed the suffix in chunks of at most `n_batch` tokens; `n_batch = 0`
+        // keeps the pre-E3 single forward, which is what the equality gate compares
+        // against. Every chunk asks for one output row: `n_out` is part of
+        // `GraphParams`, so varying it per chunk would rebuild the graph once more
+        // for nothing (the lm_head over one row is noise next to the prefill).
+        let spans = prefill_chunks(feed_from, nt, self.n_batch);
+        let n_spans = spans.len();
         let live_on = crate::live::enabled();
         if live_on {
             crate::live::begin_phase("prefill");
         }
         let trace = std::env::var("MINFER_BATCH_TRACE").is_ok();
         let t0 = std::time::Instant::now();
-        let last_logits =
-            guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)?;
+        let mut last_logits: Vec<f32> = Vec::new();
+        for (i, (from, to)) in spans.into_iter().enumerate() {
+            let batch = Batch::new(
+                job.input_ids[from..to].to_vec(),
+                (from..to).collect(),
+                vec![seq; to - from],
+            );
+            self.prefill_forwards += 1;
+            self.prefill_max_nt = self.prefill_max_nt.max(batch.len());
+            let logits =
+                guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)?;
+            if i + 1 == n_spans {
+                last_logits = logits;
+            }
+            // E3: a long prompt must not stall the conversations already running.
+            // Between chunks — never before the first or after the last — the other
+            // slots take their decode step; the chunk's rows are already written, so
+            // this is exactly the tick `serve_loop` would have run next. A failure
+            // there belongs to *that* request, not this one, so it is logged and the
+            // prefill carries on (mirroring `serve_loop`).
+            if i + 1 < n_spans && self.has_pending_decode() {
+                self.interleaved_ticks += 1;
+                if let Err(e) = self.tick(model, tokenizer) {
+                    eprintln!("[server] interleaved decode step failed: {}", e.message);
+                }
+            }
+        }
         if trace {
             eprintln!(
-                "[batch] single prefill: slot {idx}, {} tokens, {:.0} ms",
-                batch.len(),
+                "[batch] single prefill: slot {idx}, {} tokens in {n_spans} forward(s) \
+                 (n_batch {}), {:.0} ms",
+                nt - feed_from,
+                self.n_batch,
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -1669,6 +1793,305 @@ mod tests {
         assert!(
             t_serial > t_batch,
             "batching must not be slower ({t_batch:.2}s vs {t_serial:.2}s)"
+        );
+    }
+    /// E3: the chunk plan. Its boundaries are the whole contract — the last span is
+    /// the remainder, `0` means "off" (one span, the pre-E3 behaviour), and a suffix
+    /// that already fits is not split.
+    #[test]
+    fn prefill_chunks_split_a_suffix_by_the_chunk_size() {
+        assert_eq!(prefill_chunks(0, 10, 0), vec![(0, 10)], "0 = chunking off");
+        assert_eq!(prefill_chunks(0, 10, 10), vec![(0, 10)]);
+        assert_eq!(
+            prefill_chunks(0, 10, 16),
+            vec![(0, 10)],
+            "a suffix that fits stays one span"
+        );
+        assert_eq!(prefill_chunks(0, 10, 4), vec![(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(
+            prefill_chunks(0, 8, 4),
+            vec![(0, 4), (4, 8)],
+            "an exact multiple must not emit an empty tail"
+        );
+        assert_eq!(
+            prefill_chunks(3, 11, 4),
+            vec![(3, 7), (7, 11)],
+            "the reused prefix is not fed, so the split starts at `from`"
+        );
+        assert_eq!(prefill_chunks(5, 5, 4), Vec::<(usize, usize)>::new());
+        assert_eq!(prefill_chunks(6, 5, 4), Vec::<(usize, usize)>::new());
+        assert_eq!(prefill_chunks(0, 1, 8), vec![(0, 1)]);
+        // Whatever the numbers, the spans tile `[from, total)` exactly and none is
+        // wider than the chunk.
+        for (from, total, chunk) in [(0usize, 100usize, 7usize), (0, 100, 1), (13, 91, 9)] {
+            let spans = prefill_chunks(from, total, chunk);
+            assert_eq!(spans.first().map(|s| s.0), Some(from));
+            assert_eq!(spans.last().map(|s| s.1), Some(total));
+            for (i, &(a, b)) in spans.iter().enumerate() {
+                assert!(
+                    a < b && b - a <= chunk,
+                    "span {i} = ({a}, {b}) outside the chunk"
+                );
+                if i > 0 {
+                    assert_eq!(
+                        spans[i - 1].1,
+                        a,
+                        "span {i} does not continue the previous one"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_prefill_chunk_size_comes_from_the_env_or_the_default() {
+        assert_eq!(prefill_chunk_size(None), DEFAULT_PREFILL_CHUNK);
+        assert_eq!(prefill_chunk_size(Some("")), DEFAULT_PREFILL_CHUNK);
+        assert_eq!(prefill_chunk_size(Some(" 512 ")), 512);
+        assert_eq!(prefill_chunk_size(Some("0")), 0, "0 is the off switch");
+        assert_eq!(
+            prefill_chunk_size(Some("banana")),
+            DEFAULT_PREFILL_CHUNK,
+            "a typo keeps the default rather than disabling chunking"
+        );
+        assert_eq!(prefill_chunk_size(Some("-1")), DEFAULT_PREFILL_CHUNK);
+    }
+
+    /// E3 gate helper: the bytes of `Text` a slot has been sent so far, drained
+    /// without blocking (the events are already queued by the engine).
+    fn drain_text_len(rx: &mut mpsc::Receiver<StreamEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Text(t) = ev {
+                n += t.len();
+            }
+        }
+        n
+    }
+
+    /// E3 acceptance: a prompt several times the chunk size is served with **every**
+    /// prefill forward bounded by the chunk, and the continuation is the one the
+    /// unchunked path produced.
+    ///
+    /// The comparison class is the repo's standing one: bitwise on CPU (its kernels
+    /// are per-token, so shape never enters the arithmetic) and a named tolerance on
+    /// CUDA, whose prefill GEMM tiles by `nt` and quantizes activations to int8. The
+    /// gate also asserts that the *unchunked* run really did exceed the chunk —
+    /// otherwise it would be proving nothing.
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn a_chunked_prefill_answers_like_an_unchunked_one() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the E3 equality gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode(&"buffalo ".repeat(96));
+        let chunk = (ids.len() / 4).max(8);
+        let n_ctx = ids.len() + 64;
+        assert!(
+            ids.len() > 4 * chunk / 2,
+            "the prompt must be several chunks long: {} tokens, chunk {chunk}",
+            ids.len()
+        );
+
+        // Returns the prefill's own tail-row logits (what the request samples its
+        // first token from), the continuation, and the forward stats.
+        let drive = |chunk: usize| -> (Vec<f32>, String, usize, usize) {
+            let mut engine = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
+            engine.set_prefill_chunk(chunk);
+            let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+            engine
+                .submit(
+                    &*model,
+                    &tok,
+                    Job {
+                        input_ids: ids.clone(),
+                        params: sampling_params(8),
+                        tx,
+                    },
+                )
+                .expect("submit");
+            let (max_nt, forwards) = engine.prefill_stats();
+            let logits = engine.slots[0]
+                .run
+                .as_ref()
+                .expect("the prefill installed a run")
+                .last_logits
+                .clone();
+            while engine.busy() {
+                engine.tick(&*model, &tok).expect("tick");
+            }
+            let mut text = String::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let StreamEvent::Text(t) = ev {
+                    text.push_str(&t);
+                }
+            }
+            (logits, text, max_nt, forwards)
+        };
+
+        let (plain_logits, plain, max_plain, fwd_plain) = drive(0);
+        let (chunked_logits, chunked, max_chunked, fwd_chunked) = drive(chunk);
+        eprintln!(
+            "[e3] {}-token prompt: chunked {fwd_chunked} forward(s), max nt {max_chunked}; \
+             unchunked {fwd_plain} forward(s), max nt {max_plain}",
+            ids.len()
+        );
+        assert!(
+            fwd_chunked >= 4,
+            "the chunked run must really split ({fwd_chunked} forwards for a {}-token prompt \
+             at chunk {chunk})",
+            ids.len()
+        );
+        assert!(
+            max_chunked <= chunk,
+            "a prefill forward carried {max_chunked} tokens, over the {chunk} chunk"
+        );
+        assert!(
+            max_plain > chunk,
+            "the unchunked run carried only {max_plain} tokens, so this gate proves nothing"
+        );
+        assert!(!chunked.is_empty(), "the chunked run produced no text");
+        // The comparison class is the repo's standing one: **bitwise** on CPU (its
+        // kernels are per-token, so shape never enters the arithmetic) and a named
+        // tolerance on CUDA, whose prefill tiles by `nt` and quantizes activations to
+        // int8 — the same tokens at a different width land on different scores
+        // (measured <= 0.37 absolute on this repo's fixtures; 1.0 is the gross-error
+        // bound `cross_shape_tolerance` uses). The *continuation* is asserted only on
+        // CPU: on a degenerate repeated-token prompt a sub-tolerance logit shift can
+        // flip an argmax, which is a fact about the prompt, not about chunking.
+        assert_eq!(
+            plain_logits.len(),
+            chunked_logits.len(),
+            "logit widths differ"
+        );
+        let worst = plain_logits
+            .iter()
+            .zip(&chunked_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let on_cuda = {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::CudaState::get().is_some()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        };
+        let tol = if on_cuda { 1.0 } else { 0.0 };
+        let agree = plain
+            .bytes()
+            .zip(chunked.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        eprintln!(
+            "[e3] prefill logits: max |Δ| = {worst} (class {tol}); continuations agree on the \
+             first {agree} bytes"
+        );
+        assert!(
+            worst <= tol,
+            "chunking moved the prefill's logits by {worst} (class {tol})"
+        );
+        if !on_cuda {
+            assert_eq!(
+                plain, chunked,
+                "chunking changed the continuation (must be bitwise on CPU)"
+            );
+        }
+    }
+
+    /// E3 acceptance: while a long prompt prefills, the slots already serving keep
+    /// taking their decode steps.
+    ///
+    /// The interleaving is observed the way the ticket states it — as tokens emitted
+    /// by the *other* slot during the prefill call — with the A/B being chunking off,
+    /// where one forward means no decode step can fit inside the prefill at all.
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn a_long_prefill_keeps_another_slot_decoding() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the E3 interleaving gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        // Both prompts are repeats: neither is expected to EOG, which keeps the
+        // scenario about scheduling rather than about the model's mood.
+        let short = tok.encode(&"buffalo ".repeat(48));
+        let long = tok.encode(&"buffalo ".repeat(192));
+        let chunk = (long.len() / 4).max(8);
+        let n_ctx = long.len() + 256;
+
+        let drive = |chunk: usize| -> (usize, u64, usize) {
+            let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
+            engine.set_prefill_chunk(chunk);
+            // Slot 1 is already serving when the long request arrives.
+            let (tx1, mut rx1) = mpsc::channel::<StreamEvent>(4096);
+            engine
+                .submit_on(
+                    &*model,
+                    &tok,
+                    1,
+                    Job {
+                        input_ids: short.clone(),
+                        params: sampling_params(48),
+                        tx: tx1,
+                    },
+                )
+                .expect("short submit");
+            for _ in 0..3 {
+                engine.tick(&*model, &tok).expect("tick");
+            }
+            // Drain what the three ticks produced: the next drain's *return* is then
+            // exactly the bytes slot 1 gains while the long prefill runs (draining is
+            // destructive, so nothing may be subtracted here).
+            let before = drain_text_len(&mut rx1);
+            assert!(
+                before > 0,
+                "slot 1 must have emitted something before the long prefill"
+            );
+            let (tx0, _rx0) = mpsc::channel::<StreamEvent>(4096);
+            engine
+                .submit_on(
+                    &*model,
+                    &tok,
+                    0,
+                    Job {
+                        input_ids: long.clone(),
+                        params: sampling_params(4),
+                        tx: tx0,
+                    },
+                )
+                .expect("long submit");
+            let gained = drain_text_len(&mut rx1);
+            (gained, engine.interleaved_ticks(), engine.prefill_stats().0)
+        };
+
+        let (grew, ticks, max_nt) = drive(chunk);
+        let (grew_off, ticks_off, max_nt_off) = drive(0);
+        eprintln!(
+            "[e3] long prefill: chunked -> {ticks} interleaved step(s), slot 1 gained {grew} \
+             bytes, max prefill nt {max_nt}; chunking off -> {ticks_off} step(s), gained \
+             {grew_off}, max nt {max_nt_off}"
+        );
+        assert!(max_nt <= chunk, "chunked prefill carried {max_nt} tokens");
+        assert!(
+            ticks > 0 && grew > 0,
+            "a chunked prefill must keep the other slot decoding (ticks {ticks}, bytes {grew})"
+        );
+        assert_eq!(
+            ticks_off, 0,
+            "chunking off is one forward, so nothing can interleave"
+        );
+        assert_eq!(
+            grew_off, 0,
+            "with chunking off the other slot cannot advance during the prefill"
         );
     }
 }
