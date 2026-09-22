@@ -4,11 +4,11 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, staged S1a/S1b (both landed) then S2–S5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3 landed, S4–S5 next); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8b S3 (copy-on-write for a store that would land in a shared block), then S4–S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: C8b S4 (CUDA attention gather + device A/B), then S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1343,6 +1343,59 @@ here, and every backend that cannot gather refuses loudly instead of misreading 
 S3 then adds copy-on-write (`kv_private_row_for`) for a store that would land in a shared block; S4
 ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
 
+**C8b S3 landed (2026-09-22) — a store inside a shared prefix copies the row first.**
+`KvCache::private_row_for(seq, t)` plans a **copy-on-write** and `apply_private_row` books it, with
+`GraphAllocator::kv_private_row_for` driving the data half through `Backend::copy_cells`; both fill entry
+points (`fill_batch_inputs`, `fill_attn_inputs`) run it **before the first cell is resolved**, and the
+store resolver (`kv_cells_for_seq`) now refuses a position inside the share outright. A sharing
+sequence's run holds positions `[shared.rows, shared.rows + cap)`, so a store at `t < shared.rows` gives
+the share up from `t` on: `shared.rows` drops to `t` and the rows the sequence already wrote shift **up**
+by `d = old_base - t` inside the same run. That arithmetic is what keeps the change small — the span list
+stays at **two entries** (the remaining share plus the run), the owner table mirrors the move with one
+`copy_within`, and `written` is unchanged: the sequence's readable positions are still `[0, written)`,
+only `private_written` grows by `d`. `KvArenaStats` gains `cows`/`cow_cells` so a gate can *see* the
+mechanism run, and `GraphAllocator::kv_cell_of` is the read-side twin of the store resolver (a caller
+snapshotting a sharing sequence's rows cannot use the store one, which refuses those positions by
+design).
+
+**Why the run is rebased rather than given a fresh row per token.** The design's `kv_private_row_for
+(seq, t)` says "a private row for that token", and the honest way to give it one is to move the run's
+base, not to hand out unrelated cells: a per-token fresh cell would put `d` one-length spans in the span
+list for a `d`-token divergence, while `kv_map` carries `KV_MAP_MAX_SPANS = 4` runs — so any real
+divergence would fail the read path — and a *second* run per sequence is a data-model change (`SeqSlot`
+is one run) that every relocation path would have to learn. Growing the run **downward** instead of
+shifting (`[start - d, …)`) needs `d` free cells immediately below it, and C7's compaction packs free
+space *upward*, so that placement is usually blocked. The shift needs no arena space at all, only
+`cap - private_written >= d`, and `copy_cells` is overlap-safe (C7b), so it is one move inside one run.
+
+**The room is not assumed.** The shift needs `cap >= written - t`, and the server's sizing guarantees it:
+a run is sized for the whole previous request (`prompt + max_tokens`, and generation stops at
+`max_tokens`), so it covers the shared rows as well as the private ones — `cap >= rows + w >= written - t`.
+A hand-sized run without that room gets a **loud `Err`** (gate 3's second arm), never a write-through.
+
+**Why the pre-pass is its own loop.** The shift renumbers the run's cells, so a cell resolved before it
+would be stale; the resolver's refusal is what makes a missed maintenance point visible instead of
+silent. After the copy the share is `[0, t)` — still two spans, or one when `t = 0` and the share
+disappears — so `CParams.kv_map` is unaffected: the builder saw a share at build time, and `attn_map`
+handles one entry as readily as two.
+
+**Gate 3 holds.** Always-run coverage: three `KvCache` unit tests (the plan; its refusals — a run with no
+room, and a plan applied to a state it was not made from; the owner table and the spans; and a sequence
+that copies **twice** as it diverges earlier each time, ending with the share gone) plus one allocator
+test on real regions that refuses a shared position through the store resolver, drives the copy, checks
+K/V byte-for-byte at the moved cells, checks the donor's four rows are unchanged, and drives a second
+copy-on-write through `fill_attn_inputs`. The real-model gate
+(`a_store_inside_a_shared_prefix_takes_a_private_row`, ignored like the others) shares 16 rows between
+two slots and then serves slot 1 a prompt matching only their first three tokens: the request is served
+(the resolver would otherwise refuse it), `cows > 0` proves the copy ran, the answer is byte-identical to
+the same prompt on an engine with nothing to share, and the **donor's** rows — 17 positions × K/V × 24
+layers — are byte-identical after it. That last check is the one with teeth: disabling the pre-pass *and*
+the resolver's guard makes the store write through, and the gate fails on exactly that comparison
+("the diverging request wrote through the shared prefix"). Gate 3's `kv_rm` half (`occupied()` derived
+from the span lists) landed with S2. Suites: CPU 233 / CUDA 282, 0 failed.
+
+S4 ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
+
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
 (3) CoW's per-token private rows must not fragment the arena beyond what C7's growth can absorb;
@@ -1352,7 +1405,7 @@ the stats gate watches exactly that.
 |---|---|---|
 | S1 | Per-sequence **span list** + the resolvers (`kv_cells_for_seq`, `attn_span`) reading through it — single-entry in practice, so nothing observable changes | no behaviour change: suites stay bitwise |
 | S2 | Block-granular **refcounts** + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
-| S3 | Copy-on-write: `kv_private_row_for` at store resolution | gate 3 |
+| S3 | Copy-on-write: `kv_private_row_for` at store resolution — **landed 2026-09-22**: the share shrinks to the first position this forward writes and the run's own rows shift up inside it (two spans, no arena space needed), the store resolver refuses a shared position, and a run without room is a loud `Err` | gate 3 on CPU + the real-model donor-byte check |
 | S4 | CUDA attention gather + device A/B | gate 2 on GB10 + timing |
 | S5 | Metal behind G5 (refuse the map, as it refuses the span) + docs closure | compile check + G5 record |
 
