@@ -3099,6 +3099,18 @@ mod tail_tests {
     use super::*;
     use crate::models::ModelDef;
 
+    /// Dump directory for the `dump_real_*` debug helpers.
+    ///
+    /// They exist to hand real tensor slices to an external parity check, so the
+    /// files are meant to stay on disk. Nothing created the directory, so both
+    /// helpers panicked on the *write* instead of doing their job (issue #82);
+    /// creating it is the whole fix.
+    fn dump_dir() -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from("/tmp/minfer_phase7");
+        std::fs::create_dir_all(&dir).expect("create the dump directory");
+        dir
+    }
+
     fn model_path() -> Option<std::path::PathBuf> {
         let home = std::env::var_os("HOME")?;
         let mut p = std::path::PathBuf::from(home);
@@ -3738,11 +3750,12 @@ mod tail_tests {
             }
             match found {
                 Some((ty, ne, data)) => {
-                    let out = format!("/tmp/minfer_phase7/real_{}.bin", name.replace('.', "_"));
+                    let out = dump_dir().join(format!("real_{}.bin", name.replace('.', "_")));
                     std::fs::write(&out, data).unwrap();
                     spec.push_str(&format!(
-                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {out}\n",
-                        data.len()
+                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {}\n",
+                        data.len(),
+                        out.display()
                     ));
                 }
                 None => spec.push_str(&format!("{name}: MISSING\n")),
@@ -3788,11 +3801,12 @@ mod tail_tests {
             }
             match found {
                 Some((ty, ne, data)) => {
-                    let out = format!("/tmp/minfer_phase7/real05_{}.bin", name.replace('.', "_"));
+                    let out = dump_dir().join(format!("real05_{}.bin", name.replace('.', "_")));
                     std::fs::write(&out, data).unwrap();
                     spec.push_str(&format!(
-                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {out}\n",
-                        data.len()
+                        "{name}: type={ty:?} ne={ne:?} bytes={} -> {}\n",
+                        data.len(),
+                        out.display()
                     ));
                 }
                 None => spec.push_str(&format!("{name}: MISSING\n")),
