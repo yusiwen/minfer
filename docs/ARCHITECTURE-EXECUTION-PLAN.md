@@ -33,8 +33,10 @@ C8a, D1–D3, E1/E1b/E2/E6 — have no issue, and their record here is the only 
 tickets below that *do* have one are exactly the open list in the
 [tracker](https://github.com/yusiwen/minfer/issues). Doc debt and test health are filed
 the same way: [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`
-staleness), [#63](https://github.com/yusiwen/minfer/issues/63) (CI does not enforce the
-docs build). Test health was [#82](https://github.com/yusiwen/minfer/issues/82) — the three
+staleness). The docs build was [#63](https://github.com/yusiwen/minfer/issues/63) and is
+**closed**: CI job `check-docs` builds the book with the same toolchain Docs deploys with
+and runs `scripts/check_docs_links.py`, so a renamed file now fails on the PR that renames
+it instead of rotting silently (it found four dead links the day it landed). Test health was [#82](https://github.com/yusiwen/minfer/issues/82) — the three
 `#[ignore]`d real-model tests that failed on `master` — and it is **closed**: two were
 writing into a directory nothing created, and the third asserted a *model behaviour* (the
 greedy 0.5B stopping on EOG within 16 tokens) instead of the engine's rule that ties
@@ -1002,13 +1004,19 @@ CUDA, then a docs progress update, then a commit on `feat/logical-positions`).
 
 | Step | Content | Gate |
 |---|---|---|
-| S0 | this design, the roadmap/status corrections | docs build |
+| S0 | this design, the roadmap/status corrections | docs build (`check-docs`) |
 | S1 | `cells` wiring + allocator/kvcache resolver + model/server switch + fused QKV gated off under `explicit_span` | invariants 1–2, 4; CPU+CUDA suites |
 | S2 | compaction without a re-rope; the bit-identity gate | invariants 1–3 |
 | S1∪S2 | *merged in execution:* the re-rope removal is **not** optional once S1 lands — S1 makes the stored K rows' angles sequence-relative, so a compaction that still re-roped them by `from - to` would rotate them *away* from the correct angle. The first S1 run showed exactly that: `a_compaction_between_steps_keeps_the_continuation` failed with a flipped greedy token until `kv_defrag` stopped re-roping. Semantics switch and re-rope removal must therefore land in the **same** commit. | as above |
 | S3 | CUDA fused QKV family takes `cells`; the gate re-enabled for CUDA — **landed**, plus a server position bug the gate exposed | invariant 5 + fused-vs-unfused bitwise + capture regression |
-| S4 | docs closure (roadmap §2.4, AGENTS rules, design docs) | docs build |
-| S5 | PR, CI three jobs green with zero annotations, rebase merge | CI |
+| S4 | docs closure (roadmap §2.4, AGENTS rules, design docs) | docs build (`check-docs`) |
+| S5 | PR, CI four jobs green with zero annotations, rebase merge | CI |
+
+> The `docs build` gate is the CI job **`check-docs`** (`.github/workflows/ci.yml`):
+> `mdbook build` with the deployed toolchain plus `scripts/check_docs_links.py`. It did not
+> exist when S0/S4 ran — the docs were checked by hand then — and it landed with
+> [#63](https://github.com/yusiwen/minfer/issues/63); the rows above name it so the record
+> and the gate agree.
 
 #### C6 progress (2026-09-19)
 

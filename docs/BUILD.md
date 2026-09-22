@@ -72,5 +72,5 @@ still succeeds and the shader is compiled from source at first run.
   a CUDA toolkit. The driver is never a link-time dependency in either mode.
 - In CUDA builds the int8 tensor-core MMQ prefill path is **default-on**
   (runtime gates `MINFER_MMQ*`, see the README's
-  [Performance](README.md#performance) section /
+  [Performance](../README.md#performance) section /
   [CUDA_OPTIMIZATION.md](CUDA_OPTIMIZATION.md)).

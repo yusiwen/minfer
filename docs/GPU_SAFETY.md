@@ -5,7 +5,7 @@
 > original incident-driven rules; the CUDA section at the end translates them
 > for the graph CUDA backend. See
 > [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) for performance work and
-> [`AGENTS.md`](AGENTS.md) for the project overview.
+> [`AGENTS.md`](../AGENTS.md) for the project overview.
 
 ---
 

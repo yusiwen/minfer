@@ -1,7 +1,7 @@
 # Usage
 
 Examples use the built binary (`cargo build --release` first — see the
-[Build section](README.md#build) of the project README); `cargo run --release
+[Build section](../README.md#build) of the project README); `cargo run --release
 -- …` works identically.
 
 ```bash
