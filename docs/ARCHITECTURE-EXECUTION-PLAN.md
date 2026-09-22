@@ -1,23 +1,28 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
-C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
-is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3/S4/S5 landed — closed on CPU and CUDA, Metal's share path at G5); C4, C5 open); Phase D **3/3** (**D1 done**: views,
-multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
+2026-09-16); Phase C **6/8** — C1, C2, **C3**, **C6 (logical positions)**, **C7 (+C7b)**
+and **C8 (cross-sequence cell sharing)** are done. C6 merged 2026-09-20 as `001b8cc`;
+**C7 landed 2026-09-20** (the partition is elastic, and growth moves runs in **both**
+directions, so a busy neighbour above the slot no longer blocks it); **C8** split into
+**C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a
+block map and a gather in every attention kernel — S1a/S1b/S2/S3/S4/S5 landed, closed on
+CPU and CUDA, Metal's share path at G5); **C4 (quantized Q8_0 cache, CPU)** landed
+2026-09-22 as S1 — its fused dots and the CUDA/Metal kernels are
+[#87](https://github.com/yusiwen/minfer/issues/87). C5 open. Phase D **3/3** (**D1 done**:
+views, multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: G1–G3 and G5 (Metal, on a Mac), then C4/C5, then E3–E5.** The order is deliberate: the
-Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
-so those semantics are written into Metal once. Per-ticket evidence is in each phase's
-record and in the §14 open-risks table.
+check). **Next: C5, then G1–G3 and G5 (Metal, on a Mac), then E3–E5.** The order is
+deliberate: the Metal KV port (G5) comes **after** the CUDA arena stops changing shape
+(C7, C7b, C8), so those semantics are written into Metal once. Per-ticket evidence is in
+each phase's record and in the §14 open-risks table.
 **Companion to:** `docs/ARCHITECTURE-ROADMAP.md` (what is missing, why, and how it
 is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
 **Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
 `architecture-phase-a` (PR #1). This status was refreshed against `master =
-8f25904` (2026-09-22); it is refreshed with every PR that lands a ticket.
+0fdc05c` (2026-09-22); it is refreshed with every PR that lands a ticket.
 
 **Issue links.** Work tracked on GitHub carries its issue link in its table row
 (prose sections carry it in the heading), and the record written when that work lands
@@ -819,12 +824,67 @@ real model. Still open: driving the compaction from the **server's** dynamic run
 there), and the logical-positions change that would remove the re-rope and the
 offset sensitivity altogether.
 
-### C4 / C5
-- C4: Q8_0 KV first, behind `MINFER_CACHE_TYPE`, gated to where the kernels
-  support it; acceptance = named tolerance class (dequantisation is not
-  bitwise) plus a memory-footprint measurement.
-- C5: write/read the KV state to a file; acceptance = a session resumed from
-  disk produces the same continuation as one that stayed in memory.
+### C4 — Quantized KV cache, Q8_0 first · [#42](https://github.com/yusiwen/minfer/issues/42) — **DONE (S1, CPU) 2026-09-22**
+
+**Why.** f32 (and the GPU's f16-in-an-f32-region) is all the cache could be, so context
+length was bounded by KV memory with no way to trade precision for it. Q8_0 is the first
+**packed** layout: one cell is `ceil(n_kv_embd/32 * 34)` bytes instead of `4 * n_kv_embd`,
+which is a real footprint reduction — unlike f16, whose regions stay f32-shaped and buy
+bandwidth, not memory.
+
+**What S1 landed** (`src/graph/kvformat.rs` is the new authority):
+
+- `KvFormat { F32, F16, Q8_0 }` with a **strict** `MINFER_CACHE_TYPE` parser and a device
+  policy (`resolve`, pure so CI covers the matrix): an unknown value is refused on every
+  device — CUDA used to read anything that was not `f16` as f32, which is exactly the
+  silent fallback the ticket forbids — and `q8_0` is refused loudly on CUDA and Metal,
+  whose attention kernels address f32/f16 rows. `f16` on CPU stays the documented f32
+  (a process whose env is set for a GPU run must not fail a CPU one); the load path
+  (`models::load_model_ns`) turns any refusal into a failed load with the reason printed.
+- **Packed rows stay addressable by the C3/C8b machinery.** A cell is rounded up to a
+  whole number of f32 words, so `elems / n_ctx` is still one cell's width and
+  `copy_cells` (the copy-on-write shift, the compaction) keeps moving rows verbatim with
+  no change at all. `KvcacheMeta::row_elems` carries the cell width, `ensure_kv` sizes the
+  region by it, and the node's shapes stay *logical* (`[n_kv_embd, n_ctx]`), which is what
+  the store's K/V input means.
+- **CPU store quantizes, CPU attention dequantizes** the union of the batch's windows into
+  a reusable scratch and runs the unchanged f32 GQA kernel. Correctness first: the fused
+  Q8_0 dot that removes that pass, a quantize-aware physical shift, and the CUDA/Metal
+  kernels are [S2, issue #87](https://github.com/yusiwen/minfer/issues/87). A physical
+  `kv_rm`/`kv_shift` is refused loudly on a packed region for the same reason (it re-ropes
+  K in f32).
+
+**Acceptance, as measured** (CPU, `cargo test --release`, 2026-09-22):
+
+- *Footprint*: the real-model gate prints the persistent regions, f32 against q8_0 —
+  0.5B (n_kv_embd 128): **6 291 456 B → 1 671 168 B (3.76× smaller)**; Qwen3-0.6B Q8_0
+  (n_kv_embd 1024, head dim 128): **58 720 256 B → 15 597 568 B (3.76×)**.
+- *Tolerance class* (never bitwise — the store rounds every K/V cell): at the reference's
+  argmax the logits move by ≤ **1.0** (measured 0.60 on the 0.5B, 0.55 on Qwen3), and over
+  the whole 152k-way vector by ≤ **3.0** (measured 2.50, ≤ 8 % of the 37.8 spread). The
+  greedy continuation agreement is *reported*, not asserted: the CLI diverges at the 5th
+  token on a chat-templated 0.5B prompt, which is the format's honest cost, not a defect.
+- *The format itself is pinned one level down*: `a_packed_kv_region_answers_like_the_f32_one_and_is_smaller`
+  asserts a stored cell is **bitwise** the Q8_0 quantizate of the row it was given (and
+  that the f32 region holds the row verbatim), plus the 3× footprint and an attention
+  comparison over three causal queries. The gate was mutation-checked: disabling the
+  packed read path turns that comparison into max |Δ| = 3.2e38.
+- *Refusals*: `MINFER_CACHE_TYPE=q8_0` on this box (CUDA available) ends the load with
+  `minfer: MINFER_CACHE_TYPE=q8_0 is not supported on cuda yet: …`, and a typo
+  (`banana`) with `… is not a KV cache type (f32, f16, q8_0); refusing rather than
+  silently running with f32`. `ensure_kv` backstops both: a packed width on a non-CPU
+  backend, and a width Q8_0 cannot express, are `Err` where the region is sized.
+
+**Coverage, stated rather than implied.** The packed layout, the parser/policy matrix, the
+store-exactness check, the refusal and the region accounting are unit-tested and run in
+CI. The real-model gate is `#[ignore]`d (it flips a process-wide policy) and was run on
+both cached models. Not verified here: any packed region on a GPU (by design, S1 refuses
+it), and the fused dots' performance (S2).
+
+### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43)
+- Write/read the KV state (rows + ownership + the run table) to a file; acceptance = a
+  session resumed from disk produces the same continuation as one that stayed in memory,
+  and a truncated or version-mismatched file is rejected loudly.
 
 ### C6 — Logical positions (`positions` ≠ cells)
 
@@ -2493,7 +2553,7 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
          └─ A2 ──────┘
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86

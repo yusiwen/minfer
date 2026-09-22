@@ -10,7 +10,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | Platform | any | macOS (Apple GPU) | NVIDIA, **opt-in** `--features cuda` |
 | Assign priority | last (always answers) | first on macOS | second, when built in |
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
-| KV cache | f32 regions | f32 or f16 (`MINFER_CACHE_TYPE=f16`) | f32 or f16 |
+| KV cache | f32 regions, or packed Q8_0 (`MINFER_CACHE_TYPE=q8_0` — C4, 3.76× smaller) | f32 or f16 (`MINFER_CACHE_TYPE=f16`) | f32 or f16 |
 | Async model | synchronous | one `MpsCommandBuffer` per split | stream + CUDA Graph capture/replay |
 | Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-DESIGN.md), [campaign](./CUDA_OPTIMIZATION.md) |
 
@@ -101,6 +101,19 @@ return past a `threadgroup_barrier`, device limits queried at runtime).
   fusions.
 - Optional f16 KV regions halve attention bandwidth (`MINFER_CACHE_TYPE=f16`).
 
+### CPU KV cache types — `MINFER_CACHE_TYPE`
+
+`f32` (default) · `f16` (resolves to f32 here: this path has no f16 KV kernel) ·
+`q8_0` (**C4**: packed Q8_0 cells, `ceil(n_kv_embd/32 * 34)` bytes per cell instead of
+`4 * n_kv_embd`, so the regions are **3.76× smaller**; the store quantizes and the
+attention read dequantizes its window). An unknown value is refused on every device, and
+`q8_0` is CPU-only for now — CUDA and Metal refuse it loudly rather than run f32
+(the fused Q8_0 dots and the GPU kernels are
+[issue #87](https://github.com/yusiwen/minfer/issues/87)). A physical context shift
+(`kv_rm`/`kv_shift`, which re-ropes K in f32) is refused on a packed region. The
+tolerance class against f32 is named, never bitwise: see the C4 record in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md` §5.
+
 ### CUDA — opt-in, campaign-tuned
 
 - Built only with `--features cuda` (plain builds never touch nvcc);
@@ -133,7 +146,7 @@ must still run the FusionPass.
   nowhere.
 - `MINFER_DISABLE_MPS=1` — force the CPU backend on macOS.
 - `MINFER_NO_NEON=1` (aarch64) — drop the CPU NEON layer to scalar (A/B lever).
-- `MINFER_NO_CUDA_GRAPH=1`, `MINFER_CACHE_TYPE=f16|f32`,
+- `MINFER_NO_CUDA_GRAPH=1`, `MINFER_CACHE_TYPE=f32|f16|q8_0` (`q8_0` = CPU only, C4),
   `MINFER_NO_FUSE_QKV` / `MINFER_NO_FUSE_FFN` — per-backend behavior levers.
 - Which backend to expect: the startup banner and `MINFER_TRACE` /
   `MINFER_GRAPH_TRACE` show per-node assignments

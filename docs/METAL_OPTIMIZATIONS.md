@@ -1047,7 +1047,7 @@ For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
 | Var | Meaning |
 |---|---|
 | `MINFER_ATTN_CHUNKS` | override split-attention chunk count |
-| `MINFER_CACHE_TYPE` | `f16`/`f32` KV cache override; unset → auto (7B class f16, small f32, #37) |
+| `MINFER_CACHE_TYPE` | `f16`/`f32` KV cache override; unset → auto (7B class f16, small f32, #37). `q8_0` (C4, packed) is **refused** on Metal — it is CPU-only until [#87](https://github.com/yusiwen/minfer/issues/87) |
 | `MINFER_GEMM` | `0` = disable the Q4_0/non-Q4_0 prefill simdgroup GEMMs |
 | `MINFER_NO_FUSE_QKV` | `1` = disable fused QKV/FFN-gu decode matmuls |
 | `MINFER_SPLIT_CB` | `N` = split the decode into N command buffers |
