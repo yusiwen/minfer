@@ -59,6 +59,9 @@ impl Qwen2Graph {
         // nodes carry the flag, so a backend still deriving the bound refuses
         // them instead of using a wrong window.
         b.set_explicit_span(params.cparams.explicit_span);
+        // C8b S2: the same flag the caller set for this device — a sharing
+        // sequence's window is a list of cell runs, not one range.
+        b.set_kv_map(params.cparams.kv_map);
 
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
