@@ -1124,8 +1124,9 @@ promote-then-default pattern the optimization campaign uses everywhere.
 history per token; at 7B that is 28 layers × 512 kv-dims × 2 (K and V) ×
 2 bytes (f16) × context — halving it is an ~11% whole-decode win (8b). The
 CPU path stays f32 because its attention is compute/latency-carried, not
-KV-bandwidth-bound, and f32 keeps the reference path simplest. The policy
-boundary is measured, not aesthetic: `n_layers × n_kv_embd ≥ 8192`.
+KV-bandwidth-bound, and f32 keeps the reference path simplest (its own option is
+the packed Q8_0 cache of C4, which buys footprint rather than bandwidth). The
+policy boundary is measured, not aesthetic: `n_layers × n_kv_embd ≥ 8192`.
 
 **Why a 224-byte padded Q6_K layout (§3.2.2) and precomputed scale planes
 instead of faster kernels?** Both are memory-layout answers to a
@@ -1222,7 +1223,7 @@ story of §3.2.1.
   `MINFER_NO_W16CACHE=1` (per-call f16 scratch),
   `MINFER_MMQ_Q6K_EXP=0`/`MINFER_MMQ_Q4K_DSC=0` (drop the precomputed
   planes), `MINFER_NO_FUSE_QKV=1`/`MINFER_NO_FUSE_FFN=1` (decode fusions),
-  `MINFER_CACHE_TYPE=f32|f16` (KV element type),
+  `MINFER_CACHE_TYPE=f32|f16|q8_0` (KV element type; `q8_0` is CPU-only, C4),
   `MINFER_NO_PINNED_READBACK=1` (pageable readback).
 - **CUDA Graph state** — `MINFER_NO_CUDA_GRAPH=1` forces direct launches
   (the A/B lever for replay); `MINFER_NO_PREFILL_CAPTURE=1` disables

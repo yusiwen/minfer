@@ -37,12 +37,15 @@ The remaining work is at the **system layer**, and three items dominate it:
    model runs on CUDA, off on CPU/Metal).
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
    store: no sequence ids, no eviction/context shift, no defragmentation, no
-   state save/restore, no quantized KV. (Phase C's C1/C2 have since landed the
-   cell store and physical removal/shift, and C3 the compaction: a pure planner,
-   the counters, `Backend::copy_cells` on CPU and CUDA, the K re-rope a move needs
-   while `positions` are cells, and a model-level continuation gate. What is still
-   open is driving it from the server's serving model, which reserves every slot
-   once and packed. See §2.4.)
+   state save/restore, no quantized KV. (Phase C has since closed every one of
+   those: C1/C2 the cell store and physical removal/shift, C3 the compaction — a
+   pure planner, the counters, `Backend::copy_cells` on CPU and CUDA, the K re-rope
+   a move needs while `positions` are cells, and a model-level continuation gate —
+   C4 the packed Q8_0 cache (CPU) and C5 the session container. What is still open
+   is driving the compaction from the server's serving model, which reserves every
+   slot once and packed, and the C4/C5 surfaces in
+   [#87](https://github.com/yusiwen/minfer/issues/87) and
+   [#89](https://github.com/yusiwen/minfer/issues/89). See §2.4.)
 3. ~~**The server has no persistent context.** Every request builds a fresh
    `GraphCache` (KV regions + device pool re-allocated, CUDA Graph capture
    re-warmed) and re-prefills the whole prompt.~~ **Fixed in B2/B3** for the
@@ -595,7 +598,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
 | 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. | §2.7 | M |
 | 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. | §2.7 | M |
-| 21 | **Quantized KV** (Q8_0 first) — after item 1. | §2.4 | M |
+| 21 | **Quantized KV** (Q8_0 first) — after item 1. — **landed in C4 S1 (CPU); the fused Q8_0 dots, the quantize-aware shift and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87)** | §2.4 | M |
 | 22 | **Quantizer tooling**: `convert-hf-to-gguf` + `quantize` + `split`. | §2.7 | L |
 
 ### P3 — hygiene and operations
