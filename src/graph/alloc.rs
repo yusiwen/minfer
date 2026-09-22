@@ -924,6 +924,57 @@ impl GraphAllocator {
         Ok(rows)
     }
 
+    /// C8b S3: copy-on-write — make position `t` of `seq` private because a store is
+    /// about to land there and its current row belongs to the sequence it shares its
+    /// prefix with.
+    ///
+    /// [`KvCache::private_row_for`] plans the rebase, this drives the data half with
+    /// [`BackendTrait::copy_cells`], and [`KvCache::apply_private_row`] renumbers. The
+    /// sequence's own rows move **up inside its own run** (never across sequences), and
+    /// `copy_cells` is overlap-safe (C7b), so the shift needs no staging buffer. A
+    /// `None` answer means `t` was already private and nothing moved; the donor's cells
+    /// are never touched, which is the whole point.
+    pub fn kv_private_row_for(
+        &mut self,
+        seq: super::kvcache::SeqId,
+        t: usize,
+    ) -> Result<Option<super::kvcache::KvShift>, String> {
+        let Some(shift) = self.kv.private_row_for(seq, t)? else {
+            return Ok(None);
+        };
+        if shift.rows > 0 {
+            let regions: Vec<(BufRef, BufRef, usize, Backend)> = self
+                .kv
+                .iter()
+                .map(|(_, l)| (l.k, l.v, (l.elems / l.n_ctx.max(1)).max(1), l.k.backend))
+                .collect();
+            for (k, v, elems_per_cell, backend) in regions {
+                for region in [k, v] {
+                    self.copy_cells_in_pool(
+                        backend,
+                        region,
+                        region,
+                        shift.to,
+                        shift.from,
+                        shift.rows,
+                        elems_per_cell,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "kv_private_row_for: moving sequence {seq} rows {}..{} -> {} failed: \
+                             {e}",
+                            shift.from,
+                            shift.from + shift.rows,
+                            shift.to
+                        )
+                    })?;
+                }
+            }
+        }
+        self.kv.apply_private_row(&shift)?;
+        Ok(Some(shift))
+    }
+
     pub fn kv_defrag(&mut self, need: Option<usize>) -> Result<KvDefragReport, String> {
         let before = self.kv.arena_stats();
         let moves = self.kv.compaction_plan(need);
@@ -1027,6 +1078,16 @@ impl GraphAllocator {
         graph: &ComputeGraph,
         batch: &super::batch::Batch,
     ) -> Result<(), String> {
+        // C8b S3: a store may not land in a prefix this sequence reads in place, so
+        // every copy-on-write runs **before the first cell is resolved** — the rows
+        // move inside the run, and a cell resolved before the move would be stale.
+        // `private_row_for` is a no-op for a sequence with no run or nothing shared,
+        // which is what keeps the classic single-sequence path untouched.
+        for (seq, from, to) in batch.groups() {
+            if let Some(t) = batch.positions[from..to].iter().copied().min() {
+                self.kv_private_row_for(seq, t)?;
+            }
+        }
         for (seq, from, to) in batch.groups() {
             if self.kv.seq_slot(seq).is_none() {
                 if batch.n_seqs() > 1 {
@@ -1065,6 +1126,21 @@ impl GraphAllocator {
         // but only a graph that actually stores K/V has a `cells` input (a
         // rope-only fixture does not, and must not need a KV arena).
         let has_cells = graph.inputs.iter().any(|&i| graph.node(i).name == "cells");
+        if has_cells {
+            // C8b S3: same rule as `fill_batch_inputs` — the copy-on-write runs before
+            // any cell is resolved, keyed on each sequence's lowest position here. A
+            // graph with no store has nothing to write, so it needs no copy either.
+            let mut first: Vec<(u32, usize)> = Vec::new();
+            for (&seq, &p) in seq_ids.iter().zip(&pos) {
+                match first.iter_mut().find(|(s, _)| *s == seq) {
+                    Some((_, low)) => *low = (*low).min(p),
+                    None => first.push((seq, p)),
+                }
+            }
+            for (seq, t) in first {
+                self.kv_private_row_for(seq, t)?;
+            }
+        }
         if has_cells && !pos.is_empty() {
             let cells = self.kv_cells_for_seq(seq_ids, &pos)?;
             if let Some(&maxc) = cells.iter().max() {
@@ -1114,11 +1190,29 @@ impl GraphAllocator {
                 cells.push(rel as u32);
                 continue;
             };
-            if rel >= slot.cap {
+            // C8b S3: a run holds positions `[shared.rows, shared.rows + cap)` — the
+            // lower positions are read from the donor's cells, and a store there would
+            // write **through** the shared prefix and corrupt every sharer. The caller
+            // has to copy-on-write first (`kv_private_row_for`), which the two fill
+            // entry points do; anything else is a loud error, never a silent write.
+            if rel < slot.shared.rows {
+                return Err(format!(
+                    "kv_cells_for_seq: query {t} position {rel} would be written into sequence \
+                     {seq}'s {}-row shared prefix (cells {}..{}); a store must not write through \
+                     a shared prefix (C8b S3 copies the row first)",
+                    slot.shared.rows,
+                    slot.shared.cell,
+                    slot.shared.cell + slot.shared.rows
+                ));
+            }
+            if rel >= slot.shared.rows + slot.cap {
                 return Err(format!(
                     "kv_cells_for_seq: query {t} position {rel} is past sequence {seq}'s \
-                     reserved run ({} cells at {})",
-                    slot.cap, slot.start
+                     reserved run ({} cells at {}, holding positions {}..{})",
+                    slot.cap,
+                    slot.start,
+                    slot.shared.rows,
+                    slot.shared.rows + slot.cap
                 ));
             }
             // C8b S1: resolve through the sequence's span list. With one span this is
@@ -1135,6 +1229,17 @@ impl GraphAllocator {
             cells.push(cell as u32);
         }
         Ok(cells)
+    }
+
+    /// The cell position `pos` of sequence `seq` lives in, or `None` when no span of
+    /// that sequence covers it (C8b S1).
+    ///
+    /// The read-side twin of [`Self::kv_cells_for_seq`]: that one is the **store**
+    /// resolver and refuses a position inside a shared prefix (a write there would go
+    /// through to the donor), while this answers "where would a reader look?", which
+    /// is what a caller snapshotting a sharing sequence's rows needs.
+    pub fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
+        self.kv.cell_of(seq, pos)
     }
 
     /// Fill the per-query sequence ids and resolve the matching `attn_span`
@@ -2098,6 +2203,119 @@ mod tests {
         assert!(!super::kv_defrag_enabled_from(Some(std::ffi::OsStr::new(
             "1"
         ))));
+    }
+
+    /// C8b S3 end to end on CPU: a sequence that reads a prefix in place cannot
+    /// store into it, the copy-on-write moves **its own** rows up inside its run,
+    /// and the donor's cells come out of it byte-identical.
+    #[test]
+    fn a_copy_on_write_moves_the_rows_and_never_writes_through() {
+        const N_CTX: usize = 16;
+        const ROW: usize = 4; // elements per cell (n_kv_embd)
+        let mut b = GraphBuilder::new();
+        let _pos = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+        let k = b.input("k", [ROW, 1, 1, 1], crate::graph::DType::F32);
+        let v = b.input("v", [ROW, 1, 1, 1], crate::graph::DType::F32);
+        let _store = b.kvcache_store(0, k, v, N_CTX);
+        let load = b.kvcache_load(0, ROW, N_CTX, 1);
+        b.output(load);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.kv_set_capacity(N_CTX);
+        alloc.alloc_graph(&g).unwrap();
+        let (kid, vid) = alloc.kv_pair(0).unwrap();
+        // Every cell holds the row index and the element, so a moved row is
+        // identifiable wherever it lands.
+        let pattern = |base: f32| -> Vec<f32> {
+            (0..N_CTX * ROW)
+                .map(|i| base + (i / ROW) as f32 * 100.0 + (i % ROW) as f32 / 10.0)
+                .collect()
+        };
+        alloc
+            .write_pool(crate::graph::Backend::CPU, kid, &pattern(0.0))
+            .unwrap();
+        alloc
+            .write_pool(crate::graph::Backend::CPU, vid, &pattern(1000.0))
+            .unwrap();
+        // Sequence 1 computes four rows at [0, 4); sequence 2 reserves [4, 10),
+        // reads those four in place, and writes two rows of its own at [4, 6).
+        assert_eq!(alloc.kv_reserve_seq(1, 4).unwrap().start, 0);
+        alloc.kv_own_range(1, 0, 4);
+        assert_eq!(alloc.kv_reserve_seq(2, 6).unwrap().start, 4);
+        assert_eq!(alloc.kv_share_prefix(1, 2, 4).unwrap(), 4);
+        alloc.kv_own_range(2, 4, 6);
+
+        // The store resolver refuses a position inside the share: that refusal is
+        // what makes a write-through impossible rather than merely unlikely.
+        let err = alloc.kv_cells_for_seq(&[2], &[1]).unwrap_err();
+        assert!(err.contains("shared prefix"), "got: {err}");
+        assert!(err.contains("C8b S3"), "got: {err}");
+
+        let shift = alloc
+            .kv_private_row_for(2, 1)
+            .unwrap()
+            .expect("position 1 must copy-on-write");
+        assert_eq!((shift.base, shift.from, shift.to, shift.rows), (1, 4, 7, 2));
+        assert_eq!(alloc.kv_arena_stats().cows, 1);
+        // From position 1 on everything is private, and the rows that were at
+        // [4, 6) kept their positions at [7, 9) — while position 0 still reads the
+        // donor's cell 0.
+        assert_eq!(alloc.kv.cell_of(2, 0), Some(0), "still shared");
+        assert_eq!(
+            alloc
+                .kv_cells_for_seq(&[2, 2, 2, 2, 2], &[1, 2, 3, 4, 5])
+                .unwrap(),
+            vec![4, 5, 6, 7, 8]
+        );
+        // A store at 0 would still land in the donor's cells, so it is still
+        // refused — the share is smaller, not gone.
+        assert!(alloc.kv_cells_for_seq(&[2], &[0]).is_err());
+        // The data moved verbatim (K and V), and the donor's four rows are what
+        // they were — nothing wrote through them.
+        let (k_now, v_now) = alloc.copy_kv_to_cpu(0).unwrap();
+        for e in 0..ROW {
+            let row = |cell: usize| cell * ROW + e;
+            assert_eq!(k_now[row(7)], 400.0 + e as f32 / 10.0, "K at [7]");
+            assert_eq!(k_now[row(8)], 500.0 + e as f32 / 10.0, "K at [8]");
+            assert_eq!(v_now[row(7)], 1400.0 + e as f32 / 10.0, "V at [7]");
+            assert_eq!(v_now[row(8)], 1500.0 + e as f32 / 10.0, "V at [8]");
+            for cell in 0..4 {
+                assert_eq!(
+                    k_now[row(cell)],
+                    cell as f32 * 100.0 + e as f32 / 10.0,
+                    "donor K cell {cell} changed"
+                );
+                assert_eq!(
+                    v_now[row(cell)],
+                    1000.0 + cell as f32 * 100.0 + e as f32 / 10.0,
+                    "donor V cell {cell} changed"
+                );
+            }
+        }
+        // Idempotent for a position that is already private.
+        assert_eq!(alloc.kv_private_row_for(2, 3).unwrap(), None);
+        assert_eq!(alloc.kv_arena_stats().cows, 1);
+        // And a sequence with no run at all is a no-op, not an error — that is what
+        // keeps the classic single-sequence path (which never reserves) untouched.
+        assert_eq!(alloc.kv_private_row_for(9, 0).unwrap(), None);
+        // The other entry point a caller drives the allocator with gets the same
+        // rule: `fill_attn_inputs` copies for a batch that still names a shared
+        // position, and then resolves the private cells. Position 0 is the last
+        // shared one, so this is the second (and final) copy-on-write.
+        alloc.fill_attn_inputs(&g, &[2], &[0]).unwrap();
+        assert_eq!(alloc.kv_arena_stats().cows, 2);
+        assert_eq!(alloc.kv.spans_of(2), &[(0, 4, 6)], "the share is gone");
+        assert_eq!(alloc.kv.cell_of(2, 0), Some(4));
+        assert_eq!(alloc.kv.cell_of(2, 5), Some(9));
+        let (k_end, _) = alloc.copy_kv_to_cpu(0).unwrap();
+        for e in 0..ROW {
+            assert_eq!(
+                k_end[9 * ROW + e],
+                500.0 + e as f32 / 10.0,
+                "the rows shifted up once more"
+            );
+        }
     }
 
     /// D1 increment 3, structural half: `split_parts` maps each part onto the
