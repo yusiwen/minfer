@@ -1157,6 +1157,19 @@ impl CudaBackend {
                         ..
                     }
                 );
+                // C8b S2: a sharing sequence's explicit window is a list of
+                // `(cell, len)` runs (`kv_map`), which this kernel does not gather
+                // (C8b S4). Refuse it loudly rather than stride `(cell, len)` pairs as
+                // `(lo, hi)` — the layout is the input's size, and the model only asks
+                // for a map on a device that can gather one, so this is the backstop.
+                if windowed && in_bufs[3].len != 2 * nt {
+                    return Err(format!(
+                        "cuda: attention window has {} values, not the {} of one (lo, hi) per \
+                         query — a kv_map needs the C8b S4 gather",
+                        in_bufs[3].len,
+                        2 * nt
+                    ));
+                }
                 let bound_buf = if windowed { in_bufs[3] } else { in_bufs[2] };
                 let pos = self.positions_i32(bound_buf.id)?;
                 // 8d: decode (nt == 1) uses split-K flash-decoding — the

@@ -46,6 +46,13 @@ pub struct CParams {
     /// classic single-sequence path (one sequence starting at 0) keeps the
     /// causal instantiation.
     pub explicit_span: bool,
+    /// C8b S2: this graph's attention window is a **list of cell runs** (a shared
+    /// prefix plus a private run, the `kv_map` input) rather than one `[lo, hi)`
+    /// range. It selects a kernel instantiation whose window input has a different
+    /// layout, so it is topology like `explicit_span`; only a backend that can
+    /// gather a map may take the node (`Backend::supports_kv_map` — CPU until C8b
+    /// S4).
+    pub kv_map: bool,
 }
 
 impl Default for CParams {
@@ -57,6 +64,7 @@ impl Default for CParams {
             fuse_qkv: false,
             fuse_ffn: false,
             explicit_span: false,
+            kv_map: false,
         }
     }
 }

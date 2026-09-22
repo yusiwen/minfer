@@ -27,6 +27,12 @@ pub struct GraphBuilder {
     /// `GraphParams` (E2/A7: the sequence count is data). Recorded in the op so a
     /// backend that still derives its bound from positions refuses it.
     explicit_span: bool,
+    /// C8b S2: build the window as the `kv_map` input — a list of cell runs per
+    /// query (a shared prefix plus a private run) — instead of `attn_span`, one
+    /// `[lo, hi)` range. Same op, and the window input's layout *is* the
+    /// difference: a backend that cannot gather a map validates the input's size
+    /// and refuses the node (CPU can; CUDA is C8b S4; Metal is G5).
+    kv_map: bool,
 }
 
 impl GraphBuilder {
@@ -37,7 +43,16 @@ impl GraphBuilder {
             attn_span: None,
             cells: None,
             explicit_span: false,
+            kv_map: false,
         }
+    }
+
+    /// C8b S2: read attention windows from the `kv_map` input (a list of cell runs
+    /// per query) instead of `attn_span` (one range). Must be called before the
+    /// first `attn` node; the model builders pass `params.cparams.kv_map`, which
+    /// the caller sets only for a device that can gather a map.
+    pub fn set_kv_map(&mut self, on: bool) {
+        self.kv_map = on;
     }
 
     /// Declare that this graph's attention must read the explicit span (E1/E2):
@@ -80,6 +95,23 @@ impl GraphBuilder {
             return id;
         }
         let id = self.input("attn_span", [2 * nt, 1, 1, 1], DType::I32);
+        self.attn_span = Some(id);
+        id
+    }
+
+    /// C8b S2: the per-query window as a list of `KV_MAP_MAX_SPANS` `(cell, len)`
+    /// runs, zero-padded — the layout a sharing sequence needs. One node per graph,
+    /// filled per step by the allocator like `attn_span`; the length is what tells
+    /// a backend which layout it is reading.
+    fn kv_map_input(&mut self, nt: usize) -> NodeId {
+        if let Some(id) = self.attn_span {
+            return id;
+        }
+        let id = self.input(
+            "kv_map",
+            [nt * crate::graph::kvcache::KV_MAP_MAX_SPANS * 2, 1, 1, 1],
+            DType::I32,
+        );
         self.attn_span = Some(id);
         id
     }
@@ -533,7 +565,11 @@ impl GraphBuilder {
         // input may be a larger fused concat buffer (G4 FusedQKV carries
         // q|k|v), so the output shape comes from the meta, not from q.
         let nt = self.graph.nodes[q].out_shape[1];
-        let span = self.attn_span_input(nt);
+        let span = if self.kv_map {
+            self.kv_map_input(nt)
+        } else {
+            self.attn_span_input(nt)
+        };
         self.seq_ids_input(nt);
         self.node(
             "attn",

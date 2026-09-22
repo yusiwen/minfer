@@ -442,6 +442,19 @@ impl Qwen3Graph {
         let device = Self::device(model);
         let metal_on = device == crate::models::Device::Metal;
         let cuda_on = device == crate::models::Device::Cuda;
+        // C8b S2: a sequence that reads part of its prefix in place needs the
+        // window as a list of cell runs rather than one range. Only a device whose
+        // kernel can gather a map is asked (CPU today; CUDA is C8b S4, Metal is
+        // G5), and *whether* to share is the caller's decision — this only
+        // reflects it, read from the reservations the cache already holds.
+        let kv_map = device == crate::models::Device::Cpu
+            && batch.groups().iter().any(|&(seq, _, _)| {
+                cache
+                    .alloc()
+                    .kv_seq_slot(seq)
+                    .map(|s| s.shared.rows > 0)
+                    .unwrap_or(false)
+            });
         let params = GraphParams {
             n_tokens: nt,
             n_out,
@@ -454,6 +467,9 @@ impl Qwen3Graph {
                 n_ctx,
                 flash_attn: false,
                 explicit_span,
+                // C8b S2: the window as a list of cell runs. The caller sets it on
+                // a `CParams` only for a device that can gather a map (CPU).
+                kv_map,
                 gpu: metal_on || cuda_on,
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
                 // + no-bias rope+store) is part of the topology; the env toggle
@@ -997,6 +1013,7 @@ mod tests {
                     n_ctx,
                     flash_attn: false,
                     explicit_span: false,
+                    kv_map: false,
                     gpu: true,
                     fuse_qkv: true,
                     fuse_ffn: false,
@@ -1187,6 +1204,7 @@ mod tests {
                     n_ctx: 512,
                     flash_attn: false,
                     explicit_span: false,
+                    kv_map: false,
                     gpu: true,
                     fuse_qkv: false,
                     fuse_ffn: false,

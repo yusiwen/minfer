@@ -444,39 +444,18 @@ impl Backend for CpuBackend {
                     &after[v_id - out_buf.id - 1]
                 };
                 let n_ctx = k_slice.len() / nkt;
-                // E1: the allowed cells are an explicit input (`attn_span`), not
-                // a bound derived from `positions` — that is what lets a batch
-                // hold several sequences. The allocator resolved it from the
-                // cell store's ownership; here it is only validated.
-                let span_in = ins[3];
-                if span_in.len() != 2 * nt {
-                    return Err(format!(
-                        "attn: span input has {} values, expected {} (2 per query token)",
-                        span_in.len(),
-                        2 * nt
-                    ));
-                }
-                let span: Vec<(usize, usize)> = (0..nt)
-                    .map(|t| {
-                        (
-                            span_in[t].to_bits() as usize,
-                            span_in[nt + t].to_bits() as usize,
-                        )
-                    })
-                    .collect();
-                for (t, &(lo, hi)) in span.iter().enumerate() {
-                    if hi > n_ctx || hi <= lo {
-                        return Err(format!(
-                            "attn: query {t} has span [{lo}, {hi}) — outside the {n_ctx}-cell \
-                             arena, or empty (a span input that was never filled is all zeros)"
-                        ));
-                    }
-                }
-                cpu_gqa_attn(
+                // E1/C8b S2: the allowed cells are an explicit input, not a bound
+                // derived from `positions` — that is what lets a batch hold several
+                // sequences, and (S2) what lets one query's window be a list of runs.
+                // The allocator resolved it from the cell store; here it is only
+                // validated and decoded.
+                let (runs, off) = decode_window(ins[3], nt, n_ctx)?;
+                cpu_gqa_attn_runs(
                     ins[0],
                     k_slice,
                     v_slice,
-                    &span,
+                    &runs,
+                    &off,
                     nt,
                     meta.n_head,
                     meta.n_head_kv,
@@ -607,11 +586,128 @@ pub fn causal_span(pos: &[usize]) -> Vec<(usize, usize)> {
     pos.iter().map(|&p| (0, p + 1)).collect()
 }
 
+/// Decode a query-window input into `(cell, len)` runs plus per-query offsets.
+///
+/// Two layouts reach the kernel, and their **sizes tell them apart** (an input's
+/// size is graph topology, so this is fixed at build time, not a per-step choice):
+/// `attn_span` carries one `(lo, hi)` per query (E1), and `kv_map` carries
+/// `KV_MAP_MAX_SPANS` `(cell, len)` runs per query, zero-padded (C8b S2 — what a
+/// sequence reads when it shares a prefix: the shared runs plus its own). Both are
+/// validated here, and a length that is neither is an error rather than a guess.
+fn decode_window(
+    input: &[f32],
+    nt: usize,
+    n_ctx: usize,
+) -> Result<(Vec<(usize, usize)>, Vec<usize>), String> {
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(nt);
+    let mut off: Vec<usize> = Vec::with_capacity(nt + 1);
+    off.push(0);
+    if input.len() == 2 * nt {
+        for t in 0..nt {
+            let (lo, hi) = (
+                input[t].to_bits() as usize,
+                input[nt + t].to_bits() as usize,
+            );
+            if hi > n_ctx || hi <= lo {
+                return Err(format!(
+                    "attn: query {t} has span [{lo}, {hi}) — outside the {n_ctx}-cell arena, \
+                     or empty (a span input that was never filled is all zeros)"
+                ));
+            }
+            runs.push((lo, hi - lo));
+            off.push(runs.len());
+        }
+        return Ok((runs, off));
+    }
+    let k = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+    if input.len() != nt * k * 2 {
+        return Err(format!(
+            "attn: window input has {} values, expected {} (attn_span: one (lo, hi) per query) \
+             or {} (kv_map: {k} (cell, len) runs per query)",
+            input.len(),
+            2 * nt,
+            nt * k * 2
+        ));
+    }
+    for t in 0..nt {
+        let mut any = false;
+        for s in 0..k {
+            let at = (t * k + s) * 2;
+            let (cell, len) = (
+                input[at].to_bits() as usize,
+                input[at + 1].to_bits() as usize,
+            );
+            if len == 0 {
+                continue; // padding slot
+            }
+            if cell + len > n_ctx {
+                return Err(format!(
+                    "attn: query {t} run {s} is [{cell}, {}) — past the {n_ctx}-cell arena",
+                    cell + len
+                ));
+            }
+            runs.push((cell, len));
+            any = true;
+        }
+        if !any {
+            return Err(format!(
+                "attn: query {t} has no cell runs (a kv_map input that was never filled is all \
+                 zeros)"
+            ));
+        }
+        off.push(runs.len());
+    }
+    Ok((runs, off))
+}
+
+/// The one-range form of [`cpu_gqa_attn_runs`], kept for the reference callers
+/// (tests and the causal fixture): `span[t] = (lo, hi)` is one run of `hi - lo`
+/// cells. The Op::Attn path decodes the window input itself, so it can carry a
+/// list of runs (C8b S2) and not only a contiguous range.
 pub(crate) fn cpu_gqa_attn(
     q: &[f32],
     ka: &[f32],
     va: &[f32],
     span: &[(usize, usize)],
+    nt: usize,
+    nh: usize,
+    nk: usize,
+    hd: usize,
+    hd_kv: usize,
+    nkt: usize,
+    out: &mut [f32],
+    scale: f32,
+) -> Result<(), String> {
+    if span.len() != nt {
+        return Err(format!(
+            "attention: {} spans for {nt} query tokens",
+            span.len()
+        ));
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(nt);
+    let mut off: Vec<usize> = Vec::with_capacity(nt + 1);
+    off.push(0);
+    for &(lo, hi) in span {
+        if hi < lo {
+            return Err(format!("attention: span [{lo}, {hi}) is empty"));
+        }
+        runs.push((lo, hi - lo));
+        off.push(runs.len());
+    }
+    cpu_gqa_attn_runs(
+        q, ka, va, &runs, &off, nt, nh, nk, hd, hd_kv, nkt, out, scale,
+    )
+}
+
+/// GQA attention over each query's **list of `(cell, len)` runs** (C8b S2), with
+/// `off[t]..off[t + 1]` naming query `t`'s runs — the union of the runs is the
+/// query's window, in order.
+pub(crate) fn cpu_gqa_attn_runs(
+    q: &[f32],
+    ka: &[f32],
+    va: &[f32],
+    runs: &[(usize, usize)],
+    off: &[usize],
     nt: usize,
     nh: usize,
     nk: usize,
@@ -631,18 +727,21 @@ pub(crate) fn cpu_gqa_attn(
     // Each worker computes its own head range with a private scores buffer,
     // so the output is bit-identical to the single-threaded order (no
     // cross-head reduction).
-    if span.len() != nt {
+    if off.len() != nt + 1 {
         return Err(format!(
-            "attention: {} spans for {nt} query tokens",
-            span.len()
+            "attention: {} run offsets for {nt} query tokens",
+            off.len()
         ));
     }
-    let max_vl = span.iter().map(|&(lo, hi)| hi.saturating_sub(lo)).max();
+    let max_vl = (0..nt)
+        .map(|t| (off[t]..off[t + 1]).map(|i| runs[i].1).sum::<usize>())
+        .max();
     let ctx = AttnCtx {
         q: q.as_ptr(),
         ka: ka.as_ptr(),
         va: va.as_ptr(),
-        span: span.as_ptr(),
+        runs: runs.as_ptr(),
+        off: off.as_ptr(),
         nt,
         max_vl: max_vl.unwrap_or(0),
         nh,
@@ -666,8 +765,10 @@ struct AttnCtx {
     q: *const f32,
     ka: *const f32,
     va: *const f32,
-    /// Per-query allowed cell range `[lo, hi)` (E1).
-    span: *const (usize, usize),
+    /// Per-query window as `(cell, len)` runs, `off[t]..off[t + 1]` per query
+    /// (E1's one range is one run; C8b S2 makes several possible).
+    runs: *const (usize, usize),
+    off: *const usize,
     nt: usize,
     /// Longest window in the batch: sizes the per-head score scratch.
     max_vl: usize,
@@ -693,19 +794,24 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
         let hk = h / gqa;
         for t in 0..c.nt {
             let qs = t * ne_q + h * c.hd;
-            let (lo, hi) = *c.span.add(t);
-            let vl = hi.saturating_sub(lo);
+            let (o0, o1) = (*c.off.add(t), *c.off.add(t + 1));
+            let vl: usize = (o0..o1).map(|i| (*c.runs.add(i)).1).sum();
             let mut mx = f32::NEG_INFINITY;
-            for (i, kv) in (lo..hi).enumerate() {
-                let ks = kv * c.nkt + hk * c.hd_kv;
-                let s = crate::vec_ops::vec_dot_f32(
-                    c.hd_kv,
-                    std::slice::from_raw_parts(c.q.add(qs), c.hd_kv),
-                    std::slice::from_raw_parts(c.ka.add(ks), c.hd_kv),
-                ) * c.scale;
-                scrs[i] = s;
-                if s > mx {
-                    mx = s;
+            let mut i = 0usize;
+            for r in o0..o1 {
+                let (cell, len) = *c.runs.add(r);
+                for kv in cell..cell + len {
+                    let ks = kv * c.nkt + hk * c.hd_kv;
+                    let s = crate::vec_ops::vec_dot_f32(
+                        c.hd_kv,
+                        std::slice::from_raw_parts(c.q.add(qs), c.hd_kv),
+                        std::slice::from_raw_parts(c.ka.add(ks), c.hd_kv),
+                    ) * c.scale;
+                    scrs[i] = s;
+                    i += 1;
+                    if s > mx {
+                        mx = s;
+                    }
                 }
             }
             // Softmax and accumulate over the token's OWN window `[lo, hi)`, the
@@ -725,13 +831,18 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
             let out_slice = std::slice::from_raw_parts_mut(c.out.add(os), c.hd);
             out_slice.fill(0.0);
             let vs_base = hk * c.hd_kv;
-            for (i, kv) in (lo..hi).enumerate() {
-                crate::vec_ops::vec_muladd_f32(
-                    c.hd_kv,
-                    std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
-                    std::slice::from_raw_parts(c.va.add(kv * c.nkt + vs_base), c.hd_kv),
-                    scrs[i],
-                );
+            let mut i = 0usize;
+            for r in o0..o1 {
+                let (cell, len) = *c.runs.add(r);
+                for kv in cell..cell + len {
+                    crate::vec_ops::vec_muladd_f32(
+                        c.hd_kv,
+                        std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
+                        std::slice::from_raw_parts(c.va.add(kv * c.nkt + vs_base), c.hd_kv),
+                        scrs[i],
+                    );
+                    i += 1;
+                }
             }
         }
     }
@@ -740,6 +851,44 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C8b S2: a window given as **several runs** gathers exactly what the same cells
+    /// given as one range gather — the equivalence the map path rests on — and the
+    /// runs are visited in the order the store lists them.
+    #[test]
+    fn a_window_split_into_runs_gathers_like_one_range() {
+        let (nh, nk, hd, nkt, n_ctx, nt) = (2usize, 1usize, 4usize, 4usize, 6usize, 2usize);
+        let k: Vec<f32> = (0..n_ctx * nkt).map(|i| i as f32 * 0.05 + 0.1).collect();
+        let v: Vec<f32> = (0..n_ctx * nkt).map(|i| i as f32 * -0.03 + 0.7).collect();
+        let q: Vec<f32> = (0..nt * nh * hd).map(|i| i as f32 * 0.11 - 0.4).collect();
+        let mut one = vec![0.0f32; nt * nh * hd];
+        let mut split = vec![0.0f32; nt * nh * hd];
+        // Query 0 sees cells [0, 3); query 1 sees [1, 6).
+        let span = vec![(0usize, 3usize), (1, 6)];
+        cpu_gqa_attn(&q, &k, &v, &span, nt, nh, nk, hd, hd, nkt, &mut one, 0.5).unwrap();
+        // The same two windows as runs: [0, 2) + [2, 1), and [1, 3) + [4, 2).
+        let runs = vec![(0usize, 2usize), (2, 1), (1, 3), (4, 2)];
+        let off = vec![0usize, 2, 4];
+        cpu_gqa_attn_runs(
+            &q, &k, &v, &runs, &off, nt, nh, nk, hd, hd, nkt, &mut split, 0.5,
+        )
+        .unwrap();
+        assert_eq!(one, split, "the window is the union of its runs, in order");
+        // The `kv_map` layout decodes back to exactly those runs, and a padded slot
+        // (length 0) is skipped.
+        let k_max = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+        let mut flat = vec![0.0f32; nt * k_max * 2];
+        for (i, &(cell, len)) in runs.iter().enumerate() {
+            let at = (i / 2 * k_max + i % 2) * 2;
+            flat[at] = f32::from_bits(cell as u32);
+            flat[at + 1] = f32::from_bits(len as u32);
+        }
+        let (decoded, offsets) = decode_window(&flat, nt, n_ctx).unwrap();
+        assert_eq!((decoded, offsets), (runs, off));
+        // A layout that is neither form is refused, not guessed.
+        let err = decode_window(&flat[1..], nt, n_ctx).unwrap_err();
+        assert!(err.contains("expected"), "got: {err}");
+    }
 
     /// Plan §14 row 9's exoneration of the ops, as a gate.
     ///
