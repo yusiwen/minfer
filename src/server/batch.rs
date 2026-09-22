@@ -450,6 +450,15 @@ impl BatchEngine {
         self.prefix_rows_copied
     }
 
+    /// C8b S3: copy-on-write events and the rows they moved — the counter that lets
+    /// a test assert the gate's mechanism actually ran (a gate that cannot see its
+    /// own precondition is not a gate).
+    #[cfg(test)]
+    pub fn cow_stats(&mut self) -> (u64, u64) {
+        let s = self.cache.alloc().kv_arena_stats();
+        (s.cows, s.cow_cells)
+    }
+
     /// Whether several sequences may share one prefill forward on the active
     /// backend. CUDA's flash-attention prefill stages a query tile per block and
     /// a tile must not span two sequences (E1b), so with a CUDA device the
@@ -1197,6 +1206,121 @@ mod tests {
             second, solo,
             "the copied run must answer like a private one"
         );
+    }
+
+    /// C8b S3 gate: a request that diverges **inside** a prefix another slot
+    /// computed must take private rows there (copy-on-write) instead of storing
+    /// through the donor's cells.
+    ///
+    /// The failure this ticket forbids is invisible from the sharer alone: a store
+    /// that wrote through the shared cells would still give the sharer the right
+    /// answer (it reads those same cells), and only the **donor** would be corrupted.
+    /// So the gate checks four things: the request is served at all (the store
+    /// resolver refuses a shared position, so a missing copy-on-write is a loud
+    /// error), the copy-on-write counter moved, the answer is the private run's, and
+    /// the donor's rows come out byte-identical.
+    #[test]
+    #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
+    fn a_store_inside_a_shared_prefix_takes_a_private_row() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the C8b S3 gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        // Long enough that the share has rows worth copying.
+        let prompt = tok.encode(
+            "You are a helpful assistant. Answer in one short sentence. The capital of France is",
+        );
+        assert!(prompt.len() > 8, "the prompt has to be worth sharing");
+        let n_ctx = prompt.len() + 64;
+
+        // Slot 0 computes the prompt; slot 1 reads it in place (C8a/C8b S2).
+        let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
+        let (donor_seq, dst_seq) = (engine.slots[0].seq, engine.slots[1].seq);
+        serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 8);
+        serve_on(&mut engine, &*model, &tok, 1, prompt.clone(), 8);
+        let shared_rows = engine
+            .cache
+            .alloc()
+            .kv_seq_slot(dst_seq)
+            .expect("slot 1 has a run")
+            .shared
+            .rows;
+        assert!(
+            shared_rows > 3,
+            "slot 1 must read {shared_rows} rows in place for the gate to mean anything"
+        );
+        assert_eq!(engine.cow_stats().0, 0, "nothing needed a copy yet");
+
+        // A request on slot 1 matching only the prompt's first three tokens: its
+        // prefill starts inside the shared prefix, so the store has to copy.
+        let mut diverging = prompt[..3].to_vec();
+        diverging.extend(tok.encode(" and the capital of Italy is"));
+        assert_eq!(
+            common_prefix_len(&prompt, &diverging),
+            3,
+            "the divergence point is the gate's input"
+        );
+        let donor_before = kv_rows_of(&mut engine, donor_seq);
+        assert!(!donor_before.is_empty(), "the donor must hold rows");
+        let cow = serve_on(&mut engine, &*model, &tok, 1, diverging.clone(), 8);
+        let (cows, cells) = engine.cow_stats();
+        assert!(cows > 0, "the store must have copied a private row");
+        assert!(cells > 0, "and the copy has to have moved rows");
+        // The donor is still a live run — a reclaim would make the byte check below
+        // vacuous rather than wrong, which is exactly the kind of silent pass this
+        // assertion exists to prevent.
+        assert!(engine.cache.alloc().kv_seq_slot(donor_seq).is_some());
+        assert_eq!(
+            kv_rows_of(&mut engine, donor_seq),
+            donor_before,
+            "the diverging request wrote through the shared prefix"
+        );
+
+        // The answer is the private run's: the same request where there is nothing
+        // to share with.
+        let mut alone = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
+        let solo = serve_on(&mut alone, &*model, &tok, 0, diverging, 8);
+        assert_eq!(
+            cow, solo,
+            "the copy-on-written run must answer like a private one"
+        );
+    }
+
+    /// The K/V rows a sequence's written positions hold, one `Vec` per (layer, K or
+    /// V, position) in a deterministic order. Cells are resolved through the span
+    /// list on every call, so a relocation between two snapshots is not a difference;
+    /// a sharing sequence's shared rows are read from wherever they live.
+    fn kv_rows_of(engine: &mut BatchEngine, seq: SeqId) -> Vec<Vec<f32>> {
+        let written = engine
+            .cache
+            .alloc()
+            .kv_seq_slot(seq)
+            .map_or(0, |s| s.written);
+        let n_ctx = engine.cache.alloc().kv_n_ctx().max(1);
+        let cells: Vec<usize> = (0..written)
+            .map(|p| {
+                engine
+                    .cache
+                    .alloc()
+                    .kv_cell_of(seq, p)
+                    .unwrap_or_else(|| panic!("no cell for sequence {seq} position {p}"))
+            })
+            .collect();
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        let mut layer = 0;
+        while let Some((k, v)) = engine.cache.alloc().copy_kv_to_cpu(layer) {
+            let row = k.len() / n_ctx;
+            for &cell in &cells {
+                let at = cell * row;
+                out.push(k[at..at + row].to_vec());
+                out.push(v[at..at + row].to_vec());
+            }
+            layer += 1;
+        }
+        out
     }
 
     /// C7: the growth policy is pure, and it plans from the request rather than
