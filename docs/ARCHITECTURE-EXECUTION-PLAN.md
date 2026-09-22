@@ -4,11 +4,11 @@
 2026-09-16); Phase C **5/8** (C1, C2, **C3**, **C6 (logical positions)** and **C7 (+C7b)** done —
 C6 merged 2026-09-20 as `001b8cc`; **C7 landed 2026-09-20** (the partition
 is elastic, and growth moves runs in **both** directions, so a busy neighbour above
-the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3 landed, S4–S5 next); C4, C5 open); Phase D **3/3** (**D1 done**: views,
+the slot no longer blocks it) and **C8 (cross-sequence cell sharing)** is next — its design is below and splits it into **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a block map and a gather in every attention kernel — design below, S1a/S1b/S2/S3/S4 landed, S5 next); C4, C5 open); Phase D **3/3** (**D1 done**: views,
 multi-output via `split_parts`, D2, D3); Phase E **4/7** (E1, E1b, E2, E6 done;
 E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: C8b S4 (CUDA attention gather + device A/B), then S5, then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
+check). **Next: C8b S5 (Metal behind G5), then G1–G3 and G5, then C4/C5, then E3–E5.** The order is deliberate: the
 Metal KV port (G5) comes **after** the CUDA arena stops changing shape (C7, C7b, C8),
 so those semantics are written into Metal once. Per-ticket evidence is in each phase's
 record and in the §14 open-risks table.
@@ -1396,6 +1396,72 @@ from the span lists) landed with S2. Suites: CPU 233 / CUDA 282, 0 failed.
 
 S4 ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
 
+**C8b S4 landed (2026-09-22) — every CUDA attention path gathers the map.**
+`attn_span`'s single range became three *window modes* selected by the **size** of
+the node's window input (C8b S2's departure 2): `positions` (causal), one `[lo, hi)`
+pair per query (`attn_span`), or `KV_MAP_MAX_SPANS` `(cell, len)` runs per query
+(`kv_map`). Each mode is a separate template instantiation — `MAP` joins `CAUSAL` as
+a compile-time flag for the same reason (E1b: the causal kernels must compile to
+exactly their pre-E1 instructions) — and a size that matches neither is refused
+rather than mis-strided. The row walk resolves a *linear window index* through the
+run list (`kv_cell`), and the key insight that keeps every kernel's mask valid is
+that a map window is a **prefix** of the sequence's address space (every run before
+the query's own, plus its own row), so the existing `index < limit` form stays exact
+with `limit` = the run total. Covered: the split-K 1-warp decode body (the sharing
+slot's decode step), the batched split path (`1 < nt <= 16`), the 4-warp hybrid, the
+legacy per-(token, head) kernels (f16 and f32 KV), and **FA prefill**, whose staging
+loop now resolves each linear index through the runs of the tile's widest query (its
+list is a superset of the others' — the one-sequence-per-tile precondition the span
+path already relied on for its tile-wide min/max).
+
+**The first A/B found a real cost, and the fix was to stop resolving per row.** The
+map window measured **1.513x** the span at the 7B decode shape (nkv = 2048, nh = 28,
+nk = 4, hd = 128: 24.6 vs 37.2 µs/launch) — the run walk ran per staged row. A map's
+runs are long, so a four-row batch almost always sits inside one: resolving the
+batch's first row once (plus how many rows its run still holds) and adding for the
+rest brought it to **24.6 µs — 1.001x** the span, with a straddling batch still
+walking. The same measurement on the **prefill** path (nt = 512, hd = 128, f16 KV)
+is **1.726 → 1.872 ms (1.1x)** now that FA gathers too; before it, FA had to be
+skipped for a map, which the A/B priced at **170x** (301 ms of legacy per-token
+attention) — that number is why the FA port is part of this ticket rather than a
+follow-up.
+
+**Admission switches on one authority.** `Device::gathers_attn_map()` (CPU, CUDA) is
+read by both the models' graph builders (which ask for the `kv_map` input) and the
+server's admission (which shares a prefix in place instead of copying it), so the
+share and the window layout cannot disagree; `MINFER_NO_KV_SHARE=1` forces the copy
+as the A/B gate for the share itself.
+
+**Gate 2 holds, bitwise.** Always-run: `cuda_map_window_matches_the_span_over_the_same_rows`
+compares a map window against the span over the *same bytes* for two KV dtypes across
+one/two/three runs, at both prefill- and **decode-shaped** batches (a single token at
+the window's end — the case a one-token-at-position-0 draft of this test could not
+reach, and the real-model gate caught it missing) — 72 cases, all bitwise. On GB10,
+the three real-model gates (C8a's copy, E2's batched-vs-serial, and S3's
+copy-on-write) pass with sharing live, on an **f32-KV** 0.5B and an **f16-KV,
+hd = 128** Qwen3-0.6B — the two combinations that matter, since FA prefill and the
+half-width cell stride only exist on the second.
+
+**Two pre-existing bugs this ticket's gate found, both fixed here.** (1) The server's
+decode position was **off by one**: `advance` incremented `current_pos` before the
+forward that writes the row, so the first token after a prefill was stored at
+`nt + 1` and position `nt` was never written — the next step's attention read a stale
+row whose content came from the arena's history, which made answers depend on
+allocation (the gate's two identical share runs disagreed). The increment now happens
+where the row exists (`tick`, next to the mirror's push), with the assertion
+corrected to match. (2) **f16 KV cell moves strode by f32 elements**: `copy_cells`'s
+`elems_per_cell` is a count of f32, while an f16 cache stores a row as `nkt` halves
+(`nkt / 2` f32), so every moved row walked twice as far and landed in the wrong cell
+— a compaction *or* a copy-on-write on an f16 device silently corrupted the arena.
+`CudaBackend::copy_cells` now halves the stride for f16, pinned by
+`cuda_f16_kv_cell_move_strides_by_row_bytes` (always-run, and it fails without the
+fix). Neither bug could be seen by the existing gates: both compare server-against-
+server, and every CUDA gate ran on an f32-KV model.
+
+Suites: CPU 233 / CUDA 284, 0 failed, 9 ignored.
+
+S5 is Metal behind G5.
+
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
 (3) CoW's per-token private rows must not fragment the arena beyond what C7's growth can absorb;
@@ -1406,7 +1472,7 @@ the stats gate watches exactly that.
 | S1 | Per-sequence **span list** + the resolvers (`kv_cells_for_seq`, `attn_span`) reading through it — single-entry in practice, so nothing observable changes | no behaviour change: suites stay bitwise |
 | S2 | Block-granular **refcounts** + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
 | S3 | Copy-on-write: `kv_private_row_for` at store resolution — **landed 2026-09-22**: the share shrinks to the first position this forward writes and the run's own rows shift up inside it (two spans, no arena space needed), the store resolver refuses a shared position, and a run without room is a loud `Err` | gate 3 on CPU + the real-model donor-byte check |
-| S4 | CUDA attention gather + device A/B | gate 2 on GB10 + timing |
+| S4 | CUDA attention gather + device A/B — **landed 2026-09-22**: three window modes (causal / span / map) selected by the window input's size, the `MAP` flag threaded through every attention kernel including FA prefill, and the batch-level row resolution that makes the gather free | gate 2 on GB10 (bitwise, f32 *and* f16 KV) + the decode/prefill A/B |
 | S5 | Metal behind G5 (refuse the map, as it refuses the span) + docs closure | compile check + G5 record |
 
 
