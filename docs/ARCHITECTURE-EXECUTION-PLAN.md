@@ -12,10 +12,11 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**4/7** (E1, E1b, E2, E6 done; E3–E5 open); Phase F **0/8** (F1 needs x86); Phase G
+**5/7** (E1, E1b, E2, **E3**, E6 done; E4–E5 open); Phase F **0/8** (F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Phase C is complete (8/8); next: G1–G3 and G5 (Metal, on a Mac), then E3–E5.** The order is
+check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
+round G1–G3/G5 (on a Mac).** The order is
 deliberate: the Metal KV port (G5) comes **after** the CUDA arena stops changing shape
 (C7, C7b, C8), so those semantics are written into Metal once. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -1979,10 +1980,71 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E1 | 2 | IR `seq_id` + explicit attention masks (CPU) — **DONE** | L |
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
-| E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) | M |
+| E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
+
+**Why.** A prefill was **one** forward over the whole prompt. Two consequences: activation
+memory scaled with the prompt (`GraphParams.n_tokens` sizes every activation buffer), and a
+long prompt blocked every other slot's decode for its whole duration — the batch worker is
+single-threaded, so `admit` returning after the full prefill meant the other slots' tokens
+simply waited.
+
+**Rule.** `prefill_chunks(from, total, chunk)` splits the fed suffix into spans of at most
+`chunk` tokens, in order, with the remainder last (so the final forward carries the tail row
+whose logits the request samples from); `chunk == 0` is "off" — one span, the pre-E3 path —
+and a suffix that already fits is never split. `MINFER_N_BATCH` (default
+`DEFAULT_PREFILL_CHUNK = 2048`) sets it, and `--n-batch`-style plumbing is the same setter:
+`BatchEngine::set_prefill_chunk`. The server prints the outcome at startup, like the batching
+mode, because a default nobody can see is a default nobody can debug.
+
+**Interleaving is the point.** Between chunks — never before the first or after the last —
+the prefill runs the same decode step `serve_loop` would have run next, if any other slot has
+a token waiting (`has_pending_decode`). That is safe by construction: the chunk's rows are
+already written, the slot has no `Run` yet, and `finish` keeps a completed slot's rows (B2
+reuse) rather than compacting, so nothing moves under the in-flight prefill.
+
+**Why 2048 as the default**: it is a *no-op* for every prompt that fits it — identical
+forwards, identical graph, identical timing — so the change cannot regress the common case,
+while a longer prompt gets bounded memory and interleaving. The cost of the split is real and
+measured, and it is one **forward's fixed overhead per chunk** (the weights re-stream and the
+graph re-fills: it is keyed on `n_tokens`, so a chunked prefill rebuilds once per chunk —
+§14 row 3; E4's multi-graph cache is what removes that):
+
+| prompt | forwards | CPU | CUDA (GB10) |
+|---|---|---|---|
+| 98 tokens, chunk 24 | 1 → 5 | 484 → 485 ms (**1.004x**) | 29 → 57 ms (**2.0x**) |
+| 514 tokens, chunk 171 | 1 → 4 | 2676 → 2691 ms (**1.005x**) | 107 → 119 ms (**1.11x**) |
+
+The small-chunk case is the worst one (five weight passes for 98 tokens); at the default, a
+4096-token prompt is two forwards, i.e. one extra fixed cost on a prefill of that size.
+
+**Acceptance, as measured** (`cargo test --release --bin minfer -- --ignored`, 98-token
+prompt, chunk 24):
+
+- **Bounded**: the chunked run issued **5** prefill forwards whose largest `nt` was **24**;
+  the unchunked run issued **1** forward of `nt = 98`. The bound is `prefill_stats()`, an
+  observable, not a claim about buffers.
+- **Equal**: the prefill's tail-row logits are **bitwise identical** on CPU (max |Δ| = 0) and
+  within the named cross-shape class on CUDA (**0.218**, class 1.0 — CUDA's prefill tiles by
+  `nt` and quantizes activations to int8); the CPU continuation is equal byte for byte.
+- **Interleaved** (48×"buffalo " on slot 1 already decoding, a ~4× chunk prompt on slot 0):
+  the chunked prefill ran **3** decode steps for the other slot and it emitted **3 bytes**
+  during the prefill call; with chunking off the same call ran **0** steps and the slot
+  gained **0** bytes — the A/B is deterministic, not a timing race.
+- Both gates are mutation-checked: disabling the interleave fails the second
+  (`ticks 0, bytes 0`), and making `prefill_chunks` never split fails the first
+  (`1 forwards for a 98-token prompt at chunk 24`).
+
+**Coverage, stated rather than implied.** The chunk plan and the env parser are pure and run
+in CI; the two real-model gates are `#[ignore]`d (they need the cached 0.5B) and were run on
+the CPU **and** on CUDA (GB10). Not in this increment: a `--n-batch` CLI flag (the setter and
+`MINFER_N_BATCH` are the surface), and true **mixed** prefill+decode batches — the decode
+steps between chunks are the same `tick` the worker already runs, one per chunk, which bounds
+the stall without yet sharing a weight pass between a chunk and a decode row.
 
 #### E6 record (2026-09-19) — a device-aware default
 
@@ -2614,7 +2676,7 @@ Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──
 Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
 Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5 ✔   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
+Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
 Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
 Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
