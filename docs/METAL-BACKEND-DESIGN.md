@@ -120,7 +120,9 @@ and the struct is `unsafe impl Send/Sync` on that basis.
 - **KV element type.** `set_kv_cache_type(n_layers, n_kv_embd)` runs once at load: f16 when
   `n_layers × n_kv_embd >= 8192` (the 7B class; measured ~−1 ms/token at 2K context) or f32 for
   small models (f16 measured ~3% slower there, dispatch-latency-bound); `MINFER_CACHE_TYPE=f16|f32`
-  overrides. `kv_cache_is_f16()` is the query the store/attention/fused kernels use.
+  overrides (a third value, `q8_0`, is the CPU's packed cache since C4 and is **refused** here —
+  Metal's kernels address f32/f16 rows). `kv_cache_is_f16()` is the query the
+  store/attention/fused kernels use.
 
 ### 2.4 Command buffers and submission
 

@@ -550,7 +550,9 @@ value. The Qwen3 loader reads it *before* the KV type pick (its comment says
 why: the f16 auto-select multiplies `n_layers × n_kv_embd`), and its assert
 turns a wrong `key_length` fallback into a load-time crash instead of
 silently corrupting attention. The policy `set_kv_cache_type` implements
-(`metal.rs:132-153`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey;
+(`metal.rs:132-153`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey (since C4 the
+value is parsed strictly on every device — an unknown spelling, or `q8_0`, which
+only the CPU kernels read, fails the load instead of quietly running f32);
 otherwise auto-select — f16 (half precision: 2 bytes per value instead of 4)
 when `n_layers × n_kv_embd ≥ 8192`, i.e. models big enough that decode is
 KV-bandwidth-bound (measured −1 ms/token on the 7B at 2K context), f32 for
@@ -893,7 +895,8 @@ and ignored).
 - `MINFER_DISABLE_MPS=1` — forces CPU on macOS; the log flips to
   `MPS: disabled by MINFER_DISABLE_MPS` and the graph's backend colors (next
   bullet) go all-CPU. `MINFER_DISABLE_CUDA=1` is its CUDA twin.
-- `MINFER_WEIGHT_COPY=1` / `MINFER_CACHE_TYPE=f16|f32` — the first makes
+- `MINFER_WEIGHT_COPY=1` / `MINFER_CACHE_TYPE=f16|f32|q8_0` (`q8_0` is CPU-only,
+  C4) — the first makes
   Metal copy each weight into a fresh buffer instead of wrapping the mmap
   pages (A/B the zero-copy path); the second pins the KV element type
   instead of the size-based auto-select.

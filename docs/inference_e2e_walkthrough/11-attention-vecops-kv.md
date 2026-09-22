@@ -99,7 +99,7 @@ and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:76`), landing i
 
 Docs 14/15 run the *same* formulas with different execution models; three deltas to keep in mind so nothing here surprises you later:
 
-- **Storage**: Metal/CUDA may keep the K/V regions in `f16` (`MINFER_CACHE_TYPE=f16`), halving the bandwidth of §2.2's arithmetic; the CPU path stays `f32` (§3.3).
+- **Storage**: Metal/CUDA may keep the K/V regions in `f16` (`MINFER_CACHE_TYPE=f16`), halving the bandwidth of §2.2's arithmetic. The CPU stores `f32` by default and offers a **packed Q8_0** cache instead (`MINFER_CACHE_TYPE=q8_0`, C4): a cell is a Q8_0 block row — `ceil(n_kv_embd/32 * 34)` bytes instead of `4 * n_kv_embd`, 3.76x smaller measured — with the store quantizing and the attention read dequantizing the window it is about to use (§3.3).
 - **Shape**: the GPU attention kernels tile the (query, key) matrix and apply the softmax *online* — max and sum accumulate block-by-block instead of one full pass — the "flash attention" trick; the CPU path computes full rows because everything already fits in cache.
 - **Parallelism axis**: CPU splits by head (§3.3); CUDA additionally splits the KV dimension across blocks and reduces (`split-KV`), because a GPU has thousands of threads and only 14–40 heads to give them.
 
@@ -357,7 +357,7 @@ It is the FFN's activation (doc 05's `silu(gate) × up`); doc 06 fused it into `
 
 **Why compute scores in f32 (`vec_dot_f32`) instead of the int8 trick?** Doc 10's Q8_0 machinery quantizes *matmul activations*; attention scores are computed once per (query, key) pair, and quantizing q/k per score would cost more than it saves — the dot is over `hd_kv` (≤128) elements, not `n_embd`. The K/V *storage* is where bandwidth matters (hence the GPU f16 cache, below), not the score math on CPU.
 
-**Why is the KV cache f32 on CPU while GPUs offer f16?** The CPU path never re-quantizes attention inputs; f16 K/V on CPU would add a conversion per score for negligible bandwidth win at these sizes. The GPU backends, where bandwidth per token is the budget, do offer the f16 cache (`MINFER_CACHE_TYPE=f16`, docs 03/14). Same invariant — regions are persistent and position-addressed — different storage per backend.
+**Why is the KV cache f32 on CPU while GPUs offer f16?** The CPU path never re-quantizes attention inputs; f16 K/V on CPU would add a conversion per score for negligible bandwidth win at these sizes. The GPU backends, where bandwidth per token is the budget, do offer the f16 cache (`MINFER_CACHE_TYPE=f16`, docs 03/14). The CPU's own trade is different and is about **footprint**, not bandwidth: `MINFER_CACHE_TYPE=q8_0` (C4) stores packed Q8_0 cells, 3.76x smaller regions on both cached models, and `f16` is refused there because the path has no f16 KV kernel. Same invariant — regions are persistent and position-addressed — different storage per backend.
 
 **Why parallelize over heads instead of over tokens?** Heads are perfectly independent (① is the only cross-head coupling, and it is read-only), so the split has zero communication; splitting over tokens would share each head's `scrs` buffer across workers. It also composes with decode: at `nt=1` the token axis is empty, but 14 heads still parallelize the dot products.
 

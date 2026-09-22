@@ -319,7 +319,8 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
    per-layer dispatch-count difference in decode/prefill.
 4. **KV format**: llama defaults f16 + optional quantized KV (since #27390, a
    `kv_f16` dequant pass); minfer auto-selects f16 for the 7B class / f32 for small models (#37,
-   `MINFER_CACHE_TYPE=f16/f32` overrides), no quantized KV.
+   `MINFER_CACHE_TYPE=f16/f32` overrides), and since C4 also has a **packed Q8_0** cache — CPU
+   only so far, `MINFER_CACHE_TYPE=q8_0`; Metal refuses it until [#87](https://github.com/yusiwen/minfer/issues/87).
 5. **Multi-CB**: llama 2-CB concurrent encode; minfer single CB all layers.
    Measured (minfer §3.6): llama's 2-CB split is **slower** in a pure-GEMM
    replay — not a speed source.
