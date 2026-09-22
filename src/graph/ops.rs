@@ -226,8 +226,14 @@ pub struct AttnMeta {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvcacheMeta {
+    /// Logical KV row width (`n_kv_embd`): what the store's K/V input carries.
     pub n_embd: usize,
     pub n_head_kv: usize,
+    /// C4: f32 words one cell occupies in the persistent region. Equal to `n_embd`
+    /// for f32/f16; larger-per-element for a packed Q8_0 region, where the
+    /// allocator sizes the region by `row_elems * n_ctx` instead of by the node's
+    /// logical element count. Stamped by `GraphBuilder::kvcache_store`.
+    pub row_elems: usize,
 }
 
 /// decode QKV fusion metadata: concat weight (wq|wk|wv rows), the three

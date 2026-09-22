@@ -33,6 +33,8 @@ pub mod fusion;
 pub mod json;
 /// Sequence-addressable KV cell store (Phase C / C1).
 pub mod kvcache;
+/// KV cache storage format + its `MINFER_CACHE_TYPE` gate (C4).
+pub mod kvformat;
 #[cfg(target_os = "macos")]
 pub mod metal_backend;
 pub mod ops;
