@@ -109,6 +109,18 @@ pub fn run(
     });
 }
 
+/// C8b S2/S4 A/B gate: `MINFER_NO_KV_SHARE=1` (presence-checked, the campaign's
+/// standing env-gate rule) forces C8a's **copy** where the device's attention
+/// kernel could read another sequence's prefix in place.
+///
+/// It is what lets the real-model gate compare a shared run against a
+/// *shape-matched* copied one, and it is the switch that measures the share
+/// itself. Presence-checked on purpose: `MINFER_NO_KV_SHARE=0` would otherwise
+/// read as "off" while looking like a declaration.
+pub(crate) fn kv_share_disabled() -> bool {
+    std::env::var("MINFER_NO_KV_SHARE").map_or(false, |v| v == "1")
+}
+
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
