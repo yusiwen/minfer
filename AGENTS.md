@@ -159,7 +159,9 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Parameter audit, bug/debug notes, known issues | `docs/PARAMETER_AUDIT.md`, `docs/BUG-6-KV-CACHE-INDEXING.md`, `docs/DEBUGGING-*.md`, `docs/QWEN2.5-*.md`, `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |
 | Build / usage / support reference | `docs/BUILD.md`, `docs/USAGE.md`, `docs/SUPPORT-MATRIX.md`, `docs/FEATURES.md` |
 
-**Open doc debt / test health (GitHub issues):** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md` after
-the elastic partition), [#63](https://github.com/yusiwen/minfer/issues/63) (CI does not enforce the docs build),
-[#82](https://github.com/yusiwen/minfer/issues/82) (three ignored real-model tests fail on master). A finding from a gate
-run belongs here too — a red baseline makes every later gate run ambiguous.
+**Open doc debt (GitHub issues):** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md` after
+the elastic partition), [#63](https://github.com/yusiwen/minfer/issues/63) (CI does not enforce the docs build).
+Test health was [#82](https://github.com/yusiwen/minfer/issues/82), **closed**: the three ignored real-model
+tests that failed on master (two wrote into a directory nothing created; the third asserted the greedy 0.5B's stop
+behaviour instead of the `need_insert_eot` invariant — a real-model test must assert the engine's rule, not the
+model's mood). A finding from a gate run belongs here too — a red baseline makes every later gate run ambiguous.
