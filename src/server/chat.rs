@@ -686,6 +686,26 @@ pub fn worker_loop(
         let n_ctx_total: usize = slots.iter().map(|s| s.n_ctx_slot).sum();
         match super::batch::BatchEngine::new(&*model, slots.len(), n_ctx_total) {
             Ok(mut engine) => {
+                // E3: the prefill chunk (`n_batch` made real). Printed for the same
+                // reason the batching mode is: the default is a decision, and a
+                // decision nobody can see is one nobody can debug.
+                let n_batch = super::batch::prefill_chunk_size(
+                    std::env::var("MINFER_N_BATCH").ok().as_deref(),
+                );
+                engine.set_prefill_chunk(n_batch);
+                eprintln!(
+                    "[server] prefill chunks: {} ({}; MINFER_N_BATCH=0 disables chunking)",
+                    if n_batch == 0 {
+                        "off".to_string()
+                    } else {
+                        format!("{n_batch} tokens")
+                    },
+                    if std::env::var("MINFER_N_BATCH").is_ok() {
+                        "MINFER_N_BATCH"
+                    } else {
+                        "default"
+                    }
+                );
                 eprintln!(
                     "[server] continuous batching: {} slot(s), {n_ctx_total} KV rows shared",
                     engine.n_slots()
