@@ -51,6 +51,12 @@ pub trait Backend: Send + Sync {
     fn alloc_buffer(&mut self, size: usize) -> usize;
     fn free_buffer(&mut self, id: usize);
 
+    /// How many buffers the pool holds (never shrinks — the pool is the high-water mark).
+    ///
+    /// E4 S2 reads this to tell a *new* buffer from a recycled one: `pool_bytes` is the
+    /// pool's resident total, so it must only grow when the pool actually grew.
+    fn pool_len(&self) -> usize;
+
     /// Allocate a buffer that bypasses the recycle free list. Split-boundary
     /// staging needs this: at execute time the free list holds ids whose
     /// physical contents are still referenced by node_to_buf and get
@@ -62,8 +68,10 @@ pub trait Backend: Send + Sync {
     /// Execute one node: inputs and output are [`BufRef`]s into this backend's
     /// pool. A reference carries an element `offset` and `len` (D1 views), so a
     /// backend must apply the offset when it resolves the buffer — an owning
-    /// node's reference has `offset == 0` and covers the whole buffer, and a
-    /// view's is a window of its parent's.
+    /// node's reference has `offset == 0`, and `len` is the node's **logical**
+    /// element count, which since E4 S2 may be shorter than the pool buffer
+    /// (rounded up to its size class). Only ever read/write `[offset, offset +
+    /// len)`: the tail is another allocation's padding.
     ///
     /// `kv_pair` is the layer's (k, v) region buffer *ids* for KV ops (None for
     /// non-KV ops or when the layer has no regions); the persistent KV regions
@@ -107,7 +115,24 @@ pub trait Backend: Send + Sync {
     /// Host read/write of a pool buffer (for input filling and output
     /// extraction; GPU backends implement these as staged transfers).
     fn read_host(&self, id: usize) -> Option<&[f32]>;
+
+    /// Write **exactly** `data` into pool buffer `id` — the contract for a
+    /// buffer that is allocated at its exact size (persistent KV regions, split
+    /// staging).
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;
+
+    /// Write `data` into the window of pool buffer `id` that starts at element
+    /// `offset` (E4 S2).
+    ///
+    /// A pooled *activation* buffer is rounded up to its size class, so it is
+    /// routinely longer than the node it serves: the node's logical length lives
+    /// in its [`BufRef`], and this is the write that honours it. The check is
+    /// `offset + data.len() <= <pool buffer elements>` — never equality — and
+    /// `offset` may be non-zero for a view's window. A caller that wants the
+    /// exact-length contract keeps using [`Self::write_host`].
+    ///
+    /// [`BufRef`]: super::BufRef
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String>;
 
     /// Wait for async work to complete (CPU: no-op; Metal: submit the pending
     /// command buffer). Called between splits and after the last split; only the

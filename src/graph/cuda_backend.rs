@@ -1449,6 +1449,10 @@ impl Backend for CudaBackend {
         self.pool.len() - 1
     }
 
+    fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
     fn free_buffer(&mut self, id: usize) {
         let _sg = self.stream_guard();
         // Recycle, never cudaFree here: persistent KV regions survive rebuilds
@@ -1544,19 +1548,31 @@ impl Backend for CudaBackend {
     }
 
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String> {
+        // CUDA's fill has always allowed a prefix (the pool buffer may be longer
+        // than the data), which is exactly the E4 S2 window contract at offset 0.
+        self.write_host_window(id, 0, data)
+    }
+
+    /// E4 S2: pooled activation buffers are rounded to their size class, so a
+    /// node writes its logical window into a buffer that may be longer; `offset`
+    /// is that window's element offset (0 for an owning node, non-zero for a D1
+    /// view).
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String> {
         let _sg = self.stream_guard();
         let bytes = data.len() * 4;
+        let base = offset * 4;
         let dst = self.ptr_of(id)?;
-        if self.pool[id].bytes < bytes {
+        let have = self.pool[id].bytes;
+        if base.saturating_add(bytes) > have {
             return Err(format!(
-                "cuda: buffer {id} too small: {} < {bytes} bytes",
-                self.pool[id].bytes
+                "cuda: buffer {id} too small: writing {bytes} bytes at offset {base} runs past {have} bytes"
             ));
         }
         // 7e⑥: pinned-staged async fill (same-stream ordering makes this
         // race-free with the kernels that read the input; the ring syncs
         // only if more than STAGING_SLOTS fills queue up without a sync).
         let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
+        let dst = unsafe { (dst as *mut u8).add(base) as *mut std::ffi::c_void };
         self.state.write_input_async(src, dst);
         Ok(())
     }
