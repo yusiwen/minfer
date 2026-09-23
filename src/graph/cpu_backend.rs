@@ -27,8 +27,13 @@ pub struct CpuBackend {
     kv_format: KvFormat,
     /// Reusable f32 scratch the packed read path dequantizes a query window into
     /// (one per region). Kept across calls: it is one window, not the whole cache.
+    /// Only the fallback path (`hd_kv` narrower than one Q8_0 block, or
+    /// `MINFER_NO_FUSED_Q8_KV`) uses these.
     kv_scratch_k: Vec<f32>,
     kv_scratch_v: Vec<f32>,
+    /// Reusable one-cell payload for the packed store, so packing `nt` cells
+    /// allocates once rather than once per row.
+    kv_pack_buf: Vec<u8>,
     /// E4 S3: how many times the pool actually created a buffer. A rebuild that
     /// re-maps onto reserved slots must not move this — it is the CPU-side twin of
     /// CUDA's `pool_gen`, and what the "reserve, then assign" gate asserts.
@@ -44,6 +49,7 @@ impl CpuBackend {
             kv_format: super::kvformat::kv_format(),
             kv_scratch_k: Vec::new(),
             kv_scratch_v: Vec::new(),
+            kv_pack_buf: Vec::new(),
             allocs: 0,
         }
     }
@@ -234,6 +240,11 @@ impl Backend for CpuBackend {
                 (&mut before[k_id], &mut after[0])
             };
             let packed = self.kv_format.is_packed();
+            // C4 S2: one quantization scratch for the whole store, not one per cell.
+            if packed {
+                self.kv_pack_buf
+                    .resize(KvFormat::Q8_0.payload_bytes(nkt), 0);
+            }
             for t in 0..nt {
                 let p = pos[t];
                 if p >= n_ctx {
@@ -242,15 +253,17 @@ impl Backend for CpuBackend {
                 let ks = p * row_elems;
                 let src = t * nkt;
                 if packed {
-                    kvformat::pack_q8_0_cell(
+                    kvformat::pack_q8_0_cell_into(
                         &mut k_dst[ks..ks + row_elems],
                         nkt,
                         &k_src[src..src + nkt],
+                        &mut self.kv_pack_buf,
                     );
-                    kvformat::pack_q8_0_cell(
+                    kvformat::pack_q8_0_cell_into(
                         &mut v_dst[ks..ks + row_elems],
                         nkt,
                         &v_src[src..src + nkt],
+                        &mut self.kv_pack_buf,
                     );
                 } else {
                     k_dst[ks..ks + row_elems].copy_from_slice(&k_src[src..src + nkt]);
@@ -522,10 +535,34 @@ impl Backend for CpuBackend {
                 // validated and decoded.
                 let (runs, off) = decode_window(ins[3], nt, n_ctx)?;
                 if self.kv_format.is_packed() {
-                    // C4 S1: dequantize the union of this batch's windows into the
-                    // reusable scratch and run the unchanged f32 kernel over it. The
-                    // runs stay cell-indexed, only rebased to the scratch's start;
-                    // the fused Q8_0 dot that removes this pass is C4 S2 (issue #87).
+                    // C4 S2: read the packed blocks directly — the K score is a
+                    // Q8_0 × Q8_0 dot against the quantized query, V accumulates out
+                    // of the cell. No scratch, no second pass.
+                    // `MINFER_NO_FUSED_Q8_KV` keeps S1's dequantizing path for the
+                    // A/B standing rule 3 asks for (presence-checked).
+                    if meta.hd_kv % kvformat::Q8_0_BLOCK == 0 && fused_q8_kv_enabled() {
+                        return cpu_gqa_attn_runs_q8(
+                            ins[0],
+                            k_slice,
+                            v_slice,
+                            &runs,
+                            &off,
+                            nt,
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.hd_kv,
+                            nkt,
+                            out,
+                            meta.scale,
+                        );
+                    }
+                    // A KV head narrower than one Q8_0 block cannot be read
+                    // block-aligned (no supported architecture emits one — `check_width`
+                    // already requires `nkt % 32 == 0`): dequantize the union of this
+                    // batch's windows into the reusable scratch and run the unchanged
+                    // f32 kernel over it. The runs stay cell-indexed, only rebased to
+                    // the scratch's start.
                     let lo = runs.iter().map(|r| r.0).min().unwrap_or(0);
                     let hi = runs.iter().map(|r| r.0 + r.1).max().unwrap_or(lo);
                     let rows = hi.saturating_sub(lo);
@@ -966,6 +1003,192 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
                         std::slice::from_raw_parts_mut(c.out.add(os), c.hd_kv),
                         std::slice::from_raw_parts(c.va.add(kv * c.nkt + vs_base), c.hd_kv),
                         scrs[i],
+                    );
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+// ---- the fused packed (Q8_0) read path (C4 S2) -----------------------------
+
+/// Whether the fused packed read is enabled (C4 S2).
+///
+/// `MINFER_NO_FUSED_Q8_KV` (presence-checked, like the other `MINFER_NO_*` knobs)
+/// keeps S1's dequantize-into-a-scratch path available, which is the A/B standing
+/// rule 3 asks for: the two paths answer within a named class, not bitwise, because
+/// the fused one quantizes the query too.
+fn fused_q8_kv_enabled() -> bool {
+    std::env::var_os("MINFER_NO_FUSED_Q8_KV").is_none()
+}
+
+/// Attention over **packed Q8_0** K/V regions, reading the blocks directly.
+///
+/// C4 S1 dequantized the union of the batch's windows into a reusable f32 scratch
+/// (two allocations and a write+read pass per attention node, per layer, per
+/// forward) and ran the unchanged f32 kernel over it. S2 removes all of that[^bw]:
+///
+/// - the K score is `dot_q8_0_q8_0` between the **Q8_0-quantized query row** and the
+///   stored K blocks — llama.cpp's form for a quantized cache, and the reason a
+///   packed cache is worth having (34 bytes per 32 elements, SDOT in the NEON arm);
+/// - V accumulates straight out of the packed cell, block scale included, with no
+///   f32 staging at all.
+///
+/// [^bw]: The **query** is now quantized too, so a score carries the query's Q8_0
+/// error on top of the stored cell's — a new term in the tolerance class this path
+/// is measured against the f32 cache with (see `docs/ARCHITECTURE-EXECUTION-PLAN.md`
+/// §5 C4 S2 for the measured number). The V side has no new term: it evaluates the
+/// same `scale * quant` product the scratch path's dequantizer wrote.
+///
+/// `hd` must be a multiple of [`kvformat::Q8_0_BLOCK`] so a KV head's slice starts on
+/// a block boundary; the caller keeps the S1 scratch path for anything else.
+pub(crate) fn cpu_gqa_attn_runs_q8(
+    q: &[f32],
+    ka: &[f32],
+    va: &[f32],
+    runs: &[(usize, usize)],
+    off: &[usize],
+    nt: usize,
+    nh: usize,
+    nk: usize,
+    hd: usize,
+    hd_kv: usize,
+    nkt: usize,
+    out: &mut [f32],
+    scale: f32,
+) -> Result<(), String> {
+    if hd < hd_kv {
+        return Err(format!(
+            "Q head dim ({hd}) must be >= KV head dim ({hd_kv})"
+        ));
+    }
+    if hd_kv % kvformat::Q8_0_BLOCK != 0 {
+        return Err(format!(
+            "fused Q8_0 attention needs a KV head width that is a multiple of {} (got {hd_kv}): \
+             a packed block covers {} elements and a head slice must not straddle one",
+            kvformat::Q8_0_BLOCK,
+            kvformat::Q8_0_BLOCK
+        ));
+    }
+    if off.len() != nt + 1 {
+        return Err(format!(
+            "attention: {} run offsets for {nt} query tokens",
+            off.len()
+        ));
+    }
+    let max_vl = (0..nt)
+        .map(|t| (off[t]..off[t + 1]).map(|i| runs[i].1).sum::<usize>())
+        .max();
+    let ctx = AttnQ8Ctx {
+        q: q.as_ptr(),
+        ka: ka.as_ptr(),
+        ka_len: ka.len(),
+        va: va.as_ptr(),
+        va_len: va.len(),
+        runs: runs.as_ptr(),
+        off: off.as_ptr(),
+        nt,
+        max_vl: max_vl.unwrap_or(0),
+        nh,
+        hk: nk,
+        hd,
+        hd_kv,
+        nkt,
+        out: out.as_mut_ptr(),
+        scale,
+    };
+    if crate::kernel::cpu_threads() <= 1 || nh < 2 {
+        unsafe { attn_heads_q8(&ctx as *const _ as *const (), 0, nh) };
+        return Ok(());
+    }
+    crate::kernel::par_for(nh, &ctx as *const _ as *const (), attn_heads_q8);
+    Ok(())
+}
+
+/// Raw context for the pooled packed-attention worker (S2). Same fields as
+/// [`AttnCtx`] plus the two region lengths the byte views need.
+struct AttnQ8Ctx {
+    q: *const f32,
+    /// Packed K region, as pool words (read as bytes through
+    /// [`kvformat::region_bytes`]).
+    ka: *const f32,
+    ka_len: usize,
+    /// Packed V region, as pool words.
+    va: *const f32,
+    va_len: usize,
+    runs: *const (usize, usize),
+    off: *const usize,
+    nt: usize,
+    max_vl: usize,
+    nh: usize,
+    hk: usize,
+    hd: usize,
+    hd_kv: usize,
+    nkt: usize,
+    out: *mut f32,
+    scale: f32,
+}
+
+/// Fused packed attention for heads [h0, h1). SAFETY: as [`attn_heads`] — `ctx`
+/// points at a live [`AttnQ8Ctx`] for the call's duration, the head ranges are
+/// disjoint, and each head only reads.
+unsafe fn attn_heads_q8(ctx: *const (), h0: usize, h1: usize) {
+    let c = &*(ctx as *const AttnQ8Ctx);
+    let gqa = c.nh / c.hk;
+    let ne_q = c.nh * c.hd;
+    let ka = std::slice::from_raw_parts(c.ka, c.ka_len);
+    let va = std::slice::from_raw_parts(c.va, c.va_len);
+    let kbytes = kvformat::region_bytes(ka);
+    let block_bytes = (c.hd_kv / kvformat::Q8_0_BLOCK) * kvformat::Q8_0_BLOCK_BYTES;
+    // One Q8_0 block row per worker (not per query): the query is re-quantized per
+    // (head, token) into this buffer and the K dot reads it back.
+    let mut qq = vec![0u8; block_bytes];
+    let mut scrs = vec![0.0f32; c.max_vl.max(1)];
+    for h in h0..h1 {
+        let hk = h / gqa;
+        let head_elem = hk * c.hd_kv;
+        for t in 0..c.nt {
+            let qs = t * ne_q + h * c.hd;
+            let qrow = std::slice::from_raw_parts(c.q.add(qs), c.hd_kv);
+            crate::quants::quantize_row_q8_0_buf(qrow, 1, c.hd_kv, &mut qq);
+            let (o0, o1) = (*c.off.add(t), *c.off.add(t + 1));
+            let mut mx = f32::NEG_INFINITY;
+            let mut i = 0usize;
+            for r in o0..o1 {
+                let (cell, len) = *c.runs.add(r);
+                for kv in cell..cell + len {
+                    let at = kvformat::q8_0_cell_offset(c.nkt, kv, head_elem);
+                    let s =
+                        crate::quants::dot_q8_0_q8_0(&qq, &kbytes[at..at + block_bytes]) * c.scale;
+                    scrs[i] = s;
+                    i += 1;
+                    if s > mx {
+                        mx = s;
+                    }
+                }
+            }
+            // The softmax and the accumulation run over the token's OWN window, in
+            // the same order and with the same ops as the scratch path — only the
+            // source of the scores and of the V rows changed.
+            let vl = i;
+            let sm = crate::vec_ops::vec_soft_max_inplace_f32(vl, &mut scrs, mx);
+            let is = (1.0 / sm) as f32;
+            crate::vec_ops::vec_scale_f32(vl, &mut scrs, is);
+            let os = t * ne_q + h * c.hd;
+            let out_slice = std::slice::from_raw_parts_mut(c.out.add(os), c.hd);
+            out_slice.fill(0.0);
+            let mut i = 0usize;
+            for r in o0..o1 {
+                let (cell, len) = *c.runs.add(r);
+                for kv in cell..cell + len {
+                    kvformat::accumulate_q8_0_row(
+                        va,
+                        c.nkt,
+                        kv,
+                        head_elem,
+                        scrs[i],
+                        &mut out_slice[..c.hd_kv],
                     );
                     i += 1;
                 }
@@ -1536,6 +1759,218 @@ mod tests {
             "packed KV vs f32 KV: max |Δ| = {worst} over {} outputs",
             f32_out.len()
         );
+    }
+
+    /// C4 S2: the fused read addresses **each KV head's blocks** and agrees with the
+    /// S1 path it replaces.
+    ///
+    /// The oracle here is S1's own mechanism — `unpack_q8_0_cells` →
+    /// `cpu_gqa_attn_runs` — so the only permitted difference is the *query's* Q8_0
+    /// quantization (the K score is now a `dot_q8_0_q8_0`). Two KV heads with very
+    /// different K rows make a wrong head base (`hk * hd`, the block offset the
+    /// fused path computes itself) fail by the whole spread instead of by an ulp.
+    #[test]
+    fn the_fused_q8_read_matches_the_dequantizing_reference() {
+        use super::super::kvformat::{self, KvFormat};
+        let (nh, nk, hd, nt, n_ctx) = (2usize, 2usize, 32usize, 3usize, 6usize);
+        let nkt = nk * hd; // 64 → two heads, each exactly one Q8_0 block wide
+        let scale = 1.0 / (hd as f32).sqrt();
+        let kk: Vec<f32> = (0..n_ctx * nkt)
+            .map(|i| {
+                if (i % nkt) / hd == 0 {
+                    ((i as f32) * 0.31).sin() * 0.9
+                } else {
+                    ((i as f32) * 0.17).cos() * 2.5 - 1.0
+                }
+            })
+            .collect();
+        let vv: Vec<f32> = (0..n_ctx * nkt)
+            .map(|i| ((i as f32) * 0.11).sin() * 0.6 - (i % 5) as f32 * 0.03)
+            .collect();
+        let q: Vec<f32> = (0..nt * nh * hd)
+            .map(|i| ((i as f32) * 0.23).cos() * 0.8)
+            .collect();
+
+        // Pack exactly as the store does: one cell per row, heads block-aligned.
+        let row_elems = KvFormat::Q8_0.row_elems(nkt);
+        let mut kreg = vec![0.0f32; n_ctx * row_elems];
+        let mut vreg = vec![0.0f32; n_ctx * row_elems];
+        for cell in 0..n_ctx {
+            let w = cell * row_elems..(cell + 1) * row_elems;
+            kvformat::pack_q8_0_cell(&mut kreg[w.clone()], nkt, &kk[cell * nkt..(cell + 1) * nkt]);
+            kvformat::pack_q8_0_cell(&mut vreg[w], nkt, &vv[cell * nkt..(cell + 1) * nkt]);
+        }
+
+        // Causal windows, one run per query (`off[t]..off[t + 1]`).
+        let runs: Vec<(usize, usize)> = (0..nt).map(|t| (0usize, t + 1)).collect();
+        let off: Vec<usize> = (0..=nt).collect();
+
+        let mut kf = vec![0.0f32; n_ctx * nkt];
+        let mut vf = vec![0.0f32; n_ctx * nkt];
+        kvformat::unpack_q8_0_cells(&kreg, nkt, 0, n_ctx, &mut kf);
+        kvformat::unpack_q8_0_cells(&vreg, nkt, 0, n_ctx, &mut vf);
+        let mut want = vec![0.0f32; nt * nh * hd];
+        cpu_gqa_attn_runs(
+            &q, &kf, &vf, &runs, &off, nt, nh, nk, hd, hd, nkt, &mut want, scale,
+        )
+        .unwrap();
+
+        let mut got = vec![0.0f32; nt * nh * hd];
+        cpu_gqa_attn_runs_q8(
+            &q, &kreg, &vreg, &runs, &off, nt, nh, nk, hd, hd, nkt, &mut got, scale,
+        )
+        .unwrap();
+
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let spread = want.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+            - want.iter().fold(f32::INFINITY, |m, x| m.min(*x));
+        eprintln!("[c4s2] fused vs dequantizing reference: max |Δ| = {worst} of a {spread} spread");
+        assert!(
+            worst < 1e-3,
+            "the fused read may only differ by the query's Q8_0 quantization: max |Δ| = \
+             {worst} of a {spread} spread"
+        );
+    }
+
+    /// C4 S2: a physical shift on a **packed** region moves every surviving cell
+    /// verbatim (V is never re-roped, so it is bitwise), and re-ropes the survivors'
+    /// K through dequantize → rope → requantize.
+    ///
+    /// The gate is exact on both sides: V must equal the old cells byte-for-byte, and
+    /// the new K cell must be the Q8_0 quantizate of the re-roped f32 row — computed
+    /// here independently, so a shift that forgets the requantize (or re-ropes the
+    /// packed bytes) cannot pass.
+    #[test]
+    fn a_packed_physical_shift_moves_v_verbatim_and_requantizes_k() {
+        use super::super::kvformat::{self, KvFormat};
+        use crate::graph::kvcache::{rope_shift_kv, KvRope};
+        use crate::vec_ops::RopeStyle;
+
+        let nkt = 32usize;
+        let hd = 32usize;
+        let nt = 3usize;
+        let n_ctx = 8usize;
+        let kk: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i as f32) * 0.29).cos() * 1.3 + 0.04 * (i % 7) as f32)
+            .collect();
+        let vv: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i as f32) * 0.07).sin() * 0.5 - 0.02 * (i % 3) as f32)
+            .collect();
+
+        let mut h = Harness::new();
+        h.alloc.cpu_mut().set_kv_format_for_test(KvFormat::Q8_0);
+        let mut gb = GraphBuilder::new();
+        gb.set_kv_format(KvFormat::Q8_0);
+        let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+        let q = gb.input("q", [nkt, nt, 1, 1], DType::F32);
+        let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
+        let store = gb.kvcache_store(0, k, v, n_ctx);
+        gb.output(store);
+        let g = gb.build();
+        h.alloc.alloc_graph(&g).unwrap();
+        h.alloc.fill_input_i32(&g, "positions", &[0, 1, 2]).unwrap();
+        // `kvcache_store` consumes the builder's own `cells` input (C6): filling
+        // `positions` alone left every row going to cell 0, which made this gate pass
+        // on a region with one live row — exactly the kind of false green the nonzero
+        // assertions below exist to prevent.
+        h.alloc
+            .fill_attn_inputs(&g, &[0, 0, 0], &[0, 1, 2])
+            .unwrap();
+        h.alloc.fill_input(&g, "k", &kk).unwrap();
+        h.alloc.fill_input(&g, "v", &vv).unwrap();
+        h.sched.execute(&g, &mut h.alloc).unwrap();
+        h.alloc.kv_note_used(nt);
+
+        let rope = KvRope {
+            freq_base: 10_000.0,
+            freq_scale: 1.0,
+            n_head_kv: 1,
+            hd,
+            style: RopeStyle::NonInterleaved,
+        };
+        let row_elems = KvFormat::Q8_0.row_elems(nkt);
+        let (before_k_words, before_v_words) = h.alloc.copy_kv_to_cpu(0).unwrap();
+        let mut before_k = vec![0.0f32; nt * nkt];
+        let mut before_v = vec![0.0f32; nt * nkt];
+        kvformat::unpack_q8_0_cells(&before_k_words, nkt, 0, nt, &mut before_k);
+        kvformat::unpack_q8_0_cells(&before_v_words, nkt, 0, nt, &mut before_v);
+
+        // The fixture must be real: three written rows, each with data, or every
+        // assertion below would pass on zeros.
+        for r in 0..nt {
+            assert!(
+                before_k[r * nkt..(r + 1) * nkt].iter().any(|x| *x != 0.0)
+                    && before_v[r * nkt..(r + 1) * nkt].iter().any(|x| *x != 0.0),
+                "row {r} was not written (the store did not get its cells input)"
+            );
+        }
+        // Drop the oldest row: cells 1..3 slide to 0..2 and are re-roped by -1.
+        let left = h.alloc.kv_rm(0, 1, &rope).unwrap();
+        assert_eq!(left, nt - 1, "one row removed");
+        let (after_k_words, after_v_words) = h.alloc.copy_kv_to_cpu(0).unwrap();
+        let mut after_k = vec![0.0f32; nt * nkt];
+        let mut after_v = vec![0.0f32; nt * nkt];
+        kvformat::unpack_q8_0_cells(&after_k_words, nkt, 0, left, &mut after_k);
+        kvformat::unpack_q8_0_cells(&after_v_words, nkt, 0, left, &mut after_v);
+
+        // V: the cells moved verbatim, so the dequantized values are bitwise equal.
+        assert_eq!(
+            &after_v[..left * nkt],
+            &before_v[nkt..(left + 1) * nkt],
+            "V must move verbatim under a packed shift"
+        );
+        // The packed words themselves must be the old cells' words: a cell is a whole
+        // number of words, which is exactly why the move needs no format knowledge.
+        // Compared as **bits**: a packed word is an f16 scale plus int8 quants, so as an
+        // f32 it is frequently a NaN, and `==` on it is never true.
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&after_v_words[..left * row_elems]),
+            bits(&before_v_words[row_elems..(left + 1) * row_elems]),
+            "the V cells must move verbatim, byte for byte"
+        );
+        // K: exactly the Q8_0 quantizate of the old row, re-roped in f32.
+        for r in 0..left {
+            let mut want = before_k[(r + 1) * nkt..(r + 2) * nkt].to_vec();
+            rope_shift_kv(&mut want, 1, 1, &rope);
+            let bytes = crate::quants::quantize_row_q8_0(&want);
+            let mut quantized = vec![0.0f32; nkt];
+            crate::quants::dequantize_row_q8_0(&bytes, &mut quantized);
+            let got = &after_k[r * nkt..(r + 1) * nkt];
+            assert_eq!(
+                got,
+                &quantized[..],
+                "row {r}: the shifted K must be the Q8_0 quantizate of the re-roped row"
+            );
+            // And the honest approximation class: the re-rope of a *quantized* row
+            // differs from the quantum step of the stored cell.
+            let step = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                step < 0.2,
+                "row {r}: re-rope vs the f32 re-rope differs by {step}, more than one Q8_0 step"
+            );
+        }
+        // The tail must be cleared: no position may address a stale row.
+        for cell in left..n_ctx {
+            assert!(
+                after_k_words[cell * row_elems..(cell + 1) * row_elems]
+                    .iter()
+                    .all(|x| *x == 0.0)
+                    && after_v_words[cell * row_elems..(cell + 1) * row_elems]
+                        .iter()
+                        .all(|x| *x == 0.0),
+                "cell {cell} must be zeroed after the shift"
+            );
+        }
     }
 
     /// C4: a row width Q8_0 cannot express is refused where the region is sized,
