@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minfer · end-to-end shape flow</title>
+<link rel="stylesheet" href="e2e.css?v=2">
+<!-- Asset versions: bump `?v=` on the file you changed. A fresh page must never
+     pair with a stale stylesheet or script from a caching static server. -->
+<style>
+  /* The toolbar jump to the other view is inlined on purpose: it must look right
+     even when the browser still holds a stale style.css (that happened), and the
+     rule is three lines. Keep the two copies of this block in sync:
+     viz/index.html and viz/e2e.html. */
+  a.nav-btn {
+    display: inline-block; background: #273449; color: #e2e8f0;
+    border: 1px solid #334155; border-radius: 5px; padding: 4px 8px;
+    font-size: 12px; text-decoration: none; cursor: pointer; white-space: nowrap;
+  }
+  a.nav-btn:hover { border-color: #38bdf8; }
+</style>
+
+</head>
+<body>
+<header id="bar">
+  <div class="brand">
+    <span class="logo">▤</span>
+    <span class="title">minfer · shape flow</span>
+    <span class="subtitle" id="src">built-in profile</span>
+  </div>
+
+  <div class="controls">
+    <select id="sample" title="Load a pre-generated graph export (needs an http server; “Open File…” works under file://)">
+      <option value="">— sample —</option>
+    </select>
+    <button id="open" title="Load a graph or trace JSON from disk">Open File…</button>
+    <input id="file" type="file" accept=".json" hidden>
+
+    <span class="sep"></span>
+
+    <button id="play" class="primary" title="Play / pause">▶</button>
+    <button id="prev" title="Previous step">⏮</button>
+    <button id="next" title="Next step">⏭</button>
+    <button id="restart" title="Restart">↻</button>
+    <input id="speed" type="range" min="1" max="100" value="55" title="Playback speed">
+    <span class="dim" id="speedlbl">55</span>
+
+    <span class="sep"></span>
+
+    <div class="seg" id="phase" title="What to play: the full prefill→decode run, or one pass only">
+      <button data-mode="run" class="on">Run</button>
+      <button data-mode="prefill">Prefill</button>
+      <button data-mode="decode">Decode</button>
+    </div>
+    <label class="chk" title="Include the ×N-layers tick between layer 0 and the epilogue"><input id="layers" type="checkbox" checked> ×N</label>
+    <label class="chk" title="Play every node of every decode step instead of one sweep per step"><input id="detail" type="checkbox"> decode detail</label>
+
+    <span class="sep"></span>
+
+    <a id="to-ops" class="nav-btn" href="index.html" title="The operator / pipeline views of the same graph">Operators view →</a>
+  </div>
+</header>
+
+<main>
+  <div id="stagewrap"><canvas id="cv"></canvas></div>
+  <aside id="panel"><div id="panel-body"><div class="placeholder">loading…</div></div></aside>
+</main>
+
+<footer id="bottom">
+  <div id="kv">
+    <div class="kvhead">
+      <span id="kvlabel">KV cache</span>
+      <span class="dim" id="kvnum">—</span>
+    </div>
+    <div class="kvbar" title="The KV cache is a persistent [kv_dim, n_ctx] region; each step writes one more column">
+      <div id="kvfill"></div>
+      <div id="kvwin"></div>
+    </div>
+  </div>
+  <div id="chips" title="Click any step to jump to it"></div>
+</footer>
+
+<script src="e2e-model.js?v=4"></script>
+<script src="e2e.js?v=6"></script>
+</body>
+</html>
