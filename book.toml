@@ -15,7 +15,20 @@ build-dir = "book"
 default-theme = "coal"
 preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/yusiwen/minfer"
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
+# The two Mermaid assets live with the rest of the documentation assets under
+# docs/assets/, so the repo root is free of a 2.9 MB vendored bundle.
+# `additional-js` paths are relative to the *book root* (this file's directory)
+# and are copied into the output preserving that path — hence the "docs/assets/…"
+# spelling, and the matching <script src> mdBook emits. Because docs/ is also the
+# book source, mdBook copies the same two files a second time as content
+# (book/assets/…); the duplicate is confined to the gitignored book/ tree.
+#
+# Do NOT run `mdbook-mermaid install` after this move: its only target is the
+# book root, so it drops a second copy of both files there (untracked, 2.9 MB) —
+# the very clutter this layout removes. The entries above survive, because 0.13.0
+# matches them by file name and finds them already present; the root copies are
+# then dead weight rather than a build failure.
+additional-js = ["docs/assets/mermaid.min.js", "docs/assets/mermaid-init.js"]
 
 [output.html.fold]
 enable = true
