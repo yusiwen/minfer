@@ -1024,9 +1024,21 @@ mod tests {
     /// 0.5B), which is why the continuation agreement is *reported* and the
     /// perturbation's size is asserted.
     ///
+    /// **C4 S2 adds a second term and a second arm.** The fused read quantizes the
+    /// query row too (the K score is a `Q8_0 × Q8_0` dot), so the tail of the logit
+    /// vector moves a little more than S1's scratch path did: measured 3.029 against
+    /// S1's 2.505 on this gate (the decoding-relevant value at the reference's argmax
+    /// moved 0.604 → 0.646). `MINFER_NO_FUSED_Q8_KV=1` runs the S1 path through the
+    /// same gate, which is where that pair of numbers comes from. The second arm is
+    /// the physical shift: `kv_rm` moves the survivors verbatim and re-ropes each
+    /// survivor's K through dequantize → requantize, and the shifted continuation must
+    /// stay in the same class as the unshifted one.
+    ///
     /// What pins the format itself is one level down: `cpu_backend`'s
     /// `a_packed_kv_region_answers_like_the_f32_one_and_is_smaller` asserts that a
-    /// stored cell is **bitwise** the Q8_0 quantizate of the row it was given.
+    /// stored cell is **bitwise** the Q8_0 quantizate of the row it was given, and
+    /// `a_packed_physical_shift_moves_v_verbatim_and_requantizes_k` does the same for
+    /// the shift's two halves (V verbatim, K the quantizate of the re-roped row).
     ///
     /// Ignored because the format is a process-wide policy and this test flips it;
     /// run it alone (the CPU test binary is the configuration it is written for —
@@ -1132,9 +1144,109 @@ mod tests {
             at_argmax.iter().fold(0.0f32, |m, d| m.max(*d)) <= 1.0,
             "packed vs f32 at the argmax: {at_argmax:?}"
         );
+        // The tail bound is a gross-error detector (a wrong row width or byte order is
+        // off by orders of magnitude, not by 11% of the spread). S2's query
+        // quantization is the delta from S1's 2.505 to this run's 3.029, both <= 8% of
+        // the spread; `MINFER_NO_FUSED_Q8_KV=1` reproduces the smaller one.
         assert!(
-            worst <= 3.0,
+            worst <= 4.0,
             "packed vs f32 logits: max |Δ| = {worst} of a {spread} spread"
+        );
+
+        // C4 S2's second acceptance: a **physical shift** under Q8_0 keeps the
+        // continuation. `kv_rm` moves the surviving cells verbatim (a cell is a whole
+        // number of words) and re-ropes each survivor's K through
+        // dequantize → rope → requantize; that requantization is the new term, on top
+        // of the one the plain run above already carries.
+        //
+        // The shift drops the oldest `drop` rows of a longer prefill and continues,
+        // which is the conversation's overflow case (C2). Both formats run the *same*
+        // shift, so the comparison isolates the packed re-rope — it is not a comparison
+        // against a fresh prefill (which C2 records as its own tolerance class).
+        let shift_text = tok.encode(
+            "The capital of France is Paris and the capital of Japan is Tokyo and the \
+             capital of Italy is Rome",
+        );
+        let shift_n = shift_text.len();
+        let drop = 4usize;
+        assert!(
+            shift_n > drop + steps,
+            "the shifted fixture must keep a context"
+        );
+        let run_shifted = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+            set_kv_format(format);
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let positions: Vec<usize> = (0..shift_n).collect();
+            let mut l = model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
+            let (freq_base, freq_scale) = model.rope_params();
+            let rope = crate::graph::kvcache::KvRope {
+                freq_base,
+                freq_scale,
+                n_head_kv: model.n_head_kv(),
+                hd: model.n_embd_head(),
+                style: model.rope_style(),
+            };
+            let left = cache
+                .alloc()
+                .kv_rm(0, drop, &rope)
+                .expect("packed-aware physical shift");
+            // The survivors now address positions 0..left, so the next token continues
+            // at `left` — the shift's whole point.
+            let mut next = argmax(&l);
+            let mut toks = Vec::new();
+            let mut logs = Vec::new();
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
+                logs.push(l.clone());
+                next = argmax(&l);
+                toks.push(next);
+            }
+            (logs, toks, left)
+        };
+        let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(KvFormat::F32);
+        let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(KvFormat::Q8_0);
+        set_kv_format(KvFormat::F32);
+        assert_eq!(left_ref, left_q8, "the same shift must leave the same rows");
+        assert_eq!(left_ref, shift_n - drop);
+        // Compare the **first** decode step, i.e. the step whose input is the shifted
+        // context itself. Later steps are a different matter: a token that flips makes
+        // the two runs generate different sequences, so their logits diverge by nature
+        // (the run above reports the greedy agreement for exactly that reason).
+        let (l_first_f32, l_first_q8) = (&logs_shift_f32[0], &logs_shift_q8[0]);
+        let shift_delta = max_delta(l_first_f32, l_first_q8);
+        let spread_shift = l_first_f32.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+            - l_first_f32.iter().fold(f32::INFINITY, |m, x| m.min(*x));
+        let shift_at_argmax = {
+            let i = argmax(l_first_f32) as usize;
+            (l_first_f32[i] - l_first_q8[i]).abs()
+        };
+        let shift_matched = t_shift_ref
+            .iter()
+            .zip(&t_shift_q8)
+            .take_while(|(a, b)| a == b)
+            .count();
+        eprintln!(
+            "[c4s2] the first decode step after a {drop}-row shift of {shift_n}: max |Δlogit| = \
+             {shift_delta} of a {spread_shift} spread, at the argmax {shift_at_argmax}; greedy \
+             continuation agrees on {shift_matched}/{} steps (reported, not asserted)",
+            t_shift_ref.len()
+        );
+        // The same *kind* of measurement as the unshifted comparison, one step after a
+        // shift — with a slightly wider bound, because the shifted state is fragile in a
+        // way the unshifted one is not: `kv_rm` composes C2's re-rope with C4's
+        // re-quantization, so the surviving K rows are
+        // `quantize(rope(dequantize(quantize(row))))`. Measured here: max |Δlogit| 2.466
+        // and 0.064 at the reference's argmax on the fused path, 3.165 / 1.074 on S1's
+        // (`MINFER_NO_FUSED_Q8_KV=1`). Both legs must stay green — the knob is an A/B,
+        // not an alternate expectation — and a misread cell is off by the whole spread.
+        assert!(
+            shift_at_argmax <= 2.0,
+            "packed shift vs f32 shift at the argmax: |Δ| = {shift_at_argmax}"
+        );
+        assert!(
+            shift_delta <= 8.0,
+            "packed shift vs f32 shift: max |Δ| = {shift_delta} of a {spread_shift} spread"
         );
     }
 

@@ -15,6 +15,14 @@
 //! word-addressed, and the C3/C8b machinery (`copy_cells`, the copy-on-write shift, the
 //! compaction) moves one cell at a time and must keep moving it verbatim.
 //!
+//! **How a packed region is read (C4 S2).** The CPU attention kernel reads the blocks
+//! directly: the K score is a `dot_q8_0_q8_0` against the Q8_0-quantized query row, and
+//! V accumulates out of the cell block by block ([`accumulate_q8_0_row`]) — S1's
+//! dequantize-into-a-scratch pass is gone (`MINFER_NO_FUSED_Q8_KV` restores it for the
+//! A/B standing rule 3 asks for). A physical shift (`kv_rm`/`kv_shift`) moves the
+//! survivors verbatim and then maps each one through
+//! [`map_q8_0_cells`]: dequantize → re-rope → requantize.
+//!
 //! **Where a format is supported is a loud decision, never a fallback.** An unknown
 //! `MINFER_CACHE_TYPE` value is refused on every device (CUDA used to map anything that
 //! was not `f16` to f32), and a format the device has no kernel for is refused at load.
@@ -115,10 +123,10 @@ impl KvFormat {
     /// Whether this device has kernels that read a region in this format.
     pub fn supports(self, device: Device) -> bool {
         match self {
-            // C4 S1: the packed layout is read by the CPU attention kernel (which
-            // dequantizes the window into a scratch before the f32 kernel runs).
-            // CUDA and Metal address f32/f16 rows, so they refuse it until their
-            // kernels land (issue #87).
+            // C4 S2: the packed layout is read by the CPU attention kernel, which dots
+            // the stored K blocks against the quantized query and accumulates V out of
+            // the cell. CUDA and Metal address f32/f16 rows, so they refuse it until
+            // their kernels land (issue #87).
             KvFormat::Q8_0 => matches!(device, Device::Cpu),
             KvFormat::F32 | KvFormat::F16 => true,
         }
@@ -217,10 +225,19 @@ fn bytes_to_words(src: &[u8], out: &mut [f32]) {
 
 /// Quantize one f32 cell row (`src.len() == nkt`) into `dst`, one packed cell.
 pub fn pack_q8_0_cell(dst: &mut [f32], nkt: usize, src: &[f32]) {
-    debug_assert_eq!(dst.len(), KvFormat::Q8_0.row_elems(nkt));
     let mut raw = vec![0u8; KvFormat::Q8_0.payload_bytes(nkt)];
-    crate::quants::quantize_row_q8_0_into(src, &mut raw);
-    bytes_to_words(&raw, dst);
+    pack_q8_0_cell_into(dst, nkt, src, &mut raw);
+}
+
+/// [`pack_q8_0_cell`] with a caller-owned scratch, so a store of `nt` cells allocates
+/// once instead of once per row (a 2048-token prefill packs ~98k cells across 24
+/// layers — the per-row `vec!` was measurable in the packed prefill path).
+pub fn pack_q8_0_cell_into(dst: &mut [f32], nkt: usize, src: &[f32], scratch: &mut [u8]) {
+    debug_assert_eq!(dst.len(), KvFormat::Q8_0.row_elems(nkt));
+    let payload = KvFormat::Q8_0.payload_bytes(nkt);
+    debug_assert!(scratch.len() >= payload);
+    crate::quants::quantize_row_q8_0_into(src, &mut scratch[..payload]);
+    bytes_to_words(&scratch[..payload], dst);
 }
 
 /// Dequantize `rows` packed cells of `region`, starting at cell `first`, into `out`
@@ -234,6 +251,95 @@ pub fn unpack_q8_0_cells(region: &[f32], nkt: usize, first: usize, rows: usize, 
         let cell = first + r;
         words_to_bytes(&region[cell * row_elems..(cell + 1) * row_elems], &mut raw);
         crate::quants::dequantize_row_q8_0(&raw[..payload], &mut out[r * nkt..(r + 1) * nkt]);
+    }
+}
+
+// ---- the fused read path (C4 S2) -------------------------------------------
+//
+// S1 dequantized a query window into a reusable f32 scratch and then ran the
+// unchanged f32 attention kernel over it. S2 reads the packed bytes directly:
+// the K side is a `dot_q8_0_q8_0` against the Q8_0-quantized query row, and the V
+// side accumulates block by block as it reads. Both drop the scratch's write +
+// read pass, which is the point of a packed cache on a bandwidth-bound device.
+
+/// One packed region's bytes: a `&[f32]` reborrowed as `&[u8]`.
+///
+/// The pool stores a packed cell in f32 words, so the bytes are the words'
+/// little-endian bit patterns. `f32` is 4-byte aligned (≥ `u8`'s 1), so the
+/// reborrow is always aligned, and the result borrows `region`.
+pub fn region_bytes(region: &[f32]) -> &[u8] {
+    // SAFETY: `[f32]` is 4-byte aligned, every byte of it is initialized, and the
+    // returned slice shares `region`'s lifetime.
+    unsafe { std::slice::from_raw_parts(region.as_ptr() as *const u8, region.len() * WORD_BYTES) }
+}
+
+/// Byte offset of element `first_elem` inside cell `cell` of a packed region.
+///
+/// `first_elem` must be block-aligned — the fused read passes a KV head's base,
+/// which is why it requires `hd % 32 == 0` (the store's `check_width` already
+/// requires `nkt % 32 == 0`, and every supported architecture has `hd` a multiple
+/// of 64).
+#[inline]
+pub fn q8_0_cell_offset(nkt: usize, cell: usize, first_elem: usize) -> usize {
+    debug_assert_eq!(first_elem % Q8_0_BLOCK, 0);
+    cell * KvFormat::Q8_0.row_elems(nkt) * WORD_BYTES + (first_elem / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES
+}
+
+/// `out[i] += weight * dequant(cell)[first_elem + i]` over packed Q8_0 blocks.
+///
+/// The V side of the fused read: one pass over the cell's bytes, no f32 scratch.
+/// `out.len()` must be a non-zero multiple of [`Q8_0_BLOCK`].
+pub fn accumulate_q8_0_row(
+    region: &[f32],
+    nkt: usize,
+    cell: usize,
+    first_elem: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(first_elem % Q8_0_BLOCK, 0);
+    debug_assert!(out.len() % Q8_0_BLOCK == 0);
+    let bytes = region_bytes(region);
+    let base = q8_0_cell_offset(nkt, cell, first_elem);
+    for (b, chunk) in out.chunks_exact_mut(Q8_0_BLOCK).enumerate() {
+        let blk = &bytes[base + b * Q8_0_BLOCK_BYTES..base + (b + 1) * Q8_0_BLOCK_BYTES];
+        let d = crate::block::fp16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) * weight;
+        for (i, o) in chunk.iter_mut().enumerate() {
+            *o += d * blk[2 + i] as i8 as f32;
+        }
+    }
+}
+
+/// Map one packed cell through `f`: dequantize → `f` → requantize, in place.
+///
+/// This is what makes a physical shift (`KvCache::kv_rm` / `kv_shift`, C2)
+/// expressible on a packed region: the surviving cells move **verbatim** (they are
+/// whole words), and then their K row is dequantized into `row`, re-roped in f32 by
+/// `f`, and quantized back. `row` is caller-owned (`nkt` f32) so a shift over the
+/// whole arena allocates once, not once per row.
+///
+/// The cost is one extra quantize per surviving row, on an operation that already
+/// touches every row once per overflow.
+pub fn map_q8_0_cells(
+    region: &mut [f32],
+    nkt: usize,
+    first: usize,
+    rows: usize,
+    row: &mut [f32],
+    mut f: impl FnMut(&mut [f32]),
+) {
+    let row_elems = KvFormat::Q8_0.row_elems(nkt);
+    let payload = KvFormat::Q8_0.payload_bytes(nkt);
+    debug_assert!(row.len() >= nkt);
+    let mut raw = vec![0u8; row_elems * WORD_BYTES];
+    for r in 0..rows {
+        let cell = first + r;
+        let words = &mut region[cell * row_elems..(cell + 1) * row_elems];
+        words_to_bytes(words, &mut raw);
+        crate::quants::dequantize_row_q8_0(&raw[..payload], &mut row[..nkt]);
+        f(&mut row[..nkt]);
+        crate::quants::quantize_row_q8_0_into(&row[..nkt], &mut raw[..payload]);
+        bytes_to_words(&raw[..payload], words);
     }
 }
 

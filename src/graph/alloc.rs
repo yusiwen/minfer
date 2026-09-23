@@ -1008,17 +1008,12 @@ impl GraphAllocator {
         if layers.is_empty() {
             return Err("kv_rm: no KV arena allocated".into());
         }
-        // C4: the survivors are re-roped in f32 below, and a packed Q8_0 region is
-        // not f32 rows — reinterpreting its bytes would rotate noise. Refuse; the
-        // quantize-aware shift is C4 S2 (issue #87).
-        if self.kv.any_packed() {
-            return Err(
-                "kv_rm: a physical removal re-ropes the surviving K rows in f32, and this KV \
-                 cache is a packed Q8_0 region; a quantize-aware shift is C4 S2 (issue #87) — \
-                 run without MINFER_CACHE_TYPE=q8_0, or without a context shift"
-                    .into(),
-            );
-        }
+        // C4 S2: a packed Q8_0 region is not f32 rows, so the re-rope below cannot
+        // reinterpret its bytes. The survivors are still moved **verbatim** (a cell is
+        // a whole number of words, which is exactly why that move needs no format
+        // knowledge), and then each survivor's K row is dequantized, re-roped in f32
+        // and quantized back — see `kvformat::map_q8_0_cells`.
+        let packed = self.kv.any_packed();
         // Validate every layer first: a rejected removal must not leave the
         // arenas half-shifted.
         for &layer in &layers {
@@ -1051,12 +1046,29 @@ impl GraphAllocator {
             // never hold rows that no position can address.
             k.copy_within((start + len) * row..n_used * row, start * row);
             v.copy_within((start + len) * row..n_used * row, start * row);
-            super::kvcache::rope_shift_kv(
-                &mut k[start * row..],
-                new_used - start,
-                len as isize,
-                rope,
-            );
+            if packed {
+                let nkt = self
+                    .kv
+                    .get(layer)
+                    .map(|l| l.n_embd)
+                    .ok_or_else(|| format!("kv_rm: no arena for layer {layer}"))?;
+                let mut f32row = vec![0.0f32; nkt];
+                super::kvformat::map_q8_0_cells(
+                    &mut k,
+                    nkt,
+                    start,
+                    new_used - start,
+                    &mut f32row,
+                    |r| super::kvcache::rope_shift_kv(r, 1, len as isize, rope),
+                );
+            } else {
+                super::kvcache::rope_shift_kv(
+                    &mut k[start * row..],
+                    new_used - start,
+                    len as isize,
+                    rope,
+                );
+            }
             for x in &mut k[new_used * row..] {
                 *x = 0.0;
             }
