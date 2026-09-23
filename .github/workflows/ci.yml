@@ -1,5 +1,5 @@
-# CI — four jobs: one per backend that can be checked without a device, plus the
-# documentation gate.
+# CI — five jobs: one per backend that can be checked without a device, plus the
+# documentation gate and the viz gate.
 #
 # 1. test-linux-cpu   : the runtime net. Runs the whole unit suite (the
 #                       integration tests under tests/ need a GGUF model that is
@@ -17,6 +17,13 @@
 #                       `scripts/check_docs_links.py` proves every relative link in
 #                       the markdown resolves — `mdbook build` happily renders a dead
 #                       link into the HTML, which is how the docs rotted before.
+# 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
+#                       stage template against every exported sample and requires the
+#                       computed shapes to equal the ones the engine actually
+#                       exported (the layer the animation plays); the render check
+#                       boots viz/e2e.js on a stubbed DOM/canvas and plays every
+#                       step, so a crash in the render path fails here. Both are
+#                       dependency-free Node, so the job needs no setup step.
 #
 # `actions/checkout` is pinned to its Node.js 24 major (v5): the v4 line still
 # ships the Node.js 20 runtime, which GitHub now force-runs on 24 and reports as
@@ -93,3 +100,16 @@ jobs:
         run: cargo install mdbook-mermaid --locked --version 0.13.0
       - name: Build the book
         run: mdbook build
+
+  # The viz gate: the shape-flow model must agree with the engine's own export,
+  # and the render path must survive a full timeline. `node` is preinstalled on
+  # the runner image; adding `actions/setup-node@v4` would drag in the Node.js 20
+  # runtime the header comment warns about.
+  check-viz:
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shapes must match every exported sample graph
+        run: node scripts/check_viz_e2e.mjs
+      - name: The animation must boot and play every step headlessly
+        run: node scripts/check_viz_e2e_render.mjs
