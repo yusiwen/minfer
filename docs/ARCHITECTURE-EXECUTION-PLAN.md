@@ -12,7 +12,7 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**5/7** (E1, E1b, E2, **E3**, E6 done; E4–E5 open); Phase F **0/8** (F1 needs x86); Phase G
+**5/7** (E1, E1b, E2, **E3**, E6 done; E4 S1+S2 and **E5 S1** landed, both tickets still open on their remaining increments); Phase F **0/8** (F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
 check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
@@ -1982,8 +1982,94 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **S1 done (2026-09-22: the accounting, the size-class ladder and the feasibility gate); S2 done (2026-09-23: the pools allocate at the class, the length contract moved to `BufRef`, two latent liveness bugs fixed); the reserve/assign re-map and the multi-graph cache open** | L |
-| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) | L |
+| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) — **S1 done (2026-09-23: a layer-granular plan, `--gpu-layers`/`MINFER_GPU_LAYERS`, per-block weight registration and placement, the startup report, verified mixed CPU+CUDA run); the automatic fit from the memory accounting open** | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E5 record, S1 (2026-09-23) — a layer-granular offload plan
+
+**Why.** Device participation was one all-or-nothing check over the whole model
+(`Qwen2Model::device` asked "is every weight registered on the GPU?"), so a model that does not
+fit in device memory could not run at all — the roadmap's own example being "7B Q8_0 will not
+fit (7.2 GB weights alone)". Two things were missing: **granularity** (nothing in the IR said
+which block a node belonged to, so nothing could decide "these blocks here, the rest there") and
+a **knob** to choose the split.
+
+**What S1 landed.**
+
+- **`src/graph/offload.rs`** — `OffloadPlan { gpu_layers, n_layers }` and the *pure* resolver
+  `OffloadRequest::plan(env, n_layers, device_available)` (the E6 `batch_mode` pattern: CI covers
+  the matrix with no GPU). `--gpu-layers N` (CLI) and `MINFER_GPU_LAYERS=N` (environment) spell
+  it; unset means "every block a device can hold" — the pre-E5 behaviour — and anything that is
+  not a block count fails the load loudly. Blocks `0..gpu_layers` run on the device; the tensors
+  **outside** any block (the embedding, the final norm, `lm_head`) follow the device only when
+  *every* block is offloaded, so a partial plan never has to fit the two largest tensors
+  (llama.cpp's `n_gpu_layers > n_layer` convention, written down once).
+- **The plan is one number read in three places, which must agree:**
+  1. the **loader** registers a tensor on the device only when `OffloadPlan::allows_weight(name)`
+     says so — the block comes from the registry name (`block_of`, `{ns}blk.{i}.…`), including
+     the fused `blk.{i}.attn_qkv` / `blk.{i}.ffn_gu` concat copies. Registering a non-offloaded
+     block would spend exactly the device memory the plan exists to save;
+  2. the **builder** stamps `CNode.layer` (`GraphBuilder::set_layer`, called once per block by
+     both model builders) and gates the device-only fused forms on
+     `layer_gpu = gpu && il < gpu_layers`;
+  3. the **assignment pass** (`BackendScheduler::assign_backends` →
+     `GraphAllocator::supports_for(op, dtype, layer)`) never offers the device for a block past
+     the plan, and `CParams.gpu_layers` carries the plan into the **reuse identity** — the
+     assignment is topology, so a different plan must rebuild.
+- **Verification and reporting.** After registering, the load asks `device()` whether the
+  offloaded blocks can actually run there; if not, the plan drops to CPU-only with a printed
+  reason (never a silent partial offload). `offload_report()` prints the startup line E5 asks
+  for, with the device memory the offloaded weights measured.
+- **A mixed plan refuses a KV session**: a session file is one arena with one backend tag (C5),
+  so `kv_load` refuses before reading the file. `kv_save` already refused mixed layers.
+
+**Acceptance, as measured.**
+
+- **A chosen split runs** (`a_partial_offload_runs_the_rest_on_the_cpu`, 0.5B q4_0 on GB10):
+  `--gpu-layers 4` loads with 4 blocks on CUDA and 20 on the CPU, the startup line reads
+  `offload: 4 of 24 blocks on cuda, 20 on cpu; embed/output on cpu (32.0 MiB of device weights;
+  --gpu-layers 4)`, and **four greedy steps match the all-CPU run** (CPU and device logits differ
+  by design, rule 9, so tokens are the honest comparison). The device holds only the offloaded
+  blocks: `device_bytes >= Σ(blocks 0..4)` and `< Σ(all blocks)`.
+- **The boundaries copy** (the same gate): the built decode graph has **40 nodes on CUDA and 368
+  on the CPU**, cut into **7 splits (3 device, 4 CPU)**, and both a device→CPU and a CPU→device
+  boundary carry non-empty `inputs` — the scheduler's cross-backend copies are what make the
+  mixed graph executable at all. (The split count is not one per block: a block's device nodes
+  are contiguous with its neighbours' whenever the nodes between them are on the device too, so
+  the claim asserted is the alternation plus the copies, not a count.)
+- **Placement is a gate, not a hint** (`the_offload_plan_keeps_late_blocks_off_the_device`,
+  CUDA): with `gpu_layers = 2/4`, `supports_for(...)` answers `Cuda` for block 0, `CPU` for block
+  2, `CPU` for a node outside any block, and `Cuda` for an unblocked node only under a full plan.
+- **The unit matrix** (5 tests, no device): unset/empty/garbage spellings, clamping, the CLI form
+  beating the environment, the "unblocked tensors need a full plan" rule, the weight-name filter
+  (`blk.3` yes, `draft.blk.3.attn_qkv` yes, `blk.4` no, `blk.0attn`/`token_embd` no), and the
+  report text.
+- **The builder contract** (`set_layer_tags_the_nodes_created_after_it`): nodes created after
+  `set_layer(Some(2))` carry `Some(2)`, views inherit it, and the tag clears.
+- **A mixed plan cannot resume a session** (the refusal precedes the file read — the test's path
+  does not exist).
+- Suites: CPU **273 passed / 0 failed / 13 ignored**; CUDA (GB10, serial) **325 passed / 0 failed
+  / 14 ignored**; the `#[ignore]`d set serially **13 passed / 0 failed** on the CPU build (the
+  mixed-run gate skips there — no device — and passes on the device, above).
+- **CLI, end to end** (0.5B on GB10): `--gpu-layers 4` prints the line above and generates;
+  `--gpu-layers 0` prints `offload: cpu only — 0/24 blocks on the device (--gpu-layers 0)`;
+  `MINFER_GPU_LAYERS=6` prints the environment as the source; `MINFER_GPU_LAYERS=banana` fails the
+  load with the reason instead of being ignored.
+- **Mutation-checked**: with the placement gate removed from `supports_for`, the mixed run fails
+  (a non-offloaded block reaches the device and its weights are not there); with
+  `allows_weight` forced true, the device-bytes assertion fails (the device would hold the whole
+  model, which is what the plan exists to prevent).
+- **Honest scope**: this box's device has ~128 GB, so "a model larger than device memory" cannot
+  be *staged* here. The gate forces the split with the knob and asserts the device holds only the
+  offloaded blocks — the knob is exactly how the constraint is expressed; the automatic fit is
+  S2 below. Metal takes the same code path but is compile-checked only (`build-macos`).
+
+**What S1 does not do** (it stays on [#46](https://github.com/yusiwen/minfer/issues/46)): the
+**automatic fit** — consuming E4's memory accounting to put "as many blocks as the budget allows"
+on the device, which is what turns the knob into a policy (and what a device whose free memory is
+smaller than the model needs); per-block `tensor_split`-style tuning; and a per-layer map for the
+server's batching default (the server sees "the device participates", which is right for a mixed
+plan but does not distinguish it).
 
 #### E4 record, S2 (2026-09-23) — the pools allocate at the class, and what that exposed
 

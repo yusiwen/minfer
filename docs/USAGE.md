@@ -42,6 +42,14 @@ Sampling and runtime options:
 - `--seed <N>` — RNG seed for sampling
 - `--n-ctx <N>` — sizes the KV cache (clamped to the model's max context)
 - `-t, --threads <N>` — CPU worker threads
+- `--gpu-layers <N>` — E5: run the first `N` transformer blocks on the device and the rest on
+  the CPU (`0` = CPU only; unset = `MINFER_GPU_LAYERS`, i.e. every block the device can hold,
+  which is the pre-E5 behaviour). The placement is printed at load
+  (`offload: 4 of 24 blocks on cuda, 20 on cpu; embed/output on cpu (32.0 MiB of device
+  weights; --gpu-layers 4)`), and the tensors outside the blocks — `token_embd`, the final norm
+  and `lm_head` — stay on the CPU unless every block is offloaded. Today the value is an explicit
+  ceiling, not a search: the automatic fit from the memory budget is still open
+  ([#46](https://github.com/yusiwen/minfer/issues/46)).
 
 ## Multi-turn conversation
 
