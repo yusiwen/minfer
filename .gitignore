@@ -27,5 +27,10 @@ uv.lock
 # git-hooks.nix auto-generated pre-commit config (symlink into the nix store)
 /.pre-commit-config.yaml
 
+# Nested git worktrees for agent/parallel sessions (see AGENTS.md). They must be ignored: without
+# this line the outer tree's `git add -A` warns "adding embedded git repository" and stages the
+# worktree as a gitlink. Each one keeps its own /target/ (ignored by its own copy of this file).
+/.worktrees/
+
 # stray MINFER_TRACE dump accidentally committed twice (Phase 8 review)
 /1
