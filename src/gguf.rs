@@ -608,6 +608,16 @@ pub struct GgufTensorInfo {
     pub offset: u64, // offset from start of data section
 }
 
+impl GgufTensorInfo {
+    /// The tensor's payload size in bytes: whole quant blocks times the block size. This is
+    /// the number the loader slices the part with, and (E5 S2) what the `auto` offload fit
+    /// measures each block by — from the index, before anything is loaded or registered.
+    pub fn nbytes(&self) -> usize {
+        let n: i64 = self.ne.iter().product();
+        (n / self.type_.blck_size()) as usize * self.type_.type_size()
+    }
+}
+
 // === GGUF Context (gguf.cpp lines 217-228, struct gguf_context) ===
 
 #[derive(Clone)]

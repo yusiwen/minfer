@@ -129,12 +129,13 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
     eprintln!(
-        "  --gpu-layers <N>     E5: put the first N transformer blocks on the device and run the"
+        "  --gpu-layers <N|auto>  E5: put the first N transformer blocks on the device and run"
     );
+    eprintln!("                       the rest on the CPU (0 = CPU only; `auto` = as many as the");
     eprintln!(
-        "                       rest on the CPU (0 = CPU only; unset = MINFER_GPU_LAYERS, i.e."
+        "                       device budget allows, see MINFER_GPU_MEM; unset = MINFER_GPU_LAYERS,"
     );
-    eprintln!("                       every block the device can hold). The placement is printed at load.");
+    eprintln!("                       i.e. every block the device can hold). Printed at load.");
     eprintln!("  --spec-draft <model> speculative decoding: draft model (D5-R)");
     eprintln!(
         "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)",
@@ -310,9 +311,10 @@ fn main() {
             }
             "--gpu-layers" => {
                 if let Some(v) = next_val(a) {
-                    match v.parse::<usize>() {
-                        Ok(n) => {
-                            gpu_layers_request = crate::graph::offload::OffloadRequest::Layers(n);
+                    // E5 S2: a block count or `auto` (fit as many as the budget allows).
+                    match crate::graph::offload::OffloadRequest::parse(Some(v.as_str())) {
+                        Ok(r) => {
+                            gpu_layers_request = r;
                             gpu_layers_set = true;
                         }
                         Err(_) => parse_err = Some(format!("invalid --gpu-layers '{v}'")),

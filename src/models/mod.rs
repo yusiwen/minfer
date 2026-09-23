@@ -61,6 +61,20 @@ pub fn device_name(device: Device) -> &'static str {
     }
 }
 
+/// E5 S2: the device bytes the environment reports free, or `None` when no device (or no
+/// memory query) is available. The `auto` offload fit consumes it, with the same quarter held
+/// back that E4's feasibility gate uses.
+pub fn device_free_bytes() -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = crate::cuda::CudaState::get() {
+        return Some(cuda.device_free_bytes());
+    }
+    // Metal reports no free-bytes number through the current wrapper, so `auto` on macOS falls
+    // back to an explicit `MINFER_GPU_MEM` (or fits nothing) — the device still participates,
+    // it just cannot be planned against. Documented in rule 14.
+    None
+}
+
 /// E5: whether **any** device is present, decided before any weight is registered — the
 /// offload plan is resolved at the start of a load, so "unset request" can mean "every block
 /// the device can hold" without waiting for the registration checks that follow.

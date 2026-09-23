@@ -109,20 +109,42 @@ pub fn block_of(name: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
-/// The offload request as the CLI carries it: `Default` lets the environment decide, and
-/// `Layers(n)` is an explicit `--gpu-layers n` (already parsed, so it cannot be garbage).
+/// The `auto` spelling (E5 S2): fit as many blocks as the device budget allows.
+pub const AUTO: &str = "auto";
+
+/// The offload request as the CLI carries it: `Default` lets the environment decide,
+/// `Layers(n)` is an explicit `--gpu-layers n`, and `Auto` asks for as many blocks as fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OffloadRequest {
     #[default]
     Default,
     Layers(usize),
+    /// E5 S2: the block count is *computed* from the budget and the model's per-block weight
+    /// sizes — the loader resolves it (`fit_blocks`), because that is where the byte table is.
+    Auto,
 }
 
 impl OffloadRequest {
+    /// Parse the CLI/environment spelling, strictly: a decimal block count, `auto`, or
+    /// unset/empty for the default. Anything else is refused loudly — a silently ignored
+    /// offload request is indistinguishable from an offload that did not work.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(OffloadRequest::Default),
+            Some(v) if v.eq_ignore_ascii_case(AUTO) => Ok(OffloadRequest::Auto),
+            Some(v) => v.parse::<usize>().map(OffloadRequest::Layers).map_err(|_| {
+                format!(
+                    "MINFER_GPU_LAYERS='{v}' is not a block count (a decimal number, `{AUTO}` to fit as many blocks as the device budget allows, or unset to offload every block the device can hold)"
+                )
+            }),
+        }
+    }
+
     /// The spelling this request came from, for the startup report.
     pub fn source(self, env: Option<&str>) -> String {
         match self {
             OffloadRequest::Layers(n) => format!("--gpu-layers {n}"),
+            OffloadRequest::Auto => format!("--gpu-layers {AUTO}"),
             OffloadRequest::Default => match env.map(str::trim) {
                 Some(v) if !v.is_empty() => format!("MINFER_GPU_LAYERS={v}"),
                 _ => "default".to_string(),
@@ -130,9 +152,10 @@ impl OffloadRequest {
         }
     }
 
-    /// Resolve this request against the environment spelling, the model's block count and
-    /// whether a device is available at all. Pure, so CI covers the matrix without a GPU —
-    /// the same reason E6 made `batch_mode` pure.
+    /// Resolve the requests that need **no byte table**: the default and an explicit count.
+    ///
+    /// `Auto` needs the model's per-block weight sizes, so the loader resolves it with
+    /// [`fit_blocks`] and this refuses it instead of guessing — a caller cannot forget.
     pub fn plan(
         self,
         env: Option<&str>,
@@ -145,6 +168,10 @@ impl OffloadRequest {
                 gpu_layers: n.min(n_layers),
                 n_layers,
             }),
+            OffloadRequest::Auto => Err(
+                "the `auto` offload request is resolved by the loader (it needs the model's per-block weight sizes), not here"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -168,10 +195,17 @@ pub fn resolve(
                 0
             }
         }
+        Some(v) if v.eq_ignore_ascii_case(AUTO) => {
+            return Err(
+                "MINFER_GPU_LAYERS=auto is resolved by the loader (see `fit_blocks`), not by \
+ `resolve`"
+                    .to_string(),
+            )
+        }
         Some(v) => v.parse::<usize>().map_err(|_| {
             format!(
-                "MINFER_GPU_LAYERS='{v}' is not a block count (a decimal number, or unset to \
-                 offload every block the device can hold)"
+                "MINFER_GPU_LAYERS='{v}' is not a block count (a decimal number, `auto`, or \
+                 unset to offload every block the device can hold)"
             )
         })?,
     };
@@ -208,6 +242,71 @@ pub fn report(plan: OffloadPlan, device: &str, device_bytes: usize, source: &str
         plan.n_layers,
         plan.cpu_layers(),
         mib(device_bytes)
+    )
+}
+
+/// E5 S2: the weight budget an `auto` request fits into.
+///
+/// An explicit `MINFER_GPU_MEM` (MiB) wins; otherwise it is the same default E4's feasibility
+/// gate uses — three quarters of what the device reports free — so the fit and the gate that
+/// later checks the activation pool are talking about the same number.
+pub fn weight_budget(free_bytes: Option<usize>, cap_mib: Option<&str>) -> Result<usize, String> {
+    match cap_mib.map(str::trim) {
+        Some(v) if !v.is_empty() => v
+            .parse::<usize>()
+            .map(|mib| mib * 1024 * 1024)
+            .map_err(|_| format!("MINFER_GPU_MEM='{v}' is not a size in MiB (a decimal number)")),
+        _ => Ok(free_bytes.map_or(0, |f| f / 4 * 3)),
+    }
+}
+
+/// E5 S2: the largest **prefix** of blocks whose weights fit in `budget`, after `reserve` bytes
+/// are held back for what is not weights (the KV arenas and the activation pool).
+///
+/// A prefix, not a subset: the offload plan is `0..gpu_layers` by construction, and a gap would
+/// mean a CPU block between two device blocks for no reason. So the walk stops at the first
+/// block that does not fit — a large block can make the fit smaller than a knapsack would.
+///
+/// Pure, so CI covers the matrix with no device: the caller supplies the *measured* per-block
+/// bytes (from the GGUF tensor index, before anything is registered) and the budget.
+pub fn fit_blocks(budget: usize, per_block: &[usize], reserve: usize) -> usize {
+    let mut used = reserve;
+    let mut k = 0;
+    for &bytes in per_block {
+        if used.saturating_add(bytes) > budget {
+            break;
+        }
+        used += bytes;
+        k += 1;
+    }
+    k
+}
+
+/// E5 S2: the `auto` request's explanation for the startup report — what the fit decided and
+/// against which numbers, so a surprising block count is traceable.
+pub fn auto_source(
+    k: usize,
+    n_layers: usize,
+    budget: usize,
+    reserve: usize,
+    device_free: Option<usize>,
+    cap_mib: Option<&str>,
+) -> String {
+    let mib = |b: usize| format!("{:.0} MiB", b as f64 / (1024.0 * 1024.0));
+    let against = match cap_mib.map(str::trim) {
+        Some(v) if !v.is_empty() => format!("MINFER_GPU_MEM={v} MiB"),
+        _ => match device_free {
+            Some(free) => format!(
+                "device free {} (three quarters of it, the E4 default budget)",
+                mib(free)
+            ),
+            None => "no device budget".to_string(),
+        },
+    };
+    format!(
+        "auto: {k} of {n_layers} blocks fit — weights budget {}, {} reserved for KV/activations; {against}",
+        mib(budget),
+        mib(reserve)
     )
 }
 
@@ -285,6 +384,98 @@ mod tests {
         assert!(resolve(Some("0"), 0, true)
             .unwrap()
             .device_holds_unblocked());
+    }
+
+    #[test]
+    fn the_request_spelling_is_parsed_strictly() {
+        assert_eq!(
+            OffloadRequest::parse(None).unwrap(),
+            OffloadRequest::Default
+        );
+        assert_eq!(
+            OffloadRequest::parse(Some("")).unwrap(),
+            OffloadRequest::Default
+        );
+        assert_eq!(
+            OffloadRequest::parse(Some(" ")).unwrap(),
+            OffloadRequest::Default
+        );
+        assert_eq!(
+            OffloadRequest::parse(Some("4")).unwrap(),
+            OffloadRequest::Layers(4)
+        );
+        assert_eq!(
+            OffloadRequest::parse(Some("0")).unwrap(),
+            OffloadRequest::Layers(0)
+        );
+        // `auto` is case-insensitive and trimmed; a garbage spelling names the alternatives.
+        assert_eq!(
+            OffloadRequest::parse(Some(" AUTO ")).unwrap(),
+            OffloadRequest::Auto
+        );
+        let err = OffloadRequest::parse(Some("banana")).unwrap_err();
+        assert!(err.contains("banana") && err.contains("auto"), "{err}");
+        assert!(OffloadRequest::parse(Some("-1")).is_err());
+        // `auto` is the loader's job: `plan` refuses it rather than guessing a block count.
+        assert!(OffloadRequest::Auto.plan(None, 24, true).is_err());
+        assert_eq!(
+            OffloadRequest::Layers(6)
+                .plan(None, 24, true)
+                .unwrap()
+                .gpu_layers,
+            6
+        );
+        assert!(OffloadRequest::Auto.source(None).contains("auto"));
+    }
+
+    #[test]
+    fn the_fit_takes_the_largest_prefix_that_fits() {
+        // Exact boundary: 100 + 25 == 125 fits, one byte more does not.
+        let blocks = [40, 40, 40];
+        assert_eq!(fit_blocks(125, &blocks, 25), 2);
+        assert_eq!(fit_blocks(124, &blocks, 25), 2);
+        assert_eq!(fit_blocks(145, &blocks, 25), 3);
+        assert_eq!(fit_blocks(85, &blocks, 25), 1);
+        // A reserve alone can consume the budget.
+        assert_eq!(fit_blocks(25, &blocks, 25), 0);
+        assert_eq!(fit_blocks(0, &blocks, 0), 0);
+        // Empty table, zero-size blocks, and a huge budget.
+        assert_eq!(fit_blocks(1000, &[], 100), 0);
+        assert_eq!(fit_blocks(1000, &[0, 0, 0], 100), 3);
+        assert_eq!(fit_blocks(usize::MAX, &blocks, 0), 3);
+        // Prefix, not knapsack: the first block that does not fit stops the walk even though
+        // the later, smaller ones would.
+        assert_eq!(fit_blocks(100, &[90, 80, 5, 5], 10), 1);
+    }
+
+    #[test]
+    fn the_weight_budget_prefers_the_explicit_cap() {
+        // No cap: three quarters of what the device reports — the same default E4's gate uses.
+        assert_eq!(weight_budget(Some(4 << 20), None).unwrap(), 3 << 20);
+        assert_eq!(weight_budget(Some(4 << 20), Some("")).unwrap(), 3 << 20);
+        assert_eq!(weight_budget(Some(4 << 20), Some("  ")).unwrap(), 3 << 20);
+        // No device and no cap: nothing fits (the CPU-only answer).
+        assert_eq!(weight_budget(None, None).unwrap(), 0);
+        // An explicit cap is MiB, and wins over the device's number.
+        assert_eq!(weight_budget(Some(1 << 30), Some("64")).unwrap(), 64 << 20);
+        let err = weight_budget(Some(1 << 30), Some("lots")).unwrap_err();
+        assert!(err.contains("lots") && err.contains("MiB"), "{err}");
+    }
+
+    #[test]
+    fn the_auto_source_names_what_the_fit_decided() {
+        // Device budget: say what the device reported and that it was held back.
+        let line = auto_source(6, 24, 3 << 20, 1 << 20, Some(4 << 20), None);
+        assert!(line.contains("auto: 6 of 24 blocks fit"), "{line}");
+        assert!(line.contains("3 MiB"), "{line}");
+        assert!(line.contains("1 MiB reserved"), "{line}");
+        assert!(line.contains("device free 4 MiB"), "{line}");
+        // Explicit cap: name it instead.
+        let line = auto_source(2, 24, 64 << 20, 16 << 20, Some(1 << 30), Some("64"));
+        assert!(line.contains("MINFER_GPU_MEM=64 MiB"), "{line}");
+        // No budget at all: say so rather than implying a device.
+        let line = auto_source(0, 24, 0, 0, None, None);
+        assert!(line.contains("no device budget"), "{line}");
     }
 
     #[test]

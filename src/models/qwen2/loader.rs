@@ -1,6 +1,7 @@
 // Qwen2 GGUF tensor loader
 
 use crate::gguf::GgufContext;
+use crate::graph::offload;
 use crate::tensor::{Tensor, TensorType};
 use crate::vec_ops::RopeStyle;
 
@@ -182,7 +183,7 @@ fn load_tensor(
     device_bytes: &std::cell::Cell<usize>,
 ) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
-    // Registry names are namespaced for non-primary models (see Qwen2Model::ns):
+    // Registry names are namespaced for non-primary models (see the model's `ns` field):
     // the tensor's logical name (set_name) and every GPU registration use the
     // prefixed form, so a second model cannot collide with the first one's
     // name-keyed registry entries.
@@ -197,10 +198,10 @@ fn load_tensor(
     }
     let off = ctx.offset + ti.offset as usize;
     // Use GGML type for byte-size calculation — always correct regardless of TensorType mapping
+    // (E5 S2: `GgufTensorInfo::nbytes` is the same arithmetic, shared with the offload fit).
     let ts = ti.type_.type_size();
     let bs = ti.type_.blck_size() as usize;
-    let n = (shape[0] * shape[1] * shape[2] * shape[3]) as usize;
-    let nbytes = (n / bs) * ts;
+    let nbytes = ti.nbytes();
     // Borrow the tensor bytes straight from the mmap'd part file (zero-copy —
     // the file pages are shared with the CPU and GPU instead of a per-tensor copy).
     let src = &raw[off..off + nbytes];
@@ -337,6 +338,28 @@ fn load_tensor(
     tensor
 }
 
+/// E5 S2: the weight bytes each transformer block will register, measured from the **GGUF
+/// index** (type and shape) before anything is loaded — the `auto` fit has to decide the plan
+/// before the first registration, because the registration filter *is* the plan.
+///
+/// The fused concat copies (`blk.{i}.attn_qkv` / `blk.{i}.ffn_gu`) and the extra device planes
+/// (padded Q6_K, the q8_0 p32 split, the q4_K dsc pair) are *not* in this number: they are
+/// built while loading. That is what the fit's reserve is for, and an underestimate still ends
+/// as a loud E4 refusal at the first forward, never as a silent overcommit.
+fn block_weight_bytes(model: &crate::gguf::GgufModel, n_layer: usize) -> Vec<usize> {
+    let mut bytes = vec![0usize; n_layer];
+    for part in &model.parts {
+        for ti in &part.ctx.info {
+            if let Some(i) = crate::graph::offload::block_of(&ti.name) {
+                if i < n_layer {
+                    bytes[i] += ti.nbytes();
+                }
+            }
+        }
+    }
+    bytes
+}
+
 // ============================================================
 // Architecture loader
 // ============================================================
@@ -369,16 +392,62 @@ pub fn load(
     // (`graph::offload::resolve`), because an ignored offload request is indistinguishable
     // from an offload that did not work.
     let env_request = std::env::var("MINFER_GPU_LAYERS").ok();
-    let offload_source = offload.source(env_request.as_deref());
-    let plan = match offload.plan(
-        env_request.as_deref(),
-        n_layer,
-        crate::models::device_available(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("minfer: {e}");
-            return None;
+    // The CLI's explicit request wins; `Default` reads the environment (E5 S1).
+    let request = match offload {
+        offload::OffloadRequest::Default => {
+            match offload::OffloadRequest::parse(env_request.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("minfer: {e}");
+                    return None;
+                }
+            }
+        }
+        explicit => explicit,
+    };
+    let (plan, offload_source) = match request {
+        // E5 S2: `auto` measures the budget against the model's per-block weight sizes, taken
+        // from the GGUF index — the fit has to happen *before* the first registration, because
+        // the registration filter is the plan.
+        offload::OffloadRequest::Auto => {
+            let per_block = block_weight_bytes(model, n_layer);
+            let free = crate::models::device_free_bytes();
+            let cap = std::env::var("MINFER_GPU_MEM").ok();
+            let budget = match offload::weight_budget(free, cap.as_deref()) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("minfer: {e}");
+                    return None;
+                }
+            };
+            // A quarter of the weight budget is held back for the KV arenas and the activation
+            // pool: those are sized per graph, not per load, so the fit cannot measure them —
+            // and a prompt that needs more than the reserve is refused by the E4 activation
+            // gate (loudly) rather than silently swapping.
+            let reserve = budget / 4;
+            let k = offload::fit_blocks(budget, &per_block, reserve);
+            (
+                offload::OffloadPlan {
+                    gpu_layers: k,
+                    n_layers: n_layer,
+                },
+                offload::auto_source(k, n_layer, budget, reserve, free, cap.as_deref()),
+            )
+        }
+        other => {
+            let source = other.source(env_request.as_deref());
+            let plan = match other.plan(
+                env_request.as_deref(),
+                n_layer,
+                crate::models::device_available(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("minfer: {e}");
+                    return None;
+                }
+            };
+            (plan, source)
         }
     };
     // Device bytes the offloaded weights actually occupy, counted as they are registered.
