@@ -54,6 +54,9 @@ offers **two views of the same graph**:
   inspector, and a context-aware legend. Stages are derived from the exported graph (op + weight
   name), so it needs no extra instrumentation and works on the same structure/trace/live data.
 
+A third page, **Shape flow**, leaves the graph abstraction behind and animates one end-to-end pass
+instead — jump to [it below](#end-to-end-shape-flow-vize2ehtml).
+
 Both views support playback animation and live inference over SSE:
 
 ![minfer inference graph visualization](docs/viz-demo.png)
@@ -63,6 +66,31 @@ Both views support playback animation and live inference over SSE:
   change) serves the page + live SSE from a single process.
 - **Export a graph**: `minfer --dump-graph-json graph.json <model> "Hello"`; or
   pick a canned sample via the page's "Select a sample model" dropdown.
+
+### End-to-end shape flow (`viz/e2e.html`)
+
+The same exports drive a third page (the toolbar's **Shape flow →** link) that drops the graph
+abstraction and plays **one end-to-end forward pass** — prompt in, next token out — so the *shape*
+at every node is the subject:
+
+- a small packet travels the rail of stages, carrying that step's shape and morphing as it lands;
+  every node keeps a badge of the shapes it produced, and the layer block is bracketed as
+  `× N layers`;
+- the header shows the tensor at the current node, the shape formula with real numbers, and the
+  weight's quantization type; the side panel adds the shapes *inside* a node (heads split,
+  `[n_head, nt, n_kv]` scores, heads merged);
+- the text strip shows the prompt and then each sampled token as the animation reaches the sampler:
+  real tokens with a `MINFER_TRACE` export, `⟨tok⟩` placeholders for a plain graph export;
+- the footer tracks the KV cache — prefill writes `nt` cells, every decode step writes one more —
+  and `Prefill` / `Decode` / `Run` choose what to play.
+
+![minfer end-to-end shape flow](docs/viz-e2e.png)
+
+The stage table and every number are derived from the export rather than hardcoded per model:
+Qwen3's QK-Norm, tied embeddings and a decode graph's fused nodes all come along for free, and the
+two graph quirks the page labels — the last layer running at `nt = 1` during prefill, and attention
+output width being `n_head × hd` rather than `n_embd` — were found by the shape check that requires
+the computed shapes to equal the ones `--dump-graph-json` wrote.
 
 See **[viz/README.md](viz/README.md)** for the full user guide, the JSON format,
 and all page features.

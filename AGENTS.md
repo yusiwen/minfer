@@ -170,7 +170,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Model support roadmap (which model families to port next) | `docs/MODEL-SUPPORT-ROADMAP.md` |
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
 | CLI conversation plan | `docs/CLI-CONVERSATION-PLAN.md` |
-| Inference-graph viz (`MINFER_TRACE` etc.) | `viz/README.md` |
+| Inference-graph viz (`MINFER_TRACE` etc.) + end-to-end shape flow (`viz/e2e.html`) | `viz/README.md` |
 | Debug dump format | `docs/debug-dump.md` |
 | Metal / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
 | Parameter audit, bug/debug notes, known issues | `docs/PARAMETER_AUDIT.md`, `docs/BUG-6-KV-CACHE-INDEXING.md`, `docs/DEBUGGING-*.md`, `docs/QWEN2.5-*.md`, `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |

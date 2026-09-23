@@ -11,6 +11,11 @@ An interactive web visualizer for minfer's inference compute graph. Two views of
 Click any node/box to see that step's data (shape, dtype, the weight it reads, quantization
 type, etc.).
 
+A third page, **Shape flow** (`e2e.html`, link in the toolbar), leaves the graph abstraction and
+plays one end-to-end forward pass instead: what *shape* the data has at every node, how it changes,
+and what text the model is reading and writing. Jump to [the end-to-end shape flow
+section](#end-to-end-shape-flow-e2ehtml).
+
 Three kinds of data are supported:
 - **Structure graph** (`--dump-graph-json`): graph + metadata, plays an execution-order animation.
 - **Real trace** (`MINFER_TRACE`, P2): per-tensor **real statistics** for each node output
@@ -22,6 +27,176 @@ Three kinds of data are supported:
   stream out one at a time.
 
 Zero dependencies: plain HTML + CSS + vanilla JS, no build toolchain, works straight out of the box.
+
+## End-to-end shape flow (`e2e.html`)
+
+The operator grid answers *what is in the graph*; this page answers *what shape is the data at each
+node, and how does it change*. It plays one animated forward pass — prompt in, next token out — and
+turns every shape change into something you can see instead of a number you have to read.
+
+It is the second view of the same export, so the two pages share their data and their stage names:
+the toolbar link **Shape flow →** jumps here, and **Operators view →** jumps back.
+
+```bash
+# static, no build step
+cd viz && python3 -m http.server 8080     # → http://127.0.0.1:8080/e2e.html
+
+# or let the engine serve it (same page, plus the live endpoints)
+./target/release/minfer viz model.gguf    # → http://127.0.0.1:8081/e2e.html
+```
+
+Under `file://` the sample dropdown is unavailable (the page cannot fetch `samples/manifest.json`),
+but **Open File…** and the built-in Qwen2.5-0.5B profile still work.
+
+### What the page is made of
+
+| Region | What it shows |
+|---|---|
+| Header, left | **The tensor at the current node**: the graph's own shape (`[151936, 2]`), element count, bytes, and a proportional card — **width ∝ token count, height ∝ log₂(feature dim)** |
+| Header, middle | The stage: label, op, weight quant type, the shape formula with real numbers, and one line of what it does |
+| Header, right | Counters: phase, layer, decode step, KV cells written, timeline position |
+| Text strip | The prompt, then one chip per sampled token, popping in as the animation reaches the sampler (see below) |
+| Rail (canvas) | The stage nodes in execution order, each showing the shapes it produced; the layer block is bracketed as `× N layers` |
+| Footer, left | The KV cache as a `[kv_dim, n_ctx]` bar: prefill writes `nt` cells, every decode step writes one more |
+| Footer, right | One chip per timeline step — click to jump |
+
+A travelling packet — a small fixed-size chip carrying the step's primary shape, coloured by tensor
+kind, printed inside the chip so it never covers a node label, and faded out as it lands — is what
+connects them: the rail is the map, the packet is the data.
+
+### The rail, node by node
+
+One pass is the prologue, **one layer played in full**, a tick for the remaining layers, then the
+epilogue. `nt` is the token count, `n_embd` the residual width:
+
+| Stage | Op | Shape change |
+|---|---|---|
+| Tokenize | BPE | text → `[nt]` token ids (+ positions `0..nt-1`) |
+| Embedding | `get_rows` | `[nt]` → `[n_embd, nt]` (a row gather, not a matmul) |
+| RMSNorm | `rms_norm` | `[n_embd, nt]` → `[n_embd, nt]` (normalize over the feature dim) |
+| QKV projection | `matmul ×3` (or one fused `fused_qkv`) | `[n_embd, nt]` → q `[n_head·hd, nt]`, k/v `[n_kv_head·hd, nt]` |
+| QK-Norm | `qk_norm` | Qwen3 only; per-head norm, shapes unchanged |
+| RoPE | `rope` | shapes unchanged — position enters the values, not the layout |
+| KV cache write | `kvcache_store` | k/v → the persistent `[kv_dim, n_ctx]` region, columns `[pos, pos+nt)` |
+| Attention | `attn` | `[n_head·hd, nt]`; inside: heads split, scores `[n_head, nt, n_kv]`, softmax, `·v`, heads merged |
+| Output projection | `matmul` | `[n_head·hd, nt]` → `[n_embd, nt]` |
+| Residual add | `add` | `[n_embd, nt]` → `[n_embd, nt]` |
+| RMSNorm | `rms_norm` | `[n_embd, nt]`, before the FFN |
+| Gate & Up projection | `matmul ×2` (or one fused `fused_ffn`) | `[n_embd, nt]` → `[n_ff, nt]` each — most of the weights live here |
+| SiLU · SwiGLU | `silu` + `swiglu` | elementwise gating, `[n_ff, nt]` unchanged |
+| Down projection | `matmul` | `[n_ff, nt]` → `[n_embd, nt]` |
+| Residual add | `add` | back to `[n_embd, nt]`, ready for the next layer |
+| Final RMSNorm | `rms_norm` | `[n_embd, nt]` |
+| LM head | `matmul` | `[n_embd, nt]` → `[vocab, nt]` — the biggest single jump |
+| Sample one token | softmax → top-k → top-p | one logits column `[vocab]` → one id `[1]` |
+| Next step | loop | the id is appended; the next pass has `nt = 1` and one more KV cell |
+
+`Prefill` plays the table above; `Decode` plays the same graph with `nt = 1` and a KV window of
+`prompt + step`. Switching between them is the point of the page: **same graph, different shapes** —
+`[896, nt] → [896, 1]`, and the score matrix `[n_head, nt, n_kv]` that grows by one column per step.
+
+### Prefill and decode are not the same story
+
+- **Prefill** writes `nt` cells and computes every position; the attention score matrix is
+  `[n_head, nt, nt]`.
+- **Decode** writes one cell per step; every activation is `[…, 1]` and the score matrix is
+  `[n_head, 1, n_kv]`, stretching as the cache fills.
+- The epilogue runs at `nt = 1` **even during prefill**, because only the last position needs
+  logits — one of the two graph quirks the animation labels at the node where it happens.
+- The KV cache bar is why `n_ctx` matters: the prompt fills a couple of cells out of 4096, and the
+  decode steps walk one cell at a time.
+
+### The text strip
+
+The strip under the header is the model's input and output text, driven by the same playhead as the
+rail: the prompt is there from the start, and every time the animation reaches the sampler stage one
+more token appears (with a short pop and a running caret). Stepping back or replaying takes the
+tokens away again — the text is *derived from the playhead*, never accumulated, so it can never
+drift out of sync with the animation.
+
+Where the text comes from:
+
+- `MINFER_TRACE=trace.json` records the real tokens: the prompt is `Hello!` and the strip fills with
+  `" I"`, `"'m"`, `" a"`… (quoted, so a leading space is visible). The very last sample shows as
+  `#48948`, because an id in `logits_top` is all the trace recorded for it.
+- A plain `--dump-graph-json` export carries no token text at all: the strip shows `⟨tok⟩`
+  placeholders and an amber note saying so. It still moves in step with the rail.
+
+Because a trace records one token per forward pass, loading one also caps the decode steps played
+(3 recorded steps → 3 decode steps), so the strip and the rail stay 1:1.
+
+### Fusion changes the node count, not the shapes
+
+A decode graph runs the FusionPass, and the page follows it: `fused_qkv` shows up as one node
+(`[1152, 1]` instead of q/k/v), `fused_ffn` as one `[2·n_ff, nt]`, and the RoPE stage is marked as
+already applied inside the fused node. Fusion is per layer (it depends on the quant types meeting),
+and the page plays the layer the graph actually fused — `fused(layer 0): qkv=false ffn=true` in the
+0.5B decode sample — with a badge when only some layers are fused.
+
+### Where the numbers come from
+
+Everything is read from the export, never hardcoded per model:
+
+- dims: `n_embd`, `n_layer`, `n_head`, `hd`, `n_kv_head`, `kv_dim`, `n_ff`, `vocab`, `n_ctx` and the
+  token count, from the nodes and their metadata;
+- stage shapes: computed by the stage template and **checked against the export** by
+  `scripts/check_viz_e2e.mjs` (see below);
+- weights and quant types: the exact names the graph reads, including tied embeddings (Qwen3's
+  `matmul_token_embd.weight` is labelled as tied) and mixed q/k/v quant types;
+- node grouping: by op **and** weight name (`blk.7.attn_q.weight` → the QKV stage), with the block
+  boundary taken from the contiguous slice a block owns. That is why a new architecture needs no
+  per-model table here — only a new stage, if it has one, in `TEMPLATE` (`viz/e2e-model.js`).
+
+Two behaviours it surfaces instead of smoothing over:
+
+- the exported prefill graph finishes the **last layer at `nt = 1`** (only the last position needs
+  logits), so the epilogue shows `[n_embd, 1] → [vocab, 1]` even during prefill;
+- attention output width is `n_head × hd`, which equals `n_embd` for Qwen2.5 but is **2× for
+  Qwen3-0.6B** (16 heads × 128 = 2048 against `n_embd` = 1024); the O projection is what maps it
+  back. Both were found by the shape check below, not by reading the code.
+
+### Controls
+
+| Control | What it does |
+|---|---|
+| **▶ / ❚❚** | Play / pause. Nothing moves until you press it — loading a graph or switching the range never auto-plays |
+| **⏮ / ⏭** | One step back / forward (pauses) |
+| **↻** | Replay from step 0 and start playing |
+| Speed slider | Milliseconds per step (`1140` slow → `150` fast); decode steps and sweeps carry their own multipliers |
+| **Run / Prefill / Decode** | Which range to play: the full prefill→decode run, one phase only, or decode only |
+| **×N** | Include the `×N layers` tick between layer 0 and the epilogue |
+| **decode detail** | Expand every decode step into every node instead of one sweep per step |
+| Step chips (footer) | Jump to any step |
+| `Space` / `←` `→` / `R` | Play-pause / step / restart |
+
+### Checks
+
+```bash
+node scripts/check_viz_e2e.mjs          # stage shapes vs every exported sample graph
+node scripts/check_viz_e2e_render.mjs   # boot + play every step on a stubbed DOM/canvas
+```
+
+The first is the valuable one: it requires the template's computed shape at every stage to equal the
+shape `--dump-graph-json` actually wrote, for every file in `samples/` — the layer played in detail,
+the attention internals, the KV region, and that decode is the same graph with `nt = 1` and a window
+one cell longer. Both engine behaviours above were caught by it, so a wrong assumption fails the
+gate instead of shipping a plausible-looking animation. The second boots the real `viz/e2e.js`
+against a stubbed DOM and canvas, plays every step of every mode, switches samples and checks the
+panel is never empty — it catches crashes in the render path, not visual regressions.
+
+Both run in the `check-viz` CI job and need no dependencies (plain Node, no browser).
+
+### Files
+
+| File | What it is |
+|---|---|
+| `viz/e2e.html` | The page: toolbar, canvas, side panel, text strip, footer |
+| `viz/e2e.css` | Styles (palette shared with `style.css`) |
+| `viz/e2e-model.js` | The data layer: export → stage script with shape math. No DOM, so it is testable in Node |
+| `viz/e2e.js` | The canvas renderer, animation and UI wiring |
+| `scripts/check_viz_e2e.mjs` | Shape agreement with every sample (the gate above) |
+| `scripts/check_viz_e2e_render.mjs` | Headless boot + full-timeline playthrough |
+| `src/server/viz.rs` | The `minfer viz` routes for the four assets above (`no-store`, so a fresh page never pairs with a stale script) |
 
 ## Quick start
 
