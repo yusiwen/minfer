@@ -98,8 +98,14 @@ jobs:
           tool: mdbook@0.4.37
       - name: Install mdbook-mermaid
         run: cargo install mdbook-mermaid --locked --version 0.13.0
+      # The Mermaid library is not committed: the script downloads it (sha384-pinned),
+      # stages it inside the book, builds, and removes it again — see scripts/build_book.sh.
       - name: Build the book
-        run: mdbook build
+        run: scripts/build_book.sh
+      - name: The staged Mermaid assets must not survive the build
+        run: |
+          test ! -e docs/assets/mermaid.min.js
+          test ! -e docs/assets/mermaid-init.js
 
   # The viz gate: the shape-flow model must agree with the engine's own export,
   # and the render path must survive a full timeline. `node` is preinstalled on

@@ -38,14 +38,14 @@ jobs:
           tool: mdbook@0.4.37
       # Mermaid preprocessor (book.toml [preprocessor.mermaid]); pinned to
       # 0.13.0 — the same version nixpkgs 24.05 ships in the devShell, so
-      # local and CI builds preprocess identically. Its JS assets are committed
-      # under docs/assets/ and book.toml points additional-js at them, so
-      # `mdbook-mermaid install` is not needed here — and must not be run: it
-      # writes to the book root only, re-creating both files there.
+      # local and CI builds preprocess identically. The library itself is not
+      # committed: scripts/build_book.sh downloads it (sha384-pinned), stages it
+      # inside the book, and removes it again, so `mdbook-mermaid install` is not
+      # used here either.
       - name: Install mdbook-mermaid
         run: cargo install mdbook-mermaid --locked --version 0.13.0
       - name: Build the book
-        run: mdbook build
+        run: scripts/build_book.sh
       # v5 is the Node.js 24 major of both Pages actions (v3/v4 emitted the
       # deprecation annotation); their inputs are unchanged.
       - name: Upload Pages artifact

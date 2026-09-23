@@ -19,6 +19,11 @@ uv.lock
 # mdBook documentation site build output
 /book/
 
+# Mermaid assets for the mdBook build: staged by scripts/build_book.sh (downloaded
+# and sha384-checked) and removed again when it exits — never committed, see book.toml
+/docs/assets/mermaid.min.js
+/docs/assets/mermaid-init.js
+
 # git-hooks.nix auto-generated pre-commit config (symlink into the nix store)
 /.pre-commit-config.yaml
 
