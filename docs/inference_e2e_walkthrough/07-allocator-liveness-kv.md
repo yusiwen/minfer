@@ -194,6 +194,17 @@ changes) at the cost of occasionally missing a "big enough" free buffer — a
 deliberate trade: first-fit-with-growth would save a few allocations but
 complicates every downstream size assertion.
 
+**Since E4 S2 the size the allocator asks for is the node's size *class*, not
+its element count** (`graph/allocplan.rs::class_size`: powers of two up to
+16 KiB, then 16 KiB steps). The backend still matches exactly, but every buffer
+of a class has the same length, so the second shape in a class now finds the
+first one's buffer and a rebuild with a slightly different `n_tokens` stops
+growing the pool. The node keeps its real length in its `BufRef`
+(`offset` + `len`), and every consumer slices to that window — a pool buffer is
+routinely longer than the node it serves, which is why `fill_input` checks the
+data against `BufRef::len` and writes through `write_host_window`, and why the
+`MINFER_TRACE`/viz capture windows its readback.
+
 How much does all this save? A hand tally of the 0.5B prefill graph (24
 layers, per-layer node list in `docs/ARCHITECTURE.md` §4.6) with a 440-token
 prompt makes it concrete. Every hidden-width buffer holds `896 × 440 × 4 B ≈

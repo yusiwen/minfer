@@ -1981,9 +1981,92 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
-| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **S1 done (2026-09-22: the accounting, the size-class ladder and the feasibility gate); S2 (class-rounded pools, the reserve/assign re-map and the multi-graph cache) open** | L |
+| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **S1 done (2026-09-22: the accounting, the size-class ladder and the feasibility gate); S2 done (2026-09-23: the pools allocate at the class, the length contract moved to `BufRef`, two latent liveness bugs fixed); the reserve/assign re-map and the multi-graph cache open** | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E4 record, S2 (2026-09-23) — the pools allocate at the class, and what that exposed
+
+**Why.** S1 ended with the ladder in the plan and the accounting but **exact pools**: two shapes in
+one class still got a buffer each, so a rebuild with a slightly different `nt` grew the pool, and the
+ticket's "recycled buffers come from the same size classes (no silent growth)" was not claimed. The
+obstacle was that a pooled buffer is no longer the same thing as the node it serves: the pool buffer
+is `class_size(n)`, while the node's real length is `n`, and every consumer that used a *physical*
+length had to be told.
+
+**What S2 landed.**
+
+- **The pool request is the class** — `alloc_class_in_pool` asks for `class_size(size)`. Because the
+  free list matches lengths exactly and every buffer of a class has the same length, the second shape
+  in a class now finds the first one's buffer. The persistent KV regions still come through
+  `alloc_exact_in_pool`: a cell's width is a layout contract (`row_elems`), not a tuning knob.
+- **The length contract lives in `BufRef`** (new `Backend::write_host_window(id, offset, data)`): a
+  fill is checked against the node's *logical* `BufRef::len` and written at the reference's offset,
+  and `write_host` keeps the exact-length contract for the persistent regions and staging.
+  `get_buffer` returns the reference's window, not the physical slice.
+- **The capture reads are windowed** (`scheduler::window_of`): the CPU readback, the staged Metal
+  readback and the CUDA `capture_enq`/`capture_drain` path all fed `data.len()` to
+  `trace::analyze` as `n_total`, so a class-rounded buffer would have reported 256 elements for a
+  1-element `token_ids` input and changed every viz statistic.
+- **`pool_bytes` is what the pool holds** (`Backend::pool_len` is the probe): it only grows when the
+  pool creates a buffer, so a recycled class buffer is not charged again. S1 charged every request,
+  which made the report grow on every rebuild (and the budget gate refuse graphs that fit). Staging
+  buffers are now charged too (exact, but resident and live until the next rebuild frees them).
+- **Two latent bugs, both found by the rounding and both fixed here:**
+  1. **A liveness extension did not move the pool's deadline.** `buf_alive` is written from
+     `last_use` at allocation; an in-place alias and a D1 view extend `last_use` later, and `sweep`
+     reads only `buf_alive`, so a buffer could be handed to another node while the alias still read
+     it. `extend_through_views` now reports the nodes whose liveness grew and `extend_buffer_alive`
+     bumps their buffers' deadlines. D1's view branch had this wrong twice over: it called the walk
+     with `from = the view` and `to = the view's own last use`, so the first check ended the walk —
+     **the parent extension never ran at all**; it now walks from the parent.
+  2. **An input could take a buffer the walk released.** Inputs are host-filled *before* execution,
+     so the previous owner's write (during execution) lands after the fill: `seq_ids` took the
+     `matmul K` buffer in the 0.5B decode graph and read `-8.47` where its cell index belonged. All
+     input buffers are now placed **before** the walk, when the free list still holds only the
+     previous graph's buffers.
+
+**Acceptance, as measured.**
+
+- `a_rebuild_inside_one_class_reuses_the_pool`: two rebuilds inside one class (896×16 = 14336 and
+  896×17 = 15232, both class 16384) leave `pool_bytes` **unchanged** and add **zero** pool buffers;
+  a shape that leaves the class (896×20) does reserve more. Mutation-checked against exact pools and
+  against per-request `pool_bytes` accounting.
+- `a_fill_must_match_the_nodes_logical_length`: a 3-element input occupies one class, a 3-element
+  fill is accepted, and 2- or 4-element fills are refused naming both numbers; the refused fills
+  wrote nothing and `get_buffer` reads exactly 3 elements. Mutation-checked (drop the check).
+- `an_input_never_takes_a_buffer_the_walk_released` and
+  `a_view_keeps_its_parents_buffer_alive_through_later_consumers`: two synthetic execute-and-compare
+  graphs whose values change if the buffer is recycled early. Both mutation-checked (remove the input
+  pre-pass; extend from the view again).
+- Suites: CPU **265 passed / 0 failed / 12 ignored**, CUDA on GB10 (serial,
+  `scripts/cuda_test.sh`) **316 passed / 0 failed / 13 ignored** (+4 over S1's 312).
+- Real-model: the **nine** non-ignored real-model graph tests that the un-migrated rounding
+  broke (0.5B q4_0, 24 layers) — `graph_logits_match_forward_real_model`,
+  `a_two_sequence_batch_matches_two_single_sequence_forwards`,
+  `offset_sensitivity_is_narrowed_to_multi_query_attention` and the rest — pass again, and the
+  whole CPU suite is green a second time with `MINFER_BATCH_TEST_MODEL` pointed at
+  `Qwen3-0.6B-Q8_0.gguf` (f16 KV, the second cache-width path). The `#[ignore]`d real-model set,
+  run **serially** (`cargo test --release --bin minfer -- --ignored --test-threads=1`), is
+  **12 passed / 0 failed** — the same as on master; in parallel it is red, on master too, because
+  the C4 packed-cache gate sets the process-wide KV format mid-run (issue
+  [#99](https://github.com/yusiwen/minfer/issues/99), and now documented in `AGENTS.md`).
+  `MINFER_TRACE` on the 0.5B reports `n = 30` for the `token_ids` input (the prompt's length);
+  with the readback window removed it reports the class's **256**, which is the mutation
+  evidence for the capture fix.
+
+**Findings filed while doing S2** (both pre-existing, neither is caused by the allocator):
+[#98](https://github.com/yusiwen/minfer/issues/98) — `ComputeGraph::topo_order` counts in-degree
+per source entry but decrements once per node, so a graph with a repeated source (`add(x, x)`)
+is rejected as a cycle, and `alloc_graph` calls it on every build;
+[#99](https://github.com/yusiwen/minfer/issues/99) — the process-wide KV format above.
+
+**What S2 does not do** (it stays on [#55](https://github.com/yusiwen/minfer/issues/55)): the
+**reserve/assign re-map** (a reserved region a rebuild re-maps without touching the device — the
+literal "split reservation from assignment", which Metal's G6 adopts) and the **multi-graph cache**
+(§14 row 3, which is what removes E3's per-chunk rebuild). Cross-boundary staging is charged to
+`pool_bytes` but is still allocated at its exact length, and backend-internal scratch (Metal capture
+staging, CUDA `positions` scratch) is outside the report.
 
 #### E4 record, S1 (2026-09-22) — account first, allocate second
 
