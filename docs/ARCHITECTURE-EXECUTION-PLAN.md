@@ -2032,8 +2032,10 @@ memory is smaller than the model actually needs.
   "a big block stops the walk even though smaller ones follow" conservatism), the budget
   (three quarters, explicit cap wins, no device → nothing fits, garbage refused) and the report
   text (device vs cap vs no budget).
-- Mutation-checked in S1's gate (the placement rule is the same code path): removing the placement
-  gate fails the mixed run, and forcing `allows_weight` true fails the device-bytes assertion.
+- **Mutation-checked**: making `fit_blocks` ignore the budget fails the auto gate on its first
+  assertion (`a 64 MiB budget must be a strict prefix, got gpu_layers: 24`), and S1's gate covers
+  the placement rule on the same code path (removing it fails the mixed run; forcing
+  `allows_weight` true fails the device-bytes assertion).
 - Suites: CPU **280 passed / 0 failed / 15 ignored**; CUDA (GB10, serial) **333 / 0 / 16**; the
   `#[ignore]`d set serially **15 passed / 0 failed**.
 
