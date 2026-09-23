@@ -88,6 +88,16 @@ MINFER_TRACE=/tmp/t.json  ./target/release/minfer <model> "hello"  # per-node re
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md` (stale in places — [#62](https://github.com/yusiwen/minfer/issues/62)). CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
 - Multi-part GGUF: entry is part 0, all parts parsed into one merged tensor index; download resume is size-checked.
+- **Parallel work in a nested worktree**: `.worktrees/<scope>` (git-ignored, see `.gitignore`) keeps
+  the session workspace writable when the file policy is `workspace-write` — a worktree *beside* the
+  root is outside it and cannot be written to, and this repo's branch is often already checked out
+  elsewhere. `scripts/agent_worktree.sh new|rm|list` wraps the flow; `git worktree remove --force
+  .worktrees/<scope>` deletes the tree **including its `target/`**. Each worktree keeps its **own**
+  `target/`: never point `CARGO_TARGET_DIR` at the outer tree, because a plain `cargo test --release`
+  there overwrites the outer `target/release/minfer` (the CPU-vs-CUDA measurement trap above). The
+  outer tree's `git clean -fdx` skips a nested worktree (git sees an embedded repository); never use
+  `-ff` while one exists. Use absolute paths in every command: the session's relative paths still
+  resolve against the outer root.
 
 ## Support
 
