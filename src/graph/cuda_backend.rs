@@ -1422,6 +1422,11 @@ impl Backend for CudaBackend {
         true
     }
 
+    /// Device bytes the CUDA weight registry holds (E4).
+    fn weights_bytes(&self) -> usize {
+        crate::cuda::CudaState::get().map_or(0, |c| c.weights_bytes())
+    }
+
     fn alloc_buffer(&mut self, size: usize) -> usize {
         let _sg = self.stream_guard(); // cudaMalloc syncs the device
         let bytes = size * 4;

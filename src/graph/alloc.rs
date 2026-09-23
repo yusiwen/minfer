@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::allocplan::{self, AllocPlan};
 use super::backend::Backend as BackendTrait;
 use super::backend::KvProvider;
 use super::cpu_backend::CpuBackend;
@@ -21,6 +22,25 @@ use super::kvsession::{
 };
 use super::ops::{NodeMeta, Op};
 use super::{Backend, BufRef, ComputeGraph, NodeId, PersistentBuf};
+
+/// E4's accounting for one backend: what the pool holds, what is live right now, the
+/// peak live set, the registered weights, and the budget the allocator checks against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryReport {
+    pub weights_bytes: usize,
+    pub pool_bytes: usize,
+    pub live_bytes: usize,
+    pub peak_live_bytes: usize,
+    pub budget: Option<usize>,
+}
+
+impl MemoryReport {
+    /// Bytes the budget would refuse next: `budget - (weights + pool)`.
+    pub fn headroom_bytes(&self) -> Option<usize> {
+        self.budget
+            .map(|b| b.saturating_sub(self.weights_bytes + self.pool_bytes))
+    }
+}
 
 /// Per-backend liveness allocator.
 pub struct GraphAllocator {
@@ -40,6 +60,15 @@ pub struct GraphAllocator {
     cross: HashMap<(NodeId, Backend), BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
+    /// E4: bytes each pooled buffer occupies (its size class), keyed by `(backend, id)`
+    /// so a release can subtract exactly what the allocation added.
+    buf_bytes: HashMap<(Backend, usize), usize>,
+    /// E4 accounting per backend: reserved (the pool's high-water mark), live, peak live.
+    pool_bytes: HashMap<Backend, usize>,
+    live_bytes: HashMap<Backend, usize>,
+    peak_bytes: HashMap<Backend, usize>,
+    /// E4: an explicit memory budget per backend; unset = the backend's own default.
+    budget: HashMap<Backend, usize>,
     /// Per-layer KV **cell store**: the persistent regions plus per-cell
     /// sequence ownership (Phase C / C1). The allocator only allocates the
     /// arenas; the store owns their bookkeeping and the `position -> cell`
@@ -60,6 +89,11 @@ impl Default for GraphAllocator {
             node_to_buf: HashMap::new(),
             cross: HashMap::new(),
             buf_alive: HashMap::new(),
+            buf_bytes: HashMap::new(),
+            pool_bytes: HashMap::new(),
+            live_bytes: HashMap::new(),
+            peak_bytes: HashMap::new(),
+            budget: HashMap::new(),
             kv: super::kvcache::KvCache::new(),
             persistent: Vec::new(),
         }
@@ -339,7 +373,7 @@ impl GraphAllocator {
                     )?;
                     if last_use[id] > i {
                         let size = node.n_elements();
-                        let pid = self.alloc_in_pool(backend, size);
+                        let pid = self.alloc_in_pool(backend, size)?;
                         self.buf_alive.insert((backend, pid), last_use[id]);
                         self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
@@ -361,7 +395,7 @@ impl GraphAllocator {
                     )?;
                     if last_use[id] > i {
                         let size = node.n_elements();
-                        let pid = self.alloc_in_pool(backend, size);
+                        let pid = self.alloc_in_pool(backend, size)?;
                         self.buf_alive.insert((backend, pid), last_use[id]);
                         self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
@@ -422,7 +456,7 @@ impl GraphAllocator {
                             extend_through_views(graph, &mut last_use, node.src[0], lu);
                         } else {
                             let size = node.n_elements();
-                            let pid = self.alloc_in_pool(backend, size);
+                            let pid = self.alloc_in_pool(backend, size)?;
                             self.buf_alive.insert((backend, pid), last_use[id]);
                             self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                         }
@@ -431,7 +465,7 @@ impl GraphAllocator {
                 _ => {
                     if last_use[id] > i {
                         let size = node.n_elements();
-                        let pid = self.alloc_in_pool(backend, size);
+                        let pid = self.alloc_in_pool(backend, size)?;
                         self.buf_alive.insert((backend, pid), last_use[id]);
                         self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
                     }
@@ -441,7 +475,114 @@ impl GraphAllocator {
         Ok(())
     }
 
-    fn alloc_in_pool(&mut self, backend: Backend, size: usize) -> usize {
+    /// Ask a pool for a buffer of `size`, after checking the request against the
+    /// backend's memory budget (E4).
+    ///
+    /// The check is the ticket's safety half: `weights + pooled buffers + this allocation`
+    /// is compared against the budget **before** the backend is touched, so a graph that
+    /// cannot fit is refused with its numbers instead of surfacing later as a CUDA null
+    /// pointer. The allocation itself is charged at its **size class** — the ladder
+    /// `allocplan::class_size` defines — so the accounting already carries what the pools
+    /// will reserve once they round to classes too.
+    fn alloc_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
+        let want = allocplan::class_bytes(allocplan::class_size(size));
+        if let Some(budget) = self.memory_budget(backend) {
+            let pool = self.pool_bytes.get(&backend).copied().unwrap_or(0);
+            let weights = self.weights_bytes(backend);
+            if pool + weights + want > budget {
+                return Err(format!(
+                    "out of {backend:?} memory: {} MiB of weights + {} MiB of pooled buffers +                      {} MiB for this activation exceeds the {budget} byte budget ({} MiB);                      reduce --n-ctx/--n-batch, use a smaller quant, or free a session",
+                    weights / (1024 * 1024),
+                    pool / (1024 * 1024),
+                    want / (1024 * 1024),
+                    budget / (1024 * 1024)
+                ));
+            }
+        }
+        let id = self.alloc_class_in_pool(backend, size)?;
+        self.buf_bytes.insert((backend, id), want);
+        *self.pool_bytes.entry(backend).or_insert(0) += want;
+        let live = self.live_bytes.entry(backend).or_insert(0);
+        *live += want;
+        let peak = self.peak_bytes.entry(backend).or_insert(0);
+        *peak = (*peak).max(*live);
+        Ok(id)
+    }
+
+    /// The backend dispatch behind [`Self::alloc_in_pool`]. The pool is asked for the
+    /// node's exact size for now; the size class is the **plan's** view of the request and
+    /// what the budget is checked against, so the accounting already carries the ladder's
+    /// cost. Applying the class to the pools themselves (so two shapes in one class share
+    /// a buffer instead of the pool growing once per shape) is the next E4 increment: it
+    /// is the half of the ticket's second acceptance that needs the reserve/assign re-map,
+    /// because every consumer's length contract has to move to the owning `BufRef` at the
+    /// same time.
+    fn alloc_class_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
+        Ok(self.alloc_exact_in_pool(backend, size))
+    }
+
+    /// Bytes one backend's registered weights occupy (0 for a backend that does not
+    /// track them) — the "weights" half of `weights + activations > budget`.
+    fn weights_bytes(&self, backend: Backend) -> usize {
+        match backend {
+            Backend::CPU => self.cpu.weights_bytes(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => self.metal.as_ref().map_or(0, |m| m.weights_bytes()),
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => 0,
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self.cuda.as_ref().map_or(0, |c| c.weights_bytes()),
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => 0,
+        }
+    }
+
+    /// The memory budget for a backend (E4): an explicit one if it was set, else CUDA's
+    /// *free* device bytes with a quarter held back, else unbounded. The default is the
+    /// device's own answer, not a guess: `cudaMemGetInfo` already reports what is left
+    /// after every weight and KV region is resident.
+    fn memory_budget(&self, backend: Backend) -> Option<usize> {
+        if let Some(b) = self.budget.get(&backend) {
+            return Some(*b);
+        }
+        match backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => crate::cuda::CudaState::get()
+                .map(|c| c.device_free_bytes() / 4 * 3)
+                // A CUDA graph with no device state is a configuration error the
+                // assignment pass catches; the budget is simply unbounded here.
+                .or(Some(usize::MAX)),
+            _ => None,
+        }
+    }
+
+    /// Set (or clear, with `None`) a backend's memory budget. Tests and a future
+    /// offload policy use it; `None` restores the default.
+    pub fn set_memory_budget(&mut self, backend: Backend, budget: Option<usize>) {
+        match budget {
+            Some(b) => {
+                self.budget.insert(backend, b);
+            }
+            None => {
+                self.budget.remove(&backend);
+            }
+        }
+    }
+
+    /// E4's accounting for one backend: what is resident, what is live, the peak, and the
+    /// budget the allocator checks against.
+    pub fn memory_report(&self, backend: Backend) -> MemoryReport {
+        MemoryReport {
+            weights_bytes: self.weights_bytes(backend),
+            pool_bytes: self.pool_bytes.get(&backend).copied().unwrap_or(0),
+            live_bytes: self.live_bytes.get(&backend).copied().unwrap_or(0),
+            peak_live_bytes: self.peak_bytes.get(&backend).copied().unwrap_or(0),
+            budget: self.memory_budget(backend),
+        }
+    }
+
+    /// Exact-size allocation (persistent KV regions and any caller that cannot be rounded).
+    fn alloc_exact_in_pool(&mut self, backend: Backend, size: usize) -> usize {
         match backend {
             Backend::CPU => self.cpu.alloc_buffer(size),
             #[cfg(target_os = "macos")]
@@ -488,6 +629,12 @@ impl GraphAllocator {
     }
 
     fn free_in_pool(&mut self, backend: Backend, id: usize) {
+        // E4: a freed buffer stays reserved (the pool is a high-water mark) but is no
+        // longer live, so the accounting separates the two.
+        if let Some(bytes) = self.buf_bytes.remove(&(backend, id)) {
+            let live = self.live_bytes.entry(backend).or_insert(0);
+            *live = live.saturating_sub(bytes);
+        }
         match backend {
             Backend::CPU => self.cpu.free_buffer(id),
             #[cfg(target_os = "macos")]
@@ -599,7 +746,7 @@ impl GraphAllocator {
 
     /// Allocate a persistent (never-freed) region on a backend.
     pub fn alloc_persistent(&mut self, name: &str, backend: Backend, size: usize) -> BufRef {
-        let id = self.alloc_in_pool(backend, size);
+        let id = self.alloc_exact_in_pool(backend, size);
         self.persistent.push(PersistentBuf {
             name: name.to_string(),
             backend,
@@ -2955,5 +3102,101 @@ mod tests {
         });
         let mut alloc = GraphAllocator::new();
         assert!(alloc.alloc_graph(&g).is_err());
+    }
+
+    /// E4's safety half: a request that would exceed the backend's budget is refused
+    /// **before the pool is touched**, with the numbers (weights, pooled, this request,
+    /// budget), instead of surfacing later as a null pointer at execute time.
+    #[test]
+    fn a_graph_that_cannot_fit_is_refused_with_its_numbers() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [1024, 1, 1, 1], crate::graph::DType::F32);
+        let y = b.silu(x);
+        b.output(y);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        // One byte short of a 4 KiB activation: the gate must fire (the class of 1024
+        // elements is 1024 exactly, so this is the requirement minus one).
+        alloc.set_memory_budget(Backend::CPU, Some(4095));
+        let err = alloc.alloc_graph(&g).unwrap_err();
+        assert!(err.contains("out of CPU memory"), "{err}");
+        assert!(err.contains("budget"), "{err}");
+        assert!(
+            err.contains("MiB"),
+            "the error must carry the numbers, not a bare failure: {err}"
+        );
+        // Nothing was allocated: the gate runs before the pool is asked for anything.
+        assert_eq!(
+            alloc.n_cpu_buffers(),
+            0,
+            "the refused graph must not touch the pool"
+        );
+        let report = alloc.memory_report(Backend::CPU);
+        assert_eq!(report.pool_bytes, 0);
+        assert_eq!(report.budget, Some(4095));
+        assert_eq!(report.headroom_bytes(), Some(4095));
+
+        // The same graph fits once the budget does.
+        alloc.set_memory_budget(Backend::CPU, Some(1 << 20));
+        alloc.alloc_graph(&g).unwrap();
+        let report = alloc.memory_report(Backend::CPU);
+        assert!(report.pool_bytes > 0, "{report:?}");
+        assert!(report.live_bytes > 0 && report.live_bytes <= report.pool_bytes);
+        assert!(report.peak_live_bytes >= report.live_bytes);
+        assert_eq!(report.budget, Some(1 << 20));
+        assert!(report.headroom_bytes().unwrap() < 1 << 20);
+    }
+
+    /// E4's accounting half: weights and activations are one comparison, and the peak is
+    /// a number the caller can read (the ticket's "peak memory is reported").
+    #[test]
+    fn the_budget_counts_weights_and_activations_together() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [256, 1, 1, 1], crate::graph::DType::F32);
+        let y = b.silu(x);
+        b.output(y);
+        let g = b.build();
+
+        let weight = tensor_f32("w", [256, 1, 1, 1], vec![0.5; 256]);
+        let weight_bytes = weight.data.len();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.register_weight("w", weight);
+        let report = alloc.memory_report(Backend::CPU);
+        assert_eq!(report.weights_bytes, weight_bytes, "{report:?}");
+        assert_eq!(report.pool_bytes, 0, "nothing is allocated before a build");
+
+        // A budget that covers the weight but not the activation is still a refusal.
+        let activation_class =
+            crate::graph::allocplan::class_bytes(crate::graph::allocplan::class_size(256 * 4 / 4));
+        alloc.set_memory_budget(Backend::CPU, Some(weight_bytes + activation_class - 1));
+        let err = alloc.alloc_graph(&g).unwrap_err();
+        assert!(err.contains("out of CPU memory"), "{err}");
+        assert!(
+            err.contains(&format!("{} MiB", weight_bytes / (1024 * 1024))),
+            "the refusal must name the weight bytes: {err}"
+        );
+
+        // One byte more and it fits.
+        alloc.set_memory_budget(Backend::CPU, Some(weight_bytes + activation_class));
+        alloc.alloc_graph(&g).unwrap();
+        let report = alloc.memory_report(Backend::CPU);
+        assert_eq!(report.weights_bytes, weight_bytes);
+        assert!(
+            report.weights_bytes + report.pool_bytes <= report.budget.unwrap(),
+            "{report:?}"
+        );
+    }
+
+    /// The tiny f32 tensor the accounting tests register (`Tensor` carries raw bytes).
+    fn tensor_f32(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for x in data {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let mut t = crate::tensor::Tensor::from_data(crate::tensor::TensorType::F32, &shape, bytes);
+        t.name = name.to_string();
+        t
     }
 }
