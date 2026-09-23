@@ -105,14 +105,17 @@ return past a `threadgroup_barrier`, device limits queried at runtime).
 
 `f32` (default) · `f16` (resolves to f32 here: this path has no f16 KV kernel) ·
 `q8_0` (**C4**: packed Q8_0 cells, `ceil(n_kv_embd/32 * 34)` bytes per cell instead of
-`4 * n_kv_embd`, so the regions are **3.76× smaller**; the store quantizes and the
-attention read dequantizes its window). An unknown value is refused on every device, and
-`q8_0` is CPU-only for now — CUDA and Metal refuse it loudly rather than run f32
-(the fused Q8_0 dots and the GPU kernels are
+`4 * n_kv_embd`, so the regions are **3.76× smaller**; the store quantizes and the attention
+reads the packed blocks directly — the K score is a `Q8_0 × Q8_0` dot against the quantized
+query, V accumulates out of the cell, and S1's dequantize-into-a-scratch pass is gone).
+An unknown value is refused on every device, and `q8_0` is CPU-only for now — CUDA and Metal
+refuse it loudly rather than run f32 (their kernels are
 [issue #87](https://github.com/yusiwen/minfer/issues/87)). A physical context shift
-(`kv_rm`/`kv_shift`, which re-ropes K in f32) is refused on a packed region. The
-tolerance class against f32 is named, never bitwise: see the C4 record in
-`docs/ARCHITECTURE-EXECUTION-PLAN.md` §5.
+(`kv_rm`/`kv_shift`) works on a packed region: the survivors move verbatim and are
+re-rope/re-quantized one row at a time. `MINFER_NO_FUSED_Q8_KV=1` restores the S1 read path
+(the A/B of standing rule 3; measured 1.16× at ctx 512 and 1.31× at ctx 2048 in the fused
+read's favour). The tolerance class against f32 is named, never bitwise: see the C4 record
+in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5.
 
 ### CUDA — opt-in, campaign-tuned
 
@@ -147,6 +150,7 @@ must still run the FusionPass.
 - `MINFER_DISABLE_MPS=1` — force the CPU backend on macOS.
 - `MINFER_NO_NEON=1` (aarch64) — drop the CPU NEON layer to scalar (A/B lever).
 - `MINFER_NO_CUDA_GRAPH=1`, `MINFER_CACHE_TYPE=f32|f16|q8_0` (`q8_0` = CPU only, C4),
+  `MINFER_NO_FUSED_Q8_KV=1` (keep S1's dequantizing read of a packed cache, for the A/B),
   `MINFER_NO_FUSE_QKV` / `MINFER_NO_FUSE_FFN` — per-backend behavior levers.
 - Which backend to expect: the startup banner and `MINFER_TRACE` /
   `MINFER_GRAPH_TRACE` show per-node assignments
