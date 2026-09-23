@@ -57,13 +57,17 @@ impl BackendScheduler {
 
     /// Assign every node to the best backend that supports it (capability
     /// driven via the allocator's backend registry).
+    ///
+    /// E5: the node's block is part of the question — `supports_for` keeps a node whose
+    /// block the offload plan left on the CPU off the device, so a partially offloaded
+    /// model never runs a block whose weights were never registered there.
     pub fn assign_backends(&self, graph: &mut ComputeGraph, alloc: &GraphAllocator) {
         for node in &mut graph.nodes {
             if node.backend.is_some() {
                 continue; // keep explicit assignments
             }
             node.backend = alloc
-                .supports(&node.op, node.out_dtype)
+                .supports_for(&node.op, node.out_dtype, node.layer)
                 .or(Some(BackendTag::CPU));
         }
     }

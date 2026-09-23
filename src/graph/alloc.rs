@@ -69,6 +69,9 @@ pub struct GraphAllocator {
     peak_bytes: HashMap<Backend, usize>,
     /// E4: an explicit memory budget per backend; unset = the backend's own default.
     budget: HashMap<Backend, usize>,
+    /// E5: the layer offload plan in force (None = the pre-E5 "the device takes whatever it
+    /// can"). Read by `supports_for`, so it decides every node's backend.
+    offload: Option<super::offload::OffloadPlan>,
     /// Per-layer KV **cell store**: the persistent regions plus per-cell
     /// sequence ownership (Phase C / C1). The allocator only allocates the
     /// arenas; the store owns their bookkeeping and the `position -> cell`
@@ -94,6 +97,7 @@ impl Default for GraphAllocator {
             live_bytes: HashMap::new(),
             peak_bytes: HashMap::new(),
             budget: HashMap::new(),
+            offload: None,
             kv: super::kvcache::KvCache::new(),
             persistent: Vec::new(),
         }
@@ -213,24 +217,64 @@ impl GraphAllocator {
     }
 
     /// Which backend supports this op/dtype (highest priority first).
+    ///
+    /// E5: `supports_for` with `layer = None` (no offload policy) — kept for callers that
+    /// only ask "does any backend have this op", like the op matrix.
     pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
+        self.supports_for(op, dtype, None)
+    }
+
+    /// Which backend may take a node of `(op, dtype)` that belongs to `layer` — the
+    /// assignment rule with the E5 offload policy applied.
+    ///
+    /// With a plan in force, a node whose block is **not** offloaded never reaches the
+    /// device: the answer starts at the CPU, so a partial plan cannot silently run a
+    /// non-offloaded block's op on a device that never registered its weights. A node
+    /// outside any block (`layer = None`) follows the device only when every block is
+    /// offloaded (`OffloadPlan::device_holds_unblocked`).
+    pub fn supports_for(
+        &self,
+        op: &Op,
+        dtype: crate::graph::DType,
+        layer: Option<usize>,
+    ) -> Option<Backend> {
         let eligible = |b: &dyn BackendTrait| -> bool { super::backend_takes(b, op, dtype) };
-        #[cfg(target_os = "macos")]
-        if let Some(m) = &self.metal {
-            if eligible(m) {
-                return Some(Backend::Metal);
+        let device_ok = match (self.offload, layer) {
+            (None, _) => true, // no policy: the pre-E5 all-or-nothing behaviour
+            (Some(p), Some(l)) => p.on_device(l),
+            (Some(p), None) => p.device_holds_unblocked(),
+        };
+        if device_ok {
+            #[cfg(target_os = "macos")]
+            if let Some(m) = &self.metal {
+                if eligible(m) {
+                    return Some(Backend::Metal);
+                }
             }
-        }
-        #[cfg(feature = "cuda")]
-        if let Some(c) = &self.cuda {
-            if eligible(c) {
-                return Some(Backend::Cuda);
+            #[cfg(feature = "cuda")]
+            if let Some(c) = &self.cuda {
+                if eligible(c) {
+                    return Some(Backend::Cuda);
+                }
             }
         }
         if eligible(&self.cpu) {
             return Some(Backend::CPU);
         }
         None
+    }
+
+    /// E5: put an offload plan in force. `None` restores the pre-E5 behaviour (no layer
+    /// policy — the device takes whatever it can). The plan is *topology* (it decides every
+    /// node's backend), so the caller also carries it in `CParams.gpu_layers` for the reuse
+    /// check; this setter is what the assignment pass reads.
+    pub fn set_offload_plan(&mut self, plan: Option<super::offload::OffloadPlan>) {
+        self.offload = plan;
+    }
+
+    /// The offload plan in force (E5).
+    pub fn offload_plan(&self) -> Option<super::offload::OffloadPlan> {
+        self.offload
     }
 
     /// Liveness analysis + allocation for every node buffer.
@@ -2007,6 +2051,20 @@ impl GraphAllocator {
         path: &Path,
         expect: &KvSessionExpect,
     ) -> Result<KvSessionReport, String> {
+        // E5: a session is one arena — the container carries a single backend tag and one
+        // element type. A mixed CPU/device offload plan has regions on both, so the file's
+        // backend would be forced onto layers that run elsewhere. Refused before anything
+        // is applied (like every other `kv_load` refusal: a failed load is a no-op).
+        if let Some(p) = self.offload {
+            if p.is_mixed() {
+                return Err(format!(
+                    "KV session: this model's {} blocks are split across backends (E5 offload plan: {} on the device, {} on the CPU); a session is one arena, so it cannot be resumed — offload every block or none",
+                    p.n_layers,
+                    p.gpu_layers,
+                    p.cpu_layers()
+                ));
+            }
+        }
         let header = super::kvsession::verify(path)?;
         if header.backend != expect.backend {
             return Err(format!(
@@ -3210,6 +3268,7 @@ mod tests {
             backend: None,
             meta: super::super::ops::NodeMeta::None,
             view: None,
+            layer: None,
         });
         g.nodes.push(super::super::CNode {
             id: 1,
@@ -3221,6 +3280,7 @@ mod tests {
             backend: None,
             meta: super::super::ops::NodeMeta::None,
             view: None,
+            layer: None,
         });
         let mut alloc = GraphAllocator::new();
         assert!(alloc.alloc_graph(&g).is_err());
@@ -3468,6 +3528,95 @@ mod tests {
             want,
             "the window must still hold the parent's rows, not the recycled buffer's"
         );
+    }
+
+    /// E5: with a plan in force, the device is only offered for a node whose block the plan
+    /// offloaded — and a node outside any block only under a full plan. Needs a device to be
+    /// meaningful (without one the answer is CPU either way), so it is gated on the CUDA
+    /// build and skips when no device is present.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn the_offload_plan_keeps_late_blocks_off_the_device() {
+        use crate::graph::offload::OffloadPlan;
+        crate::cuda::CudaState::init();
+        if crate::cuda::CudaState::get().is_none() {
+            eprintln!("no CUDA device; skipping the E5 placement gate");
+            return;
+        }
+        let mut alloc = GraphAllocator::new();
+        assert!(alloc.enable_cuda());
+        // No plan: the pre-E5 behaviour — the device takes every node it can.
+        assert_eq!(
+            alloc.supports_for(&Op::Silu, crate::graph::DType::F32, Some(3)),
+            Some(Backend::Cuda)
+        );
+        alloc.set_offload_plan(Some(OffloadPlan {
+            gpu_layers: 2,
+            n_layers: 4,
+        }));
+        assert_eq!(
+            alloc.supports_for(&Op::Silu, crate::graph::DType::F32, Some(0)),
+            Some(Backend::Cuda),
+            "an offloaded block may use the device"
+        );
+        assert_eq!(
+            alloc.supports_for(&Op::Silu, crate::graph::DType::F32, Some(2)),
+            Some(Backend::CPU),
+            "a block past the plan stays on the CPU"
+        );
+        assert_eq!(
+            alloc.supports_for(&Op::Silu, crate::graph::DType::F32, None),
+            Some(Backend::CPU),
+            "a partial plan keeps the unblocked tensors (embed/output) on the CPU"
+        );
+        // A full plan puts the unblocked tensors back on the device.
+        alloc.set_offload_plan(Some(OffloadPlan {
+            gpu_layers: 4,
+            n_layers: 4,
+        }));
+        assert_eq!(
+            alloc.supports_for(&Op::Silu, crate::graph::DType::F32, None),
+            Some(Backend::Cuda)
+        );
+    }
+
+    /// E5: a KV session is one arena (the container carries a single backend tag), so a mixed
+    /// CPU/device plan cannot resume one. The refusal happens before the file is read — the
+    /// path below does not exist, which is how the test proves the order.
+    #[test]
+    fn a_mixed_offload_plan_refuses_to_resume_a_session() {
+        use crate::graph::kvsession::KvSessionExpect;
+        let expect = KvSessionExpect {
+            backend: Backend::CPU,
+            n_ctx: 16,
+            n_embd: 8,
+        };
+        let mut alloc = GraphAllocator::new();
+        alloc.set_offload_plan(Some(crate::graph::offload::OffloadPlan {
+            gpu_layers: 2,
+            n_layers: 4,
+        }));
+        let err = alloc
+            .kv_load(std::path::Path::new("/nonexistent/e5-mixed.bin"), &expect)
+            .unwrap_err();
+        assert!(err.contains("offload plan"), "got: {err}");
+        // An all-CPU or all-device plan proceeds to the file and fails there instead.
+        for plan in [
+            crate::graph::offload::OffloadPlan {
+                gpu_layers: 0,
+                n_layers: 4,
+            },
+            crate::graph::offload::OffloadPlan {
+                gpu_layers: 4,
+                n_layers: 4,
+            },
+        ] {
+            alloc.set_offload_plan(Some(plan));
+            let err = alloc
+                .kv_load(std::path::Path::new("/nonexistent/e5-mixed.bin"), &expect)
+                .unwrap_err();
+            assert!(!err.contains("offload plan"), "{plan:?}: {err}");
+        }
     }
 
     /// The tiny f32 tensor the accounting tests register (`Tensor` carries raw bytes).

@@ -42,6 +42,9 @@ pub fn runtime_gparams(
             gpu,
             fuse_qkv,
             fuse_ffn,
+            // E5: the JSON exporter describes a graph, not a placement policy; the
+            // assignment it already carries in each node is the answer.
+            gpu_layers: usize::MAX,
         },
         weights_version: 1,
     }

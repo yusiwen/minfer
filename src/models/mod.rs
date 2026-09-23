@@ -7,7 +7,74 @@ pub mod qwen3;
 use crate::cache::KVCache;
 use crate::gguf::GgufModel;
 use crate::graph::cache::GraphCache;
+use crate::graph::offload::OffloadPlan;
 use crate::vec_ops::RopeStyle;
+
+/// E5: what the loader decided about layer offload, and what it measured while registering
+/// weights. Stored on the model, so `device()`, the graph builder and the startup report all
+/// read the same decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffloadState {
+    /// The plan in force. After a load it is the **effective** plan: a request the device
+    /// could not honour has already been cut back to CPU-only (with a printed reason).
+    pub plan: OffloadPlan,
+    /// Device bytes the offloaded weights occupy — summed while registering, so the report
+    /// states what was actually placed rather than what the plan asked for.
+    pub device_bytes: usize,
+    /// Where the request came from ("--gpu-layers 4", "MINFER_GPU_LAYERS=4", "default"),
+    /// so a surprising placement is traceable to the thing that asked for it.
+    pub source: String,
+}
+
+impl OffloadState {
+    /// The pre-E5 state: no block on the device, nothing measured.
+    pub fn cpu_only(n_layers: usize) -> Self {
+        Self {
+            plan: OffloadPlan::all_on_cpu(n_layers),
+            device_bytes: 0,
+            source: "default".to_string(),
+        }
+    }
+
+    /// E5's startup line, or `None` when there is nothing to report: the CPU-only path is
+    /// silent **unless the request asked for it** (`--gpu-layers 0` deserves an answer; the
+    /// pre-E5 default CPU run printed nothing and still should not).
+    pub fn report(&self, device: Device) -> Option<String> {
+        if self.plan.is_cpu_only() && self.source == "default" {
+            return None;
+        }
+        Some(crate::graph::offload::report(
+            self.plan,
+            device_name(device),
+            self.device_bytes,
+            &self.source,
+        ))
+    }
+}
+
+/// The device's name as the offload report spells it.
+pub fn device_name(device: Device) -> &'static str {
+    match device {
+        Device::Cpu => "cpu",
+        Device::Metal => "metal",
+        Device::Cuda => "cuda",
+    }
+}
+
+/// E5: whether **any** device is present, decided before any weight is registered — the
+/// offload plan is resolved at the start of a load, so "unset request" can mean "every block
+/// the device can hold" without waiting for the registration checks that follow.
+pub fn device_available() -> bool {
+    #[cfg(target_os = "macos")]
+    if crate::graph::metal_backend::metal_available() {
+        return true;
+    }
+    #[cfg(feature = "cuda")]
+    if crate::cuda::CudaState::get().is_some() {
+        return true;
+    }
+    false
+}
 
 /// Which backend a model's forwards actually run on (E6).
 ///
@@ -169,8 +236,26 @@ pub trait ModelDef: Send + Sync {
 
     /// Where this model's forwards run (E6). The default is CPU, which is the
     /// truth for any implementation that does not override it.
+    ///
+    /// E5: with a partial offload plan this is "the device participates" — the *per-block*
+    /// answer is `offload().on_device(block)`, and the graph's assignment pass reads that.
     fn device(&self) -> Device {
         Device::Cpu
+    }
+
+    /// E5: the layer offload plan in force (the **effective** one: a request the device
+    /// could not honour has already been reduced to what it can). The default is "no block
+    /// on the device", which is the pre-E5 behaviour for an implementation that does not
+    /// override it.
+    fn offload(&self) -> crate::graph::offload::OffloadPlan {
+        crate::graph::offload::OffloadPlan::all_on_cpu(self.n_layer())
+    }
+
+    /// E5's startup report line ("which blocks landed where"), or `None` when there is
+    /// nothing to report (the CPU-only path). The arch loaders implement it with the device
+    /// memory their offloaded weights actually occupy.
+    fn offload_report(&self) -> Option<String> {
+        None
     }
 
     fn format_chat(&self, messages: &[(String, String)]) -> String;
@@ -208,11 +293,22 @@ pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
 /// second load collides with the first, fails its all-or-nothing CUDA check,
 /// and silently drops the primary model to CPU.
 pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
+    load_model_with(model, ns, crate::graph::offload::OffloadRequest::Default)
+}
+
+/// Load with an explicit **E5 offload request** — the CLI's `--gpu-layers`. `Default` reads
+/// `MINFER_GPU_LAYERS`, which is the interface the server and the tests use, so a caller that
+/// has already parsed a number does not have to go through the environment.
+pub fn load_model_with(
+    model: &GgufModel,
+    ns: &str,
+    offload: crate::graph::offload::OffloadRequest,
+) -> Option<Box<dyn ModelDef>> {
     let ctx = &model.parts[0].ctx;
     let arch = ctx.get_key_val_str("general.architecture")?;
     let loaded: Box<dyn ModelDef> = match arch.as_str() {
-        "qwen2" => Box::new(qwen2::loader::load(model, ns)?),
-        "qwen3" => Box::new(qwen3::loader::load(model, ns)?),
+        "qwen2" => Box::new(qwen2::loader::load(model, ns, offload)?),
+        "qwen3" => Box::new(qwen3::loader::load(model, ns, offload)?),
         other => {
             eprintln!("Unsupported architecture: '{}'", other);
             return None;
@@ -231,6 +327,12 @@ pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
             eprintln!("minfer: {e}");
             return None;
         }
+    }
+    // E5's third acceptance: say which blocks landed where (and how much device memory they
+    // took) at startup — a placement nobody can see is a placement nobody can debug. Printed
+    // after the KV policy resolved, so a load that fails there prints nothing.
+    if let Some(line) = loaded.offload_report() {
+        eprintln!("minfer: {line}");
     }
     Some(loaded)
 }

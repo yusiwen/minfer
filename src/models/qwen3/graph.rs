@@ -86,6 +86,10 @@ impl Qwen3Graph {
         let attn_scale = hp.attention_scale(); // 1/sqrt(128)
 
         for (il, l) in model.layers.iter().enumerate() {
+            // E5: tag this block's nodes (see qwen2's loop) and decide once whether this
+            // block may use the device-only fused forms.
+            b.set_layer(Some(il));
+            let layer_gpu = params.cparams.gpu && il < params.cparams.gpu_layers;
             let residual = h;
 
             // pre-norm
@@ -102,7 +106,7 @@ impl Qwen3Graph {
             // sequence-relative once the span is explicit, so it is gated off
             // until S3 gives the kernels a `cells` pointer.
             let fuse_qkv_norm = nt == 1
-                && params.cparams.gpu
+                && layer_gpu
                 && params.cparams.fuse_qkv
                 && l.q_norm.is_some()
                 && l.k_norm.is_some()
@@ -211,7 +215,7 @@ impl Qwen3Graph {
             // fuse_ffn lives in CParams (the reuse identity) so the
             // MINFER_NO_FUSE_FFN toggle reliably forces a rebuild.
             let fuse_gu = nt == 1
-                && params.cparams.gpu
+                && layer_gpu
                 && params.cparams.fuse_ffn
                 && Self::gu_concat_available(&l.ffn_gate, &l.ffn_up)
                 && nf <= 16384;
@@ -253,6 +257,8 @@ impl Qwen3Graph {
             };
             h = b.add(residual, ffn_out);
         }
+        // E5: the final norm and `lm_head` are outside any block (see qwen2's build).
+        b.set_layer(None);
 
         // output: norm + lm_head
         let normed = b.rms_norm(h, model.output_norm.as_ref(), eps);
@@ -475,6 +481,12 @@ impl Qwen3Graph {
                 // (`Device::gathers_attn_map`).
                 kv_map,
                 gpu: metal_on || cuda_on,
+                // E5: how many blocks the device holds (see qwen2's build for the rule).
+                gpu_layers: if metal_on || cuda_on {
+                    model.offload.plan.gpu_layers
+                } else {
+                    0
+                },
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
                 // + no-bias rope+store) is part of the topology; the env toggle
                 // forces a rebuild so it can be A/B'd reliably (like qwen2's
@@ -504,6 +516,9 @@ impl Qwen3Graph {
                 if cuda_on {
                     alloc.enable_cuda();
                 }
+                // E5: the offload plan is what keeps a non-offloaded block off the device
+                // (see qwen2's forward_cached).
+                alloc.set_offload_plan(Some(model.offload.plan));
                 sched.assign_backends(&mut graph, alloc);
                 let backends: Vec<&dyn Backend> = {
                     #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
@@ -669,19 +684,30 @@ impl Qwen3Graph {
     /// Every weight the graph reads must be GPU-registered for the Metal path.
     #[cfg(target_os = "macos")]
     fn weights_on_gpu(model: &Qwen3Model) -> bool {
+        // E5: only the offloaded blocks (and the unblocked tensors under a full plan) have to
+        // be registered — see qwen2's twin.
+        let plan = model.offload.plan;
+        if plan.is_cpu_only() {
+            return false;
+        }
         let names: Vec<String> = {
             let mut v = Vec::new();
-            for t in [
-                &model.tok_embd,
-                &model.output_norm,
-                &model.output,
-                &model.output_b,
-            ] {
-                if let Some(t) = t {
-                    v.push(t.name.clone());
+            if plan.device_holds_unblocked() {
+                for t in [
+                    &model.tok_embd,
+                    &model.output_norm,
+                    &model.output,
+                    &model.output_b,
+                ] {
+                    if let Some(t) = t {
+                        v.push(t.name.clone());
+                    }
                 }
             }
-            for l in &model.layers {
+            for (i, l) in model.layers.iter().enumerate() {
+                if !plan.on_device(i) {
+                    continue;
+                }
                 for t in [
                     &l.attn_norm,
                     &l.wq,
@@ -769,11 +795,22 @@ impl Qwen3Graph {
         let Some(cuda) = crate::cuda::CudaState::get() else {
             return false;
         };
-        let mut ok = embed_ok(&model.tok_embd, &cuda)
-            && matmul_ok(&model.output, &cuda)
-            && registered(&model.output_norm, &cuda)
-            && registered(&model.output_b, &cuda);
-        for l in &model.layers {
+        // E5: only the offloaded blocks and (under a full plan) the unblocked tensors.
+        let plan = model.offload.plan;
+        if plan.is_cpu_only() {
+            return false;
+        }
+        let mut ok = true;
+        if plan.device_holds_unblocked() {
+            ok = embed_ok(&model.tok_embd, &cuda)
+                && matmul_ok(&model.output, &cuda)
+                && registered(&model.output_norm, &cuda)
+                && registered(&model.output_b, &cuda);
+        }
+        for (i, l) in model.layers.iter().enumerate() {
+            if !plan.on_device(i) {
+                continue;
+            }
             ok &= registered(&l.attn_norm, &cuda)
                 && matmul_ok(&l.wq, &cuda)
                 && matmul_ok(&l.wk, &cuda)
@@ -790,31 +827,39 @@ impl Qwen3Graph {
             // Identify the first weight that fails the gate (same checks, same
             // order as above; 0 = embed, 1 = matmul, 2 = registered-only) so
             // the message names the tensor instead of a generic complaint.
-            let fail = std::iter::once((&model.tok_embd, 0u8))
-                .chain(std::iter::once((&model.output, 1u8)))
-                .chain(std::iter::once((&model.output_norm, 2u8)))
-                .chain(std::iter::once((&model.output_b, 2u8)))
-                .chain(model.layers.iter().flat_map(|l| {
-                    [
-                        (&l.attn_norm, 2u8),
-                        (&l.wq, 1u8),
-                        (&l.wk, 1u8),
-                        (&l.wv, 1u8),
-                        (&l.wo, 1u8),
-                        (&l.q_norm, 2u8),
-                        (&l.k_norm, 2u8),
-                        (&l.ffn_norm, 2u8),
-                        (&l.ffn_gate, 1u8),
-                        (&l.ffn_up, 1u8),
-                        (&l.ffn_down, 1u8),
-                    ]
-                }))
-                .find(|(t, kind)| match (t, kind) {
-                    (Some(t), 0) => !embed_t_ok(t, &cuda),
-                    (Some(t), 1) => !matmul_t_ok(t, &cuda),
-                    (Some(t), _) => !cuda.has_weight_of_size(&t.name, t.data().len()),
-                    (None, _) => false,
-                });
+            let mut named: Vec<(&Option<crate::tensor::Tensor>, u8)> = Vec::new();
+            if plan.device_holds_unblocked() {
+                named.extend([
+                    (&model.tok_embd, 0u8),
+                    (&model.output, 1u8),
+                    (&model.output_norm, 2u8),
+                    (&model.output_b, 2u8),
+                ]);
+            }
+            for (i, l) in model.layers.iter().enumerate() {
+                if !plan.on_device(i) {
+                    continue;
+                }
+                named.extend([
+                    (&l.attn_norm, 2u8),
+                    (&l.wq, 1u8),
+                    (&l.wk, 1u8),
+                    (&l.wv, 1u8),
+                    (&l.wo, 1u8),
+                    (&l.q_norm, 2u8),
+                    (&l.k_norm, 2u8),
+                    (&l.ffn_norm, 2u8),
+                    (&l.ffn_gate, 1u8),
+                    (&l.ffn_up, 1u8),
+                    (&l.ffn_down, 1u8),
+                ]);
+            }
+            let fail = named.into_iter().find(|(t, kind)| match (t, kind) {
+                (Some(t), 0) => !embed_t_ok(t, &cuda),
+                (Some(t), 1) => !matmul_t_ok(t, &cuda),
+                (Some(t), _) => !cuda.has_weight_of_size(&t.name, t.data().len()),
+                (None, _) => false,
+            });
             if let Some((Some(t), _)) = fail {
                 eprintln!(
                     "CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered",
@@ -1019,6 +1064,7 @@ mod tests {
                     explicit_span: false,
                     kv_map: false,
                     gpu: true,
+                    gpu_layers: usize::MAX, // E5 fixture: no offload limit
                     fuse_qkv: true,
                     fuse_ffn: false,
                 },
@@ -1210,6 +1256,7 @@ mod tests {
                     explicit_span: false,
                     kv_map: false,
                     gpu: true,
+                    gpu_layers: usize::MAX, // E5 fixture: no offload limit
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
