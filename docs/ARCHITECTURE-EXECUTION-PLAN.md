@@ -12,7 +12,7 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**6/7** (E1, E1b, E2, **E3**, **E4**, E6 done; **E5 S1** landed, that ticket open on its remaining increment); Phase F **0/8** (F1 needs x86); Phase G
+**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **0/8** (F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
 check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
@@ -1982,8 +1982,70 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
 | E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **DONE (2026-09-23)**: S1 the accounting + the size-class ladder + the feasibility gate; S2 the pools allocate at the class, the length contract moved to `BufRef`, two latent liveness bugs fixed; S3 split reservation (the slot table) from assignment — a rebuild re-maps without touching the pool, CUDA's `pool_gen` stops moving, and `GraphCache` holds one graph per `GraphParams` (a switch re-maps instead of rebuilding) | L |
-| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) — **S1 done (2026-09-23: a layer-granular plan, `--gpu-layers`/`MINFER_GPU_LAYERS`, per-block weight registration and placement, the startup report, verified mixed CPU+CUDA run); the automatic fit from the memory accounting open** | L |
+| E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) — **DONE (2026-09-23)**: S1 the layer-granular plan (`--gpu-layers`/`MINFER_GPU_LAYERS`), per-block weight registration and placement, the startup report, a verified mixed CPU+CUDA run; S2 the `auto` fit — per-block weight bytes from the GGUF index, the pure `fit_blocks` prefix search against a weight budget (`MINFER_GPU_MEM`, else three quarters of device free), a quarter held back for KV/activations | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E5 record, S2 (2026-09-23) — the offload plan as a fit, not a ceiling
+
+**Why.** S1 shipped the placement machinery and a knob, but the knob was an explicit ceiling: the
+user had to know the model's block count and guess how many fit. The ticket's "budget knob" is
+the other half — *compute* the split from the device's memory, which is what a machine whose free
+memory is smaller than the model actually needs.
+
+**What S2 landed.**
+
+- **`auto`** as a third request (`MINFER_GPU_LAYERS=auto` / `--gpu-layers auto`), parsed strictly
+  with the rest (`OffloadRequest::parse`: a decimal count, `auto`, or unset; anything else is a
+  refused load).
+- **The byte table comes from the index.** `block_weight_bytes` sums `GgufTensorInfo::nbytes` per
+  block (`block_of` on the tensor name) *before anything is loaded* — the decision cannot wait for
+  a measurement, because the registration filter **is** the plan. `nbytes` is now the shared
+  arithmetic (the loader slices the part with the same method), so the fit and the loader cannot
+  disagree about a tensor's size.
+- **The fit is a pure prefix search** (`fit_blocks(budget, per_block, reserve)`): the largest
+  `k` with `reserve + Σ per_block[0..k] ≤ budget`. A prefix, not a knapsack — the plan is
+  `0..gpu_layers`, and a gap would put a CPU block between two device blocks for nothing; the walk
+  stops at the first block that does not fit, which is a deliberate, documented conservatism.
+- **The budget** (`weight_budget`): `MINFER_GPU_MEM=<MiB>` when set, else **three quarters of what
+  the device reports free** — the same default E4's feasibility gate uses, so the fit and the gate
+  that later checks the activation pool are talking about one number. A quarter of the weight
+  budget is then held back as `reserve` for the KV arenas and the activation pool: both are sized
+  per graph at forward time, so no load-time fit can measure them; a prompt that needs more is
+  refused by the E4 activation gate (loudly) instead of quietly swapping.
+- **The report explains the fit** (`auto_source`): `offload: 5 of 24 blocks on cuda … (40.0 MiB of
+  device weights; auto: 5 of 24 blocks fit — weights budget 64 MiB, 16 MiB reserved for
+  KV/activations; MINFER_GPU_MEM=64 MiB)` — the decision and the numbers behind it.
+- `device_free_bytes()` is the one place that asks the device (CUDA: `cudaMemGetInfo`); Metal's
+  wrapper reports no free-bytes number yet, so on macOS `auto` needs `MINFER_GPU_MEM` and otherwise
+  fits nothing (the default and an explicit count still work there).
+
+**Acceptance, as measured** (0.5B q4_0 on GB10):
+
+- `an_auto_offload_plan_fits_the_budget` (ignored, real model): with `MINFER_GPU_MEM=64` the fit is
+  a **strict prefix** — 5 of 24 blocks, 40.0 MiB of device weights registered, i.e. inside the
+  48 MiB the budget left for weights — the report names `auto` and the cap, and the model's
+  **four greedy steps match the all-CPU run**; with no cap the same request selects **all 24
+  blocks**, so an `auto` default cannot silently under-offload a device that fits the model.
+- The pure matrix (4 tests, no device): the request spelling (`auto` case-insensitive, garbage
+  refused with the alternatives named, `plan()` refusing `auto` so a caller cannot skip the fit),
+  the prefix search (exact boundary, reserve eating the budget, empty/zero-size tables, the
+  "a big block stops the walk even though smaller ones follow" conservatism), the budget
+  (three quarters, explicit cap wins, no device → nothing fits, garbage refused) and the report
+  text (device vs cap vs no budget).
+- Mutation-checked in S1's gate (the placement rule is the same code path): removing the placement
+  gate fails the mixed run, and forcing `allows_weight` true fails the device-bytes assertion.
+- Suites: CPU **280 passed / 0 failed / 15 ignored**; CUDA (GB10, serial) **333 / 0 / 16**; the
+  `#[ignore]`d set serially **15 passed / 0 failed**.
+
+**Honest scope.** The fit measures **raw tensor bytes**; the auxiliary device copies the loader
+builds while loading (the fused `attn_qkv`/`ffn_gu` concats, the padded Q6_K layout, the q8_0 p32
+split, the q4_K dsc pair) are not in the per-block table — the quarter held back and E4's loud
+activation gate are what keep the estimate honest, and an under-estimate ends as a refusal, never
+as a silent overcommit. The reserve is a fixed quarter rather than a function of `n_ctx`/`n_batch`
+(which are runtime choices): a long-context request on a tight budget may therefore be refused by
+the gate even though `auto` accepted the weights — the message names the numbers, and
+`--gpu-layers`/`MINFER_GPU_MEM` are the knobs. Metal has no free-bytes query yet, and the fit is
+per **allocator**, like every other budget.
 
 #### E4 record, S3 (2026-09-23) — split reservation from assignment, then hold several graphs
 
