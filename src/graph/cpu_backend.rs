@@ -29,6 +29,10 @@ pub struct CpuBackend {
     /// (one per region). Kept across calls: it is one window, not the whole cache.
     kv_scratch_k: Vec<f32>,
     kv_scratch_v: Vec<f32>,
+    /// E4 S3: how many times the pool actually created a buffer. A rebuild that
+    /// re-maps onto reserved slots must not move this — it is the CPU-side twin of
+    /// CUDA's `pool_gen`, and what the "reserve, then assign" gate asserts.
+    allocs: usize,
 }
 
 impl CpuBackend {
@@ -40,6 +44,7 @@ impl CpuBackend {
             kv_format: super::kvformat::kv_format(),
             kv_scratch_k: Vec::new(),
             kv_scratch_v: Vec::new(),
+            allocs: 0,
         }
     }
 
@@ -73,6 +78,13 @@ impl CpuBackend {
     #[allow(dead_code)]
     pub fn weight(&self, name: &str) -> Option<&Tensor> {
         self.weights.get(name)
+    }
+
+    /// E4 S3: buffers this pool has created (never reused from the slot table).
+    /// (Test / accounting helper.)
+    #[allow(dead_code)]
+    pub fn alloc_count(&self) -> usize {
+        self.allocs
     }
 
     /// Pool size (for tests).
@@ -158,6 +170,7 @@ impl Backend for CpuBackend {
             return id;
         }
         self.buffers.push(vec![0.0f32; size]);
+        self.allocs += 1;
         self.buffers.len() - 1
     }
 
@@ -174,6 +187,7 @@ impl Backend for CpuBackend {
     fn alloc_fresh(&mut self, size: usize) -> usize {
         // never recycled from the free list (see Backend::alloc_fresh)
         self.buffers.push(vec![0.0f32; size]);
+        self.allocs += 1;
         self.buffers.len() - 1
     }
 

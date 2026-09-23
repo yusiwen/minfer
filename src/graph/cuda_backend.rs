@@ -1677,9 +1677,11 @@ mod tests {
         // the device copy (Phase 7c: the old remap-into-node_to_buf semantics
         // broke re-execution of reused graphs — the producing split found its
         // buffer remapped to another backend on the next execute)
-        alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
+        alloc
+            .copy_across(1, x, crate::graph::Backend::Cuda)
+            .unwrap();
         let cross = alloc
-            .cross_buffer(x, crate::graph::Backend::Cuda)
+            .cross_buffer(1, x, crate::graph::Backend::Cuda)
             .expect("cross staging buffer");
         assert_eq!(cross.backend, crate::graph::Backend::Cuda);
         assert_eq!(
@@ -1689,24 +1691,43 @@ mod tests {
         );
         assert_eq!(alloc.copy_to_cpu(x).unwrap(), data.to_vec());
         // re-copy (same dst) reuses the same staging buffer id
-        alloc.copy_across(x, crate::graph::Backend::Cuda).unwrap();
+        alloc
+            .copy_across(1, x, crate::graph::Backend::Cuda)
+            .unwrap();
         assert_eq!(
             alloc
-                .cross_buffer(x, crate::graph::Backend::Cuda)
+                .cross_buffer(1, x, crate::graph::Backend::Cuda)
                 .unwrap()
                 .id,
             cross.id
         );
         // a same-backend copy is a no-op and does not create staging for CPU
-        alloc.copy_across(x, crate::graph::Backend::CPU).unwrap();
+        alloc.copy_across(1, x, crate::graph::Backend::CPU).unwrap();
         assert!(
-            alloc.cross_buffer(x, crate::graph::Backend::CPU).is_none(),
+            alloc
+                .cross_buffer(1, x, crate::graph::Backend::CPU)
+                .is_none(),
             "the copy was already on the destination backend"
         );
-        assert!(alloc.cross_buffer(x, crate::graph::Backend::Cuda).is_some());
-        // rebuild clears staging (buffers freed, map empty)
+        assert!(alloc
+            .cross_buffer(1, x, crate::graph::Backend::Cuda)
+            .is_some());
+        // E4 S3: a rebuild keeps the staging buffer — it is keyed by (graph uid, node,
+        // backend), so it belongs to this graph's shape and survives a re-map. Re-creating it
+        // per rebuild leaked (staging is `alloc_fresh`, which never recycles).
         alloc.alloc_graph(&g).unwrap();
-        assert!(alloc.cross_buffer(x, crate::graph::Backend::Cuda).is_none());
+        assert_eq!(
+            alloc
+                .cross_buffer(1, x, crate::graph::Backend::Cuda)
+                .expect("staging survives a re-map")
+                .id,
+            cross.id,
+            "and it is the same buffer, not a fresh one"
+        );
+        // A different graph (its own uid) gets its own entry: node ids restart per graph.
+        assert!(alloc
+            .cross_buffer(2, x, crate::graph::Backend::Cuda)
+            .is_none());
     }
 
     #[test]

@@ -203,7 +203,7 @@ impl BackendScheduler {
                     flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
                     // 2. copy this split's inputs across backends
                     for &inp in &split.inputs {
-                        alloc.copy_across(inp, split.backend)?;
+                        alloc.copy_across(graph.uid, inp, split.backend)?;
                     }
                 }
             }
@@ -271,7 +271,7 @@ impl BackendScheduler {
                     // the node's canonical buffer (already on this split's
                     // backend when no copy was needed).
                     let sbr = alloc
-                        .cross_buffer(s, split.backend)
+                        .cross_buffer(graph.uid, s, split.backend)
                         .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr);

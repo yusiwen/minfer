@@ -32,6 +32,12 @@ pub struct MemoryReport {
     pub live_bytes: usize,
     pub peak_live_bytes: usize,
     pub budget: Option<usize>,
+    /// E4 S3: reserved class-sized buffers that are idle right now — the reservation table's
+    /// depth. A rebuild that re-maps leaves this where it was; a build that reserves more
+    /// raises it.
+    pub idle_slots: usize,
+    /// E4 S3: how many (backend, size class) reservations the table holds.
+    pub reserved_classes: usize,
 }
 
 impl MemoryReport {
@@ -57,12 +63,33 @@ pub struct GraphAllocator {
     /// split would find its buffer on another backend). The same staging buffer
     /// is rewritten on every execute (no per-step allocation). Keying on the
     /// destination as well is what lets one node feed two foreign backends.
-    cross: HashMap<(NodeId, Backend), BufRef>,
+    /// E4 S3: keyed by the graph's **uid** first, because node ids restart per graph and the
+    /// cache now holds several: a staging buffer belongs to one graph's node, at one size.
+    /// The entries survive a re-map (`alloc_graph` no longer drops them) — re-creating them
+    /// per switch would leak, since staging is allocated fresh, never from the slot table.
+    cross: HashMap<(u64, NodeId, Backend), BufRef>,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
     /// E4: bytes each pooled buffer occupies (its size class), keyed by `(backend, id)`
     /// so a release can subtract exactly what the allocation added.
     buf_bytes: HashMap<(Backend, usize), usize>,
+    /// E4 S3: the **reservation** half of reserve/assign — idle class-sized pool buffers,
+    /// keyed by `(backend, class in elements)`. A buffer released by liveness goes here
+    /// instead of back to the backend, so the next graph that needs that class re-maps onto
+    /// it without touching the pool (`alloc_buffer`/`free_buffer` are not called at all in
+    /// the steady state, which is what keeps CUDA's `pool_gen` — and therefore its captured
+    /// graphs — stable across rebuilds).
+    ///
+    /// A `BTreeSet` so the assignment is **deterministic**: liveness releases buffers in
+    /// `HashMap` order, so a LIFO/FIFO list would hand a rebuild different ids depending on
+    /// the iteration order, and a graph switched back into the cache would move its nodes
+    /// around. The smallest idle id is always taken first, which makes a given shape's
+    /// assignment reproducible and pins a cached graph's mapping.
+    slots: HashMap<(Backend, usize), std::collections::BTreeSet<usize>>,
+    /// E4 S3: the class (in elements) of a **classed** allocation, so a release knows whether
+    /// it returns to `slots` or to the backend's own free list (staging buffers are exact and
+    /// stay with the backend).
+    buf_class: HashMap<(Backend, usize), usize>,
     /// E4 accounting per backend: reserved (the pool's high-water mark), live, peak live.
     pool_bytes: HashMap<Backend, usize>,
     live_bytes: HashMap<Backend, usize>,
@@ -93,6 +120,8 @@ impl Default for GraphAllocator {
             cross: HashMap::new(),
             buf_alive: HashMap::new(),
             buf_bytes: HashMap::new(),
+            slots: HashMap::new(),
+            buf_class: HashMap::new(),
             pool_bytes: HashMap::new(),
             live_bytes: HashMap::new(),
             peak_bytes: HashMap::new(),
@@ -289,13 +318,12 @@ impl GraphAllocator {
         }
         self.buf_alive.clear();
         self.node_to_buf.clear();
-        // cross-backend staging buffers belong to the previous graph (their
-        // sizes follow that graph's shapes) — free and re-materialize on the
-        // first execute of the new graph
-        let prev_cross: Vec<((NodeId, Backend), BufRef)> = self.cross.drain().collect();
-        for (_, cb) in prev_cross {
-            self.free_in_pool(cb.backend, cb.id);
-        }
+        // Cross-backend staging buffers are keyed by `(graph uid, node, backend)` and
+        // survive both a rebuild and a re-map (E4 S3): their size follows the shape of the
+        // node in *that* graph, so an entry is only valid for its own graph, and re-creating
+        // them per switch would leak (staging is `alloc_fresh`, which by design never recycles
+        // from the free list). Entries of evicted graphs stay allocated — a handful of
+        // boundary-sized buffers, bounded by the cache's graph count.
 
         // The scheduler executes nodes in BUILD order (node id order — the
         // builder appends sources before consumers), so liveness must use the
@@ -608,8 +636,10 @@ impl GraphAllocator {
             }
         }
         let before = self.pool_len_of(backend);
+        let class = allocplan::class_size(size);
         let id = self.alloc_class_in_pool(backend, size)?;
         self.buf_bytes.insert((backend, id), want);
+        self.buf_class.insert((backend, id), class);
         // E4 S2: `pool_bytes` is what the pool **holds**, not the sum of the requests it
         // served. A recycled class buffer is already resident, so charging it again would
         // make the report grow on every rebuild even though the pool did not — and the
@@ -654,7 +684,17 @@ impl GraphAllocator {
     /// exactly by `ensure_kv`, because a cell's width is a layout contract (`row_elems`),
     /// not a tuning knob.
     fn alloc_class_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
-        Ok(self.alloc_exact_in_pool(backend, allocplan::class_size(size)))
+        let class = allocplan::class_size(size);
+        // E4 S3 — assign: an idle buffer of this class from the reservation table. Only a
+        // class with nothing idle asks the backend for a new buffer (reserve).
+        if let Some(id) = self
+            .slots
+            .get_mut(&(backend, class))
+            .and_then(|idle| idle.pop_first())
+        {
+            return Ok(id);
+        }
+        Ok(self.alloc_exact_in_pool(backend, class))
     }
 
     /// Bytes one backend's registered weights occupy (0 for a backend that does not
@@ -708,12 +748,22 @@ impl GraphAllocator {
     /// E4's accounting for one backend: what is resident, what is live, the peak, and the
     /// budget the allocator checks against.
     pub fn memory_report(&self, backend: Backend) -> MemoryReport {
+        let (mut idle_slots, mut reserved_classes) = (0usize, 0usize);
+        for ((b, _), ids) in &self.slots {
+            if *b != backend || ids.is_empty() {
+                continue;
+            }
+            idle_slots += ids.len();
+            reserved_classes += 1;
+        }
         MemoryReport {
             weights_bytes: self.weights_bytes(backend),
             pool_bytes: self.pool_bytes.get(&backend).copied().unwrap_or(0),
             live_bytes: self.live_bytes.get(&backend).copied().unwrap_or(0),
             peak_live_bytes: self.peak_bytes.get(&backend).copied().unwrap_or(0),
             budget: self.memory_budget(backend),
+            idle_slots,
+            reserved_classes,
         }
     }
 
@@ -770,6 +820,14 @@ impl GraphAllocator {
         if let Some(bytes) = self.buf_bytes.remove(&(backend, id)) {
             let live = self.live_bytes.entry(backend).or_insert(0);
             *live = live.saturating_sub(bytes);
+        }
+        // E4 S3 — reserve: a **classed** buffer goes back to the reservation table, not to
+        // the backend. It keeps its bytes (the pool never returns memory anyway) and the next
+        // graph needing that class is assigned this exact id, so a rebuild re-maps instead of
+        // freeing and re-allocating. Staging buffers (exact, no class) keep the old path.
+        if let Some(class) = self.buf_class.remove(&(backend, id)) {
+            self.slots.entry((backend, class)).or_default().insert(id);
+            return;
         }
         match backend {
             Backend::CPU => self.cpu.free_buffer(id),
@@ -2175,6 +2233,13 @@ impl GraphAllocator {
         self.cpu.pool_len()
     }
 
+    /// E4 S3: how many pool buffers the CPU backend has created (a re-map creates none).
+    /// (Test helper.)
+    #[allow(dead_code)]
+    pub fn n_cpu_allocs(&self) -> usize {
+        self.cpu.alloc_count()
+    }
+
     /// Number of distinct buffers actually mapped to nodes (for tests).
     #[allow(dead_code)]
     pub fn n_mapped_buffers(&self) -> usize {
@@ -2219,7 +2284,12 @@ impl GraphAllocator {
     /// re-executable: the producing split always finds its buffer where the
     /// allocator put it, and the staging buffer (allocated once per graph
     /// rebuild) is simply rewritten on each execute.
-    pub fn copy_across(&mut self, node_id: NodeId, dst_backend: Backend) -> Result<(), String> {
+    pub fn copy_across(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        dst_backend: Backend,
+    ) -> Result<(), String> {
         let br = self
             .node_buffer(node_id)
             .ok_or_else(|| format!("node {node_id} has no buffer"))?;
@@ -2234,9 +2304,14 @@ impl GraphAllocator {
         // different foreign backends needs two buffers — the old single-entry
         // map forced the consumer-side filter in the scheduler, which `None`
         // here now expresses structurally.
-        let dst_id = match self.cross.get(&(node_id, dst_backend)) {
-            Some(&cb) => cb.id,
-            None => {
+        let dst_id = match self.cross.get(&(uid, node_id, dst_backend)) {
+            // The size is part of the entry's identity (a graph's shapes never change under
+            // one uid, so this is a backstop, not a hot path).
+            Some(&cb) if cb.len == data.len() => cb.id,
+            Some(&cb) => {
+                let stale = cb;
+                self.cross.remove(&(uid, node_id, dst_backend));
+                self.free_in_pool(stale.backend, stale.id);
                 let id = self.alloc_fresh_in(dst_backend, data.len());
                 // Staging is exact (it is not an activation, so the class ladder does not
                 // apply), but it is still pool memory the budget must see: charge it as
@@ -2249,7 +2324,22 @@ impl GraphAllocator {
                 let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
                 *peak = (*peak).max(*live);
                 self.cross.insert(
-                    (node_id, dst_backend),
+                    (uid, node_id, dst_backend),
+                    BufRef::own(dst_backend, id, data.len()),
+                );
+                id
+            }
+            None => {
+                let id = self.alloc_fresh_in(dst_backend, data.len());
+                let bytes = data.len() * 4;
+                self.buf_bytes.insert((dst_backend, id), bytes);
+                *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;
+                let live = self.live_bytes.entry(dst_backend).or_insert(0);
+                *live += bytes;
+                let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
+                *peak = (*peak).max(*live);
+                self.cross.insert(
+                    (uid, node_id, dst_backend),
                     BufRef::own(dst_backend, id, data.len()),
                 );
                 id
@@ -2343,8 +2433,8 @@ impl GraphAllocator {
     /// The staging buffer a consumer on `backend` must read for `node_id`, if a
     /// split boundary copied it for the current graph. Consumers on the node's
     /// own backend read the canonical buffer instead.
-    pub fn cross_buffer(&self, node_id: NodeId, backend: Backend) -> Option<BufRef> {
-        self.cross.get(&(node_id, backend)).copied()
+    pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
+        self.cross.get(&(uid, node_id, backend)).copied()
     }
 
     /// Test hook: stage `node_id`'s output on `backend` as if a split boundary
@@ -2353,13 +2443,14 @@ impl GraphAllocator {
     #[cfg(test)]
     pub fn stage_cross_for_test(
         &mut self,
+        uid: u64,
         node_id: NodeId,
         backend: Backend,
         id: usize,
         len: usize,
     ) {
         self.cross
-            .insert((node_id, backend), BufRef::own(backend, id, len));
+            .insert((uid, node_id, backend), BufRef::own(backend, id, len));
     }
 }
 
@@ -3240,16 +3331,22 @@ mod tests {
     #[test]
     fn staging_is_keyed_by_destination_backend() {
         let mut alloc = GraphAllocator::new();
-        alloc.stage_cross_for_test(7, Backend::CPU, 3, 4);
-        assert_eq!(alloc.cross_buffer(7, Backend::CPU).map(|b| b.id), Some(3));
+        alloc.stage_cross_for_test(1, 7, Backend::CPU, 3, 4);
+        assert_eq!(
+            alloc.cross_buffer(1, 7, Backend::CPU).map(|b| b.id),
+            Some(3)
+        );
         assert!(
-            alloc.cross_buffer(7, Backend::Cuda).is_none(),
+            alloc.cross_buffer(1, 7, Backend::Cuda).is_none(),
             "a CPU staging buffer must not be offered to a CUDA consumer"
         );
-        alloc.stage_cross_for_test(7, Backend::Cuda, 4, 4);
-        assert_eq!(alloc.cross_buffer(7, Backend::Cuda).map(|b| b.id), Some(4));
+        alloc.stage_cross_for_test(1, 7, Backend::Cuda, 4, 4);
         assert_eq!(
-            alloc.cross_buffer(7, Backend::CPU).map(|b| b.id),
+            alloc.cross_buffer(1, 7, Backend::Cuda).map(|b| b.id),
+            Some(4)
+        );
+        assert_eq!(
+            alloc.cross_buffer(1, 7, Backend::CPU).map(|b| b.id),
             Some(3),
             "staging for a second backend must not clobber the first"
         );
@@ -3617,6 +3714,144 @@ mod tests {
                 .unwrap_err();
             assert!(!err.contains("offload plan"), "{plan:?}: {err}");
         }
+    }
+
+    /// E4 S3's acceptance: a rebuild **re-maps**. The reservation table hands the same
+    /// class-sized buffers back, so the pool creates nothing (`CpuBackend::alloc_count`, the
+    /// CPU twin of CUDA's `pool_gen`) and the node → slot mapping is identical — the
+    /// "reserve, then assign" split, observable.
+    #[test]
+    fn a_rebuild_remaps_instead_of_reallocating() {
+        /// The buffers a graph's nodes were assigned, by node id: `(backend, pool id)` —
+        /// deliberately not the lengths, which differ between two shapes in a class.
+        fn slots(
+            alloc: &GraphAllocator,
+            g: &ComputeGraph,
+        ) -> Vec<(NodeId, Option<(Backend, usize)>)> {
+            (0..g.n_nodes())
+                .map(|i| (i, alloc.node_buffer(i).map(|b| (b.backend, b.id))))
+                .collect()
+        }
+        let graph = |rows: usize| {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [896, rows, 1, 1], crate::graph::DType::F32);
+            let w = b.input("w", [896, rows, 1, 1], crate::graph::DType::F32);
+            let t = b.add(x, w);
+            let y = b.silu(t); // in-place: stays in `t`'s slot
+            b.output(y);
+            b.build()
+        };
+
+        let mut alloc = GraphAllocator::new();
+        let g = graph(16);
+        alloc.alloc_graph(&g).unwrap();
+        let first = slots(&alloc, &g);
+        let (allocs, buffers) = (alloc.n_cpu_allocs(), alloc.n_cpu_buffers());
+        assert!(allocs > 0 && buffers > 0, "the first build does allocate");
+
+        // The same graph, and a neighbour **in the same class** (896 x 17 = 15232 rounds to
+        // the same 16384-element class as 896 x 16 = 14336): both re-map onto the reservation.
+        for rows in [16, 17] {
+            let g = graph(rows);
+            alloc.alloc_graph(&g).unwrap();
+            assert_eq!(
+                alloc.n_cpu_allocs(),
+                allocs,
+                "a re-map must not create a pool buffer (rows = {rows})"
+            );
+            assert_eq!(alloc.n_cpu_buffers(), buffers);
+            assert_eq!(
+                slots(&alloc, &g),
+                first,
+                "the same topology gets the same slots (rows = {rows})"
+            );
+        }
+
+        // A shape that leaves the class reserves a new buffer — the table is not a no-op.
+        alloc.alloc_graph(&graph(64)).unwrap();
+        assert!(alloc.n_cpu_allocs() > allocs, "a bigger class must reserve");
+        assert!(alloc.n_cpu_buffers() > buffers);
+    }
+
+    /// E4 S3: the **reservation** is visible — a released classed buffer stays in the pool and
+    /// goes to the idle list, so `live_bytes` drops back while `pool_bytes` does not, and the
+    /// idle slot is what the next graph is assigned.
+    #[test]
+    fn a_released_buffer_stays_reserved_and_idle() {
+        let mut alloc = GraphAllocator::new();
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [256, 1, 1, 1], crate::graph::DType::F32);
+        let y = b.silu(x);
+        b.output(y);
+        let g = b.build();
+        alloc.alloc_graph(&g).unwrap();
+        let built = alloc.memory_report(Backend::CPU);
+        assert!(built.pool_bytes > 0 && built.live_bytes > 0);
+        // Rebuilding the same graph frees every classed buffer at the start and re-assigns
+        // them, so at the end the reservation and the live set are exactly what they were.
+        alloc.alloc_graph(&g).unwrap();
+        let again = alloc.memory_report(Backend::CPU);
+        assert_eq!(again.pool_bytes, built.pool_bytes);
+        assert_eq!(again.live_bytes, built.live_bytes);
+        assert_eq!(again.idle_slots, built.idle_slots);
+    }
+
+    /// E4 S3, CUDA half: a rebuild must not touch the device pool at all. `pool_gen` is the
+    /// generation counter CUDA invalidates its captured graphs on, so "the plan is untouched"
+    /// is exactly "the capture survives a rebuild".
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_rebuild_does_not_touch_the_device_pool() {
+        crate::cuda::CudaState::init();
+        if crate::cuda::CudaState::get().is_none() {
+            eprintln!("no CUDA device; skipping the E4 S3 device gate");
+            return;
+        }
+        let mut alloc = GraphAllocator::new();
+        assert!(alloc.enable_cuda());
+        let graph = |rows: usize| {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [512, rows, 1, 1], crate::graph::DType::F32);
+            let y = b.silu(x);
+            let z = b.add(y, x);
+            b.output(z);
+            let mut g = b.build();
+            // The device pool is what this gate is about: every node on CUDA.
+            for n in g.nodes.iter_mut() {
+                n.backend = Some(Backend::Cuda);
+            }
+            g
+        };
+        let g = graph(4);
+        alloc.alloc_graph(&g).unwrap();
+        let gen = alloc.cuda().unwrap().pool_gen();
+        let mapping: Vec<_> = (0..g.n_nodes())
+            .map(|i| alloc.node_buffer(i).map(|b| (b.backend, b.id)))
+            .collect();
+        // Same shape: no device traffic.
+        alloc.alloc_graph(&g).unwrap();
+        assert_eq!(
+            alloc.cuda().unwrap().pool_gen(),
+            gen,
+            "a same-shape rebuild must not allocate or free on the device"
+        );
+        // Same class, different shape: still no device traffic. (512 x 4 = 2048 and
+        // 512 x 3 = 1536 both round to the 2048-element class — asserted, so the case cannot
+        // silently stop being the one it claims to test.)
+        assert_eq!(
+            crate::graph::allocplan::class_size(512 * 4),
+            crate::graph::allocplan::class_size(512 * 3)
+        );
+        alloc.alloc_graph(&graph(3)).unwrap();
+        assert_eq!(
+            alloc.cuda().unwrap().pool_gen(),
+            gen,
+            "a shape in the same class re-maps onto the reserved device buffer"
+        );
+        let same: Vec<_> = (0..g.n_nodes())
+            .map(|i| alloc.node_buffer(i).map(|b| (b.backend, b.id)))
+            .collect();
+        assert_eq!(same, mapping, "and onto the same slots");
     }
 
     /// The tiny f32 tensor the accounting tests register (`Tensor` carries raw bytes).

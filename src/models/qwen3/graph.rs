@@ -502,7 +502,10 @@ impl Qwen3Graph {
             weights_version: 1,
         };
 
-        if !cache.try_reuse(&params) {
+        if !cache
+            .try_reuse(&params)
+            .expect("re-map onto a cached graph")
+        {
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
             {
