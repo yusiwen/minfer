@@ -1747,6 +1747,29 @@ impl CudaState {
         self.weights.lock().unwrap().contains_key(name)
     }
 
+    /// Bytes of device-resident weights this state holds (E4: the feasibility gate
+    /// charges the budget for them, so "weights + activations" is one comparison).
+    /// Sums the registry; the padded-plane companions are accounted by their own
+    /// registers and are deliberately not double-counted here.
+    pub fn weights_bytes(&self) -> usize {
+        self.weights
+            .lock()
+            .map(|w| w.values().map(|(_, size)| *size).sum())
+            .unwrap_or(0)
+    }
+
+    /// Device memory free/total in bytes, queried now (E4's default budget uses `free`).
+    pub fn device_memory(&self) -> (usize, usize) {
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        (free, total)
+    }
+
+    /// Free device bytes — the default budget is three quarters of this.
+    pub fn device_free_bytes(&self) -> usize {
+        self.device_memory().0
+    }
+
     pub fn register_weight(&self, name: &str, data: &[u8]) {
         if data.is_empty() {
             return;

@@ -23,6 +23,8 @@ pub fn backend_takes(b: &dyn backend::Backend, op: &ops::Op, dtype: DType) -> bo
     ) || b.supports_attn_span();
     span_ok && b.supports_op(op, dtype)
 }
+/// Size classes, the allocation plan and memory accounting (E4).
+pub mod allocplan;
 pub mod builder;
 pub mod cache;
 pub mod cpu_backend;

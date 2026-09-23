@@ -141,6 +141,12 @@ impl Backend for CpuBackend {
         true
     }
 
+    /// Bytes of registered weights (E4: the feasibility gate charges the budget for
+    /// them, so "weights + activations" is one comparison).
+    fn weights_bytes(&self) -> usize {
+        self.weights.values().map(|t| t.data.len()).sum()
+    }
+
     fn alloc_buffer(&mut self, size: usize) -> usize {
         if let Some(idx) = self
             .free
@@ -614,7 +620,7 @@ impl Backend for CpuBackend {
                 data.len()
             ));
         }
-        b.copy_from_slice(data);
+        b[..data.len()].copy_from_slice(data);
         Ok(())
     }
 

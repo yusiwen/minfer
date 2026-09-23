@@ -40,6 +40,13 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Bytes this backend's registered weights occupy (E4's feasibility gate counts
+    /// them against the budget). Defaults to 0: a backend that does not track its
+    /// weights is not charged for them.
+    fn weights_bytes(&self) -> usize {
+        0
+    }
+
     /// Buffer pool: allocate / release a buffer of `size` f32 elements.
     fn alloc_buffer(&mut self, size: usize) -> usize;
     fn free_buffer(&mut self, id: usize);
