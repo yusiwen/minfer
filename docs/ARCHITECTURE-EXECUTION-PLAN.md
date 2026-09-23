@@ -12,7 +12,7 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**5/7** (E1, E1b, E2, **E3**, E6 done; E4 S1+S2 and **E5 S1** landed, both tickets still open on their remaining increments); Phase F **0/8** (F1 needs x86); Phase G
+**6/7** (E1, E1b, E2, **E3**, **E4**, E6 done; **E5 S1** landed, that ticket open on its remaining increment); Phase F **0/8** (F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
 check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
@@ -1981,9 +1981,72 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
-| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **S1 done (2026-09-22: the accounting, the size-class ladder and the feasibility gate); S2 done (2026-09-23: the pools allocate at the class, the length contract moved to `BufRef`, two latent liveness bugs fixed); the reserve/assign re-map and the multi-graph cache open** | L |
+| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **DONE (2026-09-23)**: S1 the accounting + the size-class ladder + the feasibility gate; S2 the pools allocate at the class, the length contract moved to `BufRef`, two latent liveness bugs fixed; S3 split reservation (the slot table) from assignment — a rebuild re-maps without touching the pool, CUDA's `pool_gen` stops moving, and `GraphCache` holds one graph per `GraphParams` (a switch re-maps instead of rebuilding) | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) — **S1 done (2026-09-23: a layer-granular plan, `--gpu-layers`/`MINFER_GPU_LAYERS`, per-block weight registration and placement, the startup report, verified mixed CPU+CUDA run); the automatic fit from the memory accounting open** | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E4 record, S3 (2026-09-23) — split reservation from assignment, then hold several graphs
+
+**Why.** S1 and S2 left the ticket's two structural items. The allocator's walk **freed** the
+previous graph's buffers and re-allocated them, so even a same-shape rebuild went through the
+backend's pool — and CUDA's `pool_gen`, which moves on every allocate/free, is exactly what
+invalidates its captured graphs (`graph_replay_step` re-captures when the generation changed).
+Separately, `GraphCache` held **one** graph, so a server alternating a 1-wide and an N-wide
+decode step rebuilt on every step, and a chunked prefill paid E3's measured "one forward's fixed
+overhead per chunk" again on every repeat request.
+
+**What S3 landed.**
+
+- **Reserve, then assign.** A released *classed* buffer no longer goes back to the backend: it
+  goes to a reservation table (`slots: HashMap<(Backend, class-elements), BTreeSet<pool-id>>`),
+  and `alloc_class_in_pool` takes the **smallest idle id** of the class, allocating a new buffer
+  only when the class has nothing idle. `buf_class` marks which allocations are classed; staging
+  (exact-sized) keeps the backend's own free list. A rebuild therefore re-maps: the pool is not
+  touched, and the same topology gets the same slots. The smallest-id-first order is
+  load-bearing and deterministic — liveness releases buffers in `HashMap` order, so the first
+  (LIFO) version handed a rebuilt graph *different* ids each time, which the gate caught
+  immediately (`left: [(0, 2), (1, 1), (2, 0)] / right: [(0, 0), (1, 1), (2, 2)]`).
+- **`GraphCache` holds one graph per `GraphParams`** (MRU first, `MAX_CACHED_GRAPHS = 8`).
+  `try_reuse` matches **any** cached graph, makes it current and re-maps the allocator onto it
+  (`alloc_graph`: liveness + slot assignment) — no build, no assign pass, no fusion pass.
+  `stats()` reports `(builds, reuses)` for the gate; `cached_graphs()` is the depth.
+- **Cross-backend staging is per graph**: the map is keyed by `(graph uid, node, backend)` and
+  survives a re-map. Node ids restart per graph, so the old `(node, backend)` key would have let
+  a switch reuse another graph's buffer; and re-creating the entries per switch leaked, because
+  staging is `alloc_fresh` (never recycled) — the CUDA suite found it as `CUDA: OOM allocating 4
+  bytes` after ~200 generate steps in the capture-parity gate. Entries of evicted graphs stay
+  allocated (a handful of boundary-sized buffers, bounded by the cache's depth).
+- The reservation is visible: `MemoryReport::{idle_slots, reserved_classes}`, and
+  `CpuBackend::alloc_count` is the CPU twin of CUDA's `pool_gen`.
+
+**Acceptance, as measured.**
+
+- `a_rebuild_remaps_instead_of_reallocating` (CPU): the same graph **and** a neighbour in the
+  same class (896x16 / 896x17, both class 16384) re-map — `n_cpu_allocs` and `n_cpu_buffers`
+  unchanged, the node → slot mapping identical; a shape that leaves the class does reserve.
+- `a_released_buffer_stays_reserved_and_idle`: `pool_bytes`, `live_bytes` and `idle_slots` are
+  exactly what they were after a rebuild, and the reservation reports at least one class.
+- `a_rebuild_does_not_touch_the_device_pool` (CUDA, GB10): `pool_gen` is unchanged across a
+  same-shape rebuild **and** across a same-class different shape, and the mapping is identical —
+  i.e. a captured graph survives a rebuild.
+- `switching_between_cached_graphs_re_maps_instead_of_rebuilding` (CPU): two shapes built, four
+  switches, `stats() == (2, 4)`, zero pool allocations during the switches, and each graph maps
+  to the same slots every time it is switched in.
+- `a_repeated_chunked_prefill_stops_rebuilding` (real 0.5B, ignored): request 1 → **3 builds /
+  5 reuses**; request 2 (same prompt, same chunk size) → **3 / 9**, i.e. the second request
+  builds nothing. Before S3 each chunk forward of the second request was a fresh build.
+- **Mutation-checked**: returning classed buffers to the backend instead of the reservation
+  fails the re-map gate; making `try_reuse` match only the previous graph fails the switch gate.
+- Suites: CPU **276 passed / 0 failed / 14 ignored**; CUDA (GB10, serial) **329 / 0 / 15**; the
+  `#[ignore]`d set serially **14 passed / 0 failed**.
+
+**Honest scope.** The reservation is per *allocator* (per `GraphCache`), not per process: two
+caches (two models, or the spec-decode pair) each hold their own slots, exactly as they always
+held their own pools. Staging entries of an evicted graph are not reclaimed (`cross` is a
+`HashMap` the allocator does not prune against the cache); the cost is a few boundary-sized
+buffers per evicted graph, and a prune keyed on the live uids is the obvious follow-up if the
+cache ever grows past a handful of graphs. Metal shares the code path but was compile-checked
+only (`build-macos`).
 
 #### E5 record, S1 (2026-09-23) — a layer-granular offload plan
 
@@ -3071,7 +3134,7 @@ and both dtypes.
 Earlier text (kept for the record of how the diagnosis narrowed): a focused device test of the **windowed** instantiation with a *long* window at a non-zero start (34-64 rows) against the causal instantiation over the same rows — that should pin the exact kernel variant (the split/rows-per-warp bodies and the `_bt` variants are the candidates) and give a minimal reproduction, then the fix. The engine test as it stands is the end-to-end reproduction and now renders the server's prompt, so it fails the moment the bug is present and passes when it is fixed. Note also that this *corrects* the earlier "server-only, engine is fine" conclusion: that comparison used 5-token prompts on the engine side and 34-token ones on the server side. **Impact: E6 made batching the default on CUDA, so this is the default behaviour on a GPU server today**; E2's "GPU acceptance 1.9x" measurement inspected only request 0's text, so its *timing* stands but its *correctness* was never checked per request — that record is corrected here. **Immediate mitigation: moot, and it would not have worked.** Reverting E6's CUDA default (back to opt-in) was proposed while the cause was unknown; the f16 prefill fault lives in the *per-slot prefill*, which non-batched serving also performs (slots 1..n start at a non-zero KV cell), so `MINFER_BATCH=0` was affected too — it merely produced plausible-looking text instead of derailed text. The default is left on and is correct as of the fix recorded below. |
 | 1 | **CI has no GPU.** The CUDA job only compiles the harness, so every device-gated test is a local, manual run — which is exactly how six device-only test bugs survived to 2026-09-18. | process | A **self-hosted runner on this DGX Spark** would put `cargo test --features cuda` into CI; nothing else does. Until then, anyone changing CUDA code must run it by hand and say so. |
 | 2 | **The windowed instantiation's cost at equal width is unmeasured** (`cuda_causal_and_windowed_agree_on_the_same_rows` proves equality, not speed). | measurement | E1b record; needs a device A/B over identical rows at one width. |
-| 3 | **A varying batch width rebuilds the graph** (`GraphCache` holds one graph at a time), so a server alternating 1-wide and N-wide decode steps re-allocates. | design | **E4** (allocator reserve/assign + multi-graph cache). |
+| 3 | **A varying batch width rebuilds the graph** (`GraphCache` holds one graph at a time), so a server alternating 1-wide and N-wide decode steps re-allocates. | design | **DONE (E4 S3, 2026-09-23)**: the cache holds one graph per `GraphParams` and a switch re-maps the allocator onto it (liveness + slots, no build); a repeated chunked prefill builds nothing the second time (`a_repeated_chunked_prefill_stops_rebuilding`: 3 builds/5 reuses, then 3/9). |
 | 4 | **The op matrix's support table does not parse `SUPPORT-MATRIX.md`** — it checks a Rust mirror, so a stale doc row stays green (it did, for `multi_seq`). | test hardening | A1/A8; recorded in the A1 record. |
 | 5 | ~~**Batching is opt-in** even where it is measured faster.~~ **Closed by E6 (2026-09-19)**: the default follows the device (CUDA on, CPU/Metal off), with `=1`/`=0` as the override. | product | done |
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
