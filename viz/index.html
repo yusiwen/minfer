@@ -4,7 +4,22 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>minfer · Inference Graph Demo</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=2">
+<!-- Asset versions: bump `?v=` on the file you changed. A fresh page must never
+     pair with a stale stylesheet or script from a caching static server. -->
+<style>
+  /* The toolbar jump to the other view is inlined on purpose: it must look right
+     even when the browser still holds a stale style.css (that happened), and the
+     rule is three lines. Keep the two copies of this block in sync:
+     viz/index.html and viz/e2e.html. */
+  a.nav-btn {
+    display: inline-block; background: #273449; color: #e2e8f0;
+    border: 1px solid #334155; border-radius: 5px; padding: 4px 8px;
+    font-size: 12px; text-decoration: none; cursor: pointer; white-space: nowrap;
+  }
+  a.nav-btn:hover { border-color: #38bdf8; }
+</style>
+
 </head>
 <body>
 <header id="toolbar">
@@ -42,6 +57,7 @@
       <button id="view-flow" class="view-btn" title="Semantic reasoning pipeline — one box = one stage (norm / attention / FFN / logits)">Pipeline</button>
     </div>
     <button id="btn-live" class="live-btn" title="Connect to a minfer server to watch live inference">Live</button>
+    <a id="btn-shape-flow" class="nav-btn" href="e2e.html" title="End-to-end shape flow — one animated pass from the prompt to the next token, showing how the tensor shape changes at every node">Shape flow →</a>
   </div>
 </header>
 
@@ -111,6 +127,6 @@
   <button id="btn-legend" title="Operator legend">Legend</button>
 </div>
 
-<script src="app.js"></script>
+<script src="app.js?v=2"></script>
 </body>
 </html>

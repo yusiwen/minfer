@@ -39,6 +39,11 @@ use super::AppState;
 const INDEX_HTML: &str = include_str!("../../viz/index.html");
 const STYLE_CSS: &str = include_str!("../../viz/style.css");
 const APP_JS: &str = include_str!("../../viz/app.js");
+// The end-to-end shape-flow view (viz/e2e.html) and its data layer.
+const E2E_HTML: &str = include_str!("../../viz/e2e.html");
+const E2E_CSS: &str = include_str!("../../viz/e2e.css");
+const E2E_MODEL_JS: &str = include_str!("../../viz/e2e-model.js");
+const E2E_JS: &str = include_str!("../../viz/e2e.js");
 
 pub struct VizState {
     pub app: Arc<AppState>,
@@ -153,6 +158,10 @@ fn viz_router(state: Arc<VizState>) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/style.css", get(style_asset))
         .route("/app.js", get(app_asset))
+        .route("/e2e.html", get(e2e_page))
+        .route("/e2e.css", get(e2e_style_asset))
+        .route("/e2e-model.js", get(e2e_model_asset))
+        .route("/e2e.js", get(e2e_app_asset))
         .route("/samples/:name", get(sample_asset))
         .route("/viz/graph", get(viz_graph))
         .route("/viz/events", get(viz_events))
@@ -166,12 +175,35 @@ async fn page() -> Response {
     html(INDEX_HTML.to_string())
 }
 async fn style_asset() -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "text/css")], STYLE_CSS).into_response()
+    asset("text/css", STYLE_CSS)
 }
 async fn app_asset() -> Response {
+    asset("application/javascript", APP_JS)
+}
+async fn e2e_page() -> Response {
+    html(E2E_HTML.to_string())
+}
+async fn e2e_style_asset() -> Response {
+    asset("text/css", E2E_CSS)
+}
+async fn e2e_model_asset() -> Response {
+    asset("application/javascript", E2E_MODEL_JS)
+}
+async fn e2e_app_asset() -> Response {
+    asset("application/javascript", E2E_JS)
+}
+
+/// Serve one embedded asset. These are a development surface that is edited in
+/// place, so they are `no-store`: a cached script beside a fresh page is how the
+/// "Shape flow" jump silently stopped working (the listener lived in the stale
+/// script). Samples stay cacheable -- they are data, not code.
+fn asset(content_type: &'static str, body: &'static str) -> Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-        APP_JS,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
     )
         .into_response()
 }
@@ -186,7 +218,10 @@ async fn favicon() -> Response {
 
 fn html(body: String) -> Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         body,
     )
         .into_response()

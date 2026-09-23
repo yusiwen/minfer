@@ -1754,6 +1754,9 @@ function init() {
   document.getElementById("legend-close").addEventListener("click", () => legendPop.classList.remove("show"));
   buildLegend();
 
+  // The "Shape flow" jump is a plain <a class="nav-btn"> in index.html on
+  // purpose: it must not depend on this script, and it needs no listener.
+
   // 直播（P3）
   const livePanel = document.getElementById("live-panel");
   document.getElementById("btn-live").addEventListener("click", () => {
