@@ -573,7 +573,10 @@ impl Qwen2Graph {
             weights_version: 1,
         };
 
-        if !cache.try_reuse(&params) {
+        if !cache
+            .try_reuse(&params)
+            .expect("re-map onto a cached graph")
+        {
             let rebuild_t0 = std::time::Instant::now();
             let trace_rb = std::env::var("MINFER_REBUILD_TRACE").map_or(false, |v| v == "1");
             let mut graph = Self::build(model, &params);

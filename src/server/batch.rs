@@ -2005,6 +2005,59 @@ mod tests {
         }
     }
 
+    /// E4 S3 acceptance on the real path: a **repeated** request with the same chunk pattern
+    /// stops rebuilding. The engine's `GraphCache` now keeps one graph per `GraphParams`, so
+    /// the second request's prefill chunks (same sizes) hit it — before S3 each chunk was a
+    /// fresh build, which is the "one forward's fixed overhead per chunk" the E3 record
+    /// measured. The observable is the cache's own (builds, reuses).
+    #[test]
+    #[ignore = "requires the cached 0.5B model"]
+    fn a_repeated_chunked_prefill_stops_rebuilding() {
+        let Some(path) = cached_model() else {
+            eprintln!("0.5B q4_0 not cached; skipping the E4 S3 rebuild gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode(&"buffalo ".repeat(96));
+        let chunk = (ids.len() / 4).max(8);
+        let n_ctx = ids.len() + 64;
+
+        let mut engine = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
+        engine.set_prefill_chunk(chunk);
+        let mut submit_once = |engine: &mut BatchEngine| {
+            let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+            engine
+                .submit(
+                    &*model,
+                    &tok,
+                    Job {
+                        input_ids: ids.clone(),
+                        params: sampling_params(4),
+                        tx,
+                    },
+                )
+                .expect("submit");
+            while engine.busy() {
+                engine.tick(&*model, &tok).expect("tick");
+            }
+            while rx.try_recv().is_ok() {}
+        };
+
+        submit_once(&mut engine);
+        let (b1, r1) = engine.cache.stats();
+        assert!(b1 > 0, "the first request built its chunk graphs");
+        submit_once(&mut engine);
+        let (b2, r2) = engine.cache.stats();
+        eprintln!("[e4-s3] request 1: {b1} builds / {r1} reuses; request 2: {b2} / {r2}");
+        assert_eq!(
+            b2, b1,
+            "the second request must build nothing: its chunk shapes are cached"
+        );
+        assert!(r2 > r1, "and it must hit the cache instead");
+    }
+
     /// E3 acceptance: while a long prompt prefills, the slots already serving keep
     /// taking their decode steps.
     ///
