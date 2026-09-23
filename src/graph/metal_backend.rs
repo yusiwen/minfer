@@ -325,6 +325,10 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
     fn alloc_fresh(&mut self, size: usize) -> usize {
         // never recycled from the free list (see Backend::alloc_fresh)
         self.pool.push(self.state.new_f32_buffer(size));
@@ -1065,10 +1069,30 @@ impl Backend for MetalBackend {
                 data.len()
             ));
         }
+        self.write_host_window(id, 0, data)
+    }
+
+    /// E4 S2: a pooled activation buffer is rounded to its size class, so a node
+    /// writes its logical window into a buffer that may be longer.
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String> {
+        let buf = self.pool.get(id).ok_or_else(|| format!("no buffer {id}"))?;
+        let len = (buf.length() as usize) / 4;
+        let end = offset.checked_add(data.len()).ok_or_else(|| {
+            format!(
+                "buffer {id}: offset {offset} + {} elements overflows",
+                data.len()
+            )
+        })?;
+        if end > len {
+            return Err(format!(
+                "buffer {id}: writing {} elements at offset {offset} runs past the {len}-element pool buffer",
+                data.len()
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                buf.contents().as_ptr() as *mut f32,
+                (buf.contents().as_ptr() as *mut f32).add(offset),
                 data.len(),
             );
         }

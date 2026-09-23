@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::allocplan::{self, AllocPlan};
+use super::allocplan;
 use super::backend::Backend as BackendTrait;
 use super::backend::KvProvider;
 use super::cpu_backend::CpuBackend;
@@ -103,18 +103,34 @@ impl Default for GraphAllocator {
 /// D1: extend a node's liveness past `to`, walking its `view_src` ancestors —
 /// a view shares its parent's buffer, so the parent must not be recycled while
 /// the view (or anything aliasing it) is still read.
-fn extend_through_views(graph: &ComputeGraph, last_use: &mut [usize], from: NodeId, to: usize) {
+///
+/// Returns the nodes whose liveness actually grew (in walk order, the node
+/// first), so the caller can keep the pool's own deadline in step: `buf_alive`
+/// is set from `last_use` when a buffer is allocated, and a later extension that
+/// does not touch it would let `sweep` hand the buffer to another node while the
+/// alias still reads it (E4 S2: rounding makes such a hand-over likely, because
+/// a class match no longer needs an exact size coincidence — the bug was latent
+/// before it).
+fn extend_through_views(
+    graph: &ComputeGraph,
+    last_use: &mut [usize],
+    from: NodeId,
+    to: usize,
+) -> Vec<NodeId> {
+    let mut grown = Vec::new();
     let mut cur = from;
     loop {
         if last_use[cur] >= to {
             break;
         }
         last_use[cur] = to;
+        grown.push(cur);
         match graph.node(cur).view {
             Some(v) => cur = v.src,
             None => break,
         }
     }
+    grown
 }
 
 impl GraphAllocator {
@@ -279,10 +295,32 @@ impl GraphAllocator {
             }
         }
 
+        // E4 S2: every input gets its buffer **before** the walk allocates anything.
+        //
+        // An input is host-filled before execution starts, so it must never take a buffer
+        // that this build's `sweep` releases: the previous owner writes its output during
+        // execution — *after* the fill — and would clobber the input before its consumer
+        // reads it. Placing inputs first is enough, because at this moment the free list
+        // holds only buffers released by the *previous* graph, whose writers have finished.
+        // (Before size classes an input could only reuse an exactly-equal-size buffer, so
+        // the window was narrow; a class match is common, which is how this surfaced.)
+        for node in graph.nodes.iter().filter(|n| n.is_input()) {
+            let id = node.id;
+            let backend = node.backend.unwrap_or(Backend::CPU);
+            let size = node.n_elements();
+            let pid = self.alloc_in_pool(backend, size)?;
+            self.buf_alive.insert((backend, pid), last_use[id]);
+            self.node_to_buf.insert(id, BufRef::own(backend, pid, size));
+        }
+
         for (i, &id) in order.iter().enumerate() {
             self.sweep(i);
             let node = graph.node(id);
             let backend = node.backend.unwrap_or(Backend::CPU);
+            // inputs were placed above, before any sweep could recycle a buffer into them
+            if node.is_input() {
+                continue;
+            }
             // D1: a view allocates nothing. It *is* its parent's buffer, so the
             // parent's liveness must cover it (and every consumer of it) — the
             // two refusals below are loud on purpose: a view this increment
@@ -333,9 +371,18 @@ impl GraphAllocator {
                         v.src
                     ));
                 }
+                // The parent must stay alive through the view's *readers*: the view is
+                // just a window of the parent's buffer, so its bytes are read at the
+                // consumer's step, not at the view's own. Walk from the **parent**: the
+                // walk stops at the first node whose liveness already covers `to`, and
+                // starting from the view (which by definition ends at `to`) made the
+                // whole call a no-op — D1's parent extension never ran (D1/D3, found by
+                // E4 S2, where class rounding turned the stale deadline into a real
+                // hand-over).
                 let lu = last_use[id];
                 self.node_to_buf.insert(id, parent.window(v.offset, window));
-                extend_through_views(graph, &mut last_use, id, lu);
+                let grown = extend_through_views(graph, &mut last_use, v.src, lu);
+                self.extend_buffer_alive(&grown, lu);
                 continue;
             }
             match node.op {
@@ -453,7 +500,8 @@ impl GraphAllocator {
                             // node's consumers — and, if it is itself a view,
                             // so must the buffer it is a window of (D1)
                             let lu = last_use[id];
-                            extend_through_views(graph, &mut last_use, node.src[0], lu);
+                            let grown = extend_through_views(graph, &mut last_use, node.src[0], lu);
+                            self.extend_buffer_alive(&grown, lu);
                         } else {
                             let size = node.n_elements();
                             let pid = self.alloc_in_pool(backend, size)?;
@@ -475,15 +523,31 @@ impl GraphAllocator {
         Ok(())
     }
 
-    /// Ask a pool for a buffer of `size`, after checking the request against the
+    /// Keep the pool's free-list deadline in step with a liveness extension (E4 S2):
+    /// `buf_alive` is set from `last_use` when a buffer is allocated, so a node whose
+    /// life was extended afterwards (an in-place alias or a D1 view sharing its buffer)
+    /// must have its buffer's deadline moved too — otherwise `sweep` recycles a buffer
+    /// another live node still reads. Rounding to size classes makes that match easy
+    /// (any two shapes in a class), which is how the latent bug surfaced.
+    fn extend_buffer_alive(&mut self, grown: &[NodeId], to: usize) {
+        for &n in grown {
+            if let Some(br) = self.node_to_buf.get(&n).copied() {
+                if let Some(al) = self.buf_alive.get_mut(&(br.backend, br.id)) {
+                    *al = (*al).max(to);
+                }
+            }
+        }
+    }
+
+    /// Ask a pool for a buffer of `size` elements, after checking the request against the
     /// backend's memory budget (E4).
     ///
     /// The check is the ticket's safety half: `weights + pooled buffers + this allocation`
     /// is compared against the budget **before** the backend is touched, so a graph that
     /// cannot fit is refused with its numbers instead of surfacing later as a CUDA null
-    /// pointer. The allocation itself is charged at its **size class** — the ladder
-    /// `allocplan::class_size` defines — so the accounting already carries what the pools
-    /// will reserve once they round to classes too.
+    /// pointer. The allocation is charged — and made — at its **size class**, the ladder
+    /// `allocplan::class_size` defines, so the accounting and the pool agree on what was
+    /// reserved and two shapes in one class share one buffer.
     fn alloc_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
         let want = allocplan::class_bytes(allocplan::class_size(size));
         if let Some(budget) = self.memory_budget(backend) {
@@ -499,9 +563,16 @@ impl GraphAllocator {
                 ));
             }
         }
+        let before = self.pool_len_of(backend);
         let id = self.alloc_class_in_pool(backend, size)?;
         self.buf_bytes.insert((backend, id), want);
-        *self.pool_bytes.entry(backend).or_insert(0) += want;
+        // E4 S2: `pool_bytes` is what the pool **holds**, not the sum of the requests it
+        // served. A recycled class buffer is already resident, so charging it again would
+        // make the report grow on every rebuild even though the pool did not — and the
+        // budget gate would refuse graphs that fit.
+        if self.pool_len_of(backend) > before {
+            *self.pool_bytes.entry(backend).or_insert(0) += want;
+        }
         let live = self.live_bytes.entry(backend).or_insert(0);
         *live += want;
         let peak = self.peak_bytes.entry(backend).or_insert(0);
@@ -509,16 +580,37 @@ impl GraphAllocator {
         Ok(id)
     }
 
-    /// The backend dispatch behind [`Self::alloc_in_pool`]. The pool is asked for the
-    /// node's exact size for now; the size class is the **plan's** view of the request and
-    /// what the budget is checked against, so the accounting already carries the ladder's
-    /// cost. Applying the class to the pools themselves (so two shapes in one class share
-    /// a buffer instead of the pool growing once per shape) is the next E4 increment: it
-    /// is the half of the ticket's second acceptance that needs the reserve/assign re-map,
-    /// because every consumer's length contract has to move to the owning `BufRef` at the
-    /// same time.
+    /// Buffers resident in a backend's pool (E4 S2: the "did the pool grow?" probe behind
+    /// the resident-bytes accounting).
+    fn pool_len_of(&self, backend: Backend) -> usize {
+        match backend {
+            Backend::CPU => self.cpu.pool_len(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => self.metal.as_ref().map_or(0, |m| m.pool_len()),
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => 0,
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => self.cuda.as_ref().map_or(0, |c| c.pool_len()),
+            #[cfg(not(feature = "cuda"))]
+            Backend::Cuda => 0,
+        }
+    }
+
+    /// The backend dispatch behind [`Self::alloc_in_pool`]: the pool is asked for the
+    /// node's **size class**, not its exact element count (E4 S2).
+    ///
+    /// That is what makes recycling work: a pool's free list matches buffer lengths
+    /// exactly, so two activation shapes in one class would each grow the pool while the
+    /// other's buffer sat free. Rounded, the second shape finds the first one's buffer and
+    /// the pool stops growing per shape. The node keeps its *logical* length in its
+    /// [`BufRef`] — every consumer reads/writes that window, never the physical length —
+    /// which is why this one line is the whole allocator change.
+    ///
+    /// Persistent regions (the KV arenas) do **not** come through here: they are sized
+    /// exactly by `ensure_kv`, because a cell's width is a layout contract (`row_elems`),
+    /// not a tuning knob.
     fn alloc_class_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
-        Ok(self.alloc_exact_in_pool(backend, size))
+        Ok(self.alloc_exact_in_pool(backend, allocplan::class_size(size)))
     }
 
     /// Bytes one backend's registered weights occupy (0 for a backend that does not
@@ -1726,14 +1818,28 @@ impl GraphAllocator {
         let br = self
             .node_buffer(id)
             .ok_or_else(|| format!("input '{name}' has no buffer (not allocated)"))?;
-        match br.backend {
-            Backend::CPU => self.cpu.write_host(br.id, data),
+        // E4 S2: the length contract lives in the node's `BufRef`. The pool buffer is
+        // rounded up to the node's size class, so an equality check against the physical
+        // length would refuse every correct fill — and a prefix-only check would accept a
+        // wrong-sized one. The logical length is the one number that answers both.
+        if data.len() != br.len {
+            return Err(format!(
+                "input '{name}': {} elements were supplied but the node holds {} (its pool buffer \
+                 is rounded up to the {} element class)",
+                data.len(),
+                br.len,
+                allocplan::class_size(br.len)
+            ));
+        }
+        let (backend, id, offset) = (br.backend, br.id, br.offset);
+        match backend {
+            Backend::CPU => self.cpu.write_host_window(id, offset, data),
             #[cfg(target_os = "macos")]
             Backend::Metal => self
                 .metal
                 .as_mut()
                 .expect("Metal pool not enabled")
-                .write_host(br.id, data),
+                .write_host_window(id, offset, data),
             #[cfg(not(target_os = "macos"))]
             Backend::Metal => Err("Metal unavailable".into()),
             #[cfg(feature = "cuda")]
@@ -1741,19 +1847,25 @@ impl GraphAllocator {
                 .cuda
                 .as_mut()
                 .expect("CUDA pool not enabled")
-                .write_host(br.id, data),
+                .write_host_window(id, offset, data),
             #[cfg(not(feature = "cuda"))]
             Backend::Cuda => Err("CUDA unavailable".into()),
         }
     }
 
     /// Host view of a CPU node's buffer (Metal nodes: use copy_to_cpu).
-    /// (Test helper.)
+    /// (Test helper.) The reference is a **window**: since E4 S2 a pool buffer is
+    /// rounded up to its size class, so the physical slice is longer than the
+    /// node and handing it back whole would leak another allocation's padding
+    /// into every comparison.
     #[allow(dead_code)]
     pub fn get_buffer(&self, _graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
         let br = self.node_buffer(id)?;
         match br.backend {
-            Backend::CPU => self.cpu.read_host(br.id),
+            Backend::CPU => self
+                .cpu
+                .read_host(br.id)?
+                .get(br.offset..br.offset + br.len),
             _ => None,
         }
     }
@@ -2068,6 +2180,16 @@ impl GraphAllocator {
             Some(&cb) => cb.id,
             None => {
                 let id = self.alloc_fresh_in(dst_backend, data.len());
+                // Staging is exact (it is not an activation, so the class ladder does not
+                // apply), but it is still pool memory the budget must see: charge it as
+                // resident and live until the next rebuild frees it (E4 S2).
+                let bytes = data.len() * 4;
+                self.buf_bytes.insert((dst_backend, id), bytes);
+                *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;
+                let live = self.live_bytes.entry(dst_backend).or_insert(0);
+                *live += bytes;
+                let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
+                *peak = (*peak).max(*live);
                 self.cross.insert(
                     (node_id, dst_backend),
                     BufRef::own(dst_backend, id, data.len()),
@@ -3186,6 +3308,165 @@ mod tests {
         assert!(
             report.weights_bytes + report.pool_bytes <= report.budget.unwrap(),
             "{report:?}"
+        );
+    }
+
+    /// E4 S2's second acceptance: pooled activations are rounded up to their size class,
+    /// so a graph whose shapes move **inside** one class recycles the pool's buffers
+    /// instead of reserving one per shape ("no silent growth"). Before this, the free
+    /// list matched lengths exactly and every shape of a rebuild added a buffer.
+    #[test]
+    fn a_rebuild_inside_one_class_reuses_the_pool() {
+        let mut alloc = GraphAllocator::new();
+        let build = |alloc: &mut GraphAllocator, rows: usize| {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [896, rows, 1, 1], crate::graph::DType::F32);
+            let y = b.silu(x);
+            b.output(y);
+            let g = b.build();
+            alloc.alloc_graph(&g).unwrap();
+        };
+        // 896 x 16 = 14336 and 896 x 17 = 15232 both round to the 16384-element class.
+        let a = 896 * 16;
+        let class = allocplan::class_size(a);
+        assert_eq!(allocplan::class_size(896 * 17), class);
+        build(&mut alloc, 16);
+        let first = alloc.memory_report(Backend::CPU);
+        assert_eq!(first.pool_bytes, allocplan::class_bytes(class), "{first:?}");
+        let first_buffers = alloc.n_cpu_buffers();
+
+        build(&mut alloc, 17);
+        let second = alloc.memory_report(Backend::CPU);
+        assert_eq!(
+            second.pool_bytes, first.pool_bytes,
+            "a shape inside the same class must recycle the class buffer, not reserve another"
+        );
+        assert_eq!(
+            alloc.n_cpu_buffers(),
+            first_buffers,
+            "the pool grew for a shape that fits an existing class"
+        );
+
+        // The ladder is not a no-op: a shape that leaves the class does reserve more.
+        build(&mut alloc, 20); // 896 x 20 = 17920 -> the next 16 KiB step
+        assert!(
+            alloc.memory_report(Backend::CPU).pool_bytes > first.pool_bytes,
+            "a bigger class must actually reserve"
+        );
+    }
+
+    /// E4 S2: the length contract moved to the owning `BufRef`, so a fill is checked
+    /// against the node's **logical** length — the pool buffer is rounded up to a class
+    /// and is routinely longer, which makes "equals the physical length" wrong and
+    /// "fits in the physical length" too weak.
+    #[test]
+    fn a_fill_must_match_the_nodes_logical_length() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [3, 1, 1, 1], crate::graph::DType::F32);
+        let y = b.silu(x);
+        b.output(y);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        let report = alloc.memory_report(Backend::CPU);
+        assert_eq!(
+            report.pool_bytes,
+            allocplan::class_bytes(allocplan::class_size(3)),
+            "a 3-element activation still occupies a whole class: {report:?}"
+        );
+
+        alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0]).unwrap();
+        for wrong in [vec![1.0f32, 2.0, 3.0, 4.0], vec![1.0f32, 2.0]] {
+            let err = alloc.fill_input(&g, "x", &wrong).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "{} elements were supplied but the node holds 3",
+                    wrong.len()
+                )),
+                "got: {err}"
+            );
+        }
+        // The refused fills wrote nothing, and the read is the window, not the class.
+        assert_eq!(alloc.get_buffer(&g, x).unwrap(), &[1.0, 2.0, 3.0]);
+    }
+
+    /// E4 S2: an input is host-filled **before** execution, so it must never take a buffer
+    /// that this build's `sweep` released — the previous owner writes that buffer during
+    /// execution, i.e. after the fill, and the input's value is gone by the time its
+    /// consumer reads it. Here `t`'s buffer becomes free before `y` is placed, and `t`
+    /// writes it at step 1.
+    #[test]
+    fn an_input_never_takes_a_buffer_the_walk_released() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], crate::graph::DType::F32);
+        let w = b.input("w", [8, 1, 1, 1], crate::graph::DType::F32);
+        let t = b.add(x, w); // its own buffer; this is the only node that writes it
+        let c = b.mul(t, w); // last use of `t`, so its buffer is released right after
+        let y = b.input("y", [8, 1, 1, 1], crate::graph::DType::F32);
+        let o = b.mul(c, y);
+        b.output(o);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        let xs: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let ws = vec![1.0f32; 8];
+        let ys: Vec<f32> = (1..=8).map(|v| (v * 10) as f32).collect();
+        alloc.fill_input(&g, "x", &xs).unwrap();
+        alloc.fill_input(&g, "w", &ws).unwrap();
+        alloc.fill_input(&g, "y", &ys).unwrap();
+        crate::graph::scheduler::BackendScheduler::new()
+            .execute(&g, &mut alloc)
+            .expect("execute");
+        let want: Vec<f32> = xs
+            .iter()
+            .zip(&ys)
+            .map(|(a, b)| (a + 1.0) * 1.0 * b)
+            .collect();
+        assert_eq!(
+            alloc.copy_to_cpu(o).expect("read"),
+            want,
+            "`y` must still hold its fill value after `t` executed"
+        );
+    }
+
+    /// E4 S2: a view is a window of its parent's buffer, so the parent must stay alive
+    /// through the **view's** last reader. D1 wrote this extension starting from the view
+    /// itself — where the walk stops on its first check, because the view's own liveness
+    /// is already the bound — so it never ran. Here `s` would take the parent's buffer
+    /// (same class) and overwrite the window `p0` is read through.
+    #[test]
+    fn a_view_keeps_its_parents_buffer_alive_through_later_consumers() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], crate::graph::DType::F32);
+        let w = b.input("w", [8, 1, 1, 1], crate::graph::DType::F32);
+        let a = b.input("a", [4, 1, 1, 1], crate::graph::DType::F32);
+        let a4 = b.input("a4", [4, 1, 1, 1], crate::graph::DType::F32);
+        let t = b.add(x, w); // its own buffer, 8 elements (one class)
+        let parts = b.split_parts(t, &[4, 4]);
+        let p0 = parts[0]; // window [0, 4) of `t`'s buffer
+        let s = b.mul(a, a4); // same class, placed after `t`'s own last use
+        let o = b.mul(p0, s);
+        b.output(o);
+        let g = b.build();
+
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        let xs: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        alloc.fill_input(&g, "x", &xs).unwrap();
+        alloc.fill_input(&g, "w", &vec![1.0f32; 8]).unwrap();
+        alloc.fill_input(&g, "a", &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        alloc.fill_input(&g, "a4", &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        crate::graph::scheduler::BackendScheduler::new()
+            .execute(&g, &mut alloc)
+            .expect("execute");
+        // p0 = (x + w)[0..4] = [2, 3, 4, 5] with w = 1; s = a * a4 = [1, 4, 9, 16].
+        let want = vec![2.0, 12.0, 36.0, 80.0];
+        assert_eq!(
+            alloc.copy_to_cpu(o).expect("read"),
+            want,
+            "the window must still hold the parent's rows, not the recycled buffer's"
         );
     }
 

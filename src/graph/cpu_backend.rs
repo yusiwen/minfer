@@ -167,6 +167,10 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn pool_len(&self) -> usize {
+        self.buffers.len()
+    }
+
     fn alloc_fresh(&mut self, size: usize) -> usize {
         // never recycled from the free list (see Backend::alloc_fresh)
         self.buffers.push(vec![0.0f32; size]);
@@ -611,7 +615,7 @@ impl Backend for CpuBackend {
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String> {
         let b = self
             .buffers
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| format!("no buffer {id}"))?;
         if b.len() != data.len() {
             return Err(format!(
@@ -620,7 +624,31 @@ impl Backend for CpuBackend {
                 data.len()
             ));
         }
-        b[..data.len()].copy_from_slice(data);
+        self.write_host_window(id, 0, data)
+    }
+
+    /// E4 S2: a pooled activation buffer is rounded to its size class, so a node
+    /// writes its logical window into a buffer that may be longer. Bounds, not
+    /// equality.
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String> {
+        let b = self
+            .buffers
+            .get_mut(id)
+            .ok_or_else(|| format!("no buffer {id}"))?;
+        let end = offset.checked_add(data.len()).ok_or_else(|| {
+            format!(
+                "buffer {id}: offset {offset} + {} elements overflows",
+                data.len()
+            )
+        })?;
+        if end > b.len() {
+            return Err(format!(
+                "buffer {id}: writing {} elements at offset {offset} runs past the {}-element pool buffer",
+                data.len(),
+                b.len()
+            ));
+        }
+        b[offset..end].copy_from_slice(data);
         Ok(())
     }
 

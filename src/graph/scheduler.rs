@@ -17,7 +17,7 @@
 use super::alloc::GraphAllocator;
 use super::backend::{Backend, KvProvider};
 use super::ops::{NodeMeta, Op};
-use super::{Backend as BackendTag, CNode, ComputeGraph, NodeId};
+use super::{Backend as BackendTag, BufRef, CNode, ComputeGraph, NodeId};
 
 /// A contiguous subgraph executed on one backend.
 #[derive(Debug, Clone)]
@@ -233,7 +233,9 @@ impl BackendScheduler {
                     // inputs are host-filled before execute — no pending GPU
                     // work, so reading them here is always current
                     if let Some(br) = alloc.node_buffer(id) {
-                        if let Some(d) = read_host_buffer(alloc, br.backend, br.id) {
+                        if let Some(d) = read_host_buffer(alloc, br.backend, br.id)
+                            .and_then(|d| window_of(br, d))
+                        {
                             record_node_data(node, d, trace_on, live_on);
                         }
                     }
@@ -311,7 +313,9 @@ impl BackendScheduler {
                     if !is_kv {
                         match br.backend {
                             BackendTag::CPU => {
-                                if let Some(d) = alloc.cpu().read_host(br.id) {
+                                if let Some(d) =
+                                    alloc.cpu().read_host(br.id).and_then(|d| window_of(br, d))
+                                {
                                     record_node_data(node, d, trace_on, live_on);
                                 }
                             }
@@ -332,7 +336,9 @@ impl BackendScheduler {
                                     if c.capture_enq(br.id) {
                                         cuda_caps.push(id);
                                     } else if let Some(v) = c.copy_to_host(br.id) {
-                                        record_node_data(node, &v, trace_on, live_on);
+                                        if let Some(d) = window_of(br, &v) {
+                                            record_node_data(node, d, trace_on, live_on);
+                                        }
                                     }
                                 }
                             }
@@ -364,6 +370,17 @@ impl BackendScheduler {
         }
         Ok(())
     }
+}
+
+/// Slice a physical host read of a pool buffer down to the window its node owns.
+///
+/// E4 S2 rounds a pooled activation buffer up to its size class, so the read is
+/// routinely longer than the node's data: capture must report the node's
+/// elements, never the padding (which holds another buffer's stale bytes and
+/// would silently change the viz's counts and statistics). `None` when the read
+/// is shorter than the reference, which would be an allocation bug.
+fn window_of(br: BufRef, data: &[f32]) -> Option<&[f32]> {
+    data.get(br.offset..br.offset + br.len)
 }
 
 /// Read a buffer's host data. CPU: direct. Metal: only safe for host-filled
@@ -416,8 +433,11 @@ fn flush_metal_captures(
     {
         for (id, st) in staged.drain(..) {
             let node = graph.node(id);
-            if let Some(d) = alloc.metal().and_then(|m| m.read_staging(st)) {
-                record_node_data(node, d, trace_on, live_on);
+            let br = alloc.node_buffer(id);
+            if let (Some(d), Some(br)) = (alloc.metal().and_then(|m| m.read_staging(st)), br) {
+                if let Some(d) = window_of(br, d) {
+                    record_node_data(node, d, trace_on, live_on);
+                }
             }
         }
         if let Some(m) = alloc.metal_mut() {
@@ -449,7 +469,12 @@ fn flush_cuda_captures(
     let data = c.capture_drain();
     for (nid, v) in caps.drain(..).zip(data) {
         let node = graph.node(nid);
-        record_node_data(node, &v, trace_on, live_on);
+        let Some(br) = alloc.node_buffer(nid) else {
+            continue;
+        };
+        if let Some(d) = window_of(br, &v) {
+            record_node_data(node, d, trace_on, live_on);
+        }
     }
 }
 
