@@ -832,7 +832,7 @@ real model. Still open: driving the compaction from the **server's** dynamic run
 there), and the logical-positions change that would remove the re-rope and the
 offset sensitivity altogether.
 
-### C4 — Quantized KV cache, Q8_0 first · [#42](https://github.com/yusiwen/minfer/issues/42) — **DONE (S1, CPU) 2026-09-22**
+### C4 — Quantized KV cache, Q8_0 first · [#42](https://github.com/yusiwen/minfer/issues/42) — **DONE (CPU: S1 + S2) 2026-09-23**
 
 **Why.** f32 (and the GPU's f16-in-an-f32-region) is all the cache could be, so context
 length was bounded by KV memory with no way to trade precision for it. Q8_0 is the first
@@ -855,12 +855,9 @@ bandwidth, not memory.
   no change at all. `KvcacheMeta::row_elems` carries the cell width, `ensure_kv` sizes the
   region by it, and the node's shapes stay *logical* (`[n_kv_embd, n_ctx]`), which is what
   the store's K/V input means.
-- **CPU store quantizes, CPU attention dequantizes** the union of the batch's windows into
-  a reusable scratch and runs the unchanged f32 GQA kernel. Correctness first: the fused
-  Q8_0 dot that removes that pass, a quantize-aware physical shift, and the CUDA/Metal
-  kernels are [S2, issue #87](https://github.com/yusiwen/minfer/issues/87). A physical
-  `kv_rm`/`kv_shift` is refused loudly on a packed region for the same reason (it re-ropes
-  K in f32).
+- **CPU store quantizes, CPU attention reads the packed blocks** — S1 dequantized the
+  window into a scratch; S2's fused read is below. The CUDA/Metal kernels are still
+  [issue #87](https://github.com/yusiwen/minfer/issues/87).
 
 **Acceptance, as measured** (CPU, `cargo test --release`, 2026-09-22):
 
@@ -888,6 +885,83 @@ store-exactness check, the refusal and the region accounting are unit-tested and
 CI. The real-model gate is `#[ignore]`d (it flips a process-wide policy) and was run on
 both cached models. Not verified here: any packed region on a GPU (by design, S1 refuses
 it), and the fused dots' performance (S2).
+
+**C4 S2 — the fused read, the quantize-aware shift, and what is handed off (2026-09-23).**
+
+[#87](https://github.com/yusiwen/minfer/issues/87) named three items. The first two are
+CPU-only and land here; the GPU kernels are the follow-up at the end of this record.
+
+- **The fused read** (`attn_heads_q8`, `src/graph/cpu_backend.rs`). S1 dequantized the union
+  of the batch's windows into a reusable f32 scratch — two allocations plus a write-then-read
+  pass per attention node, per layer, per forward — and ran the unchanged f32 kernel over it.
+  S2 reads the packed blocks directly: the K score is `dot_q8_0_q8_0` between the stored K
+  blocks and the **Q8_0-quantized query row** (llama.cpp's form for a quantized cache), and V
+  accumulates out of the cell block by block (`kvformat::accumulate_q8_0_row`). No scratch,
+  no second pass. `MINFER_NO_FUSED_Q8_KV` (presence-checked) restores S1's path — the A/B
+  standing rule 3 asks for — and the S1 path stays as the fallback for a `hd_kv` narrower
+  than one Q8_0 block.
+- **The quantize-aware shift.** `kv_rm`/`kv_shift` used to refuse a packed region because
+  they re-rope K in f32 and a packed cell is not f32 rows. S2 keeps the property S1 already
+  relied on — a cell is a whole number of words, so the survivors move **verbatim**, which is
+  why `copy_cells` and the CoW/compaction paths needed no change at all — and then maps each
+  survivor through `kvformat::map_q8_0_cells`: dequantize → re-rope → requantize. Stated
+  honestly, the shifted K is `quantize(rope(dequantize(quantize(row))))`: C2's re-rope class
+  composed with C4's packing class.
+- **The store allocates once per node, not once per row** (`kvformat::pack_q8_0_cell_into`):
+  a 2048-token prefill packs ~98k cells across 24 layers, and the per-cell `vec!` was the
+  packed store's one avoidable cost.
+
+**Acceptance, as measured** (CPU aarch64 on the GB10 box, 20 threads, Qwen2.5-0.5B Q4_0,
+`n_ctx` 4096, `minfer bench -r 3`, greedy):
+
+| config | tg128 (ctx 512) | tg64 (ctx 2048) | pp512 | pp2048 |
+|---|---|---|---|---|
+| f32 KV | 57.96 | 47.00 | 182.94 | 173.43 |
+| q8_0 fused (S2) | **59.77** | **48.63** | 182.52 | 164.06 |
+| q8_0 S1 scratch | 51.50 | 37.26 | 187.54 | 174.67 |
+
+- *Decode is the measured effect*: the fused read is **1.16× (ctx 512)** and **1.31× (ctx
+  2048)** faster than S1's dequantizing read, which is what the deferred item was for. Against
+  f32 the packed cache went from **0.89× / 0.79×** (a real regression, which is why "does not
+  regress by more than a named factor" was the acceptance) to **1.03× (both contexts)**. A
+  second run at ctx 2048 read 174.89/50.20 f32, 162.10/50.22 fused, 156.62/37.66 S1 — the
+  same decode ratios; the f32 baseline itself moves 47.0–50.2 between runs, so only
+  within-run ratios are quoted.
+- *Prefill is not measurably affected*: the three configs overlap inside their own stddev
+  (3–6 tok/s).
+- *Tolerance class*: the real-model gate's whole-vector bound moved 3.0 → 4.0 because the
+  fused read adds a **new term** — the query's own Q8_0 quantization. Measured on the same
+  gate: **3.029 fused vs 2.505 S1** over the vector, and at the reference's argmax **0.646 vs
+  0.604**; the decoding-relevant bound stays 1.0. `MINFER_NO_FUSED_Q8_KV=1` reproduces the S1
+  column, so the delta is attributable to the term rather than to run-to-run noise.
+- *The shift*: after a 4-row shift of a 20-token prefill, the **first** decode step — the one
+  whose input *is* the shifted context — is 2.466 from the f32 shift (0.064 at the argmax) on
+  the fused path and 3.165 (1.074) on S1's; the greedy continuation agrees 4/8 and 1/8
+  respectively, *reported*, because a flipped token makes the two runs different sequences
+  from that step on. (An earlier version of this gate compared the **last** step instead and
+  read 13.9 for a difference that is 0.06 at the decision point — the measurement, not the
+  code, was wrong.)
+- *Gates, each mutation-checked*, one level below the model:
+  `the_fused_q8_read_matches_the_dequantizing_reference` (two KV heads whose K rows differ
+  strongly, so a wrong head block cannot pass; using head 0's blocks for every head fails
+  with max |Δ| 1.238 of a 1.313 spread — the shipped path measures 6.0e-5) and
+  `a_packed_physical_shift_moves_v_verbatim_and_requantizes_k` (V verbatim **compared as
+  bits** — a packed word is an f16 scale plus int8 quants, so as f32 it is frequently NaN and
+  `==` on it is never true; K exactly the Q8_0 quantizate of the re-roped row; the tail
+  zeroed; skipping the re-rope fails at row 0). The shift gate's first fixture filled only
+  `positions` and left the builder's own `cells` input at zero, so all three rows went to
+  cell 0 and the gate passed on zeros: that was found by mutating the re-rope and watching
+  the mutant survive. The fixture now fills `cells` and asserts every row is non-zero.
+- *Suites*: CPU **282 passed / 0 failed / 15 ignored** (was 280/0/15), green both with and
+  without `MINFER_NO_FUSED_Q8_KV`.
+
+**Handed off, still on [#87](https://github.com/yusiwen/minfer/issues/87):** the **CUDA and
+Metal kernels** — `MINFER_CACHE_TYPE=q8_0` is still refused on both, and the refusals stay
+loud. CUDA is the one that matters for throughput, and it is a kernel project rather than a
+read-path change: `kv_ld4<KV>` and `stride_kv` address *elements*, so a packed cell needs
+byte-based addressing plus a block-dequantizing load in every attention kernel (three window
+modes each), a Q8_0 store, and the fused decode QKV epilogue's own store. Metal stays at G5
+by the round's own decision.
 
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 
