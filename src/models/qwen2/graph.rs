@@ -88,6 +88,11 @@ impl Qwen2Graph {
         let attn_scale = hp.attention_scale();
 
         for (il, l) in model.layers.iter().enumerate() {
+            // E5: tag this block's nodes so the assignment pass can keep a non-offloaded
+            // block off the device, and decide here (not per node) whether this block's
+            // device-only fused forms are available at all.
+            b.set_layer(Some(il));
+            let layer_gpu = params.cparams.gpu && il < params.cparams.gpu_layers;
             let residual = h;
 
             // pre-norm
@@ -103,7 +108,7 @@ impl Qwen2Graph {
             //   these layers). Both replace 3 matmul + 3 bias + 2 rope +
             //   2 store dispatches.
             let fuse_qkv = nt == 1
-                && params.cparams.gpu
+                && layer_gpu
                 && params.cparams.fuse_qkv
                 && l.bq.is_some()
                 && l.bk.is_some()
@@ -246,7 +251,7 @@ impl Qwen2Graph {
             // matmul (od = 2*nf ≈ 37888) under-performs two separate matmuls on
             // the decode (nt==1) scalar kernel. Gate on FFN size.
             let fuse_gu = nt == 1
-                && params.cparams.gpu
+                && layer_gpu
                 && params.cparams.fuse_ffn
                 && Self::gu_concat_available(&l.ffn_gate, &l.ffn_up)
                 && nf <= 16384;
@@ -290,6 +295,9 @@ impl Qwen2Graph {
             };
             h = b.add(residual, ffn_out);
         }
+        // E5: everything from here on is outside any block (the final norm and `lm_head`);
+        // a partial plan keeps those on the CPU (`OffloadPlan::device_holds_unblocked`).
+        b.set_layer(None);
 
         // output: norm + lm_head
         let normed = b.rms_norm(h, model.output_norm.as_ref(), eps);
@@ -530,6 +538,14 @@ impl Qwen2Graph {
                 // (`Device::gathers_attn_map`).
                 kv_map,
                 gpu: metal_on || cuda_on,
+                // E5: how many blocks the device holds. With no device this is 0 (nothing
+                // is offloaded, and the field is inert), otherwise it is the plan the load
+                // settled on — part of `CParams` because the *assignment* is topology.
+                gpu_layers: if metal_on || cuda_on {
+                    model.offload.plan.gpu_layers
+                } else {
+                    0
+                },
                 // G4/G5: decode fusions are part of the topology — the env
                 // toggles force a rebuild so they can be A/B'd reliably.
                 // G5 (FFN gate+up) is decoupled from the QKV fusion gate
@@ -573,6 +589,10 @@ impl Qwen2Graph {
                 if cuda_on {
                     alloc.enable_cuda();
                 }
+                // E5: put the plan in force before assignment — it is what keeps a
+                // non-offloaded block's nodes off the device (a device-only fused node is
+                // never even built there, but every ordinary op still has to be placed).
+                alloc.set_offload_plan(Some(model.offload.plan));
                 sched.assign_backends(&mut graph, alloc);
                 // fusion pass gated per node's assigned backend
                 let backends: Vec<&dyn Backend> = {
@@ -759,21 +779,33 @@ impl Qwen2Graph {
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.
+    ///
+    /// E5: "the graph reads" means the **offloaded** blocks, and the unblocked tensors only
+    /// under a full plan — the loader did not register anything else for a partial plan.
     #[cfg(target_os = "macos")]
     fn weights_on_gpu(model: &Qwen2Model) -> bool {
+        let plan = model.offload.plan;
+        if plan.is_cpu_only() {
+            return false;
+        }
         let names: Vec<String> = {
             let mut v = Vec::new();
-            for t in [
-                &model.tok_embd,
-                &model.output_norm,
-                &model.output,
-                &model.output_b,
-            ] {
-                if let Some(t) = t {
-                    v.push(t.name.clone());
+            if plan.device_holds_unblocked() {
+                for t in [
+                    &model.tok_embd,
+                    &model.output_norm,
+                    &model.output,
+                    &model.output_b,
+                ] {
+                    if let Some(t) = t {
+                        v.push(t.name.clone());
+                    }
                 }
             }
-            for l in &model.layers {
+            for (i, l) in model.layers.iter().enumerate() {
+                if !plan.on_device(i) {
+                    continue;
+                }
                 for t in [
                     &l.attn_norm,
                     &l.wq,
@@ -863,11 +895,24 @@ impl Qwen2Graph {
         let Some(cuda) = crate::cuda::CudaState::get() else {
             return false;
         };
-        let mut ok = embed_ok(&model.tok_embd, &cuda)
-            && matmul_ok(&model.output, &cuda)
-            && registered(&model.output_norm, &cuda)
-            && registered(&model.output_b, &cuda);
-        for l in &model.layers {
+        // E5: only the **offloaded** blocks have to be usable on the device, and the
+        // unblocked tensors only under a full plan — the loader deliberately did not
+        // register anything else, so checking them would always fail a partial plan.
+        let plan = model.offload.plan;
+        if plan.is_cpu_only() {
+            return false;
+        }
+        let mut ok = true;
+        if plan.device_holds_unblocked() {
+            ok = embed_ok(&model.tok_embd, &cuda)
+                && matmul_ok(&model.output, &cuda)
+                && registered(&model.output_norm, &cuda)
+                && registered(&model.output_b, &cuda);
+        }
+        for (i, l) in model.layers.iter().enumerate() {
+            if !plan.on_device(i) {
+                continue; // this block runs on the CPU; its weights are not registered
+            }
             ok &= registered(&l.attn_norm, &cuda)
                 && matmul_ok(&l.wq, &cuda)
                 && registered(&l.bq, &cuda)
@@ -885,32 +930,43 @@ impl Qwen2Graph {
             // Identify the first weight that fails the gate (same checks, same
             // order as above; 0 = embed, 1 = matmul, 2 = registered-only) so
             // the message names the tensor instead of a generic complaint.
-            let fail = std::iter::once((&model.tok_embd, 0u8))
-                .chain(std::iter::once((&model.output, 1u8)))
-                .chain(std::iter::once((&model.output_norm, 2u8)))
-                .chain(std::iter::once((&model.output_b, 2u8)))
-                .chain(model.layers.iter().flat_map(|l| {
-                    [
-                        (&l.attn_norm, 2u8),
-                        (&l.wq, 1u8),
-                        (&l.bq, 2u8),
-                        (&l.wk, 1u8),
-                        (&l.bk, 2u8),
-                        (&l.wv, 1u8),
-                        (&l.bv, 2u8),
-                        (&l.wo, 1u8),
-                        (&l.ffn_norm, 2u8),
-                        (&l.ffn_gate, 1u8),
-                        (&l.ffn_up, 1u8),
-                        (&l.ffn_down, 1u8),
-                    ]
-                }))
-                .find(|(t, kind)| match (t, kind) {
-                    (Some(t), 0) => !embed_t_ok(t, &cuda),
-                    (Some(t), 1) => !matmul_t_ok(t, &cuda),
-                    (Some(t), _) => !cuda.has_weight_of_size(&t.name, t.data().len()),
-                    (None, _) => false,
-                });
+            // The same weights the check above looked at, in the same order (0 = embed,
+            // 1 = matmul, 2 = registered-only): only a partial plan leaves the unblocked
+            // tensors and the CPU-side blocks out.
+            let mut named: Vec<(&Option<crate::tensor::Tensor>, u8)> = Vec::new();
+            if plan.device_holds_unblocked() {
+                named.extend([
+                    (&model.tok_embd, 0u8),
+                    (&model.output, 1u8),
+                    (&model.output_norm, 2u8),
+                    (&model.output_b, 2u8),
+                ]);
+            }
+            for (i, l) in model.layers.iter().enumerate() {
+                if !plan.on_device(i) {
+                    continue;
+                }
+                named.extend([
+                    (&l.attn_norm, 2u8),
+                    (&l.wq, 1u8),
+                    (&l.bq, 2u8),
+                    (&l.wk, 1u8),
+                    (&l.bk, 2u8),
+                    (&l.wv, 1u8),
+                    (&l.bv, 2u8),
+                    (&l.wo, 1u8),
+                    (&l.ffn_norm, 2u8),
+                    (&l.ffn_gate, 1u8),
+                    (&l.ffn_up, 1u8),
+                    (&l.ffn_down, 1u8),
+                ]);
+            }
+            let fail = named.into_iter().find(|(t, kind)| match (t, kind) {
+                (Some(t), 0) => !embed_t_ok(t, &cuda),
+                (Some(t), 1) => !matmul_t_ok(t, &cuda),
+                (Some(t), _) => !cuda.has_weight_of_size(&t.name, t.data().len()),
+                (None, _) => false,
+            });
             if let Some((Some(t), _)) = fail {
                 eprintln!(
                     "CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered",
@@ -1175,6 +1231,214 @@ mod tests {
         }
         eprintln!("[c5] 8 greedy steps after the restore: max |Δlogit| = {worst}");
         std::fs::remove_file(&file).ok();
+    }
+
+    /// E5's acceptance on the real model: a **chosen** number of blocks on the device and the
+    /// rest on the CPU runs end to end, the scheduler splits at every block boundary (its
+    /// cross-backend copies are what make the mixed graph executable at all), the report says
+    /// which blocks landed where, and the greedy tokens match the all-CPU run of the same
+    /// prompt.
+    ///
+    /// CPU and device logits differ by design (rule 9: the CPU quantizes activations to Q8_0,
+    /// the device reads f32), so this compares **greedy tokens**, not logits. The two loads
+    /// use different registry namespaces (`cpuref.`) so the name-keyed device registry cannot
+    /// make the CPU-only model look registered.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device; run it alone:
+    ///
+    /// ```text
+    /// cargo test --release a_partial_offload_runs_the_rest_on_the_cpu -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "requires the cached 0.5B model and a CUDA device"]
+    fn a_partial_offload_runs_the_rest_on_the_cpu() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::offload::OffloadRequest;
+        use crate::graph::scheduler::BackendScheduler;
+        use crate::graph::Backend;
+        use crate::models::{Device, ModelDef};
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the E5 offload gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let n_layers = crate::models::qwen2::loader::hparams_from_gguf(&gguf.parts[0].ctx)
+            .expect("hparams")
+            .n_layer as usize;
+        let k = 4.min(n_layers);
+
+        // The all-CPU reference, under its own namespace (see the doc comment).
+        let reference =
+            crate::models::qwen2::loader::load(&gguf, "cpuref.", OffloadRequest::Layers(0))
+                .expect("load the CPU reference");
+        assert_eq!(reference.device(), Device::Cpu);
+        assert_eq!(reference.offload().gpu_layers, 0);
+
+        // The mixed model: `k` blocks on the device, the rest on the CPU.
+        let mixed = crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::Layers(k))
+            .expect("load the mixed model");
+        if mixed.device() != Device::Cuda {
+            eprintln!(
+                "no CUDA participation (device {:?}); skipping",
+                mixed.device()
+            );
+            return;
+        }
+        let plan = mixed.offload();
+        assert_eq!((plan.gpu_layers, plan.cpu_layers()), (k, n_layers - k));
+        let report = mixed
+            .offload_report()
+            .expect("a mixed plan must report where its blocks landed");
+        assert!(
+            report.contains(&format!("{k} of {n_layers} blocks")),
+            "{report}"
+        );
+        assert!(report.contains("on cpu"), "{report}");
+        eprintln!("[e5] {report}");
+
+        // It registered the **offloaded blocks'** tensors and nothing else: at least the sum
+        // of those blocks' weights (more, because the fused `attn_qkv`/`ffn_gu` concat copies
+        // are registered too) and less than the whole model (a partial plan leaves
+        // `token_embd`/`output` and the remaining blocks on the CPU).
+        let block_bytes = |m: &Qwen2Model, upto: usize| -> usize {
+            m.layers
+                .iter()
+                .take(upto)
+                .flat_map(|l| {
+                    [
+                        &l.attn_norm,
+                        &l.wq,
+                        &l.bq,
+                        &l.wk,
+                        &l.bk,
+                        &l.wv,
+                        &l.bv,
+                        &l.wo,
+                        &l.ffn_norm,
+                        &l.ffn_gate,
+                        &l.ffn_up,
+                        &l.ffn_down,
+                    ]
+                })
+                .filter_map(|t| t.as_ref())
+                .map(|t| t.data().len())
+                .sum()
+        };
+        assert_eq!(
+            reference.offload.device_bytes, 0,
+            "the CPU reference registers nothing"
+        );
+        let offloaded = block_bytes(&mixed, k);
+        let all_blocks = block_bytes(&mixed, n_layers);
+        assert!(
+            mixed.offload.device_bytes >= offloaded,
+            "the offloaded blocks' weights must be on the device: {} < {offloaded}",
+            mixed.offload.device_bytes
+        );
+        assert!(
+            mixed.offload.device_bytes < all_blocks,
+            "a partial plan must leave the remaining blocks off the device: {} >= {all_blocks}",
+            mixed.offload.device_bytes
+        );
+
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+        let steps = 4;
+
+        // Run both, greedily, and compare the token sequences.
+        let run = |model: &dyn ModelDef| -> Vec<u32> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let mut l =
+                model.forward_graph_cached(&ids, &(0..n).collect::<Vec<_>>(), 1, n_ctx, &mut cache);
+            let mut next = argmax(&l);
+            let mut toks = vec![next];
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                next = argmax(&l);
+                toks.push(next);
+            }
+            // The first forward built the graph; inspect its assignment while the cache is
+            // still alive (this is the only place the built graph is reachable).
+            let (graph, _alloc) = cache.current().expect("a built graph");
+            let n_cuda = graph
+                .nodes
+                .iter()
+                .filter(|nd| nd.backend == Some(Backend::Cuda))
+                .count();
+            let n_cpu = graph
+                .nodes
+                .iter()
+                .filter(|nd| nd.backend == Some(Backend::CPU))
+                .count();
+            let splits = BackendScheduler::new().split_graph(graph);
+            let cuda_splits: Vec<_> = splits
+                .iter()
+                .filter(|s| s.backend == Backend::Cuda)
+                .collect();
+            let cpu_splits: Vec<_> = splits
+                .iter()
+                .filter(|s| s.backend == Backend::CPU)
+                .collect();
+            eprintln!(
+                "[e5] graph: {n_cuda} nodes on cuda, {n_cpu} on cpu; {} splits ({} cuda, {} cpu)",
+                splits.len(),
+                cuda_splits.len(),
+                cpu_splits.len()
+            );
+            if model.offload().is_mixed() {
+                assert!(
+                    n_cuda > 0 && n_cpu > 0,
+                    "a mixed plan must place nodes on both"
+                );
+                // The split count is not exactly one per block (a block's device nodes are
+                // contiguous with its neighbours' when the intervening nodes are on the
+                // device too), so the claim is the alternation itself plus the copies below.
+                assert!(
+                    cuda_splits.len() >= 2 && cpu_splits.len() >= 2,
+                    "a mixed plan must alternate: {} device / {} CPU splits for {k} blocks",
+                    cuda_splits.len(),
+                    cpu_splits.len()
+                );
+                // The placement contract, on a real model graph: no node of a non-offloaded
+                // block (and no node outside any block) is on the device.
+                for nd in &graph.nodes {
+                    let on_cpu_side = match nd.layer {
+                        Some(l) => l >= k,
+                        None => true,
+                    };
+                    if on_cpu_side {
+                        assert_eq!(
+                            nd.backend,
+                            Some(Backend::CPU),
+                            "block {:?} node '{}' must stay on the CPU under a partial plan",
+                            nd.layer,
+                            nd.name
+                        );
+                    }
+                }
+                assert!(
+                    cuda_splits.iter().any(|s| !s.inputs.is_empty()),
+                    "a device split after a CPU block must take a cross-backend copy in"
+                );
+                assert!(
+                    cpu_splits.iter().any(|s| !s.inputs.is_empty()),
+                    "the CPU block after a device block must take a cross-backend copy in"
+                );
+            }
+            toks
+        };
+
+        let want = run(&reference);
+        let got = run(&mixed);
+        assert_eq!(
+            got, want,
+            "a partial offload must produce the same greedy tokens as the all-CPU run"
+        );
+        eprintln!("[e5] {k}/{n_layers} blocks on cuda, {steps} greedy steps match the CPU run");
     }
 
     /// The named tolerance class for comparisons whose two sides were computed
@@ -1733,6 +1997,7 @@ mod tests {
                     explicit_span: true,
                     kv_map: false,
                     gpu: false,
+                    gpu_layers: usize::MAX, // E5: no offload limit in this fixture
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -2607,6 +2872,7 @@ mod tests {
                     explicit_span: false,
                     kv_map: false,
                     gpu: false,
+                    gpu_layers: usize::MAX, // E5: no offload limit in this fixture
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -2658,6 +2924,7 @@ mod tests {
                     explicit_span: false,
                     kv_map: false,
                     gpu: false,
+                    gpu_layers: usize::MAX, // E5: no offload limit in this fixture
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -3270,6 +3537,7 @@ mod tail_tests {
                     explicit_span: false,
                     kv_map: false,
                     gpu: false,
+                    gpu_layers: usize::MAX, // E5: no offload limit in this fixture
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -3451,6 +3719,7 @@ mod tail_tests {
                         explicit_span: false,
                         kv_map: false,
                         gpu: true,
+                        gpu_layers: usize::MAX, // E5 fixture: no offload limit
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,
                     },
@@ -3526,6 +3795,7 @@ mod tail_tests {
                         explicit_span: false,
                         kv_map: false,
                         gpu: true,
+                        gpu_layers: usize::MAX, // E5 fixture: no offload limit
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,
                     },

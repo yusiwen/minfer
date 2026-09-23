@@ -53,6 +53,11 @@ pub struct CParams {
     /// gather a map may take the node (`Backend::supports_kv_map` — CPU until C8b
     /// S4).
     pub kv_map: bool,
+    /// E5: how many leading transformer blocks run on the device (`usize::MAX` =
+    /// every block, the pre-E5 behaviour). The *assignment* is part of the built
+    /// graph, so a different offload plan must rebuild: this is topology like
+    /// `gpu`, and `GraphCache::try_reuse` compares it with the rest of `CParams`.
+    pub gpu_layers: usize,
 }
 
 impl Default for CParams {
@@ -65,6 +70,7 @@ impl Default for CParams {
             fuse_ffn: false,
             explicit_span: false,
             kv_map: false,
+            gpu_layers: usize::MAX,
         }
     }
 }

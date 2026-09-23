@@ -28,6 +28,10 @@ pub struct Qwen2Model {
     /// registration, graph build, and the participation checks all resolve
     /// namespaced keys consistently.
     pub ns: String,
+    /// E5: the layer offload plan in force (the effective one) plus what the device
+    /// registration measured. `ModelDef::offload()` hands the plan to the graph builder and
+    /// the assignment pass; `offload_report()` is the startup line.
+    pub offload: crate::models::OffloadState,
 }
 
 impl Qwen2Model {
@@ -59,6 +63,16 @@ impl ModelDef for Qwen2Model {
     /// authority, so the server's batching default and `CParams.gpu` agree.
     fn device(&self) -> crate::models::Device {
         graph::Qwen2Graph::device(self)
+    }
+
+    /// E5: the offload plan in force (which blocks run on the device).
+    fn offload(&self) -> crate::graph::offload::OffloadPlan {
+        self.offload.plan
+    }
+
+    /// E5: the startup line naming where each block landed, or `None` on the CPU-only path.
+    fn offload_report(&self) -> Option<String> {
+        self.offload.report(self.device())
     }
 
     fn build_graph(

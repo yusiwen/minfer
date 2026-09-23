@@ -197,6 +197,8 @@ fn load_tensor(
     raw: &'static [u8],
     ti: &crate::gguf::GgufTensorInfo,
     ns: &str,
+    plan: crate::graph::offload::OffloadPlan,
+    device_bytes: &std::cell::Cell<usize>,
 ) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
     // Registry names are namespaced for non-primary models (see Qwen3Model::ns).
@@ -229,84 +231,99 @@ fn load_tensor(
     let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
     tensor.set_name(&reg_name);
 
-    // Register weight tensors with GPU backends.
+    // E5: register only when the offload plan puts this tensor's block on the device (see
+    // qwen2's loader twin for the rule and the reason).
+    #[cfg(any(target_os = "macos", feature = "cuda"))]
+    let on_device = plan.allows_weight(&reg_name);
     #[cfg(target_os = "macos")]
-    if let Some(mps) = crate::metal::MpsState::get() {
-        if matches!(
-            ttype,
-            TensorType::Q4_0
-                | TensorType::Q4_1
-                | TensorType::Q4_K
-                | TensorType::Q5_0
-                | TensorType::Q5_1
-                | TensorType::Q5_K
-                | TensorType::Q6_K
-                | TensorType::Q8_0
-        ) {
-            mps.register_weight(&reg_name, tensor.data());
-        } else if ttype == TensorType::F32 {
-            mps.register_weight(&reg_name, tensor.data());
+    if on_device {
+        if let Some(mps) = crate::metal::MpsState::get() {
+            if matches!(
+                ttype,
+                TensorType::Q4_0
+                    | TensorType::Q4_1
+                    | TensorType::Q4_K
+                    | TensorType::Q5_0
+                    | TensorType::Q5_1
+                    | TensorType::Q5_K
+                    | TensorType::Q6_K
+                    | TensorType::Q8_0
+            ) {
+                mps.register_weight(&reg_name, tensor.data());
+                device_bytes.set(device_bytes.get() + tensor.data().len());
+            } else if ttype == TensorType::F32 {
+                mps.register_weight(&reg_name, tensor.data());
+                device_bytes.set(device_bytes.get() + tensor.data().len());
+            }
         }
     }
     #[cfg(feature = "cuda")]
-    if let Some(cuda) = crate::cuda::CudaState::get() {
-        if matches!(
-            ttype,
-            TensorType::Q4_0
-                | TensorType::Q4_1
-                | TensorType::Q4_K
-                | TensorType::Q5_0
-                | TensorType::Q5_1
-                | TensorType::Q6_K
-                | TensorType::Q8_0
-        ) {
-            if ttype != TensorType::Q4_K && ttype != TensorType::Q6_K {
-                // r60: non-NB-BT-consumable quantized weight — mode-2
-                // skip-write producers unsound (see qwen2 loader twin).
-                // Global flag, global mix: any registered weight counts,
-                // namespaced or not.
-                cuda.clear_mmq_nb_bt_only();
-            }
-            if ttype == TensorType::Q6_K {
-                // 7e②: register Q6_K in the padded 224-byte block layout so
-                // the matmul kernel can use aligned uint4 weight loads
-                // (the raw 210-byte stride forces 1-byte-per-instruction
-                // reads and caps 7B decode near ~38 GB/s).
-                // NOTE: under the NAMESPACED draft load the registry key
-                // must be the namespaced reg_name, not the raw GGUF tensor
-                // name - `ti.name` here silently REPLACED the target's
-                // registry entry for the same tensor name (e.g.
-                // 'token_embd.weight'), which failed the target's
-                // has_weight_of_size at the next build_graph and dropped
-                // BOTH graphs to CPU (doc 102).
-                cuda.register_weight_q6k_padded(
-                    &reg_name,
-                    tensor.data(),
-                    tensor.shape[1] as usize,
-                    tensor.shape[0] as usize,
-                );
-            } else {
-                cuda.register_weight(&reg_name, tensor.data());
-                // doc 104: q8_0 also registers the p32 split planes for the
-                // decode MMVQ (raw registration stays; method self-gates).
-                if ttype == TensorType::Q8_0 {
-                    cuda.register_weight_q80_p32(
+    if on_device {
+        if let Some(cuda) = crate::cuda::CudaState::get() {
+            if matches!(
+                ttype,
+                TensorType::Q4_0
+                    | TensorType::Q4_1
+                    | TensorType::Q4_K
+                    | TensorType::Q5_0
+                    | TensorType::Q5_1
+                    | TensorType::Q6_K
+                    | TensorType::Q8_0
+            ) {
+                if ttype != TensorType::Q4_K && ttype != TensorType::Q6_K {
+                    // r60: non-NB-BT-consumable quantized weight — mode-2
+                    // skip-write producers unsound (see qwen2 loader twin).
+                    // Global flag, global mix: any registered weight counts,
+                    // namespaced or not.
+                    cuda.clear_mmq_nb_bt_only();
+                }
+                if ttype == TensorType::Q6_K {
+                    // 7e②: register Q6_K in the padded 224-byte block layout so
+                    // the matmul kernel can use aligned uint4 weight loads
+                    // (the raw 210-byte stride forces 1-byte-per-instruction
+                    // reads and caps 7B decode near ~38 GB/s).
+                    // NOTE: under the NAMESPACED draft load the registry key
+                    // must be the namespaced reg_name, not the raw GGUF tensor
+                    // name - `ti.name` here silently REPLACED the target's
+                    // registry entry for the same tensor name (e.g.
+                    // 'token_embd.weight'), which failed the target's
+                    // has_weight_of_size at the next build_graph and dropped
+                    // BOTH graphs to CPU (doc 102).
+                    cuda.register_weight_q6k_padded(
                         &reg_name,
                         tensor.data(),
                         tensor.shape[1] as usize,
                         tensor.shape[0] as usize,
                     );
+                } else {
+                    cuda.register_weight(&reg_name, tensor.data());
+                    // doc 104: q8_0 also registers the p32 split planes for the
+                    // decode MMVQ (raw registration stays; method self-gates).
+                    if ttype == TensorType::Q8_0 {
+                        cuda.register_weight_q80_p32(
+                            &reg_name,
+                            tensor.data(),
+                            tensor.shape[1] as usize,
+                            tensor.shape[0] as usize,
+                        );
+                    }
+                }
+            } else if ttype == TensorType::F32 {
+                cuda.register_weight(&reg_name, tensor.data());
+                // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
+                // are 1-D) — mode-2 skip-write producers unsound upstream.
+                if tensor.shape.len() == 2 {
+                    cuda.clear_mmq_nb_bt_only();
                 }
             }
-        } else if ttype == TensorType::F32 {
-            cuda.register_weight(&reg_name, tensor.data());
-            // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
-            // are 1-D) — mode-2 skip-write producers unsound upstream.
-            if tensor.shape.len() == 2 {
-                cuda.clear_mmq_nb_bt_only();
-            }
+            device_bytes.set(device_bytes.get() + tensor.data().len());
         }
     }
+
+    // A CPU-only build compiles both registration blocks out; the parameters stay part of
+    // the signature (the filter is the contract) and the plan still reaches the model.
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    let _ = (plan, device_bytes);
 
     tensor
 }
@@ -315,7 +332,11 @@ fn load_tensor(
 // Architecture loader
 // ============================================================
 
-pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Model> {
+pub fn load(
+    model: &crate::gguf::GgufModel,
+    ns: &str,
+    offload: crate::graph::offload::OffloadRequest,
+) -> Option<super::Qwen3Model> {
     #[cfg(feature = "cuda")]
     // Same rationale as qwen2/loader.rs: block until CUDA init completes so
     // per-tensor registration is all-or-nothing (no partial gate flips).
@@ -327,6 +348,22 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
     let _model_load_guard = crate::cuda::CudaState::model_load_guard();
     let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
+
+    // E5: resolve the offload plan before the first weight is registered (see qwen2's twin).
+    let env_request = std::env::var("MINFER_GPU_LAYERS").ok();
+    let offload_source = offload.source(env_request.as_deref());
+    let plan = match offload.plan(
+        env_request.as_deref(),
+        hparams.n_layer as usize,
+        crate::models::device_available(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("minfer: {e}");
+            return None;
+        }
+    };
+    let device_bytes = std::cell::Cell::new(0usize);
 
     // Merged tensor index across all split parts (llama.cpp weights_map): each
     // tensor lives in the part that lists it, read from that part's own data.
@@ -373,12 +410,12 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
     let load_one = |n: &str| -> Option<Tensor> {
         tensor_map.get(n).map(|(pi, ti)| {
             let part = &model.parts[*pi];
-            load_tensor(&part.ctx, &part.data, ti, ns)
+            load_tensor(&part.ctx, &part.data, ti, ns, plan, &device_bytes)
         })
     };
     let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
         let part = &model.parts[*pi];
-        load_tensor(&part.ctx, &part.data, ti, ns)
+        load_tensor(&part.ctx, &part.data, ti, ns, plan, &device_bytes)
     };
 
     // Token embedding
@@ -420,10 +457,12 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
         // falls back to three separate matmuls otherwise. Requires the per-head
         // Q/K norm weights to be present (Qwen3 always has them).
         #[cfg(target_os = "macos")]
-        if let Some(mps) = crate::metal::MpsState::get() {
-            if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
-                if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
-                    mps.register_weight(&format!("{ns}blk.{i}.attn_qkv"), &data);
+        if plan.on_device(i) {
+            if let Some(mps) = crate::metal::MpsState::get() {
+                if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
+                    if let Some(data) = crate::metal::concat_rows(&[wq, wk, wv]) {
+                        mps.register_weight(&format!("{ns}blk.{i}.attn_qkv"), &data);
+                    }
                 }
             }
         }
@@ -459,13 +498,15 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
         // nf = 18944 concat would otherwise hold ~2.0 GiB of weights no node
         // ever reads (Phase 8 review). Memory-footprint-only change.
         #[cfg(target_os = "macos")]
-        if let Some(mps) = crate::metal::MpsState::get() {
-            if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
-                let fuse = fg.shape[1] <= 16384
-                    && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
-                if fuse {
-                    if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
-                        mps.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
+        if plan.on_device(i) {
+            if let Some(mps) = crate::metal::MpsState::get() {
+                if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
+                    let fuse = fg.shape[1] <= 16384
+                        && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                    if fuse {
+                        if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
+                            mps.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
+                        }
                     }
                 }
             }
@@ -478,22 +519,24 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
         // nf = 18944 concat would otherwise waste ~2 GiB of VRAM on weights
         // no graph node ever reads — 7e⑤ review finding).
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = crate::cuda::CudaState::get() {
-            if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
-                let nf = fg.shape[1] as usize;
-                let fuse_ffn =
-                    nf <= 16384 && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
-                if fuse_ffn {
-                    if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
-                        if fg.ttype == crate::tensor::TensorType::Q6_K {
-                            cuda.register_weight_q6k_padded(
-                                &format!("{ns}blk.{i}.ffn_gu"),
-                                &data,
-                                (fg.shape[1] + fu.shape[1]) as usize,
-                                fg.shape[0] as usize,
-                            );
-                        } else {
-                            cuda.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
+        if plan.on_device(i) {
+            if let Some(cuda) = crate::cuda::CudaState::get() {
+                if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
+                    let nf = fg.shape[1] as usize;
+                    let fuse_ffn = nf <= 16384
+                        && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                    if fuse_ffn {
+                        if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
+                            if fg.ttype == crate::tensor::TensorType::Q6_K {
+                                cuda.register_weight_q6k_padded(
+                                    &format!("{ns}blk.{i}.ffn_gu"),
+                                    &data,
+                                    (fg.shape[1] + fu.shape[1]) as usize,
+                                    fg.shape[0] as usize,
+                                );
+                            } else {
+                                cuda.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
+                            }
                         }
                     }
                 }
@@ -504,7 +547,7 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
 
     eprintln!("Loaded: {} layers", n_layer);
 
-    let model = super::Qwen3Model {
+    let mut model = super::Qwen3Model {
         hparams,
         tok_embd: Some(tok_embd),
         output_norm,
@@ -512,7 +555,23 @@ pub fn load(model: &crate::gguf::GgufModel, ns: &str) -> Option<super::Qwen3Mode
         output_b,
         layers,
         ns: ns.to_string(),
+        offload: crate::models::OffloadState {
+            plan,
+            device_bytes: device_bytes.get(),
+            source: offload_source,
+        },
     };
+
+    // E5: verify the plan against what actually got registered (see qwen2's loader twin).
+    if !model.offload.plan.is_cpu_only()
+        && super::graph::Qwen3Graph::device(&model) == crate::models::Device::Cpu
+    {
+        eprintln!(
+"minfer: {} of {} blocks were asked onto the device ({}), but their weights are not usable there — running on CPU",
+            model.offload.plan.gpu_layers, model.offload.plan.n_layers, model.offload.source
+        );
+        model.offload = crate::models::OffloadState::cpu_only(n_layer);
+    }
 
     // 8p: warm the persistent per-weight f16 dequant cache at load.
     // Only for models big enough to amortize the +2 B/element resident

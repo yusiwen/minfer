@@ -41,6 +41,13 @@ pub mod kvformat;
 pub mod kvsession;
 #[cfg(target_os = "macos")]
 pub mod metal_backend;
+/// Layer offload plan: how many blocks run on the device (E5).
+///
+/// The plan is resolved on every build — a box with no device resolves an unset request to
+/// CPU-only — but a couple of its helpers have no caller without a device (the loader's
+/// registration filter compiles out), hence the allowance on those builds.
+#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
+pub mod offload;
 pub mod ops;
 pub mod params;
 pub mod scheduler;
@@ -158,6 +165,12 @@ pub struct CNode {
     /// (`View`/`Reshape`/`Permute`); the allocator maps it onto the parent's
     /// buffer and keeps the parent alive instead of copying.
     pub view: Option<ViewAlias>,
+    /// E5: the transformer block this node belongs to (`None` for everything
+    /// outside a block: the embedding, the final norm, `lm_head`, and the
+    /// standalone test graphs). Stamped by `GraphBuilder::set_layer`, which the
+    /// model builders set once per block; the offload policy reads it to keep a
+    /// non-offloaded block's nodes off the device.
+    pub layer: Option<usize>,
 }
 
 /// D1: a node's output *is* (a window of) another node's buffer.
@@ -316,6 +329,7 @@ mod tests {
             backend: None,
             meta: NodeMeta::None,
             view: None,
+            layer: None,
         });
         g.nodes.push(CNode {
             id: 1,
@@ -327,6 +341,7 @@ mod tests {
             backend: None,
             meta: NodeMeta::None,
             view: None,
+            layer: None,
         });
         assert!(g.topo_order().is_err());
     }

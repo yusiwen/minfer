@@ -128,6 +128,13 @@ fn print_usage(prog: &str) {
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
+    eprintln!(
+        "  --gpu-layers <N>     E5: put the first N transformer blocks on the device and run the"
+    );
+    eprintln!(
+        "                       rest on the CPU (0 = CPU only; unset = MINFER_GPU_LAYERS, i.e."
+    );
+    eprintln!("                       every block the device can hold). The placement is printed at load.");
     eprintln!("  --spec-draft <model> speculative decoding: draft model (D5-R)");
     eprintln!(
         "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)",
@@ -215,6 +222,10 @@ fn main() {
     let mut port_provided = false;
     // CUDA-only: --gpu N selects a device index; no-op on CPU/Metal builds.
     let mut gpu: Option<i32> = None;
+    // E5: --gpu-layers N offloads the first N blocks to the device (0 = CPU only, unset =
+    // MINFER_GPU_LAYERS, which is "every block the device can hold").
+    let mut gpu_layers_request = crate::graph::offload::OffloadRequest::Default;
+    let mut gpu_layers_set = false;
     // D5-R speculative decoding (--spec-draft <model>, --spec-draft-n <d>).
     let mut spec_draft: Option<String> = None;
     let mut spec_draft_n: usize = 2;
@@ -294,6 +305,18 @@ fn main() {
                             None
                         }
                     };
+                }
+                i += 2;
+            }
+            "--gpu-layers" => {
+                if let Some(v) = next_val(a) {
+                    match v.parse::<usize>() {
+                        Ok(n) => {
+                            gpu_layers_request = crate::graph::offload::OffloadRequest::Layers(n);
+                            gpu_layers_set = true;
+                        }
+                        Err(_) => parse_err = Some(format!("invalid --gpu-layers '{v}'")),
+                    }
                 }
                 i += 2;
             }
@@ -701,7 +724,11 @@ fn main() {
     let _ = gpu;
 
     // === Load model (dispatches on general.architecture) ===
-    let model = models::load_model(&gguf_model).expect("load model");
+    if gpu_layers_set {
+        // The request is already in `gpu_layers_request`; the load prints where the blocks
+        // landed (E5). Nothing else to do here.
+    }
+    let model = models::load_model_with(&gguf_model, "", gpu_layers_request).expect("load model");
     if meta_flag {
         dump_key_tensors(ctx);
     } else {

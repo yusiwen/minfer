@@ -40,6 +40,11 @@ pub struct GraphBuilder {
     /// (`KvcacheMeta::row_elems`), so a graph built under one format and executed
     /// against an allocator that sized the other refuses loudly in `ensure_kv`.
     kv_format: KvFormat,
+    /// E5: the transformer block the nodes being created belong to. The model
+    /// builders set it once per block (`set_layer(Some(il))`) and clear it after
+    /// the loop, so every node the offload policy needs to place carries its
+    /// block. `None` for everything outside a block.
+    cur_layer: Option<usize>,
 }
 
 impl GraphBuilder {
@@ -54,7 +59,15 @@ impl GraphBuilder {
             // C4: the per-load policy. Tests that need a packed region set the
             // process-wide format (or use `set_kv_format`) before building.
             kv_format: super::kvformat::kv_format(),
+            cur_layer: None,
         }
+    }
+
+    /// E5: stamp every node created from here on with `layer` (`None` = outside any
+    /// block). The model builders call this once per block; the offload policy reads
+    /// `CNode.layer` to decide which backend may take a node.
+    pub fn set_layer(&mut self, layer: Option<usize>) {
+        self.cur_layer = layer;
     }
 
     /// C8b S2: read attention windows from the `kv_map` input (a list of cell runs
@@ -224,6 +237,8 @@ impl GraphBuilder {
             backend: None,
             meta,
             view,
+            // E5: the block this node belongs to (set by the model builders per block).
+            layer: self.cur_layer,
         });
         id
     }
@@ -744,6 +759,31 @@ mod tests {
         assert_eq!(g.node(load).out_shape, [16, 1024, 1, 1]);
         // no n_past anywhere in the IR: payloads only carry the layer index
         assert_ne!(g.node(store).op, Op::KvcacheStore { layer: 4 });
+    }
+
+    /// E5: `set_layer` stamps the nodes created after it, so the offload policy can place a
+    /// node by its block. Nothing else in the IR carries the block (the KV ops' meta layer is
+    /// only the KV layers), which is why this is a builder-level contract.
+    #[test]
+    fn set_layer_tags_the_nodes_created_after_it() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [4, 1, 1, 1], DType::F32);
+        let before = b.silu(x);
+        b.set_layer(Some(2));
+        let in_block = b.silu(x);
+        let view = b.split_parts(in_block, &[2, 2])[0];
+        b.set_layer(None);
+        let after = b.silu(x);
+        let g = b.build();
+        assert_eq!(g.node(x).layer, None, "an input is outside any block");
+        assert_eq!(g.node(before).layer, None);
+        assert_eq!(g.node(in_block).layer, Some(2));
+        assert_eq!(
+            g.node(view).layer,
+            Some(2),
+            "views inherit the block they were made in"
+        );
+        assert_eq!(g.node(after).layer, None, "cleared after the block");
     }
 
     #[test]
