@@ -1981,9 +1981,70 @@ ignored, `--features cuda` 244 / 0 / 5.
 | E1b | 2 | CUDA attention kernels read `attn_span` — **DONE, device-verified (2026-09-18)** (window test passes on GB10; causal-path timing unchanged) | M |
 | E2 | 3 | Batch composition + continuous batching — **mechanism landed; CPU acceptance refuted and accepted, GPU acceptance MET (1.9x)**; opt-in at the time (`MINFER_BATCH=1` — **E6 later made the default device-aware**); A7 closed by **deleting** `n_seqs` — **ticket closed** | XL |
 | E3 | 10 | Chunked prefill: make `n_batch` real · [#45](https://github.com/yusiwen/minfer/issues/45) — **DONE (2026-09-22, see the record)** | M |
-| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) | L |
+| E4 | 8 | Allocator reserve/assign split + size classes + memory accounting · [#55](https://github.com/yusiwen/minfer/issues/55) — **S1 done (2026-09-22: the accounting, the size-class ladder and the feasibility gate); S2 (class-rounded pools, the reserve/assign re-map and the multi-graph cache) open** | L |
 | E5 | 9 | Layer-offload budget (`n_gpu_layers` equivalent) · [#46](https://github.com/yusiwen/minfer/issues/46) | L |
 | E6 | 3 (follow-up) | **Device-aware batching default** — **DONE (2026-09-19)**: `MINFER_BATCH` unset now batches iff the model's forwards run on CUDA, serial otherwise; `=1`/`=0` force it either way; the decision is a pure unit-tested function. Refetched 1.97x on the 7B with **no** environment variable (see the record) | S |
+
+#### E4 record, S1 (2026-09-22) — account first, allocate second
+
+**Why.** Roadmap §2.3 listed three consequences of an allocator that places and hands out
+memory in one step: an exact-match pool ends up with one set of buffers per shape, nothing
+can answer "will this fit?" before the device is touched (CUDA surfaced it as a null pointer
+at execute time), and peak memory was not a number anyone could read.
+
+**What S1 landed.**
+
+- **`src/graph/allocplan.rs`** — the size-class ladder and a *pure* plan.
+  `class_size(elems)`: powers of two up to 16 KiB (4096 elements), then multiples of 16 KiB,
+  floor 1 KiB; a class never wastes more than one 16 KiB step. `AllocPlan::plan` takes the
+  `(size, first use, last use)` intervals and simulates the pool's own reuse rule (a buffer
+  freed at step `f` may serve an interval whose first use is after `f`), reporting
+  `reserved_bytes`, `live_peak_bytes`, `buffers` and `reused`.
+- **Accounting** — `GraphAllocator::memory_report(backend)` returns
+  `MemoryReport { weights_bytes, pool_bytes, live_bytes, peak_live_bytes, budget }` plus
+  `headroom_bytes()`. `pool_bytes` is the pool's high-water mark (the pools never return
+  memory), `live_bytes` is what is handed out right now, and the peak is tracked as the
+  build proceeds. `weights_bytes` comes from the backend (a new `Backend` trait method with
+  a 0 default; CPU sums its registry, CUDA sums the device registry — Metal inherits the
+  default until G6 adopts the split).
+- **The feasibility gate** — `alloc_in_pool` is fallible and checks
+  `weights + pooled + this allocation (at its class size)` against the backend's budget
+  *before* the pool is asked for anything. The default budget is the backend's own answer:
+  CUDA's current `cudaMemGetInfo` free bytes with a quarter held back (new
+  `CudaState::device_memory` / `device_free_bytes`); CPU and Metal are unbounded unless
+  `set_memory_budget` sets one (tests, and a future offload policy). The refusal names the
+  numbers: weights, pooled bytes, this request, budget, all in MiB.
+
+**Acceptance, as measured** (in CI, no device needed):
+
+- a 4095-byte budget against a 4 KiB activation is refused with
+  `out of CPU memory: … MiB of weights + … MiB of pooled buffers + … MiB for this activation
+  exceeds the … byte budget (… MiB)`, and **the pool is untouched** (`n_cpu_buffers() == 0`,
+  `pool_bytes == 0`) — the gate runs before the first backend call;
+- the same graph fits at 1 MiB, and the report then shows `0 < live_bytes <= pool_bytes`,
+  `peak_live_bytes >= live_bytes` and `headroom_bytes() < budget`;
+- weights and activations are **one comparison**: a budget covering the registered weight
+  but not the activation is still refused, and one byte more is accepted;
+- the ladder is mutation-checked in both directions (the roundings above, plus the pure plan
+  tests: two shapes in one class share, overlapping lifetimes do not, the plan is
+  order-independent) and the gate itself is mutation-checked (disabling the comparison fails
+  `a_graph_that_cannot_fit_is_refused_with_its_numbers`).
+
+**What S1 does *not* do** (it stays on [#55](https://github.com/yusiwen/minfer/issues/55)):
+
+- **The pools still allocate exact sizes**, so two shapes in one class do not yet *share* —
+  the ladder is the plan's and the accounting's view, and the ticket's "recycled buffers come
+  from the same size classes (no silent growth)" is **not** claimed yet. Rounding the pools
+  is not a one-line change: every consumer's length contract has to move to the owning
+  `BufRef` at the same time (the host read/write checks, the trace/dump capture, the
+  scheduler's staging copy and the CUDA `copy_to_host` all return a physical length today).
+  That is the reserve/assign re-map, and it is the next increment.
+- **The reserve/assign re-map itself** (a reserved region a rebuild re-maps into without
+  touching the device) and the **multi-graph cache** (which §14 row 3 points at, and which is
+  what removes E3's per-chunk graph rebuild) are S2 as well.
+- The pools still never return memory to the host/device (documented, accepted debt in
+  `docs/CUDA-BACKEND-DESIGN.md`); the accounting now makes it visible as
+  `pool_bytes` vs `live_bytes`.
 
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 
