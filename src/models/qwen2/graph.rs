@@ -1444,6 +1444,116 @@ mod tests {
         eprintln!("[e5] {k}/{n_layers} blocks on cuda, {steps} greedy steps match the CPU run");
     }
 
+    /// E5 S2's acceptance on the real model: **`auto` picks the block count from the budget**.
+    ///
+    /// The gate forces a small budget with `MINFER_GPU_MEM` so the fit is a strict prefix
+    /// (`0 < k < n_layer`) instead of the trivial "everything fits" a 128 GB device gives, checks
+    /// the startup line names the fit and its numbers, and requires the same greedy tokens as the
+    /// all-CPU run (the S1 gate's comparison). Without a cap the same request must select every
+    /// block — the pre-E5 behaviour, so an `auto` default cannot silently under-offload.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device, and because `MINFER_GPU_MEM` is
+    /// process-wide (the guard restores it, including on a panic).
+    #[test]
+    #[ignore = "requires the cached 0.5B model and a CUDA device; sets MINFER_GPU_MEM"]
+    fn an_auto_offload_plan_fits_the_budget() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::offload::OffloadRequest;
+        use crate::models::{Device, ModelDef};
+
+        /// Restore an environment variable when the test ends (a panic included: libtest unwinds).
+        struct EnvGuard(&'static str, Option<String>);
+        impl EnvGuard {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let before = std::env::var(key).ok();
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                EnvGuard(key, before)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the E5 S2 auto gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let n_layers = crate::models::qwen2::loader::hparams_from_gguf(&gguf.parts[0].ctx)
+            .expect("hparams")
+            .n_layer as usize;
+        // A budget far below the model (24 blocks of ~16 MiB) but far above one block.
+        let cap = EnvGuard::set("MINFER_GPU_MEM", Some("64"));
+
+        let cpu_ref =
+            crate::models::qwen2::loader::load(&gguf, "auto-cpuref.", OffloadRequest::Layers(0))
+                .expect("load the CPU reference");
+        let mixed = crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::Auto)
+            .expect("load the auto model");
+        if mixed.device() != Device::Cuda {
+            eprintln!(
+                "no CUDA participation (device {:?}); skipping",
+                mixed.device()
+            );
+            return;
+        }
+        let plan = mixed.offload();
+        assert!(
+            plan.gpu_layers > 0 && plan.gpu_layers < n_layers,
+            "a 64 MiB budget must be a strict prefix, got {plan:?}"
+        );
+        let report = mixed.offload_report().expect("auto must report its fit");
+        assert!(
+            report.contains("auto:") && report.contains("MINFER_GPU_MEM=64"),
+            "{report}"
+        );
+        eprintln!("[e5-s2] {report}");
+
+        // It runs, and its greedy tokens match the all-CPU run (device logits differ by design).
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+        let drive = |model: &dyn ModelDef| -> Vec<u32> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let mut l =
+                model.forward_graph_cached(&ids, &(0..n).collect::<Vec<_>>(), 1, n_ctx, &mut cache);
+            let mut next = argmax(&l);
+            let mut toks = vec![next];
+            for s in 0..4 {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                next = argmax(&l);
+                toks.push(next);
+            }
+            toks
+        };
+        assert_eq!(
+            drive(&mixed),
+            drive(&cpu_ref),
+            "an auto fit must produce the same greedy tokens as the all-CPU run"
+        );
+
+        // No cap on this device: everything fits, which is the pre-E5 behaviour.
+        let _uncapped = EnvGuard::set("MINFER_GPU_MEM", None);
+        let full = crate::models::qwen2::loader::load(&gguf, "auto-full.", OffloadRequest::Auto)
+            .expect("load the auto (uncapped) model");
+        assert_eq!(
+            full.offload().gpu_layers,
+            n_layers,
+            "an uncapped auto request on a device that fits the model must offload everything: {}",
+            full.offload_report().unwrap_or_default()
+        );
+    }
+
     /// The named tolerance class for comparisons whose two sides were computed
     /// at **different batch shapes** (a different `nt` anywhere in their
     /// history) — the project's rule is "bitwise-identity *or* a named tolerance
