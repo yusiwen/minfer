@@ -178,7 +178,8 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 
 **Open doc debt (GitHub issues):** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md` after
 the elastic partition). The docs build was [#63](https://github.com/yusiwen/minfer/issues/63), **closed**: CI job
-`check-docs` runs `mdbook build` (the toolchain Docs deploys with) plus `scripts/check_docs_links.py`, which fails
+`check-docs` runs `scripts/build_book.sh` (the pinned mdBook toolchain plus the sha384-checked
+Mermaid download) and `scripts/check_docs_links.py`, which fails
 on a relative link whose target does not exist and names the file, line and target.
 Test health was [#82](https://github.com/yusiwen/minfer/issues/82), **closed**: the three ignored real-model
 tests that failed on master (two wrote into a directory nothing created; the third asserted the greedy 0.5B's stop
