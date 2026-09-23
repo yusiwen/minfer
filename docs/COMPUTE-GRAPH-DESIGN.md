@@ -456,12 +456,15 @@ pub trait Backend: Send + Sync {
     fn alloc_buffer(&mut self, size: usize) -> usize;             // from the recycle free list
     fn free_buffer(&mut self, id: usize);
     fn alloc_fresh(&mut self, size: usize) -> usize;              // bypasses the free list
+    fn pool_len(&self) -> usize;                                  // E4: did the pool grow?
 
-    fn execute_node(&mut self, node: &CNode, in_bufs: &[usize], out_buf: usize,
+    fn execute_node(&mut self, node: &CNode, in_bufs: &[BufRef], out_buf: BufRef,
                     kv_pair: Option<(usize, usize)>) -> Result<(), String>;
 
     fn read_host(&self, id: usize) -> Option<&[f32]>;
-    fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;
+    fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;   // exact length
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32])    // E4 S2: a window of
+        -> Result<(), String>;                                                 // a class-sized buffer
     fn synchronize(&mut self);
 
     #[cfg(feature = "cuda")]

@@ -65,7 +65,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 1 | KV cache redesign (cells, seq ids, prefix reuse, shift/defrag) | L4 | XL | 2–5 w |
 | 4 | Persistent server context (no per-request rebuild/realloc) | L5+L3 | M | 3–5 d |
 | 7 | IR expressiveness: strided views/aliasing + multi-output nodes | L1 | L | 1–2 w |
-| 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator — **the budget and accounting half landed (E4 S1)** | L3+L6 | L | 1–2 w |
+| 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator — **the budget, accounting and size-class pools landed (E4 S1 + S2); the reserve/assign re-map and layer offload are open** | L3+L6 | L | 1–2 w |
 | 12 | Backend registry (drop the hard-coded 3-way enum/match) | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
 | 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
@@ -247,7 +247,11 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
    buffers. The pool is a per-`GraphCache` high-water mark that never shrinks
    (documented as accepted debt, `CUDA-BACKEND-DESIGN.md:495`) — but that was
    reasoned about for a fixed-shape CLI run, not for a server whose prompt
-   lengths vary per request.
+   lengths vary per request. **E4 S2 (2026-09-23)** rounds every pooled
+   activation to its class, so shapes inside one class share a buffer across
+   rebuilds; the *reserve/assign* half (a reserved region a rebuild re-maps
+   without touching the device) is still open, and so is the multi-graph cache
+   (§14 row 3).
 3. **No VRAM budget or feasibility check.** `cudaMemGetInfo` is queried once at
    init and only printed (`cuda.rs:1525-1546`); the sole consumer of free-memory
    information today is a valve guarding the optional f16 weight cache
@@ -580,7 +584,7 @@ work predates the tracker has no issue, and the plan is its record.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | 7 | **IR expressiveness**: strided views with allocator-known aliasing, multi-output nodes; then re-express the four decode fusions as compositions. — **DONE (D1, 2026-09-19), increments 1–3**: exact views are zero-copy with allocator-known aliasing (`CNode.view` + liveness + no-op kernels), **offset/partial windows work on CPU and CUDA** (`BufRef` carries `offset`+`len` through the `Backend` trait; Metal is exact-only until G5), and the "multi-output node" is `GraphBuilder::split_parts` — one owning node plus one `Op::View` per part, so a producer's single output feeds several consumers with independently bindable tensors while the graph stays single-output. D2's windows are in production; the sketched `Op::SplitParts` was deliberately not added (a split op over one input is just views of that input). **Item 17 (MoE) therefore no longer waits on an IR blocker** — what it needs now is model work (expert weights, routing, the grouped GEMM), and item 16 (MLA) likewise | §2.1 | L |
-| 8 | **Allocator reserve/assign split** + size-class rounding + real memory accounting + VRAM feasibility gate. — **S1 landed 2026-09-22**: the size-class ladder and a pure plan (`graph/allocplan.rs`), per-backend accounting (`memory_report`: weights/pool/live/peak + `headroom_bytes`), and a feasibility gate that refuses an over-budget graph *before* the pool is touched, naming its numbers. Still open: rounding the pools to the classes (every consumer's length contract has to move to the owning `BufRef` first), the reserve/assign re-map, and the multi-graph cache · [#55](https://github.com/yusiwen/minfer/issues/55) | §2.3 | L |
+| 8 | **Allocator reserve/assign split** + size-class rounding + real memory accounting + VRAM feasibility gate. — **S1 landed 2026-09-22**: the size-class ladder and a pure plan (`graph/allocplan.rs`), per-backend accounting (`memory_report`: weights/pool/live/peak + `headroom_bytes`), and a feasibility gate that refuses an over-budget graph *before* the pool is touched, naming its numbers. **S2 landed 2026-09-23**: the pools allocate at `class_size(size)` (two shapes in one class share a buffer across a rebuild), the node's logical length moved into `BufRef` (`write_host_window`, windowed capture reads, fills checked against `BufRef::len`), `pool_bytes` counts what the pool *holds*, all input buffers are placed before the walk (an input is filled before execution, so a released buffer would be clobbered by its previous owner's write), and a liveness extension now moves the buffer's `buf_alive` deadline — D1's view branch never ran at all. Still open: the reserve/assign re-map (a reserved region a rebuild re-maps without touching the device) and the multi-graph cache · [#55](https://github.com/yusiwen/minfer/issues/55) | §2.3 | L |
 | 9 | **Layer offload policy** on top of (8); needs a layer-granular assignment pass. | §2.6 | L |
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. — **landed in E3 (2026-09-22)**: `prefill_chunks` + `MINFER_N_BATCH` (default 2048, a no-op for prompts that fit), remainder-last so the final forward carries the tail row, and the other slots take their decode step *between* chunks. Measured: 5 forwards / max `nt` 24 vs 1 / 98 for a 98-token prompt; logits bitwise on CPU and ≤ 0.218 (class 1.0) on CUDA; the interleaving A/B is 3 decode steps vs 0; the split costs one forward's fixed overhead per chunk (514 tokens in 4 forwards: CUDA 1.11x, CPU 1.005x; 98 tokens in 5: CUDA 2.0x). Not mixed prefill+decode batches yet · [#45](https://github.com/yusiwen/minfer/issues/45) | §2.5 | M |
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
