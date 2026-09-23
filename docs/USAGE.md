@@ -42,14 +42,18 @@ Sampling and runtime options:
 - `--seed <N>` — RNG seed for sampling
 - `--n-ctx <N>` — sizes the KV cache (clamped to the model's max context)
 - `-t, --threads <N>` — CPU worker threads
-- `--gpu-layers <N>` — E5: run the first `N` transformer blocks on the device and the rest on
-  the CPU (`0` = CPU only; unset = `MINFER_GPU_LAYERS`, i.e. every block the device can hold,
-  which is the pre-E5 behaviour). The placement is printed at load
+- `--gpu-layers <N|auto>` — E5: run the first `N` transformer blocks on the device and the rest
+  on the CPU (`0` = CPU only; unset/`MINFER_GPU_LAYERS` = every block the device can hold, the
+  pre-E5 behaviour; `auto` = as many as the budget allows). The placement is printed at load
   (`offload: 4 of 24 blocks on cuda, 20 on cpu; embed/output on cpu (32.0 MiB of device
   weights; --gpu-layers 4)`), and the tensors outside the blocks — `token_embd`, the final norm
-  and `lm_head` — stay on the CPU unless every block is offloaded. Today the value is an explicit
-  ceiling, not a search: the automatic fit from the memory budget is still open
-  ([#46](https://github.com/yusiwen/minfer/issues/46)).
+  and `lm_head` — stay on the CPU unless every block is offloaded.
+- `MINFER_GPU_MEM <MiB>` — the weight budget `auto` fits into; unset = three quarters of the
+  device's free bytes (the same default the activation gate uses). `auto` also holds back a
+  quarter of that budget for the KV arenas and the activation pool, and reports what it decided
+  (`offload: … auto: 5 of 24 blocks fit — weights budget 64 MiB, 16 MiB reserved for
+  KV/activations; MINFER_GPU_MEM=64 MiB`). Without a device that reports free memory (Metal
+  today) `auto` needs `MINFER_GPU_MEM`.
 
 ## Multi-turn conversation
 
