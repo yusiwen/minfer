@@ -3301,6 +3301,98 @@ conversation/KV session snapshot does not carry `mu` (it does not carry the RNG
 either): a resumed session restarts `mu` at `2 * tau`, which affects sampling
 only, never the KV.
 
+### F8 — Metrics and observability (#51) — design (2026-09-24)
+
+**Scope.** Four independent pieces, landed together because they share one
+registry: a Prometheus text `/metrics` endpoint, live KV/arena occupancy, queue
+depth, and per-op timing behind a flag. A fifth piece — graceful drain — is the
+risky one and is designed separately below.
+
+**Where the numbers come from.** The HTTP side and the worker side are two
+threads with different reach: the handler owns the job sender and the tokenizer,
+the worker owns the model, the `GraphCache` and the `BatchEngine`. A model
+reading cannot happen on the handler thread (it would need a lock on the worker),
+and a queue reading cannot happen on the worker thread (the channel backlog is
+only visible from the sender side). So the design is one `Arc<ServerMetrics>` of
+**relaxed atomics** written by both sides and read by the renderer:
+
+* the handler writes `requests_total`, `requests_rejected_total` and
+  `in_flight` (the drain surface);
+* the worker writes the queue/engine counters (`accepted`, `admitted`,
+  `running`) and, after every step, a **published snapshot** of the allocator's
+  occupancy.
+
+`minfer_queue_depth = accepted - admitted` is the quantity neither side can see
+alone: it is everything between the handler's `send` and the engine's slot
+assignment (the channel backlog plus the worker's `pending` deque). It is
+monotone per request and converges to 0 when the worker catches up; a
+transient overshoot cannot happen because `admitted` only ever counts a job that
+`accepted` already counted.
+
+**KV occupancy is a live reading, not a startup snapshot.** `BatchEngine` gains
+`publish_metrics()`, called from `serve_loop` after each tick and after each
+admission group. It copies `GraphAllocator::memory_report(backend)` (weights /
+pool / live / peak live / budget / reservation depth), the arena shape
+(`kv_layer_count()` x `kv_n_ctx()`, `kv_region_bytes()`, `kv_is_packed()`) and
+the C3 counters (`kv_arena_stats()`) into the atomics. `memory_report` is a
+handful of `HashMap` lookups, so publishing per step is cheaper than the step
+itself; the alternative — reporting only `MemoryReport` and leaving the arena
+shape to the startup log — was rejected because the plan's E4 record says "the
+same struct is what F8 will export", and a snapshot taken at startup is exactly
+what the ticket says it must not be.
+
+**Per-op timing is measured at one choke point, and the flag is off by default.**
+`BackendScheduler::execute` already walks every node and dispatches it to its
+backend; the timer wraps that dispatch (`Instant::now()` only when the flag is
+on, one `record()` after). The alternative — instrumenting each of
+`cpu_backend` / `metal_backend` / `cuda_backend` separately — was rejected: it
+triplicates the code, still cannot separate kernel time from its prologue, and
+would leave the three backends' definitions of "an op" free to drift. The honest
+scope this buys is written down: the number is **dispatch + execution of one
+node**, and split-level syncs and cross-backend copies are not attributed.
+
+Storage is a fixed `[(name, AtomicU64 nanos, AtomicU64 calls)]` table with an
+exhaustive `op_name(&Op) -> &'static str`, so a new `Op` variant is a compile
+error rather than a metric that silently disappears. `MINFER_OP_TIMING` is
+presence-checked (the repo's convention for opt-in flags, like `MINFER_TRACE`),
+resolved once into an atomic so the hot path is a relaxed load.
+
+**Graceful drain (the risky piece).** Today `server::run` has no signal handling
+and the worker is a detached thread blocked on its job channel, and a naive
+`join()` can hang forever because in-flight HTTP handlers hold an `Arc<AppState>`
+clone and therefore keep `job_tx` open. The design is therefore **bounded first,
+observable second, join third**:
+
+1. The handler increments `in_flight` when a job is accepted, and its
+   **response guard** decrements it when the response is finished (body sent, SSE
+   stream closed, or the client gone). `in_flight` is thus "requests the HTTP
+   side still owes a response to" — which is what `axum::serve`'s graceful
+   shutdown actually waits on. A client that disconnects mid-answer releases its
+   count while the worker is still decoding, so step 4 adds a bounded wait for the
+   worker itself; that is the case a single counter would otherwise lose.
+2. On `SIGINT`/`SIGTERM`, a task sets `draining` (so handlers refuse new work
+   with `503` instead of queueing behind a shutdown) and signals
+   `axum::serve`'s graceful shutdown, which stops accepting connections.
+3. `server::run` then waits for the serve future **up to `MINFER_DRAIN_MS`**
+   (default 30000). On timeout it reports the still-in-flight count to stderr and
+   into `minfer_drain_abandoned_requests`, and returns — the process exits and
+   the detached worker dies with it. It never joins unboundedly.
+4. Only if the graceful path completed inside the deadline does it wait (again
+   bounded) for the worker, which by then has seen every sender drop.
+
+The alternative — `worker.join()` after `axum::serve` returns — is the trap the
+ticket names: an SSE client that never disconnects keeps a handler clone alive,
+`job_tx` never drops, and the join blocks for as long as the client likes. The
+CLI default is untouched: with no signal the loop waits forever, exactly as
+before.
+
+**Acceptance.** `/metrics` rendering is a pure function with boundary tests;
+`/metrics` is driven over a real HTTP connection on an ephemeral port; the
+occupancy/queue numbers are published and read back in a real-model engine run;
+`MINFER_OP_TIMING` off leaves the table empty and on accumulates (and the
+computation's output is unchanged either way); the drain is bounded and reports
+what was left. At least one new gate is mutation-checked.
+
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
 Metal is a first-class target — it is the default backend on macOS and a plain
