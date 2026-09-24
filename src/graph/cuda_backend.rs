@@ -7882,7 +7882,7 @@ mod tests {
         let gguf = crate::gguf::load_gguf_model(&p).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
         let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().unwrap();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         let nt = ids.len();
         // Full model context (32k) would size f32 KV regions at ~800 MB per

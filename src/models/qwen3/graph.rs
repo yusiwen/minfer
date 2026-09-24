@@ -908,7 +908,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Qwen3Model>()
             .expect("qwen3 model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         assert!(!ids.is_empty());
         let positions: Vec<usize> = (0..ids.len()).collect();

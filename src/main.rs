@@ -1116,7 +1116,15 @@ fn main() {
     let mut kv_cache = cache::KVCache::new(n_layer, n_kv_embd, params.n_ctx);
 
     // === Tokenizer ===
-    let tokenizer = tokenizer::Tokenizer::load(&ctx);
+    // F7 (#50): an unsupported or incomplete tokenizer is a refused load, never
+    // a wrong split. The reason names the metadata value.
+    let tokenizer = match tokenizer::Tokenizer::load(&ctx) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
 
     // F3 boundary checks. The logit bias ids need the vocabulary, which is known
@@ -1295,8 +1303,23 @@ fn main() {
             .get(tokenizer.bos_token as usize)
             .map(|s| s.as_str())
             .unwrap_or("");
-        template::render_template(&tmpl, &prompt, true, bos_text)
+        // F7 (#50): an unrenderable template is refused here, before inference —
+        // never silently replaced by a generic ChatML prompt.
+        if let Err(e) = template::validate(&tmpl) {
+            eprintln!("Error: {}", e.message());
+            std::process::exit(1);
+        }
+        match template::render_template(&tmpl, &prompt, true, bos_text) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: {}", e.message());
+                std::process::exit(1);
+            }
+        }
     } else {
+        eprintln!(
+            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+        );
         prompt.clone()
     };
     #[cfg(feature = "debug_dump")]
@@ -1886,6 +1909,19 @@ fn run_conversation(
     use std::io::Write; // reset_cache / forward trait methods
 
     let template = get_chat_template(gguf_data);
+    // F7 (#50): refuse an unrenderable template before the first turn. A GGUF
+    // with no template at all still uses ChatML, and says so once.
+    match template.as_deref() {
+        Some(t) => {
+            if let Err(e) = template::validate(t) {
+                eprintln!("Error: {}", e.message());
+                return 1;
+            }
+        }
+        None => eprintln!(
+            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+        ),
+    }
     let special = model.special_tokens();
     let bos_text = tokenizer
         .id_to_token
@@ -1939,7 +1975,10 @@ fn run_conversation(
     };
     if !resumed {
         if let (Some(msgs), Some(path)) = (history, &session_file) {
-            conv.load_history(msgs, &*tokenizer, &mut engine);
+            if let Err(e) = conv.load_history(msgs, &*tokenizer, &mut engine) {
+                eprintln!("Error: {e}");
+                return 1;
+            }
             eprintln!(
                 "[session] loaded {} message(s) from {path}",
                 conv.messages.len()

@@ -1,0 +1,609 @@
+{
+  "pre": "qwen35",
+  "model": "unsloth/Qwen3.5-0.8B",
+  "revision": "23c69c53358a07516b5827588b3fdb12ae78fd65",
+  "regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+  "provenance": {
+    "reference": "tokenizer.json pre_tokenizer Split regex evaluated by CPython `regex` 2026.9.10",
+    "tokenizer_source": "https://huggingface.co/unsloth/Qwen3.5-0.8B/raw/23c69c53358a07516b5827588b3fdb12ae78fd65/tokenizer.json",
+    "command": "/tmp/f7-venv/bin/python /tmp/f7-make-fixtures.py",
+    "date": "2026-09-24"
+  },
+  "entries": [
+    {
+      "text": "Hello, world!",
+      "pieces": [
+        "Hello",
+        ",",
+        " world",
+        "!"
+      ]
+    },
+    {
+      "text": "it's don't we're I'm he'll she'd they've",
+      "pieces": [
+        "it",
+        "'s",
+        " don",
+        "'t",
+        " we",
+        "'re",
+        " I",
+        "'m",
+        " he",
+        "'ll",
+        " she",
+        "'d",
+        " they",
+        "'ve"
+      ]
+    },
+    {
+      "text": "It'S DON'T WE'RE I'M HE'LL SHE'D THEY'VE",
+      "pieces": [
+        "It",
+        "'S",
+        " DON",
+        "'T",
+        " WE",
+        "'RE",
+        " I",
+        "'M",
+        " HE",
+        "'LL",
+        " SHE",
+        "'D",
+        " THEY",
+        "'VE"
+      ]
+    },
+    {
+      "text": "中文测试，标点符号。",
+      "pieces": [
+        "中文测试",
+        "，标点符号",
+        "。"
+      ]
+    },
+    {
+      "text": "日本語のテキストです",
+      "pieces": [
+        "日本語のテキストです"
+      ]
+    },
+    {
+      "text": "한국어 텍스트",
+      "pieces": [
+        "한국어",
+        " 텍스트"
+      ]
+    },
+    {
+      "text": "café naïve façade résumé",
+      "pieces": [
+        "café",
+        " naïve",
+        " façade",
+        " résumé"
+      ]
+    },
+    {
+      "text": "emoji: 👨‍👩‍👧 🚀 🇨🇳",
+      "pieces": [
+        "emoji",
+        ":",
+        " 👨‍👩‍👧",
+        " 🚀",
+        " 🇨🇳"
+      ]
+    },
+    {
+      "text": "Ω≈ç√∫˜µ≤≥÷",
+      "pieces": [
+        "Ω",
+        "≈ç",
+        "√∫˜",
+        "µ",
+        "≤≥÷"
+      ]
+    },
+    {
+      "text": "Δοκιμή Ελληνικά",
+      "pieces": [
+        "Δοκιμή",
+        " Ελληνικά"
+      ]
+    },
+    {
+      "text": "Привет, мир!",
+      "pieces": [
+        "Привет",
+        ",",
+        " мир",
+        "!"
+      ]
+    },
+    {
+      "text": "مرحبا بالعالم",
+      "pieces": [
+        "مرحبا",
+        " بالعالم"
+      ]
+    },
+    {
+      "text": "אבגדה",
+      "pieces": [
+        "אבגדה"
+      ]
+    },
+    {
+      "text": "ᐊᓂ ᓄᓇᕗᑦ",
+      "pieces": [
+        "ᐊᓂ",
+        " ᓄᓇᕗᑦ"
+      ]
+    },
+    {
+      "text": "क्षि नमस्ते",
+      "pieces": [
+        "क्षि",
+        " नमस्ते"
+      ]
+    },
+    {
+      "text": "สวัสดี",
+      "pieces": [
+        "สวัสดี"
+      ]
+    },
+    {
+      "text": "  leading spaces",
+      "pieces": [
+        " ",
+        " leading",
+        " spaces"
+      ]
+    },
+    {
+      "text": "trailing spaces  ",
+      "pieces": [
+        "trailing",
+        " spaces",
+        "  "
+      ]
+    },
+    {
+      "text": "   ",
+      "pieces": [
+        "   "
+      ]
+    },
+    {
+      "text": "\t\t",
+      "pieces": [
+        "\t\t"
+      ]
+    },
+    {
+      "text": "\n\n\n",
+      "pieces": [
+        "\n\n\n"
+      ]
+    },
+    {
+      "text": "a  b",
+      "pieces": [
+        "a",
+        " ",
+        " b"
+      ]
+    },
+    {
+      "text": "a   b    c",
+      "pieces": [
+        "a",
+        "  ",
+        " b",
+        "   ",
+        " c"
+      ]
+    },
+    {
+      "text": "a\tb\tc",
+      "pieces": [
+        "a",
+        "\tb",
+        "\tc"
+      ]
+    },
+    {
+      "text": "a\nb\r\nc",
+      "pieces": [
+        "a",
+        "\n",
+        "b",
+        "\r\n",
+        "c"
+      ]
+    },
+    {
+      "text": "a\n\n\nb",
+      "pieces": [
+        "a",
+        "\n\n\n",
+        "b"
+      ]
+    },
+    {
+      "text": "line one\nline two\n\nline three",
+      "pieces": [
+        "line",
+        " one",
+        "\n",
+        "line",
+        " two",
+        "\n\n",
+        "line",
+        " three"
+      ]
+    },
+    {
+      "text": " \t mixed \n whitespace \r\n everywhere \t ",
+      "pieces": [
+        " \t",
+        " mixed",
+        " \n",
+        " whitespace",
+        " \r\n",
+        " everywhere",
+        " \t "
+      ]
+    },
+    {
+      "text": "end with newline\n",
+      "pieces": [
+        "end",
+        " with",
+        " newline",
+        "\n"
+      ]
+    },
+    {
+      "text": "end with two newlines\n\n",
+      "pieces": [
+        "end",
+        " with",
+        " two",
+        " newlines",
+        "\n\n"
+      ]
+    },
+    {
+      "text": "\nstart with newline",
+      "pieces": [
+        "\n",
+        "start",
+        " with",
+        " newline"
+      ]
+    },
+    {
+      "text": " \n \t \n ",
+      "pieces": [
+        " \n \t \n",
+        " "
+      ]
+    },
+    {
+      "text": "1234567890",
+      "pieces": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "0"
+      ]
+    },
+    {
+      "text": "3.14159",
+      "pieces": [
+        "3",
+        ".",
+        "1",
+        "4",
+        "1",
+        "5",
+        "9"
+      ]
+    },
+    {
+      "text": "0xDEADBEEF",
+      "pieces": [
+        "0",
+        "xDEADBEEF"
+      ]
+    },
+    {
+      "text": "a1b2c3d4",
+      "pieces": [
+        "a",
+        "1",
+        "b",
+        "2",
+        "c",
+        "3",
+        "d",
+        "4"
+      ]
+    },
+    {
+      "text": "1,000,000.50",
+      "pieces": [
+        "1",
+        ",",
+        "0",
+        "0",
+        "0",
+        ",",
+        "0",
+        "0",
+        "0",
+        ".",
+        "5",
+        "0"
+      ]
+    },
+    {
+      "text": "2024-01-02T03:04:05Z",
+      "pieces": [
+        "2",
+        "0",
+        "2",
+        "4",
+        "-",
+        "0",
+        "1",
+        "-",
+        "0",
+        "2",
+        "T",
+        "0",
+        "3",
+        ":",
+        "0",
+        "4",
+        ":",
+        "0",
+        "5",
+        "Z"
+      ]
+    },
+    {
+      "text": "!!!???...,,,;;;:::",
+      "pieces": [
+        "!!!???...,,,;;;:::"
+      ]
+    },
+    {
+      "text": "C++17 and x86_64",
+      "pieces": [
+        "C",
+        "++",
+        "1",
+        "7",
+        " and",
+        " x",
+        "8",
+        "6",
+        "_",
+        "6",
+        "4"
+      ]
+    },
+    {
+      "text": "https://example.com/path?q=1&r=2#frag",
+      "pieces": [
+        "https",
+        "://",
+        "example",
+        ".com",
+        "/path",
+        "?q",
+        "=",
+        "1",
+        "&r",
+        "=",
+        "2",
+        "#frag"
+      ]
+    },
+    {
+      "text": "user@example.com",
+      "pieces": [
+        "user",
+        "@example",
+        ".com"
+      ]
+    },
+    {
+      "text": "a-b_c.d/e\\f",
+      "pieces": [
+        "a",
+        "-b",
+        "_c",
+        ".d",
+        "/e",
+        "\\f"
+      ]
+    },
+    {
+      "text": "((nested [brackets] {braces}))",
+      "pieces": [
+        "((",
+        "nested",
+        " [",
+        "brackets",
+        "]",
+        " {",
+        "braces",
+        "}))"
+      ]
+    },
+    {
+      "text": "→ ⇒ ⇔ ± × ÷ ≠ ≤ ≥",
+      "pieces": [
+        "→",
+        " ⇒",
+        " ⇔",
+        " ±",
+        " ×",
+        " ÷",
+        " ≠",
+        " ≤",
+        " ≥"
+      ]
+    },
+    {
+      "text": "50% + 25% = 75%",
+      "pieces": [
+        "5",
+        "0",
+        "%",
+        " +",
+        " ",
+        "2",
+        "5",
+        "%",
+        " =",
+        " ",
+        "7",
+        "5",
+        "%"
+      ]
+    },
+    {
+      "text": "<|im_start|>system\nYou are helpful.<|im_end|>",
+      "pieces": [
+        "<|",
+        "im",
+        "_start",
+        "|>",
+        "system",
+        "\n",
+        "You",
+        " are",
+        " helpful",
+        ".<|",
+        "im",
+        "_end",
+        "|>"
+      ]
+    },
+    {
+      "text": "a<|im_end|>b",
+      "pieces": [
+        "a",
+        "<|",
+        "im",
+        "_end",
+        "|>",
+        "b"
+      ]
+    },
+    {
+      "text": "<|endoftext|>",
+      "pieces": [
+        "<|",
+        "endoftext",
+        "|>"
+      ]
+    },
+    {
+      "text": "<|im_start|>",
+      "pieces": [
+        "<|",
+        "im",
+        "_start",
+        "|>"
+      ]
+    },
+    {
+      "text": "text with <|endoftext|> in the middle",
+      "pieces": [
+        "text",
+        " with",
+        " <|",
+        "endoftext",
+        "|>",
+        " in",
+        " the",
+        " middle"
+      ]
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.  Pack my box with five dozen liquor jugs!\nSphinx of black quartz, judge my vow — 1234567890.\n混合文本 with English, numbers 42, and punctuation... done.\n",
+      "pieces": [
+        "The",
+        " quick",
+        " brown",
+        " fox",
+        " jumps",
+        " over",
+        " the",
+        " lazy",
+        " dog",
+        ".",
+        " ",
+        " Pack",
+        " my",
+        " box",
+        " with",
+        " five",
+        " dozen",
+        " liquor",
+        " jugs",
+        "!\n",
+        "Sphinx",
+        " of",
+        " black",
+        " quartz",
+        ",",
+        " judge",
+        " my",
+        " vow",
+        " —",
+        " ",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "0",
+        ".\n",
+        "混合文本",
+        " with",
+        " English",
+        ",",
+        " numbers",
+        " ",
+        "4",
+        "2",
+        ",",
+        " and",
+        " punctuation",
+        "...",
+        " done",
+        ".\n"
+      ]
+    }
+  ]
+}

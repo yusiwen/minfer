@@ -113,6 +113,21 @@ pub fn run_viz(
         ],
     }));
 
+    // F7 (#50): refuse to start with an unrenderable template, before the worker
+    // thread exists.
+    let template = super::chat_template_from_gguf(&gguf.parts[0].data);
+    match template.as_deref() {
+        Some(t) => {
+            if let Err(e) = crate::template::validate(t) {
+                eprintln!("Error: {}", e.message());
+                return;
+            }
+        }
+        None => eprintln!(
+            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+        ),
+    }
+
     let worker_tokenizer = tokenizer.clone();
     // F8: the viz server publishes into the same registry shape as `minfer serve`
     // (its own instance — the two commands never run in one process).
@@ -133,7 +148,6 @@ pub fn run_viz(
         )
     });
 
-    let template = super::chat_template_from_gguf(&gguf.parts[0].data);
     let app = Arc::new(AppState {
         job_tx,
         metrics,
@@ -309,12 +323,15 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
         return json_err("prompt required");
     }
     let bos = state.app.tokenizer.bos_text();
-    let prompt = crate::template::render_messages(
-        state.app.chat_template.as_deref().unwrap_or(""),
+    let prompt = match crate::template::render_messages_opt(
+        state.app.chat_template.as_deref(),
         &[("user".to_string(), Some(req.prompt.clone()))],
         true,
         &bos,
-    );
+    ) {
+        Ok(p) => p,
+        Err(e) => return json_err(e.message()),
+    };
     let input_ids = state.app.tokenizer.encode(&prompt);
     if input_ids.is_empty() {
         return json_err("prompt tokenizes to nothing");

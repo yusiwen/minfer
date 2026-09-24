@@ -337,6 +337,16 @@ pub enum ConvError {
     /// F2 (#47): the grammar engine refused a step (no allowed token, a token it
     /// rejects). The turn stops; the emitted text is a valid prefix.
     Grammar(String),
+    /// F7 (#50): the model's chat template cannot be rendered (an unsupported
+    /// construct, a syntax error). The turn is refused loudly — the engine never
+    /// substitutes a generic ChatML prompt.
+    Template(String),
+}
+
+impl From<template::TemplateError> for ConvError {
+    fn from(e: template::TemplateError) -> Self {
+        ConvError::Template(e.message())
+    }
 }
 
 impl std::fmt::Display for ConvError {
@@ -354,6 +364,7 @@ impl std::fmt::Display for ConvError {
                  state has no home in a verify round)"
             ),
             ConvError::Grammar(msg) => write!(f, "{msg}"),
+            ConvError::Template(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -412,16 +423,15 @@ pub struct ConversationSnapshot {
 
 /// Renders a message list the way a session does: the model's own chat template
 /// when it has one, the ChatML fallback otherwise.
+///
+/// F7 (#50): a template that cannot be rendered is a refusal, not a fallback.
 fn render_messages_with(
     template: Option<&str>,
     messages: &[(String, Option<String>)],
     add_generation_prompt: bool,
     bos_text: &str,
-) -> String {
-    match template {
-        Some(t) => template::render_messages(t, messages, add_generation_prompt, bos_text),
-        None => template::fallback_chatml_messages(messages, add_generation_prompt),
-    }
+) -> Result<String, template::TemplateError> {
+    template::render_messages_opt(template, messages, add_generation_prompt, bos_text)
 }
 
 /// Start of the oldest droppable turn: the index of the first user message before
@@ -468,13 +478,17 @@ impl Conversation {
     }
 
     /// Fully renders the current messages (with/without the generation prompt).
-    fn render_full(&self, add_generation_prompt: bool) -> String {
+    ///
+    /// F7 (#50): the template is validated when the session is created, but a
+    /// refusal here is still a turn error — never a generic ChatML prompt.
+    fn render_full(&self, add_generation_prompt: bool) -> Result<String, ConvError> {
         render_messages_with(
             self.template.as_deref(),
             &self.messages,
             add_generation_prompt,
             &self.bos_text,
         )
+        .map_err(|e| ConvError::Template(e.message()))
     }
 
     /// Resets the cache and prefills the given token stream from scratch (the full re-render path).
@@ -510,7 +524,7 @@ impl Conversation {
         };
         self.messages
             .push(("user".to_string(), Some(input.to_string())));
-        let full = self.render_full(true);
+        let full = self.render_full(true)?;
         let toks = decoder.encode(&full);
         if toks.is_empty() {
             return Err(ConvError::EmptyInput);
@@ -746,7 +760,7 @@ impl Conversation {
             ("user".to_string(), Some(input.to_string())),
             true,
             &self.bos_text,
-        );
+        )?;
         let delta_toks = decoder.encode(&delta.text);
         if delta_toks.is_empty() {
             return Err(ConvError::EmptyInput);
@@ -756,7 +770,7 @@ impl Conversation {
         if !delta.prefix_matched {
             self.messages
                 .push(("user".to_string(), Some(input.to_string())));
-            let full = self.render_full(true);
+            let full = self.render_full(true)?;
             let toks = decoder.encode(&full);
             if toks.is_empty() {
                 return Err(ConvError::EmptyInput);
@@ -783,7 +797,7 @@ impl Conversation {
         if self.current_pos + eot_budget + delta_toks.len() > self.n_ctx {
             self.messages
                 .push(("user".to_string(), Some(input.to_string())));
-            let (first, dropped_msg) = self.plan_overflow_drop(decoder);
+            let (first, dropped_msg) = self.plan_overflow_drop(decoder)?;
             if dropped_msg == 0 {
                 // Only [system?, last user] left and it still does not fit: a single message is too long, error out.
                 // Roll back: pop the just-pushed user message and reset the EOT flag (if EOT was written this turn,
@@ -800,9 +814,9 @@ impl Conversation {
             // Both boundaries are verified against the stream before anything is
             // touched; an unverifiable one (an exotic template, a backend that
             // cannot move rows) falls back to the exact re-render.
-            let region = self.overflow_region(first, dropped_msg, decoder);
+            let region = self.overflow_region(first, dropped_msg, decoder)?;
             self.messages.drain(first..first + dropped_msg);
-            let full = self.render_full(true);
+            let full = self.render_full(true)?;
             let toks = decoder.encode(&full);
 
             let mut used_shift = false;
@@ -896,7 +910,7 @@ impl Conversation {
         // to be prefilled too, or the stream would not be the canonical render
         // (§5.4) — and the system prompt would silently never reach the model.
         if self.current_pos == 0 {
-            let full = self.render_full(true);
+            let full = self.render_full(true)?;
             let toks = decoder.encode(&full);
             if toks.is_empty() {
                 self.messages.pop();
@@ -947,7 +961,7 @@ impl Conversation {
         // First turn (or a turn after a full re-render) has turn_pos == 0: after the rollback the KV is empty, so a full render is needed;
         // other turns only need to replay that user message's delta.
         let toks = if self.turn_pos == 0 {
-            let full = self.render_full(true);
+            let full = self.render_full(true)?;
             decoder.encode(&full)
         } else {
             let delta = format_single(
@@ -956,7 +970,7 @@ impl Conversation {
                 ("user".to_string(), Some(last_user)),
                 true,
                 &self.bos_text,
-            );
+            )?;
             decoder.encode(&delta.text)
         };
         if toks.is_empty() {
@@ -1002,7 +1016,7 @@ impl Conversation {
     /// Planned against a copy of the message list, so the caller can still
     /// resolve the dropped region's token span in the KV *before* the messages
     /// change.
-    fn plan_overflow_drop(&self, decoder: &dyn TokenCodec) -> (usize, usize) {
+    fn plan_overflow_drop(&self, decoder: &dyn TokenCodec) -> Result<(usize, usize), ConvError> {
         let mut msgs = self.messages.clone();
         // Indices in the *original* message list: `removed` messages before the
         // current drop have already gone, and drops always take the oldest turn,
@@ -1011,7 +1025,7 @@ impl Conversation {
         let mut end = 0usize;
         let mut removed = 0usize;
         loop {
-            let full = render_messages_with(self.template.as_deref(), &msgs, true, &self.bos_text);
+            let full = render_messages_with(self.template.as_deref(), &msgs, true, &self.bos_text)?;
             if decoder.encode(&full).len() <= self.n_ctx {
                 break;
             }
@@ -1030,11 +1044,11 @@ impl Conversation {
             removed += n;
             end = idx + removed;
         }
-        if first == usize::MAX {
+        Ok(if first == usize::MAX {
             (0, 0)
         } else {
             (first, end - first)
-        }
+        })
     }
 
     /// Token region `[start, start + len)` of the KV stream that messages
@@ -1045,13 +1059,17 @@ impl Conversation {
         first: usize,
         count: usize,
         decoder: &dyn TokenCodec,
-    ) -> Option<(usize, usize)> {
+    ) -> Result<Option<(usize, usize)>, ConvError> {
         if count == 0 {
-            return None;
+            return Ok(None);
         }
-        let start = self.stream_boundary(first, decoder)?;
-        let end = self.stream_boundary(first + count, decoder)?;
-        (end > start).then_some((start, end - start))
+        let (Some(start), Some(end)) = (
+            self.stream_boundary(first, decoder)?,
+            self.stream_boundary(first + count, decoder)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok((end > start).then_some((start, end - start)))
     }
 
     /// Token offset at which message `upto` starts in the KV stream, verified:
@@ -1063,21 +1081,25 @@ impl Conversation {
     /// exactly. A template whose deltas do not line up that way — or a session
     /// state where they do not — yields `None`, and the caller falls back to the
     /// exact re-render path instead of shifting the wrong rows.
-    fn stream_boundary(&self, upto: usize, decoder: &dyn TokenCodec) -> Option<usize> {
+    fn stream_boundary(
+        &self,
+        upto: usize,
+        decoder: &dyn TokenCodec,
+    ) -> Result<Option<usize>, ConvError> {
         if upto == 0 {
-            return Some(0);
+            return Ok(Some(0));
         }
         if upto > self.messages.len() {
-            return None;
+            return Ok(None);
         }
         let text = render_messages_with(
             self.template.as_deref(),
             &self.messages[..upto],
             false,
             &self.bos_text,
-        );
+        )?;
         let toks = decoder.encode(&text);
-        self.stream_tokens.starts_with(&toks).then_some(toks.len())
+        Ok(self.stream_tokens.starts_with(&toks).then_some(toks.len()))
     }
 
     /// `--session`: serializes messages as an OpenAI-style JSON array
@@ -1229,13 +1251,14 @@ impl Conversation {
         messages: Vec<(String, Option<String>)>,
         decoder: &dyn TokenCodec,
         engine: &mut dyn Engine,
-    ) {
+    ) -> Result<(), ConvError> {
         self.messages = messages;
         self.need_insert_eot = false;
         self.turn_pos = 0;
-        let full = self.render_full(false);
+        let full = self.render_full(false)?;
         let toks = decoder.encode(&full);
         let _ = self.rehydrate_full(engine, &toks);
+        Ok(())
     }
 
     /// Decode loop: sample/decode token by token starting from `logits` (the last prefill token),
@@ -2034,7 +2057,8 @@ mod tests {
             ("user".to_string(), Some("X".to_string())),
             true,
             "",
-        );
+        )
+        .expect("diff render");
         assert_eq!(
             out.prefill_tokens,
             FakeCodec.encode(&delta.text).len(),
@@ -2198,7 +2222,8 @@ mod tests {
         let mut c2 = conv(512);
         let mut eng2 = MockEngine::new(vec![IM_END, EOS]);
         let msgs = Conversation::messages_from_json(&saved).unwrap();
-        c2.load_history(msgs, &FakeCodec, &mut eng2);
+        c2.load_history(msgs, &FakeCodec, &mut eng2)
+            .expect("load history");
         assert_eq!(c2.messages, c.messages);
         assert_eq!(c2.current_pos, c2.stream_tokens.len());
         let canon = canonical(&c.messages);
@@ -2270,7 +2295,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ctx = &gguf.parts[0].ctx;
         let template = ctx
             .kv
@@ -2388,7 +2413,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ctx = &gguf.parts[0].ctx;
         let template = ctx
             .kv

@@ -1,0 +1,277 @@
+{
+  "provenance": {
+    "generator": "CPython 3.12.3 builtin str methods",
+    "command": "/tmp/f7-venv/bin/python /tmp/f7-make-fixtures.py",
+    "date": "2026-09-24"
+  },
+  "entries": [
+    {
+      "method": "strip",
+      "receiver": "\n\nhello\n",
+      "args": [],
+      "expected": "hello"
+    },
+    {
+      "method": "strip",
+      "receiver": "xxhelloxx",
+      "args": [
+        "x"
+      ],
+      "expected": "hello"
+    },
+    {
+      "method": "strip",
+      "receiver": " \t hello \t ",
+      "args": [],
+      "expected": "hello"
+    },
+    {
+      "method": "lstrip",
+      "receiver": "\n\nhello\n\n",
+      "args": [
+        "\n"
+      ],
+      "expected": "hello\n\n"
+    },
+    {
+      "method": "lstrip",
+      "receiver": "abchello",
+      "args": [
+        "abc"
+      ],
+      "expected": "hello"
+    },
+    {
+      "method": "lstrip",
+      "receiver": "hello",
+      "args": [
+        "xyz"
+      ],
+      "expected": "hello"
+    },
+    {
+      "method": "rstrip",
+      "receiver": "hello\n\n",
+      "args": [
+        "\n"
+      ],
+      "expected": "hello"
+    },
+    {
+      "method": "rstrip",
+      "receiver": "helloabcba",
+      "args": [
+        "abc"
+      ],
+      "expected": "hello"
+    },
+    {
+      "method": "split",
+      "receiver": "a</think>b</think>c",
+      "args": [
+        "</think>"
+      ],
+      "expected": [
+        "a",
+        "b",
+        "c"
+      ]
+    },
+    {
+      "method": "split",
+      "receiver": "a</think>b</think>c",
+      "args": [
+        "</think>",
+        1
+      ],
+      "expected": [
+        "a",
+        "b</think>c"
+      ]
+    },
+    {
+      "method": "split",
+      "receiver": "</think>leading",
+      "args": [
+        "</think>"
+      ],
+      "expected": [
+        "",
+        "leading"
+      ]
+    },
+    {
+      "method": "split",
+      "receiver": "trailing</think>",
+      "args": [
+        "</think>"
+      ],
+      "expected": [
+        "trailing",
+        ""
+      ]
+    },
+    {
+      "method": "split",
+      "receiver": "a b  c\td\n",
+      "args": [],
+      "expected": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ]
+    },
+    {
+      "method": "rsplit",
+      "receiver": "a.b.c",
+      "args": [
+        ".",
+        1
+      ],
+      "expected": [
+        "a.b",
+        "c"
+      ]
+    },
+    {
+      "method": "startswith",
+      "receiver": "hello world",
+      "args": [
+        "hello"
+      ],
+      "expected": true
+    },
+    {
+      "method": "startswith",
+      "receiver": "hello world",
+      "args": [
+        [
+          "x",
+          "he"
+        ]
+      ],
+      "expected": true
+    },
+    {
+      "method": "endswith",
+      "receiver": "hello world",
+      "args": [
+        "world"
+      ],
+      "expected": true
+    },
+    {
+      "method": "endswith",
+      "receiver": "hello",
+      "args": [
+        "x"
+      ],
+      "expected": false
+    },
+    {
+      "method": "replace",
+      "receiver": "a-b-c",
+      "args": [
+        "-",
+        "+"
+      ],
+      "expected": "a+b+c"
+    },
+    {
+      "method": "replace",
+      "receiver": "aaa",
+      "args": [
+        "a",
+        "b",
+        2
+      ],
+      "expected": "bba"
+    },
+    {
+      "method": "replace",
+      "receiver": "aaaa",
+      "args": [
+        "aa",
+        "b"
+      ],
+      "expected": "bb"
+    },
+    {
+      "method": "lower",
+      "receiver": "MiXeD",
+      "args": [],
+      "expected": "mixed"
+    },
+    {
+      "method": "upper",
+      "receiver": "MiXeD",
+      "args": [],
+      "expected": "MIXED"
+    },
+    {
+      "method": "title",
+      "receiver": "hello world",
+      "args": [],
+      "expected": "Hello World"
+    },
+    {
+      "method": "capitalize",
+      "receiver": "hello world",
+      "args": [],
+      "expected": "Hello world"
+    },
+    {
+      "method": "join",
+      "receiver": "-",
+      "args": [
+        "abc"
+      ],
+      "expected": "a-b-c"
+    },
+    {
+      "method": "join",
+      "receiver": ", ",
+      "args": [
+        [
+          "a",
+          "b",
+          "c"
+        ]
+      ],
+      "expected": "a, b, c"
+    },
+    {
+      "method": "find",
+      "receiver": "hello world",
+      "args": [
+        "world"
+      ],
+      "expected": 6
+    },
+    {
+      "method": "find",
+      "receiver": "hello world",
+      "args": [
+        "xyz"
+      ],
+      "expected": -1
+    },
+    {
+      "method": "rfind",
+      "receiver": "a.b.c",
+      "args": [
+        "."
+      ],
+      "expected": 3
+    },
+    {
+      "method": "count",
+      "receiver": "banana",
+      "args": [
+        "an"
+      ],
+      "expected": 2
+    }
+  ]
+}
