@@ -1040,6 +1040,58 @@ on the device is **memory** (3.76× less than f32, 1.88× less than f16); whethe
 also improves depends on the block-dequant instruction count, so the bar against f16 is "no worse
 than a named factor", not "faster".
 
+**S2b design decisions, frozen before the first line of kernel code (2026-09-24).** The plan above
+is the map; these are the choices it leaves open, decided up front so the implementation cannot
+drift into a silent fallback:
+
+1. **Layout tag and accessors.** `KV_LAYOUT_F32 = 0 / KV_LAYOUT_F16 = 1 / KV_LAYOUT_Q8_0 = 2` are
+   `#define`s in `src/cuda_kernels.cu`, and **`0/1/2` are a host contract**: the Rust side stores the
+   same codes (the registry's `KvFormat` discriminants) and every launcher takes the tag as an
+   `int`. Two accessors are the *only* place a KV address is formed:
+   `kv_row(const void* base, int64_t cell, size_t row_bytes)` (byte address of a cell) and
+   `kv4<LAYOUT>(const char* row, int elem) -> float4` (the single load idiom). `F32` is the old
+   `float4` load and `F16` the old two-`__half2` pair, both **bit-identical** to today's
+   `kv_ld4<float>` / `kv_ld4<__half>`; `Q8_0` reads block `elem/32`'s f16 scale plus four quants at
+   `2 + elem%32`. A 4-element group never straddles a block because a KV head's base is `hd`-aligned
+   and `hd % 32 == 0` — the property `ensure_kv`'s packed-width check already enforces.
+2. **No typed pointer survives.** Every attention kernel that can see a packed row takes
+   `const void* k, const void* v` plus `size_t row_bytes`, and templates on `int LAYOUT` instead of
+   `typename KV`. The `row_bytes == nk * hd * 4` value the f32 path passes is the same arithmetic as
+   the old `stride_kv * sizeof(KV)`, so the f32/f16 instruction streams are unchanged.
+3. **Dispatch cuts, each stated when the format is enabled** (build-time; a packed row never reaches
+   a kernel that would address it as f32):
+   - decode `nt == 1` → the converted split-K 1-warp body (`gqa_attn_split_partial`), with
+     `rpw_gate = 0`: the hybrid 4-warp dispatch is f16-typed (`attn_split_h4w_body` takes
+     `const __half*`) and is not converted in this increment;
+   - `1 < nt <= 16` → `gqa_attn_f32`. The batched split kernel (`gqa_attn_split_partial_bt`) exists
+     for spec-verify's **bitwise** identity contract with sequential decode; rather than claim that
+     contract without measuring it, a **speculative session refuses a packed cache loudly** (the
+     draft already keeps its own KV, and C5 already refuses a draft session);
+   - prefill `nt > 16` → `gqa_attn_f32`. The FA path (`fa_prefill_f16kv`, f16-typed shared-memory
+     staging and tensor-core QK^T) is not offered for Q8_0, so the prefill is **correct but off its
+     tuned path** — measured and reported, not hidden;
+   - the fused decode epilogue (`Op::FusedQKV` / `Op::QkvBiasRopeStore`) is **not built** for a
+     packed cache: the model builders' `layer_gpu` gate gains `&& !packed`, so a Q8_0 decode runs
+     the unfused bias → rope → store chain through the converted `store_kv_q8_0`.
+4. **The store is the CPU's quantizer, byte for byte.** `store_kv_q8_0` maps one thread to one
+   `(row, 32-element block)`, computes `amax`, `d = amax/127` as an f16 (nearest-even), and
+   `round_ties_even` for each quant — the same three steps `quants::quantize_row_q8_0_into` uses —
+   and writes `d` then the 32 quants into the packed cell at 34-byte stride. Both backends therefore
+   store the same bytes for the same f32 row, which is what makes the CPU/device Q8_0 comparison a
+   layout check rather than a tolerance question.
+5. **The gate flips only after the kernels exist, and through the registry.** `READS_PACKED_KV`
+   stays `false` until every dispatch cut above is in place; then it becomes `true` for CUDA and
+   `KvFormat::supports(Cuda)` follows automatically (`registry::reads_packed_kv` is the one
+   authority). `CudaBackend` gains an `int` layout field fed by the *resolved* `KvFormat`, so
+   `MINFER_CACHE_TYPE=q8_0` can never again mean "f32 with a packed region".
+6. **Acceptance bar, named before measuring.** The device win is **memory**: a Q8_0 cell is `34/128`
+   bytes per element versus `4` (f32) and `2` (f16), i.e. **3.76x less than f32 and 1.88x less than
+   f16**. Whether *speed* also improves depends on the block-dequant instruction count in the load
+   path, so the bar against f16 is stated as a factor, not as "faster": **Q8_0 decode tokens/s must
+   be no worse than `1/1.30` of the f16 decode rate on the same model and context** (the same 1.30x
+   already recorded for the CPU's fused Q8_0 read at ctx 2048), and the prefill is reported as its
+   own number because it takes the untuned `gqa_attn_f32` route.
+
 **Why it is not in this increment.** ~10 kernel sites, 3 launchers, ~15 host sites and 41 test
 sites, each needing an nvcc iteration and — for the gates — a serial device run. It is recorded
 here rather than half-wired. [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
