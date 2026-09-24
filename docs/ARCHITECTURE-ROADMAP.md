@@ -501,20 +501,33 @@ repacking** — the standard fix for this gap is to repack the quant blocks at
 load time into SIMD-friendly interleaved layouts. 🟠 for anyone on x86; the fix
 is well-understood and self-contained.
 
-**Tokenizer.** BPE only, loaded from GGUF metadata (`tokenizer.rs`). No
-SentencePiece/unigram path, no WordPiece, and no per-model BPE pre-tokenizer
-variants. That covers Qwen and Llama 3 but not the SentencePiece-based
-families. 🟡→🟠 as the architecture list grows. Special-token matching is
-hand-extended per model (e.g. the DeepSeek-R1 fix noted in `AGENTS.md`), which
-does not scale.
+**Tokenizer.** Byte-level BPE only, loaded from GGUF metadata
+(`tokenizer.rs`). F7 ([#50](https://github.com/yusiwen/minfer/issues/50),
+2026-09-24) made `tokenizer.ggml.pre` authoritative with two hand-written rule
+sets (`qwen2`, `qwen35`), replaced the silent `unwrap_or(0)` with a checked byte
+fallback, and made every other pre-tokenizer value (including a missing one), a
+non-`gpt2` model, an empty merge table and an incomplete byte vocabulary a loud
+load refusal. What remains: **no SentencePiece/unigram or WordPiece path**, and
+no `ignore_merges`/multi-regex pre-tokenizers (`llama3`, `default`,
+`deepseek-*`, …) — those refuse by name, so the coverage gap is explicit rather
+than a wrong split. Also no NFC normalization (llama.cpp does not apply one for
+BPE either) and special-token *matching* is still a per-model hand-extension
+(the DeepSeek-R1 fix noted in `AGENTS.md`), which does not scale. 🟡 for the
+Qwen/Llama-3-shaped families this engine supports; 🟠 for anything
+SentencePiece-based. Follow-up:
+[#132](https://github.com/yusiwen/minfer/issues/132).
 
-**Chat templates.** minijinja 2.21 exposes no `str` methods, so Qwen3's
-`chat_template` fails to render and falls back to ChatML
-(`template.rs`, `QWEN3-SUPPORT-PLAN.md §5#9`). The fallback silently loses
-`enable_thinking`, tool-call formatting and think-block handling. This is a
-**prompt-fidelity** issue, not cosmetic: it changes model behaviour. The fix is
-a wider Jinja subset (or a purpose-built renderer) plus a `--chat-template`
-override. 🟠
+**Chat templates.** **Landed in F7** ([#50](https://github.com/yusiwen/minfer/issues/50),
+2026-09-24). minijinja 2.21.0's `set_unknown_method_callback` is the extension
+point, so Qwen3's `chat_template` renders (think-block extraction, tool-call
+formatting, `enable_thinking`) with **no dependency change**; the reference
+renderings are committed and byte-for-byte gated, and any template the engine
+cannot render is a loud refusal naming the construct and line — validated at
+load, so the CLI exits and the server refuses to start. What remains: a
+`--chat-template <FILE>` override (a user-supplied template for a GGUF that has
+none or a wrong one), `strftime_now`, and the Python `str` methods outside the
+implemented set (each refused loudly). Design + accepted/refused sets:
+`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`. 🟢 for the supported models.
 
 **Sampling.** One `SamplerConfig` pipeline in `sampler.rs` (#48, **landed
 2026-09-24**): logit bias → penalties → DRY → greedy shortcut → top-k → typical
@@ -623,8 +636,8 @@ work predates the tracker has no issue, and the plan is its record.
 | 16 | **Sampler set**: min-p, typical, XTC, DRY, mirostat, logit bias. — **landed in F3 (2026-09-24)**: [#48](https://github.com/yusiwen/minfer/issues/48) | §2.7 | M |
 | 17 | **MoE support** (see `MODEL-SUPPORT-ROADMAP.md` Tier 2 #1) — depends on item 7 for a clean implementation. | §2.1, §2.7 | L |
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
-| 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. | §2.7 | M |
-| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. | §2.7 | M |
+| 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. — **landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50), the Python-`str`-method hook + the loud refusal; design record `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`; remains: `--chat-template <FILE>` + `strftime_now` ([#133](https://github.com/yusiwen/minfer/issues/133)) | §2.7 | M |
+| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. — **partly landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50) made `tokenizer.ggml.pre` authoritative (`qwen2`/`qwen35`, byte-for-byte gated, unknown values refused) and replaced the silent byte fallback; SentencePiece/unigram/WordPiece and the remaining pre-tokenizer rules are [#132](https://github.com/yusiwen/minfer/issues/132) | §2.7 | M |
 | 21 | **Quantized KV** (Q8_0 first) — after item 1. — **landed in C4 S1 + S2 on the CPU (fused read, quantize-aware shift); the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87)** | §2.4 | M |
 | 22 | **Quantizer tooling**: `convert-hf-to-gguf` + `quantize` + `split`. | §2.7 | L |
 

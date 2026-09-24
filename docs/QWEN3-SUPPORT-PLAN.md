@@ -34,7 +34,7 @@ file_type 7, quantization_version 2).
 | context_length | 40960 | `max_seq_len` / `n_ctx` |
 | tokenizer | gpt2 model, `pre = "qwen2"` | minfer's BPE tokenizer works unchanged |
 | eos / bos / pad | 151645 (`<|im_end|>`) / 151643 / 151643, `add_bos = false` | `SpecialTokens` fine |
-| chat_template | Qwen3 ChatML + `<think>` tags | **does NOT render via minijinja** — uses Python str-method syntax (`.split()/.lstrip()`) that minijinja 2.21.0 lacks → falls back to ChatML (see §5 gotcha) |
+| chat_template | Qwen3 ChatML + `<think>` tags | **renders** since F7 ([#50](https://github.com/yusiwen/minfer/issues/50), 2026-09-24): the Python `str` methods (`.split()/.lstrip()/.rstrip()/.strip()`) are provided through minijinja's unknown-method hook, so the model's own template is used and the ChatML fallback is gone (see §5 gotcha #9) |
 | vocab | 151936 (÷32 ✓ for Q8_0 blocks) | — |
 | weights | all Q8_0 (q/k/v/wo/gate/up/down) + f32 norms | Q8_0 fully supported (CPU + Metal) |
 
@@ -247,8 +247,10 @@ let attn = b.attn(q, kv, inp_pos, Gqa, AttnMeta { n_head: nh, n_head_kv: nk, hd,
    graph path (f32 activations on both sides): expect ~1e-2 max abs diff
    (reduction-order noise), which also validates the per-head norm math.
 5. **Tokenizer/template smoke**: `minfer <model> "hello"` without
-   `--no-template` — the GGUF chat template renders via minijinja (it already
-   handles `tools`/`enable_thinking` as undefined → falsy).
+   `--no-template` — the GGUF chat template renders via minijinja (since F7
+   [#50] the Python `str` methods are provided, `tools` is `none` like
+   transformers passes, and `enable_thinking` stays undefined → falsy; an
+   unrenderable template is now a loud refusal, not a ChatML fallback).
 6. Add hermetic tests in `qwen3/graph.rs` modeled on the qwen2 tests
    (`graph_logits_match_forward_real_model`, `forward_cached_isolates_kv_between_caches`)
    using the cached Qwen3 GGUF; update the model matrix in `AGENTS.md` /
@@ -303,100 +305,40 @@ let attn = b.attn(q, kv, inp_pos, Gqa, AttnMeta { n_head: nh, n_head_kv: nk, hd,
    NeoX/NonInterleaved — minfer's `cpu_rope`/Metal `rope_f32` already rotate
    the full head dim given `hd`, so only the `hd` value changes.
 5. **KV f16 auto-pick** uses `n_layer × n_kv_embd`; pass the real 1024.
-6. **ChatML template** — expected to render, but it does NOT: the Qwen3
-   `chat_template` uses Python string-method syntax that minijinja 2.21.0
-   cannot run, so it always falls back to ChatML. The fallback emits
-   `<|im_start|>` correctly (Qwen3-compatible), so plain chat works and the
-   model still emits `<think>` blocks (thinking mode). But the template's
-   think-block extraction, tool-call formatting and `enable_thinking` handling
-   are lost — see gotcha #9 below.
+6. **ChatML template** — **fixed in F7** ([#50](https://github.com/yusiwen/minfer/issues/50),
+   2026-09-24): it used to fall back to ChatML because the Qwen3
+   `chat_template` uses Python string-method syntax that minijinja 2.21.0 cannot
+   run; gotcha #9 below records the root cause, and the F7 record
+   (`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`) records the fix — the Python
+   `str` methods are supplied through minijinja's own extension point, so the
+   template's think-block extraction, tool-call formatting and
+   `enable_thinking` handling are live, and an unrenderable template is a
+   loud refusal instead of a silent fallback.
 7. **No biases anywhere** in Qwen3 — `bq/bk/bv/output_b` stay `None`; the
    loader's optional-bias paths already handle that.
 8. **Context 40960**: `n_ctx` defaults from `qwen3.context_length`; KV region
    sizing is `n_kv_embd × n_ctx` = 1024 × 40960 ≈ 40 MB/layer → ~1.1 GB f16 —
    fine, but keep the f16 KV path (auto-selected).
-9. **Qwen3 chat_template is NOT rendered by minijinja** (2026-08-27) — the
-   engine log shows
-   `chat template rendering failed (unknown method: string has no method named split), falling back to ChatML`.
-   Root cause: the template (`tokenizer.chat_template` from the GGUF) is written
-   with **Python string-method syntax** (`message.content.split('</think>')`,
-   `.lstrip('\n')`, `.rstrip('\n')` at template lines 35-36). minijinja 2.21.0
-   strings are Rust strings and expose **no** `str` methods; string operations
-   must be Jinja **filters** (`|split`, `|replace`). It also lacks the
-   `lstrip`/`rstrip`/`strip`/`contains` filters. So the template always fails at
-   line 35 and `template.rs::render_messages` falls back to `fallback_chatml_messages`
-   (`src/template.rs:50-56`). Consequence: the template's think-block extraction
-   (`<think>…</think>` split into `reasoning_content` vs `content`), tool-call
-   formatting (`<tool_call>`/`<tool_response>`), multi-step-tool collapse, and
-   `enable_thinking` are LOST; the fallback keeps `<think>` inline and feeds it
-   back verbatim on the next turn. Plain chat still works (the ChatML fallback
-   uses the Qwen3-compatible `<|im_start|>` markers). Fix direction and the
-   engine-level limitation are recorded in
-   `docs/OPENAI-CHAT-API-PLAN.md` §Chat Template Handling.
-
----
-
-## 6. Implementation Record (2026-08-23)
-
-### 6.1 What was implemented
-
-- `src/models/qwen3/` (mod.rs, loader.rs, graph.rs) — dense Qwen3 mirroring
-  qwen2 with the two deltas: explicit `n_embd_head` from
-  `qwen3.attention.key_length` (= 128) and the per-head Q/K RMSNorm.
-- `src/models/mod.rs` — dispatch `"qwen3"`.
-- New graph op **`Op::QkNorm { hd, nh, eps }`** (`src/graph/ops.rs`) +
-  `GraphBuilder::qk_norm()` + CPU and Metal execution arms. The flat
-  token-major buffer is a contiguous `[nt·nh][hd]` matrix, so both backends
-  reuse the existing RMSNorm kernels with `d = hd`, `n = nt·nh` (Metal:
-  `rms_norm_256`; no shader change).
-- Decode fused-QKV (`Op::FusedQKV`) is NOT used for Qwen3 (per §3 Phase C):
-  the `attn_bias_rope_store` kernel cannot express the per-head norm. Fused
-  FFN (`Op::FusedFFN`) IS reused unchanged.
-- `MINFER_GRAPH_DUMP` for qwen3 writes per-position decode logits
-  (`logits_decode_{pos}.f32`) + layer-0 intermediate nodes, so a full
-  generation can be inspected step by step (used heavily during verification).
-
-### 6.2 Verification (all on Qwen3-0.6B-Q8_0)
-
-1. **Prefill math vs llama.cpp**: for 6 raw prompts, the argmax token at the
-   last position is identical and the log-prob agrees within 0.01–0.06
-   (minfer CPU Q8_0-activation path vs llama.cpp CPU).
-2. **Greedy generation vs llama.cpp**: with matching sampler config
-   (`temp 0`, `repeat_penalty 1.0`) the raw-prompt continuation is
-   **byte-identical for 60 tokens** ("The capital of France is" →
-   " Paris. The capital of France is also the capital of the Republic of
-   France. …"). The default `repeat_penalty = 1.1` (both engines) changes the
-   greedy path at ambiguous positions — a sampler-config difference, not an
-   engine bug (verified: identical config ⇒ identical output).
-3. **Templated (chat) mode**: `<think>`-mode generations match for the first
-   ~8 tokens, then flip at genuinely ambiguous positions where the top-2
-   candidates are within float noise (verified via full top-10 log-prob
-   comparisons at the diverging step — distributions agree, order flips).
-4. **In-crate tests** (`src/models/qwen3/graph.rs`): CPU self-consistency
-   (two independent caches bit-identical), KV isolation between caches, Metal
-   greedy == llama.cpp-verified reference token sequence, Metal prefill
-   bitwise determinism.
-
-### 6.3 Bug found & fixed: Metal Q8_0 multi-token matmul race
-
-Verification exposed a **pre-existing Metal nondeterminism bug**:
-`kernel_q8_0_f32_matmul_multi` (`src/metal.metal`) loops over tokens and
-re-zeroes its shared-memory accumulator (`sh0[tiisg] = 0`) at the top of each
-iteration, but had **no trailing `threadgroup_barrier`** — a fast thread's
-re-zero could overtake a slow thread still reducing `sh0[tiisg]`, producing
-wrong (often 0) output elements. Symptoms: greedy text differed between
-identical runs, and K-cache rows had 0-vs-nonzero value pairs at even indices
-(the `NR0 = 2` row-pair output). Exposed only by Qwen3 because it is the first
-model whose prefill Q/K/V matmuls take the `pl_q8_0_f32_multi` path
-(`od = 1024 < 2048`, `nt < 9` → no GEMM); qwen2 models use other kernels
-(Q4_0/Q4_K paths are per-simgroup, no shmem).
-
-Fix: `threadgroup_barrier(mem_flags::mem_threadgroup);` at the end of the
-t-loop body. Audited all other `_multi` kernels (lines 115/249/466/528/1627/
-1791/1979/2148): they use per-simgroup rows + `simd_sum` only, no cross-
-simgroup shmem inside a loop — only the Q8_0 kernel needed the barrier.
-Regression test: `metal_prefill_determinism` (bitwise determinism of the
-layer-0 K path across two Metal executions).
+9. **Qwen3 chat_template is NOT rendered by minijinja** (2026-08-27) — **FIXED
+   2026-09-24 in F7** ([#50](https://github.com/yusiwen/minfer/issues/50)). The
+   historical record: the engine logged
+   `chat template rendering failed (unknown method: string has no method named split), falling back to ChatML`,
+   because the template (`tokenizer.chat_template` from the GGUF) is written with
+   **Python string-method syntax** (`message.content.split('</think>')`,
+   `.lstrip('\n')`, `.rstrip('\n')` at template lines 35-36) and minijinja 2.21.0
+   strings are Rust strings exposing **no** `str` methods. The consequence was
+   that think-block extraction, tool-call formatting, multi-step-tool collapse
+   and `enable_thinking` were lost and the ChatML fallback was fed back verbatim.
+   **The fix (F7)**: `template.rs` now installs
+   `Environment::set_unknown_method_callback` and implements the Python `str`
+   methods with CPython semantics (a character *set* for `strip`/`lstrip`/
+   `rstrip`, `split`/`rsplit` with `maxsplit`, `startswith`/`endswith`,
+   `replace`, case, `join`, `find`/`rfind`/`count`), plus `raise_exception`.
+   The model's own template now renders; the acceptance is byte-for-byte against
+   the reference renderings committed under `tests/fixtures/chat/` (Qwen2.5-0.5B,
+   Qwen2.5-7B, Qwen2.5-14B, Qwen3-0.6B). Any template the engine still cannot
+   render is a **loud error naming the construct and the template line** — the
+   silent ChatML fallback is gone.
 
 ### 6.4 Known follow-ups (unchanged from §3 Phase E)
 
@@ -408,7 +350,7 @@ layer-0 K path across two Metal executions).
   path (biases, no per-head norm) is untouched.
 - Qwen3 MoE / hybrid-SWA / VL / reranker variants (`LLM_ARCH_QWEN3MOE`,
   `QWEN3NEXT`, `QWEN3VL*`) — separate architectures, out of scope here.
-- Optional `<think>`-block stripping at the CLI layer — note: since the Qwen3
-  template isn't rendered (gotcha #9), the `<think>` block stays inline and is
-  fed back verbatim; fixing the template render (see `docs/OPENAI-CHAT-API-PLAN.md`
-  §Chat Template Handling) is the real fix, CLI-side stripping is a stopgap.
+- Optional `<think>`-block stripping at the CLI layer — the Qwen3 template now
+  renders (**F7**, gotcha #9), so the template itself decides how a replayed
+  assistant turn's `<think>` block is re-emitted; CLI-side stripping is no
+  longer needed and was never implemented.

@@ -18,7 +18,7 @@ Parses GGUF v3 files (metadata + quantized tensors) with split multi-part suppor
 
 ### Self-contained BPE tokenizer
 
-Loaded directly from GGUF metadata — no external dependency on tiktoken. Special tokens (GGUF type 3/4 table plus `<|im_start|>`/EOS fallbacks) match as single IDs before BPE, so special-token templates (DeepSeek-R1's `<｜User｜>`/`<think>`, etc.) tokenize exactly like llama.cpp.
+Loaded directly from GGUF metadata — no external dependency on tiktoken. `tokenizer.ggml.pre` selects the pre-tokenization rule (`qwen2`, alias `deepseek-r1-qwen`; `qwen35`), implemented as hand-written splitters because the `regex` crate has no lookahead; an unknown or missing rule, an empty merge table, a non-`gpt2` model or an incomplete byte vocabulary refuses the load. Special tokens (GGUF type 3/4 table plus `<|im_start|>`/EOS fallbacks) match as single IDs before BPE, so special-token templates (DeepSeek-R1's `<｜User｜>`/`<think>`, etc.) tokenize exactly like llama.cpp, and an unmatched piece falls back byte by byte instead of silently emitting id 0. Token ids are gated byte-for-byte against transformers / llama.cpp over `tests/fixtures/tokenizer/`.
 
 ## Backends
 
@@ -59,6 +59,19 @@ Append-only KV + incremental chat-template rendering: each turn only prefills th
 ### OpenAI-compatible HTTP server (`serve`)
 
 `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`, and `/metrics` — a Prometheus text snapshot of request counts, queue depth, live KV/arena occupancy and (under `MINFER_OP_TIMING`) per-op seconds; multi-slot with queued serial execution; SIGINT/SIGTERM drain bounded by `MINFER_DRAIN_MS`. Plan: [OPENAI-CHAT-API-PLAN.md](./OPENAI-CHAT-API-PLAN.md), F8 record: [ARCHITECTURE-EXECUTION-PLAN.md](./ARCHITECTURE-EXECUTION-PLAN.md).
+
+### Chat templates (F7)
+
+The model's own `tokenizer.chat_template` is rendered by minijinja plus a
+Python-`str`-method hook, so the published Qwen2.5/Qwen3 templates (including
+Qwen3's `<think>`-block split and re-emission) render as published. Reference
+renderings for every supported model live in `tests/fixtures/chat/`
+(transformers 5.17.0, generated from each model's `tokenizer_config.json`), and a
+rendered prompt must equal them byte for byte. A template the engine cannot
+render is a **loud refusal naming the construct and the template line** — checked
+at load, so the CLI exits and the server refuses to start; the generic ChatML
+renderer applies only to a GGUF with no template at all. Design + accepted and
+refused construct sets: [CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md](./CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md).
 
 ### Constrained decoding — grammar and JSON Schema (F2)
 

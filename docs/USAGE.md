@@ -92,6 +92,44 @@ Sampling and runtime options:
   KV/activations; MINFER_GPU_MEM=64 MiB`). Without a device that reports free memory (Metal
   today) `auto` needs `MINFER_GPU_MEM`.
 
+## Chat templates and tokenizer
+
+Chat rendering uses the model's own `tokenizer.chat_template` from the GGUF. The
+published Qwen2.5/Qwen3 templates use Python string methods
+(`content.split('</think>')`, `.lstrip('\n')`) that minijinja does not provide
+natively; minfer supplies them through minijinja's unknown-method hook with
+CPython semantics, so those templates render as published (this is what makes
+Qwen3's think-block handling and tool-call formatting reach the model).
+Reference renderings — multi-turn, a system message, a generation prompt, a
+`<think>`-reasoning turn — are committed under `tests/fixtures/chat/` with their
+provenance.
+
+A template the engine cannot compile or render is an **error**, never a generic
+prompt:
+
+```
+Error: chat template error — unsupported template construct: unsupported Python str
+method `splitlines` (template line 41); minfer refuses to fall back to a generic
+ChatML prompt. Supported Python str methods: capitalize, count, endswith, find,
+join, lower, lstrip, replace, rfind, rsplit, rstrip, split, startswith, strip,
+title, upper.
+```
+
+The CLI exits before inference, `serve`/`viz` refuse to start (checked before the
+worker thread is spawned), and a per-request refusal is an HTTP `400`. The generic
+ChatML renderer survives only for a GGUF that has no `tokenizer.chat_template` at
+all, and the startup path prints a one-line notice when that happens.
+`--no-template` still bypasses template rendering entirely.
+
+The tokenizer is byte-level BPE and is equally strict about what it does not
+implement. `tokenizer.ggml.pre` selects the pre-tokenization rule — `qwen2`
+(alias `deepseek-r1-qwen`) or `qwen35` — and an unknown or missing value, a
+`tokenizer.ggml.model` that is not `gpt2`, an empty merge table, or a vocabulary
+missing any of the 256 byte tokens **refuses the load** with the offending value
+named. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
+`llama-tokenize` on the same GGUF) byte for byte over the corpus committed in
+`tests/fixtures/tokenizer/`.
+
 ## Multi-turn conversation
 
 `--cnv` (docs/CLI-CONVERSATION-PLAN.md): append-only KV + incremental template

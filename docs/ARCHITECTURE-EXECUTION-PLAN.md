@@ -3519,7 +3519,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) | M | this box |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | this box |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
@@ -3687,6 +3687,88 @@ GBNF/JSON-Schema constructs the compiler refuses: `pattern`/`minLength`/
 an exact `oneOf`, `allOf`/`not`, `\d`/`\w`/`\p{...}`) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
 first codepoint to cut the residual mask cost).
+
+### F7 — Chat-template fidelity and tokenizer generality (#50) — **DONE 2026-09-24**
+
+**What landed.** `src/template.rs` renders the model's own
+`tokenizer.chat_template` again, and `src/tokenizer.rs` makes
+`tokenizer.ggml.pre` authoritative and replaces the silent byte fallback. The
+accepted/refused sets, the loud refusal and the reference behind every gate are
+the design-first artifact
+[`CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`](./CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md).
+
+*Templates.* minijinja 2.21.0's own extension point
+(`Environment::set_unknown_method_callback`) closes the gap — **no dependency
+change**, and `minijinja-contrib::pycompat` was considered and rejected as a new
+dependency with different edge semantics. The implemented Python `str` methods
+are `strip`/`lstrip`/`rstrip` (a *character set*, as CPython), `split`/`rsplit`
+with `maxsplit`, `startswith`/`endswith`, `replace`, `lower`/`upper`/`title`/
+`capitalize`, `join`, `find`/`rfind`/`count`, plus a `raise_exception` function
+for templates that refuse their own input. Qwen3's template therefore renders,
+including its `<think>`-block split and re-emission — the behaviour
+`QWEN3-SUPPORT-PLAN.md §5 gotcha #9` recorded as lost. Everything else is
+refused **loudly**: the error names the construct and the template line and
+states that the engine will not substitute a generic prompt. `validate()` runs at
+load, so the CLI exits before inference and `serve`/`viz` refuse to start (before
+the worker thread is spawned); a per-request failure is an HTTP `400`. The ChatML
+fallback survives for exactly one case — a GGUF with no
+`tokenizer.chat_template` at all, announced once on stderr — and callers that
+passed `""` for a missing template (which rendered the *empty* prompt) are fixed.
+`format_single`/`Conversation` propagate the refusal as a turn error.
+
+*Tokenizer.* `tokenizer.ggml.pre` selects the pre-tokenization rule: `qwen2`
+(alias `deepseek-r1-qwen`) and `qwen35`, hand-written splitters ported from
+llama.cpp's `unicode_regex_split_custom_*` — hand-written because the Rust
+`regex` crate has no lookahead and `\s+(?!\S)` is load-bearing for whitespace
+runs. Every other value, including a missing key, refuses the load, as do a
+`tokenizer.ggml.model` that is not `gpt2`, an empty merge table, and a
+vocabulary missing any of the 256 byte tokens. The silent `unwrap_or(0)` is a
+checked byte fallback (one token per byte), and the "whole piece is in the
+vocabulary" BPE shortcut is gone: it produced a *different* split than the
+reference on Qwen3.5, where a vocabulary entry is not reachable through merges.
+
+**Accepted / refused, in one line each.** Templates: all minijinja constructs,
+the Python `str` methods above, `raise_exception`, slices with a step
+(`messages[::-1]`); refused — any other method or an unparseable construct, each
+naming itself. Tokenizers: byte-level BPE with `pre` = `qwen2`/`qwen35`;
+refused — SentencePiece/unigram/WordPiece, `ignore_merges` and multi-regex
+pre-tokenizers (`llama3`, `default`, `deepseek-*`, `falcon`, `starcoder`, …),
+`byte_encode = false`, and a missing/unknown `pre`.
+
+**Measured acceptance.**
+
+| Gate | Evidence |
+|---|---|
+| Template rendering, per supported model | `model_templates_render_byte_for_byte`: 4 models × 7 cases byte-for-byte against transformers 5.17.0 (`tests/fixtures/chat/*.json`) |
+| The artifact the engine loads | `gguf_template_renders_like_the_reference` (`#[ignore]`d): the GGUF's own template renders the same bytes for 4 models × 7 cases, including multi-turn, system-message, generation-prompt and `<think>`-reasoning cases |
+| Loud refusal | 4 unit gates; restoring the pre-F7 fallback (mutation M2) fails all four with `unwrap_err() on an Ok`, and reverting makes them pass |
+| Pre-tokenizer rules | `pre_tokenizer_split_matches_the_reference`: `qwen2` + `qwen35`, 52 corpus entries each, == CPython `regex` on the model's own `tokenizer.json` pattern |
+| Token ids | `token_ids_match_the_reference` (`#[ignore]`d): 52 entries × 5 cached models byte-for-byte — Qwen2.5-0.5B/7B/14B and Qwen3-0.6B against transformers, Qwen3.5-0.8B against llama.cpp `llama-tokenize` on the same GGUF; transformers and llama.cpp agree on all 52 entries where both exist |
+| Byte fallback | `byte_fallback_emits_one_token_per_byte`; mutation M5 (emit id 0 again) fails it `[0,0]` vs `[1097,1098]` |
+| Mutation checks | M1 `py_trim` ignores the char set → rendering gate red; M2 restore the ChatML fallback → refusal gates red; M3 `is_number` broken → split gate red; M4 unknown `pre` silently defaults → refusal gate red; M5 silent id 0 → fallback gate red; M6 merge order inverted → id gate red (`[1519, 654, 78, …]` vs `[9707, 11, 1879, 0]`). All six reverted |
+| Full suite | `cargo test --release`: **393 passed / 0 failed / 23 ignored** + 3 / 0 / 6 (baseline 382/0/21 + 3/0/6; +11 unit gates, +2 `#[ignore]`d real-model gates) |
+| Real-model serial set | `cargo test --release --bin minfer -- --ignored --test-threads=1`: **23 passed / 0 failed** on the CPU build (baseline 21/0) — the F2 grammar and F3 pinned-sampler gates included |
+
+**Honest scope.** (a) The tokenizer does not apply the HF normalizer (NFC):
+llama.cpp does not either for BPE, and every corpus entry is NFC-normalized;
+composed-vs-decomposed input can therefore differ from transformers, and a
+normalization table is a follow-up ([#132](https://github.com/yusiwen/minfer/issues/132)). (b) Beyond `qwen2`/`qwen35` no
+pre-tokenizer is implemented; each unsupported value is refused by name, and the
+classic GPT-2 rule was dropped from the design rather than shipped ungated
+(GPT-2's `tokenizer.json` has no `Split` pattern to reference). (c) SentencePiece
+/ unigram / WordPiece models are out of scope — this is a byte-level BPE.
+(d) The template reference is the model's *published* `tokenizer_config.json`;
+the GGUF copies of Qwen2.5's and Qwen3's templates differ from it textually (a
+converter-escaped tool-call string; for Qwen3 an older but equivalent revision),
+so the real-model gate asserts the rendered bytes, and the fixture records both
+hashes. (e) Qwen3.5 (`qwen35` arch) is *not* a supported architecture; only its
+tokenizer is used, as the qwen35 reference. (f) Templates that call
+`strftime_now` or use filters minijinja lacks are refused by name rather than
+supported. (g) The byte-for-byte and id gates need the cached GGUFs, so they are
+manual/local (`#[ignore]`d) evidence; the CI-runnable gates are the fixture-
+template rendering, the split fixtures, the str-method/semantics fixtures, the
+loud refusal and the mutation-checked unit gates. (h) Nothing here is
+device-adjacent: the CUDA and macOS CI jobs are compile-only for this change.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
