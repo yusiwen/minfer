@@ -1144,6 +1144,23 @@ impl CudaBackend {
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
                 let nt = node.out_shape[1];
+                // Issue #122: the prefill entries index `q` as `nt` token rows of
+                // `n_head * hd` (`fa_prefill_f16kv`: `q[t * nh * hd + h * hd + d]`), so a
+                // q input shorter than that is an out-of-bounds device read. Refuse it
+                // loudly here instead of letting the kernel do it: the fixture that
+                // triggered #122 read ~7 MB past its q buffer and latched
+                // `cudaErrorIllegalAddress` (700), which corrupted the CUDA context and
+                // surfaced only later as a misleading "0 byte budget". The length contract
+                // is `BufRef::len` (rule 13).
+                let q_need = nt * meta.n_head * meta.hd;
+                if in_bufs[0].len < q_need {
+                    return Err(format!(
+                        "cuda: attention q input has {} values but a {} token prefill needs \
+                         n_tokens * n_head * hd = {q_need}; refusing rather than reading past \
+                         the buffer (issue #122)",
+                        in_bufs[0].len, nt
+                    ));
+                }
                 // E1b: a multi-sequence node carries an explicit `[lo, hi)` span
                 // (input 3) and runs the windowed kernel instantiations; every
                 // other node is the causal case and reads `positions` (input 2)
@@ -4097,6 +4114,14 @@ mod tests {
         let nt = 512usize;
         let spb2 = cb.alloc_buffer(2 * nt);
         let mpb2 = cb.alloc_buffer(nt * KMAX * 2);
+        // The prefill entry reads `q` as `nt` token rows of `nh * hd` floats
+        // (`fa_prefill_f16kv`: `q[t * nh * hd + h * hd + d]`, `t < nt`), so this
+        // fixture needs its own `nt`-row q buffer. Reusing the decode phase's
+        // single-row `qb` here made the kernel read ~7 MB past it: a silent read
+        // of whatever device memory followed when those pages were mapped, and a
+        // latched `cudaErrorIllegalAddress` (700) when they were not — which then
+        // failed every later `cudaMemGetInfo` in the process.
+        let qb2 = cb.alloc_buffer(nh * hd * nt);
         let ob2 = cb.alloc_buffer(nh * hd * nt);
         cb.kv_f16 = true;
         let enc = |x: f32| -> f32 { f32::from_bits(half::f16::from_f32(x).to_bits() as u32) };
@@ -4104,7 +4129,8 @@ mod tests {
             .unwrap();
         cb.write_host(vreg, &vec![enc(0.03f32); n_ctx * nkt])
             .unwrap();
-        cb.write_host(qb, &vec![enc(0.01f32); nh * hd]).unwrap();
+        cb.write_host(qb2, &vec![enc(0.01f32); nh * hd * nt])
+            .unwrap();
         let mut span2 = vec![0u32; 2 * nt];
         let mut map2 = vec![0u32; nt * KMAX * 2];
         for t in 0..nt {
@@ -4126,7 +4152,7 @@ mod tests {
             };
             let mut call = |cb: &mut crate::graph::cuda_backend::CudaBackend| {
                 cb.state.gqa_attn_f16kv(
-                    cb.ptr_of(qb).unwrap(),
+                    cb.ptr_of(qb2).unwrap(),
                     cb.ptr_of(kreg).unwrap(),
                     cb.ptr_of(vreg).unwrap(),
                     cb.ptr_of(ob2).unwrap(),

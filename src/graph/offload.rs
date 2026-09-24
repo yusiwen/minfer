@@ -25,6 +25,8 @@
 //! means "every block the device can hold" — the pre-E5 behaviour — a decimal number means "at
 //! most that many blocks", and anything else is refused loudly (`resolve`), never guessed.
 
+use super::allocplan::DeviceMemory;
+
 /// How many leading blocks run on the device, and how many there are in total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OffloadPlan {
@@ -247,16 +249,35 @@ pub fn report(plan: OffloadPlan, device: &str, device_bytes: usize, source: &str
 
 /// E5 S2: the weight budget an `auto` request fits into.
 ///
-/// An explicit `MINFER_GPU_MEM` (MiB) wins; otherwise it is the same default E4's feasibility
-/// gate uses — three quarters of what the device reports free — so the fit and the gate that
-/// later checks the activation pool are talking about the same number.
-pub fn weight_budget(free_bytes: Option<usize>, cap_mib: Option<&str>) -> Result<usize, String> {
+/// An explicit `MINFER_GPU_MEM` (MiB) wins. Otherwise it is the same default E4's
+/// feasibility gate uses — three quarters of what the device reports free — so the fit
+/// and the gate that later checks the activation pool are talking about the same number.
+///
+/// A **failed** device query refuses the `auto` request (issue #122) instead of reading
+/// it as "0 bytes free". The pre-#122 `free_bytes.map_or(0, …)` turned a failed query
+/// into a 0-byte budget, and `fit_blocks(0, …)` then planned **0 device blocks** while
+/// the startup line reported `device free 0 MiB (three quarters of it, …)` as if that
+/// were a measurement. `auto` asks for a measurement, so when none exists the load is
+/// refused with the real error name rather than silently planned around.
+///
+/// "No device at all" is unchanged and deliberate: it is the documented Metal behaviour
+/// (`auto` fits nothing without `MINFER_GPU_MEM`), not a failed query.
+pub fn weight_budget(mem: &DeviceMemory, cap_mib: Option<&str>) -> Result<usize, String> {
     match cap_mib.map(str::trim) {
         Some(v) if !v.is_empty() => v
             .parse::<usize>()
             .map(|mib| mib * 1024 * 1024)
             .map_err(|_| format!("MINFER_GPU_MEM='{v}' is not a size in MiB (a decimal number)")),
-        _ => Ok(free_bytes.map_or(0, |f| f / 4 * 3)),
+        _ => match mem {
+            DeviceMemory::Reported { free, .. } => Ok(free / 4 * 3),
+            DeviceMemory::QueryFailed { .. } => Err(format!(
+                "MINFER_GPU_LAYERS=auto needs the device's free bytes, but {}; \
+                 set MINFER_GPU_MEM=<MiB> to plan against a number you choose",
+                mem.failure_note("the device free-memory query")
+                    .unwrap_or_else(|| "the query failed".to_string())
+            )),
+            DeviceMemory::NoDevice => Ok(0),
+        },
     }
 }
 
@@ -289,18 +310,23 @@ pub fn auto_source(
     n_layers: usize,
     budget: usize,
     reserve: usize,
-    device_free: Option<usize>,
+    mem: &DeviceMemory,
     cap_mib: Option<&str>,
 ) -> String {
     let mib = |b: usize| format!("{:.0} MiB", b as f64 / (1024.0 * 1024.0));
     let against = match cap_mib.map(str::trim) {
         Some(v) if !v.is_empty() => format!("MINFER_GPU_MEM={v} MiB"),
-        _ => match device_free {
-            Some(free) => format!(
+        // A failed query never reaches here (the loader refuses first), but it must not
+        // read as a measured "0 MiB" if it ever does: say it was not measured (#122).
+        _ => match mem {
+            DeviceMemory::Reported { free, .. } => format!(
                 "device free {} (three quarters of it, the E4 default budget)",
-                mib(free)
+                mib(*free)
             ),
-            None => "no device budget".to_string(),
+            DeviceMemory::QueryFailed { .. } => {
+                "device free unmeasured (the device free-memory query failed)".to_string()
+            }
+            DeviceMemory::NoDevice => "no device budget".to_string(),
         },
     };
     format!(
@@ -450,32 +476,80 @@ mod tests {
 
     #[test]
     fn the_weight_budget_prefers_the_explicit_cap() {
+        let four = DeviceMemory::Reported {
+            free: 4 << 20,
+            total: 8 << 20,
+        };
         // No cap: three quarters of what the device reports — the same default E4's gate uses.
-        assert_eq!(weight_budget(Some(4 << 20), None).unwrap(), 3 << 20);
-        assert_eq!(weight_budget(Some(4 << 20), Some("")).unwrap(), 3 << 20);
-        assert_eq!(weight_budget(Some(4 << 20), Some("  ")).unwrap(), 3 << 20);
-        // No device and no cap: nothing fits (the CPU-only answer).
-        assert_eq!(weight_budget(None, None).unwrap(), 0);
+        assert_eq!(weight_budget(&four, None).unwrap(), 3 << 20);
+        assert_eq!(weight_budget(&four, Some("")).unwrap(), 3 << 20);
+        assert_eq!(weight_budget(&four, Some("  ")).unwrap(), 3 << 20);
+        // No device and no cap: nothing fits (the CPU-only / Metal answer).
+        assert_eq!(weight_budget(&DeviceMemory::NoDevice, None).unwrap(), 0);
         // An explicit cap is MiB, and wins over the device's number.
-        assert_eq!(weight_budget(Some(1 << 30), Some("64")).unwrap(), 64 << 20);
-        let err = weight_budget(Some(1 << 30), Some("lots")).unwrap_err();
+        assert_eq!(weight_budget(&four, Some("64")).unwrap(), 64 << 20);
+        let err = weight_budget(&four, Some("lots")).unwrap_err();
         assert!(err.contains("lots") && err.contains("MiB"), "{err}");
+    }
+
+    /// Issue #122, E5's half: a failed query must not plan "0 blocks fit".
+    ///
+    /// The mutation this pins is `free_bytes.map_or(0, |f| f / 4 * 3)`: with the CUDA
+    /// read collapsed to 0 by a discarded return code, `auto` fitted **0 blocks** and
+    /// the startup line reported `device free 0 MiB` as though the device were full.
+    #[test]
+    fn a_failed_device_query_refuses_an_auto_fit() {
+        let failed = DeviceMemory::QueryFailed {
+            code: 700,
+            name: "cudaErrorIllegalAddress".to_string(),
+        };
+        let err = weight_budget(&failed, None).unwrap_err();
+        assert!(err.contains("cudaErrorIllegalAddress"), "{err}");
+        assert!(err.contains("700"), "{err}");
+        assert!(
+            err.contains("MINFER_GPU_MEM"),
+            "offer the escape hatch: {err}"
+        );
+        assert!(
+            !err.contains("0 MiB") && !err.contains("0 bytes"),
+            "the refusal must not quote a fabricated measurement: {err}"
+        );
+        // An explicit cap still plans, because the caller supplied the measurement.
+        assert_eq!(weight_budget(&failed, Some("64")).unwrap(), 64 << 20);
     }
 
     #[test]
     fn the_auto_source_names_what_the_fit_decided() {
+        let four = DeviceMemory::Reported {
+            free: 4 << 20,
+            total: 8 << 20,
+        };
         // Device budget: say what the device reported and that it was held back.
-        let line = auto_source(6, 24, 3 << 20, 1 << 20, Some(4 << 20), None);
+        let line = auto_source(6, 24, 3 << 20, 1 << 20, &four, None);
         assert!(line.contains("auto: 6 of 24 blocks fit"), "{line}");
         assert!(line.contains("3 MiB"), "{line}");
         assert!(line.contains("1 MiB reserved"), "{line}");
         assert!(line.contains("device free 4 MiB"), "{line}");
         // Explicit cap: name it instead.
-        let line = auto_source(2, 24, 64 << 20, 16 << 20, Some(1 << 30), Some("64"));
+        let line = auto_source(2, 24, 64 << 20, 16 << 20, &four, Some("64"));
         assert!(line.contains("MINFER_GPU_MEM=64 MiB"), "{line}");
         // No budget at all: say so rather than implying a device.
-        let line = auto_source(0, 24, 0, 0, None, None);
+        let line = auto_source(0, 24, 0, 0, &DeviceMemory::NoDevice, None);
         assert!(line.contains("no device budget"), "{line}");
+        // A failed query must not read as a measured zero.
+        let line = auto_source(
+            0,
+            24,
+            0,
+            0,
+            &DeviceMemory::QueryFailed {
+                code: 1,
+                name: "x".into(),
+            },
+            None,
+        );
+        assert!(line.contains("unmeasured"), "{line}");
+        assert!(!line.contains("device free 0 MiB"), "{line}");
     }
 
     #[test]

@@ -61,18 +61,24 @@ pub fn device_name(device: Device) -> &'static str {
     }
 }
 
-/// E5 S2: the device bytes the environment reports free, or `None` when no device (or no
-/// memory query) is available. The `auto` offload fit consumes it, with the same quarter held
-/// back that E4's feasibility gate uses.
-pub fn device_free_bytes() -> Option<usize> {
+/// E5 S2: the device's own memory answer, with the query's outcome explicit (issue #122).
+/// The `auto` offload fit consumes it, with the same quarter held back that E4's
+/// feasibility gate uses.
+///
+/// This used to return `Option<usize>` with `None` meaning "no device" — but a **failed**
+/// CUDA query came back as `Some(0)`, and `auto` then read it as "0 bytes free" and
+/// silently planned 0 device blocks. The three-way [`DeviceMemory`] keeps the two apart:
+/// the fit refuses a failed query with the real error and still fits nothing on a platform
+/// that reports no free-bytes number at all.
+pub fn device_memory() -> crate::graph::allocplan::DeviceMemory {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = crate::cuda::CudaState::get() {
-        return Some(cuda.device_free_bytes());
+        return cuda.device_memory();
     }
     // Metal reports no free-bytes number through the current wrapper, so `auto` on macOS falls
     // back to an explicit `MINFER_GPU_MEM` (or fits nothing) — the device still participates,
     // it just cannot be planned against. Documented in rule 14.
-    None
+    crate::graph::allocplan::DeviceMemory::NoDevice
 }
 
 /// E5: whether **any** device is present, decided before any weight is registered — the
