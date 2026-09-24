@@ -1030,7 +1030,9 @@ mean f32.
 `exec_ids` directly, so it needs a packed cell encoder and a packed-word region size; a Q8_0
 store→attention round trip (`cuda_kv_f16_roundtrip_attn`, `:5150`, is the pattern); `copy_cells`
 under the packed stride (`cuda_f16_kv_cell_move_strides_by_row_bytes`, `:3946`); the real-model
-gate `a_packed_kv_cache_answers_like_the_f32_one` run with the `cuda` feature on GB10 (CI has no
+gate `a_packed_kv_cache_answers_like_the_f32_one` run with the `cuda` feature on GB10 (since
+[#123](https://github.com/yusiwen/minfer/issues/123) that gate is CPU-forced on a CUDA build until
+these kernels land, so this acceptance includes re-pointing it at the device; CI has no
 GPU, and its `MINFER_C4_MODEL` arm covers a second model); and an A/B against f16 on the same
 model/context with the numbers recorded. The honest expectation, stated before the work: the win
 on the device is **memory** (3.76× less than f32, 1.88× less than f16); whether decode bandwidth
@@ -2717,13 +2719,16 @@ decided whether that became a visible fault. The production path sizes `q` as `n
 | `cargo test --release` (CPU) | ~340 passed / 0 failed / 18 ignored + 3/0/6 | **382 passed / 0 failed / 21 ignored + 3/0/6** on the rebased tip (346/0/18 before the F2 rebase; the +6 here are the new gates) |
 | `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU, no `cuda` feature) | 12 passed / 0 failed (a stale count in `AGENTS.md`) | **18 passed / 0 failed** |
 
-**The two residual failures are both #123's.** `a_packed_kv_cache_answers_like_the_f32_one`
-is CPU-only by its own docstring and is refused on CUDA (it *failed alone* the same way
-before this change once the budget was healthy). `a_partial_offload_runs_the_rest_on_the_cpu`
-is second-hand damage: the packed gate sets the **process-wide** KV format to `q8_0` and
-panics at the #87 refusal before its `set_kv_format(F32)` restore runs, so the next test
-builds a `q8_0`-sized CUDA KV region and is refused (issue #99's mechanism). Neither is a
-budget failure — the 0-byte-budget string is absent from the run.
+**The two residual failures were both #123's, and are fixed there.** At this record's time
+`a_packed_kv_cache_answers_like_the_f32_one` was CPU-only by its own docstring and was refused on
+CUDA (it *failed alone* the same way before this change once the budget was healthy), and
+`a_partial_offload_runs_the_rest_on_the_cpu` was second-hand damage: the packed gate set the
+**process-wide** KV format to `q8_0` and panicked at the #87 refusal before its
+`set_kv_format(F32)` restore ran, so the next test built a `q8_0`-sized CUDA KV region and was
+refused (issue #99's mechanism). Neither was a budget failure — the 0-byte-budget string was
+absent from the run. The **test-hygiene record (#123)** below fixes both: the packed gate is
+CPU-forced and its format restoration is panic-safe (twice over: the normal path *and* a `Drop`
+guard), so the serial CUDA set is **22 passed / 0 failed**.
 
 **Acceptance, as measured (pure, CI-covered).**
 
@@ -2777,6 +2782,100 @@ failures: the CPU-only packed gate and the load-sensitive timing margin),
 [#128](https://github.com/yusiwen/minfer/issues/128) (the API-level
 `cudaErrorInvalidValue` findings: `cudaGraphDestroy` on an exec handle, which leaks the
 exec, and the eager `cudaFuncSetAttribute` opt-in failing at init).
+
+#### Test-hygiene record (#123, 2026-09-24) — the serial `#[ignore]`d set goes green on a CUDA build
+
+**What was wrong.** The documented CUDA command
+`cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` could never be
+green, for two reasons that have nothing to do with the code under test.
+
+1. **A documented CPU-only gate ran anyway.** `a_packed_kv_cache_answers_like_the_f32_one` says
+   in its own docstring that a CUDA box refuses `q8_0` by design
+   ([#87](https://github.com/yusiwen/minfer/issues/87)), and the default offload request let the
+   device claim the model, so it failed **alone** with the `ensure_kv` refusal
+   (`KV region for layer 0 would live on Cuda, which has no kernel that reads a packed q8_0
+   region …`).
+2. **A load-sensitive timing margin.** `cuda_map_window_costs_no_more_than_the_span_it_replaces`
+   asserted `p_map <= p_span * 1.25` from **one** 20-launch block per mode, span first and map
+   second. Load arriving during the map block had nothing to absorb it: a loaded GB10 measured
+   1.267x (2.232 vs 1.761 ms), and a rerun of the same binary passed.
+
+**Collateral (this is #122's record, above).** When the packed gate panicked at the #87 refusal it
+never reached its `set_kv_format(F32)` restore, so the **process-wide** KV format stayed `q8_0`
+and the next test in the serial set — `a_partial_offload_runs_the_rest_on_the_cpu` — sized its
+CUDA KV region for the wrong format and was refused too (the mechanism of
+[#99](https://github.com/yusiwen/minfer/issues/99)). The baseline at `bac8440` was therefore
+**20 passed / 2 failed**, both failures carrying the identical #87 string.
+
+**The fix.**
+
+1. The packed gate is **device-aware without losing coverage**: it loads its model with
+   `OffloadRequest::Layers(0)` (`--gpu-layers 0`, the established all-CPU configuration) and
+   asserts `model.device() == Device::Cpu`. On a CUDA build the gate therefore **executes** the
+   packed path CPU-forced instead of being skipped — the choice that keeps the most real coverage —
+   and on a CPU build nothing changes. It prints the reason it is CPU-only, naming #87.
+2. A `KvFormatGuard` snapshots the process-wide format before the gate flips it and restores it on
+   `Drop`, so a panic **anywhere** in the gate cannot leak `q8_0` into the next test. The normal
+   path's explicit restore stays; the guard is the panic-safe backstop. (Per-engine format is #99
+   and was deliberately not implemented here.)
+3. The timing gate interleaves the two modes' rounds (span, map, span, map, …) and asserts the
+   **median of the per-round `map/span` ratios** — a matched pair per round, robust to up to
+   `rounds / 2` disturbed rounds. Decode: 9 rounds × 100 launches; prefill: 9 rounds × 50 launches
+   (the old prefill form had no round structure at all), each launch group with a 3-launch warm-up.
+   The threshold is **unchanged at 1.25x** — the statistic is the fix, not a wider margin — and the
+   gate prints every per-round ratio and the medians it used.
+
+**Measured** (GB10 sm_121, CUDA 13.0, driver 580.178.04; all runs serial, `--test-threads=1`).
+
+| Gate | Before (`bac8440`) | After |
+|---|---|---|
+| Packed gate alone (CUDA build) | 0 passed / 1 failed, the #87 refusal | **1 passed**, `[c4] CPU-only by construction …`; max \|Δlogit\| 3.0289, region 3.76x smaller — identical to the CPU build |
+| Full `#[ignore]`d serial set (CUDA, 0.5B) | **20 passed / 2 failed** (both #87) | **22 passed / 0 failed**, ten consecutive runs (5 + 5) of the same binary |
+| Full `#[ignore]`d serial set (CUDA, Qwen3-0.6B config) | — | 21 passed / 1 failed; the one failure is an **unrelated, pre-existing** C5 defect (a session cannot encode an f16 element type), filed as [#130](https://github.com/yusiwen/minfer/issues/130) |
+| Timing gate, decode ratio | 1.001 / 1.001 / 1.006 / 1.001 / 1.001 (5 runs) | 1.001–1.004 (6 idle runs), 1.001–1.018 (6 loaded runs) |
+| Timing gate, prefill ratio | 1.088 / 1.087 / 1.092 / **1.021** / 1.090 (5 runs) | 1.087–1.107 (6 idle), 1.079–1.145 (6 loaded) |
+| `cargo test --release` (CPU) | 382 / 0 / 21 + 3 / 0 / 6 | **382 / 0 / 21 + 3 / 0 / 6** (unchanged) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | green | **21 passed / 0 failed**, with the packed gate executing |
+
+The pre-#123 prefill sample `1.021` is the old statistic's failure mode from the other side: a
+spike hit the span block, the ratio went *down*, and the gate would have passed for the wrong
+reason. Load for the "loaded" rows: 16 CPU spinners plus two concurrent processes running
+`cuda_verify_attention_nt_invariance` in a loop. Individual per-round ratios reached **8.60x** under
+that load; the median absorbed them (worst prefill median 1.145, worst decode median 1.018).
+
+**Mutation checks** (all reverted before landing).
+
+- Re-breaking the device-awareness (the pre-#123 `load_model`) makes the packed gate red again with
+  the exact #87 refusal: **21 passed / 1 failed** — and the collateral test stays green, because the
+  guard now restores the format on the panic path.
+- Removing the guard as well restores the `bac8440` baseline exactly: **20 passed / 2 failed**, both
+  with the #87 refusal. So both halves — the CPU-forced load and the guard — are load-bearing.
+- Doubling the map path's work in the timing gate's prefill closure trips the assert at **2.190x**
+  (182.2 vs 83.3 µs/launch), so the gate is live. Since the intrinsic ratio is ~1.09, a uniform map
+  regression of ≥ ~15% crosses 1.25x and trips it.
+
+**Honest scope.**
+
+- **Metal is not exercised**: no Mac here; CI's `build-macos` job compiles the Metal backend only.
+  The packed gate's CPU-forcing is backend-agnostic, so it holds there too.
+- **[#99](https://github.com/yusiwen/minfer/issues/99) and [#87](https://github.com/yusiwen/minfer/issues/87) remain open.** #99
+  (per-engine KV format) was explicitly out of scope; the guard is a test-local mitigation, not the
+  format-ownership fix. #87 (a device kernel that reads a packed q8_0 region) is *why* the gate is
+  CPU-forced: when it lands, the gate's `device() == Cpu` assertion will fire and it should be
+  re-pointed at the device.
+- The Qwen3-0.6B configuration's serial set is 21/1 for an unrelated pre-existing reason — the C5
+  container has no F16 flag, so a CUDA f16 session is refused on load
+  ([#130](https://github.com/yusiwen/minfer/issues/130)); that test fails **alone** with no #123
+  code in its path, so it is not a #123 regression.
+- The decode threshold could in principle be tighter than 1.25x (its intrinsic ratio is ~1.00). It
+  is left at the pre-existing 1.25x on purpose, so the ticket removes flakiness without weakening
+  the gate; it is not so wide that a real regression escapes (the 2.190x mutation trips, and the
+  arithmetic above puts the detection floor at ~15%).
+
+**Follow-ups.** [#87](https://github.com/yusiwen/minfer/issues/87) (device packed-q8_0 attention),
+[#99](https://github.com/yusiwen/minfer/issues/99) (per-engine KV format), and
+[#130](https://github.com/yusiwen/minfer/issues/130) (the f16 KV session round trip, found while
+gating this ticket).
 
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 
@@ -3421,7 +3520,7 @@ Can run in parallel with A–E by a different workstream.
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) | M | this box |
-| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24** | M | this box |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
@@ -3883,7 +3982,7 @@ largest city` byte-identically with the flag on and off (and across a repeated
 off run), and the same chat request served with and without the flag returned
 identical content.
 
-**The full `#[ignore]`d set on this CUDA build is red, and not because of F8.**
+**The full `#[ignore]`d set on this CUDA build was red, and not because of F8.**
 `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1`
 gave **5 passed / 14 failed** at `3616570` (deterministic across two runs), all 14
 failing with the same refusal: the E4 default CUDA budget collapsed to **0 bytes**
@@ -3894,7 +3993,7 @@ showed 118.6–119.8 GB of 121 GB still available. **That is fixed**
 ([#122](https://github.com/yusiwen/minfer/issues/122)): the same command at
 `eeba0d0` + the S4 record below is now **17 passed / 2 failed** (**20 passed / 2 failed**
 on the F2-rebased tip, which added three tests to the set), and the 0-byte-budget
-message appears **0** times. The two residual failures are both the packed-cache gate's
+message appears **0** times. The two residual failures were both the packed-cache gate's
 [#87](https://github.com/yusiwen/minfer/issues/87) cause, tracked in
 [#123](https://github.com/yusiwen/minfer/issues/123): first
 `a_packed_kv_cache_answers_like_the_f32_one` itself (CPU-only by its own docstring,
@@ -3905,7 +4004,14 @@ visible by #87's refusal now being the first failure instead of the budget). The
 map-window gate's 1.25x timing margin (a loaded GB10 exceeded it once, 1.267x) is the
 third #123 item and **passed** in this run. All three are filed, and none reproduces with
 either F8 gate run alone, which is why the device claim below is scoped to those two
-gates plus the op-timing path.
+gates plus the op-timing path. **All three are fixed in
+[#123](https://github.com/yusiwen/minfer/issues/123)** (its test-hygiene record lives in
+the E4 section, above): on the 0.5B configuration the serial set is **22 passed / 0
+failed**, ten consecutive runs of the same binary, and the timing gate's verdict no
+longer depends on the box being quiet — its median-of-ratios statistic stayed below
+1.15x even with 16 CPU spinners and two concurrent CUDA attention loops. The
+Qwen3-0.6B configuration's set is 21/1, its one failure a separate pre-existing C5
+defect filed as [#130](https://github.com/yusiwen/minfer/issues/130).
 
 **Honest scope.** (a) Every measurement in the sections *above* this block was taken
 on a **CPU-only build**: that worktree was built with `cargo build --release`,
