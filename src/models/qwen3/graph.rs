@@ -108,6 +108,7 @@ impl Qwen3Graph {
             let fuse_qkv_norm = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
+                && !b.kv_is_packed()
                 && l.q_norm.is_some()
                 && l.k_norm.is_some()
                 && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);

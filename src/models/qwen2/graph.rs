@@ -107,9 +107,13 @@ impl Qwen2Graph {
             //   epilogue (CUDA-only today; Metal keeps the unfused chain for
             //   these layers). Both replace 3 matmul + 3 bias + 2 rope +
             //   2 store dispatches.
+            // C4 S2b: `!b.kv_is_packed()` — the fused epilogue has no packed store
+            // (it writes one K/V element at a time; a Q8_0 block needs all 32), so a
+            // packed decode takes the unfused bias/rope/store chain instead.
             let fuse_qkv = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
+                && !b.kv_is_packed()
                 && l.bq.is_some()
                 && l.bk.is_some()
                 && l.bv.is_some();
@@ -1089,216 +1093,265 @@ mod tests {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        // C4 S2's packed read is CPU-only until #87 lands a device kernel: a CUDA
-        // (or Metal) attention kernel addresses f32/f16 rows, so a packed region on
-        // the device is refused at `ensure_kv`. `Layers(0)` is the established way
-        // to ask for the all-CPU configuration (see
-        // `a_partial_offload_runs_the_rest_on_the_cpu`), and the load resolves the
-        // KV format against the device it actually landed on, so this is a clean
-        // CPU model on every build. Assert it, so a future change that lets the
-        // device claim the model fails loudly here instead of quietly measuring the
-        // wrong backend.
-        let model = crate::models::load_model_with(&gguf, "", OffloadRequest::Layers(0))
-            .expect("load the C4 gate's model CPU-only");
-        assert_eq!(
-            model.device(),
-            Device::Cpu,
-            "the packed-KV gate must run on the CPU backend: no device attention kernel reads a \
-             packed q8_0 region yet (issue #87)"
-        );
-        eprintln!(
-            "[c4] CPU-only by construction: the packed q8_0 read has no device kernel yet \
-             (issue #87), so this gate runs `--gpu-layers 0` rather than skipping on a GPU box"
-        );
         // The format is process-wide and this gate flips it; restore it even if an
         // assertion panics, so the *next* test in the serial `#[ignore]`d set does
         // not size its KV region for `q8_0` (the collateral #122 recorded, whose
         // mechanism is #99).
         let _format = KvFormatGuard::new();
+
+        // C4 S2b: a KV layout is **two** policies. The builder's `kv_format` sizes
+        // the region (packed or f32-shaped) and `cuda::kv_cache_layout` picks the
+        // kernel that reads it; a run that sets only the first asks an f16/f32
+        // kernel to address a packed region. The loader sets both from
+        // `MINFER_CACHE_TYPE` (`cuda::set_kv_cache_type`), and this gate does the
+        // same, so an arm's measurement is always the layout it named.
+        let set_layout = |format: KvFormat| {
+            set_kv_format(format);
+            #[cfg(feature = "cuda")]
+            crate::cuda::set_kv_cache_layout(match format {
+                KvFormat::Q8_0 => crate::cuda::KV_LAYOUT_Q8_0,
+                KvFormat::F16 => crate::cuda::KV_LAYOUT_F16,
+                KvFormat::F32 => crate::cuda::KV_LAYOUT_F32,
+            });
+        };
+
+        // The arms. Before C4 S2b this gate had to ask for `Layers(0)` because the
+        // device could not read a packed region at all (#123's device-aware
+        // rework); now the device is a first-class arm and the CPU one stays as
+        // coverage — on a CPU-only build it is the whole gate, and on a CUDA build
+        // it still exercises the CPU kernel. Each arm **asserts the backend it
+        // measured**, so a silent fallback (the loader drops to CPU when the
+        // offloaded weights do not register) fails loudly instead of reporting a
+        // CPU number as a device one.
+        let mut arms: Vec<(&str, Box<dyn ModelDef>)> = Vec::new();
+        arms.push((
+            "cpu",
+            crate::models::load_model_with(&gguf, "cpu.", OffloadRequest::Layers(0))
+                .expect("load the C4 gate's model CPU-only"),
+        ));
+        #[cfg(feature = "cuda")]
+        if crate::cuda::CudaState::get().is_some() {
+            arms.push((
+                "cuda",
+                crate::models::load_model_with(&gguf, "cuda.", OffloadRequest::Default)
+                    .expect("load the C4 gate's model on the device"),
+            ));
+        }
+
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let n_ctx = 256;
         let steps = 8;
         let ids = tok.encode("The capital of France is");
         let n = ids.len();
 
-        let run = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-            set_kv_format(format);
-            let mut cache = GraphCache::new();
-            cache.alloc().kv_set_capacity(n_ctx);
-            let positions: Vec<usize> = (0..n).collect();
-            let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
-            let mut logits = vec![l.clone()];
-            let mut next = argmax(&l);
-            let mut toks = vec![next];
-            for s in 0..steps {
-                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
-                logits.push(l.clone());
-                next = argmax(&l);
-                toks.push(next);
+        for (label, model) in &arms {
+            let device = model.device();
+            if *label == "cpu" {
+                assert_eq!(
+                    device,
+                    Device::Cpu,
+                    "the CPU arm must run on the CPU backend"
+                );
+            } else {
+                assert_eq!(
+                    device,
+                    Device::Cuda,
+                    "the device arm must actually run on the device — a silent CPU fallback \
+                     would leave the packed CUDA kernels untested by the very gate that \
+                     exists to exercise them"
+                );
             }
-            (logits, toks, cache.alloc().kv_region_bytes())
-        };
 
-        let (l_ref, t_ref, b_ref) = run(KvFormat::F32);
-        let (l_q8, t_q8, b_q8) = run(KvFormat::Q8_0);
-        // Normal-path restore; `_format` (the guard) is the panic-safe backstop.
-        set_kv_format(KvFormat::F32);
-        let ratio = b_ref as f64 / b_q8 as f64;
-        let worst = l_ref
-            .iter()
-            .zip(&l_q8)
-            .map(|(a, b)| max_delta(a, b))
-            .fold(0.0f32, f32::max);
-        let step_deltas: Vec<f32> = l_ref
-            .iter()
-            .zip(&l_q8)
-            .map(|(a, b)| max_delta(a, b))
-            .collect();
-        let spread = l_ref
-            .iter()
-            .flatten()
-            .fold(f32::NEG_INFINITY, |m, x| m.max(*x))
-            - l_ref.iter().flatten().fold(f32::INFINITY, |m, x| m.min(*x));
-        let at_argmax: Vec<f32> = l_ref
-            .iter()
-            .zip(&l_q8)
-            .map(|(a, b)| {
-                let i = argmax(a) as usize;
-                (a[i] - b[i]).abs()
-            })
-            .collect();
-        let matched = t_ref.iter().zip(&t_q8).take_while(|(a, b)| a == b).count();
-        eprintln!(
-            "[c4] KV regions: f32 {b_ref} B vs q8_0 {b_q8} B ({ratio:.2}x smaller); \
-             max |Δlogit| = {worst} of a {spread} spread; per step {step_deltas:?}"
-        );
-        eprintln!("[c4] |Δ| at the reference argmax per step: {at_argmax:?}");
-        eprintln!(
-            "[c4] greedy continuation: {matched}/{} steps agree (reported, not asserted — \
-             see the note on this test)",
-            t_ref.len()
-        );
-        assert!(
-            b_q8 * 3 <= b_ref,
-            "packed regions must be at least 3x smaller: {b_q8} vs {b_ref}"
-        );
-        // Named class, measured on the 0.5B Q4_0 and on Qwen3-0.6B Q8_0 before being
-        // fixed here. Q8_0 rounds every K/V cell, so this is never bitwise. The two
-        // numbers say different things on purpose:
-        //  * at the reference's argmax the logits move by <= 1.0 (measured 0.60 on the
-        //    0.5B, 0.55 on Qwen3) — the decoding-relevant error;
-        //  * over the whole 152k-way logit vector the tail moves by <= 3.0 (measured
-        //    2.50, <= 8% of the 37.8 spread) — a gross-error detector: a wrong row
-        //    width or byte order is off by orders of magnitude, not 8%.
-        assert!(
-            at_argmax.iter().fold(0.0f32, |m, d| m.max(*d)) <= 1.0,
-            "packed vs f32 at the argmax: {at_argmax:?}"
-        );
-        // The tail bound is a gross-error detector (a wrong row width or byte order is
-        // off by orders of magnitude, not by 11% of the spread). S2's query
-        // quantization is the delta from S1's 2.505 to this run's 3.029, both <= 8% of
-        // the spread; `MINFER_NO_FUSED_Q8_KV=1` reproduces the smaller one.
-        assert!(
-            worst <= 4.0,
-            "packed vs f32 logits: max |Δ| = {worst} of a {spread} spread"
-        );
-
-        // C4 S2's second acceptance: a **physical shift** under Q8_0 keeps the
-        // continuation. `kv_rm` moves the surviving cells verbatim (a cell is a whole
-        // number of words) and re-ropes each survivor's K through
-        // dequantize → rope → requantize; that requantization is the new term, on top
-        // of the one the plain run above already carries.
-        //
-        // The shift drops the oldest `drop` rows of a longer prefill and continues,
-        // which is the conversation's overflow case (C2). Both formats run the *same*
-        // shift, so the comparison isolates the packed re-rope — it is not a comparison
-        // against a fresh prefill (which C2 records as its own tolerance class).
-        let shift_text = tok.encode(
-            "The capital of France is Paris and the capital of Japan is Tokyo and the \
-             capital of Italy is Rome",
-        );
-        let shift_n = shift_text.len();
-        let drop = 4usize;
-        assert!(
-            shift_n > drop + steps,
-            "the shifted fixture must keep a context"
-        );
-        let run_shifted = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-            set_kv_format(format);
-            let mut cache = GraphCache::new();
-            cache.alloc().kv_set_capacity(n_ctx);
-            let positions: Vec<usize> = (0..shift_n).collect();
-            let mut l = model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
-            let (freq_base, freq_scale) = model.rope_params();
-            let rope = crate::graph::kvcache::KvRope {
-                freq_base,
-                freq_scale,
-                n_head_kv: model.n_head_kv(),
-                hd: model.n_embd_head(),
-                style: model.rope_style(),
+            let run = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                set_layout(format);
+                let mut cache = GraphCache::new();
+                cache.alloc().kv_set_capacity(n_ctx);
+                let positions: Vec<usize> = (0..n).collect();
+                let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+                let mut logits = vec![l.clone()];
+                let mut next = argmax(&l);
+                let mut toks = vec![next];
+                for s in 0..steps {
+                    l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                    logits.push(l.clone());
+                    next = argmax(&l);
+                    toks.push(next);
+                }
+                (logits, toks, cache.alloc().kv_region_bytes())
             };
-            let left = cache
-                .alloc()
-                .kv_rm(0, drop, &rope)
-                .expect("packed-aware physical shift");
-            // The survivors now address positions 0..left, so the next token continues
-            // at `left` — the shift's whole point.
-            let mut next = argmax(&l);
-            let mut toks = Vec::new();
-            let mut logs = Vec::new();
-            for s in 0..steps {
-                l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
-                logs.push(l.clone());
-                next = argmax(&l);
-                toks.push(next);
-            }
-            (logs, toks, left)
-        };
-        let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(KvFormat::F32);
-        let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(KvFormat::Q8_0);
-        // Normal-path restore; `_format` (the guard) is the panic-safe backstop.
-        set_kv_format(KvFormat::F32);
-        assert_eq!(left_ref, left_q8, "the same shift must leave the same rows");
-        assert_eq!(left_ref, shift_n - drop);
-        // Compare the **first** decode step, i.e. the step whose input is the shifted
-        // context itself. Later steps are a different matter: a token that flips makes
-        // the two runs generate different sequences, so their logits diverge by nature
-        // (the run above reports the greedy agreement for exactly that reason).
-        let (l_first_f32, l_first_q8) = (&logs_shift_f32[0], &logs_shift_q8[0]);
-        let shift_delta = max_delta(l_first_f32, l_first_q8);
-        let spread_shift = l_first_f32.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x))
-            - l_first_f32.iter().fold(f32::INFINITY, |m, x| m.min(*x));
-        let shift_at_argmax = {
-            let i = argmax(l_first_f32) as usize;
-            (l_first_f32[i] - l_first_q8[i]).abs()
-        };
-        let shift_matched = t_shift_ref
-            .iter()
-            .zip(&t_shift_q8)
-            .take_while(|(a, b)| a == b)
-            .count();
-        eprintln!(
-            "[c4s2] the first decode step after a {drop}-row shift of {shift_n}: max |Δlogit| = \
-             {shift_delta} of a {spread_shift} spread, at the argmax {shift_at_argmax}; greedy \
-             continuation agrees on {shift_matched}/{} steps (reported, not asserted)",
-            t_shift_ref.len()
-        );
-        // The same *kind* of measurement as the unshifted comparison, one step after a
-        // shift — with a slightly wider bound, because the shifted state is fragile in a
-        // way the unshifted one is not: `kv_rm` composes C2's re-rope with C4's
-        // re-quantization, so the surviving K rows are
-        // `quantize(rope(dequantize(quantize(row))))`. Measured here: max |Δlogit| 2.466
-        // and 0.064 at the reference's argmax on the fused path, 3.165 / 1.074 on S1's
-        // (`MINFER_NO_FUSED_Q8_KV=1`). Both legs must stay green — the knob is an A/B,
-        // not an alternate expectation — and a misread cell is off by the whole spread.
-        assert!(
-            shift_at_argmax <= 2.0,
-            "packed shift vs f32 shift at the argmax: |Δ| = {shift_at_argmax}"
-        );
-        assert!(
-            shift_delta <= 8.0,
-            "packed shift vs f32 shift: max |Δ| = {shift_delta} of a {spread_shift} spread"
-        );
+
+            let (l_ref, t_ref, b_ref) = run(KvFormat::F32);
+            let (l_q8, t_q8, b_q8) = run(KvFormat::Q8_0);
+            // Restore the reference format between arms; `_format` is the
+            // panic-safe backstop.
+            set_layout(KvFormat::F32);
+            let ratio = b_ref as f64 / b_q8 as f64;
+            let worst = l_ref
+                .iter()
+                .zip(&l_q8)
+                .map(|(a, b)| max_delta(a, b))
+                .fold(0.0f32, f32::max);
+            let step_deltas: Vec<f32> = l_ref
+                .iter()
+                .zip(&l_q8)
+                .map(|(a, b)| max_delta(a, b))
+                .collect();
+            let spread = l_ref
+                .iter()
+                .flatten()
+                .fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+                - l_ref.iter().flatten().fold(f32::INFINITY, |m, x| m.min(*x));
+            let at_argmax: Vec<f32> = l_ref
+                .iter()
+                .zip(&l_q8)
+                .map(|(a, b)| {
+                    let i = argmax(a) as usize;
+                    (a[i] - b[i]).abs()
+                })
+                .collect();
+            let matched = t_ref.iter().zip(&t_q8).take_while(|(a, b)| a == b).count();
+            eprintln!(
+                "[c4] {label}: KV regions: f32 {b_ref} B vs q8_0 {b_q8} B ({ratio:.2}x smaller); \
+                 max |Δlogit| = {worst} of a {spread} spread; per step {step_deltas:?}"
+            );
+            eprintln!("[c4] {label}: |Δ| at the reference argmax per step: {at_argmax:?}");
+            eprintln!(
+                "[c4] {label}: greedy continuation: {matched}/{} steps agree (reported, not \
+                 asserted — see the note on this test)",
+                t_ref.len()
+            );
+            assert!(
+                b_q8 * 3 <= b_ref,
+                "[{label}] packed regions must be at least 3x smaller: {b_q8} vs {b_ref}"
+            );
+            // Named class, measured on the 0.5B Q4_0 and on Qwen3-0.6B Q8_0 before being
+            // fixed here. Q8_0 rounds every K/V cell, so this is never bitwise. The two
+            // numbers say different things on purpose:
+            //  * at the reference's argmax the logits move by <= 1.0 (measured 0.60 on the
+            //    0.5B, 0.55 on Qwen3) — the decoding-relevant error;
+            //  * over the whole 152k-way logit vector the tail moves by <= 3.0 (measured
+            //    2.50, <= 8% of the 37.8 spread) — a gross-error detector: a wrong row
+            //    width or byte order is off by orders of magnitude, not 8%.
+            assert!(
+                at_argmax.iter().fold(0.0f32, |m, d| m.max(*d)) <= 1.0,
+                "[{label}] packed vs f32 at the argmax: {at_argmax:?}"
+            );
+            // The tail bound is a gross-error detector (a wrong row width or byte order is
+            // off by orders of magnitude, not by 11% of the spread). S2's query
+            // quantization is the delta from S1's 2.505 to this run's 3.029, both <= 8% of
+            // the spread; `MINFER_NO_FUSED_Q8_KV=1` reproduces the smaller one. The device
+            // arm is the same class: a packed cell's bytes are the same bytes, so the
+            // rounding is the same rounding.
+            assert!(
+                worst <= 4.0,
+                "[{label}] packed vs f32 logits: max |Δ| = {worst} of a {spread} spread"
+            );
+
+            // C4 S2's second acceptance: a **physical shift** under Q8_0 keeps the
+            // continuation. `kv_rm` moves the surviving cells verbatim (a cell is a whole
+            // number of words) and re-ropes each survivor's K through
+            // dequantize → rope → requantize; that requantization is the new term, on top
+            // of the one the plain run above already carries. On the device arm this is
+            // where the packed region's bytes round-trip through the CUDA pool
+            // (`read_pool` → `map_q8_0_cells` → `write_pool`) and move through
+            // `kv_move_rows` one whole word per cell.
+            //
+            // The shift drops the oldest `drop` rows of a longer prefill and continues,
+            // which is the conversation's overflow case (C2). Both formats run the *same*
+            // shift, so the comparison isolates the packed re-rope — it is not a comparison
+            // against a fresh prefill (which C2 records as its own tolerance class).
+            let shift_text = tok.encode(
+                "The capital of France is Paris and the capital of Japan is Tokyo and the \
+                 capital of Italy is Rome",
+            );
+            let shift_n = shift_text.len();
+            let drop = 4usize;
+            assert!(
+                shift_n > drop + steps,
+                "the shifted fixture must keep a context"
+            );
+            let run_shifted = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                set_layout(format);
+                let mut cache = GraphCache::new();
+                cache.alloc().kv_set_capacity(n_ctx);
+                let positions: Vec<usize> = (0..shift_n).collect();
+                let mut l =
+                    model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
+                let (freq_base, freq_scale) = model.rope_params();
+                let rope = crate::graph::kvcache::KvRope {
+                    freq_base,
+                    freq_scale,
+                    n_head_kv: model.n_head_kv(),
+                    hd: model.n_embd_head(),
+                    style: model.rope_style(),
+                };
+                let left = cache
+                    .alloc()
+                    .kv_rm(0, drop, &rope)
+                    .expect("packed-aware physical shift");
+                // The survivors now address positions 0..left, so the next token continues
+                // at `left` — the shift's whole point.
+                let mut next = argmax(&l);
+                let mut toks = Vec::new();
+                let mut logs = Vec::new();
+                for s in 0..steps {
+                    l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
+                    logs.push(l.clone());
+                    next = argmax(&l);
+                    toks.push(next);
+                }
+                (logs, toks, left)
+            };
+            let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(KvFormat::F32);
+            let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(KvFormat::Q8_0);
+            set_layout(KvFormat::F32);
+            assert_eq!(
+                left_ref, left_q8,
+                "[{label}] the same shift must leave the same rows"
+            );
+            assert_eq!(left_ref, shift_n - drop);
+            // Compare the **first** decode step, i.e. the step whose input is the shifted
+            // context itself. Later steps are a different matter: a token that flips makes
+            // the two runs generate different sequences, so their logits diverge by nature
+            // (the run above reports the greedy agreement for exactly that reason).
+            let (l_first_f32, l_first_q8) = (&logs_shift_f32[0], &logs_shift_q8[0]);
+            let shift_delta = max_delta(l_first_f32, l_first_q8);
+            let spread_shift = l_first_f32.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+                - l_first_f32.iter().fold(f32::INFINITY, |m, x| m.min(*x));
+            let shift_at_argmax = {
+                let i = argmax(l_first_f32) as usize;
+                (l_first_f32[i] - l_first_q8[i]).abs()
+            };
+            let shift_matched = t_shift_ref
+                .iter()
+                .zip(&t_shift_q8)
+                .take_while(|(a, b)| a == b)
+                .count();
+            eprintln!(
+                "[c4s2] {label}: the first decode step after a {drop}-row shift of {shift_n}: max \
+                 |Δlogit| = {shift_delta} of a {spread_shift} spread, at the argmax \
+                 {shift_at_argmax}; greedy continuation agrees on {shift_matched}/{} steps \
+                 (reported, not asserted)",
+                t_shift_ref.len()
+            );
+            // The same *kind* of measurement as the unshifted comparison, one step after a
+            // shift — with a slightly wider bound, because the shifted state is fragile in a
+            // way the unshifted one is not: `kv_rm` composes C2's re-rope with C4's
+            // re-quantization, so the surviving K rows are
+            // `quantize(rope(dequantize(quantize(row))))`. Measured here: max |Δlogit| 2.466
+            // and 0.064 at the reference's argmax on the fused path, 3.165 / 1.074 on S1's
+            // (`MINFER_NO_FUSED_Q8_KV=1`). Both legs must stay green — the knob is an A/B,
+            // not an alternate expectation — and a misread cell is off by the whole spread.
+            assert!(
+                shift_at_argmax <= 2.0,
+                "[{label}] packed shift vs f32 shift at the argmax: |Δ| = {shift_at_argmax}"
+            );
+            assert!(
+                shift_delta <= 8.0,
+                "[{label}] packed shift vs f32 shift: max |Δ| = {shift_delta} of a \
+                 {spread_shift} spread"
+            );
+        }
     }
 
     /// C5's acceptance on the real model: a session resumed from disk continues
@@ -1357,6 +1410,23 @@ mod tests {
         ));
         let report = b.alloc().kv_save(&file).expect("kv_save");
         assert_eq!(report.written, n, "the prefill wrote positions 0..{n}");
+        // C4 S2b / C5: the container records the KV element type, and this gate is
+        // also the packed-session answer — run it with `MINFER_CACHE_TYPE=q8_0` and
+        // the file a packed session wrote is resumed as packed, on whatever backend
+        // the model landed on. (f16 is the type the container cannot encode:
+        // issue #130.) The assertion makes the packed run self-checking instead of
+        // passing vacuously on an f32 fallback.
+        eprintln!(
+            "[c5] live KV format: {} — the container records it (f16 is not encodable yet, #130)",
+            crate::graph::kvformat::kv_format().name()
+        );
+        if std::env::var("MINFER_CACHE_TYPE").as_deref() == Ok("q8_0") {
+            assert_eq!(
+                crate::graph::kvformat::kv_format(),
+                crate::graph::kvformat::KvFormat::Q8_0,
+                "MINFER_CACHE_TYPE=q8_0 must resolve to a packed KV session"
+            );
+        }
         eprintln!(
             "[c5] saved {} layers / {} cells / {} written / {} bytes to {}",
             report.layers,

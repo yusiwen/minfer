@@ -87,6 +87,15 @@ impl GraphBuilder {
         self.kv_format = format;
     }
 
+    /// C4 S2b: whether this graph's KV regions store **packed** cells. A model
+    /// builder reads it to keep the device-only fused QKV forms out of a packed
+    /// graph: their epilogue writes one K/V element at a time, and a Q8_0 block's
+    /// scale needs all 32 of its elements, so a packed decode takes the unfused
+    /// bias/rope/store chain (through `store_kv_q8_0`) instead.
+    pub fn kv_is_packed(&self) -> bool {
+        self.kv_format.is_packed()
+    }
+
     /// Declare that this graph's attention must read the explicit span (E1/E2):
     /// the batch spans more than one sequence, or a window does not start at
     /// cell 0. Must be called before the first `attn`/fused-attention node, since

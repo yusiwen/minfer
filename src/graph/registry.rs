@@ -773,14 +773,29 @@ mod tests {
 
     /// The #87 seam: `reads_packed_kv` is one authority, and the two call sites
     /// that used to hardcode "CPU only" read it.
+    ///
+    /// C4 S2b flipped CUDA's answer: the CUDA attention kernels are layout-tagged
+    /// and read a packed region, so this is now a two-backend yes (CPU + CUDA) with
+    /// Metal still at G5 ([#44]). A build without the `cuda` feature registers no
+    /// CUDA entry, so it claims nothing — which is the point of reading a registry
+    /// field instead of a hardcoded list.
+    ///
+    /// [#44]: https://github.com/yusiwen/minfer/issues/44
     #[test]
     fn the_packed_kv_capability_is_the_registrys_answer() {
         assert!(Backend::CPU.caps().reads_packed_kv);
         assert!(!Backend::METAL.caps().reads_packed_kv);
-        assert!(!Backend::CUDA.caps().reads_packed_kv);
         assert!(reads_packed_kv(Backend::CPU));
+        #[cfg(feature = "cuda")]
+        {
+            assert!(Backend::CUDA.caps().reads_packed_kv);
+            assert!(reads_packed_kv(Backend::CUDA));
+        }
         #[cfg(not(feature = "cuda"))]
-        assert!(!reads_packed_kv(Backend::CUDA));
+        {
+            assert!(!Backend::CUDA.caps().reads_packed_kv);
+            assert!(!reads_packed_kv(Backend::CUDA));
+        }
         // …and the C4 format gate asks the same field.
         use crate::models::Device;
         for device in [Device::Cpu, Device::Metal, Device::Cuda] {

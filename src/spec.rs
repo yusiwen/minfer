@@ -283,11 +283,32 @@ impl SpecEngine {
     /// analysis §4.2 hard gate: vocab size delta ≤ 128, same BOS/EOS, token
     /// texts equal). The draft proposes token ids the target must accept
     /// verbatim — a mismatch is silently-wrong output, so this fails loudly.
+    ///
+    /// C4 S2b: a **packed** KV cache is refused outright, for the same reason the
+    /// tokenizer gates exist. A verify round (1 < nt ≤ 16) relies on the batched
+    /// split kernel being bitwise-equal, per position, to sequential decode; a
+    /// packed cache routes that band to the general `gqa_attn_f32` kernel instead
+    /// (issue [#87]), so the identity the greedy contract rests on is not the one
+    /// the run would get. Refusing is the only honest answer — silently verifying
+    /// on a different reduction schedule would make the draft's acceptance
+    /// sampling wrong in a way no output check would catch.
+    ///
+    /// [#87]: https://github.com/yusiwen/minfer/issues/87
     pub fn new(
         cfg: &SpecConfig,
         target_tokenizer: &Tokenizer,
         target_vocab: usize,
     ) -> Result<Self, String> {
+        let format = crate::graph::kvformat::kv_format();
+        if format.is_packed() {
+            return Err(format!(
+                "speculative decoding needs the batched verify kernel (1 < nt <= 16) to be \
+                 bitwise-equal to sequential decode, and a {} KV cache routes that band to the \
+                 general attention kernel instead; run the target with MINFER_CACHE_TYPE=f32 or \
+                 f16, or without --spec-draft (issue #87)",
+                format.name()
+            ));
+        }
         let draft_path = crate::download::resolve(&cfg.draft_path)
             .map_err(|e| format!("spec draft model: {e}"))?
             .to_string_lossy()

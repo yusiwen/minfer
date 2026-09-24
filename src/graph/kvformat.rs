@@ -126,10 +126,13 @@ impl KvFormat {
     /// `BackendCaps::reads_packed_kv` — the same field `GraphAllocator::ensure_kv`
     /// reads, so the format gate and the region-sizing gate cannot disagree. The
     /// CPU's attention kernel dots the stored K blocks against the quantized query
-    /// and accumulates V out of the cell; CUDA and Metal address f32/f16 rows, so
-    /// they refuse it until their kernels land (issue [#87]).
+    /// and accumulates V out of the cell; CUDA's kernels are layout-tagged
+    /// (`KV_LAYOUT_F32/F16/Q8_0` plus the byte-addressed `kv4<LAYOUT>` load) since
+    /// C4 S2b, so it reads a packed region too. Metal still addresses f32/f16 rows
+    /// and stays at G5.
     ///
     /// [#87]: https://github.com/yusiwen/minfer/issues/87
+    /// [#44]: https://github.com/yusiwen/minfer/issues/44
     pub fn supports(self, device: Device) -> bool {
         match self {
             KvFormat::Q8_0 => super::registry::reads_packed_kv(device.backend()),
@@ -149,7 +152,8 @@ impl KvFormat {
 ///   `docs/BACKENDS.md` documents "CPU: f32 regions", so an env var set for a GPU run
 ///   must not break a CPU one;
 /// - anything else → **refused on every device** (a typo must not silently run f32);
-/// - a format the device has no kernel for → **refused** (`q8_0` off CPU).
+/// - a format the device has no kernel for → **refused** (`q8_0` on Metal, which is
+///   G5; the CPU and CUDA kernels read a packed region since C4 S2a / S2b).
 pub fn resolve(device: Device, cache_type: Option<&str>) -> Result<KvFormat, String> {
     let format = match cache_type {
         None | Some("") => KvFormat::F32,
@@ -170,9 +174,9 @@ pub fn resolve(device: Device, cache_type: Option<&str>) -> Result<KvFormat, Str
     };
     if !format.supports(device) {
         return Err(format!(
-            "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention kernel does not \
-             read a packed Q8_0 region (the CPU one does); refusing rather than silently \
-             falling back to f32",
+            "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention kernel has no \
+             packed Q8_0 read (the CPU's and CUDA's do, since C4 S2a / S2b; Metal is G5 on \
+             issue #44); refusing rather than silently falling back to f32",
             format.name(),
             device.name(),
             device.name()
@@ -412,11 +416,23 @@ mod tests {
         // f16 on CPU is the documented "CPU stays f32", not an error: the env var is
         // usually set for the GPU run a process may also do.
         assert_eq!(resolve(Device::Cpu, Some("f16")).unwrap(), KvFormat::F32);
-        // A packed format off a CPU is refused loudly, never silently mapped.
-        for dev in [Device::Cuda, Device::Metal] {
-            let err = resolve(dev, Some("q8_0")).unwrap_err();
+        // A packed format is refused exactly where the kernels are missing: Metal
+        // (G5, issue #44) always, CUDA only in a build that compiles no CUDA at
+        // all. The answer comes from the registry, not from a list here.
+        let err = resolve(Device::Metal, Some("q8_0")).unwrap_err();
+        assert!(err.contains("q8_0"), "{err}");
+        assert!(err.contains(Device::Metal.name()), "{err}");
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            resolve(Device::Cuda, Some("q8_0")).unwrap(),
+            KvFormat::Q8_0,
+            "C4 S2b gave CUDA a packed read"
+        );
+        #[cfg(not(feature = "cuda"))]
+        {
+            let err = resolve(Device::Cuda, Some("q8_0")).unwrap_err();
             assert!(err.contains("q8_0"), "{err}");
-            assert!(err.contains(dev.name()), "{err}");
+            assert!(err.contains(Device::Cuda.name()), "{err}");
         }
         // A typo is refused on every device (CUDA used to read it as f32).
         for dev in [Device::Cpu, Device::Cuda, Device::Metal] {

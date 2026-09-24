@@ -405,15 +405,17 @@ extern "C" {
     );
     fn launch_gqa_attn_f32(
         q: *const f32,
-        k: *const f32,
-        v: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
         o: *mut f32,
         bound: *const i32,
         mode: i32,
+        layout: i32,
         nh: i32,
         nk: i32,
         hd: i32,
         scale: f32,
+        row_bytes: usize,
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
@@ -592,6 +594,18 @@ extern "C" {
         dst: *mut std::ffi::c_void,
         nkt: i32,
         nt: i32,
+        positions: *const i32,
+        stream: *mut std::ffi::c_void,
+    );
+    // C4 S2b: the packed store. `row_bytes` is the Q8_0 cell's byte width
+    // (`KvFormat::Q8_0.row_bytes(nkt)`), so the kernel writes each 34-byte block
+    // at its cell's own stride.
+    fn launch_store_kv_q8_0(
+        src: *const f32,
+        dst: *mut std::ffi::c_void,
+        nkt: i32,
+        nt: i32,
+        row_bytes: usize,
         positions: *const i32,
         stream: *mut std::ffi::c_void,
     );
@@ -923,6 +937,24 @@ extern "C" {
         hd: i32,
         scale: f32,
         pstr: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    // C4 S2b: the packed decode path (nt == 1). One 1-warp split-K launch per
+    // window mode, `rpw_gate = 0` — the hybrid 4-warp body is f16-typed.
+    fn launch_gqa_attn_split_q8_0(
+        q: *const f32,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        o: *mut f32,
+        partial: *mut f32,
+        bound: *const i32,
+        mode: i32,
+        nh: i32,
+        nk: i32,
+        hd: i32,
+        scale: f32,
+        pstr: i32,
+        row_bytes: usize,
         stream: *mut std::ffi::c_void,
     );
     // doc 94: batched split attention for the verify shapes (1 < nt <= 16) —
@@ -1511,37 +1543,80 @@ pub fn concat_rows_feasible(tensors: &[&Tensor]) -> bool {
         .all(|t| t.data().len() == row * (t.shape[1] as usize))
 }
 
-/// 8b: GPU KV cache element type (CUDA side, mirrors `metal::kv_cache_is_f16`).
-/// `MINFER_CACHE_TYPE=f16|f32` forces one; unset auto-selects f16 for the
-/// 7B class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for
-/// small models. Read once per CudaBackend at construction.
-static KV_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 8b / C4 S2b: the GPU KV cache **layout** (CUDA side, mirrors
+/// `metal::kv_cache_is_f16`). The three codes are the `KV_LAYOUT_*` contract the
+/// kernels are templated on and the `KvFormat` discriminants, so the same number
+/// names the same layout on both sides of the FFI boundary:
+///
+/// - `0` f32 — one f32 per element;
+/// - `1` f16 — one f16 per element in the first half of the f32-shaped region;
+/// - `2` q8_0 — packed 34-byte Q8_0 blocks, one cell rounded up to whole f32 words.
+///
+/// `MINFER_CACHE_TYPE=f16|f32|q8_0` forces one; unset auto-selects f16 for the 7B
+/// class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for small
+/// models. Read once per `CudaBackend` at construction.
+///
+/// Before C4 S2b this was a bool and anything that was not exactly `f16` became
+/// `false` — so a `q8_0` region would have been addressed as f32 rows. The layout
+/// is now a first-class three-valued policy and `q8_0` is never silently folded
+/// into f32.
+pub const KV_LAYOUT_F32: i32 = 0;
+pub const KV_LAYOUT_F16: i32 = 1;
+pub const KV_LAYOUT_Q8_0: i32 = 2;
+
+static KV_LAYOUT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(KV_LAYOUT_F32);
+
+/// The process-wide CUDA KV layout (the `KV_LAYOUT_*` code).
+pub fn kv_cache_layout() -> i32 {
+    KV_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn kv_cache_is_f16() -> bool {
-    KV_F16.load(std::sync::atomic::Ordering::Relaxed)
+    kv_cache_layout() == KV_LAYOUT_F16
 }
 
 /// Called at model load with the model dims, BEFORE the first forward.
+///
+/// A `MINFER_CACHE_TYPE` the resolver will refuse still sets the layout it names
+/// here (and the load then ends in `kvformat::resolve`); what matters is that the
+/// layout this function installs is never *another* format's — the pre-S2b bool
+/// mapped `q8_0` to f32, which would have sized a packed region for an f32 kernel.
 pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
-    let f16 =
-        std::env::var("MINFER_CACHE_TYPE").map_or(n_layers * n_kv_embd >= 8192, |v| v == "f16");
-    set_kv_cache_f16(f16);
+    let layout = match std::env::var("MINFER_CACHE_TYPE").ok().as_deref() {
+        Some("f16") => KV_LAYOUT_F16,
+        Some("f32") => KV_LAYOUT_F32,
+        Some("q8_0") => KV_LAYOUT_Q8_0,
+        _ => {
+            if n_layers * n_kv_embd >= 8192 {
+                KV_LAYOUT_F16
+            } else {
+                KV_LAYOUT_F32
+            }
+        }
+    };
+    set_kv_cache_layout(layout);
 }
 
-/// Set the KV element type directly: the loader passes the policy for the model it
-/// just loaded, and device tests use it to exercise one layout explicitly.
+/// Set the KV layout directly: the loader passes the policy for the model it just
+/// loaded, and device tests use it to exercise one layout explicitly.
 ///
 /// This deliberately **overwrites**. The value is a per-load policy, and a process that
 /// loads a second model must be able to change it — as a `OnceLock` the first load
 /// froze the dtype for every backend constructed afterwards, so a second model silently
 /// ran under the first one's choice (its own layer/embedding dims never re-decided).
+pub fn set_kv_cache_layout(layout: i32) {
+    KV_LAYOUT.store(layout, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The f16/f32 spelling of [`set_kv_cache_layout`], kept for the device tests that
+/// exercise the pre-C4 layouts.
 pub fn set_kv_cache_f16(f16: bool) {
-    KV_F16.store(f16, std::sync::atomic::Ordering::Relaxed);
+    set_kv_cache_layout(if f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 });
 }
 
 #[cfg(test)]
 mod kv_dtype_tests {
-    use super::{kv_cache_is_f16, set_kv_cache_f16};
+    use super::{kv_cache_is_f16, kv_cache_layout, set_kv_cache_f16, KV_LAYOUT_Q8_0};
 
     /// The dtype is a policy that a later load must be able to change; the previous
     /// one-shot global made the first decision permanent for the whole process.
@@ -1552,6 +1627,22 @@ mod kv_dtype_tests {
         assert_eq!(kv_cache_is_f16(), !before, "the new value must be visible");
         set_kv_cache_f16(before);
         assert_eq!(kv_cache_is_f16(), before, "and the old one can be restored");
+    }
+
+    /// C4 S2b: the packed layout is a third value, not `false`. The pre-S2b bool
+    /// mapped anything that was not exactly `f16` to f32, so a `q8_0` region would
+    /// have been handed to the f32 kernels.
+    #[test]
+    fn the_packed_layout_is_not_the_f32_one() {
+        let before = kv_cache_layout();
+        set_kv_cache_f16(true);
+        assert_eq!(kv_cache_layout(), super::KV_LAYOUT_F16);
+        // Write the layout directly, the way `MINFER_CACHE_TYPE=q8_0` resolves.
+        super::set_kv_cache_layout(KV_LAYOUT_Q8_0);
+        assert_eq!(kv_cache_layout(), KV_LAYOUT_Q8_0);
+        assert!(!kv_cache_is_f16(), "q8_0 is not f16");
+        super::set_kv_cache_layout(before);
+        assert_eq!(kv_cache_layout(), before);
     }
 }
 
@@ -4679,6 +4770,10 @@ impl CudaState {
         }
     }
 
+    /// C4 S2b: the general nt > 1 attention kernel, layout-tagged. `row_bytes` is
+    /// the KV cell's byte width (`nk * hd * {4,2}` for f32/f16,
+    /// `KvFormat::Q8_0.row_bytes(nkt)` for a packed region).
+    #[allow(clippy::too_many_arguments)]
     pub fn gqa_attn_f32(
         &self,
         q: *mut std::ffi::c_void,
@@ -4687,25 +4782,29 @@ impl CudaState {
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
         mode: i32,
+        layout: i32,
         nh: usize,
         nk: usize,
         hd: usize,
         scale: f32,
+        row_bytes: usize,
         nt: usize,
     ) {
         let stream = self.stream();
         unsafe {
             launch_gqa_attn_f32(
                 q as *const f32,
-                k as *const f32,
-                v as *const f32,
+                k as *const std::ffi::c_void,
+                v as *const std::ffi::c_void,
                 o as *mut f32,
                 positions as *const i32,
                 mode,
+                layout,
                 nh as i32,
                 nk as i32,
                 hd as i32,
                 scale,
+                row_bytes,
                 nt as i32,
                 stream,
             );
@@ -4899,6 +4998,10 @@ impl CudaState {
         Ok(())
     }
 
+    /// C4 S2b: the decode (nt == 1) split-K path, layout-tagged. A packed cache
+    /// takes `launch_gqa_attn_split_q8_0`, whose `rpw_gate = 0` skips the hybrid
+    /// 4-warp body (f16-typed); f32/f16 keep their pre-C4 launchers unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub fn gqa_attn_split(
         &self,
         q: *mut std::ffi::c_void,
@@ -4911,7 +5014,8 @@ impl CudaState {
         nk: usize,
         hd: usize,
         scale: f32,
-        f16_kv: bool,
+        layout: i32,
+        row_bytes: usize,
     ) {
         let pstr = ((4 + hd + 3) & !3) as i32;
         const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in cuda_kernels.cu
@@ -4919,7 +5023,24 @@ impl CudaState {
         let partial = Self::get_or_grow(&self.buf_attn_partial, need);
         let stream = self.stream();
         unsafe {
-            if f16_kv {
+            if layout == KV_LAYOUT_Q8_0 {
+                launch_gqa_attn_split_q8_0(
+                    q as *const f32,
+                    k,
+                    v,
+                    o as *mut f32,
+                    partial as *mut f32,
+                    positions as *const i32,
+                    mode,
+                    nh as i32,
+                    nk as i32,
+                    hd as i32,
+                    scale,
+                    pstr,
+                    row_bytes,
+                    stream,
+                );
+            } else if layout == KV_LAYOUT_F16 {
                 launch_gqa_attn_split_f16kv(
                     q as *const f32,
                     k,
@@ -5626,6 +5747,33 @@ impl CudaState {
         }
     }
 
+    /// C4 S2b: the packed store — one thread per (row, 32-element block), with the
+    /// CPU's own quantizer (`amax/127`, f16 scale, round-ties-even). `row_bytes` is
+    /// the packed cell's byte width (`KvFormat::Q8_0.row_bytes(nkt)`), which is what
+    /// makes the kernel address the cell's 34-byte blocks inside a word-padded row.
+    pub fn store_kv_q8_0(
+        &self,
+        src: *mut std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        nkt: usize,
+        nt: usize,
+        row_bytes: usize,
+        positions: *mut std::ffi::c_void,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_store_kv_q8_0(
+                src as *const f32,
+                dst,
+                nkt as i32,
+                nt as i32,
+                row_bytes,
+                positions as *const i32,
+                stream,
+            );
+        }
+    }
+
     /// D3-8: fused decode QKV epilogue (G4 CUDA port of Metal's
     /// `attn_bias_rope_store`). `positions` drives RoPE (sequence-relative);
     /// `cells` is the allocator-resolved KV row for the store (C6) — the two
@@ -5636,7 +5784,17 @@ impl CudaState {
     /// (nt==1), the mixed-quant class passes the three separate matmul
     /// outputs. Biases added per section, q/k roped in place (math verbatim
     /// `rope_f32`), k/v stored into the persistent regions at the same
-    /// addresses as `store_kv_f32`/`store_kv_f16` (f32 or f16 per `kv_is_f16`).
+    /// addresses as `store_kv_f32`/`store_kv_f16` (f32 or f16 per `layout`).
+    ///
+    /// C4 S2b: **f32/f16 only**, and a packed layout is refused here rather than
+    /// silently stored per element. The fused epilogue writes one K/V element at a
+    /// time — a Q8_0 block's scale needs all 32 of its elements before any of them
+    /// can be quantized — so a packed cache never builds this node (the model
+    /// builders' `layer_gpu` gate gains `&& !packed`) and a Q8_0 decode runs the
+    /// unfused bias/rope/store chain through [`Self::store_kv_q8_0`]. Reaching this
+    /// function with `KV_LAYOUT_Q8_0` is a builder bug, so it is an `Err`-shaped
+    /// refusal in the caller's terms: the function is infallible in the pre-C4
+    /// signature, so it panics with the reason instead of writing the wrong bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_bias_rope_store(
         &self,
@@ -5655,8 +5813,14 @@ impl CudaState {
         freq_scale: f32,
         positions: *mut std::ffi::c_void,
         cells: *mut std::ffi::c_void,
-        kv_is_f16: bool,
+        layout: i32,
     ) {
+        assert!(
+            layout != KV_LAYOUT_Q8_0,
+            "cuda: the fused bias/rope/store epilogue has no packed Q8_0 store (it writes one \
+             element at a time; a Q8_0 block needs all 32) — the model builder must not build \
+             Op::FusedQKV / Op::QkvBiasRopeStore for a packed cache (issue #87)"
+        );
         let stream = self.stream();
         unsafe {
             launch_attn_bias_rope_store(
@@ -5675,7 +5839,7 @@ impl CudaState {
                 freq_scale,
                 positions as *const i32,
                 cells as *const i32,
-                kv_is_f16 as i32,
+                (layout == KV_LAYOUT_F16) as i32,
                 stream,
             );
         }
@@ -5947,10 +6111,12 @@ impl CudaState {
             ba_buf,
             pos_buf,
             AttnWindow::Causal.code(),
+            KV_LAYOUT_F32,
             nh,
             nk,
             hd,
             scale,
+            (nk * hd * 4) as usize,
             nt,
         );
         self.debug_sync(il as i32, "gqa_attn");
@@ -6471,8 +6637,22 @@ mod d38_probe_tests {
                 let dk_f = dev_alloc(ctx_elems * kv_bytes);
                 let dv_f = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
-                    q1, k1, v1, dbq, dbk, dbv, dk_f, dv_f, nqt, nkt, hd, freq_base, freq_scale,
-                    dpos, dpos, kv_f16,
+                    q1,
+                    k1,
+                    v1,
+                    dbq,
+                    dbk,
+                    dbv,
+                    dk_f,
+                    dv_f,
+                    nqt,
+                    nkt,
+                    hd,
+                    freq_base,
+                    freq_scale,
+                    dpos,
+                    dpos,
+                    if kv_f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 },
                 );
 
                 // ---- FUSED form 2: three separate buffers (class-2 shape) --
@@ -6485,8 +6665,22 @@ mod d38_probe_tests {
                 let dk_f2 = dev_alloc(ctx_elems * kv_bytes);
                 let dv_f2 = dev_alloc(ctx_elems * kv_bytes);
                 st.attn_bias_rope_store(
-                    d_q2, d_k2, d_v2, dbq, dbk, dbv, dk_f2, dv_f2, nqt, nkt, hd, freq_base,
-                    freq_scale, dpos, dpos, kv_f16,
+                    d_q2,
+                    d_k2,
+                    d_v2,
+                    dbq,
+                    dbk,
+                    dbv,
+                    dk_f2,
+                    dv_f2,
+                    nqt,
+                    nkt,
+                    hd,
+                    freq_base,
+                    freq_scale,
+                    dpos,
+                    dpos,
+                    if kv_f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 },
                 );
 
                 // ---- UNFUSED: the 7-launch chain on split sections ----
