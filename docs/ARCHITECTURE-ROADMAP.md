@@ -200,12 +200,24 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    exactly what breaks the first time an op is unsupported — e.g. interleaved
    RoPE on CUDA (`cuda_backend.rs:1324`), or `FusedQkvNorm`, which CUDA does
    not advertise (`:1289-1321`) while Metal does (`metal_backend.rs:276`).
-2. **Synchronous, host-mediated cross-backend movement.** `copy_across` is
-   `copy_to_cpu` (a blocking device-to-host copy) followed by `write_host` (a
-   host-to-device copy) (`alloc.rs:592-653`), always preceded by a full
-   `sync_backend` (`scheduler.rs:180`). There are no events, no second stream,
-   and no overlap of CPU and GPU work. On Metal this is a `memcpy` both ways; on
-   CUDA it is real PCIe traffic, fully serialized.
+2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
+   F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
+   boundary is now two registered phases. Phase A (`copy_across` →
+   `BackendEntry::copy_cross`) enqueues the transfer — for a CUDA source a
+   device→host `cudaMemcpyAsync` into a pinned slab plus a `cudaEventRecord`,
+   where the pre-F5 code did `copy_to_cpu` (a full stream sync + a blocking
+   `cudaMemcpy`) — and phase B (`await_cross`) waits on the recorded event at the
+   documented synchronization point, once per staged input. The CPU's hooks are a
+   synchronous host round trip and a no-op (it has no device memory); **Metal
+   declines and keeps the synchronous path** until its blit/event port is written
+   and verified on a Mac. Counters (`graph/copystats.rs`), the per-backend table,
+   the enumeration of the synchronization points and the measured before/after are
+   in `docs/BACKEND-REGISTRY-DESIGN.md` §11 and the plan's F5 record.
+   **What remains:** true *overlap* — the split loop is still strictly sequential
+   (enqueue, then immediately wait), so there is no independent work for a copy to
+   overlap with; exploiting the substrate needs the scheduler to defer a wait to
+   the consumer's first use, and the Metal port. Both are filed follow-ups (see
+   the plan's F5 record), and multi-device execution still needs both.
 
 **Also:** ~~the cross-boundary staging map is keyed by node id alone
 (`alloc.rs:34`), so a node consumed by two different foreign backends can only
@@ -215,11 +227,12 @@ enabled.~~ **Fixed in A5**: the map is keyed by `(node, destination backend)`,
 one node can feed two foreign consumers, and the consumer-side filter is gone.
 
 **Recommendation.** Add an assignment pass that (a) propagates support backwards
-from unsupported ops and (b) scores a candidate assignment by crossing count;
-and replace the host round trip with an async copy plus a recorded event when
-the source and destination are different devices. Neither is urgent *today*;
-both are prerequisites for multi-device execution and for any heterogeneous
-split.
+from unsupported ops and (b) scores a candidate assignment by crossing count; and
+replace the host round trip with an async copy plus a recorded event when the
+source and destination are different devices (**F5 landed the CUDA half of this;
+the Metal half and the actual consumer-side waiting that would let a copy overlap
+independent work are the remaining follow-ups**). Neither is urgent *today*; both
+are prerequisites for multi-device execution and for any heterogeneous split.
 
 ---
 
@@ -638,7 +651,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
 | 12 | **Backend registry** decoupling the enum from the nine match sites. — **landed in F4 (2026-09-24)**: [#57](https://github.com/yusiwen/minfer/issues/57); the handle + the name-keyed table live in `graph/registry.rs`, the priority order is a pinned number, and the name surface (`--backend` / `MINFER_BACKENDS`) has three distinct loud startup refusals (`docs/BACKEND-REGISTRY-DESIGN.md`). The registered set itself stays compile-time (no `dlopen`) | §2.6 | M |
 | 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the Metal half defers to Phase G | §2.8 | S |
-| 14 | **Async cross-backend copy + events** (needed for any heterogeneous split and for multi-device execution). | §2.2 | M |
+| 14 | **Async cross-backend copy + events** (needed for any heterogeneous split and for multi-device execution). — **landed in F5 (2026-09-24)**: [#58](https://github.com/yusiwen/minfer/issues/58); the boundary's two registered phases (`BackendEntry::copy_cross`/`await_cross`), CUDA's `cudaMemcpyAsync` D2H + event + one `cudaEventSynchronize` at the documented point, the CPU's documented no-op, counter-gated (`graph/copystats.rs`: zero blocking boundary copies, one wait per copy) and bitwise-identical to the `MINFER_SYNC_COPIES` reference on a real split model. **Metal declines (unported, no Mac to verify) and true overlap is still open** — the deferred-wait scheduling change plus the Metal port are the follow-ups | §2.2 | M |
 
 ### P2 — coverage
 
