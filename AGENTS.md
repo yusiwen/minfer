@@ -251,6 +251,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Architecture design (module map, pipeline, adding an arch) | `docs/ARCHITECTURE.md` |
 | **End-to-end inference walkthrough (15-doc beginner series: CLI → GGUF → graph → kernels → backends)** | `docs/inference_e2e_walkthrough/` (index: `README.md`) |
 | Compute graph design + implementation record | `docs/COMPUTE-GRAPH-DESIGN.md` |
+| **Backend registry (F4/#57): the handle, the registered set, the two orders, the name surface, the three refusals** | `docs/BACKEND-REGISTRY-DESIGN.md` |
 | llama.cpp compute-graph analysis | `docs/LLAMA-COMPUTE-GRAPH.md` |
 | Metal optimization plans / gap analysis | `docs/METAL_OPTIMIZATIONS.md` |
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |

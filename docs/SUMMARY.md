@@ -48,6 +48,7 @@
 
 - [Compute Graph Design](./COMPUTE-GRAPH-DESIGN.md)
 - [Backends](./BACKENDS.md)
+    - [Backend Registry (F4)](./BACKEND-REGISTRY-DESIGN.md)
     - [GPU Safety](./GPU_SAFETY.md)
     - [Metal Backend Design](./METAL-BACKEND-DESIGN.md)
     - [CUDA Backend Design](./CUDA-BACKEND-DESIGN.md)
