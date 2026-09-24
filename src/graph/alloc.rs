@@ -3235,6 +3235,82 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// #130: the same `kv_save` → `kv_load` round trip under an **f16** element
+    /// type — the policy a CUDA box's auto rule picks for the 7B class
+    /// (`n_layers * n_kv_embd >= 8192`). The store here is the CPU's (which copies
+    /// words), so this gates the *container* half with no device: the format the
+    /// allocator reports, the header's flags, the reader's decode and the
+    /// `header.format != live` check. Before `FLAG_F16` the load refused the file
+    /// the save had just produced. The device half is the Qwen3-0.6B real-model gate.
+    #[test]
+    fn an_f16_session_round_trips_through_save_and_load() {
+        use crate::graph::kvformat::KvFormat;
+        const N_CTX: usize = 8;
+        const ROW: usize = 4;
+        const SEQ: u32 = 3;
+        let kk: Vec<f32> = (0..ROW * 2).map(|i| 0.5 + i as f32).collect();
+        let vv: Vec<f32> = (0..ROW * 2).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+
+        let build = |alloc: &mut GraphAllocator| -> ComputeGraph {
+            alloc.cpu_mut().set_kv_format_for_test(KvFormat::F16);
+            let mut b = GraphBuilder::new();
+            b.set_kv_format(KvFormat::F16);
+            let pos = b.input("positions", [2, 1, 1, 1], crate::graph::DType::I32);
+            let k = b.input("k", [ROW, 2, 1, 1], crate::graph::DType::F32);
+            let v = b.input("v", [ROW, 2, 1, 1], crate::graph::DType::F32);
+            let _store = b.kvcache_store(0, k, v, N_CTX);
+            let load = b.kvcache_load(0, ROW, N_CTX, 1);
+            b.output(load);
+            let g = b.build();
+            alloc.kv_set_capacity(N_CTX);
+            alloc.alloc_graph(&g).unwrap();
+            g
+        };
+
+        let mut a = GraphAllocator::new();
+        let ga = build(&mut a);
+        a.kv_reserve_seq(SEQ, N_CTX).unwrap();
+        a.fill_input_i32(&ga, "positions", &[0, 1]).unwrap();
+        a.fill_attn_inputs(&ga, &[SEQ, SEQ], &[0, 1]).unwrap();
+        a.fill_input(&ga, "k", &kk).unwrap();
+        a.fill_input(&ga, "v", &vv).unwrap();
+        let mut sched = crate::graph::scheduler::BackendScheduler::new();
+        sched.execute(&ga, &mut a).unwrap();
+        a.kv_own_range(SEQ, 0, 2);
+        let want_kv = a.copy_kv_to_cpu(0).unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("minfer-c5-alloc-{}-f16.bin", std::process::id()));
+        let report = a.kv_save(&path).unwrap();
+        // The bytes on disk name f16 — the flag the reader must decode.
+        let bytes = std::fs::read(&path).unwrap();
+        let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(flags, 1 << 1, "the header must carry FLAG_F16");
+
+        // A fresh allocator under the same policy resumes it, rows bit-identical.
+        let expect = KvSessionExpect {
+            backend: Backend::CPU,
+            n_ctx: N_CTX,
+            n_embd: ROW,
+        };
+        let mut b = GraphAllocator::new();
+        let gb = build(&mut b);
+        let loaded = b.kv_load(&path, &expect).unwrap();
+        assert_eq!(loaded, report);
+        assert_eq!(b.copy_kv_to_cpu(0).unwrap(), want_kv);
+        let _ = gb;
+
+        // An f32 reader refuses it by element type — not silently, and without
+        // creating an arena.
+        let mut c = GraphAllocator::new();
+        c.cpu_mut().set_kv_format_for_test(KvFormat::F32);
+        let err = c.kv_load(&path, &expect).unwrap_err();
+        assert!(err.contains("element type"), "{err}");
+        assert!(err.contains("f16"), "{err}");
+        assert!(c.kv_n_used(0).is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
     /// C3 end to end on CPU: a fragmented arena refuses an 8-cell reservation,
     /// the compaction moves the real KV bytes *and* renumbers the runs, and the
     /// reservation then fits — with the moved rows byte-identical at their new

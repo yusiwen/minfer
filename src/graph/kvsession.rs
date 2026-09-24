@@ -20,8 +20,12 @@
 //!   "truncated" wherever it stops, and `read_exact` cannot silently stop early.
 //!
 //! The bytes travel as f32 *words* (the pool's unit), exactly as the backend holds
-//! them — a packed Q8_0 region is words too, which is why the format is recorded
-//! and checked rather than inferred.
+//! them — a packed Q8_0 region is words too, which is why the element type is
+//! recorded and checked rather than inferred. The header's **flags word encodes it**
+//! (`FLAG_PACKED` for Q8_0, `FLAG_F16` for f16, `0` for f32 — `#130`), and the
+//! reader refuses an unknown bit and the mutually exclusive `packed | f16`
+//! combination loudly, so a container is never applied under a layout it does not
+//! describe.
 //!
 //! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C5).
 
@@ -44,9 +48,53 @@ pub const MAGIC: [u8; 8] = *b"MINFERKV";
 ///   restore that brought the rows back without it would be a different session, so the
 ///   container carries both or neither. A version-1 file is refused loudly and the
 ///   caller falls back to re-seeding, which is what the version byte is for.
+///
+/// The version was deliberately **not** bumped when the element type gained the
+/// `FLAG_F16` bit (`#130`): that is an additive flag, exactly as `FLAG_PACKED` was,
+/// and an older v2 build refuses the unknown bit rather than guessing — so no file
+/// on disk changes meaning. A version bump is for a *layout* change; a new refusal
+/// on a bit nobody wrote before is not one.
 pub const VERSION: u32 = 2;
 /// Flags bit 0: the regions are packed Q8_0 cells (C4).
 const FLAG_PACKED: u32 = 1 << 0;
+/// Flags bit 1: the regions are f16 cells (C4's GPU bandwidth policy).
+///
+/// Kept as a **new bit** rather than a format field, so the flag word's byte
+/// layout — and therefore every file already on disk — is untouched: a Q8_0 file
+/// still reads bit 0 exactly as before, and an f32 file is still `flags == 0`.
+/// A pre-#130 build reading an f16 file does not know this bit, so it refuses it
+/// loudly at the unknown-flags check instead of decoding the region as f32 — the
+/// same property [`FLAG_PACKED`] had when it landed, and the reason no version
+/// bump is needed.
+const FLAG_F16: u32 = 1 << 1;
+/// Every bit this reader understands. A file with any other bit set was written
+/// by a newer build, and its layout is not ours to guess.
+const KNOWN_FLAGS: u32 = FLAG_PACKED | FLAG_F16;
+
+/// The flag word a header's element type encodes to. The exact inverse of
+/// [`format_of_flags`], so the writer and the reader cannot drift: the match is
+/// exhaustive over [`KvFormat`], so a fourth format is a compile error here
+/// rather than a silently unencoded one.
+fn flags_of(format: KvFormat) -> u32 {
+    match format {
+        KvFormat::Q8_0 => FLAG_PACKED,
+        KvFormat::F16 => FLAG_F16,
+        KvFormat::F32 => 0,
+    }
+}
+
+/// The element type a flag word names. The caller must already have refused
+/// unknown bits and the mutually exclusive `FLAG_PACKED | FLAG_F16`, so the
+/// remaining combinations are exactly the three formats.
+fn format_of_flags(flags: u32) -> KvFormat {
+    if flags & FLAG_PACKED != 0 {
+        KvFormat::Q8_0
+    } else if flags & FLAG_F16 != 0 {
+        KvFormat::F16
+    } else {
+        KvFormat::F32
+    }
+}
 
 /// What a reader must check before it applies anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,12 +265,7 @@ impl KvSessionWriter {
         let mut sink = Sink::new(BufWriter::new(file));
         sink.bytes(&MAGIC)?;
         sink.u32(header.version)?;
-        let flags = if header.format.is_packed() {
-            FLAG_PACKED
-        } else {
-            0
-        };
-        sink.u32(flags)?;
+        sink.u32(flags_of(header.format))?;
         sink.u32(tag_of(header.backend))?;
         sink.u32(header.n_layer as u32)?;
         sink.u32(header.n_ctx as u32)?;
@@ -456,9 +499,21 @@ impl KvSessionReader {
             ));
         }
         let flags = src.u32("the flags")?;
-        if flags & !FLAG_PACKED != 0 {
+        if flags & !KNOWN_FLAGS != 0 {
             return Err(format!(
-                "KV session: unknown flags {flags:#x} (this file was written by a newer build?)"
+                "KV session: unknown flags {flags:#x} (this file was written by a newer build \
+                 that knows element-type bits this one does not)"
+            ));
+        }
+        // The element-type bits are mutually exclusive: "packed Q8_0" and "f16"
+        // describe two different cell layouts, so a header claiming both is
+        // corrupt. Refuse it rather than resolving it by preferring one bit —
+        // the preference would decide, silently, which layout a file with the
+        // other one's payload is applied as.
+        if flags & FLAG_PACKED != 0 && flags & FLAG_F16 != 0 {
+            return Err(format!(
+                "KV session: the header claims both packed Q8_0 and f16 cells (flags {flags:#x}); \
+                 the two element types are mutually exclusive, so the file is corrupt"
             ));
         }
         let backend = backend_of_tag(src.u32("the backend tag")?)?;
@@ -466,11 +521,7 @@ impl KvSessionReader {
         let n_ctx = src.u32("n_ctx")? as usize;
         let n_embd = src.u32("n_kv_embd")? as usize;
         let row_elems = src.u32("the cell width")? as usize;
-        let format = if flags & FLAG_PACKED != 0 {
-            KvFormat::Q8_0
-        } else {
-            KvFormat::F32
-        };
+        let format = format_of_flags(flags);
         if n_layer == 0 || n_ctx == 0 || n_embd == 0 || row_elems == 0 {
             return Err(format!(
                 "KV session: the header declares {n_layer} layers of {n_ctx} cells x {row_elems} \
@@ -857,6 +908,124 @@ mod tests {
         let r = KvSessionReader::open(&path).expect("open");
         assert_eq!(r.header().format, KvFormat::Q8_0);
         assert!(r.header().format.is_packed());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// #130: an f16 arena round-trips at the container level, no device needed —
+    /// the container carries f32 words and the element type is a flag. Before the
+    /// `FLAG_F16` bit an f16 header was written as `flags == 0` and read back as
+    /// f32, so `kv_load` refused the file its own writer had just produced.
+    #[test]
+    fn an_f16_session_round_trips() {
+        let path = temp_path("f16-roundtrip");
+        let h = header(2, 16, 128, KvFormat::F16);
+        let st = state(16);
+        let report = write_session(&path, &h, &st);
+
+        let mut r = KvSessionReader::open(&path).expect("open");
+        assert_eq!(
+            r.header(),
+            &h,
+            "the whole header, element type included, survives"
+        );
+        assert_eq!(r.header().format, KvFormat::F16);
+        let mut seen = Vec::new();
+        while let Some((layer, k, v)) = r.next_layer().expect("layer") {
+            assert_eq!(k.len(), h.layer_words());
+            assert_eq!(v.len(), h.layer_words());
+            seen.push(layer);
+        }
+        assert_eq!(seen, vec![0, 1]);
+        let body = r.finish().expect("finish");
+        assert_eq!(body.state, st);
+        assert_eq!(body.report, report);
+        // The full-file pass the allocator runs before applying anything agrees.
+        assert_eq!(verify(&path).unwrap().format, KvFormat::F16);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// #130: the flags word **is** the element type, and every format round trips
+    /// through it — the encode/decode symmetry the fix rests on. If `flags_of` stops
+    /// writing a format's bit (`F16` → `0`, say) the reader decodes the wrong type
+    /// and this fails on the on-disk word, not only on the decoded header.
+    #[test]
+    fn the_flag_word_encodes_every_element_type_and_round_trips() {
+        for (format, want_flags) in [
+            (KvFormat::F32, 0u32),
+            (KvFormat::F16, FLAG_F16),
+            (KvFormat::Q8_0, FLAG_PACKED),
+        ] {
+            let path = temp_path(&format!("flags-{}", format.name()));
+            let h = header(1, 8, 32, format);
+            write_session(&path, &h, &state(8));
+            // The on-disk flags word is exactly that format's encoding.
+            let bytes = std::fs::read(&path).unwrap();
+            let on_disk = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            assert_eq!(on_disk, want_flags, "{} flags word", format.name());
+            // And the reader decodes it back symmetrically.
+            let r = KvSessionReader::open(&path).expect("open");
+            assert_eq!(r.header().format, format);
+            assert_eq!(r.header().format, format_of_flags(on_disk));
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// #130: the two element-type bits are mutually exclusive. "packed Q8_0" and
+    /// "f16" are different cell layouts, so a header claiming both is corrupt: the
+    /// reader must refuse it, not prefer one bit and apply the payload under a
+    /// layout the file does not describe. The message is asserted so that the
+    /// *width* check (which would also catch this combination) cannot stand in for
+    /// the rule under test.
+    #[test]
+    fn a_header_claiming_both_packed_and_f16_is_refused() {
+        let path = temp_path("both-flags");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[12..16].copy_from_slice(&(FLAG_PACKED | FLAG_F16).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = KvSessionReader::open(&path).err().expect("must be refused");
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(err.contains("corrupt"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// #130 keeps `FLAG_PACKED`'s property: an unknown flag bit is refused, never
+    /// ignored. This is also the compatibility story for a *newer* writer — a
+    /// pre-#130 build reading an f16 file sees `FLAG_F16` as unknown and takes
+    /// exactly this path instead of decoding the region as f32.
+    #[test]
+    fn an_unknown_flag_bit_is_refused() {
+        let path = temp_path("unknown-flag");
+        let h = header(1, 8, 32, KvFormat::F16);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        // A bit no version has assigned yet, on top of a valid f16 file.
+        bytes[12..16].copy_from_slice(&(FLAG_F16 | (1 << 7)).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = KvSessionReader::open(&path).err().expect("must be refused");
+        assert!(err.contains("unknown flags"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// #130 compatibility: every session written before the f16 bit existed is
+    /// `flags == 0`, i.e. f32, and must keep loading **as f32** — a file that merely
+    /// predates the bit is not a newer file and must not be refused. (A literal
+    /// version-1 file is refused by the version check, `a_version_1_file_is_refused_…`.)
+    #[test]
+    fn a_legacy_f32_file_without_the_f16_bit_still_loads_as_f32() {
+        let path = temp_path("legacy-f32");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            0,
+            "a pre-#130 f32 file's flags word is zero"
+        );
+        let r = KvSessionReader::open(&path).expect("a legacy f32 file still loads");
+        assert_eq!(r.header().format, KvFormat::F32);
+        assert_eq!(verify(&path).unwrap().format, KvFormat::F32);
         std::fs::remove_file(&path).ok();
     }
 
