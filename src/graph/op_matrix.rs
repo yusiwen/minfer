@@ -120,47 +120,51 @@ fn compare(name: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
 
 /// Does `tag` claim `op` (at F32)? `Err` means the backend is unavailable here,
 /// which the matrix reports as a skip.
+///
+/// F4: the handle is not an enum, so the arms are equality guards on the registry
+/// constants. The capability itself is asked of the *registry* — that is the
+/// whole point of the ticket: this harness no longer has its own copy of which
+/// backend has which op.
 fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
-    match tag {
-        Backend::CPU => {
-            let b = CpuBackend::new();
-            Ok(super::backend_takes(&b, op, DType::F32))
+    if tag == Backend::CPU {
+        let b = CpuBackend::new();
+        return Ok(super::backend_takes(&b, op, DType::F32));
+    }
+    if tag == Backend::METAL {
+        #[cfg(target_os = "macos")]
+        {
+            return match super::metal_backend::MetalBackend::new() {
+                Some(m) => Ok(super::backend_takes(&m, op, DType::F32)),
+                None => Err("no Metal device".into()),
+            };
         }
-        Backend::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                match super::metal_backend::MetalBackend::new() {
-                    Some(m) => Ok(super::backend_takes(&m, op, DType::F32)),
-                    None => Err("no Metal device".into()),
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = op;
-                Err("not compiled in (macOS-only module)".into())
-            }
-        }
-        Backend::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                // `CudaState::get()` stays `None` until something initializes the
-                // process-wide state: `main` does it at startup, the model tests
-                // through the loader. A harness that runs CUDA cells must do it
-                // itself, or the column silently depends on *test order* (it ran
-                // on a device in a full-suite run and skipped in a filtered one).
-                crate::cuda::CudaState::init();
-                match super::cuda_backend::CudaBackend::new() {
-                    Some(c) => Ok(super::backend_takes(&c, op, DType::F32)),
-                    None => Err("no CUDA device".into()),
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = op;
-                Err("not compiled in (--features cuda)".into())
-            }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = op;
+            return Err("not compiled in (macOS-only module)".into());
         }
     }
+    if tag == Backend::CUDA {
+        #[cfg(feature = "cuda")]
+        {
+            // `CudaState::get()` stays `None` until something initializes the
+            // process-wide state: `main` does it at startup, the model tests
+            // through the loader. A harness that runs CUDA cells must do it
+            // itself, or the column silently depends on *test order* (it ran
+            // on a device in a full-suite run and skipped in a filtered one).
+            crate::cuda::CudaState::init();
+            return match super::cuda_backend::CudaBackend::new() {
+                Some(c) => Ok(super::backend_takes(&c, op, DType::F32)),
+                None => Err("no CUDA device".into()),
+            };
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = op;
+            return Err("not compiled in (--features cuda)".into());
+        }
+    }
+    Err(format!("unknown backend '{}'", tag.name()))
 }
 
 /// Run one case entirely on `tag`: every node's backend is forced, so the
@@ -175,28 +179,21 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
     }
 
     let mut alloc = GraphAllocator::new();
-    match tag {
-        Backend::CPU => {}
-        Backend::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                if !alloc.enable_metal() {
-                    return Err("no Metal device".into());
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            return Err("not compiled in (macOS-only module)".into());
-        }
-        Backend::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                crate::cuda::CudaState::init();
-                if !alloc.enable_cuda() {
-                    return Err("no CUDA device".into());
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            return Err("not compiled in (--features cuda)".into());
+    // F4: enabling a backend is the registry entry's `enable` hook, so this
+    // harness does not spell the per-backend `#[cfg]` matrix a second time. The
+    // device state still has to exist first (the hook reports "no device"
+    // otherwise), exactly as the pre-F4 arm's explicit `CudaState::init()` did.
+    #[cfg(feature = "cuda")]
+    crate::cuda::CudaState::init();
+    if tag != Backend::CPU {
+        let enabled = tag.entry().map_or(false, |e| (e.enable)(&mut alloc));
+        if !enabled {
+            return Err(format!(
+                "{}: {}",
+                tag.name(),
+                crate::graph::registry::unavailable_reason(tag)
+                    .unwrap_or("not compiled into this build")
+            ));
         }
     }
 
@@ -208,7 +205,7 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
         // synthetic harness has no equivalent of. Without this the matrix's
         // weight ops could only ever report "weight not registered on CUDA".
         #[cfg(feature = "cuda")]
-        if tag == Backend::Cuda {
+        if tag == Backend::CUDA {
             if let Some(state) = crate::cuda::CudaState::get() {
                 state.register_weight(&w.name, w.data());
             }
@@ -747,7 +744,7 @@ fn op_label(op: &Op) -> &'static str {
 // tests
 // ---------------------------------------------------------------------------
 
-const TARGETS: [Backend; 3] = [Backend::CPU, Backend::Metal, Backend::Cuda];
+const TARGETS: [Backend; 3] = [Backend::CPU, Backend::METAL, Backend::CUDA];
 
 #[test]
 fn matrix_cases_match_their_reference() {
@@ -942,8 +939,8 @@ fn support_table_matches_support_matrix_doc() {
     for (name, op, cpu, metal, cuda) in table {
         for (tag, want) in [
             (Backend::CPU, *cpu),
-            (Backend::Metal, *metal),
-            (Backend::Cuda, *cuda),
+            (Backend::METAL, *metal),
+            (Backend::CUDA, *cuda),
         ] {
             match backend_claims(tag, op) {
                 // Unavailable here (not compiled in / no device): nothing to check.

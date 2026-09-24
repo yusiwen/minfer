@@ -153,6 +153,12 @@ pub struct GraphAllocator {
     /// arenas; the store owns their bookkeeping and the `position -> cell`
     /// resolution.
     kv: super::kvcache::KvCache,
+    /// F4: the backends this run may use (`--backend` / `MINFER_BACKENDS`).
+    ///
+    /// Read by `supports_for`, so a fenced backend is never offered. It is the
+    /// same fence the graph builders apply to `Device` (`registry::active_filter`,
+    /// captured at construction), which is what keeps the two from disagreeing.
+    filter: super::registry::BackendFilter,
     /// All persistent regions (never freed).
     pub persistent: Vec<PersistentBuf>,
 }
@@ -177,6 +183,7 @@ impl Default for GraphAllocator {
             budget: HashMap::new(),
             offload: None,
             kv: super::kvcache::KvCache::new(),
+            filter: super::registry::active_filter().clone(),
             persistent: Vec::new(),
         }
     }
@@ -303,13 +310,20 @@ impl GraphAllocator {
     }
 
     /// Which backend may take a node of `(op, dtype)` that belongs to `layer` — the
-    /// assignment rule with the E5 offload policy applied.
+    /// assignment rule with the E5 offload policy and F4's backend fence applied.
     ///
     /// With a plan in force, a node whose block is **not** offloaded never reaches the
     /// device: the answer starts at the CPU, so a partial plan cannot silently run a
     /// non-offloaded block's op on a device that never registered its weights. A node
     /// outside any block (`layer = None`) follows the device only when every block is
     /// offloaded (`OffloadPlan::device_holds_unblocked`).
+    ///
+    /// F4: the device order is the registry's **priority** order, not a statement
+    /// order in this function — Metal (300), CUDA (200), CPU (100) — and a backend
+    /// the run fenced off (`--backend` / `MINFER_BACKENDS`) or whose pool is not
+    /// enabled is skipped. The CPU is tried last and is always allowed: it is the
+    /// universal fallback (`BackendFilter::from_names` re-admits it), so the order
+    /// and the answer are identical to the pre-F4 chain.
     pub fn supports_for(
         &self,
         op: &Op,
@@ -323,23 +337,88 @@ impl GraphAllocator {
             (Some(p), None) => p.device_holds_unblocked(),
         };
         if device_ok {
-            #[cfg(target_os = "macos")]
-            if let Some(m) = &self.metal {
-                if eligible(m) {
-                    return Some(Backend::Metal);
+            for &backend in super::registry::registry().by_priority() {
+                if backend == Backend::CPU {
+                    continue; // the fallback, tried below even when device_ok is false
                 }
-            }
-            #[cfg(feature = "cuda")]
-            if let Some(c) = &self.cuda {
-                if eligible(c) {
-                    return Some(Backend::Cuda);
+                if !self.filter.allows(backend) {
+                    continue;
+                }
+                if let Some(pool) = self.pool(backend) {
+                    if eligible(pool) {
+                        return Some(backend);
+                    }
                 }
             }
         }
-        if eligible(&self.cpu) {
+        if self.filter.allows(Backend::CPU) && eligible(&self.cpu) {
             return Some(Backend::CPU);
         }
         None
+    }
+
+    /// F4: the backends this run may offer (the `--backend` / `MINFER_BACKENDS`
+    /// fence). Production installs it once at startup through
+    /// `registry::install_filter`, before any allocator exists — so the field's
+    /// default is already the run's fence. These two are the per-allocator test
+    /// surface (the device-gated assignment gate needs to fence one allocator
+    /// without touching the process).
+    #[cfg(test)]
+    pub fn set_backend_filter(&mut self, filter: super::registry::BackendFilter) {
+        self.filter = filter;
+    }
+
+    /// F4: the filter in force on this allocator (test accessor).
+    #[cfg(test)]
+    pub fn backend_filter(&self) -> &super::registry::BackendFilter {
+        &self.filter
+    }
+
+    /// F4: this backend's pool as the trait object every pool operation goes
+    /// through, or `None` when the backend is not compiled in or its pool is not
+    /// enabled on this allocator.
+    ///
+    /// This pair of helpers is what removed the twelve `match backend { … }`
+    /// dispatch sites from this file: the registry entry says how to reach the
+    /// pool, and the operation is a `Backend` trait call on it.
+    pub fn pool(&self, backend: Backend) -> Option<&dyn BackendTrait> {
+        (backend.entry()?.pool)(self)
+    }
+
+    /// The mutable form of [`Self::pool`].
+    pub fn pool_mut(&mut self, backend: Backend) -> Option<&mut dyn BackendTrait> {
+        (backend.entry()?.pool_mut)(self)
+    }
+
+    /// [`Self::pool_mut`] for a call site that cannot proceed without the pool:
+    /// an internal invariant violation, so it panics naming the backend rather
+    /// than silently skipping the operation.
+    fn require_pool_mut(&mut self, backend: Backend) -> &mut dyn BackendTrait {
+        let why = match backend.entry() {
+            Some(_) => "pool not enabled",
+            None => "not compiled into this build",
+        };
+        self.pool_mut(backend)
+            .unwrap_or_else(|| panic!("{} backend {why}", backend.name()))
+    }
+
+    /// F4: the enabled backends in **identity** order — the vector the fusion
+    /// pass probes, replacing the hand-built `[cpu, metal?, cuda?]` in three
+    /// call sites. [`Self::fusion_backend_index`] is the matching node → index
+    /// map, so the two cannot drift apart.
+    pub fn fusion_backends(&self) -> Vec<&dyn BackendTrait> {
+        super::registry::registry()
+            .iter()
+            .filter_map(|e| self.pool(e.handle))
+            .collect()
+    }
+
+    /// F4: a node backend's index in [`Self::fusion_backends`].
+    pub fn fusion_backend_index(&self, backend: Backend) -> Option<usize> {
+        super::registry::registry()
+            .iter()
+            .filter(|e| self.pool(e.handle).is_some())
+            .position(|e| e.handle == backend)
     }
 
     /// E5: put an offload plan in force. `None` restores the pre-E5 behaviour (no layer
@@ -474,7 +553,7 @@ impl GraphAllocator {
                 // `supports_op` already refuses a non-zero offset there, and this
                 // backstops the partial window, which the op cannot see. Loud,
                 // because the alternative is reading the wrong bytes.
-                if parent.backend == Backend::Metal && (v.offset != 0 || window != parent_elems) {
+                if parent.backend == Backend::METAL && (v.offset != 0 || window != parent_elems) {
                     return Err(format!(
                         "view node {id} ('{}') is a window of {} elements at offset {} of a \
                          {parent_elems}-element buffer on Metal, whose kernels take a buffer and a \
@@ -706,17 +785,7 @@ impl GraphAllocator {
     /// Buffers resident in a backend's pool (E4 S2: the "did the pool grow?" probe behind
     /// the resident-bytes accounting).
     fn pool_len_of(&self, backend: Backend) -> usize {
-        match backend {
-            Backend::CPU => self.cpu.pool_len(),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self.metal.as_ref().map_or(0, |m| m.pool_len()),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => 0,
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self.cuda.as_ref().map_or(0, |c| c.pool_len()),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => 0,
-        }
+        self.pool(backend).map_or(0, |p| p.pool_len())
     }
 
     /// The backend dispatch behind [`Self::alloc_in_pool`]: the pool is asked for the
@@ -749,17 +818,7 @@ impl GraphAllocator {
     /// Bytes one backend's registered weights occupy (0 for a backend that does not
     /// track them) — the "weights" half of `weights + activations > budget`.
     fn weights_bytes(&self, backend: Backend) -> usize {
-        match backend {
-            Backend::CPU => self.cpu.weights_bytes(),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self.metal.as_ref().map_or(0, |m| m.weights_bytes()),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => 0,
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self.cuda.as_ref().map_or(0, |c| c.weights_bytes()),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => 0,
-        }
+        self.pool(backend).map_or(0, |p| p.weights_bytes())
     }
 
     /// The memory budget for a backend (E4): an explicit one if it was set, else the
@@ -776,7 +835,7 @@ impl GraphAllocator {
     fn memory_budget(&self, backend: Backend) -> Option<usize> {
         let explicit = self.budget.get(&backend).copied();
         #[cfg(feature = "cuda")]
-        let mem = if backend == Backend::Cuda {
+        let mem = if backend == Backend::CUDA {
             match crate::cuda::CudaState::get() {
                 Some(c) => c.device_memory(),
                 // A CUDA graph with no device state is a configuration error the
@@ -832,49 +891,13 @@ impl GraphAllocator {
 
     /// Exact-size allocation (persistent KV regions and any caller that cannot be rounded).
     fn alloc_exact_in_pool(&mut self, backend: Backend, size: usize) -> usize {
-        match backend {
-            Backend::CPU => self.cpu.alloc_buffer(size),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self
-                .metal
-                .as_mut()
-                .expect("Metal pool not enabled")
-                .alloc_buffer(size),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => unreachable!(),
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_mut()
-                .expect("CUDA pool not enabled")
-                .alloc_buffer(size),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => unreachable!("CUDA pool not implemented"),
-        }
+        self.require_pool_mut(backend).alloc_buffer(size)
     }
 
     /// Fresh (never recycled) buffer on a backend's pool — split-boundary
     /// staging only. See Backend::alloc_fresh.
     fn alloc_fresh_in(&mut self, backend: Backend, size: usize) -> usize {
-        match backend {
-            Backend::CPU => self.cpu.alloc_fresh(size),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self
-                .metal
-                .as_mut()
-                .expect("Metal pool not enabled")
-                .alloc_fresh(size),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => unreachable!(),
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_mut()
-                .expect("CUDA pool not enabled")
-                .alloc_fresh(size),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => unreachable!("CUDA pool not implemented"),
-        }
+        self.require_pool_mut(backend).alloc_fresh(size)
     }
 
     fn free_in_pool(&mut self, backend: Backend, id: usize) {
@@ -892,24 +915,10 @@ impl GraphAllocator {
             self.slots.entry((backend, class)).or_default().insert(id);
             return;
         }
-        match backend {
-            Backend::CPU => self.cpu.free_buffer(id),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                if let Some(m) = &mut self.metal {
-                    m.free_buffer(id);
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => {}
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => {
-                if let Some(c) = &mut self.cuda {
-                    c.free_buffer(id);
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => {}
+        // A pool that is not enabled has nothing to free from (the pre-F4 Metal/CUDA
+        // arms were no-ops in exactly that case).
+        if let Some(pool) = self.pool_mut(backend) {
+            pool.free_buffer(id);
         }
     }
 
@@ -946,7 +955,13 @@ impl GraphAllocator {
             // width) sizing a region whose kernel writes the other layout.
             let format = super::kvformat::KvFormat::Q8_0;
             format.check_width(n_embd)?;
-            if backend != Backend::CPU {
+            // F4: the capability is the registry's answer (`BackendCaps::
+            // reads_packed_kv`), the same field `KvFormat::supports` reads — the
+            // pre-F4 `backend != Backend::CPU` hardcode and the C4 format gate
+            // can no longer disagree. [#87] flips it for the device kernels.
+            //
+            // [#87]: https://github.com/yusiwen/minfer/issues/87
+            if !super::registry::reads_packed_kv(backend) {
                 return Err(format!(
                     "KV region for layer {layer} would live on {backend:?}, which has no kernel \
                      that reads a packed {} region (only CPU does — C4 S1); refusing rather than \
@@ -2015,24 +2030,14 @@ impl GraphAllocator {
             ));
         }
         let (backend, id, offset) = (br.backend, br.id, br.offset);
-        match backend {
-            Backend::CPU => self.cpu.write_host_window(id, offset, data),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self
-                .metal
-                .as_mut()
-                .expect("Metal pool not enabled")
-                .write_host_window(id, offset, data),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => Err("Metal unavailable".into()),
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_mut()
-                .expect("CUDA pool not enabled")
-                .write_host_window(id, offset, data),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => Err("CUDA unavailable".into()),
+        match self.pool_mut(backend) {
+            Some(pool) => pool.write_host_window(id, offset, data),
+            None => Err(format!(
+                "{} is not usable on this allocator: {}",
+                backend.name(),
+                super::registry::unavailable_reason(backend)
+                    .unwrap_or("the backend's pool is not enabled")
+            )),
         }
     }
 
@@ -2044,13 +2049,14 @@ impl GraphAllocator {
     #[allow(dead_code)]
     pub fn get_buffer(&self, _graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
         let br = self.node_buffer(id)?;
-        match br.backend {
-            Backend::CPU => self
-                .cpu
-                .read_host(br.id)?
-                .get(br.offset..br.offset + br.len),
-            _ => None,
+        // Only the CPU pool lends a host slice: a device pool's read is a copy
+        // (`copy_to_cpu`), which cannot be returned by reference.
+        if br.backend != Backend::CPU {
+            return None;
         }
+        self.cpu
+            .read_host(br.id)?
+            .get(br.offset..br.offset + br.len)
     }
 
     /// Host copy of any node's buffer (cross-backend reads).
@@ -2059,39 +2065,22 @@ impl GraphAllocator {
         // D1: a view's reference is a window, so read exactly it — the parent's
         // buffer is longer (and may hold another view's data).
         let window = |v: Vec<f32>| -> Vec<f32> { v[br.offset..br.offset + br.len].to_vec() };
-        match br.backend {
-            Backend::CPU => self.cpu.read_host(br.id).map(|s| window(s.to_vec())),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self
-                .metal
-                .as_mut()
-                .and_then(|m| m.read_host(br.id))
-                .map(|s| window(s.to_vec())),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => None,
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_ref()
-                .and_then(|c| c.copy_to_host(br.id))
-                .map(window),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => None,
-        }
+        // F4: one call for every backend — the entry's `host_read` is CPU/Metal's
+        // borrowed read and CUDA's stream-ordered `copy_to_host`.
+        (br.backend.entry()?.host_read)(self, br.id).map(window)
     }
 
     /// Host copy of a layer's persistent KV regions (K, V) by pool buffer
     /// id — doc 95 identity debugging (the graph holds one KvcacheLoad node
     /// per layer, so the V half is reachable only through `kv_pair`).
     pub fn copy_kv_to_cpu(&mut self, layer: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        // Kept CPU/CUDA-only as before (the pre-F4 arm for Metal was `None`): this
+        // is a CPU identity-debug helper, and widening it is not this ticket's job.
         let rd = |s: &mut Self, br: BufRef| -> Option<Vec<f32>> {
-            match br.backend {
-                Backend::CPU => s.cpu.read_host(br.id).map(|x| x.to_vec()),
-                #[cfg(feature = "cuda")]
-                Backend::Cuda => s.cuda.as_ref().and_then(|c| c.copy_to_host(br.id)),
-                #[allow(unreachable_patterns)]
-                _ => None,
+            if br.backend != Backend::CPU && br.backend != Backend::CUDA {
+                return None;
             }
+            (br.backend.entry()?.host_read)(s, br.id)
         };
         let l = self.kv.get(layer)?;
         let pair = [l.k, l.v];
@@ -2101,29 +2090,13 @@ impl GraphAllocator {
     /// The KV element type a session on `backend` stores its rows in (C5). A
     /// session records it so a file written under one width cannot be resumed
     /// under another — an f16 region's second half is not meaningful data.
+    ///
+    /// F4: the answer is the registry entry's `kv_format` hook. A backend this
+    /// build does not contain answers F32, as the pre-F4 `#[cfg]` arms did.
     fn kv_element_format(&self, backend: Backend) -> KvFormat {
-        match backend {
-            Backend::CPU => self.cpu.kv_format(),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                if crate::metal::kv_cache_is_f16() {
-                    KvFormat::F16
-                } else {
-                    KvFormat::F32
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => KvFormat::F32,
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => {
-                if crate::cuda::kv_cache_is_f16() {
-                    KvFormat::F16
-                } else {
-                    KvFormat::F32
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => KvFormat::F32,
+        match backend.entry() {
+            Some(entry) => (entry.kv_format)(self),
+            None => KvFormat::F32,
         }
     }
 
@@ -2263,41 +2236,30 @@ impl GraphAllocator {
         // A restore happens before the first graph is built, so the pool the file
         // names may not exist yet: enable it here (the same lazy enable the graph
         // builder does), or refuse when this build/box cannot have it.
-        match expect.backend {
-            Backend::CPU => {}
-            #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                if !self.enable_metal() {
-                    return Err(
-                        "KV session: the file holds a Metal session but MPS is unavailable".into(),
-                    );
+        //
+        // F4: one path for every backend — the entry's `enable` hook — with the
+        // refusal still distinguishing "not compiled into this build" from
+        // "compiled in but unavailable here", because those are different facts.
+        match expect.backend.entry() {
+            None => {
+                return Err(format!(
+                    "KV session: the file holds a {} session and this build has no {} backend ({})",
+                    expect.backend.name(),
+                    expect.backend.name(),
+                    super::registry::unavailable_reason(expect.backend)
+                        .unwrap_or("not compiled into this build")
+                ));
+            }
+            Some(entry) => {
+                if !(entry.enable)(self) {
+                    return Err(format!(
+                        "KV session: the file holds a {} session but {} is not available here: {}",
+                        expect.backend.name(),
+                        expect.backend.name(),
+                        super::registry::unavailable_reason(expect.backend)
+                            .unwrap_or("the backend's pool could not be enabled")
+                    ));
                 }
-            }
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => {
-                return Err(
-                    "KV session: the file holds a Metal session and this build has no Metal \
-                     backend (macOS only)"
-                        .into(),
-                );
-            }
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => {
-                if !self.enable_cuda() {
-                    return Err(
-                        "KV session: the file holds a CUDA session but no CUDA device is \
-                         available (or MINFER_DISABLE_CUDA is set)"
-                            .into(),
-                    );
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => {
-                return Err(
-                    "KV session: the file holds a CUDA session and this build has no cuda \
-                     feature (rebuild with --features cuda)"
-                        .into(),
-                );
             }
         }
         let mut seen = 0usize;
@@ -2360,24 +2322,10 @@ impl GraphAllocator {
 
     /// Flush a backend's pending async work (split boundary / end).
     pub fn sync_backend(&mut self, backend: Backend) {
-        match backend {
-            Backend::CPU => {}
-            #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                if let Some(m) = &mut self.metal {
-                    m.synchronize();
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => {}
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => {
-                if let Some(c) = &mut self.cuda {
-                    c.synchronize();
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => {}
+        // The CPU's `synchronize` is a no-op, and a pool that is not enabled has
+        // no pending work — so one path serves every backend.
+        if let Some(pool) = self.pool_mut(backend) {
+            pool.synchronize();
         }
     }
 
@@ -2456,10 +2404,12 @@ impl GraphAllocator {
         self.write_pool(dst_backend, dst_id, &data)
     }
 
-    /// Write host data into a pool buffer of `backend` (shared by the staging
-    /// paths of `copy_across`).
     /// Dispatch `Backend::copy_cells` to the pool that owns the region (C3).
-    /// Kept beside `write_pool` so every backend arm stays in one file.
+    ///
+    /// F4: the "arm" is the registry entry's pool hook, and the refusal when
+    /// there is none distinguishes "not compiled into this build" from "compiled
+    /// in but its pool is not enabled here" — a backend that is compiled out is
+    /// never silently treated as absent.
     #[allow(clippy::too_many_arguments)]
     fn copy_cells_in_pool(
         &mut self,
@@ -2471,25 +2421,21 @@ impl GraphAllocator {
         rows: usize,
         elems_per_cell: usize,
     ) -> Result<(), String> {
-        match backend {
-            Backend::CPU => self
-                .cpu
-                .copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => match self.metal.as_mut() {
-                Some(m) => m.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
-                None => Err("copy_cells: Metal pool not enabled".into()),
-            },
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => Err("copy_cells: Metal is not compiled in this build".into()),
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => match self.cuda.as_mut() {
-                Some(c) => c.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell),
-                None => Err("copy_cells: CUDA pool not enabled".into()),
-            },
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => Err("copy_cells: CUDA is not compiled in this build".into()),
-        }
+        let Some(pool) = self.pool_mut(backend) else {
+            return Err(format!(
+                "copy_cells: {} is {}",
+                backend.name(),
+                match backend.entry() {
+                    None => "not compiled into this build".to_string(),
+                    Some(_) => format!(
+                        "not enabled on this allocator ({})",
+                        super::registry::unavailable_reason(backend)
+                            .unwrap_or("the pool is not enabled")
+                    ),
+                }
+            ));
+        };
+        pool.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell)
     }
 
     /// Host read of one pool region by reference (the read side of
@@ -2499,42 +2445,20 @@ impl GraphAllocator {
             let end = (r.offset + r.len).min(s.len());
             s[r.offset.min(end)..end].to_vec()
         };
-        match r.backend {
-            Backend::CPU => self.cpu.read_host(r.id).map(window),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self
-                .metal
-                .as_mut()
-                .and_then(|m| m.read_host(r.id))
-                .map(window),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => None,
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_ref()
-                .and_then(|c| c.copy_to_host(r.id))
-                .map(|v| window(&v)),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => None,
-        }
+        (r.backend.entry()?.host_read)(self, r.id).map(|v| window(&v))
     }
 
+    /// Write host data into a pool buffer of `backend` (shared by the staging
+    /// paths of `copy_across`).
     fn write_pool(&mut self, backend: Backend, id: usize, data: &[f32]) -> Result<(), String> {
-        match backend {
-            Backend::CPU => self.cpu.write_host(id, data),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => self.metal.as_mut().unwrap().write_host(id, data),
-            #[cfg(not(target_os = "macos"))]
-            Backend::Metal => Err("Metal unavailable".into()),
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => self
-                .cuda
-                .as_mut()
-                .expect("CUDA pool not enabled")
-                .write_host(id, data),
-            #[cfg(not(feature = "cuda"))]
-            Backend::Cuda => Err("CUDA unavailable".into()),
+        match self.pool_mut(backend) {
+            Some(pool) => pool.write_host(id, data),
+            None => Err(format!(
+                "{} is not usable on this allocator: {}",
+                backend.name(),
+                super::registry::unavailable_reason(backend)
+                    .unwrap_or("the backend's pool is not enabled")
+            )),
         }
     }
 
@@ -2597,6 +2521,61 @@ fn kv_defrag_enabled_from(no_flag: Option<&std::ffi::OsStr>) -> bool {
 mod tests {
     use super::*;
     use crate::graph::builder::GraphBuilder;
+    use crate::graph::DType;
+
+    /// F4: a fresh allocator inherits the run's backend fence, so the two places
+    /// the fence is enforced (this allocator's assignment and the graph
+    /// builders' `Device`) read the same answer. The default — nothing installed
+    /// — is every backend, i.e. the pre-F4 behaviour.
+    #[test]
+    fn a_fresh_allocator_inherits_the_runs_backend_filter() {
+        let alloc = GraphAllocator::new();
+        assert_eq!(
+            alloc.backend_filter(),
+            crate::graph::registry::active_filter()
+        );
+        // The process-wide default is unfiltered in the test binary (nothing
+        // installs a fence here), so the assignment is unchanged for every
+        // existing gate.
+        assert!(crate::graph::registry::active_filter().is_unfiltered());
+        assert_eq!(alloc.supports(&Op::Input, DType::F32), Some(Backend::CPU));
+    }
+
+    /// F4: the fence reaches the **assignment pass**, not just the name parser.
+    ///
+    /// Needs a usable device, so it is `#[ignore]`d like the other device gates
+    /// (run it serially: the CUDA device state is a process-wide singleton).
+    /// Without a fence the device takes an op it supports; with the device
+    /// fenced off the *same* op must land on the CPU — and the device stays
+    /// enabled, because the fence is a policy, not a teardown.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn cuda_the_backend_fence_moves_assignment_off_a_usable_device() {
+        crate::cuda::CudaState::init();
+        let mut alloc = GraphAllocator::new();
+        if !alloc.enable_cuda() {
+            eprintln!("no CUDA device; this gate needs one");
+            return;
+        }
+        assert_eq!(
+            alloc.supports(&Op::Silu, DType::F32),
+            Some(Backend::CUDA),
+            "an unfenced allocator must offer the device"
+        );
+        alloc.set_backend_filter(
+            crate::graph::registry::BackendFilter::from_names(["cpu"]).unwrap(),
+        );
+        assert_eq!(
+            alloc.supports(&Op::Silu, DType::F32),
+            Some(Backend::CPU),
+            "a fenced allocator must not offer the device"
+        );
+        assert!(
+            alloc.cuda().is_some(),
+            "the fence must not tear the device pool down"
+        );
+    }
 
     /// C8a S1: the prefix copy refuses what it cannot do instead of copying a row that
     /// does not exist or writing past the destination's reservation.
@@ -3027,7 +3006,7 @@ mod tests {
             (
                 "another backend",
                 KvSessionExpect {
-                    backend: Backend::Metal,
+                    backend: Backend::METAL,
                     ..expect
                 },
                 "session",
@@ -3445,12 +3424,12 @@ mod tests {
             Some(3)
         );
         assert!(
-            alloc.cross_buffer(1, 7, Backend::Cuda).is_none(),
+            alloc.cross_buffer(1, 7, Backend::CUDA).is_none(),
             "a CPU staging buffer must not be offered to a CUDA consumer"
         );
-        alloc.stage_cross_for_test(1, 7, Backend::Cuda, 4, 4);
+        alloc.stage_cross_for_test(1, 7, Backend::CUDA, 4, 4);
         assert_eq!(
-            alloc.cross_buffer(1, 7, Backend::Cuda).map(|b| b.id),
+            alloc.cross_buffer(1, 7, Backend::CUDA).map(|b| b.id),
             Some(4)
         );
         assert_eq!(
@@ -3778,7 +3757,7 @@ mod tests {
         // No plan: the pre-E5 behaviour — the device takes every node it can.
         assert_eq!(
             alloc.supports_for(&Op::Silu, crate::graph::DType::F32, Some(3)),
-            Some(Backend::Cuda)
+            Some(Backend::CUDA)
         );
         alloc.set_offload_plan(Some(OffloadPlan {
             gpu_layers: 2,
@@ -3786,7 +3765,7 @@ mod tests {
         }));
         assert_eq!(
             alloc.supports_for(&Op::Silu, crate::graph::DType::F32, Some(0)),
-            Some(Backend::Cuda),
+            Some(Backend::CUDA),
             "an offloaded block may use the device"
         );
         assert_eq!(
@@ -3806,7 +3785,7 @@ mod tests {
         }));
         assert_eq!(
             alloc.supports_for(&Op::Silu, crate::graph::DType::F32, None),
-            Some(Backend::Cuda)
+            Some(Backend::CUDA)
         );
     }
 
@@ -3951,7 +3930,7 @@ mod tests {
             let mut g = b.build();
             // The device pool is what this gate is about: every node on CUDA.
             for n in g.nodes.iter_mut() {
-                n.backend = Some(Backend::Cuda);
+                n.backend = Some(Backend::CUDA);
             }
             g
         };

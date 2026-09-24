@@ -16,11 +16,13 @@ impl ComputeGraph {
         writeln!(w, "  node [shape=record fontname=\"monospace\"];")?;
 
         for node in &self.nodes {
+            // F4: the handle is not an enum, so the arms guard on equality with
+            // the registry constants instead of matching variants.
             let color = match node.backend {
-                Some(Backend::Metal) => "lightblue",
-                Some(Backend::CPU) => "lightyellow",
-                Some(Backend::Cuda) => "lightgreen",
-                None => "white",
+                Some(b) if b == Backend::METAL => "lightblue",
+                Some(b) if b == Backend::CPU => "lightyellow",
+                Some(b) if b == Backend::CUDA => "lightgreen",
+                _ => "white",
             };
             let label = format!("{}\\n{:?}", node.name, node.op);
             writeln!(

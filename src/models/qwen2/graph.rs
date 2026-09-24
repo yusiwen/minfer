@@ -597,33 +597,17 @@ impl Qwen2Graph {
                 // never even built there, but every ordinary op still has to be placed).
                 alloc.set_offload_plan(Some(model.offload.plan));
                 sched.assign_backends(&mut graph, alloc);
-                // fusion pass gated per node's assigned backend
-                let backends: Vec<&dyn Backend> = {
-                    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
-                    let mut v: Vec<&dyn Backend> = vec![alloc.cpu()];
-                    #[cfg(target_os = "macos")]
-                    if metal_on {
-                        if let Some(m) = alloc.metal() {
-                            v.push(m);
-                        }
-                    }
-                    #[cfg(feature = "cuda")]
-                    if cuda_on {
-                        if let Some(c) = alloc.cuda() {
-                            v.push(c);
-                        }
-                    }
-                    v
-                };
-                // The closure maps a node's backend to its index in `backends`
-                // (the fusion pass probes supports_fused through it), so the
-                // CUDA index is derived from the actual vector layout.
-                let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
-                FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-                    Some(crate::graph::Backend::CPU) => Some(0),
-                    Some(crate::graph::Backend::Metal) => Some(1),
-                    Some(crate::graph::Backend::Cuda) => cuda_idx,
-                    _ => None,
+                // fusion pass gated per node's assigned backend.
+                //
+                // F4: the backend list and the node → index map come from the
+                // allocator's registry view (the enabled entries in identity
+                // order), replacing the hand-built vector and its `name() ==
+                // "cuda"` position lookup.
+                let backends: Vec<&dyn Backend> = alloc.fusion_backends();
+                FusionPass::new().run(&mut graph, &backends, &|g, id| {
+                    g.node(id)
+                        .backend
+                        .and_then(|b| alloc.fusion_backend_index(b))
                 });
                 alloc.alloc_graph(&graph).unwrap();
             }
@@ -763,8 +747,16 @@ impl Qwen2Graph {
     pub fn device(model: &Qwen2Model) -> crate::models::Device {
         #[cfg(any(target_os = "macos", feature = "cuda"))]
         {
+            // F4: a backend the run fenced off (`--backend` / `MINFER_BACKENDS`)
+            // does not participate, so the builder never emits a device-only
+            // fused node the CPU cannot execute. The fence is the same one
+            // `GraphAllocator::supports_for` reads, so the two cannot disagree.
+            let filter = crate::graph::registry::active_filter();
             #[cfg(target_os = "macos")]
-            if crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model) {
+            if filter.allows(crate::graph::Backend::METAL)
+                && crate::graph::metal_backend::metal_available()
+                && Self::weights_on_gpu(model)
+            {
                 return crate::models::Device::Metal;
             }
             // CUDA participation (Phase 7): requires a usable device AND every
@@ -772,7 +764,10 @@ impl Qwen2Graph {
             // type (all-or-nothing; 7e③ moved the embedding gather on device, so
             // tok_embd is gated like every other weight).
             #[cfg(feature = "cuda")]
-            if crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model) {
+            if filter.allows(crate::graph::Backend::CUDA)
+                && crate::cuda::CudaState::get().is_some()
+                && Self::weights_on_cuda(model)
+            {
                 return crate::models::Device::Cuda;
             }
         }
@@ -1333,8 +1328,8 @@ mod tests {
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let backend = match model.device() {
             Device::Cpu => Backend::CPU,
-            Device::Metal => Backend::Metal,
-            Device::Cuda => Backend::Cuda,
+            Device::Metal => Backend::METAL,
+            Device::Cuda => Backend::CUDA,
         };
         let n_ctx = 256;
         let ids = tok.encode("The capital of France is");
@@ -1538,7 +1533,7 @@ mod tests {
             let n_cuda = graph
                 .nodes
                 .iter()
-                .filter(|nd| nd.backend == Some(Backend::Cuda))
+                .filter(|nd| nd.backend == Some(Backend::CUDA))
                 .count();
             let n_cpu = graph
                 .nodes
@@ -1548,7 +1543,7 @@ mod tests {
             let splits = BackendScheduler::new().split_graph(graph);
             let cuda_splits: Vec<_> = splits
                 .iter()
-                .filter(|s| s.backend == Backend::Cuda)
+                .filter(|s| s.backend == Backend::CUDA)
                 .collect();
             let cpu_splits: Vec<_> = splits
                 .iter()
@@ -3389,7 +3384,7 @@ mod tests {
             for _ in 0..5 {
                 let mut g2 = g.clone();
                 for n in &mut g2.nodes {
-                    n.backend = Some(crate::graph::Backend::Metal); // FULL layer-0 on Metal
+                    n.backend = Some(crate::graph::Backend::METAL); // FULL layer-0 on Metal
                 }
                 let mut alloc = crate::graph::alloc::GraphAllocator::new();
                 Qwen2Graph::register_graph_weights(q2, &mut alloc);
@@ -3506,7 +3501,7 @@ mod tests {
             // Metal
             let mut g2 = g.clone();
             for n in &mut g2.nodes {
-                n.backend = Some(crate::graph::Backend::Metal);
+                n.backend = Some(crate::graph::Backend::METAL);
             }
             let mut alloc = crate::graph::alloc::GraphAllocator::new();
             alloc.enable_metal();
@@ -4020,7 +4015,7 @@ mod tail_tests {
                         &backends,
                         &|g, id| match g.node(id).backend {
                             Some(crate::graph::Backend::CPU) => Some(0),
-                            Some(crate::graph::Backend::Metal) => Some(1),
+                            Some(crate::graph::Backend::METAL) => Some(1),
                             _ => None,
                         },
                     );
@@ -4135,7 +4130,7 @@ mod tail_tests {
                         &backends,
                         &|g, id| match g.node(id).backend {
                             Some(crate::graph::Backend::CPU) => Some(0),
-                            Some(crate::graph::Backend::Metal) => Some(1),
+                            Some(crate::graph::Backend::METAL) => Some(1),
                             _ => None,
                         },
                     );

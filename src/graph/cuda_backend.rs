@@ -411,9 +411,9 @@ impl CudaBackend {
     ) -> Result<(), String> {
         let ins: Vec<BufRef> = in_ids
             .iter()
-            .map(|&id| BufRef::own(crate::graph::Backend::Cuda, id, self.elems(id)))
+            .map(|&id| BufRef::own(crate::graph::Backend::CUDA, id, self.elems(id)))
             .collect();
-        let out = BufRef::own(crate::graph::Backend::Cuda, out_id, self.elems(out_id));
+        let out = BufRef::own(crate::graph::Backend::CUDA, out_id, self.elems(out_id));
         self.execute_node(node, &ins, out, kv_pair)
     }
 
@@ -1372,71 +1372,137 @@ impl CudaBackend {
     }
 }
 
+/// F4: the CUDA capability matrix, as a free function.
+///
+/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
+/// which cannot take a `&self`; the trait method below forwards to it.
+///
+/// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
+/// chain runs on CUDA, including the embedding/tail gather (7e③) and the
+/// decode fusions FusedQKV/QkvBiasRopeStore/FusedFFN. Scale, Softmax,
+/// BatchMatMul and the Qwen3-only FusedQkvNorm have no kernels and stay on
+/// the CPU backend; weight-quant eligibility is the model-level
+/// all-weights-registered gate. RoPE is gated to the neox
+/// (non-interleaved) layout — the only style the supported architectures
+/// emit.
+pub fn supports_op(op: &Op, dtype: DType) -> bool {
+    if dtype != DType::F32 {
+        return false;
+    }
+    match op {
+        Op::Input
+        | Op::Add
+        | Op::Mul
+        | Op::Silu
+        | Op::SwiGLU
+        | Op::RmsNorm { .. }
+        | Op::QkNorm { .. }
+        | Op::MatMul { .. }
+        | Op::Attn { .. }
+        | Op::KvcacheStore { .. }
+        | Op::KvcacheLoad { .. }
+        | Op::View { .. }
+        | Op::Reshape { .. }
+        | Op::Permute { .. }
+        // 7e③: row gather — the embedding (Embed meta, weight dequant by
+        // type; weight-type support is enforced by the model-level gate,
+        // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
+        // generic f32 tail gather (no meta). Removes the CPU round trips
+        // around the prefill's embed and G3 tail reduction.
+        // 7e⑤: decode FFN gate+up fusion — concat matmul + in-place
+        // offset swiglu (the gu_concat_available / CParams.fuse_ffn
+        // gates decide when the node is built).
+        | Op::GetRows
+        // D3-8: decode QKV fusion (G4 CUDA port) — concat matmul + fused
+        // bias/rope/store epilogue (nt==1; the builder emits the node only
+        // when the loader registered blk.{i}.attn_qkv, the same gate as
+        // Metal — see qkv_concat_available / CParams.fuse_qkv).
+        | Op::FusedQKV { .. }
+        // D3-8: mixed-quant QKV epilogue (class 2) — same pointer-form
+        // kernel as FusedQKV's epilogue on three separate matmul outputs
+        | Op::QkvBiasRopeStore { .. }
+        | Op::FusedFFN => true,
+        // MatMul ttype gating happens at the model level (weights must all
+        // be registered on CUDA — same all-or-nothing rule as Metal).
+        Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
+        _ => false,
+    }
+}
+
+/// F4: the fusion-pass capability, as a free function (see [`supports_op`]).
+pub fn supports_fused(fused: &FusedOp) -> bool {
+    matches!(fused, FusedOp::SwiGLU)
+}
+
+/// E1b: the attention kernels gained a windowed instantiation that reads the
+/// `[lo, hi)` span, so CUDA can take a multi-sequence attention node.
+pub const SUPPORTS_ATTN_SPAN: bool = true;
+
+/// C4: CUDA addresses f32/f16 KV rows, so it does not read a packed `q8_0`
+/// region; [#87] is the work that adds the kernel and flips this.
+///
+/// [#87]: https://github.com/yusiwen/minfer/issues/87
+pub const READS_PACKED_KV: bool = false;
+
+/// F4: this backend's registry entry (see `cpu_backend::entry`).
+pub fn entry() -> super::registry::BackendEntry {
+    use super::registry::{Backend as Handle, BackendCaps, BackendEntry, PRIORITY_CUDA};
+    BackendEntry {
+        handle: Handle::CUDA,
+        name: "cuda",
+        priority: PRIORITY_CUDA,
+        caps: BackendCaps {
+            supports_op,
+            supports_fused,
+            supports_attn_span: SUPPORTS_ATTN_SPAN,
+            reads_packed_kv: READS_PACKED_KV,
+        },
+        pool: |a| a.cuda().map(|c| c as &dyn Backend),
+        pool_mut: |a| a.cuda_mut().map(|c| c as &mut dyn Backend),
+        // A borrowed `&[f32]` into device memory is not expressible, so the
+        // trait's `read_host` is `None` and the pool's own stream-ordered
+        // `copy_to_host` is the host-read path (F4: it is a registry hook for
+        // exactly this reason).
+        host_read: |a, id| a.cuda().and_then(|c| c.copy_to_host(id)),
+        // The device layer holds the process-wide f16 policy (C5 records it).
+        kv_format: |_| {
+            if crate::cuda::kv_cache_is_f16() {
+                super::kvformat::KvFormat::F16
+            } else {
+                super::kvformat::KvFormat::F32
+            }
+        },
+        enable: |a| a.enable_cuda(),
+        unavailable: || {
+            if crate::cuda::CudaState::get().is_some() {
+                None
+            } else {
+                Some("no CUDA device is available, or CUDA is disabled (MINFER_DISABLE_CUDA)")
+            }
+        },
+    }
+}
+
+/// F4: register the CUDA backend (`--features cuda`).
+pub fn register(registry: &mut super::registry::Registry) {
+    registry.register_entry(entry());
+}
+
 impl Backend for CudaBackend {
     fn name(&self) -> &str {
         "cuda"
     }
 
-    /// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
-    /// chain runs on CUDA, including the embedding/tail gather (7e③) and the
-    /// decode fusions FusedQKV/QkvBiasRopeStore/FusedFFN. Scale, Softmax,
-    /// BatchMatMul and the Qwen3-only FusedQkvNorm have no kernels and stay on
-    /// the CPU backend; weight-quant eligibility is the model-level
-    /// all-weights-registered gate. RoPE is gated to the neox
-    /// (non-interleaved) layout — the only style the supported architectures
-    /// emit.
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
-        if dtype != DType::F32 {
-            return false;
-        }
-        match op {
-            Op::Input
-            | Op::Add
-            | Op::Mul
-            | Op::Silu
-            | Op::SwiGLU
-            | Op::RmsNorm { .. }
-            | Op::QkNorm { .. }
-            | Op::MatMul { .. }
-            | Op::Attn { .. }
-            | Op::KvcacheStore { .. }
-            | Op::KvcacheLoad { .. }
-            | Op::View { .. }
-            | Op::Reshape { .. }
-            | Op::Permute { .. }
-            // 7e③: row gather — the embedding (Embed meta, weight dequant by
-            // type; weight-type support is enforced by the model-level gate,
-            // which only admits F32/Q4_0/Q8_0/Q4_K/Q6_K tok_embd) and the
-            // generic f32 tail gather (no meta). Removes the CPU round trips
-            // around the prefill's embed and G3 tail reduction.
-            // 7e⑤: decode FFN gate+up fusion — concat matmul + in-place
-            // offset swiglu (the gu_concat_available / CParams.fuse_ffn
-            // gates decide when the node is built).
-            | Op::GetRows
-            // D3-8: decode QKV fusion (G4 CUDA port) — concat matmul + fused
-            // bias/rope/store epilogue (nt==1; the builder emits the node only
-            // when the loader registered blk.{i}.attn_qkv, the same gate as
-            // Metal — see qkv_concat_available / CParams.fuse_qkv).
-            | Op::FusedQKV { .. }
-            // D3-8: mixed-quant QKV epilogue (class 2) — same pointer-form
-            // kernel as FusedQKV's epilogue on three separate matmul outputs
-            | Op::QkvBiasRopeStore { .. }
-            | Op::FusedFFN => true,
-            // MatMul ttype gating happens at the model level (weights must all
-            // be registered on CUDA — same all-or-nothing rule as Metal).
-            Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
-            _ => false,
-        }
+        supports_op(op, dtype)
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        matches!(fused, FusedOp::SwiGLU)
+        supports_fused(fused)
     }
 
     fn supports_attn_span(&self) -> bool {
-        // E1b: the attention kernels gained a windowed instantiation that reads
-        // the `[lo, hi)` span, so CUDA can take a multi-sequence attention node.
-        true
+        SUPPORTS_ATTN_SPAN
     }
 
     /// Device bytes the CUDA weight registry holds (E4).
@@ -1718,12 +1784,12 @@ mod tests {
         // broke re-execution of reused graphs — the producing split found its
         // buffer remapped to another backend on the next execute)
         alloc
-            .copy_across(1, x, crate::graph::Backend::Cuda)
+            .copy_across(1, x, crate::graph::Backend::CUDA)
             .unwrap();
         let cross = alloc
-            .cross_buffer(1, x, crate::graph::Backend::Cuda)
+            .cross_buffer(1, x, crate::graph::Backend::CUDA)
             .expect("cross staging buffer");
-        assert_eq!(cross.backend, crate::graph::Backend::Cuda);
+        assert_eq!(cross.backend, crate::graph::Backend::CUDA);
         assert_eq!(
             alloc.node_buffer(x).unwrap(),
             canon,
@@ -1732,11 +1798,11 @@ mod tests {
         assert_eq!(alloc.copy_to_cpu(x).unwrap(), data.to_vec());
         // re-copy (same dst) reuses the same staging buffer id
         alloc
-            .copy_across(1, x, crate::graph::Backend::Cuda)
+            .copy_across(1, x, crate::graph::Backend::CUDA)
             .unwrap();
         assert_eq!(
             alloc
-                .cross_buffer(1, x, crate::graph::Backend::Cuda)
+                .cross_buffer(1, x, crate::graph::Backend::CUDA)
                 .unwrap()
                 .id,
             cross.id
@@ -1750,7 +1816,7 @@ mod tests {
             "the copy was already on the destination backend"
         );
         assert!(alloc
-            .cross_buffer(1, x, crate::graph::Backend::Cuda)
+            .cross_buffer(1, x, crate::graph::Backend::CUDA)
             .is_some());
         // E4 S3: a rebuild keeps the staging buffer — it is keyed by (graph uid, node,
         // backend), so it belongs to this graph's shape and survives a re-map. Re-creating it
@@ -1758,7 +1824,7 @@ mod tests {
         alloc.alloc_graph(&g).unwrap();
         assert_eq!(
             alloc
-                .cross_buffer(1, x, crate::graph::Backend::Cuda)
+                .cross_buffer(1, x, crate::graph::Backend::CUDA)
                 .expect("staging survives a re-map")
                 .id,
             cross.id,
@@ -1766,7 +1832,7 @@ mod tests {
         );
         // A different graph (its own uid) gets its own entry: node ids restart per graph.
         assert!(alloc
-            .cross_buffer(2, x, crate::graph::Backend::Cuda)
+            .cross_buffer(2, x, crate::graph::Backend::CUDA)
             .is_none());
     }
 
@@ -1784,8 +1850,8 @@ mod tests {
         let load = b.kvcache_load(0, 16, 1024, 2);
         b.output(load);
         let mut g = b.build();
-        g.nodes[store].backend = Some(crate::graph::Backend::Cuda);
-        g.nodes[load].backend = Some(crate::graph::Backend::Cuda);
+        g.nodes[store].backend = Some(crate::graph::Backend::CUDA);
+        g.nodes[load].backend = Some(crate::graph::Backend::CUDA);
 
         let mut alloc = GraphAllocator::new();
         if !alloc.enable_cuda() {
@@ -1797,7 +1863,7 @@ mod tests {
 
         // the store node's buffer IS the K region, on the CUDA pool
         let kbuf = alloc.node_buffer(store).unwrap();
-        assert_eq!(kbuf.backend, crate::graph::Backend::Cuda);
+        assert_eq!(kbuf.backend, crate::graph::Backend::CUDA);
         assert_eq!(kbuf.id, pair.0);
         {
             let c = alloc.cuda_mut().unwrap();
@@ -4003,7 +4069,7 @@ mod tests {
             .collect();
         cb.write_host(region, &pattern).unwrap();
         let before = pattern.clone();
-        let r = BufRef::own(crate::graph::Backend::Cuda, region, slots);
+        let r = BufRef::own(crate::graph::Backend::CUDA, region, slots);
         cb.copy_cells(r, r, dst_row, src_row, rows, nkt).unwrap();
         let after = cb.copy_to_host(region).unwrap();
         assert_eq!(after.len(), slots);
@@ -5199,7 +5265,7 @@ mod tests {
             .map(|i| (i / 4) as f32 + (i % 4) as f32 / 10.0)
             .collect();
         cb.write_host(id, &data).unwrap();
-        let r = BufRef::own(crate::graph::Backend::Cuda, id, 24);
+        let r = BufRef::own(crate::graph::Backend::CUDA, id, 24);
         // Rows [1, 4) -> rows [0, 3): rows 1 and 2 are both read and overwritten.
         cb.copy_cells(r, r, 0, 1, 3, 4).unwrap();
         let got = cb.copy_to_host(id).unwrap();
@@ -7433,7 +7499,7 @@ mod tests {
         for (i, nd) in g.nodes.iter().enumerate() {
             assert_eq!(
                 nd.backend,
-                Some(crate::graph::Backend::Cuda),
+                Some(crate::graph::Backend::CUDA),
                 "node {i} ({})",
                 nd.name
             );

@@ -523,32 +523,13 @@ impl Qwen3Graph {
                 // (see qwen2's forward_cached).
                 alloc.set_offload_plan(Some(model.offload.plan));
                 sched.assign_backends(&mut graph, alloc);
-                let backends: Vec<&dyn Backend> = {
-                    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
-                    let mut v: Vec<&dyn Backend> = vec![alloc.cpu()];
-                    #[cfg(target_os = "macos")]
-                    if metal_on {
-                        if let Some(m) = alloc.metal() {
-                            v.push(m);
-                        }
-                    }
-                    #[cfg(feature = "cuda")]
-                    if cuda_on {
-                        if let Some(c) = alloc.cuda() {
-                            v.push(c);
-                        }
-                    }
-                    v
-                };
-                // The closure maps a node's backend to its index in `backends`
-                // (the fusion pass probes supports_fused through it), so the
-                // CUDA index is derived from the actual vector layout.
-                let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
-                FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-                    Some(crate::graph::Backend::CPU) => Some(0),
-                    Some(crate::graph::Backend::Metal) => Some(1),
-                    Some(crate::graph::Backend::Cuda) => cuda_idx,
-                    _ => None,
+                // F4: the backend list and the node → index map come from the
+                // allocator's registry view (see qwen2's forward_cached).
+                let backends: Vec<&dyn Backend> = alloc.fusion_backends();
+                FusionPass::new().run(&mut graph, &backends, &|g, id| {
+                    g.node(id)
+                        .backend
+                        .and_then(|b| alloc.fusion_backend_index(b))
                 });
                 alloc.alloc_graph(&graph).unwrap();
             }
@@ -666,8 +647,13 @@ impl Qwen3Graph {
     pub fn device(model: &Qwen3Model) -> crate::models::Device {
         #[cfg(any(target_os = "macos", feature = "cuda"))]
         {
+            // F4: a fenced backend does not participate (see qwen2's twin).
+            let filter = crate::graph::registry::active_filter();
             #[cfg(target_os = "macos")]
-            if crate::graph::metal_backend::metal_available() && Self::weights_on_gpu(model) {
+            if filter.allows(crate::graph::Backend::METAL)
+                && crate::graph::metal_backend::metal_available()
+                && Self::weights_on_gpu(model)
+            {
                 return crate::models::Device::Metal;
             }
             // CUDA participation (Phase 7): requires a usable device AND every
@@ -675,7 +661,10 @@ impl Qwen3Graph {
             // type (all-or-nothing; 7e③ moved the embedding gather on device, so
             // tok_embd is gated like every other weight).
             #[cfg(feature = "cuda")]
-            if crate::cuda::CudaState::get().is_some() && Self::weights_on_cuda(model) {
+            if filter.allows(crate::graph::Backend::CUDA)
+                && crate::cuda::CudaState::get().is_some()
+                && Self::weights_on_cuda(model)
+            {
                 return crate::models::Device::Cuda;
             }
         }

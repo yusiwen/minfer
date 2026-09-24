@@ -185,6 +185,21 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         }
     };
 
+    // === GPU backends ===
+    //
+    // F4: the device layer comes up before the model is resolved, so stage 2 of
+    // the backend-name surface (a backend compiled in but not usable here) is a
+    // startup refusal rather than something a missing model can preempt.
+    #[cfg(target_os = "macos")]
+    crate::metal::MpsState::init();
+    #[cfg(feature = "cuda")]
+    crate::cuda::CudaState::init();
+    if let Err(e) = crate::graph::registry::check_available(crate::graph::registry::active_filter())
+    {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+
     // === Resolve the model (paths, hf:/ollama: URIs, cached names) ===
     let model_arg = positional[0].clone();
     let is_uri = model_arg.starts_with("hf:")
@@ -224,11 +239,7 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         .map(|t| t.ne.iter().product::<i64>() as u64)
         .sum();
 
-    // === GPU backends + model ===
-    #[cfg(target_os = "macos")]
-    crate::metal::MpsState::init();
-    #[cfg(feature = "cuda")]
-    crate::cuda::CudaState::init();
+    // === Model ===
     let model = match crate::models::load_model(&gguf_model) {
         Some(m) => m,
         None => {

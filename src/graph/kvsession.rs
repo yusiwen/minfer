@@ -80,12 +80,11 @@ pub struct KvSessionExpect {
 }
 
 /// The backend a model's device uses (a session is one arena, so the two must agree).
+///
+/// F4: `Device::backend()` is the single bridge between the device and the
+/// registry id spaces; this delegates rather than spelling the mapping twice.
 pub fn backend_of(device: crate::models::Device) -> Backend {
-    match device {
-        crate::models::Device::Cpu => Backend::CPU,
-        crate::models::Device::Metal => Backend::Metal,
-        crate::models::Device::Cuda => Backend::Cuda,
-    }
+    device.backend()
 }
 
 /// What a KV session must match to be loadable by `model` at `n_ctx` (C5): the device
@@ -128,23 +127,16 @@ fn hash_bytes(h: &mut u64, bytes: &[u8]) {
     }
 }
 
+/// The on-disk backend tag: the registry id, so the file format is the handle's
+/// id space and nothing else (F4). `backend_of_tag` is its inverse.
 fn tag_of(backend: Backend) -> u32 {
-    match backend {
-        Backend::CPU => 0,
-        Backend::Metal => 1,
-        Backend::Cuda => 2,
-    }
+    backend.index() as u32
 }
 
 fn backend_of_tag(tag: u32) -> Result<Backend, String> {
-    match tag {
-        0 => Ok(Backend::CPU),
-        1 => Ok(Backend::Metal),
-        2 => Ok(Backend::Cuda),
-        other => Err(format!(
-            "KV session: unknown backend tag {other} (this file was written by a newer build?)"
-        )),
-    }
+    Backend::from_index(tag as usize).ok_or_else(|| {
+        format!("KV session: unknown backend tag {tag} (this file was written by a newer build?)")
+    })
 }
 
 // ---- writing ----------------------------------------------------------------

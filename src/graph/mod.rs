@@ -50,6 +50,8 @@ pub mod metal_backend;
 pub mod offload;
 pub mod ops;
 pub mod params;
+/// Backend registry (F4): the name-keyed table, the handle, the filter.
+pub mod registry;
 pub mod scheduler;
 
 /// Op × dtype × backend correctness matrix (ticket A1). Test-only: it exists to
@@ -90,16 +92,13 @@ impl DType {
     }
 }
 
-/// Execution backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Backend {
-    CPU,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Metal,
-    /// CUDA backend (Phase 7, `--features cuda`).
-    #[allow(dead_code)]
-    Cuda,
-}
+/// The backend handle (F4): an opaque id into the [`registry`], not an enum.
+///
+/// Re-exported here because the IR has always called it `Backend`; the handle
+/// and the registry live in [`registry`]. See
+/// `docs/BACKEND-REGISTRY-DESIGN.md` for the two orders (identity vs priority)
+/// and the name surface.
+pub use registry::Backend;
 
 /// Backend buffer handle: a buffer id inside a specific backend's pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

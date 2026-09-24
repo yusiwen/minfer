@@ -301,6 +301,15 @@ fn print_usage(prog: &str) {
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
     eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
     eprintln!(
+        "  --backend <name>     F4: restrict the backends this run may use (repeatable, or\n\
+         \x20                      comma-separated). Accepted: cpu, metal, cuda. Unset =\n\
+         \x20                      every backend this build has. `cpu` always participates\n\
+         \x20                      (it is the fallback), so `--backend cpu` forces the CPU.\n\
+         \x20                      Same surface as MINFER_BACKENDS; the flag wins. An unknown\n\
+         \x20                      name, a name this build does not contain, and a name this\n\
+         \x20                      machine cannot use are three distinct startup refusals."
+    );
+    eprintln!(
         "  --gpu-layers <N|auto>  E5: put the first N transformer blocks on the device and run"
     );
     eprintln!("                       the rest on the CPU (0 = CPU only; `auto` = as many as the");
@@ -353,9 +362,60 @@ fn token_trace(pos: usize, tok: u32) {
     }
 }
 
+/// F4: pull `--backend <name>` / `--backend=<name>` out of the argument list.
+///
+/// Returns the remaining arguments (program name first) and the requested names
+/// in order. Handled here rather than in the flag loop so every subcommand —
+/// including the ones with their own parsers (`bench`, `specverify`) — honours
+/// it, and so the name gate runs before anything else in the process.
+fn split_backend_flag(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut names: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    if let Some(prog) = it.next() {
+        rest.push(prog);
+    }
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--backend=") {
+            names.push(v.to_string());
+        } else if a == "--backend" {
+            match it.next() {
+                Some(v) => names.push(v),
+                None => {
+                    eprintln!("Error: missing value for --backend");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            rest.push(a);
+        }
+    }
+    (rest, names)
+}
+
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
+
+    // F4: the backend name surface. `--backend <name>` (repeatable, and
+    // comma-separated values are accepted) is extracted **before** any
+    // subcommand dispatch, so `serve`, `viz`, `run`, `bench` and `specverify`
+    // all honour it and no per-subcommand parser has to learn the flag. The
+    // registry is built first — the names are resolved against it, and an
+    // unknown name is a loud refusal here, before the model is even looked for.
+    let (raw_args, backend_flag) = split_backend_flag(raw_args);
+    crate::graph::registry::init();
+    let backend_filter = match crate::graph::registry::request_filter(
+        &backend_flag,
+        std::env::var("MINFER_BACKENDS").ok().as_deref(),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    crate::graph::registry::install_filter(backend_filter);
 
     // `bench` subcommand: parsed separately (its -p/-n/-r/-o flags are
     // bench-local and must not collide with the global inference options,
@@ -978,6 +1038,28 @@ fn main() {
         _ => {} // fall through to model inference
     }
 
+    // === GPU backends ===
+    //
+    // F4: the device layer comes up **here**, before the model path is resolved,
+    // so that stage 2 of the backend-name surface (a backend that is compiled in
+    // but not usable on this machine) is a startup refusal and not something a
+    // later, unrelated failure — a missing model file, a bad GGUF — can preempt.
+    #[cfg(target_os = "macos")]
+    metal::MpsState::init();
+    #[cfg(feature = "cuda")]
+    cuda::CudaState::init_with_gpu(gpu);
+    // On CPU/Metal builds `--gpu` is a no-op: it is parsed but unused.
+    #[cfg(not(feature = "cuda"))]
+    let _ = gpu;
+    // Stage 2: a named backend that this machine cannot use is refused now — a
+    // message distinct from "unknown backend" and from "not compiled into this
+    // build", and never a silent fall back to the CPU.
+    if let Err(e) = crate::graph::registry::check_available(crate::graph::registry::active_filter())
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
     let model_path = &positional[0];
 
     // Conversation mode needs the chat template (ChatML fallback included);
@@ -1088,15 +1170,6 @@ fn main() {
     } else {
         println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
     }
-
-    // === GPU backends ===
-    #[cfg(target_os = "macos")]
-    metal::MpsState::init();
-    #[cfg(feature = "cuda")]
-    cuda::CudaState::init_with_gpu(gpu);
-    // On CPU/Metal builds `--gpu` is a no-op: it is parsed but unused.
-    #[cfg(not(feature = "cuda"))]
-    let _ = gpu;
 
     // === Load model (dispatches on general.architecture) ===
     if gpu_layers_set {

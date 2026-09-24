@@ -113,50 +113,104 @@ impl Default for CpuBackend {
     }
 }
 
+/// F4: the CPU capability matrix, as a free function.
+///
+/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
+/// which cannot take a `&self`; the trait method below forwards to it, so the
+/// registry's answer and the trait's answer are the same code.
+pub fn supports_op(op: &Op, dtype: DType) -> bool {
+    if dtype != DType::F32 {
+        return false;
+    }
+    matches!(
+        op,
+        Op::Input
+            | Op::Add
+            | Op::Mul
+            | Op::Scale(_)
+            | Op::Silu
+            | Op::Softmax { .. }
+            | Op::RmsNorm { .. }
+            | Op::QkNorm { .. }
+            | Op::MatMul { .. }
+            | Op::GetRows
+            | Op::RoPE { .. }
+            | Op::Attn { .. }
+            | Op::KvcacheStore { .. }
+            | Op::KvcacheLoad { .. }
+            | Op::SwiGLU
+            | Op::View { .. }
+            | Op::Reshape { .. }
+            | Op::Permute { .. }
+    )
+}
+
+/// F4: the fusion-pass capability, as a free function (see [`supports_op`]).
+pub fn supports_fused(fused: &FusedOp) -> bool {
+    // The SwiGLU rewrite IS applied to CPU nodes (CPU is first in the
+    // fusion pass's backend list); `Op::SwiGLU` below executes it as a
+    // single pass. bias+rope and batch-matmul are not fused (batch QKV
+    // quantize-sharing is a Phase 5+ win).
+    matches!(fused, FusedOp::SwiGLU)
+}
+
+/// E1: the CPU attention kernel reads `attn_span` (the window the KV store
+/// resolved), so it can take a multi-sequence attention node.
+pub const SUPPORTS_ATTN_SPAN: bool = true;
+
+/// C4: the CPU attention kernel is the one that reads a packed `q8_0` KV region
+/// (it dots the stored K blocks against the quantized query and accumulates V
+/// out of the cell). CUDA and Metal address f32/f16 rows — issue [#87] is the
+/// work that flips their value and adds their kernels.
+///
+/// [#87]: https://github.com/yusiwen/minfer/issues/87
+pub const READS_PACKED_KV: bool = true;
+
+/// F4: this backend's registry entry. Called by `Registry::build` at startup —
+/// the only place the CPU backend is introduced to the registry.
+pub fn entry() -> super::registry::BackendEntry {
+    use super::registry::{Backend as Handle, BackendCaps, BackendEntry, PRIORITY_CPU};
+    BackendEntry {
+        handle: Handle::CPU,
+        name: "cpu",
+        priority: PRIORITY_CPU,
+        caps: BackendCaps {
+            supports_op,
+            supports_fused,
+            supports_attn_span: SUPPORTS_ATTN_SPAN,
+            reads_packed_kv: READS_PACKED_KV,
+        },
+        pool: |a| Some(a.cpu()),
+        pool_mut: |a| Some(a.cpu_mut()),
+        host_read: |a, id| a.cpu().read_host(id).map(|s| s.to_vec()),
+        // The CPU pool snapshots the process-wide `MINFER_CACHE_TYPE` policy at
+        // construction; that snapshot is the live answer.
+        kv_format: |a| a.cpu().kv_format(),
+        enable: |_| true,
+        unavailable: || None,
+    }
+}
+
+/// F4: register the CPU backend. Always present: it is the universal fallback.
+pub fn register(registry: &mut super::registry::Registry) {
+    registry.register_entry(entry());
+}
+
 impl Backend for CpuBackend {
     fn name(&self) -> &str {
         "cpu"
     }
 
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
-        if dtype != DType::F32 {
-            return false;
-        }
-        matches!(
-            op,
-            Op::Input
-                | Op::Add
-                | Op::Mul
-                | Op::Scale(_)
-                | Op::Silu
-                | Op::Softmax { .. }
-                | Op::RmsNorm { .. }
-                | Op::QkNorm { .. }
-                | Op::MatMul { .. }
-                | Op::GetRows
-                | Op::RoPE { .. }
-                | Op::Attn { .. }
-                | Op::KvcacheStore { .. }
-                | Op::KvcacheLoad { .. }
-                | Op::SwiGLU
-                | Op::View { .. }
-                | Op::Reshape { .. }
-                | Op::Permute { .. }
-        )
+        supports_op(op, dtype)
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // The SwiGLU rewrite IS applied to CPU nodes (CPU is first in the
-        // fusion pass's backend list); `Op::SwiGLU` below executes it as a
-        // single pass. bias+rope and batch-matmul are not fused (batch QKV
-        // quantize-sharing is a Phase 5+ win).
-        matches!(fused, FusedOp::SwiGLU)
+        supports_fused(fused)
     }
 
     fn supports_attn_span(&self) -> bool {
-        // E1: the CPU attention kernel reads `attn_span` (the window the KV
-        // store resolved), so it can take a multi-sequence attention node.
-        true
+        SUPPORTS_ATTN_SPAN
     }
 
     /// Bytes of registered weights (E4: the feasibility gate charges the budget for

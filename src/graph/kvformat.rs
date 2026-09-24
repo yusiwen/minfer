@@ -121,13 +121,18 @@ impl KvFormat {
     }
 
     /// Whether this device has kernels that read a region in this format.
+    ///
+    /// F4: the packed answer is the backend registry's
+    /// `BackendCaps::reads_packed_kv` — the same field `GraphAllocator::ensure_kv`
+    /// reads, so the format gate and the region-sizing gate cannot disagree. The
+    /// CPU's attention kernel dots the stored K blocks against the quantized query
+    /// and accumulates V out of the cell; CUDA and Metal address f32/f16 rows, so
+    /// they refuse it until their kernels land (issue [#87]).
+    ///
+    /// [#87]: https://github.com/yusiwen/minfer/issues/87
     pub fn supports(self, device: Device) -> bool {
         match self {
-            // C4 S2: the packed layout is read by the CPU attention kernel, which dots
-            // the stored K blocks against the quantized query and accumulates V out of
-            // the cell. CUDA and Metal address f32/f16 rows, so they refuse it until
-            // their kernels land (issue #87).
-            KvFormat::Q8_0 => matches!(device, Device::Cpu),
+            KvFormat::Q8_0 => super::registry::reads_packed_kv(device.backend()),
             KvFormat::F32 | KvFormat::F16 => true,
         }
     }
