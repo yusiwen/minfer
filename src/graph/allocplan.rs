@@ -46,6 +46,103 @@ pub fn class_bytes(elems: usize) -> usize {
     elems * std::mem::size_of::<f32>()
 }
 
+// ─── The device's own memory answer, made explicit (E4 / issue #122) ─────────────────
+
+/// What a backend's device answered when asked how much memory it has free.
+///
+/// The distinction is the point. "The device reported N bytes free" and "the query
+/// failed" are different facts, and collapsing them into `free = 0` turns a broken
+/// query into a zero-byte budget: the E4 feasibility gate then refuses every later
+/// allocation and its message blames the budget, hiding the real CUDA error behind a
+/// number that was never measured. The outcome is a type so that collapse cannot
+/// happen again by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceMemory {
+    /// The backend answered: `free` of `total` bytes.
+    Reported { free: usize, total: usize },
+    /// The query itself failed. `code` is the backend's error code and `name` its
+    /// symbolic name (for CUDA, `cudaGetErrorName`, e.g. `cudaErrorIllegalAddress`).
+    QueryFailed { code: i32, name: String },
+    /// There is no device state to ask (CPU, or a device whose state could not be
+    /// created).
+    NoDevice,
+}
+
+impl DeviceMemory {
+    /// The reported free bytes, or `None` when no measurement exists.
+    pub fn free_bytes(&self) -> Option<usize> {
+        match self {
+            DeviceMemory::Reported { free, .. } => Some(*free),
+            DeviceMemory::QueryFailed { .. } | DeviceMemory::NoDevice => None,
+        }
+    }
+
+    /// A one-line reason for a failed query, for a diagnostic that must name the real
+    /// cause. `None` when the query succeeded or there was no device to query.
+    pub fn failure_note(&self, what: &str) -> Option<String> {
+        match self {
+            DeviceMemory::QueryFailed { code, name } => {
+                Some(format!("{what} failed with {name} (code {code})"))
+            }
+            DeviceMemory::Reported { .. } | DeviceMemory::NoDevice => None,
+        }
+    }
+}
+
+/// The E4 activation budget decision for one backend.
+///
+/// `budget` is `None` for "unbounded" (CPU/Metal, or no device state) and `Some(n)`
+/// for a number the gate may compare against. `note` carries the **reason** when the
+/// number is not a measurement, so the caller can print why instead of letting a
+/// fallback pass for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetDecision {
+    pub budget: Option<usize>,
+    pub note: Option<String>,
+}
+
+/// Resolve a backend's activation budget from an explicit override and the device's
+/// own memory answer. Pure, so the whole mapping is unit-tested with no device.
+///
+/// The rules, in order:
+/// - an explicit `set_memory_budget` wins and is a measurement the caller chose; no note;
+/// - a **reported** free read keeps the pre-existing default, three quarters of it
+///   (unchanged on the happy path, including a genuine `free == 0`);
+/// - a **failed** query is not a measurement: it falls back to weights-only accounting
+///   (an unbounded activation budget) and carries a note naming the real error. Refusing
+///   every allocation instead would turn a broken accounting query into a total outage
+///   of a device that may be perfectly usable — and the backend's own allocation is the
+///   authority on whether memory exists;
+/// - no device state is unbounded and silent (a CUDA graph without device state is a
+///   configuration error the assignment pass catches).
+pub fn budget_decision(explicit: Option<usize>, mem: &DeviceMemory) -> BudgetDecision {
+    if let Some(b) = explicit {
+        return BudgetDecision {
+            budget: Some(b),
+            note: None,
+        };
+    }
+    match mem {
+        DeviceMemory::Reported { free, .. } => BudgetDecision {
+            budget: Some(free / 4 * 3),
+            note: None,
+        },
+        DeviceMemory::QueryFailed { code, name } => BudgetDecision {
+            budget: Some(usize::MAX),
+            note: Some(format!(
+                "the device free-memory query failed with {name} (code {code}); the E4 \
+                 activation gate has no measured budget for this backend, so it charges \
+                 weights only. The backend's own allocation is now the authority and will \
+                 report the real error if the context is unusable"
+            )),
+        },
+        DeviceMemory::NoDevice => BudgetDecision {
+            budget: None,
+            note: None,
+        },
+    }
+}
+
 /// The plan for one backend's activations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AllocPlan {
@@ -152,6 +249,95 @@ fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #122's gate: a failed device query must never become a zero budget.
+    ///
+    /// The mutation this pins is the old
+    /// `device_memory().0 / 4 * 3` on a discarded return code: with `free` left at 0 by
+    /// a failed `cudaMemGetInfo`, that produced `Some(0)` and the E4 gate then refused
+    /// every later device allocation with "exceeds the 0 byte budget (0 MiB)".
+    #[test]
+    fn a_failed_device_query_is_not_a_zero_budget() {
+        let failed = DeviceMemory::QueryFailed {
+            code: 700,
+            name: "cudaErrorIllegalAddress".to_string(),
+        };
+        let d = budget_decision(None, &failed);
+        assert_ne!(
+            d.budget,
+            Some(0),
+            "a failed query must not masquerade as a full device: {d:?}"
+        );
+        // The fallback is weights-only accounting (unbounded activations), so the gate
+        // cannot refuse from a number that was never measured.
+        assert_eq!(d.budget, Some(usize::MAX), "{d:?}");
+        let note = d.note.expect("the fallback must carry its reason");
+        assert!(note.contains("cudaErrorIllegalAddress"), "{note}");
+        assert!(note.contains("700"), "the note must name the code: {note}");
+        assert!(
+            !note.contains("0 byte budget") && !note.contains("0 MiB"),
+            "the note must name the cause, not a fabricated measurement: {note}"
+        );
+        // And the query outcome itself still exposes the real failure.
+        assert_eq!(failed.free_bytes(), None);
+        assert!(failed
+            .failure_note("cudaMemGetInfo")
+            .unwrap()
+            .contains("cudaErrorIllegalAddress"));
+    }
+
+    /// The happy path is unchanged: a reported read keeps the exact pre-#122 default.
+    #[test]
+    fn a_reported_free_read_keeps_the_three_quarters_default() {
+        let mem = DeviceMemory::Reported {
+            free: 4 << 20,
+            total: 8 << 20,
+        };
+        let d = budget_decision(None, &mem);
+        assert_eq!(d.budget, Some(3 << 20));
+        assert_eq!(d.note, None, "a measurement needs no note");
+        assert_eq!(mem.free_bytes(), Some(4 << 20));
+        assert_eq!(mem.failure_note("cudaMemGetInfo"), None);
+        // Rounding is the pre-existing integer division, not a new formula.
+        let odd = DeviceMemory::Reported {
+            free: 4_000_001,
+            total: 8 << 20,
+        };
+        assert_eq!(budget_decision(None, &odd).budget, Some(3_000_000));
+    }
+
+    /// A *measured* zero is a real zero and must still refuse: that is "the device is
+    /// full", which is exactly the case the gate exists for.
+    #[test]
+    fn a_measured_zero_free_read_is_still_a_zero_budget() {
+        let full = DeviceMemory::Reported {
+            free: 0,
+            total: 8 << 20,
+        };
+        let d = budget_decision(None, &full);
+        assert_eq!(d.budget, Some(0));
+        assert_eq!(d.note, None, "a real measurement carries no excuse");
+    }
+
+    /// No device state is unbounded and silent, as before; an explicit override wins.
+    #[test]
+    fn no_device_state_and_an_explicit_budget_are_unchanged() {
+        let d = budget_decision(None, &DeviceMemory::NoDevice);
+        assert_eq!(d.budget, None);
+        assert_eq!(d.note, None);
+        // An explicit budget is the caller's number, taken as given on every outcome.
+        for mem in [
+            DeviceMemory::NoDevice,
+            DeviceMemory::Reported { free: 0, total: 1 },
+            DeviceMemory::QueryFailed {
+                code: 700,
+                name: "cudaErrorIllegalAddress".to_string(),
+            },
+        ] {
+            assert_eq!(budget_decision(Some(4096), &mem).budget, Some(4096));
+            assert_eq!(budget_decision(Some(4096), &mem).note, None);
+        }
+    }
 
     #[test]
     fn the_ladder_rounds_up_without_wasting_a_step() {

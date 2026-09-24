@@ -154,12 +154,17 @@ pub struct KvSnapshot {
 pub fn kv_snapshot_from(alloc: &GraphAllocator, backend: Backend) -> KvSnapshot {
     let r = alloc.memory_report(backend);
     let arena = alloc.kv_arena_stats();
+    // `MemoryReport::budget_is_bounded` is the single authority for "is this a real
+    // number": an unaccounted device (a failed free-memory query, #122) falls back to
+    // an unbounded budget, and publishing `usize::MAX` as a gauge would be a number
+    // that was never measured.
+    let bounded = r.budget_is_bounded();
     KvSnapshot {
         weights_bytes: r.weights_bytes as u64,
         pool_bytes: r.pool_bytes as u64,
         live_bytes: r.live_bytes as u64,
         peak_live_bytes: r.peak_live_bytes as u64,
-        budget_bytes: r.budget.map(|b| b as u64),
+        budget_bytes: bounded.then(|| r.budget.unwrap() as u64),
         headroom_bytes: r.headroom_bytes().map(|h| h as u64),
         idle_slots: r.idle_slots as u64,
         reserved_classes: r.reserved_classes as u64,

@@ -392,9 +392,9 @@ pub fn load(
         // E5 S2: `auto` (see qwen2's twin for the full rationale).
         offload::OffloadRequest::Auto => {
             let per_block = block_weight_bytes(model, n_layer);
-            let free = crate::models::device_free_bytes();
+            let mem = crate::models::device_memory();
             let cap = std::env::var("MINFER_GPU_MEM").ok();
-            let budget = match offload::weight_budget(free, cap.as_deref()) {
+            let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("minfer: {e}");
@@ -408,7 +408,7 @@ pub fn load(
                     gpu_layers: k,
                     n_layers: n_layer,
                 },
-                offload::auto_source(k, n_layer, budget, reserve, free, cap.as_deref()),
+                offload::auto_source(k, n_layer, budget, reserve, &mem, cap.as_deref()),
             )
         }
         other => {

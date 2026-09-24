@@ -80,6 +80,10 @@ extern "C" {
     fn cudaGetLastError() -> i32;
     fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    // Issue #122: the *name* of a CUDA error code, so a failed memory query can say
+    // `cudaErrorIllegalAddress (700)` instead of a bare number (or nothing at all).
+    fn cudaGetErrorName(error: i32) -> *const std::os::raw::c_char;
+    fn cudaGetErrorString(error: i32) -> *const std::os::raw::c_char;
     fn cudaGetDeviceProperties(prop: *mut CudaDevicePropBuf, device: i32) -> i32;
     // T2 device-adaptation queries (plan §6): smem feasibility for the BT
     // tile config. The externs query the CURRENT device (R2 fix).
@@ -112,6 +116,37 @@ const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 const CUDA_DEV_ATTR_COMPUTE_MAJOR: i32 = 75;
 const CUDA_DEV_ATTR_COMPUTE_MINOR: i32 = 76;
 const CUDA_DEV_ATTR_MULTIPROC_COUNT: i32 = 16;
+
+/// The symbolic name of a CUDA error code (`cudaGetErrorName`), e.g.
+/// `cudaErrorIllegalAddress` for 700. Falls back to `cudaError<code>` if the runtime
+/// returns null, so a diagnostic can always name *something* specific.
+fn cuda_error_name(code: i32) -> &'static str {
+    // The runtime's strings are static and owned by it, so leaking the formatted
+    // fallback once is bounded by the number of distinct error codes ever seen.
+    let p = unsafe { cudaGetErrorName(code) };
+    if p.is_null() {
+        return Box::leak(format!("cudaError{code}").into_boxed_str());
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+    match s {
+        std::borrow::Cow::Borrowed(b) => b,
+        std::borrow::Cow::Owned(o) => Box::leak(o.into_boxed_str()),
+    }
+}
+
+/// The human-readable description of a CUDA error code (`cudaGetErrorString`).
+#[allow(dead_code)] // for diagnostics that want the prose form
+fn cuda_error_string(code: i32) -> &'static str {
+    let p = unsafe { cudaGetErrorString(code) };
+    if p.is_null() {
+        return "";
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+    match s {
+        std::borrow::Cow::Borrowed(b) => b,
+        std::borrow::Cow::Owned(o) => Box::leak(o.into_boxed_str()),
+    }
+}
 
 // Legacy layer_gpu debug tracing (7e⑦): the graph path syncs via
 // `CudaState::sync()`; MINFER_CUDA_DEBUG tracing stays for the legacy
@@ -1594,9 +1629,9 @@ impl CudaState {
         let sm_count = get_attr(CUDA_DEV_ATTR_MULTIPROC_COUNT, best_device);
         let mut free_mem: usize = 0;
         let mut total_mem: usize = 0;
-        unsafe {
-            cudaMemGetInfo(&mut free_mem, &mut total_mem);
-        }
+        // The banner's total is a convenience, but the return code is checked all the
+        // same (issue #122): a failed query here must not print a bare "0 MB" device.
+        let mem_rc = unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem) };
         // Read device name (first 256 bytes of the oversized buffer)
         let mut name_buf = CudaDevicePropBuf([0u8; 4096]);
         unsafe {
@@ -1615,6 +1650,14 @@ impl CudaState {
             total_mem / 1048576,
             sm_count
         );
+        if mem_rc != 0 {
+            eprintln!(
+                "CUDA: device memory query at init failed with {} (code {}); the banner's \
+                 size is not a measurement",
+                cuda_error_name(mem_rc),
+                mem_rc
+            );
+        }
         // T1: resolve the device tier (plan §5.3). MINFER_DEVICE_TIER=<key>
         // forces a row by llama.cpp-style key (1210/1200/890/870/860/750) —
         // the forced-tier soak runs the whole suite under a foreign tier to
@@ -1751,23 +1794,40 @@ impl CudaState {
     /// charges the budget for them, so "weights + activations" is one comparison).
     /// Sums the registry; the padded-plane companions are accounted by their own
     /// registers and are deliberately not double-counted here.
+    ///
+    /// A poisoned lock is recovered rather than answered with `0`: this registry is
+    /// append-only, so the map behind a poison is still valid, and reporting 0 would
+    /// silently *under*-charge the budget by every resident weight (issue #122's
+    /// fail-open twin).
     pub fn weights_bytes(&self) -> usize {
-        self.weights
-            .lock()
-            .map(|w| w.values().map(|(_, size)| *size).sum())
-            .unwrap_or(0)
+        crate::graph::alloc::weights_from_lock(self.weights.lock(), "CUDA weight registry", |w| {
+            w.values().map(|(_, size)| *size).sum()
+        })
     }
 
     /// Device memory free/total in bytes, queried now (E4's default budget uses `free`).
-    pub fn device_memory(&self) -> (usize, usize) {
+    ///
+    /// The `cudaMemGetInfo` return code is **not** discarded (issue #122). A pre-#122
+    /// failure left `free` at 0 and was indistinguishable from "the device is full";
+    /// the E4 feasibility gate then refused every later device allocation with
+    /// "exceeds the 0 byte budget (0 MiB)" while the real cause — a sticky CUDA error
+    /// such as `cudaErrorIllegalAddress` (700) — was thrown away.
+    pub fn device_memory(&self) -> crate::graph::allocplan::DeviceMemory {
         let (mut free, mut total) = (0usize, 0usize);
-        unsafe { cudaMemGetInfo(&mut free, &mut total) };
-        (free, total)
+        let rc = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        if rc != 0 {
+            return crate::graph::allocplan::DeviceMemory::QueryFailed {
+                code: rc,
+                name: cuda_error_name(rc).to_string(),
+            };
+        }
+        crate::graph::allocplan::DeviceMemory::Reported { free, total }
     }
 
-    /// Free device bytes — the default budget is three quarters of this.
-    pub fn device_free_bytes(&self) -> usize {
-        self.device_memory().0
+    /// Free device bytes, or `None` when the query failed (E5's `auto` fit refuses rather
+    /// than reading a failure as "0 bytes free"; issue #122).
+    pub fn device_free_bytes(&self) -> Option<usize> {
+        self.device_memory().free_bytes()
     }
 
     pub fn register_weight(&self, name: &str, data: &[u8]) {
@@ -4023,7 +4083,11 @@ impl CudaState {
         {
             let (mut free_mem, mut total_mem) = (0usize, 0usize);
             let rc = unsafe { cudaMemGetInfo(&mut free_mem, &mut total_mem) };
-            if rc == 0 && free_mem < 2 * bytes + (4usize << 30) {
+            // A failed query is *not* "there is room" (issue #122): the pre-#122
+            // `rc == 0 && …` shape let a failure fall through to the allocation,
+            // which is the fail-open direction for an optional cache. Take the
+            // documented conservative branch instead — no measurement, no cache.
+            if rc != 0 || free_mem < 2 * bytes + (4usize << 30) {
                 return None;
             }
         }
@@ -4785,12 +4849,26 @@ impl CudaState {
     /// that lands after registration. On GB10's 128 GB this always passes
     /// (zero change); on 8 GB unified-memory devices (Orin Nano) it
     /// self-disables the planes and the raw paths serve (raw lookup miss).
-    /// Deliberately silent: registration is best-effort by design — every
-    /// consumer already falls back to its raw path on a map miss.
+    /// Best-effort by design — every consumer falls back to its raw path on a
+    /// map miss — so a failed query keeps the planes **off** (the conservative
+    /// branch, unchanged) but no longer silently (issue #122): the discarded
+    /// return code used to make a broken query look like "not enough memory".
     fn plane_budget_ok(&self, extra_bytes: usize) -> bool {
         let mut free: usize = 0;
         let mut total: usize = 0;
-        unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        let rc = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        if rc != 0 {
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if WARNED.set(()).is_ok() {
+                eprintln!(
+                    "CUDA: optional weight-plane budget query failed with {} (code {}); \
+                     keeping the optional planes off",
+                    cuda_error_name(rc),
+                    rc
+                );
+            }
+            return false;
+        }
         free > extra_bytes + extra_bytes / 4
     }
 

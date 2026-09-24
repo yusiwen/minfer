@@ -41,10 +41,59 @@ pub struct MemoryReport {
 }
 
 impl MemoryReport {
-    /// Bytes the budget would refuse next: `budget - (weights + pool)`.
+    /// Whether `budget` is a real bound the gate compares against, as opposed to
+    /// "unbounded" — `None` (CPU/Metal), or the `usize::MAX` an *unaccounted* device falls
+    /// back to when its free-memory query failed. The metrics surface omits the
+    /// budget/headroom families when this is false rather than publishing a number that
+    /// was never measured (issue #122).
+    pub fn budget_is_bounded(&self) -> bool {
+        matches!(self.budget, Some(b) if b != usize::MAX)
+    }
+
+    /// Bytes the budget would refuse next: `budget - (weights + pool)`, or `None` when
+    /// there is no bound.
     pub fn headroom_bytes(&self) -> Option<usize> {
         self.budget
+            .filter(|b| *b != usize::MAX)
             .map(|b| b.saturating_sub(self.weights_bytes + self.pool_bytes))
+    }
+}
+
+/// Print the reason for an unaccounted (fallback) budget **once per process**.
+///
+/// `memory_budget` runs per allocation, so a device whose memory query keeps failing
+/// would otherwise print this on every node; once is loud enough to be found and quiet
+/// enough not to bury the log. `OnceLock` rather than an atomic flag so the note itself
+/// is what gets printed, whichever call site sees the failure first.
+fn unaccounted_budget_note(note: &str) {
+    static PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if PRINTED.set(()).is_ok() {
+        eprintln!("minfer: E4 memory accounting is unmeasured: {note}");
+    }
+}
+
+/// The byte total behind a possibly-poisoned registry lock, recovering (and naming) the
+/// poison instead of reporting zero.
+///
+/// A poisoned mutex means a previous holder panicked. The registries this is used on are
+/// append-only, so the map behind the poison is still consistent — and the old
+/// `.map(|w| …).unwrap_or(0)` behaviour was the fail-*open* twin of issue #122's failed
+/// device query: it silently reported **0 registered weights**, so `weights + activations
+/// > budget` under-charged the budget by every resident weight. Recovering the value and
+/// saying so keeps the accounting honest.
+pub fn weights_from_lock<T, F>(lock: std::sync::LockResult<T>, what: &str, sum: F) -> usize
+where
+    F: FnOnce(&T) -> usize,
+{
+    match lock {
+        Ok(v) => sum(&v),
+        Err(poisoned) => {
+            eprintln!(
+                "minfer: the {what} lock was poisoned by an earlier panic; recovering the \
+                 entries it still holds rather than reporting 0 bytes"
+            );
+            sum(&poisoned.into_inner())
+        }
     }
 }
 
@@ -713,23 +762,37 @@ impl GraphAllocator {
         }
     }
 
-    /// The memory budget for a backend (E4): an explicit one if it was set, else CUDA's
-    /// *free* device bytes with a quarter held back, else unbounded. The default is the
-    /// device's own answer, not a guess: `cudaMemGetInfo` already reports what is left
-    /// after every weight and KV region is resident.
+    /// The memory budget for a backend (E4): an explicit one if it was set, else the
+    /// device's *free* bytes with a quarter held back, else unbounded. The default is the
+    /// device's own answer, not a guess: the query already reports what is left after
+    /// every weight and KV region is resident.
+    ///
+    /// The device's answer is an explicit [`allocplan::DeviceMemory`], so a **failed**
+    /// query can no longer arrive here as `free = 0`. It resolves through the pure
+    /// [`allocplan::budget_decision`]: a reported read keeps the three-quarters default
+    /// (issue #122's happy path, byte for byte), a measured zero still refuses, and a
+    /// failed query falls back to weights-only accounting with its reason printed once
+    /// (see `unaccounted_budget_note`). Nothing derives a budget from a non-measurement.
     fn memory_budget(&self, backend: Backend) -> Option<usize> {
-        if let Some(b) = self.budget.get(&backend) {
-            return Some(*b);
-        }
-        match backend {
-            #[cfg(feature = "cuda")]
-            Backend::Cuda => crate::cuda::CudaState::get()
-                .map(|c| c.device_free_bytes() / 4 * 3)
+        let explicit = self.budget.get(&backend).copied();
+        #[cfg(feature = "cuda")]
+        let mem = if backend == Backend::Cuda {
+            match crate::cuda::CudaState::get() {
+                Some(c) => c.device_memory(),
                 // A CUDA graph with no device state is a configuration error the
                 // assignment pass catches; the budget is simply unbounded here.
-                .or(Some(usize::MAX)),
-            _ => None,
+                None => allocplan::DeviceMemory::NoDevice,
+            }
+        } else {
+            allocplan::DeviceMemory::NoDevice
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mem = allocplan::DeviceMemory::NoDevice;
+        let decision = allocplan::budget_decision(explicit, &mem);
+        if let Some(note) = &decision.note {
+            unaccounted_budget_note(note);
         }
+        decision.budget
     }
 
     /// Set (or clear, with `None`) a backend's memory budget. Tests and a future
@@ -3426,6 +3489,31 @@ mod tests {
         });
         let mut alloc = GraphAllocator::new();
         assert!(alloc.alloc_graph(&g).is_err());
+    }
+
+    /// Issue #122's fail-open twin: a **poisoned** weights lock must not report 0 bytes.
+    ///
+    /// The mutation this pins is `weights.lock().map(|w| …).unwrap_or(0)`: a panic in
+    /// another thread poisons the mutex, the sum became 0, and `weights + activations >
+    /// budget` then under-charged the budget by every resident weight. The registry is
+    /// append-only, so the value behind the poison is still valid and is recovered.
+    #[test]
+    fn a_poisoned_registry_does_not_report_zero_weights() {
+        let registry: std::sync::Mutex<Vec<(u64, usize)>> =
+            std::sync::Mutex::new(vec![(1, 7), (2, 11)]);
+        // Poison it the way a panic inside a holder would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = registry.lock().unwrap();
+            panic!("poison the registry");
+        }));
+        assert!(registry.is_poisoned(), "the test must actually poison it");
+        let bytes = weights_from_lock(registry.lock(), "test registry", |r| {
+            r.iter().map(|(_, size)| *size).sum()
+        });
+        assert_eq!(
+            bytes, 18,
+            "the poisoned registry must report its real bytes, not 0"
+        );
     }
 
     /// E4's safety half: a request that would exceed the backend's budget is refused
