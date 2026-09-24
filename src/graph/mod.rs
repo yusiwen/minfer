@@ -27,6 +27,8 @@ pub fn backend_takes(b: &dyn backend::Backend, op: &ops::Op, dtype: DType) -> bo
 pub mod allocplan;
 pub mod builder;
 pub mod cache;
+/// Cross-backend staging-copy counters + the synchronous-reference gate (F5).
+pub mod copystats;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;

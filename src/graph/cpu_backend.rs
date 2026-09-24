@@ -166,6 +166,53 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 pub const READS_PACKED_KV: bool = true;
 
+/// F5 ([#58]): registry hook **phase A** of a cross-backend staging copy, CPU
+/// source.
+///
+/// The CPU backend has **no device memory**, so there is nothing to make
+/// asynchronous: this is exactly the synchronous host round trip the boundary
+/// always performed (read the source into a host vector, write it into the
+/// destination's staging buffer). Declaring it here rather than as a
+/// `if backend != CPU` branch in the allocator is the F4 shape — the fact that
+/// the CPU's answer is "there is no transfer to overlap" is a *registered
+/// answer*, not a special case.
+///
+/// The device leg of a CPU→CUDA staging copy is not in this hook: the
+/// destination pool's own `write_host` is already the pinned, stream-ordered
+/// `cudaMemcpyAsync` fill (7e⑥), so that direction never blocked the host either
+/// — which is why the ticket's blocking-copy count is about the *device→host*
+/// direction only.
+///
+/// [#58]: https://github.com/yusiwen/minfer/issues/58
+pub(crate) fn copy_cross(
+    alloc: &mut super::alloc::GraphAllocator,
+    uid: u64,
+    node_id: super::NodeId,
+    dst_backend: super::Backend,
+) -> Result<bool, String> {
+    alloc.host_round_trip_cross(uid, node_id, dst_backend)?;
+    Ok(true)
+}
+
+/// F5 ([#58]): registry hook **phase B** for a CPU source — a documented no-op.
+///
+/// The bytes were produced by phase A (a plain host memcpy) and the device leg,
+/// when the destination is a device, is ordered on that device's stream behind
+/// its own fill. There is no event to wait for and no host stall to take. The
+/// allocator still counts the wait (phase B is issued exactly once per staged
+/// input, whatever the backend), which is what makes "the boundary path issues a
+/// wait for every staged input" a backend-independent, CI-covered assertion.
+///
+/// [#58]: https://github.com/yusiwen/minfer/issues/58
+pub(crate) fn await_cross(
+    _alloc: &mut super::alloc::GraphAllocator,
+    _uid: u64,
+    _node_id: super::NodeId,
+    _dst_backend: super::Backend,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// F4: this backend's registry entry. Called by `Registry::build` at startup —
 /// the only place the CPU backend is introduced to the registry.
 pub fn entry() -> super::registry::BackendEntry {
@@ -183,6 +230,11 @@ pub fn entry() -> super::registry::BackendEntry {
         pool: |a| Some(a.cpu()),
         pool_mut: |a| Some(a.cpu_mut()),
         host_read: |a, id| a.cpu().read_host(id).map(|s| s.to_vec()),
+        // F5: the CPU is a registered participant in the boundary contract, not a
+        // special case: phase A is the synchronous host round trip, phase B is the
+        // documented no-op. See `copy_cross` / `await_cross` above.
+        copy_cross,
+        await_cross,
         // The CPU pool snapshots the process-wide `MINFER_CACHE_TYPE` policy at
         // construction; that snapshot is the live answer.
         kv_format: |a| a.cpu().kv_format(),

@@ -204,9 +204,23 @@ impl BackendScheduler {
                     // 1b. staged Metal/CUDA captures are valid now — read back
                     flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
                     flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
-                    // 2. copy this split's inputs across backends
+                    // 2. F5 phase A — enqueue this split's cross-backend staging
+                    //    copies. A device source's transfer is an async
+                    //    `cudaMemcpyAsync` plus a recorded event; nothing here
+                    //    blocks the host on a copy.
                     for &inp in &split.inputs {
                         alloc.copy_across(graph.uid, inp, split.backend)?;
+                    }
+                    // 3. F5 phase B — the split boundary's **synchronization
+                    //    points**: one wait per staged input, in the same order,
+                    //    before any consumer can read the staging buffer. This is
+                    //    the wait the missing-wait gate is about: dropping it
+                    //    leaves the staging entry pending, and the consumer's read
+                    //    below (`cross_input`) fails loudly instead of reading a
+                    //    transfer that may still be in flight. See
+                    //    `docs/BACKEND-REGISTRY-DESIGN.md` §11.
+                    for &inp in &split.inputs {
+                        alloc.await_cross(graph.uid, inp, split.backend)?;
                     }
                 }
             }
@@ -268,8 +282,12 @@ impl BackendScheduler {
                     // consumer can pick up the other's. Otherwise fall back to
                     // the node's canonical buffer (already on this split's
                     // backend when no copy was needed).
+                    //
+                    // F5: `cross_input` (not the raw `cross_buffer`) so a staged
+                    // entry whose boundary wait was skipped is a loud error, never
+                    // a read of an in-flight transfer.
                     let sbr = alloc
-                        .cross_buffer(graph.uid, s, split.backend)
+                        .cross_input(graph.uid, s, split.backend)?
                         .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr);
@@ -647,5 +665,110 @@ mod tests {
             .find(|e| e.name == "silu")
             .map_or(0, |e| e.calls);
         assert_eq!(now, calls_after, "a run with the flag off records nothing");
+    }
+
+    /// F5 ([#58]) gate: **a staged cross-backend input cannot be consumed before
+    /// its boundary wait**.
+    ///
+    /// This is the ticket's second acceptance line made deterministic on a
+    /// CPU-only build. The test puts the allocator in exactly the state between
+    /// phase A and phase B (a staged entry that has not been waited on), runs the
+    /// **real** `execute` — whose node loop resolves every input through
+    /// `cross_input` — and asserts it fails **loudly**, naming the missing wait,
+    /// instead of consuming the staging buffer. Issuing the wait publishes the
+    /// entry and the same graph then executes to completion.
+    ///
+    /// Why the state is injected with a test hook rather than produced by a real
+    /// boundary: a boundary needs two usable backends, and the only backend a
+    /// CPU-only CI can enable is the CPU (a cross-backend split on this build
+    /// would have to be a device). The CUDA
+    /// `async_cross_copies_never_block_and_stay_bitwise_identical` gate produces
+    /// the state end-to-end on a device; together they cover the invariant from
+    /// both ends. The mutation evidence (dropping the boundary's `await_cross`
+    /// loop) is recorded in `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
+    #[test]
+    fn a_staged_boundary_input_cannot_be_consumed_before_its_wait() {
+        let g = small_graph();
+        let sched = BackendScheduler::new();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
+
+        // Stage node 1 (the silu, a source of node 2) on the CPU — the same
+        // backend, so it is the canonical buffer — and mark its copy un-waited.
+        let br = alloc.node_buffer(1).unwrap();
+        alloc.stage_cross_for_test(g.uid, 1, BackendTag::CPU, br.id, br.len);
+        alloc.mark_cross_pending_for_test(g.uid, 1, BackendTag::CPU);
+
+        let err = sched
+            .execute(&g, &mut alloc)
+            .expect_err("a pending staged input must not be consumed");
+        assert!(
+            err.contains("was read before its boundary wait"),
+            "the refusal must name the missing wait, got: {err}"
+        );
+        assert!(err.contains("#58"), "{err}");
+
+        // Phase B publishes it; the graph then runs. (The staged reference is the
+        // canonical buffer, so the values are unchanged.)
+        alloc.await_cross(g.uid, 1, BackendTag::CPU).unwrap();
+        sched.execute(&g, &mut alloc).unwrap();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let got = alloc.get_buffer(&g, 2).unwrap();
+        for i in 0..4 {
+            assert!((got[i] - (silu((i + 1) as f32) + (i + 1) as f32)).abs() < 1e-5);
+        }
+    }
+
+    /// F5 ([#58]) gate: **the CPU-only path is provably untouched.**
+    ///
+    /// A CPU-only graph is a single split, so the boundary never runs: the
+    /// counters must stay at zero in *both* modes, and forcing the synchronous
+    /// reference (`MINFER_SYNC_COPIES=1`'s code path) must not change a byte.
+    /// There is no device copy to overlap, and this is the measurement that says
+    /// so rather than asserting it.
+    ///
+    /// The mode is set programmatically: the environment is process-wide and the
+    /// parallel harness shares it.
+    #[test]
+    fn the_cpu_path_never_enters_the_cross_copy_machinery() {
+        let g = small_graph();
+        let sched = BackendScheduler::new();
+        let input = [1.0f32, -2.0, 3.5, 4.25];
+
+        let run = || -> (Vec<f32>, crate::graph::copystats::CrossCopyStats) {
+            let mut alloc = GraphAllocator::new();
+            alloc.alloc_graph(&g).unwrap();
+            alloc.fill_input(&g, "x", &input).unwrap();
+            sched.execute(&g, &mut alloc).unwrap();
+            (
+                alloc.get_buffer(&g, 2).unwrap().to_vec(),
+                alloc.cross_stats(),
+            )
+        };
+
+        let (async_bytes, async_stats) = {
+            let _g = crate::graph::copystats::set_sync_for_test(false);
+            run()
+        };
+        let (sync_bytes, sync_stats) = {
+            let _g = crate::graph::copystats::set_sync_for_test(true);
+            run()
+        };
+
+        assert_eq!(
+            async_bytes, sync_bytes,
+            "the sync reference must be bitwise identical on the CPU path"
+        );
+        assert_eq!(
+            async_stats,
+            crate::graph::copystats::CrossCopyStats::default(),
+            "a CPU-only graph has no boundary, so no copy and no wait may be counted"
+        );
+        assert_eq!(sync_stats, async_stats);
+        assert!(
+            async_stats.all_copies_awaited(),
+            "the contract is trivially satisfied when nothing crossed"
+        );
     }
 }
