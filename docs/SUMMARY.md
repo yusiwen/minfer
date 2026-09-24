@@ -151,6 +151,7 @@
 
 # Tooling
 
+- [GGUF Tooling — convert, quantize, split (F6)](./GGUF-TOOLING.md)
 - [Debug Dump](./debug-dump.md)
 
 # Reference
