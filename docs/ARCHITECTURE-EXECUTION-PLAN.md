@@ -963,6 +963,84 @@ byte-based addressing plus a block-dequantizing load in every attention kernel (
 modes each), a Q8_0 store, and the fused decode QKV epilogue's own store. Metal stays at G5
 by the round's own decision.
 
+**C4 S2b — the CUDA Q8_0 kernels: the plan of record (2026-09-24, design only).**
+
+The CPU half of #87 landed (S2a). The device half is a kernel project, not a read-path change, so
+it lands as its own increment against the same issue. This is the map it starts from: where the
+CUDA backend touches a KV region, the design that covers those sites, and the dispatch cuts that
+keep the first increment bounded. It came from walking the three files below at `a5f7961` + S2a,
+so the line numbers are the ones to read, not to trust.
+
+**What is there today.** No CUDA code knows `KvFormat`. The layout is one process-wide `bool`
+(`cuda.rs`'s `KV_F16`), and every kernel addresses a cell as `row * nkt` *elements* of a
+`float*`/`__half*` — there is no byte addressing anywhere, so a 34-byte-per-32-element cell
+cannot be expressed by any current kernel signature. `set_kv_cache_type` maps anything that is
+not exactly `f16` to false, so flipping the load gate before the kernels exist would silently
+mean f32.
+
+**The design.** A layout tag plus byte-addressed row accessors in `cuda_kernels.cu`:
+
+- `KV_LAYOUT_F32 / KV_LAYOUT_F16 / KV_LAYOUT_Q8_0`, `kv_row(base, cell, row_bytes)`, and
+  `kv4<LAYOUT>(row, elem) -> float4` as the one load idiom: f32 is the old `float4` load, f16 the
+  old two-`__half2` pair (both bit-identical to today's instantiations), and Q8_0 reads block
+  `elem/32`'s f16 scale plus four quants at `2 + elem%32`. A 4-element group never straddles a
+  block, because a KV head's base is `hd`-aligned and `hd % 32 == 0` — the property
+  `ensure_kv`'s packed-width check already enforces;
+- kernels take `const void* k/v` + `size_t row_bytes` instead of a typed pointer plus
+  `stride_kv = nk * hd`, templated on `int LAYOUT` rather than `typename KV`;
+- `store_kv_q8_0`: one thread per (row, 32-element block), with the CPU store's own quantizer
+  (`amax/127`, f16 scale, `round_ties_even`), so both backends store the same bytes.
+
+**The access sites to convert** (`src/cuda_kernels.cu`, plus the host rows below):
+
+| Site | Lines | What it is |
+|---|---|---|
+| `kv_ld4<KV>` specialisations | 2935–2950 | the split body's two loads |
+| `attn_split_1w_body<KV,…>` | 2957–3053 (3013, 3016) | K+V, `cell[j]`-indexed, `hd/4` dims per lane |
+| `gqa_attn_split_partial<KV,…>` | 3055–3083 | decode (nt == 1) |
+| `gqa_attn_split_partial_bt<KV,…>` | 3120–3137 | spec-verify (1 < nt ≤ 16) |
+| `gqa_attn_f32<CAUSAL,MAP>` | 3456–3575 (3500/3510/3535/3544) | the general kernel (nt > 16 prefill) |
+| `store_kv_f32` / `store_kv_f16` | 2530–2569 | the store both dtypes use |
+| `attn_bias_rope_store_f32` | 2590–2667 (2649–2665) | the fused decode epilogue's K/V store |
+| `gqa_attn_f32_f16kv`, `attn_split_h4w_body`, `fa_stage_kv_async`, `fa_prefill_f16kv` | 2781–2900, 3273–3431, 4327–4372, 4374–4648 | the f16-specialised paths (see the cuts) |
+| `kv_move_rows` | 8703–8720 | the compaction mover — a plain word copy, so a packed cell (a whole number of f32 words) needs **no change**; the host already passes the cell's word count |
+| host launchers | `cuda.rs` 349–897 (FFI), 4481–4755 (`CudaState`), 5393–5488 (store/epilogue) | `typename KV` / `f16_kv: bool` become a layout tag |
+| executor | `cuda_backend.rs` 26/114/133 (the field), 1075–1109 (store), 1111–1262 (dispatch), 1510–1541 (`copy_cells`), 154–156 (test setter), + 41 `kv_f16` test sites | the format decides store, dispatch and the move stride |
+| format plumbing | `cuda.rs` 1456–1478, `kvformat.rs` 124–133 (`supports`), `alloc.rs` 867–939 (`ensure_kv`'s packed refusal) and 2035–2059 (`kv_element_format`), `models/{qwen2,qwen3}/loader.rs` 462–464 | one authority: the device reads the format the loader already resolved |
+
+**The dispatch cuts that keep the first increment bounded** — build-time choices
+(`no silent fallback`), each stated when the format is enabled:
+
+- **decode (nt == 1)** takes the split-K path through the converted 1-warp body; its hybrid 4-warp
+  dispatch (`hd == 128`, `nkv >= 1921`) is f16-typed and is skipped for Q8_0 (`rpw_gate = 0`);
+- **1 < nt ≤ 16** routes to `gqa_attn_f32` instead of the batched split kernel, which exists for
+  spec-verify's *bitwise* identity contract with sequential decode. A speculative session must
+  therefore **refuse** a packed cache loudly (a draft keeps its own KV, and the two reduction
+  schedules would no longer agree) — consistent with S2a, which already refuses a draft in the
+  session container;
+- **prefill (nt > 16)** routes to `gqa_attn_f32`: the FA path (`fa_prefill_f16kv`, f16-typed
+  shared-memory staging) is not offered for Q8_0 in this increment, so the prefill is correct but
+  off its tuned path;
+- **the fused decode epilogue** (`Op::FusedQKV` / `Op::QkvBiasRopeStore`) is not built for a
+  packed cache — the model builders' `layer_gpu` gate gains `&& !packed`, and a Q8_0 decode takes
+  the unfused bias/rope/store chain through the converted store kernel.
+
+**Acceptance** (the issue's, made concrete): `cuda_map_window_matches_the_span_over_the_same_rows`
+(`cuda_backend.rs:3678`) extended to Q8_0 rows — it writes its own region contents and calls
+`exec_ids` directly, so it needs a packed cell encoder and a packed-word region size; a Q8_0
+store→attention round trip (`cuda_kv_f16_roundtrip_attn`, `:5150`, is the pattern); `copy_cells`
+under the packed stride (`cuda_f16_kv_cell_move_strides_by_row_bytes`, `:3946`); the real-model
+gate `a_packed_kv_cache_answers_like_the_f32_one` run with the `cuda` feature on GB10 (CI has no
+GPU, and its `MINFER_C4_MODEL` arm covers a second model); and an A/B against f16 on the same
+model/context with the numbers recorded. The honest expectation, stated before the work: the win
+on the device is **memory** (3.76× less than f32, 1.88× less than f16); whether decode bandwidth
+also improves depends on the block-dequant instruction count, so the bar against f16 is "no worse
+than a named factor", not "faster".
+
+**Why it is not in this increment.** ~10 kernel sites, 3 launchers, ~15 host sites and 41 test
+sites, each needing an nvcc iteration and — for the gates — a serial device run. It is recorded
+here rather than half-wired. [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 
 **Why.** A session's KV rows, ownership and run table lived only in memory, so every
