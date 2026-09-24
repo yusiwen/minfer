@@ -63,10 +63,13 @@ Four items are **not** covered by that estimate and apply to every port:
    (`rope.scaling.type = llama3`, i.e. the low/high-frequency factors in
    Llama 3.1+) are not implemented, so a Llama 3.x port is correct at short
    context and wrong past the original training window until this lands.
-4. **Chat template.** minijinja 2.21 exposes no `str` methods, so any template
-   using Python string methods silently falls back to ChatML
-   (`docs/ARCHITECTURE-ROADMAP.md` §2.7). A port whose template does this is
-   functional but loses its own prompt formatting.
+4. **Chat template.** minijinja 2.21 exposes no `str` methods natively; since
+   F7 ([#50](https://github.com/yusiwen/minfer/issues/50)) minfer installs an
+   unknown-method hook implementing the Python `str` methods with CPython
+   semantics, so a port whose template uses them renders as published. A
+   template using a construct outside the implemented set is refused loudly at
+   load (`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`), never silently replaced
+   by a generic prompt.
 
 ### New structure (the expensive case)
 
