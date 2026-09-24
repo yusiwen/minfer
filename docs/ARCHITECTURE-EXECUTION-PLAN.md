@@ -12,7 +12,7 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **5/8** (F2, F3, **F4**, F7,
+**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **6/8** (F2, F3, **F4**, **F5**, F7,
 F8 done; F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
@@ -3518,7 +3518,7 @@ Can run in parallel with A–E by a different workstream.
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | this box |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | this box |
-| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
+| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (true overlap) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | this box |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | this box |
@@ -4287,6 +4287,140 @@ an async D2H into pinned CUDA staging) — that is machinery, not a capability.
 by dropping in a library (`ROADMAP` §2.6 keeps that distinction). (g) The CPU
 numbers above are the *final* tree (after the rustfmt pass and the stage-2 fix);
 the CUDA numbers are from the same final tree.
+
+### F5 — Async cross-backend copies and events (#58) — **DONE 2026-09-24**
+
+**What landed.** The scheduler's split boundary is now **two registered phases**
+instead of one blocking host round trip. `GraphAllocator::copy_across` (phase A,
+*enqueue*) resolves the destination staging buffer, marks the entry pending, and
+calls the **source backend's** `BackendEntry::copy_cross` hook — the F4 rule
+applies: the allocator never asks "is this the CPU?", it asks the entry.
+`GraphAllocator::await_cross` (phase B, *wait*) calls the entry's `await_cross`,
+clears the pending flag and counts the wait. The scheduler walks `Split::inputs`
+once for the copies and once for the waits, before any node of the consuming
+split runs; the consumer resolves a staged input through the new
+`GraphAllocator::cross_input`, which **refuses** a still-pending entry with a
+loud `Err` naming the missing wait. The registry contract, the per-backend table
+and the enumerated synchronization points are in
+[`BACKEND-REGISTRY-DESIGN.md`](./BACKEND-REGISTRY-DESIGN.md) §11; the
+scheduler-side summary is `COMPUTE-GRAPH-DESIGN.md` §3.4.
+
+*The hot path, defined and measured.* The ticket is about **the split-boundary
+staging copies** — the per-`Split::inputs` transfers `execute` makes when a value
+produced on one backend is consumed on another; they run on every forward, on the
+critical path of every partially offloaded decode step. The copies that are
+legitimately host-visible and therefore **not** in scope are enumerated in the
+registry doc §11.1 (logits readback, KV-session save, debug/trace dumps,
+weight/tokenizer load, `fill_input`) so "zero blocking boundary copies" is not
+read as "zero device→host copies anywhere". Before F5 a single CUDA→host boundary
+input cost **two** host stalls — a full stream synchronization inside
+`copy_to_host` and then a blocking `cudaMemcpy` D2H — which is why the counters
+below count both.
+
+*Instrumentation.* `graph/copystats.rs` holds the per-allocator counters
+(`copies`, `waits`, `blocking_host_copies`, `async_host_copies`, `event_syncs`,
+`stream_waits`) and the `MINFER_SYNC_COPIES=1` switch that restores the pre-F5
+path as the bitwise reference (with `set_sync_for_test` as its programmatic
+form). Device-level twins: `CudaBackend::blocking_readback_count()` (actual
+blocking `cudaMemcpy` D2H calls) and `cuda::stream_sync_count()` (host stalls).
+
+*The device layer.* `src/cuda.rs` gains the event primitives (`record_event`,
+`wait_event`, `stream_wait_event`, `event_destroy`) and the async transfer
+(`copy_to_host_async`, `host_alloc`/`host_free` for the pinned slabs) — every
+failure is a loud `Err` naming the `cudaGetErrorName`, never a silently missing
+synchronization. `CudaBackend` owns a small grow-on-demand pinned-slab pool and
+the pending-copy table; a slab is released when its event has been waited on, and
+`Drop` destroys the events and frees the slabs.
+
+**Measured acceptance (GB10 sm_121 unless noted).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **405 passed / 0 failed / 23 ignored** unit (baseline 399; +2 `copystats`, +2 allocator, +2 scheduler) and **10 / 0 / 6** integration (unchanged) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **23 passed / 0 failed** (unchanged — every F5 gate that needs a boundary is device-gated or in the unit suite) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10, whole unit suite) | **459 passed / 0 failed / 26 ignored** (baseline 452 / 0 / 25; +6 CPU-visible tests, +1 new device test, +1 new `#[ignore]`d real-model gate) |
+| `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (0.5B) | **26 passed / 0 failed** (baseline 25 / 0, +the F5 real-model gate) |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf … --ignored --test-threads=1` | **25 passed / 1 failed** — the single failure is `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"*, i.e. the **pre-existing** [#130](https://github.com/yusiwen/minfer/issues/130), not this ticket. The F5 gate itself passes in that configuration |
+| `rustfmt +stable --edition 2021 --check` on the 10 changed `.rs` | clean (rustfmt **1.9.0-stable**; the pinned 1.97.1 toolchain has no `rustfmt` component here, as F4 found — CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **935 links resolve in 183 files** (baseline 935 / 183) |
+
+**The numbers the ticket asked for.** The real-model gate
+(`async_cross_copies_never_block_and_stay_bitwise_identical`) runs the same
+4-of-24-block offload graph 7 forwards (1 prefill + 6 decode) in both modes and
+compares every step's logits:
+
+| | async (default) | sync (`MINFER_SYNC_COPIES=1`, the pre-F5 path) |
+|---|---|---|
+| staging copies (`copies`) | 56 | 56 |
+| boundary waits (`waits`) | 56 | 56 |
+| **blocking device→host copies** | **0** | **7** |
+| async device→host copies | 7 | 0 |
+| event waits (host, the documented point) | 7 | 0 |
+| device-level blocking readbacks | **0** | 7 |
+| full stream syncs | **27** | **34** |
+| max \|Δlogit\| vs the other mode | **0** (bitwise) | — |
+
+So the before/after is: **7 → 0 blocking device→host copies** and **34 → 27 full
+stream synchronizations** (−7, exactly one per staged device→host copy) over 7
+forwards, with byte-identical logits. The cheap device gate
+(`cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`)
+reports the same shape on a 3-node CPU→CUDA→CPU graph: async `copies=2, waits=2,
+blocking=0, async_host=1, event_syncs=1, readbacks=0, syncs=1`; sync `copies=2,
+waits=2, blocking=1, readbacks=1, syncs=2`.
+
+**Mutation evidence (reverted; the tree was restored byte-identical).** The
+boundary's phase-B loop was removed from `execute`:
+
+```text
+graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise
+  panicked: called `Result::unwrap()` on an `Err` value: "staged cross-backend input 0
+  for Cuda was read before its boundary wait: every copy_across owes one await_cross (F5, #58)"
+
+models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical
+  panicked: called `Result::unwrap()` on an `Err` value: "staged cross-backend input 3
+  for Cuda was read before its boundary wait: every copy_across owes one await_cross (F5, #58)"
+```
+
+**Which half of the missing-wait gate is deterministic, and which is not.** The
+*loud refusal* above is deterministic: the pending flag left by the missing wait
+is turned into an `Err` by `cross_input` on the consumer path, on the first read.
+The *counter* half (`all_copies_awaited()`, i.e. `copies == waits`) is also
+deterministic. The *bitwise comparison against the synchronous reference* is the
+probabilistic half: a dropped event wait **can** also corrupt bytes, but whether
+it does depends on timing, so it is reported as evidence of equality between the
+two supported modes, never as the failure mode of the mutation. That is why the
+gate carries both.
+
+**Honest scope.** (a) **Metal is unported, deliberately**: there is no Mac here
+and no macOS toolchain, so its `copy_cross` **declines** (`Ok(false)`) and the
+allocator's synchronous host round trip handles it exactly as before F5 — no
+half-written blit/event code that nothing can compile. A Metal source's copies
+therefore still count as `blocking_host_copies`; the port is
+[#137](https://github.com/yusiwen/minfer/issues/137). (b) **True overlap did not
+land and is not claimed**: the split loop is strictly sequential (enqueue, then
+wait), so there is no independent work for a copy to overlap with, and a
+host-side consumer must wait by definition. What the substrate buys today is that
+the transfers are enqueued back to back and the redundant per-copy stream syncs
+disappear — the 34 → 27 measurement above. Deferring a wait to the consumer's
+first use is [#138](https://github.com/yusiwen/minfer/issues/138). (c) **Only
+CUDA has an async device path**, and only the CUDA→host direction (a device→device
+staging copy is unreachable — `copy_across` early-returns when source and
+destination backends match; CUDA→Metal on a macOS+CUDA build declines and stays
+synchronous, the pre-F5 behaviour). (d) The CPU is a **synchronous no-op by
+construction** — it has no device memory — and the gate that says so is
+`scheduler::tests::the_cpu_path_never_enters_the_cross_copy_machinery`: a
+CPU-only graph is one split, both modes are bitwise identical and every counter
+stays zero. (e) The **latency** claim is a count, not a timing: the per-copy full
+`cudaStreamSynchronize` is gone (measured as a sync count) and no blocking
+`cudaMemcpy` is issued; no wall-clock speedup is claimed, because at a boundary
+the consumer immediately needs the bytes and the dominant cost is unchanged.
+(f) The end-to-end **counter** assertion needs a real cross-backend boundary, so
+it runs on the CUDA device (`#[ignore]`d); CI (CPU-only) covers the
+allocator-level missing-wait invariant plus the graph-level refusal through
+`execute` with an injected pending entry
+(`scheduler::tests::a_staged_boundary_input_cannot_be_consumed_before_its_wait`),
+and the CPU no-op/bitwise gate. The mutation's CUDA failure output above is the
+record of the part CI cannot reach.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
