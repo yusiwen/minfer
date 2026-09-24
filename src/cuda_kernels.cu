@@ -5425,7 +5425,53 @@ __global__ void gemm_f16_nt_kernel_t(
     }
 }
 
-// one-time cudaFuncSetAttribute for dynamic smem above the 48KB static cap
+// ─── prefill-GEMM dynamic shared memory: one formula, checked opt-ins ────
+//
+// The dynamic-smem requirement of one `gemm_f16_nt_kernel_t` instantiation is
+// the kernel's own byte layout (see its definition): the As tile (2*TN*KS
+// halves), the AF32 f32 mirror Am (2*TN*KS floats, AF32 only), the Bs tile
+// (2*TM*KS halves) and the Cs store (NW*256 floats). TN = 64 and NW =
+// blockDim.x/32 = 8 at every launch site (256 threads). The launcher and the
+// eager opt-in below MUST read the same number, so this formula is the single
+// source. (Issue #145: the eager init used a stale copy of it that assumed a
+// 512-thread TM=256 launch and always added the AF32 mirror, so it asked for
+// 131072 B for `gemm_f16_nt_kernel_t<256,64,true>` — more than the device's
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin` (101376 B on GB10/sm_121). The
+// rejected `cudaFuncSetAttribute` return value was never read, and the latched
+// `cudaErrorInvalidValue` later surfaced as a phantom kernel-launch error.)
+static size_t gemm_dynamic_smem_bytes(int tm, int ks, bool af32) {
+    const size_t tn = 64, nw = 8;
+    return (2 * tn * ks + 2 * (size_t)tm * ks) * 2
+           + (af32 ? (size_t)2 * tn * ks * 4 : 0)
+           + nw * 256 * 4;
+}
+
+// The compiled `gemm_f16_nt_kernel_t<tm, ks, af32>` instantiation, or null for
+// a combination that is not in the fatbin.
+#define GEMM_FN_FOR(TM, KS, AF)                                                \
+    if (tm == (TM) && ks == (KS) && af32 == (AF))                              \
+        return reinterpret_cast<const void*>(&gemm_f16_nt_kernel_t<TM, KS, AF>);
+static const void* gemm_f16_fn_for(int tm, int ks, bool af32) {
+    GEMM_FN_FOR(64, 32, false) GEMM_FN_FOR(64, 32, true)
+    GEMM_FN_FOR(64, 64, false) GEMM_FN_FOR(64, 64, true)
+    GEMM_FN_FOR(128, 32, false) GEMM_FN_FOR(128, 32, true)
+    GEMM_FN_FOR(128, 64, false) GEMM_FN_FOR(128, 64, true)
+    GEMM_FN_FOR(256, 32, false) GEMM_FN_FOR(256, 32, true)
+    GEMM_FN_FOR(256, 64, false) GEMM_FN_FOR(256, 64, true)
+    return nullptr;
+}
+#undef GEMM_FN_FOR
+
+// The eager opt-in's outcome, for the startup report and the Rust gate that
+// asserts the launcher's >48 KiB instantiations really are admitted.
+static int g_gemm_smem_limit = 0;    // device opt-in limit, queried once
+static int g_gemm_smem_checked = 0;  // cudaFuncSetAttribute calls made
+static int g_gemm_smem_failed = 0;   // ... of which returned an error
+static int g_gemm_smem_skipped = 0;  // needs > limit, deliberately not called
+
+// One-time cudaFuncSetAttribute for dynamic smem above the 48KB static cap.
+// A failed call is named HERE and cleared; it must never latch and resurface
+// as a phantom "kernel launch error" at the next sync (issue #145).
 template <typename K>
 static void gemm_smem_optin(K kernel, size_t bytes) {
     static size_t done = 0;
@@ -5434,47 +5480,111 @@ static void gemm_smem_optin(K kernel, size_t bytes) {
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
         if (e != cudaSuccess) {
             cudaGetLastError(); // do not poison the stream; the launch errors below
-            fprintf(stderr, "minfer/cuda: gemm smem optin %zu B failed: %s\n", bytes,
-                    cudaGetErrorString(e));
+            fprintf(stderr, "minfer/cuda: gemm smem opt-in %zu B failed: %s (%d)\n", bytes,
+                    cudaGetErrorName(e), (int)e);
             return;
         }
         done = bytes;
     }
 }
 
-// Set every prefill-GEMM instantiation's dynamic-smem attribute EAGERLY:
-// the AF32 variants need >48KB, and an attribute set lazily during CUDA
-// graph capture fails silently and poisons the first captured launch.
-extern "C" void gemm_prefill_smem_init() {
+// Set every selectable prefill-GEMM instantiation's dynamic-smem attribute
+// EAGERLY: an attribute set lazily during CUDA graph capture fails, and the
+// >48KB launch then poisons the context (error 700).
+//
+// Every attr call's return value is checked. A request that exceeds the
+// device's own opt-in limit is **skipped without calling** — deliberately, and
+// with the reason stated: the call could only return `cudaErrorInvalidValue`
+// (visible to `compute-sanitizer`), and the instantiation cannot launch on
+// this device at all. The launcher must not select that (tm, ks, af32).
+//
+// Returns the number of failed attribute calls.
+extern "C" int gemm_prefill_smem_init() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(
+        &g_gemm_smem_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    g_gemm_smem_checked = 0;
+    g_gemm_smem_failed = 0;
+    g_gemm_smem_skipped = 0;
     const int tms[3] = {64, 128, 256};
     for (int i = 0; i < 3; i++) {
-        int tm = tms[i], threads = (tm >= 256) ? 512 : 256, nw = threads >> 5;
+        int tm = tms[i];
         for (int ks = 32; ks <= 64; ks += 32) {
-            size_t base = (size_t)(2 * 64 * ks + 2 * tm * ks) * 2 + (size_t)nw * 256 * 4;
-            for (int af32 = 0; af32 <= 1; af32++) {
-                size_t bytes = base + (af32 ? (size_t)2 * 64 * ks * 4 : 0);
-                if (bytes > 48 * 1024) {
-#define OPTIN(TM2, KS2, AF2)                                                       \
-    cudaFuncSetAttribute(gemm_f16_nt_kernel_t<TM2, KS2, AF2>,                      \
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes)
-                    if (tm == 64 && ks == 32 && af32) OPTIN(64, 32, true);
-                    else if (tm == 64 && ks == 32) OPTIN(64, 32, false);
-                    else if (tm == 64 && ks == 64 && af32) OPTIN(64, 64, true);
-                    else if (tm == 64 && ks == 64) OPTIN(64, 64, false);
-                    else if (tm == 128 && ks == 32 && af32) OPTIN(128, 32, true);
-                    else if (tm == 128 && ks == 32) OPTIN(128, 32, false);
-                    else if (tm == 128 && ks == 64 && af32) OPTIN(128, 64, true);
-                    else if (tm == 128 && ks == 64) OPTIN(128, 64, false);
-                    else if (tm == 256 && ks == 32 && af32) OPTIN(256, 32, true);
-                    else if (tm == 256 && ks == 32) OPTIN(256, 32, false);
-                    else if (tm == 256 && ks == 64 && af32) OPTIN(256, 64, true);
-                    else if (tm == 256 && ks == 64) OPTIN(256, 64, false);
-                    cudaGetLastError(); // oversize requests (TM=256+KS=64) are fine to skip
-#undef OPTIN
+            for (int a = 0; a <= 1; a++) {
+                const bool af32 = a != 0;
+                size_t need = gemm_dynamic_smem_bytes(tm, ks, af32);
+                if (need <= 48 * 1024) continue;  // the default cap admits it
+                const void* fn = gemm_f16_fn_for(tm, ks, af32);
+                if (fn == nullptr) continue;  // not compiled in
+                if (need > (size_t)g_gemm_smem_limit) {
+                    g_gemm_smem_skipped++;
+                    fprintf(stderr,
+                            "minfer/cuda: gemm smem opt-in SKIPPED for "
+                            "gemm_f16_nt_kernel_t<%d,%d,%s>: needs %zu B > device "
+                            "cudaDevAttrMaxSharedMemoryPerBlockOptin %d B — this "
+                            "instantiation cannot launch on this device; pick another "
+                            "MINFER_GEMM_TM / MINFER_GEMM_K64 combination\n",
+                            tm, ks, af32 ? "true" : "false", need, g_gemm_smem_limit);
+                    continue;
+                }
+                g_gemm_smem_checked++;
+                cudaError_t e = cudaFuncSetAttribute(
+                    fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need);
+                if (e != cudaSuccess) {
+                    g_gemm_smem_failed++;
+                    fprintf(stderr,
+                            "minfer/cuda: cudaFuncSetAttribute(gemm_f16_nt_kernel_t<%d,%d,%s>, "
+                            "cudaFuncAttributeMaxDynamicSharedMemorySize, %zu B) failed: %s (%d); "
+                            "device opt-in limit %d B\n",
+                            tm, ks, af32 ? "true" : "false", need, cudaGetErrorName(e),
+                            (int)e, g_gemm_smem_limit);
+                    // The report above is the record — clear the latch so the
+                    // failure cannot resurface later as a phantom launch error.
+                    cudaGetLastError();
                 }
             }
         }
     }
+    return g_gemm_smem_failed;
+}
+
+// Introspection for the Rust gate (`cuda_prefill_smem_optin_*` tests) and the
+// startup report. `gemm_smem_need` is the single-source formula; `opted_in`
+// is the device's own answer read back through `cudaFuncGetAttributes`.
+extern "C" int gemm_prefill_smem_checked() { return g_gemm_smem_checked; }
+extern "C" int gemm_prefill_smem_skipped() { return g_gemm_smem_skipped; }
+extern "C" int gemm_prefill_smem_limit() { return g_gemm_smem_limit; }
+extern "C" size_t gemm_smem_need(int tm, int ks, int af32) {
+    return gemm_dynamic_smem_bytes(tm, ks, af32 != 0);
+}
+extern "C" int gemm_smem_opted_in(int tm, int ks, int af32) {
+    const void* fn = gemm_f16_fn_for(tm, ks, af32 != 0);
+    if (fn == nullptr) return 0;
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(&a, fn) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return a.maxDynamicSharedSizeBytes
+                   >= (int)gemm_dynamic_smem_bytes(tm, ks, af32 != 0)
+               ? 1
+               : 0;
+}
+
+// Test injection (issue #145): latch a REAL `cudaErrorInvalidValue` by asking
+// for more dynamic shared memory than the device admits — the exact pre-fix
+// init request — and deliberately NOT clear it, so the Rust gate can prove
+// `CudaState::sync` reports a latched error as latched (and clears it) instead
+// of blaming the kernel that just ran. Never called by production code.
+extern "C" int cuda_test_latch_oversized_smem() {
+    int dev = 0, limit = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaError_t e = cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(&gemm_f16_nt_kernel_t<128, 32, false>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, limit + 4096);
+    return (int)e;  // left latched on purpose
 }
 
 extern "C" {
@@ -5531,7 +5641,12 @@ void launch_gemm_f16(
         const char* e = getenv("MINFER_GEMM_K64");
         ks = (e && atoi(e)) ? 64 : 32;
     }
-    const size_t dyn_smem = (size_t)(2 * 64 * ks + 2 * tm * ks) * 2 + 8 * 256 * 4;
+    // #145: the single-source formula (AF32-aware). The old inline copy dropped
+    // the AF32 f32 mirror, so `launch_gemm_f32a` declared 16384 B less than the
+    // kernel's own `Bs`/`Cs` offsets need at KS=32 — an out-of-declaration
+    // shared-memory access that "worked" only because the block's smem happened
+    // to be carved where nothing else wrote.
+    const size_t dyn_smem = gemm_dynamic_smem_bytes(tm, ks, af32);
 #define GEMM_LAUNCH(TM_, KS_)                                                      \
     do {                                                                           \
         dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_);                           \
