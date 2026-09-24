@@ -114,6 +114,22 @@ pub fn run(
     let n_ctx_slot = n_ctx / n_slots.max(1);
     let metrics = Arc::new(ServerMetrics::new());
 
+    // F7 (#50): the template is validated before the worker starts, so an
+    // unrenderable one refuses to serve instead of 500-ing per request. A GGUF
+    // with no template at all still uses ChatML, and says so once.
+    let template = chat_template_from_gguf(&gguf.parts[0].data);
+    match template.as_deref() {
+        Some(t) => {
+            if let Err(e) = crate::template::validate(t) {
+                eprintln!("Error: {}", e.message());
+                return;
+            }
+        }
+        None => eprintln!(
+            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+        ),
+    }
+
     // F8: a completion signal, so `run` can wait for the worker *boundedly* after
     // a clean drain instead of joining it (see `serve_with_shutdown`).
     let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel::<()>();
@@ -136,7 +152,6 @@ pub fn run(
         let _ = worker_done_tx.send(());
     });
 
-    let template = chat_template_from_gguf(&gguf.parts[0].data);
     let model_name = gguf
         .parts
         .first()
@@ -425,12 +440,17 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         .iter()
         .map(|m| (m.role.clone(), m.content.clone()))
         .collect();
-    let prompt = crate::template::render_messages(
-        state.chat_template.as_deref().unwrap_or(""),
+    let prompt = match crate::template::render_messages_opt(
+        state.chat_template.as_deref(),
         &messages,
         true,
         &bos,
-    );
+    ) {
+        Ok(p) => p,
+        // F7 (#50): a template refusal is a client-visible error naming the
+        // construct; the startup gate above means this is a backstop.
+        Err(e) => return error_response(&ApiError::invalid_request(e.message())),
+    };
     let input_ids = state.tokenizer.encode(&prompt);
     if input_ids.is_empty() {
         return error_response(&ApiError::invalid_request(

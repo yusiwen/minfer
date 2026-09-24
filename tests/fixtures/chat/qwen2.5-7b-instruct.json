@@ -1,0 +1,143 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "revision": "a09a35458c702b33eeacc393d103063234e8bc28",
+  "gguf": "~/.cache/minfer/models/hf/Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+  "pre": "qwen2",
+  "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f",
+  "gguf_template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4",
+  "template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n",
+  "bos_token": null,
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 AutoTokenizer.apply_chat_template(tokenize=False)",
+    "template_source": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/raw/a09a35458c702b33eeacc393d103063234e8bc28/tokenizer_config.json",
+    "command": "/tmp/f7-venv/bin/python /tmp/f7-make-fixtures.py",
+    "date": "2026-09-24"
+  },
+  "cases": [
+    {
+      "name": "single_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "system_and_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "Name three prime numbers."
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nName three prime numbers.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        },
+        {
+          "role": "assistant",
+          "content": "Hello! How can I help?"
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "multi_turn_no_generation_prompt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        },
+        {
+          "role": "assistant",
+          "content": "Hello!"
+        },
+        {
+          "role": "user",
+          "content": "Still there?"
+        }
+      ],
+      "add_generation_prompt": false,
+      "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nStill there?<|im_end|>\n"
+    },
+    {
+      "name": "unicode_and_newlines",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are 有用. Répondez en français."
+        },
+        {
+          "role": "user",
+          "content": "第一行\n第二行\n\n  indented  \n\tTabbed\ttab"
+        },
+        {
+          "role": "assistant",
+          "content": "café ☕ — naïve façade"
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>system\nYou are 有用. Répondez en français.<|im_end|>\n<|im_start|>user\n第一行\n第二行\n\n  indented  \n\tTabbed\ttab<|im_end|>\n<|im_start|>assistant\ncafé ☕ — naïve façade<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "reasoning_assistant_replay",
+      "messages": [
+        {
+          "role": "user",
+          "content": "How many r's are in strawberry?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\n\n  Let me count: s-t-r-a-w-b-e-r-r-y → r at 3, 8 and 9.\n\n</think>\n\n\nThere are three r's in \"strawberry\"."
+        }
+      ],
+      "add_generation_prompt": false,
+      "expected": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHow many r's are in strawberry?<|im_end|>\n<|im_start|>assistant\n<think>\n\n  Let me count: s-t-r-a-w-b-e-r-r-y → r at 3, 8 and 9.\n\n</think>\n\n\nThere are three r's in \"strawberry\".<|im_end|>\n"
+    },
+    {
+      "name": "reasoning_assistant_turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "How many r's are in strawberry?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nLet me count: s-t-r-a-w-b-e-r-r-y → r at 3, 8 and 9.\n</think>\n\nThere are three r's in \"strawberry\"."
+        },
+        {
+          "role": "user",
+          "content": "Are you sure?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "expected": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHow many r's are in strawberry?<|im_end|>\n<|im_start|>assistant\n<think>\nLet me count: s-t-r-a-w-b-e-r-r-y → r at 3, 8 and 9.\n</think>\n\nThere are three r's in \"strawberry\".<|im_end|>\n<|im_start|>user\nAre you sure?<|im_end|>\n<|im_start|>assistant\n"
+    }
+  ]
+}

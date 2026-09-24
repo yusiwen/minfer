@@ -1120,7 +1120,7 @@ mod tests {
         // not size its KV region for `q8_0` (the collateral #122 recorded, whose
         // mechanism is #99).
         let _format = KvFormatGuard::new();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let n_ctx = 256;
         let steps = 8;
         let ids = tok.encode("The capital of France is");
@@ -1330,7 +1330,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let backend = match model.device() {
             Device::Cpu => Backend::CPU,
             Device::Metal => Backend::Metal,
@@ -1513,7 +1513,7 @@ mod tests {
             mixed.offload.device_bytes
         );
 
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         let n = ids.len();
         let n_ctx = 256;
@@ -1686,7 +1686,7 @@ mod tests {
         eprintln!("[e5-s2] {report}");
 
         // It runs, and its greedy tokens match the all-CPU run (device logits differ by design).
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         let n = ids.len();
         let n_ctx = 256;
@@ -1832,7 +1832,7 @@ mod tests {
         // the parity test below).
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let long = tok.encode("The capital of France is Paris and the capital of Japan is");
@@ -1911,7 +1911,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let prompt: Vec<u32> =
@@ -1972,7 +1972,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let nv = model.n_vocab();
@@ -2121,7 +2121,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let full = tok.encode("The capital of France is");
         let n_ctx = 256;
 
@@ -2257,7 +2257,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         let n = ids.len();
         let n_ctx = 256;
@@ -2461,7 +2461,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let nv = model.n_vocab();
@@ -2646,7 +2646,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let nv = model.n_vocab();
@@ -2785,7 +2785,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let nv = model.n_vocab();
@@ -2901,7 +2901,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         let n_ctx = 256;
         let a = tok.encode("The capital of France is Paris and");
@@ -3131,7 +3131,7 @@ mod tests {
             .downcast_ref::<Qwen2Model>()
             .expect("qwen2 model");
         let ctx = &gguf.parts[0].ctx;
-        let tok = crate::tokenizer::Tokenizer::load(ctx);
+        let tok = crate::tokenizer::Tokenizer::load(ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         assert!(!ids.is_empty());
         let positions: Vec<usize> = (0..ids.len()).collect();
@@ -3268,7 +3268,8 @@ mod tests {
             // were allocated under the earlier decision).
             #[cfg(feature = "cuda")]
             let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-            let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+            let tok =
+                crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
             let ids = tok.encode("The capital of France is");
             let positions: Vec<usize> = (0..ids.len()).collect();
 
@@ -3581,7 +3582,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Qwen2Model>()
             .expect("qwen2 model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is Paris and");
         let nt = ids.len();
         assert!(nt > 2, "prompt too short");
@@ -3694,7 +3695,7 @@ mod tail_tests {
         #[cfg(feature = "cuda")]
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
         let nt = ids.len();
         let nv = model.n_vocab();
@@ -4184,7 +4185,8 @@ mod tail_tests {
             #[cfg(feature = "cuda")]
             let _model_load_guard = crate::cuda::CudaState::model_load_guard();
             let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
-            let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+            let tok =
+                crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
             let ids = tok.encode("The capital of France is");
             let nv = model.n_vocab();
             let model: &dyn ModelDef = q2;
@@ -4229,7 +4231,8 @@ mod tail_tests {
                 let model7 = crate::models::load_model(&gguf7).expect("load 7B model");
                 let q7: &Qwen2Model = model7.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
                 let m7: &dyn ModelDef = q7;
-                let tok7 = crate::tokenizer::Tokenizer::load(&gguf7.parts[0].ctx);
+                let tok7 =
+                    crate::tokenizer::Tokenizer::load(&gguf7.parts[0].ctx).expect("tokenizer load");
                 let ids7 = tok7.encode("Hello!");
                 let nv7 = model7.n_vocab();
 
@@ -4397,7 +4400,7 @@ mod tail_tests {
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
         let ctx = &gguf.parts[0].ctx;
-        let tok = crate::tokenizer::Tokenizer::load(ctx);
+        let tok = crate::tokenizer::Tokenizer::load(ctx).expect("tokenizer load");
         let spec = crate::conversation::ConversationSpec {
             template: None, // ChatML fallback (Qwen2's native style)
             bos_text: String::new(),
@@ -4492,7 +4495,9 @@ mod tail_tests {
         let hist = conv_a.messages_to_json();
         let msgs =
             crate::conversation::Conversation::messages_from_json(&hist).expect("history json");
-        conv_b.load_history(msgs, &tok, &mut engine_b);
+        conv_b
+            .load_history(msgs, &tok, &mut engine_b)
+            .expect("load history");
         let mut out3 = Vec::new();
         let mut emit3 = |b: &[u8]| out3.extend_from_slice(b);
         let _r3 = conv_b

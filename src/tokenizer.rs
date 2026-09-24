@@ -2,7 +2,225 @@
 // Loads tokens, scores, types, and BPE merges directly from GGUF metadata
 
 use crate::gguf::{GgufContext, GgufType};
+use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Pre-tokenization (F7, #50)
+//
+// The rule set is selected by `tokenizer.ggml.pre` and each supported rule is a
+// hand-written splitter, a port of llama.cpp's `unicode_regex_split_custom_*`.
+// Hand-written rather than a `regex` crate pattern because the Rust `regex`
+// crate has no lookahead and `\s+(?!\S)` is load-bearing for whitespace runs.
+// The rules tile the input exactly (every byte belongs to one piece); the
+// committed fixtures under tests/fixtures/tokenizer/split_*.json hold the
+// reference splits produced by CPython `regex` from the model's own
+// `tokenizer.json` pattern.
+// ---------------------------------------------------------------------------
+
+/// `^\p{L}$` etc. on one codepoint: the `regex` crate implements UTS#18 general
+/// categories, the same sets the HF `tokenizers` `Split` patterns use.
+fn unicode_class_is(cache: &'static OnceLock<Regex>, pattern: &str, c: char) -> bool {
+    let re = cache.get_or_init(|| Regex::new(pattern).expect("static Unicode class pattern"));
+    let mut buf = [0u8; 4];
+    re.is_match(c.encode_utf8(&mut buf))
+}
+
+fn is_letter(c: char) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    unicode_class_is(&R, r"^\p{L}$", c)
+}
+
+fn is_number(c: char) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    unicode_class_is(&R, r"^\p{N}$", c)
+}
+
+fn is_accent_mark(c: char) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    unicode_class_is(&R, r"^\p{M}$", c)
+}
+
+/// A byte-level BPE pre-tokenizer rule, selected by `tokenizer.ggml.pre`.
+///
+/// An unsupported value (including a missing key) is a refused load, never a
+/// guessed split — see [`PreTokenizer::from_gguf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreTokenizer {
+    /// `qwen2` (aliases: `deepseek-r1-qwen`): Qwen2 / Qwen2.5 / Qwen3.
+    Qwen2,
+    /// `qwen35`: Qwen3.5 — letter runs also consume Unicode combining marks.
+    Qwen35,
+}
+
+impl PreTokenizer {
+    /// Resolve `tokenizer.ggml.pre`. Unknown and missing values are refused.
+    pub fn from_gguf(pre: Option<&str>) -> Result<Self, String> {
+        match pre {
+            Some("qwen2") | Some("deepseek-r1-qwen") => Ok(Self::Qwen2),
+            Some("qwen35") => Ok(Self::Qwen35),
+            Some(other) => Err(format!(
+                "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
+                 pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"). \
+                 Refusing to tokenize rather than split with the wrong rule."
+            )),
+            None => Err(
+                "tokenizer.ggml.pre is missing, so the pre-tokenization rule is unknown; minfer \
+                 refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\")"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The `tokenizer.ggml.pre` spelling this rule was selected from.
+    pub fn gguf_name(self) -> &'static str {
+        match self {
+            Self::Qwen2 => "qwen2",
+            Self::Qwen35 => "qwen35",
+        }
+    }
+
+    fn include_marks(self) -> bool {
+        matches!(self, Self::Qwen35)
+    }
+
+    /// Split `text` into pre-tokenization pieces. The returned slices are in
+    /// order and tile `text` exactly (concatenating them reproduces the input).
+    ///
+    /// This is the Qwen2 pattern
+    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+    /// (Qwen3.5 replaces `\p{L}` with `[\p{L}\p{M}]`), implemented as a scan
+    /// rather than a `regex` pattern because the crate has no lookahead.
+    pub fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+        let marks = self.include_marks();
+        let word = |c: char| is_letter(c) || (marks && is_accent_mark(c));
+        let symbol = |c: char| {
+            !c.is_whitespace() && !is_letter(c) && !is_number(c) && !(marks && is_accent_mark(c))
+        };
+
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let n = chars.len();
+        let cpt = |i: usize| -> Option<char> { chars.get(i).map(|&(_, c)| c) };
+        let byte_of = |i: usize| -> usize { chars.get(i).map(|&(b, _)| b).unwrap_or(text.len()) };
+
+        let mut out: Vec<&'a str> = Vec::new();
+        let mut prev = 0usize; // byte offset where the pending piece starts
+        let mut pos = 0usize; // char index of the scan head
+        macro_rules! emit {
+            ($end:expr) => {{
+                let e = byte_of($end);
+                if e > prev {
+                    out.push(&text[prev..e]);
+                }
+                prev = e;
+            }};
+        }
+
+        while pos < n {
+            let c = chars[pos].1;
+
+            // (?i:'s|'t|'re|'ve|'m|'ll|'d) — case-insensitive contraction.
+            if c == '\'' {
+                if let Some(c1) = cpt(pos + 1) {
+                    let l1 = c1.to_ascii_lowercase();
+                    if matches!(l1, 's' | 't' | 'm' | 'd') {
+                        pos += 2;
+                        emit!(pos);
+                        continue;
+                    }
+                    if let Some(c2) = cpt(pos + 2) {
+                        let l2 = c2.to_ascii_lowercase();
+                        if (l1 == 'r' && l2 == 'e')
+                            || (l1 == 'v' && l2 == 'e')
+                            || (l1 == 'l' && l2 == 'l')
+                        {
+                            pos += 3;
+                            emit!(pos);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+            if c != '\r' && c != '\n' && !is_number(c) {
+                let next_is_word = cpt(pos + 1).map(word).unwrap_or(false);
+                if word(c) || next_is_word {
+                    pos += 1;
+                    while pos < n && word(chars[pos].1) {
+                        pos += 1;
+                    }
+                    emit!(pos);
+                    continue;
+                }
+            }
+
+            // \p{N}
+            if is_number(c) {
+                pos += 1;
+                emit!(pos);
+                continue;
+            }
+
+            // <space>?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+            let next = if c == ' ' { cpt(pos + 1) } else { Some(c) };
+            if next.map(symbol).unwrap_or(false) {
+                if c == ' ' {
+                    pos += 1;
+                }
+                while pos < n && symbol(chars[pos].1) {
+                    pos += 1;
+                }
+                while pos < n && (chars[pos].1 == '\r' || chars[pos].1 == '\n') {
+                    pos += 1;
+                }
+                emit!(pos);
+                continue;
+            }
+
+            // \s*[\r\n]+
+            let mut num_ws = 0usize;
+            let mut last_end_r_or_n = 0usize;
+            while let Some(wc) = cpt(pos + num_ws) {
+                if !wc.is_whitespace() {
+                    break;
+                }
+                if wc == '\r' || wc == '\n' {
+                    last_end_r_or_n = pos + num_ws + 1;
+                }
+                num_ws += 1;
+            }
+            if last_end_r_or_n > 0 {
+                pos = last_end_r_or_n;
+                emit!(pos);
+                continue;
+            }
+
+            // \s+(?!\S)
+            if num_ws > 1 && cpt(pos + num_ws).is_some() {
+                pos += num_ws - 1;
+                emit!(pos);
+                continue;
+            }
+
+            // \s+
+            if num_ws > 0 {
+                pos += num_ws;
+                emit!(pos);
+                continue;
+            }
+
+            // No alternative matched: emit the single codepoint.
+            pos += 1;
+            emit!(pos);
+        }
+        if prev < text.len() {
+            out.push(&text[prev..]);
+        }
+        out
+    }
+}
 
 /// Build byte-to-unicode mapping (GPT-2 style).
 fn build_byte_to_unicode() -> HashMap<u8, char> {
@@ -61,6 +279,8 @@ pub struct Tokenizer {
     unicode_to_byte: HashMap<char, u8>,
     #[allow(dead_code)]
     pub special_tokens: HashMap<String, u32>,
+    /// The pre-tokenization rule selected from `tokenizer.ggml.pre` (F7).
+    pub pre: PreTokenizer,
     /// Special tokens grouped by first char, longest-first within a group.
     /// Built from `special_tokens` (GGUF type 3/4) plus the hardcoded
     /// `<|im_start|>` / `<|im_end|>` / EOS fallbacks, so models whose
@@ -96,6 +316,7 @@ impl Tokenizer {
             byte_to_unicode: HashMap::new(),
             unicode_to_byte: HashMap::new(),
             special_tokens: HashMap::new(),
+            pre: PreTokenizer::Qwen2,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -105,7 +326,16 @@ impl Tokenizer {
     }
 
     /// Load tokenizer from a GgufContext (re-parses metadata only, no tensor data).
-    pub fn load(gguf: &GgufContext) -> Self {
+    ///
+    /// Refuses loudly (returns `Err`) when the metadata describes a tokenizer
+    /// this engine cannot reproduce byte for byte:
+    ///   * `tokenizer.ggml.model` present and not `gpt2` (only byte-level BPE);
+    ///   * `tokenizer.ggml.pre` missing or unsupported (see [`PreTokenizer`]);
+    ///   * no merges (a byte-level BPE without ranks would silently degrade to
+    ///     per-byte splits);
+    ///   * a vocabulary that is not byte-level complete (the byte fallback in
+    ///     [`Tokenizer::bpe_encode`] would otherwise drop bytes silently).
+    pub fn load(gguf: &GgufContext) -> Result<Self, String> {
         // Load token strings
         let mut id_to_token: Vec<String> = Vec::new();
         let mut id_to_score: Vec<f32> = Vec::new();
@@ -204,7 +434,40 @@ impl Tokenizer {
             group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         }
 
-        Tokenizer {
+        // F7: the pre-tokenization rule must be one this engine implements.
+        let model = Self::get_gguf_str(gguf, "tokenizer.ggml.model");
+        if let Some(model) = model.as_deref() {
+            if model != "gpt2" {
+                return Err(format!(
+                    "tokenizer.ggml.model = \"{model}\" is not a byte-level BPE; minfer's \
+                     tokenizer implements byte-level BPE only"
+                ));
+            }
+        }
+        let pre =
+            PreTokenizer::from_gguf(Self::get_gguf_str(gguf, "tokenizer.ggml.pre").as_deref())?;
+        if merges.is_empty() {
+            return Err(
+                "tokenizer.ggml.merges is empty; minfer refuses to run a byte-level BPE with no \
+                 merge ranks (every piece would silently degrade to single bytes)"
+                    .to_string(),
+            );
+        }
+        // The byte fallback is exact only when every byte has a token. Qwen's
+        // vocabularies have all 256; a vocabulary that does not is a load error
+        // rather than a lossy fallback.
+        let missing: Vec<u8> = (0u8..=255)
+            .filter(|b| !vocab.contains_key(&byte_to_unicode[b].to_string()))
+            .collect();
+        if let Some(first) = missing.first() {
+            return Err(format!(
+                "vocabulary is not byte-level complete: {} of 256 byte tokens are missing \
+                 (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
+                missing.len()
+            ));
+        }
+
+        Ok(Tokenizer {
             id_to_token,
             id_to_score,
             id_to_type,
@@ -213,12 +476,21 @@ impl Tokenizer {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens,
+            pre,
             special_by_first,
             bos_token,
             eos_token,
             im_start,
             im_end,
-        }
+        })
+    }
+
+    /// A GGUF metadata string value (F7: `tokenizer.ggml.model` / `.pre`).
+    fn get_gguf_str(gguf: &GgufContext, key: &str) -> Option<String> {
+        gguf.kv
+            .iter()
+            .find(|kv| kv.key == key && kv.type_ == GgufType::String)
+            .map(|kv| kv.get_val_str(0).to_string())
     }
 
     fn get_gguf_u32(gguf: &GgufContext, key: &str) -> Option<u32> {
@@ -240,12 +512,14 @@ impl Tokenizer {
     }
 
     /// BPE encode a single pre-token (already byte-encoded).
+    ///
+    /// The merge loop always starts from single characters. There is deliberately
+    /// **no** "whole piece is in the vocabulary" shortcut: a vocabulary entry is
+    /// not necessarily reachable through merges, and returning it directly gave a
+    /// different — wrong — split (Qwen3.5's `क्` + `ष` merge into a vocab entry
+    /// that has no rank, and transformers splits it). llama.cpp's shortcut is
+    /// gated on `tokenizer_ignore_merges`, which none of the Qwen rules set.
     fn bpe_encode(&self, token: &str) -> Vec<u32> {
-        // If the whole token is in vocab, return it directly
-        if let Some(&id) = self.vocab.get(token) {
-            return vec![id];
-        }
-
         // Split into characters
         let mut word: Vec<String> = token.chars().map(|c| c.to_string()).collect();
 
@@ -274,23 +548,47 @@ impl Tokenizer {
             word.splice(idx..=idx + 1, std::iter::once(merged));
         }
 
-        // Look up each token in vocab
-        word.iter()
-            .map(|w| self.vocab.get(w).copied().unwrap_or(0))
-            .collect()
+        // Look up each merged piece; a piece with no token is emitted byte by
+        // byte (byte-level BPE maps every byte to a vocabulary entry — `load`
+        // refuses a vocabulary where that is not true, so this never drops
+        // bytes silently, unlike the old `unwrap_or(0)`).
+        let mut out = Vec::with_capacity(word.len());
+        for piece in &word {
+            match self.vocab.get(piece) {
+                Some(&id) => out.push(id),
+                None => out.extend(self.byte_fallback(piece)),
+            }
+        }
+        out
     }
 
-    /// GPT-2 regex pre-tokenization → byte-encode → BPE
-    fn encode_bpe(&self, text: &str) -> Vec<u32> {
-        // GPT-2 pre-tokenization regex (from llama-vocab.cpp / gpt2_tokenizer.py)
-        let re = regex::Regex::new(
-            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+"
-        ).expect("Invalid GPT-2 regex");
+    /// One token per byte of a byte-encoded piece.
+    ///
+    /// `Tokenizer::load` verified that every one of the 256 byte tokens exists,
+    /// so a miss here is an invariant violation and aborts with the value —
+    /// the engine never substitutes a wrong id.
+    fn byte_fallback(&self, piece: &str) -> Vec<u32> {
+        let mut out = Vec::with_capacity(piece.len());
+        for c in piece.chars() {
+            let single = c.to_string();
+            match self.vocab.get(&single) {
+                Some(&id) => out.push(id),
+                None => panic!(
+                    "tokenizer invariant violated: no token for byte-encoded character {c:?} \
+                     (U+{:04X}); Tokenizer::load verifies all 256 byte tokens",
+                    c as u32
+                ),
+            }
+        }
+        out
+    }
 
+    /// Pre-tokenize with the rule selected from `tokenizer.ggml.pre`, then
+    /// byte-encode each piece and run BPE on it.
+    fn encode_bpe(&self, text: &str) -> Vec<u32> {
         let mut result = Vec::new();
-        for mat in re.find_iter(text) {
-            let pre_token = mat.as_str();
-            let encoded = byte_encode(pre_token, &self.byte_to_unicode);
+        for piece in self.pre.split(text) {
+            let encoded = byte_encode(piece, &self.byte_to_unicode);
             result.extend(self.bpe_encode(&encoded));
         }
         result
@@ -429,6 +727,16 @@ pub fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    /// Gives a synthetic tokenizer the 256 byte tokens every real byte-level
+    /// BPE vocabulary has (and which `Tokenizer::load` verifies). Without them
+    /// the byte fallback has nothing to emit, which is a load-time refusal in
+    /// production and an invariant violation here.
+    fn fill_byte_tokens(t: &mut Tokenizer) {
+        for (b, c) in t.byte_to_unicode.clone() {
+            t.vocab.entry(c.to_string()).or_insert(1000 + b as u32);
+        }
+    }
+
     /// Rebuilds `special_by_first` the way `load()` does: GGUF special tokens
     /// plus the hardcoded `<|im_start|>` / `<|im_end|>` fallbacks.
     fn rebuild_special_index(t: &mut Tokenizer) {
@@ -462,12 +770,14 @@ mod tests {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens: HashMap::new(),
+            pre: PreTokenizer::Qwen2,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
             im_start: 0,
             im_end: 0,
         };
+        fill_byte_tokens(&mut t);
         rebuild_special_index(&mut t);
         t
     }
@@ -546,6 +856,10 @@ mod tests {
         // Populate the vocab so BPE finds "What" and " is" etc. as whole tokens
         // (the pieces the regex would produce must NOT reassemble the specials).
         // Keys must be byte-encoded like bpe_encode expects ("Ġ" = space, "Ċ" = \n).
+        // The merge ranks matter: the encoder always starts from single
+        // characters (no "whole piece is in the vocab" shortcut), so a synthetic
+        // token that is a whole word must be reachable through merges, exactly
+        // like a real byte-level BPE vocabulary.
         t.vocab.insert("What".into(), 3838);
         t.vocab.insert(byte_encode(" is", &t.byte_to_unicode), 374);
         t.vocab.insert(byte_encode(" ", &t.byte_to_unicode), 220);
@@ -553,6 +867,21 @@ mod tests {
         t.vocab.insert(byte_encode("+", &t.byte_to_unicode), 10);
         t.vocab.insert(byte_encode("?", &t.byte_to_unicode), 30);
         t.vocab.insert(byte_encode("\n", &t.byte_to_unicode), 198);
+        let mut rank = 0usize;
+        let mut add_merges = |t: &mut Tokenizer, word: &str| {
+            let mut left = String::new();
+            for c in word.chars() {
+                let right = c.to_string();
+                if !left.is_empty() {
+                    t.merges.insert((left.clone(), right.clone()), rank);
+                    rank += 1;
+                }
+                left.push(c);
+            }
+        };
+        for word in ["What".to_string(), byte_encode(" is", &t.byte_to_unicode)] {
+            add_merges(&mut t, &word);
+        }
         t
     }
 
@@ -601,8 +930,214 @@ mod tests {
         // <|im_start|>/<|im_end|> fallback must keep working.
         let mut t = test_tokenizer();
         t.vocab.insert("hi".into(), 42);
+        t.merges.insert(("h".into(), "i".into()), 0);
         let ids = t.encode("<|im_start|>hi<|im_end|>");
         // im_start/im_end fall back to 0 (unknown) in this synthetic tokenizer
         assert_eq!(ids, vec![0, 42, 0]);
+    }
+
+    // === F7 (#50) pre-tokenizer rules and byte fallback ======================
+
+    /// Reference splits produced by CPython `regex` from the model's own
+    /// `tokenizer.json` `Split` pattern (see the fixture provenance).
+    const SPLIT_FIXTURES: &[(&str, &str)] = &[
+        (
+            "qwen2",
+            include_str!("../tests/fixtures/tokenizer/split_qwen2.json"),
+        ),
+        (
+            "qwen35",
+            include_str!("../tests/fixtures/tokenizer/split_qwen35.json"),
+        ),
+    ];
+
+    fn pre_of(name: &str) -> PreTokenizer {
+        match name {
+            "qwen2" => PreTokenizer::Qwen2,
+            "qwen35" => PreTokenizer::Qwen35,
+            other => panic!("unknown pre-tokenizer {other}"),
+        }
+    }
+
+    #[test]
+    fn pre_tokenizer_split_matches_the_reference() {
+        for (name, raw) in SPLIT_FIXTURES {
+            let fx: serde_json::Value = serde_json::from_str(raw).expect("split fixture");
+            assert_eq!(fx["pre"].as_str().unwrap(), *name);
+            assert!(
+                fx["provenance"]["reference"]
+                    .as_str()
+                    .unwrap()
+                    .contains("regex"),
+                "{name}: the reference engine must be named"
+            );
+            let pre = pre_of(name);
+            let entries = fx["entries"].as_array().unwrap();
+            assert!(entries.len() >= 45, "{name}: fixture shrank");
+            for e in entries {
+                let text = e["text"].as_str().unwrap();
+                let want: Vec<&str> = e["pieces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.as_str().unwrap())
+                    .collect();
+                let got = pre.split(text);
+                assert_eq!(
+                    got, want,
+                    "{name}: pre-tokenization of {text:?} differs from the reference"
+                );
+                assert_eq!(
+                    got.concat(),
+                    text,
+                    "{name}: pieces must tile the input for {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_tokenizer_selection_refuses_unknown_and_missing() {
+        assert_eq!(
+            PreTokenizer::from_gguf(Some("qwen2")).unwrap(),
+            PreTokenizer::Qwen2
+        );
+        assert_eq!(
+            PreTokenizer::from_gguf(Some("deepseek-r1-qwen")).unwrap(),
+            PreTokenizer::Qwen2
+        );
+        assert_eq!(
+            PreTokenizer::from_gguf(Some("qwen35")).unwrap(),
+            PreTokenizer::Qwen35
+        );
+        let err = PreTokenizer::from_gguf(Some("llama3")).unwrap_err();
+        assert!(
+            err.contains("llama3"),
+            "the refusal must name the value: {err}"
+        );
+        let err = PreTokenizer::from_gguf(None).unwrap_err();
+        assert!(
+            err.contains("missing"),
+            "a missing key must be named as such: {err}"
+        );
+        // Shown by `cargo test -- --nocapture`; this is the user-facing text.
+        eprintln!("refusal (unsupported pre-tokenizer):\n{err}");
+    }
+
+    #[test]
+    fn byte_fallback_emits_one_token_per_byte() {
+        let mut t = test_tokenizer();
+        // A merge rank exists for "a"+"b" but the merged token does not: the
+        // encoder must emit one token per byte. (`Tokenizer::load` guarantees
+        // only the 256 byte tokens, not that every merge result is a token.)
+        t.vocab.clear();
+        fill_byte_tokens(&mut t);
+        t.merges.clear();
+        t.merges.insert(("a".into(), "b".into()), 0);
+        let ids = t.encode_bpe("ab");
+        let want: Vec<u32> = "ab".bytes().map(|b| 1000 + b as u32).collect();
+        assert_eq!(ids, want);
+        assert!(
+            !ids.contains(&0),
+            "byte fallback must not emit id 0: {ids:?}"
+        );
+    }
+
+    // === F7 (#50) token-id equality against the reference tokenizer =========
+
+    const ID_FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "qwen2.5-0.5b-instruct",
+            "~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+            include_str!("../tests/fixtures/tokenizer/ids_qwen2.5-0.5b-instruct.json"),
+        ),
+        (
+            "qwen2.5-7b-instruct",
+            "~/.cache/minfer/models/hf/Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+            include_str!("../tests/fixtures/tokenizer/ids_qwen2.5-7b-instruct.json"),
+        ),
+        (
+            "qwen2.5-14b-instruct",
+            "~/.cache/minfer/models/hf/Qwen/Qwen2.5-14B-Instruct-GGUF/qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf",
+            include_str!("../tests/fixtures/tokenizer/ids_qwen2.5-14b-instruct.json"),
+        ),
+        (
+            "qwen3-0.6b",
+            "~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+            include_str!("../tests/fixtures/tokenizer/ids_qwen3-0.6b.json"),
+        ),
+        (
+            "qwen3.5-0.8b",
+            "~/.cache/minfer/models/hf/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf",
+            include_str!("../tests/fixtures/tokenizer/ids_qwen3.5-0.8b.json"),
+        ),
+    ];
+
+    fn expand_home(path: &str) -> std::path::PathBuf {
+        match path.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var_os("HOME").expect("HOME");
+                std::path::PathBuf::from(home).join(rest)
+            }
+            None => std::path::PathBuf::from(path),
+        }
+    }
+
+    /// The ticket's tokenizer acceptance: byte-for-byte token-id equality with
+    /// the reference over a corpus that exercises the generalized rules. Ignored
+    /// because it needs the cached GGUFs (the committed fixtures, not the models,
+    /// are the reference); run serially:
+    ///   cargo test --release --bin minfer -- --ignored --test-threads=1
+    ///
+    /// The reference per model is named in the fixture: transformers 5.17.0 for
+    /// Qwen2.5/Qwen3 (whose GGUF tokenizer and `tokenizer.json` agree), and
+    /// llama.cpp run on the same GGUF artifact for Qwen3.5 (whose published
+    /// `tokenizer.json` is a different revision than the GGUF).
+    #[test]
+    #[ignore = "requires the cached GGUF models (~/.cache/minfer/models)"]
+    fn token_ids_match_the_reference() {
+        for (slug, path, raw) in ID_FIXTURES {
+            let p = expand_home(path);
+            if !p.exists() {
+                eprintln!("{slug}: {} not cached; skipping", p.display());
+                continue;
+            }
+            let gguf = crate::gguf::load_gguf_model(&p).expect("parse GGUF");
+            let tok = Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+            let fx: serde_json::Value = serde_json::from_str(raw).expect("ids fixture");
+            assert_eq!(
+                fx["pre"].as_str().unwrap(),
+                tok.pre.gguf_name(),
+                "{slug}: fixture pre-tokenizer does not match the GGUF"
+            );
+            let entries = fx["entries"].as_array().unwrap();
+            assert!(entries.len() >= 45, "{slug}: fixture shrank");
+            for e in entries {
+                let text = e["text"].as_str().unwrap();
+                let want: Vec<u32> = e["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u32)
+                    .collect();
+                let got = tok.encode(text);
+                assert_eq!(
+                    got, want,
+                    "{slug}: token ids differ from transformers for {text:?}"
+                );
+            }
+            // The special/added-token requirement, asserted directly: a special
+            // token inside text is one id, never BPE-split.
+            let ids = tok.encode("<|im_start|>hi<|im_end|>");
+            assert_eq!(
+                (ids.first().copied(), ids.last().copied()),
+                (Some(tok.im_start), Some(tok.im_end)),
+                "{slug}: special tokens must survive as single ids: {ids:?}"
+            );
+            eprintln!(
+                "{slug}: {} corpus entries + special tokens match the reference byte for byte",
+                entries.len()
+            );
+        }
     }
 }

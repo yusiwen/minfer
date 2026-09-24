@@ -236,7 +236,13 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
-    let tokenizer = crate::tokenizer::Tokenizer::load(ctx);
+    let tokenizer = match crate::tokenizer::Tokenizer::load(ctx) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
     eprintln!("Model loaded.");
 
     // Backend label from the engine's own availability report (same checks

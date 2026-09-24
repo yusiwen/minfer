@@ -3730,7 +3730,7 @@ mod mmap_align_test {
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
         let q2: &Qwen2Model = model.as_any().downcast_ref::<Qwen2Model>().expect("qwen2");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
         const NT: usize = 35; // the realdata test asserts nt == 35
         let mut ids = tok.encode(

@@ -300,7 +300,8 @@ impl SpecEngine {
         // fails the target's all-or-nothing CUDA check and drops it to CPU.
         let draft = crate::models::load_model_ns(&gguf, "draft.")
             .ok_or_else(|| "spec draft: load_model failed".to_string())?;
-        let dtok = Tokenizer::load(&gguf.parts[0].ctx);
+        let dtok = Tokenizer::load(&gguf.parts[0].ctx)
+            .map_err(|e| format!("spec draft tokenizer: {e}"))?;
         let (tv, dv) = (target_vocab, dtok.vocab_size());
         if tv.abs_diff(dv) > 128 {
             return Err(format!(

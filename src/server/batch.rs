@@ -1665,7 +1665,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let prompt = tok.encode("The capital of France is");
         let n_ctx = prompt.len() + 64;
 
@@ -1710,7 +1710,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         // Long enough that the share has rows worth copying.
         let prompt = tok.encode(
             "You are a helpful assistant. Answer in one short sentence. The capital of France is",
@@ -1909,7 +1909,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode(&"buffalo ".repeat(300));
         let n_ctx = ids.len() + 64;
         assert!(
@@ -1973,7 +1973,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let texts = [
             "The capital of France is",
             "The capital of Japan is",
@@ -1994,15 +1994,17 @@ mod tests {
                     // tokenized. `model.format_chat` is a *different* path and
                     // produced a 13-token prompt where the server's is 34 — which
                     // is why the first bisect compared unequal inputs.
-                    let tpl = super::super::chat_template_from_gguf(&gguf.parts[0].data)
-                        .unwrap_or_default();
+                    let tpl = super::super::chat_template_from_gguf(&gguf.parts[0].data);
                     let msgs = vec![("user".to_string(), Some(p.to_string()))];
-                    tok.encode(&crate::template::render_messages(
-                        &tpl,
-                        &msgs,
-                        true,
-                        &tok.bos_text(),
-                    ))
+                    tok.encode(
+                        &crate::template::render_messages_opt(
+                            tpl.as_deref(),
+                            &msgs,
+                            true,
+                            &tok.bos_text(),
+                        )
+                        .expect("chat template renders"),
+                    )
                 } else {
                     tok.encode(p)
                 }
@@ -2234,7 +2236,7 @@ mod tests {
         let model = crate::models::load_model(&gguf).expect("load model");
         #[cfg(feature = "cuda")]
         let _guard = crate::cuda::CudaState::model_load_guard();
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let n_ctx = 512usize;
         let n_slots = 2usize;
         let file = std::env::temp_dir().join(format!(
@@ -2402,7 +2404,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode(&"buffalo ".repeat(96));
         let chunk = (ids.len() / 4).max(8);
         let n_ctx = ids.len() + 64;
@@ -2534,7 +2536,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode(&"buffalo ".repeat(96));
         let chunk = (ids.len() / 4).max(8);
         let n_ctx = ids.len() + 64;
@@ -2588,7 +2590,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         // Both prompts are repeats: neither is expected to EOG, which keeps the
         // scenario about scheduling rather than about the model's mood.
         let short = tok.encode(&"buffalo ".repeat(48));
@@ -2697,7 +2699,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let metric_source = |path: &str| -> Vec<u32> { tok.encode(path) };
 
         // --- round 1: two jobs, two slots, observed while running ---------------
@@ -2822,7 +2824,7 @@ mod tests {
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
         let model = crate::models::load_model(&gguf).expect("load model");
-        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let n_slots = 2usize;
         let n_ctx = 128usize;
         let mut engine = BatchEngine::new(&*model, n_slots, n_ctx).expect("engine");
