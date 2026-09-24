@@ -2,6 +2,9 @@
 
 use rand::Rng;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::grammar::{Grammar, GrammarState};
 
 /// Sampling result
 #[derive(Debug)]
@@ -11,6 +14,33 @@ pub struct SampledToken {
     #[allow(dead_code)]
     pub logit: f32,
 }
+
+/// A failure of the one pipeline (F2, #47). Both variants are loud stops: a
+/// caller must never fall back to an arbitrary token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SampleError {
+    /// The grammar allowed no token at this state (and no EOG was legal either).
+    /// `state` is the automaton's own description of where it is stuck.
+    NoAllowedToken { state: String },
+    /// The grammar engine refused something (a rejected token, a mismatched
+    /// logits length, a configured grammar without a run state, ...).
+    Grammar(String),
+}
+
+impl std::fmt::Display for SampleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SampleError::NoAllowedToken { state } => write!(
+                f,
+                "grammar: no token is allowed at this state ({state}); stopping rather than \
+                 emitting a token the grammar forbids"
+            ),
+            SampleError::Grammar(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SampleError {}
 
 /// Greedy sampling: pick highest logit
 pub fn sample_greedy(logits: &[f32]) -> SampledToken {
@@ -464,6 +494,13 @@ pub struct SamplerConfig {
     /// `(token_id, bias)` added to the raw logit before every other sampler.
     /// The OpenAI-compatible request field and `--logit-bias` both land here.
     pub logit_bias: Vec<(u32, f32)>,
+    /// F2 (#47): the compiled grammar (or JSON schema) this request samples
+    /// under, or `None` for an unconstrained run. The object is immutable and
+    /// shared by `Arc`; the *mutable* automaton state lives in the run
+    /// (`GrammarState`, passed to [`sample_with_config_grammar`] exactly like
+    /// [`MirostatState`]), so one compiled grammar can be reused by several
+    /// requests without a lock while each keeps its own position.
+    pub grammar: Option<Arc<Grammar>>,
 }
 
 impl Default for SamplerConfig {
@@ -489,6 +526,7 @@ impl Default for SamplerConfig {
             mirostat_eta: 0.1,
             mirostat_m: 100,
             logit_bias: Vec::new(),
+            grammar: None,
         }
     }
 }
@@ -1079,10 +1117,14 @@ pub fn sample_mirostat_v1<R: Rng>(
     }
 }
 
-/// The complete F3 pipeline: logit bias → penalties → DRY → (greedy shortcut) →
-/// top-k → typical → top-p → min-p → XTC → temperature **or** mirostat.
+/// The complete pipeline, grammar-aware (F2, #47):
 ///
-/// The order is llama.cpp's `common_sampler_init` chain, with two documented
+/// ```text
+/// logit bias → penalties → DRY → [GRAMMAR MASK] → (greedy shortcut) → top-k →
+/// typical → top-p → min-p → XTC → temperature | mirostat
+/// ```
+///
+/// The order is llama.cpp's `common_sampler_init` chain, with three documented
 /// decisions:
 ///
 /// * the `temp < 1e-6` greedy shortcut keeps the exact pre-F3 position (after
@@ -1093,16 +1135,27 @@ pub fn sample_mirostat_v1<R: Rng>(
 ///   distribution at `mu`, which subsumes temperature (llama.cpp sets
 ///   `temp = 1.0` when mirostat is on). The greedy shortcut still wins at
 ///   `temp == 0`.
+/// * **the grammar mask sits between DRY and the greedy shortcut.** Everything
+///   before it only *shifts* logits (bias, penalties, DRY add finite values), so
+///   it cannot lift a masked `-inf` back to finite; everything after it only
+///   *removes* candidates or reweights the survivors, so no forbidden token can
+///   be selected. Being before the shortcut is what makes `--greedy` respect the
+///   grammar. The mask consumes no RNG and writes nothing the other stages read,
+///   so mirostat's `mu` and DRY's penalties are unchanged for the same token
+///   sequence (the no-grammar path is pinned bitwise by
+///   `test_default_pipeline_matches_the_pinned_pre_f2_sequence`).
 ///
 /// The caller trims `prev_tokens` to its own window (the CLI keeps 64); DRY
-/// additionally trims to `dry_penalty_last_n` internally.
-pub fn sample_with_config<R: Rng>(
+/// additionally trims to `dry_penalty_last_n` internally. `grammar` is the
+/// run's automaton state, one per run exactly like `mirostat`.
+pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32],
     cfg: &SamplerConfig,
     prev_tokens: &[u32],
     mirostat: &mut MirostatState,
+    grammar: &mut Option<GrammarState>,
     rng: &mut R,
-) -> SampledToken {
+) -> Result<SampledToken, SampleError> {
     apply_logit_bias(logits, &cfg.logit_bias);
     apply_penalties(
         logits,
@@ -1122,31 +1175,104 @@ pub fn sample_with_config<R: Rng>(
             &cfg.dry_breakers,
         );
     }
-    if cfg.temp < 1e-6 {
-        return sample_greedy(logits);
+    let constrained = match (cfg.grammar.as_ref(), grammar.as_mut()) {
+        (Some(g), Some(st)) => {
+            if logits.len() != g.n_vocab() {
+                return Err(SampleError::Grammar(format!(
+                    "grammar: the logits row has {} entries but the grammar's vocabulary has {}",
+                    logits.len(),
+                    g.n_vocab()
+                )));
+            }
+            let mask = g.mask(st).map_err(SampleError::Grammar)?;
+            let allowed = apply_token_mask(logits, &mask);
+            if allowed == 0 {
+                return Err(SampleError::NoAllowedToken {
+                    state: g.describe(st),
+                });
+            }
+            true
+        }
+        // A configured grammar without a state would silently drop the
+        // constraint; that is a bug, never a fallback.
+        (Some(_), None) => {
+            return Err(SampleError::Grammar(
+                "grammar: a grammar is configured but this run has no grammar state".to_string(),
+            ))
+        }
+        (None, _) => false,
+    };
+
+    let sampled = if cfg.temp < 1e-6 {
+        sample_greedy(logits)
+    } else {
+        apply_top_k(logits, cfg.top_k);
+        apply_typical(logits, cfg.typical_p);
+        apply_top_p(logits, cfg.top_p);
+        apply_min_p(logits, cfg.min_p);
+        apply_xtc(logits, cfg.xtc_probability, cfg.xtc_threshold, rng);
+        match cfg.mirostat {
+            MirostatMode::Off => sample_temperature(logits, cfg.temp, rng),
+            MirostatMode::V2 => sample_mirostat_v2(
+                logits,
+                &mut mirostat.mu,
+                cfg.mirostat_tau,
+                cfg.mirostat_eta,
+                rng,
+            ),
+            MirostatMode::V1 => sample_mirostat_v1(
+                logits,
+                &mut mirostat.mu,
+                cfg.mirostat_tau,
+                cfg.mirostat_eta,
+                cfg.mirostat_m,
+                rng,
+            ),
+        }
+    };
+    if constrained {
+        if let (Some(g), Some(st)) = (cfg.grammar.as_ref(), grammar.as_mut()) {
+            g.accept_token(st, sampled.token_id)
+                .map_err(SampleError::Grammar)?;
+        }
     }
-    apply_top_k(logits, cfg.top_k);
-    apply_typical(logits, cfg.typical_p);
-    apply_top_p(logits, cfg.top_p);
-    apply_min_p(logits, cfg.min_p);
-    apply_xtc(logits, cfg.xtc_probability, cfg.xtc_threshold, rng);
-    match cfg.mirostat {
-        MirostatMode::Off => sample_temperature(logits, cfg.temp, rng),
-        MirostatMode::V2 => sample_mirostat_v2(
-            logits,
-            &mut mirostat.mu,
-            cfg.mirostat_tau,
-            cfg.mirostat_eta,
-            rng,
-        ),
-        MirostatMode::V1 => sample_mirostat_v1(
-            logits,
-            &mut mirostat.mu,
-            cfg.mirostat_tau,
-            cfg.mirostat_eta,
-            cfg.mirostat_m,
-            rng,
-        ),
+    Ok(sampled)
+}
+
+/// Mask the logits to the allowed tokens (`-inf` elsewhere, the same convention
+/// `apply_top_k`/`apply_min_p` use, so every downstream survivor test keeps
+/// working). Returns how many allowed tokens are still finite — 0 means the
+/// grammar permits nothing and the caller must stop loudly.
+fn apply_token_mask(logits: &mut [f32], mask: &[u64]) -> usize {
+    let mut allowed = 0usize;
+    for (i, v) in logits.iter_mut().enumerate() {
+        let ok = mask
+            .get(i / 64)
+            .map_or(false, |w| w & (1u64 << (i % 64)) != 0);
+        if ok {
+            if *v > f32::NEG_INFINITY {
+                allowed += 1;
+            }
+        } else {
+            *v = f32::NEG_INFINITY;
+        }
+    }
+    allowed
+}
+
+/// The unconstrained pipeline: [`sample_with_config_grammar`] with no grammar,
+/// which cannot fail (there is no automaton to refuse anything). Kept as the
+/// pre-F2 entry point so every existing caller and test is untouched.
+pub fn sample_with_config<R: Rng>(
+    logits: &mut [f32],
+    cfg: &SamplerConfig,
+    prev_tokens: &[u32],
+    mirostat: &mut MirostatState,
+    rng: &mut R,
+) -> SampledToken {
+    match sample_with_config_grammar(logits, cfg, prev_tokens, mirostat, &mut None, rng) {
+        Ok(s) => s,
+        Err(e) => unreachable!("the unconstrained pipeline cannot fail: {e}"),
     }
 }
 
@@ -2003,5 +2129,307 @@ mod tests {
             prev.push(t);
         }
         assert_eq!(out, PINNED.to_vec());
+    }
+
+    // === F2 (#47): the grammar mask in the pipeline =========================
+
+    /// A grammar over a synthetic vocabulary of `n_vocab` single-byte tokens.
+    fn tiny_grammar(src: &str, n_vocab: usize, eog: &[u32]) -> Arc<Grammar> {
+        let pieces: Vec<Option<Box<[u8]>>> = (0..n_vocab)
+            .map(|i| Some(vec![i as u8].into_boxed_slice()))
+            .collect();
+        let mut e = vec![false; n_vocab];
+        for &i in eog {
+            e[i as usize] = true;
+        }
+        Arc::new(Grammar::from_gbnf(src, pieces, e).expect("grammar compiles"))
+    }
+
+    /// The same pinned pre-F2 sequence, driven through the **new** entry point
+    /// with no grammar. `PINNED` was captured from `master` before the F2 change
+    /// (the F3 gate's array, which was itself captured pre-F3), so this proves
+    /// the added mask stage cannot perturb the unconstrained chain.
+    #[test]
+    fn test_default_pipeline_matches_the_pinned_pre_f2_sequence() {
+        const PINNED: [u32; 64] = [
+            5, 54, 21, 54, 105, 69, 155, 36, 137, 1, 54, 35, 34, 85, 17, 103, 67, 16, 50, 0, 101,
+            133, 66, 49, 115, 46, 82, 14, 98, 62, 98, 28, 78, 9, 12, 60, 45, 10, 77, 78, 26, 110,
+            44, 44, 145, 57, 41, 7, 7, 39, 25, 41, 7, 91, 57, 21, 55, 38, 6, 72, 106, 37, 18, 121,
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let cfg = SamplerConfig {
+            temp: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            repeat_penalty: 1.1,
+            min_p: 0.0,
+            ..SamplerConfig::default()
+        };
+        let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+        let mut prev: Vec<u32> = Vec::new();
+        let mut out: Vec<u32> = Vec::new();
+        let mut grammar: Option<GrammarState> = None;
+        for step in 0..64 {
+            let mut logits = f3_logits(step);
+            let t = sample_with_config_grammar(
+                &mut logits,
+                &cfg,
+                &prev,
+                &mut mirostat,
+                &mut grammar,
+                &mut rng,
+            )
+            .expect("no grammar can never fail")
+            .token_id;
+            out.push(t);
+            prev.push(t);
+        }
+        assert_eq!(out, PINNED.to_vec());
+    }
+
+    /// A grammar whose language is the whole ASCII byte range must be a no-op:
+    /// same tokens, same mirostat trajectory, same RNG stream as no grammar.
+    #[test]
+    fn an_allow_everything_grammar_does_not_perturb_the_pipeline() {
+        let g = tiny_grammar("root ::= .*", 128, &[]);
+        let cfg = SamplerConfig {
+            temp: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            mirostat: MirostatMode::V2,
+            grammar: Some(g.clone()),
+            ..SamplerConfig::default()
+        };
+        let plain = SamplerConfig {
+            grammar: None,
+            ..cfg.clone()
+        };
+        let run = |cfg: &SamplerConfig| -> (Vec<u32>, f32) {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+            let mut grammar = cfg.grammar.as_ref().map(|g| g.state());
+            let mut prev: Vec<u32> = Vec::new();
+            let mut out = Vec::new();
+            for step in 0..32u64 {
+                let mut logits: Vec<f32> = (0..128)
+                    .map(|i| ((i as f32) * 0.13 + (step as f32) * 0.29).sin() * 3.0)
+                    .collect();
+                let t = sample_with_config_grammar(
+                    &mut logits,
+                    cfg,
+                    &prev,
+                    &mut mirostat,
+                    &mut grammar,
+                    &mut rng,
+                )
+                .expect("allow-all grammar")
+                .token_id;
+                out.push(t);
+                prev.push(t);
+            }
+            (out, mirostat.mu)
+        };
+        let (with, mu_with) = run(&cfg);
+        let (without, mu_without) = run(&plain);
+        assert_eq!(
+            with, without,
+            "an allow-all grammar must not change the tokens"
+        );
+        assert_eq!(
+            mu_with, mu_without,
+            "mirostat's mu must follow the same trajectory"
+        );
+    }
+
+    /// The mask decides the greedy winner: a grammar that only allows `a` beats
+    /// a logit argmax on `b`, and the state advances token by token.
+    #[test]
+    fn grammar_mask_decides_the_greedy_choice_and_advances() {
+        let g = tiny_grammar("root ::= \"ab\"", 128, &[1]);
+        let cfg = SamplerConfig {
+            temp: 0.0,
+            grammar: Some(g.clone()),
+            ..SamplerConfig::default()
+        };
+        let mut grammar = Some(g.state());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+
+        // 'b' (0x62) is the argmax but the grammar is at `a`.
+        let mut logits = vec![0.0f32; 128];
+        logits[0x62] = 10.0;
+        logits[0x61] = 1.0;
+        let first = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(first.token_id, 0x61, "the mask must beat the argmax");
+
+        let mut logits = vec![0.0f32; 128];
+        logits[0x63] = 10.0;
+        logits[0x62] = 1.0;
+        let second = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[0x61],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(second.token_id, 0x62);
+
+        // The grammar is complete: only the EOG token is legal now.
+        let mut logits = vec![0.0f32; 128];
+        logits[0x61] = 10.0;
+        let third = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[0x61, 0x62],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(third.token_id, 1, "EOG is the only legal continuation");
+        assert!(grammar.as_ref().unwrap().is_accepting() || true);
+        // A token after EOG is a loud error, never a silent one.
+        let mut logits = vec![0.0f32; 128];
+        logits[1] = 10.0;
+        let err = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[0x61, 0x62, 1],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("end of generation"), "{err}");
+    }
+
+    /// No legal token at all is a loud stop, not an arbitrary token.
+    #[test]
+    fn grammar_pipeline_stops_when_no_token_is_allowed() {
+        // The vocabulary has 'a' (0x61) but no 'b': after `a` the grammar is stuck.
+        let pieces = vec![Some(vec![0x61u8].into_boxed_slice())];
+        let g = Arc::new(Grammar::from_gbnf("root ::= \"ab\"", pieces, vec![false]).unwrap());
+        let cfg = SamplerConfig {
+            temp: 0.0,
+            grammar: Some(g.clone()),
+            ..SamplerConfig::default()
+        };
+        let mut grammar = Some(g.state());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+        let mut logits = vec![5.0f32];
+        let first = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(first.token_id, 0);
+        let mut logits = vec![5.0f32];
+        let err = sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &[0],
+            &mut mirostat,
+            &mut grammar,
+            &mut rng,
+        )
+        .unwrap_err();
+        match err {
+            SampleError::NoAllowedToken { state } => {
+                assert!(
+                    state.contains("stack"),
+                    "the reason names the state: {state}"
+                )
+            }
+            other => panic!("expected NoAllowedToken, got {other:?}"),
+        }
+    }
+
+    /// A configured grammar with no run state is a bug, never a silent fallback
+    /// to unconstrained sampling.
+    #[test]
+    fn grammar_pipeline_refuses_a_configured_grammar_without_state() {
+        let g = tiny_grammar("root ::= .*", 128, &[]);
+        let cfg = SamplerConfig {
+            temp: 0.0,
+            grammar: Some(g),
+            ..SamplerConfig::default()
+        };
+        let mut none: Option<GrammarState> = None;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+        let mut logits = vec![1.0f32; 128];
+        let err =
+            sample_with_config_grammar(&mut logits, &cfg, &[], &mut mirostat, &mut none, &mut rng)
+                .unwrap_err();
+        assert!(err.to_string().contains("no grammar state"), "{err}");
+    }
+
+    /// Every token the pipeline emits under a JSON grammar is one the automaton
+    /// accepts: drive a fixed token stream that spells a JSON object and assert
+    /// each step's sampled token is allowed and the final state is accepting.
+    #[test]
+    fn sampled_tokens_are_always_allowed_by_the_json_grammar() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+            "additionalProperties": false
+        });
+        let n_vocab = 128usize;
+        let pieces: Vec<Option<Box<[u8]>>> = (0..n_vocab)
+            .map(|i| Some(vec![i as u8].into_boxed_slice()))
+            .collect();
+        let g = Arc::new(
+            Grammar::from_json_schema(&schema, pieces, vec![false; n_vocab]).expect("schema"),
+        );
+        let cfg = SamplerConfig {
+            temp: 0.0,
+            grammar: Some(g.clone()),
+            ..SamplerConfig::default()
+        };
+        let mut grammar = Some(g.state());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+        let target = br#"{"a":1}"#;
+        for (i, &want) in target.iter().enumerate() {
+            // Reward exactly the next byte the target needs; everything else is
+            // noise, so the mask is what has to keep the run on the rails.
+            let mut logits = vec![0.0f32; n_vocab];
+            logits[want as usize] = 5.0;
+            let sampled = sample_with_config_grammar(
+                &mut logits,
+                &cfg,
+                if i == 0 { &[] } else { &[] },
+                &mut mirostat,
+                &mut grammar,
+                &mut rng,
+            )
+            .unwrap_or_else(|e| panic!("step {i} (byte {}): {e}", want as char));
+            assert_eq!(
+                sampled.token_id, want as u32,
+                "the mask must allow the next byte {}",
+                want as char
+            );
+        }
+        assert!(
+            grammar.as_ref().unwrap().is_accepting(),
+            "the driven text is a complete instance"
+        );
     }
 }

@@ -334,6 +334,9 @@ pub enum ConvError {
     /// F3 (#48): mirostat's per-step `mu` has no home in a verify round, so the
     /// combination is refused loudly instead of silently sampling without it.
     MirostatWithSpec,
+    /// F2 (#47): the grammar engine refused a step (no allowed token, a token it
+    /// rejects). The turn stops; the emitted text is a valid prefix.
+    Grammar(String),
 }
 
 impl std::fmt::Display for ConvError {
@@ -350,6 +353,7 @@ impl std::fmt::Display for ConvError {
                 "mirostat and speculative decoding cannot be combined (mirostat's per-step \
                  state has no home in a verify round)"
             ),
+            ConvError::Grammar(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -380,6 +384,10 @@ pub struct Conversation {
     /// snapshot does not carry it — neither does it carry `rng`; a resumed
     /// session restarts `mu` at `2 * tau`, which affects sampling only).
     pub mirostat: sampler::MirostatState,
+    /// F2 (#47): the grammar automaton's position. Reset at the start of every
+    /// assistant turn, so each turn produces a fresh instance of the schema
+    /// (a persistent state would be stuck at "accepting" after turn 1).
+    pub grammar_state: Option<crate::grammar::GrammarState>,
 }
 
 const REPEAT_LAST_N: usize = 64;
@@ -451,6 +459,7 @@ impl Conversation {
             bos_text: spec.bos_text,
             n_ctx: spec.n_ctx,
             mirostat: sampler::MirostatState::new(spec.mirostat_tau),
+            grammar_state: None,
         }
     }
 
@@ -547,13 +556,18 @@ impl Conversation {
         let mut hit_n_predict = false;
         // The seed: sampled from the entry logits exactly like the plain
         // path's first iteration (G1 token identity starts at token 0).
-        let sampled = sampler::sample_with_config(
+        self.grammar_state = cfg.sampler.grammar.as_ref().map(|g| g.state());
+        let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
             &cfg.sampler,
             &self.prev_tokens,
             &mut self.mirostat,
+            &mut self.grammar_state,
             &mut self.rng,
-        );
+        ) {
+            Ok(s) => s,
+            Err(e) => return Err(ConvError::Grammar(e.to_string())),
+        };
         let mut seed = sampled.token_id;
         // Commit the seed (its KV row is written by the first round).
         if self.is_eog(seed) {
@@ -1261,6 +1275,8 @@ impl Conversation {
         let mut stopped_by_eog = false;
         let mut stopped_by_string = false;
         let mut hit_n_predict = false;
+        // F2: a fresh automaton position for this turn (see the field's note).
+        self.grammar_state = cfg.sampler.grammar.as_ref().map(|g| g.state());
 
         loop {
             if n_gen >= cfg.n_predict {
@@ -1272,13 +1288,17 @@ impl Conversation {
                 hit_n_predict = true;
                 break;
             }
-            let sampled = sampler::sample_with_config(
+            let sampled = match sampler::sample_with_config_grammar(
                 &mut logits,
                 &cfg.sampler,
                 &self.prev_tokens,
                 &mut self.mirostat,
+                &mut self.grammar_state,
                 &mut self.rng,
-            );
+            ) {
+                Ok(s) => s,
+                Err(e) => return Err(ConvError::Grammar(e.to_string())),
+            };
             if self.is_eog(sampled.token_id) {
                 // The EOG must be written to the KV: the canonical render carries the EOG marker after the assistant message
                 // (§5.4), and llama.cpp also decodes the EOG before stopping. Not writing it would break the invariant.

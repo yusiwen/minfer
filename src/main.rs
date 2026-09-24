@@ -13,6 +13,7 @@ mod device_tier;
 mod download;
 mod dump;
 mod gguf;
+mod grammar;
 mod graph;
 mod kernel;
 mod live;
@@ -32,6 +33,7 @@ mod trace;
 mod vec_ops;
 
 use rand::SeedableRng;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Conversation-mode color behavior (CLI-CONVERSATION-PLAN.md §5.6).
@@ -78,6 +80,12 @@ struct GenParams {
     mirostat_m: usize,
     /// `(token_id, bias)` pairs (`--logit-bias`).
     logit_bias: Vec<(u32, f32)>,
+    /// F2 (#47): the raw grammar/schema request (`--grammar`, `--json-schema`).
+    /// Compiled once the vocabulary is known; an unsupported construct is a
+    /// startup refusal, never a silent guess.
+    grammar_source: Option<grammar::GrammarSource>,
+    /// F2: the compiled grammar (per request), shared with `SamplerConfig`.
+    grammar: Option<Arc<grammar::Grammar>>,
     seed: u64,
     n_ctx: usize,
     stop_strings: Vec<String>,
@@ -107,6 +115,8 @@ impl Default for GenParams {
             mirostat_eta: 0.1, // F3: llama.cpp default
             mirostat_m: 100,   // F3: llama.cpp default
             logit_bias: Vec::new(),
+            grammar_source: None,
+            grammar: None,
             seed: 42,
             n_ctx: 4096,
             stop_strings: Vec::new(),
@@ -139,6 +149,7 @@ impl GenParams {
             mirostat_eta: self.mirostat_eta,
             mirostat_m: self.mirostat_m,
             logit_bias: self.logit_bias.clone(),
+            grammar: self.grammar.clone(),
         }
     }
 }
@@ -194,6 +205,23 @@ fn parse_logit_bias(spec: &str) -> Result<Vec<(u32, f32)>, String> {
         out.push((id, bias));
     }
     Ok(out)
+}
+
+/// F2: record a grammar request, refusing a second spelling (the four flags are
+/// mutually exclusive — one grammar per request, never a silent precedence rule).
+fn set_grammar_source(
+    slot: &mut Option<grammar::GrammarSource>,
+    src: grammar::GrammarSource,
+    flag: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!(
+            "{flag} given but a grammar/schema flag was already set; --grammar, --grammar-str, \
+             --json-schema and --json-schema-str are mutually exclusive"
+        ));
+    }
+    *slot = Some(src);
+    Ok(())
 }
 
 fn print_usage(prog: &str) {
@@ -262,6 +290,12 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  --logit-bias <L>     add to raw logits: 'ID:BIAS[,ID:BIAS...]', e.g. '15043:-2.0'"
     );
+    eprintln!(
+        "  --grammar <FILE>     F2: constrain sampling to a GBNF grammar (docs/GRAMMAR-DESIGN.md)"
+    );
+    eprintln!("  --grammar-str <GBNF> F2: same, grammar text inline");
+    eprintln!("  --json-schema <FILE> F2: constrain sampling to a JSON Schema (compiled to GBNF)");
+    eprintln!("  --json-schema-str <JSON>  F2: same, schema text inline");
     eprintln!("  --stop <STR>         stop generation at this string (repeatable)");
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
@@ -730,6 +764,57 @@ fn main() {
                 }
                 i += 2;
             }
+            // === F2 (#47) constrained decoding ===
+            "--grammar" | "--json-schema" => {
+                if let Some(v) = next_val(a) {
+                    let read = std::fs::read_to_string(&v)
+                        .map_err(|e| format!("cannot read {a} file '{v}': {e}"));
+                    match read {
+                        Err(e) => parse_err = Some(e),
+                        Ok(text) => {
+                            let src = if a == "--grammar" {
+                                grammar::GrammarSource::Gbnf(text)
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(&text) {
+                                    Ok(v) => grammar::GrammarSource::Json(v),
+                                    Err(e) => {
+                                        parse_err =
+                                            Some(format!("invalid JSON in {a} file '{v}': {e}"));
+                                        i += 2;
+                                        continue;
+                                    }
+                                }
+                            };
+                            match set_grammar_source(&mut params.grammar_source, src, a) {
+                                Ok(()) => {}
+                                Err(e) => parse_err = Some(e),
+                            }
+                        }
+                    }
+                }
+                i += 2;
+            }
+            "--grammar-str" | "--json-schema-str" => {
+                if let Some(v) = next_val(a) {
+                    let src = if a == "--grammar-str" {
+                        grammar::GrammarSource::Gbnf(v)
+                    } else {
+                        match serde_json::from_str::<serde_json::Value>(&v) {
+                            Ok(v) => grammar::GrammarSource::Json(v),
+                            Err(e) => {
+                                parse_err = Some(format!("invalid JSON for {a}: {e}"));
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    };
+                    match set_grammar_source(&mut params.grammar_source, src, a) {
+                        Ok(()) => {}
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
             "--stop" => {
                 if let Some(v) = next_val(a) {
                     params.stop_strings.push(v);
@@ -1044,6 +1129,36 @@ fn main() {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
+    // F2: compile the requested grammar/schema once, now that the vocabulary (and
+    // with it every token piece and the EOG ids) is known. An unsupported
+    // construct is refused here, before any generation.
+    if let Some(src) = params.grammar_source.clone() {
+        match grammar::compile_source(&src, &tokenizer, &model.special_tokens()) {
+            Ok(g) => {
+                eprintln!(
+                    "[grammar] compiled {} rule(s) over {} tokens ({} grammar bytes)",
+                    g.source().lines().filter(|l| l.contains("::=")).count(),
+                    g.n_vocab(),
+                    g.source().len()
+                );
+                params.grammar = Some(Arc::new(g));
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // A speculative verify round samples several rows from one state, and the
+    // draft model would need the same mask: refused rather than silently
+    // generating without the constraint.
+    if spec_draft.is_some() && params.grammar.is_some() {
+        eprintln!(
+            "Error: --spec-draft does not support a grammar or JSON schema (a verify round \
+             samples several rows from one automaton state); disable one of the two"
+        );
+        std::process::exit(1);
+    }
     if spec_draft.is_some() && params.mirostat != sampler::MirostatMode::Off {
         eprintln!(
             "Error: --spec-draft does not support mirostat (its per-step state belongs to the \
@@ -1356,6 +1471,8 @@ fn main() {
     // sequence the non-spec loop runs, applied per emitted token.
     let sampler_cfg = params.sampler_config();
     let mut mirostat = sampler::MirostatState::new(sampler_cfg.mirostat_tau);
+    // F2: one automaton state per run, exactly like mirostat's `mu`.
+    let mut grammar_state = sampler_cfg.grammar.as_ref().map(|g| g.state());
     if let Some(engine) = spec_engine.as_mut() {
         let sparams = spec::SpecSampler {
             cfg: sampler_cfg.clone(),
@@ -1473,13 +1590,22 @@ fn main() {
     if spec_engine.is_none() {
         while generated.len() < params.n_predict {
             t0 = std::time::Instant::now();
-            let sampled = sampler::sample_with_config(
+            let sampled = match sampler::sample_with_config_grammar(
                 &mut logits,
                 &sampler_cfg,
                 &prev_tokens,
                 &mut mirostat,
+                &mut grammar_state,
                 &mut rng,
-            );
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The loud stop the grammar contract requires: the emitted text
+                    // is a valid prefix, nothing illegal is appended.
+                    eprintln!("\n[grammar] {e}");
+                    break;
+                }
+            };
             if timing {
                 t_samp += t0.elapsed().as_secs_f64();
             }

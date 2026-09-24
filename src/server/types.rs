@@ -46,6 +46,39 @@ pub struct ChatCompletionRequest {
     /// OpenAI's `logit_bias`: `{"<token_id>": bias}`. A key that is not a token
     /// id, or an id outside the vocabulary, is a `400`.
     pub logit_bias: Option<HashMap<String, f32>>,
+    /// F2 (#47): OpenAI structured output. `{"type":"text"}` (or absent) leaves
+    /// sampling unconstrained, `{"type":"json_object"}` admits any JSON value,
+    /// and `{"type":"json_schema","json_schema":{"name":…,"schema":{…}}}` admits
+    /// the compiled schema.
+    pub response_format: Option<ResponseFormat>,
+    /// F2: llama.cpp-style GBNF extension field. Mutually exclusive with a
+    /// non-text `response_format` (one grammar per request, never a precedence
+    /// rule).
+    pub grammar: Option<String>,
+}
+
+/// OpenAI `response_format` (the subset this server implements).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// No constraint.
+    Text,
+    /// Any single JSON value (`root ::= j-value`).
+    JsonObject,
+    /// A JSON Schema.
+    JsonSchema { json_schema: JsonSchemaSpec },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct JsonSchemaSpec {
+    /// OpenAI requires a name; it does not change the accepted language.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The schema itself. `strict` is accepted and ignored (this compiler is
+    /// always strict about what it supports).
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +118,12 @@ pub struct SamplingParams {
     pub mirostat_eta: f32,
     pub mirostat_m: usize,
     pub logit_bias: Vec<(u32, f32)>,
+    /// F2 (#47): the raw grammar request, compiled against the vocabulary by
+    /// [`Self::compile_grammar`] once the tokenizer is available. `None` for an
+    /// unconstrained request, so the default path is bit-identical.
+    pub grammar_source: Option<crate::grammar::GrammarSource>,
+    /// F2: the compiled grammar, filled in by [`Self::compile_grammar`].
+    pub grammar: Option<std::sync::Arc<crate::grammar::Grammar>>,
     pub seed: u64,
     pub stop_strings: Vec<String>,
     pub max_tokens: i64,
@@ -115,7 +154,25 @@ impl SamplingParams {
             mirostat_eta: self.mirostat_eta,
             mirostat_m: self.mirostat_m,
             logit_bias: self.logit_bias.clone(),
+            grammar: self.grammar.clone(),
         }
+    }
+
+    /// F2 (#47): compile the request's grammar/schema against the vocabulary.
+    /// Called on the handler side (where the tokenizer lives) before the job is
+    /// queued, so an unsupported construct is a `400` and never reaches a slot.
+    pub fn compile_grammar(
+        &mut self,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        special: &crate::models::SpecialTokens,
+    ) -> Result<(), ApiError> {
+        let Some(src) = self.grammar_source.clone() else {
+            return Ok(());
+        };
+        let g = crate::grammar::compile_source(&src, tokenizer, special)
+            .map_err(ApiError::invalid_request)?;
+        self.grammar = Some(std::sync::Arc::new(g));
+        Ok(())
     }
 
     /// Refuse a nonsensical sampler configuration with a `400` — the same strict
@@ -192,6 +249,26 @@ impl ChatCompletionRequest {
             }
             logit_bias.sort_by_key(|(id, _)| *id);
         }
+        // F2 (#47): one grammar per request. `grammar` and a non-text
+        // `response_format` together are a 400 — never a silent precedence rule.
+        if self.grammar.is_some()
+            && !matches!(self.response_format, None | Some(ResponseFormat::Text))
+        {
+            return Err(ApiError::invalid_request(
+                "`grammar` and a non-text `response_format` are mutually exclusive; send one"
+                    .to_string(),
+            ));
+        }
+        let grammar_source = match (&self.grammar, &self.response_format) {
+            (Some(g), _) => Some(crate::grammar::GrammarSource::Gbnf(g.clone())),
+            (None, Some(ResponseFormat::JsonObject)) => {
+                Some(crate::grammar::GrammarSource::AnyJson)
+            }
+            (None, Some(ResponseFormat::JsonSchema { json_schema })) => Some(
+                crate::grammar::GrammarSource::Json(json_schema.schema.clone()),
+            ),
+            (None, Some(ResponseFormat::Text)) | (None, None) => None,
+        };
         Ok(SamplingParams {
             temp: self.temperature.unwrap_or(DEFAULT_TEMP),
             top_k: self.top_k.map(|k| k as usize).unwrap_or(DEFAULT_TOP_K),
@@ -213,6 +290,8 @@ impl ChatCompletionRequest {
             mirostat_eta: self.mirostat_eta.unwrap_or(0.1),
             mirostat_m: self.mirostat_m.unwrap_or(100),
             logit_bias,
+            grammar_source,
+            grammar: None,
             seed: self.seed.unwrap_or(rng_seed),
             stop_strings,
             max_tokens: self.max_tokens.unwrap_or(MAX_TOKENS_UNLIMITED),
@@ -556,5 +635,123 @@ mod tests {
         .resolve(0)
         .unwrap();
         assert!(bad.validate(1000).is_err());
+    }
+
+    // === F2 (#47): the structured-output surface ============================
+
+    #[test]
+    fn resolve_maps_response_format_and_the_grammar_extension() {
+        // Absent / text -> unconstrained.
+        let req = ChatCompletionRequest::parse(br#"{"messages":[{"role":"user","content":"hi"}]}"#)
+            .unwrap();
+        assert!(req.resolve(0).unwrap().grammar_source.is_none());
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"text"}}"#,
+        )
+        .unwrap();
+        assert!(req.resolve(0).unwrap().grammar_source.is_none());
+
+        // json_object -> any JSON value.
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        match req.resolve(0).unwrap().grammar_source {
+            Some(crate::grammar::GrammarSource::AnyJson) => {}
+            other => panic!("expected AnyJson, got {other:?}"),
+        }
+
+        // json_schema -> the schema, name and strict are accepted and ignored.
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json_schema","json_schema":
+                   {"name":"person","strict":true,"schema":{"type":"object"}}}}"#,
+        )
+        .unwrap();
+        match req.resolve(0).unwrap().grammar_source {
+            Some(crate::grammar::GrammarSource::Json(v)) => {
+                assert_eq!(v["type"], "object");
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+
+        // The GBNF extension field.
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"grammar":"root ::= \"a\""}"#,
+        )
+        .unwrap();
+        match req.resolve(0).unwrap().grammar_source {
+            Some(crate::grammar::GrammarSource::Gbnf(g)) => assert_eq!(g, "root ::= \"a\""),
+            other => panic!("expected Gbnf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_two_grammars_or_an_unknown_response_type() {
+        // `grammar` + a non-text `response_format`: a 400, never a precedence rule.
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"grammar":"root ::= .",
+                 "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let err = req.resolve(0).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(
+            err.message.contains("mutually exclusive"),
+            "{}",
+            err.message
+        );
+
+        // An unknown response_format type is refused by serde -> 400.
+        let err = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"xml"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+
+        // A json_schema entry without a schema is a 400.
+        let err = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn compile_grammar_turns_an_unsupported_schema_into_a_400() {
+        let tok = crate::tokenizer::Tokenizer::empty();
+        let special = crate::models::SpecialTokens {
+            eos: 0,
+            im_end: None,
+        };
+
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json_schema","json_schema":
+                   {"name":"x","schema":{"type":"string","pattern":"^a"}}}}"#,
+        )
+        .unwrap();
+        let mut p = req.resolve(0).unwrap();
+        assert!(
+            p.grammar.is_none(),
+            "uncompiled until the vocabulary is known"
+        );
+        let err = p.compile_grammar(&tok, &special).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("pattern"), "{}", err.message);
+        assert!(
+            p.grammar.is_none(),
+            "a refused schema leaves no grammar behind"
+        );
+
+        // A supported schema compiles and lands in the sampler config.
+        let req = ChatCompletionRequest::parse(
+            br#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let mut p = req.resolve(0).unwrap();
+        p.compile_grammar(&tok, &special).expect("compiles");
+        assert!(p.sampler_config().grammar.is_some());
     }
 }
