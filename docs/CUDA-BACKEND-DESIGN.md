@@ -401,7 +401,9 @@ run one of three layouts, tagged by `crate::cuda::KV_LAYOUT_F32/F16/Q8_0` — th
 - `KV_LAYOUT_F32` — one f32 per element;
 - `KV_LAYOUT_F16` — one f16 per element in the first half of the f32-shaped region
   (`set_kv_cache_type` auto-selects it when `n_layers × n_kv_embd >= 8192`, the 7B class, and
-  `MINFER_CACHE_TYPE=f16` overrides);
+  `MINFER_CACHE_TYPE=f16` overrides). Its **snapshots are restorable since [#130](https://github.com/yusiwen/minfer/issues/130)**:
+  the session container records the type in its header flags (`FLAG_F16`, C5 S3), so an
+  auto-f16 model's `--slots-file` / `--session` companion is no longer refused on load;
 - `KV_LAYOUT_Q8_0` — packed 34-byte Q8_0 blocks, one cell rounded up to whole f32 words
   (`MINFER_CACHE_TYPE=q8_0`, C4 S2b).
 

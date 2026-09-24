@@ -1166,13 +1166,14 @@ Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2
 - *Suites*: CPU `cargo test --release` **432 / 0 / 28** unit + **10 / 0 / 6** integration
   (unchanged); CPU serial ignored **28 / 0**; CUDA serial unit **490 / 0 / 31** (was 486/0/31: three
   new device gates + one new `cuda.rs` layout test; the packed gate now also runs on the device);
-  CUDA serial ignored 0.5B **31 / 0**; Qwen3-0.6B **30 / 1**, the one failure still the pre-existing
-  [#130](https://github.com/yusiwen/minfer/issues/130) f16 session-container gap.
+  CUDA serial ignored 0.5B **31 / 0**; Qwen3-0.6B **30 / 1**, the one failure the then-pre-existing
+  [#130](https://github.com/yusiwen/minfer/issues/130) f16 session-container gap (closed in C5 S3:
+  **31 / 0**).
 - *The Q8_0 session container works.* `a_session_resumed_from_disk_continues_bitwise` with
   `MINFER_CACHE_TYPE=q8_0` on the device prints `live KV format: q8_0`, saves 24 layers / 256 cells
   / 5 written / 1 696 464 B and continues **bitwise** (max |Δlogit| = 0). The container's
-  `FLAG_PACKED` bit is what encodes it; **f16 remains the one type with no flag** (the same #130
-  question).
+  `FLAG_PACKED` bit is what encodes it; f16 had no flag then — the gap
+  [#130](https://github.com/yusiwen/minfer/issues/130) closed in C5 S3 (`FLAG_F16`), below.
 
 **Handed off after S2b, still on [#87](https://github.com/yusiwen/minfer/issues/87):** the packed
 **fused decode epilogue** (a block-quantizing store inside `attn_bias_rope_store` would recover the
@@ -1232,7 +1233,7 @@ printed as a failure of the kernel that had just run.
 | `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **36** API errors (26 `cudaGraphDestroy`, 9 `cudaGetLastError`, 1 `cudaFuncSetAttribute`) | **0** errors |
 | CUDA serial unit suite | 490 / 0 / 31 | **495 / 0 / 31** (five new gates) |
 | CUDA serial ignored, 0.5B config | 31 / 0 | **31 / 0** |
-| CUDA serial ignored, Qwen3-0.6B Q8_0 | 30 / 1 | **30 / 1** — still only [#130](https://github.com/yusiwen/minfer/issues/130) |
+| CUDA serial ignored, Qwen3-0.6B Q8_0 | 30 / 1 | **30 / 1** at this commit — only [#130](https://github.com/yusiwen/minfer/issues/130), closed in C5 S3 (**31 / 0**) |
 | `minfer bench -p 64 -n 8 -r 2`, 0.5B Q4_K_M | prints `CUDA kernel launch error: 1` between the two loops | no such line; the one skipped opt-in named instead |
 | CPU `cargo test --release` | 432 / 0 / 28 unit + 10 / 0 / 6 integration | **unchanged** |
 | CPU serial ignored | 28 / 0 | **28 / 0** |
@@ -1300,7 +1301,8 @@ restart re-prefilled the whole context.
   `read_host`/`write_host` (CUDA included) and enable the pool a file names if it does not
   exist yet, because a restore happens before the first graph — which is also how the CUDA
   run of the gate found the gap. The header records the KV element type
-  (`f32`/`f16`/`q8_0`), so a file written under one width cannot be resumed under another.
+  (`f32`/`f16`/`q8_0`) in its flags word (`0`/`FLAG_F16`/`FLAG_PACKED` — C5 S3, #130), so a
+  file written under one width cannot be resumed under another.
 - **A failed load is a no-op.** `kv_load` runs `kvsession::verify` — a full pass over the
   header, every layer's declared length, the bookkeeping, the checksum and end-of-file —
   **before** `ensure_kv` creates a single region. Every refusal path is asserted to leave
@@ -1426,6 +1428,60 @@ measures ("resume the slot, and get the same continuation").
   287/0/15).
 - *Sharing*: `kvformat.rs` gains `expect_for(model, n_ctx)` / `backend_of(device)`, and the CLI's
   `--session` engine now uses them too, so "what this file must match" has one definition.
+
+**C5 S3 — the container encodes the f16 element type · [#130](https://github.com/yusiwen/minfer/issues/130) — DONE 2026-09-25.**
+
+The header already carried the KV element type in its flags word, but only Q8_0 had a bit
+(`FLAG_PACKED`). An **f16** region therefore wrote `flags == 0` and read back as **f32**, so
+`kv_load`'s `header.format != live` check refused the file its own writer had just produced — on
+any CUDA box whose model crosses the f16 auto-policy threshold (Qwen3-0.6B: `28 × 1024 = 28672 ≥
+8192`), for `--slots-file` and `--session` alike. The real-model gate showed it as *"the file was
+written with the f32 KV element type, this run uses f16"*.
+
+**The design decision: a flag bit, not a format field.** `FLAG_F16 = 1 << 1` is added, and
+`flags_of` / `format_of_flags` are each other's exact inverse. A format *field* would have had to
+either renumber `FLAG_PACKED` — changing the meaning of every Q8_0 file already on disk — or move
+the type elsewhere in the header, shifting the byte layout a version-2 reader is already parsing;
+both are the silent misread the container exists to prevent. A new bit keeps the flag word's layout
+(and every existing file's meaning), and the compatibility story follows for free: a **pre-#130
+build** reading an f16 file sees an unknown bit and refuses it **loudly** at the unknown-flags check
+instead of decoding the region as f32, while a **pre-#130 f32 file** (`flags == 0`) still loads as
+f32. The two element-type bits are **mutually exclusive** — `packed | f16` describes two
+incompatible cell layouts, so it is refused by name, never resolved by preferring one bit.
+**No version bump**: `VERSION` stays 2, because a bump is for a layout change and this is an
+additive flag whose older-reader behaviour is a loud refusal — exactly as `FLAG_PACKED` was when it
+landed.
+
+**What landed.**
+
+- `src/graph/kvsession.rs`: `FLAG_F16`, `KNOWN_FLAGS`, the `flags_of` / `format_of_flags` pair, the
+  writer encoding the format into the flag word, and the reader's unknown-bit + mutual-exclusion
+  refusals before it decodes.
+- Six new gates, five in `kvsession.rs` (no device — the CI-covered half) and one in `alloc.rs`
+  (`kv_save` → `kv_load` under an f16 policy): the f16 round trip, the flag-word sweep over all
+  three formats (encode and decode), the both-bits refusal, the unknown-bit refusal, the legacy
+  `flags == 0` → f32 load, and the allocator-level f16 round trip.
+
+**Measured** (GB10 sm_121, CUDA 13.0, serial).
+
+| check | before | after |
+|---|---|---|
+| `kvsession` unit tests | 11 | **16** |
+| CPU `cargo test --release` | 432 / 0 / 28 unit + 10 / 0 / 6 integration | **438 / 0 / 28** + 10 / 0 / 6 |
+| CPU serial ignored | 28 / 0 | **28 / 0** |
+| CUDA serial unit suite | 495 / 0 / 31 | **501 / 0 / 31** |
+| CUDA serial ignored, 0.5B config | 31 / 0 | **31 / 0** |
+| CUDA serial ignored, Qwen3-0.6B Q8_0 | 30 / 1 | **31 / 0** — `a_slot_snapshot_resumes_the_context_without_re_prefilling` resumes its own snapshot |
+
+**Mutation checks** (each reverted byte-identically, `sha256sum`): breaking the encode (f16 → `0`)
+fails the flag sweep, the container f16 round trip and the allocator f16 round trip (435/3);
+breaking the decode (dropping the `FLAG_F16` branch) fails the same three; removing the
+mutual-exclusion check fails only the both-bits gate — and it fails on the **message**, because the
+width check would otherwise refuse the file for a different reason (that is the "passes for the
+wrong reason" hazard this gate's assertion closes); widening `KNOWN_FLAGS` to `!0` fails only the
+unknown-bit gate; and encoding f32 as `FLAG_F16` fails the legacy gate plus the two f32 gates.
+`rustfmt --edition 2021 --check` clean on both files (stable rustfmt 1.9.0 — the pinned 1.97.1
+toolchain has no `rustfmt` component here; CI runs no fmt job).
 
 ### C6 — Logical positions (`positions` ≠ cells)
 
@@ -3066,7 +3122,7 @@ CUDA KV region for the wrong format and was refused too (the mechanism of
 |---|---|---|
 | Packed gate alone (CUDA build) | 0 passed / 1 failed, the #87 refusal | **1 passed**, `[c4] CPU-only by construction …`; max \|Δlogit\| 3.0289, region 3.76x smaller — identical to the CPU build |
 | Full `#[ignore]`d serial set (CUDA, 0.5B) | **20 passed / 2 failed** (both #87) | **22 passed / 0 failed**, ten consecutive runs (5 + 5) of the same binary |
-| Full `#[ignore]`d serial set (CUDA, Qwen3-0.6B config) | — | 21 passed / 1 failed; the one failure is an **unrelated, pre-existing** C5 defect (a session cannot encode an f16 element type), filed as [#130](https://github.com/yusiwen/minfer/issues/130) |
+| Full `#[ignore]`d serial set (CUDA, Qwen3-0.6B config) | — | 21 passed / 1 failed; the one failure was an **unrelated** C5 defect (a session could not encode an f16 element type), filed as [#130](https://github.com/yusiwen/minfer/issues/130) and **closed 2026-09-25** (C5 S3: **31 / 0**) |
 | Timing gate, decode ratio | 1.001 / 1.001 / 1.006 / 1.001 / 1.001 (5 runs) | 1.001–1.004 (6 idle runs), 1.001–1.018 (6 loaded runs) |
 | Timing gate, prefill ratio | 1.088 / 1.087 / 1.092 / **1.021** / 1.090 (5 runs) | 1.087–1.107 (6 idle), 1.079–1.145 (6 loaded) |
 | `cargo test --release` (CPU) | 382 / 0 / 21 + 3 / 0 / 6 | **382 / 0 / 21 + 3 / 0 / 6** (unchanged) |
@@ -3098,10 +3154,10 @@ that load; the median absorbed them (worst prefill median 1.145, worst decode me
   format-ownership fix. #87 (a device kernel that reads a packed q8_0 region) is *why* the gate is
   CPU-forced: when it lands, the gate's `device() == Cpu` assertion will fire and it should be
   re-pointed at the device.
-- The Qwen3-0.6B configuration's serial set is 21/1 for an unrelated pre-existing reason — the C5
-  container has no F16 flag, so a CUDA f16 session is refused on load
-  ([#130](https://github.com/yusiwen/minfer/issues/130)); that test fails **alone** with no #123
-  code in its path, so it is not a #123 regression.
+- The Qwen3-0.6B configuration's serial set was 21/1 for an unrelated pre-existing reason — the C5
+  container had no F16 flag, so a CUDA f16 session was refused on load
+  ([#130](https://github.com/yusiwen/minfer/issues/130), **closed 2026-09-25**: `FLAG_F16`, C5 S3);
+  that test failed **alone** with no #123 code in its path, so it was not a #123 regression.
 - The decode threshold could in principle be tighter than 1.25x (its intrinsic ratio is ~1.00). It
   is left at the pre-existing 1.25x on purpose, so the ticket removes flakiness without weakening
   the gate; it is not so wide that a real regression escapes (the 2.190x mutation trips, and the
@@ -4327,8 +4383,9 @@ the E4 section, above): on the 0.5B configuration the serial set is **22 passed 
 failed**, ten consecutive runs of the same binary, and the timing gate's verdict no
 longer depends on the box being quiet — its median-of-ratios statistic stayed below
 1.15x even with 16 CPU spinners and two concurrent CUDA attention loops. The
-Qwen3-0.6B configuration's set is 21/1, its one failure a separate pre-existing C5
-defect filed as [#130](https://github.com/yusiwen/minfer/issues/130).
+Qwen3-0.6B configuration's set was 21/1, its one failure a separate C5
+defect filed as [#130](https://github.com/yusiwen/minfer/issues/130) (**closed 2026-09-25**:
+the container's `FLAG_F16` bit, C5 S3).
 
 **Honest scope.** (a) Every measurement in the sections *above* this block was taken
 on a **CPU-only build**: that worktree was built with `cargo build --release`,
@@ -4472,7 +4529,7 @@ issue is filed for it here.
 | `CUDA_HOME=/usr/local/cuda-13.0 … cargo build --release --features cuda` | exit 0 |
 | `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (GB10 sm_121, cached 0.5B) | **25 passed / 0 failed**. The ticket's "22" predates F7's two reference gates: `0602eb2` has 26 `#[ignore]` attributes, 2 of them in the macOS-only `src/metal.rs`, i.e. **24 runnable here**, and this ticket adds the 25th (the fence gate below) |
 | `cargo test --release --features cuda --bin minfer -- --test-threads=1` (GB10, whole unit suite) | **452 passed / 0 failed / 25 ignored** |
-| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` | **24 passed / 1 failed**, the one failure `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"* — the **pre-existing** [#130](https://github.com/yusiwen/minfer/issues/130) C5 defect, which the record above documents as this configuration's 21/1 (the count moved by the same +3: F7's two gates and this ticket's) |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` | **24 passed / 1 failed** at this commit, the one failure `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"* — the then-pre-existing [#130](https://github.com/yusiwen/minfer/issues/130) C5 defect, **closed 2026-09-25** (C5 S3: **31 / 0**), which the record above documents as this configuration's 21/1 (the count moved by the same +3: F7's two gates and this ticket's) |
 | registry / CLI gates | `names_resolve_and_unknown_names_are_refused`, `the_registered_set_and_priority_order_are_pinned`, `the_name_surface_fences_devices_and_keeps_cpu`, `the_packed_kv_capability_is_the_registrys_answer`, `registry_caps_match_the_backend_trait`, `alloc::tests::a_fresh_allocator_inherits_the_runs_backend_filter`, `tests/backend_registry_cli.rs` (7, incl. `a_disabled_device_is_not_refused_unless_it_was_named`) |
 | `rustfmt --edition 2021 --check` on the 19 changed `.rs` | clean (stable's rustfmt 1.9.0: the pinned 1.97.1 toolchain has no `rustfmt` component installed here — CI runs no fmt job) |
 | `python3 scripts/check_docs_links.py` | **935 links resolve in 183 files** (baseline 930 / 182) |
@@ -4574,7 +4631,7 @@ the pending-copy table; a slab is released when its event has been waited on, an
 | `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **23 passed / 0 failed** (unchanged — every F5 gate that needs a boundary is device-gated or in the unit suite) |
 | `cargo test --release --features cuda -- --test-threads=1` (GB10, whole unit suite) | **459 passed / 0 failed / 26 ignored** (baseline 452 / 0 / 25; +6 CPU-visible tests, +1 new device test, +1 new `#[ignore]`d real-model gate) |
 | `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (0.5B) | **26 passed / 0 failed** (baseline 25 / 0, +the F5 real-model gate) |
-| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf … --ignored --test-threads=1` | **25 passed / 1 failed** — the single failure is `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"*, i.e. the **pre-existing** [#130](https://github.com/yusiwen/minfer/issues/130), not this ticket. The F5 gate itself passes in that configuration |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf … --ignored --test-threads=1` | **25 passed / 1 failed** at this commit — the single failure was `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"*, i.e. the then-pre-existing [#130](https://github.com/yusiwen/minfer/issues/130), not this ticket (**closed 2026-09-25**, C5 S3: **31 / 0**). The F5 gate itself passes in that configuration |
 | `rustfmt +stable --edition 2021 --check` on the 10 changed `.rs` | clean (rustfmt **1.9.0-stable**; the pinned 1.97.1 toolchain has no `rustfmt` component here, as F4 found — CI runs no fmt job) |
 | `python3 scripts/check_docs_links.py` | **935 links resolve in 183 files** (baseline 935 / 183) |
 
@@ -4707,7 +4764,7 @@ tolerances are stated in `docs/GGUF-TOOLING.md` §4.
 | `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **28 passed / 0 failed** (baseline 23; +5 F6 real-model gates) |
 | `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **486 passed / 0 failed / 31 ignored** (baseline 459 / 0 / 26) |
 | `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (0.5B) | **31 passed / 0 failed** (baseline 26 / 0, +the 5 F6 gates) |
-| … with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` | **30 passed / 1 failed** — the single failure is the pre-existing [#130](https://github.com/yusiwen/minfer/issues/130) (`the file was written with the f32 KV element type, this run uses f16`), as at the baseline |
+| … with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` | **30 passed / 1 failed** at this commit — the single failure is the then-pre-existing [#130](https://github.com/yusiwen/minfer/issues/130) (`the file was written with the f32 KV element type, this run uses f16`), as at the baseline; **closed 2026-09-25** (C5 S3: **31 / 0**) |
 | the F6-produced q8_0 file on the device | `CUDA GATE: …` is **not** printed; `offload: all 24 blocks + embed/output on cuda (500.8 MiB of device weights)`, 1214.7 tok/s prefill, greedy `Paris.` — the same text as `MINFER_DISABLE_CUDA=1`. The **f16** file on the same build prints `weight 'token_embd.weight' (type F16) has no CUDA kernel or is not registered` and `running on CPU` ([#141](https://github.com/yusiwen/minfer/issues/141)) |
 | HF → GGUF vs `convert_hf_to_gguf.py` (Qwen2.5-0.5B-Instruct, bf16 → f16) | **290/290 tensor payloads byte-identical** (sha256 per tensor); metadata equivalent for every loader-read value (llama.cpp also writes the cosmetic `general.size_label`, and key order differs) |
 | minfer vs llama.cpp f16 file, logits after a 4-token greedy continuation | **bitwise identical** (`assert_eq!` over 151,936 logits) and identical greedy text `[12095, 13, 1084, 374]` |
