@@ -2265,9 +2265,13 @@ memory is smaller than the model actually needs.
 - **The report explains the fit** (`auto_source`): `offload: 5 of 24 blocks on cuda … (40.0 MiB of
   device weights; auto: 5 of 24 blocks fit — weights budget 64 MiB, 16 MiB reserved for
   KV/activations; MINFER_GPU_MEM=64 MiB)` — the decision and the numbers behind it.
-- `device_free_bytes()` is the one place that asks the device (CUDA: `cudaMemGetInfo`); Metal's
-  wrapper reports no free-bytes number yet, so on macOS `auto` needs `MINFER_GPU_MEM` and otherwise
-  fits nothing (the default and an explicit count still work there).
+- `device_memory()` (`src/models/mod.rs`, from `CudaState::device_memory`) is the one place that
+  asks the device (CUDA: `cudaMemGetInfo`), and since #122 it returns an explicit
+  `allocplan::DeviceMemory` (`Reported` / `QueryFailed` / `NoDevice`) rather than an
+  `Option<usize>` where a *failure* and "no device" both looked like a small number. A failed
+  query refuses the `auto` request with the real CUDA error name instead of fitting 0 blocks;
+  Metal's wrapper reports no free-bytes number yet, so on macOS `auto` needs `MINFER_GPU_MEM` and
+  otherwise fits nothing (the default and an explicit count still work there).
 
 **Acceptance, as measured** (0.5B q4_0 on GB10):
 
@@ -2556,8 +2560,10 @@ at execute time), and peak memory was not a number anyone could read.
 - **The feasibility gate** — `alloc_in_pool` is fallible and checks
   `weights + pooled + this allocation (at its class size)` against the backend's budget
   *before* the pool is asked for anything. The default budget is the backend's own answer:
-  CUDA's current `cudaMemGetInfo` free bytes with a quarter held back (new
-  `CudaState::device_memory` / `device_free_bytes`); CPU and Metal are unbounded unless
+  CUDA's current free bytes with a quarter held back, resolved through the pure
+  `allocplan::budget_decision` over an explicit `allocplan::DeviceMemory` outcome — a
+  **failed** query is not a number (it falls back to weights-only accounting with its CUDA
+  error named once; see the S4 record below). CPU and Metal are unbounded unless
   `set_memory_budget` sets one (tests, and a future offload policy). The refusal names the
   numbers: weights, pooled bytes, this request, budget, all in MiB.
 
@@ -2661,7 +2667,116 @@ test-isolation artifact — a fixture passed an under-sized `q`, and only the te
 decided whether that became a visible fault. The production path sizes `q` as `nt` rows
 (the `Attn` node's input), so the kernel indexing itself is correct.
 
-The fix, its measurements and its honest scope are the next two commits.
+**The fix.**
+
+1. `allocplan::DeviceMemory { Reported { free, total }, QueryFailed { code, name },
+   NoDevice }` makes the query's outcome a **type**; `CudaState::device_memory` checks the
+   return code and names it with a new `cudaGetErrorName` extern, and
+   `device_free_bytes() -> Option<usize>` is `None` on failure.
+2. `allocplan::budget_decision(explicit, &DeviceMemory) -> BudgetDecision { budget, note }`
+   is the **pure** mapping: an explicit `set_memory_budget` wins; a **reported** read keeps
+   the pre-existing `free / 4 * 3` byte for byte (a genuine `free == 0` still refuses); a
+   **failed** query falls back to weights-only accounting (`Some(usize::MAX)`) with a note
+   naming `cudaErrorIllegalAddress (700)`, printed **once per process**; no device state is
+   unbounded and silent. The fallback lets the backend's own allocation be the authority —
+   it reports the real error if the context is genuinely unusable — instead of turning a
+   broken accounting query into a total outage.
+3. E5's fit shares the defect through `device_free_bytes()`, where a failure became
+   `Some(0)` → `weight_budget → 0` → `fit_blocks(0, …)` → **0 device blocks planned** while
+   the startup line said `device free 0 MiB (three quarters of it, …)`. `models::device_memory()`
+   now returns the three-way outcome, and `weight_budget` **refuses** `auto` with the real
+   CUDA error (offering `MINFER_GPU_MEM` as the escape hatch) rather than planning around a
+   non-measurement; `auto_source` can no longer render an unmeasured `device free 0 MiB`.
+   "No device at all" keeps the documented Metal behaviour (fit nothing).
+4. `weights_from_lock(lock, what, sum)` recovers a **poisoned** registry (append-only, so
+   the map behind the poison is still valid) and says so, instead of reporting 0 bytes.
+5. `MemoryReport::budget_is_bounded()` / `headroom_bytes()` treat the unbounded sentinel as
+   *unbounded*, and `kv_snapshot_from` omits the `minfer_memory_budget_bytes` /
+   `headroom_bytes` gauges for it, so the metrics surface never publishes a number that was
+   not measured.
+6. The other memory queries whose return code was discarded in the same neighbourhood: the
+   init banner now reports a failed read instead of printing `0 MB`; the `w16_cache`
+   memory-pressure valve became fail-*closed* (`rc != 0` skips the optional cache, where
+   `rc == 0 && …` used to fall through and allocate it); `plane_budget_ok` keeps the
+   conservative "planes off" decision but prints the error name once instead of silently
+   reading a failure as "not enough memory".
+7. The trigger is fixed at both ends: the fixture allocates its own `nt`-row `qb2` (the
+   timing assertions are untouched — this is a buffer-size fix, not a weakened gate), and
+   the CUDA `Op::Attn` arm refuses a `q` input shorter than `n_tokens * n_head * hd`
+   before the kernel can read past it (the `BufRef::len` contract of rule 13), so this
+   class of mistake is a loud `Err` rather than a corrupted context.
+
+**Measured before / after** (GB10, sm_121, CUDA 13.0, driver 580.178.04; all runs serial,
+`--test-threads=1`).
+
+| Gate | Before (`eeba0d0`) | After |
+|---|---|---|
+| Minimal repro (issue #122's 4 filters) | 3 passed / 1 failed, `exceeds the 0 byte budget` | 3 passed / 1 failed, the failure is the [#87](https://github.com/yusiwen/minfer/issues/87) q8_0-on-CUDA refusal |
+| Full `#[ignore]`d serial set (CUDA) | 5 passed / 14 failed, **26** × `exceeds the 0 byte budget` | **20 passed / 2 failed**, **0** × that message (17/2 before the #47 F2 rebase added three tests to the set) |
+| `compute-sanitizer --tool memcheck` on the latching subset | 4 227 errors, 28+ `Invalid __global__` faults | **11 errors, 0 kernel-memory faults** (6 `cudaGraphDestroy` + 4 `cudaGetLastError` from `graph_replay_step`, 1 `cudaFuncSetAttribute` at init — filed as [#128](https://github.com/yusiwen/minfer/issues/128)) |
+| `cargo test --release` (CPU) | ~340 passed / 0 failed / 18 ignored + 3/0/6 | **382 passed / 0 failed / 21 ignored + 3/0/6** on the rebased tip (346/0/18 before the F2 rebase; the +6 here are the new gates) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU, no `cuda` feature) | 12 passed / 0 failed (a stale count in `AGENTS.md`) | **18 passed / 0 failed** |
+
+**The two residual failures are both #123's.** `a_packed_kv_cache_answers_like_the_f32_one`
+is CPU-only by its own docstring and is refused on CUDA (it *failed alone* the same way
+before this change once the budget was healthy). `a_partial_offload_runs_the_rest_on_the_cpu`
+is second-hand damage: the packed gate sets the **process-wide** KV format to `q8_0` and
+panics at the #87 refusal before its `set_kv_format(F32)` restore runs, so the next test
+builds a `q8_0`-sized CUDA KV region and is refused (issue #99's mechanism). Neither is a
+budget failure — the 0-byte-budget string is absent from the run.
+
+**Acceptance, as measured (pure, CI-covered).**
+
+- `a_failed_device_query_is_not_a_zero_budget`: a `QueryFailed { code: 700, name:
+  "cudaErrorIllegalAddress" }` decision is **not** `Some(0)`; the budget is unbounded, the
+  note names the error **and** the code, and the note contains neither `0 MiB` nor
+  `0 byte budget`.
+- `a_reported_free_read_keeps_the_three_quarters_default`: `free = 4 MiB → 3 MiB`, and the
+  integer rounding `4 000 001 → 3 000 000`, i.e. the happy path is the pre-#122 number.
+- `a_measured_zero_free_read_is_still_a_zero_budget`: a real `free == 0` still refuses, with
+  no excuse attached.
+- `no_device_state_and_an_explicit_budget_are_unchanged`: `NoDevice` is unbounded and
+  silent; an explicit budget is taken as given on every outcome.
+- `a_failed_device_query_refuses_an_auto_fit`: E5's `auto` returns `Err` naming
+  `cudaErrorIllegalAddress (700)`, offers `MINFER_GPU_MEM`, and never quotes a fabricated
+  `0 MiB`; the explicit cap still plans.
+- `the_weight_budget_prefers_the_explicit_cap` / `the_auto_source_names_what_the_fit_decided`:
+  the pre-existing matrix, adapted to the three-way outcome, plus "an unmeasured device is
+  not `device free 0 MiB`".
+- `a_poisoned_registry_does_not_report_zero_weights`: a mutex poisoned by a panic is
+  recovered and reports its real 18 bytes, not 0.
+- **Mutation check** (all three reverted before landing): making `budget_decision` return
+  `Some(0)` on `QueryFailed`, making `weight_budget` return `Ok(0)`, and making
+  `weights_from_lock` return 0 on a poisoned lock each make their gate fail —
+  `0 passed; 3 failed`.
+
+**Honest scope.**
+
+- **Metal is not exercised**: no Mac here. `DeviceMemory::NoDevice` is the Metal arm and
+  keeps `auto` fitting nothing without `MINFER_GPU_MEM`; CI's `build-macos` job compiles the
+  Metal backend, nothing more. `MINFER_DISABLE_CUDA` / no-device behaviour is unchanged and
+  unit-tested through `NoDevice`.
+- The **trigger** (the under-sized fixture `q`) is a *test* defect. The device evidence that
+  production is unaffected is structural — the graph builder sizes the `Attn` input as
+  `nt * n_head * hd` and the real-model gates pass — not a device A/B of a fixed
+  production buffer, because there was no production buffer to fix. The trigger's
+  test-order dependence is measured (subset matrix + one sanitizer run), not inferred.
+- The `compute-sanitizer` numbers are a **memcheck A/B**, not a production measurement: the
+  sanitizer changes allocation layout and timing, so the map-window timing assert fails
+  under it (1.405x) for [#123](https://github.com/yusiwen/minfer/issues/123)'s reasons. The
+  kernel-fault count (28+ → 0) is the part that matters.
+- The **SIGTERM drain path** and the rest of the F8 wiring are untouched.
+- The **residual `a_partial_offload` failure** is attributed to #123/#99 by mechanism and by
+  the error string; it is not fixed here, per the ticket's "do not fix #123 here".
+- No Metal run, no full non-ignored CUDA suite run: the ticket's gates are the `#[ignore]`d
+  serial set plus the CPU suites, all run as above.
+
+**Follow-ups.** [#123](https://github.com/yusiwen/minfer/issues/123) (the two residual
+failures: the CPU-only packed gate and the load-sensitive timing margin),
+[#87](https://github.com/yusiwen/minfer/issues/87) (no CUDA q8_0 KV kernel),
+[#128](https://github.com/yusiwen/minfer/issues/128) (the API-level
+`cudaErrorInvalidValue` findings: `cudaGraphDestroy` on an exec handle, which leaks the
+exec, and the eager `cudaFuncSetAttribute` opt-in failing at init).
 
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 
@@ -3770,22 +3885,27 @@ identical content.
 
 **The full `#[ignore]`d set on this CUDA build is red, and not because of F8.**
 `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1`
-gives **5 passed / 14 failed** at `3616570` (deterministic across two runs), and all
-14 fail with the same refusal: the E4 default CUDA budget collapses to **0 bytes**
-once the conversation and map-window tests have run in one process — the
-`cudaMemGetInfo` free read is discarded and becomes a 0 budget, refusing every later
-allocation — while `/proc/meminfo` sampled during the minimal reproduction showed
-118.6–119.8 GB of 121 GB still available. Run alone, the two F8 gates pass (the table
-above), and the set's other pre-existing problems surface separately:
-`a_packed_kv_cache_answers_like_the_f32_one` is CPU-only by its own docstring and
-fails alone with "no CUDA kernel reads a packed q8_0 region"
-([#87](https://github.com/yusiwen/minfer/issues/87)), and
-`cuda_map_window_costs_no_more_than_the_span_it_replaces` has a 1.25x timing margin
-a loaded GB10 exceeded once (1.267x) and met in another run. All three are filed
-([#122](https://github.com/yusiwen/minfer/issues/122),
-[#123](https://github.com/yusiwen/minfer/issues/123)) and **none reproduces with
-either F8 gate run alone**, which is why the device claim below is scoped to those
-two gates plus the op-timing path.
+gave **5 passed / 14 failed** at `3616570` (deterministic across two runs), all 14
+failing with the same refusal: the E4 default CUDA budget collapsed to **0 bytes**
+once the conversation and map-window tests had run in one process — the
+`cudaMemGetInfo` return code was discarded, `free` stayed 0, and the gate then refused
+every later allocation — while `/proc/meminfo` sampled during the minimal reproduction
+showed 118.6–119.8 GB of 121 GB still available. **That is fixed**
+([#122](https://github.com/yusiwen/minfer/issues/122)): the same command at
+`eeba0d0` + the S4 record below is now **17 passed / 2 failed** (**20 passed / 2 failed**
+on the F2-rebased tip, which added three tests to the set), and the 0-byte-budget
+message appears **0** times. The two residual failures are both the packed-cache gate's
+[#87](https://github.com/yusiwen/minfer/issues/87) cause, tracked in
+[#123](https://github.com/yusiwen/minfer/issues/123): first
+`a_packed_kv_cache_answers_like_the_f32_one` itself (CPU-only by its own docstring,
+refused on CUDA), then `a_partial_offload_runs_the_rest_on_the_cpu`, because the packed
+gate sets the **process-wide** KV format to `q8_0` and panics before restoring `f32`, so
+the next test's CUDA KV region is sized for the wrong format (the #99 mechanism, made
+visible by #87's refusal now being the first failure instead of the budget). The
+map-window gate's 1.25x timing margin (a loaded GB10 exceeded it once, 1.267x) is the
+third #123 item and **passed** in this run. All three are filed, and none reproduces with
+either F8 gate run alone, which is why the device claim below is scoped to those two
+gates plus the op-timing path.
 
 **Honest scope.** (a) Every measurement in the sections *above* this block was taken
 on a **CPU-only build**: that worktree was built with `cargo build --release`,
