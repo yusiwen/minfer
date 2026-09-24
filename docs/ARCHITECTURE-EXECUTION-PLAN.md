@@ -3433,6 +3433,9 @@ remains available for anyone who wants a different window.
 `MINFER_DRAIN_MS` (default `30000`) bounds the graceful drain. Both are
 documented in `docs/USAGE.md`.
 
+*Landed as* [#120](https://github.com/yusiwen/minfer/pull/120) on the branch
+`feat/f8-metrics`.
+
 *Drain.* SIGINT/SIGTERM → set `draining` → `axum::serve` graceful shutdown →
 wait for the serve future at most `MINFER_DRAIN_MS` via `bounded_drain` → on a
 clean drain, a second bounded wait for the worker → otherwise log and record the
@@ -3534,9 +3537,8 @@ generation. Reproduced on this box (CPU, 0.5B Q4_0, `MINFER_BATCH=1`,
 chars and `finish=length`; B `200` with 0 chars, `finish=stop`,
 `completion_tokens=0`, plus `[server] job rejected: no idle slot` in the log. It
 is **out of F8's scope** (it changes `admit`'s contract and the error semantics of
-both serve paths), so it was written up as a follow-up issue; the tracker was
-unreachable from this session, so the write-up is held in the PR and the issue is
-filed as soon as the network returns.
+both serve paths), so it was written up as a follow-up:
+[#121](https://github.com/yusiwen/minfer/issues/121).
 
 **Honest scope.** (a) Every measurement in this record was taken on a **CPU-only
 build**: the worktree was built with `cargo build --release`, without
