@@ -95,15 +95,24 @@ MINFER_DRAIN_MS=5000 ./target/release/minfer serve <model>         # F8: bound t
 curl -s http://127.0.0.1:8080/metrics                              # F8: Prometheus text snapshot
 ```
 
-- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run 2026-09-23: 333 passed / 0 failed / 16 ignored, GB10 sm_121). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)).
+- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run 2026-09-23: 333 passed / 0 failed / 16 ignored, GB10 sm_121). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is now **22 passed / 0 failed** on the CUDA build (0.5B config, #123) — see the real-model-gates bullet below for what changed.
 - Real-model gates (the `#[ignore]`d set): **run it serially** —
-  `cargo test --release --bin minfer -- --ignored --test-threads=1`. Parallel, the set is red on
-  master too (5 passed / 7 failed at `6d53649`), because the C4 packed-cache gate
-  (`a_packed_kv_cache_answers_like_the_f32_one`) sets the **process-wide** KV format for its
-  measurement runs, and any test building a graph while it runs then sizes its KV nodes for
-  another format (`ensure_kv` refuses the mismatch, correctly). Serially it is 12 passed / 0
-  failed on master and on the E4 S2 branch; issue [#99](https://github.com/yusiwen/minfer/issues/99)
-  is the fix (per-engine format).
+  `cargo test --release --bin minfer -- --ignored --test-threads=1`. On a CUDA box it is
+  **22 passed / 0 failed** as of #123 (ten consecutive runs of the same binary, GB10 sm_121); on a
+  CPU-only build it is 21 passed / 0 failed. Parallel, the set is still red on master, because the
+  C4 packed-cache gate (`a_packed_kv_cache_answers_like_the_f32_one`) sets the **process-wide** KV
+  format for its measurement runs, and any test building a graph while it runs then sizes its KV
+  nodes for another format (`ensure_kv` refuses the mismatch, correctly); issue
+  [#99](https://github.com/yusiwen/minfer/issues/99) is the fix (per-engine format). #123 made that
+  gate **device-aware without skipping it**: it loads with `--gpu-layers 0` and asserts the CPU
+  backend, so it still executes the packed path on a CUDA build (q8_0 has no device attention
+  kernel — [#87](https://github.com/yusiwen/minfer/issues/87)) and still executes on a CPU build;
+  a `Drop` guard restores the process-wide KV format even when the gate panics. The map-window
+  timing gate (`cuda_map_window_costs_no_more_than_the_span_it_replaces`) asserts the median of
+  interleaved per-round ratios (9 rounds per mode) instead of two sequential sums, so its verdict
+  no longer depends on a quiet box. The Qwen3-0.6B configuration's set is 21/1: a session cannot
+  encode an f16 KV element type ([#130](https://github.com/yusiwen/minfer/issues/130)), a separate
+  pre-existing defect.
 - Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device" (A0's probes could not see the GPU either way, so "no device" was unsupported).
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md` (stale in places — [#62](https://github.com/yusiwen/minfer/issues/62)). CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
