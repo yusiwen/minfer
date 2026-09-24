@@ -728,10 +728,12 @@ mod tests {
     /// There is no device copy to overlap, and this is the measurement that says
     /// so rather than asserting it.
     ///
-    /// The mode is set programmatically: the environment is process-wide and the
-    /// parallel harness shares it.
+    /// The mode is set programmatically and the whole test holds
+    /// `copystats::gate()`: the override is process-wide and the parallel
+    /// harness shares it.
     #[test]
     fn the_cpu_path_never_enters_the_cross_copy_machinery() {
+        let _gate = crate::graph::copystats::gate();
         let g = small_graph();
         let sched = BackendScheduler::new();
         let input = [1.0f32, -2.0, 3.5, 4.25];
@@ -748,11 +750,11 @@ mod tests {
         };
 
         let (async_bytes, async_stats) = {
-            let _g = crate::graph::copystats::set_sync_for_test(false);
+            let _m = crate::graph::copystats::set_sync_for_test(false);
             run()
         };
         let (sync_bytes, sync_stats) = {
-            let _g = crate::graph::copystats::set_sync_for_test(true);
+            let _m = crate::graph::copystats::set_sync_for_test(true);
             run()
         };
 

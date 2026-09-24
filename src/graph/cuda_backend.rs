@@ -2133,6 +2133,9 @@ mod tests {
             g.nodes[2].backend = Some(crate::graph::Backend::CPU);
             g
         };
+        // The mode override is process-wide, so the whole measurement holds the
+        // gate (the parallel harness shares the process).
+        let gate = copystats::gate();
         let run = |sync: bool| -> (Vec<f32>, CrossCopyStats, u64, u64) {
             let _mode = copystats::set_sync_for_test(sync);
             let g = build();
@@ -2158,6 +2161,7 @@ mod tests {
 
         let (async_out, a, a_readbacks, a_syncs) = run(false);
         let (sync_out, s, s_readbacks, s_syncs) = run(true);
+        drop(gate);
 
         eprintln!(
             "[f5] split graph: async copies={} waits={} blocking={} async_host={} event_syncs={} \

@@ -1681,6 +1681,9 @@ mod tests {
         // One mode = one fresh cache (so the graph is built and then reused across
         // the decode steps, which is the steady state the boundary lives in) and
         // one logits vector per step.
+        // The mode override is process-wide; hold the gate for the whole
+        // comparison so no other test flips it mid-measurement.
+        let gate = copystats::gate();
         let run = |sync: bool| -> (Vec<Vec<f32>>, CrossCopyStats, u64, u64) {
             let _mode = copystats::set_sync_for_test(sync);
             let mut cache = GraphCache::new();
@@ -1723,6 +1726,7 @@ mod tests {
 
         let (async_logits, a, a_readbacks, a_syncs) = run(false);
         let (sync_logits, s, s_readbacks, s_syncs) = run(true);
+        drop(gate);
 
         eprintln!(
             "[f5] async: copies={} waits={} blocking_host_copies={} async_host_copies={} \
