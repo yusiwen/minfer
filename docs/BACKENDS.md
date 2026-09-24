@@ -108,9 +108,12 @@ return past a `threadgroup_barrier`, device limits queried at runtime).
 `4 * n_kv_embd`, so the regions are **3.76× smaller**; the store quantizes and the attention
 reads the packed blocks directly — the K score is a `Q8_0 × Q8_0` dot against the quantized
 query, V accumulates out of the cell, and S1's dequantize-into-a-scratch pass is gone).
-An unknown value is refused on every device, and `q8_0` is CPU-only for now — CUDA and Metal
-refuse it loudly rather than run f32 (their kernels are
-[issue #87](https://github.com/yusiwen/minfer/issues/87)). A physical context shift
+An unknown value is refused on every device, and a backend without a packed-read kernel refuses
+`q8_0` loudly rather than run f32 — the answer is the registry's `reads_packed_kv`, which is **true
+for the CPU (C4 S1/S2a) and CUDA (C4 S2b)** and **false for Metal**, which stays at G5
+([#44](https://github.com/yusiwen/minfer/issues/44); the CUDA tuning left on
+[#87](https://github.com/yusiwen/minfer/issues/87) is the packed fused epilogue, a dp4a packed dot
+and the packed FA prefill). A physical context shift
 (`kv_rm`/`kv_shift`) works on a packed region: the survivors move verbatim and are
 re-rope/re-quantized one row at a time. `MINFER_NO_FUSED_Q8_KV=1` restores the S1 read path
 (the A/B of standing rule 3; measured 1.16× at ctx 512 and 1.31× at ctx 2048 in the fused

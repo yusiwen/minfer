@@ -42,6 +42,39 @@ restriction** — backend assignment is per op, so mixed-group layers run fully
 on the GPU. `Raw` weights are not supported on GPU and select the CPU backend
 for those ops.
 
+### KV Cache Storage Type by Backend
+
+`MINFER_CACHE_TYPE` picks the **KV cache** element type, which is a separate
+axis from the weight type above (`graph/kvformat.rs` is the single authority,
+and the answer for "can this backend read it" is the registry's
+`reads_packed_kv`). A value the backend has no kernel for is **refused at load**,
+never silently mapped to f32.
+
+| `MINFER_CACHE_TYPE` | Cell | CPU | CUDA | Metal |
+|---|---|:---:|:---:|:---:|
+| `f32` (default) | 4 B/element, f32 | ✅ | ✅ | ✅ |
+| `f16` | 2 B/element in the f32-shaped region | → f32 | ✅ | ✅ |
+| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ❌ — G5, [#44](https://github.com/yusiwen/minfer/issues/44) |
+
+Notes:
+
+- **`f16` on the CPU resolves to `f32`** — the CPU has no f16 KV kernel, and an
+  env var set for a GPU run must not break a CPU one.
+- **The default on CUDA/Metal is the model's own auto policy** (f16 when
+  `n_layers × n_kv_embd ≥ 8192`, i.e. the 7B class, f32 for small models); the
+  table's "default" row is the *region shape*, which f16 does not change.
+- **Q8_0 is the packed one**: 3.76× smaller than f32 and 1.88× smaller than the
+  f16 auto policy. On CUDA a Q8_0 decode runs the layout-tagged split-K kernel,
+  and the verify band (`1 < nt ≤ 16`) and prefill route to the general
+  layout-tagged kernel — the f16-typed FA prefill and the hybrid 4-warp dispatch
+  are not offered for a packed cell, so those two paths are correct but off their
+  tuned route. A **speculative** session refuses a packed cache outright (its
+  greedy identity contract rests on the batched split kernel). See
+  `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 S2b.
+- **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
+  % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
+  anything else.
+
 ### Not Yet Supported
 
 | Category | Types |

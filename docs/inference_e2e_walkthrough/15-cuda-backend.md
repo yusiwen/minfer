@@ -1223,7 +1223,8 @@ story of §3.2.1.
   `MINFER_NO_W16CACHE=1` (per-call f16 scratch),
   `MINFER_MMQ_Q6K_EXP=0`/`MINFER_MMQ_Q4K_DSC=0` (drop the precomputed
   planes), `MINFER_NO_FUSE_QKV=1`/`MINFER_NO_FUSE_FFN=1` (decode fusions),
-  `MINFER_CACHE_TYPE=f32|f16|q8_0` (KV element type; `q8_0` is CPU-only, C4),
+  `MINFER_CACHE_TYPE=f32|f16|q8_0` (KV element type; `q8_0` is the packed cache the CPU and CUDA
+  kernels read, C4 — remember it is 15x slower than f16 on a packed `hd = 128` prefill),
   `MINFER_NO_PINNED_READBACK=1` (pageable readback).
 - **CUDA Graph state** — `MINFER_NO_CUDA_GRAPH=1` forces direct launches
   (the A/B lever for replay); `MINFER_NO_PREFILL_CAPTURE=1` disables
