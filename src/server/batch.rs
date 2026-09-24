@@ -2866,6 +2866,95 @@ mod tests {
         assert!(text.contains(&format!("minfer_kv_rows {n_ctx}\n")));
         assert!(text.contains("minfer_requests_running 0\n"));
 
+        // --- growth and release: the same gauges across an arena repartition -----
+        // Issue #51's acceptance asks the metrics to be correct while slots are
+        // "admitted, grown and released". A small arena forces a growth: the long
+        // prompt needs more cells than its slot's share, so the engine releases an
+        // **idle** slot's run and grows the asking one — both of which are visible
+        // in `sequences` and `reserved_cells`.
+        let mut growing = BatchEngine::new(&*model, 2, 256).expect("engine");
+        let gm = crate::server::metrics::ServerMetrics::new();
+        growing.publish_metrics(&gm);
+        let g0 = gm.snapshot();
+        assert_eq!(g0.kv.sequences, 2, "two slots hold a reservation up front");
+        assert_eq!(g0.kv.layers, 0, "no arena before the first forward");
+        assert_eq!(g0.kv.reserved_cells, 256, "128 cells a slot");
+        assert_eq!(g0.running, 0);
+
+        let long: Vec<u32> = (1..=120).collect();
+        let (ltx, mut lrx) = mpsc::channel::<StreamEvent>(4096);
+        growing
+            .submit_on(
+                &*model,
+                &tok,
+                0,
+                Job {
+                    input_ids: long.clone(),
+                    params: sampling_params(64),
+                    tx: ltx,
+                },
+            )
+            .expect("long submit");
+        growing.publish_metrics(&gm);
+        let g1 = gm.snapshot();
+        assert_eq!(g1.running, 1, "the grown request is running");
+        assert_eq!(g1.kv.layers, model.n_layer() as u64);
+        assert!(
+            g1.kv.sequences < g0.kv.sequences,
+            "growing past its share releases an idle slot's run ({} -> {})",
+            g0.kv.sequences,
+            g1.kv.sequences
+        );
+        assert!(
+            g1.kv.owned_cells >= 120,
+            "the long prefill wrote its prompt ({} cells)",
+            g1.kv.owned_cells
+        );
+
+        // Finish it, then ask for work again: the released slot re-reserves, so
+        // the gauge comes back — and `running` is 0 at both ends.
+        let deadline = Instant::now() + std::time::Duration::from_secs(180);
+        while growing.busy() && Instant::now() < deadline {
+            growing.tick(&*model, &tok).expect("tick");
+            while lrx.try_recv().is_ok() {}
+        }
+        assert!(
+            !growing.busy(),
+            "the long request finished inside the deadline"
+        );
+        growing.publish_metrics(&gm);
+        let g2 = gm.snapshot();
+        assert_eq!(g2.running, 0);
+        assert!(g2.kv.owned_cells >= 120);
+        assert!(
+            g2.kv.sequences >= g1.kv.sequences,
+            "a released slot's reservation is gone until it is used again"
+        );
+
+        let short: Vec<u32> = (1..=8).collect();
+        let (stx, _srx) = mpsc::channel::<StreamEvent>(1024);
+        growing
+            .submit_on(
+                &*model,
+                &tok,
+                1,
+                Job {
+                    input_ids: short,
+                    params: sampling_params(2),
+                    tx: stx,
+                },
+            )
+            .expect("short submit");
+        growing.publish_metrics(&gm);
+        let g3 = gm.snapshot();
+        assert_eq!(g3.running, 1);
+        assert!(
+            g3.kv.sequences > g2.kv.sequences,
+            "the second slot's reservation is back ({} -> {})",
+            g2.kv.sequences,
+            g3.kv.sequences
+        );
+
         eprintln!(
             "[f8] metrics: layers {} rows {} region {} B owned {} cells idle_slots {} \
              reserved_classes {}",
@@ -2875,6 +2964,18 @@ mod tests {
             done.kv.owned_cells,
             done.kv.idle_slots,
             done.kv.reserved_classes
+        );
+        eprintln!(
+            "[f8] growth/release: sequences {} -> {} -> {} -> {}, reserved_cells {} -> {}, \
+             owned {} -> {}",
+            g0.kv.sequences,
+            g1.kv.sequences,
+            g2.kv.sequences,
+            g3.kv.sequences,
+            g0.kv.reserved_cells,
+            g1.kv.reserved_cells,
+            g1.kv.owned_cells,
+            g2.kv.owned_cells
         );
     }
 }

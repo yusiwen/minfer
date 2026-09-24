@@ -33,6 +33,77 @@ use crate::optiming::OpTimingEntry;
 /// protocol expects; the version parameter is optional but conventional).
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+/// Seconds of history `minfer_completion_tokens_per_second` averages over.
+///
+/// A trailing window rather than a lifetime average, because a lifetime average
+/// is not a throughput: a server that has been idle for an hour would still
+/// report the burst it served at startup. Sixteen seconds is long enough that a
+/// scrape never sees an empty window on a busy server and short enough that an
+/// idle one decays to 0/s within one scrape interval.
+pub const TOKEN_RATE_WINDOW_SECS: usize = 16;
+const W: usize = TOKEN_RATE_WINDOW_SECS;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A trailing window of generated tokens, one bucket per second.
+///
+/// **One writer** (the HTTP handler finishing a response) and **many readers** (a
+/// scrape), so no lock is needed: each bucket carries the second it belongs to and
+/// [`rate`](Self::rate) ignores buckets older than the window. `add` resets a
+/// bucket whose stamp is stale *before* adding — that is what makes an idle server
+/// decay to 0/s instead of reporting its last burst forever.
+#[derive(Debug)]
+struct TokenWindow {
+    tokens: [AtomicU64; W],
+    /// Epoch second each bucket holds; 0 = never written (a real second is never
+    /// 0 for any clock this will run against, and the check also skips it).
+    stamp: [AtomicU64; W],
+}
+
+impl Default for TokenWindow {
+    fn default() -> Self {
+        Self {
+            tokens: [const { AtomicU64::new(0) }; W],
+            stamp: [const { AtomicU64::new(0) }; W],
+        }
+    }
+}
+
+impl TokenWindow {
+    fn add(&self, tokens: u64, now: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let i = (now as usize) % W;
+        if self.stamp[i].load(Ordering::Relaxed) != now {
+            // Recycle the bucket. The stamp is written after the zero, so a
+            // concurrent scrape can only see a bucket that is empty-but-new (an
+            // undercount for one scrape) and never tokens attributed to the wrong
+            // second.
+            self.tokens[i].store(0, Ordering::Relaxed);
+            self.stamp[i].store(now, Ordering::Relaxed);
+        }
+        self.tokens[i].fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    /// Generated tokens per second over the trailing [`TOKEN_RATE_WINDOW_SECS`].
+    fn rate(&self, now: u64) -> f64 {
+        let mut sum = 0u64;
+        for i in 0..W {
+            let s = self.stamp[i].load(Ordering::Relaxed);
+            if s != 0 && now.saturating_sub(s) < W as u64 {
+                sum += self.tokens[i].load(Ordering::Relaxed);
+            }
+        }
+        sum as f64 / W as f64
+    }
+}
+
 /// A plain snapshot of the allocator's accounting plus the KV arena's shape and
 /// C3/C8b counters — the numbers `/metrics` exports, decoupled from the atomics
 /// so [`render`] is a pure function that is testable without a server.
@@ -246,12 +317,19 @@ pub struct ServerMetrics {
     /// Requests occupying an engine slot right now (worker-published).
     pub running: AtomicU64,
 
+    /// Prompt tokens of the requests whose response was produced.
+    pub prompt_tokens_total: AtomicU64,
+    /// Completion tokens actually delivered to a client.
+    pub completion_tokens_total: AtomicU64,
+    /// Trailing-window bucket store for `minfer_completion_tokens_per_second`.
+    token_window: TokenWindow,
+
     /// KV / allocator occupancy, republished by the worker after every step.
     pub kv: KvMetrics,
 }
 
 /// A plain snapshot of [`ServerMetrics`] — what [`render`] consumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricsSnapshot {
     pub requests_total: u64,
     pub requests_rejected_total: u64,
@@ -264,6 +342,12 @@ pub struct MetricsSnapshot {
     pub worker_pending: u64,
     pub running: u64,
     pub jobs_dropped_total: u64,
+    pub prompt_tokens_total: u64,
+    pub completion_tokens_total: u64,
+    /// Generated tokens/s over the trailing [`TOKEN_RATE_WINDOW_SECS`] (f64: it
+    /// is a rate, and the "no metric without a `# TYPE`" rule is the only shape
+    /// constraint Prometheus puts on it).
+    pub completion_tokens_per_second: f64,
     pub kv: KvSnapshot,
     /// Per-op accumulations. Empty unless `MINFER_OP_TIMING` is set — the whole
     /// timing family is absent then, which is how "off by default" is visible in
@@ -274,6 +358,30 @@ pub struct MetricsSnapshot {
 impl ServerMetrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record one finished request's token counts, and add its completion tokens
+    /// to the throughput window.
+    ///
+    /// Called by the HTTP side when a response is *produced*, so it covers the
+    /// batched and the serial path uniformly and needs no plumbing through the
+    /// engine. A client that disconnects before its answer is complete is not
+    /// counted: those tokens were never delivered, and counting them would report
+    /// throughput no user received.
+    pub fn record_tokens(&self, prompt: u64, completion: u64) {
+        let r = Ordering::Relaxed;
+        if prompt > 0 {
+            self.prompt_tokens_total.fetch_add(prompt, r);
+        }
+        if completion > 0 {
+            self.completion_tokens_total.fetch_add(completion, r);
+            self.token_window.add(completion, now_secs());
+        }
+    }
+
+    /// The current trailing-window rate, without building a whole snapshot.
+    pub fn completion_tokens_per_second(&self) -> f64 {
+        self.token_window.rate(now_secs())
     }
 
     /// Read every atomic into one snapshot (relaxed; see the module docs).
@@ -292,6 +400,9 @@ impl ServerMetrics {
             worker_pending: self.worker_pending.load(r),
             running: self.running.load(r),
             jobs_dropped_total: self.jobs_dropped_total.load(r),
+            prompt_tokens_total: self.prompt_tokens_total.load(r),
+            completion_tokens_total: self.completion_tokens_total.load(r),
+            completion_tokens_per_second: self.token_window.rate(now_secs()),
             kv: self.kv.snapshot(),
             ops: crate::optiming::snapshot(),
         }
@@ -393,6 +504,28 @@ pub fn render(m: &MetricsSnapshot) -> String {
         "Requests currently occupying an engine slot.",
         "gauge",
         m.running,
+    );
+    // --- throughput ---
+    sample(
+        &mut out,
+        "minfer_prompt_tokens_total",
+        "Prompt tokens of the requests whose response was produced.",
+        "counter",
+        m.prompt_tokens_total,
+    );
+    sample(
+        &mut out,
+        "minfer_completion_tokens_total",
+        "Completion tokens delivered to a client.",
+        "counter",
+        m.completion_tokens_total,
+    );
+    sample(
+        &mut out,
+        "minfer_completion_tokens_per_second",
+        "Generated tokens per second over a trailing 16-second window (a lifetime average is not a throughput).",
+        "gauge",
+        format!("{:.3}", m.completion_tokens_per_second),
     );
     // --- drain ---
     sample(
@@ -615,6 +748,9 @@ mod tests {
             worker_pending: 0,
             running: 0,
             jobs_dropped_total: 0,
+            prompt_tokens_total: 0,
+            completion_tokens_total: 0,
+            completion_tokens_per_second: 0.0,
             kv: KvSnapshot::default(),
             ops: Vec::new(),
         }
@@ -691,6 +827,9 @@ mod tests {
             "minfer_requests_running",
             "minfer_draining",
             "minfer_drain_abandoned_requests",
+            "minfer_prompt_tokens_total",
+            "minfer_completion_tokens_total",
+            "minfer_completion_tokens_per_second",
             "minfer_memory_weights_bytes",
             "minfer_memory_pool_bytes",
             "minfer_memory_live_bytes",
@@ -837,6 +976,85 @@ mod tests {
         assert_eq!(seconds(999_999_999), "0.999999999");
         assert_eq!(seconds(1_000_000_000), "1.000000000");
         assert_eq!(seconds(u64::MAX), "18446744073.709551615");
+    }
+
+    /// F8 / issue #51 requires `tokens/s`. The counters are monotone and the rate
+    /// is a **trailing window**, so an idle server decays to 0/s instead of
+    /// reporting its last burst forever.
+    #[test]
+    fn token_counters_and_the_trailing_rate() {
+        let metrics = ServerMetrics::new();
+        let now = 1_000_000u64;
+
+        // Nothing delivered yet: zero counters, zero rate (a scalar, not NaN).
+        assert_eq!(metrics.prompt_tokens_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.completion_tokens_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.token_window.rate(now), 0.0);
+
+        // 160 generated tokens inside one second is 160/16 = 10 tokens/s over the
+        // 16-second window.
+        metrics.token_window.add(160, now);
+        assert!((metrics.token_window.rate(now) - 10.0).abs() < 1e-9);
+        // The same reading one second later still sees the bucket.
+        assert!((metrics.token_window.rate(now + 1) - 10.0).abs() < 1e-9);
+        // And 16 seconds later the bucket has aged out.
+        assert_eq!(metrics.token_window.rate(now + W as u64), 0.0);
+
+        // `record_tokens` drives both counters and only the completion side of the
+        // window.
+        metrics.record_tokens(7, 4);
+        assert_eq!(metrics.prompt_tokens_total.load(Ordering::Relaxed), 7);
+        assert_eq!(metrics.completion_tokens_total.load(Ordering::Relaxed), 4);
+        assert!(metrics.completion_tokens_per_second() > 0.0);
+
+        // A zero-token completion (an immediate stop) counts the prompt and adds
+        // nothing to the window, and a zero prompt is not counted at all.
+        let before = metrics.prompt_tokens_total.load(Ordering::Relaxed);
+        metrics.record_tokens(0, 0);
+        assert_eq!(metrics.prompt_tokens_total.load(Ordering::Relaxed), before);
+    }
+
+    /// Two tokens in the same second land in one bucket; tokens in different
+    /// seconds land in different buckets; and the total is the sum.
+    #[test]
+    fn the_token_window_buckets_by_second() {
+        let w = TokenWindow::default();
+        w.add(10, 500);
+        w.add(6, 500);
+        w.add(8, 501);
+        assert_eq!(w.tokens[(500 % W)].load(Ordering::Relaxed), 16);
+        assert_eq!(w.tokens[(501 % W)].load(Ordering::Relaxed), 8);
+        // (16 + 8) / 16
+        assert!((w.rate(501) - 1.5).abs() < 1e-9);
+
+        // A bucket is recycled after exactly W seconds: the same slot, a new
+        // second, and the old tokens are gone (not added to the new reading).
+        w.add(4, 500 + W as u64);
+        assert_eq!(w.tokens[(500 % W)].load(Ordering::Relaxed), 4);
+        assert!((w.rate(500 + W as u64) - 12.0 / W as f64).abs() < 1e-9);
+    }
+
+    /// The rendered family carries the rate and the counters, so a scrape sees
+    /// them without a Prometheus server computing anything.
+    #[test]
+    fn the_token_families_render() {
+        let metrics = ServerMetrics::new();
+        metrics.record_tokens(11, 22);
+        let text = render(&metrics.snapshot());
+        assert_well_formed(&text);
+        assert!(text.contains("minfer_prompt_tokens_total 11\n"));
+        assert!(text.contains("minfer_completion_tokens_total 22\n"));
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("minfer_completion_tokens_per_second "))
+            .expect("rate family");
+        let v: f64 = line
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("rate is a float");
+        assert!(v > 0.0, "rate must be positive after a completion: {line}");
     }
 
     /// A metric moved by both sides shows up in one scrape: the handler's
