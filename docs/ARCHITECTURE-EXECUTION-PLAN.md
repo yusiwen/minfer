@@ -3446,12 +3446,27 @@ automated gate drives directly.
 delta of **+24 passed, +2 ignored** from the pre-F8 baseline (313/0/16 and 3/0/6,
 at `911ce2c`). The 24 new non-ignored tests are the rendering boundary set, the
 HTTP round-trips, the drain bound, the in-flight guard, the deadline parse, and
-the timing gates. The 2 new ignored tests are the real-model gates, run here with
-`cargo test --release --bin minfer -- --ignored --test-threads=1`:
+the timing gates. The 2 new ignored tests are the real-model gates, and the whole
+ignored set run serially is **18 passed / 0 failed**
+(`cargo test --release --bin minfer -- --ignored --test-threads=1`):
 `published_metrics_move_as_requests_are_served` (24 layers, 128 rows,
 3 145 728 B of KV region, `running` 0 → 1 → 0) and
-`serve_loop_publishes_the_queue_and_running_depth` (peak queue 1, peak running 1,
-and the deterministic one-slot round dropping exactly 1 job).
+`serve_loop_publishes_the_queue_and_running_depth` (the real serve loop; peak
+running 2, and the deterministic one-slot round dropping exactly 1 job). CI's
+CUDA step, `cargo test --release --features cuda --no-run`, is clean locally too
+(nvcc 13.0, no device needed).
+
+The first version of the serve-loop gate was **itself** flaky and the failure was
+worth recording: it sampled for a peak every millisecond while serving 2-token
+answers that finish inside one sampling interval, so "the peak was 0" was true of
+the sampler, not the worker; and simply raising `max_tokens` with `n_ctx = 128`
+made a request try to grow to the whole arena, which released the other slot's
+reservation and killed both requests. The gate now asks for 128-token answers over
+`n_ctx = 1024`, and only stops after it has actually *seen* `running > 0`.
+`queue_depth` is deliberately **not** peak-asserted: `serve_loop` calls `admit` on
+every iteration and a job is placed or rejected within that pass, so the non-zero
+window after a send is shorter than a sampler's interval — the arithmetic is gated
+purely and the loop's drain through `accepted - queue_depth == n`.
 
 **End-to-end run (manual, on this box, CPU, Qwen2.5-0.5B Q4_0, `MINFER_BATCH=1`).**
 A live `minfer serve` on port 18099 with `MINFER_OP_TIMING=1` and
@@ -3484,21 +3499,45 @@ index fails `op_names_agree_with_op_index` with "two variants map to index 9".
 Both were reverted; the shared test gate is poison-tolerant so a mutation produces
 one named failure rather than a cascade of `PoisonError`s.
 
-**Honest scope.** (a) Per-op timing measures the **scheduler's per-node
+**A defect found while gating this (pre-existing, not F8's).** The new
+`minfer_jobs_dropped_total` counter made it visible: `serve_loop` calls `admit`
+every iteration, and `admit` consumes the `Job`, so a job rejected with "no idle
+slot" has its event sender dropped without an error event — the handler then
+answers **`200` with empty content**, which a client cannot tell from an empty
+generation. Reproduced on this box (CPU, 0.5B Q4_0, `MINFER_BATCH=1`,
+`--n-slots 1`, two concurrent `max_tokens=200` requests): A `200` with 1014
+chars and `finish=length`; B `200` with 0 chars, `finish=stop`,
+`completion_tokens=0`, plus `[server] job rejected: no idle slot` in the log. It
+is **out of F8's scope** (it changes `admit`'s contract and the error semantics of
+both serve paths), so it was written up as a follow-up issue; the tracker was
+unreachable from this session, so the write-up is held in the PR and the issue is
+filed as soon as the network returns.
+
+**Honest scope.** (a) Every measurement in this record was taken on a **CPU-only
+build**: the worktree was built with `cargo build --release`, without
+`--features cuda`, so the server's banner reads `device cpu` and the CUDA backend
+is not compiled in at all (the outer tree's CUDA binary was left untouched). This
+ticket does not need a device and the wiring is backend-agnostic — the timing hook
+is in the shared scheduler and `kv_snapshot_from` reads whatever backend the model
+reports — so no CUDA/Metal *runtime* claim is made here. The CUDA compile path is
+covered locally with `cargo test --release --features cuda --no-run` (nvcc 13.0,
+no device needed) and by CI's `build-linux-cuda`; the macOS compile path is CI's
+`build-macos` only. (b) Per-op timing measures the **scheduler's per-node
 dispatch** — the one choke point CPU/Metal/CUDA share — so it includes the
 backend's prologue and excludes split-level syncs, cross-backend staging copies,
-allocator liveness and `fill_input`; there is no kernel-only timer. (b) There is
+allocator liveness and `fill_input`; there is no kernel-only timer. (c) There is
 no histogram and no token/latency accounting (no `_bucket`/`_sum` families,
 no time-to-first-token): the ticket asked for occupancy, depth, per-op timing and
 drain, and adding a histogram would need a bucket policy this ticket did not
-specify. (c) The serial (non-batched) path has one `GraphCache` per slot, so
+specify. (d) The serial (non-batched) path has one `GraphCache` per slot, so
 `/metrics` reports the arena of the slot that served the last request rather than
-a sum; the batched path reports its single shared arena in full. (d) Queue depth
+a sum; the batched path reports its single shared arena in full. (e) Queue depth
 is a subtraction of two relaxed counters, so a scrape can transiently read 0
 while a job is in the channel; it is exact in the steady state and saturating,
-never negative. (e) The CMake/Metal and x86/CUDA paths are compile-checked by CI
-only — this box has no `nvcc` and no Metal, so the timing hook is exercised on
-CPU here. (f) The signal path is **not in the automated suite** — only
+never negative. (f) The Metal path is compile-checked by CI's
+`build-macos` only (there is no Mac here); the CUDA path is compile-checked both by
+CI's `build-linux-cuda` and locally (see (a)), and the timing hook itself is
+exercised on CPU here. (g) The signal path is **not in the automated suite** — only
 `bounded_drain`, the deadline parse and the draining `503` are. The end-to-end
 runs above were performed by hand on this box and are recorded here as manual
 evidence, not as a CI gate; wiring a `SIGTERM` into a test would mean a
