@@ -118,11 +118,26 @@ pub fn async_copies_enabled() -> bool {
 ///
 /// The guard restores the previous override even if the test panics, so a
 /// failed assertion cannot leave the rest of the binary in the other mode.
+///
+/// `OVERRIDE` is process-wide (the environment it stands in for is), so a gate
+/// that reads it must hold [`gate`] for the whole measurement — two tests
+/// flipping the mode concurrently would otherwise measure each other's. This is
+/// the same discipline `optiming::gate` exists for.
 #[cfg(test)]
 #[must_use = "the guard restores the previous mode on drop"]
 pub fn set_sync_for_test(sync: bool) -> SyncModeGuard {
     let prev = OVERRIDE.swap(if sync { 2 } else { 1 }, Ordering::Relaxed);
     SyncModeGuard { prev }
+}
+
+/// Serialize every test that reads or writes [`OVERRIDE`].
+#[cfg(test)]
+pub fn gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking test must not poison the gate for the rest of the binary: the
+    // mode guard already restored the override on unwind, so the lock holds no
+    // broken invariant.
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// See [`set_sync_for_test`].
@@ -182,12 +197,15 @@ mod tests {
     }
 
     /// The gate is a mode switch, not a one-way door: forcing synchronous and
-    /// back leaves the default (async) in force.
+    /// back leaves the default (async) in force. The whole check holds
+    /// [`gate`], because the override is process-wide and the parallel harness
+    /// shares it.
     #[test]
     fn the_sync_mode_override_restores_itself() {
+        let _gate = gate();
         assert!(async_copies_enabled(), "the async substrate is the default");
         {
-            let _g = set_sync_for_test(true);
+            let _m = set_sync_for_test(true);
             assert!(sync_copies());
             assert!(!async_copies_enabled());
         }
