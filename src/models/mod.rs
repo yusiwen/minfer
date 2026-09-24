@@ -135,6 +135,19 @@ impl Device {
             Device::Cuda => "cuda",
         }
     }
+
+    /// F4: the backend registry handle this device names — the single bridge
+    /// between the two id spaces, so a per-backend capability can be asked of the
+    /// registry from a `Device` (this is what `KvFormat::supports` does).
+    /// `Device` itself stays the coarse "the device participates" fact the
+    /// server's batching default reads.
+    pub fn backend(self) -> crate::graph::Backend {
+        match self {
+            Device::Cpu => crate::graph::Backend::CPU,
+            Device::Metal => crate::graph::Backend::METAL,
+            Device::Cuda => crate::graph::Backend::CUDA,
+        }
+    }
 }
 
 /// D3: should the FFN decode fusion be built as a **composition** (concat

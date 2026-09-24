@@ -215,16 +215,11 @@ impl BackendScheduler {
             // capture (per-node host readbacks inside a capture window are
             // illegal — they would corrupt the recorded graph).
             #[cfg(feature = "cuda")]
-            let replayed = if capture {
+            let replayed = if capture || split.backend != BackendTag::CUDA {
                 false
             } else {
-                match split.backend {
-                    BackendTag::Cuda => {
-                        let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
-                        c.graph_replay(graph.uid, split.node_range, graph.capture_nt_hint())
-                    }
-                    _ => false,
-                }
+                let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
+                c.graph_replay(graph.uid, split.node_range, graph.capture_nt_hint())
             };
             #[cfg(not(feature = "cuda"))]
             let replayed = false;
@@ -305,23 +300,19 @@ impl BackendScheduler {
                 } else {
                     None
                 };
-                match split.backend {
-                    BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br, kv_pair)?,
-                    #[cfg(target_os = "macos")]
-                    BackendTag::Metal => {
-                        let m = alloc.metal_mut().ok_or("Metal backend not enabled")?;
-                        m.execute_node(node, &in_bufs, br, kv_pair)?;
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    BackendTag::Metal => return Err("Metal unavailable".into()),
-                    #[cfg(feature = "cuda")]
-                    BackendTag::Cuda => {
-                        let c = alloc.cuda_mut().ok_or("CUDA backend not enabled")?;
-                        c.execute_node(node, &in_bufs, br, kv_pair)?;
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    BackendTag::Cuda => return Err("CUDA backend not implemented".into()),
-                }
+                // F4: one dispatch for every backend — the registry entry's pool
+                // hook, then the trait's `execute_node` on it. The per-backend
+                // `#[cfg]` arms (and their "unavailable" strings) are gone; a
+                // backend whose pool is not enabled is a loud error naming it.
+                let pool = alloc.pool_mut(split.backend).ok_or_else(|| {
+                    format!(
+                        "{} backend not enabled: {}",
+                        split.backend.name(),
+                        crate::graph::registry::unavailable_reason(split.backend)
+                            .unwrap_or("the backend's pool is not enabled")
+                    )
+                })?;
+                pool.execute_node(node, &in_bufs, br, kv_pair)?;
                 if let Some(t0) = t0 {
                     crate::optiming::record(crate::optiming::op_index(&node.op), t0.elapsed());
                 }
@@ -341,7 +332,7 @@ impl BackendScheduler {
                                 }
                             }
                             #[cfg(target_os = "macos")]
-                            BackendTag::Metal => {
+                            BackendTag::METAL => {
                                 metal_srcs.push((id, br.id));
                             }
                             // CUDA: queue an async D2H into the pinned capture
@@ -352,7 +343,7 @@ impl BackendScheduler {
                             // under the staging ceiling fall back to the
                             // per-node sync copy (GB-scale prefill tensors).
                             #[cfg(feature = "cuda")]
-                            BackendTag::Cuda => {
+                            BackendTag::CUDA => {
                                 if let Some(c) = alloc.cuda_mut() {
                                     if c.capture_enq(br.id) {
                                         cuda_caps.push(id);
@@ -407,13 +398,13 @@ fn window_of(br: BufRef, data: &[f32]) -> Option<&[f32]> {
 /// Read a buffer's host data. CPU: direct. Metal: only safe for host-filled
 /// inputs (no pending GPU work); staged Metal outputs go through
 /// `flush_metal_captures` instead.
+///
+/// F4: the trait's borrowed `read_host` through the registry's pool hook — not
+/// the `host_read` hook, because a device whose read is a *copy* (CUDA) has no
+/// borrowed form (`read_host` is `None` there), which is exactly the pre-F4
+/// answer for this path.
 fn read_host_buffer(alloc: &GraphAllocator, backend: BackendTag, id: usize) -> Option<&[f32]> {
-    match backend {
-        BackendTag::CPU => alloc.cpu().read_host(id),
-        #[cfg(target_os = "macos")]
-        BackendTag::Metal => alloc.metal().and_then(|m| m.read_host(id)),
-        _ => None,
-    }
+    alloc.pool(backend)?.read_host(id)
 }
 
 /// Analyze + record one node's output (shared by the immediate and the staged
@@ -546,13 +537,13 @@ mod tests {
     fn split_on_backend_change() {
         let mut g = small_graph();
         g.nodes[0].backend = Some(BackendTag::CPU);
-        g.nodes[1].backend = Some(BackendTag::Metal);
+        g.nodes[1].backend = Some(BackendTag::METAL);
         g.nodes[2].backend = Some(BackendTag::CPU);
         let sched = BackendScheduler::new();
         let splits = sched.split_graph(&g);
         assert_eq!(splits.len(), 3);
         assert_eq!(splits[0].backend, BackendTag::CPU);
-        assert_eq!(splits[1].backend, BackendTag::Metal);
+        assert_eq!(splits[1].backend, BackendTag::METAL);
         assert_eq!(splits[2].backend, BackendTag::CPU);
         assert_eq!(splits[0].outputs, vec![0]);
         assert_eq!(splits[1].inputs, vec![0]);

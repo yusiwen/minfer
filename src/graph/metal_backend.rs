@@ -257,54 +257,116 @@ impl Drop for MetalBackend {
     }
 }
 
+/// F4: the Metal capability matrix, as a free function.
+///
+/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
+/// which cannot take a `&self`; the trait method below forwards to it.
+pub fn supports_op(op: &Op, dtype: DType) -> bool {
+    match op {
+        Op::Input => true,
+        Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::QkNorm { .. } | Op::SwiGLU => {
+            dtype == DType::F32
+        }
+        Op::MatMul { .. } => {
+            matches!(dtype, DType::F32) // activations are f32; weight type in meta
+        }
+        Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
+        Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
+        Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
+        // D1: Metal's kernels take a buffer and a length, with no element
+        // offset, so it can only express an *exact* view (offset 0 == the
+        // parent's own buffer, which is what the allocator maps). An offset
+        // window would read the wrong bytes, so it is refused here rather
+        // than silently mis-computed — the allocator backstops the partial
+        // case, which `supports_op` cannot see (the parent's length is not
+        // in the op). G5 is where Metal would learn offsets.
+        Op::View { offset, .. } => *offset == 0,
+        Op::Reshape { .. } | Op::Permute { .. } => true,
+        Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
+        // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
+        // Metal the graph builder never emits it (qkv_epilogue_ok = false
+        // without `--features cuda`), so it is never assigned here.
+        Op::QkvBiasRopeStore { .. } => false,
+    }
+}
+
+/// F4: the fusion-pass capability, as a free function (see [`supports_op`]).
+pub fn supports_fused(fused: &FusedOp) -> bool {
+    // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
+    // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
+    // FusionPass target, so it is not advertised here.
+    matches!(fused, FusedOp::SwiGLU)
+}
+
+/// C8b S5: Metal has no cell-store read path yet (G5), so it refuses **both**
+/// explicit window layouts the KV store can hand a node — `attn_span`'s single
+/// `[lo, hi)` pair per query and `kv_map`'s `(cell, len)` runs. The trait
+/// default is already `false`; this constant is where a reader looks, and
+/// `execute_node`'s Attn arm backstops it.
+pub const SUPPORTS_ATTN_SPAN: bool = false;
+
+/// C4: Metal addresses f32/f16 KV rows, so it does not read a packed `q8_0`
+/// region; [#87] is the work that adds the kernel and flips this.
+///
+/// [#87]: https://github.com/yusiwen/minfer/issues/87
+pub const READS_PACKED_KV: bool = false;
+
+/// F4: this backend's registry entry (see `cpu_backend::entry`).
+pub fn entry() -> super::registry::BackendEntry {
+    use super::registry::{Backend as Handle, BackendCaps, BackendEntry, PRIORITY_METAL};
+    BackendEntry {
+        handle: Handle::METAL,
+        name: "metal",
+        priority: PRIORITY_METAL,
+        caps: BackendCaps {
+            supports_op,
+            supports_fused,
+            supports_attn_span: SUPPORTS_ATTN_SPAN,
+            reads_packed_kv: READS_PACKED_KV,
+        },
+        pool: |a| a.metal().map(|m| m as &dyn Backend),
+        pool_mut: |a| a.metal_mut().map(|m| m as &mut dyn Backend),
+        host_read: |a, id| a.metal().and_then(|m| m.read_host(id)).map(|s| s.to_vec()),
+        // The MPS device layer holds the process-wide f16 policy (C5 records it
+        // so a session written under one width cannot be resumed under another).
+        kv_format: |_| {
+            if crate::metal::kv_cache_is_f16() {
+                super::kvformat::KvFormat::F16
+            } else {
+                super::kvformat::KvFormat::F32
+            }
+        },
+        enable: |a| a.enable_metal(),
+        unavailable: || {
+            if metal_available() {
+                None
+            } else {
+                Some("no Metal device, or MPS is unavailable (MINFER_DISABLE_MPS)")
+            }
+        },
+    }
+}
+
+/// F4: register the Metal backend (macOS only).
+pub fn register(registry: &mut super::registry::Registry) {
+    registry.register_entry(entry());
+}
+
 impl Backend for MetalBackend {
     fn name(&self) -> &str {
         "metal"
     }
 
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
-        match op {
-            Op::Input => true,
-            Op::Add | Op::Mul | Op::Silu | Op::RmsNorm { .. } | Op::QkNorm { .. } | Op::SwiGLU => {
-                dtype == DType::F32
-            }
-            Op::MatMul { .. } => {
-                matches!(dtype, DType::F32) // activations are f32; weight type in meta
-            }
-            Op::GetRows | Op::RoPE { .. } | Op::Attn { .. } => dtype == DType::F32,
-            Op::KvcacheStore { .. } | Op::KvcacheLoad { .. } => dtype == DType::F32,
-            Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
-            // D1: Metal's kernels take a buffer and a length, with no element
-            // offset, so it can only express an *exact* view (offset 0 == the
-            // parent's own buffer, which is what the allocator maps). An offset
-            // window would read the wrong bytes, so it is refused here rather
-            // than silently mis-computed — the allocator backstops the partial
-            // case, which `supports_op` cannot see (the parent's length is not
-            // in the op). G5 is where Metal would learn offsets.
-            Op::View { offset, .. } => *offset == 0,
-            Op::Reshape { .. } | Op::Permute { .. } => true,
-            Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
-            // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
-            // Metal the graph builder never emits it (qkv_epilogue_ok = false
-            // without `--features cuda`), so it is never assigned here.
-            Op::QkvBiasRopeStore { .. } => false,
-        }
+        supports_op(op, dtype)
     }
 
-    /// C8b S5: Metal has no cell-store read path yet (G5), so it refuses **both**
-    /// explicit window layouts the KV store can hand a node — `attn_span`'s single
-    /// `[lo, hi)` pair per query and `kv_map`'s `(cell, len)` runs. The trait
-    /// default is already `false`; this override is where a reader looks, and
-    /// `execute_node`'s Attn arm backstops it.
     fn supports_attn_span(&self) -> bool {
-        false
+        SUPPORTS_ATTN_SPAN
     }
 
     fn supports_fused(&self, fused: &FusedOp) -> bool {
-        // swiglu_f32 is the only fusion-pass kernel. The bias+rope+store
-        // capability is a build-time fused node (FusedQKV/FusedQkvNorm), not a
-        // FusionPass target, so it is not advertised here.
-        matches!(fused, FusedOp::SwiGLU)
+        supports_fused(fused)
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {

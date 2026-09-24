@@ -91,33 +91,19 @@ pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> Compu
     BackendScheduler::new().assign_backends(&mut g, &alloc);
     // FusionPass so the exported graph matches the executed graph (the cache
     // applies it after assignment — silu+mul → SwiGLU etc.).
+    //
+    // F4: the backend list and the node → index map come from the allocator's
+    // registry view (`fusion_backends` / `fusion_backend_index`), replacing the
+    // hand-built `[cpu, metal?, cuda?]` vector plus the `name() == "cuda"`
+    // position lookup — so the list and the indices cannot drift apart.
     {
         use crate::graph::backend::Backend as BackendTrait;
         use crate::graph::fusion::FusionPass;
-        let backends: Vec<&dyn BackendTrait> = {
-            #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
-            let mut v: Vec<&dyn BackendTrait> = vec![alloc.cpu()];
-            #[cfg(target_os = "macos")]
-            if gparams.cparams.gpu {
-                if let Some(m) = alloc.metal() {
-                    v.push(m);
-                }
-            }
-            #[cfg(feature = "cuda")]
-            if gparams.cparams.gpu {
-                if let Some(c) = alloc.cuda() {
-                    v.push(c);
-                }
-            }
-            v
-        };
-        // Index into `backends` for the fusion pass's supports_fused probe.
-        let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
-        FusionPass::new().run(&mut g, &backends, &|g, id| match g.node(id).backend {
-            Some(Backend::CPU) => Some(0),
-            Some(Backend::Metal) => Some(1),
-            Some(Backend::Cuda) => cuda_idx,
-            _ => None,
+        let backends: Vec<&dyn BackendTrait> = alloc.fusion_backends();
+        FusionPass::new().run(&mut g, &backends, &|g, id| {
+            g.node(id)
+                .backend
+                .and_then(|b| alloc.fusion_backend_index(b))
         });
     }
     g
@@ -175,11 +161,8 @@ impl ComputeGraph {
 }
 
 fn backend_name(b: Backend) -> &'static str {
-    match b {
-        Backend::CPU => "cpu",
-        Backend::Metal => "metal",
-        Backend::Cuda => "cuda",
-    }
+    // F4: the registry owns the name; the exporter reads it rather than matching.
+    b.name()
 }
 
 pub(crate) fn dtype_name(d: DType) -> &'static str {
