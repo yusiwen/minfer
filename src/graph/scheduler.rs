@@ -176,6 +176,9 @@ impl BackendScheduler {
         let trace_on = crate::trace::enabled();
         let live_on = crate::live::enabled();
         let capture = trace_on || live_on;
+        // F8: resolved once per execute() (a cached relaxed load), so the
+        // per-node check is a branch and the clock is only read when it is on.
+        let op_timing = crate::optiming::enabled();
         if trace_on {
             crate::trace::begin_step();
         }
@@ -291,6 +294,17 @@ impl BackendScheduler {
                 };
                 // NOTE: execution follows node id order (build order), which is
                 // the graph's topological order by construction.
+                //
+                // F8: per-op timing wraps exactly this dispatch when
+                // `MINFER_OP_TIMING` is set. `t0` is `None` on the default path,
+                // so the flag off means the clock is never read. See
+                // `crate::optiming` for what the interval does and does not
+                // attribute.
+                let t0 = if op_timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 match split.backend {
                     BackendTag::CPU => alloc.cpu_mut().execute_node(node, &in_bufs, br, kv_pair)?,
                     #[cfg(target_os = "macos")]
@@ -307,6 +321,9 @@ impl BackendScheduler {
                     }
                     #[cfg(not(feature = "cuda"))]
                     BackendTag::Cuda => return Err("CUDA backend not implemented".into()),
+                }
+                if let Some(t0) = t0 {
+                    crate::optiming::record(crate::optiming::op_index(&node.op), t0.elapsed());
                 }
                 // CAPTURE AFTER EXECUTION — this step's output
                 if capture {
@@ -578,5 +595,66 @@ mod tests {
         for i in 0..4 {
             assert!((got[i] - (silu((i + 1) as f32) + (i + 1) as f32)).abs() < 1e-5);
         }
+    }
+
+    /// F8 (#51): `MINFER_OP_TIMING` reports numbers, it never computes them.
+    ///
+    /// The gate runs the *same* graph twice through the *same* scheduler, once
+    /// with the flag off and once on, and asserts the output buffer is
+    /// bit-identical — the flagged path may only differ in the table it fills.
+    /// The second half asserts the table actually moved, so the equality above is
+    /// not the equality of "timing is broken and never ran".
+    ///
+    /// Both halves take `optiming::GATE` because `force` is process-global: a
+    /// parallel graph test executing while the flag is forced on would otherwise
+    /// pollute the delta.
+    #[test]
+    fn op_timing_does_not_change_the_result_but_does_accumulate() {
+        let _g = crate::optiming::gate();
+        let g = small_graph();
+        let sched = BackendScheduler::new();
+        let input = [1.0f32, 2.0, 3.0, 4.0];
+
+        let run = |timing: bool| -> Vec<f32> {
+            crate::optiming::force(timing);
+            let mut alloc = GraphAllocator::new();
+            alloc.alloc_graph(&g).unwrap();
+            alloc.fill_input(&g, "x", &input).unwrap();
+            sched.execute(&g, &mut alloc).unwrap();
+            alloc.get_buffer(&g, 2).unwrap().to_vec()
+        };
+
+        // Off first, so the on-run is the only thing that can fill the table.
+        let off = run(false);
+        let before = crate::optiming::snapshot();
+        let calls_before = before
+            .iter()
+            .find(|e| e.name == "silu")
+            .map_or(0, |e| e.calls);
+        let on = run(true);
+        crate::optiming::force(false);
+        let after = crate::optiming::snapshot();
+        let calls_after = after
+            .iter()
+            .find(|e| e.name == "silu")
+            .map_or(0, |e| e.calls);
+
+        assert_eq!(
+            off, on,
+            "the timing flag must not perturb the computation, only the report"
+        );
+        assert!(
+            calls_after > calls_before,
+            "the flagged run must have recorded silu executions ({calls_before} -> {calls_after})"
+        );
+        // And with the flag off again, the scheduler reads the clock zero times:
+        // the table is unchanged by a run.
+        let quiet = run(false);
+        assert_eq!(quiet, off);
+        let now = crate::optiming::snapshot()
+            .iter()
+            .find(|e| e.name == "silu")
+            .map_or(0, |e| e.calls);
+        assert_eq!(now, calls_after, "a run with the flag off records nothing");
     }
 }

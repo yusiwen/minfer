@@ -19,6 +19,7 @@ mod live;
 #[cfg(target_os = "macos")]
 mod metal;
 mod models;
+mod optiming;
 mod quants;
 mod sampler;
 mod server;
