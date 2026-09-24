@@ -1142,13 +1142,53 @@ CLI and records what the server still needs.
 - *Not verified here*: a CUDA or Metal session companion (the container is backend-tagged and
   the CPU path is what this box measured; the CUDA half of C5's own gate was run at S1).
 
-**Still open on [#89](https://github.com/yusiwen/minfer/issues/89): the server slot
-snapshot.** `server::batch` keeps a per-slot table (`seq`, `start`, `cap`, the in-flight
-`Run`) that admission rebuilds from scratch, so a restart drops every in-flight conversation
-even though the rows are recoverable in the same container. That needs the slot table and
-each slot's request state in the host blob, a restore path in admission, and a refusal for a
-snapshot taken under another `--n-slots`/`n_ctx` — a server-lifecycle increment, so it is
-handed off rather than half-wired here.
+**C5 S2b — the server's slot snapshot (2026-09-24).**
+
+`server::batch` keeps a per-slot table (`seq`, `start`, `cap`, `cached_tokens`) that admission
+rebuilt from scratch, so a restart dropped every slot's context even though the rows were
+recoverable in the same container.
+
+**The design decision, stated because the issue's wording admits two readings.** A `Run` holds
+the response channel to a client that a restart has already disconnected, plus its RNG and the
+row's logits — none of it survives a process boundary, and "resuming" a stream nobody is reading
+would be a fiction. So the snapshot carries the **context**, not the in-flight request: each
+slot's reservation and the token sequence its rows hold. A request that arrives after the restart
+with the same prefix is admitted onto the restored rows and prefills only its own delta — B2's
+cross-request prefix reuse, with the rows coming from disk. That is the property the acceptance
+measures ("resume the slot, and get the same continuation").
+
+- **`SlotRow` / `SlotsSnapshot`** (`server/batch.rs`) are the table, as versioned JSON in the
+  container's opaque host section — the same mechanism S2a added, so the two halves cannot drift
+  apart and a version this build does not know is a refusal.
+- **`BatchEngine::save_slots(path)`** writes the table *and* the arena through
+  `kv_save_with_host`; **`load_slots(path, model)`** loads it back, validates it against this run
+  (another `--n-slots`/`--n-ctx`, another model, another KV element type, a table whose sequence
+  ids or written extents disagree with the arena it rode in with), and installs the slots.
+- **When it is written: after every completed request** (`finish`). That is when a slot's context
+  is stable and it is the last moment the rows are known-good — so a server killed *without*
+  warning still resumes the conversations that had finished, which shutdown-time saving would not
+  give. The cost is one arena write per completed request (`--slots-file` prints the size at
+  startup; ~12 MiB for the 0.5B/512-row fixture), which is why the flag is opt-in.
+- **`--slots-file <PATH>`** (CLI) → `server::run` → the worker, which loads at startup and
+  rewrites on completion, printing what it resumed or why it started empty. The **serial**
+  (non-batched) path has no shared arena to snapshot and says so loudly instead of writing
+  nothing quietly; the batched engine is the one with cross-request prefix reuse to restore.
+
+**Acceptance, as measured** (2026-09-24, Qwen2.5-0.5B Q4_0, CPU, 512 rows over 2 slots):
+
+- *Resumes without re-prefilling*: the cold run feeds `5/5` prompt tokens; the restored engine
+  feeds **`1/5`** (4 reused) for the same prompt, and its next turn — a continuation carrying the
+  whole conversation — feeds `6/11` (5 reused). A re-render would have fed all 11.
+- *Same continuation*: the restored run's generated text and token count equal the run that never
+  stopped (`a_slot_snapshot_resumes_the_context_without_re_prefilling`, `#[ignore]`d, on the
+  cached model).
+- *Refusals, naming both numbers*: a 2-slot snapshot into a 1-slot engine (`--n-slots`), and a
+  512-row snapshot into a 1024-row server (`--n-ctx`).
+- *Gate, mutation-checked*: dropping the token mirror from `load_slots` makes the resumed prompt
+  feed `5/5` again and fails the gate. Suites: CPU **288 passed / 0 failed / 16 ignored** (was
+  287/0/15).
+- *Sharing*: `kvformat.rs` gains `expect_for(model, n_ctx)` / `backend_of(device)`, and the CLI's
+  `--session` engine now uses them too, so "what this file must match" has one definition.
 
 ### C6 — Logical positions (`positions` ≠ cells)
 
