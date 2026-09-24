@@ -105,6 +105,13 @@ cross-request prefix reuse each slot otherwise keeps), while on the GB10 it is
 **1.97x faster** (7B Q4_K_M, four identical prompts, equal work, `--n-slots 4`,
 default settings). The plan's E2 and E6 records have the tables.
 
+- `--slots-file <PATH>` (batched engine only) — resume the server's slot contexts from
+  `PATH` at startup and rewrite it after every completed request (C5 S2). A request whose
+  prompt matches a restored slot's tokens prefills only its own delta; the file also carries
+  the KV rows, so a restart no longer re-prefills the conversations that had finished. The
+  startup line prints the size it will write per request (about 12 MiB for a 0.5B/512-row
+  arena), because that cost is a decision. A snapshot from another `--n-slots` or `--n-ctx`
+  (or another model / KV element type) is refused loudly and the server starts empty.
 - `MINFER_BATCH=1` forces batching on (this is how to batch on CPU, for
   experiments or for a machine where your own measurement says it wins).
 - `MINFER_BATCH=0` forces it off.
