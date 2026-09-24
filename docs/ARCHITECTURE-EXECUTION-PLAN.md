@@ -3229,7 +3229,7 @@ Can run in parallel with A–E by a different workstream.
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
-| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) | M | this box |
+| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **design 2026-09-24** ([`GRAMMAR-DESIGN.md`](./GRAMMAR-DESIGN.md)) | M | this box |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
