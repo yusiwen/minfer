@@ -190,6 +190,12 @@ the per-op family is **seconds**, everything else is a count):
   the worker's pending deque — the one number neither thread can see alone),
   `minfer_worker_pending_jobs`, `minfer_requests_running` (occupying an engine
   slot now).
+- Throughput: `minfer_prompt_tokens_total`, `minfer_completion_tokens_total`, and
+  `minfer_completion_tokens_per_second` — generated tokens/s over a **trailing
+  16-second window** (a lifetime average would keep reporting a startup burst on an
+  idle server). Tokens are counted where the response is produced, so the batched
+  and serial paths agree; a client that disconnects before its answer is complete
+  is not counted, because those tokens were never delivered.
 - Drain: `minfer_draining` (0/1), `minfer_drain_abandoned_requests` (still in
   flight when the deadline expired; 0 is a clean drain).
 - Allocator (E4 `MemoryReport`, for the backend the server runs on):

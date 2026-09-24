@@ -53,7 +53,8 @@ src/
 │                    #   atomics behind `GET /metrics` (Prometheus text): live KV/arena
 │                    #   occupancy republished by the worker after every step, queue depth
 │                    #   (`accepted - admitted`, the one number neither thread sees alone),
-│                    #   running/in-flight counts, and per-op seconds under
+│                    #   running/in-flight counts, token counters + a trailing-window
+│                    #   `tokens/s`, and per-op seconds under
 │                    #   `MINFER_OP_TIMING` (off by default; `optiming.rs` wraps the
 │                    #   scheduler's per-node dispatch, so it includes a backend's prologue
 │                    #   and excludes split syncs/copies). SIGINT/SIGTERM drain: refuse new

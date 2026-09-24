@@ -3412,6 +3412,8 @@ channel and keeps answering while the model is busy. Metric families and units:
 | `minfer_queue_depth` | gauge | jobs | `accepted - admitted`: channel backlog + the worker's `pending` deque |
 | `minfer_worker_pending_jobs` | gauge | jobs | the worker's own deque right now |
 | `minfer_requests_running` | gauge | requests | occupying an engine slot right now |
+| `minfer_prompt_tokens_total`, `minfer_completion_tokens_total` | counter | tokens | prompt / delivered completion tokens |
+| `minfer_completion_tokens_per_second` | gauge | tokens/s | generated tokens/s over a trailing 16 s window |
 | `minfer_draining` | gauge | 0/1 | a shutdown was requested |
 | `minfer_drain_abandoned_requests` | gauge | requests | still in flight when the drain deadline expired |
 | `minfer_memory_{weights,pool,live,peak_live,budget,headroom}_bytes` | gauge | bytes | E4 `MemoryReport`; budget/headroom **omitted** when unbounded |
@@ -3421,6 +3423,11 @@ channel and keeps answering while the model is busy. Metric families and units:
 | `minfer_kv_{reserved,owned,shared,free}_cells`, `minfer_kv_{free_runs,sequences}` | gauge | cells / runs | C3/C8b arena occupancy |
 | `minfer_kv_{defrags,cells_moved,cows,cow_cells}_total` | counter | count / cells | C3 compaction and C8b copy-on-write |
 | `minfer_op_seconds_total{op=…}`, `minfer_op_calls_total{op=…}` | counter | seconds / count | per-op, **present only when `MINFER_OP_TIMING` is set** |
+
+`minfer_completion_tokens_per_second` is the one family the issue names that is not
+a plain counter: it is a **trailing 16-second window** (see the honest scope), so a
+scrape gets a throughput without a Prometheus server, and `rate()` on the counters
+remains available for anyone who wants a different window.
 
 *Flags.* `MINFER_OP_TIMING` (presence-checked) turns on per-op timing.
 `MINFER_DRAIN_MS` (default `30000`) bounds the graceful drain. Both are
@@ -3441,12 +3448,13 @@ keep-alive client, or one accepted just before the signal). The `503` is
 therefore a backstop rather than the primary switch, and it is the one the
 automated gate drives directly.
 
-**Measured acceptance.** `cargo test --release`: **337 passed / 0 failed /
+**Measured acceptance.** `cargo test --release`: **340 passed / 0 failed /
 18 ignored** (unit) and **3 passed / 0 failed / 6 ignored** (integration) — a
-delta of **+24 passed, +2 ignored** from the pre-F8 baseline (313/0/16 and 3/0/6,
-at `911ce2c`). The 24 new non-ignored tests are the rendering boundary set, the
-HTTP round-trips, the drain bound, the in-flight guard, the deadline parse, and
-the timing gates. The 2 new ignored tests are the real-model gates, and the whole
+delta of **+27 passed, +2 ignored** from the pre-F8 baseline (313/0/16 and 3/0/6,
+at `911ce2c`). The 27 new non-ignored tests are the rendering boundary set, the
+HTTP round-trips, the drain bound, the in-flight guard, the deadline parse, the
+timing gates, and the three token-accounting gates (the trailing window's bucket
+arithmetic and decay, the counters, and the rendered family). The 2 new ignored tests are the real-model gates, and the whole
 ignored set run serially is **18 passed / 0 failed**
 (`cargo test --release --bin minfer -- --ignored --test-threads=1`):
 `published_metrics_move_as_requests_are_served` (24 layers, 128 rows,
@@ -3467,6 +3475,23 @@ reservation and killed both requests. The gate now asks for 128-token answers ov
 every iteration and a job is placed or rejected within that pass, so the non-zero
 window after a send is shorter than a sampler's interval — the arithmetic is gated
 purely and the loop's drain through `accepted - queue_depth == n`.
+
+**Issue #51's own acceptance, item by item.** (i) *"Metrics are exposed in a
+standard scrapeable format"* — Prometheus text 0.0.4 with `# HELP`/`# TYPE` per
+family, asserted well-formed by a gate. (ii) *"and are correct while slots are
+admitted, grown and released"* — a real-model round drives exactly that
+transition: `minfer_kv_sequences` goes **2 → 1 → 1 → 2** while `reserved_cells`
+goes **256 → 184** and `owned_cells` **120 → 183**, with the engine logging
+`slot 0: capacity 128 -> 184 cells for a request wanting 184 (released 1 idle
+slot(s); 0 run(s) moved)`; `minfer_requests_running` is 0 → 1 → 0 across it. (iii)
+*"A drain stops accepting new requests and finishes the running ones"* — the
+handler refuses with `503` once `draining` is set, and the bounded drain waits for
+the in-flight set (manual SIGTERM run below: 1 in flight → `drain complete`).
+(iv) *"Per-op timing is off by default and does not change results when on"* —
+gated bitwise through the scheduler, plus a greedy CLI A/B. (v) `tokens/s` — the
+counter pair and the trailing-window rate, verified live on **both** response
+paths: non-streaming → `prompt 32 / completion 32 / 2.000 tokens/s`, streaming →
+`64 / 64 / 4.000` (32 and 64 generated tokens over the 16-second window).
 
 **End-to-end run (manual, on this box, CPU, Qwen2.5-0.5B Q4_0, `MINFER_BATCH=1`).**
 A live `minfer serve` on port 18099 with `MINFER_OP_TIMING=1` and
@@ -3526,10 +3551,16 @@ no device needed) and by CI's `build-linux-cuda`; the macOS compile path is CI's
 dispatch** — the one choke point CPU/Metal/CUDA share — so it includes the
 backend's prologue and excludes split-level syncs, cross-backend staging copies,
 allocator liveness and `fill_input`; there is no kernel-only timer. (c) There is
-no histogram and no token/latency accounting (no `_bucket`/`_sum` families,
-no time-to-first-token): the ticket asked for occupancy, depth, per-op timing and
-drain, and adding a histogram would need a bucket policy this ticket did not
-specify. (d) The serial (non-batched) path has one `GraphCache` per slot, so
+no histogram and no latency accounting (no `_bucket`/`_sum`,
+no time-to-first-token): the counters and the trailing-window `tokens/s` the issue
+asks for are present, but a latency histogram would need a bucket policy the issue
+did not specify. The rate is a **trailing 16-second window**, not a lifetime
+average — a lifetime average is not a throughput, since an idle server would keep
+reporting its startup burst — and it is a dedicated one-writer bucket store (no
+lock, no allocation). Tokens are recorded where the response is *produced*, so the
+batched and serial paths are covered uniformly and nothing is plumbed through the
+engine; a client that disconnects before its answer is complete is not counted,
+because those tokens were never delivered. (d) The serial (non-batched) path has one `GraphCache` per slot, so
 `/metrics` reports the arena of the slot that served the last request rather than
 a sum; the batched path reports its single shared arena in full. (e) Queue depth
 is a subtraction of two relaxed counters, so a scrape can transiently read 0

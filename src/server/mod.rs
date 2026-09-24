@@ -442,11 +442,25 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     let guard = InFlight::new(state.metrics.clone());
 
     if stream {
-        stream_response(&id, &model_name, created, rx, guard)
+        stream_response(
+            &id,
+            &model_name,
+            created,
+            rx,
+            guard,
+            state.metrics.clone(),
+            prompt_tokens as u64,
+        )
     } else {
         let _guard = guard;
         match collect_response(rx).await {
             Ok((text, reason, completion_tokens)) => {
+                // F8: token accounting happens where the response is *produced*,
+                // so it covers the batched and serial paths uniformly and needs
+                // nothing plumbed through the engine.
+                state
+                    .metrics
+                    .record_tokens(prompt_tokens as u64, completion_tokens as u64);
                 let resp = types::build_response(
                     &id,
                     &model_name,
@@ -515,6 +529,8 @@ fn stream_response(
     created: i64,
     rx: mpsc::Receiver<StreamEvent>,
     guard: InFlight,
+    tokens: Arc<ServerMetrics>,
+    prompt_tokens: u64,
 ) -> Response {
     let role = ok(Event::default().data(types::chunk_role(id, model, created)));
     let done = ok(Event::default().data("[DONE]"));
@@ -524,6 +540,13 @@ fn stream_response(
         .chain(
             tokio_stream::wrappers::ReceiverStream::new(rx).map(move |ev| {
                 let _keep = &guard;
+                // F8: the worker sends `Finish` exactly once per request, so this
+                // is the streaming path's token-accounting point. A client that
+                // disconnects first drops the stream and its tokens are not
+                // counted — they were never delivered.
+                if let StreamEvent::Finish { tokens: n, .. } = &ev {
+                    tokens.record_tokens(prompt_tokens, *n as u64);
+                }
                 to_event(&id_owned, &model_owned, created, ev)
             }),
         )
