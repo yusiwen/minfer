@@ -255,27 +255,13 @@ impl Engine for GraphEngine<'_> {
     }
 
     fn kv_load(&mut self, path: &std::path::Path) -> Result<KvRestore, String> {
-        let expect = crate::graph::kvsession::KvSessionExpect {
-            backend: backend_of(self.model.device()),
-            n_ctx: self.n_ctx,
-            n_embd: self.model.n_kv_embd(),
-        };
+        let expect = crate::graph::kvsession::expect_for(self.model, self.n_ctx);
         let (host, report) = self.cache.alloc().kv_load_with_host(path, &expect)?;
         Ok(KvRestore {
             host,
             written: report.written,
             bytes: report.bytes,
         })
-    }
-}
-
-/// The backend a model's device uses (`kv_session`'s expectation is phrased in
-/// `Backend`s; `ModelDef::device()` is the single authority for the device).
-fn backend_of(device: crate::models::Device) -> crate::graph::Backend {
-    match device {
-        crate::models::Device::Cpu => crate::graph::Backend::CPU,
-        crate::models::Device::Metal => crate::graph::Backend::Metal,
-        crate::models::Device::Cuda => crate::graph::Backend::Cuda,
     }
 }
 

@@ -643,6 +643,7 @@ pub fn worker_loop(
     slots: Vec<Slot>,
     job_rx: mpsc::Receiver<Job>,
     spec_cfg: Option<crate::spec::SpecConfig>,
+    slots_file: Option<String>,
 ) {
     // E2/E6: the plain path *can* batch every ready slot into one forward per
     // step, and **whether that is a win is a property of the device** — measured
@@ -710,6 +711,26 @@ pub fn worker_loop(
                     "[server] continuous batching: {} slot(s), {n_ctx_total} KV rows shared",
                     engine.n_slots()
                 );
+                // C5 S2: resume the slot contexts, and rewrite the snapshot whenever a
+                // request completes. Printed at startup for the same reason the batching
+                // mode is: the cost of the snapshot is a decision, and a decision nobody
+                // can see is one nobody can debug.
+                if let Some(path) = &slots_file {
+                    let p = std::path::Path::new(path);
+                    match engine.load_slots(p, &*model) {
+                        Ok((slots, bytes)) => eprintln!(
+                            "[server] resumed {slots} slot(s), {bytes} byte(s) of KV from {path} \
+                             — a request whose prompt matches a slot's tokens prefills only its delta"
+                        ),
+                        Err(e) => eprintln!("[server] {e}; starting with empty slots"),
+                    }
+                    eprintln!(
+                        "[server] slot snapshot: {} (about {} MiB per completed request)",
+                        path,
+                        engine.snapshot_bytes() / (1024 * 1024)
+                    );
+                    engine.set_slots_file(Some(p.to_path_buf()));
+                }
                 super::batch::serve_loop(&*model, &tokenizer, job_rx, &mut engine);
             }
             Err(e) => {
@@ -718,6 +739,12 @@ pub fn worker_loop(
             }
         }
         return;
+    }
+    if let Some(path) = &slots_file {
+        eprintln!(
+            "[server] note: the slot snapshot ({path}) covers the shared-arena (batched) \
+             engine; this server serves serially, so nothing will be resumed or saved"
+        );
     }
     worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg);
 }
