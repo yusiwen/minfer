@@ -745,6 +745,37 @@ pub fn mat_mul_f32(
     }
 }
 
+/// f16 weight ([m, k], row-major, little-endian half bits) × f32 activations.
+///
+/// F6: a model converted to f16 must *run*, and the CPU matmul kernels are all
+/// integer dots over quantized weights. Decoding one weight row at a time into
+/// a scratch keeps an f16 model runnable without materializing an f32 copy of
+/// every weight (0.5 GiB → 1 GiB for the 0.5B, 14 GiB → 28 GiB for a 7B).
+pub fn mat_mul_f16(
+    m: usize,
+    n: usize,
+    k: usize,
+    c: &mut [f32],
+    a: &[u8],  // [m, k] f16 weight rows
+    b: &[f32], // [n, k] token-major activations
+) {
+    debug_assert!(c.len() >= m * n);
+    debug_assert!(a.len() >= m * k * 2);
+    debug_assert!(b.len() >= k * n);
+    let mut row = vec![0f32; k];
+    for col in 0..n {
+        let b_row = &b[col * k..(col + 1) * k];
+        let c_row = &mut c[col * m..(col + 1) * m];
+        for r in 0..m {
+            let ab = &a[r * k * 2..(r + 1) * k * 2];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = crate::block::fp16_to_f32(u16::from_le_bytes([ab[2 * j], ab[2 * j + 1]]));
+            }
+            c_row[r] = vec_dot_f32(k, &row, b_row);
+        }
+    }
+}
+
 // ============================================================
 // aarch64 NEON fast paths (f32 vector ops used by attention, norms, etc.)
 // ============================================================

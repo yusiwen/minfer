@@ -6,9 +6,9 @@ use std::ptr;
 
 // === Constants (from gguf.h) ===
 
-const GGUF_MAGIC: [u8; 4] = [b'G', b'G', b'U', b'F'];
-const GGUF_VERSION: u32 = 3;
-const GGUF_DEFAULT_ALIGNMENT: usize = 32;
+pub const GGUF_MAGIC: [u8; 4] = [b'G', b'G', b'U', b'F'];
+pub const GGUF_VERSION: u32 = 3;
+pub const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 const GGUF_KEY_GENERAL_ALIGNMENT: &str = "general.alignment";
 
 const GGUF_MAX_STRING_LENGTH: u64 = 1024 * 1024 * 1024;
@@ -58,7 +58,7 @@ impl GgufType {
         }
     }
 
-    fn type_size(&self) -> usize {
+    pub fn type_size(&self) -> usize {
         match self {
             GgufType::Uint8 => 1,
             GgufType::Int8 => 1,
@@ -345,7 +345,7 @@ pub struct GgufKv {
 }
 
 impl GgufKv {
-    fn new_u8(key: String, value: u8) -> Self {
+    pub fn new_u8(key: String, value: u8) -> Self {
         let mut data = Vec::with_capacity(1);
         data.push(value);
         GgufKv {
@@ -357,7 +357,7 @@ impl GgufKv {
         }
     }
 
-    fn new_i8(key: String, value: i8) -> Self {
+    pub fn new_i8(key: String, value: i8) -> Self {
         let mut data = Vec::with_capacity(1);
         data.push(value as u8);
         GgufKv {
@@ -369,7 +369,7 @@ impl GgufKv {
         }
     }
 
-    fn new_u16(key: String, value: u16) -> Self {
+    pub fn new_u16(key: String, value: u16) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -380,7 +380,7 @@ impl GgufKv {
         }
     }
 
-    fn new_i16(key: String, value: i16) -> Self {
+    pub fn new_i16(key: String, value: i16) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -391,7 +391,7 @@ impl GgufKv {
         }
     }
 
-    fn new_u32(key: String, value: u32) -> Self {
+    pub fn new_u32(key: String, value: u32) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -402,7 +402,7 @@ impl GgufKv {
         }
     }
 
-    fn new_i32(key: String, value: i32) -> Self {
+    pub fn new_i32(key: String, value: i32) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -413,7 +413,7 @@ impl GgufKv {
         }
     }
 
-    fn new_f32(key: String, value: f32) -> Self {
+    pub fn new_f32(key: String, value: f32) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -424,7 +424,7 @@ impl GgufKv {
         }
     }
 
-    fn new_f64(key: String, value: f64) -> Self {
+    pub fn new_f64(key: String, value: f64) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -435,7 +435,7 @@ impl GgufKv {
         }
     }
 
-    fn new_bool(key: String, value: bool) -> Self {
+    pub fn new_bool(key: String, value: bool) -> Self {
         let mut data = Vec::with_capacity(1);
         data.push(if value { 1 } else { 0 });
         GgufKv {
@@ -447,7 +447,7 @@ impl GgufKv {
         }
     }
 
-    fn new_u64(key: String, value: u64) -> Self {
+    pub fn new_u64(key: String, value: u64) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -458,7 +458,7 @@ impl GgufKv {
         }
     }
 
-    fn new_i64(key: String, value: i64) -> Self {
+    pub fn new_i64(key: String, value: i64) -> Self {
         let data = value.to_le_bytes().to_vec();
         GgufKv {
             key,
@@ -469,7 +469,7 @@ impl GgufKv {
         }
     }
 
-    fn new_string(key: String, value: String) -> Self {
+    pub fn new_string(key: String, value: String) -> Self {
         GgufKv {
             key,
             is_array: false,
@@ -479,7 +479,7 @@ impl GgufKv {
         }
     }
 
-    fn new_string_array(key: String, value: Vec<String>) -> Self {
+    pub fn new_string_array(key: String, value: Vec<String>) -> Self {
         GgufKv {
             key,
             is_array: true,
@@ -489,7 +489,7 @@ impl GgufKv {
         }
     }
 
-    fn new_array(key: String, type_: GgufType, raw_data: Vec<u8>) -> Self {
+    pub fn new_array(key: String, type_: GgufType, raw_data: Vec<u8>) -> Self {
         GgufKv {
             key,
             is_array: true,

@@ -4,6 +4,7 @@ mod bench;
 mod block;
 mod cache;
 mod conversation;
+mod convert;
 #[cfg(feature = "cuda")]
 mod cuda;
 // Consumers live in the CUDA backend; the offline unit tests still run
@@ -13,6 +14,7 @@ mod device_tier;
 mod download;
 mod dump;
 mod gguf;
+mod gguf_write;
 mod grammar;
 mod graph;
 mod kernel;
@@ -21,6 +23,7 @@ mod live;
 mod metal;
 mod models;
 mod optiming;
+mod quantize;
 mod quants;
 mod sampler;
 mod server;
@@ -29,6 +32,7 @@ mod spec_verify;
 mod template;
 mod tensor;
 mod tokenizer;
+mod tooling;
 mod trace;
 mod vec_ops;
 
@@ -240,6 +244,12 @@ fn print_usage(prog: &str) {
     eprintln!(
         "  {prog} specverify [-p N] [-r N] [-o json|md] <model>   # D5-1a C_T(nt) gate bench"
     );
+    eprintln!(
+        "  {prog} convert <hf-model-dir> <out.gguf> [--outtype f16|f32] [--split-max-size N]"
+    );
+    eprintln!("  {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size N]");
+    eprintln!("  {prog} split <in.gguf> <out-dir> --max-size N [--stem NAME]");
+    eprintln!("    (F6 tooling; see `{prog} convert --help`, `quantize --help`, `split --help`)");
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
     eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
@@ -430,6 +440,22 @@ fn main() {
     if raw_args.get(1).map_or(false, |s| s == "specverify") {
         let code = spec_verify::run(&prog, &raw_args[2..]);
         std::process::exit(code);
+    }
+
+    // F6 (#49): the GGUF tooling subcommands. Like `bench`/`specverify` they
+    // parse their own flags (--outtype/--type/--split-max-size/--max-size), so
+    // they must be dispatched before the global option parser, which rejects
+    // unknown flags. They also run without touching a device: conversion and
+    // quantization are host-side file work.
+    if let Some(sub) = raw_args.get(1).map(|s| s.as_str()) {
+        if matches!(sub, "convert" | "quantize" | "split") {
+            let code = match sub {
+                "convert" => tooling::run_convert(&prog, &raw_args[2..]),
+                "quantize" => tooling::run_quantize(&prog, &raw_args[2..]),
+                _ => tooling::run_split(&prog, &raw_args[2..]),
+            };
+            std::process::exit(code);
+        }
     }
 
     // Parse flags + positional args. Sampling flags map to GenParams.
