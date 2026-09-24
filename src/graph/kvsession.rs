@@ -36,7 +36,15 @@ use super::Backend;
 /// File magic, first bytes of every session file.
 pub const MAGIC: [u8; 8] = *b"MINFERKV";
 /// Container version. A reader refuses anything else, loudly.
-pub const VERSION: u32 = 1;
+///
+/// - **1** — the header, one K/V blob per layer and the KV bookkeeping.
+/// - **2** — adds the **host-state blob** (C5 S2): an opaque, length-prefixed section
+///   after the bookkeeping, carried and checksummed exactly like the rest of the file.
+///   The KV rows belong to a host state — the CLI's conversation, a server slot — and a
+///   restore that brought the rows back without it would be a different session, so the
+///   container carries both or neither. A version-1 file is refused loudly and the
+///   caller falls back to re-seeding, which is what the version byte is for.
+pub const VERSION: u32 = 2;
 /// Flags bit 0: the regions are packed Q8_0 cells (C4).
 const FLAG_PACKED: u32 = 1 << 0;
 
@@ -182,6 +190,9 @@ pub struct KvSessionWriter {
     sink: Sink<BufWriter<File>>,
     header: KvSessionHeader,
     layers: usize,
+    /// The caller's host state (C5 S2), opaque to this container: written after the
+    /// bookkeeping, inside the checksum. Empty when the caller has none.
+    host: Vec<u8>,
 }
 
 impl KvSessionWriter {
@@ -206,7 +217,15 @@ impl KvSessionWriter {
             sink,
             header: header.clone(),
             layers: 0,
+            host: Vec::new(),
         })
+    }
+
+    /// Attach the host state that the KV rows belong to (C5 S2). Opaque here: the
+    /// caller decides the encoding, the container only carries it, length-prefixed and
+    /// covered by the checksum.
+    pub fn set_host(&mut self, host: &[u8]) {
+        self.host = host.to_vec();
     }
 
     /// One layer's two regions, in pool words.
@@ -257,6 +276,9 @@ impl KvSessionWriter {
         let written = state.written();
         let mut sink = self.sink;
         write_state(&mut sink, state)?;
+        // C5 S2: the host blob last, still inside the checksum.
+        sink.u32(self.host.len() as u32)?;
+        sink.bytes(&self.host)?;
         let bytes = sink.finish()?;
         Ok(KvSessionReport {
             layers,
@@ -495,9 +517,9 @@ impl KvSessionReader {
         Ok(Some((layer, k, v)))
     }
 
-    /// Read the bookkeeping and the checksum. Everything before this is validated
-    /// against the header, so a state that arrives here is structurally sound.
-    pub fn finish(mut self) -> Result<(KvSessionState, KvSessionReport), String> {
+    /// Read the bookkeeping, the host state and the checksum. Everything before this is
+    /// validated against the header, so what arrives here is structurally sound.
+    pub fn finish(mut self) -> Result<KvSessionBody, String> {
         if self.layers != self.header.n_layer {
             return Err(format!(
                 "KV session: the header declares {} layers, the file holds {}",
@@ -505,20 +527,35 @@ impl KvSessionReader {
             ));
         }
         let state = read_state(&mut self.src, &self.header)?;
+        // C5 S2: the host blob, then the checksum that covers everything.
+        let host_len = self.src.u32("the host-state length")? as usize;
+        let host = self.src.bytes(host_len, "the host state")?;
         let layers = self.layers;
         let cells = self.header.n_ctx;
         let written = state.written();
         let bytes = self.src.finish("the bookkeeping")?;
-        Ok((
+        Ok(KvSessionBody {
             state,
-            KvSessionReport {
+            host,
+            report: KvSessionReport {
                 layers,
                 cells,
                 bytes,
                 written,
             },
-        ))
+        })
     }
+}
+
+/// What a reader hands back: the KV bookkeeping, the caller's host state (C5 S2) and
+/// the report. One struct because the three are read together and must stay together —
+/// applying the rows without the host state is what this increment exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvSessionBody {
+    pub state: KvSessionState,
+    /// Opaque to this container; whatever [`KvSessionWriter::set_host`] was given.
+    pub host: Vec<u8>,
+    pub report: KvSessionReport,
 }
 
 fn read_state(
@@ -619,7 +656,7 @@ pub fn verify(path: &Path) -> Result<KvSessionHeader, String> {
         // checksum, in file order.
         let _ = (k, v);
     }
-    let (_state, _report) = r.finish()?;
+    let _body = r.finish()?;
     Ok(header)
 }
 
@@ -689,7 +726,17 @@ mod tests {
     }
 
     fn write_session(path: &Path, h: &KvSessionHeader, st: &KvSessionState) -> KvSessionReport {
+        write_session_with_host(path, h, st, &[])
+    }
+
+    fn write_session_with_host(
+        path: &Path,
+        h: &KvSessionHeader,
+        st: &KvSessionState,
+        host: &[u8],
+    ) -> KvSessionReport {
         let mut w = KvSessionWriter::create(path, h).expect("create");
+        w.set_host(host);
         for layer in 0..h.n_layer {
             let k: Vec<f32> = (0..h.layer_words())
                 .map(|i| (i as f32) * 0.5 + layer as f32)
@@ -723,9 +770,58 @@ mod tests {
             seen.push(layer);
         }
         assert_eq!(seen, vec![0, 1]);
-        let (read_state, r2) = r.finish().expect("finish");
-        assert_eq!(read_state, st);
-        assert_eq!(r2, report);
+        let body = r.finish().expect("finish");
+        assert_eq!(body.state, st);
+        assert_eq!(body.report, report);
+        assert!(body.host.is_empty(), "no host state was written");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C5 S2: the host state rides inside the container — length-prefixed, after the
+    /// bookkeeping and **inside the checksum**, so a flipped byte in it is refused
+    /// exactly like one in the KV rows.
+    #[test]
+    fn the_host_state_round_trips_and_is_covered_by_the_checksum() {
+        let path = temp_path("host");
+        let h = header(1, 8, 32, KvFormat::F32);
+        let host = br#"{"messages":[["user","hi"]],"current_pos":3}"#.to_vec();
+        let written = write_session_with_host(&path, &h, &state(8), &host);
+        assert!(written.bytes > host.len() as u64, "{written:?}");
+
+        let mut r = KvSessionReader::open(&path).expect("open");
+        while r.next_layer().expect("layer").is_some() {}
+        let body = r.finish().expect("finish");
+        assert_eq!(
+            body.host, host,
+            "the host blob must round-trip byte for byte"
+        );
+        assert_eq!(body.state, state(8));
+
+        // Flip a byte inside the host blob: the checksum covers it.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() - host.len() - 5; // inside the blob, before the trailing words
+        bytes[at] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = verify(&path).unwrap_err();
+        assert!(err.contains("checksum"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C5 S2 keeps version 1 readable-as-a-refusal: a v1 file has no host section, and
+    /// applying its rows without the host state is exactly what the bump prevents.
+    #[test]
+    fn a_version_1_file_is_refused_so_the_caller_can_re_seed() {
+        let path = temp_path("v1");
+        let h = header(1, 8, 32, KvFormat::F32);
+        write_session(&path, &h, &state(8));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = verify(&path).unwrap_err();
+        assert!(
+            err.contains("version 1") && err.contains(&format!("version {VERSION}")),
+            "{err}"
+        );
         std::fs::remove_file(&path).ok();
     }
 

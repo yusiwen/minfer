@@ -28,6 +28,15 @@ use crate::template::{self, format_single};
 use crate::tokenizer::Tokenizer;
 
 /// Inference backend abstraction: the prerequisite for L1 mock testing (§8.2).
+/// What a KV restore handed back (C5 S2): the host state the file carried, the rows it
+/// restored, and its size for the caller's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvRestore {
+    pub host: Vec<u8>,
+    pub written: usize,
+    pub bytes: u64,
+}
+
 pub trait Engine {
     /// Returns n_out*nv logits (when n_out=1, the logits of the last/only token).
     /// The real implementation wraps `ModelDef::forward_graph_cached`.
@@ -46,6 +55,22 @@ pub trait Engine {
     /// never corrupts the session.
     fn kv_rm(&mut self, _start: usize, _len: usize) -> Result<usize, String> {
         Err("this engine has no KV rows to remove".to_string())
+    }
+    /// C5 S2: write this engine's KV arena to `path`, carrying `host` — the opaque host
+    /// state those rows belong to — inside the container. Returns the bytes written.
+    ///
+    /// `Err` when this engine has no arena to save (mock/plain engines), or when it
+    /// carries state the container cannot describe yet (a speculative draft). The caller
+    /// logs the reason and keeps going: a session that cannot be snapshotted still works,
+    /// it just re-seeds next time.
+    fn kv_save(&mut self, _path: &std::path::Path, _host: &[u8]) -> Result<u64, String> {
+        Err("this engine has no KV arena to save".to_string())
+    }
+    /// C5 S2: restore this engine's KV arena from `path` and hand back the host state the
+    /// file carries. The arena is left untouched when the file is refused (a failed load
+    /// is a no-op), so the caller can fall back to re-seeding.
+    fn kv_load(&mut self, _path: &std::path::Path) -> Result<KvRestore, String> {
+        Err("this engine has no KV arena to load".to_string())
     }
     /// doc 97: whether speculative rounds are available (mock/plain engines: no).
     fn has_spec(&self) -> bool {
@@ -157,6 +182,29 @@ impl Engine for SpecAwareEngine<'_> {
         }
         self.inner.kv_rm(start, len)
     }
+    fn kv_save(&mut self, path: &std::path::Path, host: &[u8]) -> Result<u64, String> {
+        // The draft keeps its own KV indexed by the same absolute positions; saving the
+        // target's rows without the draft's would resume into a desynchronized pair, so a
+        // speculative session refuses to snapshot (the caller re-seeds instead).
+        if self.spec.is_some() {
+            return Err(
+                "KV session: a speculative draft is not part of the container yet — this \
+                 session re-seeds instead of resuming"
+                    .to_string(),
+            );
+        }
+        self.inner.kv_save(path, host)
+    }
+    fn kv_load(&mut self, path: &std::path::Path) -> Result<KvRestore, String> {
+        if self.spec.is_some() {
+            return Err(
+                "KV session: a speculative draft is not part of the container yet — this \
+                 session re-seeds instead of resuming"
+                    .to_string(),
+            );
+        }
+        self.inner.kv_load(path)
+    }
     fn has_spec(&self) -> bool {
         self.spec.is_some()
     }
@@ -199,6 +247,35 @@ impl Engine for GraphEngine<'_> {
             style: self.model.rope_style(),
         };
         self.cache.alloc().kv_rm(start, len, &rope)
+    }
+
+    fn kv_save(&mut self, path: &std::path::Path, host: &[u8]) -> Result<u64, String> {
+        let report = self.cache.alloc().kv_save_with_host(path, host)?;
+        Ok(report.bytes)
+    }
+
+    fn kv_load(&mut self, path: &std::path::Path) -> Result<KvRestore, String> {
+        let expect = crate::graph::kvsession::KvSessionExpect {
+            backend: backend_of(self.model.device()),
+            n_ctx: self.n_ctx,
+            n_embd: self.model.n_kv_embd(),
+        };
+        let (host, report) = self.cache.alloc().kv_load_with_host(path, &expect)?;
+        Ok(KvRestore {
+            host,
+            written: report.written,
+            bytes: report.bytes,
+        })
+    }
+}
+
+/// The backend a model's device uses (`kv_session`'s expectation is phrased in
+/// `Backend`s; `ModelDef::device()` is the single authority for the device).
+fn backend_of(device: crate::models::Device) -> crate::graph::Backend {
+    match device {
+        crate::models::Device::Cpu => crate::graph::Backend::CPU,
+        crate::models::Device::Metal => crate::graph::Backend::Metal,
+        crate::models::Device::Cuda => crate::graph::Backend::Cuda,
     }
 }
 
@@ -304,6 +381,24 @@ pub struct Conversation {
 }
 
 const REPEAT_LAST_N: usize = 64;
+
+/// Version of the [`ConversationSnapshot`] JSON. A snapshot this build does not
+/// understand is *not* applied (the caller re-seeds) — the same refuse-not-guess rule the
+/// KV container's own version follows.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// The host state that belongs to a KV session (C5 S2), as stored in the container's
+/// opaque host section. Everything here is host bookkeeping; the model's rows live in
+/// the container's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationSnapshot {
+    pub messages: Vec<(String, Option<String>)>,
+    pub stream_tokens: Vec<u32>,
+    pub current_pos: usize,
+    pub turn_pos: usize,
+    pub prev_tokens: Vec<u32>,
+    pub need_insert_eot: bool,
+}
 
 /// Renders a message list the way a session does: the model's own chat template
 /// when it has one, the ChatML fallback otherwise.
@@ -1004,6 +1099,121 @@ impl Conversation {
             .collect()
     }
 
+    /// The host state a KV session belongs to (C5 S2).
+    ///
+    /// The container carries the KV *rows*; this is everything the host needs to continue
+    /// the conversation those rows were written for — which is what lets a resume prefill
+    /// **nothing**. The message list is part of it (not just the token bookkeeping), so a
+    /// resumed session can render its next turn's delta from the same history the KV was
+    /// built from.
+    pub fn snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            stream_tokens: self.stream_tokens.clone(),
+            current_pos: self.current_pos,
+            turn_pos: self.turn_pos,
+            prev_tokens: self.prev_tokens.clone(),
+            need_insert_eot: self.need_insert_eot,
+        }
+    }
+
+    /// Serialize [`Self::snapshot`] for the container's opaque host section. JSON for
+    /// the same reason the history is: it is the host's own bookkeeping, it is small, and
+    /// a human inspecting a session file can read it. The `version` field is the
+    /// refuse-not-guess marker a second format change needs.
+    pub fn snapshot_to_json(&self) -> String {
+        let msgs: Vec<serde_json::Value> = self
+            .messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect();
+        let v = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "messages": msgs,
+            "stream_tokens": self.stream_tokens,
+            "current_pos": self.current_pos,
+            "turn_pos": self.turn_pos,
+            "prev_tokens": self.prev_tokens,
+            "need_insert_eot": self.need_insert_eot,
+        });
+        serde_json::to_string(&v).unwrap_or_default()
+    }
+
+    /// Parse a host section written by [`Self::snapshot_to_json`]. `None` on anything
+    /// that is not a snapshot this build understands — the caller falls back to
+    /// re-seeding, loudly.
+    pub fn snapshot_from_json(json: &str) -> Option<ConversationSnapshot> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        if v.get("version")?.as_u64()? != SNAPSHOT_VERSION as u64 {
+            return None;
+        }
+        let messages = v
+            .get("messages")?
+            .as_array()?
+            .iter()
+            .map(|m| {
+                let role = m.get("role")?.as_str()?.to_string();
+                let content = m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+                Some((role, content))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let tokens = |key: &str| -> Option<Vec<u32>> {
+            v.get(key)?
+                .as_array()?
+                .iter()
+                .map(|x| x.as_u64().map(|n| n as u32))
+                .collect()
+        };
+        Some(ConversationSnapshot {
+            messages,
+            stream_tokens: tokens("stream_tokens")?,
+            current_pos: v.get("current_pos")?.as_u64()? as usize,
+            turn_pos: v.get("turn_pos")?.as_u64()? as usize,
+            prev_tokens: tokens("prev_tokens")?,
+            need_insert_eot: v.get("need_insert_eot")?.as_bool()?,
+        })
+    }
+
+    /// Apply a snapshot restored from a KV container (C5 S2). The KV rows are already in
+    /// the engine; this puts the host back in the state they were written for, so the
+    /// next turn prefills only its own delta.
+    ///
+    /// Validated before it is applied: a snapshot that contradicts the invariant
+    /// `current_pos == stream_tokens.len()`, or that claims positions this conversation's
+    /// `n_ctx` cannot hold, is refused — the caller then re-seeds, which is always safe.
+    pub fn restore_snapshot(&mut self, snap: &ConversationSnapshot) -> Result<(), String> {
+        if snap.current_pos != snap.stream_tokens.len() {
+            return Err(format!(
+                "session snapshot: {} written positions for {} stream tokens (the host mirror \
+                 is inconsistent)",
+                snap.current_pos,
+                snap.stream_tokens.len()
+            ));
+        }
+        if snap.current_pos > self.n_ctx {
+            return Err(format!(
+                "session snapshot: {} written positions do not fit this run's n_ctx {}",
+                snap.current_pos, self.n_ctx
+            ));
+        }
+        if snap.turn_pos > snap.current_pos {
+            return Err(format!(
+                "session snapshot: turn_pos {} is past the {} written positions",
+                snap.turn_pos, snap.current_pos
+            ));
+        }
+        self.messages = snap.messages.clone();
+        self.stream_tokens = snap.stream_tokens.clone();
+        self.current_pos = snap.current_pos;
+        self.turn_pos = snap.turn_pos;
+        self.prev_tokens = snap.prev_tokens.clone();
+        self.need_insert_eot = snap.need_insert_eot;
+        Ok(())
+    }
+
     /// Loads history and **fully re-renders** the KV (§5.8: KV state is not serialized — thanks to the §5.4 invariant,
     /// the re-render matches continuing the session, just with one extra prefill).
     pub fn load_history(
@@ -1293,6 +1503,13 @@ mod tests {
         Conversation::new(spec(n_ctx))
     }
 
+    /// The snapshot JSON with its `version` field replaced (the refuse-not-guess test).
+    fn json_with_version(json: &str, version: u32) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["version"] = serde_json::json!(version);
+        v.to_string()
+    }
+
     fn noop_emit() -> impl FnMut(&[u8]) {
         |_| {}
     }
@@ -1408,6 +1625,129 @@ mod tests {
             ("assistant".into(), Some("Hi".into())),
         ]);
         assert_eq!(c.stream_tokens[..canon.len() - 1], canon[..canon.len() - 1]);
+    }
+
+    /// C5 S2's host-state half: a conversation restored from a session snapshot starts
+    /// with **nothing prefilled** and its next turn issues exactly the engine calls the
+    /// in-memory run's does (delta prefill + decodes — never a re-render of the history).
+    /// The KV bytes that make that legitimate are the C5 container's own gate.
+    #[test]
+    fn a_resumed_snapshot_prefills_nothing_and_continues_alike() {
+        // The in-memory run: one turn, then the snapshot `--session` would write on exit.
+        // The mock pops one program token per `forward` — including prefill calls — so the
+        // program below is the one that makes turn 2 sample '!' on both sides.
+        let mut base = conv(512);
+        let mut eng = MockEngine::new(vec![72, 105, EOS, 33, 33, EOS]); // 'H','i',EOG,(EOG write),'!',EOG
+        base.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        let snap = base.snapshot();
+        let json = base.snapshot_to_json();
+        let parsed = Conversation::snapshot_from_json(&json).expect("the snapshot round-trips");
+        assert_eq!(parsed, snap, "JSON must carry the snapshot losslessly");
+
+        // The resumed run: a fresh conversation and a fresh (empty) engine, as a second
+        // `--session` process would have.
+        let mut resumed = conv(512);
+        let mut eng2 = MockEngine::new(vec![33, EOS]);
+        resumed.restore_snapshot(&parsed).expect("restore");
+        assert!(
+            eng2.calls.is_empty() && eng2.resets == 0,
+            "restoring a snapshot must not touch the engine at all"
+        );
+        assert_eq!(resumed.messages, base.messages);
+        assert_eq!(resumed.stream_tokens, base.stream_tokens);
+        assert_eq!(resumed.current_pos, base.current_pos);
+        assert_eq!(resumed.prev_tokens, base.prev_tokens);
+        assert_eq!(resumed.need_insert_eot, base.need_insert_eot);
+
+        // The next turn on both: same input, same engine calls, same output.
+        let before = eng.calls.len();
+        let out_base = base
+            .user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+            .unwrap();
+        let base_calls: Vec<(Vec<u32>, Vec<usize>)> = eng.calls[before..]
+            .iter()
+            .map(|(t, p, _)| (t.clone(), p.clone()))
+            .collect();
+        let out_resumed = resumed
+            .user_turn("Q", &FakeCodec, &cfg(), &mut eng2, &mut noop_emit())
+            .unwrap();
+        let resumed_calls: Vec<(Vec<u32>, Vec<usize>)> = eng2
+            .calls
+            .iter()
+            .map(|(t, p, _)| (t.clone(), p.clone()))
+            .collect();
+        assert_eq!(
+            base_calls, resumed_calls,
+            "a resumed turn must issue the same forwards, at the same positions"
+        );
+        assert_eq!(out_base.text, out_resumed.text, "greedy tokens must agree");
+        assert_eq!(out_resumed.text, "!");
+        // And the first call is the turn's own delta, not the history re-rendered.
+        let full_render = fallback_full(&base.messages);
+        assert!(
+            resumed_calls[0].0.len() < full_render.len(),
+            "the resumed turn prefilled {} token(s) — a re-render would be {}",
+            resumed_calls[0].0.len(),
+            full_render.len()
+        );
+        assert_eq!(resumed.messages, base.messages);
+        assert_eq!(resumed.stream_tokens, base.stream_tokens);
+        assert_eq!(resumed.current_pos, base.current_pos);
+    }
+
+    /// C5 S2: a snapshot that contradicts the host mirror is refused *before* it is
+    /// applied — the caller then re-seeds, which is always safe.
+    #[test]
+    fn a_snapshot_that_contradicts_the_host_mirror_is_refused() {
+        let mut c = conv(512);
+        let good = ConversationSnapshot {
+            messages: vec![("user".into(), Some("hi".into()))],
+            stream_tokens: vec![1, 2, 3],
+            current_pos: 3,
+            turn_pos: 0,
+            prev_tokens: vec![2, 3],
+            need_insert_eot: false,
+        };
+        c.restore_snapshot(&good)
+            .expect("a consistent snapshot applies");
+
+        // current_pos must equal the token stream's length.
+        let mut bad = good.clone();
+        bad.current_pos = 4;
+        let err = c.restore_snapshot(&bad).unwrap_err();
+        assert!(err.contains("host mirror"), "{err}");
+        // ... and must fit this run's n_ctx.
+        let mut bad = good.clone();
+        bad.stream_tokens = vec![1; 600];
+        bad.current_pos = 600;
+        let err = c.restore_snapshot(&bad).unwrap_err();
+        assert!(err.contains("n_ctx"), "{err}");
+        // ... and turn_pos may not run past it.
+        let mut bad = good.clone();
+        bad.turn_pos = 9;
+        let err = c.restore_snapshot(&bad).unwrap_err();
+        assert!(err.contains("turn_pos"), "{err}");
+
+        // A JSON this build does not understand is `None`, never a guess.
+        assert!(Conversation::snapshot_from_json("{}").is_none());
+        assert!(Conversation::snapshot_from_json("not json").is_none());
+        let bumped = json_with_version(&c.snapshot_to_json(), SNAPSHOT_VERSION + 1);
+        assert!(Conversation::snapshot_from_json(&bumped).is_none());
+        // The refused snapshots above must not have touched the conversation.
+        assert_eq!(c.current_pos, 3);
+        assert_eq!(c.stream_tokens, vec![1, 2, 3]);
+    }
+
+    /// C5 S2: an engine with no arena (the mocks, and any backend that cannot hand its KV
+    /// to the host) refuses both calls, so the CLI falls back to re-seeding instead of
+    /// pretending the session was resumed.
+    #[test]
+    fn an_engine_without_a_kv_refuses_the_session_calls() {
+        let mut eng = MockEngine::new(vec![]);
+        let path = std::path::Path::new("/tmp/minfer-c5s2-not-a-kv-file");
+        assert!(eng.kv_save(path, b"{}").is_err());
+        assert!(eng.kv_load(path).is_err());
     }
 
     #[test]

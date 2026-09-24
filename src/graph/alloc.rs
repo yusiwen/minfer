@@ -2065,6 +2065,18 @@ impl GraphAllocator {
     /// load can refuse a file that does not describe *this* arena instead of
     /// applying it. All layers must agree on the shape: a session is one arena.
     pub fn kv_save(&mut self, path: &Path) -> Result<KvSessionReport, String> {
+        self.kv_save_with_host(path, &[])
+    }
+
+    /// [`Self::kv_save`] with the caller's **host state** attached (C5 S2): the KV rows
+    /// belong to a host state (a conversation, a server slot), so the container carries
+    /// both and a restore that found only one of them is refused by the reader's own
+    /// checks instead of resuming a session nobody owns. The bytes are opaque here.
+    pub fn kv_save_with_host(
+        &mut self,
+        path: &Path,
+        host: &[u8],
+    ) -> Result<KvSessionReport, String> {
         let layers: Vec<usize> = self.kv.iter().map(|(l, _)| l).collect();
         let first = self
             .kv
@@ -2100,6 +2112,7 @@ impl GraphAllocator {
             }
         }
         let mut w = KvSessionWriter::create(path, &header)?;
+        w.set_host(host);
         for &layer in &layers {
             let (k, v) = self
                 .copy_kv_to_cpu(layer)
@@ -2121,6 +2134,19 @@ impl GraphAllocator {
         path: &Path,
         expect: &KvSessionExpect,
     ) -> Result<KvSessionReport, String> {
+        self.kv_load_with_host(path, expect)
+            .map(|(_, report)| report)
+    }
+
+    /// [`Self::kv_load`], also handing back the **host state** the file carries (C5 S2).
+    /// The returned `Vec<u8>` is whatever [`Self::kv_save_with_host`] was given; a file
+    /// with no host state returns an empty one, and the caller decides whether that is
+    /// acceptable (the CLI's resume path treats it as "no companion state" and re-seeds).
+    pub fn kv_load_with_host(
+        &mut self,
+        path: &Path,
+        expect: &KvSessionExpect,
+    ) -> Result<(Vec<u8>, KvSessionReport), String> {
         // E5: a session is one arena — the container carries a single backend tag and one
         // element type. A mixed CPU/device offload plan has regions on both, so the file's
         // backend would be forced onto layers that run elsewhere. Refused before anything
@@ -2218,7 +2244,8 @@ impl GraphAllocator {
             self.write_pool(vref.backend, vref.id, &v)?;
             seen += 1;
         }
-        let (state, report) = r.finish()?;
+        let body = r.finish()?;
+        let (state, report) = (body.state, body.report);
         if state.layers.len() != seen {
             return Err(format!(
                 "KV session: {seen} layers were read but the bookkeeping describes {}",
@@ -2226,7 +2253,7 @@ impl GraphAllocator {
             ));
         }
         self.kv.restore_session(&state)?;
-        Ok(report)
+        Ok((body.host, report))
     }
 
     /// Host view of a persistent region by name (CPU pool).
