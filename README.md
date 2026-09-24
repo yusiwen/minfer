@@ -123,7 +123,7 @@ flowchart LR
     C --> D["PREFILL<br/>graph forward, all prompt tokens"]
     D --> E["last-token logits"]
     E --> F{"DECODE loop"}
-    F -->|sample| G["sample next token<br/>penalties → top-k → top-p → temp"]
+    F -->|sample| G["sample next token<br/>logit bias → penalties → DRY → top-k → typical →<br/>top-p → min-p → XTC → temp | mirostat"]
     G -->|stop| H["text out"]
     G -->|continue| I["graph forward, 1 token<br/>KV persists in the allocator"]
     I --> F

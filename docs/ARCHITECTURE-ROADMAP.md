@@ -516,12 +516,17 @@ does not scale.
 a wider Jinja subset (or a purpose-built renderer) plus a `--chat-template`
 override. 🟠
 
-**Sampling.** Penalties → top-k → top-p → temperature
-(`sampler.rs:291-320`). Missing: min-p, typical, top-n-sigma, XTC, DRY,
-mirostat v1/v2, adaptive-p, infill, logit bias, and **grammar / JSON-schema
-constrained decoding** (a GBNF-style grammar compiled into a per-token logit
-mask). For an OpenAI-compatible server, structured output is the most-requested
-missing capability after streaming. 🟠
+**Sampling.** One `SamplerConfig` pipeline in `sampler.rs` (#48, **landed
+2026-09-24**): logit bias → penalties → DRY → greedy shortcut → top-k → typical
+→ top-p → min-p → XTC → temperature **or** mirostat v1/v2, with every new knob
+defaulting to a no-op so the pre-F3 chain is bit-identical. Landed from the old
+gap list: min-p, typical, XTC, DRY, mirostat v1/v2, logit bias (and
+frequency/presence penalties from the OpenAI plan). Still missing: top-n-sigma,
+adaptive-p, infill, and **grammar / JSON-schema constrained decoding** (a
+GBNF-style grammar compiled into a per-token logit mask) — F2 /
+[#47](https://github.com/yusiwen/minfer/issues/47). For an OpenAI-compatible
+server, structured output is the most-requested missing capability after
+streaming. 🟠
 
 **No LoRA (Low-Rank Adaptation) / adapter support.** There is no adapter path
 at all. minfer's `weights_version` field in `GraphParams` (`params.rs:62`) exists
@@ -606,7 +611,7 @@ work predates the tracker has no issue, and the plan is its record.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | 15 | **Constrained decoding**: GBNF-style grammar + JSON-schema → grammar. | §2.7 | M |
-| 16 | **Sampler set**: min-p, typical, XTC, DRY, mirostat, logit bias. | §2.7 | M |
+| 16 | **Sampler set**: min-p, typical, XTC, DRY, mirostat, logit bias. — **landed in F3 (2026-09-24)**: [#48](https://github.com/yusiwen/minfer/issues/48) | §2.7 | M |
 | 17 | **MoE support** (see `MODEL-SUPPORT-ROADMAP.md` Tier 2 #1) — depends on item 7 for a clean implementation. | §2.1, §2.7 | L |
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
 | 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. | §2.7 | M |

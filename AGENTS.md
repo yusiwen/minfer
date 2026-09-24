@@ -29,7 +29,8 @@ src/
 ├── cache.rs         # legacy KV cache type (graph path owns KV in the allocator)
 ├── dump.rs          # debug dump module (--features debug_dump)
 ├── tokenizer.rs     # BPE tokenizer (self-contained, from GGUF metadata)
-├── sampler.rs       # repeat-penalty / top-k / top-p / temperature
+├── sampler.rs       # SamplerConfig pipeline: penalties → DRY → top-k → typical → top-p →
+│                    #   min-p → XTC → temperature | mirostat v1/v2, plus logit bias (#48)
 ├── template.rs      # chat templates (minijinja) — 2.21.0 has no `str` methods; Qwen3's template falls back to ChatML (docs/QWEN3-SUPPORT-PLAN §5#9)
 ├── conversation.rs  # multi-turn session (append-only KV; overflow drops the oldest
 │                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
@@ -145,7 +146,21 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 
 ## Sampling
 
-`sampler.rs`: repeat-penalty (last 64 tokens) → top-k → top-p → temperature, seeded `StdRng`; defaults match llama.cpp (0.8 / 0.95 / 1.1). CLI: `--temp --greedy --top-k --top-p --repeat-penalty -n --seed -t`.
+`sampler.rs` (#48): one `SamplerConfig` drives one pipeline — logit bias → penalties (repeat /
+frequency / presence, last 64 tokens) → DRY → greedy shortcut (`temp == 0`) → top-k → typical →
+top-p → min-p → XTC → temperature **or** mirostat v1/v2, seeded `StdRng`. Every F3 knob defaults to
+a no-op, so the default path is bit-identical to the pre-#48 chain — pinned by
+`test_default_pipeline_matches_the_pinned_pre_f3_sequence` (a sequence captured from `master`).
+`SamplerConfig::validate` refuses nonsensical values at CLI startup / HTTP 400 (never clamps
+silently), and logit-bias token ids are checked against the vocabulary.
+Mirostat's `mu` is caller-owned state (`MirostatState`: one per run / session / request / batch
+slot); speculative decoding refuses mirostat (`--spec-draft`), because a verify round samples
+several rows from one shared RNG. DRY sequence breakers are token-id sequences
+(`--dry-sequence-breakers 198;13,2`); llama.cpp's string form needs a tokenizer port (follow-up).
+CLI: `--temp --greedy --top-k --top-p --repeat-penalty --frequency-penalty --presence-penalty
+--min-p --typical --xtc-probability --xtc-threshold --dry-multiplier --dry-base
+--dry-allowed-length --dry-penalty-last-n --dry-sequence-breakers --mirostat --mirostat-tau
+--mirostat-eta --mirostat-m --logit-bias -n --seed -t`.
 
 ## Dependencies
 

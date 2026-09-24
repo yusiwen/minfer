@@ -3230,7 +3230,7 @@ Can run in parallel with A–E by a different workstream.
 |---|---|---|---|---|
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) | M | this box |
-| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) | M | this box |
+| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
@@ -3241,6 +3241,65 @@ F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
 single CPU win, so it should be scheduled against hardware availability, not
 against the critical path.
+
+### F3 — Sampler set (#48) — **DONE 2026-09-24**
+
+**What landed.** `src/sampler.rs` gained a `SamplerConfig` (the pre-F3 knobs plus
+`min_p`, `typical_p`, `xtc_probability`/`xtc_threshold`, the DRY group,
+`mirostat`/`mirostat_tau`/`mirostat_eta`/`mirostat_m`, and `logit_bias`), a
+`MirostatState { mu }` that the caller owns (mirostat is the one sampler with
+cross-token state), and one pipeline entry point:
+
+```text
+logit bias → penalties → DRY → (greedy shortcut) → top-k → typical → top-p →
+min-p → XTC → temperature | mirostat v1/v2
+```
+
+The order is llama.cpp's `common_sampler_init` chain. Every filter is a pure
+function with its own boundary tests: `apply_min_p` (p = 0/1, ties, empty/one
+token, "the argmax always survives"), `apply_typical` (p = 1 off, p = 0 keeps
+one, dominated distributions, ties), `apply_xtc` (probability 0/threshold > 0.5
+off — *and no RNG draw*, fewer than two candidates, the exact exclusion set),
+`apply_dry` (the reverse Z-algorithm plus the restart-sequence cap, an empty
+history, a window shorter than `allowed_length`, the exponential scale, the
+single-token-breaker exemption), `sample_mirostat_v2` / `sample_mirostat_v1`
+(the `mu` update direction, `mu <= 0` never emptying the set, the documented
+degenerate `s_hat = 1` rule), and `apply_logit_bias` (positive and negative).
+
+**Surface.** `--min-p --typical --xtc-probability --xtc-threshold
+--dry-multiplier --dry-base --dry-allowed-length --dry-penalty-last-n
+--dry-sequence-breakers --mirostat --mirostat-tau --mirostat-eta --mirostat-m
+--logit-bias` on the CLI; the matching optional fields on the OpenAI request
+(`min_p`, `typical_p`, `xtc_probability`, `xtc_threshold`, `dry_*`,
+`dry_sequence_breakers`, `mirostat`, `mirostat_tau`, `mirostat_eta`,
+`mirostat_m`, `logit_bias`). `SamplerConfig::validate` refuses every
+nonsensical value at the boundary (CLI startup / HTTP `400`), and
+`validate_logit_bias` rejects a token id outside the vocabulary once it is
+known — nothing is clamped or silently ignored.
+
+**Acceptance measurements.** `cargo test --release`: the F3 gate
+`default_config_is_bit_identical_to_the_old_path` runs 64 steps through both
+`sample_with_penalties` and the new pipeline with one seed and asserts the token
+sequences are equal; `default_pipeline_matches_the_pinned_pre_f3_sequence`
+asserts the same 64 tokens as a sequence captured from `master` *before* the
+change (`[5, 54, 21, 54, 105, …]`, seed 42). A mutation check (forcing
+`min_p = 0.5` into the default config) fails the pinned gate, and reverting makes
+it pass — so the gate can fail. Full-suite counts are in the F3 record commit /
+PR (unit + integration lines).
+
+**Honest scope.** (a) DRY sequence breakers are token-id sequences
+(`--dry-sequence-breakers 198;13,2`), not llama.cpp's strings: mapping a string
+breaker to the overlapping token sequences needs
+`get_overlapping_token_sequences` against the vocabulary, a tokenizer port left
+as a follow-up. (b) Speculative decoding (`--spec-draft`) carries the pure F3
+filters but **not** mirostat — a verify round samples several rows from one
+shared RNG, so `mu` has no faithful home there; the CLI and the server refuse
+the combination loudly. (c) In mirostat mode the temperature is ignored
+(mirostat's `mu` truncation subsumes it, as in llama.cpp, which sets
+`temp = 1.0`); `temp == 0` still wins as the greedy shortcut. (d) The
+conversation/KV session snapshot does not carry `mu` (it does not carry the RNG
+either): a resumed session restarts `mu` at `2 * tau`, which affects sampling
+only, never the KV.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 

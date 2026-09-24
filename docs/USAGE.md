@@ -37,6 +37,25 @@ Sampling and runtime options:
 - `--top-k <K>` / `--top-p <P>` — top-K / nucleus sampling (defaults 40 / 0.95)
 - `--repeat-penalty <N>` — repeat penalty (default 1.1; 1.0 = off), plus
   `--frequency-penalty` / `--presence-penalty`
+- **F3 sampler set** ([#48](https://github.com/yusiwen/minfer/issues/48)) — every default below
+  leaves the pre-F3 chain unchanged:
+  - `--min-p <P>` — drop tokens whose probability is below `P * max` (0 = off; 1.0 = argmax only)
+  - `--typical <P>` — locally typical sampling (1.0 = off; 0 keeps the single most typical token)
+  - `--xtc-probability <P>` / `--xtc-threshold <T>` — XTC: with probability `P`, exclude the top
+    choices whose probability is at least `T` (`T` <= 0.5; 0 = off)
+  - `--dry-multiplier <N>` — DRY (Don't Repeat Yourself) penalty strength (0 = off), with
+    `--dry-base <N>` (default 1.75), `--dry-allowed-length <N>` (default 2),
+    `--dry-penalty-last-n <N>` (default 64) and `--dry-sequence-breakers <L>` — restart sequences
+    as *token ids*, e.g. `--dry-sequence-breakers 198;13,2` (`;` between sequences, `,` between ids)
+  - `--mirostat <0|1|2>` — mirostat off / v1 / v2, with `--mirostat-tau <N>` (target surprise in
+    bits, default 5.0), `--mirostat-eta <N>` (learning rate, default 0.1) and `--mirostat-m <N>`
+    (v1 estimator window, default 100). In mirostat mode the temperature is ignored (mirostat's
+    `mu` truncation subsumes it); `--temp 0` still means greedy. Mirostat cannot be combined with
+    `--spec-draft`.
+  - `--logit-bias <L>` — add to raw logits: `ID:BIAS` pairs separated by `,`, repeatable, e.g.
+    `--logit-bias 15043:-2.0,198:1.5`. A token id outside the vocabulary, or a bias outside
+    `[-100, 100]`, is refused at startup.
+  A nonsensical value for any of these is refused at startup (exit 1), never silently ignored.
 - `--stop <STR>` — stop generation at this string (repeatable)
 - `-n, --n-predict <N>` — max tokens to generate (default 512)
 - `--seed <N>` — RNG seed for sampling
