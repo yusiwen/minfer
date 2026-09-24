@@ -113,6 +113,11 @@ struct SlotState {
 struct Run {
     tx: mpsc::Sender<StreamEvent>,
     params: SamplingParams,
+    /// F3 (#48): the request's sampler configuration, resolved once (it owns the
+    /// DRY breakers / logit bias) and reused for every decode step.
+    cfg: crate::sampler::SamplerConfig,
+    /// F3: mirostat's running surprise budget, per request.
+    mirostat: crate::sampler::MirostatState,
     rng: StdRng,
     prev_tokens: Vec<u32>,
     stop_bytes: Vec<Vec<u8>>,
@@ -1008,8 +1013,11 @@ impl BatchEngine {
                 .extend_from_slice(&job.input_ids);
         }
         debug_assert_eq!(self.slots[idx].cached_tokens.len(), nt);
+        let cfg = job.params.sampler_config();
         self.slots[idx].run = Some(Run {
             tx: job.tx,
+            mirostat: crate::sampler::MirostatState::new(cfg.mirostat_tau),
+            cfg,
             rng: StdRng::seed_from_u64(job.params.seed),
             prev_tokens: super::chat::sampler_recent_window(&job.input_ids, REPEAT_LAST_N),
             stop_bytes: job
@@ -1132,6 +1140,8 @@ impl BatchEngine {
         let cap = self.slots[idx].cap;
         let Run {
             params,
+            cfg,
+            mirostat,
             rng,
             prev_tokens,
             stop_bytes,
@@ -1157,17 +1167,8 @@ impl BatchEngine {
             return Ok(StepOutcome::Finish("length"));
         }
         let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
-        let sampled = crate::sampler::sample_with_penalties(
-            last_logits,
-            params.temp,
-            params.top_k,
-            params.top_p,
-            params.repeat_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
-            prev_tokens,
-            rng,
-        );
+        let sampled =
+            crate::sampler::sample_with_config(last_logits, cfg, prev_tokens, mirostat, rng);
         let tok = sampled.token_id;
         if is_stop_token(tok, &special) {
             return Ok(StepOutcome::Finish("stop"));
@@ -1350,6 +1351,20 @@ mod tests {
             repeat_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            min_p: 0.0,
+            typical_p: 1.0,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.5,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 64,
+            dry_breakers: Vec::new(),
+            mirostat: crate::sampler::MirostatMode::Off,
+            mirostat_tau: 5.0,
+            mirostat_eta: 0.1,
+            mirostat_m: 100,
+            logit_bias: Vec::new(),
             seed: 7,
             stop_strings: Vec::new(),
             max_tokens,

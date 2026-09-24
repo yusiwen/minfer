@@ -60,6 +60,23 @@ struct GenParams {
     repeat_penalty: f32,
     frequency_penalty: f32,
     presence_penalty: f32,
+    // === F3 sampler set (#48); every default below is a no-op ===
+    min_p: f32,
+    typical_p: f32,
+    xtc_probability: f32,
+    xtc_threshold: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_allowed_length: usize,
+    dry_penalty_last_n: usize,
+    /// Restart sequences as token-id sequences (`--dry-sequence-breakers`).
+    dry_breakers: Vec<Vec<u32>>,
+    mirostat: sampler::MirostatMode,
+    mirostat_tau: f32,
+    mirostat_eta: f32,
+    mirostat_m: usize,
+    /// `(token_id, bias)` pairs (`--logit-bias`).
+    logit_bias: Vec<(u32, f32)>,
     seed: u64,
     n_ctx: usize,
     stop_strings: Vec<String>,
@@ -75,11 +92,107 @@ impl Default for GenParams {
             repeat_penalty: 1.1,    // 1.0 = disabled; mild penalty reduces repetition
             frequency_penalty: 0.0, // llama.cpp default (0.0 = disabled)
             presence_penalty: 0.0,  // llama.cpp default (0.0 = disabled)
+            min_p: 0.0,             // F3: disabled
+            typical_p: 1.0,         // F3: disabled
+            xtc_probability: 0.0,   // F3: disabled
+            xtc_threshold: 0.5,     // F3: llama.cpp default
+            dry_multiplier: 0.0,    // F3: disabled
+            dry_base: 1.75,         // F3: llama.cpp default
+            dry_allowed_length: 2,  // F3: llama.cpp default
+            dry_penalty_last_n: 64, // F3: llama.cpp default
+            dry_breakers: Vec::new(),
+            mirostat: sampler::MirostatMode::Off,
+            mirostat_tau: 5.0, // F3: llama.cpp default
+            mirostat_eta: 0.1, // F3: llama.cpp default
+            mirostat_m: 100,   // F3: llama.cpp default
+            logit_bias: Vec::new(),
             seed: 42,
             n_ctx: 4096,
             stop_strings: Vec::new(),
         }
     }
+}
+
+impl GenParams {
+    /// The F3 sampler configuration. `MirostatMode` is parsed strictly at the
+    /// flag, so this conversion cannot invent a value.
+    fn sampler_config(&self) -> sampler::SamplerConfig {
+        sampler::SamplerConfig {
+            temp: self.temp,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repeat_penalty: self.repeat_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            min_p: self.min_p,
+            typical_p: self.typical_p,
+            dry_multiplier: self.dry_multiplier,
+            dry_base: self.dry_base,
+            dry_allowed_length: self.dry_allowed_length,
+            dry_penalty_last_n: self.dry_penalty_last_n,
+            dry_breakers: self.dry_breakers.clone(),
+            xtc_probability: self.xtc_probability,
+            xtc_threshold: self.xtc_threshold,
+            mirostat: self.mirostat,
+            mirostat_tau: self.mirostat_tau,
+            mirostat_eta: self.mirostat_eta,
+            mirostat_m: self.mirostat_m,
+            logit_bias: self.logit_bias.clone(),
+        }
+    }
+}
+
+/// Parse `--dry-sequence-breakers`: `;`-separated restart sequences, each a
+/// `,`-separated token-id list (`198;13,2`). Every entry must be a valid token
+/// id — a non-numeric spelling is a loud parse error, never silently dropped.
+fn parse_dry_breakers(spec: &str) -> Result<Vec<Vec<u32>>, String> {
+    let mut out = Vec::new();
+    for breaker in spec.split(';').filter(|b| !b.trim().is_empty()) {
+        let mut ids = Vec::new();
+        for id in breaker.split(',') {
+            let id = id.trim();
+            match id.parse::<u32>() {
+                Ok(v) => ids.push(v),
+                Err(_) => {
+                    return Err(format!(
+                        "invalid --dry-sequence-breakers entry '{id}' (a token id is required; \
+                         llama.cpp's string breakers need a tokenizer port, see #48)"
+                    ))
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err(format!(
+                "empty --dry-sequence-breakers sequence '{breaker}'"
+            ));
+        }
+        out.push(ids);
+    }
+    Ok(out)
+}
+
+/// Parse one `--logit-bias` list: `ID:BIAS` pairs separated by `,`
+/// (`15043:-2.0,198:1.5`). Repeatable — later flags append. A malformed pair is
+/// a loud parse error.
+fn parse_logit_bias(spec: &str) -> Result<Vec<(u32, f32)>, String> {
+    let mut out = Vec::new();
+    for pair in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let Some((id, bias)) = pair.split_once(':') else {
+            return Err(format!(
+                "invalid --logit-bias entry '{pair}' (expected ID:BIAS)"
+            ));
+        };
+        let id = id
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --logit-bias token id '{}'", id.trim()))?;
+        let bias = bias
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("invalid --logit-bias value '{}'", bias.trim()))?;
+        out.push((id, bias));
+    }
+    Ok(out)
 }
 
 fn print_usage(prog: &str) {
@@ -127,6 +240,27 @@ fn print_usage(prog: &str) {
     eprintln!("  --repeat-penalty <N> penalize repeated tokens (default 1.1; 1.0 = off)");
     eprintln!("  --frequency-penalty <N> penalize by token count in the window (default 0.0)");
     eprintln!("  --presence-penalty <N>  penalize any token present in the window (default 0.0)");
+    eprintln!("  --- F3 sampler set (#48); every default leaves the chain unchanged ---");
+    eprintln!(
+        "  --min-p <P>          min-p sampling: drop tokens below P * max probability (0 = off)"
+    );
+    eprintln!("  --typical <P>        locally typical sampling (default 1.0 = off)");
+    eprintln!(
+        "  --xtc-probability <P>  XTC: chance to exclude the top choices (default 0.0 = off)"
+    );
+    eprintln!("  --xtc-threshold <T>  XTC probability threshold, 0..0.5 (default 0.5)");
+    eprintln!("  --dry-multiplier <N> DRY penalty multiplier (default 0.0 = off)");
+    eprintln!("  --dry-base <N>       DRY penalty growth base (default 1.75)");
+    eprintln!("  --dry-allowed-length <N>  shortest repeated suffix DRY reacts to (default 2)");
+    eprintln!("  --dry-penalty-last-n <N>  DRY penalty window (default 64)");
+    eprintln!("  --dry-sequence-breakers <L>  DRY restart sequences as token ids, e.g. '198;13,2'");
+    eprintln!("  --mirostat <0|1|2>   mirostat off / v1 / v2 (default 0)");
+    eprintln!("  --mirostat-tau <N>   mirostat target surprise in bits (default 5.0)");
+    eprintln!("  --mirostat-eta <N>   mirostat learning rate (default 0.1)");
+    eprintln!("  --mirostat-m <N>     mirostat v1 estimator window (default 100)");
+    eprintln!(
+        "  --logit-bias <L>     add to raw logits: 'ID:BIAS[,ID:BIAS...]', e.g. '15043:-2.0'"
+    );
     eprintln!("  --stop <STR>         stop generation at this string (repeatable)");
     eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
     eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
@@ -464,6 +598,137 @@ fn main() {
                 }
                 i += 2;
             }
+            // === F3 sampler set (#48) ===
+            "--min-p" => {
+                if let Some(v) = next_val(a) {
+                    params.min_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --min-p '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--typical" => {
+                if let Some(v) = next_val(a) {
+                    params.typical_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --typical '{v}'"));
+                        1.0
+                    });
+                }
+                i += 2;
+            }
+            "--xtc-probability" => {
+                if let Some(v) = next_val(a) {
+                    params.xtc_probability = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --xtc-probability '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--xtc-threshold" => {
+                if let Some(v) = next_val(a) {
+                    params.xtc_threshold = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --xtc-threshold '{v}'"));
+                        0.5
+                    });
+                }
+                i += 2;
+            }
+            "--dry-multiplier" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_multiplier = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-multiplier '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--dry-base" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_base = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-base '{v}'"));
+                        1.75
+                    });
+                }
+                i += 2;
+            }
+            "--dry-allowed-length" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_allowed_length = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-allowed-length '{v}'"));
+                        2
+                    });
+                }
+                i += 2;
+            }
+            "--dry-penalty-last-n" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_penalty_last_n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-penalty-last-n '{v}'"));
+                        64
+                    });
+                }
+                i += 2;
+            }
+            "--dry-sequence-breakers" => {
+                if let Some(v) = next_val(a) {
+                    match parse_dry_breakers(&v) {
+                        Ok(b) => params.dry_breakers = b,
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            "--mirostat" => {
+                if let Some(v) = next_val(a) {
+                    match v
+                        .parse::<i64>()
+                        .map_err(|_| format!("invalid --mirostat '{v}'"))
+                        .and_then(sampler::MirostatMode::parse)
+                    {
+                        Ok(m) => params.mirostat = m,
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            "--mirostat-tau" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_tau = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-tau '{v}'"));
+                        5.0
+                    });
+                }
+                i += 2;
+            }
+            "--mirostat-eta" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_eta = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-eta '{v}'"));
+                        0.1
+                    });
+                }
+                i += 2;
+            }
+            "--mirostat-m" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_m = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-m '{v}'"));
+                        100
+                    });
+                }
+                i += 2;
+            }
+            "--logit-bias" => {
+                if let Some(v) = next_val(a) {
+                    match parse_logit_bias(&v) {
+                        Ok(mut b) => params.logit_bias.append(&mut b),
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
             "--stop" => {
                 if let Some(v) = next_val(a) {
                     params.stop_strings.push(v);
@@ -518,6 +783,13 @@ fn main() {
     if let Some(e) = parse_err {
         eprintln!("Error: {e}");
         print_usage(&prog);
+        std::process::exit(1);
+    }
+
+    // F3: refuse a nonsensical sampler configuration at the boundary. The logit
+    // bias token ids are checked against the vocabulary below, once it is known.
+    if let Err(e) = params.sampler_config().validate() {
+        eprintln!("Error: {e}");
         std::process::exit(1);
     }
 
@@ -760,6 +1032,24 @@ fn main() {
     // === Tokenizer ===
     let tokenizer = tokenizer::Tokenizer::load(&ctx);
     println!("Vocabulary: {} tokens", tokenizer.vocab_size());
+
+    // F3 boundary checks. The logit bias ids need the vocabulary, which is known
+    // only now; the speculative path cannot carry mirostat's per-token state, so
+    // asking for both is refused rather than silently sampling without it.
+    if let Err(e) = params
+        .sampler_config()
+        .validate_logit_bias(tokenizer.vocab_size())
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    if spec_draft.is_some() && params.mirostat != sampler::MirostatMode::Off {
+        eprintln!(
+            "Error: --spec-draft does not support mirostat (its per-step state belongs to the \
+             serial decode loop); disable one of the two"
+        );
+        std::process::exit(1);
+    }
 
     // === OpenAI-compatible HTTP server mode ===
     // Resolve the engine depth cap: adaptive uses 8 unless the user set
@@ -1063,27 +1353,20 @@ fn main() {
     // Each round emits 1..=d+1 tokens (draft-accepted prefix + the target
     // sampler's bonus); the per-token output machinery below is the same
     // sequence the non-spec loop runs, applied per emitted token.
+    let sampler_cfg = params.sampler_config();
+    let mut mirostat = sampler::MirostatState::new(sampler_cfg.mirostat_tau);
     if let Some(engine) = spec_engine.as_mut() {
         let sparams = spec::SpecSampler {
-            temp: params.temp,
-            top_k: params.top_k,
-            top_p: params.top_p,
-            repeat_penalty: params.repeat_penalty,
-            frequency_penalty: params.frequency_penalty,
-            presence_penalty: params.presence_penalty,
+            cfg: sampler_cfg.clone(),
         };
         // Seed token: the prefill's last-row logits, sampled exactly like the
         // normal path — G1 token identity starts at token 0.
         let mut seed_logits = std::mem::take(&mut logits);
-        let sampled = sampler::sample_with_penalties(
+        let sampled = sampler::sample_with_config(
             &mut seed_logits,
-            params.temp,
-            params.top_k,
-            params.top_p,
-            params.repeat_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
+            &sampler_cfg,
             &prev_tokens,
+            &mut mirostat,
             &mut rng,
         );
         let mut next_token = sampled.token_id;
@@ -1189,15 +1472,11 @@ fn main() {
     if spec_engine.is_none() {
         while generated.len() < params.n_predict {
             t0 = std::time::Instant::now();
-            let sampled = sampler::sample_with_penalties(
+            let sampled = sampler::sample_with_config(
                 &mut logits,
-                params.temp,
-                params.top_k,
-                params.top_p,
-                params.repeat_penalty,
-                params.frequency_penalty,
-                params.presence_penalty,
+                &sampler_cfg,
                 &prev_tokens,
+                &mut mirostat,
                 &mut rng,
             );
             if timing {
@@ -1502,17 +1781,13 @@ fn run_conversation(
         eot,
         seed: params.seed,
         n_ctx: params.n_ctx,
+        mirostat_tau: params.mirostat_tau,
         system_prompt,
     };
     let mut conv = conversation::Conversation::new(spec);
     let graph_engine = conversation::GraphEngine::new(&*model, params.n_ctx);
     let sparams = spec::SpecSampler {
-        temp: params.temp,
-        top_k: params.top_k,
-        top_p: params.top_p,
-        repeat_penalty: params.repeat_penalty,
-        frequency_penalty: params.frequency_penalty,
-        presence_penalty: params.presence_penalty,
+        cfg: params.sampler_config(),
     };
     let mut engine = conversation::SpecAwareEngine::new(graph_engine, spec_engine.take(), sparams);
 
@@ -1570,12 +1845,7 @@ fn run_conversation(
     };
     let tp = conversation::TurnParams {
         n_predict: params.n_predict,
-        temp: params.temp,
-        top_k: params.top_k,
-        top_p: params.top_p,
-        repeat_penalty: params.repeat_penalty,
-        frequency_penalty: params.frequency_penalty,
-        presence_penalty: params.presence_penalty,
+        sampler: params.sampler_config(),
         stop_strings: params.stop_strings.clone(),
     };
     let color_on = color_mode.enabled();

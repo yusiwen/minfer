@@ -277,6 +277,10 @@ pub struct ConversationSpec {
     pub eot: u32,
     pub seed: u64,
     pub n_ctx: usize,
+    /// F3 (#48): initial mirostat `mu` is `2 * tau`; the session owns the state
+    /// so it survives across turns (each turn's `TurnParams` only carries the
+    /// configuration).
+    pub mirostat_tau: f32,
     /// The `--system` prompt (used as the first system message).
     pub system_prompt: Option<String>,
 }
@@ -284,12 +288,9 @@ pub struct ConversationSpec {
 /// Per-turn sampling/stopping parameters (mapped from the CLI's GenParams).
 pub struct TurnParams {
     pub n_predict: usize,
-    pub temp: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub repeat_penalty: f32,
-    pub frequency_penalty: f32,
-    pub presence_penalty: f32,
+    /// The whole F3 sampler configuration (#48): the six pre-F3 knobs plus
+    /// min-p / typical / XTC / DRY / mirostat / logit bias.
+    pub sampler: sampler::SamplerConfig,
     pub stop_strings: Vec<String>,
 }
 
@@ -325,8 +326,14 @@ pub struct TurnOutcome {
 #[derive(Debug)]
 pub enum ConvError {
     NothingToRegen,
-    ContextFull { needed: usize, available: usize },
+    ContextFull {
+        needed: usize,
+        available: usize,
+    },
     EmptyInput,
+    /// F3 (#48): mirostat's per-step `mu` has no home in a verify round, so the
+    /// combination is refused loudly instead of silently sampling without it.
+    MirostatWithSpec,
 }
 
 impl std::fmt::Display for ConvError {
@@ -338,6 +345,11 @@ impl std::fmt::Display for ConvError {
                 "context full: need {needed} tokens, have {available} (--n-ctx)"
             ),
             ConvError::EmptyInput => write!(f, "input tokenizes to nothing"),
+            ConvError::MirostatWithSpec => write!(
+                f,
+                "mirostat and speculative decoding cannot be combined (mirostat's per-step \
+                 state has no home in a verify round)"
+            ),
         }
     }
 }
@@ -364,6 +376,10 @@ pub struct Conversation {
     pub template: Option<String>,
     pub bos_text: String,
     pub n_ctx: usize,
+    /// F3 (#48): mirostat's running surprise budget, session-scoped (the KV
+    /// snapshot does not carry it — neither does it carry `rng`; a resumed
+    /// session restarts `mu` at `2 * tau`, which affects sampling only).
+    pub mirostat: sampler::MirostatState,
 }
 
 const REPEAT_LAST_N: usize = 64;
@@ -434,6 +450,7 @@ impl Conversation {
             template: spec.template,
             bos_text: spec.bos_text,
             n_ctx: spec.n_ctx,
+            mirostat: sampler::MirostatState::new(spec.mirostat_tau),
         }
     }
 
@@ -530,15 +547,11 @@ impl Conversation {
         let mut hit_n_predict = false;
         // The seed: sampled from the entry logits exactly like the plain
         // path's first iteration (G1 token identity starts at token 0).
-        let sampled = sampler::sample_with_penalties(
+        let sampled = sampler::sample_with_config(
             &mut logits,
-            cfg.temp,
-            cfg.top_k,
-            cfg.top_p,
-            cfg.repeat_penalty,
-            cfg.frequency_penalty,
-            cfg.presence_penalty,
+            &cfg.sampler,
             &self.prev_tokens,
+            &mut self.mirostat,
             &mut self.rng,
         );
         let mut seed = sampled.token_id;
@@ -598,12 +611,7 @@ impl Conversation {
                     seed,
                     self.current_pos,
                     &crate::spec::SpecSampler {
-                        temp: cfg.temp,
-                        top_k: cfg.top_k,
-                        top_p: cfg.top_p,
-                        repeat_penalty: cfg.repeat_penalty,
-                        frequency_penalty: cfg.frequency_penalty,
-                        presence_penalty: cfg.presence_penalty,
+                        cfg: cfg.sampler.clone(),
                     },
                     &mut self.prev_tokens,
                     &mut self.rng,
@@ -1233,6 +1241,11 @@ impl Conversation {
         // holdback) is mirrored token-for-token, so the emitted stream is
         // byte-identical (doc 94/95 identity contract).
         if engine.has_spec() {
+            // F3 (#48): mirostat's per-step state has no home in a verify round;
+            // refuse rather than sample without it (`SpecSampler` carries no mu).
+            if cfg.sampler.mirostat != sampler::MirostatMode::Off {
+                return Err(ConvError::MirostatWithSpec);
+            }
             return self.generate_assistant_spec(decoder, cfg, engine, emit, logits);
         }
         let stop_bytes: Vec<Vec<u8>> = cfg
@@ -1259,15 +1272,11 @@ impl Conversation {
                 hit_n_predict = true;
                 break;
             }
-            let sampled = sampler::sample_with_penalties(
+            let sampled = sampler::sample_with_config(
                 &mut logits,
-                cfg.temp,
-                cfg.top_k,
-                cfg.top_p,
-                cfg.repeat_penalty,
-                cfg.frequency_penalty,
-                cfg.presence_penalty,
+                &cfg.sampler,
                 &self.prev_tokens,
+                &mut self.mirostat,
                 &mut self.rng,
             );
             if self.is_eog(sampled.token_id) {
@@ -1463,12 +1472,14 @@ mod tests {
     fn cfg() -> TurnParams {
         TurnParams {
             n_predict: 512,
-            temp: 0.0, // greedy: the mock spike is always picked
-            top_k: 4096,
-            top_p: 1.0,
-            repeat_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            // greedy: the mock spike is always picked
+            sampler: sampler::SamplerConfig {
+                temp: 0.0,
+                top_k: 4096,
+                top_p: 1.0,
+                repeat_penalty: 1.0,
+                ..sampler::SamplerConfig::default()
+            },
             stop_strings: Vec::new(),
         }
     }
@@ -1481,6 +1492,7 @@ mod tests {
             eot: IM_END,
             seed: 42,
             n_ctx,
+            mirostat_tau: 5.0,
             system_prompt: None,
         }
     }
@@ -2265,18 +2277,20 @@ mod tests {
             eot: special.im_end.unwrap_or(special.eos),
             seed: 42,
             n_ctx: 512,
+            mirostat_tau: 5.0,
             system_prompt: None,
         };
         let mut conv = Conversation::new(spec);
         let mut engine = GraphEngine::new(&*model, 512);
         let tp = TurnParams {
             n_predict: 16, // a short reply suffices (0.5B usually EOGs within a few dozen tokens)
-            temp: 0.0,     // greedy: deterministic and fast
-            top_k: 40,
-            top_p: 0.95,
-            repeat_penalty: 1.1,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            sampler: sampler::SamplerConfig {
+                temp: 0.0, // greedy: deterministic and fast
+                top_k: 40,
+                top_p: 0.95,
+                repeat_penalty: 1.1,
+                ..sampler::SamplerConfig::default()
+            },
             stop_strings: Vec::new(),
         };
         let mut emitted: Vec<u8> = Vec::new();
@@ -2385,18 +2399,20 @@ mod tests {
             eot: special.im_end.unwrap_or(special.eos),
             seed: 42,
             n_ctx,
+            mirostat_tau: 5.0,
             system_prompt: Some("You are a terse assistant: answer in one short sentence.".into()),
         };
         let mut conv = Conversation::new(spec);
         let mut engine = GraphEngine::new(&*model, n_ctx);
         let tp = TurnParams {
             n_predict: 8, // keep the run short; a few tokens per reply still overflow n_ctx
-            temp: 0.0,
-            top_k: 40,
-            top_p: 0.95,
-            repeat_penalty: 1.1,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            sampler: sampler::SamplerConfig {
+                temp: 0.0,
+                top_k: 40,
+                top_p: 0.95,
+                repeat_penalty: 1.1,
+                ..sampler::SamplerConfig::default()
+            },
             stop_strings: Vec::new(),
         };
         let prompts = [

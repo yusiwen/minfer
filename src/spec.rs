@@ -255,15 +255,19 @@ impl AdaptiveD {
     }
 }
 
-/// Sampler inputs mirrored from GenParams so spec.rs does not depend on
-/// main.rs's private struct.
+/// Sampler inputs mirrored from a [`crate::sampler::SamplerConfig`] so spec.rs
+/// does not depend on main.rs's private struct.
+///
+/// The pure F3 filters (logit bias, DRY, min-p, typical, XTC) are supported and
+/// are applied to each verify row exactly as the serial path applies them.
+/// Mirostat is deliberately *not* supported here: its `mu` is per-decode-step
+/// state, while one round samples several rows from a single shared RNG, so
+/// carrying it faithfully would need a per-position state the round never
+/// commits. The CLI and the server refuse `mirostat + speculative` loudly
+/// (never silently sampling without it); the state passed to
+/// [`crate::sampler::sample_with_config`] below is therefore inert.
 pub struct SpecSampler {
-    pub temp: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub repeat_penalty: f32,
-    pub frequency_penalty: f32,
-    pub presence_penalty: f32,
+    pub cfg: crate::sampler::SamplerConfig,
 }
 
 pub struct SpecEngine {
@@ -415,17 +419,8 @@ impl SpecEngine {
         if d == 0 {
             let mut row =
                 target.forward_graph_cached(&[next_token], &[pos], 1, n_ctx, target_cache);
-            let t = sampler::sample_with_penalties(
-                &mut row,
-                s.temp,
-                s.top_k,
-                s.top_p,
-                s.repeat_penalty,
-                s.frequency_penalty,
-                s.presence_penalty,
-                prev_tokens,
-                rng,
-            );
+            let mut mirostat = sampler::MirostatState::new(s.cfg.mirostat_tau);
+            let t = sampler::sample_with_config(&mut row, &s.cfg, prev_tokens, &mut mirostat, rng);
             if debug {
                 eprintln!(
                     "[spec] r{} pos={pos} next={next_token} d=0 -> [{}]",
@@ -543,20 +538,13 @@ pub fn accept_loop<R: Rng>(
     let nv = logits.len() / (d + 1);
     let mut emitted = Vec::with_capacity(d + 1);
     let mut accepted = 0usize;
+    // Inert unless mirostat is configured, which the CLI/server refuse on this
+    // path (see `SpecSampler`); the pure filters all work per row.
+    let mut mirostat = sampler::MirostatState::new(s.cfg.mirostat_tau);
     for i in 0..=d {
         let mut row = logits[i * nv..(i + 1) * nv].to_vec();
         let (b1, b2) = top2(&row);
-        let t = sampler::sample_with_penalties(
-            &mut row,
-            s.temp,
-            s.top_k,
-            s.top_p,
-            s.repeat_penalty,
-            s.frequency_penalty,
-            s.presence_penalty,
-            prev_tokens,
-            rng,
-        );
+        let t = sampler::sample_with_config(&mut row, &s.cfg, prev_tokens, &mut mirostat, rng);
         if trace >= 2 {
             eprintln!(
                 "[spec] r{round} row {i}: sample={} draft={} margin {:.4}",
@@ -683,12 +671,13 @@ mod tests {
 
     fn sampler() -> SpecSampler {
         SpecSampler {
-            temp: 0.0,
-            top_k: 0,
-            top_p: 1.0,
-            repeat_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            cfg: crate::sampler::SamplerConfig {
+                temp: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                repeat_penalty: 1.0,
+                ..crate::sampler::SamplerConfig::default()
+            },
         }
     }
 
@@ -746,7 +735,7 @@ mod tests {
         let mut prev = vec![];
         let mut rng = StdRng::seed_from_u64(42);
         let mut s = sampler();
-        s.repeat_penalty = 1.5;
+        s.cfg.repeat_penalty = 1.5;
         // nv=4: row 0 argmax = 1 (accepted u1=1); row 1 raw argmax = 1 again,
         // runner-up = 2. With u1=1 in the penalty window, the penalized
         // row-1 sample must be 2, not 1.
