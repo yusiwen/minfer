@@ -75,13 +75,20 @@ Conversation options:
 - `--system <STR>` — system prompt
 - `-mli, --multiline-input` — submit input on an empty line
 - `--color on|off|auto` — color output (default auto = tty)
-- `--session <FILE>` — save/load the conversation history as JSON; on overflow
-  the oldest turns are dropped automatically and generation continues. The
-  dropped turn's KV rows are removed in place and the tail is re-based (Phase C
-  / C2), so only the new turn's delta is prefilled; `MINFER_NO_CONTEXT_SHIFT=1`
-  forces the older, exact "drop the turns and re-prefill the rest" behaviour
-  (an engine that cannot move rows — e.g. Metal, where it is Phase G — falls
-  back to that path on its own and says so on stderr)
+- `--session <FILE>` (with `--cnv`) — save/load the conversation. `FILE` is the
+  history as JSON; `FILE.kv` is a **KV session companion** written next to it (C5)
+  that carries the rows those messages were rendered into, plus the host state they
+  belong to. On start a matching companion is resumed and the history is **not**
+  re-prefilled — the run prints `resumed N message(s) and M KV row(s) … — 0 tokens
+  prefilled`; anything that does not match this run (another `--n-ctx`, another
+  model's `n_kv_embd`, another `MINFER_CACHE_TYPE`, a history the user edited, an
+  older file version) prints the reason and falls back to re-rendering the JSON,
+  which is always correct if slower. On overflow the oldest turns are dropped
+  automatically and generation continues: the dropped turn's KV rows are removed in
+  place and the tail is re-based (Phase C / C2), so only the new turn's delta is
+  prefilled; `MINFER_NO_CONTEXT_SHIFT=1` forces the older, exact "drop the turns and
+  re-prefill the rest" behaviour (an engine that cannot move rows — e.g. Metal,
+  where it is Phase G — falls back to that path on its own and says so on stderr)
 
 Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 (single-shot mode too, when stdout is a terminal or `MINFER_COLOR=1`).

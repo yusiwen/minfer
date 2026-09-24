@@ -1010,9 +1010,67 @@ restart re-prefilled the whole context.
   (24 layers / 256 cells / 5 written / 6 316 748 bytes), drop the cache, restore into a
   fresh one, then 8 greedy steps against the session that never left memory — **max
   |Δlogit| = 0**, i.e. bitwise, which is the strongest form of "the same continuation".
-- Handed off: resuming the CLI's `--session` (which still re-prefills its history JSON)
+- Handed off: resuming the CLI's `--session` (which still re-prefilled its history JSON)
   from this container, and an E2 slot-table snapshot for the server, are
   [#89](https://github.com/yusiwen/minfer/issues/89).
+
+**C5 S2 — the CLI resumes, the host state rides along (2026-09-24).**
+
+The container described the KV *rows*; the rows belong to a host state, and a restore that
+brought one back without the other would be a different session. S2 closes that gap for the
+CLI and records what the server still needs.
+
+- **The container gained a host-state section (version 2).** An opaque, length-prefixed blob
+  after the bookkeeping and **inside the checksum** (`KvSessionWriter::set_host`,
+  `KvSessionReader::finish` → `KvSessionBody`), so the two halves travel together or not at
+  all; a version-1 file has no such section and is refused loudly, which is exactly what the
+  caller's fallback path is for. `kv_save_with_host`/`kv_load_with_host` carry it through the
+  allocator; `kv_save`/`kv_load` stay as the no-host wrappers every existing gate uses.
+- **`Conversation::snapshot` / `restore_snapshot`** is the host half: the message list,
+  `stream_tokens`, `current_pos`, `turn_pos`, `prev_tokens` and `need_insert_eot`, as a
+  versioned JSON blob (`SNAPSHOT_VERSION`), with validation before it is applied — a snapshot
+  whose `current_pos` disagrees with the token mirror, or that does not fit this run's
+  `n_ctx`, is refused rather than half-applied.
+- **`--session FILE` (under `--cnv`) writes `FILE.kv` on exit and resumes it on start.**
+  Everything that could make a resume wrong falls back to re-rendering the JSON **with the
+  reason printed**: another `n_ctx`/model/`MINFER_CACHE_TYPE`, a history the user edited
+  between runs (the snapshot and the JSON must agree), an unknown snapshot version, a
+  missing companion, an engine that cannot hand its KV to the host (a speculative session —
+  the draft keeps its own KV — and the mocks), and any file the container itself refuses.
+
+**Acceptance, as measured** (2026-09-24, Qwen2.5-0.5B Q4_0, CPU, `--n-ctx 1024`,
+1530-character history, greedy, `-n 8`):
+
+- *Continues alike*: turn 2 in a **new process** resumed from the companion answers
+  `The answer to 2+2 is` — byte-identical to the same turn in the process that never left
+  memory, **and** to a run with the companion moved away (the re-seed path). So the resume is
+  behaviour-preserving, not merely fast.
+- *And prefills nothing at startup*: the resumed run prints
+  `resumed 2 message(s) and 379 KV row(s) from …seed.json.kv (25 268 624 bytes) — 0 tokens
+  prefilled`. Wall clock to the identical continuation: **0.47 s resumed vs 2.36 s re-seeded**
+  (5.0×), the difference being the ~370-token history the JSON path re-renders.
+- *Mismatches are loud*: `--n-ctx 512` against the 1024-cell companion prints
+  `KV session: the file describes a 1024-cell arena, this run has 512 (--n-ctx); re-seeding
+  the history instead` and continues correctly.
+- *Gates, each mutation-checked*: `a_resumed_snapshot_prefills_nothing_and_continues_alike`
+  (the restored run issues the **same engine calls, at the same positions**, as the in-memory
+  run — forgetting `prev_tokens` in `restore_snapshot` fails it),
+  `the_host_state_round_trips_and_is_covered_by_the_checksum` (a flipped byte inside the host
+  blob is refused; dropping the host from the writer fails it),
+  `a_version_1_file_is_refused_so_the_caller_can_re_seed`,
+  `a_snapshot_that_contradicts_the_host_mirror_is_refused`, and
+  `an_engine_without_a_kv_refuses_the_session_calls`. Suites: CPU **287 passed / 0 failed /
+  15 ignored** (was 282/0/15).
+- *Not verified here*: a CUDA or Metal session companion (the container is backend-tagged and
+  the CPU path is what this box measured; the CUDA half of C5's own gate was run at S1).
+
+**Still open on [#89](https://github.com/yusiwen/minfer/issues/89): the server slot
+snapshot.** `server::batch` keeps a per-slot table (`seq`, `start`, `cap`, the in-flight
+`Run`) that admission rebuilds from scratch, so a restart drops every in-flight conversation
+even though the rows are recoverable in the same container. That needs the slot table and
+each slot's request state in the host blob, a restore path in admission, and a refusal for a
+snapshot taken under another `--n-slots`/`n_ctx` — a server-lifecycle increment, so it is
+handed off rather than half-wired here.
 
 ### C6 — Logical positions (`positions` ≠ cells)
 
