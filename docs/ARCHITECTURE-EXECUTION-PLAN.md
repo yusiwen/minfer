@@ -3235,7 +3235,7 @@ Can run in parallel with A–E by a different workstream.
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) | M | this box |
-| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24** | M | this box |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24** | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
@@ -3540,16 +3540,92 @@ is **out of F8's scope** (it changes `admit`'s contract and the error semantics 
 both serve paths), so it was written up as a follow-up:
 [#121](https://github.com/yusiwen/minfer/issues/121).
 
-**Honest scope.** (a) Every measurement in this record was taken on a **CPU-only
-build**: the worktree was built with `cargo build --release`, without
-`--features cuda`, so the server's banner reads `device cpu` and the CUDA backend
-is not compiled in at all (the outer tree's CUDA binary was left untouched). This
-ticket does not need a device and the wiring is backend-agnostic — the timing hook
-is in the shared scheduler and `kv_snapshot_from` reads whatever backend the model
-reports — so no CUDA/Metal *runtime* claim is made here. The CUDA compile path is
-covered locally with `cargo test --release --features cuda --no-run` (nvcc 13.0,
-no device needed) and by CI's `build-linux-cuda`; the macOS compile path is CI's
-`build-macos` only. (b) Per-op timing measures the **scheduler's per-node
+**Device verification (2026-09-24, `NVIDIA GB10` sm_121, CUDA 13.0 / nvcc
+V13.0.88, driver 580.178.04).** Every measurement above is CPU-only, so the two
+real-model gates were re-run on the GPU in an isolated worktree (`.worktrees/f8gpu`,
+branch `verify/f8-gpu-gates`, from `master` `3616570`), leaving the CPU numbers
+untouched. Build: `CUDA_HOME=/usr/local/cuda-13.0
+PATH=/usr/local/cuda-13.0/bin:$PATH cargo build --release --features cuda` →
+`targets sm_75,sm_80,sm_86,sm_87,sm_88,sm_89,sm_90,sm_100,sm_103,sm_110,sm_120,sm_121;
+PTX compute_121` (`build.rs`'s auto-detected list; `cuobjdump --list-elf` confirms a
+`sm_121` cubin and `--list-ptx` a `compute_121` PTX section in the binary). The
+device really participates: the load banner reads `CUDA: using NVIDIA GB10 (SM 12.1,
+124544 MB, 48 SMs)` / `CUDA: device tier DGX Spark GB10 (Measured, mmq true)` /
+`CUDA: GPU acceleration enabled`, plus E5's `offload: all 24 blocks + embed/output
+on cuda (403.2 MiB of device weights; default)`, where the control
+(`MINFER_DISABLE_CUDA=1`) reads `CUDA: disabled by MINFER_DISABLE_CUDA` and
+`CUDA: not available, using CPU fallback` (`=0` disables too —
+presence-checked). A greedy 8-token CLI A/B on one prompt measured **1182.0 tok/s
+prefill / 208.5 tok/s decode on the device vs 194.4 / 59.2 with the device
+disabled** (6.1x / 3.5x) — the difference the gate numbers themselves cannot show.
+
+Both gates were run serially on the device (the `CudaState` singleton is
+process-wide, so the serial form is the only honest one) on the default 0.5B (f32
+KV) **and** on `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 —
+the only combination that reaches FA prefill):
+
+| Gate | Configuration | Result | Numbers it printed |
+|---|---|---|---|
+| `serve_loop_publishes_the_queue_and_running_depth` | 0.5B f32 KV, device | ok | peak running 2, 24 layers, 25 165 824 B region, 262 owned cells, 1 dropped |
+| `serve_loop_publishes_the_queue_and_running_depth` | 0.5B f32 KV, `MINFER_DISABLE_CUDA=1` | ok | peak running 2, 24 layers, 25 165 824 B, 266 owned, 1 dropped |
+| `serve_loop_publishes_the_queue_and_running_depth` | Qwen3-0.6B f16 KV, device | ok | peak running 2, 28 layers, 234 881 024 B, 262 owned, 1 dropped |
+| `published_metrics_move_as_requests_are_served` | 0.5B f32 KV, device | ok | 24 layers, 128 rows, 3 145 728 B, owned 11, idle_slots 10, reserved_classes 5; 2→1→1→2, 256→184, 120→183 |
+| `published_metrics_move_as_requests_are_served` | 0.5B f32 KV, `MINFER_DISABLE_CUDA=1` | ok | same shape, `reserved_classes` 4 |
+| `published_metrics_move_as_requests_are_served` | Qwen3-0.6B f16 KV, device | ok | 28 layers, 128 rows, 29 360 128 B, owned 11, idle_slots 17, reserved_classes 6; 2→1→1→2, 256→184, 120→183 |
+
+The *asserted* numbers are **device-independent by construction** — `model.n_layer()`,
+`n_ctx` and the KV element width, plus the arena bookkeeping — so the device and the
+control agree on them, and that agreement is deliberately **not** offered as
+evidence. The device evidence is the in-test banner/offload line and the CLI A/B
+throughput above. Two non-asserted gauges did differ (`owned_cells` 262 vs 266 in
+the serve-loop gate, `reserved_classes` 5 vs 4 in the metrics gate), both incidental
+— the greedy stop point and the per-backend size-class ladder — not independent
+proof.
+
+The F8 path that genuinely runs on the device is per-op timing, because
+`BackendScheduler::execute` dispatches CUDA through the same wrapper. On the device
+with `MINFER_OP_TIMING=1` a `serve` plus one 8-token chat completion renders **11 op
+families / 26 lines**, including the CUDA-only fused forms `fused_qkv` (72 calls) and
+`fused_ffn` (72), alongside `matmul` 316, `rms_norm` 196, `add` 192, `attn` 96,
+`kvcache_load` 96, `rope` 48, `kvcache_store` 24, `swiglu` 24 and `get_rows` 6; the
+same server with the flag unset renders **0** `minfer_op_` lines, so the flag is off
+by default on the device too. The computed text is unchanged: a greedy CLI A/B
+(`--greedy --seed 42 -n 12`) produced `The capital of France is Paris. It is the
+largest city` byte-identically with the flag on and off (and across a repeated
+off run), and the same chat request served with and without the flag returned
+identical content.
+
+**The full `#[ignore]`d set on this CUDA build is red, and not because of F8.**
+`cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1`
+gives **5 passed / 14 failed** at `3616570` (deterministic across two runs), and all
+14 fail with the same refusal: the E4 default CUDA budget collapses to **0 bytes**
+once the conversation and map-window tests have run in one process — the
+`cudaMemGetInfo` free read is discarded and becomes a 0 budget, refusing every later
+allocation — while `/proc/meminfo` sampled during the minimal reproduction showed
+118.6–119.8 GB of 121 GB still available. Run alone, the two F8 gates pass (the table
+above), and the set's other pre-existing problems surface separately:
+`a_packed_kv_cache_answers_like_the_f32_one` is CPU-only by its own docstring and
+fails alone with "no CUDA kernel reads a packed q8_0 region"
+([#87](https://github.com/yusiwen/minfer/issues/87)), and
+`cuda_map_window_costs_no_more_than_the_span_it_replaces` has a 1.25x timing margin
+a loaded GB10 exceeded once (1.267x) and met in another run. All three are filed
+([#122](https://github.com/yusiwen/minfer/issues/122),
+[#123](https://github.com/yusiwen/minfer/issues/123)) and **none reproduces with
+either F8 gate run alone**, which is why the device claim below is scoped to those
+two gates plus the op-timing path.
+
+**Honest scope.** (a) Every measurement in the sections *above* this block was taken
+on a **CPU-only build**: that worktree was built with `cargo build --release`,
+without `--features cuda`, so the server's banner reads `device cpu` and the CUDA
+backend is not compiled in at all (the outer tree's CUDA binary was left untouched).
+This ticket does not need a device and the wiring is backend-agnostic — the timing
+hook is in the shared scheduler and `kv_snapshot_from` reads whatever backend the
+model reports — so the plan-level claim was made without one. The two real-model
+gates and the timing path are **device-verified** in the block above (2026-09-24,
+GB10); everything else here still carries no CUDA/Metal *runtime* claim. The CUDA
+compile path is covered locally with `cargo test --release --features cuda --no-run`
+(nvcc 13.0, no device needed) and by CI's `build-linux-cuda`; the macOS compile path
+is CI's `build-macos` only. (b) Per-op timing measures the **scheduler's per-node
 dispatch** — the one choke point CPU/Metal/CUDA share — so it includes the
 backend's prologue and excludes split-level syncs, cross-backend staging copies,
 allocator liveness and `fill_input`; there is no kernel-only timer. (c) There is
@@ -3570,7 +3646,8 @@ while a job is in the channel; it is exact in the steady state and saturating,
 never negative. (f) The Metal path is compile-checked by CI's
 `build-macos` only (there is no Mac here); the CUDA path is compile-checked both by
 CI's `build-linux-cuda` and locally (see (a)), and the timing hook itself is
-exercised on CPU here. (g) The signal path is **not in the automated suite** — only
+exercised on CPU here and on the GB10 (the device block above), including the
+CUDA-only fused ops. (g) The signal path is **not in the automated suite** — only
 `bounded_drain`, the deadline parse and the draining `503` are. The end-to-end
 runs above were performed by hand on this box and are recorded here as manual
 evidence, not as a CI gate; wiring a `SIGTERM` into a test would mean a
