@@ -1630,6 +1630,29 @@ mod tests {
         crate::cuda::CudaState::get()
     }
 
+    /// Median of `v` (does not reorder the caller's slice).
+    fn median(v: &[f64]) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    }
+
+    /// The map-window A/B's statistic, shared by both its phases.
+    ///
+    /// `span` and `map` hold µs/launch for the **same** round index, which is why
+    /// the callers interleave the rounds: each ratio is a matched pair measured
+    /// next to each other on the same machine state, and the ratio's median is the
+    /// location estimate that ignores up to half the rounds a passing load spike
+    /// disturbed. Returns `(ratio, span_median, map_median, sorted_ratios)` so the
+    /// gate prints every sample and not just the verdict.
+    fn median_ratio(span: &[f64], map: &[f64]) -> (f64, f64, f64, Vec<f64>) {
+        assert_eq!(span.len(), map.len(), "one ratio per matched round");
+        let mut ratios: Vec<f64> = span.iter().zip(map).map(|(s, m)| m / s).collect();
+        let r = median(&ratios);
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (r, median(span), median(map), ratios)
+    }
+
     #[test]
     fn cuda_pool_roundtrip() {
         if device().is_none() {
@@ -4009,10 +4032,14 @@ mod tests {
     /// modes attend to the *same* rows (one run each), so the difference is the
     /// row resolution alone — S4's "each backend gets its own A/B".
     ///
-    /// Run with `--ignored --nocapture` on a quiet box; the medians it prints are
-    /// the numbers the plan records.
+    /// Both phases (decode and prefill) time interleaved rounds of the two modes
+    /// and assert the **median of the per-round ratios**, so load arriving during
+    /// the run is absorbed instead of deciding the verdict (issue #123). Run with
+    /// `--ignored --nocapture` to see every sample and the median the gate used;
+    /// the printed medians are the numbers the plan records. It no longer needs an
+    /// otherwise quiet box.
     #[test]
-    #[ignore = "timing: needs a CUDA device and an otherwise quiet box"]
+    #[ignore = "timing: needs a CUDA device"]
     fn cuda_map_window_costs_no_more_than_the_span_it_replaces() {
         let Some(mut cb) = pool() else {
             eprintln!("skipping: no CUDA device");
@@ -4044,9 +4071,14 @@ mod tests {
         cb.write_host(mpb, &bits(&map)).unwrap();
 
         let scale = 1.0 / (hd as f32).sqrt();
+        // µs/launch for one timed round of `reps` launches, after `warmup`
+        // untimed ones. A first launch pays the module load, which is not the
+        // measurement (the prewarm list covers the production instantiations, not
+        // necessarily these).
         let time = |cb: &mut crate::graph::cuda_backend::CudaBackend,
                     mode: crate::cuda::AttnWindow,
-                    reps: usize|
+                    reps: usize,
+                    warmup: usize|
          -> f64 {
             let win = if mode == crate::cuda::AttnWindow::Map {
                 mpb
@@ -4068,10 +4100,7 @@ mod tests {
                     false,
                 );
             };
-            // Warm-up: a first launch pays the module load, which is not the
-            // measurement (the prewarm list covers the production instantiations,
-            // not necessarily these).
-            for _ in 0..3 {
+            for _ in 0..warmup {
                 call(cb);
             }
             cb.state.sync();
@@ -4080,31 +4109,46 @@ mod tests {
                 call(cb);
             }
             cb.state.sync();
-            t0.elapsed().as_secs_f64() * 1e3
+            t0.elapsed().as_secs_f64() * 1e6 / reps as f64
         };
 
-        let (reps, rounds) = (200usize, 5usize);
-        let mut span_ms: Vec<f64> = Vec::new();
-        let mut map_ms: Vec<f64> = Vec::new();
+        // The A/B statistic (issue #123). The old form compared two sums taken one
+        // after the other — span for `reps` launches, then map — with a single
+        // `<= 1.25x` margin, so load arriving during the map half inflated the
+        // ratio with nothing to absorb it (a loaded GB10 measured 1.267x,
+        // 2.232 vs 1.761 ms; a rerun of the same binary passed). Here the two
+        // modes' rounds are **interleaved** (span, map, span, map, …), so a spike
+        // lands on one round of one mode, and the gate asserts the **median of the
+        // per-round ratios** — a matched pair per round, robust to up to
+        // `rounds / 2` disturbed rounds.
+        //
+        // The threshold is **not** widened: it is the pre-#123 gate's 1.25x. What
+        // changed is the statistic, and the margin is now justified by measurement.
+        // On an idle GB10 the median ratio is 1.001-1.004 (decode) and 1.087-1.107
+        // (prefill) over 6 runs; with 16 CPU spinners plus two concurrent CUDA
+        // attention loops it stays 1.001-1.018 and 1.079-1.145, although individual
+        // rounds reach 1.4-8.6x. So 1.25 leaves >= 9% headroom over the worst
+        // loaded median while still tripping on a >= 15% uniform map regression
+        // (the mutation check doubles the map work and fails the gate).
+        const MAX_MAP_OVER_SPAN: f64 = 1.25;
+        let (reps, rounds, warmup) = (100usize, 9usize, 3usize);
+        let mut span_us: Vec<f64> = Vec::with_capacity(rounds);
+        let mut map_us: Vec<f64> = Vec::with_capacity(rounds);
         for _ in 0..rounds {
-            span_ms.push(time(&mut cb, crate::cuda::AttnWindow::Span, reps));
-            map_ms.push(time(&mut cb, crate::cuda::AttnWindow::Map, reps));
+            span_us.push(time(&mut cb, crate::cuda::AttnWindow::Span, reps, warmup));
+            map_us.push(time(&mut cb, crate::cuda::AttnWindow::Map, reps, warmup));
         }
-        span_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        map_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let (s_ms, m_ms) = (span_ms[rounds / 2], map_ms[rounds / 2]);
+        let (d_ratio, d_span, d_map, d_ratios) = median_ratio(&span_us, &map_us);
         eprintln!(
-            "[s4-ab] nkv={nkv} nh={nh} nk={nk} hd={hd}: span {s_ms:.3} ms / map {m_ms:.3} ms over \
-             {reps} launches ({:.1} vs {:.1} us/launch) — {:.3}x",
-            s_ms * 1000.0 / reps as f64,
-            m_ms * 1000.0 / reps as f64,
-            m_ms / s_ms
+            "[s4-ab] nkv={nkv} nh={nh} nk={nk} hd={hd}: span {d_span:.1} / map {d_map:.1} \
+             us/launch (median of {rounds} interleaved rounds of {reps}); per-round ratios \
+             {d_ratios:?} — median {d_ratio:.3}x"
         );
         assert!(
-            m_ms <= s_ms * 1.25,
-            "the map window costs {:.3}x the span it replaces ({m_ms:.3} vs {s_ms:.3} ms); S4's \
-             claim is that resolving a row through runs is not a new bottleneck",
-            m_ms / s_ms
+            d_ratio <= MAX_MAP_OVER_SPAN,
+            "the map window costs {d_ratio:.3}x the span it replaces (medians {d_map:.1} vs \
+             {d_span:.1} us/launch; per-round ratios {d_ratios:?}); S4's claim is that resolving a \
+             row through runs is not a new bottleneck"
         );
 
         // The other half of the A/B: a *prefill* window (each query's whole
@@ -4143,7 +4187,8 @@ mod tests {
         cb.write_host(mpb2, &bits(&map2)).unwrap();
         let time_prefill = |cb: &mut crate::graph::cuda_backend::CudaBackend,
                             mode: crate::cuda::AttnWindow,
-                            reps: usize|
+                            reps: usize,
+                            warmup: usize|
          -> f64 {
             let win = if mode == crate::cuda::AttnWindow::Map {
                 mpb2
@@ -4165,7 +4210,7 @@ mod tests {
                     nt,
                 );
             };
-            for _ in 0..2 {
+            for _ in 0..warmup {
                 call(cb);
             }
             cb.state.sync();
@@ -4174,27 +4219,42 @@ mod tests {
                 call(cb);
             }
             cb.state.sync();
-            t0.elapsed().as_secs_f64() * 1e3
+            t0.elapsed().as_secs_f64() * 1e6 / reps as f64
         };
-        let (preps, hd_ok) = (20usize, hd == 128);
-        let (p_span, p_map) = if hd_ok {
-            (
-                time_prefill(&mut cb, crate::cuda::AttnWindow::Span, preps),
-                time_prefill(&mut cb, crate::cuda::AttnWindow::Map, preps),
-            )
-        } else {
-            (0.0, 0.0)
-        };
+        // Same interleaved, median-of-ratios statistic as the decode A/B above —
+        // this is the assertion that failed on a loaded GB10, and the old form was
+        // weaker here than there (a single 20-launch block per mode, no interleaving
+        // and no round-to-round statistic at all). 9 rounds × 50 launches at
+        // ~85 µs/launch is ~40 ms per mode.
+        let (preps, prorounds, pwarm) = (50usize, 9usize, 3usize);
+        let hd_ok = hd == 128;
         if hd_ok {
+            let mut pspan_us: Vec<f64> = Vec::with_capacity(prorounds);
+            let mut pmap_us: Vec<f64> = Vec::with_capacity(prorounds);
+            for _ in 0..prorounds {
+                pspan_us.push(time_prefill(
+                    &mut cb,
+                    crate::cuda::AttnWindow::Span,
+                    preps,
+                    pwarm,
+                ));
+                pmap_us.push(time_prefill(
+                    &mut cb,
+                    crate::cuda::AttnWindow::Map,
+                    preps,
+                    pwarm,
+                ));
+            }
+            let (p_ratio, p_span, p_map, p_ratios) = median_ratio(&pspan_us, &pmap_us);
             eprintln!(
-                "[s4-ab] prefill nt={nt} nkv={nt} hd={hd}: span {p_span:.3} ms / map {p_map:.3} \
-                 ms over {preps} launches — {:.3}x",
-                p_map / p_span
+                "[s4-ab] prefill nt={nt} nkv={nt} hd={hd}: span {p_span:.1} / map {p_map:.1} \
+                 us/launch (median of {prorounds} interleaved rounds of {preps}); per-round ratios \
+                 {p_ratios:?} — median {p_ratio:.3}x"
             );
             assert!(
-                p_map <= p_span * 1.25,
-                "a map prefill costs {:.3}x the span it replaces ({p_map:.3} vs {p_span:.3} ms)",
-                p_map / p_span
+                p_ratio <= MAX_MAP_OVER_SPAN,
+                "a map prefill costs {p_ratio:.3}x the span it replaces (medians {p_map:.1} vs \
+                 {p_span:.1} us/launch; per-round ratios {p_ratios:?})"
             );
         }
     }
