@@ -189,6 +189,9 @@ pub struct BatchEngine {
     /// `None` = no snapshot (the default). Opt-in, because a snapshot rewrites the
     /// whole arena — see the cost line the worker prints at startup.
     slots_file: Option<std::path::PathBuf>,
+    /// F8: where this engine's forwards run, so `/metrics` reports the occupancy
+    /// of the backend the server actually uses rather than the CPU's by default.
+    device: crate::models::Device,
 }
 
 /// C7: the cells a request wants reserved — pure, so the growth policy is
@@ -274,7 +277,32 @@ impl BatchEngine {
             prefill_fed: 0,
             interleaved_ticks: 0,
             slots_file: None,
+            device: model.device(),
         })
+    }
+
+    /// F8: publish this engine's live reading — the allocator's `MemoryReport`
+    /// (weights / pool / live / peak / budget / headroom / reservation depth),
+    /// the arena shape, the C3/C8b counters, and how many slots are running now.
+    ///
+    /// Called from `serve_loop` after every step and every admission group. The
+    /// cost is a handful of `HashMap` lookups plus ~20 relaxed stores, i.e. far
+    /// below one forward, so a live reading does not perturb generation (the same
+    /// reason the renderer takes no lock).
+    pub fn publish_metrics(&mut self, metrics: &super::metrics::ServerMetrics) {
+        // The borrow checker wants the slot count before `cache.alloc_mut()`.
+        let running = self.running_slots() as u64;
+        let backend = crate::graph::kvsession::backend_of(self.device);
+        let snapshot = super::metrics::kv_snapshot_from(self.cache.alloc(), backend);
+        metrics.publish_kv(&snapshot);
+        metrics
+            .running
+            .store(running, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Slots currently holding a live request.
+    pub fn running_slots(&self) -> usize {
+        self.slots.iter().filter(|s| s.run.is_some()).count()
     }
 
     /// The slot table as JSON (the KV container's opaque host section).
@@ -1266,17 +1294,28 @@ impl BatchEngine {
 }
 
 /// Drain jobs (blocking only when nothing is in flight) and step the batch.
+///
+/// F8: `metrics` is written on every pass — the queue/engine counters here, the
+/// KV/allocator reading through `BatchEngine::publish_metrics`.
 pub fn serve_loop(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     mut job_rx: mpsc::Receiver<Job>,
     engine: &mut BatchEngine,
+    metrics: &super::metrics::ServerMetrics,
 ) {
     let mut pending: VecDeque<Job> = VecDeque::new();
     loop {
         if !engine.busy() {
             // Nothing to step: wait for work.
             let Some(job) = job_rx.blocking_recv() else {
+                // No senders left: publish the final reading (idle slots, nothing
+                // running) before leaving, so a scrape after the drain is not a
+                // stale "busy".
+                metrics
+                    .worker_pending
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                engine.publish_metrics(metrics);
                 break;
             };
             pending.push_back(job);
@@ -1289,23 +1328,44 @@ pub fn serve_loop(
                 Err(TryRecvError::Disconnected) => break,
             }
         }
+        metrics
+            .worker_pending
+            .store(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // Admit everything that arrived as one group, so their prefills can
         // share a forward (`admit` places each request on its own slot and
         // combines the prefills when they fit).
         let group: Vec<Job> = pending.drain(..).collect();
         if !group.is_empty() {
-            for r in engine.admit(model, tokenizer, group) {
+            // `admitted` counts every job that *left* the queue (whether the
+            // engine could place it or not), so `requests_total - admitted` is
+            // exactly what is still waiting and cannot drift on a rejection.
+            metrics
+                .jobs_admitted_total
+                .fetch_add(group.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .worker_pending
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            let answers = engine.admit(model, tokenizer, group);
+            let dropped = answers.iter().filter(|r| r.is_err()).count() as u64;
+            for r in answers {
                 if let Err(e) = r {
                     // The engine could not place the request (no idle slot).
                     eprintln!("[server] job rejected: {}", e.message);
                 }
+            }
+            if dropped > 0 {
+                metrics
+                    .jobs_dropped_total
+                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if engine.busy() {
             if let Err(e) = engine.tick(model, tokenizer) {
                 eprintln!("[server] step failed: {}", e.message);
             }
-        } else if job_rx.is_closed() && pending.is_empty() {
+        }
+        engine.publish_metrics(metrics);
+        if !engine.busy() && job_rx.is_closed() && pending.is_empty() {
             break;
         }
     }
@@ -2565,6 +2625,244 @@ mod tests {
         assert_eq!(
             grew_off, 0,
             "with chunking off the other slot cannot advance during the prefill"
+        );
+    }
+    /// F8 (#51): `serve_loop` publishes the queue and running depth as it serves.
+    ///
+    /// Two rounds, both driving the **real** serve loop with a real model:
+    ///
+    /// 1. Two jobs on two slots: the feeder thread plays the HTTP handler's two
+    ///    increments (`requests_total` on accept, `in_flight`), sends the jobs,
+    ///    and watches the registry while the loop admits, steps and finishes
+    ///    them. The gate asserts the queue depth and the running count were both
+    ///    observed non-zero and settle at zero.
+    /// 2. Two jobs on **one** slot, both queued before the loop starts: the
+    ///    "no idle slot" path is taken deterministically and its counter
+    ///    (`jobs_dropped_total`) must fire — while the queue arithmetic still
+    ///    balances, because a rejected job has also *left* the queue.
+    ///
+    /// Real-model gate (`#[ignore]`: CI has no cached GGUF).
+    #[test]
+    #[ignore = "needs the cached 0.5B GGUF (CI has no model)"]
+    fn serve_loop_publishes_the_queue_and_running_depth() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let Some(path) = cached_model() else {
+            eprintln!("[f8] no cached model; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let metric_source = |path: &str| -> Vec<u32> { tok.encode(path) };
+
+        // --- round 1: two jobs, two slots, observed while running ---------------
+        let mut engine = BatchEngine::new(&*model, 2, 128).expect("engine");
+        let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
+        let (job_tx, job_rx) = mpsc::channel::<Job>(64);
+        let n = 2usize;
+        let prompts: Vec<Vec<u32>> = (0..n)
+            .map(|i| metric_source(&format!("Say the number {}.", i + 1)))
+            .collect();
+        let feeder_metrics = metrics.clone();
+        let feeder = std::thread::spawn(move || {
+            let mut rxs = Vec::new();
+            for p in prompts {
+                let (tx, rx) = mpsc::channel::<StreamEvent>(1024);
+                rxs.push(rx);
+                job_tx
+                    .blocking_send(Job {
+                        input_ids: p,
+                        params: sampling_params(2),
+                        tx,
+                    })
+                    .expect("send job");
+                // The HTTP handler's side of the contract: accepted + in flight.
+                feeder_metrics.requests_total.fetch_add(1, Ordering::SeqCst);
+                feeder_metrics.in_flight.fetch_add(1, Ordering::SeqCst);
+            }
+            let (mut peak_queue, mut peak_running) = (0u64, 0u64);
+            let deadline = Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let s = feeder_metrics.snapshot();
+                peak_queue = peak_queue.max(s.queue_depth);
+                peak_running = peak_running.max(s.running);
+                if (s.queue_depth == 0 && s.running == 0) || Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Drain the responses; the worker's `blocking_send` must never wedge.
+            for mut rx in rxs {
+                while rx.blocking_recv().is_some() {}
+            }
+            (peak_queue, peak_running)
+        });
+
+        super::serve_loop(&*model, &tok, job_rx, &mut engine, &metrics);
+        let (peak_queue, peak_running) = feeder.join().expect("feeder");
+
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.requests_total - s.queue_depth,
+            n as u64,
+            "every accepted job left the queue"
+        );
+        assert_eq!(s.jobs_dropped_total, 0, "two slots served two jobs");
+        assert_eq!(s.running, 0, "nothing is running once the loop drains");
+        assert_eq!(s.worker_pending, 0);
+        assert!(
+            peak_queue > 0,
+            "the queue depth was never observed non-zero"
+        );
+        assert!(
+            peak_running > 0,
+            "the running count was never observed non-zero"
+        );
+        // The KV reading is live, not a startup snapshot.
+        assert_eq!(s.kv.layers, model.n_layer() as u64);
+        assert!(s.kv.region_bytes > 0);
+
+        // --- round 2: two jobs, one slot, both queued up front ------------------
+        let mut one = BatchEngine::new(&*model, 1, 128).expect("engine");
+        let one_metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
+        let (tx1, rx1) = mpsc::channel::<Job>(64);
+        for p in [metric_source("Alpha"), metric_source("Beta")] {
+            let (tx, _rx) = mpsc::channel::<StreamEvent>(1024);
+            tx1.blocking_send(Job {
+                input_ids: p,
+                params: sampling_params(2),
+                tx,
+            })
+            .expect("queue job");
+            one_metrics.requests_total.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(tx1); // no more senders: the loop drains and exits
+        super::serve_loop(&*model, &tok, rx1, &mut one, &one_metrics);
+        let s1 = one_metrics.snapshot();
+        assert_eq!(
+            s1.requests_total - s1.queue_depth,
+            2,
+            "a rejected job still left the queue"
+        );
+        assert_eq!(
+            s1.jobs_dropped_total, 1,
+            "the second job cannot fit one slot and must be counted as dropped"
+        );
+        assert_eq!(s1.running, 0);
+        assert_eq!(s1.worker_pending, 0);
+
+        eprintln!(
+            "[f8] serve_loop: peak queue {peak_queue}, peak running {peak_running}, \
+             layers {} region {} B owned {} cells; one slot -> {} dropped",
+            s.kv.layers, s.kv.region_bytes, s.kv.owned_cells, s1.jobs_dropped_total
+        );
+    }
+
+    /// F8 (#51): the published occupancy and running counts are a **live**
+    /// reading, not a startup snapshot — they move as requests are served.
+    ///
+    /// Real-model gate (`#[ignore]`, like the rest of this module's measurement
+    /// tests: CI has no cached GGUF). Run it with
+    /// `cargo test --release --bin minfer -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "needs the cached 0.5B GGUF (CI has no model)"]
+    fn published_metrics_move_as_requests_are_served() {
+        let Some(path) = cached_model() else {
+            eprintln!("[f8] no cached model; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let n_slots = 2usize;
+        let n_ctx = 128usize;
+        let mut engine = BatchEngine::new(&*model, n_slots, n_ctx).expect("engine");
+        let metrics = crate::server::metrics::ServerMetrics::new();
+
+        // Before any forward: sequences are reserved, but no KV region exists yet
+        // (the arena is sized by the first `alloc_graph`), so the layers gauge is
+        // genuinely 0 — the reading tracks the arena, it does not assume one.
+        engine.publish_metrics(&metrics);
+        let cold = metrics.snapshot();
+        assert_eq!(cold.kv.layers, 0, "no graph built yet, so no KV region");
+        assert_eq!(cold.kv.sequences, n_slots as u64);
+        assert_eq!(cold.running, 0);
+
+        // Serve one request a step at a time and watch the numbers move.
+        let prompt: Vec<u32> = (1..=8).collect();
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+        engine
+            .submit_on(
+                &*model,
+                &tok,
+                0,
+                Job {
+                    input_ids: prompt.clone(),
+                    params: sampling_params(4),
+                    tx,
+                },
+            )
+            .expect("submit");
+        engine.publish_metrics(&metrics);
+        let warm = metrics.snapshot();
+        assert_eq!(
+            warm.kv.layers,
+            model.n_layer() as u64,
+            "the first forward allocates every layer's KV region"
+        );
+        assert_eq!(warm.kv.rows, n_ctx as u64);
+        assert!(warm.kv.region_bytes > 0, "a live arena has bytes");
+        assert_eq!(warm.running, 1, "one slot holds a live request");
+        // The admission prefilled the prompt, so those cells are already owned —
+        // the gauge tracks the store, it does not wait for a decode step.
+        assert!(
+            warm.kv.owned_cells >= prompt.len() as u64,
+            "the prefill wrote the prompt's {} cells (got {})",
+            prompt.len(),
+            warm.kv.owned_cells
+        );
+
+        // Step until the request finishes; `running` must fall back to 0 and the
+        // owned-cell gauge must have grown.
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        while engine.busy() && Instant::now() < deadline {
+            engine.tick(&*model, &tok).expect("tick");
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, StreamEvent::Finish { .. } | StreamEvent::Err(_)) {
+                    break;
+                }
+            }
+        }
+        assert!(!engine.busy(), "the request finished inside the deadline");
+        engine.publish_metrics(&metrics);
+        let done = metrics.snapshot();
+        assert_eq!(done.running, 0, "no live request is running");
+        assert!(
+            done.kv.owned_cells >= warm.kv.owned_cells,
+            "the run wrote at least the prompt's cells ({} -> {})",
+            warm.kv.owned_cells,
+            done.kv.owned_cells
+        );
+        assert_eq!(done.kv.layers, warm.kv.layers);
+
+        // The snapshot is exactly what `/metrics` renders, so the endpoint sees
+        // the live numbers too.
+        let text = metrics.render();
+        assert!(text.contains(&format!("minfer_kv_layers {}\n", model.n_layer())));
+        assert!(text.contains(&format!("minfer_kv_rows {n_ctx}\n")));
+        assert!(text.contains("minfer_requests_running 0\n"));
+
+        eprintln!(
+            "[f8] metrics: layers {} rows {} region {} B owned {} cells idle_slots {} \
+             reserved_classes {}",
+            done.kv.layers,
+            done.kv.rows,
+            done.kv.region_bytes,
+            done.kv.owned_cells,
+            done.kv.idle_slots,
+            done.kv.reserved_classes
         );
     }
 }

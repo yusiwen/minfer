@@ -1494,6 +1494,12 @@ impl GraphAllocator {
         self.kv.region_bytes()
     }
 
+    /// F8: layers with an allocated KV arena — one half of the arena shape
+    /// (the other is [`Self::kv_n_ctx`]'s row count).
+    pub fn kv_layer_count(&self) -> usize {
+        self.kv.layer_count()
+    }
+
     /// Whether the persistent KV regions store packed cells (C4).
     pub fn kv_is_packed(&self) -> bool {
         self.kv.any_packed()

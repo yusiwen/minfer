@@ -633,6 +633,7 @@ pub fn worker_loop(
     job_rx: mpsc::Receiver<Job>,
     spec_cfg: Option<crate::spec::SpecConfig>,
     slots_file: Option<String>,
+    metrics: std::sync::Arc<super::metrics::ServerMetrics>,
 ) {
     // E2/E6: the plain path *can* batch every ready slot into one forward per
     // step, and **whether that is a win is a property of the device** — measured
@@ -720,11 +721,11 @@ pub fn worker_loop(
                     );
                     engine.set_slots_file(Some(p.to_path_buf()));
                 }
-                super::batch::serve_loop(&*model, &tokenizer, job_rx, &mut engine);
+                super::batch::serve_loop(&*model, &tokenizer, job_rx, &mut engine, &metrics);
             }
             Err(e) => {
                 eprintln!("[server] continuous batching unavailable ({e}); serving serially");
-                worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg);
+                worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
             }
         }
         return;
@@ -735,18 +736,24 @@ pub fn worker_loop(
              engine; this server serves serially, so nothing will be resumed or saved"
         );
     }
-    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg);
+    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
 }
 
 /// The pre-E2 loop: one request at a time, each on its own slot cache. Kept for
 /// speculative sessions (the identity contract is per request) and as the loud
 /// fallback when the shared arena cannot be built.
+///
+/// F8: there is no shared arena here — one `GraphCache` per slot — so `/metrics`
+/// reports the arena of the slot that served the last request rather than a sum
+/// (the batched path has one arena and reports it in full). The queue depth on
+/// this path is the HTTP backlog only; the loop holds at most one job.
 fn worker_loop_serial(
     model: Box<dyn ModelDef>,
     tokenizer: Tokenizer,
     mut slots: Vec<Slot>,
     mut job_rx: mpsc::Receiver<Job>,
     spec_cfg: Option<crate::spec::SpecConfig>,
+    metrics: &super::metrics::ServerMetrics,
 ) {
     // doc 97: one draft engine per slot (each slot's draft KV is isolated
     // exactly like its target KV). The draft model is small (0.5B-class) and
@@ -760,12 +767,33 @@ fn worker_loop_serial(
         .collect();
     loop {
         let Some(job) = job_rx.blocking_recv() else {
-            break; // all senders dropped: server shutting down
+            // All senders dropped: publish an idle reading, then leave.
+            metrics
+                .worker_pending
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .running
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            break;
         };
+        // F8: this loop holds at most one job (the channel backlog is the only
+        // queue), so `pending` is always 0 and `running` follows the slot.
+        metrics
+            .jobs_admitted_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .worker_pending
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .running
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let Some(slot_idx) = slots.iter().position(|s| s.state == SlotState::Idle) else {
             let _ = job
                 .tx
                 .blocking_send(StreamEvent::Err(ApiError::unavailable("no idle slot")));
+            metrics
+                .jobs_dropped_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         };
         let slot = &mut slots[slot_idx];
@@ -779,9 +807,15 @@ fn worker_loop_serial(
                     "mirostat cannot be combined with speculative decoding (--spec-draft)"
                         .to_string(),
                 )));
+            metrics
+                .jobs_dropped_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         slot.state = SlotState::Processing;
+        metrics
+            .running
+            .store(1, std::sync::atomic::Ordering::Relaxed);
         // B2: the slot KEEPS its cache and its `cached_tokens` record across
         // requests; `generate_seq` reuses the KV only when the new prompt
         // starts with exactly the recorded sequence, and prefills from position
@@ -842,6 +876,15 @@ fn worker_loop_serial(
             slot.cached_tokens.clear();
         }
         slot.state = SlotState::Idle;
+        // F8: publish the slot's arena after every request — on this path each
+        // slot owns its own `GraphCache`, so this is a live reading of the arena
+        // that just served, not a startup snapshot.
+        metrics
+            .running
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let backend = crate::graph::kvsession::backend_of(model.device());
+        let snapshot = super::metrics::kv_snapshot_from(slot.cache.alloc(), backend);
+        metrics.publish_kv(&snapshot);
     }
 }
 
