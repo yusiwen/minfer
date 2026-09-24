@@ -20,11 +20,13 @@ struct CudaBuf {
 
 pub struct CudaBackend {
     state: &'static crate::cuda::CudaState,
-    /// 8b: KV cache element type — f16 (bandwidth-halving, Metal-aligned
-    /// auto-select policy) or f32. Set at construction from the process-wide
-    /// flag; a `#[cfg(test)]` setter flips it per instance so device tests
-    /// can exercise both layouts in one process.
-    kv_f16: bool,
+    /// 8b / C4 S2b: the KV cache **layout** as a `crate::cuda::KV_LAYOUT_*` code
+    /// (f32 / f16 / q8_0). Set at construction from the process-wide policy the
+    /// loader resolved (`crate::cuda::kv_cache_layout`); a `#[cfg(test)]` setter
+    /// flips it per instance so device tests can exercise every layout in one
+    /// process. The tag is what selects the store, the attention kernel and the
+    /// `copy_cells` stride, so a packed region can never be addressed as f32 rows.
+    kv_layout: i32,
     pool: Vec<CudaBuf>,
     free: Vec<usize>,
     /// Bumped on every pool allocation (fresh or free-list reuse). A captured
@@ -151,7 +153,7 @@ impl CudaBackend {
     #[allow(dead_code)]
     pub fn new() -> Option<Self> {
         let state = crate::cuda::CudaState::get()?;
-        let kv_f16 = crate::cuda::kv_cache_is_f16();
+        let kv_layout = crate::cuda::kv_cache_layout();
         let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
             GraphMode::Disabled
         } else {
@@ -170,7 +172,7 @@ impl CudaBackend {
             stream_guard: None,
             graphs_mode,
             prefill_capture,
-            kv_f16,
+            kv_layout,
             cap: crate::cuda::CaptureStaging::new(),
             cross_slabs: Vec::new(),
             cross_pending: Vec::new(),
@@ -192,10 +194,45 @@ impl CudaBackend {
 
     #[cfg(test)]
     /// 8b: flip the per-instance KV element type (device tests exercise both
-    /// layouts in one process; production backends take the global policy
+    /// f32/f16 layouts in one process; production backends take the global policy
     /// set by the loader at construction).
     pub(crate) fn set_kv_f16_for_test(&mut self, f16: bool) {
-        self.kv_f16 = f16;
+        self.kv_layout = if f16 {
+            crate::cuda::KV_LAYOUT_F16
+        } else {
+            crate::cuda::KV_LAYOUT_F32
+        };
+    }
+
+    #[cfg(test)]
+    /// C4 S2b: the packed layout, per instance (same reason as
+    /// [`Self::set_kv_f16_for_test`]).
+    pub(crate) fn set_kv_q8_for_test(&mut self) {
+        self.kv_layout = crate::cuda::KV_LAYOUT_Q8_0;
+    }
+
+    #[cfg(test)]
+    /// Any layout, per instance — the three-way gates (`cuda_map_window_*`) sweep
+    /// f32/f16/q8_0 through one backend.
+    pub(crate) fn set_kv_layout_for_test(&mut self, layout: i32) {
+        self.kv_layout = layout;
+    }
+
+    /// The KV layout tag this backend addresses its regions in.
+    fn kv_layout(&self) -> i32 {
+        self.kv_layout
+    }
+
+    /// Bytes one KV cell occupies on this backend's device region — the stride
+    /// every kernel is given. f32 is `nkt * 4`, f16 `nkt * 2`, Q8_0 the word-padded
+    /// packed width (`KvFormat::Q8_0.row_bytes(nkt)`).
+    fn kv_row_bytes(&self, nkt: usize) -> usize {
+        use super::kvformat::KvFormat;
+        match self.kv_layout {
+            crate::cuda::KV_LAYOUT_Q8_0 => KvFormat::Q8_0.row_bytes(nkt),
+            crate::cuda::KV_LAYOUT_F16 => nkt * 2,
+            _ => nkt * 4,
+        }
     }
 
     /// 8g②: turn on deliberate prefill capture for tests (the pp16/pp300
@@ -1050,7 +1087,7 @@ impl CudaBackend {
                     meta.freq_scale,
                     pos,
                     cells,
-                    self.kv_f16,
+                    self.kv_layout(),
                 );
                 Ok(())
             }
@@ -1140,7 +1177,7 @@ impl CudaBackend {
                     meta.freq_scale,
                     pos,
                     cells,
-                    self.kv_f16,
+                    self.kv_layout(),
                 );
                 Ok(())
             }
@@ -1268,12 +1305,23 @@ impl CudaBackend {
                 // trade-off as Metal's store_kv dispatch.
                 let (sk, sv) = (self.ptr_of_ref(in_bufs[0])?, self.ptr_of_ref(in_bufs[1])?);
                 let (dk, dv) = (self.ptr_of(k_id)?, self.ptr_of(v_id)?);
-                if self.kv_f16 {
-                    self.state.store_kv_f16(sk, dk, nkt, nt, pos);
-                    self.state.store_kv_f16(sv, dv, nkt, nt, pos);
-                } else {
-                    self.state.store_kv_f32(sk, dk, nkt, nt, pos);
-                    self.state.store_kv_f32(sv, dv, nkt, nt, pos);
+                // C4 S2b: the layout picks the store. `store_kv_q8_0` needs the
+                // packed cell's byte width, which is the same number `ensure_kv`
+                // sized the region with (`KvFormat::Q8_0.row_bytes(nkt)`).
+                match self.kv_layout() {
+                    crate::cuda::KV_LAYOUT_Q8_0 => {
+                        let row_bytes = self.kv_row_bytes(nkt);
+                        self.state.store_kv_q8_0(sk, dk, nkt, nt, row_bytes, pos);
+                        self.state.store_kv_q8_0(sv, dv, nkt, nt, row_bytes, pos);
+                    }
+                    crate::cuda::KV_LAYOUT_F16 => {
+                        self.state.store_kv_f16(sk, dk, nkt, nt, pos);
+                        self.state.store_kv_f16(sv, dv, nkt, nt, pos);
+                    }
+                    _ => {
+                        self.state.store_kv_f32(sk, dk, nkt, nt, pos);
+                        self.state.store_kv_f32(sv, dv, nkt, nt, pos);
+                    }
                 }
                 Ok(())
             }
@@ -1385,7 +1433,8 @@ impl CudaBackend {
                         meta.n_head_kv,
                         meta.hd,
                         meta.scale,
-                        self.kv_f16,
+                        self.kv_layout(),
+                        self.kv_row_bytes(meta.nkt),
                     );
                     return Ok(());
                 }
@@ -1396,7 +1445,15 @@ impl CudaBackend {
                 // a different reduction schedule, which flipped argmax on
                 // near-ties and made spec output diverge from sequential
                 // greedy decode. Prefill (nt > 16) keeps the incumbent.
-                if nt <= 16 {
+                //
+                // C4 S2b: a **packed** cache does not take this path. The batched
+                // split kernel's whole purpose is that unmeasured-here bitwise
+                // identity, so instead of claiming it for Q8_0, the verify band
+                // falls through to `gqa_attn_f32` — and a speculative session
+                // refuses a packed cache outright (`spec::draft` load gate), because
+                // its greedy identity would no longer be the thing this kernel
+                // guarantees.
+                if nt <= 16 && self.kv_layout() != crate::cuda::KV_LAYOUT_Q8_0 {
                     self.state.gqa_attn_split_batched(
                         self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
@@ -1408,15 +1465,18 @@ impl CudaBackend {
                         meta.n_head_kv,
                         meta.hd,
                         meta.scale,
-                        self.kv_f16,
+                        self.kv_layout() == crate::cuda::KV_LAYOUT_F16,
                         nt,
                     );
                     return Ok(());
                 }
                 // nt > 16 (prefill): single-warp-per-(token, head) kernel —
                 // the grid already covers nt × nh blocks.
-                // 8b: f16-KV variant reads half K/V (q/o stay f32)
-                if self.kv_f16 {
+                // 8b: f16-KV variant reads half K/V (q/o stay f32). C4 S2b: the
+                // FA prefill path (`fa_prefill_f16kv`) is f16-typed shared-memory
+                // staging, so a Q8_0 prefill takes the general layout-tagged
+                // kernel instead — correct, off the tuned FA route, and stated.
+                if self.kv_layout() == crate::cuda::KV_LAYOUT_F16 {
                     self.state.gqa_attn_f16kv(
                         self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
@@ -1438,10 +1498,12 @@ impl CudaBackend {
                         self.ptr_of_ref(out_buf)?,
                         pos,
                         mode.code(),
+                        self.kv_layout(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
                         meta.scale,
+                        self.kv_row_bytes(meta.nkt),
                         nt,
                     );
                 }
@@ -1608,11 +1670,14 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// `[lo, hi)` span, so CUDA can take a multi-sequence attention node.
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
-/// C4: CUDA addresses f32/f16 KV rows, so it does not read a packed `q8_0`
-/// region; [#87] is the work that adds the kernel and flips this.
-///
-/// [#87]: https://github.com/yusiwen/minfer/issues/87
-pub const READS_PACKED_KV: bool = false;
+/// C4 S2b: CUDA reads a packed `q8_0` KV region. The kernels gained a layout tag
+/// (`KV_LAYOUT_F32/F16/Q8_0`) and a byte-addressed row accessor (`kv_row` +
+/// `kv4<LAYOUT>`), a `store_kv_q8_0` that uses the CPU's own quantizer, and a
+/// `copy_cells` stride that leaves a word-padded packed cell alone. The dispatch
+/// cuts (decode through the converted 1-warp split body with `rpw_gate = 0`; the
+/// verify band and prefill through the layout-tagged general kernel; no fused QKV
+/// epilogue) are stated in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 S2b.
+pub const READS_PACKED_KV: bool = true;
 
 /// F5 ([#58]): registry hook **phase A** — enqueue one cross-backend staging
 /// copy out of CUDA.
@@ -1723,13 +1788,14 @@ pub fn entry() -> super::registry::BackendEntry {
         // for what each destination gets.
         copy_cross,
         await_cross,
-        // The device layer holds the process-wide f16 policy (C5 records it).
-        kv_format: |_| {
-            if crate::cuda::kv_cache_is_f16() {
-                super::kvformat::KvFormat::F16
-            } else {
-                super::kvformat::KvFormat::F32
-            }
+        // The device layer holds the process-wide layout policy (C5 records it as
+        // the session's KV element type, so a packed session is saved and resumed
+        // as Q8_0 — the container's FLAG_PACKED bit — and an f16 one is the
+        // separate gap [#130] tracks).
+        kv_format: |_| match crate::cuda::kv_cache_layout() {
+            crate::cuda::KV_LAYOUT_Q8_0 => super::kvformat::KvFormat::Q8_0,
+            crate::cuda::KV_LAYOUT_F16 => super::kvformat::KvFormat::F16,
+            _ => super::kvformat::KvFormat::F32,
         },
         enable: |a| a.enable_cuda(),
         unavailable: || {
@@ -1873,7 +1939,15 @@ impl Backend for CudaBackend {
         // landed in the wrong cell: a copy-on-write or a compaction on an f16 device
         // silently corrupted the arena. (Found by the C8b S4 real-model gate on a
         // model whose KV is f16 — the copy gates all ran on an f32-KV model.)
-        let elems_per_cell = if self.kv_f16 {
+        //
+        // C4 S2b: a **packed** cell needs no conversion. The caller passes the
+        // region's own `elems / n_ctx`, which `KvCache` sets to
+        // `KvFormat::Q8_0.row_elems(nkt)` for a packed region — already a whole
+        // number of f32 words, which is exactly the unit `kv_move_rows` strides in.
+        // The move is therefore a plain word copy of the padded cell (the 2 bytes of
+        // tail padding move with it, harmlessly). `cuda_f16_kv_cell_move_strides_by_row_bytes`
+        // and its Q8_0 twin are the gates that pin both statements.
+        let elems_per_cell = if self.kv_layout() == crate::cuda::KV_LAYOUT_F16 {
             (elems_per_cell / 2).max(1)
         } else {
             elems_per_cell
@@ -3715,7 +3789,7 @@ mod tests {
             return;
         };
         let _guard = crate::cuda::CudaState::model_load_guard();
-        cb.kv_f16 = false; // f32 KV keeps the store and the attention in one dtype
+        cb.set_kv_f16_for_test(false); // f32 KV keeps the store and the attention in one dtype
 
         // One head, hd = 4, two sequences: sequence 0 owns row 0, sequence 1
         // owns row 2. The values make a leak change the answer — query 1 scores
@@ -3828,7 +3902,7 @@ mod tests {
             return;
         };
         let _guard = crate::cuda::CudaState::model_load_guard();
-        cb.kv_f16 = false; // f32 KV keeps the store and the attention in one dtype
+        cb.set_kv_f16_for_test(false); // f32 KV keeps the store and the attention in one dtype
 
         // Two tokens at cells 0 and 1: token 0's window is [0, 1), token 1's is
         // [0, 2) — exactly what `positions[t] + 1` gives, so both instantiations
@@ -3964,7 +4038,7 @@ mod tests {
             return;
         };
         let _guard = crate::cuda::CudaState::model_load_guard();
-        cb.kv_f16 = false;
+        cb.set_kv_f16_for_test(false);
 
         // Real-ish shapes: the 7B decodes with hd 128 / 4 KV heads, which is a
         // larger `hd` and `nkv` than the 0.5B's 64 / 2 — the other reason this
@@ -4102,7 +4176,7 @@ mod tests {
                 ((4, 4, 128), 16, 64),
                 ((4, 4, 128), 34, 64),
             ] {
-                cb.kv_f16 = f16;
+                cb.set_kv_f16_for_test(f16);
                 let (causal, v_row0) = run(&mut cb, false, 0, n, shape);
                 let (windowed, _) = run(&mut cb, true, start, n, shape);
                 let hd = shape.2;
@@ -4202,11 +4276,21 @@ mod tests {
                        shape: (usize, usize, usize),
                        runs: &[(usize, usize, usize)],
                        reference: &(Vec<f32>, Vec<f32>),
-                       f16: bool|
+                       layout: i32|
          -> Vec<f32> {
             let nt = pos.len();
             let (nh, nk, hd) = shape;
             let nkt = nk * hd;
+            // C4 S2b: the packed cell's word width. Every region here is built
+            // with the *layout's* own size — `N_CTX * row_elems` — which is also
+            // the discipline issue #122 asks for (an under-sized buffer plus a
+            // device read past it latches `cudaErrorIllegalAddress` and poisons
+            // every later allocation in the process).
+            let row_elems = if layout == crate::cuda::KV_LAYOUT_Q8_0 {
+                crate::graph::kvformat::KvFormat::Q8_0.row_elems(nkt)
+            } else {
+                nkt
+            };
             let meta = crate::graph::ops::AttnMeta {
                 layer: 0,
                 n_head: nh,
@@ -4232,12 +4316,14 @@ mod tests {
             // reads the *low half* of each 4-byte slot, so a value is written as the
             // half's bit pattern there: clean f16 data rather than the garbage an
             // arbitrary f32 write leaves behind — which would make a wrong-row
-            // comparison compare zero to zero.
+            // comparison compare zero to zero. With Q8_0 the row is packed through
+            // the same quantizer the store kernel uses (`pack_q8_0_cell`), so the
+            // kernel reads exactly the bytes a real store would have written.
             let (rk, rv) = reference;
-            let mut region_k = vec![0.0f32; N_CTX * nkt];
-            let mut region_v = vec![0.0f32; N_CTX * nkt];
+            let mut region_k = vec![0.0f32; N_CTX * row_elems];
+            let mut region_v = vec![0.0f32; N_CTX * row_elems];
             let enc = |x: f32| -> f32 {
-                if f16 {
+                if layout == crate::cuda::KV_LAYOUT_F16 {
                     f32::from_bits(half::f16::from_f32(x).to_bits() as u32)
                 } else {
                     x
@@ -4246,10 +4332,23 @@ mod tests {
             for &(cell, len, base) in runs {
                 for i in 0..len {
                     let src = (base + i) * nkt;
-                    let dst = (cell + i) * nkt;
-                    for e in 0..nkt {
-                        region_k[dst + e] = enc(rk[src + e]);
-                        region_v[dst + e] = enc(rv[src + e]);
+                    let dst = (cell + i) * row_elems;
+                    if layout == crate::cuda::KV_LAYOUT_Q8_0 {
+                        crate::graph::kvformat::pack_q8_0_cell(
+                            &mut region_k[dst..dst + row_elems],
+                            nkt,
+                            &rk[src..src + nkt],
+                        );
+                        crate::graph::kvformat::pack_q8_0_cell(
+                            &mut region_v[dst..dst + row_elems],
+                            nkt,
+                            &rv[src..src + nkt],
+                        );
+                    } else {
+                        for e in 0..nkt {
+                            region_k[dst + e] = enc(rk[src + e]);
+                            region_v[dst + e] = enc(rv[src + e]);
+                        }
                     }
                 }
             }
@@ -4264,8 +4363,8 @@ mod tests {
                 })
                 .collect();
 
-            let kreg = cb.alloc_buffer(N_CTX * nkt);
-            let vreg = cb.alloc_buffer(N_CTX * nkt);
+            let kreg = cb.alloc_buffer(N_CTX * row_elems);
+            let vreg = cb.alloc_buffer(N_CTX * row_elems);
             let qb = cb.alloc_buffer(nh * hd * nt);
             let pb = cb.alloc_buffer(nt);
             let wb = cb.alloc_buffer(window.len());
@@ -4326,17 +4425,38 @@ mod tests {
 
         let mut bad: Vec<String> = Vec::new();
         let mut checked = 0usize;
-        for f16 in [false, true] {
-            cb.kv_f16 = f16;
+        // C4 S2b: all three layouts. Q8_0 rows go through exactly the same
+        // modes — the run list is resolved before the load, so the packed accessor
+        // cannot change which rows a window names.
+        for layout in [
+            crate::cuda::KV_LAYOUT_F32,
+            crate::cuda::KV_LAYOUT_F16,
+            crate::cuda::KV_LAYOUT_Q8_0,
+        ] {
+            cb.set_kv_layout_for_test(layout);
+            let layout_name = match layout {
+                crate::cuda::KV_LAYOUT_Q8_0 => "q8_0",
+                crate::cuda::KV_LAYOUT_F16 => "f16",
+                _ => "f32",
+            };
             for (shape, n) in [
                 ((1usize, 1usize, 4usize), 1usize),
                 ((2, 2, 64), 1),
                 ((4, 4, 128), 1),
                 ((2, 2, 64), 6),
-                ((4, 4, 128), 8),  // 1 < nt <= 16: the batched split path
-                ((4, 4, 128), 34), // nt > 16: FA prefill (hd = 128)
+                ((4, 4, 128), 8),  // 1 < nt <= 16: the batched split path (f32/f16)
+                ((4, 4, 128), 34), // nt > 16: FA prefill (hd = 128) for f16, general otherwise
                 ((2, 2, 64), 34),  // nt > 16 with f32 KV: the legacy kernel
             ] {
+                // A Q8_0 cell is a whole number of 32-element blocks, so `nkt` must
+                // be a multiple of 32 — the invariant `ensure_kv`'s `check_width`
+                // enforces (`nkt` is `n_head_kv * hd` and every supported arch has
+                // `hd % 32 == 0`). The `hd = 4` fixture is a kernel-shape probe that
+                // a packed format cannot express at all; it is skipped rather than
+                // silently run with a zero-word cell.
+                if layout == crate::cuda::KV_LAYOUT_Q8_0 && (shape.1 * shape.2) % 32 != 0 {
+                    continue;
+                }
                 let reference = reference(n, shape);
                 let mut variants: Vec<(&str, Vec<(usize, usize, usize)>)> = vec![
                     ("one run", vec![(64, n, 0)]),
@@ -4371,7 +4491,7 @@ mod tests {
                             shape,
                             &[(64, n, 0)],
                             &reference,
-                            f16,
+                            layout,
                         );
                         let map = run(
                             &mut cb,
@@ -4381,7 +4501,7 @@ mod tests {
                             shape,
                             &runs,
                             &reference,
-                            f16,
+                            layout,
                         );
                         checked += 1;
                         let worst = span
@@ -4391,14 +4511,14 @@ mod tests {
                             .fold(0.0f32, f32::max);
                         if worst != 0.0 {
                             bad.push(format!(
-                                "kv_f16={f16} {shape:?} n={n} {label} {which}: max|d|={worst}"
+                                "kv={layout_name} {shape:?} n={n} {label} {which}: max|d|={worst}"
                             ));
                         }
                     }
                 }
             }
         }
-        assert!(checked >= 20, "the fixture checked only {checked} cases");
+        assert!(checked >= 30, "the fixture checked only {checked} cases");
         assert!(
             bad.is_empty(),
             "the map window disagrees with the span over the same bytes in {} case(s):\n  {}",
@@ -4407,7 +4527,7 @@ mod tests {
         );
         // A window that attended to *no* row would compare equal trivially (both
         // sides zero), so the gate has to see real output too.
-        cb.kv_f16 = false;
+        cb.set_kv_f16_for_test(false);
         let reference8 = reference(8, (2, 2, 64));
         let out = run(
             &mut cb,
@@ -4417,12 +4537,58 @@ mod tests {
             (2, 2, 64),
             &[(64, 8, 0)],
             &reference8,
-            false,
+            crate::cuda::KV_LAYOUT_F32,
         );
         assert!(
             out.iter().any(|&x| x != 0.0 && x.is_finite()),
             "the fixture attends to no row — the comparison above would be vacuous"
         );
+        // Every comparison above is **between modes over the same bytes**, so a
+        // value-level fault in the layout accessor shifts both sides identically and
+        // the bitwise equality still holds. Mutation-checked by hand: deleting the
+        // block base from `kv4<KV_LAYOUT_Q8_0>` (reading block 0 for every group)
+        // left this test green while `cuda_kv_q8_0_roundtrip_attn` failed — the F6
+        // lesson, a gate passing for the wrong reason. So one single-row window is
+        // compared against an **independently computed** reference: the dequantized
+        // V row the fixture packed. A single-row window's softmax is 1, so the output
+        // is exactly `d * q[i]` of the cell — the same expression `kv4<Q8_0>`
+        // evaluates — and this arm now fails on a wrong block, scale or quant offset.
+        {
+            use crate::graph::kvformat::{pack_q8_0_cell, unpack_q8_0_cells, KvFormat};
+            let shape = (2usize, 2usize, 64usize);
+            let nkt = shape.1 * shape.2;
+            let row_elems = KvFormat::Q8_0.row_elems(nkt);
+            let reference1 = reference(1, shape);
+            let mut cell_v = vec![0f32; row_elems];
+            pack_q8_0_cell(&mut cell_v, nkt, &reference1.1);
+            let mut want_v = vec![0f32; nkt];
+            unpack_q8_0_cells(&cell_v, nkt, 0, 1, &mut want_v);
+            cb.set_kv_layout_for_test(crate::cuda::KV_LAYOUT_Q8_0);
+            let out = run(
+                &mut cb,
+                false,
+                &[0u32],
+                &span_batch(&[0u32]),
+                shape,
+                &[(64, 1, 0)],
+                &reference1,
+                crate::cuda::KV_LAYOUT_Q8_0,
+            );
+            let worst = out[..shape.2]
+                .iter()
+                .zip(&want_v[..shape.2])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                out[..shape.2].iter().any(|x| x.abs() > 1e-6),
+                "the single-row Q8_0 fixture returned all zeros — vacuous"
+            );
+            assert_eq!(
+                worst, 0.0,
+                "the Q8_0 single-row window does not return the dequantized V cell row: \
+                 max |Δ| = {worst}"
+            );
+        }
         eprintln!("[map] {checked} cases bitwise-equal to the span over the same rows");
     }
 
@@ -4442,7 +4608,7 @@ mod tests {
         const N_CTX: usize = 64;
         // A row of `nkt` halves, stored in the first `nkt / 2` f32 slots.
         let nkt = 8usize;
-        cb.kv_f16 = true;
+        cb.set_kv_f16_for_test(true);
         let (src_row, dst_row, rows) = (2usize, 10usize, 4usize);
         let slots = N_CTX * (nkt / 2);
         let region = cb.alloc_buffer(slots);
@@ -4477,6 +4643,360 @@ mod tests {
         }
     }
 
+    /// C4 S2b: the packed twin of
+    /// [`Self::cuda_f16_kv_cell_move_strides_by_row_bytes`]. A Q8_0 cell is a whole
+    /// number of f32 words (`KvFormat::Q8_0.row_elems(nkt)` = ceil(nkt/32*34 / 4)),
+    /// and that is exactly the unit `copy_cells`'s `elems_per_cell` already carries
+    /// — the caller (`GraphAllocator::kv_set_cap_with_defrag`, the compaction and
+    /// the copy-on-write) passes `region.elems / n_ctx`. So the device backend must
+    /// pass it through **unchanged**: applying the f16 halving here would move
+    /// `row_elems / 2` words per row, land every moved cell short of its slot and
+    /// silently corrupt the arena on the first compaction.
+    ///
+    /// `nkt = 64` is chosen so the two candidate strides cannot be confused:
+    /// `row_elems` is 17 words, while the pre-C4 `nkt` (and the f16 half of it) are
+    /// 64 and 32.
+    #[test]
+    fn cuda_q8_0_kv_cell_move_strides_by_row_bytes() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        const N_CTX: usize = 64;
+        let nkt = 64usize;
+        let row_elems = crate::graph::kvformat::KvFormat::Q8_0.row_elems(nkt);
+        assert_eq!(row_elems, 17, "the fixture assumes 2 Q8_0 blocks of 34 B");
+        cb.set_kv_q8_for_test();
+        let (src_row, dst_row, rows) = (2usize, 10usize, 4usize);
+        let slots = N_CTX * row_elems;
+        let region = cb.alloc_buffer(slots);
+        // Distinct word per slot, so a move of the wrong length is visible as a
+        // mismatched suffix *and* as a stray write outside the destination rows.
+        let pattern: Vec<f32> = (0..slots)
+            .map(|i| f32::from_bits(((i as u32) * 2654435761) | 1))
+            .collect();
+        cb.write_host(region, &pattern).unwrap();
+        let before = pattern.clone();
+        let r = BufRef::own(crate::graph::Backend::CUDA, region, slots);
+        // The host passes the packed cell's word count, exactly as alloc.rs does.
+        cb.copy_cells(r, r, dst_row, src_row, rows, row_elems)
+            .unwrap();
+        let after = cb.copy_to_host(region).unwrap();
+        assert_eq!(after.len(), slots);
+        for r in 0..rows {
+            let sd = (src_row + r) * row_elems;
+            let dd = (dst_row + r) * row_elems;
+            // Compared as **bits**: the pattern is arbitrary words and some are NaN,
+            // for which `==` is never true (the same reason C4's V-verbatim gate
+            // compares bits).
+            let same = after[dd..dd + row_elems]
+                .iter()
+                .zip(&before[sd..sd + row_elems])
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(
+                same,
+                "packed row {r} did not land at row {} (a Q8_0 cell is {row_elems} f32 words)",
+                dst_row + r
+            );
+        }
+        for (i, (x, y)) in before.iter().zip(&after).enumerate() {
+            let moved = (dst_row * row_elems..(dst_row + rows) * row_elems).contains(&i);
+            if !moved {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "packed cell move touched f32 slot {i} outside its rows"
+                );
+            }
+        }
+    }
+
+    /// C4 S2b: the Q8_0 store, two ways. (a) The bytes the device writes for a row
+    /// are **exactly** `kvformat::pack_q8_0_cell`'s — the CPU store's own output —
+    /// so a CPU/device Q8_0 comparison is a layout check, not a tolerance question.
+    /// (b) Those bytes survive the pool round trip (`copy_to_host` returns the same
+    /// words), which is what a physical shift's dequantize → re-rope → requantize
+    /// reads and writes back.
+    ///
+    /// Mutation-checked by hand: pointing the kernel at `elem % 32` instead of
+    /// `(elem >> 5, elem & 31)` (i.e. dropping the block base) fails (a) on the
+    /// second block; storing the scale at byte 2 and the quants at 0 fails (a) on
+    /// every element.
+    #[test]
+    fn cuda_q8_0_store_matches_the_cpu_quantizer() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        const N_CTX: usize = 64;
+        const NT: usize = 5;
+        // hd = 64 (two blocks per row) and hd = 32 (one) so a block-base mistake is
+        // exercised, not just an offset one.
+        for nkt in [64usize, 32] {
+            let row_elems = crate::graph::kvformat::KvFormat::Q8_0.row_elems(nkt);
+            let row_bytes = crate::graph::kvformat::KvFormat::Q8_0.row_bytes(nkt);
+            cb.set_kv_q8_for_test();
+            // Rows with a wide dynamic range inside each block, so `amax/127` is not
+            // a degenerate 0 or 1 and the quants exercise the round/clamp.
+            let rows: Vec<f32> = (0..NT * nkt)
+                .map(|i| {
+                    let b = (i % nkt) / 32;
+                    let sign = if (i / 7) % 2 == 0 { 1.0 } else { -1.0 };
+                    sign * (((i * 37 % 101) as f32) / 101.0) * (b as f32 + 1.0) * 2.5
+                })
+                .collect();
+            let pos: Vec<usize> = vec![0, 3, 7, 11, 15];
+            let region = cb.alloc_buffer(N_CTX * row_elems);
+            let src = cb.alloc_buffer(NT * nkt);
+            let posb = cb.alloc_buffer(NT);
+            cb.write_host(src, &rows).unwrap();
+            cb.write_host(
+                posb,
+                &pos.iter()
+                    .map(|&p| f32::from_bits(p as u32))
+                    .collect::<Vec<f32>>(),
+            )
+            .unwrap();
+            cb.write_host(region, &vec![0f32; N_CTX * row_elems])
+                .unwrap();
+            cb.state.store_kv_q8_0(
+                cb.ptr_of(src).unwrap(),
+                cb.ptr_of(region).unwrap(),
+                nkt,
+                NT,
+                row_bytes,
+                cb.ptr_of(posb).unwrap(),
+            );
+
+            let after = cb.copy_to_host(region).unwrap();
+            // (a) byte-for-byte against the CPU quantizer, per real row. Compared as
+            // **bits**: a packed word is an f16 scale and int8 quants, so as f32 it
+            // is frequently NaN and `==` on it is never true.
+            for (t, &p) in pos.iter().enumerate() {
+                let row_f32 = &rows[t * nkt..(t + 1) * nkt];
+                let expected: Vec<f32> = {
+                    let mut w = vec![0f32; row_elems];
+                    crate::graph::kvformat::pack_q8_0_cell(&mut w, nkt, row_f32);
+                    w
+                };
+                let same = after[p * row_elems..(p + 1) * row_elems]
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(
+                    same,
+                    "nkt={nkt} row {t} (cell {p}): the device store is not the CPU quantizer's bytes"
+                );
+                assert_ne!(
+                    expected.iter().fold(0u32, |m, x| m | x.to_bits()),
+                    0,
+                    "the fixture wrote all-zero packed bytes; the comparison would be vacuous"
+                );
+            }
+            // (b) unwritten cells stay zero (the store writes only its rows).
+            for cell in 0..N_CTX {
+                if pos.contains(&cell) {
+                    continue;
+                }
+                assert!(
+                    after[cell * row_elems..(cell + 1) * row_elems]
+                        .iter()
+                        .all(|x| x.to_bits() == 0),
+                    "the store touched cell {cell}, which no position named"
+                );
+            }
+        }
+    }
+
+    /// C4 S2b: the Q8_0 store → attention round trip, the packed twin of
+    /// [`Self::cuda_kv_f16_roundtrip_attn`]. The device writes real packed cells
+    /// through `Op::KvcacheStore`, then attention reads them back through the
+    /// layout-tagged split path — and the output must match the **f32** kernel run
+    /// over the same cells dequantized on the host: `kv4<Q8_0>` reconstructs
+    /// exactly `d * q[i]`, which is what `kvformat::unpack_q8_0_cells` puts in the
+    /// reference region. A wrong block index, scale offset or quant offset moves a
+    /// value by whole quant steps (the 0.117-magnitude outputs here), so the 1e-6
+    /// bound is many orders tighter than any layout fault while leaving room for
+    /// the one real difference between the two kernels: nvcc may contract the
+    /// packed accessor's `d * q` into the following FMA chain, and the f32 kernel
+    /// reads that product from memory, so the two can differ by one ulp. Measured:
+    /// exactly one ULP on one element (2.38e-7 of 0.117). The **byte-exact** claim
+    /// for the store lives in [`Self::cuda_q8_0_store_matches_the_cpu_quantizer`],
+    /// where it belongs.
+    #[test]
+    fn cuda_kv_q8_0_roundtrip_attn() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        let (nh, nk_h, hd) = (4usize, 2usize, 64usize);
+        let nkt = nk_h * hd;
+        let row_elems = crate::graph::kvformat::KvFormat::Q8_0.row_elems(nkt);
+        let (nt, n_ctx) = (3usize, 32usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let pos: Vec<usize> = vec![1, 4, 9];
+
+        let mut b = GraphBuilder::new();
+        b.set_kv_format(crate::graph::kvformat::KvFormat::Q8_0);
+        let q = b.input("q", [nh * hd, nt, 1, 1], DType::F32);
+        let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
+        let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
+        let store = b.kvcache_store(0, k, v, n_ctx);
+        let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+        let qr = b.rope(
+            q,
+            pp,
+            RopeStyle::NonInterleaved,
+            RoPEMeta {
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                n_head: nh,
+                hd,
+            },
+        );
+        let at = b.attn(
+            qr,
+            load,
+            pp,
+            AttnMode::Gqa,
+            AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk_h,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale,
+            },
+        );
+        b.output(at);
+        let g = b.build();
+
+        let (xb_q, xb_k, xb_v) = (
+            cb.alloc_buffer(nh * hd * nt),
+            cb.alloc_buffer(nkt * nt),
+            cb.alloc_buffer(nkt * nt),
+        );
+        let xb_p = cb.alloc_buffer(nt);
+        let (ob_qr, ob_at) = (cb.alloc_buffer(nh * hd * nt), cb.alloc_buffer(nh * hd * nt));
+        let (kreg, vreg) = (
+            cb.alloc_buffer(n_ctx * row_elems),
+            cb.alloc_buffer(n_ctx * row_elems),
+        );
+        // The f32 reference regions the dequantized cells are written into, read by
+        // the same kernel instantiated on KV_LAYOUT_F32.
+        let (kf32, vf32) = (cb.alloc_buffer(n_ctx * nkt), cb.alloc_buffer(n_ctx * nkt));
+
+        let qs: Vec<f32> = (0..nh * hd * nt)
+            .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+            .collect();
+        let ks: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+            .collect();
+        let vs: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+            .collect();
+        let pb: Vec<f32> = pos.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        cb.write_host(xb_q, &qs).unwrap();
+        cb.write_host(xb_k, &ks).unwrap();
+        cb.write_host(xb_v, &vs).unwrap();
+        cb.write_host(xb_p, &pb).unwrap();
+        cb.write_host(kreg, &vec![0f32; n_ctx * row_elems]).unwrap();
+        cb.write_host(vreg, &vec![0f32; n_ctx * row_elems]).unwrap();
+
+        // Q8_0 arm: store through the kernel, attention over the packed cells.
+        cb.set_kv_q8_for_test();
+        cb.exec_ids(
+            &g.nodes[store],
+            &[xb_k, xb_v, xb_p],
+            kreg,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+        cb.exec_ids(&g.nodes[qr], &[xb_q, xb_p], ob_qr, None)
+            .unwrap();
+        cb.exec_ids(
+            &g.nodes[at],
+            &[ob_qr, kreg, xb_p],
+            ob_at,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+        let got_q8 = cb.copy_to_host(ob_at).unwrap();
+
+        // Reference arm: dequantize the *same packed bytes* the device wrote on the
+        // host, put them in f32-shaped regions, and run the f32 kernel. The two arms
+        // share every byte of K/V, so the only variable is the layout arithmetic.
+        let packed_k = cb.copy_to_host(kreg).unwrap();
+        let packed_v = cb.copy_to_host(vreg).unwrap();
+        let mut ref_k = vec![0f32; n_ctx * nkt];
+        let mut ref_v = vec![0f32; n_ctx * nkt];
+        for &p in &pos {
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &packed_k,
+                nkt,
+                p,
+                1,
+                &mut ref_k[p * nkt..(p + 1) * nkt],
+            );
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &packed_v,
+                nkt,
+                p,
+                1,
+                &mut ref_v[p * nkt..(p + 1) * nkt],
+            );
+        }
+        assert!(
+            ref_k.iter().any(|x| *x != 0.0),
+            "the dequantized reference is all zero; the comparison would be vacuous"
+        );
+        cb.set_kv_layout_for_test(crate::cuda::KV_LAYOUT_F32);
+        cb.write_host(kf32, &ref_k).unwrap();
+        cb.write_host(vf32, &ref_v).unwrap();
+        cb.exec_ids(
+            &g.nodes[at],
+            &[ob_qr, kf32, xb_p],
+            ob_at,
+            Some((kf32, vf32)),
+        )
+        .unwrap();
+        let want = cb.copy_to_host(ob_at).unwrap();
+
+        let worst = got_q8
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let first = got_q8
+            .iter()
+            .zip(&want)
+            .position(|(a, b)| a != b)
+            .map(|i| (i, got_q8[i], want[i]));
+        assert!(
+            worst <= 1e-6,
+            "the packed attention read is not the f32 kernel over the dequantized \
+             cells: max |Δ| = {worst}, first {first:?}"
+        );
+        eprintln!(
+            "[c4s2] packed vs dequantized f32 attention: max |Δ| = {worst} ({} of {} \
+             elements differ)",
+            got_q8.iter().zip(&want).filter(|(a, b)| a != b).count(),
+            got_q8.len()
+        );
+
+        // …and the arm is real: a zero-output kernel would also compare equal to a
+        // zero reference, so require non-trivial output.
+        assert!(
+            got_q8.iter().any(|x| x.abs() > 1e-6),
+            "the packed attention returned all zeros"
+        );
+    }
+
     /// C8b S4 device A/B: what naming a row through the run list costs over the
     /// span's `row0 + i`, at the decode shape that pays it on every step. Both
     /// modes attend to the *same* rows (one run each), so the difference is the
@@ -4503,7 +5023,7 @@ mod tests {
         let (nh, nk, hd, nkv) = (28usize, 4usize, 128usize, 2048usize);
         let nkt = nk * hd;
         let n_ctx = 4096usize;
-        cb.kv_f16 = false;
+        cb.set_kv_f16_for_test(false);
         let qb = cb.alloc_buffer(nh * hd);
         let kreg = cb.alloc_buffer(n_ctx * nkt);
         let vreg = cb.alloc_buffer(n_ctx * nkt);
@@ -4547,7 +5067,8 @@ mod tests {
                     nk,
                     hd,
                     scale,
-                    false,
+                    crate::cuda::KV_LAYOUT_F32,
+                    nkt * 4,
                 );
             };
             for _ in 0..warmup {
@@ -4617,7 +5138,7 @@ mod tests {
         // failed every later `cudaMemGetInfo` in the process.
         let qb2 = cb.alloc_buffer(nh * hd * nt);
         let ob2 = cb.alloc_buffer(nh * hd * nt);
-        cb.kv_f16 = true;
+        cb.set_kv_f16_for_test(true);
         let enc = |x: f32| -> f32 { f32::from_bits(half::f16::from_f32(x).to_bits() as u32) };
         cb.write_host(kreg, &vec![enc(0.02f32); n_ctx * nkt])
             .unwrap();
@@ -4825,7 +5346,12 @@ mod tests {
                             nk,
                             hd,
                             scale,
-                            f16_kv,
+                            if f16_kv {
+                                crate::cuda::KV_LAYOUT_F16
+                            } else {
+                                crate::cuda::KV_LAYOUT_F32
+                            },
+                            if f16_kv { nk * hd * 2 } else { nk * hd * 4 },
                         );
                         let got = cb.copy_to_host(o1).unwrap();
                         let mut full = cb.copy_to_host(oseq).unwrap();

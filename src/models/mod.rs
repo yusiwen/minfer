@@ -355,7 +355,20 @@ pub fn load_model_with(
     // running f32.
     let cache_type = std::env::var("MINFER_CACHE_TYPE").ok();
     match crate::graph::kvformat::resolve(loaded.device(), cache_type.as_deref()) {
-        Ok(format) => crate::graph::kvformat::set_kv_format(format),
+        Ok(format) => {
+            crate::graph::kvformat::set_kv_format(format);
+            // C4 S2b: the *device* layout must be the format this load resolved.
+            // The arch loaders already pushed `MINFER_CACHE_TYPE` through
+            // `cuda::set_kv_cache_type`, but the resolver is the one authority, and
+            // a packed region addressed as f32 rows is silent corruption — so a
+            // `q8_0` resolution restates the layout here. `f32`/`f16` keep
+            // `set_kv_cache_type`'s own auto policy (the region shape is the same
+            // for both, so the pre-C4 split stands).
+            #[cfg(feature = "cuda")]
+            if format == crate::graph::kvformat::KvFormat::Q8_0 {
+                crate::cuda::set_kv_cache_layout(crate::cuda::KV_LAYOUT_Q8_0);
+            }
+        }
         Err(e) => {
             eprintln!("minfer: {e}");
             return None;
