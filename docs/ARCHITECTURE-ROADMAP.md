@@ -66,7 +66,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 4 | Persistent server context (no per-request rebuild/realloc) | L5+L3 | M | 3–5 d |
 | 7 | IR expressiveness: strided views/aliasing + multi-output nodes | L1 | L | 1–2 w |
 | 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator — **E4 complete (accounting/gate, size-class pools, reserve/assign + the multi-graph cache) and E5 complete (explicit per-block offload and the `auto` fit); only a Metal free-bytes query (so `auto` works there) and per-block tuning remain** | L3+L6 | L | 1–2 w |
-| 12 | Backend registry (drop the hard-coded 3-way enum/match) | L6 | M | 4–7 d |
+| 12 | Backend registry (drop the hard-coded 3-way enum/match) — **DONE (F4, 2026-09-24)**: the enum is a `Copy`/`Hash`/`Ord` handle over a fixed id space and the name-keyed table lives in `graph/registry.rs`; the nine match sites are gone. The set is still closed at compile time — this makes it data, not pluggable at runtime | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
 | 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
 | 15 | Grammar / JSON-schema constrained decoding — **DONE (F2, 2026-09-24)**; the mask is host-side and per state (5.4 ms on a 151k vocabulary) | L7 | M | 4–6 d |
@@ -425,12 +425,15 @@ Two smaller but immediate items sit in this layer:
 
 ### 2.6 L6 — Backend abstraction and device reach
 
-**Today.** `Backend` is a three-variant enum (`graph/mod.rs:57-65`) and a trait
-(`graph/backend.rs:21-95`). The enum is matched in `GraphAllocator::supports`
+**Today.** `Backend` is a `Copy`/`Hash`/`Eq`/`Ord` **handle** over a fixed id space
+(`graph/registry.rs`, F4) and a trait (`graph/backend.rs:21-95`). The ids are a
+KV-session file-format contract, and the name-keyed registry carries each backend's
+priority, capability matrix and pool hooks; consumers read it instead of matching.
+Before F4 the enum was matched in `GraphAllocator::supports`
 (`alloc.rs:140-157`), `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool`
 (`:314-380`), `sync_backend` (`:559-579`), `copy_across` (`:592-653`), and the
 scheduler's execute match (`scheduler.rs:274-292`) — nine `#[cfg]`-laden match
-sites. Adding a backend means touching all of them.
+sites, each of which had to be taught about a new backend.
 
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
@@ -440,10 +443,15 @@ must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
 
 **Gap.** 🟠 Two axes.
 
-*Pluggability* — the backend set is closed at compile time. A Vulkan backend
-(the only route to Windows/Linux AMD and Intel GPUs) or a remote/RPC backend
-cannot be added without editing nine sites. This is the highest-leverage
-refactor in the backend layer.
+*Pluggability* — **F4 (2026-09-24) landed the registry half**: the backend set is
+data (a name-keyed table of entries registered at startup) rather than nine match
+sites, and a name that is unknown, not compiled into this build, or not usable on
+this machine is a loud startup refusal
+(`BACKEND-REGISTRY-DESIGN.md`). What is **still** closed at compile time is the
+*set itself*: there is no `dlopen`/plugin path, so a Vulkan backend (the only
+route to Windows/Linux AMD and Intel GPUs) or a remote/RPC backend is added by
+registering an entry — but it must still be compiled in. That is what remains of
+this axis.
 
 *Placement policy* — a model that does not fit in VRAM could not run at all. The
 docs already record this as a real limitation on 8 GB devices
@@ -456,14 +464,18 @@ verified mixed CPU+CUDA run on the 0.5B — then **S2**'s `auto`: per-block weig
 bytes from the GGUF index, the pure `fit_blocks` prefix search against a weight
 budget (`MINFER_GPU_MEM`, else three quarters of the device's free bytes) with a
 quarter held back for the KV arenas and the activation pool. What remains on this
-axis is the registry/`BackendId` half above (F4), and a free-bytes query for Metal
-(so `auto` works there too).
+axis is a free-bytes query for Metal (so `auto` works there too); the registry/`BackendId`
+half is **done** (F4).
 
-**Recommendation.** (a) Introduce a `BackendRegistry` with
+**Recommendation.** (a) ~~Introduce a `BackendRegistry` with
 `register(Box<dyn Backend>)`, `supports(op, dtype) -> Option<BackendId>` and
 per-backend allocation/sync as trait methods; replace the enum with an opaque
-`BackendId`. This is a mechanical refactor that pays for itself at the third
-backend. (b) Add a layer-offload budget policy that consumes the memory
+`BackendId`.~~ **Done in F4 (2026-09-24)** — the shape that landed is a name-keyed
+`Registry` of `BackendEntry` values (priority + caps + the pool hooks, registered at
+startup) and a `Backend` handle over a fixed id space, with the assignment order
+made an explicit pinned number (`docs/BACKEND-REGISTRY-DESIGN.md`). It keeps the
+capability matrices in the trait's own modules (the trait methods forward to them),
+so the registry and the trait cannot disagree. (b) Add a layer-offload budget policy that consumes the memory
 accounting from §2.3.
 
 ---
@@ -624,7 +636,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 9 | **Layer offload policy** on top of (8); needs a layer-granular assignment pass. — **S1 landed 2026-09-23 (E5)**: `graph/offload.rs` (`OffloadPlan` + the pure resolver), `CNode.layer` + `GraphBuilder::set_layer`, `GraphAllocator::supports_for` refusing the device past the plan, per-block weight registration (`OffloadPlan::allows_weight`, the block parsed from the registry name), `--gpu-layers`/`MINFER_GPU_LAYERS`, `CParams.gpu_layers` in the reuse identity, the startup report, and the mixed-run gate (4/24 blocks on CUDA matching the all-CPU greedy tokens, one device split per offloaded block with cross-backend copies at the boundaries). **S2 landed 2026-09-23**: the `auto` request fits the largest block **prefix** into a weight budget (`MINFER_GPU_MEM`, else three quarters of the device's free bytes — the same default E4's gate uses) with a quarter held back for KV/activations; per-block bytes come from the GGUF index (measured before anything is registered, because the filter *is* the plan); the startup line explains the fit. Real-model gate: `MINFER_GPU_MEM=64` → 5 of 24 blocks, 40.0 MiB on the device, greedy tokens matching the all-CPU run; uncapped → all 24 · [#46](https://github.com/yusiwen/minfer/issues/46) | §2.6 | L |
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. — **landed in E3 (2026-09-22)**: `prefill_chunks` + `MINFER_N_BATCH` (default 2048, a no-op for prompts that fit), remainder-last so the final forward carries the tail row, and the other slots take their decode step *between* chunks. Measured: 5 forwards / max `nt` 24 vs 1 / 98 for a 98-token prompt; logits bitwise on CPU and ≤ 0.218 (class 1.0) on CUDA; the interleaving A/B is 3 decode steps vs 0; the split costs one forward's fixed overhead per chunk (514 tokens in 4 forwards: CUDA 1.11x, CPU 1.005x; 98 tokens in 5: CUDA 2.0x). Not mixed prefill+decode batches yet · [#45](https://github.com/yusiwen/minfer/issues/45) | §2.5 | M |
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
-| 12 | **Backend registry** decoupling the enum from the nine match sites. | §2.6 | M |
+| 12 | **Backend registry** decoupling the enum from the nine match sites. — **landed in F4 (2026-09-24)**: [#57](https://github.com/yusiwen/minfer/issues/57); the handle + the name-keyed table live in `graph/registry.rs`, the priority order is a pinned number, and the name surface (`--backend` / `MINFER_BACKENDS`) has three distinct loud startup refusals (`docs/BACKEND-REGISTRY-DESIGN.md`). The registered set itself stays compile-time (no `dlopen`) | §2.6 | M |
 | 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the Metal half defers to Phase G | §2.8 | S |
 | 14 | **Async cross-backend copy + events** (needed for any heterogeneous split and for multi-device execution). | §2.2 | M |
 
@@ -769,6 +781,7 @@ hazards that the larger work would otherwise have to work around.
 | Allocator | `src/graph/alloc.rs` |
 | Reuse / params | `src/graph/cache.rs`, `params.rs` |
 | Backend trait | `src/graph/backend.rs` |
+| Backend registry (F4) | `src/graph/registry.rs`, `docs/BACKEND-REGISTRY-DESIGN.md` |
 | CPU execution | `src/graph/cpu_backend.rs`, `src/kernel.rs`, `src/quants.rs` |
 | CUDA execution | `src/graph/cuda_backend.rs`, `src/cuda.rs`, `src/cuda_kernels.cu` |
 | Metal execution | `src/graph/metal_backend.rs`, `src/metal.rs`, `src/metal.metal` |

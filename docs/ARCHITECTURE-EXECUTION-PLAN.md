@@ -12,7 +12,8 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **0/8** (F1 needs x86); Phase G
+**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **5/8** (F2, F3, **F4**, F7,
+F8 done; F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
 check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
@@ -3516,7 +3517,7 @@ Can run in parallel with A–E by a different workstream.
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | this box |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
-| F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
+| F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | this box |
@@ -4133,6 +4134,159 @@ CUDA-only fused ops. (g) The signal path is **not in the automated suite** — o
 runs above were performed by hand on this box and are recorded here as manual
 evidence, not as a CI gate; wiring a `SIGTERM` into a test would mean a
 subprocess and a port, which this ticket did not take on.
+
+### F4 — Backend registry (#57) — **DONE 2026-09-24**
+
+**What landed.** `src/graph/registry.rs` (new) is the backend registry, and the
+compile-time `enum Backend { CPU, Metal, Cuda }` is gone. `Backend` is now a
+`Copy`/`Hash`/`Eq`/`Ord` **handle** over a fixed, configuration-independent id
+space (`cpu = 0`, `metal = 1`, `cuda = 2`) — the ids are a KV-session
+file-format contract, so they are appended, never renumbered. The design-first
+artifact is [`BACKEND-REGISTRY-DESIGN.md`](./BACKEND-REGISTRY-DESIGN.md); the
+contract is summarized in `COMPUTE-GRAPH-DESIGN.md` §3.6, and the module map and
+the `Extending → New backend` recipe in `AGENTS.md` were rewritten to match.
+
+*The registry.* One `BackendEntry` per backend, registered by its own module at
+startup, carrying the name, the **assignment priority** (Metal 300, CUDA 200,
+CPU 100 — the pre-F4 statement order inside `supports_for`, now an explicit
+number), the capability matrix (`supports_op` / `supports_fused` /
+`supports_attn_span` / `reads_packed_kv`) and the hooks that reach the pool
+(`pool`/`pool_mut`, `host_read`, `kv_format`, lazy `enable`, `unavailable`).
+Each backend's capability matrix moved to module-level functions that its
+`impl Backend` methods forward to, so the registry's answer and the trait's
+answer are one authority (asserted by a gate).
+
+*What stopped matching on the enum.* The allocator's twelve dispatch sites
+(allocate / free / fresh, `pool_len`, `weights_bytes`, `write_host_window`,
+`write_host`, host read, `synchronize`, `copy_cells`, the KV element format, the
+session `enable`) are trait calls on the entry's pool hook, with the per-`cfg`
+fallback arms gone; `supports_for` walks `registry().by_priority()`;
+`scheduler::execute` is `alloc.pool_mut(split.backend)`; the fusion wiring in
+`graph/json.rs` and both model graphs is `alloc.fusion_backends()` +
+`alloc.fusion_backend_index()` (the hand-built `[cpu, metal?, cuda?]` vector and
+its `name() == "cuda"` position lookup are gone from three call sites);
+`kvsession`'s tag table is `Backend::index()` / `from_index()`; the JSON and DOT
+exporters, the op-matrix harness and `kvformat::KvFormat::supports` read the
+handle/registry. `models::Device` gained `Device::backend()`, the one bridge
+between the two id spaces (`kvsession::backend_of` now delegates to it).
+
+*The two orders.* **Identity** (`Backend::index`) fixes the on-disk KV-session
+tag, the exported graph's backend index, `Ord` and the fusion backend list;
+**priority** (the numbers above) is the assignment preference. Nothing depends
+on `HashMap` iteration order: the table is a fixed-size array indexed by id,
+`by_priority()` sorts by `(Reverse(priority), id)` so no two entries can tie, and
+the filter is a `[bool; 3]`. Both orders and the numbers are pinned per
+configuration by a gate.
+
+*The name surface.* `--backend <name>` (repeatable; comma-separated values
+accepted; extracted from `argv` **before** any subcommand dispatch, so `serve`,
+`viz`, `bench` and `specverify` all honour it) and `MINFER_BACKENDS=<csv>`;
+accepted names `cpu`, `metal`, `cuda`; trimmed, case-insensitive; the flag wins
+over the environment; unset is the pre-F4 behaviour. The request is a **fence**:
+it removes backends from participation and never adds one. `cpu` is always
+admitted — it is the universal fallback a graph must always be assignable to —
+so `--backend cpu` is the useful spelling (force the CPU for every device) and
+`--backend cuda` means "the device when it can take the node, the CPU
+otherwise". The fence is read from **one** filter in two places, which is what
+keeps them from disagreeing: `Qwen2Graph::device` / `Qwen3Graph::device` (so a
+fenced device never causes a device-only fused node to be built) and
+`GraphAllocator::supports_for` (so a node is never placed on a pool whose
+weights were never registered).
+
+*Refusals.* Three classes, three messages, all before the model is even
+resolved:
+
+```text
+unknown backend 'gpu2'; known backends are: cpu, metal, cuda
+backend 'cuda' is known but not compiled into this build: the CUDA backend is compiled only with --features cuda
+backend 'cuda' is compiled in but not available on this machine: no CUDA device is available, or CUDA is disabled (MINFER_DISABLE_CUDA)
+```
+
+Stage 1 (names, purely — CI-covered) runs at the top of `main`; stage 2
+(availability) runs once the device layer is up and, on every path that will run
+a model (`run`/`serve`/`viz` in `main`, `bench` and `specverify` in their own
+`run`), **before** the model path is resolved, so a missing file or a bad GGUF
+cannot preempt it. Only a backend the request **named** is checked at stage 2:
+the default request means "whatever this build can use", so
+`MINFER_DISABLE_CUDA=1` / `MINFER_DISABLE_MPS=1` keep meaning "run on the CPU".
+That distinction is a behaviour-preservation gate of its own — the first cut of
+stage 2 checked every allowed backend and turned `MINFER_DISABLE_CUDA=1` into a
+startup refusal, which the gate caught.
+
+**Feature gates.** The *registered set* is the compile-time one (CUDA only under
+`--features cuda`, Metal only on macOS) and is pinned per configuration, but the
+**names** are unconditional: `metal` on Linux and `cuda` on a default build give
+the accurate "not compiled into this build" refusal rather than "unknown". A
+backend that is compiled out is never silently treated as absent.
+
+**#87.** `BackendCaps::reads_packed_kv` is the per-device KV-format capability
+query, and it is **used by this ticket's own code**, not reserved:
+`GraphAllocator::ensure_kv`'s packed-region refusal and `KvFormat::supports`
+both read it, replacing `backend != Backend::CPU` and
+`matches!(device, Device::Cpu)`. The region-sizing gate and the C4 format gate
+now read one field; [#87](https://github.com/yusiwen/minfer/issues/87) is the
+work that flips CUDA's and Metal's value and adds their kernels. No follow-up
+issue is filed for it here.
+
+**Measured acceptance.**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **399 passed / 0 failed / 23 ignored** unit (baseline 393; +5 registry, +1 allocator fence) and **10 / 0 / 6** integration (baseline 3; the new `tests/backend_registry_cli.rs` is 7) |
+| `cargo test --release --features cuda --test backend_registry_cli` | **7 passed / 0 failed** (exercises the `#[cfg(feature = "cuda")]` branch of the disabled-device gate) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **23 passed / 0 failed** (baseline 23) |
+| `CUDA_HOME=/usr/local/cuda-13.0 … cargo build --release --features cuda` | exit 0 |
+| `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (GB10 sm_121, cached 0.5B) | **25 passed / 0 failed**. The ticket's "22" predates F7's two reference gates: `0602eb2` has 26 `#[ignore]` attributes, 2 of them in the macOS-only `src/metal.rs`, i.e. **24 runnable here**, and this ticket adds the 25th (the fence gate below) |
+| `cargo test --release --features cuda --bin minfer -- --test-threads=1` (GB10, whole unit suite) | **452 passed / 0 failed / 25 ignored** |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` | **24 passed / 1 failed**, the one failure `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling` with *"the file was written with the f32 KV element type, this run uses f16"* — the **pre-existing** [#130](https://github.com/yusiwen/minfer/issues/130) C5 defect, which the record above documents as this configuration's 21/1 (the count moved by the same +3: F7's two gates and this ticket's) |
+| registry / CLI gates | `names_resolve_and_unknown_names_are_refused`, `the_registered_set_and_priority_order_are_pinned`, `the_name_surface_fences_devices_and_keeps_cpu`, `the_packed_kv_capability_is_the_registrys_answer`, `registry_caps_match_the_backend_trait`, `alloc::tests::a_fresh_allocator_inherits_the_runs_backend_filter`, `tests/backend_registry_cli.rs` (7, incl. `a_disabled_device_is_not_refused_unless_it_was_named`) |
+| `rustfmt --edition 2021 --check` on the 19 changed `.rs` | clean (stable's rustfmt 1.9.0: the pinned 1.97.1 toolchain has no `rustfmt` component installed here — CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **935 links resolve in 183 files** (baseline 930 / 182) |
+
+**Mutation checks (all reverted, all restored byte-identical).**
+
+| Mutation | Gate that failed | Observed |
+|---|---|---|
+| (a) an unknown name falls back to the default backend | `names_resolve_and_unknown_names_are_refused` + `the_name_surface_fences_devices_and_keeps_cpu` | `called 'Result::unwrap_err()' on an 'Ok' value: CPU`, and `Ok(BackendFilter { allowed: [true, false, false], … })` |
+| (b) swap the CUDA and CPU priorities | `the_registered_set_and_priority_order_are_pinned` | `left: [("cpu", 200), ("cuda", 100)]` vs `right: [("cuda", 200), ("cpu", 100)]` |
+| (b2) perturb one priority value (200 → 201), order unchanged | same gate | `left: [("cuda", 201), ("cpu", 100)]` vs `right: [("cuda", 200), ("cpu", 100)]` |
+
+(b2) exists because the expected numbers are deliberately **literals**: deriving
+them from the `PRIORITY_*` constants would have made the value half of the gate
+vacuous (only a reordering would have failed).
+
+**Manual evidence (device, GB10; not a CI gate).** With the CUDA build,
+`MINFER_DISABLE_CUDA=1 minfer --backend cuda <model>` and the `MINFER_BACKENDS`
+spelling both print the stage-2 message; the same with `serve`, `viz`, `bench`
+and `specverify`; `--backend metal` on Linux prints the not-compiled message;
+`--backend gpu2` prints the unknown-name message. The fence itself was checked
+end-to-end: `minfer --backend cpu … "The capital of France is"` and
+`MINFER_DISABLE_CUDA=1 minfer …` on the **same CUDA build** produce
+byte-identical stdout (prompt + 8 greedy tokens) apart from the timing lines —
+i.e. naming `cpu` selects exactly the path the pre-existing disable flag selects.
+
+**Honest scope.** (a) **Metal is compile-only**: there is no Mac here, so the
+Metal entry's `pool`/`host_read`/`kv_format`/`enable` hooks, its `unavailable`
+probe and its refusal text are covered by CI's `build-macos` job and by
+`rustfmt`, and by nothing that runs. (b) Behaviour preservation rests on the
+existing suites plus the new order/name gates; the parts a suite would not
+notice are pinned explicitly — the identity order (the on-disk session tag, the
+exporters), the priority order *and* numbers, `Ord`, the `Debug` spelling, and
+the equality of the registry's capability matrix with the trait's. (c) One
+deliberate, **unreachable** behaviour delta: `fill_input` / `write_pool` name a
+disabled backend in an `Err` where the old code panicked with
+`expect("… pool not enabled")`; assignment can never select a backend whose pool
+is not enabled, so no suite path reaches it. (d) `copy_kv_to_cpu` keeps its
+pre-F4 CPU/CUDA-only shape (a CPU identity-debug helper) rather than widening to
+Metal through the new hook — widening is not this ticket's job. (e) One
+per-backend branch remains on purpose: the `MINFER_TRACE`/viz capture path, where
+each backend captures through its own mechanism (a borrowed read, a Metal blit,
+an async D2H into pinned CUDA staging) — that is machinery, not a capability.
+(f) The registry makes the backend set **data, not pluggable**: there is no
+`dlopen` path, so a Vulkan/remote backend is registered by editing the crate, not
+by dropping in a library (`ROADMAP` §2.6 keeps that distinction). (g) The CPU
+numbers above are the *final* tree (after the rustfmt pass and the stage-2 fix);
+the CUDA numbers are from the same final tree.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 

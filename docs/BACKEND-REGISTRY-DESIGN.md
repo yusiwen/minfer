@@ -243,6 +243,21 @@ A `cuda` name on a `--features cuda` build with `MINFER_DISABLE_CUDA=1`, or with
 no device, lands here — not in the "not compiled" bucket, and never in a silent
 fallback to the CPU.
 
+**Only a *named* backend is checked at stage 2.** The filter therefore carries
+two facts per backend — `allowed` (may this run use it?) and `requested` (did the
+request name it?) — because the default request means "whatever this build can
+use". Preserving that distinction is what keeps the pre-existing
+`MINFER_DISABLE_CUDA` / `MINFER_DISABLE_MPS` flags meaning "run on the CPU"
+rather than turning them into "refuse to start": with no `--backend` /
+`MINFER_BACKENDS`, nothing was named, so stage 2 has nothing to check and the
+run proceeds on the CPU exactly as it did before F4. Naming the fenced backend
+(`--backend cuda` with `MINFER_DISABLE_CUDA=1`) *is* a refusal, because the user
+asked for it.
+
+Stage 2 runs before the model path is resolved on every path that will run a
+model (`run`/`serve`/`viz` in `main`, and `bench`/`specverify` in their own
+`run`), so an unrelated failure — a missing file, a bad GGUF — cannot preempt it.
+
 Both stages exit non-zero and print nothing else about backends. The reverse
 direction is also loud: no code path may *drop* a named backend and keep going.
 
@@ -296,18 +311,35 @@ adds their kernels). No other per-format query is added here.
 - **Behaviour preservation.** The identity and priority orders, the
   `supports_op` / `supports_fused` / `supports_attn_span` answers, the
   sync/copy arms and the memory accounting are unchanged; the existing suites
-  are the measurement, and the two order gates pin the parts a suite would not
+  are the measurement, and the order/name gates pin the parts a suite would not
   notice.
 - **Gates**
   1. `registry::tests::names_resolve_and_unknown_names_are_refused` — the known
-     names resolve to the pinned handles and an unknown name is a distinct,
-     loud error (pure; CI covers it).
+     names resolve to the pinned handles, an unknown name and a compiled-out
+     name are *distinct* loud errors, and diagnostics keep the pre-F4 spelling
+     (pure; CI covers it).
   2. `registry::tests::the_registered_set_and_priority_order_are_pinned` — the
-     registered set and the priority order, per configuration.
-  3. `tests/backend_registry_cli.rs` — the process level: an unknown name exits
+     registered set, the priority **order** and the priority **numbers**, per
+     configuration, plus `Ord` and a fresh allocator's deterministic answer.
+  3. `registry::tests::the_name_surface_fences_devices_and_keeps_cpu` — the
+     fence surface (comma/repeat spellings, `cpu` always admitted, the flag
+     winning over the environment, both refusals).
+  4. `registry::tests::the_packed_kv_capability_is_the_registrys_answer` and
+     `registry::tests::registry_caps_match_the_backend_trait` — the #87 seam is
+     the field both C4 gates read, and the registry's capability matrix is the
+     trait's (they are one authority).
+  5. `alloc::tests::a_fresh_allocator_inherits_the_runs_backend_filter` — the
+     fence reaches the assignment pass through the same active filter.
+  6. `tests/backend_registry_cli.rs` — the process level: an unknown name exits
      non-zero naming the accepted set, a compiled-out name gives the *other*
-     message, and a known name passes the gate (proved by the failure moving on
-     to the model).
+     message, a known name passes the gate (the failure moves on to the model),
+     `bench` honours the flag, `--help` documents it, and an *unnamed* device
+     disabled by the pre-existing flags is still "run on the CPU".
+  7. `alloc::tests::cuda_the_backend_fence_moves_assignment_off_a_usable_device`
+     — `#[ignore]`d (needs a device): the fence moves assignment off an enabled,
+     usable device without tearing it down.
 - **Mutation evidence.** (a) making an unknown name fall back to the default
-  backend fails gate 1; (b) swapping two priorities fails gate 2. Both are
-  reverted; the observed failure output is recorded in the ticket record.
+  backend fails gate 1; (b) swapping two priorities fails gate 2; (b2)
+  perturbing one priority *value* without reordering also fails gate 2, which is
+  why the expected numbers are literals. All three are reverted; the observed
+  failure output is recorded in the ticket record.

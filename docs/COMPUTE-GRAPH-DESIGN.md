@@ -127,6 +127,7 @@ cached graph skips the first three stages and only refills inputs.
 | `graph/params.rs` | `GraphType`, `CParams`, `GraphParams` (the reuse identity) |
 | `graph/cache.rs` | `GraphCache` — params-only reuse, graph `uid`, allocator lifetime |
 | `graph/backend.rs` | `Backend` trait, `KvProvider` |
+| `graph/registry.rs` | the backend registry (F4): the `Backend` handle, the name-keyed entries (priority + caps + pool/host-read/kv-format/enable hooks), the `--backend`/`MINFER_BACKENDS` fence — see [`BACKEND-REGISTRY-DESIGN.md`](./BACKEND-REGISTRY-DESIGN.md) |
 | `graph/alloc.rs` | `GraphAllocator` — liveness, node→buffer map, KV regions, cross-backend staging |
 | `graph/scheduler.rs` | `BackendScheduler` — `assign_backends`, `split_graph`, `execute` |
 | `graph/fusion.rs` | `FusionPass` — pattern-matching rewrite |
@@ -177,7 +178,15 @@ pub type NodeId = usize;
 
 pub enum DType { F32, F16, I32, Q8_0 }   // activations are F32; F16/I32/Q8_0 for inputs
 
-pub enum Backend { CPU, Metal, Cuda }
+// F4: the backend handle — a fixed id space (cpu = 0, metal = 1, cuda = 2), not an
+// enum. The ids are a KV-session file-format contract; `registry.rs` maps names to
+// them and carries each backend's priority, capabilities and pool hooks.
+pub struct Backend(u16);
+impl Backend {
+    pub const CPU: Backend = Backend(0);
+    pub const METAL: Backend = Backend(1);
+    pub const CUDA: Backend = Backend(2);
+}
 
 pub struct BufRef { pub backend: Backend, pub id: usize }   // id inside that backend's pool
 pub struct PersistentBuf { pub name: String, pub backend: Backend, pub id: usize }
@@ -489,7 +498,36 @@ device→host path through the allocator's `copy_to_cpu` (§9.5).
 effect (backend-internal warmup bookkeeping); the captured window is closed at the split's
 `synchronize`. The default implementation is a no-op, so CPU and Metal drop the method entirely.
 
-### 3.6 Parameters and the reuse cache (`graph/params.rs`, `graph/cache.rs`)
+### 3.6 Backend registry (`graph/registry.rs`)
+
+The set of backends is a **registry**, not a compile-time enum. `Backend` is a `Copy`/`Hash`/`Eq`/`Ord`
+handle over a fixed id space (`cpu = 0`, `metal = 1`, `cuda = 2`) — the ids are a KV-session
+file-format contract, so they are appended, never renumbered. Each backend module registers one
+`BackendEntry` at startup: its name, its **assignment priority**, its capability matrix
+(`supports_op` / `supports_fused` / `supports_attn_span` / `reads_packed_kv`) and the hooks that reach
+its pool (`pool`/`pool_mut`, `host_read`, `kv_format`, lazy `enable`, `unavailable`). The capability
+matrices are module-level functions and the trait methods forward to them, so the registry's answer
+and the trait's answer cannot diverge.
+
+Three things follow for this document:
+
+- `supports_op` is offered in **priority** order (Metal 300, CUDA 200, CPU 100) read from the
+  registry, not in a hardcoded chain inside `GraphAllocator::supports_for`. The order is a pinned
+  number because the assignment is topology (§6.1). Nothing here may depend on `HashMap` iteration
+  order.
+- the allocator's dispatch (allocation, free, sync, `copy_cells`, host I/O, the KV element format,
+  the session `enable`) is a trait call on the entry's pool hook — the twelve `match backend { … }`
+  sites are gone, together with their `#[cfg]` fallback arms.
+- a **fence** by name (`--backend` / `MINFER_BACKENDS`) removes a backend from participation, read by
+  the graph builders' `Device` and by `supports_for` from one filter; and a name that is unknown,
+  not compiled into this build, or not usable on this machine is a **loud startup refusal** that
+  names which of the three it is.
+
+The full contract — the two orders, the determinism rule, the name surface, the exact refusal
+messages and the per-configuration feature-gate table — is
+[`BACKEND-REGISTRY-DESIGN.md`](./BACKEND-REGISTRY-DESIGN.md).
+
+### 3.7 Parameters and the reuse cache (`graph/params.rs`, `graph/cache.rs`)
 
 ```rust
 pub enum GraphType { Decode, Prefill }
@@ -1516,6 +1554,18 @@ Post-baseline additions (working-tree changes made while writing this document, 
     a tag whose op it cannot execute (§5.2/§5.4).
 39. **Shared preview gate**: `graph::json::preview_fuse_flags(nt, metal_on, cuda_on)` is the single
     source for the `--dump-graph*` / `MINFER_TRACE` preview's fusion flags (item 36).
+40. **The compile-time backend enum became an opaque handle (F4, #57)**: `pub enum Backend { CPU,
+    Metal, Cuda }` is now `pub struct Backend(u16)` over a fixed, configuration-independent id space,
+    with the name-keyed registry in `graph/registry.rs` (§3.6, the design record is
+    [`BACKEND-REGISTRY-DESIGN.md`](./BACKEND-REGISTRY-DESIGN.md)). Every consumer that matched on the
+    enum now reads the registry: the allocator's twelve dispatch sites (pool, sync, `copy_cells`, host
+    I/O, KV format, session enable), the scheduler's execute, the fusion wiring in
+    `graph/json.rs` + both model graphs, the JSON/DOT exporters, the KV-session tag table and the
+    op-matrix harness. The two orders are preserved and pinned: **identity** (id order — the session
+    tag, the exporters, `Ord`) and **priority** (Metal > CUDA > CPU, the assignment preference). One
+    per-backend branch deliberately remains: the `MINFER_TRACE`/viz capture path dispatches CPU /
+    Metal / CUDA because each backend captures through its *own* mechanism (a borrowed read, a blit
+    into Metal staging, an async D2H into the pinned CUDA staging), which is not a capability.
 
 ### 17.4 Test surface and baseline
 
