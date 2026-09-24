@@ -1,7 +1,8 @@
 # Grammar and JSON-schema constrained decoding (F2, [#47](https://github.com/yusiwen/minfer/issues/47)) — design
 
-**Status: design (2026-09-24).** This document is the contract for the
-implementation: the exact grammar and schema subsets, the loud refusals, the
+**Status: implemented (2026-09-24)** — see §9 for the two defects the gates
+found and the measured mask cost. This document is the contract the
+implementation was held to: the exact grammar and schema subsets, the loud refusals, the
 automaton, where the mask sits in the sampler pipeline, and what the acceptance
 gates assert. Anything not listed as *in scope* is refused with a message that
 names the construct — never silently guessed, never silently ignored.
@@ -124,14 +125,15 @@ rules and compiled once, on demand.
 ### Scope note: object property order
 
 Object entries are emitted **in `properties` declaration order**: required
-properties must appear, optional ones may be skipped, and extra properties (when
-`additionalProperties` allows them) follow the declared ones. This is a *subset*
-of the schema's language — a model cannot produce `{"b":1,"a":2}` for a schema
-that declares `a` then `b`. It never accepts an object the schema rejects, which
-is what the acceptance line ("constrained output always parses under the given
-schema") requires. llama.cpp generates permutations up to a size cap; that is a
-follow-up (§7), not a silent guess: the behaviour is stated here and in
-`docs/USAGE.md`.
+properties must appear, optional ones may be skipped, and an extra entry (when
+`additionalProperties` allows one) may be interleaved at any position where no
+required declared property is still pending. This is a *subset* of the schema's
+language — a model cannot produce `{"b":1,"a":2}` for a schema that declares `a`
+then `b`, nor may an extra precede a required first property. It never accepts
+an object the schema rejects, which is what the acceptance line ("constrained
+output always parses under the given schema") requires. llama.cpp generates
+permutations up to a size cap; that is a follow-up (§8), not a silent guess: the
+behaviour is stated here and in `docs/USAGE.md`.
 
 ### Scope note: `oneOf`
 
@@ -198,7 +200,12 @@ Consequences, all of them asserted:
 * a token whose earlier bytes are accepted and whose later codepoint is not is
   **rejected as a whole** by the mask (`accept_token` reports the byte offset of
   the failure — the "longest accepted prefix" — and does not mutate the state);
-* an invalid UTF-8 byte is a rejection, never a `U+FFFD` substitution.
+* an invalid UTF-8 byte is a rejection, never a `U+FFFD` substitution;
+* a token that *ends* in a partial sequence is allowed only when the pending
+  bytes can still complete to a codepoint the state accepts. The completion is
+  computed exactly, so overlong forms (`0xE0 0x80 …` for `U+0061`) and the
+  surrogate block do not count — a lone `0xE0` after `"a"` is rejected rather
+  than accepted and then stranded (that was a real defect, §9).
 
 ### End-of-generation
 
@@ -216,8 +223,14 @@ only O(vocabulary) step. It is cached **by state key** in `GrammarState`
 run that revisits a state (JSON's "expect a key or `}`" state is revisited after
 every member) pays for the vocabulary once per distinct state. The compiled
 `Grammar` itself is immutable and shared by `Arc`, so a cache per run needs no
-lock; the cost of the first mask of a new state is O(vocabulary × average piece
-length).
+lock.
+
+Inside one mask computation the start state is fixed, so "consume one codepoint"
+is a function of `(state, codepoint)`; the walk interns successor states and
+memoizes the transition. That turns the O(vocabulary × piece length) walk into
+O(distinct transitions), which is what makes the cost acceptable: **5.4 ms per
+new state on the 151,936-token Qwen vocabulary** (measured, §9), down from
+71.3 ms before the memo was added.
 
 ### "No token is allowed"
 
@@ -333,5 +346,38 @@ lives), before the job occupies a worker slot.
 * **Per-request compile cost** is O(vocabulary) for the token pieces plus the
   grammar size; it is measured in the record and is the reason the mask cache is
   per state rather than recomputed per token.
-* Follow-ups are filed as GitHub issues when the implementation lands; this
-  section is not a substitute for them.
+* Follow-ups are filed as GitHub issues: [#125](https://github.com/yusiwen/minfer/issues/125)
+  (the refused GBNF/schema constructs) and
+  [#126](https://github.com/yusiwen/minfer/issues/126) (the residual mask cost).
+
+## 9. Implementation notes (2026-09-24)
+
+Two defects were found by the gates, not by reading the code, and both are now
+covered by unit tests:
+
+1. **A partial-UTF-8 token could be accepted where the automaton could never
+   finish it.** After a JSON object closed, a lone `0xE0` leader was allowed
+   (the first version computed the completion range as `U+0000..=U+0FFF`, which
+   includes ASCII), the run then had no legal continuation, and the response
+   ended with `U+FFFD` — an illegal byte, exactly what the acceptance line
+   forbids. Found by `real_model_json_schema_generation_parses` and reproduced
+   over HTTP with `{"grammar":"root ::= \"ab\""}` (the response was `"a\uFFFD"`
+   instead of `"ab"`). Fixed by computing the completion range exactly:
+   overlong forms, the surrogate block and codepoints above `U+10FFFF` are
+   excluded (`completion_range`), plus a defensive rule that a response body
+   never ends mid-character (`complete_utf8_prefix_len` on the final flush, both
+   server paths).
+2. **The mask was 13× more expensive than it needed to be** — 71.3 ms per new
+   state on a 151,936-token vocabulary, which dominated a 0.5B generation
+   (1.48 s for 15 tokens). Fixed by the per-call transition memo (§4): 5.4 ms
+   per new state, and the constrained run (0.42 s) is now faster than the
+   unconstrained one (0.70 s) because the grammar stops it after 15 tokens
+   instead of 48. The residual ~86 ms for a 16-step JSON response is the honest
+   price of an O(vocabulary) state at this vocabulary size;
+   [#126](https://github.com/yusiwen/minfer/issues/126) tracks the idea of a
+   token-indexed first-codepoint bucket to remove it, and
+   [#125](https://github.com/yusiwen/minfer/issues/125) the constructs the
+   compiler refuses.
+
+The measured acceptance (both models, greedy, seed 42) is in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md`'s F2 record.

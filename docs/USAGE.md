@@ -56,6 +56,24 @@ Sampling and runtime options:
     `--logit-bias 15043:-2.0,198:1.5`. A token id outside the vocabulary, or a bias outside
     `[-100, 100]`, is refused at startup.
   A nonsensical value for any of these is refused at startup (exit 1), never silently ignored.
+- **F2 constrained decoding** ([#47](https://github.com/yusiwen/minfer/issues/47)) — mutually
+  exclusive; an unsupported construct is refused at startup (exit 1) with the offending token:
+  - `--grammar <FILE>` / `--grammar-str <GBNF>` — constrain sampling to a GBNF grammar
+  - `--json-schema <FILE>` / `--json-schema-str <JSON>` — constrain sampling to a JSON Schema
+    (compiled to GBNF internally)
+  The grammar is compiled once against the loaded vocabulary; the mask is applied inside the
+  sampler, after the penalties/DRY and before the greedy shortcut, so `--greedy` respects it.
+  `--spec-draft` cannot be combined with a grammar (a verify round samples several rows from one
+  automaton state). The accepted GBNF and JSON-Schema subsets, and every construct that is
+  refused, are catalogued in [GRAMMAR-DESIGN.md](./GRAMMAR-DESIGN.md); the honest narrowing to
+  know about is that object properties are accepted in **declaration order** and `oneOf` is
+  compiled as `anyOf`. Example:
+  ```bash
+  minfer model.gguf "Give me a person" --json-schema-str \
+    '{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,
+      "maximum":150}},"required":["name","age"],"additionalProperties":false}'
+  # -> {"age": 25, "name": "John Doe"}
+  ```
 - `--stop <STR>` — stop generation at this string (repeatable)
 - `-n, --n-predict <N>` — max tokens to generate (default 512)
 - `--seed <N>` — RNG seed for sampling
@@ -169,6 +187,38 @@ Two environment switches around the GPU are easy to get wrong:
   `fa_prefill` tiles one query tile against one KV window — E1b), so `--n-slots`
   concurrency still pays one prefill per request, and prefix reuse across slots
   needs a cell copy (C3/D1). The batched-decode win is unaffected.
+
+### Structured output (F2)
+
+`/v1/chat/completions` accepts OpenAI's `response_format` and a llama.cpp-style `grammar`
+extension:
+
+| Field | Effect |
+|---|---|
+| `"response_format": {"type": "text"}` (or absent) | no constraint |
+| `"response_format": {"type": "json_object"}` | any single JSON value |
+| `"response_format": {"type": "json_schema", "json_schema": {"name": "person", "schema": {…}}}` | the compiled schema (`name` and `strict` are accepted and ignored) |
+| `"grammar": "root ::= …"` | a GBNF grammar inline |
+
+`grammar` together with a non-text `response_format` is a `400` (one grammar per request, never a
+precedence rule), and so is any unsupported GBNF/schema construct — the schema is compiled on the
+handler side, before the request takes a slot, so the error is an HTTP `400` with the offending
+construct named, not a truncated generation:
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role":"user","content":"Give me a person"}],
+  "temperature": 0, "max_tokens": 40,
+  "response_format": {"type":"json_schema","json_schema":{"name":"person","schema":
+    {"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,
+     "maximum":150}},"required":["name","age"],"additionalProperties":false}}}}'
+# {"choices":[{"message":{"content":"{\n  \"age\": 25,\n  \"name\": \"Qwen\"\n}"}}]}
+```
+
+A grammar is **per request**: the compiled automaton is shared by `Arc` and each request (serial
+or batch slot) carries its own position, so slots cannot perturb each other. A response body never
+ends mid-character: if a generation stops with a partial UTF-8 sequence pending, those bytes are
+dropped (with a printed note) rather than decoded to `U+FFFD`.
 
 ### Metrics and observability (F8)
 

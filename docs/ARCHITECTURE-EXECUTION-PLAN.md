@@ -3229,7 +3229,7 @@ Can run in parallel with A–E by a different workstream.
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
-| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **design 2026-09-24** ([`GRAMMAR-DESIGN.md`](./GRAMMAR-DESIGN.md)) | M | this box |
+| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | this box |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
@@ -3300,6 +3300,108 @@ the combination loudly. (c) In mirostat mode the temperature is ignored
 conversation/KV session snapshot does not carry `mu` (it does not carry the RNG
 either): a resumed session restarts `mu` at `2 * tau`, which affects sampling
 only, never the KV.
+
+### F2 — Grammar and JSON-schema constrained decoding (#47) — **DONE 2026-09-24**
+
+**What landed.** `src/grammar.rs` (new) holds the whole engine, designed in
+[`GRAMMAR-DESIGN.md`](./GRAMMAR-DESIGN.md) and implemented against that
+contract; `src/sampler.rs` gained the mask's position in the one pipeline.
+
+*GBNF subset.* Rules, string literals (`\n \r \t \\ \" \xNN \uNNNN`),
+character classes with negation, `.`, grouping, alternation, `*` `+` `?`
+`{m}` `{m,}` `{m,n}` (upper bound ≤ 1024), `#` comments. Refused loudly, each
+with the offending token: `\d`/`\w`/`\p{...}`, an empty or reversed class, a
+repetition whose upper bound is below its lower bound or above the cap, a
+missing `root`, a duplicate rule name, an undefined reference, and left
+recursion (detected while compiling every rule's epsilon closure, so it is a
+startup error rather than a generation-time hang).
+
+*JSON-Schema subset.* `type` (string or array), `enum`, `const`,
+`properties`/`required`/`additionalProperties` (bool or schema), `items`,
+`prefixItems`, `minItems`/`maxItems`, `string`, integer bounds (inclusive and
+exclusive, ranges compiled by digit decomposition), `number`, `boolean`,
+`null`, `anyOf`/`oneOf`, `$defs`/`definitions` + local `$ref` (recursive
+schemas work). Refused loudly: `pattern`, `format`, `minLength`/`maxLength`,
+non-integer numeric bounds on `number`, `multipleOf`, `propertyNames`,
+`patternProperties`, `dependent*`, `uniqueItems`, `contains`, `allOf`, `not`,
+`if`/`then`/`else`, remote or nested `$ref`, `items` as an array (the draft-07
+tuple form), and a `required` name that is not declared.
+
+*Engine.* One flat program per rule (`Cp`/`Class`/`Any`/`Split`/`Jump`/`Call`/
+`Ret`), a stack of `{rule, pc}` frames, a bounded **set** of nondeterministic
+stacks (64) with a stack-depth bound (256) that turns left recursion into an
+error, codepoint matching with a carried partial-UTF-8 buffer, EOG allowed only
+at an accepting state with no pending bytes, and an empty-piece token never
+allowed. The mask is a packed bitset per token id, cached per state (bounded at
+64) and computed through a per-call DFA-style transition memo.
+
+*Pipeline.* `SamplerConfig.grammar: Option<Arc<Grammar>>` is the compiled,
+immutable object; the mutable automaton state is per run
+(`GrammarState`), exactly like `MirostatState`. The one pipeline is now
+
+```text
+logit bias → penalties → DRY → [GRAMMAR MASK] → greedy shortcut → top-k →
+typical → top-p → min-p → XTC → temperature | mirostat v1/v2
+```
+
+The position is the argument: everything before the mask only *shifts* logits
+(finite additions cannot lift a masked `-inf`), and everything after it only
+*removes* candidates or reweights survivors, so a forbidden token can never win
+— including under `--greedy`, which is why the mask is before the shortcut. The
+mask consumes no RNG and writes nothing the other stages read, so mirostat's
+`mu` and DRY are unperturbed for the same token sequence.
+`sample_with_config_grammar` returns `SampleError::{NoAllowedToken, Grammar}`:
+an empty allowed set is a loud stop, never an arbitrary token, and a configured
+grammar with no run state is an error rather than a silent fallback.
+
+*Surfaces.* CLI `--grammar <FILE>` / `--grammar-str <GBNF>` / `--json-schema
+<FILE>` / `--json-schema-str <JSON>` (mutually exclusive, compiled once after
+the vocabulary loads, refused at startup); `--cnv` resets the automaton per
+assistant turn; `--spec-draft` + a grammar is refused. Server
+`response_format: {"type":"json_object"}` and `{"type":"json_schema",
+"json_schema":{"name":…,"schema":{…}}}` plus the `grammar` GBNF extension field
+— `grammar` together with a non-text `response_format` is a `400`, and so is an
+unsupported construct (compiled on the handler side, before a slot is taken).
+Batch slots and serial requests each build their own state.
+
+**Measured acceptance.** Greedy, seed 42, 0.5B q4_0 (f32 KV) and Qwen3-0.6B
+Q8_0 (f16 KV), schema `{name: string, age: integer 0..150}`:
+
+| Gate | 0.5B q4_0 | Qwen3-0.6B Q8_0 |
+|---|---|---|
+| schema run parses (`serde_json::from_str`) | `{"age": 25, "name": "John"}` | `{"age": 25, "name": "John Doe"}` |
+| `response_format: json_object` (server, 80 tok) parses | `{"field1": "value1", "field2": "value2"}` | — |
+| empty case: `max_tokens 0` → `""` / `"length"` | ✅ | ✅ |
+| empty case: `root ::= ""` → `""` / `"stop"`, EOG only | ✅ | ✅ |
+| max-length (8 tok) → `Grammar::accepts_prefix` ✅, full parse ✗ (as asserted) | `{"name": "John Doe` | `{"name": "John",` |
+| mask cost per **new state** (151,936-token vocab) | 5.4 ms (16 states, 86 ms) | 5.4 ms |
+| bitwise no-grammar path | pinned 64-token sequence, `test_default_pipeline_matches_the_pinned_pre_f2_sequence` | same |
+
+The two defects the gates found are recorded in `GRAMMAR-DESIGN.md` §9: a
+partial-UTF-8 token accepted where the automaton could never finish it (found by
+the real-model parse gate, reproduced over HTTP as `"a\uFFFD"` for
+`{"grammar":"root ::= \"ab\""}`), and the mask's first version costing 71.3 ms
+per state (13× the memoized cost). Four mutations were run against the new
+gates and each made one fail: an off-by-one in the sampler's mask index, a
+disabled partial-completion check, an ignored `minItems`, and a disabled EOG
+allowance.
+
+**Honest scope.** Object properties are accepted in *declaration order* (a
+subset of the schema's language: extras may be interleaved only where no
+required property is pending); `oneOf` is compiled as `anyOf`; only
+integer-valued numeric bounds are compiled (`number` + bounds is refused);
+`pattern`/`minLength`/`maxLength` and `multipleOf` are refused. The mask is
+O(vocabulary) per new state — 5.4 ms on a 151k vocabulary, cached per state — so
+a long constrained generation still pays it once per unseen state. All
+acceptance is CPU-only: CUDA/Metal are not touched by this ticket (the mask is
+host-side, before any device work), so the CUDA `build-linux-cuda` job compiles
+the change but no device run exercises it. Two follow-up issues carry what was
+deliberately left out: [#125](https://github.com/yusiwen/minfer/issues/125) (the
+GBNF/JSON-Schema constructs the compiler refuses: `pattern`/`minLength`/
+`maxLength`, real-valued numeric bounds and `multipleOf`, property permutations,
+an exact `oneOf`, `allOf`/`not`, `\d`/`\w`/`\p{...}`) and
+[#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
+first codepoint to cut the residual mask cost).
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

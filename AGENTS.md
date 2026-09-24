@@ -29,8 +29,11 @@ src/
 ├── cache.rs         # legacy KV cache type (graph path owns KV in the allocator)
 ├── dump.rs          # debug dump module (--features debug_dump)
 ├── tokenizer.rs     # BPE tokenizer (self-contained, from GGUF metadata)
-├── sampler.rs       # SamplerConfig pipeline: penalties → DRY → top-k → typical → top-p →
-│                    #   min-p → XTC → temperature | mirostat v1/v2, plus logit bias (#48)
+├── sampler.rs       # SamplerConfig pipeline: penalties → DRY → grammar mask (F2) → top-k →
+│                    #   typical → top-p → min-p → XTC → temperature | mirostat v1/v2, plus
+│                    #   logit bias (#48)
+├── grammar.rs       # F2 (#47): GBNF parser + pushdown automaton + JSON-schema front end; the
+│                    #   per-state token mask and its per-run state (docs/GRAMMAR-DESIGN.md)
 ├── template.rs      # chat templates (minijinja) — 2.21.0 has no `str` methods; Qwen3's template falls back to ChatML (docs/QWEN3-SUPPORT-PLAN §5#9)
 ├── conversation.rs  # multi-turn session (append-only KV; overflow drops the oldest
 │                    #   turn's KV range + re-ropes the tail — C2; MINFER_NO_CONTEXT_SHIFT=1 re-renders)
@@ -161,10 +164,12 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 ## Sampling
 
 `sampler.rs` (#48): one `SamplerConfig` drives one pipeline — logit bias → penalties (repeat /
-frequency / presence, last 64 tokens) → DRY → greedy shortcut (`temp == 0`) → top-k → typical →
-top-p → min-p → XTC → temperature **or** mirostat v1/v2, seeded `StdRng`. Every F3 knob defaults to
-a no-op, so the default path is bit-identical to the pre-#48 chain — pinned by
-`test_default_pipeline_matches_the_pinned_pre_f3_sequence` (a sequence captured from `master`).
+frequency / presence, last 64 tokens) → DRY → **grammar mask (F2)** → greedy shortcut
+(`temp == 0`) → top-k → typical → top-p → min-p → XTC → temperature **or** mirostat v1/v2, seeded
+`StdRng`. Every F3 knob defaults to a no-op, so the default path is bit-identical to the pre-#48
+chain — pinned by `test_default_pipeline_matches_the_pinned_pre_f3_sequence`, and re-pinned through
+the grammar-aware entry point by `test_default_pipeline_matches_the_pinned_pre_f2_sequence` (the
+same sequence, captured from `master` before both changes).
 `SamplerConfig::validate` refuses nonsensical values at CLI startup / HTTP 400 (never clamps
 silently), and logit-bias token ids are checked against the vocabulary.
 Mirostat's `mu` is caller-owned state (`MirostatState`: one per run / session / request / batch
@@ -174,7 +179,28 @@ several rows from one shared RNG. DRY sequence breakers are token-id sequences
 CLI: `--temp --greedy --top-k --top-p --repeat-penalty --frequency-penalty --presence-penalty
 --min-p --typical --xtc-probability --xtc-threshold --dry-multiplier --dry-base
 --dry-allowed-length --dry-penalty-last-n --dry-sequence-breakers --mirostat --mirostat-tau
---mirostat-eta --mirostat-m --logit-bias -n --seed -t`.
+--mirostat-eta --mirostat-m --logit-bias --grammar --grammar-str --json-schema
+--json-schema-str -n --seed -t`.
+
+**Constrained decoding (F2, [#47](https://github.com/yusiwen/minfer/issues/47)).**
+`src/grammar.rs` compiles a GBNF grammar (or a JSON Schema, through a generated
+GBNF) into one pushdown automaton — a flat program per rule, a set of
+`{rule, pc}` call stacks — and turns it into a per-state token bitset. The mask
+is applied **inside** `sample_with_config_grammar`, after DRY and before the
+greedy shortcut: every stage before it only shifts logits and every stage after
+it only removes candidates, so a forbidden token can never be chosen, and the
+mask consumes no RNG (mirostat/DRY are unperturbed). The compiled
+`Arc<Grammar>` is per request; the mutable `GrammarState` is per run, exactly
+like `MirostatState`. Token advancement is byte-level correct (a piece may be one
+byte of a multi-byte character); a token whose pending bytes can never complete
+to an accepted codepoint is rejected, EOG is legal only at an accepting state
+with no pending bytes, and **no allowed token** is a loud stop
+(`SampleError::NoAllowedToken`), never an arbitrary token. Unsupported GBNF or
+schema constructs are startup/`400` refusals — never a silent guess; the
+accepted subset and every refusal are catalogued in `docs/GRAMMAR-DESIGN.md`.
+Server: `response_format` (`json_object` / `json_schema`) plus a `grammar`
+extension field; the two together are a `400`. `--spec-draft` + a grammar is
+refused (a verify round samples several rows from one automaton state).
 
 ## Dependencies
 
@@ -206,6 +232,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **Architecture roadmap (system layers: IR, scheduler, allocator, KV, batching, backends — gaps + prioritized backlog)** | `docs/ARCHITECTURE-ROADMAP.md` |
 | **Architecture execution plan (phase-by-phase tickets, acceptance criteria, verification matrix)** | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
+| **Grammar / JSON-schema constrained decoding (F2): accepted subset, refusals, mask position** | `docs/GRAMMAR-DESIGN.md` |
 | Model support roadmap (which model families to port next) | `docs/MODEL-SUPPORT-ROADMAP.md` |
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
 | CLI conversation plan | `docs/CLI-CONVERSATION-PLAN.md` |
