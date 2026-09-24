@@ -2592,6 +2592,77 @@ at execute time), and peak memory was not a number anyone could read.
   `docs/CUDA-BACKEND-DESIGN.md`); the accounting now makes it visible as
   `pool_bytes` vs `live_bytes`.
 
+#### E4 record, S4 (#122, 2026-09-24) — a failed device query is not a zero budget
+
+**What was wrong.** `GraphAllocator::memory_budget` derived CUDA's default budget as
+`CudaState::device_free_bytes() / 4 * 3`, and `CudaState::device_memory` **discarded the
+`cudaMemGetInfo` return code**:
+
+```rust
+let (mut free, mut total) = (0usize, 0usize);
+unsafe { cudaMemGetInfo(&mut free, &mut total) };   // return code dropped
+(free, total)
+```
+
+On failure `free` stayed `0`, so the budget became `Some(0)` and the E4 feasibility gate
+refused **every** later device allocation with
+
+```
+out of Cuda memory: 553 MiB of weights + 0 MiB of pooled buffers + 0 MiB for this
+activation exceeds the 0 byte budget (0 MiB); reduce --n-ctx/--n-batch, …
+```
+
+The refusal was correct *given a 0 budget*; the defect was that a failed query was
+indistinguishable from "the device is full", and the message blamed the budget instead of
+naming the cause. `weights_bytes()` shared the class in the other direction: it summed the
+registry through `.map(…).unwrap_or(0)`, so a **poisoned** lock silently reported **0
+weights** — the fail-*open* twin, which under-charges the same comparison.
+
+**Root cause, and what actually latched the error.** Instrumenting the call
+(`eprintln!` of the return code plus `cudaGetErrorName`/`cudaGetErrorString`) gave
+
+```
+rc=700 name=cudaErrorIllegalAddress desc=an illegal memory access was encountered free=0 total=0
+```
+
+`cudaErrorIllegalAddress` is a **sticky** error: once a kernel in the context performs an
+illegal access, every later CUDA call in the process — `cudaMemGetInfo` included — returns
+700 until the process ends. The origin was then located with
+`compute-sanitizer --tool memcheck` over the failing two-test subset
+(`conversation_real_model_smoke` + `cuda_map_window_costs_no_more_than_the_span_it_replaces`):
+**4 227 errors**, of which 28 were
+
+```
+Invalid __global__ read of size 4 bytes
+    at void fa_prefill_f16kv<(bool)0, (bool)0>(…)+0xe70
+    by thread (64,0,0) in block (0,0,0)
+    Access to 0xf654445fff00 is out of bounds
+    and is 249 bytes after the nearest allocation at 0xf654445ffe00 of size 8 bytes
+    … Host Frame: CudaState::gqa_attn_f16kv
+    … Host Frame: cuda_map_window_costs_no_more_than_the_span_it_replaces
+```
+
+`fa_prefill_f16kv` indexes `q` as `nt` token rows of `nh * hd`
+(`q[t * nh * hd + h * hd + d]`, `t < nt`), but the timing gate's **prefill A/B reused the
+decode phase's single-row `qb` (`nh * hd` elements)** while calling the entry with
+`nt = 512`, so the kernel walked up to ~7 MB past the buffer. When those device pages
+happened to be mapped the read was silent garbage; when the heap layout left a hole
+unmapped it faulted and the context was gone for the rest of the process. Which of the two
+happened is a **test-order artifact** — the latch needs the conversation test(s) *and* the
+map-window test ahead of the next E4 allocation (subset matrix, same binary:
+`map` alone → 1 passed, no 700; `map+packed` → rc 700 count 0; `ctx+map+packed` → rc 700) —
+but the **masking** is not: any sticky or fatal CUDA error from any cause (a different
+kernel bug, a driver hiccup, an OOM in an earlier call) made `cudaMemGetInfo` fail and
+handed the user a message about a 0-byte budget.
+
+So both readings of the bug are true, and both are fixed: **(a)** a production robustness
+bug — a failed query silently became a 0 budget with a misleading reason; **(b)** a
+test-isolation artifact — a fixture passed an under-sized `q`, and only the test ordering
+decided whether that became a visible fault. The production path sizes `q` as `nt` rows
+(the `Attn` node's input), so the kernel indexing itself is correct.
+
+The fix, its measurements and its honest scope are the next two commits.
+
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 
 **Why.** A prefill was **one** forward over the whole prompt. Two consequences: activation
