@@ -16,11 +16,20 @@ minijinja = { version = "2", default-features = false, features = ["builtins", "
 
 # OpenAI-compatible HTTP server (OPENAI-CHAT-API-PLAN.md, Phase 2+)
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+# `time` + `signal` are F8's (#51): the bounded graceful drain needs
+# `tokio::time::timeout` and the SIGINT/SIGTERM handlers. Both are platform-neutral
+# (no new crate, no new dependency), so the macOS and CUDA builds are unaffected.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
+
+# Test-only. `AsyncReadExt`/`AsyncWriteExt` are what F8's `/metrics` test drives a
+# real HTTP/1.1 request with; the production `tokio` dependency stays without
+# `io-util`, and cargo unifies the feature for the test build only.
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }
 
 [features]
 cuda = []

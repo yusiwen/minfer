@@ -114,14 +114,27 @@ pub fn run_viz(
     }));
 
     let worker_tokenizer = tokenizer.clone();
+    // F8: the viz server publishes into the same registry shape as `minfer serve`
+    // (its own instance — the two commands never run in one process).
+    let metrics = Arc::new(super::metrics::ServerMetrics::new());
+    let worker_metrics = metrics.clone();
     // doc 97: the viz path wires no speculative draft.
     std::thread::spawn(move || {
-        super::chat::worker_loop(model, worker_tokenizer, slots, job_rx, None, None)
+        super::chat::worker_loop(
+            model,
+            worker_tokenizer,
+            slots,
+            job_rx,
+            None,
+            None,
+            worker_metrics,
+        )
     });
 
     let template = super::chat_template_from_gguf(&gguf.parts[0].data);
     let app = Arc::new(AppState {
         job_tx,
+        metrics,
         model_name: gguf
             .parts
             .first()

@@ -78,6 +78,32 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// A vocabulary with no tokens.
+    ///
+    /// Test-only: F8's server tests need an `AppState` (to build the real router
+    /// and drive it over HTTP) without a model on disk. Nothing tokenizes on the
+    /// paths they assert — the drain check runs before tokenization, and
+    /// `/health`, `/v1/models` and `/metrics` never touch the vocabulary — so an
+    /// empty one is honest rather than a stub that could hide a real call.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            id_to_token: Vec::new(),
+            id_to_score: Vec::new(),
+            id_to_type: Vec::new(),
+            vocab: HashMap::new(),
+            merges: HashMap::new(),
+            byte_to_unicode: HashMap::new(),
+            unicode_to_byte: HashMap::new(),
+            special_tokens: HashMap::new(),
+            special_by_first: HashMap::new(),
+            bos_token: 0,
+            eos_token: 0,
+            im_start: 0,
+            im_end: 0,
+        }
+    }
+
     /// Load tokenizer from a GgufContext (re-parses metadata only, no tensor data).
     pub fn load(gguf: &GgufContext) -> Self {
         // Load token strings

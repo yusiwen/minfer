@@ -6,13 +6,15 @@
 
 pub mod batch;
 pub mod chat;
+pub mod metrics;
 pub mod slot;
 pub mod types;
 pub mod viz;
 
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -29,11 +31,15 @@ use crate::models::ModelDef;
 use crate::tokenizer::Tokenizer;
 
 use chat::{Job, StreamEvent};
+use metrics::ServerMetrics;
 use types::{ApiError, ChatCompletionRequest, SamplingParams};
 
 /// Shared server state (handlers only; the worker owns the model + slots).
 pub struct AppState {
     pub job_tx: mpsc::Sender<Job>,
+    /// F8: the observability registry. The handler writes the request-lifecycle
+    /// counters; the worker publishes the queue/engine/KV readings.
+    pub metrics: Arc<ServerMetrics>,
     pub model_name: String,
     /// The whole arena. C7: an admission may repartition it, so the request bound
     /// is this, not `n_ctx_slot` (which is only the startup share a slot holds
@@ -47,18 +53,44 @@ pub struct AppState {
 
 /// Build the axum router (pure OpenAI API; the viz live endpoints live under
 /// `minfer viz`, see `server::viz`).
+///
+/// The two halves are stated and merged **after** `with_state`, so `/metrics`
+/// carries its own `Arc<ServerMetrics>` state and needs neither the tokenizer nor
+/// the job channel: a scrape keeps working while the model is busy, and the
+/// endpoint is testable without a model ([`metrics_router`]).
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let metrics = state.metrics.clone();
+    let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
+        .with_state(state);
+    api.merge(metrics_router(metrics))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
 }
 
-/// Start the server: spawn the inference worker, then serve forever.
-/// `model` and `slots` move into the worker thread; handlers only share the
-/// job channel + tokenizer.
+/// The `/metrics` route on its own state (F8) — see [`router`] for why it is
+/// split out.
+pub fn metrics_router(metrics: Arc<ServerMetrics>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .with_state(metrics)
+}
+
+/// Prometheus text exposition; see [`metrics::render`] for the metric names and
+/// units. Rendering only reads atomics, so scraping cannot perturb generation.
+async fn metrics_handler(State(metrics): State<Arc<ServerMetrics>>) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        metrics.render(),
+    )
+        .into_response()
+}
+
+/// Start the server: spawn the inference worker, then serve until a shutdown
+/// signal, drain with a bound, and return. `model` and `slots` move into the
+/// worker thread; handlers only share the job channel + tokenizer.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     model: Box<dyn ModelDef>,
     tokenizer: Tokenizer,
@@ -72,12 +104,25 @@ pub fn run(
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
+    let metrics = Arc::new(ServerMetrics::new());
 
+    // F8: a completion signal, so `run` can wait for the worker *boundedly* after
+    // a clean drain instead of joining it (see `serve_with_shutdown`).
+    let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel::<()>();
     let worker_tokenizer = tokenizer.clone();
+    let worker_metrics = metrics.clone();
     let worker = std::thread::spawn(move || {
-        chat::worker_loop(model, worker_tokenizer, slots, job_rx, spec_cfg, slots_file)
+        chat::worker_loop(
+            model,
+            worker_tokenizer,
+            slots,
+            job_rx,
+            spec_cfg,
+            slots_file,
+            worker_metrics,
+        );
+        let _ = worker_done_tx.send(());
     });
-    let _ = worker;
 
     let template = chat_template_from_gguf(&gguf.parts[0].data);
     let model_name = gguf
@@ -88,6 +133,7 @@ pub fn run(
 
     let state = Arc::new(AppState {
         job_tx,
+        metrics: metrics.clone(),
         model_name,
         n_ctx,
         n_ctx_slot,
@@ -96,8 +142,11 @@ pub fn run(
         created: now_unix(),
     });
 
+    let drain = Duration::from_millis(drain_deadline_ms(
+        std::env::var("MINFER_DRAIN_MS").ok().as_deref(),
+    ));
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.block_on(async move {
+    let outcome = runtime.block_on(async move {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -106,8 +155,176 @@ pub fn run(
                 std::process::exit(1);
             });
         eprintln!("minfer server listening on http://{addr}");
-        axum::serve(listener, router(state)).await.expect("server");
+        eprintln!(
+            "[server] graceful drain: on SIGINT/SIGTERM, new requests are refused and in-flight \
+             requests get up to {} ms (MINFER_DRAIN_MS)",
+            drain.as_millis()
+        );
+        serve_with_shutdown(listener, router(state), metrics.clone(), drain).await
     });
+
+    // Only a clean drain is worth waiting for the worker at all, and even then
+    // bounded: an SSE client that never disconnects must not be able to keep the
+    // process alive (the ticket's named trap). A forced drain returns immediately.
+    if outcome == DrainOutcome::Clean {
+        match worker_done_rx.recv_timeout(drain) {
+            Ok(()) => eprintln!("[server] worker stopped; exiting"),
+            Err(_) => eprintln!(
+                "[server] worker did not stop within {} ms after a clean drain; exiting anyway",
+                drain.as_millis()
+            ),
+        }
+    }
+    let _ = worker;
+}
+
+/// What a drain did: every in-flight request finished, or the deadline expired
+/// with `in_flight` still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    Clean,
+    Forced { in_flight: u64 },
+}
+
+/// `MINFER_DRAIN_MS` — how long a graceful drain may take. Default 30 s.
+///
+/// A value that is not a whole number of milliseconds is reported and the
+/// default is used: silently clamping a typo to 0 would turn every shutdown into
+/// an abrupt one, which is the opposite of what the flag is for. Pure, so the
+/// parse is unit-tested without a server.
+pub fn drain_deadline_ms(raw: Option<&str>) -> u64 {
+    const DEFAULT: u64 = 30_000;
+    match raw {
+        None => DEFAULT,
+        Some(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            eprintln!(
+                "[server] MINFER_DRAIN_MS={v:?} is not a whole number of milliseconds; \
+                 using {DEFAULT}"
+            );
+            DEFAULT
+        }),
+    }
+}
+
+/// Wait for `done` (the graceful server future) up to `deadline`, then report
+/// what was still in flight.
+///
+/// This is the **bounded** half of the drain: the alternative — awaiting the
+/// serve future unboundedly, then joining the worker — hangs for as long as the
+/// slowest client keeps its connection (an SSE stream can be forever), because
+/// that client's handler holds an `Arc<AppState>` and therefore keeps the job
+/// channel's sender side open. Split out from [`serve_with_shutdown`] so the
+/// bound itself is a unit test with no socket and no model.
+pub async fn bounded_drain<F>(done: F, metrics: &ServerMetrics, deadline: Duration) -> DrainOutcome
+where
+    F: std::future::Future<Output = ()>,
+{
+    match tokio::time::timeout(deadline, done).await {
+        Ok(()) => DrainOutcome::Clean,
+        Err(_) => DrainOutcome::Forced {
+            in_flight: metrics.in_flight.load(Ordering::SeqCst),
+        },
+    }
+}
+
+/// Serve `app` on `listener` until a shutdown signal, then drain within
+/// `deadline`. Without a signal this never returns — the pre-F8 behaviour.
+pub async fn serve_with_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    metrics: Arc<ServerMetrics>,
+    deadline: Duration,
+) -> DrainOutcome {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_metrics = metrics.clone();
+    tokio::spawn(async move {
+        let sig = shutdown_signal().await;
+        // Set `draining` *before* the watch fires, so a request that races the
+        // signal sees the refusal rather than queueing behind the shutdown.
+        signal_metrics.draining.store(true, Ordering::SeqCst);
+        eprintln!(
+            "[server] {sig}: draining — refusing new requests; {} request(s) in flight, \
+             up to {} ms to finish",
+            signal_metrics.in_flight.load(Ordering::SeqCst),
+            deadline.as_millis()
+        );
+        let _ = shutdown_tx.send(true);
+    });
+
+    // axum's graceful shutdown stops accepting connections and runs the in-flight
+    // ones to completion; the watch makes it start on our signal.
+    let mut serve_rx = shutdown_rx.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        while !*serve_rx.borrow() {
+            if serve_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    let serve_task = tokio::spawn(async move {
+        if let Err(e) = server.await {
+            eprintln!("[server] serve error: {e}");
+        }
+    });
+
+    // Phase 1 — wait for the signal. Without one this is the old `serve(...).await`:
+    // the loop never ends.
+    let mut wait_rx = shutdown_rx.clone();
+    while !*wait_rx.borrow() {
+        if wait_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // Phase 2 — bounded drain.
+    let outcome = bounded_drain(
+        async move {
+            let _ = serve_task.await;
+        },
+        &metrics,
+        deadline,
+    )
+    .await;
+    match outcome {
+        DrainOutcome::Clean => {
+            eprintln!("[server] drain complete: every in-flight request finished")
+        }
+        DrainOutcome::Forced { in_flight } => {
+            metrics.drain_abandoned.store(in_flight, Ordering::SeqCst);
+            eprintln!(
+                "[server] drain deadline ({} ms) reached with {in_flight} request(s) still in \
+                 flight; abandoning them and exiting",
+                deadline.as_millis()
+            );
+        }
+    }
+    outcome
+}
+
+/// Wait for SIGINT or SIGTERM, naming which one arrived.
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // Cannot listen for SIGTERM: keep SIGINT working rather than dying at
+            // startup, and say why.
+            eprintln!("[server] cannot install the SIGTERM handler ({e}); SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
 }
 
 /// C8b S2/S4 A/B gate: `MINFER_NO_KV_SHARE=1` (presence-checked, the campaign's
@@ -141,6 +358,16 @@ pub(crate) fn chat_template_from_gguf(data: &[u8]) -> Option<String> {
 // === Handlers ===
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> Response {
+    // F8: a shutdown refuses new work immediately — the drain waits for what is
+    // already accepted and nothing else, so a request that arrived after the
+    // signal must not extend the deadline.
+    if state.metrics.draining.load(Ordering::SeqCst) {
+        state
+            .metrics
+            .requests_rejected_total
+            .fetch_add(1, Ordering::SeqCst);
+        return error_response(&ApiError::unavailable("server is draining"));
+    }
     let req = match ChatCompletionRequest::parse(body.as_bytes()) {
         Ok(r) => r,
         Err(e) => return error_response(&e),
@@ -202,12 +429,22 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         tx,
     };
     if state.job_tx.send(job).await.is_err() {
+        state
+            .metrics
+            .requests_rejected_total
+            .fetch_add(1, Ordering::SeqCst);
         return error_response(&ApiError::unavailable("server shutting down"));
     }
+    state.metrics.requests_total.fetch_add(1, Ordering::SeqCst);
+    state.metrics.in_flight.fetch_add(1, Ordering::SeqCst);
+    // F8: `in_flight` falls when the response is finished — the body sent, the SSE
+    // stream closed, or the client gone. That is the set a drain waits for.
+    let guard = InFlight::new(state.metrics.clone());
 
     if stream {
-        stream_response(&id, &model_name, created, rx)
+        stream_response(&id, &model_name, created, rx, guard)
     } else {
+        let _guard = guard;
         match collect_response(rx).await {
             Ok((text, reason, completion_tokens)) => {
                 let resp = types::build_response(
@@ -223,6 +460,27 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
             }
             Err(e) => error_response(&e),
         }
+    }
+}
+
+/// F8: one accepted request, counted until its response is finished. Dropping
+/// this is what makes `in_flight` fall, and therefore what a graceful drain
+/// waits for — including the streaming path, where the guard is owned by the SSE
+/// stream and drops when the client is done or disconnects.
+struct InFlight(Arc<ServerMetrics>);
+
+impl InFlight {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        Self(metrics)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0
+            .requests_completed_total
+            .fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -247,11 +505,16 @@ async fn collect_response(
 }
 
 /// SSE stream: role chunk -> content chunks -> finish chunk -> [DONE].
+///
+/// `guard` rides the stream so `in_flight` only falls when the stream is dropped
+/// (client done, or disconnected mid-answer) — dropping it here instead would
+/// report the request finished while its tokens are still being written.
 fn stream_response(
     id: &str,
     model: &str,
     created: i64,
     rx: mpsc::Receiver<StreamEvent>,
+    guard: InFlight,
 ) -> Response {
     let role = ok(Event::default().data(types::chunk_role(id, model, created)));
     let done = ok(Event::default().data("[DONE]"));
@@ -259,8 +522,10 @@ fn stream_response(
     let model_owned = model.to_string();
     let stream = futures_util::stream::iter(vec![role])
         .chain(
-            tokio_stream::wrappers::ReceiverStream::new(rx)
-                .map(move |ev| to_event(&id_owned, &model_owned, created, ev)),
+            tokio_stream::wrappers::ReceiverStream::new(rx).map(move |ev| {
+                let _keep = &guard;
+                to_event(&id_owned, &model_owned, created, ev)
+            }),
         )
         .chain(futures_util::stream::iter(vec![done]));
     Sse::new(stream)
@@ -303,4 +568,213 @@ fn error_response(e: &ApiError) -> Response {
         "error": { "message": e.message, "type": e.error_type, "code": e.status }
     }));
     (status, axum::Json(value)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Bind an ephemeral port and serve `app` on it.
+    async fn serve(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// One real HTTP/1.1 exchange, read to EOF (`Connection: close` makes the
+    /// server close, so `read_to_end` terminates). Returns `(head, body)`.
+    async fn request(addr: SocketAddr, req: &str) -> (String, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").expect("response headers");
+        (head.to_string(), body.to_string())
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (String, String) {
+        request(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: minfer\r\nConnection: close\r\n\r\n"),
+        )
+        .await
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (String, String) {
+        request(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: minfer\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await
+    }
+
+    /// An `AppState` with no model: enough for the real router (F8's tests never
+    /// tokenize — see `Tokenizer::empty`). The returned receiver must stay alive
+    /// or `job_tx.send` fails, which is a different failure from the one under
+    /// test.
+    fn app_state(metrics: Arc<ServerMetrics>) -> (Arc<AppState>, mpsc::Receiver<Job>) {
+        let (job_tx, job_rx) = mpsc::channel::<Job>(4);
+        let state = Arc::new(AppState {
+            job_tx,
+            metrics,
+            model_name: "test-model".to_string(),
+            n_ctx: 64,
+            n_ctx_slot: 64,
+            tokenizer: Arc::new(Tokenizer::empty()),
+            chat_template: None,
+            created: 0,
+        });
+        (state, job_rx)
+    }
+
+    /// F8: `/metrics` over a real HTTP connection, with live numbers in it.
+    #[tokio::test]
+    async fn metrics_endpoint_renders_over_http() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.requests_total.store(2, Ordering::SeqCst);
+        metrics.jobs_admitted_total.store(1, Ordering::SeqCst);
+        metrics.publish_kv(&metrics::KvSnapshot {
+            layers: 24,
+            rows: 512,
+            region_bytes: 1 << 20,
+            weights_bytes: 999,
+            packed: true,
+            ..metrics::KvSnapshot::default()
+        });
+        let addr = serve(metrics_router(metrics.clone())).await;
+        let (head, body) = get(addr, "/metrics").await;
+
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+            "content type: {head}"
+        );
+        assert!(body.contains("# TYPE minfer_requests_total counter\n"));
+        assert!(body.contains("minfer_requests_total 2\n"));
+        assert!(body.contains("minfer_queue_depth 1\n"));
+        assert!(body.contains("minfer_kv_layers 24\n"));
+        assert!(body.contains("minfer_kv_rows 512\n"));
+        assert!(body.contains("minfer_kv_packed 1\n"));
+        assert!(body.contains("minfer_memory_weights_bytes 999\n"));
+    }
+
+    /// The full production router carries `/metrics` (merged from its own state),
+    /// and the pre-existing endpoints are untouched.
+    #[tokio::test]
+    async fn the_full_router_serves_metrics_health_and_models() {
+        let metrics = Arc::new(ServerMetrics::new());
+        let (state, _rx) = app_state(metrics.clone());
+        let addr = serve(router(state)).await;
+
+        let (head, body) = get(addr, "/metrics").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(body.contains("minfer_requests_total"));
+
+        let (head, body) = get(addr, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(body.contains("\"status\":\"ok\""), "{body}");
+
+        let (head, body) = get(addr, "/v1/models").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(body.contains("test-model"), "{body}");
+    }
+
+    /// F8: once a shutdown starts, new work is refused with `503` (not queued
+    /// behind the drain), the refusal is counted, and a scrape shows it.
+    #[tokio::test]
+    async fn a_draining_server_refuses_new_work_and_says_so_in_metrics() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.draining.store(true, Ordering::SeqCst);
+        let (state, _rx) = app_state(metrics.clone());
+        let addr = serve(router(state)).await;
+
+        let (head, body) = post_json(
+            addr,
+            "/v1/chat/completions",
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 503"), "status line: {head}");
+        assert!(body.contains("draining"), "body: {body}");
+        assert_eq!(metrics.requests_rejected_total.load(Ordering::SeqCst), 1);
+        // Nothing was queued, so nothing is in flight.
+        assert_eq!(metrics.requests_total.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.in_flight.load(Ordering::SeqCst), 0);
+
+        let (_, body) = get(addr, "/metrics").await;
+        assert!(body.contains("minfer_draining 1\n"), "{body}");
+        assert!(
+            body.contains("minfer_requests_rejected_total 1\n"),
+            "{body}"
+        );
+    }
+
+    /// A drain that finishes in time reports `Clean`.
+    #[tokio::test]
+    async fn bounded_drain_is_clean_when_the_work_ends_in_time() {
+        let metrics = ServerMetrics::new();
+        let out = bounded_drain(async {}, &metrics, Duration::from_millis(500)).await;
+        assert_eq!(out, DrainOutcome::Clean);
+    }
+
+    /// And a drain that does not finish is **bounded** and names what it left:
+    /// the serve future is `pending`, so only the deadline can end the wait.
+    #[tokio::test]
+    async fn bounded_drain_times_out_and_reports_the_abandoned_requests() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.in_flight.store(3, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let out = bounded_drain(
+            std::future::pending::<()>(),
+            &metrics,
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert_eq!(out, DrainOutcome::Forced { in_flight: 3 });
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "must wait out the deadline, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must be bounded, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn drain_deadline_defaults_and_reports_a_bad_value() {
+        assert_eq!(drain_deadline_ms(None), 30_000);
+        assert_eq!(drain_deadline_ms(Some("250")), 250);
+        assert_eq!(drain_deadline_ms(Some(" 100 ")), 100);
+        assert_eq!(drain_deadline_ms(Some("soon")), 30_000);
+        assert_eq!(drain_deadline_ms(Some("-1")), 30_000);
+        // 0 is a legitimate "stop now" and must not be read as "unset".
+        assert_eq!(drain_deadline_ms(Some("0")), 0);
+    }
+
+    /// The in-flight guard is what makes `in_flight` fall, and it is also what a
+    /// drain waits on — dropping it twice would break the count.
+    #[test]
+    fn the_in_flight_guard_counts_exactly_one_request() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.in_flight.store(1, Ordering::SeqCst);
+        {
+            let _g = InFlight::new(metrics.clone());
+            assert_eq!(metrics.in_flight.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(metrics.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.requests_completed_total.load(Ordering::SeqCst), 1);
+    }
 }
