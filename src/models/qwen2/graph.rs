@@ -4352,16 +4352,18 @@ mod tail_tests {
                 .unwrap_or(model.special_tokens().eos),
             seed: 42,
             n_ctx: 1024,
+            mirostat_tau: 5.0,
             system_prompt: None,
         };
         let greedy = crate::conversation::TurnParams {
             n_predict: 16,
-            temp: 0.0,
-            top_k: 1,
-            top_p: 1.0,
-            repeat_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            sampler: crate::sampler::SamplerConfig {
+                temp: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repeat_penalty: 1.0,
+                ..crate::sampler::SamplerConfig::default()
+            },
             stop_strings: Vec::new(),
         };
         use crate::conversation::Engine as _;
@@ -4378,6 +4380,7 @@ mod tail_tests {
                 .unwrap_or(model.special_tokens().eos),
             seed: 42,
             n_ctx: 1024,
+            mirostat_tau: 5.0,
             system_prompt: None,
         };
         let mut conv_a = crate::conversation::Conversation::new(spec_a);
@@ -4425,6 +4428,7 @@ mod tail_tests {
                 .unwrap_or(model.special_tokens().eos),
             seed: 42,
             n_ctx: 1024,
+            mirostat_tau: 5.0,
             system_prompt: None,
         };
         let mut conv_b = crate::conversation::Conversation::new(spec_b);

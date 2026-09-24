@@ -146,7 +146,15 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         Err(e) => return error_response(&e),
     };
     let stream = req.stream.unwrap_or(false);
-    let params: SamplingParams = req.resolve(rand::random::<u64>());
+    let params: SamplingParams = match req.resolve(rand::random::<u64>()) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    // F3 (#48): refuse a nonsensical sampler configuration as a 400 before the
+    // request occupies a worker slot.
+    if let Err(e) = params.validate(state.tokenizer.vocab_size()) {
+        return error_response(&e);
+    }
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = now_unix(); // per-request timestamp (OpenAI semantics)
     let model_name = req

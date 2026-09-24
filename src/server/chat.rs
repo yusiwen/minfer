@@ -235,6 +235,10 @@ fn generate_seq(
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler_recent_window(input_ids, REPEAT_LAST_N);
+    // F3 (#48): the request's sampler configuration, built once, plus mirostat's
+    // per-request state (`mu`); both are inert unless a new knob is set.
+    let cfg = params.sampler_config();
+    let mut mirostat = crate::sampler::MirostatState::new(cfg.mirostat_tau);
 
     let stop_bytes: Vec<Vec<u8>> = params
         .stop_strings
@@ -300,15 +304,11 @@ fn generate_seq(
             let seed_id = match spec_seed.take() {
                 Some(id) => id,
                 None => {
-                    let sampled = crate::sampler::sample_with_penalties(
+                    let sampled = crate::sampler::sample_with_config(
                         &mut logits,
-                        params.temp,
-                        params.top_k,
-                        params.top_p,
-                        params.repeat_penalty,
-                        params.frequency_penalty,
-                        params.presence_penalty,
+                        &cfg,
                         &prev_tokens,
+                        &mut mirostat,
                         &mut rng,
                     );
                     let id = sampled.token_id;
@@ -347,14 +347,7 @@ fn generate_seq(
                     id
                 }
             };
-            let sparams = crate::spec::SpecSampler {
-                temp: params.temp,
-                top_k: params.top_k,
-                top_p: params.top_p,
-                repeat_penalty: params.repeat_penalty,
-                frequency_penalty: params.frequency_penalty,
-                presence_penalty: params.presence_penalty,
-            };
+            let sparams = crate::spec::SpecSampler { cfg: cfg.clone() };
             let toks = sp.round(
                 &*model,
                 cache,
@@ -428,15 +421,11 @@ fn generate_seq(
             continue;
         }
 
-        let sampled = crate::sampler::sample_with_penalties(
+        let sampled = crate::sampler::sample_with_config(
             &mut logits,
-            params.temp,
-            params.top_k,
-            params.top_p,
-            params.repeat_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
+            &cfg,
             &prev_tokens,
+            &mut mirostat,
             &mut rng,
         );
         if is_stop_token(sampled.token_id, &special) {
@@ -781,6 +770,17 @@ fn worker_loop_serial(
         };
         let slot = &mut slots[slot_idx];
         let slot_spec = slot_specs[slot_idx].as_mut();
+        // F3 (#48): mirostat's per-step state has no home in a verify round;
+        // refuse the combination loudly instead of sampling without it.
+        if slot_spec.is_some() && job.params.mirostat != crate::sampler::MirostatMode::Off {
+            let _ = job
+                .tx
+                .blocking_send(StreamEvent::Err(ApiError::invalid_request(
+                    "mirostat cannot be combined with speculative decoding (--spec-draft)"
+                        .to_string(),
+                )));
+            continue;
+        }
         slot.state = SlotState::Processing;
         // B2: the slot KEEPS its cache and its `cached_tokens` record across
         // requests; `generate_seq` reuses the KV only when the new prompt
