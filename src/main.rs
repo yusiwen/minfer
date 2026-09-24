@@ -159,6 +159,10 @@ fn print_usage(prog: &str) {
     );
     eprintln!("                       1 = single-threaded; affects the CPU-only path)");
     eprintln!("  --n-slots <N>        server slot count (default 1)");
+    eprintln!(
+        "  --slots-file <PATH>  server: resume the slot contexts from PATH and rewrite it\n\
+         \x20                      after every completed request (C5 S2; batched engine only)"
+    );
     eprintln!("  --dump-graph <PATH>       export the compute graph as Graphviz DOT and exit");
     eprintln!("  --dump-graph-json <PATH>  export the compute graph as JSON (web visualizer, viz/) and exit");
     eprintln!("  -h, --help           show this help");
@@ -220,6 +224,8 @@ fn main() {
     let mut server_port: u16 = 8080;
     let mut server_n_ctx: usize = params.n_ctx;
     let mut server_n_slots: usize = 1;
+    // C5 S2: the slot snapshot the server resumes from and rewrites on completion.
+    let mut server_slots_file: Option<String> = None;
     // Self-contained viz server: `minfer viz [--port N] <model>`.
     let mut viz_mode = false;
     let mut viz_port: u16 = 8081;
@@ -288,6 +294,12 @@ fn main() {
                         0
                     });
                     crate::kernel::set_cpu_threads(n);
+                }
+                i += 2;
+            }
+            "--slots-file" => {
+                if let Some(v) = next_val(a) {
+                    server_slots_file = Some(v);
                 }
                 i += 2;
             }
@@ -791,6 +803,7 @@ fn main() {
             server_n_ctx,
             server_n_slots,
             server_spec,
+            server_slots_file,
         );
         return;
     }

@@ -67,6 +67,7 @@ pub fn run(
     n_ctx: usize,
     n_slots: usize,
     spec_cfg: Option<crate::spec::SpecConfig>,
+    slots_file: Option<String>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
@@ -74,7 +75,7 @@ pub fn run(
 
     let worker_tokenizer = tokenizer.clone();
     let worker = std::thread::spawn(move || {
-        chat::worker_loop(model, worker_tokenizer, slots, job_rx, spec_cfg)
+        chat::worker_loop(model, worker_tokenizer, slots, job_rx, spec_cfg, slots_file)
     });
     let _ = worker;
 

@@ -130,6 +130,36 @@ struct Run {
     live_on: bool,
 }
 
+/// Version of the slot-table JSON that rides inside the KV container's host section
+/// (C5 S2). A table this build does not understand is refused, never guessed.
+pub const SLOTS_SNAPSHOT_VERSION: u32 = 1;
+
+/// One slot's context in a snapshot: its sequence id, the reservation the rows live in,
+/// and the token sequence those rows hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotRow {
+    pub seq: SeqId,
+    pub start: usize,
+    pub cap: usize,
+    pub cached_tokens: Vec<u32>,
+}
+
+/// The slot table a restart resumes (C5 S2 / E2).
+///
+/// The **in-flight request is deliberately not here**. A `Run` owns the response
+/// channel to a client that a restart has already disconnected, plus its RNG and the
+/// row's logits; none of that survives a process boundary, and pretending otherwise
+/// would mean serving a stream nobody is reading. What survives is the *context*: the
+/// reservation and the tokens each slot's KV rows hold, so a request that arrives after
+/// the restart with the same prefix is admitted onto the restored rows and prefills only
+/// its own delta (B2's cross-request prefix reuse, with the rows coming from disk).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotsSnapshot {
+    pub n_slots: usize,
+    pub n_ctx_total: usize,
+    pub slots: Vec<SlotRow>,
+}
+
 pub struct BatchEngine {
     cache: GraphCache,
     n_ctx_total: usize,
@@ -143,9 +173,17 @@ pub struct BatchEngine {
     /// the activation bound the ticket demands is an observable, not a claim.
     prefill_forwards: usize,
     prefill_max_nt: usize,
+    /// B2/C5 S2: prompt tokens actually **fed** to a prefill (everything a slot did not
+    /// reuse from its KV), summed over requests. The snapshot gate asserts on it: a
+    /// restored context must feed only the request's own delta.
+    prefill_fed: usize,
     /// E3: decode steps run *between* the chunks of a prefill — the interleaving's
     /// observable (0 whenever chunking is off).
     interleaved_ticks: u64,
+    /// C5 S2: where the slot snapshot is written after each completed request.
+    /// `None` = no snapshot (the default). Opt-in, because a snapshot rewrites the
+    /// whole arena — see the cost line the worker prints at startup.
+    slots_file: Option<std::path::PathBuf>,
 }
 
 /// C7: the cells a request wants reserved — pure, so the growth policy is
@@ -228,8 +266,192 @@ impl BatchEngine {
             n_batch: DEFAULT_PREFILL_CHUNK,
             prefill_forwards: 0,
             prefill_max_nt: 0,
+            prefill_fed: 0,
             interleaved_ticks: 0,
+            slots_file: None,
         })
+    }
+
+    /// The slot table as JSON (the KV container's opaque host section).
+    pub fn slots_to_json(&self) -> String {
+        let slots: Vec<serde_json::Value> = self
+            .slots
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "seq": s.seq,
+                    "start": s.start,
+                    "cap": s.cap,
+                    "cached_tokens": s.cached_tokens,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "version": SLOTS_SNAPSHOT_VERSION,
+            "n_slots": self.slots.len(),
+            "n_ctx_total": self.n_ctx_total,
+            "slots": slots,
+        })
+        .to_string()
+    }
+
+    /// Parse a slot table. `None` for anything this build does not understand — the
+    /// caller refuses the snapshot and says why, rather than resuming half of it.
+    pub fn slots_from_json(json: &str) -> Option<SlotsSnapshot> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        if v.get("version")?.as_u64()? != SLOTS_SNAPSHOT_VERSION as u64 {
+            return None;
+        }
+        let slots = v
+            .get("slots")?
+            .as_array()?
+            .iter()
+            .map(|s| {
+                Some(SlotRow {
+                    seq: s.get("seq")?.as_u64()? as SeqId,
+                    start: s.get("start")?.as_u64()? as usize,
+                    cap: s.get("cap")?.as_u64()? as usize,
+                    cached_tokens: s
+                        .get("cached_tokens")?
+                        .as_array()?
+                        .iter()
+                        .map(|t| t.as_u64().map(|n| n as u32))
+                        .collect::<Option<Vec<u32>>>()?,
+                })
+            })
+            .collect::<Option<Vec<SlotRow>>>()?;
+        Some(SlotsSnapshot {
+            n_slots: v.get("n_slots")?.as_u64()? as usize,
+            n_ctx_total: v.get("n_ctx_total")?.as_u64()? as usize,
+            slots,
+        })
+    }
+
+    /// Write the slot table **and** the arena it describes into one file (C5's
+    /// container, with the table as its host section). Returns `(bytes, slots)`.
+    ///
+    /// The snapshot is taken when it is called: a slot whose request is still running
+    /// snapshots the rows it has *written* (`cached_tokens` tracks exactly those), so a
+    /// restored server serves a client that resends its conversation.
+    pub fn save_slots(&mut self, path: &std::path::Path) -> Result<(u64, usize), String> {
+        let host = self.slots_to_json();
+        let report = self
+            .cache
+            .alloc()
+            .kv_save_with_host(path, host.as_bytes())?;
+        Ok((report.bytes, self.slots.len()))
+    }
+
+    /// Restore a snapshot written by [`Self::save_slots`] (C5 S2).
+    ///
+    /// Refused, loudly and without touching the arena, unless the file describes *this*
+    /// run: another `--n-slots`/`--n-ctx`, another model, another KV element type (the
+    /// container's own header checks), a slot table whose sequence ids or written extents
+    /// disagree with the arena it rode in with, or a version this build does not know.
+    pub fn load_slots(
+        &mut self,
+        path: &std::path::Path,
+        model: &dyn crate::models::ModelDef,
+    ) -> Result<(usize, u64), String> {
+        let expect = crate::graph::kvsession::expect_for(model, self.n_ctx_total);
+        let (host, report) = self.cache.alloc().kv_load_with_host(path, &expect)?;
+        let json = String::from_utf8_lossy(&host).into_owned();
+        let Some(snap) = Self::slots_from_json(&json) else {
+            return Err(format!(
+                "{} carries no slot table this build understands (version {} expected)",
+                path.display(),
+                SLOTS_SNAPSHOT_VERSION
+            ));
+        };
+        if snap.n_slots != self.slots.len() {
+            return Err(format!(
+                "{} was written by a {}-slot server, this one has {} (--n-slots)",
+                path.display(),
+                snap.n_slots,
+                self.slots.len()
+            ));
+        }
+        if snap.n_ctx_total != self.n_ctx_total {
+            return Err(format!(
+                "{} was written with n_ctx {}, this server has {} (--n-ctx)",
+                path.display(),
+                snap.n_ctx_total,
+                self.n_ctx_total
+            ));
+        }
+        for (i, row) in snap.slots.iter().enumerate() {
+            if row.seq != self.slots[i].seq {
+                return Err(format!(
+                    "{}: slot {i} names sequence {}, this server reserved {}",
+                    path.display(),
+                    row.seq,
+                    self.slots[i].seq
+                ));
+            }
+            let restored = self.cache.alloc().kv_seq_slot(row.seq).ok_or_else(|| {
+                format!(
+                    "{}: slot {i} names sequence {} and the arena has no such run",
+                    path.display(),
+                    row.seq
+                )
+            })?;
+            // The mirror may be *shorter* than the rows: a failed request clears it
+            // (the rows it wrote are never read again, and the next request rewrites
+            // them from `cached_tokens.len()` on). It may never be longer — that would
+            // claim rows the arena does not have.
+            if row.cached_tokens.len() > restored.written {
+                return Err(format!(
+                    "{}: slot {i}'s slot table claims {} token(s) but its rows hold only {} \
+                     written row(s) — the two halves of the file disagree",
+                    path.display(),
+                    row.cached_tokens.len(),
+                    restored.written
+                ));
+            }
+            if row.cached_tokens.len() > restored.cap {
+                return Err(format!(
+                    "{}: slot {i} claims {} token(s) in a {}-cell reservation",
+                    path.display(),
+                    row.cached_tokens.len(),
+                    restored.cap
+                ));
+            }
+            // The snapshot is authoritative about where its rows are.
+            self.slots[i].start = restored.start;
+            self.slots[i].cap = restored.cap;
+            self.slots[i].cached_tokens = row.cached_tokens.clone();
+        }
+        Ok((snap.slots.len(), report.bytes))
+    }
+
+    /// Configure (or clear) the slot snapshot file (C5 S2). The worker sets this once,
+    /// before the serve loop; every completed request then rewrites it.
+    pub fn set_slots_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.slots_file = path;
+    }
+
+    /// Bytes a snapshot of this arena takes (the cost of one save), for the startup line.
+    pub fn snapshot_bytes(&mut self) -> usize {
+        self.cache.alloc().kv_region_bytes()
+    }
+
+    /// Write the snapshot when one is configured (C5 S2). Called when a request
+    /// **completes**: that is when the slot's context is stable, and it is also the
+    /// last moment the rows are known-good, so a server killed without warning still
+    /// resumes the conversations that had finished. The request that was in flight is
+    /// the one thing a snapshot cannot carry (its response stream belongs to a client a
+    /// restart has disconnected) and it is simply re-sent by that client.
+    fn save_slots_if_configured(&mut self) {
+        let Some(path) = self.slots_file.clone() else {
+            return;
+        };
+        match self.save_slots(&path) {
+            Ok((bytes, slots)) => eprintln!(
+                "[server] slot snapshot: {slots} slot(s), {bytes} byte(s) → {}",
+                path.display()
+            ),
+            Err(e) => eprintln!("[server] slot snapshot failed ({}): {e}", path.display()),
+        }
     }
 
     /// C7: make slot `idx` hold at least `want` cells, by **reclaiming idle
@@ -644,6 +866,11 @@ impl BatchEngine {
         (self.prefill_max_nt, self.prefill_forwards)
     }
 
+    /// B2/C5 S2: prompt tokens this engine has fed to prefills (see `prefill_fed`).
+    pub fn prefill_fed(&self) -> usize {
+        self.prefill_fed
+    }
+
     /// E3: decode steps run between the chunks of a prefill (0 with chunking off).
     pub fn interleaved_ticks(&self) -> u64 {
         self.interleaved_ticks
@@ -764,6 +991,7 @@ impl BatchEngine {
     /// Put a request into `slot` with the logits of its last prompt row.
     fn install_run(&mut self, idx: usize, job: Job, last_logits: Vec<f32>, feed_from: usize) {
         let nt = job.input_ids.len();
+        self.prefill_fed += nt - feed_from;
         let track = !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
         if track {
             eprintln!(
@@ -1032,6 +1260,7 @@ impl BatchEngine {
         // an ending token is never queued), so rows `0..current_pos` hold exactly
         // `cached_tokens`.
         debug_assert_eq!(self.slots[idx].cached_tokens.len(), run.current_pos);
+        self.save_slots_if_configured();
     }
 }
 
@@ -1859,6 +2088,182 @@ mod tests {
 
     /// E3 gate helper: the bytes of `Text` a slot has been sent so far, drained
     /// without blocking (the events are already queued by the engine).
+    /// C5 S2: the slot table is JSON in the container's host section — a version this
+    /// build does not know, or a shape it cannot read, is `None` (the caller refuses the
+    /// snapshot), never a half-parsed table.
+    #[test]
+    fn a_slot_table_round_trips_and_refuses_what_it_cannot_read() {
+        let json = r#"{"version":1,"n_slots":2,"n_ctx_total":64,
+            "slots":[{"seq":1,"start":0,"cap":32,"cached_tokens":[5,6,7]},
+                     {"seq":2,"start":32,"cap":32,"cached_tokens":[]}]}"#;
+        let snap = BatchEngine::slots_from_json(json).expect("parses");
+        assert_eq!(snap.n_slots, 2);
+        assert_eq!(snap.n_ctx_total, 64);
+        assert_eq!(snap.slots[0].seq, 1);
+        assert_eq!(snap.slots[0].cached_tokens, vec![5, 6, 7]);
+        assert!(snap.slots[1].cached_tokens.is_empty());
+
+        // Another version, a missing field, and a non-JSON blob are all `None`.
+        let bumped = json.replace("\"version\":1", "\"version\":2");
+        assert!(BatchEngine::slots_from_json(&bumped).is_none());
+        assert!(BatchEngine::slots_from_json(r#"{"version":1,"n_slots":1}"#).is_none());
+        assert!(BatchEngine::slots_from_json("not json").is_none());
+    }
+
+    /// C5 S2's acceptance on a real model: a snapshot written by one engine is resumed by
+    /// another with the history **not** re-prefilled, and the continuation matches the run
+    /// that never stopped. A snapshot from another `--n-slots` is refused loudly.
+    #[test]
+    #[ignore = "requires the cached 0.5B model and writes a snapshot file"]
+    fn a_slot_snapshot_resumes_the_context_without_re_prefilling() {
+        let Some(path) = cached_model() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the slot-snapshot gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        #[cfg(feature = "cuda")]
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
+        let n_ctx = 512usize;
+        let n_slots = 2usize;
+        let file = std::env::temp_dir().join(format!(
+            "minfer-c5s2-slots-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&file).ok();
+
+        let prompt = tok.encode("The capital of France is");
+        let second = tok.encode(" and the capital of Japan is");
+
+        // Run one prompt to completion and let the engine write the snapshot.
+        let (text_a, tokens_a, cold_fed) = {
+            let mut a = BatchEngine::new(&*model, n_slots, n_ctx).expect("engine");
+            a.set_slots_file(Some(file.clone()));
+            let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+            a.submit(
+                &*model,
+                &tok,
+                Job {
+                    input_ids: prompt.clone(),
+                    params: sampling_params(4),
+                    tx,
+                },
+            )
+            .expect("submit");
+            while a.busy() {
+                a.tick(&*model, &tok).expect("tick");
+            }
+            let cold_fed = a.prefill_fed();
+            assert_eq!(
+                cold_fed,
+                prompt.len(),
+                "the cold run must feed the whole prompt"
+            );
+            let mut text = String::new();
+            let mut tokens = 0usize;
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    StreamEvent::Text(t) => text.push_str(&t),
+                    StreamEvent::Finish { tokens: n, .. } => tokens = n,
+                    _ => {}
+                }
+            }
+            (text, tokens, cold_fed)
+        };
+        assert!(file.exists(), "the snapshot must be written on completion");
+
+        // A fresh engine resumes it: the same prompt prefills **nothing**.
+        let mut b = BatchEngine::new(&*model, n_slots, n_ctx).expect("engine");
+        let (slots, bytes) = b
+            .load_slots(&file, &*model)
+            .unwrap_or_else(|e| panic!("load_slots: {e}"));
+        assert_eq!(slots, n_slots);
+        assert!(bytes > 0);
+        let fed_before = b.prefill_fed();
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
+        b.submit(
+            &*model,
+            &tok,
+            Job {
+                input_ids: prompt.clone(),
+                params: sampling_params(4),
+                tx,
+            },
+        )
+        .expect("submit");
+        while b.busy() {
+            b.tick(&*model, &tok).expect("tick");
+        }
+        let warm_fed = b.prefill_fed() - fed_before;
+        assert_eq!(
+            warm_fed,
+            1,
+            "the snapshot holds the history, so only the query token is fed \
+             (the cold run fed {cold_fed} of {} token(s))",
+            prompt.len()
+        );
+        let mut text_b = String::new();
+        let mut tokens_b = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Text(t) => text_b.push_str(&t),
+                StreamEvent::Finish { tokens: n, .. } => tokens_b = n,
+                _ => {}
+            }
+        }
+        assert_eq!(text_a, text_b, "the resumed continuation must match");
+        assert_eq!(tokens_a, tokens_b);
+
+        // ... and its *next* turn prefills only the delta, not the history: the
+        // continuation carries the whole conversation, so a re-render would feed
+        // `prompt + second` tokens.
+        let mut continuation = prompt.clone();
+        continuation.extend_from_slice(&second);
+        let before_delta = b.prefill_fed();
+        let (tx, _rx) = mpsc::channel::<StreamEvent>(1024);
+        b.submit(
+            &*model,
+            &tok,
+            Job {
+                input_ids: continuation.clone(),
+                params: sampling_params(2),
+                tx,
+            },
+        )
+        .expect("submit");
+        while b.busy() {
+            b.tick(&*model, &tok).expect("tick");
+        }
+        let fed_delta = b.prefill_fed() - before_delta;
+        assert!(fed_delta > 0, "the delta still needs a forward");
+        assert!(
+            fed_delta < continuation.len(),
+            "the next turn fed {fed_delta} of {} token(s) — the history came from the snapshot",
+            continuation.len()
+        );
+
+        // A snapshot from another --n-slots is refused, loudly, naming both.
+        let mut one = BatchEngine::new(&*model, 1, n_ctx).expect("engine");
+        let err = one
+            .load_slots(&file, &*model)
+            .expect_err("a 2-slot snapshot must not load into a 1-slot server");
+        assert!(err.contains("2-slot"), "{err}");
+        assert!(err.contains("--n-slots"), "{err}");
+        // ... and one from another --n-ctx, too.
+        let mut wide = BatchEngine::new(&*model, n_slots, n_ctx * 2).expect("engine");
+        let err = wide
+            .load_slots(&file, &*model)
+            .expect_err("an n_ctx mismatch must be refused");
+        assert!(
+            err.contains(&n_ctx.to_string()) && err.contains(&(n_ctx * 2).to_string()),
+            "the refusal must name both context lengths: {err}"
+        );
+
+        std::fs::remove_file(&file).ok();
+    }
+
     fn drain_text_len(rx: &mut mpsc::Receiver<StreamEvent>) -> usize {
         let mut n = 0;
         while let Ok(ev) = rx.try_recv() {

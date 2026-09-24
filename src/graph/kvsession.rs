@@ -79,6 +79,29 @@ pub struct KvSessionExpect {
     pub n_embd: usize,
 }
 
+/// The backend a model's device uses (a session is one arena, so the two must agree).
+pub fn backend_of(device: crate::models::Device) -> Backend {
+    match device {
+        crate::models::Device::Cpu => Backend::CPU,
+        crate::models::Device::Metal => Backend::Metal,
+        crate::models::Device::Cuda => Backend::Cuda,
+    }
+}
+
+/// What a KV session must match to be loadable by `model` at `n_ctx` (C5): the device
+/// the rows will live on, the context length, and the model's logical KV row width.
+///
+/// One function, so the CLI's `--session` companion, the server's slot snapshot and the
+/// gates cannot disagree about what "this file describes this run" means — the three of
+/// them used to spell it out separately.
+pub fn expect_for(model: &dyn crate::models::ModelDef, n_ctx: usize) -> KvSessionExpect {
+    KvSessionExpect {
+        backend: backend_of(model.device()),
+        n_ctx,
+        n_embd: model.n_kv_embd(),
+    }
+}
+
 /// What a save wrote or a load read (the caller logs it; the gates assert it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvSessionReport {
