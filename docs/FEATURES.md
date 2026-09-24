@@ -60,6 +60,30 @@ Append-only KV + incremental chat-template rendering: each turn only prefills th
 
 `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`, and `/metrics` — a Prometheus text snapshot of request counts, queue depth, live KV/arena occupancy and (under `MINFER_OP_TIMING`) per-op seconds; multi-slot with queued serial execution; SIGINT/SIGTERM drain bounded by `MINFER_DRAIN_MS`. Plan: [OPENAI-CHAT-API-PLAN.md](./OPENAI-CHAT-API-PLAN.md), F8 record: [ARCHITECTURE-EXECUTION-PLAN.md](./ARCHITECTURE-EXECUTION-PLAN.md).
 
+### Constrained decoding — grammar and JSON Schema (F2)
+
+A GBNF-style grammar or a JSON Schema is compiled **once per request** into a pushdown automaton
+that masks the logits inside the one sampler pipeline, so decoding cannot leave the accepted
+language.
+
+- GBNF subset: rules, string literals, character classes with negation, `.`, grouping, alternation,
+  `*`/`+`/`?`, repetition ranges `{m}`/`{m,}`/`{m,n}`, and `#` comments.
+- JSON Schema subset: `type` (string or array), `enum`, `const`, object
+  `properties`/`required`/`additionalProperties`, array `items`/`prefixItems`/`minItems`/`maxItems`,
+  strings, integer bounds (inclusive and exclusive), numbers, booleans, null, `anyOf`/`oneOf`, and
+  `$defs` + local `$ref` (recursive schemas work).
+- Anything outside the subset is a **loud refusal** naming the construct (CLI startup error or HTTP
+  `400`) — never a silent guess. The catalogues are in
+  [GRAMMAR-DESIGN.md](./GRAMMAR-DESIGN.md).
+- Token advancement is byte-level correct: a token whose piece is one byte of a multi-byte
+  character is handled, a token that a rule only partially accepts is rejected with its longest
+  accepted prefix named, end-of-generation is legal only at a complete state, and "no token is
+  allowed" stops with a printed reason instead of emitting an arbitrary token.
+- Surfaces: CLI `--grammar`/`--grammar-str`/`--json-schema`/`--json-schema-str`; the server's
+  `response_format` (`json_object` / `json_schema`) and a `grammar` extension field. The mask is
+  cached per automaton state and computed with a DFA-style transition memo (measured 5.4 ms per
+  new state on a 151,936-token vocabulary).
+
 ### Performance benchmark (`bench`)
 
 `minfer bench <model>` runs llama-bench-style prefill (`pp<P>`) / decode (`tg<T>`) throughput tests on the active backend — mean ± stddev over reps after an untimed warmup, each rep from an empty KV context without a model reload — reported as a markdown/CSV/JSON table.

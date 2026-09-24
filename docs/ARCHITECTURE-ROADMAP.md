@@ -53,8 +53,8 @@ The remaining work is at the **system layer**, and three items dominate it:
    already covers (measured ≈11× TTFT on a second turn).
 
 Everything else — IR expressiveness (views, multi-output), memory placement
-policy (VRAM budget, layer offload), backend pluggability, grammar-constrained
-decoding, additional model families, quantizer tooling — is real but secondary,
+policy (VRAM budget, layer offload), backend pluggability, additional model
+families, quantizer tooling — is real but secondary,
 and mostly *enabled* by fixing (1) and (2) first.
 
 ### Ranked backlog (full list with numbering in §3)
@@ -69,7 +69,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 12 | Backend registry (drop the hard-coded 3-way enum/match) | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
 | 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
-| 15 | Grammar / JSON-schema constrained decoding | L7 | M | 4–6 d |
+| 15 | Grammar / JSON-schema constrained decoding — **DONE (F2, 2026-09-24)**; the mask is host-side and per state (5.4 ms on a 151k vocabulary) | L7 | M | 4–6 d |
 | 23 | Op × dtype × backend correctness matrix in CI | L8 | M | 3–5 d |
 
 ---
@@ -521,12 +521,17 @@ override. 🟠
 → top-p → min-p → XTC → temperature **or** mirostat v1/v2, with every new knob
 defaulting to a no-op so the pre-F3 chain is bit-identical. Landed from the old
 gap list: min-p, typical, XTC, DRY, mirostat v1/v2, logit bias (and
-frequency/presence penalties from the OpenAI plan). Still missing: top-n-sigma,
-adaptive-p, infill, and **grammar / JSON-schema constrained decoding** (a
-GBNF-style grammar compiled into a per-token logit mask) — F2 /
-[#47](https://github.com/yusiwen/minfer/issues/47). For an OpenAI-compatible
-server, structured output is the most-requested missing capability after
-streaming. 🟠
+frequency/presence penalties from the OpenAI plan). **Grammar / JSON-schema
+constrained decoding landed in F2 (2026-09-24)**: `src/grammar.rs` compiles a
+GBNF grammar (or a JSON Schema, via a generated GBNF) into a pushdown automaton
+and masks the logits inside that one pipeline, between DRY and the greedy
+shortcut; CLI `--grammar`/`--json-schema`, server `response_format`
+(`json_object` / `json_schema`) plus a `grammar` field. Design and the exact
+accepted subset: `docs/GRAMMAR-DESIGN.md`. What it deliberately does not do
+(and refuses loudly rather than guessing): `pattern`/`minLength`/`maxLength`,
+`multipleOf`, real-valued numeric bounds, object property permutations, and a
+device-side mask — the mask is host work before any backend runs. Still
+missing: top-n-sigma, adaptive-p, infill. 🟡
 
 **No LoRA (Low-Rank Adaptation) / adapter support.** There is no adapter path
 at all. minfer's `weights_version` field in `GraphParams` (`params.rs:62`) exists
@@ -614,7 +619,7 @@ work predates the tracker has no issue, and the plan is its record.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| 15 | **Constrained decoding**: GBNF-style grammar + JSON-schema → grammar. | §2.7 | M |
+| 15 | **Constrained decoding**: GBNF-style grammar + JSON-schema → grammar. — **landed in F2 (2026-09-24)**: [#47](https://github.com/yusiwen/minfer/issues/47), `src/grammar.rs` + the mask in `src/sampler.rs`; the design record is `docs/GRAMMAR-DESIGN.md` | §2.7 | M |
 | 16 | **Sampler set**: min-p, typical, XTC, DRY, mirostat, logit bias. — **landed in F3 (2026-09-24)**: [#48](https://github.com/yusiwen/minfer/issues/48) | §2.7 | M |
 | 17 | **MoE support** (see `MODEL-SUPPORT-ROADMAP.md` Tier 2 #1) — depends on item 7 for a clean implementation. | §2.1, §2.7 | L |
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
