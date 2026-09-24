@@ -119,7 +119,13 @@ extern "C" {
         buf_size: usize,
     ) -> i32;
     fn cudaGraphLaunch(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
+    // A `cudaGraph_t` (the result of `cudaStreamEndCapture`) and a
+    // `cudaGraphExec_t` (the result of `cudaGraphInstantiate`) are different
+    // handle types with different destroy calls. Passing an exec to
+    // `cudaGraphDestroy` returns `cudaErrorInvalidValue` and leaks the exec
+    // (issue #145).
     fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
 }
 
 // cudaMemcpyKind values (https://docs.nvidia.com/cuda/runtime-api/group__CUDART__TYPES.html)
@@ -449,7 +455,30 @@ extern "C" {
     );
     // P6: A arrives as f32 activations; the GEMM converts on stage — the
     // separate convert_f32_f16 pass disappears for every prefill matmul.
-    fn gemm_prefill_smem_init();
+    //
+    // #145: returns the number of `cudaFuncSetAttribute` calls that failed (each
+    // already named on stderr with `cudaGetErrorName` where it was made). The
+    // caller reports the count; the attribute requests that exceed the device's
+    // opt-in limit are deliberately skipped with the reason printed.
+    fn gemm_prefill_smem_init() -> i32;
+    // #145 introspection: the opt-in decision, for the startup report and the
+    // `cuda_prefill_smem_optin_*` gate. `gemm_smem_need` is the single-source
+    // formula the launcher reads; `gemm_smem_opted_in` reads the device's own
+    // `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` back.
+    #[allow(dead_code)] // read by the #145 device gate, not by a non-test build
+    fn gemm_prefill_smem_checked() -> i32;
+    fn gemm_prefill_smem_skipped() -> i32;
+    #[allow(dead_code)] // read by the #145 device gate
+    fn gemm_prefill_smem_limit() -> i32;
+    #[allow(dead_code)] // read by the #145 device gate
+    fn gemm_smem_need(tm: i32, ks: i32, af32: i32) -> usize;
+    #[allow(dead_code)] // read by the #145 device gate
+    fn gemm_smem_opted_in(tm: i32, ks: i32, af32: i32) -> i32;
+    // #145 test injection: latch a real `cudaErrorInvalidValue` on purpose
+    // (request the device limit + 4096 B) without clearing it. Only the gate
+    // calls this.
+    #[allow(dead_code)]
+    fn cuda_test_latch_oversized_smem() -> i32;
     fn launch_gemm_f32a(
         a: *const f32,
         b: *const std::ffi::c_void,
@@ -1005,9 +1034,38 @@ static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
 /// increment is the whole cost on the hot path.
 static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
 
-/// F5: the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
+/// F5 (#58): the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
 pub fn stream_sync_count() -> u64 {
     STREAM_SYNCS.load(Ordering::Relaxed)
+}
+
+/// Issue #145: how many times `CudaState::sync` found an error **already latched**
+/// by `cudaGetLastError` (i.e. not caused by the kernel that just ran). The
+/// message names the observer, never a launch; this counter is how the gate
+/// proves the error was surfaced rather than dropped.
+static LATCHED_API_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Issue #145: the process-wide count of latched API errors `sync` has reported.
+#[allow(dead_code)] // read by the #145 device gate
+pub fn latched_api_error_count() -> u64 {
+    LATCHED_API_ERRORS.load(Ordering::Relaxed)
+}
+
+/// The honest label for an error that `cudaGetLastError` found **already
+/// latched** at a sync point.
+///
+/// `sync` cannot know which call set it — it may be a launch, an attribute
+/// request, a graph destroy, or anything else several operations ago — so the
+/// message names the observer (`cudaGetLastError`), the `cudaGetErrorName`
+/// symbolic name and the code, and never claims "kernel launch". Pure, so the
+/// wording is pinned by a unit test with no device.
+pub fn latched_api_error_message(err: i32) -> String {
+    format!(
+        "CUDA: latched API error observed by cudaGetLastError: {} ({err}); NOT attributed to a \
+         kernel — an earlier CUDA call on this thread did not check its return value (fix that \
+         call site rather than the kernel)",
+        cuda_error_name(err)
+    )
 }
 
 /// A small per-thread reentrant lock guarding model weight registration.
@@ -1824,8 +1882,28 @@ impl CudaState {
         // must happen BEFORE any stream capture — capture mode Global
         // forbids cudaFuncSetAttribute, so a lazy first-use opt-in fails
         // and the >48KB launch poisons the context (error 700).
-        unsafe {
-            gemm_prefill_smem_init();
+        //
+        // #145: every attribute call's return value is checked inside
+        // `gemm_prefill_smem_init` and named there (`cudaFuncSetAttribute(
+        // gemm_f16_nt_kernel_t<..>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        // .. B) failed: cudaError... (1)`); a request over the device's opt-in
+        // limit is skipped there, with the reason. The failure count is a
+        // startup fact, not something the next `sync()` should re-blame on a
+        // kernel.
+        let smem_failures = unsafe { gemm_prefill_smem_init() };
+        if smem_failures > 0 {
+            eprintln!(
+                "CUDA: {smem_failures} prefill-GEMM dynamic-smem opt-in call(s) failed at init \
+                 (each named above); the affected >48 KiB instantiation(s) keep the 48 KiB default \
+                 and must not be selected for a captured launch"
+            );
+        }
+        let smem_skipped = unsafe { gemm_prefill_smem_skipped() };
+        if smem_skipped > 0 {
+            eprintln!(
+                "CUDA: {smem_skipped} prefill-GEMM dynamic-smem opt-in request(s) skipped because \
+                 they exceed this device's limit (see the reasons above)"
+            );
         }
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
@@ -2771,14 +2849,28 @@ impl CudaState {
         // F5: a full stream sync is a host stall — count it. It is the number the
         // split-boundary before/after is stated in (`stream_sync_count`).
         STREAM_SYNCS.fetch_add(1, Ordering::Relaxed);
+        // #145: `cudaGetLastError` reports whatever an earlier call latched —
+        // it is NOT evidence about the kernel that just ran. Name the observer
+        // and the real API error; the counting keeps the error visible instead
+        // of dropping it.
         let err = unsafe { cudaGetLastError() };
         if err != 0 {
-            eprintln!("CUDA kernel launch error: {}", err);
+            LATCHED_API_ERRORS.fetch_add(1, Ordering::Relaxed);
+            eprintln!("{}", latched_api_error_message(err));
         }
         let err = unsafe { cudaStreamSynchronize(self.stream()) };
         if err != 0 {
-            eprintln!("CUDA stream sync error: {}", err);
+            eprintln!("CUDA stream sync error: {} ({err})", cuda_error_name(err));
         }
+    }
+
+    /// Clear and return the CUDA per-thread "last error" latch (`cudaGetLastError`).
+    ///
+    /// Used by the device gates that must assert a call left **no** error
+    /// behind (e.g. `cuda_graph_destroy_*`, issue #145), and by diagnostics.
+    #[allow(dead_code)] // read by the #145 device gates
+    pub fn take_last_error(&self) -> i32 {
+        unsafe { cudaGetLastError() }
     }
 
     /// Debug sync: print label, then sync and report error.
@@ -2793,7 +2885,7 @@ impl CudaState {
         if il >= 0 {
             let tag = format!("l{il}: ");
             if err != 0 {
-                eprintln!("CUDA DEBUG: {tag}{label} -- launch error: {err}");
+                eprintln!("CUDA DEBUG: {tag}{label} -- latched API error: {err}");
             }
             let err = unsafe { cudaStreamSynchronize(self.stream()) };
             if err != 0 {
@@ -2803,7 +2895,7 @@ impl CudaState {
             }
         } else {
             if err != 0 {
-                eprintln!("CUDA DEBUG: {label} -- launch error: {err}");
+                eprintln!("CUDA DEBUG: {label} -- latched API error: {err}");
             }
             let err = unsafe { cudaStreamSynchronize(self.stream()) };
             if err != 0 {
@@ -3019,12 +3111,36 @@ impl CudaState {
     }
 
     /// Free an instantiated graph exec (Phase 7d cache invalidation).
-    pub fn graph_destroy(&self, exec: *mut std::ffi::c_void) {
-        if !exec.is_null() {
-            unsafe {
-                cudaGraphDestroy(exec);
-            }
+    ///
+    /// The handle comes from `cudaGraphInstantiate`, so it is a
+    /// `cudaGraphExec_t` and must go to `cudaGraphExecDestroy`. Passing it to
+    /// `cudaGraphDestroy` (which takes the `cudaGraph_t` from
+    /// `cudaStreamEndCapture`) returns `cudaErrorInvalidValue`, leaks the exec,
+    /// and latches an error that the next `sync()` used to report as a kernel
+    /// launch failure — issue #145.
+    ///
+    /// Returns `false` when the destroy call failed (and was named here, then
+    /// cleared). The gate asserts this return value, not the latch: the
+    /// failure is deliberately cleared here so it cannot resurface as a
+    /// phantom launch error, which would otherwise make a
+    /// "no latched error" assertion pass for the wrong reason.
+    pub fn graph_destroy(&self, exec: *mut std::ffi::c_void) -> bool {
+        if exec.is_null() {
+            return true;
         }
+        let err = unsafe { cudaGraphExecDestroy(exec) };
+        if err != 0 {
+            // Name it here, then clear it: this call site owns the error.
+            eprintln!(
+                "CUDA: cudaGraphExecDestroy failed: {} ({err})",
+                cuda_error_name(err)
+            );
+            unsafe {
+                cudaGetLastError();
+            }
+            return false;
+        }
+        true
     }
 
     /// Launch an arbitrary instantiated graph exec on the backend stream.
@@ -6902,5 +7018,208 @@ mod d38_probe_tests {
             }
         }
         v
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #145: the eager prefill-GEMM smem opt-in is checked, and a latched
+// API error is reported with its real origin (never as a kernel launch).
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod issue145_tests {
+    use super::*;
+
+    fn device() -> Option<&'static CudaState> {
+        CudaState::init();
+        CudaState::get()
+    }
+
+    /// The sync message must name the *observer* (`cudaGetLastError`) and the
+    /// real API error, and must not claim a kernel launch. Pure — no device.
+    #[test]
+    fn the_latched_error_message_never_blames_a_kernel() {
+        let msg = latched_api_error_message(1);
+        assert!(
+            msg.contains("cudaGetLastError"),
+            "must name the observer: {msg}"
+        );
+        assert!(
+            msg.contains("cudaErrorInvalidValue"),
+            "must name the error symbolically: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("kernel launch"),
+            "a latched error must not be attributed to a kernel: {msg}"
+        );
+    }
+
+    /// The single-source smem formula, pinned against the kernel's own byte
+    /// layout (As 256*KS + Am 512*KS [AF32] + Bs 4*TM*KS + Cs 8192, TN=64,
+    /// NW=8). A silent shrink of the formula is what under-declares a launch's
+    /// dynamic smem; this is the arm that sees it. Pure — no device.
+    #[test]
+    fn the_gemm_smem_formula_matches_the_kernel_layout() {
+        let cases = [
+            (64, 32, false, 24576usize),
+            (64, 32, true, 40960),
+            (64, 64, false, 40960),
+            (64, 64, true, 73728),
+            (128, 32, false, 32768),
+            (128, 32, true, 49152),
+            (128, 64, false, 57344),
+            (128, 64, true, 90112),
+            (256, 32, false, 49152),
+            (256, 32, true, 65536),
+            (256, 64, false, 90112),
+            (256, 64, true, 122880),
+        ];
+        for (tm, ks, af32, want) in cases {
+            assert_eq!(
+                unsafe { gemm_smem_need(tm, ks, af32 as i32) },
+                want,
+                "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> dynamic-smem need"
+            );
+        }
+    }
+
+    /// Every (tm, ks, af32) combination the launcher can select whose request
+    /// exceeds the 48 KiB default must actually be admitted by the device's
+    /// `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` — otherwise the
+    /// prefill GEMM's >48 KiB launch (which capture mode forces to be opted in
+    /// eagerly) fails. A request over the device limit must be skipped, never
+    /// called. Device gate.
+    #[test]
+    fn cuda_prefill_smem_optin_covers_every_launchable_instantiation() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // Re-run the eager init: idempotent, and its return value is the count
+        // of attribute calls that failed.
+        let failures = unsafe { gemm_prefill_smem_init() };
+        assert_eq!(failures, 0, "a request the device admits must not fail");
+        let limit = unsafe { gemm_prefill_smem_limit() };
+        assert!(limit >= 48 * 1024, "queried opt-in limit {limit} B");
+        let mut covered = 0usize;
+        let mut over_limit = 0usize;
+        for tm in [64, 128, 256] {
+            for ks in [32, 64] {
+                for af32 in [false, true] {
+                    let need = unsafe { gemm_smem_need(tm, ks, af32 as i32) };
+                    if need <= 48 * 1024 {
+                        continue; // the default cap admits it; no opt-in needed
+                    }
+                    let opted = unsafe { gemm_smem_opted_in(tm, ks, af32 as i32) } == 1;
+                    if need > limit as usize {
+                        over_limit += 1;
+                        assert!(
+                            !opted,
+                            "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B > the \
+                             {limit} B device limit but reads back as opted in"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        opted,
+                        "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B and the device \
+                         admits {limit} B, but cudaFuncGetAttributes reports its \
+                         maxDynamicSharedSizeBytes below that — the >48 KiB prefill launch \
+                         would fail (capture mode cannot set the attribute lazily)"
+                    );
+                    covered += 1;
+                }
+            }
+        }
+        assert!(
+            covered >= 5,
+            "expected the launchable >48 KiB instantiations to be opted in, got {covered}"
+        );
+        assert_eq!(
+            unsafe { gemm_prefill_smem_checked() } as usize,
+            covered,
+            "every admitted >48 KiB request must have been attempted exactly once"
+        );
+        assert_eq!(
+            unsafe { gemm_prefill_smem_skipped() } as usize,
+            over_limit,
+            "every over-limit request must be skipped with a reason"
+        );
+    }
+
+    /// `graph_destroy` is handed the `cudaGraphExec_t` from
+    /// `cudaGraphInstantiate`; destroying it with `cudaGraphDestroy` returns
+    /// `cudaErrorInvalidValue`, leaks the exec, and used to surface later as a
+    /// phantom "kernel launch error" (#145). Device gate.
+    #[test]
+    fn cuda_graph_exec_destroy_leaves_no_latched_error() {
+        let _model_load_guard = CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let s = device().unwrap();
+        let _ = s.take_last_error(); // start from a clean latch
+        assert!(s.graph_begin_capture(), "stream capture should begin");
+        let exec = s.graph_end_capture_to_exec();
+        assert!(
+            !exec.is_null(),
+            "an empty captured graph should instantiate"
+        );
+        // Assert the destroy CALL's own result, not just the latch: the failure
+        // is named and cleared inside `graph_destroy`, so a latch-only
+        // assertion would pass even with the wrong destructor (the gate would
+        // pass for the wrong reason).
+        assert!(
+            s.graph_destroy(exec),
+            "destroying a cudaGraphExec_t must succeed — cudaGraphExecDestroy, \
+             not cudaGraphDestroy (which returns cudaErrorInvalidValue and \
+             leaks the exec)"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "destroying a cudaGraphExec_t must not latch an API error"
+        );
+    }
+
+    /// A latched error must still be *visible* at the next sync (not dropped),
+    /// reported as latched, and cleared. Device gate.
+    ///
+    /// Env-gated (`MINFER_TEST_LATCH_ERROR=1`) **because it deliberately
+    /// latches a real CUDA API error**: the default suite run must stay clean
+    /// under `compute-sanitizer --tool memcheck`, which counts every such call.
+    #[test]
+    fn cuda_sync_surfaces_a_latched_error_as_latched() {
+        let _model_load_guard = CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        if std::env::var("MINFER_TEST_LATCH_ERROR").is_err() {
+            eprintln!(
+                "skipping: set MINFER_TEST_LATCH_ERROR=1 to run this deliberate-latch gate \
+                 (it must not pollute a compute-sanitizer run)"
+            );
+            return;
+        }
+        let s = device().unwrap();
+        let _ = s.take_last_error(); // start from a clean latch
+        let before = latched_api_error_count();
+        let injected = unsafe { cuda_test_latch_oversized_smem() };
+        assert_eq!(
+            injected, 1,
+            "the injector must latch cudaErrorInvalidValue (1), got {injected}"
+        );
+        s.sync();
+        assert_eq!(
+            latched_api_error_count(),
+            before + 1,
+            "sync must report the latched error instead of dropping it"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "sync must clear the latch it reported"
+        );
     }
 }
