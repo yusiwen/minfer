@@ -116,7 +116,10 @@ fn print_usage(prog: &str) {
     eprintln!("  --system <STR>       conversation: system prompt");
     eprintln!("  -mli, --multiline-input   conversation: submit input on an empty line");
     eprintln!("  --color [on|off|auto]     conversation: color output (default auto = tty)");
-    eprintln!("  --session <FILE>          conversation: save/load conversation history (JSON)");
+    eprintln!(
+        "  --session <FILE>          conversation: save/load history (JSON) + KV (<FILE>.kv); a\n\
+         \x20                           matching KV companion resumes with no prefill"
+    );
     eprintln!("  --temp <T>           sampling temperature (default 0.8; 0 = greedy)");
     eprintln!("  --greedy             greedy decoding (--temp 0)");
     eprintln!("  --top-k <K>          top-K sampling (default 40)");
@@ -1500,24 +1503,38 @@ fn run_conversation(
     };
     let mut engine = conversation::SpecAwareEngine::new(graph_engine, spec_engine.take(), sparams);
 
-    // --session load: history JSON → full KV re-seed (§5.8).
-    if let Some(path) = &session_file {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            match conversation::Conversation::messages_from_json(&text) {
-                Some(msgs) => {
-                    conv.load_history(msgs, &*tokenizer, &mut engine);
-                    eprintln!(
-                        "[session] loaded {} message(s) from {path}",
-                        conv.messages.len()
-                    );
-                }
-                None => eprintln!("[session] ignoring unreadable session file {path}"),
+    // --session: the history JSON is the host's own record; its `.kv` companion (C5 S2)
+    // is the KV those rows belong to. A matching companion resumes with **no** prefill;
+    // anything else falls back to re-rendering the history, and says why.
+    let history = session_file.as_ref().and_then(|path| {
+        std::fs::read_to_string(path).ok().and_then(|text| {
+            let msgs = conversation::Conversation::messages_from_json(&text);
+            if msgs.is_none() {
+                eprintln!("[session] ignoring unreadable session file {path}");
             }
+            msgs
+        })
+    });
+    let resumed = match &session_file {
+        Some(path) => {
+            let kv = format!("{path}.kv");
+            resume_from_kv_companion(&mut conv, &mut engine, history.as_deref(), &kv)
+        }
+        None => false,
+    };
+    if !resumed {
+        if let (Some(msgs), Some(path)) = (history, &session_file) {
+            conv.load_history(msgs, &*tokenizer, &mut engine);
+            eprintln!(
+                "[session] loaded {} message(s) from {path}",
+                conv.messages.len()
+            );
         }
     }
 
-    // --session save (on exit).
-    let save_session = |conv: &conversation::Conversation| {
+    // --session save (on exit): the history, then the KV that belongs to it.
+    let save_session = |conv: &conversation::Conversation,
+                        engine: &mut conversation::SpecAwareEngine| {
         if let Some(path) = &session_file {
             let json = conv.messages_to_json();
             if std::fs::write(path, json).is_ok() {
@@ -1527,6 +1544,14 @@ fn run_conversation(
                 );
             } else {
                 eprintln!("[session] failed to save session to {path}");
+            }
+            let kv = format!("{path}.kv");
+            match engine.kv_save(
+                std::path::Path::new(&kv),
+                conv.snapshot_to_json().as_bytes(),
+            ) {
+                Ok(bytes) => eprintln!("[session] saved {bytes} byte(s) of KV to {kv}"),
+                Err(e) => eprintln!("[session] KV not saved to {kv}: {e}"),
             }
         }
     };
@@ -1664,9 +1689,76 @@ fn run_conversation(
             break;
         }
     }
-    save_session(&conv);
+    save_session(&conv, &mut engine);
     eprintln!("\n---\nconversation ended after {turn} turn(s)");
     0
+}
+
+/// C5 S2: resume `--session FILE` from its KV companion, when the companion describes
+/// this run and the host state it carries agrees with the history file.
+///
+/// Returns `true` only when the conversation was actually restored — every other outcome
+/// (no companion, a file this run cannot use, a host state this build cannot read, a
+/// history the user edited) prints the reason and returns `false`, and the caller
+/// re-seeds from the history, which is always correct if slower.
+fn resume_from_kv_companion(
+    conv: &mut conversation::Conversation,
+    engine: &mut conversation::SpecAwareEngine,
+    history: Option<&[(String, Option<String>)]>,
+    kv_path: &str,
+) -> bool {
+    use crate::conversation::Engine as _; // kv_load lives on the trait
+    if !std::path::Path::new(kv_path).exists() {
+        return false;
+    }
+    let loaded = match engine.kv_load(std::path::Path::new(kv_path)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("[session] {e}; re-seeding the history instead");
+            return false;
+        }
+    };
+    let host = String::from_utf8_lossy(&loaded.host);
+    let Some(snap) = conversation::Conversation::snapshot_from_json(&host) else {
+        eprintln!(
+            "[session] {kv_path} carries no host state this build understands; re-seeding \
+             the history instead"
+        );
+        return false;
+    };
+    // The KV rows belong to the snapshot's history. A history file the user edited must
+    // not be silently ignored, so a disagreement is a refusal, not a merge.
+    if let Some(msgs) = history {
+        if msgs != snap.messages.as_slice() {
+            eprintln!(
+                "[session] {kv_path} and the history file describe different conversations \
+                 ({} vs {} messages); re-seeding the history instead",
+                snap.messages.len(),
+                msgs.len()
+            );
+            return false;
+        }
+    }
+    if snap.current_pos != loaded.written {
+        eprintln!(
+            "[session] {kv_path} holds {} written row(s) but its host state says {}; \
+             re-seeding the history instead",
+            loaded.written, snap.current_pos
+        );
+        return false;
+    }
+    if let Err(e) = conv.restore_snapshot(&snap) {
+        eprintln!("[session] {e}; re-seeding the history instead");
+        return false;
+    }
+    eprintln!(
+        "[session] resumed {} message(s) and {} KV row(s) from {kv_path} ({} bytes) — 0 tokens \
+         prefilled",
+        conv.messages.len(),
+        loaded.written,
+        loaded.bytes
+    );
+    true
 }
 
 fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {
