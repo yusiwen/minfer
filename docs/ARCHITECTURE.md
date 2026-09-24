@@ -50,10 +50,10 @@
 | `cache.rs` | **Legacy** per-layer KV cache type (the graph path owns KV in the allocator; kept for the CLI's `KVCache` plumbing) |
 | `sampler.rs` | Repeat/frequency/presence penalties → top-k → top-p → temperature, seeded `StdRng` |
 | `tokenizer.rs` | Self-contained BPE tokenizer, loaded from GGUF metadata (no tiktoken) |
-| `template.rs` | GGUF `chat_template` rendering via minijinja; ChatML fallback (minijinja 2.21 has no `str` filters, so e.g. Qwen3's template falls back) |
+| `template.rs` | GGUF `chat_template` rendering via minijinja + a Python-`str`-method hook (F7/#50), so Qwen3's think-block template renders; a template that cannot be rendered is a **loud refusal**, never a silent ChatML fallback (`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`) |
 | `models/` | Architecture implementations. `mod.rs` has the `ModelDef` trait + factory dispatch |
 | `models/qwen2/` | Qwen2/Qwen2.5: `mod.rs` (model struct + trait impl), `graph.rs` (`Qwen2Graph::build`/`forward`), `loader.rs` (GGUF weights + hparams) |
-| `models/qwen3/` | Qwen3 (dense): same triple — decoupled head dim + per-head Q/K norm (`qk_norm`), ChatML template fallback |
+| `models/qwen3/` | Qwen3 (dense): same triple — decoupled head dim + per-head Q/K norm (`qk_norm`); its ChatML+`<think>` template renders since F7 |
 | `conversation.rs` | Multi-turn session state (append-only KV) behind `--cnv` |
 | `server/` | OpenAI-compatible HTTP server (`serve`): axum + tokio, multi-slot, `/v1/chat/completions` streaming; `viz.rs` serves the viz page |
 | `metal.rs` + `metal.metal` | Apple MPS (Metal) backend: per-op kernels + command-buffer encoding (the legacy whole-layer `layer_gpu` is retained for tests) |
@@ -108,7 +108,7 @@ flowchart TD
     MODE -->|"viz"| VZ["viz server (page + live SSE)"]
     MODE -->|single shot| H["load BPE tokenizer from GGUF"]
     H --> J{"no-template?"}
-    J -->|no| K["render chat template<br/>GGUF chat_template via minijinja<br/>(ChatML fallback)"]
+    J -->|no| K["render chat template<br/>GGUF chat_template via minijinja<br/>(unrenderable → loud refusal;<br/>no template at all → ChatML)"]
     J -->|yes| L["raw prompt"]
     K --> M["tokenize prompt<br/>n_ctx = max(--n-ctx, prompt len)<br/>(sizes the KV regions once)"]
     L --> M

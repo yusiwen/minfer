@@ -52,8 +52,9 @@ answering it. The markers are not decoration; they are the protocol.
  get_chat_template()          reads GGUF metadata key "tokenizer.chat_template"
      │                        (missing, or --no-template → use the raw prompt)
      ▼
- template::render_template()  minijinja renders with add_generation_prompt=true
-     │                        (render error → fallback_chatml: hand-written ChatML)
+ template::render_template()  minijinja (+ a Python-`str`-method hook) renders
+     │                        with add_generation_prompt=true; a template it cannot
+     │                        render is a LOUD error naming the construct (F7/#50)
      ▼
  "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
   <|im_start|>user\nWhat is 2+2?<|im_end|>\n
@@ -62,7 +63,8 @@ answering it. The markers are not decoration; they are the protocol.
      ▼
  Tokenizer::encode()
      ├─ 1. special-token scan   whole strings like <|im_end|> become one id
-     ├─ 2. regex pre-tokenize   split into word / number / punctuation pieces
+     ├─ 2. pre-tokenize          the `tokenizer.ggml.pre` rule (qwen2 / qwen35)
+     │                          splits into word / number / punctuation pieces
      ├─ 3. byte-encode          map every raw byte to a printable unicode char
      └─ 4. greedy BPE merges    merge the adjacent pair with the lowest rank
      ▼
@@ -109,13 +111,13 @@ question text, or a stray `<|im_end|>`. It will not answer.
 
 So the template is not a display nicety; it selects *which distribution* the
 model samples from. minfer always passes `add_generation_prompt=true` on the
-CLI path (`src/main.rs:724`), because a one-shot prompt is by definition a
+CLI path (`src/main.rs`), because a one-shot prompt is by definition a
 "generate the assistant's next turn" request.
 
 One more piece: **bos** and **eos**. *bos* (beginning of sequence) is a token
 some model families expect at the very start of every input; *eos* (end of
 sequence) is the token the model was trained to emit when it is done talking.
-The template context exposes `bos_token` as a variable (`src/template.rs:44`);
+The template context exposes `bos_token` as a variable (`src/template.rs`);
 whether a bos marker appears is the template string's choice, not the
 engine's. For eos, minfer does not rely on the template — the GGUF metadata
 carries `tokenizer.ggml.eos_token_id` and `<|im_end|>`'s id directly (§2.5),
@@ -142,7 +144,7 @@ the token strings (`tokenizer.ggml.tokens`), the merge list in rank order
 
 A first example — byte-exact, because it comes straight from minfer's test
 suite, whose expected ids were cross-checked against llama.cpp
-(`src/tokenizer.rs:537`):
+(`src/tokenizer.rs`):
 
 ```
 text:    <｜User｜>What is 2+2?<｜Assistant｜><think>\n
@@ -152,7 +154,7 @@ ids:     151644 3838 374 220 17 10 17 30 151645 151648 198
 | id | stored token text | what a human sees | how it was produced |
 |---|---|---|---|
 | 151644 | `<｜User｜>` | (role marker) | special token, matched whole, before BPE |
-| 3838 | `What` | `What` | regex piece, whole string already in vocab |
+| 3838 | `What` | `What` | pre-token piece whose characters merge into the stored entry |
 | 374 | `Ġis` | `␣is` | regex piece `" is"`; already a single vocab entry |
 | 220 | `Ġ` | `␣` | regex `\s+` piece — the lone space before a digit |
 | 17 | `2` | `2` | regex `\p{N}` piece — **one digit only** |
@@ -161,18 +163,18 @@ ids:     151644 3838 374 220 17 10 17 30 151645 151648 198
 | 151648 | `<think>` | (reasoning marker) | special token |
 | 198 | `Ċ` | newline | regex `\s*[\r\n]+` piece |
 
-Two oddities in that table are the regex at work. The GPT-2 pre-tokenization
-regex (borrowed verbatim, `src/tokenizer.rs:259-262`) splits text into word
-pieces, single digits, and punctuation runs *before* any merging happens —
+Two oddities in that table are the pre-tokenizer at work. The rule named by
+`tokenizer.ggml.pre` (`qwen2` for Qwen2.5 and Qwen3; F7/#50) splits text into
+word pieces, single digits, and punctuation runs *before* any merging happens —
 merges can never cross a piece boundary. Digits are matched one at a time
-(`\p{N}` matches exactly one), which is why `2+2` costs four tokens and why
-models are famously weak at long arithmetic: every digit is a separate
-concept. And a space before a digit attaches to nothing (the word rule only
-glues a leading space to *letters*), so it becomes a bare `Ġ` — token 220.
+(`\p{N}` matches exactly one in the `qwen2` rule), which is why `2+2` costs
+four tokens and why models are famously weak at long arithmetic: every digit is
+a separate concept. And a space before a digit attaches to nothing (the word
+rule only glues a leading space to *letters*), so it becomes a bare `Ġ` —
+token 220.
 
-Now the greedy merge loop itself. For a piece that is not already one vocab
-entry, minfer splits it into characters and repeatedly merges the adjacent
-pair with the *lowest* rank. A toy illustration (invented ranks): if the piece
+Now the greedy merge loop itself. minfer splits the piece into characters and
+repeatedly merges the adjacent pair with the *lowest* rank. A toy illustration (invented ranks): if the piece
 is `[m][i][n][f][e][r]` and `("i","n")` has rank 88 while every other adjacent
 pair ranks higher, `[i][n]` fuses first; the scan then repeats on the shorter
 list until no adjacent pair is in the merge table, and each surviving piece is
@@ -193,7 +195,7 @@ token.
 
 **Why byte-level?** Because the alphabet is bytes, not characters. Before
 merging, every raw byte 0–255 is mapped to a printable unicode character
-(`build_byte_to_unicode`, `src/tokenizer.rs:8-37`; printable ASCII and most
+(`build_byte_to_unicode`, `src/tokenizer.rs`; printable ASCII and most
 Latin-1 map to themselves, the rest get chars from code point 256 upward —
 space becomes `Ġ`, newline `Ċ`), and every vocab entry is stored in that
 mapped form. The consequence: *any* byte string round-trips — Chinese, emoji,
@@ -211,35 +213,35 @@ then maps every character back to its raw byte via the reverse table
 Why insist on bytes rather than a Rust `String`? Because a multi-byte UTF-8
 character can be split across two tokens. Consider the Chinese character 中
 (U+4E2D), whose UTF-8 encoding is the three bytes `E4 B8 AD`; minfer's test
-(`src/tokenizer.rs:427-464`) contains a token whose mapped text is `ä¸­` — the
+(`src/tokenizer.rs`) contains a token whose mapped text is `ä¸­` — the
 mapped forms of exactly those three bytes. If the model emits the first two
 bytes of the character in one token and the third in the next, a per-token
 `String::from_utf8_lossy` conversion would stamp a `�` (U+FFFD replacement
 character) into your output stream *permanently* — the bytes were already
 thrown away. `decode_bytes` never attempts the conversion: it emits raw
 bytes, so `E4 B8` + `AD` reassembles perfectly wherever they land. The tests
-pin this: `decode_bytes_keeps_multibyte_bytes` (`src/tokenizer.rs:458`).
+pin this: `decode_bytes_keeps_multibyte_bytes` (`src/tokenizer.rs`).
 
 ### 2.5 Special tokens: ids with a job
 
 A **special token** is a vocabulary entry that is not a piece of human text but
 a control signal: `<|im_start|>`, `<|im_end|>`, `<think>`, `<｜User｜>`, and so
 on. In the GGUF they are flagged by `tokenizer.ggml.token_type` — the values
-the code checks are 3 (control) and 4 (user-defined) (`src/tokenizer.rs:138-139`).
+the code checks are 3 (control) and 4 (user-defined) (`src/tokenizer.rs`).
 
 They get special treatment at both ends of the pipeline:
 
 - **Encode**: a special token must survive as one id — the BPE machinery would
   otherwise shred `<|im_end|>` into ordinary character pieces. minfer scans
   for special-token strings *before* running BPE on each segment
-  (`src/tokenizer.rs:280-314`), matching the earliest position first and the
+  (`src/tokenizer.rs`), matching the earliest position first and the
   longest string at a given position. This is not cosmetic: DeepSeek-R1-style
-  markers `<｜User｜>` use fullwidth unicode bars that the GPT-2 regex would
+  markers `<｜User｜>` use fullwidth unicode bars that the pre-tokenizer rule would
   happily split apart; the regression test at :533 keeps them intact.
 - **Decode/generate**: the ids of eos and `<|im_end|>` are handed to the
   generation loop as *stop sentinels* — when the sampler produces one, the
   engine stops instead of appending it. They are also fed into the sampler's
-  penalty window (`src/main.rs:847`, doc 12). The ids come from
+  penalty window (`src/main.rs`, doc 12). The ids come from
   `ModelDef::special_tokens()` (doc 03), sourced from GGUF metadata:
   `tokenizer.ggml.eos_token_id`, plus a lookup of `<|im_end|>` that falls back
   to the eos id (`src/models/qwen2/loader.rs:130-131`). One vocabulary, two
@@ -251,7 +253,7 @@ They get special treatment at both ends of the pipeline:
 ### 3.1 Data in / data out
 
 **Input data — GGUF metadata** (parsed in doc 02; the tokenizer reads it via
-`GgufContext`, `src/tokenizer.rs:82`):
+`GgufContext`, `src/tokenizer.rs`):
 
 | GGUF key | Type | Lands in |
 |---|---|---|
@@ -259,6 +261,7 @@ They get special treatment at both ends of the pipeline:
 | `tokenizer.ggml.scores` | f32 array | `id_to_score` (loaded for llama.cpp parity, unused) |
 | `tokenizer.ggml.token_type` | i32 array (1 normal, 3 control, 4 user-defined) | `id_to_type`, drives the special-token table |
 | `tokenizer.ggml.merges` | string array `"A B"` per merge, in rank order | `merges: HashMap<(String,String), usize>` — pair → rank |
+| `tokenizer.ggml.pre` | string (`qwen2`, `qwen35`, …) | `pre: PreTokenizer` — which rule `split()` applies (F7/#50). An unknown or missing value refuses the whole load |
 | `tokenizer.ggml.bos_token_id` / `eos_token_id` | u32 | `bos_token` / `eos_token` |
 | `tokenizer.chat_template` | one long string | passed to minijinja verbatim |
 
@@ -269,7 +272,7 @@ is baked into the weight shape), so the conversion tool writes the matching
 token table alongside it.
 
 The flow is: `&str` prompt + metadata → rendered `String` → `Vec<u32>` →
-`ctx = max(--n-ctx, ids.len())` (`src/main.rs:749`), which sizes the persistent
+`ctx = max(--n-ctx, ids.len())` (`src/main.rs`), which sizes the persistent
 KV regions once for the whole run → `forward(&ids, positions 0..n)` (doc 05+).
 During generation the direction reverses: one sampled id per step →
 `decode_bytes` → raw bytes → stdout/SSE. The template's token cost is real
@@ -284,7 +287,7 @@ The whole template stage in `main.rs` is deliberately small — read the templat
 out of metadata, render, encode:
 
 ```rust
-// src/main.rs:715-735
+// src/main.rs — the whole CLI template stage (F7/#50)
 // === Chat template (need tokenizer for bos_token text) ===
 let processed = if no_template {
     prompt.clone()
@@ -294,104 +297,94 @@ let processed = if no_template {
         .get(tokenizer.bos_token as usize)
         .map(|s| s.as_str())
         .unwrap_or("");
-    template::render_template(&tmpl, &prompt, true, bos_text)
+    // An unrenderable template refuses the run here, before inference —
+    // `validate` renders a canary conversation through it and a failure
+    // names the construct and the template line.
+    if let Err(e) = template::validate(&tmpl) {
+        eprintln!("Error: {}", e.message());
+        std::process::exit(1);
+    }
+    match template::render_template(&tmpl, &prompt, true, bos_text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {}", e.message());
+            std::process::exit(1);
+        }
+    }
 } else {
+    eprintln!(
+        "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+    );
     prompt.clone()
 };
-#[cfg(feature = "debug_dump")]
-crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
 let input_ids = tokenizer.encode(&processed);
-if input_ids.is_empty() {
-    eprintln!("tokenize failed");
-    std::process::exit(1);
-}
-println!("Prompt: {} tokens", input_ids.len());
 ```
-
 Three branches, in priority order: `--no-template` bypasses everything and
 tokenizes the raw prompt (useful for base models and for comparing token
 counts); otherwise `get_chat_template` pulls `tokenizer.chat_template` from
 the GGUF metadata bytes (a tiny re-parse of metadata only —
-`src/main.rs:1495-1504`); with no template key at all, the raw prompt is used
+`src/main.rs`); with no template key at all, the raw prompt is used
 as-is. The literal `true` argument to `render_template` is
 `add_generation_prompt` — §2.2 explained why it must always be on for a
 one-shot prompt. If the tokenizer produces zero ids, the run aborts: an empty
 token list would leave the graph builder with no tokens to embed.
 
-The renderer wraps minijinja, a small Jinja-compatible template engine (the
-single `user` message is built as JSON at `src/template.rs:138-141`):
+The renderer wraps minijinja, a small Jinja-compatible template engine, plus a
+**Python `str`-method hook** (F7/#50). That hook is what lets the *published*
+Qwen2.5/Qwen3 templates run at all: they use Python string syntax
+(`message.content.split('</think>').lstrip('\n')`), and minijinja strings expose
+no methods, so the engine registers
+`Environment::set_unknown_method_callback` and implements the methods with
+CPython semantics (`split`, `lstrip`/`rstrip`/`strip` with a *character set*,
+`replace`, `startswith`/`endswith`, `join`, `find`, …):
 
 ```rust
-// src/template.rs:126-159 (signature at :120-125)
-let mut env = Environment::new();
-
-// Register the template
-if env.add_template("chat", template).is_err() {
-    eprintln!("Warning: invalid chat template, falling back to ChatML");
-    return fallback_chatml(user_input, add_generation_prompt);
-}
-let tmpl = match env.get_template("chat") {
-    Ok(t) => t,
-    Err(_) => return fallback_chatml(user_input, add_generation_prompt),
-};
-
-let messages = vec![serde_json::json!({
-    "role": "user",
-    "content": user_input,
-})];
-
-let result = tmpl.render(context! {
-    messages => messages,
-    add_generation_prompt => add_generation_prompt,
-    bos_token => bos_token,
-    tools => minijinja::Value::UNDEFINED,
-});
-
-match result {
-    Ok(s) => s,
-    Err(e) => {
-        eprintln!(
-            "Warning: chat template rendering failed ({}), falling back to ChatML",
-            e
-        );
-        fallback_chatml(user_input, add_generation_prompt)
-    }
+// src/template.rs — the environment every render goes through
+fn environment() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(unknown_method);
+    env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
+        Err(Error::new(ErrorKind::InvalidOperation, msg))
+    });
+    env
 }
 ```
 
-The context exposes exactly what real chat templates expect: `messages` (here,
-the single user turn), `add_generation_prompt`, `bos_token`, and `tools` as
-undefined so `{% if tools %}` branches don't crash. There are two independent
-fallback triggers: the template string can fail to *parse* (`add_template`), or
-parse and then fail at *render* time (a runtime error inside the template).
-Both land on the hand-written ChatML fallback that produces the literal text
-shown in §2.2 — system turn, user turn, then the empty assistant opener:
+The context exposes exactly what real chat templates expect: `messages`,
+`add_generation_prompt`, `bos_token`, and `tools` as `none` (transformers'
+default), so `{% if tools %}` branches take the no-tools path.
 
-```rust
-// src/template.rs:183-192
-/// Fallback: simple ChatML format (CLI path, single user message)
-fn fallback_chatml(user_input: &str, add_generation_prompt: bool) -> String {
-    let mut r = format!(
-        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n",
-        DEFAULT_SYSTEM, user_input,
-    );
-    if add_generation_prompt {
-        r.push_str("<|im_start|>assistant\n");
-    }
-    r
-}
+A template that cannot be *compiled* (`add_template` fails) or cannot be
+*rendered* (`render_messages` returns `Err(TemplateError)`) is a **refusal**,
+not a fallback. The refusal names the construct and the template line:
+
 ```
+chat template error — unsupported template construct: unsupported Python str
+method `splitlines` (template line 41); minfer refuses to fall back to a generic
+ChatML prompt. Supported Python str methods: capitalize, count, endswith, find,
+join, lower, lstrip, replace, rfind, rsplit, rstrip, split, startswith, strip,
+title, upper
+```
+
+The CLI prints that and exits; `serve`/`viz` run `template::validate` once at
+startup and refuse to start; a per-request failure is an HTTP `400`; a
+conversation turn reports it. The hand-written ChatML renderer
+(`fallback_chatml_messages`, `src/template.rs`) survives for exactly one case —
+a GGUF with **no** `tokenizer.chat_template` key at all, where there is no model
+format to lose (that is the branch that prints the `Notice:` line above).
 
 `ChatML` is the marker convention Qwen models are trained on and the de-facto
-lingua franca of chat templates, which is why a ChatML fallback is *usually*
-compatible even for models whose real template failed. The multi-turn variant
-`fallback_chatml_messages` (`src/template.rs:165-180`) loops over all messages
-instead of one user string; the server and conversation paths reach it via
-`render_messages` (`src/template.rs:13-58`).
+lingua franca of chat templates, which is why it is a reasonable *default* for a
+GGUF that carries no template. It is deliberately not used as a fallback when a
+template exists: the F7 design record
+(`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`) shows what that silently cost —
+Qwen3's think-block extraction and tool-call formatting, fed back verbatim.
 
 #### 3.2.2 Loading the tokenizer from GGUF metadata
 
-`Tokenizer::load` walks the metadata key-value list once per data kind. The
+`Tokenizer::load` (fallible since F7/#50: it returns `Result<Self, String>` and
+refuses a tokenizer it cannot reproduce byte for byte) walks the metadata
+key-value list once per data kind. The
 token strings become the `id_to_token` vector and an inverted `vocab` map
 (`:114-118`); special-token ids and types fill `special_tokens`
 (`:135-143`) plus `bos_token` / `eos_token` / `im_end` (`:145-149`). BPE's
@@ -408,8 +401,8 @@ Special tokens need one more data structure, and its comment explains the
 invariant:
 
 ```rust
-// src/tokenizer.rs:155-157, 172-179 (the <|im_start|>/<|im_end|>/eos
-// fallback inserts between, :158-171, are described in the text below)
+// src/tokenizer.rs, 172-179 (the <|im_start|>/<|im_end|>/eos
+// fallback inserts between, described in the text below)
 // Merge GGUF special tokens (type 3/4) with hardcoded fallbacks, then
 // group by first char with longest-first ordering inside each group
 // (an earliest-position, longest-match scan needs both).
@@ -423,7 +416,7 @@ for group in special_by_first.values_mut() {
 }
 ```
 
-The skipped middle (:158-171) starts from `special_tokens.clone()` and
+The skipped middle starts from `special_tokens.clone()` and
 defensively inserts `<|im_start|>`, `<|im_end|>`, and the eos token *only when
 the GGUF did not already provide them* (`contains_key` guards): some converted
 models mark their specials as ordinary type-1 tokens, so minfer hardcodes the
@@ -436,10 +429,10 @@ at instead of testing every pattern against every position.
 
 The top-level encode is a loop over "segments": text up to the next special
 token goes through BPE, the special token becomes a single id, repeat
-(`src/tokenizer.rs:280-310`, doc comment at :273-279):
+(`src/tokenizer.rs`, doc comment at :273-279):
 
 ```rust
-// src/tokenizer.rs:284-308 (fn head at :280-283, final `result` at :309-310)
+// src/tokenizer.rs (fn head at :280-283, final `result` at :309-310)
 loop {
     // Find the earliest position where any special token starts.
     let mut earliest: Option<(usize, u32, usize)> = None; // (byte_pos, id, byte_len)
@@ -474,21 +467,26 @@ The double ordering matters: the outer scan takes the first character that
 starts *any* special token ("earliest position wins"); within one position,
 the bucket is sorted longest-first, so the first `starts_with` hit is the
 longest match ("`<think▁begin｜>` beats `<think>`"). The dedicated tests
-`special_token_earliest_position_wins` (:546) and
-`longest_special_token_wins_at_same_position` (:562) pin both rules.
+`special_token_earliest_position_wins` and
+`longest_special_token_wins_at_same_position` pin both rules.
 
-Inside a segment, `encode_bpe` (`src/tokenizer.rs:258-271`) runs the GPT-2
-pre-tokenization regex — copied verbatim "from llama-vocab.cpp /
-gpt2_tokenizer.py" — over the text:
+Inside a segment, `encode_bpe` (`src/tokenizer.rs`) applies the pre-tokenization
+rule named by `tokenizer.ggml.pre` (F7/#50) over the text — for `qwen2`, which
+Qwen2.5 and Qwen3 both select:
 
 ```
-(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+
+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 ```
 
 The alternation, read left to right: contractions (`'s`, `'t`, `'re`…), an
 optional leading space glued to a run of letters, a single digit, an optional
-leading space glued to punctuation, line breaks, and any other whitespace.
-Each regex match becomes one *piece*: `byte_encode` (`:40-46`, the per-byte
+leading space glued to punctuation, line breaks, and any other whitespace. It is
+implemented as a hand-written scan rather than a `regex` pattern because the
+Rust `regex` crate has no lookahead and the `(?!\S)` on the whitespace
+alternative is load-bearing for duplicated spaces; `PreTokenizer::split` returns
+byte slices that tile the input exactly, pinned byte for byte against CPython
+`regex` on the model's own `tokenizer.json` pattern by the committed split
+fixtures. Each piece becomes one *piece* here: `byte_encode` (the per-byte
 character mapping from §2.3) maps its bytes to printable chars, and the piece
 goes to `bpe_encode`. These piece boundaries are sacred — merges never cross
 them — which is why `" is"` and `"2"` never fuse into one token no matter what
@@ -497,7 +495,7 @@ the merge table says.
 Then the merge loop itself:
 
 ```rust
-// src/tokenizer.rs:226-249 (whole-piece shortcut at :218-221, lookup tail at :251-254)
+// src/tokenizer.rs (whole-piece shortcut at :218-221, lookup tail at :251-254)
 loop {
     // Find the best merge (lowest rank)
     let mut best_rank: Option<usize> = None;
@@ -525,19 +523,23 @@ loop {
 ```
 
 Read it as: loop {scan every adjacent pair, keep the lowest-rank one, splice
-it}, until no pair is in the merge table. Before the loop there is a shortcut
-— if the whole piece is already a vocab entry, return it directly
-(`:218-221`), the overwhelmingly common case for real words — and after it,
-each surviving piece is looked up in the vocab (`:251-254`). The tail lookup
-has one trap worth naming: a final piece that is somehow in neither the merge
-output nor the vocab maps to id 0 rather than erroring (`unwrap_or(0)`,
-`:253`) — see §3.4. Complexity is O(pieces²) per word with tiny constants;
-tokenization runs once per prompt, so it is not a hot path.
+it}, until no pair is in the merge table. There is deliberately **no**
+"whole piece is already a vocab entry" shortcut (F7/#50 removed one): a
+vocabulary entry is not necessarily reachable through merges — Qwen3.5 holds a
+Devanagari cluster as one entry with no rank producing it, and every reference
+splits it — so the loop always starts from single characters, exactly like HF
+`tokenizers` and llama.cpp. After it, each surviving piece is looked up in the
+vocab, and a piece that is not there falls back **one token per byte**
+(`byte_fallback`), which `Tokenizer::load` guarantees is possible by refusing a
+vocabulary that lacks any of the 256 byte tokens. The old tail mapped such a
+piece to id 0 (`unwrap_or(0)`) — see §3.4 for why that was a bug. Complexity is
+O(pieces²) per word with tiny constants; tokenization runs once per prompt, so
+it is not a hot path.
 
 #### 3.2.4 Decode: ids → bytes → streamed text
 
 ```rust
-// src/tokenizer.rs:322-345
+// src/tokenizer.rs
 pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
     let mut encoded = String::new();
     for &id in ids {
@@ -570,7 +572,7 @@ in the reverse byte map (vocab entries holding genuine unicode text rather
 than byte-mapped forms) pass through as their UTF-8 bytes (`:336-341`).
 
 The streaming holdback, used by the server and conversation paths, is
-`complete_utf8_prefix_len` (`src/tokenizer.rs:377-399`). Its doc comment says
+`complete_utf8_prefix_len` (`src/tokenizer.rs`). Its doc comment says
 it "mirrors llama.cpp's `format_incomplete_utf8` holdback", and the mechanism
 is just the UTF-8 length grammar walked once: the lead byte of a sequence
 determines its length (1 for ASCII, 2–4 for multi-byte, judged by the
@@ -592,7 +594,7 @@ for the penalty window (`generated.push` / `prev_tokens.push`,
 `:903-907`):
 
 ```rust
-// src/main.rs:900-902, 909-918
+// src/main.rs, 909-918
 if is_stop_token(sampled.token_id, &special) {
     break;
 }
@@ -609,17 +611,17 @@ if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
 }
 ```
 
-`special` came from `model.special_tokens()` (`src/main.rs:839`), and
-`is_stop_token` (`src/main.rs:1020-1022`) is the two-line sentinel check
+`special` came from `model.special_tokens()` (`src/main.rs`), and
+`is_stop_token` (`src/main.rs`) is the two-line sentinel check
 `id == special.eos || Some(id) == special.im_end` — the `SpecialTokens` struct
-itself is two fields (`eos`, `im_end: Option<u32>`, `src/models/mod.rs:88-91`).
+itself is two fields (`eos`, `im_end: Option<u32>`, `src/models/mod.rs`).
 Note the byte-accumulation pattern: decoded bytes go into `full` *before*
 emission (the rest of the loop, `:919-922`, flushes newly completed bytes), so
 a stop string (`--stop "Let me think"`) that straddles two tokens is caught in
 the accumulated stream — the same byte-first philosophy as §2.4. The tokens
 handed to `prev_tokens` also feed the sampler's repeat-penalty window (doc
 12), so prompt *and* generated token ids influence penalties from the very
-first step (`src/main.rs:847`).
+first step (`src/main.rs`).
 
 ### 3.3 Design choices (why this shape and not another)
 
@@ -645,7 +647,7 @@ honest trade-off is exactness risk: BPE implementations differ in
 pre-tokenization details, and a divergence silently changes every id. minfer
 buys that risk down with llama.cpp-parity tests —
 `special_tokens_match_as_single_ids_before_bpe` hardcodes ids copied from
-llama.cpp's tokenizer as the expected output (`src/tokenizer.rs:537-541`), so
+llama.cpp's tokenizer as the expected output (`src/tokenizer.rs`), so
 any divergence fails CI rather than shipping as subtly different model
 behavior.
 
@@ -666,10 +668,10 @@ KV row per layer, multiplied by every layer.
 The rendered prompt must end with the empty assistant-turn opener
 (`<|im_start|>assistant\n`), or the model's next-token distribution is
 "continue whatever turn is open" — usually a continuation of the user's own
-text (§2.2). It is hard-coded `true` on the CLI path (`src/main.rs:724`)
+text (§2.2). It is hard-coded `true` on the CLI path (`src/main.rs`)
 because a one-shot CLI prompt is definitionally a "start the assistant's turn"
 request. The multi-turn paths pass it explicitly too — and *only* on the final
-render: `format_single` (`src/template.rs:77-116`), the incremental renderer
+render: `format_single` (`src/template.rs`), the incremental renderer
 behind `--cnv`, renders the recorded past with `false` and only the new state
 with `true`, then diffs the two strings so the KV cache is appended with just
 the delta — a mid-history render must not append an opener, or the KV would
@@ -681,73 +683,74 @@ lossless streaming (§2.4). A string-oriented decoder would corrupt output
 precisely in the cases that matter — emoji, CJK — and permanently:
 `from_utf8_lossy` cannot be undone. The design keeps lossy conversion strictly
 at the presentation edge (the doc comment on `decode`,
-`src/tokenizer.rs:347-352`, says streaming paths must use `decode_bytes`),
+`src/tokenizer.rs`, says streaming paths must use `decode_bytes`),
 never in the data path.
 
 **Why match special tokens before BPE, with earliest-then-longest rules?**
 Special tokens are protocol punctuation; letting BPE see them destroys their
 meaning (and with R1-style fullwidth markers, the regex pieces can never
 recombine into the special string — the test comment at
-`src/tokenizer.rs:521-522` says exactly this). Earliest-position-wins matches
+`src/tokenizer.rs` says exactly this). Earliest-position-wins matches
 how a human reads: the leftmost marker is the next structural event.
 Longest-at-position-wins disambiguates prefixes (`<think` vs
 `<think▁begin｜>`); any other priority would be arbitrary.
 
 ### 3.4 Pitfalls & invariants
 
-**The minijinja 2.21 gotcha — Qwen3's template always falls back.** minfer
-uses `minijinja = "2"` with `default-features = false` (`Cargo.toml:15`). In
-minijinja 2.21, template strings are Rust strings and expose **no** `str`
-methods and no `lstrip`/`rstrip`/`strip`/`contains` filters — string work must
-be Jinja *filters*. Qwen3's shipped `chat_template` uses Python method syntax
-(`message.content.split('</think>')`, `.lstrip('\n')`), so it fails at render
-time with `unknown method: string has no method named split` and
-`render_messages` falls back to ChatML (`docs/QWEN3-SUPPORT-PLAN.md:317-334`,
-gotcha #9). The consequences are precise: plain chat still works (the
-fallback's `<|im_start|>` markers are Qwen3-compatible, and the model still
-emits `<think>` blocks), but think-block extraction, tool-call formatting, and
-`enable_thinking` handling are lost — the fallback feeds `<think>` content
-back verbatim on the next turn. Watch for the stderr warning
-`chat template rendering failed …, falling back to ChatML`: it means the
-fallback ran, not the model's own template.
+**The minijinja 2.21 gotcha — fixed in F7, and it is why the hook exists.**
+minfer uses `minijinja = "2"` with `default-features = false`. In minijinja 2.21
+template strings are Rust strings and expose **no** `str` methods, so Qwen3's
+shipped `chat_template` (Python method syntax:
+`message.content.split('</think>')`, `.lstrip('\n')`) used to fail at render
+time (`unknown method: string has no method named split`) and silently fall back
+to ChatML — losing think-block extraction, tool-call formatting and
+`enable_thinking` (`docs/QWEN3-SUPPORT-PLAN.md` §5 gotcha #9 keeps the
+historical record). F7 ([#50](https://github.com/yusiwen/minfer/issues/50))
+installs minijinja's unknown-method callback and implements those methods with
+CPython semantics, so the model's own template runs. The *new* failure mode is
+the opposite of the old one: if a template needs a construct the hook does not
+implement you get `Error: chat template error — unsupported template construct:
+…` and no inference — never a generic prompt that silently changes model
+behaviour.
 
 **Specials must never reach BPE.** The whole-string scan happens before
 `encode_bpe`, and the regression test exists because the R1 template broke
 otherwise. Invariant: a new special-token source must join
 `merged`/`special_by_first` *before* `encode` runs.
 
-**Unknown pieces silently map to id 0.** `bpe_encode`'s tail
-(`unwrap_or(0)`, `src/tokenizer.rs:253`) means a vocab/merges inconsistency
-yields the vocabulary's first entry instead of an error. Symptom: one word of
-output is consistently garbage. The empty-encode guard in `main.rs`
-(:731-734) catches the louder failure (nothing encoded at all).
+**Unknown pieces used to map to id 0 — now they cannot.** `bpe_encode`'s tail
+maps an unknown piece to one token per byte, and `Tokenizer::load` refuses a
+vocabulary that lacks any of the 256 byte tokens (F7/#50). Before that, a
+vocab/merges inconsistency silently yielded the vocabulary's first entry and one
+word of output was consistently garbage. The empty-encode guard in `main.rs`
+still catches the louder "nothing encoded at all" failure.
 
 **Byte-decode invariant: no lossy conversion in the streaming path.** The
-lossy `decode` (`src/tokenizer.rs:354-356`) exists for tests only — its doc
+lossy `decode` (`src/tokenizer.rs`) exists for tests only — its doc
 comment says so explicitly. Streaming paths must pair `decode_bytes` with
 `complete_utf8_prefix_len`, or multi-byte characters split across tokens become
 permanent U+FFFD in the transcript.
 
 **Template and conversation modes are coupled.** `--cnv` refuses
-`--no-template` (`src/main.rs:529-532`) because the conversation session's
+`--no-template` (`src/main.rs`) because the conversation session's
 append-only KV scheme *requires* template rendering to compute what the next
 turn appends.
 
 **Template output feeds KV sizing.** `ctx = max(n_ctx, prompt_len)`
-(`src/main.rs:749`): the rendered prompt's token count participates in sizing
+(`src/main.rs`): the rendered prompt's token count participates in sizing
 the persistent KV regions (doc 07). A runaway template (e.g. one that
 duplicates history) does not just slow prefill — it changes the allocation.
 
 ## 4. Observe & verify
 
 - **The two printed counts.** Every CLI run prints `Vocabulary: 151936 tokens`
-  (`src/main.rs:661` — the number for Qwen-family models) and then
-  `Prompt: {} tokens` (:735). Run the same prompt with and without
-  `--no-template`: the difference is exactly the boilerplate the template
-  added (system turn, role markers, the assistant opener).
+  (`src/main.rs` — the number for Qwen-family models) and then
+  `Prompt: {} tokens` (printed right after tokenization). Run the same prompt
+  with and without `--no-template`: the difference is exactly the boilerplate
+  the template added (system turn, role markers, the assistant opener).
 - **See the rendered prompt.** Build with `--features debug_dump` and set
   `MINFER_DUMP_DIR`: `crate::dump::maybe_dump_text("minfer_dump_prompt", …)`
-  (`src/main.rs:728-729`) writes the post-template, pre-tokenization string —
+  (`src/main.rs`) writes the post-template, pre-tokenization string —
   the literal `<|im_start|>…<|im_end|>…<|im_start|>assistant` text of §2.2.
   Format reference: `docs/debug-dump.md`.
 - **Unit tests are the fastest oracle — and the llama.cpp cross-check.**
@@ -755,19 +758,22 @@ duplicates history) does not just slow prefill — it changes the allocation.
   (`decode_bytes_reverses_byte_encoding`, the CJK
   `decode_bytes_keeps_multibyte_bytes`), the holdback grammar
   (`complete_utf8_prefix_len_holds_incomplete_trailing`), and all three
-  special-token rules — including the id list copied from llama.cpp
-  (`src/tokenizer.rs:537`), so any id-shifting change fails CI before it can
-  shift model behavior. `cargo test template::` covers rendering, both
-  fallbacks, and the incremental `format_single` diff semantics
+  special-token rules — including the id list copied from llama.cpp, and the
+  real-model `token_ids_match_the_reference` gate (5 cached models × 52 corpus
+  entries) that fails on any id shift. `cargo test template::` covers rendering
+  byte-for-byte against the committed transformers references, the loud
+  refusal, and the incremental `format_single` diff semantics
   (`format_single_diffs_only_new_user_message` renders the real Qwen ChatML
-  template shape, `src/template.rs:268`).
-- **Per-token text in traces and the loud fallback.** With
+  template shape, `src/template.rs`).
+- **Per-token text in traces and the loud refusal.** With
   `MINFER_TRACE=<path>`, the decode loop attaches each sampled token's decoded
-  text to the trace (`crate::trace::set_token`, `src/main.rs:926-930`) — handy
-  for spotting id-0 garbage from §3.4. And template parse/render failures
-  print `Warning: invalid chat template, falling back to ChatML` or
-  `Warning: chat template rendering failed (…) …` on stderr before inference
-  starts — if you see it, the model's own template is not what ran.
+  text to the trace (`crate::trace::set_token`, `src/main.rs`) — handy for
+  spotting byte-fallback pieces from §3.4. A template failure prints
+  `Error: chat template error — …` on stderr and stops before inference: the
+  model's own template is not renderable and the engine refused to substitute a
+  different prompt. The only line that means ChatML replaced a template is
+  `Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML
+  renderer`.
 
 ## 5. Cross-references
 
@@ -787,7 +793,14 @@ duplicates history) does not just slow prefill — it changes the allocation.
   whose per-token `decode_bytes` + holdback streaming this doc set up; also the
   multi-turn path where `format_single` renders only the appended turn.
 - `docs/QWEN3-SUPPORT-PLAN.md` §5 #9: the full minijinja 2.21 record — the
-  exact template lines that fail and the fallback consequences.
+  exact template lines that failed and the fallback consequences, kept as the
+  history of the bug F7 fixed.
+- `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`: the F7 contract — accepted and
+  refused template constructs, the loud refusal, the pre-tokenizer rules, and
+  the reference behind every gate.
+- `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`: the F7 contract — accepted and
+  refused template constructs, the loud refusal, the pre-tokenizer rules, and
+  the reference behind every gate.
 - `docs/OPENAI-CHAT-API-PLAN.md` and `docs/CLI-CONVERSATION-PLAN.md`: the
   server-side template handling (`render_messages`, `tools`) and the
   incremental-render design (`format_single`) behind multi-turn sessions.
