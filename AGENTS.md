@@ -49,6 +49,16 @@ src/
 │                    #   of prefilling them (donor may be busy; C8b S2 shares them in place on
 │                    #   CPU and copies elsewhere, and S3 copies a shared row out of the donor
 │                    #   as soon as a later request diverges inside the shared prefix)
+│                    #   F8: `metrics.rs` = the shared `Arc<ServerMetrics>` of relaxed
+│                    #   atomics behind `GET /metrics` (Prometheus text): live KV/arena
+│                    #   occupancy republished by the worker after every step, queue depth
+│                    #   (`accepted - admitted`, the one number neither thread sees alone),
+│                    #   running/in-flight counts, and per-op seconds under
+│                    #   `MINFER_OP_TIMING` (off by default; `optiming.rs` wraps the
+│                    #   scheduler's per-node dispatch, so it includes a backend's prologue
+│                    #   and excludes split syncs/copies). SIGINT/SIGTERM drain: refuse new
+│                    #   work, let in-flight responses finish up to `MINFER_DRAIN_MS`
+│                    #   (default 30000), then log and exit — never an unbounded worker join
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs)
@@ -74,6 +84,9 @@ MINFER_GRAPH_DUMP=/tmp/d  ./target/release/minfer <model> "hello"  # graph logit
 MINFER_TRACE=/tmp/t.json  ./target/release/minfer <model> "hello"  # per-node real-data trace for viz/
 ./target/release/minfer --gpu-layers 8 <model> "hello"             # E5: 8 blocks on the device, the rest on CPU
 ./target/release/minfer viz <model>                                # viz server (page + live SSE)
+MINFER_OP_TIMING=1 ./target/release/minfer serve <model>           # F8: per-op timing in /metrics (off by default)
+MINFER_DRAIN_MS=5000 ./target/release/minfer serve <model>         # F8: bound the SIGINT/SIGTERM drain (default 30000)
+curl -s http://127.0.0.1:8080/metrics                              # F8: Prometheus text snapshot
 ```
 
 - CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run 2026-09-23: 333 passed / 0 failed / 16 ignored, GB10 sm_121). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)).

@@ -170,11 +170,86 @@ Two environment switches around the GPU are easy to get wrong:
   concurrency still pays one prefill per request, and prefix reuse across slots
   needs a cell copy (C3/D1). The batched-decode win is unaffected.
 
+### Metrics and observability (F8)
+
+`GET /metrics` returns a [Prometheus text](https://prometheus.io/docs/instrumenting/exposition_formats/)
+snapshot (content type `text/plain; version=0.0.4; charset=utf-8`). It is served
+from its own router state, so a scrape needs neither the tokenizer nor the job
+channel and keeps answering while the model is busy; rendering only reads atomics,
+so scraping cannot perturb generation.
+
+Family names and units (every family is `minfer_`-prefixed; `*_bytes` is bytes,
+the per-op family is **seconds**, everything else is a count):
+
+- Request lifecycle: `minfer_requests_total`,
+  `minfer_requests_completed_total`, `minfer_requests_rejected_total` (refused
+  before queueing: the server is draining, or the worker is gone),
+  `minfer_requests_in_flight` (accepted and not yet finished — the drain
+  surface), `minfer_jobs_dropped_total` (the worker could not place the job).
+- Depth: `minfer_queue_depth` (`accepted - admitted`: the channel backlog plus
+  the worker's pending deque — the one number neither thread can see alone),
+  `minfer_worker_pending_jobs`, `minfer_requests_running` (occupying an engine
+  slot now).
+- Drain: `minfer_draining` (0/1), `minfer_drain_abandoned_requests` (still in
+  flight when the deadline expired; 0 is a clean drain).
+- Allocator (E4 `MemoryReport`, for the backend the server runs on):
+  `minfer_memory_{weights,pool,live,peak_live,budget,headroom}_bytes`,
+  `minfer_memory_idle_slots`, `minfer_memory_reserved_classes`. On an unbounded
+  backend (CPU/Metal with no budget) the `budget`/`headroom` families are
+  **omitted**, not reported as 0.
+- KV arena: `minfer_kv_{layers,rows,region_bytes}`, `minfer_kv_packed` (1 for a
+  packed Q8_0 cache), `minfer_kv_{reserved,owned,shared,free}_cells`,
+  `minfer_kv_{free_runs,sequences}`, and the C3/C8b counters
+  `minfer_kv_{defrags,cells_moved,cows,cow_cells}_total`.
+- Per-op timing (present **only** when the flag below is set):
+  `minfer_op_seconds_total{op="matmul"}` and `minfer_op_calls_total{op=…}`. The
+  interval is the scheduler's per-node dispatch, so it includes the backend's own
+  prologue and excludes split-level syncs and cross-backend copies; only ops that
+  actually ran appear.
+
+Occupancy is a **live** reading: the worker republishes the allocator's numbers
+after every step. On the batched path that is the one shared arena; the serial
+path has one arena per slot, so it reports the arena of the slot that served the
+last request.
+
+Flags:
+
+- `MINFER_OP_TIMING` — presence-checked (any value), **off by default**. Turns on
+  the per-op timing above. Off, the scheduler never reads the clock and the
+  timing family is absent from a scrape; on, the numbers reported change and the
+  numbers computed do not (a greedy run is identical with and without it).
+- `MINFER_DRAIN_MS` — how long a graceful shutdown may take, in milliseconds
+  (default `30000`). A value that is not a whole number of milliseconds is
+  reported and the default is used; `0` means "stop now". See below.
+
+```bash
+MINFER_OP_TIMING=1 ./target/release/minfer serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
+curl -s http://127.0.0.1:8080/metrics
+```
+
+### Graceful shutdown (F8)
+
+On `SIGINT` or `SIGTERM` the server stops accepting new work and lets the
+requests already accepted finish, up to `MINFER_DRAIN_MS`:
+
+1. the listener is closed (a brand-new connection gets a connection error), and
+   a request that arrives on an already-accepted connection gets
+   `503` — it is counted in `minfer_requests_rejected_total`;
+2. in-flight responses are allowed to complete;
+3. at the deadline the server logs how many requests were still in flight,
+   records that count in `minfer_drain_abandoned_requests`, and exits. It never
+   waits on the worker indefinitely — an SSE client that never disconnects cannot
+   keep the process alive.
+
+With no signal the server runs forever exactly as before, and the `--slots-file`
+snapshot (written after every completed request) is unaffected.
+
 
 ```bash
 ./target/release/minfer serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0
 # POST /v1/chat/completions  (stream + non-stream)
 # GET  /v1/models, GET /health
+# GET  /metrics  (Prometheus text; see "Metrics and observability" above)
 ```
 
 ## Performance testing (bench)

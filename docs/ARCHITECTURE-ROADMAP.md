@@ -567,12 +567,16 @@ systematic op × dtype × backend correctness matrix (every op checked on every
 backend against a CPU reference); it would have caught several items in §4
 automatically — that is ticket A1.
 
-**Observability.** No metrics endpoint, no queue-depth or KV-occupancy
-exposure, no per-op timing in production (only the heavy `MINFER_TRACE` path),
-no structured logging or levels, no graceful drain on shutdown, no
-worker-restart supervision. The trace/viz stack is an excellent *development*
-instrument but is not an operations one. 🟡 for a research engine, 🟠 the moment
-it is deployed.
+**Observability.** **F8 landed 2026-09-24** ([#51](https://github.com/yusiwen/minfer/issues/51)):
+`GET /metrics` (Prometheus text) exports live KV/arena occupancy, queue depth and
+the running/in-flight counts; per-op timing is available under
+`MINFER_OP_TIMING` (off by default, measured at the scheduler's per-node
+dispatch); and SIGINT/SIGTERM drains gracefully, bounded by `MINFER_DRAIN_MS`.
+Still missing: **structured logging and levels** (the server prints free-form
+startup lines), and **worker-restart supervision** (a panicking job is isolated
+per request by `run_job_isolated`, but a dead worker thread is not restarted).
+The trace/viz stack remains a *development* instrument, not an operations one.
+🟡 for a research engine, 🟠 the moment it is deployed.
 
 ---
 
@@ -625,7 +629,7 @@ work predates the tracker has no issue, and the plan is its record.
 |---|---|---|---|
 | 23 | **Op × dtype × backend matrix test**. — **done in A1** | §2.8 | M |
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. — **done in A2** | §2.8 | S |
-| 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. — **ticketed as F8** ([#51](https://github.com/yusiwen/minfer/issues/51); the only member of the A-era batch that had no ticket) | §2.8 | M |
+| 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. — **done in F8** ([#51](https://github.com/yusiwen/minfer/issues/51), 2026-09-24; the only member of the A-era batch that had no ticket). Structured logging/levels and worker supervision were **not** part of the ticket and remain open in §2.8 | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7; fully closed in E2**, which deleted `n_seqs` too after item 3 showed it was redundant, not just unread | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
 | 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
