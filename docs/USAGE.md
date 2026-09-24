@@ -208,8 +208,9 @@ Two fuse-related switches are easy to confuse (D3):
 
 The KV cache type is its own switch (C4): `MINFER_CACHE_TYPE=f32|f16|q8_0`, strict — an
 unknown value fails the load on every device, `f16` resolves to `f32` on the CPU (no f16
-KV kernel there) and `q8_0` is refused on CUDA and Metal until their kernels land
-([#87](https://github.com/yusiwen/minfer/issues/87)). A packed `q8_0` cache is 3.76×
+KV kernel there) and `q8_0` is refused where the attention kernel has no packed read — it is
+supported on the **CPU and CUDA** and refused on **Metal** (G5,
+[#44](https://github.com/yusiwen/minfer/issues/44)). A packed `q8_0` cache is 3.76×
 smaller and, since C4 S2, is read by a fused `Q8_0 × Q8_0` K dot with V accumulated out of
 the cell; `MINFER_NO_FUSED_Q8_KV=1` restores the older dequantize-into-a-scratch read for
 the A/B. Details, numbers and the named tolerance class: `docs/BACKENDS.md`,

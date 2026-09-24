@@ -281,9 +281,9 @@ Two layers of checks are deliberately *not* in `supports_op`:
 | `QkNorm` | `rms_norm` with `d = hd` over the flat `[nt*nh, hd]` view | `hd % 4 == 0`, nonzero, divides the element count |
 | `MatMul` | `matmul_f32_ptr_layout` + optional `add_bias_f32` | see the family table below |
 | `RoPE` | `copy_d2d` if not aliased, then `rope_f32` | neox; `hd` even |
-| `KvcacheStore` | `store_kv_f16` or `store_kv_f32` (K then V) | `out_buf == k_id`; `nt = elems(K_in)/nkt`; the rows are the `cells` input (C6) — device data, not re-validated against `n_ctx` here (the allocator's `kv_cells_for_seq` and `fill_input_i32` own that) |
-| `Attn` | `nt == 1` → `gqa_attn_split`; `1 < nt <= 16` → `gqa_attn_split_batched`; `nt > 16` → `gqa_attn_f16kv` (FA prefill when `hd == 128 && !MINFER_NO_FA_PREFILL`, else legacy) or `gqa_attn_f32` for f32 KV | the attention guards of §4.3; the batched verify path is bitwise-equal per position |
-| `Attn` **windowed** (`explicit_span`) | the same entry points, instantiated with `CAUSAL = false`; `bound` carries `[lo, hi)` pairs (`bound[t]` = `lo`, `bound[nt + t]` = `hi`) instead of `positions`, and every per-row limit must come from `hi` | `cuda_windowed_attention_matches_causal_for_long_windows` sweeps `(nh, nk, hd)` × `n` × `start` × **both KV dtypes**; 22/22 bitwise equal. `fa_prefill_f16kv` used `bound[t]` (the window's `lo`) as the causal limit until 2026-09-19, which made every non-zero-start prefill attend to a single row — see `ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0 |
+| `KvcacheStore` | `store_kv_f32` / `store_kv_f16`, or `store_kv_q8_0` for a packed cache (K then V), per `kv_layout` | `out_buf == k_id`; `nt = elems(K_in)/nkt`; the rows are the `cells` input (C6) — device data, not re-validated against `n_ctx` here (the allocator's `kv_cells_for_seq` and `fill_input_i32` own that). The packed store maps one thread to one `(row, 32-element block)` and uses the CPU's quantizer, so both backends write the same bytes |
+| `Attn` | f32/f16: `nt == 1` → `gqa_attn_split`; `1 < nt <= 16` → `gqa_attn_split_batched`; `nt > 16` → `gqa_attn_f16kv` (FA prefill when `hd == 128 && !MINFER_NO_FA_PREFILL`, else legacy) or `gqa_attn_f32`. **q8_0** (C4 S2b): `nt == 1` → `gqa_attn_split_q8_0` (the same 1-warp split-K body, `rpw_gate = 0` — the hybrid 4-warp body is f16-typed); every `nt > 1` → `gqa_attn_f32` (the batched split kernel's bitwise-identity purpose is not claimed for Q8_0, and `fa_prefill_f16kv` is f16-typed shared-memory staging) | the attention guards of §4.3; the batched verify path is bitwise-equal per position. A packed cache must therefore refuse `--spec-draft` (`spec::SpecEngine::new`), and its prefill is correct but off the tuned FA route |
+| `Attn` **windowed** (`explicit_span`) | the same entry points, instantiated with `CAUSAL = false`; `bound` carries `[lo, hi)` pairs (`bound[t]` = `lo`, `bound[nt + t]` = `hi`) instead of `positions`, and every per-row limit must come from `hi`. All three window modes are instantiated per layout | `cuda_windowed_attention_matches_causal_for_long_windows` sweeps `(nh, nk, hd)` × `n` × `start` × **both KV dtypes**; `cuda_map_window_matches_the_span_over_the_same_rows` sweeps all three layouts (f32/f16/q8_0) over the same rows. `fa_prefill_f16kv` used `bound[t]` (the window's `lo`) as the causal limit until 2026-09-19, which made every non-zero-start prefill attend to a single row — see `ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0 |
 | `FusedFFN` | concat `matmul_f32_ptr_layout` + in-place `swiglu_quant_off`/`swiglu_f32_off` | `nt == 1`; offset fuse when `n % 32 == 0` |
 | `FusedQKV` | concat matmul over `[wq\|wk\|wv]` + `attn_bias_rope_store` (sources `[x, positions, cells]`) | `nt == 1`, neox, even `hd`; concat weight + 3 biases registered; KV pair present. `positions[0]` ropes q/k, `cells[0]` addresses the four KV writes (C6), so the node is valid for a run that does not start at cell 0 |
 | `QkvBiasRopeStore` | `copy_d2d` for q + `attn_bias_rope_store` over three separate matmul outputs (sources `[q, k, v, positions, cells]`) | `nt == 1`, neox, even `hd`; 3 biases registered; same positions/cells split |
@@ -370,14 +370,32 @@ tensor's bytes), the q6_K `W_exp` dense plane (~1.52 GB on 7B), the q4_K/q6_K `W
 `CUDA_OPTIMIZATION.md` Appendix A); the promoted default spends ~3.27 GB to reach the 1.080× prefill
 path.
 
-**KV element type.** The persistent K/V regions keep their f32 IR shape, but the store/attention
-kernels can run an f16 cache: `set_kv_cache_type` auto-selects f16 when
-`n_layers × n_kv_embd >= 8192` (the 7B class, KV-bandwidth-bound decode) and f32 otherwise;
-`MINFER_CACHE_TYPE=f16|f32` overrides. The backend snapshots the decision into `kv_f16` at
-construction, and `store_kv_f16`/`gqa_attn_*_f16kv` are the kernels that honour it.
-`MINFER_CACHE_TYPE=q8_0` (C4) is **refused at load** on CUDA — a packed region needs kernels
-that read Q8_0 rows, which is [issue #87](https://github.com/yusiwen/minfer/issues/87); the
-refusal is the point, since the old parser read any unknown value as f32.
+**KV layout.** The persistent K/V regions keep their f32 IR shape, but the store/attention kernels
+run one of three layouts, tagged by `crate::cuda::KV_LAYOUT_F32/F16/Q8_0` — the same `0/1/2` codes
+`KvFormat` uses, and a host contract the kernels are templated on (`int LAYOUT` in
+`cuda_kernels.cu`):
+
+- `KV_LAYOUT_F32` — one f32 per element;
+- `KV_LAYOUT_F16` — one f16 per element in the first half of the f32-shaped region
+  (`set_kv_cache_type` auto-selects it when `n_layers × n_kv_embd >= 8192`, the 7B class, and
+  `MINFER_CACHE_TYPE=f16` overrides);
+- `KV_LAYOUT_Q8_0` — packed 34-byte Q8_0 blocks, one cell rounded up to whole f32 words
+  (`MINFER_CACHE_TYPE=q8_0`, C4 S2b).
+
+Every KV address is formed in **bytes**: `kv_row(base, cell, row_bytes)` names a cell and
+`kv4<LAYOUT>(row, elem) -> float4` is the one load idiom — the old `float4` load for f32, the old
+two-`__half2` pair for f16 (both bit-identical to the pre-C4 instantiations), and for Q8_0 the f16
+scale plus four quants of block `elem/32`. A 4-element group never straddles a block because a KV
+head's base is `hd`-aligned and `hd % 32 == 0` (`ensure_kv`'s packed-width check). The kernels take
+`const void* k/v` plus `size_t row_bytes`, and the launchers take the layout as an `int`.
+
+`CudaBackend` snapshots the process-wide policy into its `kv_layout` field at construction
+(`crate::cuda::kv_cache_layout`), and `kv_row_bytes(nkt)` derives the stride (`nkt*4`, `nkt*2`, or
+`KvFormat::Q8_0.row_bytes(nkt)`). The packed store is `store_kv_q8_0`, whose quantizer is the CPU's
+step for step (`amax/127`, f16 scale, round-ties-even), so both backends store the same bytes.
+Before C4 S2b this was a `bool` that mapped anything not exactly `f16` to f32 — which would have
+addressed a packed region as f32 rows, the silent corruption the layout tag exists to make
+impossible.
 
 **Host transfers.**
 

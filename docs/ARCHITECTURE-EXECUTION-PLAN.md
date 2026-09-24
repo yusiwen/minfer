@@ -833,7 +833,7 @@ real model. Still open: driving the compaction from the **server's** dynamic run
 there), and the logical-positions change that would remove the re-rope and the
 offset sensitivity altogether.
 
-### C4 — Quantized KV cache, Q8_0 first · [#42](https://github.com/yusiwen/minfer/issues/42) — **DONE (CPU: S1 + S2) 2026-09-23**
+### C4 — Quantized KV cache, Q8_0 first · [#42](https://github.com/yusiwen/minfer/issues/42) — **DONE (CPU: S1 + S2a; CUDA: S2b) 2026-09-24**
 
 **Why.** f32 (and the GPU's f16-in-an-f32-region) is all the cache could be, so context
 length was bounded by KV memory with no way to trade precision for it. Q8_0 is the first
@@ -964,7 +964,12 @@ byte-based addressing plus a block-dequantizing load in every attention kernel (
 modes each), a Q8_0 store, and the fused decode QKV epilogue's own store. Metal stays at G5
 by the round's own decision.
 
-**C4 S2b — the CUDA Q8_0 kernels: the plan of record (2026-09-24, design only).**
+**C4 S2b — the CUDA Q8_0 kernels: landed 2026-09-24 ([#87](https://github.com/yusiwen/minfer/issues/87)).**
+The subsection below is the plan of record as it was written *before* the kernels; the design
+decisions, the measured results and the honest scope are recorded after it, so the plan and the
+outcome can be read against each other.
+
+**The plan of record (2026-09-24, written before the first line of kernel code).**
 
 The CPU half of #87 landed (S2a). The device half is a kernel project, not a read-path change, so
 it lands as its own increment against the same issue. This is the map it starts from: where the
@@ -1092,9 +1097,87 @@ drift into a silent fallback:
    already recorded for the CPU's fused Q8_0 read at ctx 2048), and the prefill is reported as its
    own number because it takes the untuned `gqa_attn_f32` route.
 
-**Why it is not in this increment.** ~10 kernel sites, 3 launchers, ~15 host sites and 41 test
-sites, each needing an nvcc iteration and — for the gates — a serial device run. It is recorded
+**Why it was not in the S2a increment.** ~10 kernel sites, 3 launchers, ~15 host sites and 41 test
+sites, each needing an nvcc iteration and — for the gates — a serial device run. It was recorded
 here rather than half-wired. [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+
+**What actually landed (2026-09-24).** The real counts are close to the estimate: **8 kernel
+sites**, **3 launchers** (`launch_gqa_attn_split_q8_0`, the layout-tagged `launch_gqa_attn_f32`,
+`launch_store_kv_q8_0`) plus two re-templated existing ones, ~25 host sites (`cuda.rs`'s FFI +
+`CudaState` methods, `cuda_backend.rs`'s store/attention/fused-epilogue dispatch, `copy_cells`, the
+registry entry), 4 new gates and 2 strengthened ones. The two files the plan expected not to change
+did not: `kv_move_rows` is a plain word copy (verified — the packed cell's word count is what the
+host already passes, and the Q8_0 move gate pins it), and the CPU path is untouched.
+
+- **Layout and accessors, exactly as designed.** `KV_LAYOUT_F32/F16/Q8_0` are `0/1/2` on both sides
+  of the FFI; `kv_row` + `kv4<LAYOUT>` are the one address/load idiom. The f32 and f16 kernels
+  compile to their pre-C4 instructions (same loads, same cells, same order).
+- **The gate flipped through the registry.** `BackendCaps::reads_packed_kv` became `true` for CUDA
+  and `KvFormat::supports(Cuda)` followed automatically; `CudaBackend` carries an `int kv_layout`
+  fed by the resolved `KvFormat`, so the pre-S2b `bool` that mapped anything but `f16` to f32 can no
+  longer turn a packed region into f32 rows.
+- **The store is the CPU's quantizer, byte for byte.** `cuda_q8_0_store_matches_the_cpu_quantizer`
+  asserts the device's packed words equal `kvformat::pack_q8_0_cell`'s for two block widths, and
+  that unwritten cells stay zero. Mutation: `amax / 126` instead of `/ 127` fails it at `nkt=64 row
+  0`.
+- **All three acceptance gates, mutation-checked.** `cuda_map_window_matches_the_span_over_the_same_rows`
+  now sweeps **f32/f16/q8_0**; `cuda_kv_q8_0_roundtrip_attn` (store → attention) and
+  `cuda_q8_0_kv_cell_move_strides_by_row_bytes` (`copy_cells` under the packed stride) are the two
+  new device gates. `compute-sanitizer --tool memcheck` over all three reports **no memory error**
+  (2 pre-existing `cudaFuncSetAttribute` API errors, the same ones master prints — follow-up). Mutations: dropping the Q8_0 block base in `kv4` left the map-window gate
+  **green** (every comparison there is *between* modes over the same bytes, so a value-level fault
+  shifts both sides together — the F6 lesson) and made the round-trip and the **real-model device
+  arm** fail (max |Δlogit| 2.48 → 26.34 of a 37.8 spread); halving the packed stride in
+  `copy_cells` fails the move gate; flipping `READS_PACKED_KV` back to `false` makes the device arm
+  refuse the region loudly. The map-window gate was **strengthened**: it now also compares one
+  single-row Q8_0 window against the dequantized V cell (max |Δ| 1.71 under the block-base
+  mutation), so it cannot pass on consistency alone.
+
+**The A/B against f16, measured on GB10 (sm_121)** — the bar was named before the work as "Q8_0
+decode no worse than `1/1.30` of f16" and **it is not met against the fused f16 baseline**:
+
+| model / config | f16 (default policy) | q8_0 | factor |
+|---|---|---|---|
+| Qwen2.5-0.5B q4_0, `pp2048` @ n_ctx 4096 | 2693.54 tok/s | 2171.85 tok/s | 1.24x slower |
+| Qwen2.5-0.5B q4_0, `tg128` @ n_ctx 4096 | 239.76 tok/s | 162.46 tok/s | **1.48x slower** |
+| …f16 with the fused epilogue cut (`MINFER_NO_FUSE_QKV=1`) | 203.58 tok/s | — | the Q8_0 kernel's own cost is **1.25x** |
+| Qwen3-0.6B Q8_0 (hd 128), `pp2048` | 8604.56 tok/s | 562.76 tok/s | **15.3x slower** |
+| Qwen3-0.6B Q8_0 (hd 128), `tg128` | 137.85 tok/s | 122.21 tok/s | 1.13x slower |
+
+Read honestly: decode on the 0.5B misses the named 1.30x because ~1.18x of the gap is the **stated
+cut** (no fused QKV epilogue for a packed cache — the unfused chain adds launches on a model whose
+decode is launch-bound) and the remaining **1.25x** is the packed load itself (`kv4<Q8_0>` costs
+four int8 converts and four multiplies where f16 costs two `__half2` converts; there is no dp4a
+packed dot in this increment). On Qwen3-0.6B, where the fused epilogue is not on the f16 default
+path in the same way, decode is 1.13x — inside the bar. The prefill is a different story: at hd 128
+the f16 path is `fa_prefill_f16kv` (**8604** tok/s) and the packed path is the general kernel
+(**563** tok/s), i.e. the packed cache is correct but off its tuned route by 15x. **The win is
+memory, as stated up front**: measured on both models, the f32/f16 region is 6 291 456 B and the
+Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2 B/element payload
+(3 145 728 B), 1.88x smaller.**
+
+**Acceptance results.**
+
+- *Real model, device arm*: `a_packed_kv_cache_answers_like_the_f32_one` runs **both** arms — the
+  CPU one (kept, coverage on every build) and, on a CUDA build with a device, one that asserts
+  `device() == Cuda`. 0.5B: f32 6 291 456 B vs q8_0 1 671 168 B (3.76x), CPU max |Δlogit| 3.03 /
+  argmax 0.65, CUDA 2.48 / 0.60 of a 37.8 spread; the physical-shift arm: CPU 2.47 / 0.064, CUDA
+  3.34 / 0.42 — inside the bounds the CPU gate had already fixed.
+- *Suites*: CPU `cargo test --release` **432 / 0 / 28** unit + **10 / 0 / 6** integration
+  (unchanged); CPU serial ignored **28 / 0**; CUDA serial unit **490 / 0 / 31** (was 486/0/31: three
+  new device gates + one new `cuda.rs` layout test; the packed gate now also runs on the device);
+  CUDA serial ignored 0.5B **31 / 0**; Qwen3-0.6B **30 / 1**, the one failure still the pre-existing
+  [#130](https://github.com/yusiwen/minfer/issues/130) f16 session-container gap.
+- *The Q8_0 session container works.* `a_session_resumed_from_disk_continues_bitwise` with
+  `MINFER_CACHE_TYPE=q8_0` on the device prints `live KV format: q8_0`, saves 24 layers / 256 cells
+  / 5 written / 1 696 464 B and continues **bitwise** (max |Δlogit| = 0). The container's
+  `FLAG_PACKED` bit is what encodes it; **f16 remains the one type with no flag** (the same #130
+  question).
+
+**Handed off after S2b, still on [#87](https://github.com/yusiwen/minfer/issues/87):** the packed
+**fused decode epilogue** (a block-quantizing store inside `attn_bias_rope_store` would recover the
+1.18x on the 0.5B) and a **dp4a packed K dot** (the 1.25x), then the FA prefill on packed cells
+(the 15x at hd 128). [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
 
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 

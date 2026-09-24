@@ -895,8 +895,8 @@ and ignored).
 - `MINFER_DISABLE_MPS=1` — forces CPU on macOS; the log flips to
   `MPS: disabled by MINFER_DISABLE_MPS` and the graph's backend colors (next
   bullet) go all-CPU. `MINFER_DISABLE_CUDA=1` is its CUDA twin.
-- `MINFER_WEIGHT_COPY=1` / `MINFER_CACHE_TYPE=f16|f32|q8_0` (`q8_0` is CPU-only,
-  C4) — the first makes
+- `MINFER_WEIGHT_COPY=1` / `MINFER_CACHE_TYPE=f16|f32|q8_0` (`q8_0` is CPU + CUDA,
+  C4; Metal is G5) — the first makes
   Metal copy each weight into a fresh buffer instead of wrapping the mmap
   pages (A/B the zero-copy path); the second pins the KV element type
   instead of the size-based auto-select.
