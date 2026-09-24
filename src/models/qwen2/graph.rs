@@ -1016,6 +1016,30 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    /// Restores the process-wide KV format when it drops.
+    ///
+    /// The C4 packed gate flips the format for its measurement runs. Its normal
+    /// path restores `f32` itself, but a panic in between (the #87 refusal is the
+    /// one that bit) does not reach that line, and the **next** test in the serial
+    /// `#[ignore]`d set then sizes its KV region for `q8_0` and is refused too —
+    /// the collateral #122 recorded, the mechanism of #99. A `Drop` guard makes the
+    /// restoration panic-safe without touching the format's ownership (per-engine
+    /// format is #99 and explicitly out of scope here).
+    struct KvFormatGuard(crate::graph::kvformat::KvFormat);
+
+    impl KvFormatGuard {
+        /// Snapshot the format in effect *before* the gate flips it.
+        fn new() -> Self {
+            Self(crate::graph::kvformat::kv_format())
+        }
+    }
+
+    impl Drop for KvFormatGuard {
+        fn drop(&mut self) {
+            crate::graph::kvformat::set_kv_format(self.0);
+        }
+    }
+
     /// C4's acceptance on the real model: the packed regions are measurably smaller,
     /// and the Q8_0 cache stays inside a **named logit tolerance** of the f32 one.
     /// The class is not bitwise, and not greedy equality either: the store rounds
@@ -1041,8 +1065,12 @@ mod tests {
     /// the shift's two halves (V verbatim, K the quantizate of the re-roped row).
     ///
     /// Ignored because the format is a process-wide policy and this test flips it;
-    /// run it alone (the CPU test binary is the configuration it is written for —
-    /// with the `cuda` feature on a CUDA box the load refuses `q8_0`, as designed).
+    /// run it alone. It is **device-aware**: the packed q8_0 read has a CPU
+    /// attention kernel only, so on a CUDA/Metal box `ensure_kv` refuses a packed
+    /// region on the device by design (issue #87). The load below therefore asks
+    /// for `--gpu-layers 0` — the model, and every measurement run, is CPU-only on
+    /// every build — instead of the gate being skipped on a GPU box, which would
+    /// delete its coverage exactly where the documented CUDA command needs it.
     /// `MINFER_C4_MODEL` points it at another cached model:
     ///
     /// ```text
@@ -1055,7 +1083,8 @@ mod tests {
     fn a_packed_kv_cache_answers_like_the_f32_one() {
         use crate::graph::cache::GraphCache;
         use crate::graph::kvformat::{set_kv_format, KvFormat};
-        use crate::models::ModelDef;
+        use crate::graph::offload::OffloadRequest;
+        use crate::models::{Device, ModelDef};
 
         let Some(path) = std::env::var_os("MINFER_C4_MODEL")
             .map(std::path::PathBuf::from)
@@ -1065,7 +1094,32 @@ mod tests {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        let model = crate::models::load_model(&gguf).expect("load model");
+        // C4 S2's packed read is CPU-only until #87 lands a device kernel: a CUDA
+        // (or Metal) attention kernel addresses f32/f16 rows, so a packed region on
+        // the device is refused at `ensure_kv`. `Layers(0)` is the established way
+        // to ask for the all-CPU configuration (see
+        // `a_partial_offload_runs_the_rest_on_the_cpu`), and the load resolves the
+        // KV format against the device it actually landed on, so this is a clean
+        // CPU model on every build. Assert it, so a future change that lets the
+        // device claim the model fails loudly here instead of quietly measuring the
+        // wrong backend.
+        let model = crate::models::load_model_with(&gguf, "", OffloadRequest::Layers(0))
+            .expect("load the C4 gate's model CPU-only");
+        assert_eq!(
+            model.device(),
+            Device::Cpu,
+            "the packed-KV gate must run on the CPU backend: no device attention kernel reads a \
+             packed q8_0 region yet (issue #87)"
+        );
+        eprintln!(
+            "[c4] CPU-only by construction: the packed q8_0 read has no device kernel yet \
+             (issue #87), so this gate runs `--gpu-layers 0` rather than skipping on a GPU box"
+        );
+        // The format is process-wide and this gate flips it; restore it even if an
+        // assertion panics, so the *next* test in the serial `#[ignore]`d set does
+        // not size its KV region for `q8_0` (the collateral #122 recorded, whose
+        // mechanism is #99).
+        let _format = KvFormatGuard::new();
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx);
         let n_ctx = 256;
         let steps = 8;
@@ -1092,6 +1146,7 @@ mod tests {
 
         let (l_ref, t_ref, b_ref) = run(KvFormat::F32);
         let (l_q8, t_q8, b_q8) = run(KvFormat::Q8_0);
+        // Normal-path restore; `_format` (the guard) is the panic-safe backstop.
         set_kv_format(KvFormat::F32);
         let ratio = b_ref as f64 / b_q8 as f64;
         let worst = l_ref
@@ -1206,6 +1261,7 @@ mod tests {
         };
         let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(KvFormat::F32);
         let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(KvFormat::Q8_0);
+        // Normal-path restore; `_format` (the guard) is the panic-safe backstop.
         set_kv_format(KvFormat::F32);
         assert_eq!(left_ref, left_q8, "the same shift must leave the same rows");
         assert_eq!(left_ref, shift_n - drop);
