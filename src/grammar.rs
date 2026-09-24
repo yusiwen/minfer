@@ -722,29 +722,57 @@ enum Flow {
 /// The contiguous codepoint range an incomplete-but-valid UTF-8 prefix can still
 /// complete to (`[0xE4]` -> `U+4000..=U+4FFF`), or `None` when the bytes cannot
 /// start a character at all.
+///
+/// Overlong encodings and the surrogate block are excluded here, not filtered
+/// later: `[0xE0]` completes only to `U+0800..=U+0FFF` (a `U+0000..=U+07FF`
+/// completion would be an overlong 3-byte form, which is not valid UTF-8), and
+/// `[0xED]` only to `U+D000..=U+D7FF`. Getting this wrong is how a lone `0xE0`
+/// came to be accepted after a closed JSON object — the run then had no legal
+/// continuation and the response ended with U+FFFD.
 fn completion_range(partial: &[u8]) -> Option<(u32, u32)> {
     let b0 = *partial.first()?;
-    let (len, mut value) = if b0 & 0xE0 == 0xC0 {
-        (2u32, (b0 & 0x1F) as u32)
-    } else if b0 & 0xF0 == 0xE0 {
-        (3, (b0 & 0x0F) as u32)
-    } else if b0 & 0xF8 == 0xF0 {
-        (4, (b0 & 0x07) as u32)
-    } else {
-        return None;
+    // (sequence length, payload mask, allowed range of the *first* continuation)
+    let (len, value0, c_lo, c_hi) = match b0 {
+        0xC2..=0xDF => (2u32, (b0 & 0x1F) as u32, 0x80u32, 0xBFu32),
+        // 0xE0's first continuation must be >= 0xA0 (else the form is overlong).
+        0xE0 => (3, (b0 & 0x0F) as u32, 0xA0, 0xBF),
+        0xE1..=0xEC | 0xEE..=0xEF => (3, (b0 & 0x0F) as u32, 0x80, 0xBF),
+        // 0xED's first continuation must be <= 0x9F (else it encodes a surrogate).
+        0xED => (3, (b0 & 0x0F) as u32, 0x80, 0x9F),
+        // 0xF0's first continuation must be >= 0x90 (else overlong).
+        0xF0 => (4, (b0 & 0x07) as u32, 0x90, 0xBF),
+        0xF1..=0xF3 => (4, (b0 & 0x07) as u32, 0x80, 0xBF),
+        // 0xF4's first continuation must be <= 0x8F (else above U+10FFFF).
+        0xF4 => (4, (b0 & 0x07) as u32, 0x80, 0x8F),
+        // 0x80..=0xC1 (stray continuation / overlong 2-byte leader) and
+        // 0xF5..=0xFF (above U+10FFFF) cannot start a character.
+        _ => return None,
     };
     if partial.len() as u32 >= len {
         return None; // already complete, or not a prefix at all
     }
-    for &b in &partial[1..] {
+    let mut value = value0;
+    for (idx, &b) in partial[1..].iter().enumerate() {
         if b & 0xC0 != 0x80 {
+            return None;
+        }
+        if idx == 0 && !((c_lo..=c_hi).contains(&(b as u32))) {
             return None;
         }
         value = (value << 6) | (b & 0x3F) as u32;
     }
-    let free = 6 * (len - partial.len() as u32);
-    let lo = value << free;
-    let hi = lo + ((1u32 << free) - 1);
+    let (lo, hi) = if partial.len() == 1 {
+        // The first continuation is constrained; the rest are free.
+        let tail = 6 * (len - 2);
+        let lo = ((value << 6) | (c_lo - 0x80)) << tail;
+        let hi = (((value << 6) | (c_hi - 0x80)) << tail) | ((1u32 << tail) - 1);
+        (lo, hi)
+    } else {
+        // The given continuations were validated above; only the tail is free.
+        let free = 6 * (len - partial.len() as u32);
+        let lo = value << free;
+        (lo, lo | ((1u32 << free) - 1))
+    };
     Some((lo, hi))
 }
 
@@ -2985,6 +3013,39 @@ mod tests {
         assert_eq!(covers(&[(0x00, 0x1F), (0x22, 0x22)], 0x00, 0x1F), true);
         assert_eq!(covers(&[(0x00, 0x1F), (0x22, 0x22)], 0x00, 0x22), false);
         assert_eq!(non_surrogate_parts(0xD000, 0xE100).len(), 2);
+
+        // Overlong forms and the special leaders: only the *valid* completions
+        // count. A 3-byte form of U+0061 (0xE0 0x80 ...) is not valid UTF-8, so
+        // `[0xE0]` must not be treated as a way to reach ASCII.
+        assert_eq!(completion_range(&[0xC0]), None, "overlong 2-byte leader");
+        assert_eq!(completion_range(&[0xC1]), None, "overlong 2-byte leader");
+        assert_eq!(completion_range(&[0xC2]), Some((0x80, 0xBF)));
+        assert_eq!(completion_range(&[0xE0]), Some((0x800, 0xFFF)));
+        assert_eq!(
+            completion_range(&[0xE0, 0x80]),
+            None,
+            "overlong first continuation"
+        );
+        assert_eq!(completion_range(&[0xED]), Some((0xD000, 0xD7FF)));
+        assert_eq!(completion_range(&[0xED, 0xA0]), None, "surrogate block");
+        assert_eq!(completion_range(&[0xF0]), Some((0x10000, 0x3FFFF)));
+        assert_eq!(
+            completion_range(&[0xF0, 0x80]),
+            None,
+            "overlong first continuation"
+        );
+        assert_eq!(completion_range(&[0xF4]), Some((0x100000, 0x10FFFF)));
+        assert_eq!(completion_range(&[0xF5]), None, "above U+10FFFF");
+        assert_eq!(
+            completion_range(&[0xE4, 0xB8, 0x41]),
+            None,
+            "bad continuation"
+        );
+
+        // U+0061 ('a') is not in [0x800, 0xFFF], so an 0xE0 leader can never
+        // reach it: the mask must reject that token (the live-server defect).
+        let (lo, hi) = completion_range(&[0xE0]).unwrap();
+        assert!(!(lo..=hi).contains(&0x61));
     }
 
     #[test]

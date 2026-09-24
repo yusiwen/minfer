@@ -520,7 +520,19 @@ fn generate_seq(
             }
         }
     } else if emitted < full.len() {
-        emit(&full, emitted, full.len(), tx)?;
+        // Never end a response body mid-character: a still-pending partial
+        // sequence can never complete now, so it is dropped rather than decoded
+        // to U+FFFD (the text stays a valid prefix of the grammar's language).
+        let complete = emitted + crate::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+        if complete > emitted {
+            emit(&full, emitted, complete, tx)?;
+        }
+        if complete < full.len() {
+            eprintln!(
+                "[server] dropped {} trailing byte(s) of an incomplete UTF-8 character",
+                full.len() - complete
+            );
+        }
     }
     let _ = tx.blocking_send(StreamEvent::Finish {
         reason: finish_reason.to_string(),
