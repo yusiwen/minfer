@@ -9,12 +9,13 @@
 //! the per-layer KV regions (each layer owns TWO persistent regions: K and V —
 //! symmetric across backends). Persistent regions survive graph rebuilds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::allocplan;
 use super::backend::Backend as BackendTrait;
 use super::backend::KvProvider;
+use super::copystats::{self, CrossCopyStats};
 use super::cpu_backend::CpuBackend;
 use super::kvformat::KvFormat;
 use super::kvsession::{
@@ -117,6 +118,20 @@ pub struct GraphAllocator {
     /// The entries survive a re-map (`alloc_graph` no longer drops them) — re-creating them
     /// per switch would leak, since staging is allocated fresh, never from the slot table.
     cross: HashMap<(u64, NodeId, Backend), BufRef>,
+    /// F5 ([#58]): the staging entries whose async copy has been enqueued but
+    /// whose event has not been waited on yet — i.e. the boundary inputs that
+    /// still **owe** their phase-B wait. `copy_across` inserts, `await_cross`
+    /// removes; `cross_input` (the consumer's read) refuses a pending entry
+    /// loudly, so a boundary that drops its wait is a named error instead of a
+    /// read of in-flight device data.
+    ///
+    /// Cleared at every `alloc_graph` (a rebuild starts a fresh execution, and no
+    /// copy can be in flight across it — the boundary either completed or failed).
+    cross_pending: HashSet<(u64, NodeId, Backend)>,
+    /// F5: what this allocator's split boundaries did — the measured half of "no
+    /// host-side blocking copy on the hot path". See
+    /// [`super::copystats::CrossCopyStats`].
+    cross_stats: CrossCopyStats,
     /// (backend, pool id) → last exec index it stays alive until
     buf_alive: HashMap<(Backend, usize), usize>,
     /// E4: bytes each pooled buffer occupies (its size class), keyed by `(backend, id)`
@@ -173,6 +188,8 @@ impl Default for GraphAllocator {
             cuda: None,
             node_to_buf: HashMap::new(),
             cross: HashMap::new(),
+            cross_pending: HashSet::new(),
+            cross_stats: CrossCopyStats::default(),
             buf_alive: HashMap::new(),
             buf_bytes: HashMap::new(),
             slots: HashMap::new(),
@@ -446,6 +463,9 @@ impl GraphAllocator {
         }
         self.buf_alive.clear();
         self.node_to_buf.clear();
+        // F5: a rebuild starts a fresh execution — no staging copy can be in
+        // flight across it (the boundary either completed or failed loudly).
+        self.cross_pending.clear();
         // Cross-backend staging buffers are keyed by `(graph uid, node, backend)` and
         // survive both a rebuild and a re-map (E4 S3): their size follows the shape of the
         // node in *that* graph, so an entry is only valid for its own graph, and re-creating
@@ -2329,9 +2349,8 @@ impl GraphAllocator {
         }
     }
 
-    /// Cross-backend copy of a node's buffer into `dst_backend`'s pool:
-    /// host round trip through read_host/write_host (shared-memory GPU
-    /// buffers make this a plain memcpy both ways).
+    /// F5 ([#58]) **phase A** of a cross-backend staging copy: *enqueue* the
+    /// transfer of a node's buffer into `dst_backend`'s staging buffer.
     ///
     /// The node's canonical buffer (node_to_buf) is left untouched — the copy
     /// lands in the `cross` staging map, which the scheduler consults when a
@@ -2340,6 +2359,18 @@ impl GraphAllocator {
     /// re-executable: the producing split always finds its buffer where the
     /// allocator put it, and the staging buffer (allocated once per graph
     /// rebuild) is simply rewritten on each execute.
+    ///
+    /// **The transfer itself is the source backend's registered hook**
+    /// (`BackendEntry::copy_cross`), so there is no `match backend` here: a
+    /// backend with device memory enqueues it asynchronously and records an
+    /// event, a backend without device memory performs the synchronous host round
+    /// trip it always did, and a backend that has not been ported *declines*
+    /// (`Ok(false)`) and gets the synchronous path. The entry is inserted into
+    /// `cross_pending` **before** the hook runs, so the contract "every staged
+    /// input owes exactly one wait" holds even when the hook fails.
+    ///
+    /// Phase B is [`Self::await_cross`]; the consumer's read is
+    /// [`Self::cross_input`], which refuses to hand out a still-pending entry.
     pub fn copy_across(
         &mut self,
         uid: u64,
@@ -2352,56 +2383,240 @@ impl GraphAllocator {
         if br.backend == dst_backend {
             return Ok(());
         }
+        let dst = self.cross_staging(uid, node_id, dst_backend)?;
+        self.cross_pending.insert((uid, node_id, dst_backend));
+        self.cross_stats.copies += 1;
+        if copystats::async_copies_enabled() {
+            let entry = br.backend.entry().ok_or_else(|| {
+                format!(
+                    "copy_across: {} is not compiled into this build",
+                    br.backend.name()
+                )
+            })?;
+            if (entry.copy_cross)(self, uid, node_id, dst_backend)? {
+                return Ok(());
+            }
+        }
+        // The synchronous host round trip: the pre-F5 path, the metal path until
+        // it is ported, and the `MINFER_SYNC_COPIES=1` reference side of the
+        // bitwise A/B.
+        self.copy_across_blocking(node_id, dst)
+    }
+
+    /// The staging buffer a boundary copies `node_id` into for `dst_backend`,
+    /// allocating it on first use. One staging buffer per (graph, node,
+    /// destination backend) per graph: the size is part of the entry's identity (a
+    /// graph's shapes never change under one uid, so the mismatch branch is a
+    /// backstop, not a hot path).
+    fn cross_staging(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        dst_backend: Backend,
+    ) -> Result<BufRef, String> {
+        let len = self
+            .node_buffer(node_id)
+            .ok_or_else(|| format!("node {node_id} has no buffer"))?
+            .len;
+        let key = (uid, node_id, dst_backend);
+        if let Some(&cb) = self.cross.get(&key) {
+            if cb.len == len {
+                return Ok(cb);
+            }
+            // The size is part of the entry's identity (a graph's shapes never
+            // change under one uid, so this is a backstop, not a hot path).
+            self.cross.remove(&key);
+            self.free_in_pool(cb.backend, cb.id);
+        }
+        let id = self.alloc_fresh_in(dst_backend, len);
+        // Staging is exact (it is not an activation, so the class ladder does not
+        // apply), but it is still pool memory the budget must see: charge it as
+        // resident and live until the next rebuild frees it (E4 S2).
+        let bytes = len * 4;
+        self.buf_bytes.insert((dst_backend, id), bytes);
+        *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;
+        let live = self.live_bytes.entry(dst_backend).or_insert(0);
+        *live += bytes;
+        let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
+        *peak = (*peak).max(*live);
+        let staged = BufRef::own(dst_backend, id, len);
+        self.cross.insert(key, staged);
+        Ok(staged)
+    }
+
+    /// F5: the **pre-F5 synchronous** host round trip of one staging copy — host
+    /// read of the source through the source entry's `host_read`, then a write
+    /// into the destination pool. Reached by `MINFER_SYNC_COPIES=1`, by a backend
+    /// whose phase-A hook declined, and by [`Self::host_round_trip_cross`] (the
+    /// CPU source's registered phase A).
+    ///
+    /// A device source's read here is a blocking copy *by construction*
+    /// (`copy_to_host` syncs the stream, then issues a blocking `cudaMemcpy`), so
+    /// it is what the `blocking_host_copies` counter counts — that counter is the
+    /// "before" number of the ticket's acceptance line.
+    fn copy_across_blocking(&mut self, node_id: NodeId, dst: BufRef) -> Result<(), String> {
+        let br = self
+            .node_buffer(node_id)
+            .ok_or_else(|| format!("node {node_id} has no buffer"))?;
+        if br.backend != Backend::CPU {
+            self.cross_stats.blocking_host_copies += 1;
+        }
         let data = self
             .copy_to_cpu(node_id)
             .ok_or_else(|| format!("node {node_id} host read failed"))?;
-        // One staging buffer per (node, dst backend) per graph, reused on every
-        // execute. Keyed by the destination too, because a node consumed by two
-        // different foreign backends needs two buffers — the old single-entry
-        // map forced the consumer-side filter in the scheduler, which `None`
-        // here now expresses structurally.
-        let dst_id = match self.cross.get(&(uid, node_id, dst_backend)) {
-            // The size is part of the entry's identity (a graph's shapes never change under
-            // one uid, so this is a backstop, not a hot path).
-            Some(&cb) if cb.len == data.len() => cb.id,
-            Some(&cb) => {
-                let stale = cb;
-                self.cross.remove(&(uid, node_id, dst_backend));
-                self.free_in_pool(stale.backend, stale.id);
-                let id = self.alloc_fresh_in(dst_backend, data.len());
-                // Staging is exact (it is not an activation, so the class ladder does not
-                // apply), but it is still pool memory the budget must see: charge it as
-                // resident and live until the next rebuild frees it (E4 S2).
-                let bytes = data.len() * 4;
-                self.buf_bytes.insert((dst_backend, id), bytes);
-                *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;
-                let live = self.live_bytes.entry(dst_backend).or_insert(0);
-                *live += bytes;
-                let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
-                *peak = (*peak).max(*live);
-                self.cross.insert(
-                    (uid, node_id, dst_backend),
-                    BufRef::own(dst_backend, id, data.len()),
-                );
-                id
-            }
-            None => {
-                let id = self.alloc_fresh_in(dst_backend, data.len());
-                let bytes = data.len() * 4;
-                self.buf_bytes.insert((dst_backend, id), bytes);
-                *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;
-                let live = self.live_bytes.entry(dst_backend).or_insert(0);
-                *live += bytes;
-                let peak = self.peak_bytes.entry(dst_backend).or_insert(0);
-                *peak = (*peak).max(*live);
-                self.cross.insert(
-                    (uid, node_id, dst_backend),
-                    BufRef::own(dst_backend, id, data.len()),
-                );
-                id
-            }
+        self.write_cross_staging(dst, &data)
+    }
+
+    /// F5: the CPU source's registered **phase A** (`cpu_backend::copy_cross`) —
+    /// the synchronous host round trip, named for what it is. The CPU has no
+    /// device memory, so there is no transfer to make asynchronous; the device leg
+    /// of a CPU→device copy is the destination pool's own stream-ordered
+    /// `write_host`, which never blocked the host either.
+    pub fn host_round_trip_cross(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        dst_backend: Backend,
+    ) -> Result<(), String> {
+        let dst = self.cross_staging(uid, node_id, dst_backend)?;
+        self.copy_across_blocking(node_id, dst)
+    }
+
+    /// F5 **phase B**: wait on the event [`Self::copy_across`]'s hook recorded,
+    /// exactly once per staged input, before the consuming split executes.
+    ///
+    /// The wait itself is the source backend's registered `await_cross` hook: a
+    /// device source waits on its recorded event (a host block for a device→host
+    /// copy — the one documented synchronization point — or a device-side
+    /// `cudaStreamWaitEvent` for a device consumer), a backend without device
+    /// memory is a documented no-op, and a backend that declined phase A has
+    /// nothing to wait for.
+    ///
+    /// The allocator owns the *contract*: it counts the wait and clears the
+    /// pending flag regardless of backend, which is what makes "the boundary path
+    /// issues a wait for every staged input" a backend-independent, CI-covered
+    /// assertion (see `scheduler`'s boundary and this module's tests). The pending
+    /// flag is cleared **after** the hook succeeds, so a failed wait leaves the
+    /// entry pending and the consumer's read errors instead of reading garbage.
+    pub fn await_cross(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        dst_backend: Backend,
+    ) -> Result<(), String> {
+        let br = self
+            .node_buffer(node_id)
+            .ok_or_else(|| format!("node {node_id} has no buffer"))?;
+        if br.backend == dst_backend {
+            // Not a staged copy: the consumer already reads the canonical buffer
+            // on its own backend. Clear defensively, so an `await_cross` is
+            // idempotent and a stale flag can never outlive its boundary.
+            self.cross_pending.remove(&(uid, node_id, dst_backend));
+            return Ok(());
+        }
+        let hook = br
+            .backend
+            .entry()
+            .ok_or_else(|| {
+                format!(
+                    "await_cross: {} is not compiled into this build",
+                    br.backend.name()
+                )
+            })?
+            .await_cross;
+        hook(self, uid, node_id, dst_backend)?;
+        self.cross_pending.remove(&(uid, node_id, dst_backend));
+        self.cross_stats.waits += 1;
+        Ok(())
+    }
+
+    /// Handle asynchronously-fetched bytes to the destination staging buffer
+    /// (F5's phase B writes what phase A transferred).
+    pub(crate) fn write_cross_staging(&mut self, dst: BufRef, data: &[f32]) -> Result<(), String> {
+        self.write_pool(dst.backend, dst.id, data)
+    }
+
+    /// F5: what this allocator's split boundaries did. The gate reads a **delta**
+    /// around one workload ([`CrossCopyStats::delta`]), because the counters are
+    /// cumulative for the allocator's life. (The F5 gates are tests, so the
+    /// production build has no caller.)
+    #[allow(dead_code)]
+    pub fn cross_stats(&self) -> CrossCopyStats {
+        self.cross_stats
+    }
+
+    /// F5: the counters are mutated by the boundary and by the registry hooks;
+    /// this is the hook-facing accessor.
+    pub fn cross_stats_mut(&mut self) -> &mut CrossCopyStats {
+        &mut self.cross_stats
+    }
+
+    /// F5: forget what the boundaries did so far (a gate that wants an absolute
+    /// number rather than a delta).
+    #[allow(dead_code)]
+    pub fn reset_cross_stats(&mut self) {
+        self.cross_stats = CrossCopyStats::default();
+    }
+
+    /// F5: the staged buffer a consumer on `backend` must read for `node_id`.
+    ///
+    /// Unlike [`Self::cross_buffer`], this **refuses** an entry whose phase-B wait
+    /// has not been issued: reading it would read a transfer that may still be in
+    /// flight. The scheduler uses this (never the raw accessor) precisely so that
+    /// dropping the boundary's wait is a loud, named failure — "no host-side
+    /// blocking copy" must never be bought with a missing synchronization.
+    pub fn cross_input(
+        &self,
+        uid: u64,
+        node_id: NodeId,
+        backend: Backend,
+    ) -> Result<Option<BufRef>, String> {
+        let key = (uid, node_id, backend);
+        let Some(staged) = self.cross.get(&key).copied() else {
+            return Ok(None);
         };
-        self.write_pool(dst_backend, dst_id, &data)
+        if self.cross_pending.contains(&key) {
+            return Err(format!(
+                "staged cross-backend input {node_id} for {backend:?} was read before its boundary \
+                 wait: every copy_across owes one await_cross (F5, #58)"
+            ));
+        }
+        Ok(Some(staged))
+    }
+
+    /// The staging buffer a consumer on `backend` must read for `node_id`, if a
+    /// split boundary copied it for the current graph. Consumers on the node's
+    /// own backend read the canonical buffer instead.
+    ///
+    /// **Raw accessor**: it does not check the phase-B contract (F5) — use
+    /// [`Self::cross_input`] on the consumer path.
+    pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
+        self.cross.get(&(uid, node_id, backend)).copied()
+    }
+
+    /// Test hook: stage `node_id`'s output on `backend` as if a split boundary
+    /// had copied it. The real path needs a second usable backend, which a
+    /// CPU-only build does not have.
+    #[cfg(test)]
+    pub fn stage_cross_for_test(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        backend: Backend,
+        id: usize,
+        len: usize,
+    ) {
+        self.cross
+            .insert((uid, node_id, backend), BufRef::own(backend, id, len));
+    }
+
+    /// Test hook (F5): mark a staged entry as having an **un-waited** copy, i.e.
+    /// behave exactly as the moment between `copy_across` and `await_cross`. Lets a
+    /// CPU-only build gate the missing-wait invariant, which otherwise needs two
+    /// usable backends.
+    #[cfg(test)]
+    pub fn mark_cross_pending_for_test(&mut self, uid: u64, node_id: NodeId, backend: Backend) {
+        self.cross_pending.insert((uid, node_id, backend));
     }
 
     /// Dispatch `Backend::copy_cells` to the pool that owns the region (C3).
@@ -2460,29 +2675,6 @@ impl GraphAllocator {
                     .unwrap_or("the backend's pool is not enabled")
             )),
         }
-    }
-
-    /// The staging buffer a consumer on `backend` must read for `node_id`, if a
-    /// split boundary copied it for the current graph. Consumers on the node's
-    /// own backend read the canonical buffer instead.
-    pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
-        self.cross.get(&(uid, node_id, backend)).copied()
-    }
-
-    /// Test hook: stage `node_id`'s output on `backend` as if a split boundary
-    /// had copied it. The real path needs a second usable backend, which a
-    /// CPU-only build does not have.
-    #[cfg(test)]
-    pub fn stage_cross_for_test(
-        &mut self,
-        uid: u64,
-        node_id: NodeId,
-        backend: Backend,
-        id: usize,
-        len: usize,
-    ) {
-        self.cross
-            .insert((uid, node_id, backend), BufRef::own(backend, id, len));
     }
 }
 
@@ -3436,6 +3628,98 @@ mod tests {
             alloc.cross_buffer(1, 7, Backend::CPU).map(|b| b.id),
             Some(3),
             "staging for a second backend must not clobber the first"
+        );
+    }
+
+    /// F5 ([#58]) gate, allocator half: **a staged entry whose boundary wait has
+    /// not been issued cannot be handed to a consumer, and issuing the wait
+    /// publishes it.**
+    ///
+    /// This is the mechanism the missing-wait gate rests on. It is deterministic
+    /// and needs no device: the pending flag is the state between phase A
+    /// (`copy_across`) and phase B (`await_cross`), and `cross_input` — the only
+    /// accessor the scheduler's consumer path uses — refuses it by name. The
+    /// graph-level version (the same refusal through the real `execute`) is
+    /// `scheduler::tests::a_staged_boundary_input_cannot_be_consumed_before_its_wait`.
+    #[test]
+    fn a_pending_staged_copy_is_refused_until_its_wait_is_issued() {
+        let g = {
+            use crate::graph::builder::GraphBuilder;
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [8, 1, 1, 1], super::super::DType::F32);
+            let s = b.silu(x);
+            b.output(s);
+            b.build()
+        };
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        // Node 1 (the silu) is on the CPU; the staging entry is for a notional
+        // device consumer, so `await_cross` dispatches to the CPU entry's
+        // registered no-op (the CPU has no device transfer to wait on) and the
+        // test stays device-free.
+        const N: NodeId = 1;
+        alloc.stage_cross_for_test(g.uid, N, Backend::CUDA, 4, 8);
+        alloc.mark_cross_pending_for_test(g.uid, N, Backend::CUDA);
+
+        // Phase B has not run: the entry is not readable.
+        let err = alloc
+            .cross_input(g.uid, N, Backend::CUDA)
+            .expect_err("a pending staging entry must not be published");
+        assert!(err.contains("before its boundary wait"), "{err}");
+        assert!(err.contains("#58"), "{err}");
+        // A key with no entry is still "nothing was staged", not an error.
+        assert_eq!(alloc.cross_input(g.uid, N, Backend::CPU).unwrap(), None);
+
+        // A different (uid, node, backend) triple is untouched by the pending flag.
+        alloc.stage_cross_for_test(2, N, Backend::CUDA, 5, 8);
+        assert!(alloc.cross_input(2, N, Backend::CUDA).unwrap().is_some());
+
+        // Phase B publishes it and the counter records the wait.
+        alloc.await_cross(g.uid, N, Backend::CUDA).unwrap();
+        let staged = alloc
+            .cross_input(g.uid, N, Backend::CUDA)
+            .expect("the wait published the entry")
+            .expect("the staging buffer exists");
+        assert_eq!((staged.id, staged.len), (4, 8));
+        assert_eq!(
+            alloc.cross_stats(),
+            CrossCopyStats {
+                copies: 0,
+                waits: 1,
+                ..CrossCopyStats::default()
+            },
+            "the wait is counted; no copy was issued here (the test injected the state)"
+        );
+    }
+
+    /// F5: `await_cross` is idempotent and self-cleaning — including when the pair
+    /// never crossed a backend (the scheduler does list a same-backend node whose
+    /// split differs, e.g. CPU → Metal → CPU). Such an entry is not a *copy*, so it
+    /// must not be counted as one, or `copies == waits` would stop meaning what the
+    /// gate reads it as.
+    #[test]
+    fn a_same_backend_boundary_input_is_neither_copied_nor_counted() {
+        let mut alloc = GraphAllocator::new();
+        alloc.mark_cross_pending_for_test(1, 7, Backend::CPU);
+        // No buffer for node 7 exists, so this is the "unknown node" refusal.
+        assert!(alloc.await_cross(1, 7, Backend::CPU).is_err());
+
+        // With a real node and a same-backend destination, both phases are no-ops.
+        let g = {
+            use crate::graph::builder::GraphBuilder;
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [4, 1, 1, 1], super::super::DType::F32);
+            let s = b.silu(x);
+            b.output(s);
+            b.build()
+        };
+        alloc.alloc_graph(&g).unwrap();
+        alloc.copy_across(g.uid, 1, Backend::CPU).unwrap();
+        alloc.await_cross(g.uid, 1, Backend::CPU).unwrap();
+        assert_eq!(alloc.cross_stats(), CrossCopyStats::default());
+        assert!(
+            alloc.cross_input(g.uid, 1, Backend::CPU).unwrap().is_none(),
+            "a same-backend input reads its canonical buffer, not staging"
         );
     }
 

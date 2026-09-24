@@ -49,7 +49,7 @@ use super::alloc::GraphAllocator;
 use super::backend::Backend as BackendTrait;
 use super::kvformat::KvFormat;
 use super::ops::{FusedOp, Op};
-use super::DType;
+use super::{DType, NodeId};
 
 /// How many backend ids exist. Fixed: the id is a file-format contract.
 pub const N_BACKENDS: usize = 3;
@@ -187,6 +187,40 @@ pub struct BackendEntry {
     /// Read one pool buffer back to the host. CUDA's stream-ordered
     /// `copy_to_host` is why this is not just `Backend::read_host`.
     pub host_read: fn(&GraphAllocator, usize) -> Option<Vec<f32>>,
+    /// F5 ([#58]): **phase A** of a cross-backend staging copy — move the output
+    /// of `node` (produced by *this* backend, at source reference `src`) into the
+    /// destination backend's staging buffer `dst`.
+    ///
+    /// `Ok(true)` means this hook issued the transfer: a backend with device
+    /// memory enqueues it asynchronously (an `cudaMemcpyAsync` plus a recorded
+    /// event) and [`Self::await_cross`] is what completes it; a backend without
+    /// device memory performs the synchronous host round trip it always did
+    /// (there is no copy to make asynchronous). `Ok(false)` **declines**, and the
+    /// allocator's synchronous host round trip handles the pair exactly as it did
+    /// before F5 — the honest answer for a direction nobody has ported yet (a
+    /// device→device staging copy, which `copy_across`'s same-backend early
+    /// return makes unreachable today; CUDA→Metal on a macOS+CUDA build; Metal
+    /// until it is ported and verified on a Mac).
+    ///
+    /// The hook owns the event it records; the allocator owns the staging buffer,
+    /// the one-wait-per-copy contract and the counters
+    /// (`graph::copystats::CrossCopyStats`).
+    ///
+    /// [#58]: https://github.com/yusiwen/minfer/issues/58
+    pub copy_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<bool, String>,
+    /// F5 ([#58]): **phase B** — wait on the event [`Self::copy_cross`] recorded,
+    /// exactly once per staged input, before the consuming split executes. A
+    /// backend that recorded no event (its phase A was synchronous, or it
+    /// declined) leaves this a no-op; a device consumer inserts a device-side
+    /// wait instead of blocking the host.
+    ///
+    /// **This is the wait the missing-wait gate is about.** Dropping it leaves the
+    /// staging entry marked pending, and the scheduler's next read of that entry
+    /// (`GraphAllocator::cross_input`) is a loud error rather than a read of
+    /// undefined data — see `docs/BACKEND-REGISTRY-DESIGN.md` §11.
+    ///
+    /// [#58]: https://github.com/yusiwen/minfer/issues/58
+    pub await_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<(), String>,
     /// The KV element type this backend's regions store (C5 records it in the
     /// session header). Takes the allocator because a backend's answer can be a
     /// per-pool snapshot (the CPU pool captures `MINFER_CACHE_TYPE` at

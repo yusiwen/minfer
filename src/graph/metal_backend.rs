@@ -311,6 +311,48 @@ pub const SUPPORTS_ATTN_SPAN: bool = false;
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 pub const READS_PACKED_KV: bool = false;
 
+/// F5 ([#58]): registry hook **phase A** of a cross-backend staging copy out of
+/// Metal — **declines**: it returns `Ok(false)`, so the allocator's synchronous
+/// host round trip handles the pair exactly as it did before F5.
+///
+/// That is a deliberate, written decision rather than a half-implementation. The
+/// async form on Metal is a `MTLBlitCommandEncoder` copy into a staging buffer
+/// plus a completion handler or an `MTLEvent`/`MTLSharedEvent` the consumer waits
+/// on — a different mechanism from CUDA's — and this ticket was developed on a
+/// **Linux** box with no Metal device and no macOS toolchain, so none of it could
+/// be compiled, let alone verified bitwise. Shipping un-compilable device code
+/// would be the "half-implemented" failure the ticket warns about; declining keeps
+/// the pre-F5 behaviour (correct, blocking) and leaves the port as a filed
+/// follow-up. The boundary counters therefore report a Metal source's copies as
+/// `blocking_host_copies`, which is the honest number on macOS until it lands.
+///
+/// The CPU→Metal direction is unaffected either way: its device leg is Metal's own
+/// `write_host` staging fill.
+///
+/// [#58]: https://github.com/yusiwen/minfer/issues/58
+pub(crate) fn copy_cross(
+    _alloc: &mut super::alloc::GraphAllocator,
+    _uid: u64,
+    _node_id: super::NodeId,
+    _dst_backend: super::Backend,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// F5 ([#58]): registry hook **phase B** for a Metal source — a no-op, because
+/// [`copy_cross`] declined and the allocator's synchronous path already produced
+/// the bytes. See that function for why the Metal port is not in this ticket.
+///
+/// [#58]: https://github.com/yusiwen/minfer/issues/58
+pub(crate) fn await_cross(
+    _alloc: &mut super::alloc::GraphAllocator,
+    _uid: u64,
+    _node_id: super::NodeId,
+    _dst_backend: super::Backend,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// F4: this backend's registry entry (see `cpu_backend::entry`).
 pub fn entry() -> super::registry::BackendEntry {
     use super::registry::{Backend as Handle, BackendCaps, BackendEntry, PRIORITY_METAL};
@@ -327,6 +369,10 @@ pub fn entry() -> super::registry::BackendEntry {
         pool: |a| a.metal().map(|m| m as &dyn Backend),
         pool_mut: |a| a.metal_mut().map(|m| m as &mut dyn Backend),
         host_read: |a, id| a.metal().and_then(|m| m.read_host(id)).map(|s| s.to_vec()),
+        // F5: Metal declines phase A (see `copy_cross` above — no Mac to compile
+        // or verify the blit/event port on) and its phase B is therefore a no-op.
+        copy_cross,
+        await_cross,
         // The MPS device layer holds the process-wide f16 policy (C5 records it
         // so a session written under one width cannot be resumed under another).
         kv_format: |_| {

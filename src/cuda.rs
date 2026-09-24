@@ -76,6 +76,20 @@ extern "C" {
     ) -> i32;
     fn cudaStreamCreate(stream: *mut *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
+    // F5 (#58): events, the synchronization primitive the split boundary's async
+    // staging copies need. `cudaEventRecord` marks a point on the stream;
+    // `cudaStreamWaitEvent` makes a later consumer wait on it **without blocking
+    // the host**; `cudaEventSynchronize` is the host-side wait and is the one
+    // documented synchronization point of a device→host staging copy.
+    fn cudaEventCreate(event: *mut *mut std::ffi::c_void) -> i32;
+    fn cudaEventRecord(event: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: *mut std::ffi::c_void) -> i32;
+    fn cudaEventDestroy(event: *mut std::ffi::c_void) -> i32;
+    fn cudaStreamWaitEvent(
+        stream: *mut std::ffi::c_void,
+        event: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaGetLastError() -> i32;
     fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
@@ -950,6 +964,19 @@ extern "C" {
 // ─── CudaState singleton ───────────────────────────────────────
 
 static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
+
+/// F5 (#58): how many times this process has **blocked the host** on the stream
+/// (`CudaState::sync` — the only full `cudaStreamSynchronize` in the device
+/// layer). Process-wide and monotonic on purpose: it is the "host stalls"
+/// measurement the ticket's before/after is stated in, and a reader compares a
+/// delta around one workload rather than an absolute count. A relaxed atomic
+/// increment is the whole cost on the hot path.
+static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// F5: the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
+pub fn stream_sync_count() -> u64 {
+    STREAM_SYNCS.load(Ordering::Relaxed)
+}
 
 /// A small per-thread reentrant lock guarding model weight registration.
 ///
@@ -2542,7 +2569,117 @@ impl CudaState {
         &self.stream_lock
     }
 
+    // ─── F5 (#58): events + asynchronous host transfers ────────
+    //
+    // The split boundary is the only place the engine moves a value between
+    // backends. Before F5 every such move read the source through
+    // `copy_from_device_pinned`, which first **synchronized the whole stream**
+    // and then issued a blocking `cudaMemcpy` — so one cross-backend hop cost
+    // the host two stalls and forbade any overlap. These are the primitives that
+    // replace it: a stream event plus a stream-ordered `cudaMemcpyAsync`, with
+    // the single host wait moved to the consumer
+    // (`docs/BACKEND-REGISTRY-DESIGN.md` §11).
+
+    /// F5: allocate a pinned host slab (the intermediate of an async D2H copy —
+    /// a pageable destination would make the driver bounce through its own
+    /// pinned buffer and block, which is exactly what this avoids).
+    pub fn host_alloc(&self, bytes: usize) -> Option<*mut u8> {
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaHostAlloc(&mut p, bytes, 0) };
+        if err != 0 || p.is_null() {
+            return None;
+        }
+        Some(p as *mut u8)
+    }
+
+    /// F5: release a slab from [`Self::host_alloc`].
+    pub fn host_free(&self, ptr: *mut u8) {
+        if !ptr.is_null() {
+            unsafe { cudaFreeHost(ptr as *mut std::ffi::c_void) };
+        }
+    }
+
+    /// F5: create an event and record it on the stream. The returned handle must
+    /// be released with [`Self::event_destroy`]; a failure is a loud `Err` naming
+    /// the `cudaGetErrorName` (never a silently missing synchronization).
+    pub fn record_event(&self) -> Result<*mut std::ffi::c_void, String> {
+        let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaEventCreate(&mut ev) };
+        if err != 0 || ev.is_null() {
+            return Err(format!(
+                "cudaEventCreate failed: {} ({err})",
+                cuda_error_name(err)
+            ));
+        }
+        let err = unsafe { cudaEventRecord(ev, self.stream()) };
+        if err != 0 {
+            unsafe { cudaEventDestroy(ev) };
+            return Err(format!(
+                "cudaEventRecord failed: {} ({err})",
+                cuda_error_name(err)
+            ));
+        }
+        Ok(ev)
+    }
+
+    /// F5: **block the host** until `ev` has completed. This is the one
+    /// documented synchronization point of a device→host staging copy, and it is
+    /// a wait on the copy — not the copy itself — that blocks.
+    pub fn wait_event(&self, ev: *mut std::ffi::c_void) -> Result<(), String> {
+        let err = unsafe { cudaEventSynchronize(ev) };
+        if err != 0 {
+            return Err(format!(
+                "cudaEventSynchronize failed: {} ({err})",
+                cuda_error_name(err)
+            ));
+        }
+        Ok(())
+    }
+
+    /// F5: make every later operation on the stream wait for `ev`, **without
+    /// blocking the host** — the synchronization point of a device consumer.
+    pub fn stream_wait_event(&self, ev: *mut std::ffi::c_void) -> Result<(), String> {
+        let err = unsafe { cudaStreamWaitEvent(self.stream(), ev, 0) };
+        if err != 0 {
+            return Err(format!(
+                "cudaStreamWaitEvent failed: {} ({err})",
+                cuda_error_name(err)
+            ));
+        }
+        Ok(())
+    }
+
+    /// F5: release an event handle (a no-op on null).
+    pub fn event_destroy(&self, ev: *mut std::ffi::c_void) {
+        if !ev.is_null() {
+            unsafe { cudaEventDestroy(ev) };
+        }
+    }
+
+    /// F5: enqueue a device→host copy on the stream. The call returns as soon as
+    /// the transfer is queued; `dst` must be pinned (see [`Self::host_alloc`]) and
+    /// must stay alive until the event that follows it has been waited on.
+    pub fn copy_to_host_async(
+        &self,
+        src: *const std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let err =
+            unsafe { cudaMemcpyAsync(dst, src, bytes, CUDA_MEMCPY_DEVICE_TO_HOST, self.stream()) };
+        if err != 0 {
+            return Err(format!(
+                "cudaMemcpyAsync (D2H) failed: {} ({err})",
+                cuda_error_name(err)
+            ));
+        }
+        Ok(())
+    }
+
     pub fn sync(&self) {
+        // F5: a full stream sync is a host stall — count it. It is the number the
+        // split-boundary before/after is stated in (`stream_sync_count`).
+        STREAM_SYNCS.fetch_add(1, Ordering::Relaxed);
         let err = unsafe { cudaGetLastError() };
         if err != 0 {
             eprintln!("CUDA kernel launch error: {}", err);

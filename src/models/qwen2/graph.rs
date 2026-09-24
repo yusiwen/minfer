@@ -1607,6 +1607,232 @@ mod tests {
         eprintln!("[e5] {k}/{n_layers} blocks on cuda, {steps} greedy steps match the CPU run");
     }
 
+    /// F5 ([#58]) acceptance on the real model: a split graph's cross-backend
+    /// staging copies are **asynchronous**, the boundary still issues exactly one
+    /// event wait per staged input, and the results are **bitwise identical** to
+    /// the pre-F5 synchronous reference.
+    ///
+    /// The test runs the *same* mixed model (the E5 offload plan, so the graph
+    /// really does alternate CPU and CUDA splits) twice — once with the async
+    /// substrate, once with `MINFER_SYNC_COPIES`'s synchronous host round trip
+    /// forced for the duration — and compares the logits of every step. Both modes
+    /// run the identical kernels in the identical order; only the *transfer* of a
+    /// cross-boundary value differs, so equality is the honest claim (this is not
+    /// the rule-9 CPU-vs-GPU comparison, which legitimately differs).
+    ///
+    /// What it asserts, and why each half matters:
+    ///
+    /// - **the missing-wait gate** — `copies == waits` (one phase-B wait per
+    ///   phase-A copy) and `waits > 0`. The counts are deterministic; dropping the
+    ///   boundary's `await_cross` loop makes them unequal *and* leaves the staging
+    ///   entry pending, which `GraphAllocator::cross_input` turns into a loud
+    ///   error the moment the consumer reads it. The mutation was recorded.
+    /// - **the no-blocking-copy gate** — `blocking_host_copies == 0` in async mode
+    ///   and `== copies` in sync mode, plus the device-level
+    ///   `CudaBackend::blocking_readback_count()` (which counts actual blocking
+    ///   `cudaMemcpy` D2H calls) not moving at all in async mode. Those are the
+    ///   measured before/after numbers.
+    /// - **the host stalls** — `cuda::stream_sync_count()` around the run. The
+    ///   pre-F5 path synced the whole stream once *per staged input inside*
+    ///   `copy_to_host`; the async path issues none of those. This is the
+    ///   latency-shaped evidence, and it is a hard count, not a timing.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device. Run alone:
+    ///
+    /// ```text
+    /// cargo test --release --features cuda async_cross_copies_never_block -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires the cached 0.5B model and a CUDA device"]
+    fn async_cross_copies_never_block_and_stay_bitwise_identical() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::copystats::{self, CrossCopyStats};
+        use crate::graph::offload::OffloadRequest;
+        use crate::models::{Device, ModelDef};
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the F5 async-copy gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let n_layers = crate::models::qwen2::loader::hparams_from_gguf(&gguf.parts[0].ctx)
+            .expect("hparams")
+            .n_layer as usize;
+        // A prefix of blocks on the device: the graph then alternates CPU → CUDA →
+        // CPU, so both copy directions are exercised.
+        let k = 4.min(n_layers);
+        let model = crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::Layers(k))
+            .expect("load the mixed model");
+        if model.device() != Device::Cuda {
+            eprintln!(
+                "no CUDA participation (device {:?}); skipping",
+                model.device()
+            );
+            return;
+        }
+
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let n_ctx = 256;
+        let steps = 6;
+
+        // One mode = one fresh cache (so the graph is built and then reused across
+        // the decode steps, which is the steady state the boundary lives in) and
+        // one logits vector per step.
+        let run = |sync: bool| -> (Vec<Vec<f32>>, CrossCopyStats, u64, u64) {
+            let _mode = copystats::set_sync_for_test(sync);
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            // Bring the device pool up before the first forward, so the
+            // device-level readback counter below has an instance to read. The
+            // graph builder enables it anyway (idempotently).
+            assert!(
+                cache.alloc().enable_cuda(),
+                "a CUDA device is participating"
+            );
+            let before = cache.alloc().cross_stats();
+            let readbacks_before = cache
+                .alloc()
+                .cuda()
+                .expect("the CUDA pool is enabled")
+                .blocking_readback_count();
+            let syncs_before = crate::cuda::stream_sync_count();
+
+            let mut l =
+                model.forward_graph_cached(&ids, &(0..n).collect::<Vec<_>>(), 1, n_ctx, &mut cache);
+            let mut out = vec![l.clone()];
+            let mut next = argmax(&l);
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                out.push(l.clone());
+                next = argmax(&l);
+            }
+
+            let stats = cache.alloc().cross_stats().delta(before);
+            let readbacks = cache
+                .alloc()
+                .cuda()
+                .expect("the CUDA pool is enabled")
+                .blocking_readback_count()
+                - readbacks_before;
+            let syncs = crate::cuda::stream_sync_count() - syncs_before;
+            (out, stats, readbacks, syncs)
+        };
+
+        let (async_logits, a, a_readbacks, a_syncs) = run(false);
+        let (sync_logits, s, s_readbacks, s_syncs) = run(true);
+
+        eprintln!(
+            "[f5] async: copies={} waits={} blocking_host_copies={} async_host_copies={} \
+             event_syncs={} stream_waits={} blocking_readbacks={} stream_syncs={}",
+            a.copies,
+            a.waits,
+            a.blocking_host_copies,
+            a.async_host_copies,
+            a.event_syncs,
+            a.stream_waits,
+            a_readbacks,
+            a_syncs
+        );
+        eprintln!(
+            "[f5] sync : copies={} waits={} blocking_host_copies={} async_host_copies={} \
+             blocking_readbacks={} stream_syncs={}",
+            s.copies, s.waits, s.blocking_host_copies, s.async_host_copies, s_readbacks, s_syncs
+        );
+
+        // The workload really does cross a backend boundary (otherwise every
+        // assertion below would be vacuously true).
+        assert!(
+            a.copies > 0,
+            "the mixed offload graph must stage at least one cross-backend copy (got {})",
+            a.copies
+        );
+
+        // ── the missing-wait gate ────────────────────────────────────────────
+        assert!(
+            a.all_copies_awaited(),
+            "every staged input must be waited on: {} copies, {} waits",
+            a.copies,
+            a.waits
+        );
+        assert_eq!(
+            s.copies, s.waits,
+            "the synchronous reference issues the same one-wait-per-copy contract"
+        );
+
+        // ── the no-blocking-copy-on-the-hot-path gate ────────────────────────
+        assert_eq!(
+            a.blocking_host_copies, 0,
+            "the async boundary must issue no blocking device→host copy (got {})",
+            a.blocking_host_copies
+        );
+        assert!(
+            a.async_host_copies > 0,
+            "the device→host direction must have taken the async path"
+        );
+        assert_eq!(
+            a.event_syncs, a.async_host_copies,
+            "each async device→host copy owes exactly one event wait"
+        );
+        assert_eq!(
+            a_readbacks, 0,
+            "no blocking device readback (`copy_to_host`) may happen on the hot path (got {a_readbacks})"
+        );
+        // Only the device→host copies block, so the synchronous reference's count
+        // is positive but never more than its total copies (CPU→device copies go
+        // through the destination pool's own stream-ordered fill, which never
+        // blocked the host either).
+        assert!(
+            s.blocking_host_copies > 0,
+            "the synchronous reference must block on its device→host copies — this is the \
+             'before' number (got 0 of {} copies)",
+            s.copies
+        );
+        assert!(s.blocking_host_copies <= s.copies);
+        assert_eq!(s.async_host_copies, 0);
+        assert!(
+            s_readbacks > 0,
+            "the device-level counter must see the synchronous path's blocking readbacks"
+        );
+
+        // ── host stalls removed ──────────────────────────────────────────────
+        // The pre-F5 path synced the whole stream once per staged input inside
+        // `copy_to_host`; the async path syncs only at the split boundary itself.
+        assert!(
+            a_syncs < s_syncs,
+            "the async path must issue strictly fewer full stream syncs ({a_syncs} vs {s_syncs})"
+        );
+        assert!(
+            s_syncs >= s.blocking_host_copies + 1,
+            "the synchronous reference must pay its per-copy stream syncs plus the boundary's \
+             own: {s_syncs} syncs for {} blocking copies",
+            s.blocking_host_copies
+        );
+        // ── bitwise equality ─────────────────────────────────────────────────
+        assert_eq!(async_logits.len(), sync_logits.len());
+        let mut worst = 0.0f32;
+        for (i, (x, y)) in async_logits.iter().zip(&sync_logits).enumerate() {
+            let d = max_delta(x, y);
+            worst = worst.max(d);
+            assert_eq!(
+                d, 0.0,
+                "step {i}: the async staging copies must be bitwise identical to the \
+                 synchronous reference (max |Δlogit| = {d})"
+            );
+        }
+        eprintln!(
+            "[f5] {steps} decode steps + 1 prefill over {k}/{n_layers} device blocks: \
+             max |Δlogit| = {worst}; stream syncs {} -> {} (-{}), blocking D2H copies {} -> {}",
+            a_syncs,
+            s_syncs,
+            s_syncs - a_syncs,
+            s.blocking_host_copies,
+            a.blocking_host_copies
+        );
+    }
+
     /// E5 S2's acceptance on the real model: **`auto` picks the block count from the budget**.
     ///
     /// The gate forces a small budget with `MINFER_GPU_MEM` so the fit is a strict prefix

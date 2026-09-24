@@ -7,9 +7,10 @@
 //! per-op kernel dispatch on the shared stream. Design + rollout:
 //! `docs/CUDA-BACKEND-DESIGN.md`.
 
+use super::alloc::GraphAllocator;
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
-use super::{BufRef, CNode, DType};
+use super::{Backend as BackendTag, BufRef, CNode, DType, NodeId};
 use crate::vec_ops::RopeStyle;
 
 struct CudaBuf {
@@ -79,6 +80,45 @@ pub struct CudaBackend {
     /// intra-split), drained with one sync at the split boundary. Replaces
     /// the per-node `copy_to_host` full-stream sync in the scheduler.
     cap: crate::cuda::CaptureStaging,
+    /// F5 (#58): pinned host slabs used as the intermediate of an **asynchronous**
+    /// cross-backend D2H staging copy. D2H has no device-side destination, so the
+    /// transfer always lands in host memory, and a pageable destination would make
+    /// the driver bounce through its own pinned buffer and block — exactly what F5
+    /// removes. Slabs are grown on demand and reused through `in_use`, so a
+    /// steady-state boundary allocates nothing.
+    cross_slabs: Vec<CrossSlab>,
+    /// F5: the cross-backend staging copies this backend has **enqueued but not
+    /// yet waited on**. The allocator's phase B (`await_cross`) drains them; a
+    /// record left here past the boundary is the missing-wait bug, and the
+    /// allocator's pending map turns the consumer's next read into a loud error.
+    cross_pending: Vec<CrossPending>,
+    /// F5: how many **blocking** device→host readbacks (`copy_to_host`) this
+    /// backend performed. Device tests read it to prove the async boundary path
+    /// issues none; it is the device-level twin of
+    /// `copystats::CrossCopyStats::blocking_host_copies`. An atomic because the
+    /// read path takes `&self` (the trait's `read_host` shape).
+    blocking_readbacks: std::sync::atomic::AtomicU64,
+}
+
+/// F5: one pinned host slab of the async D2H staging pool (see
+/// [`CudaBackend::cross_slabs`]).
+struct CrossSlab {
+    ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    in_use: bool,
+}
+
+/// F5: one in-flight cross-backend staging copy, device → host.
+struct CrossPending {
+    uid: u64,
+    node: NodeId,
+    /// The destination staging buffer — the host-side buffer the consumer reads.
+    dst: BufRef,
+    /// Index into [`CudaBackend::cross_slabs`] holding this copy's bytes.
+    slab: usize,
+    bytes: usize,
+    /// Recorded after the `cudaMemcpyAsync`; waited on by `await_cross`.
+    event: *mut std::ffi::c_void,
 }
 
 /// An instantiated CUDA Graph exec with its capture identity.
@@ -132,6 +172,9 @@ impl CudaBackend {
             prefill_capture,
             kv_f16,
             cap: crate::cuda::CaptureStaging::new(),
+            cross_slabs: Vec::new(),
+            cross_pending: Vec::new(),
+            blocking_readbacks: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -316,7 +359,10 @@ impl CudaBackend {
     /// D1: a reference's device pointer with its window applied. D1 views are
     /// `F32` (the allocator refuses anything else), so the element offset is
     /// scaled by 4 bytes.
-    fn ptr_of_ref(&self, r: BufRef) -> Result<*mut std::ffi::c_void, String> {
+    ///
+    /// F5: also the F5 registry hooks' way to resolve a source pointer
+    /// (`cuda_backend::copy_cross`) before they borrow the pool mutably.
+    pub(crate) fn ptr_of_ref(&self, r: BufRef) -> Result<*mut std::ffi::c_void, String> {
         let base = self.ptr_of(r.id)?;
         if r.offset == 0 {
             return Ok(base);
@@ -343,12 +389,128 @@ impl CudaBackend {
         }
         let _sg = self.stream_guard();
         let mut out = vec![0f32; b.bytes / 4];
+        self.blocking_readbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.state.sync();
         let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b.bytes) };
         // R3-A2: read through the pinned staging buffer (pageable-memcpy
         // bounce removed); MINFER_NO_PINNED_READBACK=1 reverts.
         self.state.copy_from_device_pinned(b.ptr, dst);
         Some(out)
+    }
+
+    /// F5: the number of **blocking** device→host readbacks this backend has
+    /// performed (`copy_to_host`, which syncs the stream and then copies). The
+    /// hot path must issue none of these; the values that legitimately do are the
+    /// enumerated host-visible ones (logits, KV session save, debug dumps,
+    /// capture fallbacks) — see `docs/BACKEND-REGISTRY-DESIGN.md` §11.
+    /// (The F5 gates are tests, so the production build has no caller.)
+    #[allow(dead_code)]
+    pub fn blocking_readback_count(&self) -> u64 {
+        self.blocking_readbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// F5: enqueue the **asynchronous** device→host staging copy of one node's
+    /// output. Returns after queueing the transfer and recording its event; the
+    /// bytes are not valid until [`Self::take_cross`] waits on that event.
+    ///
+    /// `src` is the source buffer's device pointer and `bytes` its length in
+    /// bytes; `dst` is the destination backend's staging reference (the host
+    /// buffer the consumer reads).
+    fn enqueue_cross_host(
+        &mut self,
+        uid: u64,
+        node: NodeId,
+        dst: BufRef,
+        src: *const std::ffi::c_void,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if bytes == 0 {
+            return Err(format!(
+                "cuda: node {node} has an empty staging copy (0 bytes)"
+            ));
+        }
+        let _sg = self.stream_guard();
+        let slab = self.take_cross_slab(bytes)?;
+        let ptr = self.cross_slabs[slab].ptr;
+        self.state.copy_to_host_async(src, ptr, bytes)?;
+        // The event is recorded *after* the copy on the same stream, so waiting
+        // on it is exactly "the transfer has landed" — never an earlier point.
+        let event = self.state.record_event()?;
+        self.cross_pending.push(CrossPending {
+            uid,
+            node,
+            dst,
+            slab,
+            bytes,
+            event,
+        });
+        Ok(())
+    }
+
+    /// F5: wait on a pending cross copy's event and hand its bytes back, then
+    /// release the slab and the event. `None` when this backend has no pending
+    /// copy for `(uid, node, dst)` — the pair took the allocator's synchronous
+    /// path, so its phase B is a no-op.
+    fn take_cross(
+        &mut self,
+        uid: u64,
+        node: NodeId,
+        dst: BackendTag,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let Some(pos) = self
+            .cross_pending
+            .iter()
+            .position(|p| p.uid == uid && p.node == node && p.dst.backend == dst)
+        else {
+            return Ok(None);
+        };
+        let rec = self.cross_pending.remove(pos);
+        let _sg = self.stream_guard();
+        let r = self.state.wait_event(rec.event);
+        // Release the event and the slab whatever the wait said: a failed wait
+        // must not leak the pinned memory, and the caller turns the `Err` into a
+        // loud boundary failure.
+        self.state.event_destroy(rec.event);
+        self.cross_slabs[rec.slab].in_use = false;
+        r?;
+        let bytes = rec.bytes;
+        let data = unsafe {
+            std::slice::from_raw_parts(self.cross_slabs[rec.slab].ptr as *const f32, bytes / 4)
+        };
+        Ok(Some(data.to_vec()))
+    }
+
+    /// F5: an idle pinned slab of at least `bytes`, growing the pool when every
+    /// slab is in use. The smallest sufficient slab is chosen so a 4 KB staging
+    /// copy does not occupy the 4 MB slab a prefill left behind.
+    fn take_cross_slab(&mut self, bytes: usize) -> Result<usize, String> {
+        let mut best: Option<usize> = None;
+        for (i, s) in self.cross_slabs.iter().enumerate() {
+            if s.in_use || s.bytes < bytes {
+                continue;
+            }
+            if best.is_none_or(|b| s.bytes < self.cross_slabs[b].bytes) {
+                best = Some(i);
+            }
+        }
+        if let Some(i) = best {
+            self.cross_slabs[i].in_use = true;
+            return Ok(i);
+        }
+        // 64 KiB floor: a decode-step boundary copies KB-scale activations, and
+        // rounding up avoids a realloc per layer.
+        let need = bytes.max(64 << 10);
+        let ptr = self.state.host_alloc(need).ok_or_else(|| {
+            format!("cuda: pinned staging allocation of {need} bytes failed (cudaHostAlloc)")
+        })?;
+        self.cross_slabs.push(CrossSlab {
+            ptr: ptr as *mut std::ffi::c_void,
+            bytes: need,
+            in_use: true,
+        });
+        Ok(self.cross_slabs.len() - 1)
     }
 
     /// Viz/trace capture: queue an async D2H of pool buffer `id` into the
@@ -387,6 +549,14 @@ impl Drop for CudaBackend {
         self.free.clear();
         for (_, (ptr, _)) in self.pos_scratch.drain() {
             Self::state_free(ptr);
+        }
+        // F5: release the async staging pool (a pending copy's event is destroyed
+        // first — `cudaFreeHost` syncs, so the bytes are gone either way).
+        for p in self.cross_pending.drain(..) {
+            self.state.event_destroy(p.event);
+        }
+        for s in self.cross_slabs.drain(..) {
+            self.state.host_free(s.ptr as *mut u8);
         }
         for g in &self.graph_execs {
             self.state.graph_destroy(g.exec);
@@ -1444,6 +1614,88 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 pub const READS_PACKED_KV: bool = false;
 
+/// F5 ([#58]): registry hook **phase A** — enqueue one cross-backend staging
+/// copy out of CUDA.
+///
+/// The device→host direction is the one with a device leg, and it is the whole
+/// point of the ticket: before F5 the generic path read the source with
+/// `copy_to_host`, which **synchronized the whole stream** and then issued a
+/// blocking `cudaMemcpy` — two host stalls per staged input, per boundary. Here
+/// the transfer is an `cudaMemcpyAsync` into a pinned slab plus a recorded event,
+/// so the host is not blocked at all; `await_cross` below is where it waits, once,
+/// at the documented point.
+///
+/// Every other destination **declines** (`Ok(false)`) and the allocator's
+/// synchronous host round trip handles it exactly as before F5: a device→device
+/// staging copy (unreachable today — `copy_across` early-returns when source and
+/// destination backends match), CUDA→Metal on a macOS+CUDA build, and anything
+/// else a future device adds. Declining is deliberate, not a silent fallback: the
+/// allocator *does* perform that pair, just synchronously, and the boundary
+/// counters record it as a blocking copy.
+pub(crate) fn copy_cross(
+    alloc: &mut GraphAllocator,
+    uid: u64,
+    node_id: NodeId,
+    dst_backend: BackendTag,
+) -> Result<bool, String> {
+    if dst_backend != BackendTag::CPU {
+        return Ok(false);
+    }
+    let src = alloc
+        .node_buffer(node_id)
+        .ok_or_else(|| format!("node {node_id} has no buffer"))?;
+    let dst = alloc
+        .cross_buffer(uid, node_id, dst_backend)
+        .ok_or_else(|| format!("node {node_id} has no staging buffer on {dst_backend:?}"))?;
+    // Resolve the source device pointer before borrowing the pool mutably (the
+    // two borrows cannot be live at once).
+    let src_ptr = alloc
+        .cuda()
+        .ok_or("CUDA backend not enabled")?
+        .ptr_of_ref(src)? as *const std::ffi::c_void;
+    let bytes = src.len * 4;
+    alloc
+        .cuda_mut()
+        .ok_or("CUDA backend not enabled")?
+        .enqueue_cross_host(uid, node_id, dst, src_ptr, bytes)?;
+    alloc.cross_stats_mut().async_host_copies += 1;
+    Ok(true)
+}
+
+/// F5 ([#58]): registry hook **phase B** — wait on the event phase A recorded.
+///
+/// This is the synchronization point the ticket's second acceptance line is
+/// about: the D2H copy is in flight, and reading its destination before this wait
+/// is a read of undefined data. `take_cross` waits on the recorded event (the
+/// **only** host block in the async device→host path) and releases the slab, after
+/// which the allocator publishes the bytes into the staging buffer the consumer
+/// reads.
+///
+/// A no-op when this backend has no pending copy for `(uid, node, dst)` — the pair
+/// declined phase A and the allocator's synchronous path already produced the
+/// bytes.
+pub(crate) fn await_cross(
+    alloc: &mut GraphAllocator,
+    uid: u64,
+    node_id: NodeId,
+    dst_backend: BackendTag,
+) -> Result<(), String> {
+    let Some(data) = alloc
+        .cuda_mut()
+        .ok_or("CUDA backend not enabled")?
+        .take_cross(uid, node_id, dst_backend)?
+    else {
+        return Ok(());
+    };
+    // Copy out of the released slab before the mutable borrow below: the bytes are
+    // already in host memory, so this is a plain memcpy, not a device transfer.
+    let dst = alloc
+        .cross_buffer(uid, node_id, dst_backend)
+        .ok_or_else(|| format!("node {node_id} has no staging buffer on {dst_backend:?}"))?;
+    alloc.cross_stats_mut().event_syncs += 1;
+    alloc.write_cross_staging(dst, &data)
+}
+
 /// F4: this backend's registry entry (see `cpu_backend::entry`).
 pub fn entry() -> super::registry::BackendEntry {
     use super::registry::{Backend as Handle, BackendCaps, BackendEntry, PRIORITY_CUDA};
@@ -1464,6 +1716,13 @@ pub fn entry() -> super::registry::BackendEntry {
         // `copy_to_host` is the host-read path (F4: it is a registry hook for
         // exactly this reason).
         host_read: |a, id| a.cuda().and_then(|c| c.copy_to_host(id)),
+        // F5: the split boundary's async staging copy. CUDA is the backend the
+        // device leg of the ticket is asserted on: an `cudaMemcpyAsync` D2H into a
+        // pinned slab plus a recorded event, waited on once at the boundary's
+        // documented synchronization point. See `copy_cross` / `await_cross` above
+        // for what each destination gets.
+        copy_cross,
+        await_cross,
         // The device layer holds the process-wide f16 policy (C5 records it).
         kv_format: |_| {
             if crate::cuda::kv_cache_is_f16() {
@@ -1834,6 +2093,127 @@ mod tests {
         assert!(alloc
             .cross_buffer(2, x, crate::graph::Backend::CUDA)
             .is_none());
+    }
+
+    /// F5 ([#58]) device gate: **a real split graph's boundary copies out of the
+    /// device are asynchronous, the boundary waits once per staged input, and the
+    /// result is bitwise identical to the synchronous reference.**
+    ///
+    /// This is the cheap, focused half of the F5 acceptance (the real-model half is
+    /// `models::qwen2::graph::async_cross_copies_never_block_and_stay_bitwise_identical`):
+    /// a three-node graph whose middle node is pinned to the device makes the
+    /// scheduler alternate CPU → CUDA → CPU, so the boundary stages one value *into*
+    /// the device and one *out of* it. Both modes run the same kernels in the same
+    /// order — only the transfer differs — so bitwise equality is the honest claim.
+    ///
+    /// The counters are deterministic, which is why this is the mutation gate: with
+    /// the boundary's `await_cross` loop removed, `copies == waits` fails **and**
+    /// the consumer's read of the still-pending staging entry is a loud error.
+    #[test]
+    fn a_split_graph_waits_once_per_staged_copy_and_stays_bitwise() {
+        use crate::graph::copystats::{self, CrossCopyStats};
+        use crate::graph::scheduler::BackendScheduler;
+
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let data = [1.0f32, -2.0, 3.5, 4.25];
+        // x → silu (device) → add(silu, x) (CPU). Every backend is set explicitly:
+        // `split_graph` makes an unassigned node inherit the previous one's backend.
+        let build = || {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [4, 1, 1, 1], DType::F32);
+            let s = b.silu(x);
+            let o = b.add(s, x);
+            b.output(o);
+            let mut g = b.build();
+            g.nodes[0].backend = Some(crate::graph::Backend::CPU);
+            g.nodes[1].backend = Some(crate::graph::Backend::CUDA);
+            g.nodes[2].backend = Some(crate::graph::Backend::CPU);
+            g
+        };
+        let run = |sync: bool| -> (Vec<f32>, CrossCopyStats, u64, u64) {
+            let _mode = copystats::set_sync_for_test(sync);
+            let g = build();
+            let mut alloc = GraphAllocator::new();
+            assert!(alloc.enable_cuda(), "a CUDA device answered the probe");
+            alloc.alloc_graph(&g).unwrap();
+            alloc.fill_input(&g, "x", &data).unwrap();
+            let before = alloc.cross_stats();
+            let readbacks_before = alloc.cuda().unwrap().blocking_readback_count();
+            let syncs_before = crate::cuda::stream_sync_count();
+
+            BackendScheduler::new().execute(&g, &mut alloc).unwrap();
+            let got = alloc.get_buffer(&g, 2).unwrap().to_vec();
+            let stats = alloc.cross_stats().delta(before);
+            let readbacks = alloc.cuda().unwrap().blocking_readback_count() - readbacks_before;
+            (
+                got,
+                stats,
+                readbacks,
+                crate::cuda::stream_sync_count() - syncs_before,
+            )
+        };
+
+        let (async_out, a, a_readbacks, a_syncs) = run(false);
+        let (sync_out, s, s_readbacks, s_syncs) = run(true);
+
+        eprintln!(
+            "[f5] split graph: async copies={} waits={} blocking={} async_host={} event_syncs={} \
+             reads={} syncs={} | sync copies={} waits={} blocking={} reads={} syncs={}",
+            a.copies,
+            a.waits,
+            a.blocking_host_copies,
+            a.async_host_copies,
+            a.event_syncs,
+            a_readbacks,
+            a_syncs,
+            s.copies,
+            s.waits,
+            s.blocking_host_copies,
+            s_readbacks,
+            s_syncs
+        );
+
+        // The graph really crosses the boundary in both directions: one CPU→CUDA
+        // copy (node 0 into the device split) and one CUDA→CPU copy (node 1 back
+        // out). Node 0 feeding the last split is a same-backend input and must not
+        // be counted.
+        assert_eq!(a.copies, 2, "one copy in, one copy out");
+        assert_eq!(
+            a.async_host_copies, 1,
+            "the CUDA→CPU copy took the async path"
+        );
+        assert_eq!(a.event_syncs, 1, "…and owes exactly one event wait");
+        assert!(
+            a.all_copies_awaited(),
+            "one wait per staged input: {} copies, {} waits",
+            a.copies,
+            a.waits
+        );
+        assert_eq!(
+            a.blocking_host_copies, 0,
+            "no blocking device→host copy on the boundary"
+        );
+        assert_eq!(a_readbacks, 0, "no blocking readback on the boundary");
+        assert!(
+            a_syncs < s_syncs,
+            "the async boundary removes the per-copy stream sync ({a_syncs} vs {s_syncs})"
+        );
+        assert_eq!(
+            s.blocking_host_copies, 1,
+            "the synchronous reference blocks on the device→host copy — the 'before' number"
+        );
+        assert!(s_readbacks >= 1, "the device counter sees the sync path");
+        assert_eq!(
+            async_out, sync_out,
+            "the async staging copies must be bitwise identical to the synchronous reference"
+        );
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        for (i, v) in data.iter().enumerate() {
+            assert!((async_out[i] - (silu(*v) + v)).abs() < 1e-5);
+        }
     }
 
     #[test]
