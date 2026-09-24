@@ -1124,7 +1124,7 @@ host already passes, and the Q8_0 move gate pins it), and the CPU path is untouc
   now sweeps **f32/f16/q8_0**; `cuda_kv_q8_0_roundtrip_attn` (store → attention) and
   `cuda_q8_0_kv_cell_move_strides_by_row_bytes` (`copy_cells` under the packed stride) are the two
   new device gates. `compute-sanitizer --tool memcheck` over all three reports **no memory error**
-  (2 pre-existing `cudaFuncSetAttribute` API errors, the same ones master prints — follow-up). Mutations: dropping the Q8_0 block base in `kv4` left the map-window gate
+  (the 2 pre-existing CUDA API errors it did report were root-caused in S2c below, [#145](https://github.com/yusiwen/minfer/issues/145)). Mutations: dropping the Q8_0 block base in `kv4` left the map-window gate
   **green** (every comparison there is *between* modes over the same bytes, so a value-level fault
   shifts both sides together — the F6 lesson) and made the round-trip and the **real-model device
   arm** fail (max |Δlogit| 2.48 → 26.34 of a 37.8 spread); halving the packed stride in
@@ -1178,6 +1178,105 @@ Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2
 **fused decode epilogue** (a block-quantizing store inside `attn_bias_rope_store` would recover the
 1.18x on the 0.5B) and a **dp4a packed K dot** (the 1.25x), then the FA prefill on packed cells
 (the 15x at hd 128). [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+
+### C4 — S2c: the latched CUDA API errors behind the phantom "kernel launch error" · [#145](https://github.com/yusiwen/minfer/issues/145) + [#128](https://github.com/yusiwen/minfer/issues/128) — **DONE 2026-09-25**
+
+**Why.** `minfer bench` on a CUDA build printed `CUDA kernel launch error: 1` between its two loops —
+pre-existing on master, not an S2b regression — and `compute-sanitizer --tool memcheck` over the unit
+suite reported **36** CUDA API errors. `CudaState::sync` polls `cudaGetLastError`, which reports
+whatever an *earlier* call on the thread latched, so an API error from several operations ago was
+printed as a failure of the kernel that had just run.
+
+**Root cause: two origins, both unchecked return values.**
+
+1. **`gemm_prefill_smem_init` (1 of the 36; [#145](https://github.com/yusiwen/minfer/issues/145)).**
+   The eager dynamic-smem opt-in looped over every `gemm_f16_nt_kernel_t<tm, ks, af32>` and asked
+   `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, N)` for a stale `N`: its
+   formula assumed a 512-thread `TM=256` launch and always added the AF32 mirror, so
+   `gemm_f16_nt_kernel_t<256,64,true>` requested **131072 B** against GB10/sm_121's
+   `cudaDevAttrMaxSharedMemoryPerBlockOptin` of **101376 B**. The rejected call's return value was
+   never read, so the error latched. The *same* formula existed a second time, inline in
+   `launch_gemm_f16`, and **that** copy dropped the AF32 mirror — the launcher declared 16384 B less
+   than the kernel's own `Bs`/`Cs` offsets need at the default `KS=32`, an out-of-declaration
+   shared-memory access that only worked because the block's smem happened to be carved where nothing
+   else wrote.
+2. **`cudaGraphDestroy` on a `cudaGraphExec_t` (26 of the 36; [#128](https://github.com/yusiwen/minfer/issues/128)).**
+   `CudaState::graph_destroy` is the only destroy path for an exec handle and called the *graph*
+   destructor. It returned `cudaErrorInvalidValue`, leaked the exec, and the latch surfaced at the
+   next sync — **the actual source of the bench line**. The remaining 9 errors were
+   `cudaGetLastError` observations of one of the two.
+
+**What landed.**
+
+- **One formula, read twice.** `gemm_dynamic_smem_bytes(tm, ks, af32)` is the single source for the
+  kernel's byte layout (`As 2*TN*KS halves + Am 2*TN*KS floats [AF32] + Bs 2*TM*KS halves + Cs
+  NW*256 floats`, TN = 64, NW = `blockDim.x/32` = 8 at every launch site); `launch_gemm_f16` and
+  `gemm_prefill_smem_init` both call it.
+- **The eager opt-in is checked and deliberate.** Every `cudaFuncSetAttribute` return value is read;
+  a failure is named once, at init, with the function, attribute, requested bytes, device limit and
+  `cudaGetErrorName`, and cleared there. A request above the **queried** device limit is skipped
+  without calling it, with the reason printed — on GB10 that is `gemm_f16_nt_kernel_t<256,64,true>`
+  (122880 B > 101376 B), which cannot launch on this device at all. `CudaState::try_new` reports the
+  counts.
+- **`sync` attributes honestly.** `latched_api_error_message` names the observer
+  (`cudaGetLastError`), the `cudaGetErrorName` symbol and the code, and states it is not attributed
+  to a kernel; the error is counted (`latched_api_error_count`) and cleared — still visible, never
+  dropped. `debug_sync`'s label follows.
+- **`graph_destroy` calls `cudaGraphExecDestroy`**; the `cudaGraph_t` / `cudaGraphExec_t` distinction
+  is stated at the extern and the call site, and a failure is named there and cleared.
+
+**Acceptance results (GB10, sm_121, CUDA 13.0, driver 580.178.04).**
+
+| check | before | after |
+|---|---|---|
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **36** API errors (26 `cudaGraphDestroy`, 9 `cudaGetLastError`, 1 `cudaFuncSetAttribute`) | **0** errors |
+| CUDA serial unit suite | 490 / 0 / 31 | **495 / 0 / 31** (five new gates) |
+| CUDA serial ignored, 0.5B config | 31 / 0 | **31 / 0** |
+| CUDA serial ignored, Qwen3-0.6B Q8_0 | 30 / 1 | **30 / 1** — still only [#130](https://github.com/yusiwen/minfer/issues/130) |
+| `minfer bench -p 64 -n 8 -r 2`, 0.5B Q4_K_M | prints `CUDA kernel launch error: 1` between the two loops | no such line; the one skipped opt-in named instead |
+| CPU `cargo test --release` | 432 / 0 / 28 unit + 10 / 0 / 6 integration | **unchanged** |
+| CPU serial ignored | 28 / 0 | **28 / 0** |
+
+**The five new gates, all mutation-checked.**
+
+- `the_latched_error_message_never_blames_a_kernel` (pure) — the message names `cudaGetLastError` and
+  `cudaErrorInvalidValue` and does **not** contain "kernel launch". Mutation: the old message fails it.
+- `the_gemm_smem_formula_matches_the_kernel_layout` (pure) — pins `gemm_dynamic_smem_bytes` against
+  the kernel's byte layout for all 12 `(tm, ks, af32)` combinations. This is the *value-level* arm the
+  F6 lesson asks for: a mode-vs-mode comparison is blind to a shrunk formula (launcher and init shrink
+  together, so a consistency check stays green). Mutation: dropping the AF32 term fails it.
+- `cuda_prefill_smem_optin_covers_every_launchable_instantiation` (device) — every >48 KiB request the
+  device admits reads back opted in through `cudaFuncGetAttributes().maxDynamicSharedSizeBytes`; every
+  over-limit one is skipped, never called. Mutation: `continue`-ing one admitted combination fails it.
+- `cuda_graph_exec_destroy_leaves_no_latched_error` (device) — capture → instantiate → destroy
+  returns `true` and leaves the latch at 0. Mutation: `cudaGraphDestroy` fails it. The gate asserts
+  the destroy **call's own result** (`graph_destroy` now returns `bool`), not just the latch: the
+  failure is named and cleared inside `graph_destroy`, so a latch-only assertion passed with the
+  wrong destructor — the first cut of this gate passed for the wrong reason and was fixed here.
+- `cuda_sync_surfaces_a_latched_error_as_latched` (device; env-gated behind
+  `MINFER_TEST_LATCH_ERROR=1` because it *deliberately latches a real API error*, which a
+  `compute-sanitizer` run must not see) — sync reports the injected error once and clears it.
+  Mutation: dropping the report fails it.
+
+The >48 KB capture path stays covered by the existing prefill gates — prefill capture is ON by default
+(R3-B) and `cuda_prefill_capture_defaults_on`, `cuda_prefill_capture_bit_parity_pp16_pp300`,
+`cuda_multisplit_capture_bit_parity` and the real-prefill
+`cuda_graph_generation_replay_parity_real_model` are all green in the 495 / 0 / 31 run.
+
+**The deliberate-failure check.** The pre-fix over-limit request was forced back with the
+sanitizer-clean skip bypassed, so `cudaFuncSetAttribute` really failed: the init printed
+`cudaFuncSetAttribute(gemm_f16_nt_kernel_t<256,64,true>,
+cudaFuncAttributeMaxDynamicSharedMemorySize, 131072 B) failed: cudaErrorInvalidValue (1); device
+opt-in limit 101376 B`, and `cuda_prefill_smem_optin_covers_every_launchable_instantiation` failed
+(failures = 1). Reverted; the reverted `src/cuda_kernels.cu` is byte-identical to the committed one
+(`sha256sum`, in the closing comment on #145).
+
+**Honest scope.** The device limit — and therefore *which* instantiation is skipped — is measured on
+GB10/sm_121 only; the decision is a runtime query and the skip is printed, so another device skips a
+different subset. `MINFER_GEMM_TM=256` + `MINFER_GEMM_K64=1` + the f32-A path is the only combination
+that lands on the skipped instantiation, and it had no working opt-in before either. The remaining
+unchecked CUDA calls in the same file are enumerated in
+[#147](https://github.com/yusiwen/minfer/issues/147) rather than silently fixed here.
 
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 
