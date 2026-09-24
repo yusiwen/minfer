@@ -373,6 +373,39 @@ a fixed deep KV depth and reports the per-token amortization
 `MINFER_SPECVERIFY_NOUT=1` forces prefill-style `n_out=1`. Exit code is 0
 whenever the measurement completes; the PASS/FAIL verdict is in the JSON.
 
+## GGUF tooling — convert, quantize, split (F6)
+
+```bash
+# HuggingFace Qwen2 checkpoint -> GGUF (f16, or f32 for a lossless archive)
+./target/release/minfer convert /path/to/Qwen2.5-0.5B-Instruct out.gguf --outtype f16
+# quantize an existing single-file GGUF (q4_0, q4_1, q5_0, q5_1, q8_0, f16, f32)
+./target/release/minfer quantize out.gguf out-q4_0.gguf --type q4_0
+# split a single file into transport-sized parts (any type; tensor bytes copied verbatim)
+./target/release/minfer split out-q4_0.gguf /tmp/parts --max-size 200M
+```
+
+`convert` reads `config.json`, `tokenizer.json`, `tokenizer_config.json` and
+`model.safetensors` (single file or an `index.json` shard map) and writes the
+GGUF v3 metadata the engine's **strict** loader requires: `tokenizer.ggml.model
+= gpt2`, `tokenizer.ggml.pre = qwen2`, the full 256-token byte vocabulary, the
+merge table, the special-token ids and `tokenizer.chat_template`. Supported
+architectures: `Qwen2ForCausalLM` only. 1-D tensors stay f32 under `--outtype
+f16` (llama.cpp's rule); `--outtype f32` is exact for bf16/f16 sources.
+
+`quantize` re-encodes 2-D float weights; 1-D norms/biases keep their source
+type, and on a tied model a sub-8-bit target quantizes the shared
+`token_embd.weight` at q8_0 (both are printed). K-quants and I-quants are
+refused by name — minfer can read them but has no encoder that has been
+verified against llama.cpp.
+
+`split` writes `{stem}-NNNNN-of-MMMMM.gguf` parts with
+`split.no`/`split.count`/`split.tensors.count`; the loader reads part 0 and
+merges every part into one tensor index. `--split-max-size`/`--max-size` accept
+bytes or a `K`/`M`/`G` suffix, and a tensor is never split across parts.
+
+Full contract, supported/refused sets and verification references:
+[`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
+
 ## Examples
 
 ```bash
