@@ -3235,7 +3235,7 @@ Can run in parallel with A–E by a different workstream.
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) | M | this box (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) | M | this box |
-| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) | M | this box |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24** | M | this box |
 
 F1 is the only item in this plan that **cannot be verified on this machine**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
@@ -3392,6 +3392,117 @@ occupancy/queue numbers are published and read back in a real-model engine run;
 `MINFER_OP_TIMING` off leaves the table empty and on accumulates (and the
 computation's output is unchanged either way); the drain is bounded and reports
 what was left. At least one new gate is mutation-checked.
+
+**What landed (2026-09-24).** All five pieces, in three commits: the design note,
+`feat(graph): F8 per-op timing behind MINFER_OP_TIMING`, and
+`feat(server): F8 /metrics, live KV/queue depth, bounded drain`
+([#51](https://github.com/yusiwen/minfer/issues/51)).
+
+*Surface.* `GET /metrics` (Prometheus text 0.0.4) on the OpenAI server, served
+from its own router state so a scrape needs neither the tokenizer nor the job
+channel and keeps answering while the model is busy. Metric families and units:
+
+| Family | Type | Unit | Meaning |
+|---|---|---|---|
+| `minfer_requests_total` | counter | requests | accepted and queued for the worker |
+| `minfer_requests_completed_total` | counter | requests | response finished (body sent, stream closed, client gone) |
+| `minfer_requests_rejected_total` | counter | requests | refused before queueing (draining / worker gone) |
+| `minfer_requests_in_flight` | gauge | requests | accepted, not yet finished — the drain surface |
+| `minfer_jobs_dropped_total` | counter | jobs | the worker could not place the job in a slot |
+| `minfer_queue_depth` | gauge | jobs | `accepted - admitted`: channel backlog + the worker's `pending` deque |
+| `minfer_worker_pending_jobs` | gauge | jobs | the worker's own deque right now |
+| `minfer_requests_running` | gauge | requests | occupying an engine slot right now |
+| `minfer_draining` | gauge | 0/1 | a shutdown was requested |
+| `minfer_drain_abandoned_requests` | gauge | requests | still in flight when the drain deadline expired |
+| `minfer_memory_{weights,pool,live,peak_live,budget,headroom}_bytes` | gauge | bytes | E4 `MemoryReport`; budget/headroom **omitted** when unbounded |
+| `minfer_memory_{idle_slots,reserved_classes}` | gauge | count | the E4 S3 reservation table's depth |
+| `minfer_kv_{layers,rows,region_bytes}` | gauge | count / count / bytes | the arena's shape |
+| `minfer_kv_packed` | gauge | 0/1 | packed Q8_0 cells vs f32/f16 words (C4) |
+| `minfer_kv_{reserved,owned,shared,free}_cells`, `minfer_kv_{free_runs,sequences}` | gauge | cells / runs | C3/C8b arena occupancy |
+| `minfer_kv_{defrags,cells_moved,cows,cow_cells}_total` | counter | count / cells | C3 compaction and C8b copy-on-write |
+| `minfer_op_seconds_total{op=…}`, `minfer_op_calls_total{op=…}` | counter | seconds / count | per-op, **present only when `MINFER_OP_TIMING` is set** |
+
+*Flags.* `MINFER_OP_TIMING` (presence-checked) turns on per-op timing.
+`MINFER_DRAIN_MS` (default `30000`) bounds the graceful drain. Both are
+documented in `docs/USAGE.md`.
+
+*Drain.* SIGINT/SIGTERM → set `draining` → `axum::serve` graceful shutdown →
+wait for the serve future at most `MINFER_DRAIN_MS` via `bounded_drain` → on a
+clean drain, a second bounded wait for the worker → otherwise log and record the
+still-in-flight count and return. No unbounded join, and with no signal the loop
+waits forever as before. The `--slots-file` snapshot is untouched (it is still
+written on every completed request inside `BatchEngine::finish`).
+
+Two mechanisms stop new work, and it is worth naming which does what: the
+graceful shutdown **closes the listener**, so a brand-new connection after the
+signal gets a connection error; the `draining` check in the handler then returns
+`503` for a request that arrives on an **already-accepted** connection (a
+keep-alive client, or one accepted just before the signal). The `503` is
+therefore a backstop rather than the primary switch, and it is the one the
+automated gate drives directly.
+
+**Measured acceptance.** `cargo test --release`: **337 passed / 0 failed /
+18 ignored** (unit) and **3 passed / 0 failed / 6 ignored** (integration) — a
+delta of **+24 passed, +2 ignored** from the pre-F8 baseline (313/0/16 and 3/0/6,
+at `911ce2c`). The 24 new non-ignored tests are the rendering boundary set, the
+HTTP round-trips, the drain bound, the in-flight guard, the deadline parse, and
+the timing gates. The 2 new ignored tests are the real-model gates, run here with
+`cargo test --release --bin minfer -- --ignored --test-threads=1`:
+`published_metrics_move_as_requests_are_served` (24 layers, 128 rows,
+3 145 728 B of KV region, `running` 0 → 1 → 0) and
+`serve_loop_publishes_the_queue_and_running_depth` (peak queue 1, peak running 1,
+and the deterministic one-slot round dropping exactly 1 job).
+
+**End-to-end run (manual, on this box, CPU, Qwen2.5-0.5B Q4_0, `MINFER_BATCH=1`).**
+A live `minfer serve` on port 18099 with `MINFER_OP_TIMING=1` and
+`MINFER_DRAIN_MS=8000`: before any request `/metrics` reports zeros and no timing
+family; one 16-token chat completion then shows `minfer_requests_total 1`,
+`minfer_requests_completed_total 1`, `minfer_requests_in_flight 0`,
+`minfer_kv_layers 24`, `minfer_kv_rows 512`, `minfer_kv_region_bytes 12582912`
+(= 24 × 2 × 512 × 128 × 4, the f32 KV of the 24-layer model at `--n-ctx 512`),
+`minfer_memory_weights_bytes 422782464`, and a per-op breakdown of exactly the ops
+that ran (`matmul` 0.538 s / 2704 calls, `attn` 0.034 s / 384,
+`rms_norm`, `rope`, `swiglu`, `add`, `get_rows`, `kvcache_store`,
+`kvcache_load`; `silu` and `softmax` are absent because the kernels fuse them).
+A second request was started, SIGTERM sent mid-flight with
+`MINFER_DRAIN_MS=8000`: `[server] SIGTERM: draining — refusing new requests;
+1 request(s) in flight, up to 8000 ms to finish` → `drain complete: every
+in-flight request finished` → `worker stopped; exiting`. Repeating with
+`MINFER_DRAIN_MS=150` and a 400-token request produced the **forced** path:
+`drain deadline (150 ms) reached with 1 request(s) still in flight; abandoning
+them and exiting`, with the process gone shortly after. A greedy 12-token run of
+the same prompt with and without `MINFER_OP_TIMING=1` produced the identical
+generated text (`The capital of France is Paris. It is the largest city`) — only
+the throughput lines differed — which is the flag's end-to-end "off changes
+nothing computed" claim.
+
+**Mutation checks (the gates can fail).** (a) Rendering the queue-depth sample
+from the worker's pending gauge instead of `accepted - admitted` fails
+`both_threads_write_into_one_registry` and the HTTP
+`metrics_endpoint_renders_over_http`. (b) Mapping `Op::MatMul` to `GetRows`'
+index fails `op_names_agree_with_op_index` with "two variants map to index 9".
+Both were reverted; the shared test gate is poison-tolerant so a mutation produces
+one named failure rather than a cascade of `PoisonError`s.
+
+**Honest scope.** (a) Per-op timing measures the **scheduler's per-node
+dispatch** — the one choke point CPU/Metal/CUDA share — so it includes the
+backend's prologue and excludes split-level syncs, cross-backend staging copies,
+allocator liveness and `fill_input`; there is no kernel-only timer. (b) There is
+no histogram and no token/latency accounting (no `_bucket`/`_sum` families,
+no time-to-first-token): the ticket asked for occupancy, depth, per-op timing and
+drain, and adding a histogram would need a bucket policy this ticket did not
+specify. (c) The serial (non-batched) path has one `GraphCache` per slot, so
+`/metrics` reports the arena of the slot that served the last request rather than
+a sum; the batched path reports its single shared arena in full. (d) Queue depth
+is a subtraction of two relaxed counters, so a scrape can transiently read 0
+while a job is in the channel; it is exact in the steady state and saturating,
+never negative. (e) The CMake/Metal and x86/CUDA paths are compile-checked by CI
+only — this box has no `nvcc` and no Metal, so the timing hook is exercised on
+CPU here. (f) The signal path is **not in the automated suite** — only
+`bounded_drain`, the deadline parse and the draining `503` are. The end-to-end
+runs above were performed by hand on this box and are recorded here as manual
+evidence, not as a CI gate; wiring a `SIGTERM` into a test would mean a
+subprocess and a port, which this ticket did not take on.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
