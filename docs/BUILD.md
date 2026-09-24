@@ -20,6 +20,16 @@ cargo build --release --features cuda,cuda_static
 cargo build --release --features debug_dump
 ```
 
+## GGUF tooling (F6) — no extra dependencies
+
+`minfer convert` / `quantize` / `split` need no Python, no PyTorch and no
+`gguf-py`: safetensors is parsed as a length-prefixed JSON header plus raw
+bytes and `tokenizer.json`/`config.json` are plain JSON, both through the
+already-present `serde_json`. They are host-side file work — no GPU backend is
+initialized — and they build in every configuration (CPU, Metal, CUDA). The
+writer/encoders and their verification references are documented in
+[`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
+
 ## Git hooks (git-hooks.nix)
 
 The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git-hooks.nix)

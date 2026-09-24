@@ -21,6 +21,22 @@ src/
 ├── main.rs          # CLI + inference loop (prefill → autoregressive decode)
 ├── graph/           # ★ compute graph — the inference core (files below)
 ├── gguf.rs          # GGUF v3 parser (~2100 lines, largest file)
+├── gguf_write.rs    # F6 (#49): the GGUF v3 *writer* — header/metadata/tensor-index
+│                    #   encoding for every GgufType, ggml_pad alignment, per-tensor
+│                    #   byte layout, and the split convention (`split.no`/`split.count`,
+│                    #   `{stem}-NNNNN-of-MMMMM.gguf`). `GgufWriter` + `write_single` /
+│                    #   `write_split`; the parser in gguf.rs is the contract, asserted
+│                    #   write→parse in the module's unit tests
+├── quantize.rs      # F6 (#49): weight-encoding targets + encoders, byte-identical to
+│                    #   llama.cpp's `quantize_row_*_ref` (q4_0/q4_1/q5_0/q5_1/q8_0 +
+│                    #   f16/f32 casts), their dequantize/blocks, and the loud refusal of
+│                    #   every type without an encoder (K-quants are readable, not writable)
+├── convert.rs       # F6 (#49): HuggingFace Qwen2 checkpoint → GGUF (safetensors parsed
+│                    #   with serde_json only), the strict-loader metadata (tokenizer
+│                    #   arrays/chat template/hparams), and `QuantizePlan` (re-encode an
+│                    #   existing GGUF); unknown arch/tensor/dtype are refusals
+├── tooling.rs       # F6 (#49): the `convert` / `quantize` / `split` subcommands and the
+│                    #   F6 real-model gates
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization
 ├── kernel.rs        # quantized matmul dispatch + CPU scalar fallbacks
@@ -112,6 +128,11 @@ MINFER_TRACE=/tmp/t.json  ./target/release/minfer <model> "hello"  # per-node re
 MINFER_OP_TIMING=1 ./target/release/minfer serve <model>           # F8: per-op timing in /metrics (off by default)
 MINFER_DRAIN_MS=5000 ./target/release/minfer serve <model>         # F8: bound the SIGINT/SIGTERM drain (default 30000)
 curl -s http://127.0.0.1:8080/metrics                              # F8: Prometheus text snapshot
+
+# F6 tooling (#49) — HF → GGUF, quantize, split (docs/GGUF-TOOLING.md)
+./target/release/minfer convert <hf-model-dir> out.gguf [--outtype f16|f32] [--split-max-size N]
+./target/release/minfer quantize in.gguf out.gguf --type q4_0 [--split-max-size N]
+./target/release/minfer split in.gguf <out-dir> --max-size 200M [--stem NAME]
 ```
 
 - CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run 2026-09-24: **459 passed / 0 failed / 26 ignored**, GB10 sm_121). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is now **26 passed / 0 failed** on the CUDA build (0.5B config, measured 2026-09-24; it was 25/0 at `d06f825` and F5's real-model gate is the 26th) — the "22" that stood here was stale, see the real-model-gates bullet below.
@@ -141,7 +162,7 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 - Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device" (A0's probes could not see the GPU either way, so "no device" was unsupported).
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md` (stale in places — [#62](https://github.com/yusiwen/minfer/issues/62)). CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
-- Multi-part GGUF: entry is part 0, all parts parsed into one merged tensor index; download resume is size-checked.
+- Multi-part GGUF: written by `minfer split` (F6) as `{stem}-NNNNN-of-MMMMM.gguf` with `split.no`/`split.count`/`split.tensors.count`; entry is part 0, all parts parsed into one merged tensor index (part order preserved, so the merged index equals the single-file index), and download resume is size-checked (`download::check_downloaded_size` refuses a wrong-length file and removes it).
 - **Parallel work in a nested worktree**: `.worktrees/<scope>` (git-ignored, see `.gitignore`) keeps
   the session workspace writable when the file policy is `workspace-write` — a worktree *beside* the
   root is outside it and cannot be written to, and this repo's branch is often already checked out
@@ -169,6 +190,15 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   `token_ids_match_the_reference` `#[ignore]`d test.
 - Qwen3.5 (`qwen35` arch) is **not** a supported architecture; its GGUF is used
   only as the `qwen35` pre-tokenizer/id reference.
+- f16 **weights** (F6/#49): a converted f16 GGUF loads and runs on the CPU path —
+  `Op::MatMul` decodes one f16 weight row at a time (`vec_ops::mat_mul_f16`) and
+  `Op::GetRows` decodes f16 embedding rows; 1-D norms/biases stay f32 because the
+  converter writes them f32 (llama.cpp's rule). The Metal/CUDA registration still
+  accepts f32 and the supported quants only, so an f16 model runs the CPU path even
+  on a device build, and that path is slow (~3 tok/s prefill on the 0.5B):
+  [#141](https://github.com/yusiwen/minfer/issues/141). `minfer quantize` supports
+  q4_0/q4_1/q5_0/q5_1/q8_0 (byte-identical to `llama-quantize`), f16 and f32, and
+  refuses every type without an encoder by name ([#140](https://github.com/yusiwen/minfer/issues/140)).
 
 ## GPU Safety
 
@@ -286,6 +316,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
 | CLI conversation plan | `docs/CLI-CONVERSATION-PLAN.md` |
 | Inference-graph viz (`MINFER_TRACE` etc.) + end-to-end shape flow (`viz/e2e.html`) | `viz/README.md` |
+| **GGUF tooling (F6/#49): the writer contract, `convert`/`quantize`/`split`, the supported/refused sets, the split convention, the references/tolerances** | `docs/GGUF-TOOLING.md` |
 | Debug dump format | `docs/debug-dump.md` |
 | Metal / multi-token kernel analyses | `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` |
 | Parameter audit, bug/debug notes, known issues | `docs/PARAMETER_AUDIT.md`, `docs/BUG-6-KV-CACHE-INDEXING.md`, `docs/DEBUGGING-*.md`, `docs/QWEN2.5-*.md`, `docs/KNOWN-CPU-ISSUES-2026-08-29.md` |

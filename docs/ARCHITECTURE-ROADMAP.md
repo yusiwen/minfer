@@ -509,10 +509,19 @@ BF16/MXFP4/NVFP4 (`SUPPORT-MATRIX.md §Not Yet Supported`;
 reach are Q2_K/Q3_K (running large models on small machines) and BF16 (serving
 unconverted checkpoints). 🟠 but legitimately deprioritized.
 
-**No quantizer.** minfer consumes GGUF but cannot produce it: there is no
-`convert-hf-to-gguf` and no `quantize` path, so any checkpoint that is not
-already GGUF must be converted by an external tool first. 🟡 for a research
-engine, 🟠 for a product.
+**Quantizer tooling — closed by F6 ([#49](https://github.com/yusiwen/minfer/issues/49), 2026-09-24).**
+A GGUF v3 *writer* (`src/gguf_write.rs`), byte-verified weight encoders
+(`src/quantize.rs`), a HuggingFace Qwen2 converter that satisfies the strict
+loader (`src/convert.rs`), and the `convert` / `quantize` / `split` subcommands
+(`src/tooling.rs`, `docs/GGUF-TOOLING.md`). A converted f16 model runs (the CPU
+graph path gained f16 weight dispatch); a rewrite/split round-trip is bit-exact,
+and the HF conversion's f16 output is byte-identical to llama.cpp's converter on
+the same checkpoint, per tensor. **What remains** is scope F6 did not claim: the
+K-quant/I-quant encoders are still refused by name
+([#140](https://github.com/yusiwen/minfer/issues/140)), f16 weights are CPU-only
+and slow on that path ([#141](https://github.com/yusiwen/minfer/issues/141)),
+and bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
+🟢 for conversion/quantization of the supported set.
 
 **CPU SIMD.** Only `Q4_0` and `Q8_0` have AVX2 (Advanced Vector Extensions 2)
 dot kernels (`quants.rs:42`, `:151`); `Q4_1`/`Q5_0`/`Q5_1`/`Q4_K`/`Q5_K`/`Q6_K`

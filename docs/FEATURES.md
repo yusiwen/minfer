@@ -101,6 +101,19 @@ language.
 
 `minfer bench <model>` runs llama-bench-style prefill (`pp<P>`) / decode (`tg<T>`) throughput tests on the active backend — mean ± stddev over reps after an untimed warmup, each rep from an empty KV context without a model reload — reported as a markdown/CSV/JSON table.
 
+### GGUF tooling — convert / quantize / split (F6)
+
+`minfer convert <hf-dir> out.gguf` produces a GGUF v3 from a HuggingFace Qwen2
+checkpoint with the metadata the strict tokenizer/template loader requires
+(`tokenizer.ggml.model`/`pre`, the 256 byte tokens, merges, special ids and
+`tokenizer.chat_template`); `minfer quantize in.gguf out.gguf --type …`
+re-encodes weights to q4_0/q4_1/q5_0/q5_1/q8_0 (byte-identical to
+`llama-quantize` on the same source) or f16/f32; `minfer split in.gguf dir
+--max-size N` writes `split.no`/`split.count` parts the loader merges back into
+one tensor index. Unsupported architectures, tensor names, dtypes and quant
+targets are refused by name. A converted f16 GGUF loads and runs (f16 weights
+are CPU-only). See [`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
+
 ## Philosophy
 
 **No external ML framework** — pure Rust; runtime deps are minimal (`rand`, `regex`, `half`, `serde`, `serde_json`, `minijinja`; `axum`/`tokio` only for the HTTP server). Attention, RMSNorm, RoPE, SiLU, Softmax and every quantized dot product are handwritten.

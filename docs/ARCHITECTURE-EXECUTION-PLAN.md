@@ -12,7 +12,7 @@ CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **6/8** (F2, F3, **F4**, **F5**, F7,
+**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **7/8** (F2, F3, **F4**, **F5**, **F6**, F7,
 F8 done; F1 needs x86); Phase G
 **scheduled** — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
@@ -3519,7 +3519,7 @@ Can run in parallel with A–E by a different workstream.
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | this box |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (true overlap) | M | this box (CUDA) |
-| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) | L | this box |
+| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | this box |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | this box |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | this box |
 
@@ -4421,6 +4421,121 @@ allocator-level missing-wait invariant plus the graph-level refusal through
 (`scheduler::tests::a_staged_boundary_input_cannot_be_consumed_before_its_wait`),
 and the CPU no-op/bitwise gate. The mutation's CUDA failure output above is the
 record of the part CI cannot reach.
+
+### F6 — Quantizer tooling: convert, quantize, split (#49) — **DONE 2026-09-24**
+
+**What landed.** Four new modules and the subcommands that use them:
+
+- `src/gguf_write.rs` — the GGUF v3 **writer**. The reader in `src/gguf.rs` is
+  the contract: magic/version/n_tensors/n_kv, the KV encoding for every one of
+  the 13 `GgufType`s (including arrays of strings and of the numeric types), the
+  tensor index (`name`, `n_dims`, `ne`, `type`, `offset`), `ggml_pad` alignment
+  before the data section and after every tensor, and the multi-part convention
+  (`split.no` / `split.count` / `split.tensors.count`, `{stem}-NNNNN-of-MMMMM.gguf`).
+  `write_split` assigns tensors to parts greedily by padded size, never splits a
+  tensor, gives every part the full metadata (so each parses standalone), and
+  preserves the global tensor order so the merged index equals the single-file
+  index; a one-part assignment is written as a plain single file with no
+  `split.*` keys at all. The writer validates shapes/names/payload sizes and
+  refuses a wrong-length payload instead of shifting every later tensor.
+- `src/quantize.rs` — the **weight encoders**. `q4_0`, `q4_1`, `q5_0`, `q5_1`,
+  `q8_0` (plus the `f16`/`f32` element casts), implemented as llama.cpp's
+  `quantize_row_*_ref` (the CPU reference), with `QuantTarget::parse` refusing
+  every other GGUF type **by name** ("known GGUF type but minfer has no weight
+  encoder for it … writing it would emit wrong weights").
+- `src/convert.rs` — the **HF → GGUF converter** (safetensors parsed as a
+  length-prefixed JSON header plus raw bytes; `serde_json` only, no Python and
+  no ML framework) and `QuantizePlan` (re-encode an existing GGUF, with the
+  llama.cpp "1-D tensors stay f32" rule and the tied-embedding → q8_0 policy).
+  The metadata it writes is what the F7 strict tokenizer/template loader reads:
+  `tokenizer.ggml.model = gpt2`, `.pre = qwen2`, the full `vocab_size` token
+  array with llama.cpp's token types, merges, special ids, `add_bos_token` and
+  `tokenizer.chat_template`. Unknown architecture, tensor name or dtype is a
+  refusal.
+- `src/tooling.rs` — `convert` / `quantize` / `split` and the F6 gates.
+- One engine change the acceptance forced: **f16 weights now run**. The CPU
+  graph path had no f16 weight dispatch at all (only f32 and the quants), so
+  `vec_ops::mat_mul_f16` decodes a weight row at a time and `cpu_backend`
+  dispatches it for `Op::MatMul`, and `Op::GetRows` decodes f16 embedding rows.
+  Without it "a converted model produces the same logits" was impossible for the
+  f16 output the ticket names.
+- `download::check_downloaded_size` — the second acceptance line. `http_download`
+  used to ignore the expected size it was passed; now a downloaded file whose
+  length differs from the remote's is an error and is **removed**, so it cannot
+  be mistaken for a cached complete file.
+
+**Measured acceptance (CPU; GB10 sm_121 for the CUDA row).** The references and
+tolerances are stated in `docs/GGUF-TOOLING.md` §4.
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **432 passed / 0 failed / 28 ignored** unit (baseline 405 / 0 / 23; +27 F6 tests, +5 F6 real-model gates) and **10 / 0 / 6** integration (unchanged) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **28 passed / 0 failed** (baseline 23; +5 F6 real-model gates) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **486 passed / 0 failed / 31 ignored** (baseline 459 / 0 / 26) |
+| `cargo test --release --features cuda --bin minfer -- --ignored --test-threads=1` (0.5B) | **31 passed / 0 failed** (baseline 26 / 0, +the 5 F6 gates) |
+| … with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` | **30 passed / 1 failed** — the single failure is the pre-existing [#130](https://github.com/yusiwen/minfer/issues/130) (`the file was written with the f32 KV element type, this run uses f16`), as at the baseline |
+| the F6-produced q8_0 file on the device | `CUDA GATE: …` is **not** printed; `offload: all 24 blocks + embed/output on cuda (500.8 MiB of device weights)`, 1214.7 tok/s prefill, greedy `Paris.` — the same text as `MINFER_DISABLE_CUDA=1`. The **f16** file on the same build prints `weight 'token_embd.weight' (type F16) has no CUDA kernel or is not registered` and `running on CPU` ([#141](https://github.com/yusiwen/minfer/issues/141)) |
+| HF → GGUF vs `convert_hf_to_gguf.py` (Qwen2.5-0.5B-Instruct, bf16 → f16) | **290/290 tensor payloads byte-identical** (sha256 per tensor); metadata equivalent for every loader-read value (llama.cpp also writes the cosmetic `general.size_label`, and key order differs) |
+| minfer vs llama.cpp f16 file, logits after a 4-token greedy continuation | **bitwise identical** (`assert_eq!` over 151,936 logits) and identical greedy text `[12095, 13, 1084, 374]` |
+| rewrite a cached GGUF with the writer | 291/291 tensors byte-identical, metadata key-for-key equal, logits **bitwise identical** |
+| split the cached 0.5B into 4 parts | merged index **exactly** the single-file index (name/shape/type/nbytes, in order); logits **bitwise identical**; missing part / wrong `split.no` / filename-vs-`split.count` mismatch each fail the load |
+| `minfer quantize` vs `llama-quantize` on the same f16 source | **q4_0, q4_1, q5_0, q5_1, q8_0 each 290/290 tensors byte-identical** |
+| f16 → q8_0 end-to-end | greedy continuation identical; max \|Δlogit\| **0.481** (mean 0.082) against max \|logit\| 18.43 — stated bound ≤ 1.0 absolute |
+| download size gate | pure test plus an end-to-end local HTTP server (correct `206` resume accepted; a server that ships the whole body for a range is rejected and the file removed) |
+| `rustfmt +stable --edition 2021 --check` on the 8 changed/new `.rs` | clean (rustfmt **1.9.0-stable**; the pinned 1.97.1 toolchain has no `rustfmt` component here — CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **940 links resolve in 184 files** (baseline 936 / 183; the new doc + its registration) |
+
+**The FPE detail worth recording.** The first q4_0 encoder differed from
+`llama-quantize` in **12 of 64512 bytes** on one tensor — every difference a
+single nibble off by one. The cause was not the algorithm but the *compilation*:
+llama.cpp's reference is compiled with `-ffp-contract=fast`, so `x*id + 8.5f`
+becomes an FMA on aarch64/x86, while Rust's two separate operations rounded
+twice. `f32::mul_add` reproduces it and the difference went to zero. Q8_0 uses
+a single multiply and matched without it. A quantizer that is "close" is a wrong
+file, which is why the gate is per-tensor byte equality.
+
+**Mutation evidence (reverted; the tree was restored byte-identical).** Each new
+gate was broken in the way it guards and observed to fail:
+
+| Mutation (reverted after each run) | Gate that failed (observed output) |
+|---|---|
+| writer pads between tensors to 16 while the index declares 32 | `gguf_write::tests::tensor_index_offsets_match_the_parser_requirement` — `left: 880, right: 896`: the file is 16 bytes short of the layout its own index declares |
+| tensors assigned to split parts in reverse order | `gguf_write::tests::split_writes_parts_the_reader_merges_back` — `left: 3, right: 1`, part 0 holds `t2` |
+| `split.count` written as 1 for a 3-part split | the same test panics inside `load_gguf_model`: *split count mismatch: filename implies 3 parts, split.count = 1* |
+| q4_0 encoder without `mul_add` | `f6_quantize_encoder_is_byte_identical_to_llamacpp` — *tensor `blk.0.attn_k.weight` payload differs* (the 12 bytes) |
+| `check_downloaded_size` returns `Ok` unconditionally | `a_wrong_size_file_is_refused_and_a_right_size_file_is_accepted` **and** `http_download_resumes_a_partial_file_and_size_checks_it` both FAILED (the oversized / partial file is accepted) |
+
+The reverts were byte-identical (`sha256sum` of each mutated file before and
+after matches `HEAD`). Two of the gates had to be **strengthened to catch their
+mutation**, which is the point of the exercise: the first padding gate only
+checked the index the writer *declares* (the parser recomputes the same offsets
+and never reads past the last tensor, so a short inter-tensor pad parsed fine),
+so the test now also asserts `file length == data_offset + size` — for the
+single file and for each split part; and the first reverse-order mutation landed
+in `validate_specs`' loop rather than `split_assignment`'s, so it proved
+nothing until the anchor was made specific. The table above is the re-run
+output against the committed tests.
+
+**Honest scope.** (a) **K-quants cannot be written.** The encoders are the five
+legacy types; `q4_K`/`q5_K`/`q6_K` and every I-quant are refused by name
+([#140](https://github.com/yusiwen/minfer/issues/140)). Reading them is
+unchanged. (b) **f16 weights are CPU-only.** The CPU path now decodes them, but
+the Metal/CUDA weight registration accepts f32 and the supported quants only, so
+an f16 model runs the CPU path on a device build and that path is slow
+(measured ~3 tok/s prefill on the 0.5B); the device row therefore exercises a
+`minfer quantize`-produced q8_0 file ([#141](https://github.com/yusiwen/minfer/issues/141)).
+(c) **bf16 output is refused** ([#142](https://github.com/yusiwen/minfer/issues/142));
+f32 preserves every bf16 value exactly, so the conversion itself loses nothing.
+(d) The exactness claims are named per step: f16/f32 copies and f16→f32,
+bf16→f32 are bit-exact; **bf16→f16 is exact in the mantissa but can overflow**
+(no saturation, so an out-of-range value becomes inf rather than a wrong finite
+weight); **f32→f16 is not exact**. (e) The HF reference is llama.cpp's converter
+output (byte-identical weights) plus, for logits/text, llama.cpp's own run —
+transformers was installed but not used as the logit reference, because the
+f16-vs-f16 byte comparison against llama.cpp's converter is the stronger claim.
+(f) The five real-model gates are `#[ignore]`d (they need the checkpoint and/or
+the cached 0.5B); CI covers the writer/encoder/converter/download unit and
+local-HTTP gates.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
