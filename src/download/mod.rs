@@ -445,16 +445,50 @@ fn head_content_length(url: &str) -> Option<u64> {
     })
 }
 
-/// Download a file via curl with resume support and progress.
-fn http_download(url: &str, path: &Path, _expected_size: Option<u64>) -> Result<(), String> {
+/// Verify a downloaded file's length against the remote's expected size.
+///
+/// `curl -C -` resumes, but it exits 0 even when a server ignores the `Range`
+/// header: the response body is then appended to the partial file and the
+/// result is *larger* than the remote object (or, on a truncated body, smaller).
+/// A file that is not exactly `expected` bytes long must never be treated as
+/// cached, so this is the gate between "curl exited 0" and "the file is ready".
+///
+/// Returns the file's length on success. `expected == None` means the remote
+/// size could not be determined: the length is returned but not judged, because
+/// guessing a size would reject valid files.
+pub fn check_downloaded_size(path: &Path, expected: Option<u64>) -> Result<u64, String> {
+    let actual = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .len();
+    match expected {
+        None => Ok(actual),
+        Some(want) if actual == want => Ok(actual),
+        Some(want) => Err(format!(
+            "size mismatch for {}: expected {want} bytes, got {actual} bytes \
+             (the server may have ignored the resume Range, or the download was truncated)",
+            path.display()
+        )),
+    }
+}
+
+/// Download a file via curl with resume support, then verify its length.
+///
+/// The verification is not advisory: on a mismatch the partial file is
+/// **removed** (so the next attempt starts clean instead of resuming onto a
+/// corrupt file) and the call fails.
+fn http_download(url: &str, path: &Path, expected_size: Option<u64>) -> Result<(), String> {
     let path_str = path.to_string_lossy().to_string();
 
     eprintln!("Downloading: {}", url);
     eprintln!("  To: {}", path.display());
 
+    // `--fail` keeps an HTTP error body (a 404 page) out of the model file; a
+    // 416 on resume is not useful here because a complete file is skipped
+    // before this function is called and a partial one resumes normally.
     let status = std::process::Command::new("curl")
         .args([
             "-L",
+            "-f",
             "-C",
             "-", // resume if possible
             "-o",
@@ -469,7 +503,18 @@ fn http_download(url: &str, path: &Path, _expected_size: Option<u64>) -> Result<
         return Err(format!("Download failed (exit code: {})", status));
     }
 
-    Ok(())
+    match check_downloaded_size(path, expected_size) {
+        Ok(n) => {
+            eprintln!("  Verified: {n} bytes");
+            Ok(())
+        }
+        Err(e) => {
+            // Never leave the bad file where the "already cached" check would
+            // accept it.
+            let _ = std::fs::remove_file(path);
+            Err(format!("{e}; removed the partial file"))
+        }
+    }
 }
 
 // ============================================================
@@ -548,7 +593,6 @@ mod tests {
     fn single(name: &str) -> Vec<String> {
         vec![name.to_string()]
     }
-
     fn split(prefix: &str, count: usize) -> Vec<String> {
         (1..=count)
             .map(|i| format!("{}-{:05}-of-{:05}.gguf", prefix, i, count))
@@ -629,5 +673,115 @@ mod tests {
         assert!(match_model(&files2, None)
             .unwrap_err()
             .contains("Multiple models"));
+    }
+
+    // === F6 (#49): the download size gate ===
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("minfer-f6-dl-{name}"));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_wrong_size_file_is_refused_and_a_right_size_file_is_accepted() {
+        use super::check_downloaded_size;
+        let p = tmp("size");
+        std::fs::write(&p, vec![7u8; 100]).unwrap();
+        // exact match: accepted, length returned
+        assert_eq!(check_downloaded_size(&p, Some(100)).unwrap(), 100);
+        // too large (the classic `curl -C -` on a server that ignores Range):
+        // the whole body is appended to the partial file.
+        let e = check_downloaded_size(&p, Some(40)).unwrap_err();
+        assert!(e.contains("expected 40 bytes, got 100 bytes"), "{e}");
+        // too small (a truncated body)
+        let e = check_downloaded_size(&p, Some(400)).unwrap_err();
+        assert!(e.contains("expected 400 bytes, got 100 bytes"), "{e}");
+        // unknown remote size: length reported, not judged
+        assert_eq!(check_downloaded_size(&p, None).unwrap(), 100);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// End-to-end against a local HTTP server. `correct = true` honours `Range`
+    /// with a proper `206 Partial Content`; `correct = false` is the
+    /// mishandled-Range server: it answers `206` but sends the *whole* body
+    /// (as if the range had started at 0), so `curl -C -` appends and the
+    /// result is larger than the object. No external network is touched.
+    fn serve_once(body: Vec<u8>, correct: bool) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/model.gguf", addr);
+        let h = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let range = req
+                .lines()
+                .find_map(|l| l.strip_prefix("Range: bytes="))
+                .and_then(|v| v.trim().split('-').next())
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let (head, part) = if correct {
+                let start = range.min(body.len());
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                         Content-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\n\r\n",
+                        body.len() - start,
+                        start,
+                        body.len() - 1,
+                        body.len()
+                    ),
+                    body[start..].to_vec(),
+                )
+            } else {
+                // Answers with a *correct-looking* 206 header for the requested
+                // range, but ships the whole object as the body. curl is happy
+                // (Content-Length is honoured, exit 0) and appends, so the file
+                // ends up larger than the object.
+                let start = range.min(body.len());
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                         Content-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\n\r\n",
+                        body.len(),
+                        start,
+                        body.len() - 1,
+                        body.len()
+                    ),
+                    body.clone(),
+                )
+            };
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&part);
+        });
+        (url, h)
+    }
+
+    #[test]
+    fn http_download_resumes_a_partial_file_and_size_checks_it() {
+        use super::http_download;
+        let body: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        let p = tmp("resume");
+        // A partial file: the server honours Range, so the result is complete.
+        let half = body.len() / 2;
+        std::fs::write(&p, &body[..half]).unwrap();
+        let (url, h) = serve_once(body.clone(), true);
+        http_download(&url, &p, Some(body.len() as u64)).expect("resumable download");
+        h.join().unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), body);
+
+        // A server that mishandles Range: `curl -C -` exits 0 with a file that
+        // is larger than the object. The size gate must reject it and remove it.
+        let p2 = tmp("badrange");
+        std::fs::write(&p2, &body[..half]).unwrap();
+        let (url2, h2) = serve_once(body.clone(), false);
+        let err = http_download(&url2, &p2, Some(body.len() as u64)).unwrap_err();
+        h2.join().unwrap();
+        assert!(err.contains("size mismatch"), "{err}");
+        assert!(err.contains("removed the partial file"), "{err}");
+        assert!(!p2.exists(), "a rejected download must not stay cached");
     }
 }

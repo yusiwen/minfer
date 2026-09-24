@@ -486,6 +486,9 @@ impl Backend for CpuBackend {
                 if w.ttype == crate::tensor::TensorType::F32 {
                     // plain f32 matmul: out[t*od+o] = dot(w[o], x[t])
                     crate::vec_ops::mat_mul_f32(od, nt, id, out, w.data_f32(), ins[0]);
+                } else if w.ttype == crate::tensor::TensorType::F16 {
+                    // F6: f16 weights are decoded a row at a time (no f32 copy).
+                    crate::vec_ops::mat_mul_f16(od, nt, id, out, w.data(), ins[0]);
                 } else {
                     // quantized weight × f32 activations (Q8_0-quantized on the fly)
                     kernel::cpu_quant_matmul_f32(w, ins[0], out, od, id, nt);
@@ -541,6 +544,22 @@ impl Backend for CpuBackend {
                         }
                         let src = &wf[id as usize * n_embd..(id as usize + 1) * n_embd];
                         out[t * n_embd..(t + 1) * n_embd].copy_from_slice(src);
+                    }
+                } else if w.ttype == crate::tensor::TensorType::F16 {
+                    // F6: f16 embedding rows decoded in place.
+                    let wd = w.data();
+                    let vocab = w.shape[1] as usize;
+                    for (t, &id) in ids.iter().enumerate() {
+                        if (id as usize) >= vocab {
+                            return Err(format!("embedding id {id} >= vocab {vocab}"));
+                        }
+                        let base = id as usize * n_embd * 2;
+                        for j in 0..n_embd {
+                            out[t * n_embd + j] = crate::block::fp16_to_f32(u16::from_le_bytes([
+                                wd[base + 2 * j],
+                                wd[base + 2 * j + 1],
+                            ]));
+                        }
                     }
                 } else {
                     // quantized embedding: shared dequantization
