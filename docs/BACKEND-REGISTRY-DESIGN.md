@@ -119,6 +119,9 @@ pub struct BackendEntry {
     pub pool:     fn(&GraphAllocator) -> Option<&dyn BackendTrait>,
     pub pool_mut: fn(&mut GraphAllocator) -> Option<&mut dyn BackendTrait>,
     pub host_read: fn(&GraphAllocator, usize) -> Option<Vec<f32>>,
+    // F5 (#58): the split boundary's two phases (§11).
+    pub copy_cross:  fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<bool, String>,
+    pub await_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<(), String>,
     pub kv_format: fn() -> KvFormat,
     pub enable:    fn(&mut GraphAllocator) -> bool,
     pub unavailable: fn() -> Option<&'static str>,
@@ -145,6 +148,12 @@ all collapse to one call without a `match`.
 `enable` is the lazy "a session names this backend, so bring its pool up"
 hook; `unavailable` is the runtime probe (device present, not disabled) used by
 the availability refusal in §5.
+
+`copy_cross` / `await_cross` are F5's addition (§11): the split boundary's
+cross-backend staging copy, split into *enqueue* and *wait* so a backend with
+device memory can make the transfer asynchronous and name exactly where the
+consumer waits. They follow the same rule as the rest of the entry — the
+allocator never asks "is this the CPU?", it asks the entry.
 
 ## 4. What no longer matches on `Backend`
 
@@ -343,3 +352,114 @@ adds their kernels). No other per-format query is added here.
   perturbing one priority *value* without reordering also fails gate 2, which is
   why the expected numbers are literals. All three are reverted; the observed
   failure output is recorded in the ticket record.
+
+## 11. F5 — the async staging copy and its synchronization points (#58)
+
+Ticket: [#58](https://github.com/yusiwen/minfer/issues/58) ("[F5] Async
+cross-backend copies and events"). The implementation record (measurements,
+mutation evidence, honest scope) lives in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md` §F5; the scheduler-side contract is also
+summarized in `docs/COMPUTE-GRAPH-DESIGN.md` §3.4. This section is the registry
+contract those records refer to.
+
+### 11.1 What the hot path is, exactly
+
+`BackendScheduler::execute` partitions a graph into contiguous same-backend
+splits (`assign_backends` → `split_graph`). When a value produced by one split is
+consumed by a split on **another backend**, the boundary must move it; the
+scheduler does that through `GraphAllocator::copy_across` once per entry of
+`Split::inputs`. **Those copies are the hot path this ticket is about** — they
+run on every forward, on the critical path of every decode step of a partially
+offloaded model.
+
+Everything else that reads device memory back to the host is **legitimately
+host-visible and out of scope**, and is enumerated here so "zero blocking copies"
+is not read as "zero device→host copies anywhere":
+
+| site | why it blocks on purpose |
+|---|---|
+| `GraphAllocator::copy_to_cpu` on the logits / output path | the run's answer; the caller is about to read it |
+| `GraphAllocator::copy_kv_to_cpu` (KV session save, `--session`) | a file write; no overlap to exploit |
+| `Copy` / debug dumps, `MINFER_GRAPH_DUMP`, doc dumps | diagnostics |
+| `MINFER_TRACE` / viz capture (`CudaBackend::copy_to_host` fallback, `CaptureStaging`) | already batched asynchronously; the per-node fallback is for tensors above the staging ceiling |
+| weight / tokenizer loading, `fill_input`, `write_host` | host→device or host-only; no device leg to wait on |
+
+Before F5 a *single* CUDA→host boundary input cost two host stalls: a full
+`cudaStreamSynchronize` **plus** a blocking `cudaMemcpy` D2H inside
+`CudaBackend::copy_to_host`. The counters below are how that became a number
+(`graph::copystats`, per allocator, read by the gates).
+
+### 11.2 The two phases
+
+`copy_across` (phase A) resolves/allocates the destination staging buffer, marks
+the entry **pending**, increments `copies`, and calls the source backend's
+`copy_cross`. `await_cross` (phase B) calls the source backend's `await_cross`,
+clears the pending flag and increments `waits`. One phase-B call per phase-A call
+is the **contract**, and `GraphAllocator::cross_input` — the only accessor the
+scheduler's consumer path uses — refuses a still-pending entry with a loud `Err`
+naming the missing wait, so dropping a wait can never be bought with a silent
+read of in-flight data.
+
+Phase A returning `Ok(true)` means "this backend issued the transfer";
+`Ok(false)` means "**declined** — use the synchronous host round trip". Declining
+is not a silent CPU fallback: the allocator *does* perform the pair, just
+synchronously, and the boundary counters record it as a blocking copy.
+
+| backend | phase A (`copy_cross`) | phase B (`await_cross`) |
+|---|---|---|
+| **cpu** | **synchronous host round trip** — the CPU has no device memory, so there is no transfer to make asynchronous. The device leg of CPU→device is the destination pool's own stream-ordered `write_host` (pinned + `cudaMemcpyAsync`, 7e⑥), which never blocked the host either. | **documented no-op** — nothing was enqueued that needs waiting for; the destination device orders its own fill on its stream. Still counted, so the one-wait-per-copy contract is backend-independent. |
+| **cuda** | device→host: `cudaMemcpyAsync` D2H into a pinned slab + `cudaEventRecord`, both stream-ordered after the producing kernels. Any other destination **declines**: a device→device staging copy (unreachable — `copy_across` early-returns when the source and destination backends match), CUDA→Metal on a macOS+CUDA build. | device→host: `cudaEventSynchronize` — **the** host block, and the only one the async path takes for that copy — then the bytes are published into the staging buffer. A device consumer uses `cudaStreamWaitEvent` (no host block). |
+| **metal** | **declines** (`Ok(false)`): the async form is a `MTLBlitCommandEncoder` copy plus a completion handler or an `MTLEvent` the consumer waits on — a different mechanism from CUDA's, and this ticket was developed on a Linux box with no Metal device and no macOS toolchain, so it could not be compiled or verified. The port is a filed follow-up; until then a Metal source keeps the pre-F5 synchronous behaviour. | no-op (phase A declined). |
+
+### 11.3 The synchronization points, enumerated
+
+Every execution, in order:
+
+1. **The boundary flush** (`BackendScheduler::execute` step 1) —
+   `GraphAllocator::sync_backend(previous)`. Not a copy: it retires the previous
+   backend's kernels (and, for CUDA, closes an open graph-capture window and
+   clears the MMQ memoization). Unchanged by F5.
+2. **Phase A, per staged input** — `copy_across`. A CUDA→host copy enqueues
+   `cudaMemcpyAsync` + `cudaEventRecord`; a CUDA→device copy would use
+   `cudaMemcpyAsync` D2D; the CPU does its host memcpy; Metal does the
+   synchronous read. **No host wait here.**
+3. **Phase B, per staged input** — `await_cross`, before any node of the
+   consuming split runs:
+   - **device→host**: `cudaEventSynchronize` on the event recorded in step 2.
+     *Invariant that makes it necessary*: the D2H destination is host memory, and
+     the host is about to read it; without the wait the consumer reads bytes the
+     DMA may not have written yet.
+   - **host→device**: no host wait; the fill is ordered on the consuming
+     backend's own stream ahead of the kernels that read it.
+     *Invariant*: stream order — the copy and the first consumer share one stream,
+     so no host synchronization is needed and none is taken.
+   - **device→device** (no backend implements it today): `cudaStreamWaitEvent`
+     on the consuming stream would be the mechanism; the host never blocks.
+   - The *contract* invariant, independent of backend: one phase-B wait per
+     phase-A copy, enforced by `cross_input`'s refusal.
+4. **The next boundary's flush**, or the final flush after the last split —
+   `sync_backend`, which for CUDA is also where an open capture window closes.
+
+The gated evidence for 2–3 is `copystats::CrossCopyStats` (per allocator:
+`copies`, `waits`, `blocking_host_copies`, `async_host_copies`, `event_syncs`,
+`stream_waits`), `CudaBackend::blocking_readback_count()` (a device-level count of
+blocking `cudaMemcpy` D2H calls) and `cuda::stream_sync_count()` (host stalls).
+`MINFER_SYNC_COPIES=1` restores the pre-F5 synchronous path as the bitwise
+reference; `copystats::set_sync_for_test` is its programmatic form.
+
+### 11.4 Overlap: what F5 does and does not deliver
+
+F5 delivers the **async substrate + documented waits**: no blocking copy on the
+boundary path, one explicit wait per staged input, and a measured reduction in
+host stalls (the per-copy stream synchronizations are gone).
+
+**True overlap is not claimed.** The scheduler's split loop is strictly
+sequential — a split's nodes run, the next split's copies are enqueued and
+immediately waited on — so there is no independent work for a copy to overlap
+*with* on a single graph, and a host-side consumer must wait by definition. What
+the substrate buys today is that the transfers are enqueued back to back and the
+redundant per-copy stream syncs disappear; exploiting them further needs the
+scheduler to defer a wait to the consumer's first use (and to know that the
+consumer is independent), which is a scheduling change beyond this ticket and is
+filed as a follow-up issue rather than claimed here.
+
