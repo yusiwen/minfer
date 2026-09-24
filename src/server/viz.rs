@@ -119,6 +119,8 @@ pub fn run_viz(
     let metrics = Arc::new(super::metrics::ServerMetrics::new());
     let worker_metrics = metrics.clone();
     // doc 97: the viz path wires no speculative draft.
+    // F2: the handler needs the EOG set, and the model moves into the worker.
+    let special = model.special_tokens();
     std::thread::spawn(move || {
         super::chat::worker_loop(
             model,
@@ -143,6 +145,8 @@ pub fn run_viz(
         n_ctx,
         n_ctx_slot,
         tokenizer: Arc::new(tokenizer),
+        special,
+        spec_enabled: false,
         chat_template: template,
         created: super::now_unix(),
     });
@@ -345,6 +349,10 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
         mirostat_eta: 0.1,
         mirostat_m: 100,
         logit_bias: Vec::new(),
+        // F2 (#47): the viz request surface has no grammar field, so it stays
+        // unconstrained (bit-identical to the pre-F2 path).
+        grammar_source: None,
+        grammar: None,
         seed: rand::random::<u64>(),
         stop_strings: Vec::new(),
         max_tokens: req.max_tokens.unwrap_or(32),

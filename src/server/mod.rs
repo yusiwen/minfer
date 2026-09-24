@@ -47,6 +47,14 @@ pub struct AppState {
     pub n_ctx: usize,
     pub n_ctx_slot: usize,
     pub tokenizer: Arc<Tokenizer>,
+    /// F2 (#47): the EOG ids a grammar needs, resolved once from the model (the
+    /// handler compiles the per-request grammar before queueing the job, so it
+    /// needs them here rather than only inside the worker).
+    pub special: crate::models::SpecialTokens,
+    /// F2: whether the worker runs the speculative draft engine — a grammar and a
+    /// verify round are mutually exclusive, and the handler must refuse the
+    /// combination before queueing.
+    pub spec_enabled: bool,
     pub chat_template: Option<String>,
     pub created: i64,
 }
@@ -109,6 +117,10 @@ pub fn run(
     // F8: a completion signal, so `run` can wait for the worker *boundedly* after
     // a clean drain instead of joining it (see `serve_with_shutdown`).
     let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel::<()>();
+    // F2: read what the handler needs before the model and the spec config move
+    // into the worker thread.
+    let special = model.special_tokens();
+    let spec_enabled = spec_cfg.is_some();
     let worker_tokenizer = tokenizer.clone();
     let worker_metrics = metrics.clone();
     let worker = std::thread::spawn(move || {
@@ -138,6 +150,8 @@ pub fn run(
         n_ctx,
         n_ctx_slot,
         tokenizer: Arc::new(tokenizer),
+        special,
+        spec_enabled,
         chat_template: template,
         created: now_unix(),
     });
@@ -373,13 +387,27 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         Err(e) => return error_response(&e),
     };
     let stream = req.stream.unwrap_or(false);
-    let params: SamplingParams = match req.resolve(rand::random::<u64>()) {
+    let mut params: SamplingParams = match req.resolve(rand::random::<u64>()) {
         Ok(p) => p,
         Err(e) => return error_response(&e),
     };
     // F3 (#48): refuse a nonsensical sampler configuration as a 400 before the
     // request occupies a worker slot.
     if let Err(e) = params.validate(state.tokenizer.vocab_size()) {
+        return error_response(&e);
+    }
+    // F2 (#47): compile the grammar/schema now (the vocabulary is here), so an
+    // unsupported construct is a 400 before the job is queued. Speculative
+    // decoding samples several rows from one automaton state, so a grammar and
+    // the server's draft engine are mutually exclusive.
+    if params.grammar_source.is_some() && state.spec_enabled {
+        return error_response(&ApiError::invalid_request(
+            "a grammar/JSON schema cannot be combined with the server's speculative draft \
+             engine (a verify round samples several rows from one automaton state)"
+                .to_string(),
+        ));
+    }
+    if let Err(e) = params.compile_grammar(&state.tokenizer, &state.special) {
         return error_response(&e);
     }
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -654,6 +682,11 @@ mod tests {
             n_ctx: 64,
             n_ctx_slot: 64,
             tokenizer: Arc::new(Tokenizer::empty()),
+            special: crate::models::SpecialTokens {
+                eos: 0,
+                im_end: None,
+            },
+            spec_enabled: false,
             chat_template: None,
             created: 0,
         });

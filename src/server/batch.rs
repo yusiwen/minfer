@@ -118,6 +118,8 @@ struct Run {
     cfg: crate::sampler::SamplerConfig,
     /// F3: mirostat's running surprise budget, per request.
     mirostat: crate::sampler::MirostatState,
+    /// F2 (#47): the request's grammar automaton, per slot/request.
+    grammar_state: Option<crate::grammar::GrammarState>,
     rng: StdRng,
     prev_tokens: Vec<u32>,
     stop_bytes: Vec<Vec<u8>>,
@@ -1042,9 +1044,11 @@ impl BatchEngine {
         }
         debug_assert_eq!(self.slots[idx].cached_tokens.len(), nt);
         let cfg = job.params.sampler_config();
+        let grammar_state = cfg.grammar.as_ref().map(|g| g.state());
         self.slots[idx].run = Some(Run {
             tx: job.tx,
             mirostat: crate::sampler::MirostatState::new(cfg.mirostat_tau),
+            grammar_state,
             cfg,
             rng: StdRng::seed_from_u64(job.params.seed),
             prev_tokens: super::chat::sampler_recent_window(&job.input_ids, REPEAT_LAST_N),
@@ -1170,6 +1174,7 @@ impl BatchEngine {
             params,
             cfg,
             mirostat,
+            grammar_state,
             rng,
             prev_tokens,
             stop_bytes,
@@ -1195,8 +1200,22 @@ impl BatchEngine {
             return Ok(StepOutcome::Finish("length"));
         }
         let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
-        let sampled =
-            crate::sampler::sample_with_config(last_logits, cfg, prev_tokens, mirostat, rng);
+        let sampled = match crate::sampler::sample_with_config_grammar(
+            last_logits,
+            cfg,
+            prev_tokens,
+            mirostat,
+            grammar_state,
+            rng,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The grammar allows nothing more: end the turn with the reason
+                // printed. Everything already delivered is a valid prefix.
+                eprintln!("[grammar] {e}");
+                return Ok(StepOutcome::Finish("stop"));
+            }
+        };
         let tok = sampled.token_id;
         if is_stop_token(tok, &special) {
             return Ok(StepOutcome::Finish("stop"));
@@ -1268,10 +1287,24 @@ impl BatchEngine {
             }
         }
         if run.emitted < run.full.len() {
-            let chunk = String::from_utf8_lossy(&run.full[run.emitted..]).into_owned();
-            if run.tx.blocking_send(StreamEvent::Text(chunk)).is_err() {
-                self.slots[idx].cached_tokens.clear();
-                return;
+            // A response body must be valid UTF-8. A still-pending partial
+            // character (one the generation ended in the middle of) can never
+            // complete now, so it is dropped rather than decoded to U+FFFD — the
+            // text stays a valid prefix of the grammar's language.
+            let complete =
+                run.emitted + crate::tokenizer::complete_utf8_prefix_len(&run.full[run.emitted..]);
+            if complete > run.emitted {
+                let chunk = String::from_utf8_lossy(&run.full[run.emitted..complete]).into_owned();
+                if run.tx.blocking_send(StreamEvent::Text(chunk)).is_err() {
+                    self.slots[idx].cached_tokens.clear();
+                    return;
+                }
+            }
+            if complete < run.full.len() {
+                eprintln!(
+                    "[server] dropped {} trailing byte(s) of an incomplete UTF-8 character",
+                    run.full.len() - complete
+                );
             }
         }
         let _ = run.tx.blocking_send(StreamEvent::Finish {
@@ -1425,6 +1458,8 @@ mod tests {
             mirostat_eta: 0.1,
             mirostat_m: 100,
             logit_bias: Vec::new(),
+            grammar_source: None,
+            grammar: None,
             seed: 7,
             stop_strings: Vec::new(),
             max_tokens,
