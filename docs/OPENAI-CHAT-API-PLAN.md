@@ -802,8 +802,14 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
 ### Slot Lifecycle
 
 1. Request arrives -> find idle slot
-2. If no idle slot -> **defer the task in the request queue** (never reject with 503; matches
-   llama.cpp's unbounded task queue)
+2. If no idle slot -> **reject with `503`** (`ApiError::unavailable("no idle slot")`, an SSE
+   error frame on the streaming transport, `minfer_jobs_dropped_total` +1) — the batched
+   worker calls `admit` on every pass and does not defer
+   ([#121](https://github.com/yusiwen/minfer/issues/121)). The serial path
+   (`MINFER_BATCH=0`) does queue, one job at a time, from the same channel. This replaces the
+   pre-E2 plan's *"defer the task in the request queue (never reject with 503)"*, which the
+   batched path never implemented; queueing it (with a bound) is
+   [#150](https://github.com/yusiwen/minfer/issues/150).
 3. Assign task to slot -> state becomes Processing; seed `prev_tokens` from the prompt tail
 4. Run prefill on the slot's KV regions (positions 0..nt); if prompt length exceeds the slot's
    remaining context, see [Context Overflow Handling](#context-overflow-handling)

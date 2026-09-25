@@ -58,7 +58,7 @@ Append-only KV + incremental chat-template rendering: each turn only prefills th
 
 ### OpenAI-compatible HTTP server (`serve`)
 
-`/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`, and `/metrics` — a Prometheus text snapshot of request counts, queue depth, live KV/arena occupancy and (under `MINFER_OP_TIMING`) per-op seconds; multi-slot with queued serial execution; SIGINT/SIGTERM drain bounded by `MINFER_DRAIN_MS`. Plan: [OPENAI-CHAT-API-PLAN.md](./OPENAI-CHAT-API-PLAN.md), F8 record: [ARCHITECTURE-EXECUTION-PLAN.md](./ARCHITECTURE-EXECUTION-PLAN.md).
+`/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`, and `/metrics` — a Prometheus text snapshot of request counts, queue depth, live KV/arena occupancy and (under `MINFER_OP_TIMING`) per-op seconds; multi-slot with queued serial execution (`MINFER_BATCH=0`); a request that finds every slot busy on the **batched** path is refused with `503` (`minfer_jobs_dropped_total` +1, an SSE error frame when streaming) rather than queued — queueing is [#150](https://github.com/yusiwen/minfer/issues/150); SIGINT/SIGTERM drain bounded by `MINFER_DRAIN_MS`. Plan: [OPENAI-CHAT-API-PLAN.md](./OPENAI-CHAT-API-PLAN.md), F8 record: [ARCHITECTURE-EXECUTION-PLAN.md](./ARCHITECTURE-EXECUTION-PLAN.md).
 
 ### Chat templates (F7)
 
