@@ -215,10 +215,16 @@ norm/bias path consumes. `--outtype f32` writes everything as f32.
 Targets with an implemented and byte-verified encoder:
 **`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`**, plus the `f16` / `f32` element casts.
 
-- Only 2-D float tensors are quantized. 1-D tensors (norms, biases) and any
-  tensor whose row length is not a multiple of the target block size keep their
-  source type, and the CLI prints the list — llama.cpp's rule, not a silent
-  choice.
+- For a **quant** target only 2-D float tensors are quantized. 1-D tensors (norms,
+  biases) and any tensor whose row length is not a multiple of the target block
+  size keep their source type, and the CLI prints the list — llama.cpp's rule, not
+  a silent choice.
+- The `f16` / `f32` casts are element casts: they convert **every** tensor,
+  including 1-D. That makes `--type f16` differ from `minfer convert --outtype f16`
+  (and from `llama-quantize … F16`), which keep 1-D tensors f32 because the
+  engine's f16 weight path has no f16-norm kernel — an f16 file with f16 norms is
+  not loadable (the CPU norm path asserts `F32`). Making `quantize --type f16`
+  keep 1-D f32 is [#169](https://github.com/yusiwen/minfer/issues/169).
 - On a **tied** model (no `output.weight`), a sub-8-bit target quantizes the
   shared `token_embd.weight` at **q8_0** — llama.cpp's tied-embedding policy.
   The CLI prints this too.
@@ -382,7 +388,8 @@ network is used.
 
 - **No K-quant encoders.** `q4_K`/`q5_K`/`q6_K` (readable by the engine) and
   every I-quant are refused by name for `quantize`. [#140](https://github.com/yusiwen/minfer/issues/140)
-- **f16 weights run on CPU and CUDA; Metal refuses them.**
+- **f16 weights run on CPU and CUDA for both architectures (Qwen2/Qwen2.5 and
+  Qwen3); Metal refuses them.**
   `Op::MatMul`/`Op::GetRows` dispatch f16 on the CPU (one weight row at a time,
   never an f32 copy of the weights) and the dot is **vectorized** — AVX2 `F16C`
   / aarch64 baseline NEON `FCVTL`, an f64 scalar oracle, `MINFER_NO_NEON=1`
@@ -398,8 +405,13 @@ network is used.
   loader's all-or-nothing registration check — loudly, because registering a
   weight type no kernel can consume would be a silent wrong path
   ([#164](https://github.com/yusiwen/minfer/issues/164)). Completed by
-  [#141](https://github.com/yusiwen/minfer/issues/141); the F6 half was
-  [#49](https://github.com/yusiwen/minfer/issues/49).
+  [#141](https://github.com/yusiwen/minfer/issues/141) (qwen2) and
+  [#167](https://github.com/yusiwen/minfer/issues/167) (qwen3's loader *and* its
+  graph type gate, plus the one shared registration rule in
+  `models::weight_reg`); the F6 half was
+  [#49](https://github.com/yusiwen/minfer/issues/49). The **file** contract is 2-D
+  f16 and 1-D f32; `minfer quantize --type f16` does not honour it yet
+  ([#169](https://github.com/yusiwen/minfer/issues/169)).
 - **No `--outtype bf16`.** f32 preserves every bf16 value exactly, so nothing is
   lost today, but a bf16 writer (and a bf16 weight path) is [#142](https://github.com/yusiwen/minfer/issues/142).
 - **`general.size_label` is not written** (cosmetic; llama.cpp derives it from

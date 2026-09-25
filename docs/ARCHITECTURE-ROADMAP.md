@@ -518,7 +518,12 @@ loader (`src/convert.rs`), and the `convert` / `quantize` / `split` subcommands
 CPU and on CUDA** — the CPU graph path gained f16 weight dispatch in F6 and #141
 vectorized that dot (AVX2 `F16C` / NEON `FCVTL`) and moved the multi-token row
 loop onto the shared CPU pool (3.2 → 207 tok/s prefill on the 0.5B), while CUDA
-registers the raw 2 B/element weights and converts in-register; **Metal refuses
+registers the raw 2 B/element weights and converts in-register. Both supported
+architectures now: [#141](https://github.com/yusiwen/minfer/issues/141)'s f16
+registration and graph type gate landed in qwen2's loader/graph only, so
+[#167](https://github.com/yusiwen/minfer/issues/167) completed the qwen3 pair and
+gave the two loaders one shared registration rule (`models::weight_reg`, which
+also carries the q4_K `W_dsc` plane gate). **Metal refuses
 f16 weights** until [#164](https://github.com/yusiwen/minfer/issues/164), and a
 rewrite/split round-trip is bit-exact, and the HF conversion's f16 output is
 byte-identical to llama.cpp's converter on the same checkpoint, per tensor.
