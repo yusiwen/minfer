@@ -452,7 +452,7 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
         af32: bool,
-    );
+    ) -> i32;
     // P6: A arrives as f32 activations; the GEMM converts on stage — the
     // separate convert_f32_f16 pass disappears for every prefill matmul.
     //
@@ -479,6 +479,7 @@ extern "C" {
     // calls this.
     #[allow(dead_code)]
     fn cuda_test_latch_oversized_smem() -> i32;
+    // #147: the same shape for the af32 path — 1 = launched and accepted.
     fn launch_gemm_f32a(
         a: *const f32,
         b: *const std::ffi::c_void,
@@ -487,7 +488,28 @@ extern "C" {
         od: i32,
         id: i32,
         stream: *mut std::ffi::c_void,
-    );
+    ) -> i32;
+    // #147 site-failure introspection: the last dynamic-smem / launch failure a
+    // hardened C++ site named, so the `issue147_tests` device gates can assert
+    // the site, the requested value and `cudaGetErrorName` without parsing
+    // stderr. `kind`: 1 = attribute, 2 = launch, 3 = a latched error found
+    // before a launch.
+    #[allow(dead_code)] // read by the #147 device gates
+    fn minfer_site_fail_count() -> i32;
+    #[allow(dead_code)]
+    fn minfer_site_fail_kind() -> i32;
+    #[allow(dead_code)]
+    fn minfer_site_fail_code() -> i32;
+    #[allow(dead_code)]
+    fn minfer_site_fail_bytes() -> i32;
+    #[allow(dead_code)]
+    fn minfer_site_fail_limit() -> i32;
+    #[allow(dead_code)]
+    fn minfer_site_fail_site() -> *const std::os::raw::c_char;
+    #[allow(dead_code)]
+    fn minfer_site_fail_message() -> *const std::os::raw::c_char;
+    #[allow(dead_code)]
+    fn minfer_site_fail_reset();
     // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
     // in-register (no f16 weight scratch round trip). type_id mapping as in
     // launch_dequant_f16; q6_stride = 210 raw / 224 padded (only Q6_K reads
@@ -508,6 +530,7 @@ extern "C" {
     // mma.m16n8k32/m16n8k16 (s8) with per-k-block scale rescale. type_id as
     // in launch_dequant_f16; q6_stride = 210 raw / 224 padded (Q6_K only).
     // Requires id % 32 == 0 and sm_80+ (int8 mma; sm_75 falls back).
+    // #147: 1 = launched and accepted, 0 = refused (named at the site).
     fn launch_mmq_nt(
         type_id: i32,
         w: *const u8,
@@ -518,7 +541,7 @@ extern "C" {
         id: i32,
         q6_stride: i32,
         stream: *mut std::ffi::c_void,
-    );
+    ) -> i32;
     // P6: raw-byte staging MMQ (q4_K, whole 256-k super-blocks).
     fn launch_mmq_raw_wide_nt(
         type_id: i32,
@@ -591,6 +614,8 @@ extern "C" {
         cpart: *mut f32,
         ksplit: i32,
     ) -> i32;
+    // #147: 1 = launched and accepted, 0 = refused (the opt-in or the launch
+    // failed and was named at the site); the caller turns a 0 into an `Err`.
     fn launch_mmq_raw_nt(
         type_id: i32,
         w: *const u8,
@@ -601,7 +626,7 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
         kd: i32,
-    );
+    ) -> i32;
     // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
     // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
     fn launch_fa_prefill_f16kv(
@@ -1066,6 +1091,50 @@ pub fn latched_api_error_message(err: i32) -> String {
          call site rather than the kernel)",
         cuda_error_name(err)
     )
+}
+
+/// Issue #147: the message for a `cudaGraphDestroy` that returned an error.
+///
+/// The handle destroyed here is the `cudaGraph_t` from `cudaStreamEndCapture`;
+/// a `cudaGraphExec_t` (from `cudaGraphInstantiate`) goes to
+/// `cudaGraphExecDestroy` instead — mixing them returns `cudaErrorInvalidValue`
+/// and leaks the handle (issue #145). A failed destroy leaks the graph but
+/// leaves the instantiated exec valid, so it is named and cleared here rather
+/// than turned into a refusal of the (usable) exec.
+///
+/// Pure, so the wording is pinned by a unit test with no device — and so a gate
+/// that asserts the message can be mutation-checked against a version that
+/// names the wrong call.
+pub fn graph_destroy_failure_message(err: i32) -> String {
+    format!(
+        "CUDA: cudaGraphDestroy(cudaGraph_t from cudaStreamEndCapture) failed: {} ({err}); the \
+         graph handle leaks, the instantiated exec stays valid, and the error was named and \
+         cleared here so it cannot resurface as a latched API error (issue #147)",
+        cuda_error_name(err)
+    )
+}
+
+/// Issue #147 test injection: does `MINFER_TEST_CALL_FAIL` name `site`?
+///
+/// Pure on the variable's *value*, so the matcher is unit-tested without a
+/// device and without mutating the process environment. Token matching is
+/// exact — `all` for every site, otherwise one site token — which the C++
+/// helper `minfer_test_call_fails` implements identically. The knob drives a
+/// site's **real** call into failure (an over-limit attribute / dynamic-smem
+/// request, or `cudaGraphDestroy` on an exec), so "no latched error reaches
+/// `sync`" is a meaningful assertion rather than a synthetic-return tautology.
+pub fn injection_names_site(value: &str, site: &str) -> bool {
+    value.split(',').any(|t| {
+        let t = t.trim();
+        !t.is_empty() && (t == "all" || t == site)
+    })
+}
+
+/// The `MINFER_TEST_CALL_FAIL` query for `site` (test-only; unset in every
+/// default run, including the `compute-sanitizer` one).
+#[allow(dead_code)] // read by the #147 device gates
+fn test_call_failure_requested(site: &str) -> bool {
+    std::env::var("MINFER_TEST_CALL_FAIL").map_or(false, |v| injection_names_site(&v, site))
 }
 
 /// A small per-thread reentrant lock guarding model weight registration.
@@ -3059,14 +3128,24 @@ impl CudaState {
             )
         };
         if err != 0 || exec.is_null() {
-            unsafe {
-                cudaGraphDestroy(graph);
+            // #147: `cudaGraphDestroy` takes the `cudaGraph_t` from
+            // `cudaStreamEndCapture`; read its own return value here.
+            let derr = unsafe { cudaGraphDestroy(graph) };
+            if derr != 0 {
+                eprintln!("{}", graph_destroy_failure_message(derr));
+                unsafe {
+                    cudaGetLastError(); // this site owns the error
+                }
             }
             return;
         }
 
-        unsafe {
-            cudaGraphDestroy(graph);
+        let derr = unsafe { cudaGraphDestroy(graph) };
+        if derr != 0 {
+            eprintln!("{}", graph_destroy_failure_message(derr));
+            unsafe {
+                cudaGetLastError(); // this site owns the error
+            }
         }
         *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
     }
@@ -3100,8 +3179,24 @@ impl CudaState {
                 0,
             )
         };
-        unsafe {
-            cudaGraphDestroy(graph);
+        // Issue #147: read `cudaGraphDestroy`'s own return value. `graph` is
+        // the `cudaGraph_t` from `cudaStreamEndCapture`, so this is the matching
+        // API; a failure here leaks the graph handle but leaves the exec valid,
+        // so it is named with `cudaGetErrorName` and cleared instead of being
+        // refused. Pre-#145 this call site passed the *exec* (the wrong handle,
+        // returning `cudaErrorInvalidValue`), which is exactly what the test
+        // knob re-injects to prove this message is produced and the latch gone.
+        let destroyed = if test_call_failure_requested("destroy:graph_destroy") {
+            exec
+        } else {
+            graph
+        };
+        let derr = unsafe { cudaGraphDestroy(destroyed) };
+        if derr != 0 {
+            eprintln!("{}", graph_destroy_failure_message(derr));
+            unsafe {
+                cudaGetLastError(); // this site owns the error
+            }
         }
         if err != 0 || exec.is_null() {
             eprintln!("CUDA: graph instantiate failed (err {err})");
@@ -4297,8 +4392,8 @@ impl CudaState {
                             stream,
                             kd,
                         ) == 1;
-                    if !wide_ok {
-                        launch_mmq_raw_nt(
+                    if !wide_ok
+                        && launch_mmq_raw_nt(
                             type_id,
                             wptr as *const u8,
                             q8 as *const u8,
@@ -4308,7 +4403,16 @@ impl CudaState {
                             id as i32,
                             stream,
                             kd,
-                        );
+                        ) == 0
+                    {
+                        // #147: the terminal raw-narrow launcher refused the
+                        // launch (its dynamic-smem opt-in failed or the launch
+                        // itself errored). It named the call, the instantiation
+                        // and `cudaGetErrorName` on stderr — do not let the
+                        // graph continue on an unwritten output.
+                        return Err("cuda: prefill MMQ: launch_mmq_raw_nt refused the launch \
+                                    (see the named CUDA error on stderr); no kernel ran"
+                            .to_string());
                     }
                 }
             }
@@ -4319,7 +4423,7 @@ impl CudaState {
             if q8 == 0 {
                 return Err("cuda: prefill MMQ q8 scratch OOM".to_string());
             }
-            launch_mmq_nt(
+            if launch_mmq_nt(
                 type_id,
                 wptr as *const u8,
                 q8 as *const u8,
@@ -4329,7 +4433,15 @@ impl CudaState {
                 id as i32,
                 block_stride,
                 stream,
-            );
+            ) == 0
+            {
+                // #147: same contract as launch_mmq_raw_nt above.
+                return Err(
+                    "cuda: prefill MMQ: launch_mmq_nt refused the launch (see the \
+                            named CUDA error on stderr); no kernel ran"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -4540,7 +4652,7 @@ impl CudaState {
             .map(|v| v == "1")
             .unwrap_or(false);
         if af32 {
-            unsafe {
+            let launched = unsafe {
                 std::env::var("MINFER_A32_DEBUG")
                     .is_ok()
                     .then(|| eprintln!("minfer/cuda: af32 gemm nt={nt} od={od} id={id}"));
@@ -4552,12 +4664,21 @@ impl CudaState {
                     od as i32,
                     id as i32,
                     stream,
+                )
+            };
+            if launched == 0 {
+                // #147: a refused/failed prefill GEMM launch is an error, not a
+                // silent pass over an unwritten output. The site named it.
+                return Err(
+                    "cuda: prefill GEMM (af32): launch_gemm_f32a refused the launch \
+                            (see the named CUDA error on stderr); no kernel ran"
+                        .to_string(),
                 );
             }
             return Ok(());
         }
         let x16 = Self::get_or_grow(&self.buf_f16_x, nt * id * 2);
-        unsafe {
+        let launched = unsafe {
             launch_convert_f16(x as *const f32, x16, (nt * id) as i64, stream);
             launch_gemm_f16(
                 x16,
@@ -4568,6 +4689,14 @@ impl CudaState {
                 id as i32,
                 stream,
                 false,
+            )
+        };
+        if launched == 0 {
+            // #147: same contract as the af32 arm above.
+            return Err(
+                "cuda: prefill GEMM (f16): launch_gemm_f16 refused the launch \
+                        (see the named CUDA error on stderr); no kernel ran"
+                    .to_string(),
             );
         }
         Ok(())
@@ -7220,6 +7349,820 @@ mod issue145_tests {
             s.take_last_error(),
             0,
             "sync must clear the latch it reported"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #147: the remaining unchecked attribute / launch / destroy returns.
+//
+// The C++ sites (cuda_kernels.cu) report through `minfer_site_fail_*`; the Rust
+// destroy site formats its own message (`graph_destroy_failure_message`). The
+// deliberate failures are env-gated behind `MINFER_TEST_ISSUE147=1` because they
+// *really* fail a CUDA call — a `compute-sanitizer --tool memcheck` run must not
+// see them (the same reason #145's latch gate is gated). With the knob off these
+// gates skip; the two pure gates always run.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod issue147_tests {
+    use super::*;
+
+    /// `minfer_site_fail_kind` values (cuda_kernels.cu).
+    const SITE_ATTR: i32 = 1;
+    const SITE_LAUNCH: i32 = 2;
+
+    fn device() -> Option<&'static CudaState> {
+        CudaState::init();
+        CudaState::get()
+    }
+
+    fn cstr(p: *const std::os::raw::c_char) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The deliberate-failure gates must not run in a default (or sanitizer)
+    /// run: they make a real CUDA call fail for real.
+    fn issue147_gate_enabled() -> bool {
+        if std::env::var("MINFER_TEST_ISSUE147").is_err() {
+            eprintln!(
+                "skipping: set MINFER_TEST_ISSUE147=1 to run the deliberate-failure gates (they \
+                 make real CUDA calls fail; a compute-sanitizer run must not set it)"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Restores `MINFER_TEST_CALL_FAIL` on drop, so a panicking gate cannot
+    /// leave the injection armed for the rest of the process.
+    struct InjectionGuard {
+        prev: Option<String>,
+    }
+
+    impl InjectionGuard {
+        fn arm(site: &str) -> Self {
+            let prev = std::env::var("MINFER_TEST_CALL_FAIL").ok();
+            std::env::set_var("MINFER_TEST_CALL_FAIL", site);
+            Self { prev }
+        }
+    }
+
+    impl Drop for InjectionGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("MINFER_TEST_CALL_FAIL", v),
+                None => std::env::remove_var("MINFER_TEST_CALL_FAIL"),
+            }
+        }
+    }
+
+    /// What one injected call reported, plus its own return value.
+    struct Observed {
+        ret: i32,
+        count: i32,
+        kind: i32,
+        code: i32,
+        bytes: i32,
+        limit: i32,
+        site: String,
+        msg: String,
+    }
+
+    /// Clear the latch, arm `site`, run `call`, and read back the site's own
+    /// report. The latch is cleared first so the final assertion is about this
+    /// call alone.
+    fn inject(s: &CudaState, site: &str, call: impl FnOnce() -> i32) -> Observed {
+        let _ = s.take_last_error();
+        unsafe { minfer_site_fail_reset() };
+        let ret = {
+            let _g = InjectionGuard::arm(site);
+            call()
+        };
+        Observed {
+            ret,
+            count: unsafe { minfer_site_fail_count() },
+            kind: unsafe { minfer_site_fail_kind() },
+            code: unsafe { minfer_site_fail_code() },
+            bytes: unsafe { minfer_site_fail_bytes() },
+            limit: unsafe { minfer_site_fail_limit() },
+            site: cstr(unsafe { minfer_site_fail_site() }),
+            msg: cstr(unsafe { minfer_site_fail_message() }),
+        }
+    }
+
+    fn zeroed_dev(bytes: usize) -> *mut std::ffi::c_void {
+        let p = CudaState::cuda_malloc(bytes);
+        assert!(!p.is_null(), "cudaMalloc({bytes}) failed");
+        let zeros = vec![0u8; bytes];
+        let e = unsafe {
+            cudaMemcpy(
+                p,
+                zeros.as_ptr() as *const std::ffi::c_void,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        assert_eq!(e, 0, "zero-fill failed: {}", cuda_error_name(e));
+        p
+    }
+
+    /// The formatter for the Rust-site `cudaGraphDestroy` failure must name the
+    /// matching destructor and the error, and must not name the wrong call (a
+    /// gate that only asserts "a message appeared" cannot see that). Pure.
+    #[test]
+    fn the_graph_destroy_failure_message_names_the_matching_destructor() {
+        let msg = graph_destroy_failure_message(1);
+        assert!(
+            msg.contains("cudaGraphDestroy"),
+            "must name the call: {msg}"
+        );
+        assert!(
+            msg.contains("cudaGraph_t from cudaStreamEndCapture"),
+            "must name the handle and where it came from: {msg}"
+        );
+        assert!(
+            !msg.contains("cudaGraphExecDestroy"),
+            "must not name the wrong destructor: {msg}"
+        );
+        assert!(
+            msg.contains("cudaErrorInvalidValue"),
+            "must name the error symbolically: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("kernel launch"),
+            "a destroy failure must not be confused with a launch: {msg}"
+        );
+        assert!(msg.contains("issue #147"), "must carry the ticket: {msg}");
+    }
+
+    /// The injection selector matches whole comma-separated tokens only: `all`
+    /// means every site, a site token means that site, and a near-miss is not a
+    /// match (a substring rule would let `attr:mmq` arm `attr:mmq_nt`). Pure.
+    #[test]
+    fn the_injection_matcher_matches_only_the_named_site() {
+        assert!(injection_names_site("all", "attr:mmq_nt"));
+        assert!(injection_names_site(
+            "destroy:graph_destroy",
+            "destroy:graph_destroy"
+        ));
+        assert!(!injection_names_site(
+            "destroy:graph_destroy",
+            "attr:mmq_nt"
+        ));
+        assert!(!injection_names_site("", "attr:mmq_nt"));
+        assert!(
+            !injection_names_site("small", "attr:mmq_nt"),
+            "'small' must not arm a site (no substring rule)"
+        );
+        assert!(
+            !injection_names_site("attr:mmq", "attr:mmq_nt"),
+            "a shorter token must not arm a longer site"
+        );
+        assert!(
+            !injection_names_site("attr:mmq_nt_extra", "attr:mmq_nt"),
+            "a longer token that merely contains the site must not arm it"
+        );
+        assert!(
+            !injection_names_site("destroy:graph_destroy_extra", "destroy:graph_destroy"),
+            "token matching is exact, not substring"
+        );
+        assert!(injection_names_site(
+            " launch:mmq_nt , destroy:graph_destroy ",
+            "launch:mmq_nt"
+        ));
+        assert!(injection_names_site("all", "launch:gemm_f16_f16"));
+    }
+
+    /// Every dynamic-smem opt-in site: the injected (real, over-limit) attribute
+    /// call must be named with the API, the attribute, the instantiation and
+    /// `cudaGetErrorName`, the launcher must refuse, and the latch must be gone.
+    fn assert_attr_failure(
+        s: &CudaState,
+        site: &str,
+        kernel_frag: &str,
+        call: impl FnOnce() -> i32,
+    ) {
+        let o = inject(s, site, call);
+        assert_eq!(
+            o.count, 1,
+            "[{site}] exactly one site failure must be reported: {}",
+            o.msg
+        );
+        assert_eq!(
+            o.kind, SITE_ATTR,
+            "[{site}] must be the attribute-call failure: {}",
+            o.msg
+        );
+        assert_eq!(o.site, site, "[{site}] the report must name this site");
+        assert_eq!(
+            cuda_error_name(o.code),
+            "cudaErrorInvalidValue",
+            "[{site}] the injected call must return cudaErrorInvalidValue: {}",
+            o.msg
+        );
+        assert!(
+            o.limit > 0,
+            "[{site}] the device opt-in limit must have been queried: {}",
+            o.msg
+        );
+        assert!(
+            o.bytes > o.limit,
+            "[{site}] the injected request {} must exceed the device limit {}: {}",
+            o.bytes,
+            o.limit,
+            o.msg
+        );
+        assert!(
+            o.msg.contains("cudaFuncSetAttribute"),
+            "[{site}] must name the call: {}",
+            o.msg
+        );
+        assert!(
+            o.msg
+                .contains("cudaFuncAttributeMaxDynamicSharedMemorySize"),
+            "[{site}] must name the attribute: {}",
+            o.msg
+        );
+        assert!(
+            o.msg.contains("cudaErrorInvalidValue"),
+            "[{site}] must name the error: {}",
+            o.msg
+        );
+        assert!(
+            o.msg.contains(kernel_frag),
+            "[{site}] must name the instantiation {kernel_frag}: {}",
+            o.msg
+        );
+        assert!(
+            !o.msg.contains("SKIPPED"),
+            "[{site}] an injected failure is a real failing call, not a deliberate skip: {}",
+            o.msg
+        );
+        assert_eq!(o.ret, 0, "[{site}] the launcher must refuse the launch");
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "[{site}] the site must clear the latch it named (it must not reach sync)"
+        );
+    }
+
+    /// Every launch site: the injected launch must be named, the launcher must
+    /// refuse, and the latch must be gone.
+    fn assert_launch_failure(
+        s: &CudaState,
+        site: &str,
+        kernel_frag: &str,
+        call: impl FnOnce() -> i32,
+    ) {
+        let o = inject(s, site, call);
+        assert_eq!(
+            o.count, 1,
+            "[{site}] exactly one site failure must be reported: {}",
+            o.msg
+        );
+        assert_eq!(
+            o.kind, SITE_LAUNCH,
+            "[{site}] must be the launch failure: {}",
+            o.msg
+        );
+        assert_eq!(o.site, site, "[{site}] the report must name this site");
+        assert_eq!(
+            cuda_error_name(o.code),
+            "cudaErrorInvalidValue",
+            "[{site}] the injected launch must return cudaErrorInvalidValue: {}",
+            o.msg
+        );
+        assert!(
+            o.msg.contains("kernel launch"),
+            "[{site}] must say the launch failed: {}",
+            o.msg
+        );
+        assert!(
+            o.msg.contains(kernel_frag),
+            "[{site}] must name the instantiation {kernel_frag}: {}",
+            o.msg
+        );
+        assert!(
+            o.msg.contains("cudaErrorInvalidValue"),
+            "[{site}] must name the error: {}",
+            o.msg
+        );
+        assert_eq!(o.ret, 0, "[{site}] the launcher must refuse the launch");
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "[{site}] the site must clear the latch it named (it must not reach sync)"
+        );
+    }
+
+    /// Issue #147 acceptance, site by site: a deliberately failed
+    /// `cudaFuncSetAttribute` at every dynamic-smem site is named where it is
+    /// made and the following launch is refused. Device + env-gated.
+    #[test]
+    fn cuda_issue147_attribute_sites_name_the_call_and_refuse_the_launch() {
+        let _model_load_guard = CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        if !issue147_gate_enabled() {
+            return;
+        }
+        let s = device().unwrap();
+        let w = zeroed_dev(1 << 20);
+        let q8 = zeroed_dev(1 << 20);
+        let c = zeroed_dev(1 << 20);
+        let stream = s.stream();
+
+        // launch_mmq_raw_nt: both kd branches of the terminal raw launcher.
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_nt_kd4",
+            "mmq_raw_nt_kernel<4>",
+            || unsafe {
+                launch_mmq_raw_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    stream,
+                    4,
+                )
+            },
+        );
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_nt_kd8",
+            "mmq_raw_nt_kernel<8>",
+            || unsafe {
+                launch_mmq_raw_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    stream,
+                    8,
+                )
+            },
+        );
+        // launch_mmq_nt (the MMQ_LAUNCH macro; one call per quant type).
+        assert_attr_failure(s, "attr:mmq_nt", "mmq_nt_kernel<0,1,false>", || unsafe {
+            launch_mmq_nt(
+                0,
+                w as *const u8,
+                q8 as *const u8,
+                c as *mut f32,
+                1,
+                64,
+                64,
+                40,
+                stream,
+            )
+        });
+        // launch_mmq_raw_nb_nt.
+        assert_attr_failure(s, "attr:mmq_raw_nb", "mmq_raw_nb_kernel<8>", || unsafe {
+            launch_mmq_raw_nb_nt(
+                5,
+                w as *const u8,
+                q8 as *const u8,
+                c as *mut f32,
+                1,
+                64,
+                256,
+                stream,
+                8,
+            )
+        });
+        // launch_mmq_raw_nb_bt_nt (both DSC branches share one site token).
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_nb_bt",
+            "mmq_raw_nb_bt_kernel<8,false>",
+            || unsafe {
+                launch_mmq_raw_nb_bt_nt(
+                    5,
+                    w as *const u8,
+                    std::ptr::null(),
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    8,
+                    stream,
+                    8,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            },
+        );
+        // launch_mmq_raw_nb_bt_q6k_nt.
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_nb_bt_q6k",
+            "mmq_raw_nb_bt_q6k_kernel<2,false>",
+            || unsafe {
+                launch_mmq_raw_nb_bt_q6k_nt(
+                    7,
+                    w as *const u8,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    2,
+                    210,
+                    stream,
+                    8,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            },
+        );
+        // launch_mmq_raw_wide_nt: both kd branches.
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_wide_kd4",
+            "mmq_raw_wide_nt_kernel<4>",
+            || unsafe {
+                launch_mmq_raw_wide_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    128,
+                    256,
+                    stream,
+                    4,
+                )
+            },
+        );
+        assert_attr_failure(
+            s,
+            "attr:mmq_raw_wide_kd8",
+            "mmq_raw_wide_nt_kernel<8>",
+            || unsafe {
+                launch_mmq_raw_wide_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    128,
+                    256,
+                    stream,
+                    8,
+                )
+            },
+        );
+        // launch_gemm_f16: the family is tm/ks-dependent (their env knobs are
+        // read once per process), so the assertion pins the family and the
+        // af32 instantiation suffix rather than one exact (tm, ks).
+        assert_attr_failure(s, "attr:gemm_f16_f16", "gemm_f16_nt_kernel_t<", || unsafe {
+            launch_gemm_f16(
+                w as *const std::ffi::c_void,
+                q8 as *const std::ffi::c_void,
+                c as *mut f32,
+                1,
+                64,
+                32,
+                stream,
+                false,
+            )
+        });
+        assert_attr_failure(s, "attr:gemm_f16_a32", ",true>", || unsafe {
+            launch_gemm_f16(
+                w as *const std::ffi::c_void,
+                q8 as *const std::ffi::c_void,
+                c as *mut f32,
+                1,
+                64,
+                32,
+                stream,
+                true,
+            )
+        });
+
+        // Positive control: with the knob off, the same terminal launcher must
+        // still launch. A launcher that always refused would pass the loop above
+        // for the wrong reason.
+        let _ = s.take_last_error();
+        assert_eq!(
+            unsafe {
+                launch_mmq_raw_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    stream,
+                    8,
+                )
+            },
+            1,
+            "the non-injected raw-narrow launcher must launch"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "the non-injected launch must leave no latch"
+        );
+
+        unsafe {
+            cudaFree(w);
+            cudaFree(q8);
+            cudaFree(c);
+        }
+    }
+
+    /// Issue #147 acceptance for the launches themselves: a deliberately failed
+    /// `<<<>>>` is named at the site, the launcher refuses, and the latch is
+    /// cleared. Device + env-gated.
+    #[test]
+    fn cuda_issue147_launch_sites_name_the_call_and_refuse_the_launch() {
+        let _model_load_guard = CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        if !issue147_gate_enabled() {
+            return;
+        }
+        let s = device().unwrap();
+        let w = zeroed_dev(1 << 20);
+        let q8 = zeroed_dev(1 << 20);
+        let c = zeroed_dev(1 << 20);
+        let stream = s.stream();
+
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_nt_kd4",
+            "mmq_raw_nt_kernel<4>",
+            || unsafe {
+                launch_mmq_raw_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    stream,
+                    4,
+                )
+            },
+        );
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_nt_kd8",
+            "mmq_raw_nt_kernel<8>",
+            || unsafe {
+                launch_mmq_raw_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    stream,
+                    8,
+                )
+            },
+        );
+        assert_launch_failure(s, "launch:mmq_nt", "mmq_nt_kernel<0,1,false>", || unsafe {
+            launch_mmq_nt(
+                0,
+                w as *const u8,
+                q8 as *const u8,
+                c as *mut f32,
+                1,
+                64,
+                64,
+                40,
+                stream,
+            )
+        });
+        assert_launch_failure(s, "launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>", || unsafe {
+            launch_mmq_raw_nb_nt(
+                5,
+                w as *const u8,
+                q8 as *const u8,
+                c as *mut f32,
+                1,
+                64,
+                256,
+                stream,
+                8,
+            )
+        });
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_nb_bt",
+            "mmq_raw_nb_bt_kernel<8,false>",
+            || unsafe {
+                launch_mmq_raw_nb_bt_nt(
+                    5,
+                    w as *const u8,
+                    std::ptr::null(),
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    8,
+                    stream,
+                    8,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            },
+        );
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_nb_bt_q6k",
+            "mmq_raw_nb_bt_q6k_kernel<2,false>",
+            || unsafe {
+                launch_mmq_raw_nb_bt_q6k_nt(
+                    7,
+                    w as *const u8,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    64,
+                    256,
+                    2,
+                    210,
+                    stream,
+                    8,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            },
+        );
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_wide_kd4",
+            "mmq_raw_wide_nt_kernel<4>",
+            || unsafe {
+                launch_mmq_raw_wide_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    128,
+                    256,
+                    stream,
+                    4,
+                )
+            },
+        );
+        assert_launch_failure(
+            s,
+            "launch:mmq_raw_wide_kd8",
+            "mmq_raw_wide_nt_kernel<8>",
+            || unsafe {
+                launch_mmq_raw_wide_nt(
+                    5,
+                    w as *const u8,
+                    q8 as *const u8,
+                    c as *mut f32,
+                    1,
+                    128,
+                    256,
+                    stream,
+                    8,
+                )
+            },
+        );
+        assert_launch_failure(
+            s,
+            "launch:gemm_f16_f16",
+            "gemm_f16_nt_kernel_t<",
+            || unsafe {
+                launch_gemm_f16(
+                    w as *const std::ffi::c_void,
+                    q8 as *const std::ffi::c_void,
+                    c as *mut f32,
+                    1,
+                    64,
+                    32,
+                    stream,
+                    false,
+                )
+            },
+        );
+        assert_launch_failure(s, "launch:gemm_f16_a32", ",true>", || unsafe {
+            launch_gemm_f16(
+                w as *const std::ffi::c_void,
+                q8 as *const std::ffi::c_void,
+                c as *mut f32,
+                1,
+                64,
+                32,
+                stream,
+                true,
+            )
+        });
+
+        // Positive control: the same GEMM launcher must still launch with the
+        // knob off (otherwise the loop above would pass on an always-refusing
+        // launcher).
+        let _ = s.take_last_error();
+        assert_eq!(
+            unsafe {
+                launch_gemm_f16(
+                    w as *const std::ffi::c_void,
+                    q8 as *const std::ffi::c_void,
+                    c as *mut f32,
+                    1,
+                    64,
+                    32,
+                    stream,
+                    false,
+                )
+            },
+            1,
+            "the non-injected GEMM launcher must launch"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "the non-injected launch must leave no latch"
+        );
+
+        unsafe {
+            cudaFree(w);
+            cudaFree(q8);
+            cudaFree(c);
+        }
+    }
+
+    /// Issue #147 acceptance for the Rust destroy site: an injected failed
+    /// `cudaGraphDestroy` (the pre-#145 wrong-destructor call) is named and
+    /// cleared, and the instantiated exec — which the failed destroy does not
+    /// touch — is still returned and still destroyable. Device + env-gated.
+    #[test]
+    fn cuda_issue147_graph_destroy_failure_is_named_and_the_exec_survives() {
+        let _model_load_guard = CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        if !issue147_gate_enabled() {
+            return;
+        }
+        let s = device().unwrap();
+        let _ = s.take_last_error();
+        assert!(s.graph_begin_capture(), "stream capture should begin");
+        let exec = {
+            let _g = InjectionGuard::arm("destroy:graph_destroy");
+            s.graph_end_capture_to_exec()
+        };
+        // The injected call is `cudaGraphDestroy(exec)` — the pre-#145 bug — so
+        // the *graph* leaks while the exec stays valid. Refusing the exec would
+        // be wrong (only the graph handle is lost), so the site names the
+        // failure, clears the latch, and still returns the exec.
+        assert!(
+            !exec.is_null(),
+            "a failed cudaGraphDestroy(graph) must not refuse the valid exec"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "the destroy site must not leave its error for CudaState::sync"
+        );
+        assert!(
+            s.graph_destroy(exec),
+            "the returned exec must still be a destroyable cudaGraphExec_t"
+        );
+        assert_eq!(
+            s.take_last_error(),
+            0,
+            "and that destroy must leave no latch"
         );
     }
 }
