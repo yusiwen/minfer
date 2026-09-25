@@ -157,10 +157,11 @@ process-wide `CudaState::stream_lock()` serializes stream use:
   (`latched_api_error_count`) and cleared — never dropped — but the fix belongs at the call site that
   discarded the return value.
 
-**The eager prefill-GEMM smem opt-in (issue [#145](https://github.com/yusiwen/minfer/issues/145)).**
+**The eager prefill-GEMM smem opt-in (issues [#145](https://github.com/yusiwen/minfer/issues/145) and
+[#147](https://github.com/yusiwen/minfer/issues/147)).**
 A `gemm_f16_nt_kernel_t` instantiation whose dynamic shared memory exceeds the 48 KiB default must be
 opted in with `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, N)` **before**
-anyone opens a capture window — `cudaFuncSetAttribute` is illegal under
+anyone opens a capture window — `cudaFuncSetAttribute` was believed illegal under
 `cudaStreamCaptureModeGlobal`, and a lazy first-use opt-in inside a window fails and poisons the
 first captured launch. `CudaState::try_new` therefore calls `gemm_prefill_smem_init()` eagerly. The
 number it requests is the kernel's own byte layout — `As 2*TN*KS halves + Am 2*TN*KS floats (AF32
@@ -174,6 +175,26 @@ failure is named once, at init (function, attribute, requested bytes, device lim
 the call could only return `cudaErrorInvalidValue` (which `compute-sanitizer` counts) and the
 instantiation cannot launch on that device at all. On GB10/sm_121 (limit 101376 B) that is exactly
 one combination, `gemm_f16_nt_kernel_t<256,64,true>` at 122880 B.
+
+**The launcher refuses, not just reports (#147).** The eager init is not the last line of defence: a
+caller can select an instantiation the init skipped (`MINFER_GEMM_TM=256` + `MINFER_GEMM_K64=1`, or
+the af32 path), so `launch_gemm_f16` now reads the opt-in's own answer through the shared
+`minfer_smem_optin` helper — which names the site, the instantiation, the attribute, the requested
+bytes, the queried device limit and `cudaGetErrorName`, clears the latch — and **does not launch**
+when it is false. Its own `<<<>>>` error is read too (`minfer_launch_ok`) and returned as 0, which
+`prefill_gemm_f16_inner` turns into an `Err`. The af32 wrapper `launch_gemm_f32a` returns the same
+result; the per-instantiation answer is cached (a test injection is never cached), so the hot path
+does not re-ask the driver. The same treatment covers every MMQ launcher
+(`launch_mmq_nt`/`launch_mmq_raw_nt`/`launch_mmq_raw_nb_nt`/`launch_mmq_raw_nb_bt_nt`/
+`launch_mmq_raw_nb_bt_q6k_nt`/`launch_mmq_raw_wide_nt`); the terminal two return 0 → `Err` at the
+Rust caller, the fallback ones keep their documented `0 = clean fallback` contract.
+
+**Measured correction (2026-09-25, CUDA 13.0 / driver 580.178.04 / sm_121).** A probe
+(`/tmp/fix147_attr_capture_probe.cu`) shows the historical claim above no longer holds verbatim on
+this runtime: `cudaFuncSetAttribute` returns `cudaSuccess` when called *inside* an open
+`cudaStreamCaptureModeGlobal` window, both for the already-set value and for a new one. The eager
+init stays (it is cheap, and the behaviour is not contractual across toolkits), and because the
+launcher caches one answer per instantiation it does not re-ask inside a window either.
 
 ### 2.5 Legacy surface
 
@@ -504,12 +525,18 @@ The hard rules live in `docs/GPU_SAFETY.md` (CUDA section); this is how the back
    thread latched, so its message names the observer and the `cudaGetErrorName` symbol and says it is
    not attributed to a kernel (the error is counted and cleared, not dropped). The two origins behind
    the old phantom "kernel launch error: 1" were a rejected `cudaFuncSetAttribute` and
-   `cudaGraphDestroy` called on a `cudaGraphExec_t` — both fixed at their call sites.
-5. **A return value that gates a later launch is read where the call is made.** In particular the
-   dynamic-smem opt-in: an over-limit request is skipped with the reason, any other failure is named
-   and cleared at the call site. The sync poll is the backstop for a *missed* site, not the place to
-   diagnose one; the sites still uncovered are listed in
-   [#147](https://github.com/yusiwen/minfer/issues/147).
+   `cudaGraphDestroy` called on a `cudaGraphExec_t` — both fixed at their call sites by #145, and the
+   remaining unchecked sites of the same class (every MMQ dynamic-smem opt-in and launch, the
+   prefill-GEMM launcher's own launch, and `graph_end_capture_to_exec`'s `cudaGraphDestroy`) by
+   #147.
+5. **A return value that gates a later launch is read where the call is made.** Every dynamic-smem
+   opt-in goes through `minfer_smem_optin`: an over-limit request is skipped with the reason, any
+   other failure is named and cleared at the call site and the launch is **refused** (a launch over
+   an un-opted-in dynamic smem cannot succeed). Every launch goes through `minfer_launch_ok`, whose
+   immediately-following `cudaGetLastError` is a launch check because `minfer_launch_prelude`
+   cleared (and reported) any latch that predates the launch. The sync poll is the backstop for a
+   *missed* site, not the place to diagnose one; #147's `issue147_tests` gates inject a real failure
+   at every one of the sites and assert the named report, the refusal and a clean latch.
 6. **Same-stream ordering is the async-fill contract**; the pinned ring syncs on wrap and never
    hands a slot back early.
 7. **Weight-registry ownership**: name+size reuse, different-size replace with a deliberate, bounded
@@ -627,7 +654,13 @@ Categories and the invariants they pin:
   kernel's byte layout — the value-level arm, so a silent shrink is seen),
   `cuda_prefill_smem_optin_covers_every_launchable_instantiation` (every admitted >48 KiB request
   reads back opted in through `cudaFuncGetAttributes`, every over-limit one is skipped), and
-  `the_latched_error_message_never_blames_a_kernel`.
+  `the_latched_error_message_never_blames_a_kernel`. #147's `issue147_tests` module adds
+  `the_graph_destroy_failure_message_names_the_matching_destructor` and
+  `the_injection_matcher_matches_only_the_named_site` (both pure) plus the three
+  `cuda_issue147_*` deliberate-failure gates (device; env-gated behind `MINFER_TEST_ISSUE147=1`, which
+  arms `MINFER_TEST_CALL_FAIL` per site): every dynamic-smem site names its failed opt-in and refuses
+  the launch, every launch site names its failed `<<<>>>` and refuses, and the destroy site names a
+  failed `cudaGraphDestroy` and leaves no latch.
 
 Model-level CUDA coverage:
 `cuda_conversation_multiturn_reuse` (Qwen2) asserts that an incremental multi-turn session reusing
@@ -673,6 +706,32 @@ skipped instantiation named instead. The device limit the request had to fit is
 `gemm_f16_nt_kernel_t<256,64,true>` (the corrected request is 122880 B, still over the limit, hence
 the deliberate skip). The mutation checks are recorded in
 `docs/ARCHITECTURE-EXECUTION-PLAN.md` (C4 S2c).
+
+### 7.4 Issue #147 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
+
+The follow-on to #145: the remaining CUDA calls that discarded a return value gating a later launch or
+allocation (the MMQ dynamic-smem opt-ins and the launches that follow them, the prefill-GEMM
+launcher's own launch, and `graph_end_capture_to_exec`'s `cudaGraphDestroy`). Latent on this device —
+the sanitizer was already clean — so the acceptance is that each site still cannot latch: **0 API
+errors** before and after, **508 passed / 0 failed / 32 ignored** after (503 before; five new gates:
+three pure, two device/env-gated), 0.5B and Qwen3-0.6B real-model sets **32 / 0** each, CPU suite
+440 / 0 / 29 + 10 / 0 / 6 and CPU serial ignored 29 / 0 unchanged.
+
+The deliberate-failure injection is `MINFER_TEST_CALL_FAIL` (site tokens, or `all`) plus
+`MINFER_TEST_ISSUE147=1` to enable the gates: a named site performs its **real** call with a value that
+fails — an attribute request one page over the queried device limit, a launch with 16 MiB more dynamic
+smem than was opted in, or `cudaGraphDestroy` on the exec — so the "latch cleared" half is exercised for
+real rather than through a synthetic return value. Both variables are unset in every default, bench and
+`compute-sanitizer` run. The two probes the injection relies on are recorded in `/tmp`:
+`fix147_attr_capture_probe.cu` (`cudaFuncSetAttribute` inside a Global capture window returns
+`cudaSuccess` on this runtime — see §2.4) and `fix147_launch_fail_probe2.cu` (an over-limit dynamic-smem
+launch is rejected by the launch call with `cudaErrorInvalidValue`, and the kernel never runs).
+Mutation checks: every hardening reverted one at a time (eight per-site attribute guards, the gemm
+opt-in guard, the shared launch check, the gemm message naming a wrong instantiation, the shared opt-in
+admitting a failure, the Rust destroy read, the Rust formatter, the injection matcher), each failing
+its gate, with both files restored byte-identically. The remaining 65 unchecked `<<<>>>` returns are
+[#162](https://github.com/yusiwen/minfer/issues/162); the full record is
+`docs/ARCHITECTURE-EXECUTION-PLAN.md` (C4 S2d).
 
 ---
 

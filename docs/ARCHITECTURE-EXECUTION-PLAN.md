@@ -1281,6 +1281,120 @@ that lands on the skipped instantiation, and it had no working opt-in before eit
 unchecked CUDA calls in the same file are enumerated in
 [#147](https://github.com/yusiwen/minfer/issues/147) rather than silently fixed here.
 
+### C4 — S2d: the remaining unchecked CUDA attribute / launch / destroy returns · [#147](https://github.com/yusiwen/minfer/issues/147) — **DONE 2026-09-25**
+
+**Why.** S2c ([#145](https://github.com/yusiwen/minfer/issues/145)) fixed the two latched-error
+origins `compute-sanitizer` could still see and left the CUDA unit suite at **0 API errors** — but the
+audit it performed listed a whole family of call sites that still *discard a return value which gates a
+later launch or allocation*, the class that let [#122](https://github.com/yusiwen/minfer/issues/122),
+[#128](https://github.com/yusiwen/minfer/issues/128) and #145 hide in the first place. None was known
+to fail on sm_121, so this is latent hardening, not a live bug: the value is that the next driver,
+device or tile-config change cannot turn one of them into another phantom "kernel launch error".
+
+**The re-derived site list (verified against the tree, not the ticket).** The S2c table named six rows;
+re-deriving them against the post-#145 source gives **eight code sites**, one of which the table
+understated (the wide-NT launcher already read its own return but reported nothing) and two of which
+were already fixed by #145 (the eager `gemm_prefill_smem_init` opt-in and `graph_destroy`'s
+`cudaGraphExecDestroy`). What remained, and how each is closed:
+
+| site | was | now |
+|---|---|---|
+| `launch_mmq_raw_nt` (`kd <= 4` and `kd > 4`) | `cudaFuncSetAttribute`'s return discarded; the launch followed unconditionally; the `void` launcher reported nothing and the caller could not tell | `minfer_smem_optin` reads and names the call, the following launch is refused (`return 0`), and the launcher's own `<<<>>>` error is read too (`minfer_launch_ok`); `launch_mmq_raw_nt` returns `int` and the Rust caller turns a 0 into an `Err` |
+| `launch_mmq_nt` (`MMQ_LAUNCH`, one call per quant type) | same, as a macro | the macro branches on the named opt-in, refuses, and returns the launch's own result; the launcher returns `int` → `Err` |
+| `launch_mmq_raw_nb_nt` | the return was not read; a following `cudaGetLastError()` treated *any* latch as "smem/reg cap, return 0", discarding the code and its origin | the opt-in's own return decides (`attr:mmq_raw_nb`), the launch's own error is named (`launch:mmq_raw_nb`), the 0-fallback contract is unchanged |
+| `launch_mmq_raw_nb_bt_nt` / `..._q6k_nt` | same post-hoc `cudaGetLastError()` idiom, attribution by position | the same named opt-in + launch check (`attr:…`, `launch:…`), cleared at the site |
+| `launch_mmq_raw_wide_nt` (`kd <= 4` and `kd > 4`) | the return *was* read, but a failure cleared the latch silently (no name, no value) | routed through the shared named helper: site, instantiation, requested bytes, device limit, `cudaGetErrorName` |
+| `gemm_smem_optin` + `launch_gemm_f16` | the helper printed a failed opt-in but the caller launched anyway; `launch_gemm_f16` returned `void`, so its own launch was unchecked (`launch_gemm_f32a` checked it via a post-hoc `cudaGetLastError`) | `gemm_smem_optin` returns the admitted/refused answer (cached per instantiation), the launcher refuses on false, reads its own launch error and returns `int`; `launch_gemm_f32a` forwards it; `prefill_gemm_f16_inner` returns `Err` |
+| `graph_end_capture_to_exec` | `cudaGraphDestroy(graph)`'s return discarded | read, named with `cudaGetErrorName`, cleared at the site; the legacy `graph_end_capture` gets the same read |
+
+**The mechanics (one place, no per-launcher copy).** `cuda_kernels.cu` gained a small block of shared
+helpers — `minfer_smem_optin` (skip an over-limit request **without calling**, otherwise call once, name
+the function/attribute/bytes/device-limit/`cudaGetErrorName`, clear the latch, return false → refuse),
+`minfer_launch_prelude` (report a latch that *predates* the launch, so the post-launch read is a launch
+check and not attribution by position), `minfer_launch_smem`, and `minfer_launch_ok` (name the launch's
+own error and clear it) — plus `minfer_site_fail_*` introspection for the gates. `minfer_smem_optin`
+queries `cudaDevAttrMaxSharedMemoryPerBlockOptin` once and skips a request above it, which is what keeps
+`compute-sanitizer` clean (calling it would only observe `cudaErrorInvalidValue`).
+
+**Two signature changes, both followed through.** `launch_mmq_raw_nt` and `launch_mmq_nt` went
+`void → int`, and `launch_gemm_f16` / `launch_gemm_f32a` went `void → int` (1 = launched and accepted,
+0 = refused). The Rust callers read the result and return `Err` — a failed launch is an error, never a
+silent pass over an unwritten output. The *fallback* launchers keep their documented `0 = clean
+fallback` contract, so which kernel runs is unchanged. Nothing numeric or dispatch-related moved.
+
+**A measured correction to a documented belief.** `docs/CUDA-BACKEND-DESIGN.md` said
+`cudaFuncSetAttribute` is illegal under `cudaStreamCaptureModeGlobal` and that a lazy opt-in inside a
+window fails. A probe on CUDA 13.0 / driver 580.178.04 / sm_121
+(`/tmp/fix147_attr_capture_probe.cu`) shows the call now returns `cudaSuccess` inside an open Global
+capture window (both for the set value and a new one), so the eager init is defence-in-depth rather
+than the only working form; the launcher caches one answer per instantiation, so it is not re-asked on
+the hot path either way. Recorded in the design doc.
+
+**Acceptance results (GB10, sm_121, CUDA 13.0, driver 580.178.04).**
+
+| check | before | after |
+|---|---|---|
+| CUDA serial unit suite | 503 / 0 / 32 | **508 / 0 / 32** (five new gates: three pure, two device/env-gated) |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0** API errors over 503 (349.46 s) | **0** errors over 508 |
+| CUDA serial ignored, 0.5B config | 32 / 0 | **32 / 0** |
+| CUDA serial ignored, Qwen3-0.6B Q8_0 | 32 / 0 | **32 / 0** |
+| CPU `cargo test --release` | 440 / 0 / 29 unit + 10 / 0 / 6 integration | **unchanged** |
+| CPU serial ignored | 29 / 0 | **29 / 0** |
+| `scripts/check_docs_links.py` | 940 links / 184 files | **940 / 184** |
+
+**The five new gates, all mutation-checked.**
+
+- `the_graph_destroy_failure_message_names_the_matching_destructor` (pure) — the Rust formatter names
+  `cudaGraphDestroy`, the `cudaGraph_t from cudaStreamEndCapture` handle, the `cudaGetErrorName` symbol
+  and the ticket, and must **not** name `cudaGraphExecDestroy` or "kernel launch" (a gate that only
+  asserts "a message appeared" cannot see a wrong message). Mutation: naming the exec destructor fails it.
+- `the_injection_matcher_matches_only_the_named_site` (pure) — `all`, exact comma-separated tokens,
+  whitespace-tolerant, and **no substring rule in either direction** (`small` must not arm
+  `attr:mmq_nt`; `attr:mmq_nt_extra` must not either). Mutation: the substring form fails it.
+- `cuda_issue147_attribute_sites_name_the_call_and_refuse_the_launch` (device; env-gated behind
+  `MINFER_TEST_ISSUE147=1` because it makes a **real** CUDA call fail) — for each of the ten
+  dynamic-smem tokens the injected over-limit `cudaFuncSetAttribute` is reported once, at that site,
+  with the API, the attribute, the device limit, a request above it, the exact instantiation and
+  `cudaErrorInvalidValue`; the launcher returns 0; `take_last_error()` is 0. Then a positive control
+  (knob off) launches and leaves no latch.
+- `cuda_issue147_launch_sites_name_the_call_and_refuse_the_launch` (device; env-gated) — the same for
+  the ten launch tokens (an over-limit dynamic-smem `<<<>>>`, which the launch call itself rejects with
+  `cudaErrorInvalidValue` — probed before use, `/tmp/fix147_launch_fail_probe2.cu` — so the kernel never
+  runs), plus a positive control.
+- `cuda_issue147_graph_destroy_failure_is_named_and_the_exec_survives` (device; env-gated) — the
+  injection re-creates #145's bug at this site (`cudaGraphDestroy(exec)`), the site clears the latch,
+  and the valid exec is still returned and still destroyable (a failed graph destroy leaks only the
+  graph handle, so refusing the exec would be wrong).
+
+**Mutation evidence.** Every hardening was reverted one at a time and the corresponding gate re-run;
+each reverted version failed, the file was restored, and the restored files were byte-identical
+(`sha256sum`, in the closing comment on #147). Round 1 (per-site attribute guards): A1
+`attr:mmq_raw_nt_kd4`, A2 `_kd8`, A3 the `mmq_nt` macro, A4 `attr:mmq_raw_nb`, A5 `attr:mmq_raw_nb_bt`,
+A6 `attr:mmq_raw_nb_bt_q6k`, A7 `attr:mmq_raw_wide_kd4`, A8 `_kd8` — all eight trivially failed the
+attribute gate at that site. Round 2: A9 the gemm opt-in guard, B the shared `minfer_launch_ok` check,
+C the gemm message naming a wrong instantiation (the "prints a wrong message" check), D
+`minfer_smem_optin` reporting but admitting the launch (the shape a message-only assertion would miss —
+the gate's `ret == 0` catches it), E the Rust destroy read discarded, F the Rust formatter naming the
+wrong destructor, G the injection matcher weakened to a substring.
+
+**Honest scope.** The over-limit skips and the device limit are measured on GB10/sm_121 only; the
+decision is a runtime query and every skip is printed, so another device skips a different subset. All
+deliberate-failure evidence is device-gated and driven by test-only env knobs, which invert a site's
+*own* answer rather than exercising a genuinely failing driver call in production — the injection makes
+the call fail for real (over-limit attribute / over-limit dynamic smem / wrong destructor), so the
+"latch cleared" half is exercised for real, but the production paths remain latent by construction. The
+MMQ launch check is shared by the `mmq_nt` and raw-NT launchers, so the per-launch *check* was mutated
+once (B) rather than per launcher; every launch token's own report was observed by the gate. Other
+`void` launchers in the file — **65** of them (`launch_dequant_f16`, `launch_convert_f16`,
+`launch_gemm_qb_nt`, every store/rope/attention/MVQ/MVQ-multi wrapper) — still do not read their own
+`<<<>>>` error and were left alone: a failure there is currently reported by the next hardened launch's
+prelude or by `sync` as a latched API error, and converting all of them is filed as
+[#162](https://github.com/yusiwen/minfer/issues/162) rather than smuggled in here. And the pre-#147
+fallback semantics
+are preserved deliberately: `launch_mmq_raw_nb_nt` / `_nb_bt_nt` / `_q6k_nt` / `_wide_nt` still return 0
+on any opt-in refusal, so the dispatch falls to the next kernel — the failure is named, not fatal,
+because a fallback is the designed behaviour and changing it would change which kernel runs.
+
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 
 **Why.** A session's KV rows, ownership and run table lived only in memory, so every
