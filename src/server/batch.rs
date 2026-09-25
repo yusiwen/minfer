@@ -230,6 +230,21 @@ fn apply_run_moves(slots: &mut [SlotState], moves: &[crate::graph::kvcache::KvMo
     }
 }
 
+/// Answer a job the engine will not run: send its error on the job's own
+/// channel **before** its sender is dropped, and hand the error back so the
+/// caller can still count the rejection.
+///
+/// #121: a `Job` carries the only `mpsc::Sender<StreamEvent>` its HTTP handler
+/// listens on. Dropping it silently closes the channel, and the handler reads a
+/// closed channel as a *completed* response — HTTP 200 with empty content
+/// (non-streaming) or an empty SSE stream followed by `[DONE]` (streaming) —
+/// which a client cannot tell from "the model produced nothing". Every path
+/// that gives up on a job goes through here.
+fn reject(job: Job, e: ApiError) -> ApiError {
+    let _ = job.tx.blocking_send(StreamEvent::Err(e.clone()));
+    e
+}
+
 impl BatchEngine {
     /// Reserve one run per slot in a single arena. The reservations are made
     /// once and kept: a slot that finishes a request keeps its rows and its
@@ -585,9 +600,11 @@ impl BatchEngine {
         self.slots.iter().any(|s| s.run.is_some())
     }
 
-    /// Admit a request into an idle slot and prefill it. Returns the slot index,
-    /// or `unavailable` when every slot is busy (today's behaviour).
-    /// Admit a group of requests that arrived together.
+    /// Admit a group of requests that arrived together: place each one on an
+    /// idle slot (reuse-aware) and prefill it, or — when every slot is busy —
+    /// answer it `unavailable("no idle slot")` through [`reject`], which is the
+    /// #121 semantics: a saturated server rejects **loudly** (503), it does not
+    /// queue and it never answers an empty 200.
     ///
     /// Requests are placed first (reuse-aware), then their prefills go through
     /// **one** forward where that pays: prefill is a weight-bound share of a
@@ -626,7 +643,7 @@ impl BatchEngine {
                     taken[slot] = true;
                     placed.push((i, job, slot));
                 }
-                None => answers[i] = Some(Err(ApiError::unavailable("no idle slot"))),
+                None => answers[i] = Some(Err(reject(job, ApiError::unavailable("no idle slot")))),
             }
         }
         let total: usize = placed
@@ -649,8 +666,11 @@ impl BatchEngine {
                     }
                 }
                 Err(e) => {
-                    for (i, _, _) in &placed {
-                        answers[*i] = Some(Err(ApiError::server(e.clone())));
+                    // A failed group prefill installs nothing (the install loop is
+                    // its last, infallible step), so every job in the group is
+                    // still here and must be answered, not dropped.
+                    for (i, job, _) in placed {
+                        answers[i] = Some(Err(reject(job, ApiError::server(e.clone()))));
                     }
                 }
             }
@@ -880,14 +900,6 @@ impl BatchEngine {
         Ok(())
     }
 
-    /// Admit a request on a **specific** slot.
-    ///
-    /// A slot's cell offset is part of a request's determinism: RoPE at cell
-    /// 256 and at cell 5 agree in exact arithmetic but not in `f32`, so the same
-    /// prompt on a different slot can differ in the last ulps — and flip an
-    /// argmax on a near-tie. A slot is therefore a *session's KV home*, not an
-    /// interchangeable resource, which is also what makes B2's cross-request
-    /// prefix reuse possible; this entry point is how a caller pins one.
     /// E3: set the prefill chunk size (fed tokens per prefill forward; `0` = one
     /// forward per prefill, the pre-E3 behaviour).
     pub fn set_prefill_chunk(&mut self, n_batch: usize) {
@@ -919,6 +931,18 @@ impl BatchEngine {
             .any(|s| s.run.as_ref().is_some_and(|r| r.needs_forward.is_some()))
     }
 
+    /// Admit a request on a **specific** slot.
+    ///
+    /// A slot's cell offset is part of a request's determinism: RoPE at cell
+    /// 256 and at cell 5 agree in exact arithmetic but not in `f32`, so the same
+    /// prompt on a different slot can differ in the last ulps — and flip an
+    /// argmax on a near-tie. A slot is therefore a *session's KV home*, not an
+    /// interchangeable resource, which is also what makes B2's cross-request
+    /// prefix reuse possible; this entry point is how a caller pins one.
+    ///
+    /// Every failure that gives up on the request answers it through [`reject`]
+    /// before its sender is dropped — the caller (`admit`) turns the returned
+    /// `Err` into the F8 drop count, not into the client's answer.
     pub fn submit_on(
         &mut self,
         model: &dyn ModelDef,
@@ -927,13 +951,19 @@ impl BatchEngine {
         job: Job,
     ) -> Result<usize, ApiError> {
         if idx >= self.slots.len() {
-            return Err(ApiError::invalid_request(format!(
-                "slot {idx} does not exist ({} slots)",
-                self.slots.len()
-            )));
+            return Err(reject(
+                job,
+                ApiError::invalid_request(format!(
+                    "slot {idx} does not exist ({} slots)",
+                    self.slots.len()
+                )),
+            ));
         }
         if self.slots[idx].run.is_some() {
-            return Err(ApiError::unavailable(format!("slot {idx} is busy")));
+            return Err(reject(
+                job,
+                ApiError::unavailable(format!("slot {idx} is busy")),
+            ));
         }
         let nt = job.input_ids.len();
         // C7: size the slot from this request instead of leaving the startup
@@ -942,9 +972,12 @@ impl BatchEngine {
         self.ensure_slot_capacity(idx, want);
         let cap = self.slots[idx].cap;
         if nt > cap {
-            return Err(ApiError::exceed_context(format!(
-                "prompt of {nt} tokens exceeds slot context of {cap}"
-            )));
+            return Err(reject(
+                job,
+                ApiError::exceed_context(format!(
+                    "prompt of {nt} tokens exceeds slot context of {cap}"
+                )),
+            ));
         }
         let seq = self.slots[idx].seq;
         // C8a: the rows this request can start from may live in *another* slot — the
@@ -990,7 +1023,12 @@ impl BatchEngine {
             self.prefill_forwards += 1;
             self.prefill_max_nt = self.prefill_max_nt.max(batch.len());
             let logits =
-                guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)?;
+                match guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache) {
+                    Ok(l) => l,
+                    // The prefix is not installed yet, so this request has not
+                    // been admitted and must be answered, not dropped.
+                    Err(e) => return Err(reject(job, e)),
+                };
             if i + 1 == n_spans {
                 last_logits = logits;
             }
@@ -2806,6 +2844,204 @@ mod tests {
             "[f8] serve_loop: peak running {peak_running}, layers {} region {} B owned {} \
              cells; one slot -> {} dropped",
             s.kv.layers, s.kv.region_bytes, s.kv.owned_cells, s1.jobs_dropped_total
+        );
+    }
+
+    /// #121: the answer a rejected job gets, per transport.
+    ///
+    /// Drives the real handler functions with the event [`reject`] produces:
+    /// `collect_response` must surface a **503** rather than read the closed
+    /// channel as a completed empty answer, and `stream_response` must emit a
+    /// `data:` **error frame** rather than an empty stream followed by `[DONE]`.
+    /// No model is involved, so this half runs in CI; the coupling — that a
+    /// saturated engine really calls `reject` — is the `#[ignore]`d real-model
+    /// gate below (`a_job_rejected_for_want_of_a_slot_is_answered_with_503`).
+    ///
+    /// A plain `#[test]` with its own runtime: `reject` runs on the worker (a
+    /// non-async thread, as in production), and `blocking_send` correctly refuses
+    /// to block a runtime thread — so it is called *outside* `block_on`.
+    #[test]
+    fn a_rejected_job_answers_503_and_an_sse_error_frame() {
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let job = |tx: mpsc::Sender<StreamEvent>| Job {
+            input_ids: vec![1, 2, 3],
+            params: sampling_params(4),
+            tx,
+        };
+
+        // Non-streaming: the error reaches the handler as `Err(e)`, and `e` is a
+        // 503 for the HTTP layer.
+        let (tx, rx) = mpsc::channel::<StreamEvent>(4);
+        let e = reject(job(tx), ApiError::unavailable("no idle slot"));
+        assert_eq!(e.status, 503, "the engine rejects with 503");
+        let from_stream = rt
+            .block_on(crate::server::collect_response(rx))
+            .expect_err("a rejected job must not read as a completed empty answer");
+        assert_eq!(from_stream.status, 503, "{}", from_stream.message);
+        assert!(
+            from_stream.message.contains("no idle slot"),
+            "the reason must survive: {}",
+            from_stream.message
+        );
+        assert_eq!(
+            crate::server::error_response(&from_stream).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // Streaming: the same event is an SSE error frame — not a silent close.
+        // The `Sse` response itself is built inside the runtime (axum's keep-alive
+        // arms a timer), while `reject` stays outside it.
+        let (tx, rx) = mpsc::channel::<StreamEvent>(4);
+        let _ = reject(job(tx), ApiError::unavailable("no idle slot"));
+        let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
+        let body = rt.block_on(async move {
+            let resp = crate::server::stream_response(
+                "chatcmpl-test",
+                "test-model",
+                0,
+                rx,
+                crate::server::InFlight::new(metrics.clone()),
+                metrics,
+                3,
+            );
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("SSE body")
+        });
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("no idle slot"),
+            "the SSE error frame is missing: {body}"
+        );
+        assert!(
+            body.contains("\"code\":503"),
+            "the frame must carry the status: {body}"
+        );
+        assert!(
+            !body.contains("\"finish_reason\":\"stop\""),
+            "a rejected request must not look finished: {body}"
+        );
+    }
+
+    /// #121: a saturated engine **answers** the job it cannot place.
+    ///
+    /// One slot, two jobs queued before the loop starts, so the rejection is
+    /// deterministic (the setup F8's round 2 already used) — but here both
+    /// receivers are kept and read. `A` is served (`Finish`, tokens > 0); `B`
+    /// gets **exactly one** `StreamEvent::Err` with status 503 and the
+    /// `no idle slot` message, and nothing else. `jobs_dropped_total` moves by
+    /// exactly one.
+    ///
+    /// Before the fix `B`'s channel closed with no events at all, which the
+    /// handler rendered as HTTP 200 with empty content.
+    ///
+    /// Real-model gate (`#[ignore]`: CI has no cached GGUF).
+    #[test]
+    #[ignore = "needs the cached 0.5B GGUF (CI has no model)"]
+    fn a_job_rejected_for_want_of_a_slot_is_answered_with_503() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let Some(path) = cached_model() else {
+            eprintln!("[f8] no cached model; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+
+        let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
+        let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
+        let (job_tx, job_rx) = mpsc::channel::<Job>(64);
+        let mut rxs = Vec::new();
+        for prompt in ["Alpha", "Beta"] {
+            let (tx, rx) = mpsc::channel::<StreamEvent>(1024);
+            rxs.push(rx);
+            job_tx
+                .blocking_send(Job {
+                    input_ids: tok.encode(prompt),
+                    // Two tokens, so the served request finishes immediately and
+                    // the second job is rejected in the very first `admit` pass.
+                    params: sampling_params(2),
+                    tx,
+                })
+                .expect("queue job");
+            // The HTTP handler's side of the contract (F8): accepted + in flight.
+            metrics.requests_total.fetch_add(1, Ordering::SeqCst);
+            metrics.in_flight.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(job_tx); // no more senders: the loop drains and exits
+        super::serve_loop(&*model, &tok, job_rx, &mut engine, &metrics);
+
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.jobs_dropped_total, 1,
+            "exactly one job could not be placed on the one slot"
+        );
+
+        // Read both channels: one request was served, one was answered with an
+        // error. Classify by content, not by index, so the gate cannot pass
+        // because the two happened to be swapped — and name the silent-drop
+        // shape explicitly, so the *mutation* that puts it back reports the
+        // defect instead of a confusing "the served job must finish".
+        let mut served = 0usize;
+        let mut rejected = 0usize;
+        for mut rx in rxs {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.blocking_recv() {
+                events.push(ev);
+            }
+            let err = events.iter().find_map(|ev| match ev {
+                StreamEvent::Err(e) => Some(e),
+                _ => None,
+            });
+            let finish = events.iter().find_map(|ev| match ev {
+                StreamEvent::Finish { tokens, .. } => Some(*tokens),
+                _ => None,
+            });
+            match (err, finish) {
+                (Some(e), None) => {
+                    assert_eq!(
+                        e.status, 503,
+                        "a rejected job is unavailable: {}",
+                        e.message
+                    );
+                    assert!(
+                        e.message.contains("no idle slot"),
+                        "the reason must reach the client: {}",
+                        e.message
+                    );
+                    assert_eq!(
+                        events.len(),
+                        1,
+                        "the rejected job gets exactly the error, then the channel closes"
+                    );
+                    rejected += 1;
+                }
+                (None, Some(tokens)) => {
+                    assert!(tokens > 0, "the served job produced {tokens} tokens");
+                    served += 1;
+                }
+                (Some(_), Some(_)) => panic!(
+                    "a job cannot be both rejected and finished ({} event(s))",
+                    events.len()
+                ),
+                (None, None) => panic!(
+                    "a job's channel closed with {} event(s) — the #121 silent drop is back \
+                     (the handler would answer HTTP 200 with empty content)",
+                    events.len()
+                ),
+            }
+        }
+        assert_eq!(
+            (served, rejected),
+            (1, 1),
+            "one slot serves one request and answers the other"
         );
     }
 
