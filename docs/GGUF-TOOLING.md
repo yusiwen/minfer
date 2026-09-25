@@ -351,6 +351,8 @@ packing, the 5th-bit plane, `type_size`/`blck_size`, and the zero-block case.
 | minfer-converted vs llama.cpp-converted logits (same engine) | **bitwise** | equal |
 | split vs unsplit logits | **bitwise** | equal |
 | `f16 → q8_0` logits, same context | max \|Δ\| ≤ 1.0 **and** greedy text identical | max \|Δ\| = **0.481**, mean 0.082, max \|logit\| = 18.43 (2.6% of the largest logit); greedy continuation identical |
+| an f16 file's CUDA logits vs the same file's CPU logits (#141, 34-token prompt, ctx 512, Qwen2.5-0.5B-Instruct f16) | max \|Δ\| ≤ **0.01** and max relative ≤ **1e-3**, greedy continuation identical | max \|Δ\| = **7.34e-5**, mean 1.26e-5, max \|logit\| = 18.43 (**4.0e-6** relative); greedy `[12095, 13, 1084, 374]` on both |
+| that f16 file under llama.cpp (same prompt, `--temp 0`) | — | `Paris.`, the same greedy continuation minfer produces on CPU and CUDA |
 
 ---
 
@@ -380,11 +382,24 @@ network is used.
 
 - **No K-quant encoders.** `q4_K`/`q5_K`/`q6_K` (readable by the engine) and
   every I-quant are refused by name for `quantize`. [#140](https://github.com/yusiwen/minfer/issues/140)
-- **f16 weights are CPU-only.** `Op::MatMul`/`Op::GetRows` dispatch f16 on the
-  CPU (decoding one weight row at a time), but the Metal/CUDA registration still
-  accepts only f32 and the supported quants, so an f16 model runs the CPU path
-  even on a device build; the CPU f16 path is also scalar-ish (~3 tok/s prefill
-  on the 0.5B). [#141](https://github.com/yusiwen/minfer/issues/141)
+- **f16 weights run on CPU and CUDA; Metal refuses them.**
+  `Op::MatMul`/`Op::GetRows` dispatch f16 on the CPU (one weight row at a time,
+  never an f32 copy of the weights) and the dot is **vectorized** — AVX2 `F16C`
+  / aarch64 baseline NEON `FCVTL`, an f64 scalar oracle, `MINFER_NO_NEON=1`
+  forcing scalar, and the multi-token prefill decoding each row once and
+  threading the row loop through the shared CPU pool: measured on the 0.5B at a
+  34-token prefill **3.2 → 217 tok/s** (10.71s → 0.16s; 25.0 tok/s with the
+  vectorized dot alone). CUDA registers the raw 2 B/element weights and converts
+  in-register (`f16_f32_matmul_vec` / `_scalar`, `embed_rows_f16`), so the f16
+  file keeps its memory advantage (0.5B: 948 MiB of device weights vs ~1.9 GiB
+  dequantized); an f16 prefill does not enter the int8 MMQ GEMM (which streams
+  quantized bytes) and runs the f32-activation kernel instead. **Metal has no
+  f16 weight kernel yet**, so an f16 GGUF there falls to the CPU through the
+  loader's all-or-nothing registration check — loudly, because registering a
+  weight type no kernel can consume would be a silent wrong path
+  ([#164](https://github.com/yusiwen/minfer/issues/164)). Completed by
+  [#141](https://github.com/yusiwen/minfer/issues/141); the F6 half was
+  [#49](https://github.com/yusiwen/minfer/issues/49).
 - **No `--outtype bf16`.** f32 preserves every bf16 value exactly, so nothing is
   lost today, but a bf16 writer (and a bf16 weight path) is [#142](https://github.com/yusiwen/minfer/issues/142).
 - **`general.size_label` is not written** (cosmetic; llama.cpp derives it from

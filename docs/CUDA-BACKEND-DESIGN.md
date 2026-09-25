@@ -316,7 +316,7 @@ Two layers of checks are deliberately *not* in `supports_op`:
 |---|---|---|
 | `Input`, `KvcacheLoad` | no kernel | host-filled / the output *is* the persistent K region |
 | `View`/`Reshape`/`Permute` | `copy_d2d` identity | — |
-| `GetRows` + `Embed` meta | `embed_rows_on_gpu` (per weight type, incl. the padded Q6_K layout) | weight registered; type via the model gate |
+| `GetRows` + `Embed` meta | `embed_rows_on_gpu` (per weight type, incl. the padded Q6_K layout and, since #141, a dedicated f16 gather) | weight registered; type via the model gate |
 | `GetRows` + no meta | `gather_rows_f32_on_gpu` | the G3 tail-row gather |
 | `Add` / `Mul` | `add_f32` / `mul_f32` | input element counts must match |
 | `Silu` | `copy_d2d` if not aliased, then `silu_f32` in place | in-place alias rule |
@@ -342,6 +342,18 @@ Two layers of checks are deliberately *not* in `supports_op`:
 - **Decode / small batch**: per-type **MMVQ** (dp4a over q8_0 activations) for `nt == 1` with
   shape gates, `_multi` variants for `nt 2..8`, and f32-activation kernels otherwise. Q4_1/Q5_0/Q5_1
   have f32 kernels only; F32 weights use `f32_f32_matmul_vec`/`_scalar`.
+- **f16 weights (#141)**: `f16_f32_matmul_vec` when `id % 8 == 0`, else `f16_f32_matmul_scalar` — for
+  every `nt`, because f16 is not an MMQ *format* (MMQ streams quantized bytes) and the f16-wmma path
+  is the `MINFER_MMQ=0` fallback for the quantized types, not an f16-weight kernel. The weight bytes
+  stay 2 B/element **on the device**: there is no registration-time dequant to f32, so the memory the
+  f16 file exists to save is actually saved (a 0.5B f16 GGUF registers 942.4 MiB of device weights;
+  ~1.9 GiB if it were dequantized). The kernel converts in-register with `__half22float2` and FMA's
+  against the f32 activations, so the accumulation is f32 like every other CUDA matmul. Both launchers
+  read their own launch return through the #147 helpers and return non-zero → `Err`, rather than
+  joining the unchecked `<<<>>>` sites of [#162](https://github.com/yusiwen/minfer/issues/162). The
+  f16 **embedding** gather is `embed_rows_f16` (one thread per output element) — without it the
+  all-or-nothing `weights_on_cuda` check would drop a converted f16 GGUF to the CPU over its
+  `token_embd` alone.
 - **Bias** is applied by `add_bias_f32` after the GEMM; its last argument is the **row count** `nt`
   (the kernel maps one block row per token).
 
@@ -732,6 +744,36 @@ admitting a failure, the Rust destroy read, the Rust formatter, the injection ma
 its gate, with both files restored byte-identically. The remaining 65 unchecked `<<<>>>` returns are
 [#162](https://github.com/yusiwen/minfer/issues/162); the full record is
 `docs/ARCHITECTURE-EXECUTION-PLAN.md` (C4 S2d).
+
+---
+
+### 7.5 Issue #141 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
+
+f16 weights on the device, the third item F6 (#49) left: the loader registered f32 and the supported
+quants only, so an f16 GGUF fell to the CPU through the all-or-nothing `weights_on_cuda` gate even on
+a CUDA build. The change is the registration branch (`TensorType::F16` → `register_weight` raw; it is
+deliberately **not** folded into the quantized `matches!`, whose q4_K dsc-plane gate has no type
+check), `matmul_f32_ptr_layout`'s f16 arm, `embed_rows_on_gpu`'s f16 arm, and `weights_on_cuda`'s
+matmul/embed type sets.
+
+**Verified** (`f141_f16_weights_run_on_the_cuda_device`, `#[ignore]`d in the real-model set):
+`minfer convert` produced the file from the Qwen2.5-0.5B-Instruct HF checkpoint (994,156,352 B,
+948 MiB, 290 tensors, every 2-D tensor f16). The gate asserts, in order: the model's device is
+`Cuda`; the offload report says all 24 blocks + embed/output are on the device (942.4 MiB of device
+weights); the scheduler assigns **169 f16 matmul nodes + 1 f16 embed node** to `Backend::CUDA`
+(counted by walking the built graph's `CNode.backend`, so a silent CPU fallback fails here); then the
+device logits against the same file's `Layers(0)` CPU run — max |Δlogit| **7.34e-5** (mean 1.26e-5)
+against max |logit| 18.43, **4.0e-6** relative, greedy `[12095, 13, 1084, 374]` identical, asserted at
+|Δ| ≤ 0.01 and relative ≤ 1e-3 (the bound is stated and printed by the gate). llama.cpp on the same
+file (`--temp 0`) prints `Paris.`, the same continuation minfer gives on CPU and CUDA.
+
+**Mutations (reverted; files restored byte-identical).** (a) the loader's f16 registration gated off →
+the gate fails at `device()`: *left: Cpu, right: Cuda*; (b) the f16 arm removed from
+`matmul_f32_ptr_layout` → the gate panics on the loud `Err` *"cuda: weight type F16 has no
+f32-activation matmul kernel"*, not on a silent fallback; (c) the kernel's `__half22float2` replaced
+with zeros for half of each 8-element chunk → the gate fails on the greedy continuation (a value-level
+fault cannot pass the numeric comparison either). `compute-sanitizer --tool memcheck` over the CUDA
+unit suite stays at **0 API errors**. The full record is `docs/ARCHITECTURE-EXECUTION-PLAN.md` (#141).
 
 ---
 

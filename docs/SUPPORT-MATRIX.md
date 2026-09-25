@@ -18,6 +18,7 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 | **Q5_K** | 5 | 176 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
+| **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ❌⁵ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
 ¹ Metal prefill uses a simdgroup GEMM for every quant type (dispatched when
@@ -26,6 +27,23 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 these kernels **per op** (`quant_matmul_f32_on_gpu_buf`), so every quant type
 above runs on the GPU.
 ² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
+³ F16 has no block: 2 B per element, so there is no integer dot to run. The CPU
+dot is vectorized — AVX2 uses `F16C` (`_mm256_cvtph_ps`) and aarch64 uses
+baseline NEON `FCVTL` (`vcvt_f32_f16`) — with an f64 scalar oracle/fallback
+(`vec_ops::dot_f16_f32`, `f16_dot_path()`), and the multi-token prefill decodes
+each weight row once and threads the row loop through the shared CPU pool
+(#141). The AVX2 column marks the hand-written x86 kernel; NEON is folded into
+CPU as in every other row.
+⁴ CUDA decodes in-register (`f16_f32_matmul_vec` / `_scalar`, `__half22float2`)
+and the embedding gather has its own f16 kernel — the weights stay 2 B/element
+on the device, which is the point of the format. No MMQ route: MMQ streams
+*quantized* bytes and f16 is not one of its formats, so an f16 prefill runs the
+f32-activation kernel.
+⁵ **Metal refuses f16 weights**, so an f16 GGUF runs the CPU path there
+(loudly, through the loader's all-or-nothing registration check). A registered
+weight with no kernel would be a silent wrong path, which is exactly what that
+check exists to prevent; the Metal f16 matmul/embed kernels are
+[#162](https://github.com/yusiwen/minfer/issues/162).
 
 **CUDA notes**: prefill (`nt ≥ 16`) runs the default int8 tensor-core MMQ path
 for the common quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K via the f16-wmma GEMM,
