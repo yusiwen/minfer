@@ -261,62 +261,18 @@ fn load_tensor(
     #[cfg(feature = "cuda")]
     if on_device {
         if let Some(cuda) = crate::cuda::CudaState::get() {
-            if matches!(
+            // #167: one shared rule for both architectures — see `models::weight_reg`
+            // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
+            // f16 arm (#141) live there instead of in a per-loader copy. The failure
+            // mode this closes is real: the two copies had already drifted twice.
+            crate::models::weight_reg::register_cuda_weight(
+                cuda,
+                &reg_name,
                 ttype,
-                TensorType::Q4_0
-                    | TensorType::Q4_1
-                    | TensorType::Q4_K
-                    | TensorType::Q5_0
-                    | TensorType::Q5_1
-                    | TensorType::Q6_K
-                    | TensorType::Q8_0
-            ) {
-                if ttype != TensorType::Q4_K && ttype != TensorType::Q6_K {
-                    // r60: non-NB-BT-consumable quantized weight — mode-2
-                    // skip-write producers unsound (see qwen2 loader twin).
-                    // Global flag, global mix: any registered weight counts,
-                    // namespaced or not.
-                    cuda.clear_mmq_nb_bt_only();
-                }
-                if ttype == TensorType::Q6_K {
-                    // 7e②: register Q6_K in the padded 224-byte block layout so
-                    // the matmul kernel can use aligned uint4 weight loads
-                    // (the raw 210-byte stride forces 1-byte-per-instruction
-                    // reads and caps 7B decode near ~38 GB/s).
-                    // NOTE: under the NAMESPACED draft load the registry key
-                    // must be the namespaced reg_name, not the raw GGUF tensor
-                    // name - `ti.name` here silently REPLACED the target's
-                    // registry entry for the same tensor name (e.g.
-                    // 'token_embd.weight'), which failed the target's
-                    // has_weight_of_size at the next build_graph and dropped
-                    // BOTH graphs to CPU (doc 102).
-                    cuda.register_weight_q6k_padded(
-                        &reg_name,
-                        tensor.data(),
-                        tensor.shape[1] as usize,
-                        tensor.shape[0] as usize,
-                    );
-                } else {
-                    cuda.register_weight(&reg_name, tensor.data());
-                    // doc 104: q8_0 also registers the p32 split planes for the
-                    // decode MMVQ (raw registration stays; method self-gates).
-                    if ttype == TensorType::Q8_0 {
-                        cuda.register_weight_q80_p32(
-                            &reg_name,
-                            tensor.data(),
-                            tensor.shape[1] as usize,
-                            tensor.shape[0] as usize,
-                        );
-                    }
-                }
-            } else if ttype == TensorType::F32 {
-                cuda.register_weight(&reg_name, tensor.data());
-                // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
-                // are 1-D) — mode-2 skip-write producers unsound upstream.
-                if tensor.shape.len() == 2 {
-                    cuda.clear_mmq_nb_bt_only();
-                }
-            }
+                tensor.data(),
+                &tensor.shape,
+                crate::gguf_write::ggml_n_dims(&ti.ne) as usize,
+            );
             device_bytes.set(device_bytes.get() + tensor.data().len());
         }
     }
