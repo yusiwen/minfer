@@ -30,6 +30,32 @@ initialized — and they build in every configuration (CPU, Metal, CUDA). The
 writer/encoders and their verification references are documented in
 [`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
 
+## Tests
+
+```bash
+cargo test --release                         # unit + integration, no model files needed
+scripts/real_model_gates.sh                  # the #[ignore]d real-model gate set, serial
+PARALLEL=1 scripts/real_model_gates.sh       # CPU-only parallel form (see the count below)
+FEATURES=cuda scripts/real_model_gates.sh    # device gate set (serial, one GPU)
+scripts/cuda_test.sh                         # the whole CUDA suite on a real GPU, serial
+```
+
+The `#[ignore]`d set needs the cached real models (the 0.5B for the default
+configuration, `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` for the f16-KV one)
+and writes temporary session files. `scripts/real_model_gates.sh` is the
+documented entry point: it defaults to `--test-threads=1`, which a **device**
+build requires (the CUDA state is a process-wide singleton, issue
+[#64](https://github.com/yusiwen/minfer/issues/64)), and accepts `PARALLEL=1`
+for the CPU-only parallel form. Since the KV storage format became **per engine**
+([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
+longer makes one gate size another gate's KV regions — measured 2026-09-25 on a
+CPU build: **28 / 0** serial and **27 / 1** parallel, where the one parallel
+failure is the unrelated, load-sensitive wall-clock assertion in
+`server_batch_matches_serial_and_is_faster`
+([#154](https://github.com/yusiwen/minfer/issues/154)); before #99 the parallel
+run was 19 / 9, every failure a KV-region width mismatch. The serial form stays
+the documented one, and on a CUDA build it is the only honest one.
+
 ## Git hooks (git-hooks.nix)
 
 The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git-hooks.nix)
