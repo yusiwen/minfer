@@ -264,6 +264,20 @@ impl GraphAllocator {
         &mut self.cpu
     }
 
+    /// C4 per-engine (issue #99): tell this allocator's **CPU** kernels which KV
+    /// format the engine they serve resolved. The model's graph stamps the same
+    /// format into every KV node's `KvcacheMeta::row_elems`, so the store/attention
+    /// dispatch and the region width cannot disagree within one engine.
+    ///
+    /// Honest scope: only the CPU half is per-engine. The CUDA and Metal device
+    /// layers still hold a process-wide layout tag (`cuda::KV_LAYOUT`,
+    /// `metal::kv_cache_is_f16`) that their kernels read, so a device run keeps the
+    /// documented serial discipline; making the device layout per-graph is filed as
+    /// its own follow-up.
+    pub fn set_kv_format(&mut self, format: KvFormat) {
+        self.cpu.set_kv_format(format);
+    }
+
     /// Mutable Metal backend (None until enabled / MPS unavailable).
     #[cfg(target_os = "macos")]
     pub fn metal_mut(&mut self) -> Option<&mut super::metal_backend::MetalBackend> {
@@ -2116,6 +2130,8 @@ impl GraphAllocator {
     ///
     /// F4: the answer is the registry entry's `kv_format` hook. A backend this
     /// build does not contain answers F32, as the pre-F4 `#[cfg]` arms did.
+    /// Per-engine (issue #99): the CPU hook is this allocator's own stamped format;
+    /// the device hooks still read the process-wide device layout.
     fn kv_element_format(&self, backend: Backend) -> KvFormat {
         match backend.entry() {
             Some(entry) => (entry.kv_format)(self),
@@ -3219,7 +3235,7 @@ mod tests {
         let mut fresh = GraphAllocator::new();
         fresh
             .cpu_mut()
-            .set_kv_format_for_test(super::super::kvformat::KvFormat::Q8_0);
+            .set_kv_format(super::super::kvformat::KvFormat::Q8_0);
         let err = fresh.kv_load(&path, &expect).unwrap_err();
         assert!(err.contains("element type"), "{err}");
         assert!(fresh.kv_n_used(0).is_none());
@@ -3252,7 +3268,7 @@ mod tests {
         let vv: Vec<f32> = (0..ROW * 2).map(|i| 1.0 / (i as f32 + 1.0)).collect();
 
         let build = |alloc: &mut GraphAllocator| -> ComputeGraph {
-            alloc.cpu_mut().set_kv_format_for_test(KvFormat::F16);
+            alloc.cpu_mut().set_kv_format(KvFormat::F16);
             let mut b = GraphBuilder::new();
             b.set_kv_format(KvFormat::F16);
             let pos = b.input("positions", [2, 1, 1, 1], crate::graph::DType::I32);
@@ -3303,7 +3319,7 @@ mod tests {
         // An f32 reader refuses it by element type — not silently, and without
         // creating an arena.
         let mut c = GraphAllocator::new();
-        c.cpu_mut().set_kv_format_for_test(KvFormat::F32);
+        c.cpu_mut().set_kv_format(KvFormat::F32);
         let err = c.kv_load(&path, &expect).unwrap_err();
         assert!(err.contains("element type"), "{err}");
         assert!(err.contains("f16"), "{err}");

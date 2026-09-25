@@ -34,11 +34,12 @@ pub struct GraphBuilder {
     /// difference: a backend that cannot gather a map validates the input's size
     /// and refuses the node (CPU can; CUDA is C8b S4; Metal is G5).
     kv_map: bool,
-    /// C4: the storage format of this graph's persistent KV regions. Read from the
-    /// process-wide policy (`kvformat::kv_format`, set once at model load) at
-    /// construction; it is what decides a region's *cell width*
-    /// (`KvcacheMeta::row_elems`), so a graph built under one format and executed
-    /// against an allocator that sized the other refuses loudly in `ensure_kv`.
+    /// C4 per-engine (issue #99): the storage format of this graph's persistent KV
+    /// regions. It is a **parameter** (`params.cparams.kv_format`), not a process
+    /// global: it decides a region's *cell width* (`KvcacheMeta::row_elems`), so a
+    /// graph built for one format and executed against an allocator that sized the
+    /// other refuses loudly in `ensure_kv`. The default is `F32`; the model builders
+    /// stamp the loaded engine's resolved format with [`Self::set_kv_format`].
     kv_format: KvFormat,
     /// E5: the transformer block the nodes being created belong to. The model
     /// builders set it once per block (`set_layer(Some(il))`) and clear it after
@@ -56,9 +57,8 @@ impl GraphBuilder {
             cells: None,
             explicit_span: false,
             kv_map: false,
-            // C4: the per-load policy. Tests that need a packed region set the
-            // process-wide format (or use `set_kv_format`) before building.
-            kv_format: super::kvformat::kv_format(),
+            // C4 per-engine: F32 until the model builder stamps its own format.
+            kv_format: KvFormat::F32,
             cur_layer: None,
         }
     }
@@ -78,11 +78,10 @@ impl GraphBuilder {
         self.kv_map = on;
     }
 
-    /// C4: build this graph's KV nodes for a storage format other than the
-    /// process-wide one. Production callers do **not** call this — the format comes
-    /// from `kvformat::kv_format()`, which `load_model_ns` sets once from
-    /// `MINFER_CACHE_TYPE` — but a test that wants a packed region must be able to
-    /// ask for one without mutating a process global every other test reads.
+    /// C4 per-engine (issue #99): build this graph's KV nodes for `format`. The
+    /// model builders call it once, from `params.cparams.kv_format` — the loaded
+    /// engine's resolved policy. A test that wants a packed region asks for one here
+    /// instead of mutating process state every other test reads.
     pub fn set_kv_format(&mut self, format: KvFormat) {
         self.kv_format = format;
     }

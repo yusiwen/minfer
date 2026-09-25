@@ -46,7 +46,9 @@ impl CpuBackend {
             buffers: Vec::new(),
             free: Vec::new(),
             weights: HashMap::new(),
-            kv_format: super::kvformat::kv_format(),
+            // C4 per-engine: F32 until `GraphAllocator::set_kv_format` stamps the
+            // loaded engine's resolved format (issue #99 — no process global).
+            kv_format: KvFormat::F32,
             kv_scratch_k: Vec::new(),
             kv_scratch_v: Vec::new(),
             kv_pack_buf: Vec::new(),
@@ -54,14 +56,20 @@ impl CpuBackend {
         }
     }
 
-    /// C4: the KV format this backend was built with (`MINFER_CACHE_TYPE` policy).
+    /// C4: the KV format this backend's kernels speak — the loaded engine's
+    /// `ModelDef::kv_format`, stamped through `GraphAllocator::set_kv_format`. A
+    /// packed region makes the store quantize and the attention read dequantize.
     pub fn kv_format(&self) -> KvFormat {
         self.kv_format
     }
 
-    /// Device tests exercise one layout explicitly instead of through the process
-    /// environment (`cuda_backend` does the same with `set_kv_f16_for_test`).
-    pub fn set_kv_format_for_test(&mut self, format: KvFormat) {
+    /// C4 per-engine: set the KV format this backend's kernels speak. The
+    /// allocator calls it once per forward with the model's resolved format, so two
+    /// engines with different formats no longer share a process-wide answer
+    /// (issue #99). Device tests exercise one layout explicitly instead of through
+    /// the process environment (`cuda_backend` does the same with
+    /// `set_kv_f16_for_test`).
+    pub fn set_kv_format(&mut self, format: KvFormat) {
         self.kv_format = format;
     }
 
@@ -235,8 +243,9 @@ pub fn entry() -> super::registry::BackendEntry {
         // documented no-op. See `copy_cross` / `await_cross` above.
         copy_cross,
         await_cross,
-        // The CPU pool snapshots the process-wide `MINFER_CACHE_TYPE` policy at
-        // construction; that snapshot is the live answer.
+        // Per-engine (issue #99): the allocator stamps the loaded engine's KV
+        // format onto this pool; that stamped value is the live answer, so a
+        // session header and the kernels cannot disagree.
         kv_format: |a| a.cpu().kv_format(),
         enable: |_| true,
         unavailable: || None,
@@ -1804,7 +1813,7 @@ mod tests {
             let mut h = Harness::new();
             // Both halves of the decision, without touching the process-wide policy:
             // the builder stamps the cell width, the backend reads it.
-            h.alloc.cpu_mut().set_kv_format_for_test(format);
+            h.alloc.cpu_mut().set_kv_format(format);
             let mut gb = GraphBuilder::new();
             gb.set_kv_format(format);
             let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
@@ -1987,7 +1996,7 @@ mod tests {
             .collect();
 
         let mut h = Harness::new();
-        h.alloc.cpu_mut().set_kv_format_for_test(KvFormat::Q8_0);
+        h.alloc.cpu_mut().set_kv_format(KvFormat::Q8_0);
         let mut gb = GraphBuilder::new();
         gb.set_kv_format(KvFormat::Q8_0);
         let pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
@@ -2104,7 +2113,7 @@ mod tests {
     fn a_packed_region_refuses_a_width_q8_0_cannot_express() {
         use super::super::kvformat::KvFormat;
         let mut h = Harness::new();
-        h.alloc.cpu_mut().set_kv_format_for_test(KvFormat::Q8_0);
+        h.alloc.cpu_mut().set_kv_format(KvFormat::Q8_0);
         let mut gb = GraphBuilder::new();
         gb.set_kv_format(KvFormat::Q8_0);
         let pos = gb.input("positions", [1, 1, 1, 1], DType::I32);

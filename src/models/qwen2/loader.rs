@@ -674,6 +674,9 @@ pub fn load(
             device_bytes: device_bytes.get(),
             source: offload_source,
         },
+        // C4 per-engine: the loader stamps the resolved format after `device()` is
+        // known (`models::load_model_configured`); F32 until then.
+        kv_format: crate::graph::kvformat::KvFormat::F32,
     };
 
     // E5: verify the plan against what actually got registered. `device()` answers "can the

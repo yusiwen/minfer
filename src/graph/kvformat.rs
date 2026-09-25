@@ -27,9 +27,16 @@
 //! `MINFER_CACHE_TYPE` value is refused on every device (CUDA used to map anything that
 //! was not `f16` to f32), and a format the device has no kernel for is refused at load.
 //!
-//! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C4).
-
-use std::sync::atomic::{AtomicU8, Ordering};
+//! **The format is per engine, not a process global (issue #99).** `models::load_model`
+//! resolves `MINFER_CACHE_TYPE` once, against the device the loaded model will actually
+//! use, and stores the answer on the model; `CParams::kv_format` carries it into the
+//! graph builder (which stamps each KV node's width) and into the allocator (whose CPU
+//! backend speaks it). There is deliberately **no** `kvformat::set_kv_format` /
+//! `kv_format` global any more: when there was one, the C4 packed-cache gate flipped it
+//! for its measurement runs and every other test building a graph in the same process
+//! sized its regions for the wrong format — the parallel-red gate set this ticket fixed.
+//!
+//! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C4) and its #99 record.
 
 use crate::models::Device;
 
@@ -54,15 +61,6 @@ pub enum KvFormat {
 }
 
 impl KvFormat {
-    /// Decode the atomic's value (see [`kv_format`]).
-    pub fn from_code(code: u8) -> KvFormat {
-        match code {
-            1 => KvFormat::F16,
-            2 => KvFormat::Q8_0,
-            _ => KvFormat::F32,
-        }
-    }
-
     /// The `MINFER_CACHE_TYPE` spelling.
     pub fn name(self) -> &'static str {
         match self {
@@ -185,22 +183,11 @@ pub fn resolve(device: Device, cache_type: Option<&str>) -> Result<KvFormat, Str
     Ok(format)
 }
 
-/// The process-wide format the graph builder and the CPU backend read.
-///
-/// Like `cuda::kv_cache_is_f16`, this is a **per-load policy**: a process that loads a
-/// second model must be able to change it, so it deliberately overwrites.
-static KV_FORMAT: AtomicU8 = AtomicU8::new(KvFormat::F32 as u8);
-
-/// Set the process-wide KV format (called once per model load, before the first
-/// forward — see `models::qwen2::loader`).
-pub fn set_kv_format(format: KvFormat) {
-    KV_FORMAT.store(format as u8, Ordering::Relaxed);
-}
-
-/// The process-wide KV format (F32 until a load decides otherwise).
-pub fn kv_format() -> KvFormat {
-    KvFormat::from_code(KV_FORMAT.load(Ordering::Relaxed))
-}
+// The process-wide `KV_FORMAT` static, `set_kv_format` and `kv_format` used to live
+// here. They were removed by the #99 per-engine change: the loaded model now owns its
+// format (`ModelDef::kv_format`), `CParams::kv_format` carries it into the builder,
+// and `GraphAllocator::set_kv_format` gives the CPU kernels the same answer. A process
+// global let one test's packed measurement size another test's regions.
 
 // ---- packed-row accessors --------------------------------------------------
 //
@@ -440,15 +427,6 @@ mod tests {
             assert!(err.contains("not a KV cache type"), "{err}");
         }
         assert!(resolve(Device::Cpu, Some("Q8_0")).is_err(), "case matters");
-    }
-
-    #[test]
-    fn the_process_wide_format_can_be_redecided() {
-        let before = kv_format();
-        set_kv_format(KvFormat::Q8_0);
-        assert_eq!(kv_format(), KvFormat::Q8_0);
-        set_kv_format(before);
-        assert_eq!(kv_format(), before);
     }
 
     #[test]

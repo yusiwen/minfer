@@ -12,19 +12,23 @@
 use super::ops::{NodeMeta, Op};
 use super::{Backend, ComputeGraph, DType};
 use crate::graph::alloc::GraphAllocator;
+use crate::graph::kvformat::KvFormat;
 use crate::graph::params::{CParams, GraphParams, GraphType};
 use crate::graph::scheduler::BackendScheduler;
 use crate::models::ModelDef;
 use serde_json::{json, Value};
 
 /// The GraphParams the runtime uses for a forward with `n_tokens` (mirrors the
-/// model cache's construction; `gpu`/`fuse_qkv` follow the env toggles).
+/// model cache's construction; `gpu`/`fuse_qkv` follow the env toggles, and
+/// `kv_format` is the engine's own resolved format — the exporter's graph must
+/// size its KV nodes exactly like the executed one, C4 per-engine #99).
 pub fn runtime_gparams(
     n_tokens: usize,
     n_ctx: usize,
     gpu: bool,
     fuse_qkv: bool,
     fuse_ffn: bool,
+    kv_format: KvFormat,
 ) -> GraphParams {
     GraphParams {
         n_tokens,
@@ -45,6 +49,7 @@ pub fn runtime_gparams(
             // E5: the JSON exporter describes a graph, not a placement policy; the
             // assignment it already carries in each node is the answer.
             gpu_layers: usize::MAX,
+            kv_format,
         },
         weights_version: 1,
     }
@@ -120,7 +125,7 @@ pub fn export_graph_json(
     fuse_qkv: bool,
     fuse_ffn: bool,
 ) -> Value {
-    let gparams = runtime_gparams(n_tokens, n_ctx, gpu, fuse_qkv, fuse_ffn);
+    let gparams = runtime_gparams(n_tokens, n_ctx, gpu, fuse_qkv, fuse_ffn, model.kv_format());
     let g = build_runtime_graph(model, &gparams);
     let kind = if n_tokens == 1 { "decode" } else { "prefill" };
     g.export_json(model_name, kind)

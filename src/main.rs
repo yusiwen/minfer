@@ -1344,6 +1344,7 @@ fn main() {
                 },
                 &tokenizer,
                 model.n_vocab(),
+                model.kv_format(),
             ) {
                 Ok(e) => Some(e),
                 Err(e) => {
@@ -1382,6 +1383,7 @@ fn main() {
             },
             &tokenizer,
             model.n_vocab(),
+            model.kv_format(),
         ) {
             Ok(e) => Some(e),
             Err(e) => {
@@ -1518,8 +1520,14 @@ fn main() {
         if let Some(path) = &dump_graph {
             // DOT export needs the graph itself (fused, assigned — same as the
             // runtime), so rebuild it via the shared helper.
-            let gparams =
-                runtime_gparams(input_ids.len(), params.n_ctx, metal_on, fuse_qkv, fuse_ffn);
+            let gparams = runtime_gparams(
+                input_ids.len(),
+                params.n_ctx,
+                metal_on,
+                fuse_qkv,
+                fuse_ffn,
+                model.kv_format(),
+            );
             let g = crate::graph::json::build_runtime_graph(&*model, &gparams);
             let mut f = std::fs::File::create(path).expect("create dot file");
             g.dump_dot(&mut f).expect("write dot");

@@ -222,9 +222,10 @@ pub struct BackendEntry {
     /// [#58]: https://github.com/yusiwen/minfer/issues/58
     pub await_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<(), String>,
     /// The KV element type this backend's regions store (C5 records it in the
-    /// session header). Takes the allocator because a backend's answer can be a
-    /// per-pool snapshot (the CPU pool captures `MINFER_CACHE_TYPE` at
-    /// construction).
+    /// session header). Takes the allocator because the answer belongs to the
+    /// engine it serves: per-engine (#99) the CPU hook is the allocator's stamped
+    /// `GraphAllocator::set_kv_format`; the CUDA and Metal hooks still read the
+    /// process-wide device layout.
     pub kv_format: fn(&GraphAllocator) -> KvFormat,
     /// Bring the pool up if this build/machine can (idempotent); `false` means
     /// it cannot.

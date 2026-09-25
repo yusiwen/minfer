@@ -62,6 +62,10 @@ impl Qwen2Graph {
         // C8b S2: the same flag the caller set for this device — a sharing
         // sequence's window is a list of cell runs, not one range.
         b.set_kv_map(params.cparams.kv_map);
+        // C4 per-engine (issue #99): the storage format of this graph's KV regions
+        // is a parameter of the build, not a process global — it decides each KV
+        // node's cell width, so it is part of the reuse identity (`CParams`).
+        b.set_kv_format(params.cparams.kv_format);
 
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
@@ -573,9 +577,19 @@ impl Qwen2Graph {
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)
                     && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
+                // C4 per-engine (issue #99): this engine's resolved KV format. It
+                // sizes every KV node's cell and is part of the reuse identity, so a
+                // cached graph built for one format is never reused for another.
+                kv_format: model.kv_format,
             },
             weights_version: 1,
         };
+
+        // C4 per-engine (issue #99): hand this engine's resolved format to the
+        // allocator's CPU kernels. The graph nodes above already carry the same
+        // format, so the region width and the store/attention dispatch cannot
+        // disagree — and no other engine in the process can change either.
+        cache.alloc().set_kv_format(model.kv_format);
 
         if !cache
             .try_reuse(&params)
@@ -1015,27 +1029,37 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// Restores the process-wide KV format when it drops.
+    /// Panic-safe restore of the **device** KV layout when it drops.
     ///
-    /// The C4 packed gate flips the format for its measurement runs. Its normal
-    /// path restores `f32` itself, but a panic in between (the #87 refusal is the
-    /// one that bit) does not reach that line, and the **next** test in the serial
-    /// `#[ignore]`d set then sizes its KV region for `q8_0` and is refused too —
-    /// the collateral #122 recorded, the mechanism of #99. A `Drop` guard makes the
-    /// restoration panic-safe without touching the format's ownership (per-engine
-    /// format is #99 and explicitly out of scope here).
-    struct KvFormatGuard(crate::graph::kvformat::KvFormat);
+    /// #99 made the format per engine, so the `KvFormatGuard` this test used to carry
+    /// (and the process-wide `kvformat` global it restored) is gone: this gate loads
+    /// one engine per format and mutates no shared KV state. The *device* layout is
+    /// the one process-wide policy the increment deliberately left in place — the CUDA
+    /// kernels read `cuda::KV_LAYOUT` — so this guard restores it if an assertion
+    /// panics between arms, keeping a serial device run clean. It is a no-op on a
+    /// build with no CUDA.
+    struct DeviceLayoutGuard(Option<i32>);
 
-    impl KvFormatGuard {
-        /// Snapshot the format in effect *before* the gate flips it.
+    impl DeviceLayoutGuard {
         fn new() -> Self {
-            Self(crate::graph::kvformat::kv_format())
+            #[cfg(feature = "cuda")]
+            {
+                Self(Some(crate::cuda::kv_cache_layout()))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Self(None)
+            }
         }
     }
 
-    impl Drop for KvFormatGuard {
+    impl Drop for DeviceLayoutGuard {
         fn drop(&mut self) {
-            crate::graph::kvformat::set_kv_format(self.0);
+            #[cfg(feature = "cuda")]
+            if let Some(layout) = self.0 {
+                crate::cuda::set_kv_cache_layout(layout);
+            }
+            let _ = self.0;
         }
     }
 
@@ -1063,14 +1087,19 @@ mod tests {
     /// `a_packed_physical_shift_moves_v_verbatim_and_requantizes_k` does the same for
     /// the shift's two halves (V verbatim, K the quantizate of the re-roped row).
     ///
-    /// Ignored because the format is a process-wide policy and this test flips it;
-    /// run it alone. It is **device-aware**: the packed q8_0 read has a CPU
-    /// attention kernel only, so on a CUDA/Metal box `ensure_kv` refuses a packed
-    /// region on the device by design (issue #87). The load below therefore asks
-    /// for `--gpu-layers 0` — the model, and every measurement run, is CPU-only on
-    /// every build — instead of the gate being skipped on a GPU box, which would
-    /// delete its coverage exactly where the documented CUDA command needs it.
-    /// `MINFER_C4_MODEL` points it at another cached model:
+    /// **Per-engine since #99.** This gate used to flip the process-wide KV format
+    /// for its measurement runs, which sized every other test's KV regions for the
+    /// wrong format when the harness ran the ignored set in parallel. It now loads
+    /// **two engines per arm** — one resolved for `f32`, one for `q8_0` — and flips
+    /// nothing, so the same gate is the proof that two formats coexist in one
+    /// process. The device arm still sets the one process-wide policy #99 left in
+    /// place (the CUDA `KV_LAYOUT` tag its kernels read) before each run.
+    ///
+    /// Ignored because it needs the cached 0.5B model; it is **device-aware**: the
+    /// CPU arm asks for `--gpu-layers 0` (coverage on every build), and on a CUDA
+    /// build a second arm asserts `device() == Cuda` so a silent CPU fallback fails
+    /// loudly instead of reporting a CPU number as a device one. `MINFER_C4_MODEL`
+    /// points it at another cached model:
     ///
     /// ```text
     /// cargo test --release a_packed_kv_cache_answers_like_the_f32_one -- --ignored --test-threads=1
@@ -1078,10 +1107,10 @@ mod tests {
     ///   cargo test --release a_packed_kv_cache_answers_like_the_f32_one -- --ignored --test-threads=1
     /// ```
     #[test]
-    #[ignore = "requires the cached 0.5B model and sets the process-wide KV format"]
+    #[ignore = "requires the cached 0.5B model"]
     fn a_packed_kv_cache_answers_like_the_f32_one() {
         use crate::graph::cache::GraphCache;
-        use crate::graph::kvformat::{set_kv_format, KvFormat};
+        use crate::graph::kvformat::KvFormat;
         use crate::graph::offload::OffloadRequest;
         use crate::models::{Device, ModelDef};
 
@@ -1093,26 +1122,29 @@ mod tests {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        // The format is process-wide and this gate flips it; restore it even if an
-        // assertion panics, so the *next* test in the serial `#[ignore]`d set does
-        // not size its KV region for `q8_0` (the collateral #122 recorded, whose
-        // mechanism is #99).
-        let _format = KvFormatGuard::new();
+        // The device layout is the one process-wide policy left (#99 kept it: the
+        // CUDA kernels read it). Restore it if an assertion panics between arms, so
+        // a following device test does not inherit `q8_0`. The per-engine format
+        // needs no guard: it lives on the engines loaded below.
+        let _layout = DeviceLayoutGuard::new();
 
-        // C4 S2b: a KV layout is **two** policies. The builder's `kv_format` sizes
+        // C4 S2b: a KV layout is **two** policies. The engine's `kv_format` sizes
         // the region (packed or f32-shaped) and `cuda::kv_cache_layout` picks the
         // kernel that reads it; a run that sets only the first asks an f16/f32
-        // kernel to address a packed region. The loader sets both from
-        // `MINFER_CACHE_TYPE` (`cuda::set_kv_cache_type`), and this gate does the
-        // same, so an arm's measurement is always the layout it named.
-        let set_layout = |format: KvFormat| {
-            set_kv_format(format);
+        // kernel to address a packed region. The loader resolves both from the
+        // cache type it is given, and this closure restates the device half so an
+        // arm's measurement is always the layout it named.
+        let set_device_layout = |format: KvFormat| {
             #[cfg(feature = "cuda")]
             crate::cuda::set_kv_cache_layout(match format {
                 KvFormat::Q8_0 => crate::cuda::KV_LAYOUT_Q8_0,
                 KvFormat::F16 => crate::cuda::KV_LAYOUT_F16,
                 KvFormat::F32 => crate::cuda::KV_LAYOUT_F32,
             });
+            // A CPU-only build has no device layout to set: the format travels on
+            // the engine, so there is deliberately nothing to mutate here.
+            #[cfg(not(feature = "cuda"))]
+            let _ = format;
         };
 
         // The arms. Before C4 S2b this gate had to ask for `Layers(0)` because the
@@ -1123,18 +1155,27 @@ mod tests {
         // measured**, so a silent fallback (the loader drops to CPU when the
         // offloaded weights do not register) fails loudly instead of reporting a
         // CPU number as a device one.
-        let mut arms: Vec<(&str, Box<dyn ModelDef>)> = Vec::new();
+        //
+        // Per-engine (#99): each arm carries an f32 engine and a q8_0 engine, loaded
+        // through the explicit cache-type entry point `load_model_configured` — no
+        // environment mutation, no process global. The two engines share neither a
+        // model nor a `GraphCache`, exactly like the old two `run()` calls did.
+        let load = |ns: &str, cache_type: &str, offload: OffloadRequest| -> Box<dyn ModelDef> {
+            crate::models::load_model_configured(&gguf, ns, offload, Some(cache_type))
+                .expect("load a C4 gate engine")
+        };
+        let mut arms: Vec<(&str, Box<dyn ModelDef>, Box<dyn ModelDef>)> = Vec::new();
         arms.push((
             "cpu",
-            crate::models::load_model_with(&gguf, "cpu.", OffloadRequest::Layers(0))
-                .expect("load the C4 gate's model CPU-only"),
+            load("cpu.f32.", "f32", OffloadRequest::Layers(0)),
+            load("cpu.q8.", "q8_0", OffloadRequest::Layers(0)),
         ));
         #[cfg(feature = "cuda")]
         if crate::cuda::CudaState::get().is_some() {
             arms.push((
                 "cuda",
-                crate::models::load_model_with(&gguf, "cuda.", OffloadRequest::Default)
-                    .expect("load the C4 gate's model on the device"),
+                load("cuda.f32.", "f32", OffloadRequest::Default),
+                load("cuda.q8.", "q8_0", OffloadRequest::Default),
             ));
         }
 
@@ -1144,47 +1185,59 @@ mod tests {
         let ids = tok.encode("The capital of France is");
         let n = ids.len();
 
-        for (label, model) in &arms {
-            let device = model.device();
-            if *label == "cpu" {
+        for (label, ref_model, q8_model) in &arms {
+            let models: [(&str, &Box<dyn ModelDef>, KvFormat); 2] = [
+                ("f32", ref_model, KvFormat::F32),
+                ("q8_0", q8_model, KvFormat::Q8_0),
+            ];
+            for (fmt_label, model, format) in models {
+                // Self-check: the engine carries the format this run names, so a
+                // loader that silently resolved the other one fails here instead of
+                // reporting a number from the wrong graph.
                 assert_eq!(
-                    device,
-                    Device::Cpu,
-                    "the CPU arm must run on the CPU backend"
+                    model.kv_format(),
+                    format,
+                    "[{label}] the {fmt_label} engine must resolve MINFER_CACHE_TYPE={fmt_label}"
                 );
-            } else {
-                assert_eq!(
-                    device,
-                    Device::Cuda,
-                    "the device arm must actually run on the device — a silent CPU fallback \
-                     would leave the packed CUDA kernels untested by the very gate that \
-                     exists to exercise them"
-                );
+                let device = model.device();
+                if *label == "cpu" {
+                    assert_eq!(
+                        device,
+                        Device::Cpu,
+                        "the CPU arm must run on the CPU backend"
+                    );
+                } else {
+                    assert_eq!(
+                        device,
+                        Device::Cuda,
+                        "the device arm must actually run on the device — a silent CPU fallback \
+                         would leave the packed CUDA kernels untested by the very gate that \
+                         exists to exercise them"
+                    );
+                }
             }
 
-            let run = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-                set_layout(format);
-                let mut cache = GraphCache::new();
-                cache.alloc().kv_set_capacity(n_ctx);
-                let positions: Vec<usize> = (0..n).collect();
-                let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
-                let mut logits = vec![l.clone()];
-                let mut next = argmax(&l);
-                let mut toks = vec![next];
-                for s in 0..steps {
-                    l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
-                    logits.push(l.clone());
-                    next = argmax(&l);
-                    toks.push(next);
-                }
-                (logits, toks, cache.alloc().kv_region_bytes())
-            };
+            let run =
+                |model: &dyn ModelDef, format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                    set_device_layout(format);
+                    let mut cache = GraphCache::new();
+                    cache.alloc().kv_set_capacity(n_ctx);
+                    let positions: Vec<usize> = (0..n).collect();
+                    let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+                    let mut logits = vec![l.clone()];
+                    let mut next = argmax(&l);
+                    let mut toks = vec![next];
+                    for s in 0..steps {
+                        l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                        logits.push(l.clone());
+                        next = argmax(&l);
+                        toks.push(next);
+                    }
+                    (logits, toks, cache.alloc().kv_region_bytes())
+                };
 
-            let (l_ref, t_ref, b_ref) = run(KvFormat::F32);
-            let (l_q8, t_q8, b_q8) = run(KvFormat::Q8_0);
-            // Restore the reference format between arms; `_format` is the
-            // panic-safe backstop.
-            set_layout(KvFormat::F32);
+            let (l_ref, t_ref, b_ref) = run(ref_model.as_ref(), KvFormat::F32);
+            let (l_q8, t_q8, b_q8) = run(q8_model.as_ref(), KvFormat::Q8_0);
             let ratio = b_ref as f64 / b_q8 as f64;
             let worst = l_ref
                 .iter()
@@ -1270,41 +1323,43 @@ mod tests {
                 shift_n > drop + steps,
                 "the shifted fixture must keep a context"
             );
-            let run_shifted = |format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-                set_layout(format);
-                let mut cache = GraphCache::new();
-                cache.alloc().kv_set_capacity(n_ctx);
-                let positions: Vec<usize> = (0..shift_n).collect();
-                let mut l =
-                    model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
-                let (freq_base, freq_scale) = model.rope_params();
-                let rope = crate::graph::kvcache::KvRope {
-                    freq_base,
-                    freq_scale,
-                    n_head_kv: model.n_head_kv(),
-                    hd: model.n_embd_head(),
-                    style: model.rope_style(),
+            let run_shifted =
+                |model: &dyn ModelDef, format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                    set_device_layout(format);
+                    let mut cache = GraphCache::new();
+                    cache.alloc().kv_set_capacity(n_ctx);
+                    let positions: Vec<usize> = (0..shift_n).collect();
+                    let mut l =
+                        model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
+                    let (freq_base, freq_scale) = model.rope_params();
+                    let rope = crate::graph::kvcache::KvRope {
+                        freq_base,
+                        freq_scale,
+                        n_head_kv: model.n_head_kv(),
+                        hd: model.n_embd_head(),
+                        style: model.rope_style(),
+                    };
+                    let left = cache
+                        .alloc()
+                        .kv_rm(0, drop, &rope)
+                        .expect("packed-aware physical shift");
+                    // The survivors now address positions 0..left, so the next token continues
+                    // at `left` — the shift's whole point.
+                    let mut next = argmax(&l);
+                    let mut toks = Vec::new();
+                    let mut logs = Vec::new();
+                    for s in 0..steps {
+                        l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
+                        logs.push(l.clone());
+                        next = argmax(&l);
+                        toks.push(next);
+                    }
+                    (logs, toks, left)
                 };
-                let left = cache
-                    .alloc()
-                    .kv_rm(0, drop, &rope)
-                    .expect("packed-aware physical shift");
-                // The survivors now address positions 0..left, so the next token continues
-                // at `left` — the shift's whole point.
-                let mut next = argmax(&l);
-                let mut toks = Vec::new();
-                let mut logs = Vec::new();
-                for s in 0..steps {
-                    l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
-                    logs.push(l.clone());
-                    next = argmax(&l);
-                    toks.push(next);
-                }
-                (logs, toks, left)
-            };
-            let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(KvFormat::F32);
-            let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(KvFormat::Q8_0);
-            set_layout(KvFormat::F32);
+            let (logs_shift_f32, t_shift_ref, left_ref) =
+                run_shifted(ref_model.as_ref(), KvFormat::F32);
+            let (logs_shift_q8, t_shift_q8, left_q8) =
+                run_shifted(q8_model.as_ref(), KvFormat::Q8_0);
             assert_eq!(
                 left_ref, left_q8,
                 "[{label}] the same shift must leave the same rows"
@@ -1418,11 +1473,11 @@ mod tests {
         // passing vacuously on an f32 fallback.
         eprintln!(
             "[c5] live KV format: {} — the container records it (f16 is not encodable yet, #130)",
-            crate::graph::kvformat::kv_format().name()
+            model.kv_format().name()
         );
         if std::env::var("MINFER_CACHE_TYPE").as_deref() == Ok("q8_0") {
             assert_eq!(
-                crate::graph::kvformat::kv_format(),
+                model.kv_format(),
                 crate::graph::kvformat::KvFormat::Q8_0,
                 "MINFER_CACHE_TYPE=q8_0 must resolve to a packed KV session"
             );
@@ -2574,6 +2629,7 @@ mod tests {
                     kv_map: false,
                     gpu: false,
                     gpu_layers: usize::MAX, // E5: no offload limit in this fixture
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -3449,6 +3505,7 @@ mod tests {
                     kv_map: false,
                     gpu: false,
                     gpu_layers: usize::MAX, // E5: no offload limit in this fixture
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -3501,6 +3558,7 @@ mod tests {
                     kv_map: false,
                     gpu: false,
                     gpu_layers: usize::MAX, // E5: no offload limit in this fixture
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -4115,6 +4173,7 @@ mod tail_tests {
                     kv_map: false,
                     gpu: false,
                     gpu_layers: usize::MAX, // E5: no offload limit in this fixture
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
@@ -4297,6 +4356,7 @@ mod tail_tests {
                         kv_map: false,
                         gpu: true,
                         gpu_layers: usize::MAX, // E5 fixture: no offload limit
+                        kv_format: crate::graph::kvformat::KvFormat::F32,
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,
                     },
@@ -4373,6 +4433,7 @@ mod tail_tests {
                         kv_map: false,
                         gpu: true,
                         gpu_layers: usize::MAX, // E5 fixture: no offload limit
+                        kv_format: crate::graph::kvformat::KvFormat::F32,
                         fuse_qkv: fuse,
                         fuse_ffn: fuse,
                     },
