@@ -130,6 +130,19 @@ Every graph-referenced tensor is uploaded once at model load and referenced by n
   planes (`register_weight_q6k_exp`, `register_weight_q6k_dsc`, `register_weight_q4k_dsc`, and the
   D4-4 `{name}__dpl` dense split plane). Plane maps are keyed by the weight's device pointer and
   looked up inside `prefill_mmq`.
+- **The q4_K `W_dsc` plane is admitted for q4_K and only q4_K** (`src/q4k_dsc.rs`,
+  `q4k_dsc_plane_admitted` — issue [#165](https://github.com/yusiwen/minfer/issues/165)). The rule
+  has two halves: the *type* gate (`TensorType::Q4_K` is the one type `mmq_raw_nb_bt` dispatches the
+  dsc template for, so the loader admits no other type) and the *payload* gate (`raw.len()` must be
+  exactly `od * (id / 256) * 144`, q4_K's own block layout — **equality, not a lower bound**).
+  `register_weight_q4k_dsc` re-checks the payload before the budget query and before
+  `expand_q4k_dsc`, and `expand_q4k_dsc` itself returns `None` for a payload it cannot index, so a
+  direct caller cannot bypass either. Why both: a q4_0 payload has exactly q4_K's bytes/element
+  ratio (18/32 == 144/256), so the size check cannot refuse it; a q8_0 payload (34/32) is *longer*
+  and would be misread as 144-byte q4_K super-blocks; and a future type with a *smaller* ratio (a
+  2-bit K-quant: 84/256) is *shorter* than the row arithmetic needs, so the size check is what
+  refuses it instead of reading past the tensor. The check cannot tell a q4_K payload from another
+  type's bytes of the same length — that is the type gate's job.
 - A per-weight f16 dequant cache (`w16_cache`) is enabled by the loader only when quantized matmul
   weights exceed 2 GiB **and** MMQ is off; `MINFER_NO_W16CACHE=1` reverts.
 - `ModelLoadGuard` (reentrant, process-wide) serializes loader registration so two models with
@@ -774,6 +787,47 @@ f32-activation matmul kernel"*, not on a silent fallback; (c) the kernel's `__ha
 with zeros for half of each 8-element chunk → the gate fails on the greedy continuation (a value-level
 fault cannot pass the numeric comparison either). `compute-sanitizer --tool memcheck` over the CUDA
 unit suite stays at **0 API errors**. The full record is `docs/ARCHITECTURE-EXECUTION-PLAN.md` (#141).
+
+---
+
+### 7.6 Issue #165 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
+
+The q4_K `W_dsc` plane's admission contract (§2.3 above). The defect was the qwen2 loader reaching
+`register_weight_q4k_dsc` for every non-Q6_K type in its quantized `matches!`; the surface was a
+plane built from another type's bytes that no kernel reads (the map is keyed on the q4_K weight's
+device pointer), plus a latent out-of-bounds read for a future smaller-ratio type.
+
+**Fixed** in `src/q4k_dsc.rs` (`q4k_dsc_plane_admitted` = type + exact payload; the qwen2 loader
+calls it; `register_weight_q4k_dsc` re-checks the payload before the budget query and before
+`expand_q4k_dsc`, which itself returns `None` for a payload it cannot index).
+
+**Measured** (`q4dsc_planes()`, registry-by-name; before = the two gate halves reverted):
+
+| Model | Before | After |
+|---|---|---|
+| cached 0.5B **q4_0** | 24 planes / 26 148 864 B | **0 / 0** |
+| `/tmp/fix165/qwen2.5-0.5b-instruct-q8_0.gguf` (`minfer quantize` of the q4_0 0.5B) | 24 / 26 148 864 B | **0 / 0** |
+| `Qwen3-0.6B-Q8_0.gguf` | 0 / 0 — the qwen3 loader never had the call | 0 / 0 |
+| cached 0.5B **q4_k_m** (positive control) | — | **12 / 13 074 432 B** (exactly the index's admissible q4_K set) |
+
+`cargo test --release --features cuda -- --test-threads=1`: **516 passed / 0 failed / 34 ignored**
+(baseline 513 / 0 / 33). `FEATURES=cuda scripts/real_model_gates.sh`: **34 / 0** at both the 0.5B and
+the Qwen3-0.6B-Q8_0 config. `compute-sanitizer --tool memcheck` over the serial unit suite **0 API
+errors**, before (514/2/34, the two new gates failing on the pre-fix path) and after (516/0/34).
+
+**Mutations (reverted; files restored byte-identical, `sha256sum`).** (a) type gate removed →
+the pure wrong-type assertion and the real-model q4_0 gate fail (**24 planes / 26 148 864 B** against
+0 expected); (b) exact payload equality weakened to `>=` → the pure *"one block long"* assertion and
+the device gate's *"a q8_0 payload must not register a __q4dsc plane"* fail; (c) the plane registered
+under a wrong name (`__q4dscX`) → the device gate fails at its **positive control**, proving the
+"nothing registered" arms observe the plane's real registry entry. The full record is
+`docs/ARCHITECTURE-EXECUTION-PLAN.md` (F6c).
+
+**Honest scope.** The model #165 names (`Qwen3-0.6B-Q8_0`) does **not** reproduce the defect — it is
+arch `qwen3`, whose loader has no `register_weight_q4k_dsc` call (0 planes before and after); the
+qwen2 q8_0 arm is measured on a q8_0 file built here. And the size check cannot tell a q4_K payload
+from another type's bytes of the same length (q4_0 shares q4_K's ratio exactly), which is why the
+type gate is not redundant.
 
 ---
 
