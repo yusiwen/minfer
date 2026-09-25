@@ -61,7 +61,18 @@ wall-clock pair (parallel: 21.20s batched vs 9.95s serial = 0.47x) with
 `serial/batched` ratios** (1.379–1.468x over the parallel runs; the mutation that
 doubles the timed batched arm trips it at 0.752x); the median tolerates up to
 half the rounds being disturbed, and the correctness comparison stays a separate
-full-length pair.
+full-length pair. [#158](https://github.com/yusiwen/minfer/issues/158) removed the
+last load-dependent verdict in the same set:
+`published_metrics_move_as_requests_are_served` bounded a run by absolute
+wall-clock deadlines (120s/180s) and asserted the engine had gone idle, so 16 extra
+CPU spinners on a 20-core box made it panic (28 passed / 1 failed in 435.11s,
+green without the spinners). It now bounds **work** instead — `BatchEngine::work_units`
+must advance on every step that leaves the engine busy, plus a step budget — and the
+same spinner run is **29 / 0** (424.17s). The watchdogs still in the tree
+(`run_cli`'s child-process kills, and the `serve_loop` poll backstop) are not a
+gate's only failure signal; the unbounded `while engine.busy()` stepper loops in the
+other `#[ignore]`d server gates are filed together with them as
+[#160](https://github.com/yusiwen/minfer/issues/160).
 
 ## Git hooks (git-hooks.nix)
 

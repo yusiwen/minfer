@@ -174,6 +174,20 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   three plain parallel runs (individual rounds as low as 0.923x) and **2.159x** under 16 extra CPU
   spinners; the mutation that doubles the timed batched arm trips it at **0.752x**. The correctness
   comparison is still a separate full-length (16-token) pair, byte-for-byte on CPU.
+  [#158](https://github.com/yusiwen/minfer/issues/158) removed the last load-dependent verdict in this
+  set: `published_metrics_move_as_requests_are_served` bounded a real-model run by absolute wall-clock
+  deadlines (`Instant::now() + Duration::from_secs(120/180)`, asserting `!engine.busy()`), so on this
+  20-core box under the parallel set with 16 extra CPU spinners it panicked at *"the long request
+  finished inside the deadline"* — measured **28 passed / 1 failed in 435.11s**, green without the
+  spinners. It now bounds **work, not seconds**: `BatchEngine::work_units` (one unit per decode-forward
+  row plus one per committed token) must advance on every `tick` that leaves the engine busy, and
+  `step_budget(prompt, max_tokens) = 4 * (prompt + max_tokens + 8)` caps the step count — measured
+  **4 steps / 80** and **64 / 768** on the 0.5B. Under the same 16 spinners the set is **29 passed / 0
+  failed in 424.17s**; the mutation that makes `tick` return without advancing trips the work assertion
+  on step 1 (0.18s, against the old 120s wait). The audit found no other real-model gate whose only
+  failure signal is an absolute deadline — the rest are process-hang watchdogs or a redundant poll
+  backstop — and the still-unbounded `while engine.busy()` stepper loops in the other `#[ignore]`d
+  server gates are filed as [#160](https://github.com/yusiwen/minfer/issues/160).
   On a CUDA box the set is **32 passed / 0 failed** (0.5B config, GB10 sm_121) and the Qwen3-0.6B
   configuration's set is **32 / 0**; both are still run with `--test-threads=1`. **#123 made the C4
   packed-cache gate device-aware; C4 S2b made it exercise the device; #99 made it per-engine**: it
