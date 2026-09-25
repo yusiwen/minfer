@@ -299,15 +299,30 @@ fn load_tensor(
                     // out of the memory trade (od*id/4 B per tensor, ~1.4 GB on
                     // 7B q4_k_m); the plane's only consumer is the NB-BT kernel,
                     // so the gate mirrors its dispatch switches (RAW_NB +
-                    // A_TRANSPOSE; r60: both default-on). Geometry gates (id % 256 == 0 like the
-                    // kernel's launch gate, od % 2 == 0 for the row-pair
-                    // cp.async staging) skip the plane: the kernel keeps the
-                    // in-kernel scalar decode via map miss.
+                    // A_TRANSPOSE; r60: both default-on).
+                    //
+                    // #165: `q4k_dsc_plane_admitted` is the *type* gate too —
+                    // q4_K is the one type that kernel dispatches the dsc
+                    // template for. Before it, this `else` branch was reached
+                    // for every non-Q6_K type in the `matches!` above, so a
+                    // q4_0/q5_K/q8_0 weight whose geometry passed built a plane
+                    // out of misinterpreted bytes that no kernel ever read
+                    // (wasted device memory + host CPU per tensor), and a type
+                    // with a smaller bytes/element ratio would have been read
+                    // past the tensor. The helper also carries the payload
+                    // contract (`id % 256 == 0` and exactly `id/256*144` bytes
+                    // per row). `od % 2 == 0` stays here: it is the row-pair
+                    // cp.async staging requirement, not a payload property.
                     if crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
                         && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
                         && std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() != Ok("0")
-                        && tensor.shape[0] as usize % 256 == 0
                         && tensor.shape[1] as usize % 2 == 0
+                        && crate::q4k_dsc::q4k_dsc_plane_admitted(
+                            ttype,
+                            tensor.data().len(),
+                            tensor.shape[1] as usize,
+                            tensor.shape[0] as usize,
+                        )
                     {
                         cuda.register_weight_q4k_dsc(
                             &reg_name,

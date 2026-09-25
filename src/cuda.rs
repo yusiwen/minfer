@@ -10,6 +10,7 @@
 
 use crate::block::Q8B;
 use crate::device_tier;
+use crate::q4k_dsc::q4k_dsc_payload_ok;
 use crate::tensor::{Tensor, TensorType};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2394,14 +2395,24 @@ impl CudaState {
         out
     }
 
-    /// r59 (Session F item 1): build + upload the precomputed dsc f32-pair
+    /// r59 (Session F item 1), #165: build + upload the precomputed dsc f32-pair
     /// plane for one RAW q4_K tensor and map it from the raw weight's device
     /// pointer. Called from the qwen2 loader under the NB-BT gate set
     /// (MINFER_MMQ_RAW_NB=1 + MINFER_MMQ_A_TRANSPOSE=1 + MINFER_MMQ_Q4K_DSC
-    /// != "0") + `id % 256 == 0` + `od % 2 == 0`. An alloc/upload failure
-    /// leaves the map empty: the kernel falls back to the in-kernel scalar
-    /// decode (DSC=false) with a once-per-process loud eprintln.
+    /// != "0") + [`crate::q4k_dsc::q4k_dsc_plane_admitted`] (type q4_K + `id % 256 == 0`) +
+    /// `od % 2 == 0`. An alloc/upload failure leaves the map empty: the kernel
+    /// falls back to the in-kernel scalar decode (DSC=false) with a
+    /// once-per-process loud eprintln. A payload that is not exactly
+    /// [`crate::q4k_dsc::q4k_dsc_payload_bytes`] is refused **before** the budget query and
+    /// before the host expansion: its bytes are another type's (the #165
+    /// misread) or too few for the row arithmetic (the #165 latent OOB read).
     pub fn register_weight_q4k_dsc(&self, name: &str, raw: &[u8], od: usize, id: usize) {
+        // #165: the payload contract first. It costs nothing and is the only check that
+        // can refuse a smaller-ratio payload before `expand_q4k_dsc` would index past
+        // `raw`; `q4k_dsc_plane_admitted` in the loader is the same rule plus the type.
+        if !q4k_dsc_payload_ok(raw.len(), od, id) {
+            return;
+        }
         // geometry-encoded sibling name (same rationale as the W_exp name).
         let dsc_name = format!("{name}__q4dsc{od}x{id}");
         // T2: budget-gate BEFORE the host expansion (review NIT #6) — the
@@ -2409,7 +2420,9 @@ impl CudaState {
         if !self.plane_budget_ok((id / 32) * od * 8) {
             return;
         }
-        let dsc = Self::expand_q4k_dsc(raw, od, id);
+        let Some(dsc) = Self::expand_q4k_dsc(raw, od, id) else {
+            return;
+        };
         debug_assert_eq!(dsc.len(), (id / 32) * od * 8);
         self.register_weight(&dsc_name, &dsc);
         if let Some(wp) = self.get_weight_ptr(name) {
@@ -2443,7 +2456,16 @@ impl CudaState {
     /// computation: exact f16->f32 (half::f16 = __half2float), exact
     /// u8->f32, ONE IEEE f32 multiply, exact negation, no FMA contraction
     /// on either side.
-    pub fn expand_q4k_dsc(raw: &[u8], od: usize, id: usize) -> Vec<u8> {
+    ///
+    /// #165: **`None` when `raw` is not exactly [`crate::q4k_dsc::q4k_dsc_payload_bytes`] for the
+    /// geometry** — `raw`'s rows are then not 144-byte q4_K super-block rows, and the
+    /// indexing below (`raw[j * row_len..(j + 1) * row_len]`) would either misread
+    /// another type's bytes or run past the slice. The caller
+    /// ([`Self::register_weight_q4k_dsc`]) registers nothing in that case.
+    pub fn expand_q4k_dsc(raw: &[u8], od: usize, id: usize) -> Option<Vec<u8>> {
+        if !q4k_dsc_payload_ok(raw.len(), od, id) {
+            return None;
+        }
         const Q4KB: usize = 144;
         let nsb = id / 256;
         let nchunk = id / 32;
@@ -2473,7 +2495,7 @@ impl CudaState {
                 }
             }
         }
-        out
+        Some(out)
     }
 
     /// r59 (Session F riders, r57 items 4+5): move the one-time first-launch
@@ -2565,6 +2587,20 @@ impl CudaState {
     /// Whether `name` was registered in the padded Q6_K layout.
     pub fn is_weight_padded(&self, name: &str) -> bool {
         self.padded_weights.lock().unwrap().contains_key(name)
+    }
+
+    /// #165: the q4_K `W_dsc` planes currently in the registry (`*__q4dsc*`) as
+    /// `(name, bytes)`. The plane's only consumer is the NB-BT q4_K kernel, so this is
+    /// the exact set of device buffers a load that is *not* q4_K must leave empty — the
+    /// registry query the #165 gate and its before/after accounting read by name.
+    pub fn q4dsc_planes(&self) -> Vec<(String, usize)> {
+        self.weights
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n.contains("__q4dsc"))
+            .map(|(n, (_, size))| (n.clone(), *size))
+            .collect()
     }
 
     pub fn get_weight_ptr(&self, name: &str) -> Option<*mut std::ffi::c_void> {
