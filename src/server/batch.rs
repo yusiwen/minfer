@@ -194,6 +194,14 @@ pub struct BatchEngine {
     /// F8: where this engine's forwards run, so `/metrics` reports the occupancy
     /// of the backend the server actually uses rather than the CPU's by default.
     device: crate::models::Device,
+    /// F8/#158: a monotone count of the work this engine has actually done — one
+    /// unit per row a decode forward wrote, one per token [`Self::advance`]
+    /// committed. A `tick` that leaves the engine busy always moves it (either a
+    /// forward ran or some slot's `advance` returned `Continue`, and `Continue`
+    /// commits exactly one token), which is what lets a real-model gate bound
+    /// *work* instead of wall-clock seconds: a slow box runs the same number of
+    /// units, only for longer, while a wedged engine stops moving it.
+    work_units: u64,
 }
 
 /// C7: the cells a request wants reserved — pure, so the growth policy is
@@ -295,6 +303,7 @@ impl BatchEngine {
             interleaved_ticks: 0,
             slots_file: None,
             device: model.device(),
+            work_units: 0,
         })
     }
 
@@ -923,6 +932,14 @@ impl BatchEngine {
         self.interleaved_ticks
     }
 
+    /// #158: the engine's monotone work counter (see the field). A gate drives the
+    /// engine until it is idle and asserts this moved on every `tick` that left it
+    /// busy — a load-proof replacement for an absolute wall-clock deadline, which a
+    /// slow machine could exceed while a wedged engine could not.
+    pub fn work_units(&self) -> u64 {
+        self.work_units
+    }
+
     /// Whether an already admitted request has a token waiting for its decode
     /// forward — what interleaving a prefill is *for*.
     fn has_pending_decode(&self) -> bool {
@@ -1154,6 +1171,9 @@ impl BatchEngine {
                         return Err(e);
                     }
                 };
+            // #158: this forward wrote one row per batch entry; count the work
+            // before the bookkeeping below consumes the vector.
+            self.work_units += rows.len() as u64;
             if trace {
                 let rows_desc: Vec<String> = rows
                     .iter()
@@ -1209,7 +1229,10 @@ impl BatchEngine {
                 continue;
             }
             match self.advance(idx, tokenizer) {
-                Ok(StepOutcome::Continue) => {}
+                // #158: a `Continue` committed exactly one token (every other
+                // `advance` outcome ends the run and takes it), so this is the
+                // second half of the work counter.
+                Ok(StepOutcome::Continue) => self.work_units += 1,
                 Ok(StepOutcome::Finish(reason)) => self.finish(idx, reason),
                 Err(e) => self.fail(idx, e),
             }
@@ -3460,6 +3483,71 @@ mod tests {
         assert!(!engine.busy());
     }
 
+    /// #158: the step budget for the real-model stepper loops below.
+    ///
+    /// A legitimate run does one decode forward and one sample per answer token,
+    /// plus one prefill forward per chunk (with `MINFER_N_BATCH` low, one per
+    /// prompt token), so `MARGIN * (prompt + max_tokens + SLACK)` is far above
+    /// anything the engine can legitimately need. `MARGIN = 4` and `SLACK = 8` are
+    /// deliberately loose: this bound exists to catch an engine that *cannot*
+    /// terminate, never one that is merely slow, and a false negative hangs the
+    /// suite while a false positive is the flaky gate this ticket removes.
+    ///
+    /// Measured on this box (0.5B q4_0, GB10 host CPU, 2026-09-25): the warm
+    /// request (8-token prompt, `max_tokens = 4`) takes **4 steps** against a
+    /// budget of **80**, and the long one (120-token prompt, `max_tokens = 64`)
+    /// takes **64** against **768** — margins of 20x and 12x. The gate prints both
+    /// counts on every run, so a workload that outgrows the budget says so.
+    const STEP_BUDGET_MARGIN: usize = 4;
+    const STEP_BUDGET_SLACK: usize = 8;
+
+    fn step_budget(prompt_tokens: usize, max_tokens: usize) -> usize {
+        STEP_BUDGET_MARGIN * (prompt_tokens + max_tokens + STEP_BUDGET_SLACK)
+    }
+
+    /// #158: drive `engine` to idle with a bound on *work*, not wall-clock seconds.
+    ///
+    /// Replaces the absolute deadlines this gate used (`Instant::now() +
+    /// Duration::from_secs(120/180)`), which a slow box could exceed while a
+    /// healthy engine ran on. Every `tick` that leaves the engine busy must
+    /// advance [`BatchEngine::work_units`] — a wedged engine (one whose `tick`
+    /// returns without forwarding or committing) trips that assertion on the
+    /// stalling step — and the step budget backstops an engine that keeps "moving"
+    /// along a path that cannot terminate. Neither bound is a wall-clock number, so
+    /// the verdict is a property of the code. Returns the number of steps it took.
+    fn drive_by_work(
+        engine: &mut BatchEngine,
+        model: &dyn ModelDef,
+        tokenizer: &Tokenizer,
+        rx: &mut mpsc::Receiver<StreamEvent>,
+        budget: usize,
+        what: &str,
+    ) -> usize {
+        let mut steps = 0usize;
+        let mut work = engine.work_units();
+        while engine.busy() {
+            engine.tick(model, tokenizer).expect("tick");
+            // The response channel is bounded, so every step's frames are drained:
+            // a full channel would block the worker's `blocking_send` and stall the
+            // step before the work assertion could see it.
+            while rx.try_recv().is_ok() {}
+            steps += 1;
+            let now = engine.work_units();
+            assert!(
+                !engine.busy() || now > work,
+                "{what}: the engine is wedged — step {steps} left it busy without \
+                 advancing the work counter (still {work})"
+            );
+            work = now;
+            assert!(
+                steps <= budget,
+                "{what}: {steps} steps exceeded the {budget}-step budget — the run \
+                 is not progressing toward completion"
+            );
+        }
+        steps
+    }
+
     /// F8 (#51): the published occupancy and running counts are a **live**
     /// reading, not a startup snapshot — they move as requests are served.
     ///
@@ -3525,17 +3613,19 @@ mod tests {
         );
 
         // Step until the request finishes; `running` must fall back to 0 and the
-        // owned-cell gauge must have grown.
-        let deadline = Instant::now() + std::time::Duration::from_secs(120);
-        while engine.busy() && Instant::now() < deadline {
-            engine.tick(&*model, &tok).expect("tick");
-            while let Ok(ev) = rx.try_recv() {
-                if matches!(ev, StreamEvent::Finish { .. } | StreamEvent::Err(_)) {
-                    break;
-                }
-            }
-        }
-        assert!(!engine.busy(), "the request finished inside the deadline");
+        // owned-cell gauge must have grown. The bound is on work, not seconds
+        // (#158): a loaded box runs the same steps more slowly and still passes,
+        // while a wedged engine stops moving the counter and trips the assertion.
+        let steps = drive_by_work(
+            &mut engine,
+            &*model,
+            &tok,
+            &mut rx,
+            step_budget(prompt.len(), 4),
+            "the warm request",
+        );
+        eprintln!("[f8] warm request: {steps} step(s)");
+        assert!(!engine.busy(), "the warm request completed");
         engine.publish_metrics(&metrics);
         let done = metrics.snapshot();
         assert_eq!(done.running, 0, "no live request is running");
@@ -3600,16 +3690,18 @@ mod tests {
         );
 
         // Finish it, then ask for work again: the released slot re-reserves, so
-        // the gauge comes back — and `running` is 0 at both ends.
-        let deadline = Instant::now() + std::time::Duration::from_secs(180);
-        while growing.busy() && Instant::now() < deadline {
-            growing.tick(&*model, &tok).expect("tick");
-            while lrx.try_recv().is_ok() {}
-        }
-        assert!(
-            !growing.busy(),
-            "the long request finished inside the deadline"
+        // the gauge comes back — and `running` is 0 at both ends. Same work bound
+        // as the warm request, sized for this run's prompt and token budget.
+        let steps = drive_by_work(
+            &mut growing,
+            &*model,
+            &tok,
+            &mut lrx,
+            step_budget(long.len(), 64),
+            "the long request",
         );
+        eprintln!("[f8] long request: {steps} step(s)");
+        assert!(!growing.busy(), "the long request completed");
         growing.publish_metrics(&gm);
         let g2 = gm.snapshot();
         assert_eq!(g2.running, 0);
