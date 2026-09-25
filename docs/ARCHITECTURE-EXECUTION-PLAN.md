@@ -4155,6 +4155,96 @@ continuous batching*), not a new capability — the same reason the #151 record 
 "E2's acceptance … take materially less wall time" paragraph that sat on the `serve_on` helper (it
 described this gate, not the helper) moved onto the gate, where the new statistic is stated.
 
+#### Test-infrastructure record (#158, 2026-09-25) — the F8 metrics gate bounds work, not wall-clock seconds
+
+**The defect.** `server::batch::tests::published_metrics_move_as_requests_are_served` (an
+`#[ignore]`d real-model gate, `src/server/batch.rs`) drove its two requests with **absolute
+wall-clock deadlines** — a 120s loop for the warm 8-token request and a 180s loop for the long one —
+and asserted `!engine.busy()` when the loop ended. The deadline is not a property of the code: on
+this 20-core box, running the whole **parallel** `--ignored` set with **16 extra CPU spinners** made
+the long request legitimately exceed 180s, and the gate panicked at `src/server/batch.rs:3609` with
+*"the long request finished inside the deadline"*. Measured before the fix: the set was **28 passed /
+1 failed in 435.11s** (460s wall with the spinners), green without them (29 / 0). This is the same
+*class* as [#154](https://github.com/yusiwen/minfer/issues/154) — a verdict that is a property of the
+load, not of the code — but an **absolute deadline** no statistic can absorb, unlike #154's ratio.
+[#123](https://github.com/yusiwen/minfer/issues/123) is the third member of the class (the CUDA
+map-window gate, which needed a *justified* margin rather than no margin).
+
+**The fix: a bound on progress.** `BatchEngine` gained a monotone `work_units` counter, advanced
+once per row a decode forward wrote and once per token `advance` committed. The invariant that makes
+it a progress signal: a `tick` that leaves the engine busy must have moved it — if no forward ran,
+then some slot's `advance` returned `Continue`, and `Continue` commits exactly one token (every other
+`advance` outcome ends the run and takes it). The gate's two loops became two calls to a shared
+`drive_by_work(engine, model, tok, rx, budget, what)` helper that steps until idle, asserts the
+counter moved on every step that left the engine busy, and caps the step count. **No wall-clock bound
+remains in the gate**, so there is no bare literal to justify and no env knob to add: a slow box runs
+the same steps, only for longer, while a wedged engine trips the work assertion on the stalling step.
+
+**The step budget.** `step_budget(prompt, max_tokens) = 4 * (prompt + max_tokens + 8)`
+(`STEP_BUDGET_MARGIN = 4`, `STEP_BUDGET_SLACK = 8`): one decode forward and one sample per answer
+token plus one prefill forward per chunk, times a deliberately loose margin. It is loose because the
+bound must catch an engine that *cannot* terminate, never one that is merely slow — a false negative
+hangs the suite, a false positive is the flaky gate this ticket removes. Measured on the 0.5B q4_0
+(this box, 2026-09-25): the warm request (8-token prompt, `max_tokens = 4`) took **4 steps** against a
+budget of **80** (20x); the long one (120-token prompt, `max_tokens = 64`) took **64** against **768**
+(12x). The gate prints both counts on every run.
+
+**Verdict, before and after (CPU build, this box, 16 extra CPU spinners on a 20-core machine).**
+
+| Command | Before | After |
+|---|---|---|
+| parallel `--ignored` + 16 CPU spinners | **28 / 1** in **435.11s** — the gate panicked at `batch.rs:3609` *"the long request finished inside the deadline"* | **29 / 0** in **424.17s** (438s wall) |
+| plain parallel `--ignored` | 29 / 0 | **29 / 0** in 36.60s |
+| serial `--ignored` | 29 / 0 | **29 / 0** in 38.47s |
+
+**Mutation check.** Making `tick` return `Ok(())` without forwarding or committing (the natural
+"wedge the engine" injection) makes the gate fail on **step 1** of the warm request — *"the warm
+request: the engine is wedged — step 1 left it busy without advancing the work counter (still 0)"* —
+in **0.18s**, where the old deadline would have waited the full 120s to report the same thing. Reverted
+byte-identically: `sha256sum src/server/batch.rs` back to `99a608e3…`.
+
+**The audit.** Every real-model gate shape was checked for an absolute deadline used as its *only*
+failure signal (`grep` for `Instant::now()` + `Duration::from_secs` across `src/` and `tests/`). The
+two #158 deadlines were the only ones; what remains is genuinely different and filed as
+[#160](https://github.com/yusiwen/minfer/issues/160):
+
+- `src/server/batch.rs:2925` (`serve_loop_publishes_the_queue_and_running_depth`) — the feeder's 120s
+  poll terminator is a **redundant backstop**: the verdict is the downstream `peak_running > 0` and
+  queue-arithmetic assertions, and the worker runs on the main thread, so the deadline cannot rescue a
+  real wedge.
+- `tests/conversation_cli.rs:41` — `run_cli`'s **1800s** child-process kill for the `#[ignore]`d
+  real-model CLI sessions: a **cross-process hang guard** (a child exposes no in-process progress
+  counter, and 1800s is ~10-100x the legitimate scalar-CPU runtime).
+- `tests/backend_registry_cli.rs:27` — `run_cli`'s fixed **60s** kill: a **cross-process hang guard**,
+  and not a real-model run (every case points at a nonexistent model path).
+- `src/server/mod.rs:827` — a CI unit test's 10s ceiling on a 50ms bounded drain (200x margin), not a
+  real-model gate.
+- Five `while engine.busy()` stepper loops in the other `#[ignore]`d server gates have **no** bound at
+  all (a wedge hangs the suite rather than false-failing it); #158's helpers make hardening them
+  mechanical, and #160 tracks it.
+
+**Verification (2026-09-25, this box; `--bin minfer` for the gate set).**
+
+| Command | Result |
+|---|---|
+| parallel `--ignored` + 16 CPU spinners, **before** | **28 / 1** in 435.11s (the gate panicked at `batch.rs:3609`) |
+| parallel `--ignored` + 16 CPU spinners, **after** | **29 / 0** in 424.17s |
+| plain parallel `--ignored`, after | **29 / 0** in 36.60s |
+| serial `--ignored` (`PARALLEL=0`), after | **29 / 0** in 38.47s |
+| mutation: `tick` returns without advancing | **fails** on step 1 (*"the engine is wedged … (still 0)"*), 0.18s; reverted byte-identically (`sha256sum` = `99a608e3…`) |
+| `cargo test --release` (CPU) | **440 / 0 / 29** unit + **10 / 0 / 6** integration (unchanged — no new test) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **503 / 0 / 32** unit + **10 / 0 / 6** integration (unchanged) |
+| … `--ignored --test-threads=1`, 0.5B f32 KV | **32 / 0** |
+| … `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf --ignored --test-threads=1` | **32 / 0** |
+| `rustup run stable rustfmt --edition 2021 --check src/server/batch.rs` | clean (rustfmt 1.9.0-stable; the pinned 1.97.1 toolchain has no rustfmt component) |
+| `python3 scripts/check_docs_links.py` | **940 relative links / 184 files** (unchanged) |
+
+**Docs.** `AGENTS.md`'s real-model-gates bullet and `docs/BUILD.md` § *Tests* carry #158 next to #154;
+this record is the per-ticket entry, cross-referencing #154 and #123 as the three members of the
+load-dependent-verdict class. `ARCHITECTURE-ROADMAP.md` is untouched: this is robustness inside the
+existing test-infrastructure/batching rows (item 3, *Batch composition + continuous batching*), not a
+new capability — the same reason the #154 and #151 records give.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
