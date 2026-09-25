@@ -404,7 +404,7 @@ pub fn chunk_finish(id: &str, model: &str, created: i64, reason: &str) -> String
 
 // === Error Types ===
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
     pub message: String,
