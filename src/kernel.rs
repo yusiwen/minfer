@@ -89,7 +89,9 @@ pub fn cpu_threads() -> usize {
 
 /// Minimum matmul work for which the pool is worth dispatching (rows × id
 /// MACs). Small matmuls (attn_k/v on GQA models, 512 rows) run inline.
-const MIN_PARALLEL_MACS: usize = 1 << 20; // 1M MACs
+/// `pub(crate)`: the f16 matmul (#141) in `vec_ops` uses the same threshold so
+/// the two CPU weight paths thread at the same shape.
+pub(crate) const MIN_PARALLEL_MACS: usize = 1 << 20; // 1M MACs
 
 /// One matmul job shared by all workers (Copy so each worker snapshots it).
 #[derive(Clone, Copy)]
