@@ -2607,6 +2607,24 @@ impl CudaState {
         self.weights.lock().unwrap().get(name).map(|(cp, _)| cp.0)
     }
 
+    /// #167: whether the NB-BT q4_K kernel would find a `W_dsc` plane for the raw weight
+    /// `name`. The kernel keys its map on the **raw weight's device pointer** (`q4k_dsc`,
+    /// read at `mmq_raw_nb_bt`'s launch site: a null `w_dsc` selects the in-kernel scalar
+    /// decode), so this performs exactly that lookup rather than looking the sibling name
+    /// up in the registry — which is the part a name-only assertion cannot see. `None`
+    /// when the weight is not registered at all.
+    pub fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
+        let wp = self.get_weight_ptr(name)?;
+        if wp.is_null() {
+            return None;
+        }
+        self.q4k_dsc
+            .lock()
+            .unwrap()
+            .get(&(wp as usize))
+            .map(|cp| cp.0)
+    }
+
     /// Process-wide model-load serialization: loaders hold this while
     /// registering weights, so two models with same-named tensors (qwen2 0.5B
     /// vs qwen3 0.6B in parallel tests) cannot interleave their registrations.

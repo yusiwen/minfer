@@ -248,112 +248,18 @@ fn load_tensor(
     #[cfg(feature = "cuda")]
     if on_device {
         if let Some(cuda) = crate::cuda::CudaState::get() {
-            if matches!(
+            // #167: one shared rule for both architectures — see `models::weight_reg`
+            // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
+            // f16 arm (#141) live there instead of in a per-loader copy. The failure
+            // mode this closes is real: the two copies had already drifted twice.
+            crate::models::weight_reg::register_cuda_weight(
+                cuda,
+                &reg_name,
                 ttype,
-                TensorType::Q4_0
-                    | TensorType::Q4_1
-                    | TensorType::Q4_K
-                    | TensorType::Q5_0
-                    | TensorType::Q5_1
-                    | TensorType::Q5_K
-                    | TensorType::Q6_K
-                    | TensorType::Q8_0
-            ) {
-                if ttype == TensorType::Q6_K {
-                    // 7e②: register Q6_K in the padded 224-byte block layout so
-                    // the matmul kernel can use aligned uint4 weight loads
-                    // (the raw 210-byte stride forces 1-byte-per-instruction
-                    // reads and caps 7B decode near ~38 GB/s).
-                    cuda.register_weight_q6k_padded(
-                        &reg_name,
-                        tensor.data(),
-                        tensor.shape[1] as usize,
-                        tensor.shape[0] as usize,
-                    );
-                } else {
-                    cuda.register_weight(&reg_name, tensor.data());
-                    // doc 104: q8_0 also registers the p32 split planes (payload
-                    // 32B/block aligned + dense d) for the decode MMVQ — the raw
-                    // registration above stays for every other consumer; the
-                    // method no-ops unless the geometry/env gates pass.
-                    if ttype == TensorType::Q8_0 {
-                        cuda.register_weight_q80_p32(
-                            &reg_name,
-                            tensor.data(),
-                            tensor.shape[1] as usize,
-                            tensor.shape[0] as usize,
-                        );
-                    }
-                    // r60: a non-NB-BT-consumable quantized weight (not q4_K/
-                    // q6_K) makes mode-2 skip-write fused producers unsound —
-                    // see CudaState::clear_mmq_nb_bt_only. Global flag, global
-                    // mix: ANY registered weight counts, namespaced or not — a
-                    // q4_0 draft must degrade the primary model to mode 1 (a
-                    // kept-true flag leaves mode 2 armed while the two-model
-                    // process violates its single-window guarantee).
-                    if !matches!(ttype, TensorType::Q4_K | TensorType::Q6_K) {
-                        cuda.clear_mmq_nb_bt_only();
-                    }
-                    // r59: registration-time W_dsc f32-pair plane for the NB-BT
-                    // q4_K kernel (r56 q6_K scaffold). MINFER_MMQ_Q4K_DSC=0 opts
-                    // out of the memory trade (od*id/4 B per tensor, ~1.4 GB on
-                    // 7B q4_k_m); the plane's only consumer is the NB-BT kernel,
-                    // so the gate mirrors its dispatch switches (RAW_NB +
-                    // A_TRANSPOSE; r60: both default-on).
-                    //
-                    // #165: `q4k_dsc_plane_admitted` is the *type* gate too —
-                    // q4_K is the one type that kernel dispatches the dsc
-                    // template for. Before it, this `else` branch was reached
-                    // for every non-Q6_K type in the `matches!` above, so a
-                    // q4_0/q5_K/q8_0 weight whose geometry passed built a plane
-                    // out of misinterpreted bytes that no kernel ever read
-                    // (wasted device memory + host CPU per tensor), and a type
-                    // with a smaller bytes/element ratio would have been read
-                    // past the tensor. The helper also carries the payload
-                    // contract (`id % 256 == 0` and exactly `id/256*144` bytes
-                    // per row). `od % 2 == 0` stays here: it is the row-pair
-                    // cp.async staging requirement, not a payload property.
-                    if crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
-                        && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
-                        && std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() != Ok("0")
-                        && tensor.shape[1] as usize % 2 == 0
-                        && crate::q4k_dsc::q4k_dsc_plane_admitted(
-                            ttype,
-                            tensor.data().len(),
-                            tensor.shape[1] as usize,
-                            tensor.shape[0] as usize,
-                        )
-                    {
-                        cuda.register_weight_q4k_dsc(
-                            &reg_name,
-                            tensor.data(),
-                            tensor.shape[1] as usize,
-                            tensor.shape[0] as usize,
-                        );
-                    }
-                }
-            } else if ttype == TensorType::F16 {
-                // #141: f16 weights register raw (2 B/element) and the device
-                // matmul kernel converts in-register — no f32 copy is made, so
-                // the memory the f16 file exists to save is actually saved.
-                // Deliberately NOT in the quantized `matches!` above: that
-                // branch's q4_K dsc plane gate has no type check, so an f16
-                // weight with passing geometry would build a garbage plane no
-                // kernel can read.
-                cuda.register_weight(&reg_name, tensor.data());
-                // r60: f16 is not NB-BT-consumable either — its GEMM reads the
-                // f32 activations, so a mode-2 skip-write producer upstream
-                // would feed it a dead buffer.
-                cuda.clear_mmq_nb_bt_only();
-            } else if ttype == TensorType::F32 {
-                cuda.register_weight(&reg_name, tensor.data());
-                // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
-                // are 1-D) — its GEMM reads the f32 A directly, so a mode-2
-                // skip-write producer upstream would feed it a dead buffer.
-                if tensor.shape.len() == 2 {
-                    cuda.clear_mmq_nb_bt_only();
-                }
-            }
+                tensor.data(),
+                &tensor.shape,
+                crate::gguf_write::ggml_n_dims(&ti.ne) as usize,
+            );
             device_bytes.set(device_bytes.get() + tensor.data().len());
         }
     }

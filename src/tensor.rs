@@ -274,7 +274,12 @@ impl Tensor {
 
     /// Get the data as f32 slice (panics if type is not F32)
     pub fn data_f32(&self) -> &[f32] {
-        assert!(self.ttype == TensorType::F32);
+        assert!(
+            self.ttype == TensorType::F32,
+            "data_f32 on '{}' of type {:?}",
+            self.name,
+            self.ttype
+        );
         let n = self.data.len() / 4;
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f32, n) }
     }

@@ -765,6 +765,12 @@ impl Qwen3Graph {
                 | TensorType::Q5_0
                 | TensorType::Q6_K
                 | TensorType::F32
+                // #167: the loader registers f16 raw and `f16_f32_matmul_vec` /
+                // `_scalar` are its device kernels (#141). Without this arm the
+                // all-or-nothing gate dropped an f16 Qwen3 model to the CPU even
+                // after the loader had registered it — qwen2's twin list has had
+                // F16 since #141.
+                | TensorType::F16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())
@@ -781,6 +787,9 @@ impl Qwen3Graph {
                 | TensorType::Q4_K
                 | TensorType::Q5_0
                 | TensorType::Q6_K
+                // #167: `embed_rows_f16` is the device gather (#141); see
+                // `matmul_t_ok` for the gate this completes.
+                | TensorType::F16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())

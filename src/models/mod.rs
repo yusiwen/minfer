@@ -3,6 +3,8 @@
 
 pub mod qwen2;
 pub mod qwen3;
+/// #167: the one CUDA per-tensor weight-registration rule both loaders share.
+pub mod weight_reg;
 
 use crate::cache::KVCache;
 use crate::gguf::GgufModel;
