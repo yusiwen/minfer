@@ -212,6 +212,19 @@ pub trait ModelDef: Send + Sync {
     /// Downcast helper for the graph path's weight registration.
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// C4 per-engine (issue #99): the KV storage format this engine resolved from
+    /// `MINFER_CACHE_TYPE` at load (`graph::kvformat::resolve`, device-aware). It is a
+    /// property of the loaded model, **not** a process global, so two engines with
+    /// different formats coexist in one process without sizing each other's regions.
+    /// The graph builder reads it through `CParams::kv_format` and the allocator
+    /// through `GraphAllocator::set_kv_format`.
+    fn kv_format(&self) -> crate::graph::kvformat::KvFormat;
+
+    /// C4 per-engine: stamp the resolved format on the engine. Called once by the
+    /// loader after `device()` is known. Required, not defaulted: an architecture that
+    /// forgot it would silently build f32-width nodes for a packed run.
+    fn set_kv_format(&mut self, format: crate::graph::kvformat::KvFormat);
+
     /// Build the declarative compute graph for one forward step (Phase 5).
     /// Topology is a deterministic function of `params` (reuse invariant).
     fn build_graph(
@@ -337,9 +350,28 @@ pub fn load_model_with(
     ns: &str,
     offload: crate::graph::offload::OffloadRequest,
 ) -> Option<Box<dyn ModelDef>> {
+    // C4: `MINFER_CACHE_TYPE` is the interface the CLI and the server use. Resolved
+    // once per load by `load_model_configured`, which is also the explicit-format
+    // entry point a test uses instead of mutating the environment (issue #99).
+    let cache_type = std::env::var("MINFER_CACHE_TYPE").ok();
+    load_model_configured(model, ns, offload, cache_type.as_deref())
+}
+
+/// Load with an explicit **C4 KV cache type** (`MINFER_CACHE_TYPE`'s spelling, or
+/// `None` for the unset default). This is what makes the format per engine instead
+/// of per process: the answer is resolved against the loaded model's device and
+/// stored on that model, and a caller can ask for two engines with different
+/// formats in one process without touching a global (the C4 gate does exactly
+/// that). `load_model_with` is the environment-backed wrapper.
+pub fn load_model_configured(
+    model: &GgufModel,
+    ns: &str,
+    offload: crate::graph::offload::OffloadRequest,
+    cache_type: Option<&str>,
+) -> Option<Box<dyn ModelDef>> {
     let ctx = &model.parts[0].ctx;
     let arch = ctx.get_key_val_str("general.architecture")?;
-    let loaded: Box<dyn ModelDef> = match arch.as_str() {
+    let mut loaded: Box<dyn ModelDef> = match arch.as_str() {
         "qwen2" => Box::new(qwen2::loader::load(model, ns, offload)?),
         "qwen3" => Box::new(qwen3::loader::load(model, ns, offload)?),
         other => {
@@ -347,16 +379,15 @@ pub fn load_model_with(
             return None;
         }
     };
-    // C4: the KV storage format is a per-load policy, resolved once the device is
-    // known (weights are registered by the arch loader, so `device()` is the same
-    // all-or-nothing answer every forward will use). This is the loud gate an
-    // unsupported `MINFER_CACHE_TYPE` fails on — an unknown spelling, or a packed
-    // format the device has no kernel for, ends the load here instead of quietly
-    // running f32.
-    let cache_type = std::env::var("MINFER_CACHE_TYPE").ok();
-    match crate::graph::kvformat::resolve(loaded.device(), cache_type.as_deref()) {
+    // C4: the KV storage format is resolved once the device is known (weights are
+    // registered by the arch loader, so `device()` is the same all-or-nothing answer
+    // every forward will use), and then **stored on the engine**. This is the loud
+    // gate an unsupported `MINFER_CACHE_TYPE` fails on — an unknown spelling, or a
+    // packed format the device has no kernel for, ends the load here instead of
+    // quietly running f32.
+    match crate::graph::kvformat::resolve(loaded.device(), cache_type) {
         Ok(format) => {
-            crate::graph::kvformat::set_kv_format(format);
+            loaded.set_kv_format(format);
             // C4 S2b: the *device* layout must be the format this load resolved.
             // The arch loaders already pushed `MINFER_CACHE_TYPE` through
             // `cuda::set_kv_cache_type`, but the resolver is the one authority, and
@@ -364,6 +395,11 @@ pub fn load_model_with(
             // `q8_0` resolution restates the layout here. `f32`/`f16` keep
             // `set_kv_cache_type`'s own auto policy (the region shape is the same
             // for both, so the pre-C4 split stands).
+            //
+            // This is the process-wide device half that #99 deliberately left in
+            // place: the CUDA kernels read `cuda::KV_LAYOUT`, so the layout is still
+            // a per-load process policy, and a device run keeps its serial
+            // discipline. Making it per-graph is the filed follow-up.
             #[cfg(feature = "cuda")]
             if format == crate::graph::kvformat::KvFormat::Q8_0 {
                 crate::cuda::set_kv_cache_layout(crate::cuda::KV_LAYOUT_Q8_0);

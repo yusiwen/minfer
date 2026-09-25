@@ -32,6 +32,11 @@ pub struct Qwen2Model {
     /// registration measured. `ModelDef::offload()` hands the plan to the graph builder and
     /// the assignment pass; `offload_report()` is the startup line.
     pub offload: crate::models::OffloadState,
+    /// C4 per-engine (issue #99): the KV storage format this engine resolved from
+    /// `MINFER_CACHE_TYPE` at load. `F32` until `ModelDef::set_kv_format` stamps it;
+    /// the graph builder and the allocator read it, so no test or second model can
+    /// change it out from under this engine.
+    pub kv_format: crate::graph::kvformat::KvFormat,
 }
 
 impl Qwen2Model {
@@ -57,6 +62,14 @@ impl ModelDef for Qwen2Model {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn kv_format(&self) -> crate::graph::kvformat::KvFormat {
+        self.kv_format
+    }
+
+    fn set_kv_format(&mut self, format: crate::graph::kvformat::KvFormat) {
+        self.kv_format = format;
     }
 
     /// Where this model's forwards run (E6) — delegated to the graph's single

@@ -298,8 +298,13 @@ impl SpecEngine {
         cfg: &SpecConfig,
         target_tokenizer: &Tokenizer,
         target_vocab: usize,
+        target_kv_format: crate::graph::kvformat::KvFormat,
     ) -> Result<Self, String> {
-        let format = crate::graph::kvformat::kv_format();
+        // C4 per-engine (issue #99): the *target's* resolved format, handed in by
+        // the caller that loaded it — a packed cache is the refusal below. This used
+        // to read a process global, which meant a second engine in the same process
+        // (or a test) could change the answer under this check.
+        let format = target_kv_format;
         if format.is_packed() {
             return Err(format!(
                 "speculative decoding needs the batched verify kernel (1 < nt <= 16) to be \

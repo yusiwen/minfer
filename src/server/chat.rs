@@ -794,7 +794,10 @@ fn worker_loop_serial(
     let mut slot_specs: Vec<Option<crate::spec::SpecEngine>> = slots
         .iter()
         .map(|_| match &spec_cfg {
-            Some(cfg) => crate::spec::SpecEngine::new(cfg, &tokenizer, model.n_vocab()).ok(),
+            Some(cfg) => {
+                crate::spec::SpecEngine::new(cfg, &tokenizer, model.n_vocab(), model.kv_format())
+                    .ok()
+            }
             None => None,
         })
         .collect();

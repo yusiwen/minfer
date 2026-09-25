@@ -14,6 +14,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::kvformat::KvFormat;
+
 /// Decode (n_tokens=1, incremental) vs prefill (n_tokens>1) graph type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphType {
@@ -58,6 +60,13 @@ pub struct CParams {
     /// graph, so a different offload plan must rebuild: this is topology like
     /// `gpu`, and `GraphCache::try_reuse` compares it with the rest of `CParams`.
     pub gpu_layers: usize,
+    /// C4 per-engine (issue #99): the storage format of this graph's persistent KV
+    /// regions. It fixes each KV node's width (`KvcacheMeta::row_elems`), so a graph
+    /// built for one format must not be reused for another — it is topology like
+    /// the fusion flags. It is **not** read from a process global: the loaded model
+    /// resolves `MINFER_CACHE_TYPE` once and stamps it here, so two engines with
+    /// different formats in one process cannot size each other's regions.
+    pub kv_format: KvFormat,
 }
 
 impl Default for CParams {
@@ -71,6 +80,7 @@ impl Default for CParams {
             explicit_span: false,
             kv_map: false,
             gpu_layers: usize::MAX,
+            kv_format: KvFormat::F32,
         }
     }
 }

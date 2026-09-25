@@ -60,6 +60,10 @@ impl Qwen3Graph {
         // C8b S2: the same flag the caller set for this device — a sharing
         // sequence's window is a list of cell runs, not one range.
         b.set_kv_map(params.cparams.kv_map);
+        // C4 per-engine (issue #99): the storage format of this graph's KV regions
+        // is a parameter of the build, not a process global — it decides each KV
+        // node's cell width, so it is part of the reuse identity (`CParams`).
+        b.set_kv_format(params.cparams.kv_format);
 
         let inp_pos = b.input("positions", [nt, 1, 1, 1], crate::graph::DType::I32);
         // G3 tail-row reduction input, declared at the graph HEAD (not beside
@@ -499,9 +503,17 @@ impl Qwen3Graph {
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)
                     && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
+                // C4 per-engine (issue #99): this engine's resolved KV format, part
+                // of the reuse identity so a cached graph is never reused across
+                // formats.
+                kv_format: model.kv_format,
             },
             weights_version: 1,
         };
+
+        // C4 per-engine (issue #99): the allocator's CPU kernels speak this engine's
+        // resolved format; the graph nodes carry the same one.
+        cache.alloc().set_kv_format(model.kv_format);
 
         if !cache
             .try_reuse(&params)
@@ -1058,6 +1070,7 @@ mod tests {
                     kv_map: false,
                     gpu: true,
                     gpu_layers: usize::MAX, // E5 fixture: no offload limit
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: true,
                     fuse_ffn: false,
                 },
@@ -1250,6 +1263,7 @@ mod tests {
                     kv_map: false,
                     gpu: true,
                     gpu_layers: usize::MAX, // E5 fixture: no offload limit
+                    kv_format: crate::graph::kvformat::KvFormat::F32,
                     fuse_qkv: false,
                     fuse_ffn: false,
                 },
