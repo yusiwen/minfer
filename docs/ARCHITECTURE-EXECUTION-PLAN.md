@@ -5574,9 +5574,92 @@ implemented. (d) `x86_64` codegen is verified by cross-`cargo`, not by running
 the AVX2 kernel — CI's ubuntu job is the run. (e) The row-blocked and direct
 forms are asserted bit-identical on this box; the argument that they must be
 (identical FMA tree and order) is also why the SIMD/scalar comparison uses a
-tolerance rather than bit equality. (f) A pre-existing finding is filed rather
-than fixed: the q4_K dsc plane is built for non-q4_K types with passing geometry
-([#165](https://github.com/yusiwen/minfer/issues/165)).
+tolerance rather than bit equality. (f) The pre-existing finding filed with F6b
+is **fixed in F6c** ([#165](https://github.com/yusiwen/minfer/issues/165)): the
+q4_K dsc plane was built for non-q4_K types with passing geometry.
+
+### F6c — the q4_K dsc plane is gated on q4_K, with a payload contract (#165) — **DONE 2026-09-25**
+
+**What landed.** [#165](https://github.com/yusiwen/minfer/issues/165), found while porting #141
+(F6b) and deliberately kept out of that branch (which is why f16 was not folded into the loader's
+quantized `matches!`).
+
+- The qwen2 loader built the r59 `W_dsc` f32-pair plane inside the `else` of
+  `if ttype == TensorType::Q6_K`, so the registration gate was reached for **every** non-Q6_K type
+  the enclosing `matches!` admitted (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q8_0), with no type check on the
+  plane. Any of them whose geometry passed (`id % 256 == 0`, `od` even) had 144-byte q4_K
+  super-blocks decoded out of its bytes and uploaded — a plane **no kernel reads** (the `q4k_dsc`
+  map is keyed on the q4_K weight's device pointer and its only consumer is `mmq_raw_nb_bt`), at
+  device-memory and host-CPU cost per tensor.
+- The fix is one pure rule with two load-bearing halves, `src/q4k_dsc.rs::q4k_dsc_plane_admitted`:
+  `ttype == TensorType::Q4_K` **and** `raw.len() == od * (id / 256) * 144` — q4_K's own block
+  layout, an **equality and not a lower bound**. The qwen2 loader calls it;
+  `register_weight_q4k_dsc` re-checks the payload before the budget query and before the host
+  expansion, and `expand_q4k_dsc` itself returns `None` for a payload it cannot index, so a direct
+  caller cannot bypass either. The rule is a free function in a **non-`cuda`-gated** module
+  precisely so CI's CPU job *runs* its tests; the CUDA job only compile-checks the device modules.
+- Why both checks. q4_0's bytes/element equals q4_K's exactly (18/32 == 144/256), so the size check
+  is blind to the difference — the type gate is the only thing that can refuse it. A q8_0 payload
+  (34/32) is *longer* than the row arithmetic needs and was misread; the size check refuses it. A
+  future type with a *smaller* ratio (a 2-bit K-quant: 84/256) is *shorter* and is refused instead
+  of read past the tensor — the latent OOB #165 names. What the size check **cannot** do is tell a
+  q4_K payload from another type's bytes of the same length; that is the type gate's job.
+
+**Measured acceptance (GB10, sm_121, CUDA 13.0, driver 580.178.04).** The "before" numbers are the
+real pre-fix code path (the two gate halves reverted, everything else identical).
+
+| Criterion | Before | After |
+|---|---|---|
+| `q4dsc_planes()` after loading the cached 0.5B **q4_0** (qwen2 arch) | **24 planes / 26 148 864 B** | **0 / 0** |
+| `q4dsc_planes()` after loading `/tmp/fix165/qwen2.5-0.5b-instruct-q8_0.gguf` (a qwen2 q8_0 built by `minfer quantize` from the cached 0.5B q4_0) | **24 / 26 148 864 B** | **0 / 0** |
+| `q4dsc_planes()` after loading `Qwen3-0.6B-Q8_0.gguf` — the model #165 names | **0 / 0**: the qwen3 loader never had the call (honest scope below) | 0 / 0 |
+| the cached 0.5B **q4_k_m** (the q4_K positive control, end to end) | — | **12 planes / 13 074 432 B**, exactly the GGUF index's admissible q4_K set |
+| `cargo test --release --features cuda -- --test-threads=1` | — | **516 passed / 0 failed / 34 ignored** (baseline 513 / 0 / 33) |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B and Qwen3-0.6B-Q8_0 configs) | — | **34 passed / 0 failed** both (baseline 33 / 0) |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0 API errors** over 514 passed / 2 failed / 34 ignored (the two new gates failing on the pre-fix path; 344.62 s) | **0 errors** over 516 passed / 0 failed / 34 ignored (349.38 s) |
+| `cargo test --release` (CPU) | — | **447 passed / 0 failed / 30 ignored** unit (baseline 445 / 0 / 30; +2 pure `q4k_dsc` tests) + **10 / 0 / 6** integration |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU) | — | **30 passed / 0 failed**, unchanged (the new `#[ignore]`d gate is `cuda`-gated) |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | — | clean (rustfmt **1.9.0-stable**; the pinned 1.97.1 toolchain has no `rustfmt` component, CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | — | **940 links resolve in 184 files**, unchanged |
+
+**Gates.** Two pure tests in `src/q4k_dsc.rs` (CI's CPU job): the q8_0-length and wrong-type
+refusals with a q4_K positive control and a Q5_K wrong-type control, and the short/long/empty
+payload refusals. `graph::cuda_backend::tests::cuda_q4dsc_plane_is_q4k_only` (device): the q4_K
+control registers `{name}__q4dsc{od}x{id}` and the **same** `q4dsc_planes()` query the refusals use
+sees exactly that plane, while the q8_0-length and one-block-short payloads add **nothing** — a
+query blind to planes could not see the control either. The `#[ignore]`d
+`cuda_real_model_registers_q4dsc_planes_only_for_q4k` loads a real model and asserts the registered
+plane set **equals** the GGUF index's admissible q4_K set (0 for q4_0/q8_0, 12 for q4_k_m).
+
+**Mutations (reverted; every file restored byte-identical, `sha256sum`).**
+(a) **type gate removed** (`q4k_dsc_plane_admitted` drops `ttype == Q4_K`): the pure wrong-type
+assertion fails (*"the type gate must refuse a q8_0 weight regardless of its length"*) and the
+real-model gate fails on the 0.5B q4_0 at **24 planes / 26 148 864 B** against 0 expected — the
+mutation reproduces #165 exactly.
+(b) **size validation weakened** (exact equality → `payload_bytes >= want`): the pure
+*"one block long"* assertion fails and the device gate fails at
+*"a q8_0 payload must not register a __q4dsc plane"* — so the gate really tests exactness, not a
+lower bound.
+(c) **wrong plane name** (`__q4dsc` → `__q4dscX`): the device gate fails at its *positive control*
+(*"the q4_K payload must register f165q4k1024x3072__q4dsc1024x3072"*), which is what proves the
+"nothing registered" arms observe the plane's real registry entry rather than passing vacuously.
+
+**Honest scope.** (a) **The model #165 names does not reproduce the defect**: `Qwen3-0.6B-Q8_0` is
+arch `qwen3` and goes to `src/models/qwen3/loader.rs`, which has **no** `register_weight_q4k_dsc`
+call at all — its plane count is 0 before and after (measured). The ticket's "~22 MB on
+Qwen3-0.6B-Q8_0" is the qwen2 loader's arithmetic applied to the qwen3 model's `ffn_down` shape; the
+defect is qwen2-loader-only. The qwen2 q8_0 arm is measured on a q8_0 file built here with
+`minfer quantize` (from the cached q4_0 0.5B, since a K-quant source is not re-quantizable) and both
+qwen2 arms are named in the table. (b) **The size check cannot tell a q4_K payload from another
+type's bytes of the same length** — q4_0 shares q4_K's ratio exactly, which is why the type gate is
+not redundant; the pair is the contract, and only the pair is tested. (c) The `#[ignore]`d real-model
+gate assumes the default full offload plan (all blocks fit), which holds for every cached small
+model it runs on; a *partial* plan would register fewer planes than the GGUF index implies. (d)
+**A separate loader divergence is filed, not fixed**:
+[#167](https://github.com/yusiwen/minfer/issues/167) — the qwen3 loader lacks both the q4_K dsc
+plane this record gates and the f16 registration branch #141 gave qwen2, so a q4_K Qwen3 runs the
+in-kernel scalar dsc decode and an f16 Qwen3 model drops to the CPU on CUDA (read from the loader,
+not device-verified — no f16 Qwen3 GGUF is cached here).
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
