@@ -34,8 +34,8 @@ writer/encoders and their verification references are documented in
 
 ```bash
 cargo test --release                         # unit + integration, no model files needed
-scripts/real_model_gates.sh                  # the #[ignore]d real-model gate set, serial
-PARALLEL=1 scripts/real_model_gates.sh       # CPU-only parallel form (see the count below)
+scripts/real_model_gates.sh                  # the #[ignore]d real-model gate set (parallel on CPU)
+PARALLEL=0 scripts/real_model_gates.sh       # CPU-only serial form
 FEATURES=cuda scripts/real_model_gates.sh    # device gate set (serial, one GPU)
 scripts/cuda_test.sh                         # the whole CUDA suite on a real GPU, serial
 ```
@@ -43,18 +43,25 @@ scripts/cuda_test.sh                         # the whole CUDA suite on a real GP
 The `#[ignore]`d set needs the cached real models (the 0.5B for the default
 configuration, `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` for the f16-KV one)
 and writes temporary session files. `scripts/real_model_gates.sh` is the
-documented entry point: it defaults to `--test-threads=1`, which a **device**
-build requires (the CUDA state is a process-wide singleton, issue
-[#64](https://github.com/yusiwen/minfer/issues/64)), and accepts `PARALLEL=1`
-for the CPU-only parallel form. Since the KV storage format became **per engine**
+documented entry point: it runs **serially** when `FEATURES` includes `cuda`,
+which a device build requires (the CUDA state is a process-wide singleton, issue
+[#64](https://github.com/yusiwen/minfer/issues/64)), and **in parallel**
+otherwise — on a CPU-only build that reason does not exist, and the parallel
+harness is where the [server batching
+gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
+`PARALLEL=1`/`0` overrides. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions — measured 2026-09-25 on a
-CPU build: **29 / 0** serial and **28 / 1** parallel, where the one parallel
-failure is the unrelated, load-sensitive wall-clock assertion in
-`server_batch_matches_serial_and_is_faster`
-([#154](https://github.com/yusiwen/minfer/issues/154)); before #99 the parallel
-run was 19 / 9, every failure a KV-region width mismatch. The serial form stays
-the documented one, and on a CUDA build it is the only honest one.
+CPU build: **29 / 0** serial and **29 / 0** parallel (three plain harness runs;
+before #99 the parallel run was 19 / 9, every failure a KV-region width
+mismatch, and before #154 it was 28 / 1). [#154](https://github.com/yusiwen/minfer/issues/154)
+replaced `server_batch_matches_serial_and_is_faster`'s single sequential
+wall-clock pair (parallel: 21.20s batched vs 9.95s serial = 0.47x) with
+**interleaved matched rounds** and a verdict on the **median of the per-round
+`serial/batched` ratios** (1.379–1.468x over the parallel runs; the mutation that
+doubles the timed batched arm trips it at 0.752x); the median tolerates up to
+half the rounds being disturbed, and the correctness comparison stays a separate
+full-length pair.
 
 ## Git hooks (git-hooks.nix)
 

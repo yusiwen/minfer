@@ -151,23 +151,29 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 
 - CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run after [#121](https://github.com/yusiwen/minfer/issues/121), [#99](https://github.com/yusiwen/minfer/issues/99) and [#151](https://github.com/yusiwen/minfer/issues/151) (2026-09-25): **503 passed / 0 failed / 32 ignored**, GB10 sm_121 — #121's two gates (one CI transport gate and one `#[ignore]`d real-model saturation gate) and #151's two CI gates on the C5 S3 record's 501, less the one obsolete `the_process_wide_format_can_be_redecided` unit test #99 deleted; the Qwen3-0.6B configuration's real-model set is green at **32 / 0**). `CudaState::sync` reports a `cudaGetLastError` latch as a **latched API error with its real origin**, never as a kernel launch (C4 S2c); the eager prefill-GEMM smem opt-in checks each `cudaFuncSetAttribute` return value and skips an over-limit request with the reason. The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is **32 passed / 0 failed** on the CUDA build (0.5B config, measured 2026-09-25 after #121).
 - Real-model gates (the `#[ignore]`d set): one command — `scripts/real_model_gates.sh`
-  (equivalently `cargo test --release --bin minfer -- --ignored --test-threads=1`; `PARALLEL=1` drops
-  the serial flag, `FEATURES=cuda` selects the device build). The wrapper defaults to serial because a
-  **device** build needs it: the device state is a process-wide singleton (`CudaState` — its MMQ memo
-  / captured graph execs / stream state are shared by every test), so the parallel harness can make one
-  test perturb another's measurement (issue [#64](https://github.com/yusiwen/minfer/issues/64)). On a
-  **CPU-only** build the *KV-format* reason is gone: since
+  (`FEATURES=cuda` selects the device build; `PARALLEL=1`/`0` forces the parallel/serial form). The
+  wrapper defaults to **serial on a device build** because the device state is a process-wide
+  singleton (`CudaState` — its MMQ memo / captured graph execs / stream state are shared by every
+  test), so the parallel harness can make one test perturb another's measurement (issue
+  [#64](https://github.com/yusiwen/minfer/issues/64)); on a **CPU-only** build that reason does not
+  exist, the *KV-format* reason is gone too (since
   [#99](https://github.com/yusiwen/minfer/issues/99) made the KV storage format **per engine**, the
-  parallel harness no longer sizes one gate's KV regions from another gate's format — measured
-  2026-09-25 on this box: **29 passed / 0 failed** serially, and **28 passed / 1 failed** in parallel
-  (before #99: 19 passed / 9 failed parallel against 28 passed / 0 failed serial, every one of the
-  nine a KV-region width mismatch). The single parallel failure is **not** a KV failure:
-  `server_batch_matches_serial_and_is_faster` asserts a **wall-clock** relation from two sequential
-  whole-workload measurements, so a loaded parallel harness lets the first-measured phase absorb the
-  start-up wave (measured 15.60s batched vs 11.54s serial on the rebased tree); it is the
-  same class #123 fixed for the CUDA map-window gate and is filed as
-  [#154](https://github.com/yusiwen/minfer/issues/154). Until that is robust, the **serial**
-  invocation is the documented entry point, and the wrapper defaults to it.
+  parallel harness no longer sizes one gate's KV regions from another gate's format), and the last
+  CPU-parallel failure was fixed by [#154](https://github.com/yusiwen/minfer/issues/154) — so the
+  wrapper defaults to the **parallel** form there. Measured 2026-09-25 on this box (CPU): **29 passed
+  / 0 failed** serial, **29 passed / 0 failed** in parallel (3 plain harness runs; before #99: 19
+  passed / 9 failed parallel against 28 passed / 0 failed serial, every one of the nine a KV-region
+  width mismatch; before #154 the parallel set was 28 passed / 1 failed).
+  [#154](https://github.com/yusiwen/minfer/issues/154) fixed that remaining failure:
+  `server_batch_matches_serial_and_is_faster` used to assert a **wall-clock** relation between two
+  sequential whole-workload measurements, so a loaded parallel harness let the first-measured phase
+  absorb the start-up wave (measured 21.20s batched vs 9.95s serial = **0.47x** in parallel against
+  **1.50x** serially). It now interleaves matched rounds of the two modes (`batched, serial` × 7) and
+  asserts the **median of the per-round `serial/batched` ratios** > 1.0, printing every ratio and the
+  median — the same shape #123 gave the CUDA map-window gate. The median was **1.379–1.468x** over the
+  three plain parallel runs (individual rounds as low as 0.923x) and **2.159x** under 16 extra CPU
+  spinners; the mutation that doubles the timed batched arm trips it at **0.752x**. The correctness
+  comparison is still a separate full-length (16-token) pair, byte-for-byte on CPU.
   On a CUDA box the set is **32 passed / 0 failed** (0.5B config, GB10 sm_121) and the Qwen3-0.6B
   configuration's set is **32 / 0**; both are still run with `--test-threads=1`. **#123 made the C4
   packed-cache gate device-aware; C4 S2b made it exercise the device; #99 made it per-engine**: it

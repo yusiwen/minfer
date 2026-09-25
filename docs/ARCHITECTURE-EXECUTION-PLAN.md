@@ -4069,6 +4069,92 @@ batching*), not a new capability. [#154](https://github.com/yusiwen/minfer/issue
 wall-clock flake of `server_batch_matches_serial_and_is_faster` under the parallel harness) is
 left as-is on purpose; the ignored set is run serially.
 
+#### Test-infrastructure record (#154, 2026-09-25) — the batching gate's throughput verdict is a median over interleaved rounds
+
+**The defect.** `server::batch::tests::server_batch_matches_serial_and_is_faster` (an `#[ignore]`d
+real-model gate, `src/server/batch.rs`) measured the two whole workloads **once, sequentially**
+(batched then serial) and asserted the wall-clock relation `t_serial > t_batch`. Under the parallel
+`--ignored` harness the first-measured phase absorbs the start-up wave, so the verdict was a property
+of the load, not of the code. Measured at `e1ac17f` on this box (CPU build, 0.5B q4_0, four
+requests, `max_tokens = 16`):
+
+| run | batched | serial | ratio |
+|---|---|---|---|
+| parallel `--ignored` (first) | **21.20s** | **9.95s** | **0.47x** (fail; the set was 28 passed / 1 failed in 34.36s) |
+| serial, same binary | 0.72s | 1.07s | 1.50x (pass; gate alone 2.68s) |
+
+The correctness half was never at fault — batched vs serial output (and the staggered-admission arm)
+already compared byte-for-byte on CPU and passed in both runs.
+
+**The fix (the #123 shape).** The timed rounds are now **interleaved** — `run_batched`, then
+`run_serial`, repeated `rounds` times — so each ratio is a matched pair measured next to each other
+on the same machine state, and the assertion is on the **median of the per-round `serial/batched`
+ratios** (the location estimate that tolerates up to `rounds / 2` disturbed rounds). This is the
+shape [#123](https://github.com/yusiwen/minfer/issues/123) gave
+`cuda_map_window_costs_no_more_than_the_span_it_replaces`. `median` and a factored
+`assert_replies_match` helper replace the two inline comparison loops; every per-round ratio, both
+time medians and the verdict median are printed, so a loaded box's result is auditable.
+
+**Statistic, threshold, cost.** The threshold is **unchanged at 1.0x** ("must not be slower"); the
+statistic is what changed, and no margin was invented. `rounds = 7` (env
+`MINFER_BATCH_TEST_ROUNDS`) is the smallest odd count whose median tolerates three disturbed rounds.
+The **timed** rounds use `timing_tokens = 8` (env `MINFER_BATCH_TEST_TIMING_TOKENS`) while the
+**correctness** comparison stays a separate full-length (`max_tokens = 16`) pair, so a shorter timing
+workload cannot weaken the byte-equality. The gate alone is **8.92s** on an idle box (2.68s before)
+and the whole parallel set **~41-44s** (34.36s before). The ticket's cost note ("one pair is ~27s")
+describes the *loaded* harness, where a full-length pair reached ~31s; the idle pair is ~1.8s, which
+is what made 7 full-length rounds affordable-ish and 7 shorter ones clearly so.
+
+**Verification (2026-09-25, CPU build, this box; `--bin minfer` for the gate set).**
+
+| Command | Result |
+|---|---|
+| parallel `--ignored`, **before** | 28 passed / **1 failed** — 21.20s batched vs 9.95s serial = **0.47x** |
+| serial `--ignored`, **before** | 29 passed / 0 failed |
+| parallel `--ignored`, after run 1 | **29 / 0**; per-round ratios [1.335, 1.804, 1.776, 1.434, 1.420, 1.416, 1.368]; **median 1.420x** |
+| parallel `--ignored`, after run 2 | **29 / 0**; ratios [1.350, **0.923**, 1.640, 1.342, 1.404, 1.398, 1.379]; **median 1.379x** |
+| parallel `--ignored`, after run 3 | **29 / 0**; ratios [1.647, 1.360, 1.481, 1.472, 1.468, 1.396, 1.348]; **median 1.468x** |
+| `scripts/real_model_gates.sh` (new default → parallel) | **29 / 0**; ratios [1.204, 1.787, 1.837, 1.805, 1.709, 1.824, 1.818]; **median 1.805x** |
+| parallel `--ignored` + 16 CPU spinners | the set 28 / **1** — **this gate passed** at **median 2.159x** (ratios [1.099, 2.046, 2.142, 2.159, 2.182, 2.274, 2.286]); the one failure is a **different**, deadline-based gate, filed as [#158](https://github.com/yusiwen/minfer/issues/158) |
+| serial `--ignored`, after | 29 passed / 0 failed |
+| mutation: the timed batched arm runs `timing_tokens * 2` | **fails** at **median 0.805x** (ratios 0.784–0.842, every round < 1.0); reverted byte-identically, `sha256sum src/server/batch.rs` = `15b717e1…` |
+| `cargo test --release` (CPU) | **440 / 0 / 29** unit + **10 / 0 / 6** integration (unchanged — no new test) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **503 / 0 / 32** unit + **10 / 0 / 6** integration (unchanged) |
+| … `--ignored --test-threads=1`, 0.5B f32 KV | **32 / 0** |
+| … `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf --ignored --test-threads=1` | **32 / 0** |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt 1.9.0-stable; the pinned 1.97.1 toolchain has no rustfmt component) |
+| `python3 scripts/check_docs_links.py` | **940 relative links / 184 files** (unchanged) |
+
+**The wrapper default.** `scripts/real_model_gates.sh` used to default to `--test-threads=1` on every
+build, because the device needs it (`CudaState` is process-wide, issue
+[#64](https://github.com/yusiwen/minfer/issues/64)). With #154 landed, the only CPU reason left is
+gone too, so the wrapper now defaults to **serial when `FEATURES` includes `cuda` and to the parallel
+form otherwise** (`PARALLEL=1`/`0` overrides, with a warning if parallel is forced on a CUDA build).
+The parallel CPU form is where the #154 gate's robustness is actually exercised, so it is the default
+CPU command rather than an opt-in — the fix would otherwise be invisible to whoever runs the wrapper.
+
+**Mutation check.** Doubling the **timed batched arm's** work (`timing_tokens * 2`, the natural
+"removes the batching win" injection for this statistic) makes the gate fail at median **0.805x** with
+all seven rounds below 1.0 — the median is not blind. It was reverted byte-identically (`sha256sum -c`
+on `15b717e1…`). The three plain parallel runs double as the robustness check from the other side: run
+2's round 0 measured **0.923x** (a load spike landing on one matched pair), and the median still
+returned 1.379x.
+
+**A gate that passes for the wrong reason — found, filed, not fixed here.** The extreme-load run (16
+extra CPU spinners) failed `published_metrics_move_as_requests_are_served` at *"the long request
+finished inside the deadline"* — it asserts a 180s wall-clock deadline on a 64-token generation, which
+is the same *class* of load-dependence as #154 but not the same statistic (an absolute deadline, not a
+ratio), and it is green in the plain parallel runs. Filed as
+[#158](https://github.com/yusiwen/minfer/issues/158) rather than widened here.
+
+**Docs.** `AGENTS.md`'s real-model-gates bullet no longer says the parallel CPU set is 28 / 1 or that
+the wrapper defaults to serial; `docs/BUILD.md` § *Tests* states the per-feature default and the new
+counts; the wrapper's own comments carry the same story. `ARCHITECTURE-ROADMAP.md` is untouched: this
+is robustness inside the existing test-infrastructure/batching rows (item 3, *Batch composition +
+continuous batching*), not a new capability — the same reason the #151 record gives. The stale
+"E2's acceptance … take materially less wall time" paragraph that sat on the `serve_on` helper (it
+described this gate, not the helper) moved onto the gate, where the new statistic is stated.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
