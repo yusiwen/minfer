@@ -6987,7 +6987,8 @@ mod tests {
                 }
             }
             // host-side production expander vs the mirror
-            let host = crate::cuda::CudaState::expand_q4k_dsc(&raw, od, id);
+            let host =
+                crate::cuda::CudaState::expand_q4k_dsc(&raw, od, id).expect("q4_K payload length");
             let hmis = host.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
             assert_eq!(hmis, 0, "expand_q4k_dsc vs mirror ({od}x{id})");
             // device upload path: build + read back + compare
@@ -7001,6 +7002,145 @@ mod tests {
             let dmis = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
             assert_eq!(dmis, 0, "device W_dsc vs mirror ({od}x{id})");
         }
+    }
+
+    /// #165: a payload that is not a q4_K payload registers **nothing** — no
+    /// `__q4dsc` device weight and no `q4k_dsc` map entry — while the q4_K payload
+    /// does. The positive control comes first and its registration is asserted by the
+    /// same registry queries the refusal uses, so a green run really observes the plane
+    /// (a query that is blind to planes could not see the control either).
+    #[test]
+    fn cuda_q4dsc_plane_is_q4k_only() {
+        let Some(state) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // Qwen3-0.6B `ffn_down` geometry — the shape #165 names.
+        let (od, id) = (1024usize, 3072usize);
+        let q4k_len = id / 256 * 144 * od;
+        let planes = |s: &crate::cuda::CudaState| -> (usize, usize) {
+            let p = s.q4dsc_planes();
+            (p.len(), p.iter().map(|(_, b)| b).sum())
+        };
+        let (base_n, base_b) = planes(state);
+
+        // positive control: a real q4_K payload DOES register
+        let ok_name = format!("f165q4k{od}x{id}");
+        let raw = vec![0u8; q4k_len];
+        state.register_weight(&ok_name, &raw);
+        state.register_weight_q4k_dsc(&ok_name, &raw, od, id);
+        let ok_dsc = format!("{ok_name}__q4dsc{od}x{id}");
+        assert!(
+            state.get_weight_ptr(&ok_dsc).is_some(),
+            "positive control: the q4_K payload must register {ok_dsc}"
+        );
+        let (n_after_ok, b_after_ok) = planes(state);
+        assert_eq!(
+            (n_after_ok, b_after_ok),
+            (base_n + 1, base_b + (id / 32) * od * 8),
+            "the registry query must see exactly the control's plane"
+        );
+
+        // a q8_0-length payload (34 B / 32 elements) is LONGER than q4_K's: refused
+        let q80_name = format!("f165q80{od}x{id}");
+        let q80 = vec![0u8; od * (id / 32) * 34];
+        state.register_weight(&q80_name, &q80);
+        state.register_weight_q4k_dsc(&q80_name, &q80, od, id);
+        assert!(
+            state
+                .get_weight_ptr(&format!("{q80_name}__q4dsc{od}x{id}"))
+                .is_none(),
+            "a q8_0 payload must not register a __q4dsc plane"
+        );
+
+        // a shorter payload (a future smaller-ratio type) is refused too, instead of
+        // being read past the tensor
+        let short_name = format!("f165short{od}x{id}");
+        let short = vec![0u8; q4k_len - 144];
+        state.register_weight(&short_name, &short);
+        state.register_weight_q4k_dsc(&short_name, &short, od, id);
+        assert!(
+            state
+                .get_weight_ptr(&format!("{short_name}__q4dsc{od}x{id}"))
+                .is_none(),
+            "a short payload must not register a __q4dsc plane"
+        );
+
+        // the two refusals added exactly zero planes
+        assert_eq!(
+            planes(state),
+            (n_after_ok, b_after_ok),
+            "only the q4_K control may add a plane"
+        );
+    }
+
+    /// #165 acceptance: loading a real model on CUDA registers a `W_dsc` plane for
+    /// **exactly** the admissible q4_K weights and nothing else. The default cached model
+    /// is the 0.5B q4_0, whose `ffn_down` `[4864, 896]` passed the old geometry gate: the
+    /// type gate is the only thing that can refuse it (q4_0's bytes/element equals
+    /// q4_K's), so before the fix this asserted 24 planes / 26 148 864 B. Point
+    /// `MINFER_BATCH_TEST_MODEL` at a qwen2 q8_0 GGUF to measure the q8_0 model the
+    /// ticket names (expected: 0 either way, qwen3's loader never registered the plane).
+    /// `#[ignore]`: it needs a cached GGUF (the real-model set).
+    #[test]
+    #[ignore]
+    fn cuda_real_model_registers_q4dsc_planes_only_for_q4k() {
+        use crate::gguf::GgmlType;
+        let Some(state) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let path = match std::env::var("MINFER_BATCH_TEST_MODEL") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+                p.push(
+                    ".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/\
+                     qwen2.5-0.5b-instruct-q4_0.gguf",
+                );
+                p
+            }
+        };
+        if !path.exists() {
+            eprintln!("skipping: {} not cached", path.display());
+            return;
+        }
+        // Hold the model-load lock across load + query (a parallel load of another
+        // architecture registers same-named tensors and swaps the registry underneath).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        // Expected set, from the GGUF index with the loader's own rule: a 2-D q4_K
+        // tensor (ne[0] = in = id, ne[1] = out = od) with `id % 256 == 0` and `od` even.
+        let mut want: Vec<String> = Vec::new();
+        for part in &gguf.parts {
+            for ti in &part.ctx.info {
+                if ti.type_ != GgmlType::Q4_K {
+                    continue;
+                }
+                let (id, od) = (ti.ne[0] as usize, ti.ne[1] as usize);
+                if id == 0 || id % 256 != 0 || od == 0 || od % 2 != 0 {
+                    continue;
+                }
+                want.push(format!("{}__q4dsc{od}x{id}", ti.name));
+            }
+        }
+        want.sort();
+        let _model = crate::models::load_model(&gguf).expect("load model");
+        let planes = state.q4dsc_planes();
+        let mut got: Vec<String> = planes.iter().map(|(n, _)| n.clone()).collect();
+        got.sort();
+        let bytes: usize = planes.iter().map(|(_, b)| b).sum();
+        eprintln!(
+            "q4dsc planes for {}: {} expected (q4_K), {} registered, {} bytes",
+            path.display(),
+            want.len(),
+            got.len(),
+            bytes
+        );
+        assert_eq!(
+            got, want,
+            "the W_dsc plane set must be exactly the model's admissible q4_K weights"
+        );
     }
 
     #[test]
