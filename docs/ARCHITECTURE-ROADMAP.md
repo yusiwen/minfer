@@ -509,18 +509,22 @@ BF16/MXFP4/NVFP4 (`SUPPORT-MATRIX.md §Not Yet Supported`;
 reach are Q2_K/Q3_K (running large models on small machines) and BF16 (serving
 unconverted checkpoints). 🟠 but legitimately deprioritized.
 
-**Quantizer tooling — closed by F6 ([#49](https://github.com/yusiwen/minfer/issues/49), 2026-09-24).**
+**Quantizer tooling — closed by F6 ([#49](https://github.com/yusiwen/minfer/issues/49), 2026-09-24), and
+its f16-weight gap closed by [#141](https://github.com/yusiwen/minfer/issues/141) (2026-09-25).**
 A GGUF v3 *writer* (`src/gguf_write.rs`), byte-verified weight encoders
 (`src/quantize.rs`), a HuggingFace Qwen2 converter that satisfies the strict
 loader (`src/convert.rs`), and the `convert` / `quantize` / `split` subcommands
-(`src/tooling.rs`, `docs/GGUF-TOOLING.md`). A converted f16 model runs (the CPU
-graph path gained f16 weight dispatch); a rewrite/split round-trip is bit-exact,
-and the HF conversion's f16 output is byte-identical to llama.cpp's converter on
-the same checkpoint, per tensor. **What remains** is scope F6 did not claim: the
-K-quant/I-quant encoders are still refused by name
-([#140](https://github.com/yusiwen/minfer/issues/140)), f16 weights are CPU-only
-and slow on that path ([#141](https://github.com/yusiwen/minfer/issues/141)),
-and bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
+(`src/tooling.rs`, `docs/GGUF-TOOLING.md`). A converted f16 model runs **on the
+CPU and on CUDA** — the CPU graph path gained f16 weight dispatch in F6 and #141
+vectorized that dot (AVX2 `F16C` / NEON `FCVTL`) and moved the multi-token row
+loop onto the shared CPU pool (3.2 → 207 tok/s prefill on the 0.5B), while CUDA
+registers the raw 2 B/element weights and converts in-register; **Metal refuses
+f16 weights** until [#164](https://github.com/yusiwen/minfer/issues/164), and a
+rewrite/split round-trip is bit-exact, and the HF conversion's f16 output is
+byte-identical to llama.cpp's converter on the same checkpoint, per tensor.
+**What remains** is scope F6 did not claim: the K-quant/I-quant encoders are
+still refused by name ([#140](https://github.com/yusiwen/minfer/issues/140)) and
+bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
 🟢 for conversion/quantization of the supported set.
 
 **CPU SIMD.** Only `Q4_0` and `Q8_0` have AVX2 (Advanced Vector Extensions 2)

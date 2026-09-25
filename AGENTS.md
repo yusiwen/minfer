@@ -39,8 +39,11 @@ src/
 │                    #   F6 real-model gates
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization
-├── kernel.rs        # quantized matmul dispatch + CPU scalar fallbacks
-├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU
+├── kernel.rs        # quantized matmul dispatch + CPU scalar fallbacks; #141: the shared
+│                    #   worker pool (`par_for`) the f16 matmul threads its row loop through
+├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; #141: the vectorized f16 weight dot
+│                    #   (AVX2 `F16C` / aarch64 NEON `FCVTL`) and the row-blocked, pooled
+│                    #   `mat_mul_f16` (an f64 scalar oracle, `MINFER_NO_F16_ROWB=1` control)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
 ├── cache.rs         # legacy KV cache type (graph path owns KV in the allocator)
 ├── dump.rs          # debug dump module (--features debug_dump)
@@ -149,7 +152,7 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 ./target/release/minfer split in.gguf <out-dir> --max-size 200M [--stem NAME]
 ```
 
-- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run after [#121](https://github.com/yusiwen/minfer/issues/121), [#99](https://github.com/yusiwen/minfer/issues/99), [#151](https://github.com/yusiwen/minfer/issues/151) and [#147](https://github.com/yusiwen/minfer/issues/147) (2026-09-25): **508 passed / 0 failed / 32 ignored**, GB10 sm_121 — #121's two gates (one CI transport gate and one `#[ignore]`d real-model saturation gate), #151's two CI gates on the C5 S3 record's 501, less the one obsolete `the_process_wide_format_can_be_redecided` unit test #99 deleted, plus #147's five gates (three pure, two device/env-gated); the Qwen3-0.6B configuration's real-model set is green at **32 / 0**). `CudaState::sync` reports a `cudaGetLastError` latch as a **latched API error with its real origin**, never as a kernel launch (C4 S2c); the eager prefill-GEMM smem opt-in checks each `cudaFuncSetAttribute` return value and skips an over-limit request with the reason, and #147 routed every dynamic-smem opt-in and every launch through `minfer_smem_optin` / `minfer_launch_ok`, so a failure is named at the call that made it and the launch is refused instead of issued into a checked error (`MINFER_TEST_CALL_FAIL` + `MINFER_TEST_ISSUE147=1` drive the deliberate-failure gates; both are unset in default/sanitizer runs). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is **32 passed / 0 failed** on the CUDA build (0.5B config, measured 2026-09-25 after #121).
+- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run after [#121](https://github.com/yusiwen/minfer/issues/121), [#99](https://github.com/yusiwen/minfer/issues/99), [#151](https://github.com/yusiwen/minfer/issues/151), [#147](https://github.com/yusiwen/minfer/issues/147) and [#141](https://github.com/yusiwen/minfer/issues/141) (2026-09-25): **513 passed / 0 failed / 33 ignored**, GB10 sm_121 — #121's two gates (one CI transport gate and one `#[ignore]`d real-model saturation gate), #151's two CI gates on the C5 S3 record's 501, less the one obsolete `the_process_wide_format_can_be_redecided` unit test #99 deleted, plus #147's five gates (three pure, two device/env-gated), plus #141's five unit tests and its one `#[ignore]`d f16-on-device gate; the Qwen3-0.6B configuration's real-model set is green at **33 / 0**). `CudaState::sync` reports a `cudaGetLastError` latch as a **latched API error with its real origin**, never as a kernel launch (C4 S2c); the eager prefill-GEMM smem opt-in checks each `cudaFuncSetAttribute` return value and skips an over-limit request with the reason, and #147 routed every dynamic-smem opt-in and every launch through `minfer_smem_optin` / `minfer_launch_ok`, so a failure is named at the call that made it and the launch is refused instead of issued into a checked error (`MINFER_TEST_CALL_FAIL` + `MINFER_TEST_ISSUE147=1` drive the deliberate-failure gates; both are unset in default/sanitizer runs). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is **33 passed / 0 failed** on the CUDA build (0.5B config, measured 2026-09-25 after #121 and #141).
 - Real-model gates (the `#[ignore]`d set): one command — `scripts/real_model_gates.sh`
   (`FEATURES=cuda` selects the device build; `PARALLEL=1`/`0` forces the parallel/serial form). The
   wrapper defaults to **serial on a device build** because the device state is a process-wide
@@ -160,8 +163,8 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   [#99](https://github.com/yusiwen/minfer/issues/99) made the KV storage format **per engine**, the
   parallel harness no longer sizes one gate's KV regions from another gate's format), and the last
   CPU-parallel failure was fixed by [#154](https://github.com/yusiwen/minfer/issues/154) — so the
-  wrapper defaults to the **parallel** form there. Measured 2026-09-25 on this box (CPU): **29 passed
-  / 0 failed** serial, **29 passed / 0 failed** in parallel (3 plain harness runs; before #99: 19
+  wrapper defaults to the **parallel** form there. Measured 2026-09-25 on this box (CPU): **30 passed
+  / 0 failed** serial, **30 passed / 0 failed** in parallel (29 before #141 added its device gate; 3 plain harness runs; before #99: 19
   passed / 9 failed parallel against 28 passed / 0 failed serial, every one of the nine a KV-region
   width mismatch; before #154 the parallel set was 28 passed / 1 failed).
   [#154](https://github.com/yusiwen/minfer/issues/154) fixed that remaining failure:
@@ -182,14 +185,14 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   spinners. It now bounds **work, not seconds**: `BatchEngine::work_units` (one unit per decode-forward
   row plus one per committed token) must advance on every `tick` that leaves the engine busy, and
   `step_budget(prompt, max_tokens) = 4 * (prompt + max_tokens + 8)` caps the step count — measured
-  **4 steps / 80** and **64 / 768** on the 0.5B. Under the same 16 spinners the set is **29 passed / 0
-  failed in 424.17s**; the mutation that makes `tick` return without advancing trips the work assertion
+  **4 steps / 80** and **64 / 768** on the 0.5B. Under the same 16 spinners that run was **29 passed / 0
+  failed in 424.17s** (the set is 30 with #141's device gate); the mutation that makes `tick` return without advancing trips the work assertion
   on step 1 (0.18s, against the old 120s wait). The audit found no other real-model gate whose only
   failure signal is an absolute deadline — the rest are process-hang watchdogs or a redundant poll
   backstop — and the still-unbounded `while engine.busy()` stepper loops in the other `#[ignore]`d
   server gates are filed as [#160](https://github.com/yusiwen/minfer/issues/160).
-  On a CUDA box the set is **32 passed / 0 failed** (0.5B config, GB10 sm_121) and the Qwen3-0.6B
-  configuration's set is **32 / 0**; both are still run with `--test-threads=1`. **#123 made the C4
+  On a CUDA box the set is **33 passed / 0 failed** (0.5B config, GB10 sm_121) and the Qwen3-0.6B
+  configuration's set is **33 / 0**; both are still run with `--test-threads=1`. **#123 made the C4
   packed-cache gate device-aware; C4 S2b made it exercise the device; #99 made it per-engine**: it
   loads **two engines per arm** (f32 and q8_0) through `models::load_model_configured` instead of
   flipping a process global, so it is itself the proof that two formats coexist in one process. It runs
@@ -205,7 +208,7 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   sweeps **f32/f16/q8_0** and additionally compares one single-row Q8_0 window against the
   dequantized cell, because every mode-vs-mode comparison there is blind to a value-level fault
   (mutation-checked: dropping the Q8_0 block base left it green until that arm was added). The
-  Qwen3-0.6B configuration's set is **32 passed / 0 failed** (measured 2026-09-25): the f16 KV
+  Qwen3-0.6B configuration's set is **33 passed / 0 failed** (measured 2026-09-25): the f16 KV
   element type is now a **flag** in the session header, so
   `a_slot_snapshot_resumes_the_context_without_re_prefilling` round-trips its own snapshot instead
   of being refused with *"the file was written with the f32 KV element type, this run uses f16"*
@@ -247,13 +250,29 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   `token_ids_match_the_reference` `#[ignore]`d test.
 - Qwen3.5 (`qwen35` arch) is **not** a supported architecture; its GGUF is used
   only as the `qwen35` pre-tokenizer/id reference.
-- f16 **weights** (F6/#49): a converted f16 GGUF loads and runs on the CPU path —
-  `Op::MatMul` decodes one f16 weight row at a time (`vec_ops::mat_mul_f16`) and
-  `Op::GetRows` decodes f16 embedding rows; 1-D norms/biases stay f32 because the
-  converter writes them f32 (llama.cpp's rule). The Metal/CUDA registration still
-  accepts f32 and the supported quants only, so an f16 model runs the CPU path even
-  on a device build, and that path is slow (~3 tok/s prefill on the 0.5B):
-  [#141](https://github.com/yusiwen/minfer/issues/141). `minfer quantize` supports
+- f16 **weights** (F6/#49, completed on the device by [#141](https://github.com/yusiwen/minfer/issues/141)): an f16 GGUF
+  runs on **CPU and CUDA**; **Metal refuses it** (below). `Op::MatMul` decodes one
+  f16 weight row at a time (`vec_ops::mat_mul_f16`) and `Op::GetRows` decodes f16
+  embedding rows; 1-D norms/biases stay f32 because the converter writes them f32
+  (llama.cpp's rule). The CPU dot is now **vectorized** — AVX2 `F16C`
+  (`_mm256_cvtph_ps`), aarch64 baseline NEON `FCVTL` (`vcvt_f32_f16`), an f64
+  scalar oracle, and `MINFER_NO_NEON=1` forcing scalar — and the multi-token
+  prefill decodes each weight row once and threads the row loop through the
+  shared CPU pool (`vec_ops::mat_mul_f16` → `kernel::par_for`, the same
+  `MINFER_NO_F16_ROWB=1` A/B control as the F6 shape). Measured on the 0.5B,
+  34-token prefill: **3.2 → 207 tok/s** (10.72s → 0.16s, medians of 3 interleaved
+  rounds per mode; the vectorized dot alone is 25.3 tok/s single-threaded and the
+  row blocking measured within
+  noise — the pool is the rest), and decode 2.2 → ~10 tok/s. CUDA registers the
+  **raw 2 B/element weights** and converts in-register (`f16_f32_matmul_vec` /
+  `_scalar`, `embed_rows_f16`); no registration-time f32 copy, so the memory the
+  f16 file exists to save is actually saved (0.5B: 948 MiB of device weights vs
+  ~1.9 GiB if dequantized). An f16 prefill does **not** enter the int8 MMQ GEMM —
+  MMQ streams quantized bytes — it runs the f32-activation kernel. **Metal keeps
+  the refusal**, so an f16 model there drops to the CPU with the loader's loud
+  all-or-nothing message: registering a weight type no kernel can consume would
+  be a silent wrong path, which is what that gate exists to prevent
+  ([#164](https://github.com/yusiwen/minfer/issues/164)). `minfer quantize` supports
   q4_0/q4_1/q5_0/q5_1/q8_0 (byte-identical to `llama-quantize`), f16 and f32, and
   refuses every type without an encoder by name ([#140](https://github.com/yusiwen/minfer/issues/140)).
 

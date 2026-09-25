@@ -284,6 +284,17 @@ supported quant type has the tiers that matter. Guards: K-quant `id % 256 != 0` 
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
 init. `MINFER_GEMM=0` disables the GEMM tier for A/B.
 
+**f16 weights are refused, not half-supported (#141).** The tiers above exist for f32 and the
+quantized types; Metal has no f16-weight kernel, so the loader does **not** register
+`TensorType::F16` on Metal and `Qwen2Graph::weights_on_gpu` fails its all-or-nothing check: an f16
+GGUF prints the loader's *"weights are not usable there — running on CPU"* line and runs the CPU
+path (which is now vectorized and pooled). This is deliberate. Registering a weight type a kernel
+cannot consume would make the device claim true while the op silently ran the wrong (or no) kernel
+— exactly what the registration gate exists to prevent — and a Metal f16 matmul/embed kernel cannot
+be verified from this box (no Mac; CI's `build-macos` job compiles the crate, nothing runs it). The
+follow-up is [#164](https://github.com/yusiwen/minfer/issues/164); until it lands, `f16` is on the
+CUDA side of the weight matrix and off Metal's, per `docs/SUPPORT-MATRIX.md`.
+
 **Aliasing.** Only `Silu`, `RoPE` and the view ops call `copy_in(dst, src)`, and only when the
 allocator did *not* alias them; an aliased node runs its in-place kernel directly on `out_buf`.
 
@@ -540,7 +551,9 @@ on Linux the Metal-only tests self-skip and the isolation binaries are empty.
 
 ## 8. Out of Scope / Future
 
-- **Not planned**: MPSGraph / higher-level MPS APIs, multi-GPU, f16 activations, training.
+- **Not planned**: MPSGraph / higher-level MPS APIs, multi-GPU, f16 activations (f16 **weights** are a
+  CPU/CUDA feature and are refused on Metal until [#164](https://github.com/yusiwen/minfer/issues/164) —
+  see §4.4), training.
 - **Closed by measurement** (`METAL_OPTIMIZATIONS.md` §3.6/§4): the prefill GEMM gap (params match
   llama's; decided not to change), and the flash/split/parallel attention lineup.
 - **Remaining research** (`METAL_OPTIMIZATIONS.md` §4.1/§4.2): cold-start items and the residual

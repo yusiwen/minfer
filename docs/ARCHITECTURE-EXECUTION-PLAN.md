@@ -5445,6 +5445,139 @@ f16-vs-f16 byte comparison against llama.cpp's converter is the stronger claim.
 the cached 0.5B); CI covers the writer/encoder/converter/download unit and
 local-HTTP gates.
 
+### F6b — f16 weights on the device backends + a vectorized CPU f16 dot (#141) — **DONE 2026-09-25**
+
+**What landed.** The third item F6 left open, plus the discovery that the fused
+concat registration was already fine but the type gate was not.
+
+- **CUDA**: `f16_f32_matmul_vec` / `f16_f32_matmul_scalar` in `cuda_kernels.cu`
+  (the same NR0/NSG unit mapping and token-in-block loop as the f32 kernels;
+  `__half22float2` + FMA, accumulation in f32) and `embed_rows_f16` (one thread
+  per output element). `matmul_f32_ptr_layout` gained the `F16` arm and
+  `embed_rows_on_gpu` the f16 gather; the loader registers `TensorType::F16`
+  **raw** — deliberately its own branch, not folded into the quantized
+  `matches!`, whose q4_K dsc-plane gate has no type check and would expand
+  misinterpreted bytes from an f16 tensor into a plane no kernel reads
+  ([#165](https://github.com/yusiwen/minfer/issues/165)). Both launchers read
+  their own launch return through the #147 helpers and return non-zero, so a
+  failed launch is an `Err` at the call site instead of joining the 65 unchecked
+  `<<<>>>` sites of [#162](https://github.com/yusiwen/minfer/issues/162).
+- **The design choice was a native kernel over dequant-at-registration**, and
+  the reason is the memory trade the ticket asks to state: an f16 GGUF exists to
+  halve the weight stream, and dequantizing to f32 on the device would give most
+  of it back — 0.5B: 948 MiB of device weights as f16 against ~1.9 GiB as f32
+  (14 GiB → 28 GiB for a 7B). The measured offload line for the 0.5B f16 file is
+  942.4 MiB. f16 is not an MMQ *format* (MMQ streams quantized bytes and the
+  f16-wmma GEMM is the `MINFER_MMQ=0` fallback for the *quantized* types), so an
+  f16 prefill runs the f32-activation kernel at every `nt` rather than the int8
+  GEMM.
+- **Metal is a deliberate refusal, not a partial port.** The loader does not
+  register f16 there, so `Qwen2Graph::weights_on_gpu` fails its all-or-nothing
+  check and an f16 GGUF prints the loader's *"weights are not usable there —
+  running on CPU"* line. Registering a weight type no kernel can consume would
+  make the device claim true while the op ran the wrong (or no) kernel, which is
+  exactly what that gate exists to prevent; a Metal f16 matmul/embed kernel
+  cannot be verified from this box (no Mac; CI's `build-macos` compiles the crate
+  and nothing runs it). Filed as [#164](https://github.com/yusiwen/minfer/issues/164).
+- **CPU**: `vec_ops::dot_f16_f32` (AVX2 `F16C` `_mm256_cvtph_ps` / aarch64
+  baseline NEON `FCVTL` `vcvt_f32_f16`, f64 scalar oracle) and
+  `vec_ops::decode_f16_row`, with `mat_mul_f16` decoding each weight row once for
+  `nt > 1` and folding every token into it, and the row loop going to the shared
+  worker pool (`kernel::par_for`, the same `MIN_PARALLEL_MACS` threshold the
+  quantized matmul uses). The SIMD loops run the same FMA tree in the same order
+  as `vec_dot_f32`, so the f16 dot is **bit-identical** to `vec_dot_f32` over the
+  decoded row — which is what makes the row loop safe to reorder and to thread:
+  `n` never changes a value, asserted. `MINFER_NO_F16_ROWB=1` keeps F6's
+  per-(row, token) shape as the A/B control.
+
+**Measured acceptance (GB10 CPU; GB10 sm_121 for the CUDA rows).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **445 passed / 0 failed / 30 ignored** unit (baseline 440 / 0 / 29; +5 unit tests, +1 `#[ignore]`d device gate) and **10 / 0 / 6** integration (unchanged) |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU, serial) | **30 passed / 0 failed** (baseline 29 / 0) |
+| `PARALLEL=1 scripts/real_model_gates.sh` (CPU, parallel) | **30 passed / 0 failed** (baseline 29 / 0) |
+| CPU f16 prefill, before → after (34-token prompt, medians of 3 interleaved rounds per mode) | **3.2 → 207 tok/s** (10.72 s → 0.16 s). The vectorized dot alone is 25.3 tok/s; the row blocking alone measured within noise; the pool is the rest. Decode 2.2 → ~10 tok/s |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **513 passed / 0 failed / 33 ignored** (baseline 508 / 0 / 32) + **10 / 0 / 6** integration |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B config) | **33 passed / 0 failed** (baseline 32 / 0) |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf FEATURES=cuda scripts/real_model_gates.sh` | **33 passed / 0 failed** (baseline 32 / 0) |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0 API errors** over 513 passed / 33 ignored (357.69 s) |
+| The f16 file on the device (`minfer convert --outtype f16` on the Qwen2.5-0.5B-Instruct checkpoint, 994,156,352 B) | offload report *"all 24 blocks + embed/output on cuda (942.4 MiB of device weights)"*; **169 f16 matmul + 1 f16 embed** nodes assigned `Backend::CUDA`; device vs CPU max \|Δlogit\| **7.34e-5** (mean 1.26e-5), 4.0e-6 relative, max \|logit\| 18.43; greedy `[12095, 13, 1084, 374]` identical on both |
+| the same file under llama.cpp (`--temp 0`) | `Paris.` — the same greedy continuation minfer gives on CPU and CUDA |
+| `rustup run stable rustfmt --edition 2021 --check` on the 6 changed `.rs` | clean (rustfmt **1.9.0-stable**; the pinned 1.97.1 toolchain has no `rustfmt` component here — CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **940 links resolve in 184 files** (unchanged — no new file, only absolute issue URLs) |
+| `cargo check` / `cargo rustc --emit=obj` for `x86_64-unknown-linux-gnu` | the AVX2+F16C path type-checks and **codegens** (the cross build reaches the link stage, where no `cc` cross-linker exists); running it is CI's ubuntu job |
+
+**The gate asserts placement directly, not through a timing.**
+`f141_f16_weights_run_on_the_cuda_device` (in `src/tooling.rs`, `#[ignore]`d):
+(1) `Qwen2Graph::device()` is `Cuda`; (2) the offload report says all 24 blocks +
+embed/output are on the device; (3) every `F16` matmul / embedding node the
+**scheduler assigns** is `Backend::CUDA`, counted by walking the built graph's
+`CNode.backend` — so a registered-but-unsupported type that `supports_op` routes
+to the CPU fails here instead of quietly measuring the CPU; (4) then the logits
+against the same file's `Layers(0)` CPU run, at \|Δ\| ≤ 0.01 and ≤ 1e-3 relative
+(measured 7.34e-5 / 4.0e-6), greedy identical.
+
+**Mutation evidence (reverted; the files restored byte-identical).**
+
+| Mutation | Gate that failed (observed output) |
+|---|---|
+| the loader's f16 registration gated off | `f141_f16_weights_run_on_the_cuda_device` — *left: Cpu, right: Cuda* at assertion (1) |
+| the f16 arm removed from `matmul_f32_ptr_layout` | the same gate, panicking on the loud `Err("cuda: weight type F16 has no f32-activation matmul kernel …")` — not a silent fallback |
+| `__half22float2` replaced with zeros for half of each 8-element chunk in `f16_f32_matmul_vec` | the same gate — *greedy continuation differs between device and CPU*, so a value-level fault cannot pass either |
+| `dot_f16_f32`'s SIMD match replaced by a direct scalar call (path reporting intact) | `vec_ops::tests::f16_dot_uses_the_vectorized_path` — *f16_dot_path() reports Neon but the SIMD dot never ran (0 -> 0)* |
+| the SIMD branch removed from `decode_f16_row` only | the same test — *…but the SIMD row decode never ran (1 -> 1)* |
+
+The last two are why the vectorization gate does not read `f16_dot_path()`
+alone: the SIMD entry points (dot **and** row decode) bump a test-only
+thread-local counter, so a dispatch that *reports* the SIMD path while running
+the scalar dot still fails. Reading the path function by itself was the first
+version of this gate, and the mutation above passed it — a textbook "assertion
+on something the code under test clears".
+
+**Two findings worth recording.**
+
+1. **The gate had to load under a namespace, and the reason is a real hazard.**
+   The CUDA weight registry is process-global and name-keyed, and
+   `register_weight` reuses a same-name+same-size device copy. The other
+   real-model gates in the `#[ignore]`d set load the cached q4_k_m 0.5B under the
+   default `ns=""`, which shares **121 f32 norm/bias names and their byte sizes**
+   with the converted f16 file — but not their values. The f16 gate therefore
+   failed *only in the full serial set* (device greedy `[3110, 31139, 47, 34369]`
+   against the CPU's `[12095, 13, 1084, 374]`) and passed when run alone: the
+   device arm was computing with the other file's norms. Loading both arms under
+   `ns="f141:"` (the loader's own documented remedy for a second model's
+   name-keyed entries) fixes it. This is the process-global hazard
+   [#64](https://github.com/yusiwen/minfer/issues/64) describes, and the shape of
+   the failure — a gate that passes alone and fails in the set — is worth
+   remembering.
+2. **The cached `qwen2.5-0.5b-instruct-q4_k_m.gguf` is not weight-identical to
+   the `Qwen/Qwen2.5-0.5B-Instruct` HF checkpoint.** Its f32 norms differ
+   (`blk.0.attn_norm.weight[0]` = `-0.046875` in the HF-derived f16 file — the
+   exact bf16 value in the safetensors — against `-0.082947` in the cached
+   file), which is what turned finding 1 into a wrong-weights comparison rather
+   than a last-bit one. No gate compares across the two files, so nothing is
+   red; a future gate that does must not assume they are the same weights.
+
+**Honest scope.** (a) **Metal has no f16 weight kernels**, so f16 is refused
+there and falls to the CPU loudly ([#164](https://github.com/yusiwen/minfer/issues/164));
+that is a stated policy, not an untested implementation. (b) The device gate's
+tolerance is a **backend** tolerance: both paths compute f32 activations against
+f16 weights (an f16 weight has no integer form, so the CPU does *not* quantize
+its activations the way it does for the quantized types), so what remains is
+accumulation order plus the attention exp/softmax kernel — measured 4.0e-6
+relative, bounded at 1e-3 with ~250x headroom. (c) The CPU f16 path is
+vectorized and pooled but **not blocked over the K dimension**, and the row
+blocking that is there measured neutral on this model; a K-tiled kernel that
+reuses a weight row across a token *tile* without re-reading it is not
+implemented. (d) `x86_64` codegen is verified by cross-`cargo`, not by running
+the AVX2 kernel — CI's ubuntu job is the run. (e) The row-blocked and direct
+forms are asserted bit-identical on this box; the argument that they must be
+(identical FMA tree and order) is also why the SIMD/scalar comparison uses a
+tolerance rather than bit equality. (f) A pre-existing finding is filed rather
+than fixed: the q4_K dsc plane is built for non-q4_K types with passing geometry
+([#165](https://github.com/yusiwen/minfer/issues/165)).
+
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
 Metal is a first-class target — it is the default backend on macOS and a plain
