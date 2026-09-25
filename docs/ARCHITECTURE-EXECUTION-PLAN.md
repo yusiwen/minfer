@@ -3235,27 +3235,33 @@ section states the scope, and the device run keeps the documented serial discipl
 
 **Measured** (CPU build, this box; `--bin minfer` for the gate set).
 
-| run | before (`a756419`) | after |
+| run | before (`a756419`) | after (rebased on `09ce9e7`, #121 included) |
 |---|---|---|
-| `cargo test --release --bin minfer -- --ignored` (parallel) | 19 passed / **9 failed** | **27 passed / 1 failed** |
-| `cargo test --release --bin minfer -- --ignored --test-threads=1` | 28 passed / 0 failed | **28 passed / 0 failed** |
-| `cargo test --release` (unit + integration) | 438 / 0 / 28 + 10 / 0 / 6 | **437 / 0 / 28 + 10 / 0 / 6** |
+| `cargo test --release --bin minfer -- --ignored` (parallel) | 19 passed / **9 failed** | **28 passed / 1 failed** |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` | 28 passed / 0 failed | **29 passed / 0 failed** |
+| `cargo test --release` (unit + integration) | 438 / 0 / 28 + 10 / 0 / 6 | **438 / 0 / 29 + 10 / 0 / 6** |
 | C4 gate alone (`[c4]` print) | — | cpu: f32 6 291 456 B vs q8_0 1 671 168 B (**3.76x**), max \|Δlogit\| **3.0289** of a 37.79 spread; shifted max \|Δlogit\| **2.4662** |
+
+The unit count is unchanged because two opposite moves cancel: #99 deletes the obsolete
+`the_process_wide_format_can_be_redecided` test (the global it asserted is gone) and #121 adds one
+(`38` -> `37` from #99, `+1` from #121). The ignored set grew by #121's saturation gate, hence 28 ->
+29 serial.
 
 The single remaining parallel failure is **not** a KV failure and not a #99 regression:
 `server::batch::tests::server_batch_matches_serial_and_is_faster` asserts a **wall-clock** relation
 (`t_serial > t_batch`) from two sequential whole-workload measurements, so under a loaded parallel
-harness the first-measured phase absorbs the start-up wave — measured **17.59s batched vs 9.94s
-serial** on the first run and **18.39s vs 9.75s** on a second, while the serial set passes it. All
-nine KV-region failures are gone. The load-sensitive assertion is the same class #123 fixed for the
-CUDA map-window gate and is filed as [#154](https://github.com/yusiwen/minfer/issues/154); until it
-is robust, the **serial** invocation is the documented entry point.
+harness the first-measured phase absorbs the start-up wave — measured **15.60s batched vs 11.54s
+serial** on the rebased tree (pre-rebase: 17.59 vs 9.94, then 18.39 vs 9.75), while the serial set
+passes it. All nine KV-region failures are gone. The load-sensitive assertion is the same class #123
+fixed for the CUDA map-window gate and is filed as
+[#154](https://github.com/yusiwen/minfer/issues/154); until it is robust, the **serial** invocation
+is the documented entry point.
 
-**Mutation check** (reverted byte-identically; `sha256sum -c` on all three files). Re-introducing
-the #99 shape — a process-global format read by `GraphBuilder::new`, flipped by the C4 gate per run
-— makes the parallel set **20 passed / 8 failed**, every failure the `KV region … was allocated with
-N elements but M are requested` string with the 3.765x ratio. So the parallel gate set is what
-detects the interference, and the per-engine path is what removes it.
+**Mutation check** (run before the #121 rebase; reverted byte-identically, `sha256sum -c` on all
+three files). Re-introducing the #99 shape — a process-global format read by `GraphBuilder::new`,
+flipped by the C4 gate per run — makes the parallel set **20 passed / 8 failed**, every failure the
+`KV region … was allocated with N elements but M are requested` string with the 3.765x ratio. So the
+parallel gate set is what detects the interference, and the per-engine path is what removes it.
 
 **Honest scope.**
 
@@ -3267,7 +3273,10 @@ detects the interference, and the per-engine path is what removes it.
   process-wide singleton (MMQ memo, captured graph execs, stream state — issue
   [#64](https://github.com/yusiwen/minfer/issues/64)) and the device KV layout tag is process-wide
   on top of that; `cargo test --release --features cuda -- --ignored` without `--test-threads=1`
-  remains the wrong command, and `scripts/real_model_gates.sh` keeps it serial.
+  remains the wrong command, and `scripts/real_model_gates.sh` keeps it serial. Measured serially on
+  this box (GB10 sm_121, CUDA 13.0): the unit suite is **501 passed / 0 failed / 32 ignored**, and
+  the ignored set is **32 passed / 0 failed** in both the 0.5B (f32 KV) and the Qwen3-0.6B (f16 KV)
+  configurations — unchanged by this increment except that one obsolete unit test is gone.
 - An **explicit `f16`** cache type still lets the *device* layout follow
   `set_kv_cache_type`'s auto policy (the pre-C4 split the loader comment records); the builder's
   f32/f16 region shapes are identical, so that is not a sizing hazard. A packed (`q8_0`) resolution

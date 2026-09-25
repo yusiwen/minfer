@@ -15,11 +15,11 @@
 # `MINFER_CACHE_TYPE` once, `CParams::kv_format` carries it into the graph, and
 # `GraphAllocator::set_kv_format` gives the CPU kernels the same answer), so all nine
 # KV-region failures are gone from the parallel run. Measured on a CPU build
-# 2026-09-25: serial **28 passed / 0 failed**, parallel **27 passed / 1 failed**. The
+# 2026-09-25: serial **29 passed / 0 failed**, parallel **28 passed / 1 failed**. The
 # one parallel failure is not a KV failure: `server_batch_matches_serial_and_is_faster`
 # asserts a wall-clock relation from two sequential whole-workload measurements, so a
-# loaded harness lets the first-measured phase absorb the start-up wave (17.59s
-# batched vs 9.94s serial, and 18.39s vs 9.75s on a rerun). That fragility is filed as
+# loaded harness lets the first-measured phase absorb the start-up wave (15.60s
+# batched vs 11.54s serial). That fragility is filed as
 # https://github.com/yusiwen/minfer/issues/154; until it is robust, this wrapper's
 # default (serial) is the documented entry point.
 #

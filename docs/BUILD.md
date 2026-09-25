@@ -49,7 +49,7 @@ build requires (the CUDA state is a process-wide singleton, issue
 for the CPU-only parallel form. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions — measured 2026-09-25 on a
-CPU build: **28 / 0** serial and **27 / 1** parallel, where the one parallel
+CPU build: **29 / 0** serial and **28 / 1** parallel, where the one parallel
 failure is the unrelated, load-sensitive wall-clock assertion in
 `server_batch_matches_serial_and_is_faster`
 ([#154](https://github.com/yusiwen/minfer/issues/154)); before #99 the parallel
