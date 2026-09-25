@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
+#include <cstdarg>
+#include <cstring>
 #include <mma.h>
 #include <cstdint>
 
@@ -4803,6 +4805,204 @@ __global__ void fa_prefill_f16kv(
     }
 }
 
+// ─── #147: read a gating return value where the call is made ─────────────────
+// Follow-on to #145 (docs/GPU_SAFETY.md rules 4-5). A discarded
+// `cudaFuncSetAttribute` return, a `<<<>>>` launch whose error is only seen by a
+// *later* `cudaGetLastError()` (attribution by position), and an unchecked
+// `cudaGraphDestroy` all let an error latch and resurface at a sync as a phantom
+// "kernel launch error". Every dynamic-smem opt-in and launch below goes through
+// `minfer_smem_optin()` / `minfer_launch_ok()`, which:
+//
+//   * read the call's own return value and name the failure where it is made —
+//     the site, the kernel instantiation, the attribute, the requested bytes,
+//     the device's queried `cudaDevAttrMaxSharedMemoryPerBlockOptin` limit and
+//     `cudaGetErrorName`;
+//   * SKIP a request the queried device limit already excludes, without calling
+//     it: the call could only return `cudaErrorInvalidValue` (which
+//     compute-sanitizer counts) and the launch cannot succeed anyway (#145's
+//     rule);
+//   * clear the latch they named, so nothing is left for `CudaState::sync` to
+//     mis-attribute;
+//   * return false → the caller REFUSES the launch instead of launching into a
+//     checked error.
+//
+// The last report is also kept in statics (`minfer_site_fail_*`), so the
+// `issue147_tests` device gates can assert the site, the requested value and the
+// error *name* — a gate that only asserts "a message appeared" cannot see a
+// message that names the wrong call. Serial device runs only, like `CudaState`
+// itself.
+#define MINFER_SITE_MSG_MAX 640
+
+// 0 = none, 1 = dynamic-smem attribute, 2 = kernel launch, 3 = a latched error
+// found *before* a launch (an earlier call's, never blamed on the launch).
+enum {
+    MINFER_SITE_NONE = 0,
+    MINFER_SITE_ATTR = 1,
+    MINFER_SITE_LAUNCH = 2,
+    MINFER_SITE_PREEXISTING = 3
+};
+
+static char g_site_msg[MINFER_SITE_MSG_MAX];
+static char g_site_name[48];
+static int g_site_fail_count = 0;
+static int g_site_last_kind = MINFER_SITE_NONE;
+static int g_site_last_code = 0;
+static int g_site_last_bytes = 0;
+static int g_site_last_limit = 0;
+
+extern "C" int minfer_site_fail_count(void) { return g_site_fail_count; }
+extern "C" int minfer_site_fail_kind(void) { return g_site_last_kind; }
+extern "C" int minfer_site_fail_code(void) { return g_site_last_code; }
+extern "C" int minfer_site_fail_bytes(void) { return g_site_last_bytes; }
+extern "C" int minfer_site_fail_limit(void) { return g_site_last_limit; }
+extern "C" const char* minfer_site_fail_site(void) { return g_site_name; }
+extern "C" const char* minfer_site_fail_message(void) { return g_site_msg; }
+
+// Start a fresh observation: the device gates assert one failure at a time.
+extern "C" void minfer_site_fail_reset(void) {
+    g_site_fail_count = 0;
+    g_site_last_kind = MINFER_SITE_NONE;
+    g_site_last_code = 0;
+    g_site_last_bytes = 0;
+    g_site_last_limit = 0;
+    g_site_name[0] = '\0';
+    g_site_msg[0] = '\0';
+}
+
+static void minfer_site_report(const char* site, int kind, int code, int bytes, int limit,
+                               const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_site_msg, sizeof(g_site_msg), fmt, ap);
+    va_end(ap);
+    g_site_fail_count++;
+    g_site_last_kind = kind;
+    g_site_last_code = code;
+    g_site_last_bytes = bytes;
+    g_site_last_limit = limit;
+    snprintf(g_site_name, sizeof(g_site_name), "%s", site);
+    fprintf(stderr, "minfer/cuda: %s\n", g_site_msg);
+}
+
+// Test injection (issue #147), env-gated like #145's `MINFER_TEST_LATCH_ERROR`:
+// `MINFER_TEST_CALL_FAIL` is a comma-separated list of site tokens, or `all`.
+// A named site performs its REAL call with a value that makes it fail — an
+// over-limit attribute request, an over-limit dynamic-smem launch, or (Rust
+// side) `cudaGraphDestroy` on the `cudaGraphExec_t` — so the failure is a real
+// latch the site must name and clear, not a synthetic return value. That is what
+// makes "no latched error reaches sync" a meaningful assertion. The knob is off
+// in every default run, so `compute-sanitizer --tool memcheck` over the suite
+// never sees such a call. Token matching is exact (no substring surprises).
+static bool minfer_test_call_fails(const char* site) {
+    const char* v = getenv("MINFER_TEST_CALL_FAIL");
+    if (v == 0) return false;
+    const size_t sl = strlen(site);
+    const char* p = v;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ') p++;
+        const char* q = p;
+        while (*q != '\0' && *q != ',') q++;
+        size_t n = (size_t)(q - p);
+        while (n > 0 && p[n - 1] == ' ') n--;
+        if ((n == 3 && strncmp(p, "all", 3) == 0) || (n == sl && strncmp(p, site, n) == 0))
+            return true;
+        p = q;
+    }
+    return false;
+}
+
+// The device's `cudaDevAttrMaxSharedMemoryPerBlockOptin`, queried once.
+// Negative = the query failed ("unknown"), in which case no request is skipped
+// on its account and the call's own return value decides.
+static int g_minfer_optin_limit = -2;
+static int minfer_optin_limit(void) {
+    if (g_minfer_optin_limit == -2) {
+        int dev = 0, v = 0;
+        cudaGetDevice(&dev);
+        cudaError_t e = cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (e != cudaSuccess) {
+            cudaGetLastError();
+            v = -1;
+        }
+        g_minfer_optin_limit = v;
+    }
+    return g_minfer_optin_limit;
+}
+
+// The dynamic-smem opt-in for one kernel instantiation (issue #147), the single
+// place a `cudaFuncSetAttribute` return value is read. Returns true when `bytes`
+// bytes are in force for `fn`; false means the following launch must be REFUSED,
+// because it cannot succeed.
+static bool minfer_smem_optin(const char* site, const char* kernel_name, const void* fn,
+                              int bytes) {
+    const bool injected = minfer_test_call_fails(site);
+    // The 48 KiB default cap admits it — nothing to opt into, nothing to check.
+    if (!injected && bytes <= 48 * 1024) return true;
+    const int limit = minfer_optin_limit();
+    if (!injected && limit > 0 && bytes > limit) {
+        // #145's rule: a request the queried device limit already excludes is
+        // skipped WITHOUT calling it — the call could only return
+        // cudaErrorInvalidValue, which compute-sanitizer counts, and the launch
+        // cannot succeed anyway.
+        minfer_site_report(site, MINFER_SITE_ATTR, (int)cudaErrorInvalidValue, bytes, limit,
+                           "cudaFuncSetAttribute(%s, "
+                           "cudaFuncAttributeMaxDynamicSharedMemorySize, %d B) SKIPPED: the "
+                           "request exceeds cudaDevAttrMaxSharedMemoryPerBlockOptin (%d B), the "
+                           "launch cannot succeed and the call is not made (#147/%s)",
+                           kernel_name, bytes, limit, site);
+        return false;
+    }
+    // The injection asks one page over the device limit: a real failing call
+    // with a real latch, which the failure path below must name and clear.
+    const int ask = injected ? (limit > 0 ? limit + 4096 : 48 * 1024 + 4096) : bytes;
+    cudaError_t e = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, ask);
+    if (e != cudaSuccess) {
+        minfer_site_report(site, MINFER_SITE_ATTR, (int)e, ask, limit,
+                           "cudaFuncSetAttribute(%s, "
+                           "cudaFuncAttributeMaxDynamicSharedMemorySize, %d B) failed: %s (%d); "
+                           "device cudaDevAttrMaxSharedMemoryPerBlockOptin = %d B — the launch "
+                           "is refused (#147/%s)",
+                           kernel_name, ask, cudaGetErrorName(e), (int)e, limit, site);
+        cudaGetLastError();  // this site owns the error; never leave it for sync
+        return false;
+    }
+    return true;
+}
+
+// A pre-launch latch is an *earlier* call's error and is reported as such, so
+// the post-launch read below is a launch check and not attribution by position.
+static void minfer_launch_prelude(const char* site, const char* kernel_name) {
+    cudaError_t pre = cudaGetLastError();
+    if (pre != cudaSuccess) {
+        minfer_site_report(site, MINFER_SITE_PREEXISTING, (int)pre, 0, 0,
+                           "a latched CUDA error %s (%d) was found before the %s launch and is "
+                           "NOT attributed to it: an earlier call on this thread did not check "
+                           "its own return value (#147/%s)",
+                           cudaGetErrorName(pre), (int)pre, kernel_name, site);
+    }
+}
+
+// The launch's dynamic-smem argument, made over-limit when the test knob names
+// the launch site. Probed on GB10/sm_121: an over-limit dynamic-smem launch is
+// rejected by the launch call itself with cudaErrorInvalidValue and the kernel
+// never runs (see the closing comment on #147).
+static size_t minfer_launch_smem(const char* site, size_t smem) {
+    return minfer_test_call_fails(site) ? smem + (16u << 20) : smem;
+}
+
+// The error of the launch just issued: a `<<<>>>` has no return value, and the
+// immediately-following cudaGetLastError is the documented *launch* check
+// (nothing runs in between).
+static bool minfer_launch_ok(const char* site, const char* kernel_name) {
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) return true;
+    minfer_site_report(site, MINFER_SITE_LAUNCH, (int)e, 0, 0,
+                       "kernel launch %s failed: %s (%d) — the launch is refused (#147/%s)",
+                       kernel_name, cudaGetErrorName(e), (int)e, site);
+    cudaGetLastError();  // this site owns the error
+    return false;
+}
+
 extern "C" {
 
 int launch_fa_prefill_f16kv(
@@ -5469,23 +5669,22 @@ static int g_gemm_smem_checked = 0;  // cudaFuncSetAttribute calls made
 static int g_gemm_smem_failed = 0;   // ... of which returned an error
 static int g_gemm_smem_skipped = 0;  // needs > limit, deliberately not called
 
-// One-time cudaFuncSetAttribute for dynamic smem above the 48KB static cap.
-// A failed call is named HERE and cleared; it must never latch and resurface
-// as a phantom "kernel launch error" at the next sync (issue #145).
+// One outcome per instantiation, decided through the shared #147 helper: the
+// launcher runs per layer per prefill, so an admitted or refused answer is
+// recorded and never re-asked on the hot path. Returns true when the >48 KiB
+// dynamic smem is admitted and the launch may proceed.
 template <typename K>
-static void gemm_smem_optin(K kernel, size_t bytes) {
-    static size_t done = 0;
-    if (bytes > 48 * 1024 && bytes > done) {
-        cudaError_t e = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
-        if (e != cudaSuccess) {
-            cudaGetLastError(); // do not poison the stream; the launch errors below
-            fprintf(stderr, "minfer/cuda: gemm smem opt-in %zu B failed: %s (%d)\n", bytes,
-                    cudaGetErrorName(e), (int)e);
-            return;
-        }
-        done = bytes;
-    }
+static bool gemm_smem_optin(const char* site, const char* kernel_name, K kernel, size_t bytes) {
+    static int state = 0;  // 0 = undecided, 1 = admitted, -1 = refused
+    const bool injected = minfer_test_call_fails(site);
+    // The 48 KiB default cap admits it — unless the test knob asks this site to
+    // fail, because then the failure path is what is under test.
+    if (bytes <= 48 * 1024 && !injected) return true;
+    if (state != 0 && !injected) return state == 1;
+    const bool ok = minfer_smem_optin(site, kernel_name,
+                                      reinterpret_cast<const void*>(kernel), (int)bytes);
+    if (!injected) state = ok ? 1 : -1;  // a test answer is never cached
+    return ok;
 }
 
 // Set every selectable prefill-GEMM instantiation's dynamic-smem attribute
@@ -5621,7 +5820,11 @@ void launch_convert_f16(
     convert_f32_f16_kernel<<<(int)grid, 256, 0, stream>>>(x, out, n);
 }
 
-void launch_gemm_f16(
+// #147: returns 1 when the launch was issued and accepted, 0 when the
+// dynamic-smem opt-in failed or the launch itself returned an error — either
+// way the call is named here and the caller (`prefill_gemm_f16_inner`) turns
+// the 0 into an `Err`, never a silent launch into a checked error.
+int launch_gemm_f16(
     const __half* a, const __half* b, float* c,
     int nt, int od, int id, cudaStream_t stream, bool af32
 ) {
@@ -5647,18 +5850,31 @@ void launch_gemm_f16(
     // shared-memory access that "worked" only because the block's smem happened
     // to be carved where nothing else wrote.
     const size_t dyn_smem = gemm_dynamic_smem_bytes(tm, ks, af32);
-#define GEMM_LAUNCH(TM_, KS_)                                                      \
-    do {                                                                           \
-        dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_);                           \
-        if (af32) {                                                                \
-            gemm_smem_optin(gemm_f16_nt_kernel_t<TM_, KS_, true>, dyn_smem);       \
-            gemm_f16_nt_kernel_t<TM_, KS_, true>                                   \
-                <<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);            \
-        } else {                                                                   \
-            gemm_smem_optin(gemm_f16_nt_kernel_t<TM_, KS_, false>, dyn_smem);      \
-            gemm_f16_nt_kernel_t<TM_, KS_, false>                                  \
-                <<<grid, 256, dyn_smem, stream>>>(a, b, c, nt, od, id);            \
-        }                                                                          \
+    // #147: one site token per (af32) variant: the opt-in and the launch are
+    // separate checks with separate injections.
+    const char* const attr_site = af32 ? "attr:gemm_f16_a32" : "attr:gemm_f16_f16";
+    const char* const launch_site = af32 ? "launch:gemm_f16_a32" : "launch:gemm_f16_f16";
+    int ok = 0;
+#define GEMM_ONE(TM_, KS_, AF_)                                                        \
+    do {                                                                               \
+        const char* const nm = "gemm_f16_nt_kernel_t<" #TM_ "," #KS_ "," #AF_ ">";     \
+        if (gemm_smem_optin(attr_site, nm, gemm_f16_nt_kernel_t<TM_, KS_, AF_>,        \
+                            dyn_smem)) {                                               \
+            minfer_launch_prelude(launch_site, nm);                                    \
+            gemm_f16_nt_kernel_t<TM_, KS_, AF_>                                        \
+                <<<grid, 256, minfer_launch_smem(launch_site, dyn_smem), stream>>>(    \
+                    a, b, c, nt, od, id);                                              \
+            ok = minfer_launch_ok(launch_site, nm) ? 1 : 0;                            \
+        }                                                                              \
+    } while (0)
+#define GEMM_LAUNCH(TM_, KS_)                                                          \
+    do {                                                                               \
+        dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_);                               \
+        if (af32) {                                                                    \
+            GEMM_ONE(TM_, KS_, true);                                                  \
+        } else {                                                                       \
+            GEMM_ONE(TM_, KS_, false);                                                 \
+        }                                                                              \
     } while (0)
     if (tm >= 128) {
         if (ks >= 64)
@@ -5672,25 +5888,31 @@ void launch_gemm_f16(
             GEMM_LAUNCH(64, 32);
     }
 #undef GEMM_LAUNCH
+#undef GEMM_ONE
+    return ok;
 }
 
 // P6: A arrives as f32 activations; converts inside the kernel on stage.
-void launch_gemm_f32a(
+// #147: returns `launch_gemm_f16`'s own result (1 = launched and accepted) so
+// the af32 path's failed launch is checked by its caller too.
+int launch_gemm_f32a(
     const float* a, const __half* b, float* c,
     int nt, int od, int id, cudaStream_t stream
 ) {
-    launch_gemm_f16(reinterpret_cast<const __half*>(a), b, c, nt, od, id, stream, true);
-    // P6 debug: surface the async launch error (A32-in-capture still fails)
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess)
-        fprintf(stderr, "minfer/cuda: af32 gemm launch failed: %s\n",
-                cudaGetErrorString(e));
-    if (getenv("MINFER_A32_SYNC")) {
-        e = cudaStreamSynchronize(stream);
-        if (e != cudaSuccess)
+    const int ok =
+        launch_gemm_f16(reinterpret_cast<const __half*>(a), b, c, nt, od, id, stream, true);
+    // The launch error (and the opt-in failure) is named inside
+    // `launch_gemm_f16` now (#147); this stays for the opt-in synchronous
+    // fault probe.
+    if (getenv("MINFER_A32_SYNC") && ok) {
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e != cudaSuccess) {
             fprintf(stderr, "minfer/cuda: af32 gemm ASYNC FAULT nt=%d od=%d id=%d: %s\n",
                     nt, od, id, cudaGetErrorString(e));
+            cudaGetLastError();  // named here, cleared here
+        }
     }
+    return ok;
 }
 
 
@@ -7911,40 +8133,32 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
     // own SDS path (the cp.async plane stream vs the scalar decode) — the
     // r53 pattern (no runtime branch in staging).
     const bool dsc = w_dsc != 0;
+    // #147: the opt-in's own return value decides; the pre-#147 code read
+    // `cudaGetLastError()` here, which treated ANY latch (from anywhere) as
+    // "smem/reg cap" and discarded the error code and its origin.
+    const char* const kname =
+        dsc ? "mmq_raw_nb_bt_kernel<8,true>" : "mmq_raw_nb_bt_kernel<8,false>";
+    const void* kfn = dsc ? reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, true>)
+                          : reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, false>);
+    if (!minfer_smem_optin("attr:mmq_raw_nb_bt", kname, kfn, smem)) return 0;
+    minfer_launch_prelude("launch:mmq_raw_nb_bt", kname);
     if (dsc) {
-        cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, true>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        mmq_raw_nb_bt_kernel<8, true><<<grid, 256,
+                                        minfer_launch_smem("launch:mmq_raw_nb_bt", smem),
+                                        stream>>>(w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk,
+                                                  cpart, ks);
     } else {
-        cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_nb_bt_kernel<8, false>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        mmq_raw_nb_bt_kernel<8, false><<<grid, 256,
+                                         minfer_launch_smem("launch:mmq_raw_nb_bt", smem),
+                                         stream>>>(w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk,
+                                                   cpart, ks);
     }
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-    if (dsc) {
-        mmq_raw_nb_bt_kernel<8, true><<<grid, 256, smem, stream>>>(
-            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, cpart, ks);
-    } else {
-        mmq_raw_nb_bt_kernel<8, false><<<grid, 256, smem, stream>>>(
-            w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, cpart, ks);
-    }
-    e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        fprintf(stderr, "minfer/cuda: mmq raw NB-BT launch failed: %s\n",
-                cudaGetErrorString(e));
-        return 0;
-    }
+    if (!minfer_launch_ok("launch:mmq_raw_nb_bt", kname)) return 0;
     if (ks > 1) {
         const int total = nt * od;
         mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
             cpart, c, total, ks);
-        e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            fprintf(stderr, "minfer/cuda: mmq ksplit reduce failed: %s\n",
-                    cudaGetErrorString(e));
-            return 0;
-        }
+        if (!minfer_launch_ok("launch:mmq_raw_nb_bt", "mmq_ksplit_reduce_kernel")) return 0;
     }
     return 1;
 }
@@ -7986,42 +8200,30 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     // r53: EXP is a template constant, so each instantiation keeps only its
     // own B path (the cp.async copy vs the r41 recomb) — no runtime branch.
     const bool exp = w_exp != 0;
+    // #147: the opt-in's own return value decides (see the q4_K launcher).
+    const char* const kname =
+        exp ? "mmq_raw_nb_bt_q6k_kernel<2,true>" : "mmq_raw_nb_bt_q6k_kernel<2,false>";
+    const void* kfn = exp ? reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, true>)
+                          : reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, false>);
+    if (!minfer_smem_optin("attr:mmq_raw_nb_bt_q6k", kname, kfn, smem)) return 0;
+    minfer_launch_prelude("launch:mmq_raw_nb_bt_q6k", kname);
     if (exp) {
-        cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, true>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        mmq_raw_nb_bt_q6k_kernel<KDR, true><<<grid, 256,
+                                              minfer_launch_smem("launch:mmq_raw_nb_bt_q6k", smem),
+                                              stream>>>(w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id,
+                                                        nchunk, bstride, cpart, ks);
     } else {
-        cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_nb_bt_q6k_kernel<KDR, false>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        mmq_raw_nb_bt_q6k_kernel<KDR, false><<<grid, 256,
+                                               minfer_launch_smem("launch:mmq_raw_nb_bt_q6k", smem),
+                                               stream>>>(w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id,
+                                                         nchunk, bstride, cpart, ks);
     }
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-    if (exp) {
-        mmq_raw_nb_bt_q6k_kernel<KDR, true><<<grid, 256, smem, stream>>>(
-            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride,
-            cpart, ks);
-    } else {
-        mmq_raw_nb_bt_q6k_kernel<KDR, false><<<grid, 256, smem, stream>>>(
-            w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id, nchunk, bstride,
-            cpart, ks);
-    }
-    e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        fprintf(stderr, "minfer/cuda: mmq raw NB-BT q6_K launch failed: %s\n",
-                cudaGetErrorString(e));
-        return 0;
-    }
+    if (!minfer_launch_ok("launch:mmq_raw_nb_bt_q6k", kname)) return 0;
     if (ks > 1) {
         const int total = nt * od;
         mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
             cpart, c, total, ks);
-        e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            fprintf(stderr, "minfer/cuda: mmq ksplit q6_K reduce failed: %s\n",
-                    cudaGetErrorString(e));
-            return 0;
-        }
+        if (!minfer_launch_ok("launch:mmq_raw_nb_bt_q6k", "mmq_ksplit_reduce_kernel")) return 0;
     }
     return 1;
 }
@@ -8093,17 +8295,16 @@ extern "C" int launch_mmq_raw_nb_nt(
                    + MMQ_NBJ * 128      // qb_raw
                    + 8 * MMQ_NBJ * 8;   // sds (float2 = 8B)
     dim3 grid((nt + MMQ_NBI - 1) / MMQ_NBI, (od + MMQ_NBJ - 1) / MMQ_NBJ);
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nb_kernel<8>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-    mmq_raw_nb_kernel<8><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
-    e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        fprintf(stderr, "minfer/cuda: mmq raw NB launch failed: %s\n",
-                cudaGetErrorString(e));
+    // #147: the opt-in's own return value decides; the pre-#147 code read
+    // `cudaGetLastError()` here, which treated ANY latch (from anywhere) as
+    // "smem/reg cap" and discarded the error code and its origin.
+    if (!minfer_smem_optin("attr:mmq_raw_nb", "mmq_raw_nb_kernel<8>",
+                           reinterpret_cast<const void*>(&mmq_raw_nb_kernel<8>), smem))
         return 0;
-    }
+    minfer_launch_prelude("launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>");
+    mmq_raw_nb_kernel<8><<<grid, 256, minfer_launch_smem("launch:mmq_raw_nb", smem), stream>>>(
+        w, q8, c, nt, od, id);
+    if (!minfer_launch_ok("launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>")) return 0;
     return 1;
 }
 
@@ -8116,35 +8317,41 @@ extern "C" int launch_mmq_raw_wide_nt(
     // 48B stride (ldmatrix-for-B) + packed scales. KD=8 totals 98,304B and
     // KD=4 73,728B — both inside the ~99KB opt-in cap, 1 block/SM. The
     // attr/launch results are checked: an over-cap request used to fail
-    // SILENTLY (r7 phantom 2124).
+    // SILENTLY (r7 phantom 2124). #147 routes both through the shared named
+    // helpers, so a failure says which call and which instantiation.
     dim3 grid((nt + 127) / 128, (od + 127) / 128);
     if (kd <= 4) {
         const int smem = 4 * MMQ_WBI * 32 + 4 * MMQ_WBI * 8
                        + 8 * MMQ_WBJ * MMQ_WBQ + 2 * 4 * MMQ_WBJ * 4;
-        cudaError_t e = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<4>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-        mmq_raw_wide_nt_kernel<4><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
+        const char* const kname = "mmq_raw_wide_nt_kernel<4>";
+        if (!minfer_smem_optin("attr:mmq_raw_wide_kd4", kname,
+                               reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<4>), smem))
+            return 0;
+        minfer_launch_prelude("launch:mmq_raw_wide_kd4", kname);
+        mmq_raw_wide_nt_kernel<4><<<grid, 256,
+                                    minfer_launch_smem("launch:mmq_raw_wide_kd4", smem),
+                                    stream>>>(w, q8, c, nt, od, id);
+        if (!minfer_launch_ok("launch:mmq_raw_wide_kd4", kname)) return 0;
     } else {
         const int smem = 8 * MMQ_WBI * 32 + 8 * MMQ_WBI * 8
                        + 8 * MMQ_WBJ * MMQ_WBQ + 2 * 8 * MMQ_WBJ * 4;
-        cudaError_t e = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<8>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        if (e != cudaSuccess) { cudaGetLastError(); return 0; }
-        mmq_raw_wide_nt_kernel<8><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
-    }
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        fprintf(stderr, "minfer/cuda: mmq raw wide launch failed: %s\n",
-                cudaGetErrorString(e));
-        return 0;
+        const char* const kname = "mmq_raw_wide_nt_kernel<8>";
+        if (!minfer_smem_optin("attr:mmq_raw_wide_kd8", kname,
+                               reinterpret_cast<const void*>(&mmq_raw_wide_nt_kernel<8>), smem))
+            return 0;
+        minfer_launch_prelude("launch:mmq_raw_wide_kd8", kname);
+        mmq_raw_wide_nt_kernel<8><<<grid, 256,
+                                    minfer_launch_smem("launch:mmq_raw_wide_kd8", smem),
+                                    stream>>>(w, q8, c, nt, od, id);
+        if (!minfer_launch_ok("launch:mmq_raw_wide_kd8", kname)) return 0;
     }
     return 1;
 }
 
-extern "C" void launch_mmq_raw_nt(
+// #147: the terminal raw-narrow launcher (the last resort of the MMQ dispatch)
+// now returns 1 = launched and accepted, 0 = refused. A 0 is an `Err` at the
+// Rust caller, never a silent launch over an un-opted-in dynamic smem.
+extern "C" int launch_mmq_raw_nt(
     int type_id, const uint8_t* w, const uint8_t* q8, float* c,
     int nt, int od, int id, cudaStream_t stream, int kd
 ) {
@@ -8153,16 +8360,26 @@ extern "C" void launch_mmq_raw_nt(
     if (kd <= 4) {
         const int smem = 2 * 4 * MMQ_BI * 40 + 2 * MMQ_BI * 144
                          + 2 * 2 * 4 * MMQ_BI * 4;
-        cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nt_kernel<4>),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        mmq_raw_nt_kernel<4><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
-    } else {
-        const int smem = 2 * 8 * MMQ_BI * 40 + 2 * MMQ_BI * 144
-                         + 2 * 2 * 8 * MMQ_BI * 4;
-        cudaFuncSetAttribute(reinterpret_cast<const void*>(&mmq_raw_nt_kernel<8>),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        mmq_raw_nt_kernel<8><<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id);
+        const char* const kname = "mmq_raw_nt_kernel<4>";
+        if (!minfer_smem_optin("attr:mmq_raw_nt_kd4", kname,
+                               reinterpret_cast<const void*>(&mmq_raw_nt_kernel<4>), smem))
+            return 0;
+        minfer_launch_prelude("launch:mmq_raw_nt_kd4", kname);
+        mmq_raw_nt_kernel<4><<<grid, 256,
+                               minfer_launch_smem("launch:mmq_raw_nt_kd4", smem), stream>>>(
+            w, q8, c, nt, od, id);
+        return minfer_launch_ok("launch:mmq_raw_nt_kd4", kname) ? 1 : 0;
     }
+    const int smem = 2 * 8 * MMQ_BI * 40 + 2 * MMQ_BI * 144
+                     + 2 * 2 * 8 * MMQ_BI * 4;
+    const char* const kname = "mmq_raw_nt_kernel<8>";
+    if (!minfer_smem_optin("attr:mmq_raw_nt_kd8", kname,
+                           reinterpret_cast<const void*>(&mmq_raw_nt_kernel<8>), smem))
+        return 0;
+    minfer_launch_prelude("launch:mmq_raw_nt_kd8", kname);
+    mmq_raw_nt_kernel<8><<<grid, 256, minfer_launch_smem("launch:mmq_raw_nt_kd8", smem), stream>>>(
+        w, q8, c, nt, od, id);
+    return minfer_launch_ok("launch:mmq_raw_nt_kd8", kname) ? 1 : 0;
 }
 
 extern "C" int cuda_shared_per_sm() {
@@ -8195,30 +8412,39 @@ static int mmq_dynamic_smem_bytes() {
 
 extern "C" int cuda_mmq_smem_bytes() { return mmq_dynamic_smem_bytes(); }
 
-extern "C" void launch_mmq_nt(
+// #147: returns 1 = launched and accepted, 0 = refused (the dynamic-smem
+// opt-in failed or the launch errored; both are named at the site). The Rust
+// caller turns a 0 into an `Err`.
+extern "C" int launch_mmq_nt(
     int type_id, const uint8_t* w, const uint8_t* q8, float* c,
     int nt, int od, int id, int q6_stride, cudaStream_t stream
 ) {
     dim3 grid((nt + 63) / 64, (od + 63) / 64);
     // dynamic shared: qa+qb tiles, sda/sds/sds1/sdm (float) + ssa (int)
     const int smem = mmq_dynamic_smem_bytes();
-#define MMQ_LAUNCH(KERN)                                                       \
-    do {                                                                       \
-        cudaFuncSetAttribute(reinterpret_cast<const void*>(&KERN),             \
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
-        KERN<<<grid, 256, smem, stream>>>(w, q8, c, nt, od, id, q6_stride);    \
+    int ok = 0;
+#define MMQ_LAUNCH(NAME, KERN)                                                       \
+    do {                                                                             \
+        if (minfer_smem_optin("attr:mmq_nt", NAME,                                   \
+                              reinterpret_cast<const void*>(&(KERN)), smem)) {       \
+            minfer_launch_prelude("launch:mmq_nt", NAME);                            \
+            (KERN)<<<grid, 256, minfer_launch_smem("launch:mmq_nt", smem), stream>>>( \
+                w, q8, c, nt, od, id, q6_stride);                                    \
+            ok = minfer_launch_ok("launch:mmq_nt", NAME) ? 1 : 0;                    \
+        }                                                                            \
     } while (0)
     switch (type_id) {
-        case 0: MMQ_LAUNCH((mmq_nt_kernel<0, 1, false>)); break;
-        case 1: MMQ_LAUNCH((mmq_nt_kernel<1, 1, false>)); break;
-        case 2: MMQ_LAUNCH((mmq_nt_kernel<2, 1, true>)); break;
-        case 3: MMQ_LAUNCH((mmq_nt_kernel<3, 1, false>)); break;
-        case 4: MMQ_LAUNCH((mmq_nt_kernel<4, 1, true>)); break;
-        case 5: MMQ_LAUNCH((mmq_nt_kernel<5, 1, true>)); break;
-        case 6: MMQ_LAUNCH((mmq_nt_kernel<6, 1, true>)); break;
-        default: MMQ_LAUNCH((mmq_nt_kernel<7, 2, false>)); break;
+        case 0: MMQ_LAUNCH("mmq_nt_kernel<0,1,false>", (mmq_nt_kernel<0, 1, false>)); break;
+        case 1: MMQ_LAUNCH("mmq_nt_kernel<1,1,false>", (mmq_nt_kernel<1, 1, false>)); break;
+        case 2: MMQ_LAUNCH("mmq_nt_kernel<2,1,true>", (mmq_nt_kernel<2, 1, true>)); break;
+        case 3: MMQ_LAUNCH("mmq_nt_kernel<3,1,false>", (mmq_nt_kernel<3, 1, false>)); break;
+        case 4: MMQ_LAUNCH("mmq_nt_kernel<4,1,true>", (mmq_nt_kernel<4, 1, true>)); break;
+        case 5: MMQ_LAUNCH("mmq_nt_kernel<5,1,true>", (mmq_nt_kernel<5, 1, true>)); break;
+        case 6: MMQ_LAUNCH("mmq_nt_kernel<6,1,true>", (mmq_nt_kernel<6, 1, true>)); break;
+        default: MMQ_LAUNCH("mmq_nt_kernel<7,2,false>", (mmq_nt_kernel<7, 2, false>)); break;
     }
 #undef MMQ_LAUNCH
+    return ok;
 }
 
 // ─── Step 82: multi-token MMVQ (nt in [2, 8]) ──────────────────────────
