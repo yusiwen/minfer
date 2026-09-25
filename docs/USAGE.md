@@ -227,6 +227,26 @@ Two environment switches around the GPU are easy to get wrong:
   concurrency still pays one prefill per request, and prefix reuse across slots
   needs a cell copy (C3/D1). The batched-decode win is unaffected.
 
+### Slot saturation
+
+A request that arrives while **every** engine slot is busy is **rejected loudly**, not
+queued (the decision [#121](https://github.com/yusiwen/minfer/issues/121) pinned down).
+The worker answers
+
+- non-streaming: `503 Service Unavailable` with
+  `{"error":{"code":503,"message":"no idle slot","type":"unavailable_error"}}`;
+- streaming: the event stream has already started, so the status line is `200` and the
+  signal is a `data:` **error frame** carrying the same error object (followed by
+  `[DONE]`) — not an empty stream a client could mistake for a generation that produced
+  nothing.
+
+`minfer_jobs_dropped_total` moves by exactly one per rejected request. The alternative —
+holding the request until a slot frees, which `minfer_queue_depth` would then measure and
+which the pre-E2 plan assumed (see `OPENAI-CHAT-API-PLAN.md` §"Slot Lifecycle") — is a
+feature request, [#150](https://github.com/yusiwen/minfer/issues/150); the serial path
+(`MINFER_BATCH=0`) still queues, because its single worker pulls one job at a time from
+the same channel.
+
 ### Structured output (F2)
 
 `/v1/chat/completions` accepts OpenAI's `response_format` and a llama.cpp-style `grammar`

@@ -3747,6 +3747,109 @@ for, and it is correct and free:
   bitwise equal on device, including the `hd = 128, n = 34, start = 64` prefill case
   the fault lived in.
 
+#### E2 follow-up record (#121, 2026-09-25) — a rejected job is answered, not dropped
+
+**The defect.** F8's `minfer_jobs_dropped_total` ([#51](https://github.com/yusiwen/minfer/issues/51))
+exposed it (see the F8 record's *"defect found while gating this"*): `serve_loop`
+calls `admit` on **every** pass, busy or not, and `admit` consumed the `Job` by
+value — so a job it could not place (`no idle slot`) had its
+`mpsc::Sender<StreamEvent>` dropped **without an event**. The handler read the
+closed channel as a *completed* answer: non-streaming `collect_response` returned
+`Ok(("", "stop", 0))` → **HTTP 200 with empty content**; streaming sent an empty
+SSE stream followed by `[DONE]`. A client could not tell a dropped request from a
+model that produced nothing, and the request was silently lost.
+
+Reproduced on this box (CPU, cached 0.5B Q4_0, `MINFER_BATCH=1 --n-slots 1`, two
+concurrent `max_tokens=200` requests, B sent ~0.4 s after A,
+`scripts`-free python client — see the PR):
+
+| | before | after |
+|---|---|---|
+| A | `200`, 976 chars, `finish=length`, 200 completion tokens | unchanged |
+| B, non-streaming | `200`, **0 chars**, `finish=stop`, `completion_tokens=0` | `503`, `{"error":{"code":503,"message":"no idle slot","type":"unavailable_error"}}` |
+| B, streaming | `200`, SSE = role chunk + `[DONE]`, no error frame | `200`, SSE = role chunk + `data: {"error":{"code":503,…}}` + `[DONE]` |
+| `minfer_jobs_dropped_total` | 1 | 1 |
+
+**Decision: reject loudly; queueing is a feature ([#150](https://github.com/yusiwen/minfer/issues/150)).**
+The batched worker admits on every pass instead of holding a backlog, so `--n-slots N`
+bounds concurrent requests and a request arriving while all N are busy is refused. Queueing
+it would turn `admit`'s contract inside out (the caller would own a retry loop **and** a
+bound) for a behaviour nobody asked for, and the rejection is already the measured design:
+`queue_depth` is a near-zero transient, `minfer_jobs_dropped_total` is the honest signal,
+and this ticket's whole point is that the signal must reach the client. The serial path
+(`MINFER_BATCH=0`) already *queues* — its one worker pulls a job at a time from the same
+channel — so the two paths document their difference instead of one of them silently
+losing a request. [#150](https://github.com/yusiwen/minfer/issues/150) tracks making the
+batched path queue with a bound.
+
+**What landed.** `src/server/batch.rs`: `reject(job, e)` sends `StreamEvent::Err` through
+the job's own sender **before** the sender drops and returns the error so the caller can
+still count the rejection; the three paths that give up on a job go through it —
+`admit`'s no-idle-slot branch, `admit`'s failed-group-prefill branch (the install loop is
+its last, infallible step, so nothing was installed) and `submit_on`'s errors (invalid
+slot, busy slot, prompt over the slot context, failed prefill forward). `serve_loop` still
+counts the returned `Err`s, so F8's counter keeps its meaning. `src/server/types.rs`:
+`ApiError` gains `Clone` (the error is sent and returned); `unavailable` was already the
+503 constructor (`status: 503`, `error_type: "unavailable_error"`), rendered by
+`server::error_response` (non-streaming) and `server::to_event` (streaming). A misplaced
+`submit_on` doc comment that sat above `set_prefill_chunk` was moved back to its function
+in passing.
+
+**Audit of every sender-drop path.** `worker_loop_serial`'s `no idle slot` and
+mirostat-refusal branches **already** sent their refusals (`git log -S 'no idle slot' --
+src/server/chat.rs` puts both at Phase 2–6, before F8), and the `no idle slot` branch is
+unreachable in practice anyway: the serial loop pulls one job at a time, so every slot is
+idle when it looks. `BatchEngine::fail` sends; `finish` sends `Finish`;
+`run_job_isolated` turns a job panic into a 500. The handler's own `job_tx.send` failure
+and the drain refusal answer `503` directly, before a `Job` exists. Two residual shapes
+were found and **not** changed: (a) `tick`'s failed forward returns `Err` before any
+per-run `fail`, so the affected runs keep `needs_forward` and `serve_loop` retries the same
+batch forever (a *stuck* sender, not a dropped one) — filed as
+[#151](https://github.com/yusiwen/minfer/issues/151); (b) a panic outside
+`guarded_forward_batch` in `serve_loop` would drop `pending`'s senders, but every
+model-calling path is guarded.
+
+**Gates.** `a_rejected_job_answers_503_and_an_sse_error_frame` (CI, no model) drives the
+real `reject` + `collect_response` + `error_response` + `stream_response` and asserts the
+503 and the SSE error frame. `a_job_rejected_for_want_of_a_slot_is_answered_with_503`
+(`#[ignore]`, real model, one slot, two jobs queued before the loop starts) asserts one
+request is served (`Finish`, tokens > 0) and the other gets **exactly one**
+`StreamEvent::Err` (status 503, `no idle slot`) and nothing else, with
+`jobs_dropped_total` exactly 1. The old F8 round-2 gate kept both receivers dropped, so it
+counted the rejection but could not see the empty `200` — the new gate reads them.
+
+**Mutation checks.** (a) `reject` replaced by `drop(job)` (the pre-fix silent drop): the CI
+gate fails with *"a rejected job must not read as a completed empty answer: (\"\",
+\"stop\", 0)"*, the ignored gate with *"a job's channel closed with 0 event(s) — the #121
+silent drop is back (the handler would answer HTTP 200 with empty content)"*. (b)
+`jobs_dropped_total.fetch_add(dropped, …)` → `fetch_add(0, …)`: the ignored gate fails
+*"exactly one job could not be placed on the one slot: left: 0, right: 1"*; the CI gate
+still passes, because the counter is not its property. Both reverted;
+`sha256sum src/server/batch.rs` equals the pre-mutation value, byte-identical.
+
+**Verification (2026-09-25).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **439 / 0 / 29** unit + **10 / 0 / 6** integration |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **29 / 0** (baseline 28 / 0) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **502 / 0 / 32** unit + **10 / 0 / 6** integration (baseline 501 / 0 / 31) |
+| … `--ignored --test-threads=1`, 0.5B f32 KV | **32 / 0** (baseline 31 / 0) |
+| … `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf --ignored --test-threads=1` | **32 / 0** (baseline 31 / 0) |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt 1.9.0-stable) |
+| `python3 scripts/check_docs_links.py` | **940 relative links / 184 files** (unchanged) |
+
+The counts move by exactly this ticket's two gates (+1 unit pass, +1 `#[ignore]`d
+real-model gate); the F8 serve-loop gate's own numbers (peak running 2, `1 dropped`) are
+unchanged.
+
+**Docs.** `USAGE.md` § *Slot saturation* (the decision, both status shapes, the counter);
+`FEATURES.md` and `OPENAI-CHAT-API-PLAN.md` § *Slot Lifecycle* state the batched/serial
+split (the plan's old *"defer the task in the request queue"* line was never implemented
+by the batched path and is now corrected); `AGENTS.md`'s `server/batch.rs` bullet carries
+the contract and the new counts. `ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap
+closes here.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
@@ -4298,7 +4401,12 @@ chars and `finish=length`; B `200` with 0 chars, `finish=stop`,
 `completion_tokens=0`, plus `[server] job rejected: no idle slot` in the log. It
 is **out of F8's scope** (it changes `admit`'s contract and the error semantics of
 both serve paths), so it was written up as a follow-up:
-[#121](https://github.com/yusiwen/minfer/issues/121).
+[#121](https://github.com/yusiwen/minfer/issues/121). **Fixed 2026-09-25 by #121** —
+`admit`/`submit_on` now answer a job they cannot place through `reject`, so the
+same reproduction reads `B 503 {"error":{"code":503,"message":"no idle slot",…}}`
+(non-streaming) or an SSE error frame (streaming); the E2 follow-up record in §7
+has the before/after transcript, the decision (reject loudly, not queue), the two
+new gates and their mutation checks.
 
 **Device verification (2026-09-24, `NVIDIA GB10` sm_121, CUDA 13.0 / nvcc
 V13.0.88, driver 580.178.04).** Every measurement above is CPU-only, so the two
