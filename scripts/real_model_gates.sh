@@ -14,26 +14,33 @@
 # #99 made the format **per engine** (the loaded model resolves
 # `MINFER_CACHE_TYPE` once, `CParams::kv_format` carries it into the graph, and
 # `GraphAllocator::set_kv_format` gives the CPU kernels the same answer), so all nine
-# KV-region failures are gone from the parallel run. Measured on a CPU build
-# 2026-09-25: serial **29 passed / 0 failed**, parallel **28 passed / 1 failed**. The
-# one parallel failure is not a KV failure: `server_batch_matches_serial_and_is_faster`
-# asserts a wall-clock relation from two sequential whole-workload measurements, so a
-# loaded harness lets the first-measured phase absorb the start-up wave (15.60s
-# batched vs 11.54s serial). That fragility is filed as
-# https://github.com/yusiwen/minfer/issues/154; until it is robust, this wrapper's
-# default (serial) is the documented entry point.
+# KV-region failures are gone from the parallel run. One parallel failure remained:
+# `server_batch_matches_serial_and_is_faster` asserted a wall-clock relation from two
+# sequential whole-workload measurements, so a loaded harness let the first-measured
+# phase absorb the start-up wave — measured **21.20s batched vs 9.95s serial (0.47x)**
+# in parallel against **1.50x** for the same binary serially. #154 replaced that with
+# interleaved matched rounds and the **median of the per-round `serial/batched`
+# ratios** (the shape #123 gave the CUDA map-window gate); the correctness comparison
+# stays a separate full-length pair. Measured on this box 2026-09-25 (CPU): serial
+# **29 passed / 0 failed**; parallel **29 passed / 0 failed** in every run (3 plain
+# harness runs plus 1 under 16 extra CPU spinners), the #154 gate's median
+# 1.379-1.468x plain and 2.159x under the extra load.
 #
-# A **device** build is a different story: the CUDA state is still a process-wide
+# A **device** build is a different story: the CUDA state is a process-wide
 # singleton (`CudaState`: MMQ memo, captured graph execs, stream state), so the
-# device set must run with one thread (issue #64). This wrapper defaults to
-# `--test-threads=1`, which is correct on every build and is the honest "one
-# command" entry point for the gates.
+# device set must run with one thread (issue #64). The wrapper therefore defaults to
+# **serial when `FEATURES` includes `cuda`, and to the parallel form otherwise** —
+# on a CPU-only build the device reason does not exist, the KV-format reason is gone
+# (#99), and the parallel harness is where the #154 timing gate's robustness is
+# exercised, so the default CPU command runs it.
 #
 # Usage:
 #   scripts/real_model_gates.sh [extra cargo test args...]
 #
-#   PARALLEL=1 scripts/real_model_gates.sh        # CPU-only: 27 passed / 1 failed (see #154)
-#   FEATURES=cuda scripts/real_model_gates.sh     # device set, serial (correct)
+#   scripts/real_model_gates.sh                    # CPU-only: parallel, 29 passed / 0 failed
+#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 29 passed / 0 failed
+#   FEATURES=cuda scripts/real_model_gates.sh      # device set, serial (correct: #64)
+#   PARALLEL=1 scripts/real_model_gates.sh         # force parallel (CPU-only; see #64 on a device)
 #
 # The device set's second configuration is a second run of the same command:
 #   MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
@@ -49,9 +56,30 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 cargo_args=(--release --bin minfer)
 [ -n "${FEATURES:-}" ] && cargo_args+=(--features "$FEATURES")
 cargo_args+=(-- --ignored)
-# Serial unless the caller explicitly asks for the CPU-only parallel form.
-[ "${PARALLEL:-0}" = "1" ] || cargo_args+=(--test-threads=1)
+
+# Serial on a device build (the process-wide `CudaState`, issue #64); parallel on a
+# CPU-only build, where that reason does not exist.
+parallel=1
+case ",${FEATURES:-}," in
+  *cuda*) parallel=0 ;;
+esac
+# An explicit PARALLEL=1/0 wins.
+case "${PARALLEL:-}" in
+  1) parallel=1 ;;
+  0) parallel=0 ;;
+esac
+if [ "$parallel" = "1" ]; then
+  case ",${FEATURES:-}," in
+    *cuda*)
+      echo "real_model_gates: warning: PARALLEL=1 on a CUDA build contradicts issue #64 — the" >&2
+      echo "                  device state is a process-wide singleton, so a device measurement may" >&2
+      echo "                  be perturbed by a concurrent test. Serial is the honest device form." >&2
+      ;;
+  esac
+else
+  cargo_args+=(--test-threads=1)
+fi
 cargo_args+=("$@")
 
-echo "+ cargo test ${cargo_args[*]}"
+echo "+ cargo test ${cargo_args[*]} (parallel=$parallel)"
 cargo test "${cargo_args[@]}"
