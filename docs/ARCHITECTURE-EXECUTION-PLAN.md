@@ -883,7 +883,9 @@ bandwidth, not memory.
 
 **Coverage, stated rather than implied.** The packed layout, the parser/policy matrix, the
 store-exactness check, the refusal and the region accounting are unit-tested and run in
-CI. The real-model gate is `#[ignore]`d (it flips a process-wide policy) and was run on
+CI. The real-model gate is `#[ignore]`d (at this record's time it flipped a process-wide KV policy;
+since [#99](https://github.com/yusiwen/minfer/issues/99) the format is per engine and it no longer
+mutates shared state — see the #99 record below) and was run on
 both cached models. Not verified here: any packed region on a GPU (by design, S1 refuses
 it), and the fused dots' performance (S2).
 
@@ -3164,9 +3166,119 @@ that load; the median absorbed them (worst prefill median 1.145, worst decode me
   arithmetic above puts the detection floor at ~15%).
 
 **Follow-ups.** [#87](https://github.com/yusiwen/minfer/issues/87) (device packed-q8_0 attention),
-[#99](https://github.com/yusiwen/minfer/issues/99) (per-engine KV format), and
+[#99](https://github.com/yusiwen/minfer/issues/99) (per-engine KV format — **landed 2026-09-25**;
+its record below removes the global, and with it this record's item-2 `KvFormatGuard`), and
 [#130](https://github.com/yusiwen/minfer/issues/130) (the f16 KV session round trip, found while
 gating this ticket).
+
+#### Test-infrastructure record (#99, 2026-09-25) — the KV format is per engine, and the ignored gate set stops lying in parallel
+
+**What was wrong.** The `#[ignore]`d real-model gate set was red whenever the harness ran it in
+parallel. Measured on the CPU build at `a756419`: **19 passed / 9 failed** parallel against **28
+passed / 0 failed** serially. Every failure had one shape —
+
+```text
+KV region for layer 0 was allocated with 57600 elements but 15300 are requested
+(n_ctx changed on a live GraphCache; the regions are persistent)
+```
+
+— with `57600 / 15300 = 3.765`, exactly the Q8_0 packing ratio. One cause:
+`models::qwen2::graph::tests::a_packed_kv_cache_answers_like_the_f32_one` (the C4 packed gate,
+device-aware since [#123](https://github.com/yusiwen/minfer/issues/123)) called
+`kvformat::set_kv_format(KvFormat::Q8_0)` for its measurement runs. The format was a **process
+global** read by `GraphBuilder::new` and `CpuBackend::new`, so while the gate ran any other test
+building a graph sized its KV nodes for the packed format while its own `GraphCache` — or the model
+it compared against — had been sized under another one; `ensure_kv` refused the mismatch, correctly
+(the regions are persistent). #123's `Drop` guard made the *serial* set deterministic by restoring
+the format on a panic, but it could not remove the hazard for a test running concurrently; the
+parallel red set was the reason the E4 S2 gate run was ambiguous (see the S2 record above).
+
+**The fix (the real one, not the guard).** The format is now a property of the **engine**:
+
+- `models::load_model_configured(gguf, ns, offload, cache_type)` resolves `MINFER_CACHE_TYPE`
+  once against `device()` and stamps the answer on the loaded model
+  (`ModelDef::kv_format` / `set_kv_format`). `load_model_with` / `load_model_ns` are the
+  environment-backed wrappers; the explicit argument is what a test passes instead of mutating the
+  environment (which is process-global too).
+- `CParams::kv_format` carries it into the build and is **part of the reuse identity**, so a cached
+  graph is never reused across formats; `Qwen2Graph::build` / `Qwen3Graph::build` call
+  `GraphBuilder::set_kv_format(params.cparams.kv_format)`, and `GraphBuilder::new` defaults to `F32`
+  instead of reading a global.
+- `GraphAllocator::set_kv_format` gives the **CPU** kernels the same answer
+  (`CpuBackend`'s field, which the registry's `kv_format` hook and `kv_element_format` read);
+  `forward_batch` calls it once per forward with `model.kv_format`.
+- `spec::SpecEngine::new` takes the **target's** format as an argument instead of reading the
+  global; the graph JSON exporter (`graph/json.rs`) takes it from the model.
+- `graph/kvformat.rs`'s `KV_FORMAT` static, `set_kv_format` / `kv_format` and `KvFormat::from_code`
+  are **deleted**, and the obsolete `the_process_wide_format_can_be_redecided` unit test with them
+  (the CPU unit count therefore moves **438 → 437 passed**, same 28 ignored).
+
+**The C4 gate now proves coexistence instead of mutating shared state.** It loads **two engines per
+arm** — one resolved `f32`, one `q8_0` — through `load_model_configured`, in a CPU arm and (on a
+CUDA build with a device) a device arm, and asserts each engine's `kv_format()`, its backend, the
+3x-smaller region and the two logit tolerances (unchanged bounds). The `KvFormatGuard` is gone —
+nothing process-wide is left to restore. The device arm still sets the one process-wide tag #99 left
+in place (`cuda::KV_LAYOUT`, read by the device kernels themselves) under a small
+`DeviceLayoutGuard` that restores it on a panic.
+
+**The CUDA device half is deliberately not done.** `cuda.rs` holds the layout in a process-wide
+`KV_LAYOUT` that the launchers read directly (not through `CudaBackend::kv_layout`), so a per-engine
+device path would need every launcher and the captured-graph key threaded; a per-instance field
+alone would silently still read the global. Filed as
+[#153](https://github.com/yusiwen/minfer/issues/153); `docs/CUDA-BACKEND-DESIGN.md`'s KV-layout
+section states the scope, and the device run keeps the documented serial discipline.
+
+**The entry point.** `scripts/real_model_gates.sh` is the one command for the set: it defaults to
+`--test-threads=1` (required on a device) and takes `PARALLEL=1` (CPU-only parallel) and
+`FEATURES=cuda`. Documented in `AGENTS.md` rule 11 + the real-model-gates bullet and in
+`docs/BUILD.md` §Tests.
+
+**Measured** (CPU build, this box; `--bin minfer` for the gate set).
+
+| run | before (`a756419`) | after |
+|---|---|---|
+| `cargo test --release --bin minfer -- --ignored` (parallel) | 19 passed / **9 failed** | **27 passed / 1 failed** |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` | 28 passed / 0 failed | **28 passed / 0 failed** |
+| `cargo test --release` (unit + integration) | 438 / 0 / 28 + 10 / 0 / 6 | **437 / 0 / 28 + 10 / 0 / 6** |
+| C4 gate alone (`[c4]` print) | — | cpu: f32 6 291 456 B vs q8_0 1 671 168 B (**3.76x**), max \|Δlogit\| **3.0289** of a 37.79 spread; shifted max \|Δlogit\| **2.4662** |
+
+The single remaining parallel failure is **not** a KV failure and not a #99 regression:
+`server::batch::tests::server_batch_matches_serial_and_is_faster` asserts a **wall-clock** relation
+(`t_serial > t_batch`) from two sequential whole-workload measurements, so under a loaded parallel
+harness the first-measured phase absorbs the start-up wave — measured **17.59s batched vs 9.94s
+serial** on the first run and **18.39s vs 9.75s** on a second, while the serial set passes it. All
+nine KV-region failures are gone. The load-sensitive assertion is the same class #123 fixed for the
+CUDA map-window gate and is filed as [#154](https://github.com/yusiwen/minfer/issues/154); until it
+is robust, the **serial** invocation is the documented entry point.
+
+**Mutation check** (reverted byte-identically; `sha256sum -c` on all three files). Re-introducing
+the #99 shape — a process-global format read by `GraphBuilder::new`, flipped by the C4 gate per run
+— makes the parallel set **20 passed / 8 failed**, every failure the `KV region … was allocated with
+N elements but M are requested` string with the 3.765x ratio. So the parallel gate set is what
+detects the interference, and the per-engine path is what removes it.
+
+**Honest scope.**
+
+- **Metal is not exercised** (no Mac; CI's `build-macos` job compiles the backend only). The
+  per-engine plumbing is backend-agnostic; Metal's `kv_format` hook still reads
+  `metal::kv_cache_is_f16`, and its packed format is G5 on
+  [#44](https://github.com/yusiwen/minfer/issues/44) either way.
+- **The device (CUDA) parallel run is still not green and is not claimed.** `CudaState` is a
+  process-wide singleton (MMQ memo, captured graph execs, stream state — issue
+  [#64](https://github.com/yusiwen/minfer/issues/64)) and the device KV layout tag is process-wide
+  on top of that; `cargo test --release --features cuda -- --ignored` without `--test-threads=1`
+  remains the wrong command, and `scripts/real_model_gates.sh` keeps it serial.
+- An **explicit `f16`** cache type still lets the *device* layout follow
+  `set_kv_cache_type`'s auto policy (the pre-C4 split the loader comment records); the builder's
+  f32/f16 region shapes are identical, so that is not a sizing hazard. A packed (`q8_0`) resolution
+  is still restated explicitly on the device, as before.
+- The `forward_graph` (non-cached) path uses the process-global `graph_cache()`; two *models* with
+  different formats driving that one cache would still be refused by `ensure_kv`. That is the
+  pre-existing single-cache-per-process design, not the format global, and the server/CLI paths
+  that matter pass a `GraphCache` explicitly.
+
+**Follow-ups.** [#153](https://github.com/yusiwen/minfer/issues/153) (the CUDA per-graph layout),
+[#154](https://github.com/yusiwen/minfer/issues/154) (the load-sensitive batching timing gate).
 
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 

@@ -422,6 +422,18 @@ Before C4 S2b this was a `bool` that mapped anything not exactly `f16` to f32 �
 addressed a packed region as f32 rows, the silent corruption the layout tag exists to make
 impossible.
 
+**Per-engine scope ([#99](https://github.com/yusiwen/minfer/issues/99)).** #99 made the KV *format*
+per engine for the model, the graph builder (`CParams::kv_format`), the allocator and the CPU
+kernels; **this device layout is deliberately still a per-load process policy.** The kernels read
+`crate::cuda::KV_LAYOUT` themselves (not through `CudaBackend::kv_layout`), so the tag a weight
+load / `set_kv_cache_layout` installs is what every KV kernel in the process runs — the same
+process-wide shape `CudaState`'s other state has. Making the layout per-graph means threading it
+through every launcher in `cuda.rs` and the captured-graph key, which is filed as its own follow-up;
+the discipline for now is the documented serial device run (`scripts/cuda_test.sh`,
+`scripts/real_model_gates.sh`). The loader keeps the two halves in step: `load_model_configured`
+restates `KV_LAYOUT_Q8_0` when the resolved format is packed, so the region the builder sizes and
+the kernel that addresses it cannot disagree within one engine.
+
 **Host transfers.**
 
 - **H2D fills** go through a lazy ring of 8 × 2 MiB pinned slots (`write_input_async`): the Rust slice
