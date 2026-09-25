@@ -317,6 +317,19 @@ fn load_tensor(
                         );
                     }
                 }
+            } else if ttype == TensorType::F16 {
+                // #141: f16 weights register raw (2 B/element) and the device
+                // matmul kernel converts in-register — no f32 copy is made, so
+                // the memory the f16 file exists to save is actually saved.
+                // Deliberately NOT in the quantized `matches!` above: that
+                // branch's q4_K dsc plane gate has no type check, so an f16
+                // weight with passing geometry would build a garbage plane no
+                // kernel can read.
+                cuda.register_weight(&reg_name, tensor.data());
+                // r60: f16 is not NB-BT-consumable either — its GEMM reads the
+                // f32 activations, so a mode-2 skip-write producer upstream
+                // would feed it a dead buffer.
+                cuda.clear_mmq_nb_bt_only();
             } else if ttype == TensorType::F32 {
                 cuda.register_weight(&reg_name, tensor.data());
                 // r60: a 2-D F32 weight is an f32 MATMUL weight (norms/biases
