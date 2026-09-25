@@ -5655,11 +5655,120 @@ type's bytes of the same length** — q4_0 shares q4_K's ratio exactly, which is
 not redundant; the pair is the contract, and only the pair is tested. (c) The `#[ignore]`d real-model
 gate assumes the default full offload plan (all blocks fit), which holds for every cached small
 model it runs on; a *partial* plan would register fewer planes than the GGUF index implies. (d)
-**A separate loader divergence is filed, not fixed**:
-[#167](https://github.com/yusiwen/minfer/issues/167) — the qwen3 loader lacks both the q4_K dsc
-plane this record gates and the f16 registration branch #141 gave qwen2, so a q4_K Qwen3 runs the
-in-kernel scalar dsc decode and an f16 Qwen3 model drops to the CPU on CUDA (read from the loader,
-not device-verified — no f16 Qwen3 GGUF is cached here).
+**A separate loader divergence was filed here, and is fixed in F6d**
+([#167](https://github.com/yusiwen/minfer/issues/167)): at the time the qwen3 loader lacked both
+the q4_K dsc plane this record gates and the f16 registration branch #141 gave qwen2, so a q4_K
+Qwen3 ran the in-kernel scalar dsc decode and an f16 Qwen3 model dropped to the CPU on CUDA (read
+from the loader then; device-verified in F6d, 2026-09-25).
+
+### F6d — the qwen3 loader shares qwen2's registration rule: f16 + the q4_K dsc plane (#167) — **DONE 2026-09-25**
+
+**What landed.** [#167](https://github.com/yusiwen/minfer/issues/167), the loader divergence F6c filed
+((d) above). Each loader carried its own copy of the `#[cfg(feature = "cuda")]` per-tensor
+registration block, and the copies had drifted twice:
+
+- the qwen3 copy had **no `register_weight_q4k_dsc` call** (r59), so a q4_K Qwen3 weight kept
+  `mmq_raw_nb_bt`'s in-kernel scalar dsc decode — correct, but the r59 prefill win was not available
+  to Qwen3 even though the same kernel consumes both models;
+- it had **no `TensorType::F16` branch** (#141), so an f16 Qwen3 weight was never registered and the
+  all-or-nothing `weights_on_cuda` gate dropped the whole model to the CPU even on a build with the
+  f16 kernels. Registering would not have been enough on its own: the **qwen3 graph's own type gate**
+  (`Qwen3Graph::weights_on_cuda` → `matmul_t_ok`/`embed_t_ok`) was missing `F16` as well.
+
+**The shared rule.** `src/models/weight_reg.rs` now owns the dispatch. `cuda_weight_reg` is the pure
+decision — no `CudaState`, no environment (the r59 dispatch gates are passed in), so CI's CPU job
+*runs* its tests exactly like `src/q4k_dsc.rs` — and the `cuda`-gated `register_cuda_weight` carries
+it out. Both `models/qwen2/loader.rs` and `models/qwen3/loader.rs` call it for every tensor the E5
+plan puts on the device, so the type coverage has one authority and cannot diverge by edit. It
+carries: the quantized set, the F16 raw branch, F32 (1-D norms/biases vs 2-D matmul weights), the
+Q6_K padded repack, the q8_0 p32 split plane, the q4_K `W_dsc` plane under
+`q4k_dsc_plane_admitted`, and the `clear_mmq_nb_bt_only` rule. The **Metal** per-tensor blocks were
+deliberately *not* folded in: Metal's admitted set is different and an f16 weight must stay refused
+there ([#164](https://github.com/yusiwen/minfer/issues/164)), so the extraction is CUDA-only and
+Metal's per-loader blocks are untouched (CPU/Metal behaviour unchanged is part of the acceptance).
+`Qwen3Graph::weights_on_cuda` gained `TensorType::F16` in `matmul_t_ok` and `embed_t_ok`, matching
+qwen2's list; `CudaState::q4dsc_plane_for` was added so a gate can read the same pointer-keyed map
+`mmq_raw_nb_bt` reads.
+
+**Audit finding folded in.** The extracted F32 arm used to test `tensor.shape.len() == 2`, but
+`Tensor::shape` is a `[i64; 4]`, so the test was **always false** in both loaders and the
+NB-BT-only flag was never cleared for a 2-D f32 matmul weight. The shared rule takes the real rank
+(`gguf_write::ggml_n_dims`) instead. It can only disable the mode-2 skip-write MMQ optimization
+(never change a result), and no model in the gate set has a 2-D f32 matmul weight — pinned by
+`only_a_2d_f32_weight_clears_the_nb_bt_flag`.
+
+**Test models.**
+
+| Model | Provenance | Size |
+|---|---|---|
+| `/tmp/f167-work/qwen3-q4k.gguf` | HuggingFace **`unsloth/Qwen3-0.6B-GGUF`** `Qwen3-0.6B-Q4_K_M.gguf` (the official `Qwen/Qwen3-0.6B-GGUF` repo ships only Q8_0); a real Q4_K_M mix — 168 q4_K + 29 other quantized 2-D tensors | 396 705 472 B |
+| `/tmp/f167-work/qwen3-f16.gguf` | `llama-quantize --allow-requantize <cached `Qwen3-0.6B-Q8_0.gguf`> … F16` — 2-D f16, 1-D f32 | 1 198 182 048 B |
+| `/tmp/f167-work/qwen3-q4_0.gguf` | `minfer quantize --type q4_0` of the cached Q8_0 — the **ratio-equal** negative control (q4_0's bytes/element is exactly q4_K's) | 419 245 728 B |
+| `/tmp/f167-work/qwen3-f16-minfer-quantize.gguf` | `minfer quantize --type f16` of the cached Q8_0 — **not usable**, see below | 1 198 050 976 B |
+
+`minfer quantize --type f16` was tried first, as the ticket suggested, and does **not** work: it is a
+pure element cast, so it writes the 1-D norms as f16 too, and the engine's f16 contract requires 1-D
+**f32** (the CPU RMSNorm reads `Tensor::data_f32`, which asserts F32). Loading that file panics at
+`src/tensor.rs:277` — `data_f32 on 'blk.0.attn_norm.weight' of type F16`. The new gate asserts
+1-D-stays-f32 (which is what caught it) and the f16 model was then produced with `llama-quantize`,
+which follows llama.cpp's "except 1d tensors" rule. The tooling gap is filed as
+[#169](https://github.com/yusiwen/minfer/issues/169).
+
+**Measured acceptance (GB10, sm_121, CUDA 13.0, driver 580.178.04).**
+
+| Criterion | Result |
+|---|---|
+| `f167_qwen3_q4k_registers_the_dsc_plane_exactly` — planes vs the GGUF index | **168 planes / 95 420 416 B**, exactly the index's admissible set (168 q4_K, 29 other quantized 2-D); the kernel's own pointer-keyed lookup finds every one; the q8_0 and **q4_0** negative arms register **0** |
+| `f167_f16_qwen3_weights_run_on_the_cuda_device` | `device() == Cuda`; 28/28 blocks + embed/output on the device (1137.0 MiB); **197 f16 matmul + 1 f16 embed node** assigned `Backend::CUDA`; device-vs-CPU max \|Δlogit\| **8.92e-3** (mean 1.25e-3) / **4.46e-4** relative at max \|logit\| 19.99; greedy `[12095, 13, 576, 6722]` identical, asserted at ≤ 0.05 and ≤ 1e-3 |
+| `cargo test --release --features cuda -- --test-threads=1` | **521 passed / 0 failed / 36 ignored** (baseline 516 / 0 / 34) |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B and Qwen3-0.6B-Q8_0 configs) | **36 passed / 0 failed** both (baseline 34 / 0) |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0 errors** over 521 passed / 0 failed / 36 ignored (353.44 s) |
+| `cargo test --release` (CPU) | **452 passed / 0 failed / 32 ignored** unit (baseline 447 / 0 / 30; +5 pure `weight_reg` tests, +2 `cuda`-gated ignored) + **10 / 0 / 6** integration, unchanged |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU) | **32 passed / 0 failed** (baseline 30 / 0; the two new `#[ignore]`d gates no-op and pass on a CPU build) |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt **1.9.0-stable**; the pinned toolchain has no `rustfmt` component, CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **940 relative links in 184 files**, unchanged |
+
+The device-vs-CPU spread is ~100× the 0.5B f16 gate's (7.34e-5 / 4.0e-6) because Qwen3 runs **four**
+norms per layer (`attn_norm` + per-head `q_norm`/`k_norm` + `ffn_norm`) and the CPU rms_norm (8-lane
+AVX2 FMA plus an f64 tail, then `1/sqrt`) and the device rms_norm (warp-shuffle f32, then `rsqrtf`)
+differ in reduction order and reciprocal-sqrt form; the greedy continuation and the argmax agree, and
+a wrong f16 row would move the logits by O(1).
+
+**Gates.** Five pure tests in `src/models/weight_reg.rs` (CI's CPU job *runs* them): the F16 arm;
+the q4_K dsc decision with each of its four gates refused independently (r59 gates off, odd `od`,
+the q4_0 type control, a longer q8_0 payload) plus a q4_K positive control; the quantized arm's
+pre-#167 dispatch (q6_K padded, q8_0 p32, every other quant raw + flag-clear, q4_K never clearing);
+the 1-D vs 2-D f32 rank rule; and a three-way variant discriminator. Two `#[ignore]`d real-model
+gates: the q4_K plane set (exact names/count against the GGUF index, the kernel's pointer map per
+weight, distinct non-null buffers, and the two negatives) and the f16 device path (placement asserted
+per node, then the numeric comparison). The plane gate calls `CudaState::init()` itself, so running it
+alone does not silently skip for lack of a device — a skip-shaped pass was found and removed during
+the mutation campaign.
+
+**Mutations (reverted; files restored byte-identical, `sha256sum`).**
+(a) the F16 arm removed from `cuda_weight_reg` → the pure f16 test fails and the device gate fails at
+*left: Cpu, right: Cuda*; (b) `F16` removed from `Qwen3Graph::weights_on_cuda`'s `matmul_t_ok` → the
+same device-gate failure, so the graph type gate is separately load-bearing; (c) the q4_K admission
+bypassed (`q4k_dsc = gates && od % 2 == 0`) → the pure test fails and the real-model gate fails on
+its **q4_0** negative arm (planes registered for a ratio-equal type); the q8_0 arm alone could *not*
+catch this, because the registry's own payload re-check refuses a longer payload — which is exactly
+why the q4_0 arm was added; (d) the plane forced off → the pure test fails and the real-model gate
+fails with 0 registered against 168 expected. Each mutation was re-run after the rustfmt pass and
+reverted with `sha256sum -c` OK.
+
+**Honest scope.** (a) The **prefill win the dsc plane buys is not measured here** — the gate proves
+the plane exists, contains the right weights, and that the kernel's pointer-keyed lookup finds each;
+the r59 dsc prefill A/B on Qwen3 is not run. (b) The q4_K test model is a community quant
+(unsloth) because the official Qwen Qwen3-0.6B GGUF repo has only Q8_0; it is a real Q4_K_M mix, not
+a uniform q4_K, which is stronger for the type gate but means the per-tensor set is that file's.
+(c) The f16 test model is `llama-quantize`'s F16 of the cached Q8_0, so its weights are a q8_0
+re-quantization, not an HF bf16/f16 checkpoint; it preserves the 2-D-f16/1-D-f32 shape contract and
+is the same class of file #141 gated. (d) The f16 device gate's absolute bound (0.05) is looser than
+f141's (0.01) for the stated Qwen3 reason; the relative bound stays 1e-3. (e) An f16 Qwen3 file with
+**f16 1-D norms** is not loadable (CPU panic; on CUDA `norm_weight` has no type gate, so the kernel
+would read f16 bytes as f32) — not device-verified because the CPU panic is reached first; that
+tooling gap is [#169](https://github.com/yusiwen/minfer/issues/169). (f) `minfer quantize
+--type f16` was left unchanged: fixing it is #169, out of this loader-focused ticket.
 
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 

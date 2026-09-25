@@ -143,6 +143,18 @@ Every graph-referenced tensor is uploaded once at model load and referenced by n
   2-bit K-quant: 84/256) is *shorter* than the row arithmetic needs, so the size check is what
   refuses it instead of reading past the tensor. The check cannot tell a q4_K payload from another
   type's bytes of the same length — that is the type gate's job.
+- **The per-tensor registration dispatch is one shared rule** (`src/models/weight_reg.rs`,
+  issue [#167](https://github.com/yusiwen/minfer/issues/167)). Both loaders call
+  `register_cuda_weight` for every tensor the E5 plan puts on the device; it carries the whole
+  contract: the quantized-type `matches!` set, the F16 raw branch, the F32 (1-D norms/biases vs
+  2-D matmul weights) branch, the Q6_K padded repack, the q8_0 p32 plane, the q4_K `W_dsc` plane
+  under `q4k_dsc_plane_admitted`, and the `clear_mmq_nb_bt_only` rule. The **decision**
+  (`cuda_weight_reg`) is pure — no `CudaState`, no environment; the r59 dispatch gates are passed
+  in — so CI's CPU job *runs* its tests, exactly like `src/q4k_dsc.rs`. Both loaders previously
+  carried a copy of this block and the copies had drifted twice: the qwen3 copy had neither the
+  f16 branch (#141) nor the q4_K dsc call (r59/#165), so an f16 Qwen3 fell to the CPU and a q4_K
+  Qwen3 kept the in-kernel scalar dsc decode. The graph-side type gate is per architecture and
+  must list the same types (`Qwen3Graph::weights_on_cuda` gained F16 in #167).
 - A per-weight f16 dequant cache (`w16_cache`) is enabled by the loader only when quantized matmul
   weights exceed 2 GiB **and** MMQ is off; `MINFER_NO_W16CACHE=1` reverts.
 - `ModelLoadGuard` (reentrant, process-wide) serializes loader registration so two models with
@@ -830,6 +842,51 @@ from another type's bytes of the same length (q4_0 shares q4_K's ratio exactly),
 type gate is not redundant.
 
 ---
+
+### 7.7 Issue #167 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
+
+The qwen3 loader's registration block had drifted from qwen2's twice: it had no r59
+`register_weight_q4k_dsc` call (so a q4_K Qwen3 kept `mmq_raw_nb_bt`'s in-kernel scalar dsc decode)
+and no `TensorType::F16` branch (#141, so an f16 Qwen3 model was dropped to the CPU); the qwen3
+graph's `weights_on_cuda` was missing `F16` as well, so registering alone would not have been
+enough. Fixed by §2.3's shared rule (`src/models/weight_reg.rs`; both loaders call
+`register_cuda_weight`) plus `Qwen3Graph::weights_on_cuda`'s two F16 arms and
+`CudaState::q4dsc_plane_for` (the same pointer-keyed lookup `mmq_raw_nb_bt` performs).
+
+**Verified.** `f167_qwen3_q4k_registers_the_dsc_plane_exactly` loads a HuggingFace Q4_K_M
+Qwen3-0.6B and asserts the registered `*__q4dsc*` set **equals** the GGUF index's admissible q4_K
+set by name and count: **168 planes / 95 420 416 B** (168 q4_K among 29 other quantized 2-D
+tensors), each found by the kernel's own `q4dsc_plane_for`, each non-null and distinct; a q8_0 and a
+**q4_0** negative arm register **0** (q4_0 shares q4_K's bytes/element exactly, so it is the only
+negative that can catch a type-gate bypass). `f167_f16_qwen3_weights_run_on_the_cuda_device` shows
+28/28 blocks + embed/output on the device (1137.0 MiB), **197 f16 matmul + 1 f16 embed node**
+assigned `Backend::CUDA`, and device-vs-CPU max |Δlogit| **8.92e-3** (mean 1.25e-3) / **4.46e-4**
+relative at max |logit| 19.99, greedy `[12095, 13, 576, 6722]` identical — asserted at ≤ 0.05 and
+≤ 1e-3. Qwen3's spread is ~100× the 0.5B f16 gate's (7.34e-5 / 4.0e-6) because it runs four norms
+per layer and the CPU rms_norm (8-lane AVX2 FMA + f64 tail, `1/sqrt`) and the device rms_norm
+(warp-shuffle f32, `rsqrtf`) differ in reduction order and reciprocal-sqrt form.
+
+Suites: `cargo test --release --features cuda -- --test-threads=1` **521 passed / 0 failed / 36
+ignored** (baseline 516 / 0 / 34); `FEATURES=cuda scripts/real_model_gates.sh` **36 / 0** at both
+the 0.5B and the Qwen3-0.6B-Q8_0 config (baseline 34 / 0); `compute-sanitizer --tool memcheck` over
+the serial unit suite **0 errors** (521 / 0 / 36 in 353.44 s); CPU `cargo test --release` **452 / 0
+/ 32** unit + **10 / 0 / 6** integration, `PARALLEL=0 scripts/real_model_gates.sh` **32 / 0**.
+
+**Mutations (reverted; `sha256sum` byte-identical).** (a) the F16 arm removed from
+`cuda_weight_reg` → the pure f16 test fails and the device gate fails at *left: Cpu, right: Cuda*;
+(b) F16 removed from `Qwen3Graph::weights_on_cuda`'s `matmul_t_ok` → the same failure; (c) the q4_K
+admission bypassed (`q4k_dsc = gates && od % 2 == 0`) → the pure test fails and the real-model gate
+fails on its **q4_0** negative arm (the q8_0 arm alone cannot catch it: the registry re-checks the
+payload and refuses a longer one); (d) the plane forced off → the pure test fails and the gate
+fails at 0 planes against 168 expected.
+
+**Honest scope.** The r59 dsc **prefill win is not measured** — the gate proves the plane set is
+exactly right and the kernel finds it, not a Qwen3 prefill speedup. The q4_K model is a community
+Q4_K_M (the official Qwen Qwen3-0.6B GGUF repo ships only Q8_0) and the f16 model is
+`llama-quantize --allow-requantize … F16` of the cached Q8_0; `minfer quantize --type f16` was
+tried first and writes f16 **1-D norms**, which the engine cannot load (filed as
+[#169](https://github.com/yusiwen/minfer/issues/169)). The plane gate needs
+`/tmp/f167-work/qwen3-q4k.gguf` and skips (printing why) when it is absent.
 
 ## 8. Out of Scope / Future
 

@@ -38,7 +38,15 @@ CPU as in every other row.
 and the embedding gather has its own f16 kernel — the weights stay 2 B/element
 on the device, which is the point of the format. No MMQ route: MMQ streams
 *quantized* bytes and f16 is not one of its formats, so an f16 prefill runs the
-f32-activation kernel.
+f32-activation kernel. **Both supported architectures** (Qwen2/Qwen2.5 and
+Qwen3) use it: [#141](https://github.com/yusiwen/minfer/issues/141) landed the
+registration branch and the graph type gate in the qwen2 loader/graph only, so
+until [#167](https://github.com/yusiwen/minfer/issues/167) an f16 **Qwen3**
+model fell to the CPU on a CUDA build even though these kernels existed; the
+loaders now share one registration rule (`models::weight_reg`). The engine's f16
+**file** contract is 2-D tensors f16 and 1-D norms/biases f32 (llama.cpp's rule;
+`mat_mul_f16`/the f16 embed decode have no f16-norm sibling) — what `minfer
+convert --outtype f16` writes.
 ⁵ **Metal refuses f16 weights**, so an f16 GGUF runs the CPU path there
 (loudly, through the loader's all-or-nothing registration check). A registered
 weight with no kernel would be a silent wrong path, which is exactly what that
