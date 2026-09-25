@@ -3971,6 +3971,104 @@ by the batched path and is now corrected); `AGENTS.md`'s `server/batch.rs` bulle
 the contract and the new counts. `ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap
 closes here.
 
+#### E2 follow-up record (#151, 2026-09-25) — a failed decode step answers its batch
+
+**The defect.** The mirror of [#121](https://github.com/yusiwen/minfer/issues/121): there the
+sender was dropped without an event; here it was **never dropped and never answered**.
+`BatchEngine::tick` built one batch from every run with `needs_forward` set and called
+`guarded_forward_batch(...)?` — the `?` returned **before** the per-row loop that takes each
+`needs_forward` and before `advance`/`fail`, and `serve_loop` only logged
+`[server] step failed: …`. So every run kept `needs_forward = Some(tok)`, the next pass rebuilt
+the **same** batch and retried the **same** forward. A deterministic failure (a kernel-invariant
+violation, an E4 activation-budget refusal, an `ensure_kv` format mismatch, a panic caught by
+`guarded_forward_batch`) failed forever at 100% CPU; no client was ever told, `in_flight` stayed
+≥ 1, so a graceful drain ran out its whole `MINFER_DRAIN_MS` deadline.
+
+Reproduced on this box (CPU, no model — a test double whose `forward_batch` panics, driven
+through the **real** `guarded_forward_batch` and the real `serve_loop`, with the handler's
+`InFlight` guard held until the stream ends and a 500 ms drain window):
+
+| | before | after |
+|---|---|---|
+| `serve_loop` returns | **never** (3 s window) | yes |
+| decode forwards attempted | **955 907 in 3 s** (≈319 k/s — the spin) | 2 (1 prefill + 1 decode) |
+| `StreamEvent::Err` to the client | **0** | **1** (status 500) |
+| `Finish` | 0 | 0 |
+| `in_flight` after the drain deadline | **1** (stuck) | 0 |
+| `running` after the step | 1 | 0 |
+
+**Decision: answer every row of the failed batch, once, and do not retry.** The forward is one
+weight pass, so the failure belongs to every row it carried — not to a slot, and not to a run
+that was not in it. `tick` already builds `rows: Vec<usize>` (the slot index per batch row) while
+collecting the pending tokens; that list **is** the membership test, so a run whose
+`needs_forward` was unset (already sampled) or that did not fit `MAX_BATCH` is untouched. Each
+affected run goes through the existing `fail`, which is exactly the shape
+[#121](https://github.com/yusiwen/minfer/issues/121)'s `reject` established per job: one
+`StreamEvent::Err` through the run's **own** sender, the run taken (slot freed) and
+`cached_tokens` cleared — a forward that failed part-way may have written rows the mirror does
+not describe, and reusing that prefix is the one thing a failure must not lead to. Clearing the
+slot is also what stops the retry: with `needs_forward` gone the next `tick` builds a different
+batch (or none). **No retry is a choice, not an oversight**: every reachable class here is
+deterministic and request-fatal, and a caught panic may have left the shared arena half-written,
+so trying again can only spin (the defect) or read a corrupted arena. The failure is answered for
+**these runs only** — nothing is latched on the server, so a later request builds a fresh batch.
+A transient failure would therefore still cost these particular requests their answer: that is
+the honest trade against the old infinite retry, and a genuinely transient class (if one ever
+appears) belongs in the backend as a retry around the device op. The error attribution is
+`ApiError::server` (`500 server_error`) — the **step** failed; `503 unavailable_error` stays the
+saturation refusal of #121/#150.
+
+**What landed.** `src/server/batch.rs`: `tick`'s forward is a `match`; its `Err` arm calls
+`fail_batch(&rows, &e)` and then still returns `Err(e)`, so `serve_loop` keeps its "step failed"
+signal while every affected run has been answered. `fail_batch` (`rows` empty ⇒ no-op) loops over
+`rows` calling `fail`, then prints one line naming how many runs it answered and that their slots
+were released. No behavior change on the success path, and no new test-only seam in the engine:
+the gate's injection is a `ModelDef` double, so the real `guarded_forward_batch` → `ApiError::server`
+path is what runs.
+
+**Gates.** `a_failed_decode_forward_answers_a_single_run_and_releases_its_slot` and
+`a_failed_decode_forward_answers_every_row_in_the_batch` (both plain `#[test]`, **CI** — no model
+on disk): the double's `forward_batch` panics and counts attempts; each gate asserts one
+`StreamEvent::Err` (500, `server_error`, non-empty message) and no `Finish`/`Text` per affected
+run, the sender closed and the slot free, `cached_tokens` cleared, and — after a second `tick` —
+that the attempt count did **not** grow (the bounded no-retry assertion, so a broken build fails
+instead of hanging). The multi-slot gate also installs a live run with `needs_forward = None` and
+asserts it survives with its prefix intact and its channel open. The real-model batched-vs-serial
+gates keep their counts (the new gates need no model).
+
+**Mutation checks.** (a) the pre-fix early `return` (no `fail_batch`): both gates fail with
+*"exactly one error, not zero and not a retry: left: 0, right: 1"* (and the multi-slot one with
+*"slot 0: exactly one error"*). (b) answer the run but do not take it / clear it (the slot not
+released): both fail with *"the run's sender is dropped: the slot is released"* / *"slot 0:
+released"*. Both reverted; `sha256sum src/server/batch.rs` equals the pre-mutation value,
+byte-identical (`725827f6…`).
+
+**Verification (2026-09-25).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **440 / 0 / 29** unit + **10 / 0 / 6** integration (baseline 438 / 0 / 29) |
+| `cargo test --release --bin minfer -- --ignored --test-threads=1` (CPU) | **29 / 0** (unchanged) |
+| `cargo test --release --features cuda -- --test-threads=1` (GB10 sm_121) | **503 / 0 / 32** unit + **10 / 0 / 6** integration (baseline 501 / 0 / 32) |
+| … `--ignored --test-threads=1`, 0.5B f32 KV | **32 / 0** (unchanged) |
+| … `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf --ignored --test-threads=1` | **32 / 0** (unchanged) |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt 1.9.0-stable) |
+| `python3 scripts/check_docs_links.py` | **940 relative links / 184 files** (unchanged) |
+
+The CPU/CUDA unit counts move by exactly this ticket's two gates (+2). The `#[ignore]`d set does
+not move (the new gates are CI-covered). The baseline at `ee4d0e1` measured **438 / 0 / 29** unit
+on CPU, one below the `#121` record's literal 439 — the #94 count-drift class, recorded here
+rather than rewritten into another ticket's dated record.
+
+**Docs.** `AGENTS.md`'s `server/batch.rs` bullet carries the mirror case next to #121's;
+`OPENAI-CHAT-API-PLAN.md` § *Slot Lifecycle* step 5 and the *Error Types* table state the failed
+step (one 500 per affected run, no retry) and its note no longer claims the batched path defers;
+`FEATURES.md`'s `serve` bullet names it. `ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap
+closes here — this is robustness inside an existing row (item 3, *Batch composition + continuous
+batching*), not a new capability. [#154](https://github.com/yusiwen/minfer/issues/154) (the
+wall-clock flake of `server_batch_matches_serial_and_is_faster` under the parallel harness) is
+left as-is on purpose; the ignored set is run serially.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define

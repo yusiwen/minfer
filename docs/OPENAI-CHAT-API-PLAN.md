@@ -814,7 +814,13 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
 4. Run prefill on the slot's KV regions (positions 0..nt); if prompt length exceeds the slot's
    remaining context, see [Context Overflow Handling](#context-overflow-handling)
 5. Autoregressive generation loop (penalties → top-k → top-p → temperature; stop-string / EOS /
-   max_tokens / context-full termination)
+   max_tokens / context-full termination). A **decode forward that fails** is answered, not
+   retried: every run whose row was in that one weight pass gets exactly one `StreamEvent::Err`
+   (`500 server_error`) through its own stream, its `cached_tokens` are cleared and its slot is
+   freed ([#151](https://github.com/yusiwen/minfer/issues/151)) — a run whose row was not in the
+   failed batch is left alone. The failure is not retried, because the reachable classes are
+   deterministic (a kernel invariant, an activation-budget refusal, a KV format mismatch, a
+   caught panic) and a panic may have left the shared arena half-written.
 6. On completion -> state becomes Idle, KV regions and sampling state are reset for the next request
 7. Return response -> slot available for next request
 
@@ -888,10 +894,14 @@ All errors follow OpenAI's error format:
 | Context length exceeded | 400 | exceed_context_size_error (llama.cpp's dedicated type; OpenAI uses the string code `context_length_exceeded`) |
 | Model not loaded | 503 | unavailable_error |
 | Internal server error | 500 | server_error |
+| A decode step's forward fails (kernel invariant, activation budget, KV format, panic) | 500 | server_error — answered to every run whose row was in the failed batch ([#151](https://github.com/yusiwen/minfer/issues/151)); the step failure is not the saturation refusal, so it is never a 503 |
 
-**Note:** there is **no "all slots busy" error** — busy slots defer their tasks in the request queue
-(matching llama.cpp's unbounded task queue). Rejecting with 503 would break streaming clients that
-rely on long-running generations.
+**Note:** the **batched** path does **not** defer a job when every slot is busy — it rejects with
+`503 unavailable_error` ([#121](https://github.com/yusiwen/minfer/issues/121)), and queueing it
+(with a bound) is [#150](https://github.com/yusiwen/minfer/issues/150). The **serial** path
+(`MINFER_BATCH=0`) queues, one job at a time, from the same channel. (The pre-E2 note here claimed
+busy slots defer in the request queue, matching llama.cpp's unbounded task queue; the batched path
+never implemented that.)
 
 ### Context Overflow Handling
 
