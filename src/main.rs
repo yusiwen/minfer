@@ -23,6 +23,7 @@ mod live;
 mod metal;
 mod models;
 mod optiming;
+mod q4k_dsc;
 mod quantize;
 mod quants;
 mod sampler;
