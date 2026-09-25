@@ -1700,14 +1700,77 @@ mod tests {
         }
     }
 
-    /// E2's acceptance, measured at the engine: four requests served as one
-    /// decode batch must generate exactly what four serial requests generate,
-    /// and take materially less wall time.
+    /// The E2 correctness half, shared by the batched and staggered arms: every
+    /// row of `got` must match its serial reference.
     ///
-    /// Ignored by default like the other real-model tests:
-    ///   cargo test --release --bin minfer -- --ignored server_batch --nocapture
+    /// Byte-equality is a **CPU** property: both sides drive the same engine with
+    /// the same slot reservations (`submit_on` pins each request to the slot it
+    /// would occupy), so on CPU the arithmetic is identical. On a device it cannot
+    /// be — the batched step is `nt = 4` and the serial step `nt = 1`, and CUDA's
+    /// kernels tile by `nt` (measured drift 0.22–0.37 on logits; the plan records
+    /// it as a named tolerance class), so a greedy continuation may legitimately
+    /// diverge after a few tokens. Device runs therefore assert the *structural*
+    /// property that a wrong window would break immediately — the two
+    /// continuations must start identically — and report how far they track; the
+    /// window assignment itself is pinned bitwise on device by
+    /// `batch_order_does_not_change_a_sequences_logits` (same shape, same layout)
+    /// and `cuda_two_sequences_do_not_cross_attend`.
+    fn assert_replies_match(what: &str, got: &[Reply], serial: &[Reply]) {
+        assert_eq!(got.len(), serial.len(), "{what}: row count differs");
+        for (i, (b, s)) in got.iter().zip(serial).enumerate() {
+            assert_eq!(
+                b.reason, s.reason,
+                "{what} request {i}: finish reason differs"
+            );
+            assert!(!b.text.is_empty(), "{what} request {i}: generated nothing");
+            assert!(
+                !s.text.is_empty(),
+                "serial request {i}: generated nothing (the reference is empty)"
+            );
+            if cuda_device_active() {
+                let common = b
+                    .text
+                    .bytes()
+                    .zip(s.text.bytes())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                assert!(
+                    common > 0,
+                    "{what} request {i}: {b:?} and serial {s:?} diverge at the first byte on a \
+                     device, which numerics cannot explain"
+                );
+                eprintln!(
+                    "[e2] {what} request {i}: {common} leading byte(s) shared on device; {:?} ({}) \
+                     vs serial {:?} ({})",
+                    b.text, b.tokens, s.text, s.tokens
+                );
+            } else {
+                assert_eq!(
+                    b.text, s.text,
+                    "{what} request {i}: {:?} ({}) vs serial {:?} ({})",
+                    b.text, b.tokens, s.text, s.tokens
+                );
+                assert_eq!(
+                    b.tokens, s.tokens,
+                    "{what} request {i}: token count differs"
+                );
+            }
+        }
+    }
+
+    /// The location estimate #154's timing verdict uses (the upper median for an
+    /// even count, matching `cuda_backend::tests::median`).
+    fn median(v: &[f64]) -> f64 {
+        assert!(!v.is_empty(), "median of an empty sample");
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    }
+
     /// C8a: admit `prompt` on `slot` and drive the engine until it finishes, returning
-    /// the text the client would have streamed.
+    /// the text the client would have streamed. (The E2 acceptance paragraph that used
+    /// to sit above this helper documents `server_batch_matches_serial_and_is_faster`
+    /// and now lives on it.)
     fn serve_on(
         engine: &mut BatchEngine,
         model: &dyn ModelDef,
@@ -2059,6 +2122,13 @@ mod tests {
         );
     }
 
+    /// E2's acceptance, measured at the engine: four requests served as one decode
+    /// batch must generate exactly what four serial requests generate, and the
+    /// **median** of the per-round `serial/batched` ratios over interleaved rounds
+    /// must exceed 1.0 (#154).
+    ///
+    /// Ignored by default like the other real-model tests:
+    ///   cargo test --release --bin minfer -- --ignored server_batch --nocapture
     #[test]
     #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
     fn server_batch_matches_serial_and_is_faster() {
@@ -2116,98 +2186,60 @@ mod tests {
         let n_req = n_slots.min(prompts.len());
         let prompts: Vec<Vec<u32>> = prompts.into_iter().take(n_req).collect();
         let max_tokens = 16;
+        // ---- #154: the throughput verdict is a median over interleaved rounds ----
+        //
+        // The pre-#154 form measured the two whole workloads **once, sequentially**
+        // (batched, then serial) and asserted the wall-clock relation
+        // `t_serial > t_batch`. That is not a property of the code: under the
+        // parallel `--ignored` harness the first-measured phase absorbs the
+        // start-up wave and the ratio can invert with nothing to absorb it.
+        // Measured on this box (CPU build) at `e1ac17f`: parallel **21.20s batched
+        // vs 9.95s serial (0.47x)** — the only failure of the 29-gate set (28
+        // passed / 1 failed) — while the same binary serially was **0.72s vs
+        // 1.07s (1.50x)**.
+        //
+        // The rounds are now **interleaved** (batched, serial, batched, serial,
+        // …), so each ratio is a matched pair measured next to each other on the
+        // same machine state, and the assertion is on the **median of the
+        // per-round `serial/batched` ratios** — the location estimate that
+        // tolerates up to `rounds / 2` rounds a passing load spike disturbed.
+        // Every sample and the median are printed so a loaded box's verdict is
+        // auditable. This is the shape #123 gave
+        // `cuda_map_window_costs_no_more_than_the_span_it_replaces`.
+        //
+        // Cost, and the round count. The correctness comparison below stays a
+        // **full-length** pair (`max_tokens`); the timed rounds are a separate,
+        // shorter workload so the gate's total wall clock stays bounded. On an
+        // idle box the full-length pair is ~1.8s and the timing pair is
+        // proportionally less; on the loaded parallel harness a full-length pair
+        // reached ~31s. Seven rounds is the smallest odd count whose median
+        // tolerates three disturbed rounds; `timing_tokens` halves the timed
+        // workload's per-round cost without touching the correctness comparison.
+        // Both knobs are env-overridable so a bisect can trade cost for samples.
+        let rounds: usize = std::env::var("MINFER_BATCH_TEST_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        let timing_tokens: i64 = std::env::var("MINFER_BATCH_TEST_TIMING_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         eprintln!(
             "[e2] config: {n_slots} slot(s), n_ctx {n_ctx}, {n_req} request(s), templated={templated}, \
-             prompt len {}",
+             prompt len {}, correctness max_tokens {max_tokens}, {rounds} interleaved timing round(s) \
+             at max_tokens {timing_tokens}",
             prompts[0].len()
         );
 
+        // ---- correctness: the full-length pair, byte-comparable on CPU ----
         let (batched, t_batch) =
             run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens, false);
         let (serial, t_serial) = run_serial(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens);
-
-        // Byte-equality is a **CPU** property: both sides drive the same engine
-        // with the same slot reservations (`submit_on` pins each request to the
-        // slot it would occupy), so on CPU the arithmetic is identical. On a
-        // device it cannot be — the batched step is `nt = 4` and the serial step
-        // `nt = 1`, and CUDA's kernels tile by `nt` (measured drift 0.22–0.37 on
-        // logits; the plan records it as a named tolerance class), so a greedy
-        // continuation may legitimately diverge after a few tokens.
-        //
-        // Device runs therefore assert the *structural* property that a wrong
-        // window would break immediately — the two continuations must start
-        // identically — and report how far they track; the window assignment
-        // itself is pinned bitwise on device by
-        // `batch_order_does_not_change_a_sequences_logits` (same shape, same
-        // layout) and `cuda_two_sequences_do_not_cross_attend`.
-        for (i, (b, s)) in batched.iter().zip(&serial).enumerate() {
-            assert_eq!(b.reason, s.reason, "request {i}: finish reason differs");
-            assert!(!b.text.is_empty(), "request {i}: batched generated nothing");
-            assert!(!s.text.is_empty(), "request {i}: serial generated nothing");
-            if cuda_device_active() {
-                let common = b
-                    .text
-                    .bytes()
-                    .zip(s.text.bytes())
-                    .take_while(|(x, y)| x == y)
-                    .count();
-                assert!(
-                    common > 0,
-                    "request {i}: batched {b:?} and serial {s:?} diverge at the first byte on a \
-                     device, which numerics cannot explain"
-                );
-                eprintln!(
-                    "[e2] request {i}: {common} leading byte(s) shared on device; batched {:?} ({}) vs serial {:?} ({})",
-                    b.text, b.tokens, s.text, s.tokens
-                );
-            } else {
-                assert_eq!(
-                    b.text, s.text,
-                    "request {i}: batched {:?} ({}) vs serial {:?} ({})",
-                    b.text, b.tokens, s.text, s.tokens
-                );
-                assert_eq!(b.tokens, s.tokens, "request {i}: token count differs");
-            }
-        }
+        assert_replies_match("batched", &batched, &serial);
         // ---- the server's pattern: staggered admission (mixed step widths) ----
         let (staggered, t_stag) =
             run_batched(&*model, &tok, &prompts, n_slots, n_ctx, max_tokens, true);
-        let device = cuda_device_active();
-        for (i, (st, s)) in staggered.iter().zip(&serial).enumerate() {
-            assert_eq!(
-                st.reason, s.reason,
-                "staggered request {i}: finish reason differs"
-            );
-            assert!(
-                !st.text.is_empty(),
-                "staggered request {i} generated nothing"
-            );
-            if device {
-                let common = st
-                    .text
-                    .bytes()
-                    .zip(s.text.bytes())
-                    .take_while(|(x, y)| x == y)
-                    .count();
-                assert!(
-                    common > 0,
-                    "staggered request {i} diverges from its serial reference at the first byte, \
-                     which numerics cannot explain: staggered {:?} vs serial {:?}",
-                    st.text,
-                    s.text
-                );
-                eprintln!(
-                    "[e2] staggered request {i}: {common} leading byte(s) shared; {:?} vs serial {:?}",
-                    st.text, s.text
-                );
-            } else {
-                assert_eq!(
-                    st.text, s.text,
-                    "staggered request {i}: {:?} vs serial {:?}",
-                    st.text, s.text
-                );
-            }
-        }
+        assert_replies_match("staggered", &staggered, &serial);
         eprintln!(
             "[e2] staggered {:.2}s vs simultaneous {:.2}s for {n_slots} slots",
             t_stag, t_batch
@@ -2221,14 +2253,53 @@ mod tests {
             serial.iter().map(|r| r.tokens).collect::<Vec<_>>()
         );
         eprintln!(
-            "[e2] throughput {:.1} tok/s batched vs {:.1} tok/s serial = {:.2}x",
+            "[e2] full-length single pair: {:.1} tok/s batched vs {:.1} tok/s serial = {:.2}x \
+             (audit only, not the verdict)",
             total as f64 / t_batch,
             total as f64 / t_serial,
             t_serial / t_batch
         );
+
+        // ---- throughput: interleaved matched rounds, verdict on the median ----
+        let mut t_batches: Vec<f64> = Vec::with_capacity(rounds);
+        let mut t_serials: Vec<f64> = Vec::with_capacity(rounds);
+        let mut ratios: Vec<f64> = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let (_, tb) = run_batched(
+                &*model,
+                &tok,
+                &prompts,
+                n_slots,
+                n_ctx,
+                timing_tokens,
+                false,
+            );
+            let (_, ts) = run_serial(&*model, &tok, &prompts, n_slots, n_ctx, timing_tokens);
+            t_batches.push(tb);
+            t_serials.push(ts);
+            ratios.push(ts / tb);
+        }
+        let med_batch = median(&t_batches);
+        let med_serial = median(&t_serials);
+        let med = median(&ratios);
+        let mut sorted = ratios.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[e2] timing: {rounds} interleaved rounds at max_tokens {timing_tokens} — batched \
+             {t_batches:?} s, serial {t_serials:?} s; per-round serial/batched ratios (round order) \
+             {ratios:?}, sorted {sorted:?} — median {med:.3}x (medians {med_serial:.2}s serial vs \
+             {med_batch:.2}s batched)"
+        );
+        // The threshold is the pre-#154 gate's "must not be slower": 1.0x, not a
+        // named margin. What changed is the statistic (a median of matched pairs
+        // instead of one sequential pair). On an idle CPU box the median is
+        // ~1.5x, so the gate still trips on a mutation that halves the batched
+        // arm's win (see the plan record's mutation check).
         assert!(
-            t_serial > t_batch,
-            "batching must not be slower ({t_batch:.2}s vs {t_serial:.2}s)"
+            med > 1.0,
+            "batching must not be slower: median serial/batched {med:.3}x over {rounds} interleaved \
+             rounds (per-round ratios {sorted:?}; medians {med_serial:.2}s serial vs {med_batch:.2}s \
+             batched)"
         );
     }
     /// E3: the chunk plan. Its boundaries are the whole contract — the last span is
