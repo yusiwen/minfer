@@ -258,6 +258,26 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     );
+    // #141: f16 weights × f32 activations (raw half bits). Both return 0 on
+    // success and non-zero when the launch itself failed (#147 checking; the
+    // caller turns it into an `Err`, never a silent fallback).
+    fn launch_f16_f32_matmul(
+        w: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+    fn launch_embed_rows_f16(
+        w: *const u8,
+        ids: *const f32,
+        out: *mut f32,
+        n_embd: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     fn launch_swiglu_f32_off(buf: *mut f32, n: i32, off: i32, stream: *mut std::ffi::c_void);
     // D3-5 1a: fused-producer decode A-quantize (rms_norm/swiglu + pad40
     // epilogue; q8 bytes bit-identical to quantize_q8_0_pad40).
@@ -3570,6 +3590,34 @@ impl CudaState {
                 }
                 Ok(())
             }
+            // #141: an f16 weight matmul. The weights stay 2 B/element on the
+            // device (no registration-time f32 copy — that would give up the
+            // memory the f16 file exists to save), converted in-register by the
+            // kernel. It never enters the int8 MMQ prefill GEMM above: MMQ
+            // streams *quantized* bytes and f16 is not one of its formats.
+            TensorType::F16 => {
+                let rc = unsafe {
+                    launch_f16_f32_matmul(
+                        wptr as *const u8,
+                        x as *const f32,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        stream,
+                    )
+                };
+                if rc != 0 {
+                    // #147 rule: the launch named itself at the site (see the
+                    // `minfer/cuda: kernel launch …` line on stderr); refuse
+                    // here instead of running on into a checked error.
+                    return Err(format!(
+                        "cuda: f16 matmul launch failed for [{od}x{id}] x nt={nt} \
+                         (site launch:f16_f32_matmul_*)"
+                    ));
+                }
+                Ok(())
+            }
             other => Err(format!(
                 "cuda: weight type {other:?} has no f32-activation matmul kernel (supported: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K)"
             )),
@@ -4856,6 +4904,28 @@ impl CudaState {
             TensorType::F32 => {
                 // f32 tok_embd is a plain gather of weight rows
                 self.gather_rows_f32_on_gpu(wptr, ids, out, n_embd, nt);
+                return Ok(());
+            }
+            // #141: f16 tok_embd rows gather + convert in one kernel; without
+            // this a converted f16 GGUF would fail the all-or-nothing
+            // `weights_on_cuda` embed check and run the whole model on the CPU.
+            TensorType::F16 => {
+                let rc = unsafe {
+                    launch_embed_rows_f16(
+                        wptr as *const u8,
+                        ids as *const f32,
+                        out as *mut f32,
+                        n_embd as i32,
+                        nt as i32,
+                        stream,
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "cuda: f16 embed gather launch failed for n_embd={n_embd} nt={nt} \
+                         (site launch:embed_rows_f16)"
+                    ));
+                }
                 return Ok(());
             }
             other => {

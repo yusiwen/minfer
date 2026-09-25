@@ -876,6 +876,7 @@ impl Qwen2Graph {
                 | TensorType::Q5_0
                 | TensorType::Q6_K
                 | TensorType::F32
+                | TensorType::F16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())
@@ -892,6 +893,7 @@ impl Qwen2Graph {
                 | TensorType::Q4_K
                 | TensorType::Q5_0
                 | TensorType::Q6_K
+                | TensorType::F16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())

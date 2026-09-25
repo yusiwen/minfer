@@ -2106,6 +2106,24 @@ __global__ void embed_rows_q4_0(
     }
 }
 
+// #141: f16 token-embedding row gather. An f16 GGUF stores token_embd.weight
+// as f16, so the embed op needs a device path in the same type — a registered
+// matmul-only f16 would still drop the whole model to the CPU through the
+// all-or-nothing `weights_on_cuda` gate. One thread per output element.
+__global__ void embed_rows_f16(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ ids,
+    float* __restrict__ out,
+    int n_embd, int nt
+) {
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= (long long)nt * n_embd) return;
+    int t = (int)(tid / n_embd), i = (int)(tid % n_embd);
+    int id = __float_as_int(ids[t]); // I32-as-f32 bit pattern (graph rule §4)
+    const __half* row = reinterpret_cast<const __half*>(w + (size_t)id * n_embd * 2);
+    out[tid] = __half2float(row[i]);
+}
+
 __global__ void embed_rows_q4_k(
     const uint8_t* __restrict__ w,
     const float* __restrict__ ids,
@@ -2245,6 +2263,82 @@ __global__ void f32_f32_matmul_scalar(
     const float* y = acts + (size_t)t * id;
     float acc = 0.0f;
     for (int i = 0; i < id; i++) acc += wr[i] * y[i];
+    output[idx] = acc;
+}
+
+// ─── F16 × F32 matmul (#141) ──────────────────────────────────
+// f16 weight matmul for the device backends. The weights stay 2 bytes on the
+// device (that is the point of an f16 GGUF: half the weight stream of F32), so
+// this does NOT dequantize to an f32 buffer at registration; it converts each
+// half to float in-register. Same NR0/NSG unit mapping and token-in-block loop
+// as f32_f32_matmul_vec, so the token dimension is not in the launch grid.
+// half2 loads need id even; the vec kernel is used when id % 8 == 0 and the
+// scalar kernel covers the general case.
+__global__ void f16_f32_matmul_vec(
+    const __half* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    const int NR0 = 4;
+    const int NSG = 2;
+    const int CHK = 256;
+
+    int warp_id = threadIdx.x / WARP;
+    int lane_id = threadIdx.x % WARP;
+    int r0 = (blockIdx.x * NSG + warp_id) * NR0;
+    if (r0 >= od) return;
+
+    int nch = (id + CHK - 1) / CHK;
+    for (int t = 0; t < nt; ++t) {
+        const float* y = acts + (size_t)t * id;
+
+        float acc[NR0];
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) acc[rr] = 0.0f;
+
+        for (int u = lane_id; u < nch * NR0; u += WARP) {
+            int ic = u % nch, rr = u / nch;
+            const __half* wr = weights + (size_t)(r0 + rr) * id + ic * CHK;
+            const float* yc = y + ic * CHK;
+            int len = min(CHK, id - ic * CHK);
+            float p = 0.0f;
+            // the unit's lane streams the WHOLE chunk (8 halves per pass)
+            for (int i = 0; i < len; i += 8) {
+                const __half2* wp = reinterpret_cast<const __half2*>(wr + i);
+                float2 f0 = __half22float2(wp[0]);
+                float2 f1 = __half22float2(wp[1]);
+                float2 f2 = __half22float2(wp[2]);
+                float2 f3 = __half22float2(wp[3]);
+                float4 b0 = *reinterpret_cast<const float4*>(yc + i);
+                float4 b1 = *reinterpret_cast<const float4*>(yc + i + 4);
+                p += f0.x * b0.x + f0.y * b0.y + f1.x * b0.z + f1.y * b0.w
+                   + f2.x * b1.x + f2.y * b1.y + f3.x * b1.z + f3.y * b1.w;
+            }
+            acc[rr] += p;
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < NR0; rr++) {
+            float v = warp_reduce_sum(acc[rr]);
+            if (lane_id == 0 && r0 + rr < od) output[(size_t)t * od + r0 + rr] = v;
+        }
+    }
+}
+
+__global__ void f16_f32_matmul_scalar(
+    const __half* __restrict__ weights,
+    const float* __restrict__ acts,
+    float* __restrict__ output,
+    int od, int id, int nt
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)nt * od) return;
+    int t = (int)(idx / od), r = (int)(idx % od);
+    const __half* wr = weights + (size_t)r * id;
+    const float* y = acts + (size_t)t * id;
+    float acc = 0.0f;
+    for (int i = 0; i < id; i++) acc += __half2float(wr[i]) * y[i];
     output[idx] = acc;
 }
 
@@ -3670,6 +3764,13 @@ __global__ void gqa_attn_f32(
     }
 }
 
+// #141: the #147 checked-launch helpers are defined further down (with the MMQ
+// launchers), so the new f16 launchers need these C++-linkage forward
+// declarations. They must live OUTSIDE the `extern "C" {` block below so their
+// linkage matches the definitions.
+static void minfer_launch_prelude(const char* site, const char* kernel_name);
+static bool minfer_launch_ok(const char* site, const char* kernel_name);
+
 // ====================================================================
 // extern "C" launch wrappers (called from Rust via FFI)
 // ====================================================================
@@ -3919,6 +4020,23 @@ void launch_embed_rows(
     }
 }
 
+// #141: f16 embedding gather — one thread per output element (no block math).
+// Checked like `launch_f16_f32_matmul` (see the note there): 0 = success.
+int launch_embed_rows_f16(
+    const uint8_t* w, const float* ids, float* out,
+    int n_embd, int nt, cudaStream_t stream
+) {
+    const char* site = "launch:embed_rows_f16";
+    const char* kn = "embed_rows_f16";
+    minfer_launch_prelude(site, kn);
+    int block = 256;
+    long long total = (long long)nt * n_embd;
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    embed_rows_f16<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt);
+    return minfer_launch_ok(site, kn) ? 0 : 1;
+}
+
 void launch_f32_f32_matmul(
     const float* w, const float* x, float* out,
     int od, int id, int nt, cudaStream_t stream
@@ -3933,6 +4051,40 @@ void launch_f32_f32_matmul(
         if (grid > 2147483647LL) grid = 2147483647LL;
         f32_f32_matmul_scalar<<<(int)grid, block, 0, stream>>>(w, x, out, od, id, nt);
     }
+}
+
+// #141: f16 weights × f32 activations. Same shape split as the f32 launcher —
+// the vector kernel needs id % 8 == 0 (aligned half2 / float4 loads), the
+// scalar kernel covers every id.
+//
+// Returns 0 on success, non-zero when the launch itself failed. #141 is a new
+// kernel, so it reads its own `cudaGetLastError` at the site through the #147
+// helpers instead of joining the 65 unchecked launchers recorded in #162: the
+// failure is named where it is made and the Rust caller turns it into an `Err`
+// (never a silent fallback).
+
+int launch_f16_f32_matmul(
+    const uint8_t* w, const float* x, float* out,
+    int od, int id, int nt, cudaStream_t stream
+) {
+    const __half* wh = reinterpret_cast<const __half*>(w);
+    if (id % 8 == 0) {
+        const char* site = "launch:f16_f32_matmul_vec";
+        const char* kn = "f16_f32_matmul_vec";
+        minfer_launch_prelude(site, kn);
+        dim3 grid((od + 7) / 8, 1), block(64);
+        f16_f32_matmul_vec<<<grid, block, 0, stream>>>(wh, x, out, od, id, nt);
+        return minfer_launch_ok(site, kn) ? 0 : 1;
+    }
+    const char* site = "launch:f16_f32_matmul_scalar";
+    const char* kn = "f16_f32_matmul_scalar";
+    minfer_launch_prelude(site, kn);
+    long long total = (long long)nt * od;
+    int block = 256;
+    long long grid = (total + block - 1) / block;
+    if (grid > 2147483647LL) grid = 2147483647LL;
+    f16_f32_matmul_scalar<<<(int)grid, block, 0, stream>>>(wh, x, out, od, id, nt);
+    return minfer_launch_ok(site, kn) ? 0 : 1;
 }
 
 void launch_q4_k_f32_matmul(
@@ -8273,6 +8425,9 @@ extern "C" void minfer_prewarm_kernels(void) {
     MINFER_PREWARM(rope_f32);
     // lm_head tail (f32) + decode MMVQ
     MINFER_PREWARM(f32_f32_matmul_vec);
+    // #141: the f16 weight path
+    MINFER_PREWARM(f16_f32_matmul_vec);
+    MINFER_PREWARM(embed_rows_f16);
     MINFER_PREWARM(q4_k_q8_mmvq);
     MINFER_PREWARM(q6_k_q8_mmvq);
 #undef MINFER_PREWARM
