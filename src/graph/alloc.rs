@@ -782,7 +782,13 @@ impl GraphAllocator {
     /// pointer. The allocation is charged — and made — at its **size class**, the ladder
     /// `allocplan::class_size` defines, so the accounting and the pool agree on what was
     /// reserved and two shapes in one class share one buffer.
+    ///
+    /// #171: a failure-injection chokepoint. `MINFER_TEST_CALL_FAIL=alloc_in_pool`
+    /// refuses here (before the pool is touched), and the site is observable through
+    /// `testfail::checked("alloc_in_pool")`.
     fn alloc_in_pool(&mut self, backend: Backend, size: usize) -> Result<usize, String> {
+        crate::testfail::note_checked("alloc_in_pool");
+        crate::testfail::guard("alloc_in_pool")?;
         let want = allocplan::class_bytes(allocplan::class_size(size));
         if let Some(budget) = self.memory_budget(backend) {
             let pool = self.pool_bytes.get(&backend).copied().unwrap_or(0);

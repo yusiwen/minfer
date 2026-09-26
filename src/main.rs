@@ -32,6 +32,7 @@ mod spec;
 mod spec_verify;
 mod template;
 mod tensor;
+mod testfail;
 mod tokenizer;
 mod tooling;
 mod trace;

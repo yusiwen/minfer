@@ -553,6 +553,12 @@ fn generate_seq(
 /// instead of unwinding the worker. A panic inside a *batched* forward is worse
 /// than a per-request one — the shared arena may be half-written — so `tick`
 /// fails the whole batch and the caller re-seeds the engine's caches.
+///
+/// #171: this is the `forward_batch` failure-injection chokepoint
+/// (`MINFER_TEST_CALL_FAIL=forward_batch` panics inside the guard, so the real
+/// guard and the real 500 path run) and an observable site
+/// (`testfail::checked("forward_batch")`), which is what lets a gate drop a
+/// bespoke failing-model mock.
 pub(crate) fn guarded_forward_batch(
     model: &dyn ModelDef,
     batch: &crate::graph::batch::Batch,
@@ -561,6 +567,8 @@ pub(crate) fn guarded_forward_batch(
     cache: &mut GraphCache,
 ) -> Result<Vec<f32>, ApiError> {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::testfail::note_checked("forward_batch");
+        crate::testfail::guard_panic("forward_batch");
         model.forward_batch(batch, n_out, n_ctx, cache)
     }));
     match r {

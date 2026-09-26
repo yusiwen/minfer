@@ -330,6 +330,12 @@ impl BackendScheduler {
                             .unwrap_or("the backend's pool is not enabled")
                     )
                 })?;
+                // #171: the one backend execute entry is both a
+                // failure-injection chokepoint (`MINFER_TEST_CALL_FAIL=execute_node`)
+                // and an observable site (`testfail::checked("execute_node")`), so a
+                // gate can prove a node really ran instead of trusting the dispatch.
+                crate::testfail::note_checked("execute_node");
+                crate::testfail::guard("execute_node")?;
                 pool.execute_node(node, &in_bufs, br, kv_pair)?;
                 if let Some(t0) = t0 {
                     crate::optiming::record(crate::optiming::op_index(&node.op), t0.elapsed());
@@ -604,6 +610,40 @@ mod tests {
         for i in 0..4 {
             assert!((got[i] - (silu((i + 1) as f32) + (i + 1) as f32)).abs() < 1e-5);
         }
+    }
+
+    /// #171: the observation half of the failure-injection seam.
+    ///
+    /// A gate that must prove the backend execute entry **ran** cannot read the
+    /// dispatch's own answer — that would be self-certifying — so the chokepoint
+    /// bumps `testfail::note_checked("execute_node")` and the gate asserts the
+    /// counter advanced. The expected count is the graph's non-input nodes (an
+    /// input is host-filled, never dispatched); the counter mutation (making
+    /// `note_checked` a no-op) is what this test catches.
+    #[test]
+    fn the_execute_chokepoint_is_observable() {
+        crate::testfail::reset_checked();
+        assert_eq!(crate::testfail::checked("execute_node"), 0);
+
+        let g = small_graph();
+        // An input node is host-filled by the allocator and never dispatched, so
+        // the expected count is the non-input nodes of the graph.
+        let dispatched = g.nodes.iter().filter(|n| !n.is_input()).count() as u64;
+        assert!(dispatched > 0);
+        let sched = BackendScheduler::new();
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        sched.execute(&g, &mut alloc).unwrap();
+
+        assert_eq!(
+            crate::testfail::checked("execute_node"),
+            dispatched,
+            "every dispatched node must be observed at the one execute entry"
+        );
+        // A site that did not run stays at zero: the counter is per site, not a
+        // single "something executed" flag.
+        assert_eq!(crate::testfail::checked("forward_batch"), 0);
     }
 
     /// F8 (#51): `MINFER_OP_TIMING` reports numbers, it never computes them.

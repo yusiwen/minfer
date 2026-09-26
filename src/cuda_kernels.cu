@@ -5038,6 +5038,10 @@ static void minfer_site_report(const char* site, int kind, int code, int bytes, 
 
 // Test injection (issue #147), env-gated like #145's `MINFER_TEST_LATCH_ERROR`:
 // `MINFER_TEST_CALL_FAIL` is a comma-separated list of site tokens, or `all`.
+// This is the device half of the one failure-injection seam (issue #171,
+// `src/testfail.rs` documents the Rust half and the shared matching rule); the
+// Rust matcher `testfail::injection_names_site` and this function must stay
+// exact-token identical (no substring matching).
 // A named site performs its REAL call with a value that makes it fail — an
 // over-limit attribute request, an over-limit dynamic-smem launch, or (Rust
 // side) `cudaGraphDestroy` on the `cudaGraphExec_t` — so the failure is a real
