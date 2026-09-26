@@ -286,6 +286,71 @@ impl CudaBackend {
         }
     }
 
+    /// #144 item 1: the fused decode QKV epilogue, dispatched on the KV layout.
+    /// f32/f16 write one element per thread (`attn_bias_rope_store`); a packed
+    /// cell needs whole Q8_0 blocks, so it takes the block-owning kernel
+    /// (`attn_bias_rope_store_q8_0`), which quantizes with the store's own
+    /// quantizer and writes the same bytes the unfused chain does.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_qkv_epilogue(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        bq: *mut std::ffi::c_void,
+        bk: *mut std::ffi::c_void,
+        bv: *mut std::ffi::c_void,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: usize,
+        nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *mut std::ffi::c_void,
+        cells: *mut std::ffi::c_void,
+    ) {
+        if self.kv_layout == crate::cuda::KV_LAYOUT_Q8_0 {
+            self.state.attn_bias_rope_store_q8_0(
+                q,
+                k as *const std::ffi::c_void,
+                v as *const std::ffi::c_void,
+                bq,
+                bk,
+                bv,
+                kv_k,
+                kv_v,
+                nqt,
+                nkt,
+                hd,
+                freq_base,
+                freq_scale,
+                positions,
+                cells,
+                self.kv_row_bytes(nkt),
+            );
+        } else {
+            self.state.attn_bias_rope_store(
+                q,
+                k,
+                v,
+                bq,
+                bk,
+                bv,
+                kv_k,
+                kv_v,
+                nqt,
+                nkt,
+                hd,
+                freq_base,
+                freq_scale,
+                positions,
+                cells,
+                self.kv_layout,
+            );
+        }
+    }
+
     /// 8g②: turn on deliberate prefill capture for tests (the pp16/pp300
     /// bit-parity harness is the validation gate).
     #[cfg(test)]
@@ -1131,7 +1196,7 @@ impl CudaBackend {
                 let bv = bias_ptr(&meta.bias_v)?;
                 let pos = self.positions_i32(in_bufs[3].id)?;
                 let cells = self.positions_i32(in_bufs[4].id)?;
-                self.state.attn_bias_rope_store(
+                self.fused_qkv_epilogue(
                     self.ptr_of_ref(out_buf)?,
                     self.ptr_of_ref(in_bufs[1])?,
                     self.ptr_of_ref(in_bufs[2])?,
@@ -1147,7 +1212,6 @@ impl CudaBackend {
                     meta.freq_scale,
                     pos,
                     cells,
-                    self.kv_layout(),
                 );
                 Ok(())
             }
@@ -1221,7 +1285,7 @@ impl CudaBackend {
                         q_ptr.add(meta.nqt + meta.nkt) as *mut std::ffi::c_void,
                     )
                 };
-                self.state.attn_bias_rope_store(
+                self.fused_qkv_epilogue(
                     q_ptr as *mut std::ffi::c_void,
                     k_ptr,
                     v_ptr,
@@ -1237,7 +1301,6 @@ impl CudaBackend {
                     meta.freq_scale,
                     pos,
                     cells,
-                    self.kv_layout(),
                 );
                 Ok(())
             }
@@ -1530,24 +1593,26 @@ impl CudaBackend {
                     );
                     return Ok(());
                 }
-                // nt > 16 (prefill): single-warp-per-(token, head) kernel —
-                // the grid already covers nt × nh blocks.
-                // 8b: f16-KV variant reads half K/V (q/o stay f32). C4 S2b: the
-                // FA prefill path (`fa_prefill_f16kv`) is f16-typed shared-memory
-                // staging, so a Q8_0 prefill takes the general layout-tagged
-                // kernel instead — correct, off the tuned FA route, and stated.
-                if self.kv_layout() == crate::cuda::KV_LAYOUT_F16 {
-                    self.state.gqa_attn_f16kv(
+                // nt > 16 (prefill): FA-style tiled attention (f16 tile staging,
+                // tensor-core QK^T/P·V) for the f16 and packed layouts alike —
+                // #144 item 3 stages a packed cell by dequantizing it into the
+                // same f16 tile, with the general layout-tagged kernel as the
+                // documented fallback. f32 stays on the general kernel (its
+                // staging would round the cache to f16 for no reason).
+                if self.kv_layout() != crate::cuda::KV_LAYOUT_F32 {
+                    self.state.gqa_attn_kv_prefill(
                         self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
                         self.ptr_of(v_id)?,
                         self.ptr_of_ref(out_buf)?,
                         pos,
                         mode.code(),
+                        self.kv_layout(),
                         meta.n_head,
                         meta.n_head_kv,
                         meta.hd,
                         meta.scale,
+                        self.kv_row_bytes(meta.nkt),
                         nt,
                     );
                 } else {
@@ -5158,6 +5223,213 @@ mod tests {
         );
     }
 
+    /// #144 item 1: the **packed fused decode epilogue** must write the unfused
+    /// chain's bytes. The reference is the CPU quantizer (`quants::
+    /// quantize_row_q8_0`) run over the roped / bias-added values computed on the
+    /// host — an implementation the kernel does not share — so a wrong block
+    /// index, rope pairing, scale offset or quant offset moves a value by whole
+    /// quant steps.
+    ///
+    /// Two arms:
+    /// - `pos = 0` (the rope is the identity permutation: `cs = 1`, `sn = 0`), where
+    ///   K and V are compared **byte for byte** — pairing, block math and the
+    ///   quantizer have no transcendental to hide behind;
+    /// - `pos = 7`, where the angle is real: q (never quantized) is compared as a
+    ///   value, and K is compared after dequantization at one quant step's class,
+    ///   because the device's `cosf`/`sinf` may differ from the host's in the last
+    ///   ulp and that can flip a quant sitting on a boundary.
+    #[test]
+    fn cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer() {
+        use crate::graph::kvformat::KvFormat;
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        let (nh, nk_h, hd) = (4usize, 2usize, 64usize);
+        let (nqt, nkt) = (nh * hd, nk_h * hd);
+        let row_words = KvFormat::Q8_0.row_elems(nkt);
+        let row_bytes = KvFormat::Q8_0.row_bytes(nkt);
+        let half = hd / 2;
+        let (fb, fs) = (10000.0f32, 1.0f32);
+
+        let vals = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * seed + 7) % 17) as f32 / 4.0 - 2.0)
+                .collect()
+        };
+        let (qs, ks, vs) = (vals(37, nqt), vals(41, nkt), vals(57, nkt));
+        let (bq, bk, bv) = (vals(13, nqt), vals(19, nkt), vals(23, nkt));
+
+        let (b_q, b_k, b_v) = (
+            cb.alloc_buffer(nqt),
+            cb.alloc_buffer(nkt),
+            cb.alloc_buffer(nkt),
+        );
+        let (b_bq, b_bk, b_bv) = (
+            cb.alloc_buffer(nqt),
+            cb.alloc_buffer(nkt),
+            cb.alloc_buffer(nkt),
+        );
+        let b_p = cb.alloc_buffer(1);
+        let b_c = cb.alloc_buffer(1);
+        // Two packed rows so the two arms cannot alias.
+        let (kreg, vreg) = (
+            cb.alloc_buffer(2 * row_words),
+            cb.alloc_buffer(2 * row_words),
+        );
+        cb.write_host(b_q, &qs).unwrap();
+        cb.write_host(b_k, &ks).unwrap();
+        cb.write_host(b_v, &vs).unwrap();
+        cb.write_host(b_bq, &bq).unwrap();
+        cb.write_host(b_bk, &bk).unwrap();
+        cb.write_host(b_bv, &bv).unwrap();
+        cb.write_host(kreg, &vec![0f32; 2 * row_words]).unwrap();
+        cb.write_host(vreg, &vec![0f32; 2 * row_words]).unwrap();
+
+        // The host's rope + bias, per head (neox pairing d <-> d + hd/2).
+        let roped = |src: &[f32], bias: &[f32], heads: usize, pos: usize| -> Vec<f32> {
+            let mut out = vec![0f32; heads * hd];
+            for h in 0..heads {
+                for d in 0..hd {
+                    let dd = if d < half { d } else { d - half };
+                    let ja = h * hd + dd;
+                    let jb = ja + half;
+                    let x0 = src[ja] + bias[ja];
+                    let x1 = src[jb] + bias[jb];
+                    let theta = pos as f32 * fs / fb.powf((2.0 * dd as f32) / hd as f32);
+                    let (cs, sn) = (theta.cos(), theta.sin());
+                    out[h * hd + d] = if d < half {
+                        x0 * cs - x1 * sn
+                    } else {
+                        x0 * sn + x1 * cs
+                    };
+                }
+            }
+            out
+        };
+        // The packed payload the CPU quantizer produces for a flat value row.
+        let pack = |v: &[f32]| -> Vec<u8> {
+            let nblk = v.len() / 32;
+            let mut raw = vec![0u8; nblk * 34];
+            for b in 0..nblk {
+                let q = crate::quants::quantize_row_q8_0(&v[b * 32..(b + 1) * 32]);
+                raw[b * 34..(b + 1) * 34].copy_from_slice(&q);
+            }
+            raw
+        };
+        let cell_bytes = |region: &[f32], row: usize| -> Vec<u8> {
+            let words = &region[row * row_words..(row + 1) * row_words];
+            let mut out = Vec::with_capacity(words.len() * 4);
+            for w in words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+
+        let run = |cb: &mut CudaBackend, pos: usize, row: usize| {
+            // q is roped IN PLACE, so each arm starts from the original input.
+            cb.write_host(b_q, &qs).unwrap();
+            cb.write_host(b_p, &[f32::from_bits(pos as u32)]).unwrap();
+            cb.write_host(b_c, &[f32::from_bits(row as u32)]).unwrap();
+            let (q, k, v) = (
+                cb.ptr_of(b_q).unwrap(),
+                cb.ptr_of(b_k).unwrap(),
+                cb.ptr_of(b_v).unwrap(),
+            );
+            let (pq, pk, pv) = (
+                cb.ptr_of(b_bq).unwrap(),
+                cb.ptr_of(b_bk).unwrap(),
+                cb.ptr_of(b_bv).unwrap(),
+            );
+            let pp = cb.ptr_of(b_p).unwrap();
+            let cc = cb.ptr_of(b_c).unwrap();
+            cb.state.attn_bias_rope_store_q8_0(
+                q,
+                k,
+                v,
+                pq,
+                pk,
+                pv,
+                cb.ptr_of(kreg).unwrap(),
+                cb.ptr_of(vreg).unwrap(),
+                nqt,
+                nkt,
+                hd,
+                fb,
+                fs,
+                pp,
+                cc,
+                row_bytes,
+            );
+            cb.synchronize();
+            (
+                cb.copy_to_host(b_q).unwrap(),
+                cb.copy_to_host(kreg).unwrap(),
+                cb.copy_to_host(vreg).unwrap(),
+            )
+        };
+
+        // ── arm 1: pos = 0 — K and V byte for byte ──────────────────────────
+        let (q0, k0, v0) = run(&mut cb, 0, 0);
+        let want_k = pack(&roped(&ks, &bk, nk_h, 0));
+        let want_v = pack(&(0..nkt).map(|i| vs[i] + bv[i]).collect::<Vec<f32>>());
+        assert_eq!(
+            &cell_bytes(&k0, 0)[..want_k.len()],
+            &want_k[..],
+            "the packed K cell is not the CPU quantizer's bytes at pos = 0"
+        );
+        assert_eq!(
+            &cell_bytes(&v0, 0)[..want_v.len()],
+            &want_v[..],
+            "the packed V cell is not the CPU quantizer's bytes at pos = 0"
+        );
+        let want_q0 = roped(&qs, &bq, nh, 0);
+        let qdelta0 = q0
+            .iter()
+            .zip(&want_q0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            qdelta0 <= 1e-6,
+            "the roped q buffer is not the host's identity-rope result: max |Δ| = {qdelta0}"
+        );
+
+        // ── arm 2: pos = 7 — the angle is real ─────────────────────────────
+        let (q7, k7, v7) = run(&mut cb, 7, 1);
+        let want_q7 = roped(&qs, &bq, nh, 7);
+        let qdelta = q7
+            .iter()
+            .zip(&want_q7)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            qdelta <= 1e-5,
+            "the roped q buffer diverges from the host's rope: max |Δ| = {qdelta}"
+        );
+        assert_eq!(
+            &cell_bytes(&v7, 1)[..want_v.len()],
+            &want_v[..],
+            "V does not depend on the rope angle, so its bytes must still match"
+        );
+        let mut got_k7 = vec![0f32; nkt];
+        crate::graph::kvformat::unpack_q8_0_cells(&k7, nkt, 1, 1, &mut got_k7);
+        let kdelta = got_k7
+            .iter()
+            .zip(&roped(&ks, &bk, nk_h, 7))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            kdelta <= 0.03,
+            "the packed K cell is not the host's roped values at one quant step's class: \
+             max |Δ| = {kdelta}"
+        );
+        assert!(
+            got_k7.iter().any(|x| x.abs() > 1e-3),
+            "the packed K cell is all zeros; the comparison would be vacuous"
+        );
+    }
+
     /// C8b S4 device A/B: what naming a row through the run list costs over the
     /// span's `row0 + i`, at the decode shape that pays it on every step. Both
     /// modes attend to the *same* rows (one run each), so the difference is the
@@ -5328,17 +5600,19 @@ mod tests {
                 spb2
             };
             let mut call = |cb: &mut crate::graph::cuda_backend::CudaBackend| {
-                cb.state.gqa_attn_f16kv(
+                cb.state.gqa_attn_kv_prefill(
                     cb.ptr_of(qb2).unwrap(),
                     cb.ptr_of(kreg).unwrap(),
                     cb.ptr_of(vreg).unwrap(),
                     cb.ptr_of(ob2).unwrap(),
                     cb.ptr_of(win).unwrap(),
                     mode.code(),
+                    crate::cuda::KV_LAYOUT_F16,
                     nh,
                     nk,
                     hd,
                     scale,
+                    nkt * 2,
                     nt,
                 );
             };
@@ -7402,6 +7676,150 @@ mod tests {
         }
         println!("fa prefill attention: max err {maxe:.6}");
         assert_close("fa_prefill_f16kv", &agot, &aref, 5e-3);
+    }
+
+    /// #144 item 3: FA prefill over a **packed** cache. Same shape and reference as
+    /// [`Self::cuda_fa_prefill_attention_parity`] — `nt = 100 > 16` and `hd = 128`,
+    /// the only combination that reaches the FA prefill — but the cache is Q8_0, so
+    /// the staging dequantizes each packed cell into the f16 tile instead of
+    /// copying halves. The reference is the CPU attention over the **same packed
+    /// bytes** dequantized on the host, so the only difference is the f16 staging:
+    /// the class the f16 FA gate already pins.
+    ///
+    /// The observation arm is what makes this a gate about the *packed FA route*
+    /// rather than about "some attention kernel": the parity arm alone would pass
+    /// if the launch silently fell back to the general layout-tagged kernel, so the
+    /// chokepoint's `testfail::note_checked` counter is asserted to have moved.
+    #[test]
+    fn cuda_q8_0_fa_prefill_attention_parity() {
+        use crate::graph::kvformat::KvFormat;
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let _guard = crate::cuda::CudaState::model_load_guard();
+        cb.set_kv_q8_for_test();
+        let (nh, nk_h, hd) = (4usize, 2usize, 128usize);
+        let nkt = nk_h * hd;
+        let row_words = KvFormat::Q8_0.row_elems(nkt);
+        let (nt, n_ctx) = (100usize, 128usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let pos: Vec<usize> = (0..nt).collect();
+
+        let mut b = GraphBuilder::new();
+        b.set_kv_format(KvFormat::Q8_0);
+        let q = b.input("q", [nh * hd, nt, 1, 1], DType::F32);
+        let k = b.input("k", [nkt, nt, 1, 1], DType::F32);
+        let v = b.input("v", [nkt, nt, 1, 1], DType::F32);
+        let pp = b.input("positions", [nt, 1, 1, 1], DType::I32);
+        let store = b.kvcache_store(0, k, v, n_ctx);
+        let load = b.kvcache_load(0, nkt, n_ctx, nk_h);
+        let at = b.attn(
+            q,
+            load,
+            pp,
+            AttnMode::Gqa,
+            AttnMeta {
+                layer: 0,
+                n_head: nh,
+                n_head_kv: nk_h,
+                hd,
+                hd_kv: hd,
+                nkt,
+                scale,
+            },
+        );
+        b.output(at);
+        let g = b.build();
+
+        let (xb_q, xb_k, xb_v) = (
+            cb.alloc_buffer(nh * hd * nt),
+            cb.alloc_buffer(nkt * nt),
+            cb.alloc_buffer(nkt * nt),
+        );
+        let xb_p = cb.alloc_buffer(nt);
+        let ob_at = cb.alloc_buffer(nh * hd * nt);
+        let (kreg, vreg) = (
+            cb.alloc_buffer(n_ctx * row_words),
+            cb.alloc_buffer(n_ctx * row_words),
+        );
+
+        let qs: Vec<f32> = (0..nh * hd * nt)
+            .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
+            .collect();
+        let ks: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 41) % 13) as f32 / 4.0 - 1.5)
+            .collect();
+        let vs: Vec<f32> = (0..nkt * nt)
+            .map(|i| ((i * 57) % 11) as f32 / 3.0 - 1.8)
+            .collect();
+        let pb: Vec<f32> = pos.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        cb.write_host(xb_q, &qs).unwrap();
+        cb.write_host(xb_k, &ks).unwrap();
+        cb.write_host(xb_v, &vs).unwrap();
+        cb.write_host(xb_p, &pb).unwrap();
+        cb.write_host(kreg, &vec![0f32; n_ctx * row_words]).unwrap();
+        cb.write_host(vreg, &vec![0f32; n_ctx * row_words]).unwrap();
+
+        crate::testfail::reset_checked();
+        cb.exec_ids(
+            &g.nodes[store],
+            &[xb_k, xb_v, xb_p],
+            kreg,
+            Some((kreg, vreg)),
+        )
+        .unwrap();
+        cb.exec_ids(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+            .unwrap();
+
+        // The reference reads the *same* packed bytes the device wrote (the store is
+        // byte-exact against the CPU quantizer, its own gate), dequantized on the
+        // host, so the only difference left is the f16 staging.
+        let pk = cb.copy_to_host(kreg).unwrap();
+        let pv = cb.copy_to_host(vreg).unwrap();
+        let mut kfull = vec![0f32; nkt * n_ctx];
+        let mut vfull = vec![0f32; nkt * n_ctx];
+        for &p in &pos {
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &pk,
+                nkt,
+                p,
+                1,
+                &mut kfull[p * nkt..(p + 1) * nkt],
+            );
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &pv,
+                nkt,
+                p,
+                1,
+                &mut vfull[p * nkt..(p + 1) * nkt],
+            );
+        }
+        assert!(
+            kfull.iter().any(|x| *x != 0.0),
+            "the dequantized reference is all zero; the comparison would be vacuous"
+        );
+        let span = crate::graph::cpu_backend::causal_span(&pos);
+        let mut aref = vec![0f32; nh * hd * nt];
+        crate::graph::cpu_backend::cpu_gqa_attn(
+            &qs, &kfull, &vfull, &span, nt, nh, nk_h, hd, hd, nkt, &mut aref, scale,
+        )
+        .unwrap();
+        let agot = cb.copy_to_host(ob_at).unwrap();
+        let mut maxe = 0f32;
+        for (a, r) in agot.iter().zip(aref.iter()) {
+            maxe = maxe.max((a - r).abs());
+        }
+        println!("q8_0 fa prefill attention: max err {maxe:.6}");
+        assert_close("fa_prefill_q8kv", &agot, &aref, 5e-3);
+
+        // Observation arm: the dispatch must have taken the FA launch, not the
+        // general layout-tagged fallback.
+        assert!(
+            crate::testfail::checked("cuda_fa_prefill_q8_0") > 0,
+            "the packed prefill did not reach the FA launch (it fell back to the general \
+             layout-tagged kernel); this gate would otherwise pass on the old route"
+        );
     }
 
     // 8c: prefill Q4_0 matmul (nt > 1, id <= 8192) routes through the

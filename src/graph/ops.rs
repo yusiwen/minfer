@@ -259,6 +259,13 @@ pub struct FusedQkvMeta {
     pub rope_style: RopeStyle,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
+    /// C4/#144: f32 words one KV *cell* occupies in the persistent region —
+    /// `KvFormat::row_elems(nkt)`, the same width `KvcacheMeta::row_elems`
+    /// carries. The allocator sizes the region by `row_elems * n_ctx`, so the
+    /// fused node and the store node it replaces must agree under a packed
+    /// format (the pre-#144 `!packed` builder gate meant only the store kind
+    /// ever stamped one; a packed decode now builds the fused node).
+    pub row_elems: usize,
 }
 
 /// decode QKV epilogue metadata (mixed-quant class, D3-8): the three biases
@@ -277,6 +284,8 @@ pub struct QkvBiasRopeStoreMeta {
     pub rope_style: RopeStyle,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
+    /// C4/#144: f32 words one KV cell occupies (see [`FusedQkvMeta::row_elems`]).
+    pub row_elems: usize,
 }
 
 /// decode FFN gate+up fusion metadata: the loader-registered concat weight
@@ -318,6 +327,8 @@ pub struct FusedQkvNormMeta {
     pub rope_style: RopeStyle,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
+    /// C4/#144: f32 words one KV cell occupies (see [`FusedQkvMeta::row_elems`]).
+    pub row_elems: usize,
     /// Per-head RMSNorm epsilon (llama `f_norm_rms_eps`).
     pub eps: f32,
 }

@@ -111,13 +111,14 @@ impl Qwen2Graph {
             //   epilogue (CUDA-only today; Metal keeps the unfused chain for
             //   these layers). Both replace 3 matmul + 3 bias + 2 rope +
             //   2 store dispatches.
-            // C4 S2b: `!b.kv_is_packed()` — the fused epilogue has no packed store
-            // (it writes one K/V element at a time; a Q8_0 block needs all 32), so a
-            // packed decode takes the unfused bias/rope/store chain instead.
+            // #144 item 1: a packed cache builds the fused epilogue too — CUDA's
+            // `attn_bias_rope_store_q8_0` gives one thread a whole (head,
+            // 32-element K block) and one V block, so it can quantize a cell's
+            // blocks in place. Pre-#144 the gate read `&& !b.kv_is_packed()` and a
+            // Q8_0 decode ran the unfused bias/rope/store chain.
             let fuse_qkv = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
-                && !b.kv_is_packed()
                 && l.bq.is_some()
                 && l.bk.is_some()
                 && l.bv.is_some();
@@ -148,6 +149,7 @@ impl Qwen2Graph {
                         freq_scale: hp.rope_freq_scale,
                         rope_style: hp.rope_style,
                         kv_elems: nkt * n_ctx,
+                        row_elems: params.cparams.kv_format.row_elems(nkt),
                     },
                 );
                 // q lives at concat offset 0 (rows 0..nqt); K/V went into the
@@ -179,6 +181,7 @@ impl Qwen2Graph {
                         freq_scale: hp.rope_freq_scale,
                         rope_style: hp.rope_style,
                         kv_elems: nkt * n_ctx,
+                        row_elems: params.cparams.kv_format.row_elems(nkt),
                     },
                 );
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);

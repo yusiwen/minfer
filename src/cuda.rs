@@ -687,7 +687,10 @@ extern "C" {
     ) -> i32;
     // 8n: FA-style prefill attention. Returns -1 when the >48KB dynamic
     // shared-memory opt-in fails (then Rust falls back to the legacy kernel).
-    fn launch_fa_prefill_f16kv(
+    // #144 item 3: `layout` is the KV tag the staging reads (f16 or packed
+    // Q8_0 — the packed arm dequantizes each cell into the same f16 tile);
+    // `row_bytes` is the cell's byte width and is ignored by the f16 arm.
+    fn launch_fa_prefill_kv(
         q: *const f32,
         k: *const std::ffi::c_void,
         v: *const std::ffi::c_void,
@@ -699,6 +702,8 @@ extern "C" {
         hd: i32,
         scale: f32,
         nt: i32,
+        layout: i32,
+        row_bytes: usize,
         stream: *mut std::ffi::c_void,
     ) -> i32;
     fn launch_store_kv_f16(
@@ -740,6 +745,28 @@ extern "C" {
         positions: *const i32,
         cells: *const i32,
         kv_is_f16: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    // #144 item 1: the packed arm of the fused decode QKV epilogue. One thread
+    // per (head, 32-element K block) and per V block, so a whole Q8_0 block is
+    // quantized by its owner; `row_bytes` is the packed cell's byte width.
+    fn launch_attn_bias_rope_store_q8_0(
+        q: *mut f32,
+        k: *const f32,
+        v: *const f32,
+        bias_q: *const std::ffi::c_void,
+        bias_k: *const std::ffi::c_void,
+        bias_v: *const std::ffi::c_void,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: i32,
+        nkt: i32,
+        hd: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *const i32,
+        cells: *const i32,
+        row_bytes: usize,
         stream: *mut std::ffi::c_void,
     );
     fn launch_gqa_attn_f32_f16kv(
@@ -5298,10 +5325,14 @@ impl CudaState {
         }
     }
 
-    /// 8b: GQA attention over an f16 KV cache (K/V read as half and
-    /// converted to f32 in registers; q/o stay f32). Matches Metal's
-    /// pl_gqa_attn_f16 precision class (f16 storage, f32 accumulate).
-    pub fn gqa_attn_f16kv(
+    /// 8b: GQA attention over a **staged** KV cache (K/V materialized into the
+    /// FA f16 tile). `layout` is the KV tag: `KV_LAYOUT_F16` reads halves and
+    /// `KV_LAYOUT_Q8_0` dequantizes each packed cell while staging (#144 item 3);
+    /// q/o stay f32 in both. Matches Metal's pl_gqa_attn_f16 precision class
+    /// (f16 storage, f32 accumulate). `row_bytes` is the packed cell's byte
+    /// width and is ignored by the f16 arm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attn_kv_prefill(
         &self,
         q: *mut std::ffi::c_void,
         k: *mut std::ffi::c_void,
@@ -5309,10 +5340,12 @@ impl CudaState {
         o: *mut std::ffi::c_void,
         positions: *mut std::ffi::c_void,
         mode: i32,
+        layout: i32,
         nh: usize,
         nk: usize,
         hd: usize,
         scale: f32,
+        row_bytes: usize,
         nt: usize,
     ) {
         let stream = self.stream();
@@ -5335,9 +5368,16 @@ impl CudaState {
         // each linear window index through the runs, and the tile's per-row mask is
         // that query's row count (a map window is a prefix of the sequence's address
         // space, so the existing `gcol < limit` form stays exact).
-        if nt >= 2 && hd == 128 && !Self::no_fa_prefill() {
+        //
+        // #144 item 3: the same FA body serves a packed cache — the staging
+        // dequantizes each Q8_0 cell into the f16 tile instead of copying halves,
+        // so the tensor-core QK^T/P·V stream is unchanged. The general
+        // layout-tagged kernel remains the documented fallback (the `rc == -1`
+        // arm below), and the packed arm reaches it with the same rounded
+        // window modes.
+        if nt >= 2 && hd == 128 && !Self::no_fa_prefill() && layout != crate::cuda::KV_LAYOUT_F32 {
             let rc = unsafe {
-                launch_fa_prefill_f16kv(
+                launch_fa_prefill_kv(
                     q as *const f32,
                     k as *const std::ffi::c_void,
                     v as *const std::ffi::c_void,
@@ -5349,12 +5389,30 @@ impl CudaState {
                     hd as i32,
                     scale,
                     nt as i32,
+                    layout,
+                    row_bytes,
                     stream,
                 )
             };
             if rc == 0 {
+                // #144 item 3: the observation half (gate contract rule 3) — a gate
+                // that must prove the packed FA path *ran* cannot read the dispatch's
+                // own answer, so the chokepoint records it and
+                // `cuda_q8_0_fa_prefill_attention_parity` asserts the counter moved.
+                if layout == crate::cuda::KV_LAYOUT_Q8_0 {
+                    crate::testfail::note_checked("cuda_fa_prefill_q8_0");
+                }
                 return;
             }
+        }
+        if layout == crate::cuda::KV_LAYOUT_Q8_0 {
+            // #144: the packed fallback is the general layout-tagged kernel, not
+            // the f16-typed one — `launch_gqa_attn_f32_f16kv` would read the packed
+            // bytes as halves.
+            self.gqa_attn_f32(
+                q, k, v, o, positions, mode, layout, nh, nk, hd, scale, row_bytes, nt,
+            );
+            return;
         }
         unsafe {
             launch_gqa_attn_f32_f16kv(
@@ -6238,9 +6296,9 @@ impl CudaState {
     ) {
         assert!(
             layout != KV_LAYOUT_Q8_0,
-            "cuda: the fused bias/rope/store epilogue has no packed Q8_0 store (it writes one \
-             element at a time; a Q8_0 block needs all 32) — the model builder must not build \
-             Op::FusedQKV / Op::QkvBiasRopeStore for a packed cache (issue #87)"
+            "cuda: the f32/f16 fused bias/rope/store epilogue has no packed store (it writes one \
+             element at a time; a Q8_0 block needs all 32) — a packed engine must call \
+             attn_bias_rope_store_q8_0 instead (issue #144)"
         );
         let stream = self.stream();
         unsafe {
@@ -6261,6 +6319,61 @@ impl CudaState {
                 positions as *const i32,
                 cells as *const i32,
                 (layout == KV_LAYOUT_F16) as i32,
+                stream,
+            );
+        }
+    }
+
+    /// #144 item 1: the **packed** arm of the fused decode QKV epilogue. Same
+    /// bias+rope contract as [`Self::attn_bias_rope_store`], but K and V are
+    /// written as whole Q8_0 blocks: one thread per (head, 32-element K block)
+    /// computes the block's roped values itself and hands them to the store's own
+    /// quantizer, and one thread per V block does bias + quantize. The K buffer is
+    /// left roped-free (its readers are gone in both fused classes) and the bytes
+    /// written to the packed regions are `add_bias`+`rope`+`store_kv_q8_0`'s
+    /// verbatim.
+    ///
+    /// `row_bytes` is `KvFormat::Q8_0.row_bytes(nkt)`, the same byte width
+    /// [`Self::store_kv_q8_0`] and `ensure_kv` use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_bias_rope_store_q8_0(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        bias_q: *mut std::ffi::c_void,
+        bias_k: *mut std::ffi::c_void,
+        bias_v: *mut std::ffi::c_void,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: usize,
+        nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *mut std::ffi::c_void,
+        cells: *mut std::ffi::c_void,
+        row_bytes: usize,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_attn_bias_rope_store_q8_0(
+                q as *mut f32,
+                k as *const f32,
+                v as *const f32,
+                bias_q as *const std::ffi::c_void,
+                bias_k as *const std::ffi::c_void,
+                bias_v as *const std::ffi::c_void,
+                kv_k,
+                kv_v,
+                nqt as i32,
+                nkt as i32,
+                hd as i32,
+                freq_base,
+                freq_scale,
+                positions as *const i32,
+                cells as *const i32,
+                row_bytes,
                 stream,
             );
         }
@@ -8787,6 +8900,28 @@ mod issue162_tests {
                 st,
             );
         });
+        // #144 item 1: the packed arm of the same epilogue.
+        go!(&["launch:attn_bias_rope_store_q8_0"], || unsafe {
+            launch_attn_bias_rope_store_q8_0(
+                ctx.f(0),
+                ctx.cf(1),
+                ctx.cf(2),
+                ctx.p(3),
+                ctx.p(4),
+                ctx.p(5),
+                ctx.p(6),
+                ctx.p(7),
+                2,
+                4,
+                64,
+                10000.0,
+                1.0,
+                ctx.ci32(8),
+                ctx.ci32(9),
+                68,
+                st,
+            );
+        });
         for (mode, token) in [
             (MAP, "launch:gqa_attn_f32_f16kv__map"),
             (SPAN, "launch:gqa_attn_f32_f16kv__span"),
@@ -8930,13 +9065,42 @@ mod issue162_tests {
                 st,
             );
         });
-        for (mode, token) in [
-            (MAP, "launch:fa_prefill_f16kv__map"),
-            (SPAN, "launch:fa_prefill_f16kv__span"),
-            (CAUSAL, "launch:fa_prefill_f16kv__causal"),
+        // #144: the FA launcher serves both staged layouts from one source site
+        // per (layout, mode) — six sites, all driven here.
+        for (mode, layout, token) in [
+            (
+                MAP,
+                crate::cuda::KV_LAYOUT_F16,
+                "launch:fa_prefill_kv__f16_map",
+            ),
+            (
+                SPAN,
+                crate::cuda::KV_LAYOUT_F16,
+                "launch:fa_prefill_kv__f16_span",
+            ),
+            (
+                CAUSAL,
+                crate::cuda::KV_LAYOUT_F16,
+                "launch:fa_prefill_kv__f16_causal",
+            ),
+            (
+                MAP,
+                crate::cuda::KV_LAYOUT_Q8_0,
+                "launch:fa_prefill_kv__q8_0_map",
+            ),
+            (
+                SPAN,
+                crate::cuda::KV_LAYOUT_Q8_0,
+                "launch:fa_prefill_kv__q8_0_span",
+            ),
+            (
+                CAUSAL,
+                crate::cuda::KV_LAYOUT_Q8_0,
+                "launch:fa_prefill_kv__q8_0_causal",
+            ),
         ] {
             go!(&[token], || unsafe {
-                launch_fa_prefill_f16kv(
+                launch_fa_prefill_kv(
                     ctx.cf(0),
                     ctx.p(1),
                     ctx.p(2),
@@ -8948,6 +9112,8 @@ mod issue162_tests {
                     128,
                     0.125,
                     2,
+                    layout,
+                    136,
                     st,
                 );
             });
@@ -9217,9 +9383,9 @@ mod issue162_tests {
         let _ = s.take_last_error();
         unsafe { minfer_site_fail_reset() };
         let rc = {
-            let _g = Arm::new("launch:fa_prefill_f16kv__causal");
+            let _g = Arm::new("launch:fa_prefill_kv__f16_causal");
             unsafe {
-                launch_fa_prefill_f16kv(
+                launch_fa_prefill_kv(
                     ctx.cf(0),
                     ctx.p(1),
                     ctx.p(2),
@@ -9231,6 +9397,8 @@ mod issue162_tests {
                     128,
                     0.125,
                     2,
+                    crate::cuda::KV_LAYOUT_F16,
+                    136,
                     st,
                 )
             }
