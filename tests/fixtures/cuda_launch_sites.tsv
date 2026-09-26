@@ -104,7 +104,7 @@
 8859	launch_mmq_raw_wide_nt	launch:mmq_raw_wide_kd8	mmq_raw_wide_nt_kernel
 8884	launch_mmq_raw_nt	launch:mmq_raw_nt_kd4	mmq_raw_nt_kernel
 8896	launch_mmq_raw_nt	launch:mmq_raw_nt_kd8	mmq_raw_nt_kernel
-8947	cuda_mmq_smem_bytes	launch:mmq_nt	
+8947	launch_mmq_nt	launch:mmq_nt	
 9355	launch_q4_k_q8_mmvq_multi	launch:q4_k_q8_mmvq_multi	q4_k_q8_mmvq_multi
 9365	launch_q4_k_q8_mmvq_v2_multi	launch:q4_k_q8_mmvq_v2_multi	q4_k_q8_mmvq_v2_multi
 9375	launch_q5_k_q8_mmvq_multi	launch:q5_k_q8_mmvq_multi	q5_k_q8_mmvq_multi
