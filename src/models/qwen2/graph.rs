@@ -1031,40 +1031,6 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// Panic-safe restore of the **device** KV layout when it drops.
-    ///
-    /// #99 made the format per engine, so the `KvFormatGuard` this test used to carry
-    /// (and the process-wide `kvformat` global it restored) is gone: this gate loads
-    /// one engine per format and mutates no shared KV state. The *device* layout is
-    /// the one process-wide policy the increment deliberately left in place — the CUDA
-    /// kernels read `cuda::KV_LAYOUT` — so this guard restores it if an assertion
-    /// panics between arms, keeping a serial device run clean. It is a no-op on a
-    /// build with no CUDA.
-    struct DeviceLayoutGuard(Option<i32>);
-
-    impl DeviceLayoutGuard {
-        fn new() -> Self {
-            #[cfg(feature = "cuda")]
-            {
-                Self(Some(crate::cuda::kv_cache_layout()))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Self(None)
-            }
-        }
-    }
-
-    impl Drop for DeviceLayoutGuard {
-        fn drop(&mut self) {
-            #[cfg(feature = "cuda")]
-            if let Some(layout) = self.0 {
-                crate::cuda::set_kv_cache_layout(layout);
-            }
-            let _ = self.0;
-        }
-    }
-
     /// C4's acceptance on the real model: the packed regions are measurably smaller,
     /// and the Q8_0 cache stays inside a **named logit tolerance** of the f32 one.
     /// The class is not bitwise, and not greedy equality either: the store rounds
@@ -1089,13 +1055,15 @@ mod tests {
     /// `a_packed_physical_shift_moves_v_verbatim_and_requantizes_k` does the same for
     /// the shift's two halves (V verbatim, K the quantizate of the re-roped row).
     ///
-    /// **Per-engine since #99.** This gate used to flip the process-wide KV format
-    /// for its measurement runs, which sized every other test's KV regions for the
-    /// wrong format when the harness ran the ignored set in parallel. It now loads
-    /// **two engines per arm** — one resolved for `f32`, one for `q8_0` — and flips
-    /// nothing, so the same gate is the proof that two formats coexist in one
-    /// process. The device arm still sets the one process-wide policy #99 left in
-    /// place (the CUDA `KV_LAYOUT` tag its kernels read) before each run.
+    /// **Per-engine since #99; per-engine on the device too since #153.** This gate
+    /// used to flip the process-wide KV format for its measurement runs, which sized
+    /// every other test's KV regions for the wrong format when the harness ran the
+    /// ignored set in parallel. It now loads **two engines per arm** — one resolved
+    /// for `f32`, one for `q8_0` — and flips nothing, so the same gate is the proof
+    /// that two formats coexist in one process. #153 removed the last process-wide
+    /// tag (`cuda::KV_LAYOUT`): each engine's `kv_format` reaches its own CUDA
+    /// backend through `GraphAllocator::set_kv_format`, so the device arm's two
+    /// engines address their regions in the layout each named without any mutation.
     ///
     /// Ignored because it needs the cached 0.5B model; it is **device-aware**: the
     /// CPU arm asks for `--gpu-layers 0` (coverage on every build), and on a CUDA
@@ -1124,30 +1092,14 @@ mod tests {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        // The device layout is the one process-wide policy left (#99 kept it: the
-        // CUDA kernels read it). Restore it if an assertion panics between arms, so
-        // a following device test does not inherit `q8_0`. The per-engine format
-        // needs no guard: it lives on the engines loaded below.
-        let _layout = DeviceLayoutGuard::new();
 
-        // C4 S2b: a KV layout is **two** policies. The engine's `kv_format` sizes
-        // the region (packed or f32-shaped) and `cuda::kv_cache_layout` picks the
-        // kernel that reads it; a run that sets only the first asks an f16/f32
-        // kernel to address a packed region. The loader resolves both from the
-        // cache type it is given, and this closure restates the device half so an
-        // arm's measurement is always the layout it named.
-        let set_device_layout = |format: KvFormat| {
-            #[cfg(feature = "cuda")]
-            crate::cuda::set_kv_cache_layout(match format {
-                KvFormat::Q8_0 => crate::cuda::KV_LAYOUT_Q8_0,
-                KvFormat::F16 => crate::cuda::KV_LAYOUT_F16,
-                KvFormat::F32 => crate::cuda::KV_LAYOUT_F32,
-            });
-            // A CPU-only build has no device layout to set: the format travels on
-            // the engine, so there is deliberately nothing to mutate here.
-            #[cfg(not(feature = "cuda"))]
-            let _ = format;
-        };
+        // #153: a KV layout is **one** policy per engine now. The engine's
+        // `kv_format` sizes the region (packed or f32-shaped) **and** picks the CUDA
+        // kernel that reads it — `GraphAllocator::set_kv_format` stamps both the CPU
+        // backend and (when it exists) the CUDA backend's `KV_LAYOUT_*` tag from
+        // `model.kv_format`, and `enable_cuda` builds a fresh backend with the same
+        // stamp. There is deliberately no device-layout mutation left in this gate:
+        // an arm's measurement is always the layout the engine it loaded named.
 
         // The arms. Before C4 S2b this gate had to ask for `Layers(0)` because the
         // device could not read a packed region at all (#123's device-aware
@@ -1219,27 +1171,41 @@ mod tests {
                 }
             }
 
-            let run =
-                |model: &dyn ModelDef, format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-                    set_device_layout(format);
-                    let mut cache = GraphCache::new();
-                    cache.alloc().kv_set_capacity(n_ctx);
-                    let positions: Vec<usize> = (0..n).collect();
-                    let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
-                    let mut logits = vec![l.clone()];
-                    let mut next = argmax(&l);
-                    let mut toks = vec![next];
-                    for s in 0..steps {
-                        l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
-                        logits.push(l.clone());
-                        next = argmax(&l);
-                        toks.push(next);
-                    }
-                    (logits, toks, cache.alloc().kv_region_bytes())
-                };
+            let run = |model: &dyn ModelDef| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                let mut cache = GraphCache::new();
+                cache.alloc().kv_set_capacity(n_ctx);
+                let positions: Vec<usize> = (0..n).collect();
+                let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+                // #153: the CUDA backend the forward built addresses its regions in
+                // the layout this engine resolved — the per-engine tag's value arm.
+                // (The `kv_region_bytes` comparison below is the region arm.)
+                #[cfg(feature = "cuda")]
+                if model.device() == Device::Cuda {
+                    let cb = cache
+                        .alloc()
+                        .cuda()
+                        .expect("a CUDA engine must have enabled its CUDA backend");
+                    assert_eq!(
+                        cb.kv_layout(),
+                        crate::cuda::layout_of(model.kv_format()),
+                        "[{}] the CUDA backend tag must be the engine's resolved format",
+                        model.kv_format().name()
+                    );
+                }
+                let mut logits = vec![l.clone()];
+                let mut next = argmax(&l);
+                let mut toks = vec![next];
+                for s in 0..steps {
+                    l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                    logits.push(l.clone());
+                    next = argmax(&l);
+                    toks.push(next);
+                }
+                (logits, toks, cache.alloc().kv_region_bytes())
+            };
 
-            let (l_ref, t_ref, b_ref) = run(ref_model.as_ref(), KvFormat::F32);
-            let (l_q8, t_q8, b_q8) = run(q8_model.as_ref(), KvFormat::Q8_0);
+            let (l_ref, t_ref, b_ref) = run(ref_model.as_ref());
+            let (l_q8, t_q8, b_q8) = run(q8_model.as_ref());
             let ratio = b_ref as f64 / b_q8 as f64;
             let worst = l_ref
                 .iter()
@@ -1325,43 +1291,39 @@ mod tests {
                 shift_n > drop + steps,
                 "the shifted fixture must keep a context"
             );
-            let run_shifted =
-                |model: &dyn ModelDef, format: KvFormat| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
-                    set_device_layout(format);
-                    let mut cache = GraphCache::new();
-                    cache.alloc().kv_set_capacity(n_ctx);
-                    let positions: Vec<usize> = (0..shift_n).collect();
-                    let mut l =
-                        model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
-                    let (freq_base, freq_scale) = model.rope_params();
-                    let rope = crate::graph::kvcache::KvRope {
-                        freq_base,
-                        freq_scale,
-                        n_head_kv: model.n_head_kv(),
-                        hd: model.n_embd_head(),
-                        style: model.rope_style(),
-                    };
-                    let left = cache
-                        .alloc()
-                        .kv_rm(0, drop, &rope)
-                        .expect("packed-aware physical shift");
-                    // The survivors now address positions 0..left, so the next token continues
-                    // at `left` — the shift's whole point.
-                    let mut next = argmax(&l);
-                    let mut toks = Vec::new();
-                    let mut logs = Vec::new();
-                    for s in 0..steps {
-                        l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
-                        logs.push(l.clone());
-                        next = argmax(&l);
-                        toks.push(next);
-                    }
-                    (logs, toks, left)
+            let run_shifted = |model: &dyn ModelDef| -> (Vec<Vec<f32>>, Vec<u32>, usize) {
+                let mut cache = GraphCache::new();
+                cache.alloc().kv_set_capacity(n_ctx);
+                let positions: Vec<usize> = (0..shift_n).collect();
+                let mut l =
+                    model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
+                let (freq_base, freq_scale) = model.rope_params();
+                let rope = crate::graph::kvcache::KvRope {
+                    freq_base,
+                    freq_scale,
+                    n_head_kv: model.n_head_kv(),
+                    hd: model.n_embd_head(),
+                    style: model.rope_style(),
                 };
-            let (logs_shift_f32, t_shift_ref, left_ref) =
-                run_shifted(ref_model.as_ref(), KvFormat::F32);
-            let (logs_shift_q8, t_shift_q8, left_q8) =
-                run_shifted(q8_model.as_ref(), KvFormat::Q8_0);
+                let left = cache
+                    .alloc()
+                    .kv_rm(0, drop, &rope)
+                    .expect("packed-aware physical shift");
+                // The survivors now address positions 0..left, so the next token continues
+                // at `left` — the shift's whole point.
+                let mut next = argmax(&l);
+                let mut toks = Vec::new();
+                let mut logs = Vec::new();
+                for s in 0..steps {
+                    l = model.forward_graph_cached(&[next], &[left + s], 1, n_ctx, &mut cache);
+                    logs.push(l.clone());
+                    next = argmax(&l);
+                    toks.push(next);
+                }
+                (logs, toks, left)
+            };
+            let (logs_shift_f32, t_shift_ref, left_ref) = run_shifted(ref_model.as_ref());
+            let (logs_shift_q8, t_shift_q8, left_q8) = run_shifted(q8_model.as_ref());
             assert_eq!(
                 left_ref, left_q8,
                 "[{label}] the same shift must leave the same rows"
@@ -1409,6 +1371,221 @@ mod tests {
                  {spread_shift} spread"
             );
         }
+    }
+
+    /// #153's acceptance gate: **two CUDA engines with different KV layouts in one
+    /// process**, driven interleaved through one `CudaState`.
+    ///
+    /// Before #153 the CUDA kernels read a `static KV_LAYOUT` the loader had set, so
+    /// two engines in one process could only ever run the last-loaded layout, and
+    /// the device discipline was serial *for that reason*. Now each engine's resolved
+    /// `KvFormat` reaches its own `CudaBackend` (`GraphAllocator::set_kv_format` →
+    /// `cuda::layout_of`), and the captured-graph identity records the tag.
+    ///
+    /// The arms (gate contract):
+    /// - **the tag arm** — each cache's `CudaBackend::kv_layout()` is the layout its
+    ///   engine named, and the two are different. This is the value arm that a shared
+    ///   tag fails outright.
+    /// - **the region arm** — the packed engine's regions are at least 3x smaller, an
+    ///   absolute value computed from the arena, not from the other path.
+    /// - **the attention arm** — the packed engine's logits stay inside the C4 class
+    ///   of the f32 engine's (at the argmax <= 1.0, tail <= 4.0). A packed region
+    ///   addressed as f32 rows is off by the whole logit spread, so this is the arm
+    ///   that catches a wrong kernel.
+    /// - **the isolation arm** — each engine's interleaved logits are **bitwise
+    ///   equal** to the same engine run alone in a fresh cache, so neither engine's
+    ///   presence moved the other's attention.
+    ///
+    /// Interleaved rather than threaded on purpose: `CudaState` is a process-wide
+    /// singleton and the capture path takes a process-wide stream lock, so two OS
+    /// threads would serialize on that lock anyway. "Interleaved" is the form the
+    /// ticket allows and the one that exercises the per-engine tag.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device; run it alone:
+    ///
+    /// ```text
+    /// cargo test --release --features cuda \
+    ///   two_cuda_engines_with_different_kv_layouts_run_interleaved -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires the cached 0.5B model and a CUDA device"]
+    fn two_cuda_engines_with_different_kv_layouts_run_interleaved() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::kvformat::KvFormat;
+        use crate::graph::offload::OffloadRequest;
+        use crate::models::{Device, ModelDef};
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the #153 two-engine gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+        let n_ctx = 256usize;
+        let steps = 8usize;
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let positions: Vec<usize> = (0..n).collect();
+
+        // Two engines, loaded **before either runs** and under distinct registry
+        // namespaces (the CUDA weight registry is process-global and name-keyed).
+        let f32_engine = crate::models::load_model_configured(
+            &gguf,
+            "pair.f32.",
+            OffloadRequest::Default,
+            Some("f32"),
+        )
+        .expect("load the f32 engine");
+        let q8_engine = crate::models::load_model_configured(
+            &gguf,
+            "pair.q8.",
+            OffloadRequest::Default,
+            Some("q8_0"),
+        )
+        .expect("load the q8_0 engine");
+        for (model, want, name) in [
+            (&f32_engine, KvFormat::F32, "f32"),
+            (&q8_engine, KvFormat::Q8_0, "q8_0"),
+        ] {
+            assert_eq!(
+                model.kv_format(),
+                want,
+                "the {name} engine's resolved format"
+            );
+            assert_eq!(
+                model.device(),
+                Device::Cuda,
+                "the {name} engine must run on the device — a silent CPU fallback would leave \
+                 the per-engine tag untested by the gate that exists to test it"
+            );
+        }
+
+        // Interleaved prefill: f32 first, then q8_0, on two live caches.
+        let mut caches: [GraphCache; 2] = [GraphCache::new(), GraphCache::new()];
+        for c in caches.iter_mut() {
+            c.alloc().kv_set_capacity(n_ctx);
+        }
+        let mut inter_f32: Vec<Vec<f32>> = Vec::new();
+        let mut inter_q8: Vec<Vec<f32>> = Vec::new();
+        let mut l = f32_engine.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut caches[0]);
+        inter_f32.push(l.clone());
+        let mut next_f32 = argmax(&l);
+        let mut l = q8_engine.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut caches[1]);
+        inter_q8.push(l.clone());
+        let mut next_q8 = argmax(&l);
+
+        // Tag arm: the two live backends hold the layouts their engines named.
+        let tag_f32 = caches[0]
+            .alloc()
+            .cuda()
+            .expect("the f32 engine must have a CUDA backend")
+            .kv_layout();
+        let tag_q8 = caches[1]
+            .alloc()
+            .cuda()
+            .expect("the q8_0 engine must have a CUDA backend")
+            .kv_layout();
+        assert_eq!(tag_f32, crate::cuda::KV_LAYOUT_F32, "f32 backend tag");
+        assert_eq!(tag_q8, crate::cuda::KV_LAYOUT_Q8_0, "q8_0 backend tag");
+        assert_ne!(
+            tag_f32, tag_q8,
+            "the two engines must hold different tags in one process"
+        );
+
+        // Interleaved decode: every step of one engine sits between two steps of the
+        // other, so both are live across the whole run.
+        for s in 0..steps {
+            l = f32_engine.forward_graph_cached(&[next_f32], &[n + s], 1, n_ctx, &mut caches[0]);
+            inter_f32.push(l.clone());
+            next_f32 = argmax(&l);
+            l = q8_engine.forward_graph_cached(&[next_q8], &[n + s], 1, n_ctx, &mut caches[1]);
+            inter_q8.push(l.clone());
+            next_q8 = argmax(&l);
+        }
+
+        // Region arm: the packed regions are an absolute, independently computed size.
+        let b_f32 = caches[0].alloc().kv_region_bytes();
+        let b_q8 = caches[1].alloc().kv_region_bytes();
+        assert!(
+            b_q8 * 3 <= b_f32,
+            "the packed engine's regions must be at least 3x smaller: {b_q8} vs {b_f32}"
+        );
+
+        // Attention arm: the packed engine's answer, in the C4 tolerance class.
+        let worst = inter_f32
+            .iter()
+            .zip(&inter_q8)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        let at_argmax = inter_f32
+            .iter()
+            .zip(&inter_q8)
+            .map(|(a, b)| {
+                let i = argmax(a) as usize;
+                (a[i] - b[i]).abs()
+            })
+            .fold(0.0f32, f32::max);
+        let spread = inter_f32
+            .iter()
+            .flatten()
+            .fold(f32::NEG_INFINITY, |m, x| m.max(*x))
+            - inter_f32
+                .iter()
+                .flatten()
+                .fold(f32::INFINITY, |m, x| m.min(*x));
+        assert!(
+            at_argmax <= 1.0,
+            "interleaved packed vs f32 at the argmax: |Δ| = {at_argmax}"
+        );
+        assert!(
+            worst <= 4.0,
+            "interleaved packed vs f32: max |Δ| = {worst} of a {spread} spread"
+        );
+
+        // Isolation arm: each engine alone in a fresh cache must be bitwise identical
+        // to its interleaved run — the other engine's live backend changed nothing.
+        let solo = |model: &dyn ModelDef| -> Vec<Vec<f32>> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+            let mut out = vec![l.clone()];
+            let mut next = argmax(&l);
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                out.push(l.clone());
+                next = argmax(&l);
+            }
+            out
+        };
+        let solo_f32 = solo(f32_engine.as_ref());
+        let solo_q8 = solo(q8_engine.as_ref());
+        let drift_f32 = inter_f32
+            .iter()
+            .zip(&solo_f32)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        let drift_q8 = inter_q8
+            .iter()
+            .zip(&solo_q8)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            drift_f32, 0.0,
+            "the f32 engine's interleaved logits must be bitwise its solo logits"
+        );
+        assert_eq!(
+            drift_q8, 0.0,
+            "the q8_0 engine's interleaved logits must be bitwise its solo logits"
+        );
+
+        eprintln!(
+            "[153] two live CUDA engines, interleaved {steps} decode steps: tags f32={tag_f32} \
+             q8_0={tag_q8}; regions f32 {b_f32} B vs q8_0 {b_q8} B ({:.2}x smaller); \
+             interleaved packed-vs-f32 max |Δlogit| = {worst} of a {spread} spread, at the \
+             argmax {at_argmax}; interleaved-vs-solo drift {drift_f32} / {drift_q8}",
+            b_f32 as f64 / b_q8 as f64
+        );
     }
 
     /// C5's acceptance on the real model: a session resumed from disk continues

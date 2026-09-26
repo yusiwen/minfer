@@ -264,18 +264,33 @@ impl GraphAllocator {
         &mut self.cpu
     }
 
-    /// C4 per-engine (issue #99): tell this allocator's **CPU** kernels which KV
-    /// format the engine they serve resolved. The model's graph stamps the same
+    /// C4/C4 S2b per-engine (issues #99, #153): tell this allocator's kernels which
+    /// KV format the engine they serve resolved. The model's graph stamps the same
     /// format into every KV node's `KvcacheMeta::row_elems`, so the store/attention
     /// dispatch and the region width cannot disagree within one engine.
     ///
-    /// Honest scope: only the CPU half is per-engine. The CUDA and Metal device
-    /// layers still hold a process-wide layout tag (`cuda::KV_LAYOUT`,
-    /// `metal::kv_cache_is_f16`) that their kernels read, so a device run keeps the
-    /// documented serial discipline; making the device layout per-graph is filed as
-    /// its own follow-up.
+    /// The **CPU** backend stores the format; the **CUDA** backend, if it exists, gets
+    /// the matching `KV_LAYOUT_*` tag (`cuda::layout_of`). A backend created later
+    /// (`enable_cuda`) picks the format up from this same stamp, so the tag follows the
+    /// engine and never a process global. `set_kv_layout` invalidates captured graphs
+    /// whose kernels were instantiated for the old tag.
+    ///
+    /// Honest scope (#153): the CUDA half is per-engine now; **Metal's**
+    /// `metal::kv_cache_is_f16` is still a process-wide tag its kernels read, so a
+    /// Metal run keeps the documented discipline until Metal is ported (G5).
     pub fn set_kv_format(&mut self, format: KvFormat) {
         self.cpu.set_kv_format(format);
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.cuda.as_mut() {
+            c.set_kv_layout(crate::cuda::layout_of(format));
+        }
+    }
+
+    /// The KV format this allocator's engine resolved (the CPU backend's stamp, set
+    /// by [`Self::set_kv_format`]). The CUDA backend's tag is derived from it.
+    #[allow(dead_code)]
+    pub fn kv_format(&self) -> KvFormat {
+        self.cpu.kv_format()
     }
 
     /// Mutable Metal backend (None until enabled / MPS unavailable).
@@ -291,13 +306,17 @@ impl GraphAllocator {
     }
 
     /// Enable the CUDA backend (device presence + `MINFER_DISABLE_CUDA` are
-    /// checked by `CudaBackend::new` via the CudaState singleton).
-    /// (Model-side wiring lands in Phase 7c; tests use it meanwhile.)
+    /// checked by `CudaBackend::with_layout` via the CudaState singleton).
+    ///
+    /// #153: the backend is built with this allocator's stamped KV format, so its
+    /// kernels address the regions in the layout the loaded engine resolved.
     #[allow(dead_code)]
     #[cfg(feature = "cuda")]
     pub fn enable_cuda(&mut self) -> bool {
         if self.cuda.is_none() {
-            self.cuda = super::cuda_backend::CudaBackend::new();
+            self.cuda = super::cuda_backend::CudaBackend::with_layout(crate::cuda::layout_of(
+                self.cpu.kv_format(),
+            ));
         }
         self.cuda.is_some()
     }
@@ -4227,6 +4246,47 @@ mod tests {
             alloc.supports_for(&Op::Silu, crate::graph::DType::F32, None),
             Some(Backend::CUDA)
         );
+    }
+
+    /// #153: the allocator stamps the engine's resolved format onto its **CUDA**
+    /// backend — both when the backend already exists (`set_kv_format`) and when it is
+    /// created afterwards (`enable_cuda`), so the tag is always the engine's and never
+    /// a process global. Device-gated.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn set_kv_format_stamps_the_cuda_layout_per_engine() {
+        crate::cuda::CudaState::init();
+        if crate::cuda::CudaState::get().is_none() {
+            eprintln!("no CUDA device; skipping the #153 layout-stamp gate");
+            return;
+        }
+        // (a) the format is known before the backend exists: `enable_cuda` must build
+        // it with the stamped layout, not a default.
+        let mut alloc = GraphAllocator::new();
+        assert_eq!(
+            alloc.kv_format(),
+            KvFormat::F32,
+            "a fresh allocator defaults to f32"
+        );
+        alloc.set_kv_format(KvFormat::Q8_0);
+        assert!(alloc.enable_cuda());
+        assert_eq!(
+            alloc.cuda().unwrap().kv_layout(),
+            crate::cuda::KV_LAYOUT_Q8_0,
+            "the backend must be built with the engine's stamped format"
+        );
+        assert_eq!(alloc.cuda().unwrap().kv_format(), KvFormat::Q8_0);
+
+        // (b) the format changes while the backend exists: `set_kv_format` re-stamps it
+        // (an engine's format never moves in production, but the stamp must be total).
+        alloc.set_kv_format(KvFormat::F16);
+        assert_eq!(
+            alloc.cuda().unwrap().kv_layout(),
+            crate::cuda::KV_LAYOUT_F16,
+            "an existing backend must follow the stamp"
+        );
+        assert_eq!(alloc.kv_format(), KvFormat::F16);
+        assert_eq!(alloc.cuda().unwrap().kv_format(), KvFormat::F16);
     }
 
     /// E5: a KV session is one arena (the container carries a single backend tag), so a mixed

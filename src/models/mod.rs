@@ -387,25 +387,16 @@ pub fn load_model_configured(
     // gate an unsupported `MINFER_CACHE_TYPE` fails on — an unknown spelling, or a
     // packed format the device has no kernel for, ends the load here instead of
     // quietly running f32.
-    match crate::graph::kvformat::resolve(loaded.device(), cache_type) {
+    //
+    // #153: the device's own auto policy (f16 for the 7B class) is folded in here, so
+    // the engine's resolved format is also the CUDA layout its kernels run. It used to
+    // be a separate `cuda::set_kv_cache_type` writing a process-wide tag; the resolver
+    // is now the one authority for both the region width and the kernel the device
+    // runs, and no engine can install another's layout.
+    let (n_layers, n_kv_embd) = (loaded.n_layer(), loaded.n_kv_embd());
+    match crate::graph::kvformat::resolve(loaded.device(), cache_type, n_layers, n_kv_embd) {
         Ok(format) => {
             loaded.set_kv_format(format);
-            // C4 S2b: the *device* layout must be the format this load resolved.
-            // The arch loaders already pushed `MINFER_CACHE_TYPE` through
-            // `cuda::set_kv_cache_type`, but the resolver is the one authority, and
-            // a packed region addressed as f32 rows is silent corruption — so a
-            // `q8_0` resolution restates the layout here. `f32`/`f16` keep
-            // `set_kv_cache_type`'s own auto policy (the region shape is the same
-            // for both, so the pre-C4 split stands).
-            //
-            // This is the process-wide device half that #99 deliberately left in
-            // place: the CUDA kernels read `cuda::KV_LAYOUT`, so the layout is still
-            // a per-load process policy, and a device run keeps its serial
-            // discipline. Making it per-graph is the filed follow-up.
-            #[cfg(feature = "cuda")]
-            if format == crate::graph::kvformat::KvFormat::Q8_0 {
-                crate::cuda::set_kv_cache_layout(crate::cuda::KV_LAYOUT_Q8_0);
-            }
         }
         Err(e) => {
             eprintln!("minfer: {e}");

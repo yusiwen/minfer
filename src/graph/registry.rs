@@ -223,9 +223,11 @@ pub struct BackendEntry {
     pub await_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<(), String>,
     /// The KV element type this backend's regions store (C5 records it in the
     /// session header). Takes the allocator because the answer belongs to the
-    /// engine it serves: per-engine (#99) the CPU hook is the allocator's stamped
-    /// `GraphAllocator::set_kv_format`; the CUDA and Metal hooks still read the
-    /// process-wide device layout.
+    /// engine it serves: per-engine (#99, and #153 for CUDA) the CPU hook is the
+    /// allocator's stamped `GraphAllocator::set_kv_format` and the CUDA hook is the
+    /// backend's own `kv_layout`, both derived from the loaded engine's resolved
+    /// format. **Metal's** hook still reads the process-wide `metal::kv_cache_is_f16`
+    /// — the one device-static left.
     pub kv_format: fn(&GraphAllocator) -> KvFormat,
     /// Bring the pool up if this build/machine can (idempotent); `false` means
     /// it cannot.

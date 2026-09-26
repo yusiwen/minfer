@@ -388,14 +388,13 @@ pub fn load(
     // A `Cell` because the two tensor-loading closures below both borrow it.
     let device_bytes = std::cell::Cell::new(0usize);
 
-    // KV cache element type (GPU path): auto-select f16 for the 7B class (KV
-    // bandwidth-bound decode) unless MINFER_CACHE_TYPE overrides. Must run
-    // before the first forward (kv_cache_is_f16 reads the OnceLock).
+    // KV cache element type: the **engine's** resolved format carries the GPU auto
+    // policy (#153, `kvformat::auto_device_format`) and `MINFER_CACHE_TYPE` override,
+    // and reaches the CUDA kernels from `models::load_model_configured`. Metal still
+    // keeps its own process-wide tag (the kernels read `kv_cache_is_f16`), so it is
+    // primed here before the first forward.
     #[cfg(target_os = "macos")]
     crate::metal::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
-    // 8b: CUDA side shares the same policy and MINFER_CACHE_TYPE override.
-    #[cfg(feature = "cuda")]
-    crate::cuda::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
 
     // Zero-copy weight registration: tell the Metal backend about each mmap'd
     // part (page-aligned base) BEFORE any weight is registered, so weights are

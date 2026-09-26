@@ -118,9 +118,15 @@ pub struct GraphEngine<'a> {
 
 impl<'a> GraphEngine<'a> {
     pub fn new(model: &'a dyn ModelDef, n_ctx: usize) -> Self {
+        // #153: stamp the engine's KV format before the first forward — a `--session`
+        // resume reads the session header's element type through the registry's
+        // `kv_format` hook (the allocator's stamp), and a per-engine format must be
+        // installed by the caller that knows the engine, not read from a global.
+        let mut cache = GraphCache::new();
+        cache.alloc().set_kv_format(model.kv_format());
         Self {
             model,
-            cache: GraphCache::new(),
+            cache,
             n_ctx,
         }
     }
@@ -231,7 +237,10 @@ impl Engine for GraphEngine<'_> {
             .forward_graph_cached(tokens, positions, n_out, self.n_ctx, &mut self.cache)
     }
     fn reset_cache(&mut self) {
+        // #153: a fresh cache must carry the engine's format from the start, exactly
+        // like `new` (a rebuild must not leave it at the F32 default).
         self.cache = GraphCache::new();
+        self.cache.alloc().set_kv_format(self.model.kv_format());
     }
     fn kv_rm(&mut self, start: usize, len: usize) -> Result<usize, String> {
         // The physical removal is host-side by design (memmove + re-rope through
