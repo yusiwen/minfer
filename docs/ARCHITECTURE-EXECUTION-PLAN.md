@@ -6134,3 +6134,102 @@ second implementation in C++ (a kernel cannot call into Rust); the two are docum
 identical and the Rust half is the one unit-tested. The still-unbounded `while engine.busy()` steppers
 remain [#160](https://github.com/yusiwen/minfer/issues/160), and the count-consistency check that would
 enforce rule 5's provenance remains [#94](https://github.com/yusiwen/minfer/issues/94).
+
+#### Test-infrastructure record (#173, 2026-09-26) — the op-timing gate reads its own sink, not a shared table
+
+**The problem.** `graph::scheduler::tests::op_timing_does_not_change_the_result_but_does_accumulate`
+(F8/`#51`) took the process-global `optiming::gate()` mutex, forced the timing flag on, and asserted that
+a later quiet run left the process-global per-op table unchanged. The mutex serialized the *flag* flips
+only; it could not stop another test from **executing a graph** while the flag was on, so that test's
+records landed in the same two atomics between the gate's snapshots. Observed once on 2026-09-26 in a full
+parallel CPU suite (heavy device jobs also on the box): `left: 2, right: 1` at the "a run with the flag off
+records nothing" assertion. A verdict that depends on what else happens to run beside it is not a gate —
+this is [#173](https://github.com/yusiwen/minfer/issues/173), the same isolation class `#99` fixed for the
+KV format.
+
+**What landed.** The accumulators moved into `optiming::TimingSink` — the same fixed
+`[(nanos, calls)]` table, now an instance rather than a `static`. The engine keeps one process-global
+sink (`record` / `snapshot` / `reset` delegate to it, so `/metrics` and every other consumer are
+unchanged), and `BackendScheduler` carries a `TimingMode` chosen at **construction**:
+
+- `Global` (default): the production policy — resolve `MINFER_OP_TIMING` once per `execute` and record
+  into the process-global sink when it is on;
+- `Off`: never read the clock;
+- `Private { sink: Arc<TimingSink>, enabled: bool }`: record into a caller-owned sink, gated by a
+  caller-owned flag — the isolation seam.
+
+`force()`, `GATE` and `gate()` existed only to paper over the shared table and are deleted. The gate now
+asserts **values** from the sink its own scheduler wrote: exactly one `silu` and one `add` after the
+timing-on run (the `small_graph` is input → silu → add, and an input is never dispatched), and an empty
+sink after the timing-off run. A new control test,
+`a_concurrent_graph_load_cannot_move_a_private_sink`, runs `4 × 64` real `execute`s into the **shared
+global** sink on four scoped threads while asserting eight private sinks stay at exactly one `silu` +
+one `add` each, then asserts the shared sink's total moved to `1 + 4 × 64` (the extra one through the free
+`record`). The load is bounded by work, every thread is joined by `scope`, and there are no sleeps or
+clocks (rule 4).
+
+Why `Private` carries its own `enabled` instead of the recommended `Private(Arc<TimingSink>)` that always
+records: the "flag off records nothing" arm has to read the sink the scheduler *would* write, or the arm
+is refused by the mode rather than by the flag (rule 2). With an always-recording private sink, the off
+arm could only assert the global table — the shared state this ticket removes.
+
+**The stale-doc defect.** The module doc claimed the property was "pinned by
+`op_timing_off_by_default_leaves_the_table_empty`"; no such test has ever existed. The doc now names the
+real ones — `op_timing_flag_is_presence_checked_and_off_when_unset`, `off_mode_never_records`,
+`global_mode_follows_the_flag`, and the scheduler gate — and the stale `optiming::gate` references in
+`graph/copystats.rs` are corrected.
+
+**Mutation evidence (rule 3).** The failure-injection seam does not fit — the mutation ignores a flag, it
+does not fail a call — so this is the one-line implementation edit the rule allows. Dropping the `enabled`
+gate from `TimingMode::resolve_for`'s `Private` arm (one line: `enabled.then(|| sink.as_ref())` →
+`Some(sink.as_ref())`) is "the scheduler records while the flag is off":
+
+```
+$ cargo test --release --bin minfer -- \
+    graph::scheduler::tests::op_timing_does_not_change_the_result_but_does_accumulate --exact
+test graph::scheduler::tests::op_timing_does_not_change_the_result_but_does_accumulate ... FAILED
+
+thread '...' panicked at src/graph/scheduler.rs:706:9:
+a run with timing off records nothing: [OpTimingEntry { name: "add", calls: 1, nanos: 43584 },
+  OpTimingEntry { name: "silu", calls: 1, nanos: 7056 }]
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 492 filtered out; finished in 0.00s
+error: test failed, to rerun pass `--bin minfer`
+$ echo $?
+101
+```
+
+Reverted byte-for-byte (`diff -q` clean; `src/optiming.rs` sha256
+`4f20689df7ea803ea703c96893725fd3914d7d9c2a911e4f864e9d92b9409d3f` both sides).
+
+**Counts (rule 5).** All on this box (20-core aarch64), `cargo test --release`:
+
+| Run | Unit | Integration |
+|---|---|---|
+| idle, run 1 | **460 passed / 0 failed / 33 ignored** | **10 / 0 / 6** |
+| idle, run 2 | **460 passed / 0 failed / 33 ignored** | **10 / 0 / 6** |
+| under 24 CPU spinners (20 cores) | **460 passed / 0 failed / 33 ignored** (95.89 s) | **10 / 0 / 6** |
+| the two gate tests ×20 under the same load | **2 passed / 0 failed** every iteration | — |
+
+The delta is **+3**: `optiming` loses `the_gate_switches_the_scheduler_path_on_and_off` (it tested the
+deleted `force`) and gains `off_mode_never_records`, `global_mode_follows_the_flag` and
+`private_mode_uses_its_own_sink_and_flag` (−1, +3); the scheduler replaces one gate with the rewritten
+gate plus the concurrent-load control (+1). The `x86_64 (CI runner)` row moves by the same +3
+(455 → **458**), which `test-linux-cpu`'s `--check-live` confirms against its own log; `AGENTS.md` and
+`docs/status.toml` carry both rows.
+
+**Audit of the other global-table readers (acceptance item 4).** `server::metrics::tests::
+op_timing_family_renders_seconds_with_nanosecond_resolution` builds `MetricsSnapshot.ops` by hand and
+never reads the process table, so it is outside the fault class. The two tests that render a live
+`ServerMetrics::snapshot()` (`the_token_families_render`, `both_threads_write_into_one_registry`) do read
+the global table incidentally, but assert only token/KV families and well-formedness — an op family a
+concurrent execution adds cannot change their verdict. No follow-up is needed: the only shared-table
+writer left in the suite is the `#173` control test itself, which resets the sink before and after.
+
+**Honest scope.** The new gate proves that a scheduler's verdict reads only its own sink, and the control
+test proves a concurrent global load cannot move it; it does **not** prove that any *other* future test
+will keep its hands off the process table. That is now a rule a reviewer checks, not a property CI can
+see. The removed `force()` also removes the suite's only way to flip the cached process flag — the
+production `Global` path is exercised by the pure `resolve_for` tests and the (unset) flag's rule, not by
+an in-process toggle; a real `MINFER_OP_TIMING=1` end-to-end run is still the device/manual evidence
+recorded under F8.
