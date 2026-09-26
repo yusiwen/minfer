@@ -1185,10 +1185,88 @@ Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2
   `FLAG_PACKED` bit is what encodes it; f16 had no flag then — the gap
   [#130](https://github.com/yusiwen/minfer/issues/130) closed in C5 S3 (`FLAG_F16`), below.
 
-**Handed off after S2b, still on [#87](https://github.com/yusiwen/minfer/issues/87):** the packed
-**fused decode epilogue** (a block-quantizing store inside `attn_bias_rope_store` would recover the
-1.18x on the 0.5B) and a **dp4a packed K dot** (the 1.25x), then the FA prefill on packed cells
-(the 15x at hd 128). [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+**Handed off after S2b:** the packed **fused decode epilogue**, a **dp4a packed K dot** and the
+**FA prefill on packed cells** — taken up as [#144](https://github.com/yusiwen/minfer/issues/144)
+and recorded in the next subsection (items 1 and 3 landed; item 2 stays open).
+[Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+
+### C4 — #144: the packed fused decode epilogue and the packed FA prefill · [#144](https://github.com/yusiwen/minfer/issues/144) — **DONE (items 1 + 3) 2026-09-26**
+
+**Why.** C4 S2b's packed cache is correct and 3.76x smaller than f32, but three paths were off their
+tuned route: a Q8_0 decode ran the unfused bias/rope/store chain (the builders' `layer_gpu` gate
+carried `&& !packed`), `kv4<Q8_0>` paid four int8 converts where f16 paid two `__half2`, and an hd-128
+packed prefill could not enter `fa_prefill_f16kv`'s f16 shared-memory staging, so it fell to the
+general layout-tagged kernel — 15.3x off on Qwen3-0.6B `pp2048`. This ticket took the first and third
+(a dp4a K dot is a numerics change with its own accuracy statement; it is filed separately).
+
+**What landed.**
+
+1. **The packed fused decode epilogue.** `attn_bias_rope_store_q8_0` keeps the f32/f16 epilogue's q
+   section (bias + rope in place, one thread per pair) and re-maps K and V to **one thread per
+   (head, 32-element block)**: the thread computes all 32 K roped values itself (from the unroped row
+   plus the pair partner `d <-> d + hd/2`) or the 32 V bias-added values, and hands them to
+   `q8_0_quantize_block` — the *same* device quantizer `store_kv_q8_0` now calls, factored out so the
+   two cannot drift. Neither K nor V is written back (both buffers are dead in the fused classes) —
+   which is also why the packed epilogue has no rope race. The builders dropped `&& !b.kv_is_packed()`
+   from the Qwen2 family's `fuse_qkv` gate. `FusedQkvMeta` / `QkvBiasRopeStoreMeta` /
+   `FusedQkvNormMeta` gained a `row_elems` field (the packed cell width, `KvFormat::row_elems(nkt)`)
+   and the allocator sizes the region from it: without that, the first packed fused graph died with
+   `the node declares 34 words per cell but the q8_0 layout packs one cell of 512 elements into 136`.
+2. **The packed FA prefill.** `fa_prefill_f16kv` became `fa_prefill_kv<CAUSAL, MAP, LAYOUT>`: the
+   staging is the only layout-dependent part (`kv8_q8_0` dequantizes each packed 32-element block
+   into the same f16 tile, one 16-byte smem store per 8 elements); the tensor-core QK^T, the
+   fragment-resident softmax and P·V are untouched. `gqa_attn_kv_prefill` serves f16 and Q8_0 from
+   one call and keeps the general layout-tagged kernel as the documented fallback; the launcher's
+   failed-smem arm and `MINFER_NO_FA_PREFILL=1` both reach it. The chokepoint bumps
+   `testfail::note_checked("cuda_fa_prefill_q8_0")`, so the gate can prove the packed prefill took
+   the FA route rather than silently falling back.
+
+**The A/B protocol and the numbers.** All numbers: GB10 sm_121, `cargo build --release --features cuda`,
+`minfer bench -p 2048 -n 128 --n-ctx 4096 -o json`, `MINFER_CACHE_TYPE` pinned per arm, **5 interleaved
+rounds, medians**, 2026-09-26. The bars were named *before* measuring (gate contract rules 3 and 5);
+the full protocol lives in
+[`CUDA_OPTIMIZATION.md`](./CUDA_OPTIMIZATION.md) and
+[`cuda_optimization_steps/107`](./cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md).
+
+The re-measured baseline (master `85c712e`, its own binary) reproduced the S2b table within a few
+percent: 0.5B q4_0 `tg128` 237.37 f16 / 161.49 q8_0, `MINFER_NO_FUSE_QKV=1` f16 200.80 (a 1.182x cut —
+the ticket's 1.18x); Qwen3-0.6B Q8_0 `pp2048` 8323.24 f16 / 564.47 q8_0.
+
+| item | bar (named first) | measured | verdict |
+|---|---|---|---|
+| 1 packed fused epilogue | 0.5B `tg128` q8_0 ≥ 1.15x the unfused packed chain | 170.11 vs 161.63 same-binary = **1.052x** (vs the baseline binary 161.49 = 1.053x); f16 gap 1.470x → 1.393x | **landed, bar missed** |
+| 3 packed FA prefill | Qwen3-0.6B `pp2048` q8_0 ≥ 0.5x the f16 arm | **8231.05** vs 564.57 same-binary = **14.58x**; vs the f16 arm 8540.83 = **0.964x**, i.e. the 14.7x factor became **1.038x** | **landed** |
+| 1/3 no-regression | 0.5B `pp2048` q8_0 (hd 64: FA does not apply) flat | 2144.18 vs 2139.10 = 1.002x | flat |
+
+**Item 1's miss is a result, not a failure.** The ticket's "~1.18x" was the fusion cut measured on the
+**f16-weight** arm; on the q4_0 packed arm the same binary's fused-vs-unfused A/B is 1.052x. The
+saving is the ~6 launches/layer the epilogue removes (~13 µs/layer at 24 layers ≈ the 0.32 ms/token
+the two arms differ by), so the launch-overhead component is what this cut actually buys; the residual
+1.39x f16-to-packed gap is the packed *load* (`kv4<Q8_0>`'s four converts) and the 1-warp split-K
+decode body's `rpw_gate = 0`, which the dp4a item targets.
+
+**Verification.** The two new device gates and the five named Q8_0 gates are green:
+`cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer` (new: byte-exact K/V against the CPU quantizer at
+`pos = 0`, a value q check at `pos = 7`, plus V byte-exact), `cuda_q8_0_fa_prefill_attention_parity`
+(new: 100-token hd-128 prefill against the CPU attention over the same packed bytes, 5e-3 class,
+**max err 4.8e-4**, plus the `note_checked` observation arm),
+`cuda_q8_0_store_matches_the_cpu_quantizer`, `cuda_kv_q8_0_roundtrip_attn`,
+`cuda_q8_0_kv_cell_move_strides_by_row_bytes`, the Q8_0 arm of
+`cuda_map_window_matches_the_span_over_the_same_rows`, and `cuda_fa_prefill_attention_parity`
+(the f16 route, unchanged, max err 2.8e-4). Mutations: reverting the fused kernel's block offset
+(`d = blk*32 + i` → `d = i`) turns the byte arm red (it *found* exactly that bug during development);
+shifting `kv8_q8_0`'s block base (`elem >> 5` → `elem >> 4`) turns the FA parity red (max err 3.33);
+making the packed prefill skip the FA launch leaves the parity arm green (max err 5.8e-5) but turns the
+observation arm red — which is the whole reason it exists. `MINFER_TEST_ISSUE162=1` drives all 124
+audited launch sites (six new: three `fa_prefill_kv` layouts × modes and the packed epilogue) and is
+green.
+
+**Deliberately not taken.** The **dp4a packed K dot** (item 2): a per-head-quantized query against the
+packed K accumulates in `int`, which is a numerics change needing its own accuracy statement and a
+re-measured real-model tolerance — filed as a follow-up rather than assumed. **Qwen3's packed fused
+QKV** (`Op::FusedQkvNorm`) also waits: that op has no CUDA kernel at all (it is Metal + CPU today), so
+the `!packed` gate there is not what keeps Qwen3's decode off the device; its 1.13x packed gap is
+unrelated to this ticket's cuts.
 
 ### C4 — S2c: the latched CUDA API errors behind the phantom "kernel launch error" · [#145](https://github.com/yusiwen/minfer/issues/145) + [#128](https://github.com/yusiwen/minfer/issues/128) — **DONE 2026-09-25**
 
