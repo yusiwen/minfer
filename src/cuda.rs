@@ -1718,90 +1718,68 @@ pub fn concat_rows_feasible(tensors: &[&Tensor]) -> bool {
         .all(|t| t.data().len() == row * (t.shape[1] as usize))
 }
 
-/// 8b / C4 S2b: the GPU KV cache **layout** (CUDA side, mirrors
-/// `metal::kv_cache_is_f16`). The three codes are the `KV_LAYOUT_*` contract the
-/// kernels are templated on and the `KvFormat` discriminants, so the same number
-/// names the same layout on both sides of the FFI boundary:
+/// 8b / C4 S2b: the GPU KV cache **layout** tag the kernels are templated on. The
+/// three codes are the `KvFormat` discriminants, so the same number names the same
+/// layout on both sides of the FFI boundary:
 ///
 /// - `0` f32 — one f32 per element;
 /// - `1` f16 — one f16 per element in the first half of the f32-shaped region;
 /// - `2` q8_0 — packed 34-byte Q8_0 blocks, one cell rounded up to whole f32 words.
 ///
-/// `MINFER_CACHE_TYPE=f16|f32|q8_0` forces one; unset auto-selects f16 for the 7B
-/// class (n_layers×n_kv_embd ≥ 8192 — KV-bandwidth-bound decode), f32 for small
-/// models. Read once per `CudaBackend` at construction.
-///
 /// Before C4 S2b this was a bool and anything that was not exactly `f16` became
 /// `false` — so a `q8_0` region would have been addressed as f32 rows. The layout
-/// is now a first-class three-valued policy and `q8_0` is never silently folded
+/// is now a first-class three-valued tag and `q8_0` is never silently folded
 /// into f32.
 pub const KV_LAYOUT_F32: i32 = 0;
 pub const KV_LAYOUT_F16: i32 = 1;
 pub const KV_LAYOUT_Q8_0: i32 = 2;
 
-static KV_LAYOUT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(KV_LAYOUT_F32);
-
-/// The process-wide CUDA KV layout (the `KV_LAYOUT_*` code).
-pub fn kv_cache_layout() -> i32 {
-    KV_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn kv_cache_is_f16() -> bool {
-    kv_cache_layout() == KV_LAYOUT_F16
-}
-
-/// Called at model load with the model dims, BEFORE the first forward.
+/// The `KV_LAYOUT_*` tag for a `KvFormat` — the one place the two names are tied
+/// together, exhaustive over the enum so a fourth format cannot be added without a
+/// compile error here.
 ///
-/// A `MINFER_CACHE_TYPE` the resolver will refuse still sets the layout it names
-/// here (and the load then ends in `kvformat::resolve`); what matters is that the
-/// layout this function installs is never *another* format's — the pre-S2b bool
-/// mapped `q8_0` to f32, which would have sized a packed region for an f32 kernel.
-pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
-    let layout = match std::env::var("MINFER_CACHE_TYPE").ok().as_deref() {
-        Some("f16") => KV_LAYOUT_F16,
-        Some("f32") => KV_LAYOUT_F32,
-        Some("q8_0") => KV_LAYOUT_Q8_0,
-        _ => {
-            if n_layers * n_kv_embd >= 8192 {
-                KV_LAYOUT_F16
-            } else {
-                KV_LAYOUT_F32
-            }
-        }
-    };
-    set_kv_cache_layout(layout);
+/// **Per engine since #153.** The tag used to be a `static KV_LAYOUT` this module
+/// owned and every device kernel read; the loaded engine's resolved `KvFormat` now
+/// reaches its own `CudaBackend` through `GraphAllocator::set_kv_format`, so this is
+/// a pure translation, not a policy. A process that loads two engines with different
+/// formats gives each `CudaBackend` its own tag, and the captured-graph identity
+/// records it.
+pub fn layout_of(format: crate::graph::kvformat::KvFormat) -> i32 {
+    use crate::graph::kvformat::KvFormat;
+    match format {
+        KvFormat::F32 => KV_LAYOUT_F32,
+        KvFormat::F16 => KV_LAYOUT_F16,
+        KvFormat::Q8_0 => KV_LAYOUT_Q8_0,
+    }
 }
 
-/// Set the KV layout directly: the loader passes the policy for the model it just
-/// loaded, and device tests use it to exercise one layout explicitly.
-///
-/// This deliberately **overwrites**. The value is a per-load policy, and a process that
-/// loads a second model must be able to change it — as a `OnceLock` the first load
-/// froze the dtype for every backend constructed afterwards, so a second model silently
-/// ran under the first one's choice (its own layer/embedding dims never re-decided).
-pub fn set_kv_cache_layout(layout: i32) {
-    KV_LAYOUT.store(layout, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The f16/f32 spelling of [`set_kv_cache_layout`], kept for the device tests that
-/// exercise the pre-C4 layouts.
-pub fn set_kv_cache_f16(f16: bool) {
-    set_kv_cache_layout(if f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 });
+/// The `KvFormat` a `KV_LAYOUT_*` tag names. The inverse of [`layout_of`]; an
+/// unknown tag is F32, the pre-C4 reading, and is only reachable from an internal
+/// bug (the tag is never parsed from a file or the environment).
+pub fn format_of(layout: i32) -> crate::graph::kvformat::KvFormat {
+    use crate::graph::kvformat::KvFormat;
+    match layout {
+        KV_LAYOUT_F16 => KvFormat::F16,
+        KV_LAYOUT_Q8_0 => KvFormat::Q8_0,
+        _ => KvFormat::F32,
+    }
 }
 
 #[cfg(test)]
 mod kv_dtype_tests {
-    use super::{kv_cache_is_f16, kv_cache_layout, set_kv_cache_f16, KV_LAYOUT_Q8_0};
+    use super::{format_of, layout_of, KV_LAYOUT_F16, KV_LAYOUT_F32, KV_LAYOUT_Q8_0};
+    use crate::graph::kvformat::KvFormat;
 
-    /// The dtype is a policy that a later load must be able to change; the previous
-    /// one-shot global made the first decision permanent for the whole process.
+    /// The three layouts are a total, one-to-one mapping — the tag a `CudaBackend`
+    /// holds and the format its engine resolved cannot disagree.
     #[test]
-    fn the_kv_element_type_can_be_redecided() {
-        let before = kv_cache_is_f16();
-        set_kv_cache_f16(!before);
-        assert_eq!(kv_cache_is_f16(), !before, "the new value must be visible");
-        set_kv_cache_f16(before);
-        assert_eq!(kv_cache_is_f16(), before, "and the old one can be restored");
+    fn the_layout_tag_is_the_format_discriminant() {
+        assert_eq!(layout_of(KvFormat::F32), KV_LAYOUT_F32);
+        assert_eq!(layout_of(KvFormat::F16), KV_LAYOUT_F16);
+        assert_eq!(layout_of(KvFormat::Q8_0), KV_LAYOUT_Q8_0);
+        for f in [KvFormat::F32, KvFormat::F16, KvFormat::Q8_0] {
+            assert_eq!(format_of(layout_of(f)), f, "{f:?} round trip");
+        }
     }
 
     /// C4 S2b: the packed layout is a third value, not `false`. The pre-S2b bool
@@ -1809,15 +1787,9 @@ mod kv_dtype_tests {
     /// have been handed to the f32 kernels.
     #[test]
     fn the_packed_layout_is_not_the_f32_one() {
-        let before = kv_cache_layout();
-        set_kv_cache_f16(true);
-        assert_eq!(kv_cache_layout(), super::KV_LAYOUT_F16);
-        // Write the layout directly, the way `MINFER_CACHE_TYPE=q8_0` resolves.
-        super::set_kv_cache_layout(KV_LAYOUT_Q8_0);
-        assert_eq!(kv_cache_layout(), KV_LAYOUT_Q8_0);
-        assert!(!kv_cache_is_f16(), "q8_0 is not f16");
-        super::set_kv_cache_layout(before);
-        assert_eq!(kv_cache_layout(), before);
+        assert_eq!(format_of(KV_LAYOUT_Q8_0), KvFormat::Q8_0);
+        assert_ne!(format_of(KV_LAYOUT_Q8_0), KvFormat::F32);
+        assert_ne!(format_of(KV_LAYOUT_Q8_0), KvFormat::F16);
     }
 }
 

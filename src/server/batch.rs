@@ -267,6 +267,12 @@ impl BatchEngine {
             ));
         }
         let mut cache = GraphCache::new();
+        // #153: stamp the engine's KV format **before** any forward. `load_slots`
+        // (the server's startup path) reads the session header's element type through
+        // the registry's `kv_format` hook, which is the allocator's stamped format —
+        // on master the loader's process-wide tag made this true implicitly, and a
+        // per-engine format has to be installed by the caller that knows the engine.
+        cache.alloc().set_kv_format(model.kv_format());
         cache.alloc().kv_set_capacity(n_ctx_total);
         let mut slots: Vec<SlotState> = Vec::with_capacity(n_slots);
         for i in 0..n_slots {
@@ -2022,17 +2028,9 @@ mod tests {
         // as `nkt / 2` f32 slots (`store_kv_f16` indexes halves), so the window a
         // position covers is half as wide there. Reading it at the f32 width mixed
         // two rows per window and made this snapshot report differences in cells
-        // nothing had written.
-        let half_width = {
-            #[cfg(feature = "cuda")]
-            {
-                crate::cuda::kv_cache_is_f16()
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                false
-            }
-        };
+        // nothing had written. #153: the answer is the **engine's** stamped format
+        // (the same one its CUDA kernels run), not a process-wide device tag.
+        let half_width = engine.cache.alloc().kv_format() == crate::graph::kvformat::KvFormat::F16;
         let mut out: Vec<Vec<f32>> = Vec::new();
         let mut layer = 0;
         while let Some((k, v)) = engine.cache.alloc().copy_kv_to_cpu(layer) {

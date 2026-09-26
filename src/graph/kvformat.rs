@@ -3,7 +3,7 @@
 //! Three formats can reach a KV region:
 //!
 //! - **F32** — the CPU default and the reference every tolerance is stated against;
-//! - **F16** — the GPU bandwidth policy (`cuda::set_kv_cache_type` /
+//! - **F16** — the GPU bandwidth policy ([`auto_device_format`] /
 //!   `metal::set_kv_cache_type`, auto-selected for the 7B class). It keeps the region
 //!   *f32-shaped* and stores halves in the first half of those words, so
 //!   [`KvFormat::row_elems`] is the same as F32's: the win is bandwidth, not footprint;
@@ -27,16 +27,27 @@
 //! `MINFER_CACHE_TYPE` value is refused on every device (CUDA used to map anything that
 //! was not `f16` to f32), and a format the device has no kernel for is refused at load.
 //!
-//! **The format is per engine, not a process global (issue #99).** `models::load_model`
+//! **The format is per engine, not a process global (issues #99, #153).** `models::load_model`
 //! resolves `MINFER_CACHE_TYPE` once, against the device the loaded model will actually
 //! use, and stores the answer on the model; `CParams::kv_format` carries it into the
 //! graph builder (which stamps each KV node's width) and into the allocator (whose CPU
-//! backend speaks it). There is deliberately **no** `kvformat::set_kv_format` /
-//! `kv_format` global any more: when there was one, the C4 packed-cache gate flipped it
+//! **and CUDA** backends speak it). There is deliberately **no** `kvformat::set_kv_format`
+//! / `kv_format` global any more: when there was one, the C4 packed-cache gate flipped it
 //! for its measurement runs and every other test building a graph in the same process
 //! sized its regions for the wrong format — the parallel-red gate set this ticket fixed.
 //!
-//! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C4) and its #99 record.
+//! The device half landed in [#99]'s follow-up [#153]: the CUDA kernels' `KV_LAYOUT_*`
+//! tag is no longer a `cuda::KV_LAYOUT` process global. The engine's resolved format
+//! reaches its `CudaBackend` through the same `GraphAllocator::set_kv_format` stamp the
+//! CPU kernels get, the graph builder's `CParams::kv_format` still sizes the regions, and
+//! the captured-graph identity records the layout, so an exec instantiated for one layout
+//! never replays for another. Metal's `kv_cache_is_f16` is the one device-static left.
+//!
+//! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C4) and its #99 / #153
+//! records.
+//!
+//! [#99]: https://github.com/yusiwen/minfer/issues/99
+//! [#153]: https://github.com/yusiwen/minfer/issues/153
 
 use crate::models::Device;
 
@@ -139,12 +150,33 @@ impl KvFormat {
     }
 }
 
-/// `MINFER_CACHE_TYPE` → the format to use on `device`.
+/// The KV element count above which an unset `MINFER_CACHE_TYPE` auto-selects F16 on a
+/// device (the "7B class": KV-bandwidth-bound decode). The CPU keeps F32 regardless.
+pub const AUTO_F16_MIN_KV_ELEMS: usize = 8192;
+
+/// The GPU's own auto policy for an **unset** `MINFER_CACHE_TYPE`: f16 for the 7B class
+/// (`n_layers × n_kv_embd >= AUTO_F16_MIN_KV_ELEMS` — KV-bandwidth-bound decode),
+/// f32 for small models (0.5B measured f16 ~3% *slower* — dispatch-latency-bound).
+///
+/// This used to live only in `cuda::set_kv_cache_type` / `metal::set_kv_cache_type`,
+/// which wrote a process-wide tag; #153 folded it into the engine's resolved format so
+/// the value that sizes the region and the value the kernels read cannot differ, and so
+/// two engines with different dims can pick different layouts in one process. The CPU is
+/// never auto-f16: `resolve` maps F16 back to F32 there.
+pub fn auto_device_format(device: Device, n_layers: usize, n_kv_embd: usize) -> KvFormat {
+    if device != Device::Cpu && n_layers * n_kv_embd >= AUTO_F16_MIN_KV_ELEMS {
+        KvFormat::F16
+    } else {
+        KvFormat::F32
+    }
+}
+
+/// `MINFER_CACHE_TYPE` → the format to use on `device`, for a model with the given dims.
 ///
 /// Pure, so the whole matrix is covered by CI (which has no GPU). The rules:
 ///
-/// - unset/empty → F32 (the GPU's own auto policy — f16 for the 7B class — is applied
-///   separately by `set_kv_cache_type`, and it does not change the region's shape);
+/// - unset/empty → the device's own auto policy ([`auto_device_format`]: f16 for the 7B
+///   class on a device, f32 on the CPU and for small models);
 /// - `f32`, `f16`, `q8_0` → that format;
 /// - `f16` on CPU → F32: the CPU has no f16 KV kernel and
 ///   `docs/BACKENDS.md` documents "CPU: f32 regions", so an env var set for a GPU run
@@ -152,9 +184,14 @@ impl KvFormat {
 /// - anything else → **refused on every device** (a typo must not silently run f32);
 /// - a format the device has no kernel for → **refused** (`q8_0` on Metal, which is
 ///   G5; the CPU and CUDA kernels read a packed region since C4 S2a / S2b).
-pub fn resolve(device: Device, cache_type: Option<&str>) -> Result<KvFormat, String> {
+pub fn resolve(
+    device: Device,
+    cache_type: Option<&str>,
+    n_layers: usize,
+    n_kv_embd: usize,
+) -> Result<KvFormat, String> {
     let format = match cache_type {
-        None | Some("") => KvFormat::F32,
+        None | Some("") => auto_device_format(device, n_layers, n_kv_embd),
         Some("f32") => KvFormat::F32,
         Some("f16") => KvFormat::F16,
         Some("q8_0") => KvFormat::Q8_0,
@@ -390,43 +427,105 @@ mod tests {
 
     #[test]
     fn the_cache_type_gate_is_strict_and_device_aware() {
-        // Unset: f32 everywhere (the GPU's own auto policy is applied separately).
-        assert_eq!(resolve(Device::Cpu, None).unwrap(), KvFormat::F32);
-        assert_eq!(resolve(Device::Cuda, None).unwrap(), KvFormat::F32);
-        assert_eq!(resolve(Device::Metal, None).unwrap(), KvFormat::F32);
-        assert_eq!(resolve(Device::Cpu, Some("")).unwrap(), KvFormat::F32);
+        // Unset with a small model: f32 everywhere (the 7B-class auto policy is dims-keyed).
+        assert_eq!(resolve(Device::Cpu, None, 24, 128).unwrap(), KvFormat::F32);
+        assert_eq!(resolve(Device::Cuda, None, 24, 128).unwrap(), KvFormat::F32);
+        assert_eq!(
+            resolve(Device::Metal, None, 24, 128).unwrap(),
+            KvFormat::F32
+        );
+        assert_eq!(
+            resolve(Device::Cpu, Some(""), 24, 128).unwrap(),
+            KvFormat::F32
+        );
         // The three spellings.
-        assert_eq!(resolve(Device::Cpu, Some("f32")).unwrap(), KvFormat::F32);
-        assert_eq!(resolve(Device::Cpu, Some("q8_0")).unwrap(), KvFormat::Q8_0);
-        assert_eq!(resolve(Device::Cuda, Some("f16")).unwrap(), KvFormat::F16);
-        assert_eq!(resolve(Device::Metal, Some("f16")).unwrap(), KvFormat::F16);
+        assert_eq!(
+            resolve(Device::Cpu, Some("f32"), 24, 512).unwrap(),
+            KvFormat::F32
+        );
+        assert_eq!(
+            resolve(Device::Cpu, Some("q8_0"), 24, 512).unwrap(),
+            KvFormat::Q8_0
+        );
+        assert_eq!(
+            resolve(Device::Cuda, Some("f16"), 24, 512).unwrap(),
+            KvFormat::F16
+        );
+        assert_eq!(
+            resolve(Device::Metal, Some("f16"), 24, 512).unwrap(),
+            KvFormat::F16
+        );
         // f16 on CPU is the documented "CPU stays f32", not an error: the env var is
         // usually set for the GPU run a process may also do.
-        assert_eq!(resolve(Device::Cpu, Some("f16")).unwrap(), KvFormat::F32);
+        assert_eq!(
+            resolve(Device::Cpu, Some("f16"), 24, 512).unwrap(),
+            KvFormat::F32
+        );
+        // #153: the unset 7B-class auto policy is the *engine's* format now, so the
+        // device kernels and the region width read one answer. An explicit spelling
+        // always wins over the dims.
+        assert_eq!(
+            resolve(Device::Cuda, None, 28, 1024).unwrap(),
+            KvFormat::F16,
+            "28x1024 = 28672 >= {AUTO_F16_MIN_KV_ELEMS}: the 7B class auto-selects f16"
+        );
+        assert_eq!(
+            resolve(Device::Metal, None, 28, 1024).unwrap(),
+            KvFormat::F16,
+            "the auto policy is device-wide, not CUDA-only"
+        );
+        assert_eq!(
+            resolve(Device::Cuda, None, 24, 341).unwrap(),
+            KvFormat::F32,
+            "24x341 = 8184 < {AUTO_F16_MIN_KV_ELEMS}: the 0.5B class stays f32"
+        );
+        assert_eq!(
+            resolve(Device::Cpu, None, 28, 1024).unwrap(),
+            KvFormat::F32,
+            "the CPU never auto-selects f16"
+        );
+        assert_eq!(
+            resolve(Device::Cuda, Some("f32"), 28, 1024).unwrap(),
+            KvFormat::F32,
+            "an explicit f32 overrides the auto policy"
+        );
         // A packed format is refused exactly where the kernels are missing: Metal
         // (G5, issue #44) always, CUDA only in a build that compiles no CUDA at
         // all. The answer comes from the registry, not from a list here.
-        let err = resolve(Device::Metal, Some("q8_0")).unwrap_err();
+        let err = resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap_err();
         assert!(err.contains("q8_0"), "{err}");
         assert!(err.contains(Device::Metal.name()), "{err}");
         #[cfg(feature = "cuda")]
         assert_eq!(
-            resolve(Device::Cuda, Some("q8_0")).unwrap(),
+            resolve(Device::Cuda, Some("q8_0"), 24, 512).unwrap(),
             KvFormat::Q8_0,
             "C4 S2b gave CUDA a packed read"
         );
         #[cfg(not(feature = "cuda"))]
         {
-            let err = resolve(Device::Cuda, Some("q8_0")).unwrap_err();
+            let err = resolve(Device::Cuda, Some("q8_0"), 24, 512).unwrap_err();
             assert!(err.contains("q8_0"), "{err}");
             assert!(err.contains(Device::Cuda.name()), "{err}");
         }
         // A typo is refused on every device (CUDA used to read it as f32).
         for dev in [Device::Cpu, Device::Cuda, Device::Metal] {
-            let err = resolve(dev, Some("q8")).unwrap_err();
+            let err = resolve(dev, Some("q8"), 24, 512).unwrap_err();
             assert!(err.contains("not a KV cache type"), "{err}");
         }
-        assert!(resolve(Device::Cpu, Some("Q8_0")).is_err(), "case matters");
+        assert!(
+            resolve(Device::Cpu, Some("Q8_0"), 24, 512).is_err(),
+            "case matters"
+        );
+    }
+
+    /// #153: the auto policy is a pure function of the device and the dims, so two
+    /// engines in one process can resolve different formats without a global.
+    #[test]
+    fn the_auto_policy_is_a_pure_function_of_the_dims() {
+        assert_eq!(auto_device_format(Device::Cuda, 28, 1024), KvFormat::F16);
+        assert_eq!(auto_device_format(Device::Cuda, 24, 341), KvFormat::F32);
+        assert_eq!(auto_device_format(Device::Cpu, 80, 1024), KvFormat::F32);
+        assert_eq!(auto_device_format(Device::Metal, 28, 1024), KvFormat::F16);
     }
 
     #[test]

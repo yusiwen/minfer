@@ -20,12 +20,14 @@ struct CudaBuf {
 
 pub struct CudaBackend {
     state: &'static crate::cuda::CudaState,
-    /// 8b / C4 S2b: the KV cache **layout** as a `crate::cuda::KV_LAYOUT_*` code
-    /// (f32 / f16 / q8_0). Set at construction from the process-wide policy the
-    /// loader resolved (`crate::cuda::kv_cache_layout`); a `#[cfg(test)]` setter
-    /// flips it per instance so device tests can exercise every layout in one
-    /// process. The tag is what selects the store, the attention kernel and the
-    /// `copy_cells` stride, so a packed region can never be addressed as f32 rows.
+    /// 8b / C4 S2b / #153: the KV cache **layout** as a `crate::cuda::KV_LAYOUT_*` code
+    /// (f32 / f16 / q8_0). It is **per engine**: the loaded model's resolved
+    /// `KvFormat` reaches this backend through `GraphAllocator::set_kv_format` (the
+    /// same stamp the CPU kernels get), so two engines with different formats hold
+    /// different tags in one process. The tag is what selects the store, the
+    /// attention kernel, the `copy_cells` stride **and** the captured-graph
+    /// identity, so a packed region can never be addressed as f32 rows and a graph
+    /// captured for one layout never replays for another.
     kv_layout: i32,
     pool: Vec<CudaBuf>,
     free: Vec<usize>,
@@ -124,11 +126,18 @@ struct CrossPending {
 }
 
 /// An instantiated CUDA Graph exec with its capture identity.
+///
+/// #153 added `kv_layout`: the recorded kernels were instantiated for one layout
+/// (`store_kv_f16` vs `store_kv_q8_0`, the layout-tagged attention), so replaying the
+/// exec for a backend whose tag changed would run the wrong kernel over the regions.
+/// The lookup refuses a mismatched tag exactly like a changed `pool_gen` — destroy the
+/// exec and re-warm — so the identity is (uid, range, pool_gen, kv_layout).
 struct CapturedGraph {
     exec: *mut std::ffi::c_void,
     uid: u64,
     range: (usize, usize),
     pool_gen: u64,
+    kv_layout: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +157,22 @@ unsafe impl Sync for CudaBackend {}
 impl CudaBackend {
     /// `None` when CUDA is unavailable (no device, or disabled via
     /// `MINFER_DISABLE_CUDA` — both handled by `CudaState::try_new`).
-    /// (Called by GraphAllocator::enable_cuda; bin builds see it as dead until
-    /// the Phase 7c model wiring, tests use it meanwhile.)
+    ///
+    /// The layout defaults to **F32**; a real engine's backend is built by
+    /// `GraphAllocator::enable_cuda`, which passes the allocator's stamped format
+    /// (see [`Self::with_layout`]). This constructor is for the tests and probes
+    /// that address an f32 region or stamp a layout afterwards.
     #[allow(dead_code)]
     pub fn new() -> Option<Self> {
+        Self::with_layout(crate::cuda::KV_LAYOUT_F32)
+    }
+
+    /// #153: build a backend whose kernels address the KV regions in `layout`
+    /// (`crate::cuda::KV_LAYOUT_*`). `GraphAllocator::enable_cuda` derives it from
+    /// the engine's resolved `KvFormat` (`cuda::layout_of`), so the tag is per
+    /// engine and never a process global.
+    pub fn with_layout(kv_layout: i32) -> Option<Self> {
         let state = crate::cuda::CudaState::get()?;
-        let kv_layout = crate::cuda::kv_cache_layout();
         let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
             GraphMode::Disabled
         } else {
@@ -192,34 +211,66 @@ impl CudaBackend {
         self.graph_execs.len()
     }
 
+    /// The layouts of the held execs, oldest first (test introspection for #153's
+    /// captured-graph identity).
+    #[cfg(test)]
+    fn captured_layouts(&self) -> Vec<i32> {
+        self.graph_execs.iter().map(|g| g.kv_layout).collect()
+    }
+
+    /// #153: set the KV layout this backend's kernels address. The allocator calls it
+    /// on every forward with the engine's resolved format (idempotent in steady
+    /// state), so the tag follows the engine rather than a process global.
+    ///
+    /// A **change** invalidates every captured graph: each exec was instantiated for
+    /// the old tag (`store_kv_f16` vs `store_kv_q8_0`, the layout-tagged attention) and
+    /// reporting it up to date would replay the wrong kernel. The warmup counter is
+    /// dropped too, so the next runs re-warm and re-capture under the new tag — the
+    /// [`CapturedGraph::kv_layout`] check in `graph_replay_step` is the second line of
+    /// defence.
+    pub fn set_kv_layout(&mut self, layout: i32) {
+        if self.kv_layout == layout {
+            return;
+        }
+        self.kv_layout = layout;
+        self.graph_execs.clear();
+        self.graph_runs.clear();
+    }
+
+    /// The `KvFormat` this backend's regions store (the registry's `kv_format`
+    /// hook, C5's session header). The tag is set from the engine's resolved format,
+    /// so this is the engine's answer, not a process-wide one.
+    pub fn kv_format(&self) -> super::kvformat::KvFormat {
+        crate::cuda::format_of(self.kv_layout)
+    }
+
     #[cfg(test)]
     /// 8b: flip the per-instance KV element type (device tests exercise both
-    /// f32/f16 layouts in one process; production backends take the global policy
-    /// set by the loader at construction).
+    /// f32/f16 layouts in one process).
     pub(crate) fn set_kv_f16_for_test(&mut self, f16: bool) {
-        self.kv_layout = if f16 {
+        self.set_kv_layout(if f16 {
             crate::cuda::KV_LAYOUT_F16
         } else {
             crate::cuda::KV_LAYOUT_F32
-        };
+        });
     }
 
     #[cfg(test)]
     /// C4 S2b: the packed layout, per instance (same reason as
     /// [`Self::set_kv_f16_for_test`]).
     pub(crate) fn set_kv_q8_for_test(&mut self) {
-        self.kv_layout = crate::cuda::KV_LAYOUT_Q8_0;
+        self.set_kv_layout(crate::cuda::KV_LAYOUT_Q8_0);
     }
 
     #[cfg(test)]
     /// Any layout, per instance — the three-way gates (`cuda_map_window_*`) sweep
     /// f32/f16/q8_0 through one backend.
     pub(crate) fn set_kv_layout_for_test(&mut self, layout: i32) {
-        self.kv_layout = layout;
+        self.set_kv_layout(layout);
     }
 
     /// The KV layout tag this backend addresses its regions in.
-    fn kv_layout(&self) -> i32 {
+    pub(crate) fn kv_layout(&self) -> i32 {
         self.kv_layout
     }
 
@@ -290,8 +341,14 @@ impl CudaBackend {
             .iter()
             .position(|g| g.uid == uid && g.range == range)
         {
-            if self.graph_execs[pos].pool_gen != self.pool_gen {
-                // pool churned since capture — pointers may differ, re-capture
+            if self.graph_execs[pos].pool_gen != self.pool_gen
+                || self.graph_execs[pos].kv_layout != self.kv_layout
+            {
+                // pool churned since capture (pointers may differ), or the KV
+                // layout moved (the recorded kernels were instantiated for the old
+                // tag: `store_kv_f16` vs `store_kv_q8_0`, the layout-tagged
+                // attention) — replaying either would run the wrong kernel.
+                // Re-capture.
                 let g = self.graph_execs.remove(pos);
                 self.graph_runs.remove(&key);
                 self.state.graph_destroy(g.exec);
@@ -366,6 +423,7 @@ impl CudaBackend {
                     uid: key.0,
                     range: key.1,
                     pool_gen: self.pool_gen,
+                    kv_layout: self.kv_layout,
                 });
                 self.state.sync();
             } else {
@@ -1810,15 +1868,15 @@ pub fn entry() -> super::registry::BackendEntry {
         // for what each destination gets.
         copy_cross,
         await_cross,
-        // The device layer holds the process-wide layout policy (C5 records it as
-        // the session's KV element type, so a packed session is saved and resumed
-        // as Q8_0 — the container's FLAG_PACKED bit — and an f16 one is the
-        // separate gap [#130] tracks).
-        kv_format: |_| match crate::cuda::kv_cache_layout() {
-            crate::cuda::KV_LAYOUT_Q8_0 => super::kvformat::KvFormat::Q8_0,
-            crate::cuda::KV_LAYOUT_F16 => super::kvformat::KvFormat::F16,
-            _ => super::kvformat::KvFormat::F32,
-        },
+        // #153: the answer is the **engine's** stamped format, not a process global
+        // (C5 records it as the session's KV element type, so a packed session is
+        // saved and resumed as Q8_0 — the container's FLAG_PACKED bit — and an f16
+        // one is the separate gap [#130] tracks). Reading the allocator's stamp
+        // rather than `cuda().kv_format()` matters because `kv_load` / `load_slots`
+        // run **before** the first forward, when this backend has not been enabled:
+        // `enable_cuda` builds its tag from this same stamp (`cuda::layout_of`), so
+        // the two cannot disagree, and the pre-forward answer is the engine's.
+        kv_format: |a| a.kv_format(),
         enable: |a| a.enable_cuda(),
         unavailable: || {
             if crate::cuda::CudaState::get().is_some() {
@@ -4261,9 +4319,9 @@ mod tests {
         // (window length, non-zero start): the lengths sweep the kernel variants
         // the 7B selects; the starts are the server's kind of offset.
         let mut bad: Vec<String> = Vec::new();
-        // Both KV dtypes: the production default is chosen by
-        // `cuda::set_kv_cache_type` (f16 when `n_layers * n_kv_embd >= 8192`) — so
-        // the 7B runs f16 KV while the 0.5B runs f32, and a gate that forces f32
+        // Both KV dtypes: the production default is the engine's resolved format
+        // (`kvformat::auto_device_format`: f16 when `n_layers * n_kv_embd >= 8192`) —
+        // so the 7B runs f16 KV while the 0.5B runs f32, and a gate that forces f32
         // cannot see a windowed-f16 fault at all.
         for f16 in [false, true] {
             for (shape, n, start) in [
@@ -9072,10 +9130,99 @@ mod tests {
         assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
     }
 
-    /// Real-model generation: two full generations (independent caches) must
-    /// produce identical greedy tokens — the first loop mixes direct/capture/
-    /// replay executions, the second replays everything, and a third loop
-    /// with graphs force-disabled is the direct-launch reference.
+    /// #153: a captured exec was instantiated for one KV layout, so a backend whose
+    /// tag moves must not replay it. `set_kv_layout` drops the execs eagerly, and the
+    /// `graph_replay_step` lookup refuses a mismatched tag as a second line of
+    /// defence; either way the run re-warms and re-captures under the new tag.
+    ///
+    /// The graph here is weightless (no KV store/attention), so the *kernels* do not
+    /// change with the tag — what this test pins is the **identity**: which execs are
+    /// held and under which tag. The real-model gate
+    /// (`two_cuda_engines_with_different_kv_layouts_run_interleaved`) is where the tag
+    /// changing the kernels' bytes is asserted.
+    #[test]
+    fn cuda_graph_recaptures_on_kv_layout_change() {
+        // 8m: serialize against other tests' stream users — capture on the shared
+        // stream is not thread-safe (race exposed by the prefill GEMM timing shift).
+        let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let sched = BackendScheduler::new();
+        let mut g = replay_graph();
+        let mut cap = replay_alloc(true);
+        let mut refr = replay_alloc(false);
+        sched.assign_backends(&mut g, &cap);
+        cap.alloc_graph(&g).unwrap();
+        refr.alloc_graph(&g).unwrap();
+
+        // `replay_alloc` builds an f32 backend; warm up and capture under that tag.
+        for step in 0..3u32 {
+            let seed = 1.0 + step as f32;
+            let got = replay_step(&sched, &g, &mut cap, seed);
+            let want = replay_step(&sched, &g, &mut refr, seed);
+            assert_eq!(got, want, "warmup step {step}");
+        }
+        assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_layouts(),
+            vec![crate::cuda::KV_LAYOUT_F32],
+            "the exec must be recorded under the tag it was captured for"
+        );
+
+        // `set_kv_layout` (what `GraphAllocator::set_kv_format` calls) invalidates a
+        // changed tag eagerly — the exec's kernels were recorded for the old one.
+        cap.cuda_mut()
+            .unwrap()
+            .set_kv_layout(crate::cuda::KV_LAYOUT_Q8_0);
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_count(),
+            0,
+            "a layout change must drop every captured exec"
+        );
+        assert!(
+            cap.cuda_mut().unwrap().graph_runs.is_empty(),
+            "and restart the warmup protocol"
+        );
+
+        // Run 4 is direct (warmup 1); run 5 direct (warmup 2); run 6 re-captures
+        // under the new tag. Parity with the direct-launch reference holds throughout.
+        for step in 4..7u32 {
+            let seed = step as f32;
+            let got = replay_step(&sched, &g, &mut cap, seed);
+            let want = replay_step(&sched, &g, &mut refr, seed);
+            assert_eq!(got, want, "post-layout-change step {step}");
+        }
+        assert_eq!(cap.cuda_mut().unwrap().captured_count(), 1);
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_layouts(),
+            vec![crate::cuda::KV_LAYOUT_Q8_0],
+            "the re-captured exec must carry the new tag"
+        );
+
+        // Second line of defence: bypass the eager clear (poke the field) and prove the
+        // lookup itself refuses an exec whose recorded tag no longer matches. The next
+        // scheduler step calls `graph_replay_step`, which must destroy the mismatched
+        // exec and run direct instead of launching it.
+        cap.cuda_mut().unwrap().kv_layout = crate::cuda::KV_LAYOUT_F16;
+        let got = replay_step(&sched, &g, &mut cap, 98.0);
+        let want = replay_step(&sched, &g, &mut refr, 98.0);
+        assert_eq!(
+            got, want,
+            "mismatched-tag step must still produce the right values"
+        );
+        assert_eq!(
+            cap.cuda_mut().unwrap().captured_count(),
+            0,
+            "an exec captured for q8_0 must be destroyed, not launched, for an f16 backend"
+        );
+
+        // And the direct-launch reference still agrees after all of it.
+        let got = replay_step(&sched, &g, &mut cap, 99.0);
+        let want = replay_step(&sched, &g, &mut refr, 99.0);
+        assert_eq!(got, want, "bottom of the layout-change sequence");
+    }
     #[test]
     fn cuda_graph_generation_replay_parity_real_model() {
         use crate::models::qwen2::graph::Qwen2Graph;
