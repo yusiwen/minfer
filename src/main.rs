@@ -7,6 +7,9 @@ mod conversation;
 mod convert;
 #[cfg(feature = "cuda")]
 mod cuda;
+// #185: the checked "one thread at a time in the CUDA device path" contract.
+// Pure and feature-independent on purpose, so the CPU CI job runs its tests.
+mod device_entry;
 // Consumers live in the CUDA backend; the offline unit tests still run
 // without the feature, so silence dead-code only in CPU-only builds.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]

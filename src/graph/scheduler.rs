@@ -160,6 +160,21 @@ impl BackendScheduler {
         #[cfg(debug_assertions)]
         debug_assert!(graph.topo_order().is_ok(), "graph is not a valid DAG");
         let splits = self.split_graph(graph);
+        // #185: the CUDA device layer is a process-wide singleton, and this call
+        // owns the (global-mode) capture window for its duration. A second thread
+        // entering it concurrently is undefined behaviour — the parallel device
+        // suite segfaulted inside libcuda. Refuse loudly here, before any driver
+        // call; the supported configuration is one thread at a time
+        // (`scripts/cuda_test.sh`). The test is **this graph's splits**, not the
+        // allocator's state: a CPU-only graph that happens to run on a
+        // CUDA-enabled allocator touches no driver state and must not be refused
+        // (and the parallel CPU harness never has a `CUDA` split).
+        #[cfg(feature = "cuda")]
+        let _device_entry = if splits.iter().any(|s| s.backend == BackendTag::CUDA) {
+            Some(crate::device_entry::enter("a device graph execution")?)
+        } else {
+            None
+        };
         if std::env::var("MINFER_GRAPH_TRACE").is_ok() {
             for (si, s) in splits.iter().enumerate() {
                 eprintln!(
