@@ -90,13 +90,19 @@ Notes:
   `n_layers × n_kv_embd ≥ 8192`, i.e. the 7B class, f32 for small models); the
   table's "default" row is the *region shape*, which f16 does not change.
 - **Q8_0 is the packed one**: 3.76× smaller than f32 and 1.88× smaller than the
-  f16 auto policy. On CUDA a Q8_0 decode runs the layout-tagged split-K kernel,
-  and the verify band (`1 < nt ≤ 16`) and prefill route to the general
-  layout-tagged kernel — the f16-typed FA prefill and the hybrid 4-warp dispatch
-  are not offered for a packed cell, so those two paths are correct but off their
-  tuned route. A **speculative** session refuses a packed cache outright (its
-  greedy identity contract rests on the batched split kernel). See
-  `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 S2b.
+  f16 auto policy. On CUDA a Q8_0 decode runs the layout-tagged split-K kernel
+  together with the **packed fused QKV epilogue** (`attn_bias_rope_store_q8_0`,
+  #144), and a prefill at head dim 128 runs the **packed FA prefill** — its
+  f16-tile staging dequantizes each packed block, so the tensor-core route is
+  offered for a packed cell too (#144: Qwen3-0.6B `pp2048` 564.5 → 8231.1 tok/s).
+  Still off their tuned route, and stated: the verify band (`1 < nt ≤ 16`) takes
+  the general layout-tagged kernel, the hybrid 4-warp decode dispatch is
+  f16-typed, and a **`dp4a` packed K dot** is a follow-up (it is a numerics
+  change needing its own accuracy statement). The general layout-tagged kernel
+  remains the fallback for every packed path. A **speculative** session refuses a
+  packed cache outright (its greedy identity contract rests on the batched split
+  kernel). See `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 #144 and
+  `docs/cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md`.
 - **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
   % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
   anything else.
