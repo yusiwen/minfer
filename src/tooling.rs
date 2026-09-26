@@ -1049,7 +1049,7 @@ mod tests {
                 );
             let mut alloc = crate::graph::alloc::GraphAllocator::new();
             assert!(alloc.enable_cuda(), "the CUDA allocator did not come up");
-            crate::graph::scheduler::BackendScheduler.assign_backends(&mut graph, &alloc);
+            crate::graph::scheduler::BackendScheduler::new().assign_backends(&mut graph, &alloc);
             let mut f16_matmul = 0usize;
             let mut f16_embed = 0usize;
             for nd in &graph.nodes {
@@ -1273,7 +1273,7 @@ mod tests {
                 );
             let mut alloc = crate::graph::alloc::GraphAllocator::new();
             assert!(alloc.enable_cuda(), "the CUDA allocator did not come up");
-            crate::graph::scheduler::BackendScheduler.assign_backends(&mut graph, &alloc);
+            crate::graph::scheduler::BackendScheduler::new().assign_backends(&mut graph, &alloc);
             let mut f16_matmul = 0usize;
             let mut f16_embed = 0usize;
             for nd in &graph.nodes {

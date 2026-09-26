@@ -42,7 +42,11 @@ impl Split {
     }
 }
 
-pub struct BackendScheduler;
+pub struct BackendScheduler {
+    /// Where this scheduler's per-op timings go, if anywhere. A value it holds
+    /// rather than a process-wide flag another thread can flip under it (#173).
+    timing: crate::optiming::TimingMode,
+}
 
 impl Default for BackendScheduler {
     fn default() -> Self {
@@ -51,8 +55,20 @@ impl Default for BackendScheduler {
 }
 
 impl BackendScheduler {
+    /// The production scheduler: follow `MINFER_OP_TIMING` and record into the
+    /// process-global sink when it is on.
     pub fn new() -> Self {
-        Self
+        Self {
+            timing: crate::optiming::TimingMode::Global,
+        }
+    }
+
+    /// A scheduler that times wherever `mode` says. The #173 isolation seam: a
+    /// test hands in its own sink so its verdict reads only the rows its own
+    /// scheduler wrote, and a concurrent graph execution cannot move them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_timing(mode: crate::optiming::TimingMode) -> Self {
+        Self { timing: mode }
     }
 
     /// Assign every node to the best backend that supports it (capability
@@ -176,9 +192,12 @@ impl BackendScheduler {
         let trace_on = crate::trace::enabled();
         let live_on = crate::live::enabled();
         let capture = trace_on || live_on;
-        // F8: resolved once per execute() (a cached relaxed load), so the
-        // per-node check is a branch and the clock is only read when it is on.
-        let op_timing = crate::optiming::enabled();
+        // F8: the timing destination is resolved once per execute() — the
+        // process flag (Global) is a cached relaxed load — so the per-node check
+        // is a branch and the clock is only read when the sink is `Some`. #173:
+        // the sink is per-scheduler, so a caller-owned sink reads only its own
+        // rows.
+        let timing = self.timing.resolve();
         if trace_on {
             crate::trace::begin_step();
         }
@@ -308,16 +327,12 @@ impl BackendScheduler {
                 // NOTE: execution follows node id order (build order), which is
                 // the graph's topological order by construction.
                 //
-                // F8: per-op timing wraps exactly this dispatch when
-                // `MINFER_OP_TIMING` is set. `t0` is `None` on the default path,
-                // so the flag off means the clock is never read. See
-                // `crate::optiming` for what the interval does and does not
-                // attribute.
-                let t0 = if op_timing {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
+                // F8: per-op timing wraps exactly this dispatch. `t0` is `None`
+                // when this scheduler has no timing sink (the default path with
+                // `MINFER_OP_TIMING` unset), so timing off means the clock is
+                // never read. See `crate::optiming` for what the interval does
+                // and does not attribute.
+                let t0 = timing.map(|_| std::time::Instant::now());
                 // F4: one dispatch for every backend — the registry entry's pool
                 // hook, then the trait's `execute_node` on it. The per-backend
                 // `#[cfg]` arms (and their "unavailable" strings) are gone; a
@@ -337,8 +352,8 @@ impl BackendScheduler {
                 crate::testfail::note_checked("execute_node");
                 crate::testfail::guard("execute_node")?;
                 pool.execute_node(node, &in_bufs, br, kv_pair)?;
-                if let Some(t0) = t0 {
-                    crate::optiming::record(crate::optiming::op_index(&node.op), t0.elapsed());
+                if let (Some(t0), Some(sink)) = (t0, timing) {
+                    sink.record(crate::optiming::op_index(&node.op), t0.elapsed());
                 }
                 // CAPTURE AFTER EXECUTION — this step's output
                 if capture {
@@ -543,6 +558,31 @@ mod tests {
         b.build()
     }
 
+    /// Run `small_graph` once through a scheduler whose timing goes to `sink`
+    /// (`enabled` is its flag), returning the output row. #173's isolation is
+    /// that every caller owns `sink`, so the assertions read only their own rows.
+    fn run_small_graph(
+        sink: std::sync::Arc<crate::optiming::TimingSink>,
+        enabled: bool,
+    ) -> Vec<f32> {
+        let g = small_graph();
+        let sched =
+            BackendScheduler::with_timing(crate::optiming::TimingMode::Private { sink, enabled });
+        let mut alloc = GraphAllocator::new();
+        alloc.alloc_graph(&g).unwrap();
+        alloc.fill_input(&g, "x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        sched.execute(&g, &mut alloc).unwrap();
+        alloc.get_buffer(&g, 2).unwrap().to_vec()
+    }
+
+    /// The `calls` value for `name` in `sink`, or 0 when the op never ran.
+    fn calls_in(sink: &crate::optiming::TimingSink, name: &str) -> u64 {
+        sink.snapshot()
+            .into_iter()
+            .find(|e| e.name == name)
+            .map_or(0, |e| e.calls)
+    }
+
     #[test]
     fn assign_all_cpu_and_single_split() {
         let mut g = small_graph();
@@ -648,63 +688,111 @@ mod tests {
 
     /// F8 (#51): `MINFER_OP_TIMING` reports numbers, it never computes them.
     ///
-    /// The gate runs the *same* graph twice through the *same* scheduler, once
-    /// with the flag off and once on, and asserts the output buffer is
-    /// bit-identical — the flagged path may only differ in the table it fills.
-    /// The second half asserts the table actually moved, so the equality above is
-    /// not the equality of "timing is broken and never ran".
-    ///
-    /// Both halves take `optiming::GATE` because `force` is process-global: a
-    /// parallel graph test executing while the flag is forced on would otherwise
-    /// pollute the delta.
+    /// The gate runs the *same* graph through two schedulers with **private**
+    /// sinks: the first with timing off, the second on. The output buffer must be
+    /// bit-identical — the timed path may only differ in the sink it fills — and
+    /// the assertions read **values** from the sink the run under test wrote:
+    /// exactly one `silu` and one `add` (`small_graph` is input → silu → add, and
+    /// an input is never dispatched), nothing after the timing-off run. That is
+    /// gate-contract rule 1: the old relation between two snapshots of shared
+    /// state was exactly what a concurrent execution could move (#173).
     #[test]
     fn op_timing_does_not_change_the_result_but_does_accumulate() {
-        let _g = crate::optiming::gate();
-        let g = small_graph();
-        let sched = BackendScheduler::new();
-        let input = [1.0f32, 2.0, 3.0, 4.0];
+        let off_sink = std::sync::Arc::new(crate::optiming::TimingSink::new());
+        let on_sink = std::sync::Arc::new(crate::optiming::TimingSink::new());
 
-        let run = |timing: bool| -> Vec<f32> {
-            crate::optiming::force(timing);
-            let mut alloc = GraphAllocator::new();
-            alloc.alloc_graph(&g).unwrap();
-            alloc.fill_input(&g, "x", &input).unwrap();
-            sched.execute(&g, &mut alloc).unwrap();
-            alloc.get_buffer(&g, 2).unwrap().to_vec()
-        };
+        // Off first, and assert the *value*: a scheduler whose timing is off
+        // records nothing into the sink it owns.
+        let off = run_small_graph(off_sink.clone(), false);
+        assert!(
+            off_sink.snapshot().is_empty(),
+            "a run with timing off records nothing: {:?}",
+            off_sink.snapshot()
+        );
 
-        // Off first, so the on-run is the only thing that can fill the table.
-        let off = run(false);
-        let before = crate::optiming::snapshot();
-        let calls_before = before
-            .iter()
-            .find(|e| e.name == "silu")
-            .map_or(0, |e| e.calls);
-        let on = run(true);
-        crate::optiming::force(false);
-        let after = crate::optiming::snapshot();
-        let calls_after = after
-            .iter()
-            .find(|e| e.name == "silu")
-            .map_or(0, |e| e.calls);
-
+        let on = run_small_graph(on_sink.clone(), true);
         assert_eq!(
             off, on,
-            "the timing flag must not perturb the computation, only the report"
+            "the timing sink must not perturb the computation, only the report"
         );
-        assert!(
-            calls_after > calls_before,
-            "the flagged run must have recorded silu executions ({calls_before} -> {calls_after})"
+        // One silu and one add per execute(), read from this run's own sink.
+        assert_eq!(
+            calls_in(&on_sink, "silu"),
+            1,
+            "one silu per execute: {:?}",
+            on_sink.snapshot()
         );
-        // And with the flag off again, the scheduler reads the clock zero times:
-        // the table is unchanged by a run.
-        let quiet = run(false);
-        assert_eq!(quiet, off);
-        let now = crate::optiming::snapshot()
-            .iter()
-            .find(|e| e.name == "silu")
-            .map_or(0, |e| e.calls);
-        assert_eq!(now, calls_after, "a run with the flag off records nothing");
+        assert_eq!(
+            calls_in(&on_sink, "add"),
+            1,
+            "one add per execute: {:?}",
+            on_sink.snapshot()
+        );
+    }
+
+    /// #173 control arm: **a concurrent graph execution cannot move a private
+    /// sink's verdict.**
+    ///
+    /// Several load threads run the *real* `execute` at once and record into the
+    /// **process-global** sink — the shared destination the original fault
+    /// polluted. While they run, this thread asserts exact values from a private
+    /// sink. Had the gate read the shared table, the load's `silu` records would
+    /// already make `== 1` false; a per-scheduler sink cannot see them. The load
+    /// is bounded by work (`LOAD_THREADS * LOAD_ITERS` executes), every thread is
+    /// joined by `scope`, and there are no sleeps or clocks — gate rule 4.
+    ///
+    /// The shared sink is reset first and its exact total asserted, so the test
+    /// also proves the control load really recorded (and that the free `record` /
+    /// `reset` / `snapshot` still address the one shared table `/metrics` reads).
+    #[test]
+    fn a_concurrent_graph_load_cannot_move_a_private_sink() {
+        const LOAD_THREADS: usize = 4;
+        const LOAD_ITERS: usize = 64;
+        const CHECK_ROUNDS: usize = 8;
+
+        crate::optiming::reset();
+        // One extra record through the free function: the baseline the load adds
+        // to, and the proof the free entry point writes the same shared table.
+        crate::optiming::record(
+            crate::optiming::op_index(&Op::Silu),
+            std::time::Duration::from_nanos(1),
+        );
+        let global = crate::optiming::global_sink();
+
+        std::thread::scope(|scope| {
+            for _ in 0..LOAD_THREADS {
+                scope.spawn(|| {
+                    for _ in 0..LOAD_ITERS {
+                        // Each thread owns its graph and records into the shared
+                        // global sink — the load, not a private one.
+                        let _ = run_small_graph(global.clone(), true);
+                    }
+                });
+            }
+
+            // While the load runs, the gate's own sink holds exact values.
+            for round in 0..CHECK_ROUNDS {
+                let sink = std::sync::Arc::new(crate::optiming::TimingSink::new());
+                let _ = run_small_graph(sink.clone(), true);
+                let snap = sink.snapshot();
+                assert_eq!(
+                    calls_in(&sink, "silu"),
+                    1,
+                    "round {round}: the concurrent load moved a private sink: {snap:?}"
+                );
+                assert_eq!(snap.len(), 2, "round {round}: exactly silu + add: {snap:?}");
+            }
+        });
+
+        // The control load really hammered the shared destination: had the gate
+        // read it, its `== 1` would already be false.
+        let shared = crate::optiming::snapshot();
+        assert_eq!(
+            calls_in(&crate::optiming::global_sink(), "silu"),
+            1 + (LOAD_THREADS * LOAD_ITERS) as u64,
+            "the control load must have recorded into the shared sink: {shared:?}"
+        );
+        crate::optiming::reset(); // leave the shared sink as we found it
     }
 
     /// F5 ([#58]) gate: **a staged cross-backend input cannot be consumed before

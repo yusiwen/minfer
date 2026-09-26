@@ -2,10 +2,12 @@
 //!
 //! **Off by default, and provably so.** With the variable unset,
 //! [`enabled`] is one relaxed load of a cached flag and the scheduler does not
-//! read the clock at all — the default path is the pre-F8 path. The gate is
-//! `op_timing_off_by_default_leaves_the_table_empty`, and
-//! `op_timing_does_not_change_the_result` pins that turning it on changes the
-//! numbers reported, never the numbers computed.
+//! read the clock at all — the default path is the pre-F8 path. The flag's rule
+//! is pinned by `op_timing_flag_is_presence_checked_and_off_when_unset`, the
+//! on/off decision it feeds by `off_mode_never_records` /
+//! `global_mode_follows_the_flag`, and the scheduler's use of it by
+//! `op_timing_does_not_change_the_result_but_does_accumulate`, which also pins
+//! that turning it on changes the numbers reported, never the numbers computed.
 //!
 //! **Where the time is measured, and what it is not.** The timer wraps the
 //! scheduler's per-node dispatch
@@ -22,12 +24,26 @@
 //! kernel time from its prologue, and lets the three backends' definition of "an
 //! op" drift.
 //!
+//! **A sink is a destination, not a process global (issue [#173]).** The
+//! accumulators live in a [`TimingSink`]; the engine records into the
+//! process-global one ([`snapshot`] reads it, so `/metrics` is unchanged), but a
+//! caller can own a sink and hand it to its own scheduler through
+//! [`TimingMode::Private`]. That is what a gate needs: with one shared table, a
+//! graph executed by *any other test thread* while the timing flag was forced on
+//! moved the gate's numbers, so its verdict depended on the schedule. Now the
+//! gate reads only the rows its own scheduler wrote, and a concurrent execution
+//! cannot reach them — pinned by
+//! [`a_concurrent_graph_load_cannot_move_a_private_sink`](crate::graph::scheduler::tests).
+//!
 //! **Storage is a fixed table, not a map.** `op_index` is an exhaustive `match`
 //! over [`Op`], so a new variant is a compile error instead of a metric that
 //! silently disappears. Accumulation is two relaxed `fetch_add`s on atomics —
 //! no lock and no allocation per step, even with the flag on.
+//!
+//! [#173]: https://github.com/yusiwen/minfer/issues/173
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::graph::ops::Op;
@@ -61,9 +77,6 @@ pub const OP_NAMES: [&str; 23] = [
 ];
 
 const OP_COUNT: usize = OP_NAMES.len();
-
-static OP_NANOS: [AtomicU64; OP_COUNT] = [const { AtomicU64::new(0) }; OP_COUNT];
-static OP_CALLS: [AtomicU64; OP_COUNT] = [const { AtomicU64::new(0) }; OP_COUNT];
 
 /// One op's accumulated time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +120,93 @@ pub fn op_index(op: &Op) -> usize {
     }
 }
 
+/// The per-op accumulators, one instance per destination.
+///
+/// A fixed table (see the module doc), and an *instance* rather than a static:
+/// the engine shares the process-global sink, while a caller — a test, a second
+/// engine — can own one and read only its own rows. `const fn new()` so the
+/// global needs no lazy per-call initialisation.
+pub struct TimingSink {
+    nanos: [AtomicU64; OP_COUNT],
+    calls: [AtomicU64; OP_COUNT],
+}
+
+impl Default for TimingSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TimingSink {
+    /// An empty sink. `const`, so a `static` needs no lazy initialisation.
+    pub const fn new() -> Self {
+        Self {
+            nanos: [const { AtomicU64::new(0) }; OP_COUNT],
+            calls: [const { AtomicU64::new(0) }; OP_COUNT],
+        }
+    }
+
+    /// Accumulate one execution of `index`. Called only when timing is on — the
+    /// scheduler resolves the sink up front and skips the clock otherwise.
+    ///
+    /// A CAS loop rather than `fetch_add`, so an absurd duration saturates
+    /// instead of wrapping to a small number that reads as "instant".
+    /// Contention is nil: one worker thread does the timing.
+    pub fn record(&self, index: usize, elapsed: Duration) {
+        let nanos = nanos_of(elapsed);
+        let _ = self.calls[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(1))
+        });
+        let _ = self.nanos[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(nanos))
+        });
+    }
+
+    /// Every op with at least one recorded call, in table order (deterministic).
+    /// Ops that never ran are omitted, so a family with no samples stays absent
+    /// from a scrape instead of reporting a misleading zero.
+    pub fn snapshot(&self) -> Vec<OpTimingEntry> {
+        OP_NAMES
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let calls = self.calls[i].load(Ordering::Relaxed);
+                (calls > 0).then(|| OpTimingEntry {
+                    name,
+                    calls,
+                    nanos: self.nanos[i].load(Ordering::Relaxed),
+                })
+            })
+            .collect()
+    }
+
+    /// Zero the sink. Test-only: timing is an accumulator and nothing in a
+    /// running server has a reason to reset it.
+    #[cfg(test)]
+    pub fn reset(&self) {
+        for i in 0..OP_COUNT {
+            self.nanos[i].store(0, Ordering::Relaxed);
+            self.calls[i].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The process-global sink: the destination `/metrics` reads. Behind an
+/// `OnceLock<Arc<_>>` so it can be shared with a caller that wants the *shared*
+/// destination explicitly (the #173 control arm) without exposing a bare static.
+fn global() -> &'static Arc<TimingSink> {
+    static GLOBAL_SINK: OnceLock<Arc<TimingSink>> = OnceLock::new();
+    GLOBAL_SINK.get_or_init(|| Arc::new(TimingSink::new()))
+}
+
+/// The process-global sink, so a caller can hand the shared destination to a
+/// scheduler explicitly. The #173 control arm records into it from several
+/// threads at once — the load a private-sink gate must be immune to.
+#[cfg(test)]
+pub fn global_sink() -> Arc<TimingSink> {
+    global().clone()
+}
+
 const UNKNOWN: u8 = 0;
 const ON: u8 = 1;
 const OFF: u8 = 2;
@@ -140,80 +240,81 @@ pub fn flag_from_env(value: Option<&std::ffi::OsString>) -> bool {
     value.is_some()
 }
 
+/// Where a scheduler's per-op timings go, and whether it times at all.
+///
+/// Chosen when the scheduler is constructed, so the decision is a value its
+/// owner holds rather than a process-wide flag another thread can flip under it.
+/// The default is [`TimingMode::Global`], the pre-#173 production behaviour.
+/// `Off`/`Private` are constructed by tests and by a caller that wants its own
+/// destination, so a non-test build sees only `Global`.
+#[derive(Clone, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum TimingMode {
+    /// Production: follow `MINFER_OP_TIMING` (once per `execute`) and record
+    /// into the process-global sink when it is on.
+    #[default]
+    Global,
+    /// Never read the clock and never record.
+    Off,
+    /// Record into a caller-owned sink, gated by a caller-owned flag. This is
+    /// the isolation seam: a test owns both the destination and the on/off
+    /// decision, so its assertions read only the rows its own scheduler wrote.
+    Private {
+        sink: Arc<TimingSink>,
+        enabled: bool,
+    },
+}
+
+impl TimingMode {
+    /// The sink to record into, given an already-resolved global flag and the
+    /// global sink. Pure, so the on/off rule is testable without touching a
+    /// table or the environment.
+    pub(crate) fn resolve_for<'a>(
+        &'a self,
+        global_flag: bool,
+        global: &'a TimingSink,
+    ) -> Option<&'a TimingSink> {
+        match self {
+            TimingMode::Global => global_flag.then_some(global),
+            TimingMode::Off => None,
+            TimingMode::Private { sink, enabled } => enabled.then(|| sink.as_ref()),
+        }
+    }
+
+    /// The sink for the next `execute`, or `None` to leave the clock unread.
+    /// The process flag is resolved here, once per call — the F8 property.
+    pub(crate) fn resolve(&self) -> Option<&TimingSink> {
+        self.resolve_for(enabled(), global().as_ref())
+    }
+}
+
 /// Nanoseconds of a duration, saturating at `u64::MAX`.
 ///
 /// A `Duration` can name more nanoseconds than fit in a `u64` (`u64::MAX` ns is
 /// ~584 years), and a wrap would report a huge op as instant. Pure, so the
-/// boundary is tested without touching the global table.
+/// boundary is tested without touching any table.
 fn nanos_of(elapsed: Duration) -> u64 {
     elapsed.as_nanos().min(u64::MAX as u128) as u64
 }
 
-/// Accumulate one execution of `index`. Called only when [`enabled`] — the
-/// scheduler keeps the check out of the hot path's way.
-///
-/// A CAS loop rather than `fetch_add`, so an absurd duration saturates instead
-/// of wrapping to a small number that reads as "instant". Contention is nil:
-/// one worker thread does the timing.
+/// Accumulate one execution of `index` into the process-global sink. The
+/// scheduler goes through a resolved [`TimingSink`] so a private sink is
+/// possible; this free function is the module's unchanged entry point for
+/// anything that just wants the shared table.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn record(index: usize, elapsed: Duration) {
-    let nanos = nanos_of(elapsed);
-    let _ = OP_NANOS[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        Some(cur.saturating_add(nanos))
-    });
-    let _ = OP_CALLS[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        Some(cur.saturating_add(1))
-    });
+    global().record(index, elapsed);
 }
 
-/// Every op with at least one recorded call, in table order (deterministic).
-/// Ops that never ran are omitted, so a family with no samples stays absent from
-/// a scrape instead of reporting a misleading zero.
+/// Every op with at least one recorded call in the process-global sink.
 pub fn snapshot() -> Vec<OpTimingEntry> {
-    OP_NAMES
-        .iter()
-        .enumerate()
-        .filter_map(|(i, name)| {
-            let calls = OP_CALLS[i].load(Ordering::Relaxed);
-            (calls > 0).then(|| OpTimingEntry {
-                name,
-                calls,
-                nanos: OP_NANOS[i].load(Ordering::Relaxed),
-            })
-        })
-        .collect()
+    global().snapshot()
 }
 
-/// Zero the table. Test-only: timing is a process-lifetime accumulator, and
-/// nothing in a running server has a reason to reset it.
+/// Zero the process-global sink. Test-only.
 #[cfg(test)]
 pub fn reset() {
-    for i in 0..OP_COUNT {
-        OP_NANOS[i].store(0, Ordering::Relaxed);
-        OP_CALLS[i].store(0, Ordering::Relaxed);
-    }
-}
-
-/// Force the gate for a test that needs to exercise the on/off paths without
-/// mutating the process environment (which other tests share).
-#[cfg(test)]
-pub fn force(on: bool) {
-    ENABLED.store(if on { ON } else { OFF }, Ordering::Relaxed);
-}
-
-/// Serializes every test that touches the process-global gate or table.
-/// `crate::graph::scheduler`'s timing gate takes it too — a graph test running
-/// concurrently while `force(true)` is set would otherwise record into the table
-/// another test is asserting on.
-#[cfg(test)]
-pub(crate) static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The shared gate's guard, **poison-tolerant**: a failing assertion inside one
-/// of these tests must not turn every later one into a confusing `PoisonError`
-/// panic. The mutation check relies on this — breaking `op_index` should fail
-/// `op_names_agree_with_op_index` and say why, not five tests at once.
-#[cfg(test)]
-pub(crate) fn gate() -> std::sync::MutexGuard<'static, ()> {
-    GATE.lock().unwrap_or_else(|e| e.into_inner())
+    global().reset();
 }
 
 #[cfg(test)]
@@ -262,15 +363,10 @@ mod tests {
         ]
     }
 
-    /// The counters for `op`, as `(calls, nanos)` — read without `reset`, so a
-    /// test asserts a **delta** and stays correct even if another locked test
-    /// ran first.
-    fn counters(op: &Op) -> (u64, u64) {
-        let i = op_index(op);
-        (
-            OP_CALLS[i].load(Ordering::Relaxed),
-            OP_NANOS[i].load(Ordering::Relaxed),
-        )
+    /// A fresh sink per test, so nothing here shares a destination with any
+    /// other test — the fault #173 fixes.
+    fn sink() -> TimingSink {
+        TimingSink::new()
     }
 
     /// The exhaustive `match` is only useful if it agrees with the name table: a
@@ -311,45 +407,77 @@ mod tests {
         );
     }
 
+    /// The mode-to-sink rule, asserted **as a value**: `Off` never records;
+    /// `Global` follows the flag and lands in the global sink; `Private` follows
+    /// its own flag and lands in its own sink. Pure, so "off by default leaves
+    /// the table empty" is pinned without touching a table another test could
+    /// write.
+    #[test]
+    fn off_mode_never_records() {
+        let global = sink();
+        assert!(TimingMode::Off.resolve_for(true, &global).is_none());
+        assert!(TimingMode::Off.resolve_for(false, &global).is_none());
+    }
+
+    #[test]
+    fn global_mode_follows_the_flag() {
+        let global = sink();
+        assert!(TimingMode::Global.resolve_for(false, &global).is_none());
+        assert!(std::ptr::eq(
+            TimingMode::Global.resolve_for(true, &global).unwrap(),
+            &global
+        ));
+    }
+
+    #[test]
+    fn private_mode_uses_its_own_sink_and_flag() {
+        let global = sink();
+        let mine = Arc::new(sink());
+        let off = TimingMode::Private {
+            sink: mine.clone(),
+            enabled: false,
+        };
+        let on = TimingMode::Private {
+            sink: mine.clone(),
+            enabled: true,
+        };
+        assert!(off.resolve_for(true, &global).is_none());
+        assert!(std::ptr::eq(
+            on.resolve_for(false, &global).unwrap(),
+            mine.as_ref()
+        ));
+    }
+
+    /// Exact values from a sink only this test wrote: no reset, no delta, and no
+    /// other thread can move them (issue #173).
     #[test]
     fn record_accumulates_per_op_without_cross_talk() {
-        let _g = gate();
-        force(false); // no other test can be recording while we measure
+        let s = sink();
         let matmul = Op::MatMul { transpose_b: false };
         let attn = Op::Attn {
             mode: crate::graph::ops::AttnMode::Gqa,
             explicit_span: false,
         };
-        let (m0c, m0n) = counters(&matmul);
-        let (a0c, a0n) = counters(&attn);
-        record(op_index(&matmul), Duration::from_nanos(100));
-        record(op_index(&matmul), Duration::from_nanos(250));
-        record(op_index(&attn), Duration::from_nanos(7));
-        let (m1c, m1n) = counters(&matmul);
-        let (a1c, a1n) = counters(&attn);
-        assert_eq!(m1c - m0c, 2);
-        assert_eq!(m1n - m0n, 350);
-        assert_eq!(a1c - a0c, 1);
-        assert_eq!(a1n - a0n, 7);
+        s.record(op_index(&matmul), Duration::from_nanos(100));
+        s.record(op_index(&matmul), Duration::from_nanos(250));
+        s.record(op_index(&attn), Duration::from_nanos(7));
 
-        // `snapshot` reports exactly the ops that ran, in table order.
-        let snap = snapshot();
-        let names: Vec<&str> = snap.iter().map(|e| e.name).collect();
-        let mi = names.iter().position(|n| *n == "matmul").expect("matmul");
-        let ai = names.iter().position(|n| *n == "attn").expect("attn");
-        assert!(mi < ai, "table order: matmul before attn");
-    }
-
-    /// Delta-based, so a leftover count from an earlier test cannot break it.
-    #[test]
-    fn the_gate_switches_the_scheduler_path_on_and_off() {
-        let _g = gate();
-        force(false);
-        assert!(!enabled(), "the flag is trusted, not re-read from the env");
-        force(true);
-        assert!(enabled());
-        force(false);
-        assert!(!enabled());
+        assert_eq!(
+            s.snapshot(),
+            vec![
+                OpTimingEntry {
+                    name: "matmul",
+                    calls: 2,
+                    nanos: 350,
+                },
+                OpTimingEntry {
+                    name: "attn",
+                    calls: 1,
+                    nanos: 7,
+                },
+            ],
+            "table order, only the ops that ran"
+        );
     }
 
     #[test]
@@ -363,33 +491,22 @@ mod tests {
     /// would read as "instant".
     #[test]
     fn record_saturates_instead_of_wrapping() {
-        let _g = gate();
-        force(false);
-        let op = Op::Add;
-        let (c0, n0) = counters(&op);
-        record(op_index(&op), Duration::from_secs(u64::MAX / 2));
-        let (c1, n1) = counters(&op);
-        assert_eq!(c1 - c0, 1);
-        // Either it added a saturating amount or it was already at the cap; what
-        // it must never do is come out smaller than it went in.
-        assert!(n1 >= n0);
-        if n0 < u64::MAX {
-            assert_eq!(n1, u64::MAX);
-        }
+        let s = sink();
+        s.record(op_index(&Op::Add), Duration::from_secs(u64::MAX / 2));
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].name, "add");
+        assert_eq!(snap[0].calls, 1);
+        assert_eq!(snap[0].nanos, u64::MAX);
     }
 
-    /// The whole point of the fixed table: a scrape never sees a half-written
-    /// entry, and an op that never ran contributes no family.
+    /// The whole point of the fixed table: an op that never ran contributes no
+    /// family, and a scrape never sees a half-written entry.
     #[test]
     fn snapshot_omits_ops_that_never_ran() {
-        let _g = gate();
-        force(false);
-        // Patchwork: read the un-run set first, then assert none of those appear
-        // after recording something else. Locks keep this stable.
-        let never = Op::BatchMatMul;
-        let (c, _) = counters(&never);
-        if c == 0 {
-            assert!(!snapshot().iter().any(|e| e.name == "batch_matmul"));
-        }
+        let s = sink();
+        s.record(op_index(&Op::Silu), Duration::from_nanos(5));
+        assert_eq!(s.snapshot().len(), 1);
+        assert!(!s.snapshot().iter().any(|e| e.name == "batch_matmul"));
     }
 }

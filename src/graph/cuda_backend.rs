@@ -8625,7 +8625,7 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let sched = crate::graph::scheduler::BackendScheduler;
+        let sched = crate::graph::scheduler::BackendScheduler::new();
         sched.assign_backends(&mut g, &alloc);
         for (i, nd) in g.nodes.iter().enumerate() {
             assert_eq!(
@@ -8720,7 +8720,7 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         let mut g_cap = replay_graph();
         let mut g_ref = replay_graph();
         let mut cap = replay_alloc(true);
@@ -8774,7 +8774,7 @@ mod tests {
         };
         assert_eq!(g.capture_nt_hint(), Some(8), "prefill-shaped hint");
 
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         let mut cap = replay_alloc(true);
         cap.cuda_mut().unwrap().set_prefill_capture_for_test(false);
         sched.assign_backends(&mut g, &mut cap);
@@ -8836,7 +8836,7 @@ mod tests {
         b.output(o);
         let mut g_ref = b.build();
 
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         let mut cap = replay_alloc(true);
         let mut refr = replay_alloc(false);
         sched.assign_backends(&mut g_cap, &cap);
@@ -8902,7 +8902,7 @@ mod tests {
             b.build()
         };
 
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         for nt in [16usize, 300usize] {
             let mut g_cap = build(nt);
             let mut g_ref = build(nt);
@@ -8957,7 +8957,7 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         let mut g_cap = replay_graph();
         let mut g_ref = replay_graph();
         let mut cap = replay_alloc(true);
@@ -9007,7 +9007,7 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let sched = BackendScheduler;
+        let sched = BackendScheduler::new();
         let mut g = replay_graph();
         let mut cap = replay_alloc(true);
         let mut refr = replay_alloc(false);
