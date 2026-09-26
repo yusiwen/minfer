@@ -1,5 +1,5 @@
-# CI — five jobs: one per backend that can be checked without a device, plus the
-# documentation gate and the viz gate.
+# CI — six jobs: one per backend that can be checked without a device, plus the
+# documentation gate, the viz gate and the PR-body gate.
 #
 # 1. test-linux-cpu   : the runtime net. Runs the whole unit suite (the
 #                       integration tests under tests/ need a GGUF model that is
@@ -24,6 +24,13 @@
 #                       boots viz/e2e.js on a stubbed DOM/canvas and plays every
 #                       step, so a crash in the render path fails here. Both are
 #                       dependency-free Node, so the job needs no setup step.
+# 6. check-pr-body    : the PR-body gate (#175, enforcing the gate contract's
+#                       rules 3 and 5). `scripts/check_pr_body.py --selftest` runs
+#                       the checker's own pass/fail cases, then the checker reads
+#                       the body handed over through `env:` and refuses a body
+#                       missing a required heading or leaving a gate section empty.
+#                       `pull_request` only: a push to master has no PR body. It
+#                       needs no token and no network, so it works on a fork PR.
 #
 # `actions/checkout` is pinned to its Node.js 24 major (v5): the v4 line still
 # ships the Node.js 20 runtime, which GitHub now force-runs on 24 and reports as
@@ -36,6 +43,9 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+    # `edited` is what makes a body fix re-run the check: without it a PR whose
+    # job failed on a missing section stays red after the section is filled in.
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   test-linux-cpu:
@@ -119,3 +129,25 @@ jobs:
         run: node scripts/check_viz_e2e.mjs
       - name: The animation must boot and play every step headlessly
         run: node scripts/check_viz_e2e_render.mjs
+
+  # The PR-body gate (#175): the two facts the gate contract asks a PR to state
+  # in prose — the bar named *before* measuring and the mutation evidence — have
+  # a mechanical floor. `--selftest` runs the checker's own cases first, so a
+  # broken checker cannot silently pass every body; then the real body is handed
+  # over through `env:` and read with `--body-env`. Interpolating
+  # `${{ github.event.pull_request.body }}` into a `run:` command would be a
+  # script-injection hazard, and a PR body is attacker-controlled text.
+  #
+  # `if:` keeps the job off a push to master, where there is no PR body. No API
+  # token and no network: `gh` is never called, so the job works for a fork PR.
+  check-pr-body:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
+    steps:
+      - uses: actions/checkout@v5
+      - name: The checker's own pass/fail cases
+        run: python3 scripts/check_pr_body.py --selftest
+      - name: The PR body must carry both gate sections, filled
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 scripts/check_pr_body.py --body-env PR_BODY
