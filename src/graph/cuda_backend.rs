@@ -842,8 +842,9 @@ impl CudaBackend {
             }
 
             Op::RmsNorm { eps } => {
-                let wptr = self.norm_weight(node)?;
                 let d = node.out_shape[0];
+                // #169: the weight must be f32 of exactly `d` elements.
+                let wptr = self.norm_weight(node, d)?;
                 if d % 4 != 0 || d == 0 || out_buf.len % d != 0 {
                     return Err(format!(
                         "cuda: {}: rms_norm dim {d} must be a nonzero multiple of 4 (float4 kernel)",
@@ -937,8 +938,9 @@ impl CudaBackend {
             // [nt*nh, hd] row matrix (t*(nh*hd) + h*hd == (t*nh+h)*hd), so the
             // same rms_norm kernel runs with d = hd (weight shared per head).
             Op::QkNorm { hd, eps, .. } => {
-                let wptr = self.norm_weight(node)?;
                 let d = *hd;
+                // #169: the per-head norm weight must be f32 of exactly `hd` elements.
+                let wptr = self.norm_weight(node, d)?;
                 if d % 4 != 0 || d == 0 || out_buf.len % d != 0 {
                     return Err(format!(
                         "cuda: {}: qk_norm head dim {d} must be a nonzero multiple of 4 (float4 kernel)",
@@ -1579,7 +1581,15 @@ impl CudaBackend {
     /// (which silently degrades to a weightless norm when the weight is not on
     /// the backend), a declared-but-missing weight is an invariant violation
     /// here and returns Err (docs/GPU_SAFETY.md).
-    fn norm_weight(&self, node: &CNode) -> Result<*mut std::ffi::c_void, String> {
+    ///
+    /// `elems` is the number of f32 elements the kernel will read (the norm
+    /// dim). The type is part of the invariant: the rms_norm kernel indexes the
+    /// weight as `d * 4` bytes, so a weight registered with a different length
+    /// — an f16 norm (2 B/element) from a hand-made GGUF, which the f16 weight
+    /// path has no kernel for (#169) — would read past its end silently. This
+    /// returns Err instead, naming both lengths (kernel-invariant violations
+    /// are refusals, never a silent wrong path).
+    fn norm_weight(&self, node: &CNode, elems: usize) -> Result<*mut std::ffi::c_void, String> {
         let name = match &node.meta {
             NodeMeta::Norm(m) => m.weight_name.as_deref(),
             other => {
@@ -1595,12 +1605,24 @@ impl CudaBackend {
                 node.name
             ));
         };
-        self.state.get_weight_ptr(name).ok_or_else(|| {
+        let ptr = self.state.get_weight_ptr(name).ok_or_else(|| {
             format!(
                 "cuda: weight '{name}' not registered on CUDA ({})",
                 node.name
             )
-        })
+        })?;
+        let want = elems * 4;
+        let got = self.state.weight_size(name);
+        if got != Some(want) {
+            return Err(format!(
+                "cuda: norm weight '{name}' is {} B but the rms_norm kernel reads {elems} f32 \
+                 elements ({want} B) for '{}'; the f16 weight path has no f16-norm kernel (#169)",
+                got.map(|n| n.to_string())
+                    .unwrap_or_else(|| "unregistered".to_string()),
+                node.name
+            ));
+        }
+        Ok(ptr)
     }
 }
 
@@ -2603,6 +2625,65 @@ mod tests {
             );
         }
         assert_close("qk_norm", &cb.copy_to_host(qo).unwrap(), &want2, 1e-4);
+    }
+
+    /// #169, the CUDA half: a norm weight whose registered length is not the
+    /// f32 the `rms_norm` kernel indexes (`d*4` bytes) must be refused **before**
+    /// the launch, because the kernel reads `d*4` bytes regardless and an f16
+    /// norm (2 B/element) would be read past its end.
+    ///
+    /// The two arms differ only in that property: the same graph, the same
+    /// `d = 64`, both names registered, both dims valid float4 multiples — so
+    /// the **f32** arm (the control) can only pass and the **f16** arm can only
+    /// fail through the size check. Before #169 the registry lookup alone
+    /// admitted the f16 arm, which is what makes this a value gate rather than
+    /// a relation: it asserts the refusal's own text names both lengths.
+    #[test]
+    fn cuda_norm_weight_size_is_part_of_the_invariant() {
+        let Some(mut cb) = pool() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let (d, eps) = (64usize, 1e-5f32);
+        let run = |cb: &mut CudaBackend, name: &str, t: TensorType, bytes: Vec<u8>| {
+            cb.state.register_weight(name, &bytes);
+            let mut wt = Tensor::from_data(t, &[d as i64, 1, 1, 1], bytes);
+            wt.name = name.to_string();
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [d, 1, 1, 1], DType::F32);
+            let rn = b.rms_norm(x, Some(&wt), eps);
+            b.output(rn);
+            let g = b.build();
+            let xb = cb.alloc_buffer(d);
+            cb.write_host(xb, &vec![1.0f32; d]).unwrap();
+            let ob = cb.alloc_buffer(d);
+            cb.exec_ids(&g.nodes[rn], &[xb], ob, None)
+        };
+
+        // Control arm: f32, exactly `d*4` bytes registered — must execute.
+        let w: Vec<f32> = (0..d).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let wbytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        run(&mut cb, "n169_f32", TensorType::F32, wbytes)
+            .expect("an f32 norm weight of d*4 bytes must execute");
+
+        // Property arm: the same norm weight at 2 B/element. Registered (so the
+        // "not registered" refusal cannot be the one that fires) and d is a
+        // valid float4 dim, so only the size check can refuse it.
+        let f16bytes: Vec<u8> = vec![0u8; d * 2];
+        let err = run(&mut cb, "n169_f16", TensorType::F16, f16bytes)
+            .expect_err("an f16 norm weight must be refused before the launch");
+        assert!(err.contains("n169_f16"), "{err}");
+        assert!(
+            err.contains(&format!("{} B", d * 2)),
+            "the refusal must name the registered length ({} B): {err}",
+            d * 2
+        );
+        assert!(
+            err.contains(&format!("{} B", d * 4)),
+            "the refusal must name the length the kernel reads ({} B): {err}",
+            d * 4
+        );
+        assert!(err.contains("f16-norm"), "{err}");
     }
 
     #[test]
