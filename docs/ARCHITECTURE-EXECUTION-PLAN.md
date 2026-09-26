@@ -2942,7 +2942,8 @@ length had to be told.
 **Findings filed while doing S2** (both pre-existing, neither is caused by the allocator):
 [#98](https://github.com/yusiwen/minfer/issues/98) — `ComputeGraph::topo_order` counts in-degree
 per source entry but decrements once per node, so a graph with a repeated source (`add(x, x)`)
-is rejected as a cycle, and `alloc_graph` calls it on every build;
+is rejected as a cycle, and `alloc_graph` calls it on every build; **fixed 2026-09-26** (record
+below);
 [#99](https://github.com/yusiwen/minfer/issues/99) — the process-wide KV format above.
 
 **What S2 does not do** (it stays on [#55](https://github.com/yusiwen/minfer/issues/55)): the
@@ -2951,6 +2952,72 @@ literal "split reservation from assignment", which Metal's G6 adopts) and the **
 (§14 row 3, which is what removes E3's per-chunk rebuild). Cross-boundary staging is charged to
 `pool_bytes` but is still allocated at its exact length, and backend-internal scratch (Metal capture
 staging, CUDA `positions` scratch) is outside the report.
+
+#### Graph record (#98, 2026-09-26) — a repeated source is one edge, not two
+
+**The defect.** `ComputeGraph::topo_order` counted in-degree **per source entry**
+(`for &s in &node.src { indeg[node.id] += 1 }`) but released it **once per node**
+(`if self.nodes[v].src.contains(&u) { indeg[v] -= 1 }`). A consumer that lists the same predecessor
+twice therefore never reached in-degree 0 and the validator reported a false cycle — on the minimal
+`add(x, x)` graph, `cycle detected: 1/2 nodes ordered` — even though the DAG was legal.
+
+**Reachability.** `GraphBuilder::add`/`mul` pass `&[a, b]` straight through with no dedup, so
+`b.add(x, x)` (`2 * x` written as an addition) is buildable; `GraphAllocator::alloc_graph` validates
+with `topo_order()?` on every build, so the graph could not be allocated at all (`BackendScheduler`
+only had a `debug_assert!`, so allocation was the hard failure). Found while writing E4 S2's
+input-buffer gate, which worked around it with two distinct inputs.
+
+**The fix.** The in-degree pass now counts each *distinct* predecessor once
+(`!node.src[..j].contains(&s)`), so both passes share one notion of "u is a predecessor of v". A
+duplicate source is one edge read twice, not two edges. The release pass is unchanged, and duplicate
+sources stay **legal** by design — the issue's intent is that `add(x, x)` works, not that it is
+rejected.
+
+**The tests.** `topo_order_accepts_a_repeated_source` (the order covers every node, source first)
+and `a_repeated_source_allocates_and_executes_as_two_reads` (end-to-end through `alloc_graph` +
+`BackendScheduler::execute`, asserting the **value**: `add(x, x)` = `2x` and `mul(x, x)` = `x²` on
+concrete inputs, so a graph that dropped the second read fails instead of passing an `is_ok()`). The
+control arm, `topo_order_detects_cycle`, now asserts the exact message
+`cycle detected: 0/2 nodes ordered`: a fix that simply stopped detecting cycles fails it. The E4 S2
+gate `an_input_never_takes_a_buffer_the_walk_released` keeps its two-input form on purpose (its
+property is input placement, not the duplicate-source path) and carries a comment naming #98 as the
+reason it was written that way.
+
+**Mutation evidence (rule 3).** Reverting the in-degree pass to the per-entry form (dropping the
+`!node.src[..j].contains(&s)` guard) and running both new tests:
+
+```
+$ cargo test --release repeated_source
+test graph::alloc::tests::a_repeated_source_allocates_and_executes_as_two_reads ... FAILED
+test graph::tests::topo_order_accepts_a_repeated_source ... FAILED
+thread '...a_repeated_source...' panicked at src/graph/alloc.rs:4123:37:
+add(x, x) must allocate, got: cycle detected: 1/2 nodes ordered
+thread '...topo_order_accepts_a_repeated_source' panicked at src/graph/mod.rs:337:36:
+add(x, x) is acyclic: "cycle detected: 1/2 nodes ordered"
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 493 filtered out
+exit=101
+```
+
+Restored byte-for-byte (`diff -q` clean).
+
+**Adjacent audit (the `contains`-vs-occurrence asymmetry).** The only other `src.contains(` in
+`src/graph/` is `GraphAllocator`'s "is this input consumed by a KV-indexing node" existence test —
+a duplicate does not change existence. The liveness `last_use` pass takes a `max` over source
+entries, so a duplicate is idempotent. `n_consumers` **does** count per entry, but over-counting
+only makes the in-place rule's `== 1` test stricter: it refuses an alias and keeps a private buffer,
+which is conservative and never a wrong read (a comment now says so next to the count).
+`extend_through_views` / `extend_buffer_alive` walk the single `view.src` chain and `max` a deadline,
+so no source list is involved. The fusion pass reads `mul.src[0]` / `src[1]`; a duplicate is
+arithmetically preserved because `SwiGLU(gate, up) = silu(gate) * up` is exactly the
+`Mul(Silu(gate), up)` it replaces. The scheduler pushes one input buffer per source entry (so
+`add(x, x)` really reads the buffer twice) and dedups cross-split `inputs` by `contains` (existence
+again). `cache.rs`'s reuse identity compares `src` vectors element-wise, so duplicates are
+deterministic. No other defect found; no follow-up issue needed.
+
+**Counts (rule 4).** `cargo test --release` on this box (aarch64), 2026-09-26: unit **462 passed / 0
+failed / 33 ignored** (was 460; +2 for the two new tests), integration **10 / 0 / 6**. The
+`x86_64 (CI runner)` row moves by the same +2 (458 → 460); `test-linux-cpu`'s `--check-live`
+confirms it against its own log, and `AGENTS.md` and `docs/status.toml` carry both rows.
 
 #### E4 record, S1 (2026-09-22) — account first, allocate second
 
