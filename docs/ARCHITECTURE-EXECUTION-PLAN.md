@@ -6587,3 +6587,148 @@ see. The removed `force()` also removes the suite's only way to flip the cached 
 production `Global` path is exercised by the pure `resolve_for` tests and the (unset) flag's rule, not by
 an in-process toggle; a real `MINFER_OP_TIMING=1` end-to-end run is still the device/manual evidence
 recorded under F8.
+
+#### CUDA test-infrastructure record (#185, 2026-09-26) — the parallel device suite's SIGSEGV is the global capture window racing an unlocked weight copy
+
+**The observation.** A parallel `cargo test --release --features cuda -- --ignored`
+(`--test-threads` = 20 cores, 38 tests) on GB10 sm_121 / CUDA 13.0 / driver 580.178.04 either
+segfaulted or produced an unstable failure set. Reproduced in this session on the same box and binary
+(`target/release/deps/minfer-d35a4f8f70a3b190 --ignored`, 2026-09-26):
+
+| runs | SIGSEGV (rc 139) | completed runs' failures | failure sets |
+|---|---|---|---|
+| 6 (bare, with `timeout 300`) | **3 / 6** | 4, 3, 9 failed | three distinct sets |
+| 10 (under gdb, `handle SIGSEGV stop print nopass`) | **2 / 10** | — | — |
+
+Across the 16 runs the failing members moved over `conversation::tests::*`, `server::batch::tests::*`,
+`models::qwen2::graph::tests::{a_packed_kv_cache…, an_auto_offload_plan…, async_cross_copies…,
+two_cuda_engines…}` and `graph::cuda_backend::tests::cuda_map_window…` — five distinct sets once the
+ticket's own two runs are counted. Not one of them is a wrong *value*: every one is either a 901
+capture invalidation, a process-global assertion, or a timing relation. `ulimit -s` is 8192 KiB
+(no guard-page frame in the backtraces); `compute-sanitizer --tool memcheck` is 0 errors on the
+serial suite, so a device memory error was not the candidate.
+
+**The backtrace.** Two independent gdb crashes stopped at the **same faulting instruction** inside
+the driver:
+
+```
+Thread N "models::qwen2::" received signal SIGSEGV, Segmentation fault.
+0x0000ffffab24da8c in ?? () from /lib/aarch64-linux-gnu/libcuda.so.1
+#6  cuMemcpyHtoD_v2
+#9  cudaMemcpy
+#10 <minfer::cuda::CudaState>::register_weight
+#11 minfer::models::weight_reg::register_cuda_weight
+#12 minfer::models::qwen2::loader::load_tensor
+#13 minfer::models::qwen2::loader::load
+#14 minfer::models::load_model_configured
+#15 tests::a_packed_kv_cache_answers_like_the_f32_one              (crash 1)
+     tests::two_cuda_engines_with_different_kv_layouts_run_interleaved   (crash 2)
+```
+
+and, at that instant, a **second thread** inside the same driver:
+
+```
+#8  cuGraphInstantiateWithFlags
+#10 cudaGraphInstantiate
+#11 <minfer::cuda::CudaState>::graph_end_capture_to_exec
+#12 <CudaBackend as minfer::graph::backend::Backend>::synchronize
+#13 <minfer::graph::scheduler::BackendScheduler>::execute
+#14 <minfer::models::qwen2::graph::Qwen2Graph>::forward_batch
+#15 minfer::server::chat::guarded_forward_batch
+#16 <minfer::server::batch::BatchEngine>::submit_on
+#17 tests::a_long_prefill_keeps_another_slot_decoding       (crash 2's co-tenant)
+```
+
+One thread holds an open **`cudaStreamCaptureModeGlobal`** capture window
+(`cudaStreamBeginCapture(stream, 1)`) and is instantiating it; the other issues a plain, *not*
+stream-ordered, blocking `cudaMemcpy` (H2D) from the weight-registration path.
+
+A **third** crash — captured once the two-chokepoint guard below was already in place — is a second
+unguarded entry rather than the same one, and it is why the guard has a third chokepoint:
+
+```
+Thread 5 "graph::cuda_bac" received signal SIGSEGV
+#5  cuLaunchKernel
+#8  __device_stub__gqa_attn_split_combine
+#9  launch_gqa_attn_split_f32kv
+#10 graph::cuda_backend::tests::cuda_map_window_costs_no_more_than_the_span_it_replaces
+```
+
+That gate drives `CudaBackend`/`CudaState` **directly** (no `scheduler::execute`), so no
+scheduler-level guard can see it; 3 of 8 gdb runs crashed there after the register-weight path was
+refused. It now takes the device token itself.
+
+**The determination: (a), the documented capture-stream race.**
+`CudaState::stream_lock()` serializes the paths that take it, and `graph_replay_step` holds it across
+the capture window — but `CudaState::register_weight` takes no lock at all, and a Global-mode capture
+is invalidated by another thread's non-capturable driver call. The benign mode of that race is the
+`cudaErrorStreamCaptureInvalidated (901)` the run logs are full of; the recorded mode is the driver
+faulting instead of returning. (b) *teardown/drop race*: **ruled out** — neither crash has a
+`Drop`, `cudaFree`, `cudaFreeHost`, `cudaGraphExecDestroy` or `graph_destroy` frame; the faulting
+frame is a live forward `cudaMemcpy` and the co-tenant is `cudaGraphInstantiate`, not a destructor.
+(c) *memory error the serial path only avoids by timing*: **ruled out as the root** — the destination
+pointer is the one `cudaMalloc` returned two lines earlier in the same function, no minfer `unsafe`
+passes a wild pointer, and `compute-sanitizer` is clean serially. (iv) *stack overflow*: ruled out —
+the fault is inside libcuda several frames down, not at a guard page. What makes the crash bite the
+serial path too is not a timing accident but the *sharing*: any future two-thread device use
+(a second engine thread, a parallel harness) re-creates it.
+
+**What landed (the loud refusal #185 asks for).** `src/device_entry.rs` owns a process-wide,
+re-entrant-per-thread token for "inside the CUDA device path". `BackendScheduler::execute` takes it
+for a whole execution when the graph has a **`CUDA` split** (the capture window's lifetime; the test
+is the split set, not the allocator's state, so a CPU-only graph on a CUDA-enabled allocator is not
+refused), and `models::weight_reg::register_cuda_weight` takes it for each registration (the copy
+that crashes).
+A second **thread** is refused with the operation it was doing, the operation already inside, the
+mechanism, the evidence and the remedy (`--test-threads=1` / `scripts/cuda_test.sh`) — **before any
+driver call**. The module is feature-independent and pure on purpose, so the CPU CI job runs its
+test; the same reason `models::weight_reg::cuda_weight_reg` keeps its decision pure.
+
+**Verification that it refuses rather than crashes (rule 5 numbers).** The same parallel
+`--ignored` command, GB10 sm_121, 2026-09-26, as the guard grew (before → 3 / 6 bare runs and 2 / 10
+gdb runs SIGSEGV'd with no guard at all):
+
+| guard | bare runs | SIGSEGV | gdb runs | SIGSEGV | named refusals per bare run |
+|---|---|---|---|---|---|
+| two chokepoints (`execute` + registration) | 6 | 1 / 6 | 8 | 3 / 8 (all `cuLaunchKernel` from `cuda_map_window…`) | 25, 23, 23, 25, 27, 0 |
+| **three (landed, + the direct-driver gate)** | **10** | **0 / 10** | **6** | **0 / 6** | 24, 23, 23, 30, 23, 24, 24, 23, 23, 21 |
+
+Every refusal is the `device_entry` message; no run reached the driver concurrently. That the
+*intermediate* state still crashed is the useful part: the guard converted the two backtraced
+mechanisms into refusals and exposed the third, which is a direct-driver test the scheduler cannot
+see. The serial configuration is untouched: `scripts/cuda_test.sh`, GB10 sm_121, 2026-09-26 →
+**544 / 0 / 38** (was 541 / 0 / 38; +3 tests: the guard's own test, the explicit-`auto`-budget test
+and the per-backend stream-sync gate), and the sanitizer stays at **0 errors** over the same 544.
+
+**Mutation evidence (rule 3).** Deleting the `Some(holder) if holder.thread != me` arm from
+`device_entry::enter` — i.e. letting every thread in — makes
+`device_entry::tests::the_device_path_is_exclusive_across_threads_and_re_entrant_on_one` fail at
+`a second thread must be refused`. The per-backend counter's gate is mutated by making
+`CudaBackend::stream_sync_count` return `crate::cuda::stream_sync_count()`, which fails
+`stream_sync_counts_are_per_backend_not_process_wide` on its second assertion.
+
+**What does not change, and where it is filed.** The *race* is not fixed: the guard refuses the
+configuration instead of making it correct, and it is a **chokepoint, not a structural exclusion** —
+a caller that reaches `CudaBackend::execute_node`/`synchronize`/`graph_replay_step`, or
+`CudaState::register_weight` directly rather than through those two entry points, still runs
+unguarded (as does `Drop for CudaBackend`'s frees, which the pre-existing `stream_guard` serializes
+unless the backend is mid-capture). Per-instance streams/capture contexts, or extending the
+capture discipline to every un-ordered device call (`register_weight`'s `cudaMalloc`/`cudaMemcpy`,
+`cudaMemGetInfo`, `cudaHostAlloc`/`cudaFreeHost`, the `Drop` frees), is
+[#188](https://github.com/yusiwen/minfer/issues/188), with both backtraces attached. The S4
+map-window timing gate's co-tenant sensitivity (median 1.398x once, in the parallel run; decode half
+0.916x and the whole test green in the sibling run) is the #154 class, not the crash:
+[#189](https://github.com/yusiwen/minfer/issues/189).
+
+**Two test-hygiene defects, fixed here (they are why the failure set moved).**
+`async_cross_copies_never_block_and_stay_bitwise_identical` read the **process-wide**
+`cuda::stream_sync_count()` (run A: the async arm counted 4160 stalls against the synchronous arm's
+728 — a foreign test's syncs inside the delta). The count now lives on the `CudaBackend`
+(`stream_syncs`, bumped by the one `state_sync` helper) and both F5 gates read it there, exactly as
+`blocking_readbacks` and `copystats`' accumulators already did; the process-wide function stays for
+the "host stalls in this process" figure and its doc now says a gate must not read it. And
+`an_auto_offload_plan_fits_the_budget` mutated the process-global `MINFER_GPU_MEM`; it now uses
+`OffloadRequest::AutoWithBudget(64)` — an explicit argument, the repo's convention since #99/#153 —
+and its second arm uses the device's measured free bytes, so the gate neither reads nor mutates the
+environment.
+
