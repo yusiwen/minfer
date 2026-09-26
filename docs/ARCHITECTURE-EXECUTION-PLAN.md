@@ -1403,6 +1403,114 @@ are preserved deliberately: `launch_mmq_raw_nb_nt` / `_nb_bt_nt` / `_q6k_nt` / `
 on any opt-in refusal, so the dispatch falls to the next kernel — the failure is named, not fatal,
 because a fallback is the designed behaviour and changing it would change which kernel runs.
 
+### Every `<<<>>>` reads its own launch error · [#162](https://github.com/yusiwen/minfer/issues/162) — **DONE 2026-09-26**
+
+**Why.** The #147 audit enumerated the wider case: **104** `<<<>>>` sites in `src/cuda_kernels.cu`
+(the 65 wrappers in the ticket plus multi-site families and two wrappers the #147 list had not
+counted) enqueued a kernel and never read the launch's error. A launch that failed for real —
+an illegal grid/block shape, an out-of-resources configuration, a stale context — latched the error,
+and it surfaced at `CudaState::sync` or at the *next* hardened site's pre-launch check as a *latched
+API error* (#145's honest label) with **no indication of which launch produced it**. `grep -c '<<<'`
+on the tree is **122**; two of those are the `<<<>>>` in prose comments, so the audited surface is
+**120 sites in 76 `launch_*` owners** (the wrappers plus the static `launch_gqa_attn_split_batched_kv` helper).
+
+**What landed.**
+
+- **Every site reads its own error, through the shared helper.** Each `<<<>>>` is preceded by
+  `minfer_launch_prelude(site, kernel)` (which reports any *pre-existing* latch as not this launch's)
+  and followed by a `minfer_launch_ok` / `minfer_launch_ok_opt` read that clears the latch it named.
+  The site token starts with `launch:` and the report names the **kernel instantiation** and
+  `cudaGetErrorName` — e.g. `kernel launch gemm_f16_nt_kernel_t<128,32,true> failed:
+  cudaErrorInvalidValue (1) — the launch is refused (#162/launch:gemm_f16_a32)`.
+- **The decision per launcher is severity in the helper, not a signature change.** `minfer_launch_ok`
+  is **required**: it records a sticky failure that `CudaBackend::execute_node` — **one** Rust-side
+  check (`CudaState::take_launch_failure`), not 104 signature changes and 104 Rust `Err` arms — drains
+  on **both** arms and turns into an `Err` naming the site and the node, so the op never proceeds with
+  a stale output (and the drain keeps a stale record from blaming the next node).
+  `minfer_launch_ok_opt` names and clears **without** the sticky for a path with a documented
+  fallback. Split of the 120 sites: **107 required → `Err`** (67 launchers — the matmul, elementwise,
+  rope/store-KV, embedding, dequant/convert, MMVQ, attention and split-attention families, plus the
+  MMQ terminal launchers `launch_mmq_raw_nt` / `launch_mmq_nt` and the #147 "no later gate" ones) and
+  **13 documented fallbacks** (6 launchers — `launch_fa_prefill_f16kv`'s three window modes fall back
+  to the legacy attention kernel; `launch_mmq_raw_nb_nt` / `_nb_bt_nt` (kernels + k-split reduce) /
+  `_q6k_nt` (kernels + k-split reduce) / `_wide_nt` are #147's clean fast-path fallbacks;
+  `launch_kv_move_rows` returns non-zero to its `Result` caller). The choice per family is a comment
+  at each family in `cuda_kernels.cu`.
+- **The injection lever is shared geometry, so a site's coverage is data.** `minfer_launch_block(site,
+  dim3|unsigned)` replaces the block argument at every ordinary site; when `MINFER_TEST_CALL_FAIL`
+  names the site the block becomes 4096 threads (over the 1024/block limit) and the launch itself
+  returns `cudaErrorInvalidValue` for real, the kernel never runs — probed on GB10/sm_121. The
+  dynamic-smem launchers keep #147's `minfer_launch_smem` lever. Adding a site's token is therefore a
+  one-line string in the driver, not a bespoke mechanism.
+- **A scripted audit, wired into CI.** `scripts/check_cuda_launch_returns.py` parses the source
+  (comments and string literals blanked, so a commented-out occurrence is not a site) and requires,
+  for **every** `<<<`: an enclosing `minfer_launch_prelude("<site>", …)` before it, an
+  `minfer_launch_ok`/`_opt("<site>", …)` after its statement naming the **same** token, a token that
+  starts with `launch:`, and a real-failure lever (`minfer_launch_block` or `minfer_launch_smem`) in
+  the launch geometry. It prints its result and exits 1 on any offending line. It runs in the
+  `check-docs` job (python3 present; the CUDA container's is not guaranteed) together with its own
+  `--selftest` and a `--check-fixture` against
+  `tests/fixtures/cuda_launch_sites.tsv`, the committed site list (line, owner, token, kernel
+  fragment) the device gate compares its driven set against.
+- **Two k-split reduce sites are separate tokens** (`launch:mmq_raw_nb_bt_ksplit`,
+  `launch:mmq_raw_nb_bt_q6k_ksplit`). They share the launcher with the kernel site, whose `_opt`
+  read returns 0 before the reduce; arming the kernel's token would leave the reduce site
+  unreachable, so the reduce has its own prelude/read/token and the driver arms it alone.
+
+**Acceptance results** (GB10/sm_121, CUDA 13.0, driver 580.178.04; serial device runs).
+
+| check | before | after |
+|---|---|---|
+| `scripts/check_cuda_launch_returns.py` on `src/cuda_kernels.cu` | **104** unchecked sites | **empty list**: 120 / 120 sites read their own error and carry a lever |
+| CUDA serial unit suite (`scripts/cuda_test.sh`) | **531 / 0 / 37** (master; the recorded 526 predated #173's +3 and #98's +2) | **536 / 0 / 37** (+5 gates) |
+| `MINFER_TEST_ISSUE162=1` device gate: every audited site driven and named | — | **5 / 0** tests; the coverage test's driven set equals the 118-token fixture |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0** API errors | **0** errors over 536 |
+| CUDA serial ignored, 0.5B config | 37 / 0 | **37 / 0** |
+| CUDA serial ignored, Qwen3-0.6B Q8_0 | 37 / 0 | **37 / 0** |
+
+The sanitizer row's command is
+`compute-sanitizer --tool memcheck --target-processes all target/release/deps/minfer-<hash> --test-threads=1`
+(wrapping the **test binary**, not `cargo` — the cargo/test build tree is not instrumented and
+`--target-processes all` around the whole `bash scripts/cuda_test.sh` chain stalls the harness; the
+binary form is the one that completes, in 350.17 s).
+
+**Mutation checks (each reverted; `src/cuda_kernels.cu` restored to
+`sha256 da2e00fb79442fcd03bd3618301b4014cd835f832bbafa4153b4af4283dcdbfb` byte-identically).** Full
+transcripts in the closing comment on #162; the list:
+(a) deleting the read at one single-site family (`launch_add_f32`) fails the audit **and** the device
+coverage test (the armed site reports nothing); (b) the same at one `switch` case
+(`launch:embed_rows__q4_k`) and (c) at one branch of a templated family
+(`launch:gqa_attn_split_f16kv__hybrid_causal`); (d) making `minfer_launch_read` report but **admit**
+the launch (return true) is caught by the severity test's `assert_eq!(rc, -1)` on the fa-prefill
+fallback — a message-only assertion misses it; (e) the message naming a **wrong** instantiation is
+caught by the fixture's fragment check; (f) the sticky removed from `minfer_launch_ok` is caught by
+`cuda_issue162_required_sites_set_the_sticky_opt_sites_do_not` and by the node-level test; (g)
+`execute_node`'s unconditional drain removed is caught by
+`cuda_issue162_the_err_arm_also_drains_the_sticky` (an f16 matmul whose Rust wrapper returns `Err`
+leaves the sticky pending, so a drain only on the `Ok` arm would blame the next node); (h)
+`minfer_launch_block` made a no-op is caught because no armed site fails and every armed set observes
+the empty set; (i) an `_opt` site that also sets the sticky is caught by the severity test's
+`take_launch_failure().is_none()`; (j) the audit's lever check disabled is caught by the selftest's
+"read but no lever" case; (k) the fixture's kernel fragment changed is caught by `--check-fixture`.
+An **equivalent mutant** is recorded too: deleting the trailing `cudaGetLastError()` in
+`minfer_launch_read` changes nothing (the read's own `cudaGetLastError` already resets the latch), and
+the gate correctly stays green — the trailing call is belt-and-braces, not the clear.
+
+**Honest scope.** Nothing was failing on sm_121 before or after: the sanitizer was already 0, so the
+production paths remain **latent** and the evidence is that every site *can* be shown to refuse and
+name a **real** failing launch. The injection is a test-only knob (`MINFER_TEST_CALL_FAIL` +
+`MINFER_TEST_ISSUE162=1`, unset in every default, bench and sanitizer run) that drives the site's own
+geometry illegal; it does not exercise a genuine driver fault. The **source audit is static**: it
+proves the read and the lever are *written*, not that they run — a `<<<` inside a string literal or a
+macro the parser cannot resolve is reported, never silently accepted, but the parser resolves a site
+variable only through a plain `=` assignment in the enclosing function (the `launch_site` ternary of
+`launch_gemm_f16` resolves to its first arm, which is why the driver arms `gemm_f16_a32`). The device
+gate's coverage assertion compares **sets** of site tokens; where two source sites share one token
+(the two `mmq_raw_nb_bt` kernel instantiations) the gate proves the token is reached, not that both
+branches were — the audit, not the gate, is what guarantees each source site has its own read. The
+`compute-sanitizer` and real-model rows are recorded measurements on this box (CI has no GPU); the
+x86_64 CPU row is unaffected because no pure-Rust test was added.
+
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
 
 **Why.** A session's KV rows, ownership and run table lived only in memory, so every
