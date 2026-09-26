@@ -6,17 +6,24 @@
 #                       not checked in and stay #[ignore]d) plus the CPU-side
 #                       graph/allocator/scheduler tests. This is the job that
 #                       must go red when a change breaks behaviour rather than
-#                       compilation.
+#                       compilation. It tees its own log and
+#                       `scripts/check_status.py --check-live` compares the
+#                       `x86_64 (CI runner)` suite counts against it (#94).
 # 2. build-linux-cuda : compile check for the CUDA backend in NVIDIA's own devel
 #                       image. GitHub runners have no GPU, so this cannot run
 #                       anything — it catches nvcc/kernel-compile breakage only.
 # 3. build-macos      : unchanged macOS/Metal compile check (Apple Silicon).
-# 4. check-docs       : the documentation gate (#63). `mdbook build` proves the book
-#                       renders (a chapter missing from SUMMARY.md is a hard error
-#                       there, and the toolchain matches the one Docs deploys with);
-#                       `scripts/check_docs_links.py` proves every relative link in
-#                       the markdown resolves — `mdbook build` happily renders a dead
-#                       link into the HTML, which is how the docs rotted before.
+# 4. check-docs       : the documentation gate (#63, #94). `mdbook build` proves the
+#                       book renders (a chapter missing from SUMMARY.md is a hard
+#                       error there, and the toolchain matches the one Docs deploys
+#                       with); `scripts/check_docs_links.py` proves every relative
+#                       link in the markdown resolves — `mdbook build` happily
+#                       renders a dead link into the HTML, which is how the docs
+#                       rotted before; `scripts/check_status.py --check` proves the
+#                       plan's phase counters / `next:` sentence / baseline commits
+#                       and AGENTS.md's suite counts agree with docs/status.toml,
+#                       and `--selftest` runs the checker's own cases. The ancestry
+#                       test needs history, so this job fetches with `fetch-depth: 0`.
 # 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
@@ -53,8 +60,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
+      # `set -o pipefail` is not inherited: GitHub's default shell is `bash -e {0}`.
+      # Without it `cargo test | tee LOG` reports *tee*'s status, so a failing suite
+      # would leave this step green while the next one parses its log.
       - name: Test (release, CPU)
-        run: cargo test --release
+        run: |
+          set -o pipefail
+          cargo test --release 2>&1 | tee /tmp/cargo-test.log
+      - name: The x86_64 suite counts must match this run
+        run: python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
 
   # The container tag carries the CUDA toolkit; bump it together with the
   # toolkits build.rs is known to support (12.x and 13.x today).
@@ -88,15 +102,25 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-  # The documentation gate (#63). Checked first because it is the cheap half and the
-  # half that catches rot: a renamed file leaves a dead link that `mdbook build`
-  # renders without complaint.
+  # The documentation gate (#63, #94). Checked first because it is the cheap half and
+  # the half that catches rot: a renamed file leaves a dead link that `mdbook build`
+  # renders without complaint, and a hand-edited counter drifts from its source.
   check-docs:
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
+      # `fetch-depth: 0` is required, not cosmetic: `check_status.py --check` asserts
+      # the plan's baseline and refreshed-against commits are ancestors of HEAD, and
+      # the default shallow clone (depth 1) cannot answer that — the test would fail
+      # spuriously on a commit that is perfectly fine.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Check every relative link in the markdown
         run: python3 scripts/check_docs_links.py
+      - name: The status prose must agree with docs/status.toml
+        run: python3 scripts/check_status.py --check
+      - name: The status checker's own pass/fail cases
+        run: python3 scripts/check_status.py --selftest
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands

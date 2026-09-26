@@ -1,0 +1,214 @@
+# docs/status.toml — the machine-readable source of truth for the status prose.
+#
+# The plan's phase counters and its `next:` sentence, its baseline/`refreshed
+# against` commit ids, and `AGENTS.md`'s suite counts are **derived facts**: they
+# are written here and `scripts/check_status.py --check` (CI job `check-docs`)
+# fails when the prose disagrees with this file, naming the file, the line and
+# both values. Edit *this* file, not a counter.
+#
+# Two kinds of prose target live below. The three scalars use `[prose.<field>]`;
+# each `[[phase]]` and each `[[counts]]` row carries its own `file` + `regex`, so
+# the checker holds no second copy of any value. A regex compares only the named
+# groups it captures: `state` / `done` / `total` for a phase, and the count and
+# `date` fields for a counts row. `box` is captured so the row is matched to the
+# right bullet when two rows share a command.
+#
+# What the checker can and cannot prove is stated in `scripts/check_status.py
+# --help`. In short: it proves the prose *agrees with this file* and that a
+# counts row's values *matched a cargo log that was parsed*. It cannot prove a
+# measurement was real. Every row whose `live_check` is false is a **recorded
+# measurement** (CI has no GPU and no aarch64 runner) and is labelled `note` so
+# the gate cannot be read as "verified".
+
+schema = 1
+
+# The commit the plan's status block was first baselined against, and the master
+# commit this status was last refreshed against. Both must be ancestors of HEAD.
+baseline_commit = "f32daa7"
+refreshed_against = "f663750"
+
+# The one honest `next:` sentence. It replaced a stale one that still called
+# E4/E5 upcoming years after they landed (issue #94).
+next = "the Metal round G1–G3/G5 (on a Mac) and F1 (needs x86)"
+
+# --- prose locations for the three scalars ----------------------------------
+
+[prose.baseline_commit]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'HEAD = (?P<value>[0-9a-f]{7,40})'
+
+[prose.refreshed_against]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'master =\s*(?P<value>[0-9a-f]{7,40})'
+
+[prose.next]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Next: (?P<value>[^\n]+?)\.\*\*'
+
+# --- phase counters ---------------------------------------------------------
+# `done`/`total` are the preamble's `(done/total)`; `state` is its completion
+# word. Phase G is scheduled with none of its seven tickets started.
+
+[[phase]]
+id = "A"
+done = 9
+total = 9
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase A\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "B"
+done = 3
+total = 3
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase B\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "C"
+done = 8
+total = 8
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase C\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "D"
+done = 3
+total = 3
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase D\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "E"
+done = 7
+total = 7
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase E\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "F"
+done = 7
+total = 8
+state = "in progress"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase F\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "G"
+done = 0
+total = 7
+state = "scheduled"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+# --- suite counts, per box --------------------------------------------------
+# The box is part of the identity: `quants::neon_correctness` is
+# `cfg(all(test, target_arch = "aarch64"))`, so the aarch64 box reports two more
+# unit tests than the x86_64 CI runner. Only `x86_64 (CI runner)` is compared
+# live, by `test-linux-cpu`; every other row is a recorded measurement.
+
+[[counts]]
+key = "cpu-unit"
+box = "aarch64 (this box)"
+suite = "unit"
+command = "cargo test --release"
+date = "2026-09-26"
+passed = 457
+failed = 0
+ignored = 33
+integration_passed = 10
+integration_failed = 0
+integration_ignored = 6
+live_check = false
+note = "recorded measurement; CI runs x86_64"
+file = "AGENTS.md"
+regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
+
+[[counts]]
+key = "cpu-unit"
+box = "x86_64 (CI runner)"
+suite = "unit"
+command = "cargo test --release"
+date = "2026-09-26"
+passed = 455
+failed = 0
+ignored = 33
+integration_passed = 10
+integration_failed = 0
+integration_ignored = 6
+live_check = true
+note = "compared live by the test-linux-cpu job"
+file = "AGENTS.md"
+regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
+
+[[counts]]
+key = "cpu-real-model"
+box = "aarch64 (this box)"
+suite = "real-model"
+command = "PARALLEL=0 scripts/real_model_gates.sh and the parallel form"
+date = "2026-09-26"
+passed = 33
+failed = 0
+live_check = false
+note = "recorded measurement; needs the cached models, not run in CI"
+file = "AGENTS.md"
+regex = 'CPU real-model set, box `(?P<box>[^`]+)`, `PARALLEL=0 scripts/real_model_gates\.sh` and the default parallel form, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\* each'
+
+[[counts]]
+key = "cuda-unit"
+box = "GB10 sm_121"
+suite = "unit"
+command = "scripts/cuda_test.sh"
+date = "2026-09-26"
+passed = 526
+failed = 0
+ignored = 37
+live_check = false
+note = "recorded measurement; CI has no GPU"
+file = "AGENTS.md"
+regex = 'CUDA unit, box `(?P<box>[^`]+)`, `scripts/cuda_test\.sh`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+) / (?P<ignored>[0-9]+)\*\*'
+
+[[counts]]
+key = "cuda-real-model-0.5b"
+box = "GB10 sm_121"
+suite = "real-model"
+command = "FEATURES=cuda scripts/real_model_gates.sh"
+date = "2026-09-26"
+passed = 37
+failed = 0
+live_check = false
+note = "recorded measurement; CI has no GPU"
+file = "AGENTS.md"
+regex = 'CUDA real-model set \(0\.5B config\), box `(?P<box>[^`]+)`, `FEATURES=cuda scripts/real_model_gates\.sh`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\*'
+
+[[counts]]
+key = "cuda-real-model-qwen3-0.6b"
+box = "GB10 sm_121"
+suite = "real-model"
+command = "FEATURES=cuda scripts/real_model_gates.sh"
+date = "2026-09-26"
+passed = 37
+failed = 0
+live_check = false
+note = "recorded measurement; CI has no GPU"
+file = "AGENTS.md"
+regex = 'CUDA real-model set \(Qwen3-0\.6B config\), box `(?P<box>[^`]+)`, `FEATURES=cuda scripts/real_model_gates\.sh`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\*'
+
+[[counts]]
+key = "cuda-sanitizer"
+box = "GB10 sm_121"
+suite = "sanitizer"
+command = "compute-sanitizer --tool memcheck over scripts/cuda_test.sh"
+date = "2026-09-26"
+passed = 526
+failed = 0
+ignored = 37
+api_errors = 0
+live_check = false
+note = "recorded measurement; CI has no GPU"
+file = "AGENTS.md"
+regex = '`compute-sanitizer --tool memcheck` over the CUDA unit suite, box `(?P<box>[^`]+)`, `scripts/cuda_test\.sh` under the sanitizer, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<api_errors>[0-9]+) API errors\*\* \((?P<passed>[0-9]+) / (?P<failed>[0-9]+) / (?P<ignored>[0-9]+)\)'

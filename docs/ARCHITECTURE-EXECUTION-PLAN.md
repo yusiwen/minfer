@@ -1,7 +1,7 @@
 # minfer Architecture Execution Plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-16); Phase B **complete** (3/3,
-2026-09-16); Phase C **complete (8/8)** — C1, C2, **C3**, **C4 (quantized Q8_0 cache,
+2026-09-16); Phase C **complete** (8/8) — C1, C2, **C3**, **C4 (quantized Q8_0 cache,
 CPU)**, **C5 (session save/restore)**, **C6 (logical positions)**, **C7 (+C7b)** and
 **C8 (cross-sequence cell sharing)** are done. C6 merged 2026-09-20 as `001b8cc`;
 **C7 landed 2026-09-20** (the partition is elastic, and growth moves runs in **both**
@@ -11,13 +11,12 @@ block map and a gather in every attention kernel — S1a/S1b/S2/S3/S4/S5 landed,
 CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4's fused
 dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
-Phase D **3/3** (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**7/7** (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **7/8** (F2, F3, **F4**, **F5**, **F6**, F7,
+Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
+**complete** (7/7) (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **in progress** (7/8) (F2, F3, **F4**, **F5**, **F6**, F7,
 F8 done; F1 needs x86); Phase G
-**scheduled** — after the CUDA
+**scheduled** (0/7) — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Phase C is complete (8/8); next: E4/E5 (allocator, then layer offload) and the Metal
-round G1–G3/G5 (on a Mac).** The order is
+check). **Next: the Metal round G1–G3/G5 (on a Mac) and F1 (needs x86).** The order is
 deliberate: the Metal KV port (G5) comes **after** the CUDA arena stops changing shape
 (C7, C7b, C8), so those semantics are written into Metal once. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -26,7 +25,16 @@ is ranked). This document is the *how*: phase-by-phase tickets with
 deliverables, acceptance criteria and dependencies.
 **Baseline:** `HEAD = f32daa7` (2026-09-16); Phase A landed on
 `architecture-phase-a` (PR #1). This status was refreshed against `master =
-75f14b7` (2026-09-22, the C5 merge); it is refreshed with every PR that lands a ticket.
+f663750` (2026-09-26, the #175 merge); it is refreshed with every PR that lands a ticket.
+**Derived facts:** the phase counters above, the `next:` sentence and the two commit
+ids are not hand-maintained prose — [`docs/status.toml`](./status.toml) is the source of
+truth, and `scripts/check_status.py --check` (CI job `check-docs`) fails when this block
+disagrees with it, naming the file, the line and both values. Edit the source, not the
+counter. The same checker reads `AGENTS.md`'s suite counts: `--check-live` compares the
+one CI-verifiable box against the `test-linux-cpu` log, while the CUDA / real-model /
+sanitizer rows are labelled *recorded measurements* because CI has no GPU. The
+per-ticket ✔ marks in the §11 diagram are **not** derivable from `(done, total)` and are
+deliberately out of scope for the checker.
 
 **Issue links.** Work tracked on GitHub carries its issue link in its table row
 (prose sections carry it in the heading), and the record written when that work lands
