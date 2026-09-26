@@ -3516,14 +3516,16 @@ CUDA build with a device) a device arm, and asserts each engine's `kv_format()`,
 3x-smaller region and the two logit tolerances (unchanged bounds). The `KvFormatGuard` is gone —
 nothing process-wide is left to restore. The device arm still sets the one process-wide tag #99 left
 in place (`cuda::KV_LAYOUT`, read by the device kernels themselves) under a small
-`DeviceLayoutGuard` that restores it on a panic.
+`DeviceLayoutGuard` that restores it on a panic. **Both of those device-only parts are gone as of
+[#153](https://github.com/yusiwen/minfer/issues/153)** (the guard deleted, the tag per engine — see
+the #153 record below); the sentences above describe the state at #99's landing.
 
-**The CUDA device half is deliberately not done.** `cuda.rs` holds the layout in a process-wide
+**The CUDA device half was deliberately not done at #99 and landed as
+[#153](https://github.com/yusiwen/minfer/issues/153).** `cuda.rs` held the layout in a process-wide
 `KV_LAYOUT` that the launchers read directly (not through `CudaBackend::kv_layout`), so a per-engine
-device path would need every launcher and the captured-graph key threaded; a per-instance field
-alone would silently still read the global. Filed as
-[#153](https://github.com/yusiwen/minfer/issues/153); `docs/CUDA-BACKEND-DESIGN.md`'s KV-layout
-section states the scope, and the device run keeps the documented serial discipline.
+device path needed the launchers and the captured-graph key threaded; a per-instance field alone
+would silently still have read the global. The #153 record below states what is now per-engine and
+what is not.
 
 **The entry point.** `scripts/real_model_gates.sh` is the one command for the set: it defaults to
 `--test-threads=1` (required on a device) and takes `PARALLEL=1` (CPU-only parallel) and
@@ -3568,23 +3570,122 @@ parallel gate set is what detects the interference, and the per-engine path is w
   [#44](https://github.com/yusiwen/minfer/issues/44) either way.
 - **The device (CUDA) parallel run is still not green and is not claimed.** `CudaState` is a
   process-wide singleton (MMQ memo, captured graph execs, stream state — issue
-  [#64](https://github.com/yusiwen/minfer/issues/64)) and the device KV layout tag is process-wide
-  on top of that; `cargo test --release --features cuda -- --ignored` without `--test-threads=1`
-  remains the wrong command, and `scripts/real_model_gates.sh` keeps it serial. Measured serially on
-  this box (GB10 sm_121, CUDA 13.0): the unit suite is **501 passed / 0 failed / 32 ignored**, and
-  the ignored set is **32 passed / 0 failed** in both the 0.5B (f32 KV) and the Qwen3-0.6B (f16 KV)
-  configurations — unchanged by this increment except that one obsolete unit test is gone.
+  [#64](https://github.com/yusiwen/minfer/issues/64)); `cargo test --release --features cuda --
+  --ignored` without `--test-threads=1` remains the wrong command, and `scripts/real_model_gates.sh`
+  keeps it serial. Measured serially on this box (GB10 sm_121, CUDA 13.0): the unit suite is **501
+  passed / 0 failed / 32 ignored**, and the ignored set is **32 passed / 0 failed** in both the 0.5B
+  (f32 KV) and the Qwen3-0.6B (f16 KV) configurations — unchanged by this increment except that one
+  obsolete unit test is gone. (**#153 removed the second reason** — the device KV layout tag is per
+  engine now — and re-measured the parallel form; see the #153 record below for the fresh counts.)
 - An **explicit `f16`** cache type still lets the *device* layout follow
   `set_kv_cache_type`'s auto policy (the pre-C4 split the loader comment records); the builder's
   f32/f16 region shapes are identical, so that is not a sizing hazard. A packed (`q8_0`) resolution
-  is still restated explicitly on the device, as before.
+  is still restated explicitly on the device, as before. (**#153 folded the auto policy into the
+  engine's resolved format and deleted `set_kv_cache_type`; the loader no longer restates anything.**)
 - The `forward_graph` (non-cached) path uses the process-global `graph_cache()`; two *models* with
   different formats driving that one cache would still be refused by `ensure_kv`. That is the
   pre-existing single-cache-per-process design, not the format global, and the server/CLI paths
   that matter pass a `GraphCache` explicitly.
 
-**Follow-ups.** [#153](https://github.com/yusiwen/minfer/issues/153) (the CUDA per-graph layout),
-[#154](https://github.com/yusiwen/minfer/issues/154) (the load-sensitive batching timing gate).
+**Follow-ups.** [#154](https://github.com/yusiwen/minfer/issues/154) (the load-sensitive batching
+timing gate); [#153](https://github.com/yusiwen/minfer/issues/153) (the CUDA per-graph layout) was
+its own follow-up and landed — its record follows.
+
+#### #153 record — the CUDA KV layout is per engine, and the captured-graph identity carries it
+
+**What was wrong.** #99 made the KV *format* per engine for the model, the graph builder, the
+allocator and the CPU kernels, but left the CUDA side on a process-wide `static KV_LAYOUT: AtomicI32`
+in `cuda.rs`. `CudaBackend` snapshotted it into `kv_layout` at construction, yet the value came from
+the static (and `entry()`'s `kv_format` hook read the static directly), so a per-instance value would
+have been a half-wire: two engines loaded with different formats would still have run the
+last-loaded layout, and the loader had to *restate* the tag for `q8_0`
+(`models::load_model_configured`). The honest-scope sentence in `AGENTS.md` rule 11 said exactly
+this and is the caveat this ticket retires.
+
+**The one authority is now the engine's resolved format.** `KvFormat::resolve` takes the model dims
+and folds in the GPU's own auto policy (`auto_device_format`: f16 for the 7B class, f32 for small
+models; the CPU stays f32) — it used to live only in `cuda::set_kv_cache_type`, which is deleted
+along with `kv_cache_layout` / `kv_cache_is_f16` / `set_kv_cache_layout` / `set_kv_cache_f16`.
+`models::load_model_configured` stamps the one answer on the engine, and:
+
+- `CParams::kv_format` carries it into the builder (region width) and the reuse identity, as before;
+- `GraphAllocator::set_kv_format(format)` stamps the CPU backend **and**, if it exists, the CUDA
+  backend's tag (`cuda::layout_of(format)` → `KV_LAYOUT_F32/F16/Q8_0`);
+- `GraphAllocator::enable_cuda` builds a fresh `CudaBackend::with_layout(...)` from that stamp, so a
+  backend created after the stamp cannot revert to a default;
+- the registry's `kv_format` hook answers from `a.cuda().kv_format()`, so a KV session's header
+  element type is the engine's, and `server::batch`'s row-width snapshot reads
+  `GraphAllocator::kv_format` instead of the process static.
+
+The kernels already took the tag as a launcher argument (`gqa_attn_split`, the prefill/verify
+attention, `store_kv_f32/f16/q8_0`, `attn_bias_rope_store`); what was missing was that the value came
+from a global. `cuda::layout_of` / `format_of` are the only bindings between `KvFormat` and the FFI
+codes, and the layout tag is exhaustive over the enum.
+
+**The captured-graph identity carries the layout.** `CapturedGraph` gained a `kv_layout` field, and
+`graph_replay_step`'s lookup refuses an exec whose recorded tag no longer matches the backend's —
+it is destroyed and the 3-run warmup restarts, exactly like a `pool_gen` change. `set_kv_layout`
+invalidates eagerly on a change as the first line of defence. The enforcement point is
+`graph/cuda_backend.rs::graph_replay_step` (the `pool_gen` / `kv_layout` comparison), with the
+identity recorded in `close_capture_or_sync`.
+
+**The device gate.** `models::qwen2::graph::tests::two_cuda_engines_with_different_kv_layouts_run_interleaved`
+loads an `f32` engine and a `q8_0` engine **before either runs**, prefills and then decodes them
+interleaved on two live `GraphCache`s, and asserts four things: each cache's `CudaBackend::kv_layout`
+is the layout its engine named (and the two differ); the packed regions are ≥ 3x smaller; the packed
+engine's logits stay in the C4 class of the f32 engine's (at the argmax ≤ 1.0, tail ≤ 4.0); and each
+engine's interleaved logits are **bitwise** its own solo logits (isolation). Interleaved, not
+threaded: `CudaState` is a process-wide singleton and the capture path holds a process-wide stream
+lock, so two OS threads would serialize on that lock anyway — the form the ticket allows. A unit gate
+(`cuda_graph_recaptures_on_kv_layout_change`) pins the capture identity without the model, and
+`alloc::tests::set_kv_format_stamps_the_cuda_layout_per_engine` pins the stamp → backend path.
+
+**Measured** (GB10 sm_121, CUDA 13.0, 2026-09-26).
+
+- `scripts/cuda_test.sh`: **539 passed / 0 failed / 38 ignored** (was 536 / 0 / 37; #153 adds two
+  device unit gates and one pure `kvformat` gate, and moves the two `cuda::kv_dtype_tests` to the
+  `KvFormat` ↔ tag mapping they now assert).
+- `FEATURES=cuda scripts/real_model_gates.sh`: **38 passed / 0 failed** in both the 0.5B (f32 KV) and
+  the Qwen3-0.6B (f16 KV, `hd` 128) configurations (was 37 / 0; the new two-engine gate is
+  `#[ignore]`d).
+- The two-engine gate alone prints
+  `[153] two live CUDA engines, interleaved 8 decode steps: tags f32=0 q8_0=2; regions f32 6291456 B
+  vs q8_0 1671168 B (3.76x smaller); interleaved packed-vs-f32 max |Δlogit| = 2.479504 of a 37.821205
+  spread, at the argmax 0.59605026; interleaved-vs-solo drift 0 / 0`.
+- Full `cargo test --release --features cuda -- --ignored` (**integration targets included**, which is
+  what the ticket's acceptance line names): serial `--test-threads=1` is **green** — the 38-test bin
+  set plus the 6-test `conversation_cli` set, 0 failed. Parallel (default harness) is **still red**,
+  with fresh counts and a fresh reason (below).
+- `compute-sanitizer --tool memcheck --target-processes all` over the CUDA unit suite:
+  **0 API errors** (539 / 0 / 38).
+
+**The parallel `--ignored` answer (restated, not a shrug).** The parallel run remains the wrong
+command, and the reason is now measured rather than inherited: it is **not** the KV layout any more.
+Two runs of the same command:
+
+- run A: **33 passed / 5 failed**, failures `cuda_map_window_costs_no_more_than_the_span_it_replaces`
+  (a load-sensitive timing gate — its own per-round ratios ranged 0.63–2.20 with median 1.398x) and
+  `server_batch_matches_serial_and_is_faster` (the known [#154] timing gate), plus three
+  process-global-state failures: `conversation_real_model_smoke` with
+  `cudaErrorStreamCaptureInvalidated (901)` inside a capture window,
+  `async_cross_copies_never_block_and_stay_bitwise_identical` comparing the **process-wide**
+  `cuda::stream_sync_count()` (4160 async vs 728 sync across concurrent tests), and
+  `an_auto_offload_plan_fits_the_budget` mutating the **process-wide** `MINFER_GPU_MEM` env;
+- run B: **SIGSEGV (signal 11)** after two unrelated failures — the failure set is not stable.
+
+Every mechanism is the process-wide `CudaState` singleton (one stream, one capture window, one
+MMQ/pool state — issue [#64](https://github.com/yusiwen/minfer/issues/64)) and the process-wide
+counters/env a few gates read, not the KV format: the layout is per engine now, and no failure names
+a KV region or a layout mismatch. `scripts/cuda_test.sh` and
+`FEATURES=cuda scripts/real_model_gates.sh` keep the device set serial.
+
+[#154]: https://github.com/yusiwen/minfer/issues/154
+
+**Honest scope.** The CUDA tag is per engine; **Metal's `kv_cache_is_f16` is still process-wide** (its
+kernels read it, there is no Mac here to change it on — G5 for packed). The gate interleaves two
+engines in one process, which is the ticket's allowed form; it does not prove two *threads* can drive
+two CUDA engines concurrently, and the `compute-sanitizer` run is still the whole CUDA unit suite
+serially.
 
 #### E3 record (2026-09-22) — a prefill in chunks, and what runs between them
 

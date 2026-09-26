@@ -122,7 +122,7 @@ pub struct BackendEntry {
     // F5 (#58): the split boundary's two phases (§11).
     pub copy_cross:  fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<bool, String>,
     pub await_cross: fn(&mut GraphAllocator, u64, NodeId, Backend) -> Result<(), String>,
-    pub kv_format: fn() -> KvFormat,
+    pub kv_format: fn(&GraphAllocator) -> KvFormat,
     pub enable:    fn(&mut GraphAllocator) -> bool,
     pub unavailable: fn() -> Option<&'static str>,
 }
@@ -162,7 +162,7 @@ allocator never asks "is this the CPU?", it asks the entry.
 | `alloc.rs` pool ops (12) | `match backend { Backend::CPU => …, Metal => …, Cuda => … }` | `(entry.pool_mut)(self)` → trait method |
 | `alloc.rs` `supports_for` | hardcoded Metal-then-CUDA-then-CPU `if let` chain | `registry().by_priority()` + `entry.caps` |
 | `alloc.rs` `kv_load` enable | three-arm `match` with per-`cfg` fallbacks | `entry.enable` + `unavailable` |
-| `alloc.rs` `kv_element_format` | `match` with per-`cfg` fallbacks | `entry.kv_format` |
+| `alloc.rs` `kv_element_format` | `match` with per-`cfg` fallbacks | `entry.kv_format` (takes the allocator: the answer is the **engine's** resolved format, per #99/#153 — the CPU field and the CUDA backend's `kv_layout` — not a process global) |
 | `alloc.rs` `copy_cells_in_pool` | `match` + per-`cfg` strings | `entry.pool_mut` + registry-aware refusal |
 | `scheduler.rs` `execute` | `match split.backend { … }` | `alloc.pool_mut(split.backend)` |
 | `scheduler.rs` `read_host_buffer` | `match` | `entry.host_read` |
