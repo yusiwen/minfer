@@ -143,6 +143,12 @@ pub(crate) fn register_cuda_weight(
     shape: &[i64; 4],
     rank: usize,
 ) {
+    // #171: the weight registrar is a failure-injection chokepoint
+    // (`MINFER_TEST_CALL_FAIL=register_weight`) and an observable site. A `()`
+    // return leaves a panic as the only failure channel, so it uses the panic
+    // form.
+    crate::testfail::note_checked("register_weight");
+    crate::testfail::guard_panic("register_weight");
     let (id, od) = (shape[0] as usize, shape[1] as usize);
     let dsc_gates_on = crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
         && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")

@@ -3483,6 +3483,84 @@ mod tests {
         assert!(!engine.busy());
     }
 
+    /// #171 deliverable D: the seam replaces #151's bespoke mock, on the real path.
+    ///
+    /// The gate above needs [`FailingForward`], a test-local `ModelDef`, because a
+    /// failed batch forward has no other deterministic trigger. The
+    /// failure-injection seam makes that mock one environment variable: this gate
+    /// loads the **real** cached 0.5B, arms `MINFER_TEST_CALL_FAIL=forward_batch`
+    /// for the scope, and asserts the #151 contract still holds — exactly one
+    /// `500` to the run's own sender, the slot released, no retry — plus that the
+    /// chokepoint's observation counter proves the real forward entry was reached.
+    ///
+    /// Real-model gate (`#[ignore]`: CI has no cached GGUF). It is run serially
+    /// by `scripts/real_model_gates.sh`; the transcript lives in the #171 record
+    /// because CI cannot run it.
+    #[test]
+    #[ignore = "needs the cached 0.5B GGUF (CI has no model)"]
+    fn the_seam_fails_the_batch_forward_without_a_bespoke_mock() {
+        let Some(path) = cached_model() else {
+            eprintln!("[#171] no cached model; skipping");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let model = crate::models::load_model(&gguf).expect("load model");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+
+        // Arm the seam for exactly this scope; the guard restores the process
+        // value on drop, so a panicking gate cannot leave the switch on.
+        let _seam = crate::testfail::InjectionGuard::arm("forward_batch");
+        crate::testfail::reset_checked();
+
+        let mut engine = BatchEngine::new(&*model, 1, 64).expect("engine");
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(8);
+        // One committed token waiting for its decode forward — the state `tick`'s
+        // batch builder looks for, so no prefill is involved.
+        install_pending_run(&mut engine, 0, tx, 7);
+        assert_eq!(engine.running_slots(), 1);
+
+        let err = engine
+            .tick(&*model, &tok)
+            .expect_err("the injected forward failure must be reported");
+        assert_eq!(
+            err.status, 500,
+            "a step failure is a server error: {}",
+            err.message
+        );
+        assert_eq!(err.error_type, "server_error");
+
+        let (errs, finishes, texts, closed) = read_run_channel(&mut rx);
+        assert_eq!(errs.len(), 1, "exactly one error, and no retry");
+        assert_eq!(errs[0].status, 500, "{}", errs[0].message);
+        assert_eq!((finishes, texts), (0, 0), "a failed run emits neither");
+        assert!(closed, "the run's sender is dropped: the slot is released");
+        assert!(engine.slots[0].run.is_none(), "the slot must be free");
+        assert!(
+            engine.slots[0].cached_tokens.is_empty(),
+            "a half-written forward's prefix must not be reused"
+        );
+        assert!(!engine.busy());
+        assert_eq!(
+            crate::testfail::checked("forward_batch"),
+            1,
+            "the real batch-forward entry was reached exactly once before the seam fired"
+        );
+
+        // Disarm and prove the path is clean again: the next step is a no-op and
+        // the observation counter does not move.
+        drop(_seam);
+        crate::testfail::reset_checked();
+        engine
+            .tick(&*model, &tok)
+            .expect("nothing is pending, so the next step is a no-op");
+        assert_eq!(crate::testfail::checked("forward_batch"), 0);
+        eprintln!(
+            "[#171] forward_batch seam: one 500, slot released, no retry, \
+             {} observed forward entries",
+            1
+        );
+    }
+
     /// #158: the step budget for the real-model stepper loops below.
     ///
     /// A legitimate run does one decode forward and one sample per answer token,

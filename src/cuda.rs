@@ -1135,27 +1135,17 @@ pub fn graph_destroy_failure_message(err: i32) -> String {
     )
 }
 
-/// Issue #147 test injection: does `MINFER_TEST_CALL_FAIL` name `site`?
+/// Issue #147 test injection: the `MINFER_TEST_CALL_FAIL` query for `site`
+/// (test-only; unset in every default run, including the `compute-sanitizer`
+/// one).
 ///
-/// Pure on the variable's *value*, so the matcher is unit-tested without a
-/// device and without mutating the process environment. Token matching is
-/// exact — `all` for every site, otherwise one site token — which the C++
-/// helper `minfer_test_call_fails` implements identically. The knob drives a
-/// site's **real** call into failure (an over-limit attribute / dynamic-smem
-/// request, or `cudaGraphDestroy` on an exec), so "no latched error reaches
-/// `sync`" is a meaningful assertion rather than a synthetic-return tautology.
-pub fn injection_names_site(value: &str, site: &str) -> bool {
-    value.split(',').any(|t| {
-        let t = t.trim();
-        !t.is_empty() && (t == "all" || t == site)
-    })
-}
-
-/// The `MINFER_TEST_CALL_FAIL` query for `site` (test-only; unset in every
-/// default run, including the `compute-sanitizer` one).
+/// #171 absorbed the matcher into `crate::testfail::injection_names_site` — one
+/// matcher for the Rust chokepoints and the device-side `launch:*`/`attr:*`
+/// sites, with its exact-token tests in `src/testfail.rs` — so this is now a
+/// thin alias that keeps the #147 device gates' call site unchanged.
 #[allow(dead_code)] // read by the #147 device gates
 fn test_call_failure_requested(site: &str) -> bool {
-    std::env::var("MINFER_TEST_CALL_FAIL").map_or(false, |v| injection_names_site(&v, site))
+    crate::testfail::requested(site)
 }
 
 /// A small per-thread reentrant lock guarding model weight registration.
@@ -7624,43 +7614,10 @@ mod issue147_tests {
         assert!(msg.contains("issue #147"), "must carry the ticket: {msg}");
     }
 
-    /// The injection selector matches whole comma-separated tokens only: `all`
-    /// means every site, a site token means that site, and a near-miss is not a
-    /// match (a substring rule would let `attr:mmq` arm `attr:mmq_nt`). Pure.
-    #[test]
-    fn the_injection_matcher_matches_only_the_named_site() {
-        assert!(injection_names_site("all", "attr:mmq_nt"));
-        assert!(injection_names_site(
-            "destroy:graph_destroy",
-            "destroy:graph_destroy"
-        ));
-        assert!(!injection_names_site(
-            "destroy:graph_destroy",
-            "attr:mmq_nt"
-        ));
-        assert!(!injection_names_site("", "attr:mmq_nt"));
-        assert!(
-            !injection_names_site("small", "attr:mmq_nt"),
-            "'small' must not arm a site (no substring rule)"
-        );
-        assert!(
-            !injection_names_site("attr:mmq", "attr:mmq_nt"),
-            "a shorter token must not arm a longer site"
-        );
-        assert!(
-            !injection_names_site("attr:mmq_nt_extra", "attr:mmq_nt"),
-            "a longer token that merely contains the site must not arm it"
-        );
-        assert!(
-            !injection_names_site("destroy:graph_destroy_extra", "destroy:graph_destroy"),
-            "token matching is exact, not substring"
-        );
-        assert!(injection_names_site(
-            " launch:mmq_nt , destroy:graph_destroy ",
-            "launch:mmq_nt"
-        ));
-        assert!(injection_names_site("all", "launch:gemm_f16_f16"));
-    }
+    // The injection selector's exact-token matching moved to
+    // `testfail::tests::the_matcher_is_exact_and_comma_separated` (#171): one
+    // matcher, unit-tested on the CPU job as well. The device half keeps its
+    // own gates below.
 
     /// Every dynamic-smem opt-in site: the injected (real, over-limit) attribute
     /// call must be named with the API, the attribute, the instantiation and
