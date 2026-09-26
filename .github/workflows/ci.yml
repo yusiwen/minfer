@@ -24,6 +24,9 @@
 #                       and AGENTS.md's suite counts agree with docs/status.toml,
 #                       and `--selftest` runs the checker's own cases. The ancestry
 #                       test needs history, so this job fetches with `fetch-depth: 0`.
+#                       It also runs the source-level CUDA launch-return audit (#162):
+#                       every `<<<>>>` in src/cuda_kernels.cu must read its own error
+#                       and carry an injection lever, which needs no GPU.
 # 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
@@ -121,6 +124,18 @@ jobs:
         run: python3 scripts/check_status.py --check
       - name: The status checker's own pass/fail cases
         run: python3 scripts/check_status.py --selftest
+      # #162: every `<<<>>>` in src/cuda_kernels.cu must read its own launch
+      # error through minfer_launch_ok/_opt and carry a real-failure injection
+      # lever. A source audit needs no GPU, and the CUDA container's python3 is
+      # not guaranteed — this job's is. `--check-fixture` pins the site list the
+      # device gate `cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch`
+      # compares its driven set against, so a new site cannot slip in unlisted.
+      - name: Every CUDA launch site must read its own error
+        run: python3 scripts/check_cuda_launch_returns.py
+      - name: The CUDA launch audit's own pass/fail cases
+        run: python3 scripts/check_cuda_launch_returns.py --selftest
+      - name: The CUDA launch-site fixture must match the source
+        run: python3 scripts/check_cuda_launch_returns.py --check-fixture tests/fixtures/cuda_launch_sites.tsv
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands

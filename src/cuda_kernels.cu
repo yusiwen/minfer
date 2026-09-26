@@ -17,6 +17,37 @@
 #define Q6KB 210  // sizeof(BlockQ6_K)
 #define WARP 32
 
+// ─── #162: every `<<<>>>` reads its own launch error ─────────────────────────
+// The #147 checked-launch helpers are *defined* further down (next to the MMQ
+// launchers they were first written for), but every launch wrapper in this file
+// now uses them, and the first site (`launch_gqa_attn_split_batched_kv`) is a
+// `static` function defined well before that block. These are the C++-linkage
+// forward declarations; they live OUTSIDE any `extern "C" {` block so their
+// linkage matches the definitions.
+//
+//   minfer_launch_ok      — a REQUIRED launch: names the site and the kernel
+//                           instantiation, clears the latch it named, and records
+//                           a sticky failure that `CudaBackend::execute_node`
+//                           (ONE Rust-side check, not 65 signature changes)
+//                           turns into an `Err`, so no consumer ever reads a
+//                           stale output.
+//   minfer_launch_ok_opt  — a launch on a path with a DOCUMENTED fallback (the
+//                           MMQ fast paths, the fa-prefill smem fallback, and the
+//                           int-returning launchers whose Rust caller already
+//                           makes the decision): names the site, clears the
+//                           latch, and does NOT set the sticky.
+//   minfer_launch_block — the launch geometry with the #162 injection lever: at
+//                         an armed site the block dim becomes deliberately
+//                         illegal, so the launch fails for real with a real latch
+//                         (`cudaErrorInvalidValue`, probed on sm_121) and the
+//                         kernel never runs. Data, not 65 bespoke mechanisms.
+static void minfer_launch_prelude(const char* site, const char* kernel_name);
+static bool minfer_launch_ok(const char* site, const char* kernel_name);
+static bool minfer_launch_ok_opt(const char* site, const char* kernel_name);
+static size_t minfer_launch_smem(const char* site, size_t smem);
+static dim3 minfer_launch_block(const char* site, dim3 block);
+static dim3 minfer_launch_block(const char* site, unsigned block);
+
 // ─── Helper: warp-level sum reduction ─────────────────────────
 __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -3354,24 +3385,32 @@ static void launch_gqa_attn_split_batched_kv(
     // C4 S2b: instantiated for F32/F16 only — a packed cache routes to
     // `gqa_attn_f32` instead (see the dispatch cut in `cuda_backend.rs`).
     if (mode == ATTN_WIN_MAP) {
-        gqa_attn_split_partial_bt<LAYOUT, false, true><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_batched_kv__partial_map", "gqa_attn_split_partial_bt<LAYOUT,false,true>");
+        gqa_attn_split_partial_bt<LAYOUT, false, true><<<dim3(ATTN_SPLITS, n_head, nt), minfer_launch_block("launch:gqa_attn_split_batched_kv__partial_map", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, nt
         );
+        minfer_launch_ok("launch:gqa_attn_split_batched_kv__partial_map", "gqa_attn_split_partial_bt<LAYOUT,false,true>");
     } else if (mode == ATTN_WIN_SPAN) {
-        gqa_attn_split_partial_bt<LAYOUT, false, false><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_batched_kv__partial_span", "gqa_attn_split_partial_bt<LAYOUT,false,false>");
+        gqa_attn_split_partial_bt<LAYOUT, false, false><<<dim3(ATTN_SPLITS, n_head, nt), minfer_launch_block("launch:gqa_attn_split_batched_kv__partial_span", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, nt
         );
+        minfer_launch_ok("launch:gqa_attn_split_batched_kv__partial_span", "gqa_attn_split_partial_bt<LAYOUT,false,false>");
     } else {
-        gqa_attn_split_partial_bt<LAYOUT, true, false><<<dim3(ATTN_SPLITS, n_head, nt), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_batched_kv__partial_causal", "gqa_attn_split_partial_bt<LAYOUT,true,false>");
+        gqa_attn_split_partial_bt<LAYOUT, true, false><<<dim3(ATTN_SPLITS, n_head, nt), minfer_launch_block("launch:gqa_attn_split_batched_kv__partial_causal", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, nt
         );
+        minfer_launch_ok("launch:gqa_attn_split_batched_kv__partial_causal", "gqa_attn_split_partial_bt<LAYOUT,true,false>");
     }
-    gqa_attn_split_combine_bt<<<dim3(1, n_head, nt), hd, 0, stream>>>(
+    minfer_launch_prelude("launch:gqa_attn_split_batched_kv__combine", "gqa_attn_split_combine_bt");
+    gqa_attn_split_combine_bt<<<dim3(1, n_head, nt), minfer_launch_block("launch:gqa_attn_split_batched_kv__combine", hd), 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
+    minfer_launch_ok("launch:gqa_attn_split_batched_kv__combine", "gqa_attn_split_combine_bt");
 }
 
 extern "C" int launch_gqa_attn_split_batched_f16kv(
@@ -3764,12 +3803,9 @@ __global__ void gqa_attn_f32(
     }
 }
 
-// #141: the #147 checked-launch helpers are defined further down (with the MMQ
-// launchers), so the new f16 launchers need these C++-linkage forward
-// declarations. They must live OUTSIDE the `extern "C" {` block below so their
-// linkage matches the definitions.
-static void minfer_launch_prelude(const char* site, const char* kernel_name);
-static bool minfer_launch_ok(const char* site, const char* kernel_name);
+// #141/#162: the #147 checked-launch helpers are defined further down (with the
+// MMQ launchers); their C++-linkage forward declarations live at the top of this
+// file, before the first launch site.
 
 // ====================================================================
 // extern "C" launch wrappers (called from Rust via FFI)
@@ -3784,7 +3820,9 @@ void launch_q4_0_q8_0_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q4_0_q8_0_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_0_q8_0_matmul", "q4_0_q8_0_matmul");
+    q4_0_q8_0_matmul<<<grid, minfer_launch_block("launch:q4_0_q8_0_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q4_0_q8_0_matmul", "q4_0_q8_0_matmul");
 }
 
 void launch_q4_0_f32_matmul(
@@ -3794,7 +3832,9 @@ void launch_q4_0_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q4_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_0_f32_matmul", "q4_0_f32_matmul");
+    q4_0_f32_matmul<<<grid, minfer_launch_block("launch:q4_0_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q4_0_f32_matmul", "q4_0_f32_matmul");
 }
 
 void launch_q8_0_f32_matmul(
@@ -3804,7 +3844,9 @@ void launch_q8_0_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q8_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q8_0_f32_matmul", "q8_0_f32_matmul");
+    q8_0_f32_matmul<<<grid, minfer_launch_block("launch:q8_0_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q8_0_f32_matmul", "q8_0_f32_matmul");
 }
 
 void launch_q4_1_f32_matmul(
@@ -3814,7 +3856,9 @@ void launch_q4_1_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q4_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_1_f32_matmul", "q4_1_f32_matmul");
+    q4_1_f32_matmul<<<grid, minfer_launch_block("launch:q4_1_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q4_1_f32_matmul", "q4_1_f32_matmul");
 }
 
 void launch_q6_k_f32_matmul_padded(
@@ -3824,7 +3868,9 @@ void launch_q6_k_f32_matmul_padded(
     const int NR0 = 2, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
-    q6_k_f32_matmul_padded<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q6_k_f32_matmul_padded", "q6_k_f32_matmul_padded");
+    q6_k_f32_matmul_padded<<<grid, minfer_launch_block("launch:q6_k_f32_matmul_padded", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q6_k_f32_matmul_padded", "q6_k_f32_matmul_padded");
 }
 
 void launch_swiglu_f32_off(
@@ -3832,7 +3878,9 @@ void launch_swiglu_f32_off(
 ) {
     int block = 256;
     int grid = (n + block - 1) / block;
-    swiglu_f32_off<<<grid, block, 0, stream>>>(buf, n, off);
+    minfer_launch_prelude("launch:swiglu_f32_off", "swiglu_f32_off");
+    swiglu_f32_off<<<grid, minfer_launch_block("launch:swiglu_f32_off", block), 0, stream>>>(buf, n, off);
+    minfer_launch_ok("launch:swiglu_f32_off", "swiglu_f32_off");
 }
 
 
@@ -3844,7 +3892,9 @@ void launch_swiglu_quant_pad40(
 ) {
     int block = 256;
     int grid = (n + block - 1) / block;
-    swiglu_quant_pad40<<<grid, block, 0, stream>>>(buf, q8, n, off);
+    minfer_launch_prelude("launch:swiglu_quant_pad40", "swiglu_quant_pad40");
+    swiglu_quant_pad40<<<grid, minfer_launch_block("launch:swiglu_quant_pad40", block), 0, stream>>>(buf, q8, n, off);
+    minfer_launch_ok("launch:swiglu_quant_pad40", "swiglu_quant_pad40");
 }
 
 void launch_gather_rows_f32(
@@ -3855,7 +3905,9 @@ void launch_gather_rows_f32(
     int block = 256;
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    gather_rows_f32<<<(int)grid, block, 0, stream>>>(src, ids, out, n, nt);
+    minfer_launch_prelude("launch:gather_rows_f32", "gather_rows_f32");
+    gather_rows_f32<<<(int)grid, minfer_launch_block("launch:gather_rows_f32", block), 0, stream>>>(src, ids, out, n, nt);
+    minfer_launch_ok("launch:gather_rows_f32", "gather_rows_f32");
 }
 
 // Q5_1: one thread per 32-element block (24-byte blocks).
@@ -4009,14 +4061,46 @@ void launch_embed_rows(
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
     switch (type_id) {
-        case 0: embed_rows_q8_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 1: embed_rows_q4_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 2: embed_rows_q4_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 7: embed_rows_q4_1<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 4: embed_rows_q5_1<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 5: embed_rows_q5_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        case 6: embed_rows_q5_0<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt); break;
-        default: embed_rows_q6_k<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt, block_stride); break;
+        case 0:
+            minfer_launch_prelude("launch:embed_rows__q8_0", "embed_rows_q8_0");
+            embed_rows_q8_0<<<(int)grid, minfer_launch_block("launch:embed_rows__q8_0", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q8_0", "embed_rows_q8_0");
+            break;
+        case 1:
+            minfer_launch_prelude("launch:embed_rows__q4_0", "embed_rows_q4_0");
+            embed_rows_q4_0<<<(int)grid, minfer_launch_block("launch:embed_rows__q4_0", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q4_0", "embed_rows_q4_0");
+            break;
+        case 2:
+            minfer_launch_prelude("launch:embed_rows__q4_k", "embed_rows_q4_k");
+            embed_rows_q4_k<<<(int)grid, minfer_launch_block("launch:embed_rows__q4_k", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q4_k", "embed_rows_q4_k");
+            break;
+        case 7:
+            minfer_launch_prelude("launch:embed_rows__q4_1", "embed_rows_q4_1");
+            embed_rows_q4_1<<<(int)grid, minfer_launch_block("launch:embed_rows__q4_1", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q4_1", "embed_rows_q4_1");
+            break;
+        case 4:
+            minfer_launch_prelude("launch:embed_rows__q5_1", "embed_rows_q5_1");
+            embed_rows_q5_1<<<(int)grid, minfer_launch_block("launch:embed_rows__q5_1", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q5_1", "embed_rows_q5_1");
+            break;
+        case 5:
+            minfer_launch_prelude("launch:embed_rows__q5_k", "embed_rows_q5_k");
+            embed_rows_q5_k<<<(int)grid, minfer_launch_block("launch:embed_rows__q5_k", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q5_k", "embed_rows_q5_k");
+            break;
+        case 6:
+            minfer_launch_prelude("launch:embed_rows__q5_0", "embed_rows_q5_0");
+            embed_rows_q5_0<<<(int)grid, minfer_launch_block("launch:embed_rows__q5_0", block), 0, stream>>>(w, ids, out, n_embd, nt);
+            minfer_launch_ok("launch:embed_rows__q5_0", "embed_rows_q5_0");
+            break;
+        default:
+            minfer_launch_prelude("launch:embed_rows__q6_k", "embed_rows_q6_k");
+            embed_rows_q6_k<<<(int)grid, minfer_launch_block("launch:embed_rows__q6_k", block), 0, stream>>>(w, ids, out, n_embd, nt, block_stride);
+            minfer_launch_ok("launch:embed_rows__q6_k", "embed_rows_q6_k");
+            break;
     }
 }
 
@@ -4033,7 +4117,7 @@ int launch_embed_rows_f16(
     long long total = (long long)nt * n_embd;
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    embed_rows_f16<<<(int)grid, block, 0, stream>>>(w, ids, out, n_embd, nt);
+    embed_rows_f16<<<(int)grid, minfer_launch_block(site, block), 0, stream>>>(w, ids, out, n_embd, nt);
     return minfer_launch_ok(site, kn) ? 0 : 1;
 }
 
@@ -4043,13 +4127,17 @@ void launch_f32_f32_matmul(
 ) {
     if (id % 8 == 0) {
         dim3 grid((od + 7) / 8, 1), block(64);
-        f32_f32_matmul_vec<<<grid, block, 0, stream>>>(w, x, out, od, id, nt);
+        minfer_launch_prelude("launch:f32_f32_matmul__vec", "f32_f32_matmul_vec");
+        f32_f32_matmul_vec<<<grid, minfer_launch_block("launch:f32_f32_matmul__vec", block), 0, stream>>>(w, x, out, od, id, nt);
+        minfer_launch_ok("launch:f32_f32_matmul__vec", "f32_f32_matmul_vec");
     } else {
         long long total = (long long)nt * od;
         int block = 256;
         long long grid = (total + block - 1) / block;
         if (grid > 2147483647LL) grid = 2147483647LL;
-        f32_f32_matmul_scalar<<<(int)grid, block, 0, stream>>>(w, x, out, od, id, nt);
+        minfer_launch_prelude("launch:f32_f32_matmul__scalar", "f32_f32_matmul_scalar");
+        f32_f32_matmul_scalar<<<(int)grid, minfer_launch_block("launch:f32_f32_matmul__scalar", block), 0, stream>>>(w, x, out, od, id, nt);
+        minfer_launch_ok("launch:f32_f32_matmul__scalar", "f32_f32_matmul_scalar");
     }
 }
 
@@ -4073,7 +4161,7 @@ int launch_f16_f32_matmul(
         const char* kn = "f16_f32_matmul_vec";
         minfer_launch_prelude(site, kn);
         dim3 grid((od + 7) / 8, 1), block(64);
-        f16_f32_matmul_vec<<<grid, block, 0, stream>>>(wh, x, out, od, id, nt);
+        f16_f32_matmul_vec<<<grid, minfer_launch_block(site, block), 0, stream>>>(wh, x, out, od, id, nt);
         return minfer_launch_ok(site, kn) ? 0 : 1;
     }
     const char* site = "launch:f16_f32_matmul_scalar";
@@ -4083,7 +4171,7 @@ int launch_f16_f32_matmul(
     int block = 256;
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    f16_f32_matmul_scalar<<<(int)grid, block, 0, stream>>>(wh, x, out, od, id, nt);
+    f16_f32_matmul_scalar<<<(int)grid, minfer_launch_block(site, block), 0, stream>>>(wh, x, out, od, id, nt);
     return minfer_launch_ok(site, kn) ? 0 : 1;
 }
 
@@ -4094,7 +4182,9 @@ void launch_q4_k_f32_matmul(
     const int NR0 = 2, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
-    q4_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_k_f32_matmul", "q4_k_f32_matmul");
+    q4_k_f32_matmul<<<grid, minfer_launch_block("launch:q4_k_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q4_k_f32_matmul", "q4_k_f32_matmul");
 }
 
 void launch_quantize_q8_0_pad40(
@@ -4105,7 +4195,9 @@ void launch_quantize_q8_0_pad40(
     int block = 256;
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    quantize_q8_0_pad40<<<(int)grid, block, 0, stream>>>(x, y, dim, nt);
+    minfer_launch_prelude("launch:quantize_q8_0_pad40", "quantize_q8_0_pad40");
+    quantize_q8_0_pad40<<<(int)grid, minfer_launch_block("launch:quantize_q8_0_pad40", block), 0, stream>>>(x, y, dim, nt);
+    minfer_launch_ok("launch:quantize_q8_0_pad40", "quantize_q8_0_pad40");
 }
 
 void launch_quantize_q8_0_pad40_t(
@@ -4116,7 +4208,9 @@ void launch_quantize_q8_0_pad40_t(
     int block = 256;
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    quantize_q8_0_pad40_t<<<(int)grid, block, 0, stream>>>(x, yqs, ysda, dim, nt, nchunk, ntb);
+    minfer_launch_prelude("launch:quantize_q8_0_pad40_t", "quantize_q8_0_pad40_t");
+    quantize_q8_0_pad40_t<<<(int)grid, minfer_launch_block("launch:quantize_q8_0_pad40_t", block), 0, stream>>>(x, yqs, ysda, dim, nt, nchunk, ntb);
+    minfer_launch_ok("launch:quantize_q8_0_pad40_t", "quantize_q8_0_pad40_t");
 }
 
 void launch_q4_k_q8_mmvq(
@@ -4124,7 +4218,9 @@ void launch_q4_k_q8_mmvq(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q4_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_k_q8_mmvq", "q4_k_q8_mmvq");
+    q4_k_q8_mmvq<<<grid, minfer_launch_block("launch:q4_k_q8_mmvq", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_k_q8_mmvq", "q4_k_q8_mmvq");
 }
 
 void launch_q6_k_q8_mmvq(
@@ -4132,7 +4228,9 @@ void launch_q6_k_q8_mmvq(
     int od, int id, int nt, int blk_stride, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q6_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq", "q6_k_q8_mmvq");
+    q6_k_q8_mmvq<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq", 256), 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_ok("launch:q6_k_q8_mmvq", "q6_k_q8_mmvq");
 }
 
 void launch_q5_k_q8_mmvq(
@@ -4140,7 +4238,9 @@ void launch_q5_k_q8_mmvq(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q5_k_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_k_q8_mmvq", "q5_k_q8_mmvq");
+    q5_k_q8_mmvq<<<grid, minfer_launch_block("launch:q5_k_q8_mmvq", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q5_k_q8_mmvq", "q5_k_q8_mmvq");
 }
 
 // R2: weight-streaming rework (see the v2 kernel comments). Same signatures
@@ -4150,7 +4250,9 @@ void launch_q4_k_q8_mmvq_v2(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q4_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_k_q8_mmvq_v2", "q4_k_q8_mmvq_v2");
+    q4_k_q8_mmvq_v2<<<grid, minfer_launch_block("launch:q4_k_q8_mmvq_v2", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_k_q8_mmvq_v2", "q4_k_q8_mmvq_v2");
 }
 
 void launch_q6_k_q8_mmvq_v2_pf(
@@ -4158,7 +4260,9 @@ void launch_q6_k_q8_mmvq_v2_pf(
     int od, int id, int nt, int blk_stride, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q6_k_q8_mmvq_v2_pf<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_v2_pf", "q6_k_q8_mmvq_v2_pf");
+    q6_k_q8_mmvq_v2_pf<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_v2_pf", 256), 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_v2_pf", "q6_k_q8_mmvq_v2_pf");
 }
 
 void launch_q6_k_q8_mmvq_v2(
@@ -4166,7 +4270,9 @@ void launch_q6_k_q8_mmvq_v2(
     int od, int id, int nt, int blk_stride, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q6_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_v2", "q6_k_q8_mmvq_v2");
+    q6_k_q8_mmvq_v2<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_v2", 256), 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_v2", "q6_k_q8_mmvq_v2");
 }
 
 // D4-4 L1: dense split-plane (dpl) decode launchers — see the kernel comments.
@@ -4175,7 +4281,9 @@ void launch_q6_k_q8_mmvq_v2_pf_dpl(
     int od, int id, int nt, int nbe, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q6_k_q8_mmvq_v2_pf_dpl<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_v2_pf_dpl", "q6_k_q8_mmvq_v2_pf_dpl");
+    q6_k_q8_mmvq_v2_pf_dpl<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_v2_pf_dpl", 256), 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_v2_pf_dpl", "q6_k_q8_mmvq_v2_pf_dpl");
 }
 
 void launch_q6_k_q8_mmvq_v2_dpl(
@@ -4183,7 +4291,9 @@ void launch_q6_k_q8_mmvq_v2_dpl(
     int od, int id, int nt, int nbe, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q6_k_q8_mmvq_v2_dpl<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_v2_dpl", "q6_k_q8_mmvq_v2_dpl");
+    q6_k_q8_mmvq_v2_dpl<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_v2_dpl", 256), 0, stream>>>(weights, acts8, output, od, id, nt, nbe);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_v2_dpl", "q6_k_q8_mmvq_v2_dpl");
 }
 
 void launch_q5_k_q8_mmvq_v2(
@@ -4191,7 +4301,9 @@ void launch_q5_k_q8_mmvq_v2(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q5_k_q8_mmvq_v2<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_k_q8_mmvq_v2", "q5_k_q8_mmvq_v2");
+    q5_k_q8_mmvq_v2<<<grid, minfer_launch_block("launch:q5_k_q8_mmvq_v2", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q5_k_q8_mmvq_v2", "q5_k_q8_mmvq_v2");
 }
 
 void launch_q5_1_f32_matmul(
@@ -4201,7 +4313,9 @@ void launch_q5_1_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q5_1_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_1_f32_matmul", "q5_1_f32_matmul");
+    q5_1_f32_matmul<<<grid, minfer_launch_block("launch:q5_1_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q5_1_f32_matmul", "q5_1_f32_matmul");
 }
 
 void launch_q5_0_f32_matmul(
@@ -4211,7 +4325,9 @@ void launch_q5_0_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), 1, 1);
-    q5_0_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_0_f32_matmul", "q5_0_f32_matmul");
+    q5_0_f32_matmul<<<grid, minfer_launch_block("launch:q5_0_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q5_0_f32_matmul", "q5_0_f32_matmul");
 }
 
 void launch_q5_k_f32_matmul(
@@ -4221,7 +4337,9 @@ void launch_q5_k_f32_matmul(
     const int NR0 = 4, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
-    q5_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_k_f32_matmul", "q5_k_f32_matmul");
+    q5_k_f32_matmul<<<grid, minfer_launch_block("launch:q5_k_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q5_k_f32_matmul", "q5_k_f32_matmul");
 }
 
 void launch_q6_k_f32_matmul(
@@ -4231,7 +4349,9 @@ void launch_q6_k_f32_matmul(
     const int NR0 = 2, NSG = 2;
     dim3 block(64, 1, 1);
     dim3 grid((od + NR0 * NSG - 1) / (NR0 * NSG), nt, 1);
-    q6_k_f32_matmul<<<grid, block, 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_prelude("launch:q6_k_f32_matmul", "q6_k_f32_matmul");
+    q6_k_f32_matmul<<<grid, minfer_launch_block("launch:q6_k_f32_matmul", block), 0, stream>>>(weights, acts, output, od, id, nt);
+    minfer_launch_ok("launch:q6_k_f32_matmul", "q6_k_f32_matmul");
 }
 
 void launch_quantize_q8_0(
@@ -4242,7 +4362,9 @@ void launch_quantize_q8_0(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((total + block_sz - 1) / block_sz, 1, 1);
-    quantize_q8_0<<<grid, block, 0, stream>>>(x, y, dim, nt);
+    minfer_launch_prelude("launch:quantize_q8_0", "quantize_q8_0");
+    quantize_q8_0<<<grid, minfer_launch_block("launch:quantize_q8_0", block), 0, stream>>>(x, y, dim, nt);
+    minfer_launch_ok("launch:quantize_q8_0", "quantize_q8_0");
 }
 
 void launch_rms_norm_f32(
@@ -4251,7 +4373,9 @@ void launch_rms_norm_f32(
 ) {
     dim3 block(WARP, 1, 1);
     dim3 grid(n, 1, 1);
-    rms_norm_f32<<<grid, block, 0, stream>>>(x, w, y, d, eps, n);
+    minfer_launch_prelude("launch:rms_norm_f32", "rms_norm_f32");
+    rms_norm_f32<<<grid, minfer_launch_block("launch:rms_norm_f32", block), 0, stream>>>(x, w, y, d, eps, n);
+    minfer_launch_ok("launch:rms_norm_f32", "rms_norm_f32");
 }
 
 
@@ -4264,7 +4388,9 @@ void launch_rms_norm_quant_pad40(
     // blockDim.x-relative and bitwise-identical at either geometry; 128
     // threads cut the per-row write/quantize latency chains 4x (census:
     // 9.4 -> target ~4 us at hidden 5120, 94.6 launches/decode-step).
-    rms_norm_quant_pad40<<<n, 128, 0, stream>>>(x, w, y, q8, d, eps, n);
+    minfer_launch_prelude("launch:rms_norm_quant_pad40", "rms_norm_quant_pad40");
+    rms_norm_quant_pad40<<<n, minfer_launch_block("launch:rms_norm_quant_pad40", 128), 0, stream>>>(x, w, y, q8, d, eps, n);
+    minfer_launch_ok("launch:rms_norm_quant_pad40", "rms_norm_quant_pad40");
 }
 
 void launch_add_bias_f32(
@@ -4272,7 +4398,9 @@ void launch_add_bias_f32(
 ) {
     dim3 block(64, 1, 1); // 64 threads in x, grid y handles dim remainder
     dim3 grid(n, (d + 63) / 64, 1);
-    add_bias_f32<<<grid, block, 0, stream>>>(y, b, d);
+    minfer_launch_prelude("launch:add_bias_f32", "add_bias_f32");
+    add_bias_f32<<<grid, minfer_launch_block("launch:add_bias_f32", block), 0, stream>>>(y, b, d);
+    minfer_launch_ok("launch:add_bias_f32", "add_bias_f32");
 }
 
 void launch_add_f32(
@@ -4281,7 +4409,9 @@ void launch_add_f32(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    add_f32<<<grid, block, 0, stream>>>(x, y, z, n);
+    minfer_launch_prelude("launch:add_f32", "add_f32");
+    add_f32<<<grid, minfer_launch_block("launch:add_f32", block), 0, stream>>>(x, y, z, n);
+    minfer_launch_ok("launch:add_f32", "add_f32");
 }
 
 void launch_mul_f32(
@@ -4290,14 +4420,18 @@ void launch_mul_f32(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    mul_f32<<<grid, block, 0, stream>>>(x, y, z, n);
+    minfer_launch_prelude("launch:mul_f32", "mul_f32");
+    mul_f32<<<grid, minfer_launch_block("launch:mul_f32", block), 0, stream>>>(x, y, z, n);
+    minfer_launch_ok("launch:mul_f32", "mul_f32");
 }
 
 void launch_silu_f32(float* y, int n, cudaStream_t stream) {
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    silu_f32<<<grid, block, 0, stream>>>(y, n);
+    minfer_launch_prelude("launch:silu_f32", "silu_f32");
+    silu_f32<<<grid, minfer_launch_block("launch:silu_f32", block), 0, stream>>>(y, n);
+    minfer_launch_ok("launch:silu_f32", "silu_f32");
 }
 
 void launch_swiglu_f32(
@@ -4306,7 +4440,9 @@ void launch_swiglu_f32(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    swiglu_f32<<<grid, block, 0, stream>>>(gate, up, dst, n);
+    minfer_launch_prelude("launch:swiglu_f32", "swiglu_f32");
+    swiglu_f32<<<grid, minfer_launch_block("launch:swiglu_f32", block), 0, stream>>>(gate, up, dst, n);
+    minfer_launch_ok("launch:swiglu_f32", "swiglu_f32");
 }
 
 // r51: producer-fused rms_norm + pad40_t quantize (see the kernel comment).
@@ -4318,8 +4454,10 @@ void launch_rms_norm_quant_f32_t(
     int d, float eps, int n, int nchunk, int ntb, cudaStream_t stream
 ) {
     int grid = ntb * (MMQ_A_BLK / RMSQ_RPB);
-    rms_norm_quant_f32_t<<<grid, RMSQ_RPB * WARP, 0, stream>>>(
+    minfer_launch_prelude("launch:rms_norm_quant_f32_t", "rms_norm_quant_f32_t");
+    rms_norm_quant_f32_t<<<grid, minfer_launch_block("launch:rms_norm_quant_f32_t", RMSQ_RPB * WARP), 0, stream>>>(
         x, w, y, yqs, ysda, d, eps, n, nchunk, ntb);
+    minfer_launch_ok("launch:rms_norm_quant_f32_t", "rms_norm_quant_f32_t");
 }
 
 // r51: producer-fused swiglu + pad40_t quantize (see the kernel comment).
@@ -4328,8 +4466,10 @@ void launch_swiglu_quant_f32_t(
     uint8_t* yqs, uint8_t* ysda,
     int dim, int nt, int nchunk, int ntb, cudaStream_t stream
 ) {
-    swiglu_quant_f32_t<<<ntb * MMQ_A_BLK, 256, 0, stream>>>(
+    minfer_launch_prelude("launch:swiglu_quant_f32_t", "swiglu_quant_f32_t");
+    swiglu_quant_f32_t<<<ntb * MMQ_A_BLK, minfer_launch_block("launch:swiglu_quant_f32_t", 256), 0, stream>>>(
         gate, up, dst, yqs, ysda, dim, nt, nchunk, ntb);
+    minfer_launch_ok("launch:swiglu_quant_f32_t", "swiglu_quant_f32_t");
 }
 
 // r52: mode-2 launchers (no f32 output write; see the kernel comments). Grid
@@ -4340,8 +4480,10 @@ void launch_rms_norm_quant_nw_f32_t(
     int d, float eps, int n, int nchunk, int ntb, cudaStream_t stream
 ) {
     int grid = ntb * (MMQ_A_BLK / RMSQ_RPB);
-    rms_norm_quant_nw_f32_t<<<grid, RMSQ_RPB * WARP, 0, stream>>>(
+    minfer_launch_prelude("launch:rms_norm_quant_nw_f32_t", "rms_norm_quant_nw_f32_t");
+    rms_norm_quant_nw_f32_t<<<grid, minfer_launch_block("launch:rms_norm_quant_nw_f32_t", RMSQ_RPB * WARP), 0, stream>>>(
         x, w, yqs, ysda, d, eps, n, nchunk, ntb);
+    minfer_launch_ok("launch:rms_norm_quant_nw_f32_t", "rms_norm_quant_nw_f32_t");
 }
 
 void launch_swiglu_quant_nw_f32_t(
@@ -4349,8 +4491,10 @@ void launch_swiglu_quant_nw_f32_t(
     uint8_t* yqs, uint8_t* ysda,
     int dim, int nt, int nchunk, int ntb, cudaStream_t stream
 ) {
-    swiglu_quant_nw_f32_t<<<ntb * MMQ_A_BLK, 256, 0, stream>>>(
+    minfer_launch_prelude("launch:swiglu_quant_nw_f32_t", "swiglu_quant_nw_f32_t");
+    swiglu_quant_nw_f32_t<<<ntb * MMQ_A_BLK, minfer_launch_block("launch:swiglu_quant_nw_f32_t", 256), 0, stream>>>(
         gate, up, yqs, ysda, dim, nt, nchunk, ntb);
+    minfer_launch_ok("launch:swiglu_quant_nw_f32_t", "swiglu_quant_nw_f32_t");
 }
 
 void launch_f32_bits_to_i32(
@@ -4359,7 +4503,9 @@ void launch_f32_bits_to_i32(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    f32_bits_to_i32<<<grid, block, 0, stream>>>(src, dst, n);
+    minfer_launch_prelude("launch:f32_bits_to_i32", "f32_bits_to_i32");
+    f32_bits_to_i32<<<grid, minfer_launch_block("launch:f32_bits_to_i32", block), 0, stream>>>(src, dst, n);
+    minfer_launch_ok("launch:f32_bits_to_i32", "f32_bits_to_i32");
 }
 
 void launch_rope_f32(
@@ -4370,7 +4516,9 @@ void launch_rope_f32(
     int block_sz = 64; // threads per head dimension
     dim3 block(block_sz, 1, 1);
     dim3 grid(nt, n_head, 1);
-    rope_f32<<<grid, block, 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+    minfer_launch_prelude("launch:rope_f32", "rope_f32");
+    rope_f32<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+    minfer_launch_ok("launch:rope_f32", "rope_f32");
 }
 
 void launch_store_kv_f32(
@@ -4378,7 +4526,9 @@ void launch_store_kv_f32(
     const int* positions, cudaStream_t stream
 ) {
     dim3 grid(nt, nkt, 1);
-    store_kv_f32<<<grid, dim3(1, 1, 1), 0, stream>>>(src, dst, nkt, nt, positions);
+    minfer_launch_prelude("launch:store_kv_f32", "store_kv_f32");
+    store_kv_f32<<<grid, minfer_launch_block("launch:store_kv_f32", dim3(1, 1, 1)), 0, stream>>>(src, dst, nkt, nt, positions);
+    minfer_launch_ok("launch:store_kv_f32", "store_kv_f32");
 }
 
 void launch_store_kv_f16(
@@ -4387,7 +4537,9 @@ void launch_store_kv_f16(
 ) {
     dim3 block(128, 1, 1);
     dim3 grid(nt, (nkt / 4 + 127) / 128, 1);
-    store_kv_f16<<<grid, block, 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
+    minfer_launch_prelude("launch:store_kv_f16", "store_kv_f16");
+    store_kv_f16<<<grid, minfer_launch_block("launch:store_kv_f16", block), 0, stream>>>(src, (__half*)dst, nkt, nt, positions);
+    minfer_launch_ok("launch:store_kv_f16", "store_kv_f16");
 }
 
 // C4 S2b: the packed store. One thread per (row, 32-element block); `row_bytes`
@@ -4401,8 +4553,10 @@ void launch_store_kv_q8_0(
     const int nblk = nkt / Q8_0_BLOCK_ELEMS;
     dim3 block(64, 1, 1);
     dim3 grid(nt, (nblk + 63) / 64, 1);
-    store_kv_q8_0<<<grid, block, 0, stream>>>(
+    minfer_launch_prelude("launch:store_kv_q8_0", "store_kv_q8_0");
+    store_kv_q8_0<<<grid, minfer_launch_block("launch:store_kv_q8_0", block), 0, stream>>>(
         src, (unsigned char*)dst, nkt, nt, row_bytes, positions);
+    minfer_launch_ok("launch:store_kv_q8_0", "store_kv_q8_0");
 }
 
 // D3-8: fused decode QKV epilogue launcher — 256-thread blocks over the
@@ -4423,11 +4577,13 @@ void launch_attn_bias_rope_store(
     const int total = nqt / 2 + nkt / 2 + nkt;
     const int block = 256;
     const int grid = (total + block - 1) / block;
-    attn_bias_rope_store_f32<<<grid, block, 0, stream>>>(
+    minfer_launch_prelude("launch:attn_bias_rope_store", "attn_bias_rope_store_f32");
+    attn_bias_rope_store_f32<<<grid, minfer_launch_block("launch:attn_bias_rope_store", block), 0, stream>>>(
         q, k, v,
         (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
         (float*)kv_k, (float*)kv_v,
         nqt, nkt, hd, freq_base, freq_scale, positions, cells, kv_is_f16);
+    minfer_launch_ok("launch:attn_bias_rope_store", "attn_bias_rope_store_f32");
 }
 
 void launch_gqa_attn_f32_f16kv(
@@ -4443,19 +4599,25 @@ void launch_gqa_attn_f32_f16kv(
     // its pre-E1 instruction stream (E1b's rule, now three modes).
     switch (mode) {
         case ATTN_WIN_MAP:
-            gqa_attn_f32_f16kv<false, true><<<grid, block, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_f32_f16kv__map", "gqa_attn_f32_f16kv<false,true>");
+            gqa_attn_f32_f16kv<false, true><<<grid, minfer_launch_block("launch:gqa_attn_f32_f16kv__map", block), 0, stream>>>(
                 q, (__half*)k, (__half*)v, o, bound,
                 n_head, n_head_kv, hd, scale, nt);
+            minfer_launch_ok("launch:gqa_attn_f32_f16kv__map", "gqa_attn_f32_f16kv<false,true>");
             break;
         case ATTN_WIN_SPAN:
-            gqa_attn_f32_f16kv<false, false><<<grid, block, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_f32_f16kv__span", "gqa_attn_f32_f16kv<false,false>");
+            gqa_attn_f32_f16kv<false, false><<<grid, minfer_launch_block("launch:gqa_attn_f32_f16kv__span", block), 0, stream>>>(
                 q, (__half*)k, (__half*)v, o, bound,
                 n_head, n_head_kv, hd, scale, nt);
+            minfer_launch_ok("launch:gqa_attn_f32_f16kv__span", "gqa_attn_f32_f16kv<false,false>");
             break;
         default:
-            gqa_attn_f32_f16kv<true, false><<<grid, block, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_f32_f16kv__causal", "gqa_attn_f32_f16kv<true,false>");
+            gqa_attn_f32_f16kv<true, false><<<grid, minfer_launch_block("launch:gqa_attn_f32_f16kv__causal", block), 0, stream>>>(
                 q, (__half*)k, (__half*)v, o, bound,
                 n_head, n_head_kv, hd, scale, nt);
+            minfer_launch_ok("launch:gqa_attn_f32_f16kv__causal", "gqa_attn_f32_f16kv<true,false>");
             break;
     }
 }
@@ -4484,43 +4646,63 @@ void launch_gqa_attn_split_f16kv(
     // its single query, so the branch stays launch-wide for all three modes.
     if (hd == 128) {
         if (mode == ATTN_WIN_MAP) {
-            gqa_attn_split_partial<KV_LAYOUT_F16, false, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__map_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,false,true>");
+            gqa_attn_split_partial<KV_LAYOUT_F16, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__map_h4w", 32), 0, stream>>>(
                 q, k, v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, H4W_MIN_RPW);
-            gqa_attn_split_partial_hybrid<false, true><<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__map_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,false,true>");
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__hybrid_map", "gqa_attn_split_partial_hybrid<false,true>");
+            gqa_attn_split_partial_hybrid<false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__hybrid_map", H4W_NTHREADS), 0, stream>>>(
                 q, (const __half*)k, (const __half*)v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr);
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__hybrid_map", "gqa_attn_split_partial_hybrid<false,true>");
         } else if (mode == ATTN_WIN_SPAN) {
-            gqa_attn_split_partial<KV_LAYOUT_F16, false, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__span_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,false,false>");
+            gqa_attn_split_partial<KV_LAYOUT_F16, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__span_h4w", 32), 0, stream>>>(
                 q, k, v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, H4W_MIN_RPW);
-            gqa_attn_split_partial_hybrid<false, false><<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__span_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,false,false>");
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__hybrid_span", "gqa_attn_split_partial_hybrid<false,false>");
+            gqa_attn_split_partial_hybrid<false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__hybrid_span", H4W_NTHREADS), 0, stream>>>(
                 q, (const __half*)k, (const __half*)v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr);
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__hybrid_span", "gqa_attn_split_partial_hybrid<false,false>");
         } else {
-            gqa_attn_split_partial<KV_LAYOUT_F16, true, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__causal_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,true,false>");
+            gqa_attn_split_partial<KV_LAYOUT_F16, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__causal_h4w", 32), 0, stream>>>(
                 q, k, v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, H4W_MIN_RPW);
-            gqa_attn_split_partial_hybrid<true, false><<<dim3(ATTN_SPLITS, n_head), H4W_NTHREADS, 0, stream>>>(
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__causal_h4w", "gqa_attn_split_partial<KV_LAYOUT_F16,true,false>");
+            minfer_launch_prelude("launch:gqa_attn_split_f16kv__hybrid_causal", "gqa_attn_split_partial_hybrid<true,false>");
+            gqa_attn_split_partial_hybrid<true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__hybrid_causal", H4W_NTHREADS), 0, stream>>>(
                 q, (const __half*)k, (const __half*)v, partial, bound,
                 n_head, n_head_kv, hd, scale, pstr);
+            minfer_launch_ok("launch:gqa_attn_split_f16kv__hybrid_causal", "gqa_attn_split_partial_hybrid<true,false>");
         }
     } else if (mode == ATTN_WIN_MAP) {
-        gqa_attn_split_partial<KV_LAYOUT_F16, false, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f16kv__map", "gqa_attn_split_partial<KV_LAYOUT_F16,false,true>");
+        gqa_attn_split_partial<KV_LAYOUT_F16, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__map", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f16kv__map", "gqa_attn_split_partial<KV_LAYOUT_F16,false,true>");
     } else if (mode == ATTN_WIN_SPAN) {
-        gqa_attn_split_partial<KV_LAYOUT_F16, false, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f16kv__span", "gqa_attn_split_partial<KV_LAYOUT_F16,false,false>");
+        gqa_attn_split_partial<KV_LAYOUT_F16, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__span", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f16kv__span", "gqa_attn_split_partial<KV_LAYOUT_F16,false,false>");
     } else {
-        gqa_attn_split_partial<KV_LAYOUT_F16, true, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f16kv__causal", "gqa_attn_split_partial<KV_LAYOUT_F16,true,false>");
+        gqa_attn_split_partial<KV_LAYOUT_F16, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__causal", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 2, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f16kv__causal", "gqa_attn_split_partial<KV_LAYOUT_F16,true,false>");
     }
-    gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
+    minfer_launch_prelude("launch:gqa_attn_split_f16kv__combine", "gqa_attn_split_combine");
+    gqa_attn_split_combine<<<dim3(1, n_head), minfer_launch_block("launch:gqa_attn_split_f16kv__combine", hd), 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
+    minfer_launch_ok("launch:gqa_attn_split_f16kv__combine", "gqa_attn_split_combine");
 }
 
 void launch_gqa_attn_split_f32kv(
@@ -4530,21 +4712,29 @@ void launch_gqa_attn_split_f32kv(
     float scale, int pstr, cudaStream_t stream
 ) {
     if (mode == ATTN_WIN_MAP) {
-        gqa_attn_split_partial<KV_LAYOUT_F32, false, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f32kv__map", "gqa_attn_split_partial<KV_LAYOUT_F32,false,true>");
+        gqa_attn_split_partial<KV_LAYOUT_F32, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f32kv__map", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 4, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f32kv__map", "gqa_attn_split_partial<KV_LAYOUT_F32,false,true>");
     } else if (mode == ATTN_WIN_SPAN) {
-        gqa_attn_split_partial<KV_LAYOUT_F32, false, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f32kv__span", "gqa_attn_split_partial<KV_LAYOUT_F32,false,false>");
+        gqa_attn_split_partial<KV_LAYOUT_F32, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f32kv__span", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 4, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f32kv__span", "gqa_attn_split_partial<KV_LAYOUT_F32,false,false>");
     } else {
-        gqa_attn_split_partial<KV_LAYOUT_F32, true, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_f32kv__causal", "gqa_attn_split_partial<KV_LAYOUT_F32,true,false>");
+        gqa_attn_split_partial<KV_LAYOUT_F32, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_f32kv__causal", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, (size_t)n_head_kv * hd * 4, 0);
+        minfer_launch_ok("launch:gqa_attn_split_f32kv__causal", "gqa_attn_split_partial<KV_LAYOUT_F32,true,false>");
     }
-    gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
+    minfer_launch_prelude("launch:gqa_attn_split_f32kv__combine", "gqa_attn_split_combine");
+    gqa_attn_split_combine<<<dim3(1, n_head), minfer_launch_block("launch:gqa_attn_split_f32kv__combine", hd), 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
+    minfer_launch_ok("launch:gqa_attn_split_f32kv__combine", "gqa_attn_split_combine");
 }
 
 // C4 S2b: the packed decode path. One 1-warp split-K launch per window mode, with
@@ -4558,21 +4748,29 @@ void launch_gqa_attn_split_q8_0(
     float scale, int pstr, size_t row_bytes, cudaStream_t stream
 ) {
     if (mode == ATTN_WIN_MAP) {
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
+        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+        minfer_launch_ok("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
     } else if (mode == ATTN_WIN_SPAN) {
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
+        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+        minfer_launch_ok("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
     } else {
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false><<<dim3(ATTN_SPLITS, n_head), 32, 0, stream>>>(
+        minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
+        gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal", 32), 0, stream>>>(
             q, k, v, partial, bound,
             n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+        minfer_launch_ok("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
     }
-    gqa_attn_split_combine<<<dim3(1, n_head), hd, 0, stream>>>(
+    minfer_launch_prelude("launch:gqa_attn_split_q8_0__combine", "gqa_attn_split_combine");
+    gqa_attn_split_combine<<<dim3(1, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__combine", hd), 0, stream>>>(
         partial, o, n_head, hd, pstr
     );
+    minfer_launch_ok("launch:gqa_attn_split_q8_0__combine", "gqa_attn_split_combine");
 }
 
 // C4 S2b: the general nt > 1 kernel, now layout-tagged. `row_bytes` is the
@@ -4584,8 +4782,18 @@ void launch_gqa_attn_f32(
 ) {
     dim3 block(WARP, 1, 1); // 32 threads per block (1 warp)
     dim3 grid(nt, nh, 1);
+    // #162: one source site (`gqa_attn_f32`), nine instantiations. The kernel
+    // name is stringized from the macro arguments, so the report names the exact
+    // `gqa_attn_f32<layout,causal,map>` the dispatch picked. Required: the sticky
+    // makes `execute_node` return `Err` on a failed launch.
     #define GQA_F32_LAYOUT_CASE(L, C, M) \
-        gqa_attn_f32<L, C, M><<<grid, block, 0, stream>>>(q, k, v, o, bound, nh, nk, hd, scale, row_bytes, nt)
+        do { \
+            const char* const kn = "gqa_attn_f32<" #L "," #C "," #M ">"; \
+            minfer_launch_prelude("launch:gqa_attn_f32", kn); \
+            gqa_attn_f32<L, C, M><<<grid, minfer_launch_block("launch:gqa_attn_f32", block), 0, stream>>>( \
+                q, k, v, o, bound, nh, nk, hd, scale, row_bytes, nt); \
+            minfer_launch_ok("launch:gqa_attn_f32", kn); \
+        } while (0)
     switch (layout) {
         case KV_LAYOUT_F32:
             if (mode == ATTN_WIN_MAP) GQA_F32_LAYOUT_CASE(KV_LAYOUT_F32, false, true);
@@ -4957,7 +5165,7 @@ __global__ void fa_prefill_f16kv(
     }
 }
 
-// ─── #147: read a gating return value where the call is made ─────────────────
+// ─── #147/#162: read a gating return value where the call is made ───────────
 // Follow-on to #145 (docs/GPU_SAFETY.md rules 4-5). A discarded
 // `cudaFuncSetAttribute` return, a `<<<>>>` launch whose error is only seen by a
 // *later* `cudaGetLastError()` (attribution by position), and an unchecked
@@ -4978,11 +5186,22 @@ __global__ void fa_prefill_f16kv(
 //   * return false → the caller REFUSES the launch instead of launching into a
 //     checked error.
 //
-// The last report is also kept in statics (`minfer_site_fail_*`), so the
-// `issue147_tests` device gates can assert the site, the requested value and the
-// error *name* — a gate that only asserts "a message appeared" cannot see a
-// message that names the wrong call. Serial device runs only, like `CudaState`
-// itself.
+// #162 extended that pattern from the gating sites to **every** `<<<>>>` in this
+// file, and split the answer in two: `minfer_launch_ok` is a REQUIRED launch and
+// also records a sticky failure that `CudaBackend::execute_node` — one Rust-side
+// check, not 65 signature changes — turns into an `Err`, while
+// `minfer_launch_ok_opt` names and clears for a path with a DOCUMENTED fallback
+// (the MMQ fast paths, the fa-prefill smem fallback, the int-returning launchers
+// whose Rust caller already decides). `minfer_launch_block` is the injection
+// lever every ordinary site shares. `scripts/check_cuda_launch_returns.py` audits
+// the source, the `issue162_tests` device gates drive each audited site.
+//
+// The last report is also kept in statics (`minfer_site_fail_*`) and the ordered
+// history (`minfer_site_hist_*`), so the `issue147_tests` / `issue162_tests`
+// device gates can assert the site, the requested value, the kernel
+// instantiation and the error *name* — a gate that only asserts "a message
+// appeared" cannot see a message that names the wrong call. Serial device runs
+// only, like `CudaState` itself.
 #define MINFER_SITE_MSG_MAX 640
 
 // 0 = none, 1 = dynamic-smem attribute, 2 = kernel launch, 3 = a latched error
@@ -4995,12 +5214,32 @@ enum {
 };
 
 static char g_site_msg[MINFER_SITE_MSG_MAX];
-static char g_site_name[48];
+static char g_site_name[96];
 static int g_site_fail_count = 0;
 static int g_site_last_kind = MINFER_SITE_NONE;
 static int g_site_last_code = 0;
 static int g_site_last_bytes = 0;
 static int g_site_last_limit = 0;
+
+// ─── #162: the sticky required-launch failure ────────────────────────────────
+// A `<<<>>>` in a launcher whose output nothing else recomputes must not let the
+// op proceed: `minfer_launch_ok` records the failure here, and
+// `CudaBackend::execute_node` — ONE Rust-side check, not one per launcher —
+// drains it and returns `Err` naming the site. `minfer_launch_ok_opt` (a
+// documented fallback) deliberately does not set it. Serial device runs only.
+static int g_launch_fail_pending = 0;
+static char g_launch_fail_site[96];
+static char g_launch_fail_name[80];
+static int g_launch_fail_code = 0;
+
+// Every launch failure named at a site, in order, so the #162 gate can assert
+// that a driven dispatch reached *this* site (the report's single "last" slot
+// cannot see a second launch in the same call).
+#define MINFER_SITE_HIST_MAX 1024
+static char g_site_hist_site[MINFER_SITE_HIST_MAX][96];
+static char g_site_hist_name[MINFER_SITE_HIST_MAX][96];
+static char g_site_hist_msg[MINFER_SITE_HIST_MAX][256];
+static int g_site_hist_len = 0;
 
 extern "C" int minfer_site_fail_count(void) { return g_site_fail_count; }
 extern "C" int minfer_site_fail_kind(void) { return g_site_last_kind; }
@@ -5009,6 +5248,37 @@ extern "C" int minfer_site_fail_bytes(void) { return g_site_last_bytes; }
 extern "C" int minfer_site_fail_limit(void) { return g_site_last_limit; }
 extern "C" const char* minfer_site_fail_site(void) { return g_site_name; }
 extern "C" const char* minfer_site_fail_message(void) { return g_site_msg; }
+extern "C" int minfer_launch_fail_pending(void) { return g_launch_fail_pending; }
+extern "C" const char* minfer_launch_fail_site(void) { return g_launch_fail_site; }
+extern "C" const char* minfer_launch_fail_name(void) { return g_launch_fail_name; }
+extern "C" int minfer_launch_fail_code(void) { return g_launch_fail_code; }
+extern "C" void minfer_launch_fail_clear(void) {
+    g_launch_fail_pending = 0;
+    g_launch_fail_site[0] = '\0';
+    g_launch_fail_name[0] = '\0';
+    g_launch_fail_code = 0;
+}
+extern "C" int minfer_site_hist_len(void) { return g_site_hist_len; }
+extern "C" const char* minfer_site_hist_site(int i) {
+    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_site[i] : "";
+}
+extern "C" const char* minfer_site_hist_name(int i) {
+    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_name[i] : "";
+}
+extern "C" const char* minfer_site_hist_msg(int i) {
+    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_msg[i] : "";
+}
+extern "C" void minfer_site_hist_reset(void) { g_site_hist_len = 0; }
+
+// Called *after* `minfer_site_report`, so the entry carries the message the site
+// printed (the gate asserts the full text, not just the site token).
+static void minfer_site_history_add(const char* site, const char* name) {
+    if (g_site_hist_len >= MINFER_SITE_HIST_MAX) return;
+    snprintf(g_site_hist_site[g_site_hist_len], sizeof(g_site_hist_site[0]), "%s", site);
+    snprintf(g_site_hist_name[g_site_hist_len], sizeof(g_site_hist_name[0]), "%s", name);
+    snprintf(g_site_hist_msg[g_site_hist_len], sizeof(g_site_hist_msg[0]), "%s", g_site_msg);
+    g_site_hist_len++;
+}
 
 // Start a fresh observation: the device gates assert one failure at a time.
 extern "C" void minfer_site_fail_reset(void) {
@@ -5019,6 +5289,8 @@ extern "C" void minfer_site_fail_reset(void) {
     g_site_last_limit = 0;
     g_site_name[0] = '\0';
     g_site_msg[0] = '\0';
+    minfer_launch_fail_clear();
+    minfer_site_hist_reset();
 }
 
 static void minfer_site_report(const char* site, int kind, int code, int bytes, int limit,
@@ -5146,17 +5418,48 @@ static size_t minfer_launch_smem(const char* site, size_t smem) {
     return minfer_test_call_fails(site) ? smem + (16u << 20) : smem;
 }
 
+// #162: the launch geometry, the injection lever every site shares. When the test
+// knob names the site the block becomes 4096 threads (over the 1024/block device
+// limit), so `<<<>>>` itself returns cudaErrorInvalidValue for real and the
+// kernel never runs — probed on GB10/sm_121. A thread-count lever (rather than a
+// dynamic-smem one) works for every launcher, including those with no dynamic
+// smem: adding a site's coverage is data, not another bespoke mechanism.
+#define MINFER_ILLEGAL_BLOCK 4096u
+static dim3 minfer_launch_block(const char* site, dim3 block) {
+    return minfer_test_call_fails(site) ? dim3(MINFER_ILLEGAL_BLOCK, 1, 1) : block;
+}
+static dim3 minfer_launch_block(const char* site, unsigned block) {
+    return minfer_test_call_fails(site) ? dim3(MINFER_ILLEGAL_BLOCK, 1, 1)
+                                        : dim3(block, 1, 1);
+}
+
 // The error of the launch just issued: a `<<<>>>` has no return value, and the
 // immediately-following cudaGetLastError is the documented *launch* check
-// (nothing runs in between).
-static bool minfer_launch_ok(const char* site, const char* kernel_name) {
+// (nothing runs in between). `required` selects the severity: a required launch
+// also records the sticky that `CudaBackend::execute_node` turns into an `Err`,
+// while an `_opt` site (a documented fallback) only names and clears.
+static bool minfer_launch_read(const char* site, const char* kernel_name, bool required) {
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) return true;
     minfer_site_report(site, MINFER_SITE_LAUNCH, (int)e, 0, 0,
-                       "kernel launch %s failed: %s (%d) — the launch is refused (#147/%s)",
+                       "kernel launch %s failed: %s (%d) — the launch is refused (#162/%s)",
                        kernel_name, cudaGetErrorName(e), (int)e, site);
+    minfer_site_history_add(site, kernel_name);
     cudaGetLastError();  // this site owns the error
+    if (required) {
+        g_launch_fail_pending = 1;
+        g_launch_fail_code = (int)e;
+        snprintf(g_launch_fail_site, sizeof(g_launch_fail_site), "%s", site);
+        snprintf(g_launch_fail_name, sizeof(g_launch_fail_name), "%s", kernel_name);
+    }
     return false;
+}
+
+static bool minfer_launch_ok(const char* site, const char* kernel_name) {
+    return minfer_launch_read(site, kernel_name, true);
+}
+static bool minfer_launch_ok_opt(const char* site, const char* kernel_name) {
+    return minfer_launch_read(site, kernel_name, false);
 }
 
 extern "C" {
@@ -5200,17 +5503,27 @@ int launch_fa_prefill_f16kv(
         attr_smem = smem;
     }
     dim3 grid((nt + FA_TQ - 1) / FA_TQ, nh, 1);
+    // #162: a failed launch here is a DOCUMENTED fallback, not a sticky error —
+    // the Rust caller falls back to the legacy per-token attention kernel when
+    // this returns non-zero (the `-1` smem arm above is the same contract).
+    bool launched;
     if (mode == ATTN_WIN_MAP) {
-        fa_prefill_f16kv<false, true><<<grid, 128, smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+        minfer_launch_prelude("launch:fa_prefill_f16kv__map", "fa_prefill_f16kv<false,true>");
+        fa_prefill_f16kv<false, true><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
                                                                    scale, nt);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__map", "fa_prefill_f16kv<false,true>");
     } else if (mode == ATTN_WIN_SPAN) {
-        fa_prefill_f16kv<false, false><<<grid, 128, smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+        minfer_launch_prelude("launch:fa_prefill_f16kv__span", "fa_prefill_f16kv<false,false>");
+        fa_prefill_f16kv<false, false><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
                                                                     scale, nt);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__span", "fa_prefill_f16kv<false,false>");
     } else {
-        fa_prefill_f16kv<true, false><<<grid, 128, smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+        minfer_launch_prelude("launch:fa_prefill_f16kv__causal", "fa_prefill_f16kv<true,false>");
+        fa_prefill_f16kv<true, false><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
                                                                    scale, nt);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__causal", "fa_prefill_f16kv<true,false>");
     }
-    return 0;
+    return launched ? 0 : -1;
 }
 
 // ─── 8m: prefill dequant-to-f16 + wmma HGEMM ────────────────────────────
@@ -5957,14 +6270,46 @@ void launch_dequant_f16(
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
     switch (type_id) {
-        case 0: dequant_q8_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 1: dequant_q4_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 2: dequant_q4_1_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 3: dequant_q5_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 4: dequant_q5_1_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 5: dequant_q4_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 6: dequant_q5_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        default: dequant_q6_k_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id, block_stride); break;
+        case 0:
+            minfer_launch_prelude("launch:dequant_f16__q8_0", "dequant_q8_0_f16");
+            dequant_q8_0_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q8_0", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q8_0", "dequant_q8_0_f16");
+            break;
+        case 1:
+            minfer_launch_prelude("launch:dequant_f16__q4_0", "dequant_q4_0_f16");
+            dequant_q4_0_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q4_0", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q4_0", "dequant_q4_0_f16");
+            break;
+        case 2:
+            minfer_launch_prelude("launch:dequant_f16__q4_1", "dequant_q4_1_f16");
+            dequant_q4_1_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q4_1", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q4_1", "dequant_q4_1_f16");
+            break;
+        case 3:
+            minfer_launch_prelude("launch:dequant_f16__q5_0", "dequant_q5_0_f16");
+            dequant_q5_0_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q5_0", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q5_0", "dequant_q5_0_f16");
+            break;
+        case 4:
+            minfer_launch_prelude("launch:dequant_f16__q5_1", "dequant_q5_1_f16");
+            dequant_q5_1_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q5_1", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q5_1", "dequant_q5_1_f16");
+            break;
+        case 5:
+            minfer_launch_prelude("launch:dequant_f16__q4_k", "dequant_q4_k_f16");
+            dequant_q4_k_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q4_k", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q4_k", "dequant_q4_k_f16");
+            break;
+        case 6:
+            minfer_launch_prelude("launch:dequant_f16__q5_k", "dequant_q5_k_f16");
+            dequant_q5_k_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q5_k", block), 0, stream>>>(w, out, od, id);
+            minfer_launch_ok("launch:dequant_f16__q5_k", "dequant_q5_k_f16");
+            break;
+        default:
+            minfer_launch_prelude("launch:dequant_f16__q6_k", "dequant_q6_k_f16");
+            dequant_q6_k_f16<<<(int)grid, minfer_launch_block("launch:dequant_f16__q6_k", block), 0, stream>>>(w, out, od, id, block_stride);
+            minfer_launch_ok("launch:dequant_f16__q6_k", "dequant_q6_k_f16");
+            break;
     }
 }
 
@@ -5973,7 +6318,9 @@ void launch_convert_f16(
 ) {
     long long grid = (n / 8 + 255) / 256;
     if (grid > 2147483647LL) grid = 2147483647LL;
-    convert_f32_f16_kernel<<<(int)grid, 256, 0, stream>>>(x, out, n);
+    minfer_launch_prelude("launch:convert_f16", "convert_f32_f16_kernel");
+    convert_f32_f16_kernel<<<(int)grid, minfer_launch_block("launch:convert_f16", 256), 0, stream>>>(x, out, n);
+    minfer_launch_ok("launch:convert_f16", "convert_f32_f16_kernel");
 }
 
 // #147: returns 1 when the launch was issued and accepted, 0 when the
@@ -6340,7 +6687,9 @@ void launch_gemm_qb_nt(
     int nt, int od, int id, int type_id, int q6_stride, cudaStream_t stream
 ) {
     dim3 grid((nt + 63) / 64, (od + 63) / 64);
-    gemm_qb_nt_kernel<<<grid, 256, 0, stream>>>(a, w, c, nt, od, id, type_id, q6_stride);
+    minfer_launch_prelude("launch:gemm_qb_nt", "gemm_qb_nt_kernel");
+    gemm_qb_nt_kernel<<<grid, minfer_launch_block("launch:gemm_qb_nt", 256), 0, stream>>>(a, w, c, nt, od, id, type_id, q6_stride);
+    minfer_launch_ok("launch:gemm_qb_nt", "gemm_qb_nt_kernel");
 }
 
 } // extern "C"
@@ -8309,12 +8658,16 @@ extern "C" int launch_mmq_raw_nb_bt_nt(
                                          stream>>>(w, w_dsc, qa8g, sdag, c, nt, od, id, nchunk,
                                                    cpart, ks);
     }
-    if (!minfer_launch_ok("launch:mmq_raw_nb_bt", kname)) return 0;
+    if (!minfer_launch_ok_opt("launch:mmq_raw_nb_bt", kname)) return 0;
     if (ks > 1) {
         const int total = nt * od;
-        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        // #162: the reduce is a SEPARATE site token so the gate can arm it
+        // alone — arming the kernel's token refuses the launch and returns 0
+        // before this line, which would make the reduce site unreachable.
+        minfer_launch_prelude("launch:mmq_raw_nb_bt_ksplit", "mmq_ksplit_reduce_kernel");
+        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, minfer_launch_block("launch:mmq_raw_nb_bt_ksplit", 256), 0, stream>>>(
             cpart, c, total, ks);
-        if (!minfer_launch_ok("launch:mmq_raw_nb_bt", "mmq_ksplit_reduce_kernel")) return 0;
+        if (!minfer_launch_ok_opt("launch:mmq_raw_nb_bt_ksplit", "mmq_ksplit_reduce_kernel")) return 0;
     }
     return 1;
 }
@@ -8374,12 +8727,16 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
                                                stream>>>(w, w_exp, w_dsc, qa8g, sdag, c, nt, od, id,
                                                          nchunk, bstride, cpart, ks);
     }
-    if (!minfer_launch_ok("launch:mmq_raw_nb_bt_q6k", kname)) return 0;
+    if (!minfer_launch_ok_opt("launch:mmq_raw_nb_bt_q6k", kname)) return 0;
     if (ks > 1) {
         const int total = nt * od;
-        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        // #162: the reduce is a SEPARATE site token so the gate can arm it
+        // alone — arming the kernel's token refuses the launch and returns 0
+        // before this line, which would make the reduce site unreachable.
+        minfer_launch_prelude("launch:mmq_raw_nb_bt_q6k_ksplit", "mmq_ksplit_reduce_kernel");
+        mmq_ksplit_reduce_kernel<<<(total + 255) / 256, minfer_launch_block("launch:mmq_raw_nb_bt_q6k_ksplit", 256), 0, stream>>>(
             cpart, c, total, ks);
-        if (!minfer_launch_ok("launch:mmq_raw_nb_bt_q6k", "mmq_ksplit_reduce_kernel")) return 0;
+        if (!minfer_launch_ok_opt("launch:mmq_raw_nb_bt_q6k_ksplit", "mmq_ksplit_reduce_kernel")) return 0;
     }
     return 1;
 }
@@ -8463,7 +8820,7 @@ extern "C" int launch_mmq_raw_nb_nt(
     minfer_launch_prelude("launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>");
     mmq_raw_nb_kernel<8><<<grid, 256, minfer_launch_smem("launch:mmq_raw_nb", smem), stream>>>(
         w, q8, c, nt, od, id);
-    if (!minfer_launch_ok("launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>")) return 0;
+    if (!minfer_launch_ok_opt("launch:mmq_raw_nb", "mmq_raw_nb_kernel<8>")) return 0;
     return 1;
 }
 
@@ -8490,7 +8847,7 @@ extern "C" int launch_mmq_raw_wide_nt(
         mmq_raw_wide_nt_kernel<4><<<grid, 256,
                                     minfer_launch_smem("launch:mmq_raw_wide_kd4", smem),
                                     stream>>>(w, q8, c, nt, od, id);
-        if (!minfer_launch_ok("launch:mmq_raw_wide_kd4", kname)) return 0;
+        if (!minfer_launch_ok_opt("launch:mmq_raw_wide_kd4", kname)) return 0;
     } else {
         const int smem = 8 * MMQ_WBI * 32 + 8 * MMQ_WBI * 8
                        + 8 * MMQ_WBJ * MMQ_WBQ + 2 * 8 * MMQ_WBJ * 4;
@@ -8502,7 +8859,7 @@ extern "C" int launch_mmq_raw_wide_nt(
         mmq_raw_wide_nt_kernel<8><<<grid, 256,
                                     minfer_launch_smem("launch:mmq_raw_wide_kd8", smem),
                                     stream>>>(w, q8, c, nt, od, id);
-        if (!minfer_launch_ok("launch:mmq_raw_wide_kd8", kname)) return 0;
+        if (!minfer_launch_ok_opt("launch:mmq_raw_wide_kd8", kname)) return 0;
     }
     return 1;
 }
@@ -8994,7 +9351,9 @@ void launch_q4_k_q8_mmvq_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q4_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_k_q8_mmvq_multi", "q4_k_q8_mmvq_multi");
+    q4_k_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q4_k_q8_mmvq_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_k_q8_mmvq_multi", "q4_k_q8_mmvq_multi");
 }
 
 void launch_q4_k_q8_mmvq_v2_multi(
@@ -9002,7 +9361,9 @@ void launch_q4_k_q8_mmvq_v2_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q4_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_k_q8_mmvq_v2_multi", "q4_k_q8_mmvq_v2_multi");
+    q4_k_q8_mmvq_v2_multi<<<grid, minfer_launch_block("launch:q4_k_q8_mmvq_v2_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_k_q8_mmvq_v2_multi", "q4_k_q8_mmvq_v2_multi");
 }
 
 void launch_q5_k_q8_mmvq_multi(
@@ -9010,7 +9371,9 @@ void launch_q5_k_q8_mmvq_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q5_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_k_q8_mmvq_multi", "q5_k_q8_mmvq_multi");
+    q5_k_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q5_k_q8_mmvq_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q5_k_q8_mmvq_multi", "q5_k_q8_mmvq_multi");
 }
 
 void launch_q5_k_q8_mmvq_v2_multi(
@@ -9018,7 +9381,9 @@ void launch_q5_k_q8_mmvq_v2_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q5_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q5_k_q8_mmvq_v2_multi", "q5_k_q8_mmvq_v2_multi");
+    q5_k_q8_mmvq_v2_multi<<<grid, minfer_launch_block("launch:q5_k_q8_mmvq_v2_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q5_k_q8_mmvq_v2_multi", "q5_k_q8_mmvq_v2_multi");
 }
 
 void launch_q6_k_q8_mmvq_multi(
@@ -9026,7 +9391,9 @@ void launch_q6_k_q8_mmvq_multi(
     int od, int id, int nt, int blk_stride, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q6_k_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_multi", "q6_k_q8_mmvq_multi");
+    q6_k_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_multi", "q6_k_q8_mmvq_multi");
 }
 
 void launch_q6_k_q8_mmvq_v2_multi(
@@ -9034,7 +9401,9 @@ void launch_q6_k_q8_mmvq_v2_multi(
     int od, int id, int nt, int blk_stride, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q6_k_q8_mmvq_v2_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_prelude("launch:q6_k_q8_mmvq_v2_multi", "q6_k_q8_mmvq_v2_multi");
+    q6_k_q8_mmvq_v2_multi<<<grid, minfer_launch_block("launch:q6_k_q8_mmvq_v2_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt, blk_stride);
+    minfer_launch_ok("launch:q6_k_q8_mmvq_v2_multi", "q6_k_q8_mmvq_v2_multi");
 }
 } // extern "C"
 
@@ -9212,7 +9581,9 @@ extern "C" void launch_q4_0_q8_mmvq(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q4_0_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_0_q8_mmvq", "q4_0_q8_mmvq");
+    q4_0_q8_mmvq<<<grid, minfer_launch_block("launch:q4_0_q8_mmvq", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_0_q8_mmvq", "q4_0_q8_mmvq");
 }
 
 extern "C" void launch_q4_0_q8_mmvq_multi(
@@ -9220,7 +9591,9 @@ extern "C" void launch_q4_0_q8_mmvq_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q4_0_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q4_0_q8_mmvq_multi", "q4_0_q8_mmvq_multi");
+    q4_0_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q4_0_q8_mmvq_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q4_0_q8_mmvq_multi", "q4_0_q8_mmvq_multi");
 }
 
 extern "C" void launch_q8_0_q8_mmvq(
@@ -9228,7 +9601,9 @@ extern "C" void launch_q8_0_q8_mmvq(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q8_0_q8_mmvq<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q8_0_q8_mmvq", "q8_0_q8_mmvq");
+    q8_0_q8_mmvq<<<grid, minfer_launch_block("launch:q8_0_q8_mmvq", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q8_0_q8_mmvq", "q8_0_q8_mmvq");
 }
 
 extern "C" void launch_q8_0_q8_mmvq_multi(
@@ -9236,7 +9611,9 @@ extern "C" void launch_q8_0_q8_mmvq_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q8_0_q8_mmvq_multi<<<grid, 256, 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q8_0_q8_mmvq_multi", "q8_0_q8_mmvq_multi");
+    q8_0_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q8_0_q8_mmvq_multi", 256), 0, stream>>>(weights, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q8_0_q8_mmvq_multi", "q8_0_q8_mmvq_multi");
 }
 
 // === doc 104: q8_0 p32 split-plane decode MMVQ ============================
@@ -9336,7 +9713,9 @@ extern "C" void launch_q8_0_p32_q8_mmvq(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, nt);
-    q8_0_p32_q8_mmvq<<<grid, 256, 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q8_0_p32_q8_mmvq", "q8_0_p32_q8_mmvq");
+    q8_0_p32_q8_mmvq<<<grid, minfer_launch_block("launch:q8_0_p32_q8_mmvq", 256), 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q8_0_p32_q8_mmvq", "q8_0_p32_q8_mmvq");
 }
 
 extern "C" void launch_q8_0_p32_q8_mmvq_multi(
@@ -9344,7 +9723,9 @@ extern "C" void launch_q8_0_p32_q8_mmvq_multi(
     int od, int id, int nt, cudaStream_t stream
 ) {
     dim3 grid(od, 1);
-    q8_0_p32_q8_mmvq_multi<<<grid, 256, 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+    minfer_launch_prelude("launch:q8_0_p32_q8_mmvq_multi", "q8_0_p32_q8_mmvq_multi");
+    q8_0_p32_q8_mmvq_multi<<<grid, minfer_launch_block("launch:q8_0_p32_q8_mmvq_multi", 256), 0, stream>>>(planeP, planeD, acts8, output, od, id, nt);
+    minfer_launch_ok("launch:q8_0_p32_q8_mmvq_multi", "q8_0_p32_q8_mmvq_multi");
 }
 
 // ─── C3/C7b: move KV rows within one arena (arena compaction) ───────────────
@@ -9375,8 +9756,10 @@ __global__ void kv_move_rows(
     }
 }
 
-// Returns 0 on success, non-zero when the contract is violated (the caller turns
-// that into an `Err`, never a silent no-op).
+// Returns 0 on success, non-zero when the contract is violated or the launch
+// itself failed (the caller turns that into an `Err`, never a silent no-op).
+// A documented `_opt` site (#162): the int return is the decision, so the launch
+// failure is named at the site and cleared, and no sticky is set.
 extern "C" int launch_kv_move_rows(
     float* dst, const float* src,
     int dst_row, int src_row, int rows, int elems,
@@ -9384,6 +9767,7 @@ extern "C" int launch_kv_move_rows(
 ) {
     if (rows <= 0 || elems <= 0) return 0;
     if (dst_row < 0 || src_row < 0) return 1;
-    kv_move_rows<<<1, 256, 0, stream>>>(dst, src, dst_row, src_row, rows, elems);
-    return (int)(cudaGetLastError() != cudaSuccess);
+    minfer_launch_prelude("launch:kv_move_rows", "kv_move_rows");
+    kv_move_rows<<<1, minfer_launch_block("launch:kv_move_rows", 256), 0, stream>>>(dst, src, dst_row, src_row, rows, elems);
+    return minfer_launch_ok_opt("launch:kv_move_rows", "kv_move_rows") ? 0 : 1;
 }

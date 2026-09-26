@@ -1915,8 +1915,30 @@ impl Backend for CudaBackend {
         out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
-        match self.execute_node_inner(node, in_bufs, out_buf, kv_pair) {
-            Ok(()) => Ok(()),
+        let result = self.execute_node_inner(node, in_bufs, out_buf, kv_pair);
+        // #162: drain the sticky required-launch record in BOTH arms. A launch
+        // that failed for real set it (the C site has already printed the site,
+        // the instantiation and `cudaGetErrorName`, and cleared the CUDA latch);
+        // a required kernel must not let the op proceed with a stale output, so
+        // the node fails here with the site's own message. Draining unconditionally
+        // keeps a stale record from being blamed on the *next* node, and on the
+        // `Err` arm the node's own error is the real one.
+        let launch = self.state.take_launch_failure();
+        match result {
+            Ok(()) => match launch {
+                Some(msg) => {
+                    let e = format!(
+                        "cuda: a required kernel launch failed in node {:?}: {msg} — the node \
+                         produced no valid output (issue #162)",
+                        node.op
+                    );
+                    if self.capturing.is_some() {
+                        self.abort_capture(&e);
+                    }
+                    Err(e)
+                }
+                None => Ok(()),
+            },
             Err(e) => {
                 // A node error during an open capture window dooms the window:
                 // the scheduler propagates before the boundary sync, so nothing
