@@ -301,7 +301,17 @@ fn session_save_load_round_trip() {
         1800,
     );
     assert_eq!(code2, 0, "stderr: {err2}");
-    assert!(err2.contains("[session] loaded"), "stderr: {err2}");
+    // C5 S2 added the KV companion: when `FILE.kv` matches the history, the resume
+    // path prints `[session] resumed ... (0 tokens prefilled)` and deliberately
+    // *skips* the `[session] loaded N message(s)` line. This assertion predates that
+    // change and only accepted the history-load path, so it went stale the moment
+    // the companion landed (found while running the full `cargo test --features cuda
+    // -- --ignored`, which includes this integration target). The property the test
+    // exists for is "run 2 continues the saved session", and either line is that.
+    assert!(
+        err2.contains("[session] resumed") || err2.contains("[session] loaded"),
+        "run 2 must continue the saved session (KV companion or history): {err2}"
+    );
     let stats = turn_stats(&err2);
     assert_eq!(stats.len(), 1, "run 2 continues with one more turn: {err2}");
 
