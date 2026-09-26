@@ -984,10 +984,22 @@ pub struct QuantizePlan {
 impl QuantizePlan {
     /// Plan re-encoding every tensor of `model` to `target`.
     ///
-    /// For a **quant** target, 1-D tensors (norms, biases) and tensors whose row
-    /// length is not a multiple of the target block size are **copied verbatim**
-    /// — that is llama.cpp's "except 1d tensors" rule, and it is reported, not
-    /// silent. For an f16/f32 target every tensor is converted.
+    /// llama.cpp's "except 1d tensors" rule, one statement per target:
+    ///
+    /// * **quant** — a 1-D tensor (norm, bias) and a tensor whose row length is
+    ///   not a multiple of the target block size are **copied verbatim**, i.e.
+    ///   keep their source type;
+    /// * **f16** — a 1-D tensor keeps its source type too
+    ///   (`tensor_allows_quantization` is false below 2 dims, and both
+    ///   `minfer convert --outtype f16` and `llama-quantize … F16` write those
+    ///   tensors as **f32**). Converting a 1-D norm to f16 would produce a file
+    ///   this engine cannot run: the CPU RMSNorm reads the weight through
+    ///   `Tensor::data_f32` (which asserts `F32`) and neither `mat_mul_f16` nor
+    ///   the f16 embedding decode has an f16-norm sibling (issue #169);
+    /// * **f32** — every tensor, 1-D included, becomes f32.
+    ///
+    /// The tensors left in their source type are reported through `preserved`,
+    /// never silent.
     ///
     /// A source tensor of a type this engine has no dequantizer for (the
     /// K-quants and I-quants) is a loud refusal: re-quantizing it would emit
@@ -997,7 +1009,6 @@ impl QuantizePlan {
         target: crate::quantize::QuantTarget,
     ) -> Result<Self, String> {
         use crate::quantize::QuantTarget as QT;
-        let is_quant = !matches!(target, QT::F16 | QT::F32);
         let bs = target.blck_size();
         // llama.cpp's tied-embedding policy: when `output.weight` is absent the
         // output projection *is* the token embedding, and for a sub-8-bit
@@ -1027,7 +1038,14 @@ impl QuantizePlan {
                     ));
                 }
                 let row_ok = ti.ne[0] % bs as i64 == 0;
-                let keep = is_quant && (ti.ne[1] <= 1 || !row_ok);
+                // The 1-D rule per target (see the `plan` doc comment): a 1-D
+                // tensor is preserved for the quant targets and for f16, and
+                // f32 converts everything.
+                let keep = match target {
+                    QT::F32 => false,
+                    QT::F16 => ti.ne[1] <= 1,
+                    _ => ti.ne[1] <= 1 || !row_ok,
+                };
                 if keep {
                     preserved_push(&mut preserved, ti);
                 }
