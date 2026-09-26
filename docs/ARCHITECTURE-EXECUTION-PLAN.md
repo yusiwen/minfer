@@ -5770,6 +5770,89 @@ would read f16 bytes as f32) — not device-verified because the CPU panic is re
 tooling gap is [#169](https://github.com/yusiwen/minfer/issues/169). (f) `minfer quantize
 --type f16` was left unchanged: fixing it is #169, out of this loader-focused ticket.
 
+### F6e — `quantize --type f16` keeps 1-D tensors f32, and the CUDA norm weight type gate (#169) — **DONE 2026-09-26**
+
+**What landed.** [#169](https://github.com/yusiwen/minfer/issues/169), the tooling gap F6d filed when
+its new "1-D stays f32" assertion rejected the model `minfer quantize --type f16` had just written.
+`QuantizePlan::plan` treated the f16 target as a pure element cast (`let keep = is_quant && (ne[1] <= 1
+|| !row_ok)`), so **every** tensor — the 1-D norms/biases included — was converted to f16. The
+engine's f16 weight path requires 1-D **f32**: the CPU RMSNorm reads the weight through
+`Tensor::data_f32`, which asserts `F32`, and neither `mat_mul_f16` nor the f16 embedding decode has
+an f16-norm sibling, so the tool could not run a file it had itself produced.
+
+The predicate is now one arm per target, matching llama.cpp's `tensor_allows_quantization` (which
+returns `tensor->type` for `ggml_n_dims < 2`): a **quant** target keeps its `1-D or unaligned-row`
+rule, **f16** keeps 1-D (both `minfer convert --outtype f16` and `llama-quantize … F16` write those
+tensors f32, and that is the contract the engine reads), and **f32** converts everything. The kept
+tensors are reported through the same `preserved` list; the CLI message now names the target's actual
+reason (`1-D` for f16, `1-D or row length not a multiple of N` for a quant target) instead of
+printing a block-size clause that is meaningless at f16's block size 1.
+
+The **latent CUDA hazard** the issue recorded is fixed and gated too. `CudaBackend::norm_weight` used
+to check only that the name was registered; it now compares the **registered byte length**
+(`CudaState::weight_size`, the same raw-length convention as `has_weight_of_size`) against the `d*4`
+bytes the rms_norm kernel indexes and returns `Err` naming both lengths. Without it an f16 norm would
+be launched into a `d*4`-byte read out of a `d*2` buffer — the "kernel-invariant violation is a
+refusal, never a silent wrong path" rule of `docs/GPU_SAFETY.md`, and the mutation below shows the
+read is a real invalid access, not a theoretical one.
+
+**Gates.** (1) `tooling::tests::quantize_f16_keeps_1d_f32_and_encodes_2d_f16` — CI-covered on a
+miniature f16-shaped source written by the real writer. Three arms (f16, f32, q8_0) assert the type
+of **every** tensor *as the written file declares it*, against a want computed from the source
+spec's rank (never from `plan`), and that a preserved 1-D tensor carries the source's own non-zero
+bytes; the f32 control differs in the property under test (its 2-D tensors must come back f32), so
+neither arm can carry the other. The preserved list is asserted against the source's 1-D set.
+(2) the ignored `f6_quantize_end_to_end_stays_within_the_stated_bound` gained an f16 arm on the real
+f16 file: 1-D f32 / 2-D f16 read back, the preserved count, and a **bitwise** f16→f16 logit
+equality (every source value is representable, so `assert_eq!` is the honest claim).
+(3) `graph::cuda_backend::tests::cuda_norm_weight_size_is_part_of_the_invariant` — the device gate:
+the same 64-element norm graph and `d`, two names both registered and both valid float4 dims, so the
+f32 arm (control) can only pass and the 2-byte-per-element arm can only fail through the length
+check; the refusal's text must name both lengths and "f16-norm".
+
+**Measured acceptance (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26).** The source is the
+cached `Qwen3-0.6B-Q8_0.gguf` (639 446 688 B); the reference is
+`llama-quantize --allow-requantize <src> /tmp/fix169/llama-f16.gguf F16`.
+
+| Criterion | Result |
+|---|---|
+| **Before** `minfer quantize --type f16` (the bug) | 1 198 050 976 B; **113 1-D F16** (`output_norm.weight` + `blk.*.{attn,ffn}_norm.weight` + `blk.*.attn_{q,k}_norm.weight`) and 197 2-D F16; loading panics at `src/tensor.rs:277` — `data_f32 on 'blk.0.attn_norm.weight' of type F16` |
+| **After** `minfer quantize --type f16` | 1 198 182 048 B; **113 1-D F32 + 197 2-D F16**; `sha256 6341ef3a7287cad1e42b5910cb3db4ee587ae2eff76f48f953fef63c00e26667`; **byte-identical** (`cmp`) to the `llama-quantize … F16` reference, same size |
+| per-tensor type set vs `llama-quantize … F16` | **310 / 310 agree** on (name → type), and every `ne` shape too |
+| `minfer quantize --type f32` | **310 / 310 F32** (2 390 150 816 B), no preserved list |
+| the f16 file on **CPU** (`--backend cpu`, greedy, 13-token prompt) | runs; prefill 13 tokens in 0.10 s, 16 generated tokens in 1.11 s; text `<think>\nOkay, the user asked for the capital of France. Let me think` |
+| the f16 file on **CUDA** (default backend) | `all 28 blocks + embed/output on cuda (1137.0 MiB of device weights)`; same 16-token greedy text; prefill in 0.09 s, 16 tokens in 0.22 s |
+| CPU-vs-CUDA logits (`MINFER_GRAPH_DUMP`) | argmax **equal** at prefill / decode_13 / decode_14; max \|Δlogit\| **0.0178 / 0.0169 / 0.0132** (6.0e-4 / 4.9e-4 / 4.8e-4 relative) |
+| CPU `cargo test --release` | **457 passed / 0 failed / 33 ignored** unit (baseline 456 / 0 / 33; +1 gate) + **10 / 0 / 6** integration |
+| `PARALLEL=0 scripts/real_model_gates.sh` and the default parallel form | **33 / 0** each |
+| `cargo test --release --features cuda -- --test-threads=1` | **526 passed / 0 failed / 37 ignored** (baseline 524 / 0 / 37; +1 CI gate +1 device gate) |
+| `FEATURES=cuda scripts/real_model_gates.sh` | **37 / 0** at the 0.5B config and **37 / 0** at the Qwen3-0.6B config |
+| `compute-sanitizer --tool memcheck` over the CUDA unit suite | **0 errors** over 526 / 0 / 37 |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt **1.9.0-stable**; the pinned toolchain has no `rustfmt` component and CI runs no fmt job) |
+| `python3 scripts/check_docs_links.py` | **957 relative links in 185 files** |
+
+**Mutations (reverted; `sha256sum -c` byte-identical).** (a) `QT::F16 => false` in `plan` (the
+pre-fix behaviour, 1-D converted again) → `quantize_f16_keeps_1d_f32_and_encodes_2d_f16` fails at the
+**value** assertion `F16: tensor blk.0.attn_norm.weight came back f16, expected f32 (rank 1-D)`. (b)
+the CUDA length check forced off (`if false && got != Some(want)`) → the device gate fails
+(`an f16 norm weight must be refused before the launch: ()`, i.e. the f16 arm **executed**), and
+under `compute-sanitizer` that run reports `Invalid __global__ read of size 16 bytes` ×12 /
+`ERROR SUMMARY: 12 errors` — the `d*4` read out of a `d*2` buffer, device-verified.
+
+**Honest scope.** (a) The byte-identity with `llama-quantize` is a stronger result than the ticket
+asked for (per-tensor types) but it holds only for this source/target pair: an f16 source whose 1-D
+tensors were already f16 would be **kept** as f16 by both tools (llama.cpp returns `tensor->type`;
+neither converts a 1-D tensor to f32), so the "1-D is f32" contract is a property of the files the
+producers write, not of an arbitrary GGUF. (b) The miniature source in the CI gate is synthetic
+(zero-ish payloads, one architecture key) — the shape rule is exercised, not a real architecture's
+tensor mix; the real-file half is the `#[ignore]`d arm and the acceptance run above. (c)
+`output.weight` is absent from this tied Qwen3 model, so the tied-embedding policy is not exercised
+by the acceptance run (it is covered by the existing q4_0 byte-parity tests and unchanged here). (d)
+The CUDA norm gate is device-only (CI has no GPU); its CI-covered half is the `weight_size`
+arithmetic exercised through the pure path, and the device arm is run here on GB10. (e) The
+`norm_weight` change adds one size lookup per norm node at execute time; no timing was measured and
+none is claimed.
+
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
 Metal is a first-class target — it is the default backend on macOS and a plain

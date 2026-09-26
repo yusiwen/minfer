@@ -219,12 +219,15 @@ Targets with an implemented and byte-verified encoder:
   biases) and any tensor whose row length is not a multiple of the target block
   size keep their source type, and the CLI prints the list — llama.cpp's rule, not
   a silent choice.
-- The `f16` / `f32` casts are element casts: they convert **every** tensor,
-  including 1-D. That makes `--type f16` differ from `minfer convert --outtype f16`
-  (and from `llama-quantize … F16`), which keep 1-D tensors f32 because the
-  engine's f16 weight path has no f16-norm kernel — an f16 file with f16 norms is
-  not loadable (the CPU norm path asserts `F32`). Making `quantize --type f16`
-  keep 1-D f32 is [#169](https://github.com/yusiwen/minfer/issues/169).
+- The `f16` cast follows the same "except 1d tensors" rule: 2-D tensors become
+  **f16**, 1-D tensors (norms, biases) keep their source type — **f32** in every
+  file `minfer convert --outtype f16` or `llama-quantize … F16` writes, and the
+  only type the engine's norm/bias path reads (an f16 norm is a file the engine
+  cannot run). The CLI prints the preserved list exactly as for a quant target.
+  `minfer quantize --type f16` now produces a runnable file this way
+  ([#169](https://github.com/yusiwen/minfer/issues/169)).
+- The `f32` cast is the one target that converts **every** tensor, 1-D included,
+  to f32.
 - On a **tied** model (no `output.weight`), a sub-8-bit target quantizes the
   shared `token_embd.weight` at **q8_0** — llama.cpp's tied-embedding policy.
   The CLI prints this too.
@@ -410,7 +413,10 @@ network is used.
   graph type gate, plus the one shared registration rule in
   `models::weight_reg`); the F6 half was
   [#49](https://github.com/yusiwen/minfer/issues/49). The **file** contract is 2-D
-  f16 and 1-D f32; `minfer quantize --type f16` does not honour it yet
+  f16 and 1-D f32, and `minfer quantize --type f16` now honours it (§2.2,
+  [#169](https://github.com/yusiwen/minfer/issues/169)); the CUDA norm path also
+  refuses a non-f32 norm weight (a registered length other than `d*4` bytes)
+  instead of reading `d*4` bytes out of a `d*2` buffer
   ([#169](https://github.com/yusiwen/minfer/issues/169)).
 - **No `--outtype bf16`.** f32 preserves every bf16 value exactly, so nothing is
   lost today, but a bf16 writer (and a bf16 weight path) is [#142](https://github.com/yusiwen/minfer/issues/142).

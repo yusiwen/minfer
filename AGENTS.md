@@ -154,11 +154,11 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 
 - CUDA test suite on a real GPU: `scripts/cuda_test.sh` (`cargo test --release --features cuda -- --test-threads=1`). CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to run the device-gated tests. The device state is a process-wide singleton (`CudaState`), so **run it serially** (issue [#64](https://github.com/yusiwen/minfer/issues/64)). `CudaState::sync` reports a `cudaGetLastError` latch as a latched API error with its real origin, never as a kernel launch; every dynamic-smem opt-in and launch goes through `minfer_smem_optin` / `minfer_launch_ok`, so a failure is named at the call that made it. Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked (`=0` disables CUDA).
 - Real-model gates (the `#[ignore]`d set): `scripts/real_model_gates.sh` (`FEATURES=cuda` selects the device build; `PARALLEL=1`/`0` forces the parallel/serial form). The wrapper defaults to **serial on a device build** (the `CudaState` singleton, [#64](https://github.com/yusiwen/minfer/issues/64)) and to the **parallel** form on a CPU-only build (that reason is gone there, and the parallel harness is where the batching-timing gate's robustness is exercised). Run the set twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride). Current counts, each with its date/device/command (rule 5 of the [gate contract](docs/GATE-CONTRACT.md)):
-  - CPU unit, `cargo test --release`, 2026-09-26: **456 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration.
+  - CPU unit, `cargo test --release`, 2026-09-26: **457 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration.
   - CPU real-model set, `PARALLEL=0 scripts/real_model_gates.sh` and the default parallel form, 2026-09-26: **33 / 0** each.
-  - CUDA unit, `scripts/cuda_test.sh` on GB10 sm_121, 2026-09-26: **524 / 0 / 37**.
+  - CUDA unit, `scripts/cuda_test.sh` on GB10 sm_121, 2026-09-26: **526 / 0 / 37**.
   - CUDA real-model set, `FEATURES=cuda scripts/real_model_gates.sh` on GB10 sm_121, 2026-09-26: **37 / 0** at the 0.5B config and **37 / 0** at the Qwen3-0.6B config.
-  - `compute-sanitizer --tool memcheck` over the CUDA unit suite: **0 API errors** before and after #171.
+  - `compute-sanitizer --tool memcheck` over the CUDA unit suite: **0 API errors** (526 / 0 / 37, GB10 sm_121, 2026-09-26).
   Read [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) before writing or changing a gate. It is the one home for the five rules a gate must satisfy (each with the per-ticket precedent that produced it) and for the failure-injection seam (`MINFER_TEST_CALL_FAIL`, issue [#171](https://github.com/yusiwen/minfer/issues/171)) that makes a mutation one environment variable. The per-ticket history ([#99](https://github.com/yusiwen/minfer/issues/99), [#121](https://github.com/yusiwen/minfer/issues/121), [#123](https://github.com/yusiwen/minfer/issues/123), [#141](https://github.com/yusiwen/minfer/issues/141), [#144](https://github.com/yusiwen/minfer/issues/144), [#147](https://github.com/yusiwen/minfer/issues/147), [#151](https://github.com/yusiwen/minfer/issues/151), [#154](https://github.com/yusiwen/minfer/issues/154), [#158](https://github.com/yusiwen/minfer/issues/158), [#165](https://github.com/yusiwen/minfer/issues/165), [#167](https://github.com/yusiwen/minfer/issues/167)) lives in the records (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §test-infrastructure, `docs/CUDA-BACKEND-DESIGN.md`, `docs/BUILD.md`), not here.
 - Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device" (A0's probes could not see the GPU either way, so "no device" was unsupported).
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
@@ -199,8 +199,13 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   loaders now share one registration rule (`models::weight_reg`, which also carries the q4_K
   `W_dsc` plane gate of [#165](https://github.com/yusiwen/minfer/issues/165)). `Op::MatMul` decodes one
   f16 weight row at a time (`vec_ops::mat_mul_f16`) and `Op::GetRows` decodes f16
-  embedding rows; 1-D norms/biases stay f32 because the converter writes them f32
-  (llama.cpp's rule). The CPU dot is now **vectorized** — AVX2 `F16C`
+  embedding rows; **1-D norms/biases stay f32** — the file contract every producer writes
+  (`minfer convert --outtype f16`, `llama-quantize … F16`, and now `minfer quantize --type f16`,
+  which follows llama.cpp's "except 1d tensors" rule instead of casting every tensor,
+  [#169](https://github.com/yusiwen/minfer/issues/169)). The CUDA norm path enforces it: `norm_weight`
+  checks the registered weight's byte length against the `d*4` the rms_norm kernel reads and returns
+  `Err` otherwise, so an f16 norm cannot be launched into a `d*2` buffer
+  ([#169](https://github.com/yusiwen/minfer/issues/169)). The CPU dot is now **vectorized** — AVX2 `F16C`
   (`_mm256_cvtph_ps`), aarch64 baseline NEON `FCVTL` (`vcvt_f32_f16`), an f64
   scalar oracle, and `MINFER_NO_NEON=1` forcing scalar — and the multi-token
   prefill decodes each weight row once and threads the row loop through the
@@ -220,7 +225,10 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
   be a silent wrong path, which is what that gate exists to prevent
   ([#164](https://github.com/yusiwen/minfer/issues/164)). `minfer quantize` supports
   q4_0/q4_1/q5_0/q5_1/q8_0 (byte-identical to `llama-quantize`), f16 and f32, and
-  refuses every type without an encoder by name ([#140](https://github.com/yusiwen/minfer/issues/140)).
+  refuses every type without an encoder by name ([#140](https://github.com/yusiwen/minfer/issues/140));
+  `--type f16` keeps 1-D tensors f32 and its output is byte-identical to
+  `llama-quantize … F16` ([#169](https://github.com/yusiwen/minfer/issues/169)), while `--type f32`
+  writes every tensor f32.
 
 ## GPU Safety
 
