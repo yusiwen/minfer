@@ -36,6 +36,13 @@ value is computed independently of the path under test (a dequantized reference,
 a scalar oracle, a pinned literal). A mode-vs-mode comparison is the fast arm,
 never the only arm.
 
+The isolation instance of this rule is [#173]: a gate that compared two
+snapshots of a **process-global** timing table was replaced by exact values read
+from a per-scheduler sink, because a concurrent execution could move the
+relation (record: [`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md)
+§"#173"). Rule 1 is about a shared *code path*; a shared *destination* is the
+same hazard, and a value read from an owned table is immune to it.
+
 ## 2. A control arm must differ in the property under test
 
 A negative control that is rejected by an *earlier* check never exercises the
@@ -200,4 +207,5 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#165]: https://github.com/yusiwen/minfer/issues/165
 [#167]: https://github.com/yusiwen/minfer/issues/167
 [#171]: https://github.com/yusiwen/minfer/issues/171
+[#173]: https://github.com/yusiwen/minfer/issues/173
 [#175]: https://github.com/yusiwen/minfer/issues/175
