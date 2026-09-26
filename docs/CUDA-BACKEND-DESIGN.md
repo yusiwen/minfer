@@ -178,9 +178,31 @@ process-wide `CudaState::stream_lock()` serializes stream use:
   [#145](https://github.com/yusiwen/minfer/issues/145) it reports what it finds as a **latched API
   error observed by `cudaGetLastError`**, naming the `cudaGetErrorName` symbol and stating that it is
   *not* attributed to a kernel. The old message ("CUDA kernel launch error: 1") blamed whatever
-  kernel had just run for an error an earlier call had latched. The latched error is still counted
+  kernel had just ran for an error an earlier call had latched. The latched error is still counted
   (`latched_api_error_count`) and cleared — never dropped — but the fix belongs at the call site that
   discarded the return value.
+
+**Two threads is undefined behaviour, and since [#185](https://github.com/yusiwen/minfer/issues/185)
+it is refused before any driver call.** The lock above only serializes the paths that *take* it. The
+capture window is opened in **`cudaStreamCaptureModeGlobal`** (`cudaStreamBeginCapture(stream, 1)`), so
+a driver call from *another* thread that is not capture-safe invalidates the capture
+(`cudaErrorStreamCaptureInvalidated`, 901) — and, as the parallel `#[ignore]`d suite demonstrated on
+GB10, it can instead fault inside the driver. The path that does not take the lock is **weight
+registration**: `CudaState::register_weight` issues a plain blocking `cudaMalloc` + `cudaMemcpy`
+(H2D), not a stream-ordered operation. Two gdb backtraces of the SIGSEGV (2026-09-26) both show one
+thread at `cuMemcpyHtoD_v2` under `register_weight` while another is at `cuGraphInstantiateWithFlags`
+under `graph_end_capture_to_exec`/`synchronize`/`execute`. `src/device_entry.rs` now owns a
+process-wide, re-entrant-per-thread token: `scheduler::execute` takes it for the whole execution when
+the graph has a **`CUDA` split**, and `weight_reg::register_cuda_weight` takes it for each
+registration; a second *thread* is refused with the reason, the evidence and the remedy, without
+touching the driver. It is a **chokepoint, not a structural exclusion**: a caller that reaches
+`execute_node`/`synchronize`/`graph_replay_step`, or `CudaState::register_weight` directly, is still
+unguarded — see [#188](https://github.com/yusiwen/minfer/issues/188). The **device suite therefore runs one test at a time** — `scripts/cuda_test.sh`,
+i.e. `--test-threads=1`; a parallel `--ignored` run now fails loudly instead of segfaulting. The
+underlying limitation — the capture window and the device pool are process-wide, and the
+registration path has no stream ordering — is **not** fixed here; per-instance streams/capture
+contexts (or extending the capture discipline to every device call) is
+[#188](https://github.com/yusiwen/minfer/issues/188).
 
 **The eager prefill-GEMM smem opt-in (issues [#145](https://github.com/yusiwen/minfer/issues/145) and
 [#147](https://github.com/yusiwen/minfer/issues/147)).**
