@@ -343,10 +343,16 @@ pub fn load(
         // E5 S2: `auto` measures the budget against the model's per-block weight sizes, taken
         // from the GGUF index — the fit has to happen *before* the first registration, because
         // the registration filter is the plan.
-        offload::OffloadRequest::Auto => {
+        offload::OffloadRequest::Auto | offload::OffloadRequest::AutoWithBudget(_) => {
             let per_block = block_weight_bytes(model, n_layer);
             let mem = crate::models::device_memory();
-            let cap = std::env::var("MINFER_GPU_MEM").ok();
+            // #185: an explicit budget wins and is read from the *argument*, never
+            // from the process environment — the environment is shared, so a test
+            // that set it changed what a concurrently loading test computed.
+            let explicit_mib = request.budget_mib();
+            let cap = explicit_mib
+                .map(|mib| mib.to_string())
+                .or_else(|| std::env::var("MINFER_GPU_MEM").ok());
             let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
                 Err(e) => {
@@ -365,7 +371,10 @@ pub fn load(
                     gpu_layers: k,
                     n_layers: n_layer,
                 },
-                offload::auto_source(k, n_layer, budget, reserve, &mem, cap.as_deref()),
+                match explicit_mib {
+                    Some(mib) => offload::auto_source_explicit(k, n_layer, budget, reserve, mib),
+                    None => offload::auto_source(k, n_layer, budget, reserve, &mem, cap.as_deref()),
+                },
             )
         }
         other => {

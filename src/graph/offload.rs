@@ -123,13 +123,27 @@ pub enum OffloadRequest {
     Layers(usize),
     /// E5 S2: the block count is *computed* from the budget and the model's per-block weight
     /// sizes — the loader resolves it (`fit_blocks`), because that is where the byte table is.
+    /// The budget is `MINFER_GPU_MEM=<MiB>` when set, else the device default.
     Auto,
+    /// E5 S2 with an **explicit** weight budget in MiB — the number
+    /// `MINFER_GPU_MEM=<n>` would supply, without touching the process-wide
+    /// environment (issue #185). The explicit-argument spelling exists because
+    /// the environment is shared by every thread: the E5 gate used to
+    /// `set_var("MINFER_GPU_MEM", "64")`, which a concurrently loading test then
+    /// read, and which its own second arm had to unset. The repo's convention is
+    /// an explicit argument over a mutated environment — `load_model_configured`'s
+    /// explicit cache type is the precedent (#99, #153).
+    AutoWithBudget(usize),
 }
 
 impl OffloadRequest {
     /// Parse the CLI/environment spelling, strictly: a decimal block count, `auto`, or
     /// unset/empty for the default. Anything else is refused loudly — a silently ignored
     /// offload request is indistinguishable from an offload that did not work.
+    ///
+    /// `AutoWithBudget` has no spelling on purpose: it is the explicit-argument
+    /// form (#185), and an environment variable that reached it would be the
+    /// process-global this variant exists to avoid.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
             None | Some("") => Ok(OffloadRequest::Default),
@@ -142,11 +156,23 @@ impl OffloadRequest {
         }
     }
 
+    /// The explicit budget this request carries, if any (the loader reads
+    /// `MINFER_GPU_MEM` only when this is `None`).
+    pub fn budget_mib(self) -> Option<usize> {
+        match self {
+            OffloadRequest::AutoWithBudget(mib) => Some(mib),
+            _ => None,
+        }
+    }
+
     /// The spelling this request came from, for the startup report.
     pub fn source(self, env: Option<&str>) -> String {
         match self {
             OffloadRequest::Layers(n) => format!("--gpu-layers {n}"),
             OffloadRequest::Auto => format!("--gpu-layers {AUTO}"),
+            OffloadRequest::AutoWithBudget(mib) => {
+                format!("--gpu-layers {AUTO} (explicit budget {mib} MiB)")
+            }
             OffloadRequest::Default => match env.map(str::trim) {
                 Some(v) if !v.is_empty() => format!("MINFER_GPU_LAYERS={v}"),
                 _ => "default".to_string(),
@@ -170,7 +196,7 @@ impl OffloadRequest {
                 gpu_layers: n.min(n_layers),
                 n_layers,
             }),
-            OffloadRequest::Auto => Err(
+            OffloadRequest::Auto | OffloadRequest::AutoWithBudget(_) => Err(
                 "the `auto` offload request is resolved by the loader (it needs the model's per-block weight sizes), not here"
                     .to_string(),
             ),
@@ -333,6 +359,30 @@ pub fn auto_source(
         "auto: {k} of {n_layers} blocks fit — weights budget {}, {} reserved for KV/activations; {against}",
         mib(budget),
         mib(reserve)
+    )
+}
+
+/// E5 S2 + #185: the same startup line for an **explicit** budget that did not
+/// come from `MINFER_GPU_MEM` ([`OffloadRequest::AutoWithBudget`]).
+///
+/// Separate from [`auto_source`] so the provenance in the report is true: the
+/// environment spelling says `MINFER_GPU_MEM=…`, the explicit spelling says
+/// `explicit budget <mib> MiB (OffloadRequest::AutoWithBudget, not
+/// MINFER_GPU_MEM)`. A report that named the environment for a number the
+/// environment never held would be a lie a reader could not catch.
+pub fn auto_source_explicit(
+    k: usize,
+    n_layers: usize,
+    budget: usize,
+    reserve: usize,
+    mib: usize,
+) -> String {
+    let m = |b: usize| format!("{:.0} MiB", b as f64 / (1024.0 * 1024.0));
+    format!(
+        "auto: {k} of {n_layers} blocks fit — weights budget {}, {} reserved for KV/activations; \
+         explicit budget {mib} MiB (OffloadRequest::AutoWithBudget, not MINFER_GPU_MEM)",
+        m(budget),
+        m(reserve)
     )
 }
 
@@ -550,6 +600,56 @@ mod tests {
         );
         assert!(line.contains("unmeasured"), "{line}");
         assert!(!line.contains("device free 0 MiB"), "{line}");
+    }
+
+    /// #185: the explicit-argument budget spelling
+    /// ([`OffloadRequest::AutoWithBudget`]). It is deliberately unreachable from
+    /// the environment — that is the whole point — it carries its MiB value, the
+    /// **loader** (not `plan`) resolves it, and the report names the argument
+    /// rather than an environment variable that never held the number.
+    #[test]
+    fn an_explicit_auto_budget_is_an_argument_not_an_environment_variable() {
+        let req = OffloadRequest::AutoWithBudget(64);
+        assert_eq!(req.budget_mib(), Some(64));
+        assert_eq!(OffloadRequest::Auto.budget_mib(), None);
+        assert_eq!(OffloadRequest::Layers(3).budget_mib(), None);
+        // No spelling produces it: an env var that reached this variant would be the
+        // process-global the variant exists to avoid.
+        for spelling in [None, Some(""), Some("auto"), Some("64")] {
+            assert!(
+                OffloadRequest::parse(spelling)
+                    .unwrap()
+                    .budget_mib()
+                    .is_none(),
+                "spelling {spelling:?} must not carry an explicit budget"
+            );
+        }
+        // The loader resolves `auto` (it needs the per-block byte table).
+        assert!(req.plan(None, 24, true).is_err());
+        assert!(req.source(None).contains("explicit budget 64 MiB"));
+        // The report's provenance is honest: the explicit spelling never claims the
+        // environment.
+        let line = auto_source_explicit(5, 24, 64 << 20, 16 << 20, 64);
+        assert!(line.contains("auto: 5 of 24 blocks fit"), "{line}");
+        assert!(line.contains("explicit budget 64 MiB"), "{line}");
+        assert!(
+            !line.contains("MINFER_GPU_MEM="),
+            "an explicit budget must not be reported as an environment variable: {line}"
+        );
+        // Positive control for the `!contains` above: the environment spelling does
+        // name the variable, so the two report forms are distinguishable.
+        let env_line = auto_source(
+            5,
+            24,
+            64 << 20,
+            16 << 20,
+            &DeviceMemory::Reported {
+                free: 4 << 20,
+                total: 8 << 20,
+            },
+            Some("64"),
+        );
+        assert!(env_line.contains("MINFER_GPU_MEM=64 MiB"), "{env_line}");
     }
 
     #[test]

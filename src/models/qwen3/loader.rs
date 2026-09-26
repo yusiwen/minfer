@@ -346,10 +346,14 @@ pub fn load(
     };
     let (plan, offload_source) = match request {
         // E5 S2: `auto` (see qwen2's twin for the full rationale).
-        offload::OffloadRequest::Auto => {
+        offload::OffloadRequest::Auto | offload::OffloadRequest::AutoWithBudget(_) => {
             let per_block = block_weight_bytes(model, n_layer);
             let mem = crate::models::device_memory();
-            let cap = std::env::var("MINFER_GPU_MEM").ok();
+            // #185: the explicit-argument budget wins over the process environment.
+            let explicit_mib = request.budget_mib();
+            let cap = explicit_mib
+                .map(|mib| mib.to_string())
+                .or_else(|| std::env::var("MINFER_GPU_MEM").ok());
             let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
                 Err(e) => {
@@ -364,7 +368,10 @@ pub fn load(
                     gpu_layers: k,
                     n_layers: n_layer,
                 },
-                offload::auto_source(k, n_layer, budget, reserve, &mem, cap.as_deref()),
+                match explicit_mib {
+                    Some(mib) => offload::auto_source_explicit(k, n_layer, budget, reserve, mib),
+                    None => offload::auto_source(k, n_layer, budget, reserve, &mem, cap.as_deref()),
+                },
             )
         }
         other => {
