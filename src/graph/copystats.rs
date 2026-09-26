@@ -19,8 +19,9 @@
 //!
 //! **The counters live on the allocator, not in a process static.** A static
 //! would make two tests running in parallel pollute each other's numbers
-//! (`optiming` needs a mutex gate for exactly that reason); an allocator owns
-//! one graph's execution, which is the scope these counters describe.
+//! (`optiming` fixed exactly that class in #173 by giving each scheduler its own
+//! timing sink); an allocator owns one graph's execution, which is the scope
+//! these counters describe.
 //!
 //! [#58]: https://github.com/yusiwen/minfer/issues/58
 
@@ -121,8 +122,9 @@ pub fn async_copies_enabled() -> bool {
 ///
 /// `OVERRIDE` is process-wide (the environment it stands in for is), so a gate
 /// that reads it must hold [`gate`] for the whole measurement — two tests
-/// flipping the mode concurrently would otherwise measure each other's. This is
-/// the same discipline `optiming::gate` exists for.
+/// flipping the mode concurrently would otherwise measure each other's. `optiming`
+/// avoids the mutex instead: #173 made a scheduler's timing destination an
+/// instance it owns, so its tests share nothing to serialize.
 #[cfg(test)]
 #[must_use = "the guard restores the previous mode on drop"]
 pub fn set_sync_for_test(sync: bool) -> SyncModeGuard {
