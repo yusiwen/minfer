@@ -250,11 +250,20 @@ impl ComputeGraph {
             if node.id >= n {
                 return Err(format!("node id {} out of range", node.id));
             }
-            for &s in &node.src {
+            // #98: count each *distinct* predecessor once. The release pass
+            // below decrements per node by `src.contains(&u)`, so both passes
+            // must share one notion of "u is a predecessor of v": `add(x, x)`
+            // is one edge read twice, not two edges. Counting per source entry
+            // (`x + x` = 2) against a once-per-node release leaves `indeg`
+            // unreachable at 0 and reports a false cycle on a legal DAG. The
+            // source lists are tiny, so the quadratic scan is free.
+            for (j, &s) in node.src.iter().enumerate() {
                 if s >= n {
                     return Err(format!("node {}: src {s} out of range", node.id));
                 }
-                indeg[node.id] += 1;
+                if !node.src[..j].contains(&s) {
+                    indeg[node.id] += 1;
+                }
             }
         }
         let mut queue: Vec<NodeId> = (0..n).filter(|&i| indeg[i] == 0).collect();
@@ -316,6 +325,24 @@ mod tests {
         }
     }
 
+    /// #98: `add(x, x)` lists one predecessor twice, which is one edge read
+    /// twice — not two edges. The in-degree pass must count it once (the
+    /// release pass already decrements once per node), or the validator reports
+    /// a false cycle and `GraphAllocator::alloc_graph` refuses a legal DAG.
+    #[test]
+    fn topo_order_accepts_a_repeated_source() {
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [4, 1, 1, 1], DType::F32);
+        let double = b.add(x, x);
+        b.output(double);
+        let g = b.build();
+        let order = g.topo_order().expect("add(x, x) is acyclic");
+        assert_eq!(order.len(), g.n_nodes(), "every node must be ordered");
+        let px = order.iter().position(|&i| i == x).unwrap();
+        let pd = order.iter().position(|&i| i == double).unwrap();
+        assert!(px < pd, "the source must precede its consumer");
+    }
+
     #[test]
     fn topo_order_detects_cycle() {
         // hand-built cycle: a -> b -> a
@@ -344,7 +371,12 @@ mod tests {
             view: None,
             layer: None,
         });
-        assert!(g.topo_order().is_err());
+        assert_eq!(
+            g.topo_order().unwrap_err(),
+            "cycle detected: 0/2 nodes ordered",
+            "a genuine cycle must still be refused by the cycle check itself, \
+             not by some other error the repeated-source fix might have introduced"
+        );
     }
 
     #[test]
