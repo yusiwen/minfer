@@ -521,7 +521,14 @@ impl GraphAllocator {
         }
 
         // consumer counts (for in-place alias safety: an input may only be
-        // overwritten in place when this op is its ONLY consumer)
+        // overwritten in place when this op is its ONLY consumer).
+        //
+        // #98 audit: this counts source *entries*, so a node that lists the same
+        // source twice (`add(x, x)`) counts it twice. Unlike `topo_order`, that
+        // asymmetry with the release side is safe — over-counting can only make
+        // `n_consumers[s] == 1` fail, i.e. refuse an in-place alias and leave the
+        // op with its own buffer. It never grants an alias it should not, so the
+        // worst case is a missed in-place optimization, not a wrong read.
         let mut n_consumers = vec![0usize; n];
         for node in &graph.nodes {
             for &s in &node.src {
@@ -4050,6 +4057,13 @@ mod tests {
     /// execution, i.e. after the fill, and the input's value is gone by the time its
     /// consumer reads it. Here `t`'s buffer becomes free before `y` is placed, and `t`
     /// writes it at step 1.
+    ///
+    /// This test was originally written with two distinct inputs (`add(x, w)`) because
+    /// `add(x, x)` could not be built at all: `topo_order` reported a false cycle on a
+    /// repeated source (#98). The repeated source is legal now and covered end to end by
+    /// [`a_repeated_source_allocates_and_executes_as_two_reads`]; the two-input form is
+    /// kept here on purpose so this gate keeps pinning *its* property (input placement)
+    /// rather than the duplicate-source path.
     #[test]
     fn an_input_never_takes_a_buffer_the_walk_released() {
         let mut b = GraphBuilder::new();
@@ -4083,6 +4097,47 @@ mod tests {
             want,
             "`y` must still hold its fill value after `t` executed"
         );
+    }
+
+    /// #98: a node may read the same source twice — `add(x, x)` is `2 * x`
+    /// written as an addition, `mul(x, x)` is `x * x`, and `GraphBuilder::add`
+    /// / `mul` pass `&[a, b]` straight through. `alloc_graph` validates with
+    /// `topo_order()` on every build, so before the fix this graph never
+    /// reached execution at all (it failed with a false cycle). The assertion
+    /// is the **value**: `is_ok()` alone would also pass a graph that dropped
+    /// the second read, and `2 * x` would come back as `x`.
+    #[test]
+    fn a_repeated_source_allocates_and_executes_as_two_reads() {
+        let xs = [1.5f32, -2.0, 3.25, 0.0];
+        let wants = [
+            ("add", xs.map(|v| 2.0 * v).to_vec()),
+            ("mul", xs.map(|v| v * v).to_vec()),
+        ];
+        for (name, want) in wants {
+            let mut b = GraphBuilder::new();
+            let x = b.input("x", [4, 1, 1, 1], crate::graph::DType::F32);
+            let out = if name == "mul" {
+                b.mul(x, x)
+            } else {
+                b.add(x, x)
+            };
+            b.output(out);
+            let g = b.build();
+
+            let mut alloc = GraphAllocator::new();
+            alloc
+                .alloc_graph(&g)
+                .unwrap_or_else(|e| panic!("{name}(x, x) must allocate, got: {e}"));
+            alloc.fill_input(&g, "x", &xs).unwrap();
+            crate::graph::scheduler::BackendScheduler::new()
+                .execute(&g, &mut alloc)
+                .unwrap_or_else(|e| panic!("{name}(x, x) must execute, got: {e}"));
+            assert_eq!(
+                alloc.copy_to_cpu(out).expect("read"),
+                want,
+                "{name}(x, x) must read x twice, not drop the repeated source"
+            );
+        }
     }
 
     /// E4 S2: a view is a window of its parent's buffer, so the parent must stay alive
