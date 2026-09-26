@@ -458,7 +458,7 @@ run one of three layouts, tagged by `crate::cuda::KV_LAYOUT_F32/F16/Q8_0` — th
 
 - `KV_LAYOUT_F32` — one f32 per element;
 - `KV_LAYOUT_F16` — one f16 per element in the first half of the f32-shaped region
-  (`set_kv_cache_type` auto-selects it when `n_layers × n_kv_embd >= 8192`, the 7B class, and
+  (`kvformat::auto_device_format` selects it when `n_layers × n_kv_embd >= 8192`, the 7B class, and
   `MINFER_CACHE_TYPE=f16` overrides). Its **snapshots are restorable since [#130](https://github.com/yusiwen/minfer/issues/130)**:
   the session container records the type in its header flags (`FLAG_F16`, C5 S3), so an
   auto-f16 model's `--slots-file` / `--session` companion is no longer refused on load;
@@ -472,25 +472,28 @@ scale plus four quants of block `elem/32`. A 4-element group never straddles a b
 head's base is `hd`-aligned and `hd % 32 == 0` (`ensure_kv`'s packed-width check). The kernels take
 `const void* k/v` plus `size_t row_bytes`, and the launchers take the layout as an `int`.
 
-`CudaBackend` snapshots the process-wide policy into its `kv_layout` field at construction
-(`crate::cuda::kv_cache_layout`), and `kv_row_bytes(nkt)` derives the stride (`nkt*4`, `nkt*2`, or
-`KvFormat::Q8_0.row_bytes(nkt)`). The packed store is `store_kv_q8_0`, whose quantizer is the CPU's
-step for step (`amax/127`, f16 scale, round-ties-even), so both backends store the same bytes.
-Before C4 S2b this was a `bool` that mapped anything not exactly `f16` to f32 — which would have
-addressed a packed region as f32 rows, the silent corruption the layout tag exists to make
+`CudaBackend` holds that `int` in its `kv_layout` field, and `kv_row_bytes(nkt)` derives the stride
+(`nkt*4`, `nkt*2`, or `KvFormat::Q8_0.row_bytes(nkt)`). The packed store is `store_kv_q8_0`, whose
+quantizer is the CPU's step for step (`amax/127`, f16 scale, round-ties-even), so both backends store
+the same bytes. Before C4 S2b this was a `bool` that mapped anything not exactly `f16` to f32 — which
+would have addressed a packed region as f32 rows, the silent corruption the layout tag exists to make
 impossible.
 
-**Per-engine scope ([#99](https://github.com/yusiwen/minfer/issues/99)).** #99 made the KV *format*
-per engine for the model, the graph builder (`CParams::kv_format`), the allocator and the CPU
-kernels; **this device layout is deliberately still a per-load process policy.** The kernels read
-`crate::cuda::KV_LAYOUT` themselves (not through `CudaBackend::kv_layout`), so the tag a weight
-load / `set_kv_cache_layout` installs is what every KV kernel in the process runs — the same
-process-wide shape `CudaState`'s other state has. Making the layout per-graph means threading it
-through every launcher in `cuda.rs` and the captured-graph key, which is filed as its own follow-up;
-the discipline for now is the documented serial device run (`scripts/cuda_test.sh`,
-`scripts/real_model_gates.sh`). The loader keeps the two halves in step: `load_model_configured`
-restates `KV_LAYOUT_Q8_0` when the resolved format is packed, so the region the builder sizes and
-the kernel that addresses it cannot disagree within one engine.
+**Per-engine scope ([#99](https://github.com/yusiwen/minfer/issues/99), completed by
+[#153](https://github.com/yusiwen/minfer/issues/153)).** #99 made the KV *format* per engine for the
+model, the graph builder (`CParams::kv_format`), the allocator and the CPU kernels; #153 finished the
+device half. There is **no** `cuda::KV_LAYOUT` static any more: the engine's resolved `KvFormat` —
+including the GPU auto policy, which `kvformat::resolve` now folds in from the model dims — reaches
+`CudaBackend` through `GraphAllocator::set_kv_format` (and `enable_cuda` builds a fresh backend from
+the same stamp), so `CudaBackend::kv_layout` is the only source the dispatch reads. `cuda::layout_of`
+/ `format_of` are the one binding between `KvFormat` and the FFI tag. The launchers already took the
+tag as an argument; what was process-wide was the value. Two engines in one process therefore run
+their own layouts, and the captured-graph key carries the tag (below), so an exec instantiated for
+one layout cannot replay for another. `models::load_model_configured` no longer restates anything.
+
+**Metal is the remaining device-static.** `metal::kv_cache_is_f16` is still a process-wide
+`OnceLock` its kernels read (no Mac here to re-plumb it; Metal is G5 for packed anyway), so the
+*Metal* device run keeps the documented discipline.
 
 **Host transfers.**
 
@@ -521,9 +524,13 @@ The state machine:
 1. `graphs_mode != Enabled` → direct launches.
 2. An open capture window of our own → direct launches (a nested replay would be CUDA-invalid; the
    graph is single-split today so this is unreachable).
-3. A stored exec for `(uid, range)` with a **matching `pool_gen`** → `cudaGraphLaunch`; on launch
-   failure, disable graphs for the session and fall back.
-4. A stored exec with a **different `pool_gen`** → destroy it, drop the warmup counter, re-warm.
+3. A stored exec for `(uid, range)` with a **matching `pool_gen` and `kv_layout`** → `cudaGraphLaunch`;
+   on launch failure, disable graphs for the session and fall back.
+4. A stored exec with a **different `pool_gen`** (pointer layout may differ) **or a different
+   `kv_layout`** (the recorded kernels were instantiated for the old tag — `store_kv_f16` vs
+   `store_kv_q8_0`, the layout-tagged attention) → destroy it, drop the warmup counter, re-warm. #153
+   added the `kv_layout` term; `CudaBackend::set_kv_layout` also invalidates eagerly when a stamp
+   moves, so the lookup check is the second line of defence.
 5. Warmup: executions 1 and 2 of a key run direct launches (llama.cpp warms up twice); a one-shot
    prefill never reaches capture.
 6. On the third execution, if `nt_hint.map_or(true, |nt| nt == 1 || prefill_capture)`, the backend
@@ -531,8 +538,9 @@ The state machine:
    decode-shaped graphs always capture; prefill-shaped graphs capture only when `prefill_capture` is
    on (default **ON** since R3-B; `MINFER_NO_PREFILL_CAPTURE=1` opts out).
 7. The window closes at the split's `synchronize` → `close_capture_or_sync`: end capture, instantiate,
-   **launch once** so the step still produces output, cache the exec at the current `pool_gen`, then
-   sync. A failure destroys the exec, logs loudly, and disables graphs for the session.
+   **launch once** so the step still produces output, cache the exec at the current `pool_gen` and
+   `kv_layout`, then sync. A failure destroys the exec, logs loudly, and disables graphs for the
+   session.
 
 Replay correctness rests on stable addresses: pool ids never move memory, `copy_across` rewrites the
 same staging buffers each step, and the positions scratch pointer is embedded in captured execs — so
