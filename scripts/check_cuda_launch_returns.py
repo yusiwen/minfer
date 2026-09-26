@@ -140,6 +140,18 @@ def owners(code_lines: list[str]) -> list[tuple[int, int, str]]:
         if line and not line[0].isspace():
             m = FUNC_RE.match(line)
             if m and not line.lstrip().startswith(("//", "/*")):
+                if line.rstrip().endswith(";"):
+                    # a forward declaration, not a definition
+                    i += 1
+                    continue
+                # A one-line definition (`... { return x; }`) closes on its own
+                # line; otherwise the body ends at the next column-0 `}`. The old
+                # unconditional forward scan ran past a one-liner and made the
+                # *next* function appear to own its lines.
+                if "}" in line:
+                    found.append((i, i, m.group(1)))
+                    i += 1
+                    continue
                 j = i + 1
                 while j < n and code_lines[j] != "}":
                     j += 1
