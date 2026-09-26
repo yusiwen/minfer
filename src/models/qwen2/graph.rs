@@ -1939,10 +1939,16 @@ mod tests {
     ///   `CudaBackend::blocking_readback_count()` (which counts actual blocking
     ///   `cudaMemcpy` D2H calls) not moving at all in async mode. Those are the
     ///   measured before/after numbers.
-    /// - **the host stalls** — `cuda::stream_sync_count()` around the run. The
-    ///   pre-F5 path synced the whole stream once *per staged input inside*
-    ///   `copy_to_host`; the async path issues none of those. This is the
-    ///   latency-shaped evidence, and it is a hard count, not a timing.
+    /// - **the host stalls** — the backend's own `stream_sync_count()` around the
+    ///   run. The pre-F5 path synced the whole stream once *per staged input
+    ///   inside* `copy_to_host`; the async path issues none of those. This is the
+    ///   latency-shaped evidence, and it is a hard count, not a timing. It is read
+    ///   **through the backend** ([#185]): the process-wide
+    ///   `cuda::stream_sync_count()` let a concurrent device test's stalls land
+    ///   between the two snapshots (run A read 4160 async vs 728 sync — the
+    ///   harness's own load, not the async path).
+    ///
+    /// [#185]: https://github.com/yusiwen/minfer/issues/185
     ///
     /// Ignored because it needs the cached 0.5B and a CUDA device. Run alone:
     ///
@@ -2008,7 +2014,15 @@ mod tests {
                 .cuda()
                 .expect("the CUDA pool is enabled")
                 .blocking_readback_count();
-            let syncs_before = crate::cuda::stream_sync_count();
+            // #185: read the stall count through **this** backend, not the
+            // process-wide `cuda::stream_sync_count()`: a concurrent device test's
+            // syncs landed inside this delta and made the async arm look worse than
+            // the synchronous one (4160 vs 728 in the ticket's run A).
+            let syncs_before = cache
+                .alloc()
+                .cuda()
+                .expect("the CUDA pool is enabled")
+                .stream_sync_count();
 
             let mut l =
                 model.forward_graph_cached(&ids, &(0..n).collect::<Vec<_>>(), 1, n_ctx, &mut cache);
@@ -2027,7 +2041,12 @@ mod tests {
                 .expect("the CUDA pool is enabled")
                 .blocking_readback_count()
                 - readbacks_before;
-            let syncs = crate::cuda::stream_sync_count() - syncs_before;
+            let syncs = cache
+                .alloc()
+                .cuda()
+                .expect("the CUDA pool is enabled")
+                .stream_sync_count()
+                - syncs_before;
             (out, stats, readbacks, syncs)
         };
 
@@ -2146,41 +2165,27 @@ mod tests {
 
     /// E5 S2's acceptance on the real model: **`auto` picks the block count from the budget**.
     ///
-    /// The gate forces a small budget with `MINFER_GPU_MEM` so the fit is a strict prefix
-    /// (`0 < k < n_layer`) instead of the trivial "everything fits" a 128 GB device gives, checks
-    /// the startup line names the fit and its numbers, and requires the same greedy tokens as the
-    /// all-CPU run (the S1 gate's comparison). Without a cap the same request must select every
-    /// block — the pre-E5 behaviour, so an `auto` default cannot silently under-offload.
+    /// The gate pins a small budget with `OffloadRequest::AutoWithBudget(64)` so the fit is a
+    /// strict prefix (`0 < k < n_layer`) instead of the trivial "everything fits" a 128 GB
+    /// device gives, checks the startup line names the fit and its numbers, and requires the
+    /// same greedy tokens as the all-CPU run (the S1 gate's comparison). A budget that covers
+    /// the model must select every block — the pre-E5 behaviour, so an `auto` default cannot
+    /// silently under-offload.
     ///
-    /// Ignored because it needs the cached 0.5B and a CUDA device, and because `MINFER_GPU_MEM` is
-    /// process-wide (the guard restores it, including on a panic).
+    /// Issue #185: the budget is an **explicit argument**, never `MINFER_GPU_MEM`. The
+    /// environment is process-wide, so the earlier form (`set_var` for the capped arm,
+    /// `remove_var` for the uncapped one) changed what a concurrently loading test computed —
+    /// one of the four failures that made the harness look flaky. The explicit-argument
+    /// convention is the repo's (`load_model_configured`'s cache type, #99/#153), and the
+    /// second arm uses the device's measured free bytes for the same reason.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device.
     #[test]
-    #[ignore = "requires the cached 0.5B model and a CUDA device; sets MINFER_GPU_MEM"]
+    #[ignore = "requires the cached 0.5B model and a CUDA device"]
     fn an_auto_offload_plan_fits_the_budget() {
         use crate::graph::cache::GraphCache;
         use crate::graph::offload::OffloadRequest;
         use crate::models::{Device, ModelDef};
-
-        /// Restore an environment variable when the test ends (a panic included: libtest unwinds).
-        struct EnvGuard(&'static str, Option<String>);
-        impl EnvGuard {
-            fn set(key: &'static str, value: Option<&str>) -> Self {
-                let before = std::env::var(key).ok();
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-                EnvGuard(key, before)
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(v) => std::env::set_var(self.0, v),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
 
         let Some(path) = cached_model_path() else {
             eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the E5 S2 auto gate");
@@ -2191,13 +2196,15 @@ mod tests {
             .expect("hparams")
             .n_layer as usize;
         // A budget far below the model (24 blocks of ~16 MiB) but far above one block.
-        let cap = EnvGuard::set("MINFER_GPU_MEM", Some("64"));
+        // Explicit argument, not `MINFER_GPU_MEM` (#185).
+        const CAP_MIB: usize = 64;
 
         let cpu_ref =
             crate::models::qwen2::loader::load(&gguf, "auto-cpuref.", OffloadRequest::Layers(0))
                 .expect("load the CPU reference");
-        let mixed = crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::Auto)
-            .expect("load the auto model");
+        let mixed =
+            crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::AutoWithBudget(CAP_MIB))
+                .expect("load the auto model");
         if mixed.device() != Device::Cuda {
             eprintln!(
                 "no CUDA participation (device {:?}); skipping",
@@ -2212,7 +2219,9 @@ mod tests {
         );
         let report = mixed.offload_report().expect("auto must report its fit");
         assert!(
-            report.contains("auto:") && report.contains("MINFER_GPU_MEM=64"),
+            report.contains("auto:")
+                && report.contains("explicit budget 64 MiB")
+                && !report.contains("MINFER_GPU_MEM="),
             "{report}"
         );
         eprintln!("[e5-s2] {report}");
@@ -2242,14 +2251,25 @@ mod tests {
             "an auto fit must produce the same greedy tokens as the all-CPU run"
         );
 
-        // No cap on this device: everything fits, which is the pre-E5 behaviour.
-        let _uncapped = EnvGuard::set("MINFER_GPU_MEM", None);
-        let full = crate::models::qwen2::loader::load(&gguf, "auto-full.", OffloadRequest::Auto)
-            .expect("load the auto (uncapped) model");
+        // A budget that covers the model must offload every block — the pre-E5 `auto`
+        // behaviour. It is expressed as the device's **measured free bytes** rather than by
+        // *unsetting* `MINFER_GPU_MEM`: the explicit argument neither reads nor mutates the
+        // process-global (#185).
+        let free_mib = match crate::models::device_memory() {
+            crate::graph::allocplan::DeviceMemory::Reported { free, .. } => free / (1024 * 1024),
+            other => panic!("`auto` needs a device that reports free bytes, got {other:?}"),
+        };
+        assert!(free_mib > 0, "the device must report free bytes");
+        let full = crate::models::qwen2::loader::load(
+            &gguf,
+            "auto-full.",
+            OffloadRequest::AutoWithBudget(free_mib),
+        )
+        .expect("load the auto (whole-device-budget) model");
         assert_eq!(
             full.offload().gpu_layers,
             n_layers,
-            "an uncapped auto request on a device that fits the model must offload everything: {}",
+            "a budget covering the device's free bytes must offload every block: {}",
             full.offload_report().unwrap_or_default()
         );
     }

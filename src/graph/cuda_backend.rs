@@ -102,6 +102,15 @@ pub struct CudaBackend {
     /// `copystats::CrossCopyStats::blocking_host_copies`. An atomic because the
     /// read path takes `&self` (the trait's `read_host` shape).
     blocking_readbacks: std::sync::atomic::AtomicU64,
+    /// Issue #185: how many times **this backend** blocked the host on a whole
+    /// stream (`CudaState::sync`). Per instance, never the process-wide
+    /// `cuda::stream_sync_count()`: the F5 gates compare the async arm's stalls
+    /// against the synchronous arm's, and under a parallel harness a *foreign*
+    /// test's syncs landed between the two snapshots (run A: the async arm read
+    /// 4160 stalls against the synchronous arm's 728 — the harness's own load,
+    /// not the async path). Same hazard and same fix as `blocking_readbacks`,
+    /// which was per-instance from the start.
+    stream_syncs: std::sync::atomic::AtomicU64,
 }
 
 /// F5: one pinned host slab of the async D2H staging pool (see
@@ -196,6 +205,7 @@ impl CudaBackend {
             cross_slabs: Vec::new(),
             cross_pending: Vec::new(),
             blocking_readbacks: std::sync::atomic::AtomicU64::new(0),
+            stream_syncs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -490,7 +500,7 @@ impl CudaBackend {
                     pool_gen: self.pool_gen,
                     kv_layout: self.kv_layout,
                 });
-                self.state.sync();
+                self.state_sync();
             } else {
                 self.state.graph_destroy(exec);
                 // The recorded launches never executed — this step's
@@ -505,7 +515,7 @@ impl CudaBackend {
                      rerun with MINFER_NO_CUDA_GRAPH=1)"
                 );
                 self.graphs_mode = GraphMode::Disabled;
-                self.state.sync();
+                self.state_sync();
                 // NOTE: there is no poisoned-error mechanism — later steps
                 // run direct-launch with graphs disabled; this step's outputs
                 // were undefined and are consumed as-is. (Phase 8 review:
@@ -513,7 +523,7 @@ impl CudaBackend {
             }
             return;
         }
-        self.state.sync();
+        self.state_sync();
     }
 
     /// D1: a reference's device pointer with its window applied. D1 views are
@@ -551,7 +561,7 @@ impl CudaBackend {
         let mut out = vec![0f32; b.bytes / 4];
         self.blocking_readbacks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.state.sync();
+        self.state_sync();
         let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b.bytes) };
         // R3-A2: read through the pinned staging buffer (pageable-memcpy
         // bounce removed); MINFER_NO_PINNED_READBACK=1 reverts.
@@ -569,6 +579,28 @@ impl CudaBackend {
     pub fn blocking_readback_count(&self) -> u64 {
         self.blocking_readbacks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #185: this backend's own count of full-stream host stalls
+    /// (`CudaState::sync`, the only `cudaStreamSynchronize` in the device layer).
+    ///
+    /// It is the per-instance twin of the process-wide
+    /// [`crate::cuda::stream_sync_count`], and the F5 gates read it: a delta
+    /// around one workload is then attributable to that workload, whereas the
+    /// process-wide total moves whenever *any* other thread syncs (the parallel
+    /// harness ran the F5 gate beside ~27 other device tests).
+    #[allow(dead_code)] // read by the F5 device gates
+    pub fn stream_sync_count(&self) -> u64 {
+        self.stream_syncs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #185: `CudaState::sync` with this backend's stall counter bumped in
+    /// the same call, so the count and the stall cannot drift apart. Every sync
+    /// this backend performs goes through here.
+    fn state_sync(&self) {
+        self.stream_syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.state.sync();
     }
 
     /// F5: enqueue the **asynchronous** device→host staging copy of one node's
@@ -762,7 +794,7 @@ impl CudaBackend {
                 "CUDA: node error inside capture window (split {key:?}); capture aborted, \
                  graphs disabled for this session: {cause}"
             );
-            self.state.sync();
+            self.state_sync();
         }
     }
 
@@ -2386,7 +2418,10 @@ mod tests {
             alloc.fill_input(&g, "x", &data).unwrap();
             let before = alloc.cross_stats();
             let readbacks_before = alloc.cuda().unwrap().blocking_readback_count();
-            let syncs_before = crate::cuda::stream_sync_count();
+            // #185: read the count through the backend, never the process-wide
+            // `cuda::stream_sync_count()` — a concurrent device test's syncs would
+            // otherwise land inside this delta (the failure the ticket records).
+            let syncs_before = alloc.cuda().unwrap().stream_sync_count();
 
             BackendScheduler::new().execute(&g, &mut alloc).unwrap();
             let got = alloc.get_buffer(&g, 2).unwrap().to_vec();
@@ -2396,7 +2431,7 @@ mod tests {
                 got,
                 stats,
                 readbacks,
-                crate::cuda::stream_sync_count() - syncs_before,
+                alloc.cuda().unwrap().stream_sync_count() - syncs_before,
             )
         };
 
@@ -5448,6 +5483,16 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
+        // Issue #185: this gate drives `CudaBackend`/`CudaState` **directly** — no
+        // `scheduler::execute`, so the scheduler's device-path guard cannot see it.
+        // Under the parallel `#[ignore]`d harness its launches raced another test's
+        // open capture window and faulted inside `cuLaunchKernel` (3/3 of the
+        // post-guard gdb crashes); the device token taken here turns that into this
+        // test's own loud refusal. It is held for the whole gate, which is correct:
+        // the gate is one device workload.
+        let _device_entry =
+            crate::device_entry::enter("the S4 map-window A/B (direct device calls)")
+                .unwrap_or_else(|reason| panic!("{reason}"));
         let _guard = crate::cuda::CudaState::model_load_guard();
         const KMAX: usize = crate::graph::kvcache::KV_MAP_MAX_SPANS;
         // The 7B decode shape (hd 128, 4 KV heads) at a 2K window: long enough
@@ -9727,6 +9772,42 @@ mod tests {
         assert_eq!(
             toks1, toks3,
             "graph-captured generation diverged from direct launches"
+        );
+    }
+
+    /// Issue #185: the F5 host-stall counter is **per backend**, not the
+    /// process-wide `cuda::stream_sync_count()`. Two backends in one process each
+    /// count only their own `CudaState::sync` calls, so a gate can read a delta
+    /// attributable to its own workload even when other tests are syncing on the
+    /// shared singleton.
+    ///
+    /// Mutation evidence (rule 3): make `CudaBackend::stream_sync_count` return
+    /// `crate::cuda::stream_sync_count()` instead of `self.stream_syncs`, and the
+    /// second assertion goes red — the process-wide total moves for both.
+    #[test]
+    fn stream_sync_counts_are_per_backend_not_process_wide() {
+        if device().is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let mut a = GraphAllocator::new();
+        let mut b = GraphAllocator::new();
+        assert!(a.enable_cuda(), "a CUDA device answers the first probe");
+        assert!(b.enable_cuda(), "a CUDA device answers the second probe");
+        let a_before = a.cuda().unwrap().stream_sync_count();
+        let b_before = b.cuda().unwrap().stream_sync_count();
+        // `synchronize()` is what a split boundary calls; it ends in
+        // `CudaState::sync` (through the backend's own counter).
+        a.cuda_mut().unwrap().synchronize();
+        assert_eq!(
+            a.cuda().unwrap().stream_sync_count(),
+            a_before + 1,
+            "the syncing backend must count its own stall"
+        );
+        assert_eq!(
+            b.cuda().unwrap().stream_sync_count(),
+            b_before,
+            "a sync on one backend must not move another backend's counter"
         );
     }
 }
