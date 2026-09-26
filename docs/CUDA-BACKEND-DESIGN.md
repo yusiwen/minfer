@@ -888,6 +888,41 @@ tried first and writes f16 **1-D norms**, which the engine cannot load (filed as
 [#169](https://github.com/yusiwen/minfer/issues/169)). The plane gate needs
 `/tmp/f167-work/qwen3-q4k.gguf` and skips (printing why) when it is absent.
 
+---
+
+### 7.8 Issue #169 verification — the norm weight type is part of the rms_norm invariant (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
+
+The issue recorded this as a **latent** hazard: `CudaBackend::norm_weight` resolved the weight by
+name and checked only that it was *registered*, not what it was. The CUDA `rms_norm` kernel indexes
+the weight as `d` f32 elements (`d*4` bytes) regardless, so an f16 norm weight (2 B/element) — which
+`minfer quantize --type f16` used to write for every 1-D tensor — would be read past its end. The CPU
+panic was reached first there, so the device behaviour was not observable at the time.
+
+`norm_weight(node, elems)` now resolves `CudaState::weight_size(name)` (the registered raw length,
+the same convention `has_weight_of_size` uses for a padded Q6_K plane) and requires exactly
+`elems * 4`, returning `Err` that names the registered length, the length the kernel reads, the node
+and "f16-norm". Both callers pass the dim the kernel uses (`node.out_shape[0]` for `Op::RmsNorm`,
+`*hd` for `Op::QkNorm`), so the check is the kernel's own geometry, not a name heuristic.
+
+**Verified.** `cuda_norm_weight_size_is_part_of_the_invariant`: one 64-element norm graph, two
+registered names, both valid float4 dims — the f32 arm (control) executes, the f16-sized arm must
+`Err` and the test asserts the refusal names `128 B`, `256 B` and `f16-norm`. The mutation (check
+forced off) makes the f16 arm **execute** and, under `compute-sanitizer --tool memcheck`,
+`Invalid __global__ read of size 16 bytes` ×12 / `ERROR SUMMARY: 12 errors` — the read is real.
+The CUDA unit suite is **526 passed / 0 failed / 37 ignored** with the gate in place (baseline
+524 / 0 / 37, +1 CI tooling gate and +1 device gate), and `compute-sanitizer` over that suite reports
+**0 errors**. The end-to-end half is #169's acceptance run: `minfer quantize --type f16` of the
+cached `Qwen3-0.6B-Q8_0.gguf` now writes 1-D f32 / 2-D f16, the file is byte-identical to
+`llama-quantize … F16`, and it runs with all 28 blocks + embed/output on the device (1137.0 MiB);
+CPU-vs-CUDA argmax agrees at prefill and the two decode steps (max |Δlogit| 0.0178).
+
+**Honest scope.** The gate is device-only (CI has no GPU); its arithmetic has no CI-covered pure
+twin — it is one `usize` comparison against `elems * 4`, and the device arm is the gate. It does not
+make an f16-norm model *loadable* on CUDA; registration still admits an f16 1-D weight, and the
+refusal happens at execute time with the node named, which is the documented `Err`-not-fallback rule
+of `docs/GPU_SAFETY.md`. The one lookup per norm node per execution was not benchmarked and no
+timing claim is made.
+
 ## 8. Out of Scope / Future
 
 - **Not planned** (revisit with a concrete need): cuBLAS/cublasLt, VMM pool, multi-GPU + peer copies,
