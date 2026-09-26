@@ -287,11 +287,18 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         }
     };
     if !plan.preserved.is_empty() {
+        // The reason differs per target: a quant target also preserves a 2-D
+        // tensor whose row length is not block-aligned, while f16 preserves
+        // 1-D tensors only (its block size is 1, so the row-length clause would
+        // be meaningless). #169.
+        let why = if target == QuantTarget::F16 {
+            "1-D".to_string()
+        } else {
+            format!("1-D or row length not a multiple of {}", target.blck_size())
+        };
         eprintln!(
-            "quantize: {} tensor(s) keep their source type (1-D or row length not a multiple of \
-             {}): {}",
+            "quantize: {} tensor(s) keep their source type ({why}): {}",
             plan.preserved.len(),
-            target.blck_size(),
             plan.preserved.join(", ")
         );
     }
@@ -506,6 +513,7 @@ pub fn run_split(prog: &str, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::GgmlType;
 
     #[test]
     fn parse_size_accepts_bytes_and_binary_suffixes() {
@@ -523,6 +531,144 @@ mod tests {
         let (dir, stem) = split_targets(Path::new("/tmp/f6-work/model.gguf"));
         assert_eq!(dir, Path::new("/tmp/f6-work"));
         assert_eq!(stem, "model");
+    }
+
+    // === #169: the 1-D rule per quantize target, read back from the output ===
+
+    /// A miniature stand-in for the files the converters produce: 2-D matmul
+    /// weights **f16**, 1-D norms/biases **f32** (`minfer convert --outtype f16`
+    /// and `llama-quantize … F16` both write that shape).
+    fn miniature_f16_source_specs() -> Vec<gguf_write::TensorSpec> {
+        vec![
+            gguf_write::TensorSpec::new("token_embd.weight", [64, 4, 1, 1], GgmlType::F16),
+            gguf_write::TensorSpec::new("blk.0.attn_norm.weight", [64, 1, 1, 1], GgmlType::F32),
+            gguf_write::TensorSpec::new("blk.0.attn_q.weight", [64, 2, 1, 1], GgmlType::F16),
+            gguf_write::TensorSpec::new("blk.0.attn_q.bias", [64, 1, 1, 1], GgmlType::F32),
+            gguf_write::TensorSpec::new("blk.0.ffn_down.weight", [64, 3, 1, 1], GgmlType::F16),
+            gguf_write::TensorSpec::new("output_norm.weight", [64, 1, 1, 1], GgmlType::F32),
+            // no `output.weight`: the tied model shape, but no sub-8-bit target
+            // here, so the tied-embedding retarget must not fire.
+        ]
+    }
+
+    /// `name -> (type, payload)` for one file, resolved through the parser's
+    /// own index and the mapped data section.
+    fn tensor_of<'a>(
+        model: &'a crate::gguf::GgufModel,
+        name: &str,
+    ) -> (&'a crate::gguf::GgufTensorInfo, &'a [u8]) {
+        let part = &model.parts[0];
+        let ti = part
+            .ctx
+            .info
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tensor {name} missing"));
+        let base = part.ctx.offset + ti.offset as usize;
+        (ti, &part.data[base..base + ti.nbytes()])
+    }
+
+    /// #169: every target's 1-D rule, asserted on the **types read back from
+    /// the written file** (not on the plan), with the payload of a preserved
+    /// 1-D tensor compared byte-for-byte against the source.
+    ///
+    /// The arms differ in the property under test, so neither can carry the
+    /// other: the **f16** arm must come back 1-D f32 / 2-D f16 (the bug wrote
+    /// 1-D f16), and the **f32** control must come back all f32 (it fails if
+    /// the target is ignored and the source's f16 2-D weights leak through).
+    /// The source payloads are non-zero and distinct, so "preserved verbatim"
+    /// is a check with content, and the expected type per tensor is computed
+    /// from the source spec's rank — never from `plan.preserved`.
+    #[test]
+    fn quantize_f16_keeps_1d_f32_and_encodes_2d_f16() {
+        let dir = work_dir("quantize-1d");
+        let src = dir.join("src.gguf");
+        let _ = std::fs::remove_file(&src);
+        let specs = miniature_f16_source_specs();
+        let kv = vec![
+            crate::gguf::GgufKv::new_string("general.architecture".into(), "qwen2".into()),
+            crate::gguf::GgufKv::new_u32("general.file_type".into(), 1),
+        ];
+        gguf_write::write_single(&src, &kv, specs.clone(), 32, |i, w| {
+            w.write_all(&vec![0x11 + i as u8; specs[i].nbytes()])
+        })
+        .expect("write the miniature source");
+        let model = crate::gguf::load_gguf_model(&src).expect("source parses");
+
+        for (target, tag) in [
+            (QuantTarget::F16, "f16"),
+            (QuantTarget::F32, "f32"),
+            (QuantTarget::Q8_0, "q8_0"),
+        ] {
+            let out = dir.join(format!("out-{tag}.gguf"));
+            let _ = std::fs::remove_file(&out);
+            let plan = QuantizePlan::plan(&model, target).expect("plan");
+            plan.write_single(&model, &out).expect("write");
+            let got = crate::gguf::load_gguf_model(&out).expect("output parses");
+
+            // The values first: the type of every tensor **as the written file
+            // declares it**, against a want computed from the source spec's rank
+            // (never from `plan`). A preserved 1-D tensor must also carry the
+            // source's own bytes.
+            for s in &specs {
+                let (ti, payload) = tensor_of(&got, &s.name);
+                let want = if target == QuantTarget::F32 {
+                    GgmlType::F32
+                } else if s.ne[1] <= 1 {
+                    // The engine's norm/bias path reads f32 only, for every
+                    // non-f32 target (#169).
+                    GgmlType::F32
+                } else {
+                    target.ggml_type()
+                };
+                assert_eq!(
+                    ti.type_,
+                    want,
+                    "{target:?}: tensor {} came back {}, expected {} (rank {})",
+                    s.name,
+                    ti.type_.type_name(),
+                    want.type_name(),
+                    if s.ne[1] <= 1 { "1-D" } else { "2-D" }
+                );
+                if target != QuantTarget::F32 && s.ne[1] <= 1 {
+                    let (_, src_payload) = tensor_of(&model, &s.name);
+                    assert_eq!(
+                        payload, src_payload,
+                        "{target:?}: preserved 1-D tensor {} must be the source bytes",
+                        s.name
+                    );
+                }
+            }
+
+            // Then the report: the 1-D tensors that are *not* re-encoded must
+            // be named; f32 re-encodes every tensor, so its list is empty.
+            let one_d: Vec<&str> = specs
+                .iter()
+                .filter(|s| s.ne[1] <= 1)
+                .map(|s| s.name.as_str())
+                .collect();
+            if target == QuantTarget::F32 {
+                assert!(
+                    plan.preserved.is_empty(),
+                    "f32 converts every tensor, so nothing may be preserved: {:?}",
+                    plan.preserved
+                );
+            } else {
+                assert_eq!(
+                    plan.preserved.len(),
+                    one_d.len(),
+                    "{target:?}: the preserved list must be exactly the 1-D tensors: {:?}",
+                    plan.preserved
+                );
+                for n in &one_d {
+                    assert!(
+                        plan.preserved.iter().any(|p| p.starts_with(n)),
+                        "{target:?}: 1-D tensor {n} is missing from {:?}",
+                        plan.preserved
+                    );
+                }
+            }
+        }
     }
 
     // === F6 real-model gates (#[ignore]: CI has no checkpoint/model) ===
@@ -1560,6 +1706,41 @@ mod tests {
         assert!(err.contains("no weight encoder"), "{err}");
 
         let (lf, gf) = logits_greedy(&src, PROMPT, 4, 512);
+
+        // #169: the f16 arm of the same 1-D rule, on the real source. 1-D is
+        // f32, 2-D is f16, every 1-D tensor is reported preserved — and because
+        // every source value is already f16-representable, the f16→f16 cast
+        // must be exact, so the source's own logits are an independently
+        // computed expected value (bitwise, an `assert_eq!`).
+        let out16 = dir.join("f16.gguf");
+        let _ = std::fs::remove_file(&out16);
+        let plan16 = QuantizePlan::plan(&src_gguf, QuantTarget::F16).expect("plan f16");
+        plan16.write_single(&src_gguf, &out16).expect("write f16");
+        let f = crate::gguf::load_gguf_model(&out16).expect("f16 parses");
+        let mut n_1d = 0usize;
+        for ti in &f.parts[0].ctx.info {
+            let want = if ti.ne[1] <= 1 {
+                n_1d += 1;
+                crate::gguf::GgmlType::F32
+            } else {
+                crate::gguf::GgmlType::F16
+            };
+            assert_eq!(ti.type_, want, "f16 tensor {} type", ti.name);
+        }
+        assert!(n_1d > 0, "the f16 output has no 1-D tensor");
+        assert_eq!(
+            plan16.preserved.len(),
+            n_1d,
+            "every 1-D tensor must be reported preserved for f16: {:?}",
+            plan16.preserved
+        );
+        let (l16, g16) = logits_greedy(&out16, PROMPT, 4, 512);
+        assert_eq!(gf, g16, "the f16 cast changed the greedy continuation");
+        assert_eq!(
+            lf, l16,
+            "an f16→f16 cast must be bitwise: every source value is representable"
+        );
+
         let (lq, gq) = logits_greedy(&out, PROMPT, 4, 512);
         assert_eq!(gf, gq, "q8_0 greedy continuation differs from f16");
         let max_abs = lf
