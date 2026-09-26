@@ -663,21 +663,15 @@ impl GraphAllocator {
                     // fused decode QKV: also needs the layer's persistent KV
                     // regions (the kernel stores K/V), but its output is a
                     // normal concat buffer (q|k|v), not the K region.
-                    let (kv_elems, n_ctx) = match &node.meta {
-                        NodeMeta::FusedQkv(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
-                        _ => (node.n_elements(), node.out_shape[1]),
+                    let (n_embd, row_elems, n_ctx) = match &node.meta {
+                        NodeMeta::FusedQkv(m) => (m.nkt, m.row_elems, m.kv_elems / m.nkt.max(1)),
+                        _ => (node.out_shape[0], node.out_shape[0], node.out_shape[1]),
                     };
-                    // The fusion is GPU-only, so its logical width is also its cell
-                    // width. Under a packed format this layer's region would be sized
-                    // differently from its store node's, and `ensure_kv` refuses that
-                    // mismatch loudly — the two node kinds cannot disagree.
-                    self.ensure_kv(
-                        layer,
-                        backend,
-                        kv_elems / n_ctx.max(1),
-                        kv_elems / n_ctx.max(1),
-                        n_ctx,
-                    )?;
+                    // C4/#144: the meta carries the *cell* width (`row_elems`), not
+                    // the logical one, so a packed fused node and the packed store
+                    // node size the same region. Before #144 the fused node was only
+                    // ever built for f32/f16, where the two widths coincide.
+                    self.ensure_kv(layer, backend, n_embd, row_elems, n_ctx)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size)?;
@@ -689,17 +683,13 @@ impl GraphAllocator {
                     // fused decode QKV with per-head Q/K RMSNorm (Qwen3): same
                     // layout as FusedQKV — persistent KV regions + a normal
                     // concat (q|k|v) output buffer for the attention q input.
-                    let (kv_elems, n_ctx) = match &node.meta {
-                        NodeMeta::FusedQkvNorm(m) => (m.kv_elems, m.kv_elems / m.nkt.max(1)),
-                        _ => (node.n_elements(), node.out_shape[1]),
+                    let (n_embd, row_elems, n_ctx) = match &node.meta {
+                        NodeMeta::FusedQkvNorm(m) => {
+                            (m.nkt, m.row_elems, m.kv_elems / m.nkt.max(1))
+                        }
+                        _ => (node.out_shape[0], node.out_shape[0], node.out_shape[1]),
                     };
-                    self.ensure_kv(
-                        layer,
-                        backend,
-                        kv_elems / n_ctx.max(1),
-                        kv_elems / n_ctx.max(1),
-                        n_ctx,
-                    )?;
+                    self.ensure_kv(layer, backend, n_embd, row_elems, n_ctx)?;
                     if last_use[id] > i {
                         let size = node.n_elements();
                         let pid = self.alloc_in_pool(backend, size)?;
@@ -711,23 +701,16 @@ impl GraphAllocator {
                     // D3-8: the mixed-quant QKV epilogue also needs the layer's
                     // persistent KV regions (it stores k/v like FusedQKV).
                     if let Op::QkvBiasRopeStore { layer } = &node.op {
-                        let (kv_elems, n_ctx) = match &node.meta {
+                        // C4/#144: like `Op::FusedQKV`, the meta now carries the
+                        // packed cell width so a packed epilogue sizes the region the
+                        // store node sized.
+                        let (n_embd, row_elems, n_ctx) = match &node.meta {
                             NodeMeta::QkvBiasRopeStore(m) => {
-                                (m.kv_elems, m.kv_elems / m.nkt.max(1))
+                                (m.nkt, m.row_elems, m.kv_elems / m.nkt.max(1))
                             }
-                            _ => (node.n_elements(), node.out_shape[1]),
+                            _ => (node.out_shape[0], node.out_shape[0], node.out_shape[1]),
                         };
-                        // The epilogue stores K/V like the fusion, so it too hands in
-                        // its logical width as its cell width (a packed format never
-                        // reaches it: the graph would then also carry a store node
-                        // whose region size disagrees, which `ensure_kv` refuses).
-                        self.ensure_kv(
-                            *layer,
-                            backend,
-                            kv_elems / n_ctx.max(1),
-                            kv_elems / n_ctx.max(1),
-                            n_ctx,
-                        )?;
+                        self.ensure_kv(*layer, backend, n_embd, row_elems, n_ctx)?;
                     }
                     // In-place elementwise transforms: alias the input buffer
                     // (llama.cpp executes rope/silu in place). Same-backend

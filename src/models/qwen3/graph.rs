@@ -136,6 +136,7 @@ impl Qwen3Graph {
                         freq_scale: hp.rope_freq_scale,
                         rope_style: hp.rope_style,
                         kv_elems: nkt * n_ctx,
+                        row_elems: params.cparams.kv_format.row_elems(nkt),
                         eps,
                     },
                 );

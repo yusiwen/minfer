@@ -2706,6 +2706,23 @@ __device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0>(const char* row, int elem)
     return make_float4(d * (float)q[0], d * (float)q[1], d * (float)q[2], d * (float)q[3]);
 }
 
+// #144: dequantize EIGHT consecutive elements of one packed Q8_0 KV cell into
+// eight halves (one 16-byte tensor-core staging slot). `elem` must be a multiple
+// of 8 and every head base is 32-element aligned (`ensure_kv`), so the group
+// never straddles a Q8_0 block — the same precondition `kv4<Q8_0>` relies on.
+// The dequant is `kv4<Q8_0>`'s, element for element (block scale times the signed
+// quant), rounded to half because the FA path's smem tile is f16.
+__device__ __forceinline__ void kv8_q8_0(__half* dst, const char* row, int elem) {
+    const unsigned char* blk =
+        reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const signed char* q = reinterpret_cast<const signed char*>(blk + 2) + (elem & 31);
+    __half2* h = reinterpret_cast<__half2*>(dst);
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        h[i] = __floats2half2_rn(d * (float)q[2 * i], d * (float)q[2 * i + 1]);
+}
+
 // ─── KV cache store: scatter nt rows into persistent cache ───
 
 __global__ void store_kv_f32(
@@ -2749,6 +2766,28 @@ __global__ void store_kv_f16(
     }
 }
 
+// Quantize ONE block (32 f32 values) into one packed Q8_0 block at `cell`.
+// This is the single device-side statement of the C4 S2b quantizer — `d =
+// amax/127` stored as an f16 with round-to-nearest-even and every quant
+// `rintf(x/d)` clamped to the i8 range — shared by the KV store and, since #144
+// item 1, the packed fused decode epilogue. `x` may live in registers or in
+// global memory; the loop reads each element once.
+__device__ __forceinline__ void q8_0_quantize_block(const float* x, unsigned char* cell) {
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) amax = fmaxf(amax, fabsf(x[i]));
+    const float d = amax / 127.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    *reinterpret_cast<__half*>(cell) = __float2half_rn(d);
+    signed char* q = reinterpret_cast<signed char*>(cell + 2);
+    #pragma unroll
+    for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
+        float v = rintf(x[i] * id);
+        v = fminf(127.0f, fmaxf(-128.0f, v));
+        q[i] = (signed char)(int)v;
+    }
+}
+
 // C4 S2b: quantize nt f32 rows into packed Q8_0 cells. One thread per
 // (row, 32-element block); `row_bytes` is the packed cell's byte width
 // (`KvFormat::Q8_0.row_bytes(nkt)` = ceil(nkt/32*34 / 4) * 4 words).
@@ -2771,20 +2810,7 @@ __global__ void store_kv_q8_0(
     if (t >= nt || blk >= nblk) return;
     const int p = positions[t];
     const float* x = src + (size_t)t * nkt + (size_t)blk * Q8_0_BLOCK_ELEMS;
-    float amax = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) amax = fmaxf(amax, fabsf(x[i]));
-    const float d = amax / 127.0f;
-    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
-    unsigned char* cell = dst + (size_t)p * row_bytes + (size_t)blk * Q8_0_BLOCK_BYTES;
-    *reinterpret_cast<__half*>(cell) = __float2half_rn(d);
-    signed char* q = reinterpret_cast<signed char*>(cell + 2);
-    #pragma unroll
-    for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
-        float v = rintf(x[i] * id);
-        v = fminf(127.0f, fmaxf(-128.0f, v));
-        q[i] = (signed char)(int)v;
-    }
+    q8_0_quantize_block(x, dst + (size_t)p * row_bytes + (size_t)blk * Q8_0_BLOCK_BYTES);
 }
 
 // ─── Fused decode QKV epilogue: bias-add + RoPE + KV-store (nt==1) ───
@@ -2882,6 +2908,102 @@ __global__ void attn_bias_rope_store_f32(
         } else {
             kv_v[(size_t)row * nkt + j] = val;
         }
+    }
+}
+
+// ─── #144 item 1: the PACKED arm of the fused decode epilogue ────────────────
+// The f32/f16 kernel above writes one K/V element per thread, which a packed
+// cell cannot accept: a Q8_0 block's scale needs all 32 of its elements before
+// any of them can be quantized. This arm keeps the same q section (bias + rope
+// in place, one thread per pair) and re-maps the K and V sections to one thread
+// per (head, 32-element block): the thread computes the block's 32 values
+// itself and hands them to `q8_0_quantize_block`, the store's own quantizer, so
+// the bytes it writes are the unfused chain's (`add_bias`+`rope`+`store_kv_q8_0`)
+// verbatim.
+//
+// K's 32 roped values are computed from the *unroped* k row plus the rope pair
+// partner (element d <-> d + hd/2 within the head, the neox pairing
+// `attn_bias_rope_store_f32` uses). Neither K nor V is written back: both fused
+// classes leave those buffers dead (attention reads the packed region) and a
+// block-owning thread cannot write `k` in place without racing the thread that
+// reads its pair partner. The observable output — the packed region's bytes — is
+// the unfused chain's.
+__global__ void attn_bias_rope_store_q8_0(
+    float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v,
+    unsigned char* __restrict__ kv_k,
+    unsigned char* __restrict__ kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions,
+    const int* cells,
+    size_t row_bytes
+) {
+    const int half_dim = hd / 2;
+    const int qpairs = nqt / 2;
+    const int kblks = nkt / Q8_0_BLOCK_ELEMS;
+    const int total = qpairs + 2 * kblks;
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= total) return;
+    // C6: `positions[0]` is the rope angle's sequence-relative index and
+    // `cells[0]` the allocator-resolved row the packed cell is written at.
+    const int pos = positions[0];
+    const int row = cells[0];
+
+    if (u < qpairs) {
+        // q section: bias + rope in place (verbatim attn_bias_rope_store_f32)
+        const int head = u / half_dim;
+        const int d    = u % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        float x0 = q[j]  + bias_q[j];
+        float x1 = q[j2] + bias_q[j2];
+        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
+        float theta = pos * freq;
+        float cs = cosf(theta), sn = sinf(theta);
+        q[j]  = x0 * cs - x1 * sn;
+        q[j2] = x0 * sn + x1 * cs;
+    } else if (u < qpairs + kblks) {
+        // K section: one (head, block). `b` is also the block's index inside the
+        // packed row (blocks are laid out in flat element order).
+        const int b = u - qpairs;
+        const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
+        const int head = b / (hd / Q8_0_BLOCK_ELEMS);
+        float x[Q8_0_BLOCK_ELEMS];
+        #pragma unroll
+        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
+            // `d` is the element's index inside the head, so the block's own
+            // offset must be added — without it every block of a head would
+            // compute the head's first 32 values (caught by
+            // cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer's byte arm).
+            const int d = blk * Q8_0_BLOCK_ELEMS + i;
+            const int dd = (d < half_dim) ? d : d - half_dim;
+            const int ja = head * hd + dd;
+            const int jb = ja + half_dim;
+            float x0 = k[ja] + bias_k[ja];
+            float x1 = k[jb] + bias_k[jb];
+            float freq = freq_scale / powf(freq_base, (2.0f * dd) / hd);
+            float theta = pos * freq;
+            float cs = cosf(theta), sn = sinf(theta);
+            x[i] = (d < half_dim) ? (x0 * cs - x1 * sn) : (x0 * sn + x1 * cs);
+        }
+        q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
+    } else {
+        // V section: one block, bias + quantize. The bias is folded into the
+        // quantized value only: like the K section, the V buffer itself is dead
+        // in both fused classes (attention reads the packed region), and leaving
+        // it unwritten lets `v` stay `const`.
+        const int b = u - qpairs - kblks;
+        const int base = b * Q8_0_BLOCK_ELEMS;
+        float x[Q8_0_BLOCK_ELEMS];
+        #pragma unroll
+        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) x[i] = v[base + i] + bias_v[base + i];
+        q8_0_quantize_block(x, kv_v + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
     }
 }
 
@@ -4586,6 +4708,30 @@ void launch_attn_bias_rope_store(
     minfer_launch_ok("launch:attn_bias_rope_store", "attn_bias_rope_store_f32");
 }
 
+// #144 item 1: the packed arm's launcher. Same 256-thread blocks over the
+// (nqt/2 qpairs + nkt/32 K blocks + nkt/32 V blocks) thread mapping; `row_bytes`
+// is the packed cell's byte width, the same number `store_kv_q8_0` is given.
+void launch_attn_bias_rope_store_q8_0(
+    float* q, const float* k, const float* v,
+    const void* bias_q, const void* bias_k, const void* bias_v,
+    void* kv_k, void* kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions, const int* cells, size_t row_bytes,
+    cudaStream_t stream
+) {
+    const int total = nqt / 2 + 2 * (nkt / Q8_0_BLOCK_ELEMS);
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    minfer_launch_prelude("launch:attn_bias_rope_store_q8_0", "attn_bias_rope_store_q8_0");
+    attn_bias_rope_store_q8_0<<<grid, minfer_launch_block("launch:attn_bias_rope_store_q8_0", block), 0, stream>>>(
+        q, k, v,
+        (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
+        (unsigned char*)kv_k, (unsigned char*)kv_v,
+        nqt, nkt, hd, freq_base, freq_scale, positions, cells, row_bytes);
+    minfer_launch_ok("launch:attn_bias_rope_store_q8_0", "attn_bias_rope_store_q8_0");
+}
+
 void launch_gqa_attn_f32_f16kv(
     const float* q, const void* k, const void* v, float* o,
     const int* bound, int mode,
@@ -4814,7 +4960,7 @@ void launch_gqa_attn_f32(
     #undef GQA_F32_LAYOUT_CASE
 }
 
-// ─── 8n: FA-style prefill attention (f16 KV) ────────────────────────────
+// ─── 8n: FA-style prefill attention (staged KV) ─────────────────────────
 // The legacy gqa_attn_f32_f16kv launches one block per (token, head): K is
 // re-read per token per head (7B @2K: ~132 GB per layer) and the hd-wide
 // accumulator lives in registers (float4 oc[32] = 128 regs → spills). It
@@ -4822,6 +4968,12 @@ void launch_gqa_attn_f32(
 // tiles the q dimension: one block per (64-token q tile, head), K/V tiles
 // staged in shared memory, QK^T on tensor cores, online softmax with the
 // O accumulator in shared memory. K traffic drops to ~0.8 GB per layer.
+//
+// The tile is f16 whatever the cache holds: `LAYOUT` picks the staging —
+// `KV_LAYOUT_F16` copies halves with 16-byte `cp.async` chunks, and #144 item 3's
+// `KV_LAYOUT_Q8_0` dequantizes each packed 32-element block into the same tile
+// (one 16-byte smem store per 8 elements). Everything after staging — the
+// tensor-core QK^T, the fragment-resident softmax and P·V — is layout-blind.
 //
 // Shared layout (dynamic, ~35 KB — opt-in via cudaFuncSetAttribute):
 //   Qs [64*hd] f16   q tile (scale folded in, f16 for the tensor-core QK^T)
@@ -4842,18 +4994,45 @@ void launch_gqa_attn_f32(
   // C linkage — the launchers above keep theirs; the FA kernel and its launcher
   // below open a block of their own)
 
-template <bool MAP>
+template <bool MAP, int LAYOUT>
 __device__ __forceinline__ void fa_stage_kv_async(
-    const __half* __restrict__ k, const __half* __restrict__ v,
+    const void* __restrict__ kv_kbase, const void* __restrict__ kv_vbase,
     __half* Ks, __half* Vs, const int* __restrict__ bound, int mt,
     int kt, int kv_end,
-    int hk, int hd, int stride_kv, int sstr, int tid, int nthreads
+    int hk, int hd, int stride_kv, int sstr, int tid, int nthreads,
+    size_t row_bytes
 ) {
     // C8b S4: `p` is a linear window index, which the contiguous modes take as the
     // arena row itself and the map mode resolves through the runs. `mt` is the
     // tile's widest window, so its run list names every index this tile stages
     // (row past `kv_end` are stored zero-length by the size-0 cp.async below, so
     // their address is never read).
+    if (LAYOUT == KV_LAYOUT_Q8_0) {
+        // #144 item 3: a packed cell cannot be `cp.async`'d — a Q8_0 block's 32
+        // quants must be dequantized before they can be a tensor-core operand —
+        // so the packed staging is a synchronous load/scale/convert of 8
+        // elements (one 16 B smem store) at a time. The rows past `kv_end` are
+        // zero-filled through the same store, exactly like the f16 arm's
+        // zero-length cp.async. `row_bytes` is the packed cell width
+        // (`KvFormat::Q8_0.row_bytes(nkt)`), the same byte stride every other
+        // packed kernel addresses a cell with.
+        const uint4 z4 = make_uint4(0, 0, 0, 0);
+        for (int c = tid; c < FA_TKV * hd / 8; c += nthreads) {
+            int r = (c * 8) / hd, d = (c * 8) % hd;
+            const int p = kt + r;
+            const int row = kv_cell<MAP>(bound, mt, 0, p);
+            if (p < kv_end) {
+                kv8_q8_0(Ks + r * sstr + d, kv_row(kv_kbase, row, row_bytes), hk * hd + d);
+                kv8_q8_0(Vs + r * sstr + d, kv_row(kv_vbase, row, row_bytes), hk * hd + d);
+            } else {
+                *reinterpret_cast<uint4*>(Ks + r * sstr + d) = z4;
+                *reinterpret_cast<uint4*>(Vs + r * sstr + d) = z4;
+            }
+        }
+        return;
+    }
+    const __half* __restrict__ k = reinterpret_cast<const __half*>(kv_kbase);
+    const __half* __restrict__ v = reinterpret_cast<const __half*>(kv_vbase);
 #if __CUDA_ARCH__ >= 800
     for (int c = tid; c < FA_TKV * hd / 8; c += nthreads) {
         int r = (c * 8) / hd, d = (c * 8) % hd;
@@ -4889,16 +5068,17 @@ __device__ __forceinline__ void fa_stage_kv_async(
 #endif
 }
 
-template <bool CAUSAL, bool MAP>
-__global__ void fa_prefill_f16kv(
+template <bool CAUSAL, bool MAP, int LAYOUT>
+__global__ void fa_prefill_kv(
     const float* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
+    const void* __restrict__ k,
+    const void* __restrict__ v,
     float* __restrict__ o,
     const int* __restrict__ bound,
     int nh, int nk, int hd,
     float scale,
-    int nt
+    int nt,
+    size_t row_bytes
 ) {
     extern __shared__ __align__(256) uint8_t smem[];
     // Padded smem row stride: hd=128 halves = 256B ≡ 0 mod 32 banks makes
@@ -5000,8 +5180,8 @@ __global__ void fa_prefill_f16kv(
     const int kt0 = CAUSAL ? 0 : (win_lo / FA_TKV) * FA_TKV;
     for (int kt = kt0; kt < kv_end; kt += FA_TKV) {
         // stage K/V tile (padded stride, zero-filled beyond kv_end)
-        fa_stage_kv_async<MAP>(k, v, Ks, Vs, bound, mt, kt, kv_end, hk, hd, stride_kv, sstr, tid,
-                               128);
+        fa_stage_kv_async<MAP, LAYOUT>(k, v, Ks, Vs, bound, mt, kt, kv_end, hk, hd, stride_kv,
+                                       sstr, tid, 128, row_bytes);
 #if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;\n");
         asm volatile("cp.async.wait_group 0;\n");
@@ -5464,9 +5644,10 @@ static bool minfer_launch_ok_opt(const char* site, const char* kernel_name) {
 
 extern "C" {
 
-int launch_fa_prefill_f16kv(
-    const float* q, const __half* k, const __half* v, float* o,
+int launch_fa_prefill_kv(
+    const float* q, const void* k, const void* v, float* o,
     const int* bound, int mode, int nh, int nk, int hd, float scale, int nt,
+    int layout, size_t row_bytes,
     cudaStream_t stream
 ) {
     // Qs + Ks + Vs only (S/P no longer go through shared memory). sstr = hd+8
@@ -5476,15 +5657,24 @@ int launch_fa_prefill_f16kv(
     if (smem > attr_smem) {
         // The opt-in is per *function*, so every instantiation the dispatch below
         // can pick needs its own — a single call (the pre-C8b S4 form) left one of
-        // the two window modes without it.
+        // the two window modes without it. #144 adds the packed instantiations:
+        // the smem size is layout-independent (the packed cell is dequantized
+        // into the same f16 tile), so one attribute covers whichever layout runs.
         cudaError_t e = cudaSuccess;
         for (int m = ATTN_WIN_CAUSAL; m <= ATTN_WIN_MAP && e == cudaSuccess; m++) {
             const void* f = m == ATTN_WIN_MAP
-                                ? (const void*)&fa_prefill_f16kv<false, true>
+                                ? (const void*)&fa_prefill_kv<false, true, KV_LAYOUT_F16>
                             : m == ATTN_WIN_SPAN
-                                ? (const void*)&fa_prefill_f16kv<false, false>
-                                : (const void*)&fa_prefill_f16kv<true, false>;
+                                ? (const void*)&fa_prefill_kv<false, false, KV_LAYOUT_F16>
+                                : (const void*)&fa_prefill_kv<true, false, KV_LAYOUT_F16>;
             e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            if (e != cudaSuccess) break;
+            const void* p = m == ATTN_WIN_MAP
+                                ? (const void*)&fa_prefill_kv<false, true, KV_LAYOUT_Q8_0>
+                            : m == ATTN_WIN_SPAN
+                                ? (const void*)&fa_prefill_kv<false, false, KV_LAYOUT_Q8_0>
+                                : (const void*)&fa_prefill_kv<true, false, KV_LAYOUT_Q8_0>;
+            e = cudaFuncSetAttribute(p, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         }
         if (e != cudaSuccess) {
             cudaGetLastError(); // clear the error so it cannot poison the stream
@@ -5494,7 +5684,7 @@ int launch_fa_prefill_f16kv(
             if (!warned) {
                 warned = 1;
                 fprintf(stderr,
-                        "minfer/cuda: fa_prefill_f16kv smem %zu B exceeds the device "
+                        "minfer/cuda: fa_prefill_kv smem %zu B exceeds the device "
                         "limit; falling back to the legacy attention kernel\n",
                         smem);
             }
@@ -5507,21 +5697,52 @@ int launch_fa_prefill_f16kv(
     // the Rust caller falls back to the legacy per-token attention kernel when
     // this returns non-zero (the `-1` smem arm above is the same contract).
     bool launched;
+    if (layout == KV_LAYOUT_Q8_0) {
+        if (mode == ATTN_WIN_MAP) {
+            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map",
+                                  "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0>");
+            fa_prefill_kv<false, true, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                       scale, nt, row_bytes);
+            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map",
+                                            "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0>");
+        } else if (mode == ATTN_WIN_SPAN) {
+            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span",
+                                  "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0>");
+            fa_prefill_kv<false, false, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                        scale, nt, row_bytes);
+            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span",
+                                            "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0>");
+        } else {
+            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal",
+                                  "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0>");
+            fa_prefill_kv<true, false, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                       scale, nt, row_bytes);
+            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal",
+                                            "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0>");
+        }
+        return launched ? 0 : -1;
+    }
     if (mode == ATTN_WIN_MAP) {
-        minfer_launch_prelude("launch:fa_prefill_f16kv__map", "fa_prefill_f16kv<false,true>");
-        fa_prefill_f16kv<false, true><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                   scale, nt);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__map", "fa_prefill_f16kv<false,true>");
+        minfer_launch_prelude("launch:fa_prefill_kv__f16_map",
+                              "fa_prefill_kv<false,true,KV_LAYOUT_F16>");
+        fa_prefill_kv<false, true, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                   scale, nt, row_bytes);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map",
+                                        "fa_prefill_kv<false,true,KV_LAYOUT_F16>");
     } else if (mode == ATTN_WIN_SPAN) {
-        minfer_launch_prelude("launch:fa_prefill_f16kv__span", "fa_prefill_f16kv<false,false>");
-        fa_prefill_f16kv<false, false><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                    scale, nt);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__span", "fa_prefill_f16kv<false,false>");
+        minfer_launch_prelude("launch:fa_prefill_kv__f16_span",
+                              "fa_prefill_kv<false,false,KV_LAYOUT_F16>");
+        fa_prefill_kv<false, false, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                    scale, nt, row_bytes);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span",
+                                        "fa_prefill_kv<false,false,KV_LAYOUT_F16>");
     } else {
-        minfer_launch_prelude("launch:fa_prefill_f16kv__causal", "fa_prefill_f16kv<true,false>");
-        fa_prefill_f16kv<true, false><<<grid, minfer_launch_block("launch:fa_prefill_f16kv__causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                   scale, nt);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_f16kv__causal", "fa_prefill_f16kv<true,false>");
+        minfer_launch_prelude("launch:fa_prefill_kv__f16_causal",
+                              "fa_prefill_kv<true,false,KV_LAYOUT_F16>");
+        fa_prefill_kv<true, false, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
+                                                                   scale, nt, row_bytes);
+        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal",
+                                        "fa_prefill_kv<true,false,KV_LAYOUT_F16>");
     }
     return launched ? 0 : -1;
 }
@@ -8774,10 +8995,14 @@ extern "C" void minfer_prewarm_kernels(void) {
     // attention (FA prefill + decode paths) + KV/rope
     // E1b: both instantiations, so the first windowed launch does not pay a
     // one-off module load / JIT (the causal one is what runs today).
-    MINFER_PREWARM((fa_prefill_f16kv<true, false>));
-    MINFER_PREWARM((fa_prefill_f16kv<false, false>));
+    MINFER_PREWARM((fa_prefill_kv<true, false, KV_LAYOUT_F16>));
+    MINFER_PREWARM((fa_prefill_kv<false, false, KV_LAYOUT_F16>));
     // C8b S4: the `kv_map` instantiation (a sharing sequence's window).
-    MINFER_PREWARM((fa_prefill_f16kv<false, true>));
+    MINFER_PREWARM((fa_prefill_kv<false, true, KV_LAYOUT_F16>));
+    // #144 item 3: the packed staging instantiations.
+    MINFER_PREWARM((fa_prefill_kv<true, false, KV_LAYOUT_Q8_0>));
+    MINFER_PREWARM((fa_prefill_kv<false, false, KV_LAYOUT_Q8_0>));
+    MINFER_PREWARM((fa_prefill_kv<false, true, KV_LAYOUT_Q8_0>));
     MINFER_PREWARM((gqa_attn_f32_f16kv<true, false>));
     MINFER_PREWARM((gqa_attn_f32_f16kv<false, false>));
     // C8b S4: the `kv_map` instantiation (a sharing sequence's window).

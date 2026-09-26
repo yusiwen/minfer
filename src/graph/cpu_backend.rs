@@ -2176,6 +2176,7 @@ mod tests {
                 freq_scale: 1.0,
                 rope_style: crate::vec_ops::RopeStyle::NonInterleaved,
                 kv_elems: nkt * n_ctx,
+                row_elems: crate::graph::kvformat::KvFormat::F32.row_elems(nkt),
             },
         );
         let kv = gb.kvcache_load(0, nkt, n_ctx, 1);
