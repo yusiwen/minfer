@@ -154,6 +154,10 @@
 - [GGUF Tooling — convert, quantize, split (F6)](./GGUF-TOOLING.md)
 - [Debug Dump](./debug-dump.md)
 
+# Testing
+
+- [The gate contract](./GATE-CONTRACT.md)
+
 # Reference
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)

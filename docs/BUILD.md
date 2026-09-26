@@ -51,27 +51,18 @@ harness is where the [server batching
 gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
 `PARALLEL=1`/`0` overrides. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
-longer makes one gate size another gate's KV regions — measured 2026-09-25 on a
-CPU build: **29 / 0** serial and **29 / 0** parallel (three plain harness runs;
-before #99 the parallel run was 19 / 9, every failure a KV-region width
-mismatch, and before #154 it was 28 / 1). [#154](https://github.com/yusiwen/minfer/issues/154)
-replaced `server_batch_matches_serial_and_is_faster`'s single sequential
-wall-clock pair (parallel: 21.20s batched vs 9.95s serial = 0.47x) with
-**interleaved matched rounds** and a verdict on the **median of the per-round
-`serial/batched` ratios** (1.379–1.468x over the parallel runs; the mutation that
-doubles the timed batched arm trips it at 0.752x); the median tolerates up to
-half the rounds being disturbed, and the correctness comparison stays a separate
-full-length pair. [#158](https://github.com/yusiwen/minfer/issues/158) removed the
-last load-dependent verdict in the same set:
-`published_metrics_move_as_requests_are_served` bounded a run by absolute
-wall-clock deadlines (120s/180s) and asserted the engine had gone idle, so 16 extra
-CPU spinners on a 20-core box made it panic (28 passed / 1 failed in 435.11s,
-green without the spinners). It now bounds **work** instead — `BatchEngine::work_units`
-must advance on every step that leaves the engine busy, plus a step budget — and the
-same spinner run is **29 / 0** (424.17s). The watchdogs still in the tree
-(`run_cli`'s child-process kills, and the `serve_loop` poll backstop) are not a
-gate's only failure signal; the unbounded `while engine.busy()` stepper loops in the
-other `#[ignore]`d server gates are filed together with them as
+longer makes one gate size another gate's KV regions. The current counts live in
+`AGENTS.md` (each with its date, device and command). The two fixes that made the
+parallel form trustworthy are the [server batching
+gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched rounds,
+a median verdict) and [#158](https://github.com/yusiwen/minfer/issues/158) (a work
+bound instead of absolute wall-clock deadlines); the rules behind both are
+[`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §4 and the full records are
+[`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md) §test-infrastructure.
+The watchdogs still in the tree (`run_cli`'s child-process kills, and the
+`serve_loop` poll backstop) are not a gate's only failure signal; the unbounded
+`while engine.busy()` stepper loops in the other `#[ignore]`d server gates are
+filed together with them as
 [#160](https://github.com/yusiwen/minfer/issues/160).
 
 ## Git hooks (git-hooks.nix)

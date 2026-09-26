@@ -5983,3 +5983,63 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
 | 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |
 | 9 | **A sequence's logits' tail depended on its absolute arena offset — resolved by C6 (2026-09-19)** (found while gating C3). The pre-C6 measurements stand and are what justified the fix: at cell 0 vs cell 8 the max |Δ| over the vocabulary was 2.6% relative with the greedy token unchanged and the run deterministic; the hand-built `q`/`k`/`v` → rope → store → attn graph is exact to ≤ 1.2e-7 at the model's own shape *and* equal for a 1-cell and an 8-cell offset; the arena layout is irrelevant (a split reservation is bit-identical per layer); `positions` had exactly four consumers per layer (96 = 24×4); a layer bisect put the entry at layer 0's attention output; and the **rope-injection intervention** proved the entry is RoPE alone (injecting run A's 48 rope outputs into run B made the logits bitwise identical), while a distributed ~1e-6 rope perturbation already saturates the tail (0.44 vs 0.43) with the greedy token stable from 1e-6 to 1e-2. **C6 removed the coupling** — `positions` are sequence-relative and the allocator resolves `cells` — so a cell move changes no angle: the offset tests now assert bitwise equality, C3's acceptance tightens from the named amplified-rounding class to bit-identical, and a compaction no longer re-ropes. Three method notes earned here: a zero from a perturbation probe means nothing without a loud control; **a control validates the path, not the equivalence of the perturbation** (a single element nudged by 1e-5 is not the offset's distributed 1.5e-5 — the earlier "refutation" was an over-read); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness). | measurement | Done by C6; the logical-positions design, its gates and the CUDA fused-op port (S3) are in §5. |
+
+#### Test-infrastructure record (#171, 2026-09-26) — one home for the gate contract, and one failure-injection seam
+
+**The problem.** The rules this campaign's gate work produced existed only as narrative inside two
+`AGENTS.md` bullets, interleaved with per-ticket history and the counts those tickets moved, so every
+agent re-derived them. Mutation checking in particular cost a bespoke mock per ticket (#147's
+`MINFER_TEST_CALL_FAIL`, #145's `MINFER_TEST_LATCH_ERROR`, #151's `FailingForward`, #167's switches),
+so "break it and watch the gate fail" was skipped.
+
+**What landed.** The rules are stated once in [`GATE-CONTRACT.md`](./GATE-CONTRACT.md) — five of them
+(assert the value, not a relation between two code paths; a control arm that differs in the property
+under test; mutation evidence; work, not seconds; a device number with its provenance) — each with the
+precedent that produced it, and the two `AGENTS.md` bullets keep only the point-of-use
+command/default/counts plus a pointer. The failure-injection seam is
+[`src/testfail.rs`](../src/testfail.rs): one presence-checked switch (`MINFER_TEST_CALL_FAIL`, the
+#147 name and semantics; exact-token comma list, `all` for every Rust site) with chokepoints at the
+batched forward (`forward_batch`), the allocator pool entry (`alloc_in_pool`), the backend execute
+entry (`execute_node`) and the weight registrar (`register_weight`), plus the device-side
+`launch:*`/`attr:*` sites of #147. The observation half is `testfail::note_checked(site)` /
+`checked(site)`, bumped by the chokepoint itself, so a gate proves the path ran instead of reading the
+dispatch's own answer — the shape #141's f16 vectorization gate needed (`F16_SIMD_PATH_CALLS`). #147's
+matcher `injection_names_site` moved into `testfail.rs`, so there is one matcher and its exact-token
+tests now run in CI's CPU job instead of only on a `--features cuda` build.
+
+**Migration of the older knobs.** `MINFER_TEST_CALL_FAIL` keeps its name and semantics (the contract
+the #147 gates depend on). #145's `MINFER_TEST_LATCH_ERROR` is **left in place**: it *enables* a
+deliberately-latching device gate, it does not select a chokepoint, so folding it into the token list
+would change what it means. #151's `FailingForward` mock stays in its CI gate (no model on a hosted
+runner), and the seam replaces it on the real path below. #167's gates use the pure registration rule
+and needed no switch.
+
+**Verification (2026-09-26, this box: 20-core CPU, GB10 sm_121, CUDA 13.0).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **456 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU, serial) | **33 passed / 0 failed** (37.59 s) |
+| `scripts/real_model_gates.sh` (CPU, parallel) | **33 passed / 0 failed** (33.98 s) |
+| `scripts/cuda_test.sh` (GB10) | **524 passed / 0 failed / 37 ignored** |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B) | **37 passed / 0 failed** |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf FEATURES=cuda scripts/real_model_gates.sh` | **37 passed / 0 failed** |
+| `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0 API errors** over 524 passed / 37 ignored (351.89 s) |
+| `cargo test --release --bin minfer -- --ignored --exact server::batch::tests::the_seam_fails_the_batch_forward_without_a_bespoke_mock --test-threads=1 --nocapture` | **1 passed**; prints `[#171] forward_batch seam: one 500, slot released, no retry, 1 observed forward entries` |
+| `MINFER_TEST_CALL_FAIL=forward_batch cargo test --release --bin minfer -- --ignored --exact server::batch::tests::server_batch_matches_serial_and_is_faster --test-threads=1` | **FAILED** — one environment variable reproduces #151's mutation and trips an existing gate (`[testfail] deliberate panic injected at site 'forward_batch'`) |
+| `cargo test --release --bin minfer -- testfail::tests::the_seam_is_off_by_default` with `requested()` ignoring the environment | **FAILED** at `assertion failed: !requested("all")` (reverted, `sha256sum` identical) |
+| `cargo test --release --bin minfer -- the_execute_chokepoint_is_observable` with `note_checked()` a no-op | **FAILED** `left: 0, right: 2` (reverted, `sha256sum` identical) |
+| `rustup run stable rustfmt --edition 2021 --check` on every changed `.rs` | clean (`rustfmt 1.9.0-stable`) |
+| `python3 scripts/check_docs_links.py` | **955 relative links resolve in 185 markdown files** |
+
+The CUDA unit count moves 521 → **524** passed while gaining **five** tests, because #147's
+`the_injection_matcher_matches_only_the_named_site` was cuda-gated and moved to the always-compiled
+`testfail` module: −1 cuda-only, +4 always, +1 `#[ignore]`d real-model gate.
+
+**Honest scope.** A script can require that mutation evidence is *present*; it cannot check that it is
+true. The seam removes the cost, not the discipline. The observation counter is thread-local, so a gate
+that runs the engine on another thread must read it there. The device-side matcher is necessarily a
+second implementation in C++ (a kernel cannot call into Rust); the two are documented as exact-token
+identical and the Rust half is the one unit-tested. The still-unbounded `while engine.busy()` steppers
+remain [#160](https://github.com/yusiwen/minfer/issues/160), and the count-consistency check that would
+enforce rule 5's provenance remains [#94](https://github.com/yusiwen/minfer/issues/94).
