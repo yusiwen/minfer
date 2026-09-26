@@ -152,75 +152,14 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 ./target/release/minfer split in.gguf <out-dir> --max-size 200M [--stem NAME]
 ```
 
-- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (i.e. `cargo test --release --features cuda -- --test-threads=1`; CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to exercise the device-gated tests; on this box, last full run after [#121](https://github.com/yusiwen/minfer/issues/121), [#99](https://github.com/yusiwen/minfer/issues/99), [#151](https://github.com/yusiwen/minfer/issues/151), [#147](https://github.com/yusiwen/minfer/issues/147), [#141](https://github.com/yusiwen/minfer/issues/141), [#165](https://github.com/yusiwen/minfer/issues/165) and [#167](https://github.com/yusiwen/minfer/issues/167) (2026-09-25): **521 passed / 0 failed / 36 ignored**, GB10 sm_121 — #121's two gates (one CI transport gate and one `#[ignore]`d real-model saturation gate), #151's two CI gates on the C5 S3 record's 501, less the one obsolete `the_process_wide_format_can_be_redecided` unit test #99 deleted, plus #147's five gates (three pure, two device/env-gated), plus #141's five unit tests and its one `#[ignore]`d f16-on-device gate, plus #165's three unit tests (two pure in `src/q4k_dsc.rs`, which CI's CPU job *runs*, and one device-gated) and its one `#[ignore]`d real-model plane gate, plus #167's five pure tests in `src/models/weight_reg.rs` (the shared registration rule; CI's CPU job *runs* them) and its two `#[ignore]`d real-model gates (an f16 Qwen3 device gate and a q4_K plane gate); the Qwen3-0.6B configuration's real-model set is green at **36 / 0**). `CudaState::sync` reports a `cudaGetLastError` latch as a **latched API error with its real origin**, never as a kernel launch (C4 S2c); the eager prefill-GEMM smem opt-in checks each `cudaFuncSetAttribute` return value and skips an over-limit request with the reason, and #147 routed every dynamic-smem opt-in and every launch through `minfer_smem_optin` / `minfer_launch_ok`, so a failure is named at the call that made it and the launch is refused instead of issued into a checked error (`MINFER_TEST_CALL_FAIL` + `MINFER_TEST_ISSUE147=1` drive the deliberate-failure gates; both are unset in default/sanitizer runs). The real-model gates should be run twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride; two pre-existing bugs hid behind the f32-only runs). Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked — `=0` disables CUDA. **Run it serially**: the device state is a process-wide singleton (`CudaState`) whose MMQ memo / captured graph execs / stream state every test shares, so the parallel harness can make one test perturb another's measurement — a parallel-only determinism failure is a harness artifact unless it reproduces serially (issue [#64](https://github.com/yusiwen/minfer/issues/64)). The `#[ignore]`d subset of this command is **36 passed / 0 failed** on the CUDA build (0.5B config, measured 2026-09-25 after #121, #141, #165 and #167).
-- Real-model gates (the `#[ignore]`d set): one command — `scripts/real_model_gates.sh`
-  (`FEATURES=cuda` selects the device build; `PARALLEL=1`/`0` forces the parallel/serial form). The
-  wrapper defaults to **serial on a device build** because the device state is a process-wide
-  singleton (`CudaState` — its MMQ memo / captured graph execs / stream state are shared by every
-  test), so the parallel harness can make one test perturb another's measurement (issue
-  [#64](https://github.com/yusiwen/minfer/issues/64)); on a **CPU-only** build that reason does not
-  exist, the *KV-format* reason is gone too (since
-  [#99](https://github.com/yusiwen/minfer/issues/99) made the KV storage format **per engine**, the
-  parallel harness no longer sizes one gate's KV regions from another gate's format), and the last
-  CPU-parallel failure was fixed by [#154](https://github.com/yusiwen/minfer/issues/154) — so the
-  wrapper defaults to the **parallel** form there. Measured 2026-09-25 on this box (CPU): **32 passed
-  / 0 failed** serial, **32 passed / 0 failed** in parallel (29 before #141 added its device gate and
-  30 before #167 added two `cuda`-gated `#[ignore]`d real-model gates, which no-op and pass on a CPU
-  build; 3 plain harness runs; before #99: 19
-  passed / 9 failed parallel against 28 passed / 0 failed serial, every one of the nine a KV-region
-  width mismatch; before #154 the parallel set was 28 passed / 1 failed).
-  [#154](https://github.com/yusiwen/minfer/issues/154) fixed that remaining failure:
-  `server_batch_matches_serial_and_is_faster` used to assert a **wall-clock** relation between two
-  sequential whole-workload measurements, so a loaded parallel harness let the first-measured phase
-  absorb the start-up wave (measured 21.20s batched vs 9.95s serial = **0.47x** in parallel against
-  **1.50x** serially). It now interleaves matched rounds of the two modes (`batched, serial` × 7) and
-  asserts the **median of the per-round `serial/batched` ratios** > 1.0, printing every ratio and the
-  median — the same shape #123 gave the CUDA map-window gate. The median was **1.379–1.468x** over the
-  three plain parallel runs (individual rounds as low as 0.923x) and **2.159x** under 16 extra CPU
-  spinners; the mutation that doubles the timed batched arm trips it at **0.752x**. The correctness
-  comparison is still a separate full-length (16-token) pair, byte-for-byte on CPU.
-  [#158](https://github.com/yusiwen/minfer/issues/158) removed the last load-dependent verdict in this
-  set: `published_metrics_move_as_requests_are_served` bounded a real-model run by absolute wall-clock
-  deadlines (`Instant::now() + Duration::from_secs(120/180)`, asserting `!engine.busy()`), so on this
-  20-core box under the parallel set with 16 extra CPU spinners it panicked at *"the long request
-  finished inside the deadline"* — measured **28 passed / 1 failed in 435.11s**, green without the
-  spinners. It now bounds **work, not seconds**: `BatchEngine::work_units` (one unit per decode-forward
-  row plus one per committed token) must advance on every `tick` that leaves the engine busy, and
-  `step_budget(prompt, max_tokens) = 4 * (prompt + max_tokens + 8)` caps the step count — measured
-  **4 steps / 80** and **64 / 768** on the 0.5B. Under the same 16 spinners that run was **29 passed / 0
-  failed in 424.17s** (the set is 30 with #141's device gate); the mutation that makes `tick` return without advancing trips the work assertion
-  on step 1 (0.18s, against the old 120s wait). The audit found no other real-model gate whose only
-  failure signal is an absolute deadline — the rest are process-hang watchdogs or a redundant poll
-  backstop — and the still-unbounded `while engine.busy()` stepper loops in the other `#[ignore]`d
-  server gates are filed as [#160](https://github.com/yusiwen/minfer/issues/160).
-  On a CUDA box the set is **36 passed / 0 failed** (0.5B config, GB10 sm_121) and the Qwen3-0.6B
-  configuration's set is **36 / 0**; both are still run with `--test-threads=1`. **#123 made the C4
-  packed-cache gate device-aware; C4 S2b made it exercise the device; #99 made it per-engine**: it
-  loads **two engines per arm** (f32 and q8_0) through `models::load_model_configured` instead of
-  flipping a process global, so it is itself the proof that two formats coexist in one process. It runs
-  a CPU arm (`--gpu-layers 0`, coverage on every build) and, on a CUDA build with a device, one that
-  asserts `device() == Cuda`; each arm asserts its own backend *and* each engine's `kv_format()`, so a
-  silent CPU fallback or a mis-resolved format fails loudly instead of reporting a CPU number as a
-  device one. The device arm still sets the one process-wide layout tag #99 left in place
-  (`cuda::KV_LAYOUT`, which the device kernels read), under a `Drop` guard that restores it if the gate
-  panics; the old per-process `kvformat` global and its guard are gone. The map-window timing gate
-  (`cuda_map_window_costs_no_more_than_the_span_it_replaces`) asserts the median of interleaved
-  per-round ratios (9 rounds per mode) instead of two sequential sums, so its verdict no longer
-  depends on a quiet box; its correctness sibling `cuda_map_window_matches_the_span_over_the_same_rows`
-  sweeps **f32/f16/q8_0** and additionally compares one single-row Q8_0 window against the
-  dequantized cell, because every mode-vs-mode comparison there is blind to a value-level fault
-  (mutation-checked: dropping the Q8_0 block base left it green until that arm was added). The
-  Qwen3-0.6B configuration's set is **36 passed / 0 failed** (measured 2026-09-25): the f16 KV
-  element type is now a **flag** in the session header, so
-  `a_slot_snapshot_resumes_the_context_without_re_prefilling` round-trips its own snapshot instead
-  of being refused with *"the file was written with the f32 KV element type, this run uses f16"*
-  ([#130](https://github.com/yusiwen/minfer/issues/130), closed). A **Q8_0** session round-trips
-  the same way: `a_session_resumed_from_disk_continues_bitwise` with `MINFER_CACHE_TYPE=q8_0`
-  prints `live KV format: q8_0`, saves 24 layers / 256 cells / 1 696 464 B (vs 6 316 748 B under
-  f32) and continues bitwise (max |Δlogit| = 0), because the container's `FLAG_PACKED` bit encodes
-  it — and an **f16** session now does too, via `FLAG_F16` (mutually exclusive with `FLAG_PACKED`;
-  an unknown flag bit and a header claiming both are refused loudly, and a pre-#130 `flags == 0`
-  file still loads as f32).
+- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (`cargo test --release --features cuda -- --test-threads=1`). CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to run the device-gated tests. The device state is a process-wide singleton (`CudaState`), so **run it serially** (issue [#64](https://github.com/yusiwen/minfer/issues/64)). `CudaState::sync` reports a `cudaGetLastError` latch as a latched API error with its real origin, never as a kernel launch; every dynamic-smem opt-in and launch goes through `minfer_smem_optin` / `minfer_launch_ok`, so a failure is named at the call that made it. Local GPU runs must rebuild the CLI *with* the feature (`cargo build --release --features cuda`): a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. `MINFER_DISABLE_CUDA` is presence-checked (`=0` disables CUDA).
+- Real-model gates (the `#[ignore]`d set): `scripts/real_model_gates.sh` (`FEATURES=cuda` selects the device build; `PARALLEL=1`/`0` forces the parallel/serial form). The wrapper defaults to **serial on a device build** (the `CudaState` singleton, [#64](https://github.com/yusiwen/minfer/issues/64)) and to the **parallel** form on a CPU-only build (that reason is gone there, and the parallel harness is where the batching-timing gate's robustness is exercised). Run the set twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination that reaches FA prefill and the half-width cell stride). Current counts, each with its date/device/command (rule 5 of the [gate contract](docs/GATE-CONTRACT.md)):
+  - CPU unit, `cargo test --release`, 2026-09-26: **456 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration.
+  - CPU real-model set, `PARALLEL=0 scripts/real_model_gates.sh` and the default parallel form, 2026-09-26: **33 / 0** each.
+  - CUDA unit, `scripts/cuda_test.sh` on GB10 sm_121, 2026-09-26: **524 / 0 / 37**.
+  - CUDA real-model set, `FEATURES=cuda scripts/real_model_gates.sh` on GB10 sm_121, 2026-09-26: **37 / 0** at the 0.5B config and **37 / 0** at the Qwen3-0.6B config.
+  - `compute-sanitizer --tool memcheck` over the CUDA unit suite: **0 API errors** before and after #171.
+  Read [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) before writing or changing a gate. It is the one home for the five rules a gate must satisfy (each with the per-ticket precedent that produced it) and for the failure-injection seam (`MINFER_TEST_CALL_FAIL`, issue [#171](https://github.com/yusiwen/minfer/issues/171)) that makes a mutation one environment variable. The per-ticket history ([#99](https://github.com/yusiwen/minfer/issues/99), [#121](https://github.com/yusiwen/minfer/issues/121), [#123](https://github.com/yusiwen/minfer/issues/123), [#141](https://github.com/yusiwen/minfer/issues/141), [#144](https://github.com/yusiwen/minfer/issues/144), [#147](https://github.com/yusiwen/minfer/issues/147), [#151](https://github.com/yusiwen/minfer/issues/151), [#154](https://github.com/yusiwen/minfer/issues/154), [#158](https://github.com/yusiwen/minfer/issues/158), [#165](https://github.com/yusiwen/minfer/issues/165), [#167](https://github.com/yusiwen/minfer/issues/167)) lives in the records (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §test-infrastructure, `docs/CUDA-BACKEND-DESIGN.md`, `docs/BUILD.md`), not here.
 - Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device" (A0's probes could not see the GPU either way, so "no device" was unsupported).
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md` (stale in places — [#62](https://github.com/yusiwen/minfer/issues/62)). CUDA build details (ccbin pinning, GPU arch coverage, cudart linking): `docs/BUILD.md`.
@@ -380,6 +319,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Metal optimization plans / gap analysis | `docs/METAL_OPTIMIZATIONS.md` |
 | objc2 ecosystem + migration record | `docs/METAL_OBJC-ECOSYSTEM.md` |
 | GPU safety conventions + audit | `docs/GPU_SAFETY.md` |
+| **The gate contract (#171): the five rules a gate must satisfy, and the failure-injection seam (`MINFER_TEST_CALL_FAIL`) with its chokepoints** | `docs/GATE-CONTRACT.md` |
 | CPU optimizations | `docs/CPU_OPTIMIZATIONS.md` |
 | Metal backend design + implementation record (device layer, dispatch, command buffers, safety) | `docs/METAL-BACKEND-DESIGN.md` |
 | CUDA backend design + implementation record (device layer, dispatch, capture, safety) | `docs/CUDA-BACKEND-DESIGN.md` |
