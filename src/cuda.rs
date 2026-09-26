@@ -1145,6 +1145,14 @@ static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
 static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// F5 (#58): the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
+///
+/// **A gate must not read this** (issue #185). It is a lifetime total across every
+/// thread, so a delta around one workload also contains whatever any concurrent
+/// device test synced — the F5 gate's async arm read 4160 stalls against the
+/// synchronous arm's 728 under the parallel harness. Read the backend's own
+/// `CudaBackend::stream_sync_count()` instead; the counter lives per instance,
+/// like `blocking_readbacks` and like `copystats`' accumulators.
+#[allow(dead_code)] // kept as the process-wide total; the F5 gates read the backend's own (#185)
 pub fn stream_sync_count() -> u64 {
     STREAM_SYNCS.load(Ordering::Relaxed)
 }
