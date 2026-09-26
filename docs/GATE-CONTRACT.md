@@ -166,15 +166,30 @@ re-state it.
 5. Does every number in the PR body carry its **date, device and command**?
    (rule 5)
 
+## How the shape is enforced
+
+The two facts rules 3 and 5 ask a PR to state in prose have a mechanical floor.
+The PR body is rendered from
+[`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md), and
+[`scripts/check_pr_body.py`](../scripts/check_pr_body.py) refuses a body whose
+required headings are missing or whose two gate sections — `Bar named before
+measuring` and `Mutation evidence` — are empty or left at their template
+placeholder (a stated `N/A — <reason>` is filled). The `check-pr-body` job in
+[`ci.yml`](../.github/workflows/ci.yml) runs it on `pull_request` events only,
+after the checker's own `--selftest` cases. It reads the body through `env:`,
+so it needs no token and works on a fork PR ([#175]). This is the shape, not the
+rules: the rules stay stated once, above.
+
 ## Honest scope
 
-This document is a contract, not a linter. Nothing in CI parses it: rules 1, 2
-and 4 are review discipline and rule 3's *truth* is unverifiable by construction.
-What the repository does enforce is the concrete part — the seam is off by
-default under a CI-covered test, `check_docs_links.py` keeps this page
-reachable, and the per-ticket records keep the instances auditable. Treat the
-rules as the questions a reviewer must be able to answer from the PR, not as
-property tests.
+This document is a contract, not a linter. Nothing in CI parses this page: rules
+1, 2 and 4 are review discipline and rule 3's *truth* is unverifiable by
+construction. What the repository does enforce is the concrete part — the seam is
+off by default under a CI-covered test, `check_docs_links.py` keeps this page
+reachable, the per-ticket records keep the instances auditable, and the
+`check-pr-body` job requires the two facts to be *present* in the PR body,
+never to be true (§"How the shape is enforced"). Treat the rules as the
+questions a reviewer must be able to answer from the PR, not as property tests.
 
 <!-- Issue references, linked once so the text above stays readable. -->
 [#87]: https://github.com/yusiwen/minfer/issues/87
@@ -185,3 +200,4 @@ property tests.
 [#165]: https://github.com/yusiwen/minfer/issues/165
 [#167]: https://github.com/yusiwen/minfer/issues/167
 [#171]: https://github.com/yusiwen/minfer/issues/171
+[#175]: https://github.com/yusiwen/minfer/issues/175
