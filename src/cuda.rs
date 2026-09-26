@@ -2597,6 +2597,24 @@ impl CudaState {
         self.weights.lock().unwrap().get(name).map(|(cp, _)| cp.0)
     }
 
+    /// The registered byte length of the device weight `name` (#169).
+    ///
+    /// A Q6_K entry registered through `register_weight_q6k_padded` lives on the
+    /// device with a larger stride, so it reports its **original raw** length —
+    /// the same convention `has_weight_of_size` uses. `None` when the name is
+    /// not registered at all. The norm path reads this to refuse a weight that
+    /// is not the f32 it will index as (the f16-norm hazard of #169).
+    pub fn weight_size(&self, name: &str) -> Option<usize> {
+        if let Some(&raw) = self.padded_weights.lock().unwrap().get(name) {
+            return Some(raw);
+        }
+        self.weights
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|(_, size)| *size)
+    }
+
     /// #167: whether the NB-BT q4_K kernel would find a `W_dsc` plane for the raw weight
     /// `name`. The kernel keys its map on the **raw weight's device pointer** (`q4k_dsc`,
     /// read at `mmq_raw_nb_bt`'s launch site: a null `w_dsc` selects the in-kernel scalar
