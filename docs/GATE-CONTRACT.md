@@ -107,6 +107,14 @@ the chokepoint itself** (the shape #141's vectorized f16 dot needed:
 `vec_ops::tests::f16_dot_uses_the_vectorized_path`). A gate asserts the counter
 advanced instead of trusting the dispatch's report.
 
+**The work-bound twin (#160).** Rule 4's progress assertion has its own
+mutation lever: `MINFER_TEST_TICK` drives `BatchEngine::tick` into one of two
+faults. `=wedge` returns from the step without advancing `work_units`, so the
+per-step progress assertion fires on the step that wedged the engine; `=spin`
+advances the counter but never completes a run, so only `step_budget` catches
+it. Both are read once per process and unset in every production, CI and
+default run, exactly like `MINFER_TEST_CALL_FAIL`.
+
 **Honest scope — presence is checkable, truth is not.** A script can require
 that a mutation transcript *exists* in a PR body or a record; it cannot check
 that the mutation was real, that the gate was the one that failed, or that the
@@ -144,8 +152,22 @@ entries walked) over a clock. When a timing relation is unavoidable, use
 **interleaved matched rounds** and a **median** (never two sequential sums), fix
 the round count in advance, and print every per-round value so a loaded result
 is auditable. A process-hang watchdog may keep a generous timeout, but it must
-not be a gate's only failure signal ([#160] tracks the remaining unbounded
-steppers).
+not be a gate's only failure signal.
+
+**[#160] finished the sweep [#158]'s audit opened.** Every `while engine.busy()`
+stepper in the `#[ignore]`d server gates now runs through one shared per-step
+`WorkBound` — a progress assertion plus `step_budget` — so a wedge in
+`BatchEngine::tick` fails the gating step in seconds instead of hanging the
+suite. The wall-clock bounds that remain are *named* and say at the call site
+why each is only a backstop: the `serve_loop` feeder's poll terminator
+(`FEEDER_POLL_BACKSTOP`) cannot rescue a wedge because the worker runs on the
+test's own thread, and the two `run_cli` child-process ceilings (1800s for the
+real-model sessions, 60s for the no-model registry cases) are cross-process hang
+guards, env-overridable through `MINFER_CLI_WATCHDOG_SECS`. The mutation seam is
+`MINFER_TEST_TICK` (see §3); the dated record and transcripts are
+[#160] in
+[`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md)
+§test-infrastructure.
 
 ## 5. A device number carries its date, device and command
 

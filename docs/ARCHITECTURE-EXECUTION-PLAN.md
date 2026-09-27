@@ -4721,6 +4721,136 @@ load-dependent-verdict class. `ARCHITECTURE-ROADMAP.md` is untouched: this is ro
 existing test-infrastructure/batching rows (item 3, *Batch composition + continuous batching*), not a
 new capability — the same reason the #154 and #151 records give.
 
+#### Test-infrastructure record (#160, 2026-09-27) — the remaining server-gate steppers bound work, not wall-clock seconds
+
+**The defect.** [#158](https://github.com/yusiwen/minfer/issues/158)'s audit left two shapes standing. The one this ticket was filed for: five
+`#[ignore]`d server gates drove the engine with `while engine.busy() { engine.tick(…) }` and
+**neither a progress assertion nor a step budget**, so a wedge inside `BatchEngine::tick` hung the
+suite forever instead of failing it (#158's own F8 metrics gate kept its work bound). The other
+shape: three absolute wall-clock bounds whose *verdict* does not depend on the clock. Both are
+review findings, not reproduced failures — the set was green before and after; the evidence below is
+**injected** wedges, not an observed hang.
+
+**What now bounds each site.** Every stepper goes through one shared `WorkBound`
+(`src/server/batch.rs`), the single implementation of the invariant #158 introduced: a `tick` that
+leaves the engine busy must have advanced `BatchEngine::work_units` (if no forward ran, some slot's
+`advance` returned `Continue`, and `Continue` commits exactly one token), and the step count must
+stay inside `step_budget(prompt, max_tokens)`. `drive_by_work` is now a thin wrapper over it.
+
+| site (gate) | before | now |
+|---|---|---|
+| `run_batched` (`server_batch_matches_serial_and_is_faster`, `a_long_request_may_use_the_whole_arena`) | `while !queue.is_empty() \|\| engine.busy()` | `WorkBound` with `step_budget(Σ prompts, n · cap)` |
+| `run_serial` (same two gates) | `while done.is_none()` | one `WorkBound` per request |
+| `serve_on` (`a_prefix_copied_from_another_slot_answers_identically`, `a_store_inside_a_shared_prefix_takes_a_private_row`) | `while engine.busy()` | `WorkBound` |
+| `a_slot_snapshot_resumes_the_context_without_re_prefilling` | three `while X.busy()` loops | three `WorkBound`s (cold / resumed / delta), each with its own budget |
+| `a_chunked_prefill_answers_like_an_unchunked_one` | `while engine.busy()` in both arms | `WorkBound`, the arm's own name in the message |
+| `a_repeated_chunked_prefill_stops_rebuilding` | `while engine.busy()` in both calls | `WorkBound` |
+| `a_long_prefill_keeps_another_slot_decoding` | `for _ in 0..3 { tick }` (already finite) | the same three steps through `WorkBound`, so a wedge fails on the step that wedged it |
+| `published_metrics_move_as_requests_are_served` (#158) | `drive_by_work` | unchanged behaviour, now on the shared `WorkBound` |
+
+`step_cap` folds an unbounded request (`max_tokens < 0`, which ends on its context bound) into the
+budget. No wall-clock number was added anywhere as a failure signal, and no bar was widened.
+
+**The wall-clock bounds that remain are named backstops, not verdicts.**
+
+- `serve_loop_publishes_the_queue_and_running_depth`'s feeder terminator is now
+  `FEEDER_POLL_BACKSTOP` (120s) with its reasoning at the call site: the verdict is the downstream
+  `peak_running > 0` / queue arithmetic, and the worker runs on the test's own thread, so a real
+  wedge hangs that join regardless — which is exactly why #158 left it and #160 classifies it a
+  redundant backstop. `peak_running` is observed within milliseconds, so it is not load-sensitive.
+- `tests/conversation_cli.rs`'s `run_cli` child-process ceiling (1800s for the `#[ignore]`d
+  real-model sessions, 30s for the no-model cases) and `tests/backend_registry_cli.rs`'s 60s are
+  cross-process hang guards — a child exposes no in-process progress counter. Both are now
+  **env-overridable** through `MINFER_CLI_WATCHDOG_SECS` (unset/unparsable/zero keeps the caller's
+  number), with the reasoning recorded at each `run_cli`.
+- `src/server/mod.rs`'s `elapsed < Duration::from_secs(10)` is untouched: a CI unit test's 200x
+  ceiling over a 50ms bounded drain, not a real-model gate.
+
+**The seam (rule 3).** `MINFER_TEST_TICK` (`src/server/batch.rs::tick_seam`, read once per process
+through a `OnceLock`, `Off` when unset or on any unrecognised value) injects the two arms of a
+bounded drive into the **real** `tick`: `wedge` returns before forwarding or committing anything (the
+work counter freezes), `spin` advances `work_units` without ever completing a run (the counter keeps
+moving along a path that cannot terminate). It is an **environment switch** — the mutation runs need
+no source revert, so `git diff` stayed clean throughout.
+
+**Mutation evidence — the wedge arm (rule 3).** Command shape (CPU build, aarch64, this box,
+2026-09-27): `MINFER_TEST_TICK=wedge cargo test --release --bin minfer -- --ignored --exact <gate>
+--nocapture`. Every hardened gate fails on **step 1** with
+*"the engine is wedged — step 1 left it busy without advancing the work counter (still 0)"*
+(`src/server/batch.rs:3756`):
+
+| gate | wall clock | what the message names |
+|---|---|---|
+| `published_metrics_move_as_requests_are_served` (#158 precedent) | **0.30s** | the warm request |
+| `a_prefix_copied_from_another_slot_answers_identically` | **0.21s** | the slot-scoped request |
+| `a_store_inside_a_shared_prefix_takes_a_private_row` | **0.29s** | the slot-scoped request |
+| `a_long_request_may_use_the_whole_arena` | **1.68s** | the batched run |
+| `server_batch_matches_serial_and_is_faster` | **0.30s** | the batched run |
+| `a_slot_snapshot_resumes_the_context_without_re_prefilling` | **0.22s** | the cold run |
+| `a_chunked_prefill_answers_like_an_unchunked_one` | **0.69s** | the unchunked prefill |
+| `a_repeated_chunked_prefill_stops_rebuilding` | **0.71s** | the repeated chunked prefill |
+| `a_long_prefill_keeps_another_slot_decoding` | **0.45s** | the short run |
+
+The listed time is the whole process (start + 0.5B load + the failure); libtest's own per-test time is
+0.15–1.61s. Every run's `test result:` line is `FAILED. 0 passed; 1 failed` — the assertion, not a
+timeout, ends it.
+
+**Mutation evidence — the step-budget arm.** `MINFER_TEST_TICK=spin` over the whole `#[ignore]`d set
+with the two `serve_loop` gates skipped is **10 failed / 21 passed in 12.45s** (CPU build, this box,
+2026-09-27; `cargo test --release --bin minfer -- --ignored --nocapture --skip
+serve_loop_publishes_the_queue_and_running_depth --skip
+a_job_rejected_for_want_of_a_slot_is_answered_with_503`). Each bounded stepper stops exactly one step
+past its budget, and the budget arm is the one that fires:
+
+| gate | the budget arm |
+|---|---|
+| `published_metrics_move_as_requests_are_served` | 81 steps exceeded the 80-step budget |
+| `a_prefix_copied_from_another_slot_answers_identically` | 85 > 84 |
+| `a_store_inside_a_shared_prefix_takes_a_private_row` | 133 > 132 |
+| `a_long_request_may_use_the_whole_arena` | 1273 > 1272 |
+| `server_batch_matches_serial_and_is_faster` | 369 > 368 |
+| `a_slot_snapshot_resumes_the_context_without_re_prefilling` | 69 > 68 |
+| `a_chunked_prefill_answers_like_an_unchunked_one` | 457 > 456 |
+| `a_repeated_chunked_prefill_stops_rebuilding` | 441 > 440 |
+| `a_long_prefill_keeps_another_slot_decoding` | **not the budget**: the work counter does move under `spin`, and its priming loop is a fixed three steps, so the gate's own *"slot 1 must have emitted something before the long prefill"* assertion fires instead |
+
+The tenth failure is `the_seam_fails_the_batch_forward_without_a_bespoke_mock`: the #171 gate asserts a
+`tick` reaches the forward and reports the injected `500`, and under any `MINFER_TEST_TICK` injection
+`tick` returns before the forward, so it fails on its own `.expect_err`. It is reported for
+completeness, not a bounded stepper.
+
+**The bound that could not be made to fail fast — honest scope.** Two `#[ignore]`d gates step the
+engine through the **production** `serve_loop` on the test's own thread:
+`serve_loop_publishes_the_queue_and_running_depth` and
+`a_job_rejected_for_want_of_a_slot_is_answered_with_503`. A persistent wedge keeps the engine busy,
+so `serve_loop` keeps ticking and the test thread never returns — there is nowhere for a test
+assertion to run. Measured with `MINFER_TEST_TICK=wedge … --exact` under an outer `timeout 30`: the
+process is killed at **exit 124** (it hangs), which is the shape #158's audit already recorded and
+#160's table classifies as a redundant backstop. Making those two wedge-proof needs a *production*
+liveness bound in `serve_loop` (a counted consecutive-no-progress limit) or the engine's work counter
+published to `ServerMetrics` so a spawned worker can be observed; either is a production change this
+ticket's scope fence excludes. Filed as [#196](https://github.com/yusiwen/minfer/issues/196).
+
+**Verification (2026-09-27, CPU build, aarch64 (this box); `--bin minfer` for the gate set).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **465 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration (unchanged — no test added or removed) |
+| `scripts/real_model_gates.sh` (parallel, 0.5B) | **33 / 0** in 35.08s (42.9s wall) |
+| `PARALLEL=0 scripts/real_model_gates.sh` (serial, 0.5B) | **33 / 0** in 36.67s (36.8s wall) |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf PARALLEL=0 scripts/real_model_gates.sh` | **33 / 0** in 46.39s (46.6s wall) |
+| `MINFER_TEST_TICK=wedge` per gate (9 gates) | each **FAILED** on step 1, 0.21–1.68s wall (table above) |
+| `MINFER_TEST_TICK=spin` (set, minus the two `serve_loop` gates) | **10 failed / 21 passed** in 12.45s (table above) |
+| `MINFER_TEST_TICK=wedge` on the two `serve_loop` gates, outer `timeout 30` | **exit 124** — hangs, recorded as the limit above ([#196](https://github.com/yusiwen/minfer/issues/196)) |
+| `rustup run stable rustfmt --edition 2021 --check` on the changed `.rs` | clean (rustfmt 1.9.0-stable; the pinned 1.97.1 toolchain has no rustfmt component) |
+
+**Docs.** `docs/GATE-CONTRACT.md` rule 4's closing *"[#160](https://github.com/yusiwen/minfer/issues/160) tracks the remaining unbounded steppers"*
+is replaced with the outcome (the steppers are bounded; the remaining watchdogs are named backstops;
+the seam is `MINFER_TEST_TICK`), and §3 documents the seam next to `MINFER_TEST_CALL_FAIL`.
+`docs/BUILD.md` § *Tests* records the same and the mutation lever. `ARCHITECTURE-ROADMAP.md` is
+untouched: this is robustness inside the existing test-infrastructure/batching rows, not a new
+capability — the same reason the #154, #151 and #158 records give.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define

@@ -37,10 +37,16 @@
 # Usage:
 #   scripts/real_model_gates.sh [extra cargo test args...]
 #
-#   scripts/real_model_gates.sh                    # CPU-only: parallel, 29 passed / 0 failed
-#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 29 passed / 0 failed
+#   scripts/real_model_gates.sh                    # CPU-only: parallel, 33 passed / 0 failed
+#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 33 passed / 0 failed
 #   FEATURES=cuda scripts/real_model_gates.sh      # device set, serial (correct: #64)
 #   PARALLEL=1 scripts/real_model_gates.sh         # force parallel (CPU-only; see #64 on a device)
+#
+# (The counts are as of 2026-09-27, CPU build, aarch64; `AGENTS.md` carries the dated record.)
+# #160: `MINFER_TEST_TICK=wedge|spin` injects a wedged/moving-but-non-terminating step into
+# `BatchEngine::tick` for the bounded-stepper mutation check — see `docs/GATE-CONTRACT.md` §3.
+# It is unset in every normal run; the two `serve_loop`-driven gates hang under `wedge` and are
+# skipped (`--skip`) in a whole-set mutation run (issue #196).
 #
 # The device set's second configuration is a second run of the same command:
 #   MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
