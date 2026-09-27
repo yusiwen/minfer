@@ -1132,6 +1132,7 @@ extern "C" {
         pstr: i32,
         row_bytes: usize,
         dp4a: i32,
+        wide: i32,
         stream: *mut std::ffi::c_void,
     );
     // doc 94: batched split attention for the verify shapes (1 < nt <= 16) —
@@ -1970,6 +1971,20 @@ pub const KV_LAYOUT_Q8_0: i32 = 2;
 pub fn q8_kv_dp4a_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MINFER_NO_DP4A_Q8_KV").as_deref() != Ok("1"))
+}
+
+/// #202: the packed Q8_0 **decode** K/V four-quant load's same-binary A/B control.
+/// `MINFER_NO_Q8_KV_WIDE=1` selects the incumbent four byte loads
+/// (`q8_0_load4_bytes`); unset (or any other value) selects the two 16-bit loads
+/// (`q8_0_load4_wide`) that halve the L1 request count for the same bytes.
+///
+/// The load arm is only meaningful together with the `__dp4a` K dot, so
+/// `q8_kv_dp4a_enabled() == false` already implies the byte form — the launcher
+/// checks `dp4a && wide`. Read **once per process** for the same captured-graph
+/// reason as [`q8_kv_dp4a_enabled`].
+pub fn q8_kv_wide_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MINFER_NO_Q8_KV_WIDE").as_deref() != Ok("1"))
 }
 
 /// The `KV_LAYOUT_*` tag for a `KvFormat` — the one place the two names are tied
@@ -5898,7 +5913,11 @@ impl CudaState {
         // #186: the Q8_0 decode arm's same-binary A/B control. The flag is resolved
         // once per process (`cuda::q8_kv_dp4a_enabled`) and passed as a value; the
         // launcher picks the `__dp4a` or the convert-based instantiation from it.
+        // #202 adds a second, independent arm (`wide`): the K/V four-quant groups
+        // are loaded with two 16-bit loads instead of four byte loads. It is only
+        // meaningful on the dp4a arm, so `dp4a` already gates it in the launcher.
         let dp4a = q8_kv_dp4a_enabled();
+        let wide = q8_kv_wide_enabled();
         unsafe {
             if layout == KV_LAYOUT_Q8_0 {
                 launch_gqa_attn_split_q8_0(
@@ -5916,6 +5935,7 @@ impl CudaState {
                     pstr,
                     row_bytes,
                     dp4a as i32,
+                    wide as i32,
                     stream,
                 );
                 // The observation half of gate contract rule 3: a gate that must
@@ -9394,28 +9414,36 @@ mod issue162_tests {
                 }
             );
         }
-        for (mode, base_token, dp4a_token) in [
+        for (mode, base_token, dp4a_token, wide_token) in [
             (
                 MAP,
                 "launch:gqa_attn_split_q8_0__map",
                 "launch:gqa_attn_split_q8_0__map_dp4a",
+                "launch:gqa_attn_split_q8_0__map_wide",
             ),
             (
                 SPAN,
                 "launch:gqa_attn_split_q8_0__span",
                 "launch:gqa_attn_split_q8_0__span_dp4a",
+                "launch:gqa_attn_split_q8_0__span_wide",
             ),
             (
                 CAUSAL,
                 "launch:gqa_attn_split_q8_0__causal",
                 "launch:gqa_attn_split_q8_0__causal_dp4a",
+                "launch:gqa_attn_split_q8_0__causal_wide",
             ),
         ] {
-            // #186: the Q8_0 decode launcher picks one of two instantiations from the
-            // `dp4a` argument. Every audited site must be driven, so both arms are
-            // driven explicitly — the env resolves to one of them for production, but
-            // `run`'s armed set is a value here, not a process-global answer.
-            for (token, dp4a) in [(base_token, 0i32), (dp4a_token, 1i32)] {
+            // #186/#202: the Q8_0 decode launcher picks one of three instantiations
+            // from the `dp4a`/`wide` arguments. Every audited site must be driven,
+            // so all three arms are driven explicitly — the env resolves to one of
+            // them for production, but `run`'s armed set is a value here, not a
+            // process-global answer.
+            for (token, dp4a, wide) in [
+                (base_token, 0i32, 0i32),
+                (dp4a_token, 1, 0),
+                (wide_token, 1, 1),
+            ] {
                 go!(&[token, "launch:gqa_attn_split_q8_0__combine"], || unsafe {
                     launch_gqa_attn_split_q8_0(
                         ctx.cf(0),
@@ -9432,6 +9460,7 @@ mod issue162_tests {
                         68,
                         68,
                         dp4a,
+                        wide,
                         st,
                     );
                 });
