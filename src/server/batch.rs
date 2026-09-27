@@ -1450,6 +1450,28 @@ impl BatchEngine {
         );
     }
 
+    /// #196: answer **every** run still occupying a slot — the `fail_batch` shape
+    /// without a row list, for the case where the batch is the whole engine.
+    ///
+    /// `serve_loop`'s no-progress bound knows the engine is wedged but not which
+    /// batch wedged it (a step that returned `Ok` may have built none), so the
+    /// affected set is "every slot that still has a run". Each one goes through
+    /// [`Self::fail`], the same primitive `advance`'s error path and `fail_batch`
+    /// use: exactly one `StreamEvent::Err` through the run's own sender (#121's
+    /// per-job shape), the run taken so the slot is free, and `cached_tokens`
+    /// cleared because a wedged engine's KV rows cannot be trusted as a prefix.
+    /// Returns how many runs it answered, for the log line and the gate.
+    fn fail_all(&mut self, e: &ApiError) -> usize {
+        let mut answered = 0;
+        for idx in 0..self.slots.len() {
+            if self.slots[idx].run.is_some() {
+                self.fail(idx, e.clone());
+                answered += 1;
+            }
+        }
+        answered
+    }
+
     /// Close a request: flush the tail, send `Finish`, and free the slot (its
     /// KV and `cached_tokens` stay, so the next request can reuse the prefix).
     fn finish(&mut self, idx: usize, reason: &str) {
@@ -1504,10 +1526,78 @@ impl BatchEngine {
     }
 }
 
+/// #196: how many **consecutive** steps `serve_loop` tolerates leaving the engine
+/// busy without advancing [`BatchEngine::work_units`] before it declares the worker
+/// stalled, answers every live and queued request and ends the loop.
+///
+/// The healthy maximum is **0**: a `tick` that leaves the engine busy has either
+/// forwarded a decode row or committed a token through `advance`'s `Continue`, and
+/// both increment the counter (#158's invariant — the gates' shared `WorkBound`
+/// asserts it per step, and this is the same invariant enforced in production). The
+/// number is therefore deliberately loose rather than tuned: 64 steps of slack keep
+/// a future engine change that legitimately defers work for a handful of steps from
+/// being mistaken for a stall, while a genuinely wedged engine still ends the loop
+/// promptly — a no-op step costs microseconds, so 64 of them are well under a
+/// millisecond of extra spinning, and the loop was previously spinning forever at
+/// 100% CPU. It is a **count** (steps), never a wall-clock number, per rule 4 of
+/// the gate contract (`docs/GATE-CONTRACT.md`).
+pub const STALL_STEP_LIMIT: u64 = 64;
+
+/// The error every stuck request receives when `serve_loop`'s no-progress bound
+/// trips (#196): a `500 server_error`, the same attribution #151 gave a failed
+/// decode step — the *worker* stalled, which is not the client's fault and not the
+/// saturation `503 unavailable_error` of #121/#150.
+pub const WORKER_STALLED_MESSAGE: &str = "the worker stalled";
+
+/// #196: answer every queued-but-unadmitted job when `serve_loop` gives up.
+///
+/// These jobs (the worker's own `pending` deque plus whatever is still in the
+/// channel) have not been placed, and ending the loop drops their `Job` — and with
+/// it the only `Sender<StreamEvent>` their handler listens on, which the handler
+/// reads as a *completed* empty answer (#121's silent drop: HTTP 200 with empty
+/// content). They are therefore answered with the same terminal error the live runs
+/// got, through the same [`reject`] primitive a saturated engine uses. Each is
+/// counted as admitted (it *left* the queue, so `queue_depth` stays
+/// `accepted - admitted`) **and** as dropped (the worker could not place it) — the
+/// two counters a rejected job already moves. Returns how many it answered.
+fn reject_queued(
+    pending: &mut VecDeque<Job>,
+    job_rx: &mut mpsc::Receiver<Job>,
+    e: &ApiError,
+) -> u64 {
+    let mut answered = 0;
+    for job in pending.drain(..) {
+        reject(job, e.clone());
+        answered += 1;
+    }
+    loop {
+        match job_rx.try_recv() {
+            Ok(job) => {
+                reject(job, e.clone());
+                answered += 1;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    answered
+}
+
 /// Drain jobs (blocking only when nothing is in flight) and step the batch.
 ///
 /// F8: `metrics` is written on every pass — the queue/engine counters here, the
 /// KV/allocator reading through `BatchEngine::publish_metrics`.
+///
+/// #196: the loop carries a **counted no-progress bound**. A `tick` that leaves
+/// the engine busy without advancing `BatchEngine::work_units` is counted; after
+/// [`STALL_STEP_LIMIT`] consecutive such steps the worker is declared stalled,
+/// every live run and every queued job is answered **once** with a `500`, the
+/// `worker_stalled_total` counter moves, and the loop ends. Before this, such a
+/// step spun the loop at 100% CPU forever and no client ever heard (#151's shape,
+/// one level up: the fix there answered a *failed* batch, this answers a batch
+/// that never runs). The count is reset on every sign of progress — a wait for
+/// work (`blocking_recv`), a step that moved the counter, and #151's `Err` step,
+/// which answered its batch and released its slots — so a long-lived server never
+/// accumulates toward the limit.
 pub fn serve_loop(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
@@ -1516,9 +1606,14 @@ pub fn serve_loop(
     metrics: &super::metrics::ServerMetrics,
 ) {
     let mut pending: VecDeque<Job> = VecDeque::new();
+    // #196: consecutive steps that left the engine busy with a frozen work
+    // counter. See the doc comment above; a healthy engine never gets past 0.
+    let mut stalled_steps: u64 = 0;
     loop {
         if !engine.busy() {
-            // Nothing to step: wait for work.
+            // Nothing to step: wait for work. An idle wait is not a spin, so any
+            // earlier no-progress run of steps is over.
+            stalled_steps = 0;
             let Some(job) = job_rx.blocking_recv() else {
                 // No senders left: publish the final reading (idle slots, nothing
                 // running) before leaving, so a scrape after the drain is not a
@@ -1571,8 +1666,55 @@ pub fn serve_loop(
             }
         }
         if engine.busy() {
-            if let Err(e) = engine.tick(model, tokenizer) {
-                eprintln!("[server] step failed: {}", e.message);
+            let work_before = engine.work_units();
+            match engine.tick(model, tokenizer) {
+                Ok(()) => {
+                    // #196: the counted liveness bound. A step that leaves the
+                    // engine busy must have moved the counter (#158); one that did
+                    // not is the wedge that used to spin here forever. `Ok` only:
+                    // #151's failed-batch arm is the `Err` branch below, and it is
+                    // progress — it answered that batch and released its slots.
+                    if engine.busy() && engine.work_units() == work_before {
+                        stalled_steps += 1;
+                        if stalled_steps >= STALL_STEP_LIMIT {
+                            let e = ApiError::server(WORKER_STALLED_MESSAGE);
+                            let runs = engine.fail_all(&e);
+                            let queued = reject_queued(&mut pending, &mut job_rx, &e);
+                            metrics
+                                .worker_stalled_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if queued > 0 {
+                                metrics
+                                    .jobs_admitted_total
+                                    .fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
+                                metrics
+                                    .jobs_dropped_total
+                                    .fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            metrics
+                                .worker_pending
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "[server] the worker stalled: {STALL_STEP_LIMIT} consecutive \
+                                 steps left the engine busy without advancing its work counter \
+                                 ({} run(s), {} queued job(s) answered with 500); stopping the \
+                                 worker",
+                                runs, queued
+                            );
+                            engine.publish_metrics(metrics);
+                            break;
+                        }
+                    } else {
+                        stalled_steps = 0;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[server] step failed: {}", e.message);
+                    // #151: `tick` answered the failed batch and released its
+                    // slots before returning this error, so the engine moved even
+                    // though `work_units` did not. That is progress, not a wedge.
+                    stalled_steps = 0;
+                }
             }
         }
         engine.publish_metrics(metrics);
@@ -3022,11 +3164,13 @@ mod tests {
             let mut peak_running = 0u64;
             // #160: `FEEDER_POLL_BACKSTOP` is **only a backstop**, not the gate's
             // failure signal. The verdict below is `peak_running > 0` plus the
-            // queue arithmetic, and the worker (`serve_loop`) runs on this test's
-            // main thread: a genuine wedge inside `tick` keeps the engine busy, so
-            // the join never returns and this deadline cannot rescue it. What the
-            // terminator does bound is a worker whose metrics never settle; a
-            // healthy run breaks out on `drained` within milliseconds.
+            // queue arithmetic. Since #196 a wedge in `tick` no longer hangs the
+            // join: `serve_loop` ends itself on its counted no-progress bound, so
+            // the feeder also leaves as soon as it sees `worker_stalled_total`
+            // move — the assertion that follows needs no deadline to run, and the
+            // mutation run fails in seconds. What the terminator bounds is a
+            // worker that never settles and never trips the bound; a healthy run
+            // breaks out on `drained` within milliseconds.
             let deadline = Instant::now() + FEEDER_POLL_BACKSTOP;
             loop {
                 let s = feeder_metrics.snapshot();
@@ -3035,14 +3179,32 @@ mod tests {
                 // Only stop once the run has actually been *seen* running: with
                 // 256-token answers the window is seconds wide, so this is an
                 // assertion about the worker, not about sampler luck.
-                if (peak_running > 0 && drained) || Instant::now() > deadline {
+                if (peak_running > 0 && drained)
+                    || s.worker_stalled_total > 0
+                    || Instant::now() > deadline
+                {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             // Drain the responses; the worker's `blocking_send` must never wedge.
+            // #196: a healthy `serve_loop` never trips its no-progress bound, so
+            // every response here is `Text`/`Finish`; the errors are printed so a
+            // mutation run shows the terminal answer each client actually got.
+            let mut errors: Vec<String> = Vec::new();
             for mut rx in rxs {
-                while rx.blocking_recv().is_some() {}
+                while let Some(ev) = rx.blocking_recv() {
+                    if let StreamEvent::Err(e) = ev {
+                        errors.push(format!("{} {} ({})", e.status, e.message, e.error_type));
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                eprintln!(
+                    "[f8] serve_loop answered {} error(s): {}",
+                    errors.len(),
+                    errors.join("; ")
+                );
             }
             peak_running
         });
@@ -3051,6 +3213,11 @@ mod tests {
         let peak_running = feeder.join().expect("feeder");
 
         let s = metrics.snapshot();
+        assert_eq!(
+            s.worker_stalled_total, 0,
+            "the worker tripped its counted no-progress bound: a healthy serve_loop \
+             always advances work on a step that leaves the engine busy (#196)"
+        );
         assert_eq!(
             s.requests_total - s.queue_depth,
             n as u64,
@@ -3092,6 +3259,11 @@ mod tests {
         assert_eq!(
             s1.jobs_dropped_total, 1,
             "the second job cannot fit one slot and must be counted as dropped"
+        );
+        assert_eq!(
+            s1.worker_stalled_total, 0,
+            "the worker tripped its counted no-progress bound on a run that must \
+             simply serve one request and reject the other (#196)"
         );
         assert_eq!(s1.running, 0);
         assert_eq!(s1.worker_pending, 0);
@@ -3298,6 +3470,15 @@ mod tests {
             (served, rejected),
             (1, 1),
             "one slot serves one request and answers the other"
+        );
+        // #196: checked *after* the channels are read, so a wedge — which answers
+        // the served run with `500 the worker stalled` instead of a `Finish` —
+        // surfaces as the terminal error the client actually got, above, and this
+        // is the assertion that names the guard itself.
+        assert_eq!(
+            s.worker_stalled_total, 0,
+            "the worker tripped its counted no-progress bound: a one-slot run that \
+             serves one job and rejects the other must never stall (#196)"
         );
     }
 
@@ -3588,6 +3769,109 @@ mod tests {
         assert!(!engine.busy());
     }
 
+    /// #196: the stall path answers **every** live run exactly once.
+    ///
+    /// `serve_loop`'s no-progress bound knows the engine is wedged but not which
+    /// batch wedged it, so [`BatchEngine::fail_all`] is its `fail_batch` without a
+    /// row list. Three live runs and one idle slot: each live run gets exactly one
+    /// `500 the worker stalled` (never zero — #121/#151's dropped-or-never-answered
+    /// defect — and never a second), is taken so the slot is free and no retry can
+    /// repeat the wedged batch, and has its cached prefix cleared. The idle slot is
+    /// untouched. No model is involved, so this half runs in CI.
+    #[test]
+    fn the_stall_answers_every_live_run_exactly_once() {
+        let model = FailingForward::new();
+        let mut engine = BatchEngine::new(&model, 4, 64).expect("engine");
+        let mut rxs = Vec::new();
+        for slot in [0usize, 1, 3] {
+            let (tx, rx) = mpsc::channel::<StreamEvent>(8);
+            install_pending_run(&mut engine, slot, tx, 20 + slot as u32);
+            rxs.push((slot, rx));
+        }
+        assert_eq!(engine.running_slots(), 3);
+
+        let e = ApiError::server(WORKER_STALLED_MESSAGE);
+        let answered = engine.fail_all(&e);
+        assert_eq!(answered, 3, "every live run is answered");
+        assert!(!engine.busy(), "no run is left occupying a slot");
+        assert_eq!(engine.idle_slots(), 4);
+
+        for (slot, mut rx) in rxs {
+            let (errs, finishes, texts, closed) = read_run_channel(&mut rx);
+            assert_eq!(errs.len(), 1, "slot {slot}: exactly one terminal error");
+            assert_eq!(
+                (finishes, texts),
+                (0, 0),
+                "slot {slot}: the error is the whole answer"
+            );
+            assert_eq!(errs[0].status, 500, "slot {slot}: {}", errs[0].message);
+            assert_eq!(errs[0].error_type, "server_error", "slot {slot}");
+            assert_eq!(errs[0].message, WORKER_STALLED_MESSAGE, "slot {slot}");
+            assert!(
+                closed,
+                "slot {slot}: the sender is dropped, so the slot is released"
+            );
+            assert!(engine.slots[slot].run.is_none(), "slot {slot}: free");
+            assert!(
+                engine.slots[slot].cached_tokens.is_empty(),
+                "slot {slot}: a wedged engine's prefix must not be reused"
+            );
+        }
+        assert!(engine.slots[2].run.is_none(), "the idle slot was untouched");
+        assert_eq!(
+            engine.fail_all(&e),
+            0,
+            "an already-idle engine has nothing to answer"
+        );
+    }
+
+    /// #196: the stall path answers every **queued but unadmitted** job too.
+    ///
+    /// Ending `serve_loop` drops a queued [`Job`] — and with it the only
+    /// `Sender<StreamEvent>` its handler listens on, which the handler reads as a
+    /// *completed* empty answer (#121's silent drop). [`reject_queued`] answers the
+    /// worker's own deque and whatever is still in the channel with the same
+    /// terminal error, exactly once each, before the loop ends. CI: no model.
+    #[test]
+    fn the_stall_answers_every_queued_job_exactly_once() {
+        let (job_tx, mut job_rx) = mpsc::channel::<Job>(8);
+        let mut pending: VecDeque<Job> = VecDeque::new();
+        let mut rxs = Vec::new();
+        for i in 0..3 {
+            let (tx, rx) = mpsc::channel::<StreamEvent>(8);
+            rxs.push(rx);
+            let job = Job {
+                input_ids: vec![1, 2, 3],
+                params: sampling_params(2),
+                tx,
+            };
+            if i == 0 {
+                pending.push_back(job); // already in the worker's deque
+            } else {
+                job_tx.blocking_send(job).expect("queue job"); // still in the channel
+            }
+        }
+
+        let e = ApiError::server(WORKER_STALLED_MESSAGE);
+        let answered = reject_queued(&mut pending, &mut job_rx, &e);
+        assert_eq!(answered, 3, "every queued job is answered");
+        assert!(pending.is_empty(), "the worker's deque is drained");
+
+        for (i, mut rx) in rxs.into_iter().enumerate() {
+            let (errs, finishes, texts, closed) = read_run_channel(&mut rx);
+            assert_eq!(errs.len(), 1, "job {i}: exactly one terminal error");
+            assert_eq!(
+                (finishes, texts),
+                (0, 0),
+                "job {i}: never a Finish and never text"
+            );
+            assert_eq!(errs[0].status, 500, "job {i}: {}", errs[0].message);
+            assert_eq!(errs[0].error_type, "server_error", "job {i}");
+            assert_eq!(errs[0].message, WORKER_STALLED_MESSAGE, "job {i}");
+            assert!(closed, "job {i}: the sender is dropped after the answer");
+        }
+    }
+
     /// #171 deliverable D: the seam replaces #151's bespoke mock, on the real path.
     ///
     /// The gate above needs [`FailingForward`], a test-local `ModelDef`, because a
@@ -3670,12 +3954,13 @@ mod tests {
     /// terminator, named so the number is justified where it is used.
     ///
     /// It is **not** a gate's failure signal: the verdict is the downstream
-    /// `peak_running > 0` and the queue arithmetic, and the worker runs on the
-    /// test's main thread, so a real wedge in `tick` hangs that join regardless of
-    /// any deadline here (this is exactly why #158 left it and #160 classifies it a
-    /// redundant backstop). It is also not load-sensitive: `peak_running` is
-    /// observed within milliseconds of the first admission on every run. The value
-    /// is generous only because it is the last resort for a worker that drains but
+    /// `peak_running > 0` and the queue arithmetic. Since #196 the worker also
+    /// stops itself, so this is no longer the only way out of the join: the feeder
+    /// leaves as soon as `worker_stalled_total` moves (the mutation run fails in
+    /// seconds), and it leaves on the healthy `drained` condition within
+    /// milliseconds. It is also not load-sensitive: `peak_running` is observed
+    /// within milliseconds of the first admission on every run. The value is
+    /// generous only because it is the last resort for a worker that drains but
     /// whose published metrics never settle.
     const FEEDER_POLL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(120);
 
