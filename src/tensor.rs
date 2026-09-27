@@ -9,6 +9,7 @@ use crate::gguf::GgmlType;
 pub enum TensorType {
     F32,
     F16,
+    BF16,
     Q4_0,
     Q4_1,
     Q5_0,
@@ -29,6 +30,7 @@ impl TensorType {
         match self {
             TensorType::F32 => 4,
             TensorType::F16 => 2,
+            TensorType::BF16 => 2,
             TensorType::Q4_0 => 18,  // sizeof(block_q4_0)
             TensorType::Q4_1 => 20,  // sizeof(block_q4_1)
             TensorType::Q5_0 => 22,  // sizeof(block_q5_0)
@@ -49,6 +51,7 @@ impl TensorType {
         match self {
             TensorType::F32 => 1,
             TensorType::F16 => 1,
+            TensorType::BF16 => 1,
             TensorType::Q4_0 => 32,
             TensorType::Q4_1 => 32,
             TensorType::Q5_0 => 32,
@@ -69,6 +72,7 @@ impl TensorType {
         match t {
             GgmlType::F32 => TensorType::F32,
             GgmlType::F16 => TensorType::F16,
+            GgmlType::BF16 => TensorType::BF16,
             GgmlType::Q4_0 => TensorType::Q4_0,
             GgmlType::Q4_1 => TensorType::Q4_1,
             GgmlType::Q5_0 => TensorType::Q5_0,
@@ -88,6 +92,7 @@ impl TensorType {
         match self {
             TensorType::F32 => "f32",
             TensorType::F16 => "f16",
+            TensorType::BF16 => "bf16",
             TensorType::Q4_0 => "q4_0",
             TensorType::Q4_1 => "q4_1",
             TensorType::Q5_0 => "q5_0",

@@ -8,7 +8,7 @@
 //     `lm_head`; an unknown tensor name is a refusal, so a future HF revision
 //     cannot silently drop weights.
 //   * dtypes: bf16, f16, f32 (safetensors). Anything else is refused.
-//   * output dtype: f16 (default) or f32. bf16 output is out of scope.
+//   * output dtype: f16 (default), bf16 or f32. bf16 is #142.
 //
 // No ML framework: safetensors is a length-prefixed JSON header + raw tensor
 // bytes, and tokenizer.json/config.json are plain JSON, so `serde_json` is the
@@ -29,6 +29,7 @@ use crate::gguf_write::{self, TensorSpec};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutType {
     F16,
+    Bf16,
     F32,
 }
 
@@ -36,14 +37,10 @@ impl OutType {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "f16" | "fp16" => Ok(OutType::F16),
+            "bf16" | "bfloat16" => Ok(OutType::Bf16),
             "f32" | "fp32" => Ok(OutType::F32),
-            "bf16" => Err(
-                "minfer convert: --outtype bf16 is not supported; supported output types: f16, \
-                 f32 (a bf16 writer is a follow-up — f32 preserves every bf16 value exactly)"
-                    .to_string(),
-            ),
             other => Err(format!(
-                "minfer convert: unknown --outtype {other:?}; supported: f16, f32"
+                "minfer convert: unknown --outtype {other:?}; supported: f16, bf16, f32"
             )),
         }
     }
@@ -51,6 +48,7 @@ impl OutType {
     pub fn name(self) -> &'static str {
         match self {
             OutType::F16 => "f16",
+            OutType::Bf16 => "bf16",
             OutType::F32 => "f32",
         }
     }
@@ -58,17 +56,59 @@ impl OutType {
     pub fn ggml_type(self) -> GgmlType {
         match self {
             OutType::F16 => GgmlType::F16,
+            OutType::Bf16 => GgmlType::BF16,
             OutType::F32 => GgmlType::F32,
         }
     }
 
-    /// llama.cpp's `general.file_type` (MOSTLY_F16 / ALL_F32).
+    /// llama.cpp's `general.file_type` (MOSTLY_F16 / MOSTLY_BF16 / ALL_F32).
+    /// These are `llama_ftype`'s ABI numbers (`include/llama.h`), not a local
+    /// enum: a reader parses the value from the file.
     pub fn file_type(self) -> u32 {
         match self {
             OutType::F16 => 1,
+            OutType::Bf16 => 32,
             OutType::F32 => 0,
         }
     }
+
+    /// Whether this target keeps 1-D tensors (norms, biases) in f32.
+    ///
+    /// This is llama.cpp's "except 1d tensors" rule (`conversion/base.py` sets
+    /// `data_qtype = F32` for `n_dims <= 1` on every f16/bf16 file type), and it
+    /// is what the engine's norm/bias path reads. `f32` is the one target that
+    /// converts every tensor.
+    pub fn keeps_1d_f32(self) -> bool {
+        matches!(self, OutType::F16 | OutType::Bf16)
+    }
+
+    /// The GGUF type a tensor with `ndims` stored dimensions gets for this
+    /// target — the 1-D rule of [`OutType::keeps_1d_f32`] in one place.
+    pub fn tensor_type(self, ndims: usize) -> GgmlType {
+        if self.keeps_1d_f32() && ndims <= 1 {
+            GgmlType::F32
+        } else {
+            self.ggml_type()
+        }
+    }
+}
+
+/// f32 → bf16 bits, exactly `ggml_compute_fp32_to_bf16` (ggml-impl.h):
+/// round-to-nearest-even on the top 16 bits, with a NaN forced quiet.
+///
+/// The rounding is the integer form of RNE: `bits + 0x7fff + lsb` then shift,
+/// where `lsb` is bit 16 — a tie (the discarded 16 bits are exactly `0x8000`)
+/// adds 1 only when the surviving mantissa bit is odd, i.e. it rounds to even.
+/// The exponent carries for free (a mantissa overflow increments it). Every
+/// finite value fits: the largest magnitude reaching the add is `0x7f7fffff`,
+/// so the sum cannot wrap `u32`.
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    if (u & 0x7fff_ffff) > 0x7f80_0000 {
+        // NaN: keep the sign and the top mantissa bits, set the quiet bit.
+        return ((u >> 16) as u16) | 64;
+    }
+    (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
 /// A source dtype we can decode.
@@ -425,11 +465,12 @@ fn canonical_order(tensors: &[HfTensor]) -> Vec<usize> {
 }
 
 /// Convert one tensor's bytes from `dtype` to the GGUF type `out`. bf16→f16 is
-/// exact in the mantissa but can overflow f16's range; f32→f16 is lossy
-/// (nearest-even); f16→f32 and bf16→f32 are exact.
+/// exact in the mantissa but can overflow f16's range; f32→f16 and f32→bf16 are
+/// lossy (round-to-nearest-even); f16→f32 and bf16→f32 are exact.
 pub fn convert_bytes_ggml(dtype: HfDtype, out: GgmlType, src: &[u8]) -> Vec<u8> {
     let out = match out {
         GgmlType::F32 => OutType::F32,
+        GgmlType::BF16 => OutType::Bf16,
         _ => OutType::F16,
     };
     convert_bytes(dtype, out, src)
@@ -468,6 +509,28 @@ pub fn convert_bytes(dtype: HfDtype, out: OutType, src: &[u8]) -> Vec<u8> {
                     HfDtype::F16 => unreachable!(),
                 };
                 o.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+            }
+            o
+        }
+        // bf16 target (#142). Every source is decoded to the exact f32 value
+        // first, then re-encoded with `ggml_compute_fp32_to_bf16`'s RNE. A bf16
+        // source round-trips to its own bits (it *is* the top half of that f32),
+        // so this is the identity on an already-bf16 checkpoint — the routing is
+        // kept so the NaN-quieting rule is the reference's, not a raw copy's.
+        (HfDtype::Bf16, OutType::Bf16)
+        | (HfDtype::F16, OutType::Bf16)
+        | (HfDtype::F32, OutType::Bf16) => {
+            let n = src.len() / dtype.elem_size();
+            let mut o = Vec::with_capacity(n * 2);
+            for c in src.chunks_exact(dtype.elem_size()) {
+                let v = match dtype {
+                    HfDtype::Bf16 => {
+                        f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
+                    }
+                    HfDtype::F16 => half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32(),
+                    HfDtype::F32 => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                };
+                o.extend_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
             }
             o
         }
@@ -868,8 +931,8 @@ pub struct Conversion {
     pub specs: Vec<TensorSpec>,
     pub ckpt: HfCheckpoint,
     pub out: OutType,
-    /// The output GGUF type per tensor. For `f16` output this is F32 for 1-D
-    /// tensors (norms and biases) — llama.cpp's "except 1d tensors" rule, and
+    /// The output GGUF type per tensor. For `f16`/`bf16` output this is F32 for
+    /// 1-D tensors (norms and biases) — llama.cpp's "except 1d tensors" rule, and
     /// what the engine's f32 norm/bias path consumes. For `f32` output every
     /// tensor is F32.
     pub targets: Vec<GgmlType>,
@@ -897,11 +960,7 @@ impl Conversion {
             for (j, d) in t.shape.iter().rev().enumerate().take(4) {
                 ne[j] = *d;
             }
-            let tgt = if out == OutType::F16 && t.shape.len() <= 1 {
-                GgmlType::F32
-            } else {
-                out.ggml_type()
-            };
+            let tgt = out.tensor_type(t.shape.len());
             targets.push(tgt);
             specs.push(TensorSpec::new(t.gguf_name.clone(), ne, tgt));
         }
@@ -1232,12 +1291,109 @@ mod tests {
     }
 
     #[test]
-    fn outtype_parse_refuses_bf16_by_name() {
+    fn outtype_parse_accepts_bf16_and_the_enum_agrees_with_gguf() {
         assert_eq!(OutType::parse("F16").unwrap(), OutType::F16);
         assert_eq!(OutType::parse("f32").unwrap(), OutType::F32);
-        let e = OutType::parse("bf16").unwrap_err();
-        assert!(e.contains("bf16"), "{e}");
+        // #142: bf16 is an accepted target now, in every spelling the CLI may
+        // see, and the refusal text for a genuinely unknown type names it.
+        assert_eq!(OutType::parse("bf16").unwrap(), OutType::Bf16);
+        assert_eq!(OutType::parse("BF16").unwrap(), OutType::Bf16);
+        assert_eq!(OutType::parse("bfloat16").unwrap(), OutType::Bf16);
         assert!(OutType::parse("q4_0").is_err());
+        let e = OutType::parse("bfloat").unwrap_err();
+        assert!(e.contains("bf16"), "{e}");
+
+        // The accepted target must agree with the GGUF enum and with
+        // llama.cpp's `llama_ftype` number a reader parses from the file:
+        // MOSTLY_BF16 = 32 (include/llama.h), type_size 2, blck_size 1.
+        assert_eq!(OutType::Bf16.ggml_type(), GgmlType::BF16);
+        assert_eq!(OutType::Bf16.file_type(), 32);
+        assert_eq!(OutType::Bf16.name(), "bf16");
+        assert_eq!(GgmlType::BF16.type_size(), 2);
+        assert_eq!(GgmlType::BF16.blck_size(), 1);
+        assert_eq!(OutType::F16.file_type(), 1);
+        assert_eq!(OutType::F32.file_type(), 0);
+    }
+
+    /// The 1-D rule of the file contract (#142): norms and biases stay f32 on
+    /// both half targets. llama.cpp's converter writes exactly this
+    /// (`conversion/base.py`: `if n_dims <= 1 ... data_qtype = F32`), and byte
+    /// parity against its output forces it.
+    #[test]
+    fn the_one_d_tensor_rule_is_f32_for_f16_and_bf16() {
+        for out in [OutType::F16, OutType::Bf16] {
+            assert_eq!(out.tensor_type(0), GgmlType::F32, "0-D for {out:?}");
+            assert_eq!(out.tensor_type(1), GgmlType::F32, "1-D for {out:?}");
+            assert_eq!(out.tensor_type(2), out.ggml_type(), "2-D for {out:?}");
+            assert_eq!(out.tensor_type(4), out.ggml_type(), "4-D for {out:?}");
+        }
+        // f32 is the one target that converts every tensor, 1-D included.
+        assert_eq!(OutType::F32.tensor_type(1), GgmlType::F32);
+        assert_eq!(OutType::Bf16.tensor_type(2), GgmlType::BF16);
+    }
+
+    /// f32 → bf16 is round-to-nearest-even on the top 16 bits, including exact
+    /// ties. Every expected pattern is hand-derived from the bf16 grid near 1.0
+    /// (step 2^-7): a tie adds 1 only when the surviving mantissa bit is odd.
+    #[test]
+    fn f32_to_bf16_rounds_to_nearest_even_including_ties() {
+        // Exact bf16 values pass through unchanged (bit patterns, not decimals).
+        for (f, bits) in [
+            (0.0f32, 0x0000u16),
+            (-0.0f32, 0x8000),
+            (1.0f32, 0x3F80),
+            (-1.0f32, 0xBF80),
+            (2.0f32, 0x4000),
+            (0.5f32, 0x3F00),
+        ] {
+            assert_eq!(f32_to_bf16_bits(f), bits, "{f}");
+        }
+        // Just below / just above the halfway point between 1.0 and 1.0078125.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F80_7FFF)), 0x3F80);
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F80_8001)), 0x3F81);
+        // Exact tie: 1.0 + 2^-8. Lower neighbour 0x3F80 is even → stays 0x3F80.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F80_8000)), 0x3F80);
+        // Exact tie with an odd lower neighbour → rounds up to even, 0x3F82.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F81_8000)), 0x3F82);
+        // Tie where the lower neighbour is already even → no change.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F82_8000)), 0x3F82);
+        // Tie with an odd lower neighbour one step higher → up to 0x3F84.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F83_8000)), 0x3F84);
+        // A mantissa overflow carries into the exponent: the largest value below
+        // 2.0 is a tie that rounds up to 2.0 (0x4000), not to 0x3FFF.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3FFF_8000)), 0x4000);
+        // ±inf saturates at the same pattern; a NaN is forced quiet.
+        assert_eq!(f32_to_bf16_bits(f32::INFINITY), 0x7F80);
+        assert_eq!(f32_to_bf16_bits(f32::NEG_INFINITY), 0xFF80);
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x7F80_0001)), 0x7FC0);
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0xFFC0_1234)), 0xFFC0);
+    }
+
+    /// A bf16 source re-encoded as bf16 is the identity, and `convert_bytes`
+    /// routes the BF16 GGUF type to the bf16 encoder (the pre-#142 `_ => F16`
+    /// mapping would silently write f16 bytes under a BF16 label).
+    #[test]
+    fn bf16_to_bf16_round_trips_and_routes_through_the_bf16_encoder() {
+        // Every non-signalling bf16 value round-trips to its own bits.
+        for bits in [
+            0x0000u16, 0x0001, 0x3F80, 0xBF80, 0x4000, 0x7F7F, 0xFF7F, 0x7FC0,
+        ] {
+            let y = convert_bytes(HfDtype::Bf16, OutType::Bf16, &bits.to_le_bytes());
+            assert_eq!(u16::from_le_bytes([y[0], y[1]]), bits, "bf16 {bits:#06x}");
+        }
+        // `convert_bytes_ggml` picks the bf16 encoder for the BF16 GGUF type.
+        // 1.0 + 2^-8 = 0x3F80_8000 is a tie → bf16 0x3F80, but f16 can store it
+        // exactly (0x3C04), so the two encoders are distinguishable here.
+        let v = f32::from_bits(0x3F80_8000).to_le_bytes();
+        let bf = convert_bytes_ggml(HfDtype::F32, GgmlType::BF16, &v);
+        assert_eq!(u16::from_le_bytes([bf[0], bf[1]]), 0x3F80);
+        let f16 = convert_bytes_ggml(HfDtype::F32, GgmlType::F16, &v);
+        assert_eq!(u16::from_le_bytes([f16[0], f16[1]]), 0x3C04);
+        // f16 → bf16 keeps the exact value (f16 is a strict subset of bf16's
+        // exponent range here, and every f16 mantissa is a bf16 mantissa).
+        let two = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let y = convert_bytes(HfDtype::F16, OutType::Bf16, &two);
+        assert_eq!(u16::from_le_bytes([y[0], y[1]]), 0x4000);
     }
 
     #[test]

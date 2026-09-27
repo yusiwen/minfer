@@ -98,6 +98,7 @@ it does not add row padding. A tensor of type `T` with row length `ne[0]`:
 |---|---|---|---|---|
 | `F32` | 4 | 1 | `ne[0] × 4` | LE f32 |
 | `F16` | 2 | 1 | `ne[0] × 2` | LE half bits |
+| `BF16` | 2 | 1 | `ne[0] × 2` | LE bf16 bits (`f32`'s top 16 bits) |
 | `Q4_0` | 18 | 32 | `ne[0]/32 × 18` | `d: f16`, `qs[16]` (element `j` low nibble, `j+16` high) |
 | `Q4_1` | 20 | 32 | `ne[0]/32 × 20` | `d: f16`, `m: f16`, `qs[16]` |
 | `Q5_0` | 22 | 32 | `ne[0]/32 × 22` | `d: f16`, `qh: u32` (5th bits, element `j` bit `j`), `qs[16]` |
@@ -149,7 +150,7 @@ filename count that disagrees with `split.count` all fail the load.
 ## 2. The subcommands
 
 ```text
-minfer convert  <hf-model-dir> <out.gguf> [--outtype f16|f32] [--split-max-size N]
+minfer convert  <hf-model-dir> <out.gguf> [--outtype f16|bf16|f32] [--split-max-size N]
 minfer quantize <in.gguf> <out.gguf> --type <target> [--split-max-size N]
 minfer split    <in.gguf> <out-dir> --max-size N [--stem NAME]
 ```
@@ -194,7 +195,8 @@ Metadata written (marked **strict** = read by `Tokenizer::load` /
 - **strict** `qwen2.{block_count,context_length,embedding_length,feed_forward_length}`
 - **strict** `qwen2.attention.{head_count,head_count_kv,layer_norm_rms_epsilon}`
 - **strict** `qwen2.rope.freq_base`
-- `general.file_type` (1 = f16, 0 = f32), `general.quantization_version = 2`
+- `general.file_type` (1 = f16, 32 = bf16, 0 = f32; llama.cpp's `llama_ftype`
+  numbers), `general.quantization_version = 2`
 - `general.sampling.{top_k,top_p,temp,penalty_repeat}` from `generation_config.json`
 - **strict** `tokenizer.ggml.model = "gpt2"`, **strict** `tokenizer.ggml.pre = "qwen2"`
 - **strict** `tokenizer.ggml.tokens` (all `vocab_size` ids), `tokenizer.ggml.token_type`,
@@ -212,6 +214,11 @@ does not either; the strict loader defaults missing scores to 0).
 `--outtype f16` writes 2-D tensors as f16 and **1-D tensors (norms, biases) as
 f32** — llama.cpp's "except 1d tensors" rule, and what the engine's f32
 norm/bias path consumes. `--outtype f32` writes everything as f32.
+`--outtype bf16` ([#142](https://github.com/yusiwen/minfer/issues/142)) is the
+same shape with a bf16 2-D payload: f32 → bf16 is **round-to-nearest-even**
+(`ggml_compute_fp32_to_bf16`, including the quiet-NaN rule), and 1-D stays f32 —
+`conversion/base.py`'s `n_dims <= 1` rule, which byte parity against
+`llama-quantize --pure … BF16` confirms (§4.1.1).
 
 ### 2.2 `quantize` — re-encode a single-file GGUF
 
@@ -293,8 +300,7 @@ minfer convert: HuggingFace tensor 'model.layers.0.mlp.gate_up_proj.weight' has
 minfer convert: tensor 'x' has safetensors dtype 'I8'; minfer converts bf16,
   f16 and f32 only
 
-minfer convert: --outtype bf16 is not supported; supported output types: f16,
-  f32 (a bf16 writer is a follow-up — f32 preserves every bf16 value exactly)
+minfer convert: unknown --outtype "q4_0"; supported: f16, bf16, f32
 
 minfer convert: <dir>/tokenizer_config.json has no 'chat_template'; minfer's
   strict loader renders the model's own template, so a converted GGUF without
@@ -339,8 +345,11 @@ size mismatch for <path>: expected 1048576 bytes, got 1572864 bytes (the server
 |---|---|
 | f16 → f16 (copy), f32 → f32 (copy) | bit-exact |
 | f16 → f32, bf16 → f32 | bit-exact (exponent and mantissa are preserved; bf16 is `f32`'s top 16 bits) |
-| bf16 → f16 | **exact in the mantissa** (bf16 has 8 mantissa bits, f16 has 10) but can **overflow**: a bf16 value beyond f16's ±65504 becomes ±inf. No saturation is applied, so the overflow is visible rather than a silently clamped weight. |
-| f32 → f16 | **not exact** — round-to-nearest-even, and the same overflow rule |
+| bf16 → f16 | **exact in the mantissa** (bf16's 8 mantissa bits fit f16's 10) but **not in the exponent range**: a bf16 value outside f16's range becomes ±inf, and one below f16's smallest normal (2^-14) is rounded onto f16's subnormal grid (below 2^-24 it flushes to zero). No saturation is applied, so the loss is visible rather than a silently clamped weight. |
+| f32 → f16 | **not exact** — round-to-nearest-even, and the same exponent-range rule |
+| f32 → bf16 (#142) | **not exact** — round-to-nearest-even on f32's top 16 bits (`ggml_compute_fp32_to_bf16`, NaN forced quiet). bf16 keeps f32's exponent range, so there is no overflow, only mantissa rounding |
+| bf16 → bf16 (#142) | bit-exact: the identity, since bf16 *is* f32's top half. Routed through the RNE encoder rather than copied, so a NaN payload is quieted exactly as the reference does. |
+| f16 → bf16 (#142) | **not exact** — f16's 10-bit mantissa is rounded to bf16's 7 stored bits; no overflow, because bf16's exponent range covers f16's |
 | rewrite / split (any type) | bit-exact: the payload is copied |
 | f16/f32 → q4_0/q4_1/q5_0/q5_1/q8_0 | **lossy by construction** (that is the point); the encoder is byte-identical to llama.cpp's reference |
 | q4_0…q8_0 → f32 | the exact stored values (a dequantize, not a re-quantize) |
@@ -367,8 +376,50 @@ checkpoint (bf16 safetensors downloaded to `/tmp/f6-work/hf-src`):
 
 Because the source is bf16 and the output f16, "bit-exact" here is the
 **bf16 → f16** row above: exact in the mantissa. It is *not* a claim that no
-information was lost — bf16 has 8 mantissa bits and f16 has 10, so every bf16
-value is representable, and the exactness held on this checkpoint.
+information was lost. The mantissa half is true — bf16 has 7 stored mantissa
+bits (8 with the implicit one) and f16 has 10, so no bf16 mantissa is rounded by
+f16 — but the **exponent range is not**: f16's smallest normal is 2^-14 and its
+smallest subnormal is 2^-24, so a bf16 value below 2^-14 lands on f16's subnormal
+grid (and is rounded there), and one below 2^-24 flushes to zero. On this
+checkpoint that is **123 024 values in the 169 2-D tensors** (measured
+2026-09-27, `f142_bf16_output_runs_within_the_stated_bound`); every one of them
+is an f16 subnormal. This was found while checking #142's premise that "every
+bf16 value is exactly representable in f16" — it is not, and that is why the
+bf16-vs-f16 file comparison is a stated bound, not a bitwise claim (§4.3).
+
+### 4.1.1 The bf16 writer (#142)
+
+`--outtype bf16` is accepted and writes **2-D BF16 / 1-D F32**. The reference is
+a pure cast by llama.cpp, but from the **f32** conversion rather than the f16
+one:
+
+```bash
+minfer convert ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct \
+  ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f32.gguf --outtype f32
+llama-quantize --pure ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f32.gguf \
+  ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-bf16-from-f32.gguf BF16
+MINFER_F142_LLAMACPP_BF16=~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-bf16-from-f32.gguf \
+  cargo test --release --bin minfer f142_bf16_conversion_is_byte_identical_to_the_reference -- --ignored
+```
+
+`minfer convert --outtype f32` is exact for a bf16 source, so the cast is the
+f32→bf16 RNE projection of the checkpoint's own values. Result (measured
+2026-09-27, aarch64): **290/290 tensor payloads byte-identical** — 169 BF16
+2-D tensors, 121 F32 1-D tensors. The 1-D rule agrees because
+`conversion/base.py` sets `data_qtype = F32` for `n_dims <= 1` on every file
+type, and `llama-quantize`'s `tensor_allows_quantization` returns the source
+type for a 1-D tensor.
+
+**Why not the f16 source.** #142's Source B (`llama-quantize --pure <f16>.gguf …
+BF16`) was tried first and is **not** byte-identical here: casting the f16 file
+cannot recover the 123 024 subnormal values that the f16 conversion already
+rounded, so 126 575 bytes across all 169 2-D tensors differ (measured
+2026-09-27, per-tensor byte diff). That is the reference's input, not minfer's
+writer — which is exactly what the f32-source reference isolates. The writer has
+no torch/transformers converter to check against on this box
+(`convert_hf_to_gguf.py --outtype bf16` needs torch); the f32-source cast is the
+strongest available reference, and the missing direct converter reference is
+[#209](https://github.com/yusiwen/minfer/issues/209).
 
 ### 4.2 The reference the encoders were checked against
 
@@ -487,6 +538,7 @@ done; done
 | `f16 → q4_K/q5_K/q6_K` logits (Qwen3-0.6B, hidden 1024 — every 2-D tensor K-encoded) | same | max \|Δ\| = **3.71 / 2.39 / 1.19**, mean 0.69 / 0.43 / 0.21, max \|logit\| = 19.99 (**18.6% / 11.9% / 5.9%**); greedy `[12095, 13, 576, 6722]` identical for all three |
 | an f16 file's CUDA logits vs the same file's CPU logits (#141, 34-token prompt, ctx 512, Qwen2.5-0.5B-Instruct f16) | max \|Δ\| ≤ **0.01** and max relative ≤ **1e-3**, greedy continuation identical | max \|Δ\| = **7.34e-5**, mean 1.26e-5, max \|logit\| = 18.43 (**4.0e-6** relative); greedy `[12095, 13, 1084, 374]` on both |
 | that f16 file under llama.cpp (same prompt, `--temp 0`) | — | `Paris.`, the same greedy continuation minfer produces on CPU and CUDA |
+| a **bf16** file's CPU logits vs the f16 file's, same context (0.5B, bf16 source) | max \|Δ\| ≤ **1e-4** and max relative ≤ **1e-5** **and** greedy continuation identical (the bitwise expectation of #142's text is refuted by measurement, §4.1) | max \|Δ\| = **2.29e-5**, mean 3.19e-6, max \|logit\| = 18.43 (**1.24e-6** relative); 147 357 of 151 936 logits differ in the last bits, and the whole difference is attributed to the **123 024 f16-subnormal weight values** the f16 file rounds (the bf16 file carries the checkpoint's exact values); greedy `[12095, 13, 1084, 374]` on both |
 
 The K-quant run gate (`f6_k_quant_output_runs_within_the_stated_bound`) states
 its bound as **max \|Δlogit\| ≤ 0.30 × max \|logit\| and the first greedy token
@@ -569,8 +621,20 @@ network is used.
   refuses a non-f32 norm weight (a registered length other than `d*4` bytes)
   instead of reading `d*4` bytes out of a `d*2` buffer
   ([#169](https://github.com/yusiwen/minfer/issues/169)).
-- **No `--outtype bf16`.** f32 preserves every bf16 value exactly, so nothing is
-  lost today, but a bf16 writer (and a bf16 weight path) is [#142](https://github.com/yusiwen/minfer/issues/142).
+- **bf16 runs on the CPU only.** [#142](https://github.com/yusiwen/minfer/issues/142)
+  added `--outtype bf16` and the CPU weight path (`Op::MatMul` decodes one bf16
+  row at a time via `vec_ops::mat_mul_bf16`, `Op::GetRows` decodes bf16
+  embedding rows, 1-D stays f32). On a CUDA or Metal build the loader's
+  all-or-nothing registration check does not register `TensorType::BF16`, so
+  `device()` answers `Cpu` and the load prints "their weights are not usable
+  there — running on CPU": a loud downgrade, never a silent wrong path, but not
+  device support. The device bf16 path (registration + kernel + device gate,
+  the #141 template) is [#208](https://github.com/yusiwen/minfer/issues/208).
+- **The bf16 converter reference is a cast, not the converter.** §4.1.1 checks
+  minfer's bf16 output against `llama-quantize --pure <f32>.gguf … BF16`, because
+  `convert_hf_to_gguf.py --outtype bf16` needs torch (absent here). The cast is a
+  valid per-tensor byte reference but shares minfer's RNE rule by construction;
+  the direct converter check is [#209](https://github.com/yusiwen/minfer/issues/209).
 - **`general.size_label` is not written** (cosmetic; llama.cpp derives it from
   the parameter count). Every other key llama.cpp writes for this architecture is
   written, with the same value.

@@ -37,8 +37,8 @@
 # Usage:
 #   scripts/real_model_gates.sh [extra cargo test args...]
 #
-#   scripts/real_model_gates.sh                    # CPU-only: parallel, 34 passed / 0 failed
-#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 34 passed / 0 failed
+#   scripts/real_model_gates.sh                    # CPU-only: parallel, 36 passed / 0 failed
+#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 36 passed / 0 failed
 #   FEATURES=cuda scripts/real_model_gates.sh      # device set, serial (correct: #64)
 #   PARALLEL=1 scripts/real_model_gates.sh         # force parallel (CPU-only; see #64 on a device)
 #
