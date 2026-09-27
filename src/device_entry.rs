@@ -1,46 +1,59 @@
-//! Issue #185: the **one thread at a time** contract of the process-wide CUDA
-//! device layer, as a checked invariant instead of a comment.
+//! Issue #185's **one thread at a time** contract, **narrowed by issue #188** to
+//! the one device path that still shares the context stream.
 //!
-//! `CudaState` is a process-wide singleton ([#64]). Its stream, its **capture
-//! window** (`cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)`), its
-//! device buffer pool, its MMQ/positions memos and its captured-graph execs are
-//! shared by every thread in the process. `cudaStreamCaptureModeGlobal` in
-//! particular means *another* thread's driver call is not capture-safe: it either
-//! invalidates the capture (`cudaErrorStreamCaptureInvalidated`, 901 — the
-//! failures [#185] observed) or, as the gdb backtrace of the SIGSEGV shows,
-//! faults inside the driver (`cuMemcpyHtoD_v2`) while `register_weight` copies a
-//! weight with a plain blocking `cudaMemcpy` from a thread that is not the one
-//! holding the capture.
+//! ## What #185 saw, and what #188 changed
 //!
-//! Thus: **two threads inside the device path at once is undefined behaviour**,
-//! not a performance question. The supported configuration is one thread at a
-//! time — `scripts/cuda_test.sh`, i.e. `--test-threads=1`, for the device suite.
+//! `CudaState` is a process-wide singleton ([#64]): one device, one name-keyed
+//! weight registry. Before #188 it also meant one **stream** and one
+//! **capture window**, opened with `cudaStreamBeginCapture(stream,
+//! cudaStreamCaptureModeGlobal)`. Under Global semantics another thread's
+//! capture-unsafe driver call belongs to that window: it either invalidates the
+//! capture (`cudaErrorStreamCaptureInvalidated`, 901) or faults inside the
+//! driver. The recorded SIGSEGV was `register_weight`'s blocking `cudaMemcpy`
+//! (`cuMemcpyHtoD_v2`, i.e. the legacy *null* stream) landing while another
+//! thread sat in `graph_end_capture_to_exec → cudaGraphInstantiate` ([#188]).
 //!
-//! This module is the guard that says so. [`enter`] takes a process-wide,
-//! re-entrant-per-thread token; a second *thread* is refused with the reason and
-//! the remedy, before any driver call it would have raced. The device path calls
-//! it at the two chokepoints the crash evidence names: the scheduler's
-//! [`execute`](crate::graph::scheduler::BackendScheduler::execute) (which owns the
-//! capture window) and `CudaState::register_weight`'s caller
-//! (`models::weight_reg::register_cuda_weight`).
+//! #188 made the **stream** (and the capture window, and the activation
+//! scratches) travel with the backend instance: every `CudaBackend` creates its
+//! own `cudaStreamNonBlocking` stream (`CudaState::create_stream`), binds it for
+//! the duration of each device operation (`crate::cuda::bind_stream`), and opens
+//! capture with `cudaStreamCaptureModeThreadLocal`. Weight registration no longer
+//! uses a blocking `cudaMemcpy` at all — it queues the H2D copy on the context
+//! stream and waits on that stream.
 //!
-//! **It is a chokepoint, not a structural exclusion.** A caller that reaches
-//! `CudaBackend::execute_node` / `synchronize` / `graph_replay_step`, or
-//! `CudaState::register_weight` directly instead of through those two entry
-//! points, still runs unguarded — as does `Drop for CudaBackend`'s frees (which
-//! the existing `stream_guard` serializes unless the backend is mid-capture).
-//! Making the whole device path structurally exclusive — per-instance streams and
-//! capture contexts, or a lock every device call takes — is
-//! [#188](https://github.com/yusiwen/minfer/issues/188). This guard is what makes
-//! the *observed* crash a loud refusal instead of a segfault.
+//! ## The narrowed guard
 //!
-//! The module is deliberately **pure and feature-independent** so the CPU CI job
-//! executes its tests even though a hosted runner has no GPU — the same reason
-//! `models::weight_reg::cuda_weight_reg` keeps its decision pure (see that
-//! module's docs). The `cuda`-gated callers are the only production users.
+//! What remains process-wide is the **context stream** an *unbound* caller gets:
+//! a caller that reaches `CudaState`'s launch/copy helpers without a
+//! `CudaBackend` to bind. In production exactly one such path survives —
+//! [`CudaState::layer_gpu`](crate::cuda::CudaState::layer_gpu), the legacy
+//! per-layer path (the graph path and `main` do not drive it) — and it drives
+//! the context-keyed `buf_*` activation scratches. Two threads inside *that*
+//! path would overwrite one another's scratch.
+//!
+//! So this module is now the exclusion for **the legacy unbound path only**:
+//!
+//! - **Covered** (takes [`enter`]): `CudaState::layer_gpu`.
+//! - **No longer covered** (the #188 fix removed the call): a device graph
+//!   execution (`BackendScheduler::execute`) and `register_cuda_weight`. Both are
+//!   per-instance or stream-ordered now, and the concurrent device gate
+//!   (`graph::cuda_backend::tests::
+//!   two_cuda_engines_forward_concurrently_and_stay_bitwise_identical`) asserts
+//!   the positive property — two threads run at once and stay bitwise correct —
+//!   that replaces this module's refusal.
+//! - **Never covered, still unbound**: direct `CudaState` scratch calls
+//!   (`layer_gpu`'s siblings `upload_hidden`/`download_logits`/…), all
+//!   `#[allow(dead_code)]` legacy surface. They are single-threaded by
+//!   construction (dead code); naming them here is the honest scope.
+//!
+//! The module stays **pure and feature-independent** so the CPU CI job executes
+//! its test even though a hosted runner has no GPU — the same reason
+//! `models::weight_reg::cuda_weight_reg` keeps its decision pure. The
+//! `cuda`-gated callers are the only production users.
 //!
 //! [#64]: https://github.com/yusiwen/minfer/issues/64
 //! [#185]: https://github.com/yusiwen/minfer/issues/185
+//! [#188]: https://github.com/yusiwen/minfer/issues/188
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
@@ -49,8 +62,8 @@ use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
-/// The thread currently inside the device path and what it is doing. `None`
-/// means the path is free.
+/// The thread currently inside the legacy unbound device path and what it is
+/// doing. `None` means the path is free.
 static DEVICE_ENTRY: Mutex<Option<DeviceHolder>> = Mutex::new(None);
 
 thread_local! {
@@ -66,11 +79,10 @@ struct DeviceHolder {
     what: &'static str,
 }
 
-/// Exclusive, per-thread-re-entrant ownership of the process-wide CUDA device
-/// path. Dropping it (in the other direction) releases the path; a panicking
-/// holder releases it on unwind, and a poisoned mutex is recovered rather than
-/// wedging every later device user (the slot is a single `Option`, so there is no
-/// inconsistent state to recover from).
+/// Exclusive, per-thread-re-entrant ownership of the legacy unbound device path.
+/// Dropping it releases the path; a panicking holder releases it on unwind, and a
+/// poisoned mutex is recovered rather than wedging every later device user (the
+/// slot is a single `Option`, so there is no inconsistent state to recover from).
 ///
 /// `!Send` on purpose: the thread-local depth is what makes re-entrancy work, so
 /// a token must be dropped on the thread that took it.
@@ -78,15 +90,14 @@ pub struct DeviceEntry {
     _not_send: PhantomData<*const ()>,
 }
 
-/// Enter the process-wide CUDA device path.
+/// Enter the legacy unbound device path.
 ///
 /// `what` names the operation for the refusal message (a `&'static str`, so the
 /// message needs no allocation on the hot path).
 ///
 /// Returns `Err` — **without touching the driver** — when another thread is
-/// already inside the device path. The same thread may re-enter (nested
-/// `execute` → `register_weight`, or a `DeviceEntry` held across several calls);
-/// the outermost drop releases it.
+/// already inside it. The same thread may re-enter; the outermost drop releases
+/// it.
 pub fn enter(what: &'static str) -> Result<DeviceEntry, String> {
     if DEPTH.with(|d| d.get()) > 0 {
         DEPTH.with(|d| d.set(d.get() + 1));
@@ -98,14 +109,12 @@ pub fn enter(what: &'static str) -> Result<DeviceEntry, String> {
     let mut slot = DEVICE_ENTRY.lock().unwrap_or_else(|e| e.into_inner());
     match *slot {
         Some(holder) if holder.thread != me => Err(format!(
-            "minfer: refusing to enter the CUDA device path ({what}): another thread is already \
-             inside it ({other}). `CudaState` is a process-wide singleton — one stream, one \
-             capture window (`cudaStreamCaptureModeGlobal`), one device pool, one captured-graph \
-             cache — so two threads inside the device path is undefined behaviour: the parallel \
-             `#[ignore]`d device suite has segfaulted inside libcuda at `cuMemcpyHtoD_v2` during \
-             weight registration against another thread's open capture window (issue #185). Run \
-             the device suite serially: `scripts/cuda_test.sh`, or `cargo test --release \
-             --features cuda -- --test-threads=1`.",
+            "minfer: refusing to enter the legacy unbound CUDA device path ({what}): another \
+             thread is already inside it ({other}). This path reaches `CudaState`'s launch/copy \
+             helpers without a `CudaBackend` to bind a stream, so it shares the context stream's \
+             `buf_*` activation scratches with every other unbound caller. The graph path and \
+             weight registration are per-instance/stream-ordered since issue #188 and do not take \
+             this guard; only the legacy `layer_gpu` path does. Run one unbound caller at a time.",
             other = holder.what
         )),
         _ => {
@@ -135,9 +144,10 @@ impl Drop for DeviceEntry {
 mod tests {
     use super::*;
 
-    /// #185 acceptance, the refusal half: a **second thread** is refused, the
-    /// message names the holder and the issue, and the entry is released again
-    /// when the holder drops.
+    /// The narrowed guard's acceptance: a **second thread** is refused, the
+    /// message names the holder, the mechanism (the unbound context stream's
+    /// scratches) and the issue that narrowed the scope, and the entry is
+    /// released again when the holder drops.
     ///
     /// Mutation evidence (rule 3 of the gate contract): deleting the
     /// `Some(holder) if holder.thread != me` arm — i.e. letting every thread in —
@@ -145,18 +155,17 @@ mod tests {
     ///
     /// Both halves live in **one** test on purpose: the guard is a process global,
     /// so two tests running in parallel (libtest's default) would refuse each
-    /// other — the very property being asserted. One test keeps the module's own
-    /// two halves sequential.
+    /// other — the very property being asserted.
     #[test]
-    fn the_device_path_is_exclusive_across_threads_and_re_entrant_on_one() {
+    fn the_legacy_unbound_path_is_exclusive_across_threads_and_re_entrant_on_one() {
         // ── the refusal half ────────────────────────────────────────────────
-        let held = enter("the first thread's forward").expect("the device path starts free");
+        let held = enter("the first thread's layer pass").expect("the path starts free");
 
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         let other = std::thread::spawn(move || {
             // `.err()` drops the token on the second thread either way, so a bug
             // that let it in would not leak the entry past this test.
-            let reason = enter("a second thread's forward")
+            let reason = enter("a second thread's layer pass")
                 .err()
                 .map(|e| e.to_string());
             tx.send(reason).expect("the observer is alive");
@@ -168,29 +177,31 @@ mod tests {
         other.join().expect("the observer thread");
 
         assert!(
-            reason.contains("a second thread's forward"),
+            reason.contains("a second thread's layer pass"),
             "the refusal must name what was refused: {reason}"
         );
         assert!(
-            reason.contains("the first thread's forward"),
+            reason.contains("the first thread's layer pass"),
             "the refusal must name the operation already inside: {reason}"
         );
+        // #188 narrowed the scope: the message must name the unbound context
+        // stream as the mechanism, not "CudaState is a process-wide singleton"
+        // (that reading is gone with per-instance streams).
         assert!(
-            reason.contains("process-wide singleton"),
-            "the refusal must state the mechanism: {reason}"
+            reason.contains("unbound"),
+            "the refusal must state the narrowed mechanism: {reason}"
         );
         assert!(
-            reason.contains("#185"),
-            "the refusal must point at the evidence: {reason}"
+            reason.contains("layer_gpu"),
+            "the refusal must name the only path that still needs it: {reason}"
         );
         assert!(
-            reason.contains("--test-threads=1"),
-            "the refusal must name the remedy: {reason}"
+            reason.contains("#188"),
+            "the refusal must point at the narrowing issue: {reason}"
         );
 
         // ── the re-entrancy half ────────────────────────────────────────────
-        // The same thread nests freely (an `execute` that registers a weight in
-        // the same thread must not refuse itself) …
+        // The same thread nests freely …
         let inner = enter("a nested same-thread entry").expect("re-entrant on the owner");
         drop(inner);
         // … and dropping the inner entry must not release the outer one.

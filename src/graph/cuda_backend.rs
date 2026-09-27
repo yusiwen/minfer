@@ -20,6 +20,21 @@ struct CudaBuf {
 
 pub struct CudaBackend {
     state: &'static crate::cuda::CudaState,
+    /// Issue #188: **this backend's own device stream**. Every launch, copy,
+    /// event, capture/replay and synchronize this backend issues is bound to
+    /// this stream for the duration of the operation
+    /// (`crate::cuda::bind_stream`), so two engines in one process run — and
+    /// capture — concurrently instead of sharing `CudaState`'s process-wide
+    /// stream and its one capture window. Created `cudaStreamNonBlocking` so it
+    /// does not join the legacy default stream's implicit global
+    /// synchronization, which is what let one engine's host-side `cudaMemcpy`
+    /// invalidate another engine's capture.
+    ///
+    /// It is freed in [`Drop`], after the pool, the scratches and the captured
+    /// graphs are released (a `cudaFree` on a stream that still has queued work
+    /// is ordered by the driver, but destroying the stream last keeps the
+    /// teardown order obvious).
+    stream: *mut std::ffi::c_void,
     /// 8b / C4 S2b / #153: the KV cache **layout** as a `crate::cuda::KV_LAYOUT_*` code
     /// (f32 / f16 / q8_0). It is **per engine**: the loaded model's resolved
     /// `KvFormat` reaches this backend through `GraphAllocator::set_kv_format` (the
@@ -67,9 +82,6 @@ pub struct CudaBackend {
     graph_runs: std::collections::HashMap<(u64, (usize, usize)), u32>,
     /// Open capture window (armed by `graph_replay`, closed by `synchronize`).
     capturing: Option<(u64, (usize, usize))>,
-    /// Held process-wide stream lock while `capturing` is open (released when
-    /// the window closes; see `CudaState::stream_lock`).
-    stream_guard: Option<std::sync::MutexGuard<'static, ()>>,
     /// `MINFER_NO_CUDA_GRAPH=1` (at construction) or a capture failure
     /// (session-wide) force the plain direct-launch path.
     graphs_mode: GraphMode,
@@ -182,6 +194,12 @@ impl CudaBackend {
     /// engine and never a process global.
     pub fn with_layout(kv_layout: i32) -> Option<Self> {
         let state = crate::cuda::CudaState::get()?;
+        // Issue #188: the backend's own stream. A device that cannot give us one
+        // gives us no backend (every path here is stream-scoped).
+        let stream = state.create_stream();
+        if stream.is_null() {
+            return None;
+        }
         let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
             GraphMode::Disabled
         } else {
@@ -190,6 +208,7 @@ impl CudaBackend {
         let prefill_capture = std::env::var("MINFER_NO_PREFILL_CAPTURE").as_deref() != Ok("1");
         Some(Self {
             state,
+            stream,
             pool: Vec::new(),
             free: Vec::new(),
             pool_gen: 0,
@@ -197,7 +216,6 @@ impl CudaBackend {
             graph_execs: Vec::new(),
             graph_runs: std::collections::HashMap::new(),
             capturing: None,
-            stream_guard: None,
             graphs_mode,
             prefill_capture,
             kv_layout,
@@ -207,6 +225,22 @@ impl CudaBackend {
             blocking_readbacks: std::sync::atomic::AtomicU64::new(0),
             stream_syncs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Issue #188: bind this backend's stream to the calling thread for the
+    /// lifetime of the returned guard. Every device operation this backend
+    /// performs starts with `let _bound = self.bind();`, after which
+    /// `CudaState::stream()` (and everything built on it: launchers,
+    /// `cudaMemcpyAsync` staging, events, capture/replay, `synchronize`) answers
+    /// with **this instance's** stream.
+    fn bind(&self) -> crate::cuda::StreamBinding {
+        crate::cuda::bind_stream(self.stream)
+    }
+
+    /// The stream this backend issues its device work on (test introspection +
+    /// the #188 concurrency gate's "two engines really do hold two streams" arm).
+    pub(crate) fn device_stream(&self) -> *mut std::ffi::c_void {
+        self.stream
     }
 
     /// Pool generation counter (CUDA Graph replay invalidation, Phase 7d).
@@ -401,6 +435,7 @@ impl CudaBackend {
         range: (usize, usize),
         nt_hint: Option<usize>,
     ) -> bool {
+        let _bound = self.bind();
         if self.graphs_mode != GraphMode::Enabled {
             return false;
         }
@@ -454,15 +489,12 @@ impl CudaBackend {
             && self.capturing.is_none()
             && nt_hint.map_or(true, |nt| nt == 1 || self.prefill_capture)
         {
-            // Hold the process-wide stream lock across the capture window:
-            // any other backend's stream work would otherwise be recorded
-            // into this graph (capture is per-stream, not per-thread).
-            let guard = self.state.stream_lock().lock().unwrap();
+            // Issue #188: no stream lock. The capture window is opened on THIS
+            // backend's own stream, and the mode is thread-local, so no other
+            // backend's work can be recorded into this graph or invalidate it.
             if self.state.graph_begin_capture() {
                 self.capturing = Some(key);
-                self.stream_guard = Some(guard);
             } else {
-                drop(guard);
                 eprintln!("CUDA: stream capture unavailable; graphs disabled for this session");
                 self.graphs_mode = GraphMode::Disabled;
             }
@@ -470,16 +502,12 @@ impl CudaBackend {
         false
     }
 
-    /// Stream-work serialization for backend methods: `None` while THIS
-    /// backend holds an open capture window (its own enqueues are the
-    /// recorded work); otherwise a held process-wide lock that blocks while
-    /// any other backend is capturing.
-    fn stream_guard(&self) -> Option<std::sync::MutexGuard<'static, ()>> {
-        if self.capturing.is_some() {
-            None
-        } else {
-            Some(self.state.stream_lock().lock().unwrap())
-        }
+    /// Issue #188: stream-work serialization is gone. Every backend holds its
+    /// own stream, so there is no shared stream to exclude another backend from.
+    /// Kept as a `None`-returning shim so the historical call sites read as the
+    /// no-op they now are; a caller must not rely on mutual exclusion here.
+    fn stream_guard(&self) -> Option<()> {
+        None
     }
 
     /// Close an open capture window (instantiate + launch once + cache), or
@@ -487,11 +515,9 @@ impl CudaBackend {
     /// the last split — never inside a capture window.
     fn close_capture_or_sync(&mut self) {
         if let Some(key) = self.capturing.take() {
-            // the stream lock stays held (self.stream_guard) until the window
-            // is fully closed and the capture launch has been enqueued
+            let _bound = self.bind();
             let exec = self.state.graph_end_capture_to_exec();
             let ok = !exec.is_null() && self.state.graph_launch_exec(exec);
-            self.stream_guard = None; // release after the last stream op
             if ok {
                 self.graph_execs.push(CapturedGraph {
                     exec,
@@ -553,6 +579,7 @@ impl CudaBackend {
     /// slice for a staged transfer). Explicit `sync()` first: never rely on the
     /// legacy-default-stream's implicit synchronization with blocking streams.
     pub fn copy_to_host(&self, id: usize) -> Option<Vec<f32>> {
+        let _bound = self.bind();
         let b = self.pool.get(id)?;
         if b.ptr.is_null() || b.bytes == 0 {
             return None;
@@ -598,6 +625,7 @@ impl CudaBackend {
     /// the same call, so the count and the stall cannot drift apart. Every sync
     /// this backend performs goes through here.
     fn state_sync(&self) {
+        let _bound = self.bind();
         self.stream_syncs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.state.sync();
@@ -618,6 +646,7 @@ impl CudaBackend {
         src: *const std::ffi::c_void,
         bytes: usize,
     ) -> Result<(), String> {
+        let _bound = self.bind();
         if bytes == 0 {
             return Err(format!(
                 "cuda: node {node} has an empty staging copy (0 bytes)"
@@ -651,6 +680,7 @@ impl CudaBackend {
         node: NodeId,
         dst: BackendTag,
     ) -> Result<Option<Vec<f32>>, String> {
+        let _bound = self.bind();
         let Some(pos) = self
             .cross_pending
             .iter()
@@ -678,6 +708,7 @@ impl CudaBackend {
     /// slab is in use. The smallest sufficient slab is chosen so a 4 KB staging
     /// copy does not occupy the 4 MB slab a prefill left behind.
     fn take_cross_slab(&mut self, bytes: usize) -> Result<usize, String> {
+        let _bound = self.bind();
         let mut best: Option<usize> = None;
         for (i, s) in self.cross_slabs.iter().enumerate() {
             if s.in_use || s.bytes < bytes {
@@ -710,6 +741,7 @@ impl CudaBackend {
     /// (unknown/empty buffer, or it does not fit under the staging ceiling) —
     /// the caller falls back to the per-node sync `copy_to_host`.
     pub fn capture_enq(&mut self, id: usize) -> bool {
+        let _bound = self.bind();
         let Some(b) = self.pool.get(id) else {
             return false;
         };
@@ -723,15 +755,21 @@ impl CudaBackend {
     /// One stream sync, then drain the capture staging: one `Vec<f32>` per
     /// successfully enqueued buffer, in enqueue order.
     pub fn capture_drain(&mut self) -> Vec<Vec<f32>> {
-        let _sg = self.stream_guard();
+        // Issue #188: bind first — `CaptureStaging::drain` syncs a stream, and it
+        // must be the stream the queued D2H copies were issued on.
+        let _bound = self.bind();
         self.cap.drain(self.state)
     }
 }
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
-        // cudaFree implicitly syncs — serialize against open capture windows.
-        let _sg = self.stream_guard();
+        // Issue #188: bind this backend's stream so the teardown's host-side
+        // transfers (and any queued work still in flight) are scoped to it.
+        // `cudaFree`/`cudaFreeHost` are context-wide; with the stream
+        // non-blocking they no longer implicitly sync against another engine's
+        // capturing stream, and the capture mode is thread-local.
+        let _bound = self.bind();
         // Pools live as long as the backend (inside GraphCache); only real
         // teardown frees device memory. free_buffer() only recycles.
         for b in &self.pool {
@@ -755,6 +793,9 @@ impl Drop for CudaBackend {
         }
         self.graph_execs.clear();
         self.capturing = None;
+        // Last, so every operation above ran on a live stream.
+        self.state.destroy_stream(self.stream);
+        self.stream = std::ptr::null_mut();
     }
 }
 
@@ -784,11 +825,11 @@ impl CudaBackend {
     /// are invalid. Disables graph capture for the session.
     fn abort_capture(&mut self, cause: &str) {
         if let Some(key) = self.capturing.take() {
+            let _bound = self.bind();
             let exec = self.state.graph_end_capture_to_exec();
             if !exec.is_null() {
                 self.state.graph_destroy(exec);
             }
-            self.stream_guard = None;
             self.graphs_mode = GraphMode::Disabled;
             eprintln!(
                 "CUDA: node error inside capture window (split {key:?}); capture aborted, \
@@ -1682,6 +1723,7 @@ impl CudaBackend {
     }
 
     fn copy_d2d(&self, src: BufRef, dst: BufRef) -> Result<(), String> {
+        let _bound = self.bind();
         let (s, d) = (self.ptr_of_ref(src)?, self.ptr_of_ref(dst)?);
         let (sb, db) = (src.len * 4, dst.len * 4);
         if sb != db {
@@ -2013,6 +2055,7 @@ impl Backend for CudaBackend {
     }
 
     fn alloc_buffer(&mut self, size: usize) -> usize {
+        let _bound = self.bind();
         let _sg = self.stream_guard(); // cudaMalloc syncs the device
         let bytes = size * 4;
         if let Some(pos) = self
@@ -2039,6 +2082,7 @@ impl Backend for CudaBackend {
     }
 
     fn free_buffer(&mut self, id: usize) {
+        let _bound = self.bind();
         let _sg = self.stream_guard();
         // Recycle, never cudaFree here: persistent KV regions survive rebuilds
         // and the pool keeps freed device memory for reuse (CPU/Metal alike).
@@ -2070,6 +2114,7 @@ impl Backend for CudaBackend {
         out_buf: BufRef,
         kv_pair: Option<(usize, usize)>,
     ) -> Result<(), String> {
+        let _bound = self.bind();
         let result = self.execute_node_inner(node, in_bufs, out_buf, kv_pair);
         // #162: drain the sticky required-launch record in BOTH arms. A launch
         // that failed for real set it (the C site has already printed the site,
@@ -2123,6 +2168,7 @@ impl Backend for CudaBackend {
         rows: usize,
         elems_per_cell: usize,
     ) -> Result<(), String> {
+        let _bound = self.bind();
         if dst.id != src.id {
             return Err(format!(
                 "cuda: copy_cells moves cells within one arena ({} -> {})",
@@ -2163,6 +2209,7 @@ impl Backend for CudaBackend {
     }
 
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String> {
+        let _bound = self.bind();
         // CUDA's fill has always allowed a prefix (the pool buffer may be longer
         // than the data), which is exactly the E4 S2 window contract at offset 0.
         self.write_host_window(id, 0, data)
@@ -2173,6 +2220,7 @@ impl Backend for CudaBackend {
     /// is that window's element offset (0 for an owning node, non-zero for a D1
     /// view).
     fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String> {
+        let _bound = self.bind();
         let _sg = self.stream_guard();
         let bytes = data.len() * 4;
         let base = offset * 4;
@@ -2193,6 +2241,7 @@ impl Backend for CudaBackend {
     }
 
     fn synchronize(&mut self) {
+        let _bound = self.bind();
         if self.capturing.is_none() {
             let _sg = self.stream_guard();
         }
@@ -2207,6 +2256,7 @@ impl Backend for CudaBackend {
     }
 
     fn graph_replay(&mut self, uid: u64, range: (usize, usize), nt_hint: Option<usize>) -> bool {
+        let _bound = self.bind();
         self.graph_replay_step(uid, range, nt_hint)
     }
 }
@@ -2269,6 +2319,167 @@ mod tests {
         let id2 = cb.alloc_buffer(16);
         assert_eq!(id, id2);
         assert_eq!(cb.pool_gen, 2);
+    }
+
+    /// Issue #188 acceptance, the **probe** — the instrument the mode decision
+    /// and the fix are both judged by.
+    ///
+    /// It constructs the recorded race *deterministically*: thread B opens a
+    /// capture window on its stream, records a device→device copy inside it and
+    /// signals; thread A then performs a weight registration **while the window
+    /// is open**; only then does B close the window (end capture + instantiate +
+    /// launch) and read the copied bytes back. Without the handshake the raw
+    /// failure rate was 3/6 bare and 2/10 under gdb — too low to distinguish a
+    /// fix from luck.
+    ///
+    /// Two env knobs make it the experiment rather than a single post-fix
+    /// assertion (see `docs/CUDA-BACKEND-DESIGN.md` §"Per-instance streams and
+    /// capture"):
+    /// - `MINFER_PROBE_STREAM=context` captures on `CudaState`'s own **blocking**
+    ///   stream — the pre-#188 shared stream — instead of a fresh non-blocking
+    ///   instance stream (the default);
+    /// - `MINFER_PROBE_LEGACY_MEMCPY=1` issues the registration through the
+    ///   pre-#188 **blocking** `cudaMemcpy` instead of the stream-ordered path.
+    /// - `MINFER_CUDA_CAPTURE_MODE=0|1|2` selects the capture mode.
+    ///
+    /// The 2×3 (stream × mode) matrix is run externally, one process per cell:
+    /// a fault kills the process, so it cannot be looped in-process. On the
+    /// fixed code the probe passes in every cell; on the pre-#188 code the
+    /// shared-stream + blocking-copy cells crash or report 901 under global
+    /// mode.
+    ///
+    /// The verdict has two independent arms: the capture window must close with
+    /// `cudaStreamEndCapture` code `0` (never 901
+    /// `cudaErrorStreamCaptureInvalidated`) and the graph must produce the bytes
+    /// the window recorded.
+    #[test]
+    fn capture_window_on_one_thread_survives_a_weight_registration_on_another() {
+        let Some(state) = device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let use_context_stream = std::env::var("MINFER_PROBE_STREAM").as_deref() == Ok("context");
+        let legacy_memcpy = std::env::var("MINFER_PROBE_LEGACY_MEMCPY").as_deref() == Ok("1");
+        let iterations: usize = std::env::var("MINFER_PROBE_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+
+        let stream = if use_context_stream {
+            state.stream()
+        } else {
+            state.create_stream()
+        };
+        assert!(!stream.is_null(), "the probe needs a capture stream");
+
+        const N: usize = 4096;
+        let bytes = N * 4;
+        let src = crate::cuda::CudaState::cuda_malloc(bytes);
+        let dst = crate::cuda::CudaState::cuda_malloc(bytes);
+        assert!(!src.is_null() && !dst.is_null(), "probe buffers allocated");
+        let pattern: Vec<f32> = (0..N).map(|i| ((i % 251) as f32) + 0.25).collect();
+        let raw = unsafe { std::slice::from_raw_parts(pattern.as_ptr() as *const u8, bytes) };
+        // The *wrong* value, so `dst == src` can only come from the graph's own
+        // recorded copy — the value arm must not be satisfied by the setup
+        // (gate contract rule 1).
+        let other: Vec<f32> = (0..N).map(|i| ((i % 97) as f32) - 3.5).collect();
+        let other_raw = unsafe { std::slice::from_raw_parts(other.as_ptr() as *const u8, bytes) };
+        state.copy_to_device(raw, src);
+        state.copy_to_device(other_raw, dst);
+
+        for it in 0..iterations {
+            // Seed `dst` with the wrong value again: the graph replays the
+            // recorded `copy_device_to_device(src → dst)`, so only a replayed
+            // graph makes `dst` equal `src`.
+            state.copy_to_device(other_raw, dst);
+            let b1 = std::sync::Barrier::new(2);
+            let b2 = std::sync::Barrier::new(2);
+            let outcome: std::sync::Mutex<Option<(bool, i32, bool)>> = std::sync::Mutex::new(None);
+            let name = format!("probe.capturectx.{it}");
+
+            // Raw pointers are not `Send`; carry addresses and rebuild them in
+            // each closure.
+            let stream_addr = stream as usize;
+            let (src_addr, dst_addr) = (src as usize, dst as usize);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let stream = stream_addr as *mut std::ffi::c_void;
+                    let (src, dst) = (
+                        src_addr as *mut std::ffi::c_void,
+                        dst_addr as *mut std::ffi::c_void,
+                    );
+                    let _bound = crate::cuda::bind_stream(stream);
+                    assert!(
+                        state.graph_begin_capture(),
+                        "graph_begin_capture must open on the probe stream"
+                    );
+                    // A capturable op so the window is not empty.
+                    state.copy_device_to_device(src, dst, bytes);
+                    b1.wait(); // the window is open; let A register
+                    b2.wait(); // A is done; close the window
+                    let exec = state.graph_end_capture_to_exec();
+                    let code = crate::cuda::last_capture_end_code();
+                    let launched = !exec.is_null() && state.graph_launch_exec(exec);
+                    if launched {
+                        state.sync();
+                    }
+                    state.graph_destroy(exec);
+                    *outcome.lock().unwrap() = Some((!exec.is_null(), code, launched));
+                });
+                scope.spawn(|| {
+                    b1.wait();
+                    if legacy_memcpy {
+                        state.register_weight_blocking_legacy(&name, raw);
+                    } else {
+                        state.register_weight(&name, raw);
+                    }
+                    b2.wait();
+                });
+            });
+
+            let (exec_ok, code, launched) = outcome
+                .lock()
+                .unwrap()
+                .expect("the capturing thread recorded its outcome");
+            eprintln!(
+                "PROBE: stream={} mode={} registration={} iter={it} exec_ok={exec_ok} \
+                 end_code={code} launched={launched}",
+                if use_context_stream {
+                    "context"
+                } else {
+                    "instance"
+                },
+                std::env::var("MINFER_CUDA_CAPTURE_MODE").unwrap_or_else(|_| "default".into()),
+                if legacy_memcpy { "blocking" } else { "ordered" },
+            );
+            assert_eq!(
+                code,
+                0,
+                "iteration {it}: the capture window was invalidated (code {code} = {}); the \
+                 window must survive a registration on another thread",
+                crate::cuda::cuda_error_name(code)
+            );
+            assert!(exec_ok, "iteration {it}: capture produced no exec");
+            assert!(
+                launched,
+                "iteration {it}: the captured graph did not launch"
+            );
+
+            // The value arm: the replayed copy must have produced `src`'s bytes.
+            let mut got = vec![0u8; bytes];
+            state.sync();
+            state.copy_from_device_pinned(dst as *const std::ffi::c_void, &mut got);
+            assert_eq!(
+                got, raw,
+                "iteration {it}: the captured graph's output does not match the bytes it recorded"
+            );
+        }
+
+        crate::cuda::CudaState::cuda_free(src);
+        crate::cuda::CudaState::cuda_free(dst);
+        if !use_context_stream {
+            state.destroy_stream(stream);
+        }
     }
 
     #[test]
@@ -3505,6 +3716,10 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
+        // Issue #188: direct `cb.state.*` kernel calls must land on THIS backend's
+        // stream, so the following `cb.copy_to_host` / `cb.state.sync()` waits on
+        // them (a context-stream launch + an instance-stream sync is a race).
+        let _bound = cb.bind();
         // serialize against the other mmvq parity tests (shared scratch)
         let _guard = crate::cuda::CudaState::model_load_guard();
         // two shapes: 2176 (partial tail super-block → v1 kernels) and 2560
@@ -3810,6 +4025,10 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
+        // Issue #188: direct `cb.state.*` kernel calls must land on THIS backend's
+        // stream, so the following `cb.copy_to_host` / `cb.state.sync()` waits on
+        // them (a context-stream launch + an instance-stream sync is a race).
+        let _bound = cb.bind();
         // serialize against the other mmvq parity tests (shared scratch)
         let _guard = crate::cuda::CudaState::model_load_guard();
         // two shapes: 2176 (partial tail super-block → v1 kernels) and 2560
@@ -4990,6 +5209,10 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
+        // Issue #188: direct `cb.state.*` kernel calls must land on THIS backend's
+        // stream, so the following `cb.copy_to_host` / `cb.state.sync()` waits on
+        // them (a context-stream launch + an instance-stream sync is a race).
+        let _bound = cb.bind();
         let _guard = crate::cuda::CudaState::model_load_guard();
         const N_CTX: usize = 64;
         const NT: usize = 5;
@@ -5363,6 +5586,9 @@ mod tests {
         };
 
         let run = |cb: &mut CudaBackend, pos: usize, row: usize| {
+            // #188: the direct `attn_bias_rope_store*` calls below bypass
+            // `execute_node`, so bind this backend's stream explicitly.
+            let _bound = cb.bind();
             // q is roped IN PLACE, so each arm starts from the original input.
             cb.write_host(b_q, &qs).unwrap();
             cb.write_host(b_p, &[f32::from_bits(pos as u32)]).unwrap();
@@ -5483,16 +5709,16 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
-        // Issue #185: this gate drives `CudaBackend`/`CudaState` **directly** — no
-        // `scheduler::execute`, so the scheduler's device-path guard cannot see it.
-        // Under the parallel `#[ignore]`d harness its launches raced another test's
-        // open capture window and faulted inside `cuLaunchKernel` (3/3 of the
-        // post-guard gdb crashes); the device token taken here turns that into this
-        // test's own loud refusal. It is held for the whole gate, which is correct:
-        // the gate is one device workload.
-        let _device_entry =
-            crate::device_entry::enter("the S4 map-window A/B (direct device calls)")
-                .unwrap_or_else(|reason| panic!("{reason}"));
+        // Issue #188: direct `cb.state.*` kernel calls must land on THIS backend's
+        // stream, so the following `cb.copy_to_host` / `cb.state.sync()` waits on
+        // them (a context-stream launch + an instance-stream sync is a race).
+        let _bound = cb.bind();
+        // Issue #188: this gate drives `CudaBackend`/`CudaState` **directly** — no
+        // `scheduler::execute`. It no longer takes the #185 device-entry guard:
+        // the direct `attn_bias_rope_store` calls below bind `cb`'s own stream
+        // (see `run`), so they no longer land on the context stream that another
+        // test could be capturing. The process-wide `model_load_guard` stays —
+        // this gate is a full model-load-shaped device workload.
         let _guard = crate::cuda::CudaState::model_load_guard();
         const KMAX: usize = crate::graph::kvcache::KV_MAP_MAX_SPANS;
         // The 7B decode shape (hd 128, 4 KV heads) at a 2K window: long enough
@@ -5725,6 +5951,10 @@ mod tests {
             eprintln!("skipping: no CUDA device");
             return;
         };
+        // Issue #188: direct `cb.state.*` kernel calls must land on THIS backend's
+        // stream, so the following `cb.copy_to_host` / `cb.state.sync()` waits on
+        // them (a context-stream launch + an instance-stream sync is a race).
+        let _bound = cb.bind();
         let _guard = crate::cuda::CudaState::model_load_guard();
 
         let nts = [3usize, 8usize];
@@ -9515,13 +9745,21 @@ mod tests {
         for _ in 0..3 {
             cb.graph_replay_step(7, (0, 1), None);
         }
+        // Issue #188: the window is this backend's own — `capturing` is the
+        // whole exclusion, there is no process-wide stream lock any more.
         assert!(cb.capturing.is_some(), "3rd run must open a capture window");
-        assert!(cb.stream_guard.is_some(), "window holds the stream lock");
+        assert!(
+            crate::cuda::CudaState::stream_is_capturing(cb.device_stream()),
+            "the backend's own stream must be the one in a capture window"
+        );
 
         // the error path: abort, not close
         cb.abort_capture("unit test");
         assert!(cb.capturing.is_none(), "window must be closed");
-        assert!(cb.stream_guard.is_none(), "stream lock released");
+        assert!(
+            !crate::cuda::CudaState::stream_is_capturing(cb.device_stream()),
+            "the stream must leave the capture window when it is aborted"
+        );
         assert_eq!(
             cb.graphs_mode,
             GraphMode::Disabled,

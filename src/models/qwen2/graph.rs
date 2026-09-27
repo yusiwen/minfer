@@ -1591,6 +1591,201 @@ mod tests {
         );
     }
 
+    /// Issue #188 acceptance, the **concurrency** half: two engines' forwards on
+    /// two OS threads at the same time, each bitwise equal to its own serial
+    /// reference.
+    ///
+    /// This is the configuration [#185] refuses today (`device_entry::enter`) and
+    /// the one the pre-#188 `CudaState` singleton cannot express: one stream means
+    /// a stream's work is serial, and two capture windows cannot be open on it.
+    /// The fix gives every `CudaBackend` its own non-blocking stream and a
+    /// thread-local capture mode, so the two engines really do overlap — the
+    /// `streams` arm asserts the two live backends hold **different** device
+    /// stream pointers, and the threads rendezvous on a barrier after both caches
+    /// exist so the overlap is forced rather than hoped for.
+    ///
+    /// The comparison is exact (`max |Δ| == 0`) against a serial run of the same
+    /// engine in a fresh cache, per gate contract rule 1: the concurrent run is
+    /// the arm under test and the serial run is an independent reference. It
+    /// asserts **values**, not timings, so the S4 map-window co-tenant timing gate
+    /// (issue #189) plays no part in the verdict.
+    ///
+    /// Ignored because it needs the cached 0.5B and a CUDA device; run it alone:
+    ///
+    /// ```text
+    /// cargo test --release --features cuda \
+    ///   two_cuda_engines_forward_concurrently_and_stay_bitwise_identical -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires the cached 0.5B model and a CUDA device"]
+    fn two_cuda_engines_forward_concurrently_and_stay_bitwise_identical() {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::offload::OffloadRequest;
+        use crate::models::{Device, ModelDef};
+        use std::sync::Barrier;
+
+        let Some(path) = cached_model_path() else {
+            eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the #188 concurrency gate");
+            return;
+        };
+        let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+        let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+        let n_ctx = 256usize;
+        let steps = 8usize;
+        let ids = tok.encode("The capital of France is");
+        let n = ids.len();
+        let positions: Vec<usize> = (0..n).collect();
+
+        // Two engines, loaded before either runs, under distinct registry
+        // namespaces (the CUDA weight registry is process-global and name-keyed).
+        // f32 and q8_0 so the two backends also hold different KV layout tags
+        // (#153), which keeps that reasoning inside this gate too.
+        let f32_engine = crate::models::load_model_configured(
+            &gguf,
+            "conc.f32.",
+            OffloadRequest::Default,
+            Some("f32"),
+        )
+        .expect("load the f32 engine");
+        let q8_engine = crate::models::load_model_configured(
+            &gguf,
+            "conc.q8.",
+            OffloadRequest::Default,
+            Some("q8_0"),
+        )
+        .expect("load the q8_0 engine");
+        for (model, name) in [(&f32_engine, "f32"), (&q8_engine, "q8_0")] {
+            assert_eq!(
+                model.device(),
+                Device::Cuda,
+                "the {name} engine must run on the device — a silent CPU fallback would leave the \
+                 concurrency gate measuring the CPU"
+            );
+        }
+
+        // One forward + `steps` decodes in a fresh cache; returns the logits.
+        let run = |model: &dyn ModelDef| -> Vec<Vec<f32>> {
+            let mut cache = GraphCache::new();
+            cache.alloc().kv_set_capacity(n_ctx);
+            let mut l = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+            let mut out = vec![l.clone()];
+            let mut next = argmax(&l);
+            for s in 0..steps {
+                l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                out.push(l.clone());
+                next = argmax(&l);
+            }
+            out
+        };
+
+        // Serial reference, each engine alone.
+        let ref_f32 = run(f32_engine.as_ref());
+        let ref_q8 = run(q8_engine.as_ref());
+
+        // Concurrent: two threads, both caches alive across a barrier, so the
+        // forwards genuinely overlap rather than interleave by luck.
+        let (conc_f32, conc_q8, s_f32, s_q8) = {
+            let barrier = Barrier::new(2);
+            let streams = std::sync::Mutex::new(Vec::<usize>::new());
+            let f32_out = std::sync::Mutex::new(Vec::<Vec<f32>>::new());
+            let q8_out = std::sync::Mutex::new(Vec::<Vec<f32>>::new());
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let mut cache = GraphCache::new();
+                    cache.alloc().kv_set_capacity(n_ctx);
+                    let mut l =
+                        f32_engine.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+                    let mut out = vec![l.clone()];
+                    let mut next = argmax(&l);
+                    streams
+                        .lock()
+                        .unwrap()
+                        .push(cache.alloc().cuda().unwrap().device_stream() as usize);
+                    barrier.wait(); // both backends exist and are live
+                    for s in 0..steps {
+                        l = f32_engine.forward_graph_cached(
+                            &[next],
+                            &[n + s],
+                            1,
+                            n_ctx,
+                            &mut cache,
+                        );
+                        out.push(l.clone());
+                        next = argmax(&l);
+                    }
+                    *f32_out.lock().unwrap() = out;
+                });
+                scope.spawn(|| {
+                    let mut cache = GraphCache::new();
+                    cache.alloc().kv_set_capacity(n_ctx);
+                    let mut l =
+                        q8_engine.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+                    let mut out = vec![l.clone()];
+                    let mut next = argmax(&l);
+                    streams
+                        .lock()
+                        .unwrap()
+                        .push(cache.alloc().cuda().unwrap().device_stream() as usize);
+                    barrier.wait(); // both backends exist and are live
+                    for s in 0..steps {
+                        l = q8_engine.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+                        out.push(l.clone());
+                        next = argmax(&l);
+                    }
+                    *q8_out.lock().unwrap() = out;
+                });
+            });
+            let s = streams.into_inner().unwrap();
+            assert_eq!(s.len(), 2, "one stream recorded per thread");
+            assert_ne!(
+                s[0], s[1],
+                "the two engines must hold two different device streams; a shared stream would \
+                 serialize them and make two capture windows impossible"
+            );
+            (
+                f32_out.into_inner().unwrap(),
+                q8_out.into_inner().unwrap(),
+                s[0],
+                s[1],
+            )
+        };
+
+        // Rule 1: value arm against the independent serial reference.
+        let drift_f32 = conc_f32
+            .iter()
+            .zip(&ref_f32)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        let drift_q8 = conc_q8
+            .iter()
+            .zip(&ref_q8)
+            .map(|(a, b)| max_delta(a, b))
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            drift_f32, 0.0,
+            "the f32 engine's concurrent logits must be bitwise its serial logits"
+        );
+        assert_eq!(
+            drift_q8, 0.0,
+            "the q8_0 engine's concurrent logits must be bitwise its serial logits"
+        );
+
+        // The captured-graph identity (#153) must still hold per instance: the
+        // captured execs cannot have crossed engines, so the two resolved formats
+        // must still differ.
+        assert_ne!(
+            f32_engine.kv_format(),
+            q8_engine.kv_format(),
+            "the concurrent engines must still resolve different KV formats"
+        );
+
+        eprintln!(
+            "[188] two CUDA engines forwarding on two threads ({steps} decode steps each): \
+             streams {s_f32:#x} vs {s_q8:#x}; concurrent-vs-serial drift {drift_f32} / {drift_q8}"
+        );
+    }
+
     /// C5's acceptance on the real model: a session resumed from disk continues
     /// **bitwise** like the one that stayed in memory. The restored rows *are* the
     /// bytes the in-memory run wrote, so this is an equality claim, not a tolerance
