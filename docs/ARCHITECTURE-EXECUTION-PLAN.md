@@ -4851,6 +4851,149 @@ the seam is `MINFER_TEST_TICK`), and §3 documents the seam next to `MINFER_TEST
 untouched: this is robustness inside the existing test-infrastructure/batching rows, not a new
 capability — the same reason the #154, #151 and #158 records give.
 
+#### Test-infrastructure record (#196, 2026-09-27) — `serve_loop` carries a counted no-progress bound, so a wedge answers its clients and ends
+
+**The defect.** [#160](https://github.com/yusiwen/minfer/issues/160) made every
+`while engine.busy()` stepper in the `#[ignore]`d server gates fail fast under an injected wedge —
+except two, for a structural reason:
+
+- `server::batch::tests::serve_loop_publishes_the_queue_and_running_depth`
+- `server::batch::tests::a_job_rejected_for_want_of_a_slot_is_answered_with_503`
+
+Both drive the engine through the **production** `serve_loop` on the test's own thread. A persistent
+wedge in `BatchEngine::tick` leaves the engine busy forever, `serve_loop` keeps ticking, and the test
+thread never returns — there is nowhere for an assertion to run. #160 measured
+`MINFER_TEST_TICK=wedge … --exact <gate>` under an outer `timeout 30` as **exit 124** (a hang); the
+feeder's `FEEDER_POLL_BACKSTOP` cannot rescue it, because the worker is on the same thread. In
+production the same shape is [#151](https://github.com/yusiwen/minfer/issues/151)'s client-visible
+failure one level up: the loop spins at 100% CPU, no client is ever told, `in_flight` stays ≥ 1, and
+a graceful drain burns its whole `MINFER_DRAIN_MS` deadline.
+
+**What landed — a production no-progress guard in `serve_loop`.** `src/server/batch.rs`:
+
+- `STALL_STEP_LIMIT: u64 = 64` — the number of **consecutive** steps that may leave the engine busy
+  without advancing `BatchEngine::work_units`. The healthy maximum is **0**: a `tick` that leaves the
+  engine busy has either forwarded a decode row or committed a token through `advance`'s `Continue`,
+  and both increment the counter (#158's invariant; the gates' `WorkBound` asserts it per step, and
+  this is the same invariant enforced in production). 64 is deliberately loose rather than tuned: a
+  future engine change that legitimately defers work for a handful of steps is not mistaken for a
+  stall, and 64 no-op steps cost well under a millisecond, so a real stall still ends immediately
+  against the previous "spins forever". It is a **count** (steps), never a wall-clock number
+  (rule 4).
+- On the 64th consecutive no-progress step the loop: counts `minfer_worker_stalled_total`; answers
+  **every live run exactly once** with `ApiError::server("the worker stalled")` (500 `server_error`)
+  through the existing `fail` machinery — new `BatchEngine::fail_all`, the `fail_batch` shape without
+  a row list, since a wedged step may have built no batch; answers **every queued-but-unadmitted
+  job** (the worker's `pending` deque plus the channel) with the same terminal error through #121's
+  `reject`, so its sender never drops into the silent empty `200` — new `reject_queued`; zeroes
+  `worker_pending`, publishes metrics, logs, and **breaks** the loop. The queued jobs leave the
+  queue, so they are counted in `jobs_admitted_total` **and** `jobs_dropped_total`, keeping
+  `accepted - admitted` a true queue depth.
+- The count is **reset** wherever the loop legitimately moves: on `blocking_recv` (an idle wait is
+  not a spin), on any step that advanced `work_units`, and on #151's `Err` step (it answered its
+  batch and released its slots; `work_units` does not move there because the increment sits after
+  the successful forward). The last reset is deliberate: without it, a saturated server whose every
+  forward fails deterministically — a state #151 already handles correctly, one 500 per batch —
+  would accumulate no-progress steps and be declared stalled, turning a wrong-but-answering server
+  into a stopped one.
+- Ending the loop drops `job_rx`, so a later request gets the existing
+  `503 unavailable_error("server shutting down")` (`requests_rejected_total`), not a hang.
+
+The condition is observable next to the other `AtomicU64`s: `ServerMetrics::worker_stalled_total`
+and the `minfer_worker_stalled_total` family in the `/metrics` rendering. It is the guard's own
+signal — a count of stall events — and deliberately not [#157](https://github.com/yusiwen/minfer/issues/157)'s
+general terminal-error accounting.
+
+**Gates.** Both `#[ignore]`d gates now assert `worker_stalled_total == 0`, the property the mutation
+breaks. `serve_loop_publishes_the_queue_and_running_depth` also prints the terminal error each
+client received, and its feeder leaves as soon as the counter moves, so the assertion runs at once
+instead of waiting out `FEEDER_POLL_BACKSTOP` (before that the mutated gate failed correctly but
+only after 120.19s). `a_job_rejected_for_want_of_a_slot_is_answered_with_503` checks the counter
+after reading the channels, so a wedge surfaces as the error the client actually got. Two plain
+`#[test]`s cover the answer machinery in CI, with no model:
+`the_stall_answers_every_live_run_exactly_once` (three live runs and an idle slot: one 500 each,
+slot freed, prefix cleared, idle slot untouched) and
+`the_stall_answers_every_queued_job_exactly_once` (one job in the deque, two in the channel: one 500
+each, senders closed).
+
+**Mutation evidence (rule 3).** `MINFER_TEST_TICK=wedge` is an environment switch, so no source
+revert is involved and `git diff` stayed clean throughout. CPU build, aarch64 (this box),
+2026-09-27, `MINFER_TEST_TICK=wedge cargo test --release --bin minfer -- --ignored --exact <gate>
+--nocapture`, **no outer `timeout`**:
+
+| gate | exit | wall (whole process) | what failed | the client's answer |
+|---|---|---|---|---|
+| `serve_loop_publishes_the_queue_and_running_depth` | **101** | **0.29s** | *"the worker tripped its counted no-progress bound … left: 1, right: 0"* | two runs, one `500 the worker stalled` each |
+| `a_job_rejected_for_want_of_a_slot_is_answered_with_503` | **101** | **0.18s** | *"a rejected job is unavailable: the worker stalled"* (`left: 500, right: 503`) | the served run got `500 the worker stalled` |
+
+Both logs also carry `[server] the worker stalled: 64 consecutive steps left the engine busy without
+advancing its work counter (N run(s), 0 queued job(s) answered with 500); stopping the worker`. A
+whole-set wedge run with **no `--skip`** is **21 passed / 12 failed in 12.04s** (the nine bounded
+steppers, the two `serve_loop` gates, and the #171 seam gate that cannot reach its forward under any
+injection) — against #160's `exit 124` for the same two gates under an outer `timeout 30`. The
+unmutated gates on the same commands are **pass, exit 0** (0.5B: 3.09s / 0.21s; Qwen3-0.6B: 3.69s /
+0.17s).
+
+**The `spin` arm still needs the two gates skipped — honest scope.** `MINFER_TEST_TICK=spin`
+advances `work_units` without ever completing a run, so by construction a step that keeps "moving"
+cannot trip a log of no-progress steps; the two `serve_loop` gates would still spin (they have no
+step budget, and adding one is exactly the shape #196 offers as its second, rejected alternative).
+The #160 command is unchanged:
+
+| Command (2026-09-27, CPU build, aarch64 (this box)) | Result |
+|---|---|
+| `MINFER_TEST_TICK=spin cargo test --release --bin minfer -- --ignored --skip serve_loop_publishes_the_queue_and_running_depth --skip a_job_rejected_for_want_of_a_slot_is_answered_with_503` | **21 passed / 10 failed** in 12.21s (the #160 budget arm, unchanged) |
+
+**Verification (2026-09-27, CPU build, aarch64 (this box)).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **467 passed / 0 failed / 33 ignored** unit + **10 / 0 / 6** integration (baseline 465/0/33; the two CI stall gates) |
+| the two gates `--ignored --exact`, unmutated, 0.5B | **1 / 0** each, 3.09s / 0.21s |
+| the two gates `--ignored --exact`, unmutated, Qwen3-0.6B | **1 / 0** each, 3.69s / 0.17s |
+| `scripts/real_model_gates.sh` (parallel, 0.5B) | **33 / 0** in 35.96s |
+| `PARALLEL=0 scripts/real_model_gates.sh` (serial, 0.5B) | **33 / 0** in 38.80s |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf scripts/real_model_gates.sh` (parallel) | **33 / 0** in 42.48s |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf PARALLEL=0 scripts/real_model_gates.sh` (serial) | **33 / 0** in 46.95s |
+| `MINFER_TEST_TICK=wedge`, whole `#[ignore]`d set, no `--skip` | **21 passed / 12 failed** in 12.04s, no hang |
+| `MINFER_TEST_TICK=spin`, two `serve_loop` gates skipped | **21 passed / 10 failed** in 12.21s |
+| `rustup run stable rustfmt --edition 2021 --check src/server/batch.rs src/server/metrics.rs` | clean (rustfmt 1.9.0-stable; the pinned 1.97.1 toolchain has no rustfmt component) |
+| `python3 scripts/check_status.py --check` | exit 0 |
+| `python3 scripts/check_docs_links.py` | **968 relative links / 186 markdown files**, exit 0 |
+
+**Honest limits.**
+
+- The bound is on the **loop**, not inside a single `tick`: a `tick` that never returns (or spins
+  internally without returning to the loop) still has no in-process bound — only a cross-process
+  watchdog can bound that, and none claims to here.
+- The guard **stops the worker**. Requests after the stall get `503 server shutting down` until the
+  process is restarted; that is the deliberate trade against spinning at 100% CPU with clients left
+  hanging, and `minfer_worker_stalled_total` is the signal to alert on. A self-restart is out of
+  scope.
+- `STALL_STEP_LIMIT = 64` cannot be validated by observation on the healthy path (it never reaches
+  1); it is slack, chosen by the argument above, not a measured constant.
+- The `spin` arm above: a step that advances the work counter is not a stall by this guard's
+  definition, so the two gates remain skipped in that mutation run. Filed as
+  [#198](https://github.com/yusiwen/minfer/issues/198) — a production bound for the
+  moving-but-non-terminating step, which must not false-positive a legitimately long generation.
+- The CUDA unit row of `docs/status.toml` (546, GB10 sm_121, 2026-09-27) was **not** re-measured:
+  this ticket's two new CI tests are feature-independent, so a CUDA build would read **+2**; the row
+  stays the dated device record and is not claimed to include them (the GPU rows were out of scope).
+- `AGENTS.md` no longer carries a per-module `server/batch.rs` bullet (the *Docs* lines of the #121
+  and #151 records predate that refactor); the server contract now lives in `FEATURES.md`,
+  `USAGE.md` and `OPENAI-CHAT-API-PLAN.md`, which are the files updated here.
+
+**Docs.** `docs/GATE-CONTRACT.md` rule 4's [#160] paragraph now ends with the resolution (the
+`serve_loop` gates are wedge-proof; `STALL_STEP_LIMIT`; `minfer_worker_stalled_total`;
+`FEEDER_POLL_BACKSTOP` demoted to a last resort). `docs/BUILD.md` § *Tests* and
+`scripts/real_model_gates.sh`'s mutation note record the same. Every `/metrics` enumeration
+(`USAGE.md` § *Metrics and observability*, `FEATURES.md`'s `serve` bullet,
+`OPENAI-CHAT-API-PLAN.md` § *Slot Lifecycle*, the F8 table above) names the new counter.
+`AGENTS.md`'s suite counts carry the +2 (467 aarch64 / 465 x86_64).
+`ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap closes here — this is robustness inside the
+existing test-infrastructure/batching rows, the same reason the #154, #151, #158 and #160 records
+give.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
@@ -5273,6 +5416,7 @@ channel and keeps answering while the model is busy. Metric families and units:
 | `minfer_requests_rejected_total` | counter | requests | refused before queueing (draining / worker gone) |
 | `minfer_requests_in_flight` | gauge | requests | accepted, not yet finished — the drain surface |
 | `minfer_jobs_dropped_total` | counter | jobs | the worker could not place the job in a slot |
+| `minfer_worker_stalled_total` | counter | events | the worker's counted no-progress bound tripped and ended the loop, answering every live and queued request `500` (**added by [#196](https://github.com/yusiwen/minfer/issues/196)**) |
 | `minfer_queue_depth` | gauge | jobs | `accepted - admitted`: channel backlog + the worker's `pending` deque |
 | `minfer_worker_pending_jobs` | gauge | jobs | the worker's own deque right now |
 | `minfer_requests_running` | gauge | requests | occupying an engine slot right now |

@@ -820,7 +820,12 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
    freed ([#151](https://github.com/yusiwen/minfer/issues/151)) — a run whose row was not in the
    failed batch is left alone. The failure is not retried, because the reachable classes are
    deterministic (a kernel invariant, an activation-budget refusal, a KV format mismatch, a
-   caught panic) and a panic may have left the shared arena half-written.
+   caught panic) and a panic may have left the shared arena half-written. A worker wedged
+   *inside* a step — one that keeps leaving the engine busy without advancing
+   `BatchEngine::work_units`, the case a failed forward cannot explain — ends itself after a
+   counted `STALL_STEP_LIMIT` (64) consecutive such steps: every live run and every
+   queued-but-unadmitted job gets exactly one `500 the worker stalled`, and
+   `minfer_worker_stalled_total` moves ([#196](https://github.com/yusiwen/minfer/issues/196)).
 6. On completion -> state becomes Idle, KV regions and sampling state are reset for the next request
 7. Return response -> slot available for next request
 

@@ -294,7 +294,11 @@ the per-op family is **seconds**, everything else is a count):
   `minfer_requests_completed_total`, `minfer_requests_rejected_total` (refused
   before queueing: the server is draining, or the worker is gone),
   `minfer_requests_in_flight` (accepted and not yet finished — the drain
-  surface), `minfer_jobs_dropped_total` (the worker could not place the job).
+  surface), `minfer_jobs_dropped_total` (the worker could not place the job),
+  `minfer_worker_stalled_total` (the worker's counted no-progress bound tripped:
+  every live and queued request was answered `500 the worker stalled` and the
+  worker stopped —
+  [#196](https://github.com/yusiwen/minfer/issues/196)).
 - Depth: `minfer_queue_depth` (`accepted - admitted`: the channel backlog plus
   the worker's pending deque — the one number neither thread can see alone),
   `minfer_worker_pending_jobs`, `minfer_requests_running` (occupying an engine

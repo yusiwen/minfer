@@ -45,8 +45,10 @@
 # (The counts are as of 2026-09-27, CPU build, aarch64; `AGENTS.md` carries the dated record.)
 # #160: `MINFER_TEST_TICK=wedge|spin` injects a wedged/moving-but-non-terminating step into
 # `BatchEngine::tick` for the bounded-stepper mutation check — see `docs/GATE-CONTRACT.md` §3.
-# It is unset in every normal run; the two `serve_loop`-driven gates hang under `wedge` and are
-# skipped (`--skip`) in a whole-set mutation run (issue #196).
+# It is unset in every normal run. Since #196 the two `serve_loop`-driven gates fail fast under
+# `wedge` too — `serve_loop` itself carries the counted no-progress bound (`STALL_STEP_LIMIT`)
+# — so a whole-set `wedge` run needs no `--skip`. The `spin` arm still needs them skipped: a
+# step that keeps advancing the work counter cannot be caught by a counter (#196 record).
 #
 # The device set's second configuration is a second run of the same command:
 #   MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
