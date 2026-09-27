@@ -52,18 +52,23 @@ gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
 `PARALLEL=1`/`0` overrides. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions. The current counts live in
-`AGENTS.md` (each with its date, device and command). The two fixes that made the
-parallel form trustworthy are the [server batching
+`AGENTS.md` (each with its date, device and command). Three fixes now make the
+parallel form trustworthy: the [server batching
 gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched rounds,
-a median verdict) and [#158](https://github.com/yusiwen/minfer/issues/158) (a work
-bound instead of absolute wall-clock deadlines); the rules behind both are
-[`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §4 and the full records are
+a median verdict), [#158](https://github.com/yusiwen/minfer/issues/158) (a work
+bound instead of absolute wall-clock deadlines), and
+[#160](https://github.com/yusiwen/minfer/issues/160) (every `while engine.busy()`
+stepper in the server gates routed through one shared per-step `WorkBound` —
+progress plus a step budget, both counted, never a clock). A wedge injected with
+`MINFER_TEST_TICK=wedge` now fails each of those gates on its first step in under
+two seconds instead of hanging the suite; `=spin` exercises the step-budget arm.
+The wall-clock bounds that remain are **named backstops, not verdicts**: the two
+`run_cli` child-process ceilings (1800s for the real-model sessions, 60s for the
+no-model registry cases; `MINFER_CLI_WATCHDOG_SECS` overrides both) and the
+`serve_loop` feeder's `FEEDER_POLL_BACKSTOP`, which cannot rescue a wedge because
+the worker runs on the test's own thread. The rules behind all of this are
+[`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §3/§4 and the full records are
 [`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md) §test-infrastructure.
-The watchdogs still in the tree (`run_cli`'s child-process kills, and the
-`serve_loop` poll backstop) are not a gate's only failure signal; the unbounded
-`while engine.busy()` stepper loops in the other `#[ignore]`d server gates are
-filed together with them as
-[#160](https://github.com/yusiwen/minfer/issues/160).
 
 ## Git hooks (git-hooks.nix)
 
