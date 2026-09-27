@@ -23,7 +23,22 @@ fn model_path() -> Option<String> {
 /// Spawn the built binary with piped stdin/stdout/stderr, write all input at
 /// once (EOF closes stdin), wait with a deadline (kill on hang), return
 /// (stdout, stderr, exit_code).
+///
+/// `timeout_secs` is a **process-hang ceiling**, not the gate's verdict (#160).
+/// A child process exposes no in-process progress counter, so the only thing the
+/// parent can observe is whether it exited; the `#[ignore]`d real-model sessions
+/// pass a generous **1800s** (10-100x the legitimate scalar-CPU runtime of the
+/// cached 0.5B on this box) precisely so machine load cannot flip the verdict,
+/// while the no-model cases pass 30s. `MINFER_CLI_WATCHDOG_SECS` overrides the
+/// ceiling for a bisect or a deliberate hang investigation
+/// (`MINFER_CLI_WATCHDOG_SECS=5 cargo test --test conversation_cli -- --ignored`);
+/// an unset, unparsable or zero value keeps the caller's number.
 fn run_cli(args: &[&str], stdin_input: &str, timeout_secs: u64) -> (String, String, i32) {
+    let timeout_secs = std::env::var("MINFER_CLI_WATCHDOG_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(timeout_secs);
     let mut child = Command::new(env!("CARGO_BIN_EXE_minfer"))
         .args(args)
         // Pin the CPU backend: golden/assertions decoupled from the backend (Metal logits differ from CPU by ~1e1)

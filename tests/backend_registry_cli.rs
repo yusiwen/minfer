@@ -13,7 +13,19 @@ use std::process::{Command, Stdio};
 
 /// Spawn the built binary with a deadline (kill on hang) and return
 /// `(stdout, stderr, exit_code)`.
+///
+/// The ceiling is a **process-hang guard**, not the gate's verdict (#160). This
+/// file never loads a model — every case points at [`NO_MODEL`] — so the fixed
+/// **60s** is already ~1000x the legitimate runtime, and it exists only so a
+/// wedged child cannot hang the suite. `MINFER_CLI_WATCHDOG_SECS` overrides it
+/// (`MINFER_CLI_WATCHDOG_SECS=5 cargo test --test backend_registry_cli`); an
+/// unset, unparsable or zero value keeps 60.
 fn run_cli(args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let hang_ceiling = std::env::var("MINFER_CLI_WATCHDOG_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_minfer"));
     cmd.args(args)
         .env_remove("MINFER_BACKENDS")
@@ -24,14 +36,14 @@ fn run_cli(args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn minfer");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(hang_ceiling);
     loop {
         if child.try_wait().expect("try_wait").is_some() {
             break;
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
-            panic!("minfer did not exit within 60s (hang?)");
+            panic!("minfer did not exit within {hang_ceiling}s (hang?)");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
