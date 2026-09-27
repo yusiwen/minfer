@@ -6857,3 +6857,55 @@ one thread at a time. Metal is untouched. The device suite's own default stays `
 (`scripts/cuda_test.sh`): the two new gates are parallel-safe, but other device tests still mutate
 process-global state (`MINFER_GPU_MEM` history, timing gates) and the wrapper's serial default is not this
 ticket's to change.
+
+#### Test-infrastructure record (#189, 2026-09-27) — the S4 map-window A/B is a paired sign test with a value arm
+
+**The defect.** `graph::cuda_backend::tests::cuda_map_window_costs_no_more_than_the_span_it_replaces` — the S4 device half of #123's fix — was a **pure stopwatch**: it interleaved matched rounds of the span window (`row0 + i`) and the map window (row resolved through a run list) and asserted the **median of 9 per-round ratios** `<= 1.25x`. It failed once in the parallel `#[ignore]`d device run (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26) on the prefill phase:
+
+```text
+[s4-ab] prefill nt=512 nkv=512 hd=128: span 89.9 / map 125.1 us/launch (median of 9 interleaved
+rounds of 50); per-round ratios [0.632, 0.697, 0.989, 1.091, 1.398, 1.440, 1.466, 2.198, 6.695]
+— median 1.398x
+a map prefill costs 1.398x the span it replaces
+```
+
+Five of the nine matched pairs were above the bar — exactly the count a median of nine flips at. The decode half passed in the same run (median 0.916x) and the whole test passed in a sibling run. The 1.25x bar had been justified by #123 against "16 CPU spinners plus two concurrent CUDA attention loops" (median 1.079–1.145 prefill); the parallel `#[ignore]`d suite is a far heavier co-tenant (~38 device tests, several capturing CUDA graphs, one GPU). The verdict was about the machine, not the kernel — the #154 class, and not the #185 SIGSEGV that #188 fixed structurally.
+
+**The fix — the value arm first (rule 1).** Before any timing the gate now asserts, on its own fixture (rows `[512, 2560)` carry distinct K/V; the map window's base cell is 512):
+
+- a **one-row** map window returns exactly that row's V, bit for bit against the host's input row — an absolute oracle, not a mode-vs-mode relation;
+- a **two-run** map window returns the span's bytes over the same rows, bit for bit — f32 KV at the decode shape and f16 KV at the FA-prefill shape. One run at cell 0 is indistinguishable to a resolver that reads `(cell, len)` as `(lo, hi)`; two runs at a non-zero base are not;
+- `testfail::note_checked("cuda_attn_map_window")` — bumped in the launchers `CudaState::gqa_attn_split` / `gqa_attn_kv_prefill` — is 0 after a span call and 1 after a map call. The observation is counted rather than read from the dispatch's own report (the contract's "observation half"), and it is paired with the bitwise arms so "the map kernel ran" and "it resolved the span's rows" are separate facts.
+
+**The fix — a paired sign test (rule 4).** The timing verdict is the **count** of matched pairs whose map arm is above `1.25x` its own span arm; the gate refuses only at **7 of 9** (`PAIRS = 9`, fixed in advance), the one-sided sign test at `alpha = 46/512 = 0.090`. A minority of disturbed rounds can no longer decide the verdict, and neither can the bare majority the recorded run had; a doubled map cost moves all nine. The bar is unchanged at 1.25x and the timed fixture is the pre-#189 one (constant K/V, one run at cell 0), so the recorded margins stay comparable. Every per-round ratio and the refusal count are printed.
+
+**Verification (rule 5 numbers).** All GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27.
+
+| Command | Result |
+|---|---|
+| gate alone: `cargo test --release --features cuda --bin minfer cuda_map_window_costs… -- --ignored --nocapture --test-threads=1` | decode 24.6 / 25.0 µs/launch, **0/9** refusals; prefill 82.8 / 91.1 µs/launch, **0/9** |
+| parallel `#[ignore]`d: `cargo test --release --features cuda --bin minfer -- --ignored --nocapture`, **6 runs** | **6 × 39 passed / 0 failed / 0 ignored**; gate refusals 0–3 per phase; worst single pair 5.09x |
+| mutation: `MINFER_S4_AB_MAP_REPS=2` + the gate-alone command | **0 passed / 1 failed**, decode 51.7 vs 24.6 µs/launch = **9/9** above 1.25x |
+| `scripts/cuda_test.sh` | **546 / 0 / 39** (was 545 / 0 / 39; +1 the pure statistic test) |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B, then Qwen3-0.6B) | **39 / 0** and **39 / 0** |
+| `compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` | **0 API errors** over 546 / 0 / 39 |
+| `cargo test --release` (CPU, this box) | **465 / 0 / 33** unit + **10 / 0 / 6** integration, unchanged |
+| `python3 scripts/check_status.py --check` | exit 0 |
+
+**Before/after on the parallel configuration.** The #188 record's post-fix state had 2 of 6 parallel `#[ignore]`d runs with one failure each — this gate once and `server_batch_matches_serial_and_is_faster` (#154) once. With this ticket's statistic the same configuration is **6 / 6 green** (39 / 0 each). Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so the six runs prove the gate is not decided by the co-tenant, while the recorded distribution (5 of 9 above the bar, median 1.398x) is replayed by the new pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression`, which asserts the sign test passes it **and** that the old median of the same ratios is red.
+
+**The stale #185 premise.** The ticket text says the parallel `--ignored` device run is "refused loudly (`src/device_entry.rs`)" and asks for the guard to be removed for the test session. After #188 (master `fe1b7cd`) that guard covers only the legacy unbound `CudaState::layer_gpu` path — `crate::device_entry::enter` has no other call site in `src/` (`grep -rn 'device_entry::enter' src/` names only `src/cuda.rs`, plus a doc-comment mention in `models/qwen2/graph.rs`) — and `BackendScheduler::execute` and `register_cuda_weight` no longer take it. The parallel configuration was therefore run **as-is, with no guard change**; it is the same narrowing #188's record already measured.
+
+**Mutation evidence (rule 3).** `MINFER_S4_AB_MAP_REPS=2` (`src/cuda.rs::s4_ab_map_reps`) issues every **map-mode** attention launch twice, so the gate's timed map arm pays twice the work — the reproducible form of #123's map-work doubling, and an implementation seam rather than a test edit. Armed, the gate fails with **9/9** pairs above the bar:
+
+```text
+[s4-ab] decode nkv=2048 nh=28 nk=4 hd=128: span 24.6 / map 51.7 us/launch (9 interleaved matched
+pairs of 100); per-round ratios [1.706, 1.745, 2.052, 2.091, 2.095, 2.100, 2.102, 2.136, 2.358]
+— 9/9 above 1.25x (sign test refuses at 7)
+thread '…cuda_map_window_costs_no_more_than_the_span_it_replaces' panicked: the map window is above
+1.25x the span in 9 of 9 matched pairs … FAILED
+```
+
+The mutation is an env switch, so the unmutated run is the same binary with the variable unset — there is no source mutation to revert, and `git diff` on the tree carries only the #189 change.
+
+**Docs.** `docs/CUDA-BACKEND-DESIGN.md` gains §7.10 (the statistic, the bar, the value arm, the dated device tables); `AGENTS.md`'s CUDA counts bullet and `docs/status.toml` move 545 / 39 → 546 / 39 for the pure statistic test; the gate's doc comment (which claimed "It no longer needs an otherwise quiet box" — the claim #189 refutes) now states the sign test and the value arm.
