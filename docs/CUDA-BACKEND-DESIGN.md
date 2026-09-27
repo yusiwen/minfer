@@ -825,6 +825,36 @@ Suite baselines in the campaign records: the Phase-7e entries say "144/0 (CUDA p
 tree is 145 passed / 0 failed / 3 ignored. Run `cargo test --release` for the plain suite and
 `cargo test --release --features cuda` on a device.
 
+### 7.2a Profiling on this box (`ncu` / `nsys`)
+
+The reusable recipe, so the next session does not re-derive it (recorded 2026-09-27, GB10 sm_121,
+CUDA 13.0, driver 580.178.04):
+
+- **`ncu` is installed but not on `PATH`.** The binary is
+  `/usr/local/cuda-13.0/bin/ncu` (2025.3.1). `which ncu` finding nothing means the directory is not
+  on `PATH`, not that the tool is missing — use the absolute path.
+- **A normal user cannot collect counters here** — `RmProfilingAdminOnly: 1` makes `ncu` fail with
+  `ERR_NVGPUCTRPERM`. **`sudo` collects** (passwordless on this box); no module parameter change and
+  no driver reload is needed. Record "collected as root; module parameter unchanged".
+- **`sudo` changes `HOME` to `/root`,** so the model cache under `/home/yusiwen/.cache/minfer/models`
+  is invisible to a `sudo`-launched binary. Pass absolute model paths
+  (`MINFER_BATCH_TEST_MODEL=/home/yusiwen/.cache/...`, or the path on the command line) or use
+  `sudo -E`. A "model not found" under `sudo` is this, not a missing file.
+- **Build as the normal user first, then attach `ncu` to an already-built binary.** `ncu` does not
+  write repository files, so `target/` stays `yusiwen`-owned; if a `sudo` run does leave a root-owned
+  file, `chown` it back before the next `cargo` build.
+- **Some metrics are `n/a` on GB10/sm_121** — `dram__bytes.sum` among them (the integrated-memory /
+  DGX Spark form exposes no classic DRAM counters). Confirm a metric name exists with
+  `ncu --query-metrics` first, prefer the SM / instruction / L1 / L2 families, and treat a metric you
+  actually collected as the only evidence; `n/a` is not a number.
+- **Collect targeted, not whole-run.** Counter replay is slow: filter with `-k regex:<kernel>` and
+  bound it with `--launch-count`, rather than replaying a full `bench`.
+
+`nsys` stays the cheap, always-available instrument for per-kernel durations
+(`nsys profile --trace=cuda --cuda-graph-trace=node ...` — without `node`, kernels launched from a
+replayed CUDA graph are traced as one graph and never appear individually, which silently hides the
+whole decode path).
+
 ### 7.3 Issue #145 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
 
 `compute-sanitizer --tool memcheck` over the serial CUDA unit suite is the acceptance gate. Baseline

@@ -2706,6 +2706,22 @@ __device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0>(const char* row, int elem)
     return make_float4(d * (float)q[0], d * (float)q[1], d * (float)q[2], d * (float)q[3]);
 }
 
+// #186: the same four quants as `kv4<KV_LAYOUT_Q8_0>` but left in `int8`, packed
+// little-endian into one `int` for `__dp4a`, plus the block's f16 scale as a
+// float. The Q8_0 block is `f16 d; i8 qs[32]` (34 B), so `blk + 2 + (elem & 31)`
+// has no 4-byte alignment guarantee (`34 * k` alternates parity) and the four
+// bytes are loaded separately — the packing cost is what decides whether this
+// beats the convert-based load, which is the question the ticket exists to
+// answer.
+__device__ __forceinline__ void kv4_q8_0_packed(const char* row, int elem, int& q, float& d) {
+    const unsigned char* blk =
+        reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
+    d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const signed char* p = reinterpret_cast<const signed char*>(blk + 2) + (elem & 31);
+    q = ((int)(unsigned char)p[0]) | ((int)(unsigned char)p[1] << 8) |
+        ((int)(unsigned char)p[2] << 16) | ((int)(unsigned char)p[3] << 24);
+}
+
 // #144: dequantize EIGHT consecutive elements of one packed Q8_0 KV cell into
 // eight halves (one 16-byte tensor-core staging slot). `elem` must be a multiple
 // of 8 and every head base is 32-element aligned (`ensure_kv`), so the group
@@ -3286,7 +3302,7 @@ __global__ void gqa_attn_f32_f16kv(
 // f16 instantiations issue the same loads as before (`row_bytes = nk * hd * 4` is
 // the byte form of the old `stride_kv`), and the same cells are named in the same
 // order — only the address arithmetic moved into `kv_row` / `kv4`.
-template <int LAYOUT, bool CAUSAL, bool MAP>
+template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false>
 __device__ __forceinline__ void attn_split_1w_body(
     const float* __restrict__ q,
     const void* __restrict__ k,
@@ -3310,6 +3326,32 @@ __device__ __forceinline__ void attn_split_1w_body(
     bool live = d0 < hd;
     const float4 q4 = live ? *reinterpret_cast<const float4*>(q + h * hd + d0)
                            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // #186: when the Q8_0 K dot accumulates in `int` (`__dp4a`), the lane's four
+    // query values are quantized once against their 32-element block's `amax`.
+    // The eight lanes that share a block reduce with three `shfl_xor` offsets
+    // (4/2/1 stay inside the 8-lane group), so every lane gets the block's
+    // scale; K is then read as int8 and never converted to float. `qscale` is
+    // the query's block scale, `qk` its packed int8 (zero for idle lanes).
+    int qk = 0;
+    float qscale = 0.0f;
+    if (Q8DP4A) {
+        float amax = live ? fmaxf(fmaxf(fabsf(q4.x), fabsf(q4.y)), fmaxf(fabsf(q4.z), fabsf(q4.w)))
+                          : 0.0f;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
+        qscale = amax / 127.0f;
+        const float qid = (qscale != 0.0f) ? (1.0f / qscale) : 0.0f;
+        if (live) {
+            signed char c0 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.x * qid)));
+            signed char c1 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.y * qid)));
+            signed char c2 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.z * qid)));
+            signed char c3 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.w * qid)));
+            qk = ((int)(unsigned char)c0) | ((int)(unsigned char)c1 << 8) |
+                 ((int)(unsigned char)c2 << 16) | ((int)(unsigned char)c3 << 24);
+        }
+    }
 
     float mx = -INFINITY, S = 0.0f;
     float4 oc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -3338,12 +3380,25 @@ __device__ __forceinline__ void attn_split_1w_body(
         // −42% cold-DRAM vs inline V; bitwise-identical — same rows, same
         // order, same per-row ops, only the load scheduling changes).
         float4 k4[4], v4[4];
+        int ki4[4];
+        float kd4[4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            k4[j] = (live && j < nr)
-                ? kv4<LAYOUT>(kv_row(k, cell[j], row_bytes), hk * hd + d0)
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            v4[j] = (live && j < nr)
+            const bool use = live && j < nr;
+            if (Q8DP4A) {
+                // The packed K word and its block scale; no float conversion.
+                if (use) {
+                    kv4_q8_0_packed(kv_row(k, cell[j], row_bytes), hk * hd + d0, ki4[j], kd4[j]);
+                } else {
+                    ki4[j] = 0;
+                    kd4[j] = 0.0f;
+                }
+            } else {
+                k4[j] = use
+                    ? kv4<LAYOUT>(kv_row(k, cell[j], row_bytes), hk * hd + d0)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            v4[j] = use
                 ? kv4<LAYOUT>(kv_row(v, cell[j], row_bytes), hk * hd + d0)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
@@ -3352,7 +3407,15 @@ __device__ __forceinline__ void attn_split_1w_body(
             if (j >= nr) break; // warp-uniform: all lanes exit together
             // Full-row dot: this lane's 4-dim partial, then a warp reduction
             // so every lane holds the row's complete dot (uniform softmax).
-            float d = q4.x * k4[j].x + q4.y * k4[j].y + q4.z * k4[j].z + q4.w * k4[j].w;
+            float d;
+            if (Q8DP4A) {
+                // `qk`/`ki4` carry the two int8 quads; `qscale * kd4` is the
+                // pair of block scales, applied per lane because block scale is
+                // a per-lane (per-32-element-block) value inside the row.
+                d = (float)__dp4a(qk, ki4[j], 0) * (qscale * kd4[j]);
+            } else {
+                d = q4.x * k4[j].x + q4.y * k4[j].y + q4.z * k4[j].z + q4.w * k4[j].w;
+            }
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 d += __shfl_xor_sync(0xFFFFFFFF, d, off);
@@ -3383,7 +3446,7 @@ __device__ __forceinline__ void attn_split_1w_body(
     }
 }
 
-template <int LAYOUT, bool CAUSAL, bool MAP>
+template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false>
 __global__ void gqa_attn_split_partial(
     const float* __restrict__ q,
     const void* __restrict__ k,
@@ -3409,7 +3472,7 @@ __global__ void gqa_attn_split_partial(
         const int chunk0 = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
         if (((chunk0 + 3) >> 2) >= rpw_gate) return;
     }
-    attn_split_1w_body<LAYOUT, CAUSAL, MAP>(q, k, v, partial, bound, 0, row0, nkv,
+    attn_split_1w_body<LAYOUT, CAUSAL, MAP, Q8DP4A>(q, k, v, partial, bound, 0, row0, nkv,
                                             blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
                                             row_bytes, threadIdx.x);
 }
@@ -3465,7 +3528,7 @@ __global__ void gqa_attn_split_partial_bt(
     const int t = blockIdx.z;
     int row0, nkv;
     attn_extent<CAUSAL, MAP>(bound, t, nt, row0, nkv);
-    attn_split_1w_body<LAYOUT, CAUSAL, MAP>(
+    attn_split_1w_body<LAYOUT, CAUSAL, MAP, false>(
         q + (size_t)t * nh * hd, k, v,
         partial + (size_t)t * ATTN_SPLITS * nh * pstr,
         bound, t, row0, nkv,
@@ -4887,30 +4950,61 @@ void launch_gqa_attn_split_f32kv(
 // `rpw_gate = 0` — the hybrid 4-warp body (`attn_split_h4w_body`) takes
 // `const __half*` and is not converted, so it is not offered for a packed cell.
 // `row_bytes` is `KvFormat::Q8_0.row_bytes(nkt)` (whole f32 words).
+//
+// #186: the K dot is accumulated in `int` (`__dp4a`, see
+// `kv4_q8_0_packed`/`attn_split_1w_body<...,Q8DP4A>`) instead of the
+// convert-based `kv4<Q8_0>` load. `dp4a` is the caller's answer, resolved once per
+// process on the Rust side (`cuda::q8_kv_dp4a_enabled`, `MINFER_NO_DP4A_Q8_KV=1`
+// for the incumbent arm) and passed as a value so a captured decode graph cannot
+// see it change.
 void launch_gqa_attn_split_q8_0(
     const float* q, const void* k, const void* v, float* o,
     float* partial, const int* bound, int mode,
     int n_head, int n_head_kv, int hd,
-    float scale, int pstr, size_t row_bytes, cudaStream_t stream
+    float scale, int pstr, size_t row_bytes, int dp4a, cudaStream_t stream
 ) {
     if (mode == ATTN_WIN_MAP) {
-        minfer_launch_prelude("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map", 32), 0, stream>>>(
-            q, k, v, partial, bound,
-            n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
-        minfer_launch_ok("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
+        if (dp4a) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__map_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map_dp4a", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__map_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true,true>");
+        } else {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
+        }
     } else if (mode == ATTN_WIN_SPAN) {
-        minfer_launch_prelude("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span", 32), 0, stream>>>(
-            q, k, v, partial, bound,
-            n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
-        minfer_launch_ok("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
+        if (dp4a) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__span_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span_dp4a", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__span_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false,true>");
+        } else {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
+        }
     } else {
-        minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
-        gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal", 32), 0, stream>>>(
-            q, k, v, partial, bound,
-            n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
-        minfer_launch_ok("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
+        if (dp4a) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal_dp4a", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__causal_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false,true>");
+        } else {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__causal", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false>");
+        }
     }
     minfer_launch_prelude("launch:gqa_attn_split_q8_0__combine", "gqa_attn_split_combine");
     gqa_attn_split_combine<<<dim3(1, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__combine", hd), 0, stream>>>(

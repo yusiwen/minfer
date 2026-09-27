@@ -1268,7 +1268,68 @@ QKV** (`Op::FusedQkvNorm`) also waits: that op has no CUDA kernel at all (it is 
 the `!packed` gate there is not what keeps Qwen3's decode off the device; its 1.13x packed gap is
 unrelated to this ticket's cuts.
 
-### C4 — S2c: the latched CUDA API errors behind the phantom "kernel launch error" · [#145](https://github.com/yusiwen/minfer/issues/145) + [#128](https://github.com/yusiwen/minfer/issues/128) — **DONE 2026-09-25**
+### C4 — #186: the dp4a packed Q8_0 K dot · [#186](https://github.com/yusiwen/minfer/issues/186) — **DONE 2026-09-27**
+
+**Why.** [#144]'s residual was 1.393x on Qwen2.5-0.5B q4_0 `tg128` (170.11 q8_0 vs 236.97 f16),
+and [#144] names two components: the 1-warp split-K body's `rpw_gate = 0` **plus** the
+`kv4<KV_LAYOUT_Q8_0>` load. Only the load is addressable by a dp4a K dot. The trap is that a
+whole-kernel q8_0-vs-f16 gap would mix the two: at hd 128 the f16 arm takes the 4-warp hybrid body
+while the packed arm cannot. **hd 64** (the 0.5B) is the shape where both take the identical
+`gqa_attn_split_partial<LAYOUT,true,false>` on the same grid, so the delta there is the load alone.
+
+**The bar, named before measuring.** The load-attributable share of the Q8_0 decode step ≥ 10%.
+Reasoning: only one of the residual's two components is addressable; a free load recovers at most
+`share / 1.393`; dp4a removes only the K side's converts and multiplies, adds a query quantize, and
+still pays the memory traffic; [#144]'s landed item 1 was 5.3% on this arm, the measured floor for
+"worth landing". **Measured 20.3%** (nsys, real decode, node tracing: the incumbent packed partial
+kernel is 67424 ns median per layer/token vs f16's 18528, = 1.182 ms of a 5.818 ms/token step).
+Bar cleared.
+
+**What landed.** `attn_split_1w_body<LAYOUT,CAUSAL,MAP,Q8DP4A>` (the `Q8DP4A` default `false`, so
+the f32/f16 and verify instantiations are untouched) quantizes each lane's four query values against
+its 32-element block's `amax` (the eight lanes sharing a block reduce it with three `shfl_xor`), reads
+the K quants as `int8` through `kv4_q8_0_packed`, accumulates `__dp4a(qk, ki, 0)` and scales by
+`d_q * d_k` once per block. V still dequantizes; only K changes. The launcher
+`launch_gqa_attn_split_q8_0` takes an `int dp4a` and picks the instantiation;
+`cuda::q8_kv_dp4a_enabled()` resolves `MINFER_NO_DP4A_Q8_KV=1` once per process (the same-binary A/B
+control), and the Rust call site bumps `testfail::note_checked("cuda_q8_kv_dp4a")` only when it
+launched the dp4a arm.
+
+**The numbers** (GB10 sm_121, `cargo build --release --features cuda`,
+`minfer bench -p 2048 -n 128 --n-ctx 4096 -o json`, 5 interleaved matched rounds, medians,
+2026-09-27):
+
+| arm | 0.5B q4_0 tg128 | Qwen3-0.6B Q8_0 tg128 | 0.5B pp2048 |
+|---|---|---|---|
+| incumbent (`MINFER_NO_DP4A_Q8_KV=1`) | 171.95 | 123.98 | 2149.22 |
+| dp4a | **193.30** (1.124x) | **136.66** (1.102x) | 2150.37 (flat) |
+
+The 0.5B f16 arm in the same round is 240.03, so the packed/f16 residual went 1.396x → **1.242x**;
+on Qwen3-0.6B the f16 arm is 136.73, i.e. the packed decode now matches f16. The isolated probe
+(same 1-warp geometry, load only) cuts the delta from +96% to +40% at hd 64, and `ncu` (collected as
+root, the module parameter unchanged) names the residual: dp4a removes 494984 instructions (−15.3%)
+and leaves the L1 load-sector count unchanged at 792904 — 1.71x f16's, while its L2 read sectors are
+0.57x f16's — so the remaining 1.242x is the 34-byte block layout's L1 request count, not DRAM
+traffic and no longer the arithmetic.
+
+**Tolerance, re-measured not assumed.** `a_packed_kv_cache_answers_like_the_f32_one`'s CUDA arm reads
+max |Δlogit| **2.479504** of a 37.82 spread, at the argmax **0.552662**, greedy 9/9 (incumbent arm:
+2.479504 / 0.596050 / 9-of-9) — inside the ≤4.0 / ≤1.0 class. The max is unchanged because it is the
+`nt = 512` **prefill** step's; the decode steps' deltas moved and nsys on the gate itself names
+`gqa_attn_split_partial<(int)2,(bool)1,(bool)0,(bool)1>` under the default and `...,(bool)0>` under
+the control, so the class is not "both arms ran the old path".
+
+**Verification and refusal-to-over-claim.** The dp4a arm was added to
+`cuda_kv_q8_0_roundtrip_attn` (two cells through an explicit span, an exactly Q8_0-representable
+query, plus the observation-counter arm); the first version used one cell and was **vacuous** — a
+mutated block base still passed, which is how the two-cell form was found. Mutation: `elem >> 5` →
+`elem >> 4` → red at max |Δ| = 0.35126442. **Prefill/verify is deliberately not taken**: the
+`nt > 1` general kernel also reads `kv4<Q8_0>` and measures 1.32x off its f16 arm on the 0.5B
+prefill attention, but that is a different kernel (per token *and* head query, no shared block scale)
+and not the ticket's residual — named rather than assumed. Full record:
+[`cuda_optimization_steps/108`](./cuda_optimization_steps/108-c4-dp4a-packed-q8-kv-cuda.md).
+
+
 
 **Why.** `minfer bench` on a CUDA build printed `CUDA kernel launch error: 1` between its two loops —
 pre-existing on master, not an S2b regression — and `compute-sanitizer --tool memcheck` over the unit
