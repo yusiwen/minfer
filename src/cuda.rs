@@ -12,8 +12,9 @@ use crate::block::Q8B;
 use crate::device_tier;
 use crate::q4k_dsc::q4k_dsc_payload_ok;
 use crate::tensor::{Tensor, TensorType};
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// How an attention node's KV window is expressed (mirrors `ATTN_WIN_*` in
@@ -76,7 +77,20 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
     fn cudaStreamCreate(stream: *mut *mut std::ffi::c_void) -> i32;
+    // Issue #188: a **per-backend** stream is created with
+    // `cudaStreamNonBlocking` so it does not take part in the legacy default
+    // stream's implicit global synchronization. Without that flag every
+    // explicit stream implicitly synchronizes with the null stream, and a
+    // host-side blocking `cudaMemcpy` (weight registration, readback) on one
+    // thread would serialize — and, inside another thread's capture window,
+    // invalidate — every engine's stream.
+    fn cudaStreamCreateWithFlags(stream: *mut *mut std::ffi::c_void, flags: u32) -> i32;
+    fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
+    // Issue #188: is `stream` currently inside a capture window? Used by the
+    // probe and by the registration path's refusal (no host-synchronous work
+    // may land on a stream another thread is capturing).
+    fn cudaStreamIsCapturing(stream: *mut std::ffi::c_void, status: *mut i32) -> i32;
     // F5 (#58): events, the synchronization primitive the split boundary's async
     // staging copies need. `cudaEventRecord` marks a point on the stream;
     // `cudaStreamWaitEvent` makes a later consumer wait on it **without blocking
@@ -141,7 +155,7 @@ const CUDA_DEV_ATTR_MULTIPROC_COUNT: i32 = 16;
 /// The symbolic name of a CUDA error code (`cudaGetErrorName`), e.g.
 /// `cudaErrorIllegalAddress` for 700. Falls back to `cudaError<code>` if the runtime
 /// returns null, so a diagnostic can always name *something* specific.
-fn cuda_error_name(code: i32) -> &'static str {
+pub(crate) fn cuda_error_name(code: i32) -> &'static str {
     // The runtime's strings are static and owned by it, so leaking the formatted
     // fallback once is bounded by the number of distinct error codes ever seen.
     let p = unsafe { cudaGetErrorName(code) };
@@ -1136,6 +1150,143 @@ extern "C" {
 
 static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
 
+// ─── Issue #188: the per-instance device stream ──────────────────
+//
+// `CudaState` is the process-wide **context**: the device, the name-keyed
+// weight registry and the derived weight planes are genuinely context-scoped
+// and stay shared (a second copy of a 7B model's weights is not an option).
+// The **stream**, the capture window and the activation scratches are not
+// context-scoped, and making them process-wide is what made the parallel
+// device suite fault: `cudaStreamCaptureModeGlobal` says another thread's
+// driver call belongs to the capture, so a weight registration's blocking
+// `cudaMemcpy` on a second thread either invalidated the window (901) or
+// faulted inside the driver (`cuMemcpyHtoD_v2`, issue #188's backtrace).
+//
+// The stream therefore travels with the **backend instance**. Every
+// `CudaBackend` owns its own non-blocking stream, and binds it for the
+// duration of each of its device operations; `CudaState::stream()` then
+// answers with the bound stream. That keeps the ~60 launch/copy/event helpers
+// in this module unchanged in signature while giving every consumer the
+// backend's stream, which is what makes two engines in one process able to
+// run (and capture) at the same time.
+
+thread_local! {
+    /// The device stream bound on this thread by the innermost
+    /// [`bind_stream`] guard; null means "use `CudaState`'s own stream".
+    static BOUND_STREAM: Cell<*mut std::ffi::c_void> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// The default (non-backend) stream pointer, published by `CudaState::try_new`.
+/// The per-stream scratch maps key on this when no backend has bound a stream
+/// (legacy layer path, direct `CudaState` tests), so an unbound caller still
+/// gets a stable, private scratch set.
+static DEFAULT_STREAM: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII binding of a device stream to the current thread. Restores the previous
+/// binding on drop, so a backend method may freely nest.
+///
+/// `!Send` on purpose: a binding describes the thread that made it, and moving
+/// it to another thread would restore the wrong stream there.
+pub struct StreamBinding {
+    prev: *mut std::ffi::c_void,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for StreamBinding {
+    fn drop(&mut self) {
+        BOUND_STREAM.with(|c| c.set(self.prev));
+    }
+}
+
+/// Bind `stream` as this thread's device stream until the guard drops.
+pub fn bind_stream(stream: *mut std::ffi::c_void) -> StreamBinding {
+    let prev = BOUND_STREAM.with(|c| c.replace(stream));
+    StreamBinding {
+        prev,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// The stream bound on this thread, or null when none is bound.
+pub fn bound_stream() -> *mut std::ffi::c_void {
+    BOUND_STREAM.with(|c| c.get())
+}
+
+/// Key for the per-stream scratch maps: the bound stream, or the context's own
+/// stream for an unbound caller.
+fn current_stream_key() -> usize {
+    let bound = bound_stream() as usize;
+    if bound != 0 {
+        bound
+    } else {
+        DEFAULT_STREAM.load(Ordering::Relaxed)
+    }
+}
+
+/// Grow-on-demand activation scratch that is **private to a device stream**
+/// (issue #188). Every `(ptr, size)` pair used to be a process-wide slot, so
+/// two engines running concurrently on two streams overwrote each other's
+/// quantized activations before the consuming launch read them. The public
+/// shape (`get_or_grow(&slot, need)`) is unchanged; only the key moved.
+struct StreamScratch {
+    map: Mutex<HashMap<usize, (CudaPtr, usize)>>,
+}
+
+impl StreamScratch {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The current stream's `(ptr, size)`, or `(null, 0)` when this stream has
+    /// never grown the slot. Test/introspection surface.
+    #[allow(dead_code)]
+    fn slot(&self) -> (CudaPtr, usize) {
+        let key = current_stream_key();
+        self.map
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or((CudaPtr(std::ptr::null_mut()), 0))
+    }
+}
+
+/// Issue #188: the CUDA stream capture mode the device layer opens windows
+/// with. `cudaStreamCaptureModeGlobal` (1, the pre-#188 value) makes *another*
+/// thread's non-capture-safe driver call invalidate the window; both
+/// alternatives scope invalidation to the capturing thread —
+/// `cudaStreamCaptureModeThreadLocal` (2) keeps the capturing thread's own
+/// mistakes fatal, `cudaStreamCaptureModeRelaxed` (0) does not.
+pub const CAPTURE_MODE_RELAXED: i32 = 0;
+pub const CAPTURE_MODE_GLOBAL: i32 = 1;
+pub const CAPTURE_MODE_THREAD_LOCAL: i32 = 2;
+
+/// The capture mode a window is opened with, read once per process.
+/// `MINFER_CUDA_CAPTURE_MODE=0|1|2` overrides it (the #188 probe's per-mode
+/// measurement); the default is `ThreadLocal` — see the record in
+/// `docs/CUDA-BACKEND-DESIGN.md` §"Per-instance streams and capture".
+fn capture_mode() -> i32 {
+    static MODE: OnceLock<i32> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("MINFER_CUDA_CAPTURE_MODE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            Some(m @ (CAPTURE_MODE_RELAXED | CAPTURE_MODE_GLOBAL | CAPTURE_MODE_THREAD_LOCAL)) => m,
+            Some(other) => {
+                eprintln!(
+                    "CUDA: ignoring MINFER_CUDA_CAPTURE_MODE={other} (want 0 relaxed, 1 global, \
+                     2 thread-local); using thread-local"
+                );
+                CAPTURE_MODE_THREAD_LOCAL
+            }
+            None => CAPTURE_MODE_THREAD_LOCAL,
+        }
+    })
+}
+
 /// F5 (#58): how many times this process has **blocked the host** on the stream
 /// (`CudaState::sync` — the only full `cudaStreamSynchronize` in the device
 /// layer). Process-wide and monotonic on purpose: it is the "host stalls"
@@ -1143,6 +1294,19 @@ static CUDA: OnceLock<Option<CudaState>> = OnceLock::new();
 /// delta around one workload rather than an absolute count. A relaxed atomic
 /// increment is the whole cost on the hot path.
 static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Issue #188: the raw return code of the last `cudaStreamEndCapture` the graph
+/// backend performed. `0` = the window closed cleanly; `901`
+/// (`cudaErrorStreamCaptureInvalidated`) = another thread's driver call was not
+/// capture-safe under the mode that was open. The acceptance probe reads it; the
+/// production paths ignore it (a null exec is the failure signal there).
+static LAST_CAPTURE_END_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Issue #188: see [`LAST_CAPTURE_END_CODE`].
+#[allow(dead_code)] // read by the #188 acceptance probe
+pub fn last_capture_end_code() -> i32 {
+    LAST_CAPTURE_END_CODE.load(Ordering::Relaxed)
+}
 
 /// F5 (#58): the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
 ///
@@ -1491,9 +1655,12 @@ pub const W16_ENABLE_BYTES: usize = 2 << 30;
 
 pub struct CudaState {
     stream: Mutex<CudaPtr>,
-    /// Lazy pinned staging ring (7e⑥); None until the first async fill,
-    /// and stays None if cudaHostAlloc fails (sync fallback).
-    staging: Mutex<Option<PinnedPool>>,
+    /// Lazy pinned staging ring (7e⑥), **one per device stream** since #188:
+    /// the ring's slots are written by `cudaMemcpyAsync` on the bound stream, so
+    /// a shared ring would let one engine's fill reuse a slot another engine's
+    /// in-flight copy is still reading. Empty until the first async fill on a
+    /// stream; a stream whose `cudaHostAlloc` failed falls back to a sync copy.
+    staging: Mutex<HashMap<usize, PinnedPool>>,
     /// R3-A2: pinned D2H readback buffer (grown on demand; None until the
     /// first pinned read, stays None on cudaHostAlloc failure → the pageable
     /// fallback). A blocking `cudaMemcpy` into a PAGEABLE destination bounces
@@ -1590,58 +1757,61 @@ pub struct CudaState {
     max_nchunk: std::sync::atomic::AtomicUsize,
     // Persistent activation buffers (grown on demand) with size tracking
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_hidden: Mutex<(CudaPtr, usize)>,
+    buf_hidden: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bn: Mutex<(CudaPtr, usize)>,
+    buf_bn: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bq: Mutex<(CudaPtr, usize)>,
+    buf_bq: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bk: Mutex<(CudaPtr, usize)>,
+    buf_bk: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bv: Mutex<(CudaPtr, usize)>,
+    buf_bv: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_ba: Mutex<(CudaPtr, usize)>,
+    buf_ba: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bf: Mutex<(CudaPtr, usize)>,
+    buf_bf: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bg: Mutex<(CudaPtr, usize)>,
+    buf_bg: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_q8_bn: Mutex<(CudaPtr, usize)>,
+    buf_q8_bn: StreamScratch,
     /// 8c: prefill Q8_0-activation scratch (quantized activations for the
     /// Q4_0×Q8_0 GEMM, nt > 1). Grown on demand like the layer-path buffers.
-    buf_q8_prefill: Mutex<(CudaPtr, usize)>,
+    buf_q8_prefill: StreamScratch,
     /// P6 r34: transposed-A q8_0 prepass scratch — the swizzled qs plane
     /// ([ntb][nchunk][2048]) and the packed d|ssum scale ([ntb][nchunk][256]),
     /// consumed by mmq_raw_nb_bt_kernel's bulk staging (MINFER_MMQ_A_TRANSPOSE).
-    buf_qa8_t: Mutex<(CudaPtr, usize)>,
-    buf_sda_t: Mutex<(CudaPtr, usize)>,
+    buf_qa8_t: StreamScratch,
+    buf_sda_t: StreamScratch,
     /// doc 92: K-split fp32 partials ([ksplit][nt][od]) for the BT GEMM's
     /// block-starvation fix at small nt. Grown on demand like the other
     /// prepass scratches; the reduce kernel consumes it on the same stream.
-    buf_mmq_ksplit: Mutex<(CudaPtr, usize)>,
+    buf_mmq_ksplit: StreamScratch,
     /// r49: consecutive-window memoization of the MMQ A-quantize prepass (see
-    /// [`MmqCache`]). Lives on the process singleton so the CUDA backend can
-    /// invalidate it between non-MMQ nodes / graph executions.
-    mmq_cache: Mutex<MmqCache>,
+    /// [`MmqCache`]). **Per stream since #188**: an entry records the device
+    /// pointer of the per-stream scratch plane, so a shared memo would hand one
+    /// engine's plane to another. Still keyed on the (src, nt, id) window, so
+    /// the CUDA backend invalidates its own stream's entry between non-MMQ nodes
+    /// / graph executions.
+    mmq_cache: Mutex<HashMap<usize, MmqCache>>,
     /// 8d: split-K attention partials ([8][nh][pstr] floats, nh/hd are graph
     /// constants so the size is stable — grown during warmup, never inside a
     /// capture window).
-    buf_attn_partial: Mutex<(CudaPtr, usize)>,
+    buf_attn_partial: StreamScratch,
     /// 8e-reversal: decode MMVQ q8 activation scratch (nt=1, so id/32 * 40B
     /// per token — size-stable per graph, grown during warmup runs).
-    buf_q8_decode: Mutex<(CudaPtr, usize)>,
+    buf_q8_decode: StreamScratch,
     /// 8m: prefill f16 GEMM scratch — dequantized weights (od*id halves) and
     /// converted activations (nt*id halves), grown on demand. Prefill never
     /// enters a CUDA Graph capture window (8g①), so the grow is capture-safe
     /// (same assumption as the 8c buf_q8_prefill).
-    buf_f16_w: Mutex<(CudaPtr, usize)>,
-    buf_f16_x: Mutex<(CudaPtr, usize)>,
+    buf_f16_w: StreamScratch,
+    buf_f16_x: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_q8_ba: Mutex<(CudaPtr, usize)>,
+    buf_q8_ba: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_positions: Mutex<(CudaPtr, usize)>,
+    buf_positions: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_logits: Mutex<(CudaPtr, usize)>,
+    buf_logits: StreamScratch,
     // Persistent per-layer GPU KV cache (k, v) and current size
     kv_k: Mutex<Vec<CudaPtr>>,
     kv_v: Mutex<Vec<CudaPtr>>,
@@ -1649,13 +1819,6 @@ pub struct CudaState {
     // CUDA Graph for decode step (capture once, replay for each token)
     #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
     decode_graph_exec: Mutex<CudaPtr>,
-    /// Process-wide stream serialization for the graph-path backend (Phase
-    /// 7d): stream capture is per-stream, so while one backend holds an open
-    /// capture window, every OTHER backend's stream work (fills, copies,
-    /// launches, allocs) must block instead of being recorded into that
-    /// graph. The capturing backend holds this lock across its window; its
-    /// own enqueues skip re-locking (they are the recorded work).
-    stream_lock: Mutex<()>,
 }
 
 /// Quant block element count (ggml block_q): 256 for K-quants, 32 otherwise.
@@ -2001,37 +2164,12 @@ impl CudaState {
             }
         }
 
-        let dummy = (CudaPtr(std::ptr::null_mut()), 0usize);
-        // Eager dynamic-smem opt-in for the prefill GEMM instantiations:
-        // must happen BEFORE any stream capture — capture mode Global
-        // forbids cudaFuncSetAttribute, so a lazy first-use opt-in fails
-        // and the >48KB launch poisons the context (error 700).
-        //
-        // #145: every attribute call's return value is checked inside
-        // `gemm_prefill_smem_init` and named there (`cudaFuncSetAttribute(
-        // gemm_f16_nt_kernel_t<..>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        // .. B) failed: cudaError... (1)`); a request over the device's opt-in
-        // limit is skipped there, with the reason. The failure count is a
-        // startup fact, not something the next `sync()` should re-blame on a
-        // kernel.
-        let smem_failures = unsafe { gemm_prefill_smem_init() };
-        if smem_failures > 0 {
-            eprintln!(
-                "CUDA: {smem_failures} prefill-GEMM dynamic-smem opt-in call(s) failed at init \
-                 (each named above); the affected >48 KiB instantiation(s) keep the 48 KiB default \
-                 and must not be selected for a captured launch"
-            );
-        }
-        let smem_skipped = unsafe { gemm_prefill_smem_skipped() };
-        if smem_skipped > 0 {
-            eprintln!(
-                "CUDA: {smem_skipped} prefill-GEMM dynamic-smem opt-in request(s) skipped because \
-                 they exceed this device's limit (see the reasons above)"
-            );
-        }
+        // Issue #188: publish the context stream so the per-stream scratch
+        // maps can key unbound callers (legacy layer path, direct tests).
+        DEFAULT_STREAM.store(stream as usize, Ordering::Relaxed);
         Some(CudaState {
             stream: Mutex::new(CudaPtr(stream)),
-            staging: Mutex::new(None),
+            staging: Mutex::new(HashMap::new()),
             readback: Mutex::new(None),
             weights: Mutex::new(HashMap::new()),
             w16_cache: Mutex::new(HashMap::new()),
@@ -2051,32 +2189,31 @@ impl CudaState {
             q4k_dsc: Mutex::new(HashMap::new()),
             q4k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
             max_nchunk: std::sync::atomic::AtomicUsize::new(0),
-            buf_hidden: Mutex::new(dummy),
-            buf_bn: Mutex::new(dummy),
-            buf_bq: Mutex::new(dummy),
-            buf_bk: Mutex::new(dummy),
-            buf_bv: Mutex::new(dummy),
-            buf_ba: Mutex::new(dummy),
-            buf_bf: Mutex::new(dummy),
-            buf_bg: Mutex::new(dummy),
-            buf_q8_bn: Mutex::new(dummy),
-            buf_q8_prefill: Mutex::new(dummy),
-            buf_qa8_t: Mutex::new(dummy),
-            buf_sda_t: Mutex::new(dummy),
-            buf_mmq_ksplit: Mutex::new(dummy),
-            mmq_cache: Mutex::new(MmqCache::default()),
-            buf_attn_partial: Mutex::new(dummy),
-            buf_q8_decode: Mutex::new(dummy),
-            buf_f16_w: Mutex::new(dummy),
-            buf_f16_x: Mutex::new(dummy),
-            buf_q8_ba: Mutex::new(dummy),
-            buf_positions: Mutex::new(dummy),
-            buf_logits: Mutex::new(dummy),
+            buf_hidden: StreamScratch::new(),
+            buf_bn: StreamScratch::new(),
+            buf_bq: StreamScratch::new(),
+            buf_bk: StreamScratch::new(),
+            buf_bv: StreamScratch::new(),
+            buf_ba: StreamScratch::new(),
+            buf_bf: StreamScratch::new(),
+            buf_bg: StreamScratch::new(),
+            buf_q8_bn: StreamScratch::new(),
+            buf_q8_prefill: StreamScratch::new(),
+            buf_qa8_t: StreamScratch::new(),
+            buf_sda_t: StreamScratch::new(),
+            buf_mmq_ksplit: StreamScratch::new(),
+            mmq_cache: Mutex::new(HashMap::new()),
+            buf_attn_partial: StreamScratch::new(),
+            buf_q8_decode: StreamScratch::new(),
+            buf_f16_w: StreamScratch::new(),
+            buf_f16_x: StreamScratch::new(),
+            buf_q8_ba: StreamScratch::new(),
+            buf_positions: StreamScratch::new(),
+            buf_logits: StreamScratch::new(),
             kv_k: Mutex::new(Vec::new()),
             kv_v: Mutex::new(Vec::new()),
             kv_size: Mutex::new(Vec::new()),
             decode_graph_exec: Mutex::new(CudaPtr(std::ptr::null_mut())),
-            stream_lock: Mutex::new(()),
         })
     }
 
@@ -2182,13 +2319,37 @@ impl CudaState {
             return;
         }
         let err = unsafe {
-            cudaMemcpy(
+            // Issue #188: stream-ordered, not the legacy-null-stream blocking
+            // `cudaMemcpy`. The blocking form is not a stream operation at all:
+            // while another thread holds a capture window open on a different
+            // stream, it participates in the legacy default stream's implicit
+            // global synchronization — under `cudaStreamCaptureModeGlobal` that
+            // is exactly the call that invalidated the capture (901) or faulted
+            // in `cuMemcpyHtoD_v2`. Queuing the copy on the context's own stream
+            // and waiting on that stream keeps the registration a bounded,
+            // stream-scoped operation.
+            cudaMemcpyAsync(
                 ptr,
                 data.as_ptr() as *const std::ffi::c_void,
                 data.len(),
                 CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.context_stream(),
             )
         };
+        if err == 0 {
+            let serr = unsafe { cudaStreamSynchronize(self.context_stream()) };
+            if serr != 0 {
+                eprintln!(
+                    "CUDA: weight-registration stream sync failed for '{}': {} ({serr})",
+                    name,
+                    cuda_error_name(serr)
+                );
+                unsafe {
+                    cudaFree(ptr);
+                }
+                return;
+            }
+        }
         if err != 0 {
             eprintln!("CUDA: failed to copy '{}' to device", name);
             unsafe {
@@ -2201,6 +2362,40 @@ impl CudaState {
         // non-Q6_K type would otherwise dispatch the padded-224 kernel on a
         // raw-210 buffer (Phase 8 review finding)
         self.padded_weights.lock().unwrap().remove(name);
+        self.weights
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (CudaPtr(ptr), data.len()));
+    }
+
+    /// Issue #188 probe, **test-only**: the pre-#188 registration H2D path, a
+    /// blocking `cudaMemcpy` (which the driver issues on the legacy default
+    /// stream, not on any explicit stream). Kept so the acceptance probe can
+    /// measure the capture mode against the *historical* setup — a shared
+    /// capture stream plus this copy — instead of against a setup the fix
+    /// already changed, which would make the mode look irrelevant.
+    #[cfg(test)]
+    pub fn register_weight_blocking_legacy(&self, name: &str, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
+        if err != 0 || ptr.is_null() {
+            panic!("probe: cudaMalloc({}) failed ({err})", data.len());
+        }
+        let err = unsafe {
+            cudaMemcpy(
+                ptr,
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        if err != 0 {
+            unsafe { cudaFree(ptr) };
+            panic!("probe: blocking cudaMemcpy failed ({err})");
+        }
         self.weights
             .lock()
             .unwrap()
@@ -2704,16 +2899,80 @@ impl CudaState {
             .is_some_and(|(_, size)| *size == bytes)
     }
 
+    /// The device stream this call's work belongs on.
+    ///
+    /// **Per instance since #188.** A `CudaBackend` binds its own non-blocking
+    /// stream for the duration of each device operation (`crate::cuda::bind_stream`),
+    /// so this answers with *that* backend's stream; only an unbound caller
+    /// (legacy layer path, direct `CudaState` tests, weight registration) sees
+    /// the context's own stream. Every launch, copy, event, capture and
+    /// synchronize in this module goes through here, which is what makes the
+    /// stream follow the backend rather than the process.
     pub fn stream(&self) -> *mut std::ffi::c_void {
+        let bound = bound_stream();
+        if bound.is_null() {
+            self.stream.lock().unwrap().0
+        } else {
+            bound
+        }
+    }
+
+    /// The **context's own** stream — never a backend's bound stream. Weight
+    /// registration (and any other context-level transfer) uses this so it can
+    /// never enqueue into a backend's open capture window.
+    fn context_stream(&self) -> *mut std::ffi::c_void {
         self.stream.lock().unwrap().0
+    }
+
+    /// Issue #188: create a **non-blocking** stream for a backend instance. The
+    /// flag matters: a blocking stream implicitly synchronizes with the legacy
+    /// default stream, so a host-side `cudaMemcpy` for one engine would join
+    /// every other engine's stream — and inside another thread's capture window
+    /// that implicit join is what invalidates it.
+    pub fn create_stream(&self) -> *mut std::ffi::c_void {
+        let mut s: *mut std::ffi::c_void = std::ptr::null_mut();
+        // cudaStreamNonBlocking == 1 (cudaStreamDefault == 0).
+        let err = unsafe { cudaStreamCreateWithFlags(&mut s, 1) };
+        if err != 0 || s.is_null() {
+            eprintln!(
+                "CUDA: cudaStreamCreateWithFlags(non-blocking) failed: {} ({err})",
+                cuda_error_name(err)
+            );
+            return std::ptr::null_mut();
+        }
+        s
+    }
+
+    /// Issue #188: release a stream from [`Self::create_stream`] (no-op on null).
+    pub fn destroy_stream(&self, stream: *mut std::ffi::c_void) {
+        if !stream.is_null() {
+            unsafe {
+                cudaStreamDestroy(stream);
+            }
+        }
+    }
+
+    /// Issue #188: is `stream` inside a capture window right now? Used by the
+    /// probe and by the registration path's inventory; a failed query reads as
+    /// "not capturing" (the caller's own capture bookkeeping is authoritative).
+    #[allow(dead_code)] // probe + record surface
+    pub fn stream_is_capturing(stream: *mut std::ffi::c_void) -> bool {
+        let mut status: i32 = 0; // cudaStreamCaptureStatusNone == 0
+        let err = unsafe { cudaStreamIsCapturing(stream, &mut status) };
+        err == 0 && status != 0
     }
 
     // ─── Persistent buffer management ─────────────────────────
 
     #[allow(dead_code)] // legacy surface (7e⑦)
-    fn get_or_grow(slot: &Mutex<(CudaPtr, usize)>, need: usize) -> *mut std::ffi::c_void {
-        let mut guard = slot.lock().unwrap();
-        let (ptr, size) = &mut *guard;
+    fn get_or_grow(slot: &StreamScratch, need: usize) -> *mut std::ffi::c_void {
+        // Issue #188: the slot is private to the **current stream**, so two
+        // engines' concurrent launches never read each other's staging.
+        let key = current_stream_key();
+        let mut map = slot.map.lock().unwrap();
+        let (ptr, size) = map
+            .entry(key)
+            .or_insert((CudaPtr(std::ptr::null_mut()), 0usize));
         if ptr.0.is_null() || *size < need {
             if !ptr.0.is_null() {
                 unsafe {
@@ -2779,8 +3038,12 @@ impl CudaState {
     pub fn write_input_async(&self, data: &[u8], dst: *mut std::ffi::c_void) {
         const STAGING_SLOTS: usize = 8;
         const STAGING_SLOT_BYTES: usize = 2 * 1024 * 1024;
-        let mut guard = self.staging.lock().unwrap();
-        if guard.is_none() {
+        // #188: the ring is keyed on the bound stream — its slots are the
+        // source of a `cudaMemcpyAsync` on that stream, so two engines must not
+        // share one.
+        let key = current_stream_key();
+        let mut map = self.staging.lock().unwrap();
+        if !map.contains_key(&key) {
             let mut ptrs = Vec::new();
             let mut alloc_err = 0i32;
             for _ in 0..STAGING_SLOTS {
@@ -2802,31 +3065,32 @@ impl CudaState {
                 );
             }
             if !ptrs.is_empty() {
-                *guard = Some(PinnedPool {
-                    ptrs,
-                    slot_bytes: STAGING_SLOT_BYTES,
-                    next: 0,
-                });
+                map.insert(
+                    key,
+                    PinnedPool {
+                        ptrs,
+                        slot_bytes: STAGING_SLOT_BYTES,
+                        next: 0,
+                    },
+                );
             }
         }
-        let pool = match guard.as_mut() {
-            Some(p) if data.len() <= p.slot_bytes => p,
-            _ => {
-                drop(guard);
-                self.copy_to_device(data, dst);
-                return;
-            }
-        };
+        let fits = map.get(&key).is_some_and(|p| data.len() <= p.slot_bytes);
+        if !fits {
+            drop(map);
+            self.copy_to_device(data, dst);
+            return;
+        }
         // ring wrap: retire all in-flight copies before reusing slot 0. The
         // reset is re-checked under the re-lock so two threads that both
         // observed the full ring cannot both take slot 0 (Phase 8 review).
-        if pool.next == pool.ptrs.len() {
-            drop(guard);
+        if map.get(&key).is_some_and(|p| p.next == p.ptrs.len()) {
+            drop(map);
             self.sync();
-            guard = self.staging.lock().unwrap();
+            map = self.staging.lock().unwrap();
         }
         let slot = {
-            let pool = guard.as_mut().unwrap();
+            let pool = map.get_mut(&key).expect("the ring exists (checked above)");
             if pool.next >= pool.ptrs.len() {
                 pool.next = 0;
             }
@@ -2925,12 +3189,18 @@ impl CudaState {
         }
     }
 
-    /// Process-wide stream serialization handle (see the field docs). The
-    /// returned reference is `&'static` at every call site because `CudaState`
-    /// itself is only ever built as `&'static` (Box::leak in `get`), so the
-    /// elided lifetime there is `'static` — guards may be stored.
+    /// Issue #188: **the process-wide stream lock is gone.** It existed because
+    /// every backend shared one stream, so an open capture window had to exclude
+    /// every other backend's enqueues. Each `CudaBackend` now owns a stream and a
+    /// capture window (`CudaBackend::capturing`), so there is nothing left to
+    /// serialize at the context level.
+    ///
+    /// This accessor is retained only as a compile-time pointer for the removal;
+    /// it is `#[allow(dead_code)]` and no caller remains.
+    #[allow(dead_code)]
     pub fn stream_lock(&self) -> &Mutex<()> {
-        &self.stream_lock
+        static RETIRED: Mutex<()> = Mutex::new(());
+        &RETIRED
     }
 
     // ─── F5 (#58): events + asynchronous host transfers ────────
@@ -3151,8 +3421,7 @@ impl CudaState {
     #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn download_hidden(&self, hidden: &mut [f32]) {
         let need = hidden.len() * 4;
-        let guard = self.buf_hidden.lock().unwrap();
-        let ptr = guard.0 .0;
+        let ptr = self.buf_hidden.slot().0 .0;
         if ptr.is_null() {
             return;
         }
@@ -3174,7 +3443,7 @@ impl CudaState {
 
     #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn get_positions_buf(&self) -> *mut std::ffi::c_void {
-        self.buf_positions.lock().unwrap().0 .0
+        self.buf_positions.slot().0 .0
     }
 
     // ─── KV cache management ─────────────────────────────────
@@ -3233,8 +3502,7 @@ impl CudaState {
     #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn download_logits(&self, logits: &mut [f32]) {
         let need = logits.len() * 4;
-        let guard = self.buf_logits.lock().unwrap();
-        let ptr = guard.0 .0;
+        let ptr = self.buf_logits.slot().0 .0;
         if ptr.is_null() {
             return;
         }
@@ -3252,7 +3520,12 @@ impl CudaState {
 
     pub fn graph_begin_capture(&self) -> bool {
         let stream = self.stream();
-        let err = unsafe { cudaStreamBeginCapture(stream, 1) };
+        // Issue #188: the mode is the whole point. Global (1) made another
+        // thread's capture-unsafe driver call invalidate this window (or fault
+        // inside the driver); thread-local (2) scopes invalidation to the
+        // capturing thread. `MINFER_CUDA_CAPTURE_MODE` overrides it for the
+        // probe's per-mode measurement; see `capture_mode`.
+        let err = unsafe { cudaStreamBeginCapture(stream, capture_mode()) };
         if err != 0 {
             unsafe {
                 cudaGetLastError();
@@ -3320,6 +3593,7 @@ impl CudaState {
 
         let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
+        LAST_CAPTURE_END_CODE.store(err, Ordering::Relaxed);
         if err != 0 || graph.is_null() {
             if err != 0 {
                 unsafe {
@@ -3327,6 +3601,10 @@ impl CudaState {
                 }
             }
             eprintln!("CUDA: stream capture end failed (err {err})");
+            // Issue #188: record the raw code so the acceptance probe can
+            // distinguish 901 (`cudaErrorStreamCaptureInvalidated`) from every
+            // other end-capture failure.
+            LAST_CAPTURE_END_CODE.store(err, Ordering::Relaxed);
             return std::ptr::null_mut();
         }
 
@@ -3884,9 +4162,9 @@ impl CudaState {
     /// backend between non-MMQ nodes (conservative consecutive-window rule)
     /// and at split boundaries (cross-execution staleness).
     pub fn clear_mmq_cache(&self) {
-        let mut c = self.mmq_cache.lock().unwrap();
-        c.active = false;
-        c.key = (0, 0, 0);
+        // #188: only this stream's entry — a foreign engine's window is not ours
+        // to invalidate.
+        self.mmq_cache.lock().unwrap().remove(&current_stream_key());
     }
 
     /// r49: transposed-A helper for the MMQ quantize prepass — returns
@@ -3908,7 +4186,8 @@ impl CudaState {
         let need_qa8 = (ntb as usize) * (id as usize / 32) * 2048;
         let need_sda = (ntb as usize) * (id as usize / 32) * 256;
         let key = (x as usize, nt as usize, id as usize);
-        let mut cache = self.mmq_cache.lock().unwrap();
+        let mut map = self.mmq_cache.lock().unwrap();
+        let cache = map.entry(current_stream_key()).or_default();
         if cache.active && cache.key == key && cache.transposed {
             // get_or_grow may have reallocated on a larger miss: validate the
             // physical pointers so a grown buffer is never reused stale.
@@ -3969,7 +4248,8 @@ impl CudaState {
     ) -> usize {
         let need = (nt as usize) * (id as usize / 32) * 40;
         let key = (x as usize, id as usize, nt as usize);
-        let mut cache = self.mmq_cache.lock().unwrap();
+        let mut map = self.mmq_cache.lock().unwrap();
+        let cache = map.entry(current_stream_key()).or_default();
         if cache.active && cache.key == key && !cache.transposed {
             let q8 = Self::get_or_grow(&self.buf_q8_prefill, need) as usize;
             if q8 == cache.q8 {
@@ -4017,11 +4297,13 @@ impl CudaState {
         let need = nt * (id / 32) * 40;
         let key = (x as usize, nt, id);
         if !Self::no_decode_a_fuse() {
-            let cache = self.mmq_cache.lock().unwrap();
-            if cache.active && !cache.transposed && !cache.dead_write && cache.key == key {
-                let q8 = Self::get_or_grow(&self.buf_q8_decode, need) as usize;
-                if q8 == cache.q8 {
-                    return q8 as *mut u8;
+            let map = self.mmq_cache.lock().unwrap();
+            if let Some(cache) = map.get(&current_stream_key()) {
+                if cache.active && !cache.transposed && !cache.dead_write && cache.key == key {
+                    let q8 = Self::get_or_grow(&self.buf_q8_decode, need) as usize;
+                    if q8 == cache.q8 {
+                        return q8 as *mut u8;
+                    }
                 }
             }
         }
@@ -4040,7 +4322,8 @@ impl CudaState {
     /// into the MmqCache (decode counterpart of
     /// [`Self::record_mmq_cache_transposed`]).
     fn record_mmq_cache_native(&self, src: usize, nt: usize, id: usize, q8: usize) {
-        let mut c = self.mmq_cache.lock().unwrap();
+        let mut map = self.mmq_cache.lock().unwrap();
+        let c = map.entry(current_stream_key()).or_default();
         c.active = true;
         c.key = (src, nt, id);
         c.transposed = false;
@@ -4078,7 +4361,8 @@ impl CudaState {
         sda: usize,
         dead_write: bool,
     ) {
-        let mut c = self.mmq_cache.lock().unwrap();
+        let mut map = self.mmq_cache.lock().unwrap();
+        let c = map.entry(current_stream_key()).or_default();
         c.active = true;
         c.key = (src, nt, id);
         c.transposed = true;
@@ -6501,6 +6785,15 @@ impl CudaState {
 
     /// Encode one transformer layer onto the CUDA stream.
     /// Returns false if any weight is missing from GPU.
+    ///
+    /// Issue #188: this is the **last unbound device entry point** — it drives
+    /// `buf_hidden`/`buf_bn`/… directly, with no `CudaBackend` instance to bind a
+    /// stream, so it shares the context stream and its (context-keyed) scratch set
+    /// with any other unbound caller. `crate::device_entry::enter` keeps that path
+    /// to one thread at a time. The graph path (`BackendScheduler::execute` →
+    /// `CudaBackend`, which binds its own stream) and weight registration
+    /// (stream-ordered on the context stream) no longer take the guard — see
+    /// `src/device_entry.rs` for the narrowed scope and why.
     #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn layer_gpu(
         &self,
@@ -6519,6 +6812,15 @@ impl CudaState {
         freq_base: f32,
         freq_scale: f32,
     ) -> bool {
+        let _entry = match crate::device_entry::enter(
+            "the legacy `layer_gpu` path (unbound context stream)",
+        ) {
+            Ok(e) => e,
+            Err(reason) => {
+                eprintln!("{reason}");
+                return false;
+            }
+        };
         let attn_norm = match &l.attn_norm {
             Some(t) => t,
             None => return false,
@@ -6800,11 +7102,12 @@ mod d35_probe_tests {
         out
     }
 
-    /// D2H readback of the shared decode q8 scratch (private-field probe).
+    /// D2H readback of this stream's decode q8 scratch (private-field probe).
+    /// #188 made the scratch per stream, so the slot is read through the
+    /// accessor rather than a process-wide `(ptr, size)` mutex.
     fn read_q8(st: &CudaState, bytes: usize) -> Vec<u8> {
-        let guard = st.buf_q8_decode.lock().unwrap();
-        let (ptr, size) = &*guard;
-        assert!(*size >= bytes, "q8 scratch smaller than probe readback");
+        let (ptr, size) = st.buf_q8_decode.slot();
+        assert!(size >= bytes, "q8 scratch smaller than probe readback");
         let mut out = vec![0u8; bytes];
         let err = unsafe {
             cudaMemcpy(

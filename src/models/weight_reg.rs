@@ -149,16 +149,12 @@ pub(crate) fn register_cuda_weight(
     // form.
     crate::testfail::note_checked("register_weight");
     crate::testfail::guard_panic("register_weight");
-    // #185: the registration below is a plain blocking `cudaMalloc` +
-    // `cudaMemcpy` on the process-wide device layer — *not* stream-ordered, so it
-    // is not capture-safe while another thread holds an open capture window. The
-    // parallel `#[ignore]`d suite's SIGSEGV is exactly this call faulting inside
-    // libcuda's `cuMemcpyHtoD_v2` against a concurrent capture (gdb, GB10 sm_121,
-    // 2026-09-26). Refuse loudly instead; `register_cuda_weight` already uses the
-    // panic channel above, so a refusal is reported the same way as a broken
-    // registration.
-    let _device_entry = crate::device_entry::enter("CUDA weight registration")
-        .unwrap_or_else(|reason| panic!("{reason}"));
+    // Issue #188: registration no longer takes the #185 device-entry guard.
+    // `CudaState::register_weight` queues the H2D copy on the *context* stream and
+    // waits on that stream (never a blocking `cudaMemcpy` on the legacy default
+    // stream), the activation scratches are per stream, and the capture mode is
+    // thread-local, so a registration may run while another engine captures on its
+    // own stream. `register_cuda_weight`'s panic channel above is unchanged.
     let (id, od) = (shape[0] as usize, shape[1] as usize);
     let dsc_gates_on = crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
         && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
