@@ -43,6 +43,29 @@ impl AttnWindow {
     }
 }
 
+/// Issue #189's mutation seam for the S4 map-window A/B: how many times a
+/// **map-mode** attention launch is issued.
+///
+/// `MINFER_S4_AB_MAP_REPS=2` makes the gate's timed map arm pay twice the work,
+/// which is gate contract rule 3's "break the implementation, watch the gate go
+/// red" made reproducible (the one-line form of #123's map-work doubling).
+/// Every other mode, and every run with the variable unset, returns `1`. Read
+/// once per process — a mutation run exports the variable before the process
+/// starts, so the cached value can never race a timing round.
+fn s4_ab_map_reps(mode: i32) -> usize {
+    if mode != AttnWindow::Map.code() {
+        return 1;
+    }
+    static REPS: OnceLock<usize> = OnceLock::new();
+    *REPS.get_or_init(|| {
+        std::env::var("MINFER_S4_AB_MAP_REPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
 /// Wrapper to make `*mut c_void` Send+Sync for use in Mutex.
 #[derive(Clone, Copy)]
 struct CudaPtr(*mut std::ffi::c_void);
@@ -5640,6 +5663,38 @@ impl CudaState {
         row_bytes: usize,
         nt: usize,
     ) {
+        // #189's mutation seam: 1 unless `MINFER_S4_AB_MAP_REPS=2` doubles the
+        // map arm's work (`s4_ab_map_reps`).
+        for _ in 0..s4_ab_map_reps(mode) {
+            self.gqa_attn_kv_prefill_once(
+                q, k, v, o, positions, mode, layout, nh, nk, hd, scale, row_bytes, nt,
+            );
+        }
+        // The observation half of gate contract rule 3: the map instantiation
+        // really ran. The S4 A/B resets this counter, runs one map call and one
+        // span call, and asserts the map call moved it while the span did not.
+        if mode == AttnWindow::Map.code() {
+            crate::testfail::note_checked("cuda_attn_map_window");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_attn_kv_prefill_once(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        mode: i32,
+        layout: i32,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        row_bytes: usize,
+        nt: usize,
+    ) {
         let stream = self.stream();
         // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The
         // legacy kernel is one block per (token, head) — K re-read per token
@@ -5774,6 +5829,36 @@ impl CudaState {
     /// 4-warp body (f16-typed); f32/f16 keep their pre-C4 launchers unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_attn_split(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        o: *mut std::ffi::c_void,
+        positions: *mut std::ffi::c_void,
+        mode: i32,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        layout: i32,
+        row_bytes: usize,
+    ) {
+        // #189's mutation seam: 1 unless `MINFER_S4_AB_MAP_REPS=2` doubles the
+        // map arm's work (`s4_ab_map_reps`). The launch is idempotent, so the
+        // second issue writes the same bytes and only the cost changes.
+        for _ in 0..s4_ab_map_reps(mode) {
+            self.gqa_attn_split_once(
+                q, k, v, o, positions, mode, nh, nk, hd, scale, layout, row_bytes,
+            );
+        }
+        // The observation half of gate contract rule 3 (see `gqa_attn_kv_prefill`).
+        if mode == AttnWindow::Map.code() {
+            crate::testfail::note_checked("cuda_attn_map_window");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_attn_split_once(
         &self,
         q: *mut std::ffi::c_void,
         k: *mut std::ffi::c_void,
