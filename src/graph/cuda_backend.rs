@@ -5540,6 +5540,179 @@ mod tests {
             got_q8.iter().any(|x| x.abs() > 1e-6),
             "the packed attention returned all zeros"
         );
+
+        // ── #186: the `__dp4a` decode arm ───────────────────────────────────────
+        //
+        // The int-dot path lives only in the `nt == 1` split-K kernel, which the
+        // `nt = 3` arms above never reach. This arm runs it at `nt = 1` with an
+        // explicit span `[0, 2)` over **two** stored cells, so the query's K scores
+        // actually reach the output through the softmax: with a single key the score
+        // cancels and the arm would be vacuous (the first version of this arm used
+        // `positions = [0]`/one cell and a mutated block base still passed — the
+        // mutation is what found it).
+        //
+        // `positions = [0]` keeps the rope the identity permutation, and the query is
+        // built **exactly Q8_0-representable** (`amax = 1`, values in `{-1, 0, 1}`):
+        // its block scale is then `1/127` and its quants are `±127`, so the int dot's
+        // answer equals the f32 kernel's over the dequantized cells and the bound
+        // stays tight enough to catch a wrong block base, scale offset or byte pack.
+        // The query quantization itself is a numerics change with its own class — it
+        // is measured by the real-model gate
+        // `a_packed_kv_cache_answers_like_the_f32_one`, not pinned here.
+        {
+            const NCELL: usize = 2;
+            let mut b1 = GraphBuilder::new();
+            b1.set_kv_format(crate::graph::kvformat::KvFormat::Q8_0);
+            b1.set_explicit_span(true);
+            let q1 = b1.input("q", [nh * hd, 1, 1, 1], DType::F32);
+            let k1 = b1.input("k", [nkt, NCELL, 1, 1], DType::F32);
+            let v1 = b1.input("v", [nkt, NCELL, 1, 1], DType::F32);
+            let p1 = b1.input("positions", [1, 1, 1, 1], DType::I32);
+            let st1 = b1.kvcache_store(0, k1, v1, n_ctx);
+            let ld1 = b1.kvcache_load(0, nkt, n_ctx, nk_h);
+            let qr1 = b1.rope(
+                q1,
+                p1,
+                RopeStyle::NonInterleaved,
+                RoPEMeta {
+                    freq_base: 10000.0,
+                    freq_scale: 1.0,
+                    n_head: nh,
+                    hd,
+                },
+            );
+            let at1 = b1.attn(
+                qr1,
+                ld1,
+                p1,
+                AttnMode::Gqa,
+                AttnMeta {
+                    layer: 0,
+                    n_head: nh,
+                    n_head_kv: nk_h,
+                    hd,
+                    hd_kv: hd,
+                    nkt,
+                    scale,
+                },
+            );
+            b1.output(at1);
+            let g1 = b1.build();
+
+            // The Attn node's 4th input is the builder's span node; one `[lo, hi)`
+            // pair per query, here `[0, 2)` over both stored cells.
+            let span1: Vec<f32> = [0u32, NCELL as u32]
+                .iter()
+                .map(|&x| f32::from_bits(x))
+                .collect();
+
+            let qv1: Vec<f32> = (0..nh * hd)
+                .map(|i| match i % 32 {
+                    0 => 1.0,
+                    1 => -1.0,
+                    _ => 0.0,
+                })
+                .collect();
+            assert!(
+                qv1.chunks(32).all(|c| c.iter().any(|x| *x != 0.0)),
+                "every query block must have a non-zero amax, or its scale is 0"
+            );
+            let s1_q = cb.alloc_buffer(nh * hd);
+            let s1_k = cb.alloc_buffer(nkt * NCELL);
+            let s1_v = cb.alloc_buffer(nkt * NCELL);
+            let s1_p = cb.alloc_buffer(1);
+            let s1_c = cb.alloc_buffer(NCELL);
+            let s1_w = cb.alloc_buffer(2);
+            let o1_q = cb.alloc_buffer(nh * hd);
+            let o1_a = cb.alloc_buffer(nh * hd);
+            let rk1 = cb.alloc_buffer(n_ctx * row_elems);
+            let rv1 = cb.alloc_buffer(n_ctx * row_elems);
+            let fk1 = cb.alloc_buffer(n_ctx * nkt);
+            let fv1 = cb.alloc_buffer(n_ctx * nkt);
+            let bits1 = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+            cb.write_host(s1_q, &qv1).unwrap();
+            cb.write_host(s1_k, &ks[..nkt * NCELL]).unwrap();
+            cb.write_host(s1_v, &vs[..nkt * NCELL]).unwrap();
+            cb.write_host(s1_p, &bits1(&[0])).unwrap();
+            cb.write_host(s1_c, &bits1(&[0, 1])).unwrap();
+            cb.write_host(s1_w, &span1).unwrap();
+            cb.write_host(rk1, &vec![0f32; n_ctx * row_elems]).unwrap();
+            cb.write_host(rv1, &vec![0f32; n_ctx * row_elems]).unwrap();
+
+            cb.set_kv_q8_for_test();
+            cb.exec_ids(&g1.nodes[st1], &[s1_k, s1_v, s1_c], rk1, Some((rk1, rv1)))
+                .unwrap();
+            cb.exec_ids(&g1.nodes[qr1], &[s1_q, s1_p], o1_q, None)
+                .unwrap();
+            crate::testfail::reset_checked();
+            cb.exec_ids(
+                &g1.nodes[at1],
+                &[o1_q, rk1, s1_p, s1_w],
+                o1_a,
+                Some((rk1, rv1)),
+            )
+            .unwrap();
+            let got1 = cb.copy_to_host(o1_a).unwrap();
+            // Rule 3's observation half: the counter is bumped by the launch
+            // chokepoint, so it proves the arm the A/B selects actually ran — and
+            // tracks the control (`MINFER_NO_DP4A_Q8_KV=1`) rather than lying about
+            // it.
+            assert_eq!(
+                crate::testfail::checked("cuda_q8_kv_dp4a"),
+                u64::from(crate::cuda::q8_kv_dp4a_enabled()),
+                "the Q8_0 decode launch's dp4a observation counter must match its control"
+            );
+
+            let pk1 = cb.copy_to_host(rk1).unwrap();
+            let pv1 = cb.copy_to_host(rv1).unwrap();
+            let mut ref_k1 = vec![0f32; n_ctx * nkt];
+            let mut ref_v1 = vec![0f32; n_ctx * nkt];
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &pk1,
+                nkt,
+                0,
+                NCELL,
+                &mut ref_k1[..nkt * NCELL],
+            );
+            crate::graph::kvformat::unpack_q8_0_cells(
+                &pv1,
+                nkt,
+                0,
+                NCELL,
+                &mut ref_v1[..nkt * NCELL],
+            );
+            cb.set_kv_layout_for_test(crate::cuda::KV_LAYOUT_F32);
+            cb.write_host(fk1, &ref_k1).unwrap();
+            cb.write_host(fv1, &ref_v1).unwrap();
+            cb.exec_ids(
+                &g1.nodes[at1],
+                &[o1_q, fk1, s1_p, s1_w],
+                o1_a,
+                Some((fk1, fv1)),
+            )
+            .unwrap();
+            let want1 = cb.copy_to_host(o1_a).unwrap();
+            let worst1 = got1
+                .iter()
+                .zip(&want1)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                got1.iter().any(|x| x.abs() > 1e-6),
+                "the dp4a decode arm returned all zeros"
+            );
+            assert!(
+                worst1 <= 1e-5,
+                "the dp4a decode K dot is not the f32 kernel over the dequantized \
+                 cells with an exactly-representable query: max |Δ| = {worst1}"
+            );
+            eprintln!(
+                "[c4s2] dp4a decode (nt=1, span over {} cells) vs dequantized f32 \
+                 attention: max |Δ| = {worst1}, dp4a arm {}",
+                NCELL,
+                crate::cuda::q8_kv_dp4a_enabled()
+            );
+        }
     }
 
     /// #144 item 1: the **packed fused decode epilogue** must write the unfused

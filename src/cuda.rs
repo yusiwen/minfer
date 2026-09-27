@@ -1131,6 +1131,7 @@ extern "C" {
         scale: f32,
         pstr: i32,
         row_bytes: usize,
+        dp4a: i32,
         stream: *mut std::ffi::c_void,
     );
     // doc 94: batched split attention for the verify shapes (1 < nt <= 16) —
@@ -1954,6 +1955,22 @@ pub fn concat_rows_feasible(tensors: &[&Tensor]) -> bool {
 pub const KV_LAYOUT_F32: i32 = 0;
 pub const KV_LAYOUT_F16: i32 = 1;
 pub const KV_LAYOUT_Q8_0: i32 = 2;
+
+/// #186: the packed Q8_0 **decode** K dot's same-binary A/B control, and where the
+/// launcher's answer comes from. `MINFER_NO_DP4A_Q8_KV=1` selects the incumbent
+/// convert-based `kv4<KV_LAYOUT_Q8_0>` load; unset (or any other value) selects the
+/// `__dp4a` int accumulation against the lane's quantized query.
+///
+/// Read **once per process** and passed to the launcher as a value: the decode graph
+/// is captured, and an answer that flipped mid-process would select a different
+/// kernel than the one the captured exec recorded — exactly the class of change
+/// `cuda_backend.rs::graph_replay_step` refuses for a moved layout. Resolving it here
+/// (rather than inside the `.cu`) also lets the Rust side bump the observation
+/// counter only when the arm it launched is the one under test.
+pub fn q8_kv_dp4a_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MINFER_NO_DP4A_Q8_KV").as_deref() != Ok("1"))
+}
 
 /// The `KV_LAYOUT_*` tag for a `KvFormat` — the one place the two names are tied
 /// together, exhaustive over the enum so a fourth format cannot be added without a
@@ -5878,6 +5895,10 @@ impl CudaState {
         let need = ATTN_SPLITS * nh * (pstr as usize) * 4;
         let partial = Self::get_or_grow(&self.buf_attn_partial, need);
         let stream = self.stream();
+        // #186: the Q8_0 decode arm's same-binary A/B control. The flag is resolved
+        // once per process (`cuda::q8_kv_dp4a_enabled`) and passed as a value; the
+        // launcher picks the `__dp4a` or the convert-based instantiation from it.
+        let dp4a = q8_kv_dp4a_enabled();
         unsafe {
             if layout == KV_LAYOUT_Q8_0 {
                 launch_gqa_attn_split_q8_0(
@@ -5894,8 +5915,15 @@ impl CudaState {
                     scale,
                     pstr,
                     row_bytes,
+                    dp4a as i32,
                     stream,
                 );
+                // The observation half of gate contract rule 3: a gate that must
+                // prove the int dot ran cannot read the launch's own report. The
+                // chokepoint is bumped only when this call launched the dp4a arm.
+                if dp4a {
+                    crate::testfail::note_checked("cuda_q8_kv_dp4a");
+                }
             } else if layout == KV_LAYOUT_F16 {
                 launch_gqa_attn_split_f16kv(
                     q as *const f32,
@@ -9366,29 +9394,48 @@ mod issue162_tests {
                 }
             );
         }
-        for (mode, token) in [
-            (MAP, "launch:gqa_attn_split_q8_0__map"),
-            (SPAN, "launch:gqa_attn_split_q8_0__span"),
-            (CAUSAL, "launch:gqa_attn_split_q8_0__causal"),
+        for (mode, base_token, dp4a_token) in [
+            (
+                MAP,
+                "launch:gqa_attn_split_q8_0__map",
+                "launch:gqa_attn_split_q8_0__map_dp4a",
+            ),
+            (
+                SPAN,
+                "launch:gqa_attn_split_q8_0__span",
+                "launch:gqa_attn_split_q8_0__span_dp4a",
+            ),
+            (
+                CAUSAL,
+                "launch:gqa_attn_split_q8_0__causal",
+                "launch:gqa_attn_split_q8_0__causal_dp4a",
+            ),
         ] {
-            go!(&[token, "launch:gqa_attn_split_q8_0__combine"], || unsafe {
-                launch_gqa_attn_split_q8_0(
-                    ctx.cf(0),
-                    ctx.p(1),
-                    ctx.p(2),
-                    ctx.f(3),
-                    ctx.f(4),
-                    ctx.ci32(5),
-                    mode,
-                    4,
-                    2,
-                    64,
-                    0.125,
-                    68,
-                    68,
-                    st,
-                );
-            });
+            // #186: the Q8_0 decode launcher picks one of two instantiations from the
+            // `dp4a` argument. Every audited site must be driven, so both arms are
+            // driven explicitly — the env resolves to one of them for production, but
+            // `run`'s armed set is a value here, not a process-global answer.
+            for (token, dp4a) in [(base_token, 0i32), (dp4a_token, 1i32)] {
+                go!(&[token, "launch:gqa_attn_split_q8_0__combine"], || unsafe {
+                    launch_gqa_attn_split_q8_0(
+                        ctx.cf(0),
+                        ctx.p(1),
+                        ctx.p(2),
+                        ctx.f(3),
+                        ctx.f(4),
+                        ctx.ci32(5),
+                        mode,
+                        4,
+                        2,
+                        64,
+                        0.125,
+                        68,
+                        68,
+                        dp4a,
+                        st,
+                    );
+                });
+            }
         }
         // hd == 128 takes the dual-kernel (h4w + hybrid) path; hd != 128 the
         // single incumbent one. Both share `__combine`.
