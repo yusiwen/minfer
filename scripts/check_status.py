@@ -18,7 +18,12 @@ Modes:
   commit ids — and that both ids are ancestors of ``HEAD``
   (``git merge-base --is-ancestor``, so "refreshed against master = X" cannot point
   at a rewritten-away commit) — plus `AGENTS.md`'s count rows (numbers, box and
-  date).
+  date). A counts row may also carry a **projection** (``projection_key`` /
+  ``projection_box`` / ``projection_base_passed``): when the recorded row's CPU twin
+  has moved since it was measured, ``--check`` **prints** (never fails on) the
+  projected value, so a stale recorded row cannot look current without a hint beside
+  it (#207). The relation is inexact — the device-gated tests move independently —
+  which is why it is a hint and not a comparison.
 - ``--check-live LOG --box NAME`` parses a `cargo test` log into its unit and
   integration totals and compares the manifest rows for that box. Hardening that
   is not optional: a box with no manifest rows fails loudly; a log with no
@@ -181,6 +186,45 @@ def compare_phases(root: Path, manifest: dict, problems: list[str]) -> int:
     return checked
 
 
+def projection_hints(manifest: dict) -> list[str]:
+    """Non-failing hints for a recorded row a CPU-side change has moved (#207).
+
+    The CUDA rows are recorded measurements refreshed only on a device run, but
+    they count the **same test binary plus the device-gated tests**: a
+    feature-independent test added by a CPU-only ticket moves both. A row may
+    therefore carry `projection_key` / `projection_box` (the CPU row that shares
+    its binary) and `projection_base_passed` (that row's `passed` value at the
+    moment this row was measured), and this function projects
+    `passed + (source_passed - base)`.
+
+    It is deliberately a **hint, never a check**: the device-gated tests move
+    independently of the CPU row, so the relation is inexact. The point is that a
+    stale row cannot look current without a projection beside it.
+    """
+    rows = {
+        (row.get("key"), row.get("box")): row for row in manifest.get("counts", [])
+    }
+    hints: list[str] = []
+    for row in manifest.get("counts", []):
+        if "projection_key" not in row:
+            continue
+        source = rows.get((row["projection_key"], row.get("projection_box")))
+        if source is None:
+            continue
+        base = int(row["projection_base_passed"])
+        delta = int(source["passed"]) - base
+        if delta == 0:
+            continue
+        hints.append(
+            f'{row["key"]} ({row["box"]}) records {row["passed"]} passed but the '
+            f'{source["key"]} ({source["box"]}) row it was measured with has moved '
+            f'{delta:+d} since then, so a device run would report about '
+            f'{int(row["passed"]) + delta} passed — refresh the row on the next '
+            f"device run (#207)"
+        )
+    return hints
+
+
 def compare_counts(root: Path, manifest: dict, problems: list[str]) -> int:
     """Compare every `[[counts]]` row against its own prose regex.
 
@@ -257,6 +301,7 @@ def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
         "live": live,
         "recorded": len(manifest.get("counts", [])) - len(live),
         "scalars": len(scalars),
+        "hints": projection_hints(manifest),
     }
     return problems, summary
 
@@ -631,7 +676,49 @@ def run_selftest() -> int:
             str(problems),
         )
 
-        # 9. `--help` states the honest limit.
+        # 9. #207: a recorded row whose CPU twin has moved prints a *non-failing*
+        #    projection hint; a current one prints none. The hint is a projection,
+        #    not a comparison, so the pair is the mutation evidence: same code,
+        #    only the base value differs.
+        moved = {
+            "counts": [
+                {"key": "cpu-unit", "box": "b", "passed": 462},
+                {
+                    "key": "cuda-unit",
+                    "box": "g",
+                    "passed": 548,
+                    "projection_key": "cpu-unit",
+                    "projection_box": "b",
+                    "projection_base_passed": 455,
+                },
+            ]
+        }
+        moved_hints = projection_hints(moved)
+        record(
+            "a moved CPU twin prints a non-failing projection hint (#207)",
+            len(moved_hints) == 1 and "548" in moved_hints[0] and "555" in moved_hints[0],
+            str(moved_hints),
+        )
+        current = {
+            "counts": [
+                {"key": "cpu-unit", "box": "b", "passed": 462},
+                {
+                    "key": "cuda-unit",
+                    "box": "g",
+                    "passed": 555,
+                    "projection_key": "cpu-unit",
+                    "projection_box": "b",
+                    "projection_base_passed": 462,
+                },
+            ]
+        }
+        record(
+            "a recorded row refreshed together with its projection prints no hint",
+            projection_hints(current) == [],
+            str(projection_hints(current)),
+        )
+
+        # 10. `--help` states the honest limit.
         record(
             "--help states the honest limit",
             HELP_LIMIT in build_parser().description,
@@ -758,6 +845,10 @@ def main(argv: list[str]) -> int:
         f"{len(summary['live'])} live-checkable, {summary['recorded']} recorded "
         f"measurements); baseline/refreshed commits are ancestors of HEAD"
     )
+    # #207: a recorded row whose CPU twin has moved since it was measured is
+    # *printed*, never failed on — the relation is inexact.
+    for hint in summary["hints"]:
+        print(f"check_status: projection hint: {hint}")
     return 0
 
 

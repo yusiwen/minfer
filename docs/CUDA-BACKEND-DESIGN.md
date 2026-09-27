@@ -849,6 +849,12 @@ CUDA 13.0, driver 580.178.04):
   actually collected as the only evidence; `n/a` is not a number.
 - **Collect targeted, not whole-run.** Counter replay is slow: filter with `-k regex:<kernel>` and
   bound it with `--launch-count`, rather than replaying a full `bench`.
+- **A `-k` regex must match ncu's base kernel name, not the demangled signature.** ncu lists the
+  available kernels by base name (`gqa_attn_split_partial`, no template arguments), so a regex that
+  includes `<` — e.g. `-k 'regex:gqa_attn_split_partial<'` — matches nothing and ncu prints an
+  "Available Kernels" list instead of collecting (`No kernels were profiled`). Anchor it
+  (`-k 'regex:gqa_attn_split_partial$'`) so sibling kernels (`..._combine`, `..._bt`) are excluded
+  rather than eating into `--launch-count`. Recorded by #202, which lost one collection to this.
 
 `nsys` stays the cheap, always-available instrument for per-kernel durations
 (`nsys profile --trace=cuda --cuda-graph-trace=node ...` — without `node`, kernels launched from a

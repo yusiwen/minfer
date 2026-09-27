@@ -1329,6 +1329,57 @@ prefill attention, but that is a different kernel (per token *and* head query, n
 and not the ticket's residual — named rather than assumed. Full record:
 [`cuda_optimization_steps/108`](./cuda_optimization_steps/108-c4-dp4a-packed-q8-kv-cuda.md).
 
+### C4 — #202: the packed Q8_0 KV cell's L1 request count · [#202](https://github.com/yusiwen/minfer/issues/202) — **DONE 2026-09-27 (counter-only; throughput bar missed)**
+
+**Why.** [#186]'s ncu attribution named the residual: the packed decode arm issued **1.71x** f16's L1
+load sectors (~792904 vs 463008) with 0.57x its L2 sectors, because a 34-byte Q8_0 block's 4-element
+group at `blk + 2 + (elem & 31)` is 4-byte aligned only on odd blocks, so `kv4<Q8_0>` spends four
+`s8` loads plus a scattered scale load per group. The ticket listed three candidates and said to prefer
+the one with no layout change if it clears the bar (a split plane or a 36-byte block would move the CPU
+store/read path, `copy_cells`, `map_q8_0_cells`, the FA-prefill staging and the C5 session version).
+
+**What landed.** The no-layout candidate: `34k + 2 + 4m` is **always 2-byte aligned** (`34k` is even
+for every `k`, and `4m` is), so two `unsigned short` loads replace the four `s8` loads for the same
+bytes. `q8_0_load4<WIDE>` / `kv4<LAYOUT,WIDE>` / `kv4_q8_0_packed<WIDE>` / a `Q8WIDE` template
+parameter on `attn_split_1w_body`, and a third arm in `launch_gqa_attn_split_q8_0`, selected once per
+process by `cuda::q8_kv_wide_enabled()` (`MINFER_NO_Q8_KV_WIDE=1` is the same-binary control). Three
+new launch sites, driven by the #162 test and added to the audit fixture. **No layout, CPU,
+copy-stride, session-format or `map_q8_0_cells` change.**
+
+**The bar, named before measuring.** (a) packed/f16 L1 load-sector ratio ≤ 1.30x; (b) same-binary
+`tg128` ≥ +2% over the #186 dp4a baseline 193.30, `pp2048` within 2%. **Measured: (a) met with margin
+— 792904 → 455840, ratio 1.712x → 0.9845x, instructions −2.17%; (b) NOT met — 193.13 → 193.65
+(+0.27%, 5 interleaved medians), the kernel itself only 1.4–1.7% faster (nsys 40320 → 39744 ns
+median).**
+
+**Honest result: a partial refutation.** The L1 request count moves exactly as the mechanism predicted
+and the decode step does not follow, so the 1.23x packed/f16 residual is **not** L1-request-bound —
+not L2 traffic (0.564x), not instruction count (1.10x), not load sectors (0.9845x). Landed
+counter-only, byte-identical (the `nt > 1` general kernel keeps the byte form; only the dp4a decode
+arm opts in), with the latency hypothesis (per-block scale load + `cvt` + V dequant on a 1-warp
+block's critical path) recorded for the next attribution rather than claimed. Mutation: swapping the
+two `u16` halves in `q8_0_load4_wide` turns `cuda_kv_q8_0_roundtrip_attn` red at max |Δ| = 2.5326836.
+Full record: [`cuda_optimization_steps/109`](./cuda_optimization_steps/109-c4-packed-q8-kv-l1-request.md).
+
+### Test infrastructure — #207: the CUDA count-row drift · [#207](https://github.com/yusiwen/minfer/issues/207) — **DONE 2026-09-27**
+
+**Why.** The CUDA rows are `live_check = false` recorded measurements (CI has no GPU), but they count
+the **same test binary plus the device-gated tests**: a CPU-only ticket that adds a feature-independent
+test moves both. [#140]'s K-quant encoder tests (7 passed / 1 ignored) and [#142]'s bf16 writer +
+CPU-path tests (7 passed / 2 ignored) did exactly that and left the row reading 548 / 0 / 39 while a
+device run on the branch reads **562 / 0 / 42** and both CUDA real-model rows read **42 / 0**; this was
+the second consecutive occurrence.
+
+**What landed.** Mechanism (c), chosen over a `pending` field and a rule line: `docs/status.toml`'s
+recorded rows may carry `projection_key` / `projection_box` / `projection_base_passed`, and
+`scripts/check_status.py --check` **prints** (never fails on) `passed + (cpu_now − base)` when the CPU
+twin has moved. The relation is inexact — the device-gated tests move independently — which is exactly
+why it is a hint and not a comparison; the point is that a stale recorded row cannot look current
+without a projection beside it. The unit/sanitizer rows project from `cpu-unit (aarch64)` and the two
+real-model rows from `cpu-real-model (aarch64)`, each with that row's `passed` at this measurement as
+the base, so all four hints are silent today and fire the moment a CPU ticket adds tests.
+`--selftest` gained a moved/not-moved pair (12/12 cases).
+
 
 
 **Why.** `minfer bench` on a CUDA build printed `CUDA kernel launch error: 1` between its two loops —

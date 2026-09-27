@@ -164,9 +164,20 @@ box = "GB10 sm_121"
 suite = "unit"
 command = "scripts/cuda_test.sh"
 date = "2026-09-27"
-passed = 548
+passed = 562
 failed = 0
-ignored = 39
+ignored = 42
+# #207: this row is a recorded measurement (CI has no GPU) refreshed only on a
+# device run, but it counts the same test binary plus the device-gated tests, so a
+# feature-independent test added by a CPU-only ticket moves it too.
+# `projection_*` names the CPU row that shares its binary and that row's `passed`
+# value at the moment this row was measured; `check_status.py --check` prints
+# (never fails on) `passed + (source_passed - projection_base_passed)`. The
+# relation is inexact -- the device-gated tests move independently -- which is why
+# it is a hint, not a comparison.
+projection_key = "cpu-unit"
+projection_box = "aarch64 (this box)"
+projection_base_passed = 481
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"
@@ -178,8 +189,11 @@ box = "GB10 sm_121"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-09-27"
-passed = 39
+passed = 42
 failed = 0
+projection_key = "cpu-real-model"
+projection_box = "aarch64 (this box)"
+projection_base_passed = 36
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"
@@ -191,8 +205,11 @@ box = "GB10 sm_121"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-09-27"
-passed = 39
+passed = 42
 failed = 0
+projection_key = "cpu-real-model"
+projection_box = "aarch64 (this box)"
+projection_base_passed = 36
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"
@@ -204,10 +221,14 @@ box = "GB10 sm_121"
 suite = "sanitizer"
 command = "compute-sanitizer --tool memcheck over scripts/cuda_test.sh"
 date = "2026-09-27"
-passed = 548
+passed = 562
 failed = 0
-ignored = 39
+ignored = 42
 api_errors = 0
+# Same #207 projection as the CUDA unit row: the sanitizer run is that same suite.
+projection_key = "cpu-unit"
+projection_box = "aarch64 (this box)"
+projection_base_passed = 481
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"

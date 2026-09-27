@@ -2679,16 +2679,20 @@ __device__ __forceinline__ const char* kv_row(const void* base, long long cell, 
     return reinterpret_cast<const char*>(base) + (size_t)cell * row_bytes;
 }
 
-template <int LAYOUT>
+// `WIDE` (issue #202) selects how a four-element Q8_0 group's quants are loaded:
+// false is the incumbent four byte loads, true is two 16-bit loads. It has no
+// meaning for F32/F16, whose loads are already one / two vector loads, so only
+// the `kv4<*, false>` specialisations exist for them.
+template <int LAYOUT, bool WIDE = false>
 __device__ __forceinline__ float4 kv4(const char* row, int elem);
 
 template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_F32>(const char* row, int elem) {
+__device__ __forceinline__ float4 kv4<KV_LAYOUT_F32, false>(const char* row, int elem) {
     return *reinterpret_cast<const float4*>(row + (size_t)elem * 4);
 }
 
 template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_F16>(const char* row, int elem) {
+__device__ __forceinline__ float4 kv4<KV_LAYOUT_F16, false>(const char* row, int elem) {
     const __half* p = reinterpret_cast<const __half*>(row) + elem;
     __half2 a = *reinterpret_cast<const __half2*>(p);
     __half2 b = *reinterpret_cast<const __half2*>(p + 2);
@@ -2697,29 +2701,77 @@ __device__ __forceinline__ float4 kv4<KV_LAYOUT_F16>(const char* row, int elem) 
     return make_float4(x.x, x.y, y.x, y.y);
 }
 
-template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0>(const char* row, int elem) {
+// The four quants of one 4-element group, as an `int` in little-endian byte
+// order, plus the group's Q8_0 block scale as a float.
+//
+// The incumbent load: four separate `signed char` accesses. A Q8_0 block is
+// `f16 d; i8 qs[32]` (34 B), so `blk + 2 + (elem & 31)` has no 4-byte alignment
+// guarantee (`34 * k` alternates parity) and no single 32-bit load can replace
+// them. #202 measured this as the L1 request-count cost of the packed cell: at
+// hd 64 the packed decode arm issues 1.71x the f16 arm's load sectors while
+// reading 0.57x its L2 sectors.
+__device__ __forceinline__ void q8_0_load4_bytes(
+    const unsigned char* blk, int off, int& q, float& d) {
+    d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const signed char* p = reinterpret_cast<const signed char*>(blk + 2) + off;
+    q = ((int)(unsigned char)p[0]) | ((int)(unsigned char)p[1] << 8) |
+        ((int)(unsigned char)p[2] << 16) | ((int)(unsigned char)p[3] << 24);
+}
+
+// #202: the same four bytes in HALF the load instructions. `34 * k + 2 + 4m` is
+// even for every block index `k` and every 4-element-aligned offset `4m` (`34k`
+// is even, `2 + 4m` is even), so a group is always 2-byte aligned even though it
+// is only 4-byte aligned when `k` is odd. Two `unsigned short` loads therefore
+// fetch the four bytes with two L1 requests instead of four, and the two halves
+// are recombined exactly as the byte loads were. The values are bit-identical to
+// `q8_0_load4_bytes`, so this is an access-pattern change, not a numerics change.
+__device__ __forceinline__ void q8_0_load4_wide(
+    const unsigned char* blk, int off, int& q, float& d) {
+    d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const unsigned char* p = blk + 2 + off;
+    const unsigned lo = *reinterpret_cast<const unsigned short*>(p);
+    const unsigned hi = *reinterpret_cast<const unsigned short*>(p + 2);
+    q = (int)(lo | (hi << 16));
+}
+
+template <bool WIDE>
+__device__ __forceinline__ void q8_0_load4(
+    const unsigned char* blk, int off, int& q, float& d) {
+    if (WIDE) q8_0_load4_wide(blk, off, q, d);
+    else q8_0_load4_bytes(blk, off, q, d);
+}
+
+template <bool WIDE>
+__device__ __forceinline__ float4 kv4_q8_0_impl(const char* row, int elem) {
     const unsigned char* blk =
         reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
-    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
-    const signed char* q = reinterpret_cast<const signed char*>(blk + 2) + (elem & 31);
-    return make_float4(d * (float)q[0], d * (float)q[1], d * (float)q[2], d * (float)q[3]);
+    int q;
+    float d;
+    q8_0_load4<WIDE>(blk, elem & 31, q, d);
+    return make_float4(d * (float)(signed char)(q & 0xff),
+                       d * (float)(signed char)((q >> 8) & 0xff),
+                       d * (float)(signed char)((q >> 16) & 0xff),
+                       d * (float)(signed char)((q >> 24) & 0xff));
+}
+
+template <>
+__device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0, false>(const char* row, int elem) {
+    return kv4_q8_0_impl<false>(row, elem);
+}
+
+template <>
+__device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0, true>(const char* row, int elem) {
+    return kv4_q8_0_impl<true>(row, elem);
 }
 
 // #186: the same four quants as `kv4<KV_LAYOUT_Q8_0>` but left in `int8`, packed
 // little-endian into one `int` for `__dp4a`, plus the block's f16 scale as a
-// float. The Q8_0 block is `f16 d; i8 qs[32]` (34 B), so `blk + 2 + (elem & 31)`
-// has no 4-byte alignment guarantee (`34 * k` alternates parity) and the four
-// bytes are loaded separately — the packing cost is what decides whether this
-// beats the convert-based load, which is the question the ticket exists to
-// answer.
+// float. #202's `WIDE` picks the two-16-bit-load form above.
+template <bool WIDE = false>
 __device__ __forceinline__ void kv4_q8_0_packed(const char* row, int elem, int& q, float& d) {
     const unsigned char* blk =
         reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
-    d = __half2float(*reinterpret_cast<const __half*>(blk));
-    const signed char* p = reinterpret_cast<const signed char*>(blk + 2) + (elem & 31);
-    q = ((int)(unsigned char)p[0]) | ((int)(unsigned char)p[1] << 8) |
-        ((int)(unsigned char)p[2] << 16) | ((int)(unsigned char)p[3] << 24);
+    q8_0_load4<WIDE>(blk, elem & 31, q, d);
 }
 
 // #144: dequantize EIGHT consecutive elements of one packed Q8_0 KV cell into
@@ -3302,7 +3354,7 @@ __global__ void gqa_attn_f32_f16kv(
 // f16 instantiations issue the same loads as before (`row_bytes = nk * hd * 4` is
 // the byte form of the old `stride_kv`), and the same cells are named in the same
 // order — only the address arithmetic moved into `kv_row` / `kv4`.
-template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false>
+template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false, bool Q8WIDE = false>
 __device__ __forceinline__ void attn_split_1w_body(
     const float* __restrict__ q,
     const void* __restrict__ k,
@@ -3388,18 +3440,19 @@ __device__ __forceinline__ void attn_split_1w_body(
             if (Q8DP4A) {
                 // The packed K word and its block scale; no float conversion.
                 if (use) {
-                    kv4_q8_0_packed(kv_row(k, cell[j], row_bytes), hk * hd + d0, ki4[j], kd4[j]);
+                    kv4_q8_0_packed<Q8WIDE>(
+                        kv_row(k, cell[j], row_bytes), hk * hd + d0, ki4[j], kd4[j]);
                 } else {
                     ki4[j] = 0;
                     kd4[j] = 0.0f;
                 }
             } else {
                 k4[j] = use
-                    ? kv4<LAYOUT>(kv_row(k, cell[j], row_bytes), hk * hd + d0)
+                    ? kv4<LAYOUT, Q8WIDE>(kv_row(k, cell[j], row_bytes), hk * hd + d0)
                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
             v4[j] = use
-                ? kv4<LAYOUT>(kv_row(v, cell[j], row_bytes), hk * hd + d0)
+                ? kv4<LAYOUT, Q8WIDE>(kv_row(v, cell[j], row_bytes), hk * hd + d0)
                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         #pragma unroll
@@ -3446,7 +3499,7 @@ __device__ __forceinline__ void attn_split_1w_body(
     }
 }
 
-template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false>
+template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false, bool Q8WIDE = false>
 __global__ void gqa_attn_split_partial(
     const float* __restrict__ q,
     const void* __restrict__ k,
@@ -3472,7 +3525,7 @@ __global__ void gqa_attn_split_partial(
         const int chunk0 = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
         if (((chunk0 + 3) >> 2) >= rpw_gate) return;
     }
-    attn_split_1w_body<LAYOUT, CAUSAL, MAP, Q8DP4A>(q, k, v, partial, bound, 0, row0, nkv,
+    attn_split_1w_body<LAYOUT, CAUSAL, MAP, Q8DP4A, Q8WIDE>(q, k, v, partial, bound, 0, row0, nkv,
                                             blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
                                             row_bytes, threadIdx.x);
 }
@@ -4957,14 +5010,28 @@ void launch_gqa_attn_split_f32kv(
 // process on the Rust side (`cuda::q8_kv_dp4a_enabled`, `MINFER_NO_DP4A_Q8_KV=1`
 // for the incumbent arm) and passed as a value so a captured decode graph cannot
 // see it change.
+//
+// #202: `wide` is the second, independent arm — the K and V four-quant groups are
+// fetched with two 16-bit loads instead of four byte loads (`q8_0_load4_wide`),
+// which halves the L1 request count for the same bytes. It is only meaningful on
+// the `dp4a` arm (the packed accessor); the convert arm keeps its byte loads for
+// the V side and only differs in arithmetic. `cuda::q8_kv_wide_enabled`
+// (`MINFER_NO_Q8_KV_WIDE=1` for the incumbent byte-load control) is resolved once
+// per process for the same captured-graph reason as `dp4a`.
 void launch_gqa_attn_split_q8_0(
     const float* q, const void* k, const void* v, float* o,
     float* partial, const int* bound, int mode,
     int n_head, int n_head_kv, int hd,
-    float scale, int pstr, size_t row_bytes, int dp4a, cudaStream_t stream
+    float scale, int pstr, size_t row_bytes, int dp4a, int wide, cudaStream_t stream
 ) {
     if (mode == ATTN_WIN_MAP) {
-        if (dp4a) {
+        if (dp4a && wide) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__map_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true,true,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true, true, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map_wide", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__map_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true,true,true>");
+        } else if (dp4a) {
             minfer_launch_prelude("launch:gqa_attn_split_q8_0__map_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true,true>");
             gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, true, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__map_dp4a", 32), 0, stream>>>(
                 q, k, v, partial, bound,
@@ -4978,7 +5045,13 @@ void launch_gqa_attn_split_q8_0(
             minfer_launch_ok("launch:gqa_attn_split_q8_0__map", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,true>");
         }
     } else if (mode == ATTN_WIN_SPAN) {
-        if (dp4a) {
+        if (dp4a && wide) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__span_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false,true,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false, true, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span_wide", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__span_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false,true,true>");
+        } else if (dp4a) {
             minfer_launch_prelude("launch:gqa_attn_split_q8_0__span_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false,true>");
             gqa_attn_split_partial<KV_LAYOUT_Q8_0, false, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__span_dp4a", 32), 0, stream>>>(
                 q, k, v, partial, bound,
@@ -4992,7 +5065,13 @@ void launch_gqa_attn_split_q8_0(
             minfer_launch_ok("launch:gqa_attn_split_q8_0__span", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,false,false>");
         }
     } else {
-        if (dp4a) {
+        if (dp4a && wide) {
+            minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false,true,true>");
+            gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false, true, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal_wide", 32), 0, stream>>>(
+                q, k, v, partial, bound,
+                n_head, n_head_kv, hd, scale, pstr, row_bytes, 0);
+            minfer_launch_ok("launch:gqa_attn_split_q8_0__causal_wide", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false,true,true>");
+        } else if (dp4a) {
             minfer_launch_prelude("launch:gqa_attn_split_q8_0__causal_dp4a", "gqa_attn_split_partial<KV_LAYOUT_Q8_0,true,false,true>");
             gqa_attn_split_partial<KV_LAYOUT_Q8_0, true, false, true><<<dim3(ATTN_SPLITS, n_head), minfer_launch_block("launch:gqa_attn_split_q8_0__causal_dp4a", 32), 0, stream>>>(
                 q, k, v, partial, bound,
