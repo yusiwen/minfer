@@ -317,6 +317,15 @@ pub struct ServerMetrics {
     pub jobs_admitted_total: AtomicU64,
     /// Jobs the worker could not place in a slot and answered with an error.
     pub jobs_dropped_total: AtomicU64,
+    /// #196: times `serve_loop`'s counted no-progress bound tripped — the worker
+    /// took `STALL_STEP_LIMIT` consecutive steps that left the engine busy with a
+    /// frozen `BatchEngine::work_units`, answered every live and queued request
+    /// with `500 server_error`, and stopped. Zero is the healthy value on every
+    /// engine, because a `tick` that leaves the engine busy has forwarded a row or
+    /// committed a token (and so moved the counter). Distinct from
+    /// `jobs_dropped_total`: that counts saturation rejections (`503 no idle
+    /// slot`), this counts the worker itself giving up.
+    pub worker_stalled_total: AtomicU64,
     /// Jobs in the worker's `pending` deque right now (exact, worker-published).
     pub worker_pending: AtomicU64,
     /// Requests occupying an engine slot right now (worker-published).
@@ -347,6 +356,7 @@ pub struct MetricsSnapshot {
     pub worker_pending: u64,
     pub running: u64,
     pub jobs_dropped_total: u64,
+    pub worker_stalled_total: u64,
     pub prompt_tokens_total: u64,
     pub completion_tokens_total: u64,
     /// Generated tokens/s over the trailing [`TOKEN_RATE_WINDOW_SECS`] (f64: it
@@ -405,6 +415,7 @@ impl ServerMetrics {
             worker_pending: self.worker_pending.load(r),
             running: self.running.load(r),
             jobs_dropped_total: self.jobs_dropped_total.load(r),
+            worker_stalled_total: self.worker_stalled_total.load(r),
             prompt_tokens_total: self.prompt_tokens_total.load(r),
             completion_tokens_total: self.completion_tokens_total.load(r),
             completion_tokens_per_second: self.token_window.rate(now_secs()),
@@ -488,6 +499,13 @@ pub fn render(m: &MetricsSnapshot) -> String {
         "Jobs the worker could not place in a slot and answered with an error.",
         "counter",
         m.jobs_dropped_total,
+    );
+    sample(
+        &mut out,
+        "minfer_worker_stalled_total",
+        "Times the worker's counted no-progress bound tripped: consecutive steps left the engine busy without advancing its work counter, so every live and queued request was answered 500 and the worker stopped.",
+        "counter",
+        m.worker_stalled_total,
     );
     sample(
         &mut out,
@@ -753,6 +771,7 @@ mod tests {
             worker_pending: 0,
             running: 0,
             jobs_dropped_total: 0,
+            worker_stalled_total: 0,
             prompt_tokens_total: 0,
             completion_tokens_total: 0,
             completion_tokens_per_second: 0.0,
@@ -827,6 +846,7 @@ mod tests {
             "minfer_requests_rejected_total",
             "minfer_requests_in_flight",
             "minfer_jobs_dropped_total",
+            "minfer_worker_stalled_total",
             "minfer_queue_depth",
             "minfer_worker_pending_jobs",
             "minfer_requests_running",
