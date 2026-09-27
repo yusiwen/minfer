@@ -66,6 +66,19 @@ can fail only because of that condition. If the control is refused earlier (a
 length check, an alignment check, an unset flag), it is not testing the
 condition.
 
+**The degenerate-input instance.** An arm can also fail to differ when the
+*fixture* lets the difference cancel, even though the code under test is wrong.
+[#186]'s new decode arm compared the packed `int` K dot against the
+dequantized-f32 reference — but it stored a **single** KV cell, so the softmax
+had one key and the K score cancelled out of the output entirely; mutating the
+`__dp4a` block base (`elem >> 5` → `elem >> 4`) still passed. The fix is to make
+the difference *observable* through the arm's own data — here, two cells read
+through an explicit `[0, 2)` span, so the score reaches the softmax weights — and
+then the same mutation is red (`max |Δ| = 0.35126442`). This is the same family
+as [#145]'s self-clearing assertion: before trusting a control, ask what the
+fixture does to the quantity the control is supposed to move, and assert that the
+quantity can move at all.
+
 ## 3. Every gate needs mutation evidence
 
 Break the thing the gate guards — with the implementation, not the test — watch
@@ -245,3 +258,4 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#173]: https://github.com/yusiwen/minfer/issues/173
 [#185]: https://github.com/yusiwen/minfer/issues/185
 [#175]: https://github.com/yusiwen/minfer/issues/175
+[#186]: https://github.com/yusiwen/minfer/issues/186

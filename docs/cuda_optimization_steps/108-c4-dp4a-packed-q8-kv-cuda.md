@@ -286,6 +286,13 @@ bumped, and the counter assertion fails. The A/B runs above use exactly that lev
   hd 64; hd-128 prefill uses the FA kernel, which dp4a does not touch).
 - The isolated load delta at hd 64 is cut by ~56-58%, and the real-path partial kernel
   by 41% (67.4 → 39.9 µs).
+- **The residual is filed, not just named.** The ncu attribution in §4 leaves a
+  concrete remainder — the packed arm's **1.71x** L1 load-sector count against f16's,
+  with 0.57x its L2 sectors — and it is tracked as
+  [#202](https://github.com/yusiwen/minfer/issues/202) with those four numbers, the exact
+  kernel names and shape, the mechanism, and the candidate layouts (split/aligned quant
+  plane, 36-byte block, 8-element loads). This is the piece between "the packed cache is
+  a memory win" and "the packed cache is decode-useful".
 - **Prefill / verify left alone, deliberately.** The `nt > 1` layout-tagged kernel
   (`gqa_attn_f32<...>`) also reads `kv4<Q8_0>`, and it measured **1.32x** slower than
   its f16 arm on the 0.5B prefill attention (32347 vs 24544 ns average, same nsys run).
