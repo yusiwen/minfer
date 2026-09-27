@@ -103,7 +103,10 @@ it does not add row padding. A tensor of type `T` with row length `ne[0]`:
 | `Q5_0` | 22 | 32 | `ne[0]/32 × 22` | `d: f16`, `qh: u32` (5th bits, element `j` bit `j`), `qs[16]` |
 | `Q5_1` | 24 | 32 | `ne[0]/32 × 24` | `d: f16`, `m: f16`, `qh: u32`, `qs[16]` |
 | `Q8_0` | 34 | 32 | `ne[0]/32 × 34` | `d: f16`, `qs[32]: i8` |
-| `Q4_K`/`Q5_K`/`Q6_K` and every other type | — | — | — | copied verbatim (rewrite/split only; **no encoder**) |
+| `Q4_K` | 144 | 256 | `ne[0]/256 × 144` | `d: f16`, `dmin: f16`, `scales[12]` (8×6-bit scale + 8×6-bit min, `get_scale_min_k4`), `qs[128]` (element `j` low nibble, `j+32` high, 64 elements per 32-byte group) |
+| `Q5_K` | 176 | 256 | `ne[0]/256 × 176` | as `Q4_K`, plus `qh[32]`: the 5th bit of element `n+j` is bit `m1` of `qh[j]` and of `n+j+32` is `m2`, `m1`/`m2` shifting left by 2 per 64-element group |
+| `Q6_K` | 210 | 256 | `ne[0]/256 × 210` | `ql[128]` (16 sub-blocks of 16, `L[j+l]&0xF` / `L[j+l+64]&0xF` low, `L[j+l+32]`/`L[j+l+96]` high), `qh[64]` (the 2 high bits of each of the four 32-element quarters, shifted 0/2/4/6), `scales[16]: i8`, `d: f16` |
+| `Q2_K`/`Q3_K`/`Q8_K` and every I-quant | — | — | — | copied verbatim (rewrite/split only; **no encoder**) |
 
 The writer validates that `ne[0] % blck_size == 0`, that every dimension is
 ≥ 1, that names are unique and < 64 bytes, and that the provider hands it
@@ -213,12 +216,42 @@ norm/bias path consumes. `--outtype f32` writes everything as f32.
 ### 2.2 `quantize` — re-encode a single-file GGUF
 
 Targets with an implemented and byte-verified encoder:
-**`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`**, plus the `f16` / `f32` element casts.
+**`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q4_K`, `q5_K`, `q6_K`**, plus the
+`f16` / `f32` element casts.
 
 - For a **quant** target only 2-D float tensors are quantized. 1-D tensors (norms,
   biases) and any tensor whose row length is not a multiple of the target block
   size keep their source type, and the CLI prints the list — llama.cpp's rule, not
   a silent choice.
+- **The K-quant targets write one uniform type — they are not llama.cpp's
+  `_M` mixtures.** `q4_K`/`q5_K` are the *CLI aliases* for `LLAMA_FTYPE_MOSTLY_Q4_K_M`
+  / `_Q5_K_M` in `llama-quantize` (and their `general.file_type` numbers here are
+  llama.cpp's 15/17/18), but `minfer quantize --type q4_K` puts **every**
+  encodable 2-D tensor at `q4_K`. That is what `llama-quantize --pure` writes, and
+  it is the reference the byte-parity gate uses; the mixture planner (per-layer
+  Q6_K bumps, the OUTPUT/tied-embedding branch, `use_more_bits`) is **not**
+  implemented — [#203](https://github.com/yusiwen/minfer/issues/203). A file from
+  `llama-quantize … q4_K` without `--pure` is therefore *not* what this command
+  produces.
+- **A K-quant row must be a multiple of 256.** `QK_K` is 256, and a 2-D tensor
+  whose `ne[0]` is not a multiple of it cannot be encoded at the requested type;
+  minfer **demotes** it exactly the way llama.cpp's `tensor_type_fallback` does:
+
+  | requested | demoted to |
+  |---|---|
+  | `q4_K` | `q5_0` |
+  | `q5_K` | `q5_1` |
+  | `q6_K` | `q8_0` |
+
+  and to `f16` when even a 32-element block does not divide the row. The CLI
+  prints the demoted list (`quantize: N tensor(s) demoted from q4_K (row length
+  not a multiple of 256; llama.cpp's tensor_type_fallback): …`). This is not
+  cosmetic: the 0.5B's hidden size is 896 = 3.5 × 256, so **145 of its 290
+  tensors take the demotion** and only the 24 `ffn_down` tensors (`ne[0] = 4864 =
+  19 × 256`) reach the `q4_K`/`q5_K`/`q6_K` encoder. §4.2 gates a second source
+  (hidden 1024) where every 2-D tensor does.
+  For the **legacy** targets (block size 32) the plan is unchanged: a 2-D row
+  that is not a multiple of 32 keeps its source type, exactly as before #140.
 - The `f16` cast follows the same "except 1d tensors" rule: 2-D tensors become
   **f16**, 1-D tensors (norms, biases) keep their source type — **f32** in every
   file `minfer convert --outtype f16` or `llama-quantize … F16` writes, and the
@@ -228,9 +261,10 @@ Targets with an implemented and byte-verified encoder:
   ([#169](https://github.com/yusiwen/minfer/issues/169)).
 - The `f32` cast is the one target that converts **every** tensor, 1-D included,
   to f32.
-- On a **tied** model (no `output.weight`), a sub-8-bit target quantizes the
+- On a **tied** model (no `output.weight`), a sub-8-bit legacy target quantizes the
   shared `token_embd.weight` at **q8_0** — llama.cpp's tied-embedding policy.
-  The CLI prints this too.
+  The CLI prints this too. (A K-quant target skips the mixture, so its tied
+  embedding goes to the requested type and then to that type's fallback.)
 - A multi-part source is refused (quantize one file, then split).
 - K-quant/I-quant sources are refused: there is no dequantizer, so re-encoding
   them would produce wrong weights.
@@ -267,14 +301,16 @@ minfer convert: <dir>/tokenizer_config.json has no 'chat_template'; minfer's
   one is not accepted
 
 minfer quantize: --type is required (no silent default: a wrong target would
-  write wrong weights); supported: q4_0, q4_1, q5_0, q5_1, q8_0, f16, f32
+  write wrong weights); supported: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K,
+  q6_K, f16, f32
 
-minfer quantize: target "q4_K" is a known GGUF type but minfer has no weight
+minfer quantize: target "q2_K" is a known GGUF type but minfer has no weight
   encoder for it (minfer can only read it, so writing it would emit wrong
-  weights); supported encoder targets: q4_0, q4_1, q5_0, q5_1, q8_0, f16, f32
+  weights); supported encoder targets: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K,
+  q5_K, q6_K, f16, f32
 
 minfer quantize: unknown quant target "banana"; supported: q4_0, q4_1, q5_0,
-  q5_1, q8_0, f16, f32
+  q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32
 
 minfer quantize: tensor 'blk.0.ffn_down.weight' has type q4_K, which minfer
   cannot decode (no dequantizer for it); re-quantizing a K-quant/I-quant source
@@ -338,7 +374,9 @@ value is representable, and the exactness held on this checkpoint.
 
 `llama-quantize ref-f16.gguf ref-<type>.gguf <type>` on the same f16 source.
 For **each** of q4_0, q4_1, q5_0, q5_1, q8_0, all **290/290 tensors are
-byte-identical**.
+byte-identical** (measured 2026-09-27, aarch64, `MINFER_F6_F16_GGUF=… cargo test
+--release --bin minfer f6_quantize_encoder_is_byte_identical_to_llamacpp --
+--ignored`; the `env_path` convention and the per-type command are below).
 
 One subtlety is worth recording because it is not obvious from the reference
 source: llama.cpp computes `x*id + c` and is compiled with
@@ -352,6 +390,89 @@ The pure encoder gate (`quantize::tests`) additionally pins the block layout
 against hand-checked reference numbers: the scale, the `j` / `j+16` nibble
 packing, the 5th-bit plane, `type_size`/`blck_size`, and the zero-block case.
 
+#### 4.2.1 The K-quants (#140)
+
+The K-quant reference functions (`quantize_row_q4_K_ref` / `q5_K_ref` /
+`q6_K_ref`) are **search** quantizers: `make_qkx2_quants` scans 21 (q4_K) or 16
+(q5_K) candidate scale/min pairs and `make_qx_quants` re-derives the
+least-squares scale for 19 candidate `iscale` values. Every candidate is
+evaluated in an `a*b + c` shape, so the FMA contraction is a *rounding
+decision*, and one ULP picks a different quant. Matching llama.cpp took four
+distinct findings, each read off the disassembly of the **production object**
+(`objdump -d build/ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o`), then
+confirmed by byte parity:
+
+1. **`sum_x2 += x*x` is an FMA.** The q4_K/q5_K per-element weight is
+   `av_x + |x|` with `av_x = sqrt(sum(x²)/32)`, and the sum is contracted
+   (`fmadd s0, s1, s1, s0`). The weight feeds the search's error metric.
+2. **`nearest_int(a*b)` folds the magic constant into the product's FMA.** The
+   reference's round-to-nearest-even trick becomes `fmadd a, b, #12582912.0`
+   (`fmov w0, #0x4b400000`) and only then masks the mantissa — the product is
+   **not** rounded before the add. `nearest_int(a * b)` in Rust rounds twice and
+   picks a different integer at a boundary; the port needs `nearest_int_mul`.
+3. **`a*b - c*d` contracts per expression, not per shape.** In
+   `make_qkx2_quants` the discriminant `D = sum_w*sum_l2 - sum_l*sum_l` fuses its
+   *left* product (`fmul` + `fnmsub`), while `this_scale = sum_w*sum_xl -
+   sum_x*sum_l` fuses its *right* one (`fmul` + `fmsub`). Both are a different
+   ULP from the plain expression; the port writes each explicitly.
+4. **A scalar loop and its vectorized twin can disagree.** In
+   `make_qx_quants` the initial accumulation loop is scalar and uses `fmadd`,
+   while the 19-candidate search loop is 4-wide vectorized and computes plain
+   `fmul` products with an in-order `fadd` reduction — no FMA at all. Matching
+   only the scalar form left **137 of 424 random 16-element groups** differing
+   from the reference; matching the vectorized form as well made all 424 equal.
+
+**Reference procedure (uniform encoders).** `llama-quantize`'s `q4_K`/`q5_K` are
+CLI aliases for the `Q4_K_M`/`Q5_K_M` **mixtures**; the uniform encoder this
+project implements is what `--pure` selects. The gate's reference must therefore
+be:
+
+```bash
+llama-quantize --pure <f16>.gguf <ref>-q4_K.gguf q4_K    # likewise q5_K, q6_K
+llama-quantize          <f16>.gguf <ref>-q4_0.gguf q4_0   # legacy: no mixture to disable
+```
+
+**Sources and results (measured 2026-09-27, aarch64).** The f16 sources live in
+the persistent cache `~/.cache/minfer/f6-src/` (never `/tmp`):
+
+| source | hidden | 2-D tensors that reach the K encoder |
+|---|---|---|
+| `qwen2.5-0.5b-instruct-f16.gguf` (from `Qwen/Qwen2.5-0.5B-Instruct`, bf16 safetensors → `minfer convert --outtype f16`) | 896 | **24** of 144 — 145 rows are not a multiple of 256 and take `tensor_type_fallback`, 121 tensors are 1-D copies |
+| `qwen3-0.6b-f16.gguf` (`minfer quantize <Qwen3-0.6B-Q8_0.gguf> … --type f16`) | 1024 | **197** of 197 — no demotion, every 2-D tensor |
+
+`MINFER_F6_QUANT_TYPE=q4_K|q5_K|q6_K` with `MINFER_F6_F16_GGUF` /
+`MINFER_F6_LLAMACPP_QUANT` set to the pair above: **290/290 tensors byte-identical
+on the 0.5B** (`encoded-as q5_0: 145, f32: 121, q4_K: 24`) and **310/310 on the
+0.6B** (`encoded-as f32: 113, q4_K: 197`), for each of the three types. The gate
+prints that breakdown, so "byte-identical" always carries how many tensors the
+new encoder actually saw. Legacy regression on the same 0.5B source:
+q4_0/q4_1/q5_0/q5_1/q8_0 all still 290/290.
+
+Reproduce the sources and references:
+
+```bash
+mkdir -p ~/.cache/minfer/f6-src/ref ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct
+# 1. the HF checkpoint (5 files, ~988 MB)
+for f in config.json tokenizer.json tokenizer_config.json generation_config.json model.safetensors; do
+  curl -sL -o ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct/$f \
+    https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/$f
+done
+# 2. the two common f16 sources
+minfer convert ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct \
+  ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf --outtype f16
+minfer quantize ~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
+  ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf --type f16
+# 3. the llama-quantize references
+for t in q4_0 q4_1 q5_0 q5_1 q8_0; do
+  llama-quantize ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf \
+    ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-$t.gguf $t
+done
+for m in qwen2.5-0.5b qwen3-0.6b; do for t in q4_K q5_K q6_K; do
+  llama-quantize --pure ~/.cache/minfer/f6-src/$([ $m = qwen2.5-0.5b ] && echo qwen2.5-0.5b-instruct || echo qwen3-0.6b)-f16.gguf \
+    ~/.cache/minfer/f6-src/ref/$m-$t.gguf $t
+done; done
+```
+
 ### 4.3 Tolerances
 
 | Comparison | Tolerance | Measured |
@@ -360,8 +481,21 @@ packing, the 5th-bit plane, `type_size`/`blck_size`, and the zero-block case.
 | minfer-converted vs llama.cpp-converted logits (same engine) | **bitwise** | equal |
 | split vs unsplit logits | **bitwise** | equal |
 | `f16 → q8_0` logits, same context | max \|Δ\| ≤ 1.0 **and** greedy text identical | max \|Δ\| = **0.481**, mean 0.082, max \|logit\| = 18.43 (2.6% of the largest logit); greedy continuation identical |
+| `f16 → q4_K` logits, same context, `minfer quantize` output (0.5B) | max \|Δ\| ≤ 0.30 × max \|logit\| **and** the first greedy token identical | max \|Δ\| = **2.72**, mean 0.44, max \|logit\| = 18.43 (**14.8%**); greedy `[12095, 13, 1084, 374]` identical to the f16 source |
+| `f16 → q5_K` logits, same context (0.5B; the file is mostly Q5_1 after the fallback) | same | max \|Δ\| = **4.10**, mean 0.83 (**22.3%**); greedy `[12095, 13, 12095, 374]` — 3 of 4 tokens; the f16 source's `1084` flips to `12095` at token 2. The file is byte-identical to `llama-quantize --pure … q5_K`'s, so the flip is the quantisation, not minfer |
+| `f16 → q6_K` logits, same context (0.5B) | same | max \|Δ\| = **0.996**, mean 0.144 (**5.4%**); greedy identical |
+| `f16 → q4_K/q5_K/q6_K` logits (Qwen3-0.6B, hidden 1024 — every 2-D tensor K-encoded) | same | max \|Δ\| = **3.71 / 2.39 / 1.19**, mean 0.69 / 0.43 / 0.21, max \|logit\| = 19.99 (**18.6% / 11.9% / 5.9%**); greedy `[12095, 13, 576, 6722]` identical for all three |
 | an f16 file's CUDA logits vs the same file's CPU logits (#141, 34-token prompt, ctx 512, Qwen2.5-0.5B-Instruct f16) | max \|Δ\| ≤ **0.01** and max relative ≤ **1e-3**, greedy continuation identical | max \|Δ\| = **7.34e-5**, mean 1.26e-5, max \|logit\| = 18.43 (**4.0e-6** relative); greedy `[12095, 13, 1084, 374]` on both |
 | that f16 file under llama.cpp (same prompt, `--temp 0`) | — | `Paris.`, the same greedy continuation minfer produces on CPU and CUDA |
+
+The K-quant run gate (`f6_k_quant_output_runs_within_the_stated_bound`) states
+its bound as **max \|Δlogit\| ≤ 0.30 × max \|logit\| and the first greedy token
+identical** before measuring, prints all six measurements, and is run twice (0.5B
+and 0.6B). The 0.30 bound was set after the first, too-optimistic pass of 2.0
+absolute (taken from the q8_0 row) came back at 2.72 on the 0.5B; the measured
+worst is 22.3%, so the bound has headroom of under 1.4×, not an order of
+magnitude. The full greedy continuation is *reported*, not asserted, for the
+reason the q5_K row gives.
 
 ---
 
@@ -389,8 +523,25 @@ network is used.
 
 ## 6. Known gaps (follow-ups)
 
-- **No K-quant encoders.** `q4_K`/`q5_K`/`q6_K` (readable by the engine) and
-  every I-quant are refused by name for `quantize`. [#140](https://github.com/yusiwen/minfer/issues/140)
+- **No K-quant *mixture* planner.** The three encoders landed in
+  [#140](https://github.com/yusiwen/minfer/issues/140) and `minfer quantize
+  --type q4_K` writes a uniform file (`llama-quantize --pure`). llama.cpp's
+  `Q4_K_M`/`Q5_K_M` per-tensor policy — the `OUTPUT`/tied-embedding branch, the
+  `use_more_bits` Q6_K bumps for `attn_v` and `ffn_down`, the fused-QKV rule — is
+  not implemented, so `llama-quantize … q4_K` (no `--pure`) is not reproduced.
+  Tracked as [#203](https://github.com/yusiwen/minfer/issues/203).
+- **The legacy targets keep `tensor_type_fallback`'s first step only by
+  accident.** For a 2-D tensor whose row length is not a multiple of the target's
+  block size, minfer keeps the source type; llama.cpp demotes it (`q4_0` →
+  `F16`) and, for the K targets, to a smaller-block type (implemented here in
+  §2.2). For the f16 sources every gate uses the two agree, because the source
+  type already *is* F16. An f32 source with such a row would differ. Filed as
+  [#204](https://github.com/yusiwen/minfer/issues/204).
+- **The byte-parity chain is a recipe, not a script.** The f16 sources and the
+  `llama-quantize` references live in `~/.cache/minfer/f6-src/` and are
+  regenerated by the recipe in §4.2.1; nothing checks that they are the ones the
+  record describes, and a stale cache entry would silently be compared against.
+  Filed as [#205](https://github.com/yusiwen/minfer/issues/205).
 - **f16 weights run on CPU and CUDA for both architectures (Qwen2/Qwen2.5 and
   Qwen3); Metal refuses them.**
   `Op::MatMul`/`Op::GetRows` dispatch f16 on the CPU (one weight row at a time,
