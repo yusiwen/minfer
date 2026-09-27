@@ -158,14 +158,22 @@ not be a gate's only failure signal.
 stepper in the `#[ignore]`d server gates now runs through one shared per-step
 `WorkBound` — a progress assertion plus `step_budget` — so a wedge in
 `BatchEngine::tick` fails the gating step in seconds instead of hanging the
-suite. The wall-clock bounds that remain are *named* and say at the call site
-why each is only a backstop: the `serve_loop` feeder's poll terminator
-(`FEEDER_POLL_BACKSTOP`) cannot rescue a wedge because the worker runs on the
-test's own thread, and the two `run_cli` child-process ceilings (1800s for the
-real-model sessions, 60s for the no-model registry cases) are cross-process hang
-guards, env-overridable through `MINFER_CLI_WATCHDOG_SECS`. The mutation seam is
-`MINFER_TEST_TICK` (see §3); the dated record and transcripts are
-[#160] in
+suite. **[#196] closed the case [#160] could not:** the two gates that drive the
+**production** `serve_loop` were outside any in-test bound, because a wedge kept
+the loop busy and the test thread never returned. `serve_loop` itself now carries
+the same invariant as a production guard — `STALL_STEP_LIMIT` consecutive steps
+that left the engine busy without advancing `BatchEngine::work_units` end the
+loop, answer every live **and** queued request once with a `500 server_error`, and
+move the `minfer_worker_stalled_total` counter — so both gates are wedge-proof
+with no test-side deadline, and a wedged server no longer spins at 100% CPU with
+clients left hanging. The wall-clock bounds that remain are *named* and say at
+the call site why each is only a backstop: the `serve_loop` feeder's poll
+terminator (`FEEDER_POLL_BACKSTOP`, now the last resort for a worker whose
+published metrics never settle rather than the only way out of a wedge), and the
+two `run_cli` child-process ceilings (1800s for the real-model sessions, 60s for
+the no-model registry cases) are cross-process hang guards, env-overridable
+through `MINFER_CLI_WATCHDOG_SECS`. The mutation seam is `MINFER_TEST_TICK`
+(see §3); the dated records and transcripts are [#160] and [#196] in
 [`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md)
 §test-infrastructure.
 
@@ -230,6 +238,7 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#154]: https://github.com/yusiwen/minfer/issues/154
 [#158]: https://github.com/yusiwen/minfer/issues/158
 [#160]: https://github.com/yusiwen/minfer/issues/160
+[#196]: https://github.com/yusiwen/minfer/issues/196
 [#165]: https://github.com/yusiwen/minfer/issues/165
 [#167]: https://github.com/yusiwen/minfer/issues/167
 [#171]: https://github.com/yusiwen/minfer/issues/171

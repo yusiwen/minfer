@@ -52,22 +52,30 @@ gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
 `PARALLEL=1`/`0` overrides. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions. The current counts live in
-`AGENTS.md` (each with its date, device and command). Three fixes now make the
+`AGENTS.md` (each with its date, device and command). Four fixes now make the
 parallel form trustworthy: the [server batching
 gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched rounds,
 a median verdict), [#158](https://github.com/yusiwen/minfer/issues/158) (a work
-bound instead of absolute wall-clock deadlines), and
+bound instead of absolute wall-clock deadlines),
 [#160](https://github.com/yusiwen/minfer/issues/160) (every `while engine.busy()`
 stepper in the server gates routed through one shared per-step `WorkBound` —
-progress plus a step budget, both counted, never a clock). A wedge injected with
-`MINFER_TEST_TICK=wedge` now fails each of those gates on its first step in under
-two seconds instead of hanging the suite; `=spin` exercises the step-budget arm.
-The wall-clock bounds that remain are **named backstops, not verdicts**: the two
-`run_cli` child-process ceilings (1800s for the real-model sessions, 60s for the
-no-model registry cases; `MINFER_CLI_WATCHDOG_SECS` overrides both) and the
-`serve_loop` feeder's `FEEDER_POLL_BACKSTOP`, which cannot rescue a wedge because
-the worker runs on the test's own thread. The rules behind all of this are
-[`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §3/§4 and the full records are
+progress plus a step budget, both counted, never a clock), and
+[#196](https://github.com/yusiwen/minfer/issues/196) (the production `serve_loop`
+itself carries the counted no-progress bound `STALL_STEP_LIMIT` = 64 consecutive
+steps, so the two gates that drive it are wedge-proof too, and a wedged server
+answers every live and queued request once and publishes
+`minfer_worker_stalled_total` instead of spinning). A wedge injected with
+`MINFER_TEST_TICK=wedge` now fails each of those gates in **seconds** instead of
+hanging the suite; `=spin` exercises the step-budget arm (the two `serve_loop`
+gates still have to be `--skip`ped there: a step that keeps moving the work
+counter is what a counter cannot catch — see the #196 record). The wall-clock
+bounds that remain are **named backstops, not verdicts**: the two `run_cli`
+child-process ceilings (1800s for the real-model sessions, 60s for the no-model
+registry cases; `MINFER_CLI_WATCHDOG_SECS` overrides both) and the `serve_loop`
+feeder's `FEEDER_POLL_BACKSTOP`, now the last resort for a worker whose published
+metrics never settle rather than the only way out of a wedge. The rules behind
+all of this are [`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §3/§4 and the full
+records are
 [`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md) §test-infrastructure.
 
 ## Git hooks (git-hooks.nix)
