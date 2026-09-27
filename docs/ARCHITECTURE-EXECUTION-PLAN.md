@@ -6732,3 +6732,128 @@ the "host stalls in this process" figure and its doc now says a gate must not re
 and its second arm uses the device's measured free bytes, so the gate neither reads nor mutates the
 environment.
 
+
+#### CUDA concurrency record (#188, 2026-09-27) — the stream, the capture window and the activation scratch become per `CudaBackend`
+
+**The defect #188 names.** [#185](https://github.com/yusiwen/minfer/issues/185) recorded the parallel
+`#[ignore]`d device suite's SIGSEGV as `cudaStreamBeginCapture(stream, 1)` — `cudaStreamCaptureModeGlobal` —
+racing a weight-registration `cudaMemcpy` that does not take the stream lock. Under Global semantics a
+driver call from **another** thread belongs to the capture window, so it either invalidates it
+(`cudaErrorStreamCaptureInvalidated`, 901: the benign mode, all over the run logs) or faults inside the
+driver (the recorded mode: `cuMemcpyHtoD_v2` under `register_weight` while another thread sat in
+`graph_end_capture_to_exec → cudaGraphInstantiate`). The reason one window could even be "the" window was
+structural: `static CUDA: OnceLock<Option<CudaState>>` gave the process **one stream**, so two engines
+could not capture independently at all. #185's `device_entry` token made the configuration a loud refusal;
+it did not make it correct.
+
+**The instrument, built first (gate contract rule 5 needs a number, and the raw crash rate was too low to
+judge a fix).** `graph::cuda_backend::tests::capture_window_on_one_thread_survives_a_weight_registration_on_another`
+opens a capture window on thread B, records a device→device copy into it, signals thread A, has A perform a
+weight registration **while the window is open**, then closes the window and checks both that
+`cudaStreamEndCapture` returned `0` (never 901; `cuda::last_capture_end_code`) and that the replayed graph
+produced the bytes the window recorded (the wrong value is seeded into `dst` first, so the value arm cannot
+pass on the setup — rule 1). Two env knobs make it the experiment: `MINFER_PROBE_STREAM=context` captures on
+`CudaState`'s own (blocking) stream — the pre-#188 shared-stream model — and
+`MINFER_PROBE_LEGACY_MEMCPY=1` uses the pre-#188 blocking `cudaMemcpy`;
+`MINFER_CUDA_CAPTURE_MODE=0|1|2` picks relaxed/global/thread-local. GB10 sm_121, 2026-09-27, 5 process runs
+per cell (90 s watchdog):
+
+| capture stream | registration | mode | result |
+|---|---|---|---|
+| context (blocking, shared) | blocking `cudaMemcpy` (pre-#188) | global (1, pre-#188) | **5/5 hang** |
+| context (blocking, shared) | blocking `cudaMemcpy` | thread-local (2) | **5/5 hang** |
+| context (blocking, shared) | blocking `cudaMemcpy` | relaxed (0) | **5/5 hang** |
+| instance (non-blocking) | stream-ordered (landed) | global (1) | 5/5 pass |
+| instance (non-blocking) | stream-ordered | **thread-local (2, adopted)** | **5/5 pass** |
+| instance (non-blocking) | stream-ordered | relaxed (0) | **5/5 `end_code=901`** |
+
+**The mode finding, measured rather than assumed.** (i) The blocking copy is a hard **deadlock** against a
+capture window on a blocking stream — the null stream implicitly synchronizes with every blocking stream,
+including the one that cannot complete until the host closes it — in **all three modes**. So the mode is
+*not* what fixes the historical setup; a stream-ordered copy on a per-instance non-blocking stream is.
+(ii) With the structural fix in place, `relaxed` still returns **901** in 5/5 runs (the probe's exact
+forbidden outcome; `cudaMalloc` inside the window also fails), so relaxed is ruled out by measurement.
+(iii) `global` passes the instance cell but is the mode that lets a foreign thread's call belong to the
+capture — the class this ticket exists to remove — so the adopted mode is
+**`cudaStreamCaptureModeThreadLocal` (2)**, which bounds invalidation to the capturing thread.
+
+**The structural change (both halves the ticket asks for).** `CudaBackend` now owns a
+`cudaStreamNonBlocking` stream (`CudaState::create_stream`, `#[188]`; created in `with_layout`, destroyed
+in `Drop` after the pool/scratch/host/graph teardown). `crate::cuda::bind_stream` publishes it in a
+thread-local for the duration of every backend device operation, and `CudaState::stream()` answers with
+it — so the ~60 launch/copy/event/capture/replay/synchronize helpers keep their signatures and follow the
+instance: the launchers, the pinned H2D ring (`write_input_async`), D2D (`copy_device_to_device`), the F5
+`copy_cross`/`await_cross` event path, `cudaGraphLaunch`/`graph_begin_capture`/`graph_end_capture_to_exec`,
+`state_sync`, `copy_cells` (`kv_move_rows`), `alloc_buffer`/`free_buffer` and `Drop`. **Per stream too**:
+the `buf_*` activation scratches became `StreamScratch` (a map keyed on the current stream), the `MmqCache`
+memo is keyed the same way (a hit records a scratch pointer, so a shared memo would hand one engine's
+plane to another), and the pinned staging ring is keyed on the stream. **Weight registration**
+(`CudaState::register_weight`) no longer issues a blocking `cudaMemcpy` at all: it queues the H2D copy on
+the **context** stream and waits on that stream, so it can never be recorded into a backend's window.
+Context-wide calls stay shared and are named as such: `cudaMalloc`/`cudaFree`, `cudaMemGetInfo`,
+`cudaHostAlloc`/`cudaFreeHost`, the weight registry and the derived planes. The process-wide
+`stream_lock`/`stream_guard` is gone — the capture window is the backend's own `capturing` field.
+Finally, the device tests that drive `cb.state.*` kernels **directly** (`store_kv_q8_0`,
+`gqa_attn_split*`, the q5_k/q6_k decode parities, the map-window A/B) now bind the backend's stream:
+a context-stream launch read back through an instance-stream sync was a race the shared stream used to
+hide, and the serial suite caught exactly two of them
+(`cuda_capture_staging_order_and_fallback`, `cuda_verify_attention_nt_invariance`) before the binding was
+added.
+
+**The negation: #185's guard is narrowed, and its test updated rather than deleted.** `device_entry`'s
+token no longer covers `BackendScheduler::execute` or `weight_reg::register_cuda_weight` — both are
+per-instance/stream-ordered now. It stays on the one path that still reaches `CudaState`'s helpers without
+a backend to bind: `CudaState::layer_gpu`, the legacy per-layer path, which drives the context-keyed
+`buf_*` scratches (the graph path and `main` do not call it). The module's docs and its test now state
+that scope, and the test asserts the refusal messages name the narrowed mechanism (`unbound`) and the one
+remaining path (`layer_gpu`). The **positive** property that replaces the refusal is the concurrent gate
+below.
+
+**The concurrent gate.** `models::qwen2::graph::tests::two_cuda_engines_forward_concurrently_and_stay_bitwise_identical`
+runs two CUDA engines (f32 and q8_0) on two OS threads, both caches alive across a barrier so the forwards
+genuinely overlap, and compares each engine's logits **bitwise** (`max |Δ| == 0`) against its own serial
+reference. It also asserts the two live backends hold **different** device stream pointers. The verdict is a
+value, not a timing, so the S4 map-window co-tenant gate ([#189](https://github.com/yusiwen/minfer/issues/189))
+does not decide it. GB10 sm_121, 2026-09-27:
+`[188] two CUDA engines forwarding on two threads (8 decode steps each): streams 0xe8f738039e60 vs
+0xe8f72c039de0; concurrent-vs-serial drift 0 / 0`.
+
+**Before/after on the parallel `#[ignore]`d configuration (`<test binary> --ignored`, default
+parallel, GB10 sm_121, 2026-09-27).** "Before" is master `440178b` with #185's guard call sites removed
+— i.e. the crashing configuration the guard was landed to suppress. "After" is this PR (which no longer
+routes the graph path or registration through the guard at all). Bare, 6 runs each:
+
+| | exit-ok | SIGSEGV | runs with test failures | failure set |
+|---|---|---|---|---|
+| before (guard removed) | **0 / 6** | **1 / 6** (rc 139, core dumped) | 6 / 6 (3, 5, 10, —, 5, 4 failures) | unstable: `900`/`901` launch refusals across `server::batch`, `conversation`, `a_session_resumed…` |
+| after (this PR) | **4 / 6** | **0 / 6** | 2 / 6 (1 each) | `cuda_map_window_costs…` (#189 timing gate) and `server_batch_matches_serial_and_is_faster` (#154 timing gate) |
+
+Under gdb (`gdb -batch -ex 'run --ignored' -ex 'thread apply all bt'`, 3 runs each): before **1 / 3**
+SIGSEGV (faulting inside `libcuda.so.1`), after **0 / 3**. The "after" run also **runs** the configuration instead of refusing it: 39
+tests pass in parallel, and the only failures left are the two known co-tenant timing gates — #189 (out
+of scope by the ticket) and #154's batch ratio.
+
+**Verification (rule 5 numbers).** All GB10 sm_121, 2026-09-27.
+`bash scripts/cuda_test.sh` → **545 / 0 / 39** (was 544 / 0 / 38; +1 the probe, +1 the concurrent gate,
+which is `#[ignore]`d). `cargo test --release` (CPU, this box) → **465 / 0 / 33** unit + **10 / 0 / 6**
+integration, unchanged — the renamed `device_entry` test keeps the count.
+`compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` →
+**0 API errors** over the same 545 / 0 / 39. The real-model device set
+(`FEATURES=cuda scripts/real_model_gates.sh`) → **39 / 0** for the 0.5B config and **39 / 0** for the
+Qwen3-0.6B config (was 38 / 0; +1 the concurrent gate).
+
+**Mutation evidence (rule 3).** (a) *Mode*: running the probe with `MINFER_CUDA_CAPTURE_MODE=0` (relaxed)
+makes it fail 5/5 with `end iteration 0: the capture window was invalidated (code 901 =
+cudaErrorStreamCaptureInvalidated)` — the probe detects exactly the outcome the acceptance forbids, and it
+is why relaxed was not adopted. (b) *Per-instance stream*: replacing `CudaBackend::with_layout`'s
+`state.create_stream()` with `state.stream()` (the pre-#188 shared stream) makes the concurrent gate die
+with **SIGSEGV (signal 11)** — the pre-#188 crash reproduced by one line — instead of reaching its
+`two different device streams` assertion.
+
+**What did not change / honest scope.** The legacy `layer_gpu` path and the direct `CudaState` scratch
+helpers (`upload_hidden`, `download_logits`, …) still share the context stream and its scratch; they are
+`#[allow(dead_code)]` legacy surface (the graph path is the production path) and the guard keeps them to
+one thread at a time. Metal is untouched. The device suite's own default stays `--test-threads=1`
+(`scripts/cuda_test.sh`): the two new gates are parallel-safe, but other device tests still mutate
+process-global state (`MINFER_GPU_MEM` history, timing gates) and the wrapper's serial default is not this
+ticket's to change.

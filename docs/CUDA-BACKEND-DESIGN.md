@@ -77,7 +77,7 @@ there is never a silent mid-run fallback.
 | Layer | File | Role |
 |---|---|---|
 | Graph executor | `src/graph/cuda_backend.rs` | Implements `Backend`: device buffer pool, per-op dispatch, positions conversion, CUDA Graph state machine, trace staging, error contract |
-| Device layer | `src/cuda.rs` | `CudaState` singleton: device probe, weight registry, the one stream + stream lock, `extern "C"` kernel launchers, CUDA Graph API, pinned/staging memory, MMQ caches and gate reads |
+| Device layer | `src/cuda.rs` | `CudaState` context: device probe, weight registry, the per-instance stream binding (`bind_stream`/`stream`/`create_stream`), `extern "C"` kernel launchers, CUDA Graph API, pinned/staging memory, per-stream activation scratches, MMQ caches and gate reads |
 | Device tier table | `src/device_tier.rs` | cc-keyed tier rows (measured GB10 + llama.cpp-adopted consumer rows + GENERIC) resolved once at init; feeds the MMQ gate, smem feasibility and plane-VRAM budget checks. Design + status: `DEVICE-ADAPTATION-PLAN.md`, docs 105–106 |
 | Kernels | `src/cuda_kernels.cu` | The `__global__` kernels (quantized matmul families, attention, norms, elementwise, KV store, embedding gather, quantize planes) |
 | Build chain | `build.rs` | Opt-in `--features cuda`, nvcc/`-ccbin` probe, per-arch SASS/PTX (incl. native sm_121), cudart link + rpath |
@@ -89,8 +89,9 @@ The split is deliberate: `cuda.rs` is the only place that touches the CUDA runti
 
 ```rust
 pub struct CudaBackend {
-    state: &'static crate::cuda::CudaState,   // process-wide device singleton
-    kv_f16: bool,                             // KV element type for this instance
+    state: &'static crate::cuda::CudaState,   // process-wide device context
+    stream: *mut c_void,                      // THIS instance's non-blocking stream (#188)
+    kv_layout: i32,                           // KV layout tag for this instance
     pool: Vec<CudaBuf>,                       // id -> { ptr, bytes }
     free: Vec<usize>,                         // byte-length-matched free list
     pool_gen: u64,                            // bumped on every pool allocation
@@ -99,8 +100,7 @@ pub struct CudaBackend {
     pos_memo: Option<(usize, u64)>,           // one-execution-window conversion memo
     graph_execs: Vec<CapturedGraph>,          // instantiated graphs
     graph_runs: HashMap<(u64, (usize, usize)), u32>, // warmup counters
-    capturing: Option<(u64, (usize, usize))>, // open capture window
-    stream_guard: Option<MutexGuard<'static, ()>>,
+    capturing: Option<(u64, (usize, usize))>, // open capture window (on `stream`)
     graphs_mode: GraphMode,                   // Enabled / Disabled
     prefill_capture: bool,                    // default ON (MINFER_NO_PREFILL_CAPTURE opts out)
     cap: crate::cuda::CaptureStaging,         // viz/trace async D2H staging
@@ -164,45 +164,100 @@ The graph-side CPU registry is separate: `register_graph_weights` registers into
 backend, which is what a CPU split of a mixed graph executes from; the CUDA registry is filled by the
 loaders at model-load time.
 
-### 2.4 Streams, locking and capture windows
+### 2.4 Streams, capture windows and the per-instance discipline
 
-Everything runs on **one stream**, and stream capture is per-stream rather than per-thread — so a
-process-wide `CudaState::stream_lock()` serializes stream use:
+Everything the device path issues — kernels, `cudaMemcpyAsync` staging, events,
+capture/replay, `synchronize` — runs on a **stream owned by the `CudaBackend`
+instance**, not on a process-wide one. That is the #188 change:
 
-- Normal operation: each backend call takes the lock for its own enqueues (`stream_guard()`).
-- While this backend has a capture window open, it **holds** the lock for the whole window (its own
-  enqueues skip re-locking); any other thread's stream work would otherwise be recorded into the
-  graph. Production runs a single engine thread, so the lock is uncontended.
-- `synchronize` closes a window (`close_capture_or_sync`: end capture, instantiate, launch once,
-  cache) or performs a plain stream sync. The sync also polls `cudaGetLastError`; since issue
-  [#145](https://github.com/yusiwen/minfer/issues/145) it reports what it finds as a **latched API
-  error observed by `cudaGetLastError`**, naming the `cudaGetErrorName` symbol and stating that it is
-  *not* attributed to a kernel. The old message ("CUDA kernel launch error: 1") blamed whatever
-  kernel had just ran for an error an earlier call had latched. The latched error is still counted
-  (`latched_api_error_count`) and cleared — never dropped — but the fix belongs at the call site that
-  discarded the return value.
+- `CudaState` stays the process-wide **context**: the device, the name-keyed weight
+  registry, the derived weight planes (`q6k_exp`/`q6k_dsc`/`q4k_dsc`/`w16_cache`) and
+  the `device_memory`/`host_alloc` queries are genuinely context-scoped and shared.
+- `CudaState::create_stream()` returns a fresh `cudaStreamNonBlocking` stream.
+  `CudaBackend::with_layout` creates one per instance (no stream, no backend) and
+  `Drop` destroys it after the pool, the scratches and the captured graphs.
+- Every `CudaBackend` device operation starts with `let _bound = self.bind()`.
+  `bind_stream` publishes the instance's stream in a thread-local;
+  `CudaState::stream()` answers with it, so the ~60 launch/copy/event helpers in
+  `cuda.rs` keep their signatures and still follow the instance. The stream
+  consumers, named:
 
-**Two threads is undefined behaviour, and since [#185](https://github.com/yusiwen/minfer/issues/185)
-it is refused before any driver call.** The lock above only serializes the paths that *take* it. The
-capture window is opened in **`cudaStreamCaptureModeGlobal`** (`cudaStreamBeginCapture(stream, 1)`), so
-a driver call from *another* thread that is not capture-safe invalidates the capture
-(`cudaErrorStreamCaptureInvalidated`, 901) — and, as the parallel `#[ignore]`d suite demonstrated on
-GB10, it can instead fault inside the driver. The path that does not take the lock is **weight
-registration**: `CudaState::register_weight` issues a plain blocking `cudaMalloc` + `cudaMemcpy`
-(H2D), not a stream-ordered operation. Two gdb backtraces of the SIGSEGV (2026-09-26) both show one
-thread at `cuMemcpyHtoD_v2` under `register_weight` while another is at `cuGraphInstantiateWithFlags`
-under `graph_end_capture_to_exec`/`synchronize`/`execute`. `src/device_entry.rs` now owns a
-process-wide, re-entrant-per-thread token: `scheduler::execute` takes it for the whole execution when
-the graph has a **`CUDA` split**, and `weight_reg::register_cuda_weight` takes it for each
-registration; a second *thread* is refused with the reason, the evidence and the remedy, without
-touching the driver. It is a **chokepoint, not a structural exclusion**: a caller that reaches
-`execute_node`/`synchronize`/`graph_replay_step`, or `CudaState::register_weight` directly, is still
-unguarded — see [#188](https://github.com/yusiwen/minfer/issues/188). The **device suite therefore runs one test at a time** — `scripts/cuda_test.sh`,
-i.e. `--test-threads=1`; a parallel `--ignored` run now fails loudly instead of segfaulting. The
-underlying limitation — the capture window and the device pool are process-wide, and the
-registration path has no stream ordering — is **not** fixed here; per-instance streams/capture
-contexts (or extending the capture discipline to every device call) is
-[#188](https://github.com/yusiwen/minfer/issues/188).
+  | Consumer | How it gets its stream |
+  |---|---|
+  | kernel launchers (`cuda.rs`, the MMQ/attention/fused families) | `self.stream()` → the bound instance stream |
+  | H2D input fill (`write_input_async`), D2D (`copy_device_to_device`), D2H staging (`copy_to_host_async`) | `self.stream()`; the pinned staging ring is keyed on the stream too |
+  | events (`record_event`, `stream_wait_event`) and the F5 `copy_cross`/`await_cross` hooks | `self.stream()` via `enqueue_cross_host`/`take_cross`, both of which bind |
+  | `cudaGraphLaunch` in `graph_replay_step`, `graph_begin_capture`, `graph_end_capture_to_exec` | `self.stream()` while the backend's own window is open |
+  | `synchronize` / `state_sync` | `self.stream()` — one stream sync, counted per backend |
+  | `copy_cells` (`kv_move_rows`) and `alloc_buffer`/`free_buffer` | the bound stream (the `cudaFree`/`cudaMalloc` themselves are context-wide) |
+  | `Drop for CudaBackend` | binds, then frees pool/scratch/host/graph, then destroys its stream |
+  | **weight registration** (`CudaState::register_weight`) | the **context** stream, never a backend's: an H2D copy queued on the context stream + `cudaStreamSynchronize(context)`, so it is stream-ordered and cannot be recorded into anybody's capture window |
+  | **context-wide, stays shared** | `cudaMalloc`/`cudaFree`, `cudaMemGetInfo` (`device_memory`), `cudaHostAlloc`/`cudaFreeHost` (`host_alloc`/`host_free`), the weight registry and the derived planes, `cudaGetLastError` |
+
+- **Activation scratch is per stream.** The `buf_hidden`/`buf_q8_prefill`/`buf_qa8_t`/
+  `buf_q8_decode`/`buf_attn_partial`/… slots are now `StreamScratch`, a map keyed on
+  the current stream, and the `MmqCache` memo is keyed the same way (a hit records a
+  scratch pointer, so a shared memo would hand one engine's plane to another). The
+  staging ring (`write_input_async`) is keyed on the stream for the same reason.
+  Everything unbound — the legacy layer path, direct `CudaState` tests — keys on the
+  context stream, which is why the #185 guard is **narrowed** to that path (§2.5).
+
+**Capture mode.** Windows are opened with `cudaStreamCaptureModeThreadLocal`
+(`graph_begin_capture`), not `cudaStreamCaptureModeGlobal`. Under Global another
+thread's capture-unsafe driver call belongs to the window: it either invalidates the
+capture (`cudaErrorStreamCaptureInvalidated`, 901) or faults inside the driver. The
+recorded SIGSEGV ([#185](https://github.com/yusiwen/minfer/issues/185)) was exactly
+that — one thread at `cuMemcpyHtoD_v2` under `register_weight` while another was at
+`cuGraphInstantiateWithFlags` under `graph_end_capture_to_exec`. Thread-local mode
+scopes invalidation to the capturing thread, so a registration on another thread is
+benign. `MINFER_CUDA_CAPTURE_MODE=0|1|2` overrides the mode (relaxed / global /
+thread-local) — it exists for the #188 probe's measurement, not for production.
+
+**The #188 probe is the instrument.** `graph::cuda_backend::tests::
+capture_window_on_one_thread_survives_a_weight_registration_on_another` opens a
+capture window on one thread and issues a weight-registration copy on another while
+the window is open, then closes it and checks both that `cudaStreamEndCapture`
+returned `0` (never 901) and that the replayed graph produced the bytes it recorded.
+It has two env knobs so the *mode* can be judged rather than assumed:
+`MINFER_PROBE_STREAM=context` captures on the context (blocking) stream — the pre-#188
+shared-stream model — and `MINFER_PROBE_LEGACY_MEMCPY=1` issues the registration with
+the pre-#188 blocking `cudaMemcpy`. Measured on GB10 sm_121, 5 process runs per cell
+(90 s watchdog; `crash` = the probe's own assertion failed), 2026-09-27:
+
+| capture stream | registration | mode | result |
+|---|---|---|---|
+| context (blocking), shared | blocking `cudaMemcpy` (pre-#188) | global (1, pre-#188) | **5/5 hang** |
+| context (blocking), shared | blocking `cudaMemcpy` | thread-local (2) | **5/5 hang** |
+| context (blocking), shared | blocking `cudaMemcpy` | relaxed (0) | **5/5 hang** |
+| instance (non-blocking) | stream-ordered (this PR) | global (1) | 5/5 pass |
+| instance (non-blocking) | stream-ordered | **thread-local (2, adopted)** | **5/5 pass** |
+| instance (non-blocking) | stream-ordered | relaxed (0) | **5/5 `end_code=901`** |
+
+Three measured readings, none assumed:
+
+1. **The blocking copy is a hard deadlock, independent of the mode.** A blocking
+   `cudaMemcpy` is issued on the legacy null stream, which implicitly synchronizes with
+   every **blocking** stream — including the one holding the open capture window, which
+   by construction cannot complete until the host closes it. All three modes hang 5/5.
+   So the mode is *not* the fix for the historical setup; a stream-ordered copy on a
+   non-blocking instance stream is.
+2. **Relaxed is ruled out by direct measurement.** With the structural fix in place,
+   `relaxed` still returns `cudaErrorStreamCaptureInvalidated` (901) — the exact code
+   the acceptance forbids — in 5/5 runs (`cudaMalloc` inside the window also fails,
+   `CUDA: failed to allocate 16384 bytes`). It is not adopted.
+3. **Thread-local is the mode.** With it, the probe passes 5/5 in both the pre-#188
+   shared-stream cell (the deadlock aside) and the instance cell; `global` also passes
+   the instance cell but is the mode that lets a *foreign* thread's driver call
+   belong to the capture, which is the class this ticket exists to remove.
+
+Two readings: the **mode** is what makes the historical shared-stream setup safe
+(global is not viable; thread-local and relaxed both are, and thread-local keeps the
+capturing thread's own mistakes fatal, so it is the one adopted), and the
+**structural** change makes the mode irrelevant by removing the sharing. The
+concurrent device gate
+(`models::qwen2::graph::tests::two_cuda_engines_forward_concurrently_and_stay_bitwise_identical`)
+is the positive half: two engines on two threads, two distinct streams, bitwise equal
+to their serial references.
 
 **The eager prefill-GEMM smem opt-in (issues [#145](https://github.com/yusiwen/minfer/issues/145) and
 [#147](https://github.com/yusiwen/minfer/issues/147)).**
@@ -284,12 +339,12 @@ The one llama.cpp idea still on the table as a step function is the **q8_1 GEMM-
 
 ### 4.1 `CudaBackend` lifecycle and state
 
-`new()` resolves the device singleton, snapshots the process-wide KV element type
-(`crate::cuda::kv_cache_is_f16()`), reads the two graph gates
-(`MINFER_NO_CUDA_GRAPH=1` → `GraphMode::Disabled`; `prefill_capture` defaults ON unless
-`MINFER_NO_PREFILL_CAPTURE=1`), and starts with an empty pool. `Drop` takes the stream guard (a
-`cudaFree` implicitly syncs, so it must serialize against an open capture window), frees every pool
-pointer, the positions scratch, and every captured graph exec.
+`with_layout()` resolves the device singleton, **creates the instance's own non-blocking stream**
+(issue #188; a device that cannot give one gives no backend), snapshots the engine's KV element type
+(`crate::cuda::layout_of`), reads the two graph gates (`MINFER_NO_CUDA_GRAPH=1` →
+`GraphMode::Disabled`; `prefill_capture` defaults ON unless `MINFER_NO_PREFILL_CAPTURE=1`), and
+starts with an empty pool. `Drop` binds the stream, frees every pool pointer, the positions scratch,
+the cross-backend staging and every captured graph exec, then destroys the stream.
 
 State groups:
 
@@ -298,7 +353,7 @@ State groups:
 | Device + KV policy | `state`, `kv_f16` | fixed at construction |
 | Pool | `pool`, `free`, `pool_gen` | grows on demand; `free_buffer` only recycles; `alloc_fresh` bypasses the list for split staging; `pool_gen` bumps on every allocation |
 | Positions | `pos_scratch`, `pos_scratch_bytes`, `pos_memo` | grown on demand; the scratch pointer is embedded in captured execs, so growth bumps `pool_gen` to force re-capture |
-| Capture | `graph_execs`, `graph_runs`, `capturing`, `stream_guard`, `graphs_mode`, `prefill_capture` | see §4.8 |
+| Capture | `graph_execs`, `graph_runs`, `capturing`, `graphs_mode`, `prefill_capture` (all on the instance's own stream) | see §4.8 |
 | Trace | `cap` | pinned async D2H staging, see §4.7 |
 
 Pool rules worth restating because they carry correctness weight:
@@ -309,8 +364,8 @@ Pool rules worth restating because they carry correctness weight:
 - **`alloc_fresh`** exists for split-boundary staging: ids in the free list are still referenced by
   `node_to_buf` and physically live during the execute that follows.
 - **OOM is not a panic.** `cuda_malloc` logs and returns null; the null buffer fails cleanly at
-  execute time (`ptr_of`). Panicking is forbidden because the backend may hold the process-wide
-  stream lock, and a panic under that mutex would poison it for every other user.
+  execute time (`ptr_of`). Panicking is forbidden because it would poison the shared scratch maps
+  and the device-entry token (the legacy path) for every other user.
 
 ### 4.2 Backend trait mapping
 
@@ -556,9 +611,10 @@ The state machine:
 5. Warmup: executions 1 and 2 of a key run direct launches (llama.cpp warms up twice); a one-shot
    prefill never reaches capture.
 6. On the third execution, if `nt_hint.map_or(true, |nt| nt == 1 || prefill_capture)`, the backend
-   takes the process-wide stream lock and opens a capture window around the node loop. The gate means
-   decode-shaped graphs always capture; prefill-shaped graphs capture only when `prefill_capture` is
-   on (default **ON** since R3-B; `MINFER_NO_PREFILL_CAPTURE=1` opts out).
+   opens a capture window on **its own stream**, in `cudaStreamCaptureModeThreadLocal` (§2.4) — no
+   process-wide lock, because no other backend shares this stream. The gate means decode-shaped
+   graphs always capture; prefill-shaped graphs capture only when `prefill_capture` is on (default
+   **ON** since R3-B; `MINFER_NO_PREFILL_CAPTURE=1` opts out).
 7. The window closes at the split's `synchronize` → `close_capture_or_sync`: end capture, instantiate,
    **launch once** so the step still produces output, cache the exec at the current `pool_gen` and
    `kv_layout`, then sync. A failure destroys the exec, logs loudly, and disables graphs for the
@@ -573,9 +629,9 @@ Two interactions are part of the contract:
 - **Trace/viz disables replay.** The scheduler skips `graph_replay` entirely while `MINFER_TRACE` or
   live viz capture is active, because per-node host readbacks inside a capture window are illegal.
 - **A node error inside the window aborts it** (`abort_capture`): end capture without launching,
-  destroy the exec, release the lock, disable graphs, sync. Later steps run direct-launch with graphs
-  disabled; the aborted step's outputs were never produced and are consumed as-is — there is no
-  poisoned-error mechanism, and the code says so explicitly.
+  destroy the exec, disable graphs, sync. Later steps run direct-launch with graphs disabled; the
+  aborted step's outputs were never produced and are consumed as-is — there is no poisoned-error
+  mechanism, and the code says so explicitly.
 
 ### 4.9 GPU safety (CUDA edition)
 
