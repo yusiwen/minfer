@@ -13,6 +13,18 @@ pub fn fp16_to_f32(h: Fp16) -> f32 {
     half::f16::from_bits(h).to_f32()
 }
 
+// === bf16 → f32 (issue #142) ===
+
+/// Convert one bf16 value (its 16 stored bits) to f32.
+///
+/// bf16 is f32's top 16 bits, so the decode is a left shift: **exact** for every
+/// value including NaNs (the payload bits are preserved). This is the same
+/// conversion as `ggml_bf16_to_fp32` / `GGML_BF16_TO_FP32`.
+#[inline]
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 // === Block byte-size constants (ggml-common.h) ===
 
 pub const Q4B: usize = 18; // sizeof(block_q4_0)

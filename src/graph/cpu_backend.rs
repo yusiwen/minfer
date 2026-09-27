@@ -498,6 +498,10 @@ impl Backend for CpuBackend {
                 } else if w.ttype == crate::tensor::TensorType::F16 {
                     // F6: f16 weights are decoded a row at a time (no f32 copy).
                     crate::vec_ops::mat_mul_f16(od, nt, id, out, w.data(), ins[0]);
+                } else if w.ttype == crate::tensor::TensorType::BF16 {
+                    // #142: the bf16 twin — a row decode (`bits << 16`) then the
+                    // plain f32 dot; still no f32 copy of the weight.
+                    crate::vec_ops::mat_mul_bf16(od, nt, id, out, w.data(), ins[0]);
                 } else {
                     // quantized weight × f32 activations (Q8_0-quantized on the fly)
                     kernel::cpu_quant_matmul_f32(w, ins[0], out, od, id, nt);
@@ -565,6 +569,22 @@ impl Backend for CpuBackend {
                         let base = id as usize * n_embd * 2;
                         for j in 0..n_embd {
                             out[t * n_embd + j] = crate::block::fp16_to_f32(u16::from_le_bytes([
+                                wd[base + 2 * j],
+                                wd[base + 2 * j + 1],
+                            ]));
+                        }
+                    }
+                } else if w.ttype == crate::tensor::TensorType::BF16 {
+                    // #142: bf16 embedding rows decoded in place (`bits << 16`).
+                    let wd = w.data();
+                    let vocab = w.shape[1] as usize;
+                    for (t, &id) in ids.iter().enumerate() {
+                        if (id as usize) >= vocab {
+                            return Err(format!("embedding id {id} >= vocab {vocab}"));
+                        }
+                        let base = id as usize * n_embd * 2;
+                        for j in 0..n_embd {
+                            out[t * n_embd + j] = crate::block::bf16_to_f32(u16::from_le_bytes([
                                 wd[base + 2 * j],
                                 wd[base + 2 * j + 1],
                             ]));

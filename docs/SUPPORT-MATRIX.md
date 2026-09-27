@@ -19,6 +19,7 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ❌⁵ |
+| **BF16** | 16 | 2 B / 1 val | ✅⁶ | — | ❌⁷ | ❌⁷ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
 ¹ Metal prefill uses a simdgroup GEMM for every quant type (dispatched when
@@ -52,6 +53,20 @@ convert --outtype f16` writes.
 weight with no kernel would be a silent wrong path, which is exactly what that
 check exists to prevent; the Metal f16 matmul/embed kernels are
 [#162](https://github.com/yusiwen/minfer/issues/162).
+⁶ BF16 weights ([#142](https://github.com/yusiwen/minfer/issues/142)): the CPU
+decodes one row at a time (`vec_ops::mat_mul_bf16`, exact
+`f32::from_bits(bits << 16)`, then the same `vec_dot_f32` the f16 row path uses)
+and the embedding rows in `Op::GetRows`. The decode is a left shift, so there is
+no separate SIMD kernel to mark in the AVX2 column (the dot itself is the
+vectorized `vec_dot_f32`). `minfer convert --outtype bf16` writes 2-D bf16 /
+1-D f32 and is byte-identical to `llama-quantize --pure <f32>.gguf … BF16`
+(docs/GGUF-TOOLING.md §4.1.1).
+⁷ **CUDA and Metal do not register bf16** (`models::weight_reg::cuda_weight_reg`
+answers `None` and neither loader's device branch admits the type), so a bf16
+GGUF drops to the CPU through the loader's all-or-nothing check — loudly, with
+its "weights are not usable there — running on CPU" line, never a silent wrong
+path. The device bf16 path is
+[#208](https://github.com/yusiwen/minfer/issues/208).
 
 **CUDA notes**: prefill (`nt ≥ 16`) runs the default int8 tensor-core MMQ path
 for the common quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K via the f16-wmma GEMM,
@@ -113,7 +128,7 @@ Notes:
 |----------|-------|
 | K-quants | Q2_K, Q3_K, Q8_K |
 | I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS |
-| Other | Q1_0, BF16, TQ1_0, TQ2_0, MXFP4, NVFP4 |
+| Other | Q1_0, TQ1_0, TQ2_0, MXFP4, NVFP4 |
 
 Q5_K and Q5_1 are **fully supported on CPU and both GPU backends** — Q5_K_M
 models run at full GPU speed.

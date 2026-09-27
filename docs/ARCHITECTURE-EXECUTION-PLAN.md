@@ -6129,12 +6129,18 @@ the Metal/CUDA weight registration accepts f32 and the supported quants only, so
 an f16 model runs the CPU path on a device build and that path is slow
 (measured ~3 tok/s prefill on the 0.5B); the device row therefore exercises a
 `minfer quantize`-produced q8_0 file ([#141](https://github.com/yusiwen/minfer/issues/141)).
-(c) **bf16 output is refused** ([#142](https://github.com/yusiwen/minfer/issues/142));
-f32 preserves every bf16 value exactly, so the conversion itself loses nothing.
+(c) bf16 output was refused at F6 and **landed in
+[#142](https://github.com/yusiwen/minfer/issues/142)** (`--outtype bf16`, 2-D
+bf16 / 1-D f32, round-to-nearest-even, byte-identical per tensor to
+`llama-quantize --pure <f32>.gguf … BF16`), together with the CPU bf16 weight
+path; CUDA and Metal still do not register bf16
+([#208](https://github.com/yusiwen/minfer/issues/208)).
 (d) The exactness claims are named per step: f16/f32 copies and f16→f32,
-bf16→f32 are bit-exact; **bf16→f16 is exact in the mantissa but can overflow**
-(no saturation, so an out-of-range value becomes inf rather than a wrong finite
-weight); **f32→f16 is not exact**. (e) The HF reference is llama.cpp's converter
+bf16→f32 are bit-exact; **bf16→f16 is exact in the mantissa but not in the
+exponent range** — it can overflow to inf, and below f16's smallest normal it
+rounds onto the subnormal grid (measured: 123 024 values on the 0.5B checkpoint,
+[#142](https://github.com/yusiwen/minfer/issues/142)); **f32→f16 is not exact**
+and neither is **f32→bf16** (RNE). (e) The HF reference is llama.cpp's converter
 output (byte-identical weights) plus, for logits/text, llama.cpp's own run —
 transformers was installed but not used as the logit reference, because the
 f16-vs-f16 byte comparison against llama.cpp's converter is the stronger claim.
