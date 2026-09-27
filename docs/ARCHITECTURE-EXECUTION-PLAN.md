@@ -4936,7 +4936,7 @@ unmutated gates on the same commands are **pass, exit 0** (0.5B: 3.09s / 0.21s; 
 
 **The `spin` arm still needs the two gates skipped — honest scope.** `MINFER_TEST_TICK=spin`
 advances `work_units` without ever completing a run, so by construction a step that keeps "moving"
-cannot trip a log of no-progress steps; the two `serve_loop` gates would still spin (they have no
+cannot trip a count of no-progress steps; the two `serve_loop` gates would still spin (they have no
 step budget, and adding one is exactly the shape #196 offers as its second, rejected alternative).
 The #160 command is unchanged:
 
@@ -4983,7 +4983,7 @@ The #160 command is unchanged:
   and #151 records predate that refactor); the server contract now lives in `FEATURES.md`,
   `USAGE.md` and `OPENAI-CHAT-API-PLAN.md`, which are the files updated here.
 
-**Docs.** `docs/GATE-CONTRACT.md` rule 4's [#160] paragraph now ends with the resolution (the
+**Docs.** `docs/GATE-CONTRACT.md` rule 4's [#160](https://github.com/yusiwen/minfer/issues/160) paragraph now ends with the resolution (the
 `serve_loop` gates are wedge-proof; `STALL_STEP_LIMIT`; `minfer_worker_stalled_total`;
 `FEEDER_POLL_BACKSTOP` demoted to a last resort). `docs/BUILD.md` § *Tests* and
 `scripts/real_model_gates.sh`'s mutation note record the same. Every `/metrics` enumeration
