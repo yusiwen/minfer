@@ -48,7 +48,12 @@ fn usage_quantize(prog: &str) -> String {
         "Usage: {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size BYTES]\n\
          \n\
          Re-encodes a single-file GGUF's 2-D float weights to <target>. One-dimensional\n\
-         tensors (norms, biases) keep their source type. Supported targets: {}.",
+         tensors (norms, biases) keep their source type. A 2-D tensor whose row length\n\
+         is not a multiple of a K-quant's 256-element block (q4_K/q5_K/q6_K) is demoted\n\
+         the way llama.cpp's tensor_type_fallback does it (q4_K->q5_0, q5_K->q5_1,\n\
+         q6_K->q8_0, or f16 when even a 32-element block does not divide the row).\n\
+         The K-quant targets write ONE uniform type (`llama-quantize --pure`); they are\n\
+         not llama.cpp's `Q4_K_M`/`Q5_K_M` mixtures. Supported targets: {}.",
         crate::quantize::SUPPORTED_TARGETS
     )
 }
@@ -287,11 +292,12 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         }
     };
     if !plan.preserved.is_empty() {
-        // The reason differs per target: a quant target also preserves a 2-D
-        // tensor whose row length is not block-aligned, while f16 preserves
-        // 1-D tensors only (its block size is 1, so the row-length clause would
-        // be meaningless). #169.
-        let why = if target == QuantTarget::F16 {
+        // The reason differs per target: a legacy quant target also preserves
+        // a 2-D tensor whose row length is not block-aligned, while f16 and
+        // the K-quants preserve 1-D tensors only (f16's block size is 1, so the
+        // row-length clause would be meaningless; a K-quant's unaligned rows
+        // are *demoted*, not preserved — see `plan.demoted`). #169, #140.
+        let why = if target == QuantTarget::F16 || target.row_len_fallback().is_some() {
             "1-D".to_string()
         } else {
             format!("1-D or row length not a multiple of {}", target.blck_size())
@@ -306,6 +312,16 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         eprintln!(
             "quantize: tied embedding quantized at q8_0 (llama.cpp's sub-8-bit policy): {}",
             plan.retargeted.join(", ")
+        );
+    }
+    if !plan.demoted.is_empty() {
+        eprintln!(
+            "quantize: {} tensor(s) demoted from {} (row length not a multiple of {}; \
+             llama.cpp's tensor_type_fallback): {}",
+            plan.demoted.len(),
+            target.name(),
+            target.blck_size(),
+            plan.demoted.join(", ")
         );
     }
     let result = match split_max {
@@ -771,7 +787,8 @@ mod tests {
     }
 
     /// Compare every tensor payload of two GGUFs by name (offset-independent).
-    fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) {
+    /// Returns the number of tensors compared.
+    fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) -> usize {
         let ma = crate::gguf::load_gguf_model(a_path).expect("a parses");
         let mb = crate::gguf::load_gguf_model(b_path).expect("b parses");
         let mut index = std::collections::HashMap::new();
@@ -800,6 +817,7 @@ mod tests {
         }
         assert_eq!(n, index.len(), "tensor set differs");
         assert!(n > 0);
+        n
     }
 
     /// G1: rewriting a cached GGUF through the writer is bit-exact.
@@ -1773,20 +1791,164 @@ mod tests {
         );
     }
 
+    /// Greedy continuation through whichever architecture the file declares —
+    /// the K-quant run-check gate runs on the same source it quantized, and the
+    /// 0.6B arm is Qwen3.
+    fn logits_greedy_any(
+        path: &Path,
+        prompt: &str,
+        steps: usize,
+        n_ctx: usize,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let gguf = crate::gguf::load_gguf_model(path).expect("parse GGUF");
+        let arch = gguf.parts[0]
+            .ctx
+            .get_key_val_str("general.architecture")
+            .unwrap_or_default();
+        let tok =
+            crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("strict tokenizer load");
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(0),
+        )
+        .expect("load model");
+        let ids = tok.encode(prompt);
+        if arch == "qwen3" {
+            let q = model
+                .as_any()
+                .downcast_ref::<crate::models::qwen3::Qwen3Model>()
+                .expect("Qwen3 model");
+            logits_greedy_on_qwen3(q, &ids, steps, n_ctx)
+        } else {
+            let q = model
+                .as_any()
+                .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+                .expect("Qwen2 model");
+            logits_greedy_on(q, &ids, steps, n_ctx)
+        }
+    }
+
+    /// G4c (#140): a K-quant file this module wrote **runs**.
+    ///
+    /// Byte parity alone is not the acceptance: the file has to load and
+    /// generate. The bounds are stated before measuring, in the §4.3 style:
+    /// **max |Δlogit| ≤ 0.30 × max |logit|** against the f16 source at the same
+    /// 4-token greedy context, and the **first greedy token identical** (the
+    /// highest-confidence decision). Everything is printed *before* the
+    /// assertions so a red run still reports its measurements. The full greedy
+    /// continuation is reported and deliberately **not** asserted: a 4-5-bit
+    /// quant can flip a later argmax, and the file is byte-identical to
+    /// `llama-quantize --pure`'s, so such a flip is a property of the
+    /// quantisation, not of minfer. On the 0.5B the q5_K arm flips token 2
+    /// (`1084` → `12095`); the q4_K/q6_K arms do not.
+    ///
+    /// Run it on `~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf` (hidden 1024) to
+    /// exercise the engine's K-quant decode path on *every* 2-D tensor, rather
+    /// than on the 0.5B's 24 tensors that are not demoted.
+    #[test]
+    #[ignore = "requires an f16 GGUF and writes ~0.5 GB under /tmp/f6-work"]
+    fn f6_k_quant_output_runs_within_the_stated_bound() {
+        let Some(src) = env_path(
+            "MINFER_F6_F16_GGUF",
+            "~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf",
+        ) else {
+            return;
+        };
+        let dir = work_dir("quant-k-run");
+        let src_gguf = crate::gguf::load_gguf_model(&src).expect("f16 source");
+        let (lf, gf) = logits_greedy_any(&src, PROMPT, 4, 512);
+        let max_logit = lf.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let mut results = Vec::new();
+        for target in [QuantTarget::Q4_K, QuantTarget::Q5_K, QuantTarget::Q6_K] {
+            let out = dir.join(format!("{}.gguf", target.name()));
+            let _ = std::fs::remove_file(&out);
+            let plan = QuantizePlan::plan(&src_gguf, target).expect("plan");
+            plan.write_single(&src_gguf, &out).expect("write");
+            let (lq, gq) = logits_greedy_any(&out, PROMPT, 4, 512);
+            assert!(
+                lq.iter().all(|v| v.is_finite()),
+                "{}: non-finite logits",
+                target.name()
+            );
+            let max_abs = lf
+                .iter()
+                .zip(lq.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let mean_abs = lf
+                .iter()
+                .zip(lq.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                / lf.len() as f32;
+            results.push((target, max_abs, mean_abs, gq));
+        }
+        for (t, max_abs, mean_abs, gq) in &results {
+            eprintln!(
+                "f6 k-quant run: {} on {} max |Δlogit| = {max_abs} (mean {mean_abs}), \
+                 max |logit| = {max_logit} ({:.3} relative), greedy {gq:?} \
+                 (f16 source greedy {gf:?}, {} of 4 tokens match)",
+                t.name(),
+                src.display(),
+                max_abs / max_logit.max(1.0),
+                gq.iter().zip(gf.iter()).filter(|(a, b)| a == b).count(),
+            );
+        }
+        for (t, max_abs, _, gq) in &results {
+            assert_eq!(
+                gq.first(),
+                gf.first(),
+                "{}: the first greedy token differs from the f16 source",
+                t.name()
+            );
+            assert!(
+                max_abs / max_logit.max(1.0) <= 0.30,
+                "{}: relative max |Δlogit| = {} (bound 0.30)",
+                t.name(),
+                max_abs / max_logit
+            );
+        }
+    }
+
     /// G4b: every weight encoder is byte-identical to llama.cpp's.
     ///
     /// `MINFER_F6_F16_GGUF` is the common f16 source and
-    /// `MINFER_F6_LLAMACPP_QUANT` is the file `llama-quantize <src> <out> <type>`
-    /// produced for the target named by `MINFER_F6_QUANT_TYPE` (default q4_0).
-    /// A single-nibble difference is a wrong file, so this is per-tensor byte
-    /// equality (the same comparison used for the HF conversion).
+    /// `MINFER_F6_LLAMACPP_QUANT` is the file
+    /// `llama-quantize --pure <src> <out> <type>` produced for the target named
+    /// by `MINFER_F6_QUANT_TYPE` (default q4_0; `q4_K`, `q5_K` and `q6_K` all
+    /// pass — `--pure` disables llama.cpp's k-quant *mixture* so every
+    /// 256-aligned 2-D tensor goes through the one reference encoder this gate
+    /// is about; a bare `q4_K` is the `Q4_K_M` mixture, see
+    /// `docs/GGUF-TOOLING.md` §4.2). A single-nibble difference is a wrong
+    /// file, so this is per-tensor byte equality (the same comparison used for
+    /// the HF conversion). The gate prints how many tensors each encoder
+    /// actually encoded — on the 0.5B (hidden 896) only 24 per K type, because
+    /// 145 rows are not a multiple of 256 and take llama.cpp's
+    /// `tensor_type_fallback`; the 0.6B (hidden 1024) is the arm where every
+    /// 2-D tensor goes through the K encoder.
+    ///
+    /// Defaults live in the **persistent** cache `~/.cache/minfer/f6-src/`
+    /// (f16 sources and llama-quantize references regenerated by the recipe in
+    /// `docs/GGUF-TOOLING.md` §4.2) — never `/tmp`. A missing env var (or a
+    /// default path that does not exist) prints "<var> not found at <path>;
+    /// skipping this F6 gate" through `env_path` and returns without
+    /// asserting. It prints that line, so a skipped run is visible in the
+    /// real-model set's output rather than silently green; the set is run by
+    /// `scripts/real_model_gates.sh` and its count is recorded in `AGENTS.md`.
     #[test]
     #[ignore = "requires an f16 GGUF plus a llama-quantize reference of the same target"]
     fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
-        let Some(src) = env_path("MINFER_F6_F16_GGUF", "/tmp/f6-work/ref-f16.gguf") else {
+        let Some(src) = env_path(
+            "MINFER_F6_F16_GGUF",
+            "~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf",
+        ) else {
             return;
         };
-        let Some(reff) = env_path("MINFER_F6_LLAMACPP_QUANT", "/tmp/f6-work/ref-q4_0.gguf") else {
+        let Some(reff) = env_path(
+            "MINFER_F6_LLAMACPP_QUANT",
+            "~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-q4_0.gguf",
+        ) else {
             return;
         };
         let tname = std::env::var("MINFER_F6_QUANT_TYPE").unwrap_or_else(|_| "q4_0".to_string());
@@ -1797,10 +1959,26 @@ mod tests {
         let src_gguf = crate::gguf::load_gguf_model(&src).expect("f16 source");
         let plan = QuantizePlan::plan(&src_gguf, target).expect("plan");
         plan.write_single(&src_gguf, &out).expect("write");
-        assert_tensor_payloads_equal(&out, &reff);
+        let n = assert_tensor_payloads_equal(&out, &reff);
+        // Per-*result* counts, not a bare "n/n": how many tensors the requested
+        // encoder actually saw, and how many took a demotion or a copy.
+        let mut by_type: Vec<(crate::gguf::GgmlType, usize)> = Vec::new();
+        for spec in &plan.specs {
+            match by_type.iter_mut().find(|(t, _)| *t == spec.type_) {
+                Some((_, c)) => *c += 1,
+                None => by_type.push((spec.type_, 1)),
+            }
+        }
+        let breakdown = by_type
+            .iter()
+            .map(|(t, c)| format!("{}: {c}", t.type_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
         eprintln!(
-            "f6 quantize parity: {tname} == llama-quantize on {} tensors",
-            plan.specs.len()
+            "f6 quantize parity: {tname} == llama-quantize on {n} tensors \
+             (encoded-as {breakdown}) [source {}, {} preserved as 1-D]",
+            src.display(),
+            plan.preserved.len(),
         );
     }
 }

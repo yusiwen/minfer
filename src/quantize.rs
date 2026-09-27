@@ -7,15 +7,16 @@
 // converter produces, so the reference functions there are the spec, and they
 // are gated byte-for-byte against `llama-quantize` output.
 //
-// Supported encoders: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 (plus the plain f16/f32
-// element casts). Every other GGUF type — including the K-quants this engine
-// can *read* (Q4_K/Q5_K/Q6_K) — has no encoder and is refused by name
+// Supported encoders: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the three K-quants this
+// engine reads (Q4_K, Q5_K, Q6_K), plus the plain f16/f32 element casts. Every
+// other GGUF type has no encoder and is refused by name
 // ([`QuantTarget::parse`]), never silently approximated.
 
 use crate::gguf::GgmlType;
 
 /// A quantize/convert target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)] // Q4_K/Q5_K/Q6_K are ggml's on-disk spellings
 pub enum QuantTarget {
     F32,
     F16,
@@ -24,27 +25,31 @@ pub enum QuantTarget {
     Q4_1,
     Q5_0,
     Q5_1,
+    Q4_K,
+    Q5_K,
+    Q6_K,
 }
 
 /// The targets this module can actually encode, spelled as the CLI accepts them.
-pub const SUPPORTED_TARGETS: &str = "q4_0, q4_1, q5_0, q5_1, q8_0, f16, f32";
+pub const SUPPORTED_TARGETS: &str = "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32";
 
 /// The GGUF types that exist in the format but have no encoder here. Listed so
 /// the refusal can say "known type, no encoder" instead of "unknown target" —
 /// the two are different failures and deserve different messages.
 const KNOWN_UNSUPPORTED: &[&str] = &[
-    "q2_K", "q3_K", "q4_K", "q5_K", "q6_K", "q8_K", "q8_1", "iq2_xxs", "iq2_xs", "iq3_xxs",
-    "iq1_s", "iq4_nl", "iq3_s", "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4",
-    "q1_0", "bf16", "f64", "i8", "i16", "i32", "i64",
+    "q2_K", "q3_K", "q8_K", "q8_1", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s",
+    "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4", "q1_0", "bf16", "f64", "i8",
+    "i16", "i32", "i64",
 ];
 
 impl QuantTarget {
     /// Parse a CLI target, refusing loudly and by name.
     ///
-    /// The K-quants are the interesting refusal: this engine *reads* Q4_K/Q5_K/
-    /// Q6_K at inference time, so "quantize to q4_K" looks supported and would
-    /// silently produce a file with wrong weights if the encoder were stubbed.
-    /// It is not stubbed; it is refused.
+    /// The I-quants and the K-quants without an encoder are the interesting
+    /// refusals: this engine *reads* Q4_K/Q5_K/Q6_K at inference time, so
+    /// "quantize to q2_K" looks supported and would silently produce a file
+    /// with wrong weights if the encoder were stubbed. It is not stubbed; it is
+    /// refused.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "f32" | "fp32" => Ok(QuantTarget::F32),
@@ -54,6 +59,9 @@ impl QuantTarget {
             "q4_1" => Ok(QuantTarget::Q4_1),
             "q5_0" => Ok(QuantTarget::Q5_0),
             "q5_1" => Ok(QuantTarget::Q5_1),
+            "q4_k" => Ok(QuantTarget::Q4_K),
+            "q5_k" => Ok(QuantTarget::Q5_K),
+            "q6_k" => Ok(QuantTarget::Q6_K),
             other => {
                 let known = KNOWN_UNSUPPORTED
                     .iter()
@@ -83,6 +91,9 @@ impl QuantTarget {
             QuantTarget::Q4_1 => "q4_1",
             QuantTarget::Q5_0 => "q5_0",
             QuantTarget::Q5_1 => "q5_1",
+            QuantTarget::Q4_K => "q4_K",
+            QuantTarget::Q5_K => "q5_K",
+            QuantTarget::Q6_K => "q6_K",
         }
     }
 
@@ -95,19 +106,30 @@ impl QuantTarget {
             QuantTarget::Q4_1 => GgmlType::Q4_1,
             QuantTarget::Q5_0 => GgmlType::Q5_0,
             QuantTarget::Q5_1 => GgmlType::Q5_1,
+            QuantTarget::Q4_K => GgmlType::Q4_K,
+            QuantTarget::Q5_K => GgmlType::Q5_K,
+            QuantTarget::Q6_K => GgmlType::Q6_K,
         }
     }
 
     /// llama.cpp's `llama_ftype` value for `general.file_type`.
+    ///
+    /// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's CLI vocabulary
+    /// (`LLAMA_FTYPE_MOSTLY_Q4_K_M` = 15, `_Q5_K_M` = 17); `q6_K` is 18. The
+    /// value describes the ftype, and a file whose tensors are all one K type
+    /// is what `--pure` writes under the same number.
     pub fn file_type(self) -> u32 {
         match self {
-            QuantTarget::F32 => 0,  // LLAMA_FTYPE_ALL_F32
-            QuantTarget::F16 => 1,  // LLAMA_FTYPE_MOSTLY_F16
-            QuantTarget::Q4_0 => 2, // LLAMA_FTYPE_MOSTLY_Q4_0
-            QuantTarget::Q4_1 => 3, // LLAMA_FTYPE_MOSTLY_Q4_1
-            QuantTarget::Q8_0 => 7, // LLAMA_FTYPE_MOSTLY_Q8_0
-            QuantTarget::Q5_0 => 8, // LLAMA_FTYPE_MOSTLY_Q5_0
-            QuantTarget::Q5_1 => 9, // LLAMA_FTYPE_MOSTLY_Q5_1
+            QuantTarget::F32 => 0,   // LLAMA_FTYPE_ALL_F32
+            QuantTarget::F16 => 1,   // LLAMA_FTYPE_MOSTLY_F16
+            QuantTarget::Q4_0 => 2,  // LLAMA_FTYPE_MOSTLY_Q4_0
+            QuantTarget::Q4_1 => 3,  // LLAMA_FTYPE_MOSTLY_Q4_1
+            QuantTarget::Q8_0 => 7,  // LLAMA_FTYPE_MOSTLY_Q8_0
+            QuantTarget::Q5_0 => 8,  // LLAMA_FTYPE_MOSTLY_Q5_0
+            QuantTarget::Q5_1 => 9,  // LLAMA_FTYPE_MOSTLY_Q5_1
+            QuantTarget::Q4_K => 15, // LLAMA_FTYPE_MOSTLY_Q4_K_M
+            QuantTarget::Q5_K => 17, // LLAMA_FTYPE_MOSTLY_Q5_K_M
+            QuantTarget::Q6_K => 18, // LLAMA_FTYPE_MOSTLY_Q6_K
         }
     }
 
@@ -115,12 +137,32 @@ impl QuantTarget {
     pub fn blck_size(self) -> usize {
         match self {
             QuantTarget::F32 | QuantTarget::F16 => 1,
+            QuantTarget::Q4_K | QuantTarget::Q5_K | QuantTarget::Q6_K => K_QUANT_BLOCK,
             _ => 32,
+        }
+    }
+
+    /// The type llama.cpp's `tensor_type_fallback` demotes this one to when a
+    /// 2-D tensor's row length is not a multiple of the target's block size
+    /// (`GGML_TYPE_QK_K`-block types demote to a legacy 32-block type).
+    pub fn row_len_fallback(self) -> Option<QuantTarget> {
+        match self {
+            QuantTarget::Q4_K => Some(QuantTarget::Q5_0),
+            QuantTarget::Q5_K => Some(QuantTarget::Q5_1),
+            QuantTarget::Q6_K => Some(QuantTarget::Q8_0),
+            _ => None,
         }
     }
 }
 
 // === Element decoding (GGUF bytes → f32) ===
+
+/// `QK_K` — the elements per block of every K-quant (ggml-common.h).
+pub const K_QUANT_BLOCK: usize = 256;
+
+/// llama.cpp's `GROUP_MAX_EPS` (ggml-quants.c): a sub-block whose largest
+/// magnitude is below this is treated as all-zero and gets a zero scale.
+const GROUP_MAX_EPS: f32 = 1e-15;
 
 /// Whether [`decode_to_f32`] can decode this type without the data (for
 /// planning: a K-quant source is refused before a single byte is read).
@@ -253,6 +295,14 @@ fn put_f16(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
 }
 
+/// Append already-rounded f16 bits (the K-quant reference stores `d`/`dmin` as
+/// f16 and then reads them back for the final re-round, so the bits are the
+/// value that matters).
+#[inline]
+fn put_f16_bits(out: &mut Vec<u8>, bits: u16) {
+    out.extend_from_slice(&bits.to_le_bytes());
+}
+
 // === Encoders (llama.cpp refs, verbatim arithmetic) ===
 
 /// Quantize a flat run of f32 (a whole row, or a whole tensor whose rows are
@@ -275,6 +325,9 @@ pub fn quantize_row(target: QuantTarget, x: &[f32]) -> Vec<u8> {
         QuantTarget::Q4_1 => quantize_q4_1(x),
         QuantTarget::Q5_0 => quantize_q5_0(x),
         QuantTarget::Q5_1 => quantize_q5_1(x),
+        QuantTarget::Q4_K => quantize_q4_k(x),
+        QuantTarget::Q5_K => quantize_q5_k(x),
+        QuantTarget::Q6_K => quantize_q6_k(x),
     }
 }
 
@@ -419,6 +472,472 @@ fn roundf(v: f32) -> f32 {
     v.round()
 }
 
+// === K-quant encoders (llama.cpp's `quantize_row_q{4,5,6}_K_ref`) ===
+//
+// The K-quant reference is searching: `make_qkx2_quants` scans `nstep + 1`
+// candidate scale/min pairs, and `make_qx_quants` re-derives the least-squares
+// scale for 19 candidate `iscale` values, keeping the best by weighted error.
+// Every candidate is evaluated in the same `a*b + c` shape, so each one is a
+// rounding decision the FMA contraction can move by one quant. The whole
+// arithmetic below therefore mirrors the C line for line — including which
+// products are fused, which is *not* a free choice: it is what `-ffp-contract=fast`
+// does to the C, and a plain `a * b + c` here differs from `llama-quantize` at
+// exact rounding boundaries (see `docs/GGUF-TOOLING.md` §4.2).
+
+/// llama.cpp's `nearest_int`: round to nearest, ties to **even**, via the
+/// `fval + 1.5·2²³` mantissa trick — not `f32::round`, which rounds ties away
+/// from zero. At an exact `.5` the two differ by one, which is one quant.
+#[inline]
+fn nearest_int(fval: f32) -> i32 {
+    let val = fval + 12_582_912.0f32;
+    let i = val.to_bits() as i32;
+    (i & 0x007f_ffff) - 0x0040_0000
+}
+
+/// `nearest_int(a * b)`: `-ffp-contract=fast` folds the magic constant into the
+/// product's FMA. The production object emits `fmadd s0, a, b, #12582912.0`
+/// (`fmov w0, #0x4b400000`) and only then reads the mantissa, so the product is
+/// **not** rounded before the add. Writing `nearest_int(a * b)` rounds twice and
+/// picks a different integer at a boundary.
+#[inline]
+fn nearest_int_mul(a: f32, b: f32) -> i32 {
+    let val = a.mul_add(b, 12_582_912.0f32);
+    let i = val.to_bits() as i32;
+    (i & 0x007f_ffff) - 0x0040_0000
+}
+
+/// The weight `make_qx_quants` assigns to element `i` when no explicit `qw`
+/// was supplied: `rmse_type` 1 → `x²`, 2 → `1`, 3 → `|x|`, else `sqrt(|x|)`.
+#[inline]
+fn rmse_weight(rmse_type: i32, x: f32) -> f32 {
+    match rmse_type {
+        1 => x * x,
+        2 => 1.0,
+        3 => x.abs(),
+        _ => x.abs().sqrt(),
+    }
+}
+
+/// llama.cpp's `make_qx_quants` (ggml-quants.c), verbatim arithmetic.
+///
+/// Returns the scale and writes `nmax`-offset quants into `l`. Only the
+/// `rmse_type == 1, qw == None` configuration is reached from q6_K, but the
+/// whole search is ported so the function is the reference's function.
+fn make_qx_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    l: &mut [i8],
+    rmse_type: i32,
+    qw: Option<&[f32]>,
+) -> f32 {
+    let (mut max, mut amax) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let ax = x[i].abs();
+        if ax > amax {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        // all zero
+        for v in l[..n].iter_mut() {
+            *v = 0;
+        }
+        return 0.0;
+    }
+    let mut iscale = -(nmax as f32) / max;
+    if rmse_type == 0 {
+        for i in 0..n {
+            let li = nearest_int_mul(iscale, x[i]);
+            l[i] = (nmax + li.clamp(-nmax, nmax - 1)) as i8;
+        }
+        return 1.0 / iscale;
+    }
+    let mut return_early = false;
+    let mut rmse_type = rmse_type;
+    if rmse_type < 0 {
+        rmse_type = -rmse_type;
+        return_early = true;
+    }
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (li + nmax) as i8;
+        let w = qw.map_or_else(|| rmse_weight(rmse_type, x[i]), |q| q[i]);
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * li as f32).mul_add(li as f32, suml2);
+    }
+    let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
+    if return_early {
+        return if suml2 > 0.0 {
+            0.5 * (scale + 1.0 / iscale)
+        } else {
+            1.0 / iscale
+        };
+    }
+    let mut best = scale * sumlx;
+    for is in -9..=9i32 {
+        if is == 0 {
+            continue;
+        }
+        iscale = -0.1f32.mul_add(is as f32, nmax as f32) / max;
+        // The search loop is *vectorized* by GCC (4-wide), and the reduction is
+        // a plain `fmul` product per element plus an in-order `fadd` sum — it
+        // does NOT contract the `+=` into an FMA, unlike the scalar initial loop
+        // above. The two therefore round differently, and the search's verdict
+        // depends on it. (Read off `make_qx_quants.constprop.1`.)
+        sumlx = 0.0;
+        suml2 = 0.0;
+        for i in 0..n {
+            let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+            let w = qw.map_or_else(|| rmse_weight(rmse_type, x[i]), |q| q[i]);
+            let lf = li as f32;
+            sumlx += (w * x[i]) * lf;
+            suml2 += (w * lf) * lf;
+        }
+        if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
+            for i in 0..n {
+                let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+                l[i] = (li + nmax) as i8;
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    scale
+}
+
+/// llama.cpp's `make_qkx2_quants` (ggml-quants.c), `use_mad == false`.
+///
+/// This is the search q4_K and q5_K use: `nstep + 1` candidate `iscale` values,
+/// each ranked by the weighted squared error of its best-fit `(scale, min)`.
+#[allow(clippy::too_many_arguments)]
+fn make_qkx2_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    the_min: &mut f32,
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+) -> f32 {
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x = w.mul_add(x[i], sum_x);
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for v in l[..n].iter_mut() {
+            *v = 0;
+        }
+        *the_min = -min;
+        return 0.0;
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let li = nearest_int_mul(iscale, x[i] - min);
+        l[i] = li.clamp(0, nmax) as u8;
+        let diff = scale.mul_add(l[i] as f32, min) - x[i];
+        let diff = diff * diff;
+        best_error = weights[i].mul_add(diff, best_error);
+    }
+    if nstep < 1 {
+        *the_min = -min;
+        return scale;
+    }
+    for is in 0..=nstep {
+        iscale = (rdelta.mul_add(is as f32, rmin) + nmax as f32) / (max - min);
+        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let li = nearest_int_mul(iscale, x[i] - min).clamp(0, nmax);
+            laux[i] = li as u8;
+            let w = weights[i];
+            let lf = li as f32;
+            let wl = w * lf;
+            sum_l += wl;
+            sum_l2 = wl.mul_add(lf, sum_l2);
+            sum_xl = wl.mul_add(x[i], sum_xl);
+        }
+        // `a*b - c*d` contracts as `fma(a, b, -(c*d))` — the *left* product
+        // is the fused one (the production object computes this with
+        // `fmul` + `fnmsub`). All three of these are rounding boundaries the
+        // search ranks candidates by, so the contraction is load-bearing.
+        let d = sum_w.mul_add(sum_l2, -(sum_l * sum_l));
+        if d > 0.0 {
+            let mut this_scale = sum_x.mul_add(-sum_l, sum_w * sum_xl) / d;
+            let mut this_min = sum_l2.mul_add(sum_x, -(sum_l * sum_xl)) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale.mul_add(laux[i] as f32, this_min) - x[i];
+                let diff = diff * diff;
+                cur_error = weights[i].mul_add(diff, cur_error);
+            }
+            if cur_error < best_error {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    scale
+}
+
+/// llama.cpp's `get_scale_min_k4`: unpack sub-block `j`'s 6-bit scale and min
+/// from the 12-byte packed `scales` field.
+#[inline]
+fn get_scale_min_k4(j: usize, q: &[u8; 12]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// What `quantize_row_q4_K_ref` and `quantize_row_q5_K_ref` share: the eight
+/// `make_qkx2_quants` sub-blocks, the 6-bit scale/min packing and the final
+/// re-round of every quant against the *stored* (f16-rounded) `d`/`dmin`.
+///
+/// `nmax` is 15 for q4_K and 31 for q5_K; `rmin`/`nstep` are the reference's
+/// per-type search parameters.
+fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16, u16, [u8; 256]) {
+    let mut weights = [0.0f32; 32];
+    let mut mins = [0.0f32; 8];
+    let mut scales = [0.0f32; 8];
+    let mut l_all = [0u8; 256];
+    let mut laux = [0u8; 32];
+    let mut max_scale = 0.0f32;
+    let mut max_min = 0.0f32;
+    for j in 0..8 {
+        let xb = &x[32 * j..32 * j + 32];
+        // llama.cpp weights each element by `av_x + |x|` with
+        // `av_x = sqrt(sum(x²)/32)`. The sum is contracted to an FMA by
+        // `-ffp-contract=fast` (seen as `fmadd s0, s1, s1, s0` in the
+        // production object), and the weight moves the search's error metric,
+        // so the contraction is part of the encoder.
+        let mut sum_x2 = 0.0f32;
+        for l in 0..32 {
+            sum_x2 = xb[l].mul_add(xb[l], sum_x2);
+        }
+        let av_x = (sum_x2 / 32.0).sqrt();
+        for l in 0..32 {
+            weights[l] = av_x + xb[l].abs();
+        }
+        scales[j] = make_qkx2_quants(
+            32,
+            nmax,
+            xb,
+            &weights,
+            &mut l_all[32 * j..32 * j + 32],
+            &mut mins[j],
+            &mut laux,
+            rmin,
+            0.1,
+            nstep,
+        );
+        if scales[j] > max_scale {
+            max_scale = scales[j];
+        }
+        if mins[j] > max_min {
+            max_min = mins[j];
+        }
+    }
+    let inv_scale = if max_scale > 0.0 {
+        63.0 / max_scale
+    } else {
+        0.0
+    };
+    let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+    let mut sc_packed = [0u8; 12];
+    for j in 0..8 {
+        let ls = (nearest_int_mul(inv_scale, scales[j]) as u8).min(63);
+        let lm = (nearest_int_mul(inv_min, mins[j]) as u8).min(63);
+        if j < 4 {
+            sc_packed[j] = ls;
+            sc_packed[j + 4] = lm;
+        } else {
+            sc_packed[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            sc_packed[j - 4] |= (ls >> 4) << 6;
+            sc_packed[j] |= (lm >> 4) << 6;
+        }
+    }
+    let d = half::f16::from_f32(max_scale / 63.0);
+    let dmin = half::f16::from_f32(max_min / 63.0);
+    let d_f32 = d.to_f32();
+    let dmin_f32 = dmin.to_f32();
+    for j in 0..8 {
+        let (sc, m) = get_scale_min_k4(j, &sc_packed);
+        let dq = d_f32 * sc as f32;
+        if dq == 0.0 {
+            // The reference `continue`s, leaving the `make_qkx2_quants` quants
+            // for this sub-block in `L` — reproduced by not touching them.
+            continue;
+        }
+        let dm = dmin_f32 * m as f32;
+        for ii in 0..32 {
+            let l = nearest_int((x[32 * j + ii] + dm) / dq).clamp(0, nmax);
+            l_all[32 * j + ii] = l as u8;
+        }
+    }
+    (sc_packed, d.to_bits(), dmin.to_bits(), l_all)
+}
+
+fn quantize_q4_k(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 144);
+    for xb in x.chunks_exact(K_QUANT_BLOCK) {
+        let (scales, d, dmin, l) = q4k_q5k_common(xb, 15, -1.0, 20);
+        put_f16_bits(&mut out, d);
+        put_f16_bits(&mut out, dmin);
+        out.extend_from_slice(&scales);
+        // Element j goes in the low nibble and j+32 in the high one, 32 bytes
+        // at a time (QK_K/2 bytes total).
+        for j in (0..K_QUANT_BLOCK).step_by(64) {
+            for l2 in 0..32 {
+                out.push(l[j + l2] | (l[j + l2 + 32] << 4));
+            }
+        }
+    }
+    out
+}
+
+fn quantize_q5_k(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 176);
+    for xb in x.chunks_exact(K_QUANT_BLOCK) {
+        let (scales, d, dmin, l) = q4k_q5k_common(xb, 31, -0.5, 15);
+        put_f16_bits(&mut out, d);
+        put_f16_bits(&mut out, dmin);
+        out.extend_from_slice(&scales);
+        // The 5th bit is a separate 32-byte plane: two bits per 64-element
+        // group, elements n+j in bits {m1}, n+j+32 in bits {m2}.
+        let mut qh = [0u8; 32];
+        let mut qs = [0u8; 128];
+        let (mut m1, mut m2) = (1u8, 2u8);
+        let mut qi = 0usize;
+        for n in (0..K_QUANT_BLOCK).step_by(64) {
+            for j in 0..32 {
+                let mut l1 = l[n + j];
+                if l1 > 15 {
+                    l1 -= 16;
+                    qh[j] |= m1;
+                }
+                let mut l2 = l[n + j + 32];
+                if l2 > 15 {
+                    l2 -= 16;
+                    qh[j] |= m2;
+                }
+                qs[qi + j] = l1 | (l2 << 4);
+            }
+            m1 <<= 2;
+            m2 <<= 2;
+            qi += 32;
+        }
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+
+fn quantize_q6_k(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 210);
+    for xb in x.chunks_exact(K_QUANT_BLOCK) {
+        // 16 sub-blocks of 16 elements, each with its own `make_qx_quants`
+        // scale (rmse_type 1, no importance weights).
+        let mut scales = [0.0f32; 16];
+        let mut l_all = [0i8; K_QUANT_BLOCK];
+        let (mut max_scale, mut max_abs_scale) = (0.0f32, 0.0f32);
+        for ib in 0..16 {
+            let scale = make_qx_quants(
+                16,
+                32,
+                &xb[16 * ib..16 * ib + 16],
+                &mut l_all[16 * ib..16 * ib + 16],
+                1,
+                None,
+            );
+            scales[ib] = scale;
+            let abs_scale = scale.abs();
+            if abs_scale > max_abs_scale {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+        }
+        if max_abs_scale < GROUP_MAX_EPS {
+            // An all-zero super-block is written as 210 zero bytes (d = 0).
+            out.extend_from_slice(&[0u8; 210]);
+            continue;
+        }
+        let iscale = -128.0 / max_scale;
+        let d = half::f16::from_f32(1.0 / iscale);
+        let mut sc = [0i8; 16];
+        for ib in 0..16 {
+            sc[ib] = nearest_int_mul(iscale, scales[ib]).min(127) as i8;
+        }
+        let d_f32 = d.to_f32();
+        for j in 0..16 {
+            let dq = d_f32 * sc[j] as f32;
+            if dq == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let l = nearest_int(xb[16 * j + ii] / dq).clamp(-32, 31);
+                l_all[16 * j + ii] = (l + 32) as i8;
+            }
+        }
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        let (mut qli, mut qhi) = (0usize, 0usize);
+        for j in (0..K_QUANT_BLOCK).step_by(128) {
+            for l in 0..32 {
+                let q1 = (l_all[j + l] as u8) & 0xF;
+                let q2 = (l_all[j + l + 32] as u8) & 0xF;
+                let q3 = (l_all[j + l + 64] as u8) & 0xF;
+                let q4 = (l_all[j + l + 96] as u8) & 0xF;
+                ql[qli + l] = q1 | (q3 << 4);
+                ql[qli + l + 32] = q2 | (q4 << 4);
+                qh[qhi + l] = ((l_all[j + l] as u8) >> 4)
+                    | (((l_all[j + l + 32] as u8) >> 4) << 2)
+                    | (((l_all[j + l + 64] as u8) >> 4) << 4)
+                    | (((l_all[j + l + 96] as u8) >> 4) << 6);
+            }
+            qli += 64;
+            qhi += 32;
+        }
+        out.extend_from_slice(&ql);
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&sc.map(|v| v as u8));
+        put_f16_bits(&mut out, d.to_bits());
+    }
+    out
+}
+
 /// C's `(int8_t)v`: truncation toward zero. Rust's `as i8` also truncates
 /// toward zero, which is what the reference relies on.
 #[inline]
@@ -437,11 +956,39 @@ mod tests {
         (0..32).map(|i| (i as f32 - 16.0) / 8.0).collect()
     }
 
+    /// The K-quant block sizes and byte sizes, pinned against `ggml-common.h`
+    /// (`QK_K = 256`; `sizeof(block_q4_K)` = 2+2+12+128, `q5_K` adds `qh[32]`,
+    /// `q6_K` = 128+64+16+2). `type_size`/`blck_size` come from `gguf.rs`; this
+    /// is the writer-side half of the same contract.
+    #[test]
+    fn k_quant_type_sizes_and_block_sizes_match_ggml_common_h() {
+        assert_eq!(QuantTarget::Q4_K.blck_size(), 256);
+        assert_eq!(QuantTarget::Q5_K.blck_size(), 256);
+        assert_eq!(QuantTarget::Q6_K.blck_size(), 256);
+        assert_eq!(GgmlType::Q4_K.blck_size(), 256);
+        assert_eq!(GgmlType::Q5_K.blck_size(), 256);
+        assert_eq!(GgmlType::Q6_K.blck_size(), 256);
+        assert_eq!(GgmlType::Q4_K.type_size(), 144);
+        assert_eq!(GgmlType::Q5_K.type_size(), 176);
+        assert_eq!(GgmlType::Q6_K.type_size(), 210);
+    }
+
     #[test]
     fn targets_parse_and_refuse_by_name() {
         assert_eq!(QuantTarget::parse("Q4_0").unwrap(), QuantTarget::Q4_0);
         assert_eq!(QuantTarget::parse("f16").unwrap(), QuantTarget::F16);
-        for t in ["q4_K", "q6_K", "iq2_xxs", "tq1_0", "bf16", "q8_1"] {
+        // #140: the three K-quants this engine *reads* now have encoders, spelled
+        // the way the GGUF type names them (`q4_K`, not `q4_k`/`Q4_K`).
+        for t in ["q4_K", "q5_K", "q6_K", "Q6_k"] {
+            let parsed = QuantTarget::parse(t).unwrap();
+            assert!(parsed.blck_size() == 256, "{t}");
+        }
+        assert_eq!(QuantTarget::parse("q4_K").unwrap(), QuantTarget::Q4_K);
+        assert_eq!(QuantTarget::parse("q5_K").unwrap(), QuantTarget::Q5_K);
+        assert_eq!(QuantTarget::parse("q6_K").unwrap(), QuantTarget::Q6_K);
+        // Still refused by name: the K-quants with no encoder, every I-quant and
+        // the other non-float GGUF types.
+        for t in ["q2_K", "q3_K", "q8_K", "iq2_xxs", "tq1_0", "bf16", "q8_1"] {
             let e = QuantTarget::parse(t).unwrap_err();
             assert!(e.contains("no weight encoder"), "{t}: {e}");
             assert!(e.contains(SUPPORTED_TARGETS), "{t}: {e}");
@@ -453,13 +1000,17 @@ mod tests {
 
     #[test]
     fn written_block_bytes_match_type_size_and_blck_size() {
-        let x = vec![0.5f32; 64];
+        // 512 elements: 16 legacy 32-blocks, 2 K-quant 256-blocks.
+        let x = vec![0.5f32; 512];
         for t in [
             QuantTarget::Q4_0,
             QuantTarget::Q4_1,
             QuantTarget::Q5_0,
             QuantTarget::Q5_1,
             QuantTarget::Q8_0,
+            QuantTarget::Q4_K,
+            QuantTarget::Q5_K,
+            QuantTarget::Q6_K,
         ] {
             let y = quantize_row(t, &x);
             let gt = t.ggml_type();
@@ -579,5 +1130,380 @@ mod tests {
         let y = quantize_row(QuantTarget::F16, &[70000.0f32]);
         let back = half::f16::from_bits(u16::from_le_bytes([y[0], y[1]])).to_f32();
         assert!(back.is_infinite(), "{back}");
+    }
+
+    // === #140: the K-quant encoders ===
+
+    /// The vector the K-quant encoders are pinned against: eight 32-element
+    /// ramps, **ascending** in the even 32-groups and **descending** in the odd
+    /// ones. The alternation matters: a vector whose 32-groups all run the same
+    /// way gives `L[j] == L[j+32]` and therefore identical low/high nibbles, so
+    /// a swapped-nibble bug cancels and the pin cannot see it (gate contract
+    /// rule 2). This one makes the two nibbles differ (`0xf0`, `0xe1`, …).
+    fn k_ref_vector() -> Vec<f32> {
+        (0..256)
+            .map(|i| {
+                let (g, j) = (i / 32, i % 32);
+                if g % 2 == 0 {
+                    (j as f32 - 16.0) / 8.0
+                } else {
+                    (15.0 - j as f32) / 8.0
+                }
+            })
+            .collect()
+    }
+
+    /// Dequantize a K-quant block with the *documented* on-disk layout
+    /// (`ggml-common.h` + llama.cpp's `dequantize_row_q{4,5,6}_K`), written here
+    /// rather than reusing the encoder, so the round-trip check is an
+    /// independent read-back of the bytes the encoder produced.
+    fn k_dequantize(t: QuantTarget, b: &[u8]) -> Vec<f32> {
+        let f16_at = |o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
+        match t {
+            QuantTarget::Q4_K => {
+                let (d, dmin) = (f16_at(0), f16_at(2));
+                let scales: [u8; 12] = b[4..16].try_into().unwrap();
+                let q = &b[16..144];
+                let mut out = Vec::with_capacity(256);
+                let mut is = 0usize;
+                for j in (0..256).step_by(64) {
+                    let (sc, m) = get_scale_min_k4(is, &scales);
+                    let (d1, m1) = (d * sc as f32, dmin * m as f32);
+                    let (sc, m) = get_scale_min_k4(is + 1, &scales);
+                    let (d2, m2) = (d * sc as f32, dmin * m as f32);
+                    for l in 0..32 {
+                        out.push(d1 * (q[j / 2 + l] & 0xF) as f32 - m1);
+                    }
+                    for l in 0..32 {
+                        out.push(d2 * (q[j / 2 + l] >> 4) as f32 - m2);
+                    }
+                    is += 2;
+                }
+                out
+            }
+            QuantTarget::Q5_K => {
+                let (d, dmin) = (f16_at(0), f16_at(2));
+                let scales: [u8; 12] = b[4..16].try_into().unwrap();
+                let qh = &b[16..48];
+                let ql = &b[48..176];
+                let mut out = Vec::with_capacity(256);
+                let (mut is, mut u1, mut u2) = (0usize, 1u8, 2u8);
+                for j in (0..256).step_by(64) {
+                    let (sc, m) = get_scale_min_k4(is, &scales);
+                    let (d1, m1) = (d * sc as f32, dmin * m as f32);
+                    let (sc, m) = get_scale_min_k4(is + 1, &scales);
+                    let (d2, m2) = (d * sc as f32, dmin * m as f32);
+                    for l in 0..32 {
+                        let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+                        out.push(d1 * ((ql[j / 2 + l] & 0xF) + hi) as f32 - m1);
+                    }
+                    for l in 0..32 {
+                        let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+                        out.push(d2 * ((ql[j / 2 + l] >> 4) + hi) as f32 - m2);
+                    }
+                    is += 2;
+                    u1 <<= 2;
+                    u2 <<= 2;
+                }
+                out
+            }
+            QuantTarget::Q6_K => {
+                let d = f16_at(208);
+                let sc = &b[192..208];
+                let mut out = vec![0.0f32; 256];
+                for (g, group) in out.chunks_exact_mut(128).enumerate() {
+                    let (ql, qh) = (&b[g * 64..g * 64 + 64], &b[128 + g * 32..128 + g * 32 + 32]);
+                    for l in 0..32 {
+                        let is = g * 8 + l / 16;
+                        let q = |lo: u8, sh: u32| {
+                            ((lo as i32 | (((qh[l] >> sh) & 3) as i32) << 4) - 32) as f32
+                        };
+                        group[l] = d * sc[is] as i8 as f32 * q(ql[l] & 0xF, 0);
+                        group[l + 32] = d * sc[is + 2] as i8 as f32 * q(ql[l + 32] & 0xF, 2);
+                        group[l + 64] = d * sc[is + 4] as i8 as f32 * q(ql[l] >> 4, 4);
+                        group[l + 96] = d * sc[is + 6] as i8 as f32 * q(ql[l + 32] >> 4, 6);
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The reference bytes for `k_ref_vector()`, produced by **llama.cpp's own
+    /// reference quantizers** (`quantize_row_q4_K_ref` / `q5_K_ref` /
+    /// `q6_K_ref`), compiled from `ggml/src/ggml-quants.c` with the production
+    /// flags `-O3 -DNDEBUG -std=gnu11 -mcpu=native` and driven directly — not
+    /// by this module. A single flipped nibble or a dropped FMA fails the
+    /// comparison.
+    #[test]
+    fn k_quant_encoders_match_the_llama_cpp_reference_bytes() {
+        let x = k_ref_vector();
+        let want: [(QuantTarget, &[u8]); 3] = [
+            (
+                QuantTarget::Q4_K,
+                &[
+                    0x11, 0x1c, 0xe2, 0x27, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xff, 0xff, 0xff, 0xf0, 0xf0, 0xe1, 0xe1, 0xd2, 0xd2, 0xc3, 0xc3, 0xb4, 0xb4,
+                    0xa5, 0xa5, 0x96, 0x96, 0x87, 0x87, 0x78, 0x78, 0x69, 0x69, 0x5a, 0x5a, 0x4b,
+                    0x4b, 0x3c, 0x3c, 0x2d, 0x2d, 0x1e, 0x1e, 0x0f, 0x0f, 0xf0, 0xf0, 0xe1, 0xe1,
+                    0xd2, 0xd2, 0xc3, 0xc3, 0xb4, 0xb4, 0xa5, 0xa5, 0x96, 0x96, 0x87, 0x87, 0x78,
+                    0x78, 0x69, 0x69, 0x5a, 0x5a, 0x4b, 0x4b, 0x3c, 0x3c, 0x2d, 0x2d, 0x1e, 0x1e,
+                    0x0f, 0x0f, 0xf0, 0xf0, 0xe1, 0xe1, 0xd2, 0xd2, 0xc3, 0xc3, 0xb4, 0xb4, 0xa5,
+                    0xa5, 0x96, 0x96, 0x87, 0x87, 0x78, 0x78, 0x69, 0x69, 0x5a, 0x5a, 0x4b, 0x4b,
+                    0x3c, 0x3c, 0x2d, 0x2d, 0x1e, 0x1e, 0x0f, 0x0f, 0xf0, 0xf0, 0xe1, 0xe1, 0xd2,
+                    0xd2, 0xc3, 0xc3, 0xb4, 0xb4, 0xa5, 0xa5, 0x96, 0x96, 0x87, 0x87, 0x78, 0x78,
+                    0x69, 0x69, 0x5a, 0x5a, 0x4b, 0x4b, 0x3c, 0x3c, 0x2d, 0x2d, 0x1e, 0x1e, 0x0f,
+                    0x0f,
+                ],
+            ),
+            (
+                QuantTarget::Q5_K,
+                &[
+                    0x10, 0x18, 0x10, 0x28, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xff, 0xff, 0xff, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xf0, 0xe1, 0xd2, 0xc3,
+                    0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f, 0xf0,
+                    0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d,
+                    0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a,
+                    0x4b, 0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87,
+                    0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4,
+                    0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1,
+                    0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e,
+                    0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b,
+                    0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78,
+                    0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
+                ],
+            ),
+            (
+                QuantTarget::Q6_K,
+                &[
+                    0x00, 0x22, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee, 0x00, 0x22, 0x44, 0x66, 0x88,
+                    0xaa, 0xcc, 0xee, 0x00, 0xee, 0xcc, 0xaa, 0x88, 0x66, 0x44, 0x11, 0xff, 0xdd,
+                    0xbb, 0x99, 0x77, 0x55, 0x33, 0x11, 0x11, 0x33, 0x55, 0x77, 0x99, 0xbb, 0xdd,
+                    0xff, 0x11, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee, 0x00, 0xee, 0xcc, 0xaa, 0x88,
+                    0x66, 0x44, 0x22, 0x00, 0xee, 0xcc, 0xaa, 0x88, 0x66, 0x44, 0x22, 0x00, 0x00,
+                    0x22, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee, 0x00, 0x22, 0x44, 0x66, 0x88, 0xaa,
+                    0xcc, 0xee, 0x00, 0xee, 0xcc, 0xaa, 0x88, 0x66, 0x44, 0x11, 0xff, 0xdd, 0xbb,
+                    0x99, 0x77, 0x55, 0x33, 0x11, 0x11, 0x33, 0x55, 0x77, 0x99, 0xbb, 0xdd, 0xff,
+                    0x11, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee, 0x00, 0xee, 0xcc, 0xaa, 0x88, 0x66,
+                    0x44, 0x22, 0x00, 0xee, 0xcc, 0xaa, 0x88, 0x66, 0x44, 0x22, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                    0x99, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55,
+                    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x99, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55,
+                    0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x7b, 0x7b,
+                    0x80, 0x80, 0x7b, 0x7b, 0x80, 0x80, 0x7b, 0x7b, 0x80, 0x80, 0x7b, 0x7b, 0x80,
+                    0x00, 0x90,
+                ],
+            ),
+        ];
+        for (t, bytes) in want {
+            let got = quantize_row(t, &x);
+            assert_eq!(got.len(), bytes.len(), "{} length", t.name());
+            assert_eq!(
+                got,
+                bytes,
+                "{} bytes differ from the llama.cpp reference",
+                t.name()
+            );
+        }
+    }
+
+    /// A second reference vector at exact half-integer values (`i*0.5 - 128`
+    /// plus a `.5` every third element), so the search's `iscale` candidates
+    /// land on ties and a different set of sub-blocks wins. Same provenance as
+    /// the pin above; the extra distribution is the point (the `k_ref_vector`
+    /// pin and this one do not fail on the same mutations).
+    #[test]
+    fn k_quant_encoders_match_the_reference_at_rounding_boundaries() {
+        let x: Vec<f32> = (0..256)
+            .map(|i| (i as f32) * 0.5 - 128.0 + if i % 3 == 0 { 0.5 } else { 0.0 })
+            .collect();
+        let want: [(QuantTarget, &[u8]); 3] = [
+            (
+                QuantTarget::Q4_K,
+                &[
+                    0x1c, 0x24, 0x0a, 0x40, 0xfe, 0xff, 0xfe, 0xfe, 0xbf, 0x77, 0x2f, 0x27, 0x0f,
+                    0x8e, 0xfe, 0x8f, 0x00, 0x00, 0x00, 0x11, 0x21, 0x22, 0x23, 0x33, 0x33, 0x44,
+                    0x54, 0x55, 0x56, 0x66, 0x66, 0x77, 0x77, 0x78, 0x89, 0x99, 0x99, 0x9a, 0xaa,
+                    0xab, 0xbc, 0xcc, 0xcc, 0xcd, 0xdd, 0xde, 0xef, 0xff, 0x00, 0x00, 0x00, 0x10,
+                    0x11, 0x12, 0x22, 0x22, 0x33, 0x43, 0x44, 0x45, 0x55, 0x55, 0x66, 0x76, 0x77,
+                    0x78, 0x88, 0x88, 0x99, 0xa9, 0xaa, 0xab, 0xbb, 0xbb, 0xcc, 0xdc, 0xdd, 0xde,
+                    0xee, 0xee, 0x01, 0x12, 0x22, 0x22, 0x23, 0x33, 0x34, 0x45, 0x55, 0x55, 0x56,
+                    0x66, 0x67, 0x78, 0x88, 0x88, 0x99, 0xa9, 0xaa, 0xab, 0xbb, 0xbb, 0xcc, 0xdc,
+                    0xdc, 0xdd, 0xed, 0xee, 0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x10, 0x20, 0x30,
+                    0x31, 0x32, 0x42, 0x42, 0x53, 0x63, 0x64, 0x65, 0x75, 0x75, 0x86, 0x96, 0x97,
+                    0x98, 0xa8, 0xa8, 0xb9, 0xc9, 0xca, 0xcb, 0xdb, 0xdb, 0xec, 0xec, 0xed, 0xfe,
+                    0xfe,
+                ],
+            ),
+            (
+                QuantTarget::Q5_K,
+                &[
+                    0x16, 0x20, 0x0c, 0x40, 0xff, 0xff, 0xff, 0xff, 0xbf, 0x77, 0x6f, 0x27, 0x0f,
+                    0x8f, 0x0f, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x20, 0x70, 0xf0, 0xf5, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x11, 0x23,
+                    0x43, 0x44, 0x56, 0x76, 0x77, 0x89, 0xa9, 0xaa, 0xbc, 0xdc, 0xdd, 0xef, 0xff,
+                    0xf0, 0x02, 0x22, 0x23, 0x35, 0x55, 0x56, 0x68, 0x88, 0x89, 0x9b, 0xbb, 0xbc,
+                    0xce, 0xee, 0x00, 0x00, 0x01, 0x21, 0x22, 0x34, 0x54, 0x55, 0x67, 0x87, 0x88,
+                    0x9a, 0xba, 0xbb, 0xcd, 0xed, 0xee, 0xf0, 0x10, 0x11, 0x23, 0x43, 0x44, 0x56,
+                    0x76, 0x77, 0x89, 0xa9, 0xaa, 0xbc, 0xdc, 0xdd, 0x11, 0x23, 0x43, 0x44, 0x56,
+                    0x76, 0x77, 0x89, 0xa9, 0xaa, 0xbc, 0xdc, 0xdd, 0xef, 0x0f, 0x00, 0x12, 0x32,
+                    0x33, 0x45, 0x65, 0x66, 0x78, 0x98, 0x99, 0xab, 0xcb, 0xcc, 0xde, 0xfe, 0xff,
+                    0xff, 0x02, 0x22, 0x23, 0x35, 0x55, 0x56, 0x68, 0x88, 0x89, 0x9b, 0xbb, 0xbc,
+                    0xce, 0xee, 0xef, 0xf1, 0x11, 0x12, 0x24, 0x44, 0x45, 0x57, 0x77, 0x78, 0x8a,
+                    0xaa, 0xab, 0xbd, 0xdd, 0xde, 0xef, 0xff,
+                ],
+            ),
+            (
+                QuantTarget::Q6_K,
+                &[
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x11, 0x11, 0x11, 0x11, 0x11, 0x21, 0x21,
+                    0x21, 0x21, 0x22, 0x10, 0x10, 0x10, 0x10, 0x20, 0x21, 0x21, 0x21, 0x21, 0x21,
+                    0x31, 0x31, 0x31, 0x31, 0x32, 0x32, 0x00, 0x00, 0x00, 0x10, 0x11, 0x11, 0x11,
+                    0x11, 0x11, 0x21, 0x22, 0x22, 0x22, 0x22, 0x32, 0x32, 0x00, 0x00, 0x10, 0x10,
+                    0x10, 0x10, 0x11, 0x21, 0x21, 0x21, 0x21, 0x31, 0x32, 0x32, 0x32, 0x32, 0x00,
+                    0x01, 0x11, 0x21, 0x21, 0x21, 0x32, 0x32, 0x42, 0x52, 0x53, 0x53, 0x63, 0x64,
+                    0x74, 0x84, 0x00, 0x00, 0x20, 0x21, 0x21, 0x41, 0x42, 0x42, 0x62, 0x63, 0x63,
+                    0x83, 0x83, 0x83, 0xa4, 0xa4, 0x00, 0x20, 0x21, 0x31, 0x51, 0x52, 0x62, 0x82,
+                    0x83, 0x93, 0xb3, 0xb4, 0xc4, 0xe4, 0xe5, 0xf5, 0x21, 0x22, 0x42, 0x82, 0x83,
+                    0xa3, 0xe4, 0xe4, 0x04, 0x45, 0x45, 0x65, 0xa6, 0xa7, 0xc7, 0x07, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x80, 0x80, 0x88, 0x8f,
+                    0x98, 0xa0, 0xa5, 0xb0, 0xb7, 0xbf, 0xc8, 0xd0, 0xd6, 0xe0, 0xe8, 0xf0, 0xf8,
+                    0xed, 0xa7,
+                ],
+            ),
+        ];
+        for (t, bytes) in want {
+            let got = quantize_row(t, &x);
+            assert_eq!(got.len(), bytes.len(), "{} length", t.name());
+            assert_eq!(
+                got,
+                bytes,
+                "{} bytes differ from the llama.cpp reference at a rounding boundary",
+                t.name()
+            );
+        }
+    }
+
+    /// The block layout, read back through the documented field order: the f16
+    /// scale(s), the 6-bit scale/min packing (`get_scale_min_k4`), the
+    /// `j` / `j+32` nibble split and q5_K's separate 5th-bit plane. The
+    /// round-trip is bounded by the block's own quantisation step, and the
+    /// measured worst error is printed.
+    #[test]
+    fn k_quant_blocks_round_trip_within_their_step() {
+        let x = k_ref_vector();
+        // The vector spans 4.0 and q4_K's 4-bit step is ~0.36, so a half step is
+        // ~0.18; 0.1 is tighter than a half step and a swapped nibble (error
+        // ~4.0) cannot pass. The measured worst error per type is printed.
+        let bound = 0.1f32;
+        for t in [QuantTarget::Q4_K, QuantTarget::Q5_K, QuantTarget::Q6_K] {
+            let y = quantize_row(t, &x);
+            let back = k_dequantize(t, &y);
+            assert_eq!(back.len(), 256, "{}", t.name());
+            let worst = x
+                .iter()
+                .zip(back.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst <= bound, "{}: worst |Δ| = {worst}", t.name());
+            eprintln!("{}: worst |Δ| over one QK_K block = {worst}", t.name());
+        }
+        // q5_K uses its 5th-bit plane on this vector: the high bits are not all
+        // zero, which is what makes the `qh` read-back above meaningful.
+        let y = quantize_row(QuantTarget::Q5_K, &x);
+        assert!(
+            y[16..48].iter().any(|&b| b != 0),
+            "q5_K: the vector must exercise the 5th-bit plane"
+        );
+    }
+
+    /// `nearest_int_mul` really is the *fused* form, and the fixture proves it
+    /// exercises the property: for this pair the exact product plus the magic
+    /// constant rounds to 1517, while rounding the product first and then
+    /// adding rounds to 1516. Writing `a * b + c` here — which is what the
+    /// obvious port looks like — is therefore a wrong quant, not a style
+    /// choice. (The pair was found by search; the reference emits
+    /// `fmadd a, b, #12582912.0`.)
+    #[test]
+    fn nearest_int_mul_fuses_the_magic_constant_into_the_product() {
+        let a = f32::from_bits(0xc205_b75f);
+        let b = f32::from_bits(0xc235_7575);
+        assert_eq!(
+            nearest_int(a * b),
+            1516,
+            "the fixture must distinguish the fused form from the plain one"
+        );
+        assert_eq!(nearest_int_mul(a, b), 1517);
+    }
+
+    /// A zero super-block is representable exactly: all-zero quants, zero
+    /// scale(s) and no NaN. q6_K takes the reference's `memset` path; q4_K and
+    /// q5_K take `make_qkx2_quants`'s `max == min` path plus the `if (!d)
+    /// continue` re-round, which leaves the sub-block quants at 0.
+    #[test]
+    fn a_zero_k_block_is_all_zero_bytes() {
+        let x = vec![0.0f32; 256];
+        for t in [QuantTarget::Q4_K, QuantTarget::Q5_K, QuantTarget::Q6_K] {
+            let y = quantize_row(t, &x);
+            assert!(
+                y.iter().all(|&b| b == 0),
+                "{}: a zero block must be all-zero bytes, got {:?}",
+                t.name(),
+                &y[..y.len().min(16)]
+            );
+            for f in k_dequantize(t, &y) {
+                assert!(f.is_finite(), "{}", t.name());
+            }
+        }
+    }
+
+    /// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's *CLI* vocabulary, but
+    /// `minfer quantize --type q4_K` writes one uniform type. The `file_type`
+    /// metadata number is the ftype llama.cpp records for the same number, and
+    /// the row-length fallback is llama.cpp's `tensor_type_fallback`.
+    #[test]
+    fn k_quant_file_types_and_row_length_fallbacks_match_llama_cpp() {
+        assert_eq!(QuantTarget::Q4_K.file_type(), 15); // LLAMA_FTYPE_MOSTLY_Q4_K_M
+        assert_eq!(QuantTarget::Q5_K.file_type(), 17); // LLAMA_FTYPE_MOSTLY_Q5_K_M
+        assert_eq!(QuantTarget::Q6_K.file_type(), 18); // LLAMA_FTYPE_MOSTLY_Q6_K
+        assert_eq!(
+            QuantTarget::Q4_K.row_len_fallback(),
+            Some(QuantTarget::Q5_0)
+        );
+        assert_eq!(
+            QuantTarget::Q5_K.row_len_fallback(),
+            Some(QuantTarget::Q5_1)
+        );
+        assert_eq!(
+            QuantTarget::Q6_K.row_len_fallback(),
+            Some(QuantTarget::Q8_0)
+        );
+        // The legacy targets have no fallback in this module: a 2-D tensor whose
+        // row is not a multiple of 32 keeps its source type (llama.cpp demotes
+        // it to F16, which is the same file for the f16 sources the gate uses).
+        for t in [
+            QuantTarget::Q4_0,
+            QuantTarget::Q4_1,
+            QuantTarget::Q5_0,
+            QuantTarget::Q5_1,
+            QuantTarget::Q8_0,
+            QuantTarget::F16,
+            QuantTarget::F32,
+        ] {
+            assert_eq!(t.row_len_fallback(), None, "{}", t.name());
+        }
+        assert_eq!(
+            SUPPORTED_TARGETS,
+            "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32"
+        );
     }
 }

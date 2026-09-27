@@ -979,6 +979,10 @@ pub struct QuantizePlan {
     pub preserved: Vec<String>,
     /// Tensors deliberately encoded at another type (tied embedding → q8_0).
     pub retargeted: Vec<String>,
+    /// Tensors a K-quant target could not encode because their row length is
+    /// not a multiple of the 256-element K block, demoted to llama.cpp's
+    /// `tensor_type_fallback` type.
+    pub demoted: Vec<String>,
 }
 
 impl QuantizePlan {
@@ -989,6 +993,14 @@ impl QuantizePlan {
     /// * **quant** — a 1-D tensor (norm, bias) and a tensor whose row length is
     ///   not a multiple of the target block size are **copied verbatim**, i.e.
     ///   keep their source type;
+    /// * **K-quant** (`q4_K`/`q5_K`/`q6_K`) — a 1-D tensor keeps its source
+    ///   type, and a 2-D tensor whose row length is not a multiple of the
+    ///   256-element `QK_K` block is **demoted** to llama.cpp's
+    ///   `tensor_type_fallback` type (Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0, and F16
+    ///   if even a 32-element block does not divide the row). This is not
+    ///   cosmetic: the 0.5B's hidden size is 896, so 145 of its 290 tensors take
+    ///   the demotion and the per-tensor byte-parity gate compares the demoted
+    ///   encoders too. Reported through `demoted`;
     /// * **f16** — a 1-D tensor keeps its source type too
     ///   (`tensor_allows_quantization` is false below 2 dims, and both
     ///   `minfer convert --outtype f16` and `llama-quantize … F16` write those
@@ -1010,17 +1022,21 @@ impl QuantizePlan {
     ) -> Result<Self, String> {
         use crate::quantize::QuantTarget as QT;
         let bs = target.blck_size();
-        // llama.cpp's tied-embedding policy: when `output.weight` is absent the
-        // output projection *is* the token embedding, and for a sub-8-bit
-        // (legacy) ftype llama.cpp quantizes that shared tensor at Q8_0 rather
-        // than at the requested type. Reproduced here so `minfer quantize
-        // --type q4_0` is byte-identical to `llama-quantize … q4_0` on a tied
-        // model (Qwen2.5/Qwen3 are tied).
+        // llama.cpp's tied-embedding outcome: when `output.weight` is absent the
+        // output projection *is* the token embedding, and llama.cpp's mixture
+        // sends that shared tensor through its OUTPUT branch to Q6_K; the
+        // 256-block fallback then lands it on Q8_0 whenever the hidden size is
+        // not a multiple of 256 (896 on the 0.5B). Reproduced as the observable
+        // result so `minfer quantize --type q4_0` is byte-identical to
+        // `llama-quantize … q4_0` on a tied model (Qwen2.5/Qwen3 are tied).
+        // Note this is a property of the *legacy* ftypes only: a K-quant target
+        // skips the mixture (see the `demoted` rule below).
         let tied = !model
             .parts
             .iter()
             .any(|p| p.ctx.info.iter().any(|ti| ti.name == "output.weight"));
         let mut retargeted: Vec<String> = Vec::new();
+        let mut demoted: Vec<String> = Vec::new();
         let sub_8bit = matches!(target, QT::Q4_0 | QT::Q4_1 | QT::Q5_0 | QT::Q5_1);
         let mut specs = Vec::new();
         let mut sources = Vec::new();
@@ -1040,10 +1056,17 @@ impl QuantizePlan {
                 let row_ok = ti.ne[0] % bs as i64 == 0;
                 // The 1-D rule per target (see the `plan` doc comment): a 1-D
                 // tensor is preserved for the quant targets and for f16, and
-                // f32 converts everything.
+                // f32 converts everything. A 2-D row that is not a multiple of
+                // the target's block size is preserved for the legacy targets
+                // (block size 32), but for a K-quant it is demoted to
+                // llama.cpp's `tensor_type_fallback` type instead — a K-quant
+                // block is 256 elements and this model's hidden size (896) is
+                // not a multiple of it, so 145 of the 0.5B's 290 tensors take
+                // that path. See the `demoted` report and GGUF-TOOLING §2.2.
                 let keep = match target {
                     QT::F32 => false,
                     QT::F16 => ti.ne[1] <= 1,
+                    _ if target.row_len_fallback().is_some() => ti.ne[1] <= 1,
                     _ => ti.ne[1] <= 1 || !row_ok,
                 };
                 if keep {
@@ -1053,13 +1076,35 @@ impl QuantizePlan {
                 if tied_embed {
                     retargeted.push(format!("{} -> q8_0 (tied embedding)", ti.name));
                 }
-                let tgt = if keep {
+                let mut tgt = if keep {
                     ti.type_
                 } else if tied_embed {
                     crate::gguf::GgmlType::Q8_0
                 } else {
                     target.ggml_type()
                 };
+                let mut retarget: Option<crate::quantize::QuantTarget> =
+                    tied_embed.then_some(QT::Q8_0);
+                if !keep && !tied_embed && !row_ok {
+                    if let Some(fb) = target.row_len_fallback() {
+                        // llama.cpp's `tensor_type_fallback`: a 256-block
+                        // target whose row is not a multiple of 256 demotes to
+                        // a legacy 32-block type, and to F16 when even that
+                        // block size does not divide the row.
+                        if ti.ne[0] % fb.blck_size() as i64 == 0 {
+                            tgt = fb.ggml_type();
+                            retarget = Some(fb);
+                            demoted.push(format!("{} -> {} (row % 256 != 0)", ti.name, fb.name()));
+                        } else {
+                            tgt = crate::gguf::GgmlType::F16;
+                            retarget = Some(QT::F16);
+                            demoted.push(format!(
+                                "{} -> f16 (no encoder block size divides the row)",
+                                ti.name
+                            ));
+                        }
+                    }
+                }
                 let spec = TensorSpec::new(ti.name.clone(), ti.ne, tgt);
                 sources.push(SourceTensor {
                     part: pi,
@@ -1068,7 +1113,7 @@ impl QuantizePlan {
                     src_nbytes: ti.nbytes(),
                     row_elems: ti.ne[0] as usize,
                     preserved: keep,
-                    retarget: tied_embed.then_some(crate::quantize::QuantTarget::Q8_0),
+                    retarget,
                 });
                 specs.push(spec);
             }
@@ -1089,6 +1134,7 @@ impl QuantizePlan {
             target,
             preserved,
             retargeted,
+            demoted,
         })
     }
 
