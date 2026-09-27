@@ -253,6 +253,47 @@ fn reject(job: Job, e: ApiError) -> ApiError {
     e
 }
 
+/// The environment variable behind [`tick_seam`] — #160's gate-mutation seam.
+pub const TICK_SEAM_ENV: &str = "MINFER_TEST_TICK";
+
+/// #160: what `MINFER_TEST_TICK` makes [`BatchEngine::tick`] do, so a wedge can
+/// be injected into the real step and the work-bounded gates can be shown to
+/// fail *fast* (gate contract rule 3).
+///
+/// The two arms are the two ways a bounded drive can be wrong:
+///
+/// - [`TickSeam::Wedge`] (`MINFER_TEST_TICK=wedge`) returns from the step
+///   without forwarding or committing anything, so the engine stays busy with a
+///   frozen `BatchEngine::work_units`. That is the arm the per-step progress
+///   assertion in the gates' shared `WorkBound` catches: the step that wedges
+///   the engine is the step that panics.
+/// - [`TickSeam::Spin`] (`MINFER_TEST_TICK=spin`) advances `work_units` but never
+///   completes a run, so the drive keeps "moving" along a path that cannot
+///   terminate. The progress assertion is satisfied by construction, and only
+///   the step budget (`step_budget`) catches it.
+///
+/// [`TickSeam::Off`] is every run with the variable unset — production, CI, the
+/// default suite and the unmutated real-model set — and the arms are inert then.
+/// The variable is read once per process (like `cuda::s4_ab_map_reps`), so a
+/// mutation run exports it before the process starts and a gate cannot race it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickSeam {
+    Off,
+    Wedge,
+    Spin,
+}
+
+/// Read [`TICK_SEAM_ENV`] once per process. An unknown value is `Off` — a typo
+/// must not wedge the engine by accident.
+pub fn tick_seam() -> TickSeam {
+    static SEAM: std::sync::OnceLock<TickSeam> = std::sync::OnceLock::new();
+    *SEAM.get_or_init(|| match std::env::var(TICK_SEAM_ENV).ok().as_deref() {
+        Some("wedge") => TickSeam::Wedge,
+        Some("spin") => TickSeam::Spin,
+        _ => TickSeam::Off,
+    })
+}
+
 impl BatchEngine {
     /// Reserve one run per slot in a single arena. The reservations are made
     /// once and kept: a slot that finishes a request keeps its rows and its
@@ -1133,6 +1174,19 @@ impl BatchEngine {
     /// One step: forward every ready slot's pending token in a single batch,
     /// then sample, commit and queue the next token for each of them.
     pub fn tick(&mut self, model: &dyn ModelDef, tokenizer: &Tokenizer) -> Result<(), ApiError> {
+        // #160: the gate-mutation seam (see `tick_seam`). `wedge` returns with
+        // the engine still busy and the work counter frozen; `spin` advances the
+        // counter without ever completing a run. Both fire before any real work,
+        // and neither branch is taken when the variable is unset (every
+        // production, CI and default run).
+        match tick_seam() {
+            TickSeam::Off => {}
+            TickSeam::Wedge => return Ok(()),
+            TickSeam::Spin => {
+                self.work_units += 1;
+                return Ok(());
+            }
+        }
         // (1) one forward for every slot with a committed-but-unwritten token.
         let mut tokens: Vec<u32> = Vec::new();
         let mut positions: Vec<usize> = Vec::new();
@@ -1617,6 +1671,13 @@ mod tests {
             pending.push((i, rx));
         }
         let t0 = Instant::now();
+        // #160: the whole drive is bounded by work, not by the clock. `sum of the
+        // prompts` plus every request's own token cap is the most the engine can
+        // legitimately consume; the budget's 4x margin absorbs the admission and
+        // prefill steps, which do not show up in `work_units`.
+        let total_prompt: usize = prompts.iter().map(|p| p.len()).sum();
+        let budget = step_budget(total_prompt, prompts.len() * step_cap(max_tokens, n_ctx));
+        let mut bound = WorkBound::new(&engine, budget, "the batched run");
         // Admit, then step until every request has finished.
         while !queue.is_empty() || engine.busy() {
             // `stagger` reproduces the **server's** admission pattern: requests
@@ -1634,6 +1695,7 @@ mod tests {
                 admit -= 1;
             }
             engine.tick(model, tok).expect("tick");
+            bound.step(&engine);
             // Drain events; a finished request is reported by `Finish`, and its
             // text is the concatenation of the `Text` events.
             for (i, rx) in pending.iter_mut() {
@@ -1692,10 +1754,18 @@ mod tests {
                     },
                 )
                 .unwrap_or_else(|e| panic!("submit request {i}: {}", e.message));
+            // #160: this request's own drive is bounded by work (progress and the
+            // step budget), exactly like the batched arm.
+            let mut bound = WorkBound::new(
+                &engine,
+                step_budget(p.len(), step_cap(max_tokens, n_ctx)),
+                "the serial baseline",
+            );
             let mut text = String::new();
             let mut done = None;
             while done.is_none() {
                 engine.tick(model, tok).expect("tick");
+                bound.step(&engine);
                 loop {
                     match rx.try_recv() {
                         Ok(StreamEvent::Text(t)) => text.push_str(&t),
@@ -1808,6 +1878,7 @@ mod tests {
         prompt: Vec<u32>,
         max_tokens: i64,
     ) -> String {
+        let budget = step_budget(prompt.len(), step_cap(max_tokens, engine.n_ctx_total));
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(1024);
         engine
             .submit_on(
@@ -1822,8 +1893,11 @@ mod tests {
             )
             .expect("admit");
         let mut text = String::new();
+        // #160: a bounded drive (progress + step budget), like the other steppers.
+        let mut bound = WorkBound::new(engine, budget, "the slot-scoped request");
         while engine.busy() {
             engine.tick(model, tok).expect("tick");
+            bound.step(engine);
             while let Ok(ev) = rx.try_recv() {
                 if let StreamEvent::Text(t) = ev {
                     text.push_str(&t);
@@ -2451,8 +2525,11 @@ mod tests {
                 },
             )
             .expect("submit");
+            // #160: every stepper below is bounded by work (progress + budget).
+            let mut bound = WorkBound::new(&a, step_budget(prompt.len(), 4), "the cold run");
             while a.busy() {
                 a.tick(&*model, &tok).expect("tick");
+                bound.step(&a);
             }
             let cold_fed = a.prefill_fed();
             assert_eq!(
@@ -2492,8 +2569,10 @@ mod tests {
             },
         )
         .expect("submit");
+        let mut bound = WorkBound::new(&b, step_budget(1, 4), "the resumed run");
         while b.busy() {
             b.tick(&*model, &tok).expect("tick");
+            bound.step(&b);
         }
         let warm_fed = b.prefill_fed() - fed_before;
         assert_eq!(
@@ -2532,8 +2611,10 @@ mod tests {
             },
         )
         .expect("submit");
+        let mut bound = WorkBound::new(&b, step_budget(second.len(), 2), "the delta run");
         while b.busy() {
             b.tick(&*model, &tok).expect("tick");
+            bound.step(&b);
         }
         let fed_delta = b.prefill_fed() - before_delta;
         assert!(fed_delta > 0, "the delta still needs a forward");
@@ -2625,8 +2706,16 @@ mod tests {
                 .expect("the prefill installed a run")
                 .last_logits
                 .clone();
+            // #160: bounded by work; the arm's name says which shape it drove.
+            let what = if chunk == 0 {
+                "the unchunked prefill"
+            } else {
+                "the chunked prefill"
+            };
+            let mut bound = WorkBound::new(&engine, step_budget(ids.len(), 8), what);
             while engine.busy() {
                 engine.tick(&*model, &tok).expect("tick");
+                bound.step(&engine);
             }
             let mut text = String::new();
             while let Ok(ev) = rx.try_recv() {
@@ -2743,8 +2832,14 @@ mod tests {
                     },
                 )
                 .expect("submit");
+            let mut bound = WorkBound::new(
+                engine,
+                step_budget(ids.len(), 4),
+                "the repeated chunked prefill",
+            );
             while engine.busy() {
                 engine.tick(&*model, &tok).expect("tick");
+                bound.step(engine);
             }
             while rx.try_recv().is_ok() {}
         };
@@ -2802,8 +2897,13 @@ mod tests {
                     },
                 )
                 .expect("short submit");
+            // #160: the three priming steps are a fixed bound, but they go
+            // through the same work bound so a wedged step fails here, on the
+            // step that wedged it, instead of one assertion later.
+            let mut bound = WorkBound::new(&engine, step_budget(short.len(), 48), "the short run");
             for _ in 0..3 {
                 engine.tick(&*model, &tok).expect("tick");
+                bound.step(&engine);
             }
             // Drain what the three ticks produced: the next drain's *return* is then
             // exactly the bytes slot 1 gains while the long prefill runs (draining is
@@ -2920,7 +3020,14 @@ mod tests {
                 feeder_metrics.in_flight.fetch_add(1, Ordering::SeqCst);
             }
             let mut peak_running = 0u64;
-            let deadline = Instant::now() + std::time::Duration::from_secs(120);
+            // #160: `FEEDER_POLL_BACKSTOP` is **only a backstop**, not the gate's
+            // failure signal. The verdict below is `peak_running > 0` plus the
+            // queue arithmetic, and the worker (`serve_loop`) runs on this test's
+            // main thread: a genuine wedge inside `tick` keeps the engine busy, so
+            // the join never returns and this deadline cannot rescue it. What the
+            // terminator does bound is a worker whose metrics never settle; a
+            // healthy run breaks out on `drained` within milliseconds.
+            let deadline = Instant::now() + FEEDER_POLL_BACKSTOP;
             loop {
                 let s = feeder_metrics.snapshot();
                 peak_running = peak_running.max(s.running);
@@ -3559,7 +3666,20 @@ mod tests {
         );
     }
 
-    /// #158: the step budget for the real-model stepper loops below.
+    /// #160: the `serve_loop_publishes_the_queue_and_running_depth` feeder's poll
+    /// terminator, named so the number is justified where it is used.
+    ///
+    /// It is **not** a gate's failure signal: the verdict is the downstream
+    /// `peak_running > 0` and the queue arithmetic, and the worker runs on the
+    /// test's main thread, so a real wedge in `tick` hangs that join regardless of
+    /// any deadline here (this is exactly why #158 left it and #160 classifies it a
+    /// redundant backstop). It is also not load-sensitive: `peak_running` is
+    /// observed within milliseconds of the first admission on every run. The value
+    /// is generous only because it is the last resort for a worker that drains but
+    /// whose published metrics never settle.
+    const FEEDER_POLL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// The step budget for a real-model stepper loop (#158, shared by #160).
     ///
     /// A legitimate run does one decode forward and one sample per answer token,
     /// plus one prefill forward per chunk (with `MINFER_N_BATCH` low, one per
@@ -3572,13 +3692,85 @@ mod tests {
     /// Measured on this box (0.5B q4_0, GB10 host CPU, 2026-09-25): the warm
     /// request (8-token prompt, `max_tokens = 4`) takes **4 steps** against a
     /// budget of **80**, and the long one (120-token prompt, `max_tokens = 64`)
-    /// takes **64** against **768** — margins of 20x and 12x. The gate prints both
+    /// takes **64** against **768** — margins of 20x and 12x. The gates print both
     /// counts on every run, so a workload that outgrows the budget says so.
     const STEP_BUDGET_MARGIN: usize = 4;
     const STEP_BUDGET_SLACK: usize = 8;
 
     fn step_budget(prompt_tokens: usize, max_tokens: usize) -> usize {
         STEP_BUDGET_MARGIN * (prompt_tokens + max_tokens + STEP_BUDGET_SLACK)
+    }
+
+    /// #160: the answer tokens a request may legitimately produce, for
+    /// [`step_budget`]. An unbounded request (`max_tokens < 0`) ends on its
+    /// context bound, which is the cap the engine itself enforces.
+    fn step_cap(max_tokens: i64, n_ctx: usize) -> usize {
+        if max_tokens < 0 {
+            n_ctx
+        } else {
+            max_tokens as usize
+        }
+    }
+
+    /// The per-step bound every stepper loop in this module shares (#158, made
+    /// the common shape by #160).
+    ///
+    /// A `tick` that leaves the engine busy must have advanced
+    /// [`BatchEngine::work_units`]: if no forward ran, then some slot's `advance`
+    /// returned `Continue`, and `Continue` commits exactly one token (every other
+    /// `advance` outcome ends the run and takes it). A drive can violate that in
+    /// exactly two ways, and this type names the arm that catches each:
+    ///
+    /// - the counter freezes while the engine stays busy — a **wedge**; [`step`]
+    ///   panics on the step that wedged it (this is the arm `MINFER_TEST_TICK=wedge`
+    ///   drives), or
+    /// - the counter keeps moving along a path that cannot terminate — only the
+    ///   **step budget** catches that (the arm `MINFER_TEST_TICK=spin` drives).
+    ///
+    /// Neither bound is a wall-clock number, so a loaded box runs the same steps
+    /// more slowly and still passes.
+    ///
+    /// [`step`]: WorkBound::step
+    struct WorkBound<'a> {
+        what: &'a str,
+        budget: usize,
+        steps: usize,
+        work: u64,
+    }
+
+    impl<'a> WorkBound<'a> {
+        fn new(engine: &BatchEngine, budget: usize, what: &'a str) -> Self {
+            Self {
+                what,
+                budget,
+                steps: 0,
+                work: engine.work_units(),
+            }
+        }
+
+        /// Record one step and assert it was honest. Call it immediately after
+        /// every `tick` whose `busy()` state the drive is about to re-check.
+        fn step(&mut self, engine: &BatchEngine) {
+            self.steps += 1;
+            let now = engine.work_units();
+            assert!(
+                !engine.busy() || now > self.work,
+                "{}: the engine is wedged — step {} left it busy without advancing \
+                 the work counter (still {})",
+                self.what,
+                self.steps,
+                self.work
+            );
+            self.work = now;
+            assert!(
+                self.steps <= self.budget,
+                "{}: {} steps exceeded the {}-step budget — the run is not \
+                 progressing toward completion",
+                self.what,
+                self.steps,
+                self.budget
+            );
+        }
     }
 
     /// #158: drive `engine` to idle with a bound on *work*, not wall-clock seconds.
@@ -3599,29 +3791,16 @@ mod tests {
         budget: usize,
         what: &str,
     ) -> usize {
-        let mut steps = 0usize;
-        let mut work = engine.work_units();
+        let mut bound = WorkBound::new(engine, budget, what);
         while engine.busy() {
             engine.tick(model, tokenizer).expect("tick");
             // The response channel is bounded, so every step's frames are drained:
             // a full channel would block the worker's `blocking_send` and stall the
             // step before the work assertion could see it.
             while rx.try_recv().is_ok() {}
-            steps += 1;
-            let now = engine.work_units();
-            assert!(
-                !engine.busy() || now > work,
-                "{what}: the engine is wedged — step {steps} left it busy without \
-                 advancing the work counter (still {work})"
-            );
-            work = now;
-            assert!(
-                steps <= budget,
-                "{what}: {steps} steps exceeded the {budget}-step budget — the run \
-                 is not progressing toward completion"
-            );
+            bound.step(engine);
         }
-        steps
+        bound.steps
     }
 
     /// F8 (#51): the published occupancy and running counts are a **live**
