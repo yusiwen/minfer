@@ -34,6 +34,7 @@ writer/encoders and their verification references are documented in
 
 ```bash
 cargo test --release                         # unit + integration, no model files needed
+cargo fmt --all --check                      # formatting, with the pinned toolchain's rustfmt
 scripts/real_model_gates.sh                  # the #[ignore]d real-model gate set (parallel on CPU)
 PARALLEL=0 scripts/real_model_gates.sh       # CPU-only serial form
 FEATURES=cuda scripts/real_model_gates.sh    # device gate set (serial, one GPU)
@@ -92,6 +93,20 @@ The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git
   changed files, then commit again.
 - The same check runs sandboxed as a derivation: `nix flake check`
   (`checks.pre-commit-check`), or `nix develop -c pre-commit run --all-files`.
+- **CI enforces it too** ([#211](https://github.com/yusiwen/minfer/issues/211)):
+  the `test-linux-cpu` job runs `cargo fmt --all --check` before the suite, with
+  the toolchain step installing the `rustfmt` component *for the pinned 1.97.1*
+  (`dtolnay/rust-toolchain@1.97.1` + `components: rustfmt` — 1.97.1 ships no
+  rustfmt by default). The pinned toolchain's rustfmt is used deliberately, never
+  `stable`'s: a formatter that disagrees with the toolchain is exactly how a
+  "green CI, red hook" split appears.
+- **In a nested worktree** (`.worktrees/<scope>`, the documented parallel-work
+  shape) only tracked files exist, so the ignored `.pre-commit-config.yaml` is
+  absent and `pre-commit run` cannot work. The substitute is the CI command
+  itself, after installing the component once:
+  `rustup component add rustfmt --toolchain 1.97.1 && cargo fmt --all --check`.
+  `cargo fmt` reads `rust-toolchain.toml`, so it uses the pinned rustfmt rather
+  than whichever one `stable` happens to carry.
 
 ## macOS / Metal notes
 

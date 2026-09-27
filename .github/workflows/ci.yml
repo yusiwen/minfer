@@ -1,5 +1,5 @@
-# CI — six jobs: one per backend that can be checked without a device, plus the
-# documentation gate, the viz gate and the PR-body gate.
+# CI — seven jobs: one per backend that can be checked without a device, plus the
+# documentation gate, the viz gate, the workflow-lint gate and the PR-body gate.
 #
 # 1. test-linux-cpu   : the runtime net. Runs the whole unit suite (the
 #                       integration tests under tests/ need a GGUF model that is
@@ -9,6 +9,10 @@
 #                       compilation. It tees its own log and
 #                       `scripts/check_status.py --check-live` compares the
 #                       `x86_64 (CI runner)` suite counts against it (#94).
+#                       It also runs `cargo fmt --all --check` (#211) before the
+#                       suite: the toolchain step installs the `rustfmt` component
+#                       *for 1.97.1*, so the formatter is the one the pinned
+#                       toolchain names, never `stable`'s.
 # 2. build-linux-cuda : compile check for the CUDA backend in NVIDIA's own devel
 #                       image. GitHub runners have no GPU, so this cannot run
 #                       anything — it catches nvcc/kernel-compile breakage only.
@@ -34,13 +38,34 @@
 #                       boots viz/e2e.js on a stubbed DOM/canvas and plays every
 #                       step, so a crash in the render path fails here. Both are
 #                       dependency-free Node, so the job needs no setup step.
-# 6. check-pr-body    : the PR-body gate (#175, enforcing the gate contract's
+# 6. lint-workflows   : the workflow gate (#178). `scripts/lint_workflows.sh`
+#                       downloads a pinned actionlint release tarball, verifies
+#                       its per-architecture sha256, and refuses to lint with
+#                       unverified bytes. GitHub reports a workflow that does not
+#                       *parse*; an unknown `runs-on` label, a `types:` value that
+#                       is not a real pull-request activity, an `if:` that cannot
+#                       be evaluated and a `needs:` naming a missing job are all
+#                       green there and caught here. Shellcheck integration is off
+#                       on purpose (see the script's header): its presence is not
+#                       pinned, so leaving it on would make the verdict depend on
+#                       the runner image rather than on the pinned binary.
+# 7. check-pr-body    : the PR-body gate (#175, enforcing the gate contract's
 #                       rules 3 and 5). `scripts/check_pr_body.py --selftest` runs
 #                       the checker's own pass/fail cases, then the checker reads
 #                       the body handed over through `env:` and refuses a body
 #                       missing a required heading or leaving a gate section empty.
 #                       `pull_request` only: a push to master has no PR body. It
 #                       needs no token and no network, so it works on a fork PR.
+#                       It is also the one job that must keep running when the PR
+#                       body is *edited* — see the paragraph below.
+#
+# A `pull_request` `edited` event changes no code, but `types:` is workflow-level:
+# without a guard, fixing a typo in a PR body would re-run every job against an
+# unchanged tree. Jobs 1–6 therefore carry
+#   if: github.event_name != 'pull_request' || github.event.action != 'edited'
+# and report `skipped` on such an event, while check-pr-body (whose input *is* the
+# edited body) stays unconditional on `pull_request`. A push, `opened`,
+# `synchronize` and `reopened` still run every job exactly as before (#177).
 #
 # `actions/checkout` is pinned to its Node.js 24 major (v5): the v4 line still
 # ships the Node.js 20 runtime, which GitHub now force-runs on 24 and reports as
@@ -55,14 +80,27 @@ on:
     branches: [master]
     # `edited` is what makes a body fix re-run the check: without it a PR whose
     # job failed on a missing section stays red after the section is filled in.
+    # The other six jobs carry an `if:` that makes an `edited` event a no-op for
+    # them (#177): only check-pr-body reads the new body.
     types: [opened, synchronize, reopened, edited]
 
 jobs:
   test-linux-cpu:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
+      # `components: rustfmt` installs the formatter *for the pinned toolchain*:
+      # 1.97.1 ships no rustfmt by default, and the `stable` one is a different
+      # version — a formatter that disagrees with the toolchain is exactly how a
+      # "green CI, red local hook" split appears (#211).
       - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+      # Formatting first: it costs seconds and short-circuits the long suite.
+      # rustfmt names every file it would change.
+      - name: Formatting (rustfmt for 1.97.1)
+        run: cargo fmt --all --check
       # `set -o pipefail` is not inherited: GitHub's default shell is `bash -e {0}`.
       # Without it `cargo test | tee LOG` reports *tee*'s status, so a failing suite
       # would leave this step green while the next one parses its log.
@@ -81,6 +119,7 @@ jobs:
   # `cargo build` alone silently skips them (that is how the A5 signature
   # change broke four CUDA test call sites without any local or CI signal).
   build-linux-cuda:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     container: nvidia/cuda:12.8.0-devel-ubuntu22.04
     steps:
@@ -99,6 +138,7 @@ jobs:
         run: cargo test --release --features cuda --no-run
 
   build-macos:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v5
@@ -109,6 +149,7 @@ jobs:
   # the half that catches rot: a renamed file leaves a dead link that `mdbook build`
   # renders without complaint, and a hand-edited counter drifts from its source.
   check-docs:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       # `fetch-depth: 0` is required, not cosmetic: `check_status.py --check` asserts
@@ -161,6 +202,7 @@ jobs:
   # the runner image; adding `actions/setup-node@v4` would drag in the Node.js 20
   # runtime the header comment warns about.
   check-viz:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
@@ -168,6 +210,18 @@ jobs:
         run: node scripts/check_viz_e2e.mjs
       - name: The animation must boot and play every step headlessly
         run: node scripts/check_viz_e2e_render.mjs
+
+  # The workflow gate (#178). `scripts/lint_workflows.sh` pins actionlint 1.7.12
+  # by release tarball *and* per-architecture sha256 (the `scripts/build_book.sh`
+  # precedent) and refuses to lint unverified bytes; shellcheck integration is
+  # disabled there on purpose. No toolchain, no cache: one checkout and one step.
+  lint-workflows:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
+    steps:
+      - uses: actions/checkout@v5
+      - name: Every workflow file must lint clean
+        run: scripts/lint_workflows.sh
 
   # The PR-body gate (#175): the two facts the gate contract asks a PR to state
   # in prose — the bar named *before* measuring and the mutation evidence — have
@@ -177,8 +231,10 @@ jobs:
   # `${{ github.event.pull_request.body }}` into a `run:` command would be a
   # script-injection hazard, and a PR body is attacker-controlled text.
   #
-  # `if:` keeps the job off a push to master, where there is no PR body. No API
-  # token and no network: `gh` is never called, so the job works for a fork PR.
+  # `if:` keeps the job off a push to master, where there is no PR body, and it is
+  # deliberately *not* guarded against `edited`: re-reading the edited body is the
+  # whole reason `edited` is in the trigger `types:` (#177). No API token and no
+  # network: `gh` is never called, so the job works for a fork PR.
   check-pr-body:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
