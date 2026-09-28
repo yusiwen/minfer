@@ -47,6 +47,8 @@ src/
 
 `src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op + NodeMeta · `builder.rs` GraphBuilder · `scheduler.rs` assign → split → execute · `backend.rs` + `cpu_backend.rs`/`metal_backend.rs`/`cuda_backend.rs` executors · `registry.rs` backend registry (F4; F5's `copy_cross`/`await_cross`) · `alloc.rs` liveness allocator + persistent KV regions (E4) · `allocplan.rs` size-class ladder + pure plan + `DeviceMemory`/`budget_decision` · `offload.rs` layer offload plan (E5) · `kvcache.rs` cell store, removal/shift/compaction, span list, prefix sharing (C1–C3, C8b) · `kvformat.rs` KV format + `MINFER_CACHE_TYPE` gate (C4) · `kvsession.rs` versioned KV session container (C5) · `cache.rs`/`params.rs` params-only graph reuse · `fusion.rs` SwiGLU fusion · `copystats.rs` split-boundary counters · `batch.rs` batch composition · `dot.rs`/`json.rs` exporters.
 
+Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test)] mod tests;`, so a non-test build does not parse them (e.g. `src/graph/alloc/tests.rs` for `src/graph/alloc.rs`). `src/graph/op_matrix.rs` was already this pattern. Note this buys build *hygiene*, not speed: a warm `cargo check --release --features cuda` measured 1.43–1.45 s with the tests inline vs 1.52–1.57 s extracted.
+
 ## Build & Run
 
 ```bash
