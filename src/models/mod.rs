@@ -113,10 +113,6 @@ pub enum Device {
 }
 
 impl Device {
-    pub fn is_gpu(self) -> bool {
-        !matches!(self, Device::Cpu)
-    }
-
     /// Whether this device's attention kernel can gather a `kv_map` window — a
     /// query's allowed cells as a list of `(cell, len)` runs (C8b S4).
     ///

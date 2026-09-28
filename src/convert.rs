@@ -140,8 +140,6 @@ impl HfDtype {
 /// One tensor discovered in the checkpoint, with where its bytes live.
 #[derive(Debug, Clone)]
 pub struct HfTensor {
-    /// HuggingFace name, e.g. `model.layers.0.self_attn.q_proj.weight`.
-    pub hf_name: String,
     /// GGUF name, e.g. `blk.0.attn_q.weight`.
     pub gguf_name: String,
     /// HF shape, `[out, in]` row-major (already reversed for GGUF by the caller).
@@ -219,6 +217,15 @@ pub struct HfCheckpoint {
     pub files: Vec<SafeFile>,
     pub tensors: Vec<HfTensor>,
     /// Tensor order as it will be written (canonical, not header order).
+    ///
+    /// Kept, with an allowance rather than deleted: `canonical_order` computes the
+    /// permutation but nothing applies it — the writer emits `specs` in the
+    /// name-sorted order `HfCheckpoint::open` produced, so the field records an
+    /// intent that was never wired. Whether to apply it (which changes the output
+    /// file's tensor order, and therefore what #209's `convert_hf_to_gguf.py`
+    /// comparison sees) or to drop it is a decision for that ticket, not for a
+    /// dead-code cleanup.
+    #[allow(dead_code)]
     pub order: Vec<usize>,
 }
 
@@ -258,8 +265,10 @@ impl HfCheckpoint {
             safe_files.push(SafeFile::open(s)?);
         }
 
-        // Parse every shard's header. BTreeMap iteration sorts tensor names,
-        // which is deterministic; the canonical write order is re-imposed below.
+        // Parse every shard's header. BTreeMap iteration sorts tensor names, which
+        // is deterministic, and that *name-sorted* order is what the writer emits:
+        // `order` below records the canonical permutation, but nothing applies it
+        // (see the field's note).
         let mut found: BTreeMap<String, HfTensor> = BTreeMap::new();
         for (fi, sf) in safe_files.iter().enumerate() {
             let v: Value = serde_json::from_slice(&sf.header)
@@ -317,7 +326,6 @@ impl HfCheckpoint {
                 found.insert(
                     name.clone(),
                     HfTensor {
-                        hf_name: name.clone(),
                         gguf_name,
                         shape,
                         dtype,
@@ -540,8 +548,6 @@ pub fn convert_bytes(dtype: HfDtype, out: OutType, src: &[u8]) -> Vec<u8> {
 // === config.json ===
 
 pub struct Config {
-    pub model_type: String,
-    pub architectures: Vec<String>,
     pub n_layer: i64,
     pub hidden_size: i64,
     pub n_head: i64,
@@ -594,8 +600,6 @@ impl Config {
         let n_head_kv = get_i("num_key_value_heads").unwrap_or(n_head);
         let intermediate = get_i("intermediate_size").ok_or("config.json: intermediate_size")?;
         Ok(Self {
-            model_type,
-            architectures,
             n_layer,
             hidden_size,
             n_head,
@@ -930,7 +934,6 @@ pub struct Conversion {
     pub kv: Vec<crate::gguf::GgufKv>,
     pub specs: Vec<TensorSpec>,
     pub ckpt: HfCheckpoint,
-    pub out: OutType,
     /// The output GGUF type per tensor. For `f16`/`bf16` output this is F32 for
     /// 1-D tensors (norms and biases) — llama.cpp's "except 1d tensors" rule, and
     /// what the engine's f32 norm/bias path consumes. For `f32` output every
@@ -968,7 +971,6 @@ impl Conversion {
             kv,
             specs,
             ckpt,
-            out,
             targets,
         })
     }
