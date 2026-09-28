@@ -1145,6 +1145,7 @@ impl Conversation {
     /// **nothing**. The message list is part of it (not just the token bookkeeping), so a
     /// resumed session can render its next turn's delta from the same history the KV was
     /// built from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot(&self) -> ConversationSnapshot {
         ConversationSnapshot {
             messages: self.messages.clone(),

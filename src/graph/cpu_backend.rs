@@ -981,6 +981,7 @@ fn decode_window(
 /// (tests and the causal fixture): `span[t] = (lo, hi)` is one run of `hi - lo`
 /// cells. The Op::Attn path decodes the window input itself, so it can carry a
 /// list of runs (C8b S2) and not only a contiguous range.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cpu_gqa_attn(
     q: &[f32],
     ka: &[f32],

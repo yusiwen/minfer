@@ -163,6 +163,7 @@ impl PyValue {
     }
 
     /// Fixture comparison form (the JSON encoding of the CPython result).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn to_json(self) -> serde_json::Value {
         match self {
             PyValue::Str(s) => serde_json::Value::String(s),

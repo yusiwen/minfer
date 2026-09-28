@@ -86,11 +86,13 @@ impl GraphCache {
 
     /// (builds, reuses) since the cache was created — the observable behind "a switch stopped
     /// rebuilding" (E4 S3's acceptance).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stats(&self) -> (usize, usize) {
         (self.builds, self.reuses)
     }
 
     /// How many graphs are cached right now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cached_graphs(&self) -> usize {
         self.graphs.len()
     }

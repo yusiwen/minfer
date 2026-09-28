@@ -578,6 +578,7 @@ impl KvCache {
 
     /// The single-sequence case: reserve the whole arena for `seq` if it has no
     /// reservation yet, then take ownership of `0..n_used`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn own_prefix(&mut self, seq: SeqId, n_used: usize) {
         if !self.seqs.contains_key(&seq) {
             let cap = self.n_ctx;
@@ -678,6 +679,7 @@ impl KvCache {
 
     /// Sliding-window special case of [`KvCache::after_rm`]: drop the oldest
     /// `drop` rows, so every survivor's position decreases by `drop`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn after_shift(&mut self, drop: usize) -> Result<usize, String> {
         self.after_rm(0, drop)
     }
@@ -691,6 +693,7 @@ impl KvCache {
     /// layout, and this returns `Err` instead of letting attention bound itself
     /// to the wrong window; a per-cell mask is what a hole-creating layout would
     /// need (C3/D1).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn seq_range(&self, layer: usize, seq: SeqId) -> Result<Option<(usize, usize)>, String> {
         if !self.layers.contains_key(&layer) {
             return Err(format!("no KV arena for layer {layer}"));
@@ -883,6 +886,7 @@ impl KvCache {
 
     /// Rows `seq` wrote into its **own** run — the rows a relocation copies, since
     /// the shared prefix is another sequence's memory (C8b S2).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn private_written(&self, seq: SeqId) -> usize {
         self.seqs.get(&seq).map_or(0, |s| s.private_written())
     }

@@ -143,9 +143,12 @@ fn no_fused_support(_fused: &FusedOp) -> bool {
 /// code and cannot diverge.
 #[derive(Clone, Copy)]
 pub struct BackendCaps {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub supports_op: fn(&Op, DType) -> bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub supports_fused: fn(&FusedOp) -> bool,
     /// Whether attention can be bounded from the explicit `attn_span` (E1).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub supports_attn_span: bool,
     /// Whether the attention kernel reads a packed `q8_0` KV region (C4).
     ///
@@ -173,6 +176,7 @@ impl BackendCaps {
 pub struct BackendEntry {
     pub handle: Backend,
     /// The canonical name (`resolve_name` matches it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub name: &'static str,
     /// Assignment priority, higher first (see the module docs).
     pub priority: u16,
@@ -334,6 +338,7 @@ pub fn init() {
 }
 
 /// Every accepted name, in id order.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn names() -> &'static [&'static str; N_BACKENDS] {
     &NAMES
 }
@@ -464,6 +469,7 @@ impl BackendFilter {
     }
 
     /// Whether this is "no fence" (every backend allowed).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_unfiltered(&self) -> bool {
         self.allowed.iter().all(|a| *a)
     }

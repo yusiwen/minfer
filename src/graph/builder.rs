@@ -181,6 +181,7 @@ impl GraphBuilder {
     /// The composition is proven in production by D2: `fused_ffn_composition` is
     /// a concat matmul whose gate/up halves are consumed through two such
     /// windows.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn split_parts(&mut self, owner: NodeId, sizes: &[usize]) -> Vec<NodeId> {
         let out_shape = self.graph.nodes[owner].out_shape;
         let total: usize = sizes.iter().sum();
