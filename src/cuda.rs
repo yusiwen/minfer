@@ -123,6 +123,11 @@ extern "C" {
     fn cudaEventRecord(event: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
     fn cudaEventSynchronize(event: *mut std::ffi::c_void) -> i32;
     fn cudaEventDestroy(event: *mut std::ffi::c_void) -> i32;
+    /// Kept ahead of its only caller: #138 (the F5 device→device overlap) names
+    /// this as the device-consumer wait, and `docs/BACKEND-REGISTRY-DESIGN.md` §11
+    /// documents it as the mechanism for the one copy class no backend implements
+    /// yet.
+    #[allow(dead_code)]
     fn cudaStreamWaitEvent(
         stream: *mut std::ffi::c_void,
         event: *mut std::ffi::c_void,
@@ -3301,6 +3306,11 @@ impl CudaState {
 
     /// F5: make every later operation on the stream wait for `ev`, **without
     /// blocking the host** — the synchronization point of a device consumer.
+    ///
+    /// No caller yet by construction: #138 is the ticket that wires it into the
+    /// device→device staging copy, and `docs/BACKEND-REGISTRY-DESIGN.md` §11 keeps
+    /// it as that path's mechanism.
+    #[allow(dead_code)]
     pub fn stream_wait_event(&self, ev: *mut std::ffi::c_void) -> Result<(), String> {
         let err = unsafe { cudaStreamWaitEvent(self.stream(), ev, 0) };
         if err != 0 {

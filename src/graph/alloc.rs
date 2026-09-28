@@ -484,11 +484,6 @@ impl GraphAllocator {
         self.offload = plan;
     }
 
-    /// The offload plan in force (E5).
-    pub fn offload_plan(&self) -> Option<super::offload::OffloadPlan> {
-        self.offload
-    }
-
     /// Liveness analysis + allocation for every node buffer.
     ///
     /// Runs on every graph (re)build: previous liveness buffers are released

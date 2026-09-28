@@ -226,11 +226,6 @@ impl AllocPlan {
             reused,
         }
     }
-
-    /// Class sizes, in interval order.
-    pub fn class_of(&self, interval: usize) -> usize {
-        self.classes[interval]
-    }
 }
 
 /// The live-bytes peak of a placement: walk the steps, adding each interval's class when

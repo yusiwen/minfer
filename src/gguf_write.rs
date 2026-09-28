@@ -20,9 +20,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::gguf::{
-    ggml_pad, GgmlType, GgufKv, GgufType, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION,
-};
+use crate::gguf::{ggml_pad, GgmlType, GgufKv, GgufType, GGUF_MAGIC, GGUF_VERSION};
 
 // === Metadata keys the writer itself owns (llama.cpp's LLM_KV_* spellings) ===
 
@@ -33,8 +31,6 @@ pub const KEY_SPLIT_COUNT: &str = "split.count";
 /// Total tensor count across all parts (llama.cpp writes this too; the reader
 /// does not consume it, but a tool that reads the file should see it).
 pub const KEY_SPLIT_TENSORS_COUNT: &str = "split.tensors.count";
-/// The alignment key, read back into `GgufContext::alignment`.
-pub const KEY_GENERAL_ALIGNMENT: &str = "general.alignment";
 
 /// One tensor to write, described by the GGUF index fields the parser reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,25 +56,6 @@ impl TensorSpec {
     pub fn nbytes(&self) -> usize {
         let n: i64 = self.ne.iter().product();
         (n / self.type_.blck_size()) as usize * self.type_.type_size()
-    }
-
-    /// The parsed index form (offset filled in by the writer).
-    pub fn to_info(&self, offset: u64) -> crate::gguf::GgufTensorInfo {
-        let mut nb = [0usize; 4];
-        let ts = self.type_.type_size();
-        let bs = self.type_.blck_size() as usize;
-        nb[0] = ts;
-        nb[1] = nb[0] * (self.ne[0] as usize / bs);
-        for j in 2..4 {
-            nb[j] = nb[j - 1] * self.ne[j - 1] as usize;
-        }
-        crate::gguf::GgufTensorInfo {
-            name: self.name.clone(),
-            ne: self.ne,
-            nb,
-            type_: self.type_,
-            offset,
-        }
     }
 }
 
@@ -487,11 +464,6 @@ where
         written.push(path);
     }
     Ok(written)
-}
-
-/// The default alignment a converted file uses (llama.cpp's `GGUF_DEFAULT_ALIGNMENT`).
-pub fn default_alignment() -> usize {
-    GGUF_DEFAULT_ALIGNMENT
 }
 
 #[cfg(test)]

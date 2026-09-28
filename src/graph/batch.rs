@@ -49,10 +49,6 @@ impl Batch {
         self.tokens.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
-    }
-
     /// Distinct sequences, in first-appearance order.
     pub fn seqs(&self) -> Vec<SeqId> {
         let mut out: Vec<SeqId> = Vec::new();
