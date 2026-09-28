@@ -164,9 +164,10 @@ roadmap §4 defects automatically.
 ### A1 — Op × dtype × backend matrix  · item 23 · M — **DONE**
 - **Files:** new `src/graph/op_matrix.rs`, registered as `#[cfg(test)] mod
   op_matrix;`. It needs the crate's internals (the allocator, the backends), so
-  it lives in the module tree rather than under `tests/` — the crate is a
-  binary, and the existing `tests/*.rs` files get at the code with `#[path]`
-  includes, which this would have made worse.
+  it lives in the module tree rather than under `tests/` — the crate is a binary
+  target, so a file under `tests/` is a **separate crate** that cannot name the
+  binary's items at all (there is no `lib` target to link against). The test must
+  therefore be an in-crate module.
 - **Three tests:**
   1. `matrix_cases_match_their_reference` — 17 cases (Add, Mul, Scale, Silu,
      SwiGLU, Softmax, RmsNorm, QkNorm, MatMul, GetRows, View/Reshape/Permute,
