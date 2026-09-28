@@ -82,6 +82,10 @@ fn unaccounted_budget_note(note: &str) {
 /// device query: it silently reported **0 registered weights**, so `weights + activations
 /// > budget` under-charged the budget by every resident weight. Recovering the value and
 /// saying so keeps the accounting honest.
+///
+/// The CUDA weight registry is its only production caller (`cuda.rs`); the CPU
+/// tests pin the poisoned-lock path, so the item must also exist under `test`.
+#[cfg(any(feature = "cuda", test))]
 pub fn weights_from_lock<T, F>(lock: std::sync::LockResult<T>, what: &str, sum: F) -> usize
 where
     F: FnOnce(&T) -> usize,
@@ -2592,6 +2596,9 @@ impl GraphAllocator {
 
     /// F5: the counters are mutated by the boundary and by the registry hooks;
     /// this is the hook-facing accessor.
+    ///
+    /// Only the CUDA hooks mutate them today; #137's Metal port widens this cfg.
+    #[cfg(feature = "cuda")]
     pub fn cross_stats_mut(&mut self) -> &mut CrossCopyStats {
         &mut self.cross_stats
     }
@@ -2635,6 +2642,10 @@ impl GraphAllocator {
     ///
     /// **Raw accessor**: it does not check the phase-B contract (F5) — use
     /// [`Self::cross_input`] on the consumer path.
+    ///
+    /// The CUDA staging hooks are its only production readers today; the CPU
+    /// tests read it, and #137's Metal port widens this cfg.
+    #[cfg(any(feature = "cuda", test))]
     pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
         self.cross.get(&(uid, node_id, backend)).copied()
     }

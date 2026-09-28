@@ -102,6 +102,9 @@ impl KvFormat {
     }
 
     /// Bytes one cell occupies.
+    ///
+    /// CUDA's packed-KV path and this module's own tests are its callers.
+    #[cfg(any(feature = "cuda", test))]
     pub fn row_bytes(self, nkt: usize) -> usize {
         self.row_elems(nkt) * WORD_BYTES
     }
