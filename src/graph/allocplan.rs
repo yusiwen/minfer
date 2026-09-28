@@ -70,6 +70,7 @@ pub enum DeviceMemory {
 
 impl DeviceMemory {
     /// The reported free bytes, or `None` when no measurement exists.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn free_bytes(&self) -> Option<usize> {
         match self {
             DeviceMemory::Reported { free, .. } => Some(*free),
@@ -145,6 +146,7 @@ pub fn budget_decision(explicit: Option<usize>, mem: &DeviceMemory) -> BudgetDec
 
 /// The plan for one backend's activations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct AllocPlan {
     /// Per interval, in the order given: the class it will be handed (elements).
     pub classes: Vec<usize>,
@@ -169,6 +171,7 @@ impl AllocPlan {
     /// plan is deterministic); a buffer of class `c` freed at step `f` may be handed to
     /// the next interval of that class whose `first_use > f`. That is exactly the rule
     /// the pool's free list implements, which is why the plan's numbers are the pool's.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn plan(intervals: &[(usize, usize, usize)]) -> AllocPlan {
         let mut order: Vec<usize> = (0..intervals.len()).collect();
         order.sort_by_key(|&i| (intervals[i].1, i));
@@ -225,6 +228,7 @@ impl AllocPlan {
 
 /// The live-bytes peak of a placement: walk the steps, adding each interval's class when
 /// its lifetime starts and removing it when it ends.
+#[cfg_attr(not(test), allow(dead_code))]
 fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
     if intervals.is_empty() {
         return 0;

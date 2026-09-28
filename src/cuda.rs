@@ -529,6 +529,7 @@ extern "C" {
     // already named on stderr with `cudaGetErrorName` where it was made). The
     // caller reports the count; the attribute requests that exceed the device's
     // opt-in limit are deliberately skipped with the reason printed.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn gemm_prefill_smem_init() -> i32;
     // #145 introspection: the opt-in decision, for the startup report and the
     // `cuda_prefill_smem_optin_*` gate. `gemm_smem_need` is the single-source
@@ -536,6 +537,7 @@ extern "C" {
     // `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` back.
     #[allow(dead_code)] // read by the #145 device gate, not by a non-test build
     fn gemm_prefill_smem_checked() -> i32;
+    #[cfg_attr(not(test), allow(dead_code))]
     fn gemm_prefill_smem_skipped() -> i32;
     #[allow(dead_code)] // read by the #145 device gate
     fn gemm_prefill_smem_limit() -> i32;
@@ -2009,6 +2011,7 @@ pub fn layout_of(format: crate::graph::kvformat::KvFormat) -> i32 {
 /// The `KvFormat` a `KV_LAYOUT_*` tag names. The inverse of [`layout_of`]; an
 /// unknown tag is F32, the pre-C4 reading, and is only reachable from an internal
 /// bug (the tag is never parsed from a file or the environment).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn format_of(layout: i32) -> crate::graph::kvformat::KvFormat {
     use crate::graph::kvformat::KvFormat;
     match layout {
@@ -2871,6 +2874,7 @@ impl CudaState {
     /// `(name, bytes)`. The plane's only consumer is the NB-BT q4_K kernel, so this is
     /// the exact set of device buffers a load that is *not* q4_K must leave empty — the
     /// registry query the #165 gate and its before/after accounting read by name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn q4dsc_planes(&self) -> Vec<(String, usize)> {
         self.weights
             .lock()
@@ -2909,6 +2913,7 @@ impl CudaState {
     /// decode), so this performs exactly that lookup rather than looking the sibling name
     /// up in the registry — which is the part a name-only assertion cannot see. `None`
     /// when the weight is not registered at all.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
         let wp = self.get_weight_ptr(name)?;
         if wp.is_null() {

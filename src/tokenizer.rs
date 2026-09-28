@@ -74,6 +74,7 @@ impl PreTokenizer {
     }
 
     /// The `tokenizer.ggml.pre` spelling this rule was selected from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn gguf_name(self) -> &'static str {
         match self {
             Self::Qwen2 => "qwen2",

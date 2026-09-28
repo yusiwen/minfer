@@ -40,6 +40,7 @@ pub struct OffloadPlan {
 impl OffloadPlan {
     /// A plan with every block on the device (what an unset request resolves to when a
     /// device is available).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn all_on_device(n_layers: usize) -> Self {
         Self {
             gpu_layers: n_layers,
@@ -133,6 +134,7 @@ pub enum OffloadRequest {
     /// read, and which its own second arm had to unset. The repo's convention is
     /// an explicit argument over a mutated environment — `load_model_configured`'s
     /// explicit cache type is the precedent (#99, #153).
+    #[cfg_attr(not(test), allow(dead_code))]
     AutoWithBudget(usize),
 }
 

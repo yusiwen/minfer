@@ -355,6 +355,7 @@ impl GraphAllocator {
     ///
     /// E5: `supports_for` with `layer = None` (no offload policy) — kept for callers that
     /// only ask "does any backend have this op", like the op matrix.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
         self.supports_for(op, dtype, None)
     }
@@ -905,6 +906,7 @@ impl GraphAllocator {
 
     /// Set (or clear, with `None`) a backend's memory budget. Tests and a future
     /// offload policy use it; `None` restores the default.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_memory_budget(&mut self, backend: Backend, budget: Option<usize>) {
         match budget {
             Some(b) => {
@@ -1217,6 +1219,7 @@ impl GraphAllocator {
     /// rows of every layer's KV arena and re-rope the survivors by `-drop`, so
     /// the same tokens become addressable at `pos - drop`. Returns the new
     /// written-row count.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_shift(
         &mut self,
         drop: usize,
@@ -1226,6 +1229,7 @@ impl GraphAllocator {
     }
 
     /// Written rows in a layer's arena (`n_used`), or `None` before allocation.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_n_used(&self, layer: usize) -> Option<usize> {
         self.kv.get(layer).map(|l| l.n_used)
     }
@@ -1233,6 +1237,7 @@ impl GraphAllocator {
     /// Record that the arena now holds rows `0..n_used` (Phase C / C2). The
     /// model calls this after a forward with `max(positions) + 1`, which is the
     /// only place that knows how far the KV store wrote.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_note_used(&mut self, n_used: usize) {
         self.kv.own_prefix(super::kvcache::SEQ_MAIN, n_used);
     }
@@ -1266,6 +1271,7 @@ impl GraphAllocator {
     /// Reserve a contiguous cell run for `seq` (Phase E / E2). Several
     /// sequences share one arena this way; `Err` when no run fits — see
     /// [`Self::kv_reserve_seq_with_defrag`] for the C3 retry.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_reserve_seq(
         &mut self,
         seq: super::kvcache::SeqId,
@@ -1647,6 +1653,7 @@ impl GraphAllocator {
 
     /// Mark cells `[from, to)` as written by `seq` in every layer (E2's batched
     /// forwards write several sequences per step).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_own_range(&mut self, seq: super::kvcache::SeqId, from: usize, to: usize) {
         self.kv.own_range(seq, from, to);
     }
@@ -1714,6 +1721,7 @@ impl GraphAllocator {
     /// cannot drift apart. `max(positions) + 1` is exactly the row count the KV
     /// store writes in this forward, recorded *before* the span is resolved
     /// because the span has to describe the cache the store is about to fill.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fill_attn_inputs(
         &mut self,
         graph: &ComputeGraph,
@@ -1837,6 +1845,7 @@ impl GraphAllocator {
     /// resolver and refuses a position inside a shared prefix (a write there would go
     /// through to the donor), while this answers "where would a reader look?", which
     /// is what a caller snapshotting a sharing sequence's rows needs.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
         self.kv.cell_of(seq, pos)
     }
@@ -2160,6 +2169,7 @@ impl GraphAllocator {
     /// The header records the shape, the KV element type and the backend, so a
     /// load can refuse a file that does not describe *this* arena instead of
     /// applying it. All layers must agree on the shape: a session is one arena.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_save(&mut self, path: &Path) -> Result<KvSessionReport, String> {
         self.kv_save_with_host(path, &[])
     }
@@ -2225,6 +2235,7 @@ impl GraphAllocator {
     /// checksum, end-of-file) **before** a single byte is written into a pool, so
     /// a truncated, corrupted or foreign file leaves the allocator untouched. The
     /// header must match what the caller knows from the model (`expect`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_load(
         &mut self,
         path: &Path,

@@ -102,16 +102,19 @@ pub struct GrammarState {
 
 impl GrammarState {
     /// The state is a complete, acceptable string (end-of-generation is legal).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_accepting(&self) -> bool {
         self.accepting
     }
 
     /// Bytes of an incomplete UTF-8 character carried across the last token.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_bytes(&self) -> usize {
         self.inner.partial.len()
     }
 
     /// Number of states whose mask is cached (bounded by `MAX_MASK_CACHE`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cached_states(&self) -> usize {
         self.cache.len()
     }
@@ -288,11 +291,13 @@ impl Grammar {
     /// the automaton never entered a dead state on it. This is the honest
     /// assertion for a generation truncated by the length limit: the whole text
     /// need not be a complete instance, but every byte emitted was legal.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn accepts_prefix(&self, bytes: &[u8]) -> bool {
         self.consume(&self.initial_key(), bytes).is_ok()
     }
 
     /// True when the byte string is a complete sentence of the grammar.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn accepts(&self, bytes: &[u8]) -> bool {
         match self.consume(&self.initial_key(), bytes) {
             Ok(next) => self.state_key_accepting(&next),
@@ -300,6 +305,7 @@ impl Grammar {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn initial_key(&self) -> StateKey {
         StateKey {
             stacks: self

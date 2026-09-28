@@ -239,6 +239,7 @@ impl CudaBackend {
 
     /// The stream this backend issues its device work on (test introspection +
     /// the #188 concurrency gate's "two engines really do hold two streams" arm).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn device_stream(&self) -> *mut std::ffi::c_void {
         self.stream
     }
@@ -284,6 +285,7 @@ impl CudaBackend {
     /// The `KvFormat` this backend's regions store (the registry's `kv_format`
     /// hook, C5's session header). The tag is set from the engine's resolved format,
     /// so this is the engine's answer, not a process-wide one.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kv_format(&self) -> super::kvformat::KvFormat {
         crate::cuda::format_of(self.kv_layout)
     }
@@ -1718,6 +1720,7 @@ impl CudaBackend {
         <crate::cuda::CudaState>::cuda_free(ptr);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn elems(&self, id: usize) -> usize {
         self.pool[id].bytes / 4
     }
