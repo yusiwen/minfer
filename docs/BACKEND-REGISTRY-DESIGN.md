@@ -142,8 +142,8 @@ allocator's dispatch helpers ask the entry for the pool and then call the
 `Backend` trait method (`synchronize`, `copy_cells`, `write_host`, …) on it.
 The two backends that have a native host-read path different from the trait's
 borrowed `read_host` (CUDA's stream-ordered `copy_to_host`) say so in
-`host_read`, which is why `copy_to_cpu`, `read_pool` and the CUDA KV debug read
-all collapse to one call without a `match`.
+`host_read`, which is why `copy_to_cpu` and the CUDA KV debug read all
+collapse to one call without a `match`.
 
 `enable` is the lazy "a session names this backend, so bring its pool up"
 hook; `unavailable` is the runtime probe (device present, not disabled) used by

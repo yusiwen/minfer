@@ -1277,7 +1277,7 @@ mod tests {
             // dequantize → rope → requantize; that requantization is the new term, on top
             // of the one the plain run above already carries. On the device arm this is
             // where the packed region's bytes round-trip through the CUDA pool
-            // (`read_pool` → `map_q8_0_cells` → `write_pool`) and move through
+            // (`copy_kv_to_cpu` → `map_q8_0_cells` → `write_pool`) and move through
             // `kv_move_rows` one whole word per cell.
             //
             // The shift drops the oldest `drop` rows of a longer prefill and continues,

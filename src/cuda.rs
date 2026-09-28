@@ -2336,12 +2336,6 @@ impl CudaState {
         crate::graph::allocplan::DeviceMemory::Reported { free, total }
     }
 
-    /// Free device bytes, or `None` when the query failed (E5's `auto` fit refuses rather
-    /// than reading a failure as "0 bytes free"; issue #122).
-    pub fn device_free_bytes(&self) -> Option<usize> {
-        self.device_memory().free_bytes()
-    }
-
     pub fn register_weight(&self, name: &str, data: &[u8]) {
         if data.is_empty() {
             return;

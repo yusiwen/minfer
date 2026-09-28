@@ -2687,16 +2687,6 @@ impl GraphAllocator {
         pool.copy_cells(dst, src, dst_row, src_row, rows, elems_per_cell)
     }
 
-    /// Host read of one pool region by reference (the read side of
-    /// [`Self::write_pool`]): C3's re-rope needs the K rows on the host.
-    fn read_pool(&mut self, r: BufRef) -> Option<Vec<f32>> {
-        let window = |s: &[f32]| -> Vec<f32> {
-            let end = (r.offset + r.len).min(s.len());
-            s[r.offset.min(end)..end].to_vec()
-        };
-        (r.backend.entry()?.host_read)(self, r.id).map(|v| window(&v))
-    }
-
     /// Write host data into a pool buffer of `backend` (shared by the staging
     /// paths of `copy_across`).
     fn write_pool(&mut self, backend: Backend, id: usize, data: &[f32]) -> Result<(), String> {
