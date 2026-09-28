@@ -65,7 +65,13 @@ const DEBUG_NAMES: [&str; N_BACKENDS] = ["CPU", "Metal", "Cuda"];
 /// Assignment priorities (higher wins). The values are arbitrary but pinned by
 /// `the_registered_set_and_priority_order_are_pinned`; the *order* is the
 /// pre-F4 behaviour (Metal, then CUDA, then CPU).
+///
+/// Each device constant is gated on the cfg whose backend module uses it, so a
+/// build without that backend does not carry it (`metal_backend.rs` is
+/// `target_os = "macos"`, `cuda_backend.rs` is `feature = "cuda"`).
+#[cfg(target_os = "macos")]
 pub const PRIORITY_METAL: u16 = 300;
+#[cfg(feature = "cuda")]
 pub const PRIORITY_CUDA: u16 = 200;
 pub const PRIORITY_CPU: u16 = 100;
 

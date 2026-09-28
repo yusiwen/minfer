@@ -59,9 +59,16 @@ pub fn class_bytes(elems: usize) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceMemory {
     /// The backend answered: `free` of `total` bytes.
+    ///
+    /// Only the CUDA query constructs these two variants today (`cuda.rs`) and
+    /// the planner's own tests construct them. `allow` rather than `#[cfg]`
+    /// because removing a variant changes the enum's shape and would force the
+    /// same cfg onto every `match` arm here and in `offload.rs`.
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
     Reported { free: usize, total: usize },
     /// The query itself failed. `code` is the backend's error code and `name` its
     /// symbolic name (for CUDA, `cudaGetErrorName`, e.g. `cudaErrorIllegalAddress`).
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
     QueryFailed { code: i32, name: String },
     /// There is no device state to ask (CPU, or a device whose state could not be
     /// created).
