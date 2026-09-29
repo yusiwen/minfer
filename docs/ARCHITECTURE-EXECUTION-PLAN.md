@@ -2164,6 +2164,13 @@ have) cannot happen. The HTTP layer's request bound moved from a slot's share to
 whole arena (`AppState::n_ctx`); the serial path (batching off) keeps its own
 slot-sized bound, because its graph region really is that size.
 
+*(Forward note, 2026-09-29: `kv_own_range` in the sentence above is
+`GraphAllocator::kv_own_range`, which
+[#232](https://github.com/yusiwen/minfer/issues/232) deleted as dead surface — it was a
+one-line forwarder to `KvCache::own_range`, the function production actually calls (through
+`fill_batch_inputs` → `own_positions`, and through `kv_copy_prefix`). The sentence records
+what this step landed with; it is not a live API.)*
+
 **The boundary, and why it is no longer padded.** `tick` forwards the committed token
 *before* `advance` can report `length`, so a generation that reaches its cap used to
 perform one more forward at the cell after its last token — a whole weight pass whose
@@ -4094,7 +4101,10 @@ the new reservation test). The allocator exposes the E2-facing surface
 (`kv_reserve_seq`/`kv_release_seq`/`kv_seq_slot`/`kv_own_range`). *(Since
 [#228](https://github.com/yusiwen/minfer/issues/228) the classic case is
 `fill_batch_inputs`'s own `reserve_seq(seq, n_ctx)` when a group has no run, and
-`own_prefix` is test-only.)*
+`own_prefix` is test-only. Since [#232](https://github.com/yusiwen/minfer/issues/232),
+2026-09-29: `kv_own_range` was deleted from that surface — a one-line forwarder with no
+production caller; `KvCache::own_range` is the production-used function, and the `alloc`
+tests drive it directly.)*
 
 **E2 progress, step 2 (2026-09-17).** The batch entry point landed:
 `graph/batch.rs` defines `Batch { tokens, positions, seq_ids }` with `groups()`
@@ -5473,6 +5483,97 @@ locally; it is unchanged by construction (same test count) and the CI `test-linu
 log is its source. (3) The no-`cells` helper's claim is weak by nature ("filling a
 graph with no KV input resolves nothing and touches no arena"); it is kept because the
 ticket asks for exactly that shape, not because it catches a bug.
+
+#### Test-infrastructure record (#232, 2026-09-29) — `GraphAllocator::kv_own_range` deleted; the tests drive `KvCache::own_range`
+
+**The finding (S2 of [#227](https://github.com/yusiwen/minfer/issues/227)).**
+`GraphAllocator::kv_own_range` (`alloc.rs:1645-1650` on master `f4d3390`) was a one-line
+forwarder — `self.kv.own_range(seq, from, to)` — carrying
+`#[cfg_attr(not(test), allow(dead_code))]` and a doc that claimed a production role:
+*"Mark cells `[from, to)` as written by `seq` in every layer (E2's batched forwards write
+several sequences per step)."* Production does not call it; its only callers were five
+sites in `src/graph/alloc/tests.rs`.
+
+**One implementation, not two.** Unlike S1's `fill_attn_inputs`, the wrapper and production
+share **one** implementation: the inner, unannotated `KvCache::own_range`
+(`kvcache.rs:536`). It is production-reachable through two paths that do not go through the
+wrapper:
+
+- `fill_batch_inputs` (`alloc.rs:1697` on master) → `KvCache::own_positions`
+  (`kvcache.rs:574`) → `own_range`; production reaches `fill_batch_inputs` from
+  `models/qwen2/graph.rs:660` and `models/qwen3/graph.rs:567` (`forward_batch`).
+- `GraphAllocator::kv_copy_prefix` (`alloc.rs:1488`) → `own_range`; its production caller
+  is `server/batch.rs:821`.
+
+*(Correction to [#232]'s body and [#227]'s S2 text: they place `alloc.rs:1488` inside
+`kv_private_row_for`. It is not — `kv_private_row_for` (`alloc.rs:1516`) drives
+`KvCache::private_row_for`/`apply_private_row` and never calls `own_range`. Line 1488 is
+the tail of `kv_copy_prefix`. The conclusion — production does not call the wrapper — is
+unaffected, but the reachable path is the batch prefix-copy, not the copy-on-write.)*
+
+**The disposition (b): delete, and move the call sites to the production spelling.** The
+wrapper and its doc comment are deleted. All **five call sites** — in **four** test
+functions — now spell `a.kv.own_range(...)` / `alloc.kv.own_range(...)`:
+
+| test | call sites (master) | disposition |
+|---|---|---|
+| `kv_session_round_trips_the_rows_and_the_run_table` | `:433` | `a.kv.own_range(SEQ, 0, 4)` |
+| `an_f16_session_round_trips_through_save_and_load` | `:570` | `a.kv.own_range(SEQ, 0, 2)` |
+| `kv_defrag_moves_the_bytes_and_opens_the_run` | `:629` | `alloc.kv.own_range(seq, …)` |
+| `a_copy_on_write_moves_the_rows_and_never_writes_through` | `:739`, `:742` | `alloc.kv.own_range(1, 0, 4)` / `(2, 4, 6)` |
+
+`src/graph/alloc/tests.rs` is a child module of the type's module (`alloc.rs:2735`
+`#[cfg(test)] mod tests;`) and `kv` is a private field (`alloc.rs:174`), so the direct field
+access compiles **as predicted** — the fallback (`#[cfg(test)] impl GraphAllocator` inside
+`alloc/tests.rs`) was not needed. **Every assertion is unchanged**; the diff is the five
+spellings plus the deleted wrapper. The issue's "five tests" is five *call sites* in four
+test functions — no test was dropped or weakened.
+
+**Mutation evidence (rule 3), CPU aarch64, 2026-09-29.** The mutation is in the
+**production-used** `KvCache::own_range`: an off-by-one in the written extent —
+`Some(pos) => written = written.max(pos + 1)` → `written.max(pos)`.
+
+```
+cargo test --release graph::alloc::tests::
+test result: FAILED. 34 passed; 3 failed; 0 ignored; 480 filtered out
+
+---- graph::alloc::tests::a_copy_on_write_moves_the_rows_and_never_writes_through ----
+panicked at src/graph/alloc/tests.rs:743:47:
+called `Result::unwrap()` on an `Err` value:
+  "share_prefix: sequence 1 has written 3 rows, 4 requested"
+
+---- graph::alloc::tests::kv_session_round_trips_the_rows_and_the_run_table ----
+panicked at src/graph/alloc/tests.rs:445:5:
+assertion `left == right` failed: positions 0..4 are written
+  left: 3   right: 4
+
+---- graph::alloc::tests::kv_defrag_moves_the_bytes_and_opens_the_run ----
+panicked at src/graph/alloc/tests.rs:662:5:
+assertion `left == right` failed
+  left: 3   right: 4
+```
+
+Three of the four moved tests go red — the required "at least one" with margin. The fourth
+(`an_f16_session_round_trips_through_save_and_load`) stays green under this mutation because
+its `written` is already raised to the asserted value by `fill_batch_inputs`'s
+`own_positions`; only the owner-table half of its `own_range` call is load-bearing, and that
+half is what the copy-on-write test asserts. Mutation reverted; `grep -rn MUTATION src/`
+empty and `git diff` clean of it (`src/graph/kvcache.rs` has no diff).
+
+**Counts (rule 5).** No `#[test]` was added or removed, so no row moves and **no CUDA row was
+re-measured**: `cargo test --release`, box aarch64 (this box), 2026-09-29 → **481 / 0 / 36**
+unit + **10 / 0 / 6** integration (the recorded aarch64 row). `cargo fmt --all --check`
+clean; `python3 scripts/check_status.py --check` exits 0; the non-test build warning-free
+with and without `--features cuda` (`cargo build --release` and `cargo build --release
+--features cuda`; the one `warning:` line on the CUDA build is `build.rs`'s pre-existing
+`cargo:warning=` target list, not a rustc diagnostic).
+
+**Limits.** (1) No CUDA device is used here: the `--features cuda` line is a compile, not a
+run; the CUDA *unit* row is unchanged by construction (no `#[test]` moved) and is not
+re-measured. (2) The x86_64 CPU row cannot be computed locally; it is unchanged by
+construction and the CI `test-linux-cpu` log is its source. (3) The moved call sites
+certify `KvCache::own_range`'s owner-table and written-extent halves only as far as those
+tests assert them; the f16 session test does not depend on the mutated `written` arm.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
