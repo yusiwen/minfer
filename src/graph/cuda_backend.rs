@@ -91,6 +91,19 @@ pub struct CudaBackend {
     /// nothing. `MINFER_NO_PREFILL_CAPTURE=1` restores the old default-off
     /// (`MINFER_CAPTURE_PREFILL=1` is now redundant but still accepted).
     prefill_capture: bool,
+    /// #218: how many direct-launch warmup runs of a `(uid, range)` key happen
+    /// before capture opens (default 3, llama.cpp's protocol). This is
+    /// **load-bearing beyond the capture heuristic**: the prefill-GEMM >48 KiB
+    /// dynamic-smem attribute is set lazily on an instantiation's first launch
+    /// and cached, so the warmup is what guarantees that
+    /// `cudaFuncSetAttribute` runs **outside** every capture window
+    /// (`docs/CUDA-BACKEND-DESIGN.md` §2.4). Do not lower it without reading
+    /// that section.
+    ///
+    /// Test-only seam: `MINFER_TEST_CAPTURE_WARMUP=<n>` lowers it so a gate can
+    /// drive the opt-in into the window on purpose (the #218 mutation arm). A
+    /// non-test build always uses 3.
+    capture_warmup: u32,
     /// Viz/trace capture staging: async D2H of captured node outputs queued
     /// right after each node's launch (stream-ordered — pool buffers recycle
     /// intra-split), drained with one sync at the split boundary. Replaces
@@ -206,6 +219,17 @@ impl CudaBackend {
             GraphMode::Enabled
         };
         let prefill_capture = std::env::var("MINFER_NO_PREFILL_CAPTURE").as_deref() != Ok("1");
+        // #218: the warmup count is 3 in every real build; the `MINFER_TEST_*`
+        // seam exists only so a gate can force capture onto the first run (which
+        // drives the >48 KiB smem opt-in into the window — the mutation arm).
+        #[cfg(test)]
+        let capture_warmup = std::env::var("MINFER_TEST_CAPTURE_WARMUP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3);
+        #[cfg(not(test))]
+        let capture_warmup = 3u32;
         Some(Self {
             state,
             stream,
@@ -218,6 +242,7 @@ impl CudaBackend {
             capturing: None,
             graphs_mode,
             prefill_capture,
+            capture_warmup,
             kv_layout,
             cap: crate::cuda::CaptureStaging::new(),
             cross_slabs: Vec::new(),
@@ -487,7 +512,27 @@ impl CudaBackend {
         // single split, and the pp16/pp300 bit-parity harness validated
         // replay at real-prefill scale. MINFER_NO_PREFILL_CAPTURE=1 opts
         // out (8g① semantics).
-        if *runs >= 3
+        //
+        // #218 — the warmup count is **load-bearing**, not just a cost bound.
+        // The prefill-GEMM >48 KiB dynamic-smem attribute is set lazily on an
+        // instantiation's first launch and cached per instantiation
+        // (`gemm_smem_optin`); the design's stated invariant is that the
+        // attribute is in force *before* a window opens and is never set
+        // *inside* one (`docs/CUDA-BACKEND-DESIGN.md` §2.4). Three things hold
+        // it up, and changing any of them is a design change:
+        //   1. `capture_warmup` (default 3) means the first launch of an
+        //      instantiation happens on an uncaptured run — the one
+        //      `cudaFuncSetAttribute` lands there;
+        //   2. `graph_begin_capture` opens in `cudaStreamCaptureModeThreadLocal`
+        //      (#188's measured choice), so a foreign thread's driver call
+        //      cannot belong to this window;
+        //   3. the per-instantiation cache means the in-window launch re-reads
+        //      the answer instead of asking the driver again.
+        // `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` pins
+        // (1)+(3) for a real >48 KiB captured prefill; `MINFER_TEST_CAPTURE_WARMUP=1`
+        // is the test-only seam that drives the opt-in into the window and turns
+        // that gate red.
+        if *runs >= self.capture_warmup
             && self.capturing.is_none()
             && nt_hint.map_or(true, |nt| nt == 1 || self.prefill_capture)
         {

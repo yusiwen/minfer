@@ -259,44 +259,90 @@ concurrent device gate
 is the positive half: two engines on two threads, two distinct streams, bitwise equal
 to their serial references.
 
-**The eager prefill-GEMM smem opt-in (issues [#145](https://github.com/yusiwen/minfer/issues/145) and
-[#147](https://github.com/yusiwen/minfer/issues/147)).**
+**The prefill-GEMM smem opt-in (#145, #147; lazy and gated since #218).**
 A `gemm_f16_nt_kernel_t` instantiation whose dynamic shared memory exceeds the 48 KiB default must be
-opted in with `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, N)` **before**
-anyone opens a capture window — `cudaFuncSetAttribute` was believed illegal under
-`cudaStreamCaptureModeGlobal`, and a lazy first-use opt-in inside a window fails and poisons the
-first captured launch. `CudaState::try_new` therefore calls `gemm_prefill_smem_init()` eagerly. The
-number it requests is the kernel's own byte layout — `As 2*TN*KS halves + Am 2*TN*KS floats (AF32
-only) + Bs 2*TM*KS halves + Cs NW*256 floats`, TN = 64, NW = `blockDim.x/32` = 8 — and
-`gemm_dynamic_smem_bytes(tm, ks, af32)` is the single source that the launcher
-(`launch_gemm_f16`) and the init both read; before #145 the init carried a stale copy of it while the
-launcher carried a copy that dropped the AF32 mirror. Every call's return value is checked and a
-failure is named once, at init (function, attribute, requested bytes, device limit,
-`cudaGetErrorName`) and cleared there. A request that exceeds the device's own
+opted in with `cudaFuncSetAttribute(.., cudaFuncAttributeMaxDynamicSharedMemorySize, N)` — a launch
+over an un-opted-in dynamic smem is rejected with `cudaErrorInvalidValue` and cannot succeed. The
+number requested is the kernel's own byte layout — `As 2*TN*KS halves + Am 2*TN*KS floats (AF32 only)
++ Bs 2*TM*KS halves + Cs NW*256 floats`, TN = 64, NW = `blockDim.x/32` = 8 — and
+`gemm_dynamic_smem_bytes(tm, ks, af32)` is the single source the launcher (`launch_gemm_f16`) reads;
+before #145 an eager sweep carried a stale copy of it while the launcher carried a copy that dropped
+the AF32 mirror. A request that exceeds the device's own
 `cudaDevAttrMaxSharedMemoryPerBlockOptin` is **skipped with the reason printed**, instead of called:
 the call could only return `cudaErrorInvalidValue` (which `compute-sanitizer` counts) and the
-instantiation cannot launch on that device at all. On GB10/sm_121 (limit 101376 B) that is exactly
-one combination, `gemm_f16_nt_kernel_t<256,64,true>` at 122880 B.
+instantiation cannot launch on that device at all. On GB10/sm_121 (limit 101376 B) that is exactly one
+combination, `gemm_f16_nt_kernel_t<256,64,true>` at 122880 B.
 
-**The launcher refuses, not just reports (#147).** The eager init is not the last line of defence: a
-caller can select an instantiation the init skipped (`MINFER_GEMM_TM=256` + `MINFER_GEMM_K64=1`, or
-the af32 path), so `launch_gemm_f16` now reads the opt-in's own answer through the shared
-`minfer_smem_optin` helper — which names the site, the instantiation, the attribute, the requested
-bytes, the queried device limit and `cudaGetErrorName`, clears the latch — and **does not launch**
-when it is false. Its own `<<<>>>` error is read too (`minfer_launch_ok`) and returned as 0, which
-`prefill_gemm_f16_inner` turns into an `Err`. The af32 wrapper `launch_gemm_f32a` returns the same
-result; the per-instantiation answer is cached (a test injection is never cached), so the hot path
-does not re-ask the driver. The same treatment covers every MMQ launcher
+**There is no eager sweep any more (#218).** [#188](https://github.com/yusiwen/minfer/issues/188)
+deleted `gemm_prefill_smem_init`'s `CudaState::try_new` call site with no mention in its commit message
+or its docs commit; two later "dead code hygiene" commits annotated the orphan
+`#[cfg_attr(not(test), allow(dead_code))]` instead of asking why a production-looking init had no
+production caller. [#218](https://github.com/yusiwen/minfer/issues/218) removed the function and its
+`checked`/`skipped` introspection. The opt-in is what it always really was: `gemm_smem_optin` (called
+from the launcher's `GEMM_ONE`) invokes the shared `minfer_smem_optin` helper on an instantiation's
+**first** launch and caches the answer in a function-local `static` per instantiation (a test
+injection is never cached). The helper names the site, the instantiation, the attribute, the requested
+bytes, the queried device limit and `cudaGetErrorName`, clears the latch, and the launcher **does not
+launch** when the answer is false; its own `<<<>>>` error is read too (`minfer_launch_ok`) and returned
+as 0, which `prefill_gemm_f16_inner` turns into an `Err`. The af32 wrapper `launch_gemm_f32a` returns
+the same result. The same treatment covers every MMQ launcher
 (`launch_mmq_nt`/`launch_mmq_raw_nt`/`launch_mmq_raw_nb_nt`/`launch_mmq_raw_nb_bt_nt`/
 `launch_mmq_raw_nb_bt_q6k_nt`/`launch_mmq_raw_wide_nt`); the terminal two return 0 → `Err` at the
-Rust caller, the fallback ones keep their documented `0 = clean fallback` contract.
+Rust caller, the fallback ones keep their documented `0 = clean fallback` contract. The operator's
+only signal is now the **first-launch site report**: a refused or skipped instantiation prints once,
+at the launch site (`minfer_smem_optin`), instead of in a startup banner.
+
+**Why the lazy path upholds the invariant — three load-bearing mechanisms.** The historical claim was
+that `cudaFuncSetAttribute` is illegal inside a capture window and poisons the context (error 700).
+Nothing in the repository establishes whether that holds for the *adopted* mode (see the honest limit
+below), so the design does not rely on the call being legal in a window; it relies on the call never
+happening in one. Three mechanisms, called out at their sites (`graph_replay_step` in
+`src/graph/cuda_backend.rs`, `gemm_smem_optin` in `src/cuda_kernels.cu`), hold it up — any change to
+one is a design change, not a tuning knob:
+
+1. **The 3-run capture warmup** (`capture_warmup`, default 3): capture opens only from the third run
+   of a `(uid, range)` key, and prefill-shaped graphs (`nt > 1`) capture by default since R3-B. An
+   instantiation's first launch — the one that calls `cudaFuncSetAttribute` — therefore always runs
+   uncaptured.
+2. **`cudaStreamCaptureModeThreadLocal`** (#188's measured choice): the window belongs to the
+   capturing thread, so a foreign thread's driver call cannot join it or invalidate it. Changing the
+   mode must not silently change (1)'s guarantee.
+3. **The per-instantiation cache**: the in-window launch re-reads the cached answer instead of asking
+   the driver again, so the >48 KiB launch inside the window never calls the attribute. The cache is
+   instantiated on the **`(tm, ks, af32)` template parameters**, not on a deduced `K`: every
+   `gemm_f16_nt_kernel_t` shares one signature, and the pre-#218 `template <typename K>` gave the
+   whole family one `static` (the #218 coverage gate found `<64,64,true>` answering for
+   `<128,64,false>`, whose attribute had never been set).
+
+**The #218 gates pin that as observed behaviour.** `cuda_prefill_smem_optin_is_done_by_production`
+(a real prefill forward in a fresh process; asserts the device's own `opted_in` read-back),
+`cuda_prefill_smem_optin_refusal_fails_the_prefill` (the control arm:
+`MINFER_TEST_CALL_FAIL=attr:gemm_f16_f16` makes the production prefill refuse the launch and name the
+site), `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` (a >48 KiB prefill captures,
+replays bitwise, and `gemm_smem_optin_in_capture_count() == 0`), and
+`cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation` (every launchable >48 KiB
+instantiation reads back opted in through the production function). The `capture_warmup` test seam
+(`MINFER_TEST_CAPTURE_WARMUP=1`) is the mutation lever for the counter.
+
+**The same-thread `ThreadLocal` in-window case — measured (2026-09-29).** The open question this
+section used to carry — is `cudaFuncSetAttribute` legal inside a **same-thread**
+`cudaStreamCaptureModeThreadLocal` window? — is now measured: the
+`MINFER_TEST_CAPTURE_WARMUP=1` mutation arm drives the opt-in into the first, captured run, and on
+GB10 sm_121 / CUDA 13.0 / driver 580.178.04 the call is **tolerated** — the attribute publishes, the
+>48 KiB graph still captures, instantiates and replays bitwise-identically, and only
+`gemm_smem_optin_in_capture_count()` moves. (The 2026-09-25 probe below measured the *Global* mode
+instead; this one is the adopted mode.) The design nevertheless keeps the call out of the window:
+that behaviour is not contractual across toolkits, and the counter gate is what makes "never set
+inside a window" an observed property rather than a driver assumption. The full transcript is in the
+#218 record.
 
 **Measured correction (2026-09-25, CUDA 13.0 / driver 580.178.04 / sm_121).** A probe
 (`/tmp/fix147_attr_capture_probe.cu`) shows the historical claim above no longer holds verbatim on
 this runtime: `cudaFuncSetAttribute` returns `cudaSuccess` when called *inside* an open
 `cudaStreamCaptureModeGlobal` window, both for the already-set value and for a new one. The eager
-init stays (it is cheap, and the behaviour is not contractual across toolkits), and because the
-launcher caches one answer per instantiation it does not re-ask inside a window either.
+sweep that was in tree then has since been removed by #218 (it was already dead code — #188 had
+dropped its caller), and because the launcher caches one answer per instantiation it does not re-ask
+inside a window either.
 
 ### 2.5 Legacy surface
 
@@ -781,12 +827,19 @@ Categories and the invariants they pin:
   tests (`cuda_q6k_exp_dense_byte_exact`, `cuda_q6k_dsc_dense_byte_exact`,
   `cuda_q4k_dsc_dense_byte_exact`), `cuda_prefill_fused_b_bitparity`, and
   `cuda_multi_token_matmul_bitwise` (one nt=3 forward bitwise-equal to three nt=1 forwards). The
-  eager >48 KiB opt-in has its own gates in `src/cuda.rs`:
-  `the_gemm_smem_formula_matches_the_kernel_layout` (pins `gemm_dynamic_smem_bytes` against the
-  kernel's byte layout — the value-level arm, so a silent shrink is seen),
-  `cuda_prefill_smem_optin_covers_every_launchable_instantiation` (every admitted >48 KiB request
-  reads back opted in through `cudaFuncGetAttributes`, every over-limit one is skipped), and
-  `the_latched_error_message_never_blames_a_kernel`. #147's `issue147_tests` module adds
+  lazy >48 KiB opt-in (#218) has its own gates: `the_gemm_smem_formula_matches_the_kernel_layout`
+  (pins `gemm_dynamic_smem_bytes` against the kernel's byte layout — the value-level arm, so a silent
+  shrink is seen); `cuda_prefill_smem_optin_is_done_by_production` (a **real** prefill forward makes
+  the device read back `opted_in == 1` for `gemm_f16_nt_kernel_t<128,64,false>`, in a fresh process so
+  the "not opted in before" precondition is observable); the control arm
+  `cuda_prefill_smem_optin_refusal_fails_the_prefill` (`MINFER_TEST_CALL_FAIL=attr:gemm_f16_f16`
+  refuses the launch, and the site report names the call and `cudaErrorInvalidValue`);
+  `cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation` (every launchable >48 KiB
+  instantiation reads back opted in through production's own `gemm_smem_optin`, and every over-limit
+  one is refused without a call); and `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window`
+  (a >48 KiB prefill captures, replays bitwise, and `gemm_smem_optin_in_capture_count() == 0` proves
+  the opt-in ran before the window opened). Plus `the_latched_error_message_never_blames_a_kernel`.
+  #147's `issue147_tests` module adds
   `the_graph_destroy_failure_message_names_the_matching_destructor` and
   `the_injection_matcher_matches_only_the_named_site` (both pure) plus the three
   `cuda_issue147_*` deliberate-failure gates (device; env-gated behind `MINFER_TEST_ISSUE147=1`, which

@@ -56,25 +56,34 @@ fn the_gemm_smem_formula_matches_the_kernel_layout() {
 }
 
 /// Every (tm, ks, af32) combination the launcher can select whose request
-/// exceeds the 48 KiB default must actually be admitted by the device's
-/// `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` — otherwise the
-/// prefill GEMM's >48 KiB launch (which capture mode forces to be opted in
-/// eagerly) fails. A request over the device limit must be skipped, never
-/// called. Device gate.
+/// exceeds the 48 KiB default must be admitted by the **production** opt-in —
+/// `gemm_smem_optin`, the per-instantiation function `launch_gemm_f16` itself
+/// calls (driven here through the `gemm_prefill_smem_optin_one_for_test` seam so
+/// arbitrary combinations can be selected) — and the device's own read-back
+/// (`cudaFuncGetAttributes().maxDynamicSharedSizeBytes`) must agree. A request
+/// over the device limit must be skipped, never called, and must not read back
+/// opted in. Device gate.
+///
+/// #218: the pre-#218 version called `gemm_prefill_smem_init`, the **eager
+/// sweep** #188 had orphaned (no production caller). The sweep is gone; this
+/// gate now drives the lazy path production actually uses, and its name and
+/// claim say so. The production *forward* arms live in `issue218_tests`:
+/// `cuda_prefill_smem_optin_is_done_by_production` (a real prefill opts a
+/// >48 KiB instantiation in, non-vacuously) and
+/// `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` (a >48 KiB
+/// captured prefill replays bitwise, with the opt-in shown to happen before the
+/// window opened).
 #[test]
-fn cuda_prefill_smem_optin_covers_every_launchable_instantiation() {
+fn cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation() {
     if device().is_none() {
         eprintln!("skipping: no CUDA device");
         return;
     }
-    // Re-run the eager init: idempotent, and its return value is the count
-    // of attribute calls that failed.
-    let failures = unsafe { gemm_prefill_smem_init() };
-    assert_eq!(failures, 0, "a request the device admits must not fail");
+    let s = device().unwrap();
+    let _ = s.take_last_error(); // this gate must not inherit a latch
     let limit = unsafe { gemm_prefill_smem_limit() };
     assert!(limit >= 48 * 1024, "queried opt-in limit {limit} B");
     let mut covered = 0usize;
-    let mut over_limit = 0usize;
     for tm in [64, 128, 256] {
         for ks in [32, 64] {
             for af32 in [false, true] {
@@ -82,9 +91,20 @@ fn cuda_prefill_smem_optin_covers_every_launchable_instantiation() {
                 if need <= 48 * 1024 {
                     continue; // the default cap admits it; no opt-in needed
                 }
+                let admitted = unsafe {
+                    gemm_prefill_smem_optin_one_for_test(tm, ks, af32 as i32, s.stream())
+                };
+                assert_ne!(
+                    admitted, -1,
+                    "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> must be compiled in"
+                );
                 let opted = unsafe { gemm_smem_opted_in(tm, ks, af32 as i32) } == 1;
                 if need > limit as usize {
-                    over_limit += 1;
+                    assert_eq!(
+                        admitted, 0,
+                        "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B > the \
+                         {limit} B device limit and must be refused, not launched"
+                    );
                     assert!(
                         !opted,
                         "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B > the \
@@ -92,12 +112,17 @@ fn cuda_prefill_smem_optin_covers_every_launchable_instantiation() {
                     );
                     continue;
                 }
+                assert_eq!(
+                    admitted, 1,
+                    "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B and the device \
+                     admits {limit} B, but the production opt-in refused it"
+                );
                 assert!(
                     opted,
                     "gemm_f16_nt_kernel_t<{tm},{ks},{af32}> needs {need} B and the device \
                      admits {limit} B, but cudaFuncGetAttributes reports its \
                      maxDynamicSharedSizeBytes below that — the >48 KiB prefill launch \
-                     would fail (capture mode cannot set the attribute lazily)"
+                     would fail"
                 );
                 covered += 1;
             }
@@ -108,14 +133,9 @@ fn cuda_prefill_smem_optin_covers_every_launchable_instantiation() {
         "expected the launchable >48 KiB instantiations to be opted in, got {covered}"
     );
     assert_eq!(
-        unsafe { gemm_prefill_smem_checked() } as usize,
-        covered,
-        "every admitted >48 KiB request must have been attempted exactly once"
-    );
-    assert_eq!(
-        unsafe { gemm_prefill_smem_skipped() } as usize,
-        over_limit,
-        "every over-limit request must be skipped with a reason"
+        s.take_last_error(),
+        0,
+        "the opt-in path must clear every latch it takes"
     );
 }
 

@@ -452,9 +452,14 @@ integer (`major*100 + minor`) and feeds the device-tier resolution
 plus a dynamic-smem feasibility check gate the int8 MMQ path
 (`mmq_active()`; the fallback rule for unknown devices is still `cc >= 800`,
 i.e. sm_80+, because `mma.m16n8k32` exists only from Ampere on); and
-`gemm_prefill_smem_init()` runs *eagerly* —
-opting the prefill GEMM into >48 KB dynamic shared memory is illegal inside
-a stream-capture window, so it must happen before any capture can open.
+`gemm_prefill_smem_init()` does **not** run any more: since
+[#218](https://github.com/yusiwen/minfer/issues/218) the prefill GEMM opts into
+>48 KB dynamic shared memory **lazily**, on an instantiation's first launch
+(`gemm_smem_optin`, reached through `launch_gemm_f16`), and caches the answer per
+instantiation. What keeps that attribute out of a stream-capture window is the
+3-run capture warmup (`capture_warmup`) plus `cudaStreamCaptureModeThreadLocal`;
+the reasoning and the gates that pin it are in
+`docs/CUDA-BACKEND-DESIGN.md` §2.4.
 
 Weights register through `register_weight` — a `cudaMalloc` plus one
 blocking H2D `cudaMemcpy` of the raw GGUF bytes:

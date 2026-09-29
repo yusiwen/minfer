@@ -1427,6 +1427,22 @@ printed as a failure of the kernel that had just run.
 - **`graph_destroy` calls `cudaGraphExecDestroy`**; the `cudaGraph_t` / `cudaGraphExec_t` distinction
   is stated at the extern and the call site, and a failure is named there and cleared.
 
+> **#218 forward note (2026-09-29):** the **eager** sweep this record describes is gone.
+> [#188](https://github.com/yusiwen/minfer/issues/188) deleted `gemm_prefill_smem_init`'s
+> `CudaState::try_new` call site with no mention in any commit message or document, and
+> [#218](https://github.com/yusiwen/minfer/issues/218) removed the orphaned function (and the
+> `checked`/`skipped` introspection) instead of leaving it `allow(dead_code)`-annotated. The
+> per-launch opt-in this record already describes — `gemm_smem_optin` → the shared
+> `minfer_smem_optin`, reached by `launch_gemm_f16` — is now the whole mechanism; the invariant it
+> must uphold (the attribute is in force **before** a capture window opens, never set inside one) is
+> upheld by the 3-run capture warmup (`capture_warmup`), `cudaStreamCaptureModeThreadLocal` and the
+> per-instantiation cache, and gated by `cuda_prefill_smem_optin_is_done_by_production`, the control
+> arm `cuda_prefill_smem_optin_refusal_fails_the_prefill`, the coverage arm
+> `cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation`, and
+> `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` — see the #218 record in
+> §test-infrastructure. `gemm_dynamic_smem_bytes` remains the one formula; the "read twice" wording
+> above is historical (the launcher reads it once).
+
 **Acceptance results (GB10, sm_121, CUDA 13.0, driver 580.178.04).**
 
 | check | before | after |
@@ -5106,6 +5122,104 @@ The #160 command is unchanged:
 `ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap closes here — this is robustness inside the
 existing test-infrastructure/batching rows, the same reason the #154, #151, #158 and #160 records
 give.
+
+#### Test-infrastructure record (#218, 2026-09-29) — the prefill-GEMM dynamic-smem opt-in is lazy, per-instantiation, and gated
+
+**The finding.** [#188](https://github.com/yusiwen/minfer/issues/188) deleted the production call site
+of `gemm_prefill_smem_init` — the **eager** dynamic-smem opt-in in `CudaState::try_new` — and said so
+nowhere: the commit message has no `smem`/`shared`/`attribute`/`#145` token, the same PR's docs commit
+rewrote `CUDA-BACKEND-DESIGN.md` (+174/−74) without mentioning it, and the implementation commit
+touched six `.rs` files and no documentation. Two later dead-code-hygiene commits then annotated the
+orphan `#[cfg_attr(not(test), allow(dead_code))]`: `f5a956a` under the banner *"55 items are reached
+only from `#[cfg(test)]` code"*, and `58379c0` left it because the `#145` gate calls it. The
+instrument that should have surfaced an orphaned production path instead silenced the diagnostic, and
+the `#145` gate `cuda_prefill_smem_optin_covers_every_launchable_instantiation` kept certifying a
+function production no longer called.
+
+**The decision (plan B).** Do not reintroduce the eager init. Keep the lazy per-launch path
+(`gemm_smem_optin`, reached from `launch_gemm_f16`), **remove** the orphan rather than rename it, and
+make the invariant explicit and gated. The invariant: the >48 KiB attribute is in force **before** a
+capture window opens and is never set **inside** one. Three mechanisms uphold it — the 3-run capture
+warmup (`capture_warmup`, default 3), `cudaStreamCaptureModeThreadLocal` (#188's measured choice),
+and the per-instantiation cache — and all three are now written down at their sites
+(`graph_replay_step`'s comment, `gemm_smem_optin`'s comment, `CUDA-BACKEND-DESIGN.md` §2.4) so the
+next person who changes the capture mode or the warmup count reads why. The `#145` gate was
+re-pointed at the production function and renamed
+`cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation`; the `checked`/`skipped`
+introspection and the `gemm_prefill_smem_init` symbol are gone, and the remaining introspection is a
+`#[cfg(test)] extern "C"` block, so no non-test build carries even a declaration for it (the
+`allow(dead_code)` pattern this ticket exists to end).
+
+**The bug the first gate run found.** The `gemm_smem_optin` cache was **not** per-instantiation. It
+was `template <typename K>` and every `gemm_f16_nt_kernel_t<TM,KS,AF32>` shares one *signature*, so
+`K` deduced to one function-pointer type and `static int state` was one cache for the whole family.
+The re-pointed coverage gate found it on its first run: `<64,64,true>` (73728 B) answered "admitted"
+for `<128,64,false>` (57344 B), whose attribute was never set — the device still reported its
+49152 B default for the 57344 B request. #218 made the cache genuinely per-instantiation
+(`template <int TM, int KS, bool AF32>`), which is what its comment always claimed. It is latent in
+production today (only one `(tm, ks, af32)` is used per process — both tile env knobs are read once —
+so nothing mixed families), but it is exactly the "unwritten, untested" property this ticket exists
+to end.
+
+**The gates.**
+
+| gate | value it asserts | the precondition that keeps it non-vacuous |
+|---|---|---|
+| `cuda_prefill_smem_optin_is_done_by_production` | after a **real** prefill forward, the device's own `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` read-back says `<128,64,false>` (57344 B) is opted in | it runs in a **fresh process** (`src/cuda/test_child.rs`) and asserts `opted_in == 0` *before* the forward — the tile env and the attribute are both process-scoped, so "before" is only observable in a process no earlier launch has touched |
+| `cuda_prefill_smem_optin_refusal_fails_the_prefill` | the control arm: `MINFER_TEST_CALL_FAIL=attr:gemm_f16_f16` makes the production prefill **refuse** the launch and the site report name `cudaFuncSetAttribute` + `cudaErrorInvalidValue` | a **second** child process, so the per-instantiation cache cannot have answered already; env-gated behind `MINFER_TEST_ISSUE218=1` (it makes a real call fail, as #147/#162's gates are) |
+| `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` | a >48 KiB prefill-shaped graph **is captured** (`captured_count() == 1`) and replays bitwise over 5 steps, and `gemm_smem_optin_in_capture_count() == 0` — the opt-in ran before the window, never inside it | fresh process; `gemm_smem_need > 48 KiB` asserted; `captured_count() == 1` so an uncaptured path cannot pass; `opted_in == 0` before; `MINFER_TEST_CAPTURE_WARMUP=1` is the test-only seam that makes it fail |
+| `cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation` (the re-pointed `#145` gate) | every launchable >48 KiB instantiation reads back opted in through the **production** `gemm_smem_optin`; every over-limit one is refused without a call | it drives the production function (via `gemm_prefill_smem_optin_one_for_test`), not a mirror; the over-limit combination is a separate negative arm |
+
+**Mutation evidence (rule 3), GB10 sm_121, 2026-09-29.**
+1. `gemm_smem_optin` answers `true` without calling `minfer_smem_optin` (C++, one line). The coverage
+   gate goes red at `<64,64,true>` (*"cudaFuncGetAttributes reports its maxDynamicSharedSizeBytes
+   below that"*); the real-prefill gate's child goes red with `minfer/cuda: kernel launch
+   gemm_f16_nt_kernel_t<128,64,false> failed: cudaErrorInvalidValue (1) — the launch is refused
+   (#162/launch:gemm_f16_f16)` and then *"cuda: prefill GEMM (f16): launch_gemm_f16 refused the
+   launch … no kernel ran"*; the capture gate's child goes red on the same refused launch. One
+   mutation, three gates.
+2. `MINFER_TEST_CAPTURE_WARMUP=1` (the documented seam, from the parent — the harness passes it
+   through on purpose): the child's whole gate runs — the capture happens, replays bitwise, and
+   `opted_in == 1` — and only `gemm_smem_optin_in_capture_count()` trips:
+   *"assertion `left == right` failed: the smem opt-in must be performed before a capture window
+   opens, never inside one — this is the load-bearing part of the design; left: 1, right: 0"*.
+3. `prefill_gemm_f16_inner`'s `if (launched == 0) return Err(..)` arm removed (Rust): the control
+   arm's `expect_err` goes red — *"the injected attribute failure must refuse the >48 KiB prefill
+   launch: ()"*.
+
+**Honest limit — now measured, and it still does not license removing the warmup.** Mutation 2 is
+also the experiment the #218 issue said had never been run: it drives `cudaFuncSetAttribute` into an
+open **same-thread `cudaStreamCaptureModeThreadLocal`** window. On this runtime the call is
+**tolerated** — the attribute publishes, the capture completes, instantiates and replays
+bitwise-identically; only the counter moves. So on GB10 sm_121 / CUDA 13.0 / driver 580.178.04 an
+in-window opt-in would work. The design nevertheless keeps the call out of the window, because the
+historical failure is real on other toolkits, the 2026-09-25 probe measured the *Global* mode (not
+the adopted one), and the whole point of the #218 gate is to pin the property as an *observed*
+invariant rather than rely on driver behaviour. The counter gate is what makes that true regardless
+of what the driver tolerates.
+
+**Counts (rule 5).** `scripts/cuda_test.sh` → **565 / 0 / 42**, GB10 sm_121, 2026-09-29
+(was 562 / 0 / 42; +3 device gates: the two fresh-process `issue218_tests` arms and the captured-graph
+arm). `compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` →
+**0 API errors** over 565 / 0 / 42 (one aggregated `ERROR SUMMARY` for the whole process tree — the
+fresh-process children are followed too). The two real-model configurations were re-run and stay
+green: `FEATURES=cuda scripts/real_model_gates.sh` → **42 / 0** (0.5B config) and the same command
+with `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` →
+**42 / 0**, GB10 sm_121, 2026-09-29.
+
+**Docs.** `CUDA-BACKEND-DESIGN.md` §2.4 (the eager claim replaced by the lazy path, the three
+load-bearing mechanisms, the gate list, the measured in-window experiment);
+`cuda_optimization_steps/02-wmma-f16-prefill-gemm-8m.md` and this file's #145 record carry dated
+forward notes (history is not rewritten); `inference_e2e_walkthrough/15-cuda-backend.md` no longer
+says `gemm_prefill_smem_init()` runs eagerly; `docs/GATE-CONTRACT.md` rule 1 gains the reusable
+lesson from this ticket — *a gate must exercise the production entry point, not a test-only helper
+that mirrors it* — with the #145 gate as the instance. `docs/status.toml` and `AGENTS.md` carry the
+new CUDA counts.
+
+**Process lesson.** A dead-code campaign treated "an item with no production caller that looks like
+production" as a fact to annotate rather than a question to ask. `allow(dead_code)` on a
+test-reachable production-looking item is a **deferred question**; the fix is to list such items for
+review. Future hygiene work should treat the annotation as a lead, not a resolution.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
