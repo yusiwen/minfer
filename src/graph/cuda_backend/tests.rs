@@ -7874,6 +7874,113 @@ fn cuda_prefill_capture_bit_parity_pp16_pp300() {
     }
 }
 
+/// #218: the captured-graph half of the prefill-GEMM dynamic-smem invariant.
+///
+/// A **>48 KiB** prefill-shaped graph must capture on the 3-run protocol and
+/// replay **bitwise-identically** to direct launches, and the opt-in that makes
+/// the >48 KiB launch legal must be shown to have run **before** the window
+/// opened, never inside it (`gemm_smem_optin_in_capture_count() == 0`). That is
+/// the value assertion replacing the deleted eager sweep: if the attribute were
+/// not already in force when the window opened, the in-window >48 KiB launch
+/// would fail.
+///
+/// Non-vacuity. The fixture's instantiation is `gemm_f16_nt_kernel_t<128,64,false>`
+/// at 57344 B (`MINFER_GEMM_K64=1`, forced by the fresh-process harness), the
+/// gate asserts `captured_count() == 1` so an uncaptured path cannot satisfy it,
+/// and (in the child) it asserts `opted_in == 0` **before** anything launches.
+/// The fresh process is required: the tile env is read once per process and the
+/// `cudaFuncSetAttribute` answer sticks to the kernel for the process's life.
+///
+/// Mutation evidence (rule 3).
+/// - Make `gemm_smem_optin` answer `true` without calling `cudaFuncSetAttribute`:
+///   the first warmup launch of a >48 KiB dynamic smem then fails, the scheduler
+///   returns `Err`, and the child panics (and `opted_in` stays 0).
+/// - `MINFER_TEST_CAPTURE_WARMUP=1` (the documented test-only seam) opens the
+///   window on the **first** run, so the opt-in happens inside it and
+///   `gemm_smem_optin_in_capture_count() == 0` goes red — deterministically,
+///   whether or not this driver tolerates an in-window attribute call.
+#[test]
+fn cuda_prefill_smem_optin_is_never_set_inside_a_capture_window() {
+    const FILTER: &str = "cuda_prefill_smem_optin_is_never_set_inside_a_capture_window";
+    match crate::cuda::test_child::child_phase().as_deref() {
+        Some("capture") => big_smem_capture_child(),
+        _ => {
+            let child = crate::cuda::test_child::run_self(FILTER, "capture", &[]);
+            child.verdict("the >48 KiB captured prefill");
+        }
+    }
+}
+
+fn big_smem_capture_child() {
+    use crate::cuda::issue218_tests as fx;
+    if device().is_none() {
+        crate::cuda::test_child::child_skip("no CUDA device");
+    }
+    let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+    // Preconditions, established by running in a fresh process with this as its
+    // only test: the >48 KiB instantiation has never launched, so it is not
+    // opted in and no opt-in has happened inside a window.
+    fx::assert_optin_preconditions("capture");
+
+    let sched = BackendScheduler::new();
+    let mut g_cap = fx::big_smem_prefill_graph();
+    let mut g_ref = fx::big_smem_prefill_graph();
+    let mut cap = replay_alloc(true);
+    let mut refr = replay_alloc(false);
+    assert_eq!(
+        g_cap.capture_nt_hint(),
+        Some(fx::NT),
+        "the fixture must be prefill-shaped"
+    );
+    cap.cuda_mut()
+        .unwrap()
+        .state
+        .register_weight(fx::WEIGHT, &fx::weight_bytes());
+    sched.assign_backends(&mut g_cap, &cap);
+    sched.assign_backends(&mut g_ref, &refr);
+    cap.alloc_graph(&g_cap).unwrap();
+    refr.alloc_graph(&g_ref).unwrap();
+
+    // Runs 1-2 direct (the warmup, where the opt-in happens), run 3 opens the
+    // capture window, runs 4-5 replay. Every step must be bitwise-equal to the
+    // direct-launch reference.
+    for step in 0..5u32 {
+        let seed = 1.0 + 2.0 * step as f32;
+        let xs: Vec<f32> = (0..fx::ID * fx::NT)
+            .map(|i| seed + (i % 9) as f32)
+            .collect();
+        cap.fill_input(&g_cap, "x", &xs).unwrap();
+        refr.fill_input(&g_ref, "x", &xs).unwrap();
+        sched.execute(&g_cap, &mut cap).unwrap();
+        sched.execute(&g_ref, &mut refr).unwrap();
+        let got = cap.copy_to_cpu(g_cap.outputs[0]).unwrap();
+        let want = refr.copy_to_cpu(g_ref.outputs[0]).unwrap();
+        assert_eq!(
+            got, want,
+            "step {step}: the >48 KiB prefill replay diverged from direct launches"
+        );
+    }
+    assert_eq!(
+        cap.cuda_mut().unwrap().captured_count(),
+        1,
+        "the >48 KiB prefill split must be captured exactly once — an uncaptured \
+         path must not be able to satisfy this gate"
+    );
+    assert_eq!(
+        unsafe { crate::cuda::gemm_smem_opted_in(fx::TM, fx::KS, fx::AF32) },
+        1,
+        "the warmup runs must have opted {} in before the window opened",
+        fx::KERNEL
+    );
+    assert_eq!(
+        unsafe { crate::cuda::gemm_smem_optin_in_capture_count() },
+        0,
+        "the smem opt-in must be performed before a capture window opens, never \
+         inside one — this is the load-bearing part of the design"
+    );
+    crate::cuda::test_child::child_ok();
+}
+
 /// Phase 8 review: an execute_node error during an open capture window
 /// must ABORT the window (the scheduler propagates before the boundary
 /// sync, so nothing else would close it). Driven directly here because

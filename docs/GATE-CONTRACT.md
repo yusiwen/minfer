@@ -47,6 +47,24 @@ vs 728 in the run that exposed it). Rule 1 is about a shared *code path*; a
 shared *destination* is the same hazard, and a value read from an owned table is
 immune to it.
 
+**The orphaned-entry-point instance (#218).** A gate must exercise the
+**production entry point**, never a test-only helper that mirrors it. #218 found
+that the `#145` gate `cuda_prefill_smem_optin_covers_every_launchable_instantiation`
+called `gemm_prefill_smem_init` — an eager startup sweep whose `CudaState::try_new`
+call site #188 had quietly deleted. The helper still worked, so the gate stayed
+green while **production performed no such opt-in at all**; the dead-code pass
+then annotated the orphan `#[cfg_attr(not(test), allow(dead_code))]` instead of
+asking why a production-looking function had no production caller. A mirrored
+helper is the same hazard as rule 1's shared code path: the gate and the
+production path can be wrong *together*, and the mirror is what makes it look
+certified. Ask of every gate: **is the function it calls reachable from a
+production entry point?** If the answer is a test-only sweep, the gate's claim is
+about the sweep, not the engine — either drive the real entry point (the #218
+gates drive `gemm_smem_optin` through a real forward and through the production
+launcher) or rename the gate so its claim states the mirror it tests. The
+campaign corollary: a dead-code diagnostic that `allow`s a test-reachable
+production-looking item is a **question deferred**, not a warning silenced.
+
 ## 2. A control arm must differ in the property under test
 
 A negative control that is rejected by an *earlier* check never exercises the

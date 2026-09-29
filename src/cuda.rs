@@ -527,35 +527,22 @@ extern "C" {
         stream: *mut std::ffi::c_void,
         af32: bool,
     ) -> i32;
-    // P6: A arrives as f32 activations; the GEMM converts on stage — the
-    // separate convert_f32_f16 pass disappears for every prefill matmul.
+    // #218: the **eager** sweep (`gemm_prefill_smem_init`) is gone — production
+    // opts an instantiation in lazily on its first launch (`gemm_smem_optin`,
+    // reached through `launch_gemm_f16`). The sweep's introspection lives in the
+    // `#[cfg(test)] extern "C"` block below, so no test-only declaration is
+    // carried by a non-test build.
     //
-    // #145: returns the number of `cudaFuncSetAttribute` calls that failed (each
-    // already named on stderr with `cudaGetErrorName` where it was made). The
-    // caller reports the count; the attribute requests that exceed the device's
-    // opt-in limit are deliberately skipped with the reason printed.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn gemm_prefill_smem_init() -> i32;
-    // #145 introspection: the opt-in decision, for the startup report and the
-    // `cuda_prefill_smem_optin_*` gate. `gemm_smem_need` is the single-source
-    // formula the launcher reads; `gemm_smem_opted_in` reads the device's own
-    // `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` back.
-    #[allow(dead_code)] // read by the #145 device gate, not by a non-test build
-    fn gemm_prefill_smem_checked() -> i32;
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn gemm_prefill_smem_skipped() -> i32;
-    #[allow(dead_code)] // read by the #145 device gate
-    fn gemm_prefill_smem_limit() -> i32;
-    #[allow(dead_code)] // read by the #145 device gate
-    fn gemm_smem_need(tm: i32, ks: i32, af32: i32) -> usize;
-    #[allow(dead_code)] // read by the #145 device gate
-    fn gemm_smem_opted_in(tm: i32, ks: i32, af32: i32) -> i32;
     // #145 test injection: latch a real `cudaErrorInvalidValue` on purpose
     // (request the device limit + 4096 B) without clearing it. Only the gate
     // calls this.
     #[allow(dead_code)]
     fn cuda_test_latch_oversized_smem() -> i32;
-    // #147: the same shape for the af32 path — 1 = launched and accepted.
+    // P6: A arrives as f32 activations; the GEMM converts on stage — the
+    // separate convert_f32_f16 pass disappears for every prefill matmul.
+    // #147: the same shape for the af32 path — 1 = launched and accepted; 0 =
+    // the opt-in or the launch was refused (named at the site), which the
+    // caller turns into an `Err`.
     fn launch_gemm_f32a(
         a: *const f32,
         b: *const std::ffi::c_void,
@@ -1174,6 +1161,31 @@ extern "C" {
         scale: f32,
         pstr: i32,
         nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+// #218: introspection for the prefill-GEMM dynamic-smem gates, test-only by
+// construction (`#[cfg(test)]`), so a non-test build carries neither the
+// declaration nor an `allow(dead_code)` for it. `gemm_smem_need` is the
+// single-source byte formula the launcher reads; `gemm_smem_opted_in` is the
+// device's own `cudaFuncGetAttributes().maxDynamicSharedSizeBytes` read back;
+// `gemm_prefill_smem_limit` is the queried
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin`;
+// `gemm_smem_optin_in_capture_count` counts opt-in attempts made while the
+// launch stream was capturing (the design says never);
+// `gemm_prefill_smem_optin_one_for_test` drives production's
+// per-instantiation `gemm_smem_optin` for one compiled combination.
+#[cfg(test)]
+extern "C" {
+    pub(crate) fn gemm_prefill_smem_limit() -> i32;
+    pub(crate) fn gemm_smem_need(tm: i32, ks: i32, af32: i32) -> usize;
+    pub(crate) fn gemm_smem_opted_in(tm: i32, ks: i32, af32: i32) -> i32;
+    pub(crate) fn gemm_smem_optin_in_capture_count() -> i32;
+    pub(crate) fn gemm_prefill_smem_optin_one_for_test(
+        tm: i32,
+        ks: i32,
+        af32: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
 }
@@ -7222,3 +7234,31 @@ mod issue147_tests;
 // ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod issue162_tests;
+
+// ────────────────────────────────────────────────────────────────────
+// #218: the prefill-GEMM dynamic-smem opt-in invariant.
+//
+// `gemm_prefill_smem_init` — the eager startup sweep — had no production
+// caller after #188 and was annotated away by the dead-code campaign. Plan B
+// keeps the lazy per-launch opt-in (`gemm_smem_optin`, reached through
+// `launch_gemm_f16`) and makes the invariant explicit and gated:
+//
+// - `cuda_prefill_smem_optin_is_done_by_production` — a real prefill forward
+//   opts a >48 KiB instantiation in, asserted through the device's own
+//   read-back, with the "not already opted in" precondition established by
+//   running in a fresh process (the tile config and the attribute are both
+//   process-scoped);
+// - `cuda_prefill_smem_optin_refusal_fails_the_prefill` — the control arm: the
+//   `attr:gemm_f16_f16` injection makes the prefill refuse the launch loudly;
+// - `graph::cuda_backend::tests::
+//   cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` — a >48 KiB
+//   prefill-shaped graph is captured and replays bitwise, and the opt-in is
+//   shown to run **before** the window opens, never inside it.
+//
+// `test_child` is the fresh-process harness; the sibling #145 gate in
+// `issue145_tests` now drives the same lazy production opt-in.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+pub(crate) mod issue218_tests;
+#[cfg(test)]
+pub(crate) mod test_child;
