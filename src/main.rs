@@ -1,4 +1,12 @@
 // End-to-End Inference Engine
+//
+// The non-test build is the one that ships, and it stays warning-free: this is
+// the gate that keeps the dead-code backlog PR #216 cleared from growing back
+// (the `#[allow]`s that remain are deliberate and item-scoped). Scoped to
+// `not(test)` on purpose — the test build has its own warnings (unused locals
+// and imports inside test code), which are a separate, tracked cleanup rather
+// than part of this gate.
+#![cfg_attr(not(test), deny(warnings))]
 
 mod bench;
 mod block;
