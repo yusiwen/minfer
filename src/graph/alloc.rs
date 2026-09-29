@@ -1642,13 +1642,6 @@ impl GraphAllocator {
         self.kv.seq_slot(seq)
     }
 
-    /// Mark cells `[from, to)` as written by `seq` in every layer (E2's batched
-    /// forwards write several sequences per step).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_own_range(&mut self, seq: super::kvcache::SeqId, from: usize, to: usize) {
-        self.kv.own_range(seq, from, to);
-    }
-
     /// Arena capacity in rows (`n_ctx`), 0 before allocation.
     pub fn kv_n_ctx(&self) -> usize {
         self.kv.n_ctx()

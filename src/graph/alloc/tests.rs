@@ -430,7 +430,7 @@ fn kv_session_round_trips_the_rows_and_the_run_table() {
     a.fill_input(&ga, "v", &vv).unwrap();
     let mut sched = crate::graph::scheduler::BackendScheduler::new();
     sched.execute(&ga, &mut a).unwrap();
-    a.kv_own_range(SEQ, 0, 4);
+    a.kv.own_range(SEQ, 0, 4);
     let want_kv = a.copy_kv_to_cpu(0).unwrap();
     let want_stats = a.kv_arena_stats();
     let want_cells = a.kv_cells_for_seq(&[SEQ, SEQ], &[1, 3]).unwrap();
@@ -567,7 +567,7 @@ fn an_f16_session_round_trips_through_save_and_load() {
     a.fill_input(&ga, "v", &vv).unwrap();
     let mut sched = crate::graph::scheduler::BackendScheduler::new();
     sched.execute(&ga, &mut a).unwrap();
-    a.kv_own_range(SEQ, 0, 2);
+    a.kv.own_range(SEQ, 0, 2);
     let want_kv = a.copy_kv_to_cpu(0).unwrap();
 
     let path = std::env::temp_dir().join(format!("minfer-c5-alloc-{}-f16.bin", std::process::id()));
@@ -626,7 +626,9 @@ fn kv_defrag_moves_the_bytes_and_opens_the_run() {
             alloc.kv_reserve_seq(seq, 4).unwrap().start,
             (seq as usize - 1) * 4
         );
-        alloc.kv_own_range(seq, (seq as usize - 1) * 4, seq as usize * 4);
+        alloc
+            .kv
+            .own_range(seq, (seq as usize - 1) * 4, seq as usize * 4);
     }
     let rope = crate::graph::kvcache::KvRope {
         freq_base: 10_000.0,
@@ -736,10 +738,10 @@ fn a_copy_on_write_moves_the_rows_and_never_writes_through() {
     // Sequence 1 computes four rows at [0, 4); sequence 2 reserves [4, 10),
     // reads those four in place, and writes two rows of its own at [4, 6).
     assert_eq!(alloc.kv_reserve_seq(1, 4).unwrap().start, 0);
-    alloc.kv_own_range(1, 0, 4);
+    alloc.kv.own_range(1, 0, 4);
     assert_eq!(alloc.kv_reserve_seq(2, 6).unwrap().start, 4);
     assert_eq!(alloc.kv_share_prefix(1, 2, 4).unwrap(), 4);
-    alloc.kv_own_range(2, 4, 6);
+    alloc.kv.own_range(2, 4, 6);
 
     // The store resolver refuses a position inside the share: that refusal is
     // what makes a write-through impossible rather than merely unlikely.
