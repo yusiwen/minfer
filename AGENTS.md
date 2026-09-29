@@ -131,6 +131,7 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 2. SIMD: AVX2 (x86) / NEON+SDOT (aarch64, inline asm) with scalar fallbacks; `MINFER_NO_NEON=1` forces scalar.
 3. No ML frameworks — all ops handwritten; tensor data is raw `&[u8]`; GGUF padding via `ggml_pad()`.
 4. Cross-backend: per-op assignment decided at build time via `supports_op` — offered in the backend registry's priority order (F4: Metal 300, CUDA 200, CPU 100; `docs/BACKEND-REGISTRY-DESIGN.md`) rather than in a hardcoded chain; guard failures abort — never silent mid-run fallback.
+5. **The non-test build is warning-free, and gated.** `src/main.rs` carries `#![cfg_attr(not(test), deny(warnings))]`, so any new warning fails `cargo build --release` on every platform — and the bin half of `cargo test --release`, which all three build jobs exercise. PR #216 cleared the 40-diagnostic dead-code backlog; this keeps it cleared. The `not(test)` scope is deliberate: the test build's own warnings (unused locals and imports inside test code) are a separate, tracked cleanup, not part of this gate. When code is only reachable in some configuration, silence it at the item with `#[cfg_attr(<cfg>, allow(dead_code))]` and say why — never widen the crate-level gate.
 
 ## Extending
 
