@@ -47,11 +47,11 @@ vs 728 in the run that exposed it). Rule 1 is about a shared *code path*; a
 shared *destination* is the same hazard, and a value read from an owned table is
 immune to it.
 
-**The orphaned-entry-point instance (#218).** A gate must exercise the
-**production entry point**, never a test-only helper that mirrors it. #218 found
-that the `#145` gate `cuda_prefill_smem_optin_covers_every_launchable_instantiation`
+**The orphaned-entry-point instance ([#218], [#223]).** A gate must exercise the
+**production entry point**, never a test-only helper that mirrors it. [#218] found
+that the [#145] gate `cuda_prefill_smem_optin_covers_every_launchable_instantiation`
 called `gemm_prefill_smem_init` — an eager startup sweep whose `CudaState::try_new`
-call site #188 had quietly deleted. The helper still worked, so the gate stayed
+call site [#188] had quietly deleted. The helper still worked, so the gate stayed
 green while **production performed no such opt-in at all**; the dead-code pass
 then annotated the orphan `#[cfg_attr(not(test), allow(dead_code))]` instead of
 asking why a production-looking function had no production caller. A mirrored
@@ -59,11 +59,17 @@ helper is the same hazard as rule 1's shared code path: the gate and the
 production path can be wrong *together*, and the mirror is what makes it look
 certified. Ask of every gate: **is the function it calls reachable from a
 production entry point?** If the answer is a test-only sweep, the gate's claim is
-about the sweep, not the engine — either drive the real entry point (the #218
+about the sweep, not the engine — either drive the real entry point (the [#218]
 gates drive `gemm_smem_optin` through a real forward and through the production
 launcher) or rename the gate so its claim states the mirror it tests. The
 campaign corollary: a dead-code diagnostic that `allow`s a test-reachable
 production-looking item is a **question deferred**, not a warning silenced.
+
+That question has two legitimate answers. Deleting the item is one. [#223] took
+the other and restored the production call — `CudaState::try_new` drives the eager
+pre-warm again, through the *same* per-instantiation cache the launcher reads, so
+the attribute is set before any `CudaBackend` (the only holder of a capture
+window) can exist. Annotating the item without answering the question is neither.
 
 ## 2. A control arm must differ in the property under test
 
@@ -227,15 +233,17 @@ re-state it.
 
 1. What **value** does it assert, and how is that value computed independently
    of the path under test? (rule 1)
-2. Which **single arm** can fail only because of the property under test, and
+2. Is the function the gate calls reachable from a **production entry point** —
+   or is the claim about a test-only mirror? (rule 1, the [#218] instance)
+3. Which **single arm** can fail only because of the property under test, and
    is it refused by an earlier check? (rule 2)
-3. What is the **mutation** — which implementation line do you break, and does
+4. What is the **mutation** — which implementation line do you break, and does
    the transcript show *this* gate going red? Use
    `MINFER_TEST_CALL_FAIL=<site>`; if the counter is what certifies the run,
    `testfail::note_checked` it too. (rule 3)
-4. Is the runtime bounded by **work**? If not, are the rounds interleaved and
+5. Is the runtime bounded by **work**? If not, are the rounds interleaved and
    the assertion on a median that prints its inputs? (rule 4)
-5. Does every number in the PR body carry its **date, device and command**?
+6. Does every number in the PR body carry its **date, device and command**?
    (rule 5)
 
 ## How the shape is enforced
@@ -277,3 +285,7 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#185]: https://github.com/yusiwen/minfer/issues/185
 [#175]: https://github.com/yusiwen/minfer/issues/175
 [#186]: https://github.com/yusiwen/minfer/issues/186
+[#145]: https://github.com/yusiwen/minfer/issues/145
+[#188]: https://github.com/yusiwen/minfer/issues/188
+[#218]: https://github.com/yusiwen/minfer/issues/218
+[#223]: https://github.com/yusiwen/minfer/issues/223
