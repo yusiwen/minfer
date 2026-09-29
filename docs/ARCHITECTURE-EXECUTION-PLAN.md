@@ -1981,7 +1981,10 @@ so `cells[t] == positions[t]`, and the classic path stays bitwise.
   (S1) and takes `cells` in S3.
 - **Allocator**: `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` stop
   treating `positions` as cells — `own_range`, `kv_note_used` and `attn_span`
-  resolve through the run table — and fill `cells`.
+  resolve through the run table — and fill `cells`. (History: E1's test-only
+  `fill_attn_inputs` and the `kv_note_used` → `own_prefix` C1 remnant were deleted
+  in [#228](https://github.com/yusiwen/minfer/issues/228); `fill_batch_inputs` is
+  the one production fill entry point.)
 - **KV store**: `KvCache::cells_for` (today the identity) and `attn_span` (today
   requires `position ∈ run` and `owner[position] == seq`) become the resolver;
   `check_positions_bound` / `check_attn_span` check the *cells* form.
@@ -2029,7 +2032,10 @@ What S1 changed (production):
   single-sequence identity fallback when no run is reserved;
 - `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` use relative positions,
   and `fill_attn_inputs` only resolves `cells` when the graph has that input (a
-  rope-only fixture must not need a KV arena);
+  rope-only fixture must not need a KV arena). *(History: `fill_attn_inputs` was
+  deleted in [#228](https://github.com/yusiwen/minfer/issues/228), which moved its
+  corpus onto `fill_batch_inputs`; the rope-only branch survives as the
+  `#[cfg(test)]`-scoped `GraphAllocator::fill_attn_inputs_without_cells`.)*
 - qwen2/qwen3 gate the fused QKV family off while `explicit_span` is set (S3 ports
   it for CUDA), and `server/batch.rs` passes relative positions;
 - `kv_defrag` no longer re-ropes and the `KvRope` plumbing is gone (S2).
@@ -2474,7 +2480,10 @@ ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
 `KvCache::private_row_for(seq, t)` plans a **copy-on-write** and `apply_private_row` books it, with
 `GraphAllocator::kv_private_row_for` driving the data half through `Backend::copy_cells`; both fill entry
 points (`fill_batch_inputs`, `fill_attn_inputs`) run it **before the first cell is resolved**, and the
-store resolver (`kv_cells_for_seq`) now refuses a position inside the share outright. A sharing
+store resolver (`kv_cells_for_seq`) now refuses a position inside the share outright. (As of
+[#228](https://github.com/yusiwen/minfer/issues/228) there is **one** entry point — the production
+`fill_batch_inputs` — and the resolver's refusal is a belt-and-braces check it cannot reach with a
+shared position; the `fill_attn_inputs` half of that sentence was true when S3 landed.) A sharing
 sequence's run holds positions `[shared.rows, shared.rows + cap)`, so a store at `t < shared.rows` gives
 the share up from `t` on: `shared.rows` drops to `t` and the rows the sequence already wrote shift **up**
 by `d = old_base - t` inside the same run. That arithmetic is what keeps the change small — the span list
@@ -2511,7 +2520,9 @@ room, and a plan applied to a state it was not made from; the owner table and th
 that copies **twice** as it diverges earlier each time, ending with the share gone) plus one allocator
 test on real regions that refuses a shared position through the store resolver, drives the copy, checks
 K/V byte-for-byte at the moved cells, checks the donor's four rows are unchanged, and drives a second
-copy-on-write through `fill_attn_inputs`. The real-model gate
+copy-on-write through the fill entry point (`fill_batch_inputs` since
+[#228](https://github.com/yusiwen/minfer/issues/228); `fill_attn_inputs` when this gate landed). The
+real-model gate
 (`a_store_inside_a_shared_prefix_takes_a_private_row`, ignored like the others) shares 16 rows between
 two slots and then serves slot 1 a prompt matching only their first three tokens: the request is served
 (the resolver would otherwise refuse it), `cows > 0` proves the copy ran, the answer is byte-identical to
@@ -4080,7 +4091,10 @@ reserves the whole arena for `SEQ_MAIN`, so `attn_span` still returns
 `[0, pos + 1)` and the real-model bitwise tests are the refactor's gate — they
 did not move (`cargo test --release` 183 → 184 passed / 0 failed, the +1 being
 the new reservation test). The allocator exposes the E2-facing surface
-(`kv_reserve_seq`/`kv_release_seq`/`kv_seq_slot`/`kv_own_range`).
+(`kv_reserve_seq`/`kv_release_seq`/`kv_seq_slot`/`kv_own_range`). *(Since
+[#228](https://github.com/yusiwen/minfer/issues/228) the classic case is
+`fill_batch_inputs`'s own `reserve_seq(seq, n_ctx)` when a group has no run, and
+`own_prefix` is test-only.)*
 
 **E2 progress, step 2 (2026-09-17).** The batch entry point landed:
 `graph/batch.rs` defines `Batch { tokens, positions, seq_ids }` with `groups()`
@@ -4342,7 +4356,10 @@ the new fourth input. `KvCache::seq_range` / `attn_span` resolve each query's
 `GraphAllocator::fill_attn_inputs` is the single call that records how far the
 forward writes, fills the ids and resolves the span, so the IR's ids and the
 kernel's window cannot drift apart. The CPU kernel now walks `lo..hi` instead of
-`0..pos[t] + 1`.
+`0..pos[t] + 1`. *(E1's `fill_attn_inputs` was never called by production: it was
+deleted in [#228](https://github.com/yusiwen/minfer/issues/228) and its whole test
+corpus now drives `fill_batch_inputs`, the call `forward_cached`/`forward_batch`
+themselves make.)*
 
 **The refusal has one definition.** `Backend::supports_attn_span` (default
 `false`) plus `graph::backend_takes` decide assignment; `GraphAllocator::supports`
@@ -5325,6 +5342,137 @@ gate, and carries the measured cost table; `cuda_optimization_steps/02-wmma-f16-
 and this file's #145 and #218 records carry dated forward notes (history is not rewritten);
 `inference_e2e_walkthrough/15-cuda-backend.md` still describes only `prewarm_prefill()`, which is
 unchanged. `docs/status.toml` and `AGENTS.md` carry the new CUDA counts.
+
+#### Test-infrastructure record (#228, 2026-09-30) — the E1 test corpus moves onto the production `fill_batch_inputs`
+
+**The finding (S1 of [#227](https://github.com/yusiwen/minfer/issues/227)).**
+`GraphAllocator::fill_attn_inputs` (`alloc.rs:1724` on master `b5a9d5f`) was a
+production-shaped entry point with `#[cfg_attr(not(test), allow(dead_code))]` and a
+doc that claimed *"the model path and hand-built graphs both use it"*. The model path
+does not: `forward_batch` and `forward_cached` — the latter literally
+`forward_batch(&Batch::single(tokens, positions), …)` (`models/qwen2/graph.rs:458-465`)
+— call `fill_batch_inputs`, a **separate implementation** of the same job. The
+coverage was therefore inverted: E2 had **one** test call site
+(`qwen2::graph::tests:2068`) while E1, which production never runs, had **15**. A
+change to E2's COW ordering, reservation or ownership recording could leave the suite
+green — the "mirrored helper" hazard of [GATE-CONTRACT §1](GATE-CONTRACT.md).
+
+**Classification of the 15 E1 call sites (step 1 done before any rewriting).** Every
+one asks the same question — can the scenario be a `Batch`? — and the answer is
+**yes for 14**; the exception is the rope-only fixture.
+
+| file:line (master) | driving test | graph has `cells`? | disposition |
+|---|---|---|---|
+| `alloc/tests.rs:423` | `kv_session_round_trips_the_rows_and_the_run_table` | yes | moved → `Batch::new(_, _, [SEQ, SEQ])` |
+| `alloc/tests.rs:558` | `an_f16_session_round_trips_through_save_and_load` | yes | moved → `Batch::new` |
+| `alloc/tests.rs:794` | `a_copy_on_write_moves_the_rows_and_never_writes_through` | yes | moved → `Batch::new(_, _, [2])` (not `Batch::single`: that names `SEQ_MAIN`, which holds no run here) |
+| `cpu_backend/tests.rs:377` | `embedding_and_rope` | **no** | **exception** — see below |
+| `cpu_backend/tests.rs:436` | `kvcache_store_load_and_attn_roundtrip` | yes | moved → `Batch::single` |
+| `cpu_backend/tests.rs:507` | `a_packed_kv_region_answers_like_the_f32_one_and_is_smaller` | yes | moved → `Batch::single` |
+| `cpu_backend/tests.rs:678` | `a_packed_physical_shift_moves_v_verbatim_and_requantizes_k` | yes | moved → `Batch::single`; the redundant post-execute `kv_note_used(nt)` deleted with it |
+| `qwen2/graph/tail_tests.rs:203` | `tail_reduction_matches_full_nt` (`run_keep`) | yes | moved → `Batch::single` |
+| `qwen2/graph/tail_tests.rs:403` | `fused_qkv_matches_unfused_decode` | yes | moved → `Batch::single` |
+| `qwen2/graph/tail_tests.rs:498` | `fused_qkv_matches_unfused_decode` | yes | moved → `Batch::single` |
+| `qwen2/graph/tests.rs:2907` | `graph_logits_match_forward_real_model` (`run_prefill_decode`) | yes | moved → `Batch::single` |
+| `qwen2/graph/tests.rs:2955` | `graph_logits_match_forward_real_model` (decode step) | yes | moved → `Batch::single(&[next], &[nt])` |
+| `qwen2/graph/tests.rs:3107` | `graph_metal_layer0_isolation` (macOS) | yes | moved → `Batch::single` |
+| `qwen2/graph/tests.rs:3132` | `graph_metal_layer0_isolation` (macOS) | yes | moved → `Batch::single` |
+| `qwen3/graph/tests.rs:406` | `metal_prefill_determinism` (macOS) | yes | moved → `Batch::single` |
+
+**The no-`cells` case exists — and it is a no-op.** `cpu_backend::tests::embedding_and_rope`
+builds an embedding + RoPE graph with **no** `kvcache_store`, so it has none of
+`seq_ids` / `cells` / `kv_map` / `attn_span`. E1's `has_cells` guard made its call
+there a **complete no-op**, and E2 cannot express the shape at all: with no KV node
+there is no arena (`n_ctx() == 0`), and `fill_batch_inputs`'s per-group implicit
+reservation is `reserve_seq(seq, 0)`, which is refused. So this is the one site that
+keeps the shape, as `#[cfg(test)]`-scoped
+`GraphAllocator::fill_attn_inputs_without_cells` — the `has_cells == false` branch and
+nothing else, `debug_assert`ed to reject a `cells` graph, with the doc naming
+`embedding_and_rope`. It is `#[cfg(test)]`-scoped, not `allow(dead_code)`-silenced, so
+a non-test build cannot see it.
+
+**What was deleted, and the honest disposition of each item that lost its only
+caller.**
+
+- `GraphAllocator::fill_attn_inputs` — deleted with its header comment (it was not an
+  entry point).
+- `GraphAllocator::kv_note_used` (`alloc.rs:1240`) — after the move its last caller was
+  the redundant `cpu_backend::tests:683` line; that line is gone, so it had **nothing**
+  and was deleted (a dead item behind an `allow` is exactly the pattern Core
+  Convention 5 exists to stop). Its doc claimed "the model calls this after a forward
+  with `max(positions)+1`" — false; production records the extent through
+  `KvCache::own_positions`.
+- `KvCache::own_prefix` (`kvcache.rs:582`) — `kv_note_used` was its last non-test
+  caller, so it is now **test-only**; it keeps its `#[cfg_attr(not(test),
+  allow(dead_code))]` and its doc now names the four `kvcache::tests` that drive it.
+- **`kv_cells_for_seq` is *not* an orphan — the #228 premise (inherited from #227)
+  was tested and falsified.** The premise was that its only non-test callers are E1
+  and S3's `kv_cell_of`, so it is production-unreachable yet unannotated, "silent only
+  because both its callers are annotated", and therefore missed by an
+  annotation-grep census. The reachability chain says otherwise:
+  `models/qwen2/graph.rs:660` / `qwen3/graph.rs:567` → `fill_batch_inputs` →
+  **`fill_seq_ids` → `kv_cells_for_seq`** (the `has("cells")` branch), and every model
+  graph has a `cells` input because `kvcache_store` always creates one
+  (`models/qwen2/graph.rs:217`). It was verified at runtime, not by grep: an
+  env-gated `eprintln!` at the top of `kv_cells_for_seq` plus
+  `cargo test --release models::qwen2::graph::tests::graph_logits_match_forward_real_model`
+  → **4 hits**, test green (probe reverted). So it is production-reachable, has no
+  annotation because rustc is right, and **the annotation-grep/transitive-closure
+  worry does not apply to this subgraph: `kv_cells_for_seq` needs no change.** S1 and
+  S3 are still one subgraph (joined through `kv_cells_for_seq`), but the closure
+  direction is inverted, and that inversion is the result #227's census method needs.
+  The genuinely dead chain is the smaller one:
+  `fill_attn_inputs` → `kv_note_used` → `own_prefix` (E1 and `kv_note_used` deleted;
+  `own_prefix` now test-only with its doc naming the tests). Its documented role is
+  unchanged; only the "two fill entry points" comment was corrected.
+- Residual, not fixed (out of this ticket's scope, recorded): `kv_cells_for_seq`'s
+  `classic` branch (`arena_stats().sequences == 0` → `cell == position`) is now
+  reachable only from `alloc/tests.rs`; production always reserves before
+  `fill_seq_ids` runs, because `fill_batch_inputs`'s first loop covers every group.
+
+**Mutation evidence (rule 3), CPU aarch64, 2026-09-30.** The production path must be
+the thing that goes red. Mutation: in `fill_batch_inputs`, own the **wrong** positions —
+`own_positions(seq, positions.iter().map(|p| p + 1))` — so the ownership recording is
+off by one while everything still compiles (a plain "skip `own_positions`" mutation
+does *not* compile: the item would become dead and `#![cfg_attr(not(test),
+deny(warnings))]` fires, which is itself evidence the recording is load-bearing).
+
+```
+cargo test --release
+test result: FAILED. 478 passed; 3 failed; 36 ignored; 0 measured; 0 filtered out
+  graph::alloc::tests::kv_session_round_trips_the_rows_and_the_run_table
+    src/graph/alloc/tests.rs:445: assertion `left == right` failed: positions 0..4 are written
+      left: 5   right: 4
+  graph::cpu_backend::tests::a_packed_physical_shift_moves_v_verbatim_and_requantizes_k
+    src/graph/cpu_backend/tests.rs:722: assertion `left == right` failed: one row removed
+      left: 3   right: 2
+  models::qwen2::graph::tests::kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class
+    src/models/qwen2/graph/tests.rs:2676: assertion `left == right` failed: only A survives removing B
+      left: 8   right: 7
+```
+
+Two of the three are **moved** E1 call sites; the third,
+`kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class`, reaches
+`fill_batch_inputs` through the real production caller `forward_graph_cached` — the
+strongest form of the point, because the mutation is visible to production's own path and
+not only to test-driven fills. Mutation reverted; `grep -n MUTATION src/graph/alloc.rs`
+empty and `git diff` clean of it.
+
+**Counts (rule 5).** No `#[test]` was added or removed, so the suite counts are
+unchanged and **no CUDA row was re-measured**: `cargo test --release`, box aarch64
+(this box), 2026-09-30 → **481 / 0 / 36** unit + **10 / 0 / 6** integration (the same
+as the recorded aarch64 row). `cargo fmt --all --check` clean; the non-test build
+warning-free with and without `--features cuda` (the one `warning:` line on the CUDA
+build is `build.rs`'s pre-existing `cargo:warning=` target list, not a rustc
+diagnostic).
+
+**Limits.** (1) The macOS-only arms (`graph_metal_layer0_isolation`,
+`fused_qkv_matches_unfused_decode`, `metal_prefill_determinism`) are type-checked only
+by the CI `build-macos` job here — no Mac. (2) The x86_64 CPU row cannot be computed
+locally; it is unchanged by construction (same test count) and the CI `test-linux-cpu`
+log is its source. (3) The no-`cells` helper's claim is weak by nature ("filling a
+graph with no KV input resolves nothing and touches no arena"); it is kept because the
+ticket asks for exactly that shape, not because it catches a bug.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
