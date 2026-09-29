@@ -2826,6 +2826,7 @@ fn kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class() {
 fn graph_logits_match_forward_real_model() {
     use crate::graph::alloc::GraphAllocator;
     use crate::graph::backend::Backend;
+    use crate::graph::batch::Batch;
     use crate::graph::builder::GraphBuilder;
     use crate::graph::fusion::FusionPass;
     use crate::graph::params::{CParams, GraphParams, GraphType};
@@ -2900,11 +2901,14 @@ fn graph_logits_match_forward_real_model() {
         FusionPass::new().run(&mut graph, &backends, &|_, _| Some(0));
         alloc.alloc_graph(&graph).unwrap();
         let ids32: Vec<u32> = ids.iter().copied().collect();
-        let pos32: Vec<u32> = (0..nt as u32).collect();
+        let pos: Vec<usize> = (0..nt).collect();
+        let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
         alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
-        let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
-        alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
+        // E2 — the entry point `forward_cached`/`forward_batch` themselves drive.
+        alloc
+            .fill_batch_inputs(&graph, &Batch::single(&ids32, &pos))
+            .unwrap();
         // G3 tail-reduction input: forward_cached fills it (see
         // forward_cached); the manual graph must do the same, otherwise the
         // reduce picks row 0 instead of the last row → logits of a different
@@ -2951,8 +2955,9 @@ fn graph_logits_match_forward_real_model() {
         alloc
             .fill_input_i32(&dgraph, "positions", &[nt as u32])
             .unwrap();
+        // E2: the decode step is a one-token batch on the same sequence.
         alloc
-            .fill_attn_inputs(&dgraph, &[crate::graph::kvcache::SEQ_MAIN], &[nt as u32])
+            .fill_batch_inputs(&dgraph, &Batch::single(&[next], &[nt]))
             .unwrap();
         sched.execute(&dgraph, &mut alloc).unwrap();
         let dlogits = alloc.copy_to_cpu(dgraph.outputs[0]).unwrap();
@@ -3101,10 +3106,11 @@ fn graph_metal_layer0_isolation() {
         Qwen2Graph::register_graph_weights(q2, &mut ca);
         ca.alloc_graph(&g).unwrap();
         ca.fill_input_i32(&g, "token_ids", &ids).unwrap();
-        let pos32: Vec<u32> = (0..nt as u32).collect();
+        let pos: Vec<usize> = (0..nt).collect();
+        let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
         ca.fill_input_i32(&g, "positions", &pos32).unwrap();
-        let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
-        ca.fill_attn_inputs(&g, &seqs, &pos32).unwrap();
+        ca.fill_batch_inputs(&g, &crate::graph::batch::Batch::single(&ids, &pos))
+            .unwrap();
         sched.execute(&g, &mut ca).unwrap();
         let expect = ca.copy_to_cpu(g.outputs[0]).unwrap();
 
@@ -3126,10 +3132,12 @@ fn graph_metal_layer0_isolation() {
             alloc.enable_metal();
             alloc.alloc_graph(&g2).unwrap();
             alloc.fill_input_i32(&g2, "token_ids", &ids).unwrap();
-            let pos32: Vec<u32> = (0..nt as u32).collect();
+            let pos: Vec<usize> = (0..nt).collect();
+            let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
             alloc.fill_input_i32(&g2, "positions", &pos32).unwrap();
-            let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
-            alloc.fill_attn_inputs(&g2, &seqs, &pos32).unwrap();
+            alloc
+                .fill_batch_inputs(&g2, &crate::graph::batch::Batch::single(&ids, &pos))
+                .unwrap();
             sched.execute(&g2, &mut alloc).unwrap();
             let got = alloc.copy_to_cpu(g2.outputs[0]).unwrap();
             let mut maxd = 0.0f32;

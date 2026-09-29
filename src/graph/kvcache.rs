@@ -578,6 +578,13 @@ impl KvCache {
 
     /// The single-sequence case: reserve the whole arena for `seq` if it has no
     /// reservation yet, then take ownership of `0..n_used`.
+    ///
+    /// **Test-only.** Its last production-looking caller, `GraphAllocator::kv_note_used`,
+    /// was E1's C1 remnant and was deleted with E1 (#228): production now records the
+    /// written extent per position through [`Self::own_positions`], which is
+    /// reservation-aware. The remaining callers are this module's own tests —
+    /// `kvcache::tests::own_prefix_and_release_round_trip` and its three siblings — which
+    /// use it to set up a written prefix directly.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn own_prefix(&mut self, seq: SeqId, n_used: usize) {
         if !self.seqs.contains_key(&seq) {

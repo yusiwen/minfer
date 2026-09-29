@@ -1,6 +1,7 @@
 //! `#[cfg(test)] mod tail_tests` for `src/models/qwen2/graph.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+use crate::graph::batch::Batch;
 use crate::models::ModelDef;
 
 /// Dump directory for the `dump_real_*` debug helpers.
@@ -196,11 +197,14 @@ fn tail_reduction_matches_full_nt() {
         FusionPass::new().run(&mut graph, &backends, &|_, _| Some(0));
         alloc.alloc_graph(&graph).unwrap();
         let ids32: Vec<u32> = ids.iter().copied().collect();
-        let pos32: Vec<u32> = (0..nt as u32).collect();
+        let pos: Vec<usize> = (0..nt).collect();
+        let pos32: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
         alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
-        let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
-        alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
+        // E2: one sequence, one batch — the production fill entry point.
+        alloc
+            .fill_batch_inputs(&graph, &Batch::single(&ids32, &pos))
+            .unwrap();
         if graph
             .inputs
             .iter()
@@ -400,7 +404,9 @@ fn fused_qkv_matches_unfused_decode() {
                 .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
                 .unwrap();
             alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
-            alloc.fill_attn_inputs(&graph, &[0], &[0]).unwrap();
+            alloc
+                .fill_batch_inputs(&graph, &Batch::single(&[tok_ids[0]], &[0]))
+                .unwrap();
             sched.execute(&graph, &mut alloc).unwrap();
             alloc.copy_to_cpu(graph.outputs[0]).unwrap()
         }
@@ -495,7 +501,9 @@ fn fused_qkv_matches_unfused_decode() {
                 .fill_input_i32(&graph, "token_ids", &[tok_ids[0]])
                 .unwrap();
             alloc.fill_input_i32(&graph, "positions", &[0]).unwrap();
-            alloc.fill_attn_inputs(&graph, &[0], &[0]).unwrap();
+            alloc
+                .fill_batch_inputs(&graph, &Batch::single(&[tok_ids[0]], &[0]))
+                .unwrap();
             sched.execute(&graph, &mut alloc).unwrap();
             let logits = alloc.copy_to_cpu(graph.outputs[0]).unwrap();
             let layers: Vec<Vec<f32>> = ffn_adds

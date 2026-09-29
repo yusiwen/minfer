@@ -1233,14 +1233,6 @@ impl GraphAllocator {
         self.kv.get(layer).map(|l| l.n_used)
     }
 
-    /// Record that the arena now holds rows `0..n_used` (Phase C / C2). The
-    /// model calls this after a forward with `max(positions) + 1`, which is the
-    /// only place that knows how far the KV store wrote.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_note_used(&mut self, n_used: usize) {
-        self.kv.own_prefix(super::kvcache::SEQ_MAIN, n_used);
-    }
-
     /// Mark buffers whose liveness ended before exec index `i` as reusable.
     fn sweep(&mut self, i: usize) {
         let expired: Vec<(Backend, usize)> = self
@@ -1674,10 +1666,13 @@ impl GraphAllocator {
     /// and resolve `attn_span` (Phase E / E2).
     ///
     /// A sequence with no reservation is refused unless it is the only one — the
-    /// single-sequence path takes the whole arena, which is exactly E1's
-    /// behaviour and keeps the classic forward bitwise; a batched caller must
-    /// reserve each run first (`kv_reserve_seq`), so a missing reservation is a
-    /// loud error rather than an overlap.
+    /// single-sequence path takes the whole arena, which is what keeps the classic
+    /// forward bitwise; a batched caller must reserve each run first
+    /// (`kv_reserve_seq`), so a missing reservation is a loud error rather than an
+    /// overlap. It is the **production** fill entry point: `forward_batch`
+    /// (`models/qwen2/graph.rs`) and `forward_cached` — literally
+    /// `forward_batch(&Batch::single(tokens, positions), …)` — both call it, and it
+    /// is the one the test corpus drives (GATE-CONTRACT rule 1).
     pub fn fill_batch_inputs(
         &mut self,
         graph: &ComputeGraph,
@@ -1712,53 +1707,43 @@ impl GraphAllocator {
         self.fill_seq_ids(graph, &batch.seq_ids, &positions)
     }
 
-    /// Fill the E1 attention inputs and record how far this forward writes:
-    /// `positions` are cell indices, `seq_ids` names each query's sequence.
+    /// Test-only: fill the attention inputs of a graph that has **no** `cells`
+    /// input — a rope-only fixture with no KV store, hence no arena.
     ///
-    /// This is the one call a caller needs — the model path and hand-built graphs
-    /// both use it — so the seq ids, the resolved span and the store's ownership
-    /// cannot drift apart. `max(positions) + 1` is exactly the row count the KV
-    /// store writes in this forward, recorded *before* the span is resolved
-    /// because the span has to describe the cache the store is about to fill.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn fill_attn_inputs(
+    /// [`Self::fill_batch_inputs`] is the production entry point, and it runs its
+    /// copy-on-write, implicit reservation and `own_positions` for **every** group:
+    /// a graph with no KV store has `n_ctx() == 0`, so production's implicit
+    /// reservation (`reserve_seq(seq, 0)`) is refused and the shape is not
+    /// expressible through it. The deleted E1 entry point branched on `has_cells`
+    /// and skipped every KV step for exactly this shape; this keeps that branch and
+    /// only that branch, `#[cfg(test)]`-scoped so it cannot be reached from a
+    /// non-test build (not merely `allow(dead_code)`-silenced). The one fixture that
+    /// drives it is `cpu_backend::tests::embedding_and_rope`, whose graph has no
+    /// `seq_ids`, `cells`, `kv_map` or `attn_span` input either — so the call
+    /// resolves no window and is the statement "a graph with no KV input needs no
+    /// fill, and filling one must not touch an arena".
+    #[cfg(test)]
+    pub fn fill_attn_inputs_without_cells(
         &mut self,
         graph: &ComputeGraph,
         seq_ids: &[u32],
         positions: &[u32],
     ) -> Result<(), String> {
+        debug_assert!(
+            !graph.inputs.iter().any(|&i| graph.node(i).name == "cells"),
+            "fill_attn_inputs_without_cells is for a graph with no KV store"
+        );
         let pos: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
-        // C6: the written extent is a *cell* extent, resolved through the runs —
-        // but only a graph that actually stores K/V has a `cells` input (a
-        // rope-only fixture does not, and must not need a KV arena).
-        let has_cells = graph.inputs.iter().any(|&i| graph.node(i).name == "cells");
-        if has_cells {
-            // C8b S3: same rule as `fill_batch_inputs` — the copy-on-write runs before
-            // any cell is resolved, keyed on each sequence's lowest position here. A
-            // graph with no store has nothing to write, so it needs no copy either.
-            let mut first: Vec<(u32, usize)> = Vec::new();
-            for (&seq, &p) in seq_ids.iter().zip(&pos) {
-                match first.iter_mut().find(|(s, _)| *s == seq) {
-                    Some((_, low)) => *low = (*low).min(p),
-                    None => first.push((seq, p)),
-                }
-            }
-            for (seq, t) in first {
-                self.kv_private_row_for(seq, t)?;
-            }
-        }
-        if has_cells && !pos.is_empty() {
-            let cells = self.kv_cells_for_seq(seq_ids, &pos)?;
-            if let Some(&maxc) = cells.iter().max() {
-                self.kv_note_used(maxc as usize + 1);
-            }
-        }
         self.fill_seq_ids(graph, seq_ids, &pos)
     }
 
     /// Resolve each query's **cell** from the store: `start + position`, for the
     /// runs the caller reserved (C6). This is what the KV store writes to, while
     /// `positions` stays the token's index within its sequence (what RoPE needs).
+    ///
+    /// Production reaches it through [`Self::fill_batch_inputs`] →
+    /// [`Self::fill_seq_ids`]; the reservation that bounds every write is the one
+    /// `fill_batch_inputs` took.
     pub fn kv_cells_for_seq(
         &self,
         seq_ids: &[u32],
@@ -1799,8 +1784,11 @@ impl GraphAllocator {
             // C8b S3: a run holds positions `[shared.rows, shared.rows + cap)` — the
             // lower positions are read from the donor's cells, and a store there would
             // write **through** the shared prefix and corrupt every sharer. The caller
-            // has to copy-on-write first (`kv_private_row_for`), which the two fill
-            // entry points do; anything else is a loud error, never a silent write.
+            // has to copy-on-write first (`kv_private_row_for`), which
+            // `fill_batch_inputs` does; anything else is a loud error, never a silent
+            // write. (`fill_attn_inputs_without_cells`, the test-only rope-only
+            // fixture path, never reaches here: a graph with no `cells` input takes
+            // the `has("cells")` branch's skip in `fill_seq_ids`.)
             if rel < slot.shared.rows {
                 return Err(format!(
                     "kv_cells_for_seq: query {t} position {rel} would be written into sequence \
