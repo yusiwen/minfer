@@ -177,6 +177,15 @@ jobs:
         run: python3 scripts/check_cuda_launch_returns.py --selftest
       - name: The CUDA launch-site fixture must match the source
         run: python3 scripts/check_cuda_launch_returns.py --check-fixture tests/fixtures/cuda_launch_sites.tsv
+      # The layout rules AGENTS.md states: a test module is a file (never an
+      # inline `#[cfg(test)] mod … {`), and every `src/**.rs` is named by a `mod`
+      # declaration. The second half is the dangerous one — an undeclared file is
+      # never compiled, so tests inside it silently do not run while CI stays
+      # green. A source audit needs no build and no GPU.
+      - name: Every test module is a file, and every source file is declared
+        run: python3 scripts/check_source_layout.py
+      - name: The source-layout checker's own pass/fail cases
+        run: python3 scripts/check_source_layout.py --selftest
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands
