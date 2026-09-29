@@ -17,6 +17,12 @@
 //! verdict. The child is one test, so nothing else can have opted the
 //! instantiation in first.
 //!
+//! #223 adds a third process-scoped fact: the **eager pre-warm** runs inside
+//! `CudaState::try_new`, on the child's first device call, before the body can
+//! launch anything. `MINFER_NO_GEMM_PREWARM=1` is stripped from the child by
+//! default (so the pre-warm is the default) and passed back explicitly by the
+//! arms that need the pre-#223 "lazy path alone" process.
+//!
 //! Only compiled under `#[cfg(test)]`; the gates below are the only callers.
 
 use std::process::Command;
@@ -43,6 +49,10 @@ const STRIPPED: &[&str] = &[
     "MINFER_NO_PREFILL_CAPTURE",
     "MINFER_CAPTURE_PREFILL",
     "MINFER_NO_PREFILL_GEMM",
+    // #223: the eager pre-warm's control. Stripped so a child's default is the
+    // production behaviour (pre-warm on); the #218 "lazy path alone" arms pass
+    // it back explicitly, and #223's own control arm does too.
+    "MINFER_NO_GEMM_PREWARM",
     "MINFER_DEVICE_TIER",
     "MINFER_BACKENDS",
     "MINFER_GPU_LAYERS",

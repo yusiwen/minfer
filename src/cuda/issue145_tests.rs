@@ -66,18 +66,38 @@ fn the_gemm_smem_formula_matches_the_kernel_layout() {
 ///
 /// #218: the pre-#218 version called `gemm_prefill_smem_init`, the **eager
 /// sweep** #188 had orphaned (no production caller). The sweep is gone; this
-/// gate now drives the lazy path production actually uses, and its name and
-/// claim say so. The production *forward* arms live in `issue218_tests`:
+/// gate drives the lazy path production actually uses, and its name and claim
+/// say so. The production *forward* arms live in `issue218_tests`:
 /// `cuda_prefill_smem_optin_is_done_by_production` (a real prefill opts a
 /// >48 KiB instantiation in, non-vacuously) and
 /// `cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` (a >48 KiB
 /// captured prefill replays bitwise, with the opt-in shown to happen before the
 /// window opened).
+///
+/// #223 runs this gate in a **fresh process with `MINFER_NO_GEMM_PREWARM=1`**
+/// (the documented control). Under the default eager pre-warm every attribute is
+/// already in force at context creation, so `gemm_smem_optin` would answer from
+/// its cache and "the lazy production opt-in admits it" would be untested; with
+/// the pre-warm off, this is the arm that actually drives the lazy
+/// `cudaFuncSetAttribute` for every launchable instantiation. It stays the
+/// cache-keying detector: the device read-back, not the return value, is what
+/// catches a per-signature cache.
 #[test]
 fn cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation() {
+    const FILTER: &str = "cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation";
+    match super::test_child::child_phase().as_deref() {
+        Some("coverage") => coverage_child(),
+        _ => {
+            let child =
+                super::test_child::run_self(FILTER, "coverage", &[("MINFER_NO_GEMM_PREWARM", "1")]);
+            child.verdict("the lazy production opt-in's coverage");
+        }
+    }
+}
+
+fn coverage_child() {
     if device().is_none() {
-        eprintln!("skipping: no CUDA device");
-        return;
+        super::test_child::child_skip("no CUDA device");
     }
     let s = device().unwrap();
     let _ = s.take_last_error(); // this gate must not inherit a latch
@@ -137,6 +157,7 @@ fn cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation() {
         0,
         "the opt-in path must clear every latch it takes"
     );
+    super::test_child::child_ok();
 }
 
 /// `graph_destroy` is handed the `cudaGraphExec_t` from

@@ -164,7 +164,7 @@ box = "GB10 sm_121"
 suite = "unit"
 command = "scripts/cuda_test.sh"
 date = "2026-09-29"
-passed = 565
+passed = 566
 failed = 0
 ignored = 42
 # #207: this row is a recorded measurement (CI has no GPU) refreshed only on a
@@ -221,7 +221,7 @@ box = "GB10 sm_121"
 suite = "sanitizer"
 command = "compute-sanitizer --tool memcheck over scripts/cuda_test.sh"
 date = "2026-09-29"
-passed = 565
+passed = 566
 failed = 0
 ignored = 42
 api_errors = 0

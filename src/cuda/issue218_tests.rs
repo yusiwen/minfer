@@ -3,8 +3,8 @@
 //!
 //! `gemm_prefill_smem_init` (the **eager** startup sweep) lost its production
 //! caller in #188 and was later annotated `allow(dead_code)` instead of being
-//! asked about. Plan B keeps the lazy per-launch production path
-//! (`gemm_smem_optin`, reached through `launch_gemm_f16`) and makes the
+//! asked about. #218 kept the lazy per-launch production path
+//! (`gemm_smem_optin`, reached through `launch_gemm_f16`) and made the
 //! invariant explicit:
 //!
 //! - [`cuda_prefill_smem_optin_is_done_by_production`] — a **real** prefill
@@ -21,9 +21,18 @@
 //!   process is where "production consults the opt-in on this launch" is
 //!   unambiguous.
 //!
+//! #223 restored the eager pre-warm as the default runtime guarantee (gate:
+//! `issue223_tests`). The arms here keep their claims by running their child
+//! with `MINFER_NO_GEMM_PREWARM=1` — the documented control and the "lazy path
+//! alone" configuration — which is where the `opted_in == 0` preconditions are
+//! observable. They stay the detector for a cache-keying regression that the
+//! pre-warm would otherwise mask; the eager path must not make them vacuous.
+//!
 //! The captured-graph half of the invariant
 //! (`cuda_prefill_smem_optin_is_never_set_inside_a_capture_window`) lives next
-//! to the capture machinery in `graph::cuda_backend::tests`.
+//! to the capture machinery in `graph::cuda_backend::tests` and runs its child
+//! with the same `MINFER_NO_GEMM_PREWARM=1` control, so its "the opt-in happens
+//! before the window opens" claim is still the lazy path's, not the pre-warm's.
 use super::*;
 
 /// The >48 KiB instantiation the fresh-process harness selects: with
@@ -102,6 +111,14 @@ pub(crate) fn assert_optin_preconditions(what: &str) {
 /// asserted through the device's own read-back. Fresh process (see the harness
 /// for why `opted_in == 0` cannot be observed in-process).
 ///
+/// #223: this arm runs with `MINFER_NO_GEMM_PREWARM=1`, i.e. the "lazy path
+/// alone" configuration. The eager pre-warm is now the default runtime
+/// guarantee (gate: `issue223_tests`), so the only process in which
+/// `opted_in == 0` *before* the forward is observable is one that skipped the
+/// pre-warm. The claim is unchanged — the lazy per-launch opt-in production
+/// falls back on still opts the instantiation in on its first uncaptured launch
+/// — it is just now the defence-in-depth arm.
+///
 /// Mutation evidence (rule 3): make `gemm_smem_optin` return `true` without
 /// calling `minfer_smem_optin` (i.e. never call `cudaFuncSetAttribute`); the
 /// post-forward `opted_in == 1` assertion goes red.
@@ -111,8 +128,9 @@ fn cuda_prefill_smem_optin_is_done_by_production() {
     match super::test_child::child_phase().as_deref() {
         Some("optin") => optin_child(),
         _ => {
-            let child = super::test_child::run_self(FILTER, "optin", &[]);
-            child.verdict("production prefill-GEMM smem opt-in");
+            let child =
+                super::test_child::run_self(FILTER, "optin", &[("MINFER_NO_GEMM_PREWARM", "1")]);
+            child.verdict("the lazy-path-alone production prefill-GEMM smem opt-in");
         }
     }
 }

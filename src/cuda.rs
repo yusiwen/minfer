@@ -527,11 +527,22 @@ extern "C" {
         stream: *mut std::ffi::c_void,
         af32: bool,
     ) -> i32;
-    // #218: the **eager** sweep (`gemm_prefill_smem_init`) is gone — production
-    // opts an instantiation in lazily on its first launch (`gemm_smem_optin`,
-    // reached through `launch_gemm_f16`). The sweep's introspection lives in the
-    // `#[cfg(test)] extern "C"` block below, so no test-only declaration is
-    // carried by a non-test build.
+    // #223: the **production** eager pre-warm entry, called once per process
+    // from `CudaState::try_new` for every launchable `(tm, ks, af32)`. It drives
+    // the same `gemm_smem_optin<TM,KS,AF32>` cache `launch_gemm_f16` reads, so
+    // the pre-warm and the lazy path are one mechanism, not two. Outcome:
+    //  1 = the attribute is in force (set now, or already cached);
+    //  0 = refused — `minfer_smem_optin` named the instantiation, the requested
+    //      bytes, the device limit and `cudaGetErrorName`, and cleared the latch;
+    // -1 = the combination is not in the fatbin;
+    // -2 = deliberately skipped: the request exceeds the device's
+    //      `cudaDevAttrMaxSharedMemoryPerBlockOptin`, so the attribute was never
+    //      called (the reason is named by `minfer_smem_optin`).
+    fn gemm_prefill_smem_prewarm_one(tm: i32, ks: i32, af32: i32) -> i32;
+    // #218: the removed eager sweep's (`gemm_prefill_smem_init`) introspection
+    // lives in the `#[cfg(test)] extern "C"` block below, so no test-only
+    // declaration is carried by a non-test build. The `checked`/`skipped`
+    // counters did not come back with #223's pre-warm.
     //
     // #145 test injection: latch a real `cudaErrorInvalidValue` on purpose
     // (request the device limit + 4096 B) without clearing it. Only the gate
@@ -2041,6 +2052,16 @@ pub fn format_of(layout: i32) -> crate::graph::kvformat::KvFormat {
 #[cfg(test)]
 mod kv_dtype_tests;
 
+/// Issue #223 control: `MINFER_NO_GEMM_PREWARM=1` skips the eager prefill-GEMM
+/// dynamic-smem pre-warm at context creation. It exists so the **same binary**
+/// can measure the pre-warm on/off (the performance A/B) and so the "lazy path
+/// alone" arms of the #218 gates can run in a fresh process. Unset — or any
+/// value other than `1` — is the production default: pre-warm. The lazy
+/// per-launch opt-in is unaffected either way; it is the universal fallback.
+fn gemm_prewarm_disabled() -> bool {
+    std::env::var("MINFER_NO_GEMM_PREWARM").as_deref() == Ok("1")
+}
+
 impl CudaState {
     /// Preload the NVIDIA driver library.
     ///
@@ -2211,6 +2232,81 @@ impl CudaState {
                     "CUDA: BT tile smem {smem_need} B > device optin {smem_have} B — MMQ prefill disabled, f16 GEMM path serves"
                 );
                 tier_mmq = false;
+            }
+        }
+
+        // ── Issue #223: eager prefill-GEMM dynamic-smem pre-warm ──────────────
+        //
+        // #188 deleted the #145 sweep's call from exactly this point and said so
+        // nowhere; #218 removed the orphan and made the invariant gated but still
+        // only *emergent* (a tested property, not an enforced one). This restores
+        // the runtime guarantee at the same site.
+        //
+        // **Placement, by construction.** `try_new` runs once per process under
+        // `CUDA.get_or_init`, before the state is published, before any
+        // `CudaBackend` exists, and therefore before any per-instance stream — the
+        // only place `graph_begin_capture` can open a window — can exist. So "the
+        // attribute is set outside any capture window" is true by construction
+        // here, not inferred from the 3-run warmup or the thread-local capture
+        // mode; those two remain as defence in depth, and the lazy per-launch
+        // opt-in (`gemm_smem_optin`) stays too, so a process that sets
+        // `MINFER_NO_GEMM_PREWARM=1` (the documented A/B control) behaves exactly
+        // as it did after #218.
+        //
+        // **One mechanism, not two.** Every entry drives the **production**
+        // `gemm_prefill_smem_prewarm_one` → `gemm_smem_optin<TM,KS,AF32>`, i.e.
+        // the same per-instantiation cache the launcher reads. A cache-keying
+        // regression (the #218 `template <typename K>` bug) therefore cannot be
+        // masked by the pre-warm: it makes the pre-warm itself leave
+        // instantiations un-opted-in, which the #223 gate and the #218 coverage
+        // gate both read back from the device.
+        //
+        // **No banner.** A fully admitted pre-warm prints nothing; each failure
+        // or deliberate skip is named per instantiation (the instantiation, the
+        // requested bytes, the queried device limit and `cudaGetErrorName`), and
+        // the removed `checked`/`skipped` counters do not come back.
+        if !gemm_prewarm_disabled() {
+            const GEMM_PREWARM_SET: [(i32, i32, i32); 12] = [
+                (64, 32, 0),
+                (64, 32, 1),
+                (64, 64, 0),
+                (64, 64, 1),
+                (128, 32, 0),
+                (128, 32, 1),
+                (128, 64, 0),
+                (128, 64, 1),
+                (256, 32, 0),
+                (256, 32, 1),
+                (256, 64, 0),
+                (256, 64, 1),
+            ];
+            let t0 = std::time::Instant::now();
+            let mut named = 0usize; // failures + deliberate skips (diagnostic only)
+            for &(tm, ks, af32) in GEMM_PREWARM_SET.iter() {
+                match unsafe { gemm_prefill_smem_prewarm_one(tm, ks, af32) } {
+                    1 => {}  // admitted (set now, or already cached)
+                    -1 => {} // not compiled into this fatbin — nothing to do
+                    // -2 = over the device limit, deliberately not called;
+                    // 0 = the attribute call failed. Both were named by
+                    // `minfer_smem_optin` at the `prewarm:gemm_f16` site.
+                    -2 | 0 => named += 1,
+                    other => {
+                        eprintln!(
+                            "CUDA: prefill-GEMM smem pre-warm for gemm_f16_nt_kernel_t<{tm},{ks},{}> \
+                             returned an unexpected outcome {other}",
+                            af32 != 0
+                        );
+                        named += 1;
+                    }
+                }
+            }
+            if crate::optiming::flag_from_env(std::env::var_os("MINFER_OP_TIMING").as_ref()) {
+                eprintln!(
+                    "CUDA: prefill-GEMM smem pre-warm ({} instantiation(s), {named} refused/skipped \
+                     and named above) took {} µs",
+                    GEMM_PREWARM_SET.len(),
+                    t0.elapsed().as_micros()
+                );
             }
         }
 
@@ -7236,29 +7332,50 @@ mod issue147_tests;
 mod issue162_tests;
 
 // ────────────────────────────────────────────────────────────────────
-// #218: the prefill-GEMM dynamic-smem opt-in invariant.
+// #218 → #223: the prefill-GEMM dynamic-smem opt-in invariant.
 //
 // `gemm_prefill_smem_init` — the eager startup sweep — had no production
-// caller after #188 and was annotated away by the dead-code campaign. Plan B
-// keeps the lazy per-launch opt-in (`gemm_smem_optin`, reached through
-// `launch_gemm_f16`) and makes the invariant explicit and gated:
+// caller after #188 and was annotated away by the dead-code campaign. #218
+// (plan B) kept the lazy per-launch opt-in (`gemm_smem_optin`, reached through
+// `launch_gemm_f16`) and made the invariant explicit and gated. #223 restores
+// the **runtime guarantee** on top: `CudaState::try_new` now drives the same
+// production entry eagerly, once per process, before any stream or capture
+// window can exist, so the invariant no longer depends only on the three
+// emergent mechanisms (the 3-run warmup, `cudaStreamCaptureModeThreadLocal`,
+// the per-instantiation cache), which are demoted to defence in depth.
 //
-// - `cuda_prefill_smem_optin_is_done_by_production` — a real prefill forward
-//   opts a >48 KiB instantiation in, asserted through the device's own
-//   read-back, with the "not already opted in" precondition established by
-//   running in a fresh process (the tile config and the attribute are both
-//   process-scoped);
+// The #218 arms below keep their claims by running against the documented
+// control `MINFER_NO_GEMM_PREWARM=1` (the "lazy path alone" configuration),
+// which is where the pre-#223 preconditions (`opted_in == 0` before the first
+// launch) are observable:
+//
+// - `cuda_prefill_smem_optin_is_done_by_production` — with the pre-warm off, a
+//   real prefill forward still opts a >48 KiB instantiation in, asserted
+//   through the device's own read-back, with the "not already opted in"
+//   precondition established by running in a fresh process (the tile config and
+//   the attribute are both process-scoped);
 // - `cuda_prefill_smem_optin_refusal_fails_the_prefill` — the control arm: the
 //   `attr:gemm_f16_f16` injection makes the prefill refuse the launch loudly;
 // - `graph::cuda_backend::tests::
-//   cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` — a >48 KiB
-//   prefill-shaped graph is captured and replays bitwise, and the opt-in is
-//   shown to run **before** the window opens, never inside it.
+//   cuda_prefill_smem_optin_is_never_set_inside_a_capture_window` — with the
+//   pre-warm off, a >48 KiB prefill-shaped graph is captured and replays
+//   bitwise, and the opt-in is shown to run **before** the window opens, never
+//   inside it;
+// - `issue145_tests::cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation`
+//   — every launchable >48 KiB instantiation reads back opted in through the
+//   production function (a cache-keying regression detector, whichever path set
+//   the attribute).
+//
+// #223's own gate lives in `issue223_tests`: with the pre-warm ON (the default
+// process), every launchable >48 KiB instantiation already reads back opted in
+// immediately after context creation and before any launch.
 //
 // `test_child` is the fresh-process harness; the sibling #145 gate in
-// `issue145_tests` now drives the same lazy production opt-in.
+// `issue145_tests` drives the same lazy production opt-in.
 // ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(crate) mod issue218_tests;
+#[cfg(test)]
+pub(crate) mod issue223_tests;
 #[cfg(test)]
 pub(crate) mod test_child;

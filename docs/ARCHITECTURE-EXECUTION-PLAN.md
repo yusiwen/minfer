@@ -1443,6 +1443,19 @@ printed as a failure of the kernel that had just run.
 > §test-infrastructure. `gemm_dynamic_smem_bytes` remains the one formula; the "read twice" wording
 > above is historical (the launcher reads it once).
 
+> **#223 forward note (2026-09-29):** the eager half is back, but **not as the sweep this record
+> describes**. `CudaState::try_new` now calls `gemm_prefill_smem_prewarm_one(tm, ks, af32)` for every
+> launchable combination — a thin dispatcher onto the **same** production `gemm_smem_optin` cache the
+> launcher reads — so there is one opt-in mechanism and one `cudaFuncSetAttribute` site, not a second
+> sweep with its own copy of the formula (the pre-#145 bug class). The placement is the argument: at
+> `try_new` no `CudaBackend` (and so no capture window) can exist, so the attribute is set outside any
+> window by construction. The `checked`/`skipped` counters and the startup banner are still gone; a
+> successful pre-warm is silent, and each failure or deliberate over-limit skip is named per
+> instantiation. The lazy path stays as defence in depth, and the #218 gates keep their claims by
+> running their children against the documented control `MINFER_NO_GEMM_PREWARM=1`. On the real binary
+> the loop costs ~2.2 ms (the fatbin's one-time module load), which `prewarm_prefill()` already paid —
+> net new startup cost ≈ 0, hot path within ±1% — see the #223 record in §test-infrastructure.
+
 **Acceptance results (GB10, sm_121, CUDA 13.0, driver 580.178.04).**
 
 | check | before | after |
@@ -5220,6 +5233,98 @@ new CUDA counts.
 production" as a fact to annotate rather than a question to ask. `allow(dead_code)` on a
 test-reachable production-looking item is a **deferred question**; the fix is to list such items for
 review. Future hygiene work should treat the annotation as a lead, not a resolution.
+
+> **#223 forward note (2026-09-29):** the "tested, not enforced" gap this record names is closed.
+> `CudaState::try_new` now runs the eager pre-warm through the production `gemm_smem_optin`, at the
+> earliest point in the process, where no capture window can exist yet; the lazy path and the three
+> mechanisms this record lists remain as defence in depth. The four gates above keep their claims by
+> running their children with `MINFER_NO_GEMM_PREWARM=1` (the documented control and the "lazy path
+> alone" arm); the runtime guarantee has its own fifth gate. See the #223 record below.
+
+#### Test-infrastructure record (#223, 2026-09-29) — the eager prefill-GEMM smem pre-warm is back, as a runtime guarantee through the lazy entry
+
+**The gap #218 left.** #218 made the prefill-GEMM dynamic-smem invariant explicit, gated and correctly
+cached, but production still upheld it only by *emergent* means: the 3-run capture warmup,
+`cudaStreamCaptureModeThreadLocal`, and the fact that the cache happens to be consulted on the first
+launch. The attribute was a **tested** property, not an **enforced** one — [#188](https://github.com/yusiwen/minfer/issues/188)
+had deleted the eager caller and nobody noticed.
+
+**The design (plan A).** `CudaState::try_new` drives the production pre-warm once per process for
+every launchable `(tm, ks, af32)`, at the earliest point in the process. The placement *is* the
+argument: `try_new` runs under `CUDA.get_or_init`, before the state is published and before any
+`CudaBackend` — the only thing that can hold a capture window — can exist, so "the attribute is set
+outside any window" holds **by construction**. Crucially it is **not** the old `gemm_prefill_smem_init`
+sweep: the Rust side enumerates the set and each entry goes through the new production
+`gemm_prefill_smem_prewarm_one` → `gemm_smem_optin<TM,KS,AF32>` — the same per-instantiation cache the
+launcher reads. One mechanism, one `cudaFuncSetAttribute` site, one copy of `gemm_dynamic_smem_bytes`.
+The C++ `MINFER_GEMM_OPTIN_SET` X-macro is now the single list of the launchable set (fatbin lookup,
+pre-warm and the #218 test seam all expand it). The lazy per-launch opt-in stays as defence in depth,
+and the three #218 mechanisms are demoted to defence in depth behind the pre-warm. A request above
+`cudaDevAttrMaxSharedMemoryPerBlockOptin` is skipped without calling the attribute (reason named); a
+failure is named per instantiation by `minfer_smem_optin`; the `checked`/`skipped` counters and the
+startup banner did not come back — a fully admitted pre-warm is silent. `MINFER_NO_GEMM_PREWARM=1` is
+the documented control.
+
+**The fifth gate.** `issue223_tests::cuda_prefill_smem_prewarm_opts_in_every_launchable_instantiation_before_any_launch`
+asserts, in a fresh process immediately after context creation and before any launch, that every
+launchable >48 KiB instantiation already reads back opted in. Non-vacuity: a second fresh process with
+`MINFER_NO_GEMM_PREWARM=1` asserts the negation (the read-back is capable of answering 0), the child
+launches nothing before the check, and the assertion names the load-bearing
+`gemm_f16_nt_kernel_t<128,64,false>` (57344 B). This gate exists for a mutation the #218 arms cannot
+see: **skip one `(tm, ks, af32)` in the pre-warm and the lazy path simply opts it in on first launch**,
+so the coverage/counter arms stay green. The four #218 arms now run their fresh-process children with
+`MINFER_NO_GEMM_PREWARM=1`, which is where their pre-#223 `opted_in == 0` preconditions are observable;
+their claims are unchanged (they are the lazy-path-alone arm) and they remain the cache-keying
+detector.
+
+**Mutation evidence (rule 3), GB10 sm_121, 2026-09-29.** Drop `(128, 64, 0)` from `GEMM_PREWARM_SET`
+(the Rust production list; replaced by a duplicate so the array still type-checks) and run the new
+gate: the pre-warmed child fails with *"immediately after context creation and before any kernel
+launch, gemm_f16_nt_kernel_t<128,64,false> (57344 B > 48 KiB) must already read as opted in … left: 0,
+right: 1"*. Under the **same** mutation
+`cuda_prefill_smem_lazy_optin_admits_every_launchable_instantiation` stays **green** (its child skipped
+the pre-warm, so the lazy path opts the dropped instantiation in on first launch) — the transcript that
+justifies the fifth gate. The over-limit skip is visible in every pre-warmed child's stderr:
+`cudaFuncSetAttribute(gemm_f16_nt_kernel_t<256,64,true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+122880 B) SKIPPED: the request exceeds cudaDevAttrMaxSharedMemoryPerBlockOptin (101376 B) …`.
+
+**Performance, measured (rule 5) — the real binary disagrees with the #223 proxy by ~15×, and the net
+is still zero.** Date/device/command: 2026-09-29, GB10 sm_121, CUDA 13.0, driver 580.178.04,
+`MINFER_OP_TIMING=1 ./target/release/minfer bench -p 8 -n 1 -r 1`, 25 fresh processes.
+
+| bar (named before measuring) | proxy in #223 | measured | verdict |
+|---|---|---|---|
+| pre-warm loop's own duration | ≲ 0.2 ms (first attr call 152.9 µs) | **median 2249 µs** (range 2126–2448, n=25) | above the stated bar — it is the fatbin's one-time module load, not 152.9 µs; set-size independent (n=1 ≈ n=12 ≈ 2.2 ms) |
+| `minfer bench -p 2048 -n 128` `tg128` | within ±1% | ON 236.30 vs OFF 236.45 t/s (**−0.06%**) | pass (7 interleaved matched rounds, medians, same binary) |
+| `minfer bench -p 2048 -n 128` `pp2048` | within ±1% | ON 2546.55 vs OFF 2544.34 t/s (**+0.09%**) | pass |
+| startup (model load → first token) | net new ≈ 10 µs | **net ≈ 0**: the ~2.2 ms **moves** into the existing `prewarm_prefill()` module load | the proxy's qualitative reading survives |
+
+The "the ~150 µs moves rather than appears" reading **did** survive on the real path, with a different
+magnitude. Controlled fresh-process probe on the same binary (the tiny `gemm_f16_nt_kernel_t` fixture,
+`MINFER_MMQ` 0/1 × `MINFER_GEMM_K64` 0/1): first prefill forward **2288–2314 µs** with the pre-warm
+off vs **78–120 µs** with it on; `prewarm_prefill()` (the r59 rider's `minfer_prewarm_kernels`, called
+at the end of Qwen2/Qwen3 weight registration) **4.3–4.6 ms** off vs **2.2–2.4 ms** on. So the ~2.2 ms
+is a one-time fatbin module load that the startup path already pays; the pre-warm only decides *where*
+— at `try_new` instead of at the end of registration. The end-to-end CLI phase measurement is
+consistent with that but cannot resolve the net to better than a few ms: paired `cuda_ready`
+(mid-context-creation) +2.53 ms, `forward_ms` +0.05 ms, model-load phase noise ±20 ms. The honest
+residual: if the module load ever stops being paid by `prewarm_prefill()` (e.g. that rider is removed),
+the pre-warm's loop becomes ~2.2 ms of **net new** startup cost, so the two are coupled and the next
+person to touch `prewarm_prefill` must know.
+
+**Counts (rule 5).** `scripts/cuda_test.sh` → **566 / 0 / 42**, GB10 sm_121, 2026-09-29 (was 565 / 0 /
+42; +1 device gate, `cuda::issue223_tests`). `compute-sanitizer --tool memcheck --target-processes all
+<test binary> --test-threads=1` → **0 API errors** over 566 / 0 / 42. The two real-model configurations
+were re-run and stay green: `FEATURES=cuda scripts/real_model_gates.sh` → **42 / 0** (0.5B config) and
+with `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` →
+**42 / 0**, GB10 sm_121, 2026-09-29.
+
+**Docs.** `CUDA-BACKEND-DESIGN.md` §2.4 now states the restored design (eager pre-warm at context
+creation + lazy per-launch opt-in), demotes the three mechanisms to defence in depth, names the fifth
+gate, and carries the measured cost table; `cuda_optimization_steps/02-wmma-f16-prefill-gemm-8m.md`
+and this file's #145 and #218 records carry dated forward notes (history is not rewritten);
+`inference_e2e_walkthrough/15-cuda-backend.md` still describes only `prewarm_prefill()`, which is
+unchanged. `docs/status.toml` and `AGENTS.md` carry the new CUDA counts.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 

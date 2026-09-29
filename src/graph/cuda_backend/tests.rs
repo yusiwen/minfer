@@ -7899,14 +7899,26 @@ fn cuda_prefill_capture_bit_parity_pp16_pp300() {
 ///   window on the **first** run, so the opt-in happens inside it and
 ///   `gemm_smem_optin_in_capture_count() == 0` goes red — deterministically,
 ///   whether or not this driver tolerates an in-window attribute call.
+///
+/// #223 runs the child with `MINFER_NO_GEMM_PREWARM=1` (the lazy-path-alone
+/// control): under the default eager pre-warm the attribute is already in force
+/// at context creation, so `opted_in == 0` before the first launch — the
+/// precondition this gate is built on — would not be observable. The claim stays
+/// the lazy path's: the opt-in must happen in the warmup runs, **before** the
+/// window opens, never inside it. The pre-warmed configuration's copy of the
+/// guarantee is `issue223_tests`.
 #[test]
 fn cuda_prefill_smem_optin_is_never_set_inside_a_capture_window() {
     const FILTER: &str = "cuda_prefill_smem_optin_is_never_set_inside_a_capture_window";
     match crate::cuda::test_child::child_phase().as_deref() {
         Some("capture") => big_smem_capture_child(),
         _ => {
-            let child = crate::cuda::test_child::run_self(FILTER, "capture", &[]);
-            child.verdict("the >48 KiB captured prefill");
+            let child = crate::cuda::test_child::run_self(
+                FILTER,
+                "capture",
+                &[("MINFER_NO_GEMM_PREWARM", "1")],
+            );
+            child.verdict("the lazy-path-alone >48 KiB captured prefill");
         }
     }
 }
