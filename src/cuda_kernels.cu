@@ -6511,18 +6511,25 @@ static size_t gemm_dynamic_smem_bytes(int tm, int ks, bool af32) {
            + nw * 256 * 4;
 }
 
+// The launchable prefill-GEMM set, listed **once**. The fatbin lookup below, the
+// production pre-warm entry (#223) and the #218 test seam all expand this list,
+// so an instantiation that is compiled cannot be silently missed by a caller's
+// own copy — the class of drift the #145/#218 records are about.
+#define MINFER_GEMM_OPTIN_SET(X)                                               \
+    X(64, 32, false) X(64, 32, true)                                           \
+    X(64, 64, false) X(64, 64, true)                                           \
+    X(128, 32, false) X(128, 32, true)                                         \
+    X(128, 64, false) X(128, 64, true)                                         \
+    X(256, 32, false) X(256, 32, true)                                         \
+    X(256, 64, false) X(256, 64, true)
+
 // The compiled `gemm_f16_nt_kernel_t<tm, ks, af32>` instantiation, or null for
 // a combination that is not in the fatbin.
 #define GEMM_FN_FOR(TM, KS, AF)                                                \
     if (tm == (TM) && ks == (KS) && af32 == (AF))                              \
         return reinterpret_cast<const void*>(&gemm_f16_nt_kernel_t<TM, KS, AF>);
 static const void* gemm_f16_fn_for(int tm, int ks, bool af32) {
-    GEMM_FN_FOR(64, 32, false) GEMM_FN_FOR(64, 32, true)
-    GEMM_FN_FOR(64, 64, false) GEMM_FN_FOR(64, 64, true)
-    GEMM_FN_FOR(128, 32, false) GEMM_FN_FOR(128, 32, true)
-    GEMM_FN_FOR(128, 64, false) GEMM_FN_FOR(128, 64, true)
-    GEMM_FN_FOR(256, 32, false) GEMM_FN_FOR(256, 32, true)
-    GEMM_FN_FOR(256, 64, false) GEMM_FN_FOR(256, 64, true)
+    MINFER_GEMM_OPTIN_SET(GEMM_FN_FOR)
     return nullptr;
 }
 #undef GEMM_FN_FOR
@@ -6551,16 +6558,20 @@ extern "C" int gemm_smem_optin_in_capture_count() { return g_gemm_smem_in_captur
 // "admitted" for `<128,64,false>` at 57344 B, which was never set). `static
 // state` must stay inside a per-`(TM,KS,AF32)` instantiation.
 //
-// #218: there is no eager startup sweep any more (the removed
-// `gemm_prefill_smem_init`; see the #218 record in ARCHITECTURE-EXECUTION-PLAN.md
-// and §2.4 of CUDA-BACKEND-DESIGN.md). The invariant the sweep existed for — the
-// attribute is already in force when a capture window opens — is upheld by this
-// function's own shape plus two facts recorded next to the capture trigger in
-// `graph/cuda_backend.rs`: capture opens in `cudaStreamCaptureModeThreadLocal`
-// and only from the **third** run of a `(uid, range)` key. The first launch of
-// an instantiation therefore runs outside any window, the one
-// `cudaFuncSetAttribute` happens there, and every in-window launch reads the
-// cached answer. `stream` is used only to observe (and count) the never-case.
+// #223 restored the **eager pre-warm**: `CudaState::try_new` drives this same
+// production function once per process, for every launchable `(tm, ks, af32)`,
+// from the earliest point in the process (context creation) where no stream can
+// hold a capture window yet — so "the attribute is set outside any window" holds
+// by construction, not by inference. This function is still the lazy per-launch
+// opt-in too (defence in depth): it caches the admitted/refused answer per
+// instantiation, so a launch whose pre-warm was skipped by the control env
+// (`MINFER_NO_GEMM_PREWARM=1`) or by a regression still decides on its first
+// uncaptured launch. The two remaining emergent mechanisms — capture opens in
+// `cudaStreamCaptureModeThreadLocal` and only from the **third** run of a
+// `(uid, range)` key (both recorded next to the capture trigger in
+// `graph/cuda_backend.rs`) — are now defence in depth behind the pre-warm, not
+// the primary guarantee. `stream` is used only to observe (and count) the
+// never-case; the pre-warm passes 0 because no window can exist yet.
 template <int TM, int KS, bool AF32>
 static bool gemm_smem_optin(const char* site, const char* kernel_name, size_t bytes,
                             cudaStream_t stream) {
@@ -6607,32 +6618,65 @@ extern "C" int gemm_smem_opted_in(int tm, int ks, int af32) {
                : 0;
 }
 
+// Drive the production per-instantiation opt-in for one compiled combination.
+// Returns 1 when admitted, 0 when refused (named by `minfer_smem_optin`), -1
+// when the combination is not in the fatbin. Both the pre-warm (#223) and the
+// test seam below go through here, so they read the same dispatch and the same
+// cache.
+static int gemm_smem_optin_decision(int tm, int ks, bool a, size_t bytes,
+                                    const char* site, cudaStream_t stream) {
+#define GEMM_OPTIN_CASE(TM, KS, AF)                                            \
+    if (tm == (TM) && ks == (KS) && a == (AF))                                 \
+        return gemm_smem_optin<TM, KS, AF>(                                    \
+                   site, "gemm_f16_nt_kernel_t<" #TM "," #KS "," #AF ">",      \
+                   bytes, stream)                                              \
+                   ? 1                                                         \
+                   : 0;
+    MINFER_GEMM_OPTIN_SET(GEMM_OPTIN_CASE)
+#undef GEMM_OPTIN_CASE
+    return -1;
+}
+
+// #223: the **production** eager pre-warm entry, called once per process from
+// `CudaState::try_new` for every combination the Rust side enumerates. It drives
+// `gemm_smem_optin`, so the attribute is set through the one production path and
+// the per-instantiation cache the launcher later reads is already populated.
+//
+// Outcomes:  1 = the attribute is in force (set now, or already cached);
+//            0 = refused — `minfer_smem_optin` already named the instantiation,
+//                the requested bytes, the call, the device limit and
+//                `cudaGetErrorName`, and cleared the latch;
+//           -1 = the combination is not in the fatbin (the caller skips it);
+//           -2 = **skipped deliberately**: the request exceeds the device's own
+//                `cudaDevAttrMaxSharedMemoryPerBlockOptin`, so the attribute was
+//                never called — the call could only return
+//                `cudaErrorInvalidValue` and the instantiation cannot launch on
+//                this device at all (`minfer_smem_optin` printed the reason).
+// Not gated on `stream`: there is none at context creation, and the whole point
+// of the placement is that no capture window can exist.
+extern "C" int gemm_prefill_smem_prewarm_one(int tm, int ks, int af32) {
+    const bool a = af32 != 0;
+    const size_t bytes = gemm_dynamic_smem_bytes(tm, ks, a);
+    const int decision = gemm_smem_optin_decision(tm, ks, a, bytes, "prewarm:gemm_f16", 0);
+    if (decision != 0) return decision;  // 1 admitted, -1 not compiled
+    // Refused. Re-derive *why* so the caller can report a deliberate skip
+    // separately from a real attribute failure; the report itself (with the
+    // formula, the limit and the error name) came from `minfer_smem_optin`.
+    const int limit = minfer_optin_limit();
+    return (limit > 0 && bytes > (size_t)limit) ? -2 : 0;
+}
+
 // #218 test seam: drive the **production** `gemm_smem_optin` (template, cache
 // and all) for one compiled instantiation, so the #145-derived coverage gate
 // reads the decision production makes rather than a mirror of it. Returns 1
 // when admitted, 0 when refused/skipped, -1 when the combination is not in the
 // fatbin. Test-only: production reaches the same function through
-// `launch_gemm_f16`'s `GEMM_ONE`.
+// `launch_gemm_f16`'s `GEMM_ONE` and through `gemm_prefill_smem_prewarm_one`.
 extern "C" int gemm_prefill_smem_optin_one_for_test(int tm, int ks, int af32, void* stream) {
     const bool a = af32 != 0;
     const size_t bytes = gemm_dynamic_smem_bytes(tm, ks, a);
-    const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-#define GEMM_OPTIN_ONE(TM, KS, AF)                                                  \
-    if (tm == (TM) && ks == (KS) && a == (AF))                                      \
-        return gemm_smem_optin<TM, KS, AF>("test:gemm_smem_optin",                  \
-                                           "gemm_f16_nt_kernel_t<" #TM "," #KS      \
-                                           "," #AF ">",                             \
-                                           bytes, s)                                \
-                   ? 1                                                              \
-                   : 0;
-    GEMM_OPTIN_ONE(64, 32, false) GEMM_OPTIN_ONE(64, 32, true)
-    GEMM_OPTIN_ONE(64, 64, false) GEMM_OPTIN_ONE(64, 64, true)
-    GEMM_OPTIN_ONE(128, 32, false) GEMM_OPTIN_ONE(128, 32, true)
-    GEMM_OPTIN_ONE(128, 64, false) GEMM_OPTIN_ONE(128, 64, true)
-    GEMM_OPTIN_ONE(256, 32, false) GEMM_OPTIN_ONE(256, 32, true)
-    GEMM_OPTIN_ONE(256, 64, false) GEMM_OPTIN_ONE(256, 64, true)
-#undef GEMM_OPTIN_ONE
-    return -1;
+    return gemm_smem_optin_decision(tm, ks, a, bytes, "test:gemm_smem_optin",
+                                    reinterpret_cast<cudaStream_t>(stream));
 }
 
 // Test injection (issue #145): latch a REAL `cudaErrorInvalidValue` by asking
