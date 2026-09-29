@@ -1,6 +1,7 @@
 //! `#[cfg(test)] mod tests` for `src/graph/alloc.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+use crate::graph::batch::Batch;
 use crate::graph::builder::GraphBuilder;
 use crate::graph::DType;
 
@@ -420,7 +421,11 @@ fn kv_session_round_trips_the_rows_and_the_run_table() {
     let ga = graph(&mut a);
     a.kv_reserve_seq(SEQ, N_CTX).unwrap();
     a.fill_input_i32(&ga, "positions", &[1, 3]).unwrap();
-    a.fill_attn_inputs(&ga, &[SEQ, SEQ], &[1, 3]).unwrap();
+    // E2, the production spelling: the reservation above means the fill owns
+    // positions 1 and 3 in sequence `SEQ` without reserving anything else (the
+    // deleted E1 helper recorded a prefix on `SEQ_MAIN` here instead).
+    a.fill_batch_inputs(&ga, &Batch::new(vec![0, 0], vec![1, 3], vec![SEQ, SEQ]))
+        .unwrap();
     a.fill_input(&ga, "k", &kk).unwrap();
     a.fill_input(&ga, "v", &vv).unwrap();
     let mut sched = crate::graph::scheduler::BackendScheduler::new();
@@ -555,7 +560,9 @@ fn an_f16_session_round_trips_through_save_and_load() {
     let ga = build(&mut a);
     a.kv_reserve_seq(SEQ, N_CTX).unwrap();
     a.fill_input_i32(&ga, "positions", &[0, 1]).unwrap();
-    a.fill_attn_inputs(&ga, &[SEQ, SEQ], &[0, 1]).unwrap();
+    // E2, the production spelling (see the f32 round trip above).
+    a.fill_batch_inputs(&ga, &Batch::new(vec![0, 0], vec![0, 1], vec![SEQ, SEQ]))
+        .unwrap();
     a.fill_input(&ga, "k", &kk).unwrap();
     a.fill_input(&ga, "v", &vv).unwrap();
     let mut sched = crate::graph::scheduler::BackendScheduler::new();
@@ -787,11 +794,15 @@ fn a_copy_on_write_moves_the_rows_and_never_writes_through() {
     // And a sequence with no run at all is a no-op, not an error — that is what
     // keeps the classic single-sequence path (which never reserves) untouched.
     assert_eq!(alloc.kv_private_row_for(9, 0).unwrap(), None);
-    // The other entry point a caller drives the allocator with gets the same
-    // rule: `fill_attn_inputs` copies for a batch that still names a shared
-    // position, and then resolves the private cells. Position 0 is the last
-    // shared one, so this is the second (and final) copy-on-write.
-    alloc.fill_attn_inputs(&g, &[2], &[0]).unwrap();
+    // The production entry point gets the same rule: `fill_batch_inputs` copies
+    // for a batch that still names a shared position, and then resolves the
+    // private cells. Position 0 is the last shared one, so this is the second
+    // (and final) copy-on-write. A `Batch::single` would name `SEQ_MAIN` (0) and
+    // try to reserve the whole arena for it — the wrong sequence, and the arena is
+    // already full — so this spells the batch out for sequence 2.
+    alloc
+        .fill_batch_inputs(&g, &Batch::new(vec![0], vec![0], vec![2]))
+        .unwrap();
     assert_eq!(alloc.kv_arena_stats().cows, 2);
     assert_eq!(alloc.kv.spans_of(2), &[(0, 4, 6)], "the share is gone");
     assert_eq!(alloc.kv.cell_of(2, 0), Some(4));

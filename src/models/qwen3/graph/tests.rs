@@ -402,8 +402,13 @@ fn metal_prefill_determinism() {
             alloc.fill_input_i32(&graph, "token_ids", &ids32).unwrap();
             let pos32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
             alloc.fill_input_i32(&graph, "positions", &pos32).unwrap();
-            let seqs = vec![crate::graph::kvcache::SEQ_MAIN; nt];
-            alloc.fill_attn_inputs(&graph, &seqs, &pos32).unwrap();
+            // E2 (fully qualified: this arm compiles only on macOS).
+            alloc
+                .fill_batch_inputs(
+                    &graph,
+                    &crate::graph::batch::Batch::single(&ids32, &positions),
+                )
+                .unwrap();
             sched.execute(&graph, &mut alloc).unwrap();
             let mut run_dumps = Vec::new();
             for &nid in &keep {

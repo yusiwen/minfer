@@ -1,6 +1,7 @@
 //! `#[cfg(test)] mod tests` for `src/graph/cpu_backend.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+use crate::graph::batch::Batch;
 
 /// C8b S2: a window given as **several runs** gathers exactly what the same cells
 /// given as one range gather — the equivalence the map path rests on — and the
@@ -372,9 +373,17 @@ fn embedding_and_rope() {
     h.alloc.alloc_graph(&g).unwrap();
     h.alloc.fill_input_i32(&g, "token_ids", &[0, 2]).unwrap();
     h.alloc.fill_input_i32(&g, "positions", &[0, 1]).unwrap();
-    // E1: the attention window is data the graph carries, not a bound it
-    // derives — a hand-built graph fills it like the model path does.
-    h.alloc.fill_attn_inputs(&g, &[0, 0], &[0, 1]).unwrap();
+    // No KV store and no attention: this fixture's graph has no `cells`,
+    // `seq_ids`, `kv_map` or `attn_span` input, so there is no window to resolve
+    // and no arena to reserve. Production's `fill_batch_inputs` therefore cannot
+    // drive it — its per-group reservation would ask for a 0-cell run — and the
+    // rope-only shape is kept as the `#[cfg(test)]`-scoped
+    // `GraphAllocator::fill_attn_inputs_without_cells` (the deleted E1 helper's
+    // `has_cells == false` branch). The claim is unchanged: filling must not
+    // require a KV arena for a graph that stores no K/V.
+    h.alloc
+        .fill_attn_inputs_without_cells(&g, &[0, 0], &[0, 1])
+        .unwrap();
     h.sched.execute(&g, &mut h.alloc).unwrap();
     let got = h.out(&g, rope);
     // reference: embed rows then rope per head
@@ -433,7 +442,9 @@ fn kvcache_store_load_and_attn_roundtrip() {
     // q = [1,0, 0,1], k = [1,0, 0,1], v = [0.5,0.5, 0.25,0.75] at pos 0
     h.alloc.alloc_graph(&g).unwrap();
     h.alloc.fill_input_i32(&g, "positions", &[0]).unwrap();
-    h.alloc.fill_attn_inputs(&g, &[0], &[0]).unwrap();
+    h.alloc
+        .fill_batch_inputs(&g, &Batch::single(&[0], &[0]))
+        .unwrap();
     h.alloc.fill_input(&g, "q", &[1.0, 0.0, 0.0, 1.0]).unwrap();
     h.alloc.fill_input(&g, "k", &[1.0, 0.0, 0.0, 1.0]).unwrap();
     h.alloc
@@ -504,7 +515,7 @@ fn a_packed_kv_region_answers_like_the_f32_one_and_is_smaller() {
         h.alloc.alloc_graph(&g).unwrap();
         h.alloc.fill_input_i32(&g, "positions", &[0, 1, 2]).unwrap();
         h.alloc
-            .fill_attn_inputs(&g, &[0, 0, 0], &[0, 1, 2])
+            .fill_batch_inputs(&g, &Batch::single(&[0, 0, 0], &[0, 1, 2]))
             .unwrap();
         h.alloc.fill_input(&g, "q", &qv).unwrap();
         h.alloc.fill_input(&g, "k", &kk).unwrap();
@@ -673,14 +684,15 @@ fn a_packed_physical_shift_moves_v_verbatim_and_requantizes_k() {
     // `kvcache_store` consumes the builder's own `cells` input (C6): filling
     // `positions` alone left every row going to cell 0, which made this gate pass
     // on a region with one live row — exactly the kind of false green the nonzero
-    // assertions below exist to prevent.
+    // assertions below exist to prevent. E2 is what resolves them now (and records
+    // the written extent through `own_positions`, so the old `kv_note_used`
+    // post-execute call is gone with it).
     h.alloc
-        .fill_attn_inputs(&g, &[0, 0, 0], &[0, 1, 2])
+        .fill_batch_inputs(&g, &Batch::single(&[0, 0, 0], &[0, 1, 2]))
         .unwrap();
     h.alloc.fill_input(&g, "k", &kk).unwrap();
     h.alloc.fill_input(&g, "v", &vv).unwrap();
     h.sched.execute(&g, &mut h.alloc).unwrap();
-    h.alloc.kv_note_used(nt);
 
     let rope = KvRope {
         freq_base: 10_000.0,
