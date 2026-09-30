@@ -256,6 +256,12 @@ roadmap §4 defects automatically.
   `curl ca-certificates build-essential` before the toolchain step (the last
   also supplies nvcc's host compiler). Only the fix commit's push turned all
   three green.
+- **Container base moved (2026-09-30):** the image tag above is now
+  `nvidia/cuda:12.8.0-devel-ubuntu24.04` — deliberately the same image the x64
+  release job builds in (`.github/workflows/release-build.yml`, `linux-x64-cuda`).
+  The 22.04 tag was glibc 2.35 / gcc 11 against the artifact's 2.39 / gcc 13, so
+  the compile check ran on a base no artifact was ever built on. The rest of
+  this record stands as written.
 
 ### A3 — KV bounds guard + `ensure_kv` size check  · item 5 · S — **DONE**
 - **Files:** `src/graph/alloc.rs` (only — see the deviation note).
