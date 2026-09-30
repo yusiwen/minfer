@@ -257,7 +257,7 @@ roadmap §4 defects automatically.
   also supplies nvcc's host compiler). Only the fix commit's push turned all
   three green.
 - **Container base moved (2026-09-30):** the image tag above is now
-  `nvidia/cuda:12.8.0-devel-ubuntu24.04` — deliberately the same image the x64
+  `nvidia/cuda:12.8.2-devel-ubuntu24.04` — deliberately the same image the x64
   release job builds in (`.github/workflows/release-build.yml`, `linux-x64-cuda`).
   The 22.04 tag was glibc 2.35 / gcc 11 against the artifact's 2.39 / gcc 13, so
   the compile check ran on a base no artifact was ever built on. The rest of

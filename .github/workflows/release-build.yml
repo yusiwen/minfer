@@ -12,14 +12,21 @@
 #
 # Published targets:
 #   - macOS arm64 (Apple Silicon runner).
-#   - Linux x86_64 CUDA + statically-linked cudart — NVIDIA's CUDA 12.8 devel
-#     image on an Ubuntu 24.04 base (`nvidia/cuda:12.8.0-devel-ubuntu24.04`),
-#     the same image `ci.yml`'s `build-linux-cuda` compile check runs in. Keeps
-#     the Volta V100 sm_70/72 targets (CUDA 13 removed them) and reaches sm_120,
-#     on the image's glibc 2.39 floor.
-#   - Linux arm64 CUDA + statically-linked cudart — CUDA 13 from the apt sbsa
-#     repo on an ubuntu-24.04-arm runner (the DGX Spark GB10 is sm_121, which
-#     CUDA 12.8 cannot build), glibc 2.39 floor.
+#   - Linux x86_64 CUDA + statically-linked cudart — NVIDIA's CUDA 12.8.2 devel
+#     image on an Ubuntu 24.04 base (`nvidia/cuda:12.8.2-devel-ubuntu24.04`), the
+#     same image `ci.yml`'s `build-linux-cuda` compile check runs in. Keeps the
+#     Volta V100 sm_70/72 targets (CUDA 13 removed them) and reaches sm_120, on
+#     the image's glibc 2.39 floor.
+#   - Linux arm64 CUDA + statically-linked cudart — NVIDIA's CUDA 13.0.3 devel
+#     image, same Ubuntu 24.04 base (`nvidia/cuda:13.0.3-devel-ubuntu24.04`), on
+#     the aarch64 runner. The DGX Spark GB10 is sm_121, which CUDA 12.x cannot
+#     build (it dropped sm_121), so 13 is required for native Spark SASS.
+#
+# Both image tags carry the toolkit the apt repositories were already resolving:
+# `12.8.2-devel` ships cudart 12.8.90-1 and `13.0.3-devel` ships 13.0.96-1 — the
+# exact versions the pre-container jobs got from `cuda-toolkit-12-8 12.8.2-1` and
+# `cuda-toolkit-13-0 13.0.3-1`. Moving into the images therefore pinned the
+# toolkit without changing which one the artifacts are built against.
 #
 # The three jobs are independent and run in parallel. To add a target, add a job
 # here and nothing in the callers changes.
@@ -123,21 +130,22 @@ jobs:
             "minfer-${ASSET_TAG}-macos-arm64.tar.gz.sha256" \
             --clobber
 
-  # Linux x86_64, CUDA + statically-linked cudart. Runs in NVIDIA's CUDA 12.8
+  # Linux x86_64, CUDA + statically-linked cudart. Runs in NVIDIA's CUDA 12.8.2
   # devel image on an Ubuntu 24.04 base — deliberately the *same* image ci.yml's
   # `build-linux-cuda` compile check uses, so a green check there is evidence
   # about this artifact instead of about a different glibc/gcc/toolkit. The base
   # in the tag is the artifact's glibc/gcc floor, so it must stay 24.04 (2.39 /
   # gcc 13), matching the target OS.
   #
-  # The toolkit is baked into the image, so unlike the arm64 job there is no
+  # The toolkit is baked into the image, so unlike the apt-era job there is no
   # `apt-get install cuda-toolkit-*` here: that install was this job's slowest
-  # and least stable step (measured 131–299 s across x64 runs) and it pinned no
-  # version the image does not already pin. What the image lacks and this job
-  # needs is `gh` for the upload (Ubuntu noble ships 2.45.0 — the same binary the
-  # runner-based jobs had), and the image ships no `git` at all, which is why the
-  # upload step sets `GH_REPO` (see the note there). The job is root, so there is
-  # no `sudo` to reach for. The host needs a GPU only at RUNTIME, never to build.
+  # and least stable step (measured 125–179 s across x64 runs) and it pinned no
+  # version the image does not already pin (12.8.2 / cudart 12.8.90-1 is what it
+  # resolved anyway). What the image lacks and this job needs is `gh` for the
+  # upload (Ubuntu noble ships 2.45.0 — the same binary the runner-based jobs
+  # had), and the image ships no `git` at all, which is why the upload step sets
+  # `GH_REPO` (see the note there). The job is root, so there is no `sudo` to
+  # reach for. The host needs a GPU only at RUNTIME, never to build.
   #
   # CUDA 12.8 is chosen deliberately: it is the last toolkit whose nvcc still
   # accepts the Volta compute targets (sm_70/72, added to build.rs for
@@ -148,7 +156,7 @@ jobs:
   linux-x64-cuda:
     name: Build & upload (Linux x86_64 CUDA, static cudart)
     runs-on: ubuntu-24.04 # x86_64; the container's base (24.04) sets the glibc floor (2.39)
-    container: nvidia/cuda:12.8.0-devel-ubuntu24.04
+    container: nvidia/cuda:12.8.2-devel-ubuntu24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -252,31 +260,35 @@ jobs:
             --clobber
 
   # Linux arm64 (aarch64), CUDA + statically-linked cudart. Targets the NVIDIA
-  # DGX Spark (GB10, sm_121), which is aarch64 with an ARM GPU. Built on an
-  # arm64 GitHub runner with CUDA 13 — sm_121 (GB10) was REMOVED from CUDA 12.x
-  # (only sm_120 is reachable there) so 13 is required for native Spark SASS.
-  # The Spark's OS is Ubuntu 24.04 (glibc 2.39), hence the ubuntu-24.04-arm
-  # runner for a matching glibc floor.
+  # DGX Spark (GB10, sm_121), which is aarch64 with an ARM GPU. Runs in NVIDIA's
+  # CUDA 13.0.3 devel image on the same Ubuntu 24.04 base as the x64 job: sm_121
+  # (GB10) is not reachable from CUDA 12.x at all, so 13 is required for native
+  # Spark SASS, and the base keeps the glibc 2.39 floor the Spark's own Ubuntu
+  # 24.04 has. The arm64 image is the sbsa variant of the tag, i.e. the packages
+  # the old apt step pulled from the very same `ubuntu2404/sbsa` repository.
+  #
+  # Same container mechanics as the x64 job, for the same reasons: the toolkit is
+  # baked in, so `apt-get install cuda-toolkit-13-0` is gone (measured at 2m38s in
+  # the last apt-based night against ~74 s of image pull plus ~10 s of
+  # prerequisites), and `gh` + `GH_REPO` cover the upload.
   linux-arm64-cuda:
     name: Build & upload (Linux arm64 CUDA, static cudart)
-    runs-on: ubuntu-24.04-arm # aarch64; glibc 2.39 (matches the DGX Spark)
+    runs-on: ubuntu-24.04-arm # aarch64; the container's base (24.04) sets the glibc floor (2.39)
+    container: nvidia/cuda:13.0.3-devel-ubuntu24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Install CUDA toolkit 13 (aarch64/sbsa)
+      # Same set as the x64 job — see the note there for why each one is needed.
+      - name: Install build prerequisites
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-0
-          # cuda-toolkit installs to /usr/local/cuda-13.0 and (usually) symlinks /usr/local/cuda
-          if [ ! -x /usr/local/cuda/bin/nvcc ] && [ -x /usr/local/cuda-13.0/bin/nvcc ]; then
-            sudo ln -sfn /usr/local/cuda-13.0 /usr/local/cuda
-          fi
-          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential gh
+          gh --version
+          ldd --version | head -1
+          gcc --version | head -1
           /usr/local/cuda/bin/nvcc --version | tail -1
 
       - name: Install Rust (pinned 1.97.1)
@@ -298,6 +310,9 @@ jobs:
       # The default key includes the job id, so the three platform jobs never
       # share a cache, and the rust-environment hash (Cargo.lock etc.) is stable
       # across nights, so a nightly restores the same key instead of re-uploading.
+      # Running in a container changes that hash once — the x64 job's comment
+      # spells out why (its `CARGO_HOME` is `/github/home/.cargo`) — so the first
+      # container night pays one dependency compile and later nights hit.
       - uses: Swatinem/rust-cache@v2
 
       - name: Build (CUDA + static cudart)
@@ -332,6 +347,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           ASSET_TAG: ${{ inputs.asset_tag }}
         run: |
