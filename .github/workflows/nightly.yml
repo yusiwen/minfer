@@ -145,12 +145,28 @@ jobs:
           fi
 
           # Commits landed since the base tag (the window a nightly reviewer
-          # cares about, regardless of when the previous nightly ran).
+          # cares about, regardless of when the previous nightly ran). Only the
+          # newest NOTES_COMMITS are listed; the remainder is one link to
+          # GitHub's compare view, which carries the commits *and* the diff.
+          # Without a cap this list grows with every merge between releases —
+          # the v0.0.8 nightly already listed 13 commits, and the release page is
+          # meant to be scannable.
+          #
+          # The compare range is BASE...HEAD (everything the truncation dropped,
+          # plus the five shown), not the omitted tail: it is the delta a reviewer
+          # of a nightly actually wants, and it stays valid as the tag moves.
+          NOTES_COMMITS=5
           BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
           if [ -n "${BASE}" ]; then
-            COMMITS="$(git log --format='- `%h` %s' --no-merges "${BASE}..HEAD")"
+            TOTAL="$(git rev-list --count --no-merges "${BASE}..HEAD")"
+            COMMITS="$(git log --format='- `%h` %s' --no-merges -n "${NOTES_COMMITS}" "${BASE}..HEAD")"
+            DIFF_URL="https://github.com/${REPO}/compare/${BASE}...${SHA}"
           else
-            COMMITS="$(git log --format='- `%h` %s' --no-merges -n 30 HEAD)"
+            # No release tag yet: fall back to the tip of history and the plain
+            # commit list (there is no base to diff against).
+            TOTAL="$(git rev-list --count --no-merges HEAD)"
+            COMMITS="$(git log --format='- `%h` %s' --no-merges -n "${NOTES_COMMITS}" HEAD)"
+            DIFF_URL="https://github.com/${REPO}/commits/${SHA}"
           fi
 
           {
@@ -163,9 +179,19 @@ jobs:
             echo "- Built: ${DATE} (UTC)"
             if [ -n "${BASE}" ]; then
               echo "- Commits since \`${BASE}\`:"
+            else
+              echo "- Latest commits:"
             fi
             echo ""
-            echo "${COMMITS}"
+            if [ "${TOTAL}" -eq 0 ]; then
+              echo "_No commits since \`${BASE}\`._"
+            else
+              echo "${COMMITS}"
+              if [ "${TOTAL}" -gt "${NOTES_COMMITS}" ]; then
+                echo ""
+                echo "…and **$((TOTAL - NOTES_COMMITS)) more** — [see the full diff](${DIFF_URL})"
+              fi
+            fi
             echo ""
             echo "> This is a rolling **pre-release** rebuilt every night from the"
             echo "> default branch. It is not a supported version, and it carries"
