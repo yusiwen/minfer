@@ -92,7 +92,7 @@ into an indictment with numbers.
 
 ## 3. Implementation
 
-### 3.1 Design choices (why these two measurements and this machine state)
+### 3.1 Design choices (why these two measurements and dgxspark state)
 
 - **The "all four gates" BT path**: the attribution subject must be the campaign's best
   configuration at the time (MMQ on + BT routing on), otherwise the buckets describe a

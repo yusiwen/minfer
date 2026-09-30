@@ -168,7 +168,7 @@ medians of 3 interleaved reps, prose and code prompts; raw log
 | draft `--spec-draft-n-max 8` | 47.7 | 47.5 | 1.00× |
 | draft `--spec-draft-n-max 16` | 47.2 | — | 0.99× |
 
-llama.cpp's speculative decoding is a **wash on this box** — not a
+llama.cpp's speculative decoding is a **wash on dgxspark** — not a
 regression of their implementation but the same physics doc 80 projected:
 with C_T(nt) near the weight-streaming floor (their batched verify is
 efficient), the win is capped at ~1.04–1.2×, and the per-drafted-token

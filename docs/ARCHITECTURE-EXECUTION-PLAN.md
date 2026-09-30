@@ -82,10 +82,12 @@ own invariants rather than inventing new ones.
 6. **Deferred-Metal marking.** A ticket whose cross-backend design changes
    Metal's behaviour must add a Phase G line *in the same commit*.
 
-## 2. Verification matrix (what this box can prove)
+## 2. Verification matrix (what dgxspark can prove)
 
-This machine is a **DGX Spark (GB10), aarch64 Linux, CUDA 13.0**
+`dgxspark` — the box every recorded measurement in this plan was taken on — is a
+**DGX Spark (GB10), aarch64 Linux, CUDA 13.0**
 (`/usr/local/cuda-13.0`), with cached Qwen2.5-0.5B/7B/14B and Qwen3-0.6B GGUFs.
+Measured records name it absolutely, never as "this box" (gate contract rule 5).
 
 | Backend | Build | Run/verify | Note |
 |---|---|---|---|
@@ -120,7 +122,7 @@ roadmap §4 defects automatically.
 
 | ID | Item | Title | Effort | Status |
 |---|---|---|---|---|
-| A0 | — | CUDA access spike on this box | S | ✅ done — but the verdict is **superseded (2026-09-18)**: the device is available; "unavailable" was an agent-sandbox artefact (§2) |
+| A0 | — | CUDA access spike on dgxspark | S | ✅ done — but the verdict is **superseded (2026-09-18)**: the device is available; "unavailable" was an agent-sandbox artefact (§2) |
 | A1 | 23 | Op × dtype × backend correctness matrix | M | ✅ done — found + fixed an op defect |
 | A2 | 24 | CI: test on Linux/CPU, build on CUDA, keep macOS build | S | ✅ done |
 | A3 | 5 | KV bounds guard + `ensure_kv` size check | S | ✅ done |
@@ -174,7 +176,7 @@ roadmap §4 defects automatically.
      RoPE, Attn, KvcacheStore/Load) run on **every backend that claims the op**,
      each compared against an analytic reference written in the test — never
      against another backend. Unavailable backends report
-     `SKIP (reason)`, never `PASS`: on this box that is 17 CPU cells + 34 skips.
+     `SKIP (reason)`, never `PASS`: on dgxspark that is 17 CPU cells + 34 skips.
   2. `support_table_matches_support_matrix_doc` — `supports_op` for 23 op rows
      against the table published in `SUPPORT-MATRIX.md`, so the A8 doc and the
      code cannot drift. The CPU column is checked here; the Metal/CUDA columns
@@ -318,7 +320,7 @@ roadmap §4 defects automatically.
   CPU entry survives); the existing scheduler tests still pass;
   `cargo test --release` 159 passed / 0 failed.
 - **Honest limitation:** a *behavioural* test needs a second usable backend,
-  which this box does not have (A0: CUDA unavailable; Metal not compiled). The
+  which dgxspark does not have (A0: CUDA unavailable; Metal not compiled). The
   test asserts the new keying contract directly through a `#[cfg(test)]` hook
   rather than through a real split boundary. Phase G should re-test it on a Mac.
 
@@ -452,7 +454,7 @@ re-prefilling it every turn.
 - **Tests:** `common_prefix_len_finds_the_exact_match`,
   `prefill_span_always_feeds_the_last_token` (pure), and
   `prefix_reuse_matches_a_full_prefill` (real model, bitwise).
-- **Not covered here:** the fused GPU stores are unverified on this box, so the
+- **Not covered here:** the fused GPU stores are unverified on dgxspark, so the
   gate stays conservative; Phase G re-tests on Metal.
 
 ### B3 — Measurement — **DONE (interleaved A/B, same binary)**
@@ -550,7 +552,7 @@ needs, so C1 builds it rather than a type with no consumer:
    reaches the backend exactly as today (so no kernel changes), and once false
    the resolved cell array must be passed instead. **A backend that has not been
    ported returns `Err` instead of indexing the wrong row** (standing rule 2).
-   On this box that means CPU first: CUDA was compile-verified only at the time
+   On dgxspark that means CPU first: CUDA was compile-verified only at the time
    (A0 — **superseded 2026-09-18**, the device is available) and Metal stays
    untouched (G), so C2 must either keep the mapping identity for them or refuse
    to run there.
@@ -884,7 +886,7 @@ bandwidth, not memory.
   that the f32 region holds the row verbatim), plus the 3× footprint and an attention
   comparison over three causal queries. The gate was mutation-checked: disabling the
   packed read path turns that comparison into max |Δ| = 3.2e38.
-- *Refusals*: `MINFER_CACHE_TYPE=q8_0` on this box (CUDA available) ends the load with
+- *Refusals*: `MINFER_CACHE_TYPE=q8_0` on dgxspark (CUDA available) ends the load with
   `minfer: MINFER_CACHE_TYPE=q8_0 is not supported on cuda yet: …`, and a typo
   (`banana`) with `… is not a KV cache type (f32, f16, q8_0); refusing rather than
   silently running with f32`. `ensure_kv` backstops both: a packed width on a non-CPU
@@ -1728,7 +1730,7 @@ variable only through a plain `=` assignment in the enclosing function (the `lau
 gate's coverage assertion compares **sets** of site tokens; where two source sites share one token
 (the two `mmq_raw_nb_bt` kernel instantiations) the gate proves the token is reached, not that both
 branches were — the audit, not the gate, is what guarantees each source site has its own read. The
-`compute-sanitizer` and real-model rows are recorded measurements on this box (CI has no GPU); the
+`compute-sanitizer` and real-model rows are recorded measurements on dgxspark (CI has no GPU); the
 x86_64 CPU row is unaffected because no pure-Rust test was added.
 
 ### C5 — Session save and restore · [#43](https://github.com/yusiwen/minfer/issues/43) — **DONE 2026-09-22**
@@ -1831,7 +1833,7 @@ CLI and records what the server still needs.
   `an_engine_without_a_kv_refuses_the_session_calls`. Suites: CPU **287 passed / 0 failed /
   15 ignored** (was 282/0/15).
 - *Not verified here*: a CUDA or Metal session companion (the container is backend-tagged and
-  the CPU path is what this box measured; the CUDA half of C5's own gate was run at S1).
+  the CPU path is what dgxspark measured; the CUDA half of C5's own gate was run at S1).
 
 **C5 S2b — the server's slot snapshot (2026-09-24).**
 
@@ -2552,7 +2554,7 @@ for a map only where `Device::gathers_attn_map()` says a kernel reads one (CPU, 
 so on a Mac the server keeps C8a's copy path — and since Metal's `copy_cells` is also
 refused until G5, admission logs the failed copy and prefills, which is the same loud
 fallback it has always taken. S5's gate is the **compile check** (Metal is
-`cfg(target_os = "macos")`, so CI's `build-macos` is the only compile this box cannot
+`cfg(target_os = "macos")`, so CI's `build-macos` is the only compile dgxspark cannot
 do) plus this record; the device claims stay [#44](https://github.com/yusiwen/minfer/issues/44)'s, on a Mac.
 
 That closes C8b: S1a/S1b (the span list and its two resolvers), S2 (sharing in place +
@@ -3203,7 +3205,7 @@ a **knob** to choose the split.
   (a non-offloaded block reaches the device and its weights are not there); with
   `allows_weight` forced true, the device-bytes assertion fails (the device would hold the whole
   model, which is what the plan exists to prevent).
-- **Honest scope**: this box's device has ~128 GB, so "a model larger than device memory" cannot
+- **Honest scope**: dgxspark's device has ~128 GB, so "a model larger than device memory" cannot
   be *staged* here. The gate forces the split with the knob and asserts the device holds only the
   offloaded blocks — the knob is exactly how the constraint is expressed; the automatic fit is
   S2 below. Metal takes the same code path but is compile-checked only (`build-macos`).
@@ -3360,7 +3362,7 @@ arithmetically preserved because `SwiGLU(gate, up) = silu(gate) * up` is exactly
 again). `cache.rs`'s reuse identity compares `src` vectors element-wise, so duplicates are
 deterministic. No other defect found; no follow-up issue needed.
 
-**Counts (rule 4).** `cargo test --release` on this box (aarch64), 2026-09-26: unit **462 passed / 0
+**Counts (rule 4).** `cargo test --release` on dgxspark (aarch64), 2026-09-26: unit **462 passed / 0
 failed / 33 ignored** (was 460; +2 for the two new tests), integration **10 / 0 / 6**. The
 `x86_64 (CI runner)` row moves by the same +2 (458 → 460); `test-linux-cpu`'s `--check-live`
 confirms it against its own log, and `AGENTS.md` and `docs/status.toml` carry both rows.
@@ -3770,7 +3772,7 @@ what is not.
 `FEATURES=cuda`. Documented in `AGENTS.md` rule 11 + the real-model-gates bullet and in
 `docs/BUILD.md` §Tests.
 
-**Measured** (CPU build, this box; `--bin minfer` for the gate set).
+**Measured** (CPU build, dgxspark; `--bin minfer` for the gate set).
 
 | run | before (`a756419`) | after (rebased on `09ce9e7`, #121 included) |
 |---|---|---|
@@ -3810,7 +3812,7 @@ parallel gate set is what detects the interference, and the per-engine path is w
   process-wide singleton (MMQ memo, captured graph execs, stream state — issue
   [#64](https://github.com/yusiwen/minfer/issues/64)); `cargo test --release --features cuda --
   --ignored` without `--test-threads=1` remains the wrong command, and `scripts/real_model_gates.sh`
-  keeps it serial. Measured serially on this box (GB10 sm_121, CUDA 13.0): the unit suite is **501
+  keeps it serial. Measured serially on dgxspark (GB10 sm_121, CUDA 13.0): the unit suite is **501
   passed / 0 failed / 32 ignored**, and the ignored set is **32 passed / 0 failed** in both the 0.5B
   (f32 KV) and the Qwen3-0.6B (f16 KV) configurations — unchanged by this increment except that one
   obsolete unit test is gone. (**#153 removed the second reason** — the device KV layout tag is per
@@ -4202,7 +4204,7 @@ concurrent: 17.12 s  (batched prefill: 3 prompts, 129 tokens, 14788 ms + decode)
 - **Decode batching is neutral on this model**: a 4-wide step costs 4.0x a
   single-token step (the engine measurement: 1.00x on the 7B, 1.45x on the 0.5B).
 
-So `--n-slots 4` cannot "materially exceed" the serial baseline on this box: for
+So `--n-slots 4` cannot "materially exceed" the serial baseline on dgxspark: for
 identical prompts the serial path is ~3x cheaper on prefills that batching cannot
 recover, and for distinct prompts the two tie (neutral prefill batching + neutral
 decode batching). The remaining route to the acceptance on CPU is a `nt > 1`
@@ -4211,7 +4213,7 @@ bandwidth-bound device batching is the standard win, and the trace above is what
 GPU re-measurement should compare.
 
 Still to come in E2: nothing is left to *build* for the deliverable; what remains
-is the acceptance, which this box cannot demonstrate (the step-4 trace above shows
+is the acceptance, which dgxspark cannot demonstrate (the step-4 trace above shows
 why, and `MINFER_BATCH_TRACE=1` is the instrument for re-measuring elsewhere).
 
 **E2 progress, step 5 (2026-09-17): A7's second half — `n_seqs` deleted.** The
@@ -4401,7 +4403,7 @@ attention kernels still compute `positions[t] + 1` (six of them:
 `gqa_attn_f32_f16kv`, `gqa_attn_f32`, the split partial/combine pairs,
 the batched variants and the flash-attention prefill path at
 `cuda_kernels.cu:4194`). A window with `lo > 0` changes what the split-K chunking
-covers, so the port is not mechanical; and this box had **no device at the time**
+covers, so the port is not mechanical; and dgxspark had **no device at the time**
 (A0 — **superseded 2026-09-18**: E1b is now device-verified), which made it the
 one class of change that could not be verified then — a mistake would
 silently corrupt *single-sequence* GPU output that is known-good today. So: CUDA
@@ -4525,7 +4527,7 @@ closed channel as a *completed* answer: non-streaming `collect_response` returne
 SSE stream followed by `[DONE]`. A client could not tell a dropped request from a
 model that produced nothing, and the request was silently lost.
 
-Reproduced on this box (CPU, cached 0.5B Q4_0, `MINFER_BATCH=1 --n-slots 1`, two
+Reproduced on dgxspark (CPU, cached 0.5B Q4_0, `MINFER_BATCH=1 --n-slots 1`, two
 concurrent `max_tokens=200` requests, B sent ~0.4 s after A,
 `scripts`-free python client — see the PR):
 
@@ -4629,7 +4631,7 @@ violation, an E4 activation-budget refusal, an `ensure_kv` format mismatch, a pa
 `guarded_forward_batch`) failed forever at 100% CPU; no client was ever told, `in_flight` stayed
 ≥ 1, so a graceful drain ran out its whole `MINFER_DRAIN_MS` deadline.
 
-Reproduced on this box (CPU, no model — a test double whose `forward_batch` panics, driven
+Reproduced on dgxspark (CPU, no model — a test double whose `forward_batch` panics, driven
 through the **real** `guarded_forward_batch` and the real `serve_loop`, with the handler's
 `InFlight` guard held until the stream ends and a 500 ms drain window):
 
@@ -4720,7 +4722,7 @@ left as-is on purpose; the ignored set is run serially.
 real-model gate, `src/server/batch.rs`) measured the two whole workloads **once, sequentially**
 (batched then serial) and asserted the wall-clock relation `t_serial > t_batch`. Under the parallel
 `--ignored` harness the first-measured phase absorbs the start-up wave, so the verdict was a property
-of the load, not of the code. Measured at `e1ac17f` on this box (CPU build, 0.5B q4_0, four
+of the load, not of the code. Measured at `e1ac17f` on dgxspark (CPU build, 0.5B q4_0, four
 requests, `max_tokens = 16`):
 
 | run | batched | serial | ratio |
@@ -4750,7 +4752,7 @@ and the whole parallel set **~41-44s** (34.36s before). The ticket's cost note (
 describes the *loaded* harness, where a full-length pair reached ~31s; the idle pair is ~1.8s, which
 is what made 7 full-length rounds affordable-ish and 7 shorter ones clearly so.
 
-**Verification (2026-09-25, CPU build, this box; `--bin minfer` for the gate set).**
+**Verification (2026-09-25, CPU build, dgxspark; `--bin minfer` for the gate set).**
 
 | Command | Result |
 |---|---|
@@ -4830,11 +4832,11 @@ the same steps, only for longer, while a wedged engine trips the work assertion 
 token plus one prefill forward per chunk, times a deliberately loose margin. It is loose because the
 bound must catch an engine that *cannot* terminate, never one that is merely slow — a false negative
 hangs the suite, a false positive is the flaky gate this ticket removes. Measured on the 0.5B q4_0
-(this box, 2026-09-25): the warm request (8-token prompt, `max_tokens = 4`) took **4 steps** against a
+(dgxspark, 2026-09-25): the warm request (8-token prompt, `max_tokens = 4`) took **4 steps** against a
 budget of **80** (20x); the long one (120-token prompt, `max_tokens = 64`) took **64** against **768**
 (12x). The gate prints both counts on every run.
 
-**Verdict, before and after (CPU build, this box, 16 extra CPU spinners on a 20-core machine).**
+**Verdict, before and after (CPU build, dgxspark, 16 extra CPU spinners on a 20-core machine).**
 
 | Command | Before | After |
 |---|---|---|
@@ -4868,7 +4870,7 @@ two #158 deadlines were the only ones; what remains is genuinely different and f
   all (a wedge hangs the suite rather than false-failing it); #158's helpers make hardening them
   mechanical, and #160 tracks it.
 
-**Verification (2026-09-25, this box; `--bin minfer` for the gate set).**
+**Verification (2026-09-25, dgxspark; `--bin minfer` for the gate set).**
 
 | Command | Result |
 |---|---|
@@ -4942,7 +4944,7 @@ work counter freezes), `spin` advances `work_units` without ever completing a ru
 moving along a path that cannot terminate). It is an **environment switch** — the mutation runs need
 no source revert, so `git diff` stayed clean throughout.
 
-**Mutation evidence — the wedge arm (rule 3).** Command shape (CPU build, aarch64, this box,
+**Mutation evidence — the wedge arm (rule 3).** Command shape (CPU build, aarch64, dgxspark,
 2026-09-27): `MINFER_TEST_TICK=wedge cargo test --release --bin minfer -- --ignored --exact <gate>
 --nocapture`. Every hardened gate fails on **step 1** with
 *"the engine is wedged — step 1 left it busy without advancing the work counter (still 0)"*
@@ -4965,7 +4967,7 @@ The listed time is the whole process (start + 0.5B load + the failure); libtest'
 timeout, ends it.
 
 **Mutation evidence — the step-budget arm.** `MINFER_TEST_TICK=spin` over the whole `#[ignore]`d set
-with the two `serve_loop` gates skipped is **10 failed / 21 passed in 12.45s** (CPU build, this box,
+with the two `serve_loop` gates skipped is **10 failed / 21 passed in 12.45s** (CPU build, dgxspark,
 2026-09-27; `cargo test --release --bin minfer -- --ignored --nocapture --skip
 serve_loop_publishes_the_queue_and_running_depth --skip
 a_job_rejected_for_want_of_a_slot_is_answered_with_503`). Each bounded stepper stops exactly one step
@@ -5000,7 +5002,7 @@ liveness bound in `serve_loop` (a counted consecutive-no-progress limit) or the 
 published to `ServerMetrics` so a spawned worker can be observed; either is a production change this
 ticket's scope fence excludes. Filed as [#196](https://github.com/yusiwen/minfer/issues/196).
 
-**Verification (2026-09-27, CPU build, aarch64 (this box); `--bin minfer` for the gate set).**
+**Verification (2026-09-27, CPU build, dgxspark (aarch64); `--bin minfer` for the gate set).**
 
 | Command | Result |
 |---|---|
@@ -5086,7 +5088,7 @@ slot freed, prefix cleared, idle slot untouched) and
 each, senders closed).
 
 **Mutation evidence (rule 3).** `MINFER_TEST_TICK=wedge` is an environment switch, so no source
-revert is involved and `git diff` stayed clean throughout. CPU build, aarch64 (this box),
+revert is involved and `git diff` stayed clean throughout. CPU build, dgxspark (aarch64),
 2026-09-27, `MINFER_TEST_TICK=wedge cargo test --release --bin minfer -- --ignored --exact <gate>
 --nocapture`, **no outer `timeout`**:
 
@@ -5109,11 +5111,11 @@ cannot trip a count of no-progress steps; the two `serve_loop` gates would still
 step budget, and adding one is exactly the shape #196 offers as its second, rejected alternative).
 The #160 command is unchanged:
 
-| Command (2026-09-27, CPU build, aarch64 (this box)) | Result |
+| Command (2026-09-27, CPU build, dgxspark (aarch64)) | Result |
 |---|---|
 | `MINFER_TEST_TICK=spin cargo test --release --bin minfer -- --ignored --skip serve_loop_publishes_the_queue_and_running_depth --skip a_job_rejected_for_want_of_a_slot_is_answered_with_503` | **21 passed / 10 failed** in 12.21s (the #160 budget arm, unchanged) |
 
-**Verification (2026-09-27, CPU build, aarch64 (this box)).**
+**Verification (2026-09-27, CPU build, dgxspark (aarch64)).**
 
 | Command | Result |
 |---|---|
@@ -5469,9 +5471,9 @@ not only to test-driven fills. Mutation reverted; `grep -n MUTATION src/graph/al
 empty and `git diff` clean of it.
 
 **Counts (rule 5).** No `#[test]` was added or removed, so the suite counts are
-unchanged and **no CUDA row was re-measured**: `cargo test --release`, box aarch64
-(this box), 2026-09-30 → **481 / 0 / 36** unit + **10 / 0 / 6** integration (the same
-as the recorded aarch64 row). `cargo fmt --all --check` clean; the non-test build
+unchanged and **no CUDA row was re-measured**: `cargo test --release`, box
+`dgxspark (aarch64, GB10 sm_121)`, 2026-09-30 → **481 / 0 / 36** unit + **10 / 0 / 6** integration (the same
+as the recorded CPU row). `cargo fmt --all --check` clean; the non-test build
 warning-free with and without `--features cuda` (the one `warning:` line on the CUDA
 build is `build.rs`'s pre-existing `cargo:warning=` target list, not a rustc
 diagnostic).
@@ -5561,8 +5563,8 @@ half is what the copy-on-write test asserts. Mutation reverted; `grep -rn MUTATI
 empty and `git diff` clean of it (`src/graph/kvcache.rs` has no diff).
 
 **Counts (rule 5).** No `#[test]` was added or removed, so no row moves and **no CUDA row was
-re-measured**: `cargo test --release`, box aarch64 (this box), 2026-09-29 → **481 / 0 / 36**
-unit + **10 / 0 / 6** integration (the recorded aarch64 row). `cargo fmt --all --check`
+re-measured**: `cargo test --release`, box `dgxspark (aarch64, GB10 sm_121)`, 2026-09-29 → **481 / 0 / 36**
+unit + **10 / 0 / 6** integration (the recorded CPU row). `cargo fmt --all --check`
 clean; `python3 scripts/check_status.py --check` exits 0; the non-test build warning-free
 with and without `--features cuda` (`cargo build --release` and `cargo build --release
 --features cuda`; the one `warning:` line on the CUDA build is `build.rs`'s pre-existing
@@ -5633,15 +5635,15 @@ Can run in parallel with A–E by a different workstream.
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
-| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | this box |
-| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | this box |
-| F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | this box |
-| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (true overlap) | M | this box (CUDA) |
-| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | this box |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | this box |
-| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | this box |
+| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | dgxspark |
+| F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
+| F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
+| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (true overlap) | M | dgxspark (CUDA) |
+| F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
-F1 is the only item in this plan that **cannot be verified on this machine**
+F1 is the only item in this plan that **cannot be verified on dgxspark**
 (aarch64): it needs an x86 box or a new CI runner. It is also the largest
 single CPU win, so it should be scheduled against hardware availability, not
 against the critical path.
@@ -6085,7 +6087,7 @@ counter pair and the trailing-window rate, verified live on **both** response
 paths: non-streaming → `prompt 32 / completion 32 / 2.000 tokens/s`, streaming →
 `64 / 64 / 4.000` (32 and 64 generated tokens over the 16-second window).
 
-**End-to-end run (manual, on this box, CPU, Qwen2.5-0.5B Q4_0, `MINFER_BATCH=1`).**
+**End-to-end run (manual, on dgxspark, CPU, Qwen2.5-0.5B Q4_0, `MINFER_BATCH=1`).**
 A live `minfer serve` on port 18099 with `MINFER_OP_TIMING=1` and
 `MINFER_DRAIN_MS=8000`: before any request `/metrics` reports zeros and no timing
 family; one 16-token chat completion then shows `minfer_requests_total 1`,
@@ -6121,7 +6123,7 @@ one named failure rather than a cascade of `PoisonError`s.
 every iteration, and `admit` consumes the `Job`, so a job rejected with "no idle
 slot" has its event sender dropped without an error event — the handler then
 answers **`200` with empty content**, which a client cannot tell from an empty
-generation. Reproduced on this box (CPU, 0.5B Q4_0, `MINFER_BATCH=1`,
+generation. Reproduced on dgxspark (CPU, 0.5B Q4_0, `MINFER_BATCH=1`,
 `--n-slots 1`, two concurrent `max_tokens=200` requests): A `200` with 1014
 chars and `finish=length`; B `200` with 0 chars, `finish=stop`,
 `completion_tokens=0`, plus `[server] job rejected: no idle slot` in the log. It
@@ -6256,7 +6258,7 @@ CI's `build-linux-cuda` and locally (see (a)), and the timing hook itself is
 exercised on CPU here and on the GB10 (the device block above), including the
 CUDA-only fused ops. (g) The signal path is **not in the automated suite** — only
 `bounded_drain`, the deadline parse and the draining `503` are. The end-to-end
-runs above were performed by hand on this box and are recorded here as manual
+runs above were performed by hand on dgxspark and are recorded here as manual
 evidence, not as a CI gate; wiring a `SIGTERM` into a test would mean a
 subprocess and a port, which this ticket did not take on.
 
@@ -6700,7 +6702,7 @@ concat registration was already fine but the type gate was not.
   running on CPU"* line. Registering a weight type no kernel can consume would
   make the device claim true while the op ran the wrong (or no) kernel, which is
   exactly what that gate exists to prevent; a Metal f16 matmul/embed kernel
-  cannot be verified from this box (no Mac; CI's `build-macos` compiles the crate
+  cannot be verified from dgxspark (no Mac; CI's `build-macos` compiles the crate
   and nothing runs it). Filed as [#164](https://github.com/yusiwen/minfer/issues/164).
 - **CPU**: `vec_ops::dot_f16_f32` (AVX2 `F16C` `_mm256_cvtph_ps` / aarch64
   baseline NEON `FCVTL` `vcvt_f32_f16`, f64 scalar oracle) and
@@ -6795,7 +6797,7 @@ blocking that is there measured neutral on this model; a K-tiled kernel that
 reuses a weight row across a token *tile* without re-reading it is not
 implemented. (d) `x86_64` codegen is verified by cross-`cargo`, not by running
 the AVX2 kernel — CI's ubuntu job is the run. (e) The row-blocked and direct
-forms are asserted bit-identical on this box; the argument that they must be
+forms are asserted bit-identical on dgxspark; the argument that they must be
 (identical FMA tree and order) is also why the SIMD/scalar comparison uses a
 tolerance rather than bit equality. (f) The pre-existing finding filed with F6b
 is **fixed in F6c** ([#165](https://github.com/yusiwen/minfer/issues/165)): the
@@ -7144,7 +7146,7 @@ tickets and everything after them.
 
 | Check | Result |
 |---|---|
-| Unit suite (aarch64, this box) | `162 passed / 0 failed / 3 ignored` |
+| Unit suite (aarch64, dgxspark) | `162 passed / 0 failed / 3 ignored` |
 | Unit suite (x86_64, CI runner) | `running 163 → 160 passed / 0 failed / 3 ignored`; the 2-test delta is `quants::neon_correctness`, gated `cfg(all(test, target_arch = "aarch64"))` |
 | Op matrix | 17 cases × 3 backends (17 CPU cells, 34 explicit skips), 23 support rows, exhaustive `Op` enumeration |
 | CI | three jobs green: 1m09s / 1m26s / 4m36s |
@@ -7287,7 +7289,7 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 5 | ~~**Batching is opt-in** even where it is measured faster.~~ **Closed by E6 (2026-09-19)**: the default follows the device (CUDA on, CPU/Metal off), with `=1`/`=0` as the override. | product | done |
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
-| 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on this box. | hardware | Sequencing §11; F1 is the largest single CPU win. |
+| 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on dgxspark. | hardware | Sequencing §11; F1 is the largest single CPU win. |
 | 9 | **A sequence's logits' tail depended on its absolute arena offset — resolved by C6 (2026-09-19)** (found while gating C3). The pre-C6 measurements stand and are what justified the fix: at cell 0 vs cell 8 the max |Δ| over the vocabulary was 2.6% relative with the greedy token unchanged and the run deterministic; the hand-built `q`/`k`/`v` → rope → store → attn graph is exact to ≤ 1.2e-7 at the model's own shape *and* equal for a 1-cell and an 8-cell offset; the arena layout is irrelevant (a split reservation is bit-identical per layer); `positions` had exactly four consumers per layer (96 = 24×4); a layer bisect put the entry at layer 0's attention output; and the **rope-injection intervention** proved the entry is RoPE alone (injecting run A's 48 rope outputs into run B made the logits bitwise identical), while a distributed ~1e-6 rope perturbation already saturates the tail (0.44 vs 0.43) with the greedy token stable from 1e-6 to 1e-2. **C6 removed the coupling** — `positions` are sequence-relative and the allocator resolves `cells` — so a cell move changes no angle: the offset tests now assert bitwise equality, C3's acceptance tightens from the named amplified-rounding class to bit-identical, and a compaction no longer re-ropes. Three method notes earned here: a zero from a perturbation probe means nothing without a loud control; **a control validates the path, not the equivalence of the perturbation** (a single element nudged by 1e-5 is not the offset's distributed 1.5e-5 — the earlier "refutation" was an over-read); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness). | measurement | Done by C6; the logical-positions design, its gates and the CUDA fused-op port (S3) are in §5. |
 
 #### Test-infrastructure record (#171, 2026-09-26) — one home for the gate contract, and one failure-injection seam
@@ -7320,7 +7322,7 @@ would change what it means. #151's `FailingForward` mock stays in its CI gate (n
 runner), and the seam replaces it on the real path below. #167's gates use the pure registration rule
 and needed no switch.
 
-**Verification (2026-09-26, this box: 20-core CPU, GB10 sm_121, CUDA 13.0).**
+**Verification (2026-09-26, dgxspark: 20-core CPU, GB10 sm_121, CUDA 13.0).**
 
 | Command | Result |
 |---|---|
@@ -7417,7 +7419,7 @@ $ echo $?
 Reverted byte-for-byte (`diff -q` clean; `src/optiming.rs` sha256
 `4f20689df7ea803ea703c96893725fd3914d7d9c2a911e4f864e9d92b9409d3f` both sides).
 
-**Counts (rule 5).** All on this box (20-core aarch64), `cargo test --release`:
+**Counts (rule 5).** All on dgxspark (20-core aarch64), `cargo test --release`:
 
 | Run | Unit | Integration |
 |---|---|---|
@@ -7696,7 +7698,7 @@ of scope by the ticket) and #154's batch ratio.
 
 **Verification (rule 5 numbers).** All GB10 sm_121, 2026-09-27.
 `bash scripts/cuda_test.sh` → **545 / 0 / 39** (was 544 / 0 / 38; +1 the probe, +1 the concurrent gate,
-which is `#[ignore]`d). `cargo test --release` (CPU, this box) → **465 / 0 / 33** unit + **10 / 0 / 6**
+which is `#[ignore]`d). `cargo test --release` (CPU, dgxspark) → **465 / 0 / 33** unit + **10 / 0 / 6**
 integration, unchanged — the renamed `device_entry` test keeps the count.
 `compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` →
 **0 API errors** over the same 545 / 0 / 39. The real-model device set
@@ -7750,7 +7752,7 @@ Five of the nine matched pairs were above the bar — exactly the count a median
 | `scripts/cuda_test.sh` | **546 / 0 / 39** (was 545 / 0 / 39; +1 the pure statistic test) |
 | `FEATURES=cuda scripts/real_model_gates.sh` (0.5B, then Qwen3-0.6B) | **39 / 0** and **39 / 0** |
 | `compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` | **0 API errors** over 546 / 0 / 39 |
-| `cargo test --release` (CPU, this box) | **465 / 0 / 33** unit + **10 / 0 / 6** integration, unchanged |
+| `cargo test --release` (CPU, dgxspark) | **465 / 0 / 33** unit + **10 / 0 / 6** integration, unchanged |
 | `python3 scripts/check_status.py --check` | exit 0 |
 
 **Before/after on the parallel configuration.** The #188 record's post-fix state had 2 of 6 parallel `#[ignore]`d runs with one failure each — this gate once and `server_batch_matches_serial_and_is_faster` (#154) once. With this ticket's statistic the same configuration is **6 / 6 green** (39 / 0 each). Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so the six runs prove the gate is not decided by the co-tenant, while the recorded distribution (5 of 9 above the bar, median 1.398x) is replayed by the new pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression`, which asserts the sign test passes it **and** that the old median of the same ratios is red.

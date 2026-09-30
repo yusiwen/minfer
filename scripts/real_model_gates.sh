@@ -21,7 +21,7 @@
 # in parallel against **1.50x** for the same binary serially. #154 replaced that with
 # interleaved matched rounds and the **median of the per-round `serial/batched`
 # ratios** (the shape #123 gave the CUDA map-window gate); the correctness comparison
-# stays a separate full-length pair. Measured on this box 2026-09-25 (CPU): serial
+# stays a separate full-length pair. Measured on dgxspark 2026-09-25 (CPU): serial
 # **29 passed / 0 failed**; parallel **29 passed / 0 failed** in every run (3 plain
 # harness runs plus 1 under 16 extra CPU spinners), the #154 gate's median
 # 1.379-1.468x plain and 2.159x under the extra load.

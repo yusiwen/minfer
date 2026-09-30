@@ -1496,7 +1496,7 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
 /// produced by llama.cpp, and the 1-D rule on both sides is "norms/biases
 /// stay f32".
 ///
-/// **Reference provenance.** There is no torch/transformers on this box, so
+/// **Reference provenance.** There is no torch/transformers on dgxspark, so
 /// this uses Source B of #142's plan rather than
 /// `convert_hf_to_gguf.py --outtype bf16` — but the cast's *input* is the
 /// **f32** conversion, not the f16 one:

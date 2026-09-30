@@ -106,6 +106,12 @@ file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
 
 # --- suite counts, per box --------------------------------------------------
+# `box` is the *absolute* name of the machine a row was measured on, never a
+# relative `this box` / `local`: an agent reading the record may be on another
+# machine (gate contract rule 5). The convention:
+#   `dgxspark (aarch64, GB10 sm_121)` — the maintainer's DGX Spark; one physical
+#       machine, so the CPU and the CUDA rows share the label.
+#   `x86_64 (CI runner)` — GitHub's runner; CPU-only, no GPU and no aarch64.
 # The box is part of the identity: `quants::neon_correctness` is
 # `cfg(all(test, target_arch = "aarch64"))`, so the aarch64 box reports two more
 # unit tests than the x86_64 CI runner. Only `x86_64 (CI runner)` is compared
@@ -113,7 +119,7 @@ regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]
 
 [[counts]]
 key = "cpu-unit"
-box = "aarch64 (this box)"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-09-27"
@@ -147,7 +153,7 @@ regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{
 
 [[counts]]
 key = "cpu-real-model"
-box = "aarch64 (this box)"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh and the parallel form"
 date = "2026-09-27"
@@ -160,7 +166,7 @@ regex = 'CPU real-model set, box `(?P<box>[^`]+)`, `PARALLEL=0 scripts/real_mode
 
 [[counts]]
 key = "cuda-unit"
-box = "GB10 sm_121"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "scripts/cuda_test.sh"
 date = "2026-09-29"
@@ -176,7 +182,7 @@ ignored = 42
 # relation is inexact -- the device-gated tests move independently -- which is why
 # it is a hint, not a comparison.
 projection_key = "cpu-unit"
-projection_box = "aarch64 (this box)"
+projection_box = "dgxspark (aarch64, GB10 sm_121)"
 projection_base_passed = 481
 live_check = false
 note = "recorded measurement; CI has no GPU"
@@ -185,14 +191,14 @@ regex = 'CUDA unit, box `(?P<box>[^`]+)`, `scripts/cuda_test\.sh`, (?P<date>[0-9
 
 [[counts]]
 key = "cuda-real-model-0.5b"
-box = "GB10 sm_121"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-09-27"
 passed = 42
 failed = 0
 projection_key = "cpu-real-model"
-projection_box = "aarch64 (this box)"
+projection_box = "dgxspark (aarch64, GB10 sm_121)"
 projection_base_passed = 36
 live_check = false
 note = "recorded measurement; CI has no GPU"
@@ -201,14 +207,14 @@ regex = 'CUDA real-model set \(0\.5B config\), box `(?P<box>[^`]+)`, `FEATURES=c
 
 [[counts]]
 key = "cuda-real-model-qwen3-0.6b"
-box = "GB10 sm_121"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-09-27"
 passed = 42
 failed = 0
 projection_key = "cpu-real-model"
-projection_box = "aarch64 (this box)"
+projection_box = "dgxspark (aarch64, GB10 sm_121)"
 projection_base_passed = 36
 live_check = false
 note = "recorded measurement; CI has no GPU"
@@ -217,7 +223,7 @@ regex = 'CUDA real-model set \(Qwen3-0\.6B config\), box `(?P<box>[^`]+)`, `FEAT
 
 [[counts]]
 key = "cuda-sanitizer"
-box = "GB10 sm_121"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "sanitizer"
 command = "compute-sanitizer --tool memcheck over scripts/cuda_test.sh"
 date = "2026-09-29"
@@ -227,7 +233,7 @@ ignored = 42
 api_errors = 0
 # Same #207 projection as the CUDA unit row: the sanitizer run is that same suite.
 projection_key = "cpu-unit"
-projection_box = "aarch64 (this box)"
+projection_box = "dgxspark (aarch64, GB10 sm_121)"
 projection_base_passed = 481
 live_check = false
 note = "recorded measurement; CI has no GPU"

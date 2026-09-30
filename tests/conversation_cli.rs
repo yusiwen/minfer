@@ -28,7 +28,7 @@ fn model_path() -> Option<String> {
 /// A child process exposes no in-process progress counter, so the only thing the
 /// parent can observe is whether it exited; the `#[ignore]`d real-model sessions
 /// pass a generous **1800s** (10-100x the legitimate scalar-CPU runtime of the
-/// cached 0.5B on this box) precisely so machine load cannot flip the verdict,
+/// cached 0.5B on dgxspark) precisely so machine load cannot flip the verdict,
 /// while the no-model cases pass 30s. `MINFER_CLI_WATCHDOG_SECS` overrides the
 /// ceiling for a bisect or a deliberate hang investigation
 /// (`MINFER_CLI_WATCHDOG_SECS=5 cargo test --test conversation_cli -- --ignored`);

@@ -67,7 +67,7 @@ directly: warps wait on smem loads for the staged quantized-weight/activation ti
 
 ## 5. Tooling notes
 
-- `ncu` requires GPU performance-counter permission: **runs under `sudo` on this box**
+- `ncu` requires GPU performance-counter permission: **runs under `sudo` on dgxspark**
   (`ERR_NVGPUCTRPERM` otherwise) — doc 90's "counter permissions" open lead is resolved for
   interactive profiling.
 - `ncu --kernel-name` matches the *full* demangled name; use

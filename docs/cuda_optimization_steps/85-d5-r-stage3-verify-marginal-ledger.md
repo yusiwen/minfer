@@ -38,7 +38,7 @@ from doc 81).
 
 `ncu` (Nsight Compute) was attempted for SM/memory-utilization counters and
 blocked by `ERR_NVGPUCTRPERM` (performance-counter permission is an admin
-modprobe setting on this box). All numbers below are nsys kernel durations;
+modprobe setting on dgxspark). All numbers below are nsys kernel durations;
 utilization-level attribution is deferred until counter access exists.
 
 ### 3.2 The ledger — one decode/verify forward, 14B q4_k_m (ms)

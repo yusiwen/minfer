@@ -79,7 +79,7 @@ Speculative (7B Q8_0 + 0.5B Q4_K_M draft, adaptive, −n 200 e2e):
 | **Q8_0** | **MMVQ + multi + p32 planes (this doc)** | **~1.00× — parity** (0.87× → 0.94× → 1.00×) |
 
 Both legacy quants now sit at or above llama.cpp's decode, and both engines
-are bounded by the same DRAM ceiling (~253–266 GB/s streaming on this box) —
+are bounded by the same DRAM ceiling (~253–266 GB/s streaming on dgxspark) —
 further decode gains for ANY quant require raising the streaming ceiling
 itself, not better kernels. The prefill gap (0.21–0.24×) remains the open
 front for these types.

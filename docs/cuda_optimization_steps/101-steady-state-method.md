@@ -54,6 +54,6 @@ needed the budget — its ±25 tok/s spread collapsed to ±7.
 
 ## 4. Rule
 
-Every kernel- or e2e-level claim on this box: steady-state warmup +
+Every kernel- or e2e-level claim on dgxspark: steady-state warmup +
 interleaved A/B when comparing builds. Sequential before/after runs are
 invalid instruments (doc 100 §4, now executable via the warmup budgets).

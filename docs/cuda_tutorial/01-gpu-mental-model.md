@@ -174,7 +174,7 @@ a few milliseconds; they spin on an atomic generation counter to wake in
 microseconds; the work unit is a *chunk of output rows*
 (`chunk(parts, idx, total)`, `src/kernel.rs:255`); and correctness rests on
 "each row belongs to exactly one worker", so the result is bit-identical at any
-thread count. Around 20 workers exist on this machine — one per core, because
+thread count. Around 20 workers exist on dgxspark — one per core, because
 on the CPU, parallelism is expensive and scarce.
 
 The GPU inverts nearly every line of that design:

@@ -24,7 +24,7 @@ plan ([`SPECULATIVE-DECODING-PLAN.md`](../SPECULATIVE-DECODING-PLAN.md)) made
 D5-0 the go/no-go gate: measure the cost model before building any engine
 plumbing. Three questions had to be answered with numbers, not priors:
 
-1. what does the draft model actually cost per token on this machine (same-GPU
+1. what does the draft model actually cost per token on dgxspark (same-GPU
    and cross-device)?
 2. what acceptance rate does a real 0.5B-on-7B same-family pair sustain?
 3. what does the target's verify batch have to cost for the round to win?

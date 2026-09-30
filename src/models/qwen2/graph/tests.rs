@@ -2496,7 +2496,7 @@ fn sequence_count_is_data_not_topology() {
 /// *different shapes* (a batched prefill against per-sequence prefills),
 /// which is bitwise only on CPU: CUDA's prefill kernels tile by `nt` and
 /// store quantized activations, so a different shape changes the K/V values
-/// by ~1e-3 relative — measured on this box as ~0.3 absolute on logits, and
+/// by ~1e-3 relative — measured on dgxspark as ~0.3 absolute on logits, and
 /// already true on master for B2's and C2's cross-shape tests. A swap keeps
 /// the shape, the layout, the KV history and the graph identical, leaving
 /// the window assignment as the only thing that can move the numbers, so

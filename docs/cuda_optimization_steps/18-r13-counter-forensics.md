@@ -162,7 +162,7 @@ staging, qb8 row pitch 256→272 B, float2 C stores), with numbers in §5.
 
 ### 3.3 Pitfalls
 
-1. **ncu's launch form**. The invocation that finally worked on this machine is `sudo -n env
+1. **ncu's launch form**. The invocation that finally worked on dgxspark is `sudo -n env
    LD_LIBRARY_PATH=... ncu ...` — sudo strips the user environment, and the CUDA toolchain's
    shared-library paths must be carried through explicitly with `env`, or ncu's injection
    fails.
