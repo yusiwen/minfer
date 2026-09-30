@@ -111,8 +111,14 @@ jobs:
       - name: The x86_64 suite counts must match this run
         run: python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
 
-  # The container tag carries the CUDA toolkit; bump it together with the
-  # toolkits build.rs is known to support (12.x and 13.x today).
+  # The container tag carries both the CUDA toolkit and the base image, and the
+  # base is the compile-time glibc/gcc floor. Keep the toolkit at a version
+  # build.rs is known to support (12.x and 13.x today) and keep the base at
+  # ubuntu24.04: the x64 *release* job runs in this exact image
+  # (`.github/workflows/release-build.yml` `linux-x64-cuda`), so a base mismatch
+  # here means CI compiles on a glibc/gcc pair no artifact is ever built on. It
+  # used to be `devel-ubuntu22.04` — glibc 2.35 / gcc 11 — against the artifact's
+  # 2.39 / gcc 13. Bump the two files together.
   #
   # `cargo test --no-run` matters as much as the build: the `#[cfg(test)]`
   # modules in cuda_backend.rs are only compiled when tests are compiled, so
@@ -121,7 +127,7 @@ jobs:
   build-linux-cuda:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
-    container: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    container: nvidia/cuda:12.8.0-devel-ubuntu24.04
     steps:
       - uses: actions/checkout@v5
       # The CUDA devel images are minimal: no curl, so `dtolnay/rust-toolchain`

@@ -12,10 +12,14 @@
 #
 # Published targets:
 #   - macOS arm64 (Apple Silicon runner).
-#   - Linux x86_64 CUDA + statically-linked cudart — CUDA 12.8 (keeps Volta
-#     V100 sm_70/72 + up to sm_120), glibc 2.39 floor (Ubuntu 24.04).
-#   - Linux arm64 CUDA + statically-linked cudart — CUDA 13 (the DGX Spark GB10
-#     is sm_121, which CUDA 12.8 cannot build), glibc 2.39 floor.
+#   - Linux x86_64 CUDA + statically-linked cudart — NVIDIA's CUDA 12.8 devel
+#     image on an Ubuntu 24.04 base (`nvidia/cuda:12.8.0-devel-ubuntu24.04`),
+#     the same image `ci.yml`'s `build-linux-cuda` compile check runs in. Keeps
+#     the Volta V100 sm_70/72 targets (CUDA 13 removed them) and reaches sm_120,
+#     on the image's glibc 2.39 floor.
+#   - Linux arm64 CUDA + statically-linked cudart — CUDA 13 from the apt sbsa
+#     repo on an ubuntu-24.04-arm runner (the DGX Spark GB10 is sm_121, which
+#     CUDA 12.8 cannot build), glibc 2.39 floor.
 #
 # The three jobs are independent and run in parallel. To add a target, add a job
 # here and nothing in the callers changes.
@@ -119,34 +123,52 @@ jobs:
             "minfer-${ASSET_TAG}-macos-arm64.tar.gz.sha256" \
             --clobber
 
-  # Linux x86_64, CUDA + statically-linked cudart. Builds in a plain ubuntu-24.04
-  # runner with the CUDA 12.8 toolkit installed via apt — the host needs a GPU
-  # only at RUNTIME, never to build. CUDA 12.8 is chosen deliberately: it is the
-  # last toolkit whose nvcc still accepts the Volta compute targets (sm_70/72,
-  # added to build.rs for V100/Titan-V) AND the first to reach Blackwell
-  # (sm_120/121, RTX 50); CUDA 13 removed Volta. The `cuda_static` feature links
-  # libcudart_static.a, so the artifact has no libcudart.so NEEDED dependency and
-  # only needs the NVIDIA driver at runtime.
+  # Linux x86_64, CUDA + statically-linked cudart. Runs in NVIDIA's CUDA 12.8
+  # devel image on an Ubuntu 24.04 base — deliberately the *same* image ci.yml's
+  # `build-linux-cuda` compile check uses, so a green check there is evidence
+  # about this artifact instead of about a different glibc/gcc/toolkit. The base
+  # in the tag is the artifact's glibc/gcc floor, so it must stay 24.04 (2.39 /
+  # gcc 13), matching the target OS.
+  #
+  # The toolkit is baked into the image, so unlike the arm64 job there is no
+  # `apt-get install cuda-toolkit-*` here: that install was this job's slowest
+  # and least stable step (measured 131–299 s across x64 runs) and it pinned no
+  # version the image does not already pin. What the image lacks and this job
+  # needs is `gh` for the upload (Ubuntu noble ships 2.45.0 — the same binary the
+  # runner-based jobs had), and the image ships no `git` at all, which is why the
+  # upload step sets `GH_REPO` (see the note there). The job is root, so there is
+  # no `sudo` to reach for. The host needs a GPU only at RUNTIME, never to build.
+  #
+  # CUDA 12.8 is chosen deliberately: it is the last toolkit whose nvcc still
+  # accepts the Volta compute targets (sm_70/72, added to build.rs for
+  # V100/Titan-V) AND the first to reach Blackwell (sm_120/121, RTX 50); CUDA 13
+  # removed Volta. The `cuda_static` feature links libcudart_static.a, so the
+  # artifact has no libcudart.so NEEDED dependency and only needs the NVIDIA
+  # driver at runtime.
   linux-x64-cuda:
     name: Build & upload (Linux x86_64 CUDA, static cudart)
-    runs-on: ubuntu-24.04 # x86_64; sets the glibc floor (2.39) for the artifact
+    runs-on: ubuntu-24.04 # x86_64; the container's base (24.04) sets the glibc floor (2.39)
+    container: nvidia/cuda:12.8.0-devel-ubuntu24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Install CUDA toolkit 12.8 (x86_64)
+      # The CUDA devel image is minimal: no curl (dtolnay/rust-toolchain
+      # bootstraps rustup with it), no host compiler (nvcc needs one, and build.rs
+      # probes for it), no git and no gh. `curl ca-certificates build-essential`
+      # is exactly the set ci.yml's CUDA job installs; `gh` is this job's extra.
+      # The version lines are the artifact's compile-time floor (base 24.04 →
+      # glibc 2.39 / gcc 13), printed so a log reader does not have to take the
+      # tag on trust.
+      - name: Install build prerequisites
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
-          # cuda-toolkit installs to /usr/local/cuda-12.8 and (usually) symlinks /usr/local/cuda
-          if [ ! -x /usr/local/cuda/bin/nvcc ] && [ -x /usr/local/cuda-12.8/bin/nvcc ]; then
-            sudo ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
-          fi
-          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential gh
+          gh --version
+          ldd --version | head -1
+          gcc --version | head -1
           /usr/local/cuda/bin/nvcc --version | tail -1
 
       - name: Install Rust (pinned 1.97.1)
@@ -168,6 +190,14 @@ jobs:
       # The default key includes the job id, so the three platform jobs never
       # share a cache, and the rust-environment hash (Cargo.lock etc.) is stable
       # across nights, so a nightly restores the same key instead of re-uploading.
+      #
+      # Running this job in a container changes that hash exactly once: the
+      # container's `CARGO_HOME` (`/github/home/.cargo`, set by
+      # `dtolnay/rust-toolchain`) is part of the environment rust-cache hashes, so
+      # the first container run misses the runner-era cache — measured on the
+      # probe run, key `…-60171389-a16f3a8b` against the runner's
+      # `…-7f7ca0a9-a16f3a8b`, "No cache found" — and pays one full dependency
+      # compile. Every container run after it hits the new key again.
       - uses: Swatinem/rust-cache@v2
 
       - name: Build (CUDA + static cudart)
@@ -199,9 +229,20 @@ jobs:
           sha256sum "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz" > "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz.sha256"
           ls -lh "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz"
 
+      # `GH_REPO` is not decoration: without it `gh` resolves the repository by
+      # shelling out to `git`, and this job has no git repository to find — the
+      # checkout step runs before any apt step, in an image that ships no `git`,
+      # so `actions/checkout` falls back to its REST-archive mode and leaves no
+      # `.git`. The two probe runs failed exactly here: the first with "unable to
+      # find git executable in PATH", the second — after `git` had been installed,
+      # which is too late for the checkout that already ran — with "failed to run
+      # git: fatal: not a git repository". With `GH_REPO` set, `gh release upload`
+      # does not touch git at all (verified locally with the same gh 2.45.0 in a
+      # non-git directory: exit 0, and the asset is listed on the release).
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           ASSET_TAG: ${{ inputs.asset_tag }}
         run: |
