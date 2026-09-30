@@ -64,7 +64,7 @@ distribution separation** (min-new > max-base); the whole-prefill landing bar is
 +1.5% (relative to the re-measured baseline, calibrated at r24).
 
 The alternating order is the key design: the GPU is shared (sglang is co-tenanted
-on this machine); running one side back-to-back disguises window drift as a trend.
+on dgxspark); running one side back-to-back disguises window drift as a trend.
 Paired medians cancel the co-tenant noise.
 
 ### 2.4 Gate 4: the suite and co-tenant flakes

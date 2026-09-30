@@ -638,7 +638,7 @@ the stream vocabulary to read it.
 
 **Compiling toys by hand.** nvcc is NVIDIA's compiler driver — it runs the
 host C++ compiler on the host parts and its own `cicc`/`ptxas` on the device
-parts, then packs both into one object file. On this machine it is **not** on
+parts, then packs both into one object file. On dgxspark it is **not** on
 the default PATH; call it with the full path (this is CUDA **13.0**):
 
 ```console
@@ -656,7 +656,7 @@ GB10 (aarch64): `nvidia-smi --query-gpu=compute_cap` reports **12.1**, driver
 580.173.02 — so the flag used for every toy in this tutorial is
 **`-arch=sm_121`**, which CUDA 13.0 accepts (verify with
 `nvcc --list-gpu-arch`). `-arch=native` (ask the installed driver) also works
-on this machine and compiles both toys identically — either is fine; the toys
+on dgxspark and compiles both toys identically — either is fine; the toys
 pin `sm_121` so the command is reproducible on paper. A binary built for a
 *newer* arch than your GPU will not load (no SASS match); one built for an
 *older* arch only runs if the binary embedded PTX (the intermediate assembly

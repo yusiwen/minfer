@@ -3,7 +3,7 @@
 **Status**: ⚫ measured null, reverted (2026-09-15). The last priced lever
 (32-B-aligned weight reads, doc 99 §4's ~7–10%) was implemented in full and
 measured **timing-NULL under a controlled interleaved A/B**. The experiment
-surfaced something more important: this box's short kernel benchmarks carry a
+surfaced something more important: dgxspark's short kernel benchmarks carry a
 **±7–12% clock-ramp noise band** (SM idle 208 MHz → max 3003 MHz; runs never
 reach steady state), which is large enough to have contaminated several
 sequential comparisons across docs 92–99. Only interleaved same-state A/B
@@ -54,7 +54,7 @@ movement), gated by `MINFER_BT_QS_PLANE=1`, passed to the BT kernel as a new
 
 ## 4. Method rule going forward
 
-Every kernel-level claim on this box must come from an **interleaved A/B**
+Every kernel-level claim on dgxspark must come from an **interleaved A/B**
 (build A, run A, build B, run B, repeat ×2) or a long warmup to steady
 clocks. Sequential before/after runs are only good for order-of-magnitude
 signals. This rule is the campaign's real deliverable from this phase — the

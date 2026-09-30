@@ -936,7 +936,7 @@ Suite baselines in the campaign records: the Phase-7e entries say "144/0 (CUDA p
 tree is 145 passed / 0 failed / 3 ignored. Run `cargo test --release` for the plain suite and
 `cargo test --release --features cuda` on a device.
 
-### 7.2a Profiling on this box (`ncu` / `nsys`)
+### 7.2a Profiling on dgxspark (`ncu` / `nsys`)
 
 The reusable recipe, so the next session does not re-derive it (recorded 2026-09-27, GB10 sm_121,
 CUDA 13.0, driver 580.178.04):
@@ -945,7 +945,7 @@ CUDA 13.0, driver 580.178.04):
   `/usr/local/cuda-13.0/bin/ncu` (2025.3.1). `which ncu` finding nothing means the directory is not
   on `PATH`, not that the tool is missing — use the absolute path.
 - **A normal user cannot collect counters here** — `RmProfilingAdminOnly: 1` makes `ncu` fail with
-  `ERR_NVGPUCTRPERM`. **`sudo` collects** (passwordless on this box); no module parameter change and
+  `ERR_NVGPUCTRPERM`. **`sudo` collects** (passwordless on dgxspark); no module parameter change and
   no driver reload is needed. Record "collected as root; module parameter unchanged".
 - **`sudo` changes `HOME` to `/root`,** so the model cache under `/home/yusiwen/.cache/minfer/models`
   is invisible to a `sudo`-launched binary. Pass absolute model paths
@@ -1241,7 +1241,7 @@ read runs; the device gate compares **sets** of site tokens, so where two source
 the audit, not the gate, guarantees each source site has its own read. The parser resolves a site
 variable only through a plain `=` in the enclosing function, so `launch_gemm_f16`'s `launch_site`
 ternary resolves to its first arm (`launch:gemm_f16_a32`), which is what the driver arms. The
-sanitizer count and the device limit (101376 B) are this box's; CI has no GPU, and its `check-docs`
+sanitizer count and the device limit (101376 B) are dgxspark's; CI has no GPU, and its `check-docs`
 job enforces only the source half.
 
 ### 7.10 Issue #189 verification — the S4 map-window A/B is a paired sign test with a value arm (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27)

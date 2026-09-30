@@ -705,7 +705,7 @@ fn server_batch_matches_serial_and_is_faster() {
     // `t_serial > t_batch`. That is not a property of the code: under the
     // parallel `--ignored` harness the first-measured phase absorbs the
     // start-up wave and the ratio can invert with nothing to absorb it.
-    // Measured on this box (CPU build) at `e1ac17f`: parallel **21.20s batched
+    // Measured on dgxspark (CPU build) at `e1ac17f`: parallel **21.20s batched
     // vs 9.95s serial (0.47x)** — the only failure of the 29-gate set (28
     // passed / 1 failed) — while the same binary serially was **0.72s vs
     // 1.07s (1.50x)**.
@@ -1382,7 +1382,7 @@ fn a_long_prefill_keeps_another_slot_decoding() {
 ///    `queue_depth` is deliberately **not** peak-asserted: `serve_loop` calls
 ///    `admit` on every iteration whether or not it is busy, so a job is
 ///    placed or rejected within one loop pass and its non-zero window is
-///    shorter than a sampler's interval on this box. Its arithmetic and its
+///    shorter than a sampler's interval on dgxspark. Its arithmetic and its
 ///    saturation are gated purely in `server::metrics`, and the loop's *drain*
 ///    is gated here through `jobs_admitted_total`.
 /// 2. Two jobs on **one** slot, both queued before the loop starts: the
@@ -2247,7 +2247,7 @@ const FEEDER_POLL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs
 /// terminate, never one that is merely slow, and a false negative hangs the
 /// suite while a false positive is the flaky gate this ticket removes.
 ///
-/// Measured on this box (0.5B q4_0, GB10 host CPU, 2026-09-25): the warm
+/// Measured on dgxspark (0.5B q4_0, GB10 host CPU, 2026-09-25): the warm
 /// request (8-token prompt, `max_tokens = 4`) takes **4 steps** against a
 /// budget of **80**, and the long one (120-token prompt, `max_tokens = 64`)
 /// takes **64** against **768** — margins of 20x and 12x. The gates print both

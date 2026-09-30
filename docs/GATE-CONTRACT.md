@@ -225,9 +225,25 @@ making every number self-describing.
 
 **Apply it.** Write device and suite numbers as
 `<counts>, <device>, <command>, <date>` — for example
-`36 passed / 0 failed, GB10 sm_121, FEATURES=cuda scripts/real_model_gates.sh, 2026-09-25`.
+`36 passed / 0 failed, dgxspark (aarch64, GB10 sm_121), FEATURES=cuda scripts/real_model_gates.sh, 2026-09-25`.
 A number whose command you cannot name is not evidence; delete it rather than
 re-state it.
+
+**Name the box absolutely.** A record is read on machines other than the one that
+produced it — an agent on an x64 CUDA box reads `AGENTS.md` too — so `box` is the
+*machine's own* name, never a relative one: no `this box`, `my machine` or
+`local`. The labels in use today are `dgxspark (aarch64, GB10 sm_121)` (the
+maintainer's DGX Spark — one physical machine, so its CPU and CUDA rows share the
+label) and `x86_64 (CI runner)` (GitHub's runner). A newly used machine gets its
+**own** label — its hostname, or another equally stable id, plus the arch/device
+that matters for the counts — and its own `[[counts]]` rows; a suffix or a
+re-used label would make two machines' numbers indistinguishable. The label is
+part of the machine-checked identity: it is the `box` field in
+[`docs/status.toml`](./status.toml) and the `--box` argument of
+`scripts/check_status.py --check-live`, so a rename must move both the manifest
+and the prose in the same commit. A box whose name has no manifest row fails
+`--check-live` loudly, which is deliberate: a fabricated box must not pass
+vacuously.
 
 ## Writing the next gate — checklist
 

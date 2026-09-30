@@ -416,7 +416,7 @@ cannot recover the 123 024 subnormal values that the f16 conversion already
 rounded, so 126 575 bytes across all 169 2-D tensors differ (measured
 2026-09-27, per-tensor byte diff). That is the reference's input, not minfer's
 writer — which is exactly what the f32-source reference isolates. The writer has
-no torch/transformers converter to check against on this box
+no torch/transformers converter to check against on dgxspark
 (`convert_hf_to_gguf.py --outtype bf16` needs torch); the f32-source cast is the
 strongest available reference, and the missing direct converter reference is
 [#209](https://github.com/yusiwen/minfer/issues/209).

@@ -45,7 +45,7 @@ This chapter is the *get-started*. Three deeper documents do the heavy lifting:
 ## 2. Principle — profiling: how to see a kernel before you touch it
 
 You cannot optimize what you cannot see. Two tools ship with CUDA and both are
-installed on this machine (GB10, CUDA 13.0). They answer different questions:
+installed on dgxspark (GB10, CUDA 13.0). They answer different questions:
 
 - **`ncu`** (Nsight Compute, `/usr/local/cuda-13.0/bin/ncu` — not on every
   shell's PATH) profiles *one kernel launch in depth*: throughput percentages,
@@ -153,7 +153,7 @@ per-kernel table — total time, instance count, min/med/max per kernel — whic
 is where launch-count claims come from. **Read**: sort by total time and the
 top rows *are* your optimization priority list.
 
-Observed on this machine (same 0.6B model, `nsys stats
+Observed on dgxspark (same 0.6B model, `nsys stats
 --report cuda_gpu_kern_sum`, top rows quoted as printed):
 
 ```text

@@ -877,7 +877,7 @@ fn worker_loop_serial(
         // have written part of a row, and claiming otherwise is the one way this
         // could silently go wrong. The fused GPU stores (FusedQKV /
         // FusedQkvNorm / QkvBiasRopeStore) write K/V in-kernel and are
-        // unverified on this box (A0: CUDA compile-only, Metal not built), so
+        // unverified on dgxspark (A0: CUDA compile-only, Metal not built), so
         // the reuse gate stays conservative.
         //
         // Panic isolation for the WHOLE job, not just the forward call.

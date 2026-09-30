@@ -291,7 +291,7 @@ GGUF prints the loader's *"weights are not usable there — running on CPU"* lin
 path (which is now vectorized and pooled). This is deliberate. Registering a weight type a kernel
 cannot consume would make the device claim true while the op silently ran the wrong (or no) kernel
 — exactly what the registration gate exists to prevent — and a Metal f16 matmul/embed kernel cannot
-be verified from this box (no Mac; CI's `build-macos` job compiles the crate, nothing runs it). The
+be verified from dgxspark (no Mac; CI's `build-macos` job compiles the crate, nothing runs it). The
 follow-up is [#164](https://github.com/yusiwen/minfer/issues/164); until it lands, `f16` is on the
 CUDA side of the weight matrix and off Metal's, per `docs/SUPPORT-MATRIX.md`.
 

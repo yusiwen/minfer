@@ -2051,7 +2051,7 @@ fn cuda_capture_staging_order_and_fallback() {
 /// E1b: the CUDA windowed instantiations must give each sequence its own
 /// window, matching `cpu_backend`'s `two_sequences_do_not_cross_attend`.
 /// Device-gated — CI has no GPU, so it compiles there and runs where one
-/// exists (on this box it passes on GB10/sm_121; the original `hd = 2`
+/// exists (on dgxspark it passes on GB10/sm_121; the original `hd = 2`
 /// fixture could not have, see the E1b record).
 #[test]
 fn cuda_two_sequences_do_not_cross_attend() {
@@ -2070,7 +2070,7 @@ fn cuda_two_sequences_do_not_cross_attend() {
     // hd must be a multiple of 4: the CUDA attention kernels reject anything
     // else (`attention head dim ... outside the kernel's supported range`),
     // so the original hd = 2 fixture could never execute on a device — the
-    // test compiled and skipped everywhere until this box got a working GPU.
+    // test compiled and skipped everywhere until dgxspark got a working GPU.
     let (nh, nk, hd, nt, n_ctx) = (1usize, 1usize, 4usize, 2usize, 4usize);
     let nkt = nk * hd;
     let mut gb = GraphBuilder::new();

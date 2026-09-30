@@ -259,7 +259,7 @@ Calibration results freeze into a per-process `CalibTable` (`OnceLock` in
 | 9 | smem feasibility query | smpbo ≥ 48 KB gate + J-search filter (live) | externs written, never consumed | gap → T2 |
 
 **Verdict**: the two directly comparable values (batch bound, nt=1 threads)
-agree exactly on this machine; the only true data disagreement is #4.
+agree exactly on dgxspark; the only true data disagreement is #4.
 
 ## 9. Divergence rulings
 

@@ -45,7 +45,7 @@ real. The ``§11`` sequencing diagram's per-ticket check marks are deliberately
 Usage::
 
     python3 scripts/check_status.py --check
-    python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box x86_64-ci
+    python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
     python3 scripts/check_status.py --selftest
 
 Pure and offline: stdlib only (``tomllib``), no network. ``git`` is invoked only
@@ -408,7 +408,7 @@ __REFRESH__` (2026-09-02); it is refreshed with every PR.
 
 FIXTURE_AGENTS = r"""# Fixture agents
 
-  - CPU unit, box `aarch64 (this box)`, `cargo test --release`, 2026-09-01: **457 passed / 0 failed / 3 ignored** unit + **10 / 0 / 6** integration.
+  - CPU unit, box `dgxspark (aarch64, GB10 sm_121)`, `cargo test --release`, 2026-09-01: **457 passed / 0 failed / 3 ignored** unit + **10 / 0 / 6** integration.
   - CPU unit, box `x86_64 (CI runner)`, `cargo test --release`, 2026-09-01: **455 passed / 0 failed / 3 ignored** unit + **10 / 0 / 6** integration.
 """
 
@@ -455,7 +455,7 @@ regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]
 
 [[counts]]
 key = "cpu-unit"
-box = "aarch64 (this box)"
+box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-09-01"
