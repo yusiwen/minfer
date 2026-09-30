@@ -1,0 +1,300 @@
+# Reusable build body for the two publishers — this file is never triggered on
+# its own.
+#
+# Callers:
+#   - `.github/workflows/release.yml`  — a `v*` tag push (the real release)
+#   - `.github/workflows/nightly.yml`  — the nightly rolling pre-release
+#
+# Both create the GitHub Release *first* and then call this workflow, whose three
+# per-platform jobs build, smoke-test, package and `gh release upload --clobber`
+# their tarball into it. The upload is the only publish step here; the release
+# itself (title, notes, prerelease flag, tag) is the caller's business.
+#
+# Published targets:
+#   - macOS arm64 (Apple Silicon runner).
+#   - Linux x86_64 CUDA + statically-linked cudart — CUDA 12.8 (keeps Volta
+#     V100 sm_70/72 + up to sm_120), glibc 2.39 floor (Ubuntu 24.04).
+#   - Linux arm64 CUDA + statically-linked cudart — CUDA 13 (the DGX Spark GB10
+#     is sm_121, which CUDA 12.8 cannot build), glibc 2.39 floor.
+#
+# The three jobs are independent and run in parallel. To add a target, add a job
+# here and nothing in the callers changes.
+#
+# Inputs:
+#   ref         — the commit to build (the caller's `github.sha`, or the nightly's
+#                 resolved commit). Passed explicitly so the build is pinned to
+#                 one commit rather than to whatever the caller's default is.
+#   version     — the `MINFER_VERSION` string compiled into the binary; the
+#                 `--version` smoke test asserts the binary prints exactly this.
+#   release_tag — the already-existing release to upload the assets into.
+#   asset_tag   — the tag used in the tarball file names. It differs from
+#                 `release_tag` for the nightly: the release is always tagged
+#                 `nightly` (so the download URL is stable), while the assets are
+#                 named `minfer-nightly-*`.
+
+name: Release build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        required: true
+        type: string
+      version:
+        description: MINFER_VERSION string baked into the binary
+        required: true
+        type: string
+      release_tag:
+        description: Existing release to upload the assets into
+        required: true
+        type: string
+      asset_tag:
+        description: Tag used in the tarball file names
+        required: true
+        type: string
+
+permissions:
+  contents: write # `gh release upload` into the release the caller created
+
+jobs:
+  macos-arm64:
+    name: Build & upload (macOS arm64)
+    runs-on: macos-14 # Apple Silicon (arm64) GitHub-hosted runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust (pinned 1.97.1)
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      # Cache `~/.cargo` + `target/`. What this removes is the from-scratch
+      # compile of the whole crates.io tree (tokio, axum, regex, …), which every
+      # run paid in full before this step existed.
+      #
+      # What it deliberately does NOT remove, so nobody expects it to:
+      # `rust-cache` persists dependency artifacts only — the workspace crate and
+      # its build-script output are cleaned before the cache is saved. Since
+      # `build.rs` also declares `cargo:rerun-if-env-changed=MINFER_VERSION` (the
+      # version string changes on every tag and every night), the build script
+      # re-runs and its `nvcc` compile + arch probes re-run with it, cache hit or
+      # not. Caching the kernel object would need a build.rs change (or a
+      # dedicated cache keyed on the `.cu` hash) and is a separate follow-up.
+      #
+      # The default key includes the job id, so the three platform jobs never
+      # share a cache, and the rust-environment hash (Cargo.lock etc.) is stable
+      # across nights, so a nightly restores the same key instead of re-uploading.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        env:
+          MINFER_VERSION: ${{ inputs.version }}
+        run: cargo build --release
+
+      - name: Smoke-test --version
+        run: |
+          ./target/release/minfer --version
+          test "$(./target/release/minfer --version)" = "minfer ${{ inputs.version }}"
+
+      - name: Package
+        env:
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          mkdir -p dist
+          cp target/release/minfer dist/minfer
+          tar -czf "minfer-${ASSET_TAG}-macos-arm64.tar.gz" -C dist minfer
+          shasum -a 256 "minfer-${ASSET_TAG}-macos-arm64.tar.gz" > "minfer-${ASSET_TAG}-macos-arm64.tar.gz.sha256"
+          ls -lh "minfer-${ASSET_TAG}-macos-arm64.tar.gz"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            "minfer-${ASSET_TAG}-macos-arm64.tar.gz" \
+            "minfer-${ASSET_TAG}-macos-arm64.tar.gz.sha256" \
+            --clobber
+
+  # Linux x86_64, CUDA + statically-linked cudart. Builds in a plain ubuntu-24.04
+  # runner with the CUDA 12.8 toolkit installed via apt — the host needs a GPU
+  # only at RUNTIME, never to build. CUDA 12.8 is chosen deliberately: it is the
+  # last toolkit whose nvcc still accepts the Volta compute targets (sm_70/72,
+  # added to build.rs for V100/Titan-V) AND the first to reach Blackwell
+  # (sm_120/121, RTX 50); CUDA 13 removed Volta. The `cuda_static` feature links
+  # libcudart_static.a, so the artifact has no libcudart.so NEEDED dependency and
+  # only needs the NVIDIA driver at runtime.
+  linux-x64-cuda:
+    name: Build & upload (Linux x86_64 CUDA, static cudart)
+    runs-on: ubuntu-24.04 # x86_64; sets the glibc floor (2.39) for the artifact
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install CUDA toolkit 12.8 (x86_64)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
+          # cuda-toolkit installs to /usr/local/cuda-12.8 and (usually) symlinks /usr/local/cuda
+          if [ ! -x /usr/local/cuda/bin/nvcc ] && [ -x /usr/local/cuda-12.8/bin/nvcc ]; then
+            sudo ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
+          fi
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          /usr/local/cuda/bin/nvcc --version | tail -1
+
+      - name: Install Rust (pinned 1.97.1)
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      # Cache `~/.cargo` + `target/`. What this removes is the from-scratch
+      # compile of the whole crates.io tree (tokio, axum, regex, …), which every
+      # run paid in full before this step existed.
+      #
+      # What it deliberately does NOT remove, so nobody expects it to:
+      # `rust-cache` persists dependency artifacts only — the workspace crate and
+      # its build-script output are cleaned before the cache is saved. Since
+      # `build.rs` also declares `cargo:rerun-if-env-changed=MINFER_VERSION` (the
+      # version string changes on every tag and every night), the build script
+      # re-runs and its `nvcc` compile + arch probes re-run with it, cache hit or
+      # not. Caching the kernel object would need a build.rs change (or a
+      # dedicated cache keyed on the `.cu` hash) and is a separate follow-up.
+      #
+      # The default key includes the job id, so the three platform jobs never
+      # share a cache, and the rust-environment hash (Cargo.lock etc.) is stable
+      # across nights, so a nightly restores the same key instead of re-uploading.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (CUDA + static cudart)
+        env:
+          MINFER_VERSION: ${{ inputs.version }}
+          CUDA_HOME: /usr/local/cuda
+        run: cargo build --release --features cuda,cuda_static
+
+      - name: Verify static cudart (no libcudart.so NEEDED)
+        run: |
+          if readelf -d target/release/minfer | grep -qi cudart; then
+            echo "::error::binary still NEEDED libcudart.so — cudart is not static"
+            exit 1
+          fi
+          echo "OK: no libcudart.so dependency"
+
+      - name: Smoke-test --version
+        run: |
+          ./target/release/minfer --version
+          test "$(./target/release/minfer --version)" = "minfer ${{ inputs.version }}"
+
+      - name: Package
+        env:
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          mkdir -p dist
+          cp target/release/minfer dist/minfer
+          tar -czf "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz" -C dist minfer
+          sha256sum "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz" > "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz.sha256"
+          ls -lh "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz" \
+            "minfer-${ASSET_TAG}-linux-x64-cuda.tar.gz.sha256" \
+            --clobber
+
+  # Linux arm64 (aarch64), CUDA + statically-linked cudart. Targets the NVIDIA
+  # DGX Spark (GB10, sm_121), which is aarch64 with an ARM GPU. Built on an
+  # arm64 GitHub runner with CUDA 13 — sm_121 (GB10) was REMOVED from CUDA 12.x
+  # (only sm_120 is reachable there) so 13 is required for native Spark SASS.
+  # The Spark's OS is Ubuntu 24.04 (glibc 2.39), hence the ubuntu-24.04-arm
+  # runner for a matching glibc floor.
+  linux-arm64-cuda:
+    name: Build & upload (Linux arm64 CUDA, static cudart)
+    runs-on: ubuntu-24.04-arm # aarch64; glibc 2.39 (matches the DGX Spark)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install CUDA toolkit 13 (aarch64/sbsa)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-0
+          # cuda-toolkit installs to /usr/local/cuda-13.0 and (usually) symlinks /usr/local/cuda
+          if [ ! -x /usr/local/cuda/bin/nvcc ] && [ -x /usr/local/cuda-13.0/bin/nvcc ]; then
+            sudo ln -sfn /usr/local/cuda-13.0 /usr/local/cuda
+          fi
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          /usr/local/cuda/bin/nvcc --version | tail -1
+
+      - name: Install Rust (pinned 1.97.1)
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      # Cache `~/.cargo` + `target/`. What this removes is the from-scratch
+      # compile of the whole crates.io tree (tokio, axum, regex, …), which every
+      # run paid in full before this step existed.
+      #
+      # What it deliberately does NOT remove, so nobody expects it to:
+      # `rust-cache` persists dependency artifacts only — the workspace crate and
+      # its build-script output are cleaned before the cache is saved. Since
+      # `build.rs` also declares `cargo:rerun-if-env-changed=MINFER_VERSION` (the
+      # version string changes on every tag and every night), the build script
+      # re-runs and its `nvcc` compile + arch probes re-run with it, cache hit or
+      # not. Caching the kernel object would need a build.rs change (or a
+      # dedicated cache keyed on the `.cu` hash) and is a separate follow-up.
+      #
+      # The default key includes the job id, so the three platform jobs never
+      # share a cache, and the rust-environment hash (Cargo.lock etc.) is stable
+      # across nights, so a nightly restores the same key instead of re-uploading.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (CUDA + static cudart)
+        env:
+          MINFER_VERSION: ${{ inputs.version }}
+          CUDA_HOME: /usr/local/cuda
+        run: cargo build --release --features cuda,cuda_static
+
+      - name: Verify static cudart (no libcudart.so NEEDED)
+        run: |
+          if readelf -d target/release/minfer | grep -qi cudart; then
+            echo "::error::binary still NEEDED libcudart.so — cudart is not static"
+            exit 1
+          fi
+          echo "OK: no libcudart.so dependency"
+
+      - name: Smoke-test --version
+        run: |
+          ./target/release/minfer --version
+          test "$(./target/release/minfer --version)" = "minfer ${{ inputs.version }}"
+
+      - name: Package
+        env:
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          mkdir -p dist
+          cp target/release/minfer dist/minfer
+          tar -czf "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz" -C dist minfer
+          sha256sum "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz" > "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz.sha256"
+          ls -lh "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_TAG: ${{ inputs.asset_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz" \
+            "minfer-${ASSET_TAG}-linux-arm64-cuda.tar.gz.sha256" \
+            --clobber
