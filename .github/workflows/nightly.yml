@@ -1,0 +1,192 @@
+# Nightly build — a rolling pre-release of the default branch.
+#
+# Triggered by the schedule below (UTC; GitHub cron never runs in any other zone)
+# and by `workflow_dispatch`, so a failed night can be re-run by hand.
+#
+# What it publishes: one GitHub pre-release tagged `nightly`, rebuilt from
+# scratch every night. The release is deleted and re-created at the new commit,
+# so the tag always names the build's commit and the download URLs stay stable:
+#
+#   https://github.com/<owner>/<repo>/releases/download/nightly/minfer-nightly-<target>.tar.gz
+#
+# `--prerelease` keeps it out of the "Latest release" slot, which must point at a
+# supported `v*` tag. The per-platform build/packaging is the same reusable
+# workflow the real release uses (`.github/workflows/release-build.yml`).
+#
+# Two deliberate properties:
+#   - A night whose commit was already built successfully by the previous
+#     scheduled run is a no-op: `prepare` reads the last *completed* run's
+#     conclusion for HEAD and skips the build, so an idle week costs nothing —
+#     while a night that failed (infrastructure, flaky CUDA apt) is retried, and
+#     a manual dispatch always builds.
+#   - `concurrency` keeps two nights from clobbering each other's release; the
+#     in-flight run is never cancelled, because cancelling mid-upload would leave
+#     a half-populated release behind.
+#
+# Caveat worth knowing: a nightly publishes *whatever is on the default branch*
+# at the time, including work-in-progress. That is the point of a nightly, but it
+# is not a supported version and the release notes say so.
+
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 Asia/Shanghai (19:00 UTC on the previous day). Change the hour here if
+    # a different local time is wanted — the rest of the workflow is time-agnostic.
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read # the no-op check reads the previous Nightly run's conclusion
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Version + no-op check
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      sha: ${{ steps.decide.outputs.sha }}
+      version: ${{ steps.version.outputs.value }}
+      date: ${{ steps.version.outputs.date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Tags so `git describe` can resolve the base `v*` tag, and the full
+          # history so the nightly's commit range is meaningful.
+          fetch-depth: 0
+
+      - name: Decide whether there is anything to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+          # Skip only when the last *completed* Nightly run succeeded on exactly
+          # this commit, and only for the scheduled trigger. Two consequences
+          # that matter: a night that failed for an infrastructure reason is
+          # retried on the next schedule instead of being considered done (the
+          # release exists even when a build job died), and a manual dispatch
+          # always builds, as the escape hatch for re-verifying a night by hand.
+          #
+          # The current run is `in_progress`, so `status=completed` can never
+          # return it. An API error or a workflow that has never run yields no
+          # match, which also means "build".
+          LAST=""
+          if [ "${EVENT}" = "schedule" ]; then
+            LAST="$(gh api "repos/${REPO}/actions/workflows/nightly.yml/runs?status=completed&per_page=1" \
+                    --jq '.workflow_runs[0] | "\(.head_sha) \(.conclusion)"' 2>/dev/null || echo "")"
+          fi
+
+          if [ "${LAST}" = "${SHA} success" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "The last completed Nightly run already succeeded on ${SHA:0:7} — nothing to build."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Will build ${SHA:0:7} (last completed run: ${LAST:-none})."
+          fi
+
+      - name: Compute version
+        id: version
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          # Base = the most recent reachable "v*" tag, so a nightly reads as
+          # "the next release, mid-flight": v0.0.8-nightly.20250929(6a558ca).
+          # build.rs takes the string verbatim; the smoke test asserts the binary
+          # prints exactly it.
+          BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo 'v0.0.0')"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          DATE="$(date -u +%Y%m%d)"
+          echo "value=${BASE}-nightly.${DATE}(${SHA})" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA}" >> "$GITHUB_OUTPUT"
+
+  create-release:
+    name: Recreate the rolling nightly release
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Recreate the nightly release at this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DATE: ${{ needs.prepare.outputs.date }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHORT="$(git rev-parse --short=7 HEAD)"
+
+          # Retarget the tag: a release's target commit cannot be edited, so the
+          # release (and its tag) is replaced. This is the only moment the stable
+          # URL is briefly absent, and it lasts seconds — the assets land
+          # afterwards, as each build job finishes.
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release delete nightly --yes --cleanup-tag
+          fi
+
+          # Commits landed since the base tag (the window a nightly reviewer
+          # cares about, regardless of when the previous nightly ran).
+          BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          if [ -n "${BASE}" ]; then
+            COMMITS="$(git log --format='- `%h` %s' --no-merges "${BASE}..HEAD")"
+          else
+            COMMITS="$(git log --format='- `%h` %s' --no-merges -n 30 HEAD)"
+          fi
+
+          {
+            # Provenance marker: a human reading the release can see the exact
+            # commit without trusting the tag, which moves every night.
+            echo "<!-- commit: ${SHA} -->"
+            echo "Automated nightly build of \`${BRANCH}\` (commit [\`${SHORT}\`](https://github.com/${REPO}/commit/${SHA}))."
+            echo ""
+            echo "- Version string: \`${VERSION}\`"
+            echo "- Built: ${DATE} (UTC)"
+            if [ -n "${BASE}" ]; then
+              echo "- Commits since \`${BASE}\`:"
+            fi
+            echo ""
+            echo "${COMMITS}"
+            echo ""
+            echo "> This is a rolling **pre-release** rebuilt every night from the"
+            echo "> default branch. It is not a supported version, and it carries"
+            echo "> whatever was merged at build time."
+          } > NIGHTLY-NOTES.md
+
+          gh release create nightly \
+            --target "${SHA}" \
+            --title "Nightly ${DATE} (${SHORT})" \
+            --prerelease \
+            --notes-file NIGHTLY-NOTES.md
+
+  build:
+    name: Build & upload
+    needs: [prepare, create-release]
+    if: needs.prepare.outputs.skip != 'true'
+    uses: ./.github/workflows/release-build.yml
+    permissions:
+      contents: write # the build jobs upload their assets into the nightly release
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      release_tag: nightly
+      asset_tag: nightly
