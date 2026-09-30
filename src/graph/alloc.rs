@@ -1821,12 +1821,23 @@ impl GraphAllocator {
     /// The cell position `pos` of sequence `seq` lives in, or `None` when no span of
     /// that sequence covers it (C8b S1).
     ///
-    /// The read-side twin of [`Self::kv_cells_for_seq`]: that one is the **store**
-    /// resolver and refuses a position inside a shared prefix (a write there would go
-    /// through to the donor), while this answers "where would a reader look?", which
-    /// is what a caller snapshotting a sharing sequence's rows needs.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
+    /// The pointwise read-side twin of [`Self::kv_cells_for_seq`]: that one is the
+    /// **store** resolver and refuses a position inside a shared prefix (a write there
+    /// would go through to the donor), while this answers "where would a reader
+    /// look?".
+    ///
+    /// **Test-only.** There is no production caller: production reads a sharing
+    /// sequence's rows as **windows**, not per position — `KvCache::attn_map` →
+    /// the `kv_map` input, gathered by the CPU and CUDA attention kernels (C8b
+    /// S2/S4) — and a whole-run snapshot goes through the C5 container
+    /// (`kv_save`/`kv_save_with_host`), which stores the **whole arena** and needs no
+    /// position→cell mapping. The consumer is `kv_rows_of` in `server::batch::tests`,
+    /// the observation instrument of
+    /// `a_store_inside_a_shared_prefix_takes_a_private_row` (the C8b S3 copy-on-write
+    /// gate): it must read the rows exactly where the sequence's span list says they
+    /// live.
+    #[cfg(test)]
+    pub(crate) fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
         self.kv.cell_of(seq, pos)
     }
 
