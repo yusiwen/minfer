@@ -2503,6 +2503,19 @@ mechanism run, and `GraphAllocator::kv_cell_of` is the read-side twin of the sto
 snapshotting a sharing sequence's rows cannot use the store one, which refuses those positions by
 design).
 
+*(Forward note, 2026-09-30: `kv_cell_of` is **test-only** as of
+[#236](https://github.com/yusiwen/minfer/issues/236) — `#[cfg(test)] pub(crate)`, not
+`allow(dead_code)`, because it never had a non-test caller. `git log -S 'kv_cell_of' --all` over
+`src/` names only `d43e716` (which introduced the forwarder **with** this doc), `c9bbcbd` (the test
+call) and `54f6de0` (the test-module extraction), so no production call site was ever deleted. The
+"caller snapshotting a sharing sequence's rows" the sentence above names is served two other ways in
+production: a sharer's rows are read as **windows** (`KvCache::attn_map` → the `kv_map` input, C8b
+S2/S4) and a whole-run snapshot goes through the C5 container (`kv_save`/`kv_save_with_host`, which
+stores the whole arena). The one consumer is the test-side observation instrument `kv_rows_of`
+(`server::batch::tests`), driving the C8b S3 gate
+`a_store_inside_a_shared_prefix_takes_a_private_row`; see the #236 record in
+§test-infrastructure. The sentence records what S3 landed with; it is not a live API.)*
+
 **Why the run is rebased rather than given a fresh row per token.** The design's `kv_private_row_for
 (seq, t)` says "a private row for that token", and the honest way to give it one is to move the run's
 base, not to hand out unrelated cells: a per-token fresh cell would put `d` one-length spans in the span
@@ -5576,6 +5589,123 @@ re-measured. (2) The x86_64 CPU row cannot be computed locally; it is unchanged 
 construction and the CI `test-linux-cpu` log is its source. (3) The moved call sites
 certify `KvCache::own_range`'s owner-table and written-extent halves only as far as those
 tests assert them; the f16 session test does not depend on the mutated `written` arm.
+
+#### Test-infrastructure record (#236, 2026-09-30) — `GraphAllocator::kv_cell_of` is test-only; production reads a sharer's rows as `kv_map` windows
+
+**The finding (S3 of [#227](https://github.com/yusiwen/minfer/issues/227)).**
+`GraphAllocator::kv_cell_of` (`alloc.rs:1829` on master `691a9d2`) was a one-line forwarder —
+`self.kv.cell_of(seq, pos)` — carrying `#[cfg_attr(not(test), allow(dead_code))]` and a doc that
+claimed a production role: *"…this answers 'where would a reader look?', which is what a caller
+snapshotting a sharing sequence's rows needs."* No such caller exists, and none was deleted:
+`git log -S 'kv_cell_of' --all` over `src/` names exactly three commits — `d43e716` (C8b S3 2/4,
+which introduced the forwarder **and** that doc), `c9bbcbd` (C8b S3 3/4, the test call) and
+`54f6de0` (the test-module extraction). Its only call site is `server/batch/tests.rs:514` inside
+`kv_rows_of` (`:502`), the observation instrument of the C8b S3 gate
+`a_store_inside_a_shared_prefix_takes_a_private_row` (`:385`).
+
+**The consumer class the doc named is served two other ways — neither needs position→cell.**
+(1) Reading a sharing sequence's rows **for attention** goes through *windows*:
+`GraphAllocator::fill_seq_ids` → `KvCache::attn_map` (`kvcache.rs:803`) → the `kv_map` input, which
+the CPU and CUDA attention kernels gather (C8b S2/S4). It returns **runs**, not per-position cells.
+(2) Whole-run snapshots go through the C5 container: `BatchEngine::save_slots` (`server/batch.rs:442`)
+calls `kv_save_with_host` (`alloc.rs:2172`), which stores the **whole arena** with the slot table as
+its host section — no position→cell mapping anywhere. C8b is closed (S1a–S5 landed 2026-09-21/22),
+so no pending slice was meant to consume the accessor. The `kv` field it forwards into is private
+(`alloc.rs:174`), which is why the tests cannot bypass the wrapper and call `KvCache::cell_of`
+directly from `server::batch::tests`; it is the forwarder, not `KvCache::cell_of`, that lacks a
+production caller.
+
+**The disposition (b): `#[cfg(test)] pub(crate)`, in place.** The annotation and the doc are replaced
+on the item itself (the `pub(crate) fn` is at `alloc.rs:1840` after the change), matching
+[#228](https://github.com/yusiwen/minfer/issues/228)'s precedent
+(`fill_attn_inputs_without_cells` is `#[cfg(test)]`-scoped in place). The equivalent alternative —
+a `#[cfg(test)] impl GraphAllocator` in `src/graph/alloc/tests.rs` — was rejected: `alloc/tests.rs`
+is unit-test scaffolding for `alloc`, and this method's one consumer is in
+`server::batch::tests`, so putting the type's surface in a different module's test file would move
+the boundary without moving the caller. **No call site changed** — an inherent method resolves
+wherever its `impl` lives, and `pub(crate)` keeps the cross-module caller compiling. `#[cfg(test)]`
+is strictly stronger than `allow(dead_code)`: the method **does not exist** in a non-test build, so
+a later cleanup cannot leave a production-looking orphan behind. `KvCache::cell_of` itself stays
+`pub` and production-used (the store resolver `kv_cells_for_seq` resolves through it); only the
+wrapper is gated.
+
+**Correction to an earlier record's wording.** The #228 record lists "S3's `kv_cell_of`" among
+`kv_cells_for_seq`'s *non-test* callers while it reports the premise it then falsifies.
+`kv_cell_of` forwards to `KvCache::cell_of` (`kvcache.rs:512`) and never called
+`kv_cells_for_seq`; the falsification that record reports — `kv_cells_for_seq` **is**
+production-reachable through `fill_seq_ids` — is unaffected, and as of this record `kv_cell_of`
+is itself test-only. The #228 text is left as written (it is a historical record); this is the
+dated forward correction for it.
+
+**Bar named before measuring.** No test loses its assertion, and the driver stays sensitive:
+`cargo test --release` stays 481 / 0 / 36 unit + 10 / 0 / 6 integration, the ignored S3 gate is
+green on the unmutated tree, and a `cell_of` mutation must be visible to `kv_rows_of`.
+
+**Mutation evidence (rule 3), box `dgxspark (aarch64, GB10 sm_121)`, 2026-09-30.** Two mutations of
+the **production-used** `KvCache::cell_of` (`kvcache.rs:512`), each run as
+`cargo test --release server::batch::tests::a_store_inside_a_shared_prefix_takes_a_private_row -- --ignored --nocapture`,
+each reverted. Baseline (unmutated) run: `1 passed; 0 failed; 0 ignored; 516 filtered out`.
+
+*(a) The span offset, `cell + (pos - base)` → `+ 1`.* The gate goes red — but at the **answer** arm,
+not through the instrument:
+
+```
+thread 'server::batch::tests::a_store_inside_a_shared_prefix_takes_a_private_row' panicked at
+src/server/batch/tests.rs:492:5:
+assertion `left == right` failed: the shared run must answer like the shape-matched copied one
+  left: ".\nA. the a\nB."
+ right: "\nA. Rome\nB. Naples"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 516 filtered out; finished in 1.50s
+```
+
+Every `kv_rows_of`-driven assertion **passed** under it, and that is structural, not luck:
+`kv_rows_of` resolves its cells through the *same* mutated `cell_of` the store uses, so a consistent
+offset cancels in a before/after snapshot
+(`assert_eq!(kv_rows_of(donor), donor_before)`) and in an A/B of two identical runs
+(`assert_eq!(dst_a, dst_b)`). The arm that caught it compares the sharing run's **generated answer**
+against the shape-matched copied run — generation reads through `attn_map`, which never calls
+`cell_of`, so the store's shifted cells surface as a wrong answer instead of a shifted snapshot. So
+the ticket's own example is evidence that the *gate* is
+sensitive, but **not** that the row-snapshot instrument is; it is recorded here rather than dropped,
+and the instrument is exercised by (b).
+
+*(b) The span cover, `pos < base + len` → `pos + 1 < base + len`* — the last position of every span
+resolves to `None`. This one the instrument refuses itself:
+
+```
+thread 'server::batch::tests::a_store_inside_a_shared_prefix_takes_a_private_row' panicked at
+src/server/batch/tests.rs:515:36:
+no cell for sequence 2 position 2
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 516 filtered out; finished in 0.60s
+```
+
+`tests.rs:515` is `kv_rows_of`'s own
+`.unwrap_or_else(|| panic!("no cell for sequence {seq} position {p}"))` — the failing assertion
+**is** the instrument, reached through `kv_cell_of` → `KvCache::cell_of` while it snapshots the
+diverging run's rows, before the answer arm can run. So at least one `kv_rows_of`-driven refusal
+fails under a mutation of the production `cell_of`, and the row snapshot is load-bearing. Both
+mutations reverted; `git diff src/graph/kvcache.rs` empty and `grep -rn MUTATION src/` empty.
+
+**Counts (rule 5).** No `#[test]` was added or removed, so no row moves and **no CUDA row was
+re-measured**: `cargo test --release`, box `dgxspark (aarch64, GB10 sm_121)`, 2026-09-30 → **481 / 0 / 36**
+unit + **10 / 0 / 6** integration (the recorded CPU row). `cargo fmt --all --check` clean;
+`python3 scripts/check_status.py --check` exits 0; the non-test build warning-free with and without
+`--features cuda` (`cargo build --release` and `cargo build --release --features cuda`; the one
+`warning:` line on the CUDA build is `build.rs`'s pre-existing `cargo:warning=` target list, not a
+rustc diagnostic).
+
+**Docs.** `AGENTS.md` rule 1's last sentence no longer claims a production consumer (it now says
+test-only, names the `kv_map`/`kv_save*` production paths and the one consumer); the C8b S3
+paragraph above carries a dated forward note; `docs/COMPUTE-GRAPH-DESIGN.md` was re-checked and
+never made the claim.
+
+**Limits.** (1) No CUDA device is used here: the `--features cuda` line is a compile, not a run; the
+CUDA *unit* row is unchanged by construction and is not re-measured. (2) The x86_64 CPU row cannot
+be computed locally; it is unchanged by construction and the CI `test-linux-cpu` log is its source.
+(3) The S3 gate is `#[ignore]`d (it needs the cached 0.5B model), so the mutation transcripts come
+from `-- --ignored`, not from the default `cargo test --release` run. (4) The mutation that reaches
+the instrument is the span-**cover** one, not the span-**offset** one the ticket names; which arm
+each kills is stated above, and neither is presented as the other.
 
 ## 8. Note — the dead identity fields (A7 rationale)
 
