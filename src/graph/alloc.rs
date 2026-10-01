@@ -292,7 +292,11 @@ impl GraphAllocator {
 
     /// The KV format this allocator's engine resolved (the CPU backend's stamp, set
     /// by [`Self::set_kv_format`]). The CUDA backend's tag is derived from it.
-    #[allow(dead_code)]
+    ///
+    /// The only non-test reader is the CUDA registry entry's `kv_format` hook
+    /// (`graph/cuda_backend.rs::entry`), which is compiled out of a CPU-only build,
+    /// so the method is dead there — `#[cfg_attr(not(feature = "cuda"), ...)]` (#243).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub fn kv_format(&self) -> KvFormat {
         self.cpu.kv_format()
     }

@@ -1652,9 +1652,11 @@ pub struct CudaState {
     /// (GB10 sm_12.1 → 1201; note: NOT the llama.cpp tier-key encoding
     /// 1210 — see `device_tier::llama_key`), read once at init. Gates the
     /// int8-mma MMQ prefill path (needs sm_80+ — mma.m16n8k32).
-    /// Test-only readers today (cuda_backend probe tests); the tier selector
-    /// consumes the value at init before the field is stored.
-    #[allow(dead_code)]
+    /// Its only reader is the `#[cfg(test)]` accessor [`Self::cc`]
+    /// (`graph/cuda_backend/tests.rs`); the tier selector consumes the value at
+    /// init before the field is stored, so a non-test build stores it unread —
+    /// `#[cfg_attr(not(test), ...)]` names that configuration (#243).
+    #[cfg_attr(not(test), allow(dead_code))]
     cc: std::sync::atomic::AtomicI32,
     /// T1: effective MMQ gate — the tier's own flag, or `cc >= 800` for the
     /// GENERIC row (unknown architectures keep the conservative gate).

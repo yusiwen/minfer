@@ -6258,6 +6258,115 @@ counted census is a `cargo check`: a "caller" is a compile-time reference, not a
 exercise; the suites above are the independent runtime check. (4) The real-model gate sets were not
 re-run (no test in that set was touched); their rows remain dated 2026-09-27.
 
+#### Test-infrastructure record (#243, 2026-10-01) — the config-gated dead-code annotations name their configuration
+
+**The ticket.** [#243](https://github.com/yusiwen/minfer/issues/243) is T4 of the `allow(dead_code)`
+census: bucket **D** — an item rustc reports dead in the build **without** `--features cuda` and live
+**with** it. Its annotation must name that configuration
+(`#[cfg_attr(not(feature = "cuda"), allow(dead_code))]`), not blanket-silence the item everywhere.
+The same rule covers an item dead only in the non-test build (`CudaState::cc`, whose one reader is a
+`#[cfg(test)]` accessor), and the sentence this ticket adds to Core Convention 5 states it once.
+
+**Reconciled numbers — the tracker was patched to this run.** The ticket body carried the `e9bf4c5`
+item list, so the census was re-derived on `212e748` (after [#242](https://github.com/yusiwen/minfer/issues/242)) and the body rewritten:
+
+| tree | dead `src/` sites | dead items | bucket D |
+|---|---|---|---|
+| `e9bf4c5` — the durable census' recorded baseline | 314 | 260 | 22 |
+| `79c9837` — after [#238](https://github.com/yusiwen/minfer/issues/238)/[#239](https://github.com/yusiwen/minfer/issues/239) | 191 | 156 | — |
+| `5147d2c` — after [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241) | 143 | 109 | — |
+| `212e748` — this branch's parent (after [#242](https://github.com/yusiwen/minfer/issues/242)) | **71** | **47** | **22** |
+| this branch's final tree | **71** | **47** | **22** |
+
+Method, identical on both sides: `strip.py` in a scratch worktree (every `allow(dead_code)` replaced
+by a `//STRIPPED` comment, line numbers preserved), then `cargo check --release --message-format=json`
+and `cargo check --release --features cuda --message-format=json`, taking **every** `src/` span of
+every `dead_code` diagnostic (rustc groups a dead `impl` into one diagnostic, so a primary-span-only
+read undercounts ~2.6×). Bucket D is the set difference: items in the CPU capture that are not in the
+`--features cuda` capture. The `--tests --features cuda` capture is the dead-in-the-maximal-build
+discriminator; `src/cuda.rs` and `src/graph/cuda_backend.rs` do not exist without the feature, so
+their dead items are outside bucket D by construction.
+
+**Per-item disposition (all 22).**
+
+| disposition | items |
+|---|---|
+| tightened to `#[cfg_attr(not(feature = "cuda"), allow(dead_code))]` | `GraphAllocator::kv_format` (`src/graph/alloc.rs`) — the only bucket-D item still bare |
+| already precise, module-level form, no edit | `DeviceKey`, `Provenance`, `TIERS`, `GENERIC`, `llama_key`, `Selected`, `select`, `select_forced`, `family_row`, `select_by_key` — `#[cfg_attr(not(feature = "cuda"), allow(dead_code))] mod device_tier;` (`src/main.rs`); `OffloadPlan::allows_weight` — `#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))] pub mod offload;` (`src/graph/mod.rs`); `CudaWeightReg` + `cuda_weight_reg` — `#![cfg_attr(not(feature = "cuda"), allow(dead_code))]` (`src/models/weight_reg.rs`); `q4k_dsc_payload_bytes` + `q4k_dsc_payload_ok` + `q4k_dsc_plane_admitted` — the same inner form (`src/q4k_dsc.rs`) |
+| already precise, item-level form, no edit | `DeviceMemory::{Reported.free, QueryFailed.code}` — `#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]` (`src/graph/allocplan.rs`) |
+| explicitly kept, naming [#244](https://github.com/yusiwen/minfer/issues/244) | `Vendor`, `QClass`, `DeviceTier` (`src/device_tier.rs`) — their bare item-level `#[allow(dead_code)]` is load-bearing for [#244](https://github.com/yusiwen/minfer/issues/244)'s never-constructed members in the **cuda** build (`Vendor::{Amd,Mthreads,Apple}`, `QClass::Other`, `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`). Tightening the containing item to `not(feature = "cuda")` would expose exactly those members and break the warning-free cuda build; giving each its own note is [#244](https://github.com/yusiwen/minfer/issues/244)'s decision, so this ticket does not pre-empt it and a comment records the coupling on that issue. |
+
+`CudaState::cc` is not bucket D (it lives in the feature-gated `src/cuda.rs`): its only reader is the
+`#[cfg(test)] CudaState::cc()` accessor, so its honest form is `#[cfg_attr(not(test), allow(dead_code))]`
+— the configuration where it is unused is the test build's complement, not a feature. The
+`#[cfg(test)]` accessor and its `graph/cuda_backend/tests.rs` caller are untouched. The three
+remaining residual `src/cuda.rs` dead sites (`cudaStreamWaitEvent` + `CudaState::stream_wait_event`,
+the F5 device→device wait) are intentionally untouched, pending open
+[#138](https://github.com/yusiwen/minfer/issues/138).
+
+**The reverse direction does not exist here.** Seven items are reported in the cuda capture but not
+the CPU one, all in `src/device_tier.rs`: `Vendor::{Amd, Mthreads, Apple}`, `QClass::Other`,
+`DeviceTier::{source, mmvq_batch_default, mmvq_batch_by_type}`. They are not "dead only with cuda":
+they are never constructed or read in **either** configuration. The CPU build reports the enclosing
+enum/struct as unused and never descends to its members, so the members never appear in its dead set.
+A `#[cfg_attr(feature = "cuda", allow(dead_code))]` on them would silence the cuda report of an item
+that is dead in both — the over-claim this ticket exists to remove. They are [#244](https://github.com/yusiwen/minfer/issues/244)'s
+shape items, and the census bucket definition has to be read as the *difference* between the two
+captures, not as "whichever capture names an item".
+
+**Evidence form: the stripped-oracle identity (this ticket's version of mutation evidence, as in #240/#242).**
+There is no gate to mutate — the diff is two attributes and two comments, and an attribute-only change
+has no observable behaviour to break. The falsifiable claim is instead that tightening changes the
+*diagnostics* by exactly nothing, and that each `cfg_attr` names the configuration rustc proved dead:
+
+| capture | before | after | symmetric difference |
+|---|---|---|---|
+| `cargo check --release` (CPU) | 59 items / 80 sites / 38 diagnostics | 59 / 80 / 38 | **0** |
+| `cargo check --release --features cuda` | 47 / 71 / 24 | 47 / 71 / 24 | **0** |
+| `cargo check --release --tests --features cuda` | 23 / 34 / 16 | 23 / 34 / 16 | **0** |
+
+Not one item was newly exposed and not one was hidden: the after-set is the before-set. (The
+`:296 → :300` line move of `kv_format` is the four-line doc-comment addition; the item key is
+`(file, name, kind)`.)
+
+**Non-truncation of the required captures, re-proved on this tree.** `#![cfg_attr(not(test),
+deny(warnings))]` turns the lint into an error, so the build aborts after the lint pass; the census
+uses a twin build per configuration in which that one crate-level line is commented out (the cheap
+equivalent of the durable census' `RUSTFLAGS=--cap-lints=warn`, which would force an nvcc re-run for
+every target). Required vs twin item sets: CPU 59 = 59, cuda 47 = 47, symmetric difference **0** in
+both phases — so neither capture is truncated.
+
+**Per-item config split (the proof each `cfg_attr` is precise, not decorative).**
+
+| item | `cfg_attr` covers | dead there? | dead in the other configuration? |
+|---|---|---|---|
+| `GraphAllocator::kv_format` | `not(feature = "cuda")` | CPU: **yes** | `--features cuda`: **no** |
+| `CudaState::cc` (field) | `not(test)` | non-test cuda: **yes** | `--tests --features cuda`: **no** |
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration.
+`bash scripts/cuda_test.sh` → **565 / 0 / 42**.
+`cargo check --release`, `cargo check --release --features cuda` and `cargo check --release --tests
+--features cuda` all exit 0; the non-test builds are warning-free and the only `warning:` line is
+`build.rs`'s pre-existing `cargo:warning=` target list. No count row moves: no `#[test]` was added or
+removed, so `docs/status.toml` and the `AGENTS.md` rows are unchanged. `cargo fmt --all --check`
+clean; `check_status.py --check`, `check_docs_links.py` and `check_source_layout.py` clean.
+
+**Bar named before measuring.** No `#[test]` is added, removed or weakened, and the change is
+attributes plus comments only: the bar is "the stripped-oracle dead set is unchanged in each of the
+three configurations, and each tightened annotation is dead in exactly the configuration it names" —
+stated before the after-capture was taken and measured by the tables above.
+
+**Limits.** (1) The macOS-only modules are not compiled here, but no bucket-D item is behind
+`target_os = "macos"` in the sense that would matter: `--features cuda` is the maximal Linux
+configuration and the CPU capture is the other side of the difference. (2) `--features debug_dump`
+was not built; neither the tightened item nor any bucket-D name appears in `src/dump.rs`. (3) The
+counted census is a `cargo check`: a "caller" is a compile-time reference, so `kv_format`'s liveness
+with cuda rests on `cuda_backend::entry`'s `kv_format` hook being compiled in that configuration
+(the suite above is the independent runtime check). (4) `CudaState::cc`'s test build is
+`--tests --features cuda`, not the macOS test build; the `#[cfg(test)]` accessor is
+platform-independent.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
